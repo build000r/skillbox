@@ -63,12 +63,20 @@ class Handler(BaseHTTPRequestHandler):
         <strong>API</strong>
         <p><a href="http://127.0.0.1:{API_PORT}/health">/health</a></p>
         <p><a href="http://127.0.0.1:{API_PORT}/v1/sandbox">/v1/sandbox</a></p>
+        <p><a href="http://127.0.0.1:{API_PORT}/v1/runtime">/v1/runtime</a></p>
+        <p><a href="http://127.0.0.1:{API_PORT}/v1/repos">/v1/repos</a></p>
+        <p><a href="http://127.0.0.1:{API_PORT}/v1/logs">/v1/logs</a></p>
       </div>
       <div class="card">
         <strong>Workspace shape</strong>
         <p>Repos live in <code>{html.escape(str(REPOS_ROOT.relative_to(ROOT)))}</code>.</p>
         <p>Local shipped skills live in <code>{html.escape(str(SKILLS_ROOT.relative_to(ROOT)))}</code>.</p>
         <p>Mounted config homes live under <code>home/.claude</code> and <code>home/.codex</code>.</p>
+      </div>
+      <div class="card">
+        <strong>Internal Runtime Manager</strong>
+        <p>The box internals are now declared in <code>workspace/runtime.yaml</code>.</p>
+        <p>Use <code>make runtime-sync</code>, <code>make runtime-status</code>, and <code>make dev-sanity</code> to manage repos, logs, and checks.</p>
       </div>
     </main>
   </body>

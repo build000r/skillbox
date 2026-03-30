@@ -15,6 +15,8 @@ try:
 except ModuleNotFoundError:
     yaml = None
 
+from lib.runtime_model import build_runtime_model
+
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 WORKSPACE_DIR = ROOT_DIR / "workspace"
@@ -24,6 +26,8 @@ EXPECTED_FILES = [
     ".env.example",
     "Dockerfile",
     "docker-compose.yml",
+    ".env-manager/README.md",
+    ".env-manager/manage.py",
     "docker/sandbox-entrypoint.sh",
     "scripts/01-bootstrap-do.sh",
     "scripts/02-install-tailscale.sh",
@@ -31,13 +35,16 @@ EXPECTED_FILES = [
     "scripts/package_skill.py",
     "scripts/quick_validate.py",
     "scripts/lib/__init__.py",
+    "scripts/lib/runtime_model.py",
     "scripts/lib/skill_bundle_filter.py",
     "workspace/sandbox.yaml",
     "workspace/dependencies.yaml",
+    "workspace/runtime.yaml",
     "workspace/default-skills.manifest",
     "workspace/default-skills.sources.yaml",
 ]
 EXPECTED_DIRECTORIES = [
+    ".env-manager",
     "default-skills",
     "docker",
     "home/.claude",
@@ -117,6 +124,7 @@ def build_model() -> dict[str, Any]:
     sandbox_doc = load_yaml(WORKSPACE_DIR / "sandbox.yaml")
     dependencies_doc = load_yaml(WORKSPACE_DIR / "dependencies.yaml")
     sources_doc = load_yaml(WORKSPACE_DIR / "default-skills.sources.yaml")
+    runtime_model = build_runtime_model(ROOT_DIR)
     env_defaults = load_env_defaults(ROOT_DIR / ".env.example")
     manifest_skills = load_manifest_skills(WORKSPACE_DIR / "default-skills.manifest")
 
@@ -172,6 +180,14 @@ def build_model() -> dict[str, Any]:
             "manifest_skills": manifest_skills,
             "present_bundles": read_bundle_names(ROOT_DIR / "default-skills"),
             "bundle_dependency": default_bundle,
+        },
+        "runtime_manager": {
+            "script": str(ROOT_DIR / ".env-manager" / "manage.py"),
+            "manifest_file": runtime_model["manifest_file"],
+            "repos": runtime_model["repos"],
+            "services": runtime_model["services"],
+            "logs": runtime_model["logs"],
+            "checks": runtime_model["checks"],
         },
     }
 
@@ -510,6 +526,58 @@ def check_reference_drift() -> CheckResult:
     )
 
 
+def check_runtime_manager_model(model: dict[str, Any]) -> CheckResult:
+    runtime_manager = model["runtime_manager"]
+    return CheckResult(
+        status="pass",
+        code="runtime-manager-model",
+        message="internal runtime manager manifest resolved successfully",
+        details={
+            "manifest": repo_rel(Path(runtime_manager["manifest_file"])),
+            "repos": len(runtime_manager["repos"]),
+            "services": len(runtime_manager["services"]),
+            "logs": len(runtime_manager["logs"]),
+            "checks": len(runtime_manager["checks"]),
+        },
+    )
+
+
+def check_runtime_manager_doctor() -> CheckResult:
+    result = run_command(["python3", ".env-manager/manage.py", "doctor", "--format", "json"])
+    if result.returncode != 0:
+        return CheckResult(
+            status="fail",
+            code="runtime-manager-doctor",
+            message="internal runtime manager doctor failed",
+            details={
+                "stdout": result.stdout.strip(),
+                "stderr": result.stderr.strip(),
+            },
+        )
+
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        return CheckResult(
+            status="fail",
+            code="runtime-manager-doctor",
+            message="internal runtime manager doctor emitted invalid JSON",
+            details={"error": str(exc)},
+        )
+
+    warnings = sum(1 for item in payload if item.get("status") == "warn")
+    details = {"warnings": warnings}
+    if warnings:
+        details["warning_codes"] = [item.get("code") for item in payload if item.get("status") == "warn"]
+
+    return CheckResult(
+        status="pass",
+        code="runtime-manager-doctor",
+        message="internal runtime manager doctor completed without failures",
+        details=details,
+    )
+
+
 def compose_summary(model: dict[str, Any]) -> dict[str, Any]:
     base_config = compose_config(include_surfaces=False)
     surfaces_config = compose_config(include_surfaces=True)
@@ -543,6 +611,7 @@ def build_render_payload(with_compose: bool) -> dict[str, Any]:
         "expected_mounts": model["expected_mounts"],
         "dependencies": model["dependencies"],
         "skill_sync": model["skill_sync"],
+        "runtime_manager": model["runtime_manager"],
     }
     if with_compose:
         payload["compose"] = compose_summary(model)
@@ -574,6 +643,15 @@ def print_render_text(payload: dict[str, Any]) -> None:
     print(f"  packager: {skill_sync['packager']}")
     print(f"  manifest skills: {', '.join(skill_sync['manifest_skills']) or '(none)'}")
     print(f"  present bundles: {', '.join(skill_sync['present_bundles']) or '(none)'}")
+    print()
+    print("runtime manager:")
+    runtime_manager = payload["runtime_manager"]
+    print(f"  script: {repo_rel(Path(runtime_manager['script']))}")
+    print(f"  manifest: {repo_rel(Path(runtime_manager['manifest_file']))}")
+    print(f"  repos: {len(runtime_manager['repos'])}")
+    print(f"  services: {len(runtime_manager['services'])}")
+    print(f"  logs: {len(runtime_manager['logs'])}")
+    print(f"  checks: {len(runtime_manager['checks'])}")
     if "compose" in payload:
         compose = payload["compose"]
         print()
@@ -627,6 +705,8 @@ def doctor_results(skip_compose: bool, skip_skill_sync: bool) -> list[CheckResul
         check_env_defaults(model),
         check_bundle_state(model),
         check_reference_drift(),
+        check_runtime_manager_model(model),
+        check_runtime_manager_doctor(),
     ]
 
     if skip_compose:

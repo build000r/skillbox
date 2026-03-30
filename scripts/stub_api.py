@@ -6,6 +6,8 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from lib.runtime_model import build_runtime_model
+
 
 ROOT = Path(__file__).resolve().parent.parent
 REPOS_ROOT = Path(os.environ.get("SKILLBOX_REPOS_ROOT", ROOT / "repos"))
@@ -24,6 +26,32 @@ def list_directories(root: Path) -> list[dict[str, str]]:
         if child.is_dir():
             items.append({"id": child.name, "path": str(child)})
     return items
+
+
+def runtime_summary() -> dict:
+    model = build_runtime_model(ROOT)
+    return {
+        "manifest": model["manifest_file"],
+        "repos": model["repos"],
+        "services": model["services"],
+        "logs": model["logs"],
+        "checks": model["checks"],
+    }
+
+
+def existing_paths(items: list[dict]) -> list[dict[str, str | bool]]:
+    payload: list[dict[str, str | bool]] = []
+    for item in items:
+        path = Path(str(item.get("host_path") or item["path"]))
+        payload.append(
+            {
+                "id": str(item["id"]),
+                "path": str(item["path"]),
+                "host_path": str(path),
+                "present": path.exists(),
+            }
+        )
+    return payload
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -56,6 +84,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/v1/sandbox":
+            runtime = runtime_summary()
             self._json(
                 200,
                 {
@@ -63,12 +92,31 @@ class Handler(BaseHTTPRequestHandler):
                     "entrypoints": ["ssh", "manual", "api", "web"],
                     "repos": list_directories(REPOS_ROOT),
                     "skills": list_directories(SKILLS_ROOT),
+                    "runtime_manager": {
+                        "manifest": runtime["manifest"],
+                        "service_count": len(runtime["services"]),
+                        "log_count": len(runtime["logs"]),
+                    },
                     "home_mounts": {
                         "claude": str(HOME_ROOT / ".claude"),
                         "codex": str(HOME_ROOT / ".codex"),
                     },
                 },
             )
+            return
+
+        if self.path == "/v1/runtime":
+            self._json(200, runtime_summary())
+            return
+
+        if self.path == "/v1/repos":
+            runtime = runtime_summary()
+            self._json(200, {"repos": existing_paths(runtime["repos"])})
+            return
+
+        if self.path == "/v1/logs":
+            runtime = runtime_summary()
+            self._json(200, {"logs": existing_paths(runtime["logs"])})
             return
 
         self._json(404, {"ok": False, "error": "not_found", "path": self.path})

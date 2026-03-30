@@ -1,0 +1,126 @@
+version: 1
+
+repos:
+  - id: skillbox-self
+    kind: repo
+    path: ${SKILLBOX_WORKSPACE_ROOT}
+    required: true
+    profiles:
+      - core
+    source:
+      kind: bind
+      path: ${ROOT_DIR}
+    sync:
+      mode: external
+    notes: The bind-mounted skillbox repo itself.
+
+  - id: managed-repos
+    kind: workspace-root
+    path: ${SKILLBOX_REPOS_ROOT}
+    required: true
+    profiles:
+      - core
+    source:
+      kind: directory
+    sync:
+      mode: ensure-directory
+    notes: Parent directory for repos cloned or mounted into the box.
+
+services:
+  - id: internal-env-manager
+    kind: orchestration
+    owner: local
+    repo: skillbox-self
+    path: ${SKILLBOX_WORKSPACE_ROOT}/.env-manager
+    required: true
+    profiles:
+      - core
+    command: python3 .env-manager/manage.py
+    log: runtime
+    notes: Internal control surface for repos, logs, and dev-sanity.
+
+  - id: api-stub
+    kind: http
+    owner: local
+    repo: skillbox-self
+    required: false
+    profiles:
+      - surfaces
+    command: python3 scripts/stub_api.py
+    healthcheck:
+      type: http
+      url: http://127.0.0.1:${SKILLBOX_API_PORT}/health
+      timeout_seconds: 0.5
+    log: api
+    notes: Optional sandbox inspection surface.
+
+  - id: web-stub
+    kind: http
+    owner: local
+    repo: skillbox-self
+    required: false
+    profiles:
+      - surfaces
+    command: python3 scripts/stub_web.py
+    healthcheck:
+      type: http
+      url: http://127.0.0.1:${SKILLBOX_WEB_PORT}/
+      timeout_seconds: 0.5
+    log: web
+    notes: Optional browser surface for sandbox inspection.
+
+logs:
+  - id: runtime
+    path: ${SKILLBOX_LOG_ROOT}/runtime
+    required: false
+    retention_days: 14
+    notes: Internal manager and reconciliation logs.
+
+  - id: repos
+    path: ${SKILLBOX_LOG_ROOT}/repos
+    required: false
+    retention_days: 14
+    notes: Repo-local launch and health logs.
+
+  - id: api
+    path: ${SKILLBOX_LOG_ROOT}/api
+    required: false
+    retention_days: 7
+    notes: API surface logs.
+
+  - id: web
+    path: ${SKILLBOX_LOG_ROOT}/web
+    required: false
+    retention_days: 7
+    notes: Web surface logs.
+
+checks:
+  - id: workspace-root
+    type: path_exists
+    path: ${SKILLBOX_WORKSPACE_ROOT}
+    required: true
+    notes: The workspace must be mounted.
+
+  - id: repos-root
+    type: path_exists
+    path: ${SKILLBOX_REPOS_ROOT}
+    required: true
+    notes: Managed repos root should exist.
+
+  - id: skills-root
+    type: path_exists
+    path: ${SKILLBOX_SKILLS_ROOT}
+    required: true
+    notes: Local skills root should exist.
+
+  - id: log-root
+    type: path_exists
+    path: ${SKILLBOX_LOG_ROOT}
+    required: true
+    notes: Top-level log root should exist.
+
+  - id: runtime-manager
+    type: path_exists
+    path: ${SKILLBOX_WORKSPACE_ROOT}/.env-manager/manage.py
+    required: true
+    notes: Internal manager entrypoint should exist.
