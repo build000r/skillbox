@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import shutil
@@ -72,6 +73,86 @@ def resolve_root_dir(raw_root: str | None) -> Path:
     if raw_root:
         return Path(raw_root).resolve()
     return DEFAULT_ROOT_DIR
+
+
+def normalize_active_profiles(raw_profiles: list[str] | None) -> set[str]:
+    active_profiles = {value.strip() for value in raw_profiles or [] if value and value.strip()}
+    if active_profiles:
+        active_profiles.add("core")
+    return active_profiles
+
+
+def item_matches_profiles(item: dict[str, Any], active_profiles: set[str]) -> bool:
+    if not active_profiles:
+        return True
+
+    item_profiles = {
+        str(value).strip()
+        for value in item.get("profiles") or []
+        if str(value).strip()
+    }
+    if not item_profiles:
+        return True
+    return not item_profiles.isdisjoint(active_profiles)
+
+
+def filter_model_by_profiles(model: dict[str, Any], active_profiles: set[str]) -> dict[str, Any]:
+    if not active_profiles:
+        return model
+
+    filtered_model = dict(model)
+    filtered_model["active_profiles"] = sorted(active_profiles)
+    filtered_model["repos"] = [
+        copy.deepcopy(repo) for repo in model["repos"] if item_matches_profiles(repo, active_profiles)
+    ]
+    filtered_model["skills"] = [
+        copy.deepcopy(skillset)
+        for skillset in model["skills"]
+        if item_matches_profiles(skillset, active_profiles)
+    ]
+    filtered_model["services"] = [
+        copy.deepcopy(service)
+        for service in model["services"]
+        if item_matches_profiles(service, active_profiles)
+    ]
+    filtered_model["logs"] = [
+        copy.deepcopy(log_item)
+        for log_item in model["logs"]
+        if item_matches_profiles(log_item, active_profiles)
+    ]
+    filtered_model["checks"] = [
+        copy.deepcopy(check)
+        for check in model["checks"]
+        if item_matches_profiles(check, active_profiles)
+    ]
+
+    included_repo_ids = {repo["id"] for repo in filtered_model["repos"]}
+    included_log_ids = {log_item["id"] for log_item in filtered_model["logs"]}
+
+    required_repo_ids = {
+        str(service["repo"])
+        for service in filtered_model["services"]
+        if service.get("repo")
+    }
+    required_log_ids = {
+        str(service["log"])
+        for service in filtered_model["services"]
+        if service.get("log")
+    }
+
+    for repo in model["repos"]:
+        repo_id = str(repo.get("id", "")).strip()
+        if repo_id and repo_id in required_repo_ids and repo_id not in included_repo_ids:
+            filtered_model["repos"].append(copy.deepcopy(repo))
+            included_repo_ids.add(repo_id)
+
+    for log_item in model["logs"]:
+        log_id = str(log_item.get("id", "")).strip()
+        if log_id and log_id in required_log_ids and log_id not in included_log_ids:
+            filtered_model["logs"].append(copy.deepcopy(log_item))
+            included_log_ids.add(log_id)
+
+    return filtered_model
 
 
 def find_duplicates(items: list[dict[str, Any]], field: str) -> list[str]:
@@ -1144,6 +1225,7 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
         check_statuses.append(item)
 
     return {
+        "active_profiles": model.get("active_profiles") or [],
         "repos": repo_statuses,
         "skills": skill_statuses,
         "services": service_statuses,
@@ -1153,6 +1235,9 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
 
 
 def print_render_text(model: dict[str, Any]) -> None:
+    active_profiles = model.get("active_profiles") or []
+    if active_profiles:
+        print(f"active profiles: {', '.join(active_profiles)}")
     print(f"runtime manifest: {model['manifest_file']}")
     print(f"repos: {len(model['repos'])}")
     for repo in model["repos"]:
@@ -1206,6 +1291,9 @@ def print_doctor_text(results: list[CheckResult]) -> None:
 
 
 def print_status_text(status_payload: dict[str, Any]) -> None:
+    active_profiles = status_payload.get("active_profiles") or []
+    if active_profiles:
+        print(f"active profiles: {', '.join(active_profiles)}")
     print("repos:")
     for repo in status_payload["repos"]:
         summary = "present" if repo["present"] else "missing"
@@ -1265,8 +1353,17 @@ def main() -> int:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    def add_profile_arg(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument(
+            "--profile",
+            action="append",
+            default=[],
+            help="Activate a runtime profile. Can be repeated. Selecting any profile also includes `core`.",
+        )
+
     render_parser = subparsers.add_parser("render", help="Print the resolved runtime graph.")
     render_parser.add_argument("--format", choices=("text", "json"), default="text")
+    add_profile_arg(render_parser)
 
     sync_parser = subparsers.add_parser(
         "sync",
@@ -1274,22 +1371,26 @@ def main() -> int:
     )
     sync_parser.add_argument("--dry-run", action="store_true")
     sync_parser.add_argument("--format", choices=("text", "json"), default="text")
+    add_profile_arg(sync_parser)
 
     doctor_parser = subparsers.add_parser(
         "doctor",
         help="Validate runtime graph, filesystem readiness, and installed skill integrity.",
     )
     doctor_parser.add_argument("--format", choices=("text", "json"), default="text")
+    add_profile_arg(doctor_parser)
 
     status_parser = subparsers.add_parser(
         "status",
         help="Summarize repo, skill, service, log, and check state.",
     )
     status_parser.add_argument("--format", choices=("text", "json"), default="text")
+    add_profile_arg(status_parser)
 
     args = parser.parse_args()
     root_dir = resolve_root_dir(args.root_dir)
     model = build_runtime_model(root_dir)
+    model = filter_model_by_profiles(model, normalize_active_profiles(getattr(args, "profile", [])))
 
     if args.command == "render":
         if args.format == "json":

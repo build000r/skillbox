@@ -98,6 +98,51 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(target_states["claude"], "ok")
             self.assertEqual(target_states["codex"], "ok")
 
+    def test_profile_render_and_sync_limit_runtime_to_selected_slice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            render = self._run(repo, "render", "--profile", "project-alpha", "--format", "json")
+
+            self.assertEqual(render.returncode, 0, render.stderr)
+            render_payload = json.loads(render.stdout)
+            self.assertEqual(render_payload["active_profiles"], ["core", "project-alpha"])
+            self.assertEqual(
+                {item["id"] for item in render_payload["repos"]},
+                {"skillbox-self", "managed-repos", "project-alpha"},
+            )
+            self.assertEqual(
+                {item["id"] for item in render_payload["services"]},
+                {"internal-env-manager", "project-alpha-api"},
+            )
+            self.assertEqual(
+                {item["id"] for item in render_payload["logs"]},
+                {"runtime", "repos", "project-alpha"},
+            )
+            self.assertEqual(
+                {item["id"] for item in render_payload["checks"]},
+                {"workspace-root", "repos-root", "skills-root", "log-root", "runtime-manager", "project-alpha-root"},
+            )
+
+            sync = self._run(repo, "sync", "--profile", "project-alpha", "--format", "json")
+
+            self.assertEqual(sync.returncode, 0, sync.stderr)
+            self.assertTrue((repo / "repos" / "project-alpha").is_dir())
+            self.assertFalse((repo / "repos" / "project-beta").exists())
+            self.assertTrue((repo / "logs" / "project-alpha").is_dir())
+            self.assertFalse((repo / "logs" / "project-beta").exists())
+
+            status = self._run(repo, "status", "--profile", "project-alpha", "--format", "json")
+
+            self.assertEqual(status.returncode, 0, status.stderr)
+            status_payload = json.loads(status.stdout)
+            self.assertEqual(status_payload["active_profiles"], ["core", "project-alpha"])
+            self.assertEqual(
+                {item["id"] for item in status_payload["services"]},
+                {"internal-env-manager", "project-alpha-api"},
+            )
+
     def test_doctor_fails_when_declared_bundle_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -162,6 +207,8 @@ class RuntimeManagerTests(unittest.TestCase):
             "    kind: repo\n"
             "    path: ${SKILLBOX_WORKSPACE_ROOT}\n"
             "    required: true\n"
+            "    profiles:\n"
+            "      - core\n"
             "    source:\n"
             "      kind: bind\n"
             "      path: ${ROOT_DIR}\n"
@@ -171,6 +218,28 @@ class RuntimeManagerTests(unittest.TestCase):
             "    kind: workspace-root\n"
             "    path: ${SKILLBOX_REPOS_ROOT}\n"
             "    required: true\n"
+            "    profiles:\n"
+            "      - core\n"
+            "    source:\n"
+            "      kind: directory\n"
+            "    sync:\n"
+            "      mode: ensure-directory\n"
+            "  - id: project-alpha\n"
+            "    kind: repo\n"
+            "    path: ${SKILLBOX_REPOS_ROOT}/project-alpha\n"
+            "    required: false\n"
+            "    profiles:\n"
+            "      - project-alpha\n"
+            "    source:\n"
+            "      kind: directory\n"
+            "    sync:\n"
+            "      mode: ensure-directory\n"
+            "  - id: project-beta\n"
+            "    kind: repo\n"
+            "    path: ${SKILLBOX_REPOS_ROOT}/project-beta\n"
+            "    required: false\n"
+            "    profiles:\n"
+            "      - project-beta\n"
             "    source:\n"
             "      kind: directory\n"
             "    sync:\n"
@@ -179,6 +248,8 @@ class RuntimeManagerTests(unittest.TestCase):
             "  - id: default-skills\n"
             "    kind: packaged-skill-set\n"
             "    required: true\n"
+            "    profiles:\n"
+            "      - core\n"
             "    bundle_dir: ${SKILLBOX_WORKSPACE_ROOT}/default-skills\n"
             "    manifest: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.manifest\n"
             "    sources_config: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.sources.yaml\n"
@@ -196,32 +267,100 @@ class RuntimeManagerTests(unittest.TestCase):
             "    repo: skillbox-self\n"
             "    path: ${SKILLBOX_WORKSPACE_ROOT}/.env-manager\n"
             "    required: true\n"
+            "    profiles:\n"
+            "      - core\n"
             "    command: python3 .env-manager/manage.py\n"
             "    log: runtime\n"
+            "  - id: project-alpha-api\n"
+            "    kind: http\n"
+            "    repo: project-alpha\n"
+            "    required: false\n"
+            "    profiles:\n"
+            "      - project-alpha\n"
+            "    command: python3 -m http.server 9101\n"
+            "    healthcheck:\n"
+            "      type: path_exists\n"
+            "      path: ${SKILLBOX_REPOS_ROOT}/project-alpha\n"
+            "    log: project-alpha\n"
+            "  - id: project-beta-api\n"
+            "    kind: http\n"
+            "    repo: project-beta\n"
+            "    required: false\n"
+            "    profiles:\n"
+            "      - project-beta\n"
+            "    command: python3 -m http.server 9102\n"
+            "    healthcheck:\n"
+            "      type: path_exists\n"
+            "      path: ${SKILLBOX_REPOS_ROOT}/project-beta\n"
+            "    log: project-beta\n"
             "logs:\n"
             "  - id: runtime\n"
             "    path: ${SKILLBOX_LOG_ROOT}/runtime\n"
+            "    profiles:\n"
+            "      - core\n"
             "  - id: api\n"
             "    path: ${SKILLBOX_LOG_ROOT}/api\n"
+            "    profiles:\n"
+            "      - surfaces\n"
             "  - id: web\n"
             "    path: ${SKILLBOX_LOG_ROOT}/web\n"
+            "    profiles:\n"
+            "      - surfaces\n"
+            "  - id: repos\n"
+            "    path: ${SKILLBOX_LOG_ROOT}/repos\n"
+            "    profiles:\n"
+            "      - core\n"
+            "  - id: project-alpha\n"
+            "    path: ${SKILLBOX_LOG_ROOT}/project-alpha\n"
+            "    profiles:\n"
+            "      - project-alpha\n"
+            "  - id: project-beta\n"
+            "    path: ${SKILLBOX_LOG_ROOT}/project-beta\n"
+            "    profiles:\n"
+            "      - project-beta\n"
             "checks:\n"
             "  - id: workspace-root\n"
             "    type: path_exists\n"
             "    path: ${SKILLBOX_WORKSPACE_ROOT}\n"
             "    required: true\n"
+            "    profiles:\n"
+            "      - core\n"
             "  - id: repos-root\n"
             "    type: path_exists\n"
             "    path: ${SKILLBOX_REPOS_ROOT}\n"
             "    required: true\n"
+            "    profiles:\n"
+            "      - core\n"
             "  - id: skills-root\n"
             "    type: path_exists\n"
             "    path: ${SKILLBOX_SKILLS_ROOT}\n"
             "    required: true\n"
+            "    profiles:\n"
+            "      - core\n"
             "  - id: log-root\n"
             "    type: path_exists\n"
             "    path: ${SKILLBOX_LOG_ROOT}\n"
-            "    required: true\n",
+            "    required: true\n"
+            "    profiles:\n"
+            "      - core\n"
+            "  - id: runtime-manager\n"
+            "    type: path_exists\n"
+            "    path: ${SKILLBOX_WORKSPACE_ROOT}/.env-manager/manage.py\n"
+            "    required: true\n"
+            "    profiles:\n"
+            "      - core\n"
+            "  - id: project-alpha-root\n"
+            "    type: path_exists\n"
+            "    path: ${SKILLBOX_REPOS_ROOT}/project-alpha\n"
+            "    required: false\n"
+            "    profiles:\n"
+            "      - project-alpha\n"
+            "  - id: project-beta-root\n"
+            "    type: path_exists\n"
+            "    path: ${SKILLBOX_REPOS_ROOT}/project-beta\n"
+            "    required: false\n"
+            "    profiles:\n"
+            "      - project-beta\n",
             encoding="utf-8",
         )
 

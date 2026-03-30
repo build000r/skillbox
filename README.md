@@ -365,6 +365,30 @@ checks:
     path: ${SKILLBOX_WORKSPACE_ROOT}/.env-manager/manage.py
 ```
 
+### Workload Profiles
+
+`workspace/runtime.yaml` can now describe named workload slices with `profiles`.
+The runtime manager treats `core` as the shared baseline and lets you activate
+additional slices when you render, sync, inspect, or sanity-check the box.
+
+Examples:
+
+```bash
+python3 .env-manager/manage.py render --profile bookme
+python3 .env-manager/manage.py sync --profile bookme
+python3 .env-manager/manage.py status --profile bookme
+python3 .env-manager/manage.py doctor --profile bookme
+
+make runtime-sync PROFILE=bookme
+make runtime-status PROFILE=bookme
+make dev-sanity PROFILE=bookme
+```
+
+That makes `skillbox` behave less like one static starter and more like a
+personal environment compiler: one repo can declare multiple real project
+slices without forcing every repo, service, log, and check to exist all the
+time.
+
 ## Architecture
 
 ```text
@@ -480,7 +504,7 @@ make doctor
 - There is no release installer, package manager distribution, or cloud provisioning flow yet.
 - The API and web surfaces are inspection stubs, not a full UI.
 - The internal runtime manager currently handles declaration, sync, status, and sanity checks. It does not yet do full per-repo start/stop orchestration.
-- Repo cloning, secrets management, and per-project bootstrap are still your responsibility.
+- Secrets management and richer per-project bootstrap workflows are still your responsibility.
 - There is no license file in this repo yet. Add one before publishing it as open source.
 
 ## FAQ

@@ -92,24 +92,32 @@ logs:
   - id: runtime
     path: ${SKILLBOX_LOG_ROOT}/runtime
     required: false
+    profiles:
+      - core
     retention_days: 14
     notes: Internal manager and reconciliation logs.
 
   - id: repos
     path: ${SKILLBOX_LOG_ROOT}/repos
     required: false
+    profiles:
+      - core
     retention_days: 14
     notes: Repo-local launch and health logs.
 
   - id: api
     path: ${SKILLBOX_LOG_ROOT}/api
     required: false
+    profiles:
+      - surfaces
     retention_days: 7
     notes: API surface logs.
 
   - id: web
     path: ${SKILLBOX_LOG_ROOT}/web
     required: false
+    profiles:
+      - surfaces
     retention_days: 7
     notes: Web surface logs.
 
@@ -118,28 +126,38 @@ checks:
     type: path_exists
     path: ${SKILLBOX_WORKSPACE_ROOT}
     required: true
+    profiles:
+      - core
     notes: The workspace must be mounted.
 
   - id: repos-root
     type: path_exists
     path: ${SKILLBOX_REPOS_ROOT}
     required: true
+    profiles:
+      - core
     notes: Managed repos root should exist.
 
   - id: skills-root
     type: path_exists
     path: ${SKILLBOX_SKILLS_ROOT}
     required: true
+    profiles:
+      - core
     notes: Local skills root should exist.
 
   - id: log-root
     type: path_exists
     path: ${SKILLBOX_LOG_ROOT}
     required: true
+    profiles:
+      - core
     notes: Top-level log root should exist.
 
   - id: runtime-manager
     type: path_exists
     path: ${SKILLBOX_WORKSPACE_ROOT}/.env-manager/manage.py
     required: true
+    profiles:
+      - core
     notes: Internal manager entrypoint should exist.

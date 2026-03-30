@@ -206,6 +206,7 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
 
     for log_item in model["logs"]:
         log_item.setdefault("required", False)
+        log_item.setdefault("profiles", [])
         if log_item.get("path"):
             log_item["host_path"] = str(
                 runtime_path_to_host_path(root_dir, model["env"], str(log_item["path"]))
@@ -213,6 +214,7 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
 
     for check in model["checks"]:
         check.setdefault("required", False)
+        check.setdefault("profiles", [])
         if check.get("path"):
             check["host_path"] = str(runtime_path_to_host_path(root_dir, model["env"], str(check["path"])))
 
