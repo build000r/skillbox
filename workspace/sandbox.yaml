@@ -1,0 +1,26 @@
+version: 1
+
+sandbox:
+  name: skillbox
+  purpose: cloneable-tailnet-dev-box
+  runtime:
+    mode: tailnet-docker
+    agent_user: sandbox
+    tailnet_enabled: true
+    ssh_enabled: true
+    ssh_mode: host
+  ports:
+    api: 8000
+    web: 3000
+  paths:
+    workspace_root: /workspace
+    repos_root: /workspace/repos
+    skills_root: /workspace/skills
+    log_root: /workspace/logs
+    claude_root: /home/sandbox/.claude
+    codex_root: /home/sandbox/.codex
+  entrypoints:
+    - ssh
+    - manual
+    - api
+    - web

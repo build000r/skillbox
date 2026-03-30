@@ -1,0 +1,10 @@
+# Curated default sandbox skill names.
+#
+# Notes:
+# - Blank lines and lines starting with # are ignored.
+# - Each non-comment line is just a skill name, for example `ask-cascade`.
+# - `03-skill-sync.sh` resolves names against the ordered sources in
+#   `workspace/default-skills.sources.yaml`.
+# - The first source containing `<source-root>/<skill-name>/SKILL.md` wins.
+
+ask-cascade

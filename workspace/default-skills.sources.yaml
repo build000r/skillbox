@@ -1,0 +1,9 @@
+version: 1
+
+sources:
+  - kind: github
+    repo: https://github.com/build000r/skills
+    sha: 9f0f69029aee5c6b247bf25dcfe13e34f2110e3a
+
+  - kind: local
+    path: ./skills

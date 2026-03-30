@@ -1,0 +1,83 @@
+name: ${SKILLBOX_NAME:-skillbox}
+
+x-runtime-env: &runtime_env
+  SKILLBOX_WORKSPACE_ROOT: /workspace
+  SKILLBOX_REPOS_ROOT: /workspace/repos
+  SKILLBOX_SKILLS_ROOT: /workspace/skills
+  SKILLBOX_LOG_ROOT: /workspace/logs
+  SKILLBOX_HOME_ROOT: /home/sandbox
+  SKILLBOX_API_PORT: ${SKILLBOX_API_PORT:-8000}
+  SKILLBOX_WEB_PORT: ${SKILLBOX_WEB_PORT:-3000}
+
+services:
+  workspace:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: skillbox:dev
+    init: true
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
+    env_file:
+      - path: ./.env
+        required: false
+    environment:
+      <<: *runtime_env
+    volumes:
+      - .:/workspace
+      - ./home/.claude:/home/sandbox/.claude
+      - ./home/.codex:/home/sandbox/.codex
+    command: ["sleep", "infinity"]
+
+  api:
+    profiles: ["surfaces"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: skillbox:dev
+    init: true
+    working_dir: /workspace
+    env_file:
+      - path: ./.env
+        required: false
+    environment:
+      <<: *runtime_env
+    volumes:
+      - .:/workspace
+      - ./home/.claude:/home/sandbox/.claude
+      - ./home/.codex:/home/sandbox/.codex
+    command:
+      - bash
+      - -lc
+      - >
+        mkdir -p logs/api &&
+        python3 scripts/stub_api.py 2>&1 | tee -a logs/api/api.log
+    ports:
+      - "127.0.0.1:${SKILLBOX_API_PORT:-8000}:8000"
+
+  web:
+    profiles: ["surfaces"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: skillbox:dev
+    init: true
+    working_dir: /workspace
+    env_file:
+      - path: ./.env
+        required: false
+    environment:
+      <<: *runtime_env
+    volumes:
+      - .:/workspace
+      - ./home/.claude:/home/sandbox/.claude
+      - ./home/.codex:/home/sandbox/.codex
+    command:
+      - bash
+      - -lc
+      - >
+        mkdir -p logs/web &&
+        python3 scripts/stub_web.py 2>&1 | tee -a logs/web/web.log
+    ports:
+      - "127.0.0.1:${SKILLBOX_WEB_PORT:-3000}:3000"
