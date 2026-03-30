@@ -38,6 +38,7 @@ services:
       - .:/workspace
       - ./home/.claude:/home/sandbox/.claude
       - ./home/.codex:/home/sandbox/.codex
+      - ./home/.local:/home/sandbox/.local
       - ${SKILLBOX_MONOSERVER_HOST_ROOT:-..}:${SKILLBOX_MONOSERVER_ROOT:-/monoserver}
     command: ["sleep", "infinity"]
 
@@ -58,6 +59,7 @@ services:
       - .:/workspace
       - ./home/.claude:/home/sandbox/.claude
       - ./home/.codex:/home/sandbox/.codex
+      - ./home/.local:/home/sandbox/.local
       - ${SKILLBOX_MONOSERVER_HOST_ROOT:-..}:${SKILLBOX_MONOSERVER_ROOT:-/monoserver}
     command:
       - bash
@@ -85,6 +87,7 @@ services:
       - .:/workspace
       - ./home/.claude:/home/sandbox/.claude
       - ./home/.codex:/home/sandbox/.codex
+      - ./home/.local:/home/sandbox/.local
       - ${SKILLBOX_MONOSERVER_HOST_ROOT:-..}:${SKILLBOX_MONOSERVER_ROOT:-/monoserver}
     command:
       - bash

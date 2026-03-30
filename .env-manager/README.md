@@ -1,8 +1,8 @@
 Internal runtime manager for `skillbox`.
 
 This is the inside-the-box control surface. It reads `workspace/runtime.yaml`
-and manages the declared runtime graph for repos, installed skills, services,
-logs, and sanity checks that live inside the workspace.
+and manages the declared runtime graph for repos, artifacts, installed skills,
+services, logs, and sanity checks that live inside the workspace.
 
 Useful commands:
 

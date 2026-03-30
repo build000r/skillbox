@@ -30,8 +30,10 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertFalse((repo / "logs" / "web").exists())
             self.assertTrue((repo / "home" / ".claude" / "skills" / "sample-skill" / "SKILL.md").is_file())
             self.assertTrue((repo / "home" / ".codex" / "skills" / "sample-skill" / "SKILL.md").is_file())
+            self.assertTrue((repo / "home" / ".local" / "bin" / "swimmers").is_file())
             self.assertFalse((repo / "home" / ".claude" / "skills" / "personal-skill").exists())
             self.assertTrue((repo / "workspace" / "default-skills.lock.json").is_file())
+            self.assertTrue(any("copy-if-missing:" in action for action in actions))
             self.assertTrue(any("install-skill:" in action for action in actions))
             self.assertTrue(any("write-lockfile:" in action for action in actions))
 
@@ -45,12 +47,14 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads(result.stdout)
             repos = {item["id"]: item for item in payload["repos"]}
+            artifacts = {item["id"]: item for item in payload["artifacts"]}
             skills = {item["id"]: item for item in payload["skills"]}
             self.assertEqual(payload["active_profiles"], ["core"])
             self.assertEqual(payload["active_clients"], [])
             self.assertEqual({client["id"] for client in payload["clients"]}, {"personal", "vibe-coding-client"})
             self.assertEqual(repos["skillbox-self"]["path"], "/workspace")
             self.assertEqual(repos["managed-repos"]["path"], "/workspace/repos")
+            self.assertEqual(artifacts["swimmers-bin"]["path"], "/home/sandbox/.local/bin/swimmers")
             self.assertEqual(skills["default-skills"]["bundle_dir"], "/workspace/default-skills")
             self.assertEqual(
                 skills["default-skills"]["install_targets"][0]["path"],
@@ -66,6 +70,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(before.returncode, 0, before.stderr)
             before_results = json.loads(before.stdout)
             before_warning_codes = {item["code"] for item in before_results if item["status"] == "warn"}
+            self.assertIn("syncable-artifact-paths", before_warning_codes)
             self.assertIn("runtime-log-paths", before_warning_codes)
             self.assertIn("skill-lock-state", before_warning_codes)
             self.assertIn("skill-install-state", before_warning_codes)
@@ -78,6 +83,7 @@ class RuntimeManagerTests(unittest.TestCase):
             after_results = json.loads(after.stdout)
             after_warning_codes = {item["code"] for item in after_results if item["status"] == "warn"}
             after_failure_codes = {item["code"] for item in after_results if item["status"] == "fail"}
+            self.assertNotIn("syncable-artifact-paths", after_warning_codes)
             self.assertNotIn("runtime-log-paths", after_warning_codes)
             self.assertNotIn("skill-lock-state", after_warning_codes)
             self.assertNotIn("skill-install-state", after_warning_codes)
@@ -94,12 +100,15 @@ class RuntimeManagerTests(unittest.TestCase):
             status = self._run(repo, "status", "--format", "json")
             self.assertEqual(status.returncode, 0, status.stderr)
             payload = json.loads(status.stdout)
+            artifact = payload["artifacts"][0]
             skillset = payload["skills"][0]
             skill_entry = skillset["skills"][0]
             target_states = {target["id"]: target["state"] for target in skill_entry["targets"]}
 
             self.assertEqual(payload["active_profiles"], ["core"])
             self.assertEqual(payload["active_clients"], [])
+            self.assertEqual(artifact["id"], "swimmers-bin")
+            self.assertTrue(artifact["present"])
             self.assertTrue(skillset["lock_present"])
             self.assertEqual(skill_entry["name"], "sample-skill")
             self.assertEqual(target_states["claude"], "ok")
@@ -154,17 +163,14 @@ class RuntimeManagerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
             self._write_fixture(repo)
-            (repo / "monoserver-host" / "swimmers").mkdir(parents=True, exist_ok=True)
 
             render = self._run(repo, "render", "--profile", "swimmers", "--format", "json")
 
             self.assertEqual(render.returncode, 0, render.stderr)
             payload = json.loads(render.stdout)
             self.assertEqual(payload["active_profiles"], ["core", "swimmers"])
-            self.assertEqual(
-                {item["id"] for item in payload["repos"]},
-                {"skillbox-self", "managed-repos", "swimmers-repo"},
-            )
+            self.assertEqual({item["id"] for item in payload["repos"]}, {"skillbox-self", "managed-repos"})
+            self.assertEqual({item["id"] for item in payload["artifacts"]}, {"swimmers-bin"})
             self.assertEqual(
                 {item["id"] for item in payload["services"]},
                 {"internal-env-manager", "swimmers-server"},
@@ -285,16 +291,19 @@ class RuntimeManagerTests(unittest.TestCase):
             "        kind: directory\n"
             "      sync:\n"
             "        mode: ensure-directory\n"
-            "    - id: swimmers-repo\n"
-            "      kind: repo\n"
-            "      path: ${SKILLBOX_SWIMMERS_REPO}\n"
-            "      required: true\n"
+            "  artifacts:\n"
+            "    - id: swimmers-bin\n"
+            "      kind: binary\n"
+            "      path: ${SKILLBOX_SWIMMERS_BIN}\n"
+            "      required: false\n"
             "      profiles:\n"
-            "        - swimmers\n"
+            "        - core\n"
             "      source:\n"
-            "        kind: bind\n"
+            "        kind: file\n"
+            "        path: ./artifacts/swimmers.bin\n"
+            "        executable: true\n"
             "      sync:\n"
-            "        mode: external\n"
+            "        mode: copy-if-missing\n"
             "  skills:\n"
             "    - id: default-skills\n"
             "      kind: packaged-skill-set\n"
@@ -346,8 +355,7 @@ class RuntimeManagerTests(unittest.TestCase):
             "      log: web\n"
             "    - id: swimmers-server\n"
             "      kind: tmux-api\n"
-            "      repo: swimmers-repo\n"
-            "      path: ${SKILLBOX_SWIMMERS_REPO}\n"
+            "      artifact: swimmers-bin\n"
             "      required: false\n"
             "      profiles:\n"
             "        - swimmers\n"
@@ -414,12 +422,6 @@ class RuntimeManagerTests(unittest.TestCase):
             "      required: true\n"
             "      profiles:\n"
             "        - core\n"
-            "    - id: swimmers-repo-root\n"
-            "      type: path_exists\n"
-            "      path: ${SKILLBOX_SWIMMERS_REPO}\n"
-            "      required: true\n"
-            "      profiles:\n"
-            "        - swimmers\n"
             "clients:\n"
             "  - id: personal\n"
             "    label: Personal\n"
@@ -507,6 +509,8 @@ class RuntimeManagerTests(unittest.TestCase):
             "          - core\n",
             encoding="utf-8",
         )
+        (repo / "artifacts").mkdir(parents=True, exist_ok=True)
+        (repo / "artifacts" / "swimmers.bin").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
 
         (repo / "workspace" / "default-skills.manifest").write_text("sample-skill\n", encoding="utf-8")
         (repo / "workspace" / "default-skills.sources.yaml").write_text(

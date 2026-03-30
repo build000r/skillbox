@@ -29,17 +29,20 @@ core:
         mode: ensure-directory
       notes: Managed in-repo repos root for local box-only work.
 
-    - id: swimmers-repo
-      kind: repo
-      path: ${SKILLBOX_SWIMMERS_REPO}
-      required: true
+  artifacts:
+    - id: swimmers-bin
+      kind: binary
+      path: ${SKILLBOX_SWIMMERS_BIN}
+      required: false
       profiles:
-        - swimmers
+        - core
       source:
-        kind: bind
+        kind: url
+        url: ${SKILLBOX_SWIMMERS_DOWNLOAD_URL}
+        executable: true
       sync:
-        mode: external
-      notes: Optional sibling swimmers repo used for the workspace-local tmux API.
+        mode: download-if-missing
+      notes: Core swimmers binary, installable from a pinned URL when one is configured.
 
   skills:
     - id: default-skills
@@ -106,8 +109,7 @@ core:
     - id: swimmers-server
       kind: tmux-api
       owner: local
-      repo: swimmers-repo
-      path: ${SKILLBOX_SWIMMERS_REPO}
+      artifact: swimmers-bin
       required: false
       profiles:
         - swimmers
@@ -207,14 +209,6 @@ core:
       profiles:
         - core
       notes: Internal manager entrypoint should exist.
-
-    - id: swimmers-repo-root
-      type: path_exists
-      path: ${SKILLBOX_SWIMMERS_REPO}
-      required: true
-      profiles:
-        - swimmers
-      notes: swimmers overlay expects the sibling swimmers repo to be mounted.
 
 clients:
   - id: personal

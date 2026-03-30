@@ -19,5 +19,6 @@ repos/*
 !repos/.gitkeep
 home/.claude/skills/
 home/.codex/skills/
+home/.local/
 workspace/default-skills.lock.json
 workspace/clients/*/skills.lock.json

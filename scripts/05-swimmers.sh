@@ -166,11 +166,6 @@ inside_main() {
   install_binary() {
     ensure_paths
 
-    if [[ ! -d "${swimmers_repo}" ]]; then
-      printf 'swimmers repo is missing at %s\n' "${swimmers_repo}" >&2
-      return 1
-    fi
-
     if [[ -x "${swimmers_bin}" ]] && binary_works "${swimmers_bin}"; then
       printf 'swimmers already installed at %s\n' "${swimmers_bin}"
       return 0
@@ -189,6 +184,11 @@ inside_main() {
       mv "${tmp_bin}" "${swimmers_bin}"
       printf 'installed swimmers from %s -> %s\n' "${swimmers_download_url}" "${swimmers_bin}"
       return 0
+    fi
+
+    if [[ ! -d "${swimmers_repo}" ]]; then
+      printf 'swimmers repo is missing at %s and no download URL is configured\n' "${swimmers_repo}" >&2
+      return 1
     fi
 
     if command -v cargo >/dev/null 2>&1 && [[ -f "${swimmers_repo}/Cargo.toml" ]]; then
@@ -226,8 +226,12 @@ inside_main() {
     fi
 
     : > "${swimmers_log_file}"
+    local swimmers_run_dir="${workspace_root}"
+    if [[ -d "${swimmers_repo}" ]]; then
+      swimmers_run_dir="${swimmers_repo}"
+    fi
     (
-      cd "${swimmers_repo}"
+      cd "${swimmers_run_dir}"
       nohup env \
         PORT="${swimmers_port}" \
         AUTH_MODE="${swimmers_auth_mode}" \

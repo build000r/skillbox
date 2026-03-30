@@ -219,6 +219,7 @@ def _normalize_runtime_sections(resolved: dict[str, Any]) -> dict[str, Any]:
             "selection": {},
             "clients": [],
             "repos": _normalized_items(resolved.get("repos"), "repos"),
+            "artifacts": _normalized_items(resolved.get("artifacts"), "artifacts"),
             "skills": _normalized_items(resolved.get("skills"), "skills"),
             "services": _normalized_items(resolved.get("services"), "services"),
             "logs": _normalized_items(resolved.get("logs"), "logs"),
@@ -228,6 +229,7 @@ def _normalize_runtime_sections(resolved: dict[str, Any]) -> dict[str, Any]:
     core = _normalized_mapping(resolved.get("core"), "core")
     selection = _normalized_mapping(resolved.get("selection"), "selection")
     repos = _normalized_items(core.get("repos"), "core.repos")
+    artifacts = _normalized_items(core.get("artifacts"), "core.artifacts")
     skills = _normalized_items(core.get("skills"), "core.skills")
     services = _normalized_items(core.get("services"), "core.services")
     logs = _normalized_items(core.get("logs"), "core.logs")
@@ -253,6 +255,12 @@ def _normalize_runtime_sections(resolved: dict[str, Any]) -> dict[str, Any]:
             )
         )
         repos.extend(_attach_client_scope(_normalized_items(client.get("repos"), f"clients[{client_id}].repos"), client_id))
+        artifacts.extend(
+            _attach_client_scope(
+                _normalized_items(client.get("artifacts"), f"clients[{client_id}].artifacts"),
+                client_id,
+            )
+        )
         skills.extend(
             _attach_client_scope(_normalized_items(client.get("skills"), f"clients[{client_id}].skills"), client_id)
         )
@@ -271,6 +279,7 @@ def _normalize_runtime_sections(resolved: dict[str, Any]) -> dict[str, Any]:
         "selection": selection,
         "clients": clients_meta,
         "repos": repos,
+        "artifacts": artifacts,
         "skills": skills,
         "services": services,
         "logs": logs,
@@ -293,6 +302,7 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
         "selection": normalized["selection"],
         "clients": normalized["clients"],
         "repos": normalized["repos"],
+        "artifacts": normalized["artifacts"],
         "skills": normalized["skills"],
         "services": normalized["services"],
         "logs": normalized["logs"],
@@ -308,6 +318,22 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
         repo.setdefault("source", {})
         if repo.get("path"):
             repo["host_path"] = str(runtime_path_to_host_path(root_dir, model["env"], str(repo["path"])))
+
+    for artifact in model["artifacts"]:
+        artifact.setdefault("kind", "artifact")
+        artifact.setdefault("required", False)
+        artifact.setdefault("profiles", [])
+        artifact.setdefault("client", "")
+        artifact.setdefault("sync", {})
+        artifact.setdefault("source", {})
+        if artifact.get("path"):
+            artifact["host_path"] = str(
+                runtime_path_to_host_path(root_dir, model["env"], str(artifact["path"]))
+            )
+        source = artifact.get("source") or {}
+        if source.get("kind") == "file" and source.get("path"):
+            source["host_path"] = str(host_path_to_absolute_path(root_dir, str(source["path"])))
+            artifact["source"] = source
 
     for skill in model["skills"]:
         skill.setdefault("kind", "packaged-skill-set")

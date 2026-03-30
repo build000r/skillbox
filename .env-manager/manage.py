@@ -29,6 +29,8 @@ from lib.runtime_model import build_runtime_model  # noqa: E402
 
 VALID_REPO_SOURCE_KINDS = {"bind", "directory", "git", "manual"}
 VALID_SYNC_MODES = {"external", "ensure-directory", "clone-if-missing", "manual"}
+VALID_ARTIFACT_SOURCE_KINDS = {"file", "manual", "url"}
+VALID_ARTIFACT_SYNC_MODES = {"copy-if-missing", "download-if-missing", "manual"}
 VALID_SKILL_SYNC_MODES = {"unpack-bundles"}
 VALID_HEALTHCHECK_TYPES = {"http", "path_exists"}
 VALID_CHECK_TYPES = {"path_exists"}
@@ -134,6 +136,11 @@ def filter_model(model: dict[str, Any], active_profiles: set[str], active_client
         for repo in model["repos"]
         if item_matches_profiles(repo, active_profiles) and item_matches_clients(repo, active_clients)
     ]
+    filtered_model["artifacts"] = [
+        copy.deepcopy(artifact)
+        for artifact in model["artifacts"]
+        if item_matches_profiles(artifact, active_profiles) and item_matches_clients(artifact, active_clients)
+    ]
     filtered_model["skills"] = [
         copy.deepcopy(skillset)
         for skillset in model["skills"]
@@ -156,12 +163,18 @@ def filter_model(model: dict[str, Any], active_profiles: set[str], active_client
     ]
 
     included_repo_ids = {repo["id"] for repo in filtered_model["repos"]}
+    included_artifact_ids = {artifact["id"] for artifact in filtered_model["artifacts"]}
     included_log_ids = {log_item["id"] for log_item in filtered_model["logs"]}
 
     required_repo_ids = {
         str(service["repo"])
         for service in filtered_model["services"]
         if service.get("repo")
+    }
+    required_artifact_ids = {
+        str(service["artifact"])
+        for service in filtered_model["services"]
+        if service.get("artifact")
     }
     required_log_ids = {
         str(service["log"])
@@ -174,6 +187,12 @@ def filter_model(model: dict[str, Any], active_profiles: set[str], active_client
         if repo_id and repo_id in required_repo_ids and repo_id not in included_repo_ids:
             filtered_model["repos"].append(copy.deepcopy(repo))
             included_repo_ids.add(repo_id)
+
+    for artifact in model["artifacts"]:
+        artifact_id = str(artifact.get("id", "")).strip()
+        if artifact_id and artifact_id in required_artifact_ids and artifact_id not in included_artifact_ids:
+            filtered_model["artifacts"].append(copy.deepcopy(artifact))
+            included_artifact_ids.add(artifact_id)
 
     for log_item in model["logs"]:
         log_id = str(log_item.get("id", "")).strip()
@@ -201,6 +220,16 @@ def ensure_directory(path: Path, dry_run: bool) -> None:
     if dry_run:
         return
     path.mkdir(parents=True, exist_ok=True)
+
+
+def artifact_source_configured(artifact: dict[str, Any]) -> bool:
+    source = artifact.get("source") or {}
+    source_kind = source.get("kind", "manual")
+    if source_kind == "url":
+        return bool(str(source.get("url") or "").strip())
+    if source_kind == "file":
+        return bool(str(source.get("host_path") or source.get("path") or "").strip())
+    return False
 
 
 def remove_path(path: Path) -> None:
@@ -842,7 +871,7 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
     if default_client and default_client not in declared_client_ids:
         issues.append(f"selection.default_client references unknown client {default_client!r}")
 
-    for section in ("repos", "skills", "services", "logs", "checks"):
+    for section in ("repos", "artifacts", "skills", "services", "logs", "checks"):
         duplicates = find_duplicates(model[section], "id")
         if duplicates:
             issues.append(f"{section} contain duplicate ids: {', '.join(duplicates)}")
@@ -855,7 +884,12 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
     if duplicate_log_paths:
         issues.append(f"logs contain duplicate paths: {', '.join(duplicate_log_paths)}")
 
+    duplicate_artifact_paths = find_duplicates(model["artifacts"], "path")
+    if duplicate_artifact_paths:
+        issues.append(f"artifacts contain duplicate paths: {', '.join(duplicate_artifact_paths)}")
+
     repo_ids = {repo.get("id") for repo in model["repos"]}
+    artifact_ids = {artifact.get("id") for artifact in model["artifacts"]}
     log_ids = {log_item.get("id") for log_item in model["logs"]}
 
     for repo in model["repos"]:
@@ -879,6 +913,26 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
             issues.append(f"repo {repo.get('id')} has unsupported sync.mode {sync_mode!r}")
         if source_kind == "git" and not source.get("url"):
             issues.append(f"repo {repo.get('id')} is git-backed but missing source.url")
+
+    for artifact in model["artifacts"]:
+        if not artifact.get("id"):
+            issues.append("every artifact entry must have an id")
+        if not artifact.get("path"):
+            issues.append(f"artifact {artifact.get('id', '(missing id)')} is missing path")
+        if artifact.get("client") and artifact["client"] not in declared_client_ids:
+            issues.append(f"artifact {artifact.get('id')} references unknown client {artifact['client']!r}")
+
+        source = artifact.get("source") or {}
+        source_kind = source.get("kind", "manual")
+        if source_kind not in VALID_ARTIFACT_SOURCE_KINDS:
+            issues.append(f"artifact {artifact.get('id')} has unsupported source.kind {source_kind!r}")
+
+        sync = artifact.get("sync") or {}
+        sync_mode = sync.get("mode") or (
+            "download-if-missing" if source_kind == "url" else "copy-if-missing" if source_kind == "file" else "manual"
+        )
+        if sync_mode not in VALID_ARTIFACT_SYNC_MODES:
+            issues.append(f"artifact {artifact.get('id')} has unsupported sync.mode {sync_mode!r}")
 
     for skillset in model["skills"]:
         if not skillset.get("id"):
@@ -916,6 +970,8 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
             issues.append(f"service {service.get('id')} references unknown client {service['client']!r}")
         if service.get("repo") and service["repo"] not in repo_ids:
             issues.append(f"service {service.get('id')} references unknown repo {service['repo']!r}")
+        if service.get("artifact") and service["artifact"] not in artifact_ids:
+            issues.append(f"service {service.get('id')} references unknown artifact {service['artifact']!r}")
         if service.get("log") and service["log"] not in log_ids:
             issues.append(f"service {service.get('id')} references unknown log {service['log']!r}")
 
@@ -965,6 +1021,7 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
             message="runtime manifest definitions are internally consistent",
             details={
                 "repos": len(model["repos"]),
+                "artifacts": len(model["artifacts"]),
                 "skills": len(model["skills"]),
                 "services": len(model["services"]),
                 "logs": len(model["logs"]),
@@ -978,6 +1035,8 @@ def check_filesystem(model: dict[str, Any], root_dir: Path) -> list[CheckResult]
     results: list[CheckResult] = []
     missing_syncable_repo_paths: list[str] = []
     missing_required_repo_paths: list[str] = []
+    missing_syncable_artifact_paths: list[str] = []
+    missing_required_artifact_paths: list[str] = []
     missing_log_paths: list[str] = []
     missing_required_checks: list[str] = []
 
@@ -997,6 +1056,27 @@ def check_filesystem(model: dict[str, Any], root_dir: Path) -> list[CheckResult]
             missing_syncable_repo_paths.append(repo_rel(root_dir, path))
         elif repo.get("required"):
             missing_required_repo_paths.append(repo_rel(root_dir, path))
+
+    for artifact in model["artifacts"]:
+        path = Path(str(artifact["host_path"]))
+        if path.exists():
+            continue
+
+        source = artifact.get("source") or {}
+        source_kind = source.get("kind", "manual")
+        sync = artifact.get("sync") or {}
+        sync_mode = sync.get("mode") or (
+            "download-if-missing" if source_kind == "url" else "copy-if-missing" if source_kind == "file" else "manual"
+        )
+
+        if (
+            sync_mode in {"copy-if-missing", "download-if-missing"}
+            and source_kind in {"file", "url"}
+            and artifact_source_configured(artifact)
+        ):
+            missing_syncable_artifact_paths.append(repo_rel(root_dir, path))
+        elif artifact.get("required"):
+            missing_required_artifact_paths.append(repo_rel(root_dir, path))
 
     for log_item in model["logs"]:
         path = Path(str(log_item["host_path"]))
@@ -1046,6 +1126,42 @@ def check_filesystem(model: dict[str, Any], root_dir: Path) -> list[CheckResult]
             )
         )
 
+    if missing_required_artifact_paths:
+        results.append(
+            CheckResult(
+                status="fail",
+                code="required-runtime-artifacts",
+                message="required runtime artifact paths are missing",
+                details={"missing": missing_required_artifact_paths},
+            )
+        )
+    else:
+        results.append(
+            CheckResult(
+                status="pass",
+                code="required-runtime-artifacts",
+                message="required runtime artifact paths are present",
+            )
+        )
+
+    if missing_syncable_artifact_paths:
+        results.append(
+            CheckResult(
+                status="warn",
+                code="syncable-artifact-paths",
+                message="managed artifact paths are missing but can be created by sync",
+                details={"missing": missing_syncable_artifact_paths},
+            )
+        )
+    else:
+        results.append(
+            CheckResult(
+                status="pass",
+                code="syncable-artifact-paths",
+                message="managed artifact paths do not need sync",
+            )
+        )
+
     if missing_log_paths:
         results.append(
             CheckResult(
@@ -1092,6 +1208,54 @@ def doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
     return results + check_filesystem(model, root_dir) + validate_skill_locks_and_state(model)
 
 
+def sync_artifact(artifact: dict[str, Any], dry_run: bool) -> list[str]:
+    actions: list[str] = []
+    path = Path(str(artifact["host_path"]))
+    source = artifact.get("source") or {}
+    source_kind = source.get("kind", "manual")
+    sync = artifact.get("sync") or {}
+    sync_mode = sync.get("mode") or (
+        "download-if-missing" if source_kind == "url" else "copy-if-missing" if source_kind == "file" else "manual"
+    )
+
+    if path.exists():
+        return [f"exists: {path}"]
+
+    if sync_mode == "download-if-missing" and source_kind == "url":
+        url = str(source.get("url") or "").strip()
+        if not url:
+            return [f"skip: {path} (artifact source url missing)"]
+        ensure_directory(path.parent, dry_run)
+        if dry_run:
+            return [f"download-if-missing: {url} -> {path}"]
+
+        with urllib.request.urlopen(url) as response:
+            payload = response.read()
+        tmp_path = path.parent / f".{path.name}.tmp"
+        tmp_path.write_bytes(payload)
+        if source.get("executable", False):
+            tmp_path.chmod(0o755)
+        tmp_path.replace(path)
+        return [f"download-if-missing: {url} -> {path}"]
+
+    if sync_mode == "copy-if-missing" and source_kind == "file":
+        raw_source_path = str(source.get("host_path") or source.get("path") or "").strip()
+        if not raw_source_path:
+            return [f"skip: {path} (artifact source path missing)"]
+        source_path = Path(raw_source_path)
+        ensure_directory(path.parent, dry_run)
+        if dry_run:
+            return [f"copy-if-missing: {source_path} -> {path}"]
+        if not source_path.is_file():
+            raise RuntimeError(f"artifact source file is missing: {source_path}")
+        shutil.copyfile(source_path, path)
+        if source.get("executable", False):
+            path.chmod(0o755)
+        return [f"copy-if-missing: {source_path} -> {path}"]
+
+    return [f"skip: {path} (sync mode {sync_mode})"]
+
+
 def sync_runtime(model: dict[str, Any], dry_run: bool) -> list[str]:
     actions: list[str] = []
 
@@ -1133,6 +1297,9 @@ def sync_runtime(model: dict[str, Any], dry_run: bool) -> list[str]:
             continue
 
         actions.append(f"skip: {path} (sync mode {sync_mode})")
+
+    for artifact in model["artifacts"]:
+        actions.extend(sync_artifact(artifact, dry_run=dry_run))
 
     for log_item in model["logs"]:
         path = Path(str(log_item["host_path"]))
@@ -1226,6 +1393,21 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
             item.update(git_repo_state(path))
         repo_statuses.append(item)
 
+    artifact_statuses: list[dict[str, Any]] = []
+    for artifact in model["artifacts"]:
+        path = Path(str(artifact["host_path"]))
+        source = artifact.get("source") or {}
+        item = {
+            "id": artifact["id"],
+            "kind": artifact.get("kind", "artifact"),
+            "path": str(artifact["path"]),
+            "host_path": str(path),
+            "present": path.exists(),
+            "profiles": artifact.get("profiles") or [],
+            "source_kind": source.get("kind", "manual"),
+        }
+        artifact_statuses.append(item)
+
     skill_statuses: list[dict[str, Any]] = []
     for skillset in model["skills"]:
         inventory = collect_skill_inventory(skillset)
@@ -1285,6 +1467,7 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
         "default_client": (model.get("selection") or {}).get("default_client"),
         "active_profiles": model.get("active_profiles") or [],
         "repos": repo_statuses,
+        "artifacts": artifact_statuses,
         "skills": skill_statuses,
         "services": service_statuses,
         "logs": log_statuses,
@@ -1307,6 +1490,9 @@ def print_render_text(model: dict[str, Any]) -> None:
     print(f"repos: {len(model['repos'])}")
     for repo in model["repos"]:
         print(f"  - {repo['id']}: {repo.get('kind', 'repo')} @ {repo['path']}")
+    print(f"artifacts: {len(model['artifacts'])}")
+    for artifact in model["artifacts"]:
+        print(f"  - {artifact['id']}: {artifact.get('kind', 'artifact')} @ {artifact['path']}")
     print(f"skills: {len(model['skills'])}")
     for skillset in model["skills"]:
         print(f"  - {skillset['id']}: {skillset.get('kind', 'packaged-skill-set')} @ {skillset['bundle_dir']}")
@@ -1375,6 +1561,11 @@ def print_status_text(status_payload: dict[str, Any]) -> None:
                 f"{repo.get('dirty', 0)} dirty, {repo.get('untracked', 0)} untracked"
             )
         print(f"  - {repo['id']}: {summary}")
+
+    print("artifacts:")
+    for artifact in status_payload["artifacts"]:
+        state = "present" if artifact["present"] else "missing"
+        print(f"  - {artifact['id']}: {state} ({artifact.get('source_kind', 'manual')})")
 
     print("skills:")
     for skillset in status_payload["skills"]:
@@ -1448,7 +1639,7 @@ def main() -> int:
 
     sync_parser = subparsers.add_parser(
         "sync",
-        help="Create managed runtime directories, repos, and installed skill state.",
+        help="Create managed runtime directories, repos, artifacts, and installed skill state.",
     )
     sync_parser.add_argument("--dry-run", action="store_true")
     sync_parser.add_argument("--format", choices=("text", "json"), default="text")
@@ -1465,7 +1656,7 @@ def main() -> int:
 
     status_parser = subparsers.add_parser(
         "status",
-        help="Summarize repo, skill, service, log, and check state.",
+        help="Summarize repo, artifact, skill, service, log, and check state.",
     )
     status_parser.add_argument("--format", choices=("text", "json"), default="text")
     add_profile_arg(status_parser)

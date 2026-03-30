@@ -36,7 +36,7 @@ right client context without standing up a full hosted workspace control plane.
 - mount the host parent directory at `/monoserver` for client repo roots
 - optionally run a workspace-local `swimmers` API against the same tmux namespace as the agents
 - keep one stable core machine and layer client-specific overlays on top
-- declare the inside of the box with a runtime graph for repos, installed skills, services, logs, and checks
+- declare the inside of the box with a runtime graph for repos, artifacts, installed skills, services, logs, and checks
 - pin and package default skills locally
 - validate outer drift with `make doctor` and inner drift with `make dev-sanity`
 
@@ -46,7 +46,7 @@ right client context without standing up a full hosted workspace control plane.
 |---|---|
 | Private access without public SSH exposure | Tailscale host access plus host hardening scripts |
 | A workspace that feels like a narrowed local setup | One bind-mounted `/workspace`, plus `/monoserver` for sibling repo roots and client overlays |
-| A sane way to let the box grow over time | `workspace/runtime.yaml` plus `.env-manager/manage.py` manage the core machine plus client-specific repos, installed skills, logs, and checks |
+| A sane way to let the box grow over time | `workspace/runtime.yaml` plus `.env-manager/manage.py` manage the core machine plus client-specific repos, artifacts, installed skills, logs, and checks |
 | Reproducible default skills | `03-skill-sync.sh` packages from a pinned manifest and vendored local packager |
 | Confidence that docs/config/runtime still match | `04-reconcile.py` powers `make render` and `make doctor`, while `make dev-sanity` validates the box internals |
 | Minimal surface area | No multi-tenant control plane, no hosted dependency, no hidden sibling repo requirement for packaging |
@@ -99,8 +99,9 @@ What this overlay does:
 
 - starts the `workspace` container with `docker-compose.swimmers.yml`
 - keeps the API inside the same container and tmux namespace as the agents
-- treats `../swimmers` as the mounted sibling repo at `/monoserver/swimmers`
 - installs a runnable binary at `/home/sandbox/.local/bin/swimmers`
+- can hydrate that binary from `SKILLBOX_SWIMMERS_DOWNLOAD_URL` without a sibling repo checkout
+- still supports source-building from the optional `/monoserver/swimmers` checkout when you have it
 - records process state and logs under `logs/swimmers/`
 
 Safety model:
@@ -139,7 +140,7 @@ SSH lands on the host. Docker Compose runs the workspace and optional surfaces. 
 
 ### 3. Declarative enough to check, not so abstract it disappears
 
-`workspace/sandbox.yaml`, `workspace/dependencies.yaml`, `workspace/runtime.yaml`, and the skill manifests describe the intended box. `make doctor` checks the outer shell, and `make dev-sanity` checks the interior graph plus managed skill install state.
+`workspace/sandbox.yaml`, `workspace/dependencies.yaml`, `workspace/runtime.yaml`, and the skill manifests describe the intended box. `make doctor` checks the outer shell, and `make dev-sanity` checks the interior graph plus managed artifact and skill install state.
 
 ### 4. Portable skill packaging matters
 
@@ -151,7 +152,7 @@ The repo includes enough surfaces to inspect and validate the shape, but not so 
 
 ### 6. The box should describe its internals, not just its container
 
-The new internal `.env-manager` layer is intentionally small. It does not try to become a second platform; it gives the box one declared source of truth for repos, installed skills, services, logs, and sanity checks so the workspace can accrete without turning into guesswork.
+The new internal `.env-manager` layer is intentionally small. It does not try to become a second platform; it gives the box one declared source of truth for repos, artifacts, installed skills, services, logs, and sanity checks so the workspace can accrete without turning into guesswork.
 
 ## Comparison
 
@@ -284,9 +285,9 @@ make runtime-sync
 | `scripts/04-reconcile.py doctor` | Run drift and readiness checks | `python3 scripts/04-reconcile.py doctor` |
 | `scripts/05-swimmers.sh` | Manage the workspace-local swimmers install and process lifecycle | `./scripts/05-swimmers.sh status` |
 | `.env-manager/manage.py render` | Print the resolved internal runtime graph | `python3 .env-manager/manage.py render --format json` |
-| `.env-manager/manage.py sync` | Create managed repo/log directories and install declared skills for the selected core/client scope | `python3 .env-manager/manage.py sync --client personal --dry-run` |
+| `.env-manager/manage.py sync` | Create managed repo/artifact/log directories and install declared skills for the selected core/client scope | `python3 .env-manager/manage.py sync --client personal --dry-run` |
 | `.env-manager/manage.py doctor` | Validate the internal repos/skills/logs/check graph for the selected core/client scope | `python3 .env-manager/manage.py doctor --client personal` |
-| `.env-manager/manage.py status` | Summarize repo, skill, service, log, and health state for the selected core/client scope | `python3 .env-manager/manage.py status --client personal` |
+| `.env-manager/manage.py status` | Summarize repo, artifact, skill, service, log, and health state for the selected core/client scope | `python3 .env-manager/manage.py status --client personal` |
 
 ## Configuration
 
@@ -315,6 +316,10 @@ SKILLBOX_SWIMMERS_AUTH_MODE=
 SKILLBOX_SWIMMERS_AUTH_TOKEN=
 SKILLBOX_SWIMMERS_OBSERVER_TOKEN=
 ```
+
+`SKILLBOX_SWIMMERS_REPO` is now an optional source checkout path. If you set
+`SKILLBOX_SWIMMERS_DOWNLOAD_URL`, `make runtime-sync` or `make swimmers-install`
+can hydrate the binary without needing `/monoserver/swimmers`.
 
 ### Default skill sources
 
@@ -506,7 +511,7 @@ exist all the time.
        +----------------------------------+
        | managed box internals            |
        |----------------------------------|
-       | repos, installed skills, checks  |
+       | repos, artifacts, skills, checks |
        | api/web stub health probes       |
        | default skill bundles + lockfiles |
        +----------------------------------+
@@ -608,7 +613,7 @@ So the box shape stays reproducible. You can replace the placeholder contents wi
 
 ### Why is there both `workspace/dependencies.yaml` and `workspace/runtime.yaml`?
 
-`workspace/dependencies.yaml` describes the runtime categories the box exposes. `workspace/runtime.yaml` declares the interior graph the new internal manager actually operates on: repos, installed skills, services, logs, and checks.
+`workspace/dependencies.yaml` describes the runtime categories the box exposes. `workspace/runtime.yaml` declares the interior graph the new internal manager actually operates on: repos, artifacts, installed skills, services, logs, and checks.
 
 ### Why ship a vendored skill packager?
 
