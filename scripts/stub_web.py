@@ -58,7 +58,7 @@ class Handler(BaseHTTPRequestHandler):
   <body>
     <main>
       <h1>skillbox</h1>
-      <p>Thin Tailnet Docker starter: host-level SSH over Tailscale, one workspace container, optional stub surfaces.</p>
+      <p>Thin Tailnet Docker monoserver: host-level SSH over Tailscale, one workspace container, client overlays, optional stub surfaces.</p>
       <div class="card">
         <strong>API</strong>
         <p><a href="http://127.0.0.1:{API_PORT}/health">/health</a></p>
@@ -70,6 +70,7 @@ class Handler(BaseHTTPRequestHandler):
       <div class="card">
         <strong>Workspace shape</strong>
         <p>Repos live in <code>{html.escape(str(REPOS_ROOT.relative_to(ROOT)))}</code>.</p>
+        <p>Sibling host roots are exposed inside the box at <code>/monoserver</code>.</p>
         <p>Local shipped skills live in <code>{html.escape(str(SKILLS_ROOT.relative_to(ROOT)))}</code>.</p>
         <p>Mounted config homes live under <code>home/.claude</code> and <code>home/.codex</code>.</p>
       </div>

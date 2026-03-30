@@ -32,7 +32,10 @@ def runtime_summary() -> dict:
     model = build_runtime_model(ROOT)
     return {
         "manifest": model["manifest_file"],
+        "clients": model.get("clients") or [],
+        "selection": model.get("selection") or {},
         "repos": model["repos"],
+        "skills": model["skills"],
         "services": model["services"],
         "logs": model["logs"],
         "checks": model["checks"],
@@ -94,6 +97,8 @@ class Handler(BaseHTTPRequestHandler):
                     "skills": list_directories(SKILLS_ROOT),
                     "runtime_manager": {
                         "manifest": runtime["manifest"],
+                        "client_count": len(runtime["clients"]),
+                        "skillset_count": len(runtime["skills"]),
                         "service_count": len(runtime["services"]),
                         "log_count": len(runtime["logs"]),
                     },

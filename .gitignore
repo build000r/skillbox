@@ -20,3 +20,4 @@ repos/*
 home/.claude/skills/
 home/.codex/skills/
 workspace/default-skills.lock.json
+workspace/clients/*/skills.lock.json

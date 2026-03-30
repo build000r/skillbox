@@ -19,6 +19,7 @@ sandbox:
     log_root: /workspace/logs
     claude_root: /home/sandbox/.claude
     codex_root: /home/sandbox/.codex
+    monoserver_root: /monoserver
   entrypoints:
     - ssh
     - manual

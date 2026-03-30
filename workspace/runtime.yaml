@@ -1,163 +1,275 @@
-version: 1
+version: 2
 
-repos:
-  - id: skillbox-self
-    kind: repo
-    path: ${SKILLBOX_WORKSPACE_ROOT}
-    required: true
-    profiles:
-      - core
-    source:
-      kind: bind
-      path: ${ROOT_DIR}
-    sync:
-      mode: external
-    notes: The bind-mounted skillbox repo itself.
+selection: {}
 
-  - id: managed-repos
-    kind: workspace-root
-    path: ${SKILLBOX_REPOS_ROOT}
-    required: true
-    profiles:
-      - core
-    source:
-      kind: directory
-    sync:
-      mode: ensure-directory
-    notes: Parent directory for repos cloned or mounted into the box.
+core:
+  repos:
+    - id: skillbox-self
+      kind: repo
+      path: ${SKILLBOX_WORKSPACE_ROOT}
+      required: true
+      profiles:
+        - core
+      source:
+        kind: bind
+        path: ${ROOT_DIR}
+      sync:
+        mode: external
+      notes: The bind-mounted skillbox repo itself.
 
-skills:
-  - id: default-skills
-    kind: packaged-skill-set
-    required: true
-    profiles:
-      - core
-    bundle_dir: ${SKILLBOX_WORKSPACE_ROOT}/default-skills
-    manifest: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.manifest
-    sources_config: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.sources.yaml
-    lock_path: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.lock.json
-    sync:
-      mode: unpack-bundles
-    install_targets:
-      - id: claude
-        path: ${SKILLBOX_HOME_ROOT}/.claude/skills
-      - id: codex
-        path: ${SKILLBOX_HOME_ROOT}/.codex/skills
-    notes: Install packaged default skill bundles into the managed Claude and Codex homes.
+    - id: managed-repos
+      kind: workspace-root
+      path: ${SKILLBOX_REPOS_ROOT}
+      required: true
+      profiles:
+        - core
+      source:
+        kind: directory
+      sync:
+        mode: ensure-directory
+      notes: Managed in-repo repos root for local box-only work.
 
-services:
-  - id: internal-env-manager
-    kind: orchestration
-    owner: local
-    repo: skillbox-self
-    path: ${SKILLBOX_WORKSPACE_ROOT}/.env-manager
-    required: true
-    profiles:
-      - core
-    command: python3 .env-manager/manage.py
-    log: runtime
-    notes: Internal control surface for repos, logs, and dev-sanity.
+  skills:
+    - id: default-skills
+      kind: packaged-skill-set
+      required: true
+      profiles:
+        - core
+      bundle_dir: ${SKILLBOX_WORKSPACE_ROOT}/default-skills
+      manifest: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.manifest
+      sources_config: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.sources.yaml
+      lock_path: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.lock.json
+      sync:
+        mode: unpack-bundles
+      install_targets:
+        - id: claude
+          path: ${SKILLBOX_HOME_ROOT}/.claude/skills
+        - id: codex
+          path: ${SKILLBOX_HOME_ROOT}/.codex/skills
+      notes: Install packaged default skill bundles into the managed Claude and Codex homes.
 
-  - id: api-stub
-    kind: http
-    owner: local
-    repo: skillbox-self
-    required: false
-    profiles:
-      - surfaces
-    command: python3 scripts/stub_api.py
-    healthcheck:
-      type: http
-      url: http://127.0.0.1:${SKILLBOX_API_PORT}/health
-      timeout_seconds: 0.5
-    log: api
-    notes: Optional sandbox inspection surface.
+  services:
+    - id: internal-env-manager
+      kind: orchestration
+      owner: local
+      repo: skillbox-self
+      path: ${SKILLBOX_WORKSPACE_ROOT}/.env-manager
+      required: true
+      profiles:
+        - core
+      command: python3 .env-manager/manage.py
+      log: runtime
+      notes: Internal control surface for repos, logs, and dev-sanity.
 
-  - id: web-stub
-    kind: http
-    owner: local
-    repo: skillbox-self
-    required: false
-    profiles:
-      - surfaces
-    command: python3 scripts/stub_web.py
-    healthcheck:
-      type: http
-      url: http://127.0.0.1:${SKILLBOX_WEB_PORT}/
-      timeout_seconds: 0.5
-    log: web
-    notes: Optional browser surface for sandbox inspection.
+    - id: api-stub
+      kind: http
+      owner: local
+      repo: skillbox-self
+      required: false
+      profiles:
+        - surfaces
+      command: python3 scripts/stub_api.py
+      healthcheck:
+        type: http
+        url: http://127.0.0.1:${SKILLBOX_API_PORT}/health
+        timeout_seconds: 0.5
+      log: api
+      notes: Optional sandbox inspection surface.
 
-logs:
-  - id: runtime
-    path: ${SKILLBOX_LOG_ROOT}/runtime
-    required: false
-    profiles:
-      - core
-    retention_days: 14
-    notes: Internal manager and reconciliation logs.
+    - id: web-stub
+      kind: http
+      owner: local
+      repo: skillbox-self
+      required: false
+      profiles:
+        - surfaces
+      command: python3 scripts/stub_web.py
+      healthcheck:
+        type: http
+        url: http://127.0.0.1:${SKILLBOX_WEB_PORT}/
+        timeout_seconds: 0.5
+      log: web
+      notes: Optional browser surface for sandbox inspection.
 
-  - id: repos
-    path: ${SKILLBOX_LOG_ROOT}/repos
-    required: false
-    profiles:
-      - core
-    retention_days: 14
-    notes: Repo-local launch and health logs.
+  logs:
+    - id: runtime
+      path: ${SKILLBOX_LOG_ROOT}/runtime
+      required: false
+      profiles:
+        - core
+      retention_days: 14
+      notes: Internal manager and reconciliation logs.
 
-  - id: api
-    path: ${SKILLBOX_LOG_ROOT}/api
-    required: false
-    profiles:
-      - surfaces
-    retention_days: 7
-    notes: API surface logs.
+    - id: repos
+      path: ${SKILLBOX_LOG_ROOT}/repos
+      required: false
+      profiles:
+        - core
+      retention_days: 14
+      notes: Repo-local launch and health logs.
 
-  - id: web
-    path: ${SKILLBOX_LOG_ROOT}/web
-    required: false
-    profiles:
-      - surfaces
-    retention_days: 7
-    notes: Web surface logs.
+    - id: api
+      path: ${SKILLBOX_LOG_ROOT}/api
+      required: false
+      profiles:
+        - surfaces
+      retention_days: 7
+      notes: API surface logs.
 
-checks:
-  - id: workspace-root
-    type: path_exists
-    path: ${SKILLBOX_WORKSPACE_ROOT}
-    required: true
-    profiles:
-      - core
-    notes: The workspace must be mounted.
+    - id: web
+      path: ${SKILLBOX_LOG_ROOT}/web
+      required: false
+      profiles:
+        - surfaces
+      retention_days: 7
+      notes: Web surface logs.
 
-  - id: repos-root
-    type: path_exists
-    path: ${SKILLBOX_REPOS_ROOT}
-    required: true
-    profiles:
-      - core
-    notes: Managed repos root should exist.
+  checks:
+    - id: workspace-root
+      type: path_exists
+      path: ${SKILLBOX_WORKSPACE_ROOT}
+      required: true
+      profiles:
+        - core
+      notes: The workspace must be mounted.
 
-  - id: skills-root
-    type: path_exists
-    path: ${SKILLBOX_SKILLS_ROOT}
-    required: true
-    profiles:
-      - core
-    notes: Local skills root should exist.
+    - id: repos-root
+      type: path_exists
+      path: ${SKILLBOX_REPOS_ROOT}
+      required: true
+      profiles:
+        - core
+      notes: Managed repos root should exist.
 
-  - id: log-root
-    type: path_exists
-    path: ${SKILLBOX_LOG_ROOT}
-    required: true
-    profiles:
-      - core
-    notes: Top-level log root should exist.
+    - id: skills-root
+      type: path_exists
+      path: ${SKILLBOX_SKILLS_ROOT}
+      required: true
+      profiles:
+        - core
+      notes: Local skills root should exist.
 
-  - id: runtime-manager
-    type: path_exists
-    path: ${SKILLBOX_WORKSPACE_ROOT}/.env-manager/manage.py
-    required: true
-    profiles:
-      - core
-    notes: Internal manager entrypoint should exist.
+    - id: log-root
+      type: path_exists
+      path: ${SKILLBOX_LOG_ROOT}
+      required: true
+      profiles:
+        - core
+      notes: Top-level log root should exist.
+
+    - id: monoserver-root
+      type: path_exists
+      path: ${SKILLBOX_MONOSERVER_ROOT}
+      required: true
+      profiles:
+        - core
+      notes: Shared parent mount exposing sibling repos from the host.
+
+    - id: runtime-manager
+      type: path_exists
+      path: ${SKILLBOX_WORKSPACE_ROOT}/.env-manager/manage.py
+      required: true
+      profiles:
+        - core
+      notes: Internal manager entrypoint should exist.
+
+clients:
+  - id: personal
+    label: Personal
+    default_cwd: ${SKILLBOX_MONOSERVER_ROOT}
+    repo_roots:
+      - id: personal-root
+        kind: repo-root
+        path: ${SKILLBOX_MONOSERVER_ROOT}
+        required: true
+        profiles:
+          - core
+        source:
+          kind: bind
+        sync:
+          mode: external
+        notes: Shared personal monoserver root. In this repo that usually maps to the parent directory.
+    skills:
+      - id: personal-skills
+        kind: packaged-skill-set
+        required: false
+        profiles:
+          - core
+        bundle_dir: ${SKILLBOX_WORKSPACE_ROOT}/default-skills/clients/personal
+        manifest: ${SKILLBOX_WORKSPACE_ROOT}/workspace/clients/personal/skills.manifest
+        sources_config: ${SKILLBOX_WORKSPACE_ROOT}/workspace/clients/personal/skills.sources.yaml
+        lock_path: ${SKILLBOX_WORKSPACE_ROOT}/workspace/clients/personal/skills.lock.json
+        sync:
+          mode: unpack-bundles
+        install_targets:
+          - id: claude
+            path: ${SKILLBOX_HOME_ROOT}/.claude/skills
+          - id: codex
+            path: ${SKILLBOX_HOME_ROOT}/.codex/skills
+        notes: Curated personal skills layered on top of the shared defaults.
+    logs:
+      - id: personal
+        path: ${SKILLBOX_LOG_ROOT}/clients/personal
+        required: false
+        profiles:
+          - core
+        retention_days: 14
+        notes: Client-scoped logs for the personal overlay.
+    checks:
+      - id: personal-root
+        type: path_exists
+        path: ${SKILLBOX_MONOSERVER_ROOT}
+        required: true
+        profiles:
+          - core
+        notes: Personal overlay expects the shared monoserver root to be mounted.
+
+  - id: vibe-coding-client
+    label: Vibe Coding Client
+    default_cwd: ${SKILLBOX_MONOSERVER_ROOT}/vibe-coding-client
+    repo_roots:
+      - id: vibe-coding-client-root
+        kind: repo-root
+        path: ${SKILLBOX_MONOSERVER_ROOT}/vibe-coding-client
+        required: true
+        profiles:
+          - core
+        source:
+          kind: bind
+        sync:
+          mode: external
+        notes: Example client root mounted from a sibling repo directory.
+    skills:
+      - id: vibe-coding-client-skills
+        kind: packaged-skill-set
+        required: false
+        profiles:
+          - core
+        bundle_dir: ${SKILLBOX_WORKSPACE_ROOT}/default-skills/clients/vibe-coding-client
+        manifest: ${SKILLBOX_WORKSPACE_ROOT}/workspace/clients/vibe-coding-client/skills.manifest
+        sources_config: ${SKILLBOX_WORKSPACE_ROOT}/workspace/clients/vibe-coding-client/skills.sources.yaml
+        lock_path: ${SKILLBOX_WORKSPACE_ROOT}/workspace/clients/vibe-coding-client/skills.lock.json
+        sync:
+          mode: unpack-bundles
+        install_targets:
+          - id: claude
+            path: ${SKILLBOX_HOME_ROOT}/.claude/skills
+          - id: codex
+            path: ${SKILLBOX_HOME_ROOT}/.codex/skills
+        notes: Client-scoped skills for the vibe-coding-client overlay.
+    logs:
+      - id: vibe-coding-client
+        path: ${SKILLBOX_LOG_ROOT}/clients/vibe-coding-client
+        required: false
+        profiles:
+          - core
+        retention_days: 14
+        notes: Client-scoped logs for the vibe-coding-client overlay.
+    checks:
+      - id: vibe-coding-client-root
+        type: path_exists
+        path: ${SKILLBOX_MONOSERVER_ROOT}/vibe-coding-client
+        required: true
+        profiles:
+          - core
+        notes: The vibe-coding-client overlay expects a sibling vibe-coding-client directory.

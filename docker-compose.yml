@@ -6,6 +6,7 @@ x-runtime-env: &runtime_env
   SKILLBOX_SKILLS_ROOT: /workspace/skills
   SKILLBOX_LOG_ROOT: /workspace/logs
   SKILLBOX_HOME_ROOT: /home/sandbox
+  SKILLBOX_MONOSERVER_ROOT: ${SKILLBOX_MONOSERVER_ROOT:-/monoserver}
   SKILLBOX_API_PORT: ${SKILLBOX_API_PORT:-8000}
   SKILLBOX_WEB_PORT: ${SKILLBOX_WEB_PORT:-3000}
 
@@ -28,6 +29,7 @@ services:
       - .:/workspace
       - ./home/.claude:/home/sandbox/.claude
       - ./home/.codex:/home/sandbox/.codex
+      - ${SKILLBOX_MONOSERVER_HOST_ROOT:-..}:${SKILLBOX_MONOSERVER_ROOT:-/monoserver}
     command: ["sleep", "infinity"]
 
   api:
@@ -47,6 +49,7 @@ services:
       - .:/workspace
       - ./home/.claude:/home/sandbox/.claude
       - ./home/.codex:/home/sandbox/.codex
+      - ${SKILLBOX_MONOSERVER_HOST_ROOT:-..}:${SKILLBOX_MONOSERVER_ROOT:-/monoserver}
     command:
       - bash
       - -lc
@@ -73,6 +76,7 @@ services:
       - .:/workspace
       - ./home/.claude:/home/sandbox/.claude
       - ./home/.codex:/home/sandbox/.codex
+      - ${SKILLBOX_MONOSERVER_HOST_ROOT:-..}:${SKILLBOX_MONOSERVER_ROOT:-/monoserver}
     command:
       - bash
       - -lc

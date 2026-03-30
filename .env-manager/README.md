@@ -11,15 +11,22 @@ python3 .env-manager/manage.py render
 python3 .env-manager/manage.py sync
 python3 .env-manager/manage.py doctor
 python3 .env-manager/manage.py status
-python3 .env-manager/manage.py sync --profile bookme
+python3 .env-manager/manage.py sync --client personal
+python3 .env-manager/manage.py render --client personal --profile surfaces
 ```
 
-`sync` now reconciles repo/log directories and installs the declared packaged
-default skills into the managed Claude and Codex homes, writing a generated
-lockfile at `workspace/default-skills.lock.json`.
+`sync` reconciles repo/log directories and installs the declared packaged skill
+sets for the active scope, writing generated lockfiles for each selected skill
+set.
 
-All runtime commands accept repeated `--profile` flags. Selecting any profile
-also includes the shared `core` slice.
+The mental model is:
+
+- `core` is always active
+- `--client` activates a client overlay such as `personal` or `vibe-coding-client`
+- `--profile` activates optional non-client overlays such as `surfaces`
+
+Client overlays usually point at repo roots under `/monoserver`, which is the
+host parent directory mounted into the workspace container.
 
 The outer repo-level `.env` still controls Docker and top-level workspace
 settings. This internal manager is for the contents of the box, not for the

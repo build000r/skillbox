@@ -42,10 +42,15 @@ EXPECTED_FILES = [
     "workspace/runtime.yaml",
     "workspace/default-skills.manifest",
     "workspace/default-skills.sources.yaml",
+    "workspace/clients/personal/skills.manifest",
+    "workspace/clients/personal/skills.sources.yaml",
+    "workspace/clients/vibe-coding-client/skills.manifest",
+    "workspace/clients/vibe-coding-client/skills.sources.yaml",
 ]
 EXPECTED_DIRECTORIES = [
     ".env-manager",
     "default-skills",
+    "default-skills/clients",
     "docker",
     "home/.claude",
     "home/.codex",
@@ -53,7 +58,9 @@ EXPECTED_DIRECTORIES = [
     "repos",
     "scripts",
     "skills",
+    "skills/clients",
     "workspace",
+    "workspace/clients",
 ]
 
 
@@ -145,6 +152,7 @@ def build_model() -> dict[str, Any]:
         "SKILLBOX_SKILLS_ROOT": str(paths.get("skills_root", "")),
         "SKILLBOX_LOG_ROOT": str(paths.get("log_root", "")),
         "SKILLBOX_HOME_ROOT": str(paths.get("claude_root", "")).rsplit("/.claude", 1)[0],
+        "SKILLBOX_MONOSERVER_ROOT": str(paths.get("monoserver_root", "")),
         "SKILLBOX_API_PORT": str(ports.get("api", "")),
         "SKILLBOX_WEB_PORT": str(ports.get("web", "")),
     }
@@ -153,6 +161,7 @@ def build_model() -> dict[str, Any]:
         {"source": str(ROOT_DIR), "target": paths.get("workspace_root")},
         {"source": str(ROOT_DIR / "home" / ".claude"), "target": paths.get("claude_root")},
         {"source": str(ROOT_DIR / "home" / ".codex"), "target": paths.get("codex_root")},
+        {"source": str(ROOT_DIR.parent), "target": paths.get("monoserver_root")},
     ]
 
     return {
@@ -184,6 +193,7 @@ def build_model() -> dict[str, Any]:
         "runtime_manager": {
             "script": str(ROOT_DIR / ".env-manager" / "manage.py"),
             "manifest_file": runtime_model["manifest_file"],
+            "clients": runtime_model.get("clients") or [],
             "repos": runtime_model["repos"],
             "skills": runtime_model["skills"],
             "services": runtime_model["services"],
@@ -233,6 +243,7 @@ def expected_runtime_paths(model: dict[str, Any]) -> dict[str, str]:
         "claude-config": str(paths.get("claude_root")),
         "codex-config": str(paths.get("codex_root")),
         "sandbox-root": str(paths.get("repos_root")),
+        "monoserver-root": str(paths.get("monoserver_root")),
         "local-skills": str(paths.get("skills_root")),
     }
 
@@ -277,6 +288,8 @@ def check_manifest_alignment(model: dict[str, Any]) -> CheckResult:
         issues.append("home_mounts.codex-config does not match sandbox.paths.codex_root")
     if repo_workspaces.get("sandbox-root") != dependency_paths["sandbox-root"]:
         issues.append("repo_workspaces.sandbox-root does not match sandbox.paths.repos_root")
+    if repo_workspaces.get("monoserver-root") != dependency_paths["monoserver-root"]:
+        issues.append("repo_workspaces.monoserver-root does not match sandbox.paths.monoserver_root")
     if skill_roots.get("local-skills") != dependency_paths["local-skills"]:
         issues.append("skill_roots.local-skills does not match sandbox.paths.skills_root")
 
@@ -535,6 +548,7 @@ def check_runtime_manager_model(model: dict[str, Any]) -> CheckResult:
         message="internal runtime manager manifest resolved successfully",
         details={
             "manifest": repo_rel(Path(runtime_manager["manifest_file"])),
+            "clients": len(runtime_manager.get("clients") or []),
             "repos": len(runtime_manager["repos"]),
             "skills": len(runtime_manager["skills"]),
             "services": len(runtime_manager["services"]),
@@ -650,6 +664,7 @@ def print_render_text(payload: dict[str, Any]) -> None:
     runtime_manager = payload["runtime_manager"]
     print(f"  script: {repo_rel(Path(runtime_manager['script']))}")
     print(f"  manifest: {repo_rel(Path(runtime_manager['manifest_file']))}")
+    print(f"  clients: {len(runtime_manager.get('clients') or [])}")
     print(f"  repos: {len(runtime_manager['repos'])}")
     print(f"  skills: {len(runtime_manager['skills'])}")
     print(f"  services: {len(runtime_manager['services'])}")

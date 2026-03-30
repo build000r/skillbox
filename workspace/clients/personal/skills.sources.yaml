@@ -1,0 +1,5 @@
+version: 1
+
+sources:
+  - kind: local
+    path: ./skills/clients/personal

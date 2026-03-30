@@ -17,6 +17,11 @@ repo_workspaces:
     required: true
     notes: Clone or mount project repos here.
 
+  - id: monoserver-root
+    path: /monoserver
+    required: false
+    notes: Shared parent mount exposing sibling client repo roots from the host.
+
 skill_roots:
   - id: local-skills
     path: /workspace/skills

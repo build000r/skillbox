@@ -1,6 +1,6 @@
 # skillbox
 
-> A thin, self-hosted Tailnet dev box for AI-assisted coding on a Dockerized droplet.
+> A thin, self-hosted Tailnet monoserver for AI-assisted coding, with client-scoped overlays.
 
 ![runtime](https://img.shields.io/badge/runtime-Docker-2496ED?style=flat-square&logo=docker&logoColor=white)
 ![access](https://img.shields.io/badge/access-Tailscale-242424?style=flat-square&logo=tailscale&logoColor=white)
@@ -21,7 +21,10 @@ make shell
 
 ### The Problem
 
-Most remote dev setups overshoot the need. You want one private box, one primary workspace container, your own Claude or Codex home directories, a few curated repos, and some pinned skills. You do not want to adopt a full hosted workspace control plane just to get there.
+Most remote dev setups overshoot the need. You want one private box that feels
+like a real computer: one primary workspace container, your own Claude or
+Codex home directories, a broader repo universe, and a way to activate the
+right client context without standing up a full hosted workspace control plane.
 
 ### The Solution
 
@@ -30,6 +33,8 @@ Most remote dev setups overshoot the need. You want one private box, one primary
 - SSH to the host over Tailscale
 - run one main Docker workspace container
 - mount `home/.claude` and `home/.codex` into that box
+- mount the host parent directory at `/monoserver` for client repo roots
+- keep one stable core machine and layer client-specific overlays on top
 - declare the inside of the box with a runtime graph for repos, installed skills, services, logs, and checks
 - pin and package default skills locally
 - validate outer drift with `make doctor` and inner drift with `make dev-sanity`
@@ -39,8 +44,8 @@ Most remote dev setups overshoot the need. You want one private box, one primary
 | Need | `skillbox` answer |
 |---|---|
 | Private access without public SSH exposure | Tailscale host access plus host hardening scripts |
-| A workspace that feels like a narrowed local setup | One bind-mounted `/workspace` with `repos/`, `skills/`, `logs/`, and home mounts |
-| A sane way to let the box grow over time | `workspace/runtime.yaml` plus `.env-manager/manage.py` manage internal repos, installed skills, logs, and checks |
+| A workspace that feels like a narrowed local setup | One bind-mounted `/workspace`, plus `/monoserver` for sibling repo roots and client overlays |
+| A sane way to let the box grow over time | `workspace/runtime.yaml` plus `.env-manager/manage.py` manage the core machine plus client-specific repos, installed skills, logs, and checks |
 | Reproducible default skills | `03-skill-sync.sh` packages from a pinned manifest and vendored local packager |
 | Confidence that docs/config/runtime still match | `04-reconcile.py` powers `make render` and `make doctor`, while `make dev-sanity` validates the box internals |
 | Minimal surface area | No multi-tenant control plane, no hosted dependency, no hidden sibling repo requirement for packaging |
@@ -56,6 +61,7 @@ make doctor
 make runtime-render
 make runtime-sync
 make dev-sanity
+make runtime-status CLIENT=personal
 make build
 make up
 make up-surfaces
@@ -71,6 +77,7 @@ What that gives you:
 - a validated box model
 - a validated runtime graph for the inside of the box
 - a running workspace container
+- a mounted `/monoserver` view of the host parent directory
 - optional API and web inspection surfaces
 - packaged default `.skill` bundles under `default-skills/`
 - installed default skills under `home/.claude/skills` and `home/.codex/skills`
@@ -204,7 +211,7 @@ make runtime-sync
 | `make render` | Prints the resolved sandbox model |
 | `make doctor` | Validates manifest/runtime drift, Compose wiring, and skill sync |
 | `make runtime-render` | Prints the resolved internal runtime graph |
-| `make runtime-sync` | Creates managed repo/log directories and installs declared default skills with a generated lockfile |
+| `make runtime-sync` | Creates managed repo/log directories and installs declared skills with generated lockfiles for the active core/client scope |
 | `make runtime-status` | Summarizes declared repos, skills, services, logs, and checks |
 | `make dev-sanity` | Validates the internal runtime graph, filesystem readiness, and managed skill integrity |
 | `make build` | Builds the workspace image |
@@ -224,9 +231,9 @@ make runtime-sync
 | `scripts/04-reconcile.py render` | Print the resolved sandbox model | `python3 scripts/04-reconcile.py render --with-compose` |
 | `scripts/04-reconcile.py doctor` | Run drift and readiness checks | `python3 scripts/04-reconcile.py doctor` |
 | `.env-manager/manage.py render` | Print the resolved internal runtime graph | `python3 .env-manager/manage.py render --format json` |
-| `.env-manager/manage.py sync` | Create managed repo/log directories and install declared default skills | `python3 .env-manager/manage.py sync --dry-run` |
-| `.env-manager/manage.py doctor` | Validate the internal repos/skills/logs/check graph | `python3 .env-manager/manage.py doctor` |
-| `.env-manager/manage.py status` | Summarize repo, skill, service, log, and health state | `python3 .env-manager/manage.py status` |
+| `.env-manager/manage.py sync` | Create managed repo/log directories and install declared skills for the selected core/client scope | `python3 .env-manager/manage.py sync --client personal --dry-run` |
+| `.env-manager/manage.py doctor` | Validate the internal repos/skills/logs/check graph for the selected core/client scope | `python3 .env-manager/manage.py doctor --client personal` |
+| `.env-manager/manage.py status` | Summarize repo, skill, service, log, and health state for the selected core/client scope | `python3 .env-manager/manage.py status --client personal` |
 
 ## Configuration
 
@@ -241,6 +248,8 @@ SKILLBOX_REPOS_ROOT=/workspace/repos
 SKILLBOX_SKILLS_ROOT=/workspace/skills
 SKILLBOX_LOG_ROOT=/workspace/logs
 SKILLBOX_HOME_ROOT=/home/sandbox
+SKILLBOX_MONOSERVER_ROOT=/monoserver
+SKILLBOX_MONOSERVER_HOST_ROOT=..
 SKILLBOX_API_PORT=8000
 SKILLBOX_WEB_PORT=3000
 ```
@@ -269,16 +278,20 @@ sources:
 ask-cascade
 ```
 
-### Generated skill lockfile
+### Generated skill lockfiles
 
-`make runtime-sync` now writes `workspace/default-skills.lock.json`, which records:
+`make runtime-sync` writes `workspace/default-skills.lock.json` for the shared
+default skill set, and selected client overlays write their own lockfiles under
+`workspace/clients/<client>/skills.lock.json`.
+
+Each lockfile records:
 
 - the current manifest and sources-config digests
 - the bundle digests for each declared default skill
 - the installed tree hashes for the managed Claude and Codex skill homes
 
-The lockfile is generated state and is gitignored, so running sync does not
-turn normal local runtime reconciliation into noisy repo dirt.
+These lockfiles are generated state and are gitignored, so running sync does
+not turn normal local runtime reconciliation into noisy repo dirt.
 
 ### Sandbox model
 
@@ -306,6 +319,7 @@ sandbox:
     log_root: /workspace/logs
     claude_root: /home/sandbox/.claude
     codex_root: /home/sandbox/.codex
+    monoserver_root: /monoserver
 ```
 
 ### Runtime graph
@@ -313,81 +327,77 @@ sandbox:
 `workspace/runtime.yaml` declares the inside of the box:
 
 ```yaml
-version: 1
+version: 2
 
-repos:
-  - id: skillbox-self
-    kind: repo
-    path: ${SKILLBOX_WORKSPACE_ROOT}
-    source:
-      kind: bind
-      path: ${ROOT_DIR}
-    sync:
-      mode: external
+selection: {}
 
-  - id: managed-repos
-    kind: workspace-root
-    path: ${SKILLBOX_REPOS_ROOT}
-    source:
-      kind: directory
-    sync:
-      mode: ensure-directory
+core:
+  repos:
+    - id: skillbox-self
+      path: ${SKILLBOX_WORKSPACE_ROOT}
+    - id: managed-repos
+      path: ${SKILLBOX_REPOS_ROOT}
+  skills:
+    - id: default-skills
+      manifest: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.manifest
+  services:
+    - id: internal-env-manager
+    - id: api-stub
+      profiles: [surfaces]
+    - id: web-stub
+      profiles: [surfaces]
+  checks:
+    - id: monoserver-root
+      path: ${SKILLBOX_MONOSERVER_ROOT}
 
-skills:
-  - id: default-skills
-    kind: packaged-skill-set
-    bundle_dir: ${SKILLBOX_WORKSPACE_ROOT}/default-skills
-    manifest: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.manifest
-    sources_config: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.sources.yaml
-    lock_path: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.lock.json
-    sync:
-      mode: unpack-bundles
-    install_targets:
-      - id: claude
-        path: ${SKILLBOX_HOME_ROOT}/.claude/skills
-      - id: codex
-        path: ${SKILLBOX_HOME_ROOT}/.codex/skills
+clients:
+  - id: personal
+    default_cwd: ${SKILLBOX_MONOSERVER_ROOT}
+    repo_roots:
+      - id: personal-root
+        path: ${SKILLBOX_MONOSERVER_ROOT}
+    skills:
+      - id: personal-skills
+        manifest: ${SKILLBOX_WORKSPACE_ROOT}/workspace/clients/personal/skills.manifest
 
-services:
-  - id: internal-env-manager
-    kind: orchestration
-    path: ${SKILLBOX_WORKSPACE_ROOT}/.env-manager
-    command: python3 .env-manager/manage.py
-    log: runtime
-
-logs:
-  - id: runtime
-    path: ${SKILLBOX_LOG_ROOT}/runtime
-
-checks:
-  - id: runtime-manager
-    type: path_exists
-    path: ${SKILLBOX_WORKSPACE_ROOT}/.env-manager/manage.py
+  - id: vibe-coding-client
+    default_cwd: ${SKILLBOX_MONOSERVER_ROOT}/vibe-coding-client
+    repo_roots:
+      - id: vibe-coding-client-root
+        path: ${SKILLBOX_MONOSERVER_ROOT}/vibe-coding-client
+    skills:
+      - id: vibe-coding-client-skills
+        manifest: ${SKILLBOX_WORKSPACE_ROOT}/workspace/clients/vibe-coding-client/skills.manifest
 ```
 
-### Workload Profiles
+### Client Selection
 
-`workspace/runtime.yaml` can now describe named workload slices with `profiles`.
-The runtime manager treats `core` as the shared baseline and lets you activate
-additional slices when you render, sync, inspect, or sanity-check the box.
+The mental model is now:
+
+- `core` is the monoserver itself
+- `--client` selects a client overlay
+- `--profile` selects optional non-client overlays such as `surfaces`
+- projects live inside a client overlay, not the other way around
 
 Examples:
 
 ```bash
-python3 .env-manager/manage.py render --profile bookme
-python3 .env-manager/manage.py sync --profile bookme
-python3 .env-manager/manage.py status --profile bookme
-python3 .env-manager/manage.py doctor --profile bookme
+python3 .env-manager/manage.py render --client personal
+python3 .env-manager/manage.py sync --client personal
+python3 .env-manager/manage.py status --client vibe-coding-client
+python3 .env-manager/manage.py doctor --client vibe-coding-client
+python3 .env-manager/manage.py render --client personal --profile surfaces
 
-make runtime-sync PROFILE=bookme
-make runtime-status PROFILE=bookme
-make dev-sanity PROFILE=bookme
+make runtime-sync CLIENT=personal
+make runtime-status CLIENT=vibe-coding-client
+make dev-sanity CLIENT=vibe-coding-client
+make runtime-render CLIENT=personal PROFILE=surfaces
 ```
 
 That makes `skillbox` behave less like one static starter and more like a
-personal environment compiler: one repo can declare multiple real project
-slices without forcing every repo, service, log, and check to exist all the
-time.
+personal environment compiler: one monoserver can describe multiple client
+overlays without forcing every repo, service, log, skill set, and check to
+exist all the time.
 
 ## Architecture
 
@@ -410,8 +420,9 @@ time.
 | workspace         |      | optional surfaces |
 |-------------------|      |-------------------|
 | /workspace        |      | api :8000         |
-| /workspace/repos  |      | web :3000         |
-| /workspace/skills |      +-------------------+
+| /monoserver       |      | web :3000         |
+| /workspace/repos  |      +-------------------+
+| /workspace/skills |
 | /workspace/logs   |
 | /home/.claude     |
 | /home/.codex      |
@@ -435,7 +446,7 @@ time.
        |----------------------------------|
        | repos, installed skills, checks  |
        | api/web stub health probes       |
-       | default skill bundles + lockfile |
+       | default skill bundles + lockfiles |
        +----------------------------------+
 ```
 
@@ -447,7 +458,9 @@ Check that Docker is installed and `docker compose config --format json` works o
 
 ### `make dev-sanity` warns about missing log directories or managed skill installs
 
-That is expected on a fresh clone. The runtime graph declares `logs/runtime` and `logs/repos`, and the managed skill install roots plus lockfile are also created on demand.
+That is expected on a fresh clone. The core runtime graph declares
+`logs/runtime` and `logs/repos`, and the managed skill install roots plus
+lockfile are also created on demand.
 
 Run:
 
@@ -477,7 +490,8 @@ That is expected. SSH targets the host, not the workspace container. Use `make s
 
 ### `make runtime-status` shows repos as missing
 
-The internal runtime manager evaluates host paths that correspond to the container's `/workspace/...` tree.
+The internal runtime manager evaluates host paths that correspond to the
+container's `/workspace/...` and `/monoserver/...` trees.
 
 Run:
 
@@ -486,7 +500,16 @@ make runtime-sync
 make runtime-status
 ```
 
-If a repo is still missing after sync, the runtime entry is probably configured with `sync.mode: external` and expects a bind mount or manual clone.
+If a repo is still missing after sync, the runtime entry is probably configured
+with `sync.mode: external` and expects a bind mount from `/monoserver` or a
+manual clone under `/workspace/repos`.
+
+If the missing repo belongs to a client overlay, check it explicitly:
+
+```bash
+make runtime-status CLIENT=personal
+make runtime-status CLIENT=vibe-coding-client
+```
 
 ### Default skills look stale
 
@@ -504,7 +527,7 @@ make doctor
 - There is no release installer, package manager distribution, or cloud provisioning flow yet.
 - The API and web surfaces are inspection stubs, not a full UI.
 - The internal runtime manager currently handles declaration, sync, status, and sanity checks. It does not yet do full per-repo start/stop orchestration.
-- Secrets management and richer per-project bootstrap workflows are still your responsibility.
+- Secrets management and richer per-client bootstrap workflows are still your responsibility.
 - There is no license file in this repo yet. Add one before publishing it as open source.
 
 ## FAQ
@@ -535,7 +558,15 @@ In this starter, yes. They represent the packaged default bundles the box can sh
 
 ### Can I add real repos under `repos/`?
 
-Yes. That folder exists to mimic a narrower slice of your wider local repo workspace, and `workspace/runtime.yaml` is where you should start declaring them.
+Yes, but think of that as starter behavior. The longer-term model is one
+monoserver plus one or more client overlays, each with its own repo roots,
+skills, services, logs, and checks.
+
+### What is `/monoserver` for?
+
+It is the host parent directory mounted into the workspace container. That is
+how client overlays can point at sibling roots such as the broader personal
+repo universe or a client directory like `../vibe-coding-client`.
 
 ### Is `.env-manager/` the same thing as `../.env-manager`?
 

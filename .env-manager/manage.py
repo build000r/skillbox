@@ -77,15 +77,34 @@ def resolve_root_dir(raw_root: str | None) -> Path:
 
 def normalize_active_profiles(raw_profiles: list[str] | None) -> set[str]:
     active_profiles = {value.strip() for value in raw_profiles or [] if value and value.strip()}
-    if active_profiles:
-        active_profiles.add("core")
+    active_profiles.add("core")
     return active_profiles
 
 
-def item_matches_profiles(item: dict[str, Any], active_profiles: set[str]) -> bool:
-    if not active_profiles:
-        return True
+def normalize_active_clients(model: dict[str, Any], raw_clients: list[str] | None) -> set[str]:
+    requested_clients = {value.strip() for value in raw_clients or [] if value and value.strip()}
+    available_clients = {
+        str(client.get("id", "")).strip()
+        for client in model.get("clients") or []
+        if str(client.get("id", "")).strip()
+    }
+    default_client = str((model.get("selection") or {}).get("default_client") or "").strip()
+    if not requested_clients and default_client:
+        requested_clients.add(default_client)
 
+    unknown_clients = sorted(requested_clients - available_clients)
+    if unknown_clients:
+        raise RuntimeError(
+            "Unknown runtime client(s): "
+            + ", ".join(unknown_clients)
+            + ". Available clients: "
+            + (", ".join(sorted(available_clients)) or "(none)")
+        )
+
+    return requested_clients
+
+
+def item_matches_profiles(item: dict[str, Any], active_profiles: set[str]) -> bool:
     item_profiles = {
         str(value).strip()
         for value in item.get("profiles") or []
@@ -96,34 +115,44 @@ def item_matches_profiles(item: dict[str, Any], active_profiles: set[str]) -> bo
     return not item_profiles.isdisjoint(active_profiles)
 
 
-def filter_model_by_profiles(model: dict[str, Any], active_profiles: set[str]) -> dict[str, Any]:
-    if not active_profiles:
+def item_matches_clients(item: dict[str, Any], active_clients: set[str]) -> bool:
+    item_client = str(item.get("client", "")).strip()
+    if not item_client:
+        return True
+    return item_client in active_clients
+
+
+def filter_model(model: dict[str, Any], active_profiles: set[str], active_clients: set[str]) -> dict[str, Any]:
+    if not active_profiles and not active_clients:
         return model
 
     filtered_model = dict(model)
     filtered_model["active_profiles"] = sorted(active_profiles)
+    filtered_model["active_clients"] = sorted(active_clients)
     filtered_model["repos"] = [
-        copy.deepcopy(repo) for repo in model["repos"] if item_matches_profiles(repo, active_profiles)
+        copy.deepcopy(repo)
+        for repo in model["repos"]
+        if item_matches_profiles(repo, active_profiles) and item_matches_clients(repo, active_clients)
     ]
     filtered_model["skills"] = [
         copy.deepcopy(skillset)
         for skillset in model["skills"]
-        if item_matches_profiles(skillset, active_profiles)
+        if item_matches_profiles(skillset, active_profiles) and item_matches_clients(skillset, active_clients)
     ]
     filtered_model["services"] = [
         copy.deepcopy(service)
         for service in model["services"]
-        if item_matches_profiles(service, active_profiles)
+        if item_matches_profiles(service, active_profiles) and item_matches_clients(service, active_clients)
     ]
     filtered_model["logs"] = [
         copy.deepcopy(log_item)
         for log_item in model["logs"]
-        if item_matches_profiles(log_item, active_profiles)
+        if item_matches_profiles(log_item, active_profiles) and item_matches_clients(log_item, active_clients)
     ]
     filtered_model["checks"] = [
         copy.deepcopy(check)
         for check in model["checks"]
-        if item_matches_profiles(check, active_profiles)
+        if item_matches_profiles(check, active_profiles) and item_matches_clients(check, active_clients)
     ]
 
     included_repo_ids = {repo["id"] for repo in filtered_model["repos"]}
@@ -797,6 +826,22 @@ def validate_skill_locks_and_state(model: dict[str, Any]) -> list[CheckResult]:
 def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
     issues: list[str] = []
 
+    client_ids = find_duplicates(model.get("clients") or [], "id")
+    if client_ids:
+        issues.append(f"clients contain duplicate ids: {', '.join(client_ids)}")
+    for client in model.get("clients") or []:
+        if not client.get("id"):
+            issues.append("every client entry must have an id")
+
+    declared_client_ids = {
+        str(client.get("id", "")).strip()
+        for client in model.get("clients") or []
+        if str(client.get("id", "")).strip()
+    }
+    default_client = str((model.get("selection") or {}).get("default_client") or "").strip()
+    if default_client and default_client not in declared_client_ids:
+        issues.append(f"selection.default_client references unknown client {default_client!r}")
+
     for section in ("repos", "skills", "services", "logs", "checks"):
         duplicates = find_duplicates(model[section], "id")
         if duplicates:
@@ -818,6 +863,8 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
             issues.append("every repo entry must have an id")
         if not repo.get("path"):
             issues.append(f"repo {repo.get('id', '(missing id)')} is missing path")
+        if repo.get("client") and repo["client"] not in declared_client_ids:
+            issues.append(f"repo {repo.get('id')} references unknown client {repo['client']!r}")
 
         source = repo.get("source") or {}
         source_kind = source.get("kind", "manual")
@@ -836,6 +883,8 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
     for skillset in model["skills"]:
         if not skillset.get("id"):
             issues.append("every skills entry must have an id")
+        if skillset.get("client") and skillset["client"] not in declared_client_ids:
+            issues.append(f"skill set {skillset.get('id')} references unknown client {skillset['client']!r}")
         for field in ("bundle_dir", "manifest", "sources_config", "lock_path"):
             if not skillset.get(field):
                 issues.append(f"skill set {skillset.get('id', '(missing id)')} is missing {field}")
@@ -863,6 +912,8 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
     for service in model["services"]:
         if not service.get("id"):
             issues.append("every service entry must have an id")
+        if service.get("client") and service["client"] not in declared_client_ids:
+            issues.append(f"service {service.get('id')} references unknown client {service['client']!r}")
         if service.get("repo") and service["repo"] not in repo_ids:
             issues.append(f"service {service.get('id')} references unknown repo {service['repo']!r}")
         if service.get("log") and service["log"] not in log_ids:
@@ -885,6 +936,8 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
             issues.append("every log entry must have an id")
         if not log_item.get("path"):
             issues.append(f"log {log_item.get('id', '(missing id)')} is missing path")
+        if log_item.get("client") and log_item["client"] not in declared_client_ids:
+            issues.append(f"log {log_item.get('id')} references unknown client {log_item['client']!r}")
 
     for check in model["checks"]:
         check_type = check.get("type")
@@ -892,6 +945,8 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
             issues.append(f"check {check.get('id')} has unsupported type {check_type!r}")
         if check_type == "path_exists" and not check.get("path"):
             issues.append(f"check {check.get('id')} is missing path")
+        if check.get("client") and check["client"] not in declared_client_ids:
+            issues.append(f"check {check.get('id')} references unknown client {check['client']!r}")
 
     if issues:
         return [
@@ -1225,6 +1280,9 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
         check_statuses.append(item)
 
     return {
+        "clients": copy.deepcopy(model.get("clients") or []),
+        "active_clients": model.get("active_clients") or [],
+        "default_client": (model.get("selection") or {}).get("default_client"),
         "active_profiles": model.get("active_profiles") or [],
         "repos": repo_statuses,
         "skills": skill_statuses,
@@ -1235,6 +1293,13 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
 
 
 def print_render_text(model: dict[str, Any]) -> None:
+    available_clients = ", ".join(client["id"] for client in model.get("clients") or []) or "(none)"
+    default_client = (model.get("selection") or {}).get("default_client") or "(none)"
+    active_clients = model.get("active_clients") or []
+    print(f"clients: {available_clients}")
+    print(f"default client: {default_client}")
+    if active_clients:
+        print(f"active clients: {', '.join(active_clients)}")
     active_profiles = model.get("active_profiles") or []
     if active_profiles:
         print(f"active profiles: {', '.join(active_profiles)}")
@@ -1291,6 +1356,13 @@ def print_doctor_text(results: list[CheckResult]) -> None:
 
 
 def print_status_text(status_payload: dict[str, Any]) -> None:
+    available_clients = ", ".join(client["id"] for client in status_payload.get("clients") or []) or "(none)"
+    print(f"clients: {available_clients}")
+    default_client = status_payload.get("default_client") or "(none)"
+    print(f"default client: {default_client}")
+    active_clients = status_payload.get("active_clients") or []
+    if active_clients:
+        print(f"active clients: {', '.join(active_clients)}")
     active_profiles = status_payload.get("active_profiles") or []
     if active_profiles:
         print(f"active profiles: {', '.join(active_profiles)}")
@@ -1361,9 +1433,18 @@ def main() -> int:
             help="Activate a runtime profile. Can be repeated. Selecting any profile also includes `core`.",
         )
 
+    def add_client_arg(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument(
+            "--client",
+            action="append",
+            default=[],
+            help="Activate a runtime client overlay. Can be repeated.",
+        )
+
     render_parser = subparsers.add_parser("render", help="Print the resolved runtime graph.")
     render_parser.add_argument("--format", choices=("text", "json"), default="text")
     add_profile_arg(render_parser)
+    add_client_arg(render_parser)
 
     sync_parser = subparsers.add_parser(
         "sync",
@@ -1372,6 +1453,7 @@ def main() -> int:
     sync_parser.add_argument("--dry-run", action="store_true")
     sync_parser.add_argument("--format", choices=("text", "json"), default="text")
     add_profile_arg(sync_parser)
+    add_client_arg(sync_parser)
 
     doctor_parser = subparsers.add_parser(
         "doctor",
@@ -1379,6 +1461,7 @@ def main() -> int:
     )
     doctor_parser.add_argument("--format", choices=("text", "json"), default="text")
     add_profile_arg(doctor_parser)
+    add_client_arg(doctor_parser)
 
     status_parser = subparsers.add_parser(
         "status",
@@ -1386,11 +1469,14 @@ def main() -> int:
     )
     status_parser.add_argument("--format", choices=("text", "json"), default="text")
     add_profile_arg(status_parser)
+    add_client_arg(status_parser)
 
     args = parser.parse_args()
     root_dir = resolve_root_dir(args.root_dir)
     model = build_runtime_model(root_dir)
-    model = filter_model_by_profiles(model, normalize_active_profiles(getattr(args, "profile", [])))
+    active_profiles = normalize_active_profiles(getattr(args, "profile", []))
+    active_clients = normalize_active_clients(model, getattr(args, "client", []))
+    model = filter_model(model, active_profiles, active_clients)
 
     if args.command == "render":
         if args.format == "json":

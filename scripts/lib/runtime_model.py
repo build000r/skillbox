@@ -18,8 +18,12 @@ RUNTIME_ENV_KEYS = [
     "SKILLBOX_SKILLS_ROOT",
     "SKILLBOX_LOG_ROOT",
     "SKILLBOX_HOME_ROOT",
+    "SKILLBOX_MONOSERVER_ROOT",
     "SKILLBOX_API_PORT",
     "SKILLBOX_WEB_PORT",
+]
+MANIFEST_ENV_KEYS = RUNTIME_ENV_KEYS + [
+    "SKILLBOX_MONOSERVER_HOST_ROOT",
 ]
 
 PLACEHOLDER_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
@@ -70,7 +74,7 @@ def load_runtime_env(root_dir: Path) -> dict[str, str]:
     live = load_env_file(root_dir / ".env")
 
     values = defaults | live
-    for key in RUNTIME_ENV_KEYS:
+    for key in MANIFEST_ENV_KEYS:
         env_value = os.environ.get(key)
         if env_value is not None:
             values[key] = env_value
@@ -82,6 +86,8 @@ def load_runtime_env(root_dir: Path) -> dict[str, str]:
         "SKILLBOX_SKILLS_ROOT": "/workspace/skills",
         "SKILLBOX_LOG_ROOT": "/workspace/logs",
         "SKILLBOX_HOME_ROOT": "/home/sandbox",
+        "SKILLBOX_MONOSERVER_ROOT": "/monoserver",
+        "SKILLBOX_MONOSERVER_HOST_ROOT": "..",
         "SKILLBOX_API_PORT": "8000",
         "SKILLBOX_WEB_PORT": "3000",
         "ROOT_DIR": str(root_dir),
@@ -112,6 +118,11 @@ def runtime_path_to_host_path(root_dir: Path, env_values: dict[str, str], raw_pa
     path = Path(raw_path)
     workspace_root = Path(env_values["SKILLBOX_WORKSPACE_ROOT"])
     home_root = Path(env_values["SKILLBOX_HOME_ROOT"])
+    monoserver_root = Path(env_values.get("SKILLBOX_MONOSERVER_ROOT", "/monoserver"))
+    monoserver_host_root = host_path_to_absolute_path(
+        root_dir,
+        env_values.get("SKILLBOX_MONOSERVER_HOST_ROOT", ".."),
+    )
 
     try:
         relative = path.relative_to(workspace_root)
@@ -125,7 +136,20 @@ def runtime_path_to_host_path(root_dir: Path, env_values: dict[str, str], raw_pa
     except ValueError:
         pass
 
+    try:
+        relative = path.relative_to(monoserver_root)
+        return monoserver_host_root / relative
+    except ValueError:
+        pass
+
     return path
+
+
+def host_path_to_absolute_path(root_dir: Path, raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    return (root_dir / path).resolve()
 
 
 def _normalized_items(raw_items: Any, section: str) -> list[dict[str, Any]]:
@@ -142,28 +166,126 @@ def _normalized_items(raw_items: Any, section: str) -> list[dict[str, Any]]:
     return normalized
 
 
+def _normalized_mapping(raw_value: Any, section: str) -> dict[str, Any]:
+    if raw_value is None:
+        return {}
+    if not isinstance(raw_value, dict):
+        raise RuntimeError(f"Expected {section} to be a mapping in runtime manifest")
+    return dict(raw_value)
+
+
+def _attach_client_scope(items: list[dict[str, Any]], client_id: str) -> list[dict[str, Any]]:
+    scoped_items: list[dict[str, Any]] = []
+    for item in items:
+        scoped_item = dict(item)
+        scoped_item["client"] = client_id
+        scoped_items.append(scoped_item)
+    return scoped_items
+
+
+def _normalize_client_repo_roots(raw_items: Any, client_id: str, section: str) -> list[dict[str, Any]]:
+    repo_roots = []
+    for item in _normalized_items(raw_items, section):
+        repo_root = dict(item)
+        repo_root.setdefault("kind", "repo-root")
+        repo_root.setdefault("source", {"kind": "bind"})
+        repo_root.setdefault("sync", {"mode": "external"})
+        repo_root["client"] = client_id
+        repo_roots.append(repo_root)
+    return repo_roots
+
+
+def _normalize_runtime_sections(resolved: dict[str, Any]) -> dict[str, Any]:
+    if "core" not in resolved and "clients" not in resolved:
+        return {
+            "selection": {},
+            "clients": [],
+            "repos": _normalized_items(resolved.get("repos"), "repos"),
+            "skills": _normalized_items(resolved.get("skills"), "skills"),
+            "services": _normalized_items(resolved.get("services"), "services"),
+            "logs": _normalized_items(resolved.get("logs"), "logs"),
+            "checks": _normalized_items(resolved.get("checks"), "checks"),
+        }
+
+    core = _normalized_mapping(resolved.get("core"), "core")
+    selection = _normalized_mapping(resolved.get("selection"), "selection")
+    repos = _normalized_items(core.get("repos"), "core.repos")
+    skills = _normalized_items(core.get("skills"), "core.skills")
+    services = _normalized_items(core.get("services"), "core.services")
+    logs = _normalized_items(core.get("logs"), "core.logs")
+    checks = _normalized_items(core.get("checks"), "core.checks")
+    clients_meta: list[dict[str, Any]] = []
+
+    for client in _normalized_items(resolved.get("clients"), "clients"):
+        client_id = str(client.get("id", "")).strip()
+        label = str(client.get("label") or client_id)
+        client_default_cwd = client.get("default_cwd")
+        clients_meta.append(
+            {
+                "id": client_id,
+                "label": label,
+                "default_cwd": client_default_cwd,
+            }
+        )
+        repos.extend(
+            _normalize_client_repo_roots(
+                client.get("repo_roots"),
+                client_id=client_id,
+                section=f"clients[{client_id}].repo_roots",
+            )
+        )
+        repos.extend(_attach_client_scope(_normalized_items(client.get("repos"), f"clients[{client_id}].repos"), client_id))
+        skills.extend(
+            _attach_client_scope(_normalized_items(client.get("skills"), f"clients[{client_id}].skills"), client_id)
+        )
+        services.extend(
+            _attach_client_scope(
+                _normalized_items(client.get("services"), f"clients[{client_id}].services"),
+                client_id,
+            )
+        )
+        logs.extend(_attach_client_scope(_normalized_items(client.get("logs"), f"clients[{client_id}].logs"), client_id))
+        checks.extend(
+            _attach_client_scope(_normalized_items(client.get("checks"), f"clients[{client_id}].checks"), client_id)
+        )
+
+    return {
+        "selection": selection,
+        "clients": clients_meta,
+        "repos": repos,
+        "skills": skills,
+        "services": services,
+        "logs": logs,
+        "checks": checks,
+    }
+
+
 def build_runtime_model(root_dir: Path) -> dict[str, Any]:
     root_dir = root_dir.resolve()
     runtime_doc = load_yaml(runtime_manifest_path(root_dir))
     env_values = load_runtime_env(root_dir)
     resolved = resolve_placeholders(runtime_doc, env_values)
+    normalized = _normalize_runtime_sections(resolved)
 
     model = {
         "root_dir": str(root_dir),
         "manifest_file": str(runtime_manifest_path(root_dir)),
         "version": resolved.get("version", 1),
-        "env": {key: env_values.get(key, "") for key in RUNTIME_ENV_KEYS},
-        "repos": _normalized_items(resolved.get("repos"), "repos"),
-        "skills": _normalized_items(resolved.get("skills"), "skills"),
-        "services": _normalized_items(resolved.get("services"), "services"),
-        "logs": _normalized_items(resolved.get("logs"), "logs"),
-        "checks": _normalized_items(resolved.get("checks"), "checks"),
+        "env": {key: env_values.get(key, "") for key in MANIFEST_ENV_KEYS},
+        "selection": normalized["selection"],
+        "clients": normalized["clients"],
+        "repos": normalized["repos"],
+        "skills": normalized["skills"],
+        "services": normalized["services"],
+        "logs": normalized["logs"],
+        "checks": normalized["checks"],
     }
 
     for repo in model["repos"]:
         repo.setdefault("kind", "repo")
         repo.setdefault("required", False)
         repo.setdefault("profiles", [])
+        repo.setdefault("client", "")
         repo.setdefault("sync", {})
         repo.setdefault("source", {})
         if repo.get("path"):
@@ -173,6 +295,7 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
         skill.setdefault("kind", "packaged-skill-set")
         skill.setdefault("required", False)
         skill.setdefault("profiles", [])
+        skill.setdefault("client", "")
         skill.setdefault("sync", {})
         skill.setdefault("install_targets", [])
         for field in ("bundle_dir", "manifest", "sources_config", "lock_path"):
@@ -195,6 +318,7 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
     for service in model["services"]:
         service.setdefault("required", False)
         service.setdefault("profiles", [])
+        service.setdefault("client", "")
         if service.get("path"):
             service["host_path"] = str(runtime_path_to_host_path(root_dir, model["env"], str(service["path"])))
         healthcheck = service.get("healthcheck") or {}
@@ -207,6 +331,7 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
     for log_item in model["logs"]:
         log_item.setdefault("required", False)
         log_item.setdefault("profiles", [])
+        log_item.setdefault("client", "")
         if log_item.get("path"):
             log_item["host_path"] = str(
                 runtime_path_to_host_path(root_dir, model["env"], str(log_item["path"]))
@@ -215,7 +340,15 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
     for check in model["checks"]:
         check.setdefault("required", False)
         check.setdefault("profiles", [])
+        check.setdefault("client", "")
         if check.get("path"):
             check["host_path"] = str(runtime_path_to_host_path(root_dir, model["env"], str(check["path"])))
+
+    for client in model["clients"]:
+        client.setdefault("label", client.get("id", ""))
+        if client.get("default_cwd"):
+            client["default_cwd_host_path"] = str(
+                runtime_path_to_host_path(root_dir, model["env"], str(client["default_cwd"]))
+            )
 
     return model
