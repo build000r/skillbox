@@ -150,6 +150,34 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual({item["id"] for item in payload["services"]}, {"internal-env-manager", "api-stub", "web-stub"})
             self.assertEqual({item["id"] for item in payload["logs"]}, {"runtime", "repos", "api", "web"})
 
+    def test_profile_selection_activates_swimmers_overlay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            (repo / "monoserver-host" / "swimmers").mkdir(parents=True, exist_ok=True)
+
+            render = self._run(repo, "render", "--profile", "swimmers", "--format", "json")
+
+            self.assertEqual(render.returncode, 0, render.stderr)
+            payload = json.loads(render.stdout)
+            self.assertEqual(payload["active_profiles"], ["core", "swimmers"])
+            self.assertEqual(
+                {item["id"] for item in payload["repos"]},
+                {"skillbox-self", "managed-repos", "swimmers-repo"},
+            )
+            self.assertEqual(
+                {item["id"] for item in payload["services"]},
+                {"internal-env-manager", "swimmers-server"},
+            )
+            self.assertEqual(
+                {item["id"] for item in payload["logs"]},
+                {"runtime", "repos", "swimmers"},
+            )
+
+            sync = self._run(repo, "sync", "--profile", "swimmers", "--format", "json")
+            self.assertEqual(sync.returncode, 0, sync.stderr)
+            self.assertTrue((repo / "logs" / "swimmers").is_dir())
+
     def test_doctor_fails_when_selected_client_root_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -217,7 +245,16 @@ class RuntimeManagerTests(unittest.TestCase):
             "SKILLBOX_MONOSERVER_ROOT=/monoserver\n"
             "SKILLBOX_MONOSERVER_HOST_ROOT=./monoserver-host\n"
             "SKILLBOX_API_PORT=8000\n"
-            "SKILLBOX_WEB_PORT=3000\n",
+            "SKILLBOX_WEB_PORT=3000\n"
+            "SKILLBOX_SWIMMERS_PORT=3210\n"
+            "SKILLBOX_SWIMMERS_PUBLISH_HOST=127.0.0.1\n"
+            "SKILLBOX_SWIMMERS_REPO=/monoserver/swimmers\n"
+            "SKILLBOX_SWIMMERS_INSTALL_DIR=/home/sandbox/.local/bin\n"
+            "SKILLBOX_SWIMMERS_BIN=/home/sandbox/.local/bin/swimmers\n"
+            "SKILLBOX_SWIMMERS_DOWNLOAD_URL=\n"
+            "SKILLBOX_SWIMMERS_AUTH_MODE=\n"
+            "SKILLBOX_SWIMMERS_AUTH_TOKEN=\n"
+            "SKILLBOX_SWIMMERS_OBSERVER_TOKEN=\n",
             encoding="utf-8",
         )
 
@@ -248,6 +285,16 @@ class RuntimeManagerTests(unittest.TestCase):
             "        kind: directory\n"
             "      sync:\n"
             "        mode: ensure-directory\n"
+            "    - id: swimmers-repo\n"
+            "      kind: repo\n"
+            "      path: ${SKILLBOX_SWIMMERS_REPO}\n"
+            "      required: true\n"
+            "      profiles:\n"
+            "        - swimmers\n"
+            "      source:\n"
+            "        kind: bind\n"
+            "      sync:\n"
+            "        mode: external\n"
             "  skills:\n"
             "    - id: default-skills\n"
             "      kind: packaged-skill-set\n"
@@ -297,6 +344,18 @@ class RuntimeManagerTests(unittest.TestCase):
             "        type: path_exists\n"
             "        path: ${SKILLBOX_WORKSPACE_ROOT}\n"
             "      log: web\n"
+            "    - id: swimmers-server\n"
+            "      kind: tmux-api\n"
+            "      repo: swimmers-repo\n"
+            "      path: ${SKILLBOX_SWIMMERS_REPO}\n"
+            "      required: false\n"
+            "      profiles:\n"
+            "        - swimmers\n"
+            "      command: /workspace/scripts/05-swimmers.sh --inside start\n"
+            "      healthcheck:\n"
+            "        type: path_exists\n"
+            "        path: ${SKILLBOX_LOG_ROOT}/swimmers/swimmers-server.pid\n"
+            "      log: swimmers\n"
             "  logs:\n"
             "    - id: runtime\n"
             "      path: ${SKILLBOX_LOG_ROOT}/runtime\n"
@@ -314,6 +373,10 @@ class RuntimeManagerTests(unittest.TestCase):
             "      path: ${SKILLBOX_LOG_ROOT}/web\n"
             "      profiles:\n"
             "        - surfaces\n"
+            "    - id: swimmers\n"
+            "      path: ${SKILLBOX_LOG_ROOT}/swimmers\n"
+            "      profiles:\n"
+            "        - swimmers\n"
             "  checks:\n"
             "    - id: workspace-root\n"
             "      type: path_exists\n"
@@ -351,6 +414,12 @@ class RuntimeManagerTests(unittest.TestCase):
             "      required: true\n"
             "      profiles:\n"
             "        - core\n"
+            "    - id: swimmers-repo-root\n"
+            "      type: path_exists\n"
+            "      path: ${SKILLBOX_SWIMMERS_REPO}\n"
+            "      required: true\n"
+            "      profiles:\n"
+            "        - swimmers\n"
             "clients:\n"
             "  - id: personal\n"
             "    label: Personal\n"

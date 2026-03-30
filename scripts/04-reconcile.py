@@ -26,12 +26,14 @@ EXPECTED_FILES = [
     ".env.example",
     "Dockerfile",
     "docker-compose.yml",
+    "docker-compose.swimmers.yml",
     ".env-manager/README.md",
     ".env-manager/manage.py",
     "docker/sandbox-entrypoint.sh",
     "scripts/01-bootstrap-do.sh",
     "scripts/02-install-tailscale.sh",
     "scripts/03-skill-sync.sh",
+    "scripts/05-swimmers.sh",
     "scripts/package_skill.py",
     "scripts/quick_validate.py",
     "scripts/lib/__init__.py",
@@ -145,16 +147,27 @@ def build_model() -> dict[str, Any]:
         packaged_skill_bundles[0] if packaged_skill_bundles else {},
     )
 
+    home_root = str(paths.get("claude_root", "")).rsplit("/.claude", 1)[0]
+    monoserver_root = str(paths.get("monoserver_root", ""))
     expected_env = {
         "SKILLBOX_NAME": str(sandbox.get("name", "")),
         "SKILLBOX_WORKSPACE_ROOT": str(paths.get("workspace_root", "")),
         "SKILLBOX_REPOS_ROOT": str(paths.get("repos_root", "")),
         "SKILLBOX_SKILLS_ROOT": str(paths.get("skills_root", "")),
         "SKILLBOX_LOG_ROOT": str(paths.get("log_root", "")),
-        "SKILLBOX_HOME_ROOT": str(paths.get("claude_root", "")).rsplit("/.claude", 1)[0],
-        "SKILLBOX_MONOSERVER_ROOT": str(paths.get("monoserver_root", "")),
+        "SKILLBOX_HOME_ROOT": home_root,
+        "SKILLBOX_MONOSERVER_ROOT": monoserver_root,
         "SKILLBOX_API_PORT": str(ports.get("api", "")),
         "SKILLBOX_WEB_PORT": str(ports.get("web", "")),
+        "SKILLBOX_SWIMMERS_PORT": str(ports.get("swimmers", "")),
+        "SKILLBOX_SWIMMERS_PUBLISH_HOST": "127.0.0.1",
+        "SKILLBOX_SWIMMERS_REPO": f"{monoserver_root}/swimmers",
+        "SKILLBOX_SWIMMERS_INSTALL_DIR": f"{home_root}/.local/bin",
+        "SKILLBOX_SWIMMERS_BIN": f"{home_root}/.local/bin/swimmers",
+        "SKILLBOX_SWIMMERS_DOWNLOAD_URL": "",
+        "SKILLBOX_SWIMMERS_AUTH_MODE": "",
+        "SKILLBOX_SWIMMERS_AUTH_TOKEN": "",
+        "SKILLBOX_SWIMMERS_OBSERVER_TOKEN": "",
     }
     runtime_env = {key: value for key, value in expected_env.items() if key != "SKILLBOX_NAME"}
     expected_mounts = [
@@ -213,11 +226,13 @@ def run_command(args: list[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
-def compose_config(include_surfaces: bool) -> dict[str, Any]:
+def compose_config(include_surfaces: bool, include_swimmers: bool = False) -> dict[str, Any]:
     if shutil.which("docker") is None:
         raise RuntimeError("`docker` is not installed or not on PATH")
 
-    args = ["docker", "compose"]
+    args = ["docker", "compose", "-f", "docker-compose.yml"]
+    if include_swimmers:
+        args.extend(["-f", "docker-compose.swimmers.yml"])
     if include_surfaces:
         args.extend(["--profile", "surfaces"])
     args.extend(["config", "--format", "json"])
@@ -336,6 +351,7 @@ def check_compose_model(model: dict[str, Any]) -> list[CheckResult]:
     try:
         base_config = compose_config(include_surfaces=False)
         surfaces_config = compose_config(include_surfaces=True)
+        swimmers_config = compose_config(include_surfaces=False, include_swimmers=True)
     except RuntimeError as exc:
         return [
             CheckResult(
@@ -350,7 +366,7 @@ def check_compose_model(model: dict[str, Any]) -> list[CheckResult]:
         CheckResult(
             status="pass",
             code="compose-config",
-            message="docker compose config resolved for default and surfaces profiles",
+            message="docker compose config resolved for default, surfaces, and swimmers overlay variants",
         )
     ]
 
@@ -432,6 +448,43 @@ def check_compose_model(model: dict[str, Any]) -> list[CheckResult]:
                 status="pass",
                 code="compose-surfaces",
                 message="api/web services match manifest-derived env, profile, and ports",
+            )
+        )
+
+    swimmers_issues: list[str] = []
+    swimmers_workspace = (swimmers_config.get("services") or {}).get("workspace") or {}
+    if (swimmers_workspace.get("environment") or {}) != model["runtime_env"]:
+        swimmers_issues.append("swimmers workspace environment does not match manifest-derived runtime env")
+
+    expected_swimmers_port = int(model["sandbox"]["ports"].get("swimmers"))
+    expected_swimmers_host = model["expected_env"]["SKILLBOX_SWIMMERS_PUBLISH_HOST"]
+    swimmers_ports = swimmers_workspace.get("ports") or []
+    if len(swimmers_ports) != 1:
+        swimmers_issues.append("swimmers workspace overlay should publish exactly one port")
+    else:
+        published = swimmers_ports[0]
+        if published.get("host_ip") != expected_swimmers_host:
+            swimmers_issues.append("swimmers workspace overlay host_ip does not match SKILLBOX_SWIMMERS_PUBLISH_HOST")
+        if int(published.get("target", 0)) != expected_swimmers_port:
+            swimmers_issues.append("swimmers workspace overlay target port does not match sandbox.ports.swimmers")
+        if str(published.get("published")) != str(expected_swimmers_port):
+            swimmers_issues.append("swimmers workspace overlay published port does not match sandbox.ports.swimmers")
+
+    if swimmers_issues:
+        results.append(
+            CheckResult(
+                status="fail",
+                code="compose-swimmers",
+                message="workspace swimmers overlay drifted from the manifests",
+                details={"issues": swimmers_issues},
+            )
+        )
+    else:
+        results.append(
+            CheckResult(
+                status="pass",
+                code="compose-swimmers",
+                message="workspace swimmers overlay matches manifest-derived env and port publishing",
             )
         )
 
@@ -597,6 +650,7 @@ def check_runtime_manager_doctor() -> CheckResult:
 def compose_summary(model: dict[str, Any]) -> dict[str, Any]:
     base_config = compose_config(include_surfaces=False)
     surfaces_config = compose_config(include_surfaces=True)
+    swimmers_config = compose_config(include_surfaces=False, include_swimmers=True)
 
     def service_summary(service: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -613,6 +667,7 @@ def compose_summary(model: dict[str, Any]) -> dict[str, Any]:
     return {
         "project_name": base_config.get("name"),
         "workspace": service_summary(services.get("workspace") or {}),
+        "workspace_swimmers": service_summary((swimmers_config.get("services") or {}).get("workspace") or {}),
         "api": service_summary(surfaces_services.get("api") or {}),
         "web": service_summary(surfaces_services.get("web") or {}),
         "expected_runtime_env": model["runtime_env"],
@@ -676,6 +731,7 @@ def print_render_text(payload: dict[str, Any]) -> None:
         print("compose:")
         print(f"  project: {compose.get('project_name')}")
         print(f"  workspace working_dir: {compose['workspace'].get('working_dir')}")
+        print(f"  swimmers workspace ports: {compose['workspace_swimmers'].get('ports')}")
         print(f"  api ports: {compose['api'].get('ports')}")
         print(f"  web ports: {compose['web'].get('ports')}")
 

@@ -29,6 +29,18 @@ core:
         mode: ensure-directory
       notes: Managed in-repo repos root for local box-only work.
 
+    - id: swimmers-repo
+      kind: repo
+      path: ${SKILLBOX_SWIMMERS_REPO}
+      required: true
+      profiles:
+        - swimmers
+      source:
+        kind: bind
+      sync:
+        mode: external
+      notes: Optional sibling swimmers repo used for the workspace-local tmux API.
+
   skills:
     - id: default-skills
       kind: packaged-skill-set
@@ -91,6 +103,21 @@ core:
       log: web
       notes: Optional browser surface for sandbox inspection.
 
+    - id: swimmers-server
+      kind: tmux-api
+      owner: local
+      repo: swimmers-repo
+      path: ${SKILLBOX_SWIMMERS_REPO}
+      required: false
+      profiles:
+        - swimmers
+      command: /workspace/scripts/05-swimmers.sh --inside start
+      healthcheck:
+        type: path_exists
+        path: ${SKILLBOX_LOG_ROOT}/swimmers/swimmers-server.pid
+      log: swimmers
+      notes: Workspace-local swimmers API that shares the tmux namespace with the agents.
+
   logs:
     - id: runtime
       path: ${SKILLBOX_LOG_ROOT}/runtime
@@ -123,6 +150,14 @@ core:
         - surfaces
       retention_days: 7
       notes: Web surface logs.
+
+    - id: swimmers
+      path: ${SKILLBOX_LOG_ROOT}/swimmers
+      required: false
+      profiles:
+        - swimmers
+      retention_days: 14
+      notes: swimmers install, process, and probe logs.
 
   checks:
     - id: workspace-root
@@ -172,6 +207,14 @@ core:
       profiles:
         - core
       notes: Internal manager entrypoint should exist.
+
+    - id: swimmers-repo-root
+      type: path_exists
+      path: ${SKILLBOX_SWIMMERS_REPO}
+      required: true
+      profiles:
+        - swimmers
+      notes: swimmers overlay expects the sibling swimmers repo to be mounted.
 
 clients:
   - id: personal

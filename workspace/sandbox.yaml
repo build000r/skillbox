@@ -11,6 +11,7 @@ sandbox:
     ssh_mode: host
   ports:
     api: 8000
+    swimmers: 3210
     web: 3000
   paths:
     workspace_root: /workspace
@@ -24,4 +25,5 @@ sandbox:
     - ssh
     - manual
     - api
+    - swimmers
     - web

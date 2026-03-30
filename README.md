@@ -34,6 +34,7 @@ right client context without standing up a full hosted workspace control plane.
 - run one main Docker workspace container
 - mount `home/.claude` and `home/.codex` into that box
 - mount the host parent directory at `/monoserver` for client repo roots
+- optionally run a workspace-local `swimmers` API against the same tmux namespace as the agents
 - keep one stable core machine and layer client-specific overlays on top
 - declare the inside of the box with a runtime graph for repos, installed skills, services, logs, and checks
 - pin and package default skills locally
@@ -81,6 +82,50 @@ What that gives you:
 - optional API and web inspection surfaces
 - packaged default `.skill` bundles under `default-skills/`
 - installed default skills under `home/.claude/skills` and `home/.codex/skills`
+
+## Swimmers Overlay
+
+If tmux-backed agents live inside the `workspace` container, the clean path is
+to run `swimmers` there too and keep the TUI on the operator machine.
+
+```bash
+make swimmers-install
+make swimmers-start
+make swimmers-status
+make swimmers-runtime-status
+```
+
+What this overlay does:
+
+- starts the `workspace` container with `docker-compose.swimmers.yml`
+- keeps the API inside the same container and tmux namespace as the agents
+- treats `../swimmers` as the mounted sibling repo at `/monoserver/swimmers`
+- installs a runnable binary at `/home/sandbox/.local/bin/swimmers`
+- records process state and logs under `logs/swimmers/`
+
+Safety model:
+
+- the swimmers port is `3210`
+- the compose overlay publishes only to `127.0.0.1` by default
+- remote access requires opting in with `SKILLBOX_SWIMMERS_PUBLISH_HOST=0.0.0.0`
+- non-loopback publishing is blocked unless `SKILLBOX_SWIMMERS_AUTH_MODE=token` and `SKILLBOX_SWIMMERS_AUTH_TOKEN` are set
+
+Remote operator example:
+
+```bash
+# on the client skillbox
+cat >> .env <<'EOF'
+SKILLBOX_SWIMMERS_PUBLISH_HOST=0.0.0.0
+SKILLBOX_SWIMMERS_AUTH_MODE=token
+SKILLBOX_SWIMMERS_AUTH_TOKEN=replace-me
+EOF
+make swimmers-start
+
+# on the operator machine
+AUTH_MODE=token AUTH_TOKEN=replace-me \
+SWIMMERS_TUI_URL=http://<tailnet-ip>:3210 \
+cargo run --bin swimmers-tui
+```
 
 ## Design Philosophy
 
@@ -220,6 +265,13 @@ make runtime-sync
 | `make down` | Stops all containers |
 | `make shell` | Opens a shell inside the workspace container |
 | `make logs` | Tails compose logs |
+| `make swimmers-install` | Installs a runnable swimmers binary inside the workspace container |
+| `make swimmers-start` | Starts swimmers inside the workspace container with the swimmers compose overlay |
+| `make swimmers-stop` | Stops the managed swimmers process |
+| `make swimmers-restart` | Restarts the managed swimmers process |
+| `make swimmers-status` | Reports swimmers process and probe state inside the workspace container |
+| `make swimmers-logs` | Tails swimmers server logs from inside the workspace container |
+| `make swimmers-runtime-status` | Shows the runtime-manager view of the swimmers overlay |
 
 ### Scripts
 
@@ -230,6 +282,7 @@ make runtime-sync
 | `scripts/03-skill-sync.sh` | Resolve, stage, validate, and package default skills | `./scripts/03-skill-sync.sh --dry-run` |
 | `scripts/04-reconcile.py render` | Print the resolved sandbox model | `python3 scripts/04-reconcile.py render --with-compose` |
 | `scripts/04-reconcile.py doctor` | Run drift and readiness checks | `python3 scripts/04-reconcile.py doctor` |
+| `scripts/05-swimmers.sh` | Manage the workspace-local swimmers install and process lifecycle | `./scripts/05-swimmers.sh status` |
 | `.env-manager/manage.py render` | Print the resolved internal runtime graph | `python3 .env-manager/manage.py render --format json` |
 | `.env-manager/manage.py sync` | Create managed repo/log directories and install declared skills for the selected core/client scope | `python3 .env-manager/manage.py sync --client personal --dry-run` |
 | `.env-manager/manage.py doctor` | Validate the internal repos/skills/logs/check graph for the selected core/client scope | `python3 .env-manager/manage.py doctor --client personal` |
@@ -252,6 +305,15 @@ SKILLBOX_MONOSERVER_ROOT=/monoserver
 SKILLBOX_MONOSERVER_HOST_ROOT=..
 SKILLBOX_API_PORT=8000
 SKILLBOX_WEB_PORT=3000
+SKILLBOX_SWIMMERS_PORT=3210
+SKILLBOX_SWIMMERS_PUBLISH_HOST=127.0.0.1
+SKILLBOX_SWIMMERS_REPO=/monoserver/swimmers
+SKILLBOX_SWIMMERS_INSTALL_DIR=/home/sandbox/.local/bin
+SKILLBOX_SWIMMERS_BIN=/home/sandbox/.local/bin/swimmers
+SKILLBOX_SWIMMERS_DOWNLOAD_URL=
+SKILLBOX_SWIMMERS_AUTH_MODE=
+SKILLBOX_SWIMMERS_AUTH_TOKEN=
+SKILLBOX_SWIMMERS_OBSERVER_TOKEN=
 ```
 
 ### Default skill sources

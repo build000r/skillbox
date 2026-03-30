@@ -1,0 +1,4 @@
+services:
+  workspace:
+    ports:
+      - "${SKILLBOX_SWIMMERS_PUBLISH_HOST:-127.0.0.1}:${SKILLBOX_SWIMMERS_PORT:-3210}:${SKILLBOX_SWIMMERS_PORT:-3210}"

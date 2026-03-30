@@ -10,13 +10,15 @@ HOME_ROOT="${SKILLBOX_HOME_ROOT:-/home/sandbox}"
 mkdir -p \
   "${LOG_ROOT}/api" \
   "${LOG_ROOT}/runtime" \
+  "${LOG_ROOT}/swimmers" \
   "${LOG_ROOT}/web" \
   "${REPOS_ROOT}" \
   "${SKILLS_ROOT}" \
   "${HOME_ROOT}/.claude" \
   "${HOME_ROOT}/.claude/skills" \
   "${HOME_ROOT}/.codex" \
-  "${HOME_ROOT}/.codex/skills"
+  "${HOME_ROOT}/.codex/skills" \
+  "${HOME_ROOT}/.local/bin"
 
 if [[ ! -f "${WORKSPACE_ROOT}/.env" ]]; then
   {

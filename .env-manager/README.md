@@ -13,6 +13,7 @@ python3 .env-manager/manage.py doctor
 python3 .env-manager/manage.py status
 python3 .env-manager/manage.py sync --client personal
 python3 .env-manager/manage.py render --client personal --profile surfaces
+python3 .env-manager/manage.py status --profile swimmers
 ```
 
 `sync` reconciles repo/log directories and installs the declared packaged skill

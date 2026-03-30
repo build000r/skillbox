@@ -2,7 +2,7 @@ COMPOSE := docker compose
 PROFILE_ARGS := $(if $(strip $(PROFILE)),--profile $(PROFILE),)
 CLIENT_ARGS := $(if $(strip $(CLIENT)),--client $(CLIENT),)
 
-.PHONY: help bootstrap-env render doctor runtime-render runtime-sync runtime-status dev-sanity build up up-surfaces down shell logs
+.PHONY: help bootstrap-env render doctor runtime-render runtime-sync runtime-status dev-sanity build up up-surfaces down shell logs swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status
 
 help:
 	@printf "  make bootstrap-env  Copy .env.example to .env if missing\n"
@@ -18,6 +18,13 @@ help:
 	@printf "  make down           Stop all containers\n"
 	@printf "  make shell          Open a shell in the workspace container\n"
 	@printf "  make logs           Tail compose logs\n"
+	@printf "  make swimmers-install        Install the swimmers binary inside the workspace container\n"
+	@printf "  make swimmers-start          Start swimmers inside the workspace container with the swimmers compose overlay\n"
+	@printf "  make swimmers-stop           Stop the managed swimmers process inside the workspace container\n"
+	@printf "  make swimmers-restart        Restart the managed swimmers process inside the workspace container\n"
+	@printf "  make swimmers-status         Report swimmers workspace-local process and probe state\n"
+	@printf "  make swimmers-logs           Tail swimmers server logs inside the workspace container\n"
+	@printf "  make swimmers-runtime-status Summarize the runtime-manager swimmers overlay state\n"
 
 bootstrap-env:
 	@test -f .env || cp .env.example .env
@@ -57,3 +64,24 @@ shell: bootstrap-env
 
 logs:
 	@$(COMPOSE) logs -f --tail=200
+
+swimmers-install: bootstrap-env
+	@./scripts/05-swimmers.sh install
+
+swimmers-start: bootstrap-env
+	@./scripts/05-swimmers.sh start
+
+swimmers-stop: bootstrap-env
+	@./scripts/05-swimmers.sh stop
+
+swimmers-restart: bootstrap-env
+	@./scripts/05-swimmers.sh restart
+
+swimmers-status: bootstrap-env
+	@./scripts/05-swimmers.sh status
+
+swimmers-logs: bootstrap-env
+	@./scripts/05-swimmers.sh logs
+
+swimmers-runtime-status:
+	@python3 .env-manager/manage.py status --profile swimmers $(CLIENT_ARGS)

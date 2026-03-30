@@ -57,6 +57,12 @@ runtime_services:
     required: false
     notes: Optional inspection surface for sandbox metadata.
 
+  - id: swimmers-server
+    kind: tmux-api
+    owner: local
+    required: false
+    notes: Optional swimmers API that runs inside the workspace container alongside tmux-backed agents.
+
   - id: web-stub
     kind: http
     owner: local
