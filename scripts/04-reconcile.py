@@ -185,6 +185,7 @@ def build_model() -> dict[str, Any]:
             "script": str(ROOT_DIR / ".env-manager" / "manage.py"),
             "manifest_file": runtime_model["manifest_file"],
             "repos": runtime_model["repos"],
+            "skills": runtime_model["skills"],
             "services": runtime_model["services"],
             "logs": runtime_model["logs"],
             "checks": runtime_model["checks"],
@@ -535,6 +536,7 @@ def check_runtime_manager_model(model: dict[str, Any]) -> CheckResult:
         details={
             "manifest": repo_rel(Path(runtime_manager["manifest_file"])),
             "repos": len(runtime_manager["repos"]),
+            "skills": len(runtime_manager["skills"]),
             "services": len(runtime_manager["services"]),
             "logs": len(runtime_manager["logs"]),
             "checks": len(runtime_manager["checks"]),
@@ -649,6 +651,7 @@ def print_render_text(payload: dict[str, Any]) -> None:
     print(f"  script: {repo_rel(Path(runtime_manager['script']))}")
     print(f"  manifest: {repo_rel(Path(runtime_manager['manifest_file']))}")
     print(f"  repos: {len(runtime_manager['repos'])}")
+    print(f"  skills: {len(runtime_manager['skills'])}")
     print(f"  services: {len(runtime_manager['services'])}")
     print(f"  logs: {len(runtime_manager['logs'])}")
     print(f"  checks: {len(runtime_manager['checks'])}")

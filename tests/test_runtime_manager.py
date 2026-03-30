@@ -4,6 +4,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 
@@ -12,20 +13,27 @@ MANAGER = ROOT_DIR / ".env-manager" / "manage.py"
 
 
 class RuntimeManagerTests(unittest.TestCase):
-    def test_sync_creates_managed_directories(self) -> None:
+    def test_sync_creates_managed_directories_and_installs_default_skills(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
             self._write_fixture(repo)
 
-            result = self._run(repo, "sync")
+            result = self._run(repo, "sync", "--format", "json")
 
             self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            actions = payload["actions"]
             self.assertTrue((repo / "repos").is_dir())
             self.assertTrue((repo / "logs" / "runtime").is_dir())
             self.assertTrue((repo / "logs" / "api").is_dir())
             self.assertTrue((repo / "logs" / "web").is_dir())
+            self.assertTrue((repo / "home" / ".claude" / "skills" / "sample-skill" / "SKILL.md").is_file())
+            self.assertTrue((repo / "home" / ".codex" / "skills" / "sample-skill" / "SKILL.md").is_file())
+            self.assertTrue((repo / "workspace" / "default-skills.lock.json").is_file())
+            self.assertTrue(any("install-skill:" in action for action in actions))
+            self.assertTrue(any("write-lockfile:" in action for action in actions))
 
-    def test_render_resolves_runtime_placeholders(self) -> None:
+    def test_render_resolves_runtime_placeholders_for_skill_sets(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
             self._write_fixture(repo)
@@ -35,8 +43,14 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads(result.stdout)
             repos = {item["id"]: item for item in payload["repos"]}
+            skills = {item["id"]: item for item in payload["skills"]}
             self.assertEqual(repos["skillbox-self"]["path"], "/workspace")
             self.assertEqual(repos["managed-repos"]["path"], "/workspace/repos")
+            self.assertEqual(skills["default-skills"]["bundle_dir"], "/workspace/default-skills")
+            self.assertEqual(
+                skills["default-skills"]["install_targets"][0]["path"],
+                "/home/sandbox/.claude/skills",
+            )
 
     def test_doctor_warns_before_sync_and_passes_after_sync(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -46,8 +60,10 @@ class RuntimeManagerTests(unittest.TestCase):
             before = self._run(repo, "doctor", "--format", "json")
             self.assertEqual(before.returncode, 0, before.stderr)
             before_results = json.loads(before.stdout)
-            warning_codes = {item["code"] for item in before_results if item["status"] == "warn"}
-            self.assertIn("runtime-log-paths", warning_codes)
+            before_warning_codes = {item["code"] for item in before_results if item["status"] == "warn"}
+            self.assertIn("runtime-log-paths", before_warning_codes)
+            self.assertIn("skill-lock-state", before_warning_codes)
+            self.assertIn("skill-install-state", before_warning_codes)
 
             sync = self._run(repo, "sync")
             self.assertEqual(sync.returncode, 0, sync.stderr)
@@ -55,8 +71,67 @@ class RuntimeManagerTests(unittest.TestCase):
             after = self._run(repo, "doctor", "--format", "json")
             self.assertEqual(after.returncode, 0, after.stderr)
             after_results = json.loads(after.stdout)
-            warning_codes = {item["code"] for item in after_results if item["status"] == "warn"}
-            self.assertNotIn("runtime-log-paths", warning_codes)
+            after_warning_codes = {item["code"] for item in after_results if item["status"] == "warn"}
+            after_failure_codes = {item["code"] for item in after_results if item["status"] == "fail"}
+            self.assertNotIn("runtime-log-paths", after_warning_codes)
+            self.assertNotIn("skill-lock-state", after_warning_codes)
+            self.assertNotIn("skill-install-state", after_warning_codes)
+            self.assertEqual(after_failure_codes, set(), after_results)
+
+    def test_status_reports_installed_skill_targets_and_lock_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            sync = self._run(repo, "sync")
+            self.assertEqual(sync.returncode, 0, sync.stderr)
+
+            status = self._run(repo, "status", "--format", "json")
+            self.assertEqual(status.returncode, 0, status.stderr)
+            payload = json.loads(status.stdout)
+            skillset = payload["skills"][0]
+            skill_entry = skillset["skills"][0]
+            target_states = {target["id"]: target["state"] for target in skill_entry["targets"]}
+
+            self.assertTrue(skillset["lock_present"])
+            self.assertEqual(skill_entry["name"], "sample-skill")
+            self.assertEqual(target_states["claude"], "ok")
+            self.assertEqual(target_states["codex"], "ok")
+
+    def test_doctor_fails_when_declared_bundle_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo, include_bundle=False)
+
+            result = self._run(repo, "doctor", "--format", "json")
+
+            self.assertEqual(result.returncode, 1)
+            payload = json.loads(result.stdout)
+            failure_codes = {item["code"] for item in payload if item["status"] == "fail"}
+            self.assertIn("skill-bundle-state", failure_codes)
+
+    def test_doctor_fails_when_installed_skill_drifts_from_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            sync = self._run(repo, "sync")
+            self.assertEqual(sync.returncode, 0, sync.stderr)
+
+            (repo / "home" / ".claude" / "skills" / "sample-skill" / "SKILL.md").write_text(
+                "---\nname: sample-skill\ndescription: drifted\n---\n",
+                encoding="utf-8",
+            )
+
+            result = self._run(repo, "doctor", "--format", "json")
+
+            self.assertEqual(result.returncode, 1)
+            payload = json.loads(result.stdout)
+            install_failures = [
+                item for item in payload if item["status"] == "fail" and item["code"] == "skill-install-state"
+            ]
+            self.assertEqual(len(install_failures), 1, payload)
+            self.assertIn("claude", " ".join(install_failures[0]["details"]["issues"]))
 
     def _run(self, repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -66,7 +141,7 @@ class RuntimeManagerTests(unittest.TestCase):
             check=False,
         )
 
-    def _write_fixture(self, repo: Path) -> None:
+    def _write_fixture(self, repo: Path, include_bundle: bool = True) -> None:
         (repo / ".env.example").write_text(
             "SKILLBOX_NAME=skillbox\n"
             "SKILLBOX_WORKSPACE_ROOT=/workspace\n"
@@ -100,6 +175,21 @@ class RuntimeManagerTests(unittest.TestCase):
             "      kind: directory\n"
             "    sync:\n"
             "      mode: ensure-directory\n"
+            "skills:\n"
+            "  - id: default-skills\n"
+            "    kind: packaged-skill-set\n"
+            "    required: true\n"
+            "    bundle_dir: ${SKILLBOX_WORKSPACE_ROOT}/default-skills\n"
+            "    manifest: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.manifest\n"
+            "    sources_config: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.sources.yaml\n"
+            "    lock_path: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.lock.json\n"
+            "    sync:\n"
+            "      mode: unpack-bundles\n"
+            "    install_targets:\n"
+            "      - id: claude\n"
+            "        path: ${SKILLBOX_HOME_ROOT}/.claude/skills\n"
+            "      - id: codex\n"
+            "        path: ${SKILLBOX_HOME_ROOT}/.codex/skills\n"
             "services:\n"
             "  - id: internal-env-manager\n"
             "    kind: orchestration\n"
@@ -135,11 +225,41 @@ class RuntimeManagerTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+        (repo / "workspace" / "default-skills.manifest").write_text("sample-skill\n", encoding="utf-8")
+        (repo / "workspace" / "default-skills.sources.yaml").write_text(
+            "version: 1\n"
+            "sources:\n"
+            "  - kind: local\n"
+            "    path: ./skills\n",
+            encoding="utf-8",
+        )
+
+        (repo / "default-skills").mkdir(parents=True, exist_ok=True)
+        if include_bundle:
+            self._write_skill_bundle(repo / "default-skills" / "sample-skill.skill")
+
         (repo / "skills").mkdir(parents=True, exist_ok=True)
         (repo / "logs").mkdir(parents=True, exist_ok=True)
         (repo / "repos").mkdir(parents=True, exist_ok=True)
+        (repo / "home" / ".claude").mkdir(parents=True, exist_ok=True)
+        (repo / "home" / ".codex").mkdir(parents=True, exist_ok=True)
         (repo / ".env-manager").mkdir(parents=True, exist_ok=True)
         (repo / ".env-manager" / "manage.py").write_text("# stub\n", encoding="utf-8")
+
+    def _write_skill_bundle(self, bundle_path: Path) -> None:
+        with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(
+                "sample-skill/SKILL.md",
+                "---\n"
+                "name: sample-skill\n"
+                "description: Fixture skill for runtime manager tests.\n"
+                "---\n\n"
+                "# Sample Skill\n",
+            )
+            archive.writestr(
+                "sample-skill/references/overview.md",
+                "fixture reference\n",
+            )
 
 
 if __name__ == "__main__":

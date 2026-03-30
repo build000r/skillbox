@@ -30,7 +30,7 @@ Most remote dev setups overshoot the need. You want one private box, one primary
 - SSH to the host over Tailscale
 - run one main Docker workspace container
 - mount `home/.claude` and `home/.codex` into that box
-- declare the inside of the box with a runtime graph for repos, services, logs, and checks
+- declare the inside of the box with a runtime graph for repos, installed skills, services, logs, and checks
 - pin and package default skills locally
 - validate outer drift with `make doctor` and inner drift with `make dev-sanity`
 
@@ -40,7 +40,7 @@ Most remote dev setups overshoot the need. You want one private box, one primary
 |---|---|
 | Private access without public SSH exposure | Tailscale host access plus host hardening scripts |
 | A workspace that feels like a narrowed local setup | One bind-mounted `/workspace` with `repos/`, `skills/`, `logs/`, and home mounts |
-| A sane way to let the box grow over time | `workspace/runtime.yaml` plus `.env-manager/manage.py` manage internal repos, logs, and checks |
+| A sane way to let the box grow over time | `workspace/runtime.yaml` plus `.env-manager/manage.py` manage internal repos, installed skills, logs, and checks |
 | Reproducible default skills | `03-skill-sync.sh` packages from a pinned manifest and vendored local packager |
 | Confidence that docs/config/runtime still match | `04-reconcile.py` powers `make render` and `make doctor`, while `make dev-sanity` validates the box internals |
 | Minimal surface area | No multi-tenant control plane, no hosted dependency, no hidden sibling repo requirement for packaging |
@@ -73,6 +73,7 @@ What that gives you:
 - a running workspace container
 - optional API and web inspection surfaces
 - packaged default `.skill` bundles under `default-skills/`
+- installed default skills under `home/.claude/skills` and `home/.codex/skills`
 
 ## Design Philosophy
 
@@ -86,7 +87,7 @@ SSH lands on the host. Docker Compose runs the workspace and optional surfaces. 
 
 ### 3. Declarative enough to check, not so abstract it disappears
 
-`workspace/sandbox.yaml`, `workspace/dependencies.yaml`, `workspace/runtime.yaml`, and the skill manifests describe the intended box. `make doctor` checks the outer shell, and `make dev-sanity` checks the interior graph.
+`workspace/sandbox.yaml`, `workspace/dependencies.yaml`, `workspace/runtime.yaml`, and the skill manifests describe the intended box. `make doctor` checks the outer shell, and `make dev-sanity` checks the interior graph plus managed skill install state.
 
 ### 4. Portable skill packaging matters
 
@@ -98,7 +99,7 @@ The repo includes enough surfaces to inspect and validate the shape, but not so 
 
 ### 6. The box should describe its internals, not just its container
 
-The new internal `.env-manager` layer is intentionally small. It does not try to become a second platform; it gives the box one declared source of truth for repos, services, logs, and sanity checks so the workspace can accrete without turning into guesswork.
+The new internal `.env-manager` layer is intentionally small. It does not try to become a second platform; it gives the box one declared source of truth for repos, installed skills, services, logs, and sanity checks so the workspace can accrete without turning into guesswork.
 
 ## Comparison
 
@@ -203,9 +204,9 @@ make runtime-sync
 | `make render` | Prints the resolved sandbox model |
 | `make doctor` | Validates manifest/runtime drift, Compose wiring, and skill sync |
 | `make runtime-render` | Prints the resolved internal runtime graph |
-| `make runtime-sync` | Creates managed repo and log directories declared by the runtime graph |
-| `make runtime-status` | Summarizes declared repos, services, logs, and checks |
-| `make dev-sanity` | Validates the internal runtime graph and filesystem readiness |
+| `make runtime-sync` | Creates managed repo/log directories and installs declared default skills with a generated lockfile |
+| `make runtime-status` | Summarizes declared repos, skills, services, logs, and checks |
+| `make dev-sanity` | Validates the internal runtime graph, filesystem readiness, and managed skill integrity |
 | `make build` | Builds the workspace image |
 | `make up` | Starts the workspace container |
 | `make up-surfaces` | Starts the API and web stub surfaces |
@@ -223,9 +224,9 @@ make runtime-sync
 | `scripts/04-reconcile.py render` | Print the resolved sandbox model | `python3 scripts/04-reconcile.py render --with-compose` |
 | `scripts/04-reconcile.py doctor` | Run drift and readiness checks | `python3 scripts/04-reconcile.py doctor` |
 | `.env-manager/manage.py render` | Print the resolved internal runtime graph | `python3 .env-manager/manage.py render --format json` |
-| `.env-manager/manage.py sync` | Create managed repo and log directories | `python3 .env-manager/manage.py sync --dry-run` |
-| `.env-manager/manage.py doctor` | Validate the internal repos/logs/check graph | `python3 .env-manager/manage.py doctor` |
-| `.env-manager/manage.py status` | Summarize runtime state and live stub health | `python3 .env-manager/manage.py status` |
+| `.env-manager/manage.py sync` | Create managed repo/log directories and install declared default skills | `python3 .env-manager/manage.py sync --dry-run` |
+| `.env-manager/manage.py doctor` | Validate the internal repos/skills/logs/check graph | `python3 .env-manager/manage.py doctor` |
+| `.env-manager/manage.py status` | Summarize repo, skill, service, log, and health state | `python3 .env-manager/manage.py status` |
 
 ## Configuration
 
@@ -267,6 +268,17 @@ sources:
 ```text
 ask-cascade
 ```
+
+### Generated skill lockfile
+
+`make runtime-sync` now writes `workspace/default-skills.lock.json`, which records:
+
+- the current manifest and sources-config digests
+- the bundle digests for each declared default skill
+- the installed tree hashes for the managed Claude and Codex skill homes
+
+The lockfile is generated state and is gitignored, so running sync does not
+turn normal local runtime reconciliation into noisy repo dirt.
 
 ### Sandbox model
 
@@ -320,6 +332,21 @@ repos:
       kind: directory
     sync:
       mode: ensure-directory
+
+skills:
+  - id: default-skills
+    kind: packaged-skill-set
+    bundle_dir: ${SKILLBOX_WORKSPACE_ROOT}/default-skills
+    manifest: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.manifest
+    sources_config: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.sources.yaml
+    lock_path: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.lock.json
+    sync:
+      mode: unpack-bundles
+    install_targets:
+      - id: claude
+        path: ${SKILLBOX_HOME_ROOT}/.claude/skills
+      - id: codex
+        path: ${SKILLBOX_HOME_ROOT}/.codex/skills
 
 services:
   - id: internal-env-manager
@@ -382,9 +409,9 @@ checks:
        +----------------------------------+
        | managed box internals            |
        |----------------------------------|
-       | repos, logs, runtime checks      |
+       | repos, installed skills, checks  |
        | api/web stub health probes       |
-       | default skill bundles            |
+       | default skill bundles + lockfile |
        +----------------------------------+
 ```
 
@@ -394,9 +421,9 @@ checks:
 
 Check that Docker is installed and `docker compose config --format json` works on the host.
 
-### `make dev-sanity` warns about missing log directories
+### `make dev-sanity` warns about missing log directories or managed skill installs
 
-That is expected on a fresh clone. The runtime graph declares `logs/runtime` and `logs/repos`, but they are created on demand.
+That is expected on a fresh clone. The runtime graph declares `logs/runtime` and `logs/repos`, and the managed skill install roots plus lockfile are also created on demand.
 
 Run:
 
@@ -443,6 +470,7 @@ Re-run:
 
 ```bash
 ./scripts/03-skill-sync.sh
+make runtime-sync
 make doctor
 ```
 
@@ -471,7 +499,7 @@ So the box shape stays reproducible. You can replace the placeholder contents wi
 
 ### Why is there both `workspace/dependencies.yaml` and `workspace/runtime.yaml`?
 
-`workspace/dependencies.yaml` describes the runtime categories the box exposes. `workspace/runtime.yaml` declares the interior graph the new internal manager actually operates on: repos, services, logs, and checks.
+`workspace/dependencies.yaml` describes the runtime categories the box exposes. `workspace/runtime.yaml` declares the interior graph the new internal manager actually operates on: repos, installed skills, services, logs, and checks.
 
 ### Why ship a vendored skill packager?
 

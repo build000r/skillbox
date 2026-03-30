@@ -154,6 +154,7 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
         "version": resolved.get("version", 1),
         "env": {key: env_values.get(key, "") for key in RUNTIME_ENV_KEYS},
         "repos": _normalized_items(resolved.get("repos"), "repos"),
+        "skills": _normalized_items(resolved.get("skills"), "skills"),
         "services": _normalized_items(resolved.get("services"), "services"),
         "logs": _normalized_items(resolved.get("logs"), "logs"),
         "checks": _normalized_items(resolved.get("checks"), "checks"),
@@ -167,6 +168,29 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
         repo.setdefault("source", {})
         if repo.get("path"):
             repo["host_path"] = str(runtime_path_to_host_path(root_dir, model["env"], str(repo["path"])))
+
+    for skill in model["skills"]:
+        skill.setdefault("kind", "packaged-skill-set")
+        skill.setdefault("required", False)
+        skill.setdefault("profiles", [])
+        skill.setdefault("sync", {})
+        skill.setdefault("install_targets", [])
+        for field in ("bundle_dir", "manifest", "sources_config", "lock_path"):
+            if skill.get(field):
+                skill[f"{field}_host_path"] = str(
+                    runtime_path_to_host_path(root_dir, model["env"], str(skill[field]))
+                )
+        normalized_targets: list[dict[str, Any]] = []
+        for target in skill.get("install_targets") or []:
+            if not isinstance(target, dict):
+                raise RuntimeError("Expected every skills.install_targets item to be a mapping")
+            target = dict(target)
+            if target.get("path"):
+                target["host_path"] = str(
+                    runtime_path_to_host_path(root_dir, model["env"], str(target["path"]))
+                )
+            normalized_targets.append(target)
+        skill["install_targets"] = normalized_targets
 
     for service in model["services"]:
         service.setdefault("required", False)

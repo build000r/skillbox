@@ -14,7 +14,9 @@ mkdir -p \
   "${REPOS_ROOT}" \
   "${SKILLS_ROOT}" \
   "${HOME_ROOT}/.claude" \
-  "${HOME_ROOT}/.codex"
+  "${HOME_ROOT}/.claude/skills" \
+  "${HOME_ROOT}/.codex" \
+  "${HOME_ROOT}/.codex/skills"
 
 if [[ ! -f "${WORKSPACE_ROOT}/.env" ]]; then
   {

@@ -17,3 +17,6 @@ logs/*
 !logs/README.md
 repos/*
 !repos/.gitkeep
+home/.claude/skills/
+home/.codex/skills/
+workspace/default-skills.lock.json

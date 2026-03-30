@@ -26,6 +26,25 @@ repos:
       mode: ensure-directory
     notes: Parent directory for repos cloned or mounted into the box.
 
+skills:
+  - id: default-skills
+    kind: packaged-skill-set
+    required: true
+    profiles:
+      - core
+    bundle_dir: ${SKILLBOX_WORKSPACE_ROOT}/default-skills
+    manifest: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.manifest
+    sources_config: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.sources.yaml
+    lock_path: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.lock.json
+    sync:
+      mode: unpack-bundles
+    install_targets:
+      - id: claude
+        path: ${SKILLBOX_HOME_ROOT}/.claude/skills
+      - id: codex
+        path: ${SKILLBOX_HOME_ROOT}/.codex/skills
+    notes: Install packaged default skill bundles into the managed Claude and Codex homes.
+
 services:
   - id: internal-env-manager
     kind: orchestration
