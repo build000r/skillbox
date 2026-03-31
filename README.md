@@ -1,11 +1,15 @@
+<div align="center">
+
 # skillbox
 
-> A thin, self-hosted Tailnet monoserver for AI-assisted coding, with client-scoped overlays.
+**A thin, self-hosted Tailnet monoserver for AI-assisted coding, with client-scoped overlays.**
 
 ![runtime](https://img.shields.io/badge/runtime-Docker-2496ED?style=flat-square&logo=docker&logoColor=white)
 ![access](https://img.shields.io/badge/access-Tailscale-242424?style=flat-square&logo=tailscale&logoColor=white)
 ![shape](https://img.shields.io/badge/shape-thin%20starter-6E7781?style=flat-square)
 ![doctor](https://img.shields.io/badge/doctor-manifest%20checks-2ea44f?style=flat-square)
+
+</div>
 
 ```bash
 cp .env.example .env
@@ -644,51 +648,51 @@ exist all the time.
 
 ```text
                 Tailscale SSH
-                      |
-                      v
-            +----------------------+
-            |   Host machine       |
-            |  Ubuntu / Docker     |
-            |----------------------|
-            | scripts/01,02        |
-            | docker-compose.yml   |
-            +----------+-----------+
-                       |
-          +------------+------------+
-          |                         |
-          v                         v
-+-------------------+      +-------------------+
-| workspace         |      | optional surfaces |
-|-------------------|      |-------------------|
-| /workspace        |      | api :8000         |
-| /monoserver       |      | web :3000         |
-| /workspace/repos  |      +-------------------+
-| /workspace/skills |
-| /workspace/logs   |
-| /home/.claude     |
-| /home/.codex      |
-+---------+---------+
-          |
-          v
-+-----------------------------------------+
-| declarative control layers              |
-|-----------------------------------------|
-| workspace/sandbox.yaml                  |
-| workspace/dependencies.yaml             |
-| workspace/runtime.yaml                  |
-| 04-reconcile.py                         |
-| .env-manager/manage.py                  |
-| 03-skill-sync.sh / package_skill.py     |
-+-------------------+---------------------+
-                    |
-                    v
-       +----------------------------------+
-       | managed box internals            |
-       |----------------------------------|
-       | repos, artifacts, skills, checks |
-       | api/web stub health probes       |
-       | default skill bundles + lockfiles |
-       +----------------------------------+
+                      │
+                      ▼
+            ┌──────────────────────┐
+            │   Host machine       │
+            │  Ubuntu / Docker     │
+            ├──────────────────────┤
+            │ scripts/01,02        │
+            │ docker-compose.yml   │
+            └──────────┬───────────┘
+                       │
+          ┌────────────┴────────────┐
+          │                         │
+          ▼                         ▼
+┌───────────────────┐      ┌───────────────────┐
+│ workspace         │      │ optional surfaces │
+├───────────────────┤      ├───────────────────┤
+│ /workspace        │      │ api :8000         │
+│ /monoserver       │      │ web :3000         │
+│ /workspace/repos  │      └───────────────────┘
+│ /workspace/skills │
+│ /workspace/logs   │
+│ /home/.claude     │
+│ /home/.codex      │
+└─────────┬─────────┘
+          │
+          ▼
+┌─────────────────────────────────────────┐
+│ declarative control layers              │
+├─────────────────────────────────────────┤
+│ workspace/sandbox.yaml                  │
+│ workspace/dependencies.yaml             │
+│ workspace/runtime.yaml                  │
+│ 04-reconcile.py                         │
+│ .env-manager/manage.py                  │
+│ 03-skill-sync.sh / package_skill.py     │
+└───────────────────┬─────────────────────┘
+                    │
+                    ▼
+       ┌──────────────────────────────────┐
+       │ managed box internals            │
+       ├──────────────────────────────────┤
+       │ repos, artifacts, skills, checks │
+       │ api/web stub health probes       │
+       │ default skill bundles + lockfiles │
+       └──────────────────────────────────┘
 ```
 
 ## Troubleshooting
