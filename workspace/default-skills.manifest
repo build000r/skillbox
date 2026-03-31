@@ -8,3 +8,4 @@
 # - The first source containing `<source-root>/<skill-name>/SKILL.md` wins.
 
 ask-cascade
+skillbox-operator
