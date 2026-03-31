@@ -37,6 +37,8 @@ right client context without standing up a full hosted workspace control plane.
 - optionally run a workspace-local `swimmers` API against the same tmux namespace as the agents
 - keep one stable core machine and layer client-specific overlays on top
 - declare the inside of the box with a runtime graph for repos, artifacts, installed skills, services, logs, and checks
+- declare one-shot bootstrap tasks and let services pull them in automatically
+- start and stop declared service graphs in dependency order with one command
 - pin and package default skills locally
 - validate outer drift with `make doctor` and inner drift with `make dev-sanity`
 
@@ -47,6 +49,7 @@ right client context without standing up a full hosted workspace control plane.
 | Private access without public SSH exposure | Tailscale host access plus host hardening scripts |
 | A workspace that feels like a narrowed local setup | One bind-mounted `/workspace`, plus `/monoserver` for sibling repo roots and client overlays |
 | A sane way to let the box grow over time | `workspace/runtime.yaml` plus `.env-manager/manage.py` manage the core machine plus client-specific repos, artifacts, installed skills, logs, and checks |
+| Service graphs that do not devolve into shell folklore | Declared `depends_on` edges let `up`, `down`, and `restart` expand and order service graphs automatically |
 | Reproducible default skills | `03-skill-sync.sh` packages from a pinned manifest and vendored local packager |
 | Confidence that docs/config/runtime still match | `04-reconcile.py` powers `make render` and `make doctor`, while `make dev-sanity` validates the box internals |
 | Minimal surface area | No multi-tenant control plane, no hosted dependency, no hidden sibling repo requirement for packaging |
@@ -258,8 +261,9 @@ make runtime-sync
 | `make doctor` | Validates manifest/runtime drift, Compose wiring, and skill sync |
 | `make runtime-render` | Prints the resolved internal runtime graph |
 | `make runtime-sync` | Creates managed repo/log directories and installs declared skills with generated lockfiles for the active core/client scope |
-| `make runtime-status` | Summarizes declared repos, skills, services, logs, and checks |
-| `make runtime-up` | Syncs runtime state and starts manageable services for the active scope |
+| `make runtime-status` | Summarizes declared repos, skills, tasks, services, logs, and checks |
+| `make runtime-bootstrap` | Syncs runtime state and runs declared bootstrap tasks for the active scope |
+| `make runtime-up` | Syncs runtime state, runs required bootstrap tasks, and starts manageable services for the active scope |
 | `make runtime-down` | Stops manageable services for the active scope |
 | `make runtime-restart` | Restarts manageable services for the active scope |
 | `make runtime-logs` | Shows recent service logs for the active scope |
@@ -291,12 +295,13 @@ make runtime-sync
 | `.env-manager/manage.py render` | Print the resolved internal runtime graph | `python3 .env-manager/manage.py render --format json` |
 | `.env-manager/manage.py sync` | Create managed repo/artifact/log directories and install declared skills for the selected core/client scope | `python3 .env-manager/manage.py sync --client personal --dry-run` |
 | `.env-manager/manage.py doctor` | Validate the internal repos/skills/logs/check graph for the selected core/client scope | `python3 .env-manager/manage.py doctor --client personal` |
-| `.env-manager/manage.py status` | Summarize repo, artifact, skill, service, log, and health state for the selected core/client scope | `python3 .env-manager/manage.py status --client personal` |
-| `.env-manager/manage.py up` | Sync runtime state and start manageable services, waiting for declared healthchecks when present | `python3 .env-manager/manage.py up --profile surfaces --service api-stub` |
-| `.env-manager/manage.py down` | Stop manageable services started by the runtime manager | `python3 .env-manager/manage.py down --profile surfaces --service api-stub` |
-| `.env-manager/manage.py restart` | Restart manageable services for the selected core/client scope | `python3 .env-manager/manage.py restart --profile surfaces --service web-stub` |
+| `.env-manager/manage.py status` | Summarize repo, artifact, skill, task, service, log, and health state for the selected core/client scope | `python3 .env-manager/manage.py status --client personal` |
+| `.env-manager/manage.py bootstrap` | Sync runtime state and run declared bootstrap tasks in dependency order | `python3 .env-manager/manage.py bootstrap --client acme-studio --task app-bootstrap` |
+| `.env-manager/manage.py up` | Sync runtime state, run any service-declared bootstrap tasks, and start manageable services, expanding declared `depends_on` prerequisites and waiting for healthchecks when present | `python3 .env-manager/manage.py up --profile surfaces --service api-stub` |
+| `.env-manager/manage.py down` | Stop manageable services started by the runtime manager, stopping selected dependents before their prerequisites | `python3 .env-manager/manage.py down --profile surfaces --service api-stub` |
+| `.env-manager/manage.py restart` | Restart manageable services for the selected core/client scope, preserving declared dependency order | `python3 .env-manager/manage.py restart --profile surfaces --service web-stub` |
 | `.env-manager/manage.py logs` | Print recent log output for declared services | `python3 .env-manager/manage.py logs --profile surfaces --service api-stub --lines 80` |
-| `.env-manager/manage.py client-init` | Scaffold a new `workspace/clients/<id>/overlay.yaml` plus companion skill directories | `python3 .env-manager/manage.py client-init acme-studio` |
+| `.env-manager/manage.py client-init` | Scaffold a new client overlay, optionally applying a reusable blueprint for repos and services | `python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo --set PRIMARY_REPO_URL=https://github.com/acme/app.git` |
 
 ## Configuration
 
@@ -416,6 +421,13 @@ core:
   skills:
     - id: default-skills
       manifest: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.manifest
+  tasks:
+    - id: app-bootstrap
+      repo: skillbox-self
+      command: ./scripts/bootstrap-app.sh
+      success:
+        type: path_exists
+        path: ${SKILLBOX_LOG_ROOT}/runtime/app-bootstrap.ok
   services:
     - id: internal-env-manager
     - id: api-stub
@@ -426,6 +438,26 @@ core:
     - id: monoserver-root
       path: ${SKILLBOX_MONOSERVER_ROOT}
 ```
+
+`depends_on` is optional. For example:
+
+```yaml
+services:
+  - id: api
+  - id: web
+    depends_on: [api]
+```
+
+When it is present, `up --service <id>` pulls in the full prerequisite chain
+first, while `down --service <id>` and `restart --service <id>` stop
+dependents before prerequisites and then bring the graph back in topological
+order.
+
+Tasks are the one-shot companion to services. A task declares a command,
+optional task-to-task `depends_on`, a success check, and optional `inputs` and
+`outputs`. `bootstrap --task <id>` runs the selected task graph in dependency
+order, and `up` automatically runs any tasks named under a service's
+`bootstrap_tasks` list before trying to launch the service.
 
 Client overlays are auto-discovered from `workspace/clients/<client>/overlay.yaml`.
 For example:
@@ -450,6 +482,94 @@ Create a new overlay scaffold with:
 python3 .env-manager/manage.py client-init acme-studio
 ```
 
+Or start from a built-in client blueprint that wires repos, services, logs, and
+checks into the scaffold:
+
+```bash
+python3 .env-manager/manage.py client-init --list-blueprints
+python3 .env-manager/manage.py client-init acme-studio \
+  --blueprint git-repo \
+  --set PRIMARY_REPO_URL=https://github.com/acme/app.git
+python3 .env-manager/manage.py client-init acme-studio \
+  --blueprint git-repo-http-service \
+  --set PRIMARY_REPO_URL=https://github.com/acme/app.git \
+  --set SERVICE_COMMAND='pnpm dev'
+python3 .env-manager/manage.py client-init acme-studio \
+  --blueprint git-repo-http-service-bootstrap \
+  --set PRIMARY_REPO_URL=https://github.com/acme/app.git \
+  --set BOOTSTRAP_COMMAND='pnpm install && pnpm prisma migrate deploy && mkdir -p .skillbox && touch .skillbox/bootstrap.ok' \
+  --set SERVICE_COMMAND='pnpm dev'
+```
+
+Blueprints keep the default client skills scaffold but append client-scoped
+repos, artifacts, tasks, services, logs, and checks to the generated overlay,
+so the next `render`, `sync`, `bootstrap`, `status`, `doctor`, or `up` command
+already has something concrete to operate on.
+
+### Managed Env Files
+
+Client overlays and client blueprints can now declare `env_files` alongside
+repos, artifacts, services, logs, and checks. This is the missing bridge
+between "the repo cloned" and "the repo is runnable on a fresh droplet".
+
+Example:
+
+```yaml
+client:
+  env_files:
+    - id: app-env
+      kind: dotenv
+      repo: app
+      path: ${PRIMARY_REPO_PATH}/.env.local
+      required: true
+      profiles:
+        - core
+      source:
+        kind: file
+        path: ./workspace/secrets/clients/${CLIENT_ID}/app.env
+      sync:
+        mode: write
+```
+
+What this does:
+
+- `make runtime-sync CLIENT=acme-studio` writes the declared env file into the target repo with `0600` permissions
+- `make dev-sanity CLIENT=acme-studio` fails if a required env source is missing
+- `make runtime-status CLIENT=acme-studio` reports whether the env file is present, stale, or missing
+- `make runtime-up CLIENT=acme-studio SERVICE=app-dev` refuses to launch the service until required env files are ready
+
+### Managed Bootstrap Tasks
+
+Client overlays and blueprints can now declare `tasks` alongside repos, env
+files, services, logs, and checks.
+
+Example:
+
+```yaml
+client:
+  tasks:
+    - id: app-bootstrap
+      kind: bootstrap
+      repo: app
+      command: pnpm install && pnpm prisma migrate deploy && touch .skillbox/bootstrap.ok
+      outputs:
+        - ${PRIMARY_REPO_PATH}/.skillbox/bootstrap.ok
+      success:
+        type: path_exists
+        path: ${PRIMARY_REPO_PATH}/.skillbox/bootstrap.ok
+  services:
+    - id: app-dev
+      bootstrap_tasks:
+        - app-bootstrap
+```
+
+What this does:
+
+- `make runtime-bootstrap CLIENT=acme-studio TASK=app-bootstrap` runs the selected task graph in dependency order
+- `make runtime-status CLIENT=acme-studio` reports each task as `ready`, `pending`, or `blocked`
+- `make dev-sanity CLIENT=acme-studio` warns when declared bootstrap outputs are still missing
+- `make runtime-up CLIENT=acme-studio SERVICE=app-dev` automatically runs `app-bootstrap` before starting the service
+
 ### Client Selection
 
 The mental model is now:
@@ -467,6 +587,7 @@ python3 .env-manager/manage.py sync --client personal
 python3 .env-manager/manage.py status --client vibe-coding-client
 python3 .env-manager/manage.py doctor --client vibe-coding-client
 python3 .env-manager/manage.py client-init acme-studio
+python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo --set PRIMARY_REPO_URL=https://github.com/acme/app.git
 python3 .env-manager/manage.py render --client personal --profile surfaces
 
 make runtime-sync CLIENT=personal
@@ -607,8 +728,8 @@ make doctor
 - This is not a hosted control plane or a multi-user workspace platform.
 - There is no release installer, package manager distribution, or cloud provisioning flow yet.
 - The API and web surfaces are inspection stubs, not a full UI.
-- The internal runtime manager now does basic manifest-driven service lifecycle (`up`, `down`, `restart`, `logs`), but it still does not do full dependency-aware per-repo orchestration.
-- Secrets management and richer per-client repo or service bootstrap workflows are still your responsibility.
+- The internal runtime manager now does dependency-aware task and service orchestration plus managed env hydration, but it still does not try to replace app-specific deployment systems or CI.
+- Secrets management and app-specific bootstrap details beyond what you declare in your overlays and blueprints are still your responsibility.
 - There is no license file in this repo yet. Add one before publishing it as open source.
 
 ## FAQ

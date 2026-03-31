@@ -1,0 +1,98 @@
+version: 1
+description: Clone a primary git repository, declare a bootstrap task, and wire a managed HTTP dev service.
+variables:
+  - name: PRIMARY_REPO_ID
+    default: app
+    description: Runtime repo id for the primary client repository.
+  - name: PRIMARY_REPO_URL
+    required: true
+    description: Git URL to clone when the client overlay is synced.
+  - name: PRIMARY_REPO_BRANCH
+    default: main
+    description: Branch to clone for the primary repository.
+  - name: PRIMARY_REPO_PATH
+    default: ${CLIENT_ROOT}/${PRIMARY_REPO_ID}
+    description: Runtime path where the primary repository should live.
+  - name: BOOTSTRAP_TASK_ID
+    default: app-bootstrap
+    description: Runtime task id for the one-shot bootstrap task.
+  - name: BOOTSTRAP_COMMAND
+    required: true
+    description: Command to run once from the primary repo before the service can start.
+  - name: BOOTSTRAP_SUCCESS_PATH
+    default: ${PRIMARY_REPO_PATH}/.skillbox/bootstrap.ok
+    description: Runtime path that must exist after the bootstrap task succeeds.
+  - name: SERVICE_ID
+    default: app-dev
+    description: Runtime service id for the managed dev process.
+  - name: SERVICE_COMMAND
+    required: true
+    description: Command to start the dev service from the primary repo.
+  - name: SERVICE_PORT
+    default: "4010"
+    description: Loopback port used by the HTTP healthcheck.
+  - name: SERVICE_LOG_ID
+    default: ${CLIENT_ID}-services
+    description: Log id used for managed service output.
+  - name: SERVICE_LOG_PATH
+    default: ${SKILLBOX_LOG_ROOT}/clients/${CLIENT_ID}/services
+    description: Runtime path for the service log directory.
+  - name: SERVICE_HEALTHCHECK_URL
+    default: http://127.0.0.1:${SERVICE_PORT}/health
+    description: HTTP endpoint that must answer before the service is considered healthy.
+client:
+  default_cwd: ${PRIMARY_REPO_PATH}
+  repos:
+    - id: ${PRIMARY_REPO_ID}
+      kind: repo
+      path: ${PRIMARY_REPO_PATH}
+      required: true
+      profiles:
+        - core
+      source:
+        kind: git
+        url: ${PRIMARY_REPO_URL}
+        branch: ${PRIMARY_REPO_BRANCH}
+      sync:
+        mode: clone-if-missing
+      notes: Primary client repository cloned into the mounted client root.
+  logs:
+    - id: ${SERVICE_LOG_ID}
+      path: ${SERVICE_LOG_PATH}
+      required: false
+      profiles:
+        - core
+      retention_days: 14
+      notes: Managed task and service logs declared by the client blueprint.
+  tasks:
+    - id: ${BOOTSTRAP_TASK_ID}
+      kind: bootstrap
+      repo: ${PRIMARY_REPO_ID}
+      required: false
+      profiles:
+        - core
+      command: ${BOOTSTRAP_COMMAND}
+      outputs:
+        - ${BOOTSTRAP_SUCCESS_PATH}
+      success:
+        type: path_exists
+        path: ${BOOTSTRAP_SUCCESS_PATH}
+      log: ${SERVICE_LOG_ID}
+      notes: One-shot repo bootstrap task that must succeed before the dev service starts.
+  services:
+    - id: ${SERVICE_ID}
+      kind: http
+      owner: local
+      repo: ${PRIMARY_REPO_ID}
+      required: false
+      profiles:
+        - core
+      bootstrap_tasks:
+        - ${BOOTSTRAP_TASK_ID}
+      command: ${SERVICE_COMMAND}
+      log: ${SERVICE_LOG_ID}
+      healthcheck:
+        type: http
+        url: ${SERVICE_HEALTHCHECK_URL}
+        timeout_seconds: 0.5
+      notes: Managed HTTP service declared by the client blueprint.

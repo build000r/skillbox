@@ -22,3 +22,4 @@ home/.codex/skills/
 home/.local/
 workspace/default-skills.lock.json
 workspace/clients/*/skills.lock.json
+workspace/secrets/

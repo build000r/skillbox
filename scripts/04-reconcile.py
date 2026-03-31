@@ -44,6 +44,8 @@ EXPECTED_FILES = [
     "workspace/runtime.yaml",
     "workspace/default-skills.manifest",
     "workspace/default-skills.sources.yaml",
+    "workspace/client-blueprints/git-repo.yaml",
+    "workspace/client-blueprints/git-repo-http-service.yaml",
     "workspace/clients/personal/overlay.yaml",
     "workspace/clients/personal/skills.manifest",
     "workspace/clients/personal/skills.sources.yaml",
@@ -64,6 +66,7 @@ EXPECTED_DIRECTORIES = [
     "skills",
     "skills/clients",
     "workspace",
+    "workspace/client-blueprints",
     "workspace/clients",
 ]
 
@@ -254,6 +257,14 @@ def volume_map(service: dict[str, Any]) -> dict[str, str]:
     return {item.get("target", ""): item.get("source", "") for item in volumes}
 
 
+def runtime_env_view(environment: dict[str, Any], expected_runtime_env: dict[str, str]) -> dict[str, str]:
+    return {
+        str(key): str(value)
+        for key, value in (environment or {}).items()
+        if key in expected_runtime_env
+    }
+
+
 def expected_runtime_paths(model: dict[str, Any]) -> dict[str, str]:
     paths = model["sandbox"]["paths"]
     return {
@@ -386,7 +397,7 @@ def check_compose_model(model: dict[str, Any]) -> list[CheckResult]:
         issues.append("workspace tty should be enabled")
     if workspace.get("stdin_open") is not True:
         issues.append("workspace stdin_open should be enabled")
-    if (workspace.get("environment") or {}) != model["runtime_env"]:
+    if runtime_env_view(workspace.get("environment") or {}, model["runtime_env"]) != model["runtime_env"]:
         issues.append("workspace environment does not match manifest-derived runtime env")
 
     mounts = volume_map(workspace)
@@ -419,7 +430,7 @@ def check_compose_model(model: dict[str, Any]) -> list[CheckResult]:
         service = (surfaces_config.get("services") or {}).get(service_name) or {}
         if service.get("profiles") != ["surfaces"]:
             surface_issues.append(f"{service_name} service is not scoped to the surfaces profile")
-        if (service.get("environment") or {}) != model["runtime_env"]:
+        if runtime_env_view(service.get("environment") or {}, model["runtime_env"]) != model["runtime_env"]:
             surface_issues.append(f"{service_name} environment does not match manifest-derived runtime env")
 
         expected_port = int(model["sandbox"]["ports"].get(port_key))
@@ -455,7 +466,7 @@ def check_compose_model(model: dict[str, Any]) -> list[CheckResult]:
 
     swimmers_issues: list[str] = []
     swimmers_workspace = (swimmers_config.get("services") or {}).get("workspace") or {}
-    if (swimmers_workspace.get("environment") or {}) != model["runtime_env"]:
+    if runtime_env_view(swimmers_workspace.get("environment") or {}, model["runtime_env"]) != model["runtime_env"]:
         swimmers_issues.append("swimmers workspace environment does not match manifest-derived runtime env")
 
     expected_swimmers_port = int(model["sandbox"]["ports"].get("swimmers"))

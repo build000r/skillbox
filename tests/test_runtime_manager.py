@@ -240,6 +240,48 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertTrue(log_entry["present"])
             self.assertTrue(any("fixture-daemon ready" in line for line in log_entry["lines"]))
 
+    def test_up_selected_service_starts_declared_dependencies_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._install_fixture_dependency_pair(repo)
+            self.addCleanup(self._run, repo, "down", "--format", "json")
+
+            up = self._run(repo, "up", "--service", "fixture-worker", "--format", "json")
+
+            self.assertEqual(up.returncode, 0, up.stderr)
+            up_payload = json.loads(up.stdout)
+            self.assertEqual(
+                [item["id"] for item in up_payload["services"]],
+                ["fixture-daemon", "fixture-worker"],
+            )
+            self.assertEqual(
+                [item["result"] for item in up_payload["services"]],
+                ["started", "started"],
+            )
+            self.assertTrue((repo / "logs" / "runtime" / "fixture-worker.ready").is_file())
+
+    def test_down_selected_dependency_stops_dependents_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._install_fixture_dependency_pair(repo)
+            self.addCleanup(self._run, repo, "down", "--format", "json")
+
+            up = self._run(repo, "up", "--service", "fixture-worker", "--format", "json")
+            self.assertEqual(up.returncode, 0, up.stderr)
+
+            down = self._run(repo, "down", "--service", "fixture-daemon", "--format", "json")
+
+            self.assertEqual(down.returncode, 0, down.stderr)
+            down_payload = json.loads(down.stdout)
+            self.assertEqual(
+                [item["id"] for item in down_payload["services"]],
+                ["fixture-worker", "fixture-daemon"],
+            )
+            self.assertFalse((repo / "logs" / "runtime" / "fixture-worker.pid").exists())
+            self.assertFalse((repo / "logs" / "runtime" / "fixture-daemon.pid").exists())
+
     def test_restart_replaces_running_service_process(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -257,6 +299,29 @@ class RuntimeManagerTests(unittest.TestCase):
             restart_payload = json.loads(restart.stdout)
             second_pid = restart_payload["start_services"][0]["pid"]
             self.assertNotEqual(first_pid, second_pid)
+
+    def test_restart_selected_service_restarts_graph_in_dependency_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._install_fixture_dependency_pair(repo)
+            self.addCleanup(self._run, repo, "down", "--format", "json")
+
+            up = self._run(repo, "up", "--service", "fixture-worker", "--format", "json")
+            self.assertEqual(up.returncode, 0, up.stderr)
+
+            restart = self._run(repo, "restart", "--service", "fixture-daemon", "--format", "json")
+
+            self.assertEqual(restart.returncode, 0, restart.stderr)
+            restart_payload = json.loads(restart.stdout)
+            self.assertEqual(
+                [item["id"] for item in restart_payload["stop_services"]],
+                ["fixture-worker", "fixture-daemon"],
+            )
+            self.assertEqual(
+                [item["id"] for item in restart_payload["start_services"]],
+                ["fixture-daemon", "fixture-worker"],
+            )
 
     def test_doctor_fails_when_selected_client_root_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -305,6 +370,68 @@ class RuntimeManagerTests(unittest.TestCase):
             ]
             self.assertEqual(len(install_failures), 1, payload)
             self.assertIn("claude", " ".join(install_failures[0]["details"]["issues"]))
+
+    def test_doctor_fails_when_service_dependency_is_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            runtime_path = repo / "workspace" / "runtime.yaml"
+            runtime_path.write_text(
+                runtime_path.read_text(encoding="utf-8").replace(
+                    "      log: api\n",
+                    "      log: api\n"
+                    "      depends_on:\n"
+                    "        - missing-service\n",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            result = self._run(repo, "doctor", "--profile", "surfaces", "--format", "json")
+
+            self.assertEqual(result.returncode, 1)
+            payload = json.loads(result.stdout)
+            issues = payload[0]["details"]["issues"]
+            self.assertTrue(
+                any("references unknown dependency 'missing-service'" in issue for issue in issues),
+                issues,
+            )
+
+    def test_doctor_fails_when_service_dependencies_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            runtime_path = repo / "workspace" / "runtime.yaml"
+            runtime_path.write_text(
+                runtime_path.read_text(encoding="utf-8")
+                .replace(
+                    "      log: api\n",
+                    "      log: api\n"
+                    "      depends_on:\n"
+                    "        - web-stub\n",
+                    1,
+                )
+                .replace(
+                    "      log: web\n",
+                    "      log: web\n"
+                    "      depends_on:\n"
+                    "        - api-stub\n",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            result = self._run(repo, "doctor", "--profile", "surfaces", "--format", "json")
+
+            self.assertEqual(result.returncode, 1)
+            payload = json.loads(result.stdout)
+            issues = payload[0]["details"]["issues"]
+            self.assertTrue(
+                any("service dependency cycle detected: api-stub -> web-stub -> api-stub" in issue for issue in issues),
+                issues,
+            )
 
     def test_client_init_scaffolds_overlay_and_supporting_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -360,6 +487,522 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             payload = json.loads(result.stdout)
             self.assertIn("workspace/clients/personal/overlay.yaml", payload["error"])
+
+    def test_client_init_lists_available_blueprints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._write_client_blueprint(
+                repo,
+                "git-repo",
+                "version: 1\n"
+                "description: Clone a repo.\n"
+                "variables:\n"
+                "  - name: PRIMARY_REPO_URL\n"
+                "    required: true\n"
+                "client:\n"
+                "  repos:\n"
+                "    - id: app\n"
+                "      kind: repo\n"
+                "      path: ${CLIENT_ROOT}/app\n"
+                "      source:\n"
+                "        kind: git\n"
+                "        url: ${PRIMARY_REPO_URL}\n"
+                "      sync:\n"
+                "        mode: clone-if-missing\n",
+            )
+
+            result = self._run(repo, "client-init", "--list-blueprints", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            blueprint = payload["blueprints"][0]
+            self.assertEqual(blueprint["id"], "git-repo")
+            self.assertEqual(blueprint["description"], "Clone a repo.")
+            self.assertEqual(blueprint["variables"][0]["name"], "PRIMARY_REPO_URL")
+            self.assertTrue(blueprint["variables"][0]["required"])
+
+    def test_client_init_with_blueprint_scaffolds_repo_and_service_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._write_client_blueprint(
+                repo,
+                "git-repo-http-service",
+                "version: 1\n"
+                "description: Clone a primary repo and wire an HTTP service.\n"
+                "variables:\n"
+                "  - name: PRIMARY_REPO_ID\n"
+                "    default: app\n"
+                "  - name: PRIMARY_REPO_URL\n"
+                "    required: true\n"
+                "  - name: PRIMARY_REPO_BRANCH\n"
+                "    default: main\n"
+                "  - name: PRIMARY_REPO_PATH\n"
+                "    default: ${CLIENT_ROOT}/${PRIMARY_REPO_ID}\n"
+                "  - name: SERVICE_ID\n"
+                "    default: app-dev\n"
+                "  - name: SERVICE_COMMAND\n"
+                "    required: true\n"
+                "  - name: SERVICE_LOG_ID\n"
+                "    default: ${CLIENT_ID}-services\n"
+                "  - name: SERVICE_LOG_PATH\n"
+                "    default: ${SKILLBOX_LOG_ROOT}/clients/${CLIENT_ID}/services\n"
+                "  - name: SERVICE_PORT\n"
+                "    default: \"4010\"\n"
+                "client:\n"
+                "  default_cwd: ${PRIMARY_REPO_PATH}\n"
+                "  repos:\n"
+                "    - id: ${PRIMARY_REPO_ID}\n"
+                "      kind: repo\n"
+                "      path: ${PRIMARY_REPO_PATH}\n"
+                "      required: true\n"
+                "      profiles:\n"
+                "        - core\n"
+                "      source:\n"
+                "        kind: git\n"
+                "        url: ${PRIMARY_REPO_URL}\n"
+                "        branch: ${PRIMARY_REPO_BRANCH}\n"
+                "      sync:\n"
+                "        mode: clone-if-missing\n"
+                "  logs:\n"
+                "    - id: ${SERVICE_LOG_ID}\n"
+                "      path: ${SERVICE_LOG_PATH}\n"
+                "      profiles:\n"
+                "        - core\n"
+                "  services:\n"
+                "    - id: ${SERVICE_ID}\n"
+                "      kind: http\n"
+                "      repo: ${PRIMARY_REPO_ID}\n"
+                "      profiles:\n"
+                "        - core\n"
+                "      command: ${SERVICE_COMMAND}\n"
+                "      log: ${SERVICE_LOG_ID}\n"
+                "      healthcheck:\n"
+                "        type: http\n"
+                "        url: http://127.0.0.1:${SERVICE_PORT}/health\n"
+                "        timeout_seconds: 0.5\n",
+            )
+            source_repo = self._create_git_source_repo(repo, "fixture-app")
+
+            result = self._run(
+                repo,
+                "client-init",
+                "acme-studio",
+                "--blueprint",
+                "git-repo-http-service",
+                "--set",
+                f"PRIMARY_REPO_URL={source_repo}",
+                "--set",
+                "SERVICE_COMMAND=python3 -m http.server 4010",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["blueprint"]["id"], "git-repo-http-service")
+            self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "overlay.yaml").is_file())
+
+            render = self._run(repo, "render", "--client", "acme-studio", "--format", "json")
+
+            self.assertEqual(render.returncode, 0, render.stderr)
+            render_payload = json.loads(render.stdout)
+            self.assertEqual(render_payload["active_clients"], ["acme-studio"])
+            self.assertEqual(
+                {item["id"] for item in render_payload["repos"]},
+                {"skillbox-self", "managed-repos", "acme-studio-root", "app"},
+            )
+            self.assertEqual(
+                {item["id"] for item in render_payload["services"]},
+                {"internal-env-manager", "app-dev"},
+            )
+            self.assertIn("acme-studio-services", {item["id"] for item in render_payload["logs"]})
+            self.assertEqual(
+                next(client for client in render_payload["clients"] if client["id"] == "acme-studio")["default_cwd"],
+                "/monoserver/acme-studio/app",
+            )
+
+            sync = self._run(repo, "sync", "--client", "acme-studio", "--format", "json")
+
+            self.assertEqual(sync.returncode, 0, sync.stderr)
+            self.assertTrue((repo / "monoserver-host" / "acme-studio" / "app" / "README.md").is_file())
+            self.assertTrue((repo / "logs" / "clients" / "acme-studio" / "services").is_dir())
+            self.assertTrue(any("clone-if-missing:" in action for action in json.loads(sync.stdout)["actions"]))
+
+    def test_sync_hydrates_declared_client_env_file_and_status_reports_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._write_env_blueprint(repo)
+            source_repo = self._create_git_source_repo(repo, "fixture-app")
+            self._write_env_source(repo, "acme-studio", "PORT=4010\nAPI_KEY=test-key\n")
+
+            result = self._run(
+                repo,
+                "client-init",
+                "acme-studio",
+                "--blueprint",
+                "git-repo-http-service-env",
+                "--set",
+                f"PRIMARY_REPO_URL={source_repo}",
+                "--set",
+                "SERVICE_COMMAND=python3 -m http.server 4010",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            (repo / "monoserver-host" / "acme-studio").mkdir(parents=True, exist_ok=True)
+
+            before = self._run(repo, "doctor", "--client", "acme-studio", "--format", "json")
+            self.assertEqual(before.returncode, 0, before.stderr)
+            before_payload = json.loads(before.stdout)
+            warning_codes = {item["code"] for item in before_payload if item["status"] == "warn"}
+            self.assertIn("syncable-env-files", warning_codes)
+
+            sync = self._run(repo, "sync", "--client", "acme-studio", "--format", "json")
+            self.assertEqual(sync.returncode, 0, sync.stderr)
+            sync_payload = json.loads(sync.stdout)
+            self.assertTrue(any("hydrate-env:" in action for action in sync_payload["actions"]))
+
+            env_target = repo / "monoserver-host" / "acme-studio" / "app" / ".env.local"
+            self.assertTrue(env_target.is_file())
+            self.assertEqual(env_target.read_text(encoding="utf-8"), "PORT=4010\nAPI_KEY=test-key\n")
+            self.assertEqual(env_target.stat().st_mode & 0o777, 0o600)
+
+            status = self._run(repo, "status", "--client", "acme-studio", "--format", "json")
+            self.assertEqual(status.returncode, 0, status.stderr)
+            status_payload = json.loads(status.stdout)
+            env_file = status_payload["env_files"][0]
+            self.assertEqual(env_file["id"], "app-env")
+            self.assertTrue(env_file["present"])
+            self.assertTrue(env_file["source_present"])
+            self.assertEqual(env_file["state"], "ok")
+            self.assertEqual(env_file["mode"], "0600")
+
+            after = self._run(repo, "doctor", "--client", "acme-studio", "--format", "json")
+            self.assertEqual(after.returncode, 0, after.stderr)
+            after_payload = json.loads(after.stdout)
+            after_warning_codes = {item["code"] for item in after_payload if item["status"] == "warn"}
+            after_failure_codes = {item["code"] for item in after_payload if item["status"] == "fail"}
+            self.assertNotIn("syncable-env-files", after_warning_codes)
+            self.assertEqual(after_failure_codes, set(), after_payload)
+
+    def test_doctor_fails_when_required_env_source_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._write_env_blueprint(repo)
+            source_repo = self._create_git_source_repo(repo, "fixture-app")
+
+            result = self._run(
+                repo,
+                "client-init",
+                "acme-studio",
+                "--blueprint",
+                "git-repo-http-service-env",
+                "--set",
+                f"PRIMARY_REPO_URL={source_repo}",
+                "--set",
+                "SERVICE_COMMAND=python3 -m http.server 4010",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            (repo / "monoserver-host" / "acme-studio").mkdir(parents=True, exist_ok=True)
+
+            doctor = self._run(repo, "doctor", "--client", "acme-studio", "--format", "json")
+            self.assertEqual(doctor.returncode, 1)
+            payload = json.loads(doctor.stdout)
+            failures = [item for item in payload if item["status"] == "fail" and item["code"] == "required-runtime-env-files"]
+            self.assertEqual(len(failures), 1, payload)
+            self.assertIn("workspace/secrets/clients/acme-studio/app.env", " ".join(failures[0]["details"]["missing_sources"]))
+
+    def test_up_refuses_to_start_service_when_required_env_is_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._write_env_blueprint(repo)
+            source_repo = self._create_git_source_repo(repo, "fixture-app")
+
+            result = self._run(
+                repo,
+                "client-init",
+                "acme-studio",
+                "--blueprint",
+                "git-repo-http-service-env",
+                "--set",
+                f"PRIMARY_REPO_URL={source_repo}",
+                "--set",
+                "SERVICE_COMMAND=python3 -m http.server 4010",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            up = self._run(repo, "up", "--client", "acme-studio", "--service", "app-dev", "--format", "json")
+
+            self.assertEqual(up.returncode, 1)
+            payload = json.loads(up.stdout)
+            self.assertIn("app-env", payload["error"])
+            pid_file = repo / "logs" / "clients" / "acme-studio" / "services" / "app-dev.pid"
+            self.assertFalse(pid_file.exists())
+
+    def test_sync_only_hydrates_env_files_for_selected_client(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._write_env_blueprint(repo)
+            source_repo = self._create_git_source_repo(repo, "fixture-app")
+            self._write_env_source(repo, "acme-studio", "PORT=4010\nAPI_KEY=acme\n")
+            self._write_env_source(repo, "beta-studio", "PORT=4010\nAPI_KEY=beta\n")
+
+            for client_id in ("acme-studio", "beta-studio"):
+                result = self._run(
+                    repo,
+                    "client-init",
+                    client_id,
+                    "--blueprint",
+                    "git-repo-http-service-env",
+                    "--set",
+                    f"PRIMARY_REPO_URL={source_repo}",
+                    "--set",
+                    "SERVICE_COMMAND=python3 -m http.server 4010",
+                    "--format",
+                    "json",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            sync = self._run(repo, "sync", "--client", "acme-studio", "--format", "json")
+
+            self.assertEqual(sync.returncode, 0, sync.stderr)
+            self.assertTrue((repo / "monoserver-host" / "acme-studio" / "app" / ".env.local").is_file())
+            self.assertFalse((repo / "monoserver-host" / "beta-studio" / "app" / ".env.local").exists())
+
+    def test_bootstrap_runs_tasks_in_dependency_order_and_status_reports_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._install_fixture_bootstrap_graph(repo)
+
+            sync = self._run(repo, "sync")
+            self.assertEqual(sync.returncode, 0, sync.stderr)
+
+            before_status = self._run(repo, "status", "--format", "json")
+            self.assertEqual(before_status.returncode, 0, before_status.stderr)
+            before_payload = json.loads(before_status.stdout)
+            states_before = {item["id"]: item["state"] for item in before_payload["tasks"]}
+            self.assertEqual(states_before["prepare-assets"], "pending")
+            self.assertEqual(states_before["build-app"], "blocked")
+
+            before_doctor = self._run(repo, "doctor", "--format", "json")
+            self.assertEqual(before_doctor.returncode, 0, before_doctor.stderr)
+            before_warning_codes = {
+                item["code"]
+                for item in json.loads(before_doctor.stdout)
+                if item["status"] == "warn"
+            }
+            self.assertIn("bootstrap-task-state", before_warning_codes)
+
+            bootstrap = self._run(repo, "bootstrap", "--task", "build-app", "--format", "json")
+
+            self.assertEqual(bootstrap.returncode, 0, bootstrap.stderr)
+            bootstrap_payload = json.loads(bootstrap.stdout)
+            self.assertEqual(
+                [item["id"] for item in bootstrap_payload["tasks"]],
+                ["prepare-assets", "build-app"],
+            )
+            self.assertEqual(
+                [item["result"] for item in bootstrap_payload["tasks"]],
+                ["completed", "completed"],
+            )
+
+            order_file = repo / "logs" / "runtime" / "bootstrap-order.log"
+            self.assertEqual(
+                order_file.read_text(encoding="utf-8").splitlines(),
+                ["prepare-assets", "build-app"],
+            )
+
+            after_status = self._run(repo, "status", "--format", "json")
+            self.assertEqual(after_status.returncode, 0, after_status.stderr)
+            after_payload = json.loads(after_status.stdout)
+            states_after = {item["id"]: item["state"] for item in after_payload["tasks"]}
+            self.assertEqual(states_after["prepare-assets"], "ready")
+            self.assertEqual(states_after["build-app"], "ready")
+
+            after_doctor = self._run(repo, "doctor", "--format", "json")
+            self.assertEqual(after_doctor.returncode, 0, after_doctor.stderr)
+            after_warning_codes = {
+                item["code"]
+                for item in json.loads(after_doctor.stdout)
+                if item["status"] == "warn"
+            }
+            self.assertNotIn("bootstrap-task-state", after_warning_codes)
+
+    def test_up_runs_declared_bootstrap_tasks_before_service_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._install_fixture_bootstrap_graph(repo)
+            self._install_fixture_bootstrap_service(repo)
+            self.addCleanup(self._run, repo, "down", "--service", "bootstrap-daemon", "--format", "json")
+
+            up = self._run(repo, "up", "--service", "bootstrap-daemon", "--format", "json")
+
+            self.assertEqual(up.returncode, 0, up.stderr)
+            up_payload = json.loads(up.stdout)
+            self.assertEqual(
+                [item["id"] for item in up_payload["bootstrap_tasks"]],
+                ["prepare-assets", "build-app"],
+            )
+            self.assertEqual(up_payload["services"][0]["id"], "bootstrap-daemon")
+            self.assertEqual(up_payload["services"][0]["result"], "started")
+            self.assertTrue((repo / "logs" / "runtime" / "build-app.ok").is_file())
+            self.assertTrue((repo / "logs" / "runtime" / "bootstrap-daemon.ready").is_file())
+
+    def test_client_init_with_blueprint_scaffolds_task_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._write_client_blueprint(
+                repo,
+                "git-repo-http-service-bootstrap",
+                "version: 1\n"
+                "description: Clone a primary repo, declare a bootstrap task, and wire an HTTP service.\n"
+                "variables:\n"
+                "  - name: PRIMARY_REPO_ID\n"
+                "    default: app\n"
+                "  - name: PRIMARY_REPO_URL\n"
+                "    required: true\n"
+                "  - name: PRIMARY_REPO_PATH\n"
+                "    default: ${CLIENT_ROOT}/${PRIMARY_REPO_ID}\n"
+                "  - name: BOOTSTRAP_TASK_ID\n"
+                "    default: app-bootstrap\n"
+                "  - name: BOOTSTRAP_COMMAND\n"
+                "    required: true\n"
+                "  - name: BOOTSTRAP_SUCCESS_PATH\n"
+                "    default: ${PRIMARY_REPO_PATH}/.skillbox/bootstrap.ok\n"
+                "  - name: SERVICE_ID\n"
+                "    default: app-dev\n"
+                "  - name: SERVICE_COMMAND\n"
+                "    required: true\n"
+                "  - name: SERVICE_LOG_ID\n"
+                "    default: ${CLIENT_ID}-services\n"
+                "  - name: SERVICE_LOG_PATH\n"
+                "    default: ${SKILLBOX_LOG_ROOT}/clients/${CLIENT_ID}/services\n"
+                "client:\n"
+                "  default_cwd: ${PRIMARY_REPO_PATH}\n"
+                "  repos:\n"
+                "    - id: ${PRIMARY_REPO_ID}\n"
+                "      kind: repo\n"
+                "      path: ${PRIMARY_REPO_PATH}\n"
+                "      required: true\n"
+                "      profiles:\n"
+                "        - core\n"
+                "      source:\n"
+                "        kind: git\n"
+                "        url: ${PRIMARY_REPO_URL}\n"
+                "      sync:\n"
+                "        mode: clone-if-missing\n"
+                "  logs:\n"
+                "    - id: ${SERVICE_LOG_ID}\n"
+                "      path: ${SERVICE_LOG_PATH}\n"
+                "      profiles:\n"
+                "        - core\n"
+                "  tasks:\n"
+                "    - id: ${BOOTSTRAP_TASK_ID}\n"
+                "      kind: bootstrap\n"
+                "      repo: ${PRIMARY_REPO_ID}\n"
+                "      profiles:\n"
+                "        - core\n"
+                "      command: ${BOOTSTRAP_COMMAND}\n"
+                "      outputs:\n"
+                "        - ${BOOTSTRAP_SUCCESS_PATH}\n"
+                "      success:\n"
+                "        type: path_exists\n"
+                "        path: ${BOOTSTRAP_SUCCESS_PATH}\n"
+                "      log: ${SERVICE_LOG_ID}\n"
+                "  services:\n"
+                "    - id: ${SERVICE_ID}\n"
+                "      kind: http\n"
+                "      repo: ${PRIMARY_REPO_ID}\n"
+                "      profiles:\n"
+                "        - core\n"
+                "      bootstrap_tasks:\n"
+                "        - ${BOOTSTRAP_TASK_ID}\n"
+                "      command: ${SERVICE_COMMAND}\n"
+                "      log: ${SERVICE_LOG_ID}\n"
+                "      healthcheck:\n"
+                "        type: path_exists\n"
+                "        path: ${PRIMARY_REPO_PATH}/README.md\n",
+            )
+            source_repo = self._create_git_source_repo(repo, "fixture-app")
+
+            result = self._run(
+                repo,
+                "client-init",
+                "acme-studio",
+                "--blueprint",
+                "git-repo-http-service-bootstrap",
+                "--set",
+                f"PRIMARY_REPO_URL={source_repo}",
+                "--set",
+                "BOOTSTRAP_COMMAND=python3 -c \"from pathlib import Path; Path('.skillbox').mkdir(exist_ok=True); Path('.skillbox/bootstrap.ok').write_text('ok\\n', encoding='utf-8')\"",
+                "--set",
+                "SERVICE_COMMAND=python3 -m http.server 4010",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            render = self._run(repo, "render", "--client", "acme-studio", "--format", "json")
+            self.assertEqual(render.returncode, 0, render.stderr)
+            render_payload = json.loads(render.stdout)
+            self.assertEqual({item["id"] for item in render_payload["tasks"]}, {"app-bootstrap"})
+            service = next(item for item in render_payload["services"] if item["id"] == "app-dev")
+            self.assertEqual(service["bootstrap_tasks"], ["app-bootstrap"])
+
+    def test_client_init_with_blueprint_requires_declared_variables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._write_client_blueprint(
+                repo,
+                "git-repo",
+                "version: 1\n"
+                "description: Clone a repo.\n"
+                "variables:\n"
+                "  - name: PRIMARY_REPO_URL\n"
+                "    required: true\n"
+                "client:\n"
+                "  repos:\n"
+                "    - id: app\n"
+                "      kind: repo\n"
+                "      path: ${CLIENT_ROOT}/app\n"
+                "      source:\n"
+                "        kind: git\n"
+                "        url: ${PRIMARY_REPO_URL}\n"
+                "      sync:\n"
+                "        mode: clone-if-missing\n",
+            )
+
+            result = self._run(
+                repo,
+                "client-init",
+                "acme-studio",
+                "--blueprint",
+                "git-repo",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 1)
+            payload = json.loads(result.stdout)
+            self.assertIn("PRIMARY_REPO_URL", payload["error"])
 
     def test_render_keeps_supporting_inline_clients(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -465,6 +1108,94 @@ class RuntimeManagerTests(unittest.TestCase):
             "        - core\n",
             encoding="utf-8",
         )
+
+    def _write_client_blueprint(self, repo: Path, name: str, content: str) -> None:
+        blueprint_dir = repo / "workspace" / "client-blueprints"
+        blueprint_dir.mkdir(parents=True, exist_ok=True)
+        (blueprint_dir / f"{name}.yaml").write_text(content, encoding="utf-8")
+
+    def _write_env_blueprint(self, repo: Path) -> None:
+        self._write_client_blueprint(
+            repo,
+            "git-repo-http-service-env",
+            "version: 1\n"
+            "description: Clone a primary repo, hydrate an env file, and wire an HTTP service.\n"
+            "variables:\n"
+            "  - name: PRIMARY_REPO_ID\n"
+            "    default: app\n"
+            "  - name: PRIMARY_REPO_URL\n"
+            "    required: true\n"
+            "  - name: PRIMARY_REPO_BRANCH\n"
+            "    default: main\n"
+            "  - name: PRIMARY_REPO_PATH\n"
+            "    default: ${CLIENT_ROOT}/${PRIMARY_REPO_ID}\n"
+            "  - name: SERVICE_ID\n"
+            "    default: app-dev\n"
+            "  - name: SERVICE_COMMAND\n"
+            "    required: true\n"
+            "  - name: SERVICE_LOG_ID\n"
+            "    default: ${CLIENT_ID}-services\n"
+            "  - name: SERVICE_LOG_PATH\n"
+            "    default: ${SKILLBOX_LOG_ROOT}/clients/${CLIENT_ID}/services\n"
+            "  - name: SERVICE_PORT\n"
+            "    default: \"4010\"\n"
+            "  - name: ENV_FILE_ID\n"
+            "    default: app-env\n"
+            "  - name: ENV_FILE_SOURCE_PATH\n"
+            "    default: ./workspace/secrets/clients/${CLIENT_ID}/app.env\n"
+            "  - name: ENV_FILE_TARGET_PATH\n"
+            "    default: ${PRIMARY_REPO_PATH}/.env.local\n"
+            "client:\n"
+            "  default_cwd: ${PRIMARY_REPO_PATH}\n"
+            "  repos:\n"
+            "    - id: ${PRIMARY_REPO_ID}\n"
+            "      kind: repo\n"
+            "      path: ${PRIMARY_REPO_PATH}\n"
+            "      required: true\n"
+            "      profiles:\n"
+            "        - core\n"
+            "      source:\n"
+            "        kind: git\n"
+            "        url: ${PRIMARY_REPO_URL}\n"
+            "        branch: ${PRIMARY_REPO_BRANCH}\n"
+            "      sync:\n"
+            "        mode: clone-if-missing\n"
+            "  env_files:\n"
+            "    - id: ${ENV_FILE_ID}\n"
+            "      kind: dotenv\n"
+            "      repo: ${PRIMARY_REPO_ID}\n"
+            "      path: ${ENV_FILE_TARGET_PATH}\n"
+            "      required: true\n"
+            "      profiles:\n"
+            "        - core\n"
+            "      source:\n"
+            "        kind: file\n"
+            "        path: ${ENV_FILE_SOURCE_PATH}\n"
+            "      sync:\n"
+            "        mode: write\n"
+            "  logs:\n"
+            "    - id: ${SERVICE_LOG_ID}\n"
+            "      path: ${SERVICE_LOG_PATH}\n"
+            "      profiles:\n"
+            "        - core\n"
+            "  services:\n"
+            "    - id: ${SERVICE_ID}\n"
+            "      kind: http\n"
+            "      repo: ${PRIMARY_REPO_ID}\n"
+            "      profiles:\n"
+            "        - core\n"
+            "      command: ${SERVICE_COMMAND}\n"
+            "      log: ${SERVICE_LOG_ID}\n"
+            "      healthcheck:\n"
+            "        type: http\n"
+            "        url: http://127.0.0.1:${SERVICE_PORT}/health\n"
+            "        timeout_seconds: 0.5\n",
+        )
+
+    def _write_env_source(self, repo: Path, client_id: str, content: str) -> None:
+        source_path = repo / "workspace" / "secrets" / "clients" / client_id / "app.env"
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(content, encoding="utf-8")
 
     def _write_fixture(self, repo: Path, include_bundle: bool = True) -> None:
         (repo / ".env.example").write_text(
@@ -718,6 +1449,61 @@ class RuntimeManagerTests(unittest.TestCase):
         (repo / ".env-manager").mkdir(parents=True, exist_ok=True)
         (repo / ".env-manager" / "manage.py").write_text("# stub\n", encoding="utf-8")
 
+    def _create_git_source_repo(self, repo: Path, name: str) -> Path:
+        source_repo = repo / "fixtures" / name
+        source_repo.mkdir(parents=True, exist_ok=True)
+        (source_repo / "README.md").write_text("# Fixture Repo\n", encoding="utf-8")
+
+        init = subprocess.run(
+            ["git", "init"],
+            cwd=source_repo,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(init.returncode, 0, init.stderr)
+        branch = subprocess.run(
+            ["git", "branch", "-M", "main"],
+            cwd=source_repo,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(branch.returncode, 0, branch.stderr)
+        config_email = subprocess.run(
+            ["git", "config", "user.email", "tests@example.com"],
+            cwd=source_repo,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(config_email.returncode, 0, config_email.stderr)
+        config_name = subprocess.run(
+            ["git", "config", "user.name", "Runtime Manager Tests"],
+            cwd=source_repo,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(config_name.returncode, 0, config_name.stderr)
+        add = subprocess.run(
+            ["git", "add", "README.md"],
+            cwd=source_repo,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(add.returncode, 0, add.stderr)
+        commit = subprocess.run(
+            ["git", "commit", "-m", "initial"],
+            cwd=source_repo,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(commit.returncode, 0, commit.stderr)
+        return source_repo
+
     def _install_fixture_daemon(self, repo: Path) -> None:
         scripts_dir = repo / "scripts"
         scripts_dir.mkdir(parents=True, exist_ok=True)
@@ -730,6 +1516,7 @@ class RuntimeManagerTests(unittest.TestCase):
             "from pathlib import Path\n"
             "\n"
             "ready_path = Path(sys.argv[1])\n"
+            "label = sys.argv[2] if len(sys.argv) > 2 else ready_path.stem\n"
             "ready_path.parent.mkdir(parents=True, exist_ok=True)\n"
             "\n"
             "def shutdown(*_args: object) -> None:\n"
@@ -742,7 +1529,7 @@ class RuntimeManagerTests(unittest.TestCase):
             "signal.signal(signal.SIGTERM, shutdown)\n"
             "signal.signal(signal.SIGINT, shutdown)\n"
             "ready_path.write_text('ok\\n', encoding='utf-8')\n"
-            "print('fixture-daemon ready', flush=True)\n"
+            "print(f'{label} ready', flush=True)\n"
             "while True:\n"
             "    time.sleep(0.2)\n",
             encoding="utf-8",
@@ -758,10 +1545,156 @@ class RuntimeManagerTests(unittest.TestCase):
                 "      required: false\n"
                 "      profiles:\n"
                 "        - core\n"
-                "      command: python3 scripts/fixture_daemon.py ${SKILLBOX_LOG_ROOT}/runtime/fixture-daemon.ready\n"
+                "      command: python3 scripts/fixture_daemon.py ${SKILLBOX_LOG_ROOT}/runtime/fixture-daemon.ready fixture-daemon\n"
                 "      healthcheck:\n"
                 "        type: path_exists\n"
                 "        path: ${SKILLBOX_LOG_ROOT}/runtime/fixture-daemon.ready\n"
+                "      log: runtime\n"
+                "  logs:\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+    def _install_fixture_dependency_pair(self, repo: Path) -> None:
+        self._install_fixture_daemon(repo)
+
+        runtime_path = repo / "workspace" / "runtime.yaml"
+        runtime_path.write_text(
+            runtime_path.read_text(encoding="utf-8").replace(
+                "  logs:\n",
+                "    - id: fixture-worker\n"
+                "      kind: daemon\n"
+                "      repo: skillbox-self\n"
+                "      required: false\n"
+                "      profiles:\n"
+                "        - core\n"
+                "      depends_on:\n"
+                "        - fixture-daemon\n"
+                "      command: python3 scripts/fixture_daemon.py ${SKILLBOX_LOG_ROOT}/runtime/fixture-worker.ready fixture-worker\n"
+                "      healthcheck:\n"
+                "        type: path_exists\n"
+                "        path: ${SKILLBOX_LOG_ROOT}/runtime/fixture-worker.ready\n"
+                "      log: runtime\n"
+                "  logs:\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+    def _install_fixture_bootstrap_graph(self, repo: Path) -> None:
+        scripts_dir = repo / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / "fixture_bootstrap.py").write_text(
+            "from __future__ import annotations\n"
+            "\n"
+            "import sys\n"
+            "from pathlib import Path\n"
+            "\n"
+            "target_path = Path(sys.argv[1])\n"
+            "order_path = Path(sys.argv[2])\n"
+            "label = sys.argv[3]\n"
+            "target_path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "order_path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "with order_path.open('a', encoding='utf-8') as handle:\n"
+            "    handle.write(f'{label}\\n')\n"
+            "target_path.write_text('ok\\n', encoding='utf-8')\n"
+            "print(f'{label} complete', flush=True)\n",
+            encoding="utf-8",
+        )
+
+        runtime_path = repo / "workspace" / "runtime.yaml"
+        runtime_path.write_text(
+            runtime_path.read_text(encoding="utf-8").replace(
+                "  services:\n",
+                "  tasks:\n"
+                "    - id: prepare-assets\n"
+                "      kind: bootstrap\n"
+                "      repo: skillbox-self\n"
+                "      required: false\n"
+                "      profiles:\n"
+                "        - core\n"
+                "      command: python3 scripts/fixture_bootstrap.py ${SKILLBOX_LOG_ROOT}/runtime/prepare-assets.ok ${SKILLBOX_LOG_ROOT}/runtime/bootstrap-order.log prepare-assets\n"
+                "      outputs:\n"
+                "        - ${SKILLBOX_LOG_ROOT}/runtime/prepare-assets.ok\n"
+                "      success:\n"
+                "        type: path_exists\n"
+                "        path: ${SKILLBOX_LOG_ROOT}/runtime/prepare-assets.ok\n"
+                "      log: runtime\n"
+                "    - id: build-app\n"
+                "      kind: bootstrap\n"
+                "      repo: skillbox-self\n"
+                "      required: false\n"
+                "      profiles:\n"
+                "        - core\n"
+                "      depends_on:\n"
+                "        - prepare-assets\n"
+                "      command: python3 scripts/fixture_bootstrap.py ${SKILLBOX_LOG_ROOT}/runtime/build-app.ok ${SKILLBOX_LOG_ROOT}/runtime/bootstrap-order.log build-app\n"
+                "      inputs:\n"
+                "        - ${SKILLBOX_LOG_ROOT}/runtime/prepare-assets.ok\n"
+                "      outputs:\n"
+                "        - ${SKILLBOX_LOG_ROOT}/runtime/build-app.ok\n"
+                "      success:\n"
+                "        type: path_exists\n"
+                "        path: ${SKILLBOX_LOG_ROOT}/runtime/build-app.ok\n"
+                "      log: runtime\n"
+                "  services:\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+    def _install_fixture_bootstrap_service(self, repo: Path) -> None:
+        scripts_dir = repo / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / "fixture_guarded_daemon.py").write_text(
+            "from __future__ import annotations\n"
+            "\n"
+            "import signal\n"
+            "import sys\n"
+            "import time\n"
+            "from pathlib import Path\n"
+            "\n"
+            "required_path = Path(sys.argv[1])\n"
+            "ready_path = Path(sys.argv[2])\n"
+            "label = sys.argv[3]\n"
+            "if not required_path.is_file():\n"
+            "    print(f'missing required path: {required_path}', flush=True)\n"
+            "    raise SystemExit(1)\n"
+            "ready_path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "\n"
+            "def shutdown(*_args: object) -> None:\n"
+            "    try:\n"
+            "        ready_path.unlink()\n"
+            "    except FileNotFoundError:\n"
+            "        pass\n"
+            "    raise SystemExit(0)\n"
+            "\n"
+            "signal.signal(signal.SIGTERM, shutdown)\n"
+            "signal.signal(signal.SIGINT, shutdown)\n"
+            "ready_path.write_text('ok\\n', encoding='utf-8')\n"
+            "print(f'{label} ready', flush=True)\n"
+            "while True:\n"
+            "    time.sleep(0.2)\n",
+            encoding="utf-8",
+        )
+
+        runtime_path = repo / "workspace" / "runtime.yaml"
+        runtime_path.write_text(
+            runtime_path.read_text(encoding="utf-8").replace(
+                "  logs:\n",
+                "    - id: bootstrap-daemon\n"
+                "      kind: daemon\n"
+                "      repo: skillbox-self\n"
+                "      required: false\n"
+                "      profiles:\n"
+                "        - core\n"
+                "      bootstrap_tasks:\n"
+                "        - build-app\n"
+                "      command: python3 scripts/fixture_guarded_daemon.py ${SKILLBOX_LOG_ROOT}/runtime/build-app.ok ${SKILLBOX_LOG_ROOT}/runtime/bootstrap-daemon.ready bootstrap-daemon\n"
+                "      healthcheck:\n"
+                "        type: path_exists\n"
+                "        path: ${SKILLBOX_LOG_ROOT}/runtime/bootstrap-daemon.ready\n"
                 "      log: runtime\n"
                 "  logs:\n",
                 1,

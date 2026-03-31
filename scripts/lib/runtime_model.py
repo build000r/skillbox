@@ -244,7 +244,9 @@ def _normalize_runtime_sections(
     selection = _normalized_mapping(resolved.get("selection"), "selection") if scoped_runtime else {}
     repos = _normalized_items(core.get("repos"), "core.repos" if scoped_runtime else "repos")
     artifacts = _normalized_items(core.get("artifacts"), "core.artifacts" if scoped_runtime else "artifacts")
+    env_files = _normalized_items(core.get("env_files"), "core.env_files" if scoped_runtime else "env_files")
     skills = _normalized_items(core.get("skills"), "core.skills" if scoped_runtime else "skills")
+    tasks = _normalized_items(core.get("tasks"), "core.tasks" if scoped_runtime else "tasks")
     services = _normalized_items(core.get("services"), "core.services" if scoped_runtime else "services")
     logs = _normalized_items(core.get("logs"), "core.logs" if scoped_runtime else "logs")
     checks = _normalized_items(core.get("checks"), "core.checks" if scoped_runtime else "checks")
@@ -284,8 +286,17 @@ def _normalize_runtime_sections(
                 client_id,
             )
         )
+        env_files.extend(
+            _attach_client_scope(
+                _normalized_items(client.get("env_files"), f"clients[{client_id}].env_files"),
+                client_id,
+            )
+        )
         skills.extend(
             _attach_client_scope(_normalized_items(client.get("skills"), f"clients[{client_id}].skills"), client_id)
+        )
+        tasks.extend(
+            _attach_client_scope(_normalized_items(client.get("tasks"), f"clients[{client_id}].tasks"), client_id)
         )
         services.extend(
             _attach_client_scope(
@@ -303,7 +314,9 @@ def _normalize_runtime_sections(
         "clients": clients_meta,
         "repos": repos,
         "artifacts": artifacts,
+        "env_files": env_files,
         "skills": skills,
+        "tasks": tasks,
         "services": services,
         "logs": logs,
         "checks": checks,
@@ -327,7 +340,9 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
         "clients": normalized["clients"],
         "repos": normalized["repos"],
         "artifacts": normalized["artifacts"],
+        "env_files": normalized["env_files"],
         "skills": normalized["skills"],
+        "tasks": normalized["tasks"],
         "services": normalized["services"],
         "logs": normalized["logs"],
         "checks": normalized["checks"],
@@ -359,6 +374,24 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
             source["host_path"] = str(host_path_to_absolute_path(root_dir, str(source["path"])))
             artifact["source"] = source
 
+    for env_file in model["env_files"]:
+        env_file.setdefault("kind", "env-file")
+        env_file.setdefault("required", False)
+        env_file.setdefault("profiles", [])
+        env_file.setdefault("client", "")
+        env_file.setdefault("sync", {})
+        env_file.setdefault("source", {})
+        env_file.setdefault("repo", "")
+        env_file.setdefault("mode", "0600")
+        if env_file.get("path"):
+            env_file["host_path"] = str(
+                runtime_path_to_host_path(root_dir, model["env"], str(env_file["path"]))
+            )
+        source = env_file.get("source") or {}
+        if source.get("kind") == "file" and source.get("path"):
+            source["host_path"] = str(host_path_to_absolute_path(root_dir, str(source["path"])))
+            env_file["source"] = source
+
     for skill in model["skills"]:
         skill.setdefault("kind", "packaged-skill-set")
         skill.setdefault("required", False)
@@ -382,6 +415,23 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
                 )
             normalized_targets.append(target)
         skill["install_targets"] = normalized_targets
+
+    for task in model["tasks"]:
+        task.setdefault("kind", "task")
+        task.setdefault("required", False)
+        task.setdefault("profiles", [])
+        task.setdefault("client", "")
+        task.setdefault("repo", "")
+        task.setdefault("log", "")
+        task.setdefault("depends_on", [])
+        task.setdefault("inputs", [])
+        task.setdefault("outputs", [])
+        success = task.get("success") or {}
+        if success.get("path"):
+            success["host_path"] = str(
+                runtime_path_to_host_path(root_dir, model["env"], str(success["path"]))
+            )
+            task["success"] = success
 
     for service in model["services"]:
         service.setdefault("required", False)

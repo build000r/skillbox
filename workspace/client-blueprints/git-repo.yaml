@@ -1,0 +1,31 @@
+version: 1
+description: Clone a primary git repository into the client root and use it as the default cwd.
+variables:
+  - name: PRIMARY_REPO_ID
+    default: app
+    description: Runtime repo id for the primary client repository.
+  - name: PRIMARY_REPO_URL
+    required: true
+    description: Git URL to clone when the client overlay is synced.
+  - name: PRIMARY_REPO_BRANCH
+    default: main
+    description: Branch to clone for the primary repository.
+  - name: PRIMARY_REPO_PATH
+    default: ${CLIENT_ROOT}/${PRIMARY_REPO_ID}
+    description: Runtime path where the primary repository should live.
+client:
+  default_cwd: ${PRIMARY_REPO_PATH}
+  repos:
+    - id: ${PRIMARY_REPO_ID}
+      kind: repo
+      path: ${PRIMARY_REPO_PATH}
+      required: true
+      profiles:
+        - core
+      source:
+        kind: git
+        url: ${PRIMARY_REPO_URL}
+        branch: ${PRIMARY_REPO_BRANCH}
+      sync:
+        mode: clone-if-missing
+      notes: Primary client repository cloned into the mounted client root.

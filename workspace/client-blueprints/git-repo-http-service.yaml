@@ -1,0 +1,72 @@
+version: 1
+description: Clone a primary git repository and declare a managed HTTP dev service with log wiring.
+variables:
+  - name: PRIMARY_REPO_ID
+    default: app
+    description: Runtime repo id for the primary client repository.
+  - name: PRIMARY_REPO_URL
+    required: true
+    description: Git URL to clone when the client overlay is synced.
+  - name: PRIMARY_REPO_BRANCH
+    default: main
+    description: Branch to clone for the primary repository.
+  - name: PRIMARY_REPO_PATH
+    default: ${CLIENT_ROOT}/${PRIMARY_REPO_ID}
+    description: Runtime path where the primary repository should live.
+  - name: SERVICE_ID
+    default: app-dev
+    description: Runtime service id for the managed dev process.
+  - name: SERVICE_COMMAND
+    required: true
+    description: Command to start the dev service from the primary repo.
+  - name: SERVICE_PORT
+    default: "4010"
+    description: Loopback port used by the HTTP healthcheck.
+  - name: SERVICE_LOG_ID
+    default: ${CLIENT_ID}-services
+    description: Log id used for managed service output.
+  - name: SERVICE_LOG_PATH
+    default: ${SKILLBOX_LOG_ROOT}/clients/${CLIENT_ID}/services
+    description: Runtime path for the service log directory.
+  - name: SERVICE_HEALTHCHECK_URL
+    default: http://127.0.0.1:${SERVICE_PORT}/health
+    description: HTTP endpoint that must answer before the service is considered healthy.
+client:
+  default_cwd: ${PRIMARY_REPO_PATH}
+  repos:
+    - id: ${PRIMARY_REPO_ID}
+      kind: repo
+      path: ${PRIMARY_REPO_PATH}
+      required: true
+      profiles:
+        - core
+      source:
+        kind: git
+        url: ${PRIMARY_REPO_URL}
+        branch: ${PRIMARY_REPO_BRANCH}
+      sync:
+        mode: clone-if-missing
+      notes: Primary client repository cloned into the mounted client root.
+  logs:
+    - id: ${SERVICE_LOG_ID}
+      path: ${SERVICE_LOG_PATH}
+      required: false
+      profiles:
+        - core
+      retention_days: 14
+      notes: Managed service logs declared by the client blueprint.
+  services:
+    - id: ${SERVICE_ID}
+      kind: http
+      owner: local
+      repo: ${PRIMARY_REPO_ID}
+      required: false
+      profiles:
+        - core
+      command: ${SERVICE_COMMAND}
+      log: ${SERVICE_LOG_ID}
+      healthcheck:
+        type: http
+        url: ${SERVICE_HEALTHCHECK_URL}
+        timeout_seconds: 0.5
+      notes: Managed HTTP service declared by the client blueprint.

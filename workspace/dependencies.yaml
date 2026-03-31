@@ -48,6 +48,12 @@ runtime_artifacts:
     required: false
     notes: Managed swimmers binary that can be installed from a pinned download URL without a sibling source checkout.
 
+runtime_tasks:
+  - id: app-bootstrap
+    kind: bootstrap
+    required: false
+    notes: Optional one-shot bootstrap tasks that materialize repo-specific readiness before services start.
+
 runtime_services:
   - id: internal-env-manager
     kind: orchestration

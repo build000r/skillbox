@@ -20,6 +20,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+try:
+    import yaml
+except ModuleNotFoundError:
+    yaml = None
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_ROOT_DIR = SCRIPT_DIR.parent.resolve()
@@ -39,11 +44,16 @@ VALID_REPO_SOURCE_KINDS = {"bind", "directory", "git", "manual"}
 VALID_SYNC_MODES = {"external", "ensure-directory", "clone-if-missing", "manual"}
 VALID_ARTIFACT_SOURCE_KINDS = {"file", "manual", "url"}
 VALID_ARTIFACT_SYNC_MODES = {"copy-if-missing", "download-if-missing", "manual"}
+VALID_ENV_FILE_SOURCE_KINDS = {"file", "manual"}
+VALID_ENV_FILE_SYNC_MODES = {"write", "manual"}
 VALID_SKILL_SYNC_MODES = {"unpack-bundles"}
 VALID_HEALTHCHECK_TYPES = {"http", "path_exists"}
 VALID_CHECK_TYPES = {"path_exists"}
+VALID_TASK_SUCCESS_TYPES = {"path_exists"}
 LOCKFILE_VERSION = 1
 CLIENT_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+BLUEPRINT_VARIABLE_PATTERN = re.compile(r"^[A-Z0-9_]+$")
+SCAFFOLD_PLACEHOLDER_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
 DEFAULT_SERVICE_START_WAIT_SECONDS = 10.0
 DEFAULT_SERVICE_STOP_WAIT_SECONDS = 5.0
 DEFAULT_LOG_TAIL_LINES = 40
@@ -120,20 +130,229 @@ def write_text_file(path: Path, content: str, dry_run: bool) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-def scaffold_client_overlay(
+def require_yaml(feature: str) -> Any:
+    if yaml is None:
+        raise RuntimeError(
+            f"Missing PyYAML. Install `python3-yaml` or `pip install pyyaml` to {feature}."
+        )
+    return yaml
+
+
+def client_blueprint_dir(root_dir: Path) -> Path:
+    return root_dir / "workspace" / "client-blueprints"
+
+
+def render_yaml_document(document: Any) -> str:
+    yaml_mod = require_yaml("render client blueprints")
+    return yaml_mod.safe_dump(document, sort_keys=False).rstrip() + "\n"
+
+
+def parse_key_value_assignments(raw_assignments: list[str], option_name: str) -> list[tuple[str, str]]:
+    assignments: list[tuple[str, str]] = []
+    seen_keys: set[str] = set()
+    for raw_assignment in raw_assignments:
+        if "=" not in raw_assignment:
+            raise RuntimeError(f"{option_name} expects KEY=VALUE assignments, got {raw_assignment!r}.")
+        raw_key, raw_value = raw_assignment.split("=", 1)
+        key = raw_key.strip()
+        if not key or not BLUEPRINT_VARIABLE_PATTERN.fullmatch(key):
+            raise RuntimeError(
+                f"{option_name} key {raw_key!r} is invalid. Use uppercase letters, numbers, and underscores."
+            )
+        if key in seen_keys:
+            raise RuntimeError(f"Duplicate {option_name} assignment for {key}.")
+        assignments.append((key, raw_value))
+        seen_keys.add(key)
+    return assignments
+
+
+def resolve_known_placeholders(value: Any, mapping: dict[str, str]) -> Any:
+    if isinstance(value, str):
+        def replacer(match: re.Match[str]) -> str:
+            key = match.group(1)
+            return mapping.get(key, match.group(0))
+
+        return SCAFFOLD_PLACEHOLDER_PATTERN.sub(replacer, value)
+    if isinstance(value, list):
+        return [resolve_known_placeholders(item, mapping) for item in value]
+    if isinstance(value, dict):
+        return {key: resolve_known_placeholders(item, mapping) for key, item in value.items()}
+    return value
+
+
+def list_client_blueprints(root_dir: Path) -> list[dict[str, Any]]:
+    blueprint_root = client_blueprint_dir(root_dir)
+    if not blueprint_root.is_dir():
+        return []
+
+    blueprints: list[dict[str, Any]] = []
+    for path in sorted(blueprint_root.glob("*.yaml")):
+        blueprints.append(load_client_blueprint(path))
+    return blueprints
+
+
+def resolve_client_blueprint_path(root_dir: Path, raw_blueprint: str) -> Path:
+    candidate = Path(raw_blueprint).expanduser()
+    blueprint_root = client_blueprint_dir(root_dir)
+    attempts: list[Path] = []
+
+    if candidate.is_absolute():
+        attempts.append(candidate)
+    else:
+        attempts.append((root_dir / candidate).resolve())
+        attempts.append((blueprint_root / candidate).resolve())
+        if not candidate.suffix:
+            attempts.append((blueprint_root / f"{candidate}.yaml").resolve())
+
+    for path in attempts:
+        if path.is_file():
+            return path
+
+    available = ", ".join(item["id"] for item in list_client_blueprints(root_dir)) or "(none)"
+    raise RuntimeError(
+        f"Client blueprint {raw_blueprint!r} was not found. Available blueprints: {available}"
+    )
+
+
+def load_client_blueprint(path: Path) -> dict[str, Any]:
+    yaml_mod = require_yaml("use client blueprints")
+
+    try:
+        raw = yaml_mod.safe_load(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Client blueprint not found: {path}") from exc
+    except Exception as exc:  # pragma: no cover - defensive parse path
+        raise RuntimeError(f"Failed to parse client blueprint {path}: {exc}") from exc
+
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"Expected a YAML object in client blueprint {path}")
+
+    version = raw.get("version", 1)
+    if version != 1:
+        raise RuntimeError(f"Unsupported client blueprint version in {path}: {version!r}")
+
+    raw_client = raw.get("client")
+    if raw_client is None:
+        client = {}
+    elif isinstance(raw_client, dict):
+        client = raw_client
+    else:
+        raise RuntimeError(f"Expected `client` to be a mapping in {path}")
+
+    raw_variables = raw.get("variables") or []
+    if not isinstance(raw_variables, list):
+        raise RuntimeError(f"Expected `variables` to be a list in {path}")
+
+    variables: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for raw_variable in raw_variables:
+        if not isinstance(raw_variable, dict):
+            raise RuntimeError(f"Expected every variable entry to be a mapping in {path}")
+        name = str(raw_variable.get("name", "")).strip()
+        if not name or not BLUEPRINT_VARIABLE_PATTERN.fullmatch(name):
+            raise RuntimeError(
+                f"Invalid client blueprint variable {name!r} in {path}. "
+                "Use uppercase letters, numbers, and underscores."
+            )
+        if name in seen_names:
+            raise RuntimeError(f"Duplicate client blueprint variable {name!r} in {path}")
+        seen_names.add(name)
+        variables.append(
+            {
+                "name": name,
+                "required": bool(raw_variable.get("required")),
+                "default": None if "default" not in raw_variable else str(raw_variable.get("default", "")),
+                "description": str(raw_variable.get("description", "")).strip(),
+            }
+        )
+
+    return {
+        "id": path.stem,
+        "path": str(path),
+        "description": str(raw.get("description", "")).strip(),
+        "variables": variables,
+        "client": client,
+    }
+
+
+def base_client_overlay(
+    client_id: str,
+    client_label: str,
+    client_root: str,
+    client_default_cwd: str,
+) -> dict[str, Any]:
+    return {
+        "id": client_id,
+        "label": client_label,
+        "default_cwd": client_default_cwd,
+        "repo_roots": [
+            {
+                "id": f"{client_id}-root",
+                "kind": "repo-root",
+                "path": client_root,
+                "required": True,
+                "profiles": ["core"],
+                "source": {"kind": "bind"},
+                "sync": {"mode": "external"},
+                "notes": "Client root mounted from the shared monoserver tree.",
+            }
+        ],
+        "skills": [
+            {
+                "id": f"{client_id}-skills",
+                "kind": "packaged-skill-set",
+                "required": False,
+                "profiles": ["core"],
+                "bundle_dir": f"${{SKILLBOX_WORKSPACE_ROOT}}/default-skills/clients/{client_id}",
+                "manifest": f"${{SKILLBOX_WORKSPACE_ROOT}}/workspace/clients/{client_id}/skills.manifest",
+                "sources_config": f"${{SKILLBOX_WORKSPACE_ROOT}}/workspace/clients/{client_id}/skills.sources.yaml",
+                "lock_path": f"${{SKILLBOX_WORKSPACE_ROOT}}/workspace/clients/{client_id}/skills.lock.json",
+                "sync": {"mode": "unpack-bundles"},
+                "install_targets": [
+                    {
+                        "id": "claude",
+                        "path": "${SKILLBOX_HOME_ROOT}/.claude/skills",
+                    },
+                    {
+                        "id": "codex",
+                        "path": "${SKILLBOX_HOME_ROOT}/.codex/skills",
+                    },
+                ],
+                "notes": "Client-scoped skills layered on top of the shared defaults.",
+            }
+        ],
+        "logs": [
+            {
+                "id": client_id,
+                "path": f"${{SKILLBOX_LOG_ROOT}}/clients/{client_id}",
+                "required": False,
+                "profiles": ["core"],
+                "retention_days": 14,
+                "notes": f"Client-scoped logs for the {client_id} overlay.",
+            }
+        ],
+        "checks": [
+            {
+                "id": f"{client_id}-root",
+                "type": "path_exists",
+                "path": client_root,
+                "required": True,
+                "profiles": ["core"],
+                "notes": f"The {client_id} overlay expects the client root to be mounted.",
+            }
+        ],
+    }
+
+
+def default_client_scaffold_files(
     root_dir: Path,
     client_id: str,
-    label: str | None,
-    default_cwd: str | None,
-    root_path: str | None,
-    dry_run: bool,
-    force: bool,
-) -> list[str]:
-    client_id = validate_client_id(client_id)
-    client_label = (label or titleize_client_id(client_id)).strip()
-    client_root = (root_path or f"${{SKILLBOX_MONOSERVER_ROOT}}/{client_id}").strip()
-    client_default_cwd = (default_cwd or client_root).strip()
-
+    client_label: str,
+    client_root: str,
+    client_default_cwd: str,
+) -> dict[Path, str]:
     overlay_dir = root_dir / "workspace" / "clients" / client_id
     bundle_dir = root_dir / "default-skills" / "clients" / client_id
     skills_dir = root_dir / "skills" / "clients" / client_id
@@ -144,7 +363,7 @@ def scaffold_client_overlay(
     bundle_readme_path = bundle_dir / "README.md"
     skills_keep_path = skills_dir / ".gitkeep"
 
-    target_files = {
+    return {
         overlay_path: (
             "version: 1\n"
             "\n"
@@ -213,6 +432,170 @@ def scaffold_client_overlay(
         skills_keep_path: "",
     }
 
+
+def merge_client_overlay(base_client: dict[str, Any], blueprint_client: dict[str, Any]) -> dict[str, Any]:
+    merged = copy.deepcopy(base_client)
+    additive_sections = ("repo_roots", "repos", "artifacts", "env_files", "skills", "tasks", "services", "logs", "checks")
+    scalar_items = dict(blueprint_client)
+
+    for key in additive_sections:
+        if key not in scalar_items:
+            continue
+        raw_items = scalar_items.pop(key)
+        if raw_items is None:
+            continue
+        if not isinstance(raw_items, list):
+            raise RuntimeError(f"Expected blueprint client.{key} to be a list.")
+        merged.setdefault(key, [])
+        merged[key].extend(copy.deepcopy(raw_items))
+
+    for key, value in scalar_items.items():
+        merged[key] = copy.deepcopy(value)
+
+    return merged
+
+
+def build_blueprinted_client_scaffold_files(
+    root_dir: Path,
+    client_id: str,
+    client_label: str,
+    client_root: str,
+    client_default_cwd: str,
+    explicit_label: bool,
+    explicit_default_cwd: bool,
+    blueprint: dict[str, Any],
+    blueprint_assignments: list[tuple[str, str]],
+) -> dict[Path, str]:
+    values = {
+        "CLIENT_ID": client_id,
+        "CLIENT_LABEL": client_label,
+        "CLIENT_ROOT": client_root,
+        "CLIENT_DEFAULT_CWD": client_default_cwd,
+    }
+    for key, raw_value in blueprint_assignments:
+        values[key] = str(resolve_known_placeholders(raw_value, values))
+
+    missing_required: list[str] = []
+    for variable in blueprint["variables"]:
+        name = str(variable["name"])
+        if name in values and values[name].strip():
+            continue
+        default = variable.get("default")
+        if default is not None:
+            values[name] = str(resolve_known_placeholders(default, values))
+            continue
+        if variable.get("required"):
+            missing_required.append(name)
+            continue
+        values[name] = ""
+
+    if missing_required:
+        raise RuntimeError(
+            "Client blueprint is missing required values for: "
+            + ", ".join(sorted(missing_required))
+        )
+
+    rendered_client = resolve_known_placeholders(copy.deepcopy(blueprint["client"]), values)
+    if not isinstance(rendered_client, dict):
+        raise RuntimeError("Expected rendered blueprint client to be a mapping.")
+
+    overlay_client = merge_client_overlay(
+        base_client_overlay(
+            client_id=client_id,
+            client_label=client_label,
+            client_root=client_root,
+            client_default_cwd=client_default_cwd,
+        ),
+        rendered_client,
+    )
+    overlay_client["id"] = client_id
+    if explicit_label:
+        overlay_client["label"] = client_label
+    else:
+        overlay_client.setdefault("label", client_label)
+    if explicit_default_cwd:
+        overlay_client["default_cwd"] = client_default_cwd
+    else:
+        overlay_client.setdefault("default_cwd", client_default_cwd)
+
+    overlay_dir = root_dir / "workspace" / "clients" / client_id
+    bundle_dir = root_dir / "default-skills" / "clients" / client_id
+    skills_dir = root_dir / "skills" / "clients" / client_id
+
+    overlay_path = overlay_dir / "overlay.yaml"
+    manifest_path = overlay_dir / "skills.manifest"
+    sources_path = overlay_dir / "skills.sources.yaml"
+    bundle_readme_path = bundle_dir / "README.md"
+    skills_keep_path = skills_dir / ".gitkeep"
+
+    return {
+        overlay_path: render_yaml_document({"version": 1, "client": overlay_client}),
+        manifest_path: f"# {overlay_client['label']} client-specific skills.\n",
+        sources_path: render_yaml_document(
+            {
+                "version": 1,
+                "sources": [
+                    {
+                        "kind": "local",
+                        "path": f"./skills/clients/{client_id}",
+                    }
+                ],
+            }
+        ),
+        bundle_readme_path: f"Generated `.skill` bundles for the `{client_id}` client overlay land here.\n",
+        skills_keep_path: "",
+    }
+
+
+def scaffold_client_overlay(
+    root_dir: Path,
+    client_id: str,
+    label: str | None,
+    default_cwd: str | None,
+    root_path: str | None,
+    blueprint_name: str | None,
+    blueprint_assignments: list[tuple[str, str]],
+    dry_run: bool,
+    force: bool,
+) -> tuple[list[str], dict[str, Any] | None]:
+    client_id = validate_client_id(client_id)
+    client_label = (label or titleize_client_id(client_id)).strip()
+    client_root = (root_path or f"${{SKILLBOX_MONOSERVER_ROOT}}/{client_id}").strip()
+    client_default_cwd = (default_cwd or client_root).strip()
+
+    if blueprint_name and not blueprint_assignments:
+        blueprint_assignments = []
+
+    blueprint_metadata: dict[str, Any] | None = None
+    if blueprint_name:
+        blueprint_path = resolve_client_blueprint_path(root_dir, blueprint_name)
+        blueprint = load_client_blueprint(blueprint_path)
+        target_files = build_blueprinted_client_scaffold_files(
+            root_dir=root_dir,
+            client_id=client_id,
+            client_label=client_label,
+            client_root=client_root,
+            client_default_cwd=client_default_cwd,
+            explicit_label=label is not None,
+            explicit_default_cwd=default_cwd is not None,
+            blueprint=blueprint,
+            blueprint_assignments=blueprint_assignments,
+        )
+        blueprint_metadata = {
+            "id": blueprint["id"],
+            "path": blueprint["path"],
+        }
+    else:
+        if blueprint_assignments:
+            raise RuntimeError("`--set` requires `--blueprint`.")
+        target_files = default_client_scaffold_files(
+            root_dir=root_dir,
+            client_id=client_id,
+            client_label=client_label,
+            client_root=client_root,
+            client_default_cwd=client_default_cwd,
+        )
+
     existing_paths = sorted(
         repo_rel(root_dir, path)
         for path in target_files
@@ -229,7 +612,7 @@ def scaffold_client_overlay(
         write_text_file(path, content, dry_run=dry_run)
         actions.append(f"write-file: {repo_rel(root_dir, path)}")
 
-    return actions
+    return actions, blueprint_metadata
 
 
 def normalize_active_profiles(raw_profiles: list[str] | None) -> set[str]:
@@ -296,10 +679,20 @@ def filter_model(model: dict[str, Any], active_profiles: set[str], active_client
         for artifact in model["artifacts"]
         if item_matches_profiles(artifact, active_profiles) and item_matches_clients(artifact, active_clients)
     ]
+    filtered_model["env_files"] = [
+        copy.deepcopy(env_file)
+        for env_file in model["env_files"]
+        if item_matches_profiles(env_file, active_profiles) and item_matches_clients(env_file, active_clients)
+    ]
     filtered_model["skills"] = [
         copy.deepcopy(skillset)
         for skillset in model["skills"]
         if item_matches_profiles(skillset, active_profiles) and item_matches_clients(skillset, active_clients)
+    ]
+    filtered_model["tasks"] = [
+        copy.deepcopy(task)
+        for task in model["tasks"]
+        if item_matches_profiles(task, active_profiles) and item_matches_clients(task, active_clients)
     ]
     filtered_model["services"] = [
         copy.deepcopy(service)
@@ -319,12 +712,72 @@ def filter_model(model: dict[str, Any], active_profiles: set[str], active_client
 
     included_repo_ids = {repo["id"] for repo in filtered_model["repos"]}
     included_artifact_ids = {artifact["id"] for artifact in filtered_model["artifacts"]}
+    included_task_ids = {task["id"] for task in filtered_model["tasks"]}
     included_log_ids = {log_item["id"] for log_item in filtered_model["logs"]}
+
+    tasks_by_id = {
+        str(task["id"]): task
+        for task in model["tasks"]
+        if str(task.get("id", "")).strip()
+    }
+
+    def raw_task_dependency_ids(task: dict[str, Any]) -> list[str]:
+        raw_dependencies = task.get("depends_on") or []
+        if not isinstance(raw_dependencies, list):
+            return []
+
+        dependency_ids: list[str] = []
+        seen_dependency_ids: set[str] = set()
+        for raw_dependency in raw_dependencies:
+            dependency_id = str(raw_dependency).strip()
+            if not dependency_id or dependency_id in seen_dependency_ids:
+                continue
+            dependency_ids.append(dependency_id)
+            seen_dependency_ids.add(dependency_id)
+        return dependency_ids
+
+    def raw_service_bootstrap_task_ids(service: dict[str, Any]) -> list[str]:
+        raw_tasks = service.get("bootstrap_tasks") or []
+        if not isinstance(raw_tasks, list):
+            return []
+
+        task_ids: list[str] = []
+        seen_task_ids: set[str] = set()
+        for raw_task in raw_tasks:
+            task_id = str(raw_task).strip()
+            if not task_id or task_id in seen_task_ids:
+                continue
+            task_ids.append(task_id)
+            seen_task_ids.add(task_id)
+        return task_ids
+
+    def include_task(task_id: str) -> None:
+        task = tasks_by_id.get(task_id)
+        if task is None:
+            return
+        for dependency_id in raw_task_dependency_ids(task):
+            include_task(dependency_id)
+        if task_id in included_task_ids:
+            return
+        filtered_model["tasks"].append(copy.deepcopy(task))
+        included_task_ids.add(task_id)
+
+    for service in filtered_model["services"]:
+        for task_id in raw_service_bootstrap_task_ids(service):
+            include_task(task_id)
+
+    for task in list(filtered_model["tasks"]):
+        for dependency_id in raw_task_dependency_ids(task):
+            include_task(dependency_id)
 
     required_repo_ids = {
         str(service["repo"])
         for service in filtered_model["services"]
         if service.get("repo")
+    } | {
+        str(task["repo"])
+        for task in filtered_model["tasks"]
+        if task.get("repo")
     }
     required_artifact_ids = {
         str(service["artifact"])
@@ -335,6 +788,10 @@ def filter_model(model: dict[str, Any], active_profiles: set[str], active_client
         str(service["log"])
         for service in filtered_model["services"]
         if service.get("log")
+    } | {
+        str(task["log"])
+        for task in filtered_model["tasks"]
+        if task.get("log")
     }
 
     for repo in model["repos"]:
@@ -1026,7 +1483,7 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
     if default_client and default_client not in declared_client_ids:
         issues.append(f"selection.default_client references unknown client {default_client!r}")
 
-    for section in ("repos", "artifacts", "skills", "services", "logs", "checks"):
+    for section in ("repos", "artifacts", "env_files", "skills", "tasks", "services", "logs", "checks"):
         duplicates = find_duplicates(model[section], "id")
         if duplicates:
             issues.append(f"{section} contain duplicate ids: {', '.join(duplicates)}")
@@ -1043,8 +1500,17 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
     if duplicate_artifact_paths:
         issues.append(f"artifacts contain duplicate paths: {', '.join(duplicate_artifact_paths)}")
 
+    duplicate_env_file_paths = find_duplicates(model["env_files"], "path")
+    if duplicate_env_file_paths:
+        issues.append(f"env_files contain duplicate paths: {', '.join(duplicate_env_file_paths)}")
+
     repo_ids = {repo.get("id") for repo in model["repos"]}
     artifact_ids = {artifact.get("id") for artifact in model["artifacts"]}
+    task_ids = {
+        str(task.get("id", "")).strip()
+        for task in model["tasks"]
+        if str(task.get("id", "")).strip()
+    }
     log_ids = {log_item.get("id") for log_item in model["logs"]}
 
     for repo in model["repos"]:
@@ -1089,6 +1555,28 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
         if sync_mode not in VALID_ARTIFACT_SYNC_MODES:
             issues.append(f"artifact {artifact.get('id')} has unsupported sync.mode {sync_mode!r}")
 
+    for env_file in model["env_files"]:
+        if not env_file.get("id"):
+            issues.append("every env_files entry must have an id")
+        if not env_file.get("path"):
+            issues.append(f"env file {env_file.get('id', '(missing id)')} is missing path")
+        if env_file.get("client") and env_file["client"] not in declared_client_ids:
+            issues.append(f"env file {env_file.get('id')} references unknown client {env_file['client']!r}")
+        if env_file.get("repo") and env_file["repo"] not in repo_ids:
+            issues.append(f"env file {env_file.get('id')} references unknown repo {env_file['repo']!r}")
+
+        source = env_file.get("source") or {}
+        source_kind = source.get("kind", "manual")
+        if source_kind not in VALID_ENV_FILE_SOURCE_KINDS:
+            issues.append(f"env file {env_file.get('id')} has unsupported source.kind {source_kind!r}")
+
+        sync = env_file.get("sync") or {}
+        sync_mode = sync.get("mode") or ("write" if source_kind == "file" else "manual")
+        if sync_mode not in VALID_ENV_FILE_SYNC_MODES:
+            issues.append(f"env file {env_file.get('id')} has unsupported sync.mode {sync_mode!r}")
+        if source_kind == "file" and not source.get("path"):
+            issues.append(f"env file {env_file.get('id')} is file-backed but missing source.path")
+
     for skillset in model["skills"]:
         if not skillset.get("id"):
             issues.append("every skills entry must have an id")
@@ -1118,7 +1606,69 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
             if not target.get("path"):
                 issues.append(f"skill set {skillset.get('id')} target {target.get('id', '(missing id)')} is missing path")
 
+    task_dependency_map: dict[str, list[str]] = {}
+    for task in model["tasks"]:
+        task_id = str(task.get("id", "")).strip()
+        if not task.get("id"):
+            issues.append("every task entry must have an id")
+        if task.get("client") and task["client"] not in declared_client_ids:
+            issues.append(f"task {task.get('id')} references unknown client {task['client']!r}")
+        if task.get("repo") and task["repo"] not in repo_ids:
+            issues.append(f"task {task.get('id')} references unknown repo {task['repo']!r}")
+        if task.get("log") and task["log"] not in log_ids:
+            issues.append(f"task {task.get('id')} references unknown log {task['log']!r}")
+        if not str(task.get("command") or "").strip():
+            issues.append(f"task {task.get('id', '(missing id)')} is missing command")
+
+        for field_name in ("inputs", "outputs"):
+            raw_value = task.get(field_name) or []
+            if not isinstance(raw_value, list):
+                issues.append(f"task {task.get('id')} has non-list {field_name}")
+
+        raw_dependencies = task.get("depends_on") or []
+        if raw_dependencies and not isinstance(raw_dependencies, list):
+            issues.append(f"task {task.get('id')} has non-list depends_on")
+            raw_dependencies = []
+
+        dependency_ids: list[str] = []
+        seen_dependency_ids: set[str] = set()
+        for raw_dependency in raw_dependencies:
+            dependency_id = str(raw_dependency).strip()
+            if not dependency_id:
+                issues.append(f"task {task.get('id')} contains an empty depends_on entry")
+                continue
+            if dependency_id in seen_dependency_ids:
+                issues.append(f"task {task.get('id')} contains duplicate depends_on entry {dependency_id!r}")
+                continue
+            if dependency_id == task_id:
+                issues.append(f"task {task.get('id')} cannot depend on itself")
+                continue
+            if dependency_id not in task_ids:
+                issues.append(f"task {task.get('id')} references unknown dependency {dependency_id!r}")
+                continue
+            dependency_ids.append(dependency_id)
+            seen_dependency_ids.add(dependency_id)
+        if task_id:
+            task_dependency_map[task_id] = dependency_ids
+
+        success = task.get("success") or {}
+        success_type = success.get("type")
+        if not success_type:
+            issues.append(f"task {task.get('id', '(missing id)')} is missing success.type")
+        elif success_type not in VALID_TASK_SUCCESS_TYPES:
+            issues.append(f"task {task.get('id')} has unsupported success.type {success_type!r}")
+        if success_type == "path_exists" and not success.get("path"):
+            issues.append(f"task {task.get('id')} path_exists success is missing path")
+
+    service_ids = {
+        str(service.get("id", "")).strip()
+        for service in model["services"]
+        if str(service.get("id", "")).strip()
+    }
+    service_dependency_map: dict[str, list[str]] = {}
+
     for service in model["services"]:
+        service_id = str(service.get("id", "")).strip()
         if not service.get("id"):
             issues.append("every service entry must have an id")
         if service.get("client") and service["client"] not in declared_client_ids:
@@ -1129,6 +1679,53 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
             issues.append(f"service {service.get('id')} references unknown artifact {service['artifact']!r}")
         if service.get("log") and service["log"] not in log_ids:
             issues.append(f"service {service.get('id')} references unknown log {service['log']!r}")
+        if not str(service.get("command") or "").strip():
+            issues.append(f"service {service.get('id', '(missing id)')} is missing command")
+
+        raw_dependencies = service.get("depends_on") or []
+        if raw_dependencies and not isinstance(raw_dependencies, list):
+            issues.append(f"service {service.get('id')} has non-list depends_on")
+            raw_dependencies = []
+
+        dependency_ids: list[str] = []
+        seen_dependency_ids: set[str] = set()
+        for raw_dependency in raw_dependencies:
+            dependency_id = str(raw_dependency).strip()
+            if not dependency_id:
+                issues.append(f"service {service.get('id')} contains an empty depends_on entry")
+                continue
+            if dependency_id in seen_dependency_ids:
+                issues.append(f"service {service.get('id')} contains duplicate depends_on entry {dependency_id!r}")
+                continue
+            if dependency_id == service_id:
+                issues.append(f"service {service.get('id')} cannot depend on itself")
+                continue
+            if dependency_id not in service_ids:
+                issues.append(f"service {service.get('id')} references unknown dependency {dependency_id!r}")
+                continue
+            dependency_ids.append(dependency_id)
+            seen_dependency_ids.add(dependency_id)
+        if service_id:
+            service_dependency_map[service_id] = dependency_ids
+
+        raw_bootstrap_tasks = service.get("bootstrap_tasks") or []
+        if raw_bootstrap_tasks and not isinstance(raw_bootstrap_tasks, list):
+            issues.append(f"service {service.get('id')} has non-list bootstrap_tasks")
+            raw_bootstrap_tasks = []
+
+        seen_bootstrap_tasks: set[str] = set()
+        for raw_task in raw_bootstrap_tasks:
+            task_id = str(raw_task).strip()
+            if not task_id:
+                issues.append(f"service {service.get('id')} contains an empty bootstrap_tasks entry")
+                continue
+            if task_id in seen_bootstrap_tasks:
+                issues.append(f"service {service.get('id')} contains duplicate bootstrap_tasks entry {task_id!r}")
+                continue
+            if task_id not in task_ids:
+                issues.append(f"service {service.get('id')} references unknown bootstrap task {task_id!r}")
+                continue
+            seen_bootstrap_tasks.add(task_id)
 
         healthcheck = service.get("healthcheck") or {}
         healthcheck_type = healthcheck.get("type")
@@ -1141,6 +1738,48 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
                 issues.append(f"service {service.get('id')} http healthcheck is missing url")
             if healthcheck_type == "path_exists" and not healthcheck.get("path"):
                 issues.append(f"service {service.get('id')} path_exists healthcheck is missing path")
+
+    visiting: list[str] = []
+    visited: set[str] = set()
+
+    def visit_service_dependency(service_id: str) -> None:
+        if service_id in visited:
+            return
+        if service_id in visiting:
+            cycle_start = visiting.index(service_id)
+            cycle = visiting[cycle_start:] + [service_id]
+            issues.append("service dependency cycle detected: " + " -> ".join(cycle))
+            return
+
+        visiting.append(service_id)
+        for dependency_id in service_dependency_map.get(service_id, []):
+            visit_service_dependency(dependency_id)
+        visiting.pop()
+        visited.add(service_id)
+
+    for service_id in sorted(service_dependency_map):
+        visit_service_dependency(service_id)
+
+    task_visiting: list[str] = []
+    task_visited: set[str] = set()
+
+    def visit_task_dependency(task_id: str) -> None:
+        if task_id in task_visited:
+            return
+        if task_id in task_visiting:
+            cycle_start = task_visiting.index(task_id)
+            cycle = task_visiting[cycle_start:] + [task_id]
+            issues.append("task dependency cycle detected: " + " -> ".join(cycle))
+            return
+
+        task_visiting.append(task_id)
+        for dependency_id in task_dependency_map.get(task_id, []):
+            visit_task_dependency(dependency_id)
+        task_visiting.pop()
+        task_visited.add(task_id)
+
+    for task_id in sorted(task_dependency_map):
+        visit_task_dependency(task_id)
 
     for log_item in model["logs"]:
         if not log_item.get("id"):
@@ -1177,7 +1816,9 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
             details={
                 "repos": len(model["repos"]),
                 "artifacts": len(model["artifacts"]),
+                "env_files": len(model["env_files"]),
                 "skills": len(model["skills"]),
+                "tasks": len(model["tasks"]),
                 "services": len(model["services"]),
                 "logs": len(model["logs"]),
                 "checks": len(model["checks"]),
@@ -1186,12 +1827,84 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
     ]
 
 
+def normalize_file_mode(raw_mode: Any, default: int = 0o600) -> int:
+    if raw_mode is None:
+        return default
+    if isinstance(raw_mode, int):
+        return raw_mode & 0o777
+
+    text = str(raw_mode).strip()
+    if not text:
+        return default
+    try:
+        return int(text, 8) & 0o777
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid file mode {raw_mode!r}. Use an octal string such as '0600'.") from exc
+
+
+def env_file_state(env_file: dict[str, Any]) -> dict[str, Any]:
+    path = Path(str(env_file["host_path"]))
+    source = env_file.get("source") or {}
+    source_kind = str(source.get("kind", "manual")).strip() or "manual"
+    sync = env_file.get("sync") or {}
+    sync_mode = str(sync.get("mode") or ("write" if source_kind == "file" else "manual")).strip()
+    desired_mode = normalize_file_mode(env_file.get("mode"), default=0o600)
+
+    source_path: Path | None = None
+    raw_source_path = str(source.get("host_path") or source.get("path") or "").strip()
+    if raw_source_path:
+        source_path = Path(raw_source_path)
+
+    present = path.is_file()
+    source_present = bool(source_path and source_path.is_file())
+    state = "ok" if present else "missing"
+    syncable = False
+
+    if source_kind == "file" and sync_mode == "write":
+        if not source_present:
+            state = "source-missing"
+        elif not present:
+            state = "missing"
+            syncable = True
+        else:
+            target_mode = path.stat().st_mode & 0o777
+            if path.read_bytes() != source_path.read_bytes() or target_mode != desired_mode:
+                state = "stale"
+                syncable = True
+            else:
+                state = "ok"
+    elif not present:
+        state = "missing"
+
+    return {
+        "id": env_file["id"],
+        "kind": env_file.get("kind", "env-file"),
+        "repo": str(env_file.get("repo") or ""),
+        "path": str(env_file["path"]),
+        "host_path": str(path),
+        "present": present,
+        "required": bool(env_file.get("required")),
+        "profiles": env_file.get("profiles") or [],
+        "source_kind": source_kind,
+        "source_path": str(source.get("path") or ""),
+        "source_host_path": str(source_path) if source_path else "",
+        "source_present": source_present,
+        "sync_mode": sync_mode,
+        "mode": f"{desired_mode:04o}",
+        "state": state,
+        "syncable": syncable,
+    }
+
+
 def check_filesystem(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
     results: list[CheckResult] = []
     missing_syncable_repo_paths: list[str] = []
     missing_required_repo_paths: list[str] = []
     missing_syncable_artifact_paths: list[str] = []
     missing_required_artifact_paths: list[str] = []
+    syncable_env_files: list[str] = []
+    missing_required_env_sources: list[str] = []
+    missing_required_env_targets: list[str] = []
     missing_log_paths: list[str] = []
     missing_required_checks: list[str] = []
 
@@ -1232,6 +1945,21 @@ def check_filesystem(model: dict[str, Any], root_dir: Path) -> list[CheckResult]
             missing_syncable_artifact_paths.append(repo_rel(root_dir, path))
         elif artifact.get("required"):
             missing_required_artifact_paths.append(repo_rel(root_dir, path))
+
+    for env_file in model["env_files"]:
+        state = env_file_state(env_file)
+        display_path = repo_rel(root_dir, Path(state["host_path"]))
+        if state["state"] == "source-missing":
+            if env_file.get("required"):
+                if state["source_host_path"]:
+                    missing_required_env_sources.append(repo_rel(root_dir, Path(state["source_host_path"])))
+                else:
+                    missing_required_env_sources.append(state["source_path"] or display_path)
+        elif state["state"] in {"missing", "stale"}:
+            if state["syncable"]:
+                syncable_env_files.append(display_path)
+            elif env_file.get("required"):
+                missing_required_env_targets.append(display_path)
 
     for log_item in model["logs"]:
         path = Path(str(log_item["host_path"]))
@@ -1317,6 +2045,47 @@ def check_filesystem(model: dict[str, Any], root_dir: Path) -> list[CheckResult]
             )
         )
 
+    if missing_required_env_sources or missing_required_env_targets:
+        details: dict[str, Any] = {}
+        if missing_required_env_sources:
+            details["missing_sources"] = missing_required_env_sources
+        if missing_required_env_targets:
+            details["missing_targets"] = missing_required_env_targets
+        results.append(
+            CheckResult(
+                status="fail",
+                code="required-runtime-env-files",
+                message="required runtime env files cannot be materialized",
+                details=details,
+            )
+        )
+    else:
+        results.append(
+            CheckResult(
+                status="pass",
+                code="required-runtime-env-files",
+                message="required runtime env files are materialized or source-backed",
+            )
+        )
+
+    if syncable_env_files:
+        results.append(
+            CheckResult(
+                status="warn",
+                code="syncable-env-files",
+                message="managed env files are missing or stale but can be materialized by sync",
+                details={"targets": syncable_env_files},
+            )
+        )
+    else:
+        results.append(
+            CheckResult(
+                status="pass",
+                code="syncable-env-files",
+                message="managed env files do not need sync",
+            )
+        )
+
     if missing_log_paths:
         results.append(
             CheckResult(
@@ -1356,11 +2125,62 @@ def check_filesystem(model: dict[str, Any], root_dir: Path) -> list[CheckResult]
     return results
 
 
+def validate_task_state(model: dict[str, Any]) -> list[CheckResult]:
+    if not model["tasks"]:
+        return []
+
+    pending_tasks: list[str] = []
+    blocked_tasks: list[str] = []
+
+    for task in model["tasks"]:
+        task_state = probe_task(model, task)
+        if task_state["state"] == "ready":
+            continue
+
+        summary = task["id"]
+        if task_state.get("target"):
+            summary += f" -> {task_state['target']}"
+        if task_state["state"] == "blocked":
+            blocked_on = [
+                dependency_id
+                for dependency_id, dependency_state in task_state.get("dependency_states", {}).items()
+                if dependency_state != "ok"
+            ]
+            if blocked_on:
+                summary += f" (blocked by {', '.join(blocked_on)})"
+            blocked_tasks.append(summary)
+        else:
+            pending_tasks.append(summary)
+
+    if pending_tasks or blocked_tasks:
+        details: dict[str, Any] = {}
+        if pending_tasks:
+            details["pending"] = pending_tasks
+        if blocked_tasks:
+            details["blocked"] = blocked_tasks
+        return [
+            CheckResult(
+                status="warn",
+                code="bootstrap-task-state",
+                message="bootstrap tasks are pending and can be materialized by bootstrap",
+                details=details,
+            )
+        ]
+
+    return [
+        CheckResult(
+            status="pass",
+            code="bootstrap-task-state",
+            message="bootstrap task success checks are satisfied",
+        )
+    ]
+
+
 def doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
     results = check_manifest(model)
     if any(result.status == "fail" for result in results):
         return results
-    return results + check_filesystem(model, root_dir) + validate_skill_locks_and_state(model)
+    return results + check_filesystem(model, root_dir) + validate_skill_locks_and_state(model) + validate_task_state(model)
 
 
 def sync_artifact(artifact: dict[str, Any], dry_run: bool) -> list[str]:
@@ -1411,6 +2231,42 @@ def sync_artifact(artifact: dict[str, Any], dry_run: bool) -> list[str]:
     return [f"skip: {path} (sync mode {sync_mode})"]
 
 
+def sync_env_file(env_file: dict[str, Any], dry_run: bool) -> list[str]:
+    state = env_file_state(env_file)
+    path = Path(state["host_path"])
+    source_path = Path(state["source_host_path"]) if state["source_host_path"] else None
+
+    if state["source_kind"] == "file" and state["sync_mode"] == "write":
+        if source_path is None or not source_path.is_file():
+            if env_file.get("required"):
+                raise RuntimeError(
+                    f"Required env file {env_file['id']} is missing source {state['source_path'] or state['source_host_path'] or path}."
+                )
+            return [f"skip: {path} (env source path missing)"]
+
+        ensure_directory(path.parent, dry_run)
+        if dry_run:
+            return [f"hydrate-env: {source_path} -> {path}"]
+
+        payload = source_path.read_bytes()
+        current_payload = path.read_bytes() if path.is_file() else None
+        desired_mode = normalize_file_mode(env_file.get("mode"), default=0o600)
+        current_mode = path.stat().st_mode & 0o777 if path.is_file() else None
+        if current_payload == payload and current_mode == desired_mode:
+            return [f"env-unchanged: {path}"]
+
+        path.write_bytes(payload)
+        path.chmod(desired_mode)
+        return [f"hydrate-env: {source_path} -> {path}"]
+
+    if path.exists():
+        return [f"exists: {path}"]
+
+    if env_file.get("required"):
+        raise RuntimeError(f"Required env file {env_file['id']} is missing at {path}.")
+    return [f"skip: {path} (sync mode {state['sync_mode']})"]
+
+
 def sync_runtime(model: dict[str, Any], dry_run: bool) -> list[str]:
     actions: list[str] = []
 
@@ -1456,6 +2312,9 @@ def sync_runtime(model: dict[str, Any], dry_run: bool) -> list[str]:
     for artifact in model["artifacts"]:
         actions.extend(sync_artifact(artifact, dry_run=dry_run))
 
+    for env_file in model["env_files"]:
+        actions.extend(sync_env_file(env_file, dry_run=dry_run))
+
     for log_item in model["logs"]:
         path = Path(str(log_item["host_path"]))
         if path.exists():
@@ -1484,12 +2343,200 @@ def runtime_repo_map(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
     }
 
 
+def task_id_map(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(task["id"]): task
+        for task in model.get("tasks") or []
+        if str(task.get("id", "")).strip()
+    }
+
+
+def task_dependency_ids(task: dict[str, Any]) -> list[str]:
+    raw_dependencies = task.get("depends_on") or []
+    if not isinstance(raw_dependencies, list):
+        return []
+
+    dependencies: list[str] = []
+    seen: set[str] = set()
+    for raw_dependency in raw_dependencies:
+        dependency_id = str(raw_dependency).strip()
+        if not dependency_id or dependency_id in seen:
+            continue
+        dependencies.append(dependency_id)
+        seen.add(dependency_id)
+    return dependencies
+
+
+def service_bootstrap_task_ids(service: dict[str, Any]) -> list[str]:
+    raw_tasks = service.get("bootstrap_tasks") or []
+    if not isinstance(raw_tasks, list):
+        return []
+
+    task_ids: list[str] = []
+    seen: set[str] = set()
+    for raw_task in raw_tasks:
+        task_id = str(raw_task).strip()
+        if not task_id or task_id in seen:
+            continue
+        task_ids.append(task_id)
+        seen.add(task_id)
+    return task_ids
+
+
+def task_dependency_graph(model: dict[str, Any]) -> dict[str, list[str]]:
+    return {
+        task_id: task_dependency_ids(task)
+        for task_id, task in task_id_map(model).items()
+    }
+
+
+def expand_graph_ids(graph: dict[str, list[str]], root_ids: list[str]) -> set[str]:
+    expanded = set(root_ids)
+    queue = list(root_ids)
+
+    while queue:
+        item_id = queue.pop()
+        for linked_item_id in graph.get(item_id, []):
+            if linked_item_id in expanded:
+                continue
+            expanded.add(linked_item_id)
+            queue.append(linked_item_id)
+
+    return expanded
+
+
+def order_task_ids(model: dict[str, Any], selected_ids: set[str]) -> list[str]:
+    tasks_by_id = task_id_map(model)
+    dependency_graph = task_dependency_graph(model)
+    ordered_ids: list[str] = []
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(task_id: str) -> None:
+        if task_id in visited:
+            return
+        if task_id in visiting:
+            raise RuntimeError(f"Task dependency cycle detected at {task_id}.")
+        if task_id not in tasks_by_id:
+            raise RuntimeError(f"Task dependency references unknown task {task_id!r}.")
+
+        visiting.add(task_id)
+        for dependency_id in dependency_graph.get(task_id, []):
+            if dependency_id in selected_ids:
+                visit(dependency_id)
+        visiting.remove(task_id)
+        visited.add(task_id)
+        ordered_ids.append(task_id)
+
+    for task in model["tasks"]:
+        task_id = str(task.get("id", "")).strip()
+        if task_id and task_id in selected_ids:
+            visit(task_id)
+
+    return ordered_ids
+
+
 def service_supports_lifecycle(service: dict[str, Any]) -> tuple[bool, str | None]:
     if not str(service.get("command") or "").strip():
         return False, "command missing"
     if str(service.get("kind") or "").strip() == "orchestration":
         return False, "orchestration services are status-only"
     return True, None
+
+
+def service_dependency_ids(service: dict[str, Any]) -> list[str]:
+    raw_dependencies = service.get("depends_on") or []
+    if not isinstance(raw_dependencies, list):
+        return []
+
+    dependencies: list[str] = []
+    seen: set[str] = set()
+    for raw_dependency in raw_dependencies:
+        dependency_id = str(raw_dependency).strip()
+        if not dependency_id or dependency_id in seen:
+            continue
+        dependencies.append(dependency_id)
+        seen.add(dependency_id)
+    return dependencies
+
+
+def service_id_map(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(service["id"]): service
+        for service in model["services"]
+        if str(service.get("id", "")).strip()
+    }
+
+
+def service_dependency_graph(model: dict[str, Any]) -> dict[str, list[str]]:
+    return {
+        service_id: service_dependency_ids(service)
+        for service_id, service in service_id_map(model).items()
+    }
+
+
+def reverse_service_dependency_graph(model: dict[str, Any]) -> dict[str, list[str]]:
+    reverse_graph: dict[str, list[str]] = {
+        service_id: []
+        for service_id in service_id_map(model)
+    }
+    for service_id, dependency_ids in service_dependency_graph(model).items():
+        for dependency_id in dependency_ids:
+            reverse_graph.setdefault(dependency_id, []).append(service_id)
+    return reverse_graph
+
+
+def order_service_ids(model: dict[str, Any], selected_ids: set[str]) -> list[str]:
+    services_by_id = service_id_map(model)
+    dependency_graph = service_dependency_graph(model)
+    ordered_ids: list[str] = []
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(service_id: str) -> None:
+        if service_id in visited:
+            return
+        if service_id in visiting:
+            raise RuntimeError(f"Service dependency cycle detected at {service_id}.")
+        if service_id not in services_by_id:
+            raise RuntimeError(f"Service dependency references unknown service {service_id!r}.")
+
+        visiting.add(service_id)
+        for dependency_id in dependency_graph.get(service_id, []):
+            if dependency_id in selected_ids:
+                visit(dependency_id)
+        visiting.remove(service_id)
+        visited.add(service_id)
+        ordered_ids.append(service_id)
+
+    for service in model["services"]:
+        service_id = str(service.get("id", "")).strip()
+        if service_id and service_id in selected_ids:
+            visit(service_id)
+
+    return ordered_ids
+
+
+def resolve_services_for_start(
+    model: dict[str, Any],
+    requested_services: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    requested_ids = [str(service["id"]) for service in requested_services]
+    expanded_ids = expand_graph_ids(service_dependency_graph(model), requested_ids)
+    ordered_ids = order_service_ids(model, expanded_ids)
+    services_by_id = service_id_map(model)
+    return [services_by_id[service_id] for service_id in ordered_ids]
+
+
+def resolve_services_for_stop(
+    model: dict[str, Any],
+    requested_services: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    requested_ids = [str(service["id"]) for service in requested_services]
+    expanded_ids = expand_graph_ids(reverse_service_dependency_graph(model), requested_ids)
+    ordered_ids = list(reversed(order_service_ids(model, expanded_ids)))
+    services_by_id = service_id_map(model)
+    return [services_by_id[service_id] for service_id in ordered_ids]
 
 
 def translated_runtime_env(root_dir: Path, runtime_env: dict[str, str]) -> dict[str, str]:
@@ -1520,9 +2567,9 @@ def translate_runtime_paths(value: str, runtime_env: dict[str, str], translated_
     return translated
 
 
-def service_paths(model: dict[str, Any], service: dict[str, Any]) -> dict[str, Path]:
+def runtime_item_log_dir(model: dict[str, Any], item: dict[str, Any]) -> Path:
     log_map = runtime_log_map(model)
-    log_id = str(service.get("log") or "").strip()
+    log_id = str(item.get("log") or "").strip()
     log_dir: Path
     if log_id and log_id in log_map:
         log_dir = Path(str(log_map[log_id]["host_path"]))
@@ -1530,12 +2577,25 @@ def service_paths(model: dict[str, Any], service: dict[str, Any]) -> dict[str, P
         log_dir = Path(str(log_map["runtime"]["host_path"]))
     else:
         log_dir = Path(str(model["root_dir"])) / "logs" / "runtime"
+    return log_dir
 
+
+def service_paths(model: dict[str, Any], service: dict[str, Any]) -> dict[str, Path]:
+    log_dir = runtime_item_log_dir(model, service)
     service_slug = str(service["id"])
     return {
         "log_dir": log_dir,
         "log_file": log_dir / f"{service_slug}.log",
         "pid_file": log_dir / f"{service_slug}.pid",
+    }
+
+
+def task_paths(model: dict[str, Any], task: dict[str, Any]) -> dict[str, Path]:
+    log_dir = runtime_item_log_dir(model, task)
+    task_slug = str(task["id"])
+    return {
+        "log_dir": log_dir,
+        "log_file": log_dir / f"{task_slug}.log",
     }
 
 
@@ -1590,13 +2650,13 @@ def service_manager_state(model: dict[str, Any], service: dict[str, Any]) -> dic
     }
 
 
-def resolve_service_cwd(model: dict[str, Any], service: dict[str, Any]) -> Path:
-    repo_id = str(service.get("repo") or "").strip()
+def resolve_runtime_command_cwd(model: dict[str, Any], item: dict[str, Any]) -> Path:
+    repo_id = str(item.get("repo") or "").strip()
     repo = runtime_repo_map(model).get(repo_id)
     if repo is not None:
         return Path(str(repo["host_path"]))
 
-    host_path = str(service.get("host_path") or "").strip()
+    host_path = str(item.get("host_path") or "").strip()
     if host_path:
         candidate = Path(host_path)
         return candidate if candidate.is_dir() else candidate.parent
@@ -1604,14 +2664,49 @@ def resolve_service_cwd(model: dict[str, Any], service: dict[str, Any]) -> Path:
     return Path(str(model["root_dir"]))
 
 
-def translated_service_command(model: dict[str, Any], service: dict[str, Any]) -> tuple[str, dict[str, str]]:
+def translated_runtime_command(model: dict[str, Any], item: dict[str, Any]) -> tuple[str, dict[str, str]]:
     root_dir = Path(str(model["root_dir"]))
     runtime_env = dict(model.get("env") or {})
     translated_env = translated_runtime_env(root_dir, runtime_env)
-    command = translate_runtime_paths(str(service["command"]), runtime_env, translated_env)
+    command = translate_runtime_paths(str(item["command"]), runtime_env, translated_env)
     env = os.environ.copy()
     env.update(translated_env)
     return command, env
+
+
+def task_success_state(task: dict[str, Any]) -> dict[str, Any]:
+    success = task.get("success") or {}
+    success_type = success.get("type")
+    if success_type == "path_exists":
+        path = Path(str(success["host_path"]))
+        return {"state": "ok" if path.exists() else "down", "target": str(path)}
+    return {"state": "unknown"}
+
+
+def probe_task(model: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
+    success_state = task_success_state(task)
+    tasks_by_id = task_id_map(model)
+    dependency_states = {
+        dependency_id: task_success_state(tasks_by_id[dependency_id]).get("state", "unknown")
+        for dependency_id in task_dependency_ids(task)
+        if dependency_id in tasks_by_id
+    }
+
+    if success_state.get("state") == "ok":
+        state = "ready"
+    elif any(dependency_state != "ok" for dependency_state in dependency_states.values()):
+        state = "blocked"
+    else:
+        state = "pending"
+
+    result = {
+        "state": state,
+        "depends_on": task_dependency_ids(task),
+        "dependency_states": dependency_states,
+    }
+    if success_state.get("target"):
+        result["target"] = success_state["target"]
+    return result
 
 
 def service_healthcheck_state(service: dict[str, Any]) -> dict[str, Any]:
@@ -1700,6 +2795,54 @@ def stop_process(pid: int, wait_seconds: float) -> tuple[str, int | None]:
     return "stuck", None
 
 
+def select_tasks(model: dict[str, Any], task_ids: list[str] | None) -> list[dict[str, Any]]:
+    requested_ids = [task_id.strip() for task_id in task_ids or [] if task_id.strip()]
+    available = {
+        str(task["id"]): task
+        for task in model["tasks"]
+        if str(task.get("id", "")).strip()
+    }
+    unknown = sorted(task_id for task_id in requested_ids if task_id not in available)
+    if unknown:
+        raise RuntimeError(
+            "Unknown task id(s): "
+            + ", ".join(unknown)
+            + ". Available tasks: "
+            + (", ".join(sorted(available)) or "(none)")
+        )
+    if not requested_ids:
+        return list(model["tasks"])
+
+    requested = set(requested_ids)
+    return [task for task in model["tasks"] if task["id"] in requested]
+
+
+def resolve_tasks_for_run(
+    model: dict[str, Any],
+    requested_tasks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    requested_ids = [str(task["id"]) for task in requested_tasks]
+    expanded_ids = expand_graph_ids(task_dependency_graph(model), requested_ids)
+    ordered_ids = order_task_ids(model, expanded_ids)
+    tasks_by_id = task_id_map(model)
+    return [tasks_by_id[task_id] for task_id in ordered_ids]
+
+
+def resolve_tasks_for_services(
+    model: dict[str, Any],
+    services: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    root_task_ids: list[str] = []
+    for service in services:
+        root_task_ids.extend(service_bootstrap_task_ids(service))
+    if not root_task_ids:
+        return []
+    expanded_ids = expand_graph_ids(task_dependency_graph(model), root_task_ids)
+    ordered_ids = order_task_ids(model, expanded_ids)
+    tasks_by_id = task_id_map(model)
+    return [tasks_by_id[task_id] for task_id in ordered_ids]
+
+
 def select_services(model: dict[str, Any], service_ids: list[str] | None) -> list[dict[str, Any]]:
     requested_ids = [service_id.strip() for service_id in service_ids or [] if service_id.strip()]
     available = {
@@ -1720,6 +2863,125 @@ def select_services(model: dict[str, Any], service_ids: list[str] | None) -> lis
 
     requested = set(requested_ids)
     return [service for service in model["services"] if service["id"] in requested]
+
+
+def select_env_files_for_services(model: dict[str, Any], services: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not services:
+        return list(model["env_files"])
+
+    repo_ids = {
+        str(service.get("repo") or "").strip()
+        for service in services
+        if str(service.get("repo") or "").strip()
+    }
+    return [
+        env_file
+        for env_file in model["env_files"]
+        if not str(env_file.get("repo") or "").strip() or str(env_file.get("repo") or "").strip() in repo_ids
+    ]
+
+
+def select_env_files_for_tasks(model: dict[str, Any], tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not tasks:
+        return []
+
+    repo_ids = {
+        str(task.get("repo") or "").strip()
+        for task in tasks
+        if str(task.get("repo") or "").strip()
+    }
+    return [
+        env_file
+        for env_file in model["env_files"]
+        if not str(env_file.get("repo") or "").strip() or str(env_file.get("repo") or "").strip() in repo_ids
+    ]
+
+
+def ensure_required_env_files_ready(env_files: list[dict[str, Any]]) -> None:
+    unresolved: list[str] = []
+    for env_file in env_files:
+        state = env_file_state(env_file)
+        if not env_file.get("required") or state["state"] == "ok":
+            continue
+        detail = state["state"]
+        if state["state"] == "source-missing" and state["source_path"]:
+            detail = f"{detail}: {state['source_path']}"
+        unresolved.append(f"{env_file['id']} ({detail})")
+
+    if unresolved:
+        raise RuntimeError(f"Required env files are not ready: {', '.join(unresolved)}")
+
+
+def run_tasks(
+    model: dict[str, Any],
+    tasks: list[dict[str, Any]],
+    *,
+    dry_run: bool,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for task in tasks:
+        paths = task_paths(model, task)
+        result = {
+            "id": task["id"],
+            "kind": task.get("kind", "task"),
+            "log_file": str(paths["log_file"]),
+            "depends_on": task_dependency_ids(task),
+        }
+        task_state = probe_task(model, task)
+        if task_state["state"] == "ready":
+            results.append(result | {"result": "ready", "target": task_state.get("target")})
+            continue
+        if task_state["state"] == "blocked":
+            blocked_on = [
+                dependency_id
+                for dependency_id, dependency_state in task_state.get("dependency_states", {}).items()
+                if dependency_state != "ok"
+            ]
+            raise RuntimeError(
+                f"Task {task['id']} is blocked by incomplete dependencies: {', '.join(blocked_on)}"
+            )
+
+        command, env = translated_runtime_command(model, task)
+        cwd = resolve_runtime_command_cwd(model, task)
+        result["command"] = command
+        result["cwd"] = str(cwd)
+
+        ensure_directory(paths["log_dir"], dry_run)
+        if dry_run:
+            results.append(result | {"result": "dry-run"})
+            continue
+
+        with paths["log_file"].open("a", encoding="utf-8") as log_handle:
+            completed = subprocess.run(
+                command,
+                cwd=cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                shell=True,
+                text=True,
+                check=False,
+            )
+
+        if completed.returncode != 0:
+            tail = tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)
+            raise RuntimeError(
+                f"Task {task['id']} failed with exit code {completed.returncode}."
+                + (f" Recent logs: {' | '.join(tail)}" if tail else "")
+            )
+
+        post_state = probe_task(model, task)
+        if post_state["state"] != "ready":
+            tail = tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)
+            raise RuntimeError(
+                f"Task {task['id']} completed but did not satisfy its success check."
+                + (f" Success target: {post_state['target']}." if post_state.get("target") else "")
+                + (f" Recent logs: {' | '.join(tail)}" if tail else "")
+            )
+
+        results.append(result | {"result": "completed", "target": post_state.get("target")})
+    return results
 
 
 def start_services(
@@ -1749,8 +3011,8 @@ def start_services(
             results.append(result | {"result": "already-running", "pid": pid})
             continue
 
-        command, env = translated_service_command(model, service)
-        cwd = resolve_service_cwd(model, service)
+        command, env = translated_runtime_command(model, service)
+        cwd = resolve_runtime_command_cwd(model, service)
         result["command"] = command
         result["cwd"] = str(cwd)
 
@@ -1970,6 +3232,8 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
         }
         artifact_statuses.append(item)
 
+    env_file_statuses = [env_file_state(env_file) for env_file in model["env_files"]]
+
     skill_statuses: list[dict[str, Any]] = []
     for skillset in model["skills"]:
         inventory = collect_skill_inventory(skillset)
@@ -1989,12 +3253,27 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
+    task_statuses: list[dict[str, Any]] = []
+    for task in model["tasks"]:
+        item = {
+            "id": task["id"],
+            "kind": task.get("kind", "task"),
+            "profiles": task.get("profiles") or [],
+            "depends_on": task_dependency_ids(task),
+            "inputs": list(task.get("inputs") or []),
+            "outputs": list(task.get("outputs") or []),
+        }
+        item.update(probe_task(model, task))
+        task_statuses.append(item)
+
     service_statuses: list[dict[str, Any]] = []
     for service in model["services"]:
         item = {
             "id": service["id"],
             "kind": service.get("kind", "service"),
             "profiles": service.get("profiles") or [],
+            "depends_on": service_dependency_ids(service),
+            "bootstrap_tasks": service_bootstrap_task_ids(service),
         }
         item.update(probe_service(model, service))
         service_statuses.append(item)
@@ -2030,7 +3309,9 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
         "active_profiles": model.get("active_profiles") or [],
         "repos": repo_statuses,
         "artifacts": artifact_statuses,
+        "env_files": env_file_statuses,
         "skills": skill_statuses,
+        "tasks": task_statuses,
         "services": service_statuses,
         "logs": log_statuses,
         "checks": check_statuses,
@@ -2055,13 +3336,31 @@ def print_render_text(model: dict[str, Any]) -> None:
     print(f"artifacts: {len(model['artifacts'])}")
     for artifact in model["artifacts"]:
         print(f"  - {artifact['id']}: {artifact.get('kind', 'artifact')} @ {artifact['path']}")
+    print(f"env files: {len(model['env_files'])}")
+    for env_file in model["env_files"]:
+        print(f"  - {env_file['id']}: {env_file.get('kind', 'env-file')} @ {env_file['path']}")
     print(f"skills: {len(model['skills'])}")
     for skillset in model["skills"]:
         print(f"  - {skillset['id']}: {skillset.get('kind', 'packaged-skill-set')} @ {skillset['bundle_dir']}")
+    print(f"tasks: {len(model['tasks'])}")
+    for task in model["tasks"]:
+        dependency_summary = ""
+        dependency_ids = task_dependency_ids(task)
+        if dependency_ids:
+            dependency_summary = f" depends on {', '.join(dependency_ids)}"
+        print(f"  - {task['id']}: {task.get('kind', 'task')}{dependency_summary}")
     print(f"services: {len(model['services'])}")
     for service in model["services"]:
         profiles = ", ".join(service.get("profiles") or []) or "core"
-        print(f"  - {service['id']}: {service.get('kind', 'service')} [{profiles}]")
+        dependency_summary = ""
+        dependency_ids = service_dependency_ids(service)
+        if dependency_ids:
+            dependency_summary = f" depends on {', '.join(dependency_ids)}"
+        bootstrap_summary = ""
+        bootstrap_task_ids = service_bootstrap_task_ids(service)
+        if bootstrap_task_ids:
+            bootstrap_summary = f" bootstrap {', '.join(bootstrap_task_ids)}"
+        print(f"  - {service['id']}: {service.get('kind', 'service')} [{profiles}]{dependency_summary}{bootstrap_summary}")
     print(f"logs: {len(model['logs'])}")
     for log_item in model["logs"]:
         print(f"  - {log_item['id']}: {log_item['path']}")
@@ -2129,6 +3428,10 @@ def print_status_text(status_payload: dict[str, Any]) -> None:
         state = "present" if artifact["present"] else "missing"
         print(f"  - {artifact['id']}: {state} ({artifact.get('source_kind', 'manual')})")
 
+    print("env files:")
+    for env_file in status_payload["env_files"]:
+        print(f"  - {env_file['id']}: {env_file['state']} ({env_file['source_kind']})")
+
     print("skills:")
     for skillset in status_payload["skills"]:
         total_targets = 0
@@ -2145,6 +3448,15 @@ def print_status_text(status_payload: dict[str, Any]) -> None:
             f"{len(skillset['skills'])} skills, {healthy_targets}/{total_targets} targets healthy"
         )
 
+    print("tasks:")
+    for task in status_payload["tasks"]:
+        summary = task.get("state", "pending")
+        dependency_summary = ""
+        dependency_ids = task.get("depends_on") or []
+        if dependency_ids:
+            dependency_summary = f", depends on {', '.join(dependency_ids)}"
+        print(f"  - {task['id']}: {summary}{dependency_summary}")
+
     print("services:")
     for service in status_payload["services"]:
         summary = service.get("state", "declared")
@@ -2152,7 +3464,15 @@ def print_status_text(status_payload: dict[str, Any]) -> None:
             summary = f"{summary} (pid {service['pid']})"
         elif service.get("managed") is False and service.get("manager_reason"):
             summary = f"{summary} ({service['manager_reason']})"
-        print(f"  - {service['id']}: {summary}")
+        dependency_summary = ""
+        dependency_ids = service.get("depends_on") or []
+        if dependency_ids:
+            dependency_summary = f", depends on {', '.join(dependency_ids)}"
+        bootstrap_summary = ""
+        bootstrap_task_ids = service.get("bootstrap_tasks") or []
+        if bootstrap_task_ids:
+            bootstrap_summary = f", bootstrap {', '.join(bootstrap_task_ids)}"
+        print(f"  - {service['id']}: {summary}{dependency_summary}{bootstrap_summary}")
 
     print("logs:")
     for log_item in status_payload["logs"]:
@@ -2177,6 +3497,15 @@ def print_service_actions_text(payload: dict[str, Any]) -> None:
         for action in sync_actions:
             print(f"  - {action}")
 
+    task_results = payload.get("tasks") or payload.get("bootstrap_tasks") or []
+    if task_results:
+        print("tasks:")
+        for item in task_results:
+            summary = item.get("result", "unknown")
+            if item.get("target"):
+                summary = f"{summary} ({item['target']})"
+            print(f"  - {item['id']}: {summary}")
+
     print("services:")
     for item in payload.get("services") or []:
         summary = item.get("result", "unknown")
@@ -2197,6 +3526,29 @@ def print_service_logs_text(payload: dict[str, Any]) -> None:
                 print(line)
         else:
             print("(empty)")
+
+
+def print_client_blueprints_text(blueprints: list[dict[str, Any]]) -> None:
+    if not blueprints:
+        print("No client blueprints found.")
+        return
+
+    for blueprint in blueprints:
+        description = blueprint.get("description") or "No description."
+        print(f"{blueprint['id']}: {description}")
+        variables = blueprint.get("variables") or []
+        if not variables:
+            print("  vars: none")
+            continue
+        rendered_variables: list[str] = []
+        for variable in variables:
+            summary = variable["name"]
+            if variable.get("required"):
+                summary += " (required)"
+            elif variable.get("default") is not None:
+                summary += f" (default: {variable['default']})"
+            rendered_variables.append(summary)
+        print(f"  vars: {', '.join(rendered_variables)}")
 
 
 def emit_json(payload: Any) -> None:
@@ -2236,6 +3588,14 @@ def main() -> int:
             help="Limit the command to one or more declared service ids. Can be repeated.",
         )
 
+    def add_task_arg(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument(
+            "--task",
+            action="append",
+            default=[],
+            help="Limit the command to one or more declared task ids. Can be repeated.",
+        )
+
     render_parser = subparsers.add_parser("render", help="Print the resolved runtime graph.")
     render_parser.add_argument("--format", choices=("text", "json"), default="text")
     add_profile_arg(render_parser)
@@ -2265,6 +3625,16 @@ def main() -> int:
     status_parser.add_argument("--format", choices=("text", "json"), default="text")
     add_profile_arg(status_parser)
     add_client_arg(status_parser)
+
+    bootstrap_parser = subparsers.add_parser(
+        "bootstrap",
+        help="Sync runtime state and run one-shot bootstrap tasks for the active scope.",
+    )
+    bootstrap_parser.add_argument("--dry-run", action="store_true")
+    bootstrap_parser.add_argument("--format", choices=("text", "json"), default="text")
+    add_profile_arg(bootstrap_parser)
+    add_client_arg(bootstrap_parser)
+    add_task_arg(bootstrap_parser)
 
     up_parser = subparsers.add_parser(
         "up",
@@ -2313,7 +3683,11 @@ def main() -> int:
         "client-init",
         help="Scaffold a new workspace client overlay and companion skill directories.",
     )
-    client_init_parser.add_argument("client_id", help="Lowercase client slug, for example `acme-studio`.")
+    client_init_parser.add_argument(
+        "client_id",
+        nargs="?",
+        help="Lowercase client slug, for example `acme-studio`.",
+    )
     client_init_parser.add_argument("--label", default=None, help="Human-friendly label for the client.")
     client_init_parser.add_argument(
         "--root-path",
@@ -2325,6 +3699,22 @@ def main() -> int:
         default=None,
         help="Runtime default cwd for the client. Defaults to the client root path.",
     )
+    client_init_parser.add_argument(
+        "--blueprint",
+        default=None,
+        help="Apply a reusable client blueprint from workspace/client-blueprints/ or an explicit YAML path.",
+    )
+    client_init_parser.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        help="Set a blueprint variable using KEY=VALUE. Can be repeated.",
+    )
+    client_init_parser.add_argument(
+        "--list-blueprints",
+        action="store_true",
+        help="List discoverable client blueprints and their variables.",
+    )
     client_init_parser.add_argument("--force", action="store_true", help="Overwrite existing scaffold files.")
     client_init_parser.add_argument("--dry-run", action="store_true")
     client_init_parser.add_argument("--format", choices=("text", "json"), default="text")
@@ -2334,12 +3724,26 @@ def main() -> int:
 
     if args.command == "client-init":
         try:
-            actions = scaffold_client_overlay(
+            if args.list_blueprints:
+                blueprints = list_client_blueprints(root_dir)
+                if args.format == "json":
+                    emit_json({"blueprints": blueprints})
+                else:
+                    print_client_blueprints_text(blueprints)
+                return 0
+
+            if not args.client_id:
+                raise RuntimeError("client-init requires <client_id> unless --list-blueprints is used.")
+
+            assignments = parse_key_value_assignments(args.set, "--set")
+            actions, blueprint_metadata = scaffold_client_overlay(
                 root_dir=root_dir,
                 client_id=args.client_id,
                 label=args.label,
                 default_cwd=args.default_cwd,
                 root_path=args.root_path,
+                blueprint_name=args.blueprint,
+                blueprint_assignments=assignments,
                 dry_run=args.dry_run,
                 force=args.force,
             )
@@ -2356,9 +3760,13 @@ def main() -> int:
             "force": args.force,
             "actions": actions,
         }
+        if blueprint_metadata is not None:
+            payload["blueprint"] = blueprint_metadata
         if args.format == "json":
             emit_json(payload)
         else:
+            if blueprint_metadata is not None:
+                print(f"blueprint: {blueprint_metadata['id']}")
             print("\n".join(actions))
         return 0
 
@@ -2399,10 +3807,43 @@ def main() -> int:
                 print_status_text(status_payload)
             return 0
 
-        services = select_services(model, getattr(args, "service", []))
+        if args.command == "bootstrap":
+            sync_actions = sync_runtime(model, dry_run=args.dry_run)
+            requested_tasks = select_tasks(model, getattr(args, "task", []))
+            tasks = resolve_tasks_for_run(model, requested_tasks)
+            if not args.dry_run:
+                ensure_required_env_files_ready(select_env_files_for_tasks(model, tasks))
+            task_results = run_tasks(
+                model,
+                tasks,
+                dry_run=args.dry_run,
+            )
+            payload = {
+                "dry_run": args.dry_run,
+                "sync_actions": sync_actions,
+                "tasks": task_results,
+            }
+            if args.format == "json":
+                emit_json(payload)
+            else:
+                print_service_actions_text(payload)
+            return 0
+
+        requested_services = select_services(model, getattr(args, "service", []))
 
         if args.command == "up":
             sync_actions = sync_runtime(model, dry_run=args.dry_run)
+            services = resolve_services_for_start(model, requested_services)
+            bootstrap_tasks = resolve_tasks_for_services(model, services)
+            if not args.dry_run:
+                ensure_required_env_files_ready(
+                    select_env_files_for_tasks(model, bootstrap_tasks) + select_env_files_for_services(model, services)
+                )
+            task_results = run_tasks(
+                model,
+                bootstrap_tasks,
+                dry_run=args.dry_run,
+            )
             service_results = start_services(
                 model,
                 services,
@@ -2412,6 +3853,7 @@ def main() -> int:
             payload = {
                 "dry_run": args.dry_run,
                 "sync_actions": sync_actions,
+                "bootstrap_tasks": task_results,
                 "services": service_results,
             }
             if args.format == "json":
@@ -2421,6 +3863,7 @@ def main() -> int:
             return 0
 
         if args.command == "down":
+            services = resolve_services_for_stop(model, requested_services)
             service_results = stop_services(
                 model,
                 services,
@@ -2438,16 +3881,28 @@ def main() -> int:
             return 0
 
         if args.command == "restart":
+            stop_targets = resolve_services_for_stop(model, requested_services)
+            start_targets = resolve_services_for_start(model, stop_targets)
+            bootstrap_tasks = resolve_tasks_for_services(model, start_targets)
             stop_results = stop_services(
                 model,
-                services,
+                stop_targets,
                 dry_run=args.dry_run,
                 wait_seconds=max(0.0, float(args.wait_seconds)),
             )
             sync_actions = sync_runtime(model, dry_run=args.dry_run)
+            if not args.dry_run:
+                ensure_required_env_files_ready(
+                    select_env_files_for_tasks(model, bootstrap_tasks) + select_env_files_for_services(model, start_targets)
+                )
+            task_results = run_tasks(
+                model,
+                bootstrap_tasks,
+                dry_run=args.dry_run,
+            )
             start_results = start_services(
                 model,
-                services,
+                start_targets,
                 dry_run=args.dry_run,
                 wait_seconds=max(0.0, float(args.wait_seconds)),
             )
@@ -2455,6 +3910,7 @@ def main() -> int:
                 "dry_run": args.dry_run,
                 "stop_services": stop_results,
                 "sync_actions": sync_actions,
+                "bootstrap_tasks": task_results,
                 "start_services": start_results,
             }
             if args.format == "json":
@@ -2463,13 +3919,13 @@ def main() -> int:
                 print("stop:")
                 print_service_actions_text({"services": stop_results})
                 print()
-                print_service_actions_text({"sync_actions": sync_actions, "services": start_results})
+                print_service_actions_text({"sync_actions": sync_actions, "tasks": task_results, "services": start_results})
             return 0
 
         logs_payload = {
             "services": collect_service_logs(
                 model,
-                services,
+                requested_services,
                 line_count=max(0, int(args.lines)),
             )
         }

@@ -2,9 +2,10 @@ COMPOSE := docker compose
 PROFILE_ARGS := $(if $(strip $(PROFILE)),--profile $(PROFILE),)
 CLIENT_ARGS := $(if $(strip $(CLIENT)),--client $(CLIENT),)
 SERVICE_ARGS := $(if $(strip $(SERVICE)),--service $(SERVICE),)
+TASK_ARGS := $(if $(strip $(TASK)),--task $(TASK),)
 LINES_ARGS := $(if $(strip $(LINES)),--lines $(LINES),)
 
-.PHONY: help bootstrap-env render doctor runtime-render runtime-sync runtime-status runtime-up runtime-down runtime-restart runtime-logs dev-sanity build up up-surfaces down shell logs swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status
+.PHONY: help bootstrap-env render doctor runtime-render runtime-sync runtime-status runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs dev-sanity build up up-surfaces down shell logs swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status
 
 help:
 	@printf "  make bootstrap-env  Copy .env.example to .env if missing\n"
@@ -13,6 +14,7 @@ help:
 	@printf "  make runtime-render Print the resolved internal runtime graph (optional CLIENT=name PROFILE=name)\n"
 	@printf "  make runtime-sync   Create managed repo/log dirs and install default skills (optional CLIENT=name PROFILE=name)\n"
 	@printf "  make runtime-status Summarize repo/skill/service/log state (optional CLIENT=name PROFILE=name)\n"
+	@printf "  make runtime-bootstrap Sync runtime state and run bootstrap tasks (optional CLIENT=name PROFILE=name TASK=id)\n"
 	@printf "  make runtime-up     Sync runtime state and start manageable services (optional CLIENT=name PROFILE=name SERVICE=id)\n"
 	@printf "  make runtime-down   Stop manageable services (optional CLIENT=name PROFILE=name SERVICE=id)\n"
 	@printf "  make runtime-restart Restart manageable services (optional CLIENT=name PROFILE=name SERVICE=id)\n"
@@ -49,6 +51,9 @@ runtime-sync:
 
 runtime-status:
 	@python3 .env-manager/manage.py status $(CLIENT_ARGS) $(PROFILE_ARGS)
+
+runtime-bootstrap:
+	@python3 .env-manager/manage.py bootstrap $(CLIENT_ARGS) $(PROFILE_ARGS) $(TASK_ARGS)
 
 runtime-up:
 	@python3 .env-manager/manage.py up $(CLIENT_ARGS) $(PROFILE_ARGS) $(SERVICE_ARGS)
