@@ -259,6 +259,10 @@ make runtime-sync
 | `make runtime-render` | Prints the resolved internal runtime graph |
 | `make runtime-sync` | Creates managed repo/log directories and installs declared skills with generated lockfiles for the active core/client scope |
 | `make runtime-status` | Summarizes declared repos, skills, services, logs, and checks |
+| `make runtime-up` | Syncs runtime state and starts manageable services for the active scope |
+| `make runtime-down` | Stops manageable services for the active scope |
+| `make runtime-restart` | Restarts manageable services for the active scope |
+| `make runtime-logs` | Shows recent service logs for the active scope |
 | `make dev-sanity` | Validates the internal runtime graph, filesystem readiness, and managed skill integrity |
 | `make build` | Builds the workspace image |
 | `make up` | Starts the workspace container |
@@ -288,6 +292,11 @@ make runtime-sync
 | `.env-manager/manage.py sync` | Create managed repo/artifact/log directories and install declared skills for the selected core/client scope | `python3 .env-manager/manage.py sync --client personal --dry-run` |
 | `.env-manager/manage.py doctor` | Validate the internal repos/skills/logs/check graph for the selected core/client scope | `python3 .env-manager/manage.py doctor --client personal` |
 | `.env-manager/manage.py status` | Summarize repo, artifact, skill, service, log, and health state for the selected core/client scope | `python3 .env-manager/manage.py status --client personal` |
+| `.env-manager/manage.py up` | Sync runtime state and start manageable services, waiting for declared healthchecks when present | `python3 .env-manager/manage.py up --profile surfaces --service api-stub` |
+| `.env-manager/manage.py down` | Stop manageable services started by the runtime manager | `python3 .env-manager/manage.py down --profile surfaces --service api-stub` |
+| `.env-manager/manage.py restart` | Restart manageable services for the selected core/client scope | `python3 .env-manager/manage.py restart --profile surfaces --service web-stub` |
+| `.env-manager/manage.py logs` | Print recent log output for declared services | `python3 .env-manager/manage.py logs --profile surfaces --service api-stub --lines 80` |
+| `.env-manager/manage.py client-init` | Scaffold a new `workspace/clients/<id>/overlay.yaml` plus companion skill directories | `python3 .env-manager/manage.py client-init acme-studio` |
 
 ## Configuration
 
@@ -391,7 +400,7 @@ sandbox:
 
 ### Runtime graph
 
-`workspace/runtime.yaml` declares the inside of the box:
+`workspace/runtime.yaml` declares the core inside of the box:
 
 ```yaml
 version: 2
@@ -416,25 +425,29 @@ core:
   checks:
     - id: monoserver-root
       path: ${SKILLBOX_MONOSERVER_ROOT}
+```
 
-clients:
-  - id: personal
-    default_cwd: ${SKILLBOX_MONOSERVER_ROOT}
-    repo_roots:
-      - id: personal-root
-        path: ${SKILLBOX_MONOSERVER_ROOT}
-    skills:
-      - id: personal-skills
-        manifest: ${SKILLBOX_WORKSPACE_ROOT}/workspace/clients/personal/skills.manifest
+Client overlays are auto-discovered from `workspace/clients/<client>/overlay.yaml`.
+For example:
 
-  - id: vibe-coding-client
-    default_cwd: ${SKILLBOX_MONOSERVER_ROOT}/vibe-coding-client
-    repo_roots:
-      - id: vibe-coding-client-root
-        path: ${SKILLBOX_MONOSERVER_ROOT}/vibe-coding-client
-    skills:
-      - id: vibe-coding-client-skills
-        manifest: ${SKILLBOX_WORKSPACE_ROOT}/workspace/clients/vibe-coding-client/skills.manifest
+```yaml
+version: 1
+
+client:
+  id: personal
+  default_cwd: ${SKILLBOX_MONOSERVER_ROOT}
+  repo_roots:
+    - id: personal-root
+      path: ${SKILLBOX_MONOSERVER_ROOT}
+  skills:
+    - id: personal-skills
+      manifest: ${SKILLBOX_WORKSPACE_ROOT}/workspace/clients/personal/skills.manifest
+```
+
+Create a new overlay scaffold with:
+
+```bash
+python3 .env-manager/manage.py client-init acme-studio
 ```
 
 ### Client Selection
@@ -453,6 +466,7 @@ python3 .env-manager/manage.py render --client personal
 python3 .env-manager/manage.py sync --client personal
 python3 .env-manager/manage.py status --client vibe-coding-client
 python3 .env-manager/manage.py doctor --client vibe-coding-client
+python3 .env-manager/manage.py client-init acme-studio
 python3 .env-manager/manage.py render --client personal --profile surfaces
 
 make runtime-sync CLIENT=personal
@@ -593,8 +607,8 @@ make doctor
 - This is not a hosted control plane or a multi-user workspace platform.
 - There is no release installer, package manager distribution, or cloud provisioning flow yet.
 - The API and web surfaces are inspection stubs, not a full UI.
-- The internal runtime manager currently handles declaration, sync, status, and sanity checks. It does not yet do full per-repo start/stop orchestration.
-- Secrets management and richer per-client bootstrap workflows are still your responsibility.
+- The internal runtime manager now does basic manifest-driven service lifecycle (`up`, `down`, `restart`, `logs`), but it still does not do full dependency-aware per-repo orchestration.
+- Secrets management and richer per-client repo or service bootstrap workflows are still your responsibility.
 - There is no license file in this repo yet. Add one before publishing it as open source.
 
 ## FAQ

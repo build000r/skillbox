@@ -5,10 +5,14 @@ import argparse
 import copy
 import hashlib
 import json
+import os
+import re
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -24,7 +28,11 @@ SCRIPTS_DIR = DEFAULT_ROOT_DIR / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from lib.runtime_model import build_runtime_model  # noqa: E402
+from lib.runtime_model import (  # noqa: E402
+    build_runtime_model,
+    host_path_to_absolute_path,
+    runtime_path_to_host_path,
+)
 
 
 VALID_REPO_SOURCE_KINDS = {"bind", "directory", "git", "manual"}
@@ -35,6 +43,21 @@ VALID_SKILL_SYNC_MODES = {"unpack-bundles"}
 VALID_HEALTHCHECK_TYPES = {"http", "path_exists"}
 VALID_CHECK_TYPES = {"path_exists"}
 LOCKFILE_VERSION = 1
+CLIENT_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+DEFAULT_SERVICE_START_WAIT_SECONDS = 10.0
+DEFAULT_SERVICE_STOP_WAIT_SECONDS = 5.0
+DEFAULT_LOG_TAIL_LINES = 40
+PATH_LIKE_ENV_KEYS = {
+    "SKILLBOX_WORKSPACE_ROOT",
+    "SKILLBOX_REPOS_ROOT",
+    "SKILLBOX_SKILLS_ROOT",
+    "SKILLBOX_LOG_ROOT",
+    "SKILLBOX_HOME_ROOT",
+    "SKILLBOX_MONOSERVER_ROOT",
+    "SKILLBOX_SWIMMERS_REPO",
+    "SKILLBOX_SWIMMERS_INSTALL_DIR",
+    "SKILLBOX_SWIMMERS_BIN",
+}
 
 
 @dataclass
@@ -75,6 +98,138 @@ def resolve_root_dir(raw_root: str | None) -> Path:
     if raw_root:
         return Path(raw_root).resolve()
     return DEFAULT_ROOT_DIR
+
+
+def titleize_client_id(client_id: str) -> str:
+    return " ".join(part.capitalize() for part in client_id.split("-"))
+
+
+def validate_client_id(client_id: str) -> str:
+    normalized = client_id.strip()
+    if not CLIENT_ID_PATTERN.fullmatch(normalized):
+        raise RuntimeError(
+            f"Invalid client id {client_id!r}. Use lowercase letters, numbers, and single hyphens."
+        )
+    return normalized
+
+
+def write_text_file(path: Path, content: str, dry_run: bool) -> None:
+    ensure_directory(path.parent, dry_run)
+    if dry_run:
+        return
+    path.write_text(content, encoding="utf-8")
+
+
+def scaffold_client_overlay(
+    root_dir: Path,
+    client_id: str,
+    label: str | None,
+    default_cwd: str | None,
+    root_path: str | None,
+    dry_run: bool,
+    force: bool,
+) -> list[str]:
+    client_id = validate_client_id(client_id)
+    client_label = (label or titleize_client_id(client_id)).strip()
+    client_root = (root_path or f"${{SKILLBOX_MONOSERVER_ROOT}}/{client_id}").strip()
+    client_default_cwd = (default_cwd or client_root).strip()
+
+    overlay_dir = root_dir / "workspace" / "clients" / client_id
+    bundle_dir = root_dir / "default-skills" / "clients" / client_id
+    skills_dir = root_dir / "skills" / "clients" / client_id
+
+    overlay_path = overlay_dir / "overlay.yaml"
+    manifest_path = overlay_dir / "skills.manifest"
+    sources_path = overlay_dir / "skills.sources.yaml"
+    bundle_readme_path = bundle_dir / "README.md"
+    skills_keep_path = skills_dir / ".gitkeep"
+
+    target_files = {
+        overlay_path: (
+            "version: 1\n"
+            "\n"
+            "client:\n"
+            f"  id: {json.dumps(client_id)}\n"
+            f"  label: {json.dumps(client_label)}\n"
+            f"  default_cwd: {json.dumps(client_default_cwd)}\n"
+            "  repo_roots:\n"
+            f"    - id: {json.dumps(f'{client_id}-root')}\n"
+            "      kind: repo-root\n"
+            f"      path: {json.dumps(client_root)}\n"
+            "      required: true\n"
+            "      profiles:\n"
+            "        - core\n"
+            "      source:\n"
+            "        kind: bind\n"
+            "      sync:\n"
+            "        mode: external\n"
+            "      notes: Client root mounted from the shared monoserver tree.\n"
+            "  skills:\n"
+            f"    - id: {json.dumps(f'{client_id}-skills')}\n"
+            "      kind: packaged-skill-set\n"
+            "      required: false\n"
+            "      profiles:\n"
+            "        - core\n"
+            f"      bundle_dir: {json.dumps(f'${{SKILLBOX_WORKSPACE_ROOT}}/default-skills/clients/{client_id}')}\n"
+            f"      manifest: {json.dumps(f'${{SKILLBOX_WORKSPACE_ROOT}}/workspace/clients/{client_id}/skills.manifest')}\n"
+            f"      sources_config: {json.dumps(f'${{SKILLBOX_WORKSPACE_ROOT}}/workspace/clients/{client_id}/skills.sources.yaml')}\n"
+            f"      lock_path: {json.dumps(f'${{SKILLBOX_WORKSPACE_ROOT}}/workspace/clients/{client_id}/skills.lock.json')}\n"
+            "      sync:\n"
+            "        mode: unpack-bundles\n"
+            "      install_targets:\n"
+            "        - id: claude\n"
+            f"          path: {json.dumps('${SKILLBOX_HOME_ROOT}/.claude/skills')}\n"
+            "        - id: codex\n"
+            f"          path: {json.dumps('${SKILLBOX_HOME_ROOT}/.codex/skills')}\n"
+            "      notes: Client-scoped skills layered on top of the shared defaults.\n"
+            "  logs:\n"
+            f"    - id: {json.dumps(client_id)}\n"
+            f"      path: {json.dumps(f'${{SKILLBOX_LOG_ROOT}}/clients/{client_id}')}\n"
+            "      required: false\n"
+            "      profiles:\n"
+            "        - core\n"
+            "      retention_days: 14\n"
+            f"      notes: Client-scoped logs for the {client_id} overlay.\n"
+            "  checks:\n"
+            f"    - id: {json.dumps(f'{client_id}-root')}\n"
+            "      type: path_exists\n"
+            f"      path: {json.dumps(client_root)}\n"
+            "      required: true\n"
+            "      profiles:\n"
+            "        - core\n"
+            f"      notes: The {client_id} overlay expects the client root to be mounted.\n"
+        ),
+        manifest_path: f"# {client_label} client-specific skills.\n",
+        sources_path: (
+            "version: 1\n"
+            "\n"
+            "sources:\n"
+            "  - kind: local\n"
+            f"    path: {json.dumps(f'./skills/clients/{client_id}')}\n"
+        ),
+        bundle_readme_path: (
+            f"Generated `.skill` bundles for the `{client_id}` client overlay land here.\n"
+        ),
+        skills_keep_path: "",
+    }
+
+    existing_paths = sorted(
+        repo_rel(root_dir, path)
+        for path in target_files
+        if path.exists()
+    )
+    if existing_paths and not force:
+        raise RuntimeError(
+            "Client scaffold already exists for "
+            f"{client_id}: {', '.join(existing_paths)}. Re-run with --force to overwrite."
+        )
+
+    actions: list[str] = []
+    for path, content in target_files.items():
+        write_text_file(path, content, dry_run=dry_run)
+        actions.append(f"write-file: {repo_rel(root_dir, path)}")
+
+    return actions
 
 
 def normalize_active_profiles(raw_profiles: list[str] | None) -> set[str]:
@@ -1313,6 +1468,405 @@ def sync_runtime(model: dict[str, Any], dry_run: bool) -> list[str]:
     return actions
 
 
+def runtime_log_map(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(log_item["id"]): log_item
+        for log_item in model.get("logs") or []
+        if str(log_item.get("id", "")).strip()
+    }
+
+
+def runtime_repo_map(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(repo["id"]): repo
+        for repo in model.get("repos") or []
+        if str(repo.get("id", "")).strip()
+    }
+
+
+def service_supports_lifecycle(service: dict[str, Any]) -> tuple[bool, str | None]:
+    if not str(service.get("command") or "").strip():
+        return False, "command missing"
+    if str(service.get("kind") or "").strip() == "orchestration":
+        return False, "orchestration services are status-only"
+    return True, None
+
+
+def translated_runtime_env(root_dir: Path, runtime_env: dict[str, str]) -> dict[str, str]:
+    translated: dict[str, str] = {}
+    for key, value in runtime_env.items():
+        if key == "SKILLBOX_MONOSERVER_HOST_ROOT":
+            translated[key] = str(host_path_to_absolute_path(root_dir, value))
+            continue
+        if key in PATH_LIKE_ENV_KEYS and value:
+            translated[key] = str(runtime_path_to_host_path(root_dir, runtime_env, value))
+            continue
+        translated[key] = value
+    translated["ROOT_DIR"] = str(root_dir)
+    return translated
+
+
+def translate_runtime_paths(value: str, runtime_env: dict[str, str], translated_env: dict[str, str]) -> str:
+    translated = value
+    replacements: list[tuple[str, str]] = []
+    for key in PATH_LIKE_ENV_KEYS:
+        runtime_path = str(runtime_env.get(key, "")).strip()
+        host_path = str(translated_env.get(key, "")).strip()
+        if runtime_path and host_path and runtime_path != host_path:
+            replacements.append((runtime_path, host_path))
+
+    for runtime_path, host_path in sorted(replacements, key=lambda item: len(item[0]), reverse=True):
+        translated = translated.replace(runtime_path, host_path)
+    return translated
+
+
+def service_paths(model: dict[str, Any], service: dict[str, Any]) -> dict[str, Path]:
+    log_map = runtime_log_map(model)
+    log_id = str(service.get("log") or "").strip()
+    log_dir: Path
+    if log_id and log_id in log_map:
+        log_dir = Path(str(log_map[log_id]["host_path"]))
+    elif "runtime" in log_map:
+        log_dir = Path(str(log_map["runtime"]["host_path"]))
+    else:
+        log_dir = Path(str(model["root_dir"])) / "logs" / "runtime"
+
+    service_slug = str(service["id"])
+    return {
+        "log_dir": log_dir,
+        "log_file": log_dir / f"{service_slug}.log",
+        "pid_file": log_dir / f"{service_slug}.pid",
+    }
+
+
+def read_service_pid(pid_path: Path) -> int | None:
+    if not pid_path.exists():
+        return None
+    raw_value = pid_path.read_text(encoding="utf-8").strip()
+    if not raw_value:
+        return None
+    try:
+        return int(raw_value)
+    except ValueError:
+        return None
+
+
+def process_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def remove_pid_file(pid_path: Path) -> None:
+    try:
+        pid_path.unlink()
+    except FileNotFoundError:
+        return
+
+
+def live_service_pid(pid_path: Path) -> int | None:
+    pid = read_service_pid(pid_path)
+    if pid is None:
+        return None
+    if process_is_running(pid):
+        return pid
+    remove_pid_file(pid_path)
+    return None
+
+
+def service_manager_state(model: dict[str, Any], service: dict[str, Any]) -> dict[str, Any]:
+    manageable, reason = service_supports_lifecycle(service)
+    paths = service_paths(model, service)
+    pid = live_service_pid(paths["pid_file"])
+    return {
+        "managed": manageable,
+        "manager_reason": reason,
+        "pid": pid,
+        "pid_file": str(paths["pid_file"]),
+        "log_file": str(paths["log_file"]),
+        "log_present": paths["log_file"].is_file(),
+    }
+
+
+def resolve_service_cwd(model: dict[str, Any], service: dict[str, Any]) -> Path:
+    repo_id = str(service.get("repo") or "").strip()
+    repo = runtime_repo_map(model).get(repo_id)
+    if repo is not None:
+        return Path(str(repo["host_path"]))
+
+    host_path = str(service.get("host_path") or "").strip()
+    if host_path:
+        candidate = Path(host_path)
+        return candidate if candidate.is_dir() else candidate.parent
+
+    return Path(str(model["root_dir"]))
+
+
+def translated_service_command(model: dict[str, Any], service: dict[str, Any]) -> tuple[str, dict[str, str]]:
+    root_dir = Path(str(model["root_dir"]))
+    runtime_env = dict(model.get("env") or {})
+    translated_env = translated_runtime_env(root_dir, runtime_env)
+    command = translate_runtime_paths(str(service["command"]), runtime_env, translated_env)
+    env = os.environ.copy()
+    env.update(translated_env)
+    return command, env
+
+
+def service_healthcheck_state(service: dict[str, Any]) -> dict[str, Any]:
+    healthcheck = service.get("healthcheck") or {}
+    healthcheck_type = healthcheck.get("type")
+    if not healthcheck_type:
+        return {"state": "declared"}
+
+    if healthcheck_type == "path_exists":
+        path = Path(str(healthcheck["host_path"]))
+        return {"state": "ok" if path.exists() else "down", "target": str(path)}
+
+    if healthcheck_type == "http":
+        url = str(healthcheck["url"])
+        timeout = float(healthcheck.get("timeout_seconds", 0.5))
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as response:
+                return {"state": "ok", "status_code": response.getcode(), "url": url}
+        except (urllib.error.URLError, TimeoutError, ValueError):
+            return {"state": "down", "url": url}
+
+    return {"state": "unknown"}
+
+
+def wait_for_service_health(
+    service: dict[str, Any],
+    process: subprocess.Popen[str],
+    wait_seconds: float,
+) -> dict[str, Any]:
+    healthcheck = service.get("healthcheck") or {}
+    if not healthcheck.get("type"):
+        if process.poll() is not None:
+            return {"state": "failed", "exit_code": process.returncode}
+        return {"state": "started"}
+
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() <= deadline:
+        if process.poll() is not None:
+            return {"state": "failed", "exit_code": process.returncode}
+
+        probe = service_healthcheck_state(service)
+        if probe.get("state") == "ok":
+            return {"state": "ok"} | probe
+        time.sleep(0.25)
+
+    return {"state": "timeout"} | service_healthcheck_state(service)
+
+
+def tail_lines(path: Path, line_count: int) -> list[str]:
+    if not path.is_file():
+        return []
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if line_count <= 0:
+        return lines
+    return lines[-line_count:]
+
+
+def stop_process(pid: int, wait_seconds: float) -> tuple[str, int | None]:
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        return "not-running", None
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except OSError:
+        return "not-running", None
+
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() <= deadline:
+        if not process_is_running(pid):
+            return "stopped", signal.SIGTERM
+        time.sleep(0.1)
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        return "stopped", signal.SIGTERM
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() <= deadline:
+        if not process_is_running(pid):
+            return "killed", signal.SIGKILL
+        time.sleep(0.1)
+
+    return "stuck", None
+
+
+def select_services(model: dict[str, Any], service_ids: list[str] | None) -> list[dict[str, Any]]:
+    requested_ids = [service_id.strip() for service_id in service_ids or [] if service_id.strip()]
+    available = {
+        str(service["id"]): service
+        for service in model["services"]
+        if str(service.get("id", "")).strip()
+    }
+    unknown = sorted(service_id for service_id in requested_ids if service_id not in available)
+    if unknown:
+        raise RuntimeError(
+            "Unknown service id(s): "
+            + ", ".join(unknown)
+            + ". Available services: "
+            + (", ".join(sorted(available)) or "(none)")
+        )
+    if not requested_ids:
+        return list(model["services"])
+
+    requested = set(requested_ids)
+    return [service for service in model["services"] if service["id"] in requested]
+
+
+def start_services(
+    model: dict[str, Any],
+    services: list[dict[str, Any]],
+    *,
+    dry_run: bool,
+    wait_seconds: float,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for service in services:
+        manageable, reason = service_supports_lifecycle(service)
+        paths = service_paths(model, service)
+        result = {
+            "id": service["id"],
+            "kind": service.get("kind", "service"),
+            "log_file": str(paths["log_file"]),
+            "pid_file": str(paths["pid_file"]),
+        }
+
+        if not manageable:
+            results.append(result | {"result": "skipped", "reason": reason})
+            continue
+
+        pid = live_service_pid(paths["pid_file"])
+        if pid is not None:
+            results.append(result | {"result": "already-running", "pid": pid})
+            continue
+
+        command, env = translated_service_command(model, service)
+        cwd = resolve_service_cwd(model, service)
+        result["command"] = command
+        result["cwd"] = str(cwd)
+
+        ensure_directory(paths["log_dir"], dry_run)
+        if dry_run:
+            results.append(result | {"result": "dry-run"})
+            continue
+
+        with paths["log_file"].open("a", encoding="utf-8") as log_handle:
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                shell=True,
+                start_new_session=True,
+                text=True,
+            )
+
+        paths["pid_file"].write_text(f"{process.pid}\n", encoding="utf-8")
+        health_state = wait_for_service_health(service, process, wait_seconds)
+        if health_state.get("state") in {"failed", "timeout"}:
+            stop_process(process.pid, DEFAULT_SERVICE_STOP_WAIT_SECONDS)
+            remove_pid_file(paths["pid_file"])
+            tail = tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)
+            detail = result | {"result": "failed", "tail": tail}
+            if "exit_code" in health_state:
+                detail["exit_code"] = health_state["exit_code"]
+            if "url" in health_state:
+                detail["url"] = health_state["url"]
+            if "target" in health_state:
+                detail["target"] = health_state["target"]
+            raise RuntimeError(
+                f"Service {service['id']} failed to become healthy."
+                + (f" Exit code: {health_state['exit_code']}." if "exit_code" in health_state else "")
+                + (f" Health target: {health_state['url']}." if "url" in health_state else "")
+                + (f" Health target: {health_state['target']}." if "target" in health_state else "")
+                + (f" Recent logs: {' | '.join(tail)}" if tail else "")
+            )
+
+        results.append(result | {"result": "started", "pid": process.pid})
+    return results
+
+
+def stop_services(
+    model: dict[str, Any],
+    services: list[dict[str, Any]],
+    *,
+    dry_run: bool,
+    wait_seconds: float,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for service in services:
+        manageable, reason = service_supports_lifecycle(service)
+        paths = service_paths(model, service)
+        result = {
+            "id": service["id"],
+            "kind": service.get("kind", "service"),
+            "log_file": str(paths["log_file"]),
+            "pid_file": str(paths["pid_file"]),
+        }
+
+        if not manageable:
+            results.append(result | {"result": "skipped", "reason": reason})
+            continue
+
+        pid = live_service_pid(paths["pid_file"])
+        if pid is None:
+            external_state = service_healthcheck_state(service)
+            if external_state.get("state") == "ok":
+                results.append(result | {"result": "external"})
+            else:
+                results.append(result | {"result": "not-running"})
+            continue
+
+        if dry_run:
+            results.append(result | {"result": "dry-run", "pid": pid})
+            continue
+
+        stop_result, signal_used = stop_process(pid, wait_seconds)
+        remove_pid_file(paths["pid_file"])
+        results.append(
+            result
+            | {
+                "result": stop_result,
+                "pid": pid,
+                "signal": signal_used,
+            }
+        )
+    return results
+
+
+def collect_service_logs(
+    model: dict[str, Any],
+    services: list[dict[str, Any]],
+    *,
+    line_count: int,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for service in services:
+        paths = service_paths(model, service)
+        log_file = paths["log_file"]
+        results.append(
+            {
+                "id": service["id"],
+                "kind": service.get("kind", "service"),
+                "log_file": str(log_file),
+                "present": log_file.is_file(),
+                "lines": tail_lines(log_file, line_count),
+            }
+        )
+    return results
+
+
 def git_repo_state(path: Path) -> dict[str, Any]:
     top_level = run_command(["git", "rev-parse", "--show-toplevel"], cwd=path)
     if top_level.returncode != 0:
@@ -1355,26 +1909,34 @@ def log_directory_state(path: Path) -> dict[str, Any]:
     return {"present": True, "files": file_count, "bytes": total_bytes}
 
 
-def probe_service(service: dict[str, Any]) -> dict[str, Any]:
-    healthcheck = service.get("healthcheck") or {}
-    healthcheck_type = healthcheck.get("type")
-    if not healthcheck_type:
-        return {"state": "declared"}
+def probe_service(model: dict[str, Any], service: dict[str, Any]) -> dict[str, Any]:
+    manager_state = service_manager_state(model, service)
+    health_state = service_healthcheck_state(service)
+    pid = manager_state.get("pid")
 
-    if healthcheck_type == "path_exists":
-        path = Path(str(healthcheck["host_path"]))
-        return {"state": "ok" if path.exists() else "down", "target": str(path)}
+    if pid is not None:
+        if health_state.get("state") == "ok":
+            state = "running"
+        elif health_state.get("state") == "declared":
+            state = "running"
+        else:
+            state = "starting"
+    else:
+        state = health_state.get("state", "declared")
 
-    if healthcheck_type == "http":
-        url = str(healthcheck["url"])
-        timeout = float(healthcheck.get("timeout_seconds", 0.5))
-        try:
-            with urllib.request.urlopen(url, timeout=timeout) as response:
-                return {"state": "ok", "status_code": response.getcode(), "url": url}
-        except (urllib.error.URLError, TimeoutError, ValueError):
-            return {"state": "down", "url": url}
-
-    return {"state": "unknown"}
+    return {
+        "state": state,
+        "managed": manager_state["managed"],
+        "manager_reason": manager_state["manager_reason"],
+        "pid": pid,
+        "pid_file": manager_state["pid_file"],
+        "log_file": manager_state["log_file"],
+        "log_present": manager_state["log_present"],
+    } | {
+        key: value
+        for key, value in health_state.items()
+        if key != "state"
+    }
 
 
 def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
@@ -1434,7 +1996,7 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
             "kind": service.get("kind", "service"),
             "profiles": service.get("profiles") or [],
         }
-        item.update(probe_service(service))
+        item.update(probe_service(model, service))
         service_statuses.append(item)
 
     log_statuses: list[dict[str, Any]] = []
@@ -1585,7 +2147,12 @@ def print_status_text(status_payload: dict[str, Any]) -> None:
 
     print("services:")
     for service in status_payload["services"]:
-        print(f"  - {service['id']}: {service.get('state', 'declared')}")
+        summary = service.get("state", "declared")
+        if service.get("pid") is not None:
+            summary = f"{summary} (pid {service['pid']})"
+        elif service.get("managed") is False and service.get("manager_reason"):
+            summary = f"{summary} ({service['manager_reason']})"
+        print(f"  - {service['id']}: {summary}")
 
     print("logs:")
     for log_item in status_payload["logs"]:
@@ -1601,6 +2168,35 @@ def print_status_text(status_payload: dict[str, Any]) -> None:
     for check in status_payload["checks"]:
         state = "ok" if check.get("ok") else "missing"
         print(f"  - {check['id']}: {state}")
+
+
+def print_service_actions_text(payload: dict[str, Any]) -> None:
+    sync_actions = payload.get("sync_actions") or []
+    if sync_actions:
+        print("sync:")
+        for action in sync_actions:
+            print(f"  - {action}")
+
+    print("services:")
+    for item in payload.get("services") or []:
+        summary = item.get("result", "unknown")
+        if item.get("pid") is not None:
+            summary = f"{summary} (pid {item['pid']})"
+        if item.get("reason"):
+            summary = f"{summary} ({item['reason']})"
+        print(f"  - {item['id']}: {summary}")
+
+
+def print_service_logs_text(payload: dict[str, Any]) -> None:
+    for item in payload.get("services") or []:
+        print(f"[{item['id']}] {item['log_file']}")
+        if not item.get("present"):
+            print("(missing)")
+        elif item.get("lines"):
+            for line in item["lines"]:
+                print(line)
+        else:
+            print("(empty)")
 
 
 def emit_json(payload: Any) -> None:
@@ -1630,6 +2226,14 @@ def main() -> int:
             action="append",
             default=[],
             help="Activate a runtime client overlay. Can be repeated.",
+        )
+
+    def add_service_arg(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument(
+            "--service",
+            action="append",
+            default=[],
+            help="Limit the command to one or more declared service ids. Can be repeated.",
         )
 
     render_parser = subparsers.add_parser("render", help="Print the resolved runtime graph.")
@@ -1662,42 +2266,224 @@ def main() -> int:
     add_profile_arg(status_parser)
     add_client_arg(status_parser)
 
+    up_parser = subparsers.add_parser(
+        "up",
+        help="Sync runtime state and start manageable services for the active scope.",
+    )
+    up_parser.add_argument("--dry-run", action="store_true")
+    up_parser.add_argument("--wait-seconds", type=float, default=DEFAULT_SERVICE_START_WAIT_SECONDS)
+    up_parser.add_argument("--format", choices=("text", "json"), default="text")
+    add_profile_arg(up_parser)
+    add_client_arg(up_parser)
+    add_service_arg(up_parser)
+
+    down_parser = subparsers.add_parser(
+        "down",
+        help="Stop manageable services for the active scope.",
+    )
+    down_parser.add_argument("--dry-run", action="store_true")
+    down_parser.add_argument("--wait-seconds", type=float, default=DEFAULT_SERVICE_STOP_WAIT_SECONDS)
+    down_parser.add_argument("--format", choices=("text", "json"), default="text")
+    add_profile_arg(down_parser)
+    add_client_arg(down_parser)
+    add_service_arg(down_parser)
+
+    restart_parser = subparsers.add_parser(
+        "restart",
+        help="Restart manageable services for the active scope.",
+    )
+    restart_parser.add_argument("--dry-run", action="store_true")
+    restart_parser.add_argument("--wait-seconds", type=float, default=DEFAULT_SERVICE_START_WAIT_SECONDS)
+    restart_parser.add_argument("--format", choices=("text", "json"), default="text")
+    add_profile_arg(restart_parser)
+    add_client_arg(restart_parser)
+    add_service_arg(restart_parser)
+
+    logs_parser = subparsers.add_parser(
+        "logs",
+        help="Show recent logs for declared services in the active scope.",
+    )
+    logs_parser.add_argument("--lines", type=int, default=DEFAULT_LOG_TAIL_LINES)
+    logs_parser.add_argument("--format", choices=("text", "json"), default="text")
+    add_profile_arg(logs_parser)
+    add_client_arg(logs_parser)
+    add_service_arg(logs_parser)
+
+    client_init_parser = subparsers.add_parser(
+        "client-init",
+        help="Scaffold a new workspace client overlay and companion skill directories.",
+    )
+    client_init_parser.add_argument("client_id", help="Lowercase client slug, for example `acme-studio`.")
+    client_init_parser.add_argument("--label", default=None, help="Human-friendly label for the client.")
+    client_init_parser.add_argument(
+        "--root-path",
+        default=None,
+        help="Runtime path for the client root. Defaults to ${SKILLBOX_MONOSERVER_ROOT}/<client-id>.",
+    )
+    client_init_parser.add_argument(
+        "--default-cwd",
+        default=None,
+        help="Runtime default cwd for the client. Defaults to the client root path.",
+    )
+    client_init_parser.add_argument("--force", action="store_true", help="Overwrite existing scaffold files.")
+    client_init_parser.add_argument("--dry-run", action="store_true")
+    client_init_parser.add_argument("--format", choices=("text", "json"), default="text")
+
     args = parser.parse_args()
     root_dir = resolve_root_dir(args.root_dir)
+
+    if args.command == "client-init":
+        try:
+            actions = scaffold_client_overlay(
+                root_dir=root_dir,
+                client_id=args.client_id,
+                label=args.label,
+                default_cwd=args.default_cwd,
+                root_path=args.root_path,
+                dry_run=args.dry_run,
+                force=args.force,
+            )
+        except RuntimeError as exc:
+            if args.format == "json":
+                emit_json({"error": str(exc)})
+            else:
+                print(str(exc), file=sys.stderr)
+            return 1
+
+        payload = {
+            "client_id": validate_client_id(args.client_id),
+            "dry_run": args.dry_run,
+            "force": args.force,
+            "actions": actions,
+        }
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            print("\n".join(actions))
+        return 0
+
     model = build_runtime_model(root_dir)
     active_profiles = normalize_active_profiles(getattr(args, "profile", []))
     active_clients = normalize_active_clients(model, getattr(args, "client", []))
     model = filter_model(model, active_profiles, active_clients)
 
-    if args.command == "render":
+    try:
+        if args.command == "render":
+            if args.format == "json":
+                emit_json(model)
+            else:
+                print_render_text(model)
+            return 0
+
+        if args.command == "sync":
+            actions = sync_runtime(model, dry_run=args.dry_run)
+            if args.format == "json":
+                emit_json({"actions": actions, "dry_run": args.dry_run})
+            else:
+                print("\n".join(actions))
+            return 0
+
+        if args.command == "doctor":
+            results = doctor_results(model, root_dir)
+            if args.format == "json":
+                emit_json([asdict(result) for result in results])
+            else:
+                print_doctor_text(results)
+            return 1 if any(result.status == "fail" for result in results) else 0
+
+        if args.command == "status":
+            status_payload = runtime_status(model)
+            if args.format == "json":
+                emit_json(status_payload)
+            else:
+                print_status_text(status_payload)
+            return 0
+
+        services = select_services(model, getattr(args, "service", []))
+
+        if args.command == "up":
+            sync_actions = sync_runtime(model, dry_run=args.dry_run)
+            service_results = start_services(
+                model,
+                services,
+                dry_run=args.dry_run,
+                wait_seconds=max(0.0, float(args.wait_seconds)),
+            )
+            payload = {
+                "dry_run": args.dry_run,
+                "sync_actions": sync_actions,
+                "services": service_results,
+            }
+            if args.format == "json":
+                emit_json(payload)
+            else:
+                print_service_actions_text(payload)
+            return 0
+
+        if args.command == "down":
+            service_results = stop_services(
+                model,
+                services,
+                dry_run=args.dry_run,
+                wait_seconds=max(0.0, float(args.wait_seconds)),
+            )
+            payload = {
+                "dry_run": args.dry_run,
+                "services": service_results,
+            }
+            if args.format == "json":
+                emit_json(payload)
+            else:
+                print_service_actions_text(payload)
+            return 0
+
+        if args.command == "restart":
+            stop_results = stop_services(
+                model,
+                services,
+                dry_run=args.dry_run,
+                wait_seconds=max(0.0, float(args.wait_seconds)),
+            )
+            sync_actions = sync_runtime(model, dry_run=args.dry_run)
+            start_results = start_services(
+                model,
+                services,
+                dry_run=args.dry_run,
+                wait_seconds=max(0.0, float(args.wait_seconds)),
+            )
+            payload = {
+                "dry_run": args.dry_run,
+                "stop_services": stop_results,
+                "sync_actions": sync_actions,
+                "start_services": start_results,
+            }
+            if args.format == "json":
+                emit_json(payload)
+            else:
+                print("stop:")
+                print_service_actions_text({"services": stop_results})
+                print()
+                print_service_actions_text({"sync_actions": sync_actions, "services": start_results})
+            return 0
+
+        logs_payload = {
+            "services": collect_service_logs(
+                model,
+                services,
+                line_count=max(0, int(args.lines)),
+            )
+        }
         if args.format == "json":
-            emit_json(model)
+            emit_json(logs_payload)
         else:
-            print_render_text(model)
+            print_service_logs_text(logs_payload)
         return 0
-
-    if args.command == "sync":
-        actions = sync_runtime(model, dry_run=args.dry_run)
+    except RuntimeError as exc:
         if args.format == "json":
-            emit_json({"actions": actions, "dry_run": args.dry_run})
+            emit_json({"error": str(exc)})
         else:
-            print("\n".join(actions))
-        return 0
-
-    if args.command == "doctor":
-        results = doctor_results(model, root_dir)
-        if args.format == "json":
-            emit_json([asdict(result) for result in results])
-        else:
-            print_doctor_text(results)
-        return 1 if any(result.status == "fail" for result in results) else 0
-
-    status_payload = runtime_status(model)
-    if args.format == "json":
-        emit_json(status_payload)
-    else:
-        print_status_text(status_payload)
-    return 0
+            print(str(exc), file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

@@ -44,8 +44,10 @@ EXPECTED_FILES = [
     "workspace/runtime.yaml",
     "workspace/default-skills.manifest",
     "workspace/default-skills.sources.yaml",
+    "workspace/clients/personal/overlay.yaml",
     "workspace/clients/personal/skills.manifest",
     "workspace/clients/personal/skills.sources.yaml",
+    "workspace/clients/vibe-coding-client/overlay.yaml",
     "workspace/clients/vibe-coding-client/skills.manifest",
     "workspace/clients/vibe-coding-client/skills.sources.yaml",
 ]

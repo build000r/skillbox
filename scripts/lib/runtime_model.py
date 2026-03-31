@@ -42,6 +42,13 @@ def runtime_manifest_path(root_dir: Path) -> Path:
     return root_dir / "workspace" / "runtime.yaml"
 
 
+def client_overlay_paths(root_dir: Path) -> list[Path]:
+    overlays_root = root_dir / "workspace" / "clients"
+    if not overlays_root.is_dir():
+        return []
+    return sorted(path for path in overlays_root.glob("*/overlay.yaml") if path.is_file())
+
+
 def load_yaml(path: Path) -> dict[str, Any]:
     if yaml is None:
         raise RuntimeError(
@@ -213,31 +220,47 @@ def _normalize_client_repo_roots(raw_items: Any, client_id: str, section: str) -
     return repo_roots
 
 
-def _normalize_runtime_sections(resolved: dict[str, Any]) -> dict[str, Any]:
-    if "core" not in resolved and "clients" not in resolved:
-        return {
-            "selection": {},
-            "clients": [],
-            "repos": _normalized_items(resolved.get("repos"), "repos"),
-            "artifacts": _normalized_items(resolved.get("artifacts"), "artifacts"),
-            "skills": _normalized_items(resolved.get("skills"), "skills"),
-            "services": _normalized_items(resolved.get("services"), "services"),
-            "logs": _normalized_items(resolved.get("logs"), "logs"),
-            "checks": _normalized_items(resolved.get("checks"), "checks"),
-        }
+def load_client_overlays(root_dir: Path, env_values: dict[str, str]) -> list[dict[str, Any]]:
+    overlays: list[dict[str, Any]] = []
+    for path in client_overlay_paths(root_dir):
+        overlay_doc = load_yaml(path)
+        raw_client = overlay_doc.get("client")
+        if raw_client is None:
+            raise RuntimeError(f"Expected top-level `client` mapping in {path}")
+        if not isinstance(raw_client, dict):
+            raise RuntimeError(f"Expected `client` to be a mapping in {path}")
+        resolved_client = resolve_placeholders(raw_client, env_values)
+        resolved_client["_overlay_path"] = str(path)
+        overlays.append(resolved_client)
+    return overlays
 
-    core = _normalized_mapping(resolved.get("core"), "core")
-    selection = _normalized_mapping(resolved.get("selection"), "selection")
-    repos = _normalized_items(core.get("repos"), "core.repos")
-    artifacts = _normalized_items(core.get("artifacts"), "core.artifacts")
-    skills = _normalized_items(core.get("skills"), "core.skills")
-    services = _normalized_items(core.get("services"), "core.services")
-    logs = _normalized_items(core.get("logs"), "core.logs")
-    checks = _normalized_items(core.get("checks"), "core.checks")
+
+def _normalize_runtime_sections(
+    resolved: dict[str, Any],
+    overlay_clients: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    scoped_runtime = "core" in resolved or "clients" in resolved
+    core = _normalized_mapping(resolved.get("core"), "core") if scoped_runtime else resolved
+    selection = _normalized_mapping(resolved.get("selection"), "selection") if scoped_runtime else {}
+    repos = _normalized_items(core.get("repos"), "core.repos" if scoped_runtime else "repos")
+    artifacts = _normalized_items(core.get("artifacts"), "core.artifacts" if scoped_runtime else "artifacts")
+    skills = _normalized_items(core.get("skills"), "core.skills" if scoped_runtime else "skills")
+    services = _normalized_items(core.get("services"), "core.services" if scoped_runtime else "services")
+    logs = _normalized_items(core.get("logs"), "core.logs" if scoped_runtime else "logs")
+    checks = _normalized_items(core.get("checks"), "core.checks" if scoped_runtime else "checks")
+    raw_clients = _normalized_items(resolved.get("clients"), "clients") if scoped_runtime else []
+    raw_clients.extend(_normalized_items(overlay_clients, "client overlays"))
     clients_meta: list[dict[str, Any]] = []
+    seen_client_ids: set[str] = set()
 
-    for client in _normalized_items(resolved.get("clients"), "clients"):
+    for client in raw_clients:
         client_id = str(client.get("id", "")).strip()
+        if not client_id:
+            source = str(client.get("_overlay_path") or "runtime manifest")
+            raise RuntimeError(f"Client definition in {source} is missing id")
+        if client_id in seen_client_ids:
+            raise RuntimeError(f"Duplicate runtime client id: {client_id}")
+        seen_client_ids.add(client_id)
         label = str(client.get("label") or client_id)
         client_default_cwd = client.get("default_cwd")
         clients_meta.append(
@@ -292,7 +315,8 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
     runtime_doc = load_yaml(runtime_manifest_path(root_dir))
     env_values = load_runtime_env(root_dir)
     resolved = resolve_placeholders(runtime_doc, env_values)
-    normalized = _normalize_runtime_sections(resolved)
+    overlay_clients = load_client_overlays(root_dir, env_values)
+    normalized = _normalize_runtime_sections(resolved, overlay_clients=overlay_clients)
 
     model = {
         "root_dir": str(root_dir),
