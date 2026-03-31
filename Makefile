@@ -7,7 +7,7 @@ LINES_ARGS := $(if $(strip $(LINES)),--lines $(LINES),)
 BLUEPRINT_ARGS := $(if $(strip $(BLUEPRINT)),--blueprint $(BLUEPRINT),)
 SET_ARGS := $(foreach s,$(SET),--set $(s))
 
-.PHONY: help bootstrap-env render doctor runtime-render runtime-sync runtime-status runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard context dev-sanity build up up-surfaces down shell logs swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status
+.PHONY: help bootstrap-env render doctor runtime-render runtime-sync runtime-status runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard context dev-sanity build up up-surfaces down shell logs swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles
 
 help:
 	@printf "  make bootstrap-env  Copy .env.example to .env if missing\n"
@@ -37,6 +37,12 @@ help:
 	@printf "  make swimmers-status         Report swimmers workspace-local process and probe state\n"
 	@printf "  make swimmers-logs           Tail swimmers server logs inside the workspace container\n"
 	@printf "  make swimmers-runtime-status Summarize the runtime-manager swimmers overlay state\n"
+	@printf "  make box-up         Create a DO+Tailscale box (BOX=id PROFILE=dev-small BLUEPRINT=name SET='K=V')\n"
+	@printf "  make box-down       Drain and destroy a box (BOX=id)\n"
+	@printf "  make box-status     Check health of a box (BOX=id, omit for all)\n"
+	@printf "  make box-list       List all active boxes\n"
+	@printf "  make box-ssh        SSH into a box (BOX=id)\n"
+	@printf "  make box-profiles   List available box profiles\n"
 
 bootstrap-env:
 	@test -f .env || cp .env.example .env
@@ -118,3 +124,23 @@ swimmers-logs: bootstrap-env
 
 swimmers-runtime-status:
 	@python3 .env-manager/manage.py status --profile swimmers $(CLIENT_ARGS)
+
+BOX_ARGS := $(if $(strip $(BOX)),$(BOX),)
+
+box-up:
+	@python3 scripts/box.py up $(BOX_ARGS) --profile $(or $(PROFILE),dev-small) $(BLUEPRINT_ARGS) $(SET_ARGS)
+
+box-down:
+	@python3 scripts/box.py down $(BOX_ARGS)
+
+box-status:
+	@python3 scripts/box.py status $(BOX_ARGS)
+
+box-list:
+	@python3 scripts/box.py list
+
+box-ssh:
+	@python3 scripts/box.py ssh $(BOX_ARGS)
+
+box-profiles:
+	@python3 scripts/box.py profiles

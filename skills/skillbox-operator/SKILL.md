@@ -192,11 +192,42 @@ python3 .env-manager/manage.py restart --client <id> --service <id>
 python3 .env-manager/manage.py down --client <id> [--service <id>]
 ```
 
+## Workflow: Box Lifecycle (DigitalOcean + Tailscale)
+
+Create and destroy full infrastructure from the operator's machine using `scripts/box.py`.
+
+```bash
+# List available box profiles
+python3 scripts/box.py profiles --format json
+
+# Preview what would happen
+python3 scripts/box.py up <client-id> --profile dev-small --dry-run --format json
+
+# Create: droplet → bootstrap → tailscale → deploy → onboard → verify
+python3 scripts/box.py up <client-id> --profile dev-small [--blueprint <name>] [--set KEY=VALUE] --format json
+
+# Check health
+python3 scripts/box.py status <client-id> --format json
+
+# SSH in
+python3 scripts/box.py ssh <client-id>
+
+# Destroy: drain → remove from tailnet → delete droplet
+python3 scripts/box.py down <client-id> --format json
+
+# List all active boxes
+python3 scripts/box.py list --format json
+```
+
+Required env vars in `.env` or `.env.box`: `SKILLBOX_DO_TOKEN`, `SKILLBOX_DO_SSH_KEY_ID`, `SKILLBOX_TS_AUTHKEY`.
+
+Box profiles live in `workspace/box-profiles/*.yaml` and declare region, size, image, and ssh user.
+
 ## Safety
 
-1. **Always `--dry-run` first** for sync, up, down, restart, bootstrap, and client-init.
+1. **Always `--dry-run` first** for sync, up, down, restart, bootstrap, client-init, onboard, and box up/down.
 2. **Always scope** with `--client` and `--service` when targeting a specific project or service. Never run unscoped `down` or `restart` unless the user explicitly asks to stop everything.
-3. **Confirm with the user** before `down` (stops running processes), `restart`, or any edit to runtime YAML or overlay files.
+3. **Confirm with the user** before `down` (stops running processes), `restart`, `box down` (destroys infrastructure), or any edit to runtime YAML or overlay files.
 4. **Never edit `.env`** without explicit user approval -- it may contain secrets or host-specific values.
 5. **Use `--format json`** for inspection commands when you need to parse output programmatically. Use text format when showing results directly to the user.
 6. **Read logs before escalating errors** -- the answer is usually in the service output.

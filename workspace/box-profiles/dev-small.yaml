@@ -1,0 +1,8 @@
+provider: digitalocean
+region: nyc3
+size: s-2vcpu-4gb
+image: ubuntu-24-04-x64
+ssh_user: skillbox
+tailscale_hostname_prefix: skillbox
+skillbox_repo: https://github.com/build000r/skillbox.git
+skillbox_branch: main
