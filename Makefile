@@ -4,8 +4,10 @@ CLIENT_ARGS := $(if $(strip $(CLIENT)),--client $(CLIENT),)
 SERVICE_ARGS := $(if $(strip $(SERVICE)),--service $(SERVICE),)
 TASK_ARGS := $(if $(strip $(TASK)),--task $(TASK),)
 LINES_ARGS := $(if $(strip $(LINES)),--lines $(LINES),)
+BLUEPRINT_ARGS := $(if $(strip $(BLUEPRINT)),--blueprint $(BLUEPRINT),)
+SET_ARGS := $(foreach s,$(SET),--set $(s))
 
-.PHONY: help bootstrap-env render doctor runtime-render runtime-sync runtime-status runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs dev-sanity build up up-surfaces down shell logs swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status
+.PHONY: help bootstrap-env render doctor runtime-render runtime-sync runtime-status runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard context dev-sanity build up up-surfaces down shell logs swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status
 
 help:
 	@printf "  make bootstrap-env  Copy .env.example to .env if missing\n"
@@ -19,6 +21,8 @@ help:
 	@printf "  make runtime-down   Stop manageable services (optional CLIENT=name PROFILE=name SERVICE=id)\n"
 	@printf "  make runtime-restart Restart manageable services (optional CLIENT=name PROFILE=name SERVICE=id)\n"
 	@printf "  make runtime-logs   Show recent service logs (optional CLIENT=name PROFILE=name SERVICE=id LINES=n)\n"
+	@printf "  make onboard        Scaffold, sync, bootstrap, start, context, verify in one step (CLIENT=id BLUEPRINT=name SET='K=V')\n"
+	@printf "  make context        Generate CLAUDE.md and AGENTS.md from the runtime graph (optional CLIENT=name PROFILE=name)\n"
 	@printf "  make dev-sanity     Validate runtime graph, paths, and skill integrity (optional CLIENT=name PROFILE=name)\n"
 	@printf "  make build          Build the workspace image\n"
 	@printf "  make up             Start the workspace container\n"
@@ -66,6 +70,12 @@ runtime-restart:
 
 runtime-logs:
 	@python3 .env-manager/manage.py logs $(CLIENT_ARGS) $(PROFILE_ARGS) $(SERVICE_ARGS) $(LINES_ARGS)
+
+onboard:
+	@python3 .env-manager/manage.py onboard $(CLIENT) $(BLUEPRINT_ARGS) $(SET_ARGS)
+
+context:
+	@python3 .env-manager/manage.py context $(CLIENT_ARGS) $(PROFILE_ARGS)
 
 dev-sanity:
 	@python3 .env-manager/manage.py doctor $(CLIENT_ARGS) $(PROFILE_ARGS)

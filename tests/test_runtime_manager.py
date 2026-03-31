@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -68,7 +69,10 @@ class RuntimeManagerTests(unittest.TestCase):
 
             before = self._run(repo, "doctor", "--format", "json")
             self.assertEqual(before.returncode, 0, before.stderr)
-            before_results = json.loads(before.stdout)
+            before_payload = json.loads(before.stdout)
+            self.assertIn("checks", before_payload)
+            self.assertIn("next_actions", before_payload)
+            before_results = before_payload["checks"]
             before_warning_codes = {item["code"] for item in before_results if item["status"] == "warn"}
             self.assertIn("syncable-artifact-paths", before_warning_codes)
             self.assertIn("runtime-log-paths", before_warning_codes)
@@ -80,7 +84,8 @@ class RuntimeManagerTests(unittest.TestCase):
 
             after = self._run(repo, "doctor", "--format", "json")
             self.assertEqual(after.returncode, 0, after.stderr)
-            after_results = json.loads(after.stdout)
+            after_payload = json.loads(after.stdout)
+            after_results = after_payload["checks"]
             after_warning_codes = {item["code"] for item in after_results if item["status"] == "warn"}
             after_failure_codes = {item["code"] for item in after_results if item["status"] == "fail"}
             self.assertNotIn("syncable-artifact-paths", after_warning_codes)
@@ -330,9 +335,10 @@ class RuntimeManagerTests(unittest.TestCase):
 
             result = self._run(repo, "doctor", "--client", "vibe-coding-client", "--format", "json")
 
-            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.returncode, 2)
             payload = json.loads(result.stdout)
-            failure_codes = {item["code"] for item in payload if item["status"] == "fail"}
+            checks = payload["checks"]
+            failure_codes = {item["code"] for item in checks if item["status"] == "fail"}
             self.assertIn("required-runtime-paths", failure_codes)
             self.assertIn("required-runtime-checks", failure_codes)
 
@@ -343,9 +349,10 @@ class RuntimeManagerTests(unittest.TestCase):
 
             result = self._run(repo, "doctor", "--format", "json")
 
-            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.returncode, 2)
             payload = json.loads(result.stdout)
-            failure_codes = {item["code"] for item in payload if item["status"] == "fail"}
+            checks = payload["checks"]
+            failure_codes = {item["code"] for item in checks if item["status"] == "fail"}
             self.assertIn("skill-bundle-state", failure_codes)
 
     def test_doctor_fails_when_installed_skill_drifts_from_lock(self) -> None:
@@ -363,12 +370,13 @@ class RuntimeManagerTests(unittest.TestCase):
 
             result = self._run(repo, "doctor", "--format", "json")
 
-            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.returncode, 2)
             payload = json.loads(result.stdout)
+            checks = payload["checks"]
             install_failures = [
-                item for item in payload if item["status"] == "fail" and item["code"] == "skill-install-state"
+                item for item in checks if item["status"] == "fail" and item["code"] == "skill-install-state"
             ]
-            self.assertEqual(len(install_failures), 1, payload)
+            self.assertEqual(len(install_failures), 1, checks)
             self.assertIn("claude", " ".join(install_failures[0]["details"]["issues"]))
 
     def test_doctor_fails_when_service_dependency_is_unknown(self) -> None:
@@ -390,9 +398,10 @@ class RuntimeManagerTests(unittest.TestCase):
 
             result = self._run(repo, "doctor", "--profile", "surfaces", "--format", "json")
 
-            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.returncode, 2)
             payload = json.loads(result.stdout)
-            issues = payload[0]["details"]["issues"]
+            checks = payload["checks"]
+            issues = checks[0]["details"]["issues"]
             self.assertTrue(
                 any("references unknown dependency 'missing-service'" in issue for issue in issues),
                 issues,
@@ -425,9 +434,10 @@ class RuntimeManagerTests(unittest.TestCase):
 
             result = self._run(repo, "doctor", "--profile", "surfaces", "--format", "json")
 
-            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.returncode, 2)
             payload = json.loads(result.stdout)
-            issues = payload[0]["details"]["issues"]
+            checks = payload["checks"]
+            issues = checks[0]["details"]["issues"]
             self.assertTrue(
                 any("service dependency cycle detected: api-stub -> web-stub -> api-stub" in issue for issue in issues),
                 issues,
@@ -475,7 +485,9 @@ class RuntimeManagerTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 1)
             payload = json.loads(result.stdout)
-            self.assertIn("Invalid client id", payload["error"])
+            self.assertIn("Invalid client id", payload["error"]["message"])
+            self.assertEqual(payload["error"]["type"], "invalid_client_id")
+            self.assertIn("recoverable", payload["error"])
 
     def test_client_init_refuses_existing_overlay_without_force(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -486,7 +498,7 @@ class RuntimeManagerTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 1)
             payload = json.loads(result.stdout)
-            self.assertIn("workspace/clients/personal/overlay.yaml", payload["error"])
+            self.assertIn("workspace/clients/personal/overlay.yaml", payload["error"]["message"])
 
     def test_client_init_lists_available_blueprints(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -657,7 +669,7 @@ class RuntimeManagerTests(unittest.TestCase):
 
             before = self._run(repo, "doctor", "--client", "acme-studio", "--format", "json")
             self.assertEqual(before.returncode, 0, before.stderr)
-            before_payload = json.loads(before.stdout)
+            before_payload = json.loads(before.stdout)["checks"]
             warning_codes = {item["code"] for item in before_payload if item["status"] == "warn"}
             self.assertIn("syncable-env-files", warning_codes)
 
@@ -683,7 +695,7 @@ class RuntimeManagerTests(unittest.TestCase):
 
             after = self._run(repo, "doctor", "--client", "acme-studio", "--format", "json")
             self.assertEqual(after.returncode, 0, after.stderr)
-            after_payload = json.loads(after.stdout)
+            after_payload = json.loads(after.stdout)["checks"]
             after_warning_codes = {item["code"] for item in after_payload if item["status"] == "warn"}
             after_failure_codes = {item["code"] for item in after_payload if item["status"] == "fail"}
             self.assertNotIn("syncable-env-files", after_warning_codes)
@@ -714,10 +726,10 @@ class RuntimeManagerTests(unittest.TestCase):
             (repo / "monoserver-host" / "acme-studio").mkdir(parents=True, exist_ok=True)
 
             doctor = self._run(repo, "doctor", "--client", "acme-studio", "--format", "json")
-            self.assertEqual(doctor.returncode, 1)
-            payload = json.loads(doctor.stdout)
-            failures = [item for item in payload if item["status"] == "fail" and item["code"] == "required-runtime-env-files"]
-            self.assertEqual(len(failures), 1, payload)
+            self.assertEqual(doctor.returncode, 2)
+            checks = json.loads(doctor.stdout)["checks"]
+            failures = [item for item in checks if item["status"] == "fail" and item["code"] == "required-runtime-env-files"]
+            self.assertEqual(len(failures), 1, checks)
             self.assertIn("workspace/secrets/clients/acme-studio/app.env", " ".join(failures[0]["details"]["missing_sources"]))
 
     def test_up_refuses_to_start_service_when_required_env_is_unresolved(self) -> None:
@@ -747,7 +759,7 @@ class RuntimeManagerTests(unittest.TestCase):
 
             self.assertEqual(up.returncode, 1)
             payload = json.loads(up.stdout)
-            self.assertIn("app-env", payload["error"])
+            self.assertIn("app-env", payload["error"]["message"])
             pid_file = repo / "logs" / "clients" / "acme-studio" / "services" / "app-dev.pid"
             self.assertFalse(pid_file.exists())
 
@@ -802,7 +814,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(before_doctor.returncode, 0, before_doctor.stderr)
             before_warning_codes = {
                 item["code"]
-                for item in json.loads(before_doctor.stdout)
+                for item in json.loads(before_doctor.stdout)["checks"]
                 if item["status"] == "warn"
             }
             self.assertIn("bootstrap-task-state", before_warning_codes)
@@ -837,7 +849,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(after_doctor.returncode, 0, after_doctor.stderr)
             after_warning_codes = {
                 item["code"]
-                for item in json.loads(after_doctor.stdout)
+                for item in json.loads(after_doctor.stdout)["checks"]
                 if item["status"] == "warn"
             }
             self.assertNotIn("bootstrap-task-state", after_warning_codes)
@@ -1002,7 +1014,7 @@ class RuntimeManagerTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 1)
             payload = json.loads(result.stdout)
-            self.assertIn("PRIMARY_REPO_URL", payload["error"])
+            self.assertIn("PRIMARY_REPO_URL", payload["error"]["message"])
 
     def test_render_keeps_supporting_inline_clients(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1040,6 +1052,349 @@ class RuntimeManagerTests(unittest.TestCase):
                 {item["id"] for item in payload["repos"]},
                 {"skillbox-self", "managed-repos", "legacy-inline-root"},
             )
+
+    def test_context_generates_claude_md_and_agents_md_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(repo, "context", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            actions = payload["actions"]
+            self.assertTrue(any("write-context:" in a for a in actions))
+
+            claude_md = repo / "home" / ".claude" / "CLAUDE.md"
+            agents_md = repo / "home" / ".codex" / "AGENTS.md"
+
+            self.assertTrue(claude_md.is_file())
+            self.assertTrue(agents_md.is_symlink())
+            self.assertEqual(
+                os.readlink(str(agents_md)),
+                os.path.join("..", ".claude", "CLAUDE.md"),
+            )
+
+            content = claude_md.read_text(encoding="utf-8")
+            self.assertIn("# skillbox", content)
+            self.assertIn("skillbox-self", content)
+            self.assertIn("managed-repos", content)
+            self.assertIn("internal-env-manager", content)
+            self.assertIn("make dev-sanity", content)
+            self.assertIn("make runtime-status", content)
+            self.assertNotIn("CLIENT=", content)
+
+            agents_content = agents_md.read_text(encoding="utf-8")
+            self.assertEqual(content, agents_content)
+
+    def test_context_with_client_includes_client_repos_and_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(repo, "context", "--client", "personal", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            claude_md = repo / "home" / ".claude" / "CLAUDE.md"
+            content = claude_md.read_text(encoding="utf-8")
+            self.assertIn("**personal**", content)
+            self.assertIn("CLIENT=personal", content)
+            self.assertIn("personal-root", content)
+            self.assertIn("personal-skills", content)
+
+    def test_context_symlink_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            first = self._run(repo, "context", "--format", "json")
+            self.assertEqual(first.returncode, 0, first.stderr)
+            first_actions = json.loads(first.stdout)["actions"]
+            self.assertTrue(any("symlink-context:" in a for a in first_actions))
+
+            second = self._run(repo, "context", "--format", "json")
+            self.assertEqual(second.returncode, 0, second.stderr)
+            second_actions = json.loads(second.stdout)["actions"]
+            self.assertTrue(any("exists:" in a and "AGENTS.md" in a for a in second_actions))
+            self.assertFalse(any("symlink-context:" in a for a in second_actions))
+
+    def test_sync_generates_context_automatically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(repo, "sync", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            actions = payload["actions"]
+            self.assertTrue(any("write-context:" in a for a in actions))
+
+            claude_md = repo / "home" / ".claude" / "CLAUDE.md"
+            agents_md = repo / "home" / ".codex" / "AGENTS.md"
+
+            self.assertTrue(claude_md.is_file())
+            self.assertTrue(agents_md.is_symlink())
+
+            content = claude_md.read_text(encoding="utf-8")
+            self.assertIn("# skillbox", content)
+            self.assertIn("sample-skill", content)
+
+    def test_context_lists_manifest_skill_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(repo, "context")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            claude_md = repo / "home" / ".claude" / "CLAUDE.md"
+            content = claude_md.read_text(encoding="utf-8")
+            self.assertIn("sample-skill", content)
+
+    def test_context_dry_run_does_not_write_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(repo, "context", "--dry-run", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["dry_run"])
+
+            claude_md = repo / "home" / ".claude" / "CLAUDE.md"
+            agents_md = repo / "home" / ".codex" / "AGENTS.md"
+            self.assertFalse(claude_md.exists())
+            self.assertFalse(agents_md.exists())
+
+    # -- Structured errors, next_actions, semantic exit codes ------------------
+
+    def test_structured_error_includes_type_message_and_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(repo, "client-init", "Bad Id!", "--format", "json")
+
+            self.assertEqual(result.returncode, 1)
+            payload = json.loads(result.stdout)
+            error = payload["error"]
+            self.assertIn("type", error)
+            self.assertIn("message", error)
+            self.assertIn("recoverable", error)
+            self.assertTrue(error["recoverable"])
+
+    def test_doctor_returns_exit_drift_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(repo, "doctor", "--client", "vibe-coding-client", "--format", "json")
+
+            self.assertEqual(result.returncode, 2)
+
+    def test_sync_json_includes_next_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(repo, "sync", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertIn("next_actions", payload)
+            self.assertIsInstance(payload["next_actions"], list)
+            self.assertTrue(len(payload["next_actions"]) > 0)
+
+    def test_status_json_includes_next_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._run(repo, "sync")
+
+            result = self._run(repo, "status", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertIn("next_actions", payload)
+            self.assertIsInstance(payload["next_actions"], list)
+
+    def test_doctor_json_includes_next_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(repo, "doctor", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertIn("next_actions", payload)
+            self.assertIn("checks", payload)
+
+    def test_context_json_includes_next_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(repo, "context", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertIn("next_actions", payload)
+
+    def test_client_init_json_includes_next_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(repo, "client-init", "new-project", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertIn("next_actions", payload)
+            self.assertTrue(any("sync" in action for action in payload["next_actions"]))
+
+    # -- Onboard macro ---------------------------------------------------------
+
+    def test_onboard_scaffolds_syncs_and_verifies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            # Create the client root so doctor verify passes
+            (repo / "monoserver-host" / "new-project").mkdir(parents=True, exist_ok=True)
+
+            result = self._run(
+                repo,
+                "onboard",
+                "new-project",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["client_id"], "new-project")
+            self.assertFalse(payload["dry_run"])
+            self.assertIn("steps", payload)
+            self.assertIn("next_actions", payload)
+
+            step_names = [s["step"] for s in payload["steps"]]
+            self.assertEqual(
+                step_names,
+                ["scaffold", "sync", "bootstrap", "up", "context", "verify"],
+            )
+            for s in payload["steps"]:
+                self.assertIn(s["status"], ("ok", "skip"), f"step {s['step']} failed: {s}")
+
+            # Verify overlay was created
+            overlay = repo / "workspace" / "clients" / "new-project" / "overlay.yaml"
+            self.assertTrue(overlay.is_file())
+
+            # Verify context was generated
+            claude_md = repo / "home" / ".claude" / "CLAUDE.md"
+            self.assertTrue(claude_md.is_file())
+
+    def test_onboard_with_blueprint_runs_full_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            source_repo = self._create_git_source_repo(repo, "fixture-app")
+            self._write_client_blueprint(
+                repo,
+                "git-repo",
+                "version: 1\n"
+                "description: Clone a repo.\n"
+                "variables:\n"
+                "  - name: PRIMARY_REPO_URL\n"
+                "    required: true\n"
+                "  - name: PRIMARY_REPO_PATH\n"
+                "    default: ${CLIENT_ROOT}/app\n"
+                "client:\n"
+                "  default_cwd: ${PRIMARY_REPO_PATH}\n"
+                "  repos:\n"
+                "    - id: app\n"
+                "      kind: repo\n"
+                "      path: ${PRIMARY_REPO_PATH}\n"
+                "      required: true\n"
+                "      profiles:\n"
+                "        - core\n"
+                "      source:\n"
+                "        kind: git\n"
+                "        url: ${PRIMARY_REPO_URL}\n"
+                "        branch: main\n"
+                "      sync:\n"
+                "        mode: clone-if-missing\n",
+            )
+            (repo / "monoserver-host" / "acme-app").mkdir(parents=True, exist_ok=True)
+
+            result = self._run(
+                repo,
+                "onboard",
+                "acme-app",
+                "--blueprint",
+                "git-repo",
+                "--set",
+                f"PRIMARY_REPO_URL={source_repo}",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["client_id"], "acme-app")
+            step_statuses = {s["step"]: s["status"] for s in payload["steps"]}
+            self.assertEqual(step_statuses["scaffold"], "ok")
+            self.assertEqual(step_statuses["sync"], "ok")
+
+    def test_onboard_dry_run_does_not_create_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(
+                repo,
+                "onboard",
+                "dry-test",
+                "--dry-run",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["dry_run"])
+            # All steps after scaffold should be skipped in dry-run
+            step_statuses = {s["step"]: s["status"] for s in payload["steps"]}
+            self.assertEqual(step_statuses["scaffold"], "ok")
+            for skip_step in ("sync", "bootstrap", "up", "context", "verify"):
+                self.assertEqual(step_statuses[skip_step], "skip", f"{skip_step} should be skip")
+
+            overlay = repo / "workspace" / "clients" / "dry-test" / "overlay.yaml"
+            self.assertFalse(overlay.exists())
+
+    def test_onboard_fails_with_structured_error_on_invalid_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(
+                repo,
+                "onboard",
+                "BAD ID",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 1)
+            payload = json.loads(result.stdout)
+            self.assertIn("error", payload)
+            self.assertIn("type", payload["error"])
+            self.assertIn("steps", payload)
+            self.assertEqual(payload["steps"][0]["step"], "scaffold")
+            self.assertEqual(payload["steps"][0]["status"], "fail")
 
     def _run(self, repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

@@ -85,6 +85,7 @@ What that gives you:
 - optional API and web inspection surfaces
 - packaged default `.skill` bundles under `default-skills/`
 - installed default skills under `home/.claude/skills` and `home/.codex/skills`
+- generated agent context at `home/.claude/CLAUDE.md` with a symlink at `home/.codex/AGENTS.md`
 
 ## Swimmers Overlay
 
@@ -130,6 +131,42 @@ AUTH_MODE=token AUTH_TOKEN=replace-me \
 SWIMMERS_TUI_URL=http://<tailnet-ip>:3210 \
 cargo run --bin swimmers-tui
 ```
+
+## Agent Context
+
+The runtime graph describes the inside of the box. The `context` command makes
+that description available to the agents running inside it.
+
+```bash
+make context CLIENT=personal
+```
+
+What this does:
+
+- reads the resolved runtime graph for the active client and profiles
+- generates `home/.claude/CLAUDE.md` with repos, services, tasks, skills,
+  logs, and runnable make commands
+- creates a symlink at `home/.codex/AGENTS.md` pointing to the same file
+- re-runs automatically on `make runtime-sync`
+
+When an agent starts a session inside the workspace container, it reads its
+home `CLAUDE.md` or `AGENTS.md` and immediately knows:
+
+- which client context it is operating in
+- which repos are available and where they live
+- which services exist and how to start, stop, or tail them
+- which bootstrap tasks are available and how to run them
+- which skills are installed
+- where logs go
+- the exact make commands for health checks, status, and sync
+
+This means the agent does not need to be told any of this manually. Every repo,
+service, task, or skill you add to `runtime.yaml` or a client overlay
+automatically appears in the agent context the next time `sync` or `context`
+runs.
+
+Both files are gitignored because they are generated state that varies by
+environment and client selection.
 
 ## Design Philosophy
 
@@ -267,6 +304,7 @@ make runtime-sync
 | `make runtime-down` | Stops manageable services for the active scope |
 | `make runtime-restart` | Restarts manageable services for the active scope |
 | `make runtime-logs` | Shows recent service logs for the active scope |
+| `make context` | Generates `CLAUDE.md` and `AGENTS.md` from the resolved runtime graph |
 | `make dev-sanity` | Validates the internal runtime graph, filesystem readiness, and managed skill integrity |
 | `make build` | Builds the workspace image |
 | `make up` | Starts the workspace container |
@@ -292,6 +330,7 @@ make runtime-sync
 | `scripts/04-reconcile.py render` | Print the resolved sandbox model | `python3 scripts/04-reconcile.py render --with-compose` |
 | `scripts/04-reconcile.py doctor` | Run drift and readiness checks | `python3 scripts/04-reconcile.py doctor` |
 | `scripts/05-swimmers.sh` | Manage the workspace-local swimmers install and process lifecycle | `./scripts/05-swimmers.sh status` |
+| `.env-manager/manage.py context` | Generate CLAUDE.md and AGENTS.md from the resolved runtime graph | `python3 .env-manager/manage.py context --client personal` |
 | `.env-manager/manage.py render` | Print the resolved internal runtime graph | `python3 .env-manager/manage.py render --format json` |
 | `.env-manager/manage.py sync` | Create managed repo/artifact/log directories and install declared skills for the selected core/client scope | `python3 .env-manager/manage.py sync --client personal --dry-run` |
 | `.env-manager/manage.py doctor` | Validate the internal repos/skills/logs/check graph for the selected core/client scope | `python3 .env-manager/manage.py doctor --client personal` |

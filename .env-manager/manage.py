@@ -51,6 +51,9 @@ VALID_HEALTHCHECK_TYPES = {"http", "path_exists"}
 VALID_CHECK_TYPES = {"path_exists"}
 VALID_TASK_SUCCESS_TYPES = {"path_exists"}
 LOCKFILE_VERSION = 1
+CONTEXT_CLAUDE_REL = Path("home") / ".claude" / "CLAUDE.md"
+CONTEXT_CODEX_REL = Path("home") / ".codex" / "AGENTS.md"
+CONTEXT_SYMLINK_TARGET = os.path.join("..", ".claude", "CLAUDE.md")
 CLIENT_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 BLUEPRINT_VARIABLE_PATTERN = re.compile(r"^[A-Z0-9_]+$")
 SCAFFOLD_PLACEHOLDER_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
@@ -70,12 +73,182 @@ PATH_LIKE_ENV_KEYS = {
 }
 
 
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_DRIFT = 2
+EXIT_NEEDS_INPUT = 3
+
+
 @dataclass
 class CheckResult:
     status: str
     code: str
     message: str
     details: dict[str, Any] | None = None
+
+
+def structured_error(
+    message: str,
+    *,
+    error_type: str = "runtime_error",
+    recoverable: bool = True,
+    recovery_hint: str | None = None,
+    next_actions: list[str] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "error": {
+            "type": error_type,
+            "message": message,
+            "recoverable": recoverable,
+        },
+    }
+    if recovery_hint is not None:
+        payload["error"]["recovery_hint"] = recovery_hint
+    if next_actions is not None:
+        payload["next_actions"] = next_actions
+    return payload
+
+
+def classify_error(exc: RuntimeError, command: str) -> dict[str, Any]:
+    """Map a RuntimeError to a structured error payload with contextual recovery hints."""
+    msg = str(exc)
+
+    if "client-init requires" in msg:
+        return structured_error(
+            msg,
+            error_type="missing_argument",
+            recovery_hint="Provide a client_id argument or use --list-blueprints.",
+            next_actions=["client-init --list-blueprints --format json"],
+        )
+    if "blueprint" in msg.lower() and "not found" in msg.lower():
+        return structured_error(
+            msg,
+            error_type="blueprint_not_found",
+            recovery_hint="List available blueprints, then retry with a valid name or path.",
+            next_actions=["client-init --list-blueprints --format json"],
+        )
+    if "required" in msg.lower() and "variable" in msg.lower():
+        return structured_error(
+            msg,
+            error_type="missing_variable",
+            recovery_hint="Add the missing --set KEY=VALUE assignments and retry.",
+        )
+    if "already exists" in msg.lower() or "without force" in msg.lower() or "already_exists" in msg.lower():
+        return structured_error(
+            msg,
+            error_type="conflict",
+            recovery_hint="Use --force to overwrite existing files, or choose a different client id.",
+        )
+    if "env file" in msg.lower() and ("missing" in msg.lower() or "unresolved" in msg.lower()):
+        return structured_error(
+            msg,
+            error_type="missing_env_file",
+            recovery_hint="Create the env source file or run sync first.",
+            next_actions=[f"sync --format json"],
+        )
+    if "failed to become healthy" in msg.lower():
+        return structured_error(
+            msg,
+            error_type="service_health_failure",
+            recovery_hint="Check service logs for the root cause, then restart.",
+            next_actions=["logs --format json", "doctor --format json"],
+        )
+    if "invalid client id" in msg.lower():
+        return structured_error(
+            msg,
+            error_type="invalid_client_id",
+            recoverable=True,
+            recovery_hint="Client IDs must be lowercase alphanumeric with single hyphens: my-project.",
+        )
+
+    # Contextual fallback based on command
+    fallback_next: list[str] = []
+    if command in ("sync", "up", "bootstrap", "restart"):
+        fallback_next = ["doctor --format json", "status --format json"]
+    elif command == "client-init":
+        fallback_next = ["client-init --list-blueprints --format json"]
+    elif command in ("down",):
+        fallback_next = ["status --format json"]
+
+    return structured_error(
+        msg,
+        recovery_hint="Run doctor to diagnose, then check logs for details.",
+        next_actions=fallback_next or ["doctor --format json"],
+    )
+
+
+def next_actions_for_doctor(results: list["CheckResult"]) -> list[str]:
+    has_fail = any(r.status == "fail" for r in results)
+    has_warn = any(r.status == "warn" for r in results)
+    actions: list[str] = []
+    if has_fail or has_warn:
+        actions.append("sync --format json")
+    if has_fail:
+        actions.append("status --format json")
+    if not has_fail and not has_warn:
+        actions.append("status --format json")
+    return actions
+
+
+def next_actions_for_status(status_payload: dict[str, Any]) -> list[str]:
+    actions: list[str] = []
+
+    stopped_services = [
+        s for s in status_payload.get("services", [])
+        if s.get("state") == "stopped" or s.get("state") == "not-running"
+    ]
+    pending_tasks = [
+        t for t in status_payload.get("tasks", [])
+        if t.get("state") == "pending"
+    ]
+    missing_repos = [
+        r for r in status_payload.get("repos", [])
+        if not r.get("present", True)
+    ]
+
+    if missing_repos:
+        actions.append("sync --format json")
+    if pending_tasks:
+        actions.append("bootstrap --format json")
+    if stopped_services:
+        actions.append("up --format json")
+    if not actions:
+        actions.append("doctor --format json")
+    return actions
+
+
+def next_actions_for_sync() -> list[str]:
+    return ["doctor --format json", "status --format json"]
+
+
+def next_actions_for_up(service_results: list[dict[str, Any]]) -> list[str]:
+    has_failed = any(s.get("result") == "failed" for s in service_results)
+    if has_failed:
+        return ["logs --format json", "doctor --format json"]
+    return ["status --format json"]
+
+
+def next_actions_for_down() -> list[str]:
+    return ["status --format json"]
+
+
+def next_actions_for_bootstrap(task_results: list[dict[str, Any]]) -> list[str]:
+    has_failed = any(t.get("result") == "failed" for t in task_results)
+    if has_failed:
+        return ["logs --format json", "doctor --format json"]
+    return ["up --format json", "status --format json"]
+
+
+def next_actions_for_context() -> list[str]:
+    return ["doctor --format json"]
+
+
+def next_actions_for_client_init(client_id: str) -> list[str]:
+    return [
+        f"sync --client {client_id} --format json",
+        f"bootstrap --client {client_id} --format json",
+        f"up --client {client_id} --format json",
+    ]
 
 
 def repo_rel(root_dir: Path, path: Path) -> str:
@@ -3318,6 +3491,216 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def generate_context_markdown(model: dict[str, Any]) -> str:
+    """Generate a CLAUDE.md / AGENTS.md from the resolved runtime model."""
+    lines: list[str] = []
+
+    active_clients = model.get("active_clients") or []
+    active_profiles = [p for p in (model.get("active_profiles") or []) if p != "core"]
+    clients_data = {
+        str(c.get("id", "")): c
+        for c in model.get("clients") or []
+    }
+
+    # Build make suffix for commands
+    make_parts: list[str] = []
+    if active_clients:
+        make_parts.append(f"CLIENT={active_clients[0]}")
+
+    make_suffix = " " + " ".join(make_parts) if make_parts else ""
+
+    # Determine default CWD from active client
+    default_cwd = ""
+    for client_id in active_clients:
+        client_data = clients_data.get(client_id, {})
+        cwd = str(client_data.get("default_cwd", "")).strip()
+        if cwd:
+            default_cwd = cwd
+            break
+
+    # Regenerate hint
+    regen_cmd = f"make context{make_suffix}"
+    sync_cmd = f"make runtime-sync{make_suffix}"
+
+    # Header
+    lines.append("# skillbox")
+    lines.append("")
+    lines.append(f"> Auto-generated from the runtime graph. Do not edit manually.")
+    lines.append(f"> Regenerate: `{regen_cmd}` or `{sync_cmd}`.")
+    lines.append("")
+    lines.append("You are inside a skillbox workspace container.")
+    lines.append("")
+
+    # Environment
+    lines.append("## Environment")
+    lines.append("")
+    if active_clients:
+        lines.append(f"- Client: **{', '.join(active_clients)}**")
+    if default_cwd:
+        lines.append(f"- Default CWD: `{default_cwd}`")
+    if active_profiles:
+        lines.append(f"- Profiles: {', '.join(active_profiles)}")
+    lines.append("")
+
+    # Repos
+    repos = model.get("repos") or []
+    if repos:
+        lines.append("## Repos")
+        lines.append("")
+        lines.append("| ID | Path | Kind |")
+        lines.append("|----|------|------|")
+        for repo in repos:
+            lines.append(
+                f"| {repo['id']} | `{repo['path']}` | {repo.get('kind', 'repo')} |"
+            )
+        lines.append("")
+
+    # Services
+    services = model.get("services") or []
+    if services:
+        lines.append("## Services")
+        lines.append("")
+        for service in services:
+            sid = service["id"]
+            kind = service.get("kind", "service")
+            profiles = service.get("profiles") or []
+            profile_label = ", ".join(profiles) or "core"
+            manageable, reason = service_supports_lifecycle(service)
+
+            if manageable:
+                svc_parts = list(make_parts)
+                non_core = [p for p in profiles if p != "core"]
+                if non_core:
+                    svc_parts.append(f"PROFILE={non_core[0]}")
+                svc_parts.append(f"SERVICE={sid}")
+                svc_suffix = " " + " ".join(svc_parts)
+
+                deps = service_dependency_ids(service)
+                dep_note = f" (depends on: {', '.join(deps)})" if deps else ""
+
+                lines.append(f"- **{sid}** ({kind}, {profile_label}){dep_note}")
+                lines.append(f"  - Start: `make runtime-up{svc_suffix}`")
+                lines.append(f"  - Stop: `make runtime-down{svc_suffix}`")
+                lines.append(f"  - Logs: `make runtime-logs{svc_suffix}`")
+            else:
+                lines.append(
+                    f"- **{sid}** ({kind}, {profile_label})"
+                    f" — {reason or 'not manageable'}"
+                )
+        lines.append("")
+
+    # Tasks
+    tasks = model.get("tasks") or []
+    if tasks:
+        lines.append("## Tasks")
+        lines.append("")
+        for task in tasks:
+            tid = task["id"]
+            deps = task_dependency_ids(task)
+            dep_note = f" (depends on: {', '.join(deps)})" if deps else ""
+
+            task_parts = list(make_parts)
+            task_parts.append(f"TASK={tid}")
+            task_suffix = " " + " ".join(task_parts)
+
+            lines.append(
+                f"- **{tid}**{dep_note}: `make runtime-bootstrap{task_suffix}`"
+            )
+        lines.append("")
+
+    # Installed skills
+    skills = model.get("skills") or []
+    if skills:
+        lines.append("## Installed Skills")
+        lines.append("")
+        for skillset in skills:
+            sid = skillset["id"]
+            manifest_host_path = Path(
+                str(skillset.get("manifest_host_path", ""))
+            )
+            skill_names: list[str] = []
+            if manifest_host_path.is_file():
+                try:
+                    skill_names = read_manifest_skills(manifest_host_path)
+                except Exception:
+                    pass
+
+            if skill_names:
+                lines.append(f"- **{sid}**: {', '.join(skill_names)}")
+            else:
+                lines.append(f"- **{sid}**: (empty)")
+        lines.append("")
+
+    # Logs
+    logs = model.get("logs") or []
+    if logs:
+        lines.append("## Logs")
+        lines.append("")
+        lines.append("| ID | Path |")
+        lines.append("|----|------|")
+        for log_item in logs:
+            lines.append(f"| {log_item['id']} | `{log_item['path']}` |")
+        lines.append("")
+
+    # Quick reference
+    lines.append("## Quick Reference")
+    lines.append("")
+    lines.append("```bash")
+    lines.append(f"make dev-sanity{make_suffix}")
+    lines.append(f"make runtime-status{make_suffix}")
+    lines.append(f"make runtime-sync{make_suffix}")
+    lines.append(f"make runtime-up{make_suffix} SERVICE=<id>")
+    lines.append(f"make runtime-down{make_suffix} SERVICE=<id>")
+    lines.append(f"make runtime-logs{make_suffix} SERVICE=<id>")
+    if tasks:
+        lines.append(f"make runtime-bootstrap{make_suffix} TASK=<id>")
+    lines.append("```")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def sync_context(model: dict[str, Any], root_dir: Path, dry_run: bool) -> list[str]:
+    """Write the generated CLAUDE.md and create the AGENTS.md symlink."""
+    actions: list[str] = []
+
+    content = generate_context_markdown(model)
+
+    claude_path = root_dir / CONTEXT_CLAUDE_REL
+    codex_path = root_dir / CONTEXT_CODEX_REL
+
+    # Write the primary context file.
+    ensure_directory(claude_path.parent, dry_run)
+    if not dry_run:
+        claude_path.write_text(content, encoding="utf-8")
+    actions.append(f"write-context: {repo_rel(root_dir, claude_path)}")
+
+    # Create or verify the symlink.
+    ensure_directory(codex_path.parent, dry_run)
+    if codex_path.is_symlink():
+        current_target = os.readlink(str(codex_path))
+        if current_target == CONTEXT_SYMLINK_TARGET:
+            actions.append(
+                f"exists: {repo_rel(root_dir, codex_path)}"
+                f" -> {CONTEXT_SYMLINK_TARGET}"
+            )
+            return actions
+        if not dry_run:
+            codex_path.unlink()
+    elif codex_path.exists():
+        if not dry_run:
+            codex_path.unlink()
+
+    if not dry_run:
+        codex_path.symlink_to(CONTEXT_SYMLINK_TARGET)
+    actions.append(
+        f"symlink-context: {repo_rel(root_dir, codex_path)}"
+        f" -> {CONTEXT_SYMLINK_TARGET}"
+    )
+
+    return actions
+
+
 def print_render_text(model: dict[str, Any]) -> None:
     available_clients = ", ".join(client["id"] for client in model.get("clients") or []) or "(none)"
     default_client = (model.get("selection") or {}).get("default_client") or "(none)"
@@ -3555,6 +3938,166 @@ def emit_json(payload: Any) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
+def run_onboard(
+    *,
+    root_dir: Path,
+    client_id: str,
+    label: str | None,
+    default_cwd: str | None,
+    root_path: str | None,
+    blueprint_name: str | None,
+    set_args: list[str],
+    dry_run: bool,
+    force: bool,
+    wait_seconds: float,
+    fmt: str,
+) -> int:
+    """Macro: client-init → sync → bootstrap → up → context → doctor."""
+    steps: list[dict[str, Any]] = []
+    is_json = fmt == "json"
+
+    def step(name: str, status: str, detail: Any = None) -> dict[str, Any]:
+        entry: dict[str, Any] = {"step": name, "status": status}
+        if detail is not None:
+            entry["detail"] = detail
+        steps.append(entry)
+        if not is_json:
+            marker = "ok" if status == "ok" else ("skip" if status == "skip" else "FAIL")
+            print(f"[{marker}] {name}")
+        return entry
+
+    # -- 1. Scaffold -----------------------------------------------------------
+    try:
+        cid = validate_client_id(client_id)
+        assignments = parse_key_value_assignments(set_args, "--set")
+        scaffold_actions, blueprint_metadata = scaffold_client_overlay(
+            root_dir=root_dir,
+            client_id=cid,
+            label=label,
+            default_cwd=default_cwd,
+            root_path=root_path,
+            blueprint_name=blueprint_name,
+            blueprint_assignments=assignments,
+            dry_run=dry_run,
+            force=force,
+        )
+        scaffold_detail: dict[str, Any] = {"actions": scaffold_actions}
+        if blueprint_metadata is not None:
+            scaffold_detail["blueprint"] = blueprint_metadata
+        step("scaffold", "ok", scaffold_detail)
+    except RuntimeError as exc:
+        step("scaffold", "fail", {"error": str(exc)})
+        payload: dict[str, Any] = {
+            "client_id": client_id,
+            "dry_run": dry_run,
+            "steps": steps,
+        }
+        payload.update(classify_error(exc, "onboard"))
+        if is_json:
+            emit_json(payload)
+        return EXIT_ERROR
+
+    # In dry-run mode, the scaffold didn't write files, so the client won't
+    # exist in the runtime model.  Report what *would* happen and stop early.
+    if dry_run:
+        for skip_name in ("sync", "bootstrap", "up", "context", "verify"):
+            step(skip_name, "skip", {"reason": "dry-run"})
+        payload = {
+            "client_id": cid,
+            "dry_run": True,
+            "steps": steps,
+            "next_actions": [f"onboard {cid} --format json"],
+        }
+        if is_json:
+            emit_json(payload)
+        return EXIT_OK
+
+    # -- 2. Sync ---------------------------------------------------------------
+    try:
+        model = build_runtime_model(root_dir)
+        active_profiles = normalize_active_profiles([])
+        active_clients = normalize_active_clients(model, [cid])
+        model = filter_model(model, active_profiles, active_clients)
+        sync_actions = sync_runtime(model, dry_run=False)
+        step("sync", "ok", {"actions": sync_actions})
+    except RuntimeError as exc:
+        step("sync", "fail", {"error": str(exc)})
+        payload = {"client_id": cid, "dry_run": False, "steps": steps}
+        payload.update(classify_error(exc, "onboard"))
+        if is_json:
+            emit_json(payload)
+        return EXIT_ERROR
+
+    # -- 3. Bootstrap ----------------------------------------------------------
+    try:
+        requested_tasks = select_tasks(model, [])
+        tasks = resolve_tasks_for_run(model, requested_tasks)
+        if tasks:
+            ensure_required_env_files_ready(select_env_files_for_tasks(model, tasks))
+            task_results = run_tasks(model, tasks, dry_run=False)
+            step("bootstrap", "ok", {"tasks": task_results})
+        else:
+            step("bootstrap", "skip", {"reason": "no tasks declared"})
+    except RuntimeError as exc:
+        step("bootstrap", "fail", {"error": str(exc)})
+        payload = {"client_id": cid, "dry_run": False, "steps": steps}
+        payload.update(classify_error(exc, "onboard"))
+        if is_json:
+            emit_json(payload)
+        return EXIT_ERROR
+
+    # -- 4. Up -----------------------------------------------------------------
+    try:
+        requested_services = select_services(model, [])
+        services = resolve_services_for_start(model, requested_services)
+        if services:
+            ensure_required_env_files_ready(select_env_files_for_services(model, services))
+            service_results = start_services(
+                model, services, dry_run=False, wait_seconds=wait_seconds,
+            )
+            step("up", "ok", {"services": service_results})
+        else:
+            step("up", "skip", {"reason": "no services declared"})
+    except RuntimeError as exc:
+        step("up", "fail", {"error": str(exc)})
+        payload = {"client_id": cid, "dry_run": False, "steps": steps}
+        payload.update(classify_error(exc, "onboard"))
+        if is_json:
+            emit_json(payload)
+        return EXIT_ERROR
+
+    # -- 5. Context ------------------------------------------------------------
+    try:
+        context_actions = sync_context(model, root_dir, dry_run=False)
+        step("context", "ok", {"actions": context_actions})
+    except RuntimeError as exc:
+        step("context", "fail", {"error": str(exc)})
+
+    # -- 6. Doctor (verify) ----------------------------------------------------
+    doctor = doctor_results(model, root_dir)
+    has_fail = any(r.status == "fail" for r in doctor)
+    has_warn = any(r.status == "warn" for r in doctor)
+    step(
+        "verify",
+        "fail" if has_fail else ("warn" if has_warn else "ok"),
+        {"checks": [asdict(r) for r in doctor]},
+    )
+
+    payload = {
+        "client_id": cid,
+        "dry_run": False,
+        "steps": steps,
+        "next_actions": (
+            [f"doctor --client {cid} --format json", f"status --client {cid} --format json"]
+            if has_fail
+            else [f"status --client {cid} --format json"]
+        ),
+    }
+    if is_json:
+        emit_json(payload)
+    return EXIT_DRIFT if has_fail else EXIT_OK
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Manage the internal skillbox runtime graph.")
     parser.add_argument(
@@ -3679,6 +4222,15 @@ def main() -> int:
     add_client_arg(logs_parser)
     add_service_arg(logs_parser)
 
+    context_parser = subparsers.add_parser(
+        "context",
+        help="Generate CLAUDE.md and AGENTS.md from the resolved runtime graph.",
+    )
+    context_parser.add_argument("--dry-run", action="store_true")
+    context_parser.add_argument("--format", choices=("text", "json"), default="text")
+    add_profile_arg(context_parser)
+    add_client_arg(context_parser)
+
     client_init_parser = subparsers.add_parser(
         "client-init",
         help="Scaffold a new workspace client overlay and companion skill directories.",
@@ -3719,6 +4271,43 @@ def main() -> int:
     client_init_parser.add_argument("--dry-run", action="store_true")
     client_init_parser.add_argument("--format", choices=("text", "json"), default="text")
 
+    onboard_parser = subparsers.add_parser(
+        "onboard",
+        help="Macro: scaffold a client, sync, bootstrap, start services, generate context, and verify.",
+    )
+    onboard_parser.add_argument(
+        "client_id",
+        help="Lowercase client slug, for example `acme-studio`.",
+    )
+    onboard_parser.add_argument("--label", default=None, help="Human-friendly label for the client.")
+    onboard_parser.add_argument(
+        "--root-path",
+        default=None,
+        help="Runtime path for the client root. Defaults to ${SKILLBOX_MONOSERVER_ROOT}/<client-id>.",
+    )
+    onboard_parser.add_argument(
+        "--default-cwd",
+        default=None,
+        help="Runtime default cwd for the client. Defaults to the client root path.",
+    )
+    onboard_parser.add_argument(
+        "--blueprint",
+        default=None,
+        help="Apply a reusable client blueprint from workspace/client-blueprints/ or an explicit YAML path.",
+    )
+    onboard_parser.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        help="Set a blueprint variable using KEY=VALUE. Can be repeated.",
+    )
+    onboard_parser.add_argument("--force", action="store_true", help="Overwrite existing scaffold files.")
+    onboard_parser.add_argument("--dry-run", action="store_true")
+    onboard_parser.add_argument(
+        "--wait-seconds", type=float, default=DEFAULT_SERVICE_START_WAIT_SECONDS,
+    )
+    onboard_parser.add_argument("--format", choices=("text", "json"), default="text")
+
     args = parser.parse_args()
     root_dir = resolve_root_dir(args.root_dir)
 
@@ -3730,7 +4319,7 @@ def main() -> int:
                     emit_json({"blueprints": blueprints})
                 else:
                     print_client_blueprints_text(blueprints)
-                return 0
+                return EXIT_OK
 
             if not args.client_id:
                 raise RuntimeError("client-init requires <client_id> unless --list-blueprints is used.")
@@ -3749,16 +4338,18 @@ def main() -> int:
             )
         except RuntimeError as exc:
             if args.format == "json":
-                emit_json({"error": str(exc)})
+                emit_json(classify_error(exc, "client-init"))
             else:
                 print(str(exc), file=sys.stderr)
-            return 1
+            return EXIT_ERROR
 
-        payload = {
-            "client_id": validate_client_id(args.client_id),
+        cid = validate_client_id(args.client_id)
+        payload: dict[str, Any] = {
+            "client_id": cid,
             "dry_run": args.dry_run,
             "force": args.force,
             "actions": actions,
+            "next_actions": next_actions_for_client_init(cid),
         }
         if blueprint_metadata is not None:
             payload["blueprint"] = blueprint_metadata
@@ -3768,7 +4359,22 @@ def main() -> int:
             if blueprint_metadata is not None:
                 print(f"blueprint: {blueprint_metadata['id']}")
             print("\n".join(actions))
-        return 0
+        return EXIT_OK
+
+    if args.command == "onboard":
+        return run_onboard(
+            root_dir=root_dir,
+            client_id=args.client_id,
+            label=args.label,
+            default_cwd=args.default_cwd,
+            root_path=args.root_path,
+            blueprint_name=args.blueprint,
+            set_args=args.set,
+            dry_run=args.dry_run,
+            force=args.force,
+            wait_seconds=max(0.0, float(args.wait_seconds)),
+            fmt=args.format,
+        )
 
     model = build_runtime_model(root_dir)
     active_profiles = normalize_active_profiles(getattr(args, "profile", []))
@@ -3781,31 +4387,48 @@ def main() -> int:
                 emit_json(model)
             else:
                 print_render_text(model)
-            return 0
+            return EXIT_OK
 
         if args.command == "sync":
             actions = sync_runtime(model, dry_run=args.dry_run)
+            actions.extend(sync_context(model, root_dir, dry_run=args.dry_run))
             if args.format == "json":
-                emit_json({"actions": actions, "dry_run": args.dry_run})
+                emit_json({"actions": actions, "dry_run": args.dry_run, "next_actions": next_actions_for_sync()})
             else:
                 print("\n".join(actions))
-            return 0
+            return EXIT_OK
+
+        if args.command == "context":
+            actions = sync_context(model, root_dir, dry_run=args.dry_run)
+            if args.format == "json":
+                emit_json({"actions": actions, "dry_run": args.dry_run, "next_actions": next_actions_for_context()})
+            else:
+                print("\n".join(actions))
+            return EXIT_OK
 
         if args.command == "doctor":
             results = doctor_results(model, root_dir)
+            has_fail = any(result.status == "fail" for result in results)
+            has_warn = any(result.status == "warn" for result in results)
             if args.format == "json":
-                emit_json([asdict(result) for result in results])
+                emit_json({
+                    "checks": [asdict(result) for result in results],
+                    "next_actions": next_actions_for_doctor(results),
+                })
             else:
                 print_doctor_text(results)
-            return 1 if any(result.status == "fail" for result in results) else 0
+            if has_fail:
+                return EXIT_DRIFT
+            return EXIT_OK
 
         if args.command == "status":
             status_payload = runtime_status(model)
             if args.format == "json":
+                status_payload["next_actions"] = next_actions_for_status(status_payload)
                 emit_json(status_payload)
             else:
                 print_status_text(status_payload)
-            return 0
+            return EXIT_OK
 
         if args.command == "bootstrap":
             sync_actions = sync_runtime(model, dry_run=args.dry_run)
@@ -3818,16 +4441,17 @@ def main() -> int:
                 tasks,
                 dry_run=args.dry_run,
             )
-            payload = {
+            payload: dict[str, Any] = {
                 "dry_run": args.dry_run,
                 "sync_actions": sync_actions,
                 "tasks": task_results,
+                "next_actions": next_actions_for_bootstrap(task_results),
             }
             if args.format == "json":
                 emit_json(payload)
             else:
                 print_service_actions_text(payload)
-            return 0
+            return EXIT_OK
 
         requested_services = select_services(model, getattr(args, "service", []))
 
@@ -3855,12 +4479,13 @@ def main() -> int:
                 "sync_actions": sync_actions,
                 "bootstrap_tasks": task_results,
                 "services": service_results,
+                "next_actions": next_actions_for_up(service_results),
             }
             if args.format == "json":
                 emit_json(payload)
             else:
                 print_service_actions_text(payload)
-            return 0
+            return EXIT_OK
 
         if args.command == "down":
             services = resolve_services_for_stop(model, requested_services)
@@ -3873,12 +4498,13 @@ def main() -> int:
             payload = {
                 "dry_run": args.dry_run,
                 "services": service_results,
+                "next_actions": next_actions_for_down(),
             }
             if args.format == "json":
                 emit_json(payload)
             else:
                 print_service_actions_text(payload)
-            return 0
+            return EXIT_OK
 
         if args.command == "restart":
             stop_targets = resolve_services_for_stop(model, requested_services)
@@ -3912,6 +4538,7 @@ def main() -> int:
                 "sync_actions": sync_actions,
                 "bootstrap_tasks": task_results,
                 "start_services": start_results,
+                "next_actions": next_actions_for_up(start_results),
             }
             if args.format == "json":
                 emit_json(payload)
@@ -3920,26 +4547,27 @@ def main() -> int:
                 print_service_actions_text({"services": stop_results})
                 print()
                 print_service_actions_text({"sync_actions": sync_actions, "tasks": task_results, "services": start_results})
-            return 0
+            return EXIT_OK
 
-        logs_payload = {
+        logs_payload: dict[str, Any] = {
             "services": collect_service_logs(
                 model,
                 requested_services,
                 line_count=max(0, int(args.lines)),
-            )
+            ),
+            "next_actions": ["status --format json"],
         }
         if args.format == "json":
             emit_json(logs_payload)
         else:
             print_service_logs_text(logs_payload)
-        return 0
+        return EXIT_OK
     except RuntimeError as exc:
         if args.format == "json":
-            emit_json({"error": str(exc)})
+            emit_json(classify_error(exc, args.command))
         else:
             print(str(exc), file=sys.stderr)
-        return 1
+        return EXIT_ERROR
 
 
 if __name__ == "__main__":

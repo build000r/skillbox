@@ -18,7 +18,9 @@ logs/*
 repos/*
 !repos/.gitkeep
 home/.claude/skills/
+home/.claude/CLAUDE.md
 home/.codex/skills/
+home/.codex/AGENTS.md
 home/.local/
 workspace/default-skills.lock.json
 workspace/clients/*/skills.lock.json
