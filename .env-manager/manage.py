@@ -63,6 +63,7 @@ CONTEXT_CLAUDE_REL = Path("home") / ".claude" / "CLAUDE.md"
 CONTEXT_CODEX_REL = Path("home") / ".codex" / "AGENTS.md"
 CONTEXT_SYMLINK_TARGET = os.path.join("..", ".claude", "CLAUDE.md")
 CLIENT_PROJECTS_REL = Path("builds") / "clients"
+CLIENT_OPEN_ROOT_REL = Path("sand")
 CLIENT_PROJECTION_VERSION = 1
 CLIENT_PROJECT_RUNTIME_MODEL_REL = Path("runtime-model.json")
 CLIENT_PROJECTION_METADATA_REL = Path("projection.json")
@@ -206,6 +207,8 @@ def classify_error(exc: RuntimeError, command: str) -> dict[str, Any]:
         fallback_next = ["doctor --format json", "status --format json"]
     elif command == "client-init":
         fallback_next = ["client-init --list-blueprints --format json"]
+    elif command == "client-open":
+        fallback_next = ["focus --format json", "doctor --format json"]
     elif command in ("down",):
         fallback_next = ["status --format json"]
 
@@ -340,6 +343,13 @@ def next_actions_for_client_diff(client_id: str, target_dir: Path) -> list[str]:
     return [
         f"client-publish {client_id} --target-dir {target_dir} --format json",
         f"client-project {client_id} --format json",
+    ]
+
+
+def next_actions_for_client_open(client_id: str) -> list[str]:
+    return [
+        f"client-diff {client_id} --format json",
+        f"client-publish {client_id} --format json",
     ]
 
 
@@ -685,6 +695,98 @@ def resolve_known_placeholders(value: Any, mapping: dict[str, str]) -> Any:
     return value
 
 
+def split_csv_values(raw_value: Any) -> list[str]:
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, str):
+        return [value.strip() for value in raw_value.split(",") if value.strip()]
+    if isinstance(raw_value, list):
+        values: list[str] = []
+        for item in raw_value:
+            if isinstance(item, str):
+                values.extend(split_csv_values(item))
+                continue
+            text = str(item).strip()
+            if text:
+                values.append(text)
+        return values
+    text = str(raw_value).strip()
+    return [text] if text else []
+
+
+def normalize_client_connector_entries(
+    raw_connectors: Any,
+    *,
+    client_id: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    if raw_connectors is None:
+        return [], []
+    if isinstance(raw_connectors, str):
+        return [{"id": connector_id} for connector_id in split_csv_values(raw_connectors)], []
+    if not isinstance(raw_connectors, list):
+        return [], [f"client {client_id} connectors must be a comma-separated string or a list"]
+
+    entries: list[dict[str, Any]] = []
+    issues: list[str] = []
+    for index, raw_entry in enumerate(raw_connectors, start=1):
+        if isinstance(raw_entry, str):
+            connector_id = raw_entry.strip()
+            if not connector_id:
+                issues.append(f"client {client_id} connectors[{index}] is empty")
+                continue
+            entries.append({"id": connector_id})
+            continue
+        if not isinstance(raw_entry, dict):
+            issues.append(
+                f"client {client_id} connectors[{index}] must be a string or mapping, got {type(raw_entry).__name__}"
+            )
+            continue
+
+        entry = copy.deepcopy(raw_entry)
+        connector_id = str(entry.get("id", "")).strip()
+        if not connector_id:
+            issues.append(f"client {client_id} connectors[{index}] is missing id")
+            continue
+        entry["id"] = connector_id
+
+        capabilities = entry.get("capabilities")
+        if capabilities is not None:
+            if not isinstance(capabilities, list):
+                issues.append(f"client {client_id} connector {connector_id!r} capabilities must be a list")
+            else:
+                entry["capabilities"] = split_csv_values(capabilities)
+
+        scopes = entry.get("scopes")
+        if scopes is not None and not isinstance(scopes, dict):
+            issues.append(f"client {client_id} connector {connector_id!r} scopes must be a mapping")
+
+        entries.append(entry)
+
+    return entries, issues
+
+
+def scaffold_connector_entries(raw_connectors: Any, values: dict[str, str], *, client_id: str) -> list[dict[str, Any]]:
+    entries, issues = normalize_client_connector_entries(raw_connectors, client_id=client_id)
+    if issues:
+        raise RuntimeError("Invalid client connector declaration in blueprint: " + "; ".join(issues))
+
+    slack_capabilities = split_csv_values(values.get("SLACK_CAPABILITIES", ""))
+    slack_channels = split_csv_values(values.get("SLACK_CHANNELS", ""))
+
+    normalized_entries: list[dict[str, Any]] = []
+    for entry in entries:
+        normalized_entry = copy.deepcopy(entry)
+        if normalized_entry["id"] == "slack":
+            if slack_capabilities and "capabilities" not in normalized_entry:
+                normalized_entry["capabilities"] = slack_capabilities
+            if slack_channels:
+                scopes = copy.deepcopy(normalized_entry.get("scopes") or {})
+                scopes["channels"] = slack_channels
+                normalized_entry["scopes"] = scopes
+        normalized_entries.append(normalized_entry)
+    return normalized_entries
+
+
 def list_client_blueprints(root_dir: Path) -> list[dict[str, Any]]:
     blueprint_root = client_blueprint_dir(root_dir)
     if not blueprint_root.is_dir():
@@ -1024,6 +1126,16 @@ def build_blueprinted_client_scaffold_files(
         overlay_client["default_cwd"] = client_default_cwd
     else:
         overlay_client.setdefault("default_cwd", client_default_cwd)
+    if "connectors" in overlay_client:
+        scaffolded_connectors = scaffold_connector_entries(
+            overlay_client.get("connectors"),
+            values,
+            client_id=client_id,
+        )
+        if scaffolded_connectors:
+            overlay_client["connectors"] = scaffolded_connectors
+        else:
+            overlay_client.pop("connectors", None)
 
     overlay_dir = client_config_host_dir(root_dir, env_values, client_id)
     bundle_dir = root_dir / "default-skills" / "clients" / client_id
@@ -1512,6 +1624,18 @@ def resolve_client_projection_output_dir(
             output_dir = output_dir.resolve()
         return output_dir
     return (root_dir / CLIENT_PROJECTS_REL / client_id).resolve()
+
+
+def resolve_client_open_output_dir(
+    root_dir: Path,
+    client_id: str,
+    raw_output_dir: str | None,
+) -> Path:
+    return resolve_optional_host_dir(
+        root_dir,
+        raw_output_dir,
+        default_rel=CLIENT_OPEN_ROOT_REL / client_id,
+    )
 
 
 def runtime_path_to_projection_rel_path(env_values: dict[str, str], raw_path: str) -> Path:
@@ -2635,6 +2759,77 @@ def diff_client_bundle(
             temp_bundle.cleanup()
 
 
+def open_client_surface(
+    root_dir: Path,
+    client_id: str,
+    *,
+    profiles: list[str] | None = None,
+    output_dir_arg: str | None = None,
+) -> tuple[dict[str, Any], int]:
+    cid = validate_client_id(client_id)
+    output_dir = resolve_client_open_output_dir(root_dir, cid, output_dir_arg)
+    project_payload = project_client_bundle(
+        root_dir,
+        cid,
+        profiles=profiles,
+        output_dir_arg=str(output_dir),
+        dry_run=False,
+        force=True,
+    )
+
+    profile_args = [arg for profile in profiles or [] for arg in ("--profile", profile)]
+    focus_args = [
+        "focus",
+        cid,
+        *profile_args,
+        "--context-dir",
+        str(output_dir),
+        "--format",
+        "json",
+    ]
+    focus_code, focus_payload = run_manage_json_command(root_dir, focus_args)
+    if focus_code not in (EXIT_OK, EXIT_DRIFT):
+        error_payload = focus_payload.get("error") or {}
+        message = str(error_payload.get("message") or "").strip() or f"client-open focus failed for {cid}"
+        raise RuntimeError(message)
+
+    model = build_runtime_model(root_dir)
+    filtered_model = filter_model(
+        model,
+        normalize_active_profiles(profiles or []),
+        normalize_active_clients(model, [cid]),
+    )
+    selected_mcp_configs, mcp_servers = selected_mcp_server_configs(root_dir, filtered_model)
+    mcp_config_path = output_dir / MCP_CONFIG_REL
+    mcp_changed = write_json_file(mcp_config_path, {"mcpServers": selected_mcp_configs})
+
+    actions = list(project_payload.get("actions") or [])
+    for step in focus_payload.get("steps") or []:
+        detail = step.get("detail") or {}
+        step_actions = detail.get("actions")
+        if isinstance(step_actions, list):
+            actions.extend(str(item) for item in step_actions if str(item).strip())
+    actions.append(f"{'write-file' if mcp_changed else 'keep-file'}: {repo_rel(root_dir, mcp_config_path)}")
+
+    payload = {
+        "client_id": cid,
+        "output_dir": str(output_dir),
+        "active_profiles": filtered_model.get("active_profiles", []),
+        "active_clients": filtered_model.get("active_clients", []),
+        "payload_tree_sha256": project_payload["payload_tree_sha256"],
+        "file_count": project_payload["file_count"],
+        "mcp_servers": mcp_servers,
+        "focus": {
+            "status": "warn" if focus_code == EXIT_DRIFT else "ok",
+            "step_names": [str(step.get("step")) for step in focus_payload.get("steps") or []],
+            "summary": focus_payload.get("summary") or {},
+        },
+        "actions": actions,
+        "next_actions": next_actions_for_client_open(cid),
+    }
+    return payload, focus_code
+
+
 def extract_bundle_to_target(bundle_path: Path, target_root: Path, skill_name: str) -> str:
     ensure_directory(target_root, dry_run=False)
     install_dir = target_root / skill_name
@@ -3507,6 +3702,66 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
     ]
 
 
+def validate_connector_contract(model: dict[str, Any]) -> list[CheckResult]:
+    superset = split_csv_values((model.get("env") or {}).get("SKILLBOX_FWC_CONNECTORS", ""))
+    superset_set = set(superset)
+    issues: list[str] = []
+    client_contracts: list[dict[str, Any]] = []
+
+    for client in model.get("clients") or []:
+        client_id = str(client.get("id", "")).strip()
+        source = str(client.get("_overlay_path") or "").strip()
+        entries, entry_issues = normalize_client_connector_entries(client.get("connectors"), client_id=client_id)
+        issues.extend(entry_issues)
+        if not entries:
+            continue
+
+        connector_ids = [str(entry.get("id", "")).strip() for entry in entries if str(entry.get("id", "")).strip()]
+        duplicate_ids = find_duplicates(entries, "id")
+        if duplicate_ids:
+            issues.append(f"client {client_id} declares duplicate connectors: {', '.join(duplicate_ids)}")
+
+        widened = sorted(set(connector_ids) - superset_set)
+        if widened:
+            location = f" in {source}" if source else ""
+            issues.append(
+                f"client {client_id}{location} declares connectors outside SKILLBOX_FWC_CONNECTORS: {', '.join(widened)}"
+            )
+
+        client_contracts.append(
+            {
+                "client_id": client_id,
+                "connectors": connector_ids,
+                "overlay_path": source,
+            }
+        )
+
+    if issues:
+        return [
+            CheckResult(
+                status="fail",
+                code="connector-contract",
+                message="client connector declarations violate the box-level connector contract",
+                details={
+                    "issues": issues,
+                    "box_superset": superset,
+                },
+            )
+        ]
+
+    return [
+        CheckResult(
+            status="pass",
+            code="connector-contract",
+            message="client connector declarations stay within the box-level connector superset",
+            details={
+                "box_superset": superset,
+                "clients": client_contracts,
+            },
+        )
+    ]
+
+
 def normalize_file_mode(raw_mode: Any, default: int = 0o600) -> int:
     if raw_mode is None:
         return default
@@ -3860,7 +4115,16 @@ def doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
     results = check_manifest(model)
     if any(result.status == "fail" for result in results):
         return results
-    return results + check_filesystem(model, root_dir) + validate_skill_locks_and_state(model) + validate_task_state(model)
+    connector_results = validate_connector_contract(model)
+    if any(result.status == "fail" for result in connector_results):
+        return results + connector_results
+    return (
+        results
+        + connector_results
+        + check_filesystem(model, root_dir)
+        + validate_skill_locks_and_state(model)
+        + validate_task_state(model)
+    )
 
 
 def sync_artifact(artifact: dict[str, Any], dry_run: bool) -> list[str]:
@@ -6197,6 +6461,58 @@ def load_mcp_server_configs(root_dir: Path) -> dict[str, Any]:
     return servers
 
 
+def absolutize_local_path_argument(root_dir: Path, raw_value: str) -> str:
+    value = str(raw_value or "").strip()
+    if not value or value.startswith("-"):
+        return raw_value
+
+    candidate = Path(value).expanduser()
+    if candidate.is_absolute():
+        return str(candidate.resolve()) if candidate.exists() else raw_value
+
+    if "/" not in value and not value.startswith("."):
+        return raw_value
+
+    resolved = (root_dir / candidate).resolve()
+    if resolved.exists():
+        return str(resolved)
+    return raw_value
+
+
+def translate_mcp_server_config(root_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
+    runtime_env = load_runtime_env(root_dir)
+    translated_env = translated_runtime_env(root_dir, runtime_env)
+    translated = copy.deepcopy(config)
+
+    command = str(translated.get("command") or "").strip()
+    if command:
+        command = translate_runtime_paths(command, runtime_env, translated_env)
+        translated["command"] = absolutize_local_path_argument(root_dir, command)
+
+    translated["args"] = [
+        absolutize_local_path_argument(
+            root_dir,
+            translate_runtime_paths(str(raw_arg), runtime_env, translated_env),
+        )
+        for raw_arg in translated.get("args") or []
+    ]
+    return translated
+
+
+def selected_mcp_server_configs(root_dir: Path, model: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    server_configs = load_mcp_server_configs(root_dir)
+    selected: dict[str, Any] = {}
+    server_names: list[str] = []
+    for request in requested_mcp_servers(model):
+        server_name = str(request["name"])
+        config = server_configs.get(server_name)
+        if not isinstance(config, dict):
+            raise RuntimeError(f"MCP server '{server_name}' is not configured in {MCP_CONFIG_REL}.")
+        selected[server_name] = translate_mcp_server_config(root_dir, config)
+        server_names.append(server_name)
+    return selected, server_names
+
+
 def mcp_server_name_for_service(service: dict[str, Any]) -> str:
     raw_name = str(service.get("mcp_server") or service.get("id") or "").strip()
     if raw_name.endswith("-mcp"):
@@ -7046,6 +7362,22 @@ def main() -> int:
     client_project_parser.add_argument("--format", choices=("text", "json"), default="text")
     add_profile_arg(client_project_parser)
 
+    client_open_parser = subparsers.add_parser(
+        "client-open",
+        help="Project one client into a safe surface with scoped context and MCP config.",
+    )
+    client_open_parser.add_argument(
+        "client_id",
+        help="Existing client slug to open (for example `personal`).",
+    )
+    client_open_parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Open-surface output directory. Defaults to sand/<client-id>.",
+    )
+    client_open_parser.add_argument("--format", choices=("text", "json"), default="text")
+    add_profile_arg(client_open_parser)
+
     client_publish_parser = subparsers.add_parser(
         "client-publish",
         help="Promote a client projection bundle into a git-backed control-plane repo.",
@@ -7318,6 +7650,33 @@ def main() -> int:
             print()
             print("\n".join(payload["actions"]))
         return EXIT_OK
+
+    if args.command == "client-open":
+        try:
+            payload, exit_code = open_client_surface(
+                root_dir=root_dir,
+                client_id=args.client_id,
+                profiles=args.profile,
+                output_dir_arg=args.output_dir,
+            )
+        except RuntimeError as exc:
+            if args.format == "json":
+                emit_json(classify_error(exc, "client-open"))
+            else:
+                print(str(exc), file=sys.stderr)
+            return EXIT_ERROR
+
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            print(f"client: {payload['client_id']}")
+            print(f"output_dir: {payload['output_dir']}")
+            print(f"profiles: {', '.join(payload['active_profiles'])}")
+            print(f"mcp_servers: {', '.join(payload['mcp_servers'])}")
+            print(f"focus: {payload['focus']['status']}")
+            print()
+            print("\n".join(payload["actions"]))
+        return exit_code
 
     if args.command == "client-publish":
         try:
