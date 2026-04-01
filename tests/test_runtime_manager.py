@@ -200,6 +200,58 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(sync.returncode, 0, sync.stderr)
             self.assertTrue((repo / "logs" / "swimmers").is_dir())
 
+    def test_profile_selection_activates_connectors_overlay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            render = self._run(repo, "render", "--profile", "connectors", "--format", "json")
+
+            self.assertEqual(render.returncode, 0, render.stderr)
+            payload = json.loads(render.stdout)
+            self.assertEqual(payload["active_profiles"], ["connectors", "core"])
+            self.assertEqual(
+                {item["id"] for item in payload["repos"]},
+                {"skillbox-self", "managed-repos", "flywheel-connectors"},
+            )
+            self.assertEqual(
+                {item["id"] for item in payload["artifacts"]},
+                {"swimmers-bin", "fwc-bin", "dcg-bin"},
+            )
+            self.assertEqual(
+                {item["id"] for item in payload["services"]},
+                {"internal-env-manager", "fwc-mcp", "dcg-mcp"},
+            )
+            self.assertEqual(
+                {item["id"] for item in payload["logs"]},
+                {"runtime", "repos", "connectors"},
+            )
+            self.assertEqual(
+                {item["id"] for item in payload["checks"]},
+                {
+                    "workspace-root",
+                    "repos-root",
+                    "skills-root",
+                    "log-root",
+                    "monoserver-root",
+                    "runtime-manager",
+                    "fwc-binary",
+                    "dcg-binary",
+                },
+            )
+
+            sync = self._run(repo, "sync", "--profile", "connectors", "--format", "json")
+            self.assertEqual(sync.returncode, 0, sync.stderr)
+            self.assertTrue((repo / "logs" / "connectors").is_dir())
+            self.assertTrue((repo / "home" / ".local" / "bin" / "fwc").is_file())
+            self.assertTrue((repo / "home" / ".local" / "bin" / "dcg").is_file())
+
+            doctor = self._run(repo, "doctor", "--profile", "connectors", "--format", "json")
+            self.assertEqual(doctor.returncode, 0, doctor.stderr)
+            doctor_payload = json.loads(doctor.stdout)
+            manifest_check = next(item for item in doctor_payload["checks"] if item["code"] == "runtime-manifest")
+            self.assertEqual(manifest_check["status"], "pass")
+
     def test_up_and_down_manage_selected_service_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -1450,6 +1502,119 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(MANAGE_MODULE.directory_file_entries(sibling_current), sibling_entries)
             self.assertEqual(sibling_publish.read_text(encoding="utf-8"), sibling_publish_text)
 
+    def test_client_diff_reports_full_addition_when_target_has_no_current_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._init_git_repo(repo)
+            self._create_git_source_repo(repo, "control-plane")
+
+            result = self._run(
+                repo,
+                "client-diff",
+                "personal",
+                "--target-dir",
+                "./fixtures/control-plane",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["changed"])
+            self.assertFalse(payload["current"]["present"])
+            self.assertEqual(payload["summary"]["removed"], 0)
+            self.assertEqual(payload["summary"]["changed"], 0)
+            self.assertEqual(payload["summary"]["added"], payload["candidate"]["file_count"])
+            self.assertFalse(payload["publish_metadata"]["matches_candidate"])
+            self.assertIn("services", payload["runtime_changes"]["changed_sections"])
+            self.assertIn("internal-env-manager", payload["runtime_changes"]["sections"]["services"]["added"])
+
+    def test_client_diff_is_noop_against_matching_publish_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._init_git_repo(repo)
+            self._create_git_source_repo(repo, "control-plane")
+
+            publish = self._run(
+                repo,
+                "client-publish",
+                "personal",
+                "--target-dir",
+                "./fixtures/control-plane",
+                "--format",
+                "json",
+            )
+            self.assertEqual(publish.returncode, 0, publish.stderr)
+
+            result = self._run(
+                repo,
+                "client-diff",
+                "personal",
+                "--target-dir",
+                "./fixtures/control-plane",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertFalse(payload["changed"])
+            self.assertTrue(payload["current"]["present"])
+            self.assertEqual(payload["summary"]["added"], 0)
+            self.assertEqual(payload["summary"]["removed"], 0)
+            self.assertEqual(payload["summary"]["changed"], 0)
+            self.assertTrue(payload["publish_metadata"]["matches_candidate"])
+            self.assertEqual(payload["runtime_changes"]["changed_sections"], [])
+
+    def test_client_diff_reports_runtime_surface_changes_against_existing_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._init_git_repo(repo)
+            self._create_git_source_repo(repo, "control-plane")
+
+            publish = self._run(
+                repo,
+                "client-publish",
+                "personal",
+                "--target-dir",
+                "./fixtures/control-plane",
+                "--format",
+                "json",
+            )
+            self.assertEqual(publish.returncode, 0, publish.stderr)
+
+            result = self._run(
+                repo,
+                "client-diff",
+                "personal",
+                "--target-dir",
+                "./fixtures/control-plane",
+                "--profile",
+                "surfaces",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["changed"])
+            self.assertEqual(payload["projection_changes"]["active_profiles"]["added"], ["surfaces"])
+            self.assertIn("services", payload["runtime_changes"]["changed_sections"])
+            self.assertEqual(
+                payload["runtime_changes"]["sections"]["services"]["added"],
+                ["api-stub", "web-stub"],
+            )
+            self.assertEqual(
+                payload["runtime_changes"]["sections"]["logs"]["added"],
+                ["api", "web"],
+            )
+            changed_paths = {item["path"] for item in payload["files"]["changed"]}
+            self.assertIn("projection.json", changed_paths)
+            self.assertIn("runtime-model.json", changed_paths)
+
     def test_context_generates_claude_md_and_agents_md_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -2075,9 +2240,22 @@ class RuntimeManagerTests(unittest.TestCase):
             "SKILLBOX_SWIMMERS_INSTALL_DIR=/home/sandbox/.local/bin\n"
             "SKILLBOX_SWIMMERS_BIN=/home/sandbox/.local/bin/swimmers\n"
             "SKILLBOX_SWIMMERS_DOWNLOAD_URL=\n"
+            "SKILLBOX_SWIMMERS_DOWNLOAD_SHA256=\n"
             "SKILLBOX_SWIMMERS_AUTH_MODE=\n"
             "SKILLBOX_SWIMMERS_AUTH_TOKEN=\n"
-            "SKILLBOX_SWIMMERS_OBSERVER_TOKEN=\n",
+            "SKILLBOX_SWIMMERS_OBSERVER_TOKEN=\n"
+            "SKILLBOX_DCG_BIN=/home/sandbox/.local/bin/dcg\n"
+            "SKILLBOX_DCG_DOWNLOAD_URL=\n"
+            "SKILLBOX_DCG_DOWNLOAD_SHA256=\n"
+            "SKILLBOX_DCG_PACKS=core.git,core.filesystem\n"
+            "SKILLBOX_DCG_MCP_PORT=3220\n"
+            "SKILLBOX_FWC_BIN=/home/sandbox/.local/bin/fwc\n"
+            "SKILLBOX_FWC_DOWNLOAD_URL=\n"
+            "SKILLBOX_FWC_DOWNLOAD_SHA256=\n"
+            "SKILLBOX_FWC_MCP_PORT=3221\n"
+            "SKILLBOX_FWC_ZONE=work\n"
+            "SKILLBOX_FWC_CONNECTORS=github,slack\n"
+            "SKILLBOX_PULSE_INTERVAL=30\n",
             encoding="utf-8",
         )
 
@@ -2238,11 +2416,75 @@ class RuntimeManagerTests(unittest.TestCase):
             "      path: ${SKILLBOX_WORKSPACE_ROOT}/.env-manager/manage.py\n"
             "      required: true\n"
             "      profiles:\n"
-            "        - core\n",
+            "        - core\n"
+            "connectors:\n"
+            "  repos:\n"
+            "    - id: flywheel-connectors\n"
+            "      kind: repo\n"
+            "      path: ${SKILLBOX_REPOS_ROOT}/flywheel_connectors\n"
+            "      required: false\n"
+            "      source:\n"
+            "        kind: directory\n"
+            "      sync:\n"
+            "        mode: ensure-directory\n"
+            "  artifacts:\n"
+            "    - id: fwc-bin\n"
+            "      kind: binary\n"
+            "      path: ${SKILLBOX_FWC_BIN}\n"
+            "      required: false\n"
+            "      source:\n"
+            "        kind: file\n"
+            "        path: ./artifacts/fwc.bin\n"
+            "        executable: true\n"
+            "      sync:\n"
+            "        mode: copy-if-missing\n"
+            "    - id: dcg-bin\n"
+            "      kind: binary\n"
+            "      path: ${SKILLBOX_DCG_BIN}\n"
+            "      required: false\n"
+            "      source:\n"
+            "        kind: file\n"
+            "        path: ./artifacts/dcg.bin\n"
+            "        executable: true\n"
+            "      sync:\n"
+            "        mode: copy-if-missing\n"
+            "  services:\n"
+            "    - id: fwc-mcp\n"
+            "      kind: mcp\n"
+            "      artifact: fwc-bin\n"
+            "      required: false\n"
+            "      command: ${SKILLBOX_FWC_BIN} serve-mcp --zone ${SKILLBOX_FWC_ZONE} --connectors ${SKILLBOX_FWC_CONNECTORS}\n"
+            "      healthcheck:\n"
+            "        type: process_running\n"
+            "        pattern: fwc serve-mcp\n"
+            "      log: connectors\n"
+            "    - id: dcg-mcp\n"
+            "      kind: mcp\n"
+            "      artifact: dcg-bin\n"
+            "      required: false\n"
+            "      command: ${SKILLBOX_DCG_BIN} mcp\n"
+            "      healthcheck:\n"
+            "        type: process_running\n"
+            "        pattern: dcg mcp\n"
+            "      log: connectors\n"
+            "  logs:\n"
+            "    - id: connectors\n"
+            "      path: ${SKILLBOX_LOG_ROOT}/connectors\n"
+            "  checks:\n"
+            "    - id: fwc-binary\n"
+            "      type: path_exists\n"
+            "      path: ${SKILLBOX_FWC_BIN}\n"
+            "      required: false\n"
+            "    - id: dcg-binary\n"
+            "      type: path_exists\n"
+            "      path: ${SKILLBOX_DCG_BIN}\n"
+            "      required: false\n",
             encoding="utf-8",
         )
         (repo / "artifacts").mkdir(parents=True, exist_ok=True)
         (repo / "artifacts" / "swimmers.bin").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (repo / "artifacts" / "fwc.bin").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (repo / "artifacts" / "dcg.bin").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
 
         (repo / "workspace" / "default-skills.manifest").write_text("sample-skill\n", encoding="utf-8")
         (repo / "workspace" / "default-skills.sources.yaml").write_text(
@@ -2307,7 +2549,133 @@ class RuntimeManagerTests(unittest.TestCase):
         (repo / "home" / ".codex").mkdir(parents=True, exist_ok=True)
         (repo / "monoserver-host").mkdir(parents=True, exist_ok=True)
         (repo / ".env-manager").mkdir(parents=True, exist_ok=True)
-        (repo / ".env-manager" / "manage.py").write_text("# stub\n", encoding="utf-8")
+        (repo / ".env-manager" / "manage.py").write_text(
+            "#!/usr/bin/env python3\n"
+            "from __future__ import annotations\n"
+            "\n"
+            "import subprocess\n"
+            "import sys\n"
+            "from pathlib import Path\n"
+            "\n"
+            f"REAL_MANAGE = {str(MANAGER)!r}\n"
+            "ROOT_DIR = Path(__file__).resolve().parent.parent\n"
+            "cmd = [sys.executable, REAL_MANAGE, '--root-dir', str(ROOT_DIR), *sys.argv[1:]]\n"
+            "raise SystemExit(subprocess.run(cmd, check=False).returncode)\n",
+            encoding="utf-8",
+        )
+        (repo / ".env-manager" / "mcp_server.py").write_text(
+            (ROOT_DIR / ".env-manager" / "mcp_server.py").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        (repo / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "skillbox": {
+                            "command": "python3",
+                            "args": ["./.env-manager/mcp_server.py"],
+                        },
+                        "fwc": {
+                            "command": str((repo / ".mcp-bin" / "fwc").resolve()),
+                            "args": ["serve-mcp", "--zone", "work"],
+                        },
+                        "dcg": {
+                            "command": str((repo / ".mcp-bin" / "dcg").resolve()),
+                            "args": ["mcp"],
+                        },
+                    },
+                },
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+
+    def _write_connector_focus_artifacts(self, repo: Path) -> None:
+        for name in ("fwc.bin", "dcg.bin"):
+            (repo / "artifacts" / name).write_text(
+                "#!/bin/sh\n"
+                "trap 'exit 0' TERM INT\n"
+                "while true; do\n"
+                "  sleep 1\n"
+                "done\n",
+                encoding="utf-8",
+            )
+
+    def _fixture_mcp_stub_path(self, repo: Path, name: str) -> Path:
+        return repo / ".mcp-bin" / name
+
+    def _install_absolute_mcp_stub(
+        self,
+        path: Path,
+        *,
+        tool_names: list[str],
+        exit_before_tools: bool = False,
+    ) -> None:
+        original_bytes = path.read_bytes() if path.exists() else None
+        original_mode = path.stat().st_mode if path.exists() else None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "#!/usr/bin/env python3\n"
+            "from __future__ import annotations\n"
+            "\n"
+            "import json\n"
+            "import sys\n"
+            "\n"
+            f"TOOL_NAMES = {tool_names!r}\n"
+            f"EXIT_BEFORE_TOOLS = {exit_before_tools!r}\n"
+            "\n"
+            "for raw in sys.stdin:\n"
+            "    raw = raw.strip()\n"
+            "    if not raw:\n"
+            "        continue\n"
+            "    message = json.loads(raw)\n"
+            "    method = message.get('method')\n"
+            "    if method == 'initialize':\n"
+            "        response = {\n"
+            "            'jsonrpc': '2.0',\n"
+            "            'id': message.get('id'),\n"
+            "            'result': {\n"
+            "                'protocolVersion': '2024-11-05',\n"
+            "                'capabilities': {'tools': {'listChanged': False}},\n"
+            "                'serverInfo': {'name': 'fixture', 'version': '1.0.0'},\n"
+            "            },\n"
+            "        }\n"
+            "        sys.stdout.write(json.dumps(response) + '\\n')\n"
+            "        sys.stdout.flush()\n"
+            "        if EXIT_BEFORE_TOOLS:\n"
+            "            raise SystemExit(0)\n"
+            "    elif method == 'tools/list':\n"
+            "        response = {\n"
+            "            'jsonrpc': '2.0',\n"
+            "            'id': message.get('id'),\n"
+            "            'result': {\n"
+            "                'tools': [\n"
+            "                    {'name': name, 'description': name, 'inputSchema': {'type': 'object'}}\n"
+            "                    for name in TOOL_NAMES\n"
+            "                ]\n"
+            "            },\n"
+            "        }\n"
+            "        sys.stdout.write(json.dumps(response) + '\\n')\n"
+            "        sys.stdout.flush()\n"
+            "    elif message.get('id') is not None:\n"
+            "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': {}}) + '\\n')\n"
+            "        sys.stdout.flush()\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+
+        def _restore() -> None:
+            if original_bytes is None:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                return
+            path.write_bytes(original_bytes)
+            if original_mode is not None:
+                path.chmod(original_mode)
+
+        self.addCleanup(_restore)
 
     def _create_git_source_repo(self, repo: Path, name: str) -> Path:
         source_repo = repo / "fixtures" / name
@@ -2551,6 +2919,10 @@ class RuntimeManagerTests(unittest.TestCase):
             # Steps should all be ok or skip
             for s in payload["steps"]:
                 self.assertIn(s["status"], ("ok", "skip"), f"step {s['step']} failed")
+            self.assertEqual(
+                [step["step"] for step in payload["steps"]],
+                ["compose-override", "sync", "bootstrap", "up", "collect", "skill-context", "context", "persist"],
+            )
 
             # Live state should have repos, services, checks, logs
             live = payload["live_state"]
@@ -2578,6 +2950,7 @@ class RuntimeManagerTests(unittest.TestCase):
             focus_data = json.loads(focus_path.read_text(encoding="utf-8"))
             self.assertEqual(focus_data["client_id"], "personal")
             self.assertEqual(focus_data["version"], 1)
+            self.assertEqual(focus_data["active_profiles"], ["core"])
 
     def test_focus_resume_reuses_previous_client(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2739,6 +3112,104 @@ class RuntimeManagerTests(unittest.TestCase):
             # Check that Attention section was generated
             claude_md = (repo / "home" / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
             self.assertIn("RECENT ERRORS", claude_md)
+
+    def test_focus_supports_profiles_and_persists_active_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._write_connector_focus_artifacts(repo)
+            self.addCleanup(self._run, repo, "down", "--profile", "connectors", "--format", "json")
+
+            result = self._run(repo, "focus", "personal", "--profile", "connectors", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            focus_state = json.loads((repo / "workspace" / ".focus.json").read_text(encoding="utf-8"))
+            self.assertEqual(focus_state["client_id"], "personal")
+            self.assertEqual(focus_state["active_profiles"], ["connectors", "core"])
+            self.assertEqual(
+                {service["id"] for service in payload["live_state"]["services"]},
+                {"internal-env-manager", "fwc-mcp", "dcg-mcp"},
+            )
+
+    def test_acceptance_succeeds_for_onboarded_core_client(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(repo, "acceptance", "personal", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ready"])
+            self.assertEqual(
+                [step["step"] for step in payload["steps"]],
+                ["doctor-pre", "sync", "focus", "mcp-smoke", "doctor-post"],
+            )
+            self.assertEqual(payload["active_profiles"], ["core"])
+            tool_names = payload["steps"][3]["detail"]["servers"]["skillbox"]["tool_names"]
+            self.assertIn("skillbox_status", tool_names)
+            self.assertIn("skillbox_focus", tool_names)
+
+    def test_acceptance_succeeds_only_when_connector_mcp_surfaces_are_live(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._write_connector_focus_artifacts(repo)
+            self._install_absolute_mcp_stub(self._fixture_mcp_stub_path(repo, "fwc"), tool_names=["fwc_ping"])
+            self._install_absolute_mcp_stub(self._fixture_mcp_stub_path(repo, "dcg"), tool_names=["dcg_ping"])
+            self.addCleanup(self._run, repo, "down", "--profile", "connectors", "--format", "json")
+
+            result = self._run(repo, "acceptance", "personal", "--profile", "connectors", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ready"])
+            self.assertEqual(payload["active_profiles"], ["connectors", "core"])
+            self.assertEqual(payload["steps"][3]["detail"]["servers_ok"], ["skillbox", "fwc", "dcg"])
+            self.assertEqual(
+                set(payload["steps"][2]["detail"]["services"]),
+                {"internal-env-manager", "fwc-mcp", "dcg-mcp"},
+            )
+
+    def test_acceptance_fails_before_mutation_when_client_is_not_onboarded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(repo, "acceptance", "missing-client", "--format", "json")
+
+            self.assertEqual(result.returncode, 1, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertFalse(payload["ready"])
+            self.assertEqual(payload["error"]["type"], "client_not_onboarded")
+            self.assertIn("onboard missing-client", payload["error"]["message"])
+            self.assertFalse((repo / "workspace" / ".focus.json").exists())
+
+    def test_acceptance_fails_when_mcp_smoke_fails_after_focus(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._write_connector_focus_artifacts(repo)
+            self._install_absolute_mcp_stub(
+                self._fixture_mcp_stub_path(repo, "fwc"),
+                tool_names=["fwc_ping"],
+                exit_before_tools=True,
+            )
+            self._install_absolute_mcp_stub(self._fixture_mcp_stub_path(repo, "dcg"), tool_names=["dcg_ping"])
+            self.addCleanup(self._run, repo, "down", "--profile", "connectors", "--format", "json")
+
+            result = self._run(repo, "acceptance", "personal", "--profile", "connectors", "--format", "json")
+
+            self.assertEqual(result.returncode, 1, result.stderr)
+            payload = json.loads(result.stdout)
+            steps = {step["step"]: step for step in payload["steps"]}
+            self.assertEqual(steps["focus"]["status"], "ok")
+            self.assertEqual(steps["mcp-smoke"]["status"], "fail")
+            self.assertFalse(payload["ready"])
+            self.assertEqual(payload["error"]["type"], "mcp_smoke_failed")
+            self.assertIn("sync --profile connectors --format json", payload["next_actions"])
+            self.assertIn("logs --service fwc-mcp --format json", payload["next_actions"])
 
     def test_doctor_fails_when_url_artifact_lacks_sha256(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

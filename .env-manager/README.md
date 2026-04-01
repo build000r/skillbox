@@ -21,6 +21,8 @@ python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo --se
 python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo-http-service --set PRIMARY_REPO_URL=https://github.com/acme/app.git --set SERVICE_COMMAND='pnpm dev'
 python3 .env-manager/manage.py client-project personal
 python3 .env-manager/manage.py client-project personal --profile surfaces --output-dir ./builds/clients/personal-surfaces
+python3 .env-manager/manage.py client-diff personal --target-dir ../skillbox-config-control --profile surfaces
+python3 .env-manager/manage.py client-publish personal --target-dir ../skillbox-config-control --commit --profile surfaces
 python3 .env-manager/manage.py sync --client personal
 python3 .env-manager/manage.py render --client personal --profile surfaces
 python3 .env-manager/manage.py status --profile swimmers
@@ -48,6 +50,11 @@ The mental model is:
   `builds/clients/<client>/` with a single-client `workspace/runtime.yaml`,
   only that client's overlay/skill files, and a sanitized `runtime-model.json`
   plus `projection.json`
+- `client-diff <client> --target-dir <repo>` is the review step before
+  promotion, showing file-level and runtime-surface deltas against the current
+  published payload
+- `client-publish <client> --target-dir <repo>` promotes the reviewed bundle
+  into `clients/<client>/current/` plus `publish.json`
 
 Client overlays usually point at repo roots under `/monoserver`, which is the
 host parent directory mounted into the workspace container.

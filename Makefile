@@ -14,12 +14,13 @@ LINES_ARGS := $(if $(strip $(LINES)),--lines $(LINES),)
 BLUEPRINT_ARGS := $(if $(strip $(BLUEPRINT)),--blueprint $(BLUEPRINT),)
 SET_ARGS := $(foreach s,$(SET),--set $(s))
 
-.PHONY: help bootstrap-env render doctor runtime-render runtime-sync runtime-status runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard context ack dev-sanity build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles
+.PHONY: help bootstrap-env render doctor acceptance runtime-render runtime-sync runtime-status runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard context ack dev-sanity python-cov-xml build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles
 
 help:
 	@printf "  make bootstrap-env  Copy .env.example to .env if missing\n"
 	@printf "  make render         Print the resolved sandbox model\n"
 	@printf "  make doctor         Validate manifest/runtime drift\n"
+	@printf "  make acceptance     Run first-box acceptance for CLIENT=id (optional PROFILE=name)\n"
 	@printf "  make runtime-render Print the resolved internal runtime graph (optional CLIENT=name PROFILE=name)\n"
 	@printf "  make runtime-sync   Create managed repo/log dirs and install default skills (optional CLIENT=name PROFILE=name)\n"
 	@printf "  make runtime-status Summarize repo/skill/service/log state (optional CLIENT=name PROFILE=name)\n"
@@ -64,6 +65,9 @@ render:
 doctor:
 	@python3 scripts/04-reconcile.py doctor
 
+acceptance:
+	@python3 .env-manager/manage.py acceptance $(CLIENT) $(PROFILE_ARGS) --format json
+
 runtime-render:
 	@python3 .env-manager/manage.py render $(CLIENT_ARGS) $(PROFILE_ARGS)
 
@@ -99,6 +103,12 @@ ack:
 
 dev-sanity:
 	@python3 .env-manager/manage.py doctor $(CLIENT_ARGS) $(PROFILE_ARGS)
+
+python-cov-xml:
+	@python3 -m coverage erase
+	@python3 -m coverage run --source=scripts,.env-manager -m unittest discover -s tests
+	@python3 -m coverage xml -o coverage.xml
+	@python3 -m coverage report -m --skip-covered
 
 pulse-start:
 	@python3 .env-manager/pulse.py run &

@@ -58,6 +58,7 @@ render  [--format json] [--client <id>]                # Full resolved runtime g
 status  [--format json] [--client <id>]                # Current runtime state
 doctor  [--format json] [--client <id>]                # Health validation
 logs    [--service <id>] [--lines N] [--client <id>]   # Service log tail (default: 40 lines)
+client-diff <id> --target-dir <repo> [--profile <id>]  # Review candidate bundle vs current published payload
 ```
 
 ### Mutate (use --dry-run first, confirm with user)
@@ -82,6 +83,14 @@ onboard <id> [--blueprint <name>] [--set KEY=VALUE ...] [--dry-run] [--format js
 ```bash
 client-init --list-blueprints [--format json]                                  # List blueprints
 client-init <id> --blueprint <name> --set KEY=VALUE [--set ...] [--dry-run]    # Scaffold client
+```
+
+### Promotion review
+
+```bash
+client-project <id> [--profile <id>] [--format json]                           # Build a single-client projection bundle
+client-diff <id> --target-dir <repo> [--profile <id>] [--format json]          # Compare candidate bundle vs published payload
+client-publish <id> --target-dir <repo> [--commit] [--profile <id>]            # Promote the reviewed bundle
 ```
 
 ## Structured JSON Output

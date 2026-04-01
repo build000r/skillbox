@@ -51,6 +51,7 @@ MANIFEST_ENV_KEYS = RUNTIME_ENV_KEYS + [
 ]
 
 PLACEHOLDER_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
+RESERVED_TOP_LEVEL_RUNTIME_KEYS = {"version", "selection", "core", "clients"}
 
 
 def runtime_manifest_path(root_dir: Path) -> Path:
@@ -286,6 +287,17 @@ def _normalize_client_repo_roots(raw_items: Any, client_id: str, section: str) -
     return repo_roots
 
 
+def _normalize_profile_items(raw_items: Any, profile_id: str, section: str) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in _normalized_items(raw_items, section):
+        profiled_item = dict(item)
+        profiles = [str(value).strip() for value in profiled_item.get("profiles") or [] if str(value).strip()]
+        if not profiles:
+            profiled_item["profiles"] = [profile_id]
+        normalized.append(profiled_item)
+    return normalized
+
+
 def load_client_overlays(root_dir: Path, env_values: dict[str, str]) -> list[dict[str, Any]]:
     overlays: list[dict[str, Any]] = []
     for path in client_overlay_paths(root_dir, env_values):
@@ -316,6 +328,27 @@ def _normalize_runtime_sections(
     services = _normalized_items(core.get("services"), "core.services" if scoped_runtime else "services")
     logs = _normalized_items(core.get("logs"), "core.logs" if scoped_runtime else "logs")
     checks = _normalized_items(core.get("checks"), "core.checks" if scoped_runtime else "checks")
+
+    if scoped_runtime:
+        for profile_id, raw_profile in resolved.items():
+            if profile_id in RESERVED_TOP_LEVEL_RUNTIME_KEYS:
+                continue
+            profile = _normalized_mapping(raw_profile, profile_id)
+            repos.extend(_normalize_profile_items(profile.get("repos"), profile_id, f"{profile_id}.repos"))
+            artifacts.extend(
+                _normalize_profile_items(profile.get("artifacts"), profile_id, f"{profile_id}.artifacts")
+            )
+            env_files.extend(
+                _normalize_profile_items(profile.get("env_files"), profile_id, f"{profile_id}.env_files")
+            )
+            skills.extend(_normalize_profile_items(profile.get("skills"), profile_id, f"{profile_id}.skills"))
+            tasks.extend(_normalize_profile_items(profile.get("tasks"), profile_id, f"{profile_id}.tasks"))
+            services.extend(
+                _normalize_profile_items(profile.get("services"), profile_id, f"{profile_id}.services")
+            )
+            logs.extend(_normalize_profile_items(profile.get("logs"), profile_id, f"{profile_id}.logs"))
+            checks.extend(_normalize_profile_items(profile.get("checks"), profile_id, f"{profile_id}.checks"))
+
     raw_clients = _normalized_items(resolved.get("clients"), "clients") if scoped_runtime else []
     raw_clients.extend(_normalized_items(overlay_clients, "client overlays"))
     clients_meta: list[dict[str, Any]] = []

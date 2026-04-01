@@ -2,7 +2,9 @@
 
 # skillbox
 
-**A thin, self-hosted Tailnet monoserver for AI-assisted coding, with client-scoped overlays.**
+**A private, single-tenant Tailnet box for you and your coding agents.**
+
+Thin, self-hosted, Docker-based, with durable agent homes and client-scoped overlays.
 
 ![runtime](https://img.shields.io/badge/runtime-Docker-2496ED?style=flat-square&logo=docker&logoColor=white)
 ![access](https://img.shields.io/badge/access-Tailscale-242424?style=flat-square&logo=tailscale&logoColor=white)
@@ -64,6 +66,23 @@ right client context without standing up a full hosted workspace control plane.
 | Reproducible default skills | `03-skill-sync.sh` packages from a pinned manifest and vendored local packager |
 | Confidence that docs/config/runtime still match | `04-reconcile.py` powers `make render` and `make doctor`, while `make dev-sanity` validates the box internals |
 | Minimal surface area | No multi-tenant control plane, no hosted dependency, no hidden sibling repo requirement for packaging |
+
+## Why `skillbox` Exists
+
+Most comparable tools land in one of three buckets:
+
+- heavy remote-dev platforms with control-plane overhead
+- thin environment tools that still leave durable workspace state to you
+- agent sandboxes optimized for secure ephemeral execution rather than a durable personal box
+
+`skillbox` is deliberately aimed at the narrower gap between those buckets: one
+private machine that feels like a real computer for one operator and their
+agents, with persistent homes, repo overlays, explicit runtime state, and low
+operational ceremony.
+
+For the deeper thesis, see [docs/VISION.md](docs/VISION.md): mission, vision,
+values, competitive fit, non-goals, and the market map that explains why
+`skillbox` intentionally stops short of Coder, Gitpod, Daytona, and E2B.
 
 ## Quick Example
 
@@ -316,33 +335,49 @@ unless:
 
 This prevents accidental infrastructure destruction with uncommitted work.
 
-## Design Philosophy
+## Design Stance
 
-### 1. Thin beats magical
+### 1. Single-tenant first
 
-This repo intentionally stops well short of Coder or Daytona. It focuses on one operator-controlled box and a small set of explicit scripts.
+`skillbox` is for one operator-controlled machine, not a shared workspace
+platform. That constraint keeps the shape legible and the operating model sane.
 
-### 2. Host SSH, container work
+### 2. Durable state beats ephemeral sandboxes
 
-SSH lands on the host. Docker Compose runs the workspace and optional surfaces. The container is where your day-to-day work should feel familiar.
+The box should remember your repos, agent homes, overlays, logs, and recent
+runtime history. The goal is a machine that carries context forward, not an
+execution substrate you keep rebuilding from scratch.
 
-### 3. Declarative enough to check, not so abstract it disappears
+### 3. Host SSH, container work
 
-`workspace/sandbox.yaml`, `workspace/dependencies.yaml`, `workspace/runtime.yaml`, and the skill manifests describe the intended box. `make doctor` checks the outer shell, and `make dev-sanity` checks the interior graph plus managed artifact and skill install state.
+SSH lands on the host. Docker Compose runs the workspace and optional surfaces.
+The container is where your day-to-day work should feel familiar.
 
-### 4. Portable skill packaging matters
+### 4. Explicit runtime graphs beat hidden control planes
 
-The default skill packaging chain is vendored locally. A fresh clone does not need a sibling `../opensource` checkout just to package default skills.
+`workspace/sandbox.yaml`, `workspace/dependencies.yaml`,
+`workspace/runtime.yaml`, and the skill manifests describe the intended box.
+`make doctor` checks the outer shell, and `make dev-sanity` checks the interior
+graph plus managed artifact and skill install state.
 
-### 5. Local-first operator ergonomics
+### 5. Portable skill packaging matters
 
-The repo includes enough surfaces to inspect and validate the shape, but not so much that it becomes a platform you have to operate before you can work.
+The default skill packaging chain is vendored locally. A fresh clone does not
+need a sibling `../opensource` checkout just to package default skills.
 
-### 6. The box should describe its internals, not just its container
+### 6. Local-first operator ergonomics
 
-The new internal `.env-manager` layer is intentionally small. It does not try to become a second platform; it gives the box one declared source of truth for repos, artifacts, installed skills, services, logs, and sanity checks so the workspace can accrete without turning into guesswork.
+The repo includes enough surfaces to inspect and validate the shape, but not so
+much that it becomes a platform you have to operate before you can work.
 
-### 7. Continuous observation, not just point-in-time checks
+### 7. The box should describe its internals, not just its container
+
+The internal `.env-manager` layer is intentionally small. It does not try to
+become a second platform; it gives the box one declared source of truth for
+repos, artifacts, installed skills, services, logs, and sanity checks so the
+workspace can accrete without turning into guesswork.
+
+### 8. Continuous observation beats point-in-time checks
 
 The pulse daemon and event journal give the box a memory. Instead of only
 checking state when you ask, the box continuously monitors itself and records
@@ -351,12 +386,27 @@ re-deriving it from scratch.
 
 ## Comparison
 
-| Option | Best for | Tradeoff |
-|---|---|---|
-| `skillbox` | One private dev box with curated repos and skills | You operate the host and Docker yourself |
-| Raw droplet + ad hoc shell setup | Fastest one-off experiments | Hard to reproduce, harder to hand off |
-| Coder | Multi-user remote dev environments | Heavier platform and control-plane overhead |
-| Daytona | Managed workspace orchestration | More moving parts than a single private box needs |
+| Option | Best for | What it gets right | Why `skillbox` still exists |
+|---|---|---|---|
+| `skillbox` | One private agent-friendly box with durable repos, homes, and overlays | Low ceremony, explicit runtime state, Tailscale-first access | You still operate the host and Docker yourself |
+| Raw droplet + ad hoc shell setup | One-off experiments | Fastest path to "something works" | Hard to reproduce, drift-prone, weak handoff story |
+| Devbox / DevPod | Reproducible environments or thin BYO-remote workflows | Better environment packaging and remote IDE integration | Not the same thing as one durable private box with agent context and client overlays |
+| Coder / Gitpod | Multi-user remote dev platforms | Stronger policy, team workflows, browser and IDE integrations | More platform and control-plane overhead than a single operator usually needs |
+| Daytona / E2B | Secure agent runtimes and sandbox orchestration | Better isolation and ephemeral execution controls | Solves a different layer than "my durable private machine" |
+
+**Use `skillbox` when:**
+
+- you want one private machine for you and your agents
+- durable state matters more than sandbox churn
+- SSH and Tailscale are a feature, not a compromise
+- you want explicit runtime declarations instead of a hosted control plane
+
+**Use something else when:**
+
+- you need a browser IDE product
+- you need multi-user tenancy, policy layers, or hosted control planes
+- you need untrusted-code sandboxing as the primary job
+- you only need an environment manager, not a whole box model
 
 ## Installation
 
@@ -528,6 +578,7 @@ make runtime-sync
 | `.env-manager/manage.py logs` | Print recent log output for declared services | `python3 .env-manager/manage.py logs --profile surfaces --service api-stub --lines 80` |
 | `.env-manager/manage.py client-init` | Scaffold a new client overlay, optionally applying a reusable blueprint for repos and services | `python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo --set PRIMARY_REPO_URL=https://github.com/acme/app.git` |
 | `.env-manager/manage.py client-project` | Compile a single-client projection bundle with a client-safe runtime manifest and sanitized metadata | `python3 .env-manager/manage.py client-project personal --profile surfaces` |
+| `.env-manager/manage.py client-diff` | Compare a client projection bundle against the current published payload and show both file-level and runtime-surface changes | `python3 .env-manager/manage.py client-diff personal --target-dir ../skillbox-config-control --profile surfaces` |
 | `.env-manager/manage.py client-publish` | Promote a client projection bundle into a private git-backed control-plane repo under `clients/<client>/current/` | `python3 .env-manager/manage.py client-publish personal --target-dir ../skillbox-config-control --commit` |
 | `.env-manager/pulse.py` | Pulse reconciliation daemon for continuous drift detection and auto-heal | `python3 .env-manager/pulse.py run --interval 30` |
 
@@ -639,8 +690,30 @@ without exposing the full operator repo.
 
 ### Publishing a client bundle
 
-`client-publish` turns that handoff bundle into the latest client-facing
-artifact in a private git repo:
+The intended promotion loop is:
+
+```bash
+python3 .env-manager/manage.py client-project personal --profile surfaces
+python3 .env-manager/manage.py client-diff personal \
+  --target-dir ../skillbox-config-control \
+  --profile surfaces
+python3 .env-manager/manage.py client-publish personal \
+  --target-dir ../skillbox-config-control \
+  --commit \
+  --profile surfaces
+```
+
+`client-diff` compares a candidate bundle against the existing
+`clients/<client>/current/` payload in the control repo. It shows:
+
+- added, removed, and changed files in the bundle payload
+- runtime-surface deltas across repos, artifacts, env files, skills, tasks,
+  services, logs, and checks
+- publish metadata drift, so you can see whether `publish.json` still matches
+  the candidate bundle
+
+`client-publish` then turns that reviewed bundle into the latest
+client-facing artifact in a private git repo:
 
 ```bash
 python3 .env-manager/manage.py client-publish personal \
@@ -654,6 +727,7 @@ python3 .env-manager/manage.py client-publish personal \
 What v1 does:
 
 - validates the selected bundle before promotion
+- diffs a candidate bundle against the current published payload before promotion
 - writes the payload to `clients/<client>/current/`
 - writes `clients/<client>/publish.json` with the latest published metadata
 - optionally creates one local git commit in the target repo
@@ -661,7 +735,7 @@ What v1 does:
 What v1 does not do:
 
 - push to a remote
-- diff two client bundles
+- diff arbitrary historical publishes against each other
 - restart services or deploy application code
 - manage publish history beyond the latest `publish.json`
 
@@ -1022,6 +1096,7 @@ agents tools to manage their own environment:
 | `skillbox_focus` | Activate a client with live state and enriched context |
 | `skillbox_onboard` | Scaffold and bootstrap a new client |
 | `skillbox_client_init` | Create a new client overlay from blueprint |
+| `skillbox_client_diff` | Review the delta between a candidate client bundle and the current published payload |
 | `skillbox_pulse` | Query pulse daemon status |
 | `skillbox_journal` | Query the event journal |
 | `skillbox_journal_write` | Write an agent event to the journal |
@@ -1138,6 +1213,54 @@ Run `/commit`, push, then re-run with `dry_run: true` first.
 - There is no license file in this repo yet. Add one before publishing it as open source.
 
 ## FAQ
+
+### Popular Related Tools & Apps
+
+These come up often because they sit near `skillbox`, but they do not all solve
+the same layer of the problem. For the deeper positioning thesis, see
+[docs/VISION.md](docs/VISION.md).
+
+### Is `skillbox` an alternative to OpenClaw?
+
+Not really. OpenClaw is closer to a personal-agent or agent-platform product.
+`skillbox` is the private machine shape underneath: one durable box with your
+repos, homes, overlays, logs, and runtime state. They are adjacent, and can
+coexist, but they are not clean substitutes.
+
+### Is `skillbox` like Claude Cowork?
+
+No. Claude Cowork is an app-layer agent experience for knowledge work. It lives
+much closer to the desktop product surface. `skillbox` lives lower in the
+stack: host access, workspace container, durable repos, agent homes, and box
+operations. Cowork answers "what should the agent do for me?"; `skillbox`
+answers "where does that durable work live?"
+
+### Is `skillbox` competing with Coder or Gitpod?
+
+Only indirectly. Coder and Gitpod are remote-dev platforms with much more
+control-plane, policy, and multi-user surface area. `skillbox` is for the case
+where you want one private operator-owned box and do not want to stand up a
+full platform.
+
+### Is `skillbox` competing with Daytona or E2B?
+
+They solve an adjacent layer. Daytona and E2B are much more about agent
+runtimes, sandbox orchestration, isolation, and secure execution. `skillbox` is
+about a durable private workstation for you and your agents, not an ephemeral
+sandbox substrate.
+
+### Is `skillbox` the same thing as Devbox or DevPod?
+
+No. Devbox and DevPod are closer to environment tooling or thinner remote-dev
+flows. `skillbox` goes one level up and models the whole box: access, homes,
+repos, overlays, services, runtime checks, event history, and agent context.
+
+### When should I use `skillbox` instead of those tools?
+
+Use `skillbox` when the job is "give me one private machine that feels like my
+computer, but works well for agents too." If the job is browser IDEs, multi-user
+workspace fleets, or untrusted-code sandboxing, a different tool is usually the
+better fit.
 
 ### Is SSH supposed to go to the host or the container?
 

@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import signal
 import shutil
 import subprocess
@@ -53,7 +54,7 @@ VALID_ARTIFACT_SYNC_MODES = {"copy-if-missing", "download-if-missing", "manual"}
 VALID_ENV_FILE_SOURCE_KINDS = {"file", "manual"}
 VALID_ENV_FILE_SYNC_MODES = {"write", "manual"}
 VALID_SKILL_SYNC_MODES = {"unpack-bundles"}
-VALID_HEALTHCHECK_TYPES = {"http", "path_exists"}
+VALID_HEALTHCHECK_TYPES = {"http", "path_exists", "process_running"}
 VALID_CHECK_TYPES = {"path_exists"}
 VALID_TASK_SUCCESS_TYPES = {"path_exists"}
 LOCKFILE_VERSION = 1
@@ -289,6 +290,25 @@ def next_actions_for_focus(client_id: str, has_fail: bool) -> list[str]:
     return [f"status --client {client_id} --format json"]
 
 
+def format_profile_args(profiles: list[str] | None) -> str:
+    return "".join(f" --profile {profile}" for profile in profiles or [])
+
+
+def next_actions_for_acceptance_success(client_id: str, profiles: list[str] | None) -> list[str]:
+    profile_args = format_profile_args(profiles)
+    return [f"status --client {client_id}{profile_args} --format json"]
+
+
+def next_actions_for_acceptance_mcp_failure(
+    profiles: list[str] | None,
+    failed_services: list[str],
+) -> list[str]:
+    actions = [f"sync{format_profile_args(profiles)} --format json"]
+    for service_id in failed_services:
+        actions.append(f"logs --service {service_id} --format json")
+    return actions
+
+
 def next_actions_for_client_project(client_id: str) -> list[str]:
     return [
         f"render --client {client_id} --format json",
@@ -300,6 +320,13 @@ def next_actions_for_client_publish(client_id: str) -> list[str]:
     return [
         f"client-project {client_id} --format json",
         f"render --client {client_id} --format json",
+    ]
+
+
+def next_actions_for_client_diff(client_id: str, target_dir: Path) -> list[str]:
+    return [
+        f"client-publish {client_id} --target-dir {target_dir} --format json",
+        f"client-project {client_id} --format json",
     ]
 
 
@@ -1957,6 +1984,197 @@ def load_client_projection_bundle(bundle_dir: Path, *, expected_client_id: str) 
     }
 
 
+CLIENT_RUNTIME_DIFF_SECTIONS = (
+    "clients",
+    "repos",
+    "artifacts",
+    "env_files",
+    "skills",
+    "tasks",
+    "services",
+    "logs",
+    "checks",
+)
+
+CLIENT_PUBLISH_METADATA_COMPARE_FIELDS = (
+    "version",
+    "client_id",
+    "source_commit",
+    "projection_version",
+    "overlay_mode",
+    "active_profiles",
+    "active_clients",
+    "default_client",
+    "payload_tree_sha256",
+    "file_count",
+    "current_dir",
+    "projection",
+    "runtime_manifest",
+    "runtime_model",
+)
+
+
+def stable_json_digest(value: Any) -> str:
+    return digest_bytes(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8"))
+
+
+def bundle_runtime_model(bundle: dict[str, Any]) -> dict[str, Any]:
+    bundle_dir = Path(str(bundle["bundle_dir"]))
+    runtime_model_rel = PurePosixPath(str(bundle["runtime_model_rel"]))
+    return load_json_file(bundle_dir / Path(*runtime_model_rel.parts))
+
+
+def diff_string_values(current_values: list[Any], candidate_values: list[Any]) -> dict[str, Any]:
+    current = sorted({str(value).strip() for value in current_values if str(value).strip()})
+    candidate = sorted({str(value).strip() for value in candidate_values if str(value).strip()})
+    current_set = set(current)
+    candidate_set = set(candidate)
+    return {
+        "added": sorted(candidate_set - current_set),
+        "removed": sorted(current_set - candidate_set),
+        "unchanged": len(current_set & candidate_set),
+    }
+
+
+def diff_named_entries(
+    current_map: dict[str, str],
+    candidate_map: dict[str, str],
+) -> dict[str, Any]:
+    current_ids = set(current_map)
+    candidate_ids = set(candidate_map)
+    shared_ids = sorted(current_ids & candidate_ids)
+    changed = [item_id for item_id in shared_ids if current_map[item_id] != candidate_map[item_id]]
+    return {
+        "added": sorted(candidate_ids - current_ids),
+        "removed": sorted(current_ids - candidate_ids),
+        "changed": changed,
+        "unchanged": len(shared_ids) - len(changed),
+    }
+
+
+def diff_file_entries(
+    current_entries: list[tuple[str, str]],
+    candidate_entries: list[tuple[str, str]],
+) -> dict[str, Any]:
+    current_map = dict(current_entries)
+    candidate_map = dict(candidate_entries)
+    current_paths = set(current_map)
+    candidate_paths = set(candidate_map)
+    shared_paths = sorted(current_paths & candidate_paths)
+    changed = [
+        {
+            "path": rel_path,
+            "current_sha256": current_map[rel_path],
+            "candidate_sha256": candidate_map[rel_path],
+        }
+        for rel_path in shared_paths
+        if current_map[rel_path] != candidate_map[rel_path]
+    ]
+    unchanged = len(shared_paths) - len(changed)
+    added = sorted(candidate_paths - current_paths)
+    removed = sorted(current_paths - candidate_paths)
+    return {
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+        "unchanged": unchanged,
+        "summary": {
+            "added": len(added),
+            "removed": len(removed),
+            "changed": len(changed),
+            "unchanged": unchanged,
+        },
+    }
+
+
+def runtime_section_digest_map(model: dict[str, Any], section: str) -> dict[str, str]:
+    digest_map: dict[str, str] = {}
+    raw_items = model.get(section) or []
+    if not isinstance(raw_items, list):
+        return digest_map
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("id") or "").strip()
+        if not item_id:
+            continue
+        digest_map[item_id] = stable_json_digest(item)
+    return digest_map
+
+
+def diff_runtime_models(current_model: dict[str, Any], candidate_model: dict[str, Any]) -> dict[str, Any]:
+    section_changes: dict[str, Any] = {}
+    changed_sections: list[str] = []
+    for section in CLIENT_RUNTIME_DIFF_SECTIONS:
+        section_change = diff_named_entries(
+            runtime_section_digest_map(current_model, section),
+            runtime_section_digest_map(candidate_model, section),
+        )
+        section_changes[section] = section_change
+        if section_change["added"] or section_change["removed"] or section_change["changed"]:
+            changed_sections.append(section)
+    return {
+        "active_profiles": diff_string_values(
+            current_model.get("active_profiles") or [],
+            candidate_model.get("active_profiles") or [],
+        ),
+        "active_clients": diff_string_values(
+            current_model.get("active_clients") or [],
+            candidate_model.get("active_clients") or [],
+        ),
+        "sections": section_changes,
+        "changed_sections": changed_sections,
+    }
+
+
+def diff_projection_metadata(
+    current_projection: dict[str, Any] | None,
+    candidate_projection: dict[str, Any],
+) -> dict[str, Any]:
+    current = current_projection or {}
+    return {
+        "current_present": current_projection is not None,
+        "overlay_mode": {
+            "current": current.get("overlay_mode"),
+            "candidate": candidate_projection.get("overlay_mode"),
+            "changed": current.get("overlay_mode") != candidate_projection.get("overlay_mode"),
+        },
+        "default_client": {
+            "current": current.get("default_client"),
+            "candidate": candidate_projection.get("default_client"),
+            "changed": current.get("default_client") != candidate_projection.get("default_client"),
+        },
+        "active_profiles": diff_string_values(
+            current.get("active_profiles") or [],
+            candidate_projection.get("active_profiles") or [],
+        ),
+        "active_clients": diff_string_values(
+            current.get("active_clients") or [],
+            candidate_projection.get("active_clients") or [],
+        ),
+    }
+
+
+def diff_publish_metadata(
+    actual_payload: dict[str, Any] | None,
+    expected_payload: dict[str, Any],
+) -> dict[str, Any]:
+    changed_fields: list[str] = []
+    if actual_payload is None:
+        changed_fields = list(CLIENT_PUBLISH_METADATA_COMPARE_FIELDS)
+    else:
+        for field in CLIENT_PUBLISH_METADATA_COMPARE_FIELDS:
+            if actual_payload.get(field) != expected_payload.get(field):
+                changed_fields.append(field)
+
+    return {
+        "present": actual_payload is not None,
+        "matches_candidate": not changed_fields,
+        "changed_fields": changed_fields,
+        "published_at": actual_payload.get("published_at") if actual_payload else None,
+    }
+
+
 def client_publish_paths(target_dir: Path, client_id: str) -> tuple[Path, Path, Path]:
     client_root = target_dir / CLIENT_PUBLISH_ROOT_REL / client_id
     current_dir = client_root / CLIENT_PUBLISH_CURRENT_REL
@@ -2122,6 +2340,123 @@ def publish_client_bundle(
             "file_count": len(bundle["all_entries"]),
             "actions": actions,
             "next_actions": next_actions_for_client_publish(cid),
+        }
+    finally:
+        if temp_bundle is not None:
+            temp_bundle.cleanup()
+
+
+def diff_client_bundle(
+    root_dir: Path,
+    client_id: str,
+    *,
+    target_dir_arg: str | None,
+    from_bundle_arg: str | None = None,
+    profiles: list[str] | None = None,
+) -> dict[str, Any]:
+    cid = validate_client_id(client_id)
+    target_dir = resolve_client_publish_target_dir(root_dir, target_dir_arg)
+    target_state = git_repo_state(target_dir)
+    if not target_state.get("git"):
+        raise RuntimeError(f"client-diff target must be a git repo: {target_dir}")
+
+    if from_bundle_arg and profiles:
+        raise RuntimeError("client-diff cannot combine --from-bundle with --profile.")
+
+    actions: list[str] = []
+    source_commit = git_head_commit(root_dir)
+    temp_bundle: tempfile.TemporaryDirectory[str] | None = None
+
+    try:
+        if from_bundle_arg:
+            bundle_dir = resolve_client_publish_bundle_dir(root_dir, from_bundle_arg)
+            actions.append(f"use-bundle: {repo_rel(root_dir, bundle_dir)}")
+        else:
+            temp_bundle = tempfile.TemporaryDirectory(prefix=f".skillbox-client-diff-{cid}-")
+            bundle_dir = Path(temp_bundle.name) / "bundle"
+            project_client_bundle(
+                root_dir,
+                cid,
+                profiles=profiles,
+                output_dir_arg=str(bundle_dir),
+                dry_run=False,
+                force=True,
+            )
+            actions.append(f"build-bundle: {cid}")
+
+        candidate_bundle = load_client_projection_bundle(bundle_dir, expected_client_id=cid)
+        candidate_runtime_model = bundle_runtime_model(candidate_bundle)
+        client_root, current_dir, publish_metadata_path = client_publish_paths(target_dir, cid)
+        actions.append(f"compare-current: {repo_rel(target_dir, current_dir)}")
+
+        current_bundle: dict[str, Any] | None = None
+        current_runtime_model: dict[str, Any] = {}
+        if current_dir.is_dir():
+            current_bundle = load_client_projection_bundle(current_dir, expected_client_id=cid)
+            current_runtime_model = bundle_runtime_model(current_bundle)
+
+        current_entries = current_bundle["all_entries"] if current_bundle is not None else []
+        file_changes = diff_file_entries(current_entries, candidate_bundle["all_entries"])
+        projection_changes = diff_projection_metadata(
+            current_bundle["projection"] if current_bundle is not None else None,
+            candidate_bundle["projection"],
+        )
+        runtime_changes = diff_runtime_models(current_runtime_model, candidate_runtime_model)
+
+        actual_publish_metadata = (
+            load_json_file(publish_metadata_path)
+            if publish_metadata_path.is_file()
+            else None
+        )
+        expected_publish_metadata = build_client_publish_metadata(
+            candidate_bundle,
+            client_id=cid,
+            source_commit=source_commit,
+        )
+        publish_metadata = diff_publish_metadata(actual_publish_metadata, expected_publish_metadata)
+        changed = not bundle_matches_publish_target(candidate_bundle, current_dir, publish_metadata_path)
+
+        return {
+            "client_id": cid,
+            "target_dir": str(target_dir),
+            "client_root": str(client_root),
+            "current_dir": str(current_dir),
+            "bundle_dir": str(bundle_dir),
+            "changed": changed,
+            "source_commit": source_commit,
+            "candidate": {
+                "present": True,
+                "payload_tree_sha256": candidate_bundle["payload_tree_sha256"],
+                "file_count": len(candidate_bundle["all_entries"]),
+                "active_profiles": candidate_bundle["projection"].get("active_profiles", []),
+                "overlay_mode": candidate_bundle["projection"].get("overlay_mode"),
+            },
+            "current": {
+                "present": current_bundle is not None,
+                "payload_tree_sha256": current_bundle["payload_tree_sha256"] if current_bundle else None,
+                "file_count": len(current_bundle["all_entries"]) if current_bundle else 0,
+                "active_profiles": (
+                    current_bundle["projection"].get("active_profiles", [])
+                    if current_bundle
+                    else []
+                ),
+                "overlay_mode": (
+                    current_bundle["projection"].get("overlay_mode")
+                    if current_bundle
+                    else None
+                ),
+            },
+            "summary": file_changes["summary"],
+            "files": {
+                "added": file_changes["added"],
+                "removed": file_changes["removed"],
+                "changed": file_changes["changed"],
+            },
+            "projection_changes": projection_changes,
+            "runtime_changes": runtime_changes,
+            "publish_metadata": publish_metadata,
+            "actions": actions,
+            "next_actions": next_actions_for_client_diff(cid, target_dir),
         }
     finally:
         if temp_bundle is not None:
@@ -2909,6 +3244,8 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
                 issues.append(f"service {service.get('id')} http healthcheck is missing url")
             if healthcheck_type == "path_exists" and not healthcheck.get("path"):
                 issues.append(f"service {service.get('id')} path_exists healthcheck is missing path")
+            if healthcheck_type == "process_running" and not healthcheck.get("pattern"):
+                issues.append(f"service {service.get('id')} process_running healthcheck is missing pattern")
 
     visiting: list[str] = []
     visited: set[str] = set()
@@ -3960,6 +4297,39 @@ def service_healthcheck_state(service: dict[str, Any]) -> dict[str, Any]:
         except (urllib.error.URLError, TimeoutError, ValueError):
             return {"state": "down", "url": url}
 
+    if healthcheck_type == "process_running":
+        pattern = str(healthcheck["pattern"]).strip()
+        if not pattern:
+            return {"state": "down", "pattern": pattern}
+
+        result = run_command(["ps", "-axo", "pid=,command="])
+        if result.returncode != 0:
+            return {"state": "unknown", "pattern": pattern}
+
+        matches: list[tuple[int, str]] = []
+        for raw_line in result.stdout.splitlines():
+            parts = raw_line.strip().split(None, 1)
+            if len(parts) != 2:
+                continue
+            raw_pid, command = parts
+            try:
+                pid = int(raw_pid)
+            except ValueError:
+                continue
+            if pattern in command:
+                matches.append((pid, command))
+
+        if matches:
+            matched_pid, matched_command = matches[0]
+            return {
+                "state": "ok",
+                "pattern": pattern,
+                "matched_pid": matched_pid,
+                "match_count": len(matches),
+                "matched_command": matched_command,
+            }
+        return {"state": "down", "pattern": pattern}
+
     return {"state": "unknown"}
 
 
@@ -4283,12 +4653,15 @@ def start_services(
                 detail["url"] = health_state["url"]
             if "target" in health_state:
                 detail["target"] = health_state["target"]
+            if "pattern" in health_state:
+                detail["pattern"] = health_state["pattern"]
             emit_event("service.start_failed", service["id"], {"state": health_state.get("state")})
             raise RuntimeError(
                 f"Service {service['id']} failed to become healthy."
                 + (f" Exit code: {health_state['exit_code']}." if "exit_code" in health_state else "")
                 + (f" Health target: {health_state['url']}." if "url" in health_state else "")
                 + (f" Health target: {health_state['target']}." if "target" in health_state else "")
+                + (f" Health pattern: {health_state['pattern']}." if "pattern" in health_state else "")
                 + (f" Recent logs: {' | '.join(tail)}" if tail else "")
             )
 
@@ -4445,6 +4818,9 @@ FOCUS_ERROR_PATTERNS = re.compile(
     r"(?:error|exception|traceback|fatal|panic|fail(?:ed|ure)?)",
     re.IGNORECASE,
 )
+MCP_CONFIG_REL = Path(".mcp.json")
+MCP_PROTOCOL_VERSION = "2024-11-05"
+MCP_SMOKE_TIMEOUT_SECONDS = 5.0
 
 
 def collect_live_state(model: dict[str, Any]) -> dict[str, Any]:
@@ -5298,6 +5674,62 @@ def print_client_blueprints_text(blueprints: list[dict[str, Any]]) -> None:
         print(f"  vars: {', '.join(rendered_variables)}")
 
 
+def print_client_diff_text(payload: dict[str, Any]) -> None:
+    current = payload.get("current") or {}
+    candidate = payload.get("candidate") or {}
+    summary = payload.get("summary") or {}
+    publish_metadata = payload.get("publish_metadata") or {}
+    runtime_changes = payload.get("runtime_changes") or {}
+    sections = runtime_changes.get("sections") or {}
+
+    print(f"client: {payload['client_id']}")
+    print(f"target_dir: {payload['target_dir']}")
+    print(f"current_dir: {payload['current_dir']}")
+    print(f"changed: {payload['changed']}")
+    print(f"candidate_payload_tree_sha256: {candidate.get('payload_tree_sha256')}")
+    print(f"current_payload_tree_sha256: {current.get('payload_tree_sha256') or '(none)'}")
+    print(
+        "files: "
+        f"+{summary.get('added', 0)} "
+        f"~{summary.get('changed', 0)} "
+        f"-{summary.get('removed', 0)} "
+        f"={summary.get('unchanged', 0)}"
+    )
+    print(
+        "publish_metadata: "
+        + ("match" if publish_metadata.get("matches_candidate") else "drift")
+    )
+    if publish_metadata.get("changed_fields"):
+        print("publish_metadata_fields: " + ", ".join(publish_metadata["changed_fields"]))
+
+    changed_sections = runtime_changes.get("changed_sections") or []
+    if changed_sections:
+        print("runtime_changes:")
+        for section in changed_sections:
+            change = sections.get(section) or {}
+            parts: list[str] = []
+            if change.get("added"):
+                parts.append("added " + ", ".join(change["added"]))
+            if change.get("removed"):
+                parts.append("removed " + ", ".join(change["removed"]))
+            if change.get("changed"):
+                parts.append("changed " + ", ".join(change["changed"]))
+            print(f"  - {section}: " + "; ".join(parts))
+
+    if payload["files"]["added"]:
+        print("added_files:")
+        for rel_path in payload["files"]["added"]:
+            print(f"  - {rel_path}")
+    if payload["files"]["removed"]:
+        print("removed_files:")
+        for rel_path in payload["files"]["removed"]:
+            print(f"  - {rel_path}")
+    if payload["files"]["changed"]:
+        print("changed_files:")
+        for item in payload["files"]["changed"]:
+            print(f"  - {item['path']}")
+
+
 def emit_json(payload: Any) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
 
@@ -5523,10 +5955,471 @@ def generate_client_compose_override(
     return out_path
 
 
+def run_manage_json_command(root_dir: Path, args: list[str]) -> tuple[int, dict[str, Any]]:
+    cmd = [sys.executable, str(SCRIPT_DIR / "manage.py"), "--root-dir", str(root_dir), *args]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    stdout = proc.stdout.strip()
+    if not stdout:
+        payload: dict[str, Any] = {}
+    else:
+        try:
+            parsed = json.loads(stdout)
+        except json.JSONDecodeError:
+            parsed = {"stdout": stdout}
+        payload = parsed if isinstance(parsed, dict) else {"payload": parsed}
+    if proc.stderr.strip():
+        payload["_stderr"] = proc.stderr.strip()
+    return proc.returncode, payload
+
+
+def doctor_step_status(payload: dict[str, Any], exit_code: int) -> str:
+    if exit_code not in (EXIT_OK, EXIT_DRIFT):
+        return "fail"
+    checks = payload.get("checks") or []
+    has_fail = any(str(item.get("status")) == "fail" for item in checks)
+    has_warn = any(str(item.get("status")) == "warn" for item in checks)
+    if has_fail:
+        return "fail"
+    if has_warn:
+        return "warn"
+    return "ok"
+
+
+def focus_step_detail(
+    focus_payload: dict[str, Any],
+    active_profiles: list[str],
+) -> dict[str, Any]:
+    services = [
+        str(service.get("id"))
+        for service in (focus_payload.get("live_state") or {}).get("services") or []
+        if str(service.get("id", "")).strip()
+    ]
+    if not services:
+        for item in focus_payload.get("steps") or []:
+            if item.get("step") != "up":
+                continue
+            services = [
+                str(service.get("id"))
+                for service in (item.get("detail") or {}).get("services") or []
+                if str(service.get("id", "")).strip()
+            ]
+            break
+    return {
+        "active_profiles": active_profiles,
+        "services": services,
+        "step_names": [str(item.get("step")) for item in focus_payload.get("steps") or []],
+    }
+
+
+def load_mcp_server_configs(root_dir: Path) -> dict[str, Any]:
+    config_path = root_dir / MCP_CONFIG_REL
+    if not config_path.is_file():
+        raise RuntimeError(f"Missing MCP config at {repo_rel(root_dir, config_path)}.")
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError(f"Failed to read {repo_rel(root_dir, config_path)}: {exc}") from exc
+    servers = payload.get("mcpServers")
+    if not isinstance(servers, dict):
+        raise RuntimeError(f"Invalid {repo_rel(root_dir, config_path)}: mcpServers must be an object.")
+    return servers
+
+
+def mcp_server_name_for_service(service: dict[str, Any]) -> str:
+    raw_name = str(service.get("mcp_server") or service.get("id") or "").strip()
+    if raw_name.endswith("-mcp"):
+        raw_name = raw_name[:-4]
+    return raw_name
+
+
+def requested_mcp_servers(model: dict[str, Any]) -> list[dict[str, Any]]:
+    requested: list[dict[str, Any]] = [{"name": "skillbox", "service_id": None}]
+    seen = {"skillbox"}
+    for service in model.get("services") or []:
+        if str(service.get("kind") or "").strip() != "mcp":
+            continue
+        server_name = mcp_server_name_for_service(service)
+        if not server_name or server_name in seen:
+            continue
+        requested.append({"name": server_name, "service_id": str(service.get("id") or "").strip() or None})
+        seen.add(server_name)
+    return requested
+
+
+def send_mcp_message(proc: subprocess.Popen[str], message: dict[str, Any]) -> None:
+    if proc.stdin is None:
+        raise RuntimeError("MCP process stdin is unavailable.")
+    try:
+        proc.stdin.write(json.dumps(message) + "\n")
+        proc.stdin.flush()
+    except BrokenPipeError as exc:
+        raise RuntimeError("MCP process closed stdin before the request completed.") from exc
+
+
+def read_mcp_response(
+    proc: subprocess.Popen[str],
+    request_id: int,
+    *,
+    timeout_seconds: float,
+) -> tuple[dict[str, Any], list[str]]:
+    if proc.stdout is None:
+        raise RuntimeError("MCP process stdout is unavailable.")
+
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ)
+    stray_lines: list[str] = []
+    deadline = time.monotonic() + timeout_seconds
+
+    try:
+        while time.monotonic() < deadline:
+            timeout = max(0.0, deadline - time.monotonic())
+            events = selector.select(min(0.2, timeout))
+            if not events:
+                if proc.poll() is not None:
+                    break
+                continue
+
+            line = proc.stdout.readline()
+            if not line:
+                if proc.poll() is not None:
+                    break
+                continue
+
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                message = json.loads(text)
+            except json.JSONDecodeError:
+                stray_lines.append(text)
+                continue
+
+            if message.get("id") != request_id:
+                stray_lines.append(text)
+                continue
+            if "error" in message:
+                error = message["error"]
+                if isinstance(error, dict):
+                    raise RuntimeError(str(error.get("message") or error))
+                raise RuntimeError(str(error))
+
+            result = message.get("result") or {}
+            if not isinstance(result, dict):
+                raise RuntimeError(f"MCP request {request_id} returned a non-object result.")
+            return result, stray_lines
+    finally:
+        selector.close()
+
+    if proc.poll() is not None:
+        raise RuntimeError(f"MCP process exited with code {proc.returncode} before responding.")
+    raise RuntimeError(f"Timed out waiting for MCP response to request {request_id}.")
+
+
+def finalize_mcp_process(proc: subprocess.Popen[str]) -> tuple[list[str], list[str], int | None]:
+    if proc.poll() is None:
+        proc.terminate()
+    try:
+        stdout_text, stderr_text = proc.communicate(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout_text, stderr_text = proc.communicate(timeout=0.5)
+    stdout_lines = [line for line in stdout_text.splitlines() if line.strip()]
+    stderr_lines = [line for line in stderr_text.splitlines() if line.strip()]
+    return stdout_lines[-10:], stderr_lines[-10:], proc.returncode
+
+
+def smoke_mcp_server(root_dir: Path, server_name: str, config: dict[str, Any]) -> dict[str, Any]:
+    command = str(config.get("command") or "").strip()
+    args = [str(arg) for arg in config.get("args") or []]
+    detail: dict[str, Any] = {"command": command, "args": args}
+    if not command:
+        return detail | {"status": "fail", "error": f"MCP server '{server_name}' has no command configured."}
+
+    try:
+        proc = subprocess.Popen(
+            [command, *args],
+            cwd=root_dir,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return detail | {"status": "fail", "error": str(exc)}
+
+    stray_stdout: list[str] = []
+    try:
+        send_mcp_message(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "skillbox-acceptance", "version": "1.0.0"},
+                },
+            },
+        )
+        init_result, init_noise = read_mcp_response(proc, 1, timeout_seconds=MCP_SMOKE_TIMEOUT_SECONDS)
+        stray_stdout.extend(init_noise)
+        detail["server_info"] = init_result.get("serverInfo") or {}
+
+        send_mcp_message(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {},
+            },
+        )
+        send_mcp_message(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        tools_result, tools_noise = read_mcp_response(proc, 2, timeout_seconds=MCP_SMOKE_TIMEOUT_SECONDS)
+        stray_stdout.extend(tools_noise)
+        tools = tools_result.get("tools")
+        if not isinstance(tools, list):
+            raise RuntimeError("tools/list did not return a tools array.")
+        detail["tool_names"] = [
+            str(tool.get("name"))
+            for tool in tools
+            if isinstance(tool, dict) and str(tool.get("name", "")).strip()
+        ]
+        detail["status"] = "ok"
+    except RuntimeError as exc:
+        detail["status"] = "fail"
+        detail["error"] = str(exc)
+    finally:
+        stdout_tail, stderr_tail, exit_code = finalize_mcp_process(proc)
+        merged_stdout = stray_stdout + stdout_tail
+        if merged_stdout:
+            detail["stdout_tail"] = merged_stdout[-10:]
+        if stderr_tail:
+            detail["stderr_tail"] = stderr_tail
+        if exit_code is not None:
+            detail["exit_code"] = exit_code
+
+    return detail
+
+
+def smoke_requested_mcp_servers(
+    root_dir: Path,
+    model: dict[str, Any],
+) -> tuple[bool, dict[str, Any], list[str]]:
+    detail: dict[str, Any] = {"servers": {}, "servers_ok": [], "servers_failed": []}
+    try:
+        server_configs = load_mcp_server_configs(root_dir)
+    except RuntimeError as exc:
+        detail["error"] = str(exc)
+        detail["servers_failed"] = ["skillbox"]
+        return False, detail, []
+
+    failed_services: list[str] = []
+    for request in requested_mcp_servers(model):
+        server_name = str(request["name"])
+        service_id = request.get("service_id")
+        config = server_configs.get(server_name)
+        if not isinstance(config, dict):
+            detail["servers"][server_name] = {
+                "status": "fail",
+                "error": f"MCP server '{server_name}' is not configured in {MCP_CONFIG_REL}.",
+            }
+            detail["servers_failed"].append(server_name)
+            if isinstance(service_id, str) and service_id:
+                failed_services.append(service_id)
+            continue
+
+        server_detail = smoke_mcp_server(root_dir, server_name, config)
+        detail["servers"][server_name] = server_detail
+        if server_detail.get("status") == "ok":
+            detail["servers_ok"].append(server_name)
+        else:
+            detail["servers_failed"].append(server_name)
+            if isinstance(service_id, str) and service_id:
+                failed_services.append(service_id)
+
+    return not detail["servers_failed"], detail, failed_services
+
+
+def run_acceptance(
+    *,
+    root_dir: Path,
+    client_id: str,
+    profiles: list[str],
+    fmt: str,
+) -> int:
+    steps: list[dict[str, Any]] = []
+    is_json = fmt == "json"
+    active_profiles = sorted(normalize_active_profiles(profiles))
+
+    def step(name: str, status: str, detail: Any = None) -> None:
+        entry: dict[str, Any] = {"step": name, "status": status}
+        if detail is not None:
+            entry["detail"] = detail
+        steps.append(entry)
+        if not is_json:
+            marker = {
+                "ok": "ok",
+                "warn": "warn",
+                "skip": "skip",
+            }.get(status, "FAIL")
+            print(f"[{marker}] {name}")
+
+    def emit_acceptance(payload: dict[str, Any]) -> int:
+        if is_json:
+            emit_json(payload)
+        else:
+            print()
+            print(f"  Client:  {payload['client_id']}")
+            print(f"  Ready:   {'yes' if payload.get('ready') else 'no'}")
+            print(f"  Profiles: {', '.join(payload.get('active_profiles') or ['core'])}")
+            if payload.get("error"):
+                print(f"  Error:   {payload['error']['message']}")
+        return EXIT_OK if payload.get("ready") else EXIT_ERROR
+
+    try:
+        cid = validate_client_id(client_id)
+    except RuntimeError as exc:
+        payload = {"client_id": client_id, "active_profiles": active_profiles, "steps": steps, "ready": False}
+        payload.update(classify_error(exc, "acceptance"))
+        return emit_acceptance(payload)
+
+    _, overlay_path, overlay_runtime_path = client_overlay_location(root_dir, cid)
+    if not overlay_path.is_file():
+        payload = {
+            "client_id": cid,
+            "active_profiles": active_profiles,
+            "steps": steps,
+            "ready": False,
+        }
+        payload.update(
+            structured_error(
+                (
+                    f"Client '{cid}' has no overlay at {overlay_runtime_path}. "
+                    f"Run onboard {cid} before acceptance."
+                ),
+                error_type="client_not_onboarded",
+                recovery_hint=f"Run onboard {cid} to scaffold the client overlay.",
+                next_actions=[f"onboard {cid} --format json"],
+            )
+        )
+        return emit_acceptance(payload)
+
+    profile_args = [arg for profile in profiles for arg in ("--profile", profile)]
+    doctor_args = ["doctor", "--client", cid, *profile_args, "--format", "json"]
+    sync_args = ["sync", "--client", cid, *profile_args, "--format", "json"]
+    focus_args = ["focus", cid, *profile_args, "--format", "json"]
+
+    doctor_pre_code, doctor_pre_payload = run_manage_json_command(root_dir, doctor_args)
+    doctor_pre_status = doctor_step_status(doctor_pre_payload, doctor_pre_code)
+    step("doctor-pre", doctor_pre_status, {"checks": doctor_pre_payload.get("checks") or []})
+    if doctor_pre_status == "fail":
+        step("sync", "skip", {"reason": "doctor-pre failed"})
+        step("focus", "skip", {"reason": "doctor-pre failed"})
+        step("mcp-smoke", "skip", {"reason": "doctor-pre failed"})
+        step("doctor-post", "skip", {"reason": "doctor-pre failed"})
+        payload = {
+            "client_id": cid,
+            "active_profiles": active_profiles,
+            "steps": steps,
+            "ready": False,
+        }
+        payload.update(
+            structured_error(
+                "Pre-flight doctor checks failed.",
+                error_type="doctor_pre_failed",
+                next_actions=doctor_pre_payload.get("next_actions") or ["doctor --format json"],
+            )
+        )
+        return emit_acceptance(payload)
+
+    sync_code, sync_payload = run_manage_json_command(root_dir, sync_args)
+    sync_status = "ok" if sync_code == EXIT_OK else "fail"
+    step("sync", sync_status, {"actions": sync_payload.get("actions") or []})
+    if sync_status != "ok":
+        step("focus", "skip", {"reason": "sync failed"})
+        step("mcp-smoke", "skip", {"reason": "sync failed"})
+        step("doctor-post", "skip", {"reason": "sync failed"})
+        payload = {
+            "client_id": cid,
+            "active_profiles": active_profiles,
+            "steps": steps,
+            "ready": False,
+        }
+        payload["error"] = sync_payload.get("error") or {
+            "type": "sync_failed",
+            "message": "Sync failed during acceptance.",
+            "recoverable": True,
+        }
+        payload["next_actions"] = sync_payload.get("next_actions") or [f"sync{format_profile_args(profiles)} --format json"]
+        return emit_acceptance(payload)
+
+    focus_code, focus_payload = run_manage_json_command(root_dir, focus_args)
+    focus_status = "ok" if focus_code == EXIT_OK else "fail"
+    step("focus", focus_status, focus_step_detail(focus_payload, active_profiles))
+    if focus_status != "ok":
+        step("mcp-smoke", "skip", {"reason": "focus failed"})
+        step("doctor-post", "skip", {"reason": "focus failed"})
+        payload = {
+            "client_id": cid,
+            "active_profiles": active_profiles,
+            "steps": steps,
+            "ready": False,
+        }
+        payload["error"] = focus_payload.get("error") or {
+            "type": "focus_failed",
+            "message": "Focus failed during acceptance.",
+            "recoverable": True,
+        }
+        payload["next_actions"] = focus_payload.get("next_actions") or [f"focus {cid}{format_profile_args(profiles)} --format json"]
+        return emit_acceptance(payload)
+
+    model = build_runtime_model(root_dir)
+    filtered_model = filter_model(model, normalize_active_profiles(profiles), normalize_active_clients(model, [cid]))
+    mcp_ok, mcp_detail, failed_services = smoke_requested_mcp_servers(root_dir, filtered_model)
+    step("mcp-smoke", "ok" if mcp_ok else "fail", mcp_detail)
+
+    doctor_post_code, doctor_post_payload = run_manage_json_command(root_dir, doctor_args)
+    doctor_post_status = doctor_step_status(doctor_post_payload, doctor_post_code)
+    step("doctor-post", doctor_post_status, {"checks": doctor_post_payload.get("checks") or []})
+
+    ready = mcp_ok and doctor_post_status != "fail"
+    payload = {
+        "client_id": cid,
+        "active_profiles": active_profiles,
+        "steps": steps,
+        "ready": ready,
+        "next_actions": (
+            next_actions_for_acceptance_success(cid, profiles)
+            if ready
+            else next_actions_for_acceptance_mcp_failure(profiles, failed_services)
+            if not mcp_ok
+            else doctor_post_payload.get("next_actions") or ["doctor --format json"]
+        ),
+    }
+    if not ready:
+        payload["error"] = (
+            {
+                "type": "mcp_smoke_failed",
+                "message": "MCP smoke failed for: " + ", ".join(mcp_detail.get("servers_failed") or ["unknown"]),
+                "recoverable": True,
+            }
+            if not mcp_ok
+            else {
+                "type": "doctor_post_failed",
+                "message": "Post-focus doctor checks failed.",
+                "recoverable": True,
+            }
+        )
+    return emit_acceptance(payload)
+
+
 def run_focus(
     *,
     root_dir: Path,
     client_id: str,
+    profiles: list[str],
     service_filter: list[str],
     resume: bool,
     wait_seconds: float,
@@ -5561,6 +6454,12 @@ def run_focus(
         try:
             saved = json.loads(focus_path.read_text(encoding="utf-8"))
             client_id = saved.get("client_id", client_id)
+            if not profiles:
+                profiles = [
+                    str(profile)
+                    for profile in saved.get("active_profiles") or []
+                    if str(profile).strip() and str(profile).strip() != "core"
+                ]
         except (json.JSONDecodeError, OSError) as exc:
             err = {"error": f"Failed to read .focus.json: {exc}"}
             if is_json:
@@ -5594,7 +6493,7 @@ def run_focus(
     # --- Build model ----------------------------------------------------------
     try:
         model = build_runtime_model(root_dir)
-        active_profiles = normalize_active_profiles([])
+        active_profiles = normalize_active_profiles(profiles or [])
         active_clients = normalize_active_clients(model, [cid])
         model = filter_model(model, active_profiles, active_clients)
     except RuntimeError as exc:
@@ -5990,6 +6889,27 @@ def main() -> int:
     client_publish_parser.add_argument("--format", choices=("text", "json"), default="text")
     add_profile_arg(client_publish_parser)
 
+    client_diff_parser = subparsers.add_parser(
+        "client-diff",
+        help="Compare a client projection bundle against the current published payload in a target repo.",
+    )
+    client_diff_parser.add_argument(
+        "client_id",
+        help="Existing client slug to diff (for example `personal`).",
+    )
+    client_diff_parser.add_argument(
+        "--target-dir",
+        required=True,
+        help="Git repo that holds clients/<client>/current/ and publish.json.",
+    )
+    client_diff_parser.add_argument(
+        "--from-bundle",
+        default=None,
+        help="Existing client-project bundle to diff instead of building a fresh one.",
+    )
+    client_diff_parser.add_argument("--format", choices=("text", "json"), default="text")
+    add_profile_arg(client_diff_parser)
+
     onboard_parser = subparsers.add_parser(
         "onboard",
         help="Macro: scaffold a client, sync, bootstrap, start services, generate context, and verify.",
@@ -6046,8 +6966,20 @@ def main() -> int:
         "--wait-seconds", type=float, default=DEFAULT_SERVICE_START_WAIT_SECONDS,
     )
     focus_parser.add_argument("--format", choices=("text", "json"), default="text")
+    add_profile_arg(focus_parser)
     add_service_arg(focus_parser)
     add_context_dir_arg(focus_parser)
+
+    acceptance_parser = subparsers.add_parser(
+        "acceptance",
+        help="Run the first-box readiness gate: doctor-pre, sync, focus, mcp-smoke, doctor-post.",
+    )
+    acceptance_parser.add_argument(
+        "client_id",
+        help="Existing client slug to validate for first-box acceptance (for example `personal`).",
+    )
+    acceptance_parser.add_argument("--format", choices=("text", "json"), default="text")
+    add_profile_arg(acceptance_parser)
 
     ack_parser = subparsers.add_parser(
         "ack",
@@ -6148,6 +7080,14 @@ def main() -> int:
             fmt=args.format,
         )
 
+    if args.command == "acceptance":
+        return run_acceptance(
+            root_dir=root_dir,
+            client_id=args.client_id,
+            profiles=args.profile,
+            fmt=args.format,
+        )
+
     if args.command == "client-project":
         try:
             payload = project_client_bundle(
@@ -6206,6 +7146,28 @@ def main() -> int:
             print("\n".join(payload["actions"]))
         return EXIT_OK
 
+    if args.command == "client-diff":
+        try:
+            payload = diff_client_bundle(
+                root_dir=root_dir,
+                client_id=args.client_id,
+                target_dir_arg=args.target_dir,
+                from_bundle_arg=args.from_bundle,
+                profiles=args.profile,
+            )
+        except RuntimeError as exc:
+            if args.format == "json":
+                emit_json(classify_error(exc, "client-diff"))
+            else:
+                print(str(exc), file=sys.stderr)
+            return EXIT_ERROR
+
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            print_client_diff_text(payload)
+        return EXIT_OK
+
     if args.command == "focus":
         cid = args.client_id or ""
         if not cid and not args.resume:
@@ -6214,6 +7176,7 @@ def main() -> int:
         return run_focus(
             root_dir=root_dir,
             client_id=cid,
+            profiles=args.profile,
             service_filter=getattr(args, "service", []),
             resume=args.resume,
             wait_seconds=max(0.0, float(args.wait_seconds)),

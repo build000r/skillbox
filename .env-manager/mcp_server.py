@@ -311,6 +311,7 @@ TOOLS: list[dict] = [
                         "Required unless resume=true. Must already be onboarded."
                     ),
                 },
+                "profile": _PROFILE_PROP,
                 "service": _SERVICE_PROP,
                 "resume": {
                     "type": "boolean",
@@ -318,6 +319,25 @@ TOOLS: list[dict] = [
                     "default": False,
                 },
                 "wait_seconds": _WAIT_SECONDS_PROP,
+            },
+        },
+    },
+    {
+        "name": "skillbox_acceptance",
+        "description": (
+            "Run the first-box readiness gate for an onboarded client. "
+            "Pipeline: doctor-pre → sync → focus → mcp-smoke → doctor-post. "
+            "Fails when requested MCP surfaces from .mcp.json cannot initialize or complete tools/list."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["client_id"],
+            "properties": {
+                "client_id": {
+                    "type": "string",
+                    "description": "Existing client slug (for example 'personal').",
+                },
+                "profile": _PROFILE_PROP,
             },
         },
     },
@@ -352,6 +372,37 @@ TOOLS: list[dict] = [
                     "default": False,
                 },
                 "dry_run": _DRY_RUN_PROP,
+            },
+        },
+    },
+    {
+        "name": "skillbox_client_diff",
+        "description": (
+            "Compare a client projection bundle against the currently published payload in a git-backed control-plane repo. "
+            "Use this before client-publish to review what would change. "
+            "Returns file-level added/removed/changed paths, runtime-surface deltas "
+            "(repos, services, tasks, skills, logs, checks), and publish metadata drift."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["client_id", "target_dir"],
+            "properties": {
+                "client_id": {
+                    "type": "string",
+                    "description": "Existing client slug to diff, for example 'personal'.",
+                },
+                "target_dir": {
+                    "type": "string",
+                    "description": (
+                        "Git-backed control-plane repo path visible from inside the box. "
+                        "Skillbox compares against clients/<client>/current/ under this repo."
+                    ),
+                },
+                "from_bundle": {
+                    "type": "string",
+                    "description": "Existing client-project bundle to diff instead of building a fresh one.",
+                },
+                "profile": _PROFILE_PROP,
             },
         },
     },
@@ -561,6 +612,10 @@ def build_args(command: str, params: dict, positional: str | None = None) -> lis
         args += ["--blueprint", str(params["blueprint"])]
     if params.get("label"):
         args += ["--label", str(params["label"])]
+    if params.get("target_dir"):
+        args += ["--target-dir", str(params["target_dir"])]
+    if params.get("from_bundle"):
+        args += ["--from-bundle", str(params["from_bundle"])]
     if params.get("root_path"):
         args += ["--root-path", str(params["root_path"])]
     if params.get("default_cwd"):
@@ -595,7 +650,9 @@ _DISPATCH: dict[str, tuple[str, str | None]] = {
     "skillbox_context":     ("context",     None),
     "skillbox_onboard":     ("onboard",     "client_id"),
     "skillbox_focus":       ("focus",       "client_id"),
+    "skillbox_acceptance":  ("acceptance",  "client_id"),
     "skillbox_client_init": ("client-init", "client_id"),
+    "skillbox_client_diff": ("client-diff", "client_id"),
 }
 
 
