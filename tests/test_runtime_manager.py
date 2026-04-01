@@ -1,16 +1,27 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 MANAGER = ROOT_DIR / ".env-manager" / "manage.py"
+ENV_MANAGER_DIR = ROOT_DIR / ".env-manager"
+if str(ENV_MANAGER_DIR) not in sys.path:
+    sys.path.insert(0, str(ENV_MANAGER_DIR))
+MANAGE_MODULE = SourceFileLoader(
+    "skillbox_manage",
+    str(MANAGER.resolve()),
+).load_module()
 
 
 class RuntimeManagerTests(unittest.TestCase):
@@ -2216,6 +2227,266 @@ class RuntimeManagerTests(unittest.TestCase):
             # Check that Attention section was generated
             claude_md = (repo / "home" / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
             self.assertIn("RECENT ERRORS", claude_md)
+
+    def test_doctor_fails_when_url_artifact_lacks_sha256(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            runtime_path = repo / "workspace" / "runtime.yaml"
+            runtime_text = runtime_path.read_text(encoding="utf-8")
+            runtime_text = runtime_text.replace(
+                "      source:\n"
+                "        kind: file\n"
+                "        path: ./artifacts/swimmers.bin\n"
+                "        executable: true\n"
+                "      sync:\n"
+                "        mode: copy-if-missing\n",
+                "      source:\n"
+                "        kind: url\n"
+                "        url: https://example.com/swimmers\n"
+                "        executable: true\n"
+                "      sync:\n"
+                "        mode: download-if-missing\n",
+            )
+            runtime_path.write_text(runtime_text, encoding="utf-8")
+
+            result = self._run(repo, "doctor", "--format", "json")
+
+            self.assertEqual(result.returncode, 2, result.stderr)
+            payload = json.loads(result.stdout)
+            issues = [
+                issue
+                for check in payload["checks"]
+                if check["code"] == "runtime-manifest"
+                for issue in check.get("details", {}).get("issues", [])
+            ]
+            self.assertTrue(any("source.sha256" in issue for issue in issues), issues)
+
+    def test_sync_artifact_download_verifies_sha256_before_install(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "bin" / "tool"
+            payload = b"#!/bin/sh\necho ok\n"
+            expected_sha256 = hashlib.sha256(payload).hexdigest()
+            artifact = {
+                "id": "fixture-bin",
+                "host_path": str(target),
+                "source": {
+                    "kind": "url",
+                    "url": "https://example.com/tool",
+                    "sha256": expected_sha256,
+                    "executable": True,
+                },
+                "sync": {"mode": "download-if-missing"},
+            }
+
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = payload
+
+            with mock.patch.object(MANAGE_MODULE.urllib.request, "urlopen", return_value=response) as urlopen:
+                actions = MANAGE_MODULE.sync_artifact(artifact, dry_run=False)
+
+            urlopen.assert_called_once()
+            self.assertEqual(actions, [f"download-if-missing: https://example.com/tool -> {target}"])
+            self.assertEqual(target.read_bytes(), payload)
+            self.assertTrue(target.stat().st_mode & 0o111)
+
+    def test_sync_artifact_rejects_non_https_or_mismatched_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "bin" / "tool"
+            secure_artifact = {
+                "id": "fixture-bin",
+                "host_path": str(target),
+                "source": {
+                    "kind": "url",
+                    "url": "https://example.com/tool",
+                    "sha256": "0" * 64,
+                    "executable": True,
+                },
+                "sync": {"mode": "download-if-missing"},
+            }
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = b"#!/bin/sh\necho nope\n"
+
+            with mock.patch.object(MANAGE_MODULE.urllib.request, "urlopen", return_value=response):
+                with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
+                    MANAGE_MODULE.sync_artifact(secure_artifact, dry_run=False)
+
+            insecure_artifact = {
+                "id": "fixture-bin",
+                "host_path": str(target),
+                "source": {
+                    "kind": "url",
+                    "url": "http://example.com/tool",
+                    "sha256": "0" * 64,
+                    "executable": True,
+                },
+                "sync": {"mode": "download-if-missing"},
+            }
+
+            with mock.patch.object(MANAGE_MODULE.urllib.request, "urlopen") as urlopen:
+                with self.assertRaisesRegex(RuntimeError, "must use https"):
+                    MANAGE_MODULE.sync_artifact(insecure_artifact, dry_run=False)
+            urlopen.assert_not_called()
+            self.assertFalse(target.exists())
+
+
+    # --- ack tests ---
+
+    def test_ack_writes_to_ack_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._run(repo, "sync", "--client", "personal")
+
+            # Emit a journal event via focus
+            self._run(repo, "focus", "personal")
+
+            # Ack all events
+            result = self._run(repo, "ack", "--all", "--reason", "reviewed", "--format", "json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertGreater(payload["count"], 0)
+
+            # Verify ack store file exists
+            acks_path = repo / "logs" / "runtime" / "journal.acks.json"
+            self.assertTrue(acks_path.is_file())
+            acks = json.loads(acks_path.read_text(encoding="utf-8"))
+            self.assertGreater(len(acks), 0)
+            for entry in acks.values():
+                self.assertEqual(entry["reason"], "reviewed")
+
+    def test_ack_filters_events_from_live_context(self) -> None:
+        import time as _time
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._run(repo, "sync", "--client", "personal")
+
+            # Write journal events directly so we control exactly what's there
+            journal_dir = repo / "logs" / "runtime"
+            journal_dir.mkdir(parents=True, exist_ok=True)
+            now = _time.time()
+            events = [
+                {"ts": now - 100, "type": "pulse.service_restarted", "subject": "api-stub", "detail": {}},
+                {"ts": now - 50, "type": "agent.note", "subject": "personal", "detail": {}},
+                {"ts": now - 10, "type": "focus.activated", "subject": "personal", "detail": {}},
+            ]
+            with (journal_dir / "journal.jsonl").open("w", encoding="utf-8") as f:
+                for ev in events:
+                    f.write(json.dumps(ev) + "\n")
+
+            # Focus should show all 3 events in Recent Activity
+            self._run(repo, "focus", "personal")
+            claude_md_1 = (repo / "home" / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
+            self.assertIn("Recent Activity", claude_md_1)
+            self.assertIn("pulse.service_restarted", claude_md_1)
+
+            # Ack only the pulse event
+            self._run(repo, "ack", "--type", "pulse.service_restarted", "--reason", "fixed")
+
+            # Re-focus — pulse event should be hidden, others visible
+            # Overwrite journal to same content (focus appends its own events)
+            with (journal_dir / "journal.jsonl").open("w", encoding="utf-8") as f:
+                for ev in events:
+                    f.write(json.dumps(ev) + "\n")
+
+            self._run(repo, "focus", "personal")
+            claude_md_2 = (repo / "home" / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
+            self.assertIn("Recent Activity", claude_md_2)
+            self.assertNotIn("pulse.service_restarted", claude_md_2)
+            self.assertIn("acknowledged events hidden", claude_md_2)
+
+    def test_ack_by_type_filters_matching_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._run(repo, "sync", "--client", "personal")
+
+            # Generate some journal events
+            self._run(repo, "focus", "personal")
+
+            # Ack only focus.activated events
+            result = self._run(
+                repo, "ack", "--type", "focus.activated", "--reason", "noted", "--format", "json",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            for item in payload["acked"]:
+                self.assertEqual(item["type"], "focus.activated")
+
+    def test_ack_by_subject_filters_matching_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._run(repo, "sync", "--client", "personal")
+            self._run(repo, "focus", "personal")
+
+            result = self._run(
+                repo, "ack", "--subject", "personal", "--reason", "handled", "--format", "json",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            for item in payload["acked"]:
+                self.assertEqual(item["subject"], "personal")
+
+    def test_ack_list_shows_current_acks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._run(repo, "sync", "--client", "personal")
+            self._run(repo, "focus", "personal")
+            self._run(repo, "ack", "--all", "--reason", "reviewed")
+
+            result = self._run(repo, "ack", "--list", "--format", "json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertGreater(payload["count"], 0)
+
+    def test_ack_requires_filter_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(repo, "ack", "--format", "json")
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_ack_no_matching_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(
+                repo, "ack", "--type", "nonexistent.type", "--format", "json",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["count"], 0)
+
+    def test_ack_prune_removes_expired(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            # Write a fake ack store with an old entry
+            acks_dir = repo / "logs" / "runtime"
+            acks_dir.mkdir(parents=True, exist_ok=True)
+            import time as _time
+            old_ts = _time.time() - (25 * 3600)  # 25h ago — expired
+            (acks_dir / "journal.acks.json").write_text(
+                json.dumps({"12345.0": {"at": old_ts, "reason": "old"}}),
+                encoding="utf-8",
+            )
+
+            result = self._run(repo, "ack", "--prune", "--format", "json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["pruned"], 1)
+
+            # Store should be empty
+            acks = json.loads((acks_dir / "journal.acks.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(acks), 0)
 
 
 if __name__ == "__main__":

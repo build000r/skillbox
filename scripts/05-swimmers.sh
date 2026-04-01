@@ -63,6 +63,7 @@ inside_main() {
   local swimmers_install_dir="${SKILLBOX_SWIMMERS_INSTALL_DIR:-${home_root}/.local/bin}"
   local swimmers_bin="${SKILLBOX_SWIMMERS_BIN:-${swimmers_install_dir}/swimmers}"
   local swimmers_download_url="${SKILLBOX_SWIMMERS_DOWNLOAD_URL:-}"
+  local swimmers_download_sha256="${SKILLBOX_SWIMMERS_DOWNLOAD_SHA256:-}"
   local swimmers_auth_mode="${SKILLBOX_SWIMMERS_AUTH_MODE:-}"
   local swimmers_auth_token="${SKILLBOX_SWIMMERS_AUTH_TOKEN:-}"
   local swimmers_observer_token="${SKILLBOX_SWIMMERS_OBSERVER_TOKEN:-}"
@@ -97,6 +98,41 @@ inside_main() {
       printf 'Refusing to expose swimmers on %s without token auth. Set SKILLBOX_SWIMMERS_AUTH_MODE=token and SKILLBOX_SWIMMERS_AUTH_TOKEN.\n' "${swimmers_publish_host}" >&2
       return 1
     fi
+  }
+
+  validate_https_download_url() {
+    case "${1:-}" in
+      https://*)
+        return 0
+        ;;
+      *)
+        printf 'Refusing to download swimmers over a non-HTTPS URL: %s\n' "${1:-}" >&2
+        return 1
+        ;;
+    esac
+  }
+
+  normalize_sha256() {
+    local value="${1:-}"
+    value="${value,,}"
+    if [[ ! "${value}" =~ ^[0-9a-f]{64}$ ]]; then
+      return 1
+    fi
+    printf '%s\n' "${value}"
+  }
+
+  sha256_file() {
+    local path="${1:?missing file path}"
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum "${path}" | awk '{print $1}'
+      return 0
+    fi
+    if command -v shasum >/dev/null 2>&1; then
+      shasum -a 256 "${path}" | awk '{print $1}'
+      return 0
+    fi
+    printf 'Neither sha256sum nor shasum is available to verify downloads\n' >&2
+    return 1
   }
 
   binary_works() {
@@ -172,9 +208,27 @@ inside_main() {
     fi
 
     if [[ -n "${swimmers_download_url}" ]]; then
+      local expected_sha256
+      if ! validate_https_download_url "${swimmers_download_url}"; then
+        return 1
+      fi
+      expected_sha256="$(normalize_sha256 "${swimmers_download_sha256}")" || {
+        printf 'SKILLBOX_SWIMMERS_DOWNLOAD_SHA256 must be set to a 64-character hex SHA-256 digest when download URL is configured\n' >&2
+        return 1
+      }
       local tmp_bin
+      local actual_sha256
       tmp_bin="$(mktemp "${swimmers_install_dir}/swimmers.XXXXXX")"
       curl -fsSL "${swimmers_download_url}" -o "${tmp_bin}"
+      actual_sha256="$(sha256_file "${tmp_bin}")" || {
+        rm -f "${tmp_bin}"
+        return 1
+      }
+      if [[ "${actual_sha256}" != "${expected_sha256}" ]]; then
+        printf 'downloaded swimmers binary digest mismatch: expected %s, got %s\n' "${expected_sha256}" "${actual_sha256}" >&2
+        rm -f "${tmp_bin}"
+        return 1
+      fi
       chmod +x "${tmp_bin}"
       if ! binary_works "${tmp_bin}"; then
         printf 'downloaded swimmers binary is not executable: %s\n' "${swimmers_download_url}" >&2

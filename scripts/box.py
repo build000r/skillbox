@@ -12,6 +12,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import time
@@ -63,6 +65,69 @@ DEFAULT_SSH_OPTS = [
     "-o", "ConnectTimeout=10",
     "-o", "BatchMode=yes",
 ]
+REMOTE_ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def shell_join(args: list[str]) -> str:
+    return shlex.join([str(arg) for arg in args])
+
+
+def _validated_remote_env_key(raw_key: str) -> str:
+    key = str(raw_key).strip()
+    if not REMOTE_ENV_KEY_PATTERN.fullmatch(key):
+        raise RuntimeError(f"Invalid remote env var name: {raw_key!r}")
+    return key
+
+
+def build_remote_env_command(argv: list[str], env_vars: dict[str, str] | None = None) -> str:
+    if not env_vars:
+        return shell_join(argv)
+
+    command = ["env"]
+    for raw_key, raw_value in env_vars.items():
+        key = _validated_remote_env_key(raw_key)
+        command.append(f"{key}={raw_value}")
+    command.extend(argv)
+    return shell_join(command)
+
+
+def build_deploy_command(profile: "BoxProfile") -> str:
+    return " && ".join([
+        "cd",
+        shell_join(["git", "clone", "--branch", profile.skillbox_branch, profile.skillbox_repo, "skillbox"]),
+        "cd skillbox",
+        shell_join(["cp", ".env.example", ".env"]),
+        shell_join(["make", "build"]),
+        shell_join(["make", "up"]),
+    ])
+
+
+def build_onboard_manage_argv(box_id: str, blueprint: str | None, set_args: list[str]) -> list[str]:
+    argv = [
+        "docker",
+        "compose",
+        "exec",
+        "-T",
+        "workspace",
+        "python3",
+        ".env-manager/manage.py",
+        "onboard",
+        box_id,
+    ]
+    if blueprint:
+        argv.extend(["--blueprint", blueprint])
+    for set_arg in set_args:
+        argv.extend(["--set", set_arg])
+    argv.extend(["--format", "json"])
+    return argv
+
+
+def build_onboard_command(box_id: str, blueprint: str | None, set_args: list[str]) -> str:
+    return " && ".join([
+        "cd",
+        "cd skillbox",
+        shell_join(build_onboard_manage_argv(box_id, blueprint, set_args)),
+    ])
 
 # ---------------------------------------------------------------------------
 # Structured output (same protocol as manage.py)
@@ -157,8 +222,7 @@ def ssh_cmd(user: str, host: str, command: str, *, timeout: int = 300) -> subpro
 
 def ssh_script(user: str, host: str, script_path: Path, env_vars: dict[str, str] | None = None, *, timeout: int = 600) -> subprocess.CompletedProcess[str]:
     """Run a local script on a remote host via ssh + stdin."""
-    env_prefix = " ".join(f"{k}={v}" for k, v in (env_vars or {}).items())
-    remote_cmd = f"{env_prefix} bash -s" if env_prefix else "bash -s"
+    remote_cmd = build_remote_env_command(["bash", "-s"], env_vars)
     with script_path.open("r") as f:
         return subprocess.run(
             ["ssh", *DEFAULT_SSH_OPTS, f"{user}@{host}", remote_cmd],
@@ -554,13 +618,7 @@ def cmd_up(
             if not wait_for_ssh(ssh_target, user=profile.ssh_user, max_wait=30):
                 raise RuntimeError(f"Cannot reach {profile.ssh_user}@{ts_hostname} or {ip} via SSH")
 
-        deploy_cmds = " && ".join([
-            f"git clone --branch {profile.skillbox_branch} {profile.skillbox_repo} ~/skillbox",
-            "cd ~/skillbox",
-            "cp .env.example .env",
-            "make build",
-            "make up",
-        ])
+        deploy_cmds = build_deploy_command(profile)
         result = ssh_cmd(profile.ssh_user, ssh_target, deploy_cmds, timeout=600)
         if result.returncode != 0:
             raise RuntimeError(f"Deploy failed (exit {result.returncode}): {result.stderr[-500:]}")
@@ -583,28 +641,7 @@ def cmd_up(
         if not is_json:
             print(f"[...] onboard  Running onboard for client {box_id}...")
 
-        onboard_parts = [
-            "cd ~/skillbox",
-            "docker compose exec -T workspace python3 .env-manager/manage.py",
-            f"onboard {box_id}",
-        ]
-        if blueprint:
-            onboard_parts.append(f"--blueprint {blueprint}")
-        for s in set_args:
-            onboard_parts.append(f"--set {s}")
-        onboard_parts.append("--format json")
-
-        # Build the actual command: cd && docker compose exec runs manage.py
-        exec_cmd = (
-            f"cd ~/skillbox && docker compose exec -T workspace "
-            f"python3 .env-manager/manage.py onboard {box_id}"
-        )
-        if blueprint:
-            exec_cmd += f" --blueprint {blueprint}"
-        for s in set_args:
-            exec_cmd += f" --set {s}"
-        exec_cmd += " --format json"
-
+        exec_cmd = build_onboard_command(box_id, blueprint, set_args)
         result = ssh_cmd(profile.ssh_user, ssh_target, exec_cmd, timeout=300)
         if result.returncode not in (0, 2):  # 0=ok, 2=drift (acceptable on fresh box)
             raise RuntimeError(f"Onboard failed (exit {result.returncode}): {result.stderr[-500:]}")

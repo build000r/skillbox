@@ -44,6 +44,7 @@ right client context without standing up a full hosted workspace control plane.
 - declare one-shot bootstrap tasks and let services pull them in automatically
 - start and stop declared service graphs in dependency order with one command
 - focus on a client workspace with live state collection, enriched agent context, and continuous drift monitoring
+- acknowledge journal events to curate active context — acked events are hidden from CLAUDE.md so agents only see unresolved items
 - provision and tear down remote boxes from the operator machine via MCP tools
 - pin and package default skills locally
 - validate outer drift with `make doctor` and inner drift with `make dev-sanity`
@@ -57,6 +58,7 @@ right client context without standing up a full hosted workspace control plane.
 | A sane way to let the box grow over time | `workspace/runtime.yaml` plus `.env-manager/manage.py` manage the core machine plus client-specific repos, artifacts, installed skills, logs, and checks |
 | Service graphs that do not devolve into shell folklore | Declared `depends_on` edges let `up`, `down`, and `restart` expand and order service graphs automatically |
 | Live drift detection and auto-healing | The pulse daemon monitors services on a fixed interval, auto-restarts crashes, and emits structured events to a JSONL journal |
+| Context curation across sessions | `ack` marks journal events as handled so the next `focus` only surfaces unresolved items in CLAUDE.md — less noise, higher signal |
 | One-command client activation | `focus` syncs, bootstraps, starts services, collects live state, and writes enriched agent context in a single pass |
 | Fleet management from the operator machine | The operator MCP server provisions DO droplets, enrolls Tailscale, and runs commands on remote boxes as native agent tools |
 | Reproducible default skills | `03-skill-sync.sh` packages from a pinned manifest and vendored local packager |
@@ -149,6 +151,43 @@ What it does each cycle:
 
 The journal is queryable via the `skillbox_journal` MCP tool inside the
 container or via `query_journal()` in Python.
+
+## Event Acking
+
+The journal accumulates events over time. Without curation, the Recent
+Activity section in CLAUDE.md becomes noise — agents see resolved issues
+alongside unresolved ones and can't tell which need attention.
+
+`ack` lets agents and operators mark events as handled:
+
+```bash
+# ack all pulse restart events for a specific service
+make ack TYPE=pulse.service_restarted SUBJECT=api-stub REASON="fixed"
+
+# ack everything after reviewing the journal
+make ack ALL=1 REASON="reviewed"
+
+# see current acks
+make ack LIST=1
+
+# clean up expired acks (24h default)
+make ack PRUNE=1
+```
+
+Or via the `skillbox_ack` MCP tool inside the container.
+
+What this changes:
+
+- the **Recent Activity** section in CLAUDE.md hides acked events and shows
+  a count of how many were suppressed
+- the raw journal is never modified — acks are stored in a sidecar file at
+  `logs/runtime/journal.acks.json`
+- acks **expire after 24 hours** so nothing is permanently masked
+- if the same problem recurs, pulse emits a new event with a new timestamp
+  that is unacked by definition — the issue resurfaces automatically
+
+The result is that each `focus` activation shows only the events that still
+matter, and the context window shrinks as work gets done instead of growing.
 
 ## Swimmers Overlay
 
@@ -438,6 +477,7 @@ make runtime-sync
 | `make runtime-logs` | Shows recent service logs for the active scope |
 | `make onboard` | Scaffold and activate a new client overlay with optional blueprint |
 | `make context` | Generates `CLAUDE.md` and `AGENTS.md` from the resolved runtime graph |
+| `make ack` | Acknowledge journal events to curate agent context (`TYPE=name SUBJECT=name ALL=1 LIST=1 PRUNE=1 REASON=text`) |
 | `make dev-sanity` | Validates the internal runtime graph, filesystem readiness, and managed skill integrity |
 | `make pulse-start` | Starts the pulse reconciliation daemon |
 | `make pulse-stop` | Sends SIGTERM to the running pulse daemon |
@@ -476,6 +516,7 @@ make runtime-sync
 | `scripts/guard-destructive-op.sh` | PreToolUse hook gating destructive operator tools | Called automatically by Claude Code hooks |
 | `.env-manager/manage.py context` | Generate CLAUDE.md and AGENTS.md from the resolved runtime graph | `python3 .env-manager/manage.py context --client personal` |
 | `.env-manager/manage.py focus` | Activate a client with live state and enriched context | `python3 .env-manager/manage.py focus personal --format json` |
+| `.env-manager/manage.py ack` | Acknowledge journal events to curate active context | `python3 .env-manager/manage.py ack --type pulse.service_restarted --subject api-stub --reason "fixed"` |
 | `.env-manager/manage.py render` | Print the resolved internal runtime graph | `python3 .env-manager/manage.py render --format json` |
 | `.env-manager/manage.py sync` | Create managed repo/artifact/log directories and install declared skills for the selected core/client scope | `python3 .env-manager/manage.py sync --client personal --dry-run` |
 | `.env-manager/manage.py doctor` | Validate the internal repos/skills/logs/check graph for the selected core/client scope | `python3 .env-manager/manage.py doctor --client personal` |
@@ -891,6 +932,8 @@ agents tools to manage their own environment:
 | `skillbox_client_init` | Create a new client overlay from blueprint |
 | `skillbox_pulse` | Query pulse daemon status |
 | `skillbox_journal` | Query the event journal |
+| `skillbox_journal_write` | Write an agent event to the journal |
+| `skillbox_ack` | Acknowledge events to curate active context |
 
 ### Outside the box (operator tools)
 
@@ -1057,6 +1100,14 @@ An append-only JSONL file at `logs/runtime/journal.jsonl`. Every significant
 runtime event (service start/stop/crash, sync completion, focus activation,
 pulse restarts) is recorded with a timestamp, type, subject, and detail
 object. Agents can query it via the `skillbox_journal` MCP tool.
+
+### What is event acking?
+
+A way to mark journal events as "handled" so they stop appearing in the
+Recent Activity section of CLAUDE.md. Acks are stored in a sidecar file
+(`logs/runtime/journal.acks.json`), never modify the journal itself, and
+expire after 24 hours. If a problem recurs, new events surface automatically.
+Use `make ack` or the `skillbox_ack` MCP tool.
 
 ### How does the destructive-op guard work?
 

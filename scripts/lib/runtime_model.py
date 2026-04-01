@@ -27,15 +27,18 @@ RUNTIME_ENV_KEYS = [
     "SKILLBOX_SWIMMERS_INSTALL_DIR",
     "SKILLBOX_SWIMMERS_BIN",
     "SKILLBOX_SWIMMERS_DOWNLOAD_URL",
+    "SKILLBOX_SWIMMERS_DOWNLOAD_SHA256",
     "SKILLBOX_SWIMMERS_AUTH_MODE",
     "SKILLBOX_SWIMMERS_AUTH_TOKEN",
     "SKILLBOX_SWIMMERS_OBSERVER_TOKEN",
     "SKILLBOX_DCG_BIN",
     "SKILLBOX_DCG_DOWNLOAD_URL",
+    "SKILLBOX_DCG_DOWNLOAD_SHA256",
     "SKILLBOX_DCG_PACKS",
     "SKILLBOX_DCG_MCP_PORT",
     "SKILLBOX_FWC_BIN",
     "SKILLBOX_FWC_DOWNLOAD_URL",
+    "SKILLBOX_FWC_DOWNLOAD_SHA256",
     "SKILLBOX_FWC_MCP_PORT",
     "SKILLBOX_FWC_ZONE",
     "SKILLBOX_FWC_CONNECTORS",
@@ -122,15 +125,18 @@ def load_runtime_env(root_dir: Path) -> dict[str, str]:
         "SKILLBOX_SWIMMERS_INSTALL_DIR": "/home/sandbox/.local/bin",
         "SKILLBOX_SWIMMERS_BIN": "/home/sandbox/.local/bin/swimmers",
         "SKILLBOX_SWIMMERS_DOWNLOAD_URL": "",
+        "SKILLBOX_SWIMMERS_DOWNLOAD_SHA256": "",
         "SKILLBOX_SWIMMERS_AUTH_MODE": "",
         "SKILLBOX_SWIMMERS_AUTH_TOKEN": "",
         "SKILLBOX_SWIMMERS_OBSERVER_TOKEN": "",
         "SKILLBOX_DCG_BIN": "/home/sandbox/.local/bin/dcg",
         "SKILLBOX_DCG_DOWNLOAD_URL": "",
+        "SKILLBOX_DCG_DOWNLOAD_SHA256": "",
         "SKILLBOX_DCG_PACKS": "core.git,core.filesystem",
         "SKILLBOX_DCG_MCP_PORT": "3220",
         "SKILLBOX_FWC_BIN": "/home/sandbox/.local/bin/fwc",
         "SKILLBOX_FWC_DOWNLOAD_URL": "",
+        "SKILLBOX_FWC_DOWNLOAD_SHA256": "",
         "SKILLBOX_FWC_MCP_PORT": "3221",
         "SKILLBOX_FWC_ZONE": "work",
         "SKILLBOX_FWC_CONNECTORS": "github,slack,linear",
@@ -292,6 +298,8 @@ def _normalize_runtime_sections(
         }
         if client.get("dcg"):
             client_meta["dcg"] = client["dcg"]
+        if client.get("context"):
+            client_meta["context"] = client["context"]
         clients_meta.append(client_meta)
         repos.extend(
             _normalize_client_repo_roots(

@@ -39,6 +39,7 @@ core:
       source:
         kind: url
         url: ${SKILLBOX_SWIMMERS_DOWNLOAD_URL}
+        sha256: ${SKILLBOX_SWIMMERS_DOWNLOAD_SHA256}
         executable: true
       sync:
         mode: download-if-missing
@@ -53,6 +54,7 @@ core:
       source:
         kind: url
         url: ${SKILLBOX_DCG_DOWNLOAD_URL}
+        sha256: ${SKILLBOX_DCG_DOWNLOAD_SHA256}
         executable: true
       sync:
         mode: download-if-missing
@@ -303,6 +305,7 @@ connectors:
       source:
         kind: url
         url: ${SKILLBOX_FWC_DOWNLOAD_URL}
+        sha256: ${SKILLBOX_FWC_DOWNLOAD_SHA256}
         executable: true
       sync:
         mode: download-if-missing

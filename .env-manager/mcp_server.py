@@ -437,6 +437,52 @@ TOOLS: list[dict] = [
             },
         },
     },
+    # --- Context curation ---
+    {
+        "name": "skillbox_ack",
+        "description": (
+            "Acknowledge journal events to curate active context. "
+            "Acked events are hidden from the Recent Activity section in CLAUDE.md on next focus. "
+            "Use after investigating or resolving an issue so the next session sees only unresolved items. "
+            "Acks expire after 24h — if a problem recurs, new events surface normally. "
+            "Use list=true to see current acks. Use skillbox_journal first to see events to ack."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "event_type": {
+                    "type": "string",
+                    "description": (
+                        "Ack all events of this type. "
+                        "Common types: pulse.service_restarted, service.start_failed, "
+                        "focus.activated, onboard.completed, agent.note."
+                    ),
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "Ack events for this subject (e.g. a service ID or client ID).",
+                },
+                "ts": {
+                    "type": "number",
+                    "description": "Ack a specific event by its exact timestamp.",
+                },
+                "all": {
+                    "type": "boolean",
+                    "description": "Ack all unacked events. Use after reviewing the full journal.",
+                    "default": False,
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why this was acknowledged (e.g. 'fixed', 'investigating', 'expected').",
+                },
+                "list": {
+                    "type": "boolean",
+                    "description": "List current acks instead of creating new ones.",
+                    "default": False,
+                },
+            },
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -604,6 +650,50 @@ def _handle_journal_write(params: dict) -> dict:
     return _ok_content({"written": True, "event_type": event_type, "subject": subject})
 
 
+def _handle_ack(params: dict) -> dict:
+    """Acknowledge journal events to curate context."""
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    from manage import ack_events, read_acks, DEFAULT_ROOT_DIR
+
+    if params.get("list"):
+        ack_data = read_acks(DEFAULT_ROOT_DIR)
+        return _ok_content({"acks": ack_data, "count": len(ack_data)})
+
+    event_type = params.get("event_type")
+    subject = params.get("subject")
+    ts = params.get("ts")
+    ack_all = params.get("all", False)
+    reason = params.get("reason", "")
+
+    if not event_type and not subject and ts is None and not ack_all:
+        return _error_content({
+            "error": {
+                "type": "missing_parameter",
+                "message": "Provide event_type, subject, ts, or all=true to specify which events to ack.",
+                "recoverable": True,
+                "recovery_hint": "Use skillbox_journal first to see events, then ack by type or subject.",
+            }
+        })
+
+    if ts is not None:
+        ts = float(ts)
+
+    acked_items = ack_events(
+        DEFAULT_ROOT_DIR,
+        event_type=event_type,
+        subject=subject,
+        ts=ts,
+        ack_all=ack_all,
+        reason=reason,
+    )
+    return _ok_content({
+        "acked": acked_items,
+        "count": len(acked_items),
+        "next_actions": ["skillbox_status"],
+    })
+
+
 def dispatch_tool(name: str, params: dict) -> dict:
     """Dispatch a tool call to manage.py and return a MCP content block."""
     if name == "skillbox_pulse":
@@ -612,13 +702,15 @@ def dispatch_tool(name: str, params: dict) -> dict:
         return _handle_journal(params)
     if name == "skillbox_journal_write":
         return _handle_journal_write(params)
+    if name == "skillbox_ack":
+        return _handle_ack(params)
 
     if name not in _DISPATCH:
         return _error_content({
             "error": {
                 "type": "unknown_tool",
                 "message": f"Unknown tool: '{name}'.",
-                "available_tools": sorted(list(_DISPATCH.keys()) + ["skillbox_pulse", "skillbox_journal", "skillbox_journal_write"]),
+                "available_tools": sorted(list(_DISPATCH.keys()) + ["skillbox_pulse", "skillbox_journal", "skillbox_journal_write", "skillbox_ack"]),
                 "recoverable": False,
             }
         })

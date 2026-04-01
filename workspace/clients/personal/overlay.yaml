@@ -42,6 +42,21 @@ client:
         - core
       retention_days: 14
       notes: Client-scoped logs for the personal overlay.
+  context:
+    cwd_match:
+      - ${SKILLBOX_MONOSERVER_ROOT}
+
+    plans:
+      plan_root: plans/released
+      plan_draft: plans/draft
+      plan_index: plans/INDEX.md
+      session_plans: plans/sessions
+
+    # deploy: {}      # populate with repo_slug_*, droplet_ssh, health_url_*, etc.
+    # backend: {}     # populate with repo, domain_path, migration_tool, etc.
+    # frontend: {}    # populate with repo, features_path, types_path, etc.
+    # auth: {}        # populate with packages_root, python_packages, npm_packages
+
   checks:
     - id: personal-root
       type: path_exists

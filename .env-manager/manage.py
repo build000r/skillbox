@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import asdict, dataclass
@@ -57,6 +58,7 @@ CONTEXT_SYMLINK_TARGET = os.path.join("..", ".claude", "CLAUDE.md")
 CLIENT_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 BLUEPRINT_VARIABLE_PATTERN = re.compile(r"^[A-Z0-9_]+$")
 SCAFFOLD_PLACEHOLDER_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
+SHA256_HEX_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")
 DEFAULT_SERVICE_START_WAIT_SECONDS = 10.0
 DEFAULT_SERVICE_STOP_WAIT_SECONDS = 5.0
 DEFAULT_LOG_TAIL_LINES = 40
@@ -346,6 +348,109 @@ def query_journal(
         events.append(ev)
     events.reverse()
     return events[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Event acknowledgement
+# ---------------------------------------------------------------------------
+
+ACKS_REL = Path("logs") / "runtime" / "journal.acks.json"
+DEFAULT_ACK_EXPIRY_HOURS = 24
+
+
+def read_acks(root_dir: Path = DEFAULT_ROOT_DIR) -> dict[str, Any]:
+    """Read the ack store. Keys are stringified event timestamps."""
+    acks_path = root_dir / ACKS_REL
+    if not acks_path.is_file():
+        return {}
+    try:
+        return json.loads(acks_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_acks(acks: dict[str, Any], root_dir: Path = DEFAULT_ROOT_DIR) -> None:
+    """Write the ack store."""
+    acks_path = root_dir / ACKS_REL
+    acks_path.parent.mkdir(parents=True, exist_ok=True)
+    acks_path.write_text(json.dumps(acks, indent=2), encoding="utf-8")
+
+
+def is_acked(
+    acks: dict[str, Any],
+    event_ts: float,
+    expiry_hours: float = DEFAULT_ACK_EXPIRY_HOURS,
+) -> bool:
+    """Check whether a journal event has been acknowledged and the ack is still live."""
+    key = str(event_ts)
+    entry = acks.get(key)
+    if not entry:
+        return False
+    acked_at = entry.get("at", 0)
+    now = time.time()
+    if expiry_hours > 0 and (now - acked_at) > (expiry_hours * 3600):
+        return False
+    return True
+
+
+def ack_events(
+    root_dir: Path,
+    *,
+    event_type: str | None = None,
+    subject: str | None = None,
+    ts: float | None = None,
+    ack_all: bool = False,
+    reason: str = "",
+    since_hours: float = DEFAULT_ACK_EXPIRY_HOURS,
+) -> list[dict[str, Any]]:
+    """Acknowledge matching journal events. Returns list of newly acked items."""
+    since = time.time() - (since_hours * 3600) if not ack_all else None
+    events = query_journal(root_dir, since=since, limit=500)
+    acks = read_acks(root_dir)
+    now = time.time()
+    newly_acked: list[dict[str, Any]] = []
+
+    for ev in events:
+        ev_ts = ev.get("ts", 0)
+        key = str(ev_ts)
+        if key in acks:
+            continue
+        if ts is not None:
+            if ev_ts != ts:
+                continue
+        elif not ack_all:
+            if event_type and ev.get("type") != event_type:
+                continue
+            if subject and ev.get("subject") != subject:
+                continue
+
+        acks[key] = {"at": now, "reason": reason}
+        newly_acked.append({
+            "ts": ev_ts,
+            "type": ev.get("type"),
+            "subject": ev.get("subject"),
+        })
+
+    if newly_acked:
+        save_acks(acks, root_dir)
+
+    return newly_acked
+
+
+def prune_expired_acks(
+    root_dir: Path,
+    expiry_hours: float = DEFAULT_ACK_EXPIRY_HOURS,
+) -> int:
+    """Remove expired acks from the store. Returns count of pruned entries."""
+    acks = read_acks(root_dir)
+    now = time.time()
+    cutoff = now - (expiry_hours * 3600)
+    expired_keys = [k for k, v in acks.items() if v.get("at", 0) < cutoff]
+    for k in expired_keys:
+        del acks[k]
+    if expired_keys:
+        save_acks(acks, root_dir)
+    return len(expired_keys)
 
 
 def resolve_root_dir(raw_root: str | None) -> Path:
@@ -1088,6 +1193,28 @@ def artifact_source_configured(artifact: dict[str, Any]) -> bool:
     return False
 
 
+def normalize_sha256(raw_value: Any, *, label: str) -> str:
+    value = str(raw_value or "").strip().lower()
+    if not value:
+        raise RuntimeError(f"{label} is missing")
+    if not SHA256_HEX_PATTERN.fullmatch(value):
+        raise RuntimeError(f"{label} must be a 64-character hex SHA-256 digest")
+    return value
+
+
+def validate_url_download_source(source: dict[str, Any], *, artifact_id: str) -> tuple[str, str]:
+    url = str(source.get("url") or "").strip()
+    if not url:
+        raise RuntimeError(f"artifact {artifact_id} is url-backed but missing source.url")
+
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme.lower() != "https":
+        raise RuntimeError(f"artifact {artifact_id} download url must use https: {url}")
+
+    sha256 = normalize_sha256(source.get("sha256"), label=f"artifact {artifact_id} source.sha256")
+    return url, sha256
+
+
 def remove_path(path: Path) -> None:
     if not path.exists() and not path.is_symlink():
         return
@@ -1798,6 +1925,11 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
         )
         if sync_mode not in VALID_ARTIFACT_SYNC_MODES:
             issues.append(f"artifact {artifact.get('id')} has unsupported sync.mode {sync_mode!r}")
+        if source_kind == "url" and str(source.get("url") or "").strip():
+            try:
+                validate_url_download_source(source, artifact_id=str(artifact.get("id", "(missing id)")))
+            except RuntimeError as exc:
+                issues.append(str(exc))
 
     for env_file in model["env_files"]:
         if not env_file.get("id"):
@@ -2441,15 +2573,21 @@ def sync_artifact(artifact: dict[str, Any], dry_run: bool) -> list[str]:
         return [f"exists: {path}"]
 
     if sync_mode == "download-if-missing" and source_kind == "url":
-        url = str(source.get("url") or "").strip()
-        if not url:
+        if not str(source.get("url") or "").strip():
             return [f"skip: {path} (artifact source url missing)"]
+        url, expected_sha256 = validate_url_download_source(source, artifact_id=str(artifact["id"]))
         ensure_directory(path.parent, dry_run)
         if dry_run:
             return [f"download-if-missing: {url} -> {path}"]
 
-        with urllib.request.urlopen(url) as response:
+        with urllib.request.urlopen(url, timeout=30) as response:
             payload = response.read()
+        actual_sha256 = hashlib.sha256(payload).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise RuntimeError(
+                f"artifact {artifact['id']} digest mismatch for {url}: "
+                f"expected {expected_sha256}, got {actual_sha256}"
+            )
         tmp_path = path.parent / f".{path.name}.tmp"
         tmp_path.write_bytes(payload)
         if source.get("executable", False):
@@ -3753,6 +3891,14 @@ def generate_context_markdown(model: dict[str, Any]) -> str:
         lines.append(f"- Default CWD: `{default_cwd}`")
     if active_profiles:
         lines.append(f"- Profiles: {', '.join(active_profiles)}")
+
+    # Skill context pointer
+    for cid_env in active_clients:
+        client_data_env = clients_data.get(cid_env, {})
+        if client_data_env.get("context"):
+            ctx_path = f"workspace/clients/{cid_env}/context.yaml"
+            lines.append(f"- Skill context: `$SKILLBOX_CLIENT_CONTEXT` → `{ctx_path}`")
+            break
     lines.append("")
 
     # Repos
@@ -3945,14 +4091,19 @@ def generate_live_context_markdown(
             for err_line in errors[-3:]:
                 attention.append(f"  `{err_line.strip()[:120]}`")
 
-    # --- Recent Activity (from journal) ---
-    recent = query_journal(root_dir, limit=12)
-    if recent:
+    # --- Recent Activity (from journal, excluding acked events) ---
+    acks = read_acks(root_dir)
+    recent = query_journal(root_dir, limit=20)
+    unacked = [ev for ev in recent if not is_acked(acks, ev["ts"])]
+    acked_count = len(recent) - len(unacked)
+    if unacked:
         lines.append("## Recent Activity")
         lines.append("")
-        for ev in recent:
+        for ev in unacked:
             ts_str = time.strftime("%H:%M", time.localtime(ev["ts"]))
             lines.append(f"- `{ts_str}` **{ev['type']}** {ev['subject']}")
+        if acked_count > 0:
+            lines.append(f"- _{acked_count} acknowledged events hidden_")
         lines.append("")
 
     if attention:
@@ -4005,6 +4156,72 @@ def sync_live_context(
     )
 
     emit_event("context.generated", "live-context", root_dir=root_dir)
+    return actions
+
+
+def _resolve_context_paths(
+    context: dict[str, Any], client_dir: Path,
+) -> dict[str, Any]:
+    """Resolve relative paths in a context dict to absolute paths under client_dir.
+
+    A value is treated as a relative path if it doesn't start with ``/`` and
+    contains no spaces (heuristic: avoids mangling descriptions or list items).
+    """
+    resolved: dict[str, Any] = {}
+    for key, value in context.items():
+        if isinstance(value, dict):
+            resolved[key] = _resolve_context_paths(value, client_dir)
+        elif isinstance(value, str) and not value.startswith("/") and " " not in value and "/" in value:
+            resolved[key] = str(client_dir / value)
+        elif isinstance(value, list):
+            resolved[key] = [
+                str(client_dir / v)
+                if isinstance(v, str) and not v.startswith("/") and " " not in v and "/" in v
+                else v
+                for v in value
+            ]
+        else:
+            resolved[key] = value
+    return resolved
+
+
+def generate_skill_context(
+    model: dict[str, Any], root_dir: Path, dry_run: bool,
+) -> list[str]:
+    """Write a resolved context.yaml for each active client that declares context."""
+    yaml_mod = require_yaml("generate skill context")
+    actions: list[str] = []
+    active_ids = set(model.get("active_clients") or [])
+
+    for client in model.get("clients") or []:
+        cid = client.get("id", "")
+        if cid not in active_ids:
+            continue
+        raw_context = client.get("context")
+        if not raw_context or not isinstance(raw_context, dict):
+            continue
+
+        client_dir = root_dir / "workspace" / "clients" / cid
+        resolved = _resolve_context_paths(raw_context, client_dir)
+        resolved["client_id"] = cid
+        resolved["client_dir"] = str(client_dir)
+
+        header = (
+            f"# AUTO-GENERATED by focus. Do not edit.\n"
+            f"# Source: workspace/clients/{cid}/overlay.yaml\n"
+            f"# Generated: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n\n"
+        )
+        body = yaml_mod.safe_dump(resolved, sort_keys=False, default_flow_style=False)
+        out_path = client_dir / "context.yaml"
+
+        if not dry_run:
+            ensure_directory(client_dir, dry_run=False)
+            out_path.write_text(header + body, encoding="utf-8")
+
+        actions.append(f"write-skill-context: {repo_rel(root_dir, out_path)}")
+
+    if actions:
+        emit_event("skill-context.generated", "focus", root_dir=root_dir)
     return actions
 
 
@@ -4584,21 +4801,34 @@ def run_focus(
         step("collect", "fail", {"error": str(exc)})
         live = {"collected_at": time.time(), "repos": [], "services": [], "checks": [], "logs": []}
 
-    # --- 5. Generate enriched context -----------------------------------------
+    # --- 5. Generate skill context.yaml ---------------------------------------
+    try:
+        skill_ctx_actions = generate_skill_context(model, root_dir, dry_run=False)
+        if skill_ctx_actions:
+            step("skill-context", "ok", {"actions": skill_ctx_actions})
+        else:
+            step("skill-context", "skip", {"reason": "no client context declared"})
+    except Exception as exc:
+        step("skill-context", "fail", {"error": str(exc)})
+
+    # --- 6. Generate enriched context -----------------------------------------
     try:
         context_actions = sync_live_context(model, live, root_dir)
         step("context", "ok", {"actions": context_actions})
     except RuntimeError as exc:
         step("context", "fail", {"error": str(exc)})
 
-    # --- 6. Persist focus state -----------------------------------------------
-    focus_data = {
+    # --- 7. Persist focus state -----------------------------------------------
+    ctx_yaml_path = root_dir / "workspace" / "clients" / cid / "context.yaml"
+    focus_data: dict[str, Any] = {
         "version": 1,
         "client_id": cid,
         "active_profiles": sorted(model.get("active_profiles") or []),
         "focused_at": time.time(),
         "service_filter": service_filter or None,
     }
+    if ctx_yaml_path.is_file():
+        focus_data["skill_context_path"] = str(ctx_yaml_path)
     try:
         focus_path.write_text(
             json.dumps(focus_data, indent=2), encoding="utf-8",
@@ -4888,6 +5118,37 @@ def main() -> int:
     focus_parser.add_argument("--format", choices=("text", "json"), default="text")
     add_service_arg(focus_parser)
 
+    ack_parser = subparsers.add_parser(
+        "ack",
+        help="Acknowledge journal events to remove them from active context.",
+    )
+    ack_parser.add_argument(
+        "--type", default=None, dest="event_type",
+        help="Ack events of this type (e.g. pulse.service_restarted).",
+    )
+    ack_parser.add_argument(
+        "--subject", default=None,
+        help="Ack events with this subject (e.g. a service or client ID).",
+    )
+    ack_parser.add_argument(
+        "--ts", type=float, default=None,
+        help="Ack a specific event by its exact timestamp.",
+    )
+    ack_parser.add_argument(
+        "--all", action="store_true", dest="ack_all",
+        help="Ack all unacked events.",
+    )
+    ack_parser.add_argument("--reason", default="", help="Why this was acknowledged.")
+    ack_parser.add_argument(
+        "--list", action="store_true", dest="list_acks",
+        help="List current acks instead of creating new ones.",
+    )
+    ack_parser.add_argument(
+        "--prune", action="store_true",
+        help="Remove expired acks from the store.",
+    )
+    ack_parser.add_argument("--format", choices=("text", "json"), default="text")
+
     args = parser.parse_args()
     root_dir = resolve_root_dir(args.root_dir)
 
@@ -4969,6 +5230,54 @@ def main() -> int:
             wait_seconds=max(0.0, float(args.wait_seconds)),
             fmt=args.format,
         )
+
+    if args.command == "ack":
+        if args.list_acks:
+            ack_data = read_acks(root_dir)
+            if args.format == "json":
+                emit_json({"acks": ack_data, "count": len(ack_data)})
+            else:
+                if not ack_data:
+                    print("No active acks.")
+                else:
+                    for key, entry in ack_data.items():
+                        age = time.time() - entry.get("at", 0)
+                        age_str = f"{int(age / 3600)}h ago" if age >= 3600 else f"{int(age / 60)}m ago"
+                        reason = entry.get("reason", "")
+                        reason_str = f" — {reason}" if reason else ""
+                        print(f"  ts={key} acked {age_str}{reason_str}")
+            return EXIT_OK
+
+        if args.prune:
+            pruned = prune_expired_acks(root_dir)
+            if args.format == "json":
+                emit_json({"pruned": pruned})
+            else:
+                print(f"Pruned {pruned} expired acks.")
+            return EXIT_OK
+
+        if not args.event_type and not args.subject and args.ts is None and not args.ack_all:
+            print("ack requires --type, --subject, --ts, or --all.", file=sys.stderr)
+            return EXIT_ERROR
+
+        acked_items = ack_events(
+            root_dir,
+            event_type=args.event_type,
+            subject=args.subject,
+            ts=args.ts,
+            ack_all=args.ack_all,
+            reason=args.reason,
+        )
+        if args.format == "json":
+            emit_json({"acked": acked_items, "count": len(acked_items), "next_actions": ["status --format json"]})
+        else:
+            if acked_items:
+                for item in acked_items:
+                    print(f"  acked: {item['type']} {item['subject']}")
+                print(f"\n{len(acked_items)} events acknowledged.")
+            else:
+                print("No matching events to ack.")
+        return EXIT_OK
 
     model = build_runtime_model(root_dir)
     active_profiles = normalize_active_profiles(getattr(args, "profile", []))

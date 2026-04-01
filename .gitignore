@@ -27,5 +27,6 @@ workspace/clients/*/skills.lock.json
 workspace/secrets/
 workspace/boxes.json
 workspace/.focus.json
+workspace/clients/*/context.yaml
 .env.box
 .dcg.toml
