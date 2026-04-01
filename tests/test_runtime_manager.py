@@ -1114,6 +1114,342 @@ class RuntimeManagerTests(unittest.TestCase):
                 {"skillbox-self", "managed-repos", "legacy-inline-root"},
             )
 
+    def test_client_project_writes_single_client_bundle_with_sanitized_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            (repo / ".env").write_text("SKILLBOX_SWIMMERS_AUTH_TOKEN=top-secret\n", encoding="utf-8")
+
+            result = self._run(repo, "client-project", "personal", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            projection_dir = (repo / "builds" / "clients" / "personal").resolve()
+            self.assertEqual(payload["output_dir"], str(projection_dir))
+
+            self.assertTrue((projection_dir / "workspace" / "runtime.yaml").is_file())
+            self.assertTrue((projection_dir / "projection.json").is_file())
+            self.assertTrue((projection_dir / "runtime-model.json").is_file())
+            self.assertTrue((projection_dir / "workspace" / "clients" / "personal" / "overlay.yaml").is_file())
+            self.assertTrue((projection_dir / "workspace" / "clients" / "personal" / "skills.manifest").is_file())
+            self.assertTrue((projection_dir / "workspace" / "clients" / "personal" / "skills.sources.yaml").is_file())
+            self.assertTrue((projection_dir / "default-skills" / "sample-skill.skill").is_file())
+            self.assertTrue((projection_dir / "default-skills" / "clients" / "personal" / "personal-skill.skill").is_file())
+
+            self.assertFalse((projection_dir / "workspace" / "clients" / "vibe-coding-client").exists())
+            self.assertFalse((projection_dir / "default-skills" / "clients" / "vibe-coding-client").exists())
+
+            runtime_doc = MANAGE_MODULE.load_yaml(projection_dir / "workspace" / "runtime.yaml")
+            self.assertEqual(runtime_doc["selection"]["default_client"], "personal")
+            runtime_text = (projection_dir / "workspace" / "runtime.yaml").read_text(encoding="utf-8")
+            self.assertNotIn("vibe-coding-client", runtime_text)
+
+            projection_payload = json.loads((projection_dir / "projection.json").read_text(encoding="utf-8"))
+            self.assertEqual(projection_payload["client_id"], "personal")
+            self.assertEqual(projection_payload["overlay_mode"], "overlay")
+            projected_paths = {item["path"] for item in projection_payload["files"]}
+            self.assertIn("workspace/runtime.yaml", projected_paths)
+            self.assertNotIn("workspace/clients/vibe-coding-client/overlay.yaml", projected_paths)
+
+            model_text = (projection_dir / "runtime-model.json").read_text(encoding="utf-8")
+            model_payload = json.loads(model_text)
+            self.assertEqual(model_payload["active_clients"], ["personal"])
+            self.assertEqual(model_payload["active_profiles"], ["core"])
+            self.assertNotIn("_host_path", model_text)
+            self.assertNotIn("SKILLBOX_SWIMMERS_AUTH_TOKEN", model_text)
+            self.assertNotIn("SKILLBOX_CLIENTS_HOST_ROOT", model_text)
+            self.assertNotIn(str(repo), model_text)
+
+    def test_client_project_supports_custom_output_dir_and_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(
+                repo,
+                "client-project",
+                "personal",
+                "--profile",
+                "surfaces",
+                "--output-dir",
+                "./artifacts/projection-personal",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            projection_dir = (repo / "artifacts" / "projection-personal").resolve()
+            self.assertEqual(payload["output_dir"], str(projection_dir))
+
+            model_payload = json.loads((projection_dir / "runtime-model.json").read_text(encoding="utf-8"))
+            self.assertEqual(model_payload["active_profiles"], ["core", "surfaces"])
+            self.assertEqual(
+                {item["id"] for item in model_payload["services"]},
+                {"internal-env-manager", "api-stub", "web-stub"},
+            )
+
+    def test_client_project_refuses_to_overwrite_non_projection_output_without_force(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            existing_dir = repo / "artifacts" / "existing"
+            existing_dir.mkdir(parents=True, exist_ok=True)
+            (existing_dir / "note.txt").write_text("keep me\n", encoding="utf-8")
+
+            result = self._run(
+                repo,
+                "client-project",
+                "personal",
+                "--output-dir",
+                "./artifacts/existing",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 1)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["error"]["type"], "conflict")
+            self.assertIn("already exists", payload["error"]["message"])
+
+    def test_client_publish_writes_current_payload_and_latest_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._init_git_repo(repo)
+            control_repo = self._create_git_source_repo(repo, "control-plane")
+
+            result = self._run(
+                repo,
+                "client-publish",
+                "personal",
+                "--target-dir",
+                "./fixtures/control-plane",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            current_dir = control_repo / "clients" / "personal" / "current"
+            publish_path = control_repo / "clients" / "personal" / "publish.json"
+
+            self.assertTrue(payload["changed"])
+            self.assertFalse(payload["committed"])
+            self.assertTrue((current_dir / "workspace" / "runtime.yaml").is_file())
+            self.assertTrue((current_dir / "projection.json").is_file())
+            self.assertTrue((current_dir / "runtime-model.json").is_file())
+            self.assertFalse((current_dir / "workspace" / "clients" / "vibe-coding-client").exists())
+
+            publish_payload = json.loads(publish_path.read_text(encoding="utf-8"))
+            self.assertEqual(publish_payload["client_id"], "personal")
+            self.assertEqual(publish_payload["payload_tree_sha256"], payload["payload_tree_sha256"])
+            self.assertEqual(publish_payload["active_profiles"], ["core"])
+            self.assertEqual(publish_payload["source_commit"], self._git_head(repo))
+
+    def test_client_publish_can_commit_existing_bundle_to_target_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._init_git_repo(repo)
+            control_repo = self._create_git_source_repo(repo, "control-plane")
+
+            project = self._run(repo, "client-project", "personal", "--format", "json")
+            self.assertEqual(project.returncode, 0, project.stderr)
+
+            result = self._run(
+                repo,
+                "client-publish",
+                "personal",
+                "--from-bundle",
+                "./builds/clients/personal",
+                "--target-dir",
+                "./fixtures/control-plane",
+                "--commit",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["changed"])
+            self.assertTrue(payload["committed"])
+            self.assertTrue(payload["commit_hash"])
+            self.assertTrue((control_repo / "clients" / "personal" / "current" / "projection.json").is_file())
+
+            commit_subject = subprocess.run(
+                ["git", "log", "--format=%s", "-1"],
+                cwd=control_repo,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(commit_subject.returncode, 0, commit_subject.stderr)
+            self.assertEqual(commit_subject.stdout.strip(), "chore(client-publish): publish personal bundle")
+
+    def test_client_publish_unknown_client_leaves_target_repo_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            control_repo = self._create_git_source_repo(repo, "control-plane")
+
+            result = self._run(
+                repo,
+                "client-publish",
+                "nonexistent",
+                "--target-dir",
+                "./fixtures/control-plane",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 1)
+            payload = json.loads(result.stdout)
+            self.assertIn("Unknown runtime client", payload["error"]["message"])
+            self.assertFalse((control_repo / "clients").exists())
+
+    def test_client_publish_rejects_bundle_for_the_wrong_client(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            control_repo = self._create_git_source_repo(repo, "control-plane")
+
+            project = self._run(repo, "client-project", "personal", "--format", "json")
+            self.assertEqual(project.returncode, 0, project.stderr)
+
+            result = self._run(
+                repo,
+                "client-publish",
+                "vibe-coding-client",
+                "--from-bundle",
+                "./builds/clients/personal",
+                "--target-dir",
+                "./fixtures/control-plane",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 1)
+            payload = json.loads(result.stdout)
+            self.assertIn("personal", payload["error"]["message"])
+            self.assertIn("vibe-coding-client", payload["error"]["message"])
+            self.assertFalse((control_repo / "clients").exists())
+
+    def test_client_publish_refuses_dirty_target_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            control_repo = self._create_git_source_repo(repo, "control-plane")
+            note_path = control_repo / "note.txt"
+            note_path.write_text("keep me\n", encoding="utf-8")
+
+            result = self._run(
+                repo,
+                "client-publish",
+                "personal",
+                "--target-dir",
+                "./fixtures/control-plane",
+                "--commit",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 1)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["error"]["type"], "conflict")
+            self.assertTrue(note_path.is_file())
+            self.assertFalse((control_repo / "clients" / "personal").exists())
+
+    def test_client_publish_is_idempotent_for_the_same_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._init_git_repo(repo)
+            control_repo = self._create_git_source_repo(repo, "control-plane")
+
+            project = self._run(repo, "client-project", "personal", "--format", "json")
+            self.assertEqual(project.returncode, 0, project.stderr)
+
+            first = self._run(
+                repo,
+                "client-publish",
+                "personal",
+                "--from-bundle",
+                "./builds/clients/personal",
+                "--target-dir",
+                "./fixtures/control-plane",
+                "--commit",
+                "--format",
+                "json",
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+
+            second = self._run(
+                repo,
+                "client-publish",
+                "personal",
+                "--from-bundle",
+                "./builds/clients/personal",
+                "--target-dir",
+                "./fixtures/control-plane",
+                "--commit",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(second.returncode, 0, second.stderr)
+            second_payload = json.loads(second.stdout)
+            self.assertFalse(second_payload["changed"])
+            self.assertIsNone(second_payload["commit_hash"])
+
+            commit_count = subprocess.run(
+                ["git", "rev-list", "--count", "HEAD"],
+                cwd=control_repo,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(commit_count.returncode, 0, commit_count.stderr)
+            self.assertEqual(commit_count.stdout.strip(), "2")
+
+    def test_client_publish_leaves_other_client_payloads_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._init_git_repo(repo)
+            control_repo = self._create_git_source_repo(repo, "control-plane")
+
+            first = self._run(
+                repo,
+                "client-publish",
+                "vibe-coding-client",
+                "--target-dir",
+                "./fixtures/control-plane",
+                "--commit",
+                "--format",
+                "json",
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+
+            sibling_current = control_repo / "clients" / "vibe-coding-client" / "current"
+            sibling_publish = control_repo / "clients" / "vibe-coding-client" / "publish.json"
+            sibling_entries = MANAGE_MODULE.directory_file_entries(sibling_current)
+            sibling_publish_text = sibling_publish.read_text(encoding="utf-8")
+
+            second = self._run(
+                repo,
+                "client-publish",
+                "personal",
+                "--target-dir",
+                "./fixtures/control-plane",
+                "--format",
+                "json",
+            )
+            self.assertEqual(second.returncode, 0, second.stderr)
+
+            self.assertEqual(MANAGE_MODULE.directory_file_entries(sibling_current), sibling_entries)
+            self.assertEqual(sibling_publish.read_text(encoding="utf-8"), sibling_publish_text)
+
     def test_context_generates_claude_md_and_agents_md_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -1230,6 +1566,40 @@ class RuntimeManagerTests(unittest.TestCase):
             agents_md = repo / "home" / ".codex" / "AGENTS.md"
             self.assertFalse(claude_md.exists())
             self.assertFalse(agents_md.exists())
+
+    def test_context_can_write_into_custom_context_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(
+                repo,
+                "context",
+                "--client",
+                "personal",
+                "--context-dir",
+                "./sand",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            actions = payload["actions"]
+            self.assertTrue(any("write-context: sand/CLAUDE.md" in a for a in actions))
+
+            claude_md = repo / "sand" / "CLAUDE.md"
+            agents_md = repo / "sand" / "AGENTS.md"
+
+            self.assertTrue(claude_md.is_file())
+            self.assertTrue(agents_md.is_symlink())
+            self.assertEqual(os.readlink(str(agents_md)), "CLAUDE.md")
+            self.assertFalse((repo / "home" / ".claude" / "CLAUDE.md").exists())
+            self.assertFalse((repo / "home" / ".codex" / "AGENTS.md").exists())
+
+            content = claude_md.read_text(encoding="utf-8")
+            self.assertIn("CLIENT=personal", content)
+            self.assertIn("personal-root", content)
 
     # -- Structured errors, next_actions, semantic exit codes ------------------
 
@@ -1464,6 +1834,67 @@ class RuntimeManagerTests(unittest.TestCase):
             text=True,
             check=False,
         )
+
+    def _init_git_repo(self, path: Path) -> None:
+        init = subprocess.run(
+            ["git", "init"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(init.returncode, 0, init.stderr)
+        branch = subprocess.run(
+            ["git", "branch", "-M", "main"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(branch.returncode, 0, branch.stderr)
+        config_email = subprocess.run(
+            ["git", "config", "user.email", "tests@example.com"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(config_email.returncode, 0, config_email.stderr)
+        config_name = subprocess.run(
+            ["git", "config", "user.name", "Runtime Manager Tests"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(config_name.returncode, 0, config_name.stderr)
+        add = subprocess.run(
+            ["git", "add", "."],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(add.returncode, 0, add.stderr)
+        commit = subprocess.run(
+            ["git", "commit", "-m", "initial"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(commit.returncode, 0, commit.stderr)
+
+    def _git_head(self, path: Path) -> str:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
 
     def _write_client_overlay(
         self,
@@ -1882,55 +2313,7 @@ class RuntimeManagerTests(unittest.TestCase):
         source_repo = repo / "fixtures" / name
         source_repo.mkdir(parents=True, exist_ok=True)
         (source_repo / "README.md").write_text("# Fixture Repo\n", encoding="utf-8")
-
-        init = subprocess.run(
-            ["git", "init"],
-            cwd=source_repo,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(init.returncode, 0, init.stderr)
-        branch = subprocess.run(
-            ["git", "branch", "-M", "main"],
-            cwd=source_repo,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(branch.returncode, 0, branch.stderr)
-        config_email = subprocess.run(
-            ["git", "config", "user.email", "tests@example.com"],
-            cwd=source_repo,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(config_email.returncode, 0, config_email.stderr)
-        config_name = subprocess.run(
-            ["git", "config", "user.name", "Runtime Manager Tests"],
-            cwd=source_repo,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(config_name.returncode, 0, config_name.stderr)
-        add = subprocess.run(
-            ["git", "add", "README.md"],
-            cwd=source_repo,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(add.returncode, 0, add.stderr)
-        commit = subprocess.run(
-            ["git", "commit", "-m", "initial"],
-            cwd=source_repo,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(commit.returncode, 0, commit.stderr)
+        self._init_git_repo(source_repo)
         return source_repo
 
     def _install_fixture_daemon(self, repo: Path) -> None:
@@ -2211,6 +2594,34 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads(result.stdout)
             self.assertEqual(payload["client_id"], "personal")
+
+    def test_focus_can_write_live_context_into_custom_context_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(
+                repo,
+                "focus",
+                "personal",
+                "--context-dir",
+                "./sand",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["client_id"], "personal")
+
+            claude_md = (repo / "sand" / "CLAUDE.md").read_text(encoding="utf-8")
+            self.assertIn("## Live Status", claude_md)
+            self.assertIn("personal", claude_md)
+
+            agents_md = repo / "sand" / "AGENTS.md"
+            self.assertTrue(agents_md.is_symlink())
+            self.assertEqual(os.readlink(str(agents_md)), "CLAUDE.md")
+            self.assertFalse((repo / "home" / ".claude" / "CLAUDE.md").exists())
 
     def test_focus_writes_skill_context_to_configured_clients_host_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

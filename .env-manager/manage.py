@@ -64,6 +64,10 @@ CLIENT_PROJECTS_REL = Path("builds") / "clients"
 CLIENT_PROJECTION_VERSION = 1
 CLIENT_PROJECT_RUNTIME_MODEL_REL = Path("runtime-model.json")
 CLIENT_PROJECTION_METADATA_REL = Path("projection.json")
+CLIENT_PUBLISH_VERSION = 1
+CLIENT_PUBLISH_ROOT_REL = Path("clients")
+CLIENT_PUBLISH_CURRENT_REL = Path("current")
+CLIENT_PUBLISH_METADATA_REL = Path("publish.json")
 CLIENT_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 BLUEPRINT_VARIABLE_PATTERN = re.compile(r"^[A-Z0-9_]+$")
 SCAFFOLD_PLACEHOLDER_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
@@ -151,6 +155,18 @@ def classify_error(exc: RuntimeError, command: str) -> dict[str, Any]:
             msg,
             error_type="conflict",
             recovery_hint="Use --force to overwrite existing files, or choose a different client id.",
+        )
+    if "target repo has a dirty working tree" in msg.lower():
+        return structured_error(
+            msg,
+            error_type="conflict",
+            recovery_hint="Commit or discard changes in the target repo, then retry.",
+        )
+    if "target must be a git repo" in msg.lower():
+        return structured_error(
+            msg,
+            error_type="invalid_target_repo",
+            recovery_hint="Initialize the target repo with git before publishing.",
         )
     if "env file" in msg.lower() and ("missing" in msg.lower() or "unresolved" in msg.lower()):
         return structured_error(
@@ -277,6 +293,13 @@ def next_actions_for_client_project(client_id: str) -> list[str]:
     return [
         f"render --client {client_id} --format json",
         f"sync --client {client_id} --format json",
+    ]
+
+
+def next_actions_for_client_publish(client_id: str) -> list[str]:
+    return [
+        f"client-project {client_id} --format json",
+        f"render --client {client_id} --format json",
     ]
 
 
@@ -1796,6 +1819,313 @@ def project_client_bundle(
         "actions": actions,
         "next_actions": next_actions_for_client_project(cid),
     }
+
+
+def resolve_client_publish_target_dir(root_dir: Path, raw_target_dir: str | None) -> Path:
+    target_value = str(raw_target_dir or "").strip()
+    if not target_value:
+        raise RuntimeError("client-publish requires --target-dir.")
+
+    target_dir = Path(target_value).expanduser()
+    if not target_dir.is_absolute():
+        target_dir = (root_dir / target_dir).resolve()
+    else:
+        target_dir = target_dir.resolve()
+    return target_dir
+
+
+def resolve_client_publish_bundle_dir(root_dir: Path, raw_bundle_dir: str) -> Path:
+    bundle_dir = Path(raw_bundle_dir).expanduser()
+    if not bundle_dir.is_absolute():
+        bundle_dir = (root_dir / bundle_dir).resolve()
+    else:
+        bundle_dir = bundle_dir.resolve()
+    return bundle_dir
+
+
+def git_head_commit(path: Path) -> str | None:
+    result = run_command(["git", "rev-parse", "HEAD"], cwd=path)
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def directory_file_entries(path: Path) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    if not path.is_dir():
+        return entries
+
+    for file_path in sorted(child for child in path.rglob("*") if child.is_file()):
+        entries.append((file_path.relative_to(path).as_posix(), file_sha256(file_path)))
+    return entries
+
+
+def normalize_bundle_rel_path(raw_value: Any, *, label: str) -> str:
+    value = str(raw_value or "").strip()
+    if not value:
+        raise RuntimeError(f"{label} is missing")
+
+    rel_path = PurePosixPath(value)
+    if rel_path.is_absolute() or ".." in rel_path.parts or not rel_path.parts:
+        raise RuntimeError(f"{label} must be a relative path inside the bundle")
+    return rel_path.as_posix()
+
+
+def load_client_projection_bundle(bundle_dir: Path, *, expected_client_id: str) -> dict[str, Any]:
+    if not bundle_dir.is_dir():
+        raise RuntimeError(f"Bundle directory not found: {bundle_dir}")
+
+    projection_path = bundle_dir / CLIENT_PROJECTION_METADATA_REL
+    if not projection_path.is_file():
+        raise RuntimeError(f"Bundle directory is missing projection.json: {bundle_dir}")
+
+    projection_payload = load_json_file(projection_path)
+    bundle_client_id = str(projection_payload.get("client_id") or "").strip()
+    if bundle_client_id != expected_client_id:
+        raise RuntimeError(
+            f"Bundle at {bundle_dir} is for client {bundle_client_id or '(unknown)'!r}, "
+            f"not {expected_client_id!r}"
+        )
+
+    payload_tree_sha256 = normalize_sha256(
+        projection_payload.get("payload_tree_sha256"),
+        label=f"bundle {bundle_dir} payload_tree_sha256",
+    )
+
+    raw_files = projection_payload.get("files")
+    if not isinstance(raw_files, list) or not raw_files:
+        raise RuntimeError(f"Bundle projection metadata is missing files[]: {projection_path}")
+
+    payload_entries: list[tuple[str, str]] = []
+    for index, raw_item in enumerate(raw_files):
+        if not isinstance(raw_item, dict):
+            raise RuntimeError(f"Bundle projection file entry {index} must be an object")
+
+        rel_path = normalize_bundle_rel_path(
+            raw_item.get("path"),
+            label=f"bundle {bundle_dir} files[{index}].path",
+        )
+        expected_sha = normalize_sha256(
+            raw_item.get("sha256"),
+            label=f"bundle {bundle_dir} files[{index}].sha256",
+        )
+        file_path = bundle_dir / Path(*PurePosixPath(rel_path).parts)
+        if not file_path.is_file():
+            raise RuntimeError(f"Bundle payload file is missing: {rel_path}")
+
+        actual_sha = file_sha256(file_path)
+        if actual_sha != expected_sha:
+            raise RuntimeError(f"Bundle payload file hash mismatch for {rel_path}")
+
+        payload_entries.append((rel_path, actual_sha))
+
+    if tree_hash(payload_entries) != payload_tree_sha256:
+        raise RuntimeError(f"Bundle payload tree hash mismatch for {bundle_dir}")
+
+    runtime_manifest_rel = normalize_bundle_rel_path(
+        projection_payload.get("runtime_manifest", Path("workspace") / "runtime.yaml"),
+        label=f"bundle {bundle_dir} runtime_manifest",
+    )
+    runtime_model_rel = normalize_bundle_rel_path(
+        projection_payload.get("runtime_model", CLIENT_PROJECT_RUNTIME_MODEL_REL),
+        label=f"bundle {bundle_dir} runtime_model",
+    )
+
+    for required_rel in (
+        CLIENT_PROJECTION_METADATA_REL.as_posix(),
+        runtime_manifest_rel,
+        runtime_model_rel,
+    ):
+        required_path = bundle_dir / Path(*PurePosixPath(required_rel).parts)
+        if not required_path.is_file():
+            raise RuntimeError(f"Bundle file is missing: {required_rel}")
+
+    all_entries = directory_file_entries(bundle_dir)
+    if not all_entries:
+        raise RuntimeError(f"Bundle directory is empty: {bundle_dir}")
+
+    return {
+        "bundle_dir": str(bundle_dir),
+        "client_id": expected_client_id,
+        "projection": projection_payload,
+        "payload_entries": payload_entries,
+        "payload_tree_sha256": payload_tree_sha256,
+        "runtime_manifest_rel": runtime_manifest_rel,
+        "runtime_model_rel": runtime_model_rel,
+        "all_entries": all_entries,
+    }
+
+
+def client_publish_paths(target_dir: Path, client_id: str) -> tuple[Path, Path, Path]:
+    client_root = target_dir / CLIENT_PUBLISH_ROOT_REL / client_id
+    current_dir = client_root / CLIENT_PUBLISH_CURRENT_REL
+    publish_metadata_path = client_root / CLIENT_PUBLISH_METADATA_REL
+    return client_root, current_dir, publish_metadata_path
+
+
+def bundle_matches_publish_target(
+    bundle: dict[str, Any],
+    current_dir: Path,
+    publish_metadata_path: Path,
+) -> bool:
+    if not current_dir.is_dir() or not publish_metadata_path.is_file():
+        return False
+
+    try:
+        publish_payload = load_json_file(publish_metadata_path)
+    except RuntimeError:
+        return False
+
+    if str(publish_payload.get("client_id") or "").strip() != str(bundle["client_id"]):
+        return False
+    if str(publish_payload.get("payload_tree_sha256") or "").strip().lower() != str(bundle["payload_tree_sha256"]):
+        return False
+
+    current_entries = directory_file_entries(current_dir)
+    return current_entries == bundle["all_entries"]
+
+
+def stage_bundle_for_publish(bundle_dir: Path, current_dir: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix=".skillbox-client-publish-") as tmpdir:
+        staging_current = Path(tmpdir) / "current"
+        shutil.copytree(bundle_dir, staging_current)
+        ensure_directory(current_dir.parent, dry_run=False)
+        remove_path(current_dir)
+        shutil.move(str(staging_current), str(current_dir))
+
+
+def build_client_publish_metadata(
+    bundle: dict[str, Any],
+    *,
+    client_id: str,
+    source_commit: str | None,
+) -> dict[str, Any]:
+    projection_payload = bundle["projection"]
+    current_rel = CLIENT_PUBLISH_ROOT_REL / client_id / CLIENT_PUBLISH_CURRENT_REL
+    published_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    return {
+        "version": CLIENT_PUBLISH_VERSION,
+        "client_id": client_id,
+        "published_at": published_at,
+        "source_commit": source_commit,
+        "projection_version": int(projection_payload.get("version", CLIENT_PROJECTION_VERSION)),
+        "overlay_mode": projection_payload.get("overlay_mode"),
+        "active_profiles": projection_payload.get("active_profiles", []),
+        "active_clients": projection_payload.get("active_clients", []),
+        "default_client": str(projection_payload.get("default_client") or client_id),
+        "payload_tree_sha256": bundle["payload_tree_sha256"],
+        "file_count": len(bundle["all_entries"]),
+        "current_dir": current_rel.as_posix(),
+        "projection": (current_rel / CLIENT_PROJECTION_METADATA_REL).as_posix(),
+        "runtime_manifest": (current_rel / bundle["runtime_manifest_rel"]).as_posix(),
+        "runtime_model": (current_rel / bundle["runtime_model_rel"]).as_posix(),
+    }
+
+
+def commit_client_publish(target_dir: Path, client_id: str) -> str:
+    client_rel = (CLIENT_PUBLISH_ROOT_REL / client_id).as_posix()
+    add_result = run_command(["git", "add", "-A", "--", client_rel], cwd=target_dir)
+    if add_result.returncode != 0:
+        raise RuntimeError(add_result.stderr.strip() or add_result.stdout.strip() or "git add failed")
+
+    diff_result = run_command(["git", "diff", "--cached", "--quiet"], cwd=target_dir)
+    if diff_result.returncode == 0:
+        return ""
+    if diff_result.returncode != 1:
+        raise RuntimeError(diff_result.stderr.strip() or diff_result.stdout.strip() or "git diff failed")
+
+    message = f"chore(client-publish): publish {client_id} bundle"
+    commit_result = run_command(["git", "commit", "-m", message], cwd=target_dir)
+    if commit_result.returncode != 0:
+        raise RuntimeError(commit_result.stderr.strip() or commit_result.stdout.strip() or "git commit failed")
+
+    commit_hash = git_head_commit(target_dir)
+    if not commit_hash:
+        raise RuntimeError("git commit succeeded but HEAD could not be resolved")
+    return commit_hash
+
+
+def publish_client_bundle(
+    root_dir: Path,
+    client_id: str,
+    *,
+    target_dir_arg: str | None,
+    from_bundle_arg: str | None = None,
+    profiles: list[str] | None = None,
+    commit: bool = False,
+) -> dict[str, Any]:
+    cid = validate_client_id(client_id)
+    target_dir = resolve_client_publish_target_dir(root_dir, target_dir_arg)
+    target_state = git_repo_state(target_dir)
+    if not target_state.get("git"):
+        raise RuntimeError(f"client-publish target must be a git repo: {target_dir}")
+    if int(target_state.get("dirty", 0)) or int(target_state.get("untracked", 0)):
+        raise RuntimeError(f"client-publish target repo has a dirty working tree: {target_dir}")
+
+    if from_bundle_arg and profiles:
+        raise RuntimeError("client-publish cannot combine --from-bundle with --profile.")
+
+    actions: list[str] = []
+    source_commit = git_head_commit(root_dir)
+    bundle_dir: Path
+    temp_bundle: tempfile.TemporaryDirectory[str] | None = None
+
+    try:
+        if from_bundle_arg:
+            bundle_dir = resolve_client_publish_bundle_dir(root_dir, from_bundle_arg)
+            actions.append(f"use-bundle: {repo_rel(root_dir, bundle_dir)}")
+        else:
+            temp_bundle = tempfile.TemporaryDirectory(prefix=f".skillbox-client-publish-{cid}-")
+            bundle_dir = Path(temp_bundle.name) / "bundle"
+            project_client_bundle(
+                root_dir,
+                cid,
+                profiles=profiles,
+                output_dir_arg=str(bundle_dir),
+                dry_run=False,
+                force=True,
+            )
+            actions.append(f"build-bundle: {cid}")
+
+        bundle = load_client_projection_bundle(bundle_dir, expected_client_id=cid)
+        client_root, current_dir, publish_metadata_path = client_publish_paths(target_dir, cid)
+        changed = not bundle_matches_publish_target(bundle, current_dir, publish_metadata_path)
+
+        commit_hash: str | None = None
+        if changed:
+            stage_bundle_for_publish(bundle_dir, current_dir)
+            publish_payload = build_client_publish_metadata(bundle, client_id=cid, source_commit=source_commit)
+            write_json_file(publish_metadata_path, publish_payload)
+            actions.append(f"publish-current: {repo_rel(target_dir, current_dir)}")
+            actions.append(f"write-file: {repo_rel(target_dir, publish_metadata_path)}")
+
+            if commit:
+                committed = commit_client_publish(target_dir, cid)
+                if committed:
+                    commit_hash = committed
+                    actions.append(f"git-commit: {commit_hash}")
+        else:
+            actions.append(f"publish-noop: {repo_rel(target_dir, current_dir)}")
+
+        return {
+            "client_id": cid,
+            "target_dir": str(target_dir),
+            "bundle_dir": str(bundle_dir),
+            "changed": changed,
+            "committed": commit_hash is not None,
+            "commit_hash": commit_hash,
+            "source_commit": source_commit,
+            "active_profiles": bundle["projection"].get("active_profiles", []),
+            "payload_tree_sha256": bundle["payload_tree_sha256"],
+            "file_count": len(bundle["all_entries"]),
+            "actions": actions,
+            "next_actions": next_actions_for_client_publish(cid),
+        }
+    finally:
+        if temp_bundle is not None:
+            temp_bundle.cleanup()
 
 
 def extract_bundle_to_target(bundle_path: Path, target_root: Path, skill_name: str) -> str:
@@ -5634,6 +5964,32 @@ def main() -> int:
     client_project_parser.add_argument("--format", choices=("text", "json"), default="text")
     add_profile_arg(client_project_parser)
 
+    client_publish_parser = subparsers.add_parser(
+        "client-publish",
+        help="Promote a client projection bundle into a git-backed control-plane repo.",
+    )
+    client_publish_parser.add_argument(
+        "client_id",
+        help="Existing client slug to publish (for example `personal`).",
+    )
+    client_publish_parser.add_argument(
+        "--target-dir",
+        required=True,
+        help="Git repo that receives clients/<client>/current/ and publish.json.",
+    )
+    client_publish_parser.add_argument(
+        "--from-bundle",
+        default=None,
+        help="Existing client-project bundle to publish instead of building a fresh one.",
+    )
+    client_publish_parser.add_argument(
+        "--commit",
+        action="store_true",
+        help="Create one local git commit in the target repo when the publish changes files.",
+    )
+    client_publish_parser.add_argument("--format", choices=("text", "json"), default="text")
+    add_profile_arg(client_publish_parser)
+
     onboard_parser = subparsers.add_parser(
         "onboard",
         help="Macro: scaffold a client, sync, bootstrap, start services, generate context, and verify.",
@@ -5816,6 +6172,36 @@ def main() -> int:
             print(f"output_dir: {payload['output_dir']}")
             print(f"files: {payload['file_count']}")
             print(f"payload_tree_sha256: {payload['payload_tree_sha256']}")
+            print()
+            print("\n".join(payload["actions"]))
+        return EXIT_OK
+
+    if args.command == "client-publish":
+        try:
+            payload = publish_client_bundle(
+                root_dir=root_dir,
+                client_id=args.client_id,
+                target_dir_arg=args.target_dir,
+                from_bundle_arg=args.from_bundle,
+                profiles=args.profile,
+                commit=args.commit,
+            )
+        except RuntimeError as exc:
+            if args.format == "json":
+                emit_json(classify_error(exc, "client-publish"))
+            else:
+                print(str(exc), file=sys.stderr)
+            return EXIT_ERROR
+
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            print(f"client: {payload['client_id']}")
+            print(f"target_dir: {payload['target_dir']}")
+            print(f"changed: {payload['changed']}")
+            print(f"payload_tree_sha256: {payload['payload_tree_sha256']}")
+            if payload["commit_hash"]:
+                print(f"commit: {payload['commit_hash']}")
             print()
             print("\n".join(payload["actions"]))
         return EXIT_OK

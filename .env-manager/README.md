@@ -19,6 +19,8 @@ python3 .env-manager/manage.py client-init --list-blueprints
 python3 .env-manager/manage.py client-init acme-studio
 python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo --set PRIMARY_REPO_URL=https://github.com/acme/app.git
 python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo-http-service --set PRIMARY_REPO_URL=https://github.com/acme/app.git --set SERVICE_COMMAND='pnpm dev'
+python3 .env-manager/manage.py client-project personal
+python3 .env-manager/manage.py client-project personal --profile surfaces --output-dir ./builds/clients/personal-surfaces
 python3 .env-manager/manage.py sync --client personal
 python3 .env-manager/manage.py render --client personal --profile surfaces
 python3 .env-manager/manage.py status --profile swimmers
@@ -42,6 +44,10 @@ The mental model is:
 - `client-init --blueprint ...` appends reusable repos, services, logs, and
   checks to that scaffold so `render`, `sync`, and `up` immediately work on a
   concrete client shape
+- `client-project <client>` compiles a client-safe bundle under
+  `builds/clients/<client>/` with a single-client `workspace/runtime.yaml`,
+  only that client's overlay/skill files, and a sanitized `runtime-model.json`
+  plus `projection.json`
 
 Client overlays usually point at repo roots under `/monoserver`, which is the
 host parent directory mounted into the workspace container.

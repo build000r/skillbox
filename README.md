@@ -527,6 +527,8 @@ make runtime-sync
 | `.env-manager/manage.py restart` | Restart manageable services for the selected core/client scope, preserving declared dependency order | `python3 .env-manager/manage.py restart --profile surfaces --service web-stub` |
 | `.env-manager/manage.py logs` | Print recent log output for declared services | `python3 .env-manager/manage.py logs --profile surfaces --service api-stub --lines 80` |
 | `.env-manager/manage.py client-init` | Scaffold a new client overlay, optionally applying a reusable blueprint for repos and services | `python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo --set PRIMARY_REPO_URL=https://github.com/acme/app.git` |
+| `.env-manager/manage.py client-project` | Compile a single-client projection bundle with a client-safe runtime manifest and sanitized metadata | `python3 .env-manager/manage.py client-project personal --profile surfaces` |
+| `.env-manager/manage.py client-publish` | Promote a client projection bundle into a private git-backed control-plane repo under `clients/<client>/current/` | `python3 .env-manager/manage.py client-publish personal --target-dir ../skillbox-config-control --commit` |
 | `.env-manager/pulse.py` | Pulse reconciliation daemon for continuous drift detection and auto-heal | `python3 .env-manager/pulse.py run --interval 30` |
 
 ## Configuration
@@ -603,8 +605,65 @@ With that setup:
 - `skillbox` stays publishable
 - `skillbox-config/clients/<client>/overlay.yaml` is the private source of truth
 - `client-init`, `sync`, and `focus` write client config into the private repo
+- `client-project <client>` compiles a client-safe bundle under `builds/clients/<client>/`
 - client application repos stay separate under the shared monoserver tree
 - clients usually do not need access to the `skillbox` repo itself
+
+### Client projection bundles
+
+`client-project` is the first control-plane boundary in code, not just in
+convention. It takes the public engine, the selected private client overlay,
+and the active profiles, then emits a single-client bundle:
+
+```bash
+python3 .env-manager/manage.py client-project personal
+python3 .env-manager/manage.py client-project personal --profile surfaces --output-dir ./builds/clients/personal-surfaces
+```
+
+The bundle currently includes:
+
+- `workspace/runtime.yaml` with `selection.default_client` pinned to the selected client
+- only the selected client's overlay and companion skill manifest files
+- only the skill bundles referenced by the selected runtime scope
+- `runtime-model.json` with host paths and secret-like env keys removed
+- `projection.json` with a deterministic file list and payload tree hash
+
+The bundle does not include:
+
+- other clients' overlays or bundled skills
+- generated lockfiles
+- local secrets or host-only roots such as `SKILLBOX_CLIENTS_HOST_ROOT`
+
+This is the intended handoff artifact when you want something client-specific
+without exposing the full operator repo.
+
+### Publishing a client bundle
+
+`client-publish` turns that handoff bundle into the latest client-facing
+artifact in a private git repo:
+
+```bash
+python3 .env-manager/manage.py client-publish personal \
+  --target-dir ../skillbox-config-control \
+  --commit
+python3 .env-manager/manage.py client-publish personal \
+  --from-bundle ./builds/clients/personal \
+  --target-dir ../skillbox-config-control
+```
+
+What v1 does:
+
+- validates the selected bundle before promotion
+- writes the payload to `clients/<client>/current/`
+- writes `clients/<client>/publish.json` with the latest published metadata
+- optionally creates one local git commit in the target repo
+
+What v1 does not do:
+
+- push to a remote
+- diff two client bundles
+- restart services or deploy application code
+- manage publish history beyond the latest `publish.json`
 
 ### Default skill sources
 
