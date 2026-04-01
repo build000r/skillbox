@@ -114,7 +114,7 @@ inside_main() {
 
   normalize_sha256() {
     local value="${1:-}"
-    value="${value,,}"
+    value="$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')"
     if [[ ! "${value}" =~ ^[0-9a-f]{64}$ ]]; then
       return 1
     fi

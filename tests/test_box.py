@@ -2,17 +2,50 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 import unittest
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 BOX_SCRIPT = ROOT_DIR / "scripts" / "box.py"
+BOX_MODULE = SourceFileLoader(
+    "skillbox_box",
+    str(BOX_SCRIPT.resolve()),
+).load_module()
 
 
 class BoxTests(unittest.TestCase):
     """Test box.py core logic: profiles, inventory, structured output, dry-run."""
+
+    def test_build_remote_env_command_preserves_literal_env_values(self) -> None:
+        command = BOX_MODULE.build_remote_env_command(
+            ["bash", "-s"],
+            {"TAILSCALE_AUTHKEY": "tskey-abc'; touch /tmp/pwned #"},
+        )
+
+        self.assertEqual(
+            shlex.split(command),
+            ["env", "TAILSCALE_AUTHKEY=tskey-abc'; touch /tmp/pwned #", "bash", "-s"],
+        )
+
+    def test_build_onboard_command_preserves_literal_blueprint_and_set_args(self) -> None:
+        blueprint = "/tmp/client blueprint.yaml"
+        set_args = [
+            "PRIMARY_REPO_URL=https://example.com/repo?a=1&b=2",
+            "PROJECT_NAME=one; touch /tmp/pwned",
+        ]
+
+        command = BOX_MODULE.build_onboard_command("client-box", blueprint, set_args)
+        tokens = shlex.split(command)
+
+        self.assertEqual(tokens[:5], ["cd", "&&", "cd", "skillbox", "&&"])
+        self.assertEqual(
+            tokens[5:],
+            BOX_MODULE.build_onboard_manage_argv("client-box", blueprint, set_args),
+        )
 
     def test_profiles_lists_available_profiles(self) -> None:
         result = self._run("profiles", "--format", "json")
