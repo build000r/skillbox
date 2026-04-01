@@ -43,6 +43,8 @@ right client context without standing up a full hosted workspace control plane.
 - declare the inside of the box with a runtime graph for repos, artifacts, installed skills, services, logs, and checks
 - declare one-shot bootstrap tasks and let services pull them in automatically
 - start and stop declared service graphs in dependency order with one command
+- focus on a client workspace with live state collection, enriched agent context, and continuous drift monitoring
+- provision and tear down remote boxes from the operator machine via MCP tools
 - pin and package default skills locally
 - validate outer drift with `make doctor` and inner drift with `make dev-sanity`
 
@@ -54,6 +56,9 @@ right client context without standing up a full hosted workspace control plane.
 | A workspace that feels like a narrowed local setup | One bind-mounted `/workspace`, plus `/monoserver` for sibling repo roots and client overlays |
 | A sane way to let the box grow over time | `workspace/runtime.yaml` plus `.env-manager/manage.py` manage the core machine plus client-specific repos, artifacts, installed skills, logs, and checks |
 | Service graphs that do not devolve into shell folklore | Declared `depends_on` edges let `up`, `down`, and `restart` expand and order service graphs automatically |
+| Live drift detection and auto-healing | The pulse daemon monitors services on a fixed interval, auto-restarts crashes, and emits structured events to a JSONL journal |
+| One-command client activation | `focus` syncs, bootstraps, starts services, collects live state, and writes enriched agent context in a single pass |
+| Fleet management from the operator machine | The operator MCP server provisions DO droplets, enrolls Tailscale, and runs commands on remote boxes as native agent tools |
 | Reproducible default skills | `03-skill-sync.sh` packages from a pinned manifest and vendored local packager |
 | Confidence that docs/config/runtime still match | `04-reconcile.py` powers `make render` and `make doctor`, while `make dev-sanity` validates the box internals |
 | Minimal surface area | No multi-tenant control plane, no hosted dependency, no hidden sibling repo requirement for packaging |
@@ -90,6 +95,60 @@ What that gives you:
 - packaged default `.skill` bundles under `default-skills/`
 - installed default skills under `home/.claude/skills` and `home/.codex/skills`
 - generated agent context at `home/.claude/CLAUDE.md` with a symlink at `home/.codex/AGENTS.md`
+
+## Focus
+
+The `focus` command is the single-command path from "I want to work on this
+client" to "everything is running and the agents know about it":
+
+```bash
+python3 .env-manager/manage.py focus personal --format json
+```
+
+What this does in one pass:
+
+1. **Sync** — creates managed directories, installs skills, renders config
+2. **Bootstrap** — runs declared one-shot tasks in dependency order
+3. **Up** — starts services with healthcheck waits
+4. **Collect** — snapshots live state: git branches, service health, recent log errors
+5. **Context** — writes enriched `CLAUDE.md` with live status tables, attention items, and recent activity
+6. **Persist** — saves `.focus.json` so `--resume` can re-activate later
+
+The enriched context adds live sections that the static `context` command does not:
+
+- a **Live Status** table showing service state, PID, and health
+- a **Repo State** table showing branch, dirty file count, and last commit
+- a **Recent Activity** feed from the event journal
+- an **Attention** section highlighting failing checks, downed services, and recent log errors
+
+Resume the last session without re-running the full pipeline:
+
+```bash
+python3 .env-manager/manage.py focus --resume
+```
+
+## Pulse Daemon
+
+The pulse daemon watches the runtime graph on a fixed interval and reacts to
+drift:
+
+```bash
+make pulse-start        # start the daemon (foreground, logs to logs/runtime/pulse.log)
+make pulse-status       # print cycle count, heals, service states
+make pulse-stop         # send SIGTERM
+```
+
+What it does each cycle:
+
+- reloads `runtime.yaml` and detects config hash changes
+- probes every declared service and detects state transitions
+- auto-restarts crashed managed services with exponential backoff
+- runs declared checks and detects failures and recoveries
+- writes every state change to the JSONL event journal at `logs/runtime/journal.jsonl`
+- persists a state snapshot at `logs/runtime/pulse.state.json` for the MCP tool to read
+
+The journal is queryable via the `skillbox_journal` MCP tool inside the
+container or via `query_journal()` in Python.
 
 ## Swimmers Overlay
 
@@ -172,6 +231,52 @@ runs.
 Both files are gitignored because they are generated state that varies by
 environment and client selection.
 
+## Fleet Management
+
+The operator MCP server (`scripts/operator_mcp_server.py`) exposes box
+lifecycle as native agent tools, so Claude Code on the operator machine can
+provision, inspect, and tear down remote boxes without leaving the
+conversation.
+
+```bash
+# provision a new box (dry-run first, always)
+# via MCP: operator_provision { box_id: "acme-prod", profile: "dev-large", dry_run: true }
+
+# or via make targets
+make box-up BOX=acme-prod PROFILE=dev-large
+make box-status BOX=acme-prod
+make box-list
+make box-ssh BOX=acme-prod
+make box-down BOX=acme-prod
+```
+
+Available MCP tools:
+
+| Tool | Purpose |
+|---|---|
+| `operator_boxes` | List all active boxes from inventory |
+| `operator_profiles` | List available box profiles (region, size, image) |
+| `operator_box_status` | Deep health probe for a specific box |
+| `operator_provision` | Full zero-to-running provision flow |
+| `operator_teardown` | Full teardown: drain, remove from Tailnet, destroy droplet |
+| `operator_box_exec` | Run a command on a remote box over Tailscale SSH |
+| `operator_compose_up` | Build and start local containers |
+| `operator_compose_down` | Stop all local containers |
+| `operator_doctor` | Run outer validation checks |
+| `operator_render` | Print the resolved sandbox model |
+
+### Destructive Operation Guard
+
+Destructive tools (`operator_teardown`, `operator_compose_down`) are gated by
+a PreToolUse hook (`scripts/guard-destructive-op.sh`) that blocks execution
+unless:
+
+1. `dry_run=true` was passed (preview mode always passes)
+2. All git repos in the workspace are committed and pushed
+3. A dry-run was already executed this session
+
+This prevents accidental infrastructure destruction with uncommitted work.
+
 ## Design Philosophy
 
 ### 1. Thin beats magical
@@ -197,6 +302,13 @@ The repo includes enough surfaces to inspect and validate the shape, but not so 
 ### 6. The box should describe its internals, not just its container
 
 The new internal `.env-manager` layer is intentionally small. It does not try to become a second platform; it gives the box one declared source of truth for repos, artifacts, installed skills, services, logs, and sanity checks so the workspace can accrete without turning into guesswork.
+
+### 7. Continuous observation, not just point-in-time checks
+
+The pulse daemon and event journal give the box a memory. Instead of only
+checking state when you ask, the box continuously monitors itself and records
+what happened, so agents and operators can query recent history rather than
+re-deriving it from scratch.
 
 ## Comparison
 
@@ -238,7 +350,23 @@ make build
 make up
 ```
 
-### Option 3: Copy into an existing repo workspace
+### Option 3: Operator-provisioned remote box
+
+If the operator MCP server is configured, provision a box from Claude Code:
+
+```bash
+# MCP: operator_provision { box_id: "dev-01", profile: "dev-small", dry_run: true }
+# Review dry-run output, confirm, then:
+# MCP: operator_provision { box_id: "dev-01", profile: "dev-small" }
+```
+
+Or via make:
+
+```bash
+make box-up BOX=dev-01 PROFILE=dev-small
+```
+
+### Option 4: Copy into an existing repo workspace
 
 If you already have a private server or local repo root and just want the shape:
 
@@ -308,8 +436,12 @@ make runtime-sync
 | `make runtime-down` | Stops manageable services for the active scope |
 | `make runtime-restart` | Restarts manageable services for the active scope |
 | `make runtime-logs` | Shows recent service logs for the active scope |
+| `make onboard` | Scaffold and activate a new client overlay with optional blueprint |
 | `make context` | Generates `CLAUDE.md` and `AGENTS.md` from the resolved runtime graph |
 | `make dev-sanity` | Validates the internal runtime graph, filesystem readiness, and managed skill integrity |
+| `make pulse-start` | Starts the pulse reconciliation daemon |
+| `make pulse-stop` | Sends SIGTERM to the running pulse daemon |
+| `make pulse-status` | Prints pulse daemon status: cycles, heals, service states |
 | `make build` | Builds the workspace image |
 | `make up` | Starts the workspace container |
 | `make up-surfaces` | Starts the API and web stub surfaces |
@@ -323,6 +455,12 @@ make runtime-sync
 | `make swimmers-status` | Reports swimmers process and probe state inside the workspace container |
 | `make swimmers-logs` | Tails swimmers server logs from inside the workspace container |
 | `make swimmers-runtime-status` | Shows the runtime-manager view of the swimmers overlay |
+| `make box-up` | Provision a new remote box (DO + Tailscale) |
+| `make box-down` | Tear down a remote box |
+| `make box-status` | Health-check a remote box |
+| `make box-list` | List all boxes from inventory |
+| `make box-ssh` | SSH into a remote box |
+| `make box-profiles` | List available box profiles |
 
 ### Scripts
 
@@ -334,7 +472,10 @@ make runtime-sync
 | `scripts/04-reconcile.py render` | Print the resolved sandbox model | `python3 scripts/04-reconcile.py render --with-compose` |
 | `scripts/04-reconcile.py doctor` | Run drift and readiness checks | `python3 scripts/04-reconcile.py doctor` |
 | `scripts/05-swimmers.sh` | Manage the workspace-local swimmers install and process lifecycle | `./scripts/05-swimmers.sh status` |
+| `scripts/operator_mcp_server.py` | Operator MCP server for fleet and container lifecycle | Runs via `.mcp.json` as `skillbox-operator` |
+| `scripts/guard-destructive-op.sh` | PreToolUse hook gating destructive operator tools | Called automatically by Claude Code hooks |
 | `.env-manager/manage.py context` | Generate CLAUDE.md and AGENTS.md from the resolved runtime graph | `python3 .env-manager/manage.py context --client personal` |
+| `.env-manager/manage.py focus` | Activate a client with live state and enriched context | `python3 .env-manager/manage.py focus personal --format json` |
 | `.env-manager/manage.py render` | Print the resolved internal runtime graph | `python3 .env-manager/manage.py render --format json` |
 | `.env-manager/manage.py sync` | Create managed repo/artifact/log directories and install declared skills for the selected core/client scope | `python3 .env-manager/manage.py sync --client personal --dry-run` |
 | `.env-manager/manage.py doctor` | Validate the internal repos/skills/logs/check graph for the selected core/client scope | `python3 .env-manager/manage.py doctor --client personal` |
@@ -345,12 +486,13 @@ make runtime-sync
 | `.env-manager/manage.py restart` | Restart manageable services for the selected core/client scope, preserving declared dependency order | `python3 .env-manager/manage.py restart --profile surfaces --service web-stub` |
 | `.env-manager/manage.py logs` | Print recent log output for declared services | `python3 .env-manager/manage.py logs --profile surfaces --service api-stub --lines 80` |
 | `.env-manager/manage.py client-init` | Scaffold a new client overlay, optionally applying a reusable blueprint for repos and services | `python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo --set PRIMARY_REPO_URL=https://github.com/acme/app.git` |
+| `.env-manager/pulse.py` | Pulse reconciliation daemon for continuous drift detection and auto-heal | `python3 .env-manager/pulse.py run --interval 30` |
 
 ## Configuration
 
 ### Environment defaults
 
-`.env.example` sets the main runtime paths and ports:
+`.env.example` sets the main runtime paths, ports, and optional integrations:
 
 ```dotenv
 SKILLBOX_NAME=skillbox
@@ -372,11 +514,27 @@ SKILLBOX_SWIMMERS_DOWNLOAD_URL=
 SKILLBOX_SWIMMERS_AUTH_MODE=
 SKILLBOX_SWIMMERS_AUTH_TOKEN=
 SKILLBOX_SWIMMERS_OBSERVER_TOKEN=
+SKILLBOX_DCG_BIN=/home/sandbox/.local/bin/dcg
+SKILLBOX_DCG_DOWNLOAD_URL=
+SKILLBOX_DCG_PACKS=core.git,core.filesystem
+SKILLBOX_PULSE_INTERVAL=30
+SKILLBOX_DCG_MCP_PORT=3220
+SKILLBOX_FWC_BIN=/home/sandbox/.local/bin/fwc
+SKILLBOX_FWC_DOWNLOAD_URL=
+SKILLBOX_FWC_MCP_PORT=3221
+SKILLBOX_FWC_ZONE=work
+SKILLBOX_FWC_CONNECTORS=github,slack,linear
+SKILLBOX_DO_TOKEN=
+SKILLBOX_DO_SSH_KEY_ID=
+SKILLBOX_TS_AUTHKEY=
 ```
 
 `SKILLBOX_SWIMMERS_REPO` is now an optional source checkout path. If you set
 `SKILLBOX_SWIMMERS_DOWNLOAD_URL`, `make runtime-sync` or `make swimmers-install`
 can hydrate the binary without needing `/monoserver/swimmers`.
+
+`SKILLBOX_DO_TOKEN`, `SKILLBOX_DO_SSH_KEY_ID`, and `SKILLBOX_TS_AUTHKEY` are
+required only for fleet management (`operator_provision` / `make box-up`).
 
 ### Default skill sources
 
@@ -682,6 +840,7 @@ exist all the time.
 │ workspace/runtime.yaml                  │
 │ 04-reconcile.py                         │
 │ .env-manager/manage.py                  │
+│ .env-manager/pulse.py                   │
 │ 03-skill-sync.sh / package_skill.py     │
 └───────────────────┬─────────────────────┘
                     │
@@ -691,9 +850,52 @@ exist all the time.
        ├──────────────────────────────────┤
        │ repos, artifacts, skills, checks │
        │ api/web stub health probes       │
-       │ default skill bundles + lockfiles │
+       │ default skill bundles + lockfiles│
+       │ event journal (journal.jsonl)    │
+       │ pulse state (pulse.state.json)   │
        └──────────────────────────────────┘
+
+┌─────────────────────────────────────────┐
+│ operator machine (outside the box)      │
+├─────────────────────────────────────────┤
+│ scripts/operator_mcp_server.py          │
+│   → operator_provision                  │
+│   → operator_teardown                   │
+│   → operator_box_exec                   │
+│   → operator_compose_up/down            │
+│ scripts/guard-destructive-op.sh         │
+│ scripts/box.py (DO + Tailscale fleet)   │
+│ workspace/boxes.json (inventory)        │
+└─────────────────────────────────────────┘
 ```
+
+## MCP Integration
+
+Skillbox exposes two MCP servers for different contexts:
+
+### Inside the box (agent tools)
+
+`.env-manager/mcp_server.py` runs inside the workspace container and gives
+agents tools to manage their own environment:
+
+| Tool | Purpose |
+|---|---|
+| `skillbox_status` | Runtime status for repos, services, tasks, checks |
+| `skillbox_render` | Resolved runtime graph |
+| `skillbox_sync` | Sync state (create dirs, install skills) |
+| `skillbox_up` / `skillbox_down` | Start/stop services |
+| `skillbox_logs` | Recent service log output |
+| `skillbox_bootstrap` | Run declared bootstrap tasks |
+| `skillbox_focus` | Activate a client with live state and enriched context |
+| `skillbox_onboard` | Scaffold and bootstrap a new client |
+| `skillbox_client_init` | Create a new client overlay from blueprint |
+| `skillbox_pulse` | Query pulse daemon status |
+| `skillbox_journal` | Query the event journal |
+
+### Outside the box (operator tools)
+
+`scripts/operator_mcp_server.py` runs on the operator machine and provides
+fleet lifecycle tools. See the [Fleet Management](#fleet-management) section.
 
 ## Troubleshooting
 
@@ -766,13 +968,38 @@ make runtime-sync
 make doctor
 ```
 
+### Pulse daemon won't start
+
+Check if it's already running:
+
+```bash
+make pulse-status
+```
+
+If the PID file is stale (process died without cleanup), remove it:
+
+```bash
+rm logs/runtime/pulse.pid
+make pulse-start
+```
+
+### Operator tools are blocked by the guard hook
+
+The destructive-op guard requires:
+1. All git repos committed and pushed
+2. A `dry_run=true` call before the real operation
+
+Run `/commit`, push, then re-run with `dry_run: true` first.
+
 ## Limitations
 
 - This is not a hosted control plane or a multi-user workspace platform.
-- There is no release installer, package manager distribution, or cloud provisioning flow yet.
+- There is no release installer, package manager distribution, or cloud provisioning flow yet beyond the operator MCP tools.
 - The API and web surfaces are inspection stubs, not a full UI.
 - The internal runtime manager now does dependency-aware task and service orchestration plus managed env hydration, but it still does not try to replace app-specific deployment systems or CI.
 - Secrets management and app-specific bootstrap details beyond what you declare in your overlays and blueprints are still your responsibility.
+- The pulse daemon is single-process; it does not survive container restarts unless declared as a managed service in `runtime.yaml`.
+- Fleet management requires DigitalOcean and Tailscale credentials. Other cloud providers are not supported.
 - There is no license file in this repo yet. Add one before publishing it as open source.
 
 ## FAQ
@@ -816,6 +1043,27 @@ repo universe or a client directory like `../vibe-coding-client`.
 ### Is `.env-manager/` the same thing as `../.env-manager`?
 
 No. The outer `../.env-manager` launches boxes from outside. The in-repo `.env-manager/` manages the inside of this box.
+
+### What is the difference between `focus` and `context`?
+
+`context` generates a static CLAUDE.md from the declared runtime graph.
+`focus` does everything `context` does but also syncs, bootstraps, starts
+services, collects live state, and writes an enriched context with real-time
+service health, git state, recent errors, and journal activity.
+
+### What is the event journal?
+
+An append-only JSONL file at `logs/runtime/journal.jsonl`. Every significant
+runtime event (service start/stop/crash, sync completion, focus activation,
+pulse restarts) is recorded with a timestamp, type, subject, and detail
+object. Agents can query it via the `skillbox_journal` MCP tool.
+
+### How does the destructive-op guard work?
+
+It is a bash script (`scripts/guard-destructive-op.sh`) registered as a
+Claude Code PreToolUse hook. It intercepts `operator_teardown` and
+`operator_compose_down` calls and blocks them unless all repos are clean and
+pushed, and a dry-run was already executed this session.
 
 ## About Contributions
 
