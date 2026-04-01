@@ -170,9 +170,22 @@ def build_model() -> dict[str, Any]:
         "SKILLBOX_SWIMMERS_INSTALL_DIR": f"{home_root}/.local/bin",
         "SKILLBOX_SWIMMERS_BIN": f"{home_root}/.local/bin/swimmers",
         "SKILLBOX_SWIMMERS_DOWNLOAD_URL": "",
+        "SKILLBOX_SWIMMERS_DOWNLOAD_SHA256": "",
         "SKILLBOX_SWIMMERS_AUTH_MODE": "",
         "SKILLBOX_SWIMMERS_AUTH_TOKEN": "",
         "SKILLBOX_SWIMMERS_OBSERVER_TOKEN": "",
+        "SKILLBOX_DCG_BIN": f"{home_root}/.local/bin/dcg",
+        "SKILLBOX_DCG_DOWNLOAD_URL": "",
+        "SKILLBOX_DCG_DOWNLOAD_SHA256": "",
+        "SKILLBOX_DCG_PACKS": "core.git,core.filesystem",
+        "SKILLBOX_DCG_MCP_PORT": "3220",
+        "SKILLBOX_FWC_BIN": f"{home_root}/.local/bin/fwc",
+        "SKILLBOX_FWC_DOWNLOAD_URL": "",
+        "SKILLBOX_FWC_DOWNLOAD_SHA256": "",
+        "SKILLBOX_FWC_MCP_PORT": "3221",
+        "SKILLBOX_FWC_ZONE": "work",
+        "SKILLBOX_FWC_CONNECTORS": "github,slack,linear",
+        "SKILLBOX_PULSE_INTERVAL": "30",
     }
     runtime_env = {key: value for key, value in expected_env.items() if key != "SKILLBOX_NAME"}
     expected_mounts = [
