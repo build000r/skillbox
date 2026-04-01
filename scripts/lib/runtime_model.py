@@ -33,6 +33,12 @@ RUNTIME_ENV_KEYS = [
     "SKILLBOX_DCG_BIN",
     "SKILLBOX_DCG_DOWNLOAD_URL",
     "SKILLBOX_DCG_PACKS",
+    "SKILLBOX_DCG_MCP_PORT",
+    "SKILLBOX_FWC_BIN",
+    "SKILLBOX_FWC_DOWNLOAD_URL",
+    "SKILLBOX_FWC_MCP_PORT",
+    "SKILLBOX_FWC_ZONE",
+    "SKILLBOX_FWC_CONNECTORS",
     "SKILLBOX_PULSE_INTERVAL",
 ]
 MANIFEST_ENV_KEYS = RUNTIME_ENV_KEYS + [
@@ -122,6 +128,12 @@ def load_runtime_env(root_dir: Path) -> dict[str, str]:
         "SKILLBOX_DCG_BIN": "/home/sandbox/.local/bin/dcg",
         "SKILLBOX_DCG_DOWNLOAD_URL": "",
         "SKILLBOX_DCG_PACKS": "core.git,core.filesystem",
+        "SKILLBOX_DCG_MCP_PORT": "3220",
+        "SKILLBOX_FWC_BIN": "/home/sandbox/.local/bin/fwc",
+        "SKILLBOX_FWC_DOWNLOAD_URL": "",
+        "SKILLBOX_FWC_MCP_PORT": "3221",
+        "SKILLBOX_FWC_ZONE": "work",
+        "SKILLBOX_FWC_CONNECTORS": "github,slack,linear",
         "SKILLBOX_PULSE_INTERVAL": "30",
         "ROOT_DIR": str(root_dir),
     }

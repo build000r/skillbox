@@ -31,6 +31,12 @@ variables:
   - name: SERVICE_HEALTHCHECK_URL
     default: http://127.0.0.1:${SERVICE_PORT}/health
     description: HTTP endpoint that must answer before the service is considered healthy.
+  - name: CONNECTORS
+    default: ""
+    description: >
+      Comma-separated list of FCP connector ids this client is authorized to use
+      (e.g. "slack,github,postgres"). Empty means no connectors. Requires the
+      connectors profile to be active at the box level.
 client:
   default_cwd: ${PRIMARY_REPO_PATH}
   repos:
@@ -70,3 +76,4 @@ client:
         url: ${SERVICE_HEALTHCHECK_URL}
         timeout_seconds: 0.5
       notes: Managed HTTP service declared by the client blueprint.
+  connectors: ${CONNECTORS}

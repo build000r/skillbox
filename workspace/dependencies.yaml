@@ -80,6 +80,37 @@ connector_repos:
     required: false
     notes: DCG source — 49+ rule packs, heredoc scanner, MCP server.
 
+# ---------------------------------------------------------------------------
+# Client connector schema
+#
+# Each client overlay can declare a `connectors` section listing the FCP
+# connectors it is authorized to use.  When the connectors profile is active
+# at the box level (fwc-mcp + dcg-mcp services running), the client's
+# connector declarations scope what the agent can reach.
+#
+# Schema per entry:
+#   id:            FCP connector id (e.g. slack, github, postgres)
+#   capabilities:  list of granted capabilities (read, write, react, admin, ...)
+#   scopes:        connector-specific scope map (channels, repos, tables, ...)
+#   notes:         human-readable description of why this access exists
+#
+# Connectors NOT listed are denied — allowlist model, not blocklist.
+# The box-level SKILLBOX_FWC_CONNECTORS env var sets the superset; client
+# overlays can only narrow, never widen.
+#
+# Example (see workspace/clients/vibe-coding-client/overlay.yaml):
+#   connectors:
+#     - id: slack
+#       capabilities: [read, write]
+#       scopes:
+#         channels: ["#alerts", "#deploys"]
+#     - id: github
+#       capabilities: [read, write]
+#       scopes:
+#         repos: ["org/*"]
+#         actions: [issues, pulls, reviews]
+# ---------------------------------------------------------------------------
+
 runtime_services:
   - id: internal-env-manager
     kind: orchestration

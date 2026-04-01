@@ -13,6 +13,12 @@ variables:
   - name: PRIMARY_REPO_PATH
     default: ${CLIENT_ROOT}/${PRIMARY_REPO_ID}
     description: Runtime path where the primary repository should live.
+  - name: CONNECTORS
+    default: ""
+    description: >
+      Comma-separated list of FCP connector ids this client is authorized to use
+      (e.g. "slack,github,postgres"). Empty means no connectors. Requires the
+      connectors profile to be active at the box level.
 client:
   default_cwd: ${PRIMARY_REPO_PATH}
   repos:
@@ -29,3 +35,4 @@ client:
       sync:
         mode: clone-if-missing
       notes: Primary client repository cloned into the mounted client root.
+  connectors: ${CONNECTORS}
