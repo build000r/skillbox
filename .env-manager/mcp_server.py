@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -292,6 +293,35 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "skillbox_focus",
+        "description": (
+            "Activate an existing client workspace with live state collection and enriched context. "
+            "Pipeline: sync → bootstrap → start services → collect live state → generate enriched CLAUDE.md. "
+            "Returns live_state with repo branches, service health, recent log errors, and an Attention section. "
+            "Use for existing clients — use skillbox_onboard for new ones. "
+            "Use resume=true to re-activate the last focused client without re-running the full pipeline."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "client_id": {
+                    "type": "string",
+                    "description": (
+                        "Existing client slug (e.g. 'personal'). "
+                        "Required unless resume=true. Must already be onboarded."
+                    ),
+                },
+                "service": _SERVICE_PROP,
+                "resume": {
+                    "type": "boolean",
+                    "description": "Re-activate last focus from .focus.json without re-running the full pipeline.",
+                    "default": False,
+                },
+                "wait_seconds": _WAIT_SECONDS_PROP,
+            },
+        },
+    },
+    {
         "name": "skillbox_client_init",
         "description": (
             "Scaffold a new client overlay or list available blueprints. "
@@ -322,6 +352,88 @@ TOOLS: list[dict] = [
                     "default": False,
                 },
                 "dry_run": _DRY_RUN_PROP,
+            },
+        },
+    },
+    # --- Pulse (reconciliation daemon) ---
+    {
+        "name": "skillbox_pulse",
+        "description": (
+            "Query the pulse reconciliation daemon status. "
+            "Returns: running (bool), pid, interval, cycle count, heals, "
+            "per-service states, per-check states, seconds since last tick. "
+            "Use to verify the box is being continuously monitored and to see "
+            "which services are supervised. "
+            "If pulse is not running, start it with skillbox_up targeting service 'pulse'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    # --- Journal ---
+    {
+        "name": "skillbox_journal",
+        "description": (
+            "Query the event journal for recent system and agent activity. "
+            "Returns structured events with timestamp, type, subject, and detail. "
+            "Use to understand what happened recently: service starts/stops, syncs, "
+            "focus activations, task runs, and agent notes from prior sessions."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "since_minutes": {
+                    "type": "number",
+                    "description": "Only return events from the last N minutes (default: 60).",
+                    "default": 60,
+                },
+                "event_type": {
+                    "type": "string",
+                    "description": (
+                        "Filter to a specific event type. "
+                        "System types: service.started, service.stopped, service.start_failed, "
+                        "task.started, task.completed, task.failed, sync.completed, "
+                        "context.generated, focus.activated, onboard.completed. "
+                        "Agent types: agent.note, agent.decision, agent.error."
+                    ),
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "Filter to a specific subject (e.g. a service ID or client ID).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum events to return (default: 50, newest first).",
+                    "default": 50,
+                },
+            },
+        },
+    },
+    {
+        "name": "skillbox_journal_write",
+        "description": (
+            "Write an agent event to the journal for cross-session continuity. "
+            "Use to record intent, decisions, and outcomes so the next session knows what happened. "
+            "Types are auto-prefixed with 'agent.' if not already."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["event_type", "subject"],
+            "properties": {
+                "event_type": {
+                    "type": "string",
+                    "description": "Event type (e.g. 'note', 'decision', 'error' — auto-prefixed with 'agent.').",
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "What this event is about (e.g. 'auth-refactor', 'db-migration').",
+                },
+                "detail": {
+                    "type": "object",
+                    "description": "Optional structured detail.",
+                    "additionalProperties": True,
+                },
             },
         },
     },
@@ -409,6 +521,8 @@ def build_args(command: str, params: dict, positional: str | None = None) -> lis
         args += ["--default-cwd", str(params["default_cwd"])]
     for sv in (params.get("set_vars") or []):
         args += ["--set", str(sv)]
+    if params.get("resume"):
+        args.append("--resume")
     if params.get("force"):
         args.append("--force")
     if params.get("list_blueprints"):
@@ -434,18 +548,77 @@ _DISPATCH: dict[str, tuple[str, str | None]] = {
     "skillbox_bootstrap":   ("bootstrap",   None),
     "skillbox_context":     ("context",     None),
     "skillbox_onboard":     ("onboard",     "client_id"),
+    "skillbox_focus":       ("focus",       "client_id"),
     "skillbox_client_init": ("client-init", "client_id"),
 }
 
 
+def _handle_pulse(_params: dict) -> dict:
+    """Read pulse daemon state directly (no manage.py subprocess)."""
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    from pulse import read_state
+
+    state = read_state(SCRIPT_DIR.parent)
+    return _ok_content(state)
+
+
+def _handle_journal(params: dict) -> dict:
+    """Query the event journal directly (no manage.py subprocess)."""
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    from manage import query_journal, DEFAULT_ROOT_DIR
+
+    since_minutes = float(params.get("since_minutes", 60))
+    since = time.time() - (since_minutes * 60) if since_minutes > 0 else None
+    events = query_journal(
+        DEFAULT_ROOT_DIR,
+        since=since,
+        event_type=params.get("event_type"),
+        subject=params.get("subject"),
+        limit=int(params.get("limit", 50)),
+    )
+    return _ok_content({"events": events, "count": len(events)})
+
+
+def _handle_journal_write(params: dict) -> dict:
+    """Write an agent event to the journal directly."""
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    from manage import emit_event, DEFAULT_ROOT_DIR
+
+    event_type = str(params.get("event_type", "")).strip()
+    subject = str(params.get("subject", "")).strip()
+    if not event_type or not subject:
+        return _error_content({
+            "error": {
+                "type": "missing_required_parameter",
+                "message": "'event_type' and 'subject' are required.",
+                "recoverable": True,
+            }
+        })
+    if not event_type.startswith("agent."):
+        event_type = f"agent.{event_type}"
+    detail = params.get("detail") or {}
+    emit_event(event_type, subject, detail, DEFAULT_ROOT_DIR)
+    return _ok_content({"written": True, "event_type": event_type, "subject": subject})
+
+
 def dispatch_tool(name: str, params: dict) -> dict:
     """Dispatch a tool call to manage.py and return a MCP content block."""
+    if name == "skillbox_pulse":
+        return _handle_pulse(params)
+    if name == "skillbox_journal":
+        return _handle_journal(params)
+    if name == "skillbox_journal_write":
+        return _handle_journal_write(params)
+
     if name not in _DISPATCH:
         return _error_content({
             "error": {
                 "type": "unknown_tool",
                 "message": f"Unknown tool: '{name}'.",
-                "available_tools": sorted(_DISPATCH.keys()),
+                "available_tools": sorted(list(_DISPATCH.keys()) + ["skillbox_pulse", "skillbox_journal", "skillbox_journal_write"]),
                 "recoverable": False,
             }
         })

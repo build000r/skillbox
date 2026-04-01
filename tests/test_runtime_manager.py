@@ -2073,5 +2073,150 @@ class RuntimeManagerTests(unittest.TestCase):
             )
 
 
+    # ------------------------------------------------------------------
+    # focus command tests
+    # ------------------------------------------------------------------
+
+    def test_focus_activates_client_and_generates_live_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            # First sync so directories exist
+            self._run(repo, "sync", "--client", "personal")
+
+            result = self._run(repo, "focus", "personal", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["client_id"], "personal")
+
+            # Steps should all be ok or skip
+            for s in payload["steps"]:
+                self.assertIn(s["status"], ("ok", "skip"), f"step {s['step']} failed")
+
+            # Live state should have repos, services, checks, logs
+            live = payload["live_state"]
+            self.assertIn("repos", live)
+            self.assertIn("services", live)
+            self.assertIn("checks", live)
+            self.assertIn("logs", live)
+            self.assertIn("collected_at", live)
+
+            # Summary should have expected keys
+            summary = payload["summary"]
+            self.assertIn("repos_present", summary)
+            self.assertIn("services_running", summary)
+            self.assertIn("checks_passing", summary)
+
+            # CLAUDE.md should have been written with live sections
+            claude_md = (repo / "home" / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
+            self.assertIn("## Live Status", claude_md)
+            # Repo State only appears when git repos are detected (tmpdir isn't a git repo)
+            self.assertIn("personal", claude_md)
+
+            # .focus.json should have been written
+            focus_path = repo / "workspace" / ".focus.json"
+            self.assertTrue(focus_path.is_file())
+            focus_data = json.loads(focus_path.read_text(encoding="utf-8"))
+            self.assertEqual(focus_data["client_id"], "personal")
+            self.assertEqual(focus_data["version"], 1)
+
+    def test_focus_resume_reuses_previous_client(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            # Initial focus
+            self._run(repo, "sync", "--client", "personal")
+            self._run(repo, "focus", "personal", "--format", "json")
+
+            # Resume
+            result = self._run(repo, "focus", "--resume", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["client_id"], "personal")
+
+    def test_focus_resume_fails_without_focus_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(repo, "focus", "--resume", "--format", "json")
+
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_focus_fails_for_unknown_client(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(repo, "focus", "nonexistent", "--format", "json")
+
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_focus_without_client_id_or_resume_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(repo, "focus", "--format", "json")
+
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_focus_live_context_includes_attention_for_failing_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            # Remove monoserver-host so the personal-root check fails
+            import shutil
+            monoserver = repo / "monoserver-host"
+            if monoserver.exists():
+                shutil.rmtree(monoserver)
+
+            result = self._run(repo, "focus", "personal", "--format", "json")
+
+            # Should still complete (checks fail but focus continues)
+            payload = json.loads(result.stdout)
+            claude_md = (repo / "home" / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
+            self.assertIn("## Attention", claude_md)
+            self.assertIn("CHECK FAIL", claude_md)
+
+    def test_focus_detects_recent_errors_in_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._run(repo, "sync", "--client", "personal")
+
+            # Write a fake log file with errors
+            log_dir = repo / "logs" / "runtime"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            (log_dir / "test.log").write_text(
+                "INFO: starting up\n"
+                "ERROR: connection refused on port 5432\n"
+                "INFO: retrying\n"
+                "FATAL: could not connect to database\n",
+                encoding="utf-8",
+            )
+
+            result = self._run(repo, "focus", "personal", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+
+            # Check that recent_errors were collected
+            logs_with_errors = [
+                lg for lg in payload["live_state"]["logs"]
+                if lg.get("recent_errors")
+            ]
+            self.assertTrue(len(logs_with_errors) > 0)
+
+            # Check that Attention section was generated
+            claude_md = (repo / "home" / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
+            self.assertIn("RECENT ERRORS", claude_md)
+
+
 if __name__ == "__main__":
     unittest.main()

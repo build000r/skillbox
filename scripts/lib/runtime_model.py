@@ -30,6 +30,10 @@ RUNTIME_ENV_KEYS = [
     "SKILLBOX_SWIMMERS_AUTH_MODE",
     "SKILLBOX_SWIMMERS_AUTH_TOKEN",
     "SKILLBOX_SWIMMERS_OBSERVER_TOKEN",
+    "SKILLBOX_DCG_BIN",
+    "SKILLBOX_DCG_DOWNLOAD_URL",
+    "SKILLBOX_DCG_PACKS",
+    "SKILLBOX_PULSE_INTERVAL",
 ]
 MANIFEST_ENV_KEYS = RUNTIME_ENV_KEYS + [
     "SKILLBOX_MONOSERVER_HOST_ROOT",
@@ -115,6 +119,10 @@ def load_runtime_env(root_dir: Path) -> dict[str, str]:
         "SKILLBOX_SWIMMERS_AUTH_MODE": "",
         "SKILLBOX_SWIMMERS_AUTH_TOKEN": "",
         "SKILLBOX_SWIMMERS_OBSERVER_TOKEN": "",
+        "SKILLBOX_DCG_BIN": "/home/sandbox/.local/bin/dcg",
+        "SKILLBOX_DCG_DOWNLOAD_URL": "",
+        "SKILLBOX_DCG_PACKS": "core.git,core.filesystem",
+        "SKILLBOX_PULSE_INTERVAL": "30",
         "ROOT_DIR": str(root_dir),
     }
 
@@ -265,13 +273,14 @@ def _normalize_runtime_sections(
         seen_client_ids.add(client_id)
         label = str(client.get("label") or client_id)
         client_default_cwd = client.get("default_cwd")
-        clients_meta.append(
-            {
-                "id": client_id,
-                "label": label,
-                "default_cwd": client_default_cwd,
-            }
-        )
+        client_meta: dict[str, Any] = {
+            "id": client_id,
+            "label": label,
+            "default_cwd": client_default_cwd,
+        }
+        if client.get("dcg"):
+            client_meta["dcg"] = client["dcg"]
+        clients_meta.append(client_meta)
         repos.extend(
             _normalize_client_repo_roots(
                 client.get("repo_roots"),
