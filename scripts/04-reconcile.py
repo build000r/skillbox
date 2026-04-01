@@ -647,10 +647,19 @@ def check_runtime_manager_doctor() -> CheckResult:
             details={"error": str(exc)},
         )
 
-    warnings = sum(1 for item in payload if item.get("status") == "warn")
+    items = payload.get("checks", payload) if isinstance(payload, dict) else payload
+    if not isinstance(items, list):
+        return CheckResult(
+            status="fail",
+            code="runtime-manager-doctor",
+            message="internal runtime manager doctor emitted an unexpected JSON shape",
+            details={"payload_type": type(payload).__name__},
+        )
+
+    warnings = sum(1 for item in items if item.get("status") == "warn")
     details = {"warnings": warnings}
     if warnings:
-        details["warning_codes"] = [item.get("code") for item in payload if item.get("status") == "warn"]
+        details["warning_codes"] = [item.get("code") for item in items if item.get("status") == "warn"]
 
     return CheckResult(
         status="pass",
