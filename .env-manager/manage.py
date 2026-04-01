@@ -154,7 +154,12 @@ def classify_error(exc: RuntimeError, command: str) -> dict[str, Any]:
             error_type="missing_variable",
             recovery_hint="Add the missing --set KEY=VALUE assignments and retry.",
         )
-    if "already exists" in msg.lower() or "without force" in msg.lower() or "already_exists" in msg.lower():
+    if (
+        "already exists" in msg.lower()
+        or "without force" in msg.lower()
+        or "already_exists" in msg.lower()
+        or "non-projection output directory" in msg.lower()
+    ):
         return structured_error(
             msg,
             error_type="conflict",
@@ -1690,8 +1695,8 @@ def prepare_client_projection_output_dir(
                 pass
             if not allow_replace:
                 raise RuntimeError(
-                    "Refusing to remove a non-projection output directory outside the default "
-                    f"build root: {output_dir}"
+                    "client-project output already exists at "
+                    f"{output_dir} and is not a projection directory under the default build root."
                 )
             actions.append(f"remove-output-dir: {repo_rel(root_dir, output_dir)}")
             if not dry_run:
