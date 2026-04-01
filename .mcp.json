@@ -3,6 +3,18 @@
     "skillbox": {
       "command": "python3",
       "args": ["/workspace/.env-manager/mcp_server.py"]
+    },
+    "skillbox-operator": {
+      "command": "python3",
+      "args": ["scripts/operator_mcp_server.py"]
+    },
+    "fwc": {
+      "command": "/home/sandbox/.local/bin/fwc",
+      "args": ["serve-mcp", "--zone", "work"]
+    },
+    "dcg": {
+      "command": "/home/sandbox/.local/bin/dcg",
+      "args": ["mcp"]
     }
   }
 }

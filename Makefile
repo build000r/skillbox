@@ -7,7 +7,7 @@ LINES_ARGS := $(if $(strip $(LINES)),--lines $(LINES),)
 BLUEPRINT_ARGS := $(if $(strip $(BLUEPRINT)),--blueprint $(BLUEPRINT),)
 SET_ARGS := $(foreach s,$(SET),--set $(s))
 
-.PHONY: help bootstrap-env render doctor runtime-render runtime-sync runtime-status runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard context dev-sanity build up up-surfaces down shell logs swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles
+.PHONY: help bootstrap-env render doctor runtime-render runtime-sync runtime-status runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard context dev-sanity build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles
 
 help:
 	@printf "  make bootstrap-env  Copy .env.example to .env if missing\n"
@@ -23,6 +23,9 @@ help:
 	@printf "  make runtime-logs   Show recent service logs (optional CLIENT=name PROFILE=name SERVICE=id LINES=n)\n"
 	@printf "  make onboard        Scaffold, sync, bootstrap, start, context, verify in one step (CLIENT=id BLUEPRINT=name SET='K=V')\n"
 	@printf "  make context        Generate CLAUDE.md and AGENTS.md from the runtime graph (optional CLIENT=name PROFILE=name)\n"
+	@printf "  make pulse-start    Start the pulse reconciliation daemon (auto-heals crashed services)\n"
+	@printf "  make pulse-stop     Stop the pulse daemon\n"
+	@printf "  make pulse-status   Show pulse daemon status, supervised services, and recent heals\n"
 	@printf "  make dev-sanity     Validate runtime graph, paths, and skill integrity (optional CLIENT=name PROFILE=name)\n"
 	@printf "  make build          Build the workspace image\n"
 	@printf "  make up             Start the workspace container\n"
@@ -85,6 +88,15 @@ context:
 
 dev-sanity:
 	@python3 .env-manager/manage.py doctor $(CLIENT_ARGS) $(PROFILE_ARGS)
+
+pulse-start:
+	@python3 .env-manager/pulse.py run &
+
+pulse-stop:
+	@python3 .env-manager/pulse.py stop
+
+pulse-status:
+	@python3 .env-manager/pulse.py status
 
 build: bootstrap-env
 	@$(COMPOSE) build

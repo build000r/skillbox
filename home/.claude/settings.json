@@ -3,5 +3,18 @@
     "defaultMode": "bypassPermissions"
   },
   "skipDangerousModePermissionPrompt": true,
-  "enableAllProjectMcpServers": true
+  "enableAllProjectMcpServers": true,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -x \"${SKILLBOX_DCG_BIN:-/home/sandbox/.local/bin/dcg}\" && \"${SKILLBOX_DCG_BIN:-/home/sandbox/.local/bin/dcg}\" || true"
+          }
+        ]
+      }
+    ]
+  }
 }

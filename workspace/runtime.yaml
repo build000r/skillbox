@@ -44,6 +44,20 @@ core:
         mode: download-if-missing
       notes: Core swimmers binary, installable from a pinned URL when one is configured.
 
+    - id: dcg-bin
+      kind: binary
+      path: ${SKILLBOX_DCG_BIN}
+      required: false
+      profiles:
+        - core
+      source:
+        kind: url
+        url: ${SKILLBOX_DCG_DOWNLOAD_URL}
+        executable: true
+      sync:
+        mode: download-if-missing
+      notes: Destructive command guard binary. Protects agent sessions from irreversible shell commands.
+
   skills:
     - id: default-skills
       kind: packaged-skill-set
@@ -75,6 +89,24 @@ core:
       command: python3 .env-manager/manage.py
       log: runtime
       notes: Internal control surface for repos, logs, and dev-sanity.
+
+    - id: pulse
+      kind: daemon
+      owner: local
+      repo: skillbox-self
+      required: false
+      profiles:
+        - core
+      command: python3 .env-manager/pulse.py run --interval ${SKILLBOX_PULSE_INTERVAL}
+      healthcheck:
+        type: path_exists
+        path: ${SKILLBOX_LOG_ROOT}/runtime/pulse.pid
+      log: runtime
+      notes: >
+        Live reconciliation daemon. Watches the runtime graph on a fixed
+        interval, detects service crashes and check failures, auto-heals
+        safe drift (restarts crashed services), and emits structured events
+        to the journal for agent observability.
 
     - id: api-stub
       kind: http
@@ -209,3 +241,122 @@ core:
       profiles:
         - core
       notes: Internal manager entrypoint should exist.
+
+    - id: dcg-binary
+      type: path_exists
+      path: ${SKILLBOX_DCG_BIN}
+      required: false
+      profiles:
+        - core
+      notes: Destructive command guard should be installed for agent safety.
+
+    - id: fwc-binary
+      type: path_exists
+      path: ${SKILLBOX_FWC_BIN}
+      required: false
+      profiles:
+        - connectors
+      notes: Flywheel connectors CLI should be installed for the connectors profile.
+
+connectors:
+  repos:
+    - id: flywheel-connectors
+      kind: repo
+      path: ${SKILLBOX_REPOS_ROOT}/flywheel_connectors
+      required: false
+      profiles:
+        - connectors
+      source:
+        kind: git
+        url: https://github.com/Dicklesworthstone/flywheel_connectors.git
+        branch: main
+      sync:
+        mode: clone-if-missing
+      notes: >
+        Flywheel Connector Protocol — 150+ service connectors with
+        cryptographic capability gating. Source checkout for building
+        custom connectors and reading connector manifests.
+
+    - id: destructive-command-guard
+      kind: repo
+      path: ${SKILLBOX_REPOS_ROOT}/destructive_command_guard
+      required: false
+      profiles:
+        - connectors
+      source:
+        kind: git
+        url: https://github.com/Dicklesworthstone/destructive_command_guard.git
+        branch: main
+      sync:
+        mode: clone-if-missing
+      notes: >
+        DCG source checkout. Used to build the binary from source when
+        no download URL is configured, and to inspect/extend rule packs.
+
+  artifacts:
+    - id: fwc-bin
+      kind: binary
+      path: ${SKILLBOX_FWC_BIN}
+      required: false
+      profiles:
+        - connectors
+      source:
+        kind: url
+        url: ${SKILLBOX_FWC_DOWNLOAD_URL}
+        executable: true
+      sync:
+        mode: download-if-missing
+      notes: >
+        Flywheel connectors CLI. Provides fwc serve-mcp to expose
+        connectors as MCP tools and fwc invoke for direct operation calls.
+
+  services:
+    - id: fwc-mcp
+      kind: mcp
+      owner: local
+      artifact: fwc-bin
+      required: false
+      profiles:
+        - connectors
+      command: >
+        ${SKILLBOX_FWC_BIN} serve-mcp
+        --zone ${SKILLBOX_FWC_ZONE}
+        --connectors ${SKILLBOX_FWC_CONNECTORS}
+      healthcheck:
+        type: process_running
+        pattern: fwc serve-mcp
+      depends_on: []
+      log: connectors
+      notes: >
+        Flywheel connectors MCP server. Exposes configured connectors
+        (GitHub, Slack, Linear, etc.) as MCP tools over stdio. Agents
+        inside the box get authenticated access to external services
+        through FCP's capability-gated security model.
+
+    - id: dcg-mcp
+      kind: mcp
+      owner: local
+      artifact: dcg-bin
+      required: false
+      profiles:
+        - connectors
+      command: ${SKILLBOX_DCG_BIN} mcp
+      healthcheck:
+        type: process_running
+        pattern: dcg mcp
+      depends_on: []
+      log: connectors
+      notes: >
+        DCG MCP server. Exposes check_command, scan_file, and
+        explain_pattern as agent tools. Agents can proactively verify
+        whether a command is safe before attempting it, rather than
+        being passively blocked by the PreToolUse hook.
+
+  logs:
+    - id: connectors
+      path: ${SKILLBOX_LOG_ROOT}/connectors
+      required: false
+      profiles:
+        - connectors
+      retention_days: 14
+      notes: Flywheel connectors and DCG MCP server logs.
