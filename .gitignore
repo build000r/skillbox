@@ -27,6 +27,9 @@ workspace/clients/*/skills.lock.json
 workspace/secrets/
 workspace/boxes.json
 workspace/.focus.json
+workspace/.compose-overrides/
 workspace/clients/*/context.yaml
+data/
 .env.box
 .dcg.toml
+sand/

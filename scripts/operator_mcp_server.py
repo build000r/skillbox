@@ -299,9 +299,25 @@ def run_script(
     return proc.returncode == 0, proc.returncode, {"exit_code": proc.returncode}
 
 
+def _compose_monoserver_layer() -> list[str]:
+    """Return the -f flags for the monoserver layer (client override or fat default)."""
+    focus_path = REPO_ROOT / "workspace" / ".focus.json"
+    if focus_path.is_file():
+        try:
+            focus = json.loads(focus_path.read_text(encoding="utf-8"))
+            client_id = focus.get("client_id", "")
+            override = REPO_ROOT / "workspace" / ".compose-overrides" / f"docker-compose.client-{client_id}.yml"
+            if client_id and override.is_file():
+                return ["-f", str(override.relative_to(REPO_ROOT))]
+        except (json.JSONDecodeError, OSError):
+            pass
+    return ["-f", "docker-compose.monoserver.yml"]
+
+
 def run_compose(args: list[str], *, timeout: int = 300) -> tuple[bool, int, Any]:
     """Run docker compose and return structured output."""
-    cmd = ["docker", "compose"] + args
+    file_flags = ["-f", "docker-compose.yml"] + _compose_monoserver_layer()
+    cmd = ["docker", "compose"] + file_flags + args
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout, cwd=str(REPO_ROOT),

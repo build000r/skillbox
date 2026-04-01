@@ -2,9 +2,20 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COMPOSE_FILES=(-f docker-compose.yml -f docker-compose.swimmers.yml)
 WORKSPACE_SERVICE="${SKILLBOX_WORKSPACE_SERVICE:-workspace}"
 INSIDE_FLAG="--inside"
+
+# Determine monoserver layer: per-client override or fat default.
+_FOCUS_FILE="${ROOT_DIR}/workspace/.focus.json"
+_MONOSERVER_LAYER="docker-compose.monoserver.yml"
+if [[ -f "${_FOCUS_FILE}" ]]; then
+  _CLIENT_ID="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('client_id',''))" "${_FOCUS_FILE}" 2>/dev/null || true)"
+  _OVERRIDE="${ROOT_DIR}/workspace/.compose-overrides/docker-compose.client-${_CLIENT_ID}.yml"
+  if [[ -n "${_CLIENT_ID}" && -f "${_OVERRIDE}" ]]; then
+    _MONOSERVER_LAYER="workspace/.compose-overrides/docker-compose.client-${_CLIENT_ID}.yml"
+  fi
+fi
+COMPOSE_FILES=(-f docker-compose.yml -f "${_MONOSERVER_LAYER}" -f docker-compose.swimmers.yml)
 
 usage() {
   cat <<'EOF'

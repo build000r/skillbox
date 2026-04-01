@@ -26,6 +26,7 @@ EXPECTED_FILES = [
     ".env.example",
     "Dockerfile",
     "docker-compose.yml",
+    "docker-compose.monoserver.yml",
     "docker-compose.swimmers.yml",
     ".env-manager/README.md",
     ".env-manager/manage.py",
@@ -202,13 +203,31 @@ def build_model() -> dict[str, Any]:
             or env_defaults.get("SKILLBOX_CLIENTS_HOST_ROOT", "./workspace/clients")
         ),
     )
-    expected_mounts = [
+    base_mounts = [
         {"source": str(ROOT_DIR), "target": paths.get("workspace_root")},
         {"source": str(clients_host_root), "target": expected_env["SKILLBOX_CLIENTS_ROOT"]},
         {"source": str(ROOT_DIR / "home" / ".claude"), "target": paths.get("claude_root")},
         {"source": str(ROOT_DIR / "home" / ".codex"), "target": paths.get("codex_root")},
-        {"source": str(ROOT_DIR.parent), "target": paths.get("monoserver_root")},
     ]
+
+    # Per-client overrides replace the fat monoserver mount with individual repo mounts.
+    monoserver_layer = _resolve_monoserver_layer()
+    if monoserver_layer != "docker-compose.monoserver.yml":
+        # Client-focused: read the override file to extract expected volume mounts.
+        override_path = ROOT_DIR / monoserver_layer
+        try:
+            override_doc = yaml.safe_load(override_path.read_text(encoding="utf-8")) or {}
+            ws_volumes = (override_doc.get("services", {}).get("workspace", {}).get("volumes") or [])
+            for vol_str in ws_volumes:
+                parts = str(vol_str).split(":", 1)
+                if len(parts) == 2:
+                    base_mounts.append({"source": parts[0], "target": parts[1]})
+        except (OSError, Exception):
+            base_mounts.append({"source": str(ROOT_DIR.parent), "target": paths.get("monoserver_root")})
+    else:
+        base_mounts.append({"source": str(ROOT_DIR.parent), "target": paths.get("monoserver_root")})
+
+    expected_mounts = base_mounts
 
     return {
         "root_dir": str(ROOT_DIR),
@@ -259,11 +278,27 @@ def run_command(args: list[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _resolve_monoserver_layer() -> str:
+    """Return the compose file path for the monoserver layer."""
+    focus_path = ROOT_DIR / "workspace" / ".focus.json"
+    if focus_path.is_file():
+        try:
+            focus = json.loads(focus_path.read_text(encoding="utf-8"))
+            client_id = focus.get("client_id", "")
+            override = ROOT_DIR / "workspace" / ".compose-overrides" / f"docker-compose.client-{client_id}.yml"
+            if client_id and override.is_file():
+                return str(override.relative_to(ROOT_DIR))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return "docker-compose.monoserver.yml"
+
+
 def compose_config(include_surfaces: bool, include_swimmers: bool = False) -> dict[str, Any]:
     if shutil.which("docker") is None:
         raise RuntimeError("`docker` is not installed or not on PATH")
 
-    args = ["docker", "compose", "-f", "docker-compose.yml"]
+    monoserver_layer = _resolve_monoserver_layer()
+    args = ["docker", "compose", "-f", "docker-compose.yml", "-f", monoserver_layer]
     if include_swimmers:
         args.extend(["-f", "docker-compose.swimmers.yml"])
     if include_surfaces:

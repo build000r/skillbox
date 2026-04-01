@@ -424,7 +424,7 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
         repo.setdefault("client", "")
         repo.setdefault("sync", {})
         repo.setdefault("source", {})
-        if repo.get("path"):
+        if repo.get("path") and "host_path" not in repo:
             repo["host_path"] = str(runtime_path_to_host_path(root_dir, model["env"], str(repo["path"])))
 
     for artifact in model["artifacts"]:

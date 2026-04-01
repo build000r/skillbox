@@ -1,4 +1,11 @@
 COMPOSE := docker compose
+
+# Resolve monoserver layer: per-client override when focused, fat default otherwise.
+_FOCUS_CLIENT := $(shell python3 -c "import json; print(json.load(open('workspace/.focus.json')).get('client_id',''))" 2>/dev/null)
+_CLIENT_OVERRIDE := workspace/.compose-overrides/docker-compose.client-$(_FOCUS_CLIENT).yml
+_MONOSERVER_LAYER := $(if $(and $(_FOCUS_CLIENT),$(wildcard $(_CLIENT_OVERRIDE))),$(_CLIENT_OVERRIDE),docker-compose.monoserver.yml)
+COMPOSEF := $(COMPOSE) -f docker-compose.yml -f $(_MONOSERVER_LAYER)
+
 PROFILE_ARGS := $(if $(strip $(PROFILE)),--profile $(PROFILE),)
 CLIENT_ARGS := $(if $(strip $(CLIENT)),--client $(CLIENT),)
 SERVICE_ARGS := $(if $(strip $(SERVICE)),--service $(SERVICE),)
@@ -103,22 +110,22 @@ pulse-status:
 	@python3 .env-manager/pulse.py status
 
 build: bootstrap-env
-	@$(COMPOSE) build
+	@$(COMPOSEF) build
 
 up: bootstrap-env
-	@$(COMPOSE) up -d workspace
+	@$(COMPOSEF) up -d workspace
 
 up-surfaces: bootstrap-env
-	@$(COMPOSE) --profile surfaces up -d api web
+	@$(COMPOSEF) --profile surfaces up -d api web
 
 down:
-	@$(COMPOSE) down
+	@$(COMPOSEF) down
 
 shell: bootstrap-env
-	@$(COMPOSE) exec workspace zsh
+	@$(COMPOSEF) exec workspace zsh
 
 logs:
-	@$(COMPOSE) logs -f --tail=200
+	@$(COMPOSEF) logs -f --tail=200
 
 swimmers-install: bootstrap-env
 	@./scripts/05-swimmers.sh install

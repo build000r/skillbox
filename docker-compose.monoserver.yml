@@ -1,0 +1,12 @@
+# Default monoserver mount: exposes entire parent directory.
+# Replaced by per-client overrides when a client is focused.
+services:
+  workspace:
+    volumes:
+      - ${SKILLBOX_MONOSERVER_HOST_ROOT:-..}:${SKILLBOX_MONOSERVER_ROOT:-/monoserver}
+  api:
+    volumes:
+      - ${SKILLBOX_MONOSERVER_HOST_ROOT:-..}:${SKILLBOX_MONOSERVER_ROOT:-/monoserver}
+  web:
+    volumes:
+      - ${SKILLBOX_MONOSERVER_HOST_ROOT:-..}:${SKILLBOX_MONOSERVER_ROOT:-/monoserver}

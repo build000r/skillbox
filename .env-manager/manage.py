@@ -39,7 +39,9 @@ from lib.runtime_model import (  # noqa: E402
     client_config_host_dir,
     client_config_runtime_dir,
     host_path_to_absolute_path,
+    load_yaml,
     load_runtime_env,
+    runtime_manifest_path,
     runtime_path_to_host_path,
 )
 
@@ -58,6 +60,10 @@ LOCKFILE_VERSION = 1
 CONTEXT_CLAUDE_REL = Path("home") / ".claude" / "CLAUDE.md"
 CONTEXT_CODEX_REL = Path("home") / ".codex" / "AGENTS.md"
 CONTEXT_SYMLINK_TARGET = os.path.join("..", ".claude", "CLAUDE.md")
+CLIENT_PROJECTS_REL = Path("builds") / "clients"
+CLIENT_PROJECTION_VERSION = 1
+CLIENT_PROJECT_RUNTIME_MODEL_REL = Path("runtime-model.json")
+CLIENT_PROJECTION_METADATA_REL = Path("projection.json")
 CLIENT_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 BLUEPRINT_VARIABLE_PATTERN = re.compile(r"^[A-Z0-9_]+$")
 SCAFFOLD_PLACEHOLDER_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
@@ -267,11 +273,41 @@ def next_actions_for_focus(client_id: str, has_fail: bool) -> list[str]:
     return [f"status --client {client_id} --format json"]
 
 
+def next_actions_for_client_project(client_id: str) -> list[str]:
+    return [
+        f"render --client {client_id} --format json",
+        f"sync --client {client_id} --format json",
+    ]
+
+
 def repo_rel(root_dir: Path, path: Path) -> str:
     try:
         return str(path.relative_to(root_dir))
     except ValueError:
         return str(path)
+
+
+def resolve_context_dir(root_dir: Path, raw_context_dir: str | None) -> Path | None:
+    value = str(raw_context_dir or "").strip()
+    if not value:
+        return None
+    return host_path_to_absolute_path(root_dir, value)
+
+
+def context_output_paths(root_dir: Path, context_dir: Path | None) -> tuple[Path, Path, str]:
+    if context_dir is None:
+        return (
+            root_dir / CONTEXT_CLAUDE_REL,
+            root_dir / CONTEXT_CODEX_REL,
+            CONTEXT_SYMLINK_TARGET,
+        )
+
+    target_dir = context_dir.resolve()
+    return (
+        target_dir / "CLAUDE.md",
+        target_dir / "AGENTS.md",
+        "CLAUDE.md",
+    )
 
 
 def client_overlay_location(root_dir: Path, client_id: str) -> tuple[dict[str, str], Path, Path]:
@@ -1041,6 +1077,11 @@ def filter_model(model: dict[str, Any], active_profiles: set[str], active_client
     filtered_model = dict(model)
     filtered_model["active_profiles"] = sorted(active_profiles)
     filtered_model["active_clients"] = sorted(active_clients)
+    filtered_model["clients"] = [
+        copy.deepcopy(client)
+        for client in model["clients"]
+        if not active_clients or str(client.get("id", "")).strip() in active_clients
+    ]
     filtered_model["repos"] = [
         copy.deepcopy(repo)
         for repo in model["repos"]
@@ -1354,6 +1395,407 @@ def write_json_file(path: Path, payload: dict[str, Any]) -> bool:
         return False
     path.write_text(serialized, encoding="utf-8")
     return True
+
+
+def resolve_client_projection_output_dir(
+    root_dir: Path,
+    client_id: str,
+    raw_output_dir: str | None,
+) -> Path:
+    if raw_output_dir:
+        output_dir = Path(raw_output_dir).expanduser()
+        if not output_dir.is_absolute():
+            output_dir = (root_dir / output_dir).resolve()
+        else:
+            output_dir = output_dir.resolve()
+        return output_dir
+    return (root_dir / CLIENT_PROJECTS_REL / client_id).resolve()
+
+
+def runtime_path_to_projection_rel_path(env_values: dict[str, str], raw_path: str) -> Path:
+    workspace_root = Path(env_values["SKILLBOX_WORKSPACE_ROOT"])
+    runtime_path = Path(raw_path)
+    try:
+        relative = runtime_path.relative_to(workspace_root)
+    except ValueError as exc:
+        raise RuntimeError(
+            "client-project only supports runtime files that live under "
+            f"{workspace_root}, got {runtime_path}"
+        ) from exc
+    return Path(relative.as_posix())
+
+
+def prepare_client_projection_output_dir(
+    root_dir: Path,
+    output_dir: Path,
+    *,
+    dry_run: bool,
+    force: bool,
+) -> list[str]:
+    actions: list[str] = []
+    default_root = (root_dir / CLIENT_PROJECTS_REL).resolve()
+    protected_paths = {
+        root_dir.resolve(),
+        (root_dir / "workspace").resolve(),
+        (root_dir / "default-skills").resolve(),
+        (root_dir / ".env-manager").resolve(),
+    }
+
+    if output_dir in protected_paths:
+        raise RuntimeError(f"Refusing to use protected output directory for client-project: {output_dir}")
+
+    if output_dir.exists():
+        if output_dir.is_dir():
+            has_contents = any(output_dir.iterdir())
+        else:
+            has_contents = True
+
+        if has_contents and not force:
+            raise RuntimeError(
+                f"client-project output already exists at {output_dir}. Re-run with --force to replace it."
+            )
+
+        if has_contents and force:
+            allow_replace = (output_dir / CLIENT_PROJECTION_METADATA_REL).is_file()
+            try:
+                output_dir.relative_to(default_root)
+                allow_replace = True
+            except ValueError:
+                pass
+            if not allow_replace:
+                raise RuntimeError(
+                    "Refusing to remove a non-projection output directory outside the default "
+                    f"build root: {output_dir}"
+                )
+            actions.append(f"remove-output-dir: {repo_rel(root_dir, output_dir)}")
+            if not dry_run:
+                remove_path(output_dir)
+
+    if not dry_run:
+        ensure_directory(output_dir, dry_run=False)
+    return actions
+
+
+def add_projection_source_file(
+    files: dict[str, dict[str, Any]],
+    destination_rel: Path,
+    source_path: Path,
+) -> None:
+    normalized_dest = destination_rel.as_posix()
+    if normalized_dest in files:
+        existing = files[normalized_dest]
+        if existing.get("type") == "copy" and Path(str(existing["source_path"])) == source_path:
+            return
+        raise RuntimeError(f"client-project attempted to write duplicate output file {normalized_dest}")
+    if not source_path.is_file():
+        raise RuntimeError(f"Required projection source file missing: {source_path}")
+    files[normalized_dest] = {
+        "type": "copy",
+        "destination_rel": normalized_dest,
+        "source_path": source_path,
+    }
+
+
+def add_projection_text_file(
+    files: dict[str, dict[str, Any]],
+    destination_rel: Path,
+    content: str,
+) -> None:
+    normalized_dest = destination_rel.as_posix()
+    if normalized_dest in files:
+        existing = files[normalized_dest]
+        if existing.get("type") == "text" and existing.get("content") == content:
+            return
+        raise RuntimeError(f"client-project attempted to write duplicate output file {normalized_dest}")
+    files[normalized_dest] = {
+        "type": "text",
+        "destination_rel": normalized_dest,
+        "content": content,
+    }
+
+
+def sanitize_projection_env(env_values: dict[str, Any]) -> dict[str, Any]:
+    sanitized: dict[str, Any] = {}
+    for key, value in env_values.items():
+        key_upper = str(key).upper()
+        if key_upper in {"SKILLBOX_CLIENTS_HOST_ROOT", "SKILLBOX_MONOSERVER_HOST_ROOT"}:
+            continue
+        if any(marker in key_upper for marker in ("TOKEN", "SECRET", "PASSWORD")):
+            continue
+        sanitized[str(key)] = value
+    return sanitized
+
+
+def sanitize_projection_source(source: dict[str, Any]) -> dict[str, Any]:
+    kind = str(source.get("kind") or "").strip()
+    sanitized: dict[str, Any] = {}
+    for key, value in source.items():
+        key_text = str(key)
+        key_upper = key_text.upper()
+        if key_text == "host_path":
+            continue
+        if key_text == "path" and kind in {"bind", "directory", "file", "local", "manual"}:
+            continue
+        if any(marker in key_upper for marker in ("TOKEN", "SECRET", "PASSWORD")):
+            continue
+        sanitized[key_text] = sanitize_projection_value(value, key=key_text)
+    return sanitized
+
+
+def sanitize_projection_value(value: Any, *, key: str | None = None) -> Any:
+    if isinstance(value, dict):
+        if key == "env":
+            return sanitize_projection_env(value)
+        if key == "source":
+            return sanitize_projection_source(value)
+
+        sanitized: dict[str, Any] = {}
+        for child_key, child_value in value.items():
+            child_key_text = str(child_key)
+            child_key_upper = child_key_text.upper()
+            if child_key_text in {"root_dir", "manifest_file", "host_path"} or child_key_text.endswith("_host_path"):
+                continue
+            if any(marker in child_key_upper for marker in ("TOKEN", "SECRET", "PASSWORD")):
+                continue
+            sanitized[child_key_text] = sanitize_projection_value(child_value, key=child_key_text)
+        return sanitized
+
+    if isinstance(value, list):
+        return [sanitize_projection_value(item, key=key) for item in value]
+
+    return value
+
+
+def build_projected_runtime_manifest(
+    root_dir: Path,
+    client_id: str,
+    *,
+    overlay_present: bool,
+) -> dict[str, Any]:
+    runtime_doc = copy.deepcopy(load_yaml(runtime_manifest_path(root_dir)))
+    selection = runtime_doc.get("selection")
+    if selection is None:
+        selection = {}
+    if not isinstance(selection, dict):
+        raise RuntimeError("Expected runtime manifest selection to be a mapping")
+
+    selection_copy = copy.deepcopy(selection)
+    selection_copy["default_client"] = client_id
+    runtime_doc["selection"] = selection_copy
+
+    raw_clients = runtime_doc.get("clients")
+    if raw_clients is not None:
+        if not isinstance(raw_clients, list):
+            raise RuntimeError("Expected runtime manifest clients to be a list")
+        if overlay_present:
+            runtime_doc.pop("clients", None)
+        else:
+            filtered_clients = [
+                copy.deepcopy(item)
+                for item in raw_clients
+                if isinstance(item, dict) and str(item.get("id", "")).strip() == client_id
+            ]
+            if filtered_clients:
+                runtime_doc["clients"] = filtered_clients
+            else:
+                runtime_doc.pop("clients", None)
+
+    return runtime_doc
+
+
+def collect_client_projection_files(
+    root_dir: Path,
+    model: dict[str, Any],
+    client_id: str,
+) -> tuple[dict[str, dict[str, Any]], str]:
+    env_values = load_runtime_env(root_dir)
+    files: dict[str, dict[str, Any]] = {}
+
+    client_overlay_host_path = client_config_host_dir(root_dir, env_values, client_id) / "overlay.yaml"
+    overlay_present = client_overlay_host_path.is_file()
+    runtime_doc = build_projected_runtime_manifest(
+        root_dir,
+        client_id,
+        overlay_present=overlay_present,
+    )
+    add_projection_text_file(
+        files,
+        Path("workspace") / "runtime.yaml",
+        render_yaml_document(runtime_doc),
+    )
+
+    for optional_rel_path in (
+        Path(".env.example"),
+        Path("workspace") / "sandbox.yaml",
+        Path("workspace") / "dependencies.yaml",
+    ):
+        source_path = root_dir / optional_rel_path
+        if source_path.is_file():
+            add_projection_source_file(files, optional_rel_path, source_path)
+
+    if overlay_present:
+        overlay_runtime_path = client_config_runtime_dir(env_values, client_id) / "overlay.yaml"
+        add_projection_source_file(
+            files,
+            runtime_path_to_projection_rel_path(env_values, str(overlay_runtime_path)),
+            client_overlay_host_path,
+        )
+
+    for skillset in model.get("skills") or []:
+        inventory = collect_skill_inventory(skillset)
+        manifest_host_path = Path(str(skillset["manifest_host_path"]))
+        sources_config_host_path = Path(str(skillset["sources_config_host_path"]))
+        add_projection_source_file(
+            files,
+            runtime_path_to_projection_rel_path(env_values, str(skillset["manifest"])),
+            manifest_host_path,
+        )
+        add_projection_source_file(
+            files,
+            runtime_path_to_projection_rel_path(env_values, str(skillset["sources_config"])),
+            sources_config_host_path,
+        )
+
+        bundle_dir_runtime_path = PurePosixPath(str(skillset["bundle_dir"]))
+        bundle_dir_host_path = Path(str(skillset["bundle_dir_host_path"]))
+        bundle_readme_path = bundle_dir_host_path / "README.md"
+        if bundle_readme_path.is_file():
+            add_projection_source_file(
+                files,
+                runtime_path_to_projection_rel_path(env_values, str(bundle_dir_runtime_path / "README.md")),
+                bundle_readme_path,
+            )
+
+        missing_bundles = [
+            skill_name
+            for skill_name in inventory["expected_skills"]
+            if skill_name not in inventory["bundles"]
+        ]
+        if missing_bundles:
+            raise RuntimeError(
+                f"Skill set {skillset['id']} is missing bundles for: {', '.join(sorted(missing_bundles))}"
+            )
+
+        for skill_name in inventory["expected_skills"]:
+            bundle_record = inventory["bundles"][skill_name]
+            bundle_filename = str(bundle_record["filename"])
+            add_projection_source_file(
+                files,
+                runtime_path_to_projection_rel_path(env_values, str(bundle_dir_runtime_path / bundle_filename)),
+                Path(str(bundle_record["host_path"])),
+            )
+
+    sanitized_model = sanitize_projection_value(copy.deepcopy(model))
+    add_projection_text_file(
+        files,
+        CLIENT_PROJECT_RUNTIME_MODEL_REL,
+        json.dumps(sanitized_model, indent=2, sort_keys=True) + "\n",
+    )
+
+    overlay_mode = "overlay" if overlay_present else "inline"
+    return files, overlay_mode
+
+
+def materialize_client_projection(
+    root_dir: Path,
+    output_dir: Path,
+    files: dict[str, dict[str, Any]],
+    *,
+    dry_run: bool,
+    force: bool,
+) -> tuple[list[str], list[tuple[str, str]]]:
+    actions = prepare_client_projection_output_dir(
+        root_dir,
+        output_dir,
+        dry_run=dry_run,
+        force=force,
+    )
+    entries: list[tuple[str, str]] = []
+
+    for destination_rel, spec in sorted(files.items()):
+        destination_path = output_dir / destination_rel
+        ensure_directory(destination_path.parent, dry_run)
+        if spec["type"] == "copy":
+            source_path = Path(str(spec["source_path"]))
+            digest = file_sha256(source_path)
+            actions.append(
+                f"copy-file: {repo_rel(root_dir, source_path)} -> {repo_rel(root_dir, destination_path)}"
+            )
+            if not dry_run:
+                shutil.copy2(source_path, destination_path)
+        else:
+            content = str(spec["content"])
+            digest = digest_bytes(content.encode("utf-8"))
+            actions.append(f"write-file: {repo_rel(root_dir, destination_path)}")
+            if not dry_run:
+                write_text_file(destination_path, content, dry_run=False)
+        entries.append((destination_rel, digest))
+
+    return actions, entries
+
+
+def project_client_bundle(
+    root_dir: Path,
+    client_id: str,
+    *,
+    profiles: list[str] | None = None,
+    output_dir_arg: str | None = None,
+    dry_run: bool = False,
+    force: bool = False,
+) -> dict[str, Any]:
+    cid = validate_client_id(client_id)
+    model = build_runtime_model(root_dir)
+    active_profiles = normalize_active_profiles(profiles or [])
+    active_clients = normalize_active_clients(model, [cid])
+    filtered_model = filter_model(model, active_profiles, active_clients)
+    output_dir = resolve_client_projection_output_dir(root_dir, cid, output_dir_arg)
+    files, overlay_mode = collect_client_projection_files(root_dir, filtered_model, cid)
+    actions, payload_entries = materialize_client_projection(
+        root_dir,
+        output_dir,
+        files,
+        dry_run=dry_run,
+        force=force,
+    )
+    payload_tree_sha256 = tree_hash(payload_entries)
+    generated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    projection_payload: dict[str, Any] = {
+        "version": CLIENT_PROJECTION_VERSION,
+        "client_id": cid,
+        "active_profiles": filtered_model.get("active_profiles", []),
+        "active_clients": filtered_model.get("active_clients", []),
+        "default_client": str((filtered_model.get("selection") or {}).get("default_client") or cid),
+        "generated_at": generated_at,
+        "overlay_mode": overlay_mode,
+        "runtime_manifest": "workspace/runtime.yaml",
+        "runtime_model": CLIENT_PROJECT_RUNTIME_MODEL_REL.as_posix(),
+        "payload_tree_sha256": payload_tree_sha256,
+        "files": [
+            {"path": rel_path, "sha256": digest}
+            for rel_path, digest in sorted(payload_entries)
+        ],
+    }
+
+    metadata_path = output_dir / CLIENT_PROJECTION_METADATA_REL
+    actions.append(f"write-file: {repo_rel(root_dir, metadata_path)}")
+    if not dry_run:
+        write_json_file(metadata_path, projection_payload)
+
+    return {
+        "client_id": cid,
+        "output_dir": str(output_dir),
+        "dry_run": dry_run,
+        "force": force,
+        "overlay_mode": overlay_mode,
+        "active_profiles": filtered_model.get("active_profiles", []),
+        "active_clients": filtered_model.get("active_clients", []),
+        "file_count": len(payload_entries),
+        "payload_tree_sha256": payload_tree_sha256,
+        "files": projection_payload["files"],
+        "actions": actions,
+        "next_actions": next_actions_for_client_project(cid),
+    }
 
 
 def extract_bundle_to_target(bundle_path: Path, target_root: Path, skill_name: str) -> str:
@@ -4143,44 +4585,68 @@ def generate_live_context_markdown(
     return "\n".join(lines)
 
 
+def write_agent_context_files(
+    content: str,
+    *,
+    root_dir: Path,
+    dry_run: bool,
+    context_dir: Path | None,
+    action_prefix: str,
+    event_subject: str | None = None,
+) -> list[str]:
+    actions: list[str] = []
+    claude_path, codex_path, symlink_target = context_output_paths(root_dir, context_dir)
+
+    ensure_directory(claude_path.parent, dry_run)
+    if not dry_run:
+        claude_path.write_text(content, encoding="utf-8")
+    actions.append(f"{action_prefix}: {repo_rel(root_dir, claude_path)}")
+
+    ensure_directory(codex_path.parent, dry_run)
+    if codex_path.is_symlink():
+        current_target = os.readlink(str(codex_path))
+        if current_target == symlink_target:
+            actions.append(
+                f"exists: {repo_rel(root_dir, codex_path)}"
+                f" -> {symlink_target}"
+            )
+            return actions
+        if not dry_run:
+            codex_path.unlink()
+    elif codex_path.exists():
+        if not dry_run:
+            codex_path.unlink()
+
+    if not dry_run:
+        codex_path.symlink_to(symlink_target)
+    actions.append(
+        f"symlink-context: {repo_rel(root_dir, codex_path)}"
+        f" -> {symlink_target}"
+    )
+
+    if not dry_run and event_subject:
+        detail = {"output_dir": repo_rel(root_dir, claude_path.parent)}
+        emit_event("context.generated", event_subject, detail, root_dir=root_dir)
+
+    return actions
+
+
 def sync_live_context(
     model: dict[str, Any],
     live_state: dict[str, Any],
     root_dir: Path,
+    context_dir: Path | None = None,
 ) -> list[str]:
     """Write live-enriched CLAUDE.md and create the AGENTS.md symlink."""
-    actions: list[str] = []
-
     content = generate_live_context_markdown(model, live_state, root_dir)
-
-    claude_path = root_dir / CONTEXT_CLAUDE_REL
-    codex_path = root_dir / CONTEXT_CODEX_REL
-
-    ensure_directory(claude_path.parent, False)
-    claude_path.write_text(content, encoding="utf-8")
-    actions.append(f"write-live-context: {repo_rel(root_dir, claude_path)}")
-
-    ensure_directory(codex_path.parent, False)
-    if codex_path.is_symlink():
-        current_target = os.readlink(str(codex_path))
-        if current_target == CONTEXT_SYMLINK_TARGET:
-            actions.append(
-                f"exists: {repo_rel(root_dir, codex_path)}"
-                f" -> {CONTEXT_SYMLINK_TARGET}"
-            )
-            return actions
-        codex_path.unlink()
-    elif codex_path.exists():
-        codex_path.unlink()
-
-    codex_path.symlink_to(CONTEXT_SYMLINK_TARGET)
-    actions.append(
-        f"symlink-context: {repo_rel(root_dir, codex_path)}"
-        f" -> {CONTEXT_SYMLINK_TARGET}"
+    return write_agent_context_files(
+        content,
+        root_dir=root_dir,
+        dry_run=False,
+        context_dir=context_dir,
+        action_prefix="write-live-context",
+        event_subject="live-context",
     )
-
-    emit_event("context.generated", "live-context", root_dir=root_dir)
-    return actions
 
 
 def _resolve_context_paths(
@@ -4251,47 +4717,22 @@ def generate_skill_context(
     return actions
 
 
-def sync_context(model: dict[str, Any], root_dir: Path, dry_run: bool) -> list[str]:
+def sync_context(
+    model: dict[str, Any],
+    root_dir: Path,
+    dry_run: bool,
+    context_dir: Path | None = None,
+) -> list[str]:
     """Write the generated CLAUDE.md and create the AGENTS.md symlink."""
-    actions: list[str] = []
-
     content = generate_context_markdown(model)
-
-    claude_path = root_dir / CONTEXT_CLAUDE_REL
-    codex_path = root_dir / CONTEXT_CODEX_REL
-
-    # Write the primary context file.
-    ensure_directory(claude_path.parent, dry_run)
-    if not dry_run:
-        claude_path.write_text(content, encoding="utf-8")
-    actions.append(f"write-context: {repo_rel(root_dir, claude_path)}")
-
-    # Create or verify the symlink.
-    ensure_directory(codex_path.parent, dry_run)
-    if codex_path.is_symlink():
-        current_target = os.readlink(str(codex_path))
-        if current_target == CONTEXT_SYMLINK_TARGET:
-            actions.append(
-                f"exists: {repo_rel(root_dir, codex_path)}"
-                f" -> {CONTEXT_SYMLINK_TARGET}"
-            )
-            return actions
-        if not dry_run:
-            codex_path.unlink()
-    elif codex_path.exists():
-        if not dry_run:
-            codex_path.unlink()
-
-    if not dry_run:
-        codex_path.symlink_to(CONTEXT_SYMLINK_TARGET)
-    actions.append(
-        f"symlink-context: {repo_rel(root_dir, codex_path)}"
-        f" -> {CONTEXT_SYMLINK_TARGET}"
+    return write_agent_context_files(
+        content,
+        root_dir=root_dir,
+        dry_run=dry_run,
+        context_dir=context_dir,
+        action_prefix="write-context",
+        event_subject="context",
     )
-
-    if not dry_run:
-        emit_event("context.generated", "context", root_dir=root_dir)
-    return actions
 
 
 def print_render_text(model: dict[str, Any]) -> None:
@@ -4694,6 +5135,64 @@ def run_onboard(
     return EXIT_DRIFT if has_fail else EXIT_OK
 
 
+COMPOSE_OVERRIDES_DIR_REL = Path("workspace") / ".compose-overrides"
+
+
+def generate_client_compose_override(
+    root_dir: Path,
+    model: dict[str, Any],
+    client_id: str,
+) -> Path:
+    """Generate a docker-compose.client-{id}.yml with per-repo bind mounts."""
+    env_values = model.get("env") or {}
+
+    # Collect bind mounts from all repos in the filtered model.
+    mounts: dict[str, str] = {}  # runtime_path -> host_path
+    for repo in model.get("repos", []):
+        host_path = repo.get("host_path")
+        runtime_path = repo.get("path")
+        if not host_path or not runtime_path:
+            continue
+        # Skip workspace-internal paths (they're already mounted via /workspace).
+        if runtime_path.startswith(env_values.get("SKILLBOX_WORKSPACE_ROOT", "/workspace")):
+            continue
+        mounts[runtime_path] = host_path
+
+    # Always include the swimmers repo so the binary install path works.
+    swimmers_repo = env_values.get("SKILLBOX_SWIMMERS_REPO", "")
+    if swimmers_repo and swimmers_repo not in mounts:
+        from lib.runtime_model import runtime_path_to_host_path as _rp2hp
+        swimmers_host = str(_rp2hp(root_dir, env_values, swimmers_repo))
+        if Path(swimmers_host).exists():
+            mounts[swimmers_repo] = swimmers_host
+
+    # Remove child paths when a parent is already mounted (avoids redundant mounts).
+    sorted_paths = sorted(mounts.keys())
+    pruned: dict[str, str] = {}
+    for rpath in sorted_paths:
+        if any(rpath != parent and rpath.startswith(parent + "/") for parent in pruned):
+            continue
+        pruned[rpath] = mounts[rpath]
+
+    # Build volume entries.
+    volume_entries = [f"{host}:{container}" for container, host in sorted(pruned.items())]
+
+    # Build compose override document.
+    lines = [f"# Auto-generated by skillbox for client '{client_id}'. Do not edit."]
+    lines.append("services:")
+    for svc in ("workspace", "api", "web"):
+        lines.append(f"  {svc}:")
+        lines.append("    volumes:")
+        for entry in volume_entries:
+            lines.append(f"      - {entry}")
+
+    out_dir = root_dir / COMPOSE_OVERRIDES_DIR_REL
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"docker-compose.client-{client_id}.yml"
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out_path
+
+
 def run_focus(
     *,
     root_dir: Path,
@@ -4702,6 +5201,7 @@ def run_focus(
     resume: bool,
     wait_seconds: float,
     fmt: str,
+    context_dir: Path | None = None,
 ) -> int:
     """Focus macro: sync → bootstrap → up → collect live state → generate enriched context."""
     steps: list[dict[str, Any]] = []
@@ -4761,17 +5261,35 @@ def run_focus(
             print(err_msg, file=sys.stderr)
         return EXIT_ERROR
 
-    # --- 1. Sync --------------------------------------------------------------
+    # --- Build model ----------------------------------------------------------
     try:
         model = build_runtime_model(root_dir)
         active_profiles = normalize_active_profiles([])
         active_clients = normalize_active_clients(model, [cid])
         model = filter_model(model, active_profiles, active_clients)
+    except RuntimeError as exc:
+        payload: dict[str, Any] = {"client_id": cid, "steps": steps}
+        payload.update(classify_error(exc, "focus"))
+        if is_json:
+            emit_json(payload)
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    # --- 0. Compose override ---------------------------------------------------
+    try:
+        override_path = generate_client_compose_override(root_dir, model, cid)
+        step("compose-override", "ok", {"path": str(override_path)})
+    except Exception as exc:
+        step("compose-override", "fail", {"error": str(exc)})
+
+    # --- 1. Sync --------------------------------------------------------------
+    try:
         sync_actions = sync_runtime(model, dry_run=False)
         step("sync", "ok", {"actions": sync_actions})
     except RuntimeError as exc:
         step("sync", "fail", {"error": str(exc)})
-        payload: dict[str, Any] = {"client_id": cid, "steps": steps}
+        payload = {"client_id": cid, "steps": steps}
         payload.update(classify_error(exc, "focus"))
         if is_json:
             emit_json(payload)
@@ -4839,7 +5357,7 @@ def run_focus(
 
     # --- 6. Generate enriched context -----------------------------------------
     try:
-        context_actions = sync_live_context(model, live, root_dir)
+        context_actions = sync_live_context(model, live, root_dir, context_dir=context_dir)
         step("context", "ok", {"actions": context_actions})
     except RuntimeError as exc:
         step("context", "fail", {"error": str(exc)})
@@ -4954,6 +5472,16 @@ def main() -> int:
             help="Limit the command to one or more declared task ids. Can be repeated.",
         )
 
+    def add_context_dir_arg(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument(
+            "--context-dir",
+            default=None,
+            help=(
+                "Write CLAUDE.md and AGENTS.md into this directory instead of the mounted "
+                "home/.claude and home/.codex roots. Path is resolved relative to the repo root."
+            ),
+        )
+
     render_parser = subparsers.add_parser("render", help="Print the resolved runtime graph.")
     render_parser.add_argument("--format", choices=("text", "json"), default="text")
     add_profile_arg(render_parser)
@@ -4967,6 +5495,7 @@ def main() -> int:
     sync_parser.add_argument("--format", choices=("text", "json"), default="text")
     add_profile_arg(sync_parser)
     add_client_arg(sync_parser)
+    add_context_dir_arg(sync_parser)
 
     doctor_parser = subparsers.add_parser(
         "doctor",
@@ -5045,6 +5574,7 @@ def main() -> int:
     context_parser.add_argument("--format", choices=("text", "json"), default="text")
     add_profile_arg(context_parser)
     add_client_arg(context_parser)
+    add_context_dir_arg(context_parser)
 
     client_init_parser = subparsers.add_parser(
         "client-init",
@@ -5085,6 +5615,24 @@ def main() -> int:
     client_init_parser.add_argument("--force", action="store_true", help="Overwrite existing scaffold files.")
     client_init_parser.add_argument("--dry-run", action="store_true")
     client_init_parser.add_argument("--format", choices=("text", "json"), default="text")
+
+    client_project_parser = subparsers.add_parser(
+        "client-project",
+        help="Compile a single-client runtime projection bundle with sanitized metadata.",
+    )
+    client_project_parser.add_argument(
+        "client_id",
+        help="Existing client slug to project (for example `personal`).",
+    )
+    client_project_parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Projection output directory. Defaults to builds/clients/<client-id>.",
+    )
+    client_project_parser.add_argument("--force", action="store_true", help="Replace an existing projection bundle.")
+    client_project_parser.add_argument("--dry-run", action="store_true")
+    client_project_parser.add_argument("--format", choices=("text", "json"), default="text")
+    add_profile_arg(client_project_parser)
 
     onboard_parser = subparsers.add_parser(
         "onboard",
@@ -5143,6 +5691,7 @@ def main() -> int:
     )
     focus_parser.add_argument("--format", choices=("text", "json"), default="text")
     add_service_arg(focus_parser)
+    add_context_dir_arg(focus_parser)
 
     ack_parser = subparsers.add_parser(
         "ack",
@@ -5243,6 +5792,34 @@ def main() -> int:
             fmt=args.format,
         )
 
+    if args.command == "client-project":
+        try:
+            payload = project_client_bundle(
+                root_dir=root_dir,
+                client_id=args.client_id,
+                profiles=args.profile,
+                output_dir_arg=args.output_dir,
+                dry_run=args.dry_run,
+                force=args.force,
+            )
+        except RuntimeError as exc:
+            if args.format == "json":
+                emit_json(classify_error(exc, "client-project"))
+            else:
+                print(str(exc), file=sys.stderr)
+            return EXIT_ERROR
+
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            print(f"client: {payload['client_id']}")
+            print(f"output_dir: {payload['output_dir']}")
+            print(f"files: {payload['file_count']}")
+            print(f"payload_tree_sha256: {payload['payload_tree_sha256']}")
+            print()
+            print("\n".join(payload["actions"]))
+        return EXIT_OK
+
     if args.command == "focus":
         cid = args.client_id or ""
         if not cid and not args.resume:
@@ -5255,6 +5832,7 @@ def main() -> int:
             resume=args.resume,
             wait_seconds=max(0.0, float(args.wait_seconds)),
             fmt=args.format,
+            context_dir=resolve_context_dir(root_dir, getattr(args, "context_dir", None)),
         )
 
     if args.command == "ack":
@@ -5320,7 +5898,14 @@ def main() -> int:
 
         if args.command == "sync":
             actions = sync_runtime(model, dry_run=args.dry_run)
-            actions.extend(sync_context(model, root_dir, dry_run=args.dry_run))
+            actions.extend(
+                sync_context(
+                    model,
+                    root_dir,
+                    dry_run=args.dry_run,
+                    context_dir=resolve_context_dir(root_dir, getattr(args, "context_dir", None)),
+                )
+            )
             if args.format == "json":
                 emit_json({"actions": actions, "dry_run": args.dry_run, "next_actions": next_actions_for_sync()})
             else:
@@ -5328,7 +5913,12 @@ def main() -> int:
             return EXIT_OK
 
         if args.command == "context":
-            actions = sync_context(model, root_dir, dry_run=args.dry_run)
+            actions = sync_context(
+                model,
+                root_dir,
+                dry_run=args.dry_run,
+                context_dir=resolve_context_dir(root_dir, getattr(args, "context_dir", None)),
+            )
             if args.format == "json":
                 emit_json({"actions": actions, "dry_run": args.dry_run, "next_actions": next_actions_for_context()})
             else:
