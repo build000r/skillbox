@@ -37,8 +37,8 @@ The mental model is:
 - `core` is always active
 - `--client` activates a client overlay such as `personal` or `vibe-coding-client`
 - `--profile` activates optional non-client overlays such as `surfaces`
-- `client-init` scaffolds `workspace/clients/<client>/overlay.yaml` and the
-  companion skill directories for a new overlay
+- `client-init` scaffolds `${SKILLBOX_CLIENTS_HOST_ROOT:-./workspace/clients}/<client>/overlay.yaml`
+  and the companion skill directories for a new overlay
 - `client-init --blueprint ...` appends reusable repos, services, logs, and
   checks to that scaffold so `render`, `sync`, and `up` immediately work on a
   concrete client shape

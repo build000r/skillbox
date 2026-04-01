@@ -35,7 +35,7 @@ if str(SCRIPT_DIR) not in sys.path:
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from lib.runtime_model import build_runtime_model  # noqa: E402
+from lib.runtime_model import build_runtime_model, client_overlay_paths, load_runtime_env  # noqa: E402
 from manage import (  # noqa: E402
     DEFAULT_SERVICE_START_WAIT_SECONDS,
     emit_event,
@@ -137,10 +137,9 @@ def _model_config_hash(root_dir: Path) -> str:
     runtime_yaml = root_dir / "workspace" / "runtime.yaml"
     if runtime_yaml.is_file():
         h.update(runtime_yaml.read_bytes())
-    overlays_dir = root_dir / "workspace" / "clients"
-    if overlays_dir.is_dir():
-        for overlay in sorted(overlays_dir.glob("*/overlay.yaml")):
-            h.update(overlay.read_bytes())
+    env_values = load_runtime_env(root_dir)
+    for overlay in client_overlay_paths(root_dir, env_values):
+        h.update(overlay.read_bytes())
     env_file = root_dir / ".env"
     if env_file.is_file():
         h.update(env_file.read_bytes())

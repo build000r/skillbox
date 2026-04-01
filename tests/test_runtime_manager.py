@@ -487,6 +487,56 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertTrue((repo / "logs" / "clients" / "acme-studio").is_dir())
             self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "skills.lock.json").is_file())
 
+    def test_render_reads_client_overlays_from_configured_clients_host_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            external_clients = repo / "private-config" / "clients"
+            external_clients.mkdir(parents=True, exist_ok=True)
+            (repo / ".env").write_text(
+                "SKILLBOX_CLIENTS_HOST_ROOT=./private-config/clients\n",
+                encoding="utf-8",
+            )
+            self._write_client_overlay(
+                repo,
+                "acme-studio",
+                label="Acme Studio",
+                default_cwd="${SKILLBOX_MONOSERVER_ROOT}/acme-studio",
+                root_path="${SKILLBOX_MONOSERVER_ROOT}/acme-studio",
+                clients_root=external_clients,
+            )
+
+            result = self._run(repo, "render", "--client", "acme-studio", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual({client["id"] for client in payload["clients"]}, {"acme-studio"})
+            self.assertEqual(payload["active_clients"], ["acme-studio"])
+
+    def test_client_init_writes_to_configured_clients_host_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            external_clients = repo / "private-config" / "clients"
+            external_clients.mkdir(parents=True, exist_ok=True)
+            (repo / ".env").write_text(
+                "SKILLBOX_CLIENTS_HOST_ROOT=./private-config/clients\n",
+                encoding="utf-8",
+            )
+
+            result = self._run(repo, "client-init", "acme-studio", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((external_clients / "acme-studio" / "overlay.yaml").is_file())
+            self.assertTrue((external_clients / "acme-studio" / "skills.manifest").is_file())
+            self.assertTrue((external_clients / "acme-studio" / "skills.sources.yaml").is_file())
+            self.assertFalse((repo / "workspace" / "clients" / "acme-studio").exists())
+
+            sync = self._run(repo, "sync", "--client", "acme-studio", "--format", "json")
+
+            self.assertEqual(sync.returncode, 0, sync.stderr)
+            self.assertTrue((external_clients / "acme-studio" / "skills.lock.json").is_file())
+
     def test_client_init_rejects_invalid_client_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -1423,10 +1473,13 @@ class RuntimeManagerTests(unittest.TestCase):
         label: str,
         default_cwd: str,
         root_path: str,
+        clients_root: Path | None = None,
+        include_context: bool = False,
     ) -> None:
-        overlay_dir = repo / "workspace" / "clients" / client_id
+        overlay_parent = clients_root or (repo / "workspace" / "clients")
+        overlay_dir = overlay_parent / client_id
         overlay_dir.mkdir(parents=True, exist_ok=True)
-        (overlay_dir / "overlay.yaml").write_text(
+        overlay_text = (
             "version: 1\n"
             "client:\n"
             f"  id: {client_id}\n"
@@ -1450,9 +1503,9 @@ class RuntimeManagerTests(unittest.TestCase):
             "      profiles:\n"
             "        - core\n"
             f"      bundle_dir: ${{SKILLBOX_WORKSPACE_ROOT}}/default-skills/clients/{client_id}\n"
-            f"      manifest: ${{SKILLBOX_WORKSPACE_ROOT}}/workspace/clients/{client_id}/skills.manifest\n"
-            f"      sources_config: ${{SKILLBOX_WORKSPACE_ROOT}}/workspace/clients/{client_id}/skills.sources.yaml\n"
-            f"      lock_path: ${{SKILLBOX_WORKSPACE_ROOT}}/workspace/clients/{client_id}/skills.lock.json\n"
+            f"      manifest: ${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skills.manifest\n"
+            f"      sources_config: ${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skills.sources.yaml\n"
+            f"      lock_path: ${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skills.lock.json\n"
             "      sync:\n"
             "        mode: unpack-bundles\n"
             "      install_targets:\n"
@@ -1465,15 +1518,23 @@ class RuntimeManagerTests(unittest.TestCase):
             f"      path: ${{SKILLBOX_LOG_ROOT}}/clients/{client_id}\n"
             "      profiles:\n"
             "        - core\n"
+        )
+        if include_context:
+            overlay_text += (
+                "  context:\n"
+                "    cwd_match:\n"
+                f"      - {default_cwd}\n"
+            )
+        overlay_text += (
             "  checks:\n"
             f"    - id: {client_id}-root\n"
             "      type: path_exists\n"
             f"      path: {root_path}\n"
             "      required: true\n"
             "      profiles:\n"
-            "        - core\n",
-            encoding="utf-8",
+            "        - core\n"
         )
+        (overlay_dir / "overlay.yaml").write_text(overlay_text, encoding="utf-8")
 
     def _write_client_blueprint(self, repo: Path, name: str, content: str) -> None:
         blueprint_dir = repo / "workspace" / "client-blueprints"
@@ -1572,6 +1633,8 @@ class RuntimeManagerTests(unittest.TestCase):
             "SKILLBOX_LOG_ROOT=/workspace/logs\n"
             "SKILLBOX_HOME_ROOT=/home/sandbox\n"
             "SKILLBOX_MONOSERVER_ROOT=/monoserver\n"
+            "SKILLBOX_CLIENTS_ROOT=/workspace/workspace/clients\n"
+            "SKILLBOX_CLIENTS_HOST_ROOT=./workspace/clients\n"
             "SKILLBOX_MONOSERVER_HOST_ROOT=./monoserver-host\n"
             "SKILLBOX_API_PORT=8000\n"
             "SKILLBOX_WEB_PORT=3000\n"
@@ -2148,6 +2211,44 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads(result.stdout)
             self.assertEqual(payload["client_id"], "personal")
+
+    def test_focus_writes_skill_context_to_configured_clients_host_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            external_clients = repo / "private-config" / "clients"
+            external_clients.mkdir(parents=True, exist_ok=True)
+            (repo / ".env").write_text(
+                "SKILLBOX_CLIENTS_HOST_ROOT=./private-config/clients\n",
+                encoding="utf-8",
+            )
+            self._write_client_overlay(
+                repo,
+                "personal",
+                label="Personal",
+                default_cwd="${SKILLBOX_MONOSERVER_ROOT}",
+                root_path="${SKILLBOX_MONOSERVER_ROOT}",
+                clients_root=external_clients,
+                include_context=True,
+            )
+            (external_clients / "personal" / "skills.manifest").write_text("", encoding="utf-8")
+            (external_clients / "personal" / "skills.sources.yaml").write_text(
+                "version: 1\n"
+                "sources:\n"
+                "  - kind: local\n"
+                "    path: ./skills/clients/personal\n",
+                encoding="utf-8",
+            )
+
+            result = self._run(repo, "focus", "personal", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((external_clients / "personal" / "context.yaml").is_file())
+            focus_state = json.loads((repo / "workspace" / ".focus.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                focus_state["skill_context_path"],
+                "/workspace/workspace/clients/personal/context.yaml",
+            )
 
     def test_focus_resume_fails_without_focus_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

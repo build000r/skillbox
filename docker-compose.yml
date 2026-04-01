@@ -7,6 +7,8 @@ x-runtime-env: &runtime_env
   SKILLBOX_LOG_ROOT: /workspace/logs
   SKILLBOX_HOME_ROOT: /home/sandbox
   SKILLBOX_MONOSERVER_ROOT: ${SKILLBOX_MONOSERVER_ROOT:-/monoserver}
+  SKILLBOX_CLIENTS_ROOT: ${SKILLBOX_CLIENTS_ROOT:-/workspace/workspace/clients}
+  SKILLBOX_CLIENTS_HOST_ROOT: ${SKILLBOX_CLIENTS_ROOT:-/workspace/workspace/clients}
   SKILLBOX_API_PORT: ${SKILLBOX_API_PORT:-8000}
   SKILLBOX_WEB_PORT: ${SKILLBOX_WEB_PORT:-3000}
   SKILLBOX_SWIMMERS_PORT: ${SKILLBOX_SWIMMERS_PORT:-3210}
@@ -49,6 +51,7 @@ services:
       <<: *runtime_env
     volumes:
       - .:/workspace
+      - ${SKILLBOX_CLIENTS_HOST_ROOT:-./workspace/clients}:${SKILLBOX_CLIENTS_ROOT:-/workspace/workspace/clients}
       - ./home/.claude:/home/sandbox/.claude
       - ./home/.codex:/home/sandbox/.codex
       - ./home/.local:/home/sandbox/.local
@@ -70,6 +73,7 @@ services:
       <<: *runtime_env
     volumes:
       - .:/workspace
+      - ${SKILLBOX_CLIENTS_HOST_ROOT:-./workspace/clients}:${SKILLBOX_CLIENTS_ROOT:-/workspace/workspace/clients}
       - ./home/.claude:/home/sandbox/.claude
       - ./home/.codex:/home/sandbox/.codex
       - ./home/.local:/home/sandbox/.local
@@ -98,6 +102,7 @@ services:
       <<: *runtime_env
     volumes:
       - .:/workspace
+      - ${SKILLBOX_CLIENTS_HOST_ROOT:-./workspace/clients}:${SKILLBOX_CLIENTS_ROOT:-/workspace/workspace/clients}
       - ./home/.claude:/home/sandbox/.claude
       - ./home/.codex:/home/sandbox/.codex
       - ./home/.local:/home/sandbox/.local

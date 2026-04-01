@@ -19,6 +19,7 @@ RUNTIME_ENV_KEYS = [
     "SKILLBOX_LOG_ROOT",
     "SKILLBOX_HOME_ROOT",
     "SKILLBOX_MONOSERVER_ROOT",
+    "SKILLBOX_CLIENTS_ROOT",
     "SKILLBOX_API_PORT",
     "SKILLBOX_WEB_PORT",
     "SKILLBOX_SWIMMERS_PORT",
@@ -45,6 +46,7 @@ RUNTIME_ENV_KEYS = [
     "SKILLBOX_PULSE_INTERVAL",
 ]
 MANIFEST_ENV_KEYS = RUNTIME_ENV_KEYS + [
+    "SKILLBOX_CLIENTS_HOST_ROOT",
     "SKILLBOX_MONOSERVER_HOST_ROOT",
 ]
 
@@ -55,8 +57,33 @@ def runtime_manifest_path(root_dir: Path) -> Path:
     return root_dir / "workspace" / "runtime.yaml"
 
 
-def client_overlay_paths(root_dir: Path) -> list[Path]:
-    overlays_root = root_dir / "workspace" / "clients"
+def client_configs_runtime_root(env_values: dict[str, str]) -> Path:
+    raw_root = str(env_values.get("SKILLBOX_CLIENTS_ROOT") or "").strip()
+    if raw_root:
+        return Path(raw_root)
+    workspace_root = Path(env_values.get("SKILLBOX_WORKSPACE_ROOT", "/workspace"))
+    return workspace_root / "workspace" / "clients"
+
+
+def client_configs_host_root(root_dir: Path, env_values: dict[str, str]) -> Path:
+    raw_root = str(env_values.get("SKILLBOX_CLIENTS_HOST_ROOT") or "").strip()
+    if raw_root:
+        return host_path_to_absolute_path(root_dir, raw_root)
+    return root_dir / "workspace" / "clients"
+
+
+def client_config_runtime_dir(env_values: dict[str, str], client_id: str) -> Path:
+    return client_configs_runtime_root(env_values) / client_id
+
+
+def client_config_host_dir(root_dir: Path, env_values: dict[str, str], client_id: str) -> Path:
+    return client_configs_host_root(root_dir, env_values) / client_id
+
+
+def client_overlay_paths(root_dir: Path, env_values: dict[str, str] | None = None) -> list[Path]:
+    if env_values is None:
+        env_values = load_runtime_env(root_dir)
+    overlays_root = client_configs_host_root(root_dir, env_values)
     if not overlays_root.is_dir():
         return []
     return sorted(path for path in overlays_root.glob("*/overlay.yaml") if path.is_file())
@@ -116,7 +143,6 @@ def load_runtime_env(root_dir: Path) -> dict[str, str]:
         "SKILLBOX_LOG_ROOT": "/workspace/logs",
         "SKILLBOX_HOME_ROOT": "/home/sandbox",
         "SKILLBOX_MONOSERVER_ROOT": "/monoserver",
-        "SKILLBOX_MONOSERVER_HOST_ROOT": "..",
         "SKILLBOX_API_PORT": "8000",
         "SKILLBOX_WEB_PORT": "3000",
         "SKILLBOX_SWIMMERS_PORT": "3210",
@@ -146,6 +172,12 @@ def load_runtime_env(root_dir: Path) -> dict[str, str]:
 
     for key, value in derived_defaults.items():
         values.setdefault(key, value)
+    values.setdefault(
+        "SKILLBOX_CLIENTS_ROOT",
+        f"{values['SKILLBOX_WORKSPACE_ROOT']}/workspace/clients",
+    )
+    values.setdefault("SKILLBOX_CLIENTS_HOST_ROOT", "./workspace/clients")
+    values.setdefault("SKILLBOX_MONOSERVER_HOST_ROOT", "..")
     return values
 
 
@@ -170,10 +202,18 @@ def runtime_path_to_host_path(root_dir: Path, env_values: dict[str, str], raw_pa
     workspace_root = Path(env_values["SKILLBOX_WORKSPACE_ROOT"])
     home_root = Path(env_values["SKILLBOX_HOME_ROOT"])
     monoserver_root = Path(env_values.get("SKILLBOX_MONOSERVER_ROOT", "/monoserver"))
+    clients_root = client_configs_runtime_root(env_values)
+    clients_host_root = client_configs_host_root(root_dir, env_values)
     monoserver_host_root = host_path_to_absolute_path(
         root_dir,
         env_values.get("SKILLBOX_MONOSERVER_HOST_ROOT", ".."),
     )
+
+    try:
+        relative = path.relative_to(clients_root)
+        return clients_host_root / relative
+    except ValueError:
+        pass
 
     try:
         relative = path.relative_to(workspace_root)
@@ -248,7 +288,7 @@ def _normalize_client_repo_roots(raw_items: Any, client_id: str, section: str) -
 
 def load_client_overlays(root_dir: Path, env_values: dict[str, str]) -> list[dict[str, Any]]:
     overlays: list[dict[str, Any]] = []
-    for path in client_overlay_paths(root_dir):
+    for path in client_overlay_paths(root_dir, env_values):
         overlay_doc = load_yaml(path)
         raw_client = overlay_doc.get("client")
         if raw_client is None:

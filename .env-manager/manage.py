@@ -36,7 +36,10 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from lib.runtime_model import (  # noqa: E402
     build_runtime_model,
+    client_config_host_dir,
+    client_config_runtime_dir,
     host_path_to_absolute_path,
+    load_runtime_env,
     runtime_path_to_host_path,
 )
 
@@ -69,6 +72,7 @@ PATH_LIKE_ENV_KEYS = {
     "SKILLBOX_LOG_ROOT",
     "SKILLBOX_HOME_ROOT",
     "SKILLBOX_MONOSERVER_ROOT",
+    "SKILLBOX_CLIENTS_ROOT",
     "SKILLBOX_SWIMMERS_REPO",
     "SKILLBOX_SWIMMERS_INSTALL_DIR",
     "SKILLBOX_SWIMMERS_BIN",
@@ -268,6 +272,20 @@ def repo_rel(root_dir: Path, path: Path) -> str:
         return str(path.relative_to(root_dir))
     except ValueError:
         return str(path)
+
+
+def client_overlay_location(root_dir: Path, client_id: str) -> tuple[dict[str, str], Path, Path]:
+    env_values = load_runtime_env(root_dir)
+    host_dir = client_config_host_dir(root_dir, env_values, client_id)
+    runtime_dir = client_config_runtime_dir(env_values, client_id)
+    return env_values, host_dir / "overlay.yaml", runtime_dir / "overlay.yaml"
+
+
+def client_context_location(root_dir: Path, client_id: str) -> tuple[dict[str, str], Path, Path]:
+    env_values = load_runtime_env(root_dir)
+    host_dir = client_config_host_dir(root_dir, env_values, client_id)
+    runtime_dir = client_config_runtime_dir(env_values, client_id)
+    return env_values, host_dir / "context.yaml", runtime_dir / "context.yaml"
 
 
 def run_command(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -655,9 +673,9 @@ def base_client_overlay(
                 "required": False,
                 "profiles": ["core"],
                 "bundle_dir": f"${{SKILLBOX_WORKSPACE_ROOT}}/default-skills/clients/{client_id}",
-                "manifest": f"${{SKILLBOX_WORKSPACE_ROOT}}/workspace/clients/{client_id}/skills.manifest",
-                "sources_config": f"${{SKILLBOX_WORKSPACE_ROOT}}/workspace/clients/{client_id}/skills.sources.yaml",
-                "lock_path": f"${{SKILLBOX_WORKSPACE_ROOT}}/workspace/clients/{client_id}/skills.lock.json",
+                "manifest": f"${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skills.manifest",
+                "sources_config": f"${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skills.sources.yaml",
+                "lock_path": f"${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skills.lock.json",
                 "sync": {"mode": "unpack-bundles"},
                 "install_targets": [
                     {
@@ -697,12 +715,13 @@ def base_client_overlay(
 
 def default_client_scaffold_files(
     root_dir: Path,
+    env_values: dict[str, str],
     client_id: str,
     client_label: str,
     client_root: str,
     client_default_cwd: str,
 ) -> dict[Path, str]:
-    overlay_dir = root_dir / "workspace" / "clients" / client_id
+    overlay_dir = client_config_host_dir(root_dir, env_values, client_id)
     bundle_dir = root_dir / "default-skills" / "clients" / client_id
     skills_dir = root_dir / "skills" / "clients" / client_id
 
@@ -739,9 +758,9 @@ def default_client_scaffold_files(
             "      profiles:\n"
             "        - core\n"
             f"      bundle_dir: {json.dumps(f'${{SKILLBOX_WORKSPACE_ROOT}}/default-skills/clients/{client_id}')}\n"
-            f"      manifest: {json.dumps(f'${{SKILLBOX_WORKSPACE_ROOT}}/workspace/clients/{client_id}/skills.manifest')}\n"
-            f"      sources_config: {json.dumps(f'${{SKILLBOX_WORKSPACE_ROOT}}/workspace/clients/{client_id}/skills.sources.yaml')}\n"
-            f"      lock_path: {json.dumps(f'${{SKILLBOX_WORKSPACE_ROOT}}/workspace/clients/{client_id}/skills.lock.json')}\n"
+            f"      manifest: {json.dumps(f'${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skills.manifest')}\n"
+            f"      sources_config: {json.dumps(f'${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skills.sources.yaml')}\n"
+            f"      lock_path: {json.dumps(f'${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skills.lock.json')}\n"
             "      sync:\n"
             "        mode: unpack-bundles\n"
             "      install_targets:\n"
@@ -806,6 +825,7 @@ def merge_client_overlay(base_client: dict[str, Any], blueprint_client: dict[str
 
 def build_blueprinted_client_scaffold_files(
     root_dir: Path,
+    env_values: dict[str, str],
     client_id: str,
     client_label: str,
     client_root: str,
@@ -867,7 +887,7 @@ def build_blueprinted_client_scaffold_files(
     else:
         overlay_client.setdefault("default_cwd", client_default_cwd)
 
-    overlay_dir = root_dir / "workspace" / "clients" / client_id
+    overlay_dir = client_config_host_dir(root_dir, env_values, client_id)
     bundle_dir = root_dir / "default-skills" / "clients" / client_id
     skills_dir = root_dir / "skills" / "clients" / client_id
 
@@ -908,6 +928,7 @@ def scaffold_client_overlay(
     force: bool,
 ) -> tuple[list[str], dict[str, Any] | None]:
     client_id = validate_client_id(client_id)
+    env_values = load_runtime_env(root_dir)
     client_label = (label or titleize_client_id(client_id)).strip()
     client_root = (root_path or f"${{SKILLBOX_MONOSERVER_ROOT}}/{client_id}").strip()
     client_default_cwd = (default_cwd or client_root).strip()
@@ -921,6 +942,7 @@ def scaffold_client_overlay(
         blueprint = load_client_blueprint(blueprint_path)
         target_files = build_blueprinted_client_scaffold_files(
             root_dir=root_dir,
+            env_values=env_values,
             client_id=client_id,
             client_label=client_label,
             client_root=client_root,
@@ -939,6 +961,7 @@ def scaffold_client_overlay(
             raise RuntimeError("`--set` requires `--blueprint`.")
         target_files = default_client_scaffold_files(
             root_dir=root_dir,
+            env_values=env_values,
             client_id=client_id,
             client_label=client_label,
             client_root=client_root,
@@ -2979,7 +3002,7 @@ def resolve_services_for_stop(
 def translated_runtime_env(root_dir: Path, runtime_env: dict[str, str]) -> dict[str, str]:
     translated: dict[str, str] = {}
     for key, value in runtime_env.items():
-        if key == "SKILLBOX_MONOSERVER_HOST_ROOT":
+        if key in {"SKILLBOX_MONOSERVER_HOST_ROOT", "SKILLBOX_CLIENTS_HOST_ROOT"}:
             translated[key] = str(host_path_to_absolute_path(root_dir, value))
             continue
         if key in PATH_LIKE_ENV_KEYS and value:
@@ -3893,10 +3916,11 @@ def generate_context_markdown(model: dict[str, Any]) -> str:
         lines.append(f"- Profiles: {', '.join(active_profiles)}")
 
     # Skill context pointer
+    runtime_env = model.get("env") or {}
     for cid_env in active_clients:
         client_data_env = clients_data.get(cid_env, {})
         if client_data_env.get("context"):
-            ctx_path = f"workspace/clients/{cid_env}/context.yaml"
+            ctx_path = client_config_runtime_dir(runtime_env, cid_env) / "context.yaml"
             lines.append(f"- Skill context: `$SKILLBOX_CLIENT_CONTEXT` → `{ctx_path}`")
             break
     lines.append("")
@@ -4192,6 +4216,7 @@ def generate_skill_context(
     yaml_mod = require_yaml("generate skill context")
     actions: list[str] = []
     active_ids = set(model.get("active_clients") or [])
+    runtime_env = model.get("env") or load_runtime_env(root_dir)
 
     for client in model.get("clients") or []:
         cid = client.get("id", "")
@@ -4201,14 +4226,15 @@ def generate_skill_context(
         if not raw_context or not isinstance(raw_context, dict):
             continue
 
-        client_dir = root_dir / "workspace" / "clients" / cid
+        client_dir = client_config_host_dir(root_dir, runtime_env, cid)
+        client_runtime_dir = client_config_runtime_dir(runtime_env, cid)
         resolved = _resolve_context_paths(raw_context, client_dir)
         resolved["client_id"] = cid
         resolved["client_dir"] = str(client_dir)
 
         header = (
             f"# AUTO-GENERATED by focus. Do not edit.\n"
-            f"# Source: workspace/clients/{cid}/overlay.yaml\n"
+            f"# Source: {client_runtime_dir / 'overlay.yaml'}\n"
             f"# Generated: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n\n"
         )
         body = yaml_mod.safe_dump(resolved, sort_keys=False, default_flow_style=False)
@@ -4723,10 +4749,10 @@ def run_focus(
             print(str(exc), file=sys.stderr)
         return EXIT_ERROR
 
-    overlay_path = root_dir / "workspace" / "clients" / cid / "overlay.yaml"
+    _, overlay_path, overlay_runtime_path = client_overlay_location(root_dir, cid)
     if not overlay_path.is_file():
         err_msg = (
-            f"Client '{cid}' has no overlay at {overlay_path}. "
+            f"Client '{cid}' has no overlay at {overlay_runtime_path}. "
             f"Use 'onboard {cid}' to scaffold it first."
         )
         if is_json:
@@ -4819,7 +4845,7 @@ def run_focus(
         step("context", "fail", {"error": str(exc)})
 
     # --- 7. Persist focus state -----------------------------------------------
-    ctx_yaml_path = root_dir / "workspace" / "clients" / cid / "context.yaml"
+    _, ctx_yaml_path, ctx_runtime_path = client_context_location(root_dir, cid)
     focus_data: dict[str, Any] = {
         "version": 1,
         "client_id": cid,
@@ -4828,7 +4854,7 @@ def run_focus(
         "service_filter": service_filter or None,
     }
     if ctx_yaml_path.is_file():
-        focus_data["skill_context_path"] = str(ctx_yaml_path)
+        focus_data["skill_context_path"] = str(ctx_runtime_path)
     try:
         focus_path.write_text(
             json.dumps(focus_data, indent=2), encoding="utf-8",

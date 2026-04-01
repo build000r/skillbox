@@ -23,9 +23,9 @@ client:
       profiles:
         - core
       bundle_dir: ${SKILLBOX_WORKSPACE_ROOT}/default-skills/clients/personal
-      manifest: ${SKILLBOX_WORKSPACE_ROOT}/workspace/clients/personal/skills.manifest
-      sources_config: ${SKILLBOX_WORKSPACE_ROOT}/workspace/clients/personal/skills.sources.yaml
-      lock_path: ${SKILLBOX_WORKSPACE_ROOT}/workspace/clients/personal/skills.lock.json
+      manifest: ${SKILLBOX_CLIENTS_ROOT}/personal/skills.manifest
+      sources_config: ${SKILLBOX_CLIENTS_ROOT}/personal/skills.sources.yaml
+      lock_path: ${SKILLBOX_CLIENTS_ROOT}/personal/skills.lock.json
       sync:
         mode: unpack-bundles
       install_targets:

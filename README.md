@@ -543,6 +543,8 @@ SKILLBOX_SKILLS_ROOT=/workspace/skills
 SKILLBOX_LOG_ROOT=/workspace/logs
 SKILLBOX_HOME_ROOT=/home/sandbox
 SKILLBOX_MONOSERVER_ROOT=/monoserver
+SKILLBOX_CLIENTS_ROOT=/workspace/workspace/clients
+SKILLBOX_CLIENTS_HOST_ROOT=./workspace/clients
 SKILLBOX_MONOSERVER_HOST_ROOT=..
 SKILLBOX_API_PORT=8000
 SKILLBOX_WEB_PORT=3000
@@ -577,6 +579,33 @@ can hydrate the binary without needing `/monoserver/swimmers`.
 `SKILLBOX_DO_TOKEN`, `SKILLBOX_DO_SSH_KEY_ID`, and `SKILLBOX_TS_AUTHKEY` are
 required only for fleet management (`operator_provision` / `make box-up`).
 
+### Recommended repo split
+
+The clean split is:
+
+```text
+~/repos/
+  skillbox/              # public engine and templates
+  skillbox-config/       # private client overlays and generated client context
+  client-acme-web/       # client code
+  client-acme-api/       # client code
+```
+
+Recommended local override in `skillbox/.env`:
+
+```dotenv
+SKILLBOX_CLIENTS_HOST_ROOT=../skillbox-config/clients
+SKILLBOX_MONOSERVER_HOST_ROOT=..
+```
+
+With that setup:
+
+- `skillbox` stays publishable
+- `skillbox-config/clients/<client>/overlay.yaml` is the private source of truth
+- `client-init`, `sync`, and `focus` write client config into the private repo
+- client application repos stay separate under the shared monoserver tree
+- clients usually do not need access to the `skillbox` repo itself
+
 ### Default skill sources
 
 `workspace/default-skills.sources.yaml` pins where bundled skills come from:
@@ -605,7 +634,7 @@ ask-cascade
 
 `make runtime-sync` writes `workspace/default-skills.lock.json` for the shared
 default skill set, and selected client overlays write their own lockfiles under
-`workspace/clients/<client>/skills.lock.json`.
+`${SKILLBOX_CLIENTS_HOST_ROOT:-./workspace/clients}/<client>/skills.lock.json`.
 
 Each lockfile records:
 
@@ -701,7 +730,11 @@ optional task-to-task `depends_on`, a success check, and optional `inputs` and
 order, and `up` automatically runs any tasks named under a service's
 `bootstrap_tasks` list before trying to launch the service.
 
-Client overlays are auto-discovered from `workspace/clients/<client>/overlay.yaml`.
+Client overlays are auto-discovered from
+`${SKILLBOX_CLIENTS_HOST_ROOT:-./workspace/clients}/<client>/overlay.yaml` and
+always resolve to `${SKILLBOX_CLIENTS_ROOT}` inside the box. That lets you keep
+the public engine repo and the private client-config repo separate while the
+runtime still sees a stable in-box path.
 For example:
 
 ```yaml
@@ -715,7 +748,7 @@ client:
       path: ${SKILLBOX_MONOSERVER_ROOT}
   skills:
     - id: personal-skills
-      manifest: ${SKILLBOX_WORKSPACE_ROOT}/workspace/clients/personal/skills.manifest
+      manifest: ${SKILLBOX_CLIENTS_ROOT}/personal/skills.manifest
 ```
 
 Create a new overlay scaffold with:

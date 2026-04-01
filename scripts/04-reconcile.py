@@ -15,7 +15,7 @@ try:
 except ModuleNotFoundError:
     yaml = None
 
-from lib.runtime_model import build_runtime_model
+from lib.runtime_model import build_runtime_model, host_path_to_absolute_path
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -162,6 +162,8 @@ def build_model() -> dict[str, Any]:
         "SKILLBOX_LOG_ROOT": str(paths.get("log_root", "")),
         "SKILLBOX_HOME_ROOT": home_root,
         "SKILLBOX_MONOSERVER_ROOT": monoserver_root,
+        "SKILLBOX_CLIENTS_ROOT": f"{paths.get('workspace_root', '')}/workspace/clients",
+        "SKILLBOX_CLIENTS_HOST_ROOT": "./workspace/clients",
         "SKILLBOX_API_PORT": str(ports.get("api", "")),
         "SKILLBOX_WEB_PORT": str(ports.get("web", "")),
         "SKILLBOX_SWIMMERS_PORT": str(ports.get("swimmers", "")),
@@ -187,9 +189,22 @@ def build_model() -> dict[str, Any]:
         "SKILLBOX_FWC_CONNECTORS": "github,slack,linear",
         "SKILLBOX_PULSE_INTERVAL": "30",
     }
-    runtime_env = {key: value for key, value in expected_env.items() if key != "SKILLBOX_NAME"}
+    runtime_env = {
+        key: value
+        for key, value in expected_env.items()
+        if key not in {"SKILLBOX_NAME", "SKILLBOX_CLIENTS_HOST_ROOT"}
+    }
+    runtime_env["SKILLBOX_CLIENTS_HOST_ROOT"] = expected_env["SKILLBOX_CLIENTS_ROOT"]
+    clients_host_root = host_path_to_absolute_path(
+        ROOT_DIR,
+        str(
+            (runtime_model.get("env") or {}).get("SKILLBOX_CLIENTS_HOST_ROOT")
+            or env_defaults.get("SKILLBOX_CLIENTS_HOST_ROOT", "./workspace/clients")
+        ),
+    )
     expected_mounts = [
         {"source": str(ROOT_DIR), "target": paths.get("workspace_root")},
+        {"source": str(clients_host_root), "target": expected_env["SKILLBOX_CLIENTS_ROOT"]},
         {"source": str(ROOT_DIR / "home" / ".claude"), "target": paths.get("claude_root")},
         {"source": str(ROOT_DIR / "home" / ".codex"), "target": paths.get("codex_root")},
         {"source": str(ROOT_DIR.parent), "target": paths.get("monoserver_root")},
