@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import re
 from pathlib import Path
@@ -298,6 +299,111 @@ def _normalize_profile_items(raw_items: Any, profile_id: str, section: str) -> l
     return normalized
 
 
+def _empty_runtime_sections() -> dict[str, list[dict[str, Any]]]:
+    return {
+        "repos": [],
+        "artifacts": [],
+        "env_files": [],
+        "skills": [],
+        "tasks": [],
+        "services": [],
+        "logs": [],
+        "checks": [],
+    }
+
+
+def _collect_core_sections(resolved: dict[str, Any], scoped_runtime: bool) -> tuple[dict[str, Any], dict[str, Any], dict[str, list[dict[str, Any]]]]:
+    core = _normalized_mapping(resolved.get("core"), "core") if scoped_runtime else resolved
+    selection = _normalized_mapping(resolved.get("selection"), "selection") if scoped_runtime else {}
+    sections = _empty_runtime_sections()
+    for name in sections:
+        section_name = f"core.{name}" if scoped_runtime else name
+        sections[name] = _normalized_items(core.get(name), section_name)
+    return core, selection, sections
+
+
+def _extend_sections_with_profiles(
+    sections: dict[str, list[dict[str, Any]]],
+    resolved: dict[str, Any],
+    scoped_runtime: bool,
+) -> None:
+    if not scoped_runtime:
+        return
+
+    for profile_id, raw_profile in resolved.items():
+        if profile_id in RESERVED_TOP_LEVEL_RUNTIME_KEYS:
+            continue
+        profile = _normalized_mapping(raw_profile, profile_id)
+        for name, items in sections.items():
+            items.extend(_normalize_profile_items(profile.get(name), profile_id, f"{profile_id}.{name}"))
+
+
+def _resolved_clients(
+    resolved: dict[str, Any],
+    scoped_runtime: bool,
+    overlay_clients: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    raw_clients = _normalized_items(resolved.get("clients"), "clients") if scoped_runtime else []
+    raw_clients.extend(_normalized_items(overlay_clients, "client overlays"))
+    return raw_clients
+
+
+def _extend_sections_with_client_items(
+    sections: dict[str, list[dict[str, Any]]],
+    client_id: str,
+    client: dict[str, Any],
+) -> None:
+    sections["repos"].extend(
+        _normalize_client_repo_roots(
+            client.get("repo_roots"),
+            client_id=client_id,
+            section=f"clients[{client_id}].repo_roots",
+        )
+    )
+    for name, items in sections.items():
+        if name == "repos":
+            extra = _normalized_items(client.get(name), f"clients[{client_id}].{name}")
+            items.extend(_attach_client_scope(extra, client_id))
+            continue
+        extra = _normalized_items(client.get(name), f"clients[{client_id}].{name}")
+        items.extend(_attach_client_scope(extra, client_id))
+
+
+def _collect_client_metadata(
+    raw_clients: list[dict[str, Any]],
+    sections: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    clients_meta: list[dict[str, Any]] = []
+    seen_client_ids: set[str] = set()
+
+    for client in raw_clients:
+        client_id = str(client.get("id", "")).strip()
+        if not client_id:
+            source = str(client.get("_overlay_path") or "runtime manifest")
+            raise RuntimeError(f"Client definition in {source} is missing id")
+        if client_id in seen_client_ids:
+            raise RuntimeError(f"Duplicate runtime client id: {client_id}")
+        seen_client_ids.add(client_id)
+
+        client_meta: dict[str, Any] = {
+            "id": client_id,
+            "label": str(client.get("label") or client_id),
+            "default_cwd": client.get("default_cwd"),
+        }
+        if client.get("_overlay_path"):
+            client_meta["_overlay_path"] = client["_overlay_path"]
+        if "connectors" in client:
+            client_meta["connectors"] = copy.deepcopy(client.get("connectors"))
+        if client.get("dcg"):
+            client_meta["dcg"] = client["dcg"]
+        if client.get("context"):
+            client_meta["context"] = client["context"]
+        clients_meta.append(client_meta)
+        _extend_sections_with_client_items(sections, client_id, client)
+
+    return clients_meta
+
+
 def load_client_overlays(root_dir: Path, env_values: dict[str, str]) -> list[dict[str, Any]]:
     overlays: list[dict[str, Any]] = []
     for path in client_overlay_paths(root_dir, env_values):
@@ -318,122 +424,31 @@ def _normalize_runtime_sections(
     overlay_clients: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     scoped_runtime = "core" in resolved or "clients" in resolved
-    core = _normalized_mapping(resolved.get("core"), "core") if scoped_runtime else resolved
-    selection = _normalized_mapping(resolved.get("selection"), "selection") if scoped_runtime else {}
-    repos = _normalized_items(core.get("repos"), "core.repos" if scoped_runtime else "repos")
-    artifacts = _normalized_items(core.get("artifacts"), "core.artifacts" if scoped_runtime else "artifacts")
-    env_files = _normalized_items(core.get("env_files"), "core.env_files" if scoped_runtime else "env_files")
-    skills = _normalized_items(core.get("skills"), "core.skills" if scoped_runtime else "skills")
-    tasks = _normalized_items(core.get("tasks"), "core.tasks" if scoped_runtime else "tasks")
-    services = _normalized_items(core.get("services"), "core.services" if scoped_runtime else "services")
-    logs = _normalized_items(core.get("logs"), "core.logs" if scoped_runtime else "logs")
-    checks = _normalized_items(core.get("checks"), "core.checks" if scoped_runtime else "checks")
-
-    if scoped_runtime:
-        for profile_id, raw_profile in resolved.items():
-            if profile_id in RESERVED_TOP_LEVEL_RUNTIME_KEYS:
-                continue
-            profile = _normalized_mapping(raw_profile, profile_id)
-            repos.extend(_normalize_profile_items(profile.get("repos"), profile_id, f"{profile_id}.repos"))
-            artifacts.extend(
-                _normalize_profile_items(profile.get("artifacts"), profile_id, f"{profile_id}.artifacts")
-            )
-            env_files.extend(
-                _normalize_profile_items(profile.get("env_files"), profile_id, f"{profile_id}.env_files")
-            )
-            skills.extend(_normalize_profile_items(profile.get("skills"), profile_id, f"{profile_id}.skills"))
-            tasks.extend(_normalize_profile_items(profile.get("tasks"), profile_id, f"{profile_id}.tasks"))
-            services.extend(
-                _normalize_profile_items(profile.get("services"), profile_id, f"{profile_id}.services")
-            )
-            logs.extend(_normalize_profile_items(profile.get("logs"), profile_id, f"{profile_id}.logs"))
-            checks.extend(_normalize_profile_items(profile.get("checks"), profile_id, f"{profile_id}.checks"))
-
-    raw_clients = _normalized_items(resolved.get("clients"), "clients") if scoped_runtime else []
-    raw_clients.extend(_normalized_items(overlay_clients, "client overlays"))
-    clients_meta: list[dict[str, Any]] = []
-    seen_client_ids: set[str] = set()
-
-    for client in raw_clients:
-        client_id = str(client.get("id", "")).strip()
-        if not client_id:
-            source = str(client.get("_overlay_path") or "runtime manifest")
-            raise RuntimeError(f"Client definition in {source} is missing id")
-        if client_id in seen_client_ids:
-            raise RuntimeError(f"Duplicate runtime client id: {client_id}")
-        seen_client_ids.add(client_id)
-        label = str(client.get("label") or client_id)
-        client_default_cwd = client.get("default_cwd")
-        client_meta: dict[str, Any] = {
-            "id": client_id,
-            "label": label,
-            "default_cwd": client_default_cwd,
-        }
-        if client.get("dcg"):
-            client_meta["dcg"] = client["dcg"]
-        if client.get("context"):
-            client_meta["context"] = client["context"]
-        clients_meta.append(client_meta)
-        repos.extend(
-            _normalize_client_repo_roots(
-                client.get("repo_roots"),
-                client_id=client_id,
-                section=f"clients[{client_id}].repo_roots",
-            )
-        )
-        repos.extend(_attach_client_scope(_normalized_items(client.get("repos"), f"clients[{client_id}].repos"), client_id))
-        artifacts.extend(
-            _attach_client_scope(
-                _normalized_items(client.get("artifacts"), f"clients[{client_id}].artifacts"),
-                client_id,
-            )
-        )
-        env_files.extend(
-            _attach_client_scope(
-                _normalized_items(client.get("env_files"), f"clients[{client_id}].env_files"),
-                client_id,
-            )
-        )
-        skills.extend(
-            _attach_client_scope(_normalized_items(client.get("skills"), f"clients[{client_id}].skills"), client_id)
-        )
-        tasks.extend(
-            _attach_client_scope(_normalized_items(client.get("tasks"), f"clients[{client_id}].tasks"), client_id)
-        )
-        services.extend(
-            _attach_client_scope(
-                _normalized_items(client.get("services"), f"clients[{client_id}].services"),
-                client_id,
-            )
-        )
-        logs.extend(_attach_client_scope(_normalized_items(client.get("logs"), f"clients[{client_id}].logs"), client_id))
-        checks.extend(
-            _attach_client_scope(_normalized_items(client.get("checks"), f"clients[{client_id}].checks"), client_id)
-        )
+    _, selection, sections = _collect_core_sections(resolved, scoped_runtime)
+    _extend_sections_with_profiles(sections, resolved, scoped_runtime)
+    clients_meta = _collect_client_metadata(_resolved_clients(resolved, scoped_runtime, overlay_clients), sections)
 
     return {
         "selection": selection,
         "clients": clients_meta,
-        "repos": repos,
-        "artifacts": artifacts,
-        "env_files": env_files,
-        "skills": skills,
-        "tasks": tasks,
-        "services": services,
-        "logs": logs,
-        "checks": checks,
+        "repos": sections["repos"],
+        "artifacts": sections["artifacts"],
+        "env_files": sections["env_files"],
+        "skills": sections["skills"],
+        "tasks": sections["tasks"],
+        "services": sections["services"],
+        "logs": sections["logs"],
+        "checks": sections["checks"],
     }
 
 
-def build_runtime_model(root_dir: Path) -> dict[str, Any]:
-    root_dir = root_dir.resolve()
-    runtime_doc = load_yaml(runtime_manifest_path(root_dir))
-    env_values = load_runtime_env(root_dir)
-    resolved = resolve_placeholders(runtime_doc, env_values)
-    overlay_clients = load_client_overlays(root_dir, env_values)
-    normalized = _normalize_runtime_sections(resolved, overlay_clients=overlay_clients)
-
-    model = {
+def _base_runtime_model(
+    root_dir: Path,
+    resolved: dict[str, Any],
+    env_values: dict[str, str],
+    normalized: dict[str, Any],
+) -> dict[str, Any]:
+    return {
         "root_dir": str(root_dir),
         "manifest_file": str(runtime_manifest_path(root_dir)),
         "version": resolved.get("version", 1),
@@ -450,6 +465,8 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
         "checks": normalized["checks"],
     }
 
+
+def _populate_repo_defaults(model: dict[str, Any], root_dir: Path) -> None:
     for repo in model["repos"]:
         repo.setdefault("kind", "repo")
         repo.setdefault("required", False)
@@ -460,6 +477,8 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
         if repo.get("path") and "host_path" not in repo:
             repo["host_path"] = str(runtime_path_to_host_path(root_dir, model["env"], str(repo["path"])))
 
+
+def _populate_artifact_defaults(model: dict[str, Any], root_dir: Path) -> None:
     for artifact in model["artifacts"]:
         artifact.setdefault("kind", "artifact")
         artifact.setdefault("required", False)
@@ -476,6 +495,8 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
             source["host_path"] = str(host_path_to_absolute_path(root_dir, str(source["path"])))
             artifact["source"] = source
 
+
+def _populate_env_file_defaults(model: dict[str, Any], root_dir: Path) -> None:
     for env_file in model["env_files"]:
         env_file.setdefault("kind", "env-file")
         env_file.setdefault("required", False)
@@ -494,6 +515,8 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
             source["host_path"] = str(host_path_to_absolute_path(root_dir, str(source["path"])))
             env_file["source"] = source
 
+
+def _populate_skill_defaults(model: dict[str, Any], root_dir: Path) -> None:
     for skill in model["skills"]:
         skill.setdefault("kind", "packaged-skill-set")
         skill.setdefault("required", False)
@@ -518,6 +541,8 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
             normalized_targets.append(target)
         skill["install_targets"] = normalized_targets
 
+
+def _populate_task_defaults(model: dict[str, Any], root_dir: Path) -> None:
     for task in model["tasks"]:
         task.setdefault("kind", "task")
         task.setdefault("required", False)
@@ -535,6 +560,8 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
             )
             task["success"] = success
 
+
+def _populate_service_defaults(model: dict[str, Any], root_dir: Path) -> None:
     for service in model["services"]:
         service.setdefault("required", False)
         service.setdefault("profiles", [])
@@ -548,6 +575,8 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
             )
             service["healthcheck"] = healthcheck
 
+
+def _populate_log_defaults(model: dict[str, Any], root_dir: Path) -> None:
     for log_item in model["logs"]:
         log_item.setdefault("required", False)
         log_item.setdefault("profiles", [])
@@ -557,6 +586,8 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
                 runtime_path_to_host_path(root_dir, model["env"], str(log_item["path"]))
             )
 
+
+def _populate_check_defaults(model: dict[str, Any], root_dir: Path) -> None:
     for check in model["checks"]:
         check.setdefault("required", False)
         check.setdefault("profiles", [])
@@ -564,6 +595,8 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
         if check.get("path"):
             check["host_path"] = str(runtime_path_to_host_path(root_dir, model["env"], str(check["path"])))
 
+
+def _populate_client_defaults(model: dict[str, Any], root_dir: Path) -> None:
     for client in model["clients"]:
         client.setdefault("label", client.get("id", ""))
         if client.get("default_cwd"):
@@ -571,4 +604,26 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
                 runtime_path_to_host_path(root_dir, model["env"], str(client["default_cwd"]))
             )
 
+
+def _populate_runtime_model_defaults(model: dict[str, Any], root_dir: Path) -> None:
+    _populate_repo_defaults(model, root_dir)
+    _populate_artifact_defaults(model, root_dir)
+    _populate_env_file_defaults(model, root_dir)
+    _populate_skill_defaults(model, root_dir)
+    _populate_task_defaults(model, root_dir)
+    _populate_service_defaults(model, root_dir)
+    _populate_log_defaults(model, root_dir)
+    _populate_check_defaults(model, root_dir)
+    _populate_client_defaults(model, root_dir)
+
+
+def build_runtime_model(root_dir: Path) -> dict[str, Any]:
+    root_dir = root_dir.resolve()
+    runtime_doc = load_yaml(runtime_manifest_path(root_dir))
+    env_values = load_runtime_env(root_dir)
+    resolved = resolve_placeholders(runtime_doc, env_values)
+    overlay_clients = load_client_overlays(root_dir, env_values)
+    normalized = _normalize_runtime_sections(resolved, overlay_clients=overlay_clients)
+    model = _base_runtime_model(root_dir, resolved, env_values, normalized)
+    _populate_runtime_model_defaults(model, root_dir)
     return model

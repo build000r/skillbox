@@ -423,33 +423,29 @@ def check_env_defaults(model: dict[str, Any]) -> CheckResult:
     return CheckResult(status="pass", code="env-defaults", message=".env.example matches manifest defaults")
 
 
-def check_compose_model(model: dict[str, Any]) -> list[CheckResult]:
-    try:
-        base_config = compose_config(include_surfaces=False)
-        surfaces_config = compose_config(include_surfaces=True)
-        swimmers_config = compose_config(include_surfaces=False, include_swimmers=True)
-    except RuntimeError as exc:
-        return [
-            CheckResult(
-                status="fail",
-                code="compose-config",
-                message="docker compose config could not be resolved",
-                details={"error": str(exc)},
-            )
-        ]
-
-    results = [
+def _compose_config_failure(exc: RuntimeError) -> list[CheckResult]:
+    return [
         CheckResult(
-            status="pass",
+            status="fail",
             code="compose-config",
-            message="docker compose config resolved for default, surfaces, and swimmers overlay variants",
+            message="docker compose config could not be resolved",
+            details={"error": str(exc)},
         )
     ]
 
+
+def _compose_config_success() -> CheckResult:
+    return CheckResult(
+        status="pass",
+        code="compose-config",
+        message="docker compose config resolved for default, surfaces, and swimmers overlay variants",
+    )
+
+
+def _workspace_compose_issues(base_config: dict[str, Any], model: dict[str, Any]) -> list[str]:
     issues: list[str] = []
     if base_config.get("name") != model["expected_env"]["SKILLBOX_NAME"]:
         issues.append("compose project name does not match sandbox.name / SKILLBOX_NAME")
-
     if (base_config.get("x-runtime-env") or {}) != model["runtime_env"]:
         issues.append("x-runtime-env does not match manifest-derived runtime env")
 
@@ -469,102 +465,97 @@ def check_compose_model(model: dict[str, Any]) -> list[CheckResult]:
         source = expected_mount["source"]
         if mounts.get(target) != source:
             issues.append(f"workspace bind mount {source} -> {target} is missing or different")
+    return issues
 
-    if issues:
-        results.append(
-            CheckResult(
-                status="fail",
-                code="compose-workspace",
-                message="workspace service drifted from the manifests",
-                details={"issues": issues},
-            )
-        )
-    else:
-        results.append(
-            CheckResult(
-                status="pass",
-                code="compose-workspace",
-                message="workspace service matches manifest-derived env and mounts",
-            )
-        )
 
-    surface_issues: list[str] = []
+def _surface_compose_issues(surfaces_config: dict[str, Any], model: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
     for service_name, port_key in (("api", "api"), ("web", "web")):
         service = (surfaces_config.get("services") or {}).get(service_name) or {}
         if service.get("profiles") != ["surfaces"]:
-            surface_issues.append(f"{service_name} service is not scoped to the surfaces profile")
+            issues.append(f"{service_name} service is not scoped to the surfaces profile")
         if runtime_env_view(service.get("environment") or {}, model["runtime_env"]) != model["runtime_env"]:
-            surface_issues.append(f"{service_name} environment does not match manifest-derived runtime env")
+            issues.append(f"{service_name} environment does not match manifest-derived runtime env")
 
         expected_port = int(model["sandbox"]["ports"].get(port_key))
         ports = service.get("ports") or []
         if len(ports) != 1:
-            surface_issues.append(f"{service_name} should publish exactly one port")
-        else:
-            published = ports[0]
-            if published.get("host_ip") != "127.0.0.1":
-                surface_issues.append(f"{service_name} should bind only to 127.0.0.1")
-            if int(published.get("target", 0)) != expected_port:
-                surface_issues.append(f"{service_name} container port does not match sandbox.ports.{port_key}")
-            if str(published.get("published")) != str(expected_port):
-                surface_issues.append(f"{service_name} published port does not match sandbox.ports.{port_key}")
+            issues.append(f"{service_name} should publish exactly one port")
+            continue
 
-    if surface_issues:
-        results.append(
-            CheckResult(
-                status="fail",
-                code="compose-surfaces",
-                message="api/web surface services drifted from the manifests",
-                details={"issues": surface_issues},
-            )
-        )
-    else:
-        results.append(
-            CheckResult(
-                status="pass",
-                code="compose-surfaces",
-                message="api/web services match manifest-derived env, profile, and ports",
-            )
-        )
+        published = ports[0]
+        if published.get("host_ip") != "127.0.0.1":
+            issues.append(f"{service_name} should bind only to 127.0.0.1")
+        if int(published.get("target", 0)) != expected_port:
+            issues.append(f"{service_name} container port does not match sandbox.ports.{port_key}")
+        if str(published.get("published")) != str(expected_port):
+            issues.append(f"{service_name} published port does not match sandbox.ports.{port_key}")
+    return issues
 
-    swimmers_issues: list[str] = []
+
+def _swimmers_compose_issues(swimmers_config: dict[str, Any], model: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
     swimmers_workspace = (swimmers_config.get("services") or {}).get("workspace") or {}
     if runtime_env_view(swimmers_workspace.get("environment") or {}, model["runtime_env"]) != model["runtime_env"]:
-        swimmers_issues.append("swimmers workspace environment does not match manifest-derived runtime env")
+        issues.append("swimmers workspace environment does not match manifest-derived runtime env")
 
     expected_swimmers_port = int(model["sandbox"]["ports"].get("swimmers"))
     expected_swimmers_host = model["expected_env"]["SKILLBOX_SWIMMERS_PUBLISH_HOST"]
     swimmers_ports = swimmers_workspace.get("ports") or []
     if len(swimmers_ports) != 1:
-        swimmers_issues.append("swimmers workspace overlay should publish exactly one port")
-    else:
-        published = swimmers_ports[0]
-        if published.get("host_ip") != expected_swimmers_host:
-            swimmers_issues.append("swimmers workspace overlay host_ip does not match SKILLBOX_SWIMMERS_PUBLISH_HOST")
-        if int(published.get("target", 0)) != expected_swimmers_port:
-            swimmers_issues.append("swimmers workspace overlay target port does not match sandbox.ports.swimmers")
-        if str(published.get("published")) != str(expected_swimmers_port):
-            swimmers_issues.append("swimmers workspace overlay published port does not match sandbox.ports.swimmers")
+        issues.append("swimmers workspace overlay should publish exactly one port")
+        return issues
 
-    if swimmers_issues:
-        results.append(
-            CheckResult(
-                status="fail",
-                code="compose-swimmers",
-                message="workspace swimmers overlay drifted from the manifests",
-                details={"issues": swimmers_issues},
-            )
-        )
-    else:
-        results.append(
-            CheckResult(
-                status="pass",
-                code="compose-swimmers",
-                message="workspace swimmers overlay matches manifest-derived env and port publishing",
-            )
-        )
+    published = swimmers_ports[0]
+    if published.get("host_ip") != expected_swimmers_host:
+        issues.append("swimmers workspace overlay host_ip does not match SKILLBOX_SWIMMERS_PUBLISH_HOST")
+    if int(published.get("target", 0)) != expected_swimmers_port:
+        issues.append("swimmers workspace overlay target port does not match sandbox.ports.swimmers")
+    if str(published.get("published")) != str(expected_swimmers_port):
+        issues.append("swimmers workspace overlay published port does not match sandbox.ports.swimmers")
+    return issues
 
-    return results
+
+def _compose_check_result(code: str, success_message: str, failure_message: str, issues: list[str]) -> CheckResult:
+    if issues:
+        return CheckResult(
+            status="fail",
+            code=code,
+            message=failure_message,
+            details={"issues": issues},
+        )
+    return CheckResult(status="pass", code=code, message=success_message)
+
+
+def check_compose_model(model: dict[str, Any]) -> list[CheckResult]:
+    try:
+        base_config = compose_config(include_surfaces=False)
+        surfaces_config = compose_config(include_surfaces=True)
+        swimmers_config = compose_config(include_surfaces=False, include_swimmers=True)
+    except RuntimeError as exc:
+        return _compose_config_failure(exc)
+
+    return [
+        _compose_config_success(),
+        _compose_check_result(
+            "compose-workspace",
+            "workspace service matches manifest-derived env and mounts",
+            "workspace service drifted from the manifests",
+            _workspace_compose_issues(base_config, model),
+        ),
+        _compose_check_result(
+            "compose-surfaces",
+            "api/web services match manifest-derived env, profile, and ports",
+            "api/web surface services drifted from the manifests",
+            _surface_compose_issues(surfaces_config, model),
+        ),
+        _compose_check_result(
+            "compose-swimmers",
+            "workspace swimmers overlay matches manifest-derived env and port publishing",
+            "workspace swimmers overlay drifted from the manifests",
+            _swimmers_compose_issues(swimmers_config, model),
+        ),
+    ]
 
 
 def check_skill_sync_packager(model: dict[str, Any]) -> CheckResult:

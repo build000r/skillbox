@@ -39,6 +39,7 @@ from lib.runtime_model import (  # noqa: E402
     build_runtime_model,
     client_config_host_dir,
     client_config_runtime_dir,
+    client_configs_host_root,
     host_path_to_absolute_path,
     load_yaml,
     load_runtime_env,
@@ -69,6 +70,7 @@ CLIENT_PUBLISH_VERSION = 1
 CLIENT_PUBLISH_ROOT_REL = Path("clients")
 CLIENT_PUBLISH_CURRENT_REL = Path("current")
 CLIENT_PUBLISH_METADATA_REL = Path("publish.json")
+DEFAULT_PRIVATE_REPO_REL = Path("..") / "skillbox-config"
 CLIENT_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 BLUEPRINT_VARIABLE_PATTERN = re.compile(r"^[A-Z0-9_]+$")
 SCAFFOLD_PLACEHOLDER_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
@@ -162,6 +164,13 @@ def classify_error(exc: RuntimeError, command: str) -> dict[str, Any]:
             msg,
             error_type="conflict",
             recovery_hint="Commit or discard changes in the target repo, then retry.",
+        )
+    if "no private publish target configured" in msg.lower():
+        return structured_error(
+            msg,
+            error_type="missing_target_repo",
+            recovery_hint="Run private-init to attach a private repo, or pass --target-dir explicitly.",
+            next_actions=["private-init --format json"],
         )
     if "target must be a git repo" in msg.lower():
         return structured_error(
@@ -271,6 +280,10 @@ def next_actions_for_bootstrap(task_results: list[dict[str, Any]]) -> list[str]:
 
 def next_actions_for_context() -> list[str]:
     return ["doctor --format json"]
+
+
+def next_actions_for_private_init() -> list[str]:
+    return ["render --format json"]
 
 
 def next_actions_for_client_init(client_id: str) -> list[str]:
@@ -581,6 +594,45 @@ def write_text_file(path: Path, content: str, dry_run: bool) -> None:
     if dry_run:
         return
     path.write_text(content, encoding="utf-8")
+
+
+def normalize_host_rel_path(root_dir: Path, path: Path) -> str:
+    rel_path = os.path.relpath(path, root_dir)
+    if rel_path == ".":
+        return rel_path
+    if rel_path.startswith("."):
+        return rel_path
+    return f"./{rel_path}"
+
+
+def upsert_env_file_values(path: Path, updates: dict[str, str]) -> bool:
+    existing_text = path.read_text(encoding="utf-8") if path.exists() else ""
+    lines = existing_text.splitlines()
+    updated_keys: set[str] = set()
+    new_lines: list[str] = []
+
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            raw_key, _raw_value = stripped.split("=", 1)
+            key = raw_key.strip()
+            if key in updates:
+                new_lines.append(f"{key}={updates[key]}")
+                updated_keys.add(key)
+                continue
+        new_lines.append(raw_line)
+
+    for key, value in updates.items():
+        if key not in updated_keys:
+            new_lines.append(f"{key}={value}")
+
+    serialized = "\n".join(new_lines).rstrip()
+    if serialized:
+        serialized += "\n"
+    if serialized == existing_text:
+        return False
+    path.write_text(serialized, encoding="utf-8")
+    return True
 
 
 def require_yaml(feature: str) -> Any:
@@ -1848,17 +1900,114 @@ def project_client_bundle(
     }
 
 
+def resolve_optional_host_dir(root_dir: Path, raw_path: str | None, *, default_rel: Path) -> Path:
+    value = str(raw_path or "").strip()
+    resolved = Path(value) if value else default_rel
+    resolved = resolved.expanduser()
+    if not resolved.is_absolute():
+        return (root_dir / resolved).resolve()
+    return resolved.resolve()
+
+
+def inferred_private_target_dir(root_dir: Path, env_values: dict[str, str] | None = None) -> Path | None:
+    resolved_env = env_values or load_runtime_env(root_dir)
+    clients_root = client_configs_host_root(root_dir, resolved_env).resolve()
+    default_clients_root = (root_dir / "workspace" / "clients").resolve()
+    if clients_root == default_clients_root:
+        return None
+    return clients_root.parent
+
+
+def ensure_git_repo(path: Path) -> bool:
+    ensure_directory(path, dry_run=False)
+    state = git_repo_state(path)
+    if state.get("git"):
+        return False
+
+    init_result = run_command(["git", "init"], cwd=path)
+    if init_result.returncode != 0:
+        raise RuntimeError(init_result.stderr.strip() or init_result.stdout.strip() or f"git init failed for {path}")
+
+    branch_result = run_command(["git", "branch", "-M", "main"], cwd=path)
+    if branch_result.returncode != 0:
+        raise RuntimeError(
+            branch_result.stderr.strip() or branch_result.stdout.strip() or f"git branch setup failed for {path}"
+        )
+    return True
+
+
+def migrate_client_overlay_tree(root_dir: Path, source_root: Path, target_root: Path) -> tuple[list[str], list[str]]:
+    actions: list[str] = []
+    migrated_clients: list[str] = []
+    ensure_directory(target_root, dry_run=False)
+    if not source_root.is_dir() or source_root.resolve() == target_root.resolve():
+        return actions, migrated_clients
+
+    for child in sorted(source_root.iterdir()):
+        if not child.is_dir():
+            continue
+        dest = target_root / child.name
+        if dest.exists():
+            actions.append(f"skip-client-existing: {repo_rel(root_dir, dest)}")
+            continue
+        shutil.copytree(child, dest)
+        migrated_clients.append(child.name)
+        actions.append(f"copy-client: {repo_rel(root_dir, dest)}")
+    return actions, migrated_clients
+
+
+def init_private_repo(root_dir: Path, *, target_dir_arg: str | None = None) -> dict[str, Any]:
+    env_values = load_runtime_env(root_dir)
+    current_clients_root = client_configs_host_root(root_dir, env_values).resolve()
+    target_dir = resolve_optional_host_dir(root_dir, target_dir_arg, default_rel=DEFAULT_PRIVATE_REPO_REL)
+    target_clients_root = (target_dir / "clients").resolve()
+
+    actions: list[str] = []
+    ensure_directory(target_dir, dry_run=False)
+    actions.append(f"ensure-dir: {repo_rel(root_dir, target_dir)}")
+    if ensure_git_repo(target_dir):
+        actions.append(f"git-init: {repo_rel(root_dir, target_dir)}")
+    else:
+        actions.append(f"git-repo-present: {repo_rel(root_dir, target_dir)}")
+
+    ensure_directory(target_clients_root, dry_run=False)
+    actions.append(f"ensure-dir: {repo_rel(root_dir, target_clients_root)}")
+
+    migrate_actions, migrated_clients = migrate_client_overlay_tree(
+        root_dir,
+        current_clients_root,
+        target_clients_root,
+    )
+    actions.extend(migrate_actions)
+
+    clients_host_root_value = normalize_host_rel_path(root_dir, target_clients_root)
+    env_changed = upsert_env_file_values(
+        root_dir / ".env",
+        {"SKILLBOX_CLIENTS_HOST_ROOT": clients_host_root_value},
+    )
+    actions.append(f"{'write' if env_changed else 'keep'}-env: .env")
+
+    return {
+        "target_dir": str(target_dir),
+        "clients_host_root": str(target_clients_root),
+        "env_updates": {"SKILLBOX_CLIENTS_HOST_ROOT": clients_host_root_value},
+        "migrated_clients": migrated_clients,
+        "actions": actions,
+        "next_actions": next_actions_for_private_init(),
+    }
+
+
 def resolve_client_publish_target_dir(root_dir: Path, raw_target_dir: str | None) -> Path:
     target_value = str(raw_target_dir or "").strip()
-    if not target_value:
-        raise RuntimeError("client-publish requires --target-dir.")
+    if target_value:
+        return resolve_optional_host_dir(root_dir, target_value, default_rel=DEFAULT_PRIVATE_REPO_REL)
 
-    target_dir = Path(target_value).expanduser()
-    if not target_dir.is_absolute():
-        target_dir = (root_dir / target_dir).resolve()
-    else:
-        target_dir = target_dir.resolve()
-    return target_dir
+    inferred = inferred_private_target_dir(root_dir)
+    if inferred is None:
+        raise RuntimeError(
+            "No private publish target configured. Run private-init to attach a private repo or pass --target-dir."
+        )
+    return inferred
 
 
 def resolve_client_publish_bundle_dir(root_dir: Path, raw_bundle_dir: str) -> Path:
@@ -1876,6 +2025,23 @@ def git_head_commit(path: Path) -> str | None:
         return None
     value = result.stdout.strip()
     return value or None
+
+
+def git_dirty_paths(path: Path) -> list[str]:
+    result = run_command(["git", "status", "--short"], cwd=path)
+    if result.returncode != 0:
+        return []
+
+    paths: list[str] = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        entry = line[3:].strip()
+        if " -> " in entry:
+            entry = entry.split(" -> ", 1)[1].strip()
+        if entry:
+            paths.append(entry)
+    return paths
 
 
 def directory_file_entries(path: Path) -> list[tuple[str, str]]:
@@ -2279,7 +2445,13 @@ def publish_client_bundle(
     target_state = git_repo_state(target_dir)
     if not target_state.get("git"):
         raise RuntimeError(f"client-publish target must be a git repo: {target_dir}")
-    if int(target_state.get("dirty", 0)) or int(target_state.get("untracked", 0)):
+    dirty_paths = git_dirty_paths(target_dir)
+    blocked_dirty_paths = [
+        rel_path
+        for rel_path in dirty_paths
+        if not rel_path.startswith(f"{CLIENT_PUBLISH_ROOT_REL.as_posix()}/")
+    ]
+    if blocked_dirty_paths:
         raise RuntimeError(f"client-publish target repo has a dirty working tree: {target_dir}")
 
     if from_bundle_arg and profiles:
@@ -6845,6 +7017,17 @@ def main() -> int:
     client_init_parser.add_argument("--dry-run", action="store_true")
     client_init_parser.add_argument("--format", choices=("text", "json"), default="text")
 
+    private_init_parser = subparsers.add_parser(
+        "private-init",
+        help="Attach or initialize a private client-config repo for this checkout.",
+    )
+    private_init_parser.add_argument(
+        "--path",
+        default=None,
+        help="Private repo path. Defaults to ../skillbox-config.",
+    )
+    private_init_parser.add_argument("--format", choices=("text", "json"), default="text")
+
     client_project_parser = subparsers.add_parser(
         "client-project",
         help="Compile a single-client runtime projection bundle with sanitized metadata.",
@@ -6873,7 +7056,6 @@ def main() -> int:
     )
     client_publish_parser.add_argument(
         "--target-dir",
-        required=True,
         help="Git repo that receives clients/<client>/current/ and publish.json.",
     )
     client_publish_parser.add_argument(
@@ -6899,7 +7081,6 @@ def main() -> int:
     )
     client_diff_parser.add_argument(
         "--target-dir",
-        required=True,
         help="Git repo that holds clients/<client>/current/ and publish.json.",
     )
     client_diff_parser.add_argument(
@@ -7079,6 +7260,28 @@ def main() -> int:
             wait_seconds=max(0.0, float(args.wait_seconds)),
             fmt=args.format,
         )
+
+    if args.command == "private-init":
+        try:
+            payload = init_private_repo(
+                root_dir=root_dir,
+                target_dir_arg=args.path,
+            )
+        except RuntimeError as exc:
+            if args.format == "json":
+                emit_json(classify_error(exc, "private-init"))
+            else:
+                print(str(exc), file=sys.stderr)
+            return EXIT_ERROR
+
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            print(f"target_dir: {payload['target_dir']}")
+            print(f"clients_host_root: {payload['clients_host_root']}")
+            print()
+            print("\n".join(payload["actions"]))
+        return EXIT_OK
 
     if args.command == "acceptance":
         return run_acceptance(

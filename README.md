@@ -401,12 +401,26 @@ re-deriving it from scratch.
 - SSH and Tailscale are a feature, not a compromise
 - you want explicit runtime declarations instead of a hosted control plane
 
-**Use something else when:**
+## When Not To Use `skillbox`
 
-- you need a browser IDE product
-- you need multi-user tenancy, policy layers, or hosted control planes
-- you need untrusted-code sandboxing as the primary job
-- you only need an environment manager, not a whole box model
+Do not use `skillbox` just because it is adjacent to a tool you already know.
+Use something else when the real job is one of these:
+
+- **A browser IDE product**: if the core experience needs to live in the
+  browser, use something designed around that center of gravity.
+- **Multi-user workspace fleets**: if you need tenancy, RBAC, policy layers,
+  audit controls, or a hosted control plane, you are in Coder or Gitpod
+  territory.
+- **Untrusted-code sandboxing**: if isolation and ephemeral execution are the
+  main job, look at Daytona, E2B, or similar sandbox/runtime systems.
+- **Environment management only**: if you just need reproducible packages or
+  shell environments, Devbox-like tooling is usually a better fit than a full
+  box model.
+- **Hosted SaaS ergonomics**: if you do not want to operate the host, Docker,
+  and private access model yourself, `skillbox` is the wrong tool.
+
+`skillbox` is best when the problem is narrower: one operator-owned machine that
+should feel durable, legible, and agent-friendly.
 
 ## Installation
 
@@ -577,9 +591,10 @@ make runtime-sync
 | `.env-manager/manage.py restart` | Restart manageable services for the selected core/client scope, preserving declared dependency order | `python3 .env-manager/manage.py restart --profile surfaces --service web-stub` |
 | `.env-manager/manage.py logs` | Print recent log output for declared services | `python3 .env-manager/manage.py logs --profile surfaces --service api-stub --lines 80` |
 | `.env-manager/manage.py client-init` | Scaffold a new client overlay, optionally applying a reusable blueprint for repos and services | `python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo --set PRIMARY_REPO_URL=https://github.com/acme/app.git` |
+| `.env-manager/manage.py private-init` | Attach or initialize the private client-config repo for this checkout and persist the local clients-root override | `python3 .env-manager/manage.py private-init --path ../skillbox-config` |
 | `.env-manager/manage.py client-project` | Compile a single-client projection bundle with a client-safe runtime manifest and sanitized metadata | `python3 .env-manager/manage.py client-project personal --profile surfaces` |
-| `.env-manager/manage.py client-diff` | Compare a client projection bundle against the current published payload and show both file-level and runtime-surface changes | `python3 .env-manager/manage.py client-diff personal --target-dir ../skillbox-config-control --profile surfaces` |
-| `.env-manager/manage.py client-publish` | Promote a client projection bundle into a private git-backed control-plane repo under `clients/<client>/current/` | `python3 .env-manager/manage.py client-publish personal --target-dir ../skillbox-config-control --commit` |
+| `.env-manager/manage.py client-diff` | Compare a client projection bundle against the current published payload and show both file-level and runtime-surface changes | `python3 .env-manager/manage.py client-diff personal --profile surfaces` |
+| `.env-manager/manage.py client-publish` | Promote a client projection bundle into the attached private git repo under `clients/<client>/current/` | `python3 .env-manager/manage.py client-publish personal --commit` |
 | `.env-manager/pulse.py` | Pulse reconciliation daemon for continuous drift detection and auto-heal | `python3 .env-manager/pulse.py run --interval 30` |
 
 ## Configuration
@@ -651,11 +666,19 @@ SKILLBOX_CLIENTS_HOST_ROOT=../skillbox-config/clients
 SKILLBOX_MONOSERVER_HOST_ROOT=..
 ```
 
+Or let `private-init` write the clients-root override for you and initialize the
+private repo in one step:
+
+```bash
+python3 .env-manager/manage.py private-init --path ../skillbox-config
+```
+
 With that setup:
 
 - `skillbox` stays publishable
 - `skillbox-config/clients/<client>/overlay.yaml` is the private source of truth
 - `client-init`, `sync`, and `focus` write client config into the private repo
+- `client-diff` and `client-publish` default to the attached private repo unless you explicitly pass `--target-dir`
 - `client-project <client>` compiles a client-safe bundle under `builds/clients/<client>/`
 - client application repos stay separate under the shared monoserver tree
 - clients usually do not need access to the `skillbox` repo itself
@@ -693,18 +716,14 @@ without exposing the full operator repo.
 The intended promotion loop is:
 
 ```bash
+python3 .env-manager/manage.py private-init --path ../skillbox-config
 python3 .env-manager/manage.py client-project personal --profile surfaces
-python3 .env-manager/manage.py client-diff personal \
-  --target-dir ../skillbox-config-control \
-  --profile surfaces
-python3 .env-manager/manage.py client-publish personal \
-  --target-dir ../skillbox-config-control \
-  --commit \
-  --profile surfaces
+python3 .env-manager/manage.py client-diff personal --profile surfaces
+python3 .env-manager/manage.py client-publish personal --commit --profile surfaces
 ```
 
 `client-diff` compares a candidate bundle against the existing
-`clients/<client>/current/` payload in the control repo. It shows:
+`clients/<client>/current/` payload in the attached private repo. It shows:
 
 - added, removed, and changed files in the bundle payload
 - runtime-surface deltas across repos, artifacts, env files, skills, tasks,
@@ -716,13 +735,13 @@ python3 .env-manager/manage.py client-publish personal \
 client-facing artifact in a private git repo:
 
 ```bash
+python3 .env-manager/manage.py client-publish personal --commit
 python3 .env-manager/manage.py client-publish personal \
-  --target-dir ../skillbox-config-control \
-  --commit
-python3 .env-manager/manage.py client-publish personal \
-  --from-bundle ./builds/clients/personal \
-  --target-dir ../skillbox-config-control
+  --from-bundle ./builds/clients/personal
 ```
+
+If you need to publish somewhere other than the attached repo for a specific
+run, pass `--target-dir /path/to/other-private-repo`.
 
 What v1 does:
 

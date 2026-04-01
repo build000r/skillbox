@@ -436,6 +436,249 @@ def ts_remove_node(hostname: str) -> bool:
 # box up
 # ---------------------------------------------------------------------------
 
+@dataclass
+class BoxUpContext:
+    box_id: str
+    profile_name: str
+    profile: BoxProfile
+    box: Box
+    boxes: list[Box]
+    ts_hostname: str
+    is_json: bool
+    steps: list[dict[str, Any]] = field(default_factory=list)
+    ip: str | None = None
+    ssh_target: str | None = None
+
+
+def _record_box_up_step(context: BoxUpContext, name: str, status: str, detail: Any = None) -> None:
+    entry: dict[str, Any] = {"step": name, "status": status}
+    if detail is not None:
+        entry["detail"] = detail
+    context.steps.append(entry)
+    if not context.is_json:
+        marker = "ok" if status == "ok" else ("skip" if status == "skip" else "FAIL")
+        suffix = f"  {detail}" if detail and isinstance(detail, str) else ""
+        print(f"[{marker}] {name}{suffix}")
+
+
+def _emit_box_up_failure(
+    context: BoxUpContext,
+    *,
+    error_type: str,
+    message: str,
+    next_actions: list[str] | None = None,
+) -> int:
+    payload: dict[str, Any] = {
+        "box_id": context.box_id,
+        "dry_run": False,
+        "steps": context.steps,
+    }
+    payload.update(structured_error(message, error_type=error_type, next_actions=next_actions))
+    if context.is_json:
+        emit_json(payload)
+    return EXIT_ERROR
+
+
+def _run_box_up_stage(
+    context: BoxUpContext,
+    *,
+    stage_name: str,
+    error_type: str,
+    action: Any,
+    failure_state: str | None = None,
+    next_actions: list[str] | None = None,
+) -> bool:
+    try:
+        detail = action()
+    except Exception as exc:
+        _record_box_up_step(context, stage_name, "fail", str(exc))
+        if failure_state is not None:
+            update_box(context.box, state=failure_state)
+            save_inventory(context.boxes)
+        _emit_box_up_failure(
+            context,
+            error_type=error_type,
+            message=str(exc),
+            next_actions=next_actions,
+        )
+        return False
+
+    _record_box_up_step(context, stage_name, "ok", detail)
+    return True
+
+
+def _build_box_up_context(
+    *,
+    box_id: str,
+    profile_name: str,
+    profile: BoxProfile,
+    boxes: list[Box],
+    is_json: bool,
+) -> BoxUpContext:
+    now = datetime.now(timezone.utc).isoformat()
+    ts_hostname = f"{profile.tailscale_hostname_prefix}-{box_id}"
+    box = Box(
+        id=box_id,
+        profile=profile_name,
+        state="creating",
+        ssh_user=profile.ssh_user,
+        tailscale_hostname=ts_hostname,
+        created_at=now,
+        updated_at=now,
+        region=profile.region,
+        size=profile.size,
+    )
+    return BoxUpContext(
+        box_id=box_id,
+        profile_name=profile_name,
+        profile=profile,
+        box=box,
+        boxes=boxes,
+        ts_hostname=ts_hostname,
+        is_json=is_json,
+    )
+
+
+def _box_up_dry_run_payload(context: BoxUpContext) -> dict[str, Any]:
+    _record_box_up_step(context, "create", "skip", f"would create {context.profile.size} in {context.profile.region}")
+    _record_box_up_step(context, "bootstrap", "skip", "dry-run")
+    _record_box_up_step(context, "enroll", "skip", f"would enroll as {context.ts_hostname}")
+    _record_box_up_step(context, "deploy", "skip", "dry-run")
+    _record_box_up_step(context, "onboard", "skip", "dry-run")
+    _record_box_up_step(context, "verify", "skip", "dry-run")
+    return {
+        "box_id": context.box_id,
+        "profile": asdict(context.profile),
+        "dry_run": True,
+        "steps": context.steps,
+        "next_actions": [f"box up {context.box_id} --profile {context.profile_name}"],
+    }
+
+
+def _create_box_droplet(context: BoxUpContext, *, ssh_key_id: str) -> str:
+    droplet_name = f"skillbox-{context.box_id}"
+    if not context.is_json:
+        print(f"[...] create  Creating {context.profile.size} droplet in {context.profile.region}...")
+    droplet = do_create_droplet(
+        droplet_name,
+        region=context.profile.region,
+        size=context.profile.size,
+        image=context.profile.image,
+        ssh_key_id=ssh_key_id,
+    )
+    ip = do_droplet_public_ip(droplet)
+    if not ip:
+        raise RuntimeError("Droplet created but no public IP assigned")
+    context.ip = ip
+    update_box(context.box, droplet_id=str(droplet["id"]), droplet_ip=ip, state="bootstrapping")
+    context.boxes.append(context.box)
+    save_inventory(context.boxes)
+    return f"droplet {droplet['id']} at {ip}"
+
+
+def _bootstrap_box_host(context: BoxUpContext) -> str:
+    if context.ip is None:
+        raise RuntimeError("Droplet IP unavailable during bootstrap")
+    if not context.is_json:
+        print(f"[...] bootstrap  Waiting for SSH on {context.ip}...")
+    if not wait_for_ssh(context.ip, user="root"):
+        raise RuntimeError(f"SSH not reachable at root@{context.ip} after 120s")
+    if not context.is_json:
+        print("[...] bootstrap  Running 01-bootstrap-do.sh...")
+    result = ssh_script("root", context.ip, BOOTSTRAP_SCRIPT, {"APP_USER": context.profile.ssh_user}, timeout=600)
+    if result.returncode != 0:
+        raise RuntimeError(f"Bootstrap failed (exit {result.returncode}): {result.stderr[-500:]}")
+    update_box(context.box, state="enrolling")
+    save_inventory(context.boxes)
+    return "OS packages + Docker + user created"
+
+
+def _enroll_box_tailscale(context: BoxUpContext, *, ts_authkey: str) -> str:
+    if context.ip is None:
+        raise RuntimeError("Droplet IP unavailable during tailscale enrollment")
+    if not context.is_json:
+        print(f"[...] enroll  Joining tailnet as {context.ts_hostname}...")
+    result = ssh_script(
+        "root",
+        context.ip,
+        TAILSCALE_SCRIPT,
+        {
+            "TAILSCALE_AUTHKEY": ts_authkey,
+            "TAILSCALE_HOSTNAME": context.ts_hostname,
+            "SSH_LOGIN_USER": context.profile.ssh_user,
+        },
+        timeout=300,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Tailscale enrollment failed (exit {result.returncode}): {result.stderr[-500:]}")
+    ts_ip_result = ssh_cmd("root", context.ip, "tailscale ip -4", timeout=15)
+    ts_ip = ts_ip_result.stdout.strip().split("\n")[0] if ts_ip_result.returncode == 0 else None
+    update_box(context.box, tailscale_ip=ts_ip, state="deploying")
+    save_inventory(context.boxes)
+    return f"tailscale {context.ts_hostname} at {ts_ip or 'unknown'}"
+
+
+def _resolve_deploy_target(context: BoxUpContext) -> str:
+    if context.ip is None:
+        raise RuntimeError("Droplet IP unavailable during deploy")
+    ssh_target = context.ts_hostname
+    if wait_for_ssh(ssh_target, user=context.profile.ssh_user, max_wait=60, interval=5):
+        context.ssh_target = ssh_target
+        return ssh_target
+    ssh_target = context.ip
+    if not wait_for_ssh(ssh_target, user=context.profile.ssh_user, max_wait=30):
+        raise RuntimeError(f"Cannot reach {context.profile.ssh_user}@{context.ts_hostname} or {context.ip} via SSH")
+    context.ssh_target = ssh_target
+    return ssh_target
+
+
+def _deploy_box_runtime(context: BoxUpContext) -> str:
+    if not context.is_json:
+        print(f"[...] deploy  Cloning skillbox and starting container via {context.ts_hostname}...")
+    ssh_target = _resolve_deploy_target(context)
+    deploy_cmds = build_deploy_command(context.profile)
+    result = ssh_cmd(context.profile.ssh_user, ssh_target, deploy_cmds, timeout=600)
+    if result.returncode != 0:
+        raise RuntimeError(f"Deploy failed (exit {result.returncode}): {result.stderr[-500:]}")
+    update_box(context.box, state="onboarding")
+    save_inventory(context.boxes)
+    return "container running"
+
+
+def _run_box_onboard(context: BoxUpContext, *, blueprint: str | None, set_args: list[str]) -> None:
+    if context.ssh_target is None:
+        raise RuntimeError("SSH target unavailable during onboarding")
+    if not context.is_json:
+        print(f"[...] onboard  Running onboard for client {context.box_id}...")
+    exec_cmd = build_onboard_command(context.box_id, blueprint, set_args)
+    result = ssh_cmd(context.profile.ssh_user, context.ssh_target, exec_cmd, timeout=300)
+    if result.returncode not in (0, 2):
+        raise RuntimeError(f"Onboard failed (exit {result.returncode}): {result.stderr[-500:]}")
+
+
+def _verify_box_runtime(context: BoxUpContext) -> None:
+    if context.ssh_target is None:
+        raise RuntimeError("SSH target unavailable during verification")
+    verify_cmd = "cd ~/skillbox && docker compose exec -T workspace python3 .env-manager/manage.py doctor --format json"
+    result = ssh_cmd(context.profile.ssh_user, context.ssh_target, verify_cmd, timeout=60)
+    _record_box_up_step(context, "verify", "ok" if result.returncode == 0 else "warn")
+
+
+def _box_up_success_payload(context: BoxUpContext) -> dict[str, Any]:
+    return {
+        "box_id": context.box_id,
+        "profile": asdict(context.profile),
+        "dry_run": False,
+        "droplet_id": context.box.droplet_id,
+        "droplet_ip": context.box.droplet_ip,
+        "tailscale_hostname": context.ts_hostname,
+        "tailscale_ip": context.box.tailscale_ip,
+        "ssh": f"ssh {context.profile.ssh_user}@{context.ts_hostname}",
+        "steps": context.steps,
+        "next_actions": [f"box ssh {context.box_id}", f"box status {context.box_id}"],
+    }
+
+
 def cmd_up(
     box_id: str,
     *,
@@ -446,17 +689,6 @@ def cmd_up(
     fmt: str,
 ) -> int:
     is_json = fmt == "json"
-    steps: list[dict[str, Any]] = []
-
-    def step(name: str, status: str, detail: Any = None) -> dict[str, Any]:
-        entry: dict[str, Any] = {"step": name, "status": status}
-        if detail is not None:
-            entry["detail"] = detail
-        steps.append(entry)
-        if not is_json:
-            marker = "ok" if status == "ok" else ("skip" if status == "skip" else "FAIL")
-            print(f"[{marker}] {name}" + (f"  {detail}" if detail and isinstance(detail, str) else ""))
-        return entry
 
     try:
         profile = load_profile(profile_name)
@@ -480,216 +712,85 @@ def cmd_up(
     do_token = require_env("SKILLBOX_DO_TOKEN")
     ssh_key_id = require_env("SKILLBOX_DO_SSH_KEY_ID")
     ts_authkey = require_env("SKILLBOX_TS_AUTHKEY")
-
     os.environ["DIGITALOCEAN_ACCESS_TOKEN"] = do_token
-
-    ts_hostname = f"{profile.tailscale_hostname_prefix}-{box_id}"
-    now = datetime.now(timezone.utc).isoformat()
-
-    box = Box(
-        id=box_id,
-        profile=profile_name,
-        state="creating",
-        ssh_user=profile.ssh_user,
-        tailscale_hostname=ts_hostname,
-        created_at=now,
-        updated_at=now,
-        region=profile.region,
-        size=profile.size,
+    context = _build_box_up_context(
+        box_id=box_id,
+        profile_name=profile_name,
+        profile=profile,
+        boxes=boxes,
+        is_json=is_json,
     )
 
     if dry_run:
-        step("create", "skip", f"would create {profile.size} in {profile.region}")
-        step("bootstrap", "skip", "dry-run")
-        step("enroll", "skip", f"would enroll as {ts_hostname}")
-        step("deploy", "skip", "dry-run")
-        step("onboard", "skip", "dry-run")
-        step("verify", "skip", "dry-run")
-        payload: dict[str, Any] = {
-            "box_id": box_id,
-            "profile": asdict(profile),
-            "dry_run": True,
-            "steps": steps,
-            "next_actions": [f"box up {box_id} --profile {profile_name}"],
-        }
+        payload = _box_up_dry_run_payload(context)
         if is_json:
             emit_json(payload)
         return EXIT_OK
 
-    # Remove old entry if destroyed
-    boxes = [b for b in boxes if b.id != box_id]
+    context.boxes = [candidate for candidate in boxes if candidate.id != box_id]
 
-    # -- 1. Create droplet -----------------------------------------------------
-    droplet_name = f"skillbox-{box_id}"
-    try:
-        if not is_json:
-            print(f"[...] create  Creating {profile.size} droplet in {profile.region}...")
-        droplet = do_create_droplet(
-            droplet_name,
-            region=profile.region,
-            size=profile.size,
-            image=profile.image,
-            ssh_key_id=ssh_key_id,
-        )
-        ip = do_droplet_public_ip(droplet)
-        if not ip:
-            raise RuntimeError("Droplet created but no public IP assigned")
-        update_box(box, droplet_id=str(droplet["id"]), droplet_ip=ip, state="bootstrapping")
-        boxes.append(box)
-        save_inventory(boxes)
-        step("create", "ok", f"droplet {droplet['id']} at {ip}")
-    except Exception as exc:
-        step("create", "fail", str(exc))
-        payload = {"box_id": box_id, "dry_run": False, "steps": steps}
-        payload.update(structured_error(str(exc), error_type="droplet_create_failed"))
-        if is_json:
-            emit_json(payload)
+    if not _run_box_up_stage(
+        context,
+        stage_name="create",
+        error_type="droplet_create_failed",
+        action=lambda: _create_box_droplet(context, ssh_key_id=ssh_key_id),
+    ):
         return EXIT_ERROR
 
-    # -- 2. Bootstrap host ------------------------------------------------------
-    try:
-        if not is_json:
-            print(f"[...] bootstrap  Waiting for SSH on {ip}...")
-        if not wait_for_ssh(ip, user="root"):
-            raise RuntimeError(f"SSH not reachable at root@{ip} after 120s")
-
-        if not is_json:
-            print(f"[...] bootstrap  Running 01-bootstrap-do.sh...")
-        result = ssh_script("root", ip, BOOTSTRAP_SCRIPT, {"APP_USER": profile.ssh_user}, timeout=600)
-        if result.returncode != 0:
-            raise RuntimeError(f"Bootstrap failed (exit {result.returncode}): {result.stderr[-500:]}")
-
-        update_box(box, state="enrolling")
-        save_inventory(boxes)
-        step("bootstrap", "ok", "OS packages + Docker + user created")
-    except Exception as exc:
-        step("bootstrap", "fail", str(exc))
-        update_box(box, state="bootstrapping")
-        save_inventory(boxes)
-        payload = {"box_id": box_id, "dry_run": False, "steps": steps}
-        payload.update(structured_error(str(exc), error_type="bootstrap_failed", next_actions=[f"box down {box_id}"]))
-        if is_json:
-            emit_json(payload)
+    if not _run_box_up_stage(
+        context,
+        stage_name="bootstrap",
+        error_type="bootstrap_failed",
+        action=lambda: _bootstrap_box_host(context),
+        failure_state="bootstrapping",
+        next_actions=[f"box down {box_id}"],
+    ):
         return EXIT_ERROR
 
-    # -- 3. Enroll in Tailscale -------------------------------------------------
-    try:
-        if not is_json:
-            print(f"[...] enroll  Joining tailnet as {ts_hostname}...")
-        result = ssh_script(
-            "root", ip, TAILSCALE_SCRIPT,
-            {
-                "TAILSCALE_AUTHKEY": ts_authkey,
-                "TAILSCALE_HOSTNAME": ts_hostname,
-                "SSH_LOGIN_USER": profile.ssh_user,
-            },
-            timeout=300,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"Tailscale enrollment failed (exit {result.returncode}): {result.stderr[-500:]}")
-
-        # Get the Tailscale IP
-        ts_ip_result = ssh_cmd("root", ip, "tailscale ip -4", timeout=15)
-        ts_ip = ts_ip_result.stdout.strip().split("\n")[0] if ts_ip_result.returncode == 0 else None
-
-        update_box(box, tailscale_ip=ts_ip, state="deploying")
-        save_inventory(boxes)
-        step("enroll", "ok", f"tailscale {ts_hostname} at {ts_ip or 'unknown'}")
-    except Exception as exc:
-        step("enroll", "fail", str(exc))
-        update_box(box, state="enrolling")
-        save_inventory(boxes)
-        payload = {"box_id": box_id, "dry_run": False, "steps": steps}
-        payload.update(structured_error(str(exc), error_type="tailscale_failed", next_actions=[f"box down {box_id}"]))
-        if is_json:
-            emit_json(payload)
+    if not _run_box_up_stage(
+        context,
+        stage_name="enroll",
+        error_type="tailscale_failed",
+        action=lambda: _enroll_box_tailscale(context, ts_authkey=ts_authkey),
+        failure_state="enrolling",
+        next_actions=[f"box down {box_id}"],
+    ):
         return EXIT_ERROR
 
-    # -- 4. Deploy skillbox -----------------------------------------------------
-    ssh_target = ts_hostname  # Use Tailscale hostname from now on
-    try:
-        if not is_json:
-            print(f"[...] deploy  Cloning skillbox and starting container via {ssh_target}...")
-
-        # Wait for Tailscale SSH to work
-        if not wait_for_ssh(ssh_target, user=profile.ssh_user, max_wait=60, interval=5):
-            # Fallback to public IP
-            ssh_target = ip
-            if not wait_for_ssh(ssh_target, user=profile.ssh_user, max_wait=30):
-                raise RuntimeError(f"Cannot reach {profile.ssh_user}@{ts_hostname} or {ip} via SSH")
-
-        deploy_cmds = build_deploy_command(profile)
-        result = ssh_cmd(profile.ssh_user, ssh_target, deploy_cmds, timeout=600)
-        if result.returncode != 0:
-            raise RuntimeError(f"Deploy failed (exit {result.returncode}): {result.stderr[-500:]}")
-
-        update_box(box, state="onboarding")
-        save_inventory(boxes)
-        step("deploy", "ok", "container running")
-    except Exception as exc:
-        step("deploy", "fail", str(exc))
-        update_box(box, state="deploying")
-        save_inventory(boxes)
-        payload = {"box_id": box_id, "dry_run": False, "steps": steps}
-        payload.update(structured_error(str(exc), error_type="deploy_failed", next_actions=[f"box down {box_id}"]))
-        if is_json:
-            emit_json(payload)
+    if not _run_box_up_stage(
+        context,
+        stage_name="deploy",
+        error_type="deploy_failed",
+        action=lambda: _deploy_box_runtime(context),
+        failure_state="deploying",
+        next_actions=[f"box down {box_id}"],
+    ):
         return EXIT_ERROR
 
-    # -- 5. Onboard client ------------------------------------------------------
-    try:
-        if not is_json:
-            print(f"[...] onboard  Running onboard for client {box_id}...")
-
-        exec_cmd = build_onboard_command(box_id, blueprint, set_args)
-        result = ssh_cmd(profile.ssh_user, ssh_target, exec_cmd, timeout=300)
-        if result.returncode not in (0, 2):  # 0=ok, 2=drift (acceptable on fresh box)
-            raise RuntimeError(f"Onboard failed (exit {result.returncode}): {result.stderr[-500:]}")
-
-        step("onboard", "ok")
-    except Exception as exc:
-        step("onboard", "fail", str(exc))
-        # Still mark as ready-ish — the box exists, just onboard didn't complete
-        update_box(box, state="ready")
-        save_inventory(boxes)
-        payload = {"box_id": box_id, "dry_run": False, "steps": steps}
-        payload.update(structured_error(str(exc), error_type="onboard_failed",
-                       next_actions=[f"box ssh {box_id}", f"box status {box_id}"]))
-        if is_json:
-            emit_json(payload)
+    if not _run_box_up_stage(
+        context,
+        stage_name="onboard",
+        error_type="onboard_failed",
+        action=lambda: _run_box_onboard(context, blueprint=blueprint, set_args=set_args),
+        failure_state="ready",
+        next_actions=[f"box ssh {box_id}", f"box status {box_id}"],
+    ):
         return EXIT_ERROR
-
-    # -- 6. Verify --------------------------------------------------------------
     try:
-        verify_cmd = "cd ~/skillbox && docker compose exec -T workspace python3 .env-manager/manage.py doctor --format json"
-        result = ssh_cmd(profile.ssh_user, ssh_target, verify_cmd, timeout=60)
-        doctor_ok = result.returncode == 0
-        step("verify", "ok" if doctor_ok else "warn")
+        _verify_box_runtime(context)
     except Exception:
-        step("verify", "warn")
+        _record_box_up_step(context, "verify", "warn")
 
-    update_box(box, state="ready")
-    save_inventory(boxes)
-
-    payload = {
-        "box_id": box_id,
-        "profile": asdict(profile),
-        "dry_run": False,
-        "droplet_id": box.droplet_id,
-        "droplet_ip": box.droplet_ip,
-        "tailscale_hostname": ts_hostname,
-        "tailscale_ip": box.tailscale_ip,
-        "ssh": f"ssh {profile.ssh_user}@{ts_hostname}",
-        "steps": steps,
-        "next_actions": [f"box ssh {box_id}", f"box status {box_id}"],
-    }
+    update_box(context.box, state="ready")
+    save_inventory(context.boxes)
+    payload = _box_up_success_payload(context)
     if is_json:
         emit_json(payload)
     else:
         print()
         print(f"Box {box_id} is ready.")
-        print(f"  SSH: ssh {profile.ssh_user}@{ts_hostname}")
-        print(f"  IP:  {box.droplet_ip} (public) / {box.tailscale_ip or 'pending'} (tailscale)")
+        print(f"  SSH: ssh {context.profile.ssh_user}@{context.ts_hostname}")
+        print(f"  IP:  {context.box.droplet_ip} (public) / {context.box.tailscale_ip or 'pending'} (tailscale)")
     return EXIT_OK
 
 

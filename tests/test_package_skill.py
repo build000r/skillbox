@@ -7,6 +7,7 @@ import unittest
 import zipfile
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPTS_DIR = (Path(__file__).resolve().parent.parent / "scripts").resolve()
@@ -88,6 +89,76 @@ class PackageSkillTests(unittest.TestCase):
 
             self.assertTrue(valid)
             self.assertEqual(message, "Skill is valid!")
+
+    def test_validate_skill_reports_frontmatter_and_body_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            skill_dir = Path(tmpdir) / "sample-skill"
+            skill_dir.mkdir(parents=True, exist_ok=True)
+
+            valid, message = VALIDATE_MODULE.validate_skill(skill_dir)
+            self.assertFalse(valid)
+            self.assertEqual(message, "SKILL.md not found")
+
+            skill_md = skill_dir / "SKILL.md"
+            skill_md.write_text("# No frontmatter\n", encoding="utf-8")
+            valid, message = VALIDATE_MODULE.validate_skill(skill_dir)
+            self.assertFalse(valid)
+            self.assertEqual(message, "No YAML frontmatter found")
+
+            skill_md.write_text("---\nname: bad\nextra: nope\n---\n", encoding="utf-8")
+            valid, message = VALIDATE_MODULE.validate_skill(skill_dir)
+            self.assertFalse(valid)
+            self.assertIn("Unexpected key(s)", message)
+
+            skill_md.write_text(
+                "---\n"
+                "name: sample-skill\n"
+                "description: Package a sample skill for tests and use when validating gitignored bundle safety.\n"
+                "---\n\n"
+                "[TODO: finish]\n",
+                encoding="utf-8",
+            )
+            valid, message = VALIDATE_MODULE.validate_skill(skill_dir)
+            self.assertFalse(valid)
+            self.assertIn("Incomplete skill", message)
+
+    def test_validate_skill_strict_mode_fails_on_warnings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            skill_dir = Path(tmpdir) / "sample-skill"
+            self._write_skill(skill_dir)
+            (skill_dir / "assets").mkdir(parents=True, exist_ok=True)
+            (skill_dir / "assets" / ".keep").write_text("", encoding="utf-8")
+
+            valid, message = VALIDATE_MODULE.validate_skill(skill_dir, strict=True)
+
+            self.assertFalse(valid)
+            self.assertIn("Strict mode failed", message)
+
+    def test_package_and_validate_main_cover_usage_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            skill_dir = Path(tmpdir) / "sample-skill"
+            output_dir = Path(tmpdir) / "dist"
+            self._write_skill(skill_dir)
+
+            with mock.patch.object(sys, "argv", ["package_skill.py"]):
+                self.assertEqual(PACKAGE_MODULE.main(), 1)
+
+            with mock.patch.object(
+                sys,
+                "argv",
+                ["package_skill.py", str(skill_dir), str(output_dir)],
+            ):
+                self.assertEqual(PACKAGE_MODULE.main(), 0)
+
+            with mock.patch.object(sys, "argv", ["quick_validate.py"]):
+                self.assertEqual(VALIDATE_MODULE.main(), 1)
+
+            with mock.patch.object(
+                sys,
+                "argv",
+                ["quick_validate.py", str(skill_dir), "--strict"],
+            ):
+                self.assertEqual(VALIDATE_MODULE.main(), 0)
 
     def _init_git_repo(self, repo: Path) -> None:
         subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
