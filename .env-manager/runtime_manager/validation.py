@@ -1,0 +1,1117 @@
+from __future__ import annotations
+
+from .shared import *
+
+def normalize_active_profiles(raw_profiles: list[str] | None) -> set[str]:
+    active_profiles = {value.strip() for value in raw_profiles or [] if value and value.strip()}
+    active_profiles.add("core")
+    return active_profiles
+
+
+def normalize_active_clients(model: dict[str, Any], raw_clients: list[str] | None) -> set[str]:
+    requested_clients = {value.strip() for value in raw_clients or [] if value and value.strip()}
+    available_clients = {
+        str(client.get("id", "")).strip()
+        for client in model.get("clients") or []
+        if str(client.get("id", "")).strip()
+    }
+    default_client = str((model.get("selection") or {}).get("default_client") or "").strip()
+    if not requested_clients and default_client:
+        requested_clients.add(default_client)
+
+    unknown_clients = sorted(requested_clients - available_clients)
+    if unknown_clients:
+        raise RuntimeError(
+            "Unknown runtime client(s): "
+            + ", ".join(unknown_clients)
+            + ". Available clients: "
+            + (", ".join(sorted(available_clients)) or "(none)")
+        )
+
+    return requested_clients
+
+
+def item_matches_profiles(item: dict[str, Any], active_profiles: set[str]) -> bool:
+    item_profiles = {
+        str(value).strip()
+        for value in item.get("profiles") or []
+        if str(value).strip()
+    }
+    if not item_profiles:
+        return True
+    return not item_profiles.isdisjoint(active_profiles)
+
+
+def item_matches_clients(item: dict[str, Any], active_clients: set[str]) -> bool:
+    item_client = str(item.get("client", "")).strip()
+    if not item_client:
+        return True
+    return item_client in active_clients
+
+
+def filter_model(model: dict[str, Any], active_profiles: set[str], active_clients: set[str]) -> dict[str, Any]:
+    if not active_profiles and not active_clients:
+        return model
+
+    filtered_model = dict(model)
+    filtered_model["active_profiles"] = sorted(active_profiles)
+    filtered_model["active_clients"] = sorted(active_clients)
+    filtered_model["clients"] = [
+        copy.deepcopy(client)
+        for client in model["clients"]
+        if not active_clients or str(client.get("id", "")).strip() in active_clients
+    ]
+    filtered_model["repos"] = [
+        copy.deepcopy(repo)
+        for repo in model["repos"]
+        if item_matches_profiles(repo, active_profiles) and item_matches_clients(repo, active_clients)
+    ]
+    filtered_model["artifacts"] = [
+        copy.deepcopy(artifact)
+        for artifact in model["artifacts"]
+        if item_matches_profiles(artifact, active_profiles) and item_matches_clients(artifact, active_clients)
+    ]
+    filtered_model["env_files"] = [
+        copy.deepcopy(env_file)
+        for env_file in model["env_files"]
+        if item_matches_profiles(env_file, active_profiles) and item_matches_clients(env_file, active_clients)
+    ]
+    filtered_model["skills"] = [
+        copy.deepcopy(skillset)
+        for skillset in model["skills"]
+        if item_matches_profiles(skillset, active_profiles) and item_matches_clients(skillset, active_clients)
+    ]
+    filtered_model["tasks"] = [
+        copy.deepcopy(task)
+        for task in model["tasks"]
+        if item_matches_profiles(task, active_profiles) and item_matches_clients(task, active_clients)
+    ]
+    filtered_model["services"] = [
+        copy.deepcopy(service)
+        for service in model["services"]
+        if item_matches_profiles(service, active_profiles) and item_matches_clients(service, active_clients)
+    ]
+    filtered_model["logs"] = [
+        copy.deepcopy(log_item)
+        for log_item in model["logs"]
+        if item_matches_profiles(log_item, active_profiles) and item_matches_clients(log_item, active_clients)
+    ]
+    filtered_model["checks"] = [
+        copy.deepcopy(check)
+        for check in model["checks"]
+        if item_matches_profiles(check, active_profiles) and item_matches_clients(check, active_clients)
+    ]
+
+    included_repo_ids = {repo["id"] for repo in filtered_model["repos"]}
+    included_artifact_ids = {artifact["id"] for artifact in filtered_model["artifacts"]}
+    included_task_ids = {task["id"] for task in filtered_model["tasks"]}
+    included_log_ids = {log_item["id"] for log_item in filtered_model["logs"]}
+
+    tasks_by_id = {
+        str(task["id"]): task
+        for task in model["tasks"]
+        if str(task.get("id", "")).strip()
+    }
+
+    def raw_task_dependency_ids(task: dict[str, Any]) -> list[str]:
+        raw_dependencies = task.get("depends_on") or []
+        if not isinstance(raw_dependencies, list):
+            return []
+
+        dependency_ids: list[str] = []
+        seen_dependency_ids: set[str] = set()
+        for raw_dependency in raw_dependencies:
+            dependency_id = str(raw_dependency).strip()
+            if not dependency_id or dependency_id in seen_dependency_ids:
+                continue
+            dependency_ids.append(dependency_id)
+            seen_dependency_ids.add(dependency_id)
+        return dependency_ids
+
+    def raw_service_bootstrap_task_ids(service: dict[str, Any]) -> list[str]:
+        raw_tasks = service.get("bootstrap_tasks") or []
+        if not isinstance(raw_tasks, list):
+            return []
+
+        task_ids: list[str] = []
+        seen_task_ids: set[str] = set()
+        for raw_task in raw_tasks:
+            task_id = str(raw_task).strip()
+            if not task_id or task_id in seen_task_ids:
+                continue
+            task_ids.append(task_id)
+            seen_task_ids.add(task_id)
+        return task_ids
+
+    def include_task(task_id: str) -> None:
+        task = tasks_by_id.get(task_id)
+        if task is None:
+            return
+        for dependency_id in raw_task_dependency_ids(task):
+            include_task(dependency_id)
+        if task_id in included_task_ids:
+            return
+        filtered_model["tasks"].append(copy.deepcopy(task))
+        included_task_ids.add(task_id)
+
+    for service in filtered_model["services"]:
+        for task_id in raw_service_bootstrap_task_ids(service):
+            include_task(task_id)
+
+    for task in list(filtered_model["tasks"]):
+        for dependency_id in raw_task_dependency_ids(task):
+            include_task(dependency_id)
+
+    required_repo_ids = {
+        str(service["repo"])
+        for service in filtered_model["services"]
+        if service.get("repo")
+    } | {
+        str(task["repo"])
+        for task in filtered_model["tasks"]
+        if task.get("repo")
+    }
+    required_artifact_ids = {
+        str(service["artifact"])
+        for service in filtered_model["services"]
+        if service.get("artifact")
+    }
+    required_log_ids = {
+        str(service["log"])
+        for service in filtered_model["services"]
+        if service.get("log")
+    } | {
+        str(task["log"])
+        for task in filtered_model["tasks"]
+        if task.get("log")
+    }
+
+    for repo in model["repos"]:
+        repo_id = str(repo.get("id", "")).strip()
+        if repo_id and repo_id in required_repo_ids and repo_id not in included_repo_ids:
+            filtered_model["repos"].append(copy.deepcopy(repo))
+            included_repo_ids.add(repo_id)
+
+    for artifact in model["artifacts"]:
+        artifact_id = str(artifact.get("id", "")).strip()
+        if artifact_id and artifact_id in required_artifact_ids and artifact_id not in included_artifact_ids:
+            filtered_model["artifacts"].append(copy.deepcopy(artifact))
+            included_artifact_ids.add(artifact_id)
+
+    for log_item in model["logs"]:
+        log_id = str(log_item.get("id", "")).strip()
+        if log_id and log_id in required_log_ids and log_id not in included_log_ids:
+            filtered_model["logs"].append(copy.deepcopy(log_item))
+            included_log_ids.add(log_id)
+
+    return filtered_model
+
+def lock_skill_map(lock_payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    skills = lock_payload.get("skills") or []
+    if not isinstance(skills, list):
+        raise RuntimeError("Lockfile field 'skills' must be a list")
+
+    mapping: dict[str, dict[str, Any]] = {}
+    for item in skills:
+        if not isinstance(item, dict):
+            raise RuntimeError("Lockfile skill entries must be objects")
+        name = str(item.get("name", "")).strip()
+        if not name:
+            raise RuntimeError("Lockfile skill entries must include a non-empty name")
+        if name in mapping:
+            raise RuntimeError(f"Lockfile contains duplicate skill entry {name!r}")
+
+        targets = item.get("targets") or []
+        if not isinstance(targets, list):
+            raise RuntimeError(f"Lockfile skill {name!r} has a non-list targets field")
+
+        targets_by_id: dict[str, dict[str, Any]] = {}
+        for target in targets:
+            if not isinstance(target, dict):
+                raise RuntimeError(f"Lockfile skill {name!r} contains a non-object target entry")
+            target_id = str(target.get("id", "")).strip()
+            if not target_id:
+                raise RuntimeError(f"Lockfile skill {name!r} contains a target without an id")
+            if target_id in targets_by_id:
+                raise RuntimeError(f"Lockfile skill {name!r} contains duplicate target {target_id!r}")
+            targets_by_id[target_id] = target
+
+        mapping[name] = item | {"targets_by_id": targets_by_id}
+
+    return mapping
+
+
+def collect_skill_inventory(skillset: dict[str, Any]) -> dict[str, Any]:
+    bundle_dir = Path(str(skillset["bundle_dir_host_path"]))
+    manifest_path = Path(str(skillset["manifest_host_path"]))
+    sources_config_path = Path(str(skillset["sources_config_host_path"]))
+    lock_path = Path(str(skillset["lock_path_host_path"]))
+
+    manifest_exists = manifest_path.is_file()
+    sources_exists = sources_config_path.is_file()
+    bundle_dir_exists = bundle_dir.is_dir()
+
+    expected_skills = read_manifest_skills(manifest_path) if manifest_exists else []
+    bundles: dict[str, dict[str, Any]] = {}
+    if bundle_dir_exists:
+        for bundle_path in sorted(bundle_dir.glob("*.skill")):
+            bundles[bundle_path.stem] = bundle_metadata(bundle_path, expected_skill_name=bundle_path.stem)
+
+    missing_bundles = sorted(name for name in expected_skills if name not in bundles)
+    extra_bundles = sorted(name for name in bundles if name not in expected_skills)
+
+    lock_payload: dict[str, Any] | None = None
+    lock_error: str | None = None
+    if lock_path.exists():
+        try:
+            lock_payload = load_json_file(lock_path)
+            lock_skill_map(lock_payload)
+        except RuntimeError as exc:
+            lock_error = str(exc)
+
+    lock_skills: dict[str, dict[str, Any]] = {}
+    if lock_payload and not lock_error:
+        lock_skills = lock_skill_map(lock_payload)
+
+    skill_names = list(expected_skills)
+    for extra_name in sorted(set(bundles) - set(skill_names)):
+        skill_names.append(extra_name)
+    for lock_name in sorted(set(lock_skills) - set(skill_names)):
+        skill_names.append(lock_name)
+
+    target_states: list[dict[str, Any]] = []
+    for target in skillset.get("install_targets") or []:
+        target_root = Path(str(target["host_path"]))
+        target_states.append(
+            {
+                "id": target["id"],
+                "path": str(target["path"]),
+                "host_path": str(target_root),
+                "present": target_root.exists(),
+            }
+        )
+
+    skills: list[dict[str, Any]] = []
+    for skill_name in skill_names:
+        bundle_record = bundles.get(skill_name)
+        lock_record = lock_skills.get(skill_name)
+        skill_entry = {
+            "name": skill_name,
+            "bundle_present": bundle_record is not None,
+            "bundle_state": "missing" if bundle_record is None else "present",
+            "bundle_sha256": bundle_record.get("bundle_sha256") if bundle_record else None,
+            "bundle_tree_sha256": bundle_record.get("bundle_tree_sha256") if bundle_record else None,
+            "targets": [],
+        }
+
+        if bundle_record and lock_record:
+            if (
+                lock_record.get("bundle_sha256") == bundle_record["bundle_sha256"]
+                and lock_record.get("bundle_tree_sha256") == bundle_record["bundle_tree_sha256"]
+            ):
+                skill_entry["bundle_state"] = "ok"
+            else:
+                skill_entry["bundle_state"] = "drift"
+        elif bundle_record and lock_payload:
+            skill_entry["bundle_state"] = "untracked"
+
+        for target in target_states:
+            install_dir = Path(target["host_path"]) / skill_name
+            install_tree_sha = directory_tree_sha256(install_dir)
+            target_lock = lock_record.get("targets_by_id", {}).get(target["id"]) if lock_record else None
+
+            target_state = "missing"
+            if install_dir.exists():
+                target_state = "present"
+            if target_lock:
+                if install_tree_sha is None:
+                    target_state = "missing"
+                elif target_lock.get("tree_sha256") == install_tree_sha:
+                    target_state = "ok"
+                else:
+                    target_state = "drift"
+            elif install_tree_sha is not None and lock_payload:
+                target_state = "untracked"
+
+            skill_entry["targets"].append(
+                {
+                    "id": target["id"],
+                    "path": str(target["path"]),
+                    "host_path": str(install_dir),
+                    "present": install_dir.exists(),
+                    "tree_sha256": install_tree_sha,
+                    "state": target_state,
+                }
+            )
+
+        skills.append(skill_entry)
+
+    return {
+        "id": skillset["id"],
+        "kind": skillset.get("kind", "packaged-skill-set"),
+        "bundle_dir": str(skillset["bundle_dir"]),
+        "bundle_dir_host_path": str(bundle_dir),
+        "bundle_dir_exists": bundle_dir_exists,
+        "manifest": str(skillset["manifest"]),
+        "manifest_host_path": str(manifest_path),
+        "manifest_exists": manifest_exists,
+        "manifest_sha256": file_sha256(manifest_path) if manifest_exists else None,
+        "sources_config": str(skillset["sources_config"]),
+        "sources_config_host_path": str(sources_config_path),
+        "sources_config_exists": sources_exists,
+        "sources_config_sha256": file_sha256(sources_config_path) if sources_exists else None,
+        "lock_path": str(skillset["lock_path"]),
+        "lock_path_host_path": str(lock_path),
+        "lock_present": lock_path.exists(),
+        "lock_payload": lock_payload,
+        "lock_error": lock_error,
+        "expected_skills": expected_skills,
+        "bundles": bundles,
+        "missing_bundles": missing_bundles,
+        "extra_bundles": extra_bundles,
+        "install_targets": target_states,
+        "skills": skills,
+    }
+
+
+def build_skill_lock(
+    skillset: dict[str, Any],
+    inventory: dict[str, Any],
+    install_hashes: dict[str, dict[str, str]],
+) -> dict[str, Any]:
+    skills_payload: list[dict[str, Any]] = []
+    for skill_name in inventory["expected_skills"]:
+        bundle_record = inventory["bundles"][skill_name]
+        target_payloads: list[dict[str, Any]] = []
+        for target in skillset.get("install_targets") or []:
+            install_dir = f"{str(target['path']).rstrip('/')}/{skill_name}"
+            target_payloads.append(
+                {
+                    "id": target["id"],
+                    "path": install_dir,
+                    "tree_sha256": install_hashes[skill_name][target["id"]],
+                }
+            )
+
+        skills_payload.append(
+            {
+                "name": skill_name,
+                "bundle_file": bundle_record["filename"],
+                "bundle_path": f"{str(skillset['bundle_dir']).rstrip('/')}/{bundle_record['filename']}",
+                "bundle_sha256": bundle_record["bundle_sha256"],
+                "bundle_tree_sha256": bundle_record["bundle_tree_sha256"],
+                "targets": target_payloads,
+            }
+        )
+
+    return {
+        "version": LOCKFILE_VERSION,
+        "id": skillset["id"],
+        "kind": skillset.get("kind", "packaged-skill-set"),
+        "bundle_dir": str(skillset["bundle_dir"]),
+        "manifest": str(skillset["manifest"]),
+        "manifest_sha256": inventory["manifest_sha256"],
+        "sources_config": str(skillset["sources_config"]),
+        "sources_config_sha256": inventory["sources_config_sha256"],
+        "skills": skills_payload,
+    }
+
+
+def sync_skill_sets(model: dict[str, Any], dry_run: bool) -> list[str]:
+    from .publish import extract_bundle_to_target
+
+    actions: list[str] = []
+
+    for skillset in model["skills"]:
+        inventory = collect_skill_inventory(skillset)
+        missing_inputs: list[str] = []
+        for field, present in (
+            ("bundle_dir", inventory["bundle_dir_exists"]),
+            ("manifest", inventory["manifest_exists"]),
+            ("sources_config", inventory["sources_config_exists"]),
+        ):
+            if not present:
+                missing_inputs.append(field)
+        if missing_inputs:
+            raise RuntimeError(
+                f"Skill set {skillset['id']} is missing required files: {', '.join(missing_inputs)}"
+            )
+        if inventory["missing_bundles"]:
+            raise RuntimeError(
+                f"Skill set {skillset['id']} is missing bundles for: {', '.join(inventory['missing_bundles'])}"
+            )
+
+        if inventory["extra_bundles"]:
+            actions.append(
+                f"ignore-extra-bundles: {skillset['id']} -> {', '.join(inventory['extra_bundles'])}"
+            )
+
+        for target in skillset.get("install_targets") or []:
+            target_root = Path(str(target["host_path"]))
+            ensure_directory(target_root, dry_run)
+            actions.append(f"ensure-directory: {target_root}")
+
+        install_hashes: dict[str, dict[str, str]] = {}
+        for skill_name in inventory["expected_skills"]:
+            install_hashes[skill_name] = {}
+            bundle_record = inventory["bundles"][skill_name]
+            bundle_path = Path(str(bundle_record["host_path"]))
+
+            for target in skillset.get("install_targets") or []:
+                target_root = Path(str(target["host_path"]))
+                install_dir = target_root / skill_name
+                if dry_run:
+                    actions.append(f"install-skill: {bundle_path} -> {install_dir}")
+                    continue
+
+                install_hashes[skill_name][target["id"]] = extract_bundle_to_target(
+                    bundle_path=bundle_path,
+                    target_root=target_root,
+                    skill_name=skill_name,
+                )
+                actions.append(f"install-skill: {bundle_path} -> {install_dir}")
+
+        lock_path = Path(str(skillset["lock_path_host_path"]))
+        if dry_run:
+            actions.append(f"write-lockfile: {lock_path}")
+            continue
+
+        lock_payload = build_skill_lock(skillset, inventory, install_hashes)
+        changed = write_json_file(lock_path, lock_payload)
+        actions.append(f"{'write-lockfile' if changed else 'lockfile-unchanged'}: {lock_path}")
+
+    return actions
+
+
+def validate_skill_locks_and_state(model: dict[str, Any]) -> list[CheckResult]:
+    if not model["skills"]:
+        return []
+
+    bundle_failures: list[str] = []
+    bundle_warnings: list[str] = []
+    lock_failures: list[str] = []
+    lock_warnings: list[str] = []
+    install_failures: list[str] = []
+    install_warnings: list[str] = []
+
+    for skillset in model["skills"]:
+        inventory = collect_skill_inventory(skillset)
+
+        required_missing: list[str] = []
+        for label, present, display_path in (
+            ("bundle_dir", inventory["bundle_dir_exists"], inventory["bundle_dir_host_path"]),
+            ("manifest", inventory["manifest_exists"], inventory["manifest_host_path"]),
+            ("sources_config", inventory["sources_config_exists"], inventory["sources_config_host_path"]),
+        ):
+            if not present:
+                required_missing.append(f"{skillset['id']}: missing {label} at {display_path}")
+
+        if required_missing:
+            bundle_failures.extend(required_missing)
+            continue
+
+        if inventory["missing_bundles"]:
+            bundle_failures.append(
+                f"{skillset['id']}: missing bundles for {', '.join(inventory['missing_bundles'])}"
+            )
+        if inventory["extra_bundles"]:
+            bundle_warnings.append(
+                f"{skillset['id']}: extra bundles present for {', '.join(inventory['extra_bundles'])}"
+            )
+
+        if inventory["lock_error"]:
+            lock_failures.append(f"{skillset['id']}: {inventory['lock_error']}")
+        elif not inventory["lock_present"]:
+            lock_warnings.append(
+                f"{skillset['id']}: lockfile missing at {inventory['lock_path_host_path']}"
+            )
+        else:
+            lock_payload = inventory["lock_payload"] or {}
+            if lock_payload.get("version") != LOCKFILE_VERSION:
+                lock_failures.append(
+                    f"{skillset['id']}: lockfile version {lock_payload.get('version')!r} does not match {LOCKFILE_VERSION}"
+                )
+            if lock_payload.get("id") != skillset["id"]:
+                lock_failures.append(f"{skillset['id']}: lockfile id does not match the skill set id")
+            if lock_payload.get("manifest_sha256") != inventory["manifest_sha256"]:
+                lock_failures.append(f"{skillset['id']}: lockfile manifest digest is stale")
+            if lock_payload.get("sources_config_sha256") != inventory["sources_config_sha256"]:
+                lock_failures.append(f"{skillset['id']}: lockfile sources config digest is stale")
+
+            indexed_lock = lock_skill_map(lock_payload)
+            expected_skill_names = set(inventory["expected_skills"])
+            if set(indexed_lock) - expected_skill_names:
+                extras = ", ".join(sorted(set(indexed_lock) - expected_skill_names))
+                lock_failures.append(f"{skillset['id']}: lockfile contains extra skills: {extras}")
+
+            for skill_name in inventory["expected_skills"]:
+                lock_record = indexed_lock.get(skill_name)
+                if lock_record is None:
+                    lock_failures.append(f"{skillset['id']}: lockfile is missing skill {skill_name}")
+                    continue
+
+                bundle_record = inventory["bundles"].get(skill_name)
+                if bundle_record is None:
+                    continue
+
+                if lock_record.get("bundle_sha256") != bundle_record["bundle_sha256"]:
+                    lock_failures.append(
+                        f"{skillset['id']}: lockfile bundle digest is stale for {skill_name}"
+                    )
+                if lock_record.get("bundle_tree_sha256") != bundle_record["bundle_tree_sha256"]:
+                    lock_failures.append(
+                        f"{skillset['id']}: lockfile bundle tree digest is stale for {skill_name}"
+                    )
+
+                lock_targets = lock_record.get("targets_by_id", {})
+                configured_targets = {target["id"] for target in skillset.get("install_targets") or []}
+                if set(lock_targets) - configured_targets:
+                    extras = ", ".join(sorted(set(lock_targets) - configured_targets))
+                    lock_failures.append(
+                        f"{skillset['id']}: lockfile contains unexpected targets for {skill_name}: {extras}"
+                    )
+
+                missing_targets = sorted(configured_targets - set(lock_targets))
+                if missing_targets:
+                    lock_failures.append(
+                        f"{skillset['id']}: lockfile is missing targets for {skill_name}: {', '.join(missing_targets)}"
+                    )
+
+        for skill_entry in inventory["skills"]:
+            bundle_state = skill_entry["bundle_state"]
+            if bundle_state == "drift":
+                install_failures.append(
+                    f"{skillset['id']}: bundle digest drift detected for {skill_entry['name']}"
+                )
+            elif bundle_state == "untracked" and inventory["lock_present"]:
+                install_failures.append(
+                    f"{skillset['id']}: bundle {skill_entry['name']} is not represented in the lockfile"
+                )
+
+            for target in skill_entry["targets"]:
+                if target["state"] == "drift":
+                    install_failures.append(
+                        f"{skillset['id']}: installed drift for {skill_entry['name']} in {target['id']}"
+                    )
+                elif target["state"] == "untracked":
+                    install_failures.append(
+                        f"{skillset['id']}: unmanaged install for {skill_entry['name']} in {target['id']}"
+                    )
+                elif target["state"] == "missing":
+                    install_warnings.append(
+                        f"{skillset['id']}: missing install for {skill_entry['name']} in {target['id']}"
+                    )
+
+    results: list[CheckResult] = []
+    if bundle_failures:
+        results.append(
+            CheckResult(
+                status="fail",
+                code="skill-bundle-state",
+                message="managed skill bundles do not satisfy the declared manifest",
+                details={"issues": bundle_failures},
+            )
+        )
+    elif bundle_warnings:
+        results.append(
+            CheckResult(
+                status="warn",
+                code="skill-bundle-state",
+                message="managed skill bundle directory contains undeclared bundles",
+                details={"issues": bundle_warnings},
+            )
+        )
+    else:
+        results.append(
+            CheckResult(
+                status="pass",
+                code="skill-bundle-state",
+                message="managed skill bundle directories satisfy the declared manifests",
+            )
+        )
+
+    if lock_failures:
+        results.append(
+            CheckResult(
+                status="fail",
+                code="skill-lock-state",
+                message="managed skill lockfiles are invalid or stale",
+                details={"issues": lock_failures},
+            )
+        )
+    elif lock_warnings:
+        results.append(
+            CheckResult(
+                status="warn",
+                code="skill-lock-state",
+                message="managed skill lockfiles have not been generated yet",
+                details={"issues": lock_warnings},
+            )
+        )
+    else:
+        results.append(
+            CheckResult(
+                status="pass",
+                code="skill-lock-state",
+                message="managed skill lockfiles match the current bundle and source manifests",
+            )
+        )
+
+    if install_failures:
+        results.append(
+            CheckResult(
+                status="fail",
+                code="skill-install-state",
+                message="installed skill directories drifted from the managed bundles",
+                details={"issues": install_failures},
+            )
+        )
+    elif install_warnings:
+        results.append(
+            CheckResult(
+                status="warn",
+                code="skill-install-state",
+                message="managed skill installs are missing and can be created by sync",
+                details={"issues": install_warnings},
+            )
+        )
+    else:
+        results.append(
+            CheckResult(
+                status="pass",
+                code="skill-install-state",
+                message="managed skill installs match the lockfile and bundle contents",
+            )
+        )
+
+    return results
+
+
+def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
+    issues: list[str] = []
+
+    client_ids = find_duplicates(model.get("clients") or [], "id")
+    if client_ids:
+        issues.append(f"clients contain duplicate ids: {', '.join(client_ids)}")
+    for client in model.get("clients") or []:
+        if not client.get("id"):
+            issues.append("every client entry must have an id")
+
+    declared_client_ids = {
+        str(client.get("id", "")).strip()
+        for client in model.get("clients") or []
+        if str(client.get("id", "")).strip()
+    }
+    default_client = str((model.get("selection") or {}).get("default_client") or "").strip()
+    if default_client and default_client not in declared_client_ids:
+        issues.append(f"selection.default_client references unknown client {default_client!r}")
+
+    for section in ("repos", "artifacts", "env_files", "skills", "tasks", "services", "logs", "checks"):
+        duplicates = find_duplicates(model[section], "id")
+        if duplicates:
+            issues.append(f"{section} contain duplicate ids: {', '.join(duplicates)}")
+
+    duplicate_repo_paths = find_duplicates(model["repos"], "path")
+    if duplicate_repo_paths:
+        issues.append(f"repos contain duplicate paths: {', '.join(duplicate_repo_paths)}")
+
+    duplicate_log_paths = find_duplicates(model["logs"], "path")
+    if duplicate_log_paths:
+        issues.append(f"logs contain duplicate paths: {', '.join(duplicate_log_paths)}")
+
+    duplicate_artifact_paths = find_duplicates(model["artifacts"], "path")
+    if duplicate_artifact_paths:
+        issues.append(f"artifacts contain duplicate paths: {', '.join(duplicate_artifact_paths)}")
+
+    duplicate_env_file_paths = find_duplicates(model["env_files"], "path")
+    if duplicate_env_file_paths:
+        issues.append(f"env_files contain duplicate paths: {', '.join(duplicate_env_file_paths)}")
+
+    repo_ids = {repo.get("id") for repo in model["repos"]}
+    artifact_ids = {artifact.get("id") for artifact in model["artifacts"]}
+    task_ids = {
+        str(task.get("id", "")).strip()
+        for task in model["tasks"]
+        if str(task.get("id", "")).strip()
+    }
+    log_ids = {log_item.get("id") for log_item in model["logs"]}
+
+    for repo in model["repos"]:
+        if not repo.get("id"):
+            issues.append("every repo entry must have an id")
+        if not repo.get("path"):
+            issues.append(f"repo {repo.get('id', '(missing id)')} is missing path")
+        if repo.get("client") and repo["client"] not in declared_client_ids:
+            issues.append(f"repo {repo.get('id')} references unknown client {repo['client']!r}")
+
+        source = repo.get("source") or {}
+        source_kind = source.get("kind", "manual")
+        if source_kind not in VALID_REPO_SOURCE_KINDS:
+            issues.append(f"repo {repo.get('id')} has unsupported source.kind {source_kind!r}")
+
+        sync = repo.get("sync") or {}
+        sync_mode = sync.get("mode") or (
+            "ensure-directory" if source_kind == "directory" else "external"
+        )
+        if sync_mode not in VALID_SYNC_MODES:
+            issues.append(f"repo {repo.get('id')} has unsupported sync.mode {sync_mode!r}")
+        if source_kind == "git" and not source.get("url"):
+            issues.append(f"repo {repo.get('id')} is git-backed but missing source.url")
+
+    for artifact in model["artifacts"]:
+        if not artifact.get("id"):
+            issues.append("every artifact entry must have an id")
+        if not artifact.get("path"):
+            issues.append(f"artifact {artifact.get('id', '(missing id)')} is missing path")
+        if artifact.get("client") and artifact["client"] not in declared_client_ids:
+            issues.append(f"artifact {artifact.get('id')} references unknown client {artifact['client']!r}")
+
+        source = artifact.get("source") or {}
+        source_kind = source.get("kind", "manual")
+        if source_kind not in VALID_ARTIFACT_SOURCE_KINDS:
+            issues.append(f"artifact {artifact.get('id')} has unsupported source.kind {source_kind!r}")
+
+        sync = artifact.get("sync") or {}
+        sync_mode = sync.get("mode") or (
+            "download-if-missing" if source_kind == "url" else "copy-if-missing" if source_kind == "file" else "manual"
+        )
+        if sync_mode not in VALID_ARTIFACT_SYNC_MODES:
+            issues.append(f"artifact {artifact.get('id')} has unsupported sync.mode {sync_mode!r}")
+        if source_kind == "url" and str(source.get("url") or "").strip():
+            try:
+                validate_url_download_source(source, artifact_id=str(artifact.get("id", "(missing id)")))
+            except RuntimeError as exc:
+                issues.append(str(exc))
+
+    for env_file in model["env_files"]:
+        if not env_file.get("id"):
+            issues.append("every env_files entry must have an id")
+        if not env_file.get("path"):
+            issues.append(f"env file {env_file.get('id', '(missing id)')} is missing path")
+        if env_file.get("client") and env_file["client"] not in declared_client_ids:
+            issues.append(f"env file {env_file.get('id')} references unknown client {env_file['client']!r}")
+        if env_file.get("repo") and env_file["repo"] not in repo_ids:
+            issues.append(f"env file {env_file.get('id')} references unknown repo {env_file['repo']!r}")
+
+        source = env_file.get("source") or {}
+        source_kind = source.get("kind", "manual")
+        if source_kind not in VALID_ENV_FILE_SOURCE_KINDS:
+            issues.append(f"env file {env_file.get('id')} has unsupported source.kind {source_kind!r}")
+
+        sync = env_file.get("sync") or {}
+        sync_mode = sync.get("mode") or ("write" if source_kind == "file" else "manual")
+        if sync_mode not in VALID_ENV_FILE_SYNC_MODES:
+            issues.append(f"env file {env_file.get('id')} has unsupported sync.mode {sync_mode!r}")
+        if source_kind == "file" and not source.get("path"):
+            issues.append(f"env file {env_file.get('id')} is file-backed but missing source.path")
+
+    for skillset in model["skills"]:
+        if not skillset.get("id"):
+            issues.append("every skills entry must have an id")
+        if skillset.get("client") and skillset["client"] not in declared_client_ids:
+            issues.append(f"skill set {skillset.get('id')} references unknown client {skillset['client']!r}")
+        for field in ("bundle_dir", "manifest", "sources_config", "lock_path"):
+            if not skillset.get(field):
+                issues.append(f"skill set {skillset.get('id', '(missing id)')} is missing {field}")
+
+        sync = skillset.get("sync") or {}
+        sync_mode = sync.get("mode") or "unpack-bundles"
+        if sync_mode not in VALID_SKILL_SYNC_MODES:
+            issues.append(f"skill set {skillset.get('id')} has unsupported sync.mode {sync_mode!r}")
+
+        targets = skillset.get("install_targets") or []
+        if not targets:
+            issues.append(f"skill set {skillset.get('id')} must declare at least one install target")
+            continue
+
+        target_ids = find_duplicates(targets, "id")
+        if target_ids:
+            issues.append(f"skill set {skillset.get('id')} contains duplicate target ids: {', '.join(target_ids)}")
+
+        for target in targets:
+            if not target.get("id"):
+                issues.append(f"skill set {skillset.get('id')} contains a target without an id")
+            if not target.get("path"):
+                issues.append(f"skill set {skillset.get('id')} target {target.get('id', '(missing id)')} is missing path")
+
+    task_dependency_map: dict[str, list[str]] = {}
+    for task in model["tasks"]:
+        task_id = str(task.get("id", "")).strip()
+        if not task.get("id"):
+            issues.append("every task entry must have an id")
+        if task.get("client") and task["client"] not in declared_client_ids:
+            issues.append(f"task {task.get('id')} references unknown client {task['client']!r}")
+        if task.get("repo") and task["repo"] not in repo_ids:
+            issues.append(f"task {task.get('id')} references unknown repo {task['repo']!r}")
+        if task.get("log") and task["log"] not in log_ids:
+            issues.append(f"task {task.get('id')} references unknown log {task['log']!r}")
+        if not str(task.get("command") or "").strip():
+            issues.append(f"task {task.get('id', '(missing id)')} is missing command")
+
+        for field_name in ("inputs", "outputs"):
+            raw_value = task.get(field_name) or []
+            if not isinstance(raw_value, list):
+                issues.append(f"task {task.get('id')} has non-list {field_name}")
+
+        raw_dependencies = task.get("depends_on") or []
+        if raw_dependencies and not isinstance(raw_dependencies, list):
+            issues.append(f"task {task.get('id')} has non-list depends_on")
+            raw_dependencies = []
+
+        dependency_ids: list[str] = []
+        seen_dependency_ids: set[str] = set()
+        for raw_dependency in raw_dependencies:
+            dependency_id = str(raw_dependency).strip()
+            if not dependency_id:
+                issues.append(f"task {task.get('id')} contains an empty depends_on entry")
+                continue
+            if dependency_id in seen_dependency_ids:
+                issues.append(f"task {task.get('id')} contains duplicate depends_on entry {dependency_id!r}")
+                continue
+            if dependency_id == task_id:
+                issues.append(f"task {task.get('id')} cannot depend on itself")
+                continue
+            if dependency_id not in task_ids:
+                issues.append(f"task {task.get('id')} references unknown dependency {dependency_id!r}")
+                continue
+            dependency_ids.append(dependency_id)
+            seen_dependency_ids.add(dependency_id)
+        if task_id:
+            task_dependency_map[task_id] = dependency_ids
+
+        success = task.get("success") or {}
+        success_type = success.get("type")
+        if not success_type:
+            issues.append(f"task {task.get('id', '(missing id)')} is missing success.type")
+        elif success_type not in VALID_TASK_SUCCESS_TYPES:
+            issues.append(f"task {task.get('id')} has unsupported success.type {success_type!r}")
+        if success_type == "path_exists" and not success.get("path"):
+            issues.append(f"task {task.get('id')} path_exists success is missing path")
+
+    service_ids = {
+        str(service.get("id", "")).strip()
+        for service in model["services"]
+        if str(service.get("id", "")).strip()
+    }
+    service_dependency_map: dict[str, list[str]] = {}
+
+    for service in model["services"]:
+        service_id = str(service.get("id", "")).strip()
+        if not service.get("id"):
+            issues.append("every service entry must have an id")
+        if service.get("client") and service["client"] not in declared_client_ids:
+            issues.append(f"service {service.get('id')} references unknown client {service['client']!r}")
+        if service.get("repo") and service["repo"] not in repo_ids:
+            issues.append(f"service {service.get('id')} references unknown repo {service['repo']!r}")
+        if service.get("artifact") and service["artifact"] not in artifact_ids:
+            issues.append(f"service {service.get('id')} references unknown artifact {service['artifact']!r}")
+        if service.get("log") and service["log"] not in log_ids:
+            issues.append(f"service {service.get('id')} references unknown log {service['log']!r}")
+        if not str(service.get("command") or "").strip():
+            issues.append(f"service {service.get('id', '(missing id)')} is missing command")
+
+        raw_dependencies = service.get("depends_on") or []
+        if raw_dependencies and not isinstance(raw_dependencies, list):
+            issues.append(f"service {service.get('id')} has non-list depends_on")
+            raw_dependencies = []
+
+        dependency_ids: list[str] = []
+        seen_dependency_ids: set[str] = set()
+        for raw_dependency in raw_dependencies:
+            dependency_id = str(raw_dependency).strip()
+            if not dependency_id:
+                issues.append(f"service {service.get('id')} contains an empty depends_on entry")
+                continue
+            if dependency_id in seen_dependency_ids:
+                issues.append(f"service {service.get('id')} contains duplicate depends_on entry {dependency_id!r}")
+                continue
+            if dependency_id == service_id:
+                issues.append(f"service {service.get('id')} cannot depend on itself")
+                continue
+            if dependency_id not in service_ids:
+                issues.append(f"service {service.get('id')} references unknown dependency {dependency_id!r}")
+                continue
+            dependency_ids.append(dependency_id)
+            seen_dependency_ids.add(dependency_id)
+        if service_id:
+            service_dependency_map[service_id] = dependency_ids
+
+        raw_bootstrap_tasks = service.get("bootstrap_tasks") or []
+        if raw_bootstrap_tasks and not isinstance(raw_bootstrap_tasks, list):
+            issues.append(f"service {service.get('id')} has non-list bootstrap_tasks")
+            raw_bootstrap_tasks = []
+
+        seen_bootstrap_tasks: set[str] = set()
+        for raw_task in raw_bootstrap_tasks:
+            task_id = str(raw_task).strip()
+            if not task_id:
+                issues.append(f"service {service.get('id')} contains an empty bootstrap_tasks entry")
+                continue
+            if task_id in seen_bootstrap_tasks:
+                issues.append(f"service {service.get('id')} contains duplicate bootstrap_tasks entry {task_id!r}")
+                continue
+            if task_id not in task_ids:
+                issues.append(f"service {service.get('id')} references unknown bootstrap task {task_id!r}")
+                continue
+            seen_bootstrap_tasks.add(task_id)
+
+        healthcheck = service.get("healthcheck") or {}
+        healthcheck_type = healthcheck.get("type")
+        if healthcheck_type:
+            if healthcheck_type not in VALID_HEALTHCHECK_TYPES:
+                issues.append(
+                    f"service {service.get('id')} has unsupported healthcheck.type {healthcheck_type!r}"
+                )
+            if healthcheck_type == "http" and not healthcheck.get("url"):
+                issues.append(f"service {service.get('id')} http healthcheck is missing url")
+            if healthcheck_type == "path_exists" and not healthcheck.get("path"):
+                issues.append(f"service {service.get('id')} path_exists healthcheck is missing path")
+            if healthcheck_type == "process_running" and not healthcheck.get("pattern"):
+                issues.append(f"service {service.get('id')} process_running healthcheck is missing pattern")
+
+    visiting: list[str] = []
+    visited: set[str] = set()
+
+    def visit_service_dependency(service_id: str) -> None:
+        if service_id in visited:
+            return
+        if service_id in visiting:
+            cycle_start = visiting.index(service_id)
+            cycle = visiting[cycle_start:] + [service_id]
+            issues.append("service dependency cycle detected: " + " -> ".join(cycle))
+            return
+
+        visiting.append(service_id)
+        for dependency_id in service_dependency_map.get(service_id, []):
+            visit_service_dependency(dependency_id)
+        visiting.pop()
+        visited.add(service_id)
+
+    for service_id in sorted(service_dependency_map):
+        visit_service_dependency(service_id)
+
+    task_visiting: list[str] = []
+    task_visited: set[str] = set()
+
+    def visit_task_dependency(task_id: str) -> None:
+        if task_id in task_visited:
+            return
+        if task_id in task_visiting:
+            cycle_start = task_visiting.index(task_id)
+            cycle = task_visiting[cycle_start:] + [task_id]
+            issues.append("task dependency cycle detected: " + " -> ".join(cycle))
+            return
+
+        task_visiting.append(task_id)
+        for dependency_id in task_dependency_map.get(task_id, []):
+            visit_task_dependency(dependency_id)
+        task_visiting.pop()
+        task_visited.add(task_id)
+
+    for task_id in sorted(task_dependency_map):
+        visit_task_dependency(task_id)
+
+    for log_item in model["logs"]:
+        if not log_item.get("id"):
+            issues.append("every log entry must have an id")
+        if not log_item.get("path"):
+            issues.append(f"log {log_item.get('id', '(missing id)')} is missing path")
+        if log_item.get("client") and log_item["client"] not in declared_client_ids:
+            issues.append(f"log {log_item.get('id')} references unknown client {log_item['client']!r}")
+
+    for check in model["checks"]:
+        check_type = check.get("type")
+        if check_type not in VALID_CHECK_TYPES:
+            issues.append(f"check {check.get('id')} has unsupported type {check_type!r}")
+        if check_type == "path_exists" and not check.get("path"):
+            issues.append(f"check {check.get('id')} is missing path")
+        if check.get("client") and check["client"] not in declared_client_ids:
+            issues.append(f"check {check.get('id')} references unknown client {check['client']!r}")
+
+    if issues:
+        return [
+            CheckResult(
+                status="fail",
+                code="runtime-manifest",
+                message="runtime manifest contains invalid definitions",
+                details={"issues": issues},
+            )
+        ]
+
+    return [
+        CheckResult(
+            status="pass",
+            code="runtime-manifest",
+            message="runtime manifest definitions are internally consistent",
+            details={
+                "repos": len(model["repos"]),
+                "artifacts": len(model["artifacts"]),
+                "env_files": len(model["env_files"]),
+                "skills": len(model["skills"]),
+                "tasks": len(model["tasks"]),
+                "services": len(model["services"]),
+                "logs": len(model["logs"]),
+                "checks": len(model["checks"]),
+            },
+        )
+    ]
+
+
+def validate_connector_contract(model: dict[str, Any]) -> list[CheckResult]:
+    superset = split_csv_values((model.get("env") or {}).get("SKILLBOX_FWC_CONNECTORS", ""))
+    superset_set = set(superset)
+    issues: list[str] = []
+    client_contracts: list[dict[str, Any]] = []
+
+    for client in model.get("clients") or []:
+        client_id = str(client.get("id", "")).strip()
+        source = str(client.get("_overlay_path") or "").strip()
+        entries, entry_issues = normalize_client_connector_entries(client.get("connectors"), client_id=client_id)
+        issues.extend(entry_issues)
+        if not entries:
+            continue
+
+        connector_ids = [str(entry.get("id", "")).strip() for entry in entries if str(entry.get("id", "")).strip()]
+        duplicate_ids = find_duplicates(entries, "id")
+        if duplicate_ids:
+            issues.append(f"client {client_id} declares duplicate connectors: {', '.join(duplicate_ids)}")
+
+        widened = sorted(set(connector_ids) - superset_set)
+        if widened:
+            location = f" in {source}" if source else ""
+            issues.append(
+                f"client {client_id}{location} declares connectors outside SKILLBOX_FWC_CONNECTORS: {', '.join(widened)}"
+            )
+
+        client_contracts.append(
+            {
+                "client_id": client_id,
+                "connectors": connector_ids,
+                "overlay_path": source,
+            }
+        )
+
+    if issues:
+        return [
+            CheckResult(
+                status="fail",
+                code="connector-contract",
+                message="client connector declarations violate the box-level connector contract",
+                details={
+                    "issues": issues,
+                    "box_superset": superset,
+                },
+            )
+        ]
+
+    return [
+        CheckResult(
+            status="pass",
+            code="connector-contract",
+            message="client connector declarations stay within the box-level connector superset",
+            details={
+                "box_superset": superset,
+                "clients": client_contracts,
+            },
+        )
+    ]
