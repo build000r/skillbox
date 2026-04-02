@@ -1,0 +1,11 @@
+{
+  "bundle_dir": "/workspace/default-skills/clients/personal",
+  "id": "personal-skills",
+  "kind": "packaged-skill-set",
+  "manifest": "/workspace/workspace/clients/personal/skills.manifest",
+  "manifest_sha256": "082020d88e080e9a5d2344525566ae0701f579ac21d675d0a5622d5ff48c8cb1",
+  "skills": [],
+  "sources_config": "/workspace/workspace/clients/personal/skills.sources.yaml",
+  "sources_config_sha256": "b9eea17af6cbae8aceb79b32b85190a04e4752c0b509b9fd936eec91410c1c39",
+  "version": 1
+}
