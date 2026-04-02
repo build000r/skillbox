@@ -469,37 +469,6 @@ def main() -> int:
     acceptance_parser.add_argument("--format", choices=("text", "json"), default="text")
     add_profile_arg(acceptance_parser)
 
-    ack_parser = subparsers.add_parser(
-        "ack",
-        help="Acknowledge journal events to remove them from active context.",
-    )
-    ack_parser.add_argument(
-        "--type", default=None, dest="event_type",
-        help="Ack events of this type (e.g. pulse.service_restarted).",
-    )
-    ack_parser.add_argument(
-        "--subject", default=None,
-        help="Ack events with this subject (e.g. a service or client ID).",
-    )
-    ack_parser.add_argument(
-        "--ts", type=float, default=None,
-        help="Ack a specific event by its exact timestamp.",
-    )
-    ack_parser.add_argument(
-        "--all", action="store_true", dest="ack_all",
-        help="Ack all unacked events.",
-    )
-    ack_parser.add_argument("--reason", default="", help="Why this was acknowledged.")
-    ack_parser.add_argument(
-        "--list", action="store_true", dest="list_acks",
-        help="List current acks instead of creating new ones.",
-    )
-    ack_parser.add_argument(
-        "--prune", action="store_true",
-        help="Remove expired acks from the store.",
-    )
-    ack_parser.add_argument("--format", choices=("text", "json"), default="text")
-
     args = parser.parse_args()
     root_dir = resolve_root_dir(args.root_dir)
 
@@ -880,54 +849,6 @@ def main() -> int:
                 for session in payload.get("sessions") or []:
                     label = session.get("label") or "-"
                     print(f"  - {session['session_id']}: {session.get('status', 'unknown')} {label}")
-        return EXIT_OK
-
-    if args.command == "ack":
-        if args.list_acks:
-            ack_data = read_acks(root_dir)
-            if args.format == "json":
-                emit_json({"acks": ack_data, "count": len(ack_data)})
-            else:
-                if not ack_data:
-                    print("No active acks.")
-                else:
-                    for key, entry in ack_data.items():
-                        age = time.time() - entry.get("at", 0)
-                        age_str = f"{int(age / 3600)}h ago" if age >= 3600 else f"{int(age / 60)}m ago"
-                        reason = entry.get("reason", "")
-                        reason_str = f" — {reason}" if reason else ""
-                        print(f"  ts={key} acked {age_str}{reason_str}")
-            return EXIT_OK
-
-        if args.prune:
-            pruned = prune_expired_acks(root_dir)
-            if args.format == "json":
-                emit_json({"pruned": pruned})
-            else:
-                print(f"Pruned {pruned} expired acks.")
-            return EXIT_OK
-
-        if not args.event_type and not args.subject and args.ts is None and not args.ack_all:
-            print("ack requires --type, --subject, --ts, or --all.", file=sys.stderr)
-            return EXIT_ERROR
-
-        acked_items = ack_events(
-            root_dir,
-            event_type=args.event_type,
-            subject=args.subject,
-            ts=args.ts,
-            ack_all=args.ack_all,
-            reason=args.reason,
-        )
-        if args.format == "json":
-            emit_json({"acked": acked_items, "count": len(acked_items), "next_actions": ["status --format json"]})
-        else:
-            if acked_items:
-                for item in acked_items:
-                    print(f"  acked: {item['type']} {item['subject']}")
-                print(f"\n{len(acked_items)} events acknowledged.")
-            else:
-                print("No matching events to ack.")
         return EXIT_OK
 
     model = build_runtime_model(root_dir)

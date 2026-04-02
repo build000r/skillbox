@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import datetime
 import hashlib
 import json
 import os
@@ -580,167 +581,28 @@ def human_bytes(num_bytes: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Event journal (append-only JSONL)
+# Runtime event log (plain-text, replaces structured JSONL journal)
 # ---------------------------------------------------------------------------
 
-JOURNAL_REL = Path("logs") / "runtime" / "journal.jsonl"
+RUNTIME_LOG_REL = Path("logs") / "runtime" / "runtime.log"
 
 
-def emit_event(
+def log_runtime_event(
     event_type: str,
     subject: str,
     detail: dict[str, Any] | None = None,
     root_dir: Path = DEFAULT_ROOT_DIR,
 ) -> None:
-    """Append a single structured event to the runtime journal."""
-    journal_path = root_dir / JOURNAL_REL
-    journal_path.parent.mkdir(parents=True, exist_ok=True)
-    entry = {
-        "ts": time.time(),
-        "type": event_type,
-        "subject": subject,
-        "detail": detail or {},
-    }
+    """Append a human-readable line to the runtime log. Best-effort."""
+    log_path = root_dir / RUNTIME_LOG_REL
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    detail_str = f" {json.dumps(detail, separators=(',', ':'), default=str)}" if detail else ""
     try:
-        with journal_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, separators=(",", ":"), default=str) + "\n")
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"{ts} {event_type} {subject}{detail_str}\n")
     except OSError:
-        pass  # Journal write is best-effort; never break a real operation.
-
-
-def query_journal(
-    root_dir: Path = DEFAULT_ROOT_DIR,
-    *,
-    since: float | None = None,
-    event_type: str | None = None,
-    subject: str | None = None,
-    limit: int = 50,
-) -> list[dict[str, Any]]:
-    """Read recent journal events, newest first, with optional filters."""
-    journal_path = root_dir / JOURNAL_REL
-    if not journal_path.is_file():
-        return []
-    events: list[dict[str, Any]] = []
-    for line in journal_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if since is not None and ev.get("ts", 0) < since:
-            continue
-        if event_type is not None and ev.get("type") != event_type:
-            continue
-        if subject is not None and ev.get("subject") != subject:
-            continue
-        events.append(ev)
-    events.reverse()
-    return events[:limit]
-
-
-# ---------------------------------------------------------------------------
-# Event acknowledgement
-# ---------------------------------------------------------------------------
-
-ACKS_REL = Path("logs") / "runtime" / "journal.acks.json"
-DEFAULT_ACK_EXPIRY_HOURS = 24
-
-
-def read_acks(root_dir: Path = DEFAULT_ROOT_DIR) -> dict[str, Any]:
-    """Read the ack store. Keys are stringified event timestamps."""
-    acks_path = root_dir / ACKS_REL
-    if not acks_path.is_file():
-        return {}
-    try:
-        return json.loads(acks_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def save_acks(acks: dict[str, Any], root_dir: Path = DEFAULT_ROOT_DIR) -> None:
-    """Write the ack store."""
-    acks_path = root_dir / ACKS_REL
-    acks_path.parent.mkdir(parents=True, exist_ok=True)
-    acks_path.write_text(json.dumps(acks, indent=2), encoding="utf-8")
-
-
-def is_acked(
-    acks: dict[str, Any],
-    event_ts: float,
-    expiry_hours: float = DEFAULT_ACK_EXPIRY_HOURS,
-) -> bool:
-    """Check whether a journal event has been acknowledged and the ack is still live."""
-    key = str(event_ts)
-    entry = acks.get(key)
-    if not entry:
-        return False
-    acked_at = entry.get("at", 0)
-    now = time.time()
-    if expiry_hours > 0 and (now - acked_at) > (expiry_hours * 3600):
-        return False
-    return True
-
-
-def ack_events(
-    root_dir: Path,
-    *,
-    event_type: str | None = None,
-    subject: str | None = None,
-    ts: float | None = None,
-    ack_all: bool = False,
-    reason: str = "",
-    since_hours: float = DEFAULT_ACK_EXPIRY_HOURS,
-) -> list[dict[str, Any]]:
-    """Acknowledge matching journal events. Returns list of newly acked items."""
-    since = time.time() - (since_hours * 3600) if not ack_all else None
-    events = query_journal(root_dir, since=since, limit=500)
-    acks = read_acks(root_dir)
-    now = time.time()
-    newly_acked: list[dict[str, Any]] = []
-
-    for ev in events:
-        ev_ts = ev.get("ts", 0)
-        key = str(ev_ts)
-        if key in acks:
-            continue
-        if ts is not None:
-            if ev_ts != ts:
-                continue
-        elif not ack_all:
-            if event_type and ev.get("type") != event_type:
-                continue
-            if subject and ev.get("subject") != subject:
-                continue
-
-        acks[key] = {"at": now, "reason": reason}
-        newly_acked.append({
-            "ts": ev_ts,
-            "type": ev.get("type"),
-            "subject": ev.get("subject"),
-        })
-
-    if newly_acked:
-        save_acks(acks, root_dir)
-
-    return newly_acked
-
-
-def prune_expired_acks(
-    root_dir: Path,
-    expiry_hours: float = DEFAULT_ACK_EXPIRY_HOURS,
-) -> int:
-    """Remove expired acks from the store. Returns count of pruned entries."""
-    acks = read_acks(root_dir)
-    now = time.time()
-    cutoff = now - (expiry_hours * 3600)
-    expired_keys = [k for k, v in acks.items() if v.get("at", 0) < cutoff]
-    for k in expired_keys:
-        del acks[k]
-    if expired_keys:
-        save_acks(acks, root_dir)
-    return len(expired_keys)
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -979,7 +841,7 @@ def _persist_session_event(
     write_json_file(paths["meta_path"], meta)
 
     journal_detail = {"client_id": client_id, "session_id": session_id} | (detail or {})
-    emit_event(normalized_type, _session_subject(client_id, session_id), journal_detail, root_dir)
+    log_runtime_event(normalized_type, _session_subject(client_id, session_id), journal_detail, root_dir)
     return payload
 
 

@@ -274,21 +274,6 @@ def generate_live_context_markdown(
             for err_line in errors[-3:]:
                 attention.append(f"  `{err_line.strip()[:120]}`")
 
-    # --- Recent Activity (from journal, excluding acked events) ---
-    acks = read_acks(root_dir)
-    recent = query_journal(root_dir, limit=20)
-    unacked = [ev for ev in recent if not is_acked(acks, ev["ts"])]
-    acked_count = len(recent) - len(unacked)
-    if unacked:
-        lines.append("## Recent Activity")
-        lines.append("")
-        for ev in unacked:
-            ts_str = time.strftime("%H:%M", time.localtime(ev["ts"]))
-            lines.append(f"- `{ts_str}` **{ev['type']}** {ev['subject']}")
-        if acked_count > 0:
-            lines.append(f"- _{acked_count} acknowledged events hidden_")
-        lines.append("")
-
     if attention:
         lines.append("## Attention")
         lines.append("")
@@ -343,7 +328,7 @@ def write_agent_context_files(
 
     if not dry_run and event_subject:
         detail = {"output_dir": repo_rel(root_dir, claude_path.parent)}
-        emit_event("context.generated", event_subject, detail, root_dir=root_dir)
+        log_runtime_event("context.generated", event_subject, detail, root_dir=root_dir)
 
     return actions
 
@@ -437,7 +422,7 @@ def generate_skill_context(
         actions.append(f"write-skill-context: {repo_rel(root_dir, out_path)}")
 
     if actions:
-        emit_event("skill-context.generated", "focus", root_dir=root_dir)
+        log_runtime_event("skill-context.generated", "focus", root_dir=root_dir)
     return actions
 
 

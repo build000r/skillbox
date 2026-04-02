@@ -637,7 +637,7 @@ def sync_runtime(model: dict[str, Any], dry_run: bool) -> list[str]:
     actions.extend(sync_skill_sets(model, dry_run=dry_run))
     actions.extend(sync_dcg_config(model, DEFAULT_ROOT_DIR, dry_run=dry_run))
     if not dry_run:
-        emit_event("sync.completed", "runtime", {"action_count": len(actions)})
+        log_runtime_event("sync.completed", "runtime", {"action_count": len(actions)})
     return actions
 
 
@@ -1298,7 +1298,7 @@ def run_tasks(
             results.append(result | {"result": "dry-run"})
             continue
 
-        emit_event("task.started", task["id"])
+        log_runtime_event("task.started", task["id"])
         with paths["log_file"].open("a", encoding="utf-8") as log_handle:
             completed = subprocess.run(
                 command,
@@ -1314,7 +1314,7 @@ def run_tasks(
 
         if completed.returncode != 0:
             tail = tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)
-            emit_event("task.failed", task["id"], {"exit_code": completed.returncode})
+            log_runtime_event("task.failed", task["id"], {"exit_code": completed.returncode})
             raise RuntimeError(
                 f"Task {task['id']} failed with exit code {completed.returncode}."
                 + (f" Recent logs: {' | '.join(tail)}" if tail else "")
@@ -1323,7 +1323,7 @@ def run_tasks(
         post_state = probe_task(model, task)
         if post_state["state"] != "ready":
             tail = tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)
-            emit_event("task.failed", task["id"], {"reason": "success_check_unsatisfied"})
+            log_runtime_event("task.failed", task["id"], {"reason": "success_check_unsatisfied"})
             raise RuntimeError(
                 f"Task {task['id']} completed but did not satisfy its success check."
                 + (f" Success target: {post_state['target']}." if post_state.get("target") else "")
@@ -1331,7 +1331,7 @@ def run_tasks(
             )
 
         results.append(result | {"result": "completed", "target": post_state.get("target")})
-        emit_event("task.completed", task["id"])
+        log_runtime_event("task.completed", task["id"])
     return results
 
 
@@ -1400,7 +1400,7 @@ def start_services(
                 detail["target"] = health_state["target"]
             if "pattern" in health_state:
                 detail["pattern"] = health_state["pattern"]
-            emit_event("service.start_failed", service["id"], {"state": health_state.get("state")})
+            log_runtime_event("service.start_failed", service["id"], {"state": health_state.get("state")})
             raise RuntimeError(
                 f"Service {service['id']} failed to become healthy."
                 + (f" Exit code: {health_state['exit_code']}." if "exit_code" in health_state else "")
@@ -1411,7 +1411,7 @@ def start_services(
             )
 
         results.append(result | {"result": "started", "pid": process.pid})
-        emit_event("service.started", service["id"], {"pid": process.pid})
+        log_runtime_event("service.started", service["id"], {"pid": process.pid})
     return results
 
 
@@ -1460,7 +1460,7 @@ def stop_services(
                 "signal": signal_used,
             }
         )
-        emit_event("service.stopped", service["id"], {"signal": signal_used})
+        log_runtime_event("service.stopped", service["id"], {"signal": signal_used})
     return results
 
 

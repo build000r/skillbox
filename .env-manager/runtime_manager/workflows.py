@@ -160,7 +160,7 @@ def run_onboard(
             else [f"status --client {cid} --format json"]
         ),
     }
-    emit_event("onboard.completed", cid, {
+    log_runtime_event("onboard.completed", cid, {
         "steps_ok": sum(1 for s in steps if s.get("status") == "ok"),
     }, root_dir)
     if is_json:
@@ -1188,7 +1188,7 @@ def run_focus(
         "next_actions": next_actions_for_focus(cid, has_fail, live.get("services") or []),
     }
 
-    emit_event("focus.activated", cid, payload.get("summary", {}), root_dir)
+    log_runtime_event("focus.activated", cid, payload.get("summary", {}), root_dir)
 
     if is_json:
         emit_json(payload)

@@ -6,8 +6,8 @@ Watches declared vs actual state on a fixed interval. When drift is detected:
 - Safe drift (crashed service, missing log dir) is auto-healed.
 - Risky drift (missing required repo, config change) emits an event for agents.
 
-Every state change is written to the runtime journal (logs/runtime/journal.jsonl)
-and queryable via the skillbox_journal / skillbox_pulse MCP tools.
+Every state change is logged to logs/runtime/runtime.log
+and queryable via the skillbox_pulse MCP tool.
 
 Designed to run as a managed service declared in runtime.yaml.
 Start: python3 .env-manager/pulse.py [--interval 30] [--root-dir /workspace]
@@ -38,7 +38,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 from lib.runtime_model import build_runtime_model, client_overlay_paths, load_runtime_env  # noqa: E402
 from manage import (  # noqa: E402
     DEFAULT_SERVICE_START_WAIT_SECONDS,
-    emit_event,
+    log_runtime_event,
     ensure_directory,
     filter_model,
     live_service_pid,
@@ -214,14 +214,14 @@ def _restart_service(
             except OSError:
                 pass
             remove_pid_file(paths["pid_file"])
-            emit_event("pulse.restart_failed", service_id, {
+            log_runtime_event("pulse.restart_failed", service_id, {
                 "reason": reason,
                 "health_state": health.get("state"),
             })
             log("warn", f"restart failed for {service_id}", state=health.get("state"))
             return False
 
-        emit_event("pulse.restarted", service_id, {
+        log_runtime_event("pulse.restarted", service_id, {
             "reason": reason,
             "pid": process.pid,
         })
@@ -229,7 +229,7 @@ def _restart_service(
         return True
 
     except Exception as exc:
-        emit_event("pulse.restart_failed", service_id, {
+        log_runtime_event("pulse.restart_failed", service_id, {
             "reason": reason,
             "error": str(exc),
         })
@@ -301,7 +301,7 @@ def reconcile_once(
     # -----------------------------------------------------------------------
     new_hash = _model_config_hash(root_dir)
     if state.config_hash and new_hash != state.config_hash:
-        emit_event("pulse.config_changed", "runtime", {
+        log_runtime_event("pulse.config_changed", "runtime", {
             "old_hash": state.config_hash,
             "new_hash": new_hash,
         })
@@ -311,7 +311,7 @@ def reconcile_once(
         if auto_sync:
             try:
                 actions = sync_runtime(model, dry_run=False)
-                emit_event("pulse.auto_sync", "runtime", {
+                log_runtime_event("pulse.auto_sync", "runtime", {
                     "action_count": len(actions),
                 })
                 state.events_emitted += 1
@@ -344,7 +344,7 @@ def reconcile_once(
             )
 
             event_type = "pulse.service_crashed" if is_crash else "pulse.service_state_changed"
-            emit_event(event_type, service_id, {
+            log_runtime_event(event_type, service_id, {
                 "from": previous_state,
                 "to": current_state,
             })
@@ -388,7 +388,7 @@ def reconcile_once(
 
         if ok != previous_ok:
             event_type = "pulse.check_recovered" if ok else "pulse.check_failed"
-            emit_event(event_type, check_id, {"ok": ok})
+            log_runtime_event(event_type, check_id, {"ok": ok})
             state.events_emitted += 1
             log(
                 "info" if ok else "warn",
@@ -456,7 +456,7 @@ def run_daemon(
     # Stash interval so reconcile_once can include it in state snapshots.
     reconcile_once._interval = interval  # type: ignore[attr-defined]
 
-    emit_event("pulse.started", "daemon", {
+    log_runtime_event("pulse.started", "daemon", {
         "pid": os.getpid(),
         "interval": interval,
         "auto_restart": auto_restart,
@@ -483,7 +483,7 @@ def run_daemon(
             while not _shutdown and time.monotonic() < deadline:
                 time.sleep(min(1.0, deadline - time.monotonic()))
     finally:
-        emit_event("pulse.stopped", "daemon", {
+        log_runtime_event("pulse.stopped", "daemon", {
             "pid": os.getpid(),
             "cycles": state.cycle_count,
             "heals": state.heals,
