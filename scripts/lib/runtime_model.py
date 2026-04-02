@@ -518,13 +518,13 @@ def _populate_env_file_defaults(model: dict[str, Any], root_dir: Path) -> None:
 
 def _populate_skill_defaults(model: dict[str, Any], root_dir: Path) -> None:
     for skill in model["skills"]:
-        skill.setdefault("kind", "packaged-skill-set")
+        skill.setdefault("kind", "skill-repo-set")
         skill.setdefault("required", False)
         skill.setdefault("profiles", [])
         skill.setdefault("client", "")
         skill.setdefault("sync", {})
         skill.setdefault("install_targets", [])
-        for field in ("bundle_dir", "manifest", "sources_config", "lock_path"):
+        for field in ("bundle_dir", "manifest", "sources_config", "lock_path", "skill_repos_config", "clone_root"):
             if skill.get(field):
                 skill[f"{field}_host_path"] = str(
                     runtime_path_to_host_path(root_dir, model["env"], str(skill[field]))

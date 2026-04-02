@@ -26,13 +26,20 @@ MANAGE_MODULE = SourceFileLoader(
 
 
 class RuntimeManagerTests(unittest.TestCase):
-    def test_default_skills_manifest_matches_hardened_v1_shared_pack(self) -> None:
-        manifest_skills = MANAGE_MODULE.read_manifest_skills(
-            ROOT_DIR / "workspace" / "default-skills.manifest",
+    def test_default_skill_repos_config_matches_hardened_shared_pack(self) -> None:
+        config = MANAGE_MODULE.load_skill_repos_config(
+            ROOT_DIR / "workspace" / "skill-repos.yaml",
         )
+        all_skills: list[str] = []
+        for entry in config["skill_repos"]:
+            pick = entry.get("pick")
+            if pick:
+                all_skills.extend(pick)
         self.assertEqual(
-            manifest_skills,
-            MANAGE_MODULE.HARDENED_SHARED_DEFAULT_SKILLS,
+            sorted(all_skills),
+            sorted(
+                MANAGE_MODULE.HARDENED_SHARED_DEFAULT_SKILLS + ["cass-memory"],
+            ),
         )
 
     def test_sync_creates_core_runtime_state_and_installs_default_skills(self) -> None:

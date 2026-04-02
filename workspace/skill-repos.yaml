@@ -1,0 +1,25 @@
+# Shared default skill repo declarations.
+#
+# Each entry is either a GitHub repo (cloned into workspace/skill-repos/)
+# or a local path (referenced directly). Skills are filtered-copied into
+# agent homes (~/.claude/skills/, ~/.codex/skills/) on sync.
+
+version: 2
+
+skill_repos:
+  # Public multi-skill repo — pick the curated default set
+  - repo: build000r/skills
+    ref: main
+    pick:
+      - ask-cascade
+      - build-vs-clone
+      - describe
+      - reproduce
+      - commit
+
+  # Local skills under active development
+  - path: ../skills
+    pick:
+      - cass-memory
+      - dev-sanity
+      - skillbox-operator

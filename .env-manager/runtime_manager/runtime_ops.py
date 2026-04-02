@@ -430,6 +430,7 @@ def doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
         results
         + connector_results
         + check_filesystem(model, root_dir)
+        + validate_skill_repo_sets(model)
         + validate_skill_locks_and_state(model)
         + validate_task_state(model)
     )
@@ -634,6 +635,7 @@ def sync_runtime(model: dict[str, Any], dry_run: bool) -> list[str]:
         ensure_directory(path, dry_run)
         actions.append(f"ensure-directory: {path}")
 
+    actions.extend(sync_skill_repo_sets(model, dry_run=dry_run))
     actions.extend(sync_skill_sets(model, dry_run=dry_run))
     actions.extend(sync_dcg_config(model, DEFAULT_ROOT_DIR, dry_run=dry_run))
     if not dry_run:
@@ -1667,6 +1669,73 @@ def collect_live_state(
     }
 
 
+def _collect_skill_repo_status(skillset: dict[str, Any]) -> dict[str, Any]:
+    """Build status payload for a skill-repo-set skillset."""
+    config_path = Path(str(skillset.get("skill_repos_config_host_path", "")))
+    lock_path = Path(str(skillset.get("lock_path_host_path", "")))
+
+    lock_present = lock_path.is_file()
+    lock_payload: dict[str, Any] | None = None
+    lock_error: str | None = None
+    if lock_present:
+        try:
+            lock_payload = load_json_file(lock_path)
+        except RuntimeError as exc:
+            lock_error = str(exc)
+
+    lock_skills_by_name: dict[str, dict[str, Any]] = {}
+    if lock_payload:
+        for entry in lock_payload.get("skills") or []:
+            name = str(entry.get("name", ""))
+            if name:
+                lock_skills_by_name[name] = entry
+
+    skills: list[dict[str, Any]] = []
+    for name, lock_record in sorted(lock_skills_by_name.items()):
+        skill_entry: dict[str, Any] = {
+            "name": name,
+            "repo": lock_record.get("repo"),
+            "source_path": lock_record.get("source_path"),
+            "declared_ref": lock_record.get("declared_ref"),
+            "resolved_commit": lock_record.get("resolved_commit"),
+            "targets": [],
+        }
+
+        for target in skillset.get("install_targets") or []:
+            install_dir = Path(str(target["host_path"])) / name
+            installed_sha = directory_tree_sha256(install_dir) if install_dir.is_dir() else None
+            lock_sha = lock_record.get("install_tree_sha")
+
+            if not install_dir.is_dir():
+                state = "SKILL_NOT_INSTALLED"
+            elif lock_sha and installed_sha == lock_sha:
+                state = "ok"
+            elif lock_sha:
+                state = "SKILL_INSTALL_STALE"
+            else:
+                state = "present"
+
+            skill_entry["targets"].append({
+                "id": target["id"],
+                "host_path": str(install_dir),
+                "present": install_dir.is_dir(),
+                "tree_sha256": installed_sha,
+                "state": state,
+            })
+
+        skills.append(skill_entry)
+
+    return {
+        "id": skillset["id"],
+        "kind": "skill-repo-set",
+        "skill_repos_config": str(skillset.get("skill_repos_config", "")),
+        "lock_path": str(skillset.get("lock_path", "")),
+        "lock_present": lock_present,
+        "lock_error": lock_error,
+        "skills": skills,
+    }
+
+
 def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
     repo_statuses: list[dict[str, Any]] = []
     for repo in model["repos"]:
@@ -1691,6 +1760,9 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
 
     skill_statuses: list[dict[str, Any]] = []
     for skillset in model["skills"]:
+        if skillset.get("kind") == "skill-repo-set":
+            skill_statuses.append(_collect_skill_repo_status(skillset))
+            continue
         inventory = collect_skill_inventory(skillset)
         skill_statuses.append(
             {

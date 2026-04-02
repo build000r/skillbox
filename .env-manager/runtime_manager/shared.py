@@ -56,11 +56,22 @@ VALID_ARTIFACT_SOURCE_KINDS = {"file", "manual", "url"}
 VALID_ARTIFACT_SYNC_MODES = {"copy-if-missing", "download-if-missing", "manual"}
 VALID_ENV_FILE_SOURCE_KINDS = {"file", "manual"}
 VALID_ENV_FILE_SYNC_MODES = {"write", "manual"}
-VALID_SKILL_SYNC_MODES = {"unpack-bundles"}
+VALID_SKILL_SYNC_MODES = {"clone-and-install", "unpack-bundles"}
 VALID_HEALTHCHECK_TYPES = {"http", "path_exists", "process_running"}
 VALID_CHECK_TYPES = {"path_exists"}
 VALID_TASK_SUCCESS_TYPES = {"path_exists"}
 LOCKFILE_VERSION = 1
+SKILL_REPOS_LOCKFILE_VERSION = 2
+SKILL_REPOS_CONFIG_VERSION = 2
+DEFAULT_SKILLIGNORE_PATTERNS = [
+    ".git/",
+    "__pycache__/",
+    "*.pyc",
+    ".DS_Store",
+    "modes/",
+    "briefs/",
+]
+CLONE_DIR_ROOT_REL = Path("workspace") / "skill-repos"
 CONTEXT_CLAUDE_REL = Path("home") / ".claude" / "CLAUDE.md"
 CONTEXT_CODEX_REL = Path("home") / ".codex" / "AGENTS.md"
 CONTEXT_SYMLINK_TARGET = os.path.join("..", ".claude", "CLAUDE.md")
@@ -140,7 +151,7 @@ HARDENED_CLIENT_SKILL_BUILDER_CONTEXT = {
     }
 }
 CLIENT_OVERLAY_PROJECTION_ROOT_FILES = (
-    "skills.lock.json",
+    "skill-repos.lock.json",
 )
 CLIENT_OVERLAY_PROJECTION_DIRS = (
     "skills",
@@ -1395,14 +1406,13 @@ def base_client_overlay(
         "skills": [
             {
                 "id": f"{client_id}-skills",
-                "kind": "packaged-skill-set",
+                "kind": "skill-repo-set",
                 "required": False,
                 "profiles": ["core"],
-                "bundle_dir": f"${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/bundles",
-                "manifest": f"${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skills.manifest",
-                "sources_config": f"${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skills.sources.yaml",
-                "lock_path": f"${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skills.lock.json",
-                "sync": {"mode": "unpack-bundles"},
+                "skill_repos_config": f"${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skill-repos.yaml",
+                "lock_path": f"${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skill-repos.lock.json",
+                "clone_root": "${SKILLBOX_WORKSPACE_ROOT}/workspace/skill-repos",
+                "sync": {"mode": "clone-and-install"},
                 "install_targets": [
                     {
                         "id": "claude",
@@ -1638,41 +1648,6 @@ def ensure_client_scaffold_skill_sources(
     return actions
 
 
-def ensure_client_scaffold_skill_bundles(
-    root_dir: Path,
-    overlay_dir: Path,
-    scaffold_pack: str,
-    *,
-    dry_run: bool,
-) -> list[str]:
-    actions: list[str] = []
-    output_dir = overlay_dir / "bundles"
-    ensure_directory(output_dir, dry_run=dry_run)
-    packager = DEFAULT_ROOT_DIR / "scripts" / "package_skill.py"
-
-    for skill_name in client_scaffold_pack_required_skills(scaffold_pack):
-        source_dir = overlay_dir / "skills" / skill_name
-        bundle_path = output_dir / f"{skill_name}.skill"
-        if bundle_path.is_file():
-            continue
-        if dry_run:
-            actions.append(f"package-skill-bundle: {repo_rel(root_dir, bundle_path)}")
-            continue
-        result = run_command(
-            [
-                sys.executable,
-                str(packager),
-                str(source_dir),
-                str(output_dir),
-            ],
-            cwd=DEFAULT_ROOT_DIR,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"failed to package {skill_name}")
-        actions.append(f"package-skill-bundle: {repo_rel(root_dir, bundle_path)}")
-    return actions
-
-
 def default_client_scaffold_files(
     root_dir: Path,
     env_values: dict[str, str],
@@ -1683,13 +1658,10 @@ def default_client_scaffold_files(
 ) -> tuple[dict[Path, str], str]:
     scaffold_pack = "planning"
     overlay_dir = client_config_host_dir(root_dir, env_values, client_id)
-    bundle_dir = overlay_dir / "bundles"
     skills_dir = overlay_dir / "skills"
 
     overlay_path = overlay_dir / "overlay.yaml"
-    manifest_path = overlay_dir / "skills.manifest"
-    sources_path = overlay_dir / "skills.sources.yaml"
-    bundle_readme_path = bundle_dir / "README.md"
+    skill_repos_path = overlay_dir / "skill-repos.yaml"
     skills_keep_path = skills_dir / ".gitkeep"
     overlay_client = base_client_overlay(
         client_id=client_id,
@@ -1699,21 +1671,18 @@ def default_client_scaffold_files(
         scaffold_pack=scaffold_pack,
     )
 
+    required_skills = client_scaffold_pack_required_skills(scaffold_pack)
+    pick_line = ", ".join(required_skills)
     target_files = {
         overlay_path: render_yaml_document({"version": 1, "client": overlay_client}),
-        manifest_path: render_client_skill_manifest(
-            client_label,
-            client_scaffold_pack_required_skills(scaffold_pack),
-        ),
-        sources_path: (
-            "version: 1\n"
+        skill_repos_path: (
+            f"# {client_label} client-specific skill repos.\n"
             "\n"
-            "sources:\n"
-            "  - kind: local\n"
-            "    path: \"./skills\"\n"
-        ),
-        bundle_readme_path: (
-            f"Generated `.skill` bundles for the `{client_id}` client overlay land here.\n"
+            "version: 2\n"
+            "\n"
+            "skill_repos:\n"
+            "  - path: ./skills\n"
+            f"    pick: [{pick_line}]\n"
         ),
         skills_keep_path: "",
     }
@@ -1944,14 +1913,6 @@ def scaffold_client_overlay(
             dry_run=dry_run,
         )
     )
-    actions.extend(
-        ensure_client_scaffold_skill_bundles(
-            root_dir,
-            overlay_dir,
-            scaffold_pack,
-            dry_run=dry_run,
-        )
-    )
 
     return actions, blueprint_metadata
 
@@ -2125,6 +2086,340 @@ def write_json_file(path: Path, payload: dict[str, Any]) -> bool:
         return False
     path.write_text(serialized, encoding="utf-8")
     return True
+
+
+# ---------------------------------------------------------------------------
+# Skill repo config: loading, validation, clone, filtered-copy, lock
+# ---------------------------------------------------------------------------
+
+
+def load_skill_repos_config(config_path: Path) -> dict[str, Any]:
+    """Load and validate a skill_repos YAML config file."""
+    if not config_path.is_file():
+        raise RuntimeError(f"SKILL_CONFIG_INVALID: config file missing at {config_path}")
+    raw = load_yaml(config_path)
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"SKILL_CONFIG_INVALID: expected a YAML mapping in {config_path}")
+    version = raw.get("version")
+    if version != SKILL_REPOS_CONFIG_VERSION:
+        raise RuntimeError(
+            f"SKILL_CONFIG_INVALID: expected version {SKILL_REPOS_CONFIG_VERSION}, got {version!r} in {config_path}"
+        )
+    entries = raw.get("skill_repos")
+    if entries is None:
+        entries = []
+    if not isinstance(entries, list):
+        raise RuntimeError(f"SKILL_CONFIG_INVALID: skill_repos must be a list in {config_path}")
+
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"SKILL_CONFIG_INVALID: skill_repos[{i}] must be a mapping")
+        has_repo = bool(entry.get("repo"))
+        has_path = bool(entry.get("path"))
+        if has_repo == has_path:
+            raise RuntimeError(
+                f"SKILL_CONFIG_INVALID: skill_repos[{i}] must have exactly one of 'repo' or 'path'"
+            )
+        if has_repo and not entry.get("ref"):
+            raise RuntimeError(f"SKILL_CONFIG_INVALID: skill_repos[{i}] repo entry requires a 'ref'")
+        pick = entry.get("pick")
+        if pick is not None and not isinstance(pick, list):
+            raise RuntimeError(f"SKILL_CONFIG_INVALID: skill_repos[{i}] pick must be a list")
+
+    return raw
+
+
+def clone_dir_name(repo: str) -> str:
+    """Convert 'owner/repo' to 'owner-repo' for clone directory naming."""
+    return repo.replace("/", "-")
+
+
+def _load_skillignore(skill_dir: Path) -> list[str]:
+    """Load .skillignore patterns from a skill directory, falling back to defaults."""
+    patterns = list(DEFAULT_SKILLIGNORE_PATTERNS)
+    ignore_file = skill_dir / ".skillignore"
+    if ignore_file.is_file():
+        for line in ignore_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and line not in patterns:
+                patterns.append(line)
+    return patterns
+
+
+def _matches_skillignore(rel_path: str, patterns: list[str]) -> bool:
+    """Check if a relative path matches any skillignore pattern."""
+    import fnmatch
+
+    parts = rel_path.split("/")
+    for pattern in patterns:
+        if pattern.endswith("/"):
+            dir_pattern = pattern.rstrip("/")
+            for part in parts[:-1]:
+                if fnmatch.fnmatch(part, dir_pattern):
+                    return True
+            if fnmatch.fnmatch(parts[-1], dir_pattern) and len(parts) > 0:
+                pass
+        else:
+            if fnmatch.fnmatch(parts[-1], pattern):
+                return True
+            if fnmatch.fnmatch(rel_path, pattern):
+                return True
+    return False
+
+
+def filtered_copy_skill(source_dir: Path, target_dir: Path) -> str:
+    """Copy a skill directory to target, respecting .skillignore. Returns tree SHA."""
+    patterns = _load_skillignore(source_dir)
+
+    remove_path(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    for source_file in sorted(source_dir.rglob("*")):
+        if not source_file.is_file():
+            continue
+        rel = source_file.relative_to(source_dir).as_posix()
+
+        if _matches_skillignore(rel, patterns):
+            continue
+
+        if rel == ".skillignore":
+            continue
+
+        dest = target_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(source_file), str(dest))
+
+    tree_sha = directory_tree_sha256(target_dir)
+    if tree_sha is None:
+        raise RuntimeError(f"Failed to hash installed skill directory {target_dir}")
+    return tree_sha
+
+
+def _resolve_skill_dirs(
+    entry: dict[str, Any],
+    source_root: Path,
+    repo_name: str,
+) -> list[tuple[str, Path]]:
+    """Resolve skill name -> source directory pairs from a config entry.
+
+    Returns list of (skill_name, skill_source_dir) tuples.
+    """
+    pick = entry.get("pick")
+    if pick:
+        results = []
+        for skill_name in pick:
+            skill_dir = source_root / skill_name
+            if not (skill_dir / "SKILL.md").is_file():
+                raise RuntimeError(
+                    f"SKILL_NOT_FOUND_IN_REPO: skill '{skill_name}' not found in {source_root} "
+                    f"(no SKILL.md at {skill_dir})"
+                )
+            results.append((skill_name, skill_dir))
+        return results
+
+    if (source_root / "SKILL.md").is_file():
+        return [(repo_name, source_root)]
+
+    raise RuntimeError(
+        f"SKILL_CONFIG_INVALID: repo {entry.get('repo', source_root)} has no pick list "
+        "and no SKILL.md at root. Add a pick list or ensure SKILL.md exists at the repo root."
+    )
+
+
+def _clone_or_fetch_repo(
+    repo: str,
+    ref: str,
+    clone_root: Path,
+    *,
+    dry_run: bool,
+) -> tuple[str, Path, str | None]:
+    """Clone or fetch a repo. Returns (action, clone_path, resolved_commit_or_None)."""
+    dir_name = clone_dir_name(repo)
+    clone_path = clone_root / dir_name
+
+    if clone_path.is_dir():
+        if not dry_run:
+            status_result = run_command(["git", "status", "--porcelain"], cwd=clone_path)
+            if status_result.returncode == 0 and status_result.stdout.strip():
+                return ("SKILL_REPO_DIRTY", clone_path, None)
+
+            fetch_result = run_command(["git", "fetch", "origin"], cwd=clone_path)
+            if fetch_result.returncode != 0:
+                raise RuntimeError(
+                    f"SKILL_REPO_CLONE_FAILED: git fetch failed for {repo}: "
+                    f"{fetch_result.stderr.strip()}"
+                )
+
+            checkout_result = run_command(["git", "checkout", ref], cwd=clone_path)
+            if checkout_result.returncode != 0:
+                run_command(["git", "checkout", f"origin/{ref}"], cwd=clone_path)
+
+            pull_result = run_command(["git", "pull", "--ff-only"], cwd=clone_path)
+
+            rev_result = run_command(["git", "rev-parse", "HEAD"], cwd=clone_path)
+            commit = rev_result.stdout.strip() if rev_result.returncode == 0 else None
+        else:
+            commit = None
+        return ("fetched", clone_path, commit)
+
+    if dry_run:
+        return ("cloned", clone_path, None)
+
+    clone_root.mkdir(parents=True, exist_ok=True)
+    clone_url = f"https://github.com/{repo}.git"
+    clone_result = run_command(
+        ["git", "clone", clone_url, str(clone_path)],
+    )
+    if clone_result.returncode != 0:
+        ssh_url = f"git@github.com:{repo}.git"
+        clone_result = run_command(
+            ["git", "clone", ssh_url, str(clone_path)],
+        )
+        if clone_result.returncode != 0:
+            raise RuntimeError(
+                f"SKILL_REPO_UNREACHABLE: failed to clone {repo}: "
+                f"{clone_result.stderr.strip()}"
+            )
+
+    if ref != "main" and ref != "master":
+        run_command(["git", "checkout", ref], cwd=clone_path)
+
+    rev_result = run_command(["git", "rev-parse", "HEAD"], cwd=clone_path)
+    commit = rev_result.stdout.strip() if rev_result.returncode == 0 else None
+    return ("cloned", clone_path, commit)
+
+
+def sync_skill_repo_sets(model: dict[str, Any], dry_run: bool) -> list[str]:
+    """Sync skill-repo-set skill sets: clone repos, filtered-copy skills, write lock."""
+    actions: list[str] = []
+
+    for skillset in model["skills"]:
+        if skillset.get("kind") != "skill-repo-set":
+            continue
+        sync_mode = (skillset.get("sync") or {}).get("mode", "")
+        if sync_mode != "clone-and-install":
+            continue
+
+        config_path = Path(str(skillset.get("skill_repos_config_host_path", "")))
+        lock_path = Path(str(skillset.get("lock_path_host_path", "")))
+        clone_root = Path(str(skillset.get("clone_root_host_path", "")))
+
+        config = load_skill_repos_config(config_path)
+        entries = config.get("skill_repos") or []
+
+        for target in skillset.get("install_targets") or []:
+            target_root = Path(str(target["host_path"]))
+            ensure_directory(target_root, dry_run)
+
+        repo_actions: list[dict[str, Any]] = []
+        skills_installed: list[dict[str, Any]] = []
+        lock_skills: list[dict[str, Any]] = []
+
+        for entry in entries:
+            has_repo = bool(entry.get("repo"))
+
+            if has_repo:
+                repo = entry["repo"]
+                ref = entry["ref"]
+                action, clone_path, commit = _clone_or_fetch_repo(
+                    repo, ref, clone_root, dry_run=dry_run,
+                )
+                repo_actions.append({
+                    "repo": repo,
+                    "action": action,
+                    "ref": ref,
+                    "commit": commit,
+                })
+                actions.append(f"skill-repo-{action}: {repo}")
+
+                if action == "SKILL_REPO_DIRTY":
+                    actions.append(f"SKILL_REPO_DIRTY: {repo} — skipping (uncommitted changes)")
+                    continue
+
+                source_root = clone_path
+                repo_name = repo.split("/")[-1] if "/" in repo else repo
+
+                if not source_root.is_dir():
+                    pick = entry.get("pick") or [repo_name]
+                    for skill_name in pick:
+                        for target in skillset.get("install_targets") or []:
+                            target_root = Path(str(target["host_path"]))
+                            actions.append(f"install-skill: {skill_name} -> {target_root / skill_name}")
+                    continue
+            else:
+                local_path = entry["path"]
+                if not Path(local_path).is_absolute():
+                    source_root = (config_path.parent / local_path).resolve()
+                else:
+                    source_root = Path(local_path)
+
+                if not source_root.is_dir():
+                    if dry_run:
+                        actions.append(f"skip-local-path: {source_root} (not found)")
+                        continue
+                    raise RuntimeError(
+                        f"SKILL_CONFIG_INVALID: local path does not exist: {source_root}"
+                    )
+                repo_name = source_root.name
+                commit = None
+                repo = None
+
+            skill_dirs = _resolve_skill_dirs(entry, source_root, repo_name)
+
+            for skill_name, skill_source in skill_dirs:
+                targets_installed: list[str] = []
+                install_tree_shas: dict[str, str] = {}
+
+                for target in skillset.get("install_targets") or []:
+                    target_root = Path(str(target["host_path"]))
+                    install_dir = target_root / skill_name
+
+                    if dry_run:
+                        actions.append(f"install-skill: {skill_name} -> {install_dir}")
+                        targets_installed.append(target["id"])
+                        continue
+
+                    tree_sha = filtered_copy_skill(skill_source, install_dir)
+                    install_tree_shas[target["id"]] = tree_sha
+                    targets_installed.append(target["id"])
+                    actions.append(f"install-skill: {skill_name} -> {install_dir}")
+
+                skills_installed.append({
+                    "name": skill_name,
+                    "source": repo or str(entry.get("path", "")),
+                    "targets": targets_installed,
+                })
+
+                lock_entry: dict[str, Any] = {
+                    "name": skill_name,
+                    "declared_ref": entry.get("ref"),
+                    "resolved_commit": commit,
+                }
+                if repo:
+                    lock_entry["repo"] = repo
+                else:
+                    lock_entry["source_path"] = str(entry.get("path", ""))
+
+                if not dry_run and install_tree_shas:
+                    first_target = next(iter(install_tree_shas))
+                    lock_entry["install_tree_sha"] = install_tree_shas[first_target]
+
+                lock_skills.append(lock_entry)
+
+        if dry_run:
+            actions.append(f"write-lockfile: {lock_path}")
+            continue
+
+        lock_payload = {
+            "version": SKILL_REPOS_LOCKFILE_VERSION,
+            "config_sha": file_sha256(config_path),
+            "synced_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "skills": lock_skills,
+        }
+        changed = write_json_file(lock_path, lock_payload)
+        actions.append(f"{'write-lockfile' if changed else 'lockfile-unchanged'}: {lock_path}")
+
+    return actions
 
 
 def resolve_client_projection_output_dir(
@@ -2425,6 +2720,23 @@ def collect_client_projection_files(
                 )
 
     for skillset in model.get("skills") or []:
+        if skillset.get("kind") == "skill-repo-set":
+            config_host_path = Path(str(skillset.get("skill_repos_config_host_path", "")))
+            if config_host_path.is_file():
+                add_projection_source_file(
+                    files,
+                    runtime_path_to_projection_rel_path(env_values, str(skillset["skill_repos_config"])),
+                    config_host_path,
+                )
+            lock_host_path = Path(str(skillset.get("lock_path_host_path", "")))
+            if lock_host_path.is_file():
+                add_projection_source_file(
+                    files,
+                    runtime_path_to_projection_rel_path(env_values, str(skillset["lock_path"])),
+                    lock_host_path,
+                )
+            continue
+
         inventory = collect_skill_inventory(skillset)
         manifest_host_path = Path(str(skillset["manifest_host_path"]))
         sources_config_host_path = Path(str(skillset["sources_config_host_path"]))
@@ -2859,14 +3171,6 @@ def normalize_client_overlay_shape(root_dir: Path, overlay_dir: Path) -> list[st
 
     actions.extend(
         ensure_client_scaffold_skill_sources(
-            root_dir,
-            overlay_dir,
-            scaffold_pack,
-            dry_run=False,
-        )
-    )
-    actions.extend(
-        ensure_client_scaffold_skill_bundles(
             root_dir,
             overlay_dir,
             scaffold_pack,

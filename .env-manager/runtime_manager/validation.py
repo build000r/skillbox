@@ -423,6 +423,8 @@ def sync_skill_sets(model: dict[str, Any], dry_run: bool) -> list[str]:
     actions: list[str] = []
 
     for skillset in model["skills"]:
+        if skillset.get("kind") == "skill-repo-set":
+            continue
         inventory = collect_skill_inventory(skillset)
         missing_inputs: list[str] = []
         for field, present in (
@@ -495,6 +497,8 @@ def validate_skill_locks_and_state(model: dict[str, Any]) -> list[CheckResult]:
     install_warnings: list[str] = []
 
     for skillset in model["skills"]:
+        if skillset.get("kind") == "skill-repo-set":
+            continue
         inventory = collect_skill_inventory(skillset)
 
         required_missing: list[str] = []
@@ -687,6 +691,205 @@ def validate_skill_locks_and_state(model: dict[str, Any]) -> list[CheckResult]:
     return results
 
 
+def validate_skill_repo_sets(model: dict[str, Any]) -> list[CheckResult]:
+    """Validate skill-repo-set skillsets using 2-layer drift detection."""
+    has_repo_sets = any(s.get("kind") == "skill-repo-set" for s in model["skills"])
+    if not has_repo_sets:
+        return []
+
+    config_failures: list[str] = []
+    lock_failures: list[str] = []
+    lock_warnings: list[str] = []
+    install_failures: list[str] = []
+    install_warnings: list[str] = []
+
+    for skillset in model["skills"]:
+        if skillset.get("kind") != "skill-repo-set":
+            continue
+
+        sid = skillset["id"]
+        config_path = Path(str(skillset.get("skill_repos_config_host_path", "")))
+        lock_path = Path(str(skillset.get("lock_path_host_path", "")))
+
+        if not config_path.is_file():
+            config_failures.append(f"{sid}: skill_repos config missing at {config_path}")
+            continue
+
+        try:
+            config = load_skill_repos_config(config_path)
+        except RuntimeError as exc:
+            config_failures.append(f"{sid}: {exc}")
+            continue
+
+        config_sha = file_sha256(config_path)
+
+        if not lock_path.is_file():
+            lock_warnings.append(f"{sid}: lockfile missing at {lock_path} — run sync")
+            continue
+
+        try:
+            lock_payload = load_json_file(lock_path)
+        except RuntimeError as exc:
+            lock_failures.append(f"{sid}: {exc}")
+            continue
+
+        if lock_payload.get("version") != SKILL_REPOS_LOCKFILE_VERSION:
+            lock_failures.append(
+                f"{sid}: lockfile version {lock_payload.get('version')!r} "
+                f"does not match {SKILL_REPOS_LOCKFILE_VERSION}"
+            )
+            continue
+
+        if lock_payload.get("config_sha") != config_sha:
+            lock_failures.append(f"{sid}: config changed since last sync (config_sha mismatch)")
+
+        lock_skills_by_name: dict[str, dict[str, Any]] = {}
+        for skill_entry in lock_payload.get("skills") or []:
+            name = str(skill_entry.get("name", ""))
+            if name:
+                lock_skills_by_name[name] = skill_entry
+
+        declared_skill_names: set[str] = set()
+        for entry in config.get("skill_repos") or []:
+            pick = entry.get("pick")
+            if pick:
+                declared_skill_names.update(pick)
+            elif entry.get("repo"):
+                repo = entry["repo"]
+                declared_skill_names.add(repo.split("/")[-1] if "/" in repo else repo)
+
+        for skill_name in sorted(declared_skill_names):
+            lock_record = lock_skills_by_name.get(skill_name)
+            if lock_record is None:
+                install_failures.append(f"{sid}: SKILL_NOT_INSTALLED: {skill_name} not in lockfile")
+                continue
+
+            for target in skillset.get("install_targets") or []:
+                install_dir = Path(str(target["host_path"])) / skill_name
+                if not install_dir.is_dir():
+                    install_failures.append(
+                        f"{sid}: SKILL_NOT_INSTALLED: {skill_name} missing in {target['id']}"
+                    )
+                    continue
+
+                installed_sha = directory_tree_sha256(install_dir)
+                lock_sha = lock_record.get("install_tree_sha")
+                if lock_sha and installed_sha != lock_sha:
+                    install_failures.append(
+                        f"{sid}: SKILL_INSTALL_STALE: {skill_name} in {target['id']} "
+                        f"(installed tree differs from lock)"
+                    )
+
+        installed_skill_names: set[str] = set()
+        for target in skillset.get("install_targets") or []:
+            target_root = Path(str(target["host_path"]))
+            if target_root.is_dir():
+                for child in target_root.iterdir():
+                    if child.is_dir() and (child / "SKILL.md").is_file():
+                        installed_skill_names.add(child.name)
+            break
+
+        all_declared: set[str] = set()
+        for s in model["skills"]:
+            if s.get("kind") != "skill-repo-set":
+                continue
+            sp = Path(str(s.get("skill_repos_config_host_path", "")))
+            if sp.is_file():
+                try:
+                    sc = load_skill_repos_config(sp)
+                    for e in sc.get("skill_repos") or []:
+                        p = e.get("pick")
+                        if p:
+                            all_declared.update(p)
+                        elif e.get("repo"):
+                            r = e["repo"]
+                            all_declared.add(r.split("/")[-1] if "/" in r else r)
+                except RuntimeError:
+                    pass
+
+        extras = installed_skill_names - all_declared
+        for extra_name in sorted(extras):
+            install_warnings.append(
+                f"{sid}: SKILL_EXTRA_INSTALLED: {extra_name} is installed but not declared"
+            )
+
+    results: list[CheckResult] = []
+
+    if config_failures:
+        results.append(
+            CheckResult(
+                status="fail",
+                code="skill-repo-config",
+                message="skill repo config is invalid or missing",
+                details={"issues": config_failures},
+            )
+        )
+    else:
+        results.append(
+            CheckResult(
+                status="pass",
+                code="skill-repo-config",
+                message="skill repo configs are valid",
+            )
+        )
+
+    if lock_failures:
+        results.append(
+            CheckResult(
+                status="fail",
+                code="skill-repo-lock",
+                message="skill repo lockfiles are invalid or stale",
+                details={"issues": lock_failures},
+            )
+        )
+    elif lock_warnings:
+        results.append(
+            CheckResult(
+                status="warn",
+                code="skill-repo-lock",
+                message="skill repo lockfiles need generation",
+                details={"issues": lock_warnings},
+            )
+        )
+    else:
+        results.append(
+            CheckResult(
+                status="pass",
+                code="skill-repo-lock",
+                message="skill repo lockfiles match the current config",
+            )
+        )
+
+    if install_failures:
+        results.append(
+            CheckResult(
+                status="fail",
+                code="skill-repo-install",
+                message="installed skills drifted from declared repos",
+                details={"issues": install_failures},
+            )
+        )
+    elif install_warnings:
+        results.append(
+            CheckResult(
+                status="warn",
+                code="skill-repo-install",
+                message="extra skills installed that are not declared",
+                details={"issues": install_warnings},
+            )
+        )
+    else:
+        results.append(
+            CheckResult(
+                status="pass",
+                code="skill-repo-install",
+                message="installed skills match declared repo state",
+            )
+        )
+
+    return results
+
+
 def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
     issues: list[str] = []
 
@@ -810,9 +1013,16 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
             issues.append("every skills entry must have an id")
         if skillset.get("client") and skillset["client"] not in declared_client_ids:
             issues.append(f"skill set {skillset.get('id')} references unknown client {skillset['client']!r}")
-        for field in ("bundle_dir", "manifest", "sources_config", "lock_path"):
-            if not skillset.get(field):
-                issues.append(f"skill set {skillset.get('id', '(missing id)')} is missing {field}")
+
+        kind = skillset.get("kind", "packaged-skill-set")
+        if kind == "skill-repo-set":
+            for field in ("skill_repos_config", "lock_path"):
+                if not skillset.get(field):
+                    issues.append(f"skill set {skillset.get('id', '(missing id)')} is missing {field}")
+        else:
+            for field in ("bundle_dir", "manifest", "sources_config", "lock_path"):
+                if not skillset.get(field):
+                    issues.append(f"skill set {skillset.get('id', '(missing id)')} is missing {field}")
 
         sync = skillset.get("sync") or {}
         sync_mode = sync.get("mode") or "unpack-bundles"

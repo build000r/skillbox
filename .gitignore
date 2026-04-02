@@ -12,8 +12,6 @@ coverage.xml
 build/
 dist/
 *.skill
-!default-skills/
-!default-skills/*.skill
 logs/*
 !logs/README.md
 repos/*
@@ -23,8 +21,9 @@ home/.claude/CLAUDE.md
 home/.codex/skills/
 home/.codex/AGENTS.md
 home/.local/
-workspace/default-skills.lock.json
-workspace/clients/*/skills.lock.json
+workspace/skill-repos.lock.json
+workspace/skill-repos/
+workspace/clients/*/skill-repos.lock.json
 workspace/secrets/
 workspace/boxes.json
 workspace/.focus.json

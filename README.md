@@ -48,7 +48,7 @@ right client context without standing up a full hosted workspace control plane.
 - focus on a client workspace with live state collection, enriched agent context, and continuous drift monitoring
 - acknowledge journal events to curate active context — acked events are hidden from CLAUDE.md so agents only see unresolved items
 - provision and tear down remote boxes from the operator machine via MCP tools
-- pin and package default skills locally
+- declare skill repos and sync skills from GitHub repos or local paths
 - validate outer drift with `make doctor` and inner drift with `make dev-sanity`
 
 ### Why Use `skillbox`?
@@ -63,7 +63,7 @@ right client context without standing up a full hosted workspace control plane.
 | Context curation across sessions | `ack` marks journal events as handled so the next `focus` only surfaces unresolved items in CLAUDE.md — less noise, higher signal |
 | One-command client activation | `focus` syncs, bootstraps, starts services, collects live state, and writes enriched agent context in a single pass |
 | Fleet management from the operator machine | The operator MCP server provisions DO droplets, enrolls Tailscale, and runs commands on remote boxes as native agent tools |
-| Reproducible default skills | `03-skill-sync.sh` packages from a pinned manifest and vendored local packager |
+| Reproducible default skills | `skill-repos.yaml` declares GitHub repos and local paths; `sync` clones and filtered-installs skills |
 | Confidence that docs/config/runtime still match | `04-reconcile.py` powers `make render` and `make doctor`, while `make dev-sanity` validates the box internals |
 | Minimal surface area | No multi-tenant control plane, no hosted dependency, no hidden sibling repo requirement for packaging |
 
@@ -99,7 +99,6 @@ make runtime-status CLIENT=personal
 make build
 make up
 make up-surfaces
-./scripts/03-skill-sync.sh
 curl -fsS http://127.0.0.1:8000/health
 curl -fsS http://127.0.0.1:8000/v1/sandbox
 curl -fsS http://127.0.0.1:8000/v1/runtime
@@ -113,8 +112,8 @@ What that gives you:
 - a running workspace container
 - a mounted `/monoserver` view of the host parent directory
 - optional API and web inspection surfaces
-- packaged default `.skill` bundles under `default-skills/`
-- installed default skills under `home/.claude/skills` and `home/.codex/skills`
+- cloned skill repos under `workspace/skill-repos/`
+- installed default skills under `home/.claude/skills/` and `home/.codex/skills/`
 - generated agent context at `home/.claude/CLAUDE.md` with a symlink at `home/.codex/AGENTS.md`
 
 ## Focus
@@ -356,14 +355,16 @@ The container is where your day-to-day work should feel familiar.
 ### 4. Explicit runtime graphs beat hidden control planes
 
 `workspace/sandbox.yaml`, `workspace/dependencies.yaml`,
-`workspace/runtime.yaml`, and the skill manifests describe the intended box.
+`workspace/runtime.yaml`, and the skill repo configs describe the intended box.
 `make doctor` checks the outer shell, and `make dev-sanity` checks the interior
 graph plus managed artifact and skill install state.
 
-### 5. Portable skill packaging matters
+### 5. Skills are GitHub repos, not packaged archives
 
-The default skill packaging chain is vendored locally. A fresh clone does not
-need a sibling `../opensource` checkout just to package default skills.
+Skills are declared as GitHub repo entries in `workspace/skill-repos.yaml`.
+`sync` clones repos, filtered-copies skill directories into agent homes, and
+records resolved commit SHAs in a lock file. Cloned repos are full working
+trees the operator can branch, commit, push, and PR against.
 
 ### 6. Local-first operator ergonomics
 
@@ -583,7 +584,6 @@ make runtime-sync
 |---|---|---|
 | `scripts/01-bootstrap-do.sh` | Bootstrap a fresh Ubuntu or DigitalOcean host | `sudo ./scripts/01-bootstrap-do.sh` |
 | `scripts/02-install-tailscale.sh` | Join the tailnet and harden SSH | `sudo TAILSCALE_AUTHKEY="tskey-..." ./scripts/02-install-tailscale.sh` |
-| `scripts/03-skill-sync.sh` | Resolve, stage, validate, and package default skills | `./scripts/03-skill-sync.sh --dry-run` |
 | `scripts/04-reconcile.py render` | Print the resolved sandbox model | `python3 scripts/04-reconcile.py render --with-compose` |
 | `scripts/04-reconcile.py doctor` | Run drift and readiness checks | `python3 scripts/04-reconcile.py doctor` |
 | `scripts/05-swimmers.sh` | Manage the workspace-local swimmers install and process lifecycle | `./scripts/05-swimmers.sh status` |
@@ -717,7 +717,7 @@ With that setup:
 - `skillbox` stays publishable
 - `skillbox-config/clients/<client>/overlay.yaml` is the private source of truth
 - `skillbox-config/clients/<client>/skills/` holds private client-local skill sources
-- `skillbox-config/clients/<client>/bundles/` holds generated client-local `.skill` bundles
+- `skillbox-config/clients/<client>/skill-repos.yaml` declares client-specific skill repos
 - overlay scaffold artifacts are first-class: planning clients get `plans/`, while skill-builder clients get `workflows/`, `evaluations/`, `invocations/`, and `observability/`
 - `client-init`, `sync`, and `focus` write client config into the private repo
 - `client-diff` and `client-publish` default to the attached private repo unless you explicitly pass `--target-dir`
@@ -841,47 +841,41 @@ What v1 does not do:
 - restart services or deploy application code
 - manage publish history beyond the latest `publish.json`
 
-### Default skill sources
+### Skill repo config
 
-`workspace/default-skills.sources.yaml` pins where bundled skills come from:
+`workspace/skill-repos.yaml` declares where skills come from:
 
 ```yaml
-version: 1
+version: 2
 
-sources:
-  - kind: github
-    repo: https://github.com/build000r/skills
-    sha: 9f0f69029aee5c6b247bf25dcfe13e34f2110e3a
+skill_repos:
+  - repo: build000r/skills
+    ref: main
+    pick: [ask-cascade, build-vs-clone, describe, reproduce, commit]
 
-  - kind: local
-    path: ../skills
+  - path: ../skills
+    pick: [cass-memory, dev-sanity, skillbox-operator]
 ```
 
-### Default skill manifest
+Each entry is either a GitHub repo (cloned into `workspace/skill-repos/`) or a
+local path (referenced directly). `sync` clones or fetches repos, filtered-copies
+skill directories into `~/.claude/skills/` and `~/.codex/skills/`, and writes a
+lock file with resolved commit SHAs.
 
-`workspace/default-skills.manifest` is just the list of skill names to preload:
-
-```text
-ask-cascade
-build-vs-clone
-describe
-reproduce
-commit
-dev-sanity
-skillbox-operator
-```
+Client overlays declare their own `skill-repos.yaml` under
+`${SKILLBOX_CLIENTS_HOST_ROOT:-./workspace/clients}/<client>/skill-repos.yaml`.
 
 ### Generated skill lockfiles
 
-`make runtime-sync` writes `workspace/default-skills.lock.json` for the shared
-default skill set, and selected client overlays write their own lockfiles under
-`${SKILLBOX_CLIENTS_HOST_ROOT:-./workspace/clients}/<client>/skills.lock.json`.
+`make runtime-sync` writes `workspace/skill-repos.lock.json` for the shared
+default skill set, and client overlays write their own lockfiles under
+`${SKILLBOX_CLIENTS_HOST_ROOT:-./workspace/clients}/<client>/skill-repos.lock.json`.
 
 Each lockfile records:
 
-- the current manifest and sources-config digests
-- the bundle digests for each declared default skill
-- the installed tree hashes for the managed Claude and Codex skill homes
+- the config file SHA (detects when the config changed since last sync)
+- the resolved commit SHA per skill (what ref was installed)
+- the installed tree SHA per skill (for drift detection)
 
 These lockfiles are generated state and are gitignored, so running sync does
 not turn normal local runtime reconciliation into noisy repo dirt.
@@ -932,7 +926,8 @@ core:
       path: ${SKILLBOX_REPOS_ROOT}
   skills:
     - id: default-skills
-      manifest: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.manifest
+      kind: skill-repo-set
+      skill_repos_config: ${SKILLBOX_WORKSPACE_ROOT}/workspace/skill-repos.yaml
   tasks:
     - id: app-bootstrap
       repo: skillbox-self
@@ -1175,7 +1170,7 @@ exist all the time.
 │ 04-reconcile.py                         │
 │ .env-manager/manage.py                  │
 │ .env-manager/pulse.py                   │
-│ 03-skill-sync.sh / package_skill.py     │
+│ skill-repos.yaml → clone + install      │
 └───────────────────┬─────────────────────┘
                     │
                     ▼
@@ -1184,7 +1179,7 @@ exist all the time.
        ├──────────────────────────────────┤
        │ repos, artifacts, skills, checks │
        │ api/web stub health probes       │
-       │ default skill bundles + lockfiles│
+       │ cloned skill repos + lockfiles   │
        │ event journal (journal.jsonl)    │
        │ pulse state (pulse.state.json)   │
        └──────────────────────────────────┘
@@ -1257,16 +1252,16 @@ make dev-sanity
 
 The API and web surfaces bind to `127.0.0.1` by design. Use local forwarding or a host shell, not a public interface.
 
-### `03-skill-sync.sh` fails during packaging
+### Skill sync fails
 
 Run:
 
 ```bash
-./scripts/03-skill-sync.sh --dry-run
-python3 scripts/package_skill.py /path/to/a/skill ./dist
+python3 .env-manager/manage.py sync --dry-run --format json
+python3 .env-manager/manage.py doctor --format json
 ```
 
-If the validator fails, fix the skill frontmatter or filtered file contents first.
+Check for `SKILL_REPO_UNREACHABLE` (auth/network) or `SKILL_NOT_FOUND_IN_REPO` (bad pick list).
 
 ### SSH works to the host but not the box
 
@@ -1300,7 +1295,6 @@ make runtime-status CLIENT=vibe-coding-client
 Re-run:
 
 ```bash
-./scripts/03-skill-sync.sh
 make runtime-sync
 make doctor
 ```
@@ -1405,13 +1399,13 @@ So the box shape stays reproducible. You can replace the placeholder contents wi
 
 `workspace/dependencies.yaml` describes the runtime categories the box exposes. `workspace/runtime.yaml` declares the interior graph the new internal manager actually operates on: repos, artifacts, installed skills, services, logs, and checks.
 
-### Why ship a vendored skill packager?
+### How are skills installed?
 
-So default skill packaging works from this repo alone. You do not need a sibling checkout just to build bundled `.skill` files.
-
-### Should `default-skills/*.skill` live in the repo?
-
-In this starter, yes. They represent the packaged default bundles the box can ship with. Other ad hoc `.skill` outputs should stay local.
+`workspace/skill-repos.yaml` declares GitHub repos and local paths. `sync`
+clones repos into `workspace/skill-repos/`, filtered-copies skill directories
+(respecting `.skillignore`) into `home/.claude/skills/` and `home/.codex/skills/`,
+and writes a lock file with resolved commit SHAs. Client overlays can declare
+their own `skill-repos.yaml` for client-specific skills.
 
 ### Can I add real repos under `repos/`?
 
