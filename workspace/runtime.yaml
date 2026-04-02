@@ -60,6 +60,44 @@ core:
         mode: download-if-missing
       notes: Destructive command guard binary. Protects agent sessions from irreversible shell commands.
 
+    - id: cass-bin
+      kind: binary
+      path: ${SKILLBOX_CASS_BIN}
+      required: false
+      profiles:
+        - core
+      source:
+        kind: url
+        url: ${SKILLBOX_CASS_DOWNLOAD_URL}
+        sha256: ${SKILLBOX_CASS_DOWNLOAD_SHA256}
+        executable: true
+        archive: tar.gz
+      sync:
+        mode: download-if-missing
+      notes: >
+        Cross-agent session search (cass). Indexes Claude Code and Codex
+        JSONL logs into a searchable store. Required by cm for session
+        history and evidence-based rule validation.
+
+    - id: cm-bin
+      kind: binary
+      path: ${SKILLBOX_CM_BIN}
+      required: false
+      profiles:
+        - core
+      source:
+        kind: url
+        url: ${SKILLBOX_CM_DOWNLOAD_URL}
+        sha256: ${SKILLBOX_CM_DOWNLOAD_SHA256}
+        executable: true
+      sync:
+        mode: download-if-missing
+      notes: >
+        CASS Memory System (cm). Procedural memory for agents — playbook
+        rules with confidence decay, session history search, and trauma
+        guards. Runs LLM-free (CASS_MEMORY_LLM=none); agents add rules
+        directly via cm add or the cm MCP server.
+
   skills:
     - id: default-skills
       kind: packaged-skill-set
@@ -153,6 +191,30 @@ core:
         path: ${SKILLBOX_LOG_ROOT}/swimmers/swimmers-server.pid
       log: swimmers
       notes: Workspace-local swimmers API that shares the tmux namespace with the agents.
+
+    - id: cm-mcp
+      kind: mcp
+      owner: local
+      artifact: cm-bin
+      required: false
+      profiles:
+        - core
+      command: ${SKILLBOX_CM_BIN} serve --port ${SKILLBOX_CM_MCP_PORT}
+      env:
+        CASS_MEMORY_LLM: none
+        CASS_PATH: ${SKILLBOX_CASS_BIN}
+      healthcheck:
+        type: http
+        url: http://127.0.0.1:${SKILLBOX_CM_MCP_PORT}/health
+        timeout_seconds: 0.5
+      depends_on:
+        - cass-bin
+        - cm-bin
+      log: runtime
+      notes: >
+        CM MCP server. Exposes cm_context, cm_feedback, and memory_search
+        as MCP tools over HTTP. Agents query playbook rules and record
+        learnings without shelling out. Runs LLM-free.
 
   logs:
     - id: runtime
@@ -251,6 +313,22 @@ core:
       profiles:
         - core
       notes: Destructive command guard should be installed for agent safety.
+
+    - id: cass-binary
+      type: path_exists
+      path: ${SKILLBOX_CASS_BIN}
+      required: false
+      profiles:
+        - core
+      notes: cass session indexer should be installed for cm history search.
+
+    - id: cm-binary
+      type: path_exists
+      path: ${SKILLBOX_CM_BIN}
+      required: false
+      profiles:
+        - core
+      notes: CASS Memory System (cm) should be installed for agent procedural memory.
 
     - id: fwc-binary
       type: path_exists
