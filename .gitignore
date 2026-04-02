@@ -24,7 +24,7 @@ home/.codex/AGENTS.md
 home/.local/
 workspace/skill-repos.lock.json
 workspace/skill-repos/
-workspace/clients/*/skill-repos.lock.json
+workspace/clients/
 workspace/secrets/
 workspace/boxes.json
 workspace/.focus.json
