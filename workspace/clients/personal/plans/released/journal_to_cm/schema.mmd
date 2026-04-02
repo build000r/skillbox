@@ -1,0 +1,39 @@
+erDiagram
+    RUNTIME_LOG {
+        string timestamp "ISO-8601"
+        string event_type "e.g. pulse.service_crashed"
+        string subject "e.g. service_id"
+        string detail_json "optional JSON payload"
+    }
+
+    PULSE_STATE {
+        string config_hash
+        json service_states
+        json check_states
+        json restart_backoff
+        int cycle_count
+        int heals
+        int events_emitted
+    }
+
+    CM_PLAYBOOK {
+        string rule_id
+        string text
+        float confidence
+        string maturity
+        string category
+    }
+
+    CM_DIARY {
+        string session_id
+        json accomplishments
+        json decisions
+        json errors
+    }
+
+    RUNTIME_LOG ||--o{ PULSE_STATE : "pulse writes both"
+    CM_PLAYBOOK ||--o{ CM_DIARY : "rules distilled from sessions"
+
+    %% REMOVED entities (no longer exist after this slice):
+    %% JOURNAL_JSONL - structured event journal
+    %% JOURNAL_ACKS_JSON - acknowledgement store with 24h expiry
