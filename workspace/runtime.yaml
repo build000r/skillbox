@@ -79,6 +79,25 @@ core:
         JSONL logs into a searchable store. Required by cm for session
         history and evidence-based rule validation.
 
+    - id: apr-bin
+      kind: binary
+      path: ${SKILLBOX_APR_BIN}
+      required: false
+      profiles:
+        - core
+      source:
+        kind: url
+        url: ${SKILLBOX_APR_DOWNLOAD_URL}
+        sha256: ${SKILLBOX_APR_DOWNLOAD_SHA256}
+        executable: true
+      sync:
+        mode: download-if-missing
+      notes: >
+        Automated Plan Reviser Pro (apr). Iterative specification
+        refinement via GPT Pro Extended Reasoning through Oracle.
+        Agents use robot mode (apr robot run N) for JSON API access.
+        Requires Oracle (npm: @steipete/oracle) for browser automation.
+
     - id: cm-bin
       kind: binary
       path: ${SKILLBOX_CM_BIN}
@@ -313,6 +332,16 @@ core:
       profiles:
         - core
       notes: Destructive command guard should be installed for agent safety.
+
+    - id: apr-binary
+      type: path_exists
+      path: ${SKILLBOX_APR_BIN}
+      required: false
+      profiles:
+        - core
+      notes: >
+        Automated Plan Reviser Pro should be installed for iterative
+        spec refinement. Requires Oracle (@steipete/oracle) at runtime.
 
     - id: cass-binary
       type: path_exists
