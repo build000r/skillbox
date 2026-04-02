@@ -274,12 +274,21 @@ def bundle_matches_publish_target(
 
 
 def stage_bundle_for_publish(bundle_dir: Path, current_dir: Path) -> None:
-    with tempfile.TemporaryDirectory(prefix=".skillbox-client-publish-") as tmpdir:
-        staging_current = Path(tmpdir) / "current"
-        shutil.copytree(bundle_dir, staging_current)
-        ensure_directory(current_dir.parent, dry_run=False)
-        remove_path(current_dir)
-        shutil.move(str(staging_current), str(current_dir))
+    replace_directory_from_bundle(bundle_dir, current_dir, temp_prefix=".skillbox-client-publish-")
+
+
+def replace_directory_from_bundle(
+    bundle_dir: Path,
+    target_dir: Path,
+    *,
+    temp_prefix: str,
+) -> None:
+    with tempfile.TemporaryDirectory(prefix=temp_prefix) as tmpdir:
+        staging_target = Path(tmpdir) / "target"
+        shutil.copytree(bundle_dir, staging_target)
+        ensure_directory(target_dir.parent, dry_run=False)
+        remove_path(target_dir)
+        shutil.move(str(staging_target), str(target_dir))
 
 
 def build_client_publish_metadata(
@@ -618,11 +627,65 @@ def open_client_surface(
     *,
     profiles: list[str] | None = None,
     output_dir_arg: str | None = None,
+    from_bundle_arg: str | None = None,
 ) -> tuple[dict[str, Any], int]:
     from .workflows import run_manage_json_command, selected_mcp_server_configs
 
     cid = validate_client_id(client_id)
     output_dir = resolve_client_open_output_dir(root_dir, cid, output_dir_arg)
+    if from_bundle_arg and profiles:
+        raise RuntimeError("client-open cannot combine --from-bundle with --profile.")
+
+    if from_bundle_arg:
+        bundle_dir = resolve_client_publish_bundle_dir(root_dir, from_bundle_arg)
+        bundle = load_client_projection_bundle(bundle_dir, expected_client_id=cid)
+
+        for source_path, target_path in ((bundle_dir, output_dir), (output_dir, bundle_dir)):
+            try:
+                target_path.relative_to(source_path)
+                raise RuntimeError(
+                    "client-open --from-bundle requires an output directory separate from the bundle directory."
+                )
+            except ValueError:
+                pass
+
+        actions = [f"use-bundle: {repo_rel(root_dir, bundle_dir)}"]
+        actions.extend(
+            prepare_client_projection_output_dir(
+                root_dir,
+                output_dir,
+                dry_run=False,
+                force=True,
+            )
+        )
+        replace_directory_from_bundle(bundle_dir, output_dir, temp_prefix=".skillbox-client-open-")
+        actions.append(f"materialize-bundle: {repo_rel(root_dir, output_dir)}")
+
+        filtered_model = bundle_runtime_model(bundle)
+        actions.extend(sync_context(filtered_model, root_dir, dry_run=False, context_dir=output_dir))
+        selected_mcp_configs, mcp_servers = selected_mcp_server_configs(root_dir, filtered_model)
+        mcp_config_path = output_dir / MCP_CONFIG_REL
+        mcp_changed = write_json_file(mcp_config_path, {"mcpServers": selected_mcp_configs})
+        actions.append(f"{'write-file' if mcp_changed else 'keep-file'}: {repo_rel(root_dir, mcp_config_path)}")
+
+        payload = {
+            "client_id": cid,
+            "output_dir": str(output_dir),
+            "active_profiles": filtered_model.get("active_profiles", []),
+            "active_clients": filtered_model.get("active_clients", []),
+            "payload_tree_sha256": bundle["payload_tree_sha256"],
+            "file_count": len(bundle["payload_entries"]),
+            "mcp_servers": mcp_servers,
+            "focus": {
+                "status": "skip",
+                "step_names": [],
+                "summary": {"mode": "bundle", "bundle_dir": str(bundle_dir)},
+            },
+            "actions": actions,
+            "next_actions": next_actions_for_client_open(cid),
+        }
+        return payload, EXIT_OK
+
     project_payload = project_client_bundle(
         root_dir,
         cid,

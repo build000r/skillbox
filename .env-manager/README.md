@@ -16,6 +16,7 @@ python3 .env-manager/manage.py up --profile surfaces
 python3 .env-manager/manage.py down --profile surfaces --service api-stub
 python3 .env-manager/manage.py logs --profile surfaces --service api-stub --lines 80
 python3 .env-manager/manage.py client-init --list-blueprints
+python3 .env-manager/manage.py first-box personal --format json
 python3 .env-manager/manage.py private-init --path ../skillbox-config --format json
 python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo-http-service-bootstrap --set PRIMARY_REPO_URL=https://github.com/acme/app.git --set BOOTSTRAP_COMMAND='pnpm install && mkdir -p .skillbox && touch .skillbox/bootstrap.ok' --set SERVICE_COMMAND='pnpm dev'
 python3 .env-manager/manage.py client-project personal
@@ -48,6 +49,9 @@ The mental model is:
 - `client-init --blueprint ...` appends reusable repos, services, logs, and
   checks to that scaffold so `render`, `sync`, and `up` immediately work on a
   concrete client shape; the blessed hardened-v1 path is `git-repo-http-service-bootstrap`
+- `first-box <client>` is the canonical first-run path: it runs `private-init`,
+  reuses or scaffolds the selected client, proves readiness with `acceptance`,
+  and writes `sand/<client>/` via `client-open`
 - `SKILLBOX_FWC_CONNECTORS` is the box-level connector superset; `client.connectors`
   in overlays can only narrow that set, and `doctor` / `acceptance` fail early
   when a client widens it
@@ -55,6 +59,8 @@ The mental model is:
   `builds/clients/<client>/` with a single-client `workspace/runtime.yaml`,
   only that client's overlay/skill files, and a sanitized `runtime-model.json`
   plus `projection.json`
+- `client-open <client> --from-bundle <dir>` re-opens a reviewed projection
+  bundle into `sand/<client>/` without running live `focus`
 - `client-diff <client> --target-dir <repo>` is the review step before
   promotion, showing file-level and runtime-surface deltas against the current
   published payload

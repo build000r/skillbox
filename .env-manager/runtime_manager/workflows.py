@@ -168,6 +168,215 @@ def run_onboard(
     return EXIT_DRIFT if has_fail else EXIT_OK
 
 
+def run_first_box(
+    *,
+    root_dir: Path,
+    client_id: str,
+    private_path_arg: str | None,
+    profiles: list[str],
+    output_dir_arg: str | None,
+    label: str | None,
+    default_cwd: str | None,
+    root_path: str | None,
+    blueprint_name: str | None,
+    set_args: list[str],
+    force: bool,
+    wait_seconds: float,
+    fmt: str,
+) -> int:
+    """Canonical first-box flow: private-init -> onboard (if needed) -> acceptance -> client-open."""
+    steps: list[dict[str, Any]] = []
+    is_json = fmt == "json"
+
+    def step(name: str, status: str, detail: Any = None) -> dict[str, Any]:
+        entry: dict[str, Any] = {"step": name, "status": status}
+        if detail is not None:
+            entry["detail"] = detail
+        steps.append(entry)
+        if not is_json:
+            marker = "ok" if status == "ok" else ("skip" if status == "skip" else ("warn" if status == "warn" else "FAIL"))
+            print(f"[{marker}] {name}")
+        return entry
+
+    def emit_first_box(payload: dict[str, Any]) -> int:
+        if is_json:
+            emit_json(payload)
+        else:
+            print(f"client: {payload['client_id']}")
+            print(f"private_repo: {payload['private_repo']['target_dir']}")
+            print(f"output_dir: {payload.get('output_dir', '')}")
+            print(f"profiles: {', '.join(payload.get('active_profiles') or ['core'])}")
+            print(f"created_client: {payload.get('created_client', False)}")
+            if payload.get("mcp_servers"):
+                print(f"mcp_servers: {', '.join(payload['mcp_servers'])}")
+            print()
+            for item in steps:
+                marker = item["status"]
+                print(f"{item['step']}: {marker}")
+        return payload.get("exit_code", EXIT_OK)
+
+    def failure_payload(
+        *,
+        client_id: str,
+        private_repo: dict[str, Any],
+        created_client: bool,
+        nested_payload: dict[str, Any] | None = None,
+        command: str,
+        default_message: str,
+        exit_code: int = EXIT_ERROR,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "client_id": client_id,
+            "private_repo": private_repo,
+            "created_client": created_client,
+            "steps": steps,
+            "exit_code": exit_code,
+        }
+        nested_error = (nested_payload or {}).get("error")
+        if isinstance(nested_error, dict):
+            payload["error"] = nested_error
+        else:
+            payload.update(classify_error(RuntimeError(default_message), command))
+        if nested_payload and isinstance(nested_payload.get("next_actions"), list):
+            payload["next_actions"] = nested_payload["next_actions"]
+        elif "next_actions" not in payload:
+            payload["next_actions"] = next_actions_for_first_box(client_id, profiles)
+        return payload
+
+    try:
+        cid = validate_client_id(client_id)
+    except RuntimeError as exc:
+        payload: dict[str, Any] = {"client_id": client_id, "steps": steps, "exit_code": EXIT_ERROR}
+        payload.update(classify_error(exc, "first-box"))
+        return emit_first_box(payload)
+
+    try:
+        private_init_payload = init_private_repo(root_dir, target_dir_arg=private_path_arg)
+        private_repo = {
+            "target_dir": private_init_payload["target_dir"],
+            "clients_host_root": private_init_payload["clients_host_root"],
+        }
+        step(
+            "private-init",
+            "ok",
+            {
+                "target_dir": private_init_payload["target_dir"],
+                "clients_host_root": private_init_payload["clients_host_root"],
+                "actions": private_init_payload.get("actions") or [],
+            },
+        )
+    except RuntimeError as exc:
+        step("private-init", "fail", {"error": str(exc)})
+        payload = {
+            "client_id": cid,
+            "steps": steps,
+            "exit_code": EXIT_ERROR,
+        }
+        payload.update(classify_error(exc, "first-box"))
+        return emit_first_box(payload)
+
+    _, overlay_path, overlay_runtime_path = client_overlay_location(root_dir, cid)
+    overlay_exists = overlay_path.is_file()
+    created_client = not overlay_exists
+    scaffold_inputs_present = any(
+        value is not None and value != []
+        for value in (label, default_cwd, root_path, blueprint_name, set_args)
+    ) or force
+    onboard_needed = created_client or scaffold_inputs_present
+
+    if onboard_needed:
+        onboard_args = ["onboard", cid, "--wait-seconds", str(wait_seconds), "--format", "json"]
+        if label is not None:
+            onboard_args.extend(["--label", label])
+        if default_cwd is not None:
+            onboard_args.extend(["--default-cwd", default_cwd])
+        if root_path is not None:
+            onboard_args.extend(["--root-path", root_path])
+        if blueprint_name is not None:
+            onboard_args.extend(["--blueprint", blueprint_name])
+        for assignment in set_args:
+            onboard_args.extend(["--set", assignment])
+        if force:
+            onboard_args.append("--force")
+
+        onboard_code, onboard_payload = run_manage_json_command(root_dir, onboard_args)
+        if onboard_code == EXIT_ERROR:
+            step("onboard", "fail", onboard_payload)
+            step("acceptance", "skip", {"reason": "onboard failed"})
+            step("open", "skip", {"reason": "onboard failed"})
+            payload = failure_payload(
+                client_id=cid,
+                private_repo=private_repo,
+                created_client=created_client,
+                nested_payload=onboard_payload,
+                command="first-box",
+                default_message=f"first-box onboard failed for {cid}",
+            )
+            return emit_first_box(payload)
+
+        onboard_status = "warn" if onboard_code == EXIT_DRIFT else "ok"
+        step("onboard", onboard_status, onboard_payload)
+    else:
+        step(
+            "onboard",
+            "skip",
+            {
+                "reason": f"client overlay already present at {overlay_runtime_path}",
+            },
+        )
+
+    profile_args = [arg for profile in profiles for arg in ("--profile", profile)]
+    acceptance_code, acceptance_payload = run_manage_json_command(
+        root_dir,
+        ["acceptance", cid, *profile_args, "--format", "json"],
+    )
+    if acceptance_code != EXIT_OK or not acceptance_payload.get("ready"):
+        step("acceptance", "fail", acceptance_payload)
+        step("open", "skip", {"reason": "acceptance failed"})
+        payload = failure_payload(
+            client_id=cid,
+            private_repo=private_repo,
+            created_client=created_client,
+            nested_payload=acceptance_payload,
+            command="first-box",
+            default_message=f"first-box acceptance failed for {cid}",
+        )
+        return emit_first_box(payload)
+
+    step("acceptance", "ok", acceptance_payload)
+
+    open_args = ["client-open", cid, *profile_args]
+    if output_dir_arg is not None:
+        open_args.extend(["--output-dir", output_dir_arg])
+    open_args.extend(["--format", "json"])
+    open_code, open_payload = run_manage_json_command(root_dir, open_args)
+    if open_code not in (EXIT_OK, EXIT_DRIFT):
+        step("open", "fail", open_payload)
+        payload = failure_payload(
+            client_id=cid,
+            private_repo=private_repo,
+            created_client=created_client,
+            nested_payload=open_payload,
+            command="first-box",
+            default_message=f"first-box client-open failed for {cid}",
+        )
+        return emit_first_box(payload)
+
+    step("open", "warn" if open_code == EXIT_DRIFT else "ok", open_payload)
+    payload = {
+        "client_id": cid,
+        "private_repo": private_repo,
+        "created_client": created_client,
+        "output_dir": open_payload.get("output_dir"),
+        "active_profiles": open_payload.get("active_profiles") or acceptance_payload.get("active_profiles") or ["core"],
+        "mcp_servers": open_payload.get("mcp_servers") or [],
+        "steps": steps,
+        "next_actions": next_actions_for_first_box(cid, profiles),
+        "exit_code": open_code,
+    }
+    return emit_first_box(payload)
+
+
 COMPOSE_OVERRIDES_DIR_REL = Path("workspace") / ".compose-overrides"
 
 
@@ -542,7 +751,12 @@ def smoke_requested_mcp_servers(
     for request in requested_mcp_servers(model):
         server_name = str(request["name"])
         service_id = request.get("service_id")
-        config = server_configs.get(server_name)
+        raw_config = server_configs.get(server_name)
+        config = (
+            translate_mcp_server_config(root_dir, raw_config)
+            if isinstance(raw_config, dict)
+            else raw_config
+        )
         if not isinstance(config, dict):
             detail["servers"][server_name] = {
                 "status": "fail",

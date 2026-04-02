@@ -424,21 +424,34 @@ should feel durable, legible, and agent-friendly.
 
 ## Installation
 
-There is no packaged release or curl installer yet. Today, installation means cloning or copying the repo, then choosing the workflow that matches where you are.
+The public entrypoint is now `install.sh`. It wraps the canonical `first-box`
+flow: acquire or reuse a checkout, hydrate `.env`, attach or create the private
+config repo, prove readiness with `acceptance`, and open a client-ready surface
+under `sand/<client>/`.
 
-### Option 1: Local checkout
+### Option 1: One-command installer
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/build000r/skillbox/main/install.sh | bash -s -- --client personal
+```
+
+### Option 2: Local checkout
 
 ```bash
 cp .env.example .env
-make doctor
-make runtime-sync
-make dev-sanity
+make first-box
 make build
 make up
 make shell
 ```
 
-### Option 2: Existing Linux host or droplet
+Or from an existing checkout:
+
+```bash
+bash install.sh --client personal
+```
+
+### Option 3: Existing Linux host or droplet
 
 ```bash
 cp .env.example .env
@@ -446,14 +459,12 @@ cd scripts
 sudo ./01-bootstrap-do.sh
 sudo TAILSCALE_AUTHKEY="tskey-..." TAILSCALE_HOSTNAME="skillbox-dev" ./02-install-tailscale.sh
 cd ..
-make doctor
-make runtime-sync
-make dev-sanity
+make first-box
 make build
 make up
 ```
 
-### Option 3: Operator-provisioned remote box
+### Option 4: Operator-provisioned remote box
 
 If the operator MCP server is configured, provision a box from Claude Code:
 
@@ -591,9 +602,10 @@ make runtime-sync
 | `.env-manager/manage.py restart` | Restart manageable services for the selected core/client scope, preserving declared dependency order | `python3 .env-manager/manage.py restart --profile surfaces --service web-stub` |
 | `.env-manager/manage.py logs` | Print recent log output for declared services | `python3 .env-manager/manage.py logs --profile surfaces --service api-stub --lines 80` |
 | `.env-manager/manage.py client-init` | Scaffold a new client overlay, optionally applying a reusable blueprint for repos, services, and client-scoped connector declarations | `python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo --set PRIMARY_REPO_URL=https://github.com/acme/app.git` |
+| `.env-manager/manage.py first-box` | Canonical first-run path: attach the private repo, reuse or scaffold the client, run acceptance, and open `sand/<client>/` | `python3 .env-manager/manage.py first-box personal --profile connectors` |
 | `.env-manager/manage.py private-init` | Attach or initialize the private client-config repo for this checkout and persist the local clients-root override | `python3 .env-manager/manage.py private-init --path ../skillbox-config` |
 | `.env-manager/manage.py client-project` | Compile a single-client projection bundle with a client-safe runtime manifest and sanitized metadata | `python3 .env-manager/manage.py client-project personal --profile surfaces` |
-| `.env-manager/manage.py client-open` | Build a client-safe working surface under `sand/<client>/` with scoped `CLAUDE.md`, `AGENTS.md`, and `.mcp.json` | `python3 .env-manager/manage.py client-open personal --profile connectors` |
+| `.env-manager/manage.py client-open` | Build a client-safe working surface under `sand/<client>/` with scoped `CLAUDE.md`, `AGENTS.md`, and `.mcp.json`, or re-open an existing reviewed bundle via `--from-bundle` | `python3 .env-manager/manage.py client-open personal --profile connectors` |
 | `.env-manager/manage.py client-diff` | Compare a client projection bundle against the current published payload and show both file-level and runtime-surface changes | `python3 .env-manager/manage.py client-diff personal --profile surfaces` |
 | `.env-manager/manage.py client-publish` | Promote a client projection bundle into the attached private git repo under `clients/<client>/current/`, optionally persisting acceptance evidence | `python3 .env-manager/manage.py client-publish personal --acceptance --commit` |
 | `.env-manager/pulse.py` | Pulse reconciliation daemon for continuous drift detection and auto-heal | `python3 .env-manager/pulse.py run --interval 30` |
@@ -689,6 +701,17 @@ private repo in one step:
 python3 .env-manager/manage.py private-init --path ../skillbox-config
 ```
 
+Or use the canonical first-run flow:
+
+```bash
+python3 .env-manager/manage.py first-box personal
+python3 .env-manager/manage.py first-box client-acme \
+  --blueprint git-repo-http-service-bootstrap \
+  --set PRIMARY_REPO_URL=https://github.com/acme/app.git \
+  --set BOOTSTRAP_COMMAND='pnpm install && mkdir -p .skillbox && touch .skillbox/bootstrap.ok' \
+  --set SERVICE_COMMAND='pnpm dev'
+```
+
 With that setup:
 
 - `skillbox` stays publishable
@@ -699,7 +722,8 @@ With that setup:
 - `client-init`, `sync`, and `focus` write client config into the private repo
 - `client-diff` and `client-publish` default to the attached private repo unless you explicitly pass `--target-dir`
 - `client-project <client>` compiles a client-safe bundle under `builds/clients/<client>/`
-- `client-open <client>` turns that bundle into a ready-to-work client surface under `sand/<client>/`
+- `first-box <client>` is the one-command runtime setup path for attaching the private repo, activating the client, and writing `sand/<client>/`
+- `client-open <client>` turns that bundle into a ready-to-work client surface under `sand/<client>/`, and `--from-bundle` re-opens a reviewed artifact without running live focus
 - client application repos stay separate under the shared monoserver tree
 - clients usually do not need access to the `skillbox` repo itself
 
@@ -740,6 +764,7 @@ private multi-client `skillbox-config/` setup:
 python3 .env-manager/manage.py client-open personal
 python3 .env-manager/manage.py client-open client-acme --profile connectors
 python3 .env-manager/manage.py client-open personal --output-dir ./artifacts/open-personal
+python3 .env-manager/manage.py client-open personal --from-bundle ./builds/clients/personal
 ```
 
 It does three things in one step:
@@ -747,6 +772,10 @@ It does three things in one step:
 - rebuilds the selected client's projection bundle into `sand/<client>/` by default
 - writes client-scoped `CLAUDE.md` and `AGENTS.md` into that surface instead of your shared home context
 - writes a filtered `.mcp.json` that includes only the MCP servers requested by the selected client and profiles
+
+When you already have a reviewed bundle, `--from-bundle <dir>` skips live
+`focus`, copies that bundle into the open surface, and regenerates static
+context plus `.mcp.json` from the bundled `runtime-model.json`.
 
 The generated surface is meant to be the safe place to point an agent at when
 you want one client in scope and every other client out of scope.

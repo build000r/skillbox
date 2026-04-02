@@ -13,8 +13,11 @@ TASK_ARGS := $(if $(strip $(TASK)),--task $(TASK),)
 LINES_ARGS := $(if $(strip $(LINES)),--lines $(LINES),)
 BLUEPRINT_ARGS := $(if $(strip $(BLUEPRINT)),--blueprint $(BLUEPRINT),)
 SET_ARGS := $(foreach s,$(SET),--set $(s))
+PRIVATE_PATH_ARGS := $(if $(strip $(PRIVATE_PATH)),--private-path $(PRIVATE_PATH),)
+OUTPUT_DIR_ARGS := $(if $(strip $(OUTPUT_DIR)),--output-dir $(OUTPUT_DIR),)
+FORCE_ARGS := $(if $(strip $(FORCE)),--force,)
 
-.PHONY: help bootstrap-env render doctor acceptance runtime-render runtime-sync runtime-status runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard context ack dev-sanity python-cov-xml build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles
+.PHONY: help bootstrap-env render doctor acceptance runtime-render runtime-sync runtime-status runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context ack dev-sanity python-cov-xml build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles
 
 help:
 	@printf "  make bootstrap-env  Copy .env.example to .env if missing\n"
@@ -30,6 +33,7 @@ help:
 	@printf "  make runtime-restart Restart manageable services (optional CLIENT=name PROFILE=name SERVICE=id)\n"
 	@printf "  make runtime-logs   Show recent service logs (optional CLIENT=name PROFILE=name SERVICE=id LINES=n)\n"
 	@printf "  make onboard        Scaffold, sync, bootstrap, start, context, verify in one step (CLIENT=id BLUEPRINT=name SET='K=V')\n"
+	@printf "  make first-box      Attach the private repo, reuse or scaffold CLIENT, run acceptance, and open sand/CLIENT (defaults CLIENT=personal)\n"
 	@printf "  make context        Generate CLAUDE.md and AGENTS.md from the runtime graph (optional CLIENT=name PROFILE=name)\n"
 	@printf "  make ack            Acknowledge journal events to curate agent context (TYPE=name SUBJECT=name ALL=1 LIST=1 PRUNE=1 REASON=text)\n"
 	@printf "  make pulse-start    Start the pulse reconciliation daemon (auto-heals crashed services)\n"
@@ -94,6 +98,9 @@ runtime-logs:
 
 onboard:
 	@python3 .env-manager/manage.py onboard $(CLIENT) $(BLUEPRINT_ARGS) $(SET_ARGS)
+
+first-box:
+	@python3 .env-manager/manage.py first-box $(if $(strip $(CLIENT)),$(CLIENT),personal) $(PROFILE_ARGS) $(PRIVATE_PATH_ARGS) $(OUTPUT_DIR_ARGS) $(BLUEPRINT_ARGS) $(SET_ARGS) $(FORCE_ARGS)
 
 context:
 	@python3 .env-manager/manage.py context $(CLIENT_ARGS) $(PROFILE_ARGS)

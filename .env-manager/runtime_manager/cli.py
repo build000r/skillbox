@@ -235,6 +235,11 @@ def main() -> int:
         default=None,
         help="Open-surface output directory. Defaults to sand/<client-id>.",
     )
+    client_open_parser.add_argument(
+        "--from-bundle",
+        default=None,
+        help="Existing client-project bundle to open instead of building a fresh one.",
+    )
     client_open_parser.add_argument("--format", choices=("text", "json"), default="text")
     add_profile_arg(client_open_parser)
 
@@ -324,6 +329,55 @@ def main() -> int:
         "--wait-seconds", type=float, default=DEFAULT_SERVICE_START_WAIT_SECONDS,
     )
     onboard_parser.add_argument("--format", choices=("text", "json"), default="text")
+
+    first_box_parser = subparsers.add_parser(
+        "first-box",
+        help="Canonical first-run path: attach the private repo, reuse or scaffold the client, prove readiness, and open a client surface.",
+    )
+    first_box_parser.add_argument(
+        "client_id",
+        nargs="?",
+        default="personal",
+        help="Client slug to prepare. Defaults to `personal`.",
+    )
+    first_box_parser.add_argument(
+        "--private-path",
+        default=None,
+        help="Private config repo path. Defaults to ../skillbox-config.",
+    )
+    first_box_parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Open-surface output directory. Defaults to sand/<client-id>.",
+    )
+    first_box_parser.add_argument("--label", default=None, help="Human-friendly label for the client when scaffolding.")
+    first_box_parser.add_argument(
+        "--root-path",
+        default=None,
+        help="Runtime path for the client root when scaffolding. Defaults to ${SKILLBOX_MONOSERVER_ROOT}/<client-id>.",
+    )
+    first_box_parser.add_argument(
+        "--default-cwd",
+        default=None,
+        help="Runtime default cwd for the client when scaffolding. Defaults to the client root path.",
+    )
+    first_box_parser.add_argument(
+        "--blueprint",
+        default=None,
+        help="Apply a reusable client blueprint when scaffolding a missing client.",
+    )
+    first_box_parser.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        help="Set a blueprint variable using KEY=VALUE. Can be repeated.",
+    )
+    first_box_parser.add_argument("--force", action="store_true", help="Overwrite existing scaffold files when onboarding.")
+    first_box_parser.add_argument(
+        "--wait-seconds", type=float, default=DEFAULT_SERVICE_START_WAIT_SECONDS,
+    )
+    first_box_parser.add_argument("--format", choices=("text", "json"), default="text")
+    add_profile_arg(first_box_parser)
 
     focus_parser = subparsers.add_parser(
         "focus",
@@ -458,6 +512,23 @@ def main() -> int:
             fmt=args.format,
         )
 
+    if args.command == "first-box":
+        return run_first_box(
+            root_dir=root_dir,
+            client_id=args.client_id,
+            private_path_arg=args.private_path,
+            profiles=args.profile,
+            output_dir_arg=args.output_dir,
+            label=args.label,
+            default_cwd=args.default_cwd,
+            root_path=args.root_path,
+            blueprint_name=args.blueprint,
+            set_args=args.set,
+            force=args.force,
+            wait_seconds=max(0.0, float(args.wait_seconds)),
+            fmt=args.format,
+        )
+
     if args.command == "private-init":
         try:
             payload = init_private_repo(
@@ -523,6 +594,7 @@ def main() -> int:
                 client_id=args.client_id,
                 profiles=args.profile,
                 output_dir_arg=args.output_dir,
+                from_bundle_arg=args.from_bundle,
             )
         except RuntimeError as exc:
             if args.format == "json":

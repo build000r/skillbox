@@ -2308,6 +2308,94 @@ class RuntimeManagerTests(unittest.TestCase):
             focus_state = json.loads((repo / "workspace" / ".focus.json").read_text(encoding="utf-8"))
             self.assertEqual(focus_state["client_id"], "personal")
 
+    def test_client_open_can_materialize_existing_bundle_without_focus(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            project = self._run(repo, "client-project", "personal", "--format", "json")
+            self.assertEqual(project.returncode, 0, project.stderr)
+
+            result = self._run(
+                repo,
+                "client-open",
+                "personal",
+                "--from-bundle",
+                "./builds/clients/personal",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            output_dir = repo / "sand" / "personal"
+            self.assertEqual(payload["client_id"], "personal")
+            self.assertEqual(payload["output_dir"], str(output_dir.resolve()))
+            self.assertEqual(payload["active_profiles"], ["core"])
+            self.assertEqual(payload["mcp_servers"], ["skillbox"])
+            self.assertEqual(payload["focus"]["status"], "skip")
+            self.assertEqual(payload["focus"]["step_names"], [])
+            self.assertTrue((output_dir / "CLAUDE.md").is_file())
+            self.assertTrue((output_dir / "AGENTS.md").is_symlink())
+            self.assertEqual(os.readlink(str(output_dir / "AGENTS.md")), "CLAUDE.md")
+            self.assertTrue((output_dir / ".mcp.json").is_file())
+            self.assertTrue((output_dir / "projection.json").is_file())
+            self.assertTrue((output_dir / "runtime-model.json").is_file())
+            self.assertTrue((output_dir / "workspace" / "clients" / "personal" / "overlay.yaml").is_file())
+            self.assertFalse((repo / "workspace" / ".focus.json").exists())
+
+            mcp_payload = json.loads((output_dir / ".mcp.json").read_text(encoding="utf-8"))
+            self.assertEqual(set(mcp_payload["mcpServers"]), {"skillbox"})
+
+    def test_client_open_from_bundle_supports_custom_output_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            project = self._run(
+                repo,
+                "client-project",
+                "personal",
+                "--profile",
+                "connectors",
+                "--output-dir",
+                "./builds/clients/personal-connectors",
+                "--format",
+                "json",
+            )
+            self.assertEqual(project.returncode, 0, project.stderr)
+
+            result = self._run(
+                repo,
+                "client-open",
+                "personal",
+                "--from-bundle",
+                "./builds/clients/personal-connectors",
+                "--output-dir",
+                "./artifacts/open-personal",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            output_dir = repo / "artifacts" / "open-personal"
+            self.assertEqual(payload["output_dir"], str(output_dir.resolve()))
+            self.assertEqual(payload["active_profiles"], ["connectors", "core"])
+            self.assertEqual(set(payload["mcp_servers"]), {"skillbox", "fwc", "dcg"})
+            self.assertEqual(payload["focus"]["status"], "skip")
+            self.assertFalse((repo / "workspace" / ".focus.json").exists())
+
+            mcp_payload = json.loads((output_dir / ".mcp.json").read_text(encoding="utf-8"))
+            self.assertEqual(set(mcp_payload["mcpServers"]), {"skillbox", "fwc", "dcg"})
+
+            runtime_model = json.loads((output_dir / "runtime-model.json").read_text(encoding="utf-8"))
+            self.assertEqual(runtime_model["active_profiles"], ["connectors", "core"])
+            self.assertEqual(
+                {service["id"] for service in runtime_model["services"]},
+                {"internal-env-manager", "fwc-mcp", "dcg-mcp"},
+            )
+
     def test_client_open_supports_profiles_and_custom_output_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir)
@@ -2356,6 +2444,30 @@ class RuntimeManagerTests(unittest.TestCase):
                 {"internal-env-manager", "fwc-mcp", "dcg-mcp"},
             )
 
+    def test_client_open_rejects_bundle_with_profile_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            project = self._run(repo, "client-project", "personal", "--format", "json")
+            self.assertEqual(project.returncode, 0, project.stderr)
+
+            result = self._run(
+                repo,
+                "client-open",
+                "personal",
+                "--from-bundle",
+                "./builds/clients/personal",
+                "--profile",
+                "connectors",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 1)
+            payload = json.loads(result.stdout)
+            self.assertIn("cannot combine --from-bundle with --profile", payload["error"]["message"])
+
     def test_client_open_fails_for_unknown_client(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -2372,6 +2484,30 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             payload = json.loads(result.stdout)
             self.assertIn("Unknown runtime client", payload["error"]["message"])
+
+    def test_client_open_rejects_bundle_for_the_wrong_client(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            project = self._run(repo, "client-project", "personal", "--format", "json")
+            self.assertEqual(project.returncode, 0, project.stderr)
+
+            result = self._run(
+                repo,
+                "client-open",
+                "vibe-coding-client",
+                "--from-bundle",
+                "./builds/clients/personal",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 1)
+            payload = json.loads(result.stdout)
+            self.assertIn("personal", payload["error"]["message"])
+            self.assertIn("vibe-coding-client", payload["error"]["message"])
+            self.assertFalse((repo / "sand" / "vibe-coding-client").exists())
 
     def test_client_open_refuses_to_overwrite_unrelated_output_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2772,6 +2908,223 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertIn("steps", payload)
             self.assertEqual(payload["steps"][0]["step"], "scaffold")
             self.assertEqual(payload["steps"][0]["status"], "fail")
+
+    # -- First-box macro ------------------------------------------------------
+
+    def test_first_box_completes_existing_personal_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            repo = workspace / "skillbox"
+            repo.mkdir(parents=True, exist_ok=True)
+            self._write_fixture(repo)
+
+            result = self._run(repo, "first-box", "personal", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            private_repo = workspace / "skillbox-config"
+            output_dir = repo / "sand" / "personal"
+            step_statuses = {step["step"]: step["status"] for step in payload["steps"]}
+
+            self.assertEqual(payload["client_id"], "personal")
+            self.assertFalse(payload["created_client"])
+            self.assertEqual(payload["private_repo"]["target_dir"], str(private_repo.resolve()))
+            self.assertEqual(
+                [step["step"] for step in payload["steps"]],
+                ["private-init", "onboard", "acceptance", "open"],
+            )
+            self.assertEqual(step_statuses["private-init"], "ok")
+            self.assertEqual(step_statuses["onboard"], "skip")
+            self.assertEqual(step_statuses["acceptance"], "ok")
+            self.assertEqual(step_statuses["open"], "ok")
+
+            env_text = (repo / ".env").read_text(encoding="utf-8")
+            self.assertIn("SKILLBOX_CLIENTS_HOST_ROOT=../skillbox-config/clients", env_text)
+            self.assertTrue((private_repo / ".git").exists())
+            self.assertTrue((private_repo / "clients" / "personal" / "overlay.yaml").is_file())
+            self.assertTrue((output_dir / "CLAUDE.md").is_file())
+            self.assertTrue((output_dir / "AGENTS.md").is_symlink())
+            self.assertTrue((output_dir / ".mcp.json").is_file())
+            self.assertEqual(os.readlink(str(output_dir / "AGENTS.md")), "CLAUDE.md")
+
+            mcp_payload = json.loads((output_dir / ".mcp.json").read_text(encoding="utf-8"))
+            self.assertEqual(set(mcp_payload["mcpServers"]), {"skillbox"})
+
+    def test_first_box_scaffolds_missing_client_with_blueprint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            repo = workspace / "skillbox"
+            repo.mkdir(parents=True, exist_ok=True)
+            self._write_fixture(repo)
+            source_repo = self._create_git_source_repo(repo, "fixture-app")
+            self._write_client_blueprint(
+                repo,
+                "git-repo",
+                "version: 1\n"
+                "description: Clone a repo.\n"
+                "variables:\n"
+                "  - name: PRIMARY_REPO_URL\n"
+                "    required: true\n"
+                "  - name: PRIMARY_REPO_PATH\n"
+                "    default: ${CLIENT_ROOT}/app\n"
+                "client:\n"
+                "  default_cwd: ${PRIMARY_REPO_PATH}\n"
+                "  repos:\n"
+                "    - id: app\n"
+                "      kind: repo\n"
+                "      path: ${PRIMARY_REPO_PATH}\n"
+                "      required: true\n"
+                "      profiles:\n"
+                "        - core\n"
+                "      source:\n"
+                "        kind: git\n"
+                "        url: ${PRIMARY_REPO_URL}\n"
+                "        branch: main\n"
+                "      sync:\n"
+                "        mode: clone-if-missing\n",
+            )
+            (repo / "monoserver-host" / "acme-app").mkdir(parents=True, exist_ok=True)
+
+            result = self._run(
+                repo,
+                "first-box",
+                "acme-app",
+                "--blueprint",
+                "git-repo",
+                "--set",
+                f"PRIMARY_REPO_URL={source_repo}",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            private_repo = workspace / "skillbox-config"
+            output_dir = repo / "sand" / "acme-app"
+            step_statuses = {step["step"]: step["status"] for step in payload["steps"]}
+
+            self.assertTrue(payload["created_client"])
+            self.assertEqual(step_statuses["private-init"], "ok")
+            self.assertEqual(step_statuses["onboard"], "ok")
+            self.assertEqual(step_statuses["acceptance"], "ok")
+            self.assertEqual(step_statuses["open"], "ok")
+            self.assertTrue((private_repo / "clients" / "acme-app" / "overlay.yaml").is_file())
+            self.assertTrue((output_dir / "CLAUDE.md").is_file())
+            self.assertTrue((output_dir / "workspace" / "clients" / "acme-app" / "overlay.yaml").is_file())
+
+    def test_first_box_surfaces_blueprint_validation_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            repo = workspace / "skillbox"
+            repo.mkdir(parents=True, exist_ok=True)
+            self._write_fixture(repo)
+            self._write_client_blueprint(
+                repo,
+                "git-repo",
+                "version: 1\n"
+                "description: Clone a repo.\n"
+                "variables:\n"
+                "  - name: PRIMARY_REPO_URL\n"
+                "    required: true\n"
+                "client:\n"
+                "  repos:\n"
+                "    - id: app\n"
+                "      kind: repo\n"
+                "      path: ${CLIENT_ROOT}/app\n"
+                "      required: true\n"
+                "      profiles:\n"
+                "        - core\n"
+                "      source:\n"
+                "        kind: git\n"
+                "        url: ${PRIMARY_REPO_URL}\n"
+                "        branch: main\n"
+                "      sync:\n"
+                "        mode: clone-if-missing\n",
+            )
+
+            result = self._run(
+                repo,
+                "first-box",
+                "acme-app",
+                "--blueprint",
+                "git-repo",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 1, result.stderr)
+            payload = json.loads(result.stdout)
+            step_statuses = {step["step"]: step["status"] for step in payload["steps"]}
+
+            self.assertEqual(payload["error"]["type"], "missing_variable")
+            self.assertTrue(payload["created_client"])
+            self.assertEqual(step_statuses["private-init"], "ok")
+            self.assertEqual(step_statuses["onboard"], "fail")
+            self.assertEqual(step_statuses["acceptance"], "skip")
+            self.assertEqual(step_statuses["open"], "skip")
+            self.assertFalse((repo / "sand" / "acme-app").exists())
+            self.assertTrue((workspace / "skillbox-config" / ".git").exists())
+
+    def test_first_box_refuses_to_overwrite_unrelated_output_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            repo = workspace / "skillbox"
+            repo.mkdir(parents=True, exist_ok=True)
+            self._write_fixture(repo)
+            existing_dir = repo / "artifacts" / "existing-open"
+            existing_dir.mkdir(parents=True, exist_ok=True)
+            (existing_dir / "note.txt").write_text("keep me\n", encoding="utf-8")
+
+            result = self._run(
+                repo,
+                "first-box",
+                "personal",
+                "--output-dir",
+                "./artifacts/existing-open",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 1, result.stderr)
+            payload = json.loads(result.stdout)
+            step_statuses = {step["step"]: step["status"] for step in payload["steps"]}
+
+            self.assertEqual(payload["error"]["type"], "conflict")
+            self.assertEqual(step_statuses["private-init"], "ok")
+            self.assertEqual(step_statuses["acceptance"], "ok")
+            self.assertEqual(step_statuses["open"], "fail")
+            self.assertEqual((existing_dir / "note.txt").read_text(encoding="utf-8"), "keep me\n")
+
+    def test_first_box_runs_connectors_acceptance_and_open_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            repo = workspace / "skillbox"
+            repo.mkdir(parents=True, exist_ok=True)
+            self._write_fixture(repo)
+            self._set_client_connectors(repo, "personal", ["github", "slack"])
+            self._write_connector_focus_artifacts(repo)
+            self._install_absolute_mcp_stub(self._fixture_mcp_stub_path(repo, "fwc"), tool_names=["fwc_ping"])
+            self._install_absolute_mcp_stub(self._fixture_mcp_stub_path(repo, "dcg"), tool_names=["dcg_ping"])
+            self.addCleanup(self._run, repo, "down", "--profile", "connectors", "--format", "json")
+
+            result = self._run(
+                repo,
+                "first-box",
+                "personal",
+                "--profile",
+                "connectors",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            output_dir = repo / "sand" / "personal"
+
+            self.assertEqual(payload["active_profiles"], ["connectors", "core"])
+            self.assertEqual(set(payload["mcp_servers"]), {"skillbox", "fwc", "dcg"})
+            mcp_payload = json.loads((output_dir / ".mcp.json").read_text(encoding="utf-8"))
+            self.assertEqual(set(mcp_payload["mcpServers"]), {"skillbox", "fwc", "dcg"})
 
     def _run(self, repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -4064,6 +4417,23 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(payload["error"]["type"], "mcp_smoke_failed")
             self.assertIn("sync --profile connectors --format json", payload["next_actions"])
             self.assertIn("logs --service fwc-mcp --format json", payload["next_actions"])
+
+    def test_acceptance_translates_runtime_mcp_paths_before_smoke(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            mcp_payload = json.loads((repo / ".mcp.json").read_text(encoding="utf-8"))
+            mcp_payload["mcpServers"]["skillbox"]["args"] = ["/workspace/.env-manager/mcp_server.py"]
+            (repo / ".mcp.json").write_text(json.dumps(mcp_payload, indent=2) + "\n", encoding="utf-8")
+
+            result = self._run(repo, "acceptance", "personal", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            steps = {step["step"]: step for step in payload["steps"]}
+            self.assertTrue(payload["ready"])
+            self.assertEqual(steps["mcp-smoke"]["status"], "ok")
 
     def test_doctor_fails_when_url_artifact_lacks_sha256(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

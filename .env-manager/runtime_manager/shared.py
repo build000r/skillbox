@@ -173,7 +173,10 @@ def classify_error(exc: RuntimeError, command: str) -> dict[str, Any]:
             recovery_hint="List available blueprints, then retry with a valid name or path.",
             next_actions=["client-init --list-blueprints --format json"],
         )
-    if "required" in msg.lower() and "variable" in msg.lower():
+    if (
+        ("required" in msg.lower() and "variable" in msg.lower())
+        or "missing required values" in msg.lower()
+    ):
         return structured_error(
             msg,
             error_type="missing_variable",
@@ -239,6 +242,8 @@ def classify_error(exc: RuntimeError, command: str) -> dict[str, Any]:
         fallback_next = ["client-init --list-blueprints --format json"]
     elif command == "client-open":
         fallback_next = ["focus --format json", "doctor --format json"]
+    elif command == "first-box":
+        fallback_next = ["status --format json", "doctor --format json"]
     elif command in ("down",):
         fallback_next = ["status --format json"]
 
@@ -394,6 +399,15 @@ def next_actions_for_client_open(client_id: str) -> list[str]:
     return [
         f"client-diff {client_id} --format json",
         f"client-publish {client_id} --format json",
+    ]
+
+
+def next_actions_for_first_box(client_id: str, profiles: list[str] | None) -> list[str]:
+    profile_args = format_profile_args(profiles)
+    return [
+        f"status --client {client_id}{profile_args} --format json",
+        f"client-diff {client_id}{profile_args} --format json",
+        f"client-publish {client_id} --acceptance{profile_args} --format json",
     ]
 
 
