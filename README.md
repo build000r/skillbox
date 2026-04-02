@@ -695,6 +695,7 @@ With that setup:
 - `skillbox-config/clients/<client>/overlay.yaml` is the private source of truth
 - `skillbox-config/clients/<client>/skills/` holds private client-local skill sources
 - `skillbox-config/clients/<client>/bundles/` holds generated client-local `.skill` bundles
+- `skillbox-config/clients/<client>/plans/INDEX.md` plus `plans/{draft,released,sessions}/` are first-class overlay artifacts
 - `client-init`, `sync`, and `focus` write client config into the private repo
 - `client-diff` and `client-publish` default to the attached private repo unless you explicitly pass `--target-dir`
 - `client-project <client>` compiles a client-safe bundle under `builds/clients/<client>/`
@@ -752,11 +753,17 @@ you want one client in scope and every other client out of scope.
 
 ### Publishing a client bundle
 
-The intended promotion loop is:
+The hardened v1 promotion loop is:
 
 ```bash
 python3 .env-manager/manage.py private-init --path ../skillbox-config
-python3 .env-manager/manage.py client-open personal --profile surfaces
+python3 .env-manager/manage.py client-init personal \
+  --blueprint git-repo-http-service-bootstrap \
+  --set PRIMARY_REPO_URL=https://github.com/acme/app.git \
+  --set BOOTSTRAP_COMMAND='pnpm install && mkdir -p .skillbox && touch .skillbox/bootstrap.ok' \
+  --set SERVICE_COMMAND='pnpm dev'
+python3 .env-manager/manage.py sync --client personal --profile surfaces
+python3 .env-manager/manage.py focus personal --profile surfaces --format json
 python3 .env-manager/manage.py client-diff personal --profile surfaces
 python3 .env-manager/manage.py client-publish personal --acceptance --commit --profile surfaces
 ```
@@ -818,7 +825,7 @@ sources:
     sha: 9f0f69029aee5c6b247bf25dcfe13e34f2110e3a
 
   - kind: local
-    path: ./skills
+    path: ../skills
 ```
 
 ### Default skill manifest
@@ -827,6 +834,12 @@ sources:
 
 ```text
 ask-cascade
+build-vs-clone
+describe
+reproduce
+commit
+dev-sanity
+skillbox-operator
 ```
 
 ### Generated skill lockfiles
@@ -957,18 +970,15 @@ Create a new overlay scaffold with:
 python3 .env-manager/manage.py client-init acme-studio
 ```
 
-Or start from a built-in client blueprint that wires repos, services, logs, and
-checks into the scaffold:
+That base scaffold seeds the client-local planning pack
+(`domain-planner`, `domain-reviewer`, `domain-scaffolder`, and
+`divide-and-conquer`) plus `plans/INDEX.md` and `plans/{draft,released,sessions}`.
+
+For the hardened v1 onboarding path, start from the built-in blueprint that
+wires repos, services, logs, bootstrap, and checks into the scaffold:
 
 ```bash
 python3 .env-manager/manage.py client-init --list-blueprints
-python3 .env-manager/manage.py client-init acme-studio \
-  --blueprint git-repo \
-  --set PRIMARY_REPO_URL=https://github.com/acme/app.git
-python3 .env-manager/manage.py client-init acme-studio \
-  --blueprint git-repo-http-service \
-  --set PRIMARY_REPO_URL=https://github.com/acme/app.git \
-  --set SERVICE_COMMAND='pnpm dev'
 python3 .env-manager/manage.py client-init acme-studio \
   --blueprint git-repo-http-service-bootstrap \
   --set PRIMARY_REPO_URL=https://github.com/acme/app.git \

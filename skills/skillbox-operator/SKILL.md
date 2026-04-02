@@ -143,6 +143,11 @@ Built-in blueprints and their required `--set` variables:
 | `git-repo-http-service` | Clone + managed dev server | `PRIMARY_REPO_URL`, `SERVICE_COMMAND` |
 | `git-repo-http-service-bootstrap` | Clone + install step + dev server | `PRIMARY_REPO_URL`, `BOOTSTRAP_COMMAND`, `SERVICE_COMMAND` |
 
+For the hardened v1 release path, prefer `git-repo-http-service-bootstrap`.
+That is the blessed onboarding path that pairs with `private-init`,
+client-local planning roots under `skillbox-config/clients/<client>/plans/`,
+and `client-publish --acceptance`.
+
 All blueprints accept optional overrides for repo IDs, paths, ports, and healthcheck URLs. Run `--list-blueprints --format json` to see every variable, its default, and description.
 
 For manual step-by-step control, use `client-init`, `sync`, `bootstrap`, `up`, and `context` individually.

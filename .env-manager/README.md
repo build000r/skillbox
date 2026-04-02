@@ -16,13 +16,12 @@ python3 .env-manager/manage.py up --profile surfaces
 python3 .env-manager/manage.py down --profile surfaces --service api-stub
 python3 .env-manager/manage.py logs --profile surfaces --service api-stub --lines 80
 python3 .env-manager/manage.py client-init --list-blueprints
-python3 .env-manager/manage.py client-init acme-studio
-python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo --set PRIMARY_REPO_URL=https://github.com/acme/app.git
-python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo-http-service --set PRIMARY_REPO_URL=https://github.com/acme/app.git --set SERVICE_COMMAND='pnpm dev'
+python3 .env-manager/manage.py private-init --path ../skillbox-config --format json
+python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo-http-service-bootstrap --set PRIMARY_REPO_URL=https://github.com/acme/app.git --set BOOTSTRAP_COMMAND='pnpm install && mkdir -p .skillbox && touch .skillbox/bootstrap.ok' --set SERVICE_COMMAND='pnpm dev'
 python3 .env-manager/manage.py client-project personal
 python3 .env-manager/manage.py client-project personal --profile surfaces --output-dir ./builds/clients/personal-surfaces
-python3 .env-manager/manage.py client-diff personal --target-dir ../skillbox-config-control --profile surfaces
-python3 .env-manager/manage.py client-publish personal --target-dir ../skillbox-config-control --acceptance --commit --profile surfaces
+python3 .env-manager/manage.py client-diff personal --profile surfaces
+python3 .env-manager/manage.py client-publish personal --acceptance --commit --profile surfaces
 python3 .env-manager/manage.py sync --client personal
 python3 .env-manager/manage.py render --client personal --profile surfaces
 python3 .env-manager/manage.py status --profile swimmers
@@ -45,10 +44,10 @@ The mental model is:
 - `--profile connectors` is the runtime connector surface: pinned binaries and MCP services
 - `--profile connectors-dev` adds optional FWC/DCG source checkouts for inspection or development
 - `client-init` scaffolds `${SKILLBOX_CLIENTS_HOST_ROOT:-./workspace/clients}/<client>/overlay.yaml`
-  and the companion skill directories for a new overlay
+  plus the companion skill directories, planning roots, and planning-pack manifest for a new overlay
 - `client-init --blueprint ...` appends reusable repos, services, logs, and
   checks to that scaffold so `render`, `sync`, and `up` immediately work on a
-  concrete client shape
+  concrete client shape; the blessed hardened-v1 path is `git-repo-http-service-bootstrap`
 - `SKILLBOX_FWC_CONNECTORS` is the box-level connector superset; `client.connectors`
   in overlays can only narrow that set, and `doctor` / `acceptance` fail early
   when a client widens it

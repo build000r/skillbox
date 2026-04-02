@@ -964,7 +964,7 @@ def run_focus(
             "checks_total": checks_total,
             "recent_errors": error_count,
         },
-        "next_actions": next_actions_for_focus(cid, has_fail),
+        "next_actions": next_actions_for_focus(cid, has_fail, live.get("services") or []),
     }
 
     emit_event("focus.activated", cid, payload.get("summary", {}), root_dir)

@@ -6,4 +6,4 @@ sources:
     sha: 9f0f69029aee5c6b247bf25dcfe13e34f2110e3a
 
   - kind: local
-    path: ./skills
+    path: ../skills

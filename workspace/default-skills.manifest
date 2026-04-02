@@ -8,4 +8,9 @@
 # - The first source containing `<source-root>/<skill-name>/SKILL.md` wins.
 
 ask-cascade
+build-vs-clone
+describe
+reproduce
+commit
+dev-sanity
 skillbox-operator

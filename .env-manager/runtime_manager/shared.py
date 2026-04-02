@@ -75,6 +75,7 @@ CLIENT_PUBLISH_CURRENT_REL = Path("current")
 CLIENT_PUBLISH_METADATA_REL = Path("publish.json")
 CLIENT_ACCEPTANCE_METADATA_REL = Path("acceptance.json")
 DEFAULT_PRIVATE_REPO_REL = Path("..") / "skillbox-config"
+CLIENT_PLANNING_SKILL_TEMPLATE_REL = Path("workspace") / "client-planning-skills"
 CLIENT_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 BLUEPRINT_VARIABLE_PATTERN = re.compile(r"^[A-Z0-9_]+$")
 SCAFFOLD_PLACEHOLDER_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
@@ -94,6 +95,27 @@ PATH_LIKE_ENV_KEYS = {
     "SKILLBOX_SWIMMERS_INSTALL_DIR",
     "SKILLBOX_SWIMMERS_BIN",
     "SKILLBOX_DCG_BIN",
+}
+HARDENED_SHARED_DEFAULT_SKILLS = [
+    "ask-cascade",
+    "build-vs-clone",
+    "describe",
+    "reproduce",
+    "commit",
+    "dev-sanity",
+    "skillbox-operator",
+]
+HARDENED_CLIENT_PLANNING_SKILLS = [
+    "domain-planner",
+    "domain-reviewer",
+    "domain-scaffolder",
+    "divide-and-conquer",
+]
+HARDENED_CLIENT_PLAN_PATHS = {
+    "plan_root": "plans/released",
+    "plan_draft": "plans/draft",
+    "plan_index": "plans/INDEX.md",
+    "session_plans": "plans/sessions",
 }
 
 
@@ -294,24 +316,38 @@ def next_actions_for_context() -> list[str]:
 
 
 def next_actions_for_private_init() -> list[str]:
-    return ["render --format json"]
+    return [
+        "client-init <client> --format json",
+        "client-diff <client> --format json",
+    ]
 
 
 def next_actions_for_client_init(client_id: str) -> list[str]:
     return [
         f"sync --client {client_id} --format json",
-        f"bootstrap --client {client_id} --format json",
-        f"up --client {client_id} --format json",
+        f"focus {client_id} --format json",
+        f"client-diff {client_id} --format json",
+        f"client-publish {client_id} --acceptance --format json",
     ]
 
 
-def next_actions_for_focus(client_id: str, has_fail: bool) -> list[str]:
+def next_actions_for_focus(
+    client_id: str,
+    has_fail: bool,
+    live_services: list[dict[str, Any]] | None = None,
+) -> list[str]:
     if has_fail:
         return [
             f"doctor --client {client_id} --format json",
             f"logs --client {client_id} --format json",
         ]
-    return [f"status --client {client_id} --format json"]
+    actions = [f"status --client {client_id} --format json"]
+    for service in live_services or []:
+        service_id = str(service.get("id") or "").strip()
+        if service_id:
+            actions.append(f"logs --service {service_id} --client {client_id} --format json")
+            break
+    return actions
 
 
 def format_profile_args(profiles: list[str] | None) -> str:
@@ -948,6 +984,10 @@ def base_client_overlay(
                 "notes": f"Client-scoped logs for the {client_id} overlay.",
             }
         ],
+        "context": {
+            "cwd_match": [client_default_cwd],
+            "plans": copy.deepcopy(HARDENED_CLIENT_PLAN_PATHS),
+        },
         "checks": [
             {
                 "id": f"{client_id}-root",
@@ -959,6 +999,110 @@ def base_client_overlay(
             }
         ],
     }
+
+
+def render_client_skill_manifest(
+    client_label: str,
+    required_skills: list[str],
+    existing_skills: list[str] | None = None,
+) -> str:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for skill_name in [*required_skills, *(existing_skills or [])]:
+        normalized = str(skill_name).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+
+    lines = [f"# {client_label} client-specific skills."]
+    if ordered:
+        lines.append("")
+        lines.extend(ordered)
+    return "\n".join(lines) + "\n"
+
+
+def render_client_plan_index(client_label: str) -> str:
+    return (
+        f"# {client_label} Plan Index\n"
+        "\n"
+        "| Slice | Tag | Status | Summary |\n"
+        "|---|---|---|---|\n"
+    )
+
+
+def client_plan_seed_files(overlay_dir: Path, client_label: str) -> dict[Path, str]:
+    plan_dir = overlay_dir / "plans"
+    return {
+        plan_dir / "INDEX.md": render_client_plan_index(client_label),
+        plan_dir / "draft" / ".gitkeep": "",
+        plan_dir / "released" / ".gitkeep": "",
+        plan_dir / "sessions" / ".gitkeep": "",
+    }
+
+
+def client_planning_skill_template_root() -> Path:
+    return (DEFAULT_ROOT_DIR / CLIENT_PLANNING_SKILL_TEMPLATE_REL).resolve()
+
+
+def ensure_client_planning_skill_sources(
+    root_dir: Path,
+    overlay_dir: Path,
+    *,
+    dry_run: bool,
+) -> list[str]:
+    template_root = client_planning_skill_template_root()
+    actions: list[str] = []
+    if not template_root.is_dir():
+        raise RuntimeError(f"Missing client planning skill templates at {template_root}")
+
+    skills_root = overlay_dir / "skills"
+    ensure_directory(skills_root, dry_run=dry_run)
+    for skill_name in HARDENED_CLIENT_PLANNING_SKILLS:
+        source_dir = template_root / skill_name
+        if not source_dir.is_dir():
+            raise RuntimeError(f"Missing planning skill template for {skill_name} at {source_dir}")
+        target_dir = skills_root / skill_name
+        if target_dir.exists():
+            continue
+        if not dry_run:
+            shutil.copytree(source_dir, target_dir)
+        actions.append(f"copy-skill-template: {repo_rel(root_dir, target_dir)}")
+    return actions
+
+
+def ensure_client_planning_skill_bundles(
+    root_dir: Path,
+    overlay_dir: Path,
+    *,
+    dry_run: bool,
+) -> list[str]:
+    actions: list[str] = []
+    output_dir = overlay_dir / "bundles"
+    ensure_directory(output_dir, dry_run=dry_run)
+    packager = DEFAULT_ROOT_DIR / "scripts" / "package_skill.py"
+
+    for skill_name in HARDENED_CLIENT_PLANNING_SKILLS:
+        source_dir = overlay_dir / "skills" / skill_name
+        bundle_path = output_dir / f"{skill_name}.skill"
+        if bundle_path.is_file():
+            continue
+        if dry_run:
+            actions.append(f"package-skill-bundle: {repo_rel(root_dir, bundle_path)}")
+            continue
+        result = run_command(
+            [
+                sys.executable,
+                str(packager),
+                str(source_dir),
+                str(output_dir),
+            ],
+            cwd=DEFAULT_ROOT_DIR,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"failed to package {skill_name}")
+        actions.append(f"package-skill-bundle: {repo_rel(root_dir, bundle_path)}")
+    return actions
 
 
 def default_client_scaffold_files(
@@ -979,62 +1123,22 @@ def default_client_scaffold_files(
     bundle_readme_path = bundle_dir / "README.md"
     skills_keep_path = skills_dir / ".gitkeep"
 
-    return {
-        overlay_path: (
-            "version: 1\n"
-            "\n"
-            "client:\n"
-            f"  id: {json.dumps(client_id)}\n"
-            f"  label: {json.dumps(client_label)}\n"
-            f"  default_cwd: {json.dumps(client_default_cwd)}\n"
-            "  repo_roots:\n"
-            f"    - id: {json.dumps(f'{client_id}-root')}\n"
-            "      kind: repo-root\n"
-            f"      path: {json.dumps(client_root)}\n"
-            "      required: true\n"
-            "      profiles:\n"
-            "        - core\n"
-            "      source:\n"
-            "        kind: bind\n"
-            "      sync:\n"
-            "        mode: external\n"
-            "      notes: Client root mounted from the shared monoserver tree.\n"
-            "  skills:\n"
-            f"    - id: {json.dumps(f'{client_id}-skills')}\n"
-            "      kind: packaged-skill-set\n"
-            "      required: false\n"
-            "      profiles:\n"
-            "        - core\n"
-            f"      bundle_dir: {json.dumps(f'${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/bundles')}\n"
-            f"      manifest: {json.dumps(f'${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skills.manifest')}\n"
-            f"      sources_config: {json.dumps(f'${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skills.sources.yaml')}\n"
-            f"      lock_path: {json.dumps(f'${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skills.lock.json')}\n"
-            "      sync:\n"
-            "        mode: unpack-bundles\n"
-            "      install_targets:\n"
-            "        - id: claude\n"
-            f"          path: {json.dumps('${SKILLBOX_HOME_ROOT}/.claude/skills')}\n"
-            "        - id: codex\n"
-            f"          path: {json.dumps('${SKILLBOX_HOME_ROOT}/.codex/skills')}\n"
-            "      notes: Client-scoped skills layered on top of the shared defaults.\n"
-            "  logs:\n"
-            f"    - id: {json.dumps(client_id)}\n"
-            f"      path: {json.dumps(f'${{SKILLBOX_LOG_ROOT}}/clients/{client_id}')}\n"
-            "      required: false\n"
-            "      profiles:\n"
-            "        - core\n"
-            "      retention_days: 14\n"
-            f"      notes: Client-scoped logs for the {client_id} overlay.\n"
-            "  checks:\n"
-            f"    - id: {json.dumps(f'{client_id}-root')}\n"
-            "      type: path_exists\n"
-            f"      path: {json.dumps(client_root)}\n"
-            "      required: true\n"
-            "      profiles:\n"
-            "        - core\n"
-            f"      notes: The {client_id} overlay expects the client root to be mounted.\n"
+    target_files = {
+        overlay_path: render_yaml_document(
+            {
+                "version": 1,
+                "client": base_client_overlay(
+                    client_id=client_id,
+                    client_label=client_label,
+                    client_root=client_root,
+                    client_default_cwd=client_default_cwd,
+                ),
+            }
         ),
-        manifest_path: f"# {client_label} client-specific skills.\n",
+        manifest_path: render_client_skill_manifest(
+            client_label,
+            HARDENED_CLIENT_PLANNING_SKILLS,
+        ),
         sources_path: (
             "version: 1\n"
             "\n"
@@ -1047,6 +1151,8 @@ def default_client_scaffold_files(
         ),
         skills_keep_path: "",
     }
+    target_files.update(client_plan_seed_files(overlay_dir, client_label))
+    return target_files
 
 
 def merge_client_overlay(base_client: dict[str, Any], blueprint_client: dict[str, Any]) -> dict[str, Any]:
@@ -1155,9 +1261,12 @@ def build_blueprinted_client_scaffold_files(
     bundle_readme_path = bundle_dir / "README.md"
     skills_keep_path = skills_dir / ".gitkeep"
 
-    return {
+    target_files = {
         overlay_path: render_yaml_document({"version": 1, "client": overlay_client}),
-        manifest_path: f"# {overlay_client['label']} client-specific skills.\n",
+        manifest_path: render_client_skill_manifest(
+            str(overlay_client["label"]),
+            HARDENED_CLIENT_PLANNING_SKILLS,
+        ),
         sources_path: render_yaml_document(
             {
                 "version": 1,
@@ -1172,6 +1281,8 @@ def build_blueprinted_client_scaffold_files(
         bundle_readme_path: f"Generated `.skill` bundles for the `{client_id}` client overlay land here.\n",
         skills_keep_path: "",
     }
+    target_files.update(client_plan_seed_files(overlay_dir, str(overlay_client["label"])))
+    return target_files
 
 
 def scaffold_client_overlay(
@@ -1241,6 +1352,22 @@ def scaffold_client_overlay(
     for path, content in target_files.items():
         write_text_file(path, content, dry_run=dry_run)
         actions.append(f"write-file: {repo_rel(root_dir, path)}")
+
+    overlay_dir = client_config_host_dir(root_dir, env_values, client_id)
+    actions.extend(
+        ensure_client_planning_skill_sources(
+            root_dir,
+            overlay_dir,
+            dry_run=dry_run,
+        )
+    )
+    actions.extend(
+        ensure_client_planning_skill_bundles(
+            root_dir,
+            overlay_dir,
+            dry_run=dry_run,
+        )
+    )
 
     return actions, blueprint_metadata
 
@@ -1924,6 +2051,190 @@ def migrate_client_subtree(
     return actions
 
 
+def ensure_client_overlay_skillset_shape(client_doc: dict[str, Any], client_id: str) -> None:
+    skillset_template = copy.deepcopy(base_client_overlay(
+        client_id=client_id,
+        client_label=titleize_client_id(client_id),
+        client_root=f"${{SKILLBOX_MONOSERVER_ROOT}}/{client_id}",
+        client_default_cwd=f"${{SKILLBOX_MONOSERVER_ROOT}}/{client_id}",
+    )["skills"][0])
+
+    raw_skills = client_doc.setdefault("skills", [])
+    if not isinstance(raw_skills, list):
+        raise RuntimeError("Expected client.skills to be a list.")
+
+    target_skillset: dict[str, Any] | None = None
+    for skillset in raw_skills:
+        if not isinstance(skillset, dict):
+            continue
+        skillset_id = str(skillset.get("id") or "").strip()
+        if skillset_id == f"{client_id}-skills" or str(skillset.get("kind") or "").strip() == "packaged-skill-set":
+            target_skillset = skillset
+            break
+
+    if target_skillset is None:
+        target_skillset = {}
+        raw_skills.append(target_skillset)
+
+    for key, value in skillset_template.items():
+        if key in {"install_targets", "sync"}:
+            target_skillset[key] = copy.deepcopy(value)
+        elif key not in target_skillset:
+            target_skillset[key] = copy.deepcopy(value)
+        else:
+            target_skillset[key] = copy.deepcopy(value)
+
+
+def ensure_client_overlay_context_shape(client_doc: dict[str, Any], client_default_cwd: str) -> None:
+    raw_context = client_doc.setdefault("context", {})
+    if not isinstance(raw_context, dict):
+        raise RuntimeError("Expected client.context to be a mapping.")
+
+    raw_cwd_match = raw_context.get("cwd_match")
+    if not isinstance(raw_cwd_match, list):
+        raw_cwd_match = []
+    normalized_cwd_match = [
+        str(value).strip()
+        for value in raw_cwd_match
+        if str(value).strip()
+    ]
+    if client_default_cwd not in normalized_cwd_match:
+        normalized_cwd_match.append(client_default_cwd)
+    raw_context["cwd_match"] = normalized_cwd_match or [client_default_cwd]
+
+    raw_plans = raw_context.setdefault("plans", {})
+    if not isinstance(raw_plans, dict):
+        raise RuntimeError("Expected client.context.plans to be a mapping.")
+    for key, value in HARDENED_CLIENT_PLAN_PATHS.items():
+        raw_plans[key] = value
+
+
+def ensure_client_overlay_sources_shape(sources_path: Path) -> str:
+    if sources_path.is_file():
+        raw = load_yaml(sources_path)
+        if not isinstance(raw, dict):
+            raise RuntimeError(f"Expected a mapping in {sources_path}")
+        version = int(raw.get("version") or 1)
+        raw_sources = raw.get("sources") or []
+        if not isinstance(raw_sources, list):
+            raise RuntimeError(f"Expected `sources` to be a list in {sources_path}")
+        sources: list[dict[str, Any]] = []
+        has_local_skills = False
+        for item in raw_sources:
+            if not isinstance(item, dict):
+                continue
+            normalized = copy.deepcopy(item)
+            if (
+                str(normalized.get("kind") or "").strip() == "local"
+                and str(normalized.get("path") or "").strip() == "./skills"
+            ):
+                has_local_skills = True
+            sources.append(normalized)
+        if not has_local_skills:
+            sources.insert(0, {"kind": "local", "path": "./skills"})
+        payload = {"version": version, "sources": sources}
+        return render_yaml_document(payload)
+
+    return render_yaml_document(
+        {
+            "version": 1,
+            "sources": [{"kind": "local", "path": "./skills"}],
+        }
+    )
+
+
+def normalize_client_overlay_shape(root_dir: Path, overlay_dir: Path) -> list[str]:
+    overlay_path = overlay_dir / "overlay.yaml"
+    if not overlay_path.is_file():
+        return []
+
+    overlay_doc = load_yaml(overlay_path)
+    if not isinstance(overlay_doc, dict):
+        raise RuntimeError(f"Expected a mapping in {overlay_path}")
+    client_doc = overlay_doc.setdefault("client", {})
+    if not isinstance(client_doc, dict):
+        raise RuntimeError(f"Expected a mapping at client in {overlay_path}")
+
+    client_id = validate_client_id(str(client_doc.get("id") or overlay_dir.name))
+    client_label = str(client_doc.get("label") or titleize_client_id(client_id)).strip() or titleize_client_id(client_id)
+    client_default_cwd = str(
+        client_doc.get("default_cwd")
+        or f"${{SKILLBOX_MONOSERVER_ROOT}}/{client_id}"
+    ).strip()
+    client_doc["id"] = client_id
+    client_doc["label"] = client_label
+    client_doc["default_cwd"] = client_default_cwd
+
+    ensure_client_overlay_skillset_shape(client_doc, client_id)
+    ensure_client_overlay_context_shape(client_doc, client_default_cwd)
+
+    actions: list[str] = []
+    rendered_overlay = render_yaml_document(overlay_doc)
+    existing_overlay = overlay_path.read_text(encoding="utf-8")
+    if existing_overlay != rendered_overlay:
+        overlay_path.write_text(rendered_overlay, encoding="utf-8")
+        actions.append(f"normalize-overlay: {repo_rel(root_dir, overlay_path)}")
+
+    manifest_path = overlay_dir / "skills.manifest"
+    existing_skills = read_manifest_skills(manifest_path) if manifest_path.is_file() else []
+    manifest_text = render_client_skill_manifest(
+        client_label,
+        HARDENED_CLIENT_PLANNING_SKILLS,
+        existing_skills,
+    )
+    if not manifest_path.is_file() or manifest_path.read_text(encoding="utf-8") != manifest_text:
+        ensure_directory(manifest_path.parent, dry_run=False)
+        manifest_path.write_text(manifest_text, encoding="utf-8")
+        actions.append(f"write-file: {repo_rel(root_dir, manifest_path)}")
+
+    sources_path = overlay_dir / "skills.sources.yaml"
+    sources_text = ensure_client_overlay_sources_shape(sources_path)
+    if not sources_path.is_file() or sources_path.read_text(encoding="utf-8") != sources_text:
+        ensure_directory(sources_path.parent, dry_run=False)
+        sources_path.write_text(sources_text, encoding="utf-8")
+        actions.append(f"write-file: {repo_rel(root_dir, sources_path)}")
+
+    bundle_readme_path = overlay_dir / "bundles" / "README.md"
+    bundle_readme_text = f"Generated `.skill` bundles for the `{client_id}` client overlay land here.\n"
+    ensure_directory(bundle_readme_path.parent, dry_run=False)
+    if not bundle_readme_path.is_file() or bundle_readme_path.read_text(encoding="utf-8") != bundle_readme_text:
+        bundle_readme_path.write_text(bundle_readme_text, encoding="utf-8")
+        actions.append(f"write-file: {repo_rel(root_dir, bundle_readme_path)}")
+
+    skills_keep_path = overlay_dir / "skills" / ".gitkeep"
+    ensure_directory(skills_keep_path.parent, dry_run=False)
+    if not skills_keep_path.exists():
+        skills_keep_path.write_text("", encoding="utf-8")
+        actions.append(f"write-file: {repo_rel(root_dir, skills_keep_path)}")
+
+    actions.extend(
+        ensure_client_planning_skill_sources(
+            root_dir,
+            overlay_dir,
+            dry_run=False,
+        )
+    )
+    actions.extend(
+        ensure_client_planning_skill_bundles(
+            root_dir,
+            overlay_dir,
+            dry_run=False,
+        )
+    )
+
+    for seed_path, content in client_plan_seed_files(overlay_dir, client_label).items():
+        ensure_directory(seed_path.parent, dry_run=False)
+        if seed_path.is_file():
+            if seed_path.name == "INDEX.md" and seed_path.read_text(encoding="utf-8").strip():
+                continue
+            if seed_path.read_text(encoding="utf-8") == content:
+                continue
+        seed_path.write_text(content, encoding="utf-8")
+        actions.append(f"write-file: {repo_rel(root_dir, seed_path)}")
+
+    return actions
+
+
 def init_private_repo(root_dir: Path, *, target_dir_arg: str | None = None) -> dict[str, Any]:
     env_values = load_runtime_env(root_dir)
     current_clients_root = client_configs_host_root(root_dir, env_values).resolve()
@@ -1963,6 +2274,10 @@ def init_private_repo(root_dir: Path, *, target_dir_arg: str | None = None) -> d
             subdir_name="skills",
         )
     )
+    for child in sorted(target_clients_root.iterdir()):
+        if not child.is_dir():
+            continue
+        actions.extend(normalize_client_overlay_shape(root_dir, child))
 
     clients_host_root_value = normalize_host_rel_path(root_dir, target_clients_root)
     env_changed = upsert_env_file_values(

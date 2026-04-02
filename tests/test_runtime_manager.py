@@ -26,6 +26,15 @@ MANAGE_MODULE = SourceFileLoader(
 
 
 class RuntimeManagerTests(unittest.TestCase):
+    def test_default_skills_manifest_matches_hardened_v1_shared_pack(self) -> None:
+        manifest_skills = MANAGE_MODULE.read_manifest_skills(
+            ROOT_DIR / "workspace" / "default-skills.manifest",
+        )
+        self.assertEqual(
+            manifest_skills,
+            MANAGE_MODULE.HARDENED_SHARED_DEFAULT_SKILLS,
+        )
+
     def test_sync_creates_core_runtime_state_and_installs_default_skills(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -647,8 +656,36 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "skills.sources.yaml").is_file())
             self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "bundles" / "README.md").is_file())
             self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "skills" / ".gitkeep").is_file())
+            self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "plans" / "INDEX.md").is_file())
+            self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "plans" / "draft" / ".gitkeep").is_file())
+            self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "plans" / "released" / ".gitkeep").is_file())
+            self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "plans" / "sessions" / ".gitkeep").is_file())
             self.assertFalse((repo / "default-skills" / "clients" / "acme-studio").exists())
             self.assertFalse((repo / "skills" / "clients" / "acme-studio").exists())
+            self.assertEqual(
+                payload["next_actions"],
+                [
+                    "sync --client acme-studio --format json",
+                    "focus acme-studio --format json",
+                    "client-diff acme-studio --format json",
+                    "client-publish acme-studio --acceptance --format json",
+                ],
+            )
+
+            manifest_skills = MANAGE_MODULE.read_manifest_skills(
+                repo / "workspace" / "clients" / "acme-studio" / "skills.manifest",
+            )
+            self.assertEqual(
+                manifest_skills,
+                MANAGE_MODULE.HARDENED_CLIENT_PLANNING_SKILLS,
+            )
+
+            overlay_doc = MANAGE_MODULE.load_yaml(
+                repo / "workspace" / "clients" / "acme-studio" / "overlay.yaml",
+            )
+            client_context = overlay_doc["client"]["context"]
+            self.assertEqual(client_context["cwd_match"], ["${SKILLBOX_MONOSERVER_ROOT}/acme-studio"])
+            self.assertEqual(client_context["plans"], MANAGE_MODULE.HARDENED_CLIENT_PLAN_PATHS)
 
             render = self._run(repo, "render", "--client", "acme-studio", "--format", "json")
 
@@ -714,6 +751,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertTrue((external_clients / "acme-studio" / "skills.sources.yaml").is_file())
             self.assertTrue((external_clients / "acme-studio" / "bundles" / "README.md").is_file())
             self.assertTrue((external_clients / "acme-studio" / "skills" / ".gitkeep").is_file())
+            self.assertTrue((external_clients / "acme-studio" / "plans" / "INDEX.md").is_file())
             self.assertFalse((repo / "workspace" / "clients" / "acme-studio").exists())
             self.assertFalse((repo / "default-skills" / "clients" / "acme-studio").exists())
             self.assertFalse((repo / "skills" / "clients" / "acme-studio").exists())
@@ -1561,6 +1599,13 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertTrue((private_repo / "clients" / "personal" / "overlay.yaml").is_file())
             self.assertTrue((private_repo / "clients" / "personal" / "skills.manifest").is_file())
             self.assertTrue((private_repo / "clients" / "vibe-coding-client" / "overlay.yaml").is_file())
+            self.assertEqual(
+                payload["next_actions"],
+                [
+                    "client-init <client> --format json",
+                    "client-diff <client> --format json",
+                ],
+            )
 
     def test_private_init_migrates_legacy_client_skill_trees_into_private_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1601,6 +1646,63 @@ class RuntimeManagerTests(unittest.TestCase):
             private_repo = workspace / "private-config"
             self.assertTrue((private_repo / "clients" / "acme-studio" / "bundles" / "README.md").is_file())
             self.assertTrue((private_repo / "clients" / "acme-studio" / "skills" / ".gitkeep").is_file())
+
+    def test_private_init_normalizes_overlay_shape_in_private_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            repo = workspace / "skillbox"
+            repo.mkdir(parents=True, exist_ok=True)
+            self._write_fixture(repo)
+
+            legacy_overlay = repo / "workspace" / "clients" / "personal" / "overlay.yaml"
+            legacy_overlay.write_text(
+                "version: 1\n"
+                "client:\n"
+                "  id: personal\n"
+                "  label: Personal\n"
+                "  default_cwd: ${SKILLBOX_MONOSERVER_ROOT}\n"
+                "  repo_roots:\n"
+                "    - id: personal-root\n"
+                "      kind: repo-root\n"
+                "      path: ${SKILLBOX_MONOSERVER_ROOT}\n"
+                "  skills:\n"
+                "    - id: personal-skills\n"
+                "      kind: packaged-skill-set\n"
+                "      bundle_dir: ${SKILLBOX_WORKSPACE_ROOT}/default-skills/clients/personal\n",
+                encoding="utf-8",
+            )
+            (repo / "workspace" / "clients" / "personal" / "skills.manifest").write_text("", encoding="utf-8")
+            (repo / "workspace" / "clients" / "personal" / "skills.sources.yaml").write_text(
+                "version: 1\nsources: []\n",
+                encoding="utf-8",
+            )
+
+            result = self._run(
+                repo,
+                "private-init",
+                "--path",
+                "../private-config",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            private_client = workspace / "private-config" / "clients" / "personal"
+            overlay_doc = MANAGE_MODULE.load_yaml(private_client / "overlay.yaml")
+            client_doc = overlay_doc["client"]
+            skillset = client_doc["skills"][0]
+
+            self.assertEqual(skillset["bundle_dir"], "${SKILLBOX_CLIENTS_ROOT}/personal/bundles")
+            self.assertEqual(skillset["manifest"], "${SKILLBOX_CLIENTS_ROOT}/personal/skills.manifest")
+            self.assertEqual(skillset["sources_config"], "${SKILLBOX_CLIENTS_ROOT}/personal/skills.sources.yaml")
+            self.assertEqual(skillset["lock_path"], "${SKILLBOX_CLIENTS_ROOT}/personal/skills.lock.json")
+            self.assertEqual(client_doc["context"]["plans"], MANAGE_MODULE.HARDENED_CLIENT_PLAN_PATHS)
+            self.assertTrue((private_client / "plans" / "INDEX.md").is_file())
+            self.assertTrue((private_client / "plans" / "draft" / ".gitkeep").is_file())
+            self.assertEqual(
+                MANAGE_MODULE.read_manifest_skills(private_client / "skills.manifest"),
+                MANAGE_MODULE.HARDENED_CLIENT_PLANNING_SKILLS,
+            )
 
     def test_client_publish_and_diff_use_attached_private_repo_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
