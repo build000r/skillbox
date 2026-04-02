@@ -222,6 +222,27 @@ def generate_live_context_markdown(
             )
         lines.append("")
 
+    session_states = live_state.get("sessions") or []
+    if session_states:
+        lines.append("## Sessions")
+        lines.append("")
+        lines.append("| Client | Session | Status | Updated | Label | Last Event |")
+        lines.append("|--------|---------|--------|---------|-------|------------|")
+        for session in session_states:
+            updated_at = float(session.get("updated_at") or 0)
+            updated_str = time.strftime("%H:%M", time.localtime(updated_at)) if updated_at else "-"
+            label = str(session.get("label") or session.get("goal") or "-").replace("|", "\\|")
+            last_bits = [str(session.get("last_event_type") or "").strip()]
+            last_message = str(session.get("last_message") or "").strip()
+            if last_message:
+                last_bits.append(last_message)
+            last_event = " ".join(bit for bit in last_bits if bit).strip() or "-"
+            last_event = last_event.replace("|", "\\|")
+            lines.append(
+                f"| {session['client_id']} | `{session['session_id']}` | {session.get('status', '-')} | {updated_str} | {label} | {last_event} |"
+            )
+        lines.append("")
+
     # --- Attention ---
     attention: list[str] = []
 
@@ -372,7 +393,11 @@ def _resolve_context_paths(
 
 
 def generate_skill_context(
-    model: dict[str, Any], root_dir: Path, dry_run: bool,
+    model: dict[str, Any],
+    root_dir: Path,
+    dry_run: bool,
+    *,
+    output_dir: Path | None = None,
 ) -> list[str]:
     """Write a resolved context.yaml for each active client that declares context."""
     yaml_mod = require_yaml("generate skill context")
@@ -388,8 +413,11 @@ def generate_skill_context(
         if not raw_context or not isinstance(raw_context, dict):
             continue
 
-        client_dir = client_config_host_dir(root_dir, runtime_env, cid)
         client_runtime_dir = client_config_runtime_dir(runtime_env, cid)
+        if output_dir is None:
+            client_dir = client_config_host_dir(root_dir, runtime_env, cid)
+        else:
+            client_dir = output_dir / runtime_path_to_projection_rel_path(runtime_env, str(client_runtime_dir))
         resolved = _resolve_context_paths(raw_context, client_dir)
         resolved["client_id"] = cid
         resolved["client_dir"] = str(client_dir)

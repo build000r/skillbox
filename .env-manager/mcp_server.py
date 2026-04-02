@@ -323,6 +323,117 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "skillbox_session_start",
+        "description": (
+            "Create a durable client-scoped session with metadata, handoff file, and append-only events.jsonl. "
+            "Use this at the start of tutoring or vibe-coding work so the box can recover the session after a crash."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["client_id"],
+            "properties": {
+                "client_id": {
+                    "type": "string",
+                    "description": "Existing client slug that owns the session.",
+                },
+                "label": {"type": "string", "description": "Human-friendly session label."},
+                "cwd": {"type": "string", "description": "Working directory for the session."},
+                "goal": {"type": "string", "description": "Short statement of intent."},
+                "actor": {"type": "string", "description": "Optional operator or agent name."},
+            },
+        },
+    },
+    {
+        "name": "skillbox_session_event",
+        "description": (
+            "Append a structured event to an active durable session and mirror it into the global journal. "
+            "Use this to record notes, checkpoints, decisions, or errors during work."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["client_id", "session_id", "event_type"],
+            "properties": {
+                "client_id": {
+                    "type": "string",
+                    "description": "Existing client slug that owns the session.",
+                },
+                "session_id": {"type": "string", "description": "Durable session id."},
+                "event_type": {
+                    "type": "string",
+                    "description": "Event type, with or without the session. prefix.",
+                },
+                "message": {"type": "string", "description": "Optional event message."},
+                "actor": {"type": "string", "description": "Optional operator or agent name."},
+            },
+        },
+    },
+    {
+        "name": "skillbox_session_end",
+        "description": (
+            "Close an active durable session, persist a summary, and append a terminal session.ended event."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["client_id", "session_id"],
+            "properties": {
+                "client_id": {
+                    "type": "string",
+                    "description": "Existing client slug that owns the session.",
+                },
+                "session_id": {"type": "string", "description": "Durable session id."},
+                "status": {
+                    "type": "string",
+                    "description": "Terminal state: completed, failed, or abandoned.",
+                    "enum": ["abandoned", "completed", "failed"],
+                    "default": "completed",
+                },
+                "summary": {"type": "string", "description": "Optional closeout summary."},
+            },
+        },
+    },
+    {
+        "name": "skillbox_session_resume",
+        "description": (
+            "Resume a previously ended durable session and append a session.resumed event."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["client_id", "session_id"],
+            "properties": {
+                "client_id": {
+                    "type": "string",
+                    "description": "Existing client slug that owns the session.",
+                },
+                "session_id": {"type": "string", "description": "Durable session id."},
+                "actor": {"type": "string", "description": "Optional operator or agent name."},
+                "message": {"type": "string", "description": "Optional resume note."},
+            },
+        },
+    },
+    {
+        "name": "skillbox_session_status",
+        "description": (
+            "Read one durable session with recent events or list recent sessions for a client. "
+            "Use this after a crash to recover the latest active or recently-ended work."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["client_id"],
+            "properties": {
+                "client_id": {
+                    "type": "string",
+                    "description": "Existing client slug that owns the session.",
+                },
+                "session_id": {"type": "string", "description": "Specific durable session id to inspect."},
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum sessions to return when listing.",
+                    "default": 10,
+                },
+            },
+        },
+    },
+    {
         "name": "skillbox_acceptance",
         "description": (
             "Run the first-box readiness gate for an onboarded client. "
@@ -620,6 +731,22 @@ def build_args(command: str, params: dict, positional: str | None = None) -> lis
         args += ["--root-path", str(params["root_path"])]
     if params.get("default_cwd"):
         args += ["--default-cwd", str(params["default_cwd"])]
+    if params.get("session_id"):
+        args += ["--session-id", str(params["session_id"])]
+    if params.get("event_type"):
+        args += ["--event-type", str(params["event_type"])]
+    if params.get("message"):
+        args += ["--message", str(params["message"])]
+    if params.get("goal"):
+        args += ["--goal", str(params["goal"])]
+    if params.get("actor"):
+        args += ["--actor", str(params["actor"])]
+    if params.get("summary"):
+        args += ["--summary", str(params["summary"])]
+    if params.get("status"):
+        args += ["--status", str(params["status"])]
+    if params.get("limit") is not None:
+        args += ["--limit", str(int(params["limit"]))]
     for sv in (params.get("set_vars") or []):
         args += ["--set", str(sv)]
     if params.get("resume"):
@@ -650,6 +777,11 @@ _DISPATCH: dict[str, tuple[str, str | None]] = {
     "skillbox_context":     ("context",     None),
     "skillbox_onboard":     ("onboard",     "client_id"),
     "skillbox_focus":       ("focus",       "client_id"),
+    "skillbox_session_start": ("session-start", "client_id"),
+    "skillbox_session_event": ("session-event", "client_id"),
+    "skillbox_session_end":   ("session-end", "client_id"),
+    "skillbox_session_resume": ("session-resume", "client_id"),
+    "skillbox_session_status": ("session-status", "client_id"),
     "skillbox_acceptance":  ("acceptance",  "client_id"),
     "skillbox_client_init": ("client-init", "client_id"),
     "skillbox_client_diff": ("client-diff", "client_id"),

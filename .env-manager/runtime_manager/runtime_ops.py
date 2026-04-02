@@ -1568,7 +1568,10 @@ MCP_PROTOCOL_VERSION = "2024-11-05"
 MCP_SMOKE_TIMEOUT_SECONDS = 5.0
 
 
-def collect_live_state(model: dict[str, Any]) -> dict[str, Any]:
+def collect_live_state(
+    model: dict[str, Any],
+    root_dir: Path = DEFAULT_ROOT_DIR,
+) -> dict[str, Any]:
     """Snapshot volatile runtime state: git branches, service health, check results, recent errors."""
     repo_states: list[dict[str, Any]] = []
     for repo in model.get("repos") or []:
@@ -1632,12 +1635,35 @@ def collect_live_state(model: dict[str, Any]) -> dict[str, Any]:
                 item["scanned_file"] = str(log_files[0].name)
         log_states.append(item)
 
+    session_states: list[dict[str, Any]] = []
+    active_clients = [str(client_id) for client_id in model.get("active_clients") or [] if str(client_id).strip()]
+    for client_id in active_clients:
+        for session in list_client_sessions(root_dir, client_id, limit=5):
+            session_states.append(
+                {
+                    "client_id": client_id,
+                    "session_id": session["session_id"],
+                    "status": session.get("status"),
+                    "label": session.get("label") or "",
+                    "goal": session.get("goal") or "",
+                    "updated_at": session.get("updated_at"),
+                    "last_event_type": session.get("last_event_type") or "",
+                    "last_message": session.get("last_message") or "",
+                }
+            )
+
+    session_states.sort(
+        key=lambda item: float(item.get("updated_at") or 0),
+        reverse=True,
+    )
+
     return {
         "collected_at": time.time(),
         "repos": repo_states,
         "services": service_states,
         "checks": check_states,
         "logs": log_states,
+        "sessions": session_states,
     }
 
 

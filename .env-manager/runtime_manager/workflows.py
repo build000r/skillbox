@@ -1105,11 +1105,18 @@ def run_focus(
 
     # --- 4. Collect live state ------------------------------------------------
     try:
-        live = collect_live_state(model)
+        live = collect_live_state(model, root_dir)
         step("collect", "ok")
     except Exception as exc:
         step("collect", "fail", {"error": str(exc)})
-        live = {"collected_at": time.time(), "repos": [], "services": [], "checks": [], "logs": []}
+        live = {
+            "collected_at": time.time(),
+            "repos": [],
+            "services": [],
+            "checks": [],
+            "logs": [],
+            "sessions": [],
+        }
 
     # --- 5. Generate skill context.yaml ---------------------------------------
     try:

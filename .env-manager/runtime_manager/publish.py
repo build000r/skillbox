@@ -662,6 +662,7 @@ def open_client_surface(
         actions.append(f"materialize-bundle: {repo_rel(root_dir, output_dir)}")
 
         filtered_model = bundle_runtime_model(bundle)
+        actions.extend(generate_skill_context(filtered_model, root_dir, dry_run=False, output_dir=output_dir))
         actions.extend(sync_context(filtered_model, root_dir, dry_run=False, context_dir=output_dir))
         selected_mcp_configs, mcp_servers = selected_mcp_server_configs(root_dir, filtered_model)
         mcp_config_path = output_dir / MCP_CONFIG_REL
@@ -717,6 +718,7 @@ def open_client_surface(
         normalize_active_profiles(profiles or []),
         normalize_active_clients(model, [cid]),
     )
+    sandbox_context_actions = generate_skill_context(filtered_model, root_dir, dry_run=False, output_dir=output_dir)
     selected_mcp_configs, mcp_servers = selected_mcp_server_configs(root_dir, filtered_model)
     mcp_config_path = output_dir / MCP_CONFIG_REL
     mcp_changed = write_json_file(mcp_config_path, {"mcpServers": selected_mcp_configs})
@@ -727,6 +729,7 @@ def open_client_surface(
         step_actions = detail.get("actions")
         if isinstance(step_actions, list):
             actions.extend(str(item) for item in step_actions if str(item).strip())
+    actions.extend(sandbox_context_actions)
     actions.append(f"{'write-file' if mcp_changed else 'keep-file'}: {repo_rel(root_dir, mcp_config_path)}")
 
     payload = {

@@ -76,6 +76,7 @@ CLIENT_PUBLISH_METADATA_REL = Path("publish.json")
 CLIENT_ACCEPTANCE_METADATA_REL = Path("acceptance.json")
 DEFAULT_PRIVATE_REPO_REL = Path("..") / "skillbox-config"
 CLIENT_PLANNING_SKILL_TEMPLATE_REL = Path("workspace") / "client-planning-skills"
+CLIENT_SKILL_BUILDER_TEMPLATE_REL = Path("workspace") / "client-skill-builder-skills"
 CLIENT_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 BLUEPRINT_VARIABLE_PATTERN = re.compile(r"^[A-Z0-9_]+$")
 SCAFFOLD_PLACEHOLDER_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
@@ -111,12 +112,43 @@ HARDENED_CLIENT_PLANNING_SKILLS = [
     "domain-scaffolder",
     "divide-and-conquer",
 ]
+HARDENED_CLIENT_SKILL_BUILDER_SKILLS = [
+    "skill-issue",
+    "prompt-reviewer",
+]
 HARDENED_CLIENT_PLAN_PATHS = {
     "plan_root": "plans/released",
     "plan_draft": "plans/draft",
     "plan_index": "plans/INDEX.md",
     "session_plans": "plans/sessions",
 }
+SESSION_SCHEMA_VERSION = 1
+SESSION_ACTIVE_STATUS = "active"
+SESSION_TERMINAL_STATUSES = {"completed", "failed", "abandoned"}
+HARDENED_CLIENT_SKILL_BUILDER_CONTEXT = {
+    "workflow_builder": {
+        "workflow_root": "workflows",
+        "workflow_index": "workflows/INDEX.md",
+        "evaluation_root": "evaluations",
+        "evaluation_notes": "evaluations/README.md",
+        "invocation_root": "invocations",
+        "invocation_notes": "invocations/README.md",
+        "observability_root": "observability",
+        "observability_notes": "observability/README.md",
+        "extraction_rule": "workflows/EXTRACTION.md",
+    }
+}
+CLIENT_OVERLAY_PROJECTION_ROOT_FILES = (
+    "skills.lock.json",
+)
+CLIENT_OVERLAY_PROJECTION_DIRS = (
+    "skills",
+    "plans",
+    "workflows",
+    "evaluations",
+    "invocations",
+    "observability",
+)
 
 
 EXIT_OK = 0
@@ -158,6 +190,7 @@ def structured_error(
 def classify_error(exc: RuntimeError, command: str) -> dict[str, Any]:
     """Map a RuntimeError to a structured error payload with contextual recovery hints."""
     msg = str(exc)
+    lower_msg = msg.lower()
 
     if "client-init requires" in msg:
         return structured_error(
@@ -166,7 +199,7 @@ def classify_error(exc: RuntimeError, command: str) -> dict[str, Any]:
             recovery_hint="Provide a client_id argument or use --list-blueprints.",
             next_actions=["client-init --list-blueprints --format json"],
         )
-    if "blueprint" in msg.lower() and "not found" in msg.lower():
+    if "blueprint" in lower_msg and "not found" in lower_msg:
         return structured_error(
             msg,
             error_type="blueprint_not_found",
@@ -174,8 +207,8 @@ def classify_error(exc: RuntimeError, command: str) -> dict[str, Any]:
             next_actions=["client-init --list-blueprints --format json"],
         )
     if (
-        ("required" in msg.lower() and "variable" in msg.lower())
-        or "missing required values" in msg.lower()
+        ("required" in lower_msg and "variable" in lower_msg)
+        or "missing required values" in lower_msg
     ):
         return structured_error(
             msg,
@@ -183,55 +216,90 @@ def classify_error(exc: RuntimeError, command: str) -> dict[str, Any]:
             recovery_hint="Add the missing --set KEY=VALUE assignments and retry.",
         )
     if (
-        "already exists" in msg.lower()
-        or "without force" in msg.lower()
-        or "already_exists" in msg.lower()
-        or "non-projection output directory" in msg.lower()
+        "already exists" in lower_msg
+        or "without force" in lower_msg
+        or "already_exists" in lower_msg
+        or "non-projection output directory" in lower_msg
     ):
         return structured_error(
             msg,
             error_type="conflict",
             recovery_hint="Use --force to overwrite existing files, or choose a different client id.",
         )
-    if "target repo has a dirty working tree" in msg.lower():
+    if "target repo has a dirty working tree" in lower_msg:
         return structured_error(
             msg,
             error_type="conflict",
             recovery_hint="Commit or discard changes in the target repo, then retry.",
         )
-    if "no private publish target configured" in msg.lower():
+    if "no private publish target configured" in lower_msg:
         return structured_error(
             msg,
             error_type="missing_target_repo",
             recovery_hint="Run private-init to attach a private repo, or pass --target-dir explicitly.",
             next_actions=["private-init --format json"],
         )
-    if "target must be a git repo" in msg.lower():
+    if "target must be a git repo" in lower_msg:
         return structured_error(
             msg,
             error_type="invalid_target_repo",
             recovery_hint="Initialize the target repo with git before publishing.",
         )
-    if "env file" in msg.lower() and ("missing" in msg.lower() or "unresolved" in msg.lower()):
+    if "env file" in lower_msg and ("missing" in lower_msg or "unresolved" in lower_msg):
         return structured_error(
             msg,
             error_type="missing_env_file",
             recovery_hint="Create the env source file or run sync first.",
             next_actions=[f"sync --format json"],
         )
-    if "failed to become healthy" in msg.lower():
+    if "failed to become healthy" in lower_msg:
         return structured_error(
             msg,
             error_type="service_health_failure",
             recovery_hint="Check service logs for the root cause, then restart.",
             next_actions=["logs --format json", "doctor --format json"],
         )
-    if "invalid client id" in msg.lower():
+    if "invalid client id" in lower_msg:
         return structured_error(
             msg,
             error_type="invalid_client_id",
             recoverable=True,
             recovery_hint="Client IDs must be lowercase alphanumeric with single hyphens: my-project.",
+        )
+    if "unknown client scaffold pack" in lower_msg:
+        return structured_error(
+            msg,
+            error_type="invalid_scaffold_pack",
+            recoverable=True,
+            recovery_hint="Use a supported scaffold pack such as `planning` or `skill-builder`.",
+            next_actions=["client-init --list-blueprints --format json"],
+        )
+    if "session_id is required" in lower_msg or "session event_type is required" in lower_msg:
+        return structured_error(
+            msg,
+            error_type="missing_argument",
+            recoverable=True,
+            recovery_hint="Provide the required session_id and event_type arguments, then retry.",
+        )
+    if "session not found" in lower_msg:
+        return structured_error(
+            msg,
+            error_type="session_not_found",
+            recoverable=True,
+            recovery_hint="List recent sessions for the client, then retry with a valid session_id.",
+            next_actions=["session-status <client> --format json", "focus <client> --format json"],
+        )
+    if (
+        "session is not active" in lower_msg
+        or "session is already active" in lower_msg
+        or "unsupported session status" in lower_msg
+    ):
+        return structured_error(
+            msg,
+            error_type="session_state_conflict",
+            recoverable=True,
+            recovery_hint="Inspect the session state first, then resume or end it with a valid transition.",
+            next_actions=["session-status <client> --format json"],
         )
 
     # Contextual fallback based on command
@@ -246,6 +314,8 @@ def classify_error(exc: RuntimeError, command: str) -> dict[str, Any]:
         fallback_next = ["status --format json", "doctor --format json"]
     elif command in ("down",):
         fallback_next = ["status --format json"]
+    elif command in ("session-start", "session-event", "session-end", "session-resume", "session-status"):
+        fallback_next = ["focus --format json", "status --format json"]
 
     return structured_error(
         msg,
@@ -353,6 +423,41 @@ def next_actions_for_focus(
             actions.append(f"logs --service {service_id} --client {client_id} --format json")
             break
     return actions
+
+
+def next_actions_for_session_start(client_id: str, session_id: str) -> list[str]:
+    return [
+        f"session-status {client_id} --session-id {session_id} --format json",
+        f"focus {client_id} --format json",
+    ]
+
+
+def next_actions_for_session_status(client_id: str, session_id: str | None = None) -> list[str]:
+    actions = [f"focus {client_id} --format json"]
+    if session_id:
+        actions.insert(0, f"session-event {client_id} --session-id {session_id} --event-type note --message '<message>' --format json")
+    return actions
+
+
+def next_actions_for_session_event(client_id: str, session_id: str) -> list[str]:
+    return [
+        f"session-status {client_id} --session-id {session_id} --format json",
+        f"session-end {client_id} --session-id {session_id} --format json",
+    ]
+
+
+def next_actions_for_session_end(client_id: str, session_id: str) -> list[str]:
+    return [
+        f"session-status {client_id} --session-id {session_id} --format json",
+        f"session-resume {client_id} --session-id {session_id} --format json",
+    ]
+
+
+def next_actions_for_session_resume(client_id: str, session_id: str) -> list[str]:
+    return [
+        f"session-status {client_id} --session-id {session_id} --format json",
+        f"session-end {client_id} --session-id {session_id} --format json",
+    ]
 
 
 def format_profile_args(profiles: list[str] | None) -> str:
@@ -638,6 +743,453 @@ def prune_expired_acks(
     return len(expired_keys)
 
 
+# ---------------------------------------------------------------------------
+# Durable session runtime
+# ---------------------------------------------------------------------------
+
+def _session_now() -> float:
+    return time.time()
+
+
+def _session_subject(client_id: str, session_id: str) -> str:
+    return f"{client_id}:{session_id}"
+
+
+def _normalize_session_event_type(event_type: str) -> str:
+    normalized = str(event_type or "").strip()
+    if not normalized:
+        raise RuntimeError("session event_type is required")
+    if not normalized.startswith("session."):
+        normalized = f"session.{normalized}"
+    return normalized
+
+
+def _generate_session_id() -> str:
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    return f"{stamp}-{os.urandom(3).hex()}"
+
+
+def _ensure_client_exists(root_dir: Path, client_id: str) -> str:
+    cid = validate_client_id(client_id)
+    _env_values, overlay_path, overlay_runtime_path = client_overlay_location(root_dir, cid)
+    if not overlay_path.is_file():
+        raise RuntimeError(
+            f"Client '{cid}' has no overlay at {overlay_runtime_path}. "
+            f"Use 'onboard {cid}' to scaffold it first."
+        )
+    return cid
+
+
+def resolve_client_log_root(root_dir: Path, client_id: str) -> Path:
+    cid = _ensure_client_exists(root_dir, client_id)
+    default_path = root_dir / "logs" / "clients" / cid
+    try:
+        model = build_runtime_model(root_dir)
+    except RuntimeError:
+        return default_path
+
+    candidates = [
+        Path(str(log_item["host_path"]))
+        for log_item in model.get("logs") or []
+        if str(log_item.get("client") or "").strip() == cid and log_item.get("host_path")
+    ]
+    if not candidates:
+        return default_path
+
+    ranked = sorted(
+        candidates,
+        key=lambda path: (0 if path.name == cid else 1, len(path.parts)),
+    )
+    return ranked[0]
+
+
+def resolve_client_session_root(root_dir: Path, client_id: str) -> Path:
+    return resolve_client_log_root(root_dir, client_id) / "sessions"
+
+
+def session_paths(root_dir: Path, client_id: str, session_id: str) -> dict[str, Path]:
+    sessions_root = resolve_client_session_root(root_dir, client_id)
+    session_dir = sessions_root / session_id
+    return {
+        "sessions_root": sessions_root,
+        "session_dir": session_dir,
+        "meta_path": session_dir / "meta.json",
+        "events_path": session_dir / "events.jsonl",
+        "handoff_path": session_dir / "handoff.md",
+    }
+
+
+def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    ensure_directory(path.parent, dry_run=False)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, separators=(",", ":"), default=str) + "\n")
+
+
+def _write_session_handoff(
+    path: Path,
+    *,
+    client_id: str,
+    session_id: str,
+    label: str,
+    cwd: str,
+    goal: str,
+    summary: str = "",
+) -> None:
+    lines = [
+        f"# Session Handoff: {session_id}",
+        "",
+        f"- Client: {client_id}",
+        f"- Label: {label or '-'}",
+        f"- CWD: {cwd or '-'}",
+        f"- Goal: {goal or '-'}",
+    ]
+    if summary:
+        lines += ["", "## Summary", "", summary]
+    write_text_file(path, "\n".join(lines).rstrip() + "\n", dry_run=False)
+
+
+def _read_session_meta(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise RuntimeError(f"Session not found: {path.parent.name}")
+    return load_json_file(path)
+
+
+def _read_session_events(path: Path, limit: int = 20) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    events: list[dict[str, Any]] = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            events.append(item)
+    if limit <= 0:
+        return events
+    return events[-limit:]
+
+
+def _session_payload(
+    root_dir: Path,
+    meta: dict[str, Any],
+    *,
+    include_recent_events: bool = True,
+    recent_event_limit: int = 10,
+) -> dict[str, Any]:
+    client_id = str(meta.get("client_id") or "").strip()
+    session_id = str(meta.get("session_id") or "").strip()
+    paths = session_paths(root_dir, client_id, session_id)
+    payload = dict(meta)
+    payload["paths"] = {
+        "dir": repo_rel(root_dir, paths["session_dir"]),
+        "meta": repo_rel(root_dir, paths["meta_path"]),
+        "events": repo_rel(root_dir, paths["events_path"]),
+        "handoff": repo_rel(root_dir, paths["handoff_path"]),
+    }
+    if include_recent_events:
+        payload["recent_events"] = _read_session_events(paths["events_path"], limit=recent_event_limit)
+    return payload
+
+
+def list_client_sessions(
+    root_dir: Path,
+    client_id: str,
+    *,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    cid = _ensure_client_exists(root_dir, client_id)
+    sessions_root = resolve_client_session_root(root_dir, cid)
+    if not sessions_root.is_dir():
+        return []
+
+    sessions: list[dict[str, Any]] = []
+    for meta_path in sessions_root.glob("*/meta.json"):
+        try:
+            meta = _read_session_meta(meta_path)
+        except RuntimeError:
+            continue
+        if str(meta.get("client_id") or "").strip() != cid:
+            continue
+        sessions.append(_session_payload(root_dir, meta, include_recent_events=False))
+
+    sessions.sort(
+        key=lambda item: float(item.get("updated_at") or item.get("started_at") or 0),
+        reverse=True,
+    )
+    if limit <= 0:
+        return sessions
+    return sessions[:limit]
+
+
+def read_client_session(
+    root_dir: Path,
+    client_id: str,
+    session_id: str,
+    *,
+    recent_event_limit: int = 10,
+) -> dict[str, Any]:
+    cid = _ensure_client_exists(root_dir, client_id)
+    normalized_session_id = str(session_id or "").strip()
+    if not normalized_session_id:
+        raise RuntimeError("session_id is required")
+    paths = session_paths(root_dir, cid, normalized_session_id)
+    meta = _read_session_meta(paths["meta_path"])
+    if str(meta.get("client_id") or "").strip() != cid:
+        raise RuntimeError(f"Session not found: {normalized_session_id}")
+    return _session_payload(
+        root_dir,
+        meta,
+        include_recent_events=True,
+        recent_event_limit=recent_event_limit,
+    )
+
+
+def _persist_session_event(
+    root_dir: Path,
+    meta: dict[str, Any],
+    event_type: str,
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized_type = _normalize_session_event_type(event_type)
+    now = _session_now()
+    client_id = str(meta["client_id"])
+    session_id = str(meta["session_id"])
+    paths = session_paths(root_dir, client_id, session_id)
+    payload = {
+        "ts": now,
+        "type": normalized_type,
+        "client_id": client_id,
+        "session_id": session_id,
+        "detail": detail or {},
+    }
+    _append_jsonl(paths["events_path"], payload)
+
+    meta["updated_at"] = now
+    meta["last_event_at"] = now
+    meta["last_heartbeat_at"] = now
+    meta["last_event_type"] = normalized_type
+    meta["event_count"] = int(meta.get("event_count") or 0) + 1
+    message = str((detail or {}).get("message") or "").strip()
+    if message:
+        meta["last_message"] = message
+    write_json_file(paths["meta_path"], meta)
+
+    journal_detail = {"client_id": client_id, "session_id": session_id} | (detail or {})
+    emit_event(normalized_type, _session_subject(client_id, session_id), journal_detail, root_dir)
+    return payload
+
+
+def start_client_session(
+    root_dir: Path,
+    client_id: str,
+    *,
+    label: str = "",
+    cwd: str = "",
+    goal: str = "",
+    actor: str = "",
+) -> dict[str, Any]:
+    cid = _ensure_client_exists(root_dir, client_id)
+    session_id = _generate_session_id()
+    paths = session_paths(root_dir, cid, session_id)
+    if paths["session_dir"].exists():
+        raise RuntimeError(f"Session already exists: {session_id}")
+
+    now = _session_now()
+    meta = {
+        "version": SESSION_SCHEMA_VERSION,
+        "session_id": session_id,
+        "client_id": cid,
+        "status": SESSION_ACTIVE_STATUS,
+        "label": str(label or "").strip(),
+        "cwd": str(cwd or "").strip(),
+        "goal": str(goal or "").strip(),
+        "actor": str(actor or "").strip(),
+        "created_at": now,
+        "started_at": now,
+        "updated_at": now,
+        "last_event_at": now,
+        "last_heartbeat_at": now,
+        "completed_at": None,
+        "event_count": 0,
+        "resume_count": 0,
+        "last_event_type": "",
+        "last_message": "",
+        "summary": "",
+    }
+    ensure_directory(paths["session_dir"], dry_run=False)
+    write_json_file(paths["meta_path"], meta)
+    _write_session_handoff(
+        paths["handoff_path"],
+        client_id=cid,
+        session_id=session_id,
+        label=meta["label"],
+        cwd=meta["cwd"],
+        goal=meta["goal"],
+    )
+    _persist_session_event(
+        root_dir,
+        meta,
+        "session.started",
+        {
+            "label": meta["label"],
+            "cwd": meta["cwd"],
+            "goal": meta["goal"],
+            "actor": meta["actor"],
+        },
+    )
+    return {
+        "client_id": cid,
+        "session": read_client_session(root_dir, cid, session_id),
+        "next_actions": next_actions_for_session_start(cid, session_id),
+    }
+
+
+def append_client_session_event(
+    root_dir: Path,
+    client_id: str,
+    session_id: str,
+    *,
+    event_type: str,
+    message: str = "",
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    cid = _ensure_client_exists(root_dir, client_id)
+    normalized_session_id = str(session_id or "").strip()
+    paths = session_paths(root_dir, cid, normalized_session_id)
+    meta = _read_session_meta(paths["meta_path"])
+    if str(meta.get("client_id") or "").strip() != cid:
+        raise RuntimeError(f"Session not found: {normalized_session_id}")
+    if str(meta.get("status") or "") != SESSION_ACTIVE_STATUS:
+        raise RuntimeError(f"Session is not active: {normalized_session_id}")
+
+    event_detail = dict(detail or {})
+    if message:
+        event_detail["message"] = message
+    _persist_session_event(root_dir, meta, event_type, event_detail)
+    return {
+        "client_id": meta["client_id"],
+        "session": read_client_session(root_dir, str(meta["client_id"]), normalized_session_id),
+        "next_actions": next_actions_for_session_event(str(meta["client_id"]), normalized_session_id),
+    }
+
+
+def end_client_session(
+    root_dir: Path,
+    client_id: str,
+    session_id: str,
+    *,
+    final_status: str = "completed",
+    summary: str = "",
+) -> dict[str, Any]:
+    normalized_status = str(final_status or "").strip() or "completed"
+    if normalized_status not in SESSION_TERMINAL_STATUSES:
+        raise RuntimeError(
+            f"Unsupported session status {normalized_status!r}. "
+            f"Use one of: {', '.join(sorted(SESSION_TERMINAL_STATUSES))}."
+        )
+
+    cid = _ensure_client_exists(root_dir, client_id)
+    normalized_session_id = str(session_id or "").strip()
+    paths = session_paths(root_dir, cid, normalized_session_id)
+    meta = _read_session_meta(paths["meta_path"])
+    if str(meta.get("client_id") or "").strip() != cid:
+        raise RuntimeError(f"Session not found: {normalized_session_id}")
+    if str(meta.get("status") or "") != SESSION_ACTIVE_STATUS:
+        raise RuntimeError(f"Session is not active: {normalized_session_id}")
+
+    now = _session_now()
+    meta["status"] = normalized_status
+    meta["completed_at"] = now
+    meta["summary"] = str(summary or "").strip()
+    write_json_file(paths["meta_path"], meta)
+    _persist_session_event(
+        root_dir,
+        meta,
+        "session.ended",
+        {"status": normalized_status, "message": meta["summary"]},
+    )
+    _write_session_handoff(
+        paths["handoff_path"],
+        client_id=str(meta["client_id"]),
+        session_id=normalized_session_id,
+        label=str(meta.get("label") or ""),
+        cwd=str(meta.get("cwd") or ""),
+        goal=str(meta.get("goal") or ""),
+        summary=str(meta.get("summary") or ""),
+    )
+    return {
+        "client_id": meta["client_id"],
+        "session": read_client_session(root_dir, str(meta["client_id"]), normalized_session_id),
+        "next_actions": next_actions_for_session_end(str(meta["client_id"]), normalized_session_id),
+    }
+
+
+def resume_client_session(
+    root_dir: Path,
+    client_id: str,
+    session_id: str,
+    *,
+    actor: str = "",
+    message: str = "",
+) -> dict[str, Any]:
+    cid = _ensure_client_exists(root_dir, client_id)
+    normalized_session_id = str(session_id or "").strip()
+    paths = session_paths(root_dir, cid, normalized_session_id)
+    meta = _read_session_meta(paths["meta_path"])
+    if str(meta.get("client_id") or "").strip() != cid:
+        raise RuntimeError(f"Session not found: {normalized_session_id}")
+    if str(meta.get("status") or "") == SESSION_ACTIVE_STATUS:
+        raise RuntimeError(f"Session is already active: {normalized_session_id}")
+
+    previous_status = str(meta.get("status") or "unknown")
+    meta["status"] = SESSION_ACTIVE_STATUS
+    meta["completed_at"] = None
+    meta["resume_count"] = int(meta.get("resume_count") or 0) + 1
+    meta["last_resumed_from"] = previous_status
+    if actor:
+        meta["actor"] = actor
+    write_json_file(paths["meta_path"], meta)
+    detail = {"from": previous_status}
+    if actor:
+        detail["actor"] = actor
+    if message:
+        detail["message"] = message
+    _persist_session_event(root_dir, meta, "session.resumed", detail)
+    return {
+        "client_id": meta["client_id"],
+        "session": read_client_session(root_dir, str(meta["client_id"]), normalized_session_id),
+        "next_actions": next_actions_for_session_resume(str(meta["client_id"]), normalized_session_id),
+    }
+
+
+def session_status_payload(
+    root_dir: Path,
+    client_id: str,
+    *,
+    session_id: str | None = None,
+    limit: int = 10,
+) -> dict[str, Any]:
+    cid = _ensure_client_exists(root_dir, client_id)
+    if session_id:
+        return {
+            "client_id": cid,
+            "session": read_client_session(root_dir, cid, session_id),
+            "next_actions": next_actions_for_session_status(cid, session_id),
+        }
+
+    sessions = list_client_sessions(root_dir, cid, limit=limit)
+    return {
+        "client_id": cid,
+        "sessions": sessions,
+        "count": len(sessions),
+        "next_actions": next_actions_for_session_status(cid, None),
+    }
+
+
 def resolve_root_dir(raw_root: str | None) -> Path:
     if raw_root:
         return Path(raw_root).resolve()
@@ -910,6 +1462,14 @@ def load_client_blueprint(path: Path) -> dict[str, Any]:
     if not isinstance(raw_variables, list):
         raise RuntimeError(f"Expected `variables` to be a list in {path}")
 
+    raw_scaffold = raw.get("scaffold") or {}
+    if raw_scaffold is None:
+        scaffold = {}
+    elif isinstance(raw_scaffold, dict):
+        scaffold = copy.deepcopy(raw_scaffold)
+    else:
+        raise RuntimeError(f"Expected `scaffold` to be a mapping in {path}")
+
     variables: list[dict[str, Any]] = []
     seen_names: set[str] = set()
     for raw_variable in raw_variables:
@@ -938,6 +1498,7 @@ def load_client_blueprint(path: Path) -> dict[str, Any]:
         "path": str(path),
         "description": str(raw.get("description", "")).strip(),
         "variables": variables,
+        "scaffold": scaffold,
         "client": client,
     }
 
@@ -947,11 +1508,16 @@ def base_client_overlay(
     client_label: str,
     client_root: str,
     client_default_cwd: str,
+    *,
+    scaffold_pack: str = "planning",
 ) -> dict[str, Any]:
-    return {
+    overlay = {
         "id": client_id,
         "label": client_label,
         "default_cwd": client_default_cwd,
+        "scaffold": {
+            "pack": scaffold_pack,
+        },
         "repo_roots": [
             {
                 "id": f"{client_id}-root",
@@ -1000,7 +1566,6 @@ def base_client_overlay(
         ],
         "context": {
             "cwd_match": [client_default_cwd],
-            "plans": copy.deepcopy(HARDENED_CLIENT_PLAN_PATHS),
         },
         "checks": [
             {
@@ -1013,6 +1578,8 @@ def base_client_overlay(
             }
         ],
     }
+    ensure_client_overlay_context_shape(overlay, client_default_cwd, scaffold_pack)
+    return overlay
 
 
 def render_client_skill_manifest(
@@ -1059,23 +1626,147 @@ def client_planning_skill_template_root() -> Path:
     return (DEFAULT_ROOT_DIR / CLIENT_PLANNING_SKILL_TEMPLATE_REL).resolve()
 
 
-def ensure_client_planning_skill_sources(
+def render_skill_builder_index(client_label: str) -> str:
+    return (
+        f"# {client_label} Workflow Index\n"
+        "\n"
+        "| Workflow | Status | Scope | Notes |\n"
+        "|---|---|---|---|\n"
+    )
+
+
+def render_skill_builder_extraction_rule() -> str:
+    return (
+        "# Workflow Extraction Rule\n"
+        "\n"
+        "Use this rule when deciding whether a workflow stays product-local or moves upward.\n"
+        "\n"
+        "## Keep In The Product Repo\n"
+        "\n"
+        "- The workflow uses product-specific nouns, data contracts, or client policies.\n"
+        "- The workflow is only proven in one product or one client.\n"
+        "- The runtime depends on product-specific repo structure or business logic.\n"
+        "\n"
+        "## Extract To `opensource/skills`\n"
+        "\n"
+        "- The reusable part is a portable agent workflow, review loop, or operator playbook.\n"
+        "- A second real consumer exists, or reuse pressure is already causing duplicated maintenance.\n"
+        "- The skill contract can be described without product-specific business nouns.\n"
+        "\n"
+        "## Keep In `skillbox`\n"
+        "\n"
+        "- The problem is runtime behavior: installation, sync, bundle curation, client overlays, box behavior, or operator tooling.\n"
+        "- The reusable piece is connector/runtime delivery rather than the portable skill contract itself.\n"
+        "\n"
+        "## Use A Cross-Repo Slice\n"
+        "\n"
+        "- Put the portable skill contract in `opensource/skills`.\n"
+        "- Put runtime/distribution/FWC integration in `skillbox`.\n"
+        "- Keep product-specific workflow execution and business data in the product repo.\n"
+    )
+
+
+def client_skill_builder_seed_files(overlay_dir: Path, client_label: str) -> dict[Path, str]:
+    return {
+        overlay_dir / "workflows" / "INDEX.md": render_skill_builder_index(client_label),
+        overlay_dir / "workflows" / "EXTRACTION.md": render_skill_builder_extraction_rule(),
+        overlay_dir / "evaluations" / "README.md": (
+            "# Evaluations\n"
+            "\n"
+            "Store scorecards, evaluation runs, regression notes, and acceptance snapshots here.\n"
+        ),
+        overlay_dir / "invocations" / "README.md": (
+            "# Invocations\n"
+            "\n"
+            "Track copied transcript slices, invocation summaries, or pointers to raw workflow runs here.\n"
+        ),
+        overlay_dir / "observability" / "README.md": (
+            "# Observability\n"
+            "\n"
+            "Record connector probes, health notes, drift findings, and workflow diagnostics here.\n"
+        ),
+    }
+
+
+def client_skill_builder_template_root() -> Path:
+    return (DEFAULT_ROOT_DIR / CLIENT_SKILL_BUILDER_TEMPLATE_REL).resolve()
+
+
+def client_scaffold_pack(pack_name: str | None) -> str:
+    pack = str(pack_name or "planning").strip() or "planning"
+    if pack in {"planning", "skill-builder"}:
+        return pack
+    raise RuntimeError(
+        f"Unknown client scaffold pack: {pack}. Supported packs: planning, skill-builder."
+    )
+
+
+def client_scaffold_pack_required_skills(pack_name: str | None) -> list[str]:
+    pack = client_scaffold_pack(pack_name)
+    if pack == "planning":
+        return copy.deepcopy(HARDENED_CLIENT_PLANNING_SKILLS)
+    return copy.deepcopy(HARDENED_CLIENT_SKILL_BUILDER_SKILLS)
+
+
+def client_scaffold_pack_template_root(pack_name: str | None) -> Path:
+    pack = client_scaffold_pack(pack_name)
+    if pack == "planning":
+        return client_planning_skill_template_root()
+    return client_skill_builder_template_root()
+
+
+def client_scaffold_seed_files(
+    overlay_dir: Path,
+    client_label: str,
+    pack_name: str | None,
+) -> dict[Path, str]:
+    pack = client_scaffold_pack(pack_name)
+    if pack == "planning":
+        return client_plan_seed_files(overlay_dir, client_label)
+    return client_skill_builder_seed_files(overlay_dir, client_label)
+
+
+def sync_client_scaffold_seed_files(
     root_dir: Path,
     overlay_dir: Path,
+    client_label: str,
+    scaffold_pack: str,
     *,
     dry_run: bool,
 ) -> list[str]:
-    template_root = client_planning_skill_template_root()
+    actions: list[str] = []
+    for seed_path, content in client_scaffold_seed_files(overlay_dir, client_label, scaffold_pack).items():
+        ensure_directory(seed_path.parent, dry_run=dry_run)
+        if seed_path.is_file():
+            existing = seed_path.read_text(encoding="utf-8")
+            if existing == content:
+                continue
+            if existing.strip():
+                continue
+        if not dry_run:
+            seed_path.write_text(content, encoding="utf-8")
+        actions.append(f"write-file: {repo_rel(root_dir, seed_path)}")
+    return actions
+
+
+def ensure_client_scaffold_skill_sources(
+    root_dir: Path,
+    overlay_dir: Path,
+    scaffold_pack: str,
+    *,
+    dry_run: bool,
+) -> list[str]:
+    template_root = client_scaffold_pack_template_root(scaffold_pack)
     actions: list[str] = []
     if not template_root.is_dir():
-        raise RuntimeError(f"Missing client planning skill templates at {template_root}")
+        raise RuntimeError(f"Missing client scaffold skill templates at {template_root}")
 
     skills_root = overlay_dir / "skills"
     ensure_directory(skills_root, dry_run=dry_run)
-    for skill_name in HARDENED_CLIENT_PLANNING_SKILLS:
+    for skill_name in client_scaffold_pack_required_skills(scaffold_pack):
         source_dir = template_root / skill_name
         if not source_dir.is_dir():
-            raise RuntimeError(f"Missing planning skill template for {skill_name} at {source_dir}")
+            raise RuntimeError(f"Missing scaffold skill template for {skill_name} at {source_dir}")
         target_dir = skills_root / skill_name
         if target_dir.exists():
             continue
@@ -1085,9 +1776,10 @@ def ensure_client_planning_skill_sources(
     return actions
 
 
-def ensure_client_planning_skill_bundles(
+def ensure_client_scaffold_skill_bundles(
     root_dir: Path,
     overlay_dir: Path,
+    scaffold_pack: str,
     *,
     dry_run: bool,
 ) -> list[str]:
@@ -1096,7 +1788,7 @@ def ensure_client_planning_skill_bundles(
     ensure_directory(output_dir, dry_run=dry_run)
     packager = DEFAULT_ROOT_DIR / "scripts" / "package_skill.py"
 
-    for skill_name in HARDENED_CLIENT_PLANNING_SKILLS:
+    for skill_name in client_scaffold_pack_required_skills(scaffold_pack):
         source_dir = overlay_dir / "skills" / skill_name
         bundle_path = output_dir / f"{skill_name}.skill"
         if bundle_path.is_file():
@@ -1126,7 +1818,8 @@ def default_client_scaffold_files(
     client_label: str,
     client_root: str,
     client_default_cwd: str,
-) -> dict[Path, str]:
+) -> tuple[dict[Path, str], str]:
+    scaffold_pack = "planning"
     overlay_dir = client_config_host_dir(root_dir, env_values, client_id)
     bundle_dir = overlay_dir / "bundles"
     skills_dir = overlay_dir / "skills"
@@ -1136,22 +1829,19 @@ def default_client_scaffold_files(
     sources_path = overlay_dir / "skills.sources.yaml"
     bundle_readme_path = bundle_dir / "README.md"
     skills_keep_path = skills_dir / ".gitkeep"
+    overlay_client = base_client_overlay(
+        client_id=client_id,
+        client_label=client_label,
+        client_root=client_root,
+        client_default_cwd=client_default_cwd,
+        scaffold_pack=scaffold_pack,
+    )
 
     target_files = {
-        overlay_path: render_yaml_document(
-            {
-                "version": 1,
-                "client": base_client_overlay(
-                    client_id=client_id,
-                    client_label=client_label,
-                    client_root=client_root,
-                    client_default_cwd=client_default_cwd,
-                ),
-            }
-        ),
+        overlay_path: render_yaml_document({"version": 1, "client": overlay_client}),
         manifest_path: render_client_skill_manifest(
             client_label,
-            HARDENED_CLIENT_PLANNING_SKILLS,
+            client_scaffold_pack_required_skills(scaffold_pack),
         ),
         sources_path: (
             "version: 1\n"
@@ -1165,8 +1855,8 @@ def default_client_scaffold_files(
         ),
         skills_keep_path: "",
     }
-    target_files.update(client_plan_seed_files(overlay_dir, client_label))
-    return target_files
+    target_files.update(client_scaffold_seed_files(overlay_dir, client_label, scaffold_pack))
+    return target_files, scaffold_pack
 
 
 def merge_client_overlay(base_client: dict[str, Any], blueprint_client: dict[str, Any]) -> dict[str, Any]:
@@ -1202,7 +1892,7 @@ def build_blueprinted_client_scaffold_files(
     explicit_default_cwd: bool,
     blueprint: dict[str, Any],
     blueprint_assignments: list[tuple[str, str]],
-) -> dict[Path, str]:
+) -> tuple[dict[Path, str], str]:
     values = {
         "CLIENT_ID": client_id,
         "CLIENT_LABEL": client_label,
@@ -1245,6 +1935,9 @@ def build_blueprinted_client_scaffold_files(
         ),
         rendered_client,
     )
+    scaffold = copy.deepcopy(blueprint.get("scaffold") or {})
+    if scaffold:
+        overlay_client["scaffold"] = scaffold
     overlay_client["id"] = client_id
     if explicit_label:
         overlay_client["label"] = client_label
@@ -1264,6 +1957,13 @@ def build_blueprinted_client_scaffold_files(
             overlay_client["connectors"] = scaffolded_connectors
         else:
             overlay_client.pop("connectors", None)
+    scaffold_pack = ensure_client_overlay_scaffold_shape(overlay_client)
+    ensure_client_overlay_skillset_shape(overlay_client, client_id)
+    ensure_client_overlay_context_shape(
+        overlay_client,
+        str(overlay_client["default_cwd"]),
+        scaffold_pack,
+    )
 
     overlay_dir = client_config_host_dir(root_dir, env_values, client_id)
     bundle_dir = overlay_dir / "bundles"
@@ -1279,7 +1979,7 @@ def build_blueprinted_client_scaffold_files(
         overlay_path: render_yaml_document({"version": 1, "client": overlay_client}),
         manifest_path: render_client_skill_manifest(
             str(overlay_client["label"]),
-            HARDENED_CLIENT_PLANNING_SKILLS,
+            client_scaffold_pack_required_skills(scaffold_pack),
         ),
         sources_path: render_yaml_document(
             {
@@ -1295,8 +1995,14 @@ def build_blueprinted_client_scaffold_files(
         bundle_readme_path: f"Generated `.skill` bundles for the `{client_id}` client overlay land here.\n",
         skills_keep_path: "",
     }
-    target_files.update(client_plan_seed_files(overlay_dir, str(overlay_client["label"])))
-    return target_files
+    target_files.update(
+        client_scaffold_seed_files(
+            overlay_dir,
+            str(overlay_client["label"]),
+            scaffold_pack,
+        )
+    )
+    return target_files, scaffold_pack
 
 
 def scaffold_client_overlay(
@@ -1323,7 +2029,7 @@ def scaffold_client_overlay(
     if blueprint_name:
         blueprint_path = resolve_client_blueprint_path(root_dir, blueprint_name)
         blueprint = load_client_blueprint(blueprint_path)
-        target_files = build_blueprinted_client_scaffold_files(
+        target_files, scaffold_pack = build_blueprinted_client_scaffold_files(
             root_dir=root_dir,
             env_values=env_values,
             client_id=client_id,
@@ -1342,7 +2048,7 @@ def scaffold_client_overlay(
     else:
         if blueprint_assignments:
             raise RuntimeError("`--set` requires `--blueprint`.")
-        target_files = default_client_scaffold_files(
+        target_files, scaffold_pack = default_client_scaffold_files(
             root_dir=root_dir,
             env_values=env_values,
             client_id=client_id,
@@ -1369,16 +2075,18 @@ def scaffold_client_overlay(
 
     overlay_dir = client_config_host_dir(root_dir, env_values, client_id)
     actions.extend(
-        ensure_client_planning_skill_sources(
+        ensure_client_scaffold_skill_sources(
             root_dir,
             overlay_dir,
+            scaffold_pack,
             dry_run=dry_run,
         )
     )
     actions.extend(
-        ensure_client_planning_skill_bundles(
+        ensure_client_scaffold_skill_bundles(
             root_dir,
             overlay_dir,
+            scaffold_pack,
             dry_run=dry_run,
         )
     )
@@ -1668,6 +2376,24 @@ def add_projection_source_file(
     }
 
 
+def add_projection_source_tree(
+    files: dict[str, dict[str, Any]],
+    destination_root_rel: Path,
+    source_root: Path,
+) -> None:
+    if not source_root.exists():
+        return
+    if source_root.is_file():
+        add_projection_source_file(files, destination_root_rel, source_root)
+        return
+    for source_path in sorted(child for child in source_root.rglob("*") if child.is_file()):
+        add_projection_source_file(
+            files,
+            destination_root_rel / source_path.relative_to(source_root),
+            source_path,
+        )
+
+
 def add_projection_text_file(
     files: dict[str, dict[str, Any]],
     destination_rel: Path,
@@ -1810,12 +2536,31 @@ def collect_client_projection_files(
             add_projection_source_file(files, optional_rel_path, source_path)
 
     if overlay_present:
+        client_overlay_host_dir = client_overlay_host_path.parent
         overlay_runtime_path = client_config_runtime_dir(env_values, client_id) / "overlay.yaml"
+        overlay_runtime_dir = client_config_runtime_dir(env_values, client_id)
+        overlay_projection_dir = runtime_path_to_projection_rel_path(env_values, str(overlay_runtime_dir))
         add_projection_source_file(
             files,
             runtime_path_to_projection_rel_path(env_values, str(overlay_runtime_path)),
             client_overlay_host_path,
         )
+        for file_name in CLIENT_OVERLAY_PROJECTION_ROOT_FILES:
+            source_path = client_overlay_host_dir / file_name
+            if source_path.is_file():
+                add_projection_source_file(
+                    files,
+                    overlay_projection_dir / file_name,
+                    source_path,
+                )
+        for dir_name in CLIENT_OVERLAY_PROJECTION_DIRS:
+            source_dir = client_overlay_host_dir / dir_name
+            if source_dir.exists():
+                add_projection_source_tree(
+                    files,
+                    overlay_projection_dir / dir_name,
+                    source_dir,
+                )
 
     for skillset in model.get("skills") or []:
         inventory = collect_skill_inventory(skillset)
@@ -2099,7 +2844,24 @@ def ensure_client_overlay_skillset_shape(client_doc: dict[str, Any], client_id: 
             target_skillset[key] = copy.deepcopy(value)
 
 
-def ensure_client_overlay_context_shape(client_doc: dict[str, Any], client_default_cwd: str) -> None:
+def ensure_client_overlay_scaffold_shape(client_doc: dict[str, Any]) -> str:
+    raw_scaffold = client_doc.get("scaffold") or {}
+    if raw_scaffold is None:
+        raw_scaffold = {}
+    if not isinstance(raw_scaffold, dict):
+        raise RuntimeError("Expected client.scaffold to be a mapping.")
+
+    scaffold_pack = client_scaffold_pack(raw_scaffold.get("pack"))
+    raw_scaffold["pack"] = scaffold_pack
+    client_doc["scaffold"] = raw_scaffold
+    return scaffold_pack
+
+
+def ensure_client_overlay_context_shape(
+    client_doc: dict[str, Any],
+    client_default_cwd: str,
+    scaffold_pack: str,
+) -> None:
     raw_context = client_doc.setdefault("context", {})
     if not isinstance(raw_context, dict):
         raise RuntimeError("Expected client.context to be a mapping.")
@@ -2116,11 +2878,22 @@ def ensure_client_overlay_context_shape(client_doc: dict[str, Any], client_defau
         normalized_cwd_match.append(client_default_cwd)
     raw_context["cwd_match"] = normalized_cwd_match or [client_default_cwd]
 
-    raw_plans = raw_context.setdefault("plans", {})
-    if not isinstance(raw_plans, dict):
-        raise RuntimeError("Expected client.context.plans to be a mapping.")
-    for key, value in HARDENED_CLIENT_PLAN_PATHS.items():
-        raw_plans[key] = value
+    scaffold_pack = client_scaffold_pack(scaffold_pack)
+    if scaffold_pack == "planning":
+        raw_context.pop("workflow_builder", None)
+        raw_plans = raw_context.setdefault("plans", {})
+        if not isinstance(raw_plans, dict):
+            raise RuntimeError("Expected client.context.plans to be a mapping.")
+        for key, value in HARDENED_CLIENT_PLAN_PATHS.items():
+            raw_plans[key] = value
+        return
+
+    raw_context.pop("plans", None)
+    raw_workflow_builder = raw_context.setdefault("workflow_builder", {})
+    if not isinstance(raw_workflow_builder, dict):
+        raise RuntimeError("Expected client.context.workflow_builder to be a mapping.")
+    for key, value in HARDENED_CLIENT_SKILL_BUILDER_CONTEXT["workflow_builder"].items():
+        raw_workflow_builder[key] = value
 
 
 def ensure_client_overlay_sources_shape(sources_path: Path) -> str:
@@ -2179,8 +2952,9 @@ def normalize_client_overlay_shape(root_dir: Path, overlay_dir: Path) -> list[st
     client_doc["label"] = client_label
     client_doc["default_cwd"] = client_default_cwd
 
+    scaffold_pack = ensure_client_overlay_scaffold_shape(client_doc)
     ensure_client_overlay_skillset_shape(client_doc, client_id)
-    ensure_client_overlay_context_shape(client_doc, client_default_cwd)
+    ensure_client_overlay_context_shape(client_doc, client_default_cwd, scaffold_pack)
 
     actions: list[str] = []
     rendered_overlay = render_yaml_document(overlay_doc)
@@ -2193,7 +2967,7 @@ def normalize_client_overlay_shape(root_dir: Path, overlay_dir: Path) -> list[st
     existing_skills = read_manifest_skills(manifest_path) if manifest_path.is_file() else []
     manifest_text = render_client_skill_manifest(
         client_label,
-        HARDENED_CLIENT_PLANNING_SKILLS,
+        client_scaffold_pack_required_skills(scaffold_pack),
         existing_skills,
     )
     if not manifest_path.is_file() or manifest_path.read_text(encoding="utf-8") != manifest_text:
@@ -2222,29 +2996,31 @@ def normalize_client_overlay_shape(root_dir: Path, overlay_dir: Path) -> list[st
         actions.append(f"write-file: {repo_rel(root_dir, skills_keep_path)}")
 
     actions.extend(
-        ensure_client_planning_skill_sources(
+        ensure_client_scaffold_skill_sources(
             root_dir,
             overlay_dir,
+            scaffold_pack,
             dry_run=False,
         )
     )
     actions.extend(
-        ensure_client_planning_skill_bundles(
+        ensure_client_scaffold_skill_bundles(
             root_dir,
             overlay_dir,
+            scaffold_pack,
             dry_run=False,
         )
     )
 
-    for seed_path, content in client_plan_seed_files(overlay_dir, client_label).items():
-        ensure_directory(seed_path.parent, dry_run=False)
-        if seed_path.is_file():
-            if seed_path.name == "INDEX.md" and seed_path.read_text(encoding="utf-8").strip():
-                continue
-            if seed_path.read_text(encoding="utf-8") == content:
-                continue
-        seed_path.write_text(content, encoding="utf-8")
-        actions.append(f"write-file: {repo_rel(root_dir, seed_path)}")
+    actions.extend(
+        sync_client_scaffold_seed_files(
+            root_dir,
+            overlay_dir,
+            client_label,
+            scaffold_pack,
+            dry_run=False,
+        )
+    )
 
     return actions
 

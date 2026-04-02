@@ -718,7 +718,7 @@ With that setup:
 - `skillbox-config/clients/<client>/overlay.yaml` is the private source of truth
 - `skillbox-config/clients/<client>/skills/` holds private client-local skill sources
 - `skillbox-config/clients/<client>/bundles/` holds generated client-local `.skill` bundles
-- `skillbox-config/clients/<client>/plans/INDEX.md` plus `plans/{draft,released,sessions}/` are first-class overlay artifacts
+- overlay scaffold artifacts are first-class: planning clients get `plans/`, while skill-builder clients get `workflows/`, `evaluations/`, `invocations/`, and `observability/`
 - `client-init`, `sync`, and `focus` write client config into the private repo
 - `client-diff` and `client-publish` default to the attached private repo unless you explicitly pass `--target-dir`
 - `client-project <client>` compiles a client-safe bundle under `builds/clients/<client>/`
@@ -741,7 +741,7 @@ python3 .env-manager/manage.py client-project personal --profile surfaces --outp
 The bundle currently includes:
 
 - `workspace/runtime.yaml` with `selection.default_client` pinned to the selected client
-- only the selected client's overlay and companion skill manifest files
+- only the selected client's overlay, scaffold docs, source skill tree, and companion manifest or lock files
 - only the skill bundles referenced by the selected runtime scope
 - `runtime-model.json` with host paths and secret-like env keys removed
 - `projection.json` with a deterministic file list and payload tree hash
@@ -749,7 +749,6 @@ The bundle currently includes:
 The bundle does not include:
 
 - other clients' overlays or bundled skills
-- generated lockfiles
 - local secrets or host-only roots such as `SKILLBOX_CLIENTS_HOST_ROOT`
 
 This is the intended handoff artifact when you want something client-specific
@@ -771,6 +770,7 @@ It does three things in one step:
 
 - rebuilds the selected client's projection bundle into `sand/<client>/` by default
 - writes client-scoped `CLAUDE.md` and `AGENTS.md` into that surface instead of your shared home context
+- materializes the selected client's scaffold docs, local client skill sources, and resolved `context.yaml` inside that surface
 - writes a filtered `.mcp.json` that includes only the MCP servers requested by the selected client and profiles
 
 When you already have a reviewed bundle, `--from-bundle <dir>` skips live
@@ -1003,6 +1003,23 @@ That base scaffold seeds the client-local planning pack
 (`domain-planner`, `domain-reviewer`, `domain-scaffolder`, and
 `divide-and-conquer`) plus `plans/INDEX.md` and `plans/{draft,released,sessions}`.
 
+For workflow-only skill-builder clients, start from the built-in FWC-oriented
+blueprint instead:
+
+```bash
+python3 .env-manager/manage.py client-init acme-builder \
+  --blueprint skill-builder-fwc \
+  --set CONNECTORS=github,slack
+```
+
+That blueprint switches the scaffold pack to `skill-builder`, seeds the
+client-local `skill-issue` and `prompt-reviewer` sources and bundles, creates
+`workflows/INDEX.md`, `workflows/EXTRACTION.md`, `evaluations/README.md`,
+`invocations/README.md`, and `observability/README.md`, and declares matching
+client log lanes. `client-project` and `client-open` carry that editable
+surface into `sand/<client>/`, and `client-open` also writes a resolved
+`context.yaml` there for the sandboxed agent.
+
 For the hardened v1 onboarding path, start from the built-in blueprint that
 wires repos, services, logs, bootstrap, and checks into the scaffold:
 
@@ -1015,10 +1032,11 @@ python3 .env-manager/manage.py client-init acme-studio \
   --set SERVICE_COMMAND='pnpm dev'
 ```
 
-Blueprints keep the default client skills scaffold but append client-scoped
-repos, artifacts, tasks, services, logs, and checks to the generated overlay,
-so the next `render`, `sync`, `bootstrap`, `status`, `doctor`, or `up` command
-already has something concrete to operate on.
+Blueprints keep the default client scaffold unless they explicitly set a
+different scaffold pack. They append client-scoped repos, artifacts, tasks,
+services, logs, and checks to the generated overlay, so the next `render`,
+`sync`, `bootstrap`, `status`, `doctor`, or `up` command already has something
+concrete to operate on.
 
 ### Managed Env Files
 

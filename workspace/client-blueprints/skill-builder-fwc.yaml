@@ -1,0 +1,46 @@
+version: 1
+description: Seed a skill-builder client overlay for workflow skills, FWC-scoped connectors, evals, and observability.
+scaffold:
+  pack: skill-builder
+variables:
+  - name: CONNECTORS
+    default: ""
+    description: >
+      Comma-separated list of FWC connector ids this client is authorized to use.
+      `client-init` writes these as client-scoped overlay entries only; it does
+      not mutate `SKILLBOX_FWC_CONNECTORS`. Empty means no connectors and every
+      declared connector must already exist in the box-level superset.
+  - name: SLACK_CHANNELS
+    default: ""
+    description: >
+      Comma-separated Slack channels this client can read/write
+      (e.g. "#alerts,#ops"). Only relevant when slack is in CONNECTORS.
+  - name: SLACK_CAPABILITIES
+    default: read,write
+    description: >
+      Comma-separated Slack capabilities (read, write, react, upload).
+      Controls what the agent can do in the scoped channels.
+client:
+  logs:
+    - id: ${CLIENT_ID}-invocations
+      path: ${SKILLBOX_LOG_ROOT}/clients/${CLIENT_ID}/invocations
+      required: false
+      profiles:
+        - core
+      retention_days: 14
+      notes: Invocation summaries, copied transcript slices, and workflow-run references.
+    - id: ${CLIENT_ID}-evaluations
+      path: ${SKILLBOX_LOG_ROOT}/clients/${CLIENT_ID}/evaluations
+      required: false
+      profiles:
+        - core
+      retention_days: 30
+      notes: Evaluation runs, regressions, acceptance notes, and scorecards.
+    - id: ${CLIENT_ID}-observability
+      path: ${SKILLBOX_LOG_ROOT}/clients/${CLIENT_ID}/observability
+      required: false
+      profiles:
+        - core
+      retention_days: 30
+      notes: Connector probes, health checks, drift findings, and diagnostics.
+  connectors: ${CONNECTORS}

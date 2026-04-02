@@ -1061,6 +1061,129 @@ class RuntimeManagerTests(unittest.TestCase):
             env_example = (repo / ".env.example").read_text(encoding="utf-8")
             self.assertIn("SKILLBOX_FWC_CONNECTORS=github,slack", env_example)
 
+    def test_client_init_with_skill_builder_blueprint_scaffolds_skill_builder_pack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._write_skill_builder_blueprint(repo)
+
+            result = self._run(
+                repo,
+                "client-init",
+                "acme-builder",
+                "--blueprint",
+                "skill-builder-fwc",
+                "--set",
+                "CONNECTORS=github,slack",
+                "--set",
+                "SLACK_CHANNELS=#alerts",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["blueprint"]["id"], "skill-builder-fwc")
+
+            overlay_dir = repo / "workspace" / "clients" / "acme-builder"
+            overlay_doc = MANAGE_MODULE.load_yaml(overlay_dir / "overlay.yaml")
+            client_doc = overlay_doc["client"]
+            self.assertEqual(client_doc["scaffold"]["pack"], "skill-builder")
+            self.assertEqual(
+                client_doc["context"]["workflow_builder"],
+                MANAGE_MODULE.HARDENED_CLIENT_SKILL_BUILDER_CONTEXT["workflow_builder"],
+            )
+            self.assertNotIn("plans", client_doc["context"])
+            self.assertEqual(
+                client_doc["connectors"],
+                [
+                    {"id": "github"},
+                    {
+                        "id": "slack",
+                        "capabilities": ["read", "write"],
+                        "scopes": {"channels": ["#alerts"]},
+                    },
+                ],
+            )
+            self.assertEqual(
+                MANAGE_MODULE.read_manifest_skills(overlay_dir / "skills.manifest"),
+                MANAGE_MODULE.HARDENED_CLIENT_SKILL_BUILDER_SKILLS,
+            )
+            self.assertTrue((overlay_dir / "workflows" / "INDEX.md").is_file())
+            self.assertTrue((overlay_dir / "workflows" / "EXTRACTION.md").is_file())
+            self.assertTrue((overlay_dir / "evaluations" / "README.md").is_file())
+            self.assertTrue((overlay_dir / "invocations" / "README.md").is_file())
+            self.assertTrue((overlay_dir / "observability" / "README.md").is_file())
+            self.assertTrue((overlay_dir / "skills" / "skill-issue" / "SKILL.md").is_file())
+            self.assertTrue((overlay_dir / "skills" / "prompt-reviewer" / "SKILL.md").is_file())
+            self.assertFalse((overlay_dir / "plans").exists())
+
+            sync = self._run(repo, "sync", "--client", "acme-builder", "--format", "json")
+
+            self.assertEqual(sync.returncode, 0, sync.stderr)
+            self.assertTrue((repo / "logs" / "clients" / "acme-builder").is_dir())
+            self.assertTrue((repo / "logs" / "clients" / "acme-builder" / "invocations").is_dir())
+            self.assertTrue((repo / "logs" / "clients" / "acme-builder" / "evaluations").is_dir())
+            self.assertTrue((repo / "logs" / "clients" / "acme-builder" / "observability").is_dir())
+            self.assertTrue((overlay_dir / "skills.lock.json").is_file())
+
+            project = self._run(repo, "client-project", "acme-builder", "--format", "json")
+
+            self.assertEqual(project.returncode, 0, project.stderr)
+            projection_dir = repo / "builds" / "clients" / "acme-builder"
+            self.assertTrue((projection_dir / "workspace" / "clients" / "acme-builder" / "workflows" / "INDEX.md").is_file())
+            self.assertTrue((projection_dir / "workspace" / "clients" / "acme-builder" / "evaluations" / "README.md").is_file())
+            self.assertTrue((projection_dir / "workspace" / "clients" / "acme-builder" / "skills" / "skill-issue" / "SKILL.md").is_file())
+            self.assertTrue((projection_dir / "workspace" / "clients" / "acme-builder" / "skills" / "prompt-reviewer" / "SKILL.md").is_file())
+            self.assertFalse((projection_dir / "workspace" / "clients" / "acme-builder" / "plans").exists())
+
+    def test_client_open_from_bundle_with_skill_builder_blueprint_materializes_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._write_skill_builder_blueprint(repo)
+
+            init = self._run(
+                repo,
+                "client-init",
+                "acme-builder",
+                "--blueprint",
+                "skill-builder-fwc",
+                "--format",
+                "json",
+            )
+            self.assertEqual(init.returncode, 0, init.stderr)
+
+            project = self._run(repo, "client-project", "acme-builder", "--format", "json")
+            self.assertEqual(project.returncode, 0, project.stderr)
+
+            result = self._run(
+                repo,
+                "client-open",
+                "acme-builder",
+                "--from-bundle",
+                "./builds/clients/acme-builder",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            output_dir = repo / "sand" / "acme-builder"
+            self.assertEqual(payload["focus"]["status"], "skip")
+            self.assertTrue((output_dir / "workspace" / "clients" / "acme-builder" / "context.yaml").is_file())
+            self.assertTrue((output_dir / "workspace" / "clients" / "acme-builder" / "workflows" / "INDEX.md").is_file())
+            self.assertTrue((output_dir / "workspace" / "clients" / "acme-builder" / "skills" / "skill-issue" / "SKILL.md").is_file())
+            self.assertFalse((output_dir / "workspace" / "clients" / "acme-builder" / "plans").exists())
+
+            context_doc = MANAGE_MODULE.load_yaml(
+                output_dir / "workspace" / "clients" / "acme-builder" / "context.yaml"
+            )
+            self.assertEqual(
+                Path(str(context_doc["workflow_builder"]["workflow_index"])).resolve(),
+                (output_dir / "workspace" / "clients" / "acme-builder" / "workflows" / "INDEX.md").resolve(),
+            )
+
     def test_sync_hydrates_declared_client_env_file_and_status_reports_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -1435,6 +1558,36 @@ class RuntimeManagerTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertIn("PRIMARY_REPO_URL", payload["error"]["message"])
 
+    def test_client_init_with_unknown_scaffold_pack_fails_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._write_client_blueprint(
+                repo,
+                "invalid-pack",
+                "version: 1\n"
+                "description: Invalid scaffold pack.\n"
+                "scaffold:\n"
+                "  pack: unsupported-pack\n"
+                "client:\n"
+                "  logs: []\n",
+            )
+
+            result = self._run(
+                repo,
+                "client-init",
+                "acme-builder",
+                "--blueprint",
+                "invalid-pack",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 1)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["error"]["type"], "invalid_scaffold_pack")
+            self.assertIn("unsupported-pack", payload["error"]["message"])
+
     def test_render_keeps_supporting_inline_clients(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -1703,6 +1856,71 @@ class RuntimeManagerTests(unittest.TestCase):
                 MANAGE_MODULE.read_manifest_skills(private_client / "skills.manifest"),
                 MANAGE_MODULE.HARDENED_CLIENT_PLANNING_SKILLS,
             )
+
+    def test_private_init_preserves_skill_builder_scaffold_pack_and_notes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            repo = workspace / "skillbox"
+            repo.mkdir(parents=True, exist_ok=True)
+            self._write_fixture(repo)
+            self._write_skill_builder_blueprint(repo)
+
+            init = self._run(
+                repo,
+                "client-init",
+                "acme-builder",
+                "--blueprint",
+                "skill-builder-fwc",
+                "--format",
+                "json",
+            )
+            self.assertEqual(init.returncode, 0, init.stderr)
+
+            overlay_dir = repo / "workspace" / "clients" / "acme-builder"
+            custom_files = {
+                overlay_dir / "workflows" / "INDEX.md": "# Custom workflow index\n",
+                overlay_dir / "workflows" / "EXTRACTION.md": "# Keep this extraction note\n",
+                overlay_dir / "evaluations" / "README.md": "# Existing evaluation notes\n",
+                overlay_dir / "invocations" / "README.md": "# Existing invocation notes\n",
+                overlay_dir / "observability" / "README.md": "# Existing observability notes\n",
+            }
+            for path, content in custom_files.items():
+                path.write_text(content, encoding="utf-8")
+
+            result = self._run(
+                repo,
+                "private-init",
+                "--path",
+                "../private-config",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            private_client = workspace / "private-config" / "clients" / "acme-builder"
+            overlay_doc = MANAGE_MODULE.load_yaml(private_client / "overlay.yaml")
+            client_doc = overlay_doc["client"]
+
+            self.assertEqual(client_doc["scaffold"]["pack"], "skill-builder")
+            self.assertNotIn("plans", client_doc["context"])
+            self.assertEqual(
+                client_doc["context"]["workflow_builder"],
+                MANAGE_MODULE.HARDENED_CLIENT_SKILL_BUILDER_CONTEXT["workflow_builder"],
+            )
+            self.assertEqual(
+                MANAGE_MODULE.read_manifest_skills(private_client / "skills.manifest"),
+                MANAGE_MODULE.HARDENED_CLIENT_SKILL_BUILDER_SKILLS,
+            )
+            self.assertFalse((private_client / "plans").exists())
+            self.assertTrue((private_client / "skills" / "skill-issue" / "SKILL.md").is_file())
+            for relative_path, expected in {
+                Path("workflows/INDEX.md"): "# Custom workflow index\n",
+                Path("workflows/EXTRACTION.md"): "# Keep this extraction note\n",
+                Path("evaluations/README.md"): "# Existing evaluation notes\n",
+                Path("invocations/README.md"): "# Existing invocation notes\n",
+                Path("observability/README.md"): "# Existing observability notes\n",
+            }.items():
+                self.assertEqual((private_client / relative_path).read_text(encoding="utf-8"), expected)
 
     def test_client_publish_and_diff_use_attached_private_repo_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3291,6 +3509,13 @@ class RuntimeManagerTests(unittest.TestCase):
         blueprint_dir.mkdir(parents=True, exist_ok=True)
         (blueprint_dir / f"{name}.yaml").write_text(content, encoding="utf-8")
 
+    def _write_skill_builder_blueprint(self, repo: Path) -> None:
+        self._write_client_blueprint(
+            repo,
+            "skill-builder-fwc",
+            (ROOT_DIR / "workspace" / "client-blueprints" / "skill-builder-fwc.yaml").read_text(encoding="utf-8"),
+        )
+
     def _write_env_blueprint(self, repo: Path) -> None:
         self._write_client_blueprint(
             repo,
@@ -4083,6 +4308,196 @@ class RuntimeManagerTests(unittest.TestCase):
     # focus command tests
     # ------------------------------------------------------------------
 
+    def test_session_start_creates_durable_session_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(
+                repo,
+                "session-start",
+                "personal",
+                "--label",
+                "Tutoring run",
+                "--cwd",
+                "/monoserver/personal-app",
+                "--goal",
+                "Ship the next slice",
+                "--actor",
+                "coach",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            session = payload["session"]
+            session_id = session["session_id"]
+            session_dir = repo / "logs" / "clients" / "personal" / "sessions" / session_id
+
+            self.assertEqual(payload["client_id"], "personal")
+            self.assertEqual(session["status"], "active")
+            self.assertEqual(session["label"], "Tutoring run")
+            self.assertEqual(session["cwd"], "/monoserver/personal-app")
+            self.assertEqual(session["goal"], "Ship the next slice")
+            self.assertTrue((session_dir / "meta.json").is_file())
+            self.assertTrue((session_dir / "events.jsonl").is_file())
+            self.assertTrue((session_dir / "handoff.md").is_file())
+
+            meta = json.loads((session_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["session_id"], session_id)
+            self.assertEqual(meta["event_count"], 1)
+            self.assertEqual(meta["last_event_type"], "session.started")
+            self.assertNotIn("paths", meta)
+            self.assertNotIn("recent_events", meta)
+
+            events = (session_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(events), 1)
+            started_event = json.loads(events[0])
+            self.assertEqual(started_event["type"], "session.started")
+            self.assertEqual(started_event["detail"]["actor"], "coach")
+
+    def test_session_event_appends_and_updates_heartbeat_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            started = self._run(repo, "session-start", "personal", "--format", "json")
+            session_id = json.loads(started.stdout)["session"]["session_id"]
+
+            result = self._run(
+                repo,
+                "session-event",
+                "personal",
+                "--session-id",
+                session_id,
+                "--event-type",
+                "note",
+                "--message",
+                "Student is taking over implementation",
+                "--actor",
+                "coach",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            session = payload["session"]
+            self.assertEqual(session["last_event_type"], "session.note")
+            self.assertEqual(session["last_message"], "Student is taking over implementation")
+            self.assertEqual(session["event_count"], 2)
+
+            meta_path = repo / "logs" / "clients" / "personal" / "sessions" / session_id / "meta.json"
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(meta["last_event_type"], "session.note")
+            self.assertEqual(meta["last_message"], "Student is taking over implementation")
+            self.assertGreaterEqual(meta["last_heartbeat_at"], meta["started_at"])
+            self.assertNotIn("paths", meta)
+            self.assertNotIn("recent_events", meta)
+
+    def test_session_end_and_resume_transition_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            started = self._run(repo, "session-start", "personal", "--format", "json")
+            session_id = json.loads(started.stdout)["session"]["session_id"]
+
+            ended = self._run(
+                repo,
+                "session-end",
+                "personal",
+                "--session-id",
+                session_id,
+                "--status",
+                "failed",
+                "--summary",
+                "Container crashed mid-run",
+                "--format",
+                "json",
+            )
+            self.assertEqual(ended.returncode, 0, ended.stderr)
+            ended_payload = json.loads(ended.stdout)
+            self.assertEqual(ended_payload["session"]["status"], "failed")
+            self.assertEqual(ended_payload["session"]["summary"], "Container crashed mid-run")
+
+            resumed = self._run(
+                repo,
+                "session-resume",
+                "personal",
+                "--session-id",
+                session_id,
+                "--actor",
+                "coach",
+                "--message",
+                "Recovered after crash",
+                "--format",
+                "json",
+            )
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            resumed_payload = json.loads(resumed.stdout)
+            self.assertEqual(resumed_payload["session"]["status"], "active")
+            self.assertEqual(resumed_payload["session"]["resume_count"], 1)
+            self.assertEqual(resumed_payload["session"]["last_event_type"], "session.resumed")
+            self.assertEqual(resumed_payload["session"]["last_message"], "Recovered after crash")
+
+    def test_session_status_lists_recent_sessions_newest_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            first = self._run(repo, "session-start", "personal", "--label", "First", "--format", "json")
+            first_id = json.loads(first.stdout)["session"]["session_id"]
+            second = self._run(repo, "session-start", "personal", "--label", "Second", "--format", "json")
+            second_id = json.loads(second.stdout)["session"]["session_id"]
+
+            result = self._run(repo, "session-status", "personal", "--limit", "2", "--format", "json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+
+            self.assertEqual(payload["count"], 2)
+            self.assertEqual([item["session_id"] for item in payload["sessions"]], [second_id, first_id])
+            self.assertEqual(payload["sessions"][0]["label"], "Second")
+
+    def test_session_event_errors_for_missing_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(
+                repo,
+                "session-event",
+                "personal",
+                "--session-id",
+                "missing-session",
+                "--event-type",
+                "note",
+                "--message",
+                "noop",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 1, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["error"]["type"], "session_not_found")
+
+    def test_session_end_errors_when_session_is_not_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            started = self._run(repo, "session-start", "personal", "--format", "json")
+            session_id = json.loads(started.stdout)["session"]["session_id"]
+            ended = self._run(repo, "session-end", "personal", "--session-id", session_id, "--format", "json")
+            self.assertEqual(ended.returncode, 0, ended.stderr)
+
+            again = self._run(repo, "session-end", "personal", "--session-id", session_id, "--format", "json")
+            self.assertEqual(again.returncode, 1, again.stderr)
+            payload = json.loads(again.stdout)
+            self.assertEqual(payload["error"]["type"], "session_state_conflict")
+
     def test_focus_activates_client_and_generates_live_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -4293,6 +4708,50 @@ class RuntimeManagerTests(unittest.TestCase):
             # Check that Attention section was generated
             claude_md = (repo / "home" / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
             self.assertIn("RECENT ERRORS", claude_md)
+
+    def test_focus_live_context_includes_sessions_section(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            started = self._run(
+                repo,
+                "session-start",
+                "personal",
+                "--label",
+                "Tutor handoff",
+                "--goal",
+                "Leave the student to vibe code safely",
+                "--format",
+                "json",
+            )
+            session_id = json.loads(started.stdout)["session"]["session_id"]
+            self._run(
+                repo,
+                "session-event",
+                "personal",
+                "--session-id",
+                session_id,
+                "--event-type",
+                "note",
+                "--message",
+                "Waiting on student changes",
+                "--format",
+                "json",
+            )
+
+            result = self._run(repo, "focus", "personal", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertIn("sessions", payload["live_state"])
+            self.assertTrue(payload["live_state"]["sessions"])
+            self.assertEqual(payload["live_state"]["sessions"][0]["session_id"], session_id)
+
+            claude_md = (repo / "home" / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
+            self.assertIn("## Sessions", claude_md)
+            self.assertIn("Tutor handoff", claude_md)
+            self.assertIn("session.note", claude_md)
 
     def test_focus_supports_profiles_and_persists_active_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

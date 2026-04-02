@@ -402,6 +402,62 @@ def main() -> int:
     add_service_arg(focus_parser)
     add_context_dir_arg(focus_parser)
 
+    session_start_parser = subparsers.add_parser(
+        "session-start",
+        help="Create a durable client-scoped session ledger with metadata and append-only events.",
+    )
+    session_start_parser.add_argument("client_id", help="Existing client slug to attach the session to.")
+    session_start_parser.add_argument("--label", default="", help="Human-friendly session label.")
+    session_start_parser.add_argument("--cwd", default="", help="Working directory for the session.")
+    session_start_parser.add_argument("--goal", default="", help="Short statement of intent for the session.")
+    session_start_parser.add_argument("--actor", default="", help="Optional actor or operator name.")
+    session_start_parser.add_argument("--format", choices=("text", "json"), default="text")
+
+    session_event_parser = subparsers.add_parser(
+        "session-event",
+        help="Append a structured event to an active durable session.",
+    )
+    session_event_parser.add_argument("client_id", help="Existing client slug that owns the session.")
+    session_event_parser.add_argument("--session-id", required=True, help="Durable session id.")
+    session_event_parser.add_argument("--event-type", required=True, help="Session event type, with or without session. prefix.")
+    session_event_parser.add_argument("--message", default="", help="Optional event message.")
+    session_event_parser.add_argument("--actor", default="", help="Optional actor or operator name.")
+    session_event_parser.add_argument("--format", choices=("text", "json"), default="text")
+
+    session_end_parser = subparsers.add_parser(
+        "session-end",
+        help="Close an active durable session and persist a handoff summary.",
+    )
+    session_end_parser.add_argument("client_id", help="Existing client slug that owns the session.")
+    session_end_parser.add_argument("--session-id", required=True, help="Durable session id.")
+    session_end_parser.add_argument(
+        "--status",
+        default="completed",
+        choices=sorted(SESSION_TERMINAL_STATUSES),
+        help="Terminal lifecycle state to persist.",
+    )
+    session_end_parser.add_argument("--summary", default="", help="Optional closeout summary.")
+    session_end_parser.add_argument("--format", choices=("text", "json"), default="text")
+
+    session_resume_parser = subparsers.add_parser(
+        "session-resume",
+        help="Resume a previously ended durable session.",
+    )
+    session_resume_parser.add_argument("client_id", help="Existing client slug that owns the session.")
+    session_resume_parser.add_argument("--session-id", required=True, help="Durable session id.")
+    session_resume_parser.add_argument("--actor", default="", help="Optional actor or operator name.")
+    session_resume_parser.add_argument("--message", default="", help="Optional resume note.")
+    session_resume_parser.add_argument("--format", choices=("text", "json"), default="text")
+
+    session_status_parser = subparsers.add_parser(
+        "session-status",
+        help="Read one durable session or list recent sessions for a client.",
+    )
+    session_status_parser.add_argument("client_id", help="Existing client slug that owns the session.")
+    session_status_parser.add_argument("--session-id", default=None, help="Specific durable session id to inspect.")
+    session_status_parser.add_argument("--limit", type=int, default=10, help="Maximum sessions to return when listing.")
+    session_status_parser.add_argument("--format", choices=("text", "json"), default="text")
+
     acceptance_parser = subparsers.add_parser(
         "acceptance",
         help="Run the first-box readiness gate: doctor-pre, sync, focus, mcp-smoke, doctor-post.",
@@ -686,6 +742,145 @@ def main() -> int:
             fmt=args.format,
             context_dir=resolve_context_dir(root_dir, getattr(args, "context_dir", None)),
         )
+
+    if args.command == "session-start":
+        try:
+            payload = start_client_session(
+                root_dir,
+                args.client_id,
+                label=args.label,
+                cwd=args.cwd,
+                goal=args.goal,
+                actor=args.actor,
+            )
+        except RuntimeError as exc:
+            if args.format == "json":
+                emit_json(classify_error(exc, "session-start"))
+            else:
+                print(str(exc), file=sys.stderr)
+            return EXIT_ERROR
+
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            session = payload["session"]
+            print(f"client: {payload['client_id']}")
+            print(f"session: {session['session_id']}")
+            print(f"status: {session['status']}")
+            if session.get("label"):
+                print(f"label: {session['label']}")
+        return EXIT_OK
+
+    if args.command == "session-event":
+        try:
+            detail = {"actor": args.actor} if args.actor else None
+            payload = append_client_session_event(
+                root_dir,
+                args.client_id,
+                args.session_id,
+                event_type=args.event_type,
+                message=args.message,
+                detail=detail,
+            )
+        except RuntimeError as exc:
+            if args.format == "json":
+                emit_json(classify_error(exc, "session-event"))
+            else:
+                print(str(exc), file=sys.stderr)
+            return EXIT_ERROR
+
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            session = payload["session"]
+            print(f"client: {payload['client_id']}")
+            print(f"session: {session['session_id']}")
+            print(f"last_event: {session.get('last_event_type', '-')}")
+            if session.get("last_message"):
+                print(f"message: {session['last_message']}")
+        return EXIT_OK
+
+    if args.command == "session-end":
+        try:
+            payload = end_client_session(
+                root_dir,
+                args.client_id,
+                args.session_id,
+                final_status=args.status,
+                summary=args.summary,
+            )
+        except RuntimeError as exc:
+            if args.format == "json":
+                emit_json(classify_error(exc, "session-end"))
+            else:
+                print(str(exc), file=sys.stderr)
+            return EXIT_ERROR
+
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            session = payload["session"]
+            print(f"client: {payload['client_id']}")
+            print(f"session: {session['session_id']}")
+            print(f"status: {session['status']}")
+        return EXIT_OK
+
+    if args.command == "session-resume":
+        try:
+            payload = resume_client_session(
+                root_dir,
+                args.client_id,
+                args.session_id,
+                actor=args.actor,
+                message=args.message,
+            )
+        except RuntimeError as exc:
+            if args.format == "json":
+                emit_json(classify_error(exc, "session-resume"))
+            else:
+                print(str(exc), file=sys.stderr)
+            return EXIT_ERROR
+
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            session = payload["session"]
+            print(f"client: {payload['client_id']}")
+            print(f"session: {session['session_id']}")
+            print(f"status: {session['status']}")
+        return EXIT_OK
+
+    if args.command == "session-status":
+        try:
+            payload = session_status_payload(
+                root_dir,
+                args.client_id,
+                session_id=args.session_id,
+                limit=max(0, int(args.limit)),
+            )
+        except RuntimeError as exc:
+            if args.format == "json":
+                emit_json(classify_error(exc, "session-status"))
+            else:
+                print(str(exc), file=sys.stderr)
+            return EXIT_ERROR
+
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            if payload.get("session"):
+                session = payload["session"]
+                print(f"client: {payload['client_id']}")
+                print(f"session: {session['session_id']}")
+                print(f"status: {session['status']}")
+                print(f"events: {len(session.get('recent_events') or [])}")
+            else:
+                print(f"client: {payload['client_id']}")
+                print(f"sessions: {payload['count']}")
+                for session in payload.get("sessions") or []:
+                    label = session.get("label") or "-"
+                    print(f"  - {session['session_id']}: {session.get('status', 'unknown')} {label}")
+        return EXIT_OK
 
     if args.command == "ack":
         if args.list_acks:
