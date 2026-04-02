@@ -22,7 +22,7 @@ client:
       required: false
       profiles:
         - core
-      bundle_dir: ${SKILLBOX_WORKSPACE_ROOT}/default-skills/clients/personal
+      bundle_dir: ${SKILLBOX_CLIENTS_ROOT}/personal/bundles
       manifest: ${SKILLBOX_CLIENTS_ROOT}/personal/skills.manifest
       sources_config: ${SKILLBOX_CLIENTS_ROOT}/personal/skills.sources.yaml
       lock_path: ${SKILLBOX_CLIENTS_ROOT}/personal/skills.lock.json

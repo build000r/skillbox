@@ -175,13 +175,13 @@ load_sources() {
         ;;
     esac
   done < <(
-    python3 - "$SOURCES_FILE" "$ROOT_DIR" <<'PY'
+    python3 - "$SOURCES_FILE" <<'PY'
 import re
 import sys
 from pathlib import Path
 
-config_path = Path(sys.argv[1])
-root_dir = Path(sys.argv[2])
+config_path = Path(sys.argv[1]).resolve()
+sources_root = config_path.parent
 
 if not config_path.exists():
     print(f"Source config not found: {config_path}", file=sys.stderr)
@@ -234,7 +234,7 @@ for item in items:
       elif path.startswith("/"):
           resolved = path
       else:
-          resolved = str((root_dir / path).resolve())
+          resolved = str((sources_root / path).resolve())
       print(f"local\t{resolved}")
     else:
       print(f"Unsupported source kind in {config_path}: {kind}", file=sys.stderr)

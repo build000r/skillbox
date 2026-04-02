@@ -47,17 +47,10 @@ EXPECTED_FILES = [
     "workspace/default-skills.sources.yaml",
     "workspace/client-blueprints/git-repo.yaml",
     "workspace/client-blueprints/git-repo-http-service.yaml",
-    "workspace/clients/personal/overlay.yaml",
-    "workspace/clients/personal/skills.manifest",
-    "workspace/clients/personal/skills.sources.yaml",
-    "workspace/clients/vibe-coding-client/overlay.yaml",
-    "workspace/clients/vibe-coding-client/skills.manifest",
-    "workspace/clients/vibe-coding-client/skills.sources.yaml",
 ]
 EXPECTED_DIRECTORIES = [
     ".env-manager",
     "default-skills",
-    "default-skills/clients",
     "docker",
     "home/.claude",
     "home/.codex",
@@ -65,10 +58,8 @@ EXPECTED_DIRECTORIES = [
     "repos",
     "scripts",
     "skills",
-    "skills/clients",
     "workspace",
     "workspace/client-blueprints",
-    "workspace/clients",
 ]
 
 

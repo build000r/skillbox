@@ -532,8 +532,8 @@ make runtime-sync
 | `make render` | Prints the resolved sandbox model |
 | `make doctor` | Validates manifest/runtime drift, Compose wiring, and skill sync |
 | `make runtime-render` | Prints the resolved internal runtime graph |
-| `make runtime-sync` | Creates managed repo/log directories and installs declared skills with generated lockfiles for the active core/client scope |
-| `make runtime-status` | Summarizes declared repos, skills, tasks, services, logs, and checks |
+| `make runtime-sync` | Creates managed repo/log directories, reconciles managed artifacts against declared pins or source files, and installs declared skills with generated lockfiles for the active core/client scope |
+| `make runtime-status` | Summarizes declared repos, artifacts, skills, tasks, services, logs, and checks |
 | `make runtime-bootstrap` | Syncs runtime state and runs declared bootstrap tasks for the active scope |
 | `make runtime-up` | Syncs runtime state, runs required bootstrap tasks, and starts manageable services for the active scope |
 | `make runtime-down` | Stops manageable services for the active scope |
@@ -590,11 +590,12 @@ make runtime-sync
 | `.env-manager/manage.py down` | Stop manageable services started by the runtime manager, stopping selected dependents before their prerequisites | `python3 .env-manager/manage.py down --profile surfaces --service api-stub` |
 | `.env-manager/manage.py restart` | Restart manageable services for the selected core/client scope, preserving declared dependency order | `python3 .env-manager/manage.py restart --profile surfaces --service web-stub` |
 | `.env-manager/manage.py logs` | Print recent log output for declared services | `python3 .env-manager/manage.py logs --profile surfaces --service api-stub --lines 80` |
-| `.env-manager/manage.py client-init` | Scaffold a new client overlay, optionally applying a reusable blueprint for repos and services | `python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo --set PRIMARY_REPO_URL=https://github.com/acme/app.git` |
+| `.env-manager/manage.py client-init` | Scaffold a new client overlay, optionally applying a reusable blueprint for repos, services, and client-scoped connector declarations | `python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo --set PRIMARY_REPO_URL=https://github.com/acme/app.git` |
 | `.env-manager/manage.py private-init` | Attach or initialize the private client-config repo for this checkout and persist the local clients-root override | `python3 .env-manager/manage.py private-init --path ../skillbox-config` |
 | `.env-manager/manage.py client-project` | Compile a single-client projection bundle with a client-safe runtime manifest and sanitized metadata | `python3 .env-manager/manage.py client-project personal --profile surfaces` |
+| `.env-manager/manage.py client-open` | Build a client-safe working surface under `sand/<client>/` with scoped `CLAUDE.md`, `AGENTS.md`, and `.mcp.json` | `python3 .env-manager/manage.py client-open personal --profile connectors` |
 | `.env-manager/manage.py client-diff` | Compare a client projection bundle against the current published payload and show both file-level and runtime-surface changes | `python3 .env-manager/manage.py client-diff personal --profile surfaces` |
-| `.env-manager/manage.py client-publish` | Promote a client projection bundle into the attached private git repo under `clients/<client>/current/` | `python3 .env-manager/manage.py client-publish personal --commit` |
+| `.env-manager/manage.py client-publish` | Promote a client projection bundle into the attached private git repo under `clients/<client>/current/`, optionally persisting acceptance evidence | `python3 .env-manager/manage.py client-publish personal --acceptance --commit` |
 | `.env-manager/pulse.py` | Pulse reconciliation daemon for continuous drift detection and auto-heal | `python3 .env-manager/pulse.py run --interval 30` |
 
 ## Configuration
@@ -622,16 +623,19 @@ SKILLBOX_SWIMMERS_REPO=/monoserver/swimmers
 SKILLBOX_SWIMMERS_INSTALL_DIR=/home/sandbox/.local/bin
 SKILLBOX_SWIMMERS_BIN=/home/sandbox/.local/bin/swimmers
 SKILLBOX_SWIMMERS_DOWNLOAD_URL=
+SKILLBOX_SWIMMERS_DOWNLOAD_SHA256=
 SKILLBOX_SWIMMERS_AUTH_MODE=
 SKILLBOX_SWIMMERS_AUTH_TOKEN=
 SKILLBOX_SWIMMERS_OBSERVER_TOKEN=
 SKILLBOX_DCG_BIN=/home/sandbox/.local/bin/dcg
 SKILLBOX_DCG_DOWNLOAD_URL=
+SKILLBOX_DCG_DOWNLOAD_SHA256=
 SKILLBOX_DCG_PACKS=core.git,core.filesystem
 SKILLBOX_PULSE_INTERVAL=30
 SKILLBOX_DCG_MCP_PORT=3220
 SKILLBOX_FWC_BIN=/home/sandbox/.local/bin/fwc
 SKILLBOX_FWC_DOWNLOAD_URL=
+SKILLBOX_FWC_DOWNLOAD_SHA256=
 SKILLBOX_FWC_MCP_PORT=3221
 SKILLBOX_FWC_ZONE=work
 SKILLBOX_FWC_CONNECTORS=github,slack,linear
@@ -644,6 +648,15 @@ SKILLBOX_TS_AUTHKEY=
 `SKILLBOX_SWIMMERS_DOWNLOAD_URL`, `make runtime-sync` or `make swimmers-install`
 can hydrate the binary without needing `/monoserver/swimmers`.
 
+`SKILLBOX_FWC_CONNECTORS` is the box-level connector superset. Client overlays
+may declare only a narrowed `client.connectors` subset, and `doctor` plus
+`acceptance` now fail before activation if a client tries to widen the box
+contract.
+
+The default `connectors` profile is runtime-only: install pinned connector
+binaries and expose MCP services. If you need local FWC/DCG source checkouts
+for inspection or development, add `--profile connectors-dev` explicitly.
+
 `SKILLBOX_DO_TOKEN`, `SKILLBOX_DO_SSH_KEY_ID`, and `SKILLBOX_TS_AUTHKEY` are
 required only for fleet management (`operator_provision` / `make box-up`).
 
@@ -653,10 +666,13 @@ The clean split is:
 
 ```text
 ~/repos/
-  skillbox/              # public engine and templates
-  skillbox-config/       # private client overlays and generated client context
-  client-acme-web/       # client code
-  client-acme-api/       # client code
+  skillbox/                    # public engine and templates
+  skillbox-config/             # private multi-client operator repo
+    clients/
+      personal/
+      client-acme/
+  client-acme-web/             # client code
+  client-acme-api/             # client code
 ```
 
 Recommended local override in `skillbox/.env`:
@@ -677,9 +693,12 @@ With that setup:
 
 - `skillbox` stays publishable
 - `skillbox-config/clients/<client>/overlay.yaml` is the private source of truth
+- `skillbox-config/clients/<client>/skills/` holds private client-local skill sources
+- `skillbox-config/clients/<client>/bundles/` holds generated client-local `.skill` bundles
 - `client-init`, `sync`, and `focus` write client config into the private repo
 - `client-diff` and `client-publish` default to the attached private repo unless you explicitly pass `--target-dir`
 - `client-project <client>` compiles a client-safe bundle under `builds/clients/<client>/`
+- `client-open <client>` turns that bundle into a ready-to-work client surface under `sand/<client>/`
 - client application repos stay separate under the shared monoserver tree
 - clients usually do not need access to the `skillbox` repo itself
 
@@ -711,15 +730,35 @@ The bundle does not include:
 This is the intended handoff artifact when you want something client-specific
 without exposing the full operator repo.
 
+### Opening a client surface
+
+`client-open` is the default operator entrypoint for a shared `skillbox/` plus
+private multi-client `skillbox-config/` setup:
+
+```bash
+python3 .env-manager/manage.py client-open personal
+python3 .env-manager/manage.py client-open client-acme --profile connectors
+python3 .env-manager/manage.py client-open personal --output-dir ./artifacts/open-personal
+```
+
+It does three things in one step:
+
+- rebuilds the selected client's projection bundle into `sand/<client>/` by default
+- writes client-scoped `CLAUDE.md` and `AGENTS.md` into that surface instead of your shared home context
+- writes a filtered `.mcp.json` that includes only the MCP servers requested by the selected client and profiles
+
+The generated surface is meant to be the safe place to point an agent at when
+you want one client in scope and every other client out of scope.
+
 ### Publishing a client bundle
 
 The intended promotion loop is:
 
 ```bash
 python3 .env-manager/manage.py private-init --path ../skillbox-config
-python3 .env-manager/manage.py client-project personal --profile surfaces
+python3 .env-manager/manage.py client-open personal --profile surfaces
 python3 .env-manager/manage.py client-diff personal --profile surfaces
-python3 .env-manager/manage.py client-publish personal --commit --profile surfaces
+python3 .env-manager/manage.py client-publish personal --acceptance --commit --profile surfaces
 ```
 
 `client-diff` compares a candidate bundle against the existing
@@ -738,6 +777,8 @@ client-facing artifact in a private git repo:
 python3 .env-manager/manage.py client-publish personal --commit
 python3 .env-manager/manage.py client-publish personal \
   --from-bundle ./builds/clients/personal
+python3 .env-manager/manage.py client-publish personal \
+  --acceptance --commit
 ```
 
 If you need to publish somewhere other than the attached repo for a specific
@@ -749,7 +790,13 @@ What v1 does:
 - diffs a candidate bundle against the current published payload before promotion
 - writes the payload to `clients/<client>/current/`
 - writes `clients/<client>/publish.json` with the latest published metadata
+- optionally writes `clients/<client>/acceptance.json` with compact readiness evidence from `acceptance`
 - optionally creates one local git commit in the target repo
+
+If you want promotion to mean "reviewed and actually verified on this box",
+use `--acceptance`. That runs the acceptance gate first and persists a compact
+record of the accepted profiles, MCP surfaces, and source commit alongside the
+published payload in the private repo.
 
 What v1 does not do:
 
@@ -900,6 +947,7 @@ client:
       path: ${SKILLBOX_MONOSERVER_ROOT}
   skills:
     - id: personal-skills
+      bundle_dir: ${SKILLBOX_CLIENTS_ROOT}/personal/bundles
       manifest: ${SKILLBOX_CLIENTS_ROOT}/personal/skills.manifest
 ```
 
@@ -1004,6 +1052,9 @@ The mental model is now:
 - `core` is the monoserver itself
 - `--client` selects a client overlay
 - `--profile` selects optional non-client overlays such as `surfaces`
+- the connectors profile is box-owned; blueprints may scaffold only client-level
+  connector subsets under `client.connectors`
+- `connectors-dev` is separate and only for optional FWC/DCG source checkouts
 - projects live inside a client overlay, not the other way around
 
 Examples:

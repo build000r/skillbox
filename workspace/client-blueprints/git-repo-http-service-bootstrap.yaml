@@ -43,9 +43,10 @@ variables:
   - name: CONNECTORS
     default: ""
     description: >
-      Comma-separated list of FCP connector ids this client is authorized to use
-      (e.g. "slack,github,postgres"). Empty means no connectors. Requires the
-      connectors profile to be active at the box level.
+      Comma-separated list of FWC connector ids this client is authorized to use.
+      `client-init` writes these as client-scoped overlay entries only; it does
+      not mutate `SKILLBOX_FWC_CONNECTORS`. Empty means no connectors and every
+      declared connector must already exist in the box-level superset.
   - name: SLACK_CHANNELS
     default: ""
     description: >

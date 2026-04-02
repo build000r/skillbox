@@ -69,24 +69,25 @@ runtime_artifacts:
       Destructive command guard binary. PreToolUse hook AND MCP server
       for proactive command safety checking.
 
-connector_repos:
+connector_source_repos:
   - id: flywheel-connectors
     path: /workspace/repos/flywheel_connectors
     required: false
-    notes: FCP source — 150 connector crates, SDK, mesh networking, crypto.
+    notes: Optional FCP source checkout for the `connectors-dev` profile.
 
   - id: destructive-command-guard
     path: /workspace/repos/destructive_command_guard
     required: false
-    notes: DCG source — 49+ rule packs, heredoc scanner, MCP server.
+    notes: Optional DCG source checkout for the `connectors-dev` profile.
 
 # ---------------------------------------------------------------------------
 # Client connector schema
 #
 # Each client overlay can declare a `connectors` section listing the FCP
-# connectors it is authorized to use.  When the connectors profile is active
+# connectors it is authorized to use. When the connectors profile is active
 # at the box level (fwc-mcp + dcg-mcp services running), the client's
-# connector declarations scope what the agent can reach.
+# connector declarations scope what the agent can reach. Optional FWC/DCG
+# source checkouts are separate and belong to the connectors-dev profile.
 #
 # Schema per entry:
 #   id:            FCP connector id (e.g. slack, github, postgres)

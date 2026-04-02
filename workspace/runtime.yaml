@@ -261,40 +261,6 @@ core:
       notes: Flywheel connectors CLI should be installed for the connectors profile.
 
 connectors:
-  repos:
-    - id: flywheel-connectors
-      kind: repo
-      path: ${SKILLBOX_REPOS_ROOT}/flywheel_connectors
-      required: false
-      profiles:
-        - connectors
-      source:
-        kind: git
-        url: https://github.com/Dicklesworthstone/flywheel_connectors.git
-        branch: main
-      sync:
-        mode: clone-if-missing
-      notes: >
-        Flywheel Connector Protocol — 150+ service connectors with
-        cryptographic capability gating. Source checkout for building
-        custom connectors and reading connector manifests.
-
-    - id: destructive-command-guard
-      kind: repo
-      path: ${SKILLBOX_REPOS_ROOT}/destructive_command_guard
-      required: false
-      profiles:
-        - connectors
-      source:
-        kind: git
-        url: https://github.com/Dicklesworthstone/destructive_command_guard.git
-        branch: main
-      sync:
-        mode: clone-if-missing
-      notes: >
-        DCG source checkout. Used to build the binary from source when
-        no download URL is configured, and to inspect/extend rule packs.
-
   artifacts:
     - id: fwc-bin
       kind: binary
@@ -363,3 +329,38 @@ connectors:
         - connectors
       retention_days: 14
       notes: Flywheel connectors and DCG MCP server logs.
+
+connectors-dev:
+  repos:
+    - id: flywheel-connectors
+      kind: repo
+      path: ${SKILLBOX_REPOS_ROOT}/flywheel_connectors
+      required: false
+      profiles:
+        - connectors-dev
+      source:
+        kind: git
+        url: https://github.com/Dicklesworthstone/flywheel_connectors.git
+        branch: main
+      sync:
+        mode: clone-if-missing
+      notes: >
+        Optional Flywheel Connector Protocol source checkout for building
+        custom connectors, reading connector manifests, and source-level
+        inspection. Not required for normal connector runtime use.
+
+    - id: destructive-command-guard
+      kind: repo
+      path: ${SKILLBOX_REPOS_ROOT}/destructive_command_guard
+      required: false
+      profiles:
+        - connectors-dev
+      source:
+        kind: git
+        url: https://github.com/Dicklesworthstone/destructive_command_guard.git
+        branch: main
+      sync:
+        mode: clone-if-missing
+      notes: >
+        Optional DCG source checkout for extending rule packs, reading the
+        implementation, or building from source when needed.

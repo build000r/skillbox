@@ -22,15 +22,16 @@ python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo-http
 python3 .env-manager/manage.py client-project personal
 python3 .env-manager/manage.py client-project personal --profile surfaces --output-dir ./builds/clients/personal-surfaces
 python3 .env-manager/manage.py client-diff personal --target-dir ../skillbox-config-control --profile surfaces
-python3 .env-manager/manage.py client-publish personal --target-dir ../skillbox-config-control --commit --profile surfaces
+python3 .env-manager/manage.py client-publish personal --target-dir ../skillbox-config-control --acceptance --commit --profile surfaces
 python3 .env-manager/manage.py sync --client personal
 python3 .env-manager/manage.py render --client personal --profile surfaces
 python3 .env-manager/manage.py status --profile swimmers
 ```
 
-`sync` reconciles repos, env files, artifact/log directories, and the declared
-packaged skill sets for the active scope, writing generated lockfiles for each
-selected skill set.
+`sync` reconciles repos, env files, and managed artifacts against their
+declared pins or source files, creates artifact/log directories, and installs
+the declared packaged skill sets for the active scope, writing generated
+lockfiles for each selected skill set.
 
 `up`, `down`, `restart`, and `logs` are the first lifecycle commands for
 declared services. `up` runs `sync` first, then starts manageable services and
@@ -41,11 +42,16 @@ The mental model is:
 - `core` is always active
 - `--client` activates a client overlay such as `personal` or `vibe-coding-client`
 - `--profile` activates optional non-client overlays such as `surfaces`
+- `--profile connectors` is the runtime connector surface: pinned binaries and MCP services
+- `--profile connectors-dev` adds optional FWC/DCG source checkouts for inspection or development
 - `client-init` scaffolds `${SKILLBOX_CLIENTS_HOST_ROOT:-./workspace/clients}/<client>/overlay.yaml`
   and the companion skill directories for a new overlay
 - `client-init --blueprint ...` appends reusable repos, services, logs, and
   checks to that scaffold so `render`, `sync`, and `up` immediately work on a
   concrete client shape
+- `SKILLBOX_FWC_CONNECTORS` is the box-level connector superset; `client.connectors`
+  in overlays can only narrow that set, and `doctor` / `acceptance` fail early
+  when a client widens it
 - `client-project <client>` compiles a client-safe bundle under
   `builds/clients/<client>/` with a single-client `workspace/runtime.yaml`,
   only that client's overlay/skill files, and a sanitized `runtime-model.json`
@@ -54,7 +60,8 @@ The mental model is:
   promotion, showing file-level and runtime-surface deltas against the current
   published payload
 - `client-publish <client> --target-dir <repo>` promotes the reviewed bundle
-  into `clients/<client>/current/` plus `publish.json`
+  into `clients/<client>/current/` plus `publish.json`, and `--acceptance`
+  also persists compact readiness evidence into `clients/<client>/acceptance.json`
 
 Client overlays usually point at repo roots under `/monoserver`, which is the
 host parent directory mounted into the workspace container.
