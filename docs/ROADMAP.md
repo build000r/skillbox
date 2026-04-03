@@ -113,6 +113,7 @@ One deploy command promotes a service from the box to the droplet with no manual
 | Phase | Milestone | Gate |
 |-------|-----------|------|
 | **0 (Now)** | Skillbox works for skill/agent dev | Already passing |
+| **1.5** | Trusted collaborator access via Tailnet | `03-shared-jam.sh invite` + SSH with auto-attribution |
 | **1** | Sweet-potato dev containers in runtime.yaml | `skillbox up` runs SPAPS locally |
 | **2** | Nginx parity + env parity | Local routing matches prod shape |
 | **3** | Deploy skill promotes box → droplet | One command, same skill, different target |
