@@ -25,7 +25,9 @@ def print_render_text(model: dict[str, Any]) -> None:
         print(f"  - {env_file['id']}: {env_file.get('kind', 'env-file')} @ {env_file['path']}")
     print(f"skills: {len(model['skills'])}")
     for skillset in model["skills"]:
-        print(f"  - {skillset['id']}: {skillset.get('kind', 'packaged-skill-set')} @ {skillset['bundle_dir']}")
+        kind = skillset.get('kind', 'skill-repo-set')
+        location = skillset.get('skill_repos_config') or skillset.get('bundle_dir') or '(unknown)'
+        print(f"  - {skillset['id']}: {kind} @ {location}")
     print(f"tasks: {len(model['tasks'])}")
     for task in model["tasks"]:
         dependency_summary = ""

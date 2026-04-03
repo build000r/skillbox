@@ -30,8 +30,8 @@ python3 .env-manager/manage.py status --profile swimmers
 
 `sync` reconciles repos, env files, and managed artifacts against their
 declared pins or source files, creates artifact/log directories, and installs
-the declared packaged skill sets for the active scope, writing generated
-lockfiles for each selected skill set.
+skills from declared `skill-repos.yaml` configs (clone/fetch repos, filtered
+copy into install targets), writing lockfiles for each selected skill set.
 
 `up`, `down`, `restart`, and `logs` are the first lifecycle commands for
 declared services. `up` runs `sync` first, then starts manageable services and
@@ -45,7 +45,7 @@ The mental model is:
 - `--profile connectors` is the runtime connector surface: pinned binaries and MCP services
 - `--profile connectors-dev` adds optional FWC/DCG source checkouts for inspection or development
 - `client-init` scaffolds `${SKILLBOX_CLIENTS_HOST_ROOT:-./workspace/clients}/<client>/overlay.yaml`
-  plus the companion skill directories, planning roots, and planning-pack manifest for a new overlay
+  plus the companion skill directories, `skill-repos.yaml`, and planning roots for a new overlay
 - `client-init --blueprint ...` appends reusable repos, services, logs, and
   checks to that scaffold so `render`, `sync`, and `up` immediately work on a
   concrete client shape; the blessed hardened-v1 path is `git-repo-http-service-bootstrap`

@@ -752,11 +752,22 @@ def order_task_ids(model: dict[str, Any], selected_ids: set[str]) -> list[str]:
     return ordered_ids
 
 
-def service_supports_lifecycle(service: dict[str, Any]) -> tuple[bool, str | None]:
+def service_supports_lifecycle(
+    service: dict[str, Any],
+    model: dict[str, Any] | None = None,
+) -> tuple[bool, str | None]:
     if not str(service.get("command") or "").strip():
         return False, "command missing"
     if str(service.get("kind") or "").strip() == "orchestration":
         return False, "orchestration services are status-only"
+    artifact_id = str(service.get("artifact") or "").strip()
+    if artifact_id and model is not None and not service.get("required", True):
+        for artifact in model.get("artifacts") or []:
+            if str(artifact.get("id", "")).strip() == artifact_id:
+                artifact_path = str(artifact.get("path") or "").strip()
+                if artifact_path and not Path(artifact_path).exists():
+                    return False, f"artifact {artifact_id!r} not available"
+                break
     return True, None
 
 
@@ -804,6 +815,7 @@ def reverse_service_dependency_graph(model: dict[str, Any]) -> dict[str, list[st
 
 def order_service_ids(model: dict[str, Any], selected_ids: set[str]) -> list[str]:
     services_by_id = service_id_map(model)
+    artifact_ids = {str(a.get("id", "")).strip() for a in model.get("artifacts") or []}
     dependency_graph = service_dependency_graph(model)
     ordered_ids: list[str] = []
     visiting: set[str] = set()
@@ -815,6 +827,8 @@ def order_service_ids(model: dict[str, Any], selected_ids: set[str]) -> list[str
         if service_id in visiting:
             raise RuntimeError(f"Service dependency cycle detected at {service_id}.")
         if service_id not in services_by_id:
+            if service_id in artifact_ids:
+                return
             raise RuntimeError(f"Service dependency references unknown service {service_id!r}.")
 
         visiting.add(service_id)
@@ -953,7 +967,7 @@ def live_service_pid(pid_path: Path) -> int | None:
 
 
 def service_manager_state(model: dict[str, Any], service: dict[str, Any]) -> dict[str, Any]:
-    manageable, reason = service_supports_lifecycle(service)
+    manageable, reason = service_supports_lifecycle(service, model)
     paths = service_paths(model, service)
     pid = live_service_pid(paths["pid_file"])
     return {
@@ -1346,7 +1360,7 @@ def start_services(
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for service in services:
-        manageable, reason = service_supports_lifecycle(service)
+        manageable, reason = service_supports_lifecycle(service, model)
         paths = service_paths(model, service)
         result = {
             "id": service["id"],
@@ -1426,7 +1440,7 @@ def stop_services(
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for service in services:
-        manageable, reason = service_supports_lifecycle(service)
+        manageable, reason = service_supports_lifecycle(service, model)
         paths = service_paths(model, service)
         result = {
             "id": service["id"],

@@ -1138,7 +1138,7 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
             if dependency_id == service_id:
                 issues.append(f"service {service.get('id')} cannot depend on itself")
                 continue
-            if dependency_id not in service_ids:
+            if dependency_id not in service_ids and dependency_id not in artifact_ids:
                 issues.append(f"service {service.get('id')} references unknown dependency {dependency_id!r}")
                 continue
             dependency_ids.append(dependency_id)

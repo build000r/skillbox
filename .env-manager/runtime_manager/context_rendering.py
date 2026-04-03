@@ -136,15 +136,30 @@ def generate_context_markdown(model: dict[str, Any]) -> str:
         lines.append("")
         for skillset in skills:
             sid = skillset["id"]
-            manifest_host_path = Path(
-                str(skillset.get("manifest_host_path", ""))
-            )
             skill_names: list[str] = []
-            if manifest_host_path.is_file():
-                try:
-                    skill_names = read_manifest_skills(manifest_host_path)
-                except Exception:
-                    pass
+            kind = str(skillset.get("kind") or "").strip()
+            if kind == "skill-repo-set":
+                lock_host_path = Path(str(skillset.get("lock_path_host_path", "")))
+                if lock_host_path.is_file():
+                    try:
+                        import json as _json
+                        lock_data = _json.loads(lock_host_path.read_text(encoding="utf-8"))
+                        raw_skills = lock_data.get("skills") or []
+                        if isinstance(raw_skills, list):
+                            skill_names = sorted(s.get("name", "") for s in raw_skills if s.get("name"))
+                        elif isinstance(raw_skills, dict):
+                            skill_names = sorted(raw_skills.keys())
+                    except Exception:
+                        pass
+            else:
+                manifest_host_path = Path(
+                    str(skillset.get("manifest_host_path", ""))
+                )
+                if manifest_host_path.is_file():
+                    try:
+                        skill_names = read_manifest_skills(manifest_host_path)
+                    except Exception:
+                        pass
 
             if skill_names:
                 lines.append(f"- **{sid}**: {', '.join(skill_names)}")

@@ -56,7 +56,7 @@ VALID_ARTIFACT_SOURCE_KINDS = {"file", "manual", "url"}
 VALID_ARTIFACT_SYNC_MODES = {"copy-if-missing", "download-if-missing", "manual"}
 VALID_ENV_FILE_SOURCE_KINDS = {"file", "manual"}
 VALID_ENV_FILE_SYNC_MODES = {"write", "manual"}
-VALID_SKILL_SYNC_MODES = {"clone-and-install", "unpack-bundles"}
+VALID_SKILL_SYNC_MODES = {"clone-and-install"}
 VALID_HEALTHCHECK_TYPES = {"http", "path_exists", "process_running"}
 VALID_CHECK_TYPES = {"path_exists"}
 VALID_TASK_SUCCESS_TYPES = {"path_exists"}
@@ -1454,27 +1454,6 @@ def base_client_overlay(
     return overlay
 
 
-def render_client_skill_manifest(
-    client_label: str,
-    required_skills: list[str],
-    existing_skills: list[str] | None = None,
-) -> str:
-    ordered: list[str] = []
-    seen: set[str] = set()
-    for skill_name in [*required_skills, *(existing_skills or [])]:
-        normalized = str(skill_name).strip()
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        ordered.append(normalized)
-
-    lines = [f"# {client_label} client-specific skills."]
-    if ordered:
-        lines.append("")
-        lines.extend(ordered)
-    return "\n".join(lines) + "\n"
-
-
 def render_client_plan_index(client_label: str) -> str:
     return (
         f"# {client_label} Plan Index\n"
@@ -1797,33 +1776,25 @@ def build_blueprinted_client_scaffold_files(
     )
 
     overlay_dir = client_config_host_dir(root_dir, env_values, client_id)
-    bundle_dir = overlay_dir / "bundles"
     skills_dir = overlay_dir / "skills"
 
     overlay_path = overlay_dir / "overlay.yaml"
-    manifest_path = overlay_dir / "skills.manifest"
-    sources_path = overlay_dir / "skills.sources.yaml"
-    bundle_readme_path = bundle_dir / "README.md"
+    skill_repos_path = overlay_dir / "skill-repos.yaml"
     skills_keep_path = skills_dir / ".gitkeep"
 
+    required_skills = client_scaffold_pack_required_skills(scaffold_pack)
+    pick_line = ", ".join(required_skills)
     target_files = {
         overlay_path: render_yaml_document({"version": 1, "client": overlay_client}),
-        manifest_path: render_client_skill_manifest(
-            str(overlay_client["label"]),
-            client_scaffold_pack_required_skills(scaffold_pack),
+        skill_repos_path: (
+            f"# {str(overlay_client['label'])} client-specific skill repos.\n"
+            "\n"
+            "version: 2\n"
+            "\n"
+            "skill_repos:\n"
+            "  - path: ./skills\n"
+            f"    pick: [{pick_line}]\n"
         ),
-        sources_path: render_yaml_document(
-            {
-                "version": 1,
-                "sources": [
-                    {
-                        "kind": "local",
-                        "path": "./skills",
-                    }
-                ],
-            }
-        ),
-        bundle_readme_path: f"Generated `.skill` bundles for the `{client_id}` client overlay land here.\n",
         skills_keep_path: "",
     }
     target_files.update(
@@ -2410,10 +2381,33 @@ def sync_skill_repo_sets(model: dict[str, Any], dry_run: bool) -> list[str]:
             actions.append(f"write-lockfile: {lock_path}")
             continue
 
+        new_config_sha = file_sha256(config_path)
+        synced_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        # Preserve synced_at from existing lock when semantic content is unchanged
+        if lock_path.is_file():
+            try:
+                existing_lock = json.loads(lock_path.read_text(encoding="utf-8"))
+                existing_skills = {
+                    (s.get("name"), s.get("resolved_commit"), s.get("install_tree_sha"))
+                    for s in existing_lock.get("skills") or []
+                }
+                new_skills = {
+                    (s.get("name"), s.get("resolved_commit"), s.get("install_tree_sha"))
+                    for s in lock_skills
+                }
+                if (
+                    existing_lock.get("config_sha") == new_config_sha
+                    and existing_skills == new_skills
+                ):
+                    synced_at = existing_lock.get("synced_at", synced_at)
+            except (json.JSONDecodeError, KeyError):
+                pass
+
         lock_payload = {
             "version": SKILL_REPOS_LOCKFILE_VERSION,
-            "config_sha": file_sha256(config_path),
-            "synced_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "config_sha": new_config_sha,
+            "synced_at": synced_at,
             "skills": lock_skills,
         }
         changed = write_json_file(lock_path, lock_payload)
@@ -3070,40 +3064,6 @@ def ensure_client_overlay_context_shape(
         raw_workflow_builder[key] = value
 
 
-def ensure_client_overlay_sources_shape(sources_path: Path) -> str:
-    if sources_path.is_file():
-        raw = load_yaml(sources_path)
-        if not isinstance(raw, dict):
-            raise RuntimeError(f"Expected a mapping in {sources_path}")
-        version = int(raw.get("version") or 1)
-        raw_sources = raw.get("sources") or []
-        if not isinstance(raw_sources, list):
-            raise RuntimeError(f"Expected `sources` to be a list in {sources_path}")
-        sources: list[dict[str, Any]] = []
-        has_local_skills = False
-        for item in raw_sources:
-            if not isinstance(item, dict):
-                continue
-            normalized = copy.deepcopy(item)
-            if (
-                str(normalized.get("kind") or "").strip() == "local"
-                and str(normalized.get("path") or "").strip() == "./skills"
-            ):
-                has_local_skills = True
-            sources.append(normalized)
-        if not has_local_skills:
-            sources.insert(0, {"kind": "local", "path": "./skills"})
-        payload = {"version": version, "sources": sources}
-        return render_yaml_document(payload)
-
-    return render_yaml_document(
-        {
-            "version": 1,
-            "sources": [{"kind": "local", "path": "./skills"}],
-        }
-    )
-
-
 def normalize_client_overlay_shape(root_dir: Path, overlay_dir: Path) -> list[str]:
     overlay_path = overlay_dir / "overlay.yaml"
     if not overlay_path.is_file():
@@ -3137,31 +3097,22 @@ def normalize_client_overlay_shape(root_dir: Path, overlay_dir: Path) -> list[st
         overlay_path.write_text(rendered_overlay, encoding="utf-8")
         actions.append(f"normalize-overlay: {repo_rel(root_dir, overlay_path)}")
 
-    manifest_path = overlay_dir / "skills.manifest"
-    existing_skills = read_manifest_skills(manifest_path) if manifest_path.is_file() else []
-    manifest_text = render_client_skill_manifest(
-        client_label,
-        client_scaffold_pack_required_skills(scaffold_pack),
-        existing_skills,
+    required_skills = client_scaffold_pack_required_skills(scaffold_pack)
+    pick_line = ", ".join(required_skills)
+    skill_repos_path = overlay_dir / "skill-repos.yaml"
+    skill_repos_text = (
+        f"# {client_label} client-specific skill repos.\n"
+        "\n"
+        "version: 2\n"
+        "\n"
+        "skill_repos:\n"
+        "  - path: ./skills\n"
+        f"    pick: [{pick_line}]\n"
     )
-    if not manifest_path.is_file() or manifest_path.read_text(encoding="utf-8") != manifest_text:
-        ensure_directory(manifest_path.parent, dry_run=False)
-        manifest_path.write_text(manifest_text, encoding="utf-8")
-        actions.append(f"write-file: {repo_rel(root_dir, manifest_path)}")
-
-    sources_path = overlay_dir / "skills.sources.yaml"
-    sources_text = ensure_client_overlay_sources_shape(sources_path)
-    if not sources_path.is_file() or sources_path.read_text(encoding="utf-8") != sources_text:
-        ensure_directory(sources_path.parent, dry_run=False)
-        sources_path.write_text(sources_text, encoding="utf-8")
-        actions.append(f"write-file: {repo_rel(root_dir, sources_path)}")
-
-    bundle_readme_path = overlay_dir / "bundles" / "README.md"
-    bundle_readme_text = f"Generated `.skill` bundles for the `{client_id}` client overlay land here.\n"
-    ensure_directory(bundle_readme_path.parent, dry_run=False)
-    if not bundle_readme_path.is_file() or bundle_readme_path.read_text(encoding="utf-8") != bundle_readme_text:
-        bundle_readme_path.write_text(bundle_readme_text, encoding="utf-8")
-        actions.append(f"write-file: {repo_rel(root_dir, bundle_readme_path)}")
+    if not skill_repos_path.is_file() or skill_repos_path.read_text(encoding="utf-8") != skill_repos_text:
+        ensure_directory(skill_repos_path.parent, dry_run=False)
+        skill_repos_path.write_text(skill_repos_text, encoding="utf-8")
+        actions.append(f"write-file: {repo_rel(root_dir, skill_repos_path)}")
 
     skills_keep_path = overlay_dir / "skills" / ".gitkeep"
     ensure_directory(skills_keep_path.parent, dry_run=False)

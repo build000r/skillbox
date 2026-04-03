@@ -758,6 +758,18 @@ def smoke_requested_mcp_servers(
             else raw_config
         )
         if not isinstance(config, dict):
+            # Skip non-required MCP servers whose artifact is unavailable
+            if isinstance(service_id, str) and service_id:
+                services_by_id = {str(s.get("id", "")).strip(): s for s in model.get("services") or []}
+                backing = services_by_id.get(service_id)
+                if backing and not backing.get("required", True):
+                    manageable, reason = service_supports_lifecycle(backing, model)
+                    if not manageable:
+                        detail["servers"][server_name] = {
+                            "status": "skip",
+                            "reason": reason or "backing service unavailable",
+                        }
+                        continue
             detail["servers"][server_name] = {
                 "status": "fail",
                 "error": f"MCP server '{server_name}' is not configured in {MCP_CONFIG_REL}.",
@@ -848,9 +860,23 @@ def run_acceptance(
     sync_args = ["sync", "--client", cid, *profile_args, "--format", "json"]
     focus_args = ["focus", cid, *profile_args, "--format", "json"]
 
+    # Doctor pre-flight: only block on config-level failures that sync can't fix
+    # (e.g. connector-contract, runtime-manifest). Path/artifact/lock checks are
+    # sync-resolvable and should not abort before sync has run.
+    PRE_FLIGHT_BLOCKING_CODES = {"runtime-manifest", "connector-contract"}
     doctor_pre_code, doctor_pre_payload = run_manage_json_command(root_dir, doctor_args)
-    doctor_pre_status = doctor_step_status(doctor_pre_payload, doctor_pre_code)
-    step("doctor-pre", doctor_pre_status, {"checks": doctor_pre_payload.get("checks") or []})
+    doctor_pre_checks = doctor_pre_payload.get("checks") or []
+    has_blocking_failure = any(
+        str(item.get("status")) == "fail" and str(item.get("code", "")) in PRE_FLIGHT_BLOCKING_CODES
+        for item in doctor_pre_checks
+    )
+    if has_blocking_failure:
+        doctor_pre_status = "fail"
+    elif any(str(item.get("status")) in ("fail", "warn") for item in doctor_pre_checks):
+        doctor_pre_status = "warn"
+    else:
+        doctor_pre_status = "ok"
+    step("doctor-pre", doctor_pre_status, {"checks": doctor_pre_checks})
     if doctor_pre_status == "fail":
         step("sync", "skip", {"reason": "doctor-pre failed"})
         step("focus", "skip", {"reason": "doctor-pre failed"})
