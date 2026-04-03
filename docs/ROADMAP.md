@@ -12,6 +12,31 @@ What's missing isn't the box — it's the **bridge to sweet-potato's nginx/deplo
 
 ---
 
+## Phase 1.5: Shared Jam — Trusted Collaborator Access
+
+**Goal:** The operator can invite trusted collaborators to jam on the same box — same repos, same services, same containers — with attribution at the shell and git layer.
+
+### What it does
+
+- **Tailnet membership = access list.** Invite/revoke via `scripts/03-shared-jam.sh`. No secondary auth layer.
+- **Identity from Tailscale.** On SSH login, `tailscale whois` resolves the peer's identity. Git author, tmux session name, and shared history are all attributed automatically.
+- **Shared everything.** Everyone SSHs as the same Linux user (`sandbox`). Same repos, same Docker socket, same `.claude/`, same services. No isolation, by design.
+
+### Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/03-shared-jam.sh` | `invite`, `revoke`, `list`, `status` subcommands |
+| `scripts/skillbox-login.sh` | ForceCommand login hook (deployed to `/usr/local/bin/`) |
+
+### Gate
+
+`sudo ./scripts/03-shared-jam.sh invite alice@example.com` shares the box, and Alice SSHs in with her identity auto-resolved and attributed.
+
+See [docs/shared-jam.md](shared-jam.md) for the full usage guide.
+
+---
+
 ## Phase 1: Skillbox-as-Devbox
 
 **Goal:** Skillbox becomes the canonical place where you develop *and preview* services before they hit the sweet-potato prod stack.
