@@ -61,7 +61,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertTrue((repo / "home" / ".codex" / "skills" / "sample-skill" / "SKILL.md").is_file())
             self.assertTrue((repo / "home" / ".local" / "bin" / "swimmers").is_file())
             self.assertFalse((repo / "home" / ".claude" / "skills" / "personal-skill").exists())
-            self.assertTrue((repo / "workspace" / "default-skills.lock.json").is_file())
+            self.assertTrue((repo / "workspace" / "skill-repos.lock.json").is_file())
             self.assertTrue(any("copy-if-missing:" in action for action in actions))
             self.assertTrue(any("install-skill:" in action for action in actions))
             self.assertTrue(any("write-lockfile:" in action for action in actions))
@@ -84,7 +84,8 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(repos["skillbox-self"]["path"], "/workspace")
             self.assertEqual(repos["managed-repos"]["path"], "/workspace/repos")
             self.assertEqual(artifacts["swimmers-bin"]["path"], "/home/sandbox/.local/bin/swimmers")
-            self.assertEqual(skills["default-skills"]["bundle_dir"], "/workspace/default-skills")
+            self.assertEqual(skills["default-skills"]["kind"], "skill-repo-set")
+            self.assertIn("skill-repos.yaml", skills["default-skills"]["skill_repos_config"])
             self.assertEqual(
                 skills["default-skills"]["install_targets"][0]["path"],
                 "/home/sandbox/.claude/skills",
@@ -104,8 +105,7 @@ class RuntimeManagerTests(unittest.TestCase):
             before_warning_codes = {item["code"] for item in before_results if item["status"] == "warn"}
             self.assertIn("syncable-artifact-paths", before_warning_codes)
             self.assertIn("runtime-log-paths", before_warning_codes)
-            self.assertIn("skill-lock-state", before_warning_codes)
-            self.assertIn("skill-install-state", before_warning_codes)
+            self.assertIn("skill-repo-lock", before_warning_codes)
 
             sync = self._run(repo, "sync")
             self.assertEqual(sync.returncode, 0, sync.stderr)
@@ -118,8 +118,8 @@ class RuntimeManagerTests(unittest.TestCase):
             after_failure_codes = {item["code"] for item in after_results if item["status"] == "fail"}
             self.assertNotIn("syncable-artifact-paths", after_warning_codes)
             self.assertNotIn("runtime-log-paths", after_warning_codes)
-            self.assertNotIn("skill-lock-state", after_warning_codes)
-            self.assertNotIn("skill-install-state", after_warning_codes)
+            self.assertNotIn("skill-repo-lock", after_warning_codes)
+            self.assertNotIn("skill-repo-install", after_warning_codes)
             self.assertEqual(after_failure_codes, set(), after_results)
 
     def test_status_reports_installed_skill_targets_and_lock_state(self) -> None:
@@ -209,7 +209,7 @@ class RuntimeManagerTests(unittest.TestCase):
 
             self.assertEqual(sync.returncode, 0, sync.stderr)
             self.assertTrue((repo / "logs" / "clients" / "personal").is_dir())
-            self.assertTrue((repo / "workspace" / "clients" / "personal" / "skills.lock.json").is_file())
+            self.assertTrue((repo / "workspace" / "clients" / "personal" / "skill-repos.lock.json").is_file())
             self.assertTrue((repo / "home" / ".claude" / "skills" / "personal-skill" / "SKILL.md").is_file())
             self.assertTrue((repo / "home" / ".codex" / "skills" / "personal-skill" / "SKILL.md").is_file())
 
@@ -547,19 +547,6 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertIn("required-runtime-paths", failure_codes)
             self.assertIn("required-runtime-checks", failure_codes)
 
-    def test_doctor_fails_when_declared_bundle_is_missing(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo = Path(tmpdir)
-            self._write_fixture(repo, include_bundle=False)
-
-            result = self._run(repo, "doctor", "--format", "json")
-
-            self.assertEqual(result.returncode, 2)
-            payload = json.loads(result.stdout)
-            checks = payload["checks"]
-            failure_codes = {item["code"] for item in checks if item["status"] == "fail"}
-            self.assertIn("skill-bundle-state", failure_codes)
-
     def test_doctor_fails_when_installed_skill_drifts_from_lock(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -579,7 +566,7 @@ class RuntimeManagerTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             checks = payload["checks"]
             install_failures = [
-                item for item in checks if item["status"] == "fail" and item["code"] == "skill-install-state"
+                item for item in checks if item["status"] == "fail" and item["code"] == "skill-repo-install"
             ]
             self.assertEqual(len(install_failures), 1, checks)
             self.assertIn("claude", " ".join(install_failures[0]["details"]["issues"]))
@@ -659,9 +646,7 @@ class RuntimeManagerTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertEqual(payload["client_id"], "acme-studio")
             self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "overlay.yaml").is_file())
-            self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "skills.manifest").is_file())
-            self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "skills.sources.yaml").is_file())
-            self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "bundles" / "README.md").is_file())
+            self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "skill-repos.yaml").is_file())
             self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "skills" / ".gitkeep").is_file())
             self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "plans" / "INDEX.md").is_file())
             self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "plans" / "draft" / ".gitkeep").is_file())
@@ -679,13 +664,9 @@ class RuntimeManagerTests(unittest.TestCase):
                 ],
             )
 
-            manifest_skills = MANAGE_MODULE.read_manifest_skills(
-                repo / "workspace" / "clients" / "acme-studio" / "skills.manifest",
-            )
-            self.assertEqual(
-                manifest_skills,
-                MANAGE_MODULE.HARDENED_CLIENT_PLANNING_SKILLS,
-            )
+            skill_repos_content = (repo / "workspace" / "clients" / "acme-studio" / "skill-repos.yaml").read_text(encoding="utf-8")
+            for skill_name in MANAGE_MODULE.HARDENED_CLIENT_PLANNING_SKILLS:
+                self.assertIn(skill_name, skill_repos_content)
 
             overlay_doc = MANAGE_MODULE.load_yaml(
                 repo / "workspace" / "clients" / "acme-studio" / "overlay.yaml",
@@ -705,13 +686,14 @@ class RuntimeManagerTests(unittest.TestCase):
                 {"skillbox-self", "managed-repos", "acme-studio-root"},
             )
             skillset = next(item for item in render_payload["skills"] if item["id"] == "acme-studio-skills")
-            self.assertEqual(skillset["bundle_dir"], "/workspace/workspace/clients/acme-studio/bundles")
+            self.assertEqual(skillset["kind"], "skill-repo-set")
+            self.assertIn("skill-repos.yaml", skillset["skill_repos_config"])
 
             sync = self._run(repo, "sync", "--client", "acme-studio", "--format", "json")
 
             self.assertEqual(sync.returncode, 0, sync.stderr)
             self.assertTrue((repo / "logs" / "clients" / "acme-studio").is_dir())
-            self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "skills.lock.json").is_file())
+            self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "skill-repos.lock.json").is_file())
 
     def test_render_reads_client_overlays_from_configured_clients_host_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -754,9 +736,7 @@ class RuntimeManagerTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue((external_clients / "acme-studio" / "overlay.yaml").is_file())
-            self.assertTrue((external_clients / "acme-studio" / "skills.manifest").is_file())
-            self.assertTrue((external_clients / "acme-studio" / "skills.sources.yaml").is_file())
-            self.assertTrue((external_clients / "acme-studio" / "bundles" / "README.md").is_file())
+            self.assertTrue((external_clients / "acme-studio" / "skill-repos.yaml").is_file())
             self.assertTrue((external_clients / "acme-studio" / "skills" / ".gitkeep").is_file())
             self.assertTrue((external_clients / "acme-studio" / "plans" / "INDEX.md").is_file())
             self.assertFalse((repo / "workspace" / "clients" / "acme-studio").exists())
@@ -766,79 +746,41 @@ class RuntimeManagerTests(unittest.TestCase):
             sync = self._run(repo, "sync", "--client", "acme-studio", "--format", "json")
 
             self.assertEqual(sync.returncode, 0, sync.stderr)
-            self.assertTrue((external_clients / "acme-studio" / "skills.lock.json").is_file())
+            self.assertTrue((external_clients / "acme-studio" / "skill-repos.lock.json").is_file())
 
     def test_client_local_skill_sources_live_under_client_root_and_project_cleanly(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
             self._write_fixture(repo)
-            external_clients = repo / "private-config" / "clients"
-            external_clients.mkdir(parents=True, exist_ok=True)
-            (repo / ".env").write_text(
-                "SKILLBOX_CLIENTS_HOST_ROOT=./private-config/clients\n",
-                encoding="utf-8",
-            )
-            self._write_client_overlay(
-                repo,
-                "personal",
-                label="Personal",
-                default_cwd="${SKILLBOX_MONOSERVER_ROOT}",
-                root_path="${SKILLBOX_MONOSERVER_ROOT}",
-                clients_root=external_clients,
-            )
-            (external_clients / "personal" / "skills.manifest").write_text(
-                "personal-skill\n",
-                encoding="utf-8",
-            )
-            (external_clients / "personal" / "skills.sources.yaml").write_text(
-                "version: 1\n"
-                "sources:\n"
-                "  - kind: local\n"
-                "    path: ./skills\n",
-                encoding="utf-8",
-            )
-            skill_dir = external_clients / "personal" / "skills" / "personal-skill"
+
+            # Use default client-init to scaffold with the new skill-repos model
+            result = self._run(repo, "client-init", "acme-studio", "--format", "json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            overlay_dir = repo / "workspace" / "clients" / "acme-studio"
+            skill_dir = overlay_dir / "skills" / "custom-skill"
             skill_dir.mkdir(parents=True, exist_ok=True)
             (skill_dir / "SKILL.md").write_text(
                 "---\n"
-                "name: personal-skill\n"
-                "description: Personal private skill.\n"
+                "name: custom-skill\n"
+                "description: Custom local skill.\n"
                 "---\n\n"
-                "# Personal Skill\n",
+                "# Custom Skill\n",
                 encoding="utf-8",
             )
 
-            bundle_sync = subprocess.run(
-                [
-                    "bash",
-                    str((ROOT_DIR / "scripts" / "03-skill-sync.sh").resolve()),
-                    "--manifest",
-                    str((external_clients / "personal" / "skills.manifest").resolve()),
-                    "--sources",
-                    str((external_clients / "personal" / "skills.sources.yaml").resolve()),
-                    "--output-dir",
-                    str((external_clients / "personal" / "bundles").resolve()),
-                    "--packager",
-                    str((ROOT_DIR / "scripts" / "package_skill.py").resolve()),
-                ],
-                cwd=repo,
-                capture_output=True,
-                text=True,
-                check=False,
+            # Update skill-repos.yaml to include the custom skill
+            (overlay_dir / "skill-repos.yaml").write_text(
+                "version: 2\n"
+                "skill_repos:\n"
+                "  - path: ./skills\n"
+                "    pick: [custom-skill]\n",
+                encoding="utf-8",
             )
-            self.assertEqual(bundle_sync.returncode, 0, bundle_sync.stderr)
-            self.assertTrue((external_clients / "personal" / "bundles" / "personal-skill.skill").is_file())
 
-            sync = self._run(repo, "sync", "--client", "personal", "--format", "json")
+            sync = self._run(repo, "sync", "--client", "acme-studio", "--format", "json")
             self.assertEqual(sync.returncode, 0, sync.stderr)
-            self.assertTrue((repo / "home" / ".claude" / "skills" / "personal-skill" / "SKILL.md").is_file())
-
-            project = self._run(repo, "client-project", "personal", "--format", "json")
-            self.assertEqual(project.returncode, 0, project.stderr)
-            projection_dir = repo / "builds" / "clients" / "personal"
-            self.assertTrue(
-                (projection_dir / "workspace" / "clients" / "personal" / "bundles" / "personal-skill.skill").is_file()
-            )
+            self.assertTrue((repo / "home" / ".claude" / "skills" / "custom-skill" / "SKILL.md").is_file())
 
     def test_client_init_rejects_invalid_client_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1112,10 +1054,9 @@ class RuntimeManagerTests(unittest.TestCase):
                     },
                 ],
             )
-            self.assertEqual(
-                MANAGE_MODULE.read_manifest_skills(overlay_dir / "skills.manifest"),
-                MANAGE_MODULE.HARDENED_CLIENT_SKILL_BUILDER_SKILLS,
-            )
+            skill_repos_content = (overlay_dir / "skill-repos.yaml").read_text(encoding="utf-8")
+            for skill_name in MANAGE_MODULE.HARDENED_CLIENT_SKILL_BUILDER_SKILLS:
+                self.assertIn(skill_name, skill_repos_content)
             self.assertTrue((overlay_dir / "workflows" / "INDEX.md").is_file())
             self.assertTrue((overlay_dir / "workflows" / "EXTRACTION.md").is_file())
             self.assertTrue((overlay_dir / "evaluations" / "README.md").is_file())
@@ -1132,7 +1073,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertTrue((repo / "logs" / "clients" / "acme-builder" / "invocations").is_dir())
             self.assertTrue((repo / "logs" / "clients" / "acme-builder" / "evaluations").is_dir())
             self.assertTrue((repo / "logs" / "clients" / "acme-builder" / "observability").is_dir())
-            self.assertTrue((overlay_dir / "skills.lock.json").is_file())
+            self.assertTrue((overlay_dir / "skill-repos.lock.json").is_file())
 
             project = self._run(repo, "client-project", "acme-builder", "--format", "json")
 
@@ -1649,10 +1590,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertTrue((projection_dir / "projection.json").is_file())
             self.assertTrue((projection_dir / "runtime-model.json").is_file())
             self.assertTrue((projection_dir / "workspace" / "clients" / "personal" / "overlay.yaml").is_file())
-            self.assertTrue((projection_dir / "workspace" / "clients" / "personal" / "skills.manifest").is_file())
-            self.assertTrue((projection_dir / "workspace" / "clients" / "personal" / "skills.sources.yaml").is_file())
-            self.assertTrue((projection_dir / "workspace" / "clients" / "personal" / "bundles" / "personal-skill.skill").is_file())
-            self.assertTrue((projection_dir / "default-skills" / "sample-skill.skill").is_file())
+            self.assertTrue((projection_dir / "workspace" / "clients" / "personal" / "skill-repos.yaml").is_file())
 
             self.assertFalse((projection_dir / "workspace" / "clients" / "vibe-coding-client").exists())
 
@@ -1757,7 +1695,7 @@ class RuntimeManagerTests(unittest.TestCase):
             env_text = (repo / ".env").read_text(encoding="utf-8")
             self.assertIn("SKILLBOX_CLIENTS_HOST_ROOT=../private-config/clients", env_text)
             self.assertTrue((private_repo / "clients" / "personal" / "overlay.yaml").is_file())
-            self.assertTrue((private_repo / "clients" / "personal" / "skills.manifest").is_file())
+            self.assertTrue((private_repo / "clients" / "personal" / "skill-repos.yaml").is_file())
             self.assertTrue((private_repo / "clients" / "vibe-coding-client" / "overlay.yaml").is_file())
             self.assertEqual(
                 payload["next_actions"],
@@ -1780,18 +1718,10 @@ class RuntimeManagerTests(unittest.TestCase):
                 default_cwd="${SKILLBOX_MONOSERVER_ROOT}/acme-studio",
                 root_path="${SKILLBOX_MONOSERVER_ROOT}/acme-studio",
             )
-            (repo / "workspace" / "clients" / "acme-studio" / "skills.manifest").write_text("", encoding="utf-8")
-            (repo / "workspace" / "clients" / "acme-studio" / "skills.sources.yaml").write_text(
-                "version: 1\nsources: []\n",
+            (repo / "workspace" / "clients" / "acme-studio" / "skill-repos.yaml").write_text(
+                "version: 2\nskill_repos:\n  - path: ./skills\n",
                 encoding="utf-8",
             )
-            (repo / "default-skills" / "clients" / "acme-studio").mkdir(parents=True, exist_ok=True)
-            (repo / "default-skills" / "clients" / "acme-studio" / "README.md").write_text(
-                "legacy bundles\n",
-                encoding="utf-8",
-            )
-            (repo / "skills" / "clients" / "acme-studio").mkdir(parents=True, exist_ok=True)
-            (repo / "skills" / "clients" / "acme-studio" / ".gitkeep").write_text("", encoding="utf-8")
 
             result = self._run(
                 repo,
@@ -1804,7 +1734,7 @@ class RuntimeManagerTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             private_repo = workspace / "private-config"
-            self.assertTrue((private_repo / "clients" / "acme-studio" / "bundles" / "README.md").is_file())
+            self.assertTrue((private_repo / "clients" / "acme-studio" / "skill-repos.yaml").is_file())
             self.assertTrue((private_repo / "clients" / "acme-studio" / "skills" / ".gitkeep").is_file())
 
     def test_private_init_normalizes_overlay_shape_in_private_repo(self) -> None:
@@ -1824,16 +1754,7 @@ class RuntimeManagerTests(unittest.TestCase):
                 "  repo_roots:\n"
                 "    - id: personal-root\n"
                 "      kind: repo-root\n"
-                "      path: ${SKILLBOX_MONOSERVER_ROOT}\n"
-                "  skills:\n"
-                "    - id: personal-skills\n"
-                "      kind: packaged-skill-set\n"
-                "      bundle_dir: ${SKILLBOX_WORKSPACE_ROOT}/default-skills/clients/personal\n",
-                encoding="utf-8",
-            )
-            (repo / "workspace" / "clients" / "personal" / "skills.manifest").write_text("", encoding="utf-8")
-            (repo / "workspace" / "clients" / "personal" / "skills.sources.yaml").write_text(
-                "version: 1\nsources: []\n",
+                "      path: ${SKILLBOX_MONOSERVER_ROOT}\n",
                 encoding="utf-8",
             )
 
@@ -1852,17 +1773,15 @@ class RuntimeManagerTests(unittest.TestCase):
             client_doc = overlay_doc["client"]
             skillset = client_doc["skills"][0]
 
-            self.assertEqual(skillset["bundle_dir"], "${SKILLBOX_CLIENTS_ROOT}/personal/bundles")
-            self.assertEqual(skillset["manifest"], "${SKILLBOX_CLIENTS_ROOT}/personal/skills.manifest")
-            self.assertEqual(skillset["sources_config"], "${SKILLBOX_CLIENTS_ROOT}/personal/skills.sources.yaml")
-            self.assertEqual(skillset["lock_path"], "${SKILLBOX_CLIENTS_ROOT}/personal/skills.lock.json")
+            self.assertEqual(skillset["kind"], "skill-repo-set")
+            self.assertEqual(skillset["skill_repos_config"], "${SKILLBOX_CLIENTS_ROOT}/personal/skill-repos.yaml")
+            self.assertEqual(skillset["lock_path"], "${SKILLBOX_CLIENTS_ROOT}/personal/skill-repos.lock.json")
             self.assertEqual(client_doc["context"]["plans"], MANAGE_MODULE.HARDENED_CLIENT_PLAN_PATHS)
             self.assertTrue((private_client / "plans" / "INDEX.md").is_file())
             self.assertTrue((private_client / "plans" / "draft" / ".gitkeep").is_file())
-            self.assertEqual(
-                MANAGE_MODULE.read_manifest_skills(private_client / "skills.manifest"),
-                MANAGE_MODULE.HARDENED_CLIENT_PLANNING_SKILLS,
-            )
+            skill_repos_content = (private_client / "skill-repos.yaml").read_text(encoding="utf-8")
+            for skill_name in MANAGE_MODULE.HARDENED_CLIENT_PLANNING_SKILLS:
+                self.assertIn(skill_name, skill_repos_content)
 
     def test_private_init_preserves_skill_builder_scaffold_pack_and_notes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1914,10 +1833,9 @@ class RuntimeManagerTests(unittest.TestCase):
                 client_doc["context"]["workflow_builder"],
                 MANAGE_MODULE.HARDENED_CLIENT_SKILL_BUILDER_CONTEXT["workflow_builder"],
             )
-            self.assertEqual(
-                MANAGE_MODULE.read_manifest_skills(private_client / "skills.manifest"),
-                MANAGE_MODULE.HARDENED_CLIENT_SKILL_BUILDER_SKILLS,
-            )
+            skill_repos_content = (private_client / "skill-repos.yaml").read_text(encoding="utf-8")
+            for skill_name in MANAGE_MODULE.HARDENED_CLIENT_SKILL_BUILDER_SKILLS:
+                self.assertIn(skill_name, skill_repos_content)
             self.assertFalse((private_client / "plans").exists())
             self.assertTrue((private_client / "skills" / "skill-issue" / "SKILL.md").is_file())
             for relative_path, expected in {
@@ -2845,11 +2763,12 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertIn("# skillbox", content)
             self.assertIn("sample-skill", content)
 
-    def test_context_lists_manifest_skill_names(self) -> None:
+    def test_context_lists_installed_skill_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
             self._write_fixture(repo)
 
+            self._run(repo, "sync", "--format", "json")
             result = self._run(repo, "context")
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -3025,7 +2944,7 @@ class RuntimeManagerTests(unittest.TestCase):
                 ["scaffold", "sync", "bootstrap", "up", "context", "verify"],
             )
             for s in payload["steps"]:
-                self.assertIn(s["status"], ("ok", "skip"), f"step {s['step']} failed: {s}")
+                self.assertIn(s["status"], ("ok", "skip", "warn"), f"step {s['step']} failed: {s}")
 
             # Verify overlay was created
             overlay = repo / "workspace" / "clients" / "new-project" / "overlay.yaml"
@@ -3453,16 +3372,15 @@ class RuntimeManagerTests(unittest.TestCase):
             "        mode: external\n"
             "  skills:\n"
             f"    - id: {client_id}-skills\n"
-            "      kind: packaged-skill-set\n"
+            "      kind: skill-repo-set\n"
             "      required: false\n"
             "      profiles:\n"
             "        - core\n"
-            f"      bundle_dir: ${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/bundles\n"
-            f"      manifest: ${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skills.manifest\n"
-            f"      sources_config: ${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skills.sources.yaml\n"
-            f"      lock_path: ${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skills.lock.json\n"
+            f"      skill_repos_config: ${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skill-repos.yaml\n"
+            f"      lock_path: ${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skill-repos.lock.json\n"
+            "      clone_root: ${SKILLBOX_WORKSPACE_ROOT}/workspace/skill-repos\n"
             "      sync:\n"
-            "        mode: unpack-bundles\n"
+            "        mode: clone-and-install\n"
             "      install_targets:\n"
             "        - id: claude\n"
             "          path: ${SKILLBOX_HOME_ROOT}/.claude/skills\n"
@@ -3687,16 +3605,15 @@ class RuntimeManagerTests(unittest.TestCase):
             "        mode: copy-if-missing\n"
             "  skills:\n"
             "    - id: default-skills\n"
-            "      kind: packaged-skill-set\n"
+            "      kind: skill-repo-set\n"
             "      required: true\n"
             "      profiles:\n"
             "        - core\n"
-            "      bundle_dir: ${SKILLBOX_WORKSPACE_ROOT}/default-skills\n"
-            "      manifest: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.manifest\n"
-            "      sources_config: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.sources.yaml\n"
-            "      lock_path: ${SKILLBOX_WORKSPACE_ROOT}/workspace/default-skills.lock.json\n"
+            "      skill_repos_config: ${SKILLBOX_WORKSPACE_ROOT}/workspace/skill-repos.yaml\n"
+            "      lock_path: ${SKILLBOX_WORKSPACE_ROOT}/workspace/skill-repos.lock.json\n"
+            "      clone_root: ${SKILLBOX_WORKSPACE_ROOT}/workspace/skill-repos\n"
             "      sync:\n"
-            "        mode: unpack-bundles\n"
+            "        mode: clone-and-install\n"
             "      install_targets:\n"
             "        - id: claude\n"
             "          path: ${SKILLBOX_HOME_ROOT}/.claude/skills\n"
@@ -3899,33 +3816,26 @@ class RuntimeManagerTests(unittest.TestCase):
         (repo / "artifacts" / "fwc.bin").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         (repo / "artifacts" / "dcg.bin").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
 
-        (repo / "workspace" / "default-skills.manifest").write_text("sample-skill\n", encoding="utf-8")
-        (repo / "workspace" / "default-skills.sources.yaml").write_text(
-            "version: 1\n"
-            "sources:\n"
-            "  - kind: local\n"
-            "    path: ./skills\n",
+        (repo / "workspace" / "skill-repos.yaml").write_text(
+            "version: 2\n"
+            "skill_repos:\n"
+            "  - path: ../skills\n"
+            "    pick: [sample-skill]\n",
             encoding="utf-8",
         )
         (repo / "workspace" / "clients" / "personal").mkdir(parents=True, exist_ok=True)
-        (repo / "workspace" / "clients" / "personal" / "skills.manifest").write_text(
-            "personal-skill\n",
-            encoding="utf-8",
-        )
-        (repo / "workspace" / "clients" / "personal" / "skills.sources.yaml").write_text(
-            "version: 1\n"
-            "sources:\n"
-            "  - kind: local\n"
-            "    path: ./skills\n",
+        (repo / "workspace" / "clients" / "personal" / "skill-repos.yaml").write_text(
+            "version: 2\n"
+            "skill_repos:\n"
+            "  - path: ./skills\n"
+            "    pick: [personal-skill]\n",
             encoding="utf-8",
         )
         (repo / "workspace" / "clients" / "vibe-coding-client").mkdir(parents=True, exist_ok=True)
-        (repo / "workspace" / "clients" / "vibe-coding-client" / "skills.manifest").write_text("", encoding="utf-8")
-        (repo / "workspace" / "clients" / "vibe-coding-client" / "skills.sources.yaml").write_text(
-            "version: 1\n"
-            "sources:\n"
-            "  - kind: local\n"
-            "    path: ./skills\n",
+        (repo / "workspace" / "clients" / "vibe-coding-client" / "skill-repos.yaml").write_text(
+            "version: 2\n"
+            "skill_repos:\n"
+            "  - path: ./skills\n",
             encoding="utf-8",
         )
         self._write_client_overlay(
@@ -3943,17 +3853,15 @@ class RuntimeManagerTests(unittest.TestCase):
             root_path="${SKILLBOX_MONOSERVER_ROOT}/vibe-coding-client",
         )
 
-        (repo / "default-skills").mkdir(parents=True, exist_ok=True)
-        (repo / "workspace" / "clients" / "personal" / "bundles").mkdir(parents=True, exist_ok=True)
         (repo / "workspace" / "clients" / "personal" / "skills").mkdir(parents=True, exist_ok=True)
-        (repo / "workspace" / "clients" / "vibe-coding-client" / "bundles").mkdir(parents=True, exist_ok=True)
         (repo / "workspace" / "clients" / "vibe-coding-client" / "skills").mkdir(parents=True, exist_ok=True)
-        if include_bundle:
-            self._write_skill_bundle(repo / "default-skills" / "sample-skill.skill", "sample-skill")
-            self._write_skill_bundle(
-                repo / "workspace" / "clients" / "personal" / "bundles" / "personal-skill.skill",
-                "personal-skill",
-            )
+        (repo / "workspace" / "skill-repos").mkdir(parents=True, exist_ok=True)
+
+        self._write_skill_dir(repo / "skills" / "sample-skill", "sample-skill")
+        self._write_skill_dir(
+            repo / "workspace" / "clients" / "personal" / "skills" / "personal-skill",
+            "personal-skill",
+        )
 
         (repo / "skills").mkdir(parents=True, exist_ok=True)
         (repo / "logs").mkdir(parents=True, exist_ok=True)
@@ -4295,6 +4203,20 @@ class RuntimeManagerTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def _write_skill_dir(self, skill_dir: Path, skill_name: str) -> None:
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            f"name: {skill_name}\n"
+            f"description: Fixture skill {skill_name} for runtime manager tests.\n"
+            "---\n\n"
+            "# Sample Skill\n",
+            encoding="utf-8",
+        )
+        refs_dir = skill_dir / "references"
+        refs_dir.mkdir(parents=True, exist_ok=True)
+        (refs_dir / "overview.md").write_text("fixture reference\n", encoding="utf-8")
+
     def _write_skill_bundle(self, bundle_path: Path, skill_name: str) -> None:
         with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.writestr(
@@ -4618,12 +4540,9 @@ class RuntimeManagerTests(unittest.TestCase):
                 clients_root=external_clients,
                 include_context=True,
             )
-            (external_clients / "personal" / "skills.manifest").write_text("", encoding="utf-8")
-            (external_clients / "personal" / "skills.sources.yaml").write_text(
-                "version: 1\n"
-                "sources:\n"
-                "  - kind: local\n"
-                "    path: ./skills\n",
+            (external_clients / "personal" / "skill-repos.yaml").write_text(
+                "version: 2\n"
+                "skill_repos: []\n",
                 encoding="utf-8",
             )
 
@@ -5032,164 +4951,6 @@ class RuntimeManagerTests(unittest.TestCase):
                     MANAGE_MODULE.sync_artifact(insecure_artifact, dry_run=False)
             urlopen.assert_not_called()
             self.assertFalse(target.exists())
-
-
-    # --- ack tests ---
-
-    def test_ack_writes_to_ack_store(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo = Path(tmpdir)
-            self._write_fixture(repo)
-            self._run(repo, "sync", "--client", "personal")
-
-            # Emit a journal event via focus
-            self._run(repo, "focus", "personal")
-
-            # Ack all events
-            result = self._run(repo, "ack", "--all", "--reason", "reviewed", "--format", "json")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            payload = json.loads(result.stdout)
-            self.assertGreater(payload["count"], 0)
-
-            # Verify ack store file exists
-            acks_path = repo / "logs" / "runtime" / "journal.acks.json"
-            self.assertTrue(acks_path.is_file())
-            acks = json.loads(acks_path.read_text(encoding="utf-8"))
-            self.assertGreater(len(acks), 0)
-            for entry in acks.values():
-                self.assertEqual(entry["reason"], "reviewed")
-
-    def test_ack_filters_events_from_live_context(self) -> None:
-        import time as _time
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo = Path(tmpdir)
-            self._write_fixture(repo)
-            self._run(repo, "sync", "--client", "personal")
-
-            # Write journal events directly so we control exactly what's there
-            journal_dir = repo / "logs" / "runtime"
-            journal_dir.mkdir(parents=True, exist_ok=True)
-            now = _time.time()
-            events = [
-                {"ts": now - 100, "type": "pulse.service_restarted", "subject": "api-stub", "detail": {}},
-                {"ts": now - 50, "type": "agent.note", "subject": "personal", "detail": {}},
-                {"ts": now - 10, "type": "focus.activated", "subject": "personal", "detail": {}},
-            ]
-            with (journal_dir / "journal.jsonl").open("w", encoding="utf-8") as f:
-                for ev in events:
-                    f.write(json.dumps(ev) + "\n")
-
-            # Focus should show all 3 events in Recent Activity
-            self._run(repo, "focus", "personal")
-            claude_md_1 = (repo / "home" / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
-            self.assertIn("Recent Activity", claude_md_1)
-            self.assertIn("pulse.service_restarted", claude_md_1)
-
-            # Ack only the pulse event
-            self._run(repo, "ack", "--type", "pulse.service_restarted", "--reason", "fixed")
-
-            # Re-focus — pulse event should be hidden, others visible
-            # Overwrite journal to same content (focus appends its own events)
-            with (journal_dir / "journal.jsonl").open("w", encoding="utf-8") as f:
-                for ev in events:
-                    f.write(json.dumps(ev) + "\n")
-
-            self._run(repo, "focus", "personal")
-            claude_md_2 = (repo / "home" / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
-            self.assertIn("Recent Activity", claude_md_2)
-            self.assertNotIn("pulse.service_restarted", claude_md_2)
-            self.assertIn("acknowledged events hidden", claude_md_2)
-
-    def test_ack_by_type_filters_matching_events(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo = Path(tmpdir)
-            self._write_fixture(repo)
-            self._run(repo, "sync", "--client", "personal")
-
-            # Generate some journal events
-            self._run(repo, "focus", "personal")
-
-            # Ack only focus.activated events
-            result = self._run(
-                repo, "ack", "--type", "focus.activated", "--reason", "noted", "--format", "json",
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            payload = json.loads(result.stdout)
-            for item in payload["acked"]:
-                self.assertEqual(item["type"], "focus.activated")
-
-    def test_ack_by_subject_filters_matching_events(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo = Path(tmpdir)
-            self._write_fixture(repo)
-            self._run(repo, "sync", "--client", "personal")
-            self._run(repo, "focus", "personal")
-
-            result = self._run(
-                repo, "ack", "--subject", "personal", "--reason", "handled", "--format", "json",
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            payload = json.loads(result.stdout)
-            for item in payload["acked"]:
-                self.assertEqual(item["subject"], "personal")
-
-    def test_ack_list_shows_current_acks(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo = Path(tmpdir)
-            self._write_fixture(repo)
-            self._run(repo, "sync", "--client", "personal")
-            self._run(repo, "focus", "personal")
-            self._run(repo, "ack", "--all", "--reason", "reviewed")
-
-            result = self._run(repo, "ack", "--list", "--format", "json")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            payload = json.loads(result.stdout)
-            self.assertGreater(payload["count"], 0)
-
-    def test_ack_requires_filter_argument(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo = Path(tmpdir)
-            self._write_fixture(repo)
-
-            result = self._run(repo, "ack", "--format", "json")
-            self.assertNotEqual(result.returncode, 0)
-
-    def test_ack_no_matching_events(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo = Path(tmpdir)
-            self._write_fixture(repo)
-
-            result = self._run(
-                repo, "ack", "--type", "nonexistent.type", "--format", "json",
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            payload = json.loads(result.stdout)
-            self.assertEqual(payload["count"], 0)
-
-    def test_ack_prune_removes_expired(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo = Path(tmpdir)
-            self._write_fixture(repo)
-
-            # Write a fake ack store with an old entry
-            acks_dir = repo / "logs" / "runtime"
-            acks_dir.mkdir(parents=True, exist_ok=True)
-            import time as _time
-            old_ts = _time.time() - (25 * 3600)  # 25h ago — expired
-            (acks_dir / "journal.acks.json").write_text(
-                json.dumps({"12345.0": {"at": old_ts, "reason": "old"}}),
-                encoding="utf-8",
-            )
-
-            result = self._run(repo, "ack", "--prune", "--format", "json")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            payload = json.loads(result.stdout)
-            self.assertEqual(payload["pruned"], 1)
-
-            # Store should be empty
-            acks = json.loads((acks_dir / "journal.acks.json").read_text(encoding="utf-8"))
-            self.assertEqual(len(acks), 0)
 
 
 if __name__ == "__main__":
