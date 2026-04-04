@@ -3,6 +3,8 @@
 .idea/
 .vscode/
 .cache/
+.claude/
+.mcp.json
 __pycache__/
 *.pyc
 .pytest_cache/
