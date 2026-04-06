@@ -821,6 +821,23 @@ def _build_local_core_model(
             "bridge_dependency": "local-core-bridge",
             "request_error": "LOCAL_RUNTIME_SERVICE_DEFERRED",
         },
+        # Mirrors the real overlay's ``legacy-mode-selector`` row: a covered
+        # legacy flag surface that has no corresponding managed_service because
+        # the runtime ``--mode`` argument replaces the legacy ``db=`` selector.
+        # Exercises the ``surface_type != "service"`` gate in
+        # ``validate_parity_ledger`` so covered non-service rows do not emit
+        # a false-positive LOCAL_RUNTIME_COVERAGE_GAP.
+        {
+            "id": "legacy-mode-selector",
+            "legacy_surface": "db=reuse|prod|fresh",
+            "surface_type": "flag",
+            "action": "declare",
+            "ownership_state": "covered",
+            "intended_profiles": ["local-core"],
+            "bridge_dependency": None,
+            "request_error": "LOCAL_RUNTIME_MODE_UNSUPPORTED",
+            "notes": "Runtime --mode replaces the legacy db= selector.",
+        },
     ]
     if parity_ledger_overrides is not None:
         parity_ledger = parity_ledger_overrides
@@ -1121,6 +1138,113 @@ class LocalCoreParityLedgerUS4Tests(unittest.TestCase):
             results = validate_parity_ledger(model)
             self.assertEqual(results[0].status, "fail")
             self.assertEqual(results[0].code, "LOCAL_RUNTIME_COVERAGE_GAP")
+
+
+REAL_PERSONAL_OVERLAY_PATH = Path(
+    "/Users/b/repos/skillbox-config/clients/personal/overlay.yaml"
+)
+
+
+class RealOverlayParityLedgerRegressionTests(unittest.TestCase):
+    """Regression coverage for Issue A1 / A2 from the
+    local_runtime_core_cutover AUDIT_REPORT.
+
+    Loads the real personal overlay end-to-end through the runtime_model
+    normalization helpers and asserts that ``validate_parity_ledger`` returns
+    a clean pass. The synthetic ``_build_local_core_model`` fixture used
+    ``surface_type="service"`` for every covered row, which hid a bug where
+    ``validate_parity_ledger`` emitted a false-positive
+    ``LOCAL_RUNTIME_COVERAGE_GAP`` for covered non-service rows such as
+    ``legacy-mode-selector`` (``surface_type="flag"``) in the real overlay.
+    """
+
+    def _build_model_from_real_overlay(self) -> dict:
+        self.assertTrue(
+            REAL_PERSONAL_OVERLAY_PATH.is_file(),
+            f"Real overlay missing at {REAL_PERSONAL_OVERLAY_PATH}. "
+            "This regression test relies on the shipped personal overlay.",
+        )
+        overlay_doc = runtime_model.load_yaml(REAL_PERSONAL_OVERLAY_PATH)
+        raw_client = overlay_doc.get("client")
+        self.assertIsInstance(
+            raw_client, dict,
+            f"Expected top-level `client` mapping in {REAL_PERSONAL_OVERLAY_PATH}",
+        )
+        # Tag the overlay with its real path so the normalizer's error
+        # messages point at the real file, matching production behavior in
+        # runtime_model.load_client_overlays.
+        raw_client = dict(raw_client)
+        raw_client["_overlay_path"] = str(REAL_PERSONAL_OVERLAY_PATH)
+        # Run the same normalization pipeline build_runtime_model uses: no
+        # core runtime doc, a single client overlay carrying services,
+        # bridges, tasks, and parity_ledger.
+        normalized = runtime_model._normalize_runtime_sections(
+            {"core": {}, "clients": []},
+            overlay_clients=[raw_client],
+        )
+        return {
+            "root_dir": str(REAL_PERSONAL_OVERLAY_PATH.parent),
+            "clients": normalized["clients"],
+            "repos": normalized["repos"],
+            "artifacts": normalized["artifacts"],
+            "env_files": normalized["env_files"],
+            "skills": normalized["skills"],
+            "tasks": normalized["tasks"],
+            "services": normalized["services"],
+            "logs": normalized["logs"],
+            "checks": normalized["checks"],
+            "bridges": normalized["bridges"],
+            "service_mode_commands": normalized.get(
+                "service_mode_commands", []
+            ),
+            "parity_ledger": normalized.get("parity_ledger", []),
+        }
+
+    def test_real_overlay_parity_ledger_validates_clean(self) -> None:
+        model = self._build_model_from_real_overlay()
+        # Sanity: the overlay carries the full 22-row parity ledger, and it
+        # includes at least one covered non-service row (the one that
+        # originally tripped Issue A1).
+        ledger = model["parity_ledger"]
+        self.assertGreaterEqual(len(ledger), 20)
+        covered_non_service = [
+            item for item in ledger
+            if str(item.get("ownership_state", "")).strip() == "covered"
+            and str(item.get("surface_type", "service")).strip() != "service"
+        ]
+        self.assertTrue(
+            covered_non_service,
+            "Expected at least one covered non-service parity_ledger row "
+            "(e.g. legacy-mode-selector) in the real overlay; if it was "
+            "removed, update this regression test.",
+        )
+        self.assertTrue(
+            any(
+                item.get("id") == "legacy-mode-selector"
+                for item in covered_non_service
+            ),
+            "Expected legacy-mode-selector to still be present in the real "
+            "overlay parity_ledger.",
+        )
+
+        results = validate_parity_ledger(model)
+        self.assertEqual(len(results), 1)
+        check = results[0]
+        self.assertEqual(
+            check.status, "pass",
+            f"validate_parity_ledger should return pass for the real "
+            f"personal overlay but got: {check}",
+        )
+        self.assertEqual(check.code, "parity-ledger")
+
+    def test_real_overlay_covered_services_list_excludes_flag_row(self) -> None:
+        # Issue B2 (cosmetic): the covered_services summary list must not
+        # include non-service legacy surfaces such as "db=reuse|prod|fresh".
+        model = self._build_model_from_real_overlay()
+        results = validate_parity_ledger(model)
+        details = results[0].details or {}
+        covered = details.get("covered_services", [])
+        self.assertNotIn("db=reuse|prod|fresh", covered)
 
 
 if __name__ == "__main__":

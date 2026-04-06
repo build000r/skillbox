@@ -1409,8 +1409,19 @@ def validate_parity_ledger(model: dict[str, Any]) -> list[CheckResult]:
         action = str(item.get("action", "")).strip()
         ownership_state = str(item.get("ownership_state", "")).strip()
         bridge_dependency = item.get("bridge_dependency")
-        request_error = str(item.get("request_error", "")).strip()
+        request_error_raw = item.get("request_error")
+        request_error = str(request_error_raw).strip() if request_error_raw is not None else ""
         surface = str(item.get("legacy_surface", "")).strip() or item_id
+        # Only rows that represent an actual managed_service participate in the
+        # cross-reference checks against the service graph. Non-service rows
+        # (flag, helper, env_target, bridge, ...) describe legacy surfaces that
+        # are intentionally not modelled as services — e.g. the
+        # ``legacy-mode-selector`` flag row records that the runtime ``--mode``
+        # argument has replaced the legacy ``db=`` selector. Missing
+        # ``surface_type`` defaults to ``"service"`` so pre-existing overlays
+        # that never declared the field keep their stricter check.
+        surface_type = str(item.get("surface_type", "service")).strip() or "service"
+        is_service_row = surface_type == "service"
 
         if action and action not in PARITY_LEDGER_ACTIONS:
             issues.append(
@@ -1440,19 +1451,21 @@ def validate_parity_ledger(model: dict[str, Any]) -> list[CheckResult]:
                 )
 
         if ownership_state == "covered":
-            covered_services.append(surface)
-            if item_id and service_ids and item_id not in service_ids and surface not in service_ids:
-                issues.append(
-                    f"parity_ledger {item_id}: ownership_state is 'covered' but no "
-                    f"managed_service with that id is declared"
-                )
+            if is_service_row:
+                covered_services.append(surface)
+                if item_id and service_ids and item_id not in service_ids and surface not in service_ids:
+                    issues.append(
+                        f"parity_ledger {item_id}: ownership_state is 'covered' but no "
+                        f"managed_service with that id is declared"
+                    )
         elif ownership_state in ("deferred", "bridge-only"):
-            deferred_surfaces.append(surface)
-            if item_id and item_id in service_ids:
-                issues.append(
-                    f"parity_ledger {item_id}: ownership_state is {ownership_state!r} "
-                    f"but a managed_service with that id is declared"
-                )
+            if is_service_row:
+                deferred_surfaces.append(surface)
+                if item_id and item_id in service_ids:
+                    issues.append(
+                        f"parity_ledger {item_id}: ownership_state is {ownership_state!r} "
+                        f"but a managed_service with that id is declared"
+                    )
 
     if issues:
         return [
