@@ -107,6 +107,18 @@ def main() -> int:
     up_parser.add_argument("--dry-run", action="store_true")
     up_parser.add_argument("--wait-seconds", type=float, default=DEFAULT_SERVICE_START_WAIT_SECONDS)
     up_parser.add_argument("--format", choices=("text", "json"), default="text")
+    # --mode is the first-class startup-behavior selector introduced by
+    # local_runtime_core_cutover (shared.md:428-469). It is orthogonal to
+    # --profile (which answers "which graph?") per Business Rule 2. We do
+    # NOT constrain choices at argparse level here because an unknown value
+    # must surface as a structured LOCAL_RUNTIME_MODE_UNSUPPORTED envelope
+    # rather than an argparse usage error. Validation happens immediately
+    # after parse_args() and BEFORE any mutation.
+    up_parser.add_argument(
+        "--mode",
+        default=None,
+        help="Local runtime startup behavior. One of: reuse (default), prod, fresh.",
+    )
     add_profile_arg(up_parser)
     add_client_arg(up_parser)
     add_service_arg(up_parser)
@@ -399,6 +411,10 @@ def main() -> int:
     )
     focus_parser.add_argument("--format", choices=("text", "json"), default="text")
     add_profile_arg(focus_parser)
+    # --client accepted for CLI consistency with up/status/logs/doctor
+    # (local_runtime_core_cutover WG-003). The positional client_id remains
+    # the primary input; --client is honored when no positional is given.
+    add_client_arg(focus_parser)
     add_service_arg(focus_parser)
     add_context_dir_arg(focus_parser)
 
@@ -471,6 +487,38 @@ def main() -> int:
 
     args = parser.parse_args()
     root_dir = resolve_root_dir(args.root_dir)
+
+    # --- WG-003: --mode selector validation ---------------------------------
+    # Validate the local-runtime startup mode BEFORE any mutation runs.
+    # Unknown values must emit a structured LOCAL_RUNTIME_MODE_UNSUPPORTED
+    # envelope (shared.md:457-469) and exit 1 during CLI arg validation,
+    # not during lifecycle execution. Only the `up` surface accepts --mode
+    # today; other surfaces ignore it. Mode is orthogonal to --profile and
+    # --service (shared.md:518-520, Business Rule 2).
+    requested_mode_raw = getattr(args, "mode", None)
+    default_mode = "reuse"
+    if requested_mode_raw is None or str(requested_mode_raw).strip() == "":
+        resolved_mode = default_mode
+        mode_was_explicit = False
+    else:
+        resolved_mode = str(requested_mode_raw).strip()
+        mode_was_explicit = True
+
+    if mode_was_explicit and resolved_mode not in LOCAL_RUNTIME_START_MODES:
+        supported = ", ".join(LOCAL_RUNTIME_START_MODES)
+        err = local_runtime_error(
+            LOCAL_RUNTIME_MODE_UNSUPPORTED,
+            f"Unsupported --mode value {resolved_mode!r}. Supported modes: {supported}.",
+            recoverable=True,
+            next_action=f"Re-run with --mode <{'|'.join(LOCAL_RUNTIME_START_MODES)}>.",
+        )
+        err["error"]["requested_mode"] = resolved_mode
+        fmt = getattr(args, "format", "text")
+        if fmt == "json":
+            emit_json(err)
+        else:
+            print(f"ERROR: {err['error']['detail']}", file=sys.stderr)
+        return EXIT_ERROR
 
     if args.command == "client-init":
         try:
@@ -698,6 +746,12 @@ def main() -> int:
 
     if args.command == "focus":
         cid = args.client_id or ""
+        # CLI-consistency (WG-003): fall back to --client for parity with
+        # up/status/logs/doctor when no positional client_id was provided.
+        if not cid:
+            client_flags = getattr(args, "client", []) or []
+            if client_flags:
+                cid = str(client_flags[0]).strip()
         if not cid and not args.resume:
             print("focus requires a client_id or --resume.", file=sys.stderr)
             return EXIT_ERROR
@@ -973,14 +1027,24 @@ def main() -> int:
                 bootstrap_tasks,
                 dry_run=args.dry_run,
             )
+            # TODO(WG-005): thread `mode=resolved_mode` into start_services /
+            # resolve_services_for_start / run_tasks so the selected startup
+            # behavior (reuse|prod|fresh) actually drives container lifecycle
+            # decisions. WG-003 only validates + echoes the mode; it does not
+            # alter execution. Until WG-005 lands, the effective mode is
+            # always identical to the requested mode and no reuse/prod/fresh
+            # differentiation occurs downstream.
             service_results = start_services(
                 model,
                 services,
                 dry_run=args.dry_run,
                 wait_seconds=max(0.0, float(args.wait_seconds)),
             )
+            effective_mode = resolved_mode  # WG-005 may override post-execution
             payload = {
                 "dry_run": args.dry_run,
+                "requested_mode": resolved_mode,
+                "effective_mode": effective_mode,
                 "sync_actions": sync_actions,
                 "bootstrap_tasks": task_results,
                 "services": service_results,
