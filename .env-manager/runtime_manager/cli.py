@@ -943,6 +943,24 @@ def main() -> int:
         requested_services = select_services(model, getattr(args, "service", []))
 
         if args.command == "up":
+            # Validate bridge readiness before service start
+            bridges = model.get("bridges") or []
+            if bridges and not args.dry_run:
+                for bridge in bridges:
+                    state = bridge_outputs_state(bridge)
+                    if state["state"] == "missing":
+                        err = local_runtime_error(
+                            "LOCAL_RUNTIME_ENV_BRIDGE_FAILED",
+                            f"Bridge {bridge['id']} outputs missing. Run 'manage.py focus' first.",
+                            recoverable=True,
+                            next_action=f"manage.py focus {args.client[0] if args.client else 'personal'} --profile {' --profile '.join(args.profile) if args.profile else 'local-minimal'}",
+                        )
+                        if args.format == "json":
+                            emit_json(err)
+                        else:
+                            print(f"ERROR: {err['error']['detail']}", file=sys.stderr)
+                        return EXIT_ERROR
+
             sync_actions = sync_runtime(model, dry_run=args.dry_run)
             services = resolve_services_for_start(model, requested_services)
             bootstrap_tasks = resolve_tasks_for_services(model, services)

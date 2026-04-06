@@ -53,6 +53,12 @@ def print_render_text(model: dict[str, Any]) -> None:
     print(f"checks: {len(model['checks'])}")
     for check in model["checks"]:
         print(f"  - {check['id']}: {check['type']}")
+    bridges = model.get("bridges") or []
+    if bridges:
+        print(f"bridges: {len(bridges)}")
+        for bridge in bridges:
+            targets = ", ".join(str(t) for t in bridge.get("legacy_targets") or [])
+            print(f"  - {bridge['id']}: {bridge.get('env_tier', 'local')} [{targets}]")
 
 
 def detail_lines(details: dict[str, Any]) -> list[str]:

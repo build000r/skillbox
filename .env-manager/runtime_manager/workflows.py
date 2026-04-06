@@ -1068,6 +1068,17 @@ def run_focus(
             print(str(exc), file=sys.stderr)
         return EXIT_ERROR
 
+    # --- Validate local-runtime profiles ----------------------------------------
+    profile_errors = validate_local_runtime_profiles(model)
+    if profile_errors:
+        payload = {"client_id": cid, "steps": steps}
+        payload.update(profile_errors[0])
+        if is_json:
+            emit_json(payload)
+        else:
+            print(profile_errors[0]["error"]["detail"], file=sys.stderr)
+        return EXIT_ERROR
+
     # --- 0. Compose override ---------------------------------------------------
     try:
         override_path = generate_client_compose_override(root_dir, model, cid)
@@ -1087,23 +1098,85 @@ def run_focus(
             emit_json(payload)
         return EXIT_ERROR
 
+    # --- 1b. Bridge freshness check ---------------------------------------------
+    bridges = model.get("bridges") or []
+    bridge_detail: dict[str, Any] = {}
+    if bridges:
+        overlay_path = None
+        for client in model.get("clients") or []:
+            if client.get("id") == cid and client.get("_overlay_path"):
+                overlay_path = client["_overlay_path"]
+                break
+        for bridge in bridges:
+            freshness = bridge_freshness(bridge, overlay_path)
+            bridge_detail[bridge["id"]] = freshness
+        all_fresh = all(f.get("fresh") for f in bridge_detail.values())
+        if all_fresh:
+            step("bridge-check", "ok", {"bridges": bridge_detail, "action": "skip (fresh)"})
+        else:
+            step("bridge-check", "ok", {"bridges": bridge_detail, "action": "will re-run stale bridges"})
+
     # --- 2. Bootstrap ---------------------------------------------------------
     try:
         requested_tasks = select_tasks(model, [])
         tasks = resolve_tasks_for_run(model, requested_tasks)
         if tasks:
-            ensure_required_env_files_ready(select_env_files_for_tasks(model, tasks))
-            task_results = run_tasks(model, tasks, dry_run=False)
-            step("bootstrap", "ok", {"tasks": task_results})
+            # For bridge-backed tasks, skip if bridge outputs are fresh
+            tasks_to_run = []
+            for task in tasks:
+                bid = str(task.get("bridge_id", "")).strip()
+                if bid and bridge_detail.get(bid, {}).get("fresh"):
+                    step_detail = {"task": task["id"], "bridge": bid, "action": "skipped (fresh)"}
+                    if not is_json:
+                        print(f"  [skip] {task['id']} (bridge {bid} outputs are fresh)")
+                else:
+                    tasks_to_run.append(task)
+            if tasks_to_run:
+                ensure_required_env_files_ready(select_env_files_for_tasks(model, tasks_to_run))
+                task_results = run_tasks(model, tasks_to_run, dry_run=False)
+                step("bootstrap", "ok", {"tasks": task_results})
+            else:
+                step("bootstrap", "skip", {"reason": "all bridge tasks fresh"})
         else:
             step("bootstrap", "skip", {"reason": "no tasks declared"})
     except RuntimeError as exc:
         step("bootstrap", "fail", {"error": str(exc)})
         payload = {"client_id": cid, "steps": steps}
-        payload.update(classify_error(exc, "focus"))
+        # Detect bridge-specific failures and use local runtime error codes
+        err_str = str(exc)
+        if any(bid in err_str for bid in bridge_detail):
+            payload.update(local_runtime_error(
+                "LOCAL_RUNTIME_ENV_BRIDGE_FAILED",
+                err_str,
+                recoverable=True,
+                next_action="re-run sync.sh manually to diagnose",
+            ))
+        else:
+            payload.update(classify_error(exc, "focus"))
         if is_json:
             emit_json(payload)
         return EXIT_ERROR
+
+    # --- 2b. Verify bridge outputs after bootstrap ----------------------------
+    if bridges:
+        missing_outputs: list[str] = []
+        for bridge in bridges:
+            state = bridge_outputs_state(bridge)
+            if state["state"] == "missing":
+                missing_outputs.extend(state.get("missing", []))
+        if missing_outputs:
+            step("bridge-verify", "fail", {"missing": missing_outputs})
+            payload = {"client_id": cid, "steps": steps}
+            payload.update(local_runtime_error(
+                "LOCAL_RUNTIME_ENV_OUTPUT_MISSING",
+                f"Bridge outputs missing after bootstrap: {', '.join(missing_outputs)}",
+                recoverable=True,
+                next_action="re-run sync.sh manually to diagnose",
+            ))
+            if is_json:
+                emit_json(payload)
+            return EXIT_ERROR
+        step("bridge-verify", "ok", {"bridges": len(bridges)})
 
     # --- 3. Up ----------------------------------------------------------------
     try:
@@ -1198,8 +1271,24 @@ def run_focus(
         for lg in live.get("logs", [])
     )
 
+    # Build local_runtime section if bridges are present
+    local_runtime_section: dict[str, Any] | None = None
+    if bridges:
+        bridge_states_focus = []
+        for bridge in bridges:
+            state = bridge_outputs_state(bridge)
+            bridge_states_focus.append({"id": bridge["id"], "status": "ready" if state["state"] == "ok" else state["state"]})
+        local_runtime_section = {
+            "env_bridge": bridge_states_focus[0] if len(bridge_states_focus) == 1 else bridge_states_focus,
+            "services": [
+                {"id": s["id"], "state": s.get("state", "stopped")}
+                for s in live.get("services", [])
+            ],
+        }
+
     payload = {
         "client_id": cid,
+        "active_profiles": sorted(model.get("active_profiles") or []),
         "steps": steps,
         "live_state": live,
         "summary": {
@@ -1213,6 +1302,8 @@ def run_focus(
         },
         "next_actions": next_actions_for_focus(cid, has_fail, live.get("services") or []),
     }
+    if local_runtime_section:
+        payload["local_runtime"] = local_runtime_section
 
     log_runtime_event("focus.activated", cid, payload.get("summary", {}), root_dir)
 

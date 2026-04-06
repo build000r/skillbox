@@ -101,6 +101,11 @@ def filter_model(model: dict[str, Any], active_profiles: set[str], active_client
         for check in model["checks"]
         if item_matches_profiles(check, active_profiles) and item_matches_clients(check, active_clients)
     ]
+    filtered_model["bridges"] = [
+        copy.deepcopy(bridge)
+        for bridge in model.get("bridges") or []
+        if item_matches_profiles(bridge, active_profiles) and item_matches_clients(bridge, active_clients)
+    ]
 
     included_repo_ids = {repo["id"] for repo in filtered_model["repos"]}
     included_artifact_ids = {artifact["id"] for artifact in filtered_model["artifacts"]}

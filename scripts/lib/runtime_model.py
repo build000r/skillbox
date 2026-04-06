@@ -309,6 +309,7 @@ def _empty_runtime_sections() -> dict[str, list[dict[str, Any]]]:
         "services": [],
         "logs": [],
         "checks": [],
+        "bridges": [],
     }
 
 
@@ -439,6 +440,7 @@ def _normalize_runtime_sections(
         "services": sections["services"],
         "logs": sections["logs"],
         "checks": sections["checks"],
+        "bridges": sections["bridges"],
     }
 
 
@@ -463,6 +465,7 @@ def _base_runtime_model(
         "services": normalized["services"],
         "logs": normalized["logs"],
         "checks": normalized["checks"],
+        "bridges": normalized["bridges"],
     }
 
 
@@ -587,6 +590,19 @@ def _populate_log_defaults(model: dict[str, Any], root_dir: Path) -> None:
             )
 
 
+def _populate_bridge_defaults(model: dict[str, Any], root_dir: Path) -> None:
+    for bridge in model["bridges"]:
+        bridge.setdefault("profiles", [])
+        bridge.setdefault("client", "")
+        bridge.setdefault("env_tier", "local")
+        bridge.setdefault("legacy_targets", [])
+        bridge.setdefault("emit_stubs", False)
+        if bridge.get("output_root"):
+            bridge["output_root_host_path"] = str(
+                runtime_path_to_host_path(root_dir, model["env"], str(bridge["output_root"]))
+            )
+
+
 def _populate_check_defaults(model: dict[str, Any], root_dir: Path) -> None:
     for check in model["checks"]:
         check.setdefault("required", False)
@@ -614,6 +630,7 @@ def _populate_runtime_model_defaults(model: dict[str, Any], root_dir: Path) -> N
     _populate_service_defaults(model, root_dir)
     _populate_log_defaults(model, root_dir)
     _populate_check_defaults(model, root_dir)
+    _populate_bridge_defaults(model, root_dir)
     _populate_client_defaults(model, root_dir)
 
 

@@ -419,6 +419,35 @@ def validate_task_state(model: dict[str, Any]) -> list[CheckResult]:
     ]
 
 
+def validate_bridges(model: dict[str, Any]) -> list[CheckResult]:
+    results: list[CheckResult] = []
+    bridges = bridge_id_map(model)
+    for task in model.get("tasks") or []:
+        bid = str(task.get("bridge_id", "")).strip()
+        if bid and bid not in bridges:
+            results.append(CheckResult(
+                status="fail",
+                code="bridge_reference_missing",
+                message=f"Task {task['id']} references bridge {bid!r} which is not declared",
+            ))
+    for bridge in model.get("bridges") or []:
+        state = bridge_outputs_state(bridge)
+        if state["state"] == "missing":
+            results.append(CheckResult(
+                status="warn",
+                code="bridge_outputs_missing",
+                message=f"Bridge {bridge['id']} has missing outputs",
+                details={"missing": state.get("missing", [])},
+            ))
+        elif state["state"] == "ok":
+            results.append(CheckResult(
+                status="pass",
+                code="bridge_outputs_present",
+                message=f"Bridge {bridge['id']} outputs are present",
+            ))
+    return results
+
+
 def doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
     results = check_manifest(model)
     if any(result.status == "fail" for result in results):
@@ -433,6 +462,7 @@ def doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
         + validate_skill_repo_sets(model)
         + validate_skill_locks_and_state(model)
         + validate_task_state(model)
+        + validate_bridges(model)
     )
 
 
@@ -1004,7 +1034,131 @@ def translated_runtime_command(model: dict[str, Any], item: dict[str, Any]) -> t
     return command, env
 
 
-def task_success_state(task: dict[str, Any]) -> dict[str, Any]:
+def validate_local_runtime_profiles(model: dict[str, Any]) -> list[dict[str, Any]]:
+    """Check that local-* profiles in the active set have declared services."""
+    errors: list[dict[str, Any]] = []
+    active = set(model.get("active_profiles") or [])
+    local_profiles = {p for p in active if p.startswith("local-")}
+    if not local_profiles:
+        return errors
+
+    # Collect which local profiles have at least one service
+    for lp in local_profiles:
+        has_service = any(
+            lp in (service.get("profiles") or [])
+            for service in model.get("services") or []
+        )
+        if not has_service:
+            available = sorted({
+                p for service in model.get("services") or []
+                for p in service.get("profiles") or []
+                if p.startswith("local-")
+            })
+            errors.append(local_runtime_error(
+                "LOCAL_RUNTIME_PROFILE_UNKNOWN",
+                f"Profile '{lp}' has no declared local-runtime services",
+                recoverable=False,
+                available_profiles=available,
+            ))
+    return errors
+
+
+LOCAL_RUNTIME_ERROR_CODES = {
+    "LOCAL_RUNTIME_ENV_BRIDGE_FAILED",
+    "LOCAL_RUNTIME_ENV_OUTPUT_MISSING",
+    "LOCAL_RUNTIME_PROFILE_UNKNOWN",
+    "LOCAL_RUNTIME_START_BLOCKED",
+    "LOCAL_RUNTIME_SERVICE_DEFERRED",
+    "LOCAL_RUNTIME_MODE_UNSUPPORTED",
+    "LOCAL_RUNTIME_COVERAGE_GAP",
+}
+
+
+def bridge_id_map(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(bridge["id"]): bridge
+        for bridge in model.get("bridges") or []
+        if str(bridge.get("id", "")).strip()
+    }
+
+
+def bridge_expected_outputs(bridge: dict[str, Any]) -> list[Path]:
+    output_root = bridge.get("output_root_host_path") or bridge.get("output_root", "")
+    if not output_root:
+        return []
+    root = Path(str(output_root))
+    env_tier = str(bridge.get("env_tier", "local"))
+    return [
+        root / str(target) / f"{env_tier}.env"
+        for target in bridge.get("legacy_targets") or []
+    ]
+
+
+def bridge_outputs_state(bridge: dict[str, Any]) -> dict[str, Any]:
+    expected = bridge_expected_outputs(bridge)
+    if not expected:
+        return {"state": "unknown", "outputs": []}
+    missing = [str(p) for p in expected if not p.is_file()]
+    if missing:
+        return {"state": "missing", "outputs": [str(p) for p in expected], "missing": missing}
+    return {"state": "ok", "outputs": [str(p) for p in expected]}
+
+
+def bridge_freshness(bridge: dict[str, Any], overlay_path: str | None = None) -> dict[str, Any]:
+    outputs = bridge_expected_outputs(bridge)
+    if not outputs:
+        return {"fresh": False, "reason": "no_outputs_declared"}
+    missing = [p for p in outputs if not p.is_file()]
+    if missing:
+        return {"fresh": False, "reason": "outputs_missing", "missing": [str(p) for p in missing]}
+    if overlay_path:
+        overlay_p = Path(overlay_path)
+        if overlay_p.is_file():
+            overlay_mtime = overlay_p.stat().st_mtime
+            stale = [p for p in outputs if p.stat().st_mtime < overlay_mtime]
+            if stale:
+                return {"fresh": False, "reason": "stale", "stale": [str(p) for p in stale]}
+    return {"fresh": True}
+
+
+def local_runtime_error(
+    error_type: str,
+    detail: str,
+    *,
+    recoverable: bool = True,
+    next_action: str = "",
+    blocked_services: list[str] | None = None,
+    available_profiles: list[str] | None = None,
+) -> dict[str, Any]:
+    err: dict[str, Any] = {
+        "error": {
+            "type": error_type,
+            "detail": detail,
+            "recoverable": recoverable,
+        }
+    }
+    if next_action:
+        err["error"]["next_action"] = next_action
+    if blocked_services is not None:
+        err["error"]["blocked_services"] = blocked_services
+    if available_profiles is not None:
+        err["error"]["available_profiles"] = available_profiles
+    return err
+
+
+def task_success_state(task: dict[str, Any], model: dict[str, Any] | None = None) -> dict[str, Any]:
+    # Bridge-backed task: check all bridge outputs exist
+    bridge_id = str(task.get("bridge_id", "")).strip()
+    if bridge_id and model:
+        bridges = bridge_id_map(model)
+        bridge = bridges.get(bridge_id)
+        if bridge:
+            state = bridge_outputs_state(bridge)
+            if state["state"] == "ok":
+                return {"state": "ok", "target": f"bridge:{bridge_id}"}
+            return {"state": "down", "target": f"bridge:{bridge_id}", "missing": state.get("missing", [])}
+        return {"state": "unknown", "target": f"bridge:{bridge_id} (not found)"}
+
     success = task.get("success") or {}
     success_type = success.get("type")
     if success_type == "path_exists":
@@ -1014,10 +1168,10 @@ def task_success_state(task: dict[str, Any]) -> dict[str, Any]:
 
 
 def probe_task(model: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
-    success_state = task_success_state(task)
+    success_state = task_success_state(task, model)
     tasks_by_id = task_id_map(model)
     dependency_states = {
-        dependency_id: task_success_state(tasks_by_id[dependency_id]).get("state", "unknown")
+        dependency_id: task_success_state(tasks_by_id[dependency_id], model).get("state", "unknown")
         for dependency_id in task_dependency_ids(task)
         if dependency_id in tasks_by_id
     }
@@ -1673,6 +1827,17 @@ def collect_live_state(
         reverse=True,
     )
 
+    bridge_states: list[dict[str, Any]] = []
+    for bridge in model.get("bridges") or []:
+        state = bridge_outputs_state(bridge)
+        bridge_states.append({
+            "id": bridge["id"],
+            "env_tier": bridge.get("env_tier", "local"),
+            "targets": bridge.get("legacy_targets", []),
+            "state": state["state"],
+            "missing": state.get("missing", []),
+        })
+
     return {
         "collected_at": time.time(),
         "repos": repo_states,
@@ -1680,6 +1845,7 @@ def collect_live_state(
         "checks": check_states,
         "logs": log_states,
         "sessions": session_states,
+        "bridges": bridge_states,
     }
 
 
