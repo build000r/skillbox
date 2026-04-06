@@ -455,6 +455,30 @@ def doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
     connector_results = validate_connector_contract(model)
     if any(result.status == "fail" for result in connector_results):
         return results + connector_results
+    # WG-006: fold the parity-ledger drift check into doctor so the
+    # LOCAL_RUNTIME_COVERAGE_GAP contract from shared.md:473-507 fires at
+    # the observational surface the operator actually runs.  We wrap the
+    # underlying CheckResult so the doctor text/json renderers emit the
+    # shared contract shape: ``subject=parity_ledger`` and
+    # ``details.deferred_surfaces`` populated from the ledger.
+    parity_results: list[CheckResult] = []
+    for raw in validate_parity_ledger(model):
+        details = dict(raw.details or {})
+        details.setdefault("subject", "parity_ledger")
+        details.setdefault(
+            "deferred_surfaces", parity_ledger_deferred_surfaces(model),
+        )
+        details.setdefault(
+            "covered_surfaces", parity_ledger_covered_surfaces(model),
+        )
+        parity_results.append(
+            CheckResult(
+                status=raw.status,
+                code=raw.code,
+                message=raw.message,
+                details=details,
+            )
+        )
     return (
         results
         + connector_results
@@ -463,6 +487,7 @@ def doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
         + validate_skill_locks_and_state(model)
         + validate_task_state(model)
         + validate_bridges(model)
+        + parity_results
     )
 
 
@@ -1153,6 +1178,11 @@ def local_runtime_error(
         "error": {
             "type": error_type,
             "detail": detail,
+            # WG-006: emit ``message`` alongside ``detail`` so legacy
+            # structured-error consumers that key off ``error.message``
+            # (classify_error shape) still see the underlying reason
+            # without the caller having to branch on envelope style.
+            "message": detail,
             "recoverable": recoverable,
         }
     }
@@ -2510,6 +2540,275 @@ def _collect_skill_repo_status(skillset: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# WG-006: parity-ledger enforcement helpers for status/logs/doctor/up
+# ---------------------------------------------------------------------------
+#
+# These helpers consult the declared parity_ledger so the observational and
+# lifecycle surfaces (status, logs, doctor, up) can treat the ledger as
+# runtime truth instead of documentation.  They deliberately do NOT mutate
+# any bridge, bootstrap, or service state -- they only classify requested
+# surfaces and build structured error envelopes.
+#
+# Contract anchors:
+#   * flows.md Flow 4/5 (lines 94-138)
+#   * backend.md Rule 3a + Rule 6 (lines 47-54, 77-90, 159-169)
+#   * shared.md US-4 ACs and doctor contract (lines 148-180, 473-507)
+
+
+def parity_ledger_items(model: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the declared parity_ledger items for the active model."""
+    items = model.get("parity_ledger") or []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _parity_surface_keys(item: dict[str, Any]) -> list[str]:
+    keys: list[str] = []
+    for field in ("id", "legacy_surface"):
+        value = str(item.get(field, "")).strip()
+        if value:
+            keys.append(value)
+    return keys
+
+
+def parity_ledger_by_surface(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Index parity_ledger items by id and legacy_surface for fast lookup."""
+    index: dict[str, dict[str, Any]] = {}
+    for item in parity_ledger_items(model):
+        for key in _parity_surface_keys(item):
+            index.setdefault(key, item)
+    return index
+
+
+def parity_ledger_deferred_surfaces(model: dict[str, Any]) -> list[str]:
+    """Return the sorted list of non-covered surfaces declared in the ledger.
+
+    Used by the doctor contract (shared.md:473-507) to populate
+    ``details.deferred_surfaces`` and by status/focus text renderers to
+    advertise what the operator has explicitly chosen to defer.
+    """
+    deferred: set[str] = set()
+    for item in parity_ledger_items(model):
+        state = str(item.get("ownership_state", "")).strip()
+        if state in ("deferred", "bridge-only", "external"):
+            surface = (
+                str(item.get("legacy_surface", "")).strip()
+                or str(item.get("id", "")).strip()
+            )
+            if surface:
+                deferred.add(surface)
+    return sorted(deferred)
+
+
+def parity_ledger_covered_surfaces(model: dict[str, Any]) -> list[str]:
+    """Return the sorted list of covered surfaces declared in the ledger."""
+    covered: set[str] = set()
+    for item in parity_ledger_items(model):
+        if str(item.get("ownership_state", "")).strip() == "covered":
+            surface = (
+                str(item.get("legacy_surface", "")).strip()
+                or str(item.get("id", "")).strip()
+            )
+            if surface:
+                covered.add(surface)
+    return sorted(covered)
+
+
+def ownership_state_for_service(
+    model: dict[str, Any],
+    service_id: str,
+) -> str:
+    """Return the ownership_state for a declared service.
+
+    Declared services are treated as ``covered`` unless the parity ledger
+    explicitly classifies them otherwise.  Surfaces that are not in the
+    service graph and have no ledger entry are reported as ``unknown`` so
+    renderers can still surface something meaningful.
+    """
+    target = str(service_id or "").strip()
+    if not target:
+        return "unknown"
+    index = parity_ledger_by_surface(model)
+    item = index.get(target)
+    if item is not None:
+        state = str(item.get("ownership_state", "")).strip()
+        if state:
+            return state
+    service_ids = {
+        str(service.get("id", "")).strip()
+        for service in model.get("services") or []
+    }
+    if target in service_ids:
+        return "covered"
+    return "unknown"
+
+
+def parity_ledger_next_action(
+    item: dict[str, Any],
+    *,
+    client_id: str | None = None,
+    profile: str | None = None,
+) -> str:
+    """Compose a next_action hint for a deferred/bridge-only/external item.
+
+    The overlay may declare an explicit ``next_action`` on the item; when
+    absent, we synthesize a reasonable pointer from the item's action and
+    bridge_dependency per backend.md:159-169.
+    """
+    explicit = str(item.get("next_action", "")).strip()
+    if explicit:
+        return explicit
+    action = str(item.get("action", "")).strip()
+    ownership = str(item.get("ownership_state", "")).strip()
+    bridge_dep = str(item.get("bridge_dependency") or "").strip()
+    cid = (client_id or "personal").strip() or "personal"
+    prof = (profile or "local-core").strip() or "local-core"
+
+    if ownership == "bridge-only" and bridge_dep:
+        return (
+            f"bridge seam {bridge_dep!r} is only available to covered workflows; "
+            f"run 'manage.py focus --client {cid} --profile {prof}' to reconcile it"
+        )
+    if ownership == "external":
+        return (
+            "surface is external to the skillbox runtime contract; consult the "
+            "upstream owner documented in the overlay parity_ledger"
+        )
+    if action == "build":
+        return (
+            f"surface is deferred pending a build slice; track follow-on work "
+            f"in the parity_ledger for {str(item.get('id') or item.get('legacy_surface') or '')}"
+        )
+    if action == "drop":
+        return (
+            "surface is marked drop in the parity_ledger; do not request it "
+            "through the runtime"
+        )
+    return (
+        f"manage.py doctor --client {cid} --profile {prof} --format json"
+    )
+
+
+def build_local_runtime_service_deferred_error(
+    item: dict[str, Any],
+    *,
+    client_id: str | None = None,
+    profile: str | None = None,
+    requested_mode: str | None = None,
+    surface_id: str | None = None,
+) -> dict[str, Any]:
+    """Build a ``LOCAL_RUNTIME_SERVICE_DEFERRED`` envelope from a ledger item."""
+    ownership = str(item.get("ownership_state", "")).strip() or "deferred"
+    target_surface = (
+        surface_id
+        or str(item.get("legacy_surface", "")).strip()
+        or str(item.get("id", "")).strip()
+    )
+    detail = (
+        f"Requested surface {target_surface!r} is classified {ownership!r} "
+        f"in the parity ledger and cannot be started through the runtime "
+        f"lifecycle."
+    )
+    err = local_runtime_error(
+        LOCAL_RUNTIME_SERVICE_DEFERRED,
+        detail,
+        recoverable=True,
+        next_action=parity_ledger_next_action(
+            item, client_id=client_id, profile=profile,
+        ),
+        blocked_services=[target_surface] if target_surface else [],
+    )
+    err["error"]["ownership_state"] = ownership
+    if requested_mode is not None:
+        err["error"]["requested_mode"] = requested_mode
+    ledger_id = str(item.get("id", "")).strip()
+    if ledger_id:
+        err["error"]["parity_ledger_id"] = ledger_id
+    return err
+
+
+def classify_requested_surfaces(
+    model: dict[str, Any],
+    requested_ids: list[str] | None,
+) -> dict[str, Any]:
+    """Split requested service ids against the graph and the parity ledger.
+
+    Returns a dict with three keys:
+      * ``covered``: ids present in the service graph (safe to forward to
+        ``select_services``)
+      * ``deferred``: list of ``(surface_id, ledger_item)`` tuples for ids
+        whose parity ledger entry marks them deferred/bridge-only/external
+      * ``unknown``: ids that are neither in the graph nor in the ledger
+
+    An empty ``requested_ids`` list yields an empty classification -- callers
+    should interpret that as "no explicit filter; use the profile graph".
+    """
+    normalized = [str(s).strip() for s in (requested_ids or []) if str(s).strip()]
+    service_ids = {
+        str(service.get("id", "")).strip()
+        for service in model.get("services") or []
+    }
+    ledger_index = parity_ledger_by_surface(model)
+
+    covered: list[str] = []
+    deferred: list[tuple[str, dict[str, Any]]] = []
+    unknown: list[str] = []
+    for sid in normalized:
+        if sid in service_ids:
+            item = ledger_index.get(sid)
+            if item is not None and str(
+                item.get("ownership_state", "")
+            ).strip() in ("deferred", "bridge-only", "external"):
+                deferred.append((sid, item))
+            else:
+                covered.append(sid)
+            continue
+        item = ledger_index.get(sid)
+        if item is not None:
+            deferred.append((sid, item))
+            continue
+        unknown.append(sid)
+
+    return {
+        "requested": normalized,
+        "covered": covered,
+        "deferred": deferred,
+        "unknown": unknown,
+    }
+
+
+def collect_deferred_log_entries(
+    deferred: list[tuple[str, dict[str, Any]]],
+    *,
+    client_id: str | None = None,
+    profile: str | None = None,
+) -> list[dict[str, Any]]:
+    """Produce log-payload entries for deferred/bridge-only/external ids.
+
+    Matches ``collect_service_logs``' shape enough for ``print_service_logs_text``
+    to render a deferred note instead of tailing a log file that does not
+    exist (flows.md Flow 5).
+    """
+    entries: list[dict[str, Any]] = []
+    for surface_id, item in deferred:
+        entries.append(
+            {
+                "id": surface_id,
+                "kind": "deferred",
+                "log_file": "",
+                "present": False,
+                "lines": [],
+                "ownership_state": str(item.get("ownership_state", "")).strip()
+                or "deferred",
+                "deferred": True,
+                "next_action": parity_ledger_next_action(
+                    item, client_id=client_id, profile=profile,
+                ),
+            }
+        )
+    return entries
+
+
 def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
     repo_statuses: list[dict[str, Any]] = []
     for repo in model["repos"]:
@@ -2577,7 +2876,24 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
             "bootstrap_tasks": service_bootstrap_task_ids(service),
         }
         item.update(probe_service(model, service))
+        # WG-006: annotate with the parity-ledger ownership_state so
+        # observational surfaces (text renderers, json consumers, doctor)
+        # can show coverage classification without a second lookup.
+        item["ownership_state"] = ownership_state_for_service(
+            model, str(service.get("id", ""))
+        )
         service_statuses.append(item)
+
+    # WG-006: blocked_services lists declared services whose current probe
+    # did not report a running/ok state.  Status stays observational per
+    # backend.md Rule 3a -- we do NOT re-run bridges or bootstrap tasks;
+    # we just summarise what the graph currently looks like.
+    blocked_services: list[str] = [
+        str(entry.get("id", ""))
+        for entry in service_statuses
+        if entry.get("state") not in {"running", "ok"}
+        and str(entry.get("id", "")).strip()
+    ]
 
     log_statuses: list[dict[str, Any]] = []
     for log_item in model["logs"]:
@@ -2614,6 +2930,11 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
         "skills": skill_statuses,
         "tasks": task_statuses,
         "services": service_statuses,
+        "blocked_services": blocked_services,
         "logs": log_statuses,
         "checks": check_statuses,
+        "parity_ledger": {
+            "covered_surfaces": parity_ledger_covered_surfaces(model),
+            "deferred_surfaces": parity_ledger_deferred_surfaces(model),
+        },
     }

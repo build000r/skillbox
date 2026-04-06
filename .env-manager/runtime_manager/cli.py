@@ -994,10 +994,82 @@ def main() -> int:
                 print_service_actions_text(payload)
             return EXIT_OK
 
-        requested_services = select_services(model, getattr(args, "service", []))
+        # WG-006: for logs we must consult the parity ledger BEFORE
+        # select_services -- unknown-but-declared-deferred surfaces would
+        # otherwise raise "Unknown service id" and miss the
+        # LOCAL_RUNTIME_SERVICE_DEFERRED contract (shared.md:174-177,
+        # flows.md Flow 5).  We split requested ids into (covered, deferred,
+        # unknown); if any are deferred we short-circuit.
+        raw_service_ids = [
+            s for s in (getattr(args, "service", []) or []) if s
+        ]
+        if args.command == "logs" and raw_service_ids:
+            logs_classification = classify_requested_surfaces(
+                model, raw_service_ids
+            )
+            if logs_classification["deferred"]:
+                cid_for_logs = args.client[0] if args.client else "personal"
+                profile_for_logs = (
+                    args.profile[0]
+                    if args.profile
+                    else (local_runtime_active_profile(model) or "local-minimal")
+                )
+                surface_id, item = logs_classification["deferred"][0]
+                err_payload = build_local_runtime_service_deferred_error(
+                    item,
+                    client_id=cid_for_logs,
+                    profile=profile_for_logs,
+                    surface_id=surface_id,
+                )
+                if args.format == "json":
+                    emit_json(err_payload)
+                else:
+                    print(
+                        f"ERROR: {err_payload['error'].get('detail', '')}",
+                        file=sys.stderr,
+                    )
+                return EXIT_ERROR
+
+        requested_services = select_services(model, raw_service_ids)
 
         if args.command == "up":
-            # Validate bridge readiness before service start
+            # WG-006: route local-runtime profiles through workflows.run_up
+            # so the parity ledger, bridge reconciliation, mode validation,
+            # bootstrap tasks, and service start all run through a single
+            # contract-aware path.  Non-local profiles keep using the legacy
+            # inline flow to preserve existing lifecycle test coverage.
+            active_local_profile = local_runtime_active_profile(model)
+            if active_local_profile:
+                client_id_for_up = args.client[0] if args.client else "personal"
+                service_filter = [
+                    s for s in (getattr(args, "service", []) or []) if s
+                ]
+                up_exit, up_payload = run_up(
+                    model=model,
+                    client_id=client_id_for_up,
+                    profile=active_local_profile,
+                    requested_mode=resolved_mode,
+                    service_filter=service_filter,
+                    dry_run=args.dry_run,
+                    wait_seconds=max(0.0, float(args.wait_seconds)),
+                )
+                if args.format == "json":
+                    emit_json(up_payload)
+                else:
+                    if up_exit != EXIT_OK and "error" in up_payload:
+                        print(
+                            f"ERROR: {up_payload['error'].get('detail', '')}",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print_service_actions_text(up_payload)
+                return up_exit
+
+            # --- Legacy (non local-runtime) path ---------------------------
+            # WG-006 keeps the pre-existing inline up pipeline alive for
+            # profiles that are not part of the local_runtime_core_cutover
+            # contract.  Parity-ledger classification still runs above via
+            # the shared intercept.
             bridges = model.get("bridges") or []
             if bridges and not args.dry_run:
                 for bridge in bridges:
@@ -1026,21 +1098,16 @@ def main() -> int:
                 model,
                 bootstrap_tasks,
                 dry_run=args.dry_run,
+                mode=resolved_mode,
             )
-            # TODO(WG-005): thread `mode=resolved_mode` into start_services /
-            # resolve_services_for_start / run_tasks so the selected startup
-            # behavior (reuse|prod|fresh) actually drives container lifecycle
-            # decisions. WG-003 only validates + echoes the mode; it does not
-            # alter execution. Until WG-005 lands, the effective mode is
-            # always identical to the requested mode and no reuse/prod/fresh
-            # differentiation occurs downstream.
             service_results = start_services(
                 model,
                 services,
                 dry_run=args.dry_run,
                 wait_seconds=max(0.0, float(args.wait_seconds)),
+                mode=resolved_mode,
             )
-            effective_mode = resolved_mode  # WG-005 may override post-execution
+            effective_mode = resolved_mode
             payload = {
                 "dry_run": args.dry_run,
                 "requested_mode": resolved_mode,

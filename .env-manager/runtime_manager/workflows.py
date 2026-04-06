@@ -1397,6 +1397,35 @@ def run_up(
     """
     effective_mode = (requested_mode or "").strip() or "reuse"
 
+    # (0) WG-006: parity-ledger enforcement.  Before ANY mutation -- even
+    # bridge reconciliation -- reject direct --service requests that the
+    # parity ledger classifies as deferred/bridge-only/external.  This
+    # closes US-4 so operators cannot silently fall into an inconsistent
+    # state when asking for an uncovered surface (flows.md Flow 5,
+    # backend.md:159-169).
+    if service_filter:
+        classification = classify_requested_surfaces(model, service_filter)
+        if classification["deferred"]:
+            surface_id, item = classification["deferred"][0]
+            deferred_payload: dict[str, Any] = {
+                "client_id": client_id,
+                "profile": profile,
+                "requested_mode": requested_mode,
+                "effective_mode": effective_mode,
+                "bootstrap_tasks": [],
+                "services": [],
+            }
+            deferred_payload.update(
+                build_local_runtime_service_deferred_error(
+                    item,
+                    client_id=client_id,
+                    profile=profile,
+                    requested_mode=requested_mode,
+                    surface_id=surface_id,
+                )
+            )
+            return EXIT_ERROR, deferred_payload
+
     # (1) Reconcile bridge/env before any mutation (backend.md Rule 3 + 4).
     overlay_host_path = local_runtime_overlay_path(model, client_id)
     reconcile_result = reconcile_local_runtime_env(
@@ -1621,15 +1650,18 @@ def run_up(
         payload["error"]["requested_mode"] = requested_mode
         return EXIT_ERROR, payload
 
-    services_payload = [
-        {
-            "id": str(entry.get("id", "")),
-            "state": "running"
+    # Merge the shared.md:435-469 ``state`` field onto the raw start_services
+    # entries so legacy ``result``/``pid``/``log_file`` keys are preserved
+    # for existing lifecycle tests (WG-006).
+    services_payload = []
+    for entry in started:
+        enriched = dict(entry)
+        enriched["state"] = (
+            "running"
             if entry.get("result") in {"started", "already-running"}
-            else entry.get("result", "unknown"),
-        }
-        for entry in started
-    ]
+            else entry.get("result", "unknown")
+        )
+        services_payload.append(enriched)
     payload = {
         "client_id": client_id,
         "profile": profile,

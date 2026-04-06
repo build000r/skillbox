@@ -163,7 +163,31 @@ def print_status_text(status_payload: dict[str, Any]) -> None:
         bootstrap_task_ids = service.get("bootstrap_tasks") or []
         if bootstrap_task_ids:
             bootstrap_summary = f", bootstrap {', '.join(bootstrap_task_ids)}"
-        print(f"  - {service['id']}: {summary}{dependency_summary}{bootstrap_summary}")
+        # WG-006: ownership_state badge so operators can see at a glance
+        # whether a service is covered, bridge-only, deferred, or external
+        # per the parity ledger (shared.md:148-180, backend.md:77-90).
+        ownership_state = str(service.get("ownership_state") or "").strip()
+        badge = f" [{ownership_state}]" if ownership_state else ""
+        print(
+            f"  - {service['id']}{badge}: "
+            f"{summary}{dependency_summary}{bootstrap_summary}"
+        )
+
+    # WG-006: summarise parity ledger + blocked services at the end of
+    # the status block so the observational surface tells the operator
+    # what the overlay explicitly chose to defer and which covered
+    # services are currently blocked (backend.md Rule 3a).
+    parity_block = status_payload.get("parity_ledger") or {}
+    deferred = parity_block.get("deferred_surfaces") or []
+    if deferred:
+        print("deferred surfaces (parity ledger):")
+        for surface in deferred:
+            print(f"  - {surface}")
+    blocked_services = status_payload.get("blocked_services") or []
+    if blocked_services:
+        print("blocked services:")
+        for sid in blocked_services:
+            print(f"  - {sid}")
 
     print("logs:")
     for log_item in status_payload["logs"]:
@@ -209,6 +233,15 @@ def print_service_actions_text(payload: dict[str, Any]) -> None:
 
 def print_service_logs_text(payload: dict[str, Any]) -> None:
     for item in payload.get("services") or []:
+        # WG-006: render a dedicated deferred badge for non-covered surfaces
+        # so operators are not left staring at a missing log file.
+        if item.get("deferred"):
+            ownership = item.get("ownership_state") or "deferred"
+            print(f"[{item['id']}] (parity ledger: {ownership})")
+            next_action = item.get("next_action") or ""
+            if next_action:
+                print(f"  next action: {next_action}")
+            continue
         print(f"[{item['id']}] {item['log_file']}")
         if not item.get("present"):
             print("(missing)")
