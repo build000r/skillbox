@@ -147,6 +147,69 @@ Resume the last session without re-running the full pipeline:
 python3 .env-manager/manage.py focus --resume
 ```
 
+## Local Runtime Profiles
+
+Client overlays can declare **local runtime profiles** — namespaced service
+groups (`local-*`) that replace legacy bash orchestration with overlay-owned
+lifecycle commands.
+
+### Starter profile
+
+The `personal` overlay ships with `local-minimal`, covering `spaps`,
+`htma_server`, and `htma` with the legacy dependency chain preserved:
+
+```bash
+# Hydrate env, verify bridge, write focused context
+python3 .env-manager/manage.py focus personal --profile local-minimal --format json
+
+# Start covered services in dependency order
+python3 .env-manager/manage.py up --client personal --profile local-minimal
+
+# Inspect running state
+python3 .env-manager/manage.py status --client personal --profile local-minimal
+
+# Tail one service
+python3 .env-manager/manage.py logs --client personal --service spaps
+```
+
+### Env bridge
+
+Covered services depend on generated env files. The overlay declares a
+**bridge task** that wraps the legacy `sync.sh` compiler. `focus` checks
+bridge freshness (output mtime vs overlay mtime) and re-runs only when stale.
+
+Bridge-related error codes:
+
+| Code | When |
+|------|------|
+| `LOCAL_RUNTIME_ENV_BRIDGE_FAILED` | Bridge task exits non-zero |
+| `LOCAL_RUNTIME_ENV_OUTPUT_MISSING` | Generated env file absent after bridge |
+
+### Profile namespace
+
+Local profiles use the `local-*` prefix to avoid collisions with box-level
+profiles (`core`, `surfaces`, `connectors`). Selecting `--profile local-minimal`
+also activates `core` automatically.
+
+Available local profiles (declared in the personal overlay):
+
+| Profile | Coverage |
+|---------|----------|
+| `local-minimal` | `spaps`, `htma_server`, `htma` |
+| `local-core` | Expanded daily loop (future) |
+| `local-backend` | Backend services only (future) |
+| `local-frontend` | Frontend dev surfaces (future) |
+| `local-all` | All covered local services (future) |
+
+### Error codes
+
+| Code | When |
+|------|------|
+| `LOCAL_RUNTIME_PROFILE_UNKNOWN` | Requested profile has no declared services |
+| `LOCAL_RUNTIME_START_BLOCKED` | Dependency or readiness blocks launch |
+| `LOCAL_RUNTIME_SERVICE_DEFERRED` | Service not yet covered by the overlay |
+| `LOCAL_RUNTIME_MODE_UNSUPPORTED` | Start mode not declared for service |
+
 ## Pulse Daemon
 
 The pulse daemon watches the runtime graph on a fixed interval and reacts to
