@@ -786,7 +786,16 @@ def service_supports_lifecycle(
     service: dict[str, Any],
     model: dict[str, Any] | None = None,
 ) -> tuple[bool, str | None]:
-    if not str(service.get("command") or "").strip():
+    # A service is manageable if it has either a top-level `command` or a
+    # non-empty `commands` mapping (per-mode commands introduced by WG-001 for
+    # the local_runtime_core_cutover slice).  The actual mode selection is
+    # performed later in start_services / resolve_service_mode_command.
+    has_command = bool(str(service.get("command") or "").strip())
+    raw_commands = service.get("commands")
+    has_mode_commands = isinstance(raw_commands, dict) and any(
+        str(v).strip() for v in raw_commands.values()
+    )
+    if not has_command and not has_mode_commands:
         return False, "command missing"
     if str(service.get("kind") or "").strip() == "orchestration":
         return False, "orchestration services are status-only"
@@ -880,7 +889,14 @@ def order_service_ids(model: dict[str, Any], selected_ids: set[str]) -> list[str
 def resolve_services_for_start(
     model: dict[str, Any],
     requested_services: list[dict[str, Any]],
+    *,
+    mode: str | None = None,
 ) -> list[dict[str, Any]]:
+    # `mode` is accepted so WG-005 callers can thread the effective mode
+    # through the lifecycle pipeline; the dependency expansion + topo sort is
+    # mode-agnostic, but keeping the parameter here documents the data-flow
+    # and leaves room for mode-gated expansion (see WG-005 orchestration).
+    del mode  # currently unused but reserved for future mode-gated expansion
     requested_ids = [str(service["id"]) for service in requested_services]
     expanded_ids = expand_graph_ids(service_dependency_graph(model), requested_ids)
     ordered_ids = order_service_ids(model, expanded_ids)
@@ -1011,9 +1027,12 @@ def service_manager_state(model: dict[str, Any], service: dict[str, Any]) -> dic
 
 
 def resolve_runtime_command_cwd(model: dict[str, Any], item: dict[str, Any]) -> Path:
-    repo_id = str(item.get("repo") or "").strip()
+    # Overlay schema uses `repo_id`; legacy items use `repo`.  Accept either so
+    # local_runtime_core_cutover services (which only declare `repo_id`) still
+    # launch in the correct repo working directory.
+    repo_id = str(item.get("repo") or item.get("repo_id") or "").strip()
     repo = runtime_repo_map(model).get(repo_id)
-    if repo is not None:
+    if repo is not None and repo.get("host_path"):
         return Path(str(repo["host_path"]))
 
     host_path = str(item.get("host_path") or "").strip()
@@ -1895,12 +1914,107 @@ def ensure_required_env_files_ready(env_files: list[dict[str, Any]]) -> None:
         raise RuntimeError(f"Required env files are not ready: {', '.join(unresolved)}")
 
 
+# ---------------------------------------------------------------------------
+# WG-005: mode-aware up orchestration helpers for local-core
+# ---------------------------------------------------------------------------
+#
+# These helpers live alongside start_services / run_tasks and are the
+# lifecycle-side companion to the WG-004 focus reconciliation surface.  They
+# do NOT re-run bridges or env reconciliation themselves; the caller
+# (workflows.run_up) is responsible for invoking reconcile_local_runtime_env
+# first and bailing out on any blocked result.  These helpers only:
+#
+#   * resolve the per-mode command for a service (flows.md Flow 2)
+#   * validate that EVERY requested service supports the effective mode
+#     before any mutation (backend.md Rule 2, lines 25-35)
+#   * build the deterministic topological launch plan with bootstrap tasks
+#     interleaved in declared order (shared.md:148-158)
+#
+# The WG-004 helpers (reconcile_local_runtime_env, local_runtime_focus_payload,
+# select_local_runtime_*, validate_env_file_target_paths, bridges_need_rerun,
+# local_runtime_overlay_path) are intentionally left untouched above.
+
+
+def service_has_mode_commands(service: dict[str, Any]) -> bool:
+    raw = service.get("commands")
+    return isinstance(raw, dict) and any(str(v).strip() for v in raw.values())
+
+
+def resolve_service_mode_command(
+    service: dict[str, Any],
+    mode: str | None,
+) -> str | None:
+    """Return the command string for the effective mode, or None.
+
+    Local-runtime services declare a ``commands`` mapping keyed by mode
+    (``reuse`` / ``prod`` / ``fresh``).  When the caller threads a mode we
+    return that specific command; otherwise we fall back to the reuse command
+    so the existing cli.py up path keeps working for services that only
+    declare mode commands.  Returns ``None`` when the service only has a
+    top-level ``command`` (nothing to resolve).
+    """
+    raw = service.get("commands")
+    if not isinstance(raw, dict) or not raw:
+        return None
+
+    wanted = (mode or "").strip() or "reuse"
+    command = raw.get(wanted)
+    if command is None and wanted != "reuse":
+        return None
+    if command is None:
+        # fall back: pick the first non-empty declared command
+        for value in raw.values():
+            text = str(value or "").strip()
+            if text:
+                return text
+        return None
+    text = str(command or "").strip()
+    return text or None
+
+
+def service_supports_mode(service: dict[str, Any], mode: str) -> bool:
+    """Return True if the service explicitly declares support for ``mode``.
+
+    A service supports a mode when its ``commands`` mapping has a non-empty
+    entry for the mode (per backend.md Rule 2).  Legacy services that only
+    declare a top-level ``command`` are considered mode-agnostic and thus
+    support every mode.
+    """
+    if not service_has_mode_commands(service):
+        # legacy top-level command: mode is orthogonal, accept any mode
+        return bool(str(service.get("command") or "").strip())
+    command = resolve_service_mode_command(service, mode)
+    return bool(command)
+
+
+def validate_services_support_mode(
+    services: list[dict[str, Any]],
+    mode: str,
+) -> list[str]:
+    """Return the ids of services that do NOT support the effective mode.
+
+    Used pre-mutation by run_up (backend.md:33-35): if any requested service
+    lacks a command for the effective mode the entire request is rejected
+    with LOCAL_RUNTIME_MODE_UNSUPPORTED and no state is mutated.
+    """
+    unsupported: list[str] = []
+    for service in services:
+        if not service_supports_mode(service, mode):
+            unsupported.append(str(service.get("id", "")).strip() or "(missing id)")
+    return unsupported
+
+
 def run_tasks(
     model: dict[str, Any],
     tasks: list[dict[str, Any]],
     *,
     dry_run: bool,
+    mode: str | None = None,
 ) -> list[dict[str, Any]]:
+    # Bootstrap tasks are currently mode-agnostic (bridge and DB bootstrap use
+    # a single command); the parameter is threaded here so WG-005 lifecycle
+    # callers can pass the resolved mode without a second signature.
+    del mode  # reserved for future mode-gated bootstrap commands
     results: list[dict[str, Any]] = []
     for task in tasks:
         paths = task_paths(model, task)
@@ -1977,8 +2091,10 @@ def start_services(
     *,
     dry_run: bool,
     wait_seconds: float,
+    mode: str | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
+    effective_mode = (mode or "").strip() or None
     for service in services:
         manageable, reason = service_supports_lifecycle(service, model)
         paths = service_paths(model, service)
@@ -1998,8 +2114,20 @@ def start_services(
             results.append(result | {"result": "already-running", "pid": pid})
             continue
 
-        command, env = translated_runtime_command(model, service)
-        cwd = resolve_runtime_command_cwd(model, service)
+        # Resolve the per-mode command for local-runtime services.  Services
+        # that only declare a `commands` mapping (no top-level `command`) are
+        # the local_runtime_core_cutover shape; pick the effective mode (or
+        # fall back to the reuse command when the caller did not thread one).
+        launch_service = service
+        mode_command = resolve_service_mode_command(service, effective_mode)
+        if mode_command is not None:
+            launch_service = dict(service)
+            launch_service["command"] = mode_command
+            if effective_mode is not None:
+                result["mode"] = effective_mode
+
+        command, env = translated_runtime_command(model, launch_service)
+        cwd = resolve_runtime_command_cwd(model, launch_service)
         result["command"] = command
         result["cwd"] = str(cwd)
 

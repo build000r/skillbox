@@ -1271,9 +1271,52 @@ def run_focus(
         for lg in live.get("logs", [])
     )
 
-    # Build local_runtime section if bridges are present
+    # Build local_runtime section via WG-004 reconciliation helpers ------------
+    # run_focus used to emit an ad-hoc local_runtime block derived solely from
+    # bridge outputs.  WG-005 wires it into the shared reconciliation surface
+    # (reconcile_local_runtime_env + local_runtime_focus_payload) so focus and
+    # up both agree on the readiness decision and emit the same US-1 shape.
     local_runtime_section: dict[str, Any] | None = None
-    if bridges:
+    active_local_profile = local_runtime_active_profile(model)
+    if active_local_profile:
+        try:
+            overlay_host_path = local_runtime_overlay_path(model, cid)
+            reconcile_result = reconcile_local_runtime_env(
+                model,
+                active_local_profile,
+                overlay_path=overlay_host_path,
+                dry_run=False,
+            )
+            focus_payload = local_runtime_focus_payload(
+                model,
+                reconcile_result,
+                client_id=cid,
+            )
+            local_runtime_section = focus_payload.get("local_runtime")
+            if reconcile_result.get("status") == "blocked":
+                step(
+                    "local-runtime-reconcile",
+                    "fail",
+                    {
+                        "profile": active_local_profile,
+                        "error": reconcile_result.get("error"),
+                    },
+                )
+            else:
+                step(
+                    "local-runtime-reconcile",
+                    "ok",
+                    {
+                        "profile": active_local_profile,
+                        "actions": reconcile_result.get("actions"),
+                    },
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            step("local-runtime-reconcile", "fail", {"error": str(exc)})
+    elif bridges:
+        # No active local-* profile but bridges are declared (e.g. tests that
+        # run focus without an explicit profile).  Fall back to the legacy
+        # ad-hoc block so the output shape stays backwards compatible.
         bridge_states_focus = []
         for bridge in bridges:
             state = bridge_outputs_state(bridge)
@@ -1319,3 +1362,280 @@ def run_focus(
             print(f"  Errors:    {error_count} recent error(s) in logs")
 
     return EXIT_DRIFT if has_fail else EXIT_OK
+
+
+def run_up(
+    *,
+    model: dict[str, Any],
+    client_id: str,
+    profile: str,
+    requested_mode: str,
+    service_filter: list[str] | None = None,
+    dry_run: bool = False,
+    wait_seconds: float = 0.0,
+) -> tuple[int, dict[str, Any]]:
+    """Mode-aware up orchestration for local_runtime_core_cutover (WG-005).
+
+    Implements the contract from shared.md:428-469 and backend.md:25-35:
+
+      1. Reconcile bridge/env readiness via the WG-004 helper.  Any blocked
+         result is returned as-is with the LOCAL_RUNTIME_* code that
+         reconciliation produced -- NO service mutation happens.
+      2. Resolve the requested service graph (topologically sorted, with
+         every declared dependency included).
+      3. Validate the effective mode against every requested service BEFORE
+         any mutation.  Mixed support rejects the whole request with
+         LOCAL_RUNTIME_MODE_UNSUPPORTED (backend.md:33-35, Rule 2).
+      4. Run bootstrap tasks in declared dependency order.
+      5. Start services via their mode-specific declared commands, gating
+         each downstream service on the upstream health check.  Any failure
+         returns LOCAL_RUNTIME_START_BLOCKED with the full list of services
+         that never started.
+
+    Returns a ``(exit_code, payload)`` tuple.  The payload shape matches
+    shared.md:435-469 on both happy and blocked paths.
+    """
+    effective_mode = (requested_mode or "").strip() or "reuse"
+
+    # (1) Reconcile bridge/env before any mutation (backend.md Rule 3 + 4).
+    overlay_host_path = local_runtime_overlay_path(model, client_id)
+    reconcile_result = reconcile_local_runtime_env(
+        model,
+        profile,
+        overlay_path=overlay_host_path,
+        dry_run=dry_run,
+    )
+    if reconcile_result.get("status") == "blocked":
+        payload: dict[str, Any] = {
+            "client_id": client_id,
+            "profile": profile,
+            "requested_mode": requested_mode,
+            "effective_mode": effective_mode,
+            "bootstrap_tasks": [],
+            "services": [],
+        }
+        err = reconcile_result.get("error") or {}
+        payload["error"] = dict(err)
+        payload["error"].setdefault("requested_mode", requested_mode)
+        payload["error"].setdefault("blocked_services", [])
+        return EXIT_ERROR, payload
+
+    # (2) Resolve the requested service graph.
+    filter_ids = [s for s in (service_filter or []) if s]
+    if filter_ids:
+        requested = select_services(model, filter_ids)
+    else:
+        requested = select_local_runtime_services(model, profile)
+    ordered_services = resolve_services_for_start(
+        model, requested, mode=effective_mode,
+    )
+
+    if not ordered_services:
+        payload = {
+            "client_id": client_id,
+            "profile": profile,
+            "requested_mode": requested_mode,
+            "effective_mode": effective_mode,
+            "bootstrap_tasks": [],
+            "services": [],
+        }
+        payload.update(local_runtime_error(
+            LOCAL_RUNTIME_PROFILE_UNKNOWN,
+            f"Profile {profile!r} has no declared local-runtime services.",
+            recoverable=False,
+        ))
+        payload["error"]["requested_mode"] = requested_mode
+        return EXIT_ERROR, payload
+
+    # (3) Pre-mutation mode validation (backend.md Rule 2 / shared.md US-2).
+    unsupported = validate_services_support_mode(ordered_services, effective_mode)
+    if unsupported:
+        payload = {
+            "client_id": client_id,
+            "profile": profile,
+            "requested_mode": requested_mode,
+            "effective_mode": effective_mode,
+            "bootstrap_tasks": [],
+            "services": [],
+        }
+        payload.update(local_runtime_error(
+            LOCAL_RUNTIME_MODE_UNSUPPORTED,
+            (
+                f"Mode {effective_mode!r} is not supported by all requested "
+                f"services: {', '.join(unsupported)}"
+            ),
+            recoverable=True,
+            blocked_services=unsupported,
+            next_action=(
+                f"Re-run with a mode declared by every service in {profile}."
+            ),
+        ))
+        payload["error"]["requested_mode"] = requested_mode
+        return EXIT_ERROR, payload
+
+    # (4) Bootstrap tasks (env bridge + approval-feedback DB, etc.) in declared
+    #     dependency order (shared.md:116-137, flows.md:69-89).
+    bootstrap_task_specs = resolve_tasks_for_services(model, ordered_services)
+    bootstrap_results: list[dict[str, Any]] = []
+    if bootstrap_task_specs and not dry_run:
+        try:
+            ensure_required_env_files_ready(
+                select_env_files_for_tasks(model, bootstrap_task_specs)
+                + select_env_files_for_services(model, ordered_services)
+            )
+        except RuntimeError as exc:
+            payload = {
+                "client_id": client_id,
+                "profile": profile,
+                "requested_mode": requested_mode,
+                "effective_mode": effective_mode,
+                "bootstrap_tasks": [],
+                "services": [],
+            }
+            payload.update(local_runtime_error(
+                LOCAL_RUNTIME_ENV_OUTPUT_MISSING,
+                str(exc),
+                recoverable=True,
+                blocked_services=[str(s.get("id", "")) for s in ordered_services],
+                next_action=(
+                    f"manage.py focus --client {client_id} --profile {profile}"
+                ),
+            ))
+            payload["error"]["requested_mode"] = requested_mode
+            return EXIT_ERROR, payload
+
+    try:
+        bootstrap_results = run_tasks(
+            model,
+            bootstrap_task_specs,
+            dry_run=dry_run,
+            mode=effective_mode,
+        )
+    except RuntimeError as exc:
+        payload = {
+            "client_id": client_id,
+            "profile": profile,
+            "requested_mode": requested_mode,
+            "effective_mode": effective_mode,
+            "bootstrap_tasks": [
+                {"id": str(t.get("id", "")), "status": "planned"}
+                for t in bootstrap_task_specs
+            ],
+            "services": [],
+        }
+        payload.update(local_runtime_error(
+            LOCAL_RUNTIME_START_BLOCKED,
+            f"Bootstrap task failed: {exc}",
+            recoverable=True,
+            blocked_services=[str(s.get("id", "")) for s in ordered_services],
+            next_action=(
+                f"manage.py status --client {client_id} --profile {profile}"
+            ),
+        ))
+        payload["error"]["requested_mode"] = requested_mode
+        return EXIT_ERROR, payload
+
+    bootstrap_summary = [
+        {
+            "id": str(entry.get("id", "")),
+            "status": "ok"
+            if entry.get("result") in {"ready", "completed", "dry-run"}
+            else "pending",
+        }
+        for entry in bootstrap_results
+    ]
+
+    # (5) Start the services in topological order.  Dry-run short-circuits
+    #     before any mutation and returns the planned launch order.
+    if dry_run:
+        planned_services = []
+        for service in ordered_services:
+            svc_id = str(service.get("id", ""))
+            mode_command = resolve_service_mode_command(service, effective_mode)
+            planned_services.append({
+                "id": svc_id,
+                "state": "planned",
+                "mode": effective_mode,
+                "command": mode_command,
+            })
+        payload = {
+            "client_id": client_id,
+            "profile": profile,
+            "requested_mode": requested_mode,
+            "effective_mode": effective_mode,
+            "dry_run": True,
+            "bootstrap_tasks": bootstrap_summary
+            or [
+                {"id": str(t.get("id", "")), "status": "planned"}
+                for t in bootstrap_task_specs
+            ],
+            "services": planned_services,
+        }
+        return EXIT_OK, payload
+
+    started: list[dict[str, Any]] = []
+    try:
+        started = start_services(
+            model,
+            ordered_services,
+            dry_run=False,
+            wait_seconds=wait_seconds,
+            mode=effective_mode,
+        )
+    except RuntimeError as exc:
+        started_ids = {
+            str(entry.get("id", ""))
+            for entry in started
+            if entry.get("result") in {"started", "already-running"}
+        }
+        blocked = [
+            str(service.get("id", ""))
+            for service in ordered_services
+            if str(service.get("id", "")) not in started_ids
+        ]
+        payload = {
+            "client_id": client_id,
+            "profile": profile,
+            "requested_mode": requested_mode,
+            "effective_mode": effective_mode,
+            "bootstrap_tasks": bootstrap_summary,
+            "services": [
+                {
+                    "id": str(entry.get("id", "")),
+                    "state": "running"
+                    if entry.get("result") in {"started", "already-running"}
+                    else "blocked",
+                }
+                for entry in started
+            ],
+        }
+        payload.update(local_runtime_error(
+            LOCAL_RUNTIME_START_BLOCKED,
+            str(exc),
+            recoverable=True,
+            blocked_services=blocked,
+            next_action=(
+                f"manage.py status --client {client_id} --profile {profile}"
+            ),
+        ))
+        payload["error"]["requested_mode"] = requested_mode
+        return EXIT_ERROR, payload
+
+    services_payload = [
+        {
+            "id": str(entry.get("id", "")),
+            "state": "running"
+            if entry.get("result") in {"started", "already-running"}
+            else entry.get("result", "unknown"),
+        }
+        for entry in started
+    ]
+    payload = {
+        "client_id": client_id,
+        "profile": profile,
+        "requested_mode": requested_mode,
+        "effective_mode": effective_mode,
+        "bootstrap_tasks": bootstrap_summary,
+        "services": services_payload,
+    }
+    return EXIT_OK, payload
