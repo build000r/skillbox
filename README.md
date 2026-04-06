@@ -149,34 +149,78 @@ python3 .env-manager/manage.py focus --resume
 
 ## Local Runtime Profiles
 
-Client overlays can declare **local runtime profiles** — namespaced service
-groups (`local-*`) that replace legacy bash orchestration with overlay-owned
-lifecycle commands.
+Client overlays declare **local runtime profiles** — namespaced service groups
+(`local-*`) that own the daily local development loop directly, without
+shelling out to legacy bash orchestration.
 
-### Starter profile
+### Canonical daily path
 
-The `personal` overlay ships with `local-minimal`, covering `spaps`,
-`htma_server`, and `htma` with the legacy dependency chain preserved:
+`local-core` is the canonical daily profile in the `personal` overlay. It
+covers the full six-service loop that used to live behind `../../.env-manager`
+`project.sh`. The runtime owns env hydration, bootstrap, start order, health
+waits, status, logs, and teardown for every service in the profile.
 
 ```bash
-# Hydrate env, verify bridge, write focused context
-python3 .env-manager/manage.py focus personal --profile local-minimal --format json
+# Hydrate env, run bridge, write enriched context for local-core
+python3 .env-manager/manage.py focus personal --profile local-core --format json
 
-# Start covered services in dependency order
-python3 .env-manager/manage.py up --client personal --profile local-minimal
+# Start the full core loop in dependency order, in reuse mode
+python3 .env-manager/manage.py up --client personal --profile local-core --mode reuse
 
-# Inspect running state
-python3 .env-manager/manage.py status --client personal --profile local-minimal
+# Same, but use each repo's prod-backed local path where it differs
+python3 .env-manager/manage.py up --client personal --profile local-core --mode prod
+
+# Same, but use each repo's reset/fresh-restore path
+python3 .env-manager/manage.py up --client personal --profile local-core --mode fresh
+
+# Inspect state for the active profile
+python3 .env-manager/manage.py status --client personal --profile local-core
 
 # Tail one service
-python3 .env-manager/manage.py logs --client personal --service spaps
+python3 .env-manager/manage.py logs --client personal --service htma_server
 ```
+
+### Covered services
+
+`local-core` covers these six services. Repo roots are resolved under
+`${SKILLBOX_MONOSERVER_ROOT}` and each repo provides its own start command;
+the overlay declares dependency order, env targets, and health probes.
+
+| Service | Repo root | Depends on | Health |
+|---------|-----------|------------|--------|
+| `spaps` | `sweet-potato` | — | `http://localhost:3301/health` |
+| `htma_server` | `htma_server` | `spaps` | `http://localhost:8000/health` |
+| `ingredient_server` | `ingredient_server` | `spaps` | `http://localhost:8001/health` |
+| `approval_feedback_api` | `unclawg/services/approval_feedback_api` | `spaps` | `http://localhost:8010/health` |
+| `cfo` | `cfo` | `spaps` | TCP probe on port `8050` |
+| `htma` | `htma` | `spaps`, `htma_server` | `http://localhost:5173` |
+
+All six support `--mode reuse`, `--mode prod`, and `--mode fresh`. The runtime
+validates the selected mode against each service before starting anything and
+returns `LOCAL_RUNTIME_MODE_UNSUPPORTED` if a requested service cannot honor
+it.
+
+### Start modes
+
+| Mode | Meaning |
+|------|---------|
+| `reuse` | Reuse healthy local dependencies and existing local DB state where the repo supports it |
+| `prod` | Use the repo's prod-backed local path when that path differs from the default |
+| `fresh` | Use the repo's reset or fresh-restore path when the repo supports it |
+
+`--mode` replaces the legacy `db=reuse|prod|fresh` flag from `project.sh up`.
 
 ### Env bridge
 
-Covered services depend on generated env files. The overlay declares a
-**bridge task** that wraps the legacy `sync.sh` compiler. `focus` checks
-bridge freshness (output mtime vs overlay mtime) and re-runs only when stale.
+Covered services consume generated env files. The overlay declares a
+`local-core-bridge` task that wraps the legacy `../../.env-manager/sync.sh`
+compiler as an explicit, temporary seam. `focus` checks bridge freshness
+(output mtime vs overlay mtime) and re-runs only when stale. Direct lifecycle
+requests against `sync.sh` return `LOCAL_RUNTIME_SERVICE_DEFERRED`; failures
+inside a covered workflow surface as `LOCAL_RUNTIME_ENV_BRIDGE_FAILED`.
+
+`sync.sh` is a bridge seam, not a supported surface. A later slice will
+replace it with native env layering.
 
 Bridge-related error codes:
 
@@ -185,21 +229,72 @@ Bridge-related error codes:
 | `LOCAL_RUNTIME_ENV_BRIDGE_FAILED` | Bridge task exits non-zero |
 | `LOCAL_RUNTIME_ENV_OUTPUT_MISSING` | Generated env file absent after bridge |
 
+### local-minimal subset
+
+`local-minimal` is a strict subset of `local-core` covering `spaps`,
+`htma_server`, and `htma`. It shares the same overlay declarations, the same
+`--mode` contract, and runs off its own `local-minimal-bridge` (which compiles
+the same targets minus the three the subset does not need). Use it when you
+only need the frontend slice plus its server dependency.
+
+```bash
+python3 .env-manager/manage.py up --client personal --profile local-minimal --mode reuse
+```
+
 ### Profile namespace
 
 Local profiles use the `local-*` prefix to avoid collisions with box-level
-profiles (`core`, `surfaces`, `connectors`). Selecting `--profile local-minimal`
+profiles (`core`, `surfaces`, `connectors`). Selecting any `local-*` profile
 also activates `core` automatically.
 
-Available local profiles (declared in the personal overlay):
+Profiles declared in the personal overlay:
 
 | Profile | Coverage |
 |---------|----------|
-| `local-minimal` | `spaps`, `htma_server`, `htma` |
-| `local-core` | Expanded daily loop (future) |
-| `local-backend` | Backend services only (future) |
-| `local-frontend` | Frontend dev surfaces (future) |
-| `local-all` | All covered local services (future) |
+| `local-core` | Full daily loop: `spaps`, `htma_server`, `ingredient_server`, `approval_feedback_api`, `cfo`, `htma` |
+| `local-minimal` | Subset of `local-core`: `spaps`, `htma_server`, `htma` |
+| `local-backend` | Backend subset of `local-core` |
+| `local-frontend` | Frontend subset of `local-core` |
+| `local-openclaw` | Unclawg-oriented subset of `local-core` |
+| `local-all` | Union of all covered local-runtime services |
+
+The runtime resolves each profile by filtering the same covered-service set;
+it does not introduce new services outside `local-core`. Any legacy target
+that is not yet native is recorded in the parity ledger (see below) and
+rejected at request time with `LOCAL_RUNTIME_SERVICE_DEFERRED`.
+
+### Parity ledger
+
+Everything from the old `.env-manager` bash surface that `local-core` does not
+cover natively is declared in the overlay's `parity_ledger` section. The
+runtime enforces that ledger directly: `up`, `status`, `logs`, and `doctor`
+all read it, and any request for a non-covered surface fails with a stable
+error code instead of a silent no-op.
+
+Each entry records:
+
+- `legacy_surface` — the original `sync.sh` / `project.sh` name
+- `surface_type` — `service`, `env_target`, `helper`, or `flag`
+- `action` — `declare`, `bridge`, `build`, or `drop`
+- `ownership_state` — `covered`, `bridge-only`, `deferred`, or `external`
+- `intended_profiles` — which future `local-*` profile should own it
+- `bridge_dependency` — which bridge, if any, the surface still runs through
+- `request_error` — the error code returned for direct lifecycle requests
+
+Current ownership states for legacy surfaces on the `personal` overlay:
+
+| State | Examples |
+|-------|----------|
+| `covered` | `spaps`, `htma_server`, `ingredient_server`, `approval_feedback_api`, `cfo`, `htma`, `db=reuse\|prod\|fresh` |
+| `bridge-only` | `sync.sh` env compilation |
+| `deferred` | `buildooor`, `cca-website`, `unclawg`, `voice-to-text`, `swimmers` (legacy personal service), `videos`, `cfo-discord-bot`, `skill-control-plane`, `approval_feedback_expiry_worker`, `watch`, `mobile`/`tailnet`, `hot_reload*` |
+| `external` | `opensource/skills`, `openclaw_health*` |
+
+Deferred surfaces are acknowledged, not supported. Requesting one through the
+runtime returns `LOCAL_RUNTIME_SERVICE_DEFERRED`; adding one requires a
+follow-on slice that moves it from `deferred` to `covered`. Drift between the
+declared ledger and the covered set surfaces as `LOCAL_RUNTIME_COVERAGE_GAP`
+in `status` and `doctor`.
 
 ### Error codes
 
@@ -207,8 +302,9 @@ Available local profiles (declared in the personal overlay):
 |------|------|
 | `LOCAL_RUNTIME_PROFILE_UNKNOWN` | Requested profile has no declared services |
 | `LOCAL_RUNTIME_START_BLOCKED` | Dependency or readiness blocks launch |
-| `LOCAL_RUNTIME_SERVICE_DEFERRED` | Service not yet covered by the overlay |
-| `LOCAL_RUNTIME_MODE_UNSUPPORTED` | Start mode not declared for service |
+| `LOCAL_RUNTIME_SERVICE_DEFERRED` | Requested surface is in the parity ledger but not covered |
+| `LOCAL_RUNTIME_MODE_UNSUPPORTED` | Start mode not declared for a requested service |
+| `LOCAL_RUNTIME_COVERAGE_GAP` | Declared ledger and covered set have drifted |
 
 ## Pulse Daemon
 
