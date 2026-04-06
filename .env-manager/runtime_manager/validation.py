@@ -2,6 +2,26 @@ from __future__ import annotations
 
 from .shared import *
 
+# Stable error codes from the local_runtime_core_cutover shared contract
+# (shared.md:245-254). Re-exported here so consumers that already pull in
+# the validation module get the full set without also importing
+# scripts.lib.runtime_model.
+from lib.runtime_model import (  # noqa: E402
+    LOCAL_RUNTIME_ENV_BRIDGE_FAILED,
+    LOCAL_RUNTIME_ENV_OUTPUT_MISSING,
+    LOCAL_RUNTIME_PROFILE_UNKNOWN,
+    LOCAL_RUNTIME_START_BLOCKED,
+    LOCAL_RUNTIME_SERVICE_DEFERRED,
+    LOCAL_RUNTIME_MODE_UNSUPPORTED,
+    LOCAL_RUNTIME_COVERAGE_GAP,
+    LOCAL_RUNTIME_ERROR_CODES,
+    LOCAL_RUNTIME_START_MODES,
+    PARITY_LEDGER_ACTIONS,
+    PARITY_OWNERSHIP_STATES,
+    CANONICAL_RUNTIME_RECORDS,
+    LocalRuntimeContractError,
+)
+
 def normalize_active_profiles(raw_profiles: list[str] | None) -> set[str]:
     active_profiles = {value.strip() for value in raw_profiles or [] if value and value.strip()}
     active_profiles.add("core")
@@ -1327,6 +1347,136 @@ def validate_connector_contract(model: dict[str, Any]) -> list[CheckResult]:
             details={
                 "box_superset": superset,
                 "clients": client_contracts,
+            },
+        )
+    ]
+
+
+def validate_parity_ledger(model: dict[str, Any]) -> list[CheckResult]:
+    """Detect drift between the runtime graph and the declared parity ledger.
+
+    Implements the `doctor` drift surface from shared.md US-4 and backend.md
+    Business Rule 6. Issues are reported with the stable
+    ``LOCAL_RUNTIME_COVERAGE_GAP`` code so downstream CLI formatters can map
+    them back to the shared contract.
+
+    Drift conditions flagged here:
+
+    * ``bridge_dependency`` references an id that is not a declared bridge
+      (shared.md:279-281 restricts this field to ``legacy_env_bridge.id``
+      and explicitly forbids ``bootstrap_task.id``).
+    * ``action`` or ``ownership_state`` uses an unknown value.
+    * A parity-ledger item is marked ``ownership_state == "covered"`` but no
+      managed_service with the same id exists in the runtime graph.
+    * A parity-ledger item is marked ``ownership_state == "deferred"`` or
+      ``"bridge-only"`` but a managed_service with the same id is declared
+      (runtime claims coverage the ledger denies).
+    * ``request_error`` is set to a value outside the canonical seven.
+    """
+    ledger = model.get("parity_ledger") or []
+    if not ledger:
+        return [
+            CheckResult(
+                status="pass",
+                code="parity-ledger",
+                message="no parity-ledger items declared",
+                details={"deferred_surfaces": [], "covered_services": []},
+            )
+        ]
+
+    bridge_ids = {
+        str(bridge.get("id", "")).strip()
+        for bridge in model.get("bridges") or []
+        if str(bridge.get("id", "")).strip()
+    }
+    task_ids = {
+        str(task.get("id", "")).strip()
+        for task in model.get("tasks") or []
+        if str(task.get("id", "")).strip()
+    }
+    service_ids = {
+        str(service.get("id", "")).strip()
+        for service in model.get("services") or []
+        if str(service.get("id", "")).strip()
+    }
+
+    issues: list[str] = []
+    covered_services: list[str] = []
+    deferred_surfaces: list[str] = []
+
+    for item in ledger:
+        item_id = str(item.get("id", "")).strip() or "(missing id)"
+        action = str(item.get("action", "")).strip()
+        ownership_state = str(item.get("ownership_state", "")).strip()
+        bridge_dependency = item.get("bridge_dependency")
+        request_error = str(item.get("request_error", "")).strip()
+        surface = str(item.get("legacy_surface", "")).strip() or item_id
+
+        if action and action not in PARITY_LEDGER_ACTIONS:
+            issues.append(
+                f"parity_ledger {item_id}: unsupported action {action!r}"
+            )
+        if ownership_state and ownership_state not in PARITY_OWNERSHIP_STATES:
+            issues.append(
+                f"parity_ledger {item_id}: unsupported ownership_state {ownership_state!r}"
+            )
+        if request_error and request_error not in LOCAL_RUNTIME_ERROR_CODES:
+            issues.append(
+                f"parity_ledger {item_id}: request_error {request_error!r} is not one of "
+                f"the stable error codes"
+            )
+
+        if bridge_dependency is not None and str(bridge_dependency).strip():
+            dep_id = str(bridge_dependency).strip()
+            if dep_id in task_ids and dep_id not in bridge_ids:
+                issues.append(
+                    f"parity_ledger {item_id}: bridge_dependency {dep_id!r} refers to a "
+                    f"bootstrap_task id; only legacy_env_bridge ids are allowed"
+                )
+            elif dep_id not in bridge_ids:
+                issues.append(
+                    f"parity_ledger {item_id}: bridge_dependency {dep_id!r} is not a "
+                    f"declared legacy_env_bridge"
+                )
+
+        if ownership_state == "covered":
+            covered_services.append(surface)
+            if item_id and service_ids and item_id not in service_ids and surface not in service_ids:
+                issues.append(
+                    f"parity_ledger {item_id}: ownership_state is 'covered' but no "
+                    f"managed_service with that id is declared"
+                )
+        elif ownership_state in ("deferred", "bridge-only"):
+            deferred_surfaces.append(surface)
+            if item_id and item_id in service_ids:
+                issues.append(
+                    f"parity_ledger {item_id}: ownership_state is {ownership_state!r} "
+                    f"but a managed_service with that id is declared"
+                )
+
+    if issues:
+        return [
+            CheckResult(
+                status="fail",
+                code=LOCAL_RUNTIME_COVERAGE_GAP,
+                message="parity ledger drifts from the declared runtime graph",
+                details={
+                    "error_code": LOCAL_RUNTIME_COVERAGE_GAP,
+                    "issues": issues,
+                    "covered_services": sorted(set(covered_services)),
+                    "deferred_surfaces": sorted(set(deferred_surfaces)),
+                },
+            )
+        ]
+
+    return [
+        CheckResult(
+            status="pass",
+            code="parity-ledger",
+            message="parity ledger matches the declared runtime graph",
+            details={
+                "covered_services": sorted(set(covered_services)),
+                "deferred_surfaces": sorted(set(deferred_surfaces)),
             },
         )
     ]

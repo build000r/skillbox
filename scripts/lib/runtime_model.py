@@ -55,6 +55,108 @@ PLACEHOLDER_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
 RESERVED_TOP_LEVEL_RUNTIME_KEYS = {"version", "selection", "core", "clients"}
 
 
+# ---------------------------------------------------------------------------
+# local_runtime_core_cutover canonical contract
+# ---------------------------------------------------------------------------
+#
+# The records below match `clients/personal/plans/released/
+# local_runtime_core_cutover/schema.mmd` and shared.md:256-281. They are the
+# canonical shape downstream WG nodes (focus, up, doctor, parity ledger)
+# agree on. The runtime manifest / client overlays are free to use nested
+# YAML shapes; load time flattens them into these flat records so callers do
+# not have to special-case overlay vs. runtime-manifest shapes.
+
+LOCAL_RUNTIME_ENV_BRIDGE_FAILED = "LOCAL_RUNTIME_ENV_BRIDGE_FAILED"
+LOCAL_RUNTIME_ENV_OUTPUT_MISSING = "LOCAL_RUNTIME_ENV_OUTPUT_MISSING"
+LOCAL_RUNTIME_PROFILE_UNKNOWN = "LOCAL_RUNTIME_PROFILE_UNKNOWN"
+LOCAL_RUNTIME_START_BLOCKED = "LOCAL_RUNTIME_START_BLOCKED"
+LOCAL_RUNTIME_SERVICE_DEFERRED = "LOCAL_RUNTIME_SERVICE_DEFERRED"
+LOCAL_RUNTIME_MODE_UNSUPPORTED = "LOCAL_RUNTIME_MODE_UNSUPPORTED"
+LOCAL_RUNTIME_COVERAGE_GAP = "LOCAL_RUNTIME_COVERAGE_GAP"
+
+LOCAL_RUNTIME_ERROR_CODES: frozenset[str] = frozenset({
+    LOCAL_RUNTIME_ENV_BRIDGE_FAILED,
+    LOCAL_RUNTIME_ENV_OUTPUT_MISSING,
+    LOCAL_RUNTIME_PROFILE_UNKNOWN,
+    LOCAL_RUNTIME_START_BLOCKED,
+    LOCAL_RUNTIME_SERVICE_DEFERRED,
+    LOCAL_RUNTIME_MODE_UNSUPPORTED,
+    LOCAL_RUNTIME_COVERAGE_GAP,
+})
+
+LOCAL_RUNTIME_START_MODES: tuple[str, ...] = ("reuse", "prod", "fresh")
+PARITY_LEDGER_ACTIONS: frozenset[str] = frozenset({"declare", "bridge", "build", "drop"})
+PARITY_OWNERSHIP_STATES: frozenset[str] = frozenset({"covered", "bridge-only", "deferred", "external"})
+
+CANONICAL_RUNTIME_RECORDS: dict[str, tuple[str, ...]] = {
+    "local_runtime_profile": ("id", "label", "service_ids", "default_mode"),
+    "legacy_env_bridge": (
+        "id",
+        "env_tier",
+        "legacy_targets",
+        "output_root",
+        "emit_stubs",
+        "profiles",
+    ),
+    "local_runtime_repo": ("id", "repo_path", "notes"),
+    "managed_env_file": (
+        "id",
+        "repo_id",
+        "target_path",
+        "source_kind",
+        "source_path",
+        "required",
+        "profiles",
+    ),
+    # bootstrap_task enforces a XOR between `repo_id` and `bridge_id` at load
+    # time (see _validate_bootstrap_task_owner_xor).
+    "bootstrap_task": (
+        "id",
+        "repo_id",
+        "bridge_id",
+        "kind",
+        "command",
+        "success_check",
+        "profiles",
+    ),
+    "managed_service": (
+        "id",
+        "repo_id",
+        "kind",
+        "health_type",
+        "health_target",
+        "depends_on",
+        "bootstrap_tasks",
+        "profiles",
+    ),
+    "service_mode_command": ("id", "service_id", "mode", "command"),
+    "parity_ledger_item": (
+        "id",
+        "legacy_surface",
+        "surface_type",
+        "action",
+        "ownership_state",
+        "intended_profiles",
+        "bridge_dependency",
+        "request_error",
+        "notes",
+    ),
+}
+
+
+class LocalRuntimeContractError(RuntimeError):
+    """Raised when the canonical contract is violated at load time.
+
+    Carries a stable error-code tag (one of ``LOCAL_RUNTIME_ERROR_CODES``)
+    so downstream CLI formatting can map the exception back to the shared
+    contract without string-sniffing the message.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 def runtime_manifest_path(root_dir: Path) -> Path:
     return root_dir / "workspace" / "runtime.yaml"
 
@@ -310,6 +412,8 @@ def _empty_runtime_sections() -> dict[str, list[dict[str, Any]]]:
         "logs": [],
         "checks": [],
         "bridges": [],
+        "service_mode_commands": [],
+        "parity_ledger": [],
     }
 
 
@@ -420,6 +524,145 @@ def load_client_overlays(root_dir: Path, env_values: dict[str, str]) -> list[dic
     return overlays
 
 
+def _flatten_env_file_record(env_file: dict[str, Any]) -> None:
+    """Flatten nested overlay YAML shapes onto a managed_env_file record.
+
+    Overlay authors write ``source.kind`` / ``source.source_path`` /
+    ``source.path``. The canonical record stores ``source_kind`` and
+    ``source_path`` at the top level. The nested ``source`` dict is kept
+    intact for backward compatibility with existing helpers.
+    """
+    source = env_file.get("source") or {}
+    if isinstance(source, dict):
+        if "source_kind" not in env_file and source.get("kind") is not None:
+            env_file["source_kind"] = source.get("kind")
+        if "source_path" not in env_file:
+            raw_source_path = source.get("source_path") or source.get("path")
+            if raw_source_path is not None:
+                env_file["source_path"] = raw_source_path
+    if "target_path" not in env_file and env_file.get("path"):
+        env_file["target_path"] = env_file.get("path")
+    if "repo_id" not in env_file and env_file.get("repo"):
+        env_file["repo_id"] = env_file.get("repo")
+
+
+def _flatten_service_record(service: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten nested overlay YAML shapes onto a managed_service record and
+    extract any ``commands.<mode>`` entries into ``service_mode_command``
+    records. Returns the list of extracted service_mode_command dicts.
+    """
+    healthcheck = service.get("healthcheck") or {}
+    if isinstance(healthcheck, dict):
+        if "health_type" not in service and healthcheck.get("type") is not None:
+            service["health_type"] = healthcheck.get("type")
+        if "health_target" not in service:
+            target = (
+                healthcheck.get("url")
+                or healthcheck.get("port")
+                or healthcheck.get("path")
+                or healthcheck.get("pattern")
+            )
+            if target is not None:
+                service["health_target"] = target
+    if "repo_id" not in service and service.get("repo"):
+        service["repo_id"] = service.get("repo")
+
+    extracted: list[dict[str, Any]] = []
+    raw_commands = service.get("commands")
+    if isinstance(raw_commands, dict) and raw_commands:
+        service_id = str(service.get("id", "")).strip()
+        for mode, command in raw_commands.items():
+            mode_str = str(mode).strip()
+            if not mode_str:
+                continue
+            extracted.append(
+                {
+                    "id": f"{service_id}:{mode_str}" if service_id else mode_str,
+                    "service_id": service_id,
+                    "mode": mode_str,
+                    "command": command,
+                    "profiles": list(service.get("profiles") or []),
+                    "client": service.get("client", ""),
+                }
+            )
+    return extracted
+
+
+def _flatten_bootstrap_task_record(task: dict[str, Any]) -> None:
+    """Flatten the overlay shape onto a bootstrap_task record."""
+    if "repo_id" not in task and task.get("repo"):
+        task["repo_id"] = task.get("repo")
+    # bridge_id is already the canonical key; nothing to flatten.
+
+
+def _validate_bootstrap_task_owner_xor(tasks: list[dict[str, Any]]) -> None:
+    """Enforce the XOR rule from shared.md:274-277 and backend.md Rule 6.
+
+    Every ``bootstrap_task`` declares exactly one of ``repo_id`` or
+    ``bridge_id``. Declaring both or neither is a coverage gap and is
+    reported with the stable ``LOCAL_RUNTIME_COVERAGE_GAP`` code before any
+    mutation happens.
+
+    Only tasks that actually look like bootstrap tasks are checked — a task
+    that neither has ``kind == "bootstrap"`` nor declares ``bridge_id`` /
+    ``repo_id`` is ignored so the existing core-runtime tasks (which have
+    neither owner and are not bootstrap tasks) keep validating cleanly.
+    """
+    for task in tasks:
+        kind = str(task.get("kind") or "").strip()
+        has_repo = bool(str(task.get("repo_id") or "").strip())
+        has_bridge = bool(str(task.get("bridge_id") or "").strip())
+        is_bootstrap = kind == "bootstrap" or has_repo or has_bridge
+        if not is_bootstrap:
+            continue
+        if has_repo and has_bridge:
+            raise LocalRuntimeContractError(
+                LOCAL_RUNTIME_COVERAGE_GAP,
+                (
+                    f"bootstrap_task {task.get('id', '(missing id)')!r} declares "
+                    "both repo_id and bridge_id; exactly one is allowed"
+                ),
+            )
+        if not has_repo and not has_bridge:
+            raise LocalRuntimeContractError(
+                LOCAL_RUNTIME_COVERAGE_GAP,
+                (
+                    f"bootstrap_task {task.get('id', '(missing id)')!r} declares "
+                    "neither repo_id nor bridge_id; exactly one is required"
+                ),
+            )
+
+
+def _flatten_parity_ledger_record(item: dict[str, Any]) -> None:
+    """Normalize a parity_ledger_item record in place.
+
+    Ensures ``bridge_dependency`` is either ``None`` or a string; the
+    contract (shared.md:279-281) forbids bootstrap_task ids here, so a
+    cross-reference check runs during validation once the task id set is
+    known.
+    """
+    bridge_dep = item.get("bridge_dependency")
+    if bridge_dep is not None and not isinstance(bridge_dep, str):
+        item["bridge_dependency"] = str(bridge_dep)
+    if "intended_profiles" in item and item["intended_profiles"] is None:
+        item["intended_profiles"] = []
+
+
+def _post_process_runtime_sections(sections: dict[str, list[dict[str, Any]]]) -> None:
+    """Run flatten + XOR validation after every source has been merged in."""
+    for env_file in sections["env_files"]:
+        _flatten_env_file_record(env_file)
+    for service in sections["services"]:
+        extracted = _flatten_service_record(service)
+        if extracted:
+            sections["service_mode_commands"].extend(extracted)
+    for task in sections["tasks"]:
+        _flatten_bootstrap_task_record(task)
+    for item in sections["parity_ledger"]:
+        _flatten_parity_ledger_record(item)
+    _validate_bootstrap_task_owner_xor(sections["tasks"])
+
+
 def _normalize_runtime_sections(
     resolved: dict[str, Any],
     overlay_clients: list[dict[str, Any]] | None = None,
@@ -428,6 +671,7 @@ def _normalize_runtime_sections(
     _, selection, sections = _collect_core_sections(resolved, scoped_runtime)
     _extend_sections_with_profiles(sections, resolved, scoped_runtime)
     clients_meta = _collect_client_metadata(_resolved_clients(resolved, scoped_runtime, overlay_clients), sections)
+    _post_process_runtime_sections(sections)
 
     return {
         "selection": selection,
@@ -441,6 +685,8 @@ def _normalize_runtime_sections(
         "logs": sections["logs"],
         "checks": sections["checks"],
         "bridges": sections["bridges"],
+        "service_mode_commands": sections["service_mode_commands"],
+        "parity_ledger": sections["parity_ledger"],
     }
 
 
@@ -466,6 +712,8 @@ def _base_runtime_model(
         "logs": normalized["logs"],
         "checks": normalized["checks"],
         "bridges": normalized["bridges"],
+        "service_mode_commands": normalized.get("service_mode_commands", []),
+        "parity_ledger": normalized.get("parity_ledger", []),
     }
 
 
@@ -612,6 +860,29 @@ def _populate_check_defaults(model: dict[str, Any], root_dir: Path) -> None:
             check["host_path"] = str(runtime_path_to_host_path(root_dir, model["env"], str(check["path"])))
 
 
+def _populate_service_mode_command_defaults(model: dict[str, Any], root_dir: Path) -> None:
+    for entry in model.get("service_mode_commands") or []:
+        entry.setdefault("profiles", [])
+        entry.setdefault("client", "")
+        entry.setdefault("service_id", "")
+        entry.setdefault("mode", "")
+        entry.setdefault("command", "")
+
+
+def _populate_parity_ledger_defaults(model: dict[str, Any], root_dir: Path) -> None:
+    for item in model.get("parity_ledger") or []:
+        item.setdefault("profiles", [])
+        item.setdefault("intended_profiles", [])
+        item.setdefault("client", "")
+        item.setdefault("ownership_state", "deferred")
+        item.setdefault("action", "build")
+        item.setdefault("bridge_dependency", None)
+        item.setdefault("request_error", "")
+        item.setdefault("notes", "")
+        item.setdefault("surface_type", "")
+        item.setdefault("legacy_surface", "")
+
+
 def _populate_client_defaults(model: dict[str, Any], root_dir: Path) -> None:
     for client in model["clients"]:
         client.setdefault("label", client.get("id", ""))
@@ -631,6 +902,8 @@ def _populate_runtime_model_defaults(model: dict[str, Any], root_dir: Path) -> N
     _populate_log_defaults(model, root_dir)
     _populate_check_defaults(model, root_dir)
     _populate_bridge_defaults(model, root_dir)
+    _populate_service_mode_command_defaults(model, root_dir)
+    _populate_parity_ledger_defaults(model, root_dir)
     _populate_client_defaults(model, root_dir)
 
 
