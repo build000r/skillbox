@@ -206,5 +206,198 @@ class RuntimeModelUnitTests(unittest.TestCase):
         (repo / "env" / "runtime.env").write_text("KEY=VALUE\n", encoding="utf-8")
 
 
+class LocalRuntimeCoreModelTests(unittest.TestCase):
+    """WG-007: Model-level tests for local_runtime_core_cutover contract.
+
+    Covers the bullet list under "Model-level" in the WG-007 brief:
+      * bootstrap_task XOR-owner validation (both/neither -> LOCAL_RUNTIME_COVERAGE_GAP)
+      * All seven stable error codes are exported constants
+      * Canonical constants (LOCAL_RUNTIME_START_MODES, PARITY_LEDGER_ACTIONS,
+        PARITY_OWNERSHIP_STATES, CANONICAL_RUNTIME_RECORDS) are exposed
+      * Flattening rules for env_files, services, bootstrap_tasks:
+          source.kind -> source_kind
+          healthcheck.type/url/port -> health_type/health_target
+          commands.<mode> -> service_mode_command records
+    """
+
+    # --- stable error codes (US-1..US-4) ---------------------------------
+
+    def test_all_seven_stable_error_codes_are_exported_constants(self) -> None:
+        expected = {
+            "LOCAL_RUNTIME_ENV_BRIDGE_FAILED",
+            "LOCAL_RUNTIME_ENV_OUTPUT_MISSING",
+            "LOCAL_RUNTIME_PROFILE_UNKNOWN",
+            "LOCAL_RUNTIME_START_BLOCKED",
+            "LOCAL_RUNTIME_SERVICE_DEFERRED",
+            "LOCAL_RUNTIME_MODE_UNSUPPORTED",
+            "LOCAL_RUNTIME_COVERAGE_GAP",
+        }
+        for code in expected:
+            self.assertTrue(
+                hasattr(runtime_model_module, code),
+                f"runtime_model must export {code} as a module constant",
+            )
+            self.assertEqual(getattr(runtime_model_module, code), code)
+        self.assertEqual(
+            set(runtime_model_module.LOCAL_RUNTIME_ERROR_CODES), expected
+        )
+
+    def test_local_runtime_start_modes_and_parity_sets_are_exported(self) -> None:
+        self.assertEqual(
+            runtime_model_module.LOCAL_RUNTIME_START_MODES,
+            ("reuse", "prod", "fresh"),
+        )
+        self.assertEqual(
+            set(runtime_model_module.PARITY_LEDGER_ACTIONS),
+            {"declare", "bridge", "build", "drop"},
+        )
+        self.assertEqual(
+            set(runtime_model_module.PARITY_OWNERSHIP_STATES),
+            {"covered", "bridge-only", "deferred", "external"},
+        )
+
+    def test_canonical_runtime_records_declares_bootstrap_task_xor_fields(self) -> None:
+        records = runtime_model_module.CANONICAL_RUNTIME_RECORDS
+        self.assertIn("bootstrap_task", records)
+        self.assertIn("repo_id", records["bootstrap_task"])
+        self.assertIn("bridge_id", records["bootstrap_task"])
+        self.assertIn("service_mode_command", records)
+        self.assertIn("parity_ledger_item", records)
+        self.assertIn("legacy_env_bridge", records)
+
+    # --- bootstrap_task XOR owner validation (US-3) ----------------------
+
+    def test_bootstrap_task_xor_rejects_both_owners(self) -> None:
+        tasks = [
+            {
+                "id": "bad-task",
+                "kind": "bootstrap",
+                "repo_id": "approval-feedback-api",
+                "bridge_id": "local-core-bridge",
+                "command": "true",
+            }
+        ]
+        with self.assertRaises(runtime_model_module.LocalRuntimeContractError) as ctx:
+            runtime_model_module._validate_bootstrap_task_owner_xor(tasks)
+        self.assertEqual(
+            ctx.exception.code,
+            runtime_model_module.LOCAL_RUNTIME_COVERAGE_GAP,
+        )
+
+    def test_bootstrap_task_xor_rejects_neither_owner(self) -> None:
+        tasks = [
+            {
+                "id": "orphan-task",
+                "kind": "bootstrap",
+                "command": "true",
+            }
+        ]
+        with self.assertRaises(runtime_model_module.LocalRuntimeContractError) as ctx:
+            runtime_model_module._validate_bootstrap_task_owner_xor(tasks)
+        self.assertEqual(
+            ctx.exception.code,
+            runtime_model_module.LOCAL_RUNTIME_COVERAGE_GAP,
+        )
+
+    def test_bootstrap_task_xor_accepts_bridge_only_owner(self) -> None:
+        tasks = [
+            {
+                "id": "env-bridge-local-core",
+                "kind": "bootstrap",
+                "bridge_id": "local-core-bridge",
+                "command": "sync.sh --emit",
+            }
+        ]
+        # must not raise
+        runtime_model_module._validate_bootstrap_task_owner_xor(tasks)
+
+    def test_bootstrap_task_xor_accepts_repo_only_owner(self) -> None:
+        tasks = [
+            {
+                "id": "approval-feedback-db-bootstrap",
+                "kind": "bootstrap",
+                "repo_id": "approval-feedback-api",
+                "command": "docker start unclawg-db-1",
+            }
+        ]
+        runtime_model_module._validate_bootstrap_task_owner_xor(tasks)
+
+    def test_bootstrap_task_xor_ignores_non_bootstrap_tasks(self) -> None:
+        # Existing core runtime tasks declare neither owner; they must
+        # remain valid because they are not bootstrap tasks.
+        tasks = [
+            {"id": "legacy-task", "kind": "task", "command": "noop"},
+        ]
+        runtime_model_module._validate_bootstrap_task_owner_xor(tasks)
+
+    # --- flattening rules (shared.md:269-272) ----------------------------
+
+    def test_flatten_env_file_promotes_source_kind_and_path(self) -> None:
+        env_file = {
+            "id": "approval-feedback-env",
+            "repo": "approval-feedback-api",
+            "path": "/repo/approval_feedback_api/.env",
+            "source": {
+                "kind": "file",
+                "source_path": "/bridge/out/unclawg-approval-feedback-api/local.env",
+            },
+        }
+        runtime_model_module._flatten_env_file_record(env_file)
+        self.assertEqual(env_file["source_kind"], "file")
+        self.assertEqual(
+            env_file["source_path"],
+            "/bridge/out/unclawg-approval-feedback-api/local.env",
+        )
+        self.assertEqual(env_file["target_path"], "/repo/approval_feedback_api/.env")
+        self.assertEqual(env_file["repo_id"], "approval-feedback-api")
+
+    def test_flatten_service_promotes_healthcheck_type_and_url(self) -> None:
+        service = {
+            "id": "approval_feedback_api",
+            "repo": "approval-feedback-api",
+            "healthcheck": {"type": "http", "url": "http://localhost:8010/health"},
+            "commands": {
+                "reuse": "make local-up-daemon",
+                "prod": "make local-up-prod",
+                "fresh": "make local-up-prod-fresh",
+            },
+        }
+        extracted = runtime_model_module._flatten_service_record(service)
+        self.assertEqual(service["health_type"], "http")
+        self.assertEqual(service["health_target"], "http://localhost:8010/health")
+        self.assertEqual(service["repo_id"], "approval-feedback-api")
+
+        # commands.<mode> -> service_mode_command records
+        by_mode = {rec["mode"]: rec for rec in extracted}
+        self.assertEqual(set(by_mode), {"reuse", "prod", "fresh"})
+        self.assertEqual(by_mode["reuse"]["service_id"], "approval_feedback_api")
+        self.assertEqual(by_mode["prod"]["command"], "make local-up-prod")
+        self.assertEqual(by_mode["fresh"]["command"], "make local-up-prod-fresh")
+        self.assertEqual(
+            by_mode["reuse"]["id"], "approval_feedback_api:reuse"
+        )
+
+    def test_flatten_service_without_commands_extracts_no_mode_records(self) -> None:
+        service = {
+            "id": "legacy",
+            "command": "python3 -m http.server",
+            "healthcheck": {"type": "port", "port": 8080},
+        }
+        extracted = runtime_model_module._flatten_service_record(service)
+        self.assertEqual(extracted, [])
+        self.assertEqual(service["health_type"], "port")
+        self.assertEqual(service["health_target"], 8080)
+
+    def test_flatten_bootstrap_task_promotes_repo_to_repo_id(self) -> None:
+        task = {
+            "id": "approval-feedback-db-bootstrap",
+            "kind": "bootstrap",
+            "repo": "approval-feedback-api",
+            "command": "docker start unclawg-db-1",
+        }
+        runtime_model_module._flatten_bootstrap_task_record(task)
+        self.assertEqual(task["repo_id"], "approval-feedback-api")
+
+
 if __name__ == "__main__":
     unittest.main()

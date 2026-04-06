@@ -19,7 +19,18 @@ MANAGE_MODULE = SourceFileLoader(
     str((ROOT_DIR / ".env-manager" / "manage.py").resolve()),
 ).load_module()
 
+build_local_runtime_service_deferred_error = MANAGE_MODULE.build_local_runtime_service_deferred_error
+classify_requested_surfaces = MANAGE_MODULE.classify_requested_surfaces
+collect_deferred_log_entries = MANAGE_MODULE.collect_deferred_log_entries
+doctor_results = MANAGE_MODULE.doctor_results
 filter_model = MANAGE_MODULE.filter_model
+local_runtime_focus_payload = MANAGE_MODULE.local_runtime_focus_payload
+parity_ledger_deferred_surfaces = MANAGE_MODULE.parity_ledger_deferred_surfaces
+reconcile_local_runtime_env = MANAGE_MODULE.reconcile_local_runtime_env
+runtime_status = MANAGE_MODULE.runtime_status
+select_local_runtime_services = MANAGE_MODULE.select_local_runtime_services
+validate_env_file_target_paths = MANAGE_MODULE.validate_env_file_target_paths
+validate_parity_ledger = MANAGE_MODULE.validate_parity_ledger
 normalize_active_clients = MANAGE_MODULE.normalize_active_clients
 normalize_active_profiles = MANAGE_MODULE.normalize_active_profiles
 bridge_expected_outputs = MANAGE_MODULE.bridge_expected_outputs
@@ -554,6 +565,562 @@ class FullModelIntegrationTests(unittest.TestCase):
             self.assertEqual(len(filtered["bridges"]), 0)
             local_services = [s for s in filtered["services"] if "local-minimal" in (s.get("profiles") or [])]
             self.assertEqual(len(local_services), 0)
+
+
+# ---------------------------------------------------------------------------
+# WG-007: Full local-core graph + parity ledger test harness
+# ---------------------------------------------------------------------------
+#
+# These tests drive reconcile_local_runtime_env / local_runtime_focus_payload /
+# validate_env_file_target_paths against an in-memory six-service model that
+# mirrors the personal overlay declared in
+# /Users/b/repos/skillbox-config/clients/personal/overlay.yaml (shared.md US-1).
+# We build the model as plain dicts rather than materialising overlay.yaml so
+# the tests stay fast and hermetic.
+from typing import Any
+
+LOCAL_CORE_SERVICE_IDS: tuple[str, ...] = (
+    "spaps",
+    "htma_server",
+    "ingredient_server",
+    "approval_feedback_api",
+    "cfo",
+    "htma",
+)
+
+
+def _build_local_core_model(
+    repo_root: Path,
+    *,
+    with_bridge_outputs: bool = True,
+    parity_ledger_overrides: list[dict[str, Any]] | None = None,
+    approval_env_filename: str = ".env",
+    include_approval_bootstrap: bool = True,
+) -> dict[str, Any]:
+    """Return a minimal in-memory runtime model for the local-core graph.
+
+    Mirrors the personal overlay contract from shared.md (WG-001/WG-002):
+      * six services with declared mode commands (reuse/prod/fresh)
+      * one env bridge with six legacy targets
+      * two bootstrap tasks (env-bridge-local-core, approval-feedback-db-bootstrap)
+      * approval_feedback_api env target is repo-local ``.env``
+      * a parity ledger with one deferred surface (``buildooor``) + the
+        bridge-only ``sync.sh env compilation`` seam, keyed by the six
+        covered services as ``covered``.
+    """
+    bridge_root = repo_root / "env-out"
+    if with_bridge_outputs:
+        for target in (
+            "sweet-potato",
+            "htma_server",
+            "ingredient_server",
+            "unclawg-approval-feedback-api",
+            "cfo",
+            "htma",
+        ):
+            target_dir = bridge_root / target
+            target_dir.mkdir(parents=True, exist_ok=True)
+            (target_dir / "local.env").write_text(f"# {target}\n", encoding="utf-8")
+
+    def _repo(rid: str, sub: str) -> dict[str, Any]:
+        host = repo_root / sub
+        host.mkdir(parents=True, exist_ok=True)
+        return {
+            "id": rid,
+            "path": str(host),
+            "repo_path": str(host),
+            "host_path": str(host),
+            "kind": "repo",
+            "profiles": ["local-core"],
+        }
+
+    repos = [
+        _repo("sweet-potato", "sweet-potato"),
+        _repo("htma_server", "htma_server"),
+        _repo("ingredient_server", "ingredient_server"),
+        _repo("approval-feedback-api", "unclawg/services/approval_feedback_api"),
+        _repo("cfo", "cfo"),
+        _repo("htma", "htma"),
+    ]
+
+    bridges = [
+        {
+            "id": "local-core-bridge",
+            "client": "personal",
+            "env_tier": "local",
+            "legacy_targets": [
+                "sweet-potato",
+                "htma_server",
+                "ingredient_server",
+                "unclawg-approval-feedback-api",
+                "cfo",
+                "htma",
+            ],
+            "output_root": str(bridge_root),
+            "output_root_host_path": str(bridge_root),
+            "emit_stubs": False,
+            "profiles": ["local-core"],
+        }
+    ]
+
+    tasks: list[dict[str, Any]] = [
+        {
+            "id": "env-bridge-local-core",
+            "kind": "bootstrap",
+            "bridge_id": "local-core-bridge",
+            "profiles": ["local-core"],
+            "command": "sync.sh --emit",
+        }
+    ]
+    if include_approval_bootstrap:
+        tasks.append(
+            {
+                "id": "approval-feedback-db-bootstrap",
+                "kind": "bootstrap",
+                "repo_id": "approval-feedback-api",
+                "profiles": ["local-core"],
+                "command": "docker start unclawg-db-1 >/dev/null 2>&1 || true",
+                "success": {
+                    "type": "path_exists",
+                    "host_path": str(repo_root / ".unclawg-db.ready"),
+                },
+            }
+        )
+
+    approval_target = (
+        repo_root
+        / "unclawg"
+        / "services"
+        / "approval_feedback_api"
+        / approval_env_filename
+    )
+    approval_source = (
+        bridge_root / "unclawg-approval-feedback-api" / "local.env"
+    )
+    # Pre-create the target so env_file_state reports state="ok" for
+    # ensure_required_env_files_ready (WG-005 pre-mutation check).
+    if with_bridge_outputs and approval_env_filename == ".env":
+        approval_target.parent.mkdir(parents=True, exist_ok=True)
+        if approval_source.is_file():
+            approval_target.write_bytes(approval_source.read_bytes())
+            # env_file_state enforces 0o600 for a matching target
+            import os as _os
+            _os.chmod(approval_target, 0o600)
+    env_files = [
+        {
+            "id": "approval-feedback-env",
+            "repo": "approval-feedback-api",
+            "repo_id": "approval-feedback-api",
+            "path": str(approval_target),
+            "host_path": str(approval_target),
+            "target_path": str(approval_target),
+            "required": True,
+            "profiles": ["local-core"],
+            "mode": "0600",
+            "source": {
+                "kind": "file",
+                "path": str(approval_source),
+                "host_path": str(approval_source),
+                "source_path": str(approval_source),
+            },
+            "sync": {"mode": "write"},
+            "source_kind": "file",
+            "source_path": str(approval_source),
+            "source_host_path": str(approval_source),
+        }
+    ]
+
+    def _svc(
+        sid: str,
+        repo_id: str,
+        depends_on: list[str],
+        health_url: str,
+        *,
+        bootstrap_tasks: list[str] | None = None,
+        supports: tuple[str, ...] = ("reuse", "prod", "fresh"),
+    ) -> dict[str, Any]:
+        commands = {mode: f"make local-up-{mode} # {sid}" for mode in supports}
+        return {
+            "id": sid,
+            "kind": "http",
+            "repo": repo_id,
+            "repo_id": repo_id,
+            "profiles": ["local-core"],
+            "depends_on": depends_on,
+            "bootstrap_tasks": list(bootstrap_tasks or ["env-bridge-local-core"]),
+            "commands": commands,
+            "healthcheck": {"type": "http", "url": health_url},
+            "health_type": "http",
+            "health_target": health_url,
+        }
+
+    approval_bootstraps = ["env-bridge-local-core"]
+    if include_approval_bootstrap:
+        approval_bootstraps.append("approval-feedback-db-bootstrap")
+
+    services = [
+        _svc("spaps", "sweet-potato", [], "http://localhost:3301/health"),
+        _svc("htma_server", "htma_server", ["spaps"], "http://localhost:8000/health"),
+        _svc(
+            "ingredient_server",
+            "ingredient_server",
+            ["spaps"],
+            "http://localhost:8001/health",
+        ),
+        _svc(
+            "approval_feedback_api",
+            "approval-feedback-api",
+            ["spaps"],
+            "http://localhost:8010/health",
+            bootstrap_tasks=approval_bootstraps,
+        ),
+        _svc("cfo", "cfo", ["spaps"], "http://localhost:8050/health"),
+        _svc("htma", "htma", ["spaps", "htma_server"], "http://localhost:5173"),
+    ]
+
+    parity_ledger = [
+        {
+            "id": sid,
+            "legacy_surface": sid,
+            "surface_type": "service",
+            "action": "declare",
+            "ownership_state": "covered",
+            "intended_profiles": ["local-core"],
+            "bridge_dependency": None,
+        }
+        for sid in LOCAL_CORE_SERVICE_IDS
+    ] + [
+        {
+            "id": "buildooor",
+            "legacy_surface": "buildooor",
+            "surface_type": "service",
+            "action": "build",
+            "ownership_state": "deferred",
+            "intended_profiles": ["local-all"],
+            "bridge_dependency": None,
+            "request_error": "LOCAL_RUNTIME_SERVICE_DEFERRED",
+            "notes": "follow-on slice",
+        },
+        {
+            "id": "swimmers",
+            "legacy_surface": "swimmers",
+            "surface_type": "service",
+            "action": "build",
+            "ownership_state": "deferred",
+            "intended_profiles": ["local-all"],
+            "bridge_dependency": None,
+            "request_error": "LOCAL_RUNTIME_SERVICE_DEFERRED",
+        },
+        {
+            "id": "sync-sh-env-compilation",
+            "legacy_surface": "sync.sh env compilation",
+            "surface_type": "bridge",
+            "action": "bridge",
+            "ownership_state": "bridge-only",
+            "intended_profiles": ["local-core"],
+            "bridge_dependency": "local-core-bridge",
+            "request_error": "LOCAL_RUNTIME_SERVICE_DEFERRED",
+        },
+    ]
+    if parity_ledger_overrides is not None:
+        parity_ledger = parity_ledger_overrides
+
+    return {
+        "root_dir": str(repo_root),
+        "active_profiles": ["core", "local-core"],
+        "active_clients": ["personal"],
+        "selection": {},
+        "clients": [
+            {
+                "id": "personal",
+                "label": "Personal",
+                "_overlay_path": str(repo_root / "overlay.yaml"),
+            }
+        ],
+        "repos": repos,
+        "artifacts": [],
+        "env_files": env_files,
+        "skills": [],
+        "tasks": tasks,
+        "services": services,
+        "logs": [],
+        "checks": [],
+        "bridges": bridges,
+        "parity_ledger": parity_ledger,
+    }
+
+
+class LocalCoreFocusUS1Tests(unittest.TestCase):
+    """WG-007 / US-1: Full local-core focus coverage."""
+
+    def test_local_core_focus_resolves_six_services(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = _build_local_core_model(repo)
+            services = select_local_runtime_services(model, "local-core")
+            self.assertEqual(
+                [s["id"] for s in services], list(LOCAL_CORE_SERVICE_IDS)
+            )
+
+    def test_local_core_focus_payload_shape_matches_us1(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = _build_local_core_model(repo)
+            result = reconcile_local_runtime_env(
+                model, "local-core", overlay_path=None, dry_run=True,
+            )
+            self.assertEqual(result["status"], "ready", result)
+            payload = local_runtime_focus_payload(
+                model, result, client_id="personal",
+            )
+            self.assertEqual(payload["client_id"], "personal")
+            self.assertIn("core", payload["active_profiles"])
+            self.assertIn("local-core", payload["active_profiles"])
+            self.assertEqual(payload["local_runtime"]["profile"], "local-core")
+            self.assertEqual(
+                payload["local_runtime"]["default_mode"], "reuse"
+            )
+            env_bridge = payload["local_runtime"]["env_bridge"]
+            self.assertEqual(env_bridge["id"], "local-core-bridge")
+            self.assertEqual(env_bridge["status"], "ready")
+            service_ids = [
+                entry["id"]
+                for entry in payload["local_runtime"]["services"]
+            ]
+            self.assertEqual(service_ids, list(LOCAL_CORE_SERVICE_IDS))
+            self.assertTrue(payload["next_actions"][0].startswith("manage.py up"))
+
+    def test_unknown_profile_returns_profile_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = _build_local_core_model(repo)
+            result = reconcile_local_runtime_env(
+                model, "local-nonexistent", overlay_path=None, dry_run=True,
+            )
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(
+                result["error"]["type"], "LOCAL_RUNTIME_PROFILE_UNKNOWN",
+            )
+
+    def test_empty_profile_returns_profile_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = _build_local_core_model(repo)
+            result = reconcile_local_runtime_env(
+                model, "", overlay_path=None, dry_run=True,
+            )
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(
+                result["error"]["type"], "LOCAL_RUNTIME_PROFILE_UNKNOWN",
+            )
+
+    def test_missing_bridge_output_returns_env_output_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = _build_local_core_model(repo, with_bridge_outputs=True)
+            # Nuke one bridge output to simulate an incomplete bridge run.
+            missing_path = (
+                repo / "env-out" / "unclawg-approval-feedback-api" / "local.env"
+            )
+            missing_path.unlink()
+            # Drop the bridge task so reconciliation cannot repair it.
+            model["tasks"] = [
+                t for t in model["tasks"]
+                if t["id"] != "env-bridge-local-core"
+            ]
+            result = reconcile_local_runtime_env(
+                model, "local-core", overlay_path=None, dry_run=True,
+            )
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(
+                result["error"]["type"], "LOCAL_RUNTIME_ENV_OUTPUT_MISSING",
+            )
+
+    def test_bridge_non_zero_exit_returns_env_bridge_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = _build_local_core_model(repo, with_bridge_outputs=False)
+            # Monkey-patch run_tasks so it raises inside the reconciliation
+            # path, simulating sync.sh exiting non-zero.
+            import runtime_manager.runtime_ops as runtime_ops_mod
+            original = runtime_ops_mod.run_tasks
+
+            def _boom(*args: object, **kwargs: object) -> None:
+                raise RuntimeError("sync.sh exited 1 for targets: sweet-potato")
+
+            runtime_ops_mod.run_tasks = _boom  # type: ignore[assignment]
+            try:
+                result = reconcile_local_runtime_env(
+                    model,
+                    "local-core",
+                    overlay_path=None,
+                    dry_run=False,
+                )
+            finally:
+                runtime_ops_mod.run_tasks = original  # type: ignore[assignment]
+
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(
+                result["error"]["type"], "LOCAL_RUNTIME_ENV_BRIDGE_FAILED",
+            )
+            self.assertIn("sync.sh", result["error"]["detail"])
+
+    def test_approval_feedback_env_target_must_be_dot_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            good = _build_local_core_model(repo)
+            self.assertEqual(
+                validate_env_file_target_paths(good["env_files"], good),
+                [],
+            )
+            bad = _build_local_core_model(repo, approval_env_filename=".env.local")
+            violations = validate_env_file_target_paths(bad["env_files"], bad)
+            self.assertEqual(len(violations), 1)
+            self.assertIn("approval_feedback_api", violations[0])
+            self.assertIn(".env", violations[0])
+
+    def test_wrong_env_target_path_surfaces_as_env_output_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = _build_local_core_model(
+                repo, approval_env_filename=".env.local",
+            )
+            result = reconcile_local_runtime_env(
+                model, "local-core", overlay_path=None, dry_run=True,
+            )
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(
+                result["error"]["type"], "LOCAL_RUNTIME_ENV_OUTPUT_MISSING",
+            )
+
+
+class LocalCoreParityLedgerUS4Tests(unittest.TestCase):
+    """WG-007 / US-4: Parity ledger enforcement and doctor drift."""
+
+    def test_classify_requested_surfaces_marks_deferred_buildooor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = _build_local_core_model(repo)
+            classification = classify_requested_surfaces(model, ["buildooor"])
+            self.assertEqual(classification["covered"], [])
+            self.assertEqual(classification["unknown"], [])
+            self.assertEqual(len(classification["deferred"]), 1)
+            sid, item = classification["deferred"][0]
+            self.assertEqual(sid, "buildooor")
+            self.assertEqual(item["ownership_state"], "deferred")
+
+    def test_classify_requested_surfaces_marks_bridge_only_seam_deferred(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = _build_local_core_model(repo)
+            classification = classify_requested_surfaces(
+                model, ["sync-sh-env-compilation"]
+            )
+            self.assertEqual(len(classification["deferred"]), 1)
+            _, item = classification["deferred"][0]
+            self.assertEqual(item["ownership_state"], "bridge-only")
+
+    def test_build_local_runtime_service_deferred_error_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = _build_local_core_model(repo)
+            _, item = classify_requested_surfaces(model, ["buildooor"])["deferred"][0]
+            err = build_local_runtime_service_deferred_error(
+                item,
+                client_id="personal",
+                profile="local-core",
+                requested_mode="reuse",
+                surface_id="buildooor",
+            )
+            self.assertEqual(
+                err["error"]["type"], "LOCAL_RUNTIME_SERVICE_DEFERRED",
+            )
+            self.assertIn("buildooor", err["error"]["blocked_services"])
+            self.assertEqual(err["error"]["ownership_state"], "deferred")
+            self.assertEqual(err["error"]["requested_mode"], "reuse")
+
+    def test_logs_against_deferred_surface_returns_service_deferred(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = _build_local_core_model(repo)
+            deferred_pairs = classify_requested_surfaces(
+                model, ["buildooor"]
+            )["deferred"]
+            entries = collect_deferred_log_entries(
+                deferred_pairs, client_id="personal", profile="local-core",
+            )
+            self.assertEqual(len(entries), 1)
+            entry = entries[0]
+            self.assertEqual(entry["id"], "buildooor")
+            self.assertTrue(entry["deferred"])
+            self.assertEqual(entry["ownership_state"], "deferred")
+            self.assertTrue(entry["next_action"])
+
+    def test_status_with_blocked_prerequisites_exits_observationally(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = _build_local_core_model(repo)
+            status = runtime_status(model)
+            # observational: the key exists and the payload carries the
+            # parity-ledger section; we don't assert exit code here because
+            # runtime_status is the pre-exit data shape
+            self.assertIn("blocked_services", status)
+            self.assertIsInstance(status["blocked_services"], list)
+            # services in the fixture are not actually running, so status
+            # surfaces them through the ownership-state annotated listing
+            service_ids_in_status = {s["id"] for s in status["services"]}
+            self.assertEqual(service_ids_in_status, set(LOCAL_CORE_SERVICE_IDS))
+            for service in status["services"]:
+                self.assertEqual(service["ownership_state"], "covered")
+            deferred = status["parity_ledger"]["deferred_surfaces"]
+            self.assertIn("buildooor", deferred)
+            self.assertIn("sync.sh env compilation", deferred)
+
+    def test_doctor_emits_parity_ledger_subject_with_deferred_surfaces(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = _build_local_core_model(repo)
+            results = validate_parity_ledger(model)
+            self.assertEqual(len(results), 1)
+            check = results[0]
+            self.assertEqual(check.status, "pass", check)
+            self.assertEqual(check.code, "parity-ledger")
+            details = check.details or {}
+            self.assertIn("deferred_surfaces", details)
+            self.assertIn("buildooor", details["deferred_surfaces"])
+
+    def test_parity_ledger_drift_deferred_with_service_fires_coverage_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = _build_local_core_model(repo)
+            # Drift: mark spaps as deferred while the service graph still
+            # declares it (runtime claims coverage the ledger denies).
+            for item in model["parity_ledger"]:
+                if item.get("id") == "spaps":
+                    item["ownership_state"] = "deferred"
+                    break
+            results = validate_parity_ledger(model)
+            self.assertEqual(results[0].status, "fail")
+            self.assertEqual(results[0].code, "LOCAL_RUNTIME_COVERAGE_GAP")
+
+    def test_parity_ledger_drift_covered_without_service_fires_coverage_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = _build_local_core_model(repo)
+            model["parity_ledger"].append(
+                {
+                    "id": "ghost_service",
+                    "legacy_surface": "ghost_service",
+                    "surface_type": "service",
+                    "action": "declare",
+                    "ownership_state": "covered",
+                    "intended_profiles": ["local-core"],
+                    "bridge_dependency": None,
+                }
+            )
+            results = validate_parity_ledger(model)
+            self.assertEqual(results[0].status, "fail")
+            self.assertEqual(results[0].code, "LOCAL_RUNTIME_COVERAGE_GAP")
 
 
 if __name__ == "__main__":

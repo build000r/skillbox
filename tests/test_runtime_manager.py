@@ -4953,5 +4953,382 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertFalse(target.exists())
 
 
+# ---------------------------------------------------------------------------
+# WG-007: local-core mode-aware up orchestration and topology tests
+# ---------------------------------------------------------------------------
+#
+# Reuses the in-memory local-core model builder from test_local_runtime so
+# we assert against the exact same six-service graph that US-1 is checked
+# against.  Tests here exercise US-2 (mode-aware up), US-3 (bootstrap +
+# topology), and the US-4 deferred-surface pre-mutation rejection path for
+# the run_up workflow.
+from tests.test_local_runtime import (  # noqa: E402
+    LOCAL_CORE_SERVICE_IDS as _LOCAL_CORE_IDS,
+    _build_local_core_model as _build_local_core,
+)
+
+
+class LocalCoreModeAwareUpUS2Tests(unittest.TestCase):
+    """WG-007 / US-2: Mode-aware local-core up orchestration."""
+
+    def _fresh_model(self, tmpdir: str) -> dict[str, Any]:
+        return _build_local_core(Path(tmpdir).resolve())
+
+    def test_up_mode_default_resolves_to_reuse(self) -> None:
+        # Confirms that run_up treats an empty requested_mode string as
+        # ``reuse`` without any mutation (backend.md Rule 2).  We use
+        # dry_run so no actual service processes are started.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = self._fresh_model(tmpdir)
+            exit_code, payload = MANAGE_MODULE.run_up(
+                model=model,
+                client_id="personal",
+                profile="local-core",
+                requested_mode="",
+                dry_run=True,
+            )
+            self.assertEqual(exit_code, 0, payload)
+            self.assertEqual(payload["effective_mode"], "reuse")
+            self.assertEqual(payload["requested_mode"], "")
+            self.assertTrue(payload.get("dry_run"))
+            # All six services planned with the reuse command
+            service_ids = [s["id"] for s in payload["services"]]
+            self.assertEqual(service_ids, list(_LOCAL_CORE_IDS))
+            for entry in payload["services"]:
+                self.assertEqual(entry["mode"], "reuse")
+                self.assertIn("reuse", entry["command"])
+
+    def test_up_mode_reuse_picks_reuse_per_service_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = self._fresh_model(tmpdir)
+            exit_code, payload = MANAGE_MODULE.run_up(
+                model=model,
+                client_id="personal",
+                profile="local-core",
+                requested_mode="reuse",
+                dry_run=True,
+            )
+            self.assertEqual(exit_code, 0, payload)
+            self.assertEqual(payload["effective_mode"], "reuse")
+            for entry in payload["services"]:
+                self.assertIn("local-up-reuse", entry["command"])
+
+    def test_up_mode_prod_picks_prod_per_service_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = self._fresh_model(tmpdir)
+            exit_code, payload = MANAGE_MODULE.run_up(
+                model=model,
+                client_id="personal",
+                profile="local-core",
+                requested_mode="prod",
+                dry_run=True,
+            )
+            self.assertEqual(exit_code, 0, payload)
+            self.assertEqual(payload["effective_mode"], "prod")
+            for entry in payload["services"]:
+                self.assertIn("local-up-prod", entry["command"])
+
+    def test_up_mode_fresh_picks_fresh_per_service_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = self._fresh_model(tmpdir)
+            exit_code, payload = MANAGE_MODULE.run_up(
+                model=model,
+                client_id="personal",
+                profile="local-core",
+                requested_mode="fresh",
+                dry_run=True,
+            )
+            self.assertEqual(exit_code, 0, payload)
+            self.assertEqual(payload["effective_mode"], "fresh")
+            for entry in payload["services"]:
+                self.assertIn("local-up-fresh", entry["command"])
+
+    def test_up_unknown_mode_rejects_pre_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = self._fresh_model(tmpdir)
+            exit_code, payload = MANAGE_MODULE.run_up(
+                model=model,
+                client_id="personal",
+                profile="local-core",
+                requested_mode="danger-mode",
+                dry_run=True,
+            )
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(
+                payload["error"]["type"], "LOCAL_RUNTIME_MODE_UNSUPPORTED",
+            )
+            # Whole request is rejected (no partial service start list).
+            self.assertEqual(payload["services"], [])
+
+    def test_up_mixed_mode_support_rejects_whole_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = self._fresh_model(tmpdir)
+            # cfo only supports reuse; requesting prod must reject the
+            # whole graph per backend.md Rule 2 / shared.md US-2.
+            for service in model["services"]:
+                if service["id"] == "cfo":
+                    service["commands"] = {"reuse": "make local-up-reuse # cfo"}
+                    break
+            exit_code, payload = MANAGE_MODULE.run_up(
+                model=model,
+                client_id="personal",
+                profile="local-core",
+                requested_mode="prod",
+                dry_run=True,
+            )
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(
+                payload["error"]["type"], "LOCAL_RUNTIME_MODE_UNSUPPORTED",
+            )
+            self.assertIn("cfo", payload["error"]["blocked_services"])
+            # No services were started, not even the five that do support prod
+            self.assertEqual(payload["services"], [])
+
+    def test_up_topological_order_is_six_service_graph(self) -> None:
+        # Confirms htma's dual dependency (spaps+htma_server) is enforced,
+        # and the five siblings depend only on spaps.  The planned order
+        # emitted by run_up is produced by resolve_services_for_start.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = self._fresh_model(tmpdir)
+            exit_code, payload = MANAGE_MODULE.run_up(
+                model=model,
+                client_id="personal",
+                profile="local-core",
+                requested_mode="reuse",
+                dry_run=True,
+            )
+            self.assertEqual(exit_code, 0, payload)
+            ordered = [s["id"] for s in payload["services"]]
+            pos = {sid: index for index, sid in enumerate(ordered)}
+            # spaps strictly precedes each dependent service
+            for dependent in (
+                "htma_server",
+                "ingredient_server",
+                "approval_feedback_api",
+                "cfo",
+                "htma",
+            ):
+                self.assertLess(pos["spaps"], pos[dependent])
+            # htma depends on BOTH spaps and htma_server
+            self.assertLess(pos["htma_server"], pos["htma"])
+            self.assertEqual(set(ordered), set(_LOCAL_CORE_IDS))
+
+    def test_up_identical_mode_commands_are_accepted(self) -> None:
+        # shared.md US-2 AC: "identical commands across modes are allowed
+        # but must still be explicit".  Validates service_supports_mode
+        # accepts the explicit duplicate.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = self._fresh_model(tmpdir)
+            for service in model["services"]:
+                service["commands"] = {
+                    mode: "make local-up-same"
+                    for mode in ("reuse", "prod", "fresh")
+                }
+            exit_code, payload = MANAGE_MODULE.run_up(
+                model=model,
+                client_id="personal",
+                profile="local-core",
+                requested_mode="fresh",
+                dry_run=True,
+            )
+            self.assertEqual(exit_code, 0, payload)
+            for entry in payload["services"]:
+                self.assertEqual(entry["command"], "make local-up-same")
+
+
+class LocalCoreBootstrapAndBlockedUS3Tests(unittest.TestCase):
+    """WG-007 / US-3: Bootstrap ordering and START_BLOCKED."""
+
+    def test_approval_feedback_db_bootstrap_ordered_before_service_start(self) -> None:
+        # resolve_tasks_for_services returns bootstrap tasks in dependency
+        # order for the resolved service list; the approval-feedback-db
+        # task must appear in that list when approval_feedback_api is
+        # being started.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = _build_local_core(Path(tmpdir).resolve())
+            services = MANAGE_MODULE.select_local_runtime_services(
+                model, "local-core",
+            )
+            ordered_services = MANAGE_MODULE.resolve_services_for_start(
+                model, services, mode="reuse",
+            )
+            ordered_ids = [s["id"] for s in ordered_services]
+            self.assertEqual(ordered_ids[0], "spaps")
+            task_specs = MANAGE_MODULE.resolve_tasks_for_services(
+                model, ordered_services,
+            )
+            task_ids = [t["id"] for t in task_specs]
+            self.assertIn("approval-feedback-db-bootstrap", task_ids)
+            self.assertIn("env-bridge-local-core", task_ids)
+            # The bootstrap task is resolved BEFORE we start
+            # approval_feedback_api (it is the bootstrap the service
+            # declares as a dependency).  run_up runs tasks before
+            # start_services; here we simply confirm the service
+            # declares it in ``bootstrap_tasks``.
+            approval = next(
+                s for s in ordered_services
+                if s["id"] == "approval_feedback_api"
+            )
+            self.assertIn(
+                "approval-feedback-db-bootstrap",
+                approval["bootstrap_tasks"],
+            )
+
+    def test_up_db_bootstrap_failure_returns_start_blocked(self) -> None:
+        # Simulate the approval-feedback DB bootstrap failing to reach
+        # port 5436 -- run_tasks raises and run_up translates it into
+        # LOCAL_RUNTIME_START_BLOCKED with blocked_services populated.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = _build_local_core(Path(tmpdir).resolve())
+            import runtime_manager.workflows as workflows_mod
+            original = workflows_mod.run_tasks
+
+            def _boom(model_arg, task_specs, *, dry_run, mode=None):  # type: ignore[no-untyped-def]
+                raise RuntimeError(
+                    "Task approval-feedback-db-bootstrap failed: "
+                    "port 5436 never became ready"
+                )
+
+            workflows_mod.run_tasks = _boom  # type: ignore[assignment]
+            try:
+                exit_code, payload = MANAGE_MODULE.run_up(
+                    model=model,
+                    client_id="personal",
+                    profile="local-core",
+                    requested_mode="reuse",
+                    dry_run=False,
+                )
+            finally:
+                workflows_mod.run_tasks = original  # type: ignore[assignment]
+
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(
+                payload["error"]["type"], "LOCAL_RUNTIME_START_BLOCKED",
+            )
+            self.assertIn(
+                "approval_feedback_api",
+                payload["error"]["blocked_services"],
+            )
+
+    def test_up_wrong_env_target_blocks_before_mutation(self) -> None:
+        # US-3: wrong env target path -> reconcile returns
+        # LOCAL_RUNTIME_ENV_OUTPUT_MISSING and run_up surfaces it with no
+        # mutation.  Confirms the pre-mutation ordering (reconcile runs
+        # before mode validation and start).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = _build_local_core(
+                Path(tmpdir).resolve(),
+                approval_env_filename=".env.local",
+            )
+            exit_code, payload = MANAGE_MODULE.run_up(
+                model=model,
+                client_id="personal",
+                profile="local-core",
+                requested_mode="reuse",
+                dry_run=True,
+            )
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(
+                payload["error"]["type"], "LOCAL_RUNTIME_ENV_OUTPUT_MISSING",
+            )
+            self.assertEqual(payload["services"], [])
+
+
+class LocalCoreParityLedgerUS4RunUpTests(unittest.TestCase):
+    """WG-007 / US-4: run_up rejects deferred surfaces pre-mutation."""
+
+    def test_up_deferred_service_rejected_pre_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = _build_local_core(Path(tmpdir).resolve())
+            exit_code, payload = MANAGE_MODULE.run_up(
+                model=model,
+                client_id="personal",
+                profile="local-core",
+                requested_mode="reuse",
+                service_filter=["buildooor"],
+                dry_run=True,
+            )
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(
+                payload["error"]["type"], "LOCAL_RUNTIME_SERVICE_DEFERRED",
+            )
+            self.assertEqual(payload["services"], [])
+            self.assertEqual(payload["bootstrap_tasks"], [])
+
+    def test_up_bridge_only_seam_rejected_as_service_deferred(self) -> None:
+        # Bridge-only seams route through LOCAL_RUNTIME_SERVICE_DEFERRED
+        # (NOT LOCAL_RUNTIME_ENV_BRIDGE_FAILED) per shared.md US-4.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = _build_local_core(Path(tmpdir).resolve())
+            exit_code, payload = MANAGE_MODULE.run_up(
+                model=model,
+                client_id="personal",
+                profile="local-core",
+                requested_mode="reuse",
+                service_filter=["sync-sh-env-compilation"],
+                dry_run=True,
+            )
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(
+                payload["error"]["type"], "LOCAL_RUNTIME_SERVICE_DEFERRED",
+            )
+            self.assertNotEqual(
+                payload["error"]["type"], "LOCAL_RUNTIME_ENV_BRIDGE_FAILED",
+            )
+
+
+class LocalMinimalRegressionTests(unittest.TestCase):
+    """WG-007: Regression — the local-minimal subset still resolves and
+    orchestrates under the new contract."""
+
+    def test_local_minimal_focus_resolves_three_service_subset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = _build_local_core(repo)
+            # Promote the three-service subset into local-minimal as well,
+            # so the same overlay answers both profile ids.  This mirrors
+            # shared.md Rule 1: local-minimal is a subset of local-core,
+            # not a competing bridge path.
+            for service in model["services"]:
+                if service["id"] in ("spaps", "htma_server", "htma"):
+                    service["profiles"] = sorted(
+                        set(service["profiles"]) | {"local-minimal"}
+                    )
+            for bridge in model["bridges"]:
+                bridge["profiles"] = sorted(
+                    set(bridge["profiles"]) | {"local-minimal"}
+                )
+            for task in model["tasks"]:
+                if task["id"] == "env-bridge-local-core":
+                    task["profiles"] = sorted(
+                        set(task["profiles"]) | {"local-minimal"}
+                    )
+            model["active_profiles"] = ["core", "local-minimal"]
+
+            services = MANAGE_MODULE.select_local_runtime_services(
+                model, "local-minimal",
+            )
+            ids = [s["id"] for s in services]
+            self.assertEqual(ids, ["spaps", "htma_server", "htma"])
+
+            # focus reconciliation still passes against the same bridge outputs
+            result = MANAGE_MODULE.reconcile_local_runtime_env(
+                model, "local-minimal", overlay_path=None, dry_run=True,
+            )
+            self.assertEqual(result["status"], "ready", result)
+
+            # up --mode reuse (dry-run) plans the three-service topo order
+            exit_code, payload = MANAGE_MODULE.run_up(
+                model=model,
+                client_id="personal",
+                profile="local-minimal",
+                requested_mode="reuse",
+                dry_run=True,
+            )
+            self.assertEqual(exit_code, 0, payload)
+            ordered = [s["id"] for s in payload["services"]]
+            self.assertEqual(ordered, ["spaps", "htma_server", "htma"])
+
+
 if __name__ == "__main__":
     unittest.main()
