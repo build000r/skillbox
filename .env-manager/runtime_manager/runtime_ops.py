@@ -1146,6 +1146,472 @@ def local_runtime_error(
     return err
 
 
+# ---------------------------------------------------------------------------
+# WG-004: focus + bridge/env reconciliation for local-core
+# ---------------------------------------------------------------------------
+#
+# Flow 1 (flows.md:10-34) and Rule 3 + Rule 4 (backend.md:37-65) require that
+# `manage.py focus` for a local-* profile:
+#   1. Resolve the declared service graph for the profile
+#   2. Re-run the declared bridge task only when outputs are missing or stale
+#      against the overlay mtime; otherwise verify without re-execution
+#   3. Validate each generated env source exists (LOCAL_RUNTIME_ENV_OUTPUT_MISSING)
+#   4. Validate each env target_path matches the repo contract
+#      (approval_feedback_api must use repo-local `.env`)
+#   5. Emit stable error codes at each decision point
+#
+# These helpers are the shared reconciliation surface used by focus.  The
+# `up`/orchestration functions (WG-005) will call the same helpers but from
+# the lifecycle path and with their own policy around retries.
+#
+# Approval-feedback target filename policy: per Rule 4 (backend.md:56-65), the
+# approval_feedback_api repo reads `.env`, not `.env.local`.  All other covered
+# repos currently read `.env.local`, but the runtime must not hard-code that;
+# it only enforces the explicit approval-feedback case and otherwise accepts
+# whatever filename the overlay declares as long as it is an env-style file
+# inside the declared repo directory.
+APPROVAL_FEEDBACK_REPO_IDS = frozenset(
+    {"approval-feedback-api", "approval_feedback_api"}
+)
+APPROVAL_FEEDBACK_REQUIRED_FILENAME = ".env"
+
+
+def local_runtime_active_profile(model: dict[str, Any]) -> str | None:
+    """Return the single active `local-*` profile, if any.
+
+    Focus only ever operates on one local-* profile at a time; this helper
+    normalises the lookup and ignores the framing `core` profile.
+    """
+    for raw_profile in model.get("active_profiles") or []:
+        profile = str(raw_profile).strip()
+        if profile.startswith("local-"):
+            return profile
+    return None
+
+
+def select_local_runtime_bridges(
+    model: dict[str, Any],
+    profile: str,
+) -> list[dict[str, Any]]:
+    """Return bridges that declare the given local profile."""
+    bridges: list[dict[str, Any]] = []
+    for bridge in model.get("bridges") or []:
+        declared = [str(p).strip() for p in (bridge.get("profiles") or [])]
+        if profile in declared:
+            bridges.append(bridge)
+    return bridges
+
+
+def select_local_runtime_tasks_for_bridges(
+    model: dict[str, Any],
+    bridges: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return bootstrap tasks that materialise the given bridges."""
+    bridge_ids = {
+        str(bridge.get("id", "")).strip()
+        for bridge in bridges
+        if str(bridge.get("id", "")).strip()
+    }
+    if not bridge_ids:
+        return []
+    return [
+        task
+        for task in model.get("tasks") or []
+        if str(task.get("bridge_id", "")).strip() in bridge_ids
+    ]
+
+
+def select_local_runtime_services(
+    model: dict[str, Any],
+    profile: str,
+) -> list[dict[str, Any]]:
+    """Return services declared in the given local profile, preserving overlay order."""
+    services: list[dict[str, Any]] = []
+    for service in model.get("services") or []:
+        declared = [str(p).strip() for p in (service.get("profiles") or [])]
+        if profile in declared:
+            services.append(service)
+    return services
+
+
+def select_local_runtime_env_files(
+    model: dict[str, Any],
+    profile: str,
+) -> list[dict[str, Any]]:
+    """Return env_files declared in the given local profile."""
+    files: list[dict[str, Any]] = []
+    for env_file in model.get("env_files") or []:
+        declared = [str(p).strip() for p in (env_file.get("profiles") or [])]
+        if profile in declared:
+            files.append(env_file)
+    return files
+
+
+def local_runtime_overlay_path(
+    model: dict[str, Any],
+    client_id: str | None = None,
+) -> str | None:
+    """Return the host path of the overlay for the active client, if known.
+
+    The loader stores the overlay path on each client entry as
+    `_overlay_path` (see workflows.run_focus).
+    """
+    target_client = (client_id or "").strip()
+    for client in model.get("clients") or []:
+        cid = str(client.get("id", "")).strip()
+        if target_client and cid != target_client:
+            continue
+        overlay_path = client.get("_overlay_path")
+        if overlay_path:
+            return str(overlay_path)
+    return None
+
+
+def validate_env_file_target_paths(
+    env_files: list[dict[str, Any]],
+    model: dict[str, Any],
+) -> list[str]:
+    """Return a list of violation messages for env target paths.
+
+    Rule 4 (backend.md:56-65): each declared env target_path must match the
+    repo's real env contract.  approval_feedback_api must use repo-local
+    `.env`; the runtime must not assume a uniform `.env.local` convention.
+
+    The validation runs against each env_file's post-normalisation `host_path`
+    (the materialised target path) and uses the `repo` id to locate the repo's
+    host directory.
+    """
+    violations: list[str] = []
+    repo_map = runtime_repo_map(model)
+
+    for env_file in env_files:
+        env_id = str(env_file.get("id", "")).strip() or "(missing id)"
+        target_raw = env_file.get("host_path") or env_file.get("path")
+        if not target_raw:
+            violations.append(f"{env_id}: missing target path")
+            continue
+
+        target_path = Path(str(target_raw))
+        repo_id = str(env_file.get("repo") or "").strip()
+
+        # approval_feedback_api: must use .env exactly, not .env.local
+        if repo_id in APPROVAL_FEEDBACK_REPO_IDS:
+            if target_path.name != APPROVAL_FEEDBACK_REQUIRED_FILENAME:
+                violations.append(
+                    f"{env_id}: approval_feedback_api env target must be "
+                    f"{APPROVAL_FEEDBACK_REQUIRED_FILENAME!r}, got {target_path.name!r} "
+                    f"(target_path={target_path})"
+                )
+                continue
+
+        # All env targets must look like env files (either .env or .env.<tier>)
+        name = target_path.name
+        if not (name == ".env" or name.startswith(".env.")):
+            violations.append(
+                f"{env_id}: target path {target_path} is not an env-style file"
+            )
+            continue
+
+        # The env target must live inside the declared repo host directory.
+        if repo_id and repo_id in repo_map:
+            repo_host = Path(str(repo_map[repo_id].get("host_path") or ""))
+            if repo_host:
+                try:
+                    target_path.resolve().relative_to(repo_host.resolve())
+                except (ValueError, OSError):
+                    violations.append(
+                        f"{env_id}: target_path {target_path} is not inside "
+                        f"repo {repo_id} at {repo_host}"
+                    )
+
+    return violations
+
+
+def bridges_need_rerun(
+    bridges: list[dict[str, Any]],
+    overlay_path: str | None,
+) -> tuple[bool, dict[str, dict[str, Any]]]:
+    """Return (needs_rerun, freshness_by_id) for the given bridges.
+
+    A bridge needs rerun when its freshness reports anything other than
+    `fresh=True` (outputs missing, stale vs overlay mtime, or no outputs).
+    """
+    freshness_by_id: dict[str, dict[str, Any]] = {}
+    needs_rerun = False
+    for bridge in bridges:
+        bid = str(bridge.get("id", "")).strip() or "(missing id)"
+        freshness = bridge_freshness(bridge, overlay_path)
+        freshness_by_id[bid] = freshness
+        if not freshness.get("fresh"):
+            needs_rerun = True
+    return needs_rerun, freshness_by_id
+
+
+def run_local_runtime_bridge_tasks(
+    model: dict[str, Any],
+    tasks: list[dict[str, Any]],
+    *,
+    dry_run: bool = False,
+) -> list[dict[str, Any]]:
+    """Execute the given bridge-backed bootstrap tasks in dependency order.
+
+    Wraps `run_tasks` but translates any failure into a
+    RuntimeError tagged so callers can map it to
+    LOCAL_RUNTIME_ENV_BRIDGE_FAILED without guessing from the error string.
+    """
+    if not tasks:
+        return []
+    ordered = resolve_tasks_for_run(model, tasks)
+    return run_tasks(model, ordered, dry_run=dry_run)
+
+
+def reconcile_local_runtime_env(
+    model: dict[str, Any],
+    profile: str,
+    *,
+    overlay_path: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Implement Flow 1 bridge/env reconciliation for a local-* profile.
+
+    Returns a result dict with shape:
+      {
+        "status": "ready" | "blocked",
+        "profile": <profile>,
+        "bridges": [ {id, status, freshness, ...}, ... ],
+        "env_files": [ {id, path, present}, ... ],
+        "actions": [ ... ],  # action log lines
+        "error": {...}       # only when status == "blocked"
+      }
+
+    Steps follow backend.md:136-146:
+      1. Resolve bridges + tasks + env files for the profile
+      2. Re-run bridge tasks when stale / outputs missing
+      3. Validate each generated env source exists
+      4. Validate target_path matches repo contract
+      5. Mark blocked on any failure with a stable LOCAL_RUNTIME_* code
+    """
+    actions: list[str] = []
+    result: dict[str, Any] = {
+        "status": "ready",
+        "profile": profile,
+        "bridges": [],
+        "env_files": [],
+        "actions": actions,
+    }
+
+    # (0) Unknown / empty profile -> LOCAL_RUNTIME_PROFILE_UNKNOWN
+    if not profile or not profile.strip():
+        result["status"] = "blocked"
+        result.update(local_runtime_error(
+            "LOCAL_RUNTIME_PROFILE_UNKNOWN",
+            "No local runtime profile selected.",
+            recoverable=False,
+            available_profiles=sorted({
+                str(p).strip()
+                for service in model.get("services") or []
+                for p in service.get("profiles") or []
+                if str(p).strip().startswith("local-")
+            }),
+        ))
+        return result
+
+    services = select_local_runtime_services(model, profile)
+    if not services:
+        result["status"] = "blocked"
+        result.update(local_runtime_error(
+            "LOCAL_RUNTIME_PROFILE_UNKNOWN",
+            f"Profile {profile!r} has no declared local-runtime services.",
+            recoverable=False,
+            available_profiles=sorted({
+                str(p).strip()
+                for service in model.get("services") or []
+                for p in service.get("profiles") or []
+                if str(p).strip().startswith("local-")
+            }),
+        ))
+        return result
+
+    # (1) Resolve bridges + bridge-backed tasks + env files
+    bridges = select_local_runtime_bridges(model, profile)
+    bridge_tasks = select_local_runtime_tasks_for_bridges(model, bridges)
+    env_files = select_local_runtime_env_files(model, profile)
+
+    # (2) Bridge freshness decision -- Flow 1 decision point
+    needs_rerun, freshness_by_id = bridges_need_rerun(bridges, overlay_path)
+    if needs_rerun and bridge_tasks:
+        actions.append(
+            f"bridge-rerun: stale or missing outputs for "
+            f"{', '.join(sorted(freshness_by_id))}"
+        )
+        try:
+            run_local_runtime_bridge_tasks(model, bridge_tasks, dry_run=dry_run)
+        except RuntimeError as exc:
+            result["status"] = "blocked"
+            result.update(local_runtime_error(
+                "LOCAL_RUNTIME_ENV_BRIDGE_FAILED",
+                str(exc),
+                recoverable=True,
+                next_action="Inspect sync.sh bridge logs and rerun focus.",
+            ))
+            # Still surface bridge freshness for observability
+            result["bridges"] = [
+                {
+                    "id": str(bridge.get("id", "")),
+                    "status": "failed",
+                    "freshness": freshness_by_id.get(str(bridge.get("id", ""))),
+                }
+                for bridge in bridges
+            ]
+            return result
+    elif not bridges:
+        actions.append("bridge-skip: no bridges declared for profile")
+    else:
+        actions.append("bridge-verify: all bridge outputs are fresh")
+
+    # Re-probe bridge state after any rerun.
+    bridge_report: list[dict[str, Any]] = []
+    any_bridge_missing = False
+    missing_outputs: list[str] = []
+    for bridge in bridges:
+        bid = str(bridge.get("id", "")).strip()
+        state = bridge_outputs_state(bridge)
+        ready = state["state"] == "ok"
+        if not ready:
+            any_bridge_missing = True
+            missing_outputs.extend(state.get("missing", []))
+        bridge_report.append({
+            "id": bid,
+            "status": "ready" if ready else state["state"],
+            "freshness": freshness_by_id.get(bid),
+            "outputs": state.get("outputs", []),
+            "missing": state.get("missing", []),
+        })
+    result["bridges"] = bridge_report
+
+    if any_bridge_missing:
+        result["status"] = "blocked"
+        result.update(local_runtime_error(
+            "LOCAL_RUNTIME_ENV_OUTPUT_MISSING",
+            "Bridge outputs missing after reconciliation: "
+            + ", ".join(missing_outputs),
+            recoverable=True,
+            next_action="Inspect sync.sh bridge and rerun focus.",
+        ))
+        return result
+
+    # (3) Validate each generated env source exists
+    missing_sources: list[str] = []
+    env_file_report: list[dict[str, Any]] = []
+    for env_file in env_files:
+        state = env_file_state(env_file)
+        source_present = True
+        source_host_path = state.get("source_host_path") or ""
+        if source_host_path:
+            source_present = Path(source_host_path).is_file()
+        env_file_report.append({
+            "id": env_file.get("id"),
+            "repo": env_file.get("repo"),
+            "target_path": state.get("host_path"),
+            "source_path": source_host_path,
+            "source_present": source_present,
+            "target_present": state.get("present"),
+            "state": state.get("state"),
+        })
+        if env_file.get("required") and source_host_path and not source_present:
+            missing_sources.append(source_host_path)
+    result["env_files"] = env_file_report
+
+    if missing_sources:
+        result["status"] = "blocked"
+        result.update(local_runtime_error(
+            "LOCAL_RUNTIME_ENV_OUTPUT_MISSING",
+            "Required env sources missing: " + ", ".join(missing_sources),
+            recoverable=True,
+            next_action="Inspect sync.sh bridge outputs and rerun focus.",
+        ))
+        return result
+
+    # (4) Validate each target_path matches the repo contract (Rule 4)
+    target_violations = validate_env_file_target_paths(env_files, model)
+    if target_violations:
+        result["status"] = "blocked"
+        result.update(local_runtime_error(
+            "LOCAL_RUNTIME_ENV_OUTPUT_MISSING",
+            "Env target path contract violated: " + "; ".join(target_violations),
+            recoverable=False,
+            next_action="Update overlay env_files target_path to match repo contract.",
+        ))
+        return result
+
+    # (5) All prerequisites satisfied
+    return result
+
+
+def local_runtime_focus_payload(
+    model: dict[str, Any],
+    reconcile_result: dict[str, Any],
+    *,
+    client_id: str,
+) -> dict[str, Any]:
+    """Build the US-1 focus response payload (shared.md:397-416).
+
+    Shape:
+      {
+        "client_id": <cid>,
+        "active_profiles": [...],
+        "local_runtime": {
+          "profile": <profile>,
+          "default_mode": "reuse",
+          "env_bridge": {"id": ..., "status": ...},
+          "services": [{"id": ..., "state": "stopped"}, ...]
+        },
+        "next_actions": [...]
+      }
+    """
+    profile = str(reconcile_result.get("profile") or "")
+    active_profiles = sorted(model.get("active_profiles") or [])
+
+    bridge_entries = reconcile_result.get("bridges") or []
+    if len(bridge_entries) == 1:
+        env_bridge: Any = {
+            "id": bridge_entries[0]["id"],
+            "status": bridge_entries[0]["status"],
+        }
+    elif bridge_entries:
+        env_bridge = [
+            {"id": entry["id"], "status": entry["status"]}
+            for entry in bridge_entries
+        ]
+    else:
+        env_bridge = {"id": None, "status": "absent"}
+
+    service_entries: list[dict[str, Any]] = []
+    for service in select_local_runtime_services(model, profile):
+        probe = probe_service(model, service)
+        service_entries.append({
+            "id": service["id"],
+            "state": probe.get("state", "stopped"),
+        })
+
+    next_actions = [
+        f"manage.py up --client {client_id} --profile {profile} --mode reuse",
+        f"manage.py status --client {client_id} --profile {profile}",
+    ]
+
+    return {
+        "client_id": client_id,
+        "active_profiles": active_profiles,
+        "local_runtime": {
+            "profile": profile,
+            "default_mode": "reuse",
+            "env_bridge": env_bridge,
+            "services": service_entries,
+        },
+        "next_actions": next_actions,
+    }
+
+
 def task_success_state(task: dict[str, Any], model: dict[str, Any] | None = None) -> dict[str, Any]:
     # Bridge-backed task: check all bridge outputs exist
     bridge_id = str(task.get("bridge_id", "")).strip()
