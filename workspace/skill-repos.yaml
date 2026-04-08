@@ -27,13 +27,18 @@ skill_repos:
   # Shared workflow skills from the main opensource skills repo
   - path: ../../skills
     pick:
+      - crap
       - divide-and-conquer
       - domain-planner
       - domain-reviewer
       - domain-scaffolder
+      - mutate
+      - oss-doc-audit
 
   # Private local skills that should ship with the default box setup
   - path: ../../../skills-private
     pick:
       - cass
+      - changelog-md-workmanship
+      - readme-writing
       - smart
