@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
@@ -31,21 +32,117 @@ class BoxTests(unittest.TestCase):
             ["env", "TAILSCALE_AUTHKEY=tskey-abc'; touch /tmp/pwned #", "bash", "-s"],
         )
 
-    def test_build_onboard_command_preserves_literal_blueprint_and_set_args(self) -> None:
+    def test_build_first_box_command_preserves_literal_blueprint_and_set_args(self) -> None:
         blueprint = "/tmp/client blueprint.yaml"
         set_args = [
             "PRIMARY_REPO_URL=https://example.com/repo?a=1&b=2",
             "PROJECT_NAME=one; touch /tmp/pwned",
         ]
 
-        command = BOX_MODULE.build_onboard_command("client-box", blueprint, set_args)
+        command = BOX_MODULE.build_first_box_command(
+            "client-box",
+            repo_dir="/home/skillbox/skillbox",
+            private_path="/home/skillbox/skillbox-config",
+            active_profiles=["core", "ops"],
+            blueprint=blueprint,
+            set_args=set_args,
+        )
         tokens = shlex.split(command)
 
-        self.assertEqual(tokens[:5], ["cd", "&&", "cd", "skillbox", "&&"])
+        self.assertEqual(tokens[:3], ["cd", "/home/skillbox/skillbox", "&&"])
         self.assertEqual(
-            tokens[5:],
-            BOX_MODULE.build_onboard_manage_argv("client-box", blueprint, set_args),
+            tokens[3:],
+            BOX_MODULE.build_first_box_manage_argv(
+                "client-box",
+                private_path="/home/skillbox/skillbox-config",
+                active_profiles=["core", "ops"],
+                blueprint=blueprint,
+                set_args=set_args,
+            ),
         )
+
+    def test_build_release_install_args_uses_offline_archive_and_skips_first_box(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            archive_path = root / "skillbox.tar.gz"
+            archive_path.write_bytes(b"fixture release archive\n")
+            archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+            manifest_path = root / "deploy.json"
+            manifest_path.write_text(json.dumps({
+                "client_id": "personal",
+                "source_commit": "abc123def456",
+                "payload_tree_sha256": "1" * 64,
+                "archive": "skillbox.tar.gz",
+                "archive_sha256": archive_sha256,
+            }), encoding="utf-8")
+
+            release = BOX_MODULE.load_deploy_manifest(manifest_path, expected_client_id="personal")
+            args = BOX_MODULE.build_release_install_args(
+                "personal",
+                release,
+                remote_archive_path="/home/skillbox/skillbox.tar.gz",
+                repo_dir="/home/skillbox/skillbox",
+                private_path="/home/skillbox/skillbox-config",
+            )
+
+            self.assertEqual(
+                args,
+                [
+                    "--offline", "/home/skillbox/skillbox.tar.gz",
+                    "--sha256", archive_sha256,
+                    "--repo-dir", "/home/skillbox/skillbox",
+                    "--private-path", "/home/skillbox/skillbox-config",
+                    "--client", "personal",
+                    "--skip-first-box",
+                    "--no-gum",
+                ],
+            )
+
+    def test_build_release_upgrade_args_carries_non_core_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            archive_path = root / "skillbox.tar.gz"
+            archive_path.write_bytes(b"fixture release archive\n")
+            archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+            manifest_path = root / "deploy.json"
+            manifest_path.write_text(json.dumps({
+                "client_id": "personal",
+                "source_commit": "abc123def456",
+                "payload_tree_sha256": "1" * 64,
+                "active_profiles": ["connectors", "core"],
+                "archive": "skillbox.tar.gz",
+                "archive_sha256": archive_sha256,
+            }), encoding="utf-8")
+
+            release = BOX_MODULE.load_deploy_manifest(manifest_path, expected_client_id="personal")
+            args = BOX_MODULE.build_release_upgrade_args(
+                "personal",
+                release,
+                remote_archive_path="/home/skillbox/skillbox.tar.gz",
+                repo_dir="/home/skillbox/skillbox",
+            )
+
+            self.assertEqual(
+                args,
+                [
+                    "--archive", "/home/skillbox/skillbox.tar.gz",
+                    "--sha256", archive_sha256,
+                    "--repo-dir", "/home/skillbox/skillbox",
+                    "--client", "personal",
+                    "--profile", "connectors",
+                ],
+            )
+
+    def test_build_deploy_command_keeps_branch_clone_for_legacy_profiles(self) -> None:
+        profile = BOX_MODULE.load_profile("dev-small")
+        command = BOX_MODULE.build_deploy_command(profile)
+        tokens = shlex.split(command)
+
+        self.assertIn("git", tokens)
+        self.assertIn("clone", tokens)
+        self.assertIn("--branch", tokens)
+        self.assertIn(profile.skillbox_branch, tokens)
+        self.assertIn(profile.skillbox_repo, tokens)
 
     def test_profiles_lists_available_profiles(self) -> None:
         result = self._run("profiles", "--format", "json")
@@ -133,19 +230,31 @@ class BoxTests(unittest.TestCase):
             self.assertTrue(payload["dry_run"])
             self.assertIn("steps", payload)
             step_names = [s["step"] for s in payload["steps"]]
-            self.assertEqual(step_names, ["create", "bootstrap", "enroll", "deploy", "onboard", "verify"])
+            self.assertEqual(step_names, ["create", "storage", "bootstrap", "enroll", "deploy", "first-box"])
             for s in payload["steps"]:
                 self.assertEqual(s["status"], "skip", f"step {s['step']} should be skip in dry-run")
             self.assertIn("profile", payload)
             self.assertEqual(payload["profile"]["region"], "nyc3")
+            self.assertEqual(payload["volume"]["name"], "skillbox-state-dry-test")
 
     def test_up_fails_without_do_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            archive_path = root / "skillbox.tar.gz"
+            archive_path.write_bytes(b"fixture release archive\n")
+            archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+            manifest_path = root / "deploy.json"
+            manifest_path.write_text(json.dumps({
+                "client_id": "no-token",
+                "source_commit": "abc123def456",
+                "payload_tree_sha256": "1" * 64,
+                "archive": "skillbox.tar.gz",
+                "archive_sha256": archive_sha256,
+            }), encoding="utf-8")
             env = self._env_with_inventory(tmpdir)
-            # Deliberately omit DO token
 
             result = self._run(
-                "up", "no-token", "--profile", "dev-small", "--format", "json",
+                "up", "no-token", "--profile", "dev-small", "--deploy-manifest", str(manifest_path), "--format", "json",
                 env=env,
             )
 
@@ -213,6 +322,135 @@ class BoxTests(unittest.TestCase):
             self.assertTrue(payload["dry_run"])
             step_names = [s["step"] for s in payload["steps"]]
             self.assertEqual(step_names, ["drain", "remove", "destroy"])
+
+    def test_upgrade_dry_run_shows_release_and_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            inv_path = root / "workspace" / "boxes.json"
+            inv_path.parent.mkdir(parents=True)
+            inv_path.write_text(json.dumps({
+                "boxes": [
+                    {"id": "jeremy", "profile": "dev-small", "state": "ready",
+                     "droplet_id": "321", "droplet_ip": "1.2.3.4",
+                     "tailscale_hostname": "skillbox-jeremy", "tailscale_ip": "100.64.1.9",
+                     "ssh_user": "skillbox", "created_at": "", "updated_at": "",
+                     "region": "nyc3", "size": "s-2vcpu-4gb"},
+                ],
+            }))
+            archive_path = root / "skillbox.tar.gz"
+            archive_path.write_bytes(b"fixture release archive\n")
+            archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+            manifest_path = root / "deploy.json"
+            manifest_path.write_text(json.dumps({
+                "client_id": "jeremy",
+                "source_commit": "abc123def456",
+                "payload_tree_sha256": "1" * 64,
+                "active_profiles": ["connectors", "core"],
+                "archive": "skillbox.tar.gz",
+                "archive_sha256": archive_sha256,
+            }), encoding="utf-8")
+
+            env = self._env_with_inventory(tmpdir)
+            result = self._run(
+                "upgrade",
+                "jeremy",
+                "--deploy-manifest",
+                str(manifest_path),
+                "--dry-run",
+                "--format",
+                "json",
+                env=env,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["dry_run"])
+            self.assertEqual([step["step"] for step in payload["steps"]], ["upload", "upgrade", "verify"])
+            self.assertTrue(all(step["status"] == "skip" for step in payload["steps"]))
+            self.assertEqual(payload["deploy_release"]["source_commit"], "abc123def456")
+            self.assertEqual(payload["deploy_release"]["active_profiles"], ["connectors", "core"])
+
+    def test_upgrade_rejects_non_ready_box(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            inv_path = root / "workspace" / "boxes.json"
+            inv_path.parent.mkdir(parents=True)
+            inv_path.write_text(json.dumps({
+                "boxes": [
+                    {"id": "jeremy", "profile": "dev-small", "state": "deploying",
+                     "droplet_id": "321", "droplet_ip": "1.2.3.4",
+                     "tailscale_hostname": "skillbox-jeremy", "tailscale_ip": "100.64.1.9",
+                     "ssh_user": "skillbox", "created_at": "", "updated_at": "",
+                     "region": "nyc3", "size": "s-2vcpu-4gb"},
+                ],
+            }))
+            archive_path = root / "skillbox.tar.gz"
+            archive_path.write_bytes(b"fixture release archive\n")
+            archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+            manifest_path = root / "deploy.json"
+            manifest_path.write_text(json.dumps({
+                "client_id": "jeremy",
+                "source_commit": "abc123def456",
+                "payload_tree_sha256": "1" * 64,
+                "archive": "skillbox.tar.gz",
+                "archive_sha256": archive_sha256,
+            }), encoding="utf-8")
+
+            env = self._env_with_inventory(tmpdir)
+            result = self._run(
+                "upgrade",
+                "jeremy",
+                "--deploy-manifest",
+                str(manifest_path),
+                "--format",
+                "json",
+                env=env,
+            )
+
+            self.assertEqual(result.returncode, 1)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["error"]["type"], "invalid_state")
+
+    def test_upgrade_rejects_mismatched_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            inv_path = root / "workspace" / "boxes.json"
+            inv_path.parent.mkdir(parents=True)
+            inv_path.write_text(json.dumps({
+                "boxes": [
+                    {"id": "jeremy", "profile": "dev-small", "state": "ready",
+                     "droplet_id": "321", "droplet_ip": "1.2.3.4",
+                     "tailscale_hostname": "skillbox-jeremy", "tailscale_ip": "100.64.1.9",
+                     "ssh_user": "skillbox", "created_at": "", "updated_at": "",
+                     "region": "nyc3", "size": "s-2vcpu-4gb"},
+                ],
+            }))
+            archive_path = root / "skillbox.tar.gz"
+            archive_path.write_bytes(b"fixture release archive\n")
+            archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+            manifest_path = root / "deploy.json"
+            manifest_path.write_text(json.dumps({
+                "client_id": "someone-else",
+                "source_commit": "abc123def456",
+                "payload_tree_sha256": "1" * 64,
+                "archive": "skillbox.tar.gz",
+                "archive_sha256": archive_sha256,
+            }), encoding="utf-8")
+
+            env = self._env_with_inventory(tmpdir)
+            result = self._run(
+                "upgrade",
+                "jeremy",
+                "--deploy-manifest",
+                str(manifest_path),
+                "--format",
+                "json",
+                env=env,
+            )
+
+            self.assertEqual(result.returncode, 1)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["error"]["type"], "deploy_manifest_invalid")
 
     def test_inventory_round_trip(self) -> None:
         """Verify inventory serialization and deserialization."""

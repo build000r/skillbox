@@ -39,18 +39,18 @@ class RuntimeModelTests(unittest.TestCase):
             self.assertEqual(skills["default-skills"]["bundle_dir_host_path"], str(repo / "default-skills"))
             self.assertEqual(
                 skills["default-skills"]["install_targets"][0]["host_path"],
-                str(repo / "home" / ".claude" / "skills"),
+                str(repo / ".skillbox-state" / "home" / ".claude" / "skills"),
             )
             self.assertEqual(
                 tasks["bootstrap"]["success"]["host_path"],
-                str(repo / "logs" / "runtime" / "bootstrap.ok"),
+                str(repo / ".skillbox-state" / "logs" / "runtime" / "bootstrap.ok"),
             )
             self.assertEqual(
                 services["api"]["healthcheck"]["host_path"],
                 str(repo / "scripts" / "check-api.sh"),
             )
             self.assertEqual(services["web"]["profiles"], ["surfaces"])
-            self.assertEqual(logs["runtime"]["host_path"], str(repo / "logs" / "runtime.log"))
+            self.assertEqual(logs["runtime"]["host_path"], str(repo / ".skillbox-state" / "logs" / "runtime.log"))
             self.assertEqual(checks["repo-root"]["host_path"], str(repo / "repos"))
             self.assertEqual(clients["inline"]["default_cwd_host_path"], str(repo / "repos" / "inline"))
             self.assertEqual(clients["overlayed"]["default_cwd_host_path"], str(repo / "repos" / "overlayed"))
@@ -142,7 +142,25 @@ class RuntimeModelTests(unittest.TestCase):
                 "client:\n  - invalid\n",
                 encoding="utf-8",
             )
-            (repo / ".env.example").write_text("", encoding="utf-8")
+            (repo / "workspace" / "persistence.yaml").write_text(
+                "version: 1\n"
+                "state_root_env: SKILLBOX_STATE_ROOT\n"
+                "targets:\n"
+                "  local:\n"
+                "    provider: local\n"
+                "    default_state_root: ./.skillbox-state\n"
+                "bindings:\n"
+                "  - id: workspace-root\n"
+                "    runtime_path: /workspace\n"
+                "    storage_class: external\n"
+                "    source_ref: root_dir\n"
+                "  - id: clients-root\n"
+                "    runtime_path: /workspace/workspace/clients\n"
+                "    storage_class: persistent\n"
+                "    relative_path: clients\n",
+                encoding="utf-8",
+            )
+            (repo / ".env.example").write_text("SKILLBOX_CLIENTS_HOST_ROOT=./workspace/clients\n", encoding="utf-8")
 
             with self.assertRaisesRegex(RuntimeError, "Expected `client` to be a mapping"):
                 runtime_model.load_client_overlays(repo, runtime_model.load_runtime_env(repo))
@@ -150,6 +168,43 @@ class RuntimeModelTests(unittest.TestCase):
     def _write_fixture(self, repo: Path) -> None:
         (repo / "workspace" / "clients" / "overlayed").mkdir(parents=True)
         (repo / "defaults").mkdir()
+        (repo / "workspace" / "persistence.yaml").write_text(
+            textwrap.dedent(
+                """\
+                version: 1
+                state_root_env: SKILLBOX_STATE_ROOT
+                targets:
+                  local:
+                    provider: local
+                    default_state_root: ./.skillbox-state
+                  digitalocean:
+                    provider: digitalocean
+                    default_state_root: /srv/skillbox
+                bindings:
+                  - id: workspace-root
+                    runtime_path: /workspace
+                    storage_class: external
+                    source_ref: root_dir
+                  - id: claude-home
+                    runtime_path: /workspace/home/.claude
+                    storage_class: persistent
+                    relative_path: home/.claude
+                  - id: clients-root
+                    runtime_path: /workspace/workspace/clients
+                    storage_class: persistent
+                    relative_path: clients
+                  - id: logs-root
+                    runtime_path: /workspace/logs
+                    storage_class: persistent
+                    relative_path: logs
+                  - id: monoserver-root
+                    runtime_path: /monoserver
+                    storage_class: persistent
+                    relative_path: monoserver
+                """
+            ),
+            encoding="utf-8",
+        )
         (repo / ".env.example").write_text(
             textwrap.dedent(
                 """\

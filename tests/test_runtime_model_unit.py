@@ -92,7 +92,7 @@ class RuntimeModelUnitTests(unittest.TestCase):
 
         self.assertEqual(clients_path, ROOT_DIR / "workspace" / "clients" / "acme" / "overlay.yaml")
         self.assertEqual(workspace_path, ROOT_DIR / "scripts" / "box.py")
-        self.assertEqual(home_path, ROOT_DIR / "home" / ".claude" / "settings.json")
+        self.assertEqual(home_path, ROOT_DIR / ".skillbox-state" / "home" / ".claude" / "settings.json")
         self.assertEqual(monoserver_path, (ROOT_DIR / "monoserver-host" / "project" / "app.py").resolve())
 
     def test_build_runtime_model_populates_host_paths(self) -> None:
@@ -113,19 +113,25 @@ class RuntimeModelUnitTests(unittest.TestCase):
             client_entry = next(item for item in model["clients"] if item["id"] == "acme")
 
             self.assertEqual(Path(repo_entry["host_path"]).resolve(), repo.resolve())
-            self.assertEqual(Path(artifact_entry["host_path"]).resolve(), (repo / "home" / ".local" / "bin" / "tool").resolve())
+            self.assertEqual(
+                Path(artifact_entry["host_path"]).resolve(),
+                (repo / ".skillbox-state" / "home" / ".local" / "bin" / "tool").resolve(),
+            )
             self.assertEqual(Path(artifact_entry["source"]["host_path"]).resolve(), (repo / "artifacts" / "tool").resolve())
             self.assertEqual(Path(env_file_entry["host_path"]).resolve(), (repo / ".env").resolve())
             self.assertEqual(Path(env_file_entry["source"]["host_path"]).resolve(), (repo / "env" / "runtime.env").resolve())
             self.assertEqual(Path(skill_entry["bundle_dir_host_path"]).resolve(), (repo / "default-skills").resolve())
             self.assertEqual(
                 Path(skill_entry["install_targets"][0]["host_path"]).resolve(),
-                (repo / "home" / ".claude" / "skills").resolve(),
+                (repo / ".skillbox-state" / "home" / ".claude" / "skills").resolve(),
             )
             self.assertEqual(Path(task_entry["success"]["host_path"]).resolve(), (repo / ".done" / "bootstrap.ok").resolve())
             self.assertEqual(Path(service_entry["host_path"]).resolve(), (repo / ".env-manager" / "manage.py").resolve())
             self.assertEqual(Path(service_entry["healthcheck"]["host_path"]).resolve(), repo.resolve())
-            self.assertEqual(Path(log_entry["host_path"]).resolve(), (repo / "logs" / "runtime").resolve())
+            self.assertEqual(
+                Path(log_entry["host_path"]).resolve(),
+                (repo / ".skillbox-state" / "logs" / "runtime").resolve(),
+            )
             self.assertEqual(Path(check_entry["host_path"]).resolve(), repo.resolve())
             self.assertEqual(
                 Path(client_entry["default_cwd_host_path"]).resolve(),
@@ -137,6 +143,43 @@ class RuntimeModelUnitTests(unittest.TestCase):
         (repo / "artifacts").mkdir(parents=True, exist_ok=True)
         (repo / "env").mkdir(parents=True, exist_ok=True)
         (repo / "home" / ".claude" / "skills").mkdir(parents=True, exist_ok=True)
+        (repo / "workspace" / "persistence.yaml").write_text(
+            "version: 1\n"
+            "state_root_env: SKILLBOX_STATE_ROOT\n"
+            "targets:\n"
+            "  local:\n"
+            "    provider: local\n"
+            "    default_state_root: ./.skillbox-state\n"
+            "  digitalocean:\n"
+            "    provider: digitalocean\n"
+            "    default_state_root: /srv/skillbox\n"
+            "bindings:\n"
+            "  - id: workspace-root\n"
+            "    runtime_path: /workspace\n"
+            "    storage_class: external\n"
+            "    source_ref: root_dir\n"
+            "  - id: claude-home\n"
+            "    runtime_path: /home/sandbox/.claude\n"
+            "    storage_class: persistent\n"
+            "    relative_path: home/.claude\n"
+            "  - id: local-home\n"
+            "    runtime_path: /home/sandbox/.local\n"
+            "    storage_class: persistent\n"
+            "    relative_path: home/.local\n"
+            "  - id: clients-root\n"
+            "    runtime_path: /workspace/workspace/clients\n"
+            "    storage_class: persistent\n"
+            "    relative_path: clients\n"
+            "  - id: logs-root\n"
+            "    runtime_path: /workspace/logs\n"
+            "    storage_class: persistent\n"
+            "    relative_path: logs\n"
+            "  - id: monoserver-root\n"
+            "    runtime_path: /monoserver\n"
+            "    storage_class: persistent\n"
+            "    relative_path: monoserver\n",
+            encoding="utf-8",
+        )
 
         (repo / ".env.example").write_text(
             "SKILLBOX_NAME=skillbox\n"

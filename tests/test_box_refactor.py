@@ -22,12 +22,42 @@ def _completed(returncode: int = 0, stdout: str = "", stderr: str = "") -> subpr
     return subprocess.CompletedProcess(["mock"], returncode, stdout=stdout, stderr=stderr)
 
 
+def _storage() -> object:
+    return BOX.BoxProfileStorage(
+        provider="digitalocean",
+        mount_path="/srv/skillbox",
+        filesystem="ext4",
+        required=True,
+        min_free_gb=20,
+    )
+
+
+def _release(client_id: str = "alpha") -> object:
+    return BOX.DeployRelease(
+        manifest_path=Path("/tmp/deploy.json"),
+        client_id=client_id,
+        source_commit="1234567890ab1234567890ab1234567890ab1234",
+        payload_tree_sha256="a" * 64,
+        archive_path=Path("/tmp/skillbox.tar.gz"),
+        archive_sha256="b" * 64,
+        active_profiles=["core", "ops"],
+    )
+
+
 class BoxRefactorTests(unittest.TestCase):
     def test_load_profile_reads_yaml_variants_and_validates_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             profiles_dir = Path(tmpdir)
             (profiles_dir / "custom").write_text(
-                "provider: local\nregion: sfo3\nsize: s-4vcpu-8gb\n",
+                "provider: local\n"
+                "region: sfo3\n"
+                "size: s-4vcpu-8gb\n"
+                "storage:\n"
+                "  provider: local\n"
+                "  mount_path: /srv/skillbox\n"
+                "  filesystem: ext4\n"
+                "  required: true\n"
+                "  min_free_gb: 20\n",
                 encoding="utf-8",
             )
             (profiles_dir / "broken.yaml").write_text("- not-a-mapping\n", encoding="utf-8")
@@ -37,6 +67,7 @@ class BoxRefactorTests(unittest.TestCase):
                 profile = BOX.load_profile("custom")
                 self.assertEqual(profile.provider, "local")
                 self.assertEqual(profile.region, "sfo3")
+                self.assertEqual(profile.storage.mount_path, "/srv/skillbox")
 
                 with self.assertRaisesRegex(RuntimeError, "Expected a YAML mapping"):
                     BOX.load_profile("broken")
@@ -64,28 +95,32 @@ class BoxRefactorTests(unittest.TestCase):
                 self.assertEqual(os.environ["QUX"], "loaded")
 
     def test_cmd_up_success_reports_ready_payload(self) -> None:
-        profile = BOX.BoxProfile(id="dev-small")
+        profile = BOX.BoxProfile(id="dev-small", storage=_storage())
         payloads: list[dict[str, object]] = []
 
         with mock.patch.object(BOX, "load_profile", return_value=profile), \
             mock.patch.object(BOX, "load_inventory", return_value=[]), \
+            mock.patch.object(BOX, "load_deploy_manifest", return_value=_release()), \
             mock.patch.object(BOX, "require_env", side_effect=["do-token", "ssh-key", "ts-auth"]), \
             mock.patch.object(BOX, "do_create_droplet", return_value={"id": 42}), \
             mock.patch.object(BOX, "do_droplet_public_ip", return_value="1.2.3.4"), \
+            mock.patch.object(BOX, "do_find_volume_by_name", return_value=None), \
+            mock.patch.object(BOX, "do_create_volume", return_value={"id": "vol-1", "size_gigabytes": 20}), \
+            mock.patch.object(BOX, "do_attach_volume"), \
+            mock.patch.object(BOX, "do_get_volume", return_value={"id": "vol-1", "size_gigabytes": 20, "droplet_ids": [42]}), \
             mock.patch.object(BOX, "wait_for_ssh", side_effect=[True, True]), \
             mock.patch.object(
                 BOX,
                 "ssh_script",
-                side_effect=[_completed(), _completed()],
+                side_effect=[_completed(), _completed(), _completed()],
             ), \
+            mock.patch.object(BOX, "scp_file", return_value=_completed()), \
             mock.patch.object(
                 BOX,
                 "ssh_cmd",
                 side_effect=[
                     _completed(stdout="100.64.0.1\n"),
-                    _completed(),
-                    _completed(),
-                    _completed(),
+                    _completed(stdout='{"client_id":"alpha","active_profiles":["core","ops"],"created_client":true}\n'),
                 ],
             ), \
             mock.patch.object(BOX, "save_inventory"), \
@@ -95,6 +130,7 @@ class BoxRefactorTests(unittest.TestCase):
                 profile_name="dev-small",
                 blueprint=None,
                 set_args=[],
+                deploy_manifest="/tmp/deploy.json",
                 dry_run=False,
                 fmt="json",
             )
@@ -103,17 +139,24 @@ class BoxRefactorTests(unittest.TestCase):
         payload = payloads[-1]
         self.assertEqual(payload["box_id"], "alpha")
         self.assertEqual(payload["tailscale_ip"], "100.64.0.1")
+        self.assertEqual(payload["storage"]["mount_path"], "/srv/skillbox")
+        self.assertEqual(payload["volume"]["name"], "skillbox-state-alpha")
         self.assertEqual([step["status"] for step in payload["steps"]], ["ok", "ok", "ok", "ok", "ok", "ok"])
 
     def test_cmd_up_returns_structured_error_when_deploy_fails(self) -> None:
-        profile = BOX.BoxProfile(id="dev-small")
+        profile = BOX.BoxProfile(id="dev-small", storage=_storage())
         payloads: list[dict[str, object]] = []
 
         with mock.patch.object(BOX, "load_profile", return_value=profile), \
             mock.patch.object(BOX, "load_inventory", return_value=[]), \
+            mock.patch.object(BOX, "load_deploy_manifest", return_value=_release()), \
             mock.patch.object(BOX, "require_env", side_effect=["do-token", "ssh-key", "ts-auth"]), \
             mock.patch.object(BOX, "do_create_droplet", return_value={"id": 42}), \
             mock.patch.object(BOX, "do_droplet_public_ip", return_value="1.2.3.4"), \
+            mock.patch.object(BOX, "do_find_volume_by_name", return_value=None), \
+            mock.patch.object(BOX, "do_create_volume", return_value={"id": "vol-1", "size_gigabytes": 20}), \
+            mock.patch.object(BOX, "do_attach_volume"), \
+            mock.patch.object(BOX, "do_get_volume", return_value={"id": "vol-1", "size_gigabytes": 20, "droplet_ids": [42]}), \
             mock.patch.object(BOX, "wait_for_ssh", side_effect=[True, False, False]), \
             mock.patch.object(
                 BOX,
@@ -128,6 +171,7 @@ class BoxRefactorTests(unittest.TestCase):
                 profile_name="dev-small",
                 blueprint=None,
                 set_args=[],
+                deploy_manifest="/tmp/deploy.json",
                 dry_run=False,
                 fmt="json",
             )
@@ -144,13 +188,13 @@ class BoxRefactorTests(unittest.TestCase):
 
         with mock.patch.object(BOX, "load_profile", return_value=profile), \
             mock.patch.object(BOX, "load_inventory", return_value=[]), \
-            mock.patch.object(BOX, "require_env", side_effect=["do-token", "ssh-key", "ts-auth"]), \
             mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
             result = BOX.cmd_up(
                 "dry-box",
                 profile_name="dev-small",
                 blueprint=None,
                 set_args=[],
+                deploy_manifest=None,
                 dry_run=True,
                 fmt="json",
             )
@@ -159,7 +203,7 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertTrue(payloads[-1]["dry_run"])
         self.assertEqual(
             [step["status"] for step in payloads[-1]["steps"]],
-            ["skip", "skip", "skip", "skip", "skip", "skip"],
+            ["skip", "skip", "skip", "skip", "skip"],
         )
 
     def test_cmd_up_returns_conflict_for_existing_active_box(self) -> None:
@@ -174,6 +218,7 @@ class BoxRefactorTests(unittest.TestCase):
                 profile_name="dev-small",
                 blueprint=None,
                 set_args=[],
+                deploy_manifest=None,
                 dry_run=False,
                 fmt="json",
             )
@@ -181,24 +226,68 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertEqual(result, BOX.EXIT_ERROR)
         self.assertEqual(payloads[-1]["error"]["type"], "conflict")
 
-    def test_cmd_up_returns_onboard_failure_payload(self) -> None:
-        profile = BOX.BoxProfile(id="dev-small")
+    def test_cmd_up_requires_deploy_manifest_for_non_dry_run(self) -> None:
+        payloads: list[dict[str, object]] = []
+
+        with mock.patch.object(BOX, "load_profile", return_value=BOX.BoxProfile(id="dev-small", storage=_storage())), \
+            mock.patch.object(BOX, "load_inventory", return_value=[]), \
+            mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
+            result = BOX.cmd_up(
+                "alpha",
+                profile_name="dev-small",
+                blueprint=None,
+                set_args=[],
+                deploy_manifest=None,
+                dry_run=False,
+                fmt="json",
+            )
+
+        self.assertEqual(result, BOX.EXIT_ERROR)
+        self.assertEqual(payloads[-1]["error"]["type"], "deploy_manifest_required")
+
+    def test_cmd_up_requires_storage_layout_for_digitalocean_profile(self) -> None:
+        payloads: list[dict[str, object]] = []
+
+        with mock.patch.object(BOX, "load_profile", return_value=BOX.BoxProfile(id="dev-small")), \
+            mock.patch.object(BOX, "load_inventory", return_value=[]), \
+            mock.patch.object(BOX, "load_deploy_manifest", return_value=_release()), \
+            mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
+            result = BOX.cmd_up(
+                "alpha",
+                profile_name="dev-small",
+                blueprint=None,
+                set_args=[],
+                deploy_manifest="/tmp/deploy.json",
+                dry_run=False,
+                fmt="json",
+            )
+
+        self.assertEqual(result, BOX.EXIT_ERROR)
+        self.assertEqual(payloads[-1]["error"]["type"], "storage_layout_missing")
+
+    def test_cmd_up_returns_first_box_failure_payload(self) -> None:
+        profile = BOX.BoxProfile(id="dev-small", storage=_storage())
         payloads: list[dict[str, object]] = []
 
         with mock.patch.object(BOX, "load_profile", return_value=profile), \
             mock.patch.object(BOX, "load_inventory", return_value=[]), \
+            mock.patch.object(BOX, "load_deploy_manifest", return_value=_release()), \
             mock.patch.object(BOX, "require_env", side_effect=["do-token", "ssh-key", "ts-auth"]), \
             mock.patch.object(BOX, "do_create_droplet", return_value={"id": 42}), \
             mock.patch.object(BOX, "do_droplet_public_ip", return_value="1.2.3.4"), \
+            mock.patch.object(BOX, "do_find_volume_by_name", return_value=None), \
+            mock.patch.object(BOX, "do_create_volume", return_value={"id": "vol-1", "size_gigabytes": 20}), \
+            mock.patch.object(BOX, "do_attach_volume"), \
+            mock.patch.object(BOX, "do_get_volume", return_value={"id": "vol-1", "size_gigabytes": 20, "droplet_ids": [42]}), \
             mock.patch.object(BOX, "wait_for_ssh", side_effect=[True, True]), \
-            mock.patch.object(BOX, "ssh_script", side_effect=[_completed(), _completed()]), \
+            mock.patch.object(BOX, "ssh_script", side_effect=[_completed(), _completed(), _completed()]), \
+            mock.patch.object(BOX, "scp_file", return_value=_completed()), \
             mock.patch.object(
                 BOX,
                 "ssh_cmd",
                 side_effect=[
                     _completed(stdout="100.64.0.1\n"),
-                    _completed(),
-                    _completed(returncode=1, stderr="onboard failed"),
+                    _completed(returncode=1, stderr="first-box failed"),
                 ],
             ), \
             mock.patch.object(BOX, "save_inventory"), \
@@ -208,13 +297,14 @@ class BoxRefactorTests(unittest.TestCase):
                 profile_name="dev-small",
                 blueprint=None,
                 set_args=[],
+                deploy_manifest="/tmp/deploy.json",
                 dry_run=False,
                 fmt="json",
             )
 
         self.assertEqual(result, BOX.EXIT_ERROR)
-        self.assertEqual(payloads[-1]["error"]["type"], "onboard_failed")
-        self.assertEqual(payloads[-1]["steps"][-1]["step"], "onboard")
+        self.assertEqual(payloads[-1]["error"]["type"], "first_box_failed")
+        self.assertEqual(payloads[-1]["steps"][-1]["step"], "first-box")
         self.assertEqual(payloads[-1]["steps"][-1]["status"], "fail")
 
     def test_cmd_down_marks_box_destroyed_and_reports_steps(self) -> None:
