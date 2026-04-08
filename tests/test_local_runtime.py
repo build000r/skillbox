@@ -209,6 +209,15 @@ def _write_local_runtime_fixture(repo: Path, *, with_bridge_outputs: bool = Fals
                     type: http
                     url: http://localhost:3000
 
+              ingress_routes:
+                - id: htma-public
+                  service_id: htma
+                  listener: public
+                  path: /htma
+                  match: prefix
+                  profiles:
+                    - local-minimal
+
               checks:
                 - id: personal-root
                   type: path_exists
@@ -243,6 +252,9 @@ class BridgeModelCompilationTests(unittest.TestCase):
             self.assertEqual(bridge["legacy_targets"], ["sweet-potato", "htma_server", "htma"])
             self.assertIn("output_root_host_path", bridge)
             self.assertEqual(bridge["client"], "personal")
+            routes = {route["id"]: route for route in model["ingress_routes"]}
+            self.assertEqual(routes["htma-public"]["service_id"], "htma")
+            self.assertEqual(routes["htma-public"]["listener"], "public")
 
     def test_filter_model_scopes_bridges_by_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -255,11 +267,13 @@ class BridgeModelCompilationTests(unittest.TestCase):
             clients = normalize_active_clients(model, ["personal"])
             filtered = filter_model(model, active, clients)
             self.assertEqual(len(filtered["bridges"]), 1)
+            self.assertEqual(len(filtered["ingress_routes"]), 1)
 
             # With only core profile, bridge should be excluded
             active_core = normalize_active_profiles([])
             filtered_core = filter_model(model, active_core, clients)
             self.assertEqual(len(filtered_core["bridges"]), 0)
+            self.assertEqual(len(filtered_core["ingress_routes"]), 0)
 
     def test_filter_model_includes_local_services_for_local_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

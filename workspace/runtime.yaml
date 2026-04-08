@@ -234,6 +234,24 @@ core:
         as MCP tools over HTTP. Agents query playbook rules and record
         learnings without shelling out. Runs LLM-free.
 
+    - id: ingress-router
+      kind: ingress
+      owner: local
+      repo: skillbox-self
+      required: false
+      profiles:
+        - local-all
+      command: python3 scripts/ingress_proxy.py --routes-file ${SKILLBOX_INGRESS_ROUTE_FILE}
+      healthcheck:
+        type: http
+        url: http://127.0.0.1:${SKILLBOX_INGRESS_PUBLIC_PORT}/__skillbox/health
+        timeout_seconds: 0.5
+      log: runtime
+      notes: >
+        Box-owned reverse proxy for path-based ingress. Hot-reloads the
+        generated ingress route manifest so local client overlays can expose
+        stable public/private listener URLs without per-app tunnel processes.
+
   logs:
     - id: runtime
       path: ${SKILLBOX_LOG_ROOT}/runtime

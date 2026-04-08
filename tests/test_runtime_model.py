@@ -22,6 +22,7 @@ class RuntimeModelTests(unittest.TestCase):
             skills = {item["id"]: item for item in model["skills"]}
             tasks = {item["id"]: item for item in model["tasks"]}
             services = {item["id"]: item for item in model["services"]}
+            ingress_routes = {item["id"]: item for item in model["ingress_routes"]}
             logs = {item["id"]: item for item in model["logs"]}
             checks = {item["id"]: item for item in model["checks"]}
             clients = {item["id"]: item for item in model["clients"]}
@@ -50,6 +51,9 @@ class RuntimeModelTests(unittest.TestCase):
                 str(repo / "scripts" / "check-api.sh"),
             )
             self.assertEqual(services["web"]["profiles"], ["surfaces"])
+            self.assertEqual(ingress_routes["overlay-api"]["service_id"], "api")
+            self.assertEqual(ingress_routes["overlay-api"]["client"], "overlayed")
+            self.assertEqual(ingress_routes["overlay-api"]["match"], "prefix")
             self.assertEqual(logs["runtime"]["host_path"], str(repo / ".skillbox-state" / "logs" / "runtime.log"))
             self.assertEqual(checks["repo-root"]["host_path"], str(repo / "repos"))
             self.assertEqual(clients["inline"]["default_cwd_host_path"], str(repo / "repos" / "inline"))
@@ -71,13 +75,21 @@ class RuntimeModelTests(unittest.TestCase):
 
         normalized = runtime_model._normalize_runtime_sections(
             resolved,
-            overlay_clients=[{"id": "overlayed", "_overlay_path": "/tmp/overlay.yaml", "logs": [{"id": "overlay-log"}]}],
+            overlay_clients=[
+                {
+                    "id": "overlayed",
+                    "_overlay_path": "/tmp/overlay.yaml",
+                    "logs": [{"id": "overlay-log"}],
+                    "ingress_routes": [{"id": "overlay-route", "service_id": "web", "path": "/reports"}],
+                }
+            ],
         )
 
         self.assertEqual({repo["id"] for repo in normalized["repos"]}, {"core", "inline-repo"})
         self.assertEqual(normalized["services"][0]["profiles"], ["surfaces"])
         self.assertEqual(normalized["checks"][0]["client"], "inline")
         self.assertEqual(normalized["logs"][0]["client"], "overlayed")
+        self.assertEqual(normalized["ingress_routes"][0]["client"], "overlayed")
 
     def test_helper_defaults_populate_host_paths_for_sections(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -289,6 +301,12 @@ class RuntimeModelTests(unittest.TestCase):
                   repo_roots:
                     - id: overlay-root
                       path: ${SKILLBOX_REPOS_ROOT}/overlayed
+                  ingress_routes:
+                    - id: overlay-api
+                      service_id: api
+                      listener: private
+                      path: /reports
+                      match: prefix
                 """
             ),
             encoding="utf-8",
