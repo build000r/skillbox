@@ -57,10 +57,15 @@ FIRST_BOX_OUTPUT_DIR=""
 FIRST_BOX_PRIVATE_REPO=""
 LOCK_DIR=""
 TEMP_DIR=""
-SCRIPT_PATH="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")"
-SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-${0:-}}"
+SCRIPT_PATH=""
+SCRIPT_DIR=""
+if [[ -n "${SCRIPT_SOURCE}" && "${SCRIPT_SOURCE}" != "bash" && "${SCRIPT_SOURCE}" != "-" ]]; then
+  SCRIPT_PATH="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${SCRIPT_SOURCE}")"
+  SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+fi
 RUNNING_FROM_CHECKOUT=0
-if [[ -f "${SCRIPT_DIR}/.env-manager/manage.py" && -f "${SCRIPT_DIR}/README.md" ]]; then
+if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/.env-manager/manage.py" && -f "${SCRIPT_DIR}/README.md" ]]; then
   RUNNING_FROM_CHECKOUT=1
 fi
 

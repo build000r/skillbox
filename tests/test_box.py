@@ -93,6 +93,8 @@ class BoxTests(unittest.TestCase):
                     "--repo-dir", "/home/skillbox/skillbox",
                     "--private-path", "/home/skillbox/skillbox-config",
                     "--client", "personal",
+                    "--skip-build",
+                    "--skip-up",
                     "--skip-first-box",
                     "--no-gum",
                 ],
@@ -165,6 +167,50 @@ class BoxTests(unittest.TestCase):
         self.assertEqual(dev_small["image"], "ubuntu-24-04-x64")
         self.assertEqual(dev_small["ssh_user"], "skillbox")
 
+    def test_volume_filesystem_label_drops_state_prefix_for_ext4(self) -> None:
+        self.assertEqual(
+            BOX_MODULE.volume_filesystem_label("skillbox-state-jeremy", "ext4"),
+            "skillbox-jeremy",
+        )
+
+    def test_volume_filesystem_label_respects_xfs_length_limit(self) -> None:
+        label = BOX_MODULE.volume_filesystem_label("skillbox-state-averylongboxname", "xfs")
+
+        self.assertLessEqual(len(label), 12)
+        self.assertRegex(label, r"^[A-Za-z0-9_-]+$")
+        self.assertTrue(label.endswith("name"))
+
+    def test_extract_tailscale_ipv4_reads_marker_line(self) -> None:
+        output = "\n".join([
+            "some log line",
+            "TAILSCALE_IPV4=100.101.102.103",
+            "more log output",
+        ])
+
+        self.assertEqual(
+            BOX_MODULE.extract_tailscale_ipv4(output),
+            "100.101.102.103",
+        )
+
+    def test_extract_tailscale_ipv4_returns_none_without_marker(self) -> None:
+        self.assertIsNone(BOX_MODULE.extract_tailscale_ipv4("no marker here"))
+
+    def test_wait_for_ssh_retries_after_timeout(self) -> None:
+        original_ssh_cmd = BOX_MODULE.ssh_cmd
+        calls = {"count": 0}
+
+        def fake_ssh_cmd(user: str, host: str, command: str, *, timeout: int = 300):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise subprocess.TimeoutExpired(cmd=["ssh"], timeout=timeout)
+            return subprocess.CompletedProcess(args=["ssh"], returncode=0, stdout="ok\n", stderr="")
+
+        BOX_MODULE.ssh_cmd = fake_ssh_cmd
+        try:
+            self.assertTrue(BOX_MODULE.wait_for_ssh("example-host", user="skillbox", max_wait=1, interval=0))
+        finally:
+            BOX_MODULE.ssh_cmd = original_ssh_cmd
+
     def test_list_empty_when_no_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             env = self._env_with_inventory(tmpdir)
@@ -230,12 +276,62 @@ class BoxTests(unittest.TestCase):
             self.assertTrue(payload["dry_run"])
             self.assertIn("steps", payload)
             step_names = [s["step"] for s in payload["steps"]]
-            self.assertEqual(step_names, ["create", "storage", "bootstrap", "enroll", "deploy", "first-box"])
+            self.assertEqual(step_names, ["create", "storage", "bootstrap", "ssh-ready", "enroll", "deploy", "first-box"])
             for s in payload["steps"]:
                 self.assertEqual(s["status"], "skip", f"step {s['step']} should be skip in dry-run")
             self.assertIn("profile", payload)
             self.assertEqual(payload["profile"]["region"], "nyc3")
             self.assertEqual(payload["volume"]["name"], "skillbox-state-dry-test")
+
+    def test_resolve_existing_box_target_prefers_public_when_ssh_ready(self) -> None:
+        box = BOX_MODULE.Box(
+            id="test-box",
+            profile="dev-small",
+            state="ssh-ready",
+            droplet_ip="1.2.3.4",
+            tailscale_ip="100.64.0.10",
+            tailscale_hostname="skillbox-test-box",
+            ssh_user="skillbox",
+        )
+        original_wait_for_ssh = BOX_MODULE.wait_for_ssh
+        calls: list[str] = []
+
+        def fake_wait_for_ssh(host: str, user: str = "root", *, max_wait: int = 120, interval: int = 5) -> bool:
+            calls.append(host)
+            return host == "1.2.3.4"
+
+        BOX_MODULE.wait_for_ssh = fake_wait_for_ssh
+        try:
+            self.assertEqual(BOX_MODULE._resolve_existing_box_target(box), "1.2.3.4")
+        finally:
+            BOX_MODULE.wait_for_ssh = original_wait_for_ssh
+
+        self.assertEqual(calls[0], "1.2.3.4")
+
+    def test_resolve_existing_box_target_falls_back_to_public(self) -> None:
+        box = BOX_MODULE.Box(
+            id="test-box",
+            profile="dev-small",
+            state="ready",
+            droplet_ip="1.2.3.4",
+            tailscale_ip="100.64.0.10",
+            tailscale_hostname="skillbox-test-box",
+            ssh_user="skillbox",
+        )
+        original_wait_for_ssh = BOX_MODULE.wait_for_ssh
+        calls: list[str] = []
+
+        def fake_wait_for_ssh(host: str, user: str = "root", *, max_wait: int = 120, interval: int = 5) -> bool:
+            calls.append(host)
+            return host == "1.2.3.4"
+
+        BOX_MODULE.wait_for_ssh = fake_wait_for_ssh
+        try:
+            self.assertEqual(BOX_MODULE._resolve_existing_box_target(box), "1.2.3.4")
+        finally:
+            BOX_MODULE.wait_for_ssh = original_wait_for_ssh
+
+        self.assertEqual(calls[:3], ["100.64.0.10", "skillbox-test-box", "1.2.3.4"])
 
     def test_up_fails_without_do_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
