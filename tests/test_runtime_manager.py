@@ -5520,6 +5520,101 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(probe_payload["client_id"], "personal")
             self.assertEqual(probe_payload["profiles"], "core")
 
+    def test_acceptance_translates_runtime_paths_before_running_workflow_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            probe_script = self._clients_host_root(repo) / "personal" / "scripts" / "acceptance_probe.py"
+            probe_script.parent.mkdir(parents=True, exist_ok=True)
+            probe_script.write_text(
+                "from __future__ import annotations\n"
+                "\n"
+                "import json\n"
+                "import os\n"
+                "from pathlib import Path\n"
+                "\n"
+                "payload = {\n"
+                "    'cwd': os.getcwd(),\n"
+                "    'client_id': os.environ.get('SKILLBOX_ACCEPTANCE_CLIENT_ID'),\n"
+                "    'profiles': os.environ.get('SKILLBOX_ACCEPTANCE_PROFILES'),\n"
+                "}\n"
+                "Path(os.environ['PROBE_OUTPUT_PATH']).write_text(json.dumps(payload), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            probe_output = repo / ".skillbox-state" / "monoserver" / "probe-output.json"
+            self._set_client_acceptance_probe(
+                repo,
+                "personal",
+                command=["python3", "${SKILLBOX_CLIENTS_ROOT}/personal/scripts/acceptance_probe.py"],
+                cwd="${SKILLBOX_MONOSERVER_ROOT}",
+                env={"PROBE_OUTPUT_PATH": "${SKILLBOX_MONOSERVER_ROOT}/probe-output.json"},
+            )
+
+            result = self._run(repo, "acceptance", "personal", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            steps = {step["step"]: step for step in payload["steps"]}
+            self.assertTrue(payload["ready"])
+            self.assertEqual(steps["workflow-probe"]["status"], "ok")
+            self.assertEqual(
+                steps["workflow-probe"]["detail"]["cwd"],
+                str((repo / ".skillbox-state" / "monoserver").resolve()),
+            )
+            self.assertEqual(
+                steps["workflow-probe"]["detail"]["command"][1],
+                str(probe_script.resolve()),
+            )
+            probe_payload = json.loads(probe_output.read_text(encoding="utf-8"))
+            self.assertEqual(probe_payload["cwd"], str((repo / ".skillbox-state" / "monoserver").resolve()))
+            self.assertEqual(probe_payload["client_id"], "personal")
+            self.assertEqual(probe_payload["profiles"], "core")
+
+    def test_acceptance_exposes_runtime_ingress_env_to_workflow_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            (repo / ".env").write_text(
+                "SKILLBOX_INGRESS_PUBLIC_BASE_URL=https://reports.example.test\n"
+                "SKILLBOX_INGRESS_PUBLIC_HOST=127.0.0.1\n"
+                "SKILLBOX_INGRESS_PUBLIC_PORT=8443\n",
+                encoding="utf-8",
+            )
+
+            probe_script = repo / "acceptance_probe_env.py"
+            probe_script.write_text(
+                "from __future__ import annotations\n"
+                "\n"
+                "import json\n"
+                "import os\n"
+                "from pathlib import Path\n"
+                "\n"
+                "payload = {\n"
+                "    'public_base_url': os.environ.get('SKILLBOX_INGRESS_PUBLIC_BASE_URL'),\n"
+                "    'public_host': os.environ.get('SKILLBOX_INGRESS_PUBLIC_HOST'),\n"
+                "    'public_port': os.environ.get('SKILLBOX_INGRESS_PUBLIC_PORT'),\n"
+                "}\n"
+                "Path(os.environ['PROBE_OUTPUT_PATH']).write_text(json.dumps(payload), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            probe_output = repo / "workspace" / "probe-output.json"
+            self._set_client_acceptance_probe(
+                repo,
+                "personal",
+                command=["python3", "${ROOT_DIR}/acceptance_probe_env.py"],
+                cwd="${ROOT_DIR}/workspace",
+                env={"PROBE_OUTPUT_PATH": "${ROOT_DIR}/workspace/probe-output.json"},
+            )
+
+            result = self._run(repo, "acceptance", "personal", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            probe_payload = json.loads(probe_output.read_text(encoding="utf-8"))
+            self.assertEqual(probe_payload["public_base_url"], "https://reports.example.test")
+            self.assertEqual(probe_payload["public_host"], "127.0.0.1")
+            self.assertEqual(probe_payload["public_port"], "8443")
+
     def test_acceptance_skips_profile_gated_probe_when_profile_is_inactive(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)

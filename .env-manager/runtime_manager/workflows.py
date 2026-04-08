@@ -950,15 +950,48 @@ def run_client_acceptance_probe(
     profiles: list[str],
     probe: dict[str, Any],
 ) -> tuple[bool, dict[str, Any]]:
+    runtime_env = load_runtime_env(root_dir)
+    translated_env = translated_runtime_env(root_dir, runtime_env)
+
+    def translate_probe_value(raw_value: Any) -> str:
+        value = str(raw_value)
+        if value.startswith("/"):
+            return str(runtime_path_to_host_path(root_dir, runtime_env, value))
+        return translate_runtime_paths(value, runtime_env, translated_env)
+
     raw_cwd = str(probe.get("cwd") or "").strip()
-    cwd = root_dir if not raw_cwd else Path(raw_cwd)
+    translated_cwd = translate_probe_value(raw_cwd) if raw_cwd else str(root_dir)
+    cwd = root_dir if not raw_cwd else Path(translated_cwd)
     if raw_cwd and not cwd.is_absolute():
         cwd = (root_dir / cwd).resolve()
+    translated_command = [
+        absolutize_local_path_argument(
+            root_dir,
+            translate_probe_value(arg),
+        )
+        for arg in probe["command"]
+    ]
+    probe_env = {
+        str(key): translate_probe_value(value)
+        for key, value in (probe.get("env") or {}).items()
+    }
+    runtime_probe_env = {
+        key: str(runtime_env.get(key) or "")
+        for key in (
+            "SKILLBOX_INGRESS_PUBLIC_BASE_URL",
+            "SKILLBOX_INGRESS_PUBLIC_HOST",
+            "SKILLBOX_INGRESS_PUBLIC_PORT",
+            "SKILLBOX_INGRESS_PRIVATE_BASE_URL",
+            "SKILLBOX_INGRESS_PRIVATE_HOST",
+            "SKILLBOX_INGRESS_PRIVATE_PORT",
+        )
+        if str(runtime_env.get(key) or "").strip()
+    }
 
     detail: dict[str, Any] = {
-        "command": list(probe["command"]),
+        "command": translated_command,
         "cwd": str(cwd),
-        "env_keys": sorted(probe.get("env", {}).keys()),
+        "env_keys": sorted({*probe_env.keys(), *runtime_probe_env.keys()}),
         "timeout_seconds": probe["timeout_seconds"],
     }
 
@@ -967,14 +1000,15 @@ def run_client_acceptance_probe(
         return False, detail
 
     env = os.environ.copy()
-    env.update({str(key): str(value) for key, value in (probe.get("env") or {}).items()})
+    env.update(runtime_probe_env)
+    env.update(probe_env)
     env.setdefault("SKILLBOX_ACCEPTANCE_CLIENT_ID", client_id)
     env.setdefault("SKILLBOX_ACCEPTANCE_PROFILES", ",".join(sorted(normalize_active_profiles(profiles))))
     env.setdefault("SKILLBOX_ACCEPTANCE_ROOT_DIR", str(root_dir))
 
     try:
         result = subprocess.run(
-            [str(arg) for arg in probe["command"]],
+            translated_command,
             cwd=cwd,
             env=env,
             capture_output=True,
