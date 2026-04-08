@@ -48,6 +48,7 @@ class OperatorMcpServerTests(unittest.TestCase):
                 {
                     "box_id": "alpha",
                     "profile": "dev-small",
+                    "deploy_manifest": "/tmp/deploy.json",
                     "blueprint": "git-repo",
                     "set_vars": ["FOO=bar"],
                     "dry_run": True,
@@ -60,6 +61,7 @@ class OperatorMcpServerTests(unittest.TestCase):
         args = run_script.call_args.args[1]
         self.assertIn("up", args)
         self.assertIn("--profile", args)
+        self.assertIn("--deploy-manifest", args)
         self.assertIn("--blueprint", args)
         self.assertIn("--set", args)
         self.assertIn("--dry-run", args)

@@ -108,6 +108,13 @@ TOOLS: list[dict] = [
                     "description": "Box profile name (default: 'dev-small'). Use operator_profiles to list options.",
                     "default": "dev-small",
                 },
+                "deploy_manifest": {
+                    "type": "string",
+                    "description": (
+                        "Pinned deploy.json path for non-dry-run launches. "
+                        "Generate it with client-publish --deploy-artifact."
+                    ),
+                },
                 "blueprint": {
                     "type": "string",
                     "description": "Client blueprint for the onboard step (e.g. 'git-repo-http-service-bootstrap').",
@@ -467,6 +474,8 @@ def handle_operator_provision(params: dict) -> dict:
     args = ["up", str(box_id), "--format", "json"]
     if params.get("profile"):
         args += ["--profile", str(params["profile"])]
+    if params.get("deploy_manifest"):
+        args += ["--deploy-manifest", str(params["deploy_manifest"])]
     if params.get("blueprint"):
         args += ["--blueprint", str(params["blueprint"])]
     for sv in (params.get("set_vars") or []):
