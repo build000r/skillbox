@@ -64,7 +64,7 @@ right client context without standing up a full hosted workspace control plane.
 | One-command client activation | `focus` syncs, bootstraps, starts services, collects live state, and writes enriched agent context in a single pass |
 | Fleet management from the operator machine | The operator MCP server provisions DO droplets, enrolls Tailscale, and runs commands on remote boxes as native agent tools |
 | Reproducible default skills | `skill-repos.yaml` declares GitHub repos and local paths; `sync` clones and filtered-installs skills |
-| Confidence that docs/config/runtime still match | `04-reconcile.py` powers `make render` and `make doctor`, while `make dev-sanity` validates the box internals |
+| Confidence that docs/config/runtime still match | `04-reconcile.py` powers `make render` and the outer `make doctor` path, while `make dev-sanity` validates the live runtime internals |
 | Minimal surface area | No multi-tenant control plane, no hosted dependency, no hidden sibling repo requirement for packaging |
 
 ## Why `skillbox` Exists
@@ -704,7 +704,7 @@ make runtime-sync
 |---|---|
 | `make bootstrap-env` | Copies `.env.example` to `.env` if needed |
 | `make render` | Prints the resolved sandbox model |
-| `make doctor` | Validates manifest/runtime drift, Compose wiring, and skill sync |
+| `make doctor` | Validates the outer repo shell: manifests, Compose wiring, and the default `skill-repo-set` sync path |
 | `make runtime-render` | Prints the resolved internal runtime graph |
 | `make runtime-sync` | Creates managed repo/log directories, reconciles managed artifacts against declared pins or source files, and installs declared skills with generated lockfiles for the active core/client scope |
 | `make runtime-status` | Summarizes declared repos, artifacts, skills, tasks, services, logs, and checks |
@@ -1034,6 +1034,12 @@ skill_repos:
 
   - path: ../skills
     pick: [cass-memory, dev-sanity, skillbox-operator]
+
+  - path: ../../skills
+    pick: [divide-and-conquer, domain-planner, domain-reviewer, domain-scaffolder]
+
+  - path: ../../../skills-private
+    pick: [cass, smart]
 ```
 
 Each entry is either a GitHub repo (cloned into `workspace/skill-repos/`) or a
@@ -1193,6 +1199,11 @@ client-local `skill-issue` and `prompt-reviewer` sources and bundles, creates
 client log lanes. `client-project` and `client-open` carry that editable
 surface into `sand/<client>/`, and `client-open` also writes a resolved
 `context.yaml` there for the sandboxed agent.
+
+For mixed clients that need both released plans and a client-local skill/report
+loop, set `client.scaffold.pack: hybrid`. The hybrid pack preserves the
+planning surface, seeds the workflow-builder directories, and installs both the
+planning skills and the client-local `skill-issue` / `prompt-reviewer` pair.
 
 For the hardened v1 onboarding path, start from the built-in blueprint that
 wires repos, services, logs, bootstrap, and checks into the scaffold:
@@ -1404,6 +1415,10 @@ agents tools to manage their own environment:
 | `skillbox_journal_write` | Write an agent event to the journal |
 | `skillbox_ack` | Acknowledge events to curate active context |
 
+Opened client surfaces always include the `skillbox` MCP. Core surfaces also
+include `cm` for procedural memory, and connector-capable surfaces add `fwc`
+and `dcg` on top of that.
+
 ### Outside the box (operator tools)
 
 `scripts/operator_mcp_server.py` runs on the operator machine and provides
@@ -1576,7 +1591,7 @@ container restarts. Inside the box those same directories mount at
 
 ### Why is there both `make doctor` and `make render`?
 
-`make render` shows the intended model. `make doctor` checks whether the intended model and the runnable repo state still agree.
+`make render` shows the intended model. `make doctor` checks the outer repo shell for drift against that model: manifests, Compose wiring, and the default `skill-repo-set` sync path. `make dev-sanity` checks the live runtime state after sync/bootstrap.
 
 ### Why is there both `workspace/dependencies.yaml` and `workspace/runtime.yaml`?
 
