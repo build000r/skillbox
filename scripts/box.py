@@ -47,6 +47,7 @@ EXIT_DRIFT = 2
 STATES = [
     "creating",
     "bootstrapping",
+    "ssh-ready",
     "enrolling",
     "deploying",
     "acceptance",
@@ -58,7 +59,8 @@ STATES = [
 
 VALID_TRANSITIONS = {
     "creating": ["bootstrapping", "destroyed"],
-    "bootstrapping": ["enrolling", "destroyed"],
+    "bootstrapping": ["ssh-ready", "destroyed"],
+    "ssh-ready": ["enrolling", "destroyed"],
     "enrolling": ["deploying", "destroyed"],
     "deploying": ["acceptance", "onboarding", "destroyed"],
     "acceptance": ["ready", "destroyed"],
@@ -124,6 +126,8 @@ def build_release_install_args(
         "--repo-dir", repo_dir,
         "--private-path", private_path,
         "--client", client_id,
+        "--skip-build",
+        "--skip-up",
         "--skip-first-box",
         "--no-gum",
     ]
@@ -297,6 +301,17 @@ def ssh_script(
         )
 
 
+def extract_tailscale_ipv4(output: str) -> str | None:
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("TAILSCALE_IPV4="):
+            continue
+        value = line.split("=", 1)[1].strip()
+        if value:
+            return value
+    return None
+
+
 def scp_file(local_path: Path, user: str, host: str, remote_path: str, *, timeout: int = 600) -> subprocess.CompletedProcess[str]:
     return run(
         ["scp", *DEFAULT_SSH_OPTS, str(local_path), f"{user}@{host}:{remote_path}"],
@@ -308,11 +323,42 @@ def scp_file(local_path: Path, user: str, host: str, remote_path: str, *, timeou
 def wait_for_ssh(host: str, user: str = "root", *, max_wait: int = 120, interval: int = 5) -> bool:
     deadline = time.monotonic() + max_wait
     while time.monotonic() < deadline:
-        result = ssh_cmd(user, host, "echo ok", timeout=10)
+        try:
+            result = ssh_cmd(user, host, "echo ok", timeout=10)
+        except subprocess.TimeoutExpired:
+            time.sleep(interval)
+            continue
         if result.returncode == 0 and "ok" in result.stdout:
             return True
         time.sleep(interval)
     return False
+
+
+def box_ssh_candidates(box: "Box", *, prefer_public: bool = False) -> list[str]:
+    ordered = [box.droplet_ip, box.tailscale_ip, box.tailscale_hostname] if prefer_public else [
+        box.tailscale_ip,
+        box.tailscale_hostname,
+        box.droplet_ip,
+    ]
+    candidates: list[str] = []
+    for candidate in ordered:
+        value = str(candidate or "").strip()
+        if value and value not in candidates:
+            candidates.append(value)
+    return candidates
+
+
+def resolve_box_ssh_target(
+    box: "Box",
+    *,
+    max_wait: int = 10,
+    interval: int = 2,
+    prefer_public: bool = False,
+) -> str | None:
+    for target in box_ssh_candidates(box, prefer_public=prefer_public):
+        if wait_for_ssh(target, user=box.ssh_user, max_wait=max_wait, interval=interval):
+            return target
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +504,36 @@ def storage_payload(storage: BoxProfileStorage | None) -> dict[str, Any] | None:
 
 def volume_name_for_box(box_id: str) -> str:
     return f"skillbox-state-{box_id}"
+
+
+def volume_filesystem_label(name: str, filesystem: str) -> str:
+    # Keep the DO volume name descriptive, but shorten the filesystem label to
+    # fit mkfs/ext4/xfs limits so volume creation does not fail server-side.
+    max_len = 12 if filesystem == "xfs" else 16
+    candidate = str(name).strip()
+    if candidate.startswith("skillbox-state-"):
+        candidate = "skillbox-" + candidate.removeprefix("skillbox-state-")
+    candidate = re.sub(r"[^A-Za-z0-9_-]+", "-", candidate).strip("-_")
+    if not candidate:
+        candidate = "skillbox"
+    if len(candidate) <= max_len:
+        return candidate
+
+    suffix = ""
+    parts = [part for part in candidate.split("-") if part]
+    if parts:
+        suffix = parts[-1]
+    if suffix:
+        suffix = suffix[-(max_len - 2):]
+        prefix_len = max_len - len(suffix) - 1
+        if prefix_len > 0:
+            shortened = f"{candidate[:prefix_len]}-{suffix}"
+            shortened = shortened[:max_len].strip("-_")
+            if shortened:
+                return shortened
+
+    shortened = candidate[:max_len].strip("-_")
+    return shortened or "skillbox"[:max_len]
 
 
 def storage_volume_size_gb(storage: BoxProfileStorage) -> int:
@@ -768,7 +844,7 @@ def do_create_volume(
         "--region", region,
         "--size", f"{size_gb}GiB",
         "--fs-type", filesystem,
-        "--fs-label", name,
+        "--fs-label", volume_filesystem_label(name, filesystem),
         "--output", "json",
     ]
     if description:
@@ -951,6 +1027,7 @@ def _box_up_dry_run_payload(context: BoxUpContext) -> dict[str, Any]:
             f"would attach {context.box.volume_name} at {context.profile.storage.mount_path}",
         )
     _record_box_up_step(context, "bootstrap", "skip", "dry-run")
+    _record_box_up_step(context, "ssh-ready", "skip", f"would verify ssh {context.profile.ssh_user}@<public-ip>")
     _record_box_up_step(context, "enroll", "skip", f"would enroll as {context.ts_hostname}")
     _record_box_up_step(context, "deploy", "skip", "dry-run")
     _record_box_up_step(context, "first-box", "skip", "dry-run")
@@ -1055,9 +1132,19 @@ def _bootstrap_box_host(context: BoxUpContext) -> str:
     result = ssh_script("root", context.ip, BOOTSTRAP_SCRIPT, env_vars, timeout=600)
     if result.returncode != 0:
         raise RuntimeError(f"Bootstrap failed (exit {result.returncode}): {result.stderr[-500:]}")
-    update_box(context.box, state="enrolling")
-    save_inventory(context.boxes)
     return f"OS packages + Docker + state root {storage.mount_path} mounted"
+
+
+def _mark_box_ssh_ready(context: BoxUpContext) -> str:
+    public_ip = str(context.box.droplet_ip or "").strip()
+    if not public_ip:
+        raise RuntimeError("Droplet public IP unavailable while checking skillbox SSH access")
+    if not wait_for_ssh(public_ip, user=context.profile.ssh_user, max_wait=30, interval=3):
+        raise RuntimeError(f"SSH not reachable at {context.profile.ssh_user}@{public_ip} after bootstrap")
+    context.ssh_target = public_ip
+    update_box(context.box, state="ssh-ready")
+    save_inventory(context.boxes)
+    return f"ssh {context.profile.ssh_user}@{public_ip}"
 
 
 def _enroll_box_tailscale(context: BoxUpContext, *, ts_authkey: str) -> str:
@@ -1065,6 +1152,8 @@ def _enroll_box_tailscale(context: BoxUpContext, *, ts_authkey: str) -> str:
         raise RuntimeError("Droplet IP unavailable during tailscale enrollment")
     if not context.is_json:
         print(f"[...] enroll  Joining tailnet as {context.ts_hostname}...")
+    update_box(context.box, state="enrolling")
+    save_inventory(context.boxes)
     result = ssh_script(
         "root",
         context.ip,
@@ -1078,8 +1167,10 @@ def _enroll_box_tailscale(context: BoxUpContext, *, ts_authkey: str) -> str:
     )
     if result.returncode != 0:
         raise RuntimeError(f"Tailscale enrollment failed (exit {result.returncode}): {result.stderr[-500:]}")
-    ts_ip_result = ssh_cmd("root", context.ip, "tailscale ip -4", timeout=15)
-    ts_ip = ts_ip_result.stdout.strip().split("\n")[0] if ts_ip_result.returncode == 0 else None
+    ts_ip = extract_tailscale_ipv4(result.stdout)
+    if not ts_ip:
+        ts_ip_result = ssh_cmd("root", context.ip, "tailscale ip -4", timeout=15)
+        ts_ip = ts_ip_result.stdout.strip().split("\n")[0] if ts_ip_result.returncode == 0 else None
     update_box(context.box, tailscale_ip=ts_ip, state="deploying")
     save_inventory(context.boxes)
     return f"tailscale {context.ts_hostname} at {ts_ip or 'unknown'}"
@@ -1088,15 +1179,16 @@ def _enroll_box_tailscale(context: BoxUpContext, *, ts_authkey: str) -> str:
 def _resolve_deploy_target(context: BoxUpContext) -> str:
     if context.ip is None:
         raise RuntimeError("Droplet IP unavailable during deploy")
-    ssh_target = context.ts_hostname
-    if wait_for_ssh(ssh_target, user=context.profile.ssh_user, max_wait=60, interval=5):
-        context.ssh_target = ssh_target
-        return ssh_target
-    ssh_target = context.ip
-    if not wait_for_ssh(ssh_target, user=context.profile.ssh_user, max_wait=30):
-        raise RuntimeError(f"Cannot reach {context.profile.ssh_user}@{context.ts_hostname} or {context.ip} via SSH")
-    context.ssh_target = ssh_target
-    return ssh_target
+    for ssh_target in box_ssh_candidates(context.box, prefer_public=context.box.state == "ssh-ready"):
+        max_wait = 30 if ssh_target == context.ip else 60
+        if wait_for_ssh(ssh_target, user=context.profile.ssh_user, max_wait=max_wait, interval=5):
+            context.ssh_target = ssh_target
+            return ssh_target
+
+    raise RuntimeError(
+        f"Cannot reach {context.profile.ssh_user}@{context.ts_hostname or '<no-tailscale-host>'}, "
+        f"{context.box.tailscale_ip or '<no-tailscale-ip>'}, or {context.ip} via SSH"
+    )
 
 
 def _deploy_box_runtime(context: BoxUpContext) -> str:
@@ -1182,6 +1274,7 @@ def _run_box_first_box(context: BoxUpContext, *, blueprint: str | None, set_args
 
 
 def _box_up_success_payload(context: BoxUpContext) -> dict[str, Any]:
+    ssh_target = context.ssh_target or context.box.tailscale_ip or context.ts_hostname or context.box.droplet_ip
     payload = {
         "box_id": context.box_id,
         "profile": asdict(context.profile),
@@ -1190,7 +1283,7 @@ def _box_up_success_payload(context: BoxUpContext) -> dict[str, Any]:
         "droplet_ip": context.box.droplet_ip,
         "tailscale_hostname": context.ts_hostname,
         "tailscale_ip": context.box.tailscale_ip,
-        "ssh": f"ssh {context.profile.ssh_user}@{context.ts_hostname}",
+        "ssh": f"ssh {context.profile.ssh_user}@{ssh_target}" if ssh_target else None,
         "steps": context.steps,
         "storage": storage_payload(context.profile.storage),
         "volume": volume_payload(context.box),
@@ -1327,11 +1420,21 @@ def cmd_up(
 
     if not _run_box_up_stage(
         context,
+        stage_name="ssh-ready",
+        error_type="ssh_access_failed",
+        action=lambda: _mark_box_ssh_ready(context),
+        failure_state="bootstrapping",
+        next_actions=[f"box down {box_id}", f"ssh {context.profile.ssh_user}@<public-ip>"],
+    ):
+        return EXIT_ERROR
+
+    if not _run_box_up_stage(
+        context,
         stage_name="enroll",
         error_type="tailscale_failed",
         action=lambda: _enroll_box_tailscale(context, ts_authkey=ts_authkey),
-        failure_state="enrolling",
-        next_actions=[f"box down {box_id}"],
+        failure_state="ssh-ready",
+        next_actions=[f"box ssh {box_id}", f"box down {box_id}"],
     ):
         return EXIT_ERROR
 
@@ -1340,8 +1443,8 @@ def cmd_up(
         stage_name="deploy",
         error_type="deploy_failed",
         action=lambda: _deploy_box_runtime(context),
-        failure_state="deploying",
-        next_actions=[f"box down {box_id}"],
+        failure_state="ssh-ready",
+        next_actions=[f"box ssh {box_id}", f"box down {box_id}"],
     ):
         return EXIT_ERROR
 
@@ -1350,7 +1453,7 @@ def cmd_up(
         stage_name="first-box",
         error_type="first_box_failed",
         action=lambda: _run_box_first_box(context, blueprint=blueprint, set_args=set_args),
-        failure_state="acceptance",
+        failure_state="ssh-ready",
         next_actions=[f"box ssh {box_id}", f"box status {box_id}"],
     ):
         return EXIT_ERROR
@@ -1386,13 +1489,13 @@ def _record_box_step(steps: list[dict[str, Any]], is_json: bool, name: str, stat
 
 
 def _resolve_existing_box_target(box: Box) -> str:
-    if box.tailscale_hostname and wait_for_ssh(box.tailscale_hostname, user=box.ssh_user, max_wait=60, interval=5):
-        return box.tailscale_hostname
-    if box.droplet_ip and wait_for_ssh(box.droplet_ip, user=box.ssh_user, max_wait=30):
-        return box.droplet_ip
+    prefer_public = box.state == "ssh-ready"
+    target = resolve_box_ssh_target(box, max_wait=10 if prefer_public else 15, interval=2, prefer_public=prefer_public)
+    if target:
+        return target
     raise RuntimeError(
-        f"Cannot reach {box.ssh_user}@{box.tailscale_hostname or '<no-tailscale>'} "
-        f"or {box.droplet_ip or '<no-public-ip>'} via SSH"
+        f"Cannot reach {box.ssh_user}@{box.tailscale_hostname or '<no-tailscale-host>'}, "
+        f"{box.tailscale_ip or '<no-tailscale-ip>'}, or {box.droplet_ip or '<no-public-ip>'} via SSH"
     )
 
 
@@ -1433,7 +1536,7 @@ def _box_upgrade_dry_run_payload(box: Box, release: DeployRelease, steps: list[d
 
 
 def _box_upgrade_success_payload(box: Box, release: DeployRelease, steps: list[dict[str, Any]]) -> dict[str, Any]:
-    ssh_target = box.tailscale_hostname or box.droplet_ip
+    ssh_target = box.tailscale_ip or box.tailscale_hostname or box.droplet_ip
     return {
         "box_id": box.id,
         "profile": box.profile,
@@ -1579,7 +1682,7 @@ def cmd_upgrade(
     else:
         print()
         print(f"Box {box_id} upgraded to {release.source_commit[:12]}.")
-        print(f"  SSH: ssh {box.ssh_user}@{box.tailscale_hostname or box.droplet_ip}")
+        print(f"  SSH: ssh {box.ssh_user}@{box.tailscale_ip or box.tailscale_hostname or box.droplet_ip}")
     return EXIT_OK
 
 
@@ -1625,7 +1728,7 @@ def cmd_down(box_id: str, *, dry_run: bool, fmt: str) -> int:
         return EXIT_OK
 
     # -- 1. Drain ---------------------------------------------------------------
-    ssh_target = box.tailscale_hostname or box.droplet_ip
+    ssh_target = resolve_box_ssh_target(box, max_wait=5, interval=1, prefer_public=box.state == "ssh-ready")
     if ssh_target and box.state == "ready":
         try:
             if not is_json:
@@ -1739,6 +1842,7 @@ def box_health(box: Box) -> dict[str, Any]:
         "volume_name": box.volume_name,
         "volume_size_gb": box.volume_size_gb,
         "created_at": box.created_at,
+        "ssh_target": None,
         "ssh_reachable": False,
         "container_running": False,
     }
@@ -1746,10 +1850,10 @@ def box_health(box: Box) -> dict[str, Any]:
     if box.state in ("destroyed", "creating"):
         return status
 
-    ssh_target = box.tailscale_hostname or box.droplet_ip
+    ssh_target = resolve_box_ssh_target(box, max_wait=5, interval=1, prefer_public=box.state == "ssh-ready")
     if ssh_target:
-        probe = ssh_cmd(box.ssh_user, ssh_target, "echo ok", timeout=10)
-        status["ssh_reachable"] = probe.returncode == 0
+        status["ssh_target"] = ssh_target
+        status["ssh_reachable"] = True
 
         if status["ssh_reachable"]:
             container_probe = ssh_cmd(
@@ -1780,7 +1884,8 @@ def print_box_status_text(status: dict[str, Any]) -> None:
         print(f"  volume={status['volume_name']}  size_gb={status.get('volume_size_gb') or 'n/a'}")
     print(f"  ssh={reachable}  container={container}")
     if status.get("ssh_reachable"):
-        print(f"  connect: ssh {status['ssh_user']}@{ts}")
+        connect_target = status.get("ssh_target") or status.get("tailscale_ip") or ts
+        print(f"  connect: ssh {status['ssh_user']}@{connect_target}")
 
 
 # ---------------------------------------------------------------------------
@@ -1794,7 +1899,7 @@ def cmd_ssh(box_id: str) -> int:
         print(f"Box {box_id!r} not found or destroyed.", file=sys.stderr)
         return EXIT_ERROR
 
-    target = box.tailscale_hostname or box.droplet_ip
+    target = resolve_box_ssh_target(box, max_wait=5, interval=1, prefer_public=box.state == "ssh-ready")
     if not target:
         print(f"Box {box_id!r} has no reachable address.", file=sys.stderr)
         return EXIT_ERROR
