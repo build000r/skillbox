@@ -38,18 +38,18 @@ class ReconcileTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            sandbox_doc, dependencies_doc, persistence_doc, sources_doc, runtime_model = self._model_inputs()
+            sandbox_doc, dependencies_doc, persistence_doc, skill_repos_doc, runtime_model = self._model_inputs()
 
             with self._patch_roots(repo), \
-                mock.patch.object(RECONCILE, "load_yaml", side_effect=[sandbox_doc, dependencies_doc, persistence_doc, sources_doc]), \
+                mock.patch.object(RECONCILE, "load_yaml", side_effect=[sandbox_doc, dependencies_doc, persistence_doc, skill_repos_doc]), \
+                mock.patch.object(RECONCILE, "load_json", return_value={"skills": [{"name": "sample-skill"}]}), \
                 mock.patch.object(RECONCILE, "build_runtime_model", return_value=runtime_model), \
-                mock.patch.object(RECONCILE, "load_env_defaults", return_value={"SKILLBOX_CLIENTS_HOST_ROOT": "./workspace/clients"}), \
-                mock.patch.object(RECONCILE, "load_manifest_skills", return_value=["sample-skill"]), \
-                mock.patch.object(RECONCILE, "read_bundle_names", return_value=["sample-skill"]):
+                mock.patch.object(RECONCILE, "load_env_defaults", return_value={"SKILLBOX_CLIENTS_HOST_ROOT": "./workspace/clients"}):
                 model = RECONCILE.build_model()
 
             self.assertEqual(model["expected_mounts"][-1], {"source": "./repos/personal", "target": "/monoserver/personal"})
             self.assertEqual(model["runtime_env"]["SKILLBOX_CLIENTS_HOST_ROOT"], "/workspace/workspace/clients")
+            self.assertEqual(model["skill_sync"]["declared_skills"], ["sample-skill"])
 
     def test_build_model_falls_back_to_parent_mount_when_override_is_invalid(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -60,14 +60,13 @@ class ReconcileTests(unittest.TestCase):
             (workspace / ".focus.json").write_text('{"client_id":"personal"}', encoding="utf-8")
             override.write_text("not: [valid", encoding="utf-8")
 
-            sandbox_doc, dependencies_doc, persistence_doc, sources_doc, runtime_model = self._model_inputs()
+            sandbox_doc, dependencies_doc, persistence_doc, skill_repos_doc, runtime_model = self._model_inputs()
 
             with self._patch_roots(repo), \
-                mock.patch.object(RECONCILE, "load_yaml", side_effect=[sandbox_doc, dependencies_doc, persistence_doc, sources_doc]), \
+                mock.patch.object(RECONCILE, "load_yaml", side_effect=[sandbox_doc, dependencies_doc, persistence_doc, skill_repos_doc]), \
+                mock.patch.object(RECONCILE, "load_json", return_value={}), \
                 mock.patch.object(RECONCILE, "build_runtime_model", return_value=runtime_model), \
-                mock.patch.object(RECONCILE, "load_env_defaults", return_value={"SKILLBOX_CLIENTS_HOST_ROOT": "./workspace/clients"}), \
-                mock.patch.object(RECONCILE, "load_manifest_skills", return_value=["sample-skill"]), \
-                mock.patch.object(RECONCILE, "read_bundle_names", return_value=["sample-skill"]):
+                mock.patch.object(RECONCILE, "load_env_defaults", return_value={"SKILLBOX_CLIENTS_HOST_ROOT": "./workspace/clients"}):
                 model = RECONCILE.build_model()
 
             self.assertEqual(model["expected_mounts"][-1], {"source": "/state-root/monoserver", "target": "/monoserver"})
@@ -147,13 +146,11 @@ class ReconcileTests(unittest.TestCase):
             "expected_env": {"A": "1"},
             "expected_mounts": [{"source": "/repo", "target": "/workspace"}],
             "skill_sync": {
-                "script": str(ROOT_DIR / "scripts" / "03-skill-sync.sh"),
-                "manifest_file": str(ROOT_DIR / "workspace" / "default-skills.manifest"),
-                "sources_file": str(ROOT_DIR / "workspace" / "default-skills.sources.yaml"),
-                "output_dir": str(ROOT_DIR / "default-skills"),
-                "packager": "scripts/package_skill.py",
-                "manifest_skills": ["sample-skill"],
-                "present_bundles": ["sample-skill"],
+                "config_file": str(ROOT_DIR / "workspace" / "skill-repos.yaml"),
+                "lock_file": str(ROOT_DIR / "workspace" / "skill-repos.lock.json"),
+                "clone_root": str(ROOT_DIR / "workspace" / "skill-repos"),
+                "declared_skills": ["sample-skill"],
+                "locked_skills": ["sample-skill"],
             },
             "runtime_manager": {
                 "script": str(ROOT_DIR / ".env-manager" / "manage.py"),
@@ -193,9 +190,10 @@ class ReconcileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir).resolve()
             (repo / "docs").mkdir()
-            (repo / "docs" / "note.txt").write_text("use 00-skill-sync.sh\n", encoding="utf-8")
+            legacy_script = "00" "-skill-sync.sh"
+            (repo / "docs" / "note.txt").write_text(f"use {legacy_script}\n", encoding="utf-8")
             (repo / ".cache").mkdir()
-            (repo / ".cache" / "ignored.txt").write_text("00-skill-sync.sh\n", encoding="utf-8")
+            (repo / ".cache" / "ignored.txt").write_text(f"{legacy_script}\n", encoding="utf-8")
 
             with self._patch_roots(repo):
                 drift = RECONCILE.check_reference_drift()
@@ -203,11 +201,42 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(drift.status, "fail")
         self.assertEqual(drift.details["hits"], ["docs/note.txt:1"])
 
-        process = mock.Mock(returncode=0, stdout=json.dumps({"checks": [{"status": "warn", "code": "bundle-state"}]}), stderr="")
+        process = mock.Mock(returncode=0, stdout=json.dumps({"checks": [{"status": "warn", "code": "skill-repo-lock-state"}]}), stderr="")
         with mock.patch.object(RECONCILE, "run_command", return_value=process):
             doctor = RECONCILE.check_runtime_manager_doctor()
         self.assertEqual(doctor.status, "pass")
-        self.assertEqual(doctor.details["warning_codes"], ["bundle-state"])
+        self.assertEqual(doctor.details["warning_codes"], ["skill-repo-lock-state"])
+
+    def test_skill_repo_lock_state_and_sync_dry_run_helpers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            lock_path = repo / "workspace" / "skill-repos.lock.json"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path.write_text("{}", encoding="utf-8")
+            model = {
+                "skill_sync": {
+                    "lock_file": str(lock_path),
+                    "declared_skills": ["ask-cascade", "describe"],
+                    "locked_skills": ["ask-cascade"],
+                }
+            }
+
+            lock_state = RECONCILE.check_bundle_state(model)
+
+        self.assertEqual(lock_state.status, "warn")
+        self.assertEqual(lock_state.code, "skill-repo-lock-state")
+        self.assertEqual(lock_state.details["missing"], ["describe"])
+
+        process = mock.Mock(
+            returncode=0,
+            stdout=json.dumps({"actions": ["skill-repo-fetched: build000r/skills"]}),
+            stderr="",
+        )
+        with mock.patch.object(RECONCILE, "run_command", return_value=process):
+            dry_run = RECONCILE.check_skill_sync_dry_run({})
+        self.assertEqual(dry_run.status, "pass")
+        self.assertEqual(dry_run.code, "skill-repo-sync-dry-run")
+        self.assertEqual(dry_run.details["preview"], ["skill-repo-fetched: build000r/skills"])
 
     def test_check_manifest_alignment_and_compose_config_helpers(self) -> None:
         model = {
@@ -230,11 +259,13 @@ class ReconcileTests(unittest.TestCase):
                 }
             },
             "skill_sync": {
-                "bundle_dependency": {
-                    "path": "/workspace/default-skills",
-                    "source_manifest": "/workspace/workspace/default-skills.manifest",
-                    "sources_config": "/workspace/workspace/default-skills.sources.yaml",
-                }
+                "runtime_skillset": {
+                    "kind": "skill-repo-set",
+                    "skill_repos_config": "/workspace/workspace/skill-repos.yaml",
+                    "lock_path": "/workspace/workspace/skill-repos.lock.json",
+                    "clone_root": "/workspace/workspace/skill-repos",
+                    "sync": {"mode": "clone-and-install"},
+                },
             },
         }
 
@@ -314,16 +345,7 @@ class ReconcileTests(unittest.TestCase):
                 "entrypoints": ["workspace"],
             }
         }
-        dependencies_doc = {
-            "packaged_skill_bundles": [
-                {
-                    "id": "default-skills",
-                    "path": "/workspace/default-skills",
-                    "source_manifest": "/workspace/workspace/default-skills.manifest",
-                    "sources_config": "/workspace/workspace/default-skills.sources.yaml",
-                }
-            ]
-        }
+        dependencies_doc = {}
         persistence_doc = {
             "state_root_env": "SKILLBOX_STATE_ROOT",
             "targets": {
@@ -333,7 +355,7 @@ class ReconcileTests(unittest.TestCase):
                 }
             },
         }
-        sources_doc = {"sources": [{"kind": "local", "path": "./skills"}]}
+        skill_repos_doc = {"skill_repos": [{"path": "../skills", "pick": ["sample-skill"]}]}
         runtime_model = {
             "manifest_file": "/workspace/runtime.yaml",
             "persistence_manifest_file": "/workspace/persistence.yaml",
@@ -382,12 +404,22 @@ class ReconcileTests(unittest.TestCase):
             },
             "clients": [],
             "repos": [],
-            "skills": [],
+            "skills": [
+                {
+                    "id": "default-skills",
+                    "kind": "skill-repo-set",
+                    "skill_repos_config": "/workspace/workspace/skill-repos.yaml",
+                    "lock_path": "/workspace/workspace/skill-repos.lock.json",
+                    "clone_root": "/workspace/workspace/skill-repos",
+                    "sync": {"mode": "clone-and-install"},
+                    "client": "",
+                }
+            ],
             "services": [],
             "logs": [],
             "checks": [],
         }
-        return sandbox_doc, dependencies_doc, persistence_doc, sources_doc, runtime_model
+        return sandbox_doc, dependencies_doc, persistence_doc, skill_repos_doc, runtime_model
 
     def _patch_roots(self, repo: Path):
         return mock.patch.multiple(RECONCILE, ROOT_DIR=repo, WORKSPACE_DIR=repo / "workspace")

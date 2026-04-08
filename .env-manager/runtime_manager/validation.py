@@ -59,7 +59,43 @@ def item_matches_profiles(item: dict[str, Any], active_profiles: set[str]) -> bo
     }
     if not item_profiles:
         return True
-    return not item_profiles.isdisjoint(active_profiles)
+    if not item_profiles.isdisjoint(active_profiles):
+        return True
+    if "local-all" in item_profiles and any(profile.startswith("local-") for profile in active_profiles):
+        return True
+    if "local-all" in active_profiles and any(profile.startswith("local-") for profile in item_profiles):
+        return True
+    return False
+
+
+def parity_ledger_item_matches_profiles(item: dict[str, Any], active_profiles: set[str]) -> bool:
+    """Scope parity rows by explicit profiles or intended_profiles.
+
+    Client overlays usually leave ``profiles`` empty on parity-ledger rows and
+    instead declare ``intended_profiles``. Scoped doctor/status/focus runs need
+    that field to behave like profile scope; otherwise unrelated client/profile
+    rows leak into filtered models and produce false coverage gaps.
+    """
+    item_profiles = {
+        str(value).strip()
+        for value in item.get("profiles") or []
+        if str(value).strip()
+    }
+    if not item_profiles:
+        item_profiles = {
+            str(value).strip()
+            for value in item.get("intended_profiles") or []
+            if str(value).strip()
+        }
+    if not item_profiles:
+        return True
+    if not item_profiles.isdisjoint(active_profiles):
+        return True
+    if "local-all" in item_profiles and any(profile.startswith("local-") for profile in active_profiles):
+        return True
+    if "local-all" in active_profiles and any(profile.startswith("local-") for profile in item_profiles):
+        return True
+    return False
 
 
 def item_matches_clients(item: dict[str, Any], active_clients: set[str]) -> bool:
@@ -125,6 +161,12 @@ def filter_model(model: dict[str, Any], active_profiles: set[str], active_client
         copy.deepcopy(bridge)
         for bridge in model.get("bridges") or []
         if item_matches_profiles(bridge, active_profiles) and item_matches_clients(bridge, active_clients)
+    ]
+    filtered_model["parity_ledger"] = [
+        copy.deepcopy(item)
+        for item in model.get("parity_ledger") or []
+        if parity_ledger_item_matches_profiles(item, active_profiles)
+        and item_matches_clients(item, active_clients)
     ]
 
     included_repo_ids = {repo["id"] for repo in filtered_model["repos"]}

@@ -135,6 +135,10 @@ HARDENED_CLIENT_SKILL_BUILDER_SKILLS = [
     "skill-issue",
     "prompt-reviewer",
 ]
+HARDENED_CLIENT_HYBRID_SKILLS = (
+    HARDENED_CLIENT_PLANNING_SKILLS
+    + HARDENED_CLIENT_SKILL_BUILDER_SKILLS
+)
 HARDENED_CLIENT_PLAN_PATHS = {
     "plan_root": "plans/released",
     "plan_draft": "plans/draft",
@@ -303,7 +307,7 @@ def classify_error(exc: RuntimeError, command: str) -> dict[str, Any]:
             msg,
             error_type="invalid_scaffold_pack",
             recoverable=True,
-            recovery_hint="Use a supported scaffold pack such as `planning` or `skill-builder`.",
+            recovery_hint="Use a supported scaffold pack such as `planning`, `skill-builder`, or `hybrid`.",
             next_actions=["client-init --list-blueprints --format json"],
         )
     if "session_id is required" in lower_msg or "session event_type is required" in lower_msg:
@@ -1565,10 +1569,10 @@ def client_skill_builder_template_root() -> Path:
 
 def client_scaffold_pack(pack_name: str | None) -> str:
     pack = str(pack_name or "planning").strip() or "planning"
-    if pack in {"planning", "skill-builder"}:
+    if pack in {"planning", "skill-builder", "hybrid"}:
         return pack
     raise RuntimeError(
-        f"Unknown client scaffold pack: {pack}. Supported packs: planning, skill-builder."
+        f"Unknown client scaffold pack: {pack}. Supported packs: planning, skill-builder, hybrid."
     )
 
 
@@ -1576,14 +1580,27 @@ def client_scaffold_pack_required_skills(pack_name: str | None) -> list[str]:
     pack = client_scaffold_pack(pack_name)
     if pack == "planning":
         return copy.deepcopy(HARDENED_CLIENT_PLANNING_SKILLS)
-    return copy.deepcopy(HARDENED_CLIENT_SKILL_BUILDER_SKILLS)
+    if pack == "skill-builder":
+        return copy.deepcopy(HARDENED_CLIENT_SKILL_BUILDER_SKILLS)
+    return copy.deepcopy(HARDENED_CLIENT_HYBRID_SKILLS)
 
 
-def client_scaffold_pack_template_root(pack_name: str | None) -> Path:
+def client_scaffold_pack_skill_templates(pack_name: str | None) -> list[tuple[str, Path]]:
     pack = client_scaffold_pack(pack_name)
-    if pack == "planning":
-        return client_planning_skill_template_root()
-    return client_skill_builder_template_root()
+    template_pairs: list[tuple[str, Path]] = []
+    if pack in {"planning", "hybrid"}:
+        planning_root = client_planning_skill_template_root()
+        template_pairs.extend(
+            (skill_name, planning_root / skill_name)
+            for skill_name in HARDENED_CLIENT_PLANNING_SKILLS
+        )
+    if pack in {"skill-builder", "hybrid"}:
+        skill_builder_root = client_skill_builder_template_root()
+        template_pairs.extend(
+            (skill_name, skill_builder_root / skill_name)
+            for skill_name in HARDENED_CLIENT_SKILL_BUILDER_SKILLS
+        )
+    return template_pairs
 
 
 def client_scaffold_seed_files(
@@ -1594,7 +1611,11 @@ def client_scaffold_seed_files(
     pack = client_scaffold_pack(pack_name)
     if pack == "planning":
         return client_plan_seed_files(overlay_dir, client_label)
-    return client_skill_builder_seed_files(overlay_dir, client_label)
+    if pack == "skill-builder":
+        return client_skill_builder_seed_files(overlay_dir, client_label)
+    seed_files = client_plan_seed_files(overlay_dir, client_label)
+    seed_files.update(client_skill_builder_seed_files(overlay_dir, client_label))
+    return seed_files
 
 
 def sync_client_scaffold_seed_files(
@@ -1627,15 +1648,10 @@ def ensure_client_scaffold_skill_sources(
     *,
     dry_run: bool,
 ) -> list[str]:
-    template_root = client_scaffold_pack_template_root(scaffold_pack)
     actions: list[str] = []
-    if not template_root.is_dir():
-        raise RuntimeError(f"Missing client scaffold skill templates at {template_root}")
-
     skills_root = overlay_dir / "skills"
     ensure_directory(skills_root, dry_run=dry_run)
-    for skill_name in client_scaffold_pack_required_skills(scaffold_pack):
-        source_dir = template_root / skill_name
+    for skill_name, source_dir in client_scaffold_pack_skill_templates(scaffold_pack):
         if not source_dir.is_dir():
             raise RuntimeError(f"Missing scaffold skill template for {skill_name} at {source_dir}")
         target_dir = skills_root / skill_name
@@ -3092,21 +3108,24 @@ def ensure_client_overlay_context_shape(
     raw_context["cwd_match"] = normalized_cwd_match or [client_default_cwd]
 
     scaffold_pack = client_scaffold_pack(scaffold_pack)
-    if scaffold_pack == "planning":
-        raw_context.pop("workflow_builder", None)
+    if scaffold_pack in {"planning", "hybrid"}:
         raw_plans = raw_context.setdefault("plans", {})
         if not isinstance(raw_plans, dict):
             raise RuntimeError("Expected client.context.plans to be a mapping.")
         for key, value in HARDENED_CLIENT_PLAN_PATHS.items():
             raw_plans[key] = value
-        return
+        if scaffold_pack == "planning":
+            raw_context.pop("workflow_builder", None)
+            return
 
-    raw_context.pop("plans", None)
-    raw_workflow_builder = raw_context.setdefault("workflow_builder", {})
-    if not isinstance(raw_workflow_builder, dict):
-        raise RuntimeError("Expected client.context.workflow_builder to be a mapping.")
-    for key, value in HARDENED_CLIENT_SKILL_BUILDER_CONTEXT["workflow_builder"].items():
-        raw_workflow_builder[key] = value
+    if scaffold_pack in {"skill-builder", "hybrid"}:
+        raw_workflow_builder = raw_context.setdefault("workflow_builder", {})
+        if not isinstance(raw_workflow_builder, dict):
+            raise RuntimeError("Expected client.context.workflow_builder to be a mapping.")
+        for key, value in HARDENED_CLIENT_SKILL_BUILDER_CONTEXT["workflow_builder"].items():
+            raw_workflow_builder[key] = value
+        if scaffold_pack == "skill-builder":
+            raw_context.pop("plans", None)
 
 
 def normalize_client_overlay_shape(root_dir: Path, overlay_dir: Path) -> list[str]:
