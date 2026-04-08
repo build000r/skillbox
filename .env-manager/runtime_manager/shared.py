@@ -115,6 +115,8 @@ PATH_LIKE_ENV_KEYS = {
     "SKILLBOX_SWIMMERS_INSTALL_DIR",
     "SKILLBOX_SWIMMERS_BIN",
     "SKILLBOX_DCG_BIN",
+    "SKILLBOX_INGRESS_ROUTE_FILE",
+    "SKILLBOX_INGRESS_NGINX_CONFIG",
 }
 HARDENED_SHARED_DEFAULT_SKILLS = [
     "ask-cascade",
@@ -1707,7 +1709,18 @@ def default_client_scaffold_files(
 
 def merge_client_overlay(base_client: dict[str, Any], blueprint_client: dict[str, Any]) -> dict[str, Any]:
     merged = copy.deepcopy(base_client)
-    additive_sections = ("repo_roots", "repos", "artifacts", "env_files", "skills", "tasks", "services", "logs", "checks")
+    additive_sections = (
+        "repo_roots",
+        "repos",
+        "artifacts",
+        "env_files",
+        "skills",
+        "tasks",
+        "services",
+        "logs",
+        "checks",
+        "ingress_routes",
+    )
     scalar_items = dict(blueprint_client)
 
     for key in additive_sections:
