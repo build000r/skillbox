@@ -11,12 +11,35 @@ STATE_ROOT="${SKILLBOX_STATE_ROOT:-}"
 STORAGE_FILESYSTEM="${SKILLBOX_STORAGE_FILESYSTEM:-}"
 VOLUME_NAME="${SKILLBOX_VOLUME_NAME:-}"
 VOLUME_DEVICE=""
+APT_LOCK_TIMEOUT_SECONDS="${APT_LOCK_TIMEOUT_SECONDS:-300}"
+
+wait_for_apt_readiness() {
+  local deadline=$((SECONDS + APT_LOCK_TIMEOUT_SECONDS))
+
+  if command -v cloud-init >/dev/null 2>&1; then
+    echo "Waiting for cloud-init to finish..."
+    cloud-init status --wait || true
+  fi
+
+  while fuser /var/lib/dpkg/lock >/dev/null 2>&1 \
+    || fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+    || fuser /var/lib/apt/lists/lock >/dev/null 2>&1 \
+    || pgrep -x apt >/dev/null 2>&1 \
+    || pgrep -x apt-get >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      echo "Timed out waiting for apt/dpkg locks to clear." >&2
+      return 1
+    fi
+    sleep 5
+  done
+}
 
 if [[ -n "${VOLUME_NAME}" ]]; then
   VOLUME_DEVICE="/dev/disk/by-id/scsi-0DO_Volume_${VOLUME_NAME}"
 fi
 
 echo "[1/9] Updating OS packages..."
+wait_for_apt_readiness
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get -y upgrade
 
@@ -61,6 +84,10 @@ if ! id -u "${APP_USER}" >/dev/null 2>&1; then
   adduser --disabled-password --gecos "" "${APP_USER}"
 fi
 usermod -aG sudo,docker,adm "${APP_USER}"
+install -d -m 700 -o "${APP_USER}" -g "${APP_USER}" "/home/${APP_USER}/.ssh"
+if [[ -f /root/.ssh/authorized_keys ]]; then
+  install -m 600 -o "${APP_USER}" -g "${APP_USER}" /root/.ssh/authorized_keys "/home/${APP_USER}/.ssh/authorized_keys"
+fi
 
 echo "[6/9] Preparing durable state root..."
 if [[ -n "${STATE_ROOT}" && -n "${STORAGE_FILESYSTEM}" && -n "${VOLUME_DEVICE}" ]]; then
