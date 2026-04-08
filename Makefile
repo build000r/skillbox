@@ -22,7 +22,7 @@ FORCE_ARGS := $(if $(strip $(FORCE)),--force,)
 help:
 	@printf "  make bootstrap-env  Copy .env.example to .env if missing\n"
 	@printf "  make render         Print the resolved sandbox model\n"
-	@printf "  make doctor         Validate manifest/runtime drift\n"
+	@printf "  make doctor         Validate outer manifests, compose drift, and default skill-repo-set sync\n"
 	@printf "  make acceptance     Run first-box acceptance for CLIENT=id (optional PROFILE=name)\n"
 	@printf "  make runtime-render Print the resolved internal runtime graph (optional CLIENT=name PROFILE=name)\n"
 	@printf "  make runtime-sync   Create managed repo/log dirs and install default skills (optional CLIENT=name PROFILE=name)\n"

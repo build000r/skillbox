@@ -23,3 +23,17 @@ skill_repos:
       - cass-memory
       - dev-sanity
       - skillbox-operator
+
+  # Shared workflow skills from the main opensource skills repo
+  - path: ../../skills
+    pick:
+      - divide-and-conquer
+      - domain-planner
+      - domain-reviewer
+      - domain-scaffolder
+
+  # Private local skills that should ship with the default box setup
+  - path: ../../../skills-private
+    pick:
+      - cass
+      - smart

@@ -36,3 +36,4 @@ data/
 .env.box
 .dcg.toml
 sand/
+.skillbox-state/
