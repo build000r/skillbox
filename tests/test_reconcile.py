@@ -38,10 +38,10 @@ class ReconcileTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            sandbox_doc, dependencies_doc, sources_doc, runtime_model = self._model_inputs()
+            sandbox_doc, dependencies_doc, persistence_doc, sources_doc, runtime_model = self._model_inputs()
 
             with self._patch_roots(repo), \
-                mock.patch.object(RECONCILE, "load_yaml", side_effect=[sandbox_doc, dependencies_doc, sources_doc]), \
+                mock.patch.object(RECONCILE, "load_yaml", side_effect=[sandbox_doc, dependencies_doc, persistence_doc, sources_doc]), \
                 mock.patch.object(RECONCILE, "build_runtime_model", return_value=runtime_model), \
                 mock.patch.object(RECONCILE, "load_env_defaults", return_value={"SKILLBOX_CLIENTS_HOST_ROOT": "./workspace/clients"}), \
                 mock.patch.object(RECONCILE, "load_manifest_skills", return_value=["sample-skill"]), \
@@ -60,17 +60,17 @@ class ReconcileTests(unittest.TestCase):
             (workspace / ".focus.json").write_text('{"client_id":"personal"}', encoding="utf-8")
             override.write_text("not: [valid", encoding="utf-8")
 
-            sandbox_doc, dependencies_doc, sources_doc, runtime_model = self._model_inputs()
+            sandbox_doc, dependencies_doc, persistence_doc, sources_doc, runtime_model = self._model_inputs()
 
             with self._patch_roots(repo), \
-                mock.patch.object(RECONCILE, "load_yaml", side_effect=[sandbox_doc, dependencies_doc, sources_doc]), \
+                mock.patch.object(RECONCILE, "load_yaml", side_effect=[sandbox_doc, dependencies_doc, persistence_doc, sources_doc]), \
                 mock.patch.object(RECONCILE, "build_runtime_model", return_value=runtime_model), \
                 mock.patch.object(RECONCILE, "load_env_defaults", return_value={"SKILLBOX_CLIENTS_HOST_ROOT": "./workspace/clients"}), \
                 mock.patch.object(RECONCILE, "load_manifest_skills", return_value=["sample-skill"]), \
                 mock.patch.object(RECONCILE, "read_bundle_names", return_value=["sample-skill"]):
                 model = RECONCILE.build_model()
 
-            self.assertEqual(model["expected_mounts"][-1], {"source": str(repo.parent), "target": "/monoserver"})
+            self.assertEqual(model["expected_mounts"][-1], {"source": "/state-root/monoserver", "target": "/monoserver"})
 
     def test_check_compose_model_reports_workspace_surface_and_swimmers_drift(self) -> None:
         model = {
@@ -158,6 +158,7 @@ class ReconcileTests(unittest.TestCase):
             "runtime_manager": {
                 "script": str(ROOT_DIR / ".env-manager" / "manage.py"),
                 "manifest_file": str(ROOT_DIR / "workspace" / "runtime.yaml"),
+                "persistence_manifest_file": str(ROOT_DIR / "workspace" / "persistence.yaml"),
                 "clients": [],
                 "repos": [{}],
                 "skills": [{}],
@@ -292,7 +293,9 @@ class ReconcileTests(unittest.TestCase):
         emit_json.assert_not_called()
         print_render_text.assert_not_called()
 
-    def _model_inputs(self) -> tuple[dict[str, object], dict[str, object], dict[str, object], dict[str, object]]:
+    def _model_inputs(
+        self,
+    ) -> tuple[dict[str, object], dict[str, object], dict[str, object], dict[str, object], dict[str, object]]:
         sandbox_doc = {
             "sandbox": {
                 "name": "skillbox",
@@ -321,10 +324,62 @@ class ReconcileTests(unittest.TestCase):
                 }
             ]
         }
+        persistence_doc = {
+            "state_root_env": "SKILLBOX_STATE_ROOT",
+            "targets": {
+                "local": {
+                    "provider": "local",
+                    "default_state_root": "./.skillbox-state",
+                }
+            },
+        }
         sources_doc = {"sources": [{"kind": "local", "path": "./skills"}]}
         runtime_model = {
             "manifest_file": "/workspace/runtime.yaml",
+            "persistence_manifest_file": "/workspace/persistence.yaml",
             "env": {"SKILLBOX_CLIENTS_HOST_ROOT": "./workspace/clients"},
+            "storage": {
+                "provider": "local",
+                "state_root": "/state-root",
+                "bindings": [
+                    {
+                        "id": "workspace-root",
+                        "runtime_path": "/workspace",
+                        "storage_class": "external",
+                        "resolved_host_path": str(ROOT_DIR),
+                    },
+                    {
+                        "id": "clients-root",
+                        "runtime_path": "/workspace/workspace/clients",
+                        "storage_class": "persistent",
+                        "resolved_host_path": "/state-root/clients",
+                    },
+                    {
+                        "id": "claude-home",
+                        "runtime_path": "/workspace/home/.claude",
+                        "storage_class": "persistent",
+                        "resolved_host_path": "/state-root/home/.claude",
+                    },
+                    {
+                        "id": "codex-home",
+                        "runtime_path": "/workspace/home/.codex",
+                        "storage_class": "persistent",
+                        "resolved_host_path": "/state-root/home/.codex",
+                    },
+                    {
+                        "id": "logs-root",
+                        "runtime_path": "/workspace/logs",
+                        "storage_class": "persistent",
+                        "resolved_host_path": "/state-root/logs",
+                    },
+                    {
+                        "id": "monoserver-root",
+                        "runtime_path": "/monoserver",
+                        "storage_class": "persistent",
+                        "resolved_host_path": "/state-root/monoserver",
+                    },
+                ],
+            },
             "clients": [],
             "repos": [],
             "skills": [],
@@ -332,7 +387,7 @@ class ReconcileTests(unittest.TestCase):
             "logs": [],
             "checks": [],
         }
-        return sandbox_doc, dependencies_doc, sources_doc, runtime_model
+        return sandbox_doc, dependencies_doc, persistence_doc, sources_doc, runtime_model
 
     def _patch_roots(self, repo: Path):
         return mock.patch.multiple(RECONCILE, ROOT_DIR=repo, WORKSPACE_DIR=repo / "workspace")

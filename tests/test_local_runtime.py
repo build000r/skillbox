@@ -47,6 +47,43 @@ def _write_local_runtime_fixture(repo: Path, *, with_bridge_outputs: bool = Fals
     """Scaffold a minimal runtime fixture with local-runtime bridge declarations."""
     (repo / "workspace" / "clients" / "personal").mkdir(parents=True)
     (repo / "defaults").mkdir(exist_ok=True)
+    (repo / "workspace" / "persistence.yaml").write_text(
+        textwrap.dedent(
+            """\
+            version: 1
+            state_root_env: SKILLBOX_STATE_ROOT
+            targets:
+              local:
+                provider: local
+                default_state_root: ./.skillbox-state
+              digitalocean:
+                provider: digitalocean
+                default_state_root: /srv/skillbox
+            bindings:
+              - id: workspace-root
+                runtime_path: /workspace
+                storage_class: external
+                source_ref: root_dir
+              - id: local-home
+                runtime_path: /home/sandbox/.local
+                storage_class: persistent
+                relative_path: home/.local
+              - id: clients-root
+                runtime_path: /workspace/workspace/clients
+                storage_class: persistent
+                relative_path: clients
+              - id: logs-root
+                runtime_path: /workspace/logs
+                storage_class: persistent
+                relative_path: logs
+              - id: monoserver-root
+                runtime_path: /monoserver
+                storage_class: persistent
+                relative_path: monoserver
+            """
+        ),
+        encoding="utf-8",
+    )
     (repo / ".env.example").write_text(
         textwrap.dedent(f"""\
             SKILLBOX_WORKSPACE_ROOT={repo / "workspace"}

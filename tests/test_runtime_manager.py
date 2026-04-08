@@ -53,14 +53,14 @@ class RuntimeManagerTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             actions = payload["actions"]
             self.assertTrue((repo / "repos").is_dir())
-            self.assertTrue((repo / "logs" / "runtime").is_dir())
-            self.assertTrue((repo / "logs" / "repos").is_dir())
-            self.assertFalse((repo / "logs" / "api").exists())
-            self.assertFalse((repo / "logs" / "web").exists())
-            self.assertTrue((repo / "home" / ".claude" / "skills" / "sample-skill" / "SKILL.md").is_file())
-            self.assertTrue((repo / "home" / ".codex" / "skills" / "sample-skill" / "SKILL.md").is_file())
-            self.assertTrue((repo / "home" / ".local" / "bin" / "swimmers").is_file())
-            self.assertFalse((repo / "home" / ".claude" / "skills" / "personal-skill").exists())
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "runtime").is_dir())
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "repos").is_dir())
+            self.assertFalse((repo / ".skillbox-state" / "logs" / "api").exists())
+            self.assertFalse((repo / ".skillbox-state" / "logs" / "web").exists())
+            self.assertTrue((repo / ".skillbox-state" / "home" / ".claude" / "skills" / "sample-skill" / "SKILL.md").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "home" / ".codex" / "skills" / "sample-skill" / "SKILL.md").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "home" / ".local" / "bin" / "swimmers").is_file())
+            self.assertFalse((repo / ".skillbox-state" / "home" / ".claude" / "skills" / "personal-skill").exists())
             self.assertTrue((repo / "workspace" / "skill-repos.lock.json").is_file())
             self.assertTrue(any("copy-if-missing:" in action for action in actions))
             self.assertTrue(any("install-skill:" in action for action in actions))
@@ -159,7 +159,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(sync.returncode, 0, sync.stderr)
 
             source_path = repo / "artifacts" / "swimmers.bin"
-            target_path = repo / "home" / ".local" / "bin" / "swimmers"
+            target_path = repo / ".skillbox-state" / "home" / ".local" / "bin" / "swimmers"
             source_path.write_text("#!/bin/sh\necho updated\n", encoding="utf-8")
 
             doctor = self._run(repo, "doctor", "--format", "json")
@@ -168,7 +168,7 @@ class RuntimeManagerTests(unittest.TestCase):
             artifact_check = next(item for item in checks if item["code"] == "syncable-artifact-paths")
             self.assertEqual(artifact_check["status"], "warn")
             self.assertIn("stale", artifact_check["details"])
-            self.assertTrue(any("home/.local/bin/swimmers" in item for item in artifact_check["details"]["stale"]))
+            self.assertTrue(any(".skillbox-state/home/.local/bin/swimmers" in item for item in artifact_check["details"]["stale"]))
 
             reconcile = self._run(repo, "sync", "--format", "json")
             self.assertEqual(reconcile.returncode, 0, reconcile.stderr)
@@ -208,10 +208,10 @@ class RuntimeManagerTests(unittest.TestCase):
             sync = self._run(repo, "sync", "--client", "personal", "--format", "json")
 
             self.assertEqual(sync.returncode, 0, sync.stderr)
-            self.assertTrue((repo / "logs" / "clients" / "personal").is_dir())
-            self.assertTrue((repo / "workspace" / "clients" / "personal" / "skill-repos.lock.json").is_file())
-            self.assertTrue((repo / "home" / ".claude" / "skills" / "personal-skill" / "SKILL.md").is_file())
-            self.assertTrue((repo / "home" / ".codex" / "skills" / "personal-skill" / "SKILL.md").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "clients" / "personal").is_dir())
+            self.assertTrue((repo / ".skillbox-state" / "clients" / "personal" / "skill-repos.lock.json").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "home" / ".claude" / "skills" / "personal-skill" / "SKILL.md").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "home" / ".codex" / "skills" / "personal-skill" / "SKILL.md").is_file())
 
     def test_profile_selection_limits_optional_surfaces(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -249,7 +249,7 @@ class RuntimeManagerTests(unittest.TestCase):
 
             sync = self._run(repo, "sync", "--profile", "swimmers", "--format", "json")
             self.assertEqual(sync.returncode, 0, sync.stderr)
-            self.assertTrue((repo / "logs" / "swimmers").is_dir())
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "swimmers").is_dir())
 
     def test_profile_selection_activates_connectors_overlay(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -293,9 +293,9 @@ class RuntimeManagerTests(unittest.TestCase):
 
             sync = self._run(repo, "sync", "--profile", "connectors", "--format", "json")
             self.assertEqual(sync.returncode, 0, sync.stderr)
-            self.assertTrue((repo / "logs" / "connectors").is_dir())
-            self.assertTrue((repo / "home" / ".local" / "bin" / "fwc").is_file())
-            self.assertTrue((repo / "home" / ".local" / "bin" / "dcg").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "connectors").is_dir())
+            self.assertTrue((repo / ".skillbox-state" / "home" / ".local" / "bin" / "fwc").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "home" / ".local" / "bin" / "dcg").is_file())
 
             doctor = self._run(repo, "doctor", "--profile", "connectors", "--format", "json")
             self.assertEqual(doctor.returncode, 0, doctor.stderr)
@@ -364,7 +364,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self._set_runtime_env_value(repo, "SKILLBOX_FWC_CONNECTORS", "github,slack,linear")
             self._set_client_connectors(repo, "personal", ["github", "slack"])
             self._set_client_connectors(repo, "vibe-coding-client", ["linear"])
-            (repo / "monoserver-host" / "vibe-coding-client").mkdir(parents=True, exist_ok=True)
+            (repo / ".skillbox-state" / "monoserver" / "vibe-coding-client").mkdir(parents=True, exist_ok=True)
 
             personal_result = self._run(
                 repo,
@@ -408,8 +408,8 @@ class RuntimeManagerTests(unittest.TestCase):
             service_result = up_payload["services"][0]
             self.assertEqual(service_result["id"], "fixture-daemon")
             self.assertEqual(service_result["result"], "started")
-            self.assertTrue((repo / "logs" / "runtime" / "fixture-daemon.pid").is_file())
-            self.assertTrue((repo / "logs" / "runtime" / "fixture-daemon.ready").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-daemon.pid").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-daemon.ready").is_file())
 
             status = self._run(repo, "status", "--format", "json")
             self.assertEqual(status.returncode, 0, status.stderr)
@@ -424,8 +424,8 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(down.returncode, 0, down.stderr)
             down_payload = json.loads(down.stdout)
             self.assertIn(down_payload["services"][0]["result"], {"stopped", "killed"})
-            self.assertFalse((repo / "logs" / "runtime" / "fixture-daemon.pid").exists())
-            self.assertFalse((repo / "logs" / "runtime" / "fixture-daemon.ready").exists())
+            self.assertFalse((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-daemon.pid").exists())
+            self.assertFalse((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-daemon.ready").exists())
 
     def test_up_skips_status_only_services_and_logs_show_recent_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -469,7 +469,7 @@ class RuntimeManagerTests(unittest.TestCase):
                 [item["result"] for item in up_payload["services"]],
                 ["started", "started"],
             )
-            self.assertTrue((repo / "logs" / "runtime" / "fixture-worker.ready").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-worker.ready").is_file())
 
     def test_down_selected_dependency_stops_dependents_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -489,8 +489,8 @@ class RuntimeManagerTests(unittest.TestCase):
                 [item["id"] for item in down_payload["services"]],
                 ["fixture-worker", "fixture-daemon"],
             )
-            self.assertFalse((repo / "logs" / "runtime" / "fixture-worker.pid").exists())
-            self.assertFalse((repo / "logs" / "runtime" / "fixture-daemon.pid").exists())
+            self.assertFalse((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-worker.pid").exists())
+            self.assertFalse((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-daemon.pid").exists())
 
     def test_restart_replaces_running_service_process(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -555,7 +555,7 @@ class RuntimeManagerTests(unittest.TestCase):
             sync = self._run(repo, "sync")
             self.assertEqual(sync.returncode, 0, sync.stderr)
 
-            (repo / "home" / ".claude" / "skills" / "sample-skill" / "SKILL.md").write_text(
+            (repo / ".skillbox-state" / "home" / ".claude" / "skills" / "sample-skill" / "SKILL.md").write_text(
                 "---\nname: sample-skill\ndescription: drifted\n---\n",
                 encoding="utf-8",
             )
@@ -645,13 +645,13 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads(result.stdout)
             self.assertEqual(payload["client_id"], "acme-studio")
-            self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "overlay.yaml").is_file())
-            self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "skill-repos.yaml").is_file())
-            self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "skills" / ".gitkeep").is_file())
-            self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "plans" / "INDEX.md").is_file())
-            self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "plans" / "draft" / ".gitkeep").is_file())
-            self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "plans" / "released" / ".gitkeep").is_file())
-            self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "plans" / "sessions" / ".gitkeep").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "clients" / "acme-studio" / "overlay.yaml").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "clients" / "acme-studio" / "skill-repos.yaml").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "clients" / "acme-studio" / "skills" / ".gitkeep").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "clients" / "acme-studio" / "plans" / "INDEX.md").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "clients" / "acme-studio" / "plans" / "draft" / ".gitkeep").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "clients" / "acme-studio" / "plans" / "released" / ".gitkeep").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "clients" / "acme-studio" / "plans" / "sessions" / ".gitkeep").is_file())
             self.assertFalse((repo / "default-skills" / "clients" / "acme-studio").exists())
             self.assertFalse((repo / "skills" / "clients" / "acme-studio").exists())
             self.assertEqual(
@@ -664,15 +664,15 @@ class RuntimeManagerTests(unittest.TestCase):
                 ],
             )
 
-            skill_repos_content = (repo / "workspace" / "clients" / "acme-studio" / "skill-repos.yaml").read_text(encoding="utf-8")
+            skill_repos_content = (repo / ".skillbox-state" / "clients" / "acme-studio" / "skill-repos.yaml").read_text(encoding="utf-8")
             for skill_name in MANAGE_MODULE.HARDENED_CLIENT_PLANNING_SKILLS:
                 self.assertIn(skill_name, skill_repos_content)
 
             overlay_doc = MANAGE_MODULE.load_yaml(
-                repo / "workspace" / "clients" / "acme-studio" / "overlay.yaml",
+                repo / ".skillbox-state" / "clients" / "acme-studio" / "overlay.yaml",
             )
             client_context = overlay_doc["client"]["context"]
-            self.assertEqual(client_context["cwd_match"], ["${SKILLBOX_MONOSERVER_ROOT}/acme-studio"])
+            self.assertEqual(client_context["cwd_match"], ["${SKILLBOX_MONOSERVER_ROOT}"])
             self.assertEqual(client_context["plans"], MANAGE_MODULE.HARDENED_CLIENT_PLAN_PATHS)
 
             render = self._run(repo, "render", "--client", "acme-studio", "--format", "json")
@@ -692,8 +692,8 @@ class RuntimeManagerTests(unittest.TestCase):
             sync = self._run(repo, "sync", "--client", "acme-studio", "--format", "json")
 
             self.assertEqual(sync.returncode, 0, sync.stderr)
-            self.assertTrue((repo / "logs" / "clients" / "acme-studio").is_dir())
-            self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "skill-repos.lock.json").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "clients" / "acme-studio").is_dir())
+            self.assertTrue((repo / ".skillbox-state" / "clients" / "acme-studio" / "skill-repos.lock.json").is_file())
 
     def test_render_reads_client_overlays_from_configured_clients_host_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -739,7 +739,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertTrue((external_clients / "acme-studio" / "skill-repos.yaml").is_file())
             self.assertTrue((external_clients / "acme-studio" / "skills" / ".gitkeep").is_file())
             self.assertTrue((external_clients / "acme-studio" / "plans" / "INDEX.md").is_file())
-            self.assertFalse((repo / "workspace" / "clients" / "acme-studio").exists())
+            self.assertFalse((repo / ".skillbox-state" / "clients" / "acme-studio").exists())
             self.assertFalse((repo / "default-skills" / "clients" / "acme-studio").exists())
             self.assertFalse((repo / "skills" / "clients" / "acme-studio").exists())
 
@@ -757,7 +757,7 @@ class RuntimeManagerTests(unittest.TestCase):
             result = self._run(repo, "client-init", "acme-studio", "--format", "json")
             self.assertEqual(result.returncode, 0, result.stderr)
 
-            overlay_dir = repo / "workspace" / "clients" / "acme-studio"
+            overlay_dir = repo / ".skillbox-state" / "clients" / "acme-studio"
             skill_dir = overlay_dir / "skills" / "custom-skill"
             skill_dir.mkdir(parents=True, exist_ok=True)
             (skill_dir / "SKILL.md").write_text(
@@ -780,7 +780,7 @@ class RuntimeManagerTests(unittest.TestCase):
 
             sync = self._run(repo, "sync", "--client", "acme-studio", "--format", "json")
             self.assertEqual(sync.returncode, 0, sync.stderr)
-            self.assertTrue((repo / "home" / ".claude" / "skills" / "custom-skill" / "SKILL.md").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "home" / ".claude" / "skills" / "custom-skill" / "SKILL.md").is_file())
 
     def test_client_init_rejects_invalid_client_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -804,7 +804,7 @@ class RuntimeManagerTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 1)
             payload = json.loads(result.stdout)
-            self.assertIn("workspace/clients/personal/overlay.yaml", payload["error"]["message"])
+            self.assertIn(".skillbox-state/clients/personal/overlay.yaml", payload["error"]["message"])
 
     def test_client_init_lists_available_blueprints(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -920,7 +920,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads(result.stdout)
             self.assertEqual(payload["blueprint"]["id"], "git-repo-http-service")
-            self.assertTrue((repo / "workspace" / "clients" / "acme-studio" / "overlay.yaml").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "clients" / "acme-studio" / "overlay.yaml").is_file())
 
             render = self._run(repo, "render", "--client", "acme-studio", "--format", "json")
 
@@ -938,14 +938,14 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertIn("acme-studio-services", {item["id"] for item in render_payload["logs"]})
             self.assertEqual(
                 next(client for client in render_payload["clients"] if client["id"] == "acme-studio")["default_cwd"],
-                "/monoserver/acme-studio/app",
+                "/monoserver/app",
             )
 
             sync = self._run(repo, "sync", "--client", "acme-studio", "--format", "json")
 
             self.assertEqual(sync.returncode, 0, sync.stderr)
-            self.assertTrue((repo / "monoserver-host" / "acme-studio" / "app" / "README.md").is_file())
-            self.assertTrue((repo / "logs" / "clients" / "acme-studio" / "services").is_dir())
+            self.assertTrue((repo / ".skillbox-state" / "monoserver" / "app" / "README.md").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "clients" / "acme-studio" / "services").is_dir())
             self.assertTrue(any("clone-if-missing:" in action for action in json.loads(sync.stdout)["actions"]))
 
     def test_client_init_with_blueprint_scaffolds_client_scoped_connectors(self) -> None:
@@ -1002,7 +1002,7 @@ class RuntimeManagerTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            overlay_doc = MANAGE_MODULE.load_yaml(repo / "workspace" / "clients" / "acme-studio" / "overlay.yaml")
+            overlay_doc = MANAGE_MODULE.load_yaml(repo / ".skillbox-state" / "clients" / "acme-studio" / "overlay.yaml")
             self.assertEqual(
                 overlay_doc["client"]["connectors"],
                 [{"id": "github"}, {"id": "slack"}],
@@ -1034,7 +1034,7 @@ class RuntimeManagerTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertEqual(payload["blueprint"]["id"], "skill-builder-fwc")
 
-            overlay_dir = repo / "workspace" / "clients" / "acme-builder"
+            overlay_dir = repo / ".skillbox-state" / "clients" / "acme-builder"
             overlay_doc = MANAGE_MODULE.load_yaml(overlay_dir / "overlay.yaml")
             client_doc = overlay_doc["client"]
             self.assertEqual(client_doc["scaffold"]["pack"], "skill-builder")
@@ -1069,10 +1069,10 @@ class RuntimeManagerTests(unittest.TestCase):
             sync = self._run(repo, "sync", "--client", "acme-builder", "--format", "json")
 
             self.assertEqual(sync.returncode, 0, sync.stderr)
-            self.assertTrue((repo / "logs" / "clients" / "acme-builder").is_dir())
-            self.assertTrue((repo / "logs" / "clients" / "acme-builder" / "invocations").is_dir())
-            self.assertTrue((repo / "logs" / "clients" / "acme-builder" / "evaluations").is_dir())
-            self.assertTrue((repo / "logs" / "clients" / "acme-builder" / "observability").is_dir())
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "clients" / "acme-builder").is_dir())
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "clients" / "acme-builder" / "invocations").is_dir())
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "clients" / "acme-builder" / "evaluations").is_dir())
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "clients" / "acme-builder" / "observability").is_dir())
             self.assertTrue((overlay_dir / "skill-repos.lock.json").is_file())
 
             project = self._run(repo, "client-project", "acme-builder", "--format", "json")
@@ -1155,7 +1155,7 @@ class RuntimeManagerTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            (repo / "monoserver-host" / "acme-studio").mkdir(parents=True, exist_ok=True)
+            (repo / ".skillbox-state" / "monoserver" / "acme-studio").mkdir(parents=True, exist_ok=True)
 
             before = self._run(repo, "doctor", "--client", "acme-studio", "--format", "json")
             self.assertEqual(before.returncode, 0, before.stderr)
@@ -1168,7 +1168,7 @@ class RuntimeManagerTests(unittest.TestCase):
             sync_payload = json.loads(sync.stdout)
             self.assertTrue(any("hydrate-env:" in action for action in sync_payload["actions"]))
 
-            env_target = repo / "monoserver-host" / "acme-studio" / "app" / ".env.local"
+            env_target = repo / ".skillbox-state" / "monoserver" / "app" / ".env.local"
             self.assertTrue(env_target.is_file())
             self.assertEqual(env_target.read_text(encoding="utf-8"), "PORT=4010\nAPI_KEY=test-key\n")
             self.assertEqual(env_target.stat().st_mode & 0o777, 0o600)
@@ -1213,7 +1213,7 @@ class RuntimeManagerTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            (repo / "monoserver-host" / "acme-studio").mkdir(parents=True, exist_ok=True)
+            (repo / ".skillbox-state" / "monoserver" / "acme-studio").mkdir(parents=True, exist_ok=True)
 
             doctor = self._run(repo, "doctor", "--client", "acme-studio", "--format", "json")
             self.assertEqual(doctor.returncode, 2)
@@ -1250,7 +1250,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(up.returncode, 1)
             payload = json.loads(up.stdout)
             self.assertIn("app-env", payload["error"]["message"])
-            pid_file = repo / "logs" / "clients" / "acme-studio" / "services" / "app-dev.pid"
+            pid_file = repo / ".skillbox-state" / "logs" / "clients" / "acme-studio" / "services" / "app-dev.pid"
             self.assertFalse(pid_file.exists())
 
     def test_sync_only_hydrates_env_files_for_selected_client(self) -> None:
@@ -1281,8 +1281,10 @@ class RuntimeManagerTests(unittest.TestCase):
             sync = self._run(repo, "sync", "--client", "acme-studio", "--format", "json")
 
             self.assertEqual(sync.returncode, 0, sync.stderr)
-            self.assertTrue((repo / "monoserver-host" / "acme-studio" / "app" / ".env.local").is_file())
-            self.assertFalse((repo / "monoserver-host" / "beta-studio" / "app" / ".env.local").exists())
+            env_target = repo / ".skillbox-state" / "monoserver" / "app" / ".env.local"
+            self.assertTrue(env_target.is_file())
+            self.assertEqual(env_target.read_text(encoding="utf-8"), "PORT=4010\nAPI_KEY=acme\n")
+            self.assertEqual(sorted((repo / ".skillbox-state" / "monoserver").rglob(".env.local")), [env_target])
 
     def test_bootstrap_runs_tasks_in_dependency_order_and_status_reports_ready(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1322,7 +1324,7 @@ class RuntimeManagerTests(unittest.TestCase):
                 ["completed", "completed"],
             )
 
-            order_file = repo / "logs" / "runtime" / "bootstrap-order.log"
+            order_file = repo / ".skillbox-state" / "logs" / "runtime" / "bootstrap-order.log"
             self.assertEqual(
                 order_file.read_text(encoding="utf-8").splitlines(),
                 ["prepare-assets", "build-app"],
@@ -1362,8 +1364,8 @@ class RuntimeManagerTests(unittest.TestCase):
             )
             self.assertEqual(up_payload["services"][0]["id"], "bootstrap-daemon")
             self.assertEqual(up_payload["services"][0]["result"], "started")
-            self.assertTrue((repo / "logs" / "runtime" / "build-app.ok").is_file())
-            self.assertTrue((repo / "logs" / "runtime" / "bootstrap-daemon.ready").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "runtime" / "build-app.ok").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "runtime" / "bootstrap-daemon.ready").is_file())
 
     def test_client_init_with_blueprint_scaffolds_task_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1587,6 +1589,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(payload["output_dir"], str(projection_dir))
 
             self.assertTrue((projection_dir / "workspace" / "runtime.yaml").is_file())
+            self.assertTrue((projection_dir / "workspace" / "persistence.yaml").is_file())
             self.assertTrue((projection_dir / "projection.json").is_file())
             self.assertTrue((projection_dir / "runtime-model.json").is_file())
             self.assertTrue((projection_dir / "workspace" / "clients" / "personal" / "overlay.yaml").is_file())
@@ -1604,15 +1607,18 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(projection_payload["overlay_mode"], "overlay")
             projected_paths = {item["path"] for item in projection_payload["files"]}
             self.assertIn("workspace/runtime.yaml", projected_paths)
+            self.assertIn("workspace/persistence.yaml", projected_paths)
             self.assertNotIn("workspace/clients/vibe-coding-client/overlay.yaml", projected_paths)
 
             model_text = (projection_dir / "runtime-model.json").read_text(encoding="utf-8")
             model_payload = json.loads(model_text)
             self.assertEqual(model_payload["active_clients"], ["personal"])
             self.assertEqual(model_payload["active_profiles"], ["core"])
+            self.assertEqual(model_payload["persistence_manifest_file"], "/workspace/persistence.yaml")
+            self.assertEqual(model_payload["storage"]["state_root"], "./.skillbox-state")
             self.assertNotIn("_host_path", model_text)
             self.assertNotIn("SKILLBOX_SWIMMERS_AUTH_TOKEN", model_text)
-            self.assertNotIn("SKILLBOX_CLIENTS_HOST_ROOT", model_text)
+            self.assertNotIn("SKILLBOX_CLIENTS_HOST_ROOT", model_payload["env"])
             self.assertNotIn(str(repo), model_text)
 
     def test_client_project_supports_custom_output_dir_and_profiles(self) -> None:
@@ -1718,7 +1724,7 @@ class RuntimeManagerTests(unittest.TestCase):
                 default_cwd="${SKILLBOX_MONOSERVER_ROOT}/acme-studio",
                 root_path="${SKILLBOX_MONOSERVER_ROOT}/acme-studio",
             )
-            (repo / "workspace" / "clients" / "acme-studio" / "skill-repos.yaml").write_text(
+            (repo / ".skillbox-state" / "clients" / "acme-studio" / "skill-repos.yaml").write_text(
                 "version: 2\nskill_repos:\n  - path: ./skills\n",
                 encoding="utf-8",
             )
@@ -1744,7 +1750,7 @@ class RuntimeManagerTests(unittest.TestCase):
             repo.mkdir(parents=True, exist_ok=True)
             self._write_fixture(repo)
 
-            legacy_overlay = repo / "workspace" / "clients" / "personal" / "overlay.yaml"
+            legacy_overlay = repo / ".skillbox-state" / "clients" / "personal" / "overlay.yaml"
             legacy_overlay.write_text(
                 "version: 1\n"
                 "client:\n"
@@ -1802,7 +1808,7 @@ class RuntimeManagerTests(unittest.TestCase):
             )
             self.assertEqual(init.returncode, 0, init.stderr)
 
-            overlay_dir = repo / "workspace" / "clients" / "acme-builder"
+            overlay_dir = repo / ".skillbox-state" / "clients" / "acme-builder"
             custom_files = {
                 overlay_dir / "workflows" / "INDEX.md": "# Custom workflow index\n",
                 overlay_dir / "workflows" / "EXTRACTION.md": "# Keep this extraction note\n",
@@ -1915,9 +1921,9 @@ class RuntimeManagerTests(unittest.TestCase):
             self._write_fixture(repo)
             private_clients = repo / "private-config" / "clients"
             private_clients.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(repo / "workspace" / "clients" / "personal", private_clients / "personal")
+            shutil.copytree(repo / ".skillbox-state" / "clients" / "personal", private_clients / "personal")
             (private_clients / "personal" / "overlay.yaml").write_text(
-                (repo / "workspace" / "clients" / "personal" / "overlay.yaml").read_text(encoding="utf-8"),
+                (repo / ".skillbox-state" / "clients" / "personal" / "overlay.yaml").read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
             (repo / ".env").write_text(
@@ -2086,6 +2092,84 @@ class RuntimeManagerTests(unittest.TestCase):
             payload = json.loads(second.stdout)
             self.assertFalse(payload["changed"])
             self.assertEqual(acceptance_path.read_text(encoding="utf-8"), first_acceptance)
+
+    def test_client_publish_with_deploy_artifact_persists_release_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._init_git_repo(repo)
+            control_repo = self._create_git_source_repo(repo, "control-plane")
+
+            result = self._run(
+                repo,
+                "client-publish",
+                "personal",
+                "--target-dir",
+                "./fixtures/control-plane",
+                "--acceptance",
+                "--deploy-artifact",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            deploy_path = control_repo / "clients" / "personal" / "deploy.json"
+
+            self.assertTrue(payload["deploy"]["present"])
+            self.assertTrue(deploy_path.is_file())
+
+            deploy_payload = json.loads(deploy_path.read_text(encoding="utf-8"))
+            archive_path = control_repo / "clients" / "personal" / deploy_payload["archive"]
+            archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+
+            self.assertEqual(deploy_payload["client_id"], "personal")
+            self.assertEqual(deploy_payload["source_commit"], self._git_head(repo))
+            self.assertEqual(deploy_payload["payload_tree_sha256"], payload["payload_tree_sha256"])
+            self.assertEqual(deploy_payload["archive_sha256"], archive_sha256)
+            self.assertTrue(archive_path.is_file())
+
+    def test_client_publish_with_deploy_artifact_is_noop_when_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._init_git_repo(repo)
+            control_repo = self._create_git_source_repo(repo, "control-plane")
+
+            first = self._run(
+                repo,
+                "client-publish",
+                "personal",
+                "--target-dir",
+                "./fixtures/control-plane",
+                "--deploy-artifact",
+                "--format",
+                "json",
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+
+            deploy_path = control_repo / "clients" / "personal" / "deploy.json"
+            first_deploy = deploy_path.read_bytes()
+            first_payload = json.loads(first.stdout)
+            first_archive = control_repo / Path(first_payload["deploy"]["archive"])
+            first_archive_bytes = first_archive.read_bytes()
+
+            second = self._run(
+                repo,
+                "client-publish",
+                "personal",
+                "--target-dir",
+                "./fixtures/control-plane",
+                "--deploy-artifact",
+                "--format",
+                "json",
+            )
+            self.assertEqual(second.returncode, 0, second.stderr)
+            second_payload = json.loads(second.stdout)
+
+            self.assertFalse(second_payload["changed"])
+            self.assertEqual(deploy_path.read_bytes(), first_deploy)
+            self.assertEqual(first_archive.read_bytes(), first_archive_bytes)
 
     def test_client_publish_can_commit_existing_bundle_to_target_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2921,7 +3005,7 @@ class RuntimeManagerTests(unittest.TestCase):
             repo = Path(tmpdir)
             self._write_fixture(repo)
             # Create the client root so doctor verify passes
-            (repo / "monoserver-host" / "new-project").mkdir(parents=True, exist_ok=True)
+            (repo / ".skillbox-state" / "monoserver" / "new-project").mkdir(parents=True, exist_ok=True)
 
             result = self._run(
                 repo,
@@ -2947,7 +3031,7 @@ class RuntimeManagerTests(unittest.TestCase):
                 self.assertIn(s["status"], ("ok", "skip", "warn"), f"step {s['step']} failed: {s}")
 
             # Verify overlay was created
-            overlay = repo / "workspace" / "clients" / "new-project" / "overlay.yaml"
+            overlay = repo / ".skillbox-state" / "clients" / "new-project" / "overlay.yaml"
             self.assertTrue(overlay.is_file())
 
             # Verify context was generated
@@ -2985,7 +3069,7 @@ class RuntimeManagerTests(unittest.TestCase):
                 "      sync:\n"
                 "        mode: clone-if-missing\n",
             )
-            (repo / "monoserver-host" / "acme-app").mkdir(parents=True, exist_ok=True)
+            (repo / ".skillbox-state" / "monoserver" / "acme-app").mkdir(parents=True, exist_ok=True)
 
             result = self._run(
                 repo,
@@ -3029,7 +3113,7 @@ class RuntimeManagerTests(unittest.TestCase):
             for skip_step in ("sync", "bootstrap", "up", "context", "verify"):
                 self.assertEqual(step_statuses[skip_step], "skip", f"{skip_step} should be skip")
 
-            overlay = repo / "workspace" / "clients" / "dry-test" / "overlay.yaml"
+            overlay = repo / ".skillbox-state" / "clients" / "dry-test" / "overlay.yaml"
             self.assertFalse(overlay.exists())
 
     def test_onboard_fails_with_structured_error_on_invalid_id(self) -> None:
@@ -3127,7 +3211,7 @@ class RuntimeManagerTests(unittest.TestCase):
                 "      sync:\n"
                 "        mode: clone-if-missing\n",
             )
-            (repo / "monoserver-host" / "acme-app").mkdir(parents=True, exist_ok=True)
+            (repo / ".skillbox-state" / "monoserver" / "acme-app").mkdir(parents=True, exist_ok=True)
 
             result = self._run(
                 repo,
@@ -3350,7 +3434,7 @@ class RuntimeManagerTests(unittest.TestCase):
         clients_root: Path | None = None,
         include_context: bool = False,
     ) -> None:
-        overlay_parent = clients_root or (repo / "workspace" / "clients")
+        overlay_parent = clients_root or self._clients_host_root(repo)
         overlay_dir = overlay_parent / client_id
         overlay_dir.mkdir(parents=True, exist_ok=True)
         overlay_text = (
@@ -3412,10 +3496,13 @@ class RuntimeManagerTests(unittest.TestCase):
         (overlay_dir / "skills").mkdir(parents=True, exist_ok=True)
 
     def _set_client_connectors(self, repo: Path, client_id: str, connectors: list[str]) -> None:
-        overlay_path = repo / "workspace" / "clients" / client_id / "overlay.yaml"
+        overlay_path = self._clients_host_root(repo) / client_id / "overlay.yaml"
         overlay_doc = MANAGE_MODULE.load_yaml(overlay_path)
         overlay_doc.setdefault("client", {})["connectors"] = connectors
         overlay_path.write_text(MANAGE_MODULE.render_yaml_document(overlay_doc), encoding="utf-8")
+
+    def _clients_host_root(self, repo: Path) -> Path:
+        return repo / ".skillbox-state" / "clients"
 
     def _set_runtime_env_value(self, repo: Path, key: str, value: str) -> None:
         env_path = repo / ".env.example"
@@ -3525,8 +3612,55 @@ class RuntimeManagerTests(unittest.TestCase):
         source_path.write_text(content, encoding="utf-8")
 
     def _write_fixture(self, repo: Path, include_bundle: bool = True) -> None:
+        (repo / "workspace").mkdir(parents=True, exist_ok=True)
+        (repo / "workspace" / "persistence.yaml").write_text(
+            "version: 1\n"
+            "state_root_env: SKILLBOX_STATE_ROOT\n"
+            "targets:\n"
+            "  local:\n"
+            "    provider: local\n"
+            "    default_state_root: ./.skillbox-state\n"
+            "  digitalocean:\n"
+            "    provider: digitalocean\n"
+            "    default_state_root: /srv/skillbox\n"
+            "bindings:\n"
+            "  - id: workspace-root\n"
+            "    runtime_path: /workspace\n"
+            "    storage_class: external\n"
+            "    source_ref: root_dir\n"
+            "  - id: claude-home\n"
+            "    runtime_path: /home/sandbox/.claude\n"
+            "    storage_class: persistent\n"
+            "    relative_path: home/.claude\n"
+            "  - id: codex-home\n"
+            "    runtime_path: /home/sandbox/.codex\n"
+            "    storage_class: persistent\n"
+            "    relative_path: home/.codex\n"
+            "  - id: local-home\n"
+            "    runtime_path: /home/sandbox/.local\n"
+            "    storage_class: persistent\n"
+            "    relative_path: home/.local\n"
+            "  - id: clients-root\n"
+            "    runtime_path: /workspace/workspace/clients\n"
+            "    storage_class: persistent\n"
+            "    relative_path: clients\n"
+            "  - id: logs-root\n"
+            "    runtime_path: /workspace/logs\n"
+            "    storage_class: persistent\n"
+            "    relative_path: logs\n"
+            "  - id: monoserver-root\n"
+            "    runtime_path: /monoserver\n"
+            "    storage_class: persistent\n"
+            "    relative_path: monoserver\n",
+            encoding="utf-8",
+        )
         (repo / ".env.example").write_text(
             "SKILLBOX_NAME=skillbox\n"
+            "SKILLBOX_STORAGE_PROVIDER=local\n"
+            "SKILLBOX_STATE_ROOT=./.skillbox-state\n"
+            "SKILLBOX_STORAGE_FILESYSTEM=\n"
+            "SKILLBOX_STORAGE_REQUIRED=false\n"
+            "SKILLBOX_STORAGE_MIN_FREE_GB=0\n"
             "SKILLBOX_WORKSPACE_ROOT=/workspace\n"
             "SKILLBOX_REPOS_ROOT=/workspace/repos\n"
             "SKILLBOX_SKILLS_ROOT=/workspace/skills\n"
@@ -3534,8 +3668,8 @@ class RuntimeManagerTests(unittest.TestCase):
             "SKILLBOX_HOME_ROOT=/home/sandbox\n"
             "SKILLBOX_MONOSERVER_ROOT=/monoserver\n"
             "SKILLBOX_CLIENTS_ROOT=/workspace/workspace/clients\n"
-            "SKILLBOX_CLIENTS_HOST_ROOT=./workspace/clients\n"
-            "SKILLBOX_MONOSERVER_HOST_ROOT=./monoserver-host\n"
+            "SKILLBOX_CLIENTS_HOST_ROOT=./.skillbox-state/clients\n"
+            "SKILLBOX_MONOSERVER_HOST_ROOT=./.skillbox-state/monoserver\n"
             "SKILLBOX_API_PORT=8000\n"
             "SKILLBOX_WEB_PORT=3000\n"
             "SKILLBOX_SWIMMERS_PORT=3210\n"
@@ -3823,16 +3957,17 @@ class RuntimeManagerTests(unittest.TestCase):
             "    pick: [sample-skill]\n",
             encoding="utf-8",
         )
-        (repo / "workspace" / "clients" / "personal").mkdir(parents=True, exist_ok=True)
-        (repo / "workspace" / "clients" / "personal" / "skill-repos.yaml").write_text(
+        clients_root = self._clients_host_root(repo)
+        (clients_root / "personal").mkdir(parents=True, exist_ok=True)
+        (clients_root / "personal" / "skill-repos.yaml").write_text(
             "version: 2\n"
             "skill_repos:\n"
             "  - path: ./skills\n"
             "    pick: [personal-skill]\n",
             encoding="utf-8",
         )
-        (repo / "workspace" / "clients" / "vibe-coding-client").mkdir(parents=True, exist_ok=True)
-        (repo / "workspace" / "clients" / "vibe-coding-client" / "skill-repos.yaml").write_text(
+        (clients_root / "vibe-coding-client").mkdir(parents=True, exist_ok=True)
+        (clients_root / "vibe-coding-client" / "skill-repos.yaml").write_text(
             "version: 2\n"
             "skill_repos:\n"
             "  - path: ./skills\n",
@@ -3844,6 +3979,7 @@ class RuntimeManagerTests(unittest.TestCase):
             label="Personal",
             default_cwd="${SKILLBOX_MONOSERVER_ROOT}",
             root_path="${SKILLBOX_MONOSERVER_ROOT}",
+            clients_root=clients_root,
         )
         self._write_client_overlay(
             repo,
@@ -3851,24 +3987,25 @@ class RuntimeManagerTests(unittest.TestCase):
             label="Vibe Coding Client",
             default_cwd="${SKILLBOX_MONOSERVER_ROOT}/vibe-coding-client",
             root_path="${SKILLBOX_MONOSERVER_ROOT}/vibe-coding-client",
+            clients_root=clients_root,
         )
 
-        (repo / "workspace" / "clients" / "personal" / "skills").mkdir(parents=True, exist_ok=True)
-        (repo / "workspace" / "clients" / "vibe-coding-client" / "skills").mkdir(parents=True, exist_ok=True)
+        (clients_root / "personal" / "skills").mkdir(parents=True, exist_ok=True)
+        (clients_root / "vibe-coding-client" / "skills").mkdir(parents=True, exist_ok=True)
         (repo / "workspace" / "skill-repos").mkdir(parents=True, exist_ok=True)
 
         self._write_skill_dir(repo / "skills" / "sample-skill", "sample-skill")
         self._write_skill_dir(
-            repo / "workspace" / "clients" / "personal" / "skills" / "personal-skill",
+            clients_root / "personal" / "skills" / "personal-skill",
             "personal-skill",
         )
 
         (repo / "skills").mkdir(parents=True, exist_ok=True)
-        (repo / "logs").mkdir(parents=True, exist_ok=True)
+        (repo / ".skillbox-state" / "logs").mkdir(parents=True, exist_ok=True)
         (repo / "repos").mkdir(parents=True, exist_ok=True)
         (repo / "home" / ".claude").mkdir(parents=True, exist_ok=True)
         (repo / "home" / ".codex").mkdir(parents=True, exist_ok=True)
-        (repo / "monoserver-host").mkdir(parents=True, exist_ok=True)
+        (repo / ".skillbox-state" / "monoserver").mkdir(parents=True, exist_ok=True)
         (repo / ".env-manager").mkdir(parents=True, exist_ok=True)
         (repo / ".env-manager" / "manage.py").write_text(
             "#!/usr/bin/env python3\n"
@@ -4262,7 +4399,7 @@ class RuntimeManagerTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             session = payload["session"]
             session_id = session["session_id"]
-            session_dir = repo / "logs" / "clients" / "personal" / "sessions" / session_id
+            session_dir = repo / ".skillbox-state" / "logs" / "clients" / "personal" / "sessions" / session_id
 
             self.assertEqual(payload["client_id"], "personal")
             self.assertEqual(session["status"], "active")
@@ -4317,7 +4454,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(session["last_message"], "Student is taking over implementation")
             self.assertEqual(session["event_count"], 2)
 
-            meta_path = repo / "logs" / "clients" / "personal" / "sessions" / session_id / "meta.json"
+            meta_path = repo / ".skillbox-state" / "logs" / "clients" / "personal" / "sessions" / session_id / "meta.json"
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             self.assertEqual(meta["last_event_type"], "session.note")
             self.assertEqual(meta["last_message"], "Student is taking over implementation")
@@ -4588,9 +4725,9 @@ class RuntimeManagerTests(unittest.TestCase):
             repo = Path(tmpdir)
             self._write_fixture(repo)
 
-            # Remove monoserver-host so the personal-root check fails
+            # Remove the persistent monoserver root so the personal-root check fails
             import shutil
-            monoserver = repo / "monoserver-host"
+            monoserver = repo / ".skillbox-state" / "monoserver"
             if monoserver.exists():
                 shutil.rmtree(monoserver)
 
@@ -4609,7 +4746,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self._run(repo, "sync", "--client", "personal")
 
             # Write a fake log file with errors
-            log_dir = repo / "logs" / "runtime"
+            log_dir = repo / ".skillbox-state" / "logs" / "runtime"
             log_dir.mkdir(parents=True, exist_ok=True)
             (log_dir / "test.log").write_text(
                 "INFO: starting up\n"

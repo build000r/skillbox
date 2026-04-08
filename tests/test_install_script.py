@@ -20,6 +20,7 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("--private-path", result.stdout)
         self.assertIn("--client", result.stdout)
         self.assertIn("--offline", result.stdout)
+        self.assertIn("--skip-first-box", result.stdout)
         self.assertIn("--dry-run", result.stdout)
         self.assertIn("--skip-build", result.stdout)
         self.assertIn("--skip-up", result.stdout)
@@ -126,6 +127,33 @@ class InstallScriptTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("verify: ok", result.stdout)
+
+    def test_skip_first_box_leaves_private_repo_uncreated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_dir = root / "skillbox"
+            private_dir = root / "skillbox-config"
+
+            result = self._run(
+                "--source-dir",
+                str(ROOT_DIR),
+                "--repo-dir",
+                str(repo_dir),
+                "--private-path",
+                str(private_dir),
+                "--client",
+                "personal",
+                "--skip-first-box",
+                "--skip-build",
+                "--skip-up",
+                "--no-gum",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((repo_dir / ".env").is_file())
+            self.assertFalse(private_dir.exists())
+            self.assertFalse((repo_dir / "sand" / "personal").exists())
+            self.assertIn("first_box: skipped", result.stdout)
 
     def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
