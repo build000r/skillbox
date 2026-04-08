@@ -4,7 +4,7 @@
 
 **A private, single-tenant Tailnet box for you and your coding agents.**
 
-Thin, self-hosted, Docker-based, with durable agent homes and client-scoped overlays.
+Thin, self-hosted, Docker-based, with durable runtime state under `.skillbox-state/` and client-scoped overlays.
 
 ![runtime](https://img.shields.io/badge/runtime-Docker-2496ED?style=flat-square&logo=docker&logoColor=white)
 ![access](https://img.shields.io/badge/access-Tailscale-242424?style=flat-square&logo=tailscale&logoColor=white)
@@ -38,8 +38,8 @@ right client context without standing up a full hosted workspace control plane.
 
 - SSH to the host over Tailscale
 - run one main Docker workspace container
-- mount `home/.claude` and `home/.codex` into that box
-- mount the host parent directory at `/monoserver` for client repo roots
+- persist agent homes, logs, client overlays, and optional repo roots under `SKILLBOX_STATE_ROOT` (`./.skillbox-state` by default)
+- mount that durable state into the box at `/home/sandbox`, `/workspace/logs`, `/workspace/workspace/clients`, and `/monoserver`
 - optionally run a workspace-local `swimmers` API against the same tmux namespace as the agents
 - keep one stable core machine and layer client-specific overlays on top
 - declare the inside of the box with a runtime graph for repos, artifacts, installed skills, services, logs, and checks
@@ -56,7 +56,7 @@ right client context without standing up a full hosted workspace control plane.
 | Need | `skillbox` answer |
 |---|---|
 | Private access without public SSH exposure | Tailscale host access plus host hardening scripts |
-| A workspace that feels like a narrowed local setup | One bind-mounted `/workspace`, plus `/monoserver` for sibling repo roots and client overlays |
+| A workspace that feels like a narrowed local setup | One bind-mounted `/workspace`, plus durable state from `SKILLBOX_STATE_ROOT` mounted into `/workspace/logs`, `/workspace/workspace/clients`, `/home/sandbox`, and optional `/monoserver` |
 | A sane way to let the box grow over time | `workspace/runtime.yaml` plus `.env-manager/manage.py` manage the core machine plus client-specific repos, artifacts, installed skills, logs, and checks |
 | Service graphs that do not devolve into shell folklore | Declared `depends_on` edges let `up`, `down`, and `restart` expand and order service graphs automatically |
 | Live drift detection and auto-healing | The pulse daemon monitors services on a fixed interval, auto-restarts crashes, and emits structured events to a JSONL journal |
@@ -110,10 +110,11 @@ What that gives you:
 - a validated box model
 - a validated runtime graph for the inside of the box
 - a running workspace container
-- a mounted `/monoserver` view of the host parent directory
+- a durable runtime state root at `${SKILLBOX_STATE_ROOT:-./.skillbox-state}`
+- a mounted `/monoserver` view backed by `${SKILLBOX_STATE_ROOT:-./.skillbox-state}/monoserver`
 - optional API and web inspection surfaces
 - cloned skill repos under `workspace/skill-repos/`
-- installed default skills under `home/.claude/skills/` and `home/.codex/skills/`
+- installed default skills under `.skillbox-state/home/.claude/skills/` and `.skillbox-state/home/.codex/skills/`
 - generated agent context at `home/.claude/CLAUDE.md` with a symlink at `home/.codex/AGENTS.md`
 
 ## Focus
@@ -584,10 +585,12 @@ should feel durable, legible, and agent-friendly.
 
 ## Installation
 
-The public entrypoint is now `install.sh`. It wraps the canonical `first-box`
-flow: acquire or reuse a checkout, hydrate `.env`, attach or create the private
-config repo, prove readiness with `acceptance`, and open a client-ready surface
-under `sand/<client>/`.
+The public entrypoint is `install.sh`. It wraps the canonical `first-box`
+flow: acquire or reuse a checkout, hydrate `.env`, initialize or reuse
+`SKILLBOX_STATE_ROOT` (`./.skillbox-state` locally, `/srv/skillbox` on the
+DigitalOcean target), attach or create private client config when requested,
+prove readiness with `acceptance`, and open a client-ready surface under
+`sand/<client>/`.
 
 ### Option 1: One-command installer
 
@@ -599,7 +602,7 @@ curl -fsSL https://raw.githubusercontent.com/build000r/skillbox/main/install.sh 
 
 ```bash
 cp .env.example .env
-make first-box
+make first-box CLIENT=personal
 make build
 make up
 make shell
@@ -619,7 +622,7 @@ cd scripts
 sudo ./01-bootstrap-do.sh
 sudo TAILSCALE_AUTHKEY="tskey-..." TAILSCALE_HOSTNAME="skillbox-dev" ./02-install-tailscale.sh
 cd ..
-make first-box
+make first-box CLIENT=personal
 make build
 make up
 ```
@@ -773,10 +776,12 @@ make runtime-sync
 
 ### Environment defaults
 
-`.env.example` sets the main runtime paths, ports, and optional integrations:
+`.env.example` keeps the checkout source-only and points durable runtime state
+at `SKILLBOX_STATE_ROOT`:
 
 ```dotenv
 SKILLBOX_NAME=skillbox
+SKILLBOX_STATE_ROOT=./.skillbox-state
 SKILLBOX_WORKSPACE_ROOT=/workspace
 SKILLBOX_REPOS_ROOT=/workspace/repos
 SKILLBOX_SKILLS_ROOT=/workspace/skills
@@ -784,8 +789,8 @@ SKILLBOX_LOG_ROOT=/workspace/logs
 SKILLBOX_HOME_ROOT=/home/sandbox
 SKILLBOX_MONOSERVER_ROOT=/monoserver
 SKILLBOX_CLIENTS_ROOT=/workspace/workspace/clients
-SKILLBOX_CLIENTS_HOST_ROOT=./workspace/clients
-SKILLBOX_MONOSERVER_HOST_ROOT=..
+SKILLBOX_CLIENTS_HOST_ROOT=./.skillbox-state/clients
+SKILLBOX_MONOSERVER_HOST_ROOT=./.skillbox-state/monoserver
 SKILLBOX_API_PORT=8000
 SKILLBOX_WEB_PORT=3000
 SKILLBOX_SWIMMERS_PORT=3210
@@ -815,6 +820,19 @@ SKILLBOX_DO_SSH_KEY_ID=
 SKILLBOX_TS_AUTHKEY=
 ```
 
+Canonical local state layout:
+
+```text
+.skillbox-state/
+  clients/
+  home/
+    .claude/
+    .codex/
+    .local/
+  logs/
+  monoserver/
+```
+
 `SKILLBOX_SWIMMERS_REPO` is now an optional source checkout path. If you set
 `SKILLBOX_SWIMMERS_DOWNLOAD_URL`, `make runtime-sync` or `make swimmers-install`
 can hydrate the binary without needing `/monoserver/swimmers`.
@@ -831,9 +849,11 @@ for inspection or development, add `--profile connectors-dev` explicitly.
 `SKILLBOX_DO_TOKEN`, `SKILLBOX_DO_SSH_KEY_ID`, and `SKILLBOX_TS_AUTHKEY` are
 required only for fleet management (`operator_provision` / `make box-up`).
 
-### Recommended repo split
+### Optional private repo split
 
-The clean split is:
+The canonical local setup keeps client overlays and `/monoserver` content under
+`.skillbox-state/`. If you want a separate private operator repo instead,
+override the host-side persistence roots:
 
 ```text
 ~/repos/
@@ -846,7 +866,7 @@ The clean split is:
   client-acme-api/             # client code
 ```
 
-Recommended local override in `skillbox/.env`:
+Recommended override in `skillbox/.env`:
 
 ```dotenv
 SKILLBOX_CLIENTS_HOST_ROOT=../skillbox-config/clients
@@ -1126,7 +1146,7 @@ order, and `up` automatically runs any tasks named under a service's
 `bootstrap_tasks` list before trying to launch the service.
 
 Client overlays are auto-discovered from
-`${SKILLBOX_CLIENTS_HOST_ROOT:-./workspace/clients}/<client>/overlay.yaml` and
+`${SKILLBOX_CLIENTS_HOST_ROOT:-./.skillbox-state/clients}/<client>/overlay.yaml` and
 always resolve to `${SKILLBOX_CLIENTS_ROOT}` inside the box. That lets you keep
 the public engine repo and the private client-config repo separate while the
 runtime still sees a stable in-box path.
@@ -1302,6 +1322,7 @@ exist all the time.
             ├──────────────────────┤
             │ scripts/01,02        │
             │ docker-compose.yml   │
+            │ .skillbox-state/     │
             └──────────┬───────────┘
                        │
           ┌────────────┴────────────┐
@@ -1315,8 +1336,8 @@ exist all the time.
 │ /workspace/repos  │      └───────────────────┘
 │ /workspace/skills │
 │ /workspace/logs   │
-│ /home/.claude     │
-│ /home/.codex      │
+│ /home/sandbox/.claude │
+│ /home/sandbox/.codex  │
 └─────────┬─────────┘
           │
           ▼
@@ -1397,7 +1418,7 @@ Check that Docker is installed and `docker compose config --format json` works o
 ### `make dev-sanity` warns about missing log directories or managed skill installs
 
 That is expected on a fresh clone. The core runtime graph declares
-`logs/runtime` and `logs/repos`, and the managed skill install roots plus
+`.skillbox-state/logs/runtime`, `.skillbox-state/logs/repos`, and the managed skill install roots plus
 lockfile are also created on demand.
 
 Run:
@@ -1466,10 +1487,11 @@ Check if it's already running:
 make pulse-status
 ```
 
-If the PID file is stale (process died without cleanup), remove it:
+If the PID file is stale (process died without cleanup), remove it from the
+state root:
 
 ```bash
-rm logs/runtime/pulse.pid
+rm .skillbox-state/logs/runtime/pulse.pid
 make pulse-start
 ```
 
@@ -1546,9 +1568,11 @@ better fit.
 
 The host. The container is the workspace runtime, not the SSH target.
 
-### Why keep `home/.claude` and `home/.codex` in the repo?
+### Why keep agent homes under `.skillbox-state/home/`?
 
-So the box shape stays reproducible. You can replace the placeholder contents with your own baseline configs.
+So the checkout stays source-only while agent homes survive rebuilds and
+container restarts. Inside the box those same directories mount at
+`/home/sandbox/.claude` and `/home/sandbox/.codex`.
 
 ### Why is there both `make doctor` and `make render`?
 
@@ -1562,7 +1586,9 @@ So the box shape stays reproducible. You can replace the placeholder contents wi
 
 `workspace/skill-repos.yaml` declares GitHub repos and local paths. `sync`
 clones repos into `workspace/skill-repos/`, filtered-copies skill directories
-(respecting `.skillignore`) into `home/.claude/skills/` and `home/.codex/skills/`,
+(respecting `.skillignore`) into `/home/sandbox/.claude/skills/` and `/home/sandbox/.codex/skills/`
+inside the container, backed by `.skillbox-state/home/.claude/skills/` and
+`.skillbox-state/home/.codex/skills/` on the host,
 and writes a lock file with resolved commit SHAs. Client overlays can declare
 their own `skill-repos.yaml` for client-specific skills.
 
@@ -1574,9 +1600,10 @@ skills, services, logs, and checks.
 
 ### What is `/monoserver` for?
 
-It is the host parent directory mounted into the workspace container. That is
-how client overlays can point at sibling roots such as the broader personal
-repo universe or a client directory like `../vibe-coding-client`.
+It is the runtime path for the persistent monoserver tree. By default the host
+side lives at `${SKILLBOX_STATE_ROOT}/monoserver` and mounts into the workspace
+container at `/monoserver`. If you prefer a sibling checkout layout, override
+`SKILLBOX_MONOSERVER_HOST_ROOT`.
 
 ### Is `.env-manager/` the same thing as `../.env-manager`?
 
@@ -1591,16 +1618,19 @@ service health, git state, recent errors, and journal activity.
 
 ### What is the event journal?
 
-An append-only JSONL file at `logs/runtime/journal.jsonl`. Every significant
-runtime event (service start/stop/crash, sync completion, focus activation,
-pulse restarts) is recorded with a timestamp, type, subject, and detail
-object. Agents can query it via the `skillbox_journal` MCP tool.
+An append-only JSONL file at `.skillbox-state/logs/runtime/journal.jsonl` on
+the host, mounted at `/workspace/logs/runtime/journal.jsonl` inside the
+container. Every significant runtime event (service start/stop/crash, sync
+completion, focus activation, pulse restarts) is recorded with a timestamp,
+type, subject, and detail object. Agents can query it via the
+`skillbox_journal` MCP tool.
 
 ### What is event acking?
 
 A way to mark journal events as "handled" so they stop appearing in the
 Recent Activity section of CLAUDE.md. Acks are stored in a sidecar file
-(`logs/runtime/journal.acks.json`), never modify the journal itself, and
+(`.skillbox-state/logs/runtime/journal.acks.json` on the host), never modify
+the journal itself, and
 expire after 24 hours. If a problem recurs, new events surface automatically.
 Use `make ack` or the `skillbox_ack` MCP tool.
 
