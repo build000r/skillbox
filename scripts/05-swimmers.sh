@@ -123,6 +123,10 @@ inside_main() {
     esac
   }
 
+  default_release_download_url() {
+    printf '%s\n' "https://github.com/build000r/swimmers/releases/latest/download/swimmers-linux-amd64"
+  }
+
   normalize_sha256() {
     local value="${1:-}"
     value="$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')"
@@ -130,6 +134,26 @@ inside_main() {
       return 1
     fi
     printf '%s\n' "${value}"
+  }
+
+  parse_sha256_text() {
+    local line="${1%%$'\n'*}"
+    local candidate
+    candidate="$(printf '%s' "${line}" | awk '{print $1}')"
+    normalize_sha256 "${candidate}"
+  }
+
+  resolve_download_sha256() {
+    local url="${1:?missing download url}"
+    if [[ -n "${swimmers_download_sha256}" ]]; then
+      normalize_sha256 "${swimmers_download_sha256}" || return 1
+      return 0
+    fi
+
+    local companion_url="${url}.sha256"
+    local companion_text
+    companion_text="$(curl -fsSL "${companion_url}")" || return 1
+    parse_sha256_text "${companion_text}" || return 1
   }
 
   sha256_file() {
@@ -218,19 +242,24 @@ inside_main() {
       return 0
     fi
 
-    if [[ -n "${swimmers_download_url}" ]]; then
+    local resolved_download_url="${swimmers_download_url}"
+    if [[ -z "${resolved_download_url}" && ! -d "${swimmers_repo}" ]]; then
+      resolved_download_url="$(default_release_download_url)"
+    fi
+
+    if [[ -n "${resolved_download_url}" ]]; then
       local expected_sha256
-      if ! validate_https_download_url "${swimmers_download_url}"; then
+      if ! validate_https_download_url "${resolved_download_url}"; then
         return 1
       fi
-      expected_sha256="$(normalize_sha256 "${swimmers_download_sha256}")" || {
-        printf 'SKILLBOX_SWIMMERS_DOWNLOAD_SHA256 must be set to a 64-character hex SHA-256 digest when download URL is configured\n' >&2
+      expected_sha256="$(resolve_download_sha256 "${resolved_download_url}")" || {
+        printf 'Unable to resolve swimmers download SHA-256 for %s. Set SKILLBOX_SWIMMERS_DOWNLOAD_SHA256 or publish %s.sha256.\n' "${resolved_download_url}" "${resolved_download_url}" >&2
         return 1
       }
       local tmp_bin
       local actual_sha256
       tmp_bin="$(mktemp "${swimmers_install_dir}/swimmers.XXXXXX")"
-      curl -fsSL "${swimmers_download_url}" -o "${tmp_bin}"
+      curl -fsSL "${resolved_download_url}" -o "${tmp_bin}"
       actual_sha256="$(sha256_file "${tmp_bin}")" || {
         rm -f "${tmp_bin}"
         return 1
@@ -242,12 +271,12 @@ inside_main() {
       fi
       chmod +x "${tmp_bin}"
       if ! binary_works "${tmp_bin}"; then
-        printf 'downloaded swimmers binary is not executable: %s\n' "${swimmers_download_url}" >&2
+        printf 'downloaded swimmers binary is not executable: %s\n' "${resolved_download_url}" >&2
         rm -f "${tmp_bin}"
         return 1
       fi
       mv "${tmp_bin}" "${swimmers_bin}"
-      printf 'installed swimmers from %s -> %s\n' "${swimmers_download_url}" "${swimmers_bin}"
+      printf 'installed swimmers from %s -> %s\n' "${resolved_download_url}" "${swimmers_bin}"
       return 0
     fi
 
