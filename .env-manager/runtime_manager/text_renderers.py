@@ -60,6 +60,16 @@ def print_render_text(model: dict[str, Any]) -> None:
         for bridge in bridges:
             targets = ", ".join(str(t) for t in bridge.get("legacy_targets") or [])
             print(f"  - {bridge['id']}: {bridge.get('env_tier', 'local')} [{targets}]")
+    ingress_routes = model.get("ingress_routes") or []
+    if ingress_routes:
+        print(f"ingress routes: {len(ingress_routes)}")
+        for route in ingress_routes:
+            listener = str(route.get("listener") or "public")
+            match = str(route.get("match") or "exact")
+            print(
+                f"  - {route['id']}: {listener} {route.get('path', '')} "
+                f"-> {route.get('service_id', '')} ({match})"
+            )
 
 
 def detail_lines(details: dict[str, Any]) -> list[str]:
@@ -189,6 +199,16 @@ def print_status_text(status_payload: dict[str, Any]) -> None:
         print("blocked services:")
         for sid in blocked_services:
             print(f"  - {sid}")
+
+    ingress = status_payload.get("ingress") or {}
+    ingress_routes = ingress.get("routes") or []
+    if ingress_routes:
+        print("ingress:")
+        for route in ingress_routes:
+            print(
+                f"  - {route['id']}: {route['listener']} {route['path']} "
+                f"-> {route['service_id']} @ {route['request_url']}"
+            )
 
     print("logs:")
     for log_item in status_payload["logs"]:

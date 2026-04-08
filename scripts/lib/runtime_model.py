@@ -51,6 +51,14 @@ RUNTIME_ENV_KEYS = [
     "SKILLBOX_FWC_ZONE",
     "SKILLBOX_FWC_CONNECTORS",
     "SKILLBOX_PULSE_INTERVAL",
+    "SKILLBOX_INGRESS_PUBLIC_HOST",
+    "SKILLBOX_INGRESS_PUBLIC_PORT",
+    "SKILLBOX_INGRESS_PUBLIC_BASE_URL",
+    "SKILLBOX_INGRESS_PRIVATE_HOST",
+    "SKILLBOX_INGRESS_PRIVATE_PORT",
+    "SKILLBOX_INGRESS_PRIVATE_BASE_URL",
+    "SKILLBOX_INGRESS_ROUTE_FILE",
+    "SKILLBOX_INGRESS_NGINX_CONFIG",
 ]
 MANIFEST_ENV_KEYS = RUNTIME_ENV_KEYS + [
     "SKILLBOX_CLIENTS_HOST_ROOT",
@@ -164,6 +172,13 @@ CANONICAL_RUNTIME_RECORDS: dict[str, tuple[str, ...]] = {
         "profiles",
     ),
     "service_mode_command": ("id", "service_id", "mode", "command"),
+    "ingress_route": (
+        "id",
+        "service_id",
+        "listener",
+        "path",
+        "match",
+    ),
     "parity_ledger_item": (
         "id",
         "legacy_surface",
@@ -341,6 +356,14 @@ def load_runtime_env(root_dir: Path) -> dict[str, str]:
         "SKILLBOX_FWC_ZONE": "work",
         "SKILLBOX_FWC_CONNECTORS": "github,slack,linear",
         "SKILLBOX_PULSE_INTERVAL": "30",
+        "SKILLBOX_INGRESS_PUBLIC_HOST": "127.0.0.1",
+        "SKILLBOX_INGRESS_PUBLIC_PORT": "8080",
+        "SKILLBOX_INGRESS_PUBLIC_BASE_URL": "",
+        "SKILLBOX_INGRESS_PRIVATE_HOST": "127.0.0.1",
+        "SKILLBOX_INGRESS_PRIVATE_PORT": "9080",
+        "SKILLBOX_INGRESS_PRIVATE_BASE_URL": "",
+        "SKILLBOX_INGRESS_ROUTE_FILE": "/workspace/logs/runtime/ingress-routes.json",
+        "SKILLBOX_INGRESS_NGINX_CONFIG": "/workspace/logs/runtime/ingress-nginx.conf",
         "ROOT_DIR": str(root_dir),
     }
 
@@ -677,6 +700,7 @@ def _empty_runtime_sections() -> dict[str, list[dict[str, Any]]]:
         "checks": [],
         "bridges": [],
         "service_mode_commands": [],
+        "ingress_routes": [],
         "parity_ledger": [],
     }
 
@@ -912,6 +936,18 @@ def _flatten_parity_ledger_record(item: dict[str, Any]) -> None:
         item["intended_profiles"] = []
 
 
+def _flatten_ingress_route_record(route: dict[str, Any]) -> None:
+    """Normalize ingress_route records in place."""
+    if "service_id" not in route and route.get("service"):
+        route["service_id"] = route.get("service")
+    if "path" in route and route["path"] is None:
+        route["path"] = ""
+    if "match" in route and route["match"] is None:
+        route["match"] = "exact"
+    if "listener" in route and route["listener"] is None:
+        route["listener"] = "public"
+
+
 def _post_process_runtime_sections(sections: dict[str, list[dict[str, Any]]]) -> None:
     """Run flatten + XOR validation after every source has been merged in."""
     for env_file in sections["env_files"]:
@@ -924,6 +960,8 @@ def _post_process_runtime_sections(sections: dict[str, list[dict[str, Any]]]) ->
         _flatten_bootstrap_task_record(task)
     for item in sections["parity_ledger"]:
         _flatten_parity_ledger_record(item)
+    for route in sections["ingress_routes"]:
+        _flatten_ingress_route_record(route)
     _validate_bootstrap_task_owner_xor(sections["tasks"])
 
 
@@ -950,6 +988,7 @@ def _normalize_runtime_sections(
         "checks": sections["checks"],
         "bridges": sections["bridges"],
         "service_mode_commands": sections["service_mode_commands"],
+        "ingress_routes": sections["ingress_routes"],
         "parity_ledger": sections["parity_ledger"],
     }
 
@@ -980,6 +1019,7 @@ def _base_runtime_model(
         "checks": normalized["checks"],
         "bridges": normalized["bridges"],
         "service_mode_commands": normalized.get("service_mode_commands", []),
+        "ingress_routes": normalized.get("ingress_routes", []),
         "parity_ledger": normalized.get("parity_ledger", []),
     }
 
@@ -1136,6 +1176,17 @@ def _populate_service_mode_command_defaults(model: dict[str, Any], root_dir: Pat
         entry.setdefault("command", "")
 
 
+def _populate_ingress_route_defaults(model: dict[str, Any], root_dir: Path) -> None:
+    del root_dir  # reserved for future host-path expansions
+    for route in model.get("ingress_routes") or []:
+        route.setdefault("profiles", [])
+        route.setdefault("client", "")
+        route.setdefault("service_id", "")
+        route.setdefault("listener", "public")
+        route.setdefault("path", "")
+        route.setdefault("match", "exact")
+
+
 def _populate_parity_ledger_defaults(model: dict[str, Any], root_dir: Path) -> None:
     for item in model.get("parity_ledger") or []:
         item.setdefault("profiles", [])
@@ -1170,6 +1221,7 @@ def _populate_runtime_model_defaults(model: dict[str, Any], root_dir: Path) -> N
     _populate_check_defaults(model, root_dir)
     _populate_bridge_defaults(model, root_dir)
     _populate_service_mode_command_defaults(model, root_dir)
+    _populate_ingress_route_defaults(model, root_dir)
     _populate_parity_ledger_defaults(model, root_dir)
     _populate_client_defaults(model, root_dir)
 

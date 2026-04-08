@@ -22,6 +22,10 @@ from lib.runtime_model import (  # noqa: E402
     LocalRuntimeContractError,
 )
 
+VALID_INGRESS_ROUTE_LISTENERS = {"public", "private"}
+VALID_INGRESS_ROUTE_MATCHES = {"exact", "prefix"}
+
+
 def normalize_active_profiles(raw_profiles: list[str] | None) -> set[str]:
     active_profiles = {value.strip() for value in raw_profiles or [] if value and value.strip()}
     active_profiles.add("core")
@@ -161,6 +165,11 @@ def filter_model(model: dict[str, Any], active_profiles: set[str], active_client
         copy.deepcopy(bridge)
         for bridge in model.get("bridges") or []
         if item_matches_profiles(bridge, active_profiles) and item_matches_clients(bridge, active_clients)
+    ]
+    filtered_model["ingress_routes"] = [
+        copy.deepcopy(route)
+        for route in model.get("ingress_routes") or []
+        if item_matches_profiles(route, active_profiles) and item_matches_clients(route, active_clients)
     ]
     filtered_model["parity_ledger"] = [
         copy.deepcopy(item)
@@ -976,8 +985,8 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
     if default_client and default_client not in declared_client_ids:
         issues.append(f"selection.default_client references unknown client {default_client!r}")
 
-    for section in ("repos", "artifacts", "env_files", "skills", "tasks", "services", "logs", "checks"):
-        duplicates = find_duplicates(model[section], "id")
+    for section in ("repos", "artifacts", "env_files", "skills", "tasks", "services", "logs", "checks", "ingress_routes"):
+        duplicates = find_duplicates(model.get(section) or [], "id")
         if duplicates:
             issues.append(f"{section} contain duplicate ids: {', '.join(duplicates)}")
 
@@ -1266,6 +1275,47 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
 
     for service_id in sorted(service_dependency_map):
         visit_service_dependency(service_id)
+
+    ingress_route_conflicts: set[tuple[str, str, str]] = set()
+    for route in model.get("ingress_routes") or []:
+        route_id = str(route.get("id", "")).strip()
+        if not route_id:
+            issues.append("every ingress_routes entry must have an id")
+        if route.get("client") and route["client"] not in declared_client_ids:
+            issues.append(f"ingress route {route.get('id')} references unknown client {route['client']!r}")
+
+        service_id = str(route.get("service_id") or "").strip()
+        if not service_id:
+            issues.append(f"ingress route {route.get('id', '(missing id)')} is missing service_id")
+        elif service_id not in service_ids:
+            issues.append(f"ingress route {route.get('id')} references unknown service {service_id!r}")
+
+        listener = str(route.get("listener") or "").strip().lower()
+        if listener not in VALID_INGRESS_ROUTE_LISTENERS:
+            issues.append(
+                f"ingress route {route.get('id')} has unsupported listener {route.get('listener')!r}"
+            )
+
+        path = str(route.get("path") or "").strip()
+        if not path:
+            issues.append(f"ingress route {route.get('id', '(missing id)')} is missing path")
+        elif not path.startswith("/"):
+            issues.append(f"ingress route {route.get('id')} path must start with '/'")
+
+        match = str(route.get("match") or "exact").strip().lower()
+        if match not in VALID_INGRESS_ROUTE_MATCHES:
+            issues.append(
+                f"ingress route {route.get('id')} has unsupported match {route.get('match')!r}"
+            )
+
+        conflict_key = (listener or "public", path, match or "exact")
+        if path:
+            if conflict_key in ingress_route_conflicts:
+                issues.append(
+                    "ingress routes contain duplicate listener/path/match: "
+                    f"{listener or 'public'} {path} ({match or 'exact'})"
+                )
+            ingress_route_conflicts.add(conflict_key)
 
     task_visiting: list[str] = []
     task_visited: set[str] = set()

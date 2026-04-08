@@ -592,6 +592,296 @@ def validate_bridges(model: dict[str, Any]) -> list[CheckResult]:
     return results
 
 
+def has_ingress_runtime(model: dict[str, Any]) -> bool:
+    return bool(model.get("ingress_routes") or []) or any(
+        str(service.get("kind") or "").strip() == "ingress"
+        for service in model.get("services") or []
+    )
+
+
+def ingress_listener_settings(model: dict[str, Any], listener: str) -> dict[str, Any]:
+    env = model.get("env") or {}
+    normalized_listener = "private" if str(listener or "").strip().lower() == "private" else "public"
+    host_key = f"SKILLBOX_INGRESS_{normalized_listener.upper()}_HOST"
+    port_key = f"SKILLBOX_INGRESS_{normalized_listener.upper()}_PORT"
+    base_url_key = f"SKILLBOX_INGRESS_{normalized_listener.upper()}_BASE_URL"
+
+    host = str(env.get(host_key) or "").strip() or "127.0.0.1"
+    port_raw = str(env.get(port_key) or "").strip() or ("9080" if normalized_listener == "private" else "8080")
+    try:
+        port = int(port_raw)
+    except ValueError:
+        port = 9080 if normalized_listener == "private" else 8080
+    display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    raw_base_url = str(env.get(base_url_key) or "").strip().rstrip("/")
+    base_url = raw_base_url or f"http://{display_host}:{port}"
+    return {
+        "listener": normalized_listener,
+        "host": host,
+        "port": port,
+        "base_url": base_url,
+    }
+
+
+def service_upstream_base_url(service: dict[str, Any] | None) -> str:
+    if not service:
+        return ""
+    healthcheck = service.get("healthcheck") or {}
+    url = str(healthcheck.get("url") or "").strip()
+    if not url:
+        return ""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+
+
+def sorted_ingress_routes(routes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        routes,
+        key=lambda route: (
+            str(route.get("listener") or "public"),
+            0 if str(route.get("match") or "exact") == "exact" else 1,
+            -len(str(route.get("path") or "")),
+            str(route.get("path") or ""),
+            str(route.get("id") or ""),
+        ),
+    )
+
+
+def resolved_ingress_routes(model: dict[str, Any]) -> list[dict[str, Any]]:
+    services_by_id = {
+        str(service.get("id") or "").strip(): service
+        for service in model.get("services") or []
+        if str(service.get("id") or "").strip()
+    }
+    entries: list[dict[str, Any]] = []
+    for route in model.get("ingress_routes") or []:
+        listener = str(route.get("listener") or "public").strip().lower() or "public"
+        path = str(route.get("path") or "").strip()
+        match = str(route.get("match") or "exact").strip().lower() or "exact"
+        service_id = str(route.get("service_id") or "").strip()
+        service = services_by_id.get(service_id)
+        listener_settings = ingress_listener_settings(model, listener)
+        request_url = listener_settings["base_url"]
+        if path:
+            request_url = f"{request_url}{path}"
+        entries.append(
+            {
+                "id": str(route.get("id") or "").strip(),
+                "client": str(route.get("client") or "").strip(),
+                "profiles": list(route.get("profiles") or []),
+                "listener": listener,
+                "path": path,
+                "match": match,
+                "service_id": service_id,
+                "service_state": probe_service(model, service).get("state", "missing") if service else "missing",
+                "request_url": request_url,
+                "upstream_base_url": service_upstream_base_url(service),
+            }
+        )
+    return sorted_ingress_routes(entries)
+
+
+def ingress_config_paths(model: dict[str, Any]) -> dict[str, Path]:
+    root_dir = Path(str(model["root_dir"]))
+    env = model.get("env") or {}
+    storage = model.get("storage")
+    route_file = runtime_path_to_host_path(
+        root_dir,
+        env,
+        str(env.get("SKILLBOX_INGRESS_ROUTE_FILE") or "/workspace/logs/runtime/ingress-routes.json"),
+        storage=storage,
+    )
+    nginx_config = runtime_path_to_host_path(
+        root_dir,
+        env,
+        str(env.get("SKILLBOX_INGRESS_NGINX_CONFIG") or "/workspace/logs/runtime/ingress-nginx.conf"),
+        storage=storage,
+    )
+    return {
+        "route_file": Path(str(route_file)),
+        "nginx_config": Path(str(nginx_config)),
+    }
+
+
+def render_ingress_routes_document(model: dict[str, Any]) -> str:
+    payload = {
+        "version": 1,
+        "listeners": {
+            "public": ingress_listener_settings(model, "public"),
+            "private": ingress_listener_settings(model, "private"),
+        },
+        "routes": [
+            {
+                "id": route["id"],
+                "client": route["client"],
+                "profiles": route["profiles"],
+                "listener": route["listener"],
+                "path": route["path"],
+                "match": route["match"],
+                "service_id": route["service_id"],
+                "upstream_base_url": route["upstream_base_url"],
+            }
+            for route in resolved_ingress_routes(model)
+        ],
+    }
+    return json.dumps(payload, indent=2, sort_keys=True) + "\n"
+
+
+def render_ingress_nginx_config(model: dict[str, Any]) -> str:
+    routes_by_listener: dict[str, list[dict[str, Any]]] = {"public": [], "private": []}
+    for route in resolved_ingress_routes(model):
+        routes_by_listener.setdefault(route["listener"], []).append(route)
+
+    lines = [
+        "# Auto-generated by skillbox runtime manager. Do not edit manually.",
+        "events {",
+        "  worker_connections 1024;",
+        "}",
+        "http {",
+        "  access_log off;",
+        "  sendfile on;",
+    ]
+
+    for listener in ("public", "private"):
+        settings = ingress_listener_settings(model, listener)
+        if settings["host"] in {"0.0.0.0", "::"}:
+            listen_value = str(settings["port"])
+        else:
+            listen_value = f"{settings['host']}:{settings['port']}"
+        lines.extend(
+            [
+                "  server {",
+                f"    listen {listen_value};",
+                "    server_name _;",
+                "    location = /__skillbox/health {",
+                "      add_header Content-Type text/plain;",
+                "      return 200 'ok';",
+                "    }",
+            ]
+        )
+        for route in routes_by_listener.get(listener, []):
+            location_modifier = "=" if route["match"] == "exact" else "^~"
+            lines.extend(
+                [
+                    f"    location {location_modifier} {route['path']} {{",
+                    f"      proxy_pass {route['upstream_base_url']};",
+                    "      proxy_http_version 1.1;",
+                    "      proxy_set_header Host $host;",
+                    "      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+                    "      proxy_set_header X-Forwarded-Host $host;",
+                    "      proxy_set_header X-Forwarded-Proto $scheme;",
+                    "    }",
+                ]
+            )
+        lines.extend(
+            [
+                "  }",
+            ]
+        )
+
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def managed_text_artifact_state(path: Path, desired: str) -> str:
+    if not path.is_file():
+        return "missing"
+    try:
+        current = path.read_text(encoding="utf-8")
+    except OSError:
+        return "stale"
+    return "ok" if current == desired else "stale"
+
+
+def sync_ingress_artifacts(model: dict[str, Any], dry_run: bool) -> list[str]:
+    if not has_ingress_runtime(model):
+        return []
+
+    paths = ingress_config_paths(model)
+    desired_route_payload = render_ingress_routes_document(model)
+    desired_nginx_config = render_ingress_nginx_config(model)
+    route_count = len(model.get("ingress_routes") or [])
+    actions: list[str] = []
+
+    for key, desired in (
+        ("route_file", desired_route_payload),
+        ("nginx_config", desired_nginx_config),
+    ):
+        path = paths[key]
+        state = managed_text_artifact_state(path, desired)
+        ensure_directory(path.parent, dry_run)
+        action_label = "render-ingress-routes" if key == "route_file" else "render-ingress-nginx"
+        if dry_run:
+            actions.append(f"{action_label}: {path} ({route_count} routes)")
+            continue
+        if state == "ok":
+            actions.append(f"{action_label}-unchanged: {path}")
+            continue
+        path.write_text(desired, encoding="utf-8")
+        actions.append(f"{action_label}: {path} ({route_count} routes)")
+
+    return actions
+
+
+def validate_ingress(model: dict[str, Any]) -> list[CheckResult]:
+    if not has_ingress_runtime(model):
+        return []
+    if not model.get("ingress_routes"):
+        return []
+
+    results: list[CheckResult] = []
+    routes = resolved_ingress_routes(model)
+    invalid_upstreams = [
+        route["id"]
+        for route in routes
+        if route["service_id"] and not route["upstream_base_url"]
+    ]
+    if invalid_upstreams:
+        results.append(
+            CheckResult(
+                status="fail",
+                code="ingress-upstream-missing",
+                message="ingress routes require HTTP-backed services with resolvable upstream URLs",
+                details={"routes": invalid_upstreams},
+            )
+        )
+        return results
+
+    desired_route_payload = render_ingress_routes_document(model)
+    desired_nginx_config = render_ingress_nginx_config(model)
+    paths = ingress_config_paths(model)
+    route_state = managed_text_artifact_state(paths["route_file"], desired_route_payload)
+    nginx_state = managed_text_artifact_state(paths["nginx_config"], desired_nginx_config)
+
+    results.append(
+        CheckResult(
+            status="pass" if route_state == "ok" else "warn",
+            code="ingress-route-manifest",
+            message=(
+                "ingress route manifest matches the active runtime graph"
+                if route_state == "ok"
+                else "ingress route manifest needs regeneration"
+            ),
+            details={"path": str(paths["route_file"]), "state": route_state, "routes": len(routes)},
+        )
+    )
+    results.append(
+        CheckResult(
+            status="pass" if nginx_state == "ok" else "warn",
+            code="ingress-nginx-config",
+            message=(
+                "ingress nginx config matches the active runtime graph"
+                if nginx_state == "ok"
+                else "ingress nginx config needs regeneration"
+            ),
+            details={"path": str(paths["nginx_config"]), "state": nginx_state, "routes": len(routes)},
+        )
+    )
+    return results
+
+
 def doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
     results = check_manifest(model)
     if any(result.status == "fail" for result in results):
@@ -632,6 +922,7 @@ def doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
         + validate_task_state(model)
         + validate_storage_posture(model)
         + validate_bridges(model)
+        + validate_ingress(model)
         + parity_results
     )
 
@@ -915,7 +1206,8 @@ def sync_runtime(model: dict[str, Any], dry_run: bool) -> list[str]:
 
     actions.extend(sync_skill_repo_sets(model, dry_run=dry_run))
     actions.extend(sync_skill_sets(model, dry_run=dry_run))
-    actions.extend(sync_dcg_config(model, DEFAULT_ROOT_DIR, dry_run=dry_run))
+    actions.extend(sync_dcg_config(model, Path(str(model["root_dir"])), dry_run=dry_run))
+    actions.extend(sync_ingress_artifacts(model, dry_run=dry_run))
     if not dry_run:
         log_runtime_event("sync.completed", "runtime", {"action_count": len(actions)})
     return actions
@@ -1045,6 +1337,8 @@ def service_supports_lifecycle(
     )
     if not has_command and not has_mode_commands:
         return False, "command missing"
+    if str(service.get("kind") or "").strip() == "ingress" and model is not None and not model.get("ingress_routes"):
+        return False, "no ingress routes active"
     if str(service.get("kind") or "").strip() == "orchestration":
         return False, "orchestration services are status-only"
     artifact_id = str(service.get("artifact") or "").strip()
@@ -3142,6 +3436,19 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
             item["ok"] = path.exists()
         check_statuses.append(item)
 
+    ingress_paths = ingress_config_paths(model) if has_ingress_runtime(model) else {}
+    ingress_payload = {
+        "listeners": {
+            "public": ingress_listener_settings(model, "public"),
+            "private": ingress_listener_settings(model, "private"),
+        },
+        "route_file": str(ingress_paths["route_file"]) if ingress_paths else "",
+        "route_file_present": ingress_paths["route_file"].is_file() if ingress_paths else False,
+        "nginx_config": str(ingress_paths["nginx_config"]) if ingress_paths else "",
+        "nginx_config_present": ingress_paths["nginx_config"].is_file() if ingress_paths else False,
+        "routes": resolved_ingress_routes(model),
+    }
+
     return {
         "clients": copy.deepcopy(model.get("clients") or []),
         "active_clients": model.get("active_clients") or [],
@@ -3157,6 +3464,7 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
         "blocked_services": blocked_services,
         "logs": log_statuses,
         "checks": check_statuses,
+        "ingress": ingress_payload,
         "parity_ledger": {
             "covered_surfaces": parity_ledger_covered_surfaces(model),
             "deferred_surfaces": parity_ledger_deferred_surfaces(model),
