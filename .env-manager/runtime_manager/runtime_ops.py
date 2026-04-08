@@ -649,7 +649,11 @@ def sorted_ingress_routes(routes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 
-def resolved_ingress_routes(model: dict[str, Any]) -> list[dict[str, Any]]:
+def resolved_ingress_routes(
+    model: dict[str, Any],
+    *,
+    include_service_state: bool = False,
+) -> list[dict[str, Any]]:
     services_by_id = {
         str(service.get("id") or "").strip(): service
         for service in model.get("services") or []
@@ -667,18 +671,26 @@ def resolved_ingress_routes(model: dict[str, Any]) -> list[dict[str, Any]]:
         if path:
             request_url = f"{request_url}{path}"
         entries.append(
-            {
-                "id": str(route.get("id") or "").strip(),
-                "client": str(route.get("client") or "").strip(),
-                "profiles": list(route.get("profiles") or []),
-                "listener": listener,
-                "path": path,
-                "match": match,
-                "service_id": service_id,
-                "service_state": probe_service(model, service).get("state", "missing") if service else "missing",
-                "request_url": request_url,
-                "upstream_base_url": service_upstream_base_url(service),
-            }
+            (
+                {
+                    "id": str(route.get("id") or "").strip(),
+                    "client": str(route.get("client") or "").strip(),
+                    "profiles": list(route.get("profiles") or []),
+                    "listener": listener,
+                    "path": path,
+                    "match": match,
+                    "service_id": service_id,
+                    "request_url": request_url,
+                    "upstream_base_url": service_upstream_base_url(service),
+                }
+                | (
+                    {
+                        "service_state": probe_service(model, service).get("state", "missing")
+                        if service else "missing"
+                    }
+                    if include_service_state else {}
+                )
+            )
         )
     return sorted_ingress_routes(entries)
 
@@ -2737,6 +2749,7 @@ def stop_services(
     for service in services:
         manageable, reason = service_supports_lifecycle(service, model)
         paths = service_paths(model, service)
+        pid = live_service_pid(paths["pid_file"])
         result = {
             "id": service["id"],
             "kind": service.get("kind", "service"),
@@ -2744,11 +2757,16 @@ def stop_services(
             "pid_file": str(paths["pid_file"]),
         }
 
-        if not manageable:
+        can_stop_idle_ingress = (
+            pid is not None
+            and str(service.get("kind") or "").strip() == "ingress"
+            and reason == "no ingress routes active"
+        )
+
+        if not manageable and not can_stop_idle_ingress:
             results.append(result | {"result": "skipped", "reason": reason})
             continue
 
-        pid = live_service_pid(paths["pid_file"])
         if pid is None:
             external_state = service_healthcheck_state(service)
             if external_state.get("state") == "ok":
@@ -2844,7 +2862,14 @@ def probe_service(model: dict[str, Any], service: dict[str, Any]) -> dict[str, A
     health_state = service_healthcheck_state(service)
     pid = manager_state.get("pid")
 
-    if pid is not None:
+    if (
+        pid is None
+        and str(service.get("kind") or "").strip() == "ingress"
+        and manager_state.get("managed") is False
+        and manager_state.get("manager_reason") == "no ingress routes active"
+    ):
+        state = "idle"
+    elif pid is not None:
         if health_state.get("state") == "ok":
             state = "running"
         elif health_state.get("state") == "declared":
@@ -3408,7 +3433,7 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
     blocked_services: list[str] = [
         str(entry.get("id", ""))
         for entry in service_statuses
-        if entry.get("state") not in {"running", "ok"}
+        if entry.get("state") not in {"running", "ok", "idle"}
         and str(entry.get("id", "")).strip()
     ]
 
@@ -3446,7 +3471,7 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
         "route_file_present": ingress_paths["route_file"].is_file() if ingress_paths else False,
         "nginx_config": str(ingress_paths["nginx_config"]) if ingress_paths else "",
         "nginx_config_present": ingress_paths["nginx_config"].is_file() if ingress_paths else False,
-        "routes": resolved_ingress_routes(model),
+        "routes": resolved_ingress_routes(model, include_service_state=True),
     }
 
     return {

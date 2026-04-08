@@ -153,6 +153,40 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(target_states["claude"], "ok")
             self.assertEqual(target_states["codex"], "ok")
 
+    def test_sync_ingress_artifacts_writes_route_manifest_and_nginx_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = self._ingress_model(repo)
+
+            actions = MANAGE_MODULE.sync_ingress_artifacts(model, dry_run=False)
+
+            route_file = repo / "logs" / "runtime" / "ingress-routes.json"
+            nginx_config = repo / "logs" / "runtime" / "ingress-nginx.conf"
+            self.assertTrue(route_file.is_file())
+            self.assertTrue(nginx_config.is_file())
+            payload = json.loads(route_file.read_text(encoding="utf-8"))
+            self.assertEqual(payload["routes"][0]["service_id"], "backend")
+            self.assertEqual(payload["routes"][0]["listener"], "public")
+            self.assertIn("location = /v1/report", nginx_config.read_text(encoding="utf-8"))
+            self.assertTrue(any(action.startswith("render-ingress-routes:") for action in actions))
+            self.assertTrue(any(action.startswith("render-ingress-nginx:") for action in actions))
+
+    def test_runtime_status_includes_resolved_ingress_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = self._ingress_model(repo)
+
+            with mock.patch.object(MANAGE_MODULE, "probe_service", return_value={"state": "running"}):
+                status = MANAGE_MODULE.runtime_status(model)
+
+            ingress = status["ingress"]
+            self.assertTrue(ingress["route_file"].endswith("ingress-routes.json"))
+            self.assertEqual(len(ingress["routes"]), 1)
+            route = ingress["routes"][0]
+            self.assertIn("service_state", route)
+            self.assertEqual(route["request_url"], "https://reports.example.test/v1/report")
+            self.assertEqual(route["upstream_base_url"], "http://127.0.0.1:8001")
+
     def test_doctor_warns_and_sync_reconciles_stale_file_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -4438,6 +4472,55 @@ class RuntimeManagerTests(unittest.TestCase):
             encoding="utf-8",
         )
         self._install_absolute_mcp_stub(self._fixture_mcp_stub_path(repo, "cm"), tool_names=["memory_search"])
+
+    def _ingress_model(self, repo: Path) -> dict:
+        return {
+            "root_dir": str(repo),
+            "env": {
+                "SKILLBOX_WORKSPACE_ROOT": "/workspace",
+                "SKILLBOX_LOG_ROOT": "/workspace/logs",
+                "SKILLBOX_HOME_ROOT": "/home/sandbox",
+                "SKILLBOX_MONOSERVER_ROOT": "/monoserver",
+                "SKILLBOX_CLIENTS_ROOT": "/workspace/workspace/clients",
+                "SKILLBOX_INGRESS_PUBLIC_HOST": "127.0.0.1",
+                "SKILLBOX_INGRESS_PUBLIC_PORT": "8080",
+                "SKILLBOX_INGRESS_PUBLIC_BASE_URL": "https://reports.example.test",
+                "SKILLBOX_INGRESS_PRIVATE_HOST": "127.0.0.1",
+                "SKILLBOX_INGRESS_PRIVATE_PORT": "9080",
+                "SKILLBOX_INGRESS_PRIVATE_BASE_URL": "http://tailnet.example.test:9080",
+                "SKILLBOX_INGRESS_ROUTE_FILE": "/workspace/logs/runtime/ingress-routes.json",
+                "SKILLBOX_INGRESS_NGINX_CONFIG": "/workspace/logs/runtime/ingress-nginx.conf",
+            },
+            "storage": None,
+            "logs": [],
+            "services": [
+                {
+                    "id": "backend",
+                    "kind": "http",
+                    "healthcheck": {"type": "http", "url": "http://127.0.0.1:8001/v1/reports"},
+                }
+            ],
+            "ingress_routes": [
+                {
+                    "id": "report-command",
+                    "service_id": "backend",
+                    "listener": "public",
+                    "path": "/v1/report",
+                    "match": "exact",
+                    "client": "jeremy",
+                    "profiles": ["local-ecom"],
+                }
+            ],
+            "repos": [],
+            "artifacts": [],
+            "env_files": [],
+            "skills": [],
+            "tasks": [],
+            "checks": [],
+            "clients": [],
+            "active_clients": ["jeremy"],
+            "active_profiles": ["core", "local-ecom"],
+        }
 
     def _write_connector_focus_artifacts(self, repo: Path) -> None:
         for name in ("fwc.bin", "dcg.bin"):

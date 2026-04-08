@@ -34,6 +34,7 @@ class RuntimeModelUnitTests(unittest.TestCase):
                     "repo_roots": [{"id": "acme-root", "path": "/workspace/repos/acme"}],
                     "repos": [{"id": "acme-repo", "path": "/workspace/repos/acme/app"}],
                     "checks": [{"id": "acme-check", "path": "/workspace/repos/acme"}],
+                    "ingress_routes": [{"id": "acme-route", "service_id": "core-service", "path": "/app"}],
                 }
             ],
         }
@@ -58,6 +59,7 @@ class RuntimeModelUnitTests(unittest.TestCase):
         self.assertIn("api-service", {service["id"] for service in normalized["services"]})
         self.assertIn("beta-task", {task["id"] for task in normalized["tasks"]})
         self.assertIn("acme-check", {check["id"] for check in normalized["checks"]})
+        self.assertIn("acme-route", {route["id"] for route in normalized["ingress_routes"]})
 
     def test_runtime_path_to_host_path_maps_known_roots(self) -> None:
         env_values = {
