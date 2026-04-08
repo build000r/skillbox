@@ -274,6 +274,53 @@ class BridgeModelCompilationTests(unittest.TestCase):
             service_ids = {s["id"] for s in filtered["services"]}
             self.assertEqual(service_ids, {"spaps", "htma_server", "htma"})
 
+    def test_filter_model_scopes_parity_ledger_by_client_and_intended_profile(self) -> None:
+        model = {
+            "clients": [{"id": "personal"}, {"id": "jeremy"}],
+            "repos": [],
+            "artifacts": [],
+            "env_files": [],
+            "skills": [],
+            "tasks": [],
+            "services": [],
+            "logs": [],
+            "checks": [],
+            "bridges": [],
+            "parity_ledger": [
+                {
+                    "id": "personal-local-core",
+                    "client": "personal",
+                    "intended_profiles": ["local-core"],
+                },
+                {
+                    "id": "personal-local-all",
+                    "client": "personal",
+                    "intended_profiles": ["local-all"],
+                },
+                {
+                    "id": "jeremy-local-ecom",
+                    "client": "jeremy",
+                    "intended_profiles": ["local-ecom"],
+                },
+            ],
+        }
+
+        jeremy_profiles = normalize_active_profiles(["local-ecom"])
+        jeremy_clients = normalize_active_clients(model, ["jeremy"])
+        jeremy_filtered = filter_model(model, jeremy_profiles, jeremy_clients)
+        self.assertEqual(
+            {item["id"] for item in jeremy_filtered["parity_ledger"]},
+            {"jeremy-local-ecom"},
+        )
+
+        personal_profiles = normalize_active_profiles(["local-core"])
+        personal_clients = normalize_active_clients(model, ["personal"])
+        personal_filtered = filter_model(model, personal_profiles, personal_clients)
+        self.assertEqual(
+            {item["id"] for item in personal_filtered["parity_ledger"]},
+            {"personal-local-all", "personal-local-core"},
+        )
+
     def test_active_profiles_includes_core_plus_local(self) -> None:
         active = normalize_active_profiles(["local-minimal"])
         self.assertIn("core", active)

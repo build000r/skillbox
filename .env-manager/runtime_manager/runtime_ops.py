@@ -779,6 +779,63 @@ def sync_dcg_config(model: dict[str, Any], root_dir: Path, dry_run: bool) -> lis
     return actions
 
 
+def runtime_repo_reference_id(entry: dict[str, Any]) -> str:
+    return str(entry.get("repo_id") or entry.get("repo") or "").strip()
+
+
+def repo_regenerable_file_rel_paths(model: dict[str, Any], repo: dict[str, Any]) -> set[Path]:
+    repo_id = str(repo.get("id") or "").strip()
+    repo_root = Path(str(repo["host_path"]))
+    allowed: set[Path] = set()
+
+    for env_file in model.get("env_files") or []:
+        if runtime_repo_reference_id(env_file) != repo_id:
+            continue
+        try:
+            allowed.add(Path(str(env_file["host_path"])).relative_to(repo_root))
+        except ValueError:
+            continue
+
+    for task in model.get("tasks") or []:
+        if runtime_repo_reference_id(task) != repo_id:
+            continue
+        success = task.get("success") or {}
+        if str(success.get("type") or "").strip() != "path_exists":
+            continue
+        try:
+            allowed.add(Path(str(success["host_path"])).relative_to(repo_root))
+        except ValueError:
+            continue
+
+    return allowed
+
+
+def repo_has_only_regenerable_git_residue(model: dict[str, Any], repo: dict[str, Any]) -> bool:
+    path = Path(str(repo["host_path"]))
+    if not path.is_dir():
+        return False
+
+    allowed_files = repo_regenerable_file_rel_paths(model, repo)
+    for child in path.rglob("*"):
+        if child.is_dir():
+            continue
+        rel_path = child.relative_to(path)
+        if rel_path.parts and rel_path.parts[0] == ".skillbox":
+            continue
+        if rel_path in allowed_files:
+            continue
+        return False
+    return True
+
+
+def clear_repo_git_residue(path: Path) -> None:
+    for child in path.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
 def sync_runtime(model: dict[str, Any], dry_run: bool) -> list[str]:
     actions: list[str] = []
 
@@ -791,20 +848,32 @@ def sync_runtime(model: dict[str, Any], dry_run: bool) -> list[str]:
             "ensure-directory" if source_kind == "directory" else "external"
         )
 
-        if path.exists():
-            actions.append(f"exists: {path}")
-            continue
-
-        if sync_mode == "ensure-directory" or source_kind == "directory":
-            ensure_directory(path, dry_run)
-            actions.append(f"ensure-directory: {path}")
-            continue
-
         if source_kind == "git" and sync_mode == "clone-if-missing":
-            parent = path.parent
-            ensure_directory(parent, dry_run)
             url = str(source["url"])
             branch = str(source.get("branch", "")).strip()
+            if path.exists():
+                if path.is_dir() and git_repo_state(path).get("git"):
+                    actions.append(f"exists: {path}")
+                    continue
+                if not repo_has_only_regenerable_git_residue(model, repo):
+                    actions.append(f"exists: {path}")
+                    continue
+                if dry_run:
+                    actions.append(f"clone-reconcile: {url} -> {path}")
+                    continue
+                clear_repo_git_residue(path)
+                args = ["git", "clone"]
+                if branch:
+                    args.extend(["--branch", branch])
+                args.extend([url, str(path)])
+                result = run_command(args)
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"git clone failed for {url}")
+                actions.append(f"clone-reconcile: {url} -> {path}")
+                continue
+
+            parent = path.parent
+            ensure_directory(parent, dry_run)
             if dry_run:
                 actions.append(f"clone-if-missing: {url} -> {path}")
                 continue
@@ -817,6 +886,15 @@ def sync_runtime(model: dict[str, Any], dry_run: bool) -> list[str]:
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"git clone failed for {url}")
             actions.append(f"clone-if-missing: {url} -> {path}")
+            continue
+
+        if path.exists():
+            actions.append(f"exists: {path}")
+            continue
+
+        if sync_mode == "ensure-directory" or source_kind == "directory":
+            ensure_directory(path, dry_run)
+            actions.append(f"ensure-directory: {path}")
             continue
 
         actions.append(f"skip: {path} (sync mode {sync_mode})")

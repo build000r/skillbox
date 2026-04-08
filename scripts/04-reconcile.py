@@ -20,8 +20,6 @@ from lib.runtime_model import build_runtime_model
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 WORKSPACE_DIR = ROOT_DIR / "workspace"
-DEFAULT_SKILL_SYNC_SCRIPT = ROOT_DIR / "scripts" / "03-skill-sync.sh"
-DEFAULT_PACKAGER = ROOT_DIR / "scripts" / "package_skill.py"
 EXPECTED_FILES = [
     ".env.example",
     "Dockerfile",
@@ -33,9 +31,7 @@ EXPECTED_FILES = [
     "docker/sandbox-entrypoint.sh",
     "scripts/01-bootstrap-do.sh",
     "scripts/02-install-tailscale.sh",
-    "scripts/03-skill-sync.sh",
     "scripts/05-swimmers.sh",
-    "scripts/package_skill.py",
     "scripts/quick_validate.py",
     "scripts/lib/__init__.py",
     "scripts/lib/runtime_model.py",
@@ -44,14 +40,12 @@ EXPECTED_FILES = [
     "workspace/dependencies.yaml",
     "workspace/persistence.yaml",
     "workspace/runtime.yaml",
-    "workspace/default-skills.manifest",
-    "workspace/default-skills.sources.yaml",
+    "workspace/skill-repos.yaml",
     "workspace/client-blueprints/git-repo.yaml",
     "workspace/client-blueprints/git-repo-http-service.yaml",
 ]
 EXPECTED_DIRECTORIES = [
     ".env-manager",
-    "default-skills",
     "docker",
     "repos",
     "scripts",
@@ -109,38 +103,66 @@ def load_env_defaults(path: Path) -> dict[str, str]:
     return values
 
 
-def load_manifest_skills(path: Path) -> list[str]:
-    skills: list[str] = []
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.split("#", 1)[0].strip()
-        if line:
-            skills.append(line)
-    return skills
+def load_json(path: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Failed to parse {repo_rel(path)}: {exc}") from exc
+
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"Expected a JSON object in {repo_rel(path)}")
+    return raw
 
 
-def read_bundle_names(path: Path) -> list[str]:
-    if not path.exists():
-        return []
-    return sorted(bundle.stem for bundle in path.glob("*.skill"))
+def declared_skill_names(skill_repos_doc: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    for entry in skill_repos_doc.get("skill_repos") or []:
+        pick = entry.get("pick") or []
+        if pick:
+            names.extend(str(item) for item in pick if str(item).strip())
+            continue
+
+        repo_name = str(entry.get("repo") or "").strip()
+        path_name = str(entry.get("path") or "").strip()
+        if repo_name:
+            names.append(repo_name.rsplit("/", 1)[-1])
+        elif path_name:
+            names.append(Path(path_name).name)
+    return sorted(dict.fromkeys(names))
+
+
+def lockfile_skill_names(lock_payload: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    for item in lock_payload.get("skills") or []:
+        name = str(item.get("name") or "").strip()
+        if name:
+            names.append(name)
+    return sorted(dict.fromkeys(names))
 
 
 def build_model() -> dict[str, Any]:
     sandbox_doc = load_yaml(WORKSPACE_DIR / "sandbox.yaml")
     dependencies_doc = load_yaml(WORKSPACE_DIR / "dependencies.yaml")
     persistence_doc = load_yaml(WORKSPACE_DIR / "persistence.yaml")
-    sources_doc = load_yaml(WORKSPACE_DIR / "default-skills.sources.yaml")
+    skill_repos_doc = load_yaml(WORKSPACE_DIR / "skill-repos.yaml")
+    skill_repos_lock = load_json(WORKSPACE_DIR / "skill-repos.lock.json")
     runtime_model = build_runtime_model(ROOT_DIR)
     env_defaults = load_env_defaults(ROOT_DIR / ".env.example")
-    manifest_skills = load_manifest_skills(WORKSPACE_DIR / "default-skills.manifest")
 
     sandbox = sandbox_doc.get("sandbox") or {}
     runtime = sandbox.get("runtime") or {}
     paths = sandbox.get("paths") or {}
     ports = sandbox.get("ports") or {}
-    packaged_skill_bundles = dependencies_doc.get("packaged_skill_bundles") or []
-    default_bundle = next(
-        (item for item in packaged_skill_bundles if item.get("id") == "default-skills"),
-        packaged_skill_bundles[0] if packaged_skill_bundles else {},
+    runtime_skillsets = runtime_model.get("skills") or []
+    default_skillset = next(
+        (
+            item
+            for item in runtime_skillsets
+            if item.get("id") == "default-skills" and item.get("client", "") == ""
+        ),
+        {},
     )
 
     home_root = str(paths.get("claude_root", "")).rsplit("/.claude", 1)[0]
@@ -243,15 +265,13 @@ def build_model() -> dict[str, Any]:
         "runtime_env": runtime_env,
         "expected_mounts": expected_mounts,
         "skill_sync": {
-            "script": str(DEFAULT_SKILL_SYNC_SCRIPT),
-            "manifest_file": str(WORKSPACE_DIR / "default-skills.manifest"),
-            "sources_file": str(WORKSPACE_DIR / "default-skills.sources.yaml"),
-            "output_dir": str(ROOT_DIR / "default-skills"),
-            "packager": str(DEFAULT_PACKAGER),
-            "sources": sources_doc.get("sources") or [],
-            "manifest_skills": manifest_skills,
-            "present_bundles": read_bundle_names(ROOT_DIR / "default-skills"),
-            "bundle_dependency": default_bundle,
+            "config_file": str(WORKSPACE_DIR / "skill-repos.yaml"),
+            "lock_file": str(WORKSPACE_DIR / "skill-repos.lock.json"),
+            "clone_root": str(WORKSPACE_DIR / "skill-repos"),
+            "declared_skills": declared_skill_names(skill_repos_doc),
+            "locked_skills": lockfile_skill_names(skill_repos_lock),
+            "config_sha": skill_repos_lock.get("config_sha"),
+            "runtime_skillset": default_skillset,
         },
         "runtime_manager": {
             "script": str(ROOT_DIR / ".env-manager" / "manage.py"),
@@ -383,16 +403,23 @@ def check_manifest_alignment(model: dict[str, Any]) -> CheckResult:
     if skill_roots.get("local-skills") != dependency_paths["local-skills"]:
         issues.append("skill_roots.local-skills does not match sandbox.paths.skills_root")
 
-    bundle = model["skill_sync"]["bundle_dependency"] or {}
-    expected_bundle_path = f"{paths.get('workspace_root')}/default-skills"
-    expected_manifest_path = f"{paths.get('workspace_root')}/workspace/default-skills.manifest"
-    expected_sources_path = f"{paths.get('workspace_root')}/workspace/default-skills.sources.yaml"
-    if bundle.get("path") != expected_bundle_path:
-        issues.append("packaged_skill_bundles.default-skills path does not match workspace_root")
-    if bundle.get("source_manifest") != expected_manifest_path:
-        issues.append("packaged_skill_bundles.default-skills source_manifest does not match workspace_root")
-    if bundle.get("sources_config") != expected_sources_path:
-        issues.append("packaged_skill_bundles.default-skills sources_config does not match workspace_root")
+    skillset = model["skill_sync"]["runtime_skillset"] or {}
+    expected_config_path = f"{paths.get('workspace_root')}/workspace/skill-repos.yaml"
+    expected_lock_path = f"{paths.get('workspace_root')}/workspace/skill-repos.lock.json"
+    expected_clone_root = f"{paths.get('workspace_root')}/workspace/skill-repos"
+    if not skillset:
+        issues.append("runtime.yaml is missing the default-skills skill-repo-set")
+    else:
+        if skillset.get("kind") != "skill-repo-set":
+            issues.append("runtime.skills.default-skills kind is not skill-repo-set")
+        if skillset.get("skill_repos_config") != expected_config_path:
+            issues.append("runtime.skills.default-skills skill_repos_config does not match workspace_root")
+        if skillset.get("lock_path") != expected_lock_path:
+            issues.append("runtime.skills.default-skills lock_path does not match workspace_root")
+        if skillset.get("clone_root") != expected_clone_root:
+            issues.append("runtime.skills.default-skills clone_root does not match workspace_root")
+        if (skillset.get("sync") or {}).get("mode") != "clone-and-install":
+            issues.append("runtime.skills.default-skills sync.mode is not clone-and-install")
 
     if issues:
         return CheckResult(
@@ -557,63 +584,73 @@ def check_compose_model(model: dict[str, Any]) -> list[CheckResult]:
     ]
 
 
-def check_skill_sync_packager(model: dict[str, Any]) -> CheckResult:
-    packager = Path(model["skill_sync"]["packager"])
-    if not packager.is_file():
-        return CheckResult(
-            status="fail",
-            code="skill-sync-packager",
-            message="skill packager is missing",
-            details={"expected_path": repo_rel(packager) if packager.is_relative_to(ROOT_DIR) else str(packager)},
-        )
-    return CheckResult(
-        status="pass",
-        code="skill-sync-packager",
-        message="skill packager is available",
-        details={"path": str(packager)},
-    )
-
-
 def check_skill_sync_dry_run(model: dict[str, Any]) -> CheckResult:
-    result = run_command(["bash", model["skill_sync"]["script"], "--dry-run"])
+    result = run_command(["python3", ".env-manager/manage.py", "sync", "--dry-run", "--format", "json"])
     if result.returncode != 0:
         return CheckResult(
             status="fail",
-            code="skill-sync-dry-run",
-            message="03-skill-sync.sh --dry-run failed",
+            code="skill-repo-sync-dry-run",
+            message="manage.py sync --dry-run failed for the default skill-repo-set",
             details={
                 "stdout": result.stdout.strip(),
                 "stderr": result.stderr.strip(),
             },
         )
 
-    preview = [line for line in result.stdout.splitlines() if line.strip()]
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        return CheckResult(
+            status="fail",
+            code="skill-repo-sync-dry-run",
+            message="manage.py sync --dry-run emitted invalid JSON",
+            details={"error": str(exc)},
+        )
+
+    actions = payload.get("actions") if isinstance(payload, dict) else None
+    if not isinstance(actions, list):
+        return CheckResult(
+            status="fail",
+            code="skill-repo-sync-dry-run",
+            message="manage.py sync --dry-run emitted an unexpected JSON shape",
+            details={"payload_type": type(payload).__name__},
+        )
+
     return CheckResult(
         status="pass",
-        code="skill-sync-dry-run",
-        message="03-skill-sync.sh can resolve the configured default skills",
-        details={"preview": preview[:4]},
+        code="skill-repo-sync-dry-run",
+        message="manage.py sync --dry-run can resolve the configured default skill-repo-set",
+        details={"preview": actions[:4]},
     )
 
 
 def check_bundle_state(model: dict[str, Any]) -> CheckResult:
-    expected = set(model["skill_sync"]["manifest_skills"])
-    present = set(model["skill_sync"]["present_bundles"])
-    missing = sorted(expected - present)
-    extra = sorted(present - expected)
+    lock_path = Path(model["skill_sync"]["lock_file"])
+    expected = set(model["skill_sync"]["declared_skills"])
+    locked = set(model["skill_sync"]["locked_skills"])
+    if not lock_path.is_file():
+        return CheckResult(
+            status="warn",
+            code="skill-repo-lock-state",
+            message="workspace skill repo lockfile is missing",
+            details={"expected_path": repo_rel(lock_path)},
+        )
 
+    missing = sorted(expected - locked)
+    extra = sorted(locked - expected)
     if missing or extra:
         return CheckResult(
             status="warn",
-            code="bundle-state",
-            message="default-skills contents do not exactly match the manifest",
+            code="skill-repo-lock-state",
+            message="workspace skill repo lockfile does not exactly match the declared picks",
             details={"missing": missing, "extra": extra},
         )
+
     return CheckResult(
         status="pass",
-        code="bundle-state",
-        message="default-skills contents match the manifest",
-        details={"bundles": sorted(present)},
+        code="skill-repo-lock-state",
+        message="workspace skill repo lockfile matches the declared picks",
+        details={"skills": sorted(locked)},
     )
 
 
@@ -800,13 +837,11 @@ def print_render_text(payload: dict[str, Any]) -> None:
     print()
     print("skill sync:")
     skill_sync = payload["skill_sync"]
-    print(f"  script: {repo_rel(Path(skill_sync['script']))}")
-    print(f"  manifest: {repo_rel(Path(skill_sync['manifest_file']))}")
-    print(f"  sources: {repo_rel(Path(skill_sync['sources_file']))}")
-    print(f"  output: {repo_rel(Path(skill_sync['output_dir']))}")
-    print(f"  packager: {skill_sync['packager']}")
-    print(f"  manifest skills: {', '.join(skill_sync['manifest_skills']) or '(none)'}")
-    print(f"  present bundles: {', '.join(skill_sync['present_bundles']) or '(none)'}")
+    print(f"  config: {repo_rel(Path(skill_sync['config_file']))}")
+    print(f"  lockfile: {repo_rel(Path(skill_sync['lock_file']))}")
+    print(f"  clone root: {repo_rel(Path(skill_sync['clone_root']))}")
+    print(f"  declared skills: {', '.join(skill_sync['declared_skills']) or '(none)'}")
+    print(f"  locked skills: {', '.join(skill_sync['locked_skills']) or '(none)'}")
     print()
     print("runtime manager:")
     runtime_manager = payload["runtime_manager"]
@@ -898,7 +933,6 @@ def doctor_results(skip_compose: bool, skip_skill_sync: bool) -> list[CheckResul
             )
         )
     else:
-        results.append(check_skill_sync_packager(model))
         results.append(check_skill_sync_dry_run(model))
 
     return results
@@ -930,7 +964,7 @@ def main() -> int:
     doctor_parser.add_argument(
         "--skip-skill-sync",
         action="store_true",
-        help="Skip the 03-skill-sync.sh dry-run check.",
+        help="Skip the manage.py sync --dry-run check for the default skill-repo-set.",
     )
 
     args = parser.parse_args()

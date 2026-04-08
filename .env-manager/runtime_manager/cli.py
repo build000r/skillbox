@@ -487,6 +487,7 @@ def main() -> int:
         "client_id",
         help="Existing client slug to validate for first-box acceptance (for example `personal`).",
     )
+    acceptance_parser.add_argument("--wait-seconds", type=float, default=DEFAULT_SERVICE_START_WAIT_SECONDS)
     acceptance_parser.add_argument("--format", choices=("text", "json"), default="text")
     add_profile_arg(acceptance_parser)
 
@@ -634,6 +635,7 @@ def main() -> int:
             root_dir=root_dir,
             client_id=args.client_id,
             profiles=args.profile,
+            wait_seconds=max(0.0, float(args.wait_seconds)),
             fmt=args.format,
         )
 

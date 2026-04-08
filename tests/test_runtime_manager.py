@@ -38,7 +38,10 @@ class RuntimeManagerTests(unittest.TestCase):
         self.assertEqual(
             sorted(all_skills),
             sorted(
-                MANAGE_MODULE.HARDENED_SHARED_DEFAULT_SKILLS + ["cass-memory"],
+                MANAGE_MODULE.HARDENED_SHARED_DEFAULT_SKILLS
+                + ["cass-memory"]
+                + MANAGE_MODULE.HARDENED_CLIENT_PLANNING_SKILLS
+                + ["cass", "smart"],
             ),
         )
 
@@ -213,6 +216,80 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertTrue((repo / ".skillbox-state" / "home" / ".claude" / "skills" / "personal-skill" / "SKILL.md").is_file())
             self.assertTrue((repo / ".skillbox-state" / "home" / ".codex" / "skills" / "personal-skill" / "SKILL.md").is_file())
 
+    def test_sync_reconciles_safe_git_repo_residue_into_a_real_clone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            source_repo = self._create_git_source_repo(repo, "fixture-app")
+
+            self._write_client_overlay(
+                repo,
+                "acme-sync",
+                label="Acme Sync",
+                default_cwd="${SKILLBOX_MONOSERVER_ROOT}/acme-sync/app",
+                root_path="${SKILLBOX_MONOSERVER_ROOT}/acme-sync",
+                include_context=True,
+            )
+
+            clients_root = self._clients_host_root(repo)
+            env_source = clients_root / "acme-sync" / "env" / "app.env"
+            env_source.parent.mkdir(parents=True, exist_ok=True)
+            env_source.write_text("API_TOKEN=from-source\n", encoding="utf-8")
+            (clients_root / "acme-sync" / "skill-repos.yaml").write_text(
+                "version: 2\nskill_repos: []\n",
+                encoding="utf-8",
+            )
+
+            overlay_path = clients_root / "acme-sync" / "overlay.yaml"
+            overlay_doc = MANAGE_MODULE.load_yaml(overlay_path)
+            overlay_doc["client"]["default_cwd"] = "${SKILLBOX_MONOSERVER_ROOT}/acme-sync/app"
+            overlay_doc["client"]["repos"] = [
+                {
+                    "id": "app",
+                    "kind": "repo",
+                    "path": "${SKILLBOX_MONOSERVER_ROOT}/acme-sync/app",
+                    "repo_path": "${SKILLBOX_MONOSERVER_ROOT}/acme-sync/app",
+                    "required": True,
+                    "profiles": ["core"],
+                    "source": {
+                        "kind": "git",
+                        "url": str(source_repo),
+                        "branch": "main",
+                    },
+                    "sync": {"mode": "clone-if-missing"},
+                }
+            ]
+            overlay_doc["client"]["env_files"] = [
+                {
+                    "id": "app-env",
+                    "repo_id": "app",
+                    "path": "${SKILLBOX_MONOSERVER_ROOT}/acme-sync/app/.env",
+                    "target_path": "${SKILLBOX_MONOSERVER_ROOT}/acme-sync/app/.env",
+                    "required": True,
+                    "profiles": ["core"],
+                    "source": {
+                        "kind": "file",
+                        "path": "${SKILLBOX_CLIENTS_HOST_ROOT}/acme-sync/env/app.env",
+                        "source_path": "${SKILLBOX_CLIENTS_HOST_ROOT}/acme-sync/env/app.env",
+                    },
+                    "sync": {"mode": "write"},
+                }
+            ]
+            overlay_path.write_text(MANAGE_MODULE.render_yaml_document(overlay_doc), encoding="utf-8")
+
+            target_repo = repo / ".skillbox-state" / "monoserver" / "acme-sync" / "app"
+            target_repo.mkdir(parents=True, exist_ok=True)
+            (target_repo / ".env").write_text("API_TOKEN=stale\n", encoding="utf-8")
+
+            result = self._run(repo, "sync", "--client", "acme-sync", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            actions = json.loads(result.stdout)["actions"]
+            self.assertTrue(any("clone-reconcile:" in action for action in actions), actions)
+            self.assertTrue((target_repo / ".git").is_dir())
+            self.assertTrue((target_repo / "README.md").is_file())
+            self.assertEqual((target_repo / ".env").read_text(encoding="utf-8"), "API_TOKEN=from-source\n")
+
     def test_profile_selection_limits_optional_surfaces(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -223,7 +300,10 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(render.returncode, 0, render.stderr)
             payload = json.loads(render.stdout)
             self.assertEqual(payload["active_profiles"], ["core", "surfaces"])
-            self.assertEqual({item["id"] for item in payload["services"]}, {"internal-env-manager", "api-stub", "web-stub"})
+            self.assertEqual(
+                {item["id"] for item in payload["services"]},
+                {"internal-env-manager", "cm-mcp", "api-stub", "web-stub"},
+            )
             self.assertEqual({item["id"] for item in payload["logs"]}, {"runtime", "repos", "api", "web"})
 
     def test_profile_selection_activates_swimmers_overlay(self) -> None:
@@ -237,10 +317,10 @@ class RuntimeManagerTests(unittest.TestCase):
             payload = json.loads(render.stdout)
             self.assertEqual(payload["active_profiles"], ["core", "swimmers"])
             self.assertEqual({item["id"] for item in payload["repos"]}, {"skillbox-self", "managed-repos"})
-            self.assertEqual({item["id"] for item in payload["artifacts"]}, {"swimmers-bin"})
+            self.assertEqual({item["id"] for item in payload["artifacts"]}, {"swimmers-bin", "cass-bin", "cm-bin"})
             self.assertEqual(
                 {item["id"] for item in payload["services"]},
-                {"internal-env-manager", "swimmers-server"},
+                {"internal-env-manager", "cm-mcp", "swimmers-server"},
             )
             self.assertEqual(
                 {item["id"] for item in payload["logs"]},
@@ -267,11 +347,11 @@ class RuntimeManagerTests(unittest.TestCase):
             )
             self.assertEqual(
                 {item["id"] for item in payload["artifacts"]},
-                {"swimmers-bin", "fwc-bin", "dcg-bin"},
+                {"swimmers-bin", "cass-bin", "cm-bin", "fwc-bin", "dcg-bin"},
             )
             self.assertEqual(
                 {item["id"] for item in payload["services"]},
-                {"internal-env-manager", "fwc-mcp", "dcg-mcp"},
+                {"internal-env-manager", "cm-mcp", "fwc-mcp", "dcg-mcp"},
             )
             self.assertEqual(
                 {item["id"] for item in payload["logs"]},
@@ -321,11 +401,11 @@ class RuntimeManagerTests(unittest.TestCase):
             )
             self.assertEqual(
                 {item["id"] for item in payload["artifacts"]},
-                {"swimmers-bin"},
+                {"swimmers-bin", "cass-bin", "cm-bin"},
             )
             self.assertEqual(
                 {item["id"] for item in payload["services"]},
-                {"internal-env-manager"},
+                {"internal-env-manager", "cm-mcp"},
             )
             self.assertEqual(
                 {item["id"] for item in payload["logs"]},
@@ -393,6 +473,48 @@ class RuntimeManagerTests(unittest.TestCase):
                 checks = json.loads(result.stdout)["checks"]
                 connector_check = next(item for item in checks if item["code"] == "connector-contract")
                 self.assertEqual(connector_check["status"], "pass")
+
+    def test_doctor_ignores_out_of_scope_client_parity_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            overlay_path = self._clients_host_root(repo) / "personal" / "overlay.yaml"
+            overlay_doc = MANAGE_MODULE.load_yaml(overlay_path)
+            overlay_doc.setdefault("client", {})["parity_ledger"] = [
+                {
+                    "id": "ghost-local-core-service",
+                    "legacy_surface": "ghost-local-core-service",
+                    "surface_type": "service",
+                    "action": "declare",
+                    "ownership_state": "covered",
+                    "intended_profiles": ["local-core"],
+                    "bridge_dependency": None,
+                }
+            ]
+            overlay_path.write_text(MANAGE_MODULE.render_yaml_document(overlay_doc), encoding="utf-8")
+
+            result = self._run(
+                repo,
+                "doctor",
+                "--client",
+                "personal",
+                "--profile",
+                "connectors",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            coverage_failures = [
+                item
+                for item in payload["checks"]
+                if item["status"] == "fail" and item["code"] == "LOCAL_RUNTIME_COVERAGE_GAP"
+            ]
+            self.assertEqual(coverage_failures, [], payload["checks"])
+            parity_check = next(item for item in payload["checks"] if item["code"] == "parity-ledger")
+            self.assertEqual(parity_check["status"], "pass")
 
     def test_up_and_down_manage_selected_service_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -933,7 +1055,7 @@ class RuntimeManagerTests(unittest.TestCase):
             )
             self.assertEqual(
                 {item["id"] for item in render_payload["services"]},
-                {"internal-env-manager", "app-dev"},
+                {"internal-env-manager", "cm-mcp", "app-dev"},
             )
             self.assertIn("acme-studio-services", {item["id"] for item in render_payload["logs"]})
             self.assertEqual(
@@ -1647,7 +1769,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(model_payload["active_profiles"], ["core", "surfaces"])
             self.assertEqual(
                 {item["id"] for item in model_payload["services"]},
-                {"internal-env-manager", "api-stub", "web-stub"},
+                {"internal-env-manager", "cm-mcp", "api-stub", "web-stub"},
             )
 
     def test_client_project_refuses_to_overwrite_non_projection_output_without_force(self) -> None:
@@ -1852,6 +1974,66 @@ class RuntimeManagerTests(unittest.TestCase):
                 Path("observability/README.md"): "# Existing observability notes\n",
             }.items():
                 self.assertEqual((private_client / relative_path).read_text(encoding="utf-8"), expected)
+
+    def test_private_init_preserves_hybrid_scaffold_pack_and_seeds_both_contexts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            repo = workspace / "skillbox"
+            repo.mkdir(parents=True, exist_ok=True)
+            self._write_fixture(repo)
+            self._init_git_repo(repo)
+
+            self._write_client_overlay(
+                repo,
+                "acme-hybrid",
+                label="Acme Hybrid",
+                default_cwd="${SKILLBOX_MONOSERVER_ROOT}/acme-hybrid",
+                root_path="${SKILLBOX_MONOSERVER_ROOT}/acme-hybrid",
+                include_context=True,
+            )
+
+            overlay_dir = repo / ".skillbox-state" / "clients" / "acme-hybrid"
+            overlay_doc = MANAGE_MODULE.load_yaml(overlay_dir / "overlay.yaml")
+            overlay_doc["client"]["scaffold"] = {"pack": "hybrid"}
+            (overlay_dir / "overlay.yaml").write_text(
+                MANAGE_MODULE.render_yaml_document(overlay_doc),
+                encoding="utf-8",
+            )
+            (overlay_dir / "plans").mkdir(parents=True, exist_ok=True)
+            (overlay_dir / "workflows").mkdir(parents=True, exist_ok=True)
+            (overlay_dir / "plans" / "INDEX.md").write_text("# Custom plan index\n", encoding="utf-8")
+            (overlay_dir / "workflows" / "INDEX.md").write_text("# Custom workflow index\n", encoding="utf-8")
+
+            result = self._run(
+                repo,
+                "private-init",
+                "--path",
+                "../private-config",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            private_client = workspace / "private-config" / "clients" / "acme-hybrid"
+            private_overlay = MANAGE_MODULE.load_yaml(private_client / "overlay.yaml")
+            client_doc = private_overlay["client"]
+
+            self.assertEqual(client_doc["scaffold"]["pack"], "hybrid")
+            self.assertEqual(client_doc["context"]["plans"], MANAGE_MODULE.HARDENED_CLIENT_PLAN_PATHS)
+            self.assertEqual(
+                client_doc["context"]["workflow_builder"],
+                MANAGE_MODULE.HARDENED_CLIENT_SKILL_BUILDER_CONTEXT["workflow_builder"],
+            )
+            skill_repos_content = (private_client / "skill-repos.yaml").read_text(encoding="utf-8")
+            for skill_name in MANAGE_MODULE.HARDENED_CLIENT_HYBRID_SKILLS:
+                self.assertIn(skill_name, skill_repos_content)
+            self.assertEqual((private_client / "plans" / "INDEX.md").read_text(encoding="utf-8"), "# Custom plan index\n")
+            self.assertEqual(
+                (private_client / "workflows" / "INDEX.md").read_text(encoding="utf-8"),
+                "# Custom workflow index\n",
+            )
+            self.assertTrue((private_client / "skills" / "domain-planner" / "SKILL.md").is_file())
+            self.assertTrue((private_client / "skills" / "skill-issue" / "SKILL.md").is_file())
 
     def test_client_publish_and_diff_use_attached_private_repo_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2518,7 +2700,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(payload["client_id"], "personal")
             self.assertEqual(payload["output_dir"], str(output_dir.resolve()))
             self.assertEqual(payload["active_profiles"], ["core"])
-            self.assertEqual(payload["mcp_servers"], ["skillbox"])
+            self.assertEqual(set(payload["mcp_servers"]), {"skillbox", "cm"})
             self.assertTrue((output_dir / "CLAUDE.md").is_file())
             self.assertTrue((output_dir / "AGENTS.md").is_symlink())
             self.assertEqual(os.readlink(str(output_dir / "AGENTS.md")), "CLAUDE.md")
@@ -2530,7 +2712,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertFalse((repo / "home" / ".claude" / "CLAUDE.md").exists())
 
             mcp_payload = json.loads((output_dir / ".mcp.json").read_text(encoding="utf-8"))
-            self.assertEqual(set(mcp_payload["mcpServers"]), {"skillbox"})
+            self.assertEqual(set(mcp_payload["mcpServers"]), {"skillbox", "cm"})
 
             focus_state = json.loads((repo / "workspace" / ".focus.json").read_text(encoding="utf-8"))
             self.assertEqual(focus_state["client_id"], "personal")
@@ -2559,7 +2741,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(payload["client_id"], "personal")
             self.assertEqual(payload["output_dir"], str(output_dir.resolve()))
             self.assertEqual(payload["active_profiles"], ["core"])
-            self.assertEqual(payload["mcp_servers"], ["skillbox"])
+            self.assertEqual(set(payload["mcp_servers"]), {"skillbox", "cm"})
             self.assertEqual(payload["focus"]["status"], "skip")
             self.assertEqual(payload["focus"]["step_names"], [])
             self.assertTrue((output_dir / "CLAUDE.md").is_file())
@@ -2572,7 +2754,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertFalse((repo / "workspace" / ".focus.json").exists())
 
             mcp_payload = json.loads((output_dir / ".mcp.json").read_text(encoding="utf-8"))
-            self.assertEqual(set(mcp_payload["mcpServers"]), {"skillbox"})
+            self.assertEqual(set(mcp_payload["mcpServers"]), {"skillbox", "cm"})
 
     def test_client_open_from_bundle_supports_custom_output_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2609,18 +2791,18 @@ class RuntimeManagerTests(unittest.TestCase):
             output_dir = repo / "artifacts" / "open-personal"
             self.assertEqual(payload["output_dir"], str(output_dir.resolve()))
             self.assertEqual(payload["active_profiles"], ["connectors", "core"])
-            self.assertEqual(set(payload["mcp_servers"]), {"skillbox", "fwc", "dcg"})
+            self.assertEqual(set(payload["mcp_servers"]), {"skillbox", "cm", "fwc", "dcg"})
             self.assertEqual(payload["focus"]["status"], "skip")
             self.assertFalse((repo / "workspace" / ".focus.json").exists())
 
             mcp_payload = json.loads((output_dir / ".mcp.json").read_text(encoding="utf-8"))
-            self.assertEqual(set(mcp_payload["mcpServers"]), {"skillbox", "fwc", "dcg"})
+            self.assertEqual(set(mcp_payload["mcpServers"]), {"skillbox", "cm", "fwc", "dcg"})
 
             runtime_model = json.loads((output_dir / "runtime-model.json").read_text(encoding="utf-8"))
             self.assertEqual(runtime_model["active_profiles"], ["connectors", "core"])
             self.assertEqual(
                 {service["id"] for service in runtime_model["services"]},
-                {"internal-env-manager", "fwc-mcp", "dcg-mcp"},
+                {"internal-env-manager", "cm-mcp", "fwc-mcp", "dcg-mcp"},
             )
 
     def test_client_open_supports_profiles_and_custom_output_dir(self) -> None:
@@ -2659,16 +2841,16 @@ class RuntimeManagerTests(unittest.TestCase):
             output_dir = repo / "artifacts" / "open-personal"
             self.assertEqual(payload["output_dir"], str(output_dir.resolve()))
             self.assertEqual(payload["active_profiles"], ["connectors", "core"])
-            self.assertEqual(set(payload["mcp_servers"]), {"skillbox", "fwc", "dcg"})
+            self.assertEqual(set(payload["mcp_servers"]), {"skillbox", "cm", "fwc", "dcg"})
 
             mcp_payload = json.loads((output_dir / ".mcp.json").read_text(encoding="utf-8"))
-            self.assertEqual(set(mcp_payload["mcpServers"]), {"skillbox", "fwc", "dcg"})
+            self.assertEqual(set(mcp_payload["mcpServers"]), {"skillbox", "cm", "fwc", "dcg"})
 
             runtime_model = json.loads((output_dir / "runtime-model.json").read_text(encoding="utf-8"))
             self.assertEqual(runtime_model["active_profiles"], ["connectors", "core"])
             self.assertEqual(
                 {service["id"] for service in runtime_model["services"]},
-                {"internal-env-manager", "fwc-mcp", "dcg-mcp"},
+                {"internal-env-manager", "cm-mcp", "fwc-mcp", "dcg-mcp"},
             )
 
     def test_client_open_rejects_bundle_with_profile_override(self) -> None:
@@ -3176,7 +3358,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(os.readlink(str(output_dir / "AGENTS.md")), "CLAUDE.md")
 
             mcp_payload = json.loads((output_dir / ".mcp.json").read_text(encoding="utf-8"))
-            self.assertEqual(set(mcp_payload["mcpServers"]), {"skillbox"})
+            self.assertEqual(set(mcp_payload["mcpServers"]), {"skillbox", "cm"})
 
     def test_first_box_scaffolds_missing_client_with_blueprint(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3350,9 +3532,130 @@ class RuntimeManagerTests(unittest.TestCase):
             output_dir = repo / "sand" / "personal"
 
             self.assertEqual(payload["active_profiles"], ["connectors", "core"])
-            self.assertEqual(set(payload["mcp_servers"]), {"skillbox", "fwc", "dcg"})
+            self.assertEqual(set(payload["mcp_servers"]), {"skillbox", "cm", "fwc", "dcg"})
             mcp_payload = json.loads((output_dir / ".mcp.json").read_text(encoding="utf-8"))
-            self.assertEqual(set(mcp_payload["mcpServers"]), {"skillbox", "fwc", "dcg"})
+            self.assertEqual(set(mcp_payload["mcpServers"]), {"skillbox", "cm", "fwc", "dcg"})
+
+    def test_first_box_forwards_wait_seconds_to_acceptance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            repo = workspace / "skillbox"
+            repo.mkdir(parents=True, exist_ok=True)
+            self._write_fixture(repo)
+
+            seen_args: list[list[str]] = []
+
+            def fake_run_manage_json_command(root_dir: Path, args: list[str]) -> tuple[int, dict[str, object]]:
+                del root_dir
+                seen_args.append(args)
+                if args[0] == "acceptance":
+                    return MANAGE_MODULE.EXIT_OK, {
+                        "client_id": "personal",
+                        "active_profiles": ["core"],
+                        "ready": True,
+                        "steps": [],
+                    }
+                if args[0] == "client-open":
+                    return MANAGE_MODULE.EXIT_OK, {
+                        "output_dir": str(repo / "sand" / "personal"),
+                        "active_profiles": ["core"],
+                        "mcp_servers": ["skillbox", "cm"],
+                    }
+                raise AssertionError(f"Unexpected command: {args}")
+
+            with mock.patch.dict(
+                MANAGE_MODULE.run_first_box.__globals__,
+                {
+                    "init_private_repo": lambda _root_dir, target_dir_arg=None: {
+                        "target_dir": str((workspace / "skillbox-config").resolve()),
+                        "clients_host_root": str((repo / ".skillbox-state" / "clients").resolve()),
+                    },
+                    "run_manage_json_command": fake_run_manage_json_command,
+                    "emit_json": lambda _payload: None,
+                },
+            ):
+                result = MANAGE_MODULE.run_first_box(
+                    root_dir=repo,
+                    client_id="personal",
+                    private_path_arg=None,
+                    profiles=[],
+                    output_dir_arg=None,
+                    label=None,
+                    default_cwd=None,
+                    root_path=None,
+                    blueprint_name=None,
+                    set_args=[],
+                    force=False,
+                    wait_seconds=42.0,
+                    fmt="json",
+                )
+
+            self.assertEqual(result, MANAGE_MODULE.EXIT_OK)
+            acceptance_args = next(args for args in seen_args if args[0] == "acceptance")
+            self.assertEqual(
+                acceptance_args,
+                ["acceptance", "personal", "--wait-seconds", "42.0", "--format", "json"],
+            )
+
+    def test_first_box_fails_when_open_surface_is_missing_required_inner_mcp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            repo = workspace / "skillbox"
+            repo.mkdir(parents=True, exist_ok=True)
+            self._write_fixture(repo)
+
+            def fake_run_manage_json_command(root_dir: Path, args: list[str]) -> tuple[int, dict[str, object]]:
+                del root_dir
+                if args[0] == "acceptance":
+                    return MANAGE_MODULE.EXIT_OK, {
+                        "client_id": "personal",
+                        "active_profiles": ["core"],
+                        "ready": True,
+                        "steps": [],
+                    }
+                if args[0] == "client-open":
+                    return MANAGE_MODULE.EXIT_OK, {
+                        "output_dir": str(repo / "sand" / "personal"),
+                        "active_profiles": ["core"],
+                        "mcp_servers": ["skillbox"],
+                    }
+                raise AssertionError(f"Unexpected command: {args}")
+
+            captured_payloads: list[dict[str, object]] = []
+            with mock.patch.dict(
+                MANAGE_MODULE.run_first_box.__globals__,
+                {
+                    "init_private_repo": lambda _root_dir, target_dir_arg=None: {
+                        "target_dir": str((workspace / "skillbox-config").resolve()),
+                        "clients_host_root": str((repo / ".skillbox-state" / "clients").resolve()),
+                    },
+                    "run_manage_json_command": fake_run_manage_json_command,
+                    "emit_json": captured_payloads.append,
+                },
+            ):
+                result = MANAGE_MODULE.run_first_box(
+                    root_dir=repo,
+                    client_id="personal",
+                    private_path_arg=None,
+                    profiles=[],
+                    output_dir_arg=None,
+                    label=None,
+                    default_cwd=None,
+                    root_path=None,
+                    blueprint_name=None,
+                    set_args=[],
+                    force=False,
+                    wait_seconds=45.0,
+                    fmt="json",
+                )
+
+            self.assertEqual(result, MANAGE_MODULE.EXIT_ERROR)
+            payload = captured_payloads[0]
+            self.assertEqual(payload["error"]["type"], "missing_mcp_surface")
+            self.assertIn("cm", payload["error"]["message"])
+            open_step = next(step for step in payload["steps"] if step["step"] == "open")
+            self.assertEqual(open_step["status"], "fail")
+            self.assertEqual(open_step["detail"]["missing_mcp_servers"], ["cm"])
 
     def _run(self, repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -3499,6 +3802,31 @@ class RuntimeManagerTests(unittest.TestCase):
         overlay_path = self._clients_host_root(repo) / client_id / "overlay.yaml"
         overlay_doc = MANAGE_MODULE.load_yaml(overlay_path)
         overlay_doc.setdefault("client", {})["connectors"] = connectors
+        overlay_path.write_text(MANAGE_MODULE.render_yaml_document(overlay_doc), encoding="utf-8")
+
+    def _set_client_acceptance_probe(
+        self,
+        repo: Path,
+        client_id: str,
+        *,
+        command: list[str],
+        cwd: str | None = None,
+        profiles: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        overlay_path = self._clients_host_root(repo) / client_id / "overlay.yaml"
+        overlay_doc = MANAGE_MODULE.load_yaml(overlay_path)
+        probe: dict[str, object] = {"command": command}
+        if cwd is not None:
+            probe["cwd"] = cwd
+        if profiles:
+            probe["profiles"] = profiles
+        if env:
+            probe["env"] = env
+        if timeout_seconds is not None:
+            probe["timeout_seconds"] = timeout_seconds
+        overlay_doc.setdefault("client", {})["acceptance_probe"] = probe
         overlay_path.write_text(MANAGE_MODULE.render_yaml_document(overlay_doc), encoding="utf-8")
 
     def _clients_host_root(self, repo: Path) -> Path:
@@ -3687,6 +4015,16 @@ class RuntimeManagerTests(unittest.TestCase):
             "SKILLBOX_DCG_DOWNLOAD_SHA256=\n"
             "SKILLBOX_DCG_PACKS=core.git,core.filesystem\n"
             "SKILLBOX_DCG_MCP_PORT=3220\n"
+            "SKILLBOX_CASS_BIN=/home/sandbox/.local/bin/cass\n"
+            "SKILLBOX_CASS_DOWNLOAD_URL=\n"
+            "SKILLBOX_CASS_DOWNLOAD_SHA256=\n"
+            "SKILLBOX_APR_BIN=/home/sandbox/.local/bin/apr\n"
+            "SKILLBOX_APR_DOWNLOAD_URL=\n"
+            "SKILLBOX_APR_DOWNLOAD_SHA256=\n"
+            "SKILLBOX_CM_BIN=/home/sandbox/.local/bin/cm\n"
+            "SKILLBOX_CM_DOWNLOAD_URL=\n"
+            "SKILLBOX_CM_DOWNLOAD_SHA256=\n"
+            "SKILLBOX_CM_MCP_PORT=3222\n"
             "SKILLBOX_FWC_BIN=/home/sandbox/.local/bin/fwc\n"
             "SKILLBOX_FWC_DOWNLOAD_URL=\n"
             "SKILLBOX_FWC_DOWNLOAD_SHA256=\n"
@@ -3734,6 +4072,30 @@ class RuntimeManagerTests(unittest.TestCase):
             "      source:\n"
             "        kind: file\n"
             "        path: ./artifacts/swimmers.bin\n"
+            "        executable: true\n"
+            "      sync:\n"
+            "        mode: copy-if-missing\n"
+            "    - id: cass-bin\n"
+            "      kind: binary\n"
+            "      path: ${SKILLBOX_CASS_BIN}\n"
+            "      required: false\n"
+            "      profiles:\n"
+            "        - core\n"
+            "      source:\n"
+            "        kind: file\n"
+            "        path: ./artifacts/cass.bin\n"
+            "        executable: true\n"
+            "      sync:\n"
+            "        mode: copy-if-missing\n"
+            "    - id: cm-bin\n"
+            "      kind: binary\n"
+            "      path: ${SKILLBOX_CM_BIN}\n"
+            "      required: false\n"
+            "      profiles:\n"
+            "        - core\n"
+            "      source:\n"
+            "        kind: file\n"
+            "        path: ./artifacts/cm.bin\n"
             "        executable: true\n"
             "      sync:\n"
             "        mode: copy-if-missing\n"
@@ -3796,6 +4158,24 @@ class RuntimeManagerTests(unittest.TestCase):
             "        type: path_exists\n"
             "        path: ${SKILLBOX_LOG_ROOT}/swimmers/swimmers-server.pid\n"
             "      log: swimmers\n"
+            "    - id: cm-mcp\n"
+            "      kind: mcp\n"
+            "      artifact: cm-bin\n"
+            "      required: false\n"
+            "      profiles:\n"
+            "        - core\n"
+            "      command: ${SKILLBOX_CM_BIN} serve --port ${SKILLBOX_CM_MCP_PORT}\n"
+            "      env:\n"
+            "        CASS_MEMORY_LLM: none\n"
+            "        CASS_PATH: ${SKILLBOX_CASS_BIN}\n"
+            "      healthcheck:\n"
+            "        type: http\n"
+            "        url: http://127.0.0.1:${SKILLBOX_CM_MCP_PORT}/health\n"
+            "        timeout_seconds: 0.5\n"
+            "      depends_on:\n"
+            "        - cass-bin\n"
+            "        - cm-bin\n"
+            "      log: runtime\n"
             "  logs:\n"
             "    - id: runtime\n"
             "      path: ${SKILLBOX_LOG_ROOT}/runtime\n"
@@ -3947,6 +4327,8 @@ class RuntimeManagerTests(unittest.TestCase):
         )
         (repo / "artifacts").mkdir(parents=True, exist_ok=True)
         (repo / "artifacts" / "swimmers.bin").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (repo / "artifacts" / "cass.bin").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (repo / "artifacts" / "cm.bin").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         (repo / "artifacts" / "fwc.bin").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         (repo / "artifacts" / "dcg.bin").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
 
@@ -4033,6 +4415,14 @@ class RuntimeManagerTests(unittest.TestCase):
                             "command": "python3",
                             "args": ["./.env-manager/mcp_server.py"],
                         },
+                        "cm": {
+                            "command": str((repo / ".mcp-bin" / "cm").resolve()),
+                            "args": ["serve", "--port", "3222"],
+                            "env": {
+                                "CASS_MEMORY_LLM": "none",
+                                "CASS_PATH": "/home/sandbox/.local/bin/cass",
+                            },
+                        },
                         "fwc": {
                             "command": str((repo / ".mcp-bin" / "fwc").resolve()),
                             "args": ["serve-mcp", "--zone", "work"],
@@ -4047,6 +4437,7 @@ class RuntimeManagerTests(unittest.TestCase):
             ) + "\n",
             encoding="utf-8",
         )
+        self._install_absolute_mcp_stub(self._fixture_mcp_stub_path(repo, "cm"), tool_names=["memory_search"])
 
     def _write_connector_focus_artifacts(self, repo: Path) -> None:
         for name in ("fwc.bin", "dcg.bin"):
@@ -4739,6 +5130,81 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertIn("## Attention", claude_md)
             self.assertIn("CHECK FAIL", claude_md)
 
+    def test_focus_fails_before_bootstrap_when_post_sync_doctor_has_fatal_task_blockers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            self._write_client_overlay(
+                repo,
+                "acme-runtime",
+                label="Acme Runtime",
+                default_cwd="${SKILLBOX_MONOSERVER_ROOT}/acme-runtime",
+                root_path="${SKILLBOX_MONOSERVER_ROOT}/acme-runtime",
+                include_context=True,
+            )
+            (repo / ".skillbox-state" / "monoserver" / "acme-runtime").mkdir(parents=True, exist_ok=True)
+            (self._clients_host_root(repo) / "acme-runtime" / "skill-repos.yaml").write_text(
+                "version: 2\nskill_repos: []\n",
+                encoding="utf-8",
+            )
+
+            overlay_path = self._clients_host_root(repo) / "acme-runtime" / "overlay.yaml"
+            overlay_doc = MANAGE_MODULE.load_yaml(overlay_path)
+            client_doc = overlay_doc["client"]
+            client_doc["repos"] = [
+                {
+                    "id": "app",
+                    "kind": "repo",
+                    "path": "${SKILLBOX_MONOSERVER_ROOT}/acme-runtime/app",
+                    "repo_path": "${SKILLBOX_MONOSERVER_ROOT}/acme-runtime/app",
+                    "required": True,
+                    "profiles": ["core"],
+                    "source": {"kind": "directory"},
+                    "sync": {"mode": "ensure-directory"},
+                }
+            ]
+            client_doc["tasks"] = [
+                {
+                    "id": "app-bootstrap",
+                    "kind": "bootstrap",
+                    "repo_id": "app",
+                    "log": "acme-runtime",
+                    "profiles": ["core"],
+                    "command": "touch .bootstrap.ok",
+                    "success": {
+                        "type": "path_exists",
+                        "path": "${SKILLBOX_MONOSERVER_ROOT}/acme-runtime/app/.bootstrap.ok",
+                    },
+                }
+            ]
+            client_doc.setdefault("checks", []).append(
+                {
+                    "id": "app-package-json",
+                    "type": "path_exists",
+                    "path": "${SKILLBOX_MONOSERVER_ROOT}/acme-runtime/app/package.json",
+                    "required": True,
+                    "profiles": ["core"],
+                }
+            )
+            overlay_path.write_text(MANAGE_MODULE.render_yaml_document(overlay_doc), encoding="utf-8")
+
+            result = self._run(repo, "focus", "acme-runtime", "--format", "json")
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            payload = json.loads(result.stdout)
+            steps = {step["step"]: step for step in payload["steps"]}
+            self.assertEqual(steps["sync"]["status"], "ok")
+            self.assertEqual(steps["bootstrap"]["status"], "fail")
+            self.assertEqual(payload["error"]["type"], "pre_bootstrap_doctor_failed")
+            failing_codes = {
+                check["code"]
+                for check in steps["bootstrap"]["detail"]["checks"]
+                if check["status"] == "fail"
+            }
+            self.assertIn("required-runtime-checks", failing_codes)
+            self.assertFalse((repo / "workspace" / ".focus.json").exists())
+
     def test_focus_detects_recent_errors_in_logs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -4832,7 +5298,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(focus_state["active_profiles"], ["connectors", "core"])
             self.assertEqual(
                 {service["id"] for service in payload["live_state"]["services"]},
-                {"internal-env-manager", "fwc-mcp", "dcg-mcp"},
+                {"internal-env-manager", "cm-mcp", "fwc-mcp", "dcg-mcp"},
             )
 
     def test_acceptance_succeeds_for_onboarded_core_client(self) -> None:
@@ -4854,6 +5320,53 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertIn("skillbox_status", tool_names)
             self.assertIn("skillbox_focus", tool_names)
 
+    def test_acceptance_forwards_wait_seconds_to_focus(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            captured_payloads: list[dict[str, object]] = []
+            seen_args: list[list[str]] = []
+
+            def fake_run_manage_json_command(root_dir: Path, args: list[str]) -> tuple[int, dict[str, object]]:
+                del root_dir
+                seen_args.append(list(args))
+                command = args[0]
+                if command == "doctor":
+                    return MANAGE_MODULE.EXIT_OK, {"checks": []}
+                if command == "sync":
+                    return MANAGE_MODULE.EXIT_OK, {"actions": []}
+                if command == "focus":
+                    return MANAGE_MODULE.EXIT_OK, {"live_state": {"services": []}, "steps": []}
+                raise AssertionError(f"Unexpected command: {args}")
+
+            with mock.patch.dict(
+                MANAGE_MODULE.run_acceptance.__globals__,
+                {
+                    "run_manage_json_command": fake_run_manage_json_command,
+                    "smoke_requested_mcp_servers": lambda _root_dir, _model: (
+                        True,
+                        {"servers": {}, "servers_ok": ["skillbox"], "servers_failed": []},
+                        [],
+                    ),
+                    "build_runtime_model": lambda _root_dir: {"clients": []},
+                    "filter_model": lambda model, _profiles, _clients: model,
+                    "normalize_active_clients": lambda _model, clients: clients,
+                    "emit_json": captured_payloads.append,
+                },
+            ):
+                result = MANAGE_MODULE.run_acceptance(
+                    root_dir=repo,
+                    client_id="personal",
+                    profiles=[],
+                    wait_seconds=42.5,
+                    fmt="json",
+                )
+
+            self.assertEqual(result, MANAGE_MODULE.EXIT_OK)
+            focus_args = next(args for args in seen_args if args[0] == "focus")
+            self.assertEqual(focus_args, ["focus", "personal", "--wait-seconds", "42.5", "--format", "json"])
+            self.assertTrue(captured_payloads[0]["ready"])
+
     def test_acceptance_succeeds_only_when_connector_mcp_surfaces_are_live(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -4870,10 +5383,88 @@ class RuntimeManagerTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertTrue(payload["ready"])
             self.assertEqual(payload["active_profiles"], ["connectors", "core"])
-            self.assertEqual(payload["steps"][3]["detail"]["servers_ok"], ["skillbox", "fwc", "dcg"])
+            self.assertEqual(payload["steps"][3]["detail"]["servers_ok"], ["skillbox", "cm", "fwc", "dcg"])
             self.assertEqual(
                 set(payload["steps"][2]["detail"]["services"]),
-                {"internal-env-manager", "fwc-mcp", "dcg-mcp"},
+                {"internal-env-manager", "cm-mcp", "fwc-mcp", "dcg-mcp"},
+            )
+
+    def test_acceptance_runs_configured_workflow_probe_after_mcp_smoke(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            probe_script = repo / "acceptance_probe.py"
+            probe_script.write_text(
+                "from __future__ import annotations\n"
+                "\n"
+                "import json\n"
+                "import os\n"
+                "from pathlib import Path\n"
+                "\n"
+                "payload = {\n"
+                "    'cwd': os.getcwd(),\n"
+                "    'client_id': os.environ.get('SKILLBOX_ACCEPTANCE_CLIENT_ID'),\n"
+                "    'profiles': os.environ.get('SKILLBOX_ACCEPTANCE_PROFILES'),\n"
+                "}\n"
+                "Path(os.environ['PROBE_OUTPUT_PATH']).write_text(json.dumps(payload), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            probe_output = repo / "workspace" / "probe-output.json"
+            self._set_client_acceptance_probe(
+                repo,
+                "personal",
+                command=["python3", "${ROOT_DIR}/acceptance_probe.py"],
+                cwd="${ROOT_DIR}/workspace",
+                env={"PROBE_OUTPUT_PATH": "${ROOT_DIR}/workspace/probe-output.json"},
+            )
+
+            result = self._run(repo, "acceptance", "personal", "--wait-seconds", "17.5", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            step_names = [step["step"] for step in payload["steps"]]
+            self.assertTrue(payload["ready"])
+            self.assertEqual(
+                step_names,
+                ["doctor-pre", "sync", "focus", "mcp-smoke", "workflow-probe", "doctor-post"],
+            )
+            probe_step = payload["steps"][4]
+            self.assertEqual(probe_step["status"], "ok")
+            self.assertEqual(probe_step["detail"]["cwd"], str((repo / "workspace").resolve()))
+            probe_payload = json.loads(probe_output.read_text(encoding="utf-8"))
+            self.assertEqual(probe_payload["cwd"], str((repo / "workspace").resolve()))
+            self.assertEqual(probe_payload["client_id"], "personal")
+            self.assertEqual(probe_payload["profiles"], "core")
+
+    def test_acceptance_skips_profile_gated_probe_when_profile_is_inactive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            probe_script = repo / "acceptance_probe_should_not_run.py"
+            probe_script.write_text(
+                "from __future__ import annotations\n"
+                "\n"
+                "raise SystemExit('probe should not have run')\n",
+                encoding="utf-8",
+            )
+            self._set_client_acceptance_probe(
+                repo,
+                "personal",
+                command=["python3", "${ROOT_DIR}/acceptance_probe_should_not_run.py"],
+                cwd="${ROOT_DIR}",
+                profiles=["connectors"],
+            )
+
+            result = self._run(repo, "acceptance", "personal", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ready"])
+            self.assertEqual(
+                [step["step"] for step in payload["steps"]],
+                ["doctor-pre", "sync", "focus", "mcp-smoke", "doctor-post"],
             )
 
     def test_acceptance_fails_before_activation_when_client_connectors_exceed_box_superset(self) -> None:
@@ -4939,6 +5530,42 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(payload["error"]["type"], "mcp_smoke_failed")
             self.assertIn("sync --profile connectors --format json", payload["next_actions"])
             self.assertIn("logs --service fwc-mcp --format json", payload["next_actions"])
+
+    def test_acceptance_fails_when_workflow_probe_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            probe_script = repo / "acceptance_probe_fail.py"
+            probe_script.write_text(
+                "from __future__ import annotations\n"
+                "\n"
+                "import sys\n"
+                "\n"
+                "print('probe exploded')\n"
+                "sys.exit(3)\n",
+                encoding="utf-8",
+            )
+            self._set_client_acceptance_probe(
+                repo,
+                "personal",
+                command=["python3", "${ROOT_DIR}/acceptance_probe_fail.py"],
+                cwd="${ROOT_DIR}",
+            )
+
+            result = self._run(repo, "acceptance", "personal", "--format", "json")
+
+            self.assertEqual(result.returncode, 1, result.stderr)
+            payload = json.loads(result.stdout)
+            steps = {step["step"]: step for step in payload["steps"]}
+            self.assertFalse(payload["ready"])
+            self.assertEqual(steps["mcp-smoke"]["status"], "ok")
+            self.assertEqual(steps["workflow-probe"]["status"], "fail")
+            self.assertEqual(steps["doctor-post"]["status"], "ok")
+            self.assertEqual(payload["error"]["type"], "acceptance_probe_failed")
+            self.assertIn("logs --client personal --format json", payload["next_actions"])
+            self.assertEqual(steps["workflow-probe"]["detail"]["exit_code"], 3)
+            self.assertEqual(steps["workflow-probe"]["detail"]["stdout_tail"], ["probe exploded"])
 
     def test_acceptance_translates_runtime_mcp_paths_before_smoke(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

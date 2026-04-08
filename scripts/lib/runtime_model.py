@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import os
 import re
+from datetime import date, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -258,6 +259,18 @@ def load_yaml(path: Path) -> dict[str, Any]:
     except Exception as exc:  # pragma: no cover - defensive parse path
         raise RuntimeError(f"Failed to parse {path}: {exc}") from exc
 
+    def normalize_scalars(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: normalize_scalars(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [normalize_scalars(item) for item in value]
+        if isinstance(value, tuple):
+            return [normalize_scalars(item) for item in value]
+        if isinstance(value, (datetime, date)):
+            return value.isoformat()
+        return value
+
+    raw = normalize_scalars(raw)
     if raw is None:
         return {}
     if not isinstance(raw, dict):
