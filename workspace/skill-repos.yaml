@@ -34,6 +34,7 @@ skill_repos:
       - domain-scaffolder
       - mutate
       - oss-doc-audit
+      - skill-issue
 
   # Private local skills that should ship with the default box setup
   - path: ../../../skills-private
