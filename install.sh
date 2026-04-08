@@ -19,6 +19,7 @@ DRY_RUN=0
 VERIFY=0
 RUN_BUILD=1
 RUN_UP=1
+RUN_FIRST_BOX=1
 RUN_BOOTSTRAP_HOST=0
 RUN_TAILSCALE=0
 
@@ -87,6 +88,7 @@ Source acquisition:
   --sha256 <hex>           Expected SHA256 for --offline tarball or downloaded tarball.
 
 Lifecycle:
+  --skip-first-box         Do not run first-box after acquiring the source.
   --skip-build             Do not run make build after first-box.
   --skip-up                Do not run make up after first-box.
   --verify                 Run post-install runtime verification commands.
@@ -227,14 +229,19 @@ PY
 
 json_get() {
   local json_file="$1"
-  local expr="$2"
-  python3 - "$json_file" "$expr" <<'PY'
+  local path="$2"
+  python3 - "$json_file" "$path" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(eval(sys.argv[2], {"payload": payload}))
+node = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+for key in [p for p in sys.argv[2].split(".") if p]:
+    if not isinstance(node, dict) or key not in node:
+        node = ""
+        break
+    node = node[key]
+print(node if node is not None else "")
 PY
 }
 
@@ -412,6 +419,7 @@ copy_checkout() {
   local src="$1"
   local dest="$2"
   local rel=""
+  local always_copy=""
 
   if [[ "${src}" == "${dest}" ]]; then
     STATUS_SOURCE="reused"
@@ -426,6 +434,12 @@ copy_checkout() {
       mkdir -p "${dest}/$(dirname "${rel}")"
       cp -pR "${src}/${rel}" "${dest}/${rel}"
     done < <(git -C "${src}" ls-files -z --cached --modified --others --exclude-standard)
+    for always_copy in ".mcp.json"; do
+      if [[ -f "${src}/${always_copy}" ]]; then
+        mkdir -p "${dest}/$(dirname "${always_copy}")"
+        cp -p "${src}/${always_copy}" "${dest}/${always_copy}"
+      fi
+    done
   else
     rsync -a \
       --exclude '.git/' \
@@ -564,6 +578,72 @@ hydrate_env() {
   STATUS_ENV="created"
 }
 
+ensure_local_state_layout() {
+  local target_repo="$1"
+  local env_file="${target_repo}/.env"
+  local dir_path=""
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    info "dry-run: prepare local state layout under ${target_repo}"
+    return 0
+  fi
+  if [[ ! -f "${env_file}" ]]; then
+    return 0
+  fi
+
+  while IFS= read -r dir_path; do
+    [[ -n "${dir_path}" ]] || continue
+    mkdir -p "${dir_path}"
+  done < <(python3 - "${target_repo}" "${env_file}" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1]).resolve()
+env_file = Path(sys.argv[2])
+values = {}
+for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    key, value = line.split("=", 1)
+    values[key.strip()] = value.strip()
+
+state_root_raw = values.get("SKILLBOX_STATE_ROOT", "./.skillbox-state")
+monoserver_raw = values.get("SKILLBOX_MONOSERVER_HOST_ROOT", "${SKILLBOX_STATE_ROOT}/monoserver")
+
+def resolve_host_path(raw: str) -> Path:
+    expanded = raw.replace("${SKILLBOX_STATE_ROOT}", state_root_raw)
+    path = Path(os.path.expanduser(expanded))
+    if not path.is_absolute():
+        path = (repo / path).resolve()
+    else:
+        path = path.resolve()
+    return path
+
+state_root = resolve_host_path(state_root_raw)
+monoserver_root = resolve_host_path(monoserver_raw)
+
+dirs = [
+    state_root,
+    state_root / "home" / ".claude",
+    state_root / "home" / ".codex",
+    state_root / "home" / ".local",
+    state_root / "logs",
+    monoserver_root,
+]
+
+seen = set()
+for path in dirs:
+    text = str(path)
+    if text in seen:
+        continue
+    seen.add(text)
+    print(text)
+PY
+  )
+}
+
 run_host_bootstrap() {
   local target_repo="$1"
   local bootstrap_script="${target_repo}/scripts/01-bootstrap-do.sh"
@@ -623,6 +703,11 @@ run_first_box() {
   local profile=""
   local assignment=""
 
+  if [[ "${RUN_FIRST_BOX}" -ne 1 ]]; then
+    STATUS_FIRST_BOX="skipped"
+    return 0
+  fi
+
   STATUS_FIRST_BOX="pending"
   FIRST_BOX_OUTPUT_DIR="${target_repo}/sand/${CLIENT_ID}"
   FIRST_BOX_PRIVATE_REPO="${PRIVATE_PATH}"
@@ -657,8 +742,8 @@ run_first_box() {
     exit 1
   fi
   STATUS_FIRST_BOX="ok"
-  FIRST_BOX_OUTPUT_DIR="$(json_get "${output_file}" "payload.get('output_dir', '')" || printf '%s' "${FIRST_BOX_OUTPUT_DIR}")"
-  FIRST_BOX_PRIVATE_REPO="$(json_get "${output_file}" "payload.get('private_repo', {}).get('target_dir', '')" || printf '%s' "${FIRST_BOX_PRIVATE_REPO}")"
+  FIRST_BOX_OUTPUT_DIR="$(json_get "${output_file}" "output_dir" || printf '%s' "${FIRST_BOX_OUTPUT_DIR}")"
+  FIRST_BOX_PRIVATE_REPO="$(json_get "${output_file}" "private_repo.target_dir" || printf '%s' "${FIRST_BOX_PRIVATE_REPO}")"
 }
 
 run_make_target() {
@@ -680,6 +765,10 @@ run_verify() {
   local cmd=()
 
   if [[ "${VERIFY}" -ne 1 ]]; then
+    return 0
+  fi
+  if [[ "${RUN_FIRST_BOX}" -ne 1 ]]; then
+    STATUS_VERIFY="skipped"
     return 0
   fi
   STATUS_VERIFY="pending"
@@ -792,6 +881,10 @@ while [[ $# -gt 0 ]]; do
       RUN_BUILD=0
       shift
       ;;
+    --skip-first-box)
+      RUN_FIRST_BOX=0
+      shift
+      ;;
     --skip-up)
       RUN_UP=0
       shift
@@ -894,6 +987,7 @@ else
 fi
 
 hydrate_env "${REPO_DIR}"
+ensure_local_state_layout "${REPO_DIR}"
 run_host_bootstrap "${REPO_DIR}"
 run_tailscale_setup "${REPO_DIR}"
 

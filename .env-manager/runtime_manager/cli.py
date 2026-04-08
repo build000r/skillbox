@@ -178,7 +178,7 @@ def main() -> int:
     client_init_parser.add_argument(
         "--root-path",
         default=None,
-        help="Runtime path for the client root. Defaults to ${SKILLBOX_MONOSERVER_ROOT}/<client-id>.",
+        help="Runtime path for the client root. Defaults to ${SKILLBOX_MONOSERVER_ROOT}.",
     )
     client_init_parser.add_argument(
         "--default-cwd",
@@ -278,6 +278,11 @@ def main() -> int:
         help="Run acceptance first and persist compact acceptance evidence with the published client payload.",
     )
     client_publish_parser.add_argument(
+        "--deploy-artifact",
+        action="store_true",
+        help="Build a pinned source archive plus deploy.json for offline box installs.",
+    )
+    client_publish_parser.add_argument(
         "--commit",
         action="store_true",
         help="Create one local git commit in the target repo when the publish changes files.",
@@ -317,7 +322,7 @@ def main() -> int:
     onboard_parser.add_argument(
         "--root-path",
         default=None,
-        help="Runtime path for the client root. Defaults to ${SKILLBOX_MONOSERVER_ROOT}/<client-id>.",
+        help="Runtime path for the client root. Defaults to ${SKILLBOX_MONOSERVER_ROOT}.",
     )
     onboard_parser.add_argument(
         "--default-cwd",
@@ -366,7 +371,7 @@ def main() -> int:
     first_box_parser.add_argument(
         "--root-path",
         default=None,
-        help="Runtime path for the client root when scaffolding. Defaults to ${SKILLBOX_MONOSERVER_ROOT}/<client-id>.",
+        help="Runtime path for the client root when scaffolding. Defaults to ${SKILLBOX_MONOSERVER_ROOT}.",
     )
     first_box_parser.add_argument(
         "--default-cwd",
@@ -517,7 +522,7 @@ def main() -> int:
         if fmt == "json":
             emit_json(err)
         else:
-            print(f"ERROR: {err['error']['detail']}", file=sys.stderr)
+            print_local_runtime_error_text(err)
         return EXIT_ERROR
 
     if args.command == "client-init":
@@ -697,6 +702,7 @@ def main() -> int:
                 from_bundle_arg=args.from_bundle,
                 profiles=args.profile,
                 require_acceptance=args.acceptance,
+                write_deploy_artifact=args.deploy_artifact,
                 commit=args.commit,
             )
         except RuntimeError as exc:
@@ -716,6 +722,9 @@ def main() -> int:
             if payload["acceptance"]["present"]:
                 print(f"accepted_at: {payload['acceptance']['accepted_at']}")
                 print(f"acceptance_profiles: {', '.join(payload['acceptance']['active_profiles'])}")
+            if payload["deploy"]["present"]:
+                print(f"deploy_manifest: {payload['deploy']['manifest']}")
+                print(f"deploy_archive: {payload['deploy']['archive']}")
             if payload["commit_hash"]:
                 print(f"commit: {payload['commit_hash']}")
             print()
@@ -905,12 +914,12 @@ def main() -> int:
                     print(f"  - {session['session_id']}: {session.get('status', 'unknown')} {label}")
         return EXIT_OK
 
-    model = build_runtime_model(root_dir)
-    active_profiles = normalize_active_profiles(getattr(args, "profile", []))
-    active_clients = normalize_active_clients(model, getattr(args, "client", []))
-    model = filter_model(model, active_profiles, active_clients)
-
     try:
+        model = build_runtime_model(root_dir)
+        active_profiles = normalize_active_profiles(getattr(args, "profile", []))
+        active_clients = normalize_active_clients(model, getattr(args, "client", []))
+        model = filter_model(model, active_profiles, active_clients)
+
         if args.command == "render":
             if args.format == "json":
                 emit_json(model)
@@ -1024,10 +1033,7 @@ def main() -> int:
                 if args.format == "json":
                     emit_json(err_payload)
                 else:
-                    print(
-                        f"ERROR: {err_payload['error'].get('detail', '')}",
-                        file=sys.stderr,
-                    )
+                    print_local_runtime_error_text(err_payload)
                 return EXIT_ERROR
 
         requested_services = select_services(model, raw_service_ids)
@@ -1057,10 +1063,7 @@ def main() -> int:
                     emit_json(up_payload)
                 else:
                     if up_exit != EXIT_OK and "error" in up_payload:
-                        print(
-                            f"ERROR: {up_payload['error'].get('detail', '')}",
-                            file=sys.stderr,
-                        )
+                        print_local_runtime_error_text(up_payload)
                     else:
                         print_service_actions_text(up_payload)
                 return up_exit
@@ -1084,7 +1087,7 @@ def main() -> int:
                         if args.format == "json":
                             emit_json(err)
                         else:
-                            print(f"ERROR: {err['error']['detail']}", file=sys.stderr)
+                            print_local_runtime_error_text(err)
                         return EXIT_ERROR
 
             sync_actions = sync_runtime(model, dry_run=args.dry_run)

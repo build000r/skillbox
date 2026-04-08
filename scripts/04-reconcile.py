@@ -15,7 +15,7 @@ try:
 except ModuleNotFoundError:
     yaml = None
 
-from lib.runtime_model import build_runtime_model, host_path_to_absolute_path
+from lib.runtime_model import build_runtime_model
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -42,6 +42,7 @@ EXPECTED_FILES = [
     "scripts/lib/skill_bundle_filter.py",
     "workspace/sandbox.yaml",
     "workspace/dependencies.yaml",
+    "workspace/persistence.yaml",
     "workspace/runtime.yaml",
     "workspace/default-skills.manifest",
     "workspace/default-skills.sources.yaml",
@@ -52,9 +53,6 @@ EXPECTED_DIRECTORIES = [
     ".env-manager",
     "default-skills",
     "docker",
-    "home/.claude",
-    "home/.codex",
-    "logs",
     "repos",
     "scripts",
     "skills",
@@ -129,6 +127,7 @@ def read_bundle_names(path: Path) -> list[str]:
 def build_model() -> dict[str, Any]:
     sandbox_doc = load_yaml(WORKSPACE_DIR / "sandbox.yaml")
     dependencies_doc = load_yaml(WORKSPACE_DIR / "dependencies.yaml")
+    persistence_doc = load_yaml(WORKSPACE_DIR / "persistence.yaml")
     sources_doc = load_yaml(WORKSPACE_DIR / "default-skills.sources.yaml")
     runtime_model = build_runtime_model(ROOT_DIR)
     env_defaults = load_env_defaults(ROOT_DIR / ".env.example")
@@ -146,8 +145,21 @@ def build_model() -> dict[str, Any]:
 
     home_root = str(paths.get("claude_root", "")).rsplit("/.claude", 1)[0]
     monoserver_root = str(paths.get("monoserver_root", ""))
+    storage = runtime_model.get("storage") or {}
+    targets = persistence_doc.get("targets") or {}
+    local_target = targets.get("local") or {}
+    local_state_root = str(local_target.get("default_state_root") or "./.skillbox-state")
+
+    def join_state_root(relative_path: str) -> str:
+        return f"{local_state_root.rstrip('/')}/{relative_path}"
+
     expected_env = {
         "SKILLBOX_NAME": str(sandbox.get("name", "")),
+        "SKILLBOX_STORAGE_PROVIDER": str(local_target.get("provider") or "local"),
+        "SKILLBOX_STATE_ROOT": local_state_root,
+        "SKILLBOX_STORAGE_FILESYSTEM": "",
+        "SKILLBOX_STORAGE_REQUIRED": "false",
+        "SKILLBOX_STORAGE_MIN_FREE_GB": "0",
         "SKILLBOX_WORKSPACE_ROOT": str(paths.get("workspace_root", "")),
         "SKILLBOX_REPOS_ROOT": str(paths.get("repos_root", "")),
         "SKILLBOX_SKILLS_ROOT": str(paths.get("skills_root", "")),
@@ -155,7 +167,8 @@ def build_model() -> dict[str, Any]:
         "SKILLBOX_HOME_ROOT": home_root,
         "SKILLBOX_MONOSERVER_ROOT": monoserver_root,
         "SKILLBOX_CLIENTS_ROOT": f"{paths.get('workspace_root', '')}/workspace/clients",
-        "SKILLBOX_CLIENTS_HOST_ROOT": "./workspace/clients",
+        "SKILLBOX_CLIENTS_HOST_ROOT": join_state_root("clients"),
+        "SKILLBOX_MONOSERVER_HOST_ROOT": join_state_root("monoserver"),
         "SKILLBOX_API_PORT": str(ports.get("api", "")),
         "SKILLBOX_WEB_PORT": str(ports.get("web", "")),
         "SKILLBOX_SWIMMERS_PORT": str(ports.get("swimmers", "")),
@@ -184,39 +197,32 @@ def build_model() -> dict[str, Any]:
     runtime_env = {
         key: value
         for key, value in expected_env.items()
-        if key not in {"SKILLBOX_NAME", "SKILLBOX_CLIENTS_HOST_ROOT"}
+        if key not in {"SKILLBOX_NAME", "SKILLBOX_MONOSERVER_HOST_ROOT"}
     }
     runtime_env["SKILLBOX_CLIENTS_HOST_ROOT"] = expected_env["SKILLBOX_CLIENTS_ROOT"]
-    clients_host_root = host_path_to_absolute_path(
-        ROOT_DIR,
-        str(
-            (runtime_model.get("env") or {}).get("SKILLBOX_CLIENTS_HOST_ROOT")
-            or env_defaults.get("SKILLBOX_CLIENTS_HOST_ROOT", "./workspace/clients")
-        ),
-    )
     base_mounts = [
-        {"source": str(ROOT_DIR), "target": paths.get("workspace_root")},
-        {"source": str(clients_host_root), "target": expected_env["SKILLBOX_CLIENTS_ROOT"]},
-        {"source": str(ROOT_DIR / "home" / ".claude"), "target": paths.get("claude_root")},
-        {"source": str(ROOT_DIR / "home" / ".codex"), "target": paths.get("codex_root")},
+        {
+            "source": str(binding.get("resolved_host_path")),
+            "target": str(binding.get("runtime_path")),
+        }
+        for binding in storage.get("bindings") or []
+        if binding.get("resolved_host_path") and binding.get("runtime_path")
     ]
 
-    # Per-client overrides replace the fat monoserver mount with individual repo mounts.
+    # Per-client overrides replace the default /monoserver bind with client-scoped repo mounts.
     monoserver_layer = _resolve_monoserver_layer()
     if monoserver_layer != "docker-compose.monoserver.yml":
-        # Client-focused: read the override file to extract expected volume mounts.
         override_path = ROOT_DIR / monoserver_layer
         try:
             override_doc = yaml.safe_load(override_path.read_text(encoding="utf-8")) or {}
             ws_volumes = (override_doc.get("services", {}).get("workspace", {}).get("volumes") or [])
+            base_mounts = [mount for mount in base_mounts if mount["target"] != monoserver_root]
             for vol_str in ws_volumes:
                 parts = str(vol_str).split(":", 1)
                 if len(parts) == 2:
                     base_mounts.append({"source": parts[0], "target": parts[1]})
         except (OSError, Exception):
-            base_mounts.append({"source": str(ROOT_DIR.parent), "target": paths.get("monoserver_root")})
-    else:
-        base_mounts.append({"source": str(ROOT_DIR.parent), "target": paths.get("monoserver_root")})
+            pass
 
     expected_mounts = base_mounts
 
@@ -231,6 +237,7 @@ def build_model() -> dict[str, Any]:
             "entrypoints": sandbox.get("entrypoints") or [],
         },
         "dependencies": dependencies_doc,
+        "storage": storage,
         "env_defaults": env_defaults,
         "expected_env": expected_env,
         "runtime_env": runtime_env,
@@ -249,6 +256,7 @@ def build_model() -> dict[str, Any]:
         "runtime_manager": {
             "script": str(ROOT_DIR / ".env-manager" / "manage.py"),
             "manifest_file": runtime_model["manifest_file"],
+            "persistence_manifest_file": runtime_model.get("persistence_manifest_file"),
             "clients": runtime_model.get("clients") or [],
             "repos": runtime_model["repos"],
             "skills": runtime_model["skills"],
@@ -659,12 +667,14 @@ def check_runtime_manager_model(model: dict[str, Any]) -> CheckResult:
         message="internal runtime manager manifest resolved successfully",
         details={
             "manifest": repo_rel(Path(runtime_manager["manifest_file"])),
+            "persistence_manifest": repo_rel(Path(runtime_manager["persistence_manifest_file"])),
             "clients": len(runtime_manager.get("clients") or []),
             "repos": len(runtime_manager["repos"]),
             "skills": len(runtime_manager["skills"]),
             "services": len(runtime_manager["services"]),
             "logs": len(runtime_manager["logs"]),
             "checks": len(runtime_manager["checks"]),
+            "storage_bindings": len(model.get("storage", {}).get("bindings") or []),
         },
     )
 
@@ -748,6 +758,7 @@ def build_render_payload(with_compose: bool) -> dict[str, Any]:
         "expected_env": model["expected_env"],
         "expected_mounts": model["expected_mounts"],
         "dependencies": model["dependencies"],
+        "storage": model["storage"],
         "skill_sync": model["skill_sync"],
         "runtime_manager": model["runtime_manager"],
     }
@@ -772,6 +783,21 @@ def print_render_text(payload: dict[str, Any]) -> None:
     for mount in payload["expected_mounts"]:
         print(f"  {mount['source']} -> {mount['target']}")
     print()
+    storage = payload.get("storage") or {}
+    print("storage:")
+    print(f"  provider: {storage.get('provider') or 'unknown'}")
+    print(f"  state_root: {storage.get('state_root') or 'unknown'}")
+    print(f"  filesystem: {storage.get('filesystem') or '(unset)'}")
+    print(f"  required: {storage.get('required')}")
+    print(f"  min_free_gb: {storage.get('min_free_gb')}")
+    for binding in storage.get("bindings") or []:
+        print(
+            "  "
+            f"{binding.get('id')}: "
+            f"{binding.get('resolved_host_path')} -> {binding.get('runtime_path')} "
+            f"({binding.get('storage_class')})"
+        )
+    print()
     print("skill sync:")
     skill_sync = payload["skill_sync"]
     print(f"  script: {repo_rel(Path(skill_sync['script']))}")
@@ -786,6 +812,8 @@ def print_render_text(payload: dict[str, Any]) -> None:
     runtime_manager = payload["runtime_manager"]
     print(f"  script: {repo_rel(Path(runtime_manager['script']))}")
     print(f"  manifest: {repo_rel(Path(runtime_manager['manifest_file']))}")
+    if runtime_manager.get("persistence_manifest_file"):
+        print(f"  persistence: {repo_rel(Path(runtime_manager['persistence_manifest_file']))}")
     print(f"  clients: {len(runtime_manager.get('clients') or [])}")
     print(f"  repos: {len(runtime_manager['repos'])}")
     print(f"  skills: {len(runtime_manager['skills'])}")

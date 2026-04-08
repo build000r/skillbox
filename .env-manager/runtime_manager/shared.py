@@ -38,15 +38,19 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from lib.runtime_model import (  # noqa: E402
+    PERSISTENCE_ERROR_CODES,
+    PersistenceContractError,
     build_runtime_model,
     client_config_host_dir,
     client_config_runtime_dir,
     client_configs_host_root,
+    compile_persistence_summary,
     host_path_to_absolute_path,
     load_yaml,
     load_runtime_env,
     runtime_manifest_path,
     runtime_path_to_host_path,
+    storage_binding_by_id,
 )
 
 
@@ -82,10 +86,13 @@ CLIENT_PROJECT_RUNTIME_MODEL_REL = Path("runtime-model.json")
 CLIENT_PROJECTION_METADATA_REL = Path("projection.json")
 CLIENT_PUBLISH_VERSION = 1
 CLIENT_ACCEPTANCE_VERSION = 1
+CLIENT_DEPLOY_VERSION = 1
 CLIENT_PUBLISH_ROOT_REL = Path("clients")
 CLIENT_PUBLISH_CURRENT_REL = Path("current")
 CLIENT_PUBLISH_METADATA_REL = Path("publish.json")
 CLIENT_ACCEPTANCE_METADATA_REL = Path("acceptance.json")
+CLIENT_DEPLOY_METADATA_REL = Path("deploy.json")
+CLIENT_DEPLOY_ARTIFACTS_REL = Path("artifacts")
 DEFAULT_PRIVATE_REPO_REL = Path("..") / "skillbox-config"
 CLIENT_PLANNING_SKILL_TEMPLATE_REL = Path("workspace") / "client-planning-skills"
 CLIENT_SKILL_BUILDER_TEMPLATE_REL = Path("workspace") / "client-skill-builder-skills"
@@ -203,6 +210,19 @@ def classify_error(exc: RuntimeError, command: str) -> dict[str, Any]:
     """Map a RuntimeError to a structured error payload with contextual recovery hints."""
     msg = str(exc)
     lower_msg = msg.lower()
+    persistence_code = str(getattr(exc, "code", "") or "").strip()
+
+    if isinstance(exc, PersistenceContractError) or persistence_code in PERSISTENCE_ERROR_CODES:
+        return structured_error(
+            msg,
+            error_type=persistence_code or "PERSISTENCE_CONFIG_INVALID",
+            recoverable=True,
+            recovery_hint=(
+                "Fix workspace/persistence.yaml or the related SKILLBOX_STORAGE_* / "
+                "SKILLBOX_STATE_ROOT values, then retry."
+            ),
+            next_actions=["render --format json", "doctor --format json"],
+        )
 
     if "client-init requires" in msg:
         return structured_error(
@@ -1821,7 +1841,7 @@ def scaffold_client_overlay(
     client_id = validate_client_id(client_id)
     env_values = load_runtime_env(root_dir)
     client_label = (label or titleize_client_id(client_id)).strip()
-    client_root = (root_path or f"${{SKILLBOX_MONOSERVER_ROOT}}/{client_id}").strip()
+    client_root = (root_path or "${SKILLBOX_MONOSERVER_ROOT}").strip()
     client_default_cwd = (default_cwd or client_root).strip()
 
     if blueprint_name and not blueprint_assignments:
@@ -2681,6 +2701,7 @@ def collect_client_projection_files(
         Path(".env.example"),
         Path("workspace") / "sandbox.yaml",
         Path("workspace") / "dependencies.yaml",
+        Path("workspace") / "persistence.yaml",
     ):
         source_path = root_dir / optional_rel_path
         if source_path.is_file():
@@ -2775,6 +2796,18 @@ def collect_client_projection_files(
             )
 
     sanitized_model = sanitize_projection_value(copy.deepcopy(model))
+    if isinstance(sanitized_model.get("storage"), dict):
+        storage_summary = sanitized_model["storage"]
+        raw_state_root = str(storage_summary.get("raw_state_root") or "").strip()
+        if raw_state_root:
+            storage_summary["state_root"] = raw_state_root
+        else:
+            storage_summary.pop("state_root", None)
+    persistence_manifest = root_dir / "workspace" / "persistence.yaml"
+    if persistence_manifest.is_file():
+        sanitized_model["persistence_manifest_file"] = "/workspace/persistence.yaml"
+    else:
+        sanitized_model.pop("persistence_manifest_file", None)
     add_projection_text_file(
         files,
         CLIENT_PROJECT_RUNTIME_MODEL_REL,
@@ -2898,8 +2931,20 @@ def resolve_optional_host_dir(root_dir: Path, raw_path: str | None, *, default_r
 def inferred_private_target_dir(root_dir: Path, env_values: dict[str, str] | None = None) -> Path | None:
     resolved_env = env_values or load_runtime_env(root_dir)
     clients_root = client_configs_host_root(root_dir, resolved_env).resolve()
-    default_clients_root = (root_dir / "workspace" / "clients").resolve()
-    if clients_root == default_clients_root:
+    default_clients_roots = {
+        (root_dir / "workspace" / "clients").resolve(),
+    }
+    try:
+        storage = compile_persistence_summary(root_dir, resolved_env)
+    except RuntimeError:
+        storage = None
+    binding = storage_binding_by_id(storage, "clients-root")
+    if binding is not None:
+        relative_path = str(binding.get("relative_path") or "").strip()
+        state_root = str(storage.get("state_root") or "").strip() if storage else ""
+        if relative_path and state_root:
+            default_clients_roots.add((Path(state_root) / Path(relative_path)).resolve())
+    if clients_root in default_clients_roots:
         return None
     return clients_root.parent
 
@@ -3080,7 +3125,7 @@ def normalize_client_overlay_shape(root_dir: Path, overlay_dir: Path) -> list[st
     client_label = str(client_doc.get("label") or titleize_client_id(client_id)).strip() or titleize_client_id(client_id)
     client_default_cwd = str(
         client_doc.get("default_cwd")
-        or f"${{SKILLBOX_MONOSERVER_ROOT}}/{client_id}"
+        or "${SKILLBOX_MONOSERVER_ROOT}"
     ).strip()
     client_doc["id"] = client_id
     client_doc["label"] = client_label

@@ -243,12 +243,115 @@ def build_client_acceptance_metadata(
     }
 
 
-def client_publish_paths(target_dir: Path, client_id: str) -> tuple[Path, Path, Path, Path]:
+CLIENT_DEPLOY_MATCH_FIELDS = (
+    "version",
+    "client_id",
+    "source_commit",
+    "payload_tree_sha256",
+    "active_profiles",
+    "archive",
+    "archive_sha256",
+)
+
+
+def build_client_deploy_metadata(
+    bundle: dict[str, Any],
+    *,
+    client_id: str,
+    source_commit: str,
+    archive_rel: str,
+    archive_sha256: str,
+) -> dict[str, Any]:
+    projection_payload = bundle["projection"]
+    return {
+        "version": CLIENT_DEPLOY_VERSION,
+        "client_id": client_id,
+        "source_commit": source_commit,
+        "payload_tree_sha256": bundle["payload_tree_sha256"],
+        "active_profiles": projection_payload.get("active_profiles", []),
+        "archive": archive_rel,
+        "archive_sha256": archive_sha256,
+    }
+
+
+def deploy_metadata_matches(
+    actual_payload: dict[str, Any] | None,
+    expected_payload: dict[str, Any],
+) -> bool:
+    if actual_payload is None:
+        return False
+    for field in CLIENT_DEPLOY_MATCH_FIELDS:
+        if actual_payload.get(field) != expected_payload.get(field):
+            return False
+    return True
+
+
+def deploy_metadata_summary(
+    target_dir: Path,
+    client_id: str,
+    deploy_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "present": deploy_payload is not None,
+        "manifest": None,
+        "archive": None,
+        "archive_sha256": None,
+        "source_commit": None,
+        "payload_tree_sha256": None,
+    }
+    if deploy_payload is None:
+        return summary
+
+    client_root = target_dir / CLIENT_PUBLISH_ROOT_REL / client_id
+    archive_rel = str(deploy_payload.get("archive") or "").strip()
+    archive_path = client_root / Path(*PurePosixPath(archive_rel).parts) if archive_rel else None
+    summary.update({
+        "manifest": (CLIENT_PUBLISH_ROOT_REL / client_id / CLIENT_DEPLOY_METADATA_REL).as_posix(),
+        "archive": archive_path.relative_to(target_dir).as_posix() if archive_path is not None else None,
+        "archive_sha256": deploy_payload.get("archive_sha256"),
+        "source_commit": deploy_payload.get("source_commit"),
+        "payload_tree_sha256": deploy_payload.get("payload_tree_sha256"),
+    })
+    return summary
+
+
+def write_client_source_archive(
+    root_dir: Path,
+    archive_path: Path,
+    *,
+    source_commit: str,
+) -> None:
+    ensure_directory(archive_path.parent, dry_run=False)
+    result = run_command(
+        [
+            "git",
+            "archive",
+            "--format=tar.gz",
+            "--prefix=skillbox/",
+            f"--output={archive_path}",
+            source_commit,
+        ],
+        cwd=root_dir,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "git archive failed")
+
+
+def client_publish_paths(target_dir: Path, client_id: str) -> tuple[Path, Path, Path, Path, Path, Path]:
     client_root = target_dir / CLIENT_PUBLISH_ROOT_REL / client_id
     current_dir = client_root / CLIENT_PUBLISH_CURRENT_REL
     publish_metadata_path = client_root / CLIENT_PUBLISH_METADATA_REL
     acceptance_metadata_path = client_root / CLIENT_ACCEPTANCE_METADATA_REL
-    return client_root, current_dir, publish_metadata_path, acceptance_metadata_path
+    deploy_metadata_path = client_root / CLIENT_DEPLOY_METADATA_REL
+    deploy_artifacts_dir = client_root / CLIENT_DEPLOY_ARTIFACTS_REL
+    return (
+        client_root,
+        current_dir,
+        publish_metadata_path,
+        acceptance_metadata_path,
+        deploy_metadata_path,
+        deploy_artifacts_dir,
+    )
 
 
 def bundle_matches_publish_target(
@@ -358,6 +461,7 @@ def publish_client_bundle(
     from_bundle_arg: str | None = None,
     profiles: list[str] | None = None,
     require_acceptance: bool = False,
+    write_deploy_artifact: bool = False,
     commit: bool = False,
 ) -> dict[str, Any]:
     from .workflows import run_manage_json_command
@@ -428,10 +532,22 @@ def publish_client_bundle(
             if acceptance_run_payload is not None
             else None
         )
-        client_root, current_dir, publish_metadata_path, acceptance_metadata_path = client_publish_paths(target_dir, cid)
+        (
+            client_root,
+            current_dir,
+            publish_metadata_path,
+            acceptance_metadata_path,
+            deploy_metadata_path,
+            deploy_artifacts_dir,
+        ) = client_publish_paths(target_dir, cid)
         current_acceptance_metadata = (
             load_json_file(acceptance_metadata_path)
             if acceptance_metadata_path.is_file()
+            else None
+        )
+        current_deploy_metadata = (
+            load_json_file(deploy_metadata_path)
+            if deploy_metadata_path.is_file()
             else None
         )
         payload_changed = not bundle_matches_publish_target(bundle, current_dir, publish_metadata_path)
@@ -444,7 +560,62 @@ def publish_client_bundle(
             and acceptance_metadata is None
             and acceptance_metadata_path.is_file()
         )
-        changed = payload_changed or acceptance_changed or acceptance_removed
+        deploy_metadata: dict[str, Any] | None = None
+        deploy_changed = False
+        deploy_removed = False
+
+        if write_deploy_artifact:
+            if not source_commit:
+                raise RuntimeError(
+                    "client-publish --deploy-artifact requires a git-backed source checkout with a resolvable HEAD commit."
+                )
+            archive_name = f"skillbox-{source_commit[:12]}.tar.gz"
+            archive_rel = (CLIENT_DEPLOY_ARTIFACTS_REL / archive_name).as_posix()
+            archive_path = deploy_artifacts_dir / archive_name
+            archive_sha256 = file_sha256(archive_path) if archive_path.is_file() else ""
+            candidate_deploy_metadata = build_client_deploy_metadata(
+                bundle,
+                client_id=cid,
+                source_commit=source_commit,
+                archive_rel=archive_rel,
+                archive_sha256=archive_sha256,
+            )
+            deploy_current = archive_path.is_file() and deploy_metadata_matches(
+                current_deploy_metadata,
+                candidate_deploy_metadata,
+            )
+            if deploy_current:
+                deploy_metadata = candidate_deploy_metadata
+            else:
+                remove_path(deploy_artifacts_dir)
+                write_client_source_archive(root_dir, archive_path, source_commit=source_commit)
+                archive_sha256 = file_sha256(archive_path)
+                deploy_metadata = build_client_deploy_metadata(
+                    bundle,
+                    client_id=cid,
+                    source_commit=source_commit,
+                    archive_rel=archive_rel,
+                    archive_sha256=archive_sha256,
+                )
+                deploy_changed = True
+        elif current_deploy_metadata is not None:
+            current_archive_rel = str(current_deploy_metadata.get("archive") or "").strip()
+            current_archive_path = (
+                client_root / Path(*PurePosixPath(current_archive_rel).parts)
+                if current_archive_rel
+                else None
+            )
+            deploy_stale = (
+                str(current_deploy_metadata.get("payload_tree_sha256") or "").strip().lower()
+                != str(bundle["payload_tree_sha256"]).strip().lower()
+                or str(current_deploy_metadata.get("source_commit") or "").strip() != str(source_commit or "").strip()
+                or current_archive_path is None
+                or not current_archive_path.is_file()
+            )
+            if deploy_stale:
+                deploy_removed = True
+
+        changed = payload_changed or acceptance_changed or acceptance_removed or deploy_changed or deploy_removed
 
         commit_hash: str | None = None
         if changed:
@@ -466,6 +637,17 @@ def publish_client_bundle(
             actions.append(f"publish-current: {repo_rel(target_dir, current_dir)}")
             actions.append(f"write-file: {repo_rel(target_dir, publish_metadata_path)}")
 
+            if deploy_metadata is not None:
+                write_json_file(deploy_metadata_path, deploy_metadata)
+                archive_path = client_root / Path(*PurePosixPath(str(deploy_metadata["archive"])).parts)
+                actions.append(f"write-file: {repo_rel(target_dir, archive_path)}")
+                actions.append(f"write-file: {repo_rel(target_dir, deploy_metadata_path)}")
+            elif deploy_removed:
+                remove_path(deploy_artifacts_dir)
+                remove_path(deploy_metadata_path)
+                actions.append(f"remove-path: {repo_rel(target_dir, deploy_artifacts_dir)}")
+                actions.append(f"remove-file: {repo_rel(target_dir, deploy_metadata_path)}")
+
             if commit:
                 committed = commit_client_publish(target_dir, cid)
                 if committed:
@@ -477,6 +659,9 @@ def publish_client_bundle(
         final_acceptance_metadata = acceptance_metadata
         if final_acceptance_metadata is None and not payload_changed:
             final_acceptance_metadata = current_acceptance_metadata
+        final_deploy_metadata = deploy_metadata
+        if final_deploy_metadata is None and not deploy_removed:
+            final_deploy_metadata = current_deploy_metadata
 
         return {
             "client_id": cid,
@@ -490,6 +675,7 @@ def publish_client_bundle(
             "payload_tree_sha256": bundle["payload_tree_sha256"],
             "file_count": len(bundle["all_entries"]),
             "acceptance": summarize_acceptance_metadata(final_acceptance_metadata),
+            "deploy": deploy_metadata_summary(target_dir, cid, final_deploy_metadata),
             "actions": actions,
             "next_actions": next_actions_for_client_publish(cid),
         }
@@ -538,7 +724,14 @@ def diff_client_bundle(
 
         candidate_bundle = load_client_projection_bundle(bundle_dir, expected_client_id=cid)
         candidate_runtime_model = bundle_runtime_model(candidate_bundle)
-        client_root, current_dir, publish_metadata_path, acceptance_metadata_path = client_publish_paths(target_dir, cid)
+        (
+            client_root,
+            current_dir,
+            publish_metadata_path,
+            acceptance_metadata_path,
+            _deploy_metadata_path,
+            _deploy_artifacts_dir,
+        ) = client_publish_paths(target_dir, cid)
         actions.append(f"compare-current: {repo_rel(target_dir, current_dir)}")
 
         current_bundle: dict[str, Any] | None = None

@@ -4,6 +4,7 @@ from .shared import *
 from .validation import *
 from .runtime_ops import *
 from .context_rendering import *
+from .text_renderers import print_local_runtime_error_text
 
 def run_onboard(
     *,
@@ -547,10 +548,18 @@ def selected_mcp_server_configs(root_dir: Path, model: dict[str, Any]) -> tuple[
     server_configs = load_mcp_server_configs(root_dir)
     selected: dict[str, Any] = {}
     server_names: list[str] = []
+    services_by_id = {str(s.get("id", "")).strip(): s for s in model.get("services") or []}
     for request in requested_mcp_servers(model):
         server_name = str(request["name"])
+        service_id = request.get("service_id")
         config = server_configs.get(server_name)
         if not isinstance(config, dict):
+            if isinstance(service_id, str) and service_id:
+                backing = services_by_id.get(service_id)
+                if backing and not backing.get("required", True):
+                    manageable, _reason = service_supports_lifecycle(backing, model)
+                    if not manageable:
+                        continue
             raise RuntimeError(f"MCP server '{server_name}' is not configured in {MCP_CONFIG_REL}.")
         selected[server_name] = translate_mcp_server_config(root_dir, config)
         server_names.append(server_name)
@@ -1076,7 +1085,7 @@ def run_focus(
         if is_json:
             emit_json(payload)
         else:
-            print(profile_errors[0]["error"]["detail"], file=sys.stderr)
+            print_local_runtime_error_text(profile_errors[0])
         return EXIT_ERROR
 
     # --- 0. Compose override ---------------------------------------------------
@@ -1155,6 +1164,8 @@ def run_focus(
             payload.update(classify_error(exc, "focus"))
         if is_json:
             emit_json(payload)
+        elif (payload.get("error") or {}).get("type", "").startswith("LOCAL_RUNTIME_"):
+            print_local_runtime_error_text(payload)
         return EXIT_ERROR
 
     # --- 2b. Verify bridge outputs after bootstrap ----------------------------
@@ -1175,6 +1186,8 @@ def run_focus(
             ))
             if is_json:
                 emit_json(payload)
+            else:
+                print_local_runtime_error_text(payload)
             return EXIT_ERROR
         step("bridge-verify", "ok", {"bridges": len(bridges)})
 

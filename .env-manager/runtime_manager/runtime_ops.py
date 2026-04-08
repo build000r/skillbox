@@ -2,6 +2,150 @@ from __future__ import annotations
 
 from .shared import *
 from .validation import *
+from lib.runtime_model import (
+    PERSISTENT_PATH_OFF_STATE_ROOT,
+    STATE_ROOT_LOW_SPACE,
+    STATE_ROOT_MISSING,
+    STATE_ROOT_WRONG_FILESYSTEM,
+    STATE_ROOT_WRONG_OWNERSHIP,
+)
+
+
+def _storage_filesystem_type(path: Path) -> str:
+    result = run_command(["findmnt", "-no", "FSTYPE", "--target", str(path)])
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def validate_storage_posture(model: dict[str, Any]) -> list[CheckResult]:
+    storage = model.get("storage") or {}
+    bindings = storage.get("bindings") or []
+    if not isinstance(storage, dict) or not bindings:
+        return []
+
+    provider = str(storage.get("provider") or "local").strip() or "local"
+    required = bool(storage.get("required"))
+    expected_filesystem = str(storage.get("filesystem") or "").strip()
+    min_free_gb = float(storage.get("min_free_gb") or 0.0)
+    state_root = Path(str(storage.get("state_root") or "")).expanduser()
+    persistent_bindings = [
+        binding for binding in bindings
+        if str(binding.get("storage_class") or "").strip() == "persistent"
+    ]
+
+    if not str(state_root):
+        return [
+            CheckResult(
+                status="fail",
+                code=STATE_ROOT_MISSING,
+                message="storage summary does not include a state_root",
+            )
+        ]
+
+    results: list[CheckResult] = []
+    missing_status = "fail" if provider == "digitalocean" or required else "warn"
+    if not state_root.exists():
+        results.append(
+            CheckResult(
+                status=missing_status,
+                code=STATE_ROOT_MISSING,
+                message="state root is missing",
+                details={"state_root": str(state_root), "provider": provider},
+            )
+        )
+        return results
+
+    if provider == "digitalocean" and required and not state_root.is_mount():
+        results.append(
+            CheckResult(
+                status="fail",
+                code=STATE_ROOT_MISSING,
+                message="DigitalOcean state root exists but is not mounted",
+                details={"state_root": str(state_root)},
+            )
+        )
+
+    if provider == "digitalocean" and expected_filesystem:
+        actual_filesystem = _storage_filesystem_type(state_root)
+        if actual_filesystem and actual_filesystem != expected_filesystem:
+            results.append(
+                CheckResult(
+                    status="fail",
+                    code=STATE_ROOT_WRONG_FILESYSTEM,
+                    message="state root filesystem does not match policy",
+                    details={
+                        "state_root": str(state_root),
+                        "expected_filesystem": expected_filesystem,
+                        "actual_filesystem": actual_filesystem,
+                    },
+                )
+            )
+
+    if not os.access(state_root, os.W_OK | os.X_OK):
+        results.append(
+            CheckResult(
+                status="fail",
+                code=STATE_ROOT_WRONG_OWNERSHIP,
+                message="state root is not writable by the current runtime user",
+                details={"state_root": str(state_root)},
+            )
+        )
+
+    usage = shutil.disk_usage(state_root)
+    free_gb = round(usage.free / (1024 ** 3), 2)
+    if free_gb < min_free_gb:
+        results.append(
+            CheckResult(
+                status="fail",
+                code=STATE_ROOT_LOW_SPACE,
+                message="state root free space is below the configured minimum",
+                details={
+                    "state_root": str(state_root),
+                    "required_free_gb": min_free_gb,
+                    "actual_free_gb": free_gb,
+                },
+            )
+        )
+
+    state_root_resolved = state_root.resolve()
+    for binding in persistent_bindings:
+        resolved_host_path = Path(str(binding.get("resolved_host_path") or "")).expanduser()
+        override_env = str(binding.get("override_env") or "").strip()
+        try:
+            resolved_host_path.resolve().relative_to(state_root_resolved)
+        except ValueError:
+            if override_env:
+                continue
+            results.append(
+                CheckResult(
+                    status="fail",
+                    code=PERSISTENT_PATH_OFF_STATE_ROOT,
+                    message="persistent binding resolves outside SKILLBOX_STATE_ROOT",
+                    details={
+                        "binding_id": str(binding.get("id") or ""),
+                        "state_root": str(state_root),
+                        "resolved_host_path": str(resolved_host_path),
+                    },
+                )
+            )
+
+    if results:
+        return results
+
+    return [
+        CheckResult(
+            status="pass",
+            code="storage-posture",
+            message="storage posture matches the compiled persistence contract",
+            details={
+                "provider": provider,
+                "state_root": str(state_root),
+                "persistent_bindings": [str(binding.get("id") or "") for binding in persistent_bindings],
+                "free_gb": free_gb,
+            },
+        )
+    ]
 
 def normalize_file_mode(raw_mode: Any, default: int = 0o600) -> int:
     if raw_mode is None:
@@ -486,6 +630,7 @@ def doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
         + validate_skill_repo_sets(model)
         + validate_skill_locks_and_state(model)
         + validate_task_state(model)
+        + validate_storage_posture(model)
         + validate_bridges(model)
         + parity_results
     )
@@ -2924,6 +3069,7 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
         "active_clients": model.get("active_clients") or [],
         "default_client": (model.get("selection") or {}).get("default_client"),
         "active_profiles": model.get("active_profiles") or [],
+        "storage": copy.deepcopy(model.get("storage") or {}),
         "repos": repo_statuses,
         "artifacts": artifact_statuses,
         "env_files": env_file_statuses,

@@ -6,3 +6,9 @@ ssh_user: skillbox
 tailscale_hostname_prefix: skillbox
 skillbox_repo: https://github.com/build000r/skillbox.git
 skillbox_branch: main
+storage:
+  provider: digitalocean
+  mount_path: /srv/skillbox
+  filesystem: ext4
+  required: true
+  min_free_gb: 20

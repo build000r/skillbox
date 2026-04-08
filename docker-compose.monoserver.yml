@@ -3,10 +3,10 @@
 services:
   workspace:
     volumes:
-      - ${SKILLBOX_MONOSERVER_HOST_ROOT:-..}:${SKILLBOX_MONOSERVER_ROOT:-/monoserver}
+      - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/monoserver:${SKILLBOX_MONOSERVER_ROOT:-/monoserver}
   api:
     volumes:
-      - ${SKILLBOX_MONOSERVER_HOST_ROOT:-..}:${SKILLBOX_MONOSERVER_ROOT:-/monoserver}
+      - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/monoserver:${SKILLBOX_MONOSERVER_ROOT:-/monoserver}
   web:
     volumes:
-      - ${SKILLBOX_MONOSERVER_HOST_ROOT:-..}:${SKILLBOX_MONOSERVER_ROOT:-/monoserver}
+      - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/monoserver:${SKILLBOX_MONOSERVER_ROOT:-/monoserver}

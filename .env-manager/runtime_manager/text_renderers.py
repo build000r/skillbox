@@ -205,6 +205,38 @@ def print_status_text(status_payload: dict[str, Any]) -> None:
         print(f"  - {check['id']}: {state}")
 
 
+def print_local_runtime_error_text(err: dict[str, Any]) -> None:
+    """Render a LOCAL_RUNTIME_* error envelope to stderr.
+
+    Mirrors the structured fields that JSON consumers already see
+    (``error.type``, ``error.detail``, ``error.requested_mode``,
+    ``error.blocked_services``, ``error.next_action``) so text-mode
+    operators are not left with a single opaque ``ERROR: <detail>`` line.
+    Optional fields are omitted entirely when empty so the output stays
+    quiet for envelopes that do not carry them (e.g. mode pre-validation
+    has no blocked services).
+    """
+    error_block = (err or {}).get("error") or {}
+    code = str(error_block.get("type") or "").strip()
+    detail = str(error_block.get("detail") or error_block.get("message") or "").strip()
+    headline = f"ERROR [{code}]: {detail}" if code else f"ERROR: {detail}"
+    print(headline, file=sys.stderr)
+
+    requested_mode = str(error_block.get("requested_mode") or "").strip()
+    if requested_mode:
+        print(f"requested mode: {requested_mode}", file=sys.stderr)
+
+    blocked = error_block.get("blocked_services") or []
+    if blocked:
+        print("blocked services:", file=sys.stderr)
+        for sid in blocked:
+            print(f"  - {sid}", file=sys.stderr)
+
+    next_action = str(error_block.get("next_action") or "").strip()
+    if next_action:
+        print(f"next action: {next_action}", file=sys.stderr)
+
+
 def print_service_actions_text(payload: dict[str, Any]) -> None:
     sync_actions = payload.get("sync_actions") or []
     if sync_actions:

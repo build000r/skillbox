@@ -1,6 +1,11 @@
 name: ${SKILLBOX_NAME:-skillbox}
 
 x-runtime-env: &runtime_env
+  SKILLBOX_STORAGE_PROVIDER: ${SKILLBOX_STORAGE_PROVIDER:-local}
+  SKILLBOX_STATE_ROOT: ${SKILLBOX_STATE_ROOT:-./.skillbox-state}
+  SKILLBOX_STORAGE_FILESYSTEM: ${SKILLBOX_STORAGE_FILESYSTEM:-}
+  SKILLBOX_STORAGE_REQUIRED: ${SKILLBOX_STORAGE_REQUIRED:-false}
+  SKILLBOX_STORAGE_MIN_FREE_GB: ${SKILLBOX_STORAGE_MIN_FREE_GB:-0}
   SKILLBOX_WORKSPACE_ROOT: /workspace
   SKILLBOX_REPOS_ROOT: /workspace/repos
   SKILLBOX_SKILLS_ROOT: /workspace/skills
@@ -51,10 +56,11 @@ services:
       <<: *runtime_env
     volumes:
       - .:/workspace
-      - ${SKILLBOX_CLIENTS_HOST_ROOT:-./workspace/clients}:${SKILLBOX_CLIENTS_ROOT:-/workspace/workspace/clients}
-      - ./home/.claude:/home/sandbox/.claude
-      - ./home/.codex:/home/sandbox/.codex
-      - ./home/.local:/home/sandbox/.local
+      - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/clients:${SKILLBOX_CLIENTS_ROOT:-/workspace/workspace/clients}
+      - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/logs:/workspace/logs
+      - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.claude:/home/sandbox/.claude
+      - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.codex:/home/sandbox/.codex
+      - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.local:/home/sandbox/.local
     command: ["sleep", "infinity"]
 
   api:
@@ -72,10 +78,11 @@ services:
       <<: *runtime_env
     volumes:
       - .:/workspace
-      - ${SKILLBOX_CLIENTS_HOST_ROOT:-./workspace/clients}:${SKILLBOX_CLIENTS_ROOT:-/workspace/workspace/clients}
-      - ./home/.claude:/home/sandbox/.claude
-      - ./home/.codex:/home/sandbox/.codex
-      - ./home/.local:/home/sandbox/.local
+      - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/clients:${SKILLBOX_CLIENTS_ROOT:-/workspace/workspace/clients}
+      - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/logs:/workspace/logs
+      - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.claude:/home/sandbox/.claude
+      - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.codex:/home/sandbox/.codex
+      - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.local:/home/sandbox/.local
     command:
       - bash
       - -lc
@@ -100,10 +107,11 @@ services:
       <<: *runtime_env
     volumes:
       - .:/workspace
-      - ${SKILLBOX_CLIENTS_HOST_ROOT:-./workspace/clients}:${SKILLBOX_CLIENTS_ROOT:-/workspace/workspace/clients}
-      - ./home/.claude:/home/sandbox/.claude
-      - ./home/.codex:/home/sandbox/.codex
-      - ./home/.local:/home/sandbox/.local
+      - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/clients:${SKILLBOX_CLIENTS_ROOT:-/workspace/workspace/clients}
+      - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/logs:/workspace/logs
+      - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.claude:/home/sandbox/.claude
+      - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.codex:/home/sandbox/.codex
+      - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.local:/home/sandbox/.local
     command:
       - bash
       - -lc

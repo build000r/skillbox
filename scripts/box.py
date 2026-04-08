@@ -2,7 +2,7 @@
 """Skillbox box lifecycle manager.
 
 Orchestrates DigitalOcean droplets with Tailscale enrollment for
-full create → bootstrap → deploy → onboard → drain → destroy lifecycle.
+full create → bootstrap → deploy → first-box → drain → destroy lifecycle.
 
 Runs from the operator's machine (not inside the container).
 Uses doctl, ssh, and tailscale CLIs — no SDK dependencies.
@@ -10,7 +10,9 @@ Uses doctl, ssh, and tailscale CLIs — no SDK dependencies.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -27,6 +29,9 @@ REPO_ROOT = SCRIPT_DIR.parent
 PROFILES_DIR = REPO_ROOT / "workspace" / "box-profiles"
 BOOTSTRAP_SCRIPT = SCRIPT_DIR / "01-bootstrap-do.sh"
 TAILSCALE_SCRIPT = SCRIPT_DIR / "02-install-tailscale.sh"
+UPGRADE_SCRIPT = SCRIPT_DIR / "06-upgrade-release.sh"
+INSTALL_SCRIPT = REPO_ROOT / "install.sh"
+DEFAULT_BOX_CLIENT_ROOT = "${SKILLBOX_MONOSERVER_ROOT}"
 
 
 def inventory_path() -> Path:
@@ -44,6 +49,7 @@ STATES = [
     "bootstrapping",
     "enrolling",
     "deploying",
+    "acceptance",
     "onboarding",
     "ready",
     "draining",
@@ -54,7 +60,8 @@ VALID_TRANSITIONS = {
     "creating": ["bootstrapping", "destroyed"],
     "bootstrapping": ["enrolling", "destroyed"],
     "enrolling": ["deploying", "destroyed"],
-    "deploying": ["onboarding", "destroyed"],
+    "deploying": ["acceptance", "onboarding", "destroyed"],
+    "acceptance": ["ready", "destroyed"],
     "onboarding": ["ready", "destroyed"],
     "ready": ["draining", "destroyed"],
     "draining": ["destroyed"],
@@ -66,6 +73,7 @@ DEFAULT_SSH_OPTS = [
     "-o", "BatchMode=yes",
 ]
 REMOTE_ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+SHA256_HEX_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")
 
 
 def shell_join(args: list[str]) -> str:
@@ -102,31 +110,75 @@ def build_deploy_command(profile: "BoxProfile") -> str:
     ])
 
 
-def build_onboard_manage_argv(box_id: str, blueprint: str | None, set_args: list[str]) -> list[str]:
+def build_release_install_args(
+    client_id: str,
+    release: "DeployRelease",
+    *,
+    remote_archive_path: str,
+    repo_dir: str,
+    private_path: str,
+) -> list[str]:
+    return [
+        "--offline", remote_archive_path,
+        "--sha256", release.archive_sha256,
+        "--repo-dir", repo_dir,
+        "--private-path", private_path,
+        "--client", client_id,
+        "--skip-first-box",
+        "--no-gum",
+    ]
+
+
+def build_first_box_manage_argv(
+    box_id: str,
+    *,
+    private_path: str,
+    active_profiles: list[str],
+    blueprint: str | None,
+    set_args: list[str],
+) -> list[str]:
     argv = [
-        "docker",
-        "compose",
-        "exec",
-        "-T",
-        "workspace",
         "python3",
         ".env-manager/manage.py",
-        "onboard",
+        "first-box",
         box_id,
+        "--private-path",
+        private_path,
+        "--root-path",
+        DEFAULT_BOX_CLIENT_ROOT,
+        "--default-cwd",
+        DEFAULT_BOX_CLIENT_ROOT,
+        "--format",
+        "json",
     ]
+    argv.extend(manage_profile_args(active_profiles))
     if blueprint:
         argv.extend(["--blueprint", blueprint])
     for set_arg in set_args:
         argv.extend(["--set", set_arg])
-    argv.extend(["--format", "json"])
     return argv
 
 
-def build_onboard_command(box_id: str, blueprint: str | None, set_args: list[str]) -> str:
+def build_first_box_command(
+    box_id: str,
+    *,
+    repo_dir: str,
+    private_path: str,
+    active_profiles: list[str],
+    blueprint: str | None,
+    set_args: list[str],
+) -> str:
     return " && ".join([
-        "cd",
-        "cd skillbox",
-        shell_join(build_onboard_manage_argv(box_id, blueprint, set_args)),
+        shell_join(["cd", repo_dir]),
+        shell_join(
+            build_first_box_manage_argv(
+                box_id,
+                private_path=private_path,
+                active_profiles=active_profiles,
+                blueprint=blueprint,
+                set_args=set_args,
+            )
+        ),
     ])
 
 # ---------------------------------------------------------------------------
@@ -220,9 +272,20 @@ def ssh_cmd(user: str, host: str, command: str, *, timeout: int = 300) -> subpro
     )
 
 
-def ssh_script(user: str, host: str, script_path: Path, env_vars: dict[str, str] | None = None, *, timeout: int = 600) -> subprocess.CompletedProcess[str]:
+def ssh_script(
+    user: str,
+    host: str,
+    script_path: Path,
+    env_vars: dict[str, str] | None = None,
+    *,
+    script_args: list[str] | None = None,
+    timeout: int = 600,
+) -> subprocess.CompletedProcess[str]:
     """Run a local script on a remote host via ssh + stdin."""
-    remote_cmd = build_remote_env_command(["bash", "-s"], env_vars)
+    remote_argv = ["bash", "-s"]
+    if script_args:
+        remote_argv.extend(["--", *script_args])
+    remote_cmd = build_remote_env_command(remote_argv, env_vars)
     with script_path.open("r") as f:
         return subprocess.run(
             ["ssh", *DEFAULT_SSH_OPTS, f"{user}@{host}", remote_cmd],
@@ -232,6 +295,14 @@ def ssh_script(user: str, host: str, script_path: Path, env_vars: dict[str, str]
             check=False,
             timeout=timeout,
         )
+
+
+def scp_file(local_path: Path, user: str, host: str, remote_path: str, *, timeout: int = 600) -> subprocess.CompletedProcess[str]:
+    return run(
+        ["scp", *DEFAULT_SSH_OPTS, str(local_path), f"{user}@{host}:{remote_path}"],
+        check=False,
+        timeout=timeout,
+    )
 
 
 def wait_for_ssh(host: str, user: str = "root", *, max_wait: int = 120, interval: int = 5) -> bool:
@@ -259,6 +330,197 @@ class BoxProfile:
     tailscale_hostname_prefix: str = "skillbox"
     skillbox_repo: str = "https://github.com/build000r/skillbox.git"
     skillbox_branch: str = "main"
+    storage: "BoxProfileStorage | None" = None
+
+
+@dataclass
+class BoxProfileStorage:
+    provider: str
+    mount_path: str
+    filesystem: str
+    required: bool = True
+    min_free_gb: float = 0.0
+
+
+@dataclass
+class DeployRelease:
+    manifest_path: Path
+    client_id: str
+    source_commit: str
+    payload_tree_sha256: str
+    archive_path: Path
+    archive_sha256: str
+    active_profiles: list[str] = field(default_factory=list)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_deploy_manifest(manifest_path: Path, *, expected_client_id: str | None = None) -> DeployRelease:
+    resolved_manifest = manifest_path.expanduser().resolve()
+    if not resolved_manifest.is_file():
+        raise RuntimeError(f"Deploy manifest not found: {resolved_manifest}")
+
+    try:
+        payload = json.loads(resolved_manifest.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Deploy manifest is not valid JSON: {resolved_manifest}") from exc
+
+    client_id = str(payload.get("client_id") or "").strip()
+    if not client_id:
+        raise RuntimeError(f"Deploy manifest is missing client_id: {resolved_manifest}")
+    if expected_client_id is not None and client_id != expected_client_id:
+        raise RuntimeError(
+            f"Deploy manifest {resolved_manifest} is for client {client_id!r}, not {expected_client_id!r}"
+        )
+
+    source_commit = str(payload.get("source_commit") or "").strip()
+    if not source_commit:
+        raise RuntimeError(f"Deploy manifest is missing source_commit: {resolved_manifest}")
+
+    payload_tree_sha256 = str(payload.get("payload_tree_sha256") or "").strip().lower()
+    if not SHA256_HEX_PATTERN.fullmatch(payload_tree_sha256):
+        raise RuntimeError(f"Deploy manifest has invalid payload_tree_sha256: {resolved_manifest}")
+
+    archive_rel = str(payload.get("archive") or "").strip()
+    if not archive_rel:
+        raise RuntimeError(f"Deploy manifest is missing archive path: {resolved_manifest}")
+    archive_path = (resolved_manifest.parent / archive_rel).resolve()
+    if not archive_path.is_file():
+        raise RuntimeError(f"Deploy archive not found: {archive_path}")
+
+    archive_sha256 = str(payload.get("archive_sha256") or "").strip().lower()
+    if not SHA256_HEX_PATTERN.fullmatch(archive_sha256):
+        raise RuntimeError(f"Deploy manifest has invalid archive_sha256: {resolved_manifest}")
+    actual_archive_sha256 = sha256_file(archive_path)
+    if actual_archive_sha256 != archive_sha256:
+        raise RuntimeError(
+            f"Deploy archive hash mismatch for {archive_path}: expected {archive_sha256}, got {actual_archive_sha256}"
+        )
+
+    raw_active_profiles = payload.get("active_profiles")
+    active_profiles: list[str] = []
+    seen_profiles: set[str] = set()
+    if raw_active_profiles is not None:
+        if not isinstance(raw_active_profiles, list):
+            raise RuntimeError(f"Deploy manifest has invalid active_profiles: {resolved_manifest}")
+        for raw_profile in raw_active_profiles:
+            profile = str(raw_profile).strip()
+            if not profile or profile in seen_profiles:
+                continue
+            seen_profiles.add(profile)
+            active_profiles.append(profile)
+
+    return DeployRelease(
+        manifest_path=resolved_manifest,
+        client_id=client_id,
+        source_commit=source_commit,
+        payload_tree_sha256=payload_tree_sha256,
+        archive_path=archive_path,
+        archive_sha256=archive_sha256,
+        active_profiles=active_profiles,
+    )
+
+
+def deploy_release_payload(release: DeployRelease) -> dict[str, Any]:
+    return {
+        "manifest_path": str(release.manifest_path),
+        "source_commit": release.source_commit,
+        "payload_tree_sha256": release.payload_tree_sha256,
+        "archive_path": str(release.archive_path),
+        "archive_sha256": release.archive_sha256,
+        "active_profiles": release.active_profiles,
+    }
+
+
+def manage_profile_args(active_profiles: list[str]) -> list[str]:
+    args: list[str] = []
+    for profile in active_profiles:
+        if profile == "core":
+            continue
+        args.extend(["--profile", profile])
+    return args
+
+
+def storage_payload(storage: BoxProfileStorage | None) -> dict[str, Any] | None:
+    if storage is None:
+        return None
+    return asdict(storage)
+
+
+def volume_name_for_box(box_id: str) -> str:
+    return f"skillbox-state-{box_id}"
+
+
+def storage_volume_size_gb(storage: BoxProfileStorage) -> int:
+    return max(20, int(math.ceil(storage.min_free_gb or 0.0)))
+
+
+def parse_box_profile_storage(
+    *,
+    profile_id: str,
+    profile_provider: str,
+    raw_storage: Any,
+) -> BoxProfileStorage | None:
+    if raw_storage is None:
+        return None
+    if not isinstance(raw_storage, dict):
+        raise RuntimeError(f"Expected a YAML mapping at storage in box profile {profile_id!r}")
+
+    storage_provider = str(raw_storage.get("provider") or profile_provider).strip() or profile_provider
+    if storage_provider != profile_provider:
+        raise RuntimeError(
+            f"Box profile {profile_id!r} storage.provider {storage_provider!r} does not match provider {profile_provider!r}"
+        )
+
+    mount_path = str(raw_storage.get("mount_path") or "").strip()
+    if not mount_path:
+        raise RuntimeError(f"Box profile {profile_id!r} storage.mount_path is required")
+
+    filesystem = str(raw_storage.get("filesystem") or "").strip()
+    if not filesystem:
+        raise RuntimeError(f"Box profile {profile_id!r} storage.filesystem is required")
+
+    min_free_raw = raw_storage.get("min_free_gb", 0)
+    try:
+        min_free_gb = float(min_free_raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Box profile {profile_id!r} storage.min_free_gb must be numeric") from exc
+    if min_free_gb < 0:
+        raise RuntimeError(f"Box profile {profile_id!r} storage.min_free_gb cannot be negative")
+
+    return BoxProfileStorage(
+        provider=storage_provider,
+        mount_path=mount_path,
+        filesystem=filesystem,
+        required=bool(raw_storage.get("required", True)),
+        min_free_gb=min_free_gb,
+    )
+
+
+def build_release_upgrade_args(
+    client_id: str,
+    release: "DeployRelease",
+    *,
+    remote_archive_path: str,
+    repo_dir: str,
+) -> list[str]:
+    args = [
+        "--archive", remote_archive_path,
+        "--sha256", release.archive_sha256,
+        "--repo-dir", repo_dir,
+        "--client", client_id,
+    ]
+    args.extend(manage_profile_args(release.active_profiles))
+    return args
 
 
 def load_profile(name: str) -> BoxProfile:
@@ -284,9 +546,16 @@ def load_profile(name: str) -> BoxProfile:
     if not isinstance(data, dict):
         raise RuntimeError(f"Expected a YAML mapping in {path}")
 
+    provider = str(data.get("provider", "digitalocean"))
+    storage = parse_box_profile_storage(
+        profile_id=name,
+        profile_provider=provider,
+        raw_storage=data.get("storage"),
+    )
+
     return BoxProfile(
         id=name,
-        provider=data.get("provider", "digitalocean"),
+        provider=provider,
         region=data.get("region", "nyc3"),
         size=data.get("size", "s-2vcpu-4gb"),
         image=data.get("image", "ubuntu-24-04-x64"),
@@ -294,6 +563,7 @@ def load_profile(name: str) -> BoxProfile:
         tailscale_hostname_prefix=data.get("tailscale_hostname_prefix", "skillbox"),
         skillbox_repo=data.get("skillbox_repo", "https://github.com/build000r/skillbox.git"),
         skillbox_branch=data.get("skillbox_branch", "main"),
+        storage=storage,
     )
 
 
@@ -327,6 +597,14 @@ class Box:
     updated_at: str = ""
     region: str = ""
     size: str = ""
+    storage_provider: str | None = None
+    state_root: str | None = None
+    storage_filesystem: str | None = None
+    storage_required: bool = False
+    storage_min_free_gb: float | None = None
+    volume_id: str | None = None
+    volume_name: str | None = None
+    volume_size_gb: int | None = None
 
 
 def load_inventory() -> list[Box]:
@@ -361,6 +639,16 @@ def update_box(box: Box, **kwargs: Any) -> None:
         if hasattr(box, k):
             setattr(box, k, v)
     box.updated_at = datetime.now(timezone.utc).isoformat()
+
+
+def volume_payload(box: Box) -> dict[str, Any] | None:
+    if not box.volume_name and not box.volume_id:
+        return None
+    return {
+        "id": box.volume_id,
+        "name": box.volume_name,
+        "size_gb": box.volume_size_gb,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +705,90 @@ def do_droplet_public_ip(droplet: dict[str, Any]) -> str | None:
     return None
 
 
+def _volume_droplet_ids(volume: dict[str, Any]) -> list[str]:
+    raw_ids = volume.get("droplet_ids")
+    if raw_ids is None:
+        raw_ids = volume.get("dropletIds")
+    if not isinstance(raw_ids, list):
+        return []
+    return [str(item) for item in raw_ids if str(item).strip()]
+
+
+def _volume_size_gb(volume: dict[str, Any], fallback: int) -> int:
+    raw = volume.get("size_gigabytes")
+    if raw is None:
+        raw = volume.get("sizeGigaBytes")
+    if raw is None:
+        raw = volume.get("size")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def do_list_volumes(*, region: str | None = None) -> list[dict[str, Any]]:
+    args = ["compute", "volume", "list"]
+    if region:
+        args.extend(["--region", region])
+    args.extend(["--output", "json"])
+    result = doctl(*args, timeout=120)
+    payload = json.loads(result.stdout)
+    if not isinstance(payload, list):
+        raise RuntimeError("doctl returned an unexpected volume list payload")
+    return payload
+
+
+def do_get_volume(volume_id: str) -> dict[str, Any]:
+    result = doctl("compute", "volume", "get", volume_id, "--output", "json", timeout=120)
+    payload = json.loads(result.stdout)
+    if not isinstance(payload, list) or not payload:
+        raise RuntimeError(f"doctl returned an empty result for volume {volume_id}")
+    return payload[0]
+
+
+def do_find_volume_by_name(name: str, *, region: str) -> dict[str, Any] | None:
+    matches = [volume for volume in do_list_volumes(region=region) if str(volume.get("name") or "") == name]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise RuntimeError(f"Multiple DigitalOcean volumes named {name!r} exist in region {region!r}")
+    return matches[0]
+
+
+def do_create_volume(
+    name: str,
+    *,
+    region: str,
+    size_gb: int,
+    filesystem: str,
+    description: str = "",
+) -> dict[str, Any]:
+    args = [
+        "compute", "volume", "create", name,
+        "--region", region,
+        "--size", f"{size_gb}GiB",
+        "--fs-type", filesystem,
+        "--fs-label", name,
+        "--output", "json",
+    ]
+    if description:
+        args.extend(["--desc", description])
+    result = doctl(*args, timeout=300)
+    payload = json.loads(result.stdout)
+    if not isinstance(payload, list) or not payload:
+        raise RuntimeError(f"doctl returned an empty result when creating volume {name}")
+    return payload[0]
+
+
+def do_attach_volume(volume_id: str, droplet_id: str) -> None:
+    doctl(
+        "compute", "volume-action", "attach", volume_id, droplet_id,
+        "--wait",
+        "--output", "json",
+        timeout=300,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tailscale operations
 # ---------------------------------------------------------------------------
@@ -445,9 +817,29 @@ class BoxUpContext:
     boxes: list[Box]
     ts_hostname: str
     is_json: bool
+    deploy_release: DeployRelease | None = None
     steps: list[dict[str, Any]] = field(default_factory=list)
     ip: str | None = None
     ssh_target: str | None = None
+
+
+def require_profile_storage(profile: BoxProfile) -> BoxProfileStorage:
+    if profile.provider != "digitalocean":
+        raise RuntimeError(
+            f"Unsupported box provider {profile.provider!r}. box.py currently provisions DigitalOcean droplets only."
+        )
+
+    storage = profile.storage
+    if storage is None:
+        raise RuntimeError(
+            f"DigitalOcean profile {profile.id!r} is missing a storage stanza. "
+            "Declare storage.mount_path, storage.filesystem, storage.required, and storage.min_free_gb."
+        )
+    if not storage.required:
+        raise RuntimeError(
+            f"DigitalOcean profile {profile.id!r} must declare storage.required=true for durable state."
+        )
+    return storage
 
 
 def _record_box_up_step(context: BoxUpContext, name: str, status: str, detail: Any = None) -> None:
@@ -514,9 +906,11 @@ def _build_box_up_context(
     profile: BoxProfile,
     boxes: list[Box],
     is_json: bool,
+    deploy_release: DeployRelease | None = None,
 ) -> BoxUpContext:
     now = datetime.now(timezone.utc).isoformat()
     ts_hostname = f"{profile.tailscale_hostname_prefix}-{box_id}"
+    storage = profile.storage
     box = Box(
         id=box_id,
         profile=profile_name,
@@ -527,6 +921,13 @@ def _build_box_up_context(
         updated_at=now,
         region=profile.region,
         size=profile.size,
+        storage_provider=storage.provider if storage is not None else None,
+        state_root=storage.mount_path if storage is not None else None,
+        storage_filesystem=storage.filesystem if storage is not None else None,
+        storage_required=storage.required if storage is not None else False,
+        storage_min_free_gb=storage.min_free_gb if storage is not None else None,
+        volume_name=volume_name_for_box(box_id) if storage is not None else None,
+        volume_size_gb=storage_volume_size_gb(storage) if storage is not None else None,
     )
     return BoxUpContext(
         box_id=box_id,
@@ -536,23 +937,35 @@ def _build_box_up_context(
         boxes=boxes,
         ts_hostname=ts_hostname,
         is_json=is_json,
+        deploy_release=deploy_release,
     )
 
 
 def _box_up_dry_run_payload(context: BoxUpContext) -> dict[str, Any]:
     _record_box_up_step(context, "create", "skip", f"would create {context.profile.size} in {context.profile.region}")
+    if context.profile.storage is not None:
+        _record_box_up_step(
+            context,
+            "storage",
+            "skip",
+            f"would attach {context.box.volume_name} at {context.profile.storage.mount_path}",
+        )
     _record_box_up_step(context, "bootstrap", "skip", "dry-run")
     _record_box_up_step(context, "enroll", "skip", f"would enroll as {context.ts_hostname}")
     _record_box_up_step(context, "deploy", "skip", "dry-run")
-    _record_box_up_step(context, "onboard", "skip", "dry-run")
-    _record_box_up_step(context, "verify", "skip", "dry-run")
-    return {
+    _record_box_up_step(context, "first-box", "skip", "dry-run")
+    payload = {
         "box_id": context.box_id,
         "profile": asdict(context.profile),
         "dry_run": True,
         "steps": context.steps,
-        "next_actions": [f"box up {context.box_id} --profile {context.profile_name}"],
+        "storage": storage_payload(context.profile.storage),
+        "volume": volume_payload(context.box),
+        "next_actions": [f"box up {context.box_id} --profile {context.profile_name} --deploy-manifest <path>"],
     }
+    if context.deploy_release is not None:
+        payload["deploy_release"] = deploy_release_payload(context.deploy_release)
+    return payload
 
 
 def _create_box_droplet(context: BoxUpContext, *, ssh_key_id: str) -> str:
@@ -576,6 +989,52 @@ def _create_box_droplet(context: BoxUpContext, *, ssh_key_id: str) -> str:
     return f"droplet {droplet['id']} at {ip}"
 
 
+def _ensure_box_storage(context: BoxUpContext) -> str:
+    storage = require_profile_storage(context.profile)
+    droplet_id = str(context.box.droplet_id or "").strip()
+    if not droplet_id:
+        raise RuntimeError("Droplet ID unavailable during storage provisioning")
+
+    volume_name = context.box.volume_name or volume_name_for_box(context.box_id)
+    size_gb = context.box.volume_size_gb or storage_volume_size_gb(storage)
+    volume = do_find_volume_by_name(volume_name, region=context.profile.region)
+    created = False
+    if volume is None:
+        volume = do_create_volume(
+            volume_name,
+            region=context.profile.region,
+            size_gb=size_gb,
+            filesystem=storage.filesystem,
+            description=f"Skillbox durable state for {context.box_id}",
+        )
+        created = True
+
+    volume_id = str(volume.get("id") or "").strip()
+    if not volume_id:
+        raise RuntimeError(f"DigitalOcean volume {volume_name!r} has no ID")
+
+    attached_ids = _volume_droplet_ids(volume)
+    if attached_ids and droplet_id not in attached_ids:
+        raise RuntimeError(
+            f"Volume {volume_name!r} is already attached to droplet(s) {', '.join(attached_ids)}. "
+            f"Detach it before reusing box {context.box_id!r}."
+        )
+    if droplet_id not in attached_ids:
+        do_attach_volume(volume_id, droplet_id)
+        volume = do_get_volume(volume_id)
+
+    update_box(
+        context.box,
+        volume_id=volume_id,
+        volume_name=volume_name,
+        volume_size_gb=_volume_size_gb(volume, size_gb),
+        state="bootstrapping",
+    )
+    save_inventory(context.boxes)
+    action = "created+attached" if created else "attached"
+    return f"{action} volume {volume_name} ({context.box.volume_size_gb}GiB) at {storage.mount_path}"
+
+
 def _bootstrap_box_host(context: BoxUpContext) -> str:
     if context.ip is None:
         raise RuntimeError("Droplet IP unavailable during bootstrap")
@@ -585,12 +1044,20 @@ def _bootstrap_box_host(context: BoxUpContext) -> str:
         raise RuntimeError(f"SSH not reachable at root@{context.ip} after 120s")
     if not context.is_json:
         print("[...] bootstrap  Running 01-bootstrap-do.sh...")
-    result = ssh_script("root", context.ip, BOOTSTRAP_SCRIPT, {"APP_USER": context.profile.ssh_user}, timeout=600)
+    storage = require_profile_storage(context.profile)
+    env_vars = {
+        "APP_USER": context.profile.ssh_user,
+        "SKILLBOX_STATE_ROOT": storage.mount_path,
+        "SKILLBOX_STORAGE_FILESYSTEM": storage.filesystem,
+        "SKILLBOX_STORAGE_MIN_FREE_GB": str(storage.min_free_gb),
+        "SKILLBOX_VOLUME_NAME": context.box.volume_name or volume_name_for_box(context.box_id),
+    }
+    result = ssh_script("root", context.ip, BOOTSTRAP_SCRIPT, env_vars, timeout=600)
     if result.returncode != 0:
         raise RuntimeError(f"Bootstrap failed (exit {result.returncode}): {result.stderr[-500:]}")
     update_box(context.box, state="enrolling")
     save_inventory(context.boxes)
-    return "OS packages + Docker + user created"
+    return f"OS packages + Docker + state root {storage.mount_path} mounted"
 
 
 def _enroll_box_tailscale(context: BoxUpContext, *, ts_authkey: str) -> str:
@@ -633,39 +1100,89 @@ def _resolve_deploy_target(context: BoxUpContext) -> str:
 
 
 def _deploy_box_runtime(context: BoxUpContext) -> str:
-    if not context.is_json:
-        print(f"[...] deploy  Cloning skillbox and starting container via {context.ts_hostname}...")
     ssh_target = _resolve_deploy_target(context)
-    deploy_cmds = build_deploy_command(context.profile)
-    result = ssh_cmd(context.profile.ssh_user, ssh_target, deploy_cmds, timeout=600)
-    if result.returncode != 0:
-        raise RuntimeError(f"Deploy failed (exit {result.returncode}): {result.stderr[-500:]}")
-    update_box(context.box, state="onboarding")
+    if context.deploy_release is None:
+        if not context.is_json:
+            print(f"[...] deploy  Cloning skillbox and starting container via {context.ts_hostname}...")
+        deploy_cmds = build_deploy_command(context.profile)
+        result = ssh_cmd(context.profile.ssh_user, ssh_target, deploy_cmds, timeout=600)
+        if result.returncode != 0:
+            raise RuntimeError(f"Deploy failed (exit {result.returncode}): {result.stderr[-500:]}")
+    else:
+        release = context.deploy_release
+        if not context.is_json:
+            print(
+                f"[...] deploy  Installing pinned release {release.source_commit[:12]} "
+                f"via {context.ts_hostname}..."
+            )
+        remote_home = f"/home/{context.profile.ssh_user}"
+        remote_archive_path = f"{remote_home}/{release.archive_path.name}"
+        upload_result = scp_file(release.archive_path, context.profile.ssh_user, ssh_target, remote_archive_path, timeout=600)
+        if upload_result.returncode != 0:
+            raise RuntimeError(f"Deploy archive upload failed (exit {upload_result.returncode}): {upload_result.stderr[-500:]}")
+
+        install_args = build_release_install_args(
+            context.box_id,
+            release,
+            remote_archive_path=remote_archive_path,
+            repo_dir=f"{remote_home}/skillbox",
+            private_path=f"{remote_home}/skillbox-config",
+        )
+        result = ssh_script(
+            context.profile.ssh_user,
+            ssh_target,
+            INSTALL_SCRIPT,
+            script_args=install_args,
+            timeout=1800,
+        )
+        if result.returncode != 0:
+            tail = result.stderr[-500:] or result.stdout[-500:]
+            raise RuntimeError(f"Deploy failed (exit {result.returncode}): {tail}")
+    update_box(context.box, state="acceptance")
     save_inventory(context.boxes)
-    return "container running"
+    if context.deploy_release is None:
+        return "container running"
+    return f"installed release {context.deploy_release.source_commit[:12]}"
 
 
-def _run_box_onboard(context: BoxUpContext, *, blueprint: str | None, set_args: list[str]) -> None:
+def _run_box_first_box(context: BoxUpContext, *, blueprint: str | None, set_args: list[str]) -> dict[str, Any]:
     if context.ssh_target is None:
-        raise RuntimeError("SSH target unavailable during onboarding")
+        raise RuntimeError("SSH target unavailable during first-box")
+    remote_home = f"/home/{context.profile.ssh_user}"
+    remote_repo_dir = f"{remote_home}/skillbox"
+    remote_private_path = f"{remote_home}/skillbox-config"
     if not context.is_json:
-        print(f"[...] onboard  Running onboard for client {context.box_id}...")
-    exec_cmd = build_onboard_command(context.box_id, blueprint, set_args)
-    result = ssh_cmd(context.profile.ssh_user, context.ssh_target, exec_cmd, timeout=300)
-    if result.returncode not in (0, 2):
-        raise RuntimeError(f"Onboard failed (exit {result.returncode}): {result.stderr[-500:]}")
-
-
-def _verify_box_runtime(context: BoxUpContext) -> None:
-    if context.ssh_target is None:
-        raise RuntimeError("SSH target unavailable during verification")
-    verify_cmd = "cd ~/skillbox && docker compose exec -T workspace python3 .env-manager/manage.py doctor --format json"
-    result = ssh_cmd(context.profile.ssh_user, context.ssh_target, verify_cmd, timeout=60)
-    _record_box_up_step(context, "verify", "ok" if result.returncode == 0 else "warn")
+        print(f"[...] first-box  Running canonical first-box for client {context.box_id}...")
+    exec_cmd = build_first_box_command(
+        context.box_id,
+        repo_dir=remote_repo_dir,
+        private_path=remote_private_path,
+        active_profiles=context.deploy_release.active_profiles if context.deploy_release is not None else [],
+        blueprint=blueprint,
+        set_args=set_args,
+    )
+    result = ssh_cmd(context.profile.ssh_user, context.ssh_target, exec_cmd, timeout=600)
+    if result.returncode != 0:
+        tail = result.stderr[-500:] or result.stdout[-500:]
+        raise RuntimeError(f"first-box failed (exit {result.returncode}): {tail}")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {
+            "client_id": context.box_id,
+            "active_profiles": context.deploy_release.active_profiles if context.deploy_release is not None else ["core"],
+            "status": "ok",
+        }
+    return {
+        "client_id": payload.get("client_id") or context.box_id,
+        "active_profiles": payload.get("active_profiles") or context.deploy_release.active_profiles or ["core"],
+        "created_client": payload.get("created_client"),
+        "output_dir": payload.get("output_dir"),
+    }
 
 
 def _box_up_success_payload(context: BoxUpContext) -> dict[str, Any]:
-    return {
+    payload = {
         "box_id": context.box_id,
         "profile": asdict(context.profile),
         "dry_run": False,
@@ -675,8 +1192,13 @@ def _box_up_success_payload(context: BoxUpContext) -> dict[str, Any]:
         "tailscale_ip": context.box.tailscale_ip,
         "ssh": f"ssh {context.profile.ssh_user}@{context.ts_hostname}",
         "steps": context.steps,
+        "storage": storage_payload(context.profile.storage),
+        "volume": volume_payload(context.box),
         "next_actions": [f"box ssh {context.box_id}", f"box status {context.box_id}"],
     }
+    if context.deploy_release is not None:
+        payload["deploy_release"] = deploy_release_payload(context.deploy_release)
+    return payload
 
 
 def cmd_up(
@@ -685,6 +1207,7 @@ def cmd_up(
     profile_name: str,
     blueprint: str | None,
     set_args: list[str],
+    deploy_manifest: str | None,
     dry_run: bool,
     fmt: str,
 ) -> int:
@@ -709,16 +1232,56 @@ def cmd_up(
             print(msg, file=sys.stderr)
         return EXIT_ERROR
 
-    do_token = require_env("SKILLBOX_DO_TOKEN")
-    ssh_key_id = require_env("SKILLBOX_DO_SSH_KEY_ID")
-    ts_authkey = require_env("SKILLBOX_TS_AUTHKEY")
-    os.environ["DIGITALOCEAN_ACCESS_TOKEN"] = do_token
+    deploy_release: DeployRelease | None = None
+    if deploy_manifest:
+        try:
+            deploy_release = load_deploy_manifest(Path(deploy_manifest), expected_client_id=box_id)
+        except RuntimeError as exc:
+            if is_json:
+                emit_json(structured_error(str(exc), error_type="deploy_manifest_invalid"))
+            else:
+                print(str(exc), file=sys.stderr)
+            return EXIT_ERROR
+    elif not dry_run:
+        msg = (
+            "box up requires --deploy-manifest for non-dry-run launches. "
+            "Branch-based deploys are not allowed for remote provisioning."
+        )
+        if is_json:
+            emit_json(
+                structured_error(
+                    msg,
+                    error_type="deploy_manifest_required",
+                    next_actions=[f"box up {box_id} --profile {profile_name} --deploy-manifest <path>"],
+                )
+            )
+        else:
+            print(msg, file=sys.stderr)
+        return EXIT_ERROR
+
+    if not dry_run:
+        try:
+            require_profile_storage(profile)
+        except RuntimeError as exc:
+            if is_json:
+                emit_json(
+                    structured_error(
+                        str(exc),
+                        error_type="storage_layout_missing",
+                        next_actions=[f"box profiles --format json", f"box up {box_id} --profile {profile_name} --dry-run"],
+                    )
+                )
+            else:
+                print(str(exc), file=sys.stderr)
+            return EXIT_ERROR
+
     context = _build_box_up_context(
         box_id=box_id,
         profile_name=profile_name,
         profile=profile,
         boxes=boxes,
         is_json=is_json,
+        deploy_release=deploy_release,
     )
 
     if dry_run:
@@ -727,6 +1290,11 @@ def cmd_up(
             emit_json(payload)
         return EXIT_OK
 
+    do_token = require_env("SKILLBOX_DO_TOKEN")
+    ssh_key_id = require_env("SKILLBOX_DO_SSH_KEY_ID")
+    ts_authkey = require_env("SKILLBOX_TS_AUTHKEY")
+    os.environ["DIGITALOCEAN_ACCESS_TOKEN"] = do_token
+
     context.boxes = [candidate for candidate in boxes if candidate.id != box_id]
 
     if not _run_box_up_stage(
@@ -734,6 +1302,16 @@ def cmd_up(
         stage_name="create",
         error_type="droplet_create_failed",
         action=lambda: _create_box_droplet(context, ssh_key_id=ssh_key_id),
+    ):
+        return EXIT_ERROR
+
+    if not _run_box_up_stage(
+        context,
+        stage_name="storage",
+        error_type="storage_attach_failed",
+        action=lambda: _ensure_box_storage(context),
+        failure_state="bootstrapping",
+        next_actions=[f"box down {box_id}", f"box status {box_id}"],
     ):
         return EXIT_ERROR
 
@@ -769,17 +1347,13 @@ def cmd_up(
 
     if not _run_box_up_stage(
         context,
-        stage_name="onboard",
-        error_type="onboard_failed",
-        action=lambda: _run_box_onboard(context, blueprint=blueprint, set_args=set_args),
-        failure_state="ready",
+        stage_name="first-box",
+        error_type="first_box_failed",
+        action=lambda: _run_box_first_box(context, blueprint=blueprint, set_args=set_args),
+        failure_state="acceptance",
         next_actions=[f"box ssh {box_id}", f"box status {box_id}"],
     ):
         return EXIT_ERROR
-    try:
-        _verify_box_runtime(context)
-    except Exception:
-        _record_box_up_step(context, "verify", "warn")
 
     update_box(context.box, state="ready")
     save_inventory(context.boxes)
@@ -791,6 +1365,221 @@ def cmd_up(
         print(f"Box {box_id} is ready.")
         print(f"  SSH: ssh {context.profile.ssh_user}@{context.ts_hostname}")
         print(f"  IP:  {context.box.droplet_ip} (public) / {context.box.tailscale_ip or 'pending'} (tailscale)")
+        if context.box.state_root:
+            print(f"  State root: {context.box.state_root} ({context.box.storage_filesystem or 'unknown fs'})")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# box upgrade
+# ---------------------------------------------------------------------------
+
+def _record_box_step(steps: list[dict[str, Any]], is_json: bool, name: str, status: str, detail: Any = None) -> None:
+    entry: dict[str, Any] = {"step": name, "status": status}
+    if detail is not None:
+        entry["detail"] = detail
+    steps.append(entry)
+    if not is_json:
+        marker = "ok" if status == "ok" else ("skip" if status == "skip" else "FAIL")
+        suffix = f"  {detail}" if isinstance(detail, str) and detail else ""
+        print(f"[{marker}] {name}{suffix}")
+
+
+def _resolve_existing_box_target(box: Box) -> str:
+    if box.tailscale_hostname and wait_for_ssh(box.tailscale_hostname, user=box.ssh_user, max_wait=60, interval=5):
+        return box.tailscale_hostname
+    if box.droplet_ip and wait_for_ssh(box.droplet_ip, user=box.ssh_user, max_wait=30):
+        return box.droplet_ip
+    raise RuntimeError(
+        f"Cannot reach {box.ssh_user}@{box.tailscale_hostname or '<no-tailscale>'} "
+        f"or {box.droplet_ip or '<no-public-ip>'} via SSH"
+    )
+
+
+def _emit_box_upgrade_failure(
+    *,
+    box_id: str,
+    steps: list[dict[str, Any]],
+    is_json: bool,
+    error_type: str,
+    message: str,
+    deploy_release: DeployRelease,
+    next_actions: list[str] | None = None,
+) -> int:
+    payload: dict[str, Any] = {
+        "box_id": box_id,
+        "dry_run": False,
+        "steps": steps,
+        "deploy_release": deploy_release_payload(deploy_release),
+    }
+    payload.update(structured_error(message, error_type=error_type, next_actions=next_actions))
+    if is_json:
+        emit_json(payload)
+    else:
+        print(message, file=sys.stderr)
+    return EXIT_ERROR
+
+
+def _box_upgrade_dry_run_payload(box: Box, release: DeployRelease, steps: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "box_id": box.id,
+        "profile": box.profile,
+        "dry_run": True,
+        "steps": steps,
+        "volume": volume_payload(box),
+        "deploy_release": deploy_release_payload(release),
+        "next_actions": [f"box upgrade {box.id} --deploy-manifest {release.manifest_path}"],
+    }
+
+
+def _box_upgrade_success_payload(box: Box, release: DeployRelease, steps: list[dict[str, Any]]) -> dict[str, Any]:
+    ssh_target = box.tailscale_hostname or box.droplet_ip
+    return {
+        "box_id": box.id,
+        "profile": box.profile,
+        "dry_run": False,
+        "ssh": f"ssh {box.ssh_user}@{ssh_target}" if ssh_target else None,
+        "steps": steps,
+        "volume": volume_payload(box),
+        "deploy_release": deploy_release_payload(release),
+        "next_actions": [f"box status {box.id}", f"box ssh {box.id}"],
+    }
+
+
+def cmd_upgrade(
+    box_id: str,
+    *,
+    deploy_manifest: str,
+    dry_run: bool,
+    fmt: str,
+) -> int:
+    is_json = fmt == "json"
+    steps: list[dict[str, Any]] = []
+    boxes = load_inventory()
+    box = find_box(boxes, box_id)
+    if box is None or box.state == "destroyed":
+        msg = f"Box {box_id!r} not found or already destroyed."
+        if is_json:
+            emit_json(structured_error(msg, error_type="not_found", next_actions=["box list"]))
+        else:
+            print(msg, file=sys.stderr)
+        return EXIT_ERROR
+    if box.state != "ready":
+        msg = f"Box {box_id!r} must be in 'ready' state for upgrade; found {box.state!r}."
+        if is_json:
+            emit_json(structured_error(msg, error_type="invalid_state", next_actions=[f"box status {box_id}"]))
+        else:
+            print(msg, file=sys.stderr)
+        return EXIT_ERROR
+
+    try:
+        release = load_deploy_manifest(Path(deploy_manifest), expected_client_id=box_id)
+    except RuntimeError as exc:
+        if is_json:
+            emit_json(structured_error(str(exc), error_type="deploy_manifest_invalid"))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    if dry_run:
+        _record_box_step(steps, is_json, "upload", "skip", "dry-run")
+        _record_box_step(steps, is_json, "upgrade", "skip", f"would install {release.source_commit[:12]}")
+        _record_box_step(steps, is_json, "verify", "skip", "dry-run")
+        if is_json:
+            emit_json(_box_upgrade_dry_run_payload(box, release, steps))
+        return EXIT_OK
+
+    try:
+        ssh_target = _resolve_existing_box_target(box)
+    except RuntimeError as exc:
+        _record_box_step(steps, is_json, "upload", "fail", str(exc))
+        return _emit_box_upgrade_failure(
+            box_id=box_id,
+            steps=steps,
+            is_json=is_json,
+            error_type="ssh_unreachable",
+            message=str(exc),
+            deploy_release=release,
+            next_actions=[f"box status {box_id}", f"box ssh {box_id}"],
+        )
+
+    remote_home = f"/home/{box.ssh_user}"
+    remote_repo_dir = f"{remote_home}/skillbox"
+    remote_archive_path = f"{remote_home}/{release.archive_path.name}"
+    upload_result = scp_file(release.archive_path, box.ssh_user, ssh_target, remote_archive_path, timeout=600)
+    if upload_result.returncode != 0:
+        detail = upload_result.stderr[-500:] or upload_result.stdout[-500:] or "scp failed"
+        _record_box_step(steps, is_json, "upload", "fail", detail)
+        return _emit_box_upgrade_failure(
+            box_id=box_id,
+            steps=steps,
+            is_json=is_json,
+            error_type="upload_failed",
+            message=f"Upgrade archive upload failed: {detail}",
+            deploy_release=release,
+            next_actions=[f"box ssh {box_id}", f"box status {box_id}"],
+        )
+    _record_box_step(steps, is_json, "upload", "ok", remote_archive_path)
+
+    upgrade_args = build_release_upgrade_args(
+        box_id,
+        release,
+        remote_archive_path=remote_archive_path,
+        repo_dir=remote_repo_dir,
+    )
+    upgrade_result = ssh_script(
+        box.ssh_user,
+        ssh_target,
+        UPGRADE_SCRIPT,
+        script_args=upgrade_args,
+        timeout=1800,
+    )
+    if upgrade_result.returncode != 0:
+        detail = upgrade_result.stderr[-500:] or upgrade_result.stdout[-500:] or "remote upgrade failed"
+        _record_box_step(steps, is_json, "upgrade", "fail", detail)
+        return _emit_box_upgrade_failure(
+            box_id=box_id,
+            steps=steps,
+            is_json=is_json,
+            error_type="upgrade_failed",
+            message=f"Remote upgrade failed: {detail}",
+            deploy_release=release,
+            next_actions=[f"box ssh {box_id}", f"box status {box_id}"],
+        )
+    _record_box_step(steps, is_json, "upgrade", "ok", f"installed {release.source_commit[:12]}")
+
+    verify_result = ssh_cmd(
+        box.ssh_user,
+        ssh_target,
+        "cd ~/skillbox && docker compose ps --format json 2>/dev/null | head -1",
+        timeout=30,
+    )
+    verify_ok = verify_result.returncode == 0 and "workspace" in verify_result.stdout
+    verify_detail = {
+        "ssh_target": ssh_target,
+        "container_running": verify_ok,
+    }
+    _record_box_step(steps, is_json, "verify", "ok" if verify_ok else "fail", verify_detail)
+    if not verify_ok:
+        return _emit_box_upgrade_failure(
+            box_id=box_id,
+            steps=steps,
+            is_json=is_json,
+            error_type="verify_failed",
+            message=f"Box {box_id!r} did not report a healthy workspace container after upgrade.",
+            deploy_release=release,
+            next_actions=[f"box status {box_id}", f"box ssh {box_id}"],
+        )
+
+    update_box(box, state="ready")
+    save_inventory(boxes)
+    payload = _box_upgrade_success_payload(box, release, steps)
+    if is_json:
+        emit_json(payload)
+    else:
+        print()
+        print(f"Box {box_id} upgraded to {release.source_commit[:12]}.")
+        print(f"  SSH: ssh {box.ssh_user}@{box.tailscale_hostname or box.droplet_ip}")
     return EXIT_OK
 
 
@@ -857,8 +1646,9 @@ def cmd_down(box_id: str, *, dry_run: bool, fmt: str) -> int:
             if not is_json:
                 print(f"[...] remove  Removing from tailnet...")
             # Run tailscale logout on the box itself
-            ssh_cmd("root", box.droplet_ip or ssh_target, "tailscale logout", timeout=30)
-            step("remove", "ok")
+            result = ssh_cmd("root", box.droplet_ip or ssh_target, "tailscale logout", timeout=30)
+            detail = result.stderr[-500:] or result.stdout[-500:] or None
+            step("remove", "ok" if result.returncode == 0 else "warn", detail)
         except Exception:
             step("remove", "warn", "Could not remove from tailnet")
     else:
@@ -943,6 +1733,11 @@ def box_health(box: Box) -> dict[str, Any]:
         "ssh_user": box.ssh_user,
         "region": box.region,
         "size": box.size,
+        "state_root": box.state_root,
+        "storage_filesystem": box.storage_filesystem,
+        "volume_id": box.volume_id,
+        "volume_name": box.volume_name,
+        "volume_size_gb": box.volume_size_gb,
         "created_at": box.created_at,
         "ssh_reachable": False,
         "container_running": False,
@@ -979,6 +1774,10 @@ def print_box_status_text(status: dict[str, Any]) -> None:
     ts = status["tailscale_hostname"] or "n/a"
     print(f"{status['id']}  state={status['state']}  profile={status['profile']}")
     print(f"  droplet={status['droplet_id']}  ip={status['droplet_ip']}  ts={ts}")
+    if status.get("state_root"):
+        print(f"  state_root={status['state_root']}  fs={status.get('storage_filesystem') or 'n/a'}")
+    if status.get("volume_name"):
+        print(f"  volume={status['volume_name']}  size_gb={status.get('volume_size_gb') or 'n/a'}")
     print(f"  ssh={reachable}  container={container}")
     if status.get("ssh_reachable"):
         print(f"  connect: ssh {status['ssh_user']}@{ts}")
@@ -1023,7 +1822,12 @@ def cmd_list(*, fmt: str) -> int:
         else:
             for b in active:
                 ts = b.tailscale_hostname or "n/a"
-                print(f"  {b.id}  state={b.state}  ts={ts}  ip={b.droplet_ip}  profile={b.profile}")
+                root = b.state_root or "n/a"
+                volume = b.volume_name or "n/a"
+                print(
+                    f"  {b.id}  state={b.state}  ts={ts}  ip={b.droplet_ip}  "
+                    f"profile={b.profile}  state_root={root}  volume={volume}"
+                )
     return EXIT_OK
 
 
@@ -1040,7 +1844,8 @@ def cmd_profiles(*, fmt: str) -> int:
             print(f"No profiles found in {PROFILES_DIR}")
         else:
             for p in profiles:
-                print(f"  {p.id}  {p.size} in {p.region} ({p.image})")
+                storage = p.storage.mount_path if p.storage is not None else "n/a"
+                print(f"  {p.id}  {p.size} in {p.region} ({p.image})  state_root={storage}")
     return EXIT_OK
 
 
@@ -1057,11 +1862,12 @@ def main() -> int:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    up_parser = subparsers.add_parser("up", help="Create and provision a new box.")
+    up_parser = subparsers.add_parser("up", help="Create and provision a new box from a pinned deploy artifact.")
     up_parser.add_argument("box_id", help="Box identifier (becomes droplet name and client id).")
     up_parser.add_argument("--profile", default="dev-small", help="Box profile from workspace/box-profiles/.")
-    up_parser.add_argument("--blueprint", default=None, help="Client blueprint for onboard step.")
+    up_parser.add_argument("--blueprint", default=None, help="Client blueprint for the remote first-box step.")
     up_parser.add_argument("--set", action="append", default=[], help="Blueprint variable KEY=VALUE.")
+    up_parser.add_argument("--deploy-manifest", default=None, help="Pinned deploy.json from client-publish --deploy-artifact. Required unless --dry-run.")
     up_parser.add_argument("--dry-run", action="store_true")
     up_parser.add_argument("--format", choices=("text", "json"), default="text")
 
@@ -1069,6 +1875,12 @@ def main() -> int:
     down_parser.add_argument("box_id", help="Box identifier.")
     down_parser.add_argument("--dry-run", action="store_true")
     down_parser.add_argument("--format", choices=("text", "json"), default="text")
+
+    upgrade_parser = subparsers.add_parser("upgrade", help="Upgrade an existing ready box from a pinned deploy manifest.")
+    upgrade_parser.add_argument("box_id", help="Box identifier.")
+    upgrade_parser.add_argument("--deploy-manifest", required=True, help="Pinned deploy.json from client-publish --deploy-artifact.")
+    upgrade_parser.add_argument("--dry-run", action="store_true")
+    upgrade_parser.add_argument("--format", choices=("text", "json"), default="text")
 
     status_parser = subparsers.add_parser("status", help="Check health of one or all boxes.")
     status_parser.add_argument("box_id", nargs="?", default=None, help="Box identifier (omit for all).")
@@ -1094,11 +1906,19 @@ def main() -> int:
                 profile_name=args.profile,
                 blueprint=args.blueprint,
                 set_args=args.set,
+                deploy_manifest=args.deploy_manifest,
                 dry_run=args.dry_run,
                 fmt=args.format,
             )
         if args.command == "down":
             return cmd_down(args.box_id, dry_run=args.dry_run, fmt=args.format)
+        if args.command == "upgrade":
+            return cmd_upgrade(
+                args.box_id,
+                deploy_manifest=args.deploy_manifest,
+                dry_run=args.dry_run,
+                fmt=args.format,
+            )
         if args.command == "status":
             return cmd_status(args.box_id, fmt=args.format)
         if args.command == "ssh":

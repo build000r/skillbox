@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import os
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 try:
@@ -14,6 +14,11 @@ except ModuleNotFoundError:
 
 RUNTIME_ENV_KEYS = [
     "SKILLBOX_NAME",
+    "SKILLBOX_STORAGE_PROVIDER",
+    "SKILLBOX_STATE_ROOT",
+    "SKILLBOX_STORAGE_FILESYSTEM",
+    "SKILLBOX_STORAGE_REQUIRED",
+    "SKILLBOX_STORAGE_MIN_FREE_GB",
     "SKILLBOX_WORKSPACE_ROOT",
     "SKILLBOX_REPOS_ROOT",
     "SKILLBOX_SKILLS_ROOT",
@@ -53,6 +58,34 @@ MANIFEST_ENV_KEYS = RUNTIME_ENV_KEYS + [
 
 PLACEHOLDER_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
 RESERVED_TOP_LEVEL_RUNTIME_KEYS = {"version", "selection", "core", "clients"}
+
+PERSISTENCE_CONFIG_INVALID = "PERSISTENCE_CONFIG_INVALID"
+PERSISTENCE_CLASS_UNKNOWN = "PERSISTENCE_CLASS_UNKNOWN"
+PERSISTENCE_BINDING_CONFLICT = "PERSISTENCE_BINDING_CONFLICT"
+DO_VOLUME_LAYOUT_MISSING = "DO_VOLUME_LAYOUT_MISSING"
+STATE_ROOT_MISSING = "STATE_ROOT_MISSING"
+STATE_ROOT_WRONG_FILESYSTEM = "STATE_ROOT_WRONG_FILESYSTEM"
+STATE_ROOT_WRONG_OWNERSHIP = "STATE_ROOT_WRONG_OWNERSHIP"
+STATE_ROOT_LOW_SPACE = "STATE_ROOT_LOW_SPACE"
+PERSISTENT_PATH_OFF_STATE_ROOT = "PERSISTENT_PATH_OFF_STATE_ROOT"
+
+PERSISTENCE_ERROR_CODES: frozenset[str] = frozenset({
+    PERSISTENCE_CONFIG_INVALID,
+    PERSISTENCE_CLASS_UNKNOWN,
+    PERSISTENCE_BINDING_CONFLICT,
+    DO_VOLUME_LAYOUT_MISSING,
+    STATE_ROOT_MISSING,
+    STATE_ROOT_WRONG_FILESYSTEM,
+    STATE_ROOT_WRONG_OWNERSHIP,
+    STATE_ROOT_LOW_SPACE,
+    PERSISTENT_PATH_OFF_STATE_ROOT,
+})
+PERSISTENCE_STORAGE_CLASSES: frozenset[str] = frozenset({"persistent", "ephemeral", "external"})
+PERSISTENCE_PROVIDERS: frozenset[str] = frozenset({"local", "digitalocean"})
+PERSISTENCE_BINDING_ENV_OVERRIDES: dict[str, str] = {
+    "clients-root": "SKILLBOX_CLIENTS_HOST_ROOT",
+    "monoserver-root": "SKILLBOX_MONOSERVER_HOST_ROOT",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -157,8 +190,20 @@ class LocalRuntimeContractError(RuntimeError):
         self.code = code
 
 
+class PersistenceContractError(RuntimeError):
+    """Raised when workspace/persistence.yaml violates the declared contract."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 def runtime_manifest_path(root_dir: Path) -> Path:
     return root_dir / "workspace" / "runtime.yaml"
+
+
+def persistence_manifest_path(root_dir: Path) -> Path:
+    return root_dir / "workspace" / "persistence.yaml"
 
 
 def client_configs_runtime_root(env_values: dict[str, str]) -> Path:
@@ -173,6 +218,13 @@ def client_configs_host_root(root_dir: Path, env_values: dict[str, str]) -> Path
     raw_root = str(env_values.get("SKILLBOX_CLIENTS_HOST_ROOT") or "").strip()
     if raw_root:
         return host_path_to_absolute_path(root_dir, raw_root)
+    try:
+        storage = compile_persistence_summary(root_dir, env_values)
+    except RuntimeError:
+        storage = None
+    binding = storage_binding_by_id(storage, "clients-root")
+    if binding is not None:
+        return Path(str(binding["resolved_host_path"]))
     return root_dir / "workspace" / "clients"
 
 
@@ -241,6 +293,11 @@ def load_runtime_env(root_dir: Path) -> dict[str, str]:
 
     derived_defaults = {
         "SKILLBOX_NAME": "skillbox",
+        "SKILLBOX_STORAGE_PROVIDER": "local",
+        "SKILLBOX_STATE_ROOT": "./.skillbox-state",
+        "SKILLBOX_STORAGE_FILESYSTEM": "",
+        "SKILLBOX_STORAGE_REQUIRED": "false",
+        "SKILLBOX_STORAGE_MIN_FREE_GB": "0",
         "SKILLBOX_WORKSPACE_ROOT": "/workspace",
         "SKILLBOX_REPOS_ROOT": "/workspace/repos",
         "SKILLBOX_SKILLS_ROOT": "/workspace/skills",
@@ -280,9 +337,186 @@ def load_runtime_env(root_dir: Path) -> dict[str, str]:
         "SKILLBOX_CLIENTS_ROOT",
         f"{values['SKILLBOX_WORKSPACE_ROOT']}/workspace/clients",
     )
-    values.setdefault("SKILLBOX_CLIENTS_HOST_ROOT", "./workspace/clients")
-    values.setdefault("SKILLBOX_MONOSERVER_HOST_ROOT", "..")
+    values.setdefault("SKILLBOX_CLIENTS_HOST_ROOT", "./.skillbox-state/clients")
+    values.setdefault("SKILLBOX_MONOSERVER_HOST_ROOT", "./.skillbox-state/monoserver")
     return values
+
+
+def _persistence_error(code: str, message: str) -> PersistenceContractError:
+    return PersistenceContractError(code, message)
+
+
+def _persistence_path(value: str, *, field_name: str) -> PurePosixPath:
+    text = str(value or "").strip()
+    if not text:
+        raise _persistence_error(PERSISTENCE_CONFIG_INVALID, f"{field_name} is required")
+    path = PurePosixPath(text)
+    if not path.is_absolute():
+        raise _persistence_error(PERSISTENCE_CONFIG_INVALID, f"{field_name} must be an absolute runtime path")
+    return path
+
+
+def _persistence_relative_path(value: str, *, field_name: str) -> PurePosixPath:
+    text = str(value or "").strip()
+    if not text:
+        raise _persistence_error(PERSISTENCE_CONFIG_INVALID, f"{field_name} is required")
+    path = PurePosixPath(text)
+    if path.is_absolute():
+        raise _persistence_error(PERSISTENCE_CONFIG_INVALID, f"{field_name} must be relative to SKILLBOX_STATE_ROOT")
+    if any(part in {"", ".", ".."} for part in path.parts):
+        raise _persistence_error(PERSISTENCE_CONFIG_INVALID, f"{field_name} must not contain traversal segments")
+    return path
+
+
+def _env_bool(env_values: dict[str, str], key: str, default: bool) -> bool:
+    raw = str(env_values.get(key, "")).strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _env_float(env_values: dict[str, str], key: str, default: float) -> float:
+    raw = str(env_values.get(key, "")).strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise _persistence_error(PERSISTENCE_CONFIG_INVALID, f"{key} must be numeric") from exc
+
+
+def storage_binding_by_id(storage: dict[str, Any] | None, binding_id: str) -> dict[str, Any] | None:
+    if not storage:
+        return None
+    for binding in storage.get("bindings") or []:
+        if str(binding.get("id") or "").strip() == binding_id:
+            return binding
+    return None
+
+
+def _resolve_persistence_source_ref(root_dir: Path, source_ref: str) -> Path:
+    if source_ref == "root_dir":
+        return root_dir.resolve()
+    raise _persistence_error(PERSISTENCE_CONFIG_INVALID, f"Unsupported persistence source_ref {source_ref!r}")
+
+
+def compile_persistence_summary(root_dir: Path, env_values: dict[str, str]) -> dict[str, Any]:
+    doc = load_yaml(persistence_manifest_path(root_dir))
+    state_root_env = str(doc.get("state_root_env") or "SKILLBOX_STATE_ROOT").strip() or "SKILLBOX_STATE_ROOT"
+    provider = str(env_values.get("SKILLBOX_STORAGE_PROVIDER") or "local").strip().lower() or "local"
+    if provider not in PERSISTENCE_PROVIDERS:
+        raise _persistence_error(PERSISTENCE_CONFIG_INVALID, f"Unsupported persistence provider {provider!r}")
+
+    raw_targets = doc.get("targets")
+    if not isinstance(raw_targets, dict):
+        raise _persistence_error(PERSISTENCE_CONFIG_INVALID, "workspace/persistence.yaml must define targets")
+    target = raw_targets.get(provider)
+    if not isinstance(target, dict):
+        raise _persistence_error(DO_VOLUME_LAYOUT_MISSING, f"workspace/persistence.yaml is missing target {provider!r}")
+
+    default_state_root = str(target.get("default_state_root") or "").strip()
+    raw_state_root = str(env_values.get(state_root_env) or default_state_root).strip()
+    if not raw_state_root:
+        raise _persistence_error(STATE_ROOT_MISSING, f"{state_root_env} is required for persistence target {provider!r}")
+    state_root = host_path_to_absolute_path(root_dir, raw_state_root)
+
+    raw_bindings = doc.get("bindings")
+    if not isinstance(raw_bindings, list):
+        raise _persistence_error(PERSISTENCE_CONFIG_INVALID, "workspace/persistence.yaml must define bindings as a list")
+
+    seen_runtime_paths: set[str] = set()
+    seen_persistent_relative_paths: set[str] = set()
+    bindings: list[dict[str, Any]] = []
+
+    for index, raw_binding in enumerate(raw_bindings, start=1):
+        if not isinstance(raw_binding, dict):
+            raise _persistence_error(PERSISTENCE_CONFIG_INVALID, f"bindings[{index}] must be a mapping")
+        binding_id = str(raw_binding.get("id") or "").strip()
+        if not binding_id:
+            raise _persistence_error(PERSISTENCE_CONFIG_INVALID, f"bindings[{index}] is missing id")
+
+        runtime_path = _persistence_path(str(raw_binding.get("runtime_path") or ""), field_name=f"bindings[{binding_id}].runtime_path")
+        runtime_path_text = runtime_path.as_posix()
+        if runtime_path_text in seen_runtime_paths:
+            raise _persistence_error(PERSISTENCE_BINDING_CONFLICT, f"Duplicate persistence runtime_path {runtime_path_text!r}")
+        seen_runtime_paths.add(runtime_path_text)
+
+        storage_class = str(raw_binding.get("storage_class") or "").strip().lower()
+        if storage_class not in PERSISTENCE_STORAGE_CLASSES:
+            raise _persistence_error(PERSISTENCE_CLASS_UNKNOWN, f"Unsupported storage_class {storage_class!r} for binding {binding_id!r}")
+
+        relative_path_text = ""
+        source_ref_text = ""
+        override_env = PERSISTENCE_BINDING_ENV_OVERRIDES.get(binding_id, "")
+        resolved_host_path: Path
+
+        if storage_class == "external":
+            source_ref_text = str(raw_binding.get("source_ref") or "").strip()
+            if not source_ref_text:
+                raise _persistence_error(PERSISTENCE_CONFIG_INVALID, f"binding {binding_id!r} requires source_ref")
+            if raw_binding.get("relative_path"):
+                raise _persistence_error(PERSISTENCE_CONFIG_INVALID, f"binding {binding_id!r} cannot mix source_ref with relative_path")
+            resolved_host_path = _resolve_persistence_source_ref(root_dir, source_ref_text)
+        else:
+            relative_path = _persistence_relative_path(
+                str(raw_binding.get("relative_path") or (f"ephemeral/{binding_id}" if storage_class == "ephemeral" else "")),
+                field_name=f"binding {binding_id!r} relative_path",
+            )
+            relative_path_text = relative_path.as_posix()
+            if storage_class == "persistent":
+                if relative_path_text in seen_persistent_relative_paths:
+                    raise _persistence_error(PERSISTENCE_BINDING_CONFLICT, f"Duplicate persistent relative_path {relative_path_text!r}")
+                seen_persistent_relative_paths.add(relative_path_text)
+            override_value = str(env_values.get(override_env) or "").strip() if override_env else ""
+            if override_value:
+                resolved_host_path = host_path_to_absolute_path(root_dir, override_value)
+            else:
+                resolved_host_path = (state_root / Path(relative_path_text)).resolve()
+
+        bindings.append({
+            "id": binding_id,
+            "runtime_path": runtime_path_text,
+            "storage_class": storage_class,
+            "relative_path": relative_path_text,
+            "source_ref": source_ref_text,
+            "resolved_host_path": str(resolved_host_path),
+            "override_env": override_env or "",
+        })
+
+    return {
+        "version": int(doc.get("version", 1) or 1),
+        "provider": provider,
+        "state_root_env": state_root_env,
+        "state_root": str(state_root),
+        "raw_state_root": raw_state_root,
+        "default_state_root": default_state_root,
+        "filesystem": str(env_values.get("SKILLBOX_STORAGE_FILESYSTEM") or "").strip(),
+        "required": _env_bool(env_values, "SKILLBOX_STORAGE_REQUIRED", default=provider == "digitalocean"),
+        "min_free_gb": _env_float(env_values, "SKILLBOX_STORAGE_MIN_FREE_GB", default=0.0),
+        "bindings": bindings,
+    }
+
+
+def resolve_storage_host_path(storage: dict[str, Any] | None, raw_path: str) -> Path | None:
+    if not storage:
+        return None
+    runtime_path = PurePosixPath(str(raw_path))
+    matches: list[tuple[int, Path]] = []
+    for binding in storage.get("bindings") or []:
+        binding_runtime = PurePosixPath(str(binding.get("runtime_path") or ""))
+        try:
+            relative = runtime_path.relative_to(binding_runtime)
+        except ValueError:
+            continue
+        host_root = Path(str(binding["resolved_host_path"]))
+        if relative.parts:
+            matches.append((len(binding_runtime.parts), (host_root / Path(*relative.parts)).resolve()))
+        else:
+            matches.append((len(binding_runtime.parts), host_root.resolve()))
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item[0], reverse=True)
+    return matches[0][1]
 
 
 def resolve_placeholders(value: Any, mapping: dict[str, str]) -> Any:
@@ -301,7 +535,24 @@ def resolve_placeholders(value: Any, mapping: dict[str, str]) -> Any:
     return value
 
 
-def runtime_path_to_host_path(root_dir: Path, env_values: dict[str, str], raw_path: str) -> Path:
+def runtime_path_to_host_path(
+    root_dir: Path,
+    env_values: dict[str, str],
+    raw_path: str,
+    *,
+    storage: dict[str, Any] | None = None,
+) -> Path:
+    resolved_storage = storage
+    if resolved_storage is None:
+        try:
+            resolved_storage = compile_persistence_summary(root_dir, env_values)
+        except RuntimeError:
+            resolved_storage = None
+
+    storage_match = resolve_storage_host_path(resolved_storage, raw_path)
+    if storage_match is not None:
+        return storage_match
+
     path = Path(raw_path)
     workspace_root = Path(env_values["SKILLBOX_WORKSPACE_ROOT"])
     home_root = Path(env_values["SKILLBOX_HOME_ROOT"])
@@ -696,11 +947,14 @@ def _base_runtime_model(
     env_values: dict[str, str],
     normalized: dict[str, Any],
 ) -> dict[str, Any]:
+    storage = compile_persistence_summary(root_dir, env_values)
     return {
         "root_dir": str(root_dir),
         "manifest_file": str(runtime_manifest_path(root_dir)),
+        "persistence_manifest_file": str(persistence_manifest_path(root_dir)),
         "version": resolved.get("version", 1),
         "env": {key: env_values.get(key, "") for key in MANIFEST_ENV_KEYS},
+        "storage": storage,
         "selection": normalized["selection"],
         "clients": normalized["clients"],
         "repos": normalized["repos"],
@@ -726,7 +980,7 @@ def _populate_repo_defaults(model: dict[str, Any], root_dir: Path) -> None:
         repo.setdefault("sync", {})
         repo.setdefault("source", {})
         if repo.get("path") and "host_path" not in repo:
-            repo["host_path"] = str(runtime_path_to_host_path(root_dir, model["env"], str(repo["path"])))
+            repo["host_path"] = str(runtime_path_to_host_path(root_dir, model["env"], str(repo["path"]), storage=model.get("storage")))
 
 
 def _populate_artifact_defaults(model: dict[str, Any], root_dir: Path) -> None:
@@ -739,7 +993,7 @@ def _populate_artifact_defaults(model: dict[str, Any], root_dir: Path) -> None:
         artifact.setdefault("source", {})
         if artifact.get("path"):
             artifact["host_path"] = str(
-                runtime_path_to_host_path(root_dir, model["env"], str(artifact["path"]))
+                runtime_path_to_host_path(root_dir, model["env"], str(artifact["path"]), storage=model.get("storage"))
             )
         source = artifact.get("source") or {}
         if source.get("kind") == "file" and source.get("path"):
@@ -759,7 +1013,7 @@ def _populate_env_file_defaults(model: dict[str, Any], root_dir: Path) -> None:
         env_file.setdefault("mode", "0600")
         if env_file.get("path"):
             env_file["host_path"] = str(
-                runtime_path_to_host_path(root_dir, model["env"], str(env_file["path"]))
+                runtime_path_to_host_path(root_dir, model["env"], str(env_file["path"]), storage=model.get("storage"))
             )
         source = env_file.get("source") or {}
         if source.get("kind") == "file" and source.get("path"):
@@ -778,7 +1032,7 @@ def _populate_skill_defaults(model: dict[str, Any], root_dir: Path) -> None:
         for field in ("bundle_dir", "manifest", "sources_config", "lock_path", "skill_repos_config", "clone_root"):
             if skill.get(field):
                 skill[f"{field}_host_path"] = str(
-                    runtime_path_to_host_path(root_dir, model["env"], str(skill[field]))
+                    runtime_path_to_host_path(root_dir, model["env"], str(skill[field]), storage=model.get("storage"))
                 )
         normalized_targets: list[dict[str, Any]] = []
         for target in skill.get("install_targets") or []:
@@ -787,7 +1041,7 @@ def _populate_skill_defaults(model: dict[str, Any], root_dir: Path) -> None:
             target = dict(target)
             if target.get("path"):
                 target["host_path"] = str(
-                    runtime_path_to_host_path(root_dir, model["env"], str(target["path"]))
+                    runtime_path_to_host_path(root_dir, model["env"], str(target["path"]), storage=model.get("storage"))
                 )
             normalized_targets.append(target)
         skill["install_targets"] = normalized_targets
@@ -807,7 +1061,7 @@ def _populate_task_defaults(model: dict[str, Any], root_dir: Path) -> None:
         success = task.get("success") or {}
         if success.get("path"):
             success["host_path"] = str(
-                runtime_path_to_host_path(root_dir, model["env"], str(success["path"]))
+                runtime_path_to_host_path(root_dir, model["env"], str(success["path"]), storage=model.get("storage"))
             )
             task["success"] = success
 
@@ -818,11 +1072,11 @@ def _populate_service_defaults(model: dict[str, Any], root_dir: Path) -> None:
         service.setdefault("profiles", [])
         service.setdefault("client", "")
         if service.get("path"):
-            service["host_path"] = str(runtime_path_to_host_path(root_dir, model["env"], str(service["path"])))
+            service["host_path"] = str(runtime_path_to_host_path(root_dir, model["env"], str(service["path"]), storage=model.get("storage")))
         healthcheck = service.get("healthcheck") or {}
         if healthcheck.get("path"):
             healthcheck["host_path"] = str(
-                runtime_path_to_host_path(root_dir, model["env"], str(healthcheck["path"]))
+                runtime_path_to_host_path(root_dir, model["env"], str(healthcheck["path"]), storage=model.get("storage"))
             )
             service["healthcheck"] = healthcheck
 
@@ -834,7 +1088,7 @@ def _populate_log_defaults(model: dict[str, Any], root_dir: Path) -> None:
         log_item.setdefault("client", "")
         if log_item.get("path"):
             log_item["host_path"] = str(
-                runtime_path_to_host_path(root_dir, model["env"], str(log_item["path"]))
+                runtime_path_to_host_path(root_dir, model["env"], str(log_item["path"]), storage=model.get("storage"))
             )
 
 
@@ -847,7 +1101,7 @@ def _populate_bridge_defaults(model: dict[str, Any], root_dir: Path) -> None:
         bridge.setdefault("emit_stubs", False)
         if bridge.get("output_root"):
             bridge["output_root_host_path"] = str(
-                runtime_path_to_host_path(root_dir, model["env"], str(bridge["output_root"]))
+                runtime_path_to_host_path(root_dir, model["env"], str(bridge["output_root"]), storage=model.get("storage"))
             )
 
 
@@ -857,7 +1111,7 @@ def _populate_check_defaults(model: dict[str, Any], root_dir: Path) -> None:
         check.setdefault("profiles", [])
         check.setdefault("client", "")
         if check.get("path"):
-            check["host_path"] = str(runtime_path_to_host_path(root_dir, model["env"], str(check["path"])))
+            check["host_path"] = str(runtime_path_to_host_path(root_dir, model["env"], str(check["path"]), storage=model.get("storage")))
 
 
 def _populate_service_mode_command_defaults(model: dict[str, Any], root_dir: Path) -> None:
@@ -888,7 +1142,7 @@ def _populate_client_defaults(model: dict[str, Any], root_dir: Path) -> None:
         client.setdefault("label", client.get("id", ""))
         if client.get("default_cwd"):
             client["default_cwd_host_path"] = str(
-                runtime_path_to_host_path(root_dir, model["env"], str(client["default_cwd"]))
+                runtime_path_to_host_path(root_dir, model["env"], str(client["default_cwd"]), storage=model.get("storage"))
             )
 
 
