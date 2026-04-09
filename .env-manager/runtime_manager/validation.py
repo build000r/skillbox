@@ -40,6 +40,10 @@ def normalize_active_profiles(raw_profiles: list[str] | None) -> set[str]:
     return active_profiles
 
 
+def _is_int_port(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def normalize_active_clients(model: dict[str, Any], raw_clients: list[str] | None) -> set[str]:
     requested_clients = {value.strip() for value in raw_clients or [] if value and value.strip()}
     available_clients = {
@@ -231,6 +235,8 @@ def filter_model(model: dict[str, Any], active_profiles: set[str], active_client
         task = tasks_by_id.get(task_id)
         if task is None:
             return
+        if not item_matches_profiles(task, active_profiles) or not item_matches_clients(task, active_clients):
+            return
         for dependency_id in raw_task_dependency_ids(task):
             include_task(dependency_id)
         if task_id in included_task_ids:
@@ -245,6 +251,20 @@ def filter_model(model: dict[str, Any], active_profiles: set[str], active_client
     for task in list(filtered_model["tasks"]):
         for dependency_id in raw_task_dependency_ids(task):
             include_task(dependency_id)
+
+    for service in filtered_model["services"]:
+        service["bootstrap_tasks"] = [
+            task_id
+            for task_id in raw_service_bootstrap_task_ids(service)
+            if task_id in included_task_ids
+        ]
+
+    for task in filtered_model["tasks"]:
+        task["depends_on"] = [
+            dependency_id
+            for dependency_id in raw_task_dependency_ids(task)
+            if dependency_id in included_task_ids
+        ]
 
     required_repo_ids = {
         str(service["repo"])
@@ -1021,6 +1041,11 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
         for task in model["tasks"]
         if str(task.get("id", "")).strip()
     }
+    bridge_ids = {
+        str(bridge.get("id", "")).strip()
+        for bridge in model.get("bridges") or []
+        if str(bridge.get("id", "")).strip()
+    }
     log_ids = {log_item.get("id") for log_item in model["logs"]}
 
     for repo in model["repos"]:
@@ -1181,6 +1206,16 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
             issues.append(f"task {task.get('id')} has unsupported success.type {success_type!r}")
         if success_type == "path_exists" and not success.get("path"):
             issues.append(f"task {task.get('id')} path_exists success is missing path")
+        if success_type == "all_outputs_exist":
+            target = str(success.get("target") or "").strip()
+            if not target:
+                issues.append(f"task {task.get('id')} all_outputs_exist success is missing target")
+            elif target not in bridge_ids:
+                issues.append(
+                    f"task {task.get('id')} all_outputs_exist success references unknown bridge {target!r}"
+                )
+        if success_type == "port_listening" and not _is_int_port(success.get("port")):
+            issues.append(f"task {task.get('id')} port_listening success is missing integer port")
 
     service_ids = {
         str(service.get("id", "")).strip()
@@ -1267,6 +1302,8 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
                 issues.append(f"service {service.get('id')} path_exists healthcheck is missing path")
             if healthcheck_type == "process_running" and not healthcheck.get("pattern"):
                 issues.append(f"service {service.get('id')} process_running healthcheck is missing pattern")
+            if healthcheck_type == "port" and not _is_int_port(healthcheck.get("port")):
+                issues.append(f"service {service.get('id')} port healthcheck is missing integer port")
 
     visiting: list[str] = []
     visited: set[str] = set()

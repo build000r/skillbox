@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import socket
 import tempfile
 import textwrap
 import unittest
@@ -29,6 +30,7 @@ parity_ledger_deferred_surfaces = MANAGE_MODULE.parity_ledger_deferred_surfaces
 reconcile_local_runtime_env = MANAGE_MODULE.reconcile_local_runtime_env
 runtime_status = MANAGE_MODULE.runtime_status
 select_local_runtime_services = MANAGE_MODULE.select_local_runtime_services
+service_healthcheck_state = MANAGE_MODULE.service_healthcheck_state
 validate_env_file_target_paths = MANAGE_MODULE.validate_env_file_target_paths
 validate_parity_ledger = MANAGE_MODULE.validate_parity_ledger
 normalize_active_clients = MANAGE_MODULE.normalize_active_clients
@@ -125,9 +127,9 @@ def _write_local_runtime_fixture(repo: Path, *, with_bridge_outputs: bool = Fals
               default_cwd: {repo}
 
               repos:
-                - id: sweet-potato
+                - id: auth-app
                   kind: repo
-                  repo_path: {repo}/sweet-potato
+                  repo_path: {repo}/auth-app
                   profiles:
                     - local-minimal
 
@@ -135,9 +137,9 @@ def _write_local_runtime_fixture(repo: Path, *, with_bridge_outputs: bool = Fals
                 - id: local-minimal-bridge
                   env_tier: local
                   legacy_targets:
-                    - sweet-potato
-                    - htma_server
-                    - htma
+                    - auth-app
+                    - svc-api
+                    - svc-web
                   output_root: {repo}/env-out
                   emit_stubs: false
                   profiles:
@@ -152,22 +154,22 @@ def _write_local_runtime_fixture(repo: Path, *, with_bridge_outputs: bool = Fals
                   command: echo bridge-ran
 
               env_files:
-                - id: sweet-potato-env
-                  repo_id: sweet-potato
-                  target_path: {repo}/sweet-potato/.env.local
+                - id: auth-app-env
+                  repo_id: auth-app
+                  target_path: {repo}/auth-app/.env.local
                   required: true
                   profiles:
                     - local-minimal
                   source:
                     kind: file
-                    source_path: {repo}/env-out/sweet-potato/local.env
+                    source_path: {repo}/env-out/auth-app/local.env
                   sync:
                     mode: write
 
               services:
-                - id: spaps
+                - id: svc-auth
                   kind: http
-                  repo_id: sweet-potato
+                  repo_id: auth-app
                   profiles:
                     - local-minimal
                   depends_on: []
@@ -180,12 +182,12 @@ def _write_local_runtime_fixture(repo: Path, *, with_bridge_outputs: bool = Fals
                     type: http
                     url: http://localhost:3301/health
 
-                - id: htma_server
+                - id: svc-api
                   kind: http
                   profiles:
                     - local-minimal
                   depends_on:
-                    - spaps
+                    - svc-auth
                   bootstrap_tasks:
                     - env-bridge-local-minimal
                   start_modes:
@@ -194,13 +196,13 @@ def _write_local_runtime_fixture(repo: Path, *, with_bridge_outputs: bool = Fals
                     type: http
                     url: http://localhost:8000/health
 
-                - id: htma
+                - id: svc-web
                   kind: http
                   profiles:
                     - local-minimal
                   depends_on:
-                    - spaps
-                    - htma_server
+                    - svc-auth
+                    - svc-api
                   bootstrap_tasks:
                     - env-bridge-local-minimal
                   start_modes:
@@ -210,10 +212,10 @@ def _write_local_runtime_fixture(repo: Path, *, with_bridge_outputs: bool = Fals
                     url: http://localhost:3000
 
               ingress_routes:
-                - id: htma-public
-                  service_id: htma
+                - id: web-public
+                  service_id: svc-web
                   listener: public
-                  path: /htma
+                  path: /web
                   match: prefix
                   profiles:
                     - local-minimal
@@ -230,7 +232,7 @@ def _write_local_runtime_fixture(repo: Path, *, with_bridge_outputs: bool = Fals
     )
 
     if with_bridge_outputs:
-        for target in ("sweet-potato", "htma_server", "htma"):
+        for target in ("auth-app", "svc-api", "svc-web"):
             out_dir = repo / "env-out" / target
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "local.env").write_text(f"# generated for {target}\n", encoding="utf-8")
@@ -249,12 +251,12 @@ class BridgeModelCompilationTests(unittest.TestCase):
             self.assertIn("local-minimal-bridge", bridges)
             bridge = bridges["local-minimal-bridge"]
             self.assertEqual(bridge["env_tier"], "local")
-            self.assertEqual(bridge["legacy_targets"], ["sweet-potato", "htma_server", "htma"])
+            self.assertEqual(bridge["legacy_targets"], ["auth-app", "svc-api", "svc-web"])
             self.assertIn("output_root_host_path", bridge)
             self.assertEqual(bridge["client"], "personal")
             routes = {route["id"]: route for route in model["ingress_routes"]}
-            self.assertEqual(routes["htma-public"]["service_id"], "htma")
-            self.assertEqual(routes["htma-public"]["listener"], "public")
+            self.assertEqual(routes["web-public"]["service_id"], "svc-web")
+            self.assertEqual(routes["web-public"]["listener"], "public")
 
     def test_filter_model_scopes_bridges_by_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -275,6 +277,21 @@ class BridgeModelCompilationTests(unittest.TestCase):
             self.assertEqual(len(filtered_core["bridges"]), 0)
             self.assertEqual(len(filtered_core["ingress_routes"]), 0)
 
+    def test_filter_model_prunes_bootstrap_tasks_outside_active_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            _write_local_runtime_fixture(repo)
+            model = runtime_model.build_runtime_model(repo)
+
+            active = normalize_active_profiles(["local-minimal"])
+            clients = normalize_active_clients(model, ["personal"])
+            filtered = filter_model(model, active, clients)
+
+            task_ids = {task["id"] for task in filtered["tasks"]}
+            self.assertEqual(task_ids, {"env-bridge-local-minimal"})
+            for service in filtered["services"]:
+                self.assertEqual(service.get("bootstrap_tasks"), ["env-bridge-local-minimal"])
+
     def test_filter_model_includes_local_services_for_local_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir).resolve()
@@ -286,7 +303,7 @@ class BridgeModelCompilationTests(unittest.TestCase):
             filtered = filter_model(model, active, clients)
 
             service_ids = {s["id"] for s in filtered["services"]}
-            self.assertEqual(service_ids, {"spaps", "htma_server", "htma"})
+            self.assertEqual(service_ids, {"svc-auth", "svc-api", "svc-web"})
 
     def test_filter_model_scopes_parity_ledger_by_client_and_intended_profile(self) -> None:
         model = {
@@ -347,23 +364,23 @@ class BridgeFreshnessTests(unittest.TestCase):
     def test_bridge_expected_outputs_generates_correct_paths(self) -> None:
         bridge = {
             "output_root_host_path": "/env-out",
-            "legacy_targets": ["sweet-potato", "htma_server"],
+            "legacy_targets": ["auth-app", "svc-api"],
             "env_tier": "local",
         }
         outputs = bridge_expected_outputs(bridge)
         self.assertEqual(len(outputs), 2)
-        self.assertEqual(outputs[0], Path("/env-out/sweet-potato/local.env"))
-        self.assertEqual(outputs[1], Path("/env-out/htma_server/local.env"))
+        self.assertEqual(outputs[0], Path("/env-out/auth-app/local.env"))
+        self.assertEqual(outputs[1], Path("/env-out/svc-api/local.env"))
 
     def test_bridge_outputs_state_ok_when_all_present(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            for target in ("sweet-potato", "htma_server"):
+            for target in ("auth-app", "svc-api"):
                 (root / target).mkdir()
                 (root / target / "local.env").write_text("ok\n")
             bridge = {
                 "output_root_host_path": str(root),
-                "legacy_targets": ["sweet-potato", "htma_server"],
+                "legacy_targets": ["auth-app", "svc-api"],
                 "env_tier": "local",
             }
             state = bridge_outputs_state(bridge)
@@ -372,17 +389,17 @@ class BridgeFreshnessTests(unittest.TestCase):
     def test_bridge_outputs_state_missing_when_absent(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            (root / "sweet-potato").mkdir()
-            (root / "sweet-potato" / "local.env").write_text("ok\n")
+            (root / "auth-app").mkdir()
+            (root / "auth-app" / "local.env").write_text("ok\n")
             bridge = {
                 "output_root_host_path": str(root),
-                "legacy_targets": ["sweet-potato", "htma_server"],
+                "legacy_targets": ["auth-app", "svc-api"],
                 "env_tier": "local",
             }
             state = bridge_outputs_state(bridge)
             self.assertEqual(state["state"], "missing")
             self.assertEqual(len(state["missing"]), 1)
-            self.assertIn("htma_server", state["missing"][0])
+            self.assertIn("svc-api", state["missing"][0])
 
     def test_bridge_freshness_returns_fresh_when_outputs_newer_than_overlay(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -433,14 +450,14 @@ class BridgeBackedTaskTests(unittest.TestCase):
     def test_task_success_state_ok_when_bridge_outputs_present(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            for target in ("sweet-potato", "htma_server"):
+            for target in ("auth-app", "svc-api"):
                 (root / target).mkdir()
                 (root / target / "local.env").write_text("ok\n")
             model = {
                 "bridges": [{
                     "id": "local-minimal-bridge",
                     "output_root_host_path": str(root),
-                    "legacy_targets": ["sweet-potato", "htma_server"],
+                    "legacy_targets": ["auth-app", "svc-api"],
                     "env_tier": "local",
                 }],
             }
@@ -456,7 +473,7 @@ class BridgeBackedTaskTests(unittest.TestCase):
                 "bridges": [{
                     "id": "local-minimal-bridge",
                     "output_root_host_path": str(root),
-                    "legacy_targets": ["sweet-potato"],
+                    "legacy_targets": ["auth-app"],
                     "env_tier": "local",
                 }],
             }
@@ -475,6 +492,25 @@ class BridgeBackedTaskTests(unittest.TestCase):
         state = task_success_state(task)
         self.assertEqual(state["state"], "down")
 
+    def test_task_success_state_port_listening_reports_ok_when_socket_open(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            port = server.getsockname()[1]
+            task = {"id": "db-bootstrap", "success": {"type": "port_listening", "port": port}}
+            state = task_success_state(task)
+            self.assertEqual(state["state"], "ok")
+            self.assertEqual(state["target"], f"127.0.0.1:{port}")
+
+    def test_service_healthcheck_state_supports_port_checks(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            port = server.getsockname()[1]
+            state = service_healthcheck_state({"healthcheck": {"type": "port", "port": port}})
+            self.assertEqual(state["state"], "ok")
+            self.assertEqual(state["port"], port)
+
 
 class LocalRuntimeProfileValidationTests(unittest.TestCase):
     """WG-002/WG-004: Profile validation for local-* profiles."""
@@ -482,7 +518,7 @@ class LocalRuntimeProfileValidationTests(unittest.TestCase):
     def test_valid_local_profile_with_services_returns_no_errors(self) -> None:
         model = {
             "active_profiles": ["core", "local-minimal"],
-            "services": [{"id": "spaps", "profiles": ["local-minimal"]}],
+            "services": [{"id": "svc-auth", "profiles": ["local-minimal"]}],
         }
         errors = validate_local_runtime_profiles(model)
         self.assertEqual(len(errors), 0)
@@ -490,7 +526,7 @@ class LocalRuntimeProfileValidationTests(unittest.TestCase):
     def test_local_profile_without_services_returns_profile_unknown(self) -> None:
         model = {
             "active_profiles": ["core", "local-nonexistent"],
-            "services": [{"id": "spaps", "profiles": ["local-minimal"]}],
+            "services": [{"id": "svc-auth", "profiles": ["local-minimal"]}],
         }
         errors = validate_local_runtime_profiles(model)
         self.assertEqual(len(errors), 1)
@@ -512,7 +548,7 @@ class LocalRuntimeErrorCodeTests(unittest.TestCase):
     def test_env_bridge_failed_error_shape(self) -> None:
         err = local_runtime_error(
             "LOCAL_RUNTIME_ENV_BRIDGE_FAILED",
-            "sync.sh exited 1 for targets: sweet-potato",
+            "sync.sh exited 1 for targets: auth-app",
             recoverable=True,
             next_action="re-run sync.sh manually to diagnose",
         )
@@ -523,7 +559,7 @@ class LocalRuntimeErrorCodeTests(unittest.TestCase):
     def test_env_output_missing_error_shape(self) -> None:
         err = local_runtime_error(
             "LOCAL_RUNTIME_ENV_OUTPUT_MISSING",
-            "sweet-potato/local.env missing after bridge",
+            "auth-app/local.env missing after bridge",
             recoverable=True,
         )
         self.assertEqual(err["error"]["type"], "LOCAL_RUNTIME_ENV_OUTPUT_MISSING")
@@ -542,17 +578,17 @@ class LocalRuntimeErrorCodeTests(unittest.TestCase):
     def test_start_blocked_error_shape(self) -> None:
         err = local_runtime_error(
             "LOCAL_RUNTIME_START_BLOCKED",
-            "htma_server health check timed out after 30s",
-            blocked_services=["htma_server", "htma"],
+            "svc-api health check timed out after 30s",
+            blocked_services=["svc-api", "svc-web"],
             next_action="manage.py status --client personal --profile local-minimal",
         )
         self.assertEqual(err["error"]["type"], "LOCAL_RUNTIME_START_BLOCKED")
-        self.assertEqual(err["error"]["blocked_services"], ["htma_server", "htma"])
+        self.assertEqual(err["error"]["blocked_services"], ["svc-api", "svc-web"])
 
     def test_service_deferred_error_shape(self) -> None:
         err = local_runtime_error(
             "LOCAL_RUNTIME_SERVICE_DEFERRED",
-            "ingredient_server is not yet covered by the overlay runtime",
+            "svc-worker is not yet covered by the overlay runtime",
             recoverable=True,
         )
         self.assertEqual(err["error"]["type"], "LOCAL_RUNTIME_SERVICE_DEFERRED")
@@ -560,7 +596,7 @@ class LocalRuntimeErrorCodeTests(unittest.TestCase):
     def test_mode_unsupported_error_shape(self) -> None:
         err = local_runtime_error(
             "LOCAL_RUNTIME_MODE_UNSUPPORTED",
-            "start mode 'prod' is not supported for htma",
+            "start mode 'prod' is not supported for svc-web",
             recoverable=False,
         )
         self.assertEqual(err["error"]["type"], "LOCAL_RUNTIME_MODE_UNSUPPORTED")
@@ -613,6 +649,20 @@ class BridgeDoctorValidationTests(unittest.TestCase):
         codes = [r.code for r in results]
         self.assertIn("bridge_reference_missing", codes)
 
+    def test_doctor_treats_bridge_backed_missing_env_sources_as_warn_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            _write_local_runtime_fixture(repo, with_bridge_outputs=False)
+            model = runtime_model.build_runtime_model(repo)
+
+            active = normalize_active_profiles(["local-minimal"])
+            clients = normalize_active_clients(model, ["personal"])
+            filtered = filter_model(model, active, clients)
+            results = doctor_results(filtered, repo)
+
+            fail_codes = {result.code for result in results if result.status == "fail"}
+            self.assertNotIn("required-runtime-env-files", fail_codes)
+
 
 class FullModelIntegrationTests(unittest.TestCase):
     """WG-004: End-to-end model compilation with local-runtime overlay."""
@@ -633,9 +683,9 @@ class FullModelIntegrationTests(unittest.TestCase):
 
             # Services present with correct dependency order
             service_ids = [s["id"] for s in filtered["services"]]
-            self.assertIn("spaps", service_ids)
-            self.assertIn("htma_server", service_ids)
-            self.assertIn("htma", service_ids)
+            self.assertIn("svc-auth", service_ids)
+            self.assertIn("svc-api", service_ids)
+            self.assertIn("svc-web", service_ids)
 
             # Tasks present
             task_ids = {t["id"] for t in filtered["tasks"]}
@@ -671,19 +721,18 @@ class FullModelIntegrationTests(unittest.TestCase):
 #
 # These tests drive reconcile_local_runtime_env / local_runtime_focus_payload /
 # validate_env_file_target_paths against an in-memory six-service model that
-# mirrors the personal overlay declared in
-# /Users/b/repos/skillbox-config/clients/personal/overlay.yaml (shared.md US-1).
+# mirrors the shape of a typical client overlay (shared.md US-1).
 # We build the model as plain dicts rather than materialising overlay.yaml so
 # the tests stay fast and hermetic.
 from typing import Any
 
 LOCAL_CORE_SERVICE_IDS: tuple[str, ...] = (
-    "spaps",
-    "htma_server",
-    "ingredient_server",
-    "approval_feedback_api",
-    "cfo",
-    "htma",
+    "svc-auth",
+    "svc-api",
+    "svc-worker",
+    "svc_feedback",
+    "svc-finance",
+    "svc-web",
 )
 
 
@@ -692,29 +741,29 @@ def _build_local_core_model(
     *,
     with_bridge_outputs: bool = True,
     parity_ledger_overrides: list[dict[str, Any]] | None = None,
-    approval_env_filename: str = ".env",
-    include_approval_bootstrap: bool = True,
+    feedback_env_filename: str = ".env",
+    include_feedback_bootstrap: bool = True,
 ) -> dict[str, Any]:
     """Return a minimal in-memory runtime model for the local-core graph.
 
     Mirrors the personal overlay contract from shared.md (WG-001/WG-002):
       * six services with declared mode commands (reuse/prod/fresh)
       * one env bridge with six legacy targets
-      * two bootstrap tasks (env-bridge-local-core, approval-feedback-db-bootstrap)
-      * approval_feedback_api env target is repo-local ``.env``
-      * a parity ledger with one deferred surface (``buildooor``) + the
+      * two bootstrap tasks (env-bridge-local-core, svc-feedback-db-bootstrap)
+      * svc_feedback env target is repo-local ``.env``
+      * a parity ledger with one deferred surface (``legacy-builder``) + the
         bridge-only ``sync.sh env compilation`` seam, keyed by the six
         covered services as ``covered``.
     """
     bridge_root = repo_root / "env-out"
     if with_bridge_outputs:
         for target in (
-            "sweet-potato",
-            "htma_server",
-            "ingredient_server",
-            "unclawg-approval-feedback-api",
-            "cfo",
-            "htma",
+            "auth-app",
+            "svc-api",
+            "svc-worker",
+            "svc-feedback-bridge-target",
+            "svc-finance",
+            "svc-web",
         ):
             target_dir = bridge_root / target
             target_dir.mkdir(parents=True, exist_ok=True)
@@ -733,12 +782,12 @@ def _build_local_core_model(
         }
 
     repos = [
-        _repo("sweet-potato", "sweet-potato"),
-        _repo("htma_server", "htma_server"),
-        _repo("ingredient_server", "ingredient_server"),
-        _repo("approval-feedback-api", "unclawg/services/approval_feedback_api"),
-        _repo("cfo", "cfo"),
-        _repo("htma", "htma"),
+        _repo("auth-app", "auth-app"),
+        _repo("svc-api", "svc-api"),
+        _repo("svc-worker", "svc-worker"),
+        _repo("svc-feedback-repo", "apps/services/svc_feedback"),
+        _repo("svc-finance", "svc-finance"),
+        _repo("svc-web", "svc-web"),
     ]
 
     bridges = [
@@ -747,12 +796,12 @@ def _build_local_core_model(
             "client": "personal",
             "env_tier": "local",
             "legacy_targets": [
-                "sweet-potato",
-                "htma_server",
-                "ingredient_server",
-                "unclawg-approval-feedback-api",
-                "cfo",
-                "htma",
+                "auth-app",
+                "svc-api",
+                "svc-worker",
+                "svc-feedback-bridge-target",
+                "svc-finance",
+                "svc-web",
             ],
             "output_root": str(bridge_root),
             "output_root_host_path": str(bridge_root),
@@ -770,61 +819,62 @@ def _build_local_core_model(
             "command": "sync.sh --emit",
         }
     ]
-    if include_approval_bootstrap:
+    if include_feedback_bootstrap:
         tasks.append(
             {
-                "id": "approval-feedback-db-bootstrap",
+                "id": "svc-feedback-db-bootstrap",
                 "kind": "bootstrap",
-                "repo_id": "approval-feedback-api",
+                "repo_id": "svc-feedback-repo",
                 "profiles": ["local-core"],
-                "command": "docker start unclawg-db-1 >/dev/null 2>&1 || true",
+                "command": "docker start feedback-db-1 >/dev/null 2>&1 || true",
                 "success": {
                     "type": "path_exists",
-                    "host_path": str(repo_root / ".unclawg-db.ready"),
+                    "host_path": str(repo_root / ".feedback-db.ready"),
                 },
             }
         )
 
-    approval_target = (
+    feedback_target = (
         repo_root
-        / "unclawg"
+        / "apps"
         / "services"
-        / "approval_feedback_api"
-        / approval_env_filename
+        / "svc_feedback"
+        / feedback_env_filename
     )
-    approval_source = (
-        bridge_root / "unclawg-approval-feedback-api" / "local.env"
+    feedback_source = (
+        bridge_root / "svc-feedback-bridge-target" / "local.env"
     )
     # Pre-create the target so env_file_state reports state="ok" for
     # ensure_required_env_files_ready (WG-005 pre-mutation check).
-    if with_bridge_outputs and approval_env_filename == ".env":
-        approval_target.parent.mkdir(parents=True, exist_ok=True)
-        if approval_source.is_file():
-            approval_target.write_bytes(approval_source.read_bytes())
+    if with_bridge_outputs and feedback_env_filename == ".env":
+        feedback_target.parent.mkdir(parents=True, exist_ok=True)
+        if feedback_source.is_file():
+            feedback_target.write_bytes(feedback_source.read_bytes())
             # env_file_state enforces 0o600 for a matching target
             import os as _os
-            _os.chmod(approval_target, 0o600)
+            _os.chmod(feedback_target, 0o600)
     env_files = [
         {
-            "id": "approval-feedback-env",
-            "repo": "approval-feedback-api",
-            "repo_id": "approval-feedback-api",
-            "path": str(approval_target),
-            "host_path": str(approval_target),
-            "target_path": str(approval_target),
+            "id": "svc-feedback-env",
+            "repo": "svc-feedback-repo",
+            "repo_id": "svc-feedback-repo",
+            "path": str(feedback_target),
+            "host_path": str(feedback_target),
+            "target_path": str(feedback_target),
             "required": True,
+            "enforce_filename": ".env",
             "profiles": ["local-core"],
             "mode": "0600",
             "source": {
                 "kind": "file",
-                "path": str(approval_source),
-                "host_path": str(approval_source),
-                "source_path": str(approval_source),
+                "path": str(feedback_source),
+                "host_path": str(feedback_source),
+                "source_path": str(feedback_source),
             },
             "sync": {"mode": "write"},
             "source_kind": "file",
-            "source_path": str(approval_source),
-            "source_host_path": str(approval_source),
+            "source_path": str(feedback_source),
+            "source_host_path": str(feedback_source),
         }
     ]
 
@@ -852,28 +902,28 @@ def _build_local_core_model(
             "health_target": health_url,
         }
 
-    approval_bootstraps = ["env-bridge-local-core"]
-    if include_approval_bootstrap:
-        approval_bootstraps.append("approval-feedback-db-bootstrap")
+    feedback_bootstraps = ["env-bridge-local-core"]
+    if include_feedback_bootstrap:
+        feedback_bootstraps.append("svc-feedback-db-bootstrap")
 
     services = [
-        _svc("spaps", "sweet-potato", [], "http://localhost:3301/health"),
-        _svc("htma_server", "htma_server", ["spaps"], "http://localhost:8000/health"),
+        _svc("svc-auth", "auth-app", [], "http://localhost:3301/health"),
+        _svc("svc-api", "svc-api", ["svc-auth"], "http://localhost:8000/health"),
         _svc(
-            "ingredient_server",
-            "ingredient_server",
-            ["spaps"],
+            "svc-worker",
+            "svc-worker",
+            ["svc-auth"],
             "http://localhost:8001/health",
         ),
         _svc(
-            "approval_feedback_api",
-            "approval-feedback-api",
-            ["spaps"],
+            "svc_feedback",
+            "svc-feedback-repo",
+            ["svc-auth"],
             "http://localhost:8010/health",
-            bootstrap_tasks=approval_bootstraps,
+            bootstrap_tasks=feedback_bootstraps,
         ),
-        _svc("cfo", "cfo", ["spaps"], "http://localhost:8050/health"),
-        _svc("htma", "htma", ["spaps", "htma_server"], "http://localhost:5173"),
+        _svc("svc-finance", "svc-finance", ["svc-auth"], "http://localhost:8050/health"),
+        _svc("svc-web", "svc-web", ["svc-auth", "svc-api"], "http://localhost:5173"),
     ]
 
     parity_ledger = [
@@ -889,8 +939,8 @@ def _build_local_core_model(
         for sid in LOCAL_CORE_SERVICE_IDS
     ] + [
         {
-            "id": "buildooor",
-            "legacy_surface": "buildooor",
+            "id": "legacy-builder",
+            "legacy_surface": "legacy-builder",
             "surface_type": "service",
             "action": "build",
             "ownership_state": "deferred",
@@ -1035,7 +1085,7 @@ class LocalCoreFocusUS1Tests(unittest.TestCase):
             model = _build_local_core_model(repo, with_bridge_outputs=True)
             # Nuke one bridge output to simulate an incomplete bridge run.
             missing_path = (
-                repo / "env-out" / "unclawg-approval-feedback-api" / "local.env"
+                repo / "env-out" / "svc-feedback-bridge-target" / "local.env"
             )
             missing_path.unlink()
             # Drop the bridge task so reconciliation cannot repair it.
@@ -1061,7 +1111,7 @@ class LocalCoreFocusUS1Tests(unittest.TestCase):
             original = runtime_ops_mod.run_tasks
 
             def _boom(*args: object, **kwargs: object) -> None:
-                raise RuntimeError("sync.sh exited 1 for targets: sweet-potato")
+                raise RuntimeError("sync.sh exited 1 for targets: auth-app")
 
             runtime_ops_mod.run_tasks = _boom  # type: ignore[assignment]
             try:
@@ -1080,7 +1130,7 @@ class LocalCoreFocusUS1Tests(unittest.TestCase):
             )
             self.assertIn("sync.sh", result["error"]["detail"])
 
-    def test_approval_feedback_env_target_must_be_dot_env(self) -> None:
+    def test_svc_feedback_env_target_must_be_dot_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir).resolve()
             good = _build_local_core_model(repo)
@@ -1088,17 +1138,17 @@ class LocalCoreFocusUS1Tests(unittest.TestCase):
                 validate_env_file_target_paths(good["env_files"], good),
                 [],
             )
-            bad = _build_local_core_model(repo, approval_env_filename=".env.local")
+            bad = _build_local_core_model(repo, feedback_env_filename=".env.local")
             violations = validate_env_file_target_paths(bad["env_files"], bad)
             self.assertEqual(len(violations), 1)
-            self.assertIn("approval_feedback_api", violations[0])
+            self.assertIn("svc_feedback", violations[0])
             self.assertIn(".env", violations[0])
 
     def test_wrong_env_target_path_surfaces_as_env_output_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir).resolve()
             model = _build_local_core_model(
-                repo, approval_env_filename=".env.local",
+                repo, feedback_env_filename=".env.local",
             )
             result = reconcile_local_runtime_env(
                 model, "local-core", overlay_path=None, dry_run=True,
@@ -1112,16 +1162,16 @@ class LocalCoreFocusUS1Tests(unittest.TestCase):
 class LocalCoreParityLedgerUS4Tests(unittest.TestCase):
     """WG-007 / US-4: Parity ledger enforcement and doctor drift."""
 
-    def test_classify_requested_surfaces_marks_deferred_buildooor(self) -> None:
+    def test_classify_requested_surfaces_marks_deferred_legacy_builder(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir).resolve()
             model = _build_local_core_model(repo)
-            classification = classify_requested_surfaces(model, ["buildooor"])
+            classification = classify_requested_surfaces(model, ["legacy-builder"])
             self.assertEqual(classification["covered"], [])
             self.assertEqual(classification["unknown"], [])
             self.assertEqual(len(classification["deferred"]), 1)
             sid, item = classification["deferred"][0]
-            self.assertEqual(sid, "buildooor")
+            self.assertEqual(sid, "legacy-builder")
             self.assertEqual(item["ownership_state"], "deferred")
 
     def test_classify_requested_surfaces_marks_bridge_only_seam_deferred(self) -> None:
@@ -1139,18 +1189,18 @@ class LocalCoreParityLedgerUS4Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir).resolve()
             model = _build_local_core_model(repo)
-            _, item = classify_requested_surfaces(model, ["buildooor"])["deferred"][0]
+            _, item = classify_requested_surfaces(model, ["legacy-builder"])["deferred"][0]
             err = build_local_runtime_service_deferred_error(
                 item,
                 client_id="personal",
                 profile="local-core",
                 requested_mode="reuse",
-                surface_id="buildooor",
+                surface_id="legacy-builder",
             )
             self.assertEqual(
                 err["error"]["type"], "LOCAL_RUNTIME_SERVICE_DEFERRED",
             )
-            self.assertIn("buildooor", err["error"]["blocked_services"])
+            self.assertIn("legacy-builder", err["error"]["blocked_services"])
             self.assertEqual(err["error"]["ownership_state"], "deferred")
             self.assertEqual(err["error"]["requested_mode"], "reuse")
 
@@ -1159,14 +1209,14 @@ class LocalCoreParityLedgerUS4Tests(unittest.TestCase):
             repo = Path(tmpdir).resolve()
             model = _build_local_core_model(repo)
             deferred_pairs = classify_requested_surfaces(
-                model, ["buildooor"]
+                model, ["legacy-builder"]
             )["deferred"]
             entries = collect_deferred_log_entries(
                 deferred_pairs, client_id="personal", profile="local-core",
             )
             self.assertEqual(len(entries), 1)
             entry = entries[0]
-            self.assertEqual(entry["id"], "buildooor")
+            self.assertEqual(entry["id"], "legacy-builder")
             self.assertTrue(entry["deferred"])
             self.assertEqual(entry["ownership_state"], "deferred")
             self.assertTrue(entry["next_action"])
@@ -1188,7 +1238,7 @@ class LocalCoreParityLedgerUS4Tests(unittest.TestCase):
             for service in status["services"]:
                 self.assertEqual(service["ownership_state"], "covered")
             deferred = status["parity_ledger"]["deferred_surfaces"]
-            self.assertIn("buildooor", deferred)
+            self.assertIn("legacy-builder", deferred)
             self.assertIn("sync.sh env compilation", deferred)
 
     def test_doctor_emits_parity_ledger_subject_with_deferred_surfaces(self) -> None:
@@ -1202,16 +1252,16 @@ class LocalCoreParityLedgerUS4Tests(unittest.TestCase):
             self.assertEqual(check.code, "parity-ledger")
             details = check.details or {}
             self.assertIn("deferred_surfaces", details)
-            self.assertIn("buildooor", details["deferred_surfaces"])
+            self.assertIn("legacy-builder", details["deferred_surfaces"])
 
     def test_parity_ledger_drift_deferred_with_service_fires_coverage_gap(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir).resolve()
             model = _build_local_core_model(repo)
-            # Drift: mark spaps as deferred while the service graph still
+            # Drift: mark svc-auth as deferred while the service graph still
             # declares it (runtime claims coverage the ledger denies).
             for item in model["parity_ledger"]:
-                if item.get("id") == "spaps":
+                if item.get("id") == "svc-auth":
                     item["ownership_state"] = "deferred"
                     break
             results = validate_parity_ledger(model)
