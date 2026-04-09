@@ -176,7 +176,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._write_text(404, "No ingress route matched this request.\n")
             return
 
-        upstream = str(route.get("upstream_base_url") or "").strip()
+        upstream = str(route.get("origin_url") or "").strip()
         if not upstream:
             self._write_text(502, f"Ingress route {route.get('id', '(unknown)')} has no upstream.\n")
             return

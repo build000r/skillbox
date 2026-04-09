@@ -26,6 +26,14 @@ VALID_INGRESS_ROUTE_LISTENERS = {"public", "private"}
 VALID_INGRESS_ROUTE_MATCHES = {"exact", "prefix"}
 
 
+def _looks_like_ingress_origin(raw_value: Any) -> bool:
+    value = str(raw_value or "").strip()
+    if not value:
+        return False
+    parsed = urllib.parse.urlsplit(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
 def normalize_active_profiles(raw_profiles: list[str] | None) -> set[str]:
     active_profiles = {value.strip() for value in raw_profiles or [] if value and value.strip()}
     active_profiles.add("core")
@@ -1179,6 +1187,11 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
         for service in model["services"]
         if str(service.get("id", "")).strip()
     }
+    services_by_id = {
+        str(service.get("id", "")).strip(): service
+        for service in model["services"]
+        if str(service.get("id", "")).strip()
+    }
     service_dependency_map: dict[str, list[str]] = {}
 
     for service in model["services"]:
@@ -1289,6 +1302,10 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
             issues.append(f"ingress route {route.get('id', '(missing id)')} is missing service_id")
         elif service_id not in service_ids:
             issues.append(f"ingress route {route.get('id')} references unknown service {service_id!r}")
+        elif not _looks_like_ingress_origin(services_by_id[service_id].get("origin_url")):
+            issues.append(
+                f"ingress route {route.get('id')} references service {service_id!r} without a valid origin_url"
+            )
 
         listener = str(route.get("listener") or "").strip().lower()
         if listener not in VALID_INGRESS_ROUTE_LISTENERS:
