@@ -37,3 +37,9 @@ data/
 .dcg.toml
 sand/
 .skillbox-state/
+/.codex/
+/.ntm/
+/MODES_CONTEXT_PACK.md
+/MODES_OF_REASONING_REPORT_AND_ANALYSIS_OF_PROJECT.md
+/MODE_OUTPUT_*.md
+/SMART_RECOMMENDATION_CHAIN.md
