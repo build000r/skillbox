@@ -623,11 +623,10 @@ def ingress_listener_settings(model: dict[str, Any], listener: str) -> dict[str,
     }
 
 
-def service_upstream_base_url(service: dict[str, Any] | None) -> str:
+def service_origin_url(service: dict[str, Any] | None) -> str:
     if not service:
         return ""
-    healthcheck = service.get("healthcheck") or {}
-    url = str(healthcheck.get("url") or "").strip()
+    url = str(service.get("origin_url") or "").strip()
     if not url:
         return ""
     parsed = urllib.parse.urlsplit(url)
@@ -681,7 +680,7 @@ def resolved_ingress_routes(
                     "match": match,
                     "service_id": service_id,
                     "request_url": request_url,
-                    "upstream_base_url": service_upstream_base_url(service),
+                    "origin_url": service_origin_url(service),
                 }
                 | (
                     {
@@ -733,7 +732,7 @@ def render_ingress_routes_document(model: dict[str, Any]) -> str:
                 "path": route["path"],
                 "match": route["match"],
                 "service_id": route["service_id"],
-                "upstream_base_url": route["upstream_base_url"],
+                "origin_url": route["origin_url"],
             }
             for route in resolved_ingress_routes(model)
         ],
@@ -778,7 +777,7 @@ def render_ingress_nginx_config(model: dict[str, Any]) -> str:
             lines.extend(
                 [
                     f"    location {location_modifier} {route['path']} {{",
-                    f"      proxy_pass {route['upstream_base_url']};",
+                    f"      proxy_pass {route['origin_url']};",
                     "      proxy_http_version 1.1;",
                     "      proxy_set_header Host $host;",
                     "      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
@@ -848,7 +847,7 @@ def validate_ingress(model: dict[str, Any]) -> list[CheckResult]:
     invalid_upstreams = [
         route["id"]
         for route in routes
-        if route["service_id"] and not route["upstream_base_url"]
+        if route["service_id"] and not route["origin_url"]
     ]
     if invalid_upstreams:
         results.append(

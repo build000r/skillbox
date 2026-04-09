@@ -167,9 +167,36 @@ class RuntimeManagerTests(unittest.TestCase):
             payload = json.loads(route_file.read_text(encoding="utf-8"))
             self.assertEqual(payload["routes"][0]["service_id"], "backend")
             self.assertEqual(payload["routes"][0]["listener"], "public")
+            self.assertEqual(payload["routes"][0]["origin_url"], "http://127.0.0.1:9100")
             self.assertIn("location = /v1/report", nginx_config.read_text(encoding="utf-8"))
+            self.assertIn("proxy_pass http://127.0.0.1:9100;", nginx_config.read_text(encoding="utf-8"))
             self.assertTrue(any(action.startswith("render-ingress-routes:") for action in actions))
             self.assertTrue(any(action.startswith("render-ingress-nginx:") for action in actions))
+
+    def test_resolved_ingress_routes_order_exact_before_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = self._ingress_model(repo)
+            model["ingress_routes"].append(
+                {
+                    "id": "report-prefix",
+                    "service_id": "backend",
+                    "listener": "public",
+                    "path": "/v1",
+                    "match": "prefix",
+                    "client": "jeremy",
+                    "profiles": ["local-ecom"],
+                }
+            )
+
+            routes = MANAGE_MODULE.resolved_ingress_routes(model)
+            nginx_config = MANAGE_MODULE.render_ingress_nginx_config(model)
+
+            self.assertEqual([route["id"] for route in routes], ["report-command", "report-prefix"])
+            self.assertLess(
+                nginx_config.index("location = /v1/report"),
+                nginx_config.index("location ^~ /v1"),
+            )
 
     def test_runtime_status_includes_resolved_ingress_routes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -185,7 +212,88 @@ class RuntimeManagerTests(unittest.TestCase):
             route = ingress["routes"][0]
             self.assertIn("service_state", route)
             self.assertEqual(route["request_url"], "https://reports.example.test/v1/report")
-            self.assertEqual(route["upstream_base_url"], "http://127.0.0.1:8001")
+            self.assertEqual(route["origin_url"], "http://127.0.0.1:9100")
+
+    def test_check_manifest_requires_service_origin_url_for_ingress_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = self._ingress_model(repo)
+            model["services"][0]["origin_url"] = ""
+
+            results = MANAGE_MODULE.check_manifest(model)
+            issues = [
+                issue
+                for result in results
+                if result.code == "runtime-manifest"
+                for issue in result.details.get("issues", [])
+            ]
+
+            self.assertTrue(
+                any("without a valid origin_url" in issue for issue in issues)
+            )
+
+    def test_validate_ingress_requires_service_origin_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = self._ingress_model(repo)
+            model["services"][0]["origin_url"] = ""
+
+            results = MANAGE_MODULE.validate_ingress(model)
+
+            self.assertEqual([item.code for item in results], ["ingress-upstream-missing"])
+            self.assertEqual(results[0].details["routes"], ["report-command"])
+
+    def test_probe_service_marks_route_less_ingress_as_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = self._ingress_model(repo)
+            ingress_service = {
+                "id": "ingress-router",
+                "kind": "ingress",
+                "command": "python3 scripts/ingress_proxy.py --routes-file ${SKILLBOX_INGRESS_ROUTE_FILE}",
+            }
+            model["services"].append(ingress_service)
+            model["ingress_routes"] = []
+
+            state = MANAGE_MODULE.probe_service(model, ingress_service)
+
+            self.assertEqual(state["state"], "idle")
+            self.assertFalse(state["managed"])
+            self.assertEqual(state["manager_reason"], "no ingress routes active")
+
+    def test_stop_services_stops_stale_idle_ingress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = self._ingress_model(repo)
+            ingress_service = {
+                "id": "ingress-router",
+                "kind": "ingress",
+                "command": "python3 scripts/ingress_proxy.py --routes-file ${SKILLBOX_INGRESS_ROUTE_FILE}",
+            }
+            model["services"].append(ingress_service)
+            model["ingress_routes"] = []
+
+            with (
+                mock.patch(
+                    "runtime_manager.runtime_ops.live_service_pid",
+                    return_value=4321,
+                ),
+                mock.patch(
+                    "runtime_manager.runtime_ops.stop_process",
+                    return_value=("stopped", "SIGTERM"),
+                ) as stop_process,
+            ):
+                results = MANAGE_MODULE.stop_services(
+                    model,
+                    [ingress_service],
+                    dry_run=False,
+                    wait_seconds=0.1,
+                )
+
+            self.assertEqual(results[0]["result"], "stopped")
+            self.assertEqual(results[0]["pid"], 4321)
+            self.assertEqual(results[0]["signal"], "SIGTERM")
+            stop_process.assert_called_once_with(4321, 0.1)
 
     def test_doctor_warns_and_sync_reconciles_stale_file_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4497,6 +4605,7 @@ class RuntimeManagerTests(unittest.TestCase):
                 {
                     "id": "backend",
                     "kind": "http",
+                    "origin_url": "http://127.0.0.1:9100",
                     "healthcheck": {"type": "http", "url": "http://127.0.0.1:8001/v1/reports"},
                 }
             ],

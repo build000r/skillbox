@@ -165,6 +165,7 @@ CANONICAL_RUNTIME_RECORDS: dict[str, tuple[str, ...]] = {
         "id",
         "repo_id",
         "kind",
+        "origin_url",
         "health_type",
         "health_target",
         "depends_on",
@@ -1124,6 +1125,7 @@ def _populate_service_defaults(model: dict[str, Any], root_dir: Path) -> None:
         service.setdefault("required", False)
         service.setdefault("profiles", [])
         service.setdefault("client", "")
+        service.setdefault("origin_url", "")
         if service.get("path"):
             service["host_path"] = str(runtime_path_to_host_path(root_dir, model["env"], str(service["path"]), storage=model.get("storage")))
         healthcheck = service.get("healthcheck") or {}
