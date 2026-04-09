@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import socket
+
 from .shared import *
 from .validation import *
 from lib.runtime_model import (
@@ -298,6 +300,11 @@ def check_filesystem(model: dict[str, Any], root_dir: Path) -> list[CheckResult]
     missing_required_env_targets: list[str] = []
     missing_log_paths: list[str] = []
     missing_required_checks: list[str] = []
+    bridge_output_paths = {
+        str(path.resolve())
+        for bridge in model.get("bridges") or []
+        for path in bridge_expected_outputs(bridge)
+    }
 
     for repo in model["repos"]:
         path = Path(str(repo["host_path"]))
@@ -333,6 +340,9 @@ def check_filesystem(model: dict[str, Any], root_dir: Path) -> list[CheckResult]
         display_path = repo_rel(root_dir, Path(state["host_path"]))
         if state["state"] == "source-missing":
             if env_file.get("required"):
+                source_host_path = str(Path(state["source_host_path"]).resolve()) if state["source_host_path"] else ""
+                if source_host_path and source_host_path in bridge_output_paths:
+                    continue
                 if state["source_host_path"]:
                     missing_required_env_sources.append(repo_rel(root_dir, Path(state["source_host_path"])))
                 else:
@@ -1676,6 +1686,14 @@ def bridge_outputs_state(bridge: dict[str, Any]) -> dict[str, Any]:
     return {"state": "ok", "outputs": [str(p) for p in expected]}
 
 
+def _port_listening_state(port: int, *, host: str = "127.0.0.1", timeout: float = 0.5) -> dict[str, Any]:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return {"state": "ok", "host": host, "port": port}
+    except OSError:
+        return {"state": "down", "host": host, "port": port}
+
+
 def bridge_freshness(bridge: dict[str, Any], overlay_path: str | None = None) -> dict[str, Any]:
     outputs = bridge_expected_outputs(bridge)
     if not outputs:
@@ -1733,24 +1751,21 @@ def local_runtime_error(
 #   2. Re-run the declared bridge task only when outputs are missing or stale
 #      against the overlay mtime; otherwise verify without re-execution
 #   3. Validate each generated env source exists (LOCAL_RUNTIME_ENV_OUTPUT_MISSING)
-#   4. Validate each env target_path matches the repo contract
-#      (approval_feedback_api must use repo-local `.env`)
+#   4. Validate each env target_path matches the repo contract — if an
+#      env_file declares ``enforce_filename``, the target basename must match
+#      it exactly. This is the seam for repos whose env contract diverges
+#      from the default ``.env.local`` convention.
 #   5. Emit stable error codes at each decision point
 #
 # These helpers are the shared reconciliation surface used by focus.  The
 # `up`/orchestration functions (WG-005) will call the same helpers but from
 # the lifecycle path and with their own policy around retries.
 #
-# Approval-feedback target filename policy: per Rule 4 (backend.md:56-65), the
-# approval_feedback_api repo reads `.env`, not `.env.local`.  All other covered
-# repos currently read `.env.local`, but the runtime must not hard-code that;
-# it only enforces the explicit approval-feedback case and otherwise accepts
-# whatever filename the overlay declares as long as it is an env-style file
-# inside the declared repo directory.
-APPROVAL_FEEDBACK_REPO_IDS = frozenset(
-    {"approval-feedback-api", "approval_feedback_api"}
-)
-APPROVAL_FEEDBACK_REQUIRED_FILENAME = ".env"
+# Env filename policy: the runtime does not assume a uniform ``.env.local``
+# convention. Overlays declare an optional ``enforce_filename`` on each
+# env_file; when set, the target basename must match exactly. Repos that read
+# ``.env`` instead of ``.env.local`` (or any other variant) opt in through
+# that field rather than through a hardcoded allowlist.
 
 
 def local_runtime_active_profile(model: dict[str, Any]) -> str | None:
@@ -1851,8 +1866,9 @@ def validate_env_file_target_paths(
     """Return a list of violation messages for env target paths.
 
     Rule 4 (backend.md:56-65): each declared env target_path must match the
-    repo's real env contract.  approval_feedback_api must use repo-local
-    `.env`; the runtime must not assume a uniform `.env.local` convention.
+    repo's real env contract. The runtime must not assume a uniform
+    ``.env.local`` convention; overlays declare ``enforce_filename`` on any
+    env_file whose target repo requires a specific filename.
 
     The validation runs against each env_file's post-normalisation `host_path`
     (the materialised target path) and uses the `repo` id to locate the repo's
@@ -1871,12 +1887,13 @@ def validate_env_file_target_paths(
         target_path = Path(str(target_raw))
         repo_id = str(env_file.get("repo") or "").strip()
 
-        # approval_feedback_api: must use .env exactly, not .env.local
-        if repo_id in APPROVAL_FEEDBACK_REPO_IDS:
-            if target_path.name != APPROVAL_FEEDBACK_REQUIRED_FILENAME:
+        # Overlay-declared exact filename enforcement.
+        required_name = str(env_file.get("enforce_filename") or "").strip()
+        if required_name:
+            if target_path.name != required_name:
                 violations.append(
-                    f"{env_id}: approval_feedback_api env target must be "
-                    f"{APPROVAL_FEEDBACK_REQUIRED_FILENAME!r}, got {target_path.name!r} "
+                    f"{env_id}: env target filename must be "
+                    f"{required_name!r}, got {target_path.name!r} "
                     f"(target_path={target_path})"
                 )
                 continue
@@ -2190,7 +2207,33 @@ def local_runtime_focus_payload(
 
 
 def task_success_state(task: dict[str, Any], model: dict[str, Any] | None = None) -> dict[str, Any]:
-    # Bridge-backed task: check all bridge outputs exist
+    success = task.get("success") or {}
+    success_type = success.get("type")
+    if success_type == "all_outputs_exist" and model:
+        bridge_id = str(success.get("target") or task.get("bridge_id") or "").strip()
+        if not bridge_id:
+            return {"state": "unknown"}
+        bridges = bridge_id_map(model)
+        bridge = bridges.get(bridge_id)
+        if bridge:
+            state = bridge_outputs_state(bridge)
+            if state["state"] == "ok":
+                return {"state": "ok", "target": f"bridge:{bridge_id}"}
+            return {"state": "down", "target": f"bridge:{bridge_id}", "missing": state.get("missing", [])}
+        return {"state": "unknown", "target": f"bridge:{bridge_id} (not found)"}
+    if success_type == "path_exists":
+        path = Path(str(success["host_path"]))
+        return {"state": "ok" if path.exists() else "down", "target": str(path)}
+    if success_type == "port_listening":
+        try:
+            port = int(success["port"])
+        except (KeyError, TypeError, ValueError):
+            return {"state": "unknown"}
+        host = str(success.get("host") or "127.0.0.1")
+        result = _port_listening_state(port, host=host)
+        return result | {"target": f"{host}:{port}"}
+
+    # Backward-compatible bridge-backed task: check all bridge outputs exist.
     bridge_id = str(task.get("bridge_id", "")).strip()
     if bridge_id and model:
         bridges = bridge_id_map(model)
@@ -2201,12 +2244,6 @@ def task_success_state(task: dict[str, Any], model: dict[str, Any] | None = None
                 return {"state": "ok", "target": f"bridge:{bridge_id}"}
             return {"state": "down", "target": f"bridge:{bridge_id}", "missing": state.get("missing", [])}
         return {"state": "unknown", "target": f"bridge:{bridge_id} (not found)"}
-
-    success = task.get("success") or {}
-    success_type = success.get("type")
-    if success_type == "path_exists":
-        path = Path(str(success["host_path"]))
-        return {"state": "ok" if path.exists() else "down", "target": str(path)}
     return {"state": "unknown"}
 
 
@@ -2254,6 +2291,14 @@ def service_healthcheck_state(service: dict[str, Any]) -> dict[str, Any]:
                 return {"state": "ok", "status_code": response.getcode(), "url": url}
         except (urllib.error.URLError, TimeoutError, ValueError):
             return {"state": "down", "url": url}
+
+    if healthcheck_type == "port":
+        try:
+            port = int(healthcheck["port"])
+        except (KeyError, TypeError, ValueError):
+            return {"state": "unknown"}
+        host = str(healthcheck.get("host") or "127.0.0.1")
+        return _port_listening_state(port, host=host)
 
     if healthcheck_type == "process_running":
         pattern = str(healthcheck["pattern"]).strip()

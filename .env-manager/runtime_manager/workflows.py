@@ -1368,6 +1368,50 @@ def run_focus(
             print_local_runtime_error_text(profile_errors[0])
         return EXIT_ERROR
 
+    active_local_profile = local_runtime_active_profile(model)
+
+    if active_local_profile:
+        try:
+            overlay_host_path = local_runtime_overlay_path(model, cid)
+            pre_reconcile = reconcile_local_runtime_env(
+                model,
+                active_local_profile,
+                overlay_path=overlay_host_path,
+                dry_run=False,
+            )
+            if pre_reconcile.get("status") == "blocked":
+                step(
+                    "local-runtime-preflight",
+                    "fail",
+                    {
+                        "profile": active_local_profile,
+                        "error": pre_reconcile.get("error"),
+                    },
+                )
+                payload = {"client_id": cid, "steps": steps}
+                if pre_reconcile.get("error"):
+                    payload["error"] = pre_reconcile["error"]
+                if is_json:
+                    emit_json(payload)
+                elif payload.get("error", {}).get("type", "").startswith("LOCAL_RUNTIME_"):
+                    print_local_runtime_error_text(payload)
+                return EXIT_ERROR
+            step(
+                "local-runtime-preflight",
+                "ok",
+                {
+                    "profile": active_local_profile,
+                    "actions": pre_reconcile.get("actions"),
+                },
+            )
+        except RuntimeError as exc:
+            step("local-runtime-preflight", "fail", {"error": str(exc)})
+            payload = {"client_id": cid, "steps": steps}
+            payload.update(classify_error(exc, "focus"))
+            if is_json:
+                emit_json(payload)
+            return EXIT_ERROR
+
     # --- 0. Compose override ---------------------------------------------------
     try:
         override_path = generate_client_compose_override(root_dir, model, cid)
@@ -1602,7 +1646,6 @@ def run_focus(
     # (reconcile_local_runtime_env + local_runtime_focus_payload) so focus and
     # up both agree on the readiness decision and emit the same US-1 shape.
     local_runtime_section: dict[str, Any] | None = None
-    active_local_profile = local_runtime_active_profile(model)
     if active_local_profile:
         try:
             overlay_host_path = local_runtime_overlay_path(model, cid)
@@ -1827,7 +1870,7 @@ def run_up(
         payload["error"]["requested_mode"] = requested_mode
         return EXIT_ERROR, payload
 
-    # (4) Bootstrap tasks (env bridge + approval-feedback DB, etc.) in declared
+    # (4) Bootstrap tasks (env bridge + repo-specific DB bootstraps, etc.) in declared
     #     dependency order (shared.md:116-137, flows.md:69-89).
     bootstrap_task_specs = resolve_tasks_for_services(model, ordered_services)
     bootstrap_results: list[dict[str, Any]] = []

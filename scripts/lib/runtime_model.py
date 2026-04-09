@@ -140,10 +140,11 @@ CANONICAL_RUNTIME_RECORDS: dict[str, tuple[str, ...]] = {
         "emit_stubs",
         "profiles",
     ),
-    "local_runtime_repo": ("id", "repo_path", "notes"),
+    "local_runtime_repo": ("id", "path", "repo_path", "notes"),
     "managed_env_file": (
         "id",
         "repo_id",
+        "path",
         "target_path",
         "source_kind",
         "source_path",
@@ -813,26 +814,109 @@ def load_client_overlays(root_dir: Path, env_values: dict[str, str]) -> list[dic
     return overlays
 
 
+def _flatten_repo_record(repo: dict[str, Any]) -> None:
+    """Flatten overlay repo shorthand onto the canonical repo shape."""
+    raw_path = repo.get("path") or repo.get("repo_path")
+    if raw_path is not None:
+        repo.setdefault("path", raw_path)
+        repo.setdefault("repo_path", raw_path)
+
+
 def _flatten_env_file_record(env_file: dict[str, Any]) -> None:
     """Flatten nested overlay YAML shapes onto a managed_env_file record.
 
     Overlay authors write ``source.kind`` / ``source.source_path`` /
-    ``source.path``. The canonical record stores ``source_kind`` and
-    ``source_path`` at the top level. The nested ``source`` dict is kept
-    intact for backward compatibility with existing helpers.
+    ``source.path`` and may shorthand the target as ``target_path``. The
+    canonical record stores ``path``, ``source_kind``, and ``source_path``
+    at the top level. The nested ``source`` dict is kept intact for
+    backward compatibility with existing helpers and validators.
     """
-    source = env_file.get("source") or {}
-    if isinstance(source, dict):
-        if "source_kind" not in env_file and source.get("kind") is not None:
-            env_file["source_kind"] = source.get("kind")
-        if "source_path" not in env_file:
-            raw_source_path = source.get("source_path") or source.get("path")
-            if raw_source_path is not None:
-                env_file["source_path"] = raw_source_path
-    if "target_path" not in env_file and env_file.get("path"):
-        env_file["target_path"] = env_file.get("path")
-    if "repo_id" not in env_file and env_file.get("repo"):
-        env_file["repo_id"] = env_file.get("repo")
+    source = env_file.get("source")
+    if not isinstance(source, dict):
+        source = {}
+
+    raw_source_kind = env_file.get("source_kind")
+    if raw_source_kind is None:
+        raw_source_kind = source.get("kind")
+    if raw_source_kind is not None:
+        env_file.setdefault("source_kind", raw_source_kind)
+        source.setdefault("kind", raw_source_kind)
+
+    raw_source_path = env_file.get("source_path")
+    if raw_source_path is None:
+        raw_source_path = source.get("source_path") or source.get("path")
+    if raw_source_path is not None:
+        env_file.setdefault("source_path", raw_source_path)
+        source.setdefault("source_path", raw_source_path)
+        source.setdefault("path", raw_source_path)
+
+    raw_target_path = env_file.get("path") or env_file.get("target_path")
+    if raw_target_path is not None:
+        env_file.setdefault("path", raw_target_path)
+        env_file.setdefault("target_path", raw_target_path)
+
+    raw_repo_id = env_file.get("repo_id") or env_file.get("repo")
+    if raw_repo_id:
+        env_file.setdefault("repo_id", raw_repo_id)
+        env_file.setdefault("repo", raw_repo_id)
+
+    if source:
+        env_file["source"] = source
+
+
+def _first_present_service_command(raw_commands: dict[str, Any]) -> str | None:
+    for mode in LOCAL_RUNTIME_START_MODES:
+        value = str(raw_commands.get(mode) or "").strip()
+        if value:
+            return value
+    for value in raw_commands.values():
+        text = str(value or "").strip()
+        if text:
+            return text
+    return None
+
+
+def _parse_task_success_check(raw_success_check: Any) -> dict[str, Any]:
+    text = str(raw_success_check or "").strip()
+    if not text:
+        raise LocalRuntimeContractError(
+            LOCAL_RUNTIME_COVERAGE_GAP,
+            "bootstrap_task declares an empty success_check",
+        )
+
+    match = re.fullmatch(r"([a-z_][a-z0-9_]*)\((.*)\)", text)
+    if not match:
+        raise LocalRuntimeContractError(
+            LOCAL_RUNTIME_COVERAGE_GAP,
+            f"bootstrap_task success_check {text!r} has unsupported syntax",
+        )
+
+    success_type = match.group(1)
+    raw_arg = match.group(2).strip()
+    if not raw_arg:
+        raise LocalRuntimeContractError(
+            LOCAL_RUNTIME_COVERAGE_GAP,
+            f"bootstrap_task success_check {text!r} is missing its argument",
+        )
+
+    if success_type == "all_outputs_exist":
+        return {"type": success_type, "target": raw_arg}
+    if success_type == "path_exists":
+        return {"type": success_type, "path": raw_arg}
+    if success_type == "port_listening":
+        try:
+            port = int(raw_arg)
+        except ValueError as exc:
+            raise LocalRuntimeContractError(
+                LOCAL_RUNTIME_COVERAGE_GAP,
+                f"bootstrap_task success_check {text!r} must contain an integer port",
+            ) from exc
+        return {"type": success_type, "port": port}
+
+    raise LocalRuntimeContractError(
+        LOCAL_RUNTIME_COVERAGE_GAP,
+        f"bootstrap_task success_check {text!r} uses unsupported type {success_type!r}",
+    )
 
 
 def _flatten_service_record(service: dict[str, Any]) -> list[dict[str, Any]]:
@@ -853,8 +937,10 @@ def _flatten_service_record(service: dict[str, Any]) -> list[dict[str, Any]]:
             )
             if target is not None:
                 service["health_target"] = target
-    if "repo_id" not in service and service.get("repo"):
-        service["repo_id"] = service.get("repo")
+    raw_repo_id = service.get("repo_id") or service.get("repo")
+    if raw_repo_id:
+        service.setdefault("repo_id", raw_repo_id)
+        service.setdefault("repo", raw_repo_id)
 
     extracted: list[dict[str, Any]] = []
     raw_commands = service.get("commands")
@@ -862,26 +948,41 @@ def _flatten_service_record(service: dict[str, Any]) -> list[dict[str, Any]]:
         service_id = str(service.get("id", "")).strip()
         for mode, command in raw_commands.items():
             mode_str = str(mode).strip()
-            if not mode_str:
+            text = str(command or "").strip()
+            if not mode_str or not text:
                 continue
             extracted.append(
                 {
                     "id": f"{service_id}:{mode_str}" if service_id else mode_str,
                     "service_id": service_id,
                     "mode": mode_str,
-                    "command": command,
+                    "command": text,
                     "profiles": list(service.get("profiles") or []),
                     "client": service.get("client", ""),
                 }
             )
+        if not str(service.get("command") or "").strip():
+            preferred = _first_present_service_command(raw_commands)
+            if preferred:
+                service["command"] = preferred
     return extracted
 
 
 def _flatten_bootstrap_task_record(task: dict[str, Any]) -> None:
     """Flatten the overlay shape onto a bootstrap_task record."""
-    if "repo_id" not in task and task.get("repo"):
-        task["repo_id"] = task.get("repo")
-    # bridge_id is already the canonical key; nothing to flatten.
+    raw_repo_id = task.get("repo_id") or task.get("repo")
+    if raw_repo_id:
+        task.setdefault("repo_id", raw_repo_id)
+        task.setdefault("repo", raw_repo_id)
+
+    success = task.get("success")
+    if not isinstance(success, dict):
+        success = {}
+    if not str(success.get("type") or "").strip() and str(task.get("success_check") or "").strip():
+        task["success"] = _parse_task_success_check(task.get("success_check"))
+    elif success:
+        task["success"] = success
+    # bridge_id is already the canonical key; nothing else to flatten.
 
 
 def _validate_bootstrap_task_owner_xor(tasks: list[dict[str, Any]]) -> None:
@@ -951,6 +1052,8 @@ def _flatten_ingress_route_record(route: dict[str, Any]) -> None:
 
 def _post_process_runtime_sections(sections: dict[str, list[dict[str, Any]]]) -> None:
     """Run flatten + XOR validation after every source has been merged in."""
+    for repo in sections["repos"]:
+        _flatten_repo_record(repo)
     for env_file in sections["env_files"]:
         _flatten_env_file_record(env_file)
     for service in sections["services"]:
@@ -1051,7 +1154,13 @@ def _populate_artifact_defaults(model: dict[str, Any], root_dir: Path) -> None:
             )
         source = artifact.get("source") or {}
         if source.get("kind") == "file" and source.get("path"):
-            source["host_path"] = str(host_path_to_absolute_path(root_dir, str(source["path"])))
+            raw_source_path = str(source["path"])
+            if Path(raw_source_path).is_absolute():
+                source["host_path"] = str(
+                    runtime_path_to_host_path(root_dir, model["env"], raw_source_path, storage=model.get("storage"))
+                )
+            else:
+                source["host_path"] = str(host_path_to_absolute_path(root_dir, raw_source_path))
             artifact["source"] = source
 
 
@@ -1071,7 +1180,13 @@ def _populate_env_file_defaults(model: dict[str, Any], root_dir: Path) -> None:
             )
         source = env_file.get("source") or {}
         if source.get("kind") == "file" and source.get("path"):
-            source["host_path"] = str(host_path_to_absolute_path(root_dir, str(source["path"])))
+            raw_source_path = str(source["path"])
+            if Path(raw_source_path).is_absolute():
+                source["host_path"] = str(
+                    runtime_path_to_host_path(root_dir, model["env"], raw_source_path, storage=model.get("storage"))
+                )
+            else:
+                source["host_path"] = str(host_path_to_absolute_path(root_dir, raw_source_path))
             env_file["source"] = source
 
 

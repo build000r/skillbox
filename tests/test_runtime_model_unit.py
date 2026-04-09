@@ -317,7 +317,7 @@ class LocalRuntimeCoreModelTests(unittest.TestCase):
             {
                 "id": "bad-task",
                 "kind": "bootstrap",
-                "repo_id": "approval-feedback-api",
+                "repo_id": "svc-feedback-repo",
                 "bridge_id": "local-core-bridge",
                 "command": "true",
             }
@@ -359,10 +359,10 @@ class LocalRuntimeCoreModelTests(unittest.TestCase):
     def test_bootstrap_task_xor_accepts_repo_only_owner(self) -> None:
         tasks = [
             {
-                "id": "approval-feedback-db-bootstrap",
+                "id": "svc-feedback-db-bootstrap",
                 "kind": "bootstrap",
-                "repo_id": "approval-feedback-api",
-                "command": "docker start unclawg-db-1",
+                "repo_id": "svc-feedback-repo",
+                "command": "docker start feedback-db-1",
             }
         ]
         runtime_model_module._validate_bootstrap_task_owner_xor(tasks)
@@ -379,27 +379,31 @@ class LocalRuntimeCoreModelTests(unittest.TestCase):
 
     def test_flatten_env_file_promotes_source_kind_and_path(self) -> None:
         env_file = {
-            "id": "approval-feedback-env",
-            "repo": "approval-feedback-api",
-            "path": "/repo/approval_feedback_api/.env",
+            "id": "svc-feedback-env",
+            "repo": "svc-feedback-repo",
+            "path": "/repo/svc_feedback/.env",
             "source": {
                 "kind": "file",
-                "source_path": "/bridge/out/unclawg-approval-feedback-api/local.env",
+                "source_path": "/bridge/out/svc-feedback-bridge-target/local.env",
             },
         }
         runtime_model_module._flatten_env_file_record(env_file)
         self.assertEqual(env_file["source_kind"], "file")
         self.assertEqual(
             env_file["source_path"],
-            "/bridge/out/unclawg-approval-feedback-api/local.env",
+            "/bridge/out/svc-feedback-bridge-target/local.env",
         )
-        self.assertEqual(env_file["target_path"], "/repo/approval_feedback_api/.env")
-        self.assertEqual(env_file["repo_id"], "approval-feedback-api")
+        self.assertEqual(
+            env_file["source"]["path"],
+            "/bridge/out/svc-feedback-bridge-target/local.env",
+        )
+        self.assertEqual(env_file["target_path"], "/repo/svc_feedback/.env")
+        self.assertEqual(env_file["repo_id"], "svc-feedback-repo")
 
     def test_flatten_service_promotes_healthcheck_type_and_url(self) -> None:
         service = {
-            "id": "approval_feedback_api",
-            "repo": "approval-feedback-api",
+            "id": "svc_feedback",
+            "repo": "svc-feedback-repo",
             "healthcheck": {"type": "http", "url": "http://localhost:8010/health"},
             "commands": {
                 "reuse": "make local-up-daemon",
@@ -410,16 +414,17 @@ class LocalRuntimeCoreModelTests(unittest.TestCase):
         extracted = runtime_model_module._flatten_service_record(service)
         self.assertEqual(service["health_type"], "http")
         self.assertEqual(service["health_target"], "http://localhost:8010/health")
-        self.assertEqual(service["repo_id"], "approval-feedback-api")
+        self.assertEqual(service["repo_id"], "svc-feedback-repo")
+        self.assertEqual(service["command"], "make local-up-daemon")
 
         # commands.<mode> -> service_mode_command records
         by_mode = {rec["mode"]: rec for rec in extracted}
         self.assertEqual(set(by_mode), {"reuse", "prod", "fresh"})
-        self.assertEqual(by_mode["reuse"]["service_id"], "approval_feedback_api")
+        self.assertEqual(by_mode["reuse"]["service_id"], "svc_feedback")
         self.assertEqual(by_mode["prod"]["command"], "make local-up-prod")
         self.assertEqual(by_mode["fresh"]["command"], "make local-up-prod-fresh")
         self.assertEqual(
-            by_mode["reuse"]["id"], "approval_feedback_api:reuse"
+            by_mode["reuse"]["id"], "svc_feedback:reuse"
         )
 
     def test_flatten_service_without_commands_extracts_no_mode_records(self) -> None:
@@ -435,13 +440,79 @@ class LocalRuntimeCoreModelTests(unittest.TestCase):
 
     def test_flatten_bootstrap_task_promotes_repo_to_repo_id(self) -> None:
         task = {
-            "id": "approval-feedback-db-bootstrap",
+            "id": "svc-feedback-db-bootstrap",
             "kind": "bootstrap",
-            "repo": "approval-feedback-api",
-            "command": "docker start unclawg-db-1",
+            "repo": "svc-feedback-repo",
+            "command": "docker start feedback-db-1",
         }
         runtime_model_module._flatten_bootstrap_task_record(task)
-        self.assertEqual(task["repo_id"], "approval-feedback-api")
+        self.assertEqual(task["repo_id"], "svc-feedback-repo")
+
+    def test_post_process_runtime_sections_flattens_overlay_shorthand(self) -> None:
+        sections = {
+            "repos": [
+                {"id": "svc-feedback-repo", "repo_path": "/repo/svc_feedback"},
+            ],
+            "artifacts": [],
+            "env_files": [
+                {
+                    "id": "svc-feedback-env",
+                    "repo_id": "svc-feedback-repo",
+                    "target_path": "/repo/svc_feedback/.env",
+                    "source": {
+                        "kind": "file",
+                        "source_path": "/bridge/out/svc-feedback/local.env",
+                    },
+                }
+            ],
+            "skills": [],
+            "tasks": [
+                {
+                    "id": "svc-feedback-db-bootstrap",
+                    "kind": "bootstrap",
+                    "repo_id": "svc-feedback-repo",
+                    "command": "docker start feedback-db-1",
+                    "success_check": "port_listening(5436)",
+                }
+            ],
+            "services": [
+                {
+                    "id": "svc_feedback",
+                    "repo_id": "svc-feedback-repo",
+                    "commands": {
+                        "reuse": "X",
+                        "prod": "Y",
+                    },
+                    "healthcheck": {"type": "port", "port": 8080},
+                }
+            ],
+            "logs": [],
+            "checks": [],
+            "bridges": [
+                {"id": "local-core-bridge"},
+            ],
+            "service_mode_commands": [],
+            "ingress_routes": [],
+            "parity_ledger": [],
+        }
+
+        runtime_model_module._post_process_runtime_sections(sections)
+
+        repo = sections["repos"][0]
+        env_file = sections["env_files"][0]
+        task = sections["tasks"][0]
+        service = sections["services"][0]
+
+        self.assertEqual(repo["path"], "/repo/svc_feedback")
+        self.assertEqual(env_file["path"], "/repo/svc_feedback/.env")
+        self.assertEqual(env_file["source"]["path"], "/bridge/out/svc-feedback/local.env")
+        self.assertEqual(task["success"], {"type": "port_listening", "port": 5436})
+        self.assertEqual(service["command"], "X")
+        self.assertEqual(service["healthcheck"]["type"], "port")
+        self.assertEqual(
+            [entry["mode"] for entry in sections["service_mode_commands"]],
+            ["reuse", "prod"],
+        )
 
 
 if __name__ == "__main__":
