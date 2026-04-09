@@ -49,9 +49,7 @@ services:
     stdin_open: true
     tty: true
     working_dir: /workspace
-    env_file:
-      - path: ./.env
-        required: false
+    # K4: operator-scoped .env no longer loaded into workspace services — see MODES_OF_REASONING_REPORT_AND_ANALYSIS_OF_PROJECT.md §4.K4
     environment:
       <<: *runtime_env
     volumes:
@@ -71,9 +69,7 @@ services:
     image: skillbox:dev
     init: true
     working_dir: /workspace
-    env_file:
-      - path: ./.env
-        required: false
+    # K4: operator-scoped .env no longer loaded into workspace services — see MODES_OF_REASONING_REPORT_AND_ANALYSIS_OF_PROJECT.md §4.K4
     environment:
       <<: *runtime_env
     volumes:
@@ -100,9 +96,7 @@ services:
     image: skillbox:dev
     init: true
     working_dir: /workspace
-    env_file:
-      - path: ./.env
-        required: false
+    # K4: operator-scoped .env no longer loaded into workspace services — see MODES_OF_REASONING_REPORT_AND_ANALYSIS_OF_PROJECT.md §4.K4
     environment:
       <<: *runtime_env
     volumes:

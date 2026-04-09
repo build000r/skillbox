@@ -35,7 +35,6 @@ EXPECTED_FILES = [
     "scripts/quick_validate.py",
     "scripts/lib/__init__.py",
     "scripts/lib/runtime_model.py",
-    "scripts/lib/skill_bundle_filter.py",
     "workspace/sandbox.yaml",
     "workspace/dependencies.yaml",
     "workspace/persistence.yaml",

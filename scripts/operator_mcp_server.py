@@ -642,8 +642,8 @@ def emit_event(event_type: str, subject: str, detail: dict | None = None) -> Non
 
 def _stamp_dryrun_marker(tool_name: str, box_id: str) -> None:
     """Create a temp marker so the PreToolUse hook knows a dry-run was done."""
-    import tempfile
-    marker = Path(tempfile.gettempdir()) / f".skillbox-dryrun-{tool_name}-{box_id}"
+    marker = REPO_ROOT / ".skillbox-state" / "dryrun-markers" / f".skillbox-dryrun-{tool_name}-{box_id}"
+    marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(f"dry-run completed for {tool_name} box={box_id}\n")
 
 

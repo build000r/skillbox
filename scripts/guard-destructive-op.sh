@@ -261,7 +261,7 @@ if [ -n "$PROBLEMS" ]; then
 fi
 
 # --- Gate 3: Require dry_run=true on first real invocation ---
-MARKER="/tmp/.skillbox-dryrun-${FRIENDLY_NAME}-${BOX_ID}"
+MARKER="${REPO_ROOT}/.skillbox-state/dryrun-markers/.skillbox-dryrun-${FRIENDLY_NAME}-${BOX_ID}"
 
 if [ ! -f "$MARKER" ]; then
     cat >&2 <<EOF
