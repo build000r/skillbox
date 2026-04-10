@@ -2349,12 +2349,16 @@ def wait_for_service_health(
 
     deadline = time.monotonic() + wait_seconds
     while time.monotonic() <= deadline:
-        if process.poll() is not None:
-            return {"state": "failed", "exit_code": process.returncode}
-
         probe = service_healthcheck_state(service)
         if probe.get("state") == "ok":
-            return {"state": "ok"} | probe
+            reused_existing = process.poll() is not None
+            state = {"state": "ok"} | probe
+            if reused_existing:
+                state["reused_existing"] = True
+                state["exit_code"] = process.returncode
+            return state
+        if process.poll() is not None:
+            return {"state": "failed", "exit_code": process.returncode}
         time.sleep(0.25)
 
     return {"state": "timeout"} | service_healthcheck_state(service)
@@ -2776,6 +2780,17 @@ def start_services(
                 + (f" Health pattern: {health_state['pattern']}." if "pattern" in health_state else "")
                 + (f" Recent logs: {' | '.join(tail)}" if tail else "")
             )
+
+        if health_state.get("reused_existing"):
+            remove_pid_file(paths["pid_file"])
+            reused_result = result | {"result": "already-running"}
+            if "url" in health_state:
+                reused_result["url"] = health_state["url"]
+            if "target" in health_state:
+                reused_result["target"] = health_state["target"]
+            results.append(reused_result)
+            log_runtime_event("service.reused", service["id"])
+            continue
 
         results.append(result | {"result": "started", "pid": process.pid})
         log_runtime_event("service.started", service["id"], {"pid": process.pid})

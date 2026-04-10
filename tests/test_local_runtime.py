@@ -1,9 +1,11 @@
 """Tests for local-runtime bridge, profile, and lifecycle features."""
 from __future__ import annotations
 
+import http.server
 import sys
 import socket
 import tempfile
+import threading
 import textwrap
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -31,6 +33,7 @@ reconcile_local_runtime_env = MANAGE_MODULE.reconcile_local_runtime_env
 runtime_status = MANAGE_MODULE.runtime_status
 select_local_runtime_services = MANAGE_MODULE.select_local_runtime_services
 service_healthcheck_state = MANAGE_MODULE.service_healthcheck_state
+start_services = MANAGE_MODULE.start_services
 validate_env_file_target_paths = MANAGE_MODULE.validate_env_file_target_paths
 validate_parity_ledger = MANAGE_MODULE.validate_parity_ledger
 normalize_active_clients = MANAGE_MODULE.normalize_active_clients
@@ -510,6 +513,53 @@ class BridgeBackedTaskTests(unittest.TestCase):
             state = service_healthcheck_state({"healthcheck": {"type": "port", "port": port}})
             self.assertEqual(state["state"], "ok")
             self.assertEqual(state["port"], port)
+
+    def test_start_services_reuses_existing_healthy_http_service(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            logs_dir = root / "logs" / "runtime"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+
+            class QuietHandler(http.server.SimpleHTTPRequestHandler):
+                def log_message(self, format: str, *args: object) -> None:
+                    del format, args
+
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), QuietHandler)
+            port = server.server_address[1]
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+
+            model = {
+                "root_dir": str(root),
+                "env": {},
+                "artifacts": [],
+                "logs": [{"id": "runtime", "host_path": str(logs_dir)}],
+                "repos": [{"id": "skillbox-self", "host_path": str(root), "path": str(root)}],
+                "services": [],
+            }
+            service = {
+                "id": "cm-mcp",
+                "kind": "http",
+                "repo": "skillbox-self",
+                "command": (
+                    "python3 -c "
+                    f"\\\"import socket, time; s=socket.socket(); "
+                    f"s.bind(('127.0.0.1', {port})); time.sleep(5)\\\""
+                ),
+                "healthcheck": {"type": "http", "url": f"http://127.0.0.1:{port}/"},
+                "log": "runtime",
+            }
+
+            try:
+                results = start_services(model, [service], dry_run=False, wait_seconds=0.5)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+            self.assertEqual(results[0]["result"], "already-running")
+            self.assertEqual(results[0]["url"], f"http://127.0.0.1:{port}/")
+            self.assertFalse((logs_dir / "cm-mcp.pid").exists())
 
 
 class LocalRuntimeProfileValidationTests(unittest.TestCase):
