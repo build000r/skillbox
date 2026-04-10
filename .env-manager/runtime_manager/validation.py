@@ -806,6 +806,39 @@ def validate_skill_repo_sets(model: dict[str, Any]) -> list[CheckResult]:
     lock_warnings: list[str] = []
     install_failures: list[str] = []
     install_warnings: list[str] = []
+    declared_skills_by_skillset: dict[str, set[str]] = {}
+    effective_skill_owner: dict[str, str] = {}
+
+    def declared_skill_names(config: dict[str, Any]) -> set[str]:
+        names: set[str] = set()
+        for entry in config.get("skill_repos") or []:
+            pick = entry.get("pick")
+            if pick:
+                names.update(str(item) for item in pick if str(item).strip())
+                continue
+            repo = str(entry.get("repo") or "").strip()
+            if repo:
+                names.add(repo.split("/")[-1] if "/" in repo else repo)
+        return names
+
+    for skillset in model["skills"]:
+        if skillset.get("kind") != "skill-repo-set":
+            continue
+
+        sid = skillset["id"]
+        config_path = Path(str(skillset.get("skill_repos_config_host_path", "")))
+        if not config_path.is_file():
+            continue
+
+        try:
+            config = load_skill_repos_config(config_path)
+        except RuntimeError:
+            continue
+
+        declared = declared_skill_names(config)
+        declared_skills_by_skillset[sid] = declared
+        for skill_name in declared:
+            effective_skill_owner[skill_name] = sid
 
     for skillset in model["skills"]:
         if skillset.get("kind") != "skill-repo-set":
@@ -826,6 +859,7 @@ def validate_skill_repo_sets(model: dict[str, Any]) -> list[CheckResult]:
             continue
 
         config_sha = file_sha256(config_path)
+        declared_skill_names_for_set = declared_skills_by_skillset.get(sid, set())
 
         if not lock_path.is_file():
             lock_warnings.append(f"{sid}: lockfile missing at {lock_path} — run sync")
@@ -853,19 +887,12 @@ def validate_skill_repo_sets(model: dict[str, Any]) -> list[CheckResult]:
             if name:
                 lock_skills_by_name[name] = skill_entry
 
-        declared_skill_names: set[str] = set()
-        for entry in config.get("skill_repos") or []:
-            pick = entry.get("pick")
-            if pick:
-                declared_skill_names.update(pick)
-            elif entry.get("repo"):
-                repo = entry["repo"]
-                declared_skill_names.add(repo.split("/")[-1] if "/" in repo else repo)
-
-        for skill_name in sorted(declared_skill_names):
+        for skill_name in sorted(declared_skill_names_for_set):
             lock_record = lock_skills_by_name.get(skill_name)
             if lock_record is None:
                 install_failures.append(f"{sid}: SKILL_NOT_INSTALLED: {skill_name} not in lockfile")
+                continue
+            if effective_skill_owner.get(skill_name) != sid:
                 continue
 
             for target in skillset.get("install_targets") or []:

@@ -469,6 +469,90 @@ copy_checkout() {
   STATUS_SOURCE="copied"
 }
 
+vendor_external_skill_roots() {
+  local source_repo="$1"
+  local target_repo="$2"
+  local source_config="${source_repo}/workspace/skill-repos.yaml"
+  local target_config="${target_repo}/workspace/skill-repos.yaml"
+
+  if [[ ! -f "${source_config}" || ! -f "${target_config}" ]]; then
+    return 0
+  fi
+
+  python3 - "${source_repo}" "${target_repo}" <<'PY'
+import os
+import shutil
+import sys
+from pathlib import Path
+
+source_repo = Path(sys.argv[1]).resolve()
+target_repo = Path(sys.argv[2]).resolve()
+source_config = source_repo / "workspace" / "skill-repos.yaml"
+target_config = target_repo / "workspace" / "skill-repos.yaml"
+
+sys.path.insert(0, str((target_repo / ".env-manager").resolve()))
+from runtime_manager.shared import load_skill_repos_config, render_yaml_document  # type: ignore[import-not-found]
+
+
+def contains(base: Path, candidate: Path) -> bool:
+    try:
+        candidate.resolve().relative_to(base.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def unique_vendor_name(root: Path, preferred: str) -> str:
+    base = preferred or "skill-root"
+    candidate = base
+    suffix = 2
+    while (root / candidate).exists():
+        candidate = f"{base}-{suffix}"
+        suffix += 1
+    return candidate
+
+
+source_doc = load_skill_repos_config(source_config)
+target_doc = load_skill_repos_config(target_config)
+entries = target_doc.get("skill_repos") or []
+source_entries = source_doc.get("skill_repos") or []
+vendor_root = target_repo / "workspace" / "portable-skill-repos"
+ignore = shutil.ignore_patterns(".git", ".pytest_cache", "__pycache__", "*.pyc", ".DS_Store")
+changed = False
+
+for index, entry in enumerate(entries):
+    raw_path = str(entry.get("path") or "").strip()
+    if not raw_path:
+        continue
+
+    source_entry = source_entries[index] if index < len(source_entries) else entry
+    source_raw_path = str(source_entry.get("path") or raw_path).strip()
+
+    source_root = Path(source_raw_path).expanduser()
+    if not source_root.is_absolute():
+        source_root = (source_config.parent / source_root).resolve()
+
+    target_root = Path(raw_path).expanduser()
+    if not target_root.is_absolute():
+        target_root = (target_config.parent / target_root).resolve()
+
+    if contains(target_repo, target_root) and target_root.exists():
+        continue
+    if not source_root.is_dir():
+        continue
+
+    vendor_root.mkdir(parents=True, exist_ok=True)
+    vendor_name = unique_vendor_name(vendor_root, source_root.name)
+    vendor_path = vendor_root / vendor_name
+    shutil.copytree(source_root, vendor_path, ignore=ignore)
+    entry["path"] = os.path.relpath(vendor_path, target_config.parent).replace(os.sep, "/")
+    changed = True
+
+if changed:
+    target_config.write_text(render_yaml_document(target_doc), encoding="utf-8")
+PY
+}
+
 extract_tarball_checkout() {
   local tarball="$1"
   local dest="$2"
@@ -566,6 +650,9 @@ hydrate_env() {
   local target_repo="$1"
   local env_file="${target_repo}/.env"
   local env_example="${target_repo}/.env.example"
+  local cass_path=""
+  local cm_path=""
+  local apr_path=""
 
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     STATUS_ENV="planned"
@@ -580,6 +667,93 @@ hydrate_env() {
     return 0
   fi
   cp "${env_example}" "${env_file}"
+
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    cass_path="$(command -v cass 2>/dev/null || true)"
+    cm_path="$(command -v cm 2>/dev/null || true)"
+    apr_path="$(command -v apr 2>/dev/null || true)"
+    if [[ -n "${cass_path}" || -n "${cm_path}" || -n "${apr_path}" ]]; then
+      python3 - "${env_file}" "${cass_path}" "${cm_path}" "${apr_path}" <<'PY'
+import sys
+from pathlib import Path
+
+env_path = Path(sys.argv[1])
+cass_path, cm_path, apr_path = sys.argv[2:5]
+updates = {}
+
+if cass_path:
+    updates["SKILLBOX_CASS_BIN"] = cass_path
+    updates["SKILLBOX_CASS_DOWNLOAD_URL"] = ""
+    updates["SKILLBOX_CASS_DOWNLOAD_SHA256"] = ""
+if cm_path:
+    updates["SKILLBOX_CM_BIN"] = cm_path
+    updates["SKILLBOX_CM_DOWNLOAD_URL"] = ""
+    updates["SKILLBOX_CM_DOWNLOAD_SHA256"] = ""
+if apr_path:
+    updates["SKILLBOX_APR_BIN"] = apr_path
+    updates["SKILLBOX_APR_DOWNLOAD_URL"] = ""
+    updates["SKILLBOX_APR_DOWNLOAD_SHA256"] = ""
+
+if updates:
+    lines = env_path.read_text(encoding="utf-8").splitlines()
+    rendered = []
+    seen = set()
+    for line in lines:
+        if not line or line.lstrip().startswith("#") or "=" not in line:
+            rendered.append(line)
+            continue
+        key, _, value = line.partition("=")
+        if key in updates:
+            rendered.append(f"{key}={updates[key]}")
+            seen.add(key)
+        else:
+            rendered.append(line)
+    for key, value in updates.items():
+        if key not in seen:
+            rendered.append(f"{key}={value}")
+    env_path.write_text("\n".join(rendered) + "\n", encoding="utf-8")
+PY
+    fi
+  fi
+
+  python3 - "${env_file}" <<'PY'
+import socket
+import sys
+from pathlib import Path
+
+env_path = Path(sys.argv[1])
+lines = env_path.read_text(encoding="utf-8").splitlines()
+values = {}
+for line in lines:
+    if not line or line.lstrip().startswith("#") or "=" not in line:
+        continue
+    key, _, value = line.partition("=")
+    values[key] = value
+
+raw_port = values.get("SKILLBOX_CM_MCP_PORT", "").strip()
+try:
+    cm_port = int(raw_port)
+except ValueError:
+    cm_port = 0
+
+def port_in_use(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.2)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+if cm_port > 0 and port_in_use(cm_port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        new_port = probe.getsockname()[1]
+    rendered = []
+    for line in lines:
+        if line.startswith("SKILLBOX_CM_MCP_PORT="):
+            rendered.append(f"SKILLBOX_CM_MCP_PORT={new_port}")
+        else:
+            rendered.append(line)
+    env_path.write_text("\n".join(rendered) + "\n", encoding="utf-8")
+PY
+
   STATUS_ENV="created"
 }
 
@@ -952,6 +1126,7 @@ if [[ -n "${SOURCE_DIR}" ]]; then
     STATUS_SOURCE="planned"
   else
     copy_checkout "${SOURCE_DIR}" "${REPO_DIR}"
+    vendor_external_skill_roots "${SOURCE_DIR}" "${REPO_DIR}"
   fi
 elif [[ -n "${OFFLINE_TARBALL}" ]]; then
   OFFLINE_TARBALL="$(resolve_abs_path "${OFFLINE_TARBALL}")"
