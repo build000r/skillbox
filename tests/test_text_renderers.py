@@ -67,9 +67,9 @@ class LocalRuntimeErrorRendererTests(unittest.TestCase):
         # TC-2: workflows.run_up emits MODE_UNSUPPORTED with blocked services.
         envelope = local_runtime_error(
             "LOCAL_RUNTIME_MODE_UNSUPPORTED",
-            "Mode 'prod' is not supported by all requested services: cfo",
+            "Mode 'prod' is not supported by all requested services: svc-finance",
             recoverable=True,
-            blocked_services=["cfo"],
+            blocked_services=["svc-finance"],
             next_action="Re-run with a mode declared by every service in local-core.",
         )
         envelope["error"]["requested_mode"] = "prod"
@@ -78,11 +78,11 @@ class LocalRuntimeErrorRendererTests(unittest.TestCase):
         self.assertEqual(
             lines[0],
             "ERROR [LOCAL_RUNTIME_MODE_UNSUPPORTED]: Mode 'prod' is not supported by"
-            " all requested services: cfo",
+            " all requested services: svc-finance",
         )
         self.assertIn("requested mode: prod", out)
         self.assertIn("blocked services:", out)
-        self.assertIn("  - cfo", out)
+        self.assertIn("  - svc-finance", out)
         self.assertIn(
             "next action: Re-run with a mode declared by every service in local-core.",
             out,
@@ -91,12 +91,12 @@ class LocalRuntimeErrorRendererTests(unittest.TestCase):
     def test_tc3_start_blocked_lists_every_blocked_service(self) -> None:
         # TC-3: bootstrap failure produces START_BLOCKED with full blocked list.
         blocked = [
-            "spaps",
-            "htma_server",
-            "ingredient_server",
-            "approval_feedback_api",
-            "cfo",
-            "htma",
+            "svc-auth",
+            "svc-api",
+            "svc-worker",
+            "svc-feedback",
+            "svc-finance",
+            "svc-web",
         ]
         envelope = local_runtime_error(
             "LOCAL_RUNTIME_START_BLOCKED",
@@ -123,19 +123,19 @@ class LocalRuntimeErrorRendererTests(unittest.TestCase):
         # TC-4: logs deferred surface — has next_action, no blocked_services.
         envelope = local_runtime_error(
             "LOCAL_RUNTIME_SERVICE_DEFERRED",
-            "Service ingredient_server is declared deferred by parity ledger",
+            "Service svc-worker is declared deferred by parity ledger",
             recoverable=False,
-            next_action="manage.py logs --service spaps",
+            next_action="manage.py logs --service svc-auth",
         )
         out = render_to_stderr(envelope)
         self.assertTrue(
             out.startswith(
-                "ERROR [LOCAL_RUNTIME_SERVICE_DEFERRED]: Service ingredient_server"
+                "ERROR [LOCAL_RUNTIME_SERVICE_DEFERRED]: Service svc-worker"
                 " is declared deferred by parity ledger"
             ),
             f"unexpected output: {out!r}",
         )
-        self.assertIn("next action: manage.py logs --service spaps", out)
+        self.assertIn("next action: manage.py logs --service svc-auth", out)
         self.assertNotIn("blocked services:", out)
         self.assertNotIn("requested mode:", out)
 
@@ -143,13 +143,13 @@ class LocalRuntimeErrorRendererTests(unittest.TestCase):
         # TC-5 (Bug B): focus bootstrap failure must surface in text mode.
         envelope = local_runtime_error(
             "LOCAL_RUNTIME_ENV_BRIDGE_FAILED",
-            "approval-feedback bridge exited with status 2",
+            "svc-feedback bridge exited with status 2",
             recoverable=True,
             next_action="re-run sync.sh manually to diagnose",
         )
         out = render_to_stderr(envelope)
         self.assertIn(
-            "ERROR [LOCAL_RUNTIME_ENV_BRIDGE_FAILED]: approval-feedback bridge"
+            "ERROR [LOCAL_RUNTIME_ENV_BRIDGE_FAILED]: svc-feedback bridge"
             " exited with status 2",
             out,
         )
@@ -251,7 +251,7 @@ class LocalRuntimeJsonRegressionTests(unittest.TestCase):
             "LOCAL_RUNTIME_MODE_UNSUPPORTED",
             "byte-stability check",
             recoverable=True,
-            blocked_services=["cfo"],
+            blocked_services=["svc-finance"],
             next_action="re-run",
         )
         envelope["error"]["requested_mode"] = "prod"
@@ -264,7 +264,7 @@ class LocalRuntimeJsonRegressionTests(unittest.TestCase):
         self.assertEqual(err["type"], "LOCAL_RUNTIME_MODE_UNSUPPORTED")
         self.assertEqual(err["detail"], "byte-stability check")
         self.assertEqual(err["recoverable"], True)
-        self.assertEqual(err["blocked_services"], ["cfo"])
+        self.assertEqual(err["blocked_services"], ["svc-finance"])
         self.assertEqual(err["next_action"], "re-run")
         self.assertEqual(err["requested_mode"], "prod")
 

@@ -3112,6 +3112,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertIn("internal-env-manager", content)
             self.assertIn("make dev-sanity", content)
             self.assertIn("make runtime-status", content)
+            self.assertIn("use `gh-axi` for GitHub operations", content)
             self.assertNotIn("CLIENT=", content)
 
             agents_content = agents_md.read_text(encoding="utf-8")
@@ -5186,6 +5187,7 @@ class RuntimeManagerTests(unittest.TestCase):
             # CLAUDE.md should have been written with live sections
             claude_md = (repo / "home" / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
             self.assertIn("## Live Status", claude_md)
+            self.assertIn("use `gh-axi` for GitHub operations", claude_md)
             # Repo State only appears when git repos are detected (tmpdir isn't a git repo)
             self.assertIn("personal", claude_md)
 
@@ -6114,11 +6116,11 @@ class LocalCoreModeAwareUpUS2Tests(unittest.TestCase):
     def test_up_mixed_mode_support_rejects_whole_request(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             model = self._fresh_model(tmpdir)
-            # cfo only supports reuse; requesting prod must reject the
+            # svc-finance only supports reuse; requesting prod must reject the
             # whole graph per backend.md Rule 2 / shared.md US-2.
             for service in model["services"]:
-                if service["id"] == "cfo":
-                    service["commands"] = {"reuse": "make local-up-reuse # cfo"}
+                if service["id"] == "svc-finance":
+                    service["commands"] = {"reuse": "make local-up-reuse # svc-finance"}
                     break
             exit_code, payload = MANAGE_MODULE.run_up(
                 model=model,
@@ -6131,13 +6133,13 @@ class LocalCoreModeAwareUpUS2Tests(unittest.TestCase):
             self.assertEqual(
                 payload["error"]["type"], "LOCAL_RUNTIME_MODE_UNSUPPORTED",
             )
-            self.assertIn("cfo", payload["error"]["blocked_services"])
+            self.assertIn("svc-finance", payload["error"]["blocked_services"])
             # No services were started, not even the five that do support prod
             self.assertEqual(payload["services"], [])
 
     def test_up_topological_order_is_six_service_graph(self) -> None:
-        # Confirms htma's dual dependency (spaps+htma_server) is enforced,
-        # and the five siblings depend only on spaps.  The planned order
+        # Confirms svc-web's dual dependency (svc-auth+svc-api) is enforced,
+        # and the five siblings depend only on svc-auth.  The planned order
         # emitted by run_up is produced by resolve_services_for_start.
         with tempfile.TemporaryDirectory() as tmpdir:
             model = self._fresh_model(tmpdir)
@@ -6151,17 +6153,17 @@ class LocalCoreModeAwareUpUS2Tests(unittest.TestCase):
             self.assertEqual(exit_code, 0, payload)
             ordered = [s["id"] for s in payload["services"]]
             pos = {sid: index for index, sid in enumerate(ordered)}
-            # spaps strictly precedes each dependent service
+            # svc-auth strictly precedes each dependent service
             for dependent in (
-                "htma_server",
-                "ingredient_server",
-                "approval_feedback_api",
-                "cfo",
-                "htma",
+                "svc-api",
+                "svc-worker",
+                "svc_feedback",
+                "svc-finance",
+                "svc-web",
             ):
-                self.assertLess(pos["spaps"], pos[dependent])
-            # htma depends on BOTH spaps and htma_server
-            self.assertLess(pos["htma_server"], pos["htma"])
+                self.assertLess(pos["svc-auth"], pos[dependent])
+            # svc-web depends on BOTH svc-auth and svc-api
+            self.assertLess(pos["svc-api"], pos["svc-web"])
             self.assertEqual(set(ordered), set(_LOCAL_CORE_IDS))
 
     def test_up_identical_mode_commands_are_accepted(self) -> None:
@@ -6190,10 +6192,10 @@ class LocalCoreModeAwareUpUS2Tests(unittest.TestCase):
 class LocalCoreBootstrapAndBlockedUS3Tests(unittest.TestCase):
     """WG-007 / US-3: Bootstrap ordering and START_BLOCKED."""
 
-    def test_approval_feedback_db_bootstrap_ordered_before_service_start(self) -> None:
+    def test_svc_feedback_db_bootstrap_ordered_before_service_start(self) -> None:
         # resolve_tasks_for_services returns bootstrap tasks in dependency
-        # order for the resolved service list; the approval-feedback-db
-        # task must appear in that list when approval_feedback_api is
+        # order for the resolved service list; the svc-feedback-db
+        # task must appear in that list when svc_feedback is
         # being started.
         with tempfile.TemporaryDirectory() as tmpdir:
             model = _build_local_core(Path(tmpdir).resolve())
@@ -6204,29 +6206,29 @@ class LocalCoreBootstrapAndBlockedUS3Tests(unittest.TestCase):
                 model, services, mode="reuse",
             )
             ordered_ids = [s["id"] for s in ordered_services]
-            self.assertEqual(ordered_ids[0], "spaps")
+            self.assertEqual(ordered_ids[0], "svc-auth")
             task_specs = MANAGE_MODULE.resolve_tasks_for_services(
                 model, ordered_services,
             )
             task_ids = [t["id"] for t in task_specs]
-            self.assertIn("approval-feedback-db-bootstrap", task_ids)
+            self.assertIn("svc-feedback-db-bootstrap", task_ids)
             self.assertIn("env-bridge-local-core", task_ids)
             # The bootstrap task is resolved BEFORE we start
-            # approval_feedback_api (it is the bootstrap the service
+            # svc_feedback (it is the bootstrap the service
             # declares as a dependency).  run_up runs tasks before
             # start_services; here we simply confirm the service
             # declares it in ``bootstrap_tasks``.
-            approval = next(
+            feedback = next(
                 s for s in ordered_services
-                if s["id"] == "approval_feedback_api"
+                if s["id"] == "svc_feedback"
             )
             self.assertIn(
-                "approval-feedback-db-bootstrap",
-                approval["bootstrap_tasks"],
+                "svc-feedback-db-bootstrap",
+                feedback["bootstrap_tasks"],
             )
 
     def test_up_db_bootstrap_failure_returns_start_blocked(self) -> None:
-        # Simulate the approval-feedback DB bootstrap failing to reach
+        # Simulate the svc-feedback DB bootstrap failing to reach
         # port 5436 -- run_tasks raises and run_up translates it into
         # LOCAL_RUNTIME_START_BLOCKED with blocked_services populated.
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -6236,7 +6238,7 @@ class LocalCoreBootstrapAndBlockedUS3Tests(unittest.TestCase):
 
             def _boom(model_arg, task_specs, *, dry_run, mode=None):  # type: ignore[no-untyped-def]
                 raise RuntimeError(
-                    "Task approval-feedback-db-bootstrap failed: "
+                    "Task svc-feedback-db-bootstrap failed: "
                     "port 5436 never became ready"
                 )
 
@@ -6257,7 +6259,7 @@ class LocalCoreBootstrapAndBlockedUS3Tests(unittest.TestCase):
                 payload["error"]["type"], "LOCAL_RUNTIME_START_BLOCKED",
             )
             self.assertIn(
-                "approval_feedback_api",
+                "svc_feedback",
                 payload["error"]["blocked_services"],
             )
 
@@ -6269,7 +6271,7 @@ class LocalCoreBootstrapAndBlockedUS3Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             model = _build_local_core(
                 Path(tmpdir).resolve(),
-                approval_env_filename=".env.local",
+                feedback_env_filename=".env.local",
             )
             exit_code, payload = MANAGE_MODULE.run_up(
                 model=model,
@@ -6296,7 +6298,7 @@ class LocalCoreParityLedgerUS4RunUpTests(unittest.TestCase):
                 client_id="personal",
                 profile="local-core",
                 requested_mode="reuse",
-                service_filter=["buildooor"],
+                service_filter=["legacy-builder"],
                 dry_run=True,
             )
             self.assertEqual(exit_code, 1)
@@ -6341,7 +6343,7 @@ class LocalMinimalRegressionTests(unittest.TestCase):
             # shared.md Rule 1: local-minimal is a subset of local-core,
             # not a competing bridge path.
             for service in model["services"]:
-                if service["id"] in ("spaps", "htma_server", "htma"):
+                if service["id"] in ("svc-auth", "svc-api", "svc-web"):
                     service["profiles"] = sorted(
                         set(service["profiles"]) | {"local-minimal"}
                     )
@@ -6360,7 +6362,7 @@ class LocalMinimalRegressionTests(unittest.TestCase):
                 model, "local-minimal",
             )
             ids = [s["id"] for s in services]
-            self.assertEqual(ids, ["spaps", "htma_server", "htma"])
+            self.assertEqual(ids, ["svc-auth", "svc-api", "svc-web"])
 
             # focus reconciliation still passes against the same bridge outputs
             result = MANAGE_MODULE.reconcile_local_runtime_env(
@@ -6378,7 +6380,7 @@ class LocalMinimalRegressionTests(unittest.TestCase):
             )
             self.assertEqual(exit_code, 0, payload)
             ordered = [s["id"] for s in payload["services"]]
-            self.assertEqual(ordered, ["spaps", "htma_server", "htma"])
+            self.assertEqual(ordered, ["svc-auth", "svc-api", "svc-web"])
 
 
 if __name__ == "__main__":

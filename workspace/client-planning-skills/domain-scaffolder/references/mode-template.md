@@ -17,7 +17,7 @@ plan_index: {path or "N/A"}
 
 ## Auth Service Integration (Optional)
 
-Preferred generic keys:
+Use these generic keys to point at a reusable auth/payments/identity layer:
 
 ```text
 auth_packages_root: ../{auth-service}/packages
@@ -25,14 +25,8 @@ auth_python_packages: [<required package names>]
 auth_npm_packages: [<required package names>]
 ```
 
-Legacy compatibility aliases are still accepted in existing modes when the auth
-layer is SPAPS-shaped:
-
-```text
-spaps_root: ../sweet-potato/packages
-spaps_python_packages: [<required package names>]
-spaps_npm_packages: [<required package names>]
-```
+Operator overlays may map these to whatever auth package layout their stack
+uses; the scaffolder treats them as opaque pointers.
 
 Rules:
 
