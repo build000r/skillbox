@@ -27,6 +27,7 @@ skill_repos:
   # Shared workflow skills from the main opensource skills repo
   - path: ../../skills
     pick:
+      - cli-ergonomics
       - crap
       - divide-and-conquer
       - domain-planner

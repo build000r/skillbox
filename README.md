@@ -46,7 +46,7 @@ right client context without standing up a full hosted workspace control plane.
 - declare one-shot bootstrap tasks and let services pull them in automatically
 - start and stop declared service graphs in dependency order with one command
 - focus on a client workspace with live state collection, enriched agent context, and continuous drift monitoring
-- acknowledge journal events to curate active context — acked events are hidden from CLAUDE.md so agents only see unresolved items
+- record runtime activity in `runtime.log` and durable client-scoped session timelines
 - provision and tear down remote boxes from the operator machine via MCP tools
 - declare skill repos and sync skills from GitHub repos or local paths
 - validate outer drift with `make doctor` and inner drift with `make dev-sanity`
@@ -59,8 +59,8 @@ right client context without standing up a full hosted workspace control plane.
 | A workspace that feels like a narrowed local setup | One bind-mounted `/workspace`, plus durable state from `SKILLBOX_STATE_ROOT` mounted into `/workspace/logs`, `/workspace/workspace/clients`, `/home/sandbox`, and optional `/monoserver` |
 | A sane way to let the box grow over time | `workspace/runtime.yaml` plus `.env-manager/manage.py` manage the core machine plus client-specific repos, artifacts, installed skills, logs, and checks |
 | Service graphs that do not devolve into shell folklore | Declared `depends_on` edges let `up`, `down`, and `restart` expand and order service graphs automatically |
-| Live drift detection and auto-healing | The pulse daemon monitors services on a fixed interval, auto-restarts crashes, and emits structured events to a JSONL journal |
-| Context curation across sessions | `ack` marks journal events as handled so the next `focus` only surfaces unresolved items in CLAUDE.md — less noise, higher signal |
+| Live drift detection and auto-healing | The pulse daemon monitors services on a fixed interval, auto-restarts crashes, and appends human-readable events to `logs/runtime/runtime.log` |
+| Runtime history plus durable work notes | `focus` surfaces recent runtime activity, while `skillbox_session_*` tools and `cm` carry longer-lived work context |
 | One-command client activation | `focus` syncs, bootstraps, starts services, collects live state, and writes enriched agent context in a single pass |
 | Fleet management from the operator machine | The operator MCP server provisions DO droplets, enrolls Tailscale, and runs commands on remote boxes as native agent tools |
 | Reproducible default skills | `skill-repos.yaml` declares GitHub repos and local paths; `sync` clones and filtered-installs skills |
@@ -139,7 +139,7 @@ The enriched context adds live sections that the static `context` command does n
 
 - a **Live Status** table showing service state, PID, and health
 - a **Repo State** table showing branch, dirty file count, and last commit
-- a **Recent Activity** feed from the event journal
+- a **Recent Activity** feed from the runtime log and active durable sessions
 - an **Attention** section highlighting failing checks, downed services, and recent log errors
 
 Resume the last session without re-running the full pipeline:
@@ -156,50 +156,50 @@ shelling out to legacy bash orchestration.
 
 ### Canonical daily path
 
-`local-core` is the canonical daily profile in the `personal` overlay. It
-covers the full six-service loop that used to live behind `../../.env-manager`
-`project.sh`. The runtime owns env hydration, bootstrap, start order, health
-waits, status, logs, and teardown for every service in the profile.
+A `local-core` profile in your client overlay declares the daily local
+development loop — the set of services you want `up` together, in dependency
+order, with health waits. The runtime owns env hydration, bootstrap, start
+order, health waits, status, logs, and teardown for every service in the
+profile.
 
 ```bash
 # Hydrate env, run bridge, write enriched context for local-core
-python3 .env-manager/manage.py focus personal --profile local-core --format json
+python3 .env-manager/manage.py focus <client> --profile local-core --format json
 
 # Start the full core loop in dependency order, in reuse mode
-python3 .env-manager/manage.py up --client personal --profile local-core --mode reuse
+python3 .env-manager/manage.py up --client <client> --profile local-core --mode reuse
 
 # Same, but use each repo's prod-backed local path where it differs
-python3 .env-manager/manage.py up --client personal --profile local-core --mode prod
+python3 .env-manager/manage.py up --client <client> --profile local-core --mode prod
 
 # Same, but use each repo's reset/fresh-restore path
-python3 .env-manager/manage.py up --client personal --profile local-core --mode fresh
+python3 .env-manager/manage.py up --client <client> --profile local-core --mode fresh
 
 # Inspect state for the active profile
-python3 .env-manager/manage.py status --client personal --profile local-core
+python3 .env-manager/manage.py status --client <client> --profile local-core
 
 # Tail one service
-python3 .env-manager/manage.py logs --client personal --service htma_server
+python3 .env-manager/manage.py logs --client <client> --service <service-id>
 ```
 
-### Covered services
+### Declaring covered services
 
-`local-core` covers these six services. Repo roots are resolved under
-`${SKILLBOX_MONOSERVER_ROOT}` and each repo provides its own start command;
-the overlay declares dependency order, env targets, and health probes.
+`local-core` covers whatever services your overlay declares for it. Repo
+roots are resolved under `${SKILLBOX_MONOSERVER_ROOT}` and each repo
+provides its own start command; the overlay declares dependency order, env
+targets, and health probes. A typical overlay might look like:
 
 | Service | Repo root | Depends on | Health |
 |---------|-----------|------------|--------|
-| `spaps` | `sweet-potato` | — | `http://localhost:3301/health` |
-| `htma_server` | `htma_server` | `spaps` | `http://localhost:8000/health` |
-| `ingredient_server` | `ingredient_server` | `spaps` | `http://localhost:8001/health` |
-| `approval_feedback_api` | `unclawg/services/approval_feedback_api` | `spaps` | `http://localhost:8010/health` |
-| `cfo` | `cfo` | `spaps` | TCP probe on port `8050` |
-| `htma` | `htma` | `spaps`, `htma_server` | `http://localhost:5173` |
+| `auth-api` | `auth` | — | `http://localhost:3301/health` |
+| `core-api` | `core-api` | `auth-api` | `http://localhost:8000/health` |
+| `worker` | `worker` | `auth-api` | `http://localhost:8001/health` |
+| `web` | `web` | `auth-api`, `core-api` | `http://localhost:5173` |
 
-All six support `--mode reuse`, `--mode prod`, and `--mode fresh`. The runtime
-validates the selected mode against each service before starting anything and
-returns `LOCAL_RUNTIME_MODE_UNSUPPORTED` if a requested service cannot honor
-it.
+Covered services may declare any subset of `--mode reuse`, `--mode prod`, and
+`--mode fresh`. The runtime validates the selected mode against each service
+before starting anything and returns `LOCAL_RUNTIME_MODE_UNSUPPORTED` if a
+requested service cannot honor it.
 
 ### Start modes
 
@@ -230,16 +230,17 @@ Bridge-related error codes:
 | `LOCAL_RUNTIME_ENV_BRIDGE_FAILED` | Bridge task exits non-zero |
 | `LOCAL_RUNTIME_ENV_OUTPUT_MISSING` | Generated env file absent after bridge |
 
-### local-minimal subset
+### local-minimal subsets
 
-`local-minimal` is a strict subset of `local-core` covering `spaps`,
-`htma_server`, and `htma`. It shares the same overlay declarations, the same
-`--mode` contract, and runs off its own `local-minimal-bridge` (which compiles
-the same targets minus the three the subset does not need). Use it when you
-only need the frontend slice plus its server dependency.
+Overlays can declare strict subsets of `local-core` (for example a
+`local-minimal` profile that covers only the frontend slice plus its server
+dependency). A subset shares the same overlay declarations, the same
+`--mode` contract, and runs off its own bridge (which compiles only the env
+targets the subset needs). Use a subset when you do not need the full daily
+loop running.
 
 ```bash
-python3 .env-manager/manage.py up --client personal --profile local-minimal --mode reuse
+python3 .env-manager/manage.py up --client <client> --profile local-minimal --mode reuse
 ```
 
 ### Profile namespace
@@ -248,15 +249,14 @@ Local profiles use the `local-*` prefix to avoid collisions with box-level
 profiles (`core`, `surfaces`, `connectors`). Selecting any `local-*` profile
 also activates `core` automatically.
 
-Profiles declared in the personal overlay:
+Typical profiles an overlay might declare:
 
 | Profile | Coverage |
 |---------|----------|
-| `local-core` | Full daily loop: `spaps`, `htma_server`, `ingredient_server`, `approval_feedback_api`, `cfo`, `htma` |
-| `local-minimal` | Subset of `local-core`: `spaps`, `htma_server`, `htma` |
+| `local-core` | The full daily loop your overlay declares as covered |
+| `local-minimal` | A strict subset of `local-core` for a narrower slice |
 | `local-backend` | Backend subset of `local-core` |
 | `local-frontend` | Frontend subset of `local-core` |
-| `local-openclaw` | Unclawg-oriented subset of `local-core` |
 | `local-all` | Union of all covered local-runtime services |
 
 The runtime resolves each profile by filtering the same covered-service set;
@@ -282,14 +282,14 @@ Each entry records:
 - `bridge_dependency` — which bridge, if any, the surface still runs through
 - `request_error` — the error code returned for direct lifecycle requests
 
-Current ownership states for legacy surfaces on the `personal` overlay:
+Each overlay records its own ownership states. The shape looks like:
 
-| State | Examples |
-|-------|----------|
-| `covered` | `spaps`, `htma_server`, `ingredient_server`, `approval_feedback_api`, `cfo`, `htma`, `db=reuse\|prod\|fresh` |
-| `bridge-only` | `sync.sh` env compilation |
-| `deferred` | `buildooor`, `cca-website`, `unclawg`, `voice-to-text`, `swimmers` (legacy personal service), `videos`, `cfo-discord-bot`, `skill-control-plane`, `approval_feedback_expiry_worker`, `watch`, `mobile`/`tailnet`, `hot_reload*` |
-| `external` | `opensource/skills`, `openclaw_health*` |
+| State | What it means |
+|-------|---------------|
+| `covered` | Surfaces fully owned by the runtime, including supported `--mode` values |
+| `bridge-only` | Surfaces still running through a temporary seam (e.g. `sync.sh` env compilation) |
+| `deferred` | Surfaces acknowledged but not yet covered — requesting them returns `LOCAL_RUNTIME_SERVICE_DEFERRED` |
+| `external` | Surfaces explicitly owned outside this overlay |
 
 Deferred surfaces are acknowledged, not supported. Requesting one through the
 runtime returns `LOCAL_RUNTIME_SERVICE_DEFERRED`; adding one requires a
@@ -324,48 +324,13 @@ What it does each cycle:
 - probes every declared service and detects state transitions
 - auto-restarts crashed managed services with exponential backoff
 - runs declared checks and detects failures and recoveries
-- writes every state change to the JSONL event journal at `logs/runtime/journal.jsonl`
+- writes every state change to the plain-text runtime log at `logs/runtime/runtime.log`
 - persists a state snapshot at `logs/runtime/pulse.state.json` for the MCP tool to read
 
-The journal is queryable via the `skillbox_journal` MCP tool inside the
-container or via `query_journal()` in Python.
-
-## Event Acking
-
-The journal accumulates events over time. Without curation, the Recent
-Activity section in CLAUDE.md becomes noise — agents see resolved issues
-alongside unresolved ones and can't tell which need attention.
-
-`ack` lets agents and operators mark events as handled:
-
-```bash
-# ack all pulse restart events for a specific service
-make ack TYPE=pulse.service_restarted SUBJECT=api-stub REASON="fixed"
-
-# ack everything after reviewing the journal
-make ack ALL=1 REASON="reviewed"
-
-# see current acks
-make ack LIST=1
-
-# clean up expired acks (24h default)
-make ack PRUNE=1
-```
-
-Or via the `skillbox_ack` MCP tool inside the container.
-
-What this changes:
-
-- the **Recent Activity** section in CLAUDE.md hides acked events and shows
-  a count of how many were suppressed
-- the raw journal is never modified — acks are stored in a sidecar file at
-  `logs/runtime/journal.acks.json`
-- acks **expire after 24 hours** so nothing is permanently masked
-- if the same problem recurs, pulse emits a new event with a new timestamp
-  that is unacked by definition — the issue resurfaces automatically
-
-The result is that each `focus` activation shows only the events that still
-matter, and the context window shrinks as work gets done instead of growing.
+For durable, work-specific notes, use the `skillbox_session_*` MCP tools for
+client-scoped session timelines and `cm` for procedural memory. `focus`
+surfaces recent runtime activity directly from `runtime.log`; there is no
+separate journal ack queue.
 
 ## Swimmers Overlay
 
@@ -540,7 +505,7 @@ workspace can accrete without turning into guesswork.
 
 ### 8. Continuous observation beats point-in-time checks
 
-The pulse daemon and event journal give the box a memory. Instead of only
+The pulse daemon, runtime log, and durable session timeline give the box a memory. Instead of only
 checking state when you ask, the box continuously monitors itself and records
 what happened, so agents and operators can query recent history rather than
 re-deriving it from scratch.
@@ -715,7 +680,6 @@ make runtime-sync
 | `make runtime-logs` | Shows recent service logs for the active scope |
 | `make onboard` | Scaffold and activate a new client overlay with optional blueprint |
 | `make context` | Generates `CLAUDE.md` and `AGENTS.md` from the resolved runtime graph |
-| `make ack` | Acknowledge journal events to curate agent context (`TYPE=name SUBJECT=name ALL=1 LIST=1 PRUNE=1 REASON=text`) |
 | `make dev-sanity` | Validates the internal runtime graph, filesystem readiness, and managed skill integrity |
 | `make pulse-start` | Starts the pulse reconciliation daemon |
 | `make pulse-stop` | Sends SIGTERM to the running pulse daemon |
@@ -753,7 +717,6 @@ make runtime-sync
 | `scripts/guard-destructive-op.sh` | PreToolUse hook gating destructive operator tools | Called automatically by Claude Code hooks |
 | `.env-manager/manage.py context` | Generate CLAUDE.md and AGENTS.md from the resolved runtime graph | `python3 .env-manager/manage.py context --client personal` |
 | `.env-manager/manage.py focus` | Activate a client with live state and enriched context | `python3 .env-manager/manage.py focus personal --format json` |
-| `.env-manager/manage.py ack` | Acknowledge journal events to curate active context | `python3 .env-manager/manage.py ack --type pulse.service_restarted --subject api-stub --reason "fixed"` |
 | `.env-manager/manage.py render` | Print the resolved internal runtime graph | `python3 .env-manager/manage.py render --format json` |
 | `.env-manager/manage.py sync` | Create managed repo/artifact/log directories and install declared skills for the selected core/client scope | `python3 .env-manager/manage.py sync --client personal --dry-run` |
 | `.env-manager/manage.py doctor` | Validate the internal repos/skills/logs/check graph for the selected core/client scope | `python3 .env-manager/manage.py doctor --client personal` |
@@ -1371,7 +1334,7 @@ exist all the time.
        │ repos, artifacts, skills, checks │
        │ api/web stub health probes       │
        │ cloned skill repos + lockfiles   │
-       │ event journal (journal.jsonl)    │
+       │ runtime log (runtime.log)        │
        │ pulse state (pulse.state.json)   │
        └──────────────────────────────────┘
 
@@ -1411,9 +1374,8 @@ agents tools to manage their own environment:
 | `skillbox_client_init` | Create a new client overlay from blueprint |
 | `skillbox_client_diff` | Review the delta between a candidate client bundle and the current published payload |
 | `skillbox_pulse` | Query pulse daemon status |
-| `skillbox_journal` | Query the event journal |
-| `skillbox_journal_write` | Write an agent event to the journal |
-| `skillbox_ack` | Acknowledge events to curate active context |
+| `skillbox_session_start` / `skillbox_session_event` / `skillbox_session_end` | Manage durable client-scoped session timelines |
+| `skillbox_session_resume` / `skillbox_session_status` | Resume or inspect durable session state |
 
 Opened client surfaces always include the `skillbox` MCP. Core surfaces also
 include `cm` for procedural memory, and connector-capable surfaces add `fwc`
@@ -1629,25 +1591,20 @@ No. The outer `../.env-manager` launches boxes from outside. The in-repo `.env-m
 `context` generates a static CLAUDE.md from the declared runtime graph.
 `focus` does everything `context` does but also syncs, bootstraps, starts
 services, collects live state, and writes an enriched context with real-time
-service health, git state, recent errors, and journal activity.
+service health, git state, recent errors, and runtime activity.
 
-### What is the event journal?
+### What is the runtime log?
 
-An append-only JSONL file at `.skillbox-state/logs/runtime/journal.jsonl` on
-the host, mounted at `/workspace/logs/runtime/journal.jsonl` inside the
-container. Every significant runtime event (service start/stop/crash, sync
-completion, focus activation, pulse restarts) is recorded with a timestamp,
-type, subject, and detail object. Agents can query it via the
-`skillbox_journal` MCP tool.
+A plain-text log at `.skillbox-state/logs/runtime/runtime.log` on the host,
+mounted at `/workspace/logs/runtime/runtime.log` inside the container. Pulse,
+sync, focus, and other runtime paths append human-readable status lines there
+so recent activity can be surfaced without a separate journal service.
 
-### What is event acking?
+### How should agents store durable notes or memory?
 
-A way to mark journal events as "handled" so they stop appearing in the
-Recent Activity section of CLAUDE.md. Acks are stored in a sidecar file
-(`.skillbox-state/logs/runtime/journal.acks.json` on the host), never modify
-the journal itself, and
-expire after 24 hours. If a problem recurs, new events surface automatically.
-Use `make ack` or the `skillbox_ack` MCP tool.
+Use the `skillbox_session_*` MCP tools for client-scoped session timelines and
+`cm` for longer-lived procedural memory. `focus` reads recent runtime activity
+from `runtime.log`; there is no `ack` command or journal sidecar flow anymore.
 
 ### How does the destructive-op guard work?
 

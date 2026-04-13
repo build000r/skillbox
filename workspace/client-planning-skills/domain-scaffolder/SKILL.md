@@ -123,19 +123,15 @@ If the plan is missing, stop and tell the user to use `domain-planner` first.
 ### Auth Service Reuse
 
 The mode's auth-service block is the canonical auth/payments/identity source.
-Prefer the generic keys:
+Use these keys in mode files:
 
 - `auth_packages_root`
 - `auth_python_packages`
 - `auth_npm_packages`
 
-Legacy SPAPS-shaped keys remain valid in existing modes and mean the same thing:
-
-- `spaps_root`
-- `spaps_python_packages`
-- `spaps_npm_packages`
-
-If both generic and legacy keys appear, prefer the generic `auth_*` values.
+Operator overlays may map these to whatever auth package layout their stack
+uses. The scaffolder treats them as opaque pointers to a reusable
+auth/payments/identity layer.
 
 1. Reuse existing auth packages first
 2. Do not scaffold parallel local auth/payments/identity systems
