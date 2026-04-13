@@ -1970,66 +1970,34 @@ def run_up(
         }
         return EXIT_OK, payload
 
-    started: list[dict[str, Any]] = []
-    try:
-        started = start_services(
-            model,
-            ordered_services,
-            dry_run=False,
-            wait_seconds=wait_seconds,
-            mode=effective_mode,
-        )
-    except RuntimeError as exc:
-        started_ids = {
-            str(entry.get("id", ""))
-            for entry in started
-            if entry.get("result") in {"started", "already-running"}
-        }
-        blocked = [
-            str(service.get("id", ""))
-            for service in ordered_services
-            if str(service.get("id", "")) not in started_ids
-        ]
-        payload = {
-            "client_id": client_id,
-            "profile": profile,
-            "requested_mode": requested_mode,
-            "effective_mode": effective_mode,
-            "bootstrap_tasks": bootstrap_summary,
-            "services": [
-                {
-                    "id": str(entry.get("id", "")),
-                    "state": "running"
-                    if entry.get("result") in {"started", "already-running"}
-                    else "blocked",
-                }
-                for entry in started
-            ],
-        }
-        payload.update(local_runtime_error(
-            LOCAL_RUNTIME_START_BLOCKED,
-            str(exc),
-            recoverable=True,
-            blocked_services=blocked,
-            next_action=(
-                f"manage.py status --client {client_id} --profile {profile}"
-            ),
-        ))
-        payload["error"]["requested_mode"] = requested_mode
-        return EXIT_ERROR, payload
+    started = start_services(
+        model,
+        ordered_services,
+        dry_run=False,
+        wait_seconds=wait_seconds,
+        mode=effective_mode,
+    )
 
     # Merge the shared.md:435-469 ``state`` field onto the raw start_services
     # entries so legacy ``result``/``pid``/``log_file`` keys are preserved
     # for existing lifecycle tests (WG-006).
     services_payload = []
+    has_failure = False
     for entry in started:
         enriched = dict(entry)
-        enriched["state"] = (
-            "running"
-            if entry.get("result") in {"started", "already-running"}
-            else entry.get("result", "unknown")
-        )
+        result_val = entry.get("result", "unknown")
+        if result_val in {"started", "already-running"}:
+            enriched["state"] = "running"
+        elif result_val == "timeout":
+            enriched["state"] = "starting"
+            has_failure = True
+        elif result_val == "failed":
+            enriched["state"] = "failed"
+            has_failure = True
+        else:
+            enriched["state"] = result_val
         services_payload.append(enriched)
+
     payload = {
         "client_id": client_id,
         "profile": profile,
@@ -2038,4 +2006,23 @@ def run_up(
         "bootstrap_tasks": bootstrap_summary,
         "services": services_payload,
     }
+
+    if has_failure:
+        failed_ids = [
+            str(e.get("id", ""))
+            for e in started
+            if e.get("result") in {"failed", "timeout"}
+        ]
+        payload.update(local_runtime_error(
+            LOCAL_RUNTIME_START_BLOCKED,
+            f"Some services did not become healthy: {', '.join(failed_ids)}",
+            recoverable=True,
+            blocked_services=failed_ids,
+            next_action=(
+                f"manage.py status --client {client_id} --profile {profile}"
+            ),
+        ))
+        payload["error"]["requested_mode"] = requested_mode
+        return EXIT_ERROR, payload
+
     return EXIT_OK, payload

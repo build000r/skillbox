@@ -221,13 +221,23 @@ def build_model() -> dict[str, Any]:
         if key not in {"SKILLBOX_NAME", "SKILLBOX_MONOSERVER_HOST_ROOT"}
     }
     runtime_env["SKILLBOX_CLIENTS_HOST_ROOT"] = expected_env["SKILLBOX_CLIENTS_ROOT"]
+    state_root = str(storage.get("state_root") or "").strip()
+
+    def compose_mount_source(binding: dict[str, Any]) -> str:
+        resolved_host_path = str(binding.get("resolved_host_path") or "").strip()
+        storage_class = str(binding.get("storage_class") or "").strip().lower()
+        relative_path = str(binding.get("relative_path") or "").strip()
+        if storage_class != "external" and state_root and relative_path:
+            return str((Path(state_root) / Path(relative_path)).resolve())
+        return resolved_host_path
+
     base_mounts = [
         {
-            "source": str(binding.get("resolved_host_path")),
+            "source": compose_mount_source(binding),
             "target": str(binding.get("runtime_path")),
         }
         for binding in storage.get("bindings") or []
-        if binding.get("resolved_host_path") and binding.get("runtime_path")
+        if compose_mount_source(binding) and binding.get("runtime_path")
     ]
 
     # Per-client overrides replace the default /monoserver bind with client-scoped repo mounts.

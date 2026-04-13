@@ -10,6 +10,7 @@ from lib.runtime_model import (
     STATE_ROOT_MISSING,
     STATE_ROOT_WRONG_FILESYSTEM,
     STATE_ROOT_WRONG_OWNERSHIP,
+    is_runtime_absolute_path,
 )
 
 
@@ -1479,13 +1480,30 @@ def resolve_services_for_stop(
 
 
 def translated_runtime_env(root_dir: Path, runtime_env: dict[str, str]) -> dict[str, str]:
+    try:
+        storage = compile_persistence_summary(root_dir, runtime_env)
+    except RuntimeError:
+        storage = None
+
+    def _already_host_path(raw_value: str) -> bool:
+        raw_text = str(raw_value).strip()
+        if not raw_text:
+            return False
+        path = Path(raw_text).expanduser()
+        if not path.is_absolute():
+            return False
+        return not is_runtime_absolute_path(raw_text)
+
     translated: dict[str, str] = {}
     for key, value in runtime_env.items():
         if key in {"SKILLBOX_MONOSERVER_HOST_ROOT", "SKILLBOX_CLIENTS_HOST_ROOT"}:
             translated[key] = str(host_path_to_absolute_path(root_dir, value))
             continue
         if key in PATH_LIKE_ENV_KEYS and value:
-            translated[key] = str(runtime_path_to_host_path(root_dir, runtime_env, value))
+            if _already_host_path(value):
+                translated[key] = str(Path(value).expanduser())
+            else:
+                translated[key] = str(runtime_path_to_host_path(root_dir, runtime_env, value, storage=storage))
             continue
         translated[key] = value
     translated["ROOT_DIR"] = str(root_dir)
@@ -1877,6 +1895,12 @@ def validate_env_file_target_paths(
     violations: list[str] = []
     repo_map = runtime_repo_map(model)
 
+    def _absolute_without_resolve(path: Path) -> Path:
+        expanded = path.expanduser()
+        if expanded.is_absolute():
+            return expanded
+        return Path(os.path.abspath(str(expanded)))
+
     for env_file in env_files:
         env_id = str(env_file.get("id", "")).strip() or "(missing id)"
         target_raw = env_file.get("host_path") or env_file.get("path")
@@ -1911,8 +1935,10 @@ def validate_env_file_target_paths(
             repo_host = Path(str(repo_map[repo_id].get("host_path") or ""))
             if repo_host:
                 try:
-                    target_path.resolve().relative_to(repo_host.resolve())
-                except (ValueError, OSError):
+                    _absolute_without_resolve(target_path).relative_to(
+                        _absolute_without_resolve(repo_host)
+                    )
+                except ValueError:
                     violations.append(
                         f"{env_id}: target_path {target_path} is not inside "
                         f"repo {repo_id} at {repo_host}"
@@ -2758,7 +2784,8 @@ def start_services(
 
         paths["pid_file"].write_text(f"{process.pid}\n", encoding="utf-8")
         health_state = wait_for_service_health(service, process, wait_seconds)
-        if health_state.get("state") in {"failed", "timeout"}:
+        if health_state.get("state") == "failed":
+            # Process actually exited — clean up PID file.
             stop_process(process.pid, DEFAULT_SERVICE_STOP_WAIT_SECONDS)
             remove_pid_file(paths["pid_file"])
             tail = tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)
@@ -2771,15 +2798,23 @@ def start_services(
                 detail["target"] = health_state["target"]
             if "pattern" in health_state:
                 detail["pattern"] = health_state["pattern"]
-            log_runtime_event("service.start_failed", service["id"], {"state": health_state.get("state")})
-            raise RuntimeError(
-                f"Service {service['id']} failed to become healthy."
-                + (f" Exit code: {health_state['exit_code']}." if "exit_code" in health_state else "")
-                + (f" Health target: {health_state['url']}." if "url" in health_state else "")
-                + (f" Health target: {health_state['target']}." if "target" in health_state else "")
-                + (f" Health pattern: {health_state['pattern']}." if "pattern" in health_state else "")
-                + (f" Recent logs: {' | '.join(tail)}" if tail else "")
-            )
+            log_runtime_event("service.start_failed", service["id"], {"state": "failed"})
+            results.append(detail)
+            continue
+        if health_state.get("state") == "timeout":
+            # Process is still alive but health check hasn't passed yet.
+            # Leave it running — it may still be compiling / booting.
+            tail = tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)
+            detail = result | {"result": "timeout", "pid": process.pid, "tail": tail}
+            if "url" in health_state:
+                detail["url"] = health_state["url"]
+            if "target" in health_state:
+                detail["target"] = health_state["target"]
+            if "pattern" in health_state:
+                detail["pattern"] = health_state["pattern"]
+            log_runtime_event("service.start_timeout", service["id"], {"state": "timeout", "pid": process.pid})
+            results.append(detail)
+            continue
 
         if health_state.get("reused_existing"):
             remove_pid_file(paths["pid_file"])

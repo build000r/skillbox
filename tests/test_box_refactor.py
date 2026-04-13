@@ -108,7 +108,7 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(BOX, "do_create_volume", return_value={"id": "vol-1", "size_gigabytes": 20}), \
             mock.patch.object(BOX, "do_attach_volume"), \
             mock.patch.object(BOX, "do_get_volume", return_value={"id": "vol-1", "size_gigabytes": 20, "droplet_ids": [42]}), \
-            mock.patch.object(BOX, "wait_for_ssh", side_effect=[True, True]), \
+            mock.patch.object(BOX, "wait_for_ssh", side_effect=[True, True, True]), \
             mock.patch.object(
                 BOX,
                 "ssh_script",
@@ -141,7 +141,7 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertEqual(payload["tailscale_ip"], "100.64.0.1")
         self.assertEqual(payload["storage"]["mount_path"], "/srv/skillbox")
         self.assertEqual(payload["volume"]["name"], "skillbox-state-alpha")
-        self.assertEqual([step["status"] for step in payload["steps"]], ["ok", "ok", "ok", "ok", "ok", "ok"])
+        self.assertEqual([step["status"] for step in payload["steps"]], ["ok", "ok", "ok", "ok", "ok", "ok", "ok"])
 
     def test_cmd_up_returns_structured_error_when_deploy_fails(self) -> None:
         profile = BOX.BoxProfile(id="dev-small", storage=_storage())
@@ -157,12 +157,13 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(BOX, "do_create_volume", return_value={"id": "vol-1", "size_gigabytes": 20}), \
             mock.patch.object(BOX, "do_attach_volume"), \
             mock.patch.object(BOX, "do_get_volume", return_value={"id": "vol-1", "size_gigabytes": 20, "droplet_ids": [42]}), \
-            mock.patch.object(BOX, "wait_for_ssh", side_effect=[True, False, False]), \
+            mock.patch.object(BOX, "wait_for_ssh", side_effect=[True, True, True]), \
             mock.patch.object(
                 BOX,
                 "ssh_script",
-                side_effect=[_completed(), _completed()],
+                side_effect=[_completed(), _completed(), _completed(returncode=1, stderr="deploy failed")],
             ), \
+            mock.patch.object(BOX, "scp_file", return_value=_completed()), \
             mock.patch.object(BOX, "ssh_cmd", side_effect=[_completed(stdout="100.64.0.1\n")]), \
             mock.patch.object(BOX, "save_inventory"), \
             mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
@@ -203,7 +204,7 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertTrue(payloads[-1]["dry_run"])
         self.assertEqual(
             [step["status"] for step in payloads[-1]["steps"]],
-            ["skip", "skip", "skip", "skip", "skip"],
+            ["skip", "skip", "skip", "skip", "skip", "skip"],
         )
 
     def test_cmd_up_returns_conflict_for_existing_active_box(self) -> None:
@@ -279,7 +280,7 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(BOX, "do_create_volume", return_value={"id": "vol-1", "size_gigabytes": 20}), \
             mock.patch.object(BOX, "do_attach_volume"), \
             mock.patch.object(BOX, "do_get_volume", return_value={"id": "vol-1", "size_gigabytes": 20, "droplet_ids": [42]}), \
-            mock.patch.object(BOX, "wait_for_ssh", side_effect=[True, True]), \
+            mock.patch.object(BOX, "wait_for_ssh", side_effect=[True, True, True]), \
             mock.patch.object(BOX, "ssh_script", side_effect=[_completed(), _completed(), _completed()]), \
             mock.patch.object(BOX, "scp_file", return_value=_completed()), \
             mock.patch.object(
@@ -321,6 +322,7 @@ class BoxRefactorTests(unittest.TestCase):
 
         with mock.patch.object(BOX, "load_inventory", return_value=[box]), \
             mock.patch.object(BOX, "optional_env", return_value=""), \
+            mock.patch.object(BOX, "resolve_box_ssh_target", return_value="1.2.3.4"), \
             mock.patch.object(BOX, "ssh_cmd", side_effect=[_completed(returncode=1), _completed()]), \
             mock.patch.object(BOX, "do_delete_droplet", return_value=True), \
             mock.patch.object(BOX, "save_inventory"), \
@@ -331,6 +333,34 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertEqual(box.state, "destroyed")
         payload = payloads[-1]
         self.assertEqual([step["status"] for step in payload["steps"]], ["warn", "ok", "ok"])
+
+    def test_cmd_down_returns_destroy_failed_and_preserves_state(self) -> None:
+        box = BOX.Box(
+            id="teardown",
+            profile="dev-small",
+            state="ready",
+            droplet_id="77",
+            droplet_ip="1.2.3.4",
+            tailscale_hostname="skillbox-teardown",
+            ssh_user="skillbox",
+        )
+        payloads: list[dict[str, object]] = []
+
+        with mock.patch.object(BOX, "load_inventory", return_value=[box]), \
+            mock.patch.object(BOX, "optional_env", return_value=""), \
+            mock.patch.object(BOX, "resolve_box_ssh_target", return_value="1.2.3.4"), \
+            mock.patch.object(BOX, "ssh_cmd", side_effect=[_completed(), _completed()]), \
+            mock.patch.object(BOX, "do_delete_droplet", return_value=False), \
+            mock.patch.object(BOX, "save_inventory"), \
+            mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
+            result = BOX.cmd_down("teardown", dry_run=False, fmt="json")
+
+        self.assertEqual(result, BOX.EXIT_ERROR)
+        self.assertNotEqual(box.state, "destroyed")
+        payload = payloads[-1]
+        self.assertEqual(payload["error"]["type"], "destroy_failed")
+        self.assertEqual(payload["steps"][-1]["step"], "destroy")
+        self.assertEqual(payload["steps"][-1]["status"], "fail")
 
     def test_cmd_down_returns_not_found_payload(self) -> None:
         payloads: list[dict[str, object]] = []
@@ -363,6 +393,7 @@ class BoxRefactorTests(unittest.TestCase):
 
         with mock.patch.object(BOX, "load_inventory", return_value=[box]), \
             mock.patch.object(BOX, "optional_env", return_value=""), \
+            mock.patch.object(BOX, "resolve_box_ssh_target", return_value=None), \
             mock.patch.object(BOX, "save_inventory"), \
             mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
             result = BOX.cmd_down("teardown", dry_run=False, fmt="json")
@@ -386,6 +417,7 @@ class BoxRefactorTests(unittest.TestCase):
 
         with mock.patch.object(BOX, "load_inventory", return_value=[box]), \
             mock.patch.object(BOX, "optional_env", return_value="token"), \
+            mock.patch.object(BOX, "resolve_box_ssh_target", return_value="1.2.3.4"), \
             mock.patch.object(
                 BOX,
                 "ssh_cmd",
@@ -399,8 +431,8 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch("builtins.print") as print_mock:
             result = BOX.cmd_down("teardown", dry_run=False, fmt="text")
 
-        self.assertEqual(result, BOX.EXIT_OK)
-        self.assertEqual(box.state, "destroyed")
+        self.assertEqual(result, BOX.EXIT_ERROR)
+        self.assertNotEqual(box.state, "destroyed")
         self.assertTrue(print_mock.called)
 
     def test_cmd_status_lists_only_active_boxes(self) -> None:
