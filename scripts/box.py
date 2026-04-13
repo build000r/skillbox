@@ -1758,18 +1758,43 @@ def cmd_down(box_id: str, *, dry_run: bool, fmt: str) -> int:
         step("remove", "skip", "no ssh target")
 
     # -- 3. Destroy droplet -----------------------------------------------------
+    destroy_ok = False
     if box.droplet_id:
         try:
             if not is_json:
                 print(f"[...] destroy  Deleting droplet {box.droplet_id}...")
             if do_delete_droplet(box.droplet_id):
                 step("destroy", "ok", f"droplet {box.droplet_id} deleted")
+                destroy_ok = True
             else:
-                step("destroy", "warn", "doctl delete returned non-zero")
+                step("destroy", "fail", "doctl delete returned non-zero")
         except Exception as exc:
             step("destroy", "fail", str(exc))
     else:
         step("destroy", "skip", "no droplet id")
+        destroy_ok = True
+
+    if not destroy_ok:
+        save_inventory(boxes)
+        message = f"Droplet deletion failed for box {box_id!r}; inventory state remains {box.state!r}."
+        payload = {
+            "box_id": box_id,
+            "dry_run": False,
+            "steps": steps,
+            "next_actions": [f"box status {box_id}", f"box down {box_id}"],
+        }
+        payload.update(
+            structured_error(
+                message,
+                error_type="destroy_failed",
+                next_actions=[f"box status {box_id}", f"box down {box_id}"],
+            )
+        )
+        if is_json:
+            emit_json(payload)
+        else:
+            print(message, file=sys.stderr)
+        return EXIT_ERROR
 
     update_box(box, state="destroyed")
     save_inventory(boxes)

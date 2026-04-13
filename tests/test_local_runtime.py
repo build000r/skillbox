@@ -1208,6 +1208,23 @@ class LocalCoreFocusUS1Tests(unittest.TestCase):
                 result["error"]["type"], "LOCAL_RUNTIME_ENV_OUTPUT_MISSING",
             )
 
+    def test_env_target_symlink_inside_repo_is_still_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = _build_local_core_model(repo)
+            env_file = next(
+                item for item in model["env_files"]
+                if item["id"] == "svc-feedback-env"
+            )
+            target_path = Path(str(env_file["host_path"]))
+            source_path = Path(str(env_file["source"]["host_path"]))
+            target_path.unlink()
+            target_path.symlink_to(source_path)
+            self.assertEqual(
+                validate_env_file_target_paths(model["env_files"], model),
+                [],
+            )
+
 
 class LocalCoreParityLedgerUS4Tests(unittest.TestCase):
     """WG-007 / US-4: Parity ledger enforcement and doctor drift."""

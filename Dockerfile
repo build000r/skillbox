@@ -2,13 +2,15 @@ FROM node:22-bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    GH_AXI_DISABLE_HOOKS=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
     ca-certificates \
     curl \
     git \
+    gh \
     jq \
     less \
     make \
@@ -22,6 +24,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tmux \
     zsh \
  && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g gh-axi@0.1.11
 
 RUN useradd --create-home --shell /bin/zsh sandbox
 

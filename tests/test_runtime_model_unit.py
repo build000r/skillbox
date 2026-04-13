@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 
@@ -10,8 +11,17 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = ROOT_DIR / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
+ENV_MANAGER_DIR = ROOT_DIR / ".env-manager"
+if str(ENV_MANAGER_DIR) not in sys.path:
+    sys.path.insert(0, str(ENV_MANAGER_DIR))
 
 from lib import runtime_model as runtime_model_module
+
+
+MANAGE_MODULE = SourceFileLoader(
+    "skillbox_manage_runtime_model_unit",
+    str((ROOT_DIR / ".env-manager" / "manage.py").resolve()),
+).load_module()
 
 
 class RuntimeModelUnitTests(unittest.TestCase):
@@ -96,6 +106,42 @@ class RuntimeModelUnitTests(unittest.TestCase):
         self.assertEqual(workspace_path, ROOT_DIR / "scripts" / "box.py")
         self.assertEqual(home_path, ROOT_DIR / ".skillbox-state" / "home" / ".claude" / "settings.json")
         self.assertEqual(monoserver_path, (ROOT_DIR / "monoserver-host" / "project" / "app.py").resolve())
+
+    def test_runtime_path_to_host_path_preserves_host_absolute_paths(self) -> None:
+        env_values = {
+            "SKILLBOX_WORKSPACE_ROOT": "/workspace",
+            "SKILLBOX_HOME_ROOT": "/home/sandbox",
+            "SKILLBOX_MONOSERVER_ROOT": str(ROOT_DIR.parent),
+            "SKILLBOX_CLIENTS_ROOT": str(ROOT_DIR.parent / "skillbox-config" / "clients"),
+            "SKILLBOX_CLIENTS_HOST_ROOT": "./workspace/clients",
+            "SKILLBOX_MONOSERVER_HOST_ROOT": "./monoserver-host",
+        }
+
+        host_path = ROOT_DIR.parent / ".env-manager" / "sync.sh"
+        translated = runtime_model_module.runtime_path_to_host_path(
+            ROOT_DIR,
+            env_values,
+            str(host_path),
+        )
+
+        self.assertEqual(translated, host_path.resolve())
+
+    def test_translated_runtime_env_preserves_host_absolute_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            self._write_runtime_fixture(repo)
+            runtime_env = runtime_model_module.load_runtime_env(repo)
+            runtime_env["SKILLBOX_WORKSPACE_ROOT"] = str(repo / "workspace")
+            runtime_env["SKILLBOX_HOME_ROOT"] = str(repo / "home")
+            runtime_env["SKILLBOX_CLIENTS_ROOT"] = str(repo / "workspace" / "clients")
+            runtime_env["SKILLBOX_MONOSERVER_ROOT"] = str(repo.parent)
+
+            translated = MANAGE_MODULE.translated_runtime_env(repo, runtime_env)
+
+            self.assertEqual(translated["SKILLBOX_WORKSPACE_ROOT"], str((repo / "workspace").resolve()))
+            self.assertEqual(translated["SKILLBOX_HOME_ROOT"], str((repo / "home").resolve()))
+            self.assertEqual(translated["SKILLBOX_CLIENTS_ROOT"], str((repo / "workspace" / "clients").resolve()))
+            self.assertEqual(translated["SKILLBOX_MONOSERVER_ROOT"], str(repo.parent.resolve()))
 
     def test_build_runtime_model_populates_host_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -63,6 +63,14 @@ def generate_context_markdown(model: dict[str, Any]) -> str:
             break
     lines.append("")
 
+    lines.append("## Tooling Guidance")
+    lines.append("")
+    lines.append(
+        "- GitHub: use `gh-axi` for GitHub operations when available; "
+        "fall back to `gh` only when `gh-axi` cannot satisfy the task."
+    )
+    lines.append("")
+
     # Repos
     repos = model.get("repos") or []
     if repos:

@@ -95,6 +95,11 @@ PERSISTENCE_BINDING_ENV_OVERRIDES: dict[str, str] = {
     "clients-root": "SKILLBOX_CLIENTS_HOST_ROOT",
     "monoserver-root": "SKILLBOX_MONOSERVER_HOST_ROOT",
 }
+RUNTIME_PATH_PREFIXES: tuple[PurePosixPath, ...] = (
+    PurePosixPath("/workspace"),
+    PurePosixPath("/home/sandbox"),
+    PurePosixPath("/monoserver"),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -573,6 +578,22 @@ def resolve_placeholders(value: Any, mapping: dict[str, str]) -> Any:
     return value
 
 
+def is_runtime_absolute_path(raw_path: str) -> bool:
+    text = str(raw_path).strip()
+    if not text:
+        return False
+    path = PurePosixPath(text)
+    if not path.is_absolute():
+        return False
+    for runtime_root in RUNTIME_PATH_PREFIXES:
+        try:
+            path.relative_to(runtime_root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
 def runtime_path_to_host_path(
     root_dir: Path,
     env_values: dict[str, str],
@@ -580,6 +601,10 @@ def runtime_path_to_host_path(
     *,
     storage: dict[str, Any] | None = None,
 ) -> Path:
+    candidate = Path(raw_path).expanduser()
+    if candidate.is_absolute() and not is_runtime_absolute_path(raw_path):
+        return candidate
+
     resolved_storage = storage
     if resolved_storage is None:
         try:

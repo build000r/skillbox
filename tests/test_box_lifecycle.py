@@ -44,6 +44,11 @@ class BoxLifecycleTests(unittest.TestCase):
             BOX_MODULE.update_box(context.box, tailscale_ip="100.64.0.8", state="deploying")
             return "tailscale skillbox-box-1 at 100.64.0.8"
 
+        def fake_mark_box_ssh_ready(context: BOX_MODULE.BoxUpContext) -> str:
+            context.ssh_target = "1.2.3.4"
+            BOX_MODULE.update_box(context.box, state="ssh-ready")
+            return "ssh skillbox@1.2.3.4"
+
         def fake_deploy_box_runtime(context: BOX_MODULE.BoxUpContext) -> str:
             context.ssh_target = context.ts_hostname
             BOX_MODULE.update_box(context.box, state="acceptance")
@@ -57,6 +62,7 @@ class BoxLifecycleTests(unittest.TestCase):
             mock.patch.object(BOX_MODULE, "_create_box_droplet", side_effect=fake_create_box_droplet),
             mock.patch.object(BOX_MODULE, "_ensure_box_storage", side_effect=fake_ensure_box_storage),
             mock.patch.object(BOX_MODULE, "_bootstrap_box_host", return_value="bootstrap ok"),
+            mock.patch.object(BOX_MODULE, "_mark_box_ssh_ready", side_effect=fake_mark_box_ssh_ready),
             mock.patch.object(BOX_MODULE, "_enroll_box_tailscale", side_effect=fake_enroll_box_tailscale),
             mock.patch.object(BOX_MODULE, "_deploy_box_runtime", side_effect=fake_deploy_box_runtime),
             mock.patch.object(
@@ -81,7 +87,10 @@ class BoxLifecycleTests(unittest.TestCase):
         self.assertEqual(len(payloads), 1)
         payload = payloads[0]
         self.assertEqual(payload["box_id"], "box-1")
-        self.assertEqual([step["step"] for step in payload["steps"]], ["create", "storage", "bootstrap", "enroll", "deploy", "first-box"])
+        self.assertEqual(
+            [step["step"] for step in payload["steps"]],
+            ["create", "storage", "bootstrap", "ssh-ready", "enroll", "deploy", "first-box"],
+        )
         self.assertTrue(all(step["status"] == "ok" for step in payload["steps"]))
         self.assertEqual(payload["droplet_ip"], "1.2.3.4")
         self.assertEqual(payload["tailscale_ip"], "100.64.0.8")
@@ -151,6 +160,7 @@ class BoxLifecycleTests(unittest.TestCase):
         with (
             mock.patch.object(BOX_MODULE, "load_inventory", return_value=[box]),
             mock.patch.object(BOX_MODULE, "optional_env", return_value=""),
+            mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="1.2.3.4"),
             mock.patch.object(BOX_MODULE, "ssh_cmd", return_value=subprocess.CompletedProcess([], 0, "", "")),
             mock.patch.object(BOX_MODULE, "do_delete_droplet", return_value=True),
             mock.patch.object(BOX_MODULE, "save_inventory"),

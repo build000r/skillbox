@@ -17,7 +17,7 @@ PRIVATE_PATH_ARGS := $(if $(strip $(PRIVATE_PATH)),--private-path $(PRIVATE_PATH
 OUTPUT_DIR_ARGS := $(if $(strip $(OUTPUT_DIR)),--output-dir $(OUTPUT_DIR),)
 FORCE_ARGS := $(if $(strip $(FORCE)),--force,)
 
-.PHONY: help bootstrap-env render doctor acceptance runtime-render runtime-sync runtime-status runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context ack dev-sanity python-cov-xml build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles
+.PHONY: help bootstrap-env render doctor acceptance runtime-render runtime-sync runtime-status runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context dev-sanity python-cov-xml build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles
 
 help:
 	@printf "  make bootstrap-env  Copy .env.example to .env if missing\n"
@@ -35,7 +35,6 @@ help:
 	@printf "  make onboard        Scaffold, sync, bootstrap, start, context, verify in one step (CLIENT=id BLUEPRINT=name SET='K=V')\n"
 	@printf "  make first-box      Attach the private repo, reuse or scaffold CLIENT, run acceptance, and open sand/CLIENT (defaults CLIENT=personal)\n"
 	@printf "  make context        Generate CLAUDE.md and AGENTS.md from the runtime graph (optional CLIENT=name PROFILE=name)\n"
-	@printf "  make ack            Acknowledge journal events to curate agent context (TYPE=name SUBJECT=name ALL=1 LIST=1 PRUNE=1 REASON=text)\n"
 	@printf "  make pulse-start    Start the pulse reconciliation daemon (auto-heals crashed services)\n"
 	@printf "  make pulse-stop     Stop the pulse daemon\n"
 	@printf "  make pulse-status   Show pulse daemon status, supervised services, and recent heals\n"
@@ -104,9 +103,6 @@ first-box:
 
 context:
 	@python3 .env-manager/manage.py context $(CLIENT_ARGS) $(PROFILE_ARGS)
-
-ack:
-	@python3 .env-manager/manage.py ack $(if $(strip $(TYPE)),--type $(TYPE),) $(if $(strip $(SUBJECT)),--subject $(SUBJECT),) $(if $(strip $(REASON)),--reason '$(REASON)',) $(if $(strip $(ALL)),--all,) $(if $(strip $(LIST)),--list,) $(if $(strip $(PRUNE)),--prune,)
 
 dev-sanity:
 	@python3 .env-manager/manage.py doctor $(CLIENT_ARGS) $(PROFILE_ARGS)

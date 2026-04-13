@@ -600,6 +600,9 @@ class BoxTests(unittest.TestCase):
             "PATH": os.environ.get("PATH", ""),
             "HOME": os.environ.get("HOME", ""),
             "SKILLBOX_BOX_INVENTORY": str(inv_dir / "boxes.json"),
+            "SKILLBOX_DO_TOKEN": "",
+            "SKILLBOX_DO_SSH_KEY_ID": "",
+            "SKILLBOX_TS_AUTHKEY": "",
         }
 
 

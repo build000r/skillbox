@@ -71,6 +71,23 @@ class ReconcileTests(unittest.TestCase):
 
             self.assertEqual(model["expected_mounts"][-1], {"source": "/state-root/monoserver", "target": "/monoserver"})
 
+    def test_build_model_uses_state_root_mounts_for_persistent_bindings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            sandbox_doc, dependencies_doc, persistence_doc, skill_repos_doc, runtime_model = self._model_inputs()
+            runtime_model["storage"]["bindings"][1]["resolved_host_path"] = str(repo / "private-config" / "clients")
+            runtime_model["storage"]["bindings"][1]["relative_path"] = "clients"
+
+            with self._patch_roots(repo), \
+                mock.patch.object(RECONCILE, "load_yaml", side_effect=[sandbox_doc, dependencies_doc, persistence_doc, skill_repos_doc]), \
+                mock.patch.object(RECONCILE, "load_json", return_value={}), \
+                mock.patch.object(RECONCILE, "build_runtime_model", return_value=runtime_model), \
+                mock.patch.object(RECONCILE, "load_env_defaults", return_value={"SKILLBOX_CLIENTS_HOST_ROOT": "./private-config/clients"}):
+                model = RECONCILE.build_model()
+
+            mounts = {item["target"]: item["source"] for item in model["expected_mounts"]}
+            self.assertEqual(mounts["/workspace/workspace/clients"], "/state-root/clients")
+
     def test_check_compose_model_reports_workspace_surface_and_swimmers_drift(self) -> None:
         model = {
             "expected_env": {
@@ -374,30 +391,35 @@ class ReconcileTests(unittest.TestCase):
                         "id": "clients-root",
                         "runtime_path": "/workspace/workspace/clients",
                         "storage_class": "persistent",
+                        "relative_path": "clients",
                         "resolved_host_path": "/state-root/clients",
                     },
                     {
                         "id": "claude-home",
                         "runtime_path": "/workspace/home/.claude",
                         "storage_class": "persistent",
+                        "relative_path": "home/.claude",
                         "resolved_host_path": "/state-root/home/.claude",
                     },
                     {
                         "id": "codex-home",
                         "runtime_path": "/workspace/home/.codex",
                         "storage_class": "persistent",
+                        "relative_path": "home/.codex",
                         "resolved_host_path": "/state-root/home/.codex",
                     },
                     {
                         "id": "logs-root",
                         "runtime_path": "/workspace/logs",
                         "storage_class": "persistent",
+                        "relative_path": "logs",
                         "resolved_host_path": "/state-root/logs",
                     },
                     {
                         "id": "monoserver-root",
                         "runtime_path": "/monoserver",
                         "storage_class": "persistent",
+                        "relative_path": "monoserver",
                         "resolved_host_path": "/state-root/monoserver",
                     },
                 ],

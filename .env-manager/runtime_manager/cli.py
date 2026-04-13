@@ -1209,3 +1209,10 @@ def main() -> int:
         else:
             print(str(exc), file=sys.stderr)
         return EXIT_ERROR
+    except Exception as exc:
+        if args.format == "json":
+            emit_json(classify_error(RuntimeError(f"Unexpected error: {exc}"), args.command))
+        else:
+            import traceback
+            traceback.print_exc()
+        return EXIT_ERROR

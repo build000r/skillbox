@@ -346,7 +346,7 @@ TOOLS: list[dict] = [
     {
         "name": "skillbox_session_event",
         "description": (
-            "Append a structured event to an active durable session and mirror it into the global journal. "
+            "Append a structured event to an active durable session and mirror a summary into the global runtime log. "
             "Use this to record notes, checkpoints, decisions, or errors during work."
         ),
         "inputSchema": {
@@ -559,14 +559,27 @@ def run_manage(args: list[str]) -> tuple[bool, int, Any]:
             }
         }
 
+    # Scale timeout with --wait-seconds when present.  Services are started
+    # sequentially so total time can be wait_seconds * service_count.  Use a
+    # generous base (120s) plus the declared per-service wait to avoid killing
+    # manage.py while it is still polling health checks.
+    subprocess_timeout = 120.0
+    for i, arg in enumerate(args):
+        if arg == "--wait-seconds" and i + 1 < len(args):
+            try:
+                subprocess_timeout = max(subprocess_timeout, float(args[i + 1]) * 2 + 60)
+            except ValueError:
+                pass
+            break
+
     cmd = [sys.executable, str(MANAGE_PY)] + args
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=subprocess_timeout)
     except subprocess.TimeoutExpired:
         return False, -1, {
             "error": {
                 "type": "timeout",
-                "message": "manage.py timed out after 120 seconds.",
+                "message": f"manage.py timed out after {subprocess_timeout:.0f} seconds.",
                 "recoverable": True,
                 "recovery_hint": "Check service logs with skillbox_logs — a service may be hanging.",
                 "next_actions": ["skillbox_logs"],
