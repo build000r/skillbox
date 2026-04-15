@@ -1,0 +1,153 @@
+version: 1
+description: Clone a primary git repository, wire SPAPS local auth on :3301, materialize repo-local auth fixtures, and start a managed HTTP dev service.
+variables:
+  - name: PRIMARY_REPO_ID
+    default: app
+    description: Runtime repo id for the primary client repository.
+  - name: PRIMARY_REPO_URL
+    required: true
+    description: Git URL to clone when the client overlay is synced.
+  - name: PRIMARY_REPO_BRANCH
+    default: main
+    description: Branch to clone for the primary repository.
+  - name: PRIMARY_REPO_PATH
+    default: ${CLIENT_ROOT}/${PRIMARY_REPO_ID}
+    description: Runtime path where the primary repository should live.
+  - name: BOOTSTRAP_TASK_ID
+    default: app-bootstrap
+    description: Runtime task id for the primary repo bootstrap step.
+  - name: BOOTSTRAP_COMMAND
+    required: true
+    description: Command to run once from the primary repo before the app service can start.
+  - name: BOOTSTRAP_SUCCESS_PATH
+    default: ${PRIMARY_REPO_PATH}/.skillbox/bootstrap.ok
+    description: Runtime path that must exist after the app bootstrap task succeeds.
+  - name: SERVICE_ID
+    default: app-dev
+    description: Runtime service id for the managed client HTTP service.
+  - name: SERVICE_COMMAND
+    required: true
+    description: Command to start the managed client HTTP service from the primary repo.
+  - name: SERVICE_PORT
+    default: "5173"
+    description: Loopback port used by the managed client HTTP service.
+  - name: SERVICE_HEALTHCHECK_URL
+    default: http://127.0.0.1:${SERVICE_PORT}/health
+    description: HTTP endpoint that must answer before the client service is considered healthy.
+  - name: SERVICE_LOG_ID
+    default: ${CLIENT_ID}-services
+    description: Log id used for managed service output.
+  - name: SERVICE_LOG_PATH
+    default: ${SKILLBOX_LOG_ROOT}/clients/${CLIENT_ID}/services
+    description: Runtime path for the service log directory.
+  - name: SPAPS_AUTH_SERVICE_ID
+    default: auth-api
+    description: Runtime service id for the managed SPAPS local auth service.
+  - name: SPAPS_AUTH_PORT
+    default: "3301"
+    description: Loopback port used by SPAPS local auth.
+  - name: SPAPS_AUTH_RUNTIME_DIR
+    default: ${PRIMARY_REPO_PATH}/.skillbox/spaps-local
+    description: Persistent runtime directory passed to `spaps local`.
+  - name: SPAPS_AUTH_RUNTIME_SOURCE
+    default: bundle
+    description: SPAPS runtime source to use (`bundle` for plain installs, `repo` for a sibling checkout).
+  - name: SPAPS_AUTH_BASE_URL
+    default: http://127.0.0.1:${SERVICE_PORT}
+    description: Frontend origin advertised to the SPAPS auth runtime.
+  - name: SPAPS_FIXTURE_TASK_ID
+    default: spaps-fixtures
+    description: Runtime task id that materializes repo-local SPAPS auth fixtures.
+  - name: SPAPS_FIXTURE_BASE_URL
+    default: http://127.0.0.1:${SERVICE_PORT}
+    description: Browser base URL used when generating `.spaps/browser/*` artifacts.
+  - name: SPAPS_FIXTURE_SUCCESS_PATH
+    default: ${PRIMARY_REPO_PATH}/public/spaps-dev-auth.js
+    description: Generated bridge file used as the success marker for fixture materialization.
+client:
+  default_cwd: ${PRIMARY_REPO_PATH}
+  repos:
+    - id: ${PRIMARY_REPO_ID}
+      kind: repo
+      path: ${PRIMARY_REPO_PATH}
+      required: true
+      profiles:
+        - core
+      source:
+        kind: git
+        url: ${PRIMARY_REPO_URL}
+        branch: ${PRIMARY_REPO_BRANCH}
+      sync:
+        mode: clone-if-missing
+      notes: Primary client repository cloned into the mounted client root.
+  logs:
+    - id: ${SERVICE_LOG_ID}
+      path: ${SERVICE_LOG_PATH}
+      required: false
+      profiles:
+        - core
+      retention_days: 14
+      notes: Managed service logs declared by the client blueprint.
+  tasks:
+    - id: ${BOOTSTRAP_TASK_ID}
+      kind: bootstrap
+      repo: ${PRIMARY_REPO_ID}
+      required: false
+      profiles:
+        - core
+      command: ${BOOTSTRAP_COMMAND}
+      outputs:
+        - ${BOOTSTRAP_SUCCESS_PATH}
+      success:
+        type: path_exists
+        path: ${BOOTSTRAP_SUCCESS_PATH}
+      log: ${SERVICE_LOG_ID}
+      notes: One-shot repo bootstrap task that must succeed before the client service starts.
+    - id: ${SPAPS_FIXTURE_TASK_ID}
+      kind: bootstrap
+      repo: ${PRIMARY_REPO_ID}
+      required: false
+      profiles:
+        - core
+      command: npx spaps fixtures apply --dir ${PRIMARY_REPO_PATH} --port ${SPAPS_AUTH_PORT} --base-url ${SPAPS_FIXTURE_BASE_URL}
+      outputs:
+        - ${SPAPS_FIXTURE_SUCCESS_PATH}
+      success:
+        type: path_exists
+        path: ${SPAPS_FIXTURE_SUCCESS_PATH}
+      log: ${SERVICE_LOG_ID}
+      notes: Generates repo-local RBAC/auth fixtures and the frontend dev-auth bridge.
+  services:
+    - id: ${SPAPS_AUTH_SERVICE_ID}
+      kind: http
+      owner: local
+      repo: ${PRIMARY_REPO_ID}
+      required: false
+      profiles:
+        - core
+      command: SPAPS_AUTH_BASE_URL=${SPAPS_AUTH_BASE_URL} npx spaps local --port ${SPAPS_AUTH_PORT} --runtime-dir ${SPAPS_AUTH_RUNTIME_DIR} --runtime-source ${SPAPS_AUTH_RUNTIME_SOURCE}
+      log: ${SERVICE_LOG_ID}
+      healthcheck:
+        type: http
+        url: http://127.0.0.1:${SPAPS_AUTH_PORT}/health
+        timeout_seconds: 0.5
+      notes: Managed SPAPS local auth/runtime service used for local RBAC testing.
+    - id: ${SERVICE_ID}
+      kind: http
+      owner: local
+      repo: ${PRIMARY_REPO_ID}
+      required: false
+      profiles:
+        - core
+      depends_on:
+        - ${SPAPS_AUTH_SERVICE_ID}
+      bootstrap_tasks:
+        - ${BOOTSTRAP_TASK_ID}
+        - ${SPAPS_FIXTURE_TASK_ID}
+      command: ${SERVICE_COMMAND}
+      log: ${SERVICE_LOG_ID}
+      healthcheck:
+        type: http
+        url: ${SERVICE_HEALTHCHECK_URL}
+        timeout_seconds: 0.5
+      notes: Managed client HTTP service that depends on SPAPS auth and pre-generated fixture artifacts.

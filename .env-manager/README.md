@@ -19,6 +19,7 @@ python3 .env-manager/manage.py client-init --list-blueprints
 python3 .env-manager/manage.py first-box personal --format json
 python3 .env-manager/manage.py private-init --path ../skillbox-config --format json
 python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo-http-service-bootstrap --set PRIMARY_REPO_URL=https://github.com/acme/app.git --set BOOTSTRAP_COMMAND='pnpm install && mkdir -p .skillbox && touch .skillbox/bootstrap.ok' --set SERVICE_COMMAND='pnpm dev'
+python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo-http-service-bootstrap-spaps-auth --set PRIMARY_REPO_URL=https://github.com/acme/app.git --set BOOTSTRAP_COMMAND='pnpm install && mkdir -p .skillbox && touch .skillbox/bootstrap.ok' --set SERVICE_COMMAND='pnpm dev'
 python3 .env-manager/manage.py client-project personal
 python3 .env-manager/manage.py client-project personal --profile surfaces --output-dir ./builds/clients/personal-surfaces
 python3 .env-manager/manage.py client-diff personal --profile surfaces
@@ -48,7 +49,9 @@ The mental model is:
   plus the companion skill directories, `skill-repos.yaml`, and planning roots for a new overlay
 - `client-init --blueprint ...` appends reusable repos, services, logs, and
   checks to that scaffold so `render`, `sync`, and `up` immediately work on a
-  concrete client shape; the blessed hardened-v1 path is `git-repo-http-service-bootstrap`
+  concrete client shape; `git-repo-http-service-bootstrap` is the generic path,
+  and `git-repo-http-service-bootstrap-spaps-auth` adds managed SPAPS local auth
+  plus repo-local fixture bootstrap
 - `first-box <client>` is the canonical first-run path: it runs `private-init`,
   reuses or scaffolds the selected client, proves readiness with `acceptance`,
   and writes `sand/<client>/` via `client-open`

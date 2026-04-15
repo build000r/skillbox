@@ -1734,6 +1734,57 @@ class RuntimeManagerTests(unittest.TestCase):
             service = next(item for item in render_payload["services"] if item["id"] == "app-dev")
             self.assertEqual(service["bootstrap_tasks"], ["app-bootstrap"])
 
+    def test_client_init_with_spaps_auth_blueprint_wires_auth_service_and_fixture_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._write_client_blueprint(
+                repo,
+                "git-repo-http-service-bootstrap-spaps-auth",
+                (
+                    ROOT_DIR
+                    / "workspace"
+                    / "client-blueprints"
+                    / "git-repo-http-service-bootstrap-spaps-auth.yaml"
+                ).read_text(encoding="utf-8"),
+            )
+            source_repo = self._create_git_source_repo(repo, "fixture-app")
+
+            result = self._run(
+                repo,
+                "client-init",
+                "acme-studio",
+                "--blueprint",
+                "git-repo-http-service-bootstrap-spaps-auth",
+                "--set",
+                f"PRIMARY_REPO_URL={source_repo}",
+                "--set",
+                "BOOTSTRAP_COMMAND=python3 -c \"from pathlib import Path; Path('.skillbox').mkdir(exist_ok=True); Path('.skillbox/bootstrap.ok').write_text('ok\\n', encoding='utf-8')\"",
+                "--set",
+                "SERVICE_COMMAND=python3 -m http.server 5173",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            render = self._run(repo, "render", "--client", "acme-studio", "--format", "json")
+            self.assertEqual(render.returncode, 0, render.stderr)
+            render_payload = json.loads(render.stdout)
+
+            task_ids = {item["id"] for item in render_payload["tasks"]}
+            self.assertEqual(task_ids, {"app-bootstrap", "spaps-fixtures"})
+
+            services = {item["id"]: item for item in render_payload["services"]}
+            self.assertIn("auth-api", services)
+            self.assertIn("app-dev", services)
+            self.assertEqual(services["app-dev"]["depends_on"], ["auth-api"])
+            self.assertEqual(
+                services["app-dev"]["bootstrap_tasks"],
+                ["app-bootstrap", "spaps-fixtures"],
+            )
+            self.assertIn("npx spaps local", services["auth-api"]["command"])
+
     def test_client_init_with_blueprint_requires_declared_variables(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -5276,6 +5327,79 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(
                 focus_state["skill_context_path"],
                 "/workspace/workspace/clients/personal/context.yaml",
+            )
+
+    def test_focus_skill_context_mangling_urls_or_tilde_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            overlay_path = self._clients_host_root(repo) / "personal" / "overlay.yaml"
+            overlay_doc = MANAGE_MODULE.load_yaml(overlay_path)
+            overlay_doc.setdefault("client", {})["context"] = {
+                "cwd_match": [
+                    "repos/sweet-potato",
+                    "~/repos/opensource",
+                    "/monoserver",
+                ],
+                "plans": {
+                    "plan_root": "plans/released",
+                    "plan_index": "plans/INDEX.md",
+                },
+                "workflow_builder": {
+                    "workflow_index": "workflows/INDEX.md",
+                },
+                "domains": {
+                    "frontends": {
+                        "buildooor": {
+                            "local": "http://localhost:3000",
+                            "repo_slug": "build000r/buildooor",
+                        }
+                    }
+                },
+                "deploy": {
+                    "legacy_ssh_key": "~/.ssh/do_terra_cc",
+                },
+            }
+            overlay_path.write_text(
+                MANAGE_MODULE.render_yaml_document(overlay_doc),
+                encoding="utf-8",
+            )
+
+            result = self._run(repo, "focus", "personal", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            client_dir = self._clients_host_root(repo) / "personal"
+            context_doc = MANAGE_MODULE.load_yaml(client_dir / "context.yaml")
+            self.assertEqual(
+                Path(str(context_doc["cwd_match"][0])).resolve(),
+                (client_dir / "repos/sweet-potato").resolve(),
+            )
+            self.assertEqual(context_doc["cwd_match"][1], "~/repos/opensource")
+            self.assertEqual(context_doc["cwd_match"][2], "/monoserver")
+            self.assertEqual(
+                Path(str(context_doc["plans"]["plan_root"])).resolve(),
+                (client_dir / "plans/released").resolve(),
+            )
+            self.assertEqual(
+                Path(str(context_doc["plans"]["plan_index"])).resolve(),
+                (client_dir / "plans/INDEX.md").resolve(),
+            )
+            self.assertEqual(
+                Path(str(context_doc["workflow_builder"]["workflow_index"])).resolve(),
+                (client_dir / "workflows/INDEX.md").resolve(),
+            )
+            self.assertEqual(
+                context_doc["domains"]["frontends"]["buildooor"]["local"],
+                "http://localhost:3000",
+            )
+            self.assertEqual(
+                context_doc["domains"]["frontends"]["buildooor"]["repo_slug"],
+                "build000r/buildooor",
+            )
+            self.assertEqual(
+                context_doc["deploy"]["legacy_ssh_key"],
+                "~/.ssh/do_terra_cc",
             )
 
     def test_focus_resume_fails_without_focus_json(self) -> None:

@@ -13,6 +13,7 @@ TASK_ARGS := $(if $(strip $(TASK)),--task $(TASK),)
 LINES_ARGS := $(if $(strip $(LINES)),--lines $(LINES),)
 BLUEPRINT_ARGS := $(if $(strip $(BLUEPRINT)),--blueprint $(BLUEPRINT),)
 SET_ARGS := $(foreach s,$(SET),--set $(s))
+DEPLOY_MANIFEST_ARGS := $(if $(strip $(DEPLOY_MANIFEST)),--deploy-manifest $(DEPLOY_MANIFEST),)
 PRIVATE_PATH_ARGS := $(if $(strip $(PRIVATE_PATH)),--private-path $(PRIVATE_PATH),)
 OUTPUT_DIR_ARGS := $(if $(strip $(OUTPUT_DIR)),--output-dir $(OUTPUT_DIR),)
 FORCE_ARGS := $(if $(strip $(FORCE)),--force,)
@@ -52,7 +53,7 @@ help:
 	@printf "  make swimmers-status         Report swimmers workspace-local process and probe state\n"
 	@printf "  make swimmers-logs           Tail swimmers server logs inside the workspace container\n"
 	@printf "  make swimmers-runtime-status Summarize the runtime-manager swimmers overlay state\n"
-	@printf "  make box-up         Create a DO+Tailscale box (BOX=id PROFILE=dev-small BLUEPRINT=name SET='K=V')\n"
+	@printf "  make box-up         Create a DO+Tailscale box (BOX=id PROFILE=dev-small DEPLOY_MANIFEST=path BLUEPRINT=name SET='K=V')\n"
 	@printf "  make box-down       Drain and destroy a box (BOX=id)\n"
 	@printf "  make box-status     Check health of a box (BOX=id, omit for all)\n"
 	@printf "  make box-list       List all active boxes\n"
@@ -164,7 +165,7 @@ swimmers-runtime-status:
 BOX_ARGS := $(if $(strip $(BOX)),$(BOX),)
 
 box-up:
-	@python3 scripts/box.py up $(BOX_ARGS) --profile $(or $(PROFILE),dev-small) $(BLUEPRINT_ARGS) $(SET_ARGS)
+	@python3 scripts/box.py up $(BOX_ARGS) --profile $(or $(PROFILE),dev-small) $(DEPLOY_MANIFEST_ARGS) $(BLUEPRINT_ARGS) $(SET_ARGS)
 
 box-down:
 	@python3 scripts/box.py down $(BOX_ARGS)

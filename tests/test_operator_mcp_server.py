@@ -150,6 +150,32 @@ class OperatorMcpServerTests(unittest.TestCase):
         payload = _content_payload(result)
         self.assertEqual(payload["error"]["type"], "build_failed")
 
+    def test_handle_operator_compose_down_dry_run_preserves_preview_failure(self) -> None:
+        with mock.patch.object(
+            MODULE,
+            "run_compose",
+            return_value=(False, 1, {"stderr": "boom"}),
+        ), mock.patch.object(MODULE, "_stamp_dryrun_marker") as stamp:
+            result = MODULE.handle_operator_compose_down({"dry_run": True})
+
+        payload = _content_payload(result)
+        self.assertTrue(result["isError"])
+        self.assertEqual(payload["error"]["type"], "compose_preview_failed")
+        self.assertEqual(payload["exit_code"], 1)
+        stamp.assert_not_called()
+
+    def test_handle_operator_compose_down_dry_run_stamps_marker_on_success(self) -> None:
+        with mock.patch.object(
+            MODULE,
+            "run_compose",
+            return_value=(True, 0, [{"service": "api"}]),
+        ), mock.patch.object(MODULE, "_stamp_dryrun_marker") as stamp:
+            result = MODULE.handle_operator_compose_down({"dry_run": True})
+
+        payload = _content_payload(result)
+        self.assertEqual(payload["would_stop"], [{"service": "api"}])
+        stamp.assert_called_once_with("operator_compose_down", "local")
+
     def test_run_script_covers_missing_timeout_json_text_and_empty_output(self) -> None:
         missing_ok, missing_code, missing_payload = MODULE.run_script(Path("/missing-script.py"), [])
         self.assertFalse(missing_ok)
