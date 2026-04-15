@@ -374,30 +374,68 @@ def sync_live_context(
     )
 
 
+CONTEXT_PATH_KEYS = {
+    "cwd_match",
+    "scan_roots",
+    "default_cwd",
+    "plan_root",
+    "plan_draft",
+    "plan_index",
+    "session_plans",
+    "workflow_root",
+    "workflow_index",
+    "evaluation_root",
+    "evaluation_notes",
+    "invocation_root",
+    "invocation_notes",
+    "observability_root",
+    "observability_notes",
+    "extraction_rule",
+    "source_docs",
+    "strategy_pages",
+    "acquisition_pages",
+    "hydration_sources",
+    "overlay_path",
+    "client_dir",
+}
+
+
+def _should_resolve_context_path(value: str) -> bool:
+    text = value.strip()
+    if not text:
+        return False
+    if text.startswith(("/", "~", "$")):
+        return False
+    if "${" in text:
+        return False
+    parsed = urllib.parse.urlparse(text)
+    if parsed.scheme and parsed.netloc:
+        return False
+    return True
+
+
 def _resolve_context_paths(
     context: dict[str, Any], client_dir: Path,
 ) -> dict[str, Any]:
-    """Resolve relative paths in a context dict to absolute paths under client_dir.
+    """Resolve only explicit path-like context keys under client_dir."""
 
-    A value is treated as a relative path if it doesn't start with ``/`` and
-    contains no spaces (heuristic: avoids mangling descriptions or list items).
-    """
-    resolved: dict[str, Any] = {}
-    for key, value in context.items():
+    def _resolve_value(value: Any, key: str | None = None) -> Any:
         if isinstance(value, dict):
-            resolved[key] = _resolve_context_paths(value, client_dir)
-        elif isinstance(value, str) and not value.startswith("/") and " " not in value and "/" in value:
-            resolved[key] = str(client_dir / value)
-        elif isinstance(value, list):
-            resolved[key] = [
-                str(client_dir / v)
-                if isinstance(v, str) and not v.startswith("/") and " " not in v and "/" in v
-                else v
-                for v in value
-            ]
-        else:
-            resolved[key] = value
-    return resolved
+            return {
+                child_key: _resolve_value(child_value, child_key)
+                for child_key, child_value in value.items()
+            }
+        if isinstance(value, list):
+            return [_resolve_value(item, key) for item in value]
+        if isinstance(value, str) and key in CONTEXT_PATH_KEYS:
+            if _should_resolve_context_path(value):
+                return str(client_dir / value)
+        return value
+
+    return {
+        key: _resolve_value(value, key)
+        for key, value in context.items()
+    }
 
 
 def generate_skill_context(

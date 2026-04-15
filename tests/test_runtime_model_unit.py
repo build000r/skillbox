@@ -143,6 +143,21 @@ class RuntimeModelUnitTests(unittest.TestCase):
             self.assertEqual(translated["SKILLBOX_CLIENTS_ROOT"], str((repo / "workspace" / "clients").resolve()))
             self.assertEqual(translated["SKILLBOX_MONOSERVER_ROOT"], str(repo.parent.resolve()))
 
+    def test_load_runtime_env_infers_monoserver_host_root_from_host_native_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            self._write_runtime_fixture(repo)
+            host_root = repo.parent / "host-monoserver"
+            (repo / ".env").write_text(
+                f"SKILLBOX_MONOSERVER_ROOT={host_root}\n",
+                encoding="utf-8",
+            )
+
+            runtime_env = runtime_model_module.load_runtime_env(repo)
+
+            self.assertEqual(runtime_env["SKILLBOX_MONOSERVER_ROOT"], str(host_root))
+            self.assertEqual(runtime_env["SKILLBOX_MONOSERVER_HOST_ROOT"], str(host_root.resolve()))
+
     def test_build_runtime_model_populates_host_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)

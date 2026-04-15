@@ -585,7 +585,19 @@ def handle_operator_compose_down(params: dict) -> dict:
     is_dry_run = bool(params.get("dry_run"))
     if is_dry_run:
         # Compose doesn't have native dry-run; simulate it.
-        ok, _code, data = run_compose(["ps", "--format", "json"], timeout=30)
+        ok, code, data = run_compose(["ps", "--format", "json"], timeout=30)
+        if not ok:
+            return _error_content({
+                "dry_run": True,
+                "action": "compose down",
+                "exit_code": code,
+                "detail": data,
+                "error": {
+                    "type": "compose_preview_failed",
+                    "message": "docker compose ps failed during compose-down preview.",
+                    "recoverable": True,
+                },
+            })
         payload = {
             "dry_run": True,
             "action": "compose down",

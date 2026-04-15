@@ -1180,6 +1180,23 @@ python3 .env-manager/manage.py client-init acme-studio \
   --set SERVICE_COMMAND='pnpm dev'
 ```
 
+If the client repo needs local SPAPS auth and RBAC fixtures on day one, use the
+SPAPS-aware variant instead:
+
+```bash
+python3 .env-manager/manage.py client-init acme-studio \
+  --blueprint git-repo-http-service-bootstrap-spaps-auth \
+  --set PRIMARY_REPO_URL=https://github.com/acme/app.git \
+  --set BOOTSTRAP_COMMAND='pnpm install && mkdir -p .skillbox && touch .skillbox/bootstrap.ok' \
+  --set SERVICE_COMMAND='pnpm dev'
+```
+
+That scaffold adds:
+
+- a managed `auth-api` service on `http://127.0.0.1:3301/health`
+- a repo-local SPAPS fixture bootstrap task
+- an app service that depends on auth before startup
+
 Blueprints keep the default client scaffold unless they explicitly set a
 different scaffold pack. They append client-scoped repos, artifacts, tasks,
 services, logs, and checks to the generated overlay, so the next `render`,

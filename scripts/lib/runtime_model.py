@@ -382,6 +382,14 @@ def load_runtime_env(root_dir: Path) -> dict[str, str]:
     )
     values.setdefault("SKILLBOX_CLIENTS_HOST_ROOT", "./.skillbox-state/clients")
     values.setdefault("SKILLBOX_MONOSERVER_HOST_ROOT", "./.skillbox-state/monoserver")
+
+    monoserver_root = str(values.get("SKILLBOX_MONOSERVER_ROOT") or "").strip()
+    monoserver_root_path = Path(monoserver_root).expanduser()
+    if monoserver_root_path.is_absolute() and not is_runtime_absolute_path(monoserver_root):
+        # Host-native runs often only set SKILLBOX_MONOSERVER_ROOT. In that
+        # mode the host root must match the same absolute path or command/path
+        # translation will fall back to stale relative defaults like "..".
+        values["SKILLBOX_MONOSERVER_HOST_ROOT"] = str(monoserver_root_path.resolve())
     return values
 
 
