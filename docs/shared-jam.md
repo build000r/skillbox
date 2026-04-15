@@ -1,6 +1,6 @@
 # Shared Jam — Collaborator Access Guide
 
-Share your skillbox with trusted devs. They SSH in and start working immediately, with their identity attached to git commits, tmux sessions, and shell history.
+Share your skillbox with trusted devs. They SSH in and start working immediately, with their identity attached to git commits, tmux sessions, and shell history. If they also want local operator MCP access from their own clone, register the shared box instead of hand-editing `workspace/boxes.json`.
 
 ---
 
@@ -22,6 +22,7 @@ sudo ./scripts/03-shared-jam.sh invite alice@example.com
 ```
 
 The script shares the Tailscale node and prints the SSH command the dev should use.
+It also prints the exact `box register` command they can run from their local `skillbox` clone to populate operator inventory.
 
 ### Revoke access
 
@@ -53,15 +54,25 @@ Shows active tmux sessions and the last 20 lines of shared command history.
 
 The operator will share the node with you. Accept it in your Tailscale client.
 
-### 2. SSH in
+### 2. Register the shared box locally if you want operator MCP
+
+From your own `skillbox` clone, run the `box register` command printed by `03-shared-jam.sh invite`. Example:
 
 ```bash
-ssh sandbox@skillbox-dev
+python3 scripts/box.py register alice --host skillbox-dev.tailnet.ts.net --ssh-user skillbox
 ```
 
-(The operator will tell you the exact hostname.)
+This writes a local inventory entry for `operator_boxes`, `operator_box_status`, and `operator_box_exec` without touching `workspace/boxes.json` by hand.
 
-### 3. What happens automatically
+### 3. SSH in
+
+```bash
+ssh skillbox@skillbox-dev
+```
+
+(The operator will tell you the exact hostname and login user. The default shared login user is `skillbox`, but boxes installed with `SSH_LOGIN_USER=sandbox` will print `sandbox` instead.)
+
+### 4. What happens automatically
 
 On login, the system:
 
@@ -72,7 +83,7 @@ On login, the system:
 
 You don't need to configure anything.
 
-### 4. Pair programming
+### 5. Pair programming
 
 To join someone else's terminal:
 
@@ -82,9 +93,9 @@ tmux attach -t alice
 
 Both of you see the same terminal in real-time.
 
-### 5. Disconnect
+### 6. Disconnect
 
-Detach from tmux with `Ctrl-b d` or just close the terminal. Your tmux session persists — reconnect anytime with `ssh sandbox@skillbox-dev`.
+Detach from tmux with `Ctrl-b d` or just close the terminal. Your tmux session persists — reconnect anytime with the same SSH command.
 
 ---
 

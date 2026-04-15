@@ -76,6 +76,16 @@ DEFAULT_SSH_OPTS = [
 ]
 REMOTE_ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SHA256_HEX_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")
+IPV4_PATTERN = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+REGISTER_PROBE_COMMAND = (
+    "TS_IP=\"$(tailscale ip -4 2>/dev/null | head -n1 || true)\"; "
+    "CONTAINER=no; "
+    "if [ -d \"$HOME/skillbox\" ] && "
+    "CONTAINER_JSON=\"$(cd \"$HOME/skillbox\" 2>/dev/null && docker compose ps --format json 2>/dev/null | head -1 || true)\" && "
+    "printf '%s' \"$CONTAINER_JSON\" | grep -q 'workspace'; then CONTAINER=yes; fi; "
+    "printf 'SKILLBOX_PROBE_TAILSCALE_IPV4=%s\\n' \"$TS_IP\"; "
+    "printf 'SKILLBOX_PROBE_CONTAINER_RUNNING=%s\\n' \"$CONTAINER\""
+)
 
 
 def shell_join(args: list[str]) -> str:
@@ -310,6 +320,88 @@ def extract_tailscale_ipv4(output: str) -> str | None:
         if value:
             return value
     return None
+
+
+def is_ipv4_address(candidate: str) -> bool:
+    value = str(candidate or "").strip()
+    if not IPV4_PATTERN.fullmatch(value):
+        return False
+    parts = value.split(".")
+    return all(0 <= int(part) <= 255 for part in parts)
+
+
+def is_tailscale_ipv4(candidate: str) -> bool:
+    if not is_ipv4_address(candidate):
+        return False
+    first, second, *_ = [int(part) for part in str(candidate).split(".")]
+    return first == 100 and 64 <= second <= 127
+
+
+def derive_box_id_from_host(host: str) -> str:
+    base = str(host or "").strip().lower()
+    if not base:
+        return "shared-box"
+    if not is_ipv4_address(base):
+        base = base.split(".", 1)[0]
+    base = base.removeprefix("skillbox-")
+    base = re.sub(r"[^a-z0-9-]+", "-", base).strip("-")
+    return base or "shared-box"
+
+
+def seed_registered_box_fields(host: str) -> dict[str, str]:
+    value = str(host or "").strip()
+    if not value:
+        return {}
+    if is_tailscale_ipv4(value):
+        return {"tailscale_ip": value}
+    if is_ipv4_address(value):
+        return {"droplet_ip": value}
+    return {"tailscale_hostname": value}
+
+
+def parse_register_probe(output: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "tailscale_ip": None,
+        "container_running": False,
+    }
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line.startswith("SKILLBOX_PROBE_TAILSCALE_IPV4="):
+            value = line.split("=", 1)[1].strip()
+            if value:
+                payload["tailscale_ip"] = value
+        elif line.startswith("SKILLBOX_PROBE_CONTAINER_RUNNING="):
+            payload["container_running"] = line.split("=", 1)[1].strip().lower() == "yes"
+    return payload
+
+
+def probe_registered_box(box: "Box", *, enabled: bool) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "probe_enabled": enabled,
+        "ssh_target": None,
+        "ssh_reachable": False,
+        "container_running": False,
+        "tailscale_ip": box.tailscale_ip,
+    }
+    if not enabled:
+        return payload
+
+    prefer_public = bool(box.droplet_ip and not box.tailscale_ip and not box.tailscale_hostname)
+    ssh_target = resolve_box_ssh_target(box, max_wait=5, interval=1, prefer_public=prefer_public)
+    if not ssh_target:
+        return payload
+
+    payload["ssh_target"] = ssh_target
+    payload["ssh_reachable"] = True
+    result = ssh_cmd(box.ssh_user, ssh_target, REGISTER_PROBE_COMMAND, timeout=20)
+    if result.returncode != 0:
+        return payload
+
+    parsed = parse_register_probe(result.stdout)
+    payload["container_running"] = bool(parsed["container_running"])
+    if parsed["tailscale_ip"]:
+        payload["tailscale_ip"] = parsed["tailscale_ip"]
+    return payload
 
 
 def scp_file(local_path: Path, user: str, host: str, remote_path: str, *, timeout: int = 600) -> subprocess.CompletedProcess[str]:
@@ -664,6 +756,7 @@ class Box:
     id: str
     profile: str
     state: str = "creating"
+    management_mode: str = "managed"
     droplet_id: str | None = None
     droplet_ip: str | None = None
     tailscale_hostname: str | None = None
@@ -724,6 +817,39 @@ def volume_payload(box: Box) -> dict[str, Any] | None:
         "id": box.volume_id,
         "name": box.volume_name,
         "size_gb": box.volume_size_gb,
+    }
+
+
+def registration_payload(box: Box, probe: dict[str, Any], *, host: str) -> dict[str, Any]:
+    next_actions = [f"box status {box.id}"]
+    if probe.get("ssh_reachable"):
+        next_actions.append(f"box ssh {box.id}")
+    elif box.management_mode == "external":
+        next_actions.append(f"box unregister {box.id}")
+
+    return {
+        "box_id": box.id,
+        "host": host,
+        "registered": True,
+        "management_mode": box.management_mode,
+        "state": box.state,
+        "profile": box.profile,
+        "droplet_id": box.droplet_id,
+        "droplet_ip": box.droplet_ip,
+        "tailscale_hostname": box.tailscale_hostname,
+        "tailscale_ip": box.tailscale_ip,
+        "ssh_user": box.ssh_user,
+        "region": box.region,
+        "size": box.size,
+        "state_root": box.state_root,
+        "storage_filesystem": box.storage_filesystem,
+        "volume_name": box.volume_name,
+        "volume_size_gb": box.volume_size_gb,
+        "ssh_target": probe.get("ssh_target"),
+        "ssh_reachable": bool(probe.get("ssh_reachable")),
+        "container_running": bool(probe.get("container_running")),
+        "probe_enabled": bool(probe.get("probe_enabled")),
+        "next_actions": next_actions,
     }
 
 
@@ -1714,6 +1840,17 @@ def cmd_down(box_id: str, *, dry_run: bool, fmt: str) -> int:
             print(msg, file=sys.stderr)
         return EXIT_ERROR
 
+    if box.management_mode == "external":
+        msg = (
+            f"Box {box_id!r} was registered from an existing shared host and cannot be torn down "
+            f"through box down. Use 'box unregister {box_id}' to remove the local inventory entry."
+        )
+        if is_json:
+            emit_json(structured_error(msg, error_type="invalid_state", next_actions=[f"box unregister {box_id}"]))
+        else:
+            print(msg, file=sys.stderr)
+        return EXIT_ERROR
+
     do_token = optional_env("SKILLBOX_DO_TOKEN")
     if do_token:
         os.environ["DIGITALOCEAN_ACCESS_TOKEN"] = do_token
@@ -1808,6 +1945,139 @@ def cmd_down(box_id: str, *, dry_run: bool, fmt: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# box unregister
+# ---------------------------------------------------------------------------
+
+def cmd_unregister(box_id: str, *, fmt: str) -> int:
+    is_json = fmt == "json"
+    boxes = load_inventory()
+    box = find_box(boxes, box_id)
+    if box is None or box.state == "destroyed":
+        msg = f"Box {box_id!r} not found or already destroyed."
+        if is_json:
+            emit_json(structured_error(msg, error_type="not_found", next_actions=["box list"]))
+        else:
+            print(msg, file=sys.stderr)
+        return EXIT_ERROR
+
+    if box.management_mode != "external":
+        msg = f"Box {box_id!r} is managed by this inventory. Use 'box down {box_id}' for teardown."
+        if is_json:
+            emit_json(structured_error(msg, error_type="invalid_state", next_actions=[f"box down {box_id} --dry-run"]))
+        else:
+            print(msg, file=sys.stderr)
+        return EXIT_ERROR
+
+    update_box(box, state="destroyed")
+    save_inventory(boxes)
+    payload = {
+        "box_id": box_id,
+        "management_mode": box.management_mode,
+        "unregistered": True,
+        "next_actions": ["box list"],
+    }
+    if is_json:
+        emit_json(payload)
+    else:
+        print(f"Unregistered external box {box_id}.")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# box register
+# ---------------------------------------------------------------------------
+
+def cmd_register(
+    box_id: str | None,
+    *,
+    host: str,
+    profile_name: str,
+    ssh_user: str | None,
+    force: bool,
+    probe: bool,
+    fmt: str,
+) -> int:
+    is_json = fmt == "json"
+    resolved_box_id = box_id or derive_box_id_from_host(host)
+
+    profile: BoxProfile | None = None
+    if profile_name != "shared":
+        try:
+            profile = load_profile(profile_name)
+        except RuntimeError as exc:
+            if is_json:
+                emit_json(structured_error(str(exc), error_type="profile_not_found"))
+            else:
+                print(str(exc), file=sys.stderr)
+            return EXIT_ERROR
+
+    boxes = load_inventory()
+    existing = find_box(boxes, resolved_box_id)
+    if existing and existing.state != "destroyed" and not force:
+        msg = (
+            f"Box {resolved_box_id!r} already exists in state {existing.state!r}. "
+            f"Use 'box unregister {resolved_box_id}' or rerun with --force."
+        )
+        if is_json:
+            emit_json(
+                structured_error(
+                    msg,
+                    error_type="conflict",
+                    next_actions=[f"box status {resolved_box_id}", f"box unregister {resolved_box_id}"],
+                )
+            )
+        else:
+            print(msg, file=sys.stderr)
+        return EXIT_ERROR
+
+    filtered_boxes = [candidate for candidate in boxes if candidate.id != resolved_box_id]
+    now = datetime.now(timezone.utc).isoformat()
+    storage = profile.storage if profile is not None else None
+    box = Box(
+        id=resolved_box_id,
+        profile=profile_name,
+        state="ready",
+        management_mode="external",
+        ssh_user=(ssh_user or (profile.ssh_user if profile is not None else "skillbox")),
+        created_at=now,
+        updated_at=now,
+        region=profile.region if profile is not None else "",
+        size=profile.size if profile is not None else "",
+        storage_provider=storage.provider if storage is not None else None,
+        state_root=storage.mount_path if storage is not None else None,
+        storage_filesystem=storage.filesystem if storage is not None else None,
+        storage_required=storage.required if storage is not None else False,
+        storage_min_free_gb=storage.min_free_gb if storage is not None else None,
+        volume_name=volume_name_for_box(resolved_box_id) if storage is not None else None,
+        volume_size_gb=storage_volume_size_gb(storage) if storage is not None else None,
+    )
+    update_box(box, **seed_registered_box_fields(host))
+
+    register_probe = probe_registered_box(box, enabled=probe)
+    updates: dict[str, Any] = {}
+    if register_probe.get("tailscale_ip") and not box.tailscale_ip:
+        updates["tailscale_ip"] = register_probe["tailscale_ip"]
+    if register_probe.get("ssh_reachable"):
+        updates["state"] = "ready" if register_probe.get("container_running") else "ssh-ready"
+    if updates:
+        update_box(box, **updates)
+
+    filtered_boxes.append(box)
+    save_inventory(filtered_boxes)
+    payload = registration_payload(box, register_probe, host=host)
+    if is_json:
+        emit_json(payload)
+    else:
+        print(f"Registered external box {resolved_box_id} from {host}.")
+        print(f"  SSH user: {box.ssh_user}")
+        if payload["ssh_reachable"]:
+            print(f"  connect: ssh {box.ssh_user}@{payload['ssh_target']}")
+        else:
+            print("  ssh probe: unreachable (saved with known fields only)")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
 # box status
 # ---------------------------------------------------------------------------
 
@@ -1835,7 +2105,7 @@ def cmd_status(box_id: str | None, *, fmt: str) -> int:
         statuses = [box_health(b) for b in boxes if b.state != "destroyed"]
         payload: dict[str, Any] = {
             "boxes": statuses,
-            "next_actions": ["box up <id> --profile <name>"] if not statuses else [],
+            "next_actions": ["box up <id> --profile <name>", "box register <id> --host <tailscale-hostname>"] if not statuses else [],
         }
         if is_json:
             emit_json(payload)
@@ -1854,6 +2124,7 @@ def box_health(box: Box) -> dict[str, Any]:
         "id": box.id,
         "state": box.state,
         "profile": box.profile,
+        "management_mode": box.management_mode,
         "droplet_id": box.droplet_id,
         "droplet_ip": box.droplet_ip,
         "tailscale_hostname": box.tailscale_hostname,
@@ -1890,7 +2161,10 @@ def box_health(box: Box) -> dict[str, Any]:
 
     next_actions: list[str] = []
     if not status["ssh_reachable"]:
-        next_actions.append(f"box down {box.id}")
+        if box.management_mode == "external":
+            next_actions.append(f"box unregister {box.id}")
+        else:
+            next_actions.append(f"box down {box.id}")
     elif not status["container_running"]:
         next_actions.append(f"box ssh {box.id}")
     status["next_actions"] = next_actions or [f"box ssh {box.id}"]
@@ -1902,6 +2176,8 @@ def print_box_status_text(status: dict[str, Any]) -> None:
     container = "yes" if status["container_running"] else "no"
     ts = status["tailscale_hostname"] or "n/a"
     print(f"{status['id']}  state={status['state']}  profile={status['profile']}")
+    if status.get("management_mode") == "external":
+        print("  mode=external")
     print(f"  droplet={status['droplet_id']}  ip={status['droplet_ip']}  ts={ts}")
     if status.get("state_root"):
         print(f"  state_root={status['state_root']}  fs={status.get('storage_filesystem') or 'n/a'}")
@@ -1944,7 +2220,7 @@ def cmd_list(*, fmt: str) -> int:
     if fmt == "json":
         emit_json({
             "boxes": [asdict(b) for b in active],
-            "next_actions": ["box up <id> --profile <name>"] if not active else [],
+            "next_actions": ["box up <id> --profile <name>", "box register <id> --host <tailscale-hostname>"] if not active else [],
         })
     else:
         if not active:
@@ -1956,7 +2232,7 @@ def cmd_list(*, fmt: str) -> int:
                 volume = b.volume_name or "n/a"
                 print(
                     f"  {b.id}  state={b.state}  ts={ts}  ip={b.droplet_ip}  "
-                    f"profile={b.profile}  state_root={root}  volume={volume}"
+                    f"profile={b.profile}  mode={b.management_mode}  state_root={root}  volume={volume}"
                 )
     return EXIT_OK
 
@@ -2019,6 +2295,28 @@ def main() -> int:
     ssh_parser = subparsers.add_parser("ssh", help="SSH into a box.")
     ssh_parser.add_argument("box_id", help="Box identifier.")
 
+    register_parser = subparsers.add_parser("register", help="Register an existing shared or manually created box in local inventory.")
+    register_parser.add_argument("box_id", nargs="?", default=None, help="Local box identifier. Defaults to a host-derived alias.")
+    register_parser.add_argument("--host", required=True, help="Reachable host: Tailscale hostname, Tailscale IP, or public IP.")
+    register_parser.add_argument("--profile", default="shared", help="Local profile label (default: shared).")
+    register_parser.add_argument("--ssh-user", default=None, help="SSH login user. Defaults to the profile ssh_user or 'skillbox'.")
+    register_parser.add_argument("--force", action="store_true", help="Replace an existing active inventory entry with the same id.")
+    register_parser.add_argument("--no-probe", action="store_true", help="Skip the SSH probe and save known fields only.")
+    register_parser.add_argument("--format", choices=("text", "json"), default="text")
+
+    import_parser = subparsers.add_parser("import", help="Alias for register.")
+    import_parser.add_argument("box_id", nargs="?", default=None, help="Local box identifier. Defaults to a host-derived alias.")
+    import_parser.add_argument("--host", required=True, help="Reachable host: Tailscale hostname, Tailscale IP, or public IP.")
+    import_parser.add_argument("--profile", default="shared", help="Local profile label (default: shared).")
+    import_parser.add_argument("--ssh-user", default=None, help="SSH login user. Defaults to the profile ssh_user or 'skillbox'.")
+    import_parser.add_argument("--force", action="store_true", help="Replace an existing active inventory entry with the same id.")
+    import_parser.add_argument("--no-probe", action="store_true", help="Skip the SSH probe and save known fields only.")
+    import_parser.add_argument("--format", choices=("text", "json"), default="text")
+
+    unregister_parser = subparsers.add_parser("unregister", help="Remove a registered external box from local inventory.")
+    unregister_parser.add_argument("box_id", help="Box identifier.")
+    unregister_parser.add_argument("--format", choices=("text", "json"), default="text")
+
     subparsers.add_parser("list", help="List all active boxes.").add_argument(
         "--format", choices=("text", "json"), default="text",
     )
@@ -2053,6 +2351,18 @@ def main() -> int:
             return cmd_status(args.box_id, fmt=args.format)
         if args.command == "ssh":
             return cmd_ssh(args.box_id)
+        if args.command in ("register", "import"):
+            return cmd_register(
+                args.box_id,
+                host=args.host,
+                profile_name=args.profile,
+                ssh_user=args.ssh_user,
+                force=args.force,
+                probe=not args.no_probe,
+                fmt=args.format,
+            )
+        if args.command == "unregister":
+            return cmd_unregister(args.box_id, fmt=args.format)
         if args.command == "list":
             return cmd_list(fmt=args.format)
         if args.command == "profiles":

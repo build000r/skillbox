@@ -372,6 +372,18 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertEqual(result, BOX.EXIT_ERROR)
         self.assertEqual(payloads[-1]["error"]["type"], "not_found")
 
+    def test_cmd_down_rejects_external_box(self) -> None:
+        box = BOX.Box(id="shared-pal", profile="shared", state="ready", management_mode="external")
+        payloads: list[dict[str, object]] = []
+
+        with mock.patch.object(BOX, "load_inventory", return_value=[box]), \
+            mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
+            result = BOX.cmd_down("shared-pal", dry_run=False, fmt="json")
+
+        self.assertEqual(result, BOX.EXIT_ERROR)
+        self.assertEqual(payloads[-1]["error"]["type"], "invalid_state")
+        self.assertEqual(payloads[-1]["next_actions"], ["box unregister shared-pal"])
+
     def test_cmd_down_dry_run_skips_all_steps(self) -> None:
         box = BOX.Box(id="teardown", profile="dev-small", state="ready", droplet_id="77")
         payloads: list[dict[str, object]] = []
@@ -475,6 +487,22 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertFalse(status["ssh_reachable"])
         self.assertEqual(status["next_actions"], ["box down broken"])
 
+    def test_box_health_prefers_unregister_for_external_box(self) -> None:
+        box = BOX.Box(
+            id="shared-pal",
+            profile="shared",
+            state="ready",
+            management_mode="external",
+            tailscale_hostname="skillbox-shared-pal",
+            ssh_user="skillbox",
+        )
+
+        with mock.patch.object(BOX, "ssh_cmd", return_value=_completed(returncode=1)):
+            status = BOX.box_health(box)
+
+        self.assertFalse(status["ssh_reachable"])
+        self.assertEqual(status["next_actions"], ["box unregister shared-pal"])
+
     def test_cmd_list_reports_empty_and_text_modes(self) -> None:
         payloads: list[dict[str, object]] = []
         active = BOX.Box(id="box-1", profile="dev-small", state="ready", droplet_ip="1.2.3.4")
@@ -484,7 +512,10 @@ class BoxRefactorTests(unittest.TestCase):
             result = BOX.cmd_list(fmt="json")
 
         self.assertEqual(result, BOX.EXIT_OK)
-        self.assertEqual(payloads[-1]["next_actions"], ["box up <id> --profile <name>"])
+        self.assertEqual(
+            payloads[-1]["next_actions"],
+            ["box up <id> --profile <name>", "box register <id> --host <tailscale-hostname>"],
+        )
 
         with mock.patch.object(BOX, "load_inventory", return_value=[active]), \
             mock.patch("builtins.print") as print_mock:
@@ -493,12 +524,66 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertEqual(result, BOX.EXIT_OK)
         print_mock.assert_called()
 
+    def test_cmd_register_persists_external_box_and_hydrates_probe_fields(self) -> None:
+        persisted: list[BOX.Box] = []
+        payloads: list[dict[str, object]] = []
+
+        def capture_inventory(boxes: list[BOX.Box]) -> None:
+            persisted[:] = boxes
+
+        with mock.patch.object(BOX, "load_inventory", return_value=[]), \
+            mock.patch.object(
+                BOX,
+                "probe_registered_box",
+                return_value={
+                    "probe_enabled": True,
+                    "ssh_target": "100.64.0.8",
+                    "ssh_reachable": True,
+                    "container_running": True,
+                    "tailscale_ip": "100.64.0.8",
+                },
+            ), \
+            mock.patch.object(BOX, "save_inventory", side_effect=capture_inventory), \
+            mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
+            result = BOX.cmd_register(
+                "shared-pal",
+                host="skillbox-shared-pal.tailnet.ts.net",
+                profile_name="shared",
+                ssh_user="sandbox",
+                force=False,
+                probe=True,
+                fmt="json",
+            )
+
+        self.assertEqual(result, BOX.EXIT_OK)
+        self.assertEqual(len(persisted), 1)
+        self.assertEqual(persisted[0].management_mode, "external")
+        self.assertEqual(persisted[0].state, "ready")
+        self.assertEqual(persisted[0].tailscale_ip, "100.64.0.8")
+        self.assertEqual(payloads[-1]["ssh_target"], "100.64.0.8")
+        self.assertEqual(payloads[-1]["next_actions"], ["box status shared-pal", "box ssh shared-pal"])
+
+    def test_cmd_unregister_marks_external_box_destroyed(self) -> None:
+        box = BOX.Box(id="shared-pal", profile="shared", state="ready", management_mode="external")
+        payloads: list[dict[str, object]] = []
+
+        with mock.patch.object(BOX, "load_inventory", return_value=[box]), \
+            mock.patch.object(BOX, "save_inventory"), \
+            mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
+            result = BOX.cmd_unregister("shared-pal", fmt="json")
+
+        self.assertEqual(result, BOX.EXIT_OK)
+        self.assertEqual(box.state, "destroyed")
+        self.assertTrue(payloads[-1]["unregistered"])
+
     def test_main_dispatches_commands_and_wraps_errors(self) -> None:
         dispatch_cases = [
             (["up", "alpha"], "cmd_up"),
             (["down", "alpha"], "cmd_down"),
             (["status", "alpha"], "cmd_status"),
             (["ssh", "alpha"], "cmd_ssh"),
+            (["register", "alpha", "--host", "skillbox-alpha.tail.ts.net"], "cmd_register"),
+            (["unregister", "alpha"], "cmd_unregister"),
             (["list"], "cmd_list"),
             (["profiles"], "cmd_profiles"),
         ]
@@ -513,6 +598,8 @@ class BoxRefactorTests(unittest.TestCase):
                     mock.patch.object(BOX, "cmd_down", return_value=12), \
                     mock.patch.object(BOX, "cmd_status", return_value=13), \
                     mock.patch.object(BOX, "cmd_ssh", return_value=14), \
+                    mock.patch.object(BOX, "cmd_register", return_value=17), \
+                    mock.patch.object(BOX, "cmd_unregister", return_value=18), \
                     mock.patch.object(BOX, "cmd_list", return_value=15), \
                     mock.patch.object(BOX, "cmd_profiles", return_value=16):
                     result = BOX.main()
@@ -522,6 +609,8 @@ class BoxRefactorTests(unittest.TestCase):
                     "cmd_down": 12,
                     "cmd_status": 13,
                     "cmd_ssh": 14,
+                    "cmd_register": 17,
+                    "cmd_unregister": 18,
                     "cmd_list": 15,
                     "cmd_profiles": 16,
                 }[handler_name]

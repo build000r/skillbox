@@ -18,7 +18,7 @@ PRIVATE_PATH_ARGS := $(if $(strip $(PRIVATE_PATH)),--private-path $(PRIVATE_PATH
 OUTPUT_DIR_ARGS := $(if $(strip $(OUTPUT_DIR)),--output-dir $(OUTPUT_DIR),)
 FORCE_ARGS := $(if $(strip $(FORCE)),--force,)
 
-.PHONY: help bootstrap-env render doctor acceptance runtime-render runtime-sync runtime-status runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context dev-sanity python-cov-xml build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles
+.PHONY: help bootstrap-env render doctor acceptance runtime-render runtime-sync runtime-status runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context dev-sanity python-cov-xml build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles box-register box-unregister
 
 help:
 	@printf "  make bootstrap-env  Copy .env.example to .env if missing\n"
@@ -59,6 +59,8 @@ help:
 	@printf "  make box-list       List all active boxes\n"
 	@printf "  make box-ssh        SSH into a box (BOX=id)\n"
 	@printf "  make box-profiles   List available box profiles\n"
+	@printf "  make box-register   Register an existing shared box locally (BOX=id HOST=name SSH_USER=user)\n"
+	@printf "  make box-unregister Remove a registered shared box from local inventory (BOX=id)\n"
 
 bootstrap-env:
 	@test -f .env || cp .env.example .env
@@ -181,3 +183,13 @@ box-ssh:
 
 box-profiles:
 	@python3 scripts/box.py profiles
+
+HOST_ARGS := $(if $(strip $(HOST)),--host $(HOST),)
+SSH_USER_ARGS := $(if $(strip $(SSH_USER)),--ssh-user $(SSH_USER),)
+NO_PROBE_ARGS := $(if $(strip $(NO_PROBE)),--no-probe,)
+
+box-register:
+	@python3 scripts/box.py register $(BOX_ARGS) $(HOST_ARGS) $(PROFILE_ARGS) $(SSH_USER_ARGS) $(FORCE_ARGS) $(NO_PROBE_ARGS)
+
+box-unregister:
+	@python3 scripts/box.py unregister $(BOX_ARGS)
