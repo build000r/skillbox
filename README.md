@@ -463,8 +463,9 @@ This prevents accidental infrastructure destruction with uncommitted work.
 
 ### 1. Single-tenant first
 
-`skillbox` is for one operator-controlled machine, not a shared workspace
-platform. That constraint keeps the shape legible and the operating model sane.
+`skillbox` is for one operator-controlled machine, not a multi-tenant workspace
+platform. Trusted collaborator access is still valid, but it is an explicit
+shared-box mode on top of a single machine, not a separate tenancy model.
 
 ### 2. Durable state beats ephemeral sandboxes
 

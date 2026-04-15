@@ -575,6 +575,64 @@ class BoxTests(unittest.TestCase):
             self.assertEqual(box["region"], "sfo3")
             self.assertEqual(box["tailscale_ip"], "100.64.2.2")
 
+    def test_register_no_probe_creates_external_inventory_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._env_with_inventory(tmpdir)
+            result = self._run(
+                "register",
+                "shared-pal",
+                "--host",
+                "100.64.1.9",
+                "--ssh-user",
+                "sandbox",
+                "--no-probe",
+                "--format",
+                "json",
+                env=env,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["registered"])
+            self.assertEqual(payload["management_mode"], "external")
+            self.assertEqual(payload["tailscale_ip"], "100.64.1.9")
+
+            listed = self._run("list", "--format", "json", env=env)
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+            listed_payload = json.loads(listed.stdout)
+            self.assertEqual(len(listed_payload["boxes"]), 1)
+            self.assertEqual(listed_payload["boxes"][0]["management_mode"], "external")
+
+    def test_unregister_hides_registered_box_from_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            inv_path = Path(tmpdir) / "workspace" / "boxes.json"
+            inv_path.parent.mkdir(parents=True)
+            inv_path.write_text(json.dumps({
+                "boxes": [
+                    {
+                        "id": "shared-pal",
+                        "profile": "shared",
+                        "state": "ready",
+                        "management_mode": "external",
+                        "tailscale_hostname": "skillbox-shared-pal.tailnet.ts.net",
+                        "ssh_user": "sandbox",
+                        "created_at": "2026-04-15T00:00:00Z",
+                        "updated_at": "2026-04-15T00:00:00Z",
+                    }
+                ]
+            }), encoding="utf-8")
+            env = self._env_with_inventory(tmpdir)
+
+            unregister = self._run("unregister", "shared-pal", "--format", "json", env=env)
+            self.assertEqual(unregister.returncode, 0, unregister.stderr)
+            payload = json.loads(unregister.stdout)
+            self.assertTrue(payload["unregistered"])
+
+            listed = self._run("list", "--format", "json", env=env)
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+            listed_payload = json.loads(listed.stdout)
+            self.assertEqual(listed_payload["boxes"], [])
+
     def _run(self, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         run_env = dict(os.environ)
         if env:

@@ -533,11 +533,14 @@ def handle_operator_box_exec(params: dict) -> dict:
                 "type": "box_not_found",
                 "message": f"Box '{box_id}' not found or destroyed.",
                 "recoverable": True,
-                "recovery_hint": "Run operator_boxes to list active boxes.",
+                "recovery_hint": (
+                    "Run operator_boxes to list active boxes, or register an existing shared box "
+                    "with `python3 scripts/box.py register <id> --host <tailscale-hostname>`."
+                ),
             }
         })
 
-    host = box.get("tailscale_hostname") or box.get("droplet_ip")
+    host = box.get("tailscale_ip") or box.get("tailscale_hostname") or box.get("droplet_ip")
     user = box.get("ssh_user", "skillbox")
     if not host:
         return _error_content({

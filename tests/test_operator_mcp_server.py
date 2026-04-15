@@ -108,6 +108,7 @@ class OperatorMcpServerTests(unittest.TestCase):
             return_value={
                 "id": "alpha",
                 "state": "ready",
+                "tailscale_ip": "100.64.0.8",
                 "tailscale_hostname": "skillbox-alpha",
                 "ssh_user": "skillbox",
             },
@@ -122,7 +123,7 @@ class OperatorMcpServerTests(unittest.TestCase):
 
         payload = _content_payload(result)
         self.assertEqual(payload["stdout"], "ok")
-        run_ssh.assert_called_once_with("skillbox", "skillbox-alpha", "pwd", timeout=15)
+        run_ssh.assert_called_once_with("skillbox", "100.64.0.8", "pwd", timeout=15)
 
     def test_handle_operator_compose_up_covers_success_and_build_failure(self) -> None:
         with mock.patch.object(
