@@ -24,6 +24,8 @@ from lib.runtime_model import (  # noqa: E402
 
 VALID_INGRESS_ROUTE_LISTENERS = {"public", "private"}
 VALID_INGRESS_ROUTE_MATCHES = {"exact", "prefix"}
+CLIENT_SHARED_SKILLS_REL = "../_shared/skills"
+VENDORED_SHARED_SKILLS_ESCAPE_HATCH = "allow_vendored_shared_skills"
 
 
 def _looks_like_ingress_origin(raw_value: Any) -> bool:
@@ -806,8 +808,63 @@ def validate_skill_repo_sets(model: dict[str, Any]) -> list[CheckResult]:
     lock_warnings: list[str] = []
     install_failures: list[str] = []
     install_warnings: list[str] = []
+    shared_source_failures: list[str] = []
     declared_skills_by_skillset: dict[str, set[str]] = {}
     effective_skill_owner: dict[str, str] = {}
+
+    def validate_shared_client_planning_sources(
+        skillset: dict[str, Any],
+        config_path: Path,
+        config: dict[str, Any],
+    ) -> list[str]:
+        client_id = str(skillset.get("client", "")).strip()
+        if not client_id:
+            return []
+
+        overlay_dir = config_path.parent
+        expected_shared_source = (overlay_dir / CLIENT_SHARED_SKILLS_REL).resolve()
+        protected_names = set(HARDENED_CLIENT_PLANNING_SKILLS)
+        failures: list[str] = []
+
+        for index, entry in enumerate(config.get("skill_repos") or []):
+            local_path = str(entry.get("path") or "").strip()
+            if not local_path:
+                continue
+
+            picked_names = {
+                str(item).strip()
+                for item in entry.get("pick") or []
+                if str(item).strip()
+            }
+            protected_picks = sorted(picked_names & protected_names)
+            if not protected_picks:
+                continue
+
+            if bool(entry.get(VENDORED_SHARED_SKILLS_ESCAPE_HATCH)):
+                continue
+
+            source_path = Path(local_path).expanduser()
+            if not source_path.is_absolute():
+                source_path = overlay_dir / source_path
+
+            if not source_path.exists() and not source_path.is_symlink():
+                failures.append(
+                    f"{client_id}: skill_repos[{index}] references missing local path "
+                    f"{repo_rel(DEFAULT_ROOT_DIR, source_path)} for protected planning skills "
+                    f"{', '.join(protected_picks)}; point it at {CLIENT_SHARED_SKILLS_REL} "
+                    f"or set {VENDORED_SHARED_SKILLS_ESCAPE_HATCH}: true when divergence is intentional"
+                )
+                continue
+
+            if source_path.resolve() != expected_shared_source:
+                failures.append(
+                    f"{client_id}: skill_repos[{index}] sources protected planning skills "
+                    f"{', '.join(protected_picks)} from {repo_rel(DEFAULT_ROOT_DIR, source_path)}; "
+                    f"point it at {CLIENT_SHARED_SKILLS_REL} or set "
+                    f"{VENDORED_SHARED_SKILLS_ESCAPE_HATCH}: true when divergence is intentional"
+                )
+
+        return failures
 
     def declared_skill_names(config: dict[str, Any]) -> set[str]:
         names: set[str] = set()
@@ -857,6 +914,10 @@ def validate_skill_repo_sets(model: dict[str, Any]) -> list[CheckResult]:
         except RuntimeError as exc:
             config_failures.append(f"{sid}: {exc}")
             continue
+
+        shared_source_failures.extend(
+            validate_shared_client_planning_sources(skillset, config_path, config)
+        )
 
         config_sha = file_sha256(config_path)
         declared_skill_names_for_set = declared_skills_by_skillset.get(sid, set())
@@ -961,6 +1022,24 @@ def validate_skill_repo_sets(model: dict[str, Any]) -> list[CheckResult]:
                 status="pass",
                 code="skill-repo-config",
                 message="skill repo configs are valid",
+            )
+        )
+
+    if shared_source_failures:
+        results.append(
+            CheckResult(
+                status="fail",
+                code="skill-repo-shared-source",
+                message="client planning skill bundles must use the shared source contract",
+                details={"issues": shared_source_failures},
+            )
+        )
+    else:
+        results.append(
+            CheckResult(
+                status="pass",
+                code="skill-repo-shared-source",
+                message="client planning skill bundles honor the shared source contract",
             )
         )
 
