@@ -28,6 +28,7 @@ skill_repos:
   - path: ../../skills
     pick:
       - cli-ergonomics
+      - audit-plans
       - crap
       - divide-and-conquer
       - domain-planner
