@@ -14,6 +14,8 @@ Discipline the server enforces: assess → scope → dry-run → act → verify.
 from __future__ import annotations
 
 import json
+import os
+import re
 import subprocess
 import sys
 import time
@@ -25,6 +27,92 @@ MANAGE_PY = SCRIPT_DIR / "manage.py"
 SERVER_NAME = "skillbox"
 SERVER_VERSION = "1.0.0"
 PROTOCOL_VERSION = "2024-11-05"
+
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+LOG_LEVELS = (
+    "debug",
+    "info",
+    "notice",
+    "warning",
+    "error",
+    "critical",
+    "alert",
+    "emergency",
+)
+LOG_LEVEL_ORDER = {level: index for index, level in enumerate(LOG_LEVELS)}
+CURRENT_LOG_LEVEL = "warning"
+MCP_EVENT_CONTEXT_ENV = "SKILLBOX_MCP_EVENT_CONTEXT"
+_RUNTIME_MANAGER: Any = None
+
+
+class JsonRpcError(RuntimeError):
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _runtime_manager_search_roots() -> list[Path]:
+    roots = [SCRIPT_DIR]
+    try:
+        manage_text = MANAGE_PY.read_text(encoding="utf-8")
+    except OSError:
+        manage_text = ""
+    match = re.search(r"REAL_MANAGE = ['\"](.+?)['\"]", manage_text)
+    if match:
+        roots.append(Path(match.group(1)).resolve().parent)
+    return roots
+
+
+def _runtime_manager_module() -> Any:
+    global _RUNTIME_MANAGER
+    if _RUNTIME_MANAGER is not None:
+        return _RUNTIME_MANAGER
+
+    last_error: Exception | None = None
+    for root in _runtime_manager_search_roots():
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        try:
+            import runtime_manager as runtime_manager_module
+        except ModuleNotFoundError as exc:
+            last_error = exc
+            continue
+        _RUNTIME_MANAGER = runtime_manager_module
+        return _RUNTIME_MANAGER
+
+    raise ModuleNotFoundError("No module named 'runtime_manager'") from last_error
+
+
+def _normalize_log_level(level: Any) -> str:
+    normalized = str(level or "").strip().lower()
+    if normalized not in LOG_LEVEL_ORDER:
+        supported = ", ".join(LOG_LEVELS)
+        raise JsonRpcError(-32602, f"Invalid log level: {level!r}. Expected one of: {supported}.")
+    return normalized
+
+
+def _should_emit_log(level: str) -> bool:
+    return LOG_LEVEL_ORDER[level] >= LOG_LEVEL_ORDER[CURRENT_LOG_LEVEL]
+
+
+def emit_log_message(level: str, data: Any, *, logger: str = SERVER_NAME) -> None:
+    normalized = _normalize_log_level(level)
+    if not _should_emit_log(normalized):
+        return
+    send(
+        {
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {
+                "level": normalized,
+                "logger": logger,
+                "data": data,
+            },
+        }
+    )
 
 # ---------------------------------------------------------------------------
 # Shared schema fragments
@@ -133,6 +221,41 @@ TOOLS: list[dict] = [
                     "type": "integer",
                     "description": "Lines to return per service (default: 40).",
                     "default": 40,
+                },
+            },
+        },
+    },
+    {
+        "name": "skillbox_events",
+        "description": (
+            "Replay runtime.log lines and durable session events through one cursor-based feed. "
+            "Use this as the orchestrator fallback when you need recent failures, checkpoints, "
+            "or long-poll style watching without relying on live MCP notifications."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "client_id": {
+                    "type": "string",
+                    "description": "Optional client slug to scope the event feed.",
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Optional durable session id to scope the event feed.",
+                },
+                "cursor": {
+                    "type": "string",
+                    "description": "Opaque cursor returned by an earlier skillbox_events call.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum events to return (default: 50).",
+                    "default": 50,
+                },
+                "wait_seconds": {
+                    "type": "number",
+                    "description": "Long-poll duration while waiting for new events (default: 0).",
+                    "default": 0,
                 },
             },
         },
@@ -539,14 +662,62 @@ TOOLS: list[dict] = [
 # manage.py invocation
 # ---------------------------------------------------------------------------
 
-def run_manage(args: list[str]) -> tuple[bool, int, Any]:
+def _compact_log_context(base: dict[str, Any] | None = None, **extra: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for source in (base or {}, extra):
+        for key, value in source.items():
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            if isinstance(value, (list, dict)) and not value:
+                continue
+            payload[str(key)] = value
+    return payload
+
+
+def build_tool_event_context(name: str, command: str, params: dict, request_id: Any) -> dict[str, Any]:
+    context: dict[str, Any] = {
+        "mcp_tool_name": name,
+        "manage_command": command,
+    }
+    if request_id is not None:
+        context["mcp_request_id"] = str(request_id)
+
+    client_id = str(params.get("client_id") or "").strip()
+    session_id = str(params.get("session_id") or "").strip()
+    actor = str(params.get("actor") or "").strip()
+    if client_id:
+        context["client_id"] = client_id
+    if session_id:
+        context["session_id"] = session_id
+    if actor:
+        context["actor"] = actor
+
+    client_scope = [str(item).strip() for item in (params.get("client") or []) if str(item).strip()]
+    if client_scope:
+        if len(client_scope) == 1 and "client_id" not in context:
+            context["client_id"] = client_scope[0]
+        else:
+            context["client_scope"] = client_scope
+
+    for key in ("profile", "service", "task"):
+        values = [str(item).strip() for item in (params.get(key) or []) if str(item).strip()]
+        if values:
+            context[key] = values
+
+    return context
+
+
+def run_manage(args: list[str], *, event_context: dict[str, Any] | None = None) -> tuple[bool, int, Any]:
     """
     Invoke manage.py with given args. Returns (ok, exit_code, parsed_output).
     ok=True for exit 0 (success) or exit 2 (drift — still parseable and useful).
     ok=False for exit 1 (error) or failures.
     """
+    log_context = _compact_log_context(event_context, manage_args=args)
     if not MANAGE_PY.exists():
-        return False, -1, {
+        payload = {
             "error": {
                 "type": "manage_not_found",
                 "message": (
@@ -558,6 +729,8 @@ def run_manage(args: list[str]) -> tuple[bool, int, Any]:
                 "recovery_hint": "Run 'make up && make shell' to enter the workspace container.",
             }
         }
+        emit_log_message("error", _compact_log_context(log_context, error=payload["error"]), logger="skillbox.manage")
+        return False, -1, payload
 
     # Scale timeout with --wait-seconds when present.  Services are started
     # sequentially so total time can be wait_seconds * service_count.  Use a
@@ -573,10 +746,24 @@ def run_manage(args: list[str]) -> tuple[bool, int, Any]:
             break
 
     cmd = [sys.executable, str(MANAGE_PY)] + args
+    proc_env = None
+    if event_context:
+        proc_env = os.environ.copy()
+        proc_env[MCP_EVENT_CONTEXT_ENV] = json.dumps(
+            event_context,
+            separators=(",", ":"),
+            default=str,
+        )
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=subprocess_timeout)
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=subprocess_timeout,
+            env=proc_env,
+        )
     except subprocess.TimeoutExpired:
-        return False, -1, {
+        payload = {
             "error": {
                 "type": "timeout",
                 "message": f"manage.py timed out after {subprocess_timeout:.0f} seconds.",
@@ -585,18 +772,54 @@ def run_manage(args: list[str]) -> tuple[bool, int, Any]:
                 "next_actions": ["skillbox_logs"],
             }
         }
+        emit_log_message(
+            "error",
+            _compact_log_context(log_context, error=payload["error"]),
+            logger="skillbox.manage",
+        )
+        return False, -1, payload
 
     if proc.stderr.strip():
+        stderr_text = proc.stderr.strip()
+        emit_log_message(
+            "warning" if proc.returncode in (0, 2) else "error",
+            _compact_log_context(log_context, exit_code=proc.returncode, stderr=stderr_text),
+            logger="skillbox.manage.stderr",
+        )
         print(f"[skillbox-mcp] stderr: {proc.stderr.strip()}", file=sys.stderr, flush=True)
 
     stdout = proc.stdout.strip()
     if stdout:
         try:
-            return proc.returncode in (0, 2), proc.returncode, json.loads(stdout)
+            data = json.loads(stdout)
+            ok = proc.returncode in (0, 2)
+            if not ok:
+                emit_log_message(
+                    "error",
+                    _compact_log_context(log_context, exit_code=proc.returncode, result=data),
+                    logger="skillbox.manage",
+                )
+            return ok, proc.returncode, data
         except json.JSONDecodeError:
-            return proc.returncode == 0, proc.returncode, {"text": stdout}
+            data = {"text": stdout}
+            ok = proc.returncode == 0
+            if not ok:
+                emit_log_message(
+                    "error",
+                    _compact_log_context(log_context, exit_code=proc.returncode, result=data),
+                    logger="skillbox.manage",
+                )
+            return ok, proc.returncode, data
 
-    return proc.returncode == 0, proc.returncode, {"exit_code": proc.returncode}
+    ok = proc.returncode == 0
+    data = {"exit_code": proc.returncode}
+    if not ok:
+        emit_log_message(
+            "error",
+            _compact_log_context(log_context, exit_code=proc.returncode),
+            logger="skillbox.manage",
+        )
+    return ok, proc.returncode, data
 
 
 def build_args(command: str, params: dict, positional: str | None = None) -> list[str]:
@@ -691,25 +914,56 @@ _DISPATCH: dict[str, tuple[str, str | None]] = {
 
 def _handle_pulse(_params: dict) -> dict:
     """Read pulse daemon state directly (no manage.py subprocess)."""
-    if str(SCRIPT_DIR) not in sys.path:
-        sys.path.insert(0, str(SCRIPT_DIR))
     from pulse import read_state
 
     state = read_state(SCRIPT_DIR.parent)
     return _ok_content(state)
 
 
-def dispatch_tool(name: str, params: dict) -> dict:
+def _handle_events(params: dict) -> dict:
+    runtime_manager = _runtime_manager_module()
+    try:
+        limit = int(params.get("limit") or runtime_manager.DEFAULT_EVENT_FEED_LIMIT)
+        wait_seconds = float(params.get("wait_seconds") or 0.0)
+    except (TypeError, ValueError) as exc:
+        return _error_content(
+            {
+                "error": {
+                    "type": "invalid_parameter",
+                    "message": f"Invalid skillbox_events parameter: {exc}",
+                    "recoverable": True,
+                }
+            }
+        )
+
+    payload = runtime_manager.event_feed_payload(
+        runtime_manager.DEFAULT_ROOT_DIR,
+        client_id=str(params.get("client_id") or "").strip() or None,
+        session_id=str(params.get("session_id") or "").strip() or None,
+        cursor=str(params.get("cursor") or "").strip() or None,
+        limit=limit,
+        wait_seconds=wait_seconds,
+    )
+    return _ok_content(payload)
+
+
+_DIRECT_HANDLERS: dict[str, Any] = {
+    "skillbox_events": _handle_events,
+    "skillbox_pulse": _handle_pulse,
+}
+
+
+def dispatch_tool(name: str, params: dict, *, request_id: Any = None) -> dict:
     """Dispatch a tool call to manage.py and return a MCP content block."""
-    if name == "skillbox_pulse":
-        return _handle_pulse(params)
+    if name in _DIRECT_HANDLERS:
+        return _DIRECT_HANDLERS[name](params)
 
     if name not in _DISPATCH:
         return _error_content({
             "error": {
                 "type": "unknown_tool",
                 "message": f"Unknown tool: '{name}'.",
-                "available_tools": sorted(list(_DISPATCH.keys()) + ["skillbox_pulse"]),
+                "available_tools": sorted(list(_DISPATCH.keys()) + list(_DIRECT_HANDLERS.keys())),
                 "recoverable": False,
             }
         })
@@ -728,7 +982,8 @@ def dispatch_tool(name: str, params: dict) -> dict:
         })
 
     args = build_args(command, params, positional)
-    ok, exit_code, data = run_manage(args)
+    event_context = build_tool_event_context(name, command, params, request_id)
+    ok, exit_code, data = run_manage(args, event_context=event_context)
 
     # Annotate exit code so agents know what happened without parsing error fields.
     if isinstance(data, dict):
@@ -749,10 +1004,13 @@ def _error_content(data: Any) -> dict:
 # MCP protocol handlers
 # ---------------------------------------------------------------------------
 
-def handle_initialize(_params: dict) -> dict:
+def handle_initialize(_params: dict, _request_id: Any = None) -> dict:
     return {
         "protocolVersion": PROTOCOL_VERSION,
-        "capabilities": {"tools": {"listChanged": False}},
+        "capabilities": {
+            "logging": {},
+            "tools": {"listChanged": False},
+        },
         "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
         "instructions": (
             "skillbox runtime manager. "
@@ -761,17 +1019,24 @@ def handle_initialize(_params: dict) -> dict:
             "2. Pass dry_run=true first for sync/up/down/restart/bootstrap/onboard. "
             "3. Scope with client= and service= — avoid unintended side effects. "
             "4. Run skillbox_doctor after every mutation to confirm success. "
-            "5. Run skillbox_logs before escalating a service error."
+            "5. Run skillbox_logs before escalating a service error. "
+            "6. Use skillbox_events to replay runtime/session failures when a previous call already exited."
         ),
     }
 
 
-def handle_tools_list() -> dict:
+def handle_tools_list(_params: dict | None = None, _request_id: Any = None) -> dict:
     return {"tools": TOOLS}
 
 
-def handle_tools_call(params: dict) -> dict:
-    return dispatch_tool(params.get("name", ""), params.get("arguments") or {})
+def handle_tools_call(params: dict, request_id: Any = None) -> dict:
+    return dispatch_tool(params.get("name", ""), params.get("arguments") or {}, request_id=request_id)
+
+
+def handle_logging_set_level(params: dict, _request_id: Any = None) -> dict:
+    global CURRENT_LOG_LEVEL
+    CURRENT_LOG_LEVEL = _normalize_log_level((params or {}).get("level"))
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -779,10 +1044,16 @@ def handle_tools_call(params: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 _HANDLERS: dict[str, Any] = {
-    "initialize":  lambda p: handle_initialize(p),
-    "tools/list":  lambda _p: handle_tools_list(),
-    "tools/call":  lambda p: handle_tools_call(p),
-    "ping":        lambda _p: {},
+    "initialize":  handle_initialize,
+    "logging/setLevel": handle_logging_set_level,
+    "tools/list":  handle_tools_list,
+    "tools/call":  handle_tools_call,
+    "ping":        lambda _p, _request_id=None: {},
+}
+
+_NOTIFICATION_HANDLERS: dict[str, Any] = {
+    "notifications/cancelled": lambda _p: None,
+    "notifications/initialized": lambda _p: None,
 }
 
 
@@ -815,6 +1086,12 @@ def main() -> None:
 
         # Notifications (no id) require no response.
         if msg_id is None:
+            handler = _NOTIFICATION_HANDLERS.get(method)
+            if handler is not None:
+                try:
+                    handler(params)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[skillbox-mcp] notification error in {method}: {exc}", file=sys.stderr, flush=True)
             continue
 
         handler = _HANDLERS.get(method)
@@ -823,7 +1100,10 @@ def main() -> None:
             continue
 
         try:
-            result = handler(params)
+            result = handler(params, msg_id)
+        except JsonRpcError as exc:
+            send_error(msg_id, exc.code, exc.message)
+            continue
         except Exception as exc:  # noqa: BLE001
             print(f"[skillbox-mcp] unhandled error in {method}: {exc}", file=sys.stderr, flush=True)
             send_error(msg_id, -32603, f"Internal error: {exc}")

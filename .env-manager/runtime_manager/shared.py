@@ -622,6 +622,28 @@ def human_bytes(num_bytes: int) -> str:
 # ---------------------------------------------------------------------------
 
 RUNTIME_LOG_REL = Path("logs") / "runtime" / "runtime.log"
+MCP_EVENT_CONTEXT_ENV = "SKILLBOX_MCP_EVENT_CONTEXT"
+DEFAULT_EVENT_FEED_LIMIT = 50
+DEFAULT_EVENT_FEED_POLL_INTERVAL_SECONDS = 0.25
+
+
+def current_mcp_event_context() -> dict[str, Any]:
+    raw = str(os.environ.get(MCP_EVENT_CONTEXT_ENV) or "").strip()
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def merge_runtime_event_detail(detail: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    merged = dict(detail or {})
+    context = current_mcp_event_context()
+    for key, value in context.items():
+        merged.setdefault(str(key), value)
+    return merged or None
 
 
 def log_runtime_event(
@@ -634,6 +656,7 @@ def log_runtime_event(
     log_path = root_dir / RUNTIME_LOG_REL
     log_path.parent.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    detail = merge_runtime_event_detail(detail)
     detail_str = f" {json.dumps(detail, separators=(',', ':'), default=str)}" if detail else ""
     try:
         with log_path.open("a", encoding="utf-8") as fh:
@@ -858,6 +881,7 @@ def _persist_session_event(
     client_id = str(meta["client_id"])
     session_id = str(meta["session_id"])
     paths = session_paths(root_dir, client_id, session_id)
+    detail = merge_runtime_event_detail(detail)
     payload = {
         "ts": now,
         "type": normalized_type,
@@ -877,7 +901,9 @@ def _persist_session_event(
         meta["last_message"] = message
     write_json_file(paths["meta_path"], meta)
 
-    journal_detail = {"client_id": client_id, "session_id": session_id} | (detail or {})
+    journal_detail = {"client_id": client_id, "session_id": session_id}
+    if detail:
+        journal_detail.update(detail)
     log_runtime_event(normalized_type, _session_subject(client_id, session_id), journal_detail, root_dir)
     return payload
 
@@ -1087,6 +1113,232 @@ def session_status_payload(
         "count": len(sessions),
         "next_actions": next_actions_for_session_status(cid, None),
     }
+
+
+def _runtime_log_timestamp(raw_ts: str) -> float:
+    dt = datetime.datetime.strptime(raw_ts, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+    return dt.timestamp()
+
+
+def parse_runtime_log_line(line: str, *, line_number: int) -> dict[str, Any] | None:
+    text = str(line or "").strip()
+    if not text:
+        return None
+    parts = text.split(" ", 3)
+    if len(parts) < 3:
+        return None
+    raw_ts, event_type, subject = parts[:3]
+    try:
+        ts = _runtime_log_timestamp(raw_ts)
+    except ValueError:
+        return None
+
+    detail: dict[str, Any] = {}
+    if len(parts) == 4 and parts[3].strip():
+        try:
+            parsed = json.loads(parts[3])
+            if isinstance(parsed, dict):
+                detail = parsed
+        except json.JSONDecodeError:
+            detail = {"raw_detail": parts[3]}
+
+    client_id = str(detail.get("client_id") or "").strip()
+    session_id = str(detail.get("session_id") or "").strip()
+    message = str(detail.get("message") or "").strip()
+    return {
+        "source": "runtime_log",
+        "line_number": line_number,
+        "ts": ts,
+        "time": raw_ts + "Z",
+        "type": event_type,
+        "subject": subject,
+        "client_id": client_id or None,
+        "session_id": session_id or None,
+        "message": message or None,
+        "detail": detail,
+    }
+
+
+def _event_matches_scope(
+    event: dict[str, Any],
+    *,
+    client_id: str | None,
+    session_id: str | None,
+) -> bool:
+    target_client = str(client_id or "").strip()
+    target_session = str(session_id or "").strip()
+    event_client = str(event.get("client_id") or "").strip()
+    event_session = str(event.get("session_id") or "").strip()
+    subject = str(event.get("subject") or "").strip()
+
+    if target_session:
+        return (
+            event_session == target_session
+            or subject.endswith(f":{target_session}")
+        )
+    if target_client:
+        return (
+            event_client == target_client
+            or subject == target_client
+            or subject.startswith(f"{target_client}:")
+        )
+    return True
+
+
+def read_runtime_log_events(
+    root_dir: Path,
+    *,
+    client_id: str | None = None,
+    session_id: str | None = None,
+) -> list[dict[str, Any]]:
+    log_path = root_dir / RUNTIME_LOG_REL
+    if not log_path.is_file():
+        return []
+    events: list[dict[str, Any]] = []
+    for line_number, raw_line in enumerate(log_path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+        parsed = parse_runtime_log_line(raw_line, line_number=line_number)
+        if parsed is None:
+            continue
+        if _event_matches_scope(parsed, client_id=client_id, session_id=session_id):
+            events.append(parsed)
+    return events
+
+
+def _session_event_roots(root_dir: Path, client_id: str | None = None) -> list[Path]:
+    normalized_client = str(client_id or "").strip()
+    if normalized_client:
+        try:
+            return [resolve_client_session_root(root_dir, normalized_client)]
+        except RuntimeError:
+            return []
+
+    roots: list[Path] = []
+    for base in (
+        root_dir / ".skillbox-state" / "logs" / "clients",
+        root_dir / "logs" / "clients",
+    ):
+        if not base.is_dir():
+            continue
+        for child in base.iterdir():
+            if child.is_dir():
+                roots.append(child / "sessions")
+    return roots
+
+
+def read_durable_session_events(
+    root_dir: Path,
+    *,
+    client_id: str | None = None,
+    session_id: str | None = None,
+) -> list[dict[str, Any]]:
+    target_session = str(session_id or "").strip()
+    events: list[dict[str, Any]] = []
+    for sessions_root in _session_event_roots(root_dir, client_id=client_id):
+        if not sessions_root.is_dir():
+            continue
+        pattern = f"{target_session}/events.jsonl" if target_session else "*/events.jsonl"
+        for events_path in sessions_root.glob(pattern):
+            meta_path = events_path.parent / "meta.json"
+            meta: dict[str, Any] = {}
+            if meta_path.is_file():
+                try:
+                    meta = load_json_file(meta_path)
+                except RuntimeError:
+                    meta = {}
+            fallback_client = str(meta.get("client_id") or events_path.parent.parent.parent.name).strip()
+            fallback_session = str(meta.get("session_id") or events_path.parent.name).strip()
+            for line_number, raw_line in enumerate(
+                events_path.read_text(encoding="utf-8", errors="replace").splitlines(),
+                start=1,
+            ):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                detail = item.get("detail")
+                if not isinstance(detail, dict):
+                    detail = {}
+                event = {
+                    "source": "session",
+                    "line_number": line_number,
+                    "ts": float(item.get("ts") or 0.0),
+                    "time": datetime.datetime.fromtimestamp(
+                        float(item.get("ts") or 0.0),
+                        tz=datetime.timezone.utc,
+                    ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "type": str(item.get("type") or "").strip(),
+                    "subject": f"{fallback_client}:{fallback_session}",
+                    "client_id": str(item.get("client_id") or fallback_client).strip() or None,
+                    "session_id": str(item.get("session_id") or fallback_session).strip() or None,
+                    "message": str(detail.get("message") or "").strip() or None,
+                    "detail": detail,
+                    "paths": {
+                        "events": repo_rel(root_dir, events_path),
+                        "meta": repo_rel(root_dir, meta_path),
+                    },
+                }
+                if _event_matches_scope(event, client_id=client_id, session_id=session_id):
+                    events.append(event)
+    return events
+
+
+def event_feed_payload(
+    root_dir: Path,
+    *,
+    client_id: str | None = None,
+    session_id: str | None = None,
+    cursor: str | None = None,
+    limit: int = DEFAULT_EVENT_FEED_LIMIT,
+    wait_seconds: float = 0.0,
+) -> dict[str, Any]:
+    normalized_client = str(client_id or "").strip() or None
+    normalized_session = str(session_id or "").strip() or None
+    try:
+        cursor_index = max(0, int(str(cursor or "0")))
+    except ValueError:
+        cursor_index = 0
+    max_items = max(1, int(limit or DEFAULT_EVENT_FEED_LIMIT))
+    deadline = time.monotonic() + max(0.0, float(wait_seconds))
+
+    while True:
+        events = read_runtime_log_events(
+            root_dir,
+            client_id=normalized_client,
+            session_id=normalized_session,
+        ) + read_durable_session_events(
+            root_dir,
+            client_id=normalized_client,
+            session_id=normalized_session,
+        )
+        events.sort(
+            key=lambda item: (
+                float(item.get("ts") or 0.0),
+                str(item.get("source") or ""),
+                int(item.get("line_number") or 0),
+                str(item.get("subject") or ""),
+            )
+        )
+        total = len(events)
+        safe_cursor = min(cursor_index, total)
+        if total > safe_cursor or time.monotonic() >= deadline or wait_seconds <= 0:
+            window = events[safe_cursor:safe_cursor + max_items]
+            next_cursor = safe_cursor + len(window)
+            return {
+                "client_id": normalized_client,
+                "session_id": normalized_session,
+                "cursor": str(safe_cursor),
+                "next_cursor": str(next_cursor),
+                "returned": len(window),
+                "total_events": total,
+                "has_more": total > next_cursor,
+                "events": window,
+            }
+        time.sleep(DEFAULT_EVENT_FEED_POLL_INTERVAL_SECONDS)
 
 
 def resolve_root_dir(raw_root: str | None) -> Path:

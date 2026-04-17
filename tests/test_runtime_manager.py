@@ -5058,6 +5058,52 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(started_event["type"], "session.started")
             self.assertEqual(started_event["detail"]["actor"], "coach")
 
+    def test_session_start_merges_mcp_event_context_into_durable_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            env = os.environ.copy()
+            env["SKILLBOX_MCP_EVENT_CONTEXT"] = json.dumps(
+                {
+                    "mcp_request_id": "req-42",
+                    "mcp_tool_name": "skillbox_session_start",
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(MANAGER),
+                    "--root-dir",
+                    str(repo),
+                    "session-start",
+                    "personal",
+                    "--actor",
+                    "coach",
+                    "--format",
+                    "json",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            session_id = payload["session"]["session_id"]
+            session_dir = repo / ".skillbox-state" / "logs" / "clients" / "personal" / "sessions" / session_id
+
+            started_event = json.loads(
+                (session_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()[0]
+            )
+            self.assertEqual(started_event["detail"]["mcp_request_id"], "req-42")
+            self.assertEqual(started_event["detail"]["mcp_tool_name"], "skillbox_session_start")
+
+            runtime_log = (repo / "logs" / "runtime" / "runtime.log").read_text(encoding="utf-8")
+            self.assertIn('"mcp_request_id":"req-42"', runtime_log)
+            self.assertIn('"mcp_tool_name":"skillbox_session_start"', runtime_log)
+
     def test_session_event_appends_and_updates_heartbeat_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
