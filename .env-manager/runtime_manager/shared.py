@@ -1839,22 +1839,72 @@ def client_scaffold_pack_required_skills(pack_name: str | None) -> list[str]:
     return copy.deepcopy(HARDENED_CLIENT_HYBRID_SKILLS)
 
 
-def client_scaffold_pack_skill_templates(pack_name: str | None) -> list[tuple[str, Path]]:
+def client_scaffold_pack_skill_templates(pack_name: str | None) -> list[tuple[str, Path, str]]:
     pack = client_scaffold_pack(pack_name)
-    template_pairs: list[tuple[str, Path]] = []
+    template_pairs: list[tuple[str, Path, str]] = []
     if pack in {"planning", "hybrid"}:
         planning_root = client_planning_skill_template_root()
         template_pairs.extend(
-            (skill_name, planning_root / skill_name)
+            (skill_name, planning_root / skill_name, "shared")
             for skill_name in HARDENED_CLIENT_PLANNING_SKILLS
         )
     if pack in {"skill-builder", "hybrid"}:
         skill_builder_root = client_skill_builder_template_root()
         template_pairs.extend(
-            (skill_name, skill_builder_root / skill_name)
+            (skill_name, skill_builder_root / skill_name, "local")
             for skill_name in HARDENED_CLIENT_SKILL_BUILDER_SKILLS
         )
     return template_pairs
+
+
+def client_scaffold_shared_skills_dir(overlay_dir: Path) -> Path:
+    return overlay_dir.parent / "_shared" / "skills"
+
+
+def client_scaffold_local_skills_dir(overlay_dir: Path) -> Path:
+    return overlay_dir / "skills"
+
+
+def client_scaffold_skill_repo_entries(pack_name: str | None) -> list[dict[str, Any]]:
+    pack = client_scaffold_pack(pack_name)
+    entries: list[dict[str, Any]] = []
+    if pack in {"planning", "hybrid"}:
+        entries.append(
+            {
+                "path": "../_shared/skills",
+                "pick": copy.deepcopy(HARDENED_CLIENT_PLANNING_SKILLS),
+            }
+        )
+    if pack in {"skill-builder", "hybrid"}:
+        entries.append(
+            {
+                "path": "./skills",
+                "pick": copy.deepcopy(HARDENED_CLIENT_SKILL_BUILDER_SKILLS),
+            }
+        )
+    return entries
+
+
+def render_client_scaffold_skill_repos(client_label: str, pack_name: str | None) -> str:
+    lines = [
+        f"# {client_label} client-specific skill repos.",
+        "",
+        "version: 2",
+        "",
+        "skill_repos:",
+    ]
+    for entry in client_scaffold_skill_repo_entries(pack_name):
+        lines.append(f"  - path: {entry['path']}")
+        pick_line = ", ".join(str(item) for item in entry.get("pick") or [])
+        lines.append(f"    pick: [{pick_line}]")
+    return "\n".join(lines) + "\n"
+
+
+def client_scaffold_keep_files(overlay_dir: Path, pack_name: str | None) -> dict[Path, str]:
+    keep_files: dict[Path, str] = {client_scaffold_local_skills_dir(overlay_dir) / ".gitkeep": ""}
+    if client_scaffold_pack(pack_name) in {"planning", "hybrid"}:
+        keep_files[client_scaffold_shared_skills_dir(overlay_dir) / ".gitkeep"] = ""
+    return keep_files
 
 
 def client_scaffold_seed_files(
@@ -1903,12 +1953,17 @@ def ensure_client_scaffold_skill_sources(
     dry_run: bool,
 ) -> list[str]:
     actions: list[str] = []
-    skills_root = overlay_dir / "skills"
-    ensure_directory(skills_root, dry_run=dry_run)
-    for skill_name, source_dir in client_scaffold_pack_skill_templates(scaffold_pack):
+    ensure_directory(client_scaffold_local_skills_dir(overlay_dir), dry_run=dry_run)
+    if client_scaffold_pack(scaffold_pack) in {"planning", "hybrid"}:
+        ensure_directory(client_scaffold_shared_skills_dir(overlay_dir), dry_run=dry_run)
+    for skill_name, source_dir, placement in client_scaffold_pack_skill_templates(scaffold_pack):
         if not source_dir.is_dir():
             raise RuntimeError(f"Missing scaffold skill template for {skill_name} at {source_dir}")
-        target_dir = skills_root / skill_name
+        if placement == "shared":
+            target_root = client_scaffold_shared_skills_dir(overlay_dir)
+        else:
+            target_root = client_scaffold_local_skills_dir(overlay_dir)
+        target_dir = target_root / skill_name
         if target_dir.exists():
             continue
         if not dry_run:
@@ -1927,11 +1982,9 @@ def default_client_scaffold_files(
 ) -> tuple[dict[Path, str], str]:
     scaffold_pack = "planning"
     overlay_dir = client_config_host_dir(root_dir, env_values, client_id)
-    skills_dir = overlay_dir / "skills"
 
     overlay_path = overlay_dir / "overlay.yaml"
     skill_repos_path = overlay_dir / "skill-repos.yaml"
-    skills_keep_path = skills_dir / ".gitkeep"
     overlay_client = base_client_overlay(
         client_id=client_id,
         client_label=client_label,
@@ -1940,21 +1993,11 @@ def default_client_scaffold_files(
         scaffold_pack=scaffold_pack,
     )
 
-    required_skills = client_scaffold_pack_required_skills(scaffold_pack)
-    pick_line = ", ".join(required_skills)
     target_files = {
         overlay_path: render_yaml_document({"version": 1, "client": overlay_client}),
-        skill_repos_path: (
-            f"# {client_label} client-specific skill repos.\n"
-            "\n"
-            "version: 2\n"
-            "\n"
-            "skill_repos:\n"
-            "  - path: ./skills\n"
-            f"    pick: [{pick_line}]\n"
-        ),
-        skills_keep_path: "",
+        skill_repos_path: render_client_scaffold_skill_repos(client_label, scaffold_pack),
     }
+    target_files.update(client_scaffold_keep_files(overlay_dir, scaffold_pack))
     target_files.update(client_scaffold_seed_files(overlay_dir, client_label, scaffold_pack))
     return target_files, scaffold_pack
 
@@ -2077,27 +2120,14 @@ def build_blueprinted_client_scaffold_files(
     )
 
     overlay_dir = client_config_host_dir(root_dir, env_values, client_id)
-    skills_dir = overlay_dir / "skills"
 
     overlay_path = overlay_dir / "overlay.yaml"
     skill_repos_path = overlay_dir / "skill-repos.yaml"
-    skills_keep_path = skills_dir / ".gitkeep"
-
-    required_skills = client_scaffold_pack_required_skills(scaffold_pack)
-    pick_line = ", ".join(required_skills)
     target_files = {
         overlay_path: render_yaml_document({"version": 1, "client": overlay_client}),
-        skill_repos_path: (
-            f"# {str(overlay_client['label'])} client-specific skill repos.\n"
-            "\n"
-            "version: 2\n"
-            "\n"
-            "skill_repos:\n"
-            "  - path: ./skills\n"
-            f"    pick: [{pick_line}]\n"
-        ),
-        skills_keep_path: "",
+        skill_repos_path: render_client_scaffold_skill_repos(str(overlay_client["label"]), scaffold_pack),
     }
+    target_files.update(client_scaffold_keep_files(overlay_dir, scaffold_pack))
     target_files.update(
         client_scaffold_seed_files(
             overlay_dir,
@@ -2160,10 +2190,15 @@ def scaffold_client_overlay(
             client_default_cwd=client_default_cwd,
         )
 
+    overlay_dir = client_config_host_dir(root_dir, env_values, client_id).resolve()
     existing_paths = sorted(
         repo_rel(root_dir, path)
         for path in target_files
         if path.exists()
+        and (
+            path.resolve() == overlay_dir
+            or overlay_dir in path.resolve().parents
+        )
     )
     if existing_paths and not force:
         raise RuntimeError(
@@ -3426,28 +3461,19 @@ def normalize_client_overlay_shape(root_dir: Path, overlay_dir: Path) -> list[st
         overlay_path.write_text(rendered_overlay, encoding="utf-8")
         actions.append(f"normalize-overlay: {repo_rel(root_dir, overlay_path)}")
 
-    required_skills = client_scaffold_pack_required_skills(scaffold_pack)
-    pick_line = ", ".join(required_skills)
     skill_repos_path = overlay_dir / "skill-repos.yaml"
-    skill_repos_text = (
-        f"# {client_label} client-specific skill repos.\n"
-        "\n"
-        "version: 2\n"
-        "\n"
-        "skill_repos:\n"
-        "  - path: ./skills\n"
-        f"    pick: [{pick_line}]\n"
-    )
+    skill_repos_text = render_client_scaffold_skill_repos(client_label, scaffold_pack)
     if not skill_repos_path.is_file() or skill_repos_path.read_text(encoding="utf-8") != skill_repos_text:
         ensure_directory(skill_repos_path.parent, dry_run=False)
         skill_repos_path.write_text(skill_repos_text, encoding="utf-8")
         actions.append(f"write-file: {repo_rel(root_dir, skill_repos_path)}")
 
-    skills_keep_path = overlay_dir / "skills" / ".gitkeep"
-    ensure_directory(skills_keep_path.parent, dry_run=False)
-    if not skills_keep_path.exists():
-        skills_keep_path.write_text("", encoding="utf-8")
-        actions.append(f"write-file: {repo_rel(root_dir, skills_keep_path)}")
+    for keep_path, keep_content in client_scaffold_keep_files(overlay_dir, scaffold_pack).items():
+        ensure_directory(keep_path.parent, dry_run=False)
+        if keep_path.exists():
+            continue
+        keep_path.write_text(keep_content, encoding="utf-8")
+        actions.append(f"write-file: {repo_rel(root_dir, keep_path)}")
 
     actions.extend(
         ensure_client_scaffold_skill_sources(
@@ -3510,8 +3536,15 @@ def init_private_repo(root_dir: Path, *, target_dir_arg: str | None = None) -> d
             subdir_name="skills",
         )
     )
+    shared_skills_root = current_clients_root / "_shared"
+    target_shared_skills_root = target_clients_root / "_shared"
+    if shared_skills_root.is_dir() and not target_shared_skills_root.exists():
+        shutil.copytree(shared_skills_root, target_shared_skills_root)
+        actions.append(f"copy-client-shared: {repo_rel(root_dir, target_shared_skills_root)}")
     for child in sorted(target_clients_root.iterdir()):
         if not child.is_dir():
+            continue
+        if child.name.startswith("_"):
             continue
         actions.extend(normalize_client_overlay_shape(root_dir, child))
 

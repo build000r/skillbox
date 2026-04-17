@@ -912,6 +912,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertTrue((repo / ".skillbox-state" / "clients" / "acme-studio" / "overlay.yaml").is_file())
             self.assertTrue((repo / ".skillbox-state" / "clients" / "acme-studio" / "skill-repos.yaml").is_file())
             self.assertTrue((repo / ".skillbox-state" / "clients" / "acme-studio" / "skills" / ".gitkeep").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "clients" / "_shared" / "skills" / ".gitkeep").is_file())
             self.assertTrue((repo / ".skillbox-state" / "clients" / "acme-studio" / "plans" / "INDEX.md").is_file())
             self.assertTrue((repo / ".skillbox-state" / "clients" / "acme-studio" / "plans" / "draft" / ".gitkeep").is_file())
             self.assertTrue((repo / ".skillbox-state" / "clients" / "acme-studio" / "plans" / "released" / ".gitkeep").is_file())
@@ -929,8 +930,12 @@ class RuntimeManagerTests(unittest.TestCase):
             )
 
             skill_repos_content = (repo / ".skillbox-state" / "clients" / "acme-studio" / "skill-repos.yaml").read_text(encoding="utf-8")
+            self.assertIn("../_shared/skills", skill_repos_content)
             for skill_name in MANAGE_MODULE.HARDENED_CLIENT_PLANNING_SKILLS:
                 self.assertIn(skill_name, skill_repos_content)
+                self.assertTrue(
+                    (repo / ".skillbox-state" / "clients" / "_shared" / "skills" / skill_name / "SKILL.md").is_file()
+                )
 
             overlay_doc = MANAGE_MODULE.load_yaml(
                 repo / ".skillbox-state" / "clients" / "acme-studio" / "overlay.yaml",
@@ -2101,8 +2106,12 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertTrue((private_client / "plans" / "INDEX.md").is_file())
             self.assertTrue((private_client / "plans" / "draft" / ".gitkeep").is_file())
             skill_repos_content = (private_client / "skill-repos.yaml").read_text(encoding="utf-8")
+            self.assertIn("../_shared/skills", skill_repos_content)
             for skill_name in MANAGE_MODULE.HARDENED_CLIENT_PLANNING_SKILLS:
                 self.assertIn(skill_name, skill_repos_content)
+                self.assertTrue(
+                    (private_client.parent / "_shared" / "skills" / skill_name / "SKILL.md").is_file()
+                )
 
     def test_private_init_preserves_skill_builder_scaffold_pack_and_notes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2225,7 +2234,8 @@ class RuntimeManagerTests(unittest.TestCase):
                 (private_client / "workflows" / "INDEX.md").read_text(encoding="utf-8"),
                 "# Custom workflow index\n",
             )
-            self.assertTrue((private_client / "skills" / "domain-planner" / "SKILL.md").is_file())
+            self.assertIn("../_shared/skills", skill_repos_content)
+            self.assertTrue((private_client.parent / "_shared" / "skills" / "domain-planner" / "SKILL.md").is_file())
             self.assertTrue((private_client / "skills" / "skill-issue" / "SKILL.md").is_file())
 
     def test_client_publish_and_diff_use_attached_private_repo_by_default(self) -> None:
