@@ -1535,7 +1535,10 @@ Run `/commit`, push, then re-run with `dry_run: true` first.
 ## Limitations
 
 - This is not a hosted control plane or a multi-user workspace platform.
-- There is no release installer, package manager distribution, or cloud provisioning flow yet beyond the operator MCP tools.
+- Skill distribution is client-side only today: signed distributor sync is
+  implemented, but the distributor publisher service, standalone laptop CLI,
+  background update checks, and short-lived token exchange are still future
+  work.
 - The API and web surfaces are inspection stubs, not a full UI.
 - The internal runtime manager now does dependency-aware task and service orchestration plus managed env hydration, but it still does not try to replace app-specific deployment systems or CI.
 - Secrets management and app-specific bootstrap details beyond what you declare in your overlays and blueprints are still your responsibility.
