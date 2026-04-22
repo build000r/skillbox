@@ -120,11 +120,19 @@ PATH_LIKE_ENV_KEYS = {
 }
 HARDENED_SHARED_DEFAULT_SKILLS = [
     "ask-cascade",
+    "audit-plans",
     "build-vs-clone",
+    "changelog-md-workmanship",
+    "cli-ergonomics",
     "describe",
     "reproduce",
     "commit",
+    "crap",
     "dev-sanity",
+    "mutate",
+    "oss-doc-audit",
+    "readme-writing",
+    "skill-issue",
     "skillbox-operator",
 ]
 HARDENED_CLIENT_PLANNING_SKILLS = [
@@ -2402,6 +2410,8 @@ def write_json_file(path: Path, payload: dict[str, Any]) -> bool:
 
 def load_skill_repos_config(config_path: Path) -> dict[str, Any]:
     """Load and validate a skill_repos YAML config file."""
+    from runtime_manager.shared_distribution import ConfigError, validate_distribution_config
+
     if not config_path.is_file():
         raise RuntimeError(f"SKILL_CONFIG_INVALID: config file missing at {config_path}")
     raw = load_yaml(config_path)
@@ -2421,6 +2431,8 @@ def load_skill_repos_config(config_path: Path) -> dict[str, Any]:
     for i, entry in enumerate(entries):
         if not isinstance(entry, dict):
             raise RuntimeError(f"SKILL_CONFIG_INVALID: skill_repos[{i}] must be a mapping")
+        if entry.get("distributor"):
+            continue
         has_repo = bool(entry.get("repo"))
         has_path = bool(entry.get("path"))
         if has_repo == has_path:
@@ -2432,6 +2444,11 @@ def load_skill_repos_config(config_path: Path) -> dict[str, Any]:
         pick = entry.get("pick")
         if pick is not None and not isinstance(pick, list):
             raise RuntimeError(f"SKILL_CONFIG_INVALID: skill_repos[{i}] pick must be a list")
+
+    try:
+        validate_distribution_config(raw, config_path)
+    except ConfigError as exc:
+        raise RuntimeError(f"SKILL_CONFIG_INVALID: {exc}") from exc
 
     return raw
 
@@ -2623,6 +2640,8 @@ def sync_skill_repo_sets(model: dict[str, Any], dry_run: bool) -> list[str]:
         lock_skills: list[dict[str, Any]] = []
 
         for entry in entries:
+            if entry.get("distributor"):
+                continue
             has_repo = bool(entry.get("repo"))
 
             if has_repo:

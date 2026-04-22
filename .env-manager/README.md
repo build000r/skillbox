@@ -31,8 +31,11 @@ python3 .env-manager/manage.py status --profile swimmers
 
 `sync` reconciles repos, env files, and managed artifacts against their
 declared pins or source files, creates artifact/log directories, and installs
-skills from declared `skill-repos.yaml` configs (clone/fetch repos, filtered
-copy into install targets), writing lockfiles for each selected skill set.
+skills from declared `skill-repos.yaml` configs. Repo and path sources are
+clone/fetch or local filtered-copy inputs. Distributor sources fetch a signed
+per-client manifest, verify signed `.skillbundle.tar.gz` bundles, filtered-copy
+the selected skills into install targets, and write distributor metadata into
+the generated lockfile for each selected skill set.
 
 `up`, `down`, `restart`, and `logs` are the first lifecycle commands for
 declared services. `up` runs `sync` first, then starts manageable services and
@@ -70,6 +73,9 @@ The mental model is:
 - `client-publish <client> --target-dir <repo>` promotes the reviewed bundle
   into `clients/<client>/current/` plus `publish.json`, and `--acceptance`
   also persists compact readiness evidence into `clients/<client>/acceptance.json`
+- `skill-repos.yaml` may combine repo, path, and distributor sources; distributor
+  sources require a top-level `distributors` section, API-key env var, and
+  pinned ed25519 public key, and they are installed only during explicit sync
 
 Client overlays usually point at repo roots under `/monoserver`, which is the
 host parent directory mounted into the workspace container.

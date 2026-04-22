@@ -1149,6 +1149,16 @@ def clear_repo_git_residue(path: Path) -> None:
             child.unlink()
 
 
+def _sync_distributor_sources(model: dict[str, Any], dry_run: bool) -> list[str]:
+    from .distribution.sync import sync_distributor_sources
+    return sync_distributor_sources(model, dry_run=dry_run)
+
+
+def _runtime_status_distributors(model: dict[str, Any]) -> list[dict[str, Any]]:
+    from .distribution.status import collect_distributor_status
+    return collect_distributor_status(model)
+
+
 def sync_runtime(model: dict[str, Any], dry_run: bool) -> list[str]:
     actions: list[str] = []
 
@@ -1227,6 +1237,7 @@ def sync_runtime(model: dict[str, Any], dry_run: bool) -> list[str]:
         actions.append(f"ensure-directory: {path}")
 
     actions.extend(sync_skill_repo_sets(model, dry_run=dry_run))
+    actions.extend(_sync_distributor_sources(model, dry_run=dry_run))
     actions.extend(sync_skill_sets(model, dry_run=dry_run))
     actions.extend(sync_dcg_config(model, Path(str(model["root_dir"])), dry_run=dry_run))
     actions.extend(sync_ingress_artifacts(model, dry_run=dry_run))
@@ -3573,6 +3584,7 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
         "active_clients": model.get("active_clients") or [],
         "default_client": (model.get("selection") or {}).get("default_client"),
         "active_profiles": model.get("active_profiles") or [],
+        "distributors": _runtime_status_distributors(model),
         "storage": copy.deepcopy(model.get("storage") or {}),
         "repos": repo_statuses,
         "artifacts": artifact_statuses,
