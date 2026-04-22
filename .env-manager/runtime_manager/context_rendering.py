@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .shared import *
 from .runtime_ops import *
+from .distribution.status import render_connected_distributors_section
 
 def generate_context_markdown(model: dict[str, Any]) -> str:
     """Generate a CLAUDE.md / AGENTS.md from the resolved runtime model."""
@@ -174,6 +175,10 @@ def generate_context_markdown(model: dict[str, Any]) -> str:
             else:
                 lines.append(f"- **{sid}**: (empty)")
         lines.append("")
+
+    distributor_lines = render_connected_distributors_section(model)
+    if distributor_lines:
+        lines.extend(distributor_lines)
 
     # Logs
     logs = model.get("logs") or []

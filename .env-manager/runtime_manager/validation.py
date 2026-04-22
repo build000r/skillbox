@@ -799,9 +799,12 @@ def validate_skill_locks_and_state(model: dict[str, Any]) -> list[CheckResult]:
 
 def validate_skill_repo_sets(model: dict[str, Any]) -> list[CheckResult]:
     """Validate skill-repo-set skillsets using 2-layer drift detection."""
+    from .distribution.doctor import validate_distribution_doctor_checks
+
+    distribution_results = validate_distribution_doctor_checks(model)
     has_repo_sets = any(s.get("kind") == "skill-repo-set" for s in model["skills"])
     if not has_repo_sets:
-        return []
+        return distribution_results
 
     config_failures: list[str] = []
     lock_failures: list[str] = []
@@ -1097,7 +1100,7 @@ def validate_skill_repo_sets(model: dict[str, Any]) -> list[CheckResult]:
             )
         )
 
-    return results
+    return results + distribution_results
 
 
 def check_manifest(model: dict[str, Any]) -> list[CheckResult]:

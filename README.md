@@ -485,12 +485,14 @@ The container is where your day-to-day work should feel familiar.
 `make doctor` checks the outer shell, and `make dev-sanity` checks the interior
 graph plus managed artifact and skill install state.
 
-### 5. Skills are GitHub repos, not packaged archives
+### 5. Skill content is local and lockfile-backed
 
-Skills are declared as GitHub repo entries in `workspace/skill-repos.yaml`.
-`sync` clones repos, filtered-copies skill directories into agent homes, and
-records resolved commit SHAs in a lock file. Cloned repos are full working
-trees the operator can branch, commit, push, and PR against.
+Skills are declared in `workspace/skill-repos.yaml` and materialized by
+explicit sync. GitHub repos and local paths stay the default development path:
+`sync` clones or references them, filtered-copies skill directories into agent
+homes, and records resolved SHAs in a lock file. Distributor bundles are allowed
+only as signed sync-time inputs; they are verified, unpacked into local files,
+and recorded in the same lockfile rather than fetched live at agent runtime.
 
 ### 6. Local-first operator ergonomics
 
@@ -1000,16 +1002,46 @@ skill_repos:
     pick: [cass-memory, dev-sanity, skillbox-operator]
 
   - path: ../../skills
-    pick: [divide-and-conquer, domain-planner, domain-reviewer, domain-scaffolder]
+    pick: [cli-ergonomics, audit-plans, crap, divide-and-conquer, domain-planner, domain-reviewer, domain-scaffolder, mutate, oss-doc-audit, skill-issue]
 
   - path: ../../../skills-private
-    pick: [cass, smart]
+    pick: [cass, changelog-md-workmanship, readme-writing, smart]
 ```
 
 Each entry is either a GitHub repo (cloned into `workspace/skill-repos/`) or a
 local path (referenced directly). `sync` clones or fetches repos, filtered-copies
 skill directories into `~/.claude/skills/` and `~/.codex/skills/`, and writes a
 lock file with resolved commit SHAs.
+
+`skill_repos` also supports distributor-backed sources for reviewed
+multi-client skill delivery. A config can declare a top-level `distributors`
+section and then select skills from a distributor entry:
+
+```yaml
+version: 3
+
+distributors:
+  - id: acme-skills
+    url: https://skills.acme.dev/api/v1
+    client_id: client-42
+    auth:
+      method: api-key
+      key_env: ACME_DISTRIBUTOR_KEY
+    verification:
+      public_key: "ed25519:..."
+
+skill_repos:
+  - distributor: acme-skills
+    pick: [deploy, codebase-audit]
+    pin:
+      deploy: 7
+```
+
+Distributor sync fetches a signed per-client manifest, verifies signed
+`.skillbundle.tar.gz` bundles, installs the selected skills through the same
+filtered-copy path as repo and local-path sources, and records distributor
+metadata in the generated lockfile. This is a sync-time delivery channel only;
+installed skill content remains local and usable offline after sync.
 
 Client overlays declare their own `skill-repos.yaml` under
 `${SKILLBOX_CLIENTS_HOST_ROOT:-./workspace/clients}/<client>/skill-repos.yaml`.
@@ -1025,6 +1057,8 @@ Each lockfile records:
 - the config file SHA (detects when the config changed since last sync)
 - the resolved commit SHA per skill (what ref was installed)
 - the installed tree SHA per skill (for drift detection)
+- distributor manifest versions, bundle hashes, selected versions, and pin
+  reasons for distributor-backed skills
 
 These lockfiles are generated state and are gitignored, so running sync does
 not turn normal local runtime reconciliation into noisy repo dirt.
