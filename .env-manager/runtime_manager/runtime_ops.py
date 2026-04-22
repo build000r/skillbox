@@ -1642,6 +1642,10 @@ def translated_runtime_command(model: dict[str, Any], item: dict[str, Any]) -> t
     command = translate_runtime_paths(str(item["command"]), runtime_env, translated_env)
     env = os.environ.copy()
     env.update(translated_env)
+    item_env = item.get("env") or {}
+    if isinstance(item_env, dict):
+        for key, value in item_env.items():
+            env[str(key)] = translate_runtime_paths(str(value), runtime_env, translated_env)
     return command, env
 
 
@@ -2756,6 +2760,19 @@ def start_services(
         pid = live_service_pid(paths["pid_file"])
         if pid is not None:
             results.append(result | {"result": "already-running", "pid": pid})
+            continue
+
+        prelaunch_health = service_healthcheck_state(service)
+        if prelaunch_health.get("state") == "ok":
+            reused_result = result | {"result": "already-running"}
+            if "url" in prelaunch_health:
+                reused_result["url"] = prelaunch_health["url"]
+            if "target" in prelaunch_health:
+                reused_result["target"] = prelaunch_health["target"]
+            if "port" in prelaunch_health:
+                reused_result["port"] = prelaunch_health["port"]
+            results.append(reused_result)
+            log_runtime_event("service.reused", service["id"])
             continue
 
         # Resolve the per-mode command for local-runtime services.  Services

@@ -64,6 +64,7 @@ DEFAULT_INTERVAL = 30
 PID_REL = Path("logs") / "runtime" / "pulse.pid"
 STATE_REL = Path("logs") / "runtime" / "pulse.state.json"
 LOG_REL = Path("logs") / "runtime" / "pulse.log"
+DEFAULT_UNHEALTHY_GRACE_SECONDS = 60.0
 
 # ---------------------------------------------------------------------------
 # Logging (structured, to file + stderr)
@@ -187,8 +188,15 @@ def _restart_service(
     cwd = resolve_runtime_command_cwd(model, service)
 
     ensure_directory(paths["log_dir"], dry_run=False)
+    cleanup_paths = _move_restart_cleanup_paths(service, cwd)
 
-    log("info", f"restarting {service_id}", reason=reason, command=command)
+    log(
+        "info",
+        f"restarting {service_id}",
+        reason=reason,
+        command=command,
+        cleanup_paths=cleanup_paths,
+    )
 
     try:
         with paths["log_file"].open("a", encoding="utf-8") as log_handle:
@@ -204,8 +212,9 @@ def _restart_service(
                 text=True,
             )
         paths["pid_file"].write_text(f"{process.pid}\n", encoding="utf-8")
+        wait_seconds = float(service.get("start_wait_seconds") or DEFAULT_SERVICE_START_WAIT_SECONDS)
         health = wait_for_service_health(
-            service, process, DEFAULT_SERVICE_START_WAIT_SECONDS,
+            service, process, wait_seconds,
         )
         if health.get("state") in {"failed", "timeout"}:
             # Clean up — don't leave a zombie.
@@ -237,6 +246,66 @@ def _restart_service(
         return False
 
 
+def _move_restart_cleanup_paths(service: dict[str, Any], cwd: Path) -> list[dict[str, str]]:
+    """Move service-declared generated state aside before a supervised restart."""
+    moved: list[dict[str, str]] = []
+    raw_paths = service.get("restart_cleanup_paths") or []
+    if not isinstance(raw_paths, list):
+        return moved
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for raw_path in raw_paths:
+        text = str(raw_path).strip()
+        if not text:
+            continue
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            path = cwd / path
+        if not path.exists():
+            continue
+
+        target = path.with_name(f"{path.name}.stale-pulse-{stamp}")
+        suffix = 1
+        while target.exists():
+            target = path.with_name(f"{path.name}.stale-pulse-{stamp}-{suffix}")
+            suffix += 1
+        try:
+            path.rename(target)
+            moved.append({"from": str(path), "to": str(target)})
+        except OSError as exc:
+            log("warn", f"failed cleanup move for {service.get('id')}: {exc}", path=str(path))
+    return moved
+
+
+def _service_should_ensure_running(service: dict[str, Any]) -> bool:
+    return bool(service.get("supervise") or service.get("required"))
+
+
+def _restart_with_backoff(
+    model: dict[str, Any],
+    state: "PulseState",
+    service: dict[str, Any],
+    service_id: str,
+    *,
+    now: float,
+    reason: str,
+) -> bool | None:
+    backoff_until = state.restart_backoff.get(service_id, 0)
+    if now < backoff_until:
+        remaining = int(backoff_until - now)
+        log("info", f"skipping restart for {service_id} (backoff {remaining}s)")
+        return None
+
+    ok = _restart_service(model, service, reason=reason)
+    if ok:
+        state.heals += 1
+        state.restart_backoff.pop(service_id, None)
+        return True
+
+    state.restart_backoff[service_id] = now + RESTART_BACKOFF_SECONDS
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Core reconciliation cycle
 # ---------------------------------------------------------------------------
@@ -249,11 +318,18 @@ class PulseState:
         self.service_states: dict[str, str] = {}  # service_id → state string
         self.check_states: dict[str, bool] = {}    # check_id → ok
         self.restart_backoff: dict[str, float] = {}  # service_id → next eligible restart time
+        self.unhealthy_since: dict[str, float] = {}  # service_id → monotonic timestamp
         self.cycle_count: int = 0
         self.heals: int = 0
         self.events_emitted: int = 0
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, now: float | None = None) -> dict[str, Any]:
+        unhealthy_for = {}
+        if now is not None:
+            unhealthy_for = {
+                service_id: round(max(0.0, now - started_at), 1)
+                for service_id, started_at in self.unhealthy_since.items()
+            }
         return {
             "cycle_count": self.cycle_count,
             "heals": self.heals,
@@ -261,6 +337,7 @@ class PulseState:
             "config_hash": self.config_hash,
             "service_states": dict(self.service_states),
             "check_states": dict(self.check_states),
+            "unhealthy_for_seconds": unhealthy_for,
         }
 
 
@@ -276,6 +353,9 @@ def reconcile_once(
     *,
     auto_restart: bool = True,
     auto_sync: bool = False,
+    active_clients: list[str] | None = None,
+    active_profiles: list[str] | None = None,
+    unhealthy_grace_seconds: float = DEFAULT_UNHEALTHY_GRACE_SECONDS,
 ) -> None:
     """Run one reconciliation cycle."""
     state.cycle_count += 1
@@ -289,9 +369,9 @@ def reconcile_once(
         log("error", f"failed to load runtime model: {exc}")
         return
 
-    profiles = normalize_active_profiles(None)
+    profiles = normalize_active_profiles(active_profiles)
     try:
-        clients = normalize_active_clients(model, None)
+        clients = normalize_active_clients(model, active_clients)
     except RuntimeError:
         clients = set()
     model = filter_model(model, profiles, clients)
@@ -330,9 +410,36 @@ def reconcile_once(
     for service_id, probe in current_services.items():
         current_state = probe.get("state", "declared")
         previous_state = state.service_states.get(service_id)
+        has_live_pid = probe.get("pid") is not None
+        is_unhealthy_http = current_state == "starting" and has_live_pid
+        service = services_by_id.get(service_id)
+
+        if is_unhealthy_http:
+            state.unhealthy_since.setdefault(service_id, now)
+        else:
+            state.unhealthy_since.pop(service_id, None)
 
         # First cycle — just record, don't react.
         if previous_state is None:
+            if (
+                auto_restart
+                and current_state in ("down", "declared")
+                and service
+                and _service_should_ensure_running(service)
+                and service_supports_lifecycle(service)[0]
+            ):
+                log_runtime_event("pulse.service_down", service_id, {"state": current_state})
+                state.events_emitted += 1
+                restarted = _restart_with_backoff(
+                    model,
+                    state,
+                    service,
+                    service_id,
+                    now=now,
+                    reason="supervised_down",
+                )
+                if restarted:
+                    current_state = "running"
             state.service_states[service_id] = current_state
             continue
 
@@ -356,21 +463,57 @@ def reconcile_once(
 
             # Auto-restart crashed managed services.
             if is_crash and auto_restart:
-                service = services_by_id.get(service_id)
                 if service and service_supports_lifecycle(service)[0]:
-                    backoff_until = state.restart_backoff.get(service_id, 0)
-                    if now >= backoff_until:
-                        ok = _restart_service(model, service, reason="crashed")
-                        if ok:
-                            state.heals += 1
-                            current_state = "running"
-                            # Clear backoff on success.
-                            state.restart_backoff.pop(service_id, None)
-                        else:
-                            state.restart_backoff[service_id] = now + RESTART_BACKOFF_SECONDS
-                    else:
-                        remaining = int(backoff_until - now)
-                        log("info", f"skipping restart for {service_id} (backoff {remaining}s)")
+                    restarted = _restart_with_backoff(
+                        model,
+                        state,
+                        service,
+                        service_id,
+                        now=now,
+                        reason="crashed",
+                    )
+                    if restarted:
+                        current_state = "running"
+
+        if (
+            current_state in ("down", "declared")
+            and auto_restart
+            and service
+            and _service_should_ensure_running(service)
+            and service_supports_lifecycle(service)[0]
+        ):
+            restarted = _restart_with_backoff(
+                model,
+                state,
+                service,
+                service_id,
+                now=now,
+                reason="supervised_down",
+            )
+            if restarted:
+                current_state = "running"
+
+        if current_state == "starting" and has_live_pid and auto_restart:
+            unhealthy_started_at = state.unhealthy_since.get(service_id, now)
+            unhealthy_for = now - unhealthy_started_at
+            if unhealthy_for >= unhealthy_grace_seconds:
+                if service and service_supports_lifecycle(service)[0]:
+                    log_runtime_event("pulse.service_unhealthy", service_id, {
+                        "state": current_state,
+                        "unhealthy_for_seconds": round(unhealthy_for, 1),
+                    })
+                    state.events_emitted += 1
+                    restarted = _restart_with_backoff(
+                        model,
+                        state,
+                        service,
+                        service_id,
+                        now=now,
+                        reason="unhealthy_http",
+                    )
+                    if restarted:
+                        current_state = "running"
+                        state.unhealthy_since.pop(service_id, None)
 
         state.service_states[service_id] = current_state
 
@@ -408,7 +551,10 @@ def reconcile_once(
         "interval": getattr(reconcile_once, "_interval", DEFAULT_INTERVAL),
         "auto_restart": auto_restart,
         "auto_sync": auto_sync,
-    } | state.to_dict()
+        "active_clients": sorted(clients),
+        "active_profiles": sorted(profiles),
+        "unhealthy_grace_seconds": unhealthy_grace_seconds,
+    } | state.to_dict(now=now)
     try:
         state_path.write_text(
             json.dumps(snapshot, indent=2, default=str) + "\n",
@@ -437,6 +583,9 @@ def run_daemon(
     interval: int = DEFAULT_INTERVAL,
     auto_restart: bool = True,
     auto_sync: bool = False,
+    active_clients: list[str] | None = None,
+    active_profiles: list[str] | None = None,
+    unhealthy_grace_seconds: float = DEFAULT_UNHEALTHY_GRACE_SECONDS,
 ) -> int:
     """Run the pulse daemon until signalled to stop."""
     global _shutdown
@@ -461,6 +610,9 @@ def run_daemon(
         "interval": interval,
         "auto_restart": auto_restart,
         "auto_sync": auto_sync,
+        "active_clients": active_clients or [],
+        "active_profiles": active_profiles or [],
+        "unhealthy_grace_seconds": unhealthy_grace_seconds,
     }, root_dir)
     log("info", "started", pid=os.getpid(), interval=interval)
 
@@ -474,6 +626,9 @@ def run_daemon(
                     state,
                     auto_restart=auto_restart,
                     auto_sync=auto_sync,
+                    active_clients=active_clients,
+                    active_profiles=active_profiles,
+                    unhealthy_grace_seconds=unhealthy_grace_seconds,
                 )
             except Exception as exc:
                 log("error", f"cycle failed: {exc}")
@@ -583,6 +738,37 @@ def read_state(root_dir: Path) -> dict[str, Any]:
 # CLI
 # ---------------------------------------------------------------------------
 
+def _split_scope_values(raw_value: str) -> list[str]:
+    return [
+        part.strip()
+        for chunk in raw_value.split(",")
+        for part in chunk.split()
+        if part.strip()
+    ]
+
+
+def _scope_from_cli_or_env(cli_values: list[str] | None, env_name: str) -> list[str] | None:
+    values = [value.strip() for value in cli_values or [] if value and value.strip()]
+    if values:
+        return values
+    env_value = os.environ.get(env_name, "").strip()
+    if not env_value:
+        return None
+    return _split_scope_values(env_value)
+
+
+def _float_from_cli_or_env(cli_value: float | None, env_name: str, default: float) -> float:
+    if cli_value is not None:
+        return cli_value
+    env_value = os.environ.get(env_name, "").strip()
+    if not env_value:
+        return default
+    try:
+        return float(env_value)
+    except ValueError:
+        log("warn", f"ignoring invalid {env_name}", value=env_value)
+        return default
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Pulse — live reconciliation daemon for the skillbox runtime graph.",
@@ -611,6 +797,24 @@ def main() -> int:
         action="store_true",
         help="Auto-run sync when config changes are detected.",
     )
+    run_parser.add_argument(
+        "--client",
+        action="append",
+        default=None,
+        help="Client overlay to supervise. Can be repeated. Defaults to SKILLBOX_PULSE_CLIENTS or the runtime default client.",
+    )
+    run_parser.add_argument(
+        "--profile",
+        action="append",
+        default=None,
+        help="Runtime profile to supervise. Can be repeated. Defaults to SKILLBOX_PULSE_PROFILES or core.",
+    )
+    run_parser.add_argument(
+        "--unhealthy-grace-seconds",
+        type=float,
+        default=None,
+        help=f"Seconds a live service may fail healthchecks before restart (default: {DEFAULT_UNHEALTHY_GRACE_SECONDS:g}).",
+    )
 
     sub.add_parser("status", help="Print current pulse daemon status.")
     sub.add_parser("stop", help="Send SIGTERM to the running pulse daemon.")
@@ -637,12 +841,22 @@ def main() -> int:
     if interval is None:
         env_interval = os.environ.get("SKILLBOX_PULSE_INTERVAL", "").strip()
         interval = int(env_interval) if env_interval else DEFAULT_INTERVAL
+    active_clients = _scope_from_cli_or_env(getattr(args, "client", None), "SKILLBOX_PULSE_CLIENTS")
+    active_profiles = _scope_from_cli_or_env(getattr(args, "profile", None), "SKILLBOX_PULSE_PROFILES")
+    unhealthy_grace_seconds = _float_from_cli_or_env(
+        getattr(args, "unhealthy_grace_seconds", None),
+        "SKILLBOX_PULSE_UNHEALTHY_GRACE_SECONDS",
+        DEFAULT_UNHEALTHY_GRACE_SECONDS,
+    )
 
     return run_daemon(
         root_dir,
         interval=interval,
         auto_restart=not getattr(args, "no_restart", False),
         auto_sync=getattr(args, "auto_sync", False),
+        active_clients=active_clients,
+        active_profiles=active_profiles,
+        unhealthy_grace_seconds=unhealthy_grace_seconds,
     )
 
 
