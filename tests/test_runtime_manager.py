@@ -1522,6 +1522,29 @@ class RuntimeManagerTests(unittest.TestCase):
             pid_file = repo / ".skillbox-state" / "logs" / "clients" / "acme-studio" / "services" / "app-dev.pid"
             self.assertFalse(pid_file.exists())
 
+    def test_translated_runtime_command_includes_item_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            model = MANAGE_MODULE.build_runtime_model(repo)
+            command, env = MANAGE_MODULE.translated_runtime_command(
+                model,
+                {
+                    "id": "scoped-pulse",
+                    "command": "python3 .env-manager/pulse.py run",
+                    "env": {
+                        "SKILLBOX_PULSE_CLIENTS": "personal",
+                        "SKILLBOX_LOG_ROOT_COPY": "/workspace/logs",
+                    },
+                },
+            )
+            self.assertEqual(command, "python3 .env-manager/pulse.py run")
+            self.assertEqual(env["SKILLBOX_PULSE_CLIENTS"], "personal")
+            self.assertEqual(
+                env["SKILLBOX_LOG_ROOT_COPY"],
+                str((repo / ".skillbox-state" / "logs").resolve()),
+            )
+
     def test_sync_only_hydrates_env_files_for_selected_client(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -4235,7 +4258,10 @@ class RuntimeManagerTests(unittest.TestCase):
             "SKILLBOX_FWC_MCP_PORT=3221\n"
             "SKILLBOX_FWC_ZONE=work\n"
             "SKILLBOX_FWC_CONNECTORS=github,slack\n"
-            "SKILLBOX_PULSE_INTERVAL=30\n",
+            "SKILLBOX_PULSE_INTERVAL=30\n"
+            "SKILLBOX_PULSE_CLIENTS=\n"
+            "SKILLBOX_PULSE_PROFILES=\n"
+            "SKILLBOX_PULSE_UNHEALTHY_GRACE_SECONDS=60\n",
             encoding="utf-8",
         )
 

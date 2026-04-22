@@ -156,6 +156,10 @@ core:
       profiles:
         - core
       command: python3 .env-manager/pulse.py run --interval ${SKILLBOX_PULSE_INTERVAL}
+      env:
+        SKILLBOX_PULSE_CLIENTS: ${SKILLBOX_PULSE_CLIENTS}
+        SKILLBOX_PULSE_PROFILES: ${SKILLBOX_PULSE_PROFILES}
+        SKILLBOX_PULSE_UNHEALTHY_GRACE_SECONDS: ${SKILLBOX_PULSE_UNHEALTHY_GRACE_SECONDS}
       healthcheck:
         type: path_exists
         path: ${SKILLBOX_LOG_ROOT}/runtime/pulse.pid
