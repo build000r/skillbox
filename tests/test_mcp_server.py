@@ -118,6 +118,92 @@ class SkillboxMcpServerTests(unittest.TestCase):
             },
         )
 
+    def test_skillbox_skills_is_exposed_and_maps_scope_arguments(self) -> None:
+        tool_names = {tool["name"] for tool in MODULE.handle_tools_list({})["tools"]}
+        self.assertIn("skillbox_skills", tool_names)
+
+        with mock.patch.object(
+            MODULE,
+            "run_manage",
+            return_value=(True, 0, {"summary": {"effective": 0}}),
+        ) as run_manage:
+            result = MODULE.handle_tools_call(
+                {
+                    "name": "skillbox_skills",
+                    "arguments": {
+                        "cwd": "/tmp/repo",
+                        "client": ["personal"],
+                        "profile": ["local-core"],
+                        "include_global": False,
+                        "include_project": False,
+                        "show_sources": True,
+                    },
+                },
+                request_id="req-skills",
+            )
+
+        payload = _content_payload(result)
+        self.assertEqual(payload["summary"]["effective"], 0)
+        args = run_manage.call_args.args[0]
+        self.assertEqual(args[:3], ["skills", "--format", "json"])
+        self.assertIn("--cwd", args)
+        self.assertIn("/tmp/repo", args)
+        self.assertIn("--client", args)
+        self.assertIn("personal", args)
+        self.assertIn("--profile", args)
+        self.assertIn("local-core", args)
+        self.assertIn("--no-global", args)
+        self.assertIn("--no-project", args)
+        self.assertIn("--show-sources", args)
+        self.assertEqual(
+            run_manage.call_args.kwargs["event_context"]["mcp_tool_name"],
+            "skillbox_skills",
+        )
+
+    def test_skillbox_skill_maps_lifecycle_arguments(self) -> None:
+        tool_names = {tool["name"] for tool in MODULE.handle_tools_list({})["tools"]}
+        self.assertIn("skillbox_skill", tool_names)
+
+        with mock.patch.object(
+            MODULE,
+            "run_manage",
+            return_value=(True, 0, {"summary": {"actions": 2}}),
+        ) as run_manage:
+            result = MODULE.handle_tools_call(
+                {
+                    "name": "skillbox_skill",
+                    "arguments": {
+                        "action": "add",
+                        "skill": "ui",
+                        "cwd": "/tmp/repo",
+                        "to": "category",
+                        "category": ["frontend"],
+                        "source": "/tmp/skills/ui",
+                        "dry_run": True,
+                    },
+                },
+                request_id="req-skill",
+            )
+
+        payload = _content_payload(result)
+        self.assertEqual(payload["summary"]["actions"], 2)
+        args = run_manage.call_args.args[0]
+        self.assertEqual(args[:3], ["skill", "add", "--format"])
+        self.assertIn("ui", args)
+        self.assertIn("--cwd", args)
+        self.assertIn("/tmp/repo", args)
+        self.assertIn("--to", args)
+        self.assertIn("category", args)
+        self.assertIn("--category", args)
+        self.assertIn("frontend", args)
+        self.assertIn("--source", args)
+        self.assertIn("/tmp/skills/ui", args)
+        self.assertIn("--dry-run", args)
+        self.assertEqual(
+            run_manage.call_args.kwargs["event_context"]["mcp_tool_name"],
+            "skillbox_skill",
+        )
+
     def test_skillbox_events_replays_runtime_and_session_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)

@@ -676,6 +676,7 @@ make runtime-sync
 | `make runtime-render` | Prints the resolved internal runtime graph |
 | `make runtime-sync` | Creates managed repo/log directories, reconciles managed artifacts against declared pins or source files, and installs declared skills with generated lockfiles for the active core/client scope |
 | `make runtime-status` | Summarizes declared repos, artifacts, skills, tasks, services, logs, and checks |
+| `make runtime-skills` | Shows effective skill availability across global, client, and project-local layers, including broken/scope violations and shadowed declarations |
 | `make runtime-bootstrap` | Syncs runtime state and runs declared bootstrap tasks for the active scope |
 | `make runtime-up` | Syncs runtime state, runs required bootstrap tasks, and starts manageable services for the active scope |
 | `make runtime-down` | Stops manageable services for the active scope |
@@ -724,6 +725,7 @@ make runtime-sync
 | `.env-manager/manage.py sync` | Create managed repo/artifact/log directories and install declared skills for the selected core/client scope | `python3 .env-manager/manage.py sync --client personal --dry-run` |
 | `.env-manager/manage.py doctor` | Validate the internal repos/skills/logs/check graph for the selected core/client scope | `python3 .env-manager/manage.py doctor --client personal` |
 | `.env-manager/manage.py status` | Summarize repo, artifact, skill, task, service, log, and health state for the selected core/client scope | `python3 .env-manager/manage.py status --client personal` |
+| `.env-manager/manage.py skills` | Show the effective skill set for a cwd/client/profile, with global extras, broken links, scope violations, project-local layers, and shadowed lower-precedence sources | `python3 .env-manager/manage.py skills --client personal --profile local-all --cwd "$PWD"` |
 | `.env-manager/manage.py bootstrap` | Sync runtime state and run declared bootstrap tasks in dependency order | `python3 .env-manager/manage.py bootstrap --client acme-studio --task app-bootstrap` |
 | `.env-manager/manage.py up` | Sync runtime state, run any service-declared bootstrap tasks, and start manageable services, expanding declared `depends_on` prerequisites and waiting for healthchecks when present | `python3 .env-manager/manage.py up --profile surfaces --service api-stub` |
 | `.env-manager/manage.py down` | Stop manageable services started by the runtime manager, stopping selected dependents before their prerequisites | `python3 .env-manager/manage.py down --profile surfaces --service api-stub` |
@@ -1045,6 +1047,76 @@ installed skill content remains local and usable offline after sync.
 
 Client overlays declare their own `skill-repos.yaml` under
 `${SKILLBOX_CLIENTS_HOST_ROOT:-./workspace/clients}/<client>/skill-repos.yaml`.
+
+### Effective skill visibility
+
+`manage.py skills` is the conflict-aware view of what an agent can use for a
+given cwd, client, and profile:
+
+```bash
+python3 .env-manager/manage.py skills --client personal --profile local-all --cwd "$PWD"
+```
+
+It layers declared default skills, matched client skills, project-local
+`.claude/skills` or `.codex/skills`, and the operator's global
+`~/.claude/skills` plus `~/.codex/skills`. The output shows one effective
+winner per skill, counts lower-precedence shadowed sources, and flags broken
+global symlinks, broken project-local links, undeclared global extras, skills
+installed outside their declared scope, and skills that are expected for the
+current cwd but are not available yet.
+
+Use `--issues-only` for a compact agent/operator check, and `--show-sources`
+when you intentionally want the larger inventory of source-tree skills that are
+not currently synced.
+
+An operator config root may also define `skill-scope.yaml` or
+`skills-scope.yaml` beside `clients/`. Those files declare repo-only or
+global-allowed skill rules; `manage.py skills` reports `scope_violations` when
+a skill is installed outside its declared availability. The policy can also
+define named `project_categories` so rules can say `categories: [frontend]`
+instead of repeating the same repo path list in every rule.
+
+The same view is available to agents as the read-only `skillbox_skills` MCP
+tool. Run it before adding, moving, or globally installing skills so the agent
+can keep global utilities global and project/category skills local to the repos
+where they belong.
+
+Use the singular `skill` command when you want to apply that policy:
+
+```bash
+python3 .env-manager/manage.py skill plan mcp-server-design --cwd ~/repos/opensource/skillbox
+python3 .env-manager/manage.py skill add mcp-server-design --cwd ~/repos/opensource/skillbox
+python3 .env-manager/manage.py skill add ui --to category --category frontend
+python3 .env-manager/manage.py skill sync --cwd "$PWD" --dry-run
+python3 .env-manager/manage.py skill prune --dry-run
+```
+
+`skill add` links the source skill into the selected global or repo-local
+Claude/Codex skill roots. `--to auto` follows `skill-scope.yaml`: global
+allowlist skills go into `~/.claude/skills` and `~/.codex/skills`; scoped
+skills go under the matching repo/category as `.claude/skills` and
+`.codex/skills`. `remove`, `move`, and `prune` require `--dry-run` first or
+`--yes` to apply unlinking actions.
+
+The personal `sbp` wrapper delegates to the same lifecycle surface:
+
+```bash
+sbp
+sbp help
+sbp skills --issues-only
+sbp skill plan mcp-server-design
+sbp skill add mcp-server-design
+sbp skill add ui --to category --category frontend
+sbp skill sync --dry-run
+```
+
+`sbp` with no args is intentionally read-only: it prints a fast cwd-aware skill
+home view and next commands, skipping the slower global scan. Runtime mutation
+is explicit with `sbp up`, `sbp down`, `sbp restart`, or `sbp skill ...`; use
+`sbp skills --issues-only` for the full global/project drift check.
+
+Agents can apply the same flow through the `skillbox_skill` MCP tool after a
+dry-run review.
 
 ### Generated skill lockfiles
 
@@ -1417,6 +1489,8 @@ agents tools to manage their own environment:
 |---|---|
 | `skillbox_status` | Runtime status for repos, services, tasks, checks |
 | `skillbox_render` | Resolved runtime graph |
+| `skillbox_skills` | Effective skill availability, scope violations, and install/move recommendations |
+| `skillbox_skill` | Plan/apply skill add, move, remove, prune, and policy sync actions |
 | `skillbox_sync` | Sync state (create dirs, install skills) |
 | `skillbox_up` / `skillbox_down` | Start/stop services |
 | `skillbox_logs` | Recent service log output |

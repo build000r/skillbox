@@ -358,6 +358,39 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertTrue((repo / ".skillbox-state" / "home" / ".claude" / "skills" / "personal-skill" / "SKILL.md").is_file())
             self.assertTrue((repo / ".skillbox-state" / "home" / ".codex" / "skills" / "personal-skill" / "SKILL.md").is_file())
 
+    def test_skills_command_auto_selects_pwd_matched_client(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            client_root = repo / ".skillbox-state" / "monoserver"
+            self._write_client_overlay(
+                repo,
+                "personal",
+                label="Personal",
+                default_cwd=str(client_root),
+                root_path=str(client_root),
+                include_context=True,
+            )
+
+            result = self._run(
+                repo,
+                "skills",
+                "--cwd",
+                str(client_root / "app"),
+                "--no-global",
+                "--no-project",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            effective_names = {item["name"] for item in payload["effective"]}
+            self.assertEqual(payload["active_clients"], ["personal"])
+            self.assertEqual(payload["matched_clients"][0]["id"], "personal")
+            self.assertIn("sample-skill", effective_names)
+            self.assertIn("personal-skill", effective_names)
+
     def test_sync_reconciles_safe_git_repo_residue_into_a_real_clone(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -1050,6 +1083,56 @@ class RuntimeManagerTests(unittest.TestCase):
             sync = self._run(repo, "sync", "--client", "acme-studio", "--format", "json")
             self.assertEqual(sync.returncode, 0, sync.stderr)
             self.assertTrue((repo / ".skillbox-state" / "home" / ".claude" / "skills" / "custom-skill" / "SKILL.md").is_file())
+
+    def test_skill_command_add_links_project_local_skill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            project = repo / "project"
+            project.mkdir()
+            source = repo / "skills" / "project-skill"
+            self._write_skill_dir(source, "project-skill")
+
+            result = self._run(
+                repo,
+                "skill",
+                "add",
+                "project-skill",
+                "--source",
+                str(source),
+                "--to",
+                "project",
+                "--cwd",
+                str(project),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["summary"]["link"], 2)
+            for surface in ("claude", "codex"):
+                link = project / f".{surface}" / "skills" / "project-skill"
+                self.assertTrue(link.is_symlink())
+                self.assertEqual(link.resolve(), source.resolve())
+
+    def test_skill_command_remove_requires_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(
+                repo,
+                "skill",
+                "remove",
+                "project-skill",
+                "--format",
+                "json",
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            payload = json.loads(result.stdout)
+            self.assertIn("may unlink existing installs", payload["error"]["message"])
 
     def test_client_init_rejects_invalid_client_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
