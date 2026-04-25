@@ -205,6 +205,119 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "skillbox_skills",
+        "description": (
+            "Show effective skill availability and scope-policy issues for a cwd/client/profile. "
+            "Use this before adding, moving, or globally installing skills. "
+            "Returns compact structured JSON with effective skills, matched project categories, "
+            "scope violations, missing cwd-scoped skills, and concrete recommendations. "
+            "Source-root inventory is opt-in because it can be large."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "client": _CLIENT_PROP,
+                "profile": _PROFILE_PROP,
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory used to match client overlays, project-local skills, and project categories.",
+                },
+                "include_global": {
+                    "type": "boolean",
+                    "description": "Inspect ~/.claude/skills and ~/.codex/skills. Defaults to true.",
+                    "default": True,
+                },
+                "include_project": {
+                    "type": "boolean",
+                    "description": "Inspect repo-local .claude/.codex skill directories near cwd. Defaults to true.",
+                    "default": True,
+                },
+                "show_sources": {
+                    "type": "boolean",
+                    "description": "Also scan configured skill source roots for unsynced skills. Defaults to false.",
+                    "default": False,
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum rows for text-oriented manage output; JSON still includes compact policy issues.",
+                    "default": 80,
+                },
+            },
+        },
+    },
+    {
+        "name": "skillbox_skill",
+        "description": (
+            "Plan or apply one skill lifecycle action: add/link, move, remove, prune, or sync "
+            "cwd-missing skills from skill-scope policy. Uses the same global/project/category "
+            "placement rules as skillbox_skills. Always call with dry_run=true first before "
+            "mutating, and pass yes=true for remove/move/prune actions after reviewing the plan."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["action"],
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["plan", "add", "move", "remove", "prune", "sync"],
+                    "description": "Lifecycle action to run.",
+                },
+                "skill": {
+                    "type": "string",
+                    "description": "Skill name. Required for plan/add/move/remove; optional for sync/prune.",
+                },
+                "client": _CLIENT_PROP,
+                "profile": _PROFILE_PROP,
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory used to infer client overlays, repo roots, and categories.",
+                },
+                "to": {
+                    "type": "string",
+                    "enum": ["auto", "global", "project", "category"],
+                    "description": "Destination scope. auto follows skill-scope policy.",
+                    "default": "auto",
+                },
+                "category": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Project category ids to target, such as cli, mcp, frontend, or ios.",
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Explicit skill directory or parent source directory.",
+                },
+                "from_scope": {
+                    "type": "string",
+                    "enum": ["global", "project", "all"],
+                    "description": "Scope to remove from for remove/move.",
+                    "default": "all",
+                },
+                "dry_run": _DRY_RUN_PROP,
+                "prune": {
+                    "type": "boolean",
+                    "description": "For sync, also unlink policy violations.",
+                    "default": False,
+                },
+                "yes": {
+                    "type": "boolean",
+                    "description": "Confirm remove/move/prune unlink actions after a dry-run review.",
+                    "default": False,
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "Replace existing non-symlink files and override global policy blocks.",
+                    "default": False,
+                },
+                "allow_directories": {
+                    "type": "boolean",
+                    "description": "Allow unlink/prune to remove real skill directories, not just symlinks/files.",
+                    "default": False,
+                },
+            },
+        },
+    },
+    {
         "name": "skillbox_logs",
         "description": (
             "Tail recent log output for declared services. "
@@ -871,6 +984,36 @@ def build_args(command: str, params: dict, positional: str | None = None) -> lis
         args += ["--status", str(params["status"])]
     if params.get("limit") is not None:
         args += ["--limit", str(int(params["limit"]))]
+    if params.get("skill"):
+        args.append(str(params["skill"]))
+    if params.get("cwd"):
+        args += ["--cwd", str(params["cwd"])]
+    if params.get("to"):
+        args += ["--to", str(params["to"])]
+    for category in (params.get("category") or []):
+        args += ["--category", str(category)]
+    if params.get("source"):
+        args += ["--source", str(params["source"])]
+    if params.get("from_scope"):
+        args += ["--from", str(params["from_scope"])]
+    if params.get("include_global") is False or params.get("no_global"):
+        args.append("--no-global")
+    if params.get("include_project") is False or params.get("no_project"):
+        args.append("--no-project")
+    if params.get("show_sources"):
+        args.append("--show-sources")
+    if params.get("show_shadowed"):
+        args.append("--show-shadowed")
+    if params.get("issues_only"):
+        args.append("--issues-only")
+    if params.get("full"):
+        args.append("--full")
+    if params.get("allow_directories"):
+        args.append("--allow-directories")
+    if params.get("yes"):
+        args.append("--yes")
+    if params.get("prune"):
+        args.append("--prune")
     for sv in (params.get("set_vars") or []):
         args += ["--set", str(sv)]
     if params.get("resume"):
@@ -892,6 +1035,8 @@ _DISPATCH: dict[str, tuple[str, str | None]] = {
     "skillbox_status":      ("status",      None),
     "skillbox_doctor":      ("doctor",      None),
     "skillbox_render":      ("render",      None),
+    "skillbox_skills":      ("skills",      None),
+    "skillbox_skill":       ("skill",       "action"),
     "skillbox_logs":        ("logs",        None),
     "skillbox_sync":        ("sync",        None),
     "skillbox_up":          ("up",          None),

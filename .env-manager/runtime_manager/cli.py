@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 from .shared import *
 from .validation import *
 from .publish import *
 from .runtime_ops import *
+from .skill_visibility import *
 from .context_rendering import *
 from .text_renderers import *
 from .workflows import *
@@ -89,6 +93,159 @@ def main() -> int:
     status_parser.add_argument("--format", choices=("text", "json"), default="text")
     add_profile_arg(status_parser)
     add_client_arg(status_parser)
+
+    skills_parser = subparsers.add_parser(
+        "skills",
+        help="Show effective skill availability across global, client, and project layers.",
+    )
+    skills_parser.add_argument("--format", choices=("text", "json"), default="text")
+    skills_parser.add_argument(
+        "--cwd",
+        default=None,
+        help="Working directory used for pwd-match and project-local skill discovery. Defaults to the current cwd.",
+    )
+    skills_parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Show every effective skill in text output and full raw JSON instead of compact JSON.",
+    )
+    skills_parser.add_argument(
+        "--show-shadowed",
+        action="store_true",
+        help="Show lower-precedence skill declarations hidden by the effective layer.",
+    )
+    skills_parser.add_argument(
+        "--show-sources",
+        action="store_true",
+        help="Scan configured source roots for skills that are not currently synced. This can be noisy.",
+    )
+    skills_parser.add_argument(
+        "--issues-only",
+        action="store_true",
+        help="Show compact policy issues and recommendations instead of the effective skill list.",
+    )
+    skills_parser.add_argument(
+        "--limit",
+        type=int,
+        default=80,
+        help="Maximum effective skills to show in text output unless --full is set.",
+    )
+    skills_parser.add_argument(
+        "--no-global",
+        action="store_true",
+        help="Do not inspect ~/.claude/skills or ~/.codex/skills.",
+    )
+    skills_parser.add_argument(
+        "--no-project",
+        action="store_true",
+        help="Do not inspect project-local .claude/.codex skill directories near --cwd.",
+    )
+    add_profile_arg(skills_parser)
+    add_client_arg(skills_parser)
+
+    skill_parser = subparsers.add_parser(
+        "skill",
+        help="Plan and apply skill installs, moves, removals, and policy syncs.",
+    )
+    skill_subparsers = skill_parser.add_subparsers(dest="skill_action", required=True)
+
+    def add_skill_lifecycle_common(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument("--format", choices=("text", "json"), default="text")
+        command_parser.add_argument(
+            "--cwd",
+            default=None,
+            help="Working directory used to infer client overlays, repo roots, and project categories.",
+        )
+        command_parser.add_argument(
+            "--to",
+            choices=("auto", "global", "project", "category"),
+            default="auto",
+            help="Where to install/link the skill. auto uses skill-scope policy.",
+        )
+        command_parser.add_argument(
+            "--category",
+            action="append",
+            default=[],
+            help="Project category to target. Can be repeated.",
+        )
+        command_parser.add_argument(
+            "--source",
+            default=None,
+            help="Explicit skill directory or parent source directory.",
+        )
+        command_parser.add_argument("--dry-run", action="store_true")
+        command_parser.add_argument(
+            "--force",
+            action="store_true",
+            help="Replace existing non-symlink files and override global policy blocks.",
+        )
+        command_parser.add_argument(
+            "--allow-directories",
+            action="store_true",
+            help="Allow remove/prune/move to delete real skill directories, not just symlinks/files.",
+        )
+        command_parser.add_argument(
+            "--yes",
+            action="store_true",
+            help="Confirm remove/prune/move actions that unlink existing installs.",
+        )
+        add_profile_arg(command_parser)
+        add_client_arg(command_parser)
+
+    for action_name, help_text in (
+        ("plan", "Preview where a skill would be installed."),
+        ("add", "Install/link a skill into the selected global, project, or category scope."),
+        ("move", "Install/link a skill into a new scope and remove old installs for that skill."),
+    ):
+        action_parser = skill_subparsers.add_parser(action_name, help=help_text)
+        action_parser.add_argument("skill_name")
+        add_skill_lifecycle_common(action_parser)
+
+    remove_parser = skill_subparsers.add_parser("remove", help="Remove installed links/files for a skill.")
+    remove_parser.add_argument("skill_name")
+    add_skill_lifecycle_common(remove_parser)
+    remove_parser.add_argument(
+        "--from",
+        dest="from_scope",
+        choices=("global", "project", "all"),
+        default="all",
+        help="Installed scope to remove from.",
+    )
+
+    prune_parser = skill_subparsers.add_parser("prune", help="Remove installed skills that violate skill-scope policy.")
+    add_skill_lifecycle_common(prune_parser)
+
+    sync_skills_parser = skill_subparsers.add_parser(
+        "sync",
+        help="Install/link a named skill or all literal skills missing for the current cwd policy.",
+    )
+    sync_skills_parser.add_argument("skill_name", nargs="?")
+    add_skill_lifecycle_common(sync_skills_parser)
+    sync_skills_parser.add_argument(
+        "--prune",
+        action="store_true",
+        help="Also unlink existing policy violations after installing missing skills.",
+    )
+
+    overlay_parser = subparsers.add_parser(
+        "overlay",
+        help="List, enable, disable, or toggle skill scope overlays (e.g. marketing).",
+    )
+    overlay_parser.add_argument(
+        "action",
+        nargs="?",
+        default="list",
+        choices=("list", "on", "off", "toggle"),
+        help="list (default), on, off, or toggle.",
+    )
+    overlay_parser.add_argument("name", nargs="?", help="Overlay name, e.g. marketing.")
+    overlay_parser.add_argument("--cwd", default=None, help="Target cwd for scoped unlinks. Defaults to $PWD.")
+    overlay_parser.add_argument(
+        "--keep",
+        action="store_true",
+        help="When turning an overlay off, keep existing symlinks. Default is to unlink overlay-scoped symlinks from the cwd and agent homes.",
+    )
+    overlay_parser.add_argument("--format", choices=("text", "json"), default="text")
 
     bootstrap_parser = subparsers.add_parser(
         "bootstrap",
@@ -919,7 +1076,13 @@ def main() -> int:
     try:
         model = build_runtime_model(root_dir)
         active_profiles = normalize_active_profiles(getattr(args, "profile", []))
-        active_clients = normalize_active_clients(model, getattr(args, "client", []))
+        requested_clients = getattr(args, "client", [])
+        active_clients = normalize_active_clients(model, requested_clients)
+        if args.command in {"skills", "skill"} and not requested_clients:
+            skill_cwd = Path(getattr(args, "cwd", None) or os.getcwd())
+            matches = matched_skill_clients(model, skill_cwd)
+            if matches:
+                active_clients = normalize_active_clients(model, [matches[0]["id"]])
         model = filter_model(model, active_profiles, active_clients)
 
         if args.command == "render":
@@ -980,6 +1143,121 @@ def main() -> int:
                 emit_json(status_payload)
             else:
                 print_status_text(status_payload)
+            return EXIT_OK
+
+        if args.command == "skills":
+            payload = collect_skill_visibility(
+                model,
+                cwd=args.cwd,
+                include_global=not args.no_global,
+                include_project=not args.no_project,
+                include_sources=args.show_sources,
+            )
+            if args.format == "json":
+                emit_json(payload if args.full else compact_skill_visibility_payload(payload))
+            else:
+                print_skill_visibility_text(
+                    payload,
+                    full=args.full,
+                    show_shadowed=args.show_shadowed,
+                    issues_only=args.issues_only,
+                    limit=max(0, int(args.limit)),
+                )
+            return EXIT_OK
+
+        if args.command == "skill":
+            skill_action = str(args.skill_action)
+            dry_run = bool(args.dry_run or skill_action == "plan")
+            if (
+                not dry_run
+                and not bool(getattr(args, "yes", False))
+                and (
+                    skill_action in {"move", "remove", "prune"}
+                    or (skill_action == "sync" and bool(getattr(args, "prune", False)))
+                )
+            ):
+                raise RuntimeError(
+                    f"`skill {skill_action}` may unlink existing installs. "
+                    "Re-run with --dry-run to preview or --yes to apply."
+                )
+            payload = skill_lifecycle_plan(
+                model,
+                skill_action,
+                skill_name=getattr(args, "skill_name", None),
+                cwd=args.cwd,
+                to=args.to,
+                categories=getattr(args, "category", []) or [],
+                source=args.source,
+                from_scope=getattr(args, "from_scope", "all"),
+                prune=bool(getattr(args, "prune", False)),
+                force=bool(args.force),
+            )
+            payload = apply_skill_lifecycle_plan(
+                payload,
+                dry_run=dry_run,
+                allow_directories=bool(args.allow_directories),
+                force=bool(args.force),
+            )
+            if args.format == "json":
+                emit_json(payload)
+            else:
+                print_skill_lifecycle_text(payload)
+            if not dry_run:
+                problematic = [
+                    item for item in payload.get("actions") or []
+                    if str(item.get("status") or "").startswith(("blocked", "conflict", "skipped"))
+                ]
+                if problematic:
+                    return EXIT_DRIFT
+            return EXIT_OK
+
+        if args.command == "overlay":
+            action = str(getattr(args, "action", "list"))
+            name = str(getattr(args, "name", "") or "").strip()
+            if action != "list" and not name:
+                raise RuntimeError(
+                    f"overlay {action}: pass an overlay name, e.g. `overlay {action} marketing`."
+                )
+            was_on = name in active_overlays()
+            if action == "on":
+                set_overlay(name, True)
+            elif action == "off":
+                set_overlay(name, False)
+            elif action == "toggle":
+                toggle_overlay(name)
+            current = sorted(active_overlays())
+            now_on = name in current
+            removed: list[str] = []
+            if (
+                name
+                and was_on
+                and not now_on
+                and not bool(getattr(args, "keep", False))
+            ):
+                overlay_cwd = Path(
+                    getattr(args, "cwd", None) or os.environ.get("PWD") or os.getcwd()
+                )
+                removed = unlink_overlay_scoped_skills(model, name, overlay_cwd)
+            if args.format == "json":
+                emit_json({
+                    "overlays": current,
+                    "action": action,
+                    "name": name,
+                    "unlinked": removed,
+                })
+            else:
+                if action == "list":
+                    if current:
+                        print("overlays on:", ", ".join(current))
+                    else:
+                        print("overlays: (none)")
+                else:
+                    state = "on" if now_on else "off"
+                    print(f"overlay {name}: {state}")
+                    if current:
+                        print("all on:", ", ".join(current))
+                    if removed:
+                        print(f"unlinked: {len(removed)} symlinks")
             return EXIT_OK
 
         if args.command == "bootstrap":
