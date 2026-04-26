@@ -211,7 +211,17 @@ def _restart_service(
                 start_new_session=True,
                 text=True,
             )
-        paths["pid_file"].write_text(f"{process.pid}\n", encoding="utf-8")
+        try:
+            tmp_pid = paths["pid_file"].with_suffix(paths["pid_file"].suffix + ".tmp")
+            tmp_pid.write_text(f"{process.pid}\n", encoding="utf-8")
+            os.replace(tmp_pid, paths["pid_file"])
+        except OSError:
+            # PID write failed — don't leave an orphan child untracked.
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            except OSError:
+                pass
+            raise
         wait_seconds = float(service.get("start_wait_seconds") or DEFAULT_SERVICE_START_WAIT_SECONDS)
         health = wait_for_service_health(
             service, process, wait_seconds,
@@ -556,10 +566,12 @@ def reconcile_once(
         "unhealthy_grace_seconds": unhealthy_grace_seconds,
     } | state.to_dict(now=now)
     try:
-        state_path.write_text(
+        tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
+        tmp_path.write_text(
             json.dumps(snapshot, indent=2, default=str) + "\n",
             encoding="utf-8",
         )
+        os.replace(tmp_path, state_path)
     except OSError:
         pass
 
