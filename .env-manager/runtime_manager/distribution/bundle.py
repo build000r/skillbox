@@ -22,7 +22,7 @@ import json
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, Union
 
 SKILL_META_DIR = ".skill-meta"
 MANIFEST_FILENAME = "manifest.json"
@@ -241,16 +241,37 @@ def pack_skill_bundle(
     return bundle_path
 
 
-def unpack_skill_bundle(bundle_path: Path, dest_dir: Path) -> BundleManifest:
-    bundle_path = Path(bundle_path)
+def unpack_skill_bundle(
+    bundle: Union[Path, BinaryIO],
+    dest_dir: Path,
+) -> BundleManifest:
+    """Unpack a skill bundle into ``dest_dir``.
+
+    Accepts either a path or an already-opened binary file object. Passing a
+    file object lets callers open-once / verify / unpack from the same inode,
+    which closes the TOCTOU window between SHA verification and extraction.
+    """
     dest_dir = Path(dest_dir)
 
-    if not bundle_path.is_file():
-        raise BundleStructureError(f"bundle file does not exist: {bundle_path}")
+    if isinstance(bundle, Path) or isinstance(bundle, str):
+        bundle_path = Path(bundle)
+        if not bundle_path.is_file():
+            raise BundleStructureError(f"bundle file does not exist: {bundle_path}")
+        tar_kwargs: dict[str, Any] = {"name": str(bundle_path)}
+    else:
+        try:
+            bundle.seek(0)
+        except (AttributeError, OSError):
+            pass
+        tar_kwargs = {"fileobj": bundle}
 
     try:
-        with tarfile.open(bundle_path, "r:gz") as tar:
+        with tarfile.open(mode="r:gz", **tar_kwargs) as tar:
             for member in tar.getmembers():
+                if member.issym() or member.islnk():
+                    raise BundleStructureError(
+                        f"link member not allowed in bundle: {member.name}"
+                    )
                 if member.name.startswith("/") or ".." in member.name.split("/"):
                     raise BundleStructureError(f"unsafe path in bundle: {member.name}")
             tar.extractall(dest_dir, filter="data")
