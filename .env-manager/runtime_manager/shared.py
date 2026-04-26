@@ -1369,11 +1369,33 @@ def validate_client_id(client_id: str) -> str:
     return normalized
 
 
+def atomic_write_text(path: Path, content: str) -> None:
+    # Crash-safe text write: stage to a sibling temp file, then os.replace().
+    # A mid-write crash leaves the previous content intact instead of a
+    # truncated half-write that downstream readers would treat as valid.
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def write_text_file(path: Path, content: str, dry_run: bool) -> None:
     ensure_directory(path.parent, dry_run)
     if dry_run:
         return
-    path.write_text(content, encoding="utf-8")
+    atomic_write_text(path, content)
 
 
 def normalize_host_rel_path(root_dir: Path, path: Path) -> str:
@@ -1411,7 +1433,7 @@ def upsert_env_file_values(path: Path, updates: dict[str, str]) -> bool:
         serialized += "\n"
     if serialized == existing_text:
         return False
-    path.write_text(serialized, encoding="utf-8")
+    atomic_write_text(path, serialized)
     return True
 
 
@@ -1949,7 +1971,7 @@ def sync_client_scaffold_seed_files(
             if existing.strip():
                 continue
         if not dry_run:
-            seed_path.write_text(content, encoding="utf-8")
+            atomic_write_text(seed_path, content)
         actions.append(f"write-file: {repo_rel(root_dir, seed_path)}")
     return actions
 
@@ -2400,7 +2422,7 @@ def write_json_file(path: Path, payload: dict[str, Any]) -> bool:
     ensure_directory(path.parent, dry_run=False)
     if path.exists() and path.read_text(encoding="utf-8") == serialized:
         return False
-    path.write_text(serialized, encoding="utf-8")
+    atomic_write_text(path, serialized)
     return True
 
 
@@ -3478,21 +3500,21 @@ def normalize_client_overlay_shape(root_dir: Path, overlay_dir: Path) -> list[st
     rendered_overlay = render_yaml_document(overlay_doc)
     existing_overlay = overlay_path.read_text(encoding="utf-8")
     if existing_overlay != rendered_overlay:
-        overlay_path.write_text(rendered_overlay, encoding="utf-8")
+        atomic_write_text(overlay_path, rendered_overlay)
         actions.append(f"normalize-overlay: {repo_rel(root_dir, overlay_path)}")
 
     skill_repos_path = overlay_dir / "skill-repos.yaml"
     skill_repos_text = render_client_scaffold_skill_repos(client_label, scaffold_pack)
     if not skill_repos_path.is_file() or skill_repos_path.read_text(encoding="utf-8") != skill_repos_text:
         ensure_directory(skill_repos_path.parent, dry_run=False)
-        skill_repos_path.write_text(skill_repos_text, encoding="utf-8")
+        atomic_write_text(skill_repos_path, skill_repos_text)
         actions.append(f"write-file: {repo_rel(root_dir, skill_repos_path)}")
 
     for keep_path, keep_content in client_scaffold_keep_files(overlay_dir, scaffold_pack).items():
         ensure_directory(keep_path.parent, dry_run=False)
         if keep_path.exists():
             continue
-        keep_path.write_text(keep_content, encoding="utf-8")
+        atomic_write_text(keep_path, keep_content)
         actions.append(f"write-file: {repo_rel(root_dir, keep_path)}")
 
     actions.extend(

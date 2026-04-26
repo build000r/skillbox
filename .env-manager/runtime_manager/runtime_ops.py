@@ -841,7 +841,7 @@ def sync_ingress_artifacts(model: dict[str, Any], dry_run: bool) -> list[str]:
         if state == "ok":
             actions.append(f"{action_label}-unchanged: {path}")
             continue
-        path.write_text(desired, encoding="utf-8")
+        atomic_write_text(path, desired)
         actions.append(f"{action_label}: {path} ({route_count} routes)")
 
     return actions
@@ -1087,7 +1087,7 @@ def sync_dcg_config(model: dict[str, Any], root_dir: Path, dry_run: bool) -> lis
     if dry_run:
         return [f"render-dcg-config: {dcg_config_path} (packs: {', '.join(packs)})"]
 
-    dcg_config_path.write_text(content)
+    atomic_write_text(dcg_config_path, content)
     actions.append(f"render-dcg-config: {dcg_config_path} (packs: {', '.join(packs)})")
     return actions
 

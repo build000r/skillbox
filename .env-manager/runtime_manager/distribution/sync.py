@@ -30,6 +30,7 @@ from .manifest import parse_manifest, verify_manifest
 from .pin_resolver import resolve_pin
 from .signing import SignatureVerificationError, load_public_key
 
+from ..shared import atomic_write_text
 from ..shared_distribution import (
     DistributorConfig,
     DistributorSetSource,
@@ -400,9 +401,9 @@ def sync_distributor_sources(model: dict[str, Any], dry_run: bool) -> list[str]:
 
         if not dry_run:
             lock_path.parent.mkdir(parents=True, exist_ok=True)
-            lock_path.write_text(
+            atomic_write_text(
+                lock_path,
                 json.dumps(lock_payload, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
             )
         actions.append(f"write-lockfile: {lock_path} (distribution-merged)")
 

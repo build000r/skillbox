@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -790,8 +791,9 @@ def main() -> None:
         try:
             result = handler(params)
         except Exception as exc:  # noqa: BLE001
+            traceback.print_exc(file=sys.stderr)
             print(f"[operator-mcp] error in {method}: {exc}", file=sys.stderr, flush=True)
-            send_error(msg_id, -32603, f"Internal error: {exc}")
+            send_error(msg_id, -32603, f"Internal error in {method}")
             continue
 
         send({"jsonrpc": "2.0", "id": msg_id, "result": result})

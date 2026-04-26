@@ -19,6 +19,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -1236,6 +1237,7 @@ def main() -> None:
                 try:
                     handler(params)
                 except Exception as exc:  # noqa: BLE001
+                    traceback.print_exc(file=sys.stderr)
                     print(f"[skillbox-mcp] notification error in {method}: {exc}", file=sys.stderr, flush=True)
             continue
 
@@ -1250,8 +1252,9 @@ def main() -> None:
             send_error(msg_id, exc.code, exc.message)
             continue
         except Exception as exc:  # noqa: BLE001
+            traceback.print_exc(file=sys.stderr)
             print(f"[skillbox-mcp] unhandled error in {method}: {exc}", file=sys.stderr, flush=True)
-            send_error(msg_id, -32603, f"Internal error: {exc}")
+            send_error(msg_id, -32603, f"Internal error in {method}")
             continue
 
         send({"jsonrpc": "2.0", "id": msg_id, "result": result})
