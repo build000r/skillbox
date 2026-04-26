@@ -86,8 +86,10 @@ def check(path):
             )
             if ahead.stdout.strip():
                 problems.append(f"unpushed:{path}")
-    except Exception:
-        pass  # unreachable repo — not our problem to block on
+    except Exception as exc:
+        # Repo unreachable (permissions, broken mount, etc). Refuse to assume
+        # it is clean — that would mask real uncommitted work.
+        problems.append(f"inaccessible:{path}: {exc.__class__.__name__}: {exc}")
     return problems
 
 # Find all git repos: the repo root itself, plus any .git dirs under
@@ -196,21 +198,22 @@ if [ "$FRIENDLY_NAME" = "operator_compose_down" ]; then
     PROBLEMS=$(python3 -c "$check_repo_script" "$REPO_ROOT" 2>/dev/null || true)
 elif [ "$FRIENDLY_NAME" = "operator_teardown" ] && [ "$BOX_ID" != "local" ]; then
     # Remote: look up box SSH details from inventory, run check on the box
-    SSH_TARGET=$(python3 -c "
+    SSH_TARGET=$(python3 -c '
 import json, sys
 from pathlib import Path
-inv_path = Path('$REPO_ROOT') / 'workspace' / 'boxes.json'
+repo_root, box_id = sys.argv[1], sys.argv[2]
+inv_path = Path(repo_root) / "workspace" / "boxes.json"
 if not inv_path.is_file():
     sys.exit(0)
-boxes = json.loads(inv_path.read_text()).get('boxes', [])
+boxes = json.loads(inv_path.read_text()).get("boxes", [])
 for b in boxes:
-    if b.get('id') == '$BOX_ID':
-        host = b.get('tailscale_hostname') or b.get('droplet_ip', '')
-        user = b.get('ssh_user', 'skillbox')
+    if b.get("id") == box_id:
+        host = b.get("tailscale_hostname") or b.get("droplet_ip", "")
+        user = b.get("ssh_user", "skillbox")
         if host:
-            print(f'{user}@{host}')
+            print(f"{user}@{host}")
         break
-" 2>/dev/null || true)
+' "$REPO_ROOT" "$BOX_ID" 2>/dev/null || true)
 
     if [ -n "$SSH_TARGET" ]; then
         PROBLEMS=$(ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes \
@@ -228,15 +231,17 @@ if [ -n "$PROBLEMS" ]; then
     # Parse problems into a readable list
     DIRTY_REPOS=""
     UNPUSHED_REPOS=""
+    INACCESSIBLE_REPOS=""
     while IFS= read -r line; do
         case "$line" in
-            dirty:*)   DIRTY_REPOS="${DIRTY_REPOS}    - ${line#dirty:}"$'\n' ;;
-            unpushed:*) UNPUSHED_REPOS="${UNPUSHED_REPOS}    - ${line#unpushed:}"$'\n' ;;
+            dirty:*)        DIRTY_REPOS="${DIRTY_REPOS}    - ${line#dirty:}"$'\n' ;;
+            unpushed:*)     UNPUSHED_REPOS="${UNPUSHED_REPOS}    - ${line#unpushed:}"$'\n' ;;
+            inaccessible:*) INACCESSIBLE_REPOS="${INACCESSIBLE_REPOS}    - ${line#inaccessible:}"$'\n' ;;
         esac
     done <<< "$PROBLEMS"
 
     {
-        echo "BLOCKED: ${FRIENDLY_NAME} — repos have unsaved work."
+        echo "BLOCKED: ${FRIENDLY_NAME} — repo cleanliness check failed."
         echo ""
         if [ -n "$DIRTY_REPOS" ]; then
             echo "Uncommitted changes in:"
@@ -246,35 +251,61 @@ if [ -n "$PROBLEMS" ]; then
             echo "Unpushed commits in:"
             echo "$UNPUSHED_REPOS"
         fi
-        echo "ALL repos in the workspace must be committed and pushed before"
-        echo "destructive operations. Tearing down infrastructure is irreversible;"
-        echo "uncommitted or unpushed work would be lost forever."
+        if [ -n "$INACCESSIBLE_REPOS" ]; then
+            echo "Repos that could not be inspected (treated as unsafe):"
+            echo "$INACCESSIBLE_REPOS"
+            echo "Resolve permissions or remount before retrying — an"
+            echo "inaccessible repo could hide uncommitted work."
+            echo ""
+        fi
+        echo "ALL repos in the workspace must be committed, pushed, and"
+        echo "inspectable before destructive operations. Tearing down"
+        echo "infrastructure is irreversible; uncommitted or unpushed work"
+        echo "would be lost forever."
         echo ""
         echo "Next steps:"
         echo "  1. Run /commit in each dirty repo"
         echo "  2. git push in each repo with unpushed commits"
-        echo "  3. Then re-run ${FRIENDLY_NAME} with dry_run=true"
-        echo "  4. Confirm the dry-run output with the user"
-        echo "  5. Then run ${FRIENDLY_NAME} for real"
+        echo "  3. Resolve any inaccessible repos"
+        echo "  4. Then re-run ${FRIENDLY_NAME} with dry_run=true"
+        echo "  5. Confirm the dry-run output with the user"
+        echo "  6. Then run ${FRIENDLY_NAME} for real"
     } >&2
     exit 1
 fi
 
 # --- Gate 3: Require dry_run=true on first real invocation ---
+# Marker is invalidated after MARKER_TTL_SECONDS so a stale dry-run from a
+# prior day cannot authorize today's teardown. Default 1 hour.
 MARKER="${REPO_ROOT}/.skillbox-state/dryrun-markers/.skillbox-dryrun-${FRIENDLY_NAME}-${BOX_ID}"
+MARKER_TTL_SECONDS="${SKILLBOX_DRYRUN_MARKER_TTL_SECONDS:-3600}"
 
-if [ ! -f "$MARKER" ]; then
+MARKER_AGE_OK=false
+if [ -f "$MARKER" ]; then
+    MARKER_AGE=$(python3 -c '
+import os, sys, time
+try:
+    print(int(time.time() - os.stat(sys.argv[1]).st_mtime))
+except OSError:
+    sys.exit(1)
+' "$MARKER" 2>/dev/null || echo "")
+    if [ -n "$MARKER_AGE" ] && [ "$MARKER_AGE" -ge 0 ] && [ "$MARKER_AGE" -le "$MARKER_TTL_SECONDS" ]; then
+        MARKER_AGE_OK=true
+    fi
+fi
+
+if [ "$MARKER_AGE_OK" != "true" ]; then
     cat >&2 <<EOF
-BLOCKED: ${FRIENDLY_NAME} requires a dry-run first.
+BLOCKED: ${FRIENDLY_NAME} requires a fresh dry-run first.
 
 Before executing a destructive operation, you must:
-  1. Run ${FRIENDLY_NAME} with dry_run=true
+  1. Run ${FRIENDLY_NAME} with dry_run=true (within the last ${MARKER_TTL_SECONDS}s)
   2. Show the dry-run output to the user
   3. Get explicit confirmation
   4. Then run ${FRIENDLY_NAME} for real
 
-This is the first call for ${FRIENDLY_NAME} (box: ${BOX_ID}) this session.
-Run with dry_run=true first.
+This is either the first call for ${FRIENDLY_NAME} (box: ${BOX_ID}) or
+the previous dry-run marker has expired. Run with dry_run=true first.
 EOF
     exit 1
 fi
