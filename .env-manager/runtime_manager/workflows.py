@@ -495,9 +495,27 @@ def generate_client_compose_override(
     return out_path
 
 
+MANAGE_JSON_COMMAND_TIMEOUT_SECONDS = 300.0
+
+
 def run_manage_json_command(root_dir: Path, args: list[str]) -> tuple[int, dict[str, Any]]:
     cmd = [sys.executable, str(SCRIPT_DIR / "manage.py"), "--root-dir", str(root_dir), *args]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=MANAGE_JSON_COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return 124, {
+            "error": (
+                f"manage.py {' '.join(args)} timed out after "
+                f"{MANAGE_JSON_COMMAND_TIMEOUT_SECONDS:.0f}s"
+            ),
+            "_stderr": (exc.stderr or b"").decode("utf-8", errors="replace") if isinstance(exc.stderr, (bytes, bytearray)) else (exc.stderr or ""),
+        }
     stdout = proc.stdout.strip()
     if not stdout:
         payload: dict[str, Any] = {}

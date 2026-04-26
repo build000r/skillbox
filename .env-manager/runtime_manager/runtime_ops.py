@@ -2697,18 +2697,27 @@ def run_tasks(
             continue
 
         log_runtime_event("task.started", task["id"])
+        task_timeout = float(task.get("timeout_seconds") or DEFAULT_TASK_TIMEOUT_SECONDS)
         with paths["log_file"].open("a", encoding="utf-8") as log_handle:
-            completed = subprocess.run(
-                command,
-                cwd=cwd,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                shell=True,
-                text=True,
-                check=False,
-            )
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=cwd,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    shell=True,
+                    text=True,
+                    check=False,
+                    timeout=task_timeout,
+                )
+            except subprocess.TimeoutExpired:
+                log_runtime_event("task.failed", task["id"], {"reason": "timeout"})
+                raise RuntimeError(
+                    f"Task {task['id']} timed out after {task_timeout:.0f}s. "
+                    "Increase 'timeout_seconds' on the task to allow more time."
+                )
 
         if completed.returncode != 0:
             tail = tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)
