@@ -500,23 +500,39 @@ MANAGE_JSON_COMMAND_TIMEOUT_SECONDS = 300.0
 
 def run_manage_json_command(root_dir: Path, args: list[str]) -> tuple[int, dict[str, Any]]:
     cmd = [sys.executable, str(SCRIPT_DIR / "manage.py"), "--root-dir", str(root_dir), *args]
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=MANAGE_JSON_COMMAND_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return 124, {
-            "error": (
-                f"manage.py {' '.join(args)} timed out after "
-                f"{MANAGE_JSON_COMMAND_TIMEOUT_SECONDS:.0f}s"
-            ),
-            "_stderr": (exc.stderr or b"").decode("utf-8", errors="replace") if isinstance(exc.stderr, (bytes, bytearray)) else (exc.stderr or ""),
-        }
-    stdout = proc.stdout.strip()
+    # Run in a new session so that on timeout we can SIGKILL the whole group —
+    # manage.py itself spawns subprocesses (git, docker compose, etc.) and
+    # killing only the immediate child would leave them orphaned.
+    with subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    ) as proc:
+        try:
+            stdout, stderr = proc.communicate(timeout=MANAGE_JSON_COMMAND_TIMEOUT_SECONDS)
+            returncode = proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+                stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+            return 124, {
+                "error": (
+                    f"manage.py {' '.join(args)} timed out after "
+                    f"{MANAGE_JSON_COMMAND_TIMEOUT_SECONDS:.0f}s"
+                ),
+                "_stderr": stderr or "",
+            }
+
+    stdout = (stdout or "").strip()
     if not stdout:
         payload: dict[str, Any] = {}
     else:
@@ -525,9 +541,10 @@ def run_manage_json_command(root_dir: Path, args: list[str]) -> tuple[int, dict[
         except json.JSONDecodeError:
             parsed = {"stdout": stdout}
         payload = parsed if isinstance(parsed, dict) else {"payload": parsed}
-    if proc.stderr.strip():
-        payload["_stderr"] = proc.stderr.strip()
-    return proc.returncode, payload
+    stderr = (stderr or "").strip()
+    if stderr:
+        payload["_stderr"] = stderr
+    return returncode, payload
 
 
 def doctor_step_status(payload: dict[str, Any], exit_code: int) -> str:
