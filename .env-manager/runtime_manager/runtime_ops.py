@@ -2699,31 +2699,43 @@ def run_tasks(
         log_runtime_event("task.started", task["id"])
         task_timeout = float(task.get("timeout_seconds") or DEFAULT_TASK_TIMEOUT_SECONDS)
         with paths["log_file"].open("a", encoding="utf-8") as log_handle:
+            # Run in a new session so the shell + every descendant share a
+            # process group we can SIGKILL on timeout. subprocess.run() with
+            # shell=True only kills the immediate /bin/sh child, leaving the
+            # actual command's children orphaned.
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                shell=True,
+                text=True,
+                start_new_session=True,
+            )
             try:
-                completed = subprocess.run(
-                    command,
-                    cwd=cwd,
-                    env=env,
-                    stdin=subprocess.DEVNULL,
-                    stdout=log_handle,
-                    stderr=subprocess.STDOUT,
-                    shell=True,
-                    text=True,
-                    check=False,
-                    timeout=task_timeout,
-                )
+                returncode = process.wait(timeout=task_timeout)
             except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
                 log_runtime_event("task.failed", task["id"], {"reason": "timeout"})
                 raise RuntimeError(
                     f"Task {task['id']} timed out after {task_timeout:.0f}s. "
                     "Increase 'timeout_seconds' on the task to allow more time."
                 )
 
-        if completed.returncode != 0:
+        if returncode != 0:
             tail = tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)
-            log_runtime_event("task.failed", task["id"], {"exit_code": completed.returncode})
+            log_runtime_event("task.failed", task["id"], {"exit_code": returncode})
             raise RuntimeError(
-                f"Task {task['id']} failed with exit code {completed.returncode}."
+                f"Task {task['id']} failed with exit code {returncode}."
                 + (f" Recent logs: {' | '.join(tail)}" if tail else "")
             )
 
@@ -2819,7 +2831,17 @@ def start_services(
                 text=True,
             )
 
-        paths["pid_file"].write_text(f"{process.pid}\n", encoding="utf-8")
+        try:
+            tmp_pid = paths["pid_file"].with_suffix(paths["pid_file"].suffix + ".tmp")
+            tmp_pid.write_text(f"{process.pid}\n", encoding="utf-8")
+            os.replace(tmp_pid, paths["pid_file"])
+        except OSError:
+            # PID write failed — don't leave an orphan child untracked.
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            except OSError:
+                pass
+            raise
         health_state = wait_for_service_health(service, process, wait_seconds)
         if health_state.get("state") == "failed":
             # Process actually exited — clean up PID file.

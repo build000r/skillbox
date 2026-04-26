@@ -64,9 +64,9 @@ def _distribution_context(model: dict[str, Any]) -> _DistributionDoctorContext:
         if not parsed_distributors and not sources:
             continue
 
-        lock_path = Path(str(skillset.get("lock_path_host_path") or ""))
-        if str(lock_path):
-            lock_paths.add(lock_path)
+        raw_lock_path = str(skillset.get("lock_path_host_path") or "").strip()
+        if raw_lock_path:
+            lock_paths.add(Path(raw_lock_path))
 
         for distributor_id, parsed in parsed_distributors.items():
             existing = distributors.get(distributor_id)

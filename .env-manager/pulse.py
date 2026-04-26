@@ -38,6 +38,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 from lib.runtime_model import build_runtime_model, client_overlay_paths, load_runtime_env  # noqa: E402
 from manage import (  # noqa: E402
     DEFAULT_SERVICE_START_WAIT_SECONDS,
+    DEFAULT_SERVICE_STOP_WAIT_SECONDS,
     log_runtime_event,
     ensure_directory,
     filter_model,
@@ -50,6 +51,7 @@ from manage import (  # noqa: E402
     resolve_runtime_command_cwd,
     service_paths,
     service_supports_lifecycle,
+    stop_process,
     sync_runtime,
     tail_lines,
     translated_runtime_command,
@@ -101,7 +103,9 @@ def log(level: str, message: str, **extra: Any) -> None:
 def write_pid(root_dir: Path) -> Path:
     pid_path = root_dir / PID_REL
     pid_path.parent.mkdir(parents=True, exist_ok=True)
-    pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    tmp_path = pid_path.with_suffix(pid_path.suffix + ".tmp")
+    tmp_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    os.replace(tmp_path, pid_path)
     return pid_path
 
 
@@ -227,11 +231,11 @@ def _restart_service(
             service, process, wait_seconds,
         )
         if health.get("state") in {"failed", "timeout"}:
-            # Clean up — don't leave a zombie.
-            try:
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-            except OSError:
-                pass
+            # Clean up — don't leave a zombie. SIGTERM alone isn't enough:
+            # a service that ignores it would survive while the pid file is
+            # removed, and pulse would then start a fresh copy each cycle.
+            # stop_process escalates to SIGKILL after wait_seconds.
+            stop_process(process.pid, DEFAULT_SERVICE_STOP_WAIT_SECONDS)
             remove_pid_file(paths["pid_file"])
             log_runtime_event("pulse.restart_failed", service_id, {
                 "reason": reason,

@@ -14,6 +14,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request
 
 from .bundle import SKILL_META_DIR, unpack_skill_bundle, verify_bundle_contents
@@ -180,6 +181,25 @@ def sync_distributor_set(
 
         if need_download:
             bundle_url = f"{distributor.url.rstrip('/')}{skill.download_url}"
+            # Defense-in-depth: even though the manifest is signature-verified,
+            # a compromised distributor (or compromised signing key) could
+            # supply a download_url that escapes its own host via userinfo
+            # tricks like '@evil.com/...' (urlparse splits at '@' in netloc).
+            # Pin the bundle host/scheme to the configured distributor.
+            distributor_parsed = urlparse(distributor.url)
+            bundle_parsed = urlparse(bundle_url)
+            if (
+                bundle_parsed.scheme != distributor_parsed.scheme
+                or (bundle_parsed.hostname or "").lower()
+                    != (distributor_parsed.hostname or "").lower()
+                or bundle_parsed.port != distributor_parsed.port
+            ):
+                raise DistributorSyncError(
+                    f"refusing to fetch bundle for {skill.name!r}: "
+                    f"download_url resolves to a different host than the "
+                    f"configured distributor ({bundle_parsed.hostname!r} != "
+                    f"{distributor_parsed.hostname!r})"
+                )
             bundle_bytes = _http_get(
                 bundle_url,
                 {**auth_headers, "Accept": "application/gzip"},
