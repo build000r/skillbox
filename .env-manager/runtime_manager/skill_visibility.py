@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .shared import (
+    atomic_write_text,
     directory_tree_sha256,
     load_json_file,
     load_yaml,
@@ -344,9 +345,9 @@ def set_overlay(name: str, enabled: bool) -> bool:
         current.add(name)
     else:
         current.discard(name)
-    state_path.write_text(
+    atomic_write_text(
+        state_path,
         "\n".join(sorted(current)) + ("\n" if current else ""),
-        encoding="utf-8",
     )
     return enabled
 
