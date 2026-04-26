@@ -8,9 +8,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from ..shared import CheckResult, file_sha256, load_skill_repos_config
+from .http_security import HttpsOnlyError, require_https, secure_opener
 from ..shared_distribution import (
     ConfigError,
     DistributorConfig,
@@ -140,6 +141,10 @@ def _check_distributor_config_valid(context: _DistributionDoctorContext) -> Chec
 
 def _probe_manifest_head(distributor: DistributorConfig, api_key: str) -> tuple[bool, str]:
     url = f"{distributor.url.rstrip('/')}/manifest"
+    try:
+        require_https(url)
+    except HttpsOnlyError as exc:
+        return False, f"{distributor.id}: {exc}"
     request = Request(
         url,
         headers={
@@ -150,7 +155,7 @@ def _probe_manifest_head(distributor: DistributorConfig, api_key: str) -> tuple[
         method="HEAD",
     )
     try:
-        with urlopen(request, timeout=5.0) as response:
+        with secure_opener().open(request, timeout=5.0) as response:
             status = int(getattr(response, "status", response.getcode()))
     except HTTPError as exc:
         status = int(exc.code)

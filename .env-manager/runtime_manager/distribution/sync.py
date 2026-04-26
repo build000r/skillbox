@@ -14,9 +14,10 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from .bundle import SKILL_META_DIR, unpack_skill_bundle, verify_bundle_contents
+from .http_security import HttpsOnlyError, require_https, secure_opener
 from .lockfile import (
     DistributorManifestLockEntry,
     Lockfile,
@@ -50,8 +51,12 @@ def _http_get(
     timeout: float = 30.0,
     _opener: Callable | None = None,
 ) -> bytes:
+    try:
+        require_https(url)
+    except HttpsOnlyError as exc:
+        raise DistributorSyncError(str(exc)) from exc
     req = Request(url, headers=headers, method="GET")
-    open_fn = _opener or urlopen
+    open_fn = _opener or secure_opener().open
     try:
         resp = open_fn(req, timeout=timeout)
         return resp.read()
@@ -126,6 +131,16 @@ def sync_distributor_set(
             f"manifest signature verification failed for '{distributor.id}': {exc}"
         ) from exc
 
+    # The manifest signature confirms the manifest came from a holder of the
+    # configured public key, but does not bind it to this distributor. Reject
+    # mismatches before installing anything so a hostile or misconfigured
+    # endpoint cannot impersonate another distributor.
+    if manifest.distributor_id != distributor.id:
+        raise DistributorSyncError(
+            f"manifest distributor_id {manifest.distributor_id!r} does not match "
+            f"configured distributor id {distributor.id!r}"
+        )
+
     # -- Cache raw manifest ---------------------------------------------------
     manifest_cache_dir = state_root / "manifests"
     manifest_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -192,10 +207,26 @@ def sync_distributor_set(
             ))
             continue
 
-        # Unpack, verify, install
+        # Unpack, verify, install.
+        # Open the cached bundle once, hash through that file handle, and
+        # extract from the same handle so the inode is locked: a path-level
+        # swap between verify and extract cannot redirect the unpack reader
+        # to a different file. Closes the TOCTOU window between hash check
+        # and extractall.
         with tempfile.TemporaryDirectory() as tmp_str:
             tmp = Path(tmp_str)
-            bundle_manifest = unpack_skill_bundle(cached_bundle, tmp)
+            with cached_bundle.open("rb") as bundle_fh:
+                hasher = hashlib.sha256()
+                for chunk in iter(lambda: bundle_fh.read(65536), b""):
+                    hasher.update(chunk)
+                pre_unpack_hash = hasher.hexdigest()
+                if pre_unpack_hash != skill.sha256:
+                    raise DistributorSyncError(
+                        f"bundle SHA256 mismatch for {skill.name} prior to unpack: "
+                        f"expected {skill.sha256}, got {pre_unpack_hash}"
+                    )
+                bundle_fh.seek(0)
+                bundle_manifest = unpack_skill_bundle(bundle_fh, tmp)
             verify_bundle_contents(bundle_manifest, tmp)
 
             meta_dir = tmp / SKILL_META_DIR
