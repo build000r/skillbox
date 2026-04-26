@@ -159,8 +159,10 @@ def check(path):
             )
             if ahead.stdout.strip():
                 problems.append(f"unpushed:{path}")
-    except Exception:
-        pass
+    except Exception as exc:
+        # Repo unreachable on the remote box (permissions, broken mount, etc.).
+        # Refuse to assume it is clean — that would mask real uncommitted work.
+        problems.append(f"inaccessible:{path}: {exc.__class__.__name__}: {exc}")
     return problems
 
 search_roots = []
