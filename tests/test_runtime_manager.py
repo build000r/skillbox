@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -71,6 +72,39 @@ class RuntimeManagerTests(unittest.TestCase):
 
         self.assertTrue(manageable)
         self.assertIsNone(reason)
+
+    def test_start_services_preserves_self_managed_pid_file(self) -> None:
+        from runtime_manager.runtime_ops import start_services, stop_process
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            log_dir = root / "logs" / "runtime"
+            pid_file = log_dir / "self-managed.pid"
+            service = {
+                "id": "self-managed",
+                "kind": "daemon",
+                "command": f"sh -c 'sleep 30 & echo $! > {shlex.quote(str(pid_file))}; sleep 1'",
+                "healthcheck": {
+                    "type": "path_exists",
+                    "host_path": str(pid_file),
+                },
+            }
+            model = {
+                "root_dir": str(root),
+                "env": {},
+                "logs": [{"id": "runtime", "host_path": str(log_dir)}],
+                "repos": [],
+                "artifacts": [],
+            }
+
+            results = start_services(model, [service], dry_run=False, wait_seconds=2)
+            server_pid = int(pid_file.read_text(encoding="utf-8").strip())
+            try:
+                self.assertEqual(results[0]["result"], "started")
+                self.assertEqual(results[0]["pid"], server_pid)
+                self.assertTrue(server_pid > 0)
+            finally:
+                stop_process(server_pid, 1)
 
     def test_sync_creates_core_runtime_state_and_installs_default_skills(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
