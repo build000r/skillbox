@@ -2812,6 +2812,11 @@ def start_services(
         cwd = resolve_runtime_command_cwd(model, launch_service)
         result["command"] = command
         result["cwd"] = str(cwd)
+        healthcheck = launch_service.get("healthcheck") or {}
+        self_managed_pid_file = (
+            healthcheck.get("type") == "path_exists"
+            and str(healthcheck.get("host_path") or "") == str(paths["pid_file"])
+        )
 
         ensure_directory(paths["log_dir"], dry_run)
         if dry_run:
@@ -2831,22 +2836,24 @@ def start_services(
                 text=True,
             )
 
-        try:
-            tmp_pid = paths["pid_file"].with_suffix(paths["pid_file"].suffix + ".tmp")
-            tmp_pid.write_text(f"{process.pid}\n", encoding="utf-8")
-            os.replace(tmp_pid, paths["pid_file"])
-        except OSError:
-            # PID write failed — don't leave an orphan child untracked.
+        if not self_managed_pid_file:
             try:
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                tmp_pid = paths["pid_file"].with_suffix(paths["pid_file"].suffix + ".tmp")
+                tmp_pid.write_text(f"{process.pid}\n", encoding="utf-8")
+                os.replace(tmp_pid, paths["pid_file"])
             except OSError:
-                pass
-            raise
+                # PID write failed — don't leave an orphan child untracked.
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                except OSError:
+                    pass
+                raise
         health_state = wait_for_service_health(service, process, wait_seconds)
         if health_state.get("state") == "failed":
             # Process actually exited — clean up PID file.
             stop_process(process.pid, DEFAULT_SERVICE_STOP_WAIT_SECONDS)
-            remove_pid_file(paths["pid_file"])
+            if not self_managed_pid_file:
+                remove_pid_file(paths["pid_file"])
             tail = tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)
             detail = result | {"result": "failed", "tail": tail}
             if "exit_code" in health_state:
@@ -2886,8 +2893,12 @@ def start_services(
             log_runtime_event("service.reused", service["id"])
             continue
 
-        results.append(result | {"result": "started", "pid": process.pid})
-        log_runtime_event("service.started", service["id"], {"pid": process.pid})
+        started_pid = live_service_pid(paths["pid_file"]) if self_managed_pid_file else process.pid
+        started_detail = result | {"result": "started"}
+        if started_pid is not None:
+            started_detail["pid"] = started_pid
+        results.append(started_detail)
+        log_runtime_event("service.started", service["id"], {"pid": started_pid or process.pid})
     return results
 
 
