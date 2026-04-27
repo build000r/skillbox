@@ -1,0 +1,12 @@
+version: 2
+
+skill_repos:
+  # Optional memory layer. Activate with --profile memory when a box should
+  # include Cass session archaeology and Cass Memory playbooks.
+  - path: ../skills
+    pick:
+      - cass-memory
+
+  - path: ../../../skills-private
+    pick:
+      - cass

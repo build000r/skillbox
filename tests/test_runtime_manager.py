@@ -39,9 +39,8 @@ class RuntimeManagerTests(unittest.TestCase):
             sorted(all_skills),
             sorted(
                 MANAGE_MODULE.HARDENED_SHARED_DEFAULT_SKILLS
-                + ["cass-memory"]
                 + MANAGE_MODULE.HARDENED_CLIENT_PLANNING_SKILLS
-                + ["cass", "smart"],
+                + ["smart"],
             ),
         )
 
