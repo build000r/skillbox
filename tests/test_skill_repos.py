@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 ENV_MANAGER_DIR = ROOT_DIR / ".env-manager"
@@ -26,6 +27,7 @@ from runtime_manager.shared import (
     SKILL_REPOS_LOCKFILE_VERSION,
     _load_skillignore,
     _matches_skillignore,
+    _clone_or_fetch_repo,
     _resolve_skill_dirs,
     clone_dir_name,
     directory_tree_sha256,
@@ -35,6 +37,10 @@ from runtime_manager.shared import (
     load_skill_repos_config,
     write_json_file,
 )
+
+
+def _completed(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
 
 
 class TestSkillReposConfig(unittest.TestCase):
@@ -108,6 +114,107 @@ class TestCloneDirName(unittest.TestCase):
 
     def test_nested_slashes(self) -> None:
         self.assertEqual(clone_dir_name("org/sub/repo"), "org-sub-repo")
+
+
+class TestCloneOrFetchRepo(unittest.TestCase):
+    def test_existing_clone_raises_when_ref_checkout_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clone_root = Path(tmpdir)
+            clone_path = clone_root / "owner-skills"
+            clone_path.mkdir()
+
+            def fake_run_command(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+                if args[:2] == ["git", "status"]:
+                    return _completed()
+                if args[:2] == ["git", "fetch"]:
+                    return _completed()
+                if args[:2] == ["git", "checkout"]:
+                    return _completed(1, stderr="unknown revision")
+                self.fail(f"unexpected command after checkout failure: {args}")
+
+            with mock.patch("runtime_manager.shared.run_command", side_effect=fake_run_command):
+                with self.assertRaises(RuntimeError) as ctx:
+                    _clone_or_fetch_repo("owner/skills", "missing-ref", clone_root, dry_run=False)
+
+            self.assertIn("git checkout failed", str(ctx.exception))
+
+    def test_existing_clone_raises_when_pull_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clone_root = Path(tmpdir)
+            clone_path = clone_root / "owner-skills"
+            clone_path.mkdir()
+
+            def fake_run_command(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+                if args[:2] == ["git", "status"]:
+                    return _completed()
+                if args[:2] == ["git", "fetch"]:
+                    return _completed()
+                if args[:2] == ["git", "checkout"]:
+                    return _completed()
+                if args == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+                    return _completed(stdout="main\n")
+                if args[:3] == ["git", "pull", "--ff-only"]:
+                    return _completed(1, stderr="not possible to fast-forward")
+                self.fail(f"unexpected command after pull failure: {args}")
+
+            with mock.patch("runtime_manager.shared.run_command", side_effect=fake_run_command):
+                with self.assertRaises(RuntimeError) as ctx:
+                    _clone_or_fetch_repo("owner/skills", "main", clone_root, dry_run=False)
+
+            self.assertIn("git pull --ff-only failed", str(ctx.exception))
+
+    def test_existing_clone_does_not_pull_detached_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clone_root = Path(tmpdir)
+            clone_path = clone_root / "owner-skills"
+            clone_path.mkdir()
+            commands: list[list[str]] = []
+
+            def fake_run_command(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+                commands.append(args)
+                if args[:2] == ["git", "status"]:
+                    return _completed()
+                if args[:2] == ["git", "fetch"]:
+                    return _completed()
+                if args[:2] == ["git", "checkout"]:
+                    return _completed()
+                if args == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+                    return _completed(stdout="HEAD\n")
+                if args == ["git", "rev-parse", "HEAD"]:
+                    return _completed(stdout="abc123\n")
+                self.fail(f"unexpected command: {args}")
+
+            with mock.patch("runtime_manager.shared.run_command", side_effect=fake_run_command):
+                action, clone_path, commit = _clone_or_fetch_repo("owner/skills", "v1.2.3", clone_root, dry_run=False)
+
+            self.assertEqual(action, "fetched")
+            self.assertEqual(clone_path, clone_root / "owner-skills")
+            self.assertEqual(commit, "abc123")
+            self.assertNotIn(["git", "pull", "--ff-only"], commands)
+
+    def test_new_clone_checks_out_declared_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clone_root = Path(tmpdir)
+            commands: list[list[str]] = []
+
+            def fake_run_command(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+                commands.append(args)
+                if args[:2] == ["git", "clone"]:
+                    (clone_root / "owner-skills").mkdir()
+                    return _completed()
+                if args[:2] == ["git", "checkout"]:
+                    return _completed()
+                if args[:2] == ["git", "rev-parse"]:
+                    return _completed(stdout="abc123\n")
+                self.fail(f"unexpected command: {args}")
+
+            with mock.patch("runtime_manager.shared.run_command", side_effect=fake_run_command):
+                action, clone_path, commit = _clone_or_fetch_repo("owner/skills", "main", clone_root, dry_run=False)
+
+            self.assertEqual(action, "cloned")
+            self.assertEqual(clone_path, clone_root / "owner-skills")
+            self.assertEqual(commit, "abc123")
+            self.assertIn(["git", "checkout", "main"], commands)
 
 
 class TestSkillignore(unittest.TestCase):
@@ -210,6 +317,44 @@ class TestFilteredCopy(unittest.TestCase):
             sha1 = filtered_copy_skill(source, target1)
             sha2 = filtered_copy_skill(source, target2)
             self.assertEqual(sha1, sha2)
+
+    def test_refuses_same_source_and_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "skill"
+            source.mkdir()
+            (source / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+
+            with self.assertRaises(RuntimeError) as ctx:
+                filtered_copy_skill(source, source)
+
+            self.assertIn("overlapping source and target", str(ctx.exception))
+            self.assertTrue((source / "SKILL.md").is_file())
+
+    def test_refuses_target_inside_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "skill"
+            target = source / "installed"
+            source.mkdir()
+            (source / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+
+            with self.assertRaises(RuntimeError) as ctx:
+                filtered_copy_skill(source, target)
+
+            self.assertIn("overlapping source and target", str(ctx.exception))
+            self.assertFalse(target.exists())
+
+    def test_refuses_source_inside_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "install"
+            source = target / "skill"
+            source.mkdir(parents=True)
+            (source / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+
+            with self.assertRaises(RuntimeError) as ctx:
+                filtered_copy_skill(source, target)
+
+            self.assertIn("overlapping source and target", str(ctx.exception))
+            self.assertTrue((source / "SKILL.md").is_file())
 
 
 class TestResolveSkillDirs(unittest.TestCase):

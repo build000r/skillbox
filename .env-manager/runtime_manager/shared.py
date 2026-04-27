@@ -2516,6 +2516,24 @@ def _matches_skillignore(rel_path: str, patterns: list[str]) -> bool:
 
 def filtered_copy_skill(source_dir: Path, target_dir: Path) -> str:
     """Copy a skill directory to target, respecting .skillignore. Returns tree SHA."""
+    resolved_source = source_dir.resolve()
+    resolved_target = target_dir.resolve()
+    try:
+        resolved_source.relative_to(resolved_target)
+        overlaps = True
+    except ValueError:
+        overlaps = False
+    try:
+        resolved_target.relative_to(resolved_source)
+        overlaps = True
+    except ValueError:
+        pass
+    if overlaps:
+        raise RuntimeError(
+            "Refusing to install skill with overlapping source and target paths: "
+            f"{source_dir} -> {target_dir}"
+        )
+
     patterns = _load_skillignore(source_dir)
 
     remove_path(target_dir)
@@ -2599,9 +2617,26 @@ def _clone_or_fetch_repo(
 
             checkout_result = run_command(["git", "checkout", ref], cwd=clone_path)
             if checkout_result.returncode != 0:
-                run_command(["git", "checkout", f"origin/{ref}"], cwd=clone_path)
+                checkout_result = run_command(["git", "checkout", f"origin/{ref}"], cwd=clone_path)
+            if checkout_result.returncode != 0:
+                raise RuntimeError(
+                    f"SKILL_REPO_CLONE_FAILED: git checkout failed for {repo}@{ref}: "
+                    f"{checkout_result.stderr.strip() or checkout_result.stdout.strip()}"
+                )
 
-            pull_result = run_command(["git", "pull", "--ff-only"], cwd=clone_path)
+            branch_result = run_command(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=clone_path)
+            checked_out_branch = (
+                branch_result.returncode == 0
+                and branch_result.stdout.strip()
+                and branch_result.stdout.strip() != "HEAD"
+            )
+            if checked_out_branch:
+                pull_result = run_command(["git", "pull", "--ff-only"], cwd=clone_path)
+                if pull_result.returncode != 0:
+                    raise RuntimeError(
+                        f"SKILL_REPO_CLONE_FAILED: git pull --ff-only failed for {repo}@{ref}: "
+                        f"{pull_result.stderr.strip() or pull_result.stdout.strip()}"
+                    )
 
             rev_result = run_command(["git", "rev-parse", "HEAD"], cwd=clone_path)
             commit = rev_result.stdout.strip() if rev_result.returncode == 0 else None
@@ -2628,8 +2663,14 @@ def _clone_or_fetch_repo(
                 f"{clone_result.stderr.strip()}"
             )
 
-    if ref != "main" and ref != "master":
-        run_command(["git", "checkout", ref], cwd=clone_path)
+    checkout_result = run_command(["git", "checkout", ref], cwd=clone_path)
+    if checkout_result.returncode != 0:
+        checkout_result = run_command(["git", "checkout", f"origin/{ref}"], cwd=clone_path)
+    if checkout_result.returncode != 0:
+        raise RuntimeError(
+            f"SKILL_REPO_CLONE_FAILED: git checkout failed for {repo}@{ref}: "
+            f"{checkout_result.stderr.strip() or checkout_result.stdout.strip()}"
+        )
 
     rev_result = run_command(["git", "rev-parse", "HEAD"], cwd=clone_path)
     commit = rev_result.stdout.strip() if rev_result.returncode == 0 else None

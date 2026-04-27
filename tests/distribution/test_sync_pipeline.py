@@ -702,6 +702,25 @@ class TestSyncDistributorSources(unittest.TestCase):
         self.assertEqual(me.manifest_version, 14)
 
     @mock.patch.dict(os.environ, {"TEST_DIST_KEY": TEST_API_KEY})
+    def test_model_level_sync_uses_configured_state_root_for_cache(self) -> None:
+        custom_state_root = self.tmpdir / "custom-state"
+        model = dict(self.model)
+        model["storage"] = {"state_root": str(custom_state_root)}
+
+        sync_distributor_sources(model, dry_run=False)
+
+        self.assertTrue((custom_state_root / "manifests" / f"{TEST_DISTRIBUTOR_ID}.json").is_file())
+        self.assertTrue(
+            (
+                custom_state_root
+                / "bundle-cache"
+                / "deploy"
+                / "deploy-v8.skillbundle.tar.gz"
+            ).is_file()
+        )
+        self.assertFalse((self.root_dir / ".skillbox-state" / "manifests").exists())
+
+    @mock.patch.dict(os.environ, {"TEST_DIST_KEY": TEST_API_KEY})
     def test_model_level_sync_merges_with_existing_repo_entries(self) -> None:
         """Existing repo-sourced entries in lockfile are preserved after merge."""
         existing_lock = {
