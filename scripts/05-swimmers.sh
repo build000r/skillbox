@@ -328,6 +328,7 @@ inside_main() {
       cd "${swimmers_run_dir}"
       nohup env \
         PORT="${swimmers_port}" \
+        SWIMMERS_BIND="${swimmers_publish_host}" \
         AUTH_MODE="${swimmers_auth_mode}" \
         AUTH_TOKEN="${swimmers_auth_token}" \
         OBSERVER_TOKEN="${swimmers_observer_token}" \

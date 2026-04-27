@@ -20,7 +20,6 @@ skill_repos:
   # Local skills under active development
   - path: ../skills
     pick:
-      - cass-memory
       - dev-sanity
       - skillbox-operator
 
@@ -41,7 +40,6 @@ skill_repos:
   # Private local skills that should ship with the default box setup
   - path: ../../../skills-private
     pick:
-      - cass
       - changelog-md-workmanship
       - readme-writing
       - smart

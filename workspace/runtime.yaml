@@ -65,7 +65,7 @@ core:
       path: ${SKILLBOX_CASS_BIN}
       required: false
       profiles:
-        - core
+        - memory
       source:
         kind: url
         url: ${SKILLBOX_CASS_DOWNLOAD_URL}
@@ -103,7 +103,7 @@ core:
       path: ${SKILLBOX_CM_BIN}
       required: false
       profiles:
-        - core
+        - memory
       source:
         kind: url
         url: ${SKILLBOX_CM_DOWNLOAD_URL}
@@ -134,6 +134,23 @@ core:
         - id: codex
           path: ${SKILLBOX_HOME_ROOT}/.codex/skills
       notes: Clone skill repos and filtered-install skills into managed Claude and Codex homes.
+
+    - id: memory-skills
+      kind: skill-repo-set
+      required: false
+      profiles:
+        - memory
+      skill_repos_config: ${SKILLBOX_WORKSPACE_ROOT}/workspace/skill-repos-memory.yaml
+      lock_path: ${SKILLBOX_WORKSPACE_ROOT}/workspace/skill-repos-memory.lock.json
+      clone_root: ${SKILLBOX_WORKSPACE_ROOT}/workspace/skill-repos
+      sync:
+        mode: clone-and-install
+      install_targets:
+        - id: claude
+          path: ${SKILLBOX_HOME_ROOT}/.claude/skills
+        - id: codex
+          path: ${SKILLBOX_HOME_ROOT}/.codex/skills
+      notes: Optional Cass-backed memory skills. Keep this out of lean boxes unless the memory profile is explicitly active.
 
   services:
     - id: internal-env-manager
@@ -220,7 +237,7 @@ core:
       artifact: cm-bin
       required: false
       profiles:
-        - core
+        - memory
       command: ${SKILLBOX_CM_BIN} serve --port ${SKILLBOX_CM_MCP_PORT}
       env:
         CASS_MEMORY_LLM: none
@@ -369,7 +386,7 @@ core:
       path: ${SKILLBOX_CASS_BIN}
       required: false
       profiles:
-        - core
+        - memory
       notes: cass session indexer should be installed for cm history search.
 
     - id: cm-binary
@@ -377,7 +394,7 @@ core:
       path: ${SKILLBOX_CM_BIN}
       required: false
       profiles:
-        - core
+        - memory
       notes: CASS Memory System (cm) should be installed for agent procedural memory.
 
     - id: fwc-binary

@@ -357,7 +357,7 @@ Safety model:
 
 - the swimmers port is `3210`
 - the compose overlay publishes only to `127.0.0.1` by default
-- remote access requires opting in with `SKILLBOX_SWIMMERS_PUBLISH_HOST=0.0.0.0`
+- remote access requires opting in with `SKILLBOX_SWIMMERS_PUBLISH_HOST=0.0.0.0` (the helper exports this as `SWIMMERS_BIND`)
 - non-loopback publishing is blocked unless `SKILLBOX_SWIMMERS_AUTH_MODE=token` and `SKILLBOX_SWIMMERS_AUTH_TOKEN` are set
 
 Remote operator example:
@@ -1001,18 +1001,20 @@ skill_repos:
     pick: [ask-cascade, build-vs-clone, describe, reproduce, commit]
 
   - path: ../skills
-    pick: [cass-memory, dev-sanity, skillbox-operator]
+    pick: [dev-sanity, skillbox-operator]
 
   - path: ../../skills
     pick: [cli-ergonomics, audit-plans, crap, divide-and-conquer, domain-planner, domain-reviewer, domain-scaffolder, mutate, oss-doc-audit, skill-issue]
 
   - path: ../../../skills-private
-    pick: [cass, changelog-md-workmanship, readme-writing, smart]
+    pick: [changelog-md-workmanship, readme-writing, smart]
 ```
 
 Each entry is either a GitHub repo (cloned into `workspace/skill-repos/`) or a
 local path (referenced directly). `sync` clones or fetches repos, filtered-copies
 skill directories into `~/.claude/skills/` and `~/.codex/skills/`, and writes a
+lockfile. Cass-backed memory skills live in `workspace/skill-repos-memory.yaml`
+and are installed only when the `memory` profile is active.
 lock file with resolved commit SHAs.
 
 `skill_repos` also supports distributor-backed sources for reviewed

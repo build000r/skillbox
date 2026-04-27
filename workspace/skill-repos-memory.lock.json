@@ -1,0 +1,21 @@
+{
+  "config_sha": "64bfe03ba7f6df224b377c220b2e46ba5519ca98fa390f2086a373c3213f21cd",
+  "skills": [
+    {
+      "declared_ref": null,
+      "install_tree_sha": "d3d960b90f9410c2c349a0bbb2d12506b257b20feabb2a0c9b44b97a6e5bc74c",
+      "name": "cass-memory",
+      "resolved_commit": null,
+      "source_path": "../skills"
+    },
+    {
+      "declared_ref": null,
+      "install_tree_sha": "eec4c6edd013ab7d560ddc7e758533344b6828dab7df06d47d1ea745d478cf3f",
+      "name": "cass",
+      "resolved_commit": null,
+      "source_path": "../../../skills-private"
+    }
+  ],
+  "synced_at": "2026-04-27T22:58:36.249038+00:00",
+  "version": 2
+}
