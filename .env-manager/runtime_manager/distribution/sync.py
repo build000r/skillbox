@@ -30,7 +30,7 @@ from .manifest import parse_manifest, verify_manifest
 from .pin_resolver import resolve_pin
 from .signing import SignatureVerificationError, load_public_key
 
-from ..shared import atomic_write_text
+from ..shared import atomic_write_text, host_path_to_absolute_path
 from ..shared_distribution import (
     DistributorConfig,
     DistributorSetSource,
@@ -313,7 +313,14 @@ def sync_distributor_sources(model: dict[str, Any], dry_run: bool) -> list[str]:
         config_path = Path(str(skillset.get("skill_repos_config_host_path", "")))
         lock_path = Path(str(skillset.get("lock_path_host_path", "")))
         root_dir = Path(str(model.get("root_dir", "")))
-        state_root = root_dir / ".skillbox-state"
+        storage = model.get("storage") if isinstance(model.get("storage"), dict) else {}
+        env_values = model.get("env") if isinstance(model.get("env"), dict) else {}
+        raw_state_root = str(
+            (storage or {}).get("state_root")
+            or (env_values or {}).get("SKILLBOX_STATE_ROOT")
+            or ".skillbox-state"
+        ).strip()
+        state_root = host_path_to_absolute_path(root_dir, raw_state_root)
 
         try:
             config = load_skill_repos_config(config_path)
