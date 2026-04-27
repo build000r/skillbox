@@ -1000,7 +1000,7 @@ skill_repos:
     ref: main
     pick: [ask-cascade, audit-plans, build-vs-clone, cli-ergonomics, commit, crap, describe, divide-and-conquer, domain-planner, domain-reviewer, domain-scaffolder, mutate, oss-doc-audit, reproduce, skill-issue]
 
-  - path: skills
+  - path: ../skills
     pick: [dev-sanity, skillbox-operator]
 ```
 
