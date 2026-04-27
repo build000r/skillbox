@@ -152,7 +152,30 @@ echo "[8/9] Enabling fail2ban..."
 systemctl enable --now fail2ban
 
 echo "[9/9] Enabling swapfile (delegates to 01b-enable-swap.sh)..."
-bash "$(dirname "$0")/01b-enable-swap.sh"
+swap_helper="$(dirname "$0")/01b-enable-swap.sh"
+if [[ -f "${swap_helper}" ]]; then
+  bash "${swap_helper}"
+else
+  swapfile="${SWAPFILE:-/swapfile}"
+  swapsize="${SWAPSIZE:-2G}"
+  if swapon --show=NAME --noheadings | grep -qx "${swapfile}"; then
+    echo "  Swap already active at ${swapfile}."
+  else
+    if [[ ! -f "${swapfile}" ]]; then
+      if command -v fallocate >/dev/null 2>&1; then
+        fallocate -l "${swapsize}" "${swapfile}"
+      else
+        dd if=/dev/zero of="${swapfile}" bs=1M count=2048 status=none
+      fi
+      chmod 600 "${swapfile}"
+      mkswap "${swapfile}" >/dev/null
+    fi
+    swapon "${swapfile}"
+  fi
+  grep -qE "^[^#[:space:]]+[[:space:]]+none[[:space:]]+swap[[:space:]]" /etc/fstab \
+    || echo "${swapfile} none swap sw 0 0" >> /etc/fstab
+  echo "  Swap enabled at ${swapfile}."
+fi
 
 echo
 echo "Bootstrap complete."
