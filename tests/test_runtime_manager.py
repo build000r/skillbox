@@ -43,6 +43,35 @@ class RuntimeManagerTests(unittest.TestCase):
             ),
         )
 
+    def test_optional_service_artifact_check_uses_host_path(self) -> None:
+        from runtime_manager.runtime_ops import service_supports_lifecycle
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "bin" / "tool"
+            artifact_path.parent.mkdir(parents=True)
+            artifact_path.write_text("#!/bin/sh\n", encoding="utf-8")
+
+            manageable, reason = service_supports_lifecycle(
+                {
+                    "id": "tool-service",
+                    "command": "tool serve",
+                    "artifact": "tool-bin",
+                    "required": False,
+                },
+                {
+                    "artifacts": [
+                        {
+                            "id": "tool-bin",
+                            "path": "/home/sandbox/.local/bin/tool",
+                            "host_path": str(artifact_path),
+                        }
+                    ]
+                },
+            )
+
+        self.assertTrue(manageable)
+        self.assertIsNone(reason)
+
     def test_sync_creates_core_runtime_state_and_installs_default_skills(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
