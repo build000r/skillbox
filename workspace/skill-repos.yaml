@@ -28,7 +28,7 @@ skill_repos:
       - skill-issue
 
   # Local skills shipped with this repo.
-  - path: skills
+  - path: ../skills
     pick:
       - dev-sanity
       - skillbox-operator
