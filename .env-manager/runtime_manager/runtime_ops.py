@@ -1378,7 +1378,7 @@ def service_supports_lifecycle(
     if artifact_id and model is not None and not service.get("required", True):
         for artifact in model.get("artifacts") or []:
             if str(artifact.get("id", "")).strip() == artifact_id:
-                artifact_path = str(artifact.get("path") or "").strip()
+                artifact_path = str(artifact.get("host_path") or artifact.get("path") or "").strip()
                 if artifact_path and not Path(artifact_path).exists():
                     return False, f"artifact {artifact_id!r} not available"
                 break
