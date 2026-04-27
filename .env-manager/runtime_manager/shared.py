@@ -123,7 +123,6 @@ HARDENED_SHARED_DEFAULT_SKILLS = [
     "ask-cascade",
     "audit-plans",
     "build-vs-clone",
-    "changelog-md-workmanship",
     "cli-ergonomics",
     "describe",
     "reproduce",
@@ -132,7 +131,6 @@ HARDENED_SHARED_DEFAULT_SKILLS = [
     "dev-sanity",
     "mutate",
     "oss-doc-audit",
-    "readme-writing",
     "skill-issue",
     "skillbox-operator",
 ]

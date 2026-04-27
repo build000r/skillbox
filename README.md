@@ -998,24 +998,19 @@ version: 2
 skill_repos:
   - repo: build000r/skills
     ref: main
-    pick: [ask-cascade, build-vs-clone, describe, reproduce, commit]
+    pick: [ask-cascade, audit-plans, build-vs-clone, cli-ergonomics, commit, crap, describe, divide-and-conquer, domain-planner, domain-reviewer, domain-scaffolder, mutate, oss-doc-audit, reproduce, skill-issue]
 
-  - path: ../skills
+  - path: skills
     pick: [dev-sanity, skillbox-operator]
-
-  - path: ../../skills
-    pick: [cli-ergonomics, audit-plans, crap, divide-and-conquer, domain-planner, domain-reviewer, domain-scaffolder, mutate, oss-doc-audit, skill-issue]
-
-  - path: ../../../skills-private
-    pick: [changelog-md-workmanship, readme-writing, smart]
 ```
 
 Each entry is either a GitHub repo (cloned into `workspace/skill-repos/`) or a
 local path (referenced directly). `sync` clones or fetches repos, filtered-copies
 skill directories into `~/.claude/skills/` and `~/.codex/skills/`, and writes a
-lockfile. Cass-backed memory skills live in `workspace/skill-repos-memory.yaml`
-and are installed only when the `memory` profile is active.
-lock file with resolved commit SHAs.
+lock file with resolved commit SHAs. Private writing skills and Cass-backed
+memory skills are intentionally outside the core pack; Cass-backed memory skills
+live in `workspace/skill-repos-memory.yaml` and are installed only when the
+`memory` profile is active.
 
 `skill_repos` also supports distributor-backed sources for reviewed
 multi-client skill delivery. A config can declare a top-level `distributors`
