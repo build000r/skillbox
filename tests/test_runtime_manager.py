@@ -39,8 +39,7 @@ class RuntimeManagerTests(unittest.TestCase):
             sorted(all_skills),
             sorted(
                 MANAGE_MODULE.HARDENED_SHARED_DEFAULT_SKILLS
-                + MANAGE_MODULE.HARDENED_CLIENT_PLANNING_SKILLS
-                + ["smart"],
+                + MANAGE_MODULE.HARDENED_CLIENT_PLANNING_SKILLS,
             ),
         )
 

@@ -12,34 +12,23 @@ skill_repos:
     ref: main
     pick:
       - ask-cascade
-      - build-vs-clone
-      - describe
-      - reproduce
-      - commit
-
-  # Local skills under active development
-  - path: ../skills
-    pick:
-      - dev-sanity
-      - skillbox-operator
-
-  # Shared workflow skills from the main opensource skills repo
-  - path: ../../skills
-    pick:
-      - cli-ergonomics
       - audit-plans
+      - build-vs-clone
+      - cli-ergonomics
+      - commit
       - crap
+      - describe
       - divide-and-conquer
       - domain-planner
       - domain-reviewer
       - domain-scaffolder
       - mutate
       - oss-doc-audit
+      - reproduce
       - skill-issue
 
-  # Private local skills that should ship with the default box setup
-  - path: ../../../skills-private
+  # Local skills shipped with this repo.
+  - path: skills
     pick:
-      - changelog-md-workmanship
-      - readme-writing
-      - smart
+      - dev-sanity
+      - skillbox-operator
