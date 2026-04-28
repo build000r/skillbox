@@ -120,9 +120,12 @@ class BoxRefactorTests(unittest.TestCase):
                 "ssh_cmd",
                 side_effect=[
                     _completed(stdout="100.64.0.1\n"),
+                    _completed(stdout='{"env_updates":["SKILLBOX_STATE_ROOT"],"mcp_config":"created"}\n'),
+                    _completed(stdout="launch ok\n"),
                     _completed(stdout='{"client_id":"alpha","active_profiles":["core","ops"],"created_client":true}\n'),
                 ],
             ), \
+            mock.patch.object(BOX, "_verify_operator_swimmers_surface", return_value={"skipped": "no swimmers profile"}), \
             mock.patch.object(BOX, "save_inventory"), \
             mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
             result = BOX.cmd_up(
@@ -131,6 +134,7 @@ class BoxRefactorTests(unittest.TestCase):
                 blueprint=None,
                 set_args=[],
                 deploy_manifest="/tmp/deploy.json",
+                resume=False,
                 dry_run=False,
                 fmt="json",
             )
@@ -141,7 +145,7 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertEqual(payload["tailscale_ip"], "100.64.0.1")
         self.assertEqual(payload["storage"]["mount_path"], "/srv/skillbox")
         self.assertEqual(payload["volume"]["name"], "skillbox-state-alpha")
-        self.assertEqual([step["status"] for step in payload["steps"]], ["ok", "ok", "ok", "ok", "ok", "ok", "ok"])
+        self.assertEqual([step["status"] for step in payload["steps"]], ["ok", "ok", "ok", "ok", "ok", "ok", "ok", "ok", "ok", "ok"])
 
     def test_cmd_up_returns_structured_error_when_deploy_fails(self) -> None:
         profile = BOX.BoxProfile(id="dev-small", storage=_storage())
@@ -173,6 +177,7 @@ class BoxRefactorTests(unittest.TestCase):
                 blueprint=None,
                 set_args=[],
                 deploy_manifest="/tmp/deploy.json",
+                resume=False,
                 dry_run=False,
                 fmt="json",
             )
@@ -196,6 +201,7 @@ class BoxRefactorTests(unittest.TestCase):
                 blueprint=None,
                 set_args=[],
                 deploy_manifest=None,
+                resume=False,
                 dry_run=True,
                 fmt="json",
             )
@@ -204,7 +210,7 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertTrue(payloads[-1]["dry_run"])
         self.assertEqual(
             [step["status"] for step in payloads[-1]["steps"]],
-            ["skip", "skip", "skip", "skip", "skip", "skip"],
+            ["skip", "skip", "skip", "skip", "skip", "skip", "skip", "skip", "skip"],
         )
 
     def test_cmd_up_returns_conflict_for_existing_active_box(self) -> None:
@@ -220,6 +226,7 @@ class BoxRefactorTests(unittest.TestCase):
                 blueprint=None,
                 set_args=[],
                 deploy_manifest=None,
+                resume=False,
                 dry_run=False,
                 fmt="json",
             )
@@ -239,6 +246,7 @@ class BoxRefactorTests(unittest.TestCase):
                 blueprint=None,
                 set_args=[],
                 deploy_manifest=None,
+                resume=False,
                 dry_run=False,
                 fmt="json",
             )
@@ -259,6 +267,7 @@ class BoxRefactorTests(unittest.TestCase):
                 blueprint=None,
                 set_args=[],
                 deploy_manifest="/tmp/deploy.json",
+                resume=False,
                 dry_run=False,
                 fmt="json",
             )
@@ -288,9 +297,12 @@ class BoxRefactorTests(unittest.TestCase):
                 "ssh_cmd",
                 side_effect=[
                     _completed(stdout="100.64.0.1\n"),
+                    _completed(stdout='{"env_updates":["SKILLBOX_STATE_ROOT"],"mcp_config":"created"}\n'),
+                    _completed(stdout="launch ok\n"),
                     _completed(returncode=1, stderr="first-box failed"),
                 ],
             ), \
+            mock.patch.object(BOX, "_verify_operator_swimmers_surface", return_value={"skipped": "no swimmers profile"}), \
             mock.patch.object(BOX, "save_inventory"), \
             mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
             result = BOX.cmd_up(
@@ -299,6 +311,7 @@ class BoxRefactorTests(unittest.TestCase):
                 blueprint=None,
                 set_args=[],
                 deploy_manifest="/tmp/deploy.json",
+                resume=False,
                 dry_run=False,
                 fmt="json",
             )

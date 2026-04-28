@@ -588,7 +588,12 @@ def focus_step_detail(
 def load_mcp_server_configs(root_dir: Path) -> dict[str, Any]:
     config_path = root_dir / MCP_CONFIG_REL
     if not config_path.is_file():
-        raise RuntimeError(f"Missing MCP config at {repo_rel(root_dir, config_path)}.")
+        return {
+            "skillbox": {
+                "command": "python3",
+                "args": ["/workspace/.env-manager/mcp_server.py"],
+            }
+        }
     try:
         payload = json.loads(config_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:

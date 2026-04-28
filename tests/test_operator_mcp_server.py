@@ -25,6 +25,14 @@ def _content_payload(result: dict) -> dict:
 
 
 class OperatorMcpServerTests(unittest.TestCase):
+    def test_operator_provision_schema_surfaces_spaps_auth_blueprint(self) -> None:
+        tool = next(item for item in MODULE.TOOLS if item["name"] == "operator_provision")
+        blueprint_prop = tool["inputSchema"]["properties"]["blueprint"]
+        description = blueprint_prop["description"]
+        self.assertIn("git-repo-http-service-bootstrap-spaps-auth", description)
+        self.assertIn("SPAPS local auth/RBAC fixtures", description)
+        self.assertEqual(blueprint_prop["default"], MODULE.DEFAULT_FIRST_BOX_BLUEPRINT)
+
     def test_load_dotenv_only_sets_missing_keys(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             env_path = Path(tmpdir) / ".env"
@@ -51,6 +59,7 @@ class OperatorMcpServerTests(unittest.TestCase):
                     "deploy_manifest": "/tmp/deploy.json",
                     "blueprint": "git-repo",
                     "set_vars": ["FOO=bar"],
+                    "resume": True,
                     "dry_run": True,
                 }
             )
@@ -64,8 +73,21 @@ class OperatorMcpServerTests(unittest.TestCase):
         self.assertIn("--deploy-manifest", args)
         self.assertIn("--blueprint", args)
         self.assertIn("--set", args)
+        self.assertIn("--resume", args)
         self.assertIn("--dry-run", args)
+        self.assertEqual(run_script.call_args.kwargs["timeout"], MODULE.PROVISION_TIMEOUT_SECONDS)
         emit_event.assert_called_once()
+
+    def test_handle_operator_provision_relies_on_box_default_blueprint_when_unspecified(self) -> None:
+        with mock.patch.object(
+            MODULE,
+            "run_script",
+            return_value=(True, 0, {"box_id": "alpha"}),
+        ) as run_script, mock.patch.object(MODULE, "emit_event"):
+            MODULE.handle_operator_provision({"box_id": "alpha"})
+
+        args = run_script.call_args.args[1]
+        self.assertNotIn("--blueprint", args)
 
     def test_handle_operator_teardown_stamps_marker_for_dry_run(self) -> None:
         error_payload = _content_payload(MODULE.handle_operator_teardown({}))

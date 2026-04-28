@@ -19,7 +19,7 @@ python3 .env-manager/manage.py client-init --list-blueprints
 python3 .env-manager/manage.py first-box personal --format json
 python3 .env-manager/manage.py private-init --path ../skillbox-config --format json
 python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo-http-service-bootstrap --set PRIMARY_REPO_URL=https://github.com/acme/app.git --set BOOTSTRAP_COMMAND='pnpm install && mkdir -p .skillbox && touch .skillbox/bootstrap.ok' --set SERVICE_COMMAND='pnpm dev'
-python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo-http-service-bootstrap-spaps-auth --set PRIMARY_REPO_URL=https://github.com/acme/app.git --set BOOTSTRAP_COMMAND='pnpm install && mkdir -p .skillbox && touch .skillbox/bootstrap.ok' --set SERVICE_COMMAND='pnpm dev'
+python3 .env-manager/manage.py client-init acme-studio --blueprint git-repo-http-service-bootstrap-spaps-auth --set PRIMARY_REPO_URL=https://github.com/acme/app.git --set BOOTSTRAP_COMMAND='pnpm install && mkdir -p .skillbox && touch .skillbox/bootstrap.ok' --set SERVICE_COMMAND='pnpm dev' --set SPAPS_CLI_PACKAGE=spaps@0.7.7
 python3 .env-manager/manage.py client-project personal
 python3 .env-manager/manage.py client-project personal --profile surfaces --output-dir ./builds/clients/personal-surfaces
 python3 .env-manager/manage.py client-diff personal --profile surfaces
@@ -54,7 +54,10 @@ The mental model is:
   checks to that scaffold so `render`, `sync`, and `up` immediately work on a
   concrete client shape; `git-repo-http-service-bootstrap` is the generic path,
   and `git-repo-http-service-bootstrap-spaps-auth` adds managed SPAPS local auth
-  plus repo-local fixture bootstrap
+  plus repo-local fixture bootstrap with non-interactive `npx --yes` CLI
+  execution; the blueprint defaults `SPAPS_CLI_PACKAGE=spaps@0.7.7` as the core
+  contract, override with `--set SPAPS_CLI_PACKAGE=spaps@x.y.z` for a different
+  version
 - `first-box <client>` is the canonical first-run path: it runs `private-init`,
   reuses or scaffolds the selected client, proves readiness with `acceptance`,
   and writes `sand/<client>/` via `client-open`

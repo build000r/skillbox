@@ -12,6 +12,7 @@ import unittest
 import zipfile
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 
@@ -1955,7 +1956,9 @@ class RuntimeManagerTests(unittest.TestCase):
                 services["app-dev"]["bootstrap_tasks"],
                 ["app-bootstrap", "spaps-fixtures"],
             )
-            self.assertIn("npx spaps local", services["auth-api"]["command"])
+            self.assertIn("npx --yes spaps@0.7.7 local", services["auth-api"]["command"])
+            fixtures_task = next(item for item in render_payload["tasks"] if item["id"] == "spaps-fixtures")
+            self.assertIn("npx --yes spaps@0.7.7 fixtures apply", fixtures_task["command"])
 
     def test_client_init_with_blueprint_requires_declared_variables(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5670,6 +5673,7 @@ class RuntimeManagerTests(unittest.TestCase):
 
             # Should still complete (checks fail but focus continues)
             payload = json.loads(result.stdout)
+            self.assertEqual(payload["client_id"], "personal")
             claude_md = (repo / "home" / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
             self.assertIn("## Attention", claude_md)
             self.assertIn("CHECK FAIL", claude_md)

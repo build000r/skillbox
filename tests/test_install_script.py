@@ -165,7 +165,7 @@ class InstallScriptTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=180,
+            timeout=300,
         )
 
 

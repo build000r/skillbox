@@ -426,6 +426,8 @@ conversation.
 
 # or via make targets
 make box-up BOX=acme-prod PROFILE=dev-large
+# resume a partial first-box/deploy failure without rebuilding the droplet
+make box-up BOX=acme-prod PROFILE=dev-large DEPLOY_MANIFEST=clients/acme-prod/deploy.json RESUME=1
 make box-status BOX=acme-prod
 make box-list
 make box-ssh BOX=acme-prod
@@ -609,6 +611,7 @@ Or via make:
 
 ```bash
 make box-up BOX=dev-01 PROFILE=dev-small
+make box-up BOX=dev-01 PROFILE=dev-small DEPLOY_MANIFEST=clients/dev-01/deploy.json RESUME=1
 ```
 
 ### Option 4: Copy into an existing repo workspace
@@ -701,7 +704,7 @@ make runtime-sync
 | `make swimmers-status` | Reports swimmers process and probe state inside the workspace container |
 | `make swimmers-logs` | Tails swimmers server logs from inside the workspace container |
 | `make swimmers-runtime-status` | Shows the runtime-manager view of the swimmers overlay |
-| `make box-up` | Provision a new remote box (DO + Tailscale) |
+| `make box-up` | Provision a new remote box (DO + Tailscale), or resume a partial provision with `RESUME=1` |
 | `make box-down` | Tear down a remote box |
 | `make box-status` | Health-check a remote box |
 | `make box-list` | List all boxes from inventory |
@@ -1292,14 +1295,20 @@ python3 .env-manager/manage.py client-init acme-studio \
   --blueprint git-repo-http-service-bootstrap-spaps-auth \
   --set PRIMARY_REPO_URL=https://github.com/acme/app.git \
   --set BOOTSTRAP_COMMAND='pnpm install && mkdir -p .skillbox && touch .skillbox/bootstrap.ok' \
-  --set SERVICE_COMMAND='pnpm dev'
+  --set SERVICE_COMMAND='pnpm dev' \
+  --set SPAPS_CLI_PACKAGE=spaps@0.7.7
 ```
+
+The blueprint defaults `SPAPS_CLI_PACKAGE=spaps@0.7.7` as the core contract.
+Override with `--set SPAPS_CLI_PACKAGE=spaps@x.y.z` to use a different version.
 
 That scaffold adds:
 
 - a managed `auth-api` service on `http://127.0.0.1:3301/health`
 - a repo-local SPAPS fixture bootstrap task
 - an app service that depends on auth before startup
+- non-interactive `npx --yes` execution for the SPAPS CLI, pinned to
+  `spaps@0.7.7` by default
 
 Blueprints keep the default client scaffold unless they explicitly set a
 different scaffold pack. They append client-scoped repos, artifacts, tasks,
