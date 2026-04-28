@@ -54,6 +54,51 @@ require_cmd() {
   fi
 }
 
+compose_layer_for_repo() {
+  local repo_dir="$1"
+  local focus_client=""
+  local override=""
+
+  repo_dir="$(cd "${repo_dir}" && pwd -P)"
+  focus_client="$(cd "${repo_dir}" && python3 -c "import json; print(json.load(open('workspace/.focus.json')).get('client_id',''))" 2>/dev/null || true)"
+  override="${repo_dir}/workspace/.compose-overrides/docker-compose.client-${focus_client}.yml"
+  if [[ -n "${focus_client}" && -f "${override}" ]]; then
+    printf '%s\n' "${override}"
+    return 0
+  fi
+  printf '%s\n' "${repo_dir}/docker-compose.monoserver.yml"
+}
+
+repo_lifecycle_target() {
+  local repo_dir="$1"
+  local target="$2"
+  local layer=""
+
+  repo_dir="$(cd "${repo_dir}" && pwd -P)"
+  if have_cmd make && [[ -f "${repo_dir}/Makefile" ]]; then
+    (cd "${repo_dir}" && make "${target}" >/dev/null)
+    return $?
+  fi
+
+  require_cmd docker
+  layer="$(compose_layer_for_repo "${repo_dir}")"
+  case "${target}" in
+    down)
+      (cd "${repo_dir}" && docker compose -f docker-compose.yml -f "${layer}" down >/dev/null)
+      ;;
+    build)
+      (cd "${repo_dir}" && docker compose -f docker-compose.yml -f "${layer}" build >/dev/null)
+      ;;
+    up)
+      (cd "${repo_dir}" && docker compose -f docker-compose.yml -f "${layer}" up -d workspace >/dev/null)
+      ;;
+    *)
+      err "Unsupported lifecycle target: ${target}"
+      return 1
+      ;;
+  esac
+}
+
 sha256_file() {
   local path="$1"
   if have_cmd sha256sum; then
@@ -108,7 +153,7 @@ bring_repo_up() {
   if [[ ! -d "${repo_dir}" ]]; then
     return 0
   fi
-  if ! (cd "${repo_dir}" && make up >/dev/null); then
+  if ! repo_lifecycle_target "${repo_dir}" up; then
     warn "Failed to restart services in ${repo_dir}"
     return 1
   fi
@@ -130,7 +175,7 @@ rollback() {
       move_preserved_paths "${REPO_DIR}" "${PRESERVE_ROOT}" || true
     fi
     if [[ "${SWAPPED}" -eq 1 && -d "${REPO_DIR}" ]]; then
-      (cd "${REPO_DIR}" && make down >/dev/null 2>&1) || true
+      repo_lifecycle_target "${REPO_DIR}" down >/dev/null 2>&1 || true
       rm -rf "${REPO_DIR}"
     fi
     if [[ "${SWAPPED}" -eq 1 && -d "${ROLLBACK_DIR}" ]]; then
@@ -195,7 +240,6 @@ if [[ -z "${ARCHIVE}" || -z "${ARCHIVE_SHA256}" || -z "${REPO_DIR}" || -z "${CLI
   exit 1
 fi
 
-require_cmd make
 require_cmd python3
 require_cmd tar
 if ! have_cmd shasum && ! have_cmd sha256sum; then
@@ -231,10 +275,10 @@ if [[ -z "${STAGED_REPO}" || ! -f "${STAGED_REPO}/.env-manager/manage.py" ]]; th
 fi
 
 info "Stopping current services"
-if (cd "${REPO_DIR}" && make down >/dev/null 2>&1); then
+if repo_lifecycle_target "${REPO_DIR}" down >/dev/null 2>&1; then
   STOPPED_OLD=1
 else
-  warn "make down failed in ${REPO_DIR}; continuing with transactional swap"
+  warn "service stop failed in ${REPO_DIR}; continuing with transactional swap"
 fi
 
 info "Moving runtime-owned state out of the current checkout"
@@ -253,10 +297,10 @@ if [[ ! -f "${REPO_DIR}/.env" && -f "${REPO_DIR}/.env.example" ]]; then
 fi
 
 info "Building upgraded workspace image"
-(cd "${REPO_DIR}" && make build >/dev/null)
+repo_lifecycle_target "${REPO_DIR}" build
 
 info "Starting upgraded workspace"
-(cd "${REPO_DIR}" && make up >/dev/null)
+repo_lifecycle_target "${REPO_DIR}" up
 
 ACCEPTANCE_CMD=(python3 ".env-manager/manage.py" "acceptance" "${CLIENT_ID}" "--format" "json")
 for profile in "${PROFILE_ARGS[@]}"; do

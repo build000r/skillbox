@@ -3120,19 +3120,25 @@ def collect_live_state(
             "recent_errors": [],
         }
         if path.exists():
-            # Scan the most recently modified log file for error-like lines.
+            # Scan several recent files; focus itself can touch newer logs
+            # after a failing service wrote the error the operator needs.
             log_files = sorted(
                 (f for f in path.rglob("*") if f.is_file()),
                 key=lambda f: f.stat().st_mtime,
                 reverse=True,
             )
-            if log_files:
-                lines = tail_lines(log_files[0], 100)
-                errors = [
+            errors: list[str] = []
+            scanned_files: list[str] = []
+            for log_file in log_files[:5]:
+                scanned_files.append(str(log_file.name))
+                lines = tail_lines(log_file, 100)
+                errors.extend(
                     line for line in lines if FOCUS_ERROR_PATTERNS.search(line)
-                ]
-                item["recent_errors"] = errors[-5:]  # Keep at most 5
-                item["scanned_file"] = str(log_files[0].name)
+                )
+            item["recent_errors"] = errors[-5:]  # Keep at most 5
+            if scanned_files:
+                item["scanned_files"] = scanned_files
+                item["scanned_file"] = scanned_files[0]
         log_states.append(item)
 
     session_states: list[dict[str, Any]] = []

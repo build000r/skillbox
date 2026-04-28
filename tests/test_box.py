@@ -100,6 +100,23 @@ class BoxTests(unittest.TestCase):
                 ],
             )
 
+    def test_build_remote_workspace_launch_command_adds_swimmers_overlay_step(self) -> None:
+        command = BOX_MODULE.build_remote_workspace_launch_command(
+            ["core", "swimmers"],
+            repo_dir="/home/skillbox/skillbox",
+        )
+
+        self.assertEqual(
+            shlex.split(command),
+            ["cd", "/home/skillbox/skillbox", "&&", "make", "build", "&&", "make", "up", "&&", "make", "swimmers-start"],
+        )
+
+    def test_remote_contract_command_rejects_multiline_env_values(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "Invalid multiline env value"):
+            BOX_MODULE.normalize_remote_env_updates(
+                {"SKILLBOX_SWIMMERS_AUTH_TOKEN": "one\nTWO=2"}
+            )
+
     def test_build_release_upgrade_args_carries_non_core_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -276,7 +293,7 @@ class BoxTests(unittest.TestCase):
             self.assertTrue(payload["dry_run"])
             self.assertIn("steps", payload)
             step_names = [s["step"] for s in payload["steps"]]
-            self.assertEqual(step_names, ["create", "storage", "bootstrap", "ssh-ready", "enroll", "deploy", "first-box"])
+            self.assertEqual(step_names, ["create", "storage", "bootstrap", "ssh-ready", "enroll", "deploy", "contract", "launch", "first-box", "verify"])
             for s in payload["steps"]:
                 self.assertEqual(s["status"], "skip", f"step {s['step']} should be skip in dry-run")
             self.assertIn("profile", payload)
@@ -461,7 +478,7 @@ class BoxTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads(result.stdout)
             self.assertTrue(payload["dry_run"])
-            self.assertEqual([step["step"] for step in payload["steps"]], ["upload", "upgrade", "verify"])
+            self.assertEqual([step["step"] for step in payload["steps"]], ["upload", "contract", "upgrade", "verify"])
             self.assertTrue(all(step["status"] == "skip" for step in payload["steps"]))
             self.assertEqual(payload["deploy_release"]["source_commit"], "abc123def456")
             self.assertEqual(payload["deploy_release"]["active_profiles"], ["connectors", "core"])

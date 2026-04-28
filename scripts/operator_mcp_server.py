@@ -28,6 +28,8 @@ ENV_BOX_FILE = REPO_ROOT / ".env.box"
 SERVER_NAME = "skillbox-operator"
 SERVER_VERSION = "1.0.0"
 PROTOCOL_VERSION = "2024-11-05"
+DEFAULT_FIRST_BOX_BLUEPRINT = "git-repo-http-service-bootstrap-spaps-auth"
+PROVISION_TIMEOUT_SECONDS = 3600
 
 # ---------------------------------------------------------------------------
 # Shared schema fragments
@@ -118,7 +120,12 @@ TOOLS: list[dict] = [
                 },
                 "blueprint": {
                     "type": "string",
-                    "description": "Client blueprint for the onboard step (e.g. 'git-repo-http-service-bootstrap').",
+                    "description": (
+                        "Client blueprint for the onboard step. Defaults to "
+                        f"'{DEFAULT_FIRST_BOX_BLUEPRINT}' for SPAPS local auth/RBAC fixtures; "
+                        "use 'git-repo-http-service-bootstrap' for a plain app service."
+                    ),
+                    "default": DEFAULT_FIRST_BOX_BLUEPRINT,
                 },
                 "set_vars": {
                     "type": "array",
@@ -127,6 +134,14 @@ TOOLS: list[dict] = [
                         "Blueprint variables as KEY=VALUE strings. "
                         "Example: ['PRIMARY_REPO_URL=https://github.com/acme/app.git']."
                     ),
+                },
+                "resume": {
+                    "type": "boolean",
+                    "description": (
+                        "Resume a partial ssh-ready/deploying/acceptance/onboarding box "
+                        "instead of creating a new droplet."
+                    ),
+                    "default": False,
                 },
                 "dry_run": _DRY_RUN_PROP,
             },
@@ -481,11 +496,17 @@ def handle_operator_provision(params: dict) -> dict:
         args += ["--blueprint", str(params["blueprint"])]
     for sv in (params.get("set_vars") or []):
         args += ["--set", str(sv)]
+    if params.get("resume"):
+        args.append("--resume")
     if params.get("dry_run"):
         args.append("--dry-run")
 
-    ok, _code, data = run_script(BOX_PY, args, timeout=900)
-    emit_event("operator.provision", str(box_id), {"ok": ok, "dry_run": bool(params.get("dry_run"))})
+    ok, _code, data = run_script(BOX_PY, args, timeout=PROVISION_TIMEOUT_SECONDS)
+    emit_event(
+        "operator.provision",
+        str(box_id),
+        {"ok": ok, "dry_run": bool(params.get("dry_run")), "resume": bool(params.get("resume"))},
+    )
     return _ok_content(data) if ok else _error_content(data)
 
 

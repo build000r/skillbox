@@ -10,6 +10,7 @@ Uses doctl, ssh, and tailscale CLIs — no SDK dependencies.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import math
@@ -19,6 +20,8 @@ import shlex
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +35,17 @@ TAILSCALE_SCRIPT = SCRIPT_DIR / "02-install-tailscale.sh"
 UPGRADE_SCRIPT = SCRIPT_DIR / "06-upgrade-release.sh"
 INSTALL_SCRIPT = REPO_ROOT / "install.sh"
 DEFAULT_BOX_CLIENT_ROOT = "${SKILLBOX_MONOSERVER_ROOT}"
+DEFAULT_FIRST_BOX_BLUEPRINT = "git-repo-http-service-bootstrap-spaps-auth"
+DEFAULT_ROOT_MCP_CONFIG = {
+    "mcpServers": {
+        "skillbox": {
+            "command": "python3",
+            "args": ["/workspace/.env-manager/mcp_server.py"],
+        }
+    }
+}
+RESUMABLE_UP_STATES = {"ssh-ready", "deploying", "acceptance", "onboarding"}
+SWIMMERS_ENV_PREFIX = "SKILLBOX_SWIMMERS_"
 
 
 def inventory_path() -> Path:
@@ -151,6 +165,7 @@ def build_first_box_manage_argv(
     blueprint: str | None,
     set_args: list[str],
 ) -> list[str]:
+    effective_blueprint = blueprint or DEFAULT_FIRST_BOX_BLUEPRINT
     argv = [
         "python3",
         ".env-manager/manage.py",
@@ -166,8 +181,7 @@ def build_first_box_manage_argv(
         "json",
     ]
     argv.extend(manage_profile_args(active_profiles))
-    if blueprint:
-        argv.extend(["--blueprint", blueprint])
+    argv.extend(["--blueprint", effective_blueprint])
     for set_arg in set_args:
         argv.extend(["--set", set_arg])
     return argv
@@ -588,6 +602,181 @@ def manage_profile_args(active_profiles: list[str]) -> list[str]:
     return args
 
 
+def normalized_env_slug(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", str(value or "").strip()).strip("_")
+    return slug.upper()
+
+
+def derived_swimmers_auth_token_env(box_id: str) -> str:
+    slug = normalized_env_slug(box_id)
+    return f"SWIMMERS_{slug}_AUTH_TOKEN" if slug else "SWIMMERS_AUTH_TOKEN"
+
+
+def local_swimmers_auth_token(box_id: str) -> tuple[str | None, str | None]:
+    for env_name in ("SKILLBOX_SWIMMERS_AUTH_TOKEN", derived_swimmers_auth_token_env(box_id)):
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            return value, env_name
+    return None, None
+
+
+def normalize_remote_env_updates(raw_updates: dict[str, Any]) -> dict[str, str]:
+    updates: dict[str, str] = {}
+    for raw_key, raw_value in (raw_updates or {}).items():
+        key = str(raw_key).strip()
+        value = str(raw_value)
+        if not key:
+            continue
+        if not REMOTE_ENV_KEY_PATTERN.fullmatch(key):
+            raise RuntimeError(f"Invalid env key in remote contract: {key!r}")
+        if "\n" in value or "\r" in value:
+            raise RuntimeError(f"Invalid multiline env value in remote contract for {key}")
+        updates[key] = value
+    return updates
+
+
+def is_loopback_publish_host(value: str | None) -> bool:
+    host = str(value or "").strip().lower()
+    return host in {"", "localhost", "::1", "0:0:0:0:0:0:0:1"} or host.startswith("127.")
+
+
+def active_profiles_for_release(release: DeployRelease | None) -> list[str]:
+    profiles = release.active_profiles if release is not None else []
+    return sorted(dict.fromkeys(["core", *profiles]))
+
+
+def remote_box_contract_payload(context: "BoxUpContext") -> dict[str, Any]:
+    state_root = str(context.box.state_root or (context.profile.storage.mount_path if context.profile.storage else "")).strip()
+    storage_filesystem = str(
+        context.box.storage_filesystem
+        or (context.profile.storage.filesystem if context.profile.storage else "")
+    ).strip()
+    storage_min_free_gb = context.box.storage_min_free_gb
+    if storage_min_free_gb is None and context.profile.storage is not None:
+        storage_min_free_gb = context.profile.storage.min_free_gb
+
+    env_updates: dict[str, str] = {}
+    if context.profile.storage is not None:
+        env_updates.update({
+            "SKILLBOX_STORAGE_PROVIDER": context.box.storage_provider or context.profile.storage.provider,
+            "SKILLBOX_STORAGE_FILESYSTEM": storage_filesystem,
+            "SKILLBOX_STORAGE_REQUIRED": "true",
+            "SKILLBOX_STORAGE_MIN_FREE_GB": str(storage_min_free_gb or 0),
+        })
+    if state_root:
+        env_updates.update({
+            "SKILLBOX_STATE_ROOT": state_root,
+            "SKILLBOX_CLIENTS_HOST_ROOT": f"{state_root.rstrip('/')}/clients",
+            "SKILLBOX_MONOSERVER_HOST_ROOT": f"{state_root.rstrip('/')}/monoserver",
+        })
+
+    active_profiles = active_profiles_for_release(context.deploy_release)
+    has_swimmers_profile = "swimmers" in active_profiles
+    token, token_source = local_swimmers_auth_token(context.box_id)
+    for key, value in os.environ.items():
+        if key.startswith(SWIMMERS_ENV_PREFIX) and value.strip():
+            env_updates[key] = value.strip()
+    if has_swimmers_profile:
+        publish_host = env_updates.get("SKILLBOX_SWIMMERS_PUBLISH_HOST")
+        if is_loopback_publish_host(publish_host):
+            env_updates["SKILLBOX_SWIMMERS_PUBLISH_HOST"] = "0.0.0.0"
+    if token:
+        env_updates["SKILLBOX_SWIMMERS_AUTH_TOKEN"] = token
+        env_updates.setdefault("SKILLBOX_SWIMMERS_AUTH_MODE", "token")
+
+    return {
+        "env_updates": env_updates,
+        "mcp_config": DEFAULT_ROOT_MCP_CONFIG,
+        "active_profiles": active_profiles,
+        "swimmers_auth_token_env": token_source,
+    }
+
+
+def build_remote_contract_command(payload: dict[str, Any], *, repo_dir: str) -> str:
+    payload = dict(payload)
+    payload["env_updates"] = normalize_remote_env_updates(payload.get("env_updates") or {})
+    encoded = base64.b64encode(json.dumps(payload, sort_keys=True).encode("utf-8")).decode("ascii")
+    script = f"""python3 - <<'PY'
+import base64
+import json
+import re
+from pathlib import Path
+
+payload = json.loads(base64.b64decode({encoded!r}).decode("utf-8"))
+repo = Path({repo_dir!r}).expanduser()
+env_path = repo / ".env"
+example_path = repo / ".env.example"
+if not env_path.exists():
+    if example_path.exists():
+        env_path.write_text(example_path.read_text(encoding="utf-8"), encoding="utf-8")
+    else:
+        env_path.write_text("", encoding="utf-8")
+
+key_pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+updates = {{}}
+for raw_key, raw_value in (payload.get("env_updates") or {{}}).items():
+    key = str(raw_key).strip()
+    value = str(raw_value)
+    if not key:
+        continue
+    if not key_pattern.fullmatch(key):
+        raise SystemExit(f"Invalid env key in remote contract: {{key!r}}")
+    if "\\n" in value or "\\r" in value:
+        raise SystemExit(f"Invalid multiline env value in remote contract for {{key}}")
+    updates[key] = value
+lines = env_path.read_text(encoding="utf-8").splitlines()
+rendered = []
+seen = set()
+for line in lines:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in line:
+        rendered.append(line)
+        continue
+    key, _, _value = line.partition("=")
+    key = key.strip()
+    if key in updates:
+        rendered.append(f"{{key}}={{updates[key]}}")
+        seen.add(key)
+    else:
+        rendered.append(line)
+for key in sorted(updates):
+    if key not in seen:
+        rendered.append(f"{{key}}={{updates[key]}}")
+env_path.write_text("\\n".join(rendered).rstrip() + "\\n", encoding="utf-8")
+
+mcp_path = repo / ".mcp.json"
+mcp_status = "kept"
+if not mcp_path.exists():
+    mcp_path.write_text(json.dumps(payload["mcp_config"], indent=2, sort_keys=True) + "\\n", encoding="utf-8")
+    mcp_status = "created"
+
+print(json.dumps({{
+    "env_updates": sorted(updates),
+    "mcp_config": mcp_status,
+}}))
+PY"""
+    return script
+
+
+def remote_workspace_launch_targets(active_profiles: list[str]) -> list[str]:
+    targets = ["build", "up"]
+    if "swimmers" in set(active_profiles):
+        targets.append("swimmers-start")
+    return targets
+
+
+def build_remote_workspace_launch_command(active_profiles: list[str], *, repo_dir: str) -> str:
+    return " && ".join(
+        [
+            shell_join(["cd", repo_dir]),
+            *[
+                shell_join(["make", target])
+                for target in remote_workspace_launch_targets(active_profiles)
+            ],
+        ]
+    )
+
+
 def storage_payload(storage: BoxProfileStorage | None) -> dict[str, Any] | None:
     if storage is None:
         return None
@@ -997,13 +1186,14 @@ def do_attach_volume(volume_id: str, droplet_id: str) -> None:
 
 def ts_remove_node(hostname: str) -> bool:
     """Remove a node from the tailnet by hostname via doctl-style CLI."""
+    del hostname
     # Try tailscale CLI first (admin removal requires API, but we try)
     result = run(
         ["tailscale", "logout"],
         check=False,
     )
     # For proper removal, we SSH into the box and run tailscale logout there
-    return True
+    return result.returncode == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1143,6 +1333,28 @@ def _build_box_up_context(
     )
 
 
+def _build_box_resume_context(
+    *,
+    existing: Box,
+    profile: BoxProfile,
+    boxes: list[Box],
+    is_json: bool,
+    deploy_release: DeployRelease | None,
+) -> BoxUpContext:
+    context = BoxUpContext(
+        box_id=existing.id,
+        profile_name=existing.profile,
+        profile=profile,
+        box=existing,
+        boxes=boxes,
+        ts_hostname=existing.tailscale_hostname or f"{profile.tailscale_hostname_prefix}-{existing.id}",
+        is_json=is_json,
+        deploy_release=deploy_release,
+    )
+    context.ip = existing.droplet_ip
+    return context
+
+
 def _box_up_dry_run_payload(context: BoxUpContext) -> dict[str, Any]:
     _record_box_up_step(context, "create", "skip", f"would create {context.profile.size} in {context.profile.region}")
     if context.profile.storage is not None:
@@ -1156,7 +1368,10 @@ def _box_up_dry_run_payload(context: BoxUpContext) -> dict[str, Any]:
     _record_box_up_step(context, "ssh-ready", "skip", f"would verify ssh {context.profile.ssh_user}@<public-ip>")
     _record_box_up_step(context, "enroll", "skip", f"would enroll as {context.ts_hostname}")
     _record_box_up_step(context, "deploy", "skip", "dry-run")
+    _record_box_up_step(context, "contract", "skip", "dry-run")
+    _record_box_up_step(context, "launch", "skip", "dry-run")
     _record_box_up_step(context, "first-box", "skip", "dry-run")
+    _record_box_up_step(context, "verify", "skip", "dry-run")
     payload = {
         "box_id": context.box_id,
         "profile": asdict(context.profile),
@@ -1303,8 +1518,8 @@ def _enroll_box_tailscale(context: BoxUpContext, *, ts_authkey: str) -> str:
 
 
 def _resolve_deploy_target(context: BoxUpContext) -> str:
-    if context.ip is None:
-        raise RuntimeError("Droplet IP unavailable during deploy")
+    if not box_ssh_candidates(context.box, prefer_public=context.box.state == "ssh-ready"):
+        raise RuntimeError("No SSH target is known for deploy")
     for ssh_target in box_ssh_candidates(context.box, prefer_public=context.box.state == "ssh-ready"):
         max_wait = 30 if ssh_target == context.ip else 60
         if wait_for_ssh(ssh_target, user=context.profile.ssh_user, max_wait=max_wait, interval=5):
@@ -1363,6 +1578,99 @@ def _deploy_box_runtime(context: BoxUpContext) -> str:
     return f"installed release {context.deploy_release.source_commit[:12]}"
 
 
+def _patch_remote_runtime_contract(context: BoxUpContext) -> dict[str, Any]:
+    if context.ssh_target is None:
+        raise RuntimeError("SSH target unavailable while writing remote runtime contract")
+    remote_home = f"/home/{context.profile.ssh_user}"
+    remote_repo_dir = f"{remote_home}/skillbox"
+    payload = remote_box_contract_payload(context)
+    result = ssh_cmd(
+        context.profile.ssh_user,
+        context.ssh_target,
+        build_remote_contract_command(payload, repo_dir=remote_repo_dir),
+        timeout=60,
+    )
+    if result.returncode != 0:
+        tail = result.stderr[-500:] or result.stdout[-500:]
+        raise RuntimeError(f"remote contract patch failed (exit {result.returncode}): {tail}")
+    try:
+        detail = json.loads(result.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError):
+        detail = {"stdout_tail": result.stdout[-500:]}
+    return {
+        "active_profiles": payload.get("active_profiles") or ["core"],
+        "swimmers_auth_token_env": payload.get("swimmers_auth_token_env"),
+        **detail,
+    }
+
+
+def _launch_remote_workspace(context: BoxUpContext) -> dict[str, Any]:
+    if context.deploy_release is None:
+        return {
+            "skipped": "legacy deploy already launched workspace",
+            "active_profiles": active_profiles_for_release(context.deploy_release),
+        }
+    if context.ssh_target is None:
+        raise RuntimeError("SSH target unavailable while launching remote workspace")
+
+    active_profiles = active_profiles_for_release(context.deploy_release)
+    remote_home = f"/home/{context.profile.ssh_user}"
+    remote_repo_dir = f"{remote_home}/skillbox"
+    targets = remote_workspace_launch_targets(active_profiles)
+    result = ssh_cmd(
+        context.profile.ssh_user,
+        context.ssh_target,
+        build_remote_workspace_launch_command(active_profiles, repo_dir=remote_repo_dir),
+        timeout=1800,
+    )
+    if result.returncode != 0:
+        tail = result.stderr[-500:] or result.stdout[-500:]
+        raise RuntimeError(f"remote workspace launch failed (exit {result.returncode}): {tail}")
+    return {
+        "targets": targets,
+        "active_profiles": active_profiles,
+    }
+
+
+def _verify_operator_swimmers_surface(context: BoxUpContext) -> dict[str, Any]:
+    active_profiles = active_profiles_for_release(context.deploy_release)
+    if "swimmers" not in active_profiles:
+        return {"skipped": "no swimmers profile", "active_profiles": active_profiles}
+
+    ts_ip = str(context.box.tailscale_ip or "").strip()
+    if not ts_ip:
+        raise RuntimeError("Cannot verify swimmers from operator side without a Tailscale IP.")
+    token, token_source = local_swimmers_auth_token(context.box_id)
+    if not token:
+        raise RuntimeError(
+            "Cannot verify swimmers from operator side without "
+            f"SKILLBOX_SWIMMERS_AUTH_TOKEN or {derived_swimmers_auth_token_env(context.box_id)}."
+        )
+
+    port = os.environ.get("SKILLBOX_SWIMMERS_PORT", "3210").strip() or "3210"
+    url = f"http://{ts_ip}:{port}/v1/sessions"
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            body = response.read(1024)
+            status = response.status
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Operator-side swimmers check failed for {url}: {exc}") from exc
+    if status != 200:
+        raise RuntimeError(f"Operator-side swimmers check returned HTTP {status} for {url}.")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Operator-side swimmers check returned non-JSON from {url}.") from exc
+    if "sessions" not in payload:
+        raise RuntimeError(f"Operator-side swimmers check returned JSON without sessions from {url}.")
+    return {
+        "url": url,
+        "auth_token_env": token_source,
+        "sessions": len(payload.get("sessions") or []),
+    }
+
+
 def _run_box_first_box(context: BoxUpContext, *, blueprint: str | None, set_args: list[str]) -> dict[str, Any]:
     if context.ssh_target is None:
         raise RuntimeError("SSH target unavailable during first-box")
@@ -1388,12 +1696,12 @@ def _run_box_first_box(context: BoxUpContext, *, blueprint: str | None, set_args
     except json.JSONDecodeError:
         return {
             "client_id": context.box_id,
-            "active_profiles": context.deploy_release.active_profiles if context.deploy_release is not None else ["core"],
+            "active_profiles": active_profiles_for_release(context.deploy_release),
             "status": "ok",
         }
     return {
         "client_id": payload.get("client_id") or context.box_id,
-        "active_profiles": payload.get("active_profiles") or context.deploy_release.active_profiles or ["core"],
+        "active_profiles": payload.get("active_profiles") or active_profiles_for_release(context.deploy_release),
         "created_client": payload.get("created_client"),
         "output_dir": payload.get("output_dir"),
     }
@@ -1420,6 +1728,114 @@ def _box_up_success_payload(context: BoxUpContext) -> dict[str, Any]:
     return payload
 
 
+def _run_resumed_box_up(
+    context: BoxUpContext,
+    *,
+    blueprint: str | None,
+    set_args: list[str],
+) -> int:
+    box_id = context.box_id
+    _record_box_up_step(context, "create", "skip", f"resuming droplet {context.box.droplet_id or 'unknown'}")
+    _record_box_up_step(context, "storage", "skip", f"resuming state root {context.box.state_root or 'unknown'}")
+    _record_box_up_step(context, "bootstrap", "skip", "resuming existing host")
+
+    if not _run_box_up_stage(
+        context,
+        stage_name="ssh-ready",
+        error_type="ssh_access_failed",
+        action=lambda: f"ssh {context.profile.ssh_user}@{_resolve_deploy_target(context)}",
+        failure_state="ssh-ready",
+        next_actions=[f"box status {box_id}", f"box ssh {box_id}"],
+    ):
+        return EXIT_ERROR
+
+    if context.box.tailscale_ip:
+        _record_box_up_step(context, "enroll", "skip", f"already enrolled at {context.box.tailscale_ip}")
+    else:
+        try:
+            ts_authkey = require_env("SKILLBOX_TS_AUTHKEY")
+        except RuntimeError as exc:
+            _record_box_up_step(context, "enroll", "fail", str(exc))
+            _emit_box_up_failure(
+                context,
+                error_type="tailscale_auth_missing",
+                message=str(exc),
+                next_actions=[f"box status {box_id}", f"box ssh {box_id}"],
+            )
+            return EXIT_ERROR
+        if not _run_box_up_stage(
+            context,
+            stage_name="enroll",
+            error_type="tailscale_failed",
+            action=lambda: _enroll_box_tailscale(context, ts_authkey=ts_authkey),
+            failure_state="ssh-ready",
+            next_actions=[f"box ssh {box_id}", f"box down {box_id}"],
+        ):
+            return EXIT_ERROR
+
+    if not _run_box_up_stage(
+        context,
+        stage_name="deploy",
+        error_type="deploy_failed",
+        action=lambda: _deploy_box_runtime(context),
+        failure_state="ssh-ready",
+        next_actions=[f"box ssh {box_id}", f"box status {box_id}"],
+    ):
+        return EXIT_ERROR
+
+    if not _run_box_up_stage(
+        context,
+        stage_name="contract",
+        error_type="remote_contract_failed",
+        action=lambda: _patch_remote_runtime_contract(context),
+        failure_state="ssh-ready",
+        next_actions=[f"box ssh {box_id}", f"box status {box_id}"],
+    ):
+        return EXIT_ERROR
+
+    if not _run_box_up_stage(
+        context,
+        stage_name="launch",
+        error_type="remote_launch_failed",
+        action=lambda: _launch_remote_workspace(context),
+        failure_state="acceptance",
+        next_actions=[f"box ssh {box_id}", f"box status {box_id}"],
+    ):
+        return EXIT_ERROR
+
+    if not _run_box_up_stage(
+        context,
+        stage_name="first-box",
+        error_type="first_box_failed",
+        action=lambda: _run_box_first_box(context, blueprint=blueprint, set_args=set_args),
+        failure_state="ssh-ready",
+        next_actions=[f"box ssh {box_id}", f"box status {box_id}"],
+    ):
+        return EXIT_ERROR
+
+    if not _run_box_up_stage(
+        context,
+        stage_name="verify",
+        error_type="operator_verify_failed",
+        action=lambda: _verify_operator_swimmers_surface(context),
+        failure_state="ssh-ready",
+        next_actions=[f"box status {box_id}", f"box ssh {box_id}"],
+    ):
+        return EXIT_ERROR
+
+    update_box(context.box, state="ready")
+    save_inventory(context.boxes)
+    payload = _box_up_success_payload(context)
+    payload["resumed"] = True
+    if context.is_json:
+        emit_json(payload)
+    else:
+        print()
+        print(f"Box {box_id} is ready.")
+        print(f"  SSH: ssh {context.profile.ssh_user}@{context.box.tailscale_ip or context.box.tailscale_hostname or context.box.droplet_ip}")
+    return EXIT_OK
+
+
 def cmd_up(
     box_id: str,
     *,
@@ -1427,10 +1843,12 @@ def cmd_up(
     blueprint: str | None,
     set_args: list[str],
     deploy_manifest: str | None,
+    resume: bool,
     dry_run: bool,
     fmt: str,
 ) -> int:
     is_json = fmt == "json"
+    effective_blueprint = blueprint or DEFAULT_FIRST_BOX_BLUEPRINT
 
     try:
         profile = load_profile(profile_name)
@@ -1443,10 +1861,47 @@ def cmd_up(
 
     boxes = load_inventory()
     existing = find_box(boxes, box_id)
-    if existing and existing.state not in ("destroyed",):
-        msg = f"Box {box_id!r} already exists in state {existing.state!r}. Use 'box down {box_id}' first or choose a different id."
+    if existing and existing.state not in ("destroyed",) and not resume:
+        msg = (
+            f"Box {box_id!r} already exists in state {existing.state!r}. "
+            "Use 'box up --resume' for a partial provision, 'box down' first, or choose a different id."
+        )
         if is_json:
-            emit_json(structured_error(msg, error_type="conflict", next_actions=[f"box down {box_id}", f"box status {box_id}"]))
+            emit_json(
+                structured_error(
+                    msg,
+                    error_type="conflict",
+                    next_actions=[
+                        f"box up {box_id} --profile {profile_name} --deploy-manifest <path> --resume",
+                        f"box down {box_id}",
+                        f"box status {box_id}",
+                    ],
+                )
+            )
+        else:
+            print(msg, file=sys.stderr)
+        return EXIT_ERROR
+    if resume and (existing is None or existing.state == "destroyed"):
+        msg = f"Box {box_id!r} has no resumable inventory entry."
+        if is_json:
+            emit_json(structured_error(msg, error_type="not_found", next_actions=["box list"]))
+        else:
+            print(msg, file=sys.stderr)
+        return EXIT_ERROR
+    if resume and existing and existing.state not in RESUMABLE_UP_STATES:
+        msg = (
+            f"Box {box_id!r} cannot resume from state {existing.state!r}; "
+            f"resumable states are: {', '.join(sorted(RESUMABLE_UP_STATES))}."
+        )
+        if is_json:
+            emit_json(structured_error(msg, error_type="invalid_state", next_actions=[f"box status {box_id}", f"box down {box_id}"]))
+        else:
+            print(msg, file=sys.stderr)
+        return EXIT_ERROR
+    if resume and existing and existing.profile != profile_name:
+        msg = f"Box {box_id!r} uses profile {existing.profile!r}, not {profile_name!r}."
+        if is_json:
+            emit_json(structured_error(msg, error_type="profile_mismatch", next_actions=[f"box up {box_id} --profile {existing.profile} --deploy-manifest <path> --resume"]))
         else:
             print(msg, file=sys.stderr)
         return EXIT_ERROR
@@ -1478,6 +1933,42 @@ def cmd_up(
             print(msg, file=sys.stderr)
         return EXIT_ERROR
 
+    if resume and existing is not None:
+        context = _build_box_resume_context(
+            existing=existing,
+            profile=profile,
+            boxes=boxes,
+            is_json=is_json,
+            deploy_release=deploy_release,
+        )
+        if dry_run:
+            _record_box_up_step(context, "create", "skip", f"would resume droplet {existing.droplet_id or 'unknown'}")
+            _record_box_up_step(context, "storage", "skip", "would reuse attached state root")
+            _record_box_up_step(context, "bootstrap", "skip", "would reuse existing host")
+            _record_box_up_step(context, "ssh-ready", "skip", "would verify existing SSH")
+            _record_box_up_step(context, "enroll", "skip", "would enroll only if Tailscale IP is missing")
+            _record_box_up_step(context, "deploy", "skip", "would reinstall pinned release")
+            _record_box_up_step(context, "contract", "skip", "would write remote .env and .mcp.json contract")
+            _record_box_up_step(context, "launch", "skip", "would build and start remote workspace")
+            _record_box_up_step(context, "first-box", "skip", "would rerun first-box")
+            _record_box_up_step(context, "verify", "skip", "would run operator-side checks")
+            payload = {
+                "box_id": context.box_id,
+                "profile": asdict(context.profile),
+                "dry_run": True,
+                "resumed": True,
+                "steps": context.steps,
+                "storage": storage_payload(context.profile.storage),
+                "volume": volume_payload(context.box),
+                "next_actions": [f"box up {context.box_id} --profile {context.profile_name} --deploy-manifest <path> --resume"],
+            }
+            if context.deploy_release is not None:
+                payload["deploy_release"] = deploy_release_payload(context.deploy_release)
+            if is_json:
+                emit_json(payload)
+            return EXIT_OK
+        return _run_resumed_box_up(context, blueprint=effective_blueprint, set_args=set_args)
+
     if not dry_run:
         try:
             require_profile_storage(profile)
@@ -1487,7 +1978,7 @@ def cmd_up(
                     structured_error(
                         str(exc),
                         error_type="storage_layout_missing",
-                        next_actions=[f"box profiles --format json", f"box up {box_id} --profile {profile_name} --dry-run"],
+                        next_actions=["box profiles --format json", f"box up {box_id} --profile {profile_name} --dry-run"],
                     )
                 )
             else:
@@ -1576,11 +2067,41 @@ def cmd_up(
 
     if not _run_box_up_stage(
         context,
-        stage_name="first-box",
-        error_type="first_box_failed",
-        action=lambda: _run_box_first_box(context, blueprint=blueprint, set_args=set_args),
+        stage_name="contract",
+        error_type="remote_contract_failed",
+        action=lambda: _patch_remote_runtime_contract(context),
         failure_state="ssh-ready",
         next_actions=[f"box ssh {box_id}", f"box status {box_id}"],
+    ):
+        return EXIT_ERROR
+
+    if not _run_box_up_stage(
+        context,
+        stage_name="launch",
+        error_type="remote_launch_failed",
+        action=lambda: _launch_remote_workspace(context),
+        failure_state="acceptance",
+        next_actions=[f"box ssh {box_id}", f"box status {box_id}"],
+    ):
+        return EXIT_ERROR
+
+    if not _run_box_up_stage(
+        context,
+        stage_name="first-box",
+        error_type="first_box_failed",
+        action=lambda: _run_box_first_box(context, blueprint=effective_blueprint, set_args=set_args),
+        failure_state="ssh-ready",
+        next_actions=[f"box ssh {box_id}", f"box status {box_id}"],
+    ):
+        return EXIT_ERROR
+
+    if not _run_box_up_stage(
+        context,
+        stage_name="verify",
+        error_type="operator_verify_failed",
+        action=lambda: _verify_operator_swimmers_surface(context),
+        failure_state="ssh-ready",
+        next_actions=[f"box status {box_id}", f"box ssh {box_id}"],
     ):
         return EXIT_ERROR
 
@@ -1710,8 +2231,18 @@ def cmd_upgrade(
             print(str(exc), file=sys.stderr)
         return EXIT_ERROR
 
+    try:
+        profile = load_profile(box.profile)
+    except RuntimeError as exc:
+        if is_json:
+            emit_json(structured_error(str(exc), error_type="profile_not_found", next_actions=["box profiles --format json"]))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
     if dry_run:
         _record_box_step(steps, is_json, "upload", "skip", "dry-run")
+        _record_box_step(steps, is_json, "contract", "skip", "would refresh remote .env and .mcp.json contract")
         _record_box_step(steps, is_json, "upgrade", "skip", f"would install {release.source_commit[:12]}")
         _record_box_step(steps, is_json, "verify", "skip", "dry-run")
         if is_json:
@@ -1749,6 +2280,29 @@ def cmd_upgrade(
             next_actions=[f"box ssh {box_id}", f"box status {box_id}"],
         )
     _record_box_step(steps, is_json, "upload", "ok", remote_archive_path)
+
+    contract_context = _build_box_resume_context(
+        existing=box,
+        profile=profile,
+        boxes=boxes,
+        is_json=is_json,
+        deploy_release=release,
+    )
+    contract_context.ssh_target = ssh_target
+    try:
+        contract_detail = _patch_remote_runtime_contract(contract_context)
+    except RuntimeError as exc:
+        _record_box_step(steps, is_json, "contract", "fail", str(exc))
+        return _emit_box_upgrade_failure(
+            box_id=box_id,
+            steps=steps,
+            is_json=is_json,
+            error_type="remote_contract_failed",
+            message=str(exc),
+            deploy_release=release,
+            next_actions=[f"box ssh {box_id}", f"box status {box_id}"],
+        )
+    _record_box_step(steps, is_json, "contract", "ok", contract_detail)
 
     upgrade_args = build_release_upgrade_args(
         box_id,
@@ -1884,7 +2438,7 @@ def cmd_down(box_id: str, *, dry_run: bool, fmt: str) -> int:
     if ssh_target:
         try:
             if not is_json:
-                print(f"[...] remove  Removing from tailnet...")
+                print("[...] remove  Removing from tailnet...")
             # Run tailscale logout on the box itself
             result = ssh_cmd("root", box.droplet_ip or ssh_target, "tailscale logout", timeout=30)
             detail = result.stderr[-500:] or result.stdout[-500:] or None
@@ -2271,9 +2825,17 @@ def main() -> int:
     up_parser = subparsers.add_parser("up", help="Create and provision a new box from a pinned deploy artifact.")
     up_parser.add_argument("box_id", help="Box identifier (becomes droplet name and client id).")
     up_parser.add_argument("--profile", default="dev-small", help="Box profile from workspace/box-profiles/.")
-    up_parser.add_argument("--blueprint", default=None, help="Client blueprint for the remote first-box step.")
+    up_parser.add_argument(
+        "--blueprint",
+        default=DEFAULT_FIRST_BOX_BLUEPRINT,
+        help=(
+            "Client blueprint for the remote first-box step "
+            f"(defaults to {DEFAULT_FIRST_BOX_BLUEPRINT}; pass another blueprint to override)."
+        ),
+    )
     up_parser.add_argument("--set", action="append", default=[], help="Blueprint variable KEY=VALUE.")
     up_parser.add_argument("--deploy-manifest", default=None, help="Pinned deploy.json from client-publish --deploy-artifact. Required unless --dry-run.")
+    up_parser.add_argument("--resume", action="store_true", help="Resume a partial box from ssh-ready/deploying/acceptance/onboarding instead of recreating it.")
     up_parser.add_argument("--dry-run", action="store_true")
     up_parser.add_argument("--format", choices=("text", "json"), default="text")
 
@@ -2335,6 +2897,7 @@ def main() -> int:
                 blueprint=args.blueprint,
                 set_args=args.set,
                 deploy_manifest=args.deploy_manifest,
+                resume=args.resume,
                 dry_run=args.dry_run,
                 fmt=args.format,
             )

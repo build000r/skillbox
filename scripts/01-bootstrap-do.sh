@@ -51,6 +51,7 @@ apt-get install -y \
   git \
   gnupg \
   jq \
+  make \
   python3 \
   python3-yaml \
   tmux \

@@ -14,6 +14,13 @@ UPGRADE_SCRIPT = ROOT_DIR / "scripts" / "06-upgrade-release.sh"
 
 
 class UpgradeReleaseScriptTests(unittest.TestCase):
+    def test_upgrade_release_does_not_require_make_on_remote_host(self) -> None:
+        script = UPGRADE_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertNotIn("require_cmd make", script)
+        self.assertIn("repo_lifecycle_target", script)
+        self.assertIn('repo_dir="$(cd "${repo_dir}" && pwd -P)"', script)
+
     def test_upgrade_release_preserves_runtime_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -159,7 +166,7 @@ class UpgradeReleaseScriptTests(unittest.TestCase):
         (repo_dir / ".env.example").write_text("DEFAULT=1\n", encoding="utf-8")
         (repo_dir / "Makefile").write_text(
             textwrap.dedent(
-                f"""\
+                """\
                 build:
                 \t@python3 -c "from pathlib import Path; Path('.build-version').write_text(Path('VERSION.txt').read_text(encoding='utf-8'), encoding='utf-8')"
 

@@ -52,6 +52,9 @@ variables:
   - name: SPAPS_AUTH_RUNTIME_SOURCE
     default: bundle
     description: SPAPS runtime source to use (`bundle` for plain installs, `repo` for a sibling checkout).
+  - name: SPAPS_CLI_PACKAGE
+    default: spaps@0.7.7
+    description: Package spec passed to `npx --yes`; override with `--set SPAPS_CLI_PACKAGE=spaps@x.y.z` to use a different version.
   - name: SPAPS_AUTH_BASE_URL
     default: http://127.0.0.1:${SERVICE_PORT}
     description: Frontend origin advertised to the SPAPS auth runtime.
@@ -109,7 +112,7 @@ client:
       required: false
       profiles:
         - core
-      command: npx spaps fixtures apply --dir ${PRIMARY_REPO_PATH} --port ${SPAPS_AUTH_PORT} --base-url ${SPAPS_FIXTURE_BASE_URL}
+      command: npx --yes ${SPAPS_CLI_PACKAGE} fixtures apply --dir ${PRIMARY_REPO_PATH} --port ${SPAPS_AUTH_PORT} --base-url ${SPAPS_FIXTURE_BASE_URL}
       outputs:
         - ${SPAPS_FIXTURE_SUCCESS_PATH}
       success:
@@ -125,7 +128,7 @@ client:
       required: false
       profiles:
         - core
-      command: SPAPS_AUTH_BASE_URL=${SPAPS_AUTH_BASE_URL} npx spaps local --port ${SPAPS_AUTH_PORT} --runtime-dir ${SPAPS_AUTH_RUNTIME_DIR} --runtime-source ${SPAPS_AUTH_RUNTIME_SOURCE}
+      command: SPAPS_AUTH_BASE_URL=${SPAPS_AUTH_BASE_URL} npx --yes ${SPAPS_CLI_PACKAGE} local --port ${SPAPS_AUTH_PORT} --runtime-dir ${SPAPS_AUTH_RUNTIME_DIR} --runtime-source ${SPAPS_AUTH_RUNTIME_SOURCE}
       log: ${SERVICE_LOG_ID}
       healthcheck:
         type: http

@@ -17,6 +17,7 @@ DEPLOY_MANIFEST_ARGS := $(if $(strip $(DEPLOY_MANIFEST)),--deploy-manifest $(DEP
 PRIVATE_PATH_ARGS := $(if $(strip $(PRIVATE_PATH)),--private-path $(PRIVATE_PATH),)
 OUTPUT_DIR_ARGS := $(if $(strip $(OUTPUT_DIR)),--output-dir $(OUTPUT_DIR),)
 FORCE_ARGS := $(if $(strip $(FORCE)),--force,)
+RESUME_ARGS := $(if $(strip $(RESUME)),--resume,)
 
 .PHONY: help bootstrap-env render doctor acceptance runtime-render runtime-sync runtime-status runtime-skills runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context dev-sanity python-cov-xml build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles box-register box-unregister
 
@@ -171,7 +172,7 @@ swimmers-runtime-status:
 BOX_ARGS := $(if $(strip $(BOX)),$(BOX),)
 
 box-up:
-	@python3 scripts/box.py up $(BOX_ARGS) --profile $(or $(PROFILE),dev-small) $(DEPLOY_MANIFEST_ARGS) $(BLUEPRINT_ARGS) $(SET_ARGS)
+	@python3 scripts/box.py up $(BOX_ARGS) --profile $(or $(PROFILE),dev-small) $(DEPLOY_MANIFEST_ARGS) $(BLUEPRINT_ARGS) $(SET_ARGS) $(RESUME_ARGS)
 
 box-down:
 	@python3 scripts/box.py down $(BOX_ARGS)
