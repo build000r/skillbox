@@ -1956,9 +1956,12 @@ class RuntimeManagerTests(unittest.TestCase):
                 services["app-dev"]["bootstrap_tasks"],
                 ["app-bootstrap", "spaps-fixtures"],
             )
-            self.assertIn("npx --yes spaps@0.7.7 local", services["auth-api"]["command"])
+            self.assertIn("spaps local", services["auth-api"]["command"])
+            self.assertIn("CORS_ALLOW_ORIGINS=", services["auth-api"]["command"])
             fixtures_task = next(item for item in render_payload["tasks"] if item["id"] == "spaps-fixtures")
-            self.assertIn("npx --yes spaps@0.7.7 fixtures apply", fixtures_task["command"])
+            self.assertIn("spaps fixtures apply", fixtures_task["command"])
+            self.assertIn("SPAPS_BROWSER_API_URL=", fixtures_task["command"])
+            self.assertIn("spaps-dev-auth.js", fixtures_task["command"])
 
     def test_client_init_with_blueprint_requires_declared_variables(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3795,6 +3798,39 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertTrue((private_repo / "clients" / "acme-app" / "overlay.yaml").is_file())
             self.assertTrue((output_dir / "CLAUDE.md").is_file())
             self.assertTrue((output_dir / "workspace" / "clients" / "acme-app" / "overlay.yaml").is_file())
+
+    def test_first_box_skips_scaffold_inputs_for_existing_overlay_without_force(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            repo = workspace / "skillbox"
+            repo.mkdir(parents=True, exist_ok=True)
+            self._write_fixture(repo)
+
+            result = self._run(
+                repo,
+                "first-box",
+                "personal",
+                "--blueprint",
+                "missing-blueprint",
+                "--set",
+                "PRIMARY_REPO_URL=https://example.com/repo.git",
+                "--root-path",
+                "${SKILLBOX_MONOSERVER_ROOT}",
+                "--default-cwd",
+                "${SKILLBOX_MONOSERVER_ROOT}",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            onboard_step = next(step for step in payload["steps"] if step["step"] == "onboard")
+            self.assertEqual(onboard_step["status"], "skip")
+            self.assertEqual(payload["created_client"], False)
+            self.assertEqual(
+                onboard_step["detail"]["ignored_scaffold_inputs"],
+                ["default_cwd", "root_path", "blueprint", "set"],
+            )
 
     def test_first_box_surfaces_blueprint_validation_failures(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

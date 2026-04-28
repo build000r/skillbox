@@ -187,6 +187,55 @@ def build_first_box_manage_argv(
     return argv
 
 
+def _set_arg_map(set_args: list[str]) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw in set_args:
+        key, sep, value = raw.partition("=")
+        if sep and key:
+            values[key] = value
+    return values
+
+
+def blueprint_is_spaps_auth(blueprint: str | None) -> bool:
+    if blueprint is None:
+        return True
+    return Path(blueprint).stem == DEFAULT_FIRST_BOX_BLUEPRINT
+
+
+def augment_spaps_tailnet_set_args(
+    set_args: list[str],
+    *,
+    blueprint: str | None,
+    tailscale_ip: str | None,
+) -> list[str]:
+    """Add browser-visible SPAPS defaults for remote first-box runs."""
+    if not blueprint_is_spaps_auth(blueprint):
+        return list(set_args)
+    ts_ip = str(tailscale_ip or "").strip()
+    if not ts_ip:
+        return list(set_args)
+
+    values = _set_arg_map(set_args)
+    service_port = values.get("SERVICE_PORT", "5173").strip() or "5173"
+    auth_port = values.get("SPAPS_AUTH_PORT", "3301").strip() or "3301"
+    defaults = {
+        "SPAPS_AUTH_BASE_URL": f"http://{ts_ip}:{service_port}",
+        "SPAPS_FIXTURE_BASE_URL": f"http://{ts_ip}:{service_port}",
+        "SPAPS_BROWSER_API_URL": f"http://{ts_ip}:{auth_port}",
+        "SPAPS_CORS_ALLOW_ORIGINS": (
+            f"http://{ts_ip}:{service_port},"
+            f"http://localhost:{service_port},"
+            f"http://127.0.0.1:{service_port}"
+        ),
+    }
+
+    augmented = list(set_args)
+    for key, value in defaults.items():
+        if key not in values:
+            augmented.append(f"{key}={value}")
+    return augmented
+
+
 def build_first_box_command(
     box_id: str,
     *,
@@ -1679,13 +1728,18 @@ def _run_box_first_box(context: BoxUpContext, *, blueprint: str | None, set_args
     remote_private_path = f"{remote_home}/skillbox-config"
     if not context.is_json:
         print(f"[...] first-box  Running canonical first-box for client {context.box_id}...")
+    effective_set_args = augment_spaps_tailnet_set_args(
+        set_args,
+        blueprint=blueprint,
+        tailscale_ip=context.box.tailscale_ip,
+    )
     exec_cmd = build_first_box_command(
         context.box_id,
         repo_dir=remote_repo_dir,
         private_path=remote_private_path,
         active_profiles=context.deploy_release.active_profiles if context.deploy_release is not None else [],
         blueprint=blueprint,
-        set_args=set_args,
+        set_args=effective_set_args,
     )
     result = ssh_cmd(context.profile.ssh_user, context.ssh_target, exec_cmd, timeout=600)
     if result.returncode != 0:

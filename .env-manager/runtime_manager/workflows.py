@@ -293,7 +293,11 @@ def run_first_box(
         value is not None and value != []
         for value in (label, default_cwd, root_path, blueprint_name, set_args)
     ) or force
-    onboard_needed = created_client or scaffold_inputs_present
+    # Box lifecycle callers pass scaffold defaults defensively.  When the
+    # private repo already owns an overlay, first-box must not reinterpret those
+    # defaults as permission to overwrite it; use onboard/client-init --force
+    # for an intentional replacement.
+    onboard_needed = created_client or force
 
     if onboard_needed:
         onboard_args = ["onboard", cid, "--wait-seconds", str(wait_seconds), "--format", "json"]
@@ -328,12 +332,31 @@ def run_first_box(
         onboard_status = "warn" if onboard_code == EXIT_DRIFT else "ok"
         step("onboard", onboard_status, onboard_payload)
     else:
+        ignored_scaffold_inputs: list[str] = []
+        if scaffold_inputs_present:
+            if label is not None:
+                ignored_scaffold_inputs.append("label")
+            if default_cwd is not None:
+                ignored_scaffold_inputs.append("default_cwd")
+            if root_path is not None:
+                ignored_scaffold_inputs.append("root_path")
+            if blueprint_name is not None:
+                ignored_scaffold_inputs.append("blueprint")
+            if set_args:
+                ignored_scaffold_inputs.append("set")
+        skip_detail: dict[str, Any] = {
+            "reason": f"client overlay already present at {overlay_runtime_path}",
+        }
+        if ignored_scaffold_inputs:
+            skip_detail["ignored_scaffold_inputs"] = ignored_scaffold_inputs
+            skip_detail["next_actions"] = [
+                f"onboard {cid} --force --format json",
+                f"client-init {cid} --force --format json",
+            ]
         step(
             "onboard",
             "skip",
-            {
-                "reason": f"client overlay already present at {overlay_runtime_path}",
-            },
+            skip_detail,
         )
 
     profile_args = [arg for profile in profiles for arg in ("--profile", profile)]

@@ -52,18 +52,24 @@ variables:
   - name: SPAPS_AUTH_RUNTIME_SOURCE
     default: bundle
     description: SPAPS runtime source to use (`bundle` for plain installs, `repo` for a sibling checkout).
-  - name: SPAPS_CLI_PACKAGE
-    default: spaps@0.7.7
-    description: Package spec passed to `npx --yes`; override with `--set SPAPS_CLI_PACKAGE=spaps@x.y.z` to use a different version.
+  - name: SPAPS_CLI_COMMAND
+    default: spaps
+    description: CLI command used by the auth service and fixture task; defaults to the SPAPS CLI installed in every skillbox image.
   - name: SPAPS_AUTH_BASE_URL
     default: http://127.0.0.1:${SERVICE_PORT}
     description: Frontend origin advertised to the SPAPS auth runtime.
+  - name: SPAPS_BROWSER_API_URL
+    default: http://127.0.0.1:${SPAPS_AUTH_PORT}
+    description: Browser-visible SPAPS API URL patched into generated fixture artifacts; set to the box Tailscale URL for remote boxes.
   - name: SPAPS_FIXTURE_TASK_ID
     default: spaps-fixtures
     description: Runtime task id that materializes repo-local SPAPS auth fixtures.
   - name: SPAPS_FIXTURE_BASE_URL
     default: http://127.0.0.1:${SERVICE_PORT}
     description: Browser base URL used when generating `.spaps/browser/*` artifacts.
+  - name: SPAPS_CORS_ALLOW_ORIGINS
+    default: ${SPAPS_FIXTURE_BASE_URL},http://localhost:${SERVICE_PORT},http://127.0.0.1:${SERVICE_PORT}
+    description: Comma-separated browser origins allowed by the SPAPS local runtime.
   - name: SPAPS_FIXTURE_SUCCESS_PATH
     default: ${PRIMARY_REPO_PATH}/public/spaps-dev-auth.js
     description: Generated bridge file used as the success marker for fixture materialization.
@@ -112,7 +118,9 @@ client:
       required: false
       profiles:
         - core
-      command: npx --yes ${SPAPS_CLI_PACKAGE} fixtures apply --dir ${PRIMARY_REPO_PATH} --port ${SPAPS_AUTH_PORT} --base-url ${SPAPS_FIXTURE_BASE_URL}
+      command: >-
+        ${SPAPS_CLI_COMMAND} fixtures apply --dir ${PRIMARY_REPO_PATH} --port ${SPAPS_AUTH_PORT} --base-url ${SPAPS_FIXTURE_BASE_URL} &&
+        SPAPS_FIXTURE_ROOT=${PRIMARY_REPO_PATH} SPAPS_BROWSER_API_URL=${SPAPS_BROWSER_API_URL} SPAPS_AUTH_PORT=${SPAPS_AUTH_PORT} python3 -c 'import os; from pathlib import Path; root=Path(os.environ["SPAPS_FIXTURE_ROOT"]); target=os.environ.get("SPAPS_BROWSER_API_URL", "").strip(); port=os.environ.get("SPAPS_AUTH_PORT", "3301"); paths=([root / "public" / "spaps-dev-auth.js"] + list((root / ".spaps").rglob("*.json"))) if target and (root / ".spaps").exists() else ([root / "public" / "spaps-dev-auth.js"] if target else []); [p.write_text(p.read_text(encoding="utf-8").replace(f"http://localhost:{port}", target).replace(f"http://127.0.0.1:{port}", target), encoding="utf-8") for p in paths if p.exists()]'
       outputs:
         - ${SPAPS_FIXTURE_SUCCESS_PATH}
       success:
@@ -128,7 +136,9 @@ client:
       required: false
       profiles:
         - core
-      command: SPAPS_AUTH_BASE_URL=${SPAPS_AUTH_BASE_URL} npx --yes ${SPAPS_CLI_PACKAGE} local --port ${SPAPS_AUTH_PORT} --runtime-dir ${SPAPS_AUTH_RUNTIME_DIR} --runtime-source ${SPAPS_AUTH_RUNTIME_SOURCE}
+      command: >-
+        SPAPS_AUTH_BASE_URL=${SPAPS_AUTH_BASE_URL} CORS_ALLOW_ORIGINS=${SPAPS_CORS_ALLOW_ORIGINS}
+        ${SPAPS_CLI_COMMAND} local --port ${SPAPS_AUTH_PORT} --runtime-dir ${SPAPS_AUTH_RUNTIME_DIR} --runtime-source ${SPAPS_AUTH_RUNTIME_SOURCE}
       log: ${SERVICE_LOG_ID}
       healthcheck:
         type: http
