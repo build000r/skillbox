@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
@@ -8,7 +9,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import warnings
 import zipfile
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -106,6 +109,46 @@ class RuntimeManagerTests(unittest.TestCase):
                 self.assertTrue(server_pid > 0)
             finally:
                 stop_process(server_pid, 1)
+
+    def test_start_services_tracks_running_launcher_processes_without_resource_warning(self) -> None:
+        from runtime_manager import runtime_ops
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            log_dir = root / "logs" / "runtime"
+            pid_file = log_dir / "self-managed.pid"
+            service = {
+                "id": "self-managed",
+                "kind": "daemon",
+                "command": f"sh -c 'sleep 30 & echo $! > {shlex.quote(str(pid_file))}; sleep 1'",
+                "healthcheck": {
+                    "type": "path_exists",
+                    "host_path": str(pid_file),
+                },
+            }
+            model = {
+                "root_dir": str(root),
+                "env": {},
+                "logs": [{"id": "runtime", "host_path": str(log_dir)}],
+                "repos": [],
+                "artifacts": [],
+            }
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ResourceWarning)
+                results = runtime_ops.start_services(model, [service], dry_run=False, wait_seconds=2)
+                gc.collect()
+
+            server_pid = int(pid_file.read_text(encoding="utf-8").strip())
+            try:
+                self.assertEqual(results[0]["result"], "started")
+                self.assertFalse(
+                    [warning for warning in caught if issubclass(warning.category, ResourceWarning)],
+                )
+            finally:
+                runtime_ops.stop_process(server_pid, 1)
+                time.sleep(1.1)
+                runtime_ops.reap_started_service_processes()
 
     def test_sync_creates_core_runtime_state_and_installs_default_skills(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -785,6 +828,35 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertIn(down_payload["services"][0]["result"], {"stopped", "killed"})
             self.assertFalse((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-daemon.pid").exists())
             self.assertFalse((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-daemon.ready").exists())
+
+    def test_no_args_prints_status_home_view(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(repo)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("clients:", result.stdout)
+            self.assertIn("repos:", result.stdout)
+            self.assertIn("services:", result.stdout)
+            self.assertNotIn("usage: manage.py", result.stderr)
+
+    def test_status_compact_json_omits_raw_client_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(repo, "status", "--format", "json", "--compact")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertIn("client_ids", payload)
+            self.assertNotIn("clients", payload)
+            self.assertIn("next_actions", payload)
+            self.assertNotIn("bindings", payload["storage"])
+            self.assertEqual(payload["skills"][0]["skill_count"], 0)
+            self.assertIn("internal-env-manager", {item["id"] for item in payload["services"]})
 
     def test_up_skips_status_only_services_and_logs_show_recent_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

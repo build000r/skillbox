@@ -160,6 +160,37 @@ class SkillboxMcpServerTests(unittest.TestCase):
             "skillbox_skills",
         )
 
+    def test_skillbox_status_defaults_to_compact_with_full_escape_hatch(self) -> None:
+        tool = next(tool for tool in MODULE.handle_tools_list({})["tools"] if tool["name"] == "skillbox_status")
+        self.assertIn("full", tool["inputSchema"]["properties"])
+
+        with mock.patch.object(
+            MODULE,
+            "run_manage",
+            return_value=(True, 0, {"ok": True}),
+        ) as run_manage:
+            MODULE.handle_tools_call({"name": "skillbox_status", "arguments": {}}, request_id="req-status")
+
+        self.assertEqual(run_manage.call_args.args[0][:3], ["status", "--format", "json"])
+        self.assertIn("--compact", run_manage.call_args.args[0])
+        self.assertEqual(
+            run_manage.call_args.kwargs["event_context"]["mcp_tool_name"],
+            "skillbox_status",
+        )
+
+        with mock.patch.object(
+            MODULE,
+            "run_manage",
+            return_value=(True, 0, {"ok": True}),
+        ) as run_manage:
+            MODULE.handle_tools_call(
+                {"name": "skillbox_status", "arguments": {"full": True}},
+                request_id="req-status-full",
+            )
+
+        self.assertNotIn("--compact", run_manage.call_args.args[0])
+        self.assertNotIn("--full", run_manage.call_args.args[0])
+
     def test_skillbox_skill_maps_lifecycle_arguments(self) -> None:
         tool_names = {tool["name"] for tool in MODULE.handle_tools_list({})["tools"]}
         self.assertIn("skillbox_skill", tool_names)

@@ -175,7 +175,18 @@ TOOLS: list[dict] = [
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {"client": _CLIENT_PROP, "profile": _PROFILE_PROP},
+            "properties": {
+                "client": _CLIENT_PROP,
+                "profile": _PROFILE_PROP,
+                "full": {
+                    "type": "boolean",
+                    "description": (
+                        "Return the full raw runtime status payload. Defaults to false so agents get "
+                        "the compact inspection summary first."
+                    ),
+                    "default": False,
+                },
+            },
         },
     },
     {
@@ -1007,8 +1018,10 @@ def build_args(command: str, params: dict, positional: str | None = None) -> lis
         args.append("--show-shadowed")
     if params.get("issues_only"):
         args.append("--issues-only")
-    if params.get("full"):
+    if params.get("full") and command == "skills":
         args.append("--full")
+    if params.get("compact") and command == "status":
+        args.append("--compact")
     if params.get("allow_directories"):
         args.append("--allow-directories")
     if params.get("yes"):
@@ -1115,9 +1128,12 @@ def dispatch_tool(name: str, params: dict, *, request_id: Any = None) -> dict:
         })
 
     command, positional_key = _DISPATCH[name]
-    positional = str(params[positional_key]) if positional_key and positional_key in params else None
+    tool_params = dict(params)
+    if name == "skillbox_status" and not tool_params.get("full"):
+        tool_params["compact"] = True
+    positional = str(tool_params[positional_key]) if positional_key and positional_key in tool_params else None
 
-    if positional_key and positional is None and not params.get("list_blueprints"):
+    if positional_key and positional is None and not tool_params.get("list_blueprints"):
         return _error_content({
             "error": {
                 "type": "missing_required_parameter",
@@ -1127,8 +1143,8 @@ def dispatch_tool(name: str, params: dict, *, request_id: Any = None) -> dict:
             }
         })
 
-    args = build_args(command, params, positional)
-    event_context = build_tool_event_context(name, command, params, request_id)
+    args = build_args(command, tool_params, positional)
+    event_context = build_tool_event_context(name, command, tool_params, request_id)
     ok, exit_code, data = run_manage(args, event_context=event_context)
 
     # Annotate exit code so agents know what happened without parsing error fields.
