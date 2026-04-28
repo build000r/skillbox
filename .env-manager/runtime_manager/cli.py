@@ -19,7 +19,7 @@ def main() -> int:
         default=None,
         help="Override the repo root for testing or embedding.",
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command")
 
     def add_profile_arg(command_parser: argparse.ArgumentParser) -> None:
         command_parser.add_argument(
@@ -91,6 +91,11 @@ def main() -> int:
         help="Summarize repo, artifact, skill, service, log, and check state.",
     )
     status_parser.add_argument("--format", choices=("text", "json"), default="text")
+    status_parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="Emit compact JSON for agent inspection instead of the full raw status payload.",
+    )
     add_profile_arg(status_parser)
     add_client_arg(status_parser)
 
@@ -649,6 +654,12 @@ def main() -> int:
     add_profile_arg(acceptance_parser)
 
     args = parser.parse_args()
+    if args.command is None:
+        args.command = "status"
+        args.format = "text"
+        args.compact = False
+        args.profile = []
+        args.client = []
     root_dir = resolve_root_dir(args.root_dir)
 
     # --- WG-003: --mode selector validation ---------------------------------
@@ -1140,7 +1151,7 @@ def main() -> int:
             status_payload = runtime_status(model)
             if args.format == "json":
                 status_payload["next_actions"] = next_actions_for_status(status_payload)
-                emit_json(status_payload)
+                emit_json(compact_runtime_status(status_payload) if args.compact else status_payload)
             else:
                 print_status_text(status_payload)
             return EXIT_OK

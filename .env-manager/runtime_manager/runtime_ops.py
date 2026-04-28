@@ -14,6 +14,29 @@ from lib.runtime_model import (
 )
 
 
+_STARTED_SERVICE_PROCESSES: list[subprocess.Popen[str]] = []
+
+
+def reap_started_service_processes() -> None:
+    """Reap service launcher processes that have exited since startup."""
+    running: list[subprocess.Popen[str]] = []
+    for process in _STARTED_SERVICE_PROCESSES:
+        if process.poll() is None:
+            running.append(process)
+            continue
+        try:
+            process.communicate(timeout=0)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    _STARTED_SERVICE_PROCESSES[:] = running
+
+
+def track_started_service_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is None:
+        reap_started_service_processes()
+        _STARTED_SERVICE_PROCESSES.append(process)
+
+
 def _storage_filesystem_type(path: Path) -> str:
     result = run_command(["findmnt", "-no", "FSTYPE", "--target", str(path)])
     if result.returncode != 0:
@@ -2415,6 +2438,7 @@ def tail_lines(path: Path, line_count: int) -> list[str]:
 
 
 def stop_process(pid: int, wait_seconds: float) -> tuple[str, int | None]:
+    reap_started_service_processes()
     try:
         pgid = os.getpgid(pid)
     except OSError:
@@ -2427,6 +2451,7 @@ def stop_process(pid: int, wait_seconds: float) -> tuple[str, int | None]:
 
     deadline = time.monotonic() + wait_seconds
     while time.monotonic() <= deadline:
+        reap_started_service_processes()
         if not process_is_running(pid):
             return "stopped", signal.SIGTERM
         time.sleep(0.1)
@@ -2438,10 +2463,12 @@ def stop_process(pid: int, wait_seconds: float) -> tuple[str, int | None]:
 
     deadline = time.monotonic() + 1.0
     while time.monotonic() <= deadline:
+        reap_started_service_processes()
         if not process_is_running(pid):
             return "killed", signal.SIGKILL
         time.sleep(0.1)
 
+    reap_started_service_processes()
     return "stuck", None
 
 
@@ -2870,6 +2897,7 @@ def start_services(
         if health_state.get("state") == "timeout":
             # Process is still alive but health check hasn't passed yet.
             # Leave it running — it may still be compiling / booting.
+            track_started_service_process(process)
             tail = tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)
             detail = result | {"result": "timeout", "pid": process.pid, "tail": tail}
             if "url" in health_state:
@@ -2899,6 +2927,7 @@ def start_services(
             started_detail["pid"] = started_pid
         results.append(started_detail)
         log_runtime_event("service.started", service["id"], {"pid": started_pid or process.pid})
+        track_started_service_process(process)
     return results
 
 
@@ -3665,4 +3694,126 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
             "covered_surfaces": parity_ledger_covered_surfaces(model),
             "deferred_surfaces": parity_ledger_deferred_surfaces(model),
         },
+    }
+
+
+def compact_runtime_status(status_payload: dict[str, Any]) -> dict[str, Any]:
+    """Return the agent-facing status summary without heavyweight raw config."""
+    compact_skills: list[dict[str, Any]] = []
+    for skillset in status_payload.get("skills") or []:
+        total_targets = 0
+        healthy_targets = 0
+        for skill_entry in skillset.get("skills") or []:
+            for target in skill_entry.get("targets") or []:
+                total_targets += 1
+                if target.get("state") == "ok":
+                    healthy_targets += 1
+        compact_skills.append(
+            {
+                "id": skillset.get("id"),
+                "kind": skillset.get("kind"),
+                "lock_present": bool(skillset.get("lock_present")),
+                "lock_error": skillset.get("lock_error"),
+                "skill_count": len(skillset.get("skills") or []),
+                "healthy_targets": healthy_targets,
+                "total_targets": total_targets,
+            }
+        )
+
+    parity_ledger = status_payload.get("parity_ledger") or {}
+    ingress = status_payload.get("ingress") or {}
+
+    return {
+        "client_ids": [
+            str(client.get("id"))
+            for client in status_payload.get("clients") or []
+            if client.get("id")
+        ],
+        "active_clients": status_payload.get("active_clients") or [],
+        "default_client": status_payload.get("default_client"),
+        "active_profiles": status_payload.get("active_profiles") or [],
+        "distributors": status_payload.get("distributors") or [],
+        "storage": {
+            "provider": (status_payload.get("storage") or {}).get("provider"),
+            "state_root": (status_payload.get("storage") or {}).get("state_root"),
+            "required": bool((status_payload.get("storage") or {}).get("required")),
+        },
+        "repos": [
+            {
+                "id": repo.get("id"),
+                "present": bool(repo.get("present")),
+                "branch": repo.get("branch"),
+                "dirty": repo.get("dirty"),
+                "untracked": repo.get("untracked"),
+            }
+            for repo in status_payload.get("repos") or []
+        ],
+        "artifacts": [
+            {
+                "id": artifact.get("id"),
+                "state": artifact.get("state"),
+                "source_kind": artifact.get("source_kind"),
+                "required": bool(artifact.get("required")),
+            }
+            for artifact in status_payload.get("artifacts") or []
+        ],
+        "env_files": [
+            {
+                "id": env_file.get("id"),
+                "state": env_file.get("state"),
+                "source_kind": env_file.get("source_kind"),
+                "required": bool(env_file.get("required")),
+            }
+            for env_file in status_payload.get("env_files") or []
+        ],
+        "skills": compact_skills,
+        "tasks": [
+            {
+                "id": task.get("id"),
+                "state": task.get("state"),
+                "depends_on": task.get("depends_on") or [],
+            }
+            for task in status_payload.get("tasks") or []
+        ],
+        "services": [
+            {
+                "id": service.get("id"),
+                "state": service.get("state"),
+                "pid": service.get("pid"),
+                "managed": service.get("managed"),
+                "manager_reason": service.get("manager_reason"),
+                "ownership_state": service.get("ownership_state"),
+                "depends_on": service.get("depends_on") or [],
+                "bootstrap_tasks": service.get("bootstrap_tasks") or [],
+            }
+            for service in status_payload.get("services") or []
+        ],
+        "blocked_services": status_payload.get("blocked_services") or [],
+        "logs": [
+            {
+                "id": log_item.get("id"),
+                "present": bool(log_item.get("present")),
+                "files": log_item.get("files"),
+                "bytes": log_item.get("bytes"),
+            }
+            for log_item in status_payload.get("logs") or []
+        ],
+        "checks": [
+            {
+                "id": check.get("id"),
+                "type": check.get("type"),
+                "ok": check.get("ok"),
+            }
+            for check in status_payload.get("checks") or []
+        ],
+        "ingress": {
+            "route_file_present": bool(ingress.get("route_file_present")),
+            "nginx_config_present": bool(ingress.get("nginx_config_present")),
+            "route_count": len(ingress.get("routes") or []),
+        },
+        "parity_ledger": {
+            "covered_count": len(parity_ledger.get("covered_surfaces") or []),
+            "deferred_surfaces": parity_ledger.get("deferred_surfaces") or [],
+        },
+        "next_actions": status_payload.get("next_actions") or [],
     }
