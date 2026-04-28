@@ -25,7 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zsh \
  && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g gh-axi@0.1.11
+RUN npm install -g gh-axi@0.1.11 spaps@0.7.7
 
 RUN useradd --create-home --shell /bin/zsh sandbox
 

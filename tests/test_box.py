@@ -21,6 +21,10 @@ BOX_MODULE = SourceFileLoader(
 class BoxTests(unittest.TestCase):
     """Test box.py core logic: profiles, inventory, structured output, dry-run."""
 
+    def test_workspace_image_installs_mandatory_spaps_cli(self) -> None:
+        dockerfile = (ROOT_DIR / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("spaps@0.7.7", dockerfile)
+
     def test_build_remote_env_command_preserves_literal_env_values(self) -> None:
         command = BOX_MODULE.build_remote_env_command(
             ["bash", "-s"],
@@ -60,6 +64,45 @@ class BoxTests(unittest.TestCase):
                 set_args=set_args,
             ),
         )
+
+    def test_augment_spaps_tailnet_set_args_adds_browser_visible_defaults(self) -> None:
+        result = BOX_MODULE.augment_spaps_tailnet_set_args(
+            ["PRIMARY_REPO_URL=https://example.com/app.git"],
+            blueprint=BOX_MODULE.DEFAULT_FIRST_BOX_BLUEPRINT,
+            tailscale_ip="100.76.6.41",
+        )
+
+        self.assertIn("SPAPS_AUTH_BASE_URL=http://100.76.6.41:5173", result)
+        self.assertIn("SPAPS_FIXTURE_BASE_URL=http://100.76.6.41:5173", result)
+        self.assertIn("SPAPS_BROWSER_API_URL=http://100.76.6.41:3301", result)
+        self.assertIn(
+            "SPAPS_CORS_ALLOW_ORIGINS=http://100.76.6.41:5173,http://localhost:5173,http://127.0.0.1:5173",
+            result,
+        )
+
+    def test_augment_spaps_tailnet_set_args_preserves_explicit_values(self) -> None:
+        result = BOX_MODULE.augment_spaps_tailnet_set_args(
+            [
+                "SERVICE_PORT=3000",
+                "SPAPS_AUTH_PORT=4401",
+                "SPAPS_BROWSER_API_URL=http://custom:4401",
+            ],
+            blueprint=BOX_MODULE.DEFAULT_FIRST_BOX_BLUEPRINT,
+            tailscale_ip="100.76.6.41",
+        )
+
+        self.assertIn("SPAPS_BROWSER_API_URL=http://custom:4401", result)
+        self.assertNotIn("SPAPS_BROWSER_API_URL=http://100.76.6.41:4401", result)
+        self.assertIn("SPAPS_AUTH_BASE_URL=http://100.76.6.41:3000", result)
+
+    def test_augment_spaps_tailnet_set_args_skips_plain_blueprint(self) -> None:
+        result = BOX_MODULE.augment_spaps_tailnet_set_args(
+            ["PRIMARY_REPO_URL=https://example.com/app.git"],
+            blueprint="git-repo-http-service-bootstrap",
+            tailscale_ip="100.76.6.41",
+        )
+
+        self.assertEqual(result, ["PRIMARY_REPO_URL=https://example.com/app.git"])
 
     def test_build_release_install_args_uses_offline_archive_and_skips_first_box(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

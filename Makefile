@@ -55,7 +55,7 @@ help:
 	@printf "  make swimmers-status         Report swimmers workspace-local process and probe state\n"
 	@printf "  make swimmers-logs           Tail swimmers server logs inside the workspace container\n"
 	@printf "  make swimmers-runtime-status Summarize the runtime-manager swimmers overlay state\n"
-	@printf "  make box-up         Create a DO+Tailscale box (BOX=id PROFILE=dev-small DEPLOY_MANIFEST=path BLUEPRINT=name SET='K=V')\n"
+	@printf "  make box-up         Create a DO+Tailscale box (BOX=id PROFILE=dev-small DEPLOY_MANIFEST=path; default BLUEPRINT=SPAPS auth)\n"
 	@printf "  make box-down       Drain and destroy a box (BOX=id)\n"
 	@printf "  make box-status     Check health of a box (BOX=id, omit for all)\n"
 	@printf "  make box-list       List all active boxes\n"

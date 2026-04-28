@@ -426,6 +426,7 @@ conversation.
 
 # or via make targets
 make box-up BOX=acme-prod PROFILE=dev-large
+# default first-box onboarding uses the SPAPS auth/RBAC blueprint; pass BLUEPRINT=git-repo-http-service-bootstrap for a plain service
 # resume a partial first-box/deploy failure without rebuilding the droplet
 make box-up BOX=acme-prod PROFILE=dev-large DEPLOY_MANIFEST=clients/acme-prod/deploy.json RESUME=1
 make box-status BOX=acme-prod
@@ -611,6 +612,7 @@ Or via make:
 
 ```bash
 make box-up BOX=dev-01 PROFILE=dev-small
+# default BLUEPRINT is git-repo-http-service-bootstrap-spaps-auth
 make box-up BOX=dev-01 PROFILE=dev-small DEPLOY_MANIFEST=clients/dev-01/deploy.json RESUME=1
 ```
 
@@ -704,7 +706,7 @@ make runtime-sync
 | `make swimmers-status` | Reports swimmers process and probe state inside the workspace container |
 | `make swimmers-logs` | Tails swimmers server logs from inside the workspace container |
 | `make swimmers-runtime-status` | Shows the runtime-manager view of the swimmers overlay |
-| `make box-up` | Provision a new remote box (DO + Tailscale), or resume a partial provision with `RESUME=1` |
+| `make box-up` | Provision a new remote box (DO + Tailscale) with the SPAPS auth/RBAC blueprint by default, or resume a partial provision with `RESUME=1` |
 | `make box-down` | Tear down a remote box |
 | `make box-status` | Health-check a remote box |
 | `make box-list` | List all boxes from inventory |
@@ -872,7 +874,7 @@ With that setup:
 - `client-init`, `sync`, and `focus` write client config into the private repo
 - `client-diff` and `client-publish` default to the attached private repo unless you explicitly pass `--target-dir`
 - `client-project <client>` compiles a client-safe bundle under `builds/clients/<client>/`
-- `first-box <client>` is the one-command runtime setup path for attaching the private repo, activating the client, and writing `sand/<client>/`
+- `first-box <client>` is the one-command runtime setup path for attaching the private repo, activating the client, and writing `sand/<client>/`; if the overlay already exists, scaffold arguments such as `--blueprint` are reported as ignored unless `--force` is passed
 - `client-open <client>` turns that bundle into a ready-to-work client surface under `sand/<client>/`, and `--from-bundle` re-opens a reviewed artifact without running live focus
 - client application repos stay separate under the shared monoserver tree
 - clients usually do not need access to the `skillbox` repo itself
@@ -1295,20 +1297,41 @@ python3 .env-manager/manage.py client-init acme-studio \
   --blueprint git-repo-http-service-bootstrap-spaps-auth \
   --set PRIMARY_REPO_URL=https://github.com/acme/app.git \
   --set BOOTSTRAP_COMMAND='pnpm install && mkdir -p .skillbox && touch .skillbox/bootstrap.ok' \
-  --set SERVICE_COMMAND='pnpm dev' \
-  --set SPAPS_CLI_PACKAGE=spaps@0.7.7
+  --set SERVICE_COMMAND='pnpm dev'
 ```
 
-The blueprint defaults `SPAPS_CLI_PACKAGE=spaps@0.7.7` as the core contract.
-Override with `--set SPAPS_CLI_PACKAGE=spaps@x.y.z` to use a different version.
+Every skillbox image installs `spaps@0.7.7` as a mandatory workspace CLI. The
+SPAPS blueprint uses that installed `spaps` command by default; override
+`SPAPS_CLI_COMMAND` only when you intentionally want a different command, such
+as `npx --yes spaps@x.y.z`.
+
+For a remote box that should be usable from your tailnet browser, set the
+browser-facing URLs explicitly. For example, with a Tailscale IP of
+`100.76.6.41` and an app on `5173`:
+
+```bash
+--set SERVICE_COMMAND='npm run dev -- --host 0.0.0.0 --port 5173' \
+--set SERVICE_HEALTHCHECK_URL=http://127.0.0.1:5173/ \
+--set SPAPS_AUTH_BASE_URL=http://100.76.6.41:5173 \
+--set SPAPS_FIXTURE_BASE_URL=http://100.76.6.41:5173 \
+--set SPAPS_BROWSER_API_URL=http://100.76.6.41:3301 \
+--set SPAPS_CORS_ALLOW_ORIGINS=http://100.76.6.41:5173,http://localhost:5173,http://127.0.0.1:5173
+```
+
+`box up` fills those SPAPS browser/CORS values from the enrolled Tailscale IP
+when the default SPAPS blueprint is used; pass explicit `--set` values only when
+you need to override the derived URLs.
 
 That scaffold adds:
 
 - a managed `auth-api` service on `http://127.0.0.1:3301/health`
 - a repo-local SPAPS fixture bootstrap task
 - an app service that depends on auth before startup
-- non-interactive `npx --yes` execution for the SPAPS CLI, pinned to
-  `spaps@0.7.7` by default
+- the preinstalled `spaps` CLI, so default first-box boot does not depend on an
+  npm first-run install prompt
+- a fixture postprocess step that rewrites generated browser artifacts to the
+  configured `SPAPS_BROWSER_API_URL`, so remote browser sessions do not get
+  stuck calling `localhost:3301`
 
 Blueprints keep the default client scaffold unless they explicitly set a
 different scaffold pack. They append client-scoped repos, artifacts, tasks,
