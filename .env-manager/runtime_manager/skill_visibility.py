@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import glob
+import hashlib
 import os
 import shutil
 from pathlib import Path
@@ -390,20 +391,31 @@ def unlink_overlay_scoped_skills(
     model: dict[str, Any],
     overlay_name: str,
     cwd: Path | str,
+    *,
+    scope: str = "all",
 ) -> list[str]:
-    """Remove symlinks for overlay-scoped skills from cwd's project dirs and
-    the operator-wide agent homes. Never touches real directories — only
-    symlinks — so an accidental call cannot delete skill sources.
+    """Remove symlinks for overlay-scoped skills from selected agent surfaces.
+
+    Never touches real directories — only symlinks — so an accidental call
+    cannot delete skill sources. scope controls the blast radius:
+    project = cwd-local .claude/.codex, global = operator homes, all = both.
     """
     skill_names = overlay_scoped_skill_names(model, overlay_name)
     if not skill_names:
         return []
-    targets = [
-        Path(cwd) / ".claude" / "skills",
-        Path(cwd) / ".codex" / "skills",
-        Path.home() / ".claude" / "skills",
-        Path.home() / ".codex" / "skills",
-    ]
+    if scope not in {"project", "global", "all"}:
+        raise RuntimeError("overlay unlink scope must be one of: project, global, all")
+    targets: list[Path] = []
+    if scope in {"project", "all"}:
+        targets.extend([
+            Path(cwd) / ".claude" / "skills",
+            Path(cwd) / ".codex" / "skills",
+        ])
+    if scope in {"global", "all"}:
+        targets.extend([
+            Path.home() / ".claude" / "skills",
+            Path.home() / ".codex" / "skills",
+        ])
     removed: list[str] = []
     for target_dir in targets:
         if not target_dir.is_dir():
@@ -417,6 +429,47 @@ def unlink_overlay_scoped_skills(
                 except OSError:
                     pass
     return sorted(removed)
+
+
+def activate_overlay_scoped_skills(
+    model: dict[str, Any],
+    overlay_name: str,
+    cwd: Path | str,
+    *,
+    to: str = "project",
+    categories: list[str] | None = None,
+    source: str | None = None,
+    dry_run: bool = False,
+    allow_directories: bool = False,
+    force: bool = False,
+) -> list[dict[str, Any]]:
+    """Activate literal skills for one overlay without changing overlay state."""
+    activations: list[dict[str, Any]] = []
+    for skill_name in sorted(overlay_scoped_skill_names(model, overlay_name)):
+        activation_plan = skill_lifecycle_plan(
+            model,
+            "activate",
+            skill_name=skill_name,
+            cwd=str(cwd),
+            to=to,
+            categories=categories or [],
+            source=source,
+            force=force,
+        )
+        activation_result = apply_skill_lifecycle_plan(
+            activation_plan,
+            dry_run=dry_run,
+            allow_directories=allow_directories,
+            force=force,
+        )
+        activations.append({
+            "skill": skill_name,
+            "summary": activation_result.get("summary"),
+            "warnings": activation_result.get("warnings") or [],
+            "actions": activation_result.get("actions") or [],
+            "activation_packet": activation_result.get("activation_packet"),
+        })
+    return activations
 
 
 def _load_scope_policy(path: Path) -> dict[str, Any] | None:
@@ -1063,6 +1116,46 @@ def _dedupe_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return deduped
 
 
+def _activation_packet(
+    skill_name: str,
+    selected_source: dict[str, Any],
+    actions: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, str | None]:
+    source_path = Path(str(selected_source.get("source") or "")).resolve()
+    skill_md_path = source_path / "SKILL.md"
+    try:
+        skill_md_bytes = skill_md_path.read_bytes()
+        skill_md = skill_md_bytes.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, f"Could not read activation packet for {skill_name!r}: {exc}"
+
+    surface_targets: dict[str, list[str]] = {}
+    for action in actions:
+        if action.get("op") != "link":
+            continue
+        surface = str(action.get("surface") or "")
+        destination = str(action.get("destination") or "")
+        if surface and destination:
+            surface_targets.setdefault(surface, []).append(destination)
+
+    return {
+        "name": skill_name,
+        "source": str(source_path),
+        "source_bucket": selected_source.get("source_bucket"),
+        "skill_md_path": str(skill_md_path),
+        "skill_md_sha256": hashlib.sha256(skill_md_bytes).hexdigest(),
+        "skill_md": skill_md,
+        "surface_targets": {
+            surface: sorted(targets)
+            for surface, targets in sorted(surface_targets.items())
+        },
+        "instructions": (
+            "Use this SKILL.md content immediately in the current agent session. "
+            "The filesystem links make the skill visible to future Claude and Codex sessions."
+        ),
+    }, None
+
+
 def skill_lifecycle_plan(
     model: dict[str, Any],
     action: str,
@@ -1084,7 +1177,7 @@ def skill_lifecycle_plan(
     selected_source: dict[str, Any] | None = None
     resolved_to = to
 
-    if action in {"plan", "add", "move"}:
+    if action in {"plan", "add", "move", "activate"}:
         if not skill_name:
             raise RuntimeError(f"`skill {action}` requires a skill name.")
         source_options = _skill_source_options(model, skill_name, explicit_source=source)
@@ -1187,6 +1280,11 @@ def skill_lifecycle_plan(
                 ))
 
     actions = _dedupe_actions(actions)
+    activation_packet = None
+    if action == "activate" and skill_name and selected_source:
+        activation_packet, packet_warning = _activation_packet(skill_name, selected_source, actions)
+        if packet_warning:
+            warnings.append(packet_warning)
     return {
         "action": action,
         "skill": skill_name,
@@ -1197,6 +1295,7 @@ def skill_lifecycle_plan(
         "from_scope": from_scope,
         "source_options": source_options,
         "selected_source": selected_source,
+        "activation_packet": activation_packet,
         "warnings": warnings,
         "actions": actions,
         "summary": {
@@ -1302,6 +1401,14 @@ def print_skill_lifecycle_text(payload: dict[str, Any]) -> None:
         dest = action.get("destination")
         skill = action.get("skill")
         print(f"  - {status}: {op} {skill} -> {dest}")
+    packet = payload.get("activation_packet")
+    if packet:
+        print("activation packet:")
+        print(f"name: {packet.get('name')}")
+        print(f"source: {packet.get('source')}")
+        print(f"skill_md_sha256: {packet.get('skill_md_sha256')}")
+        print("skill_md:")
+        print(str(packet.get("skill_md") or "").rstrip())
 
 
 def _scope_allows_global(model: dict[str, Any], skill_name: str) -> bool:

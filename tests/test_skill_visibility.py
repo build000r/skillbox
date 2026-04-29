@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 ENV_MANAGER_DIR = ROOT_DIR / ".env-manager"
@@ -12,6 +14,7 @@ if str(ENV_MANAGER_DIR) not in sys.path:
     sys.path.insert(0, str(ENV_MANAGER_DIR))
 
 from runtime_manager.skill_visibility import (  # noqa: E402
+    activate_overlay_scoped_skills,
     apply_skill_lifecycle_plan,
     _effective_occurrences,
     _project_skill_roots,
@@ -19,6 +22,7 @@ from runtime_manager.skill_visibility import (  # noqa: E402
     collect_skill_visibility,
     matched_skill_clients,
     skill_lifecycle_plan,
+    unlink_overlay_scoped_skills,
 )
 
 
@@ -369,6 +373,182 @@ class SkillVisibilityTests(unittest.TestCase):
                     link = project / f".{surface}" / "skills" / "ui"
                     self.assertTrue(link.is_symlink())
                     self.assertEqual(link.resolve(), skill_dir.resolve())
+
+    def test_skill_lifecycle_activate_links_both_surfaces_and_returns_packet(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            clients_root = root / "clients"
+            source_root = root / "source-skills"
+            project = root / "repos" / "tool"
+            clients_root.mkdir()
+            project.mkdir(parents=True)
+            skill_dir = source_root / "hot-skill"
+            skill_dir.mkdir(parents=True)
+            skill_md = "# Hot Skill\n\nUse immediately.\n"
+            (skill_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
+
+            model = {
+                "env": {"SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root)},
+                "clients": [],
+                "skills": [],
+            }
+
+            plan = skill_lifecycle_plan(
+                model,
+                "activate",
+                skill_name="hot-skill",
+                cwd=str(project),
+                to="project",
+                source=str(skill_dir),
+            )
+            result = apply_skill_lifecycle_plan(plan, dry_run=False)
+
+            self.assertEqual(result["summary"]["link"], 2)
+            packet = result["activation_packet"]
+            self.assertEqual(packet["name"], "hot-skill")
+            self.assertEqual(packet["skill_md"], skill_md)
+            self.assertEqual(
+                packet["skill_md_sha256"],
+                hashlib.sha256(skill_md.encode("utf-8")).hexdigest(),
+            )
+            self.assertEqual(set(packet["surface_targets"]), {"claude", "codex"})
+            for surface in ("claude", "codex"):
+                link = project / f".{surface}" / "skills" / "hot-skill"
+                self.assertTrue(link.is_symlink())
+                self.assertEqual(link.resolve(), skill_dir.resolve())
+                self.assertIn(str(link.parent.resolve() / link.name), packet["surface_targets"][surface])
+
+    def test_overlay_activation_defaults_to_project_scope_and_tracks_cwd_metamorphically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            clients_root = root / "clients"
+            source_root = root / "source-skills"
+            project_a = root / "repos" / "tool-a"
+            project_b = root / "repos" / "tool-b"
+            clients_root.mkdir()
+            project_a.mkdir(parents=True)
+            project_b.mkdir(parents=True)
+            skill_dir = source_root / "hot-skill"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("# Hot Skill\n\nUse immediately.\n", encoding="utf-8")
+            (root / "skill-scope.yaml").write_text(
+                "version: 1\n"
+                f"skill_source_roots: [{source_root}]\n"
+                "rules:\n"
+                "  - id: marketing-local\n"
+                "    overlay: marketing\n"
+                "    skills: [hot-skill]\n",
+                encoding="utf-8",
+            )
+            model = {
+                "env": {"SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root)},
+                "clients": [],
+                "skills": [],
+            }
+
+            first = activate_overlay_scoped_skills(model, "marketing", project_a)
+            second = activate_overlay_scoped_skills(model, "marketing", project_b)
+
+            self.assertEqual(len(first), 1)
+            self.assertEqual(len(second), 1)
+            self.assertEqual(first[0]["summary"]["link"], 2)
+            self.assertEqual(second[0]["summary"]["link"], 2)
+            self.assertEqual(
+                first[0]["activation_packet"]["skill_md_sha256"],
+                second[0]["activation_packet"]["skill_md_sha256"],
+            )
+            for surface in ("claude", "codex"):
+                first_target = first[0]["activation_packet"]["surface_targets"][surface][0]
+                second_target = second[0]["activation_packet"]["surface_targets"][surface][0]
+                self.assertEqual(second_target, first_target.replace(str(project_a.resolve()), str(project_b.resolve())))
+                self.assertTrue(first_target.startswith(str(project_a.resolve())))
+                self.assertTrue(second_target.startswith(str(project_b.resolve())))
+                self.assertFalse(first_target.startswith(str(Path.home())))
+                self.assertFalse(second_target.startswith(str(Path.home())))
+
+    def test_overlay_activation_can_explicitly_target_global_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            clients_root = root / "clients"
+            source_root = root / "source-skills"
+            project = root / "repos" / "tool"
+            clients_root.mkdir()
+            project.mkdir(parents=True)
+            skill_dir = source_root / "hot-skill"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("# Hot Skill\n", encoding="utf-8")
+            (root / "skill-scope.yaml").write_text(
+                "version: 1\n"
+                f"skill_source_roots: [{source_root}]\n"
+                "rules:\n"
+                "  - id: marketing-local\n"
+                "    overlay: marketing\n"
+                "    skills: [hot-skill]\n",
+                encoding="utf-8",
+            )
+            model = {
+                "env": {"SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root)},
+                "clients": [],
+                "skills": [],
+            }
+
+            activations = activate_overlay_scoped_skills(
+                model,
+                "marketing",
+                project,
+                to="global",
+                dry_run=True,
+            )
+
+            destinations = {action["destination"] for action in activations[0]["actions"]}
+            self.assertEqual(destinations, {
+                str(Path.home() / ".claude" / "skills" / "hot-skill"),
+                str(Path.home() / ".codex" / "skills" / "hot-skill"),
+            })
+
+    def test_overlay_unlink_scope_project_does_not_remove_global_links(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            clients_root = root / "clients"
+            project = root / "repos" / "tool"
+            fake_home = root / "home"
+            source = root / "source-skills" / "hot-skill"
+            clients_root.mkdir()
+            source.mkdir(parents=True)
+            (source / "SKILL.md").write_text("# Hot Skill\n", encoding="utf-8")
+            (root / "skill-scope.yaml").write_text(
+                "version: 1\n"
+                "rules:\n"
+                "  - id: marketing-local\n"
+                "    overlay: marketing\n"
+                "    skills: [hot-skill]\n",
+                encoding="utf-8",
+            )
+            for base in (
+                project / ".claude" / "skills",
+                project / ".codex" / "skills",
+                fake_home / ".claude" / "skills",
+                fake_home / ".codex" / "skills",
+            ):
+                base.mkdir(parents=True)
+                (base / "hot-skill").symlink_to(source)
+            model = {
+                "env": {"SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root)},
+                "clients": [],
+                "skills": [],
+            }
+
+            with mock.patch("runtime_manager.skill_visibility.Path.home", return_value=fake_home):
+                removed = unlink_overlay_scoped_skills(model, "marketing", project, scope="project")
+
+            self.assertEqual(set(removed), {
+                str(project / ".claude" / "skills" / "hot-skill"),
+                str(project / ".codex" / "skills" / "hot-skill"),
+            })
+            self.assertFalse((project / ".claude" / "skills" / "hot-skill").exists())
+            self.assertFalse((project / ".codex" / "skills" / "hot-skill").exists())
+            self.assertTrue((fake_home / ".claude" / "skills" / "hot-skill").is_symlink())
+            self.assertTrue((fake_home / ".codex" / "skills" / "hot-skill").is_symlink())
 
     def test_skill_lifecycle_auto_uses_project_when_global_policy_disallows_skill(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
