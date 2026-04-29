@@ -260,9 +260,10 @@ TOOLS: list[dict] = [
     {
         "name": "skillbox_skill",
         "description": (
-            "Plan or apply one skill lifecycle action: add/link, move, remove, prune, or sync "
+            "Plan or apply one skill lifecycle action: add/link, activate, move, remove, prune, or sync "
             "cwd-missing skills from skill-scope policy. Uses the same global/project/category "
-            "placement rules as skillbox_skills. Always call with dry_run=true first before "
+            "placement rules as skillbox_skills. activate also returns the SKILL.md activation "
+            "packet for the current agent session. Always call with dry_run=true first before "
             "mutating, and pass yes=true for remove/move/prune actions after reviewing the plan."
         ),
         "inputSchema": {
@@ -271,7 +272,7 @@ TOOLS: list[dict] = [
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["plan", "add", "move", "remove", "prune", "sync"],
+                    "enum": ["plan", "add", "activate", "move", "remove", "prune", "sync"],
                     "description": "Lifecycle action to run.",
                 },
                 "skill": {
@@ -324,6 +325,69 @@ TOOLS: list[dict] = [
                 "allow_directories": {
                     "type": "boolean",
                     "description": "Allow unlink/prune to remove real skill directories, not just symlinks/files.",
+                    "default": False,
+                },
+            },
+        },
+    },
+    {
+        "name": "skillbox_overlay",
+        "description": (
+            "List, enable, disable, toggle, or activate a skill-scope overlay. "
+            "activate is cwd-scoped and does not persist overlay state by default: it links "
+            "literal scoped skills into both Claude and Codex project skill roots for cwd, "
+            "then returns SKILL.md activation packets for immediate use in the current session. "
+            "Use to=global only when the overlay should be installed into operator homes."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "on", "off", "toggle", "activate"],
+                    "description": "Overlay action. Defaults to list.",
+                    "default": "list",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Overlay name, such as marketing. Required except for list.",
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory used to match overlay-scoped skills and repo roots.",
+                },
+                "to": {
+                    "type": "string",
+                    "enum": ["project", "global", "category", "auto"],
+                    "description": "Activation destination. Defaults to project so hot overlays stay scoped to cwd.",
+                    "default": "project",
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["project", "global", "all"],
+                    "description": "Symlink removal scope for off/toggle. Defaults to project.",
+                    "default": "project",
+                },
+                "category": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Project category ids to target when to=category.",
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Explicit skill directory or parent source directory for activation.",
+                },
+                "client": _CLIENT_PROP,
+                "profile": _PROFILE_PROP,
+                "keep": {
+                    "type": "boolean",
+                    "description": "For off, keep existing overlay-scoped symlinks instead of unlinking them.",
+                    "default": False,
+                },
+                "dry_run": _DRY_RUN_PROP,
+                "force": {
+                    "type": "boolean",
+                    "description": "Replace existing non-symlink files and override global policy blocks.",
                     "default": False,
                 },
             },
@@ -947,6 +1011,88 @@ def run_manage(args: list[str], *, event_context: dict[str, Any] | None = None) 
     return ok, proc.returncode, data
 
 
+_REPEAT_ARG_SPECS: tuple[tuple[str, str], ...] = (
+    ("client", "--client"),
+    ("profile", "--profile"),
+    ("service", "--service"),
+    ("task", "--task"),
+    ("category", "--category"),
+    ("set_vars", "--set"),
+)
+_STRING_ARG_SPECS: tuple[tuple[str, str], ...] = (
+    ("blueprint", "--blueprint"),
+    ("label", "--label"),
+    ("target_dir", "--target-dir"),
+    ("from_bundle", "--from-bundle"),
+    ("root_path", "--root-path"),
+    ("default_cwd", "--default-cwd"),
+    ("session_id", "--session-id"),
+    ("event_type", "--event-type"),
+    ("message", "--message"),
+    ("goal", "--goal"),
+    ("actor", "--actor"),
+    ("summary", "--summary"),
+    ("status", "--status"),
+    ("cwd", "--cwd"),
+    ("to", "--to"),
+    ("scope", "--scope"),
+    ("source", "--source"),
+    ("from_scope", "--from"),
+)
+_BOOL_ARG_SPECS: tuple[tuple[str, str], ...] = (
+    ("dry_run", "--dry-run"),
+    ("show_sources", "--show-sources"),
+    ("show_shadowed", "--show-shadowed"),
+    ("issues_only", "--issues-only"),
+    ("allow_directories", "--allow-directories"),
+    ("yes", "--yes"),
+    ("prune", "--prune"),
+    ("resume", "--resume"),
+    ("force", "--force"),
+    ("list_blueprints", "--list-blueprints"),
+    ("keep", "--keep"),
+)
+
+
+def _append_repeat_args(args: list[str], params: dict) -> None:
+    for key, flag in _REPEAT_ARG_SPECS:
+        for value in params.get(key) or []:
+            args += [flag, str(value)]
+
+
+def _append_scalar_args(args: list[str], params: dict) -> None:
+    for key, flag in _STRING_ARG_SPECS:
+        if params.get(key):
+            args += [flag, str(params[key])]
+    if params.get("lines") is not None:
+        args += ["--lines", str(int(params["lines"]))]
+    if params.get("wait_seconds") is not None:
+        args += ["--wait-seconds", str(float(params["wait_seconds"]))]
+    if params.get("limit") is not None:
+        args += ["--limit", str(int(params["limit"]))]
+
+
+def _append_bool_args(args: list[str], command: str, params: dict) -> None:
+    for key, flag in _BOOL_ARG_SPECS:
+        if params.get(key):
+            args.append(flag)
+    if params.get("include_global") is False or params.get("no_global"):
+        args.append("--no-global")
+    if params.get("include_project") is False or params.get("no_project"):
+        args.append("--no-project")
+    if params.get("full") and command == "skills":
+        args.append("--full")
+    if params.get("compact") and command == "status":
+        args.append("--compact")
+
+
+def _append_command_positionals(args: list[str], command: str, params: dict) -> None:
+    if params.get("skill"):
+        args.append(str(params["skill"]))
+    if command == "overlay" and params.get("name"):
+        args.append(str(params["name"]))
+
+
 def build_args(command: str, params: dict, positional: str | None = None) -> list[str]:
     """Translate tool params into a manage.py argv list."""
     args: list[str] = [command]
@@ -954,88 +1100,10 @@ def build_args(command: str, params: dict, positional: str | None = None) -> lis
         args.append(positional)
     args += ["--format", "json"]
 
-    for c in (params.get("client") or []):
-        args += ["--client", str(c)]
-    for p in (params.get("profile") or []):
-        args += ["--profile", str(p)]
-    for s in (params.get("service") or []):
-        args += ["--service", str(s)]
-    for t in (params.get("task") or []):
-        args += ["--task", str(t)]
-    if params.get("dry_run"):
-        args.append("--dry-run")
-    if params.get("lines") is not None:
-        args += ["--lines", str(int(params["lines"]))]
-    if params.get("wait_seconds") is not None:
-        args += ["--wait-seconds", str(float(params["wait_seconds"]))]
-    if params.get("blueprint"):
-        args += ["--blueprint", str(params["blueprint"])]
-    if params.get("label"):
-        args += ["--label", str(params["label"])]
-    if params.get("target_dir"):
-        args += ["--target-dir", str(params["target_dir"])]
-    if params.get("from_bundle"):
-        args += ["--from-bundle", str(params["from_bundle"])]
-    if params.get("root_path"):
-        args += ["--root-path", str(params["root_path"])]
-    if params.get("default_cwd"):
-        args += ["--default-cwd", str(params["default_cwd"])]
-    if params.get("session_id"):
-        args += ["--session-id", str(params["session_id"])]
-    if params.get("event_type"):
-        args += ["--event-type", str(params["event_type"])]
-    if params.get("message"):
-        args += ["--message", str(params["message"])]
-    if params.get("goal"):
-        args += ["--goal", str(params["goal"])]
-    if params.get("actor"):
-        args += ["--actor", str(params["actor"])]
-    if params.get("summary"):
-        args += ["--summary", str(params["summary"])]
-    if params.get("status"):
-        args += ["--status", str(params["status"])]
-    if params.get("limit") is not None:
-        args += ["--limit", str(int(params["limit"]))]
-    if params.get("skill"):
-        args.append(str(params["skill"]))
-    if params.get("cwd"):
-        args += ["--cwd", str(params["cwd"])]
-    if params.get("to"):
-        args += ["--to", str(params["to"])]
-    for category in (params.get("category") or []):
-        args += ["--category", str(category)]
-    if params.get("source"):
-        args += ["--source", str(params["source"])]
-    if params.get("from_scope"):
-        args += ["--from", str(params["from_scope"])]
-    if params.get("include_global") is False or params.get("no_global"):
-        args.append("--no-global")
-    if params.get("include_project") is False or params.get("no_project"):
-        args.append("--no-project")
-    if params.get("show_sources"):
-        args.append("--show-sources")
-    if params.get("show_shadowed"):
-        args.append("--show-shadowed")
-    if params.get("issues_only"):
-        args.append("--issues-only")
-    if params.get("full") and command == "skills":
-        args.append("--full")
-    if params.get("compact") and command == "status":
-        args.append("--compact")
-    if params.get("allow_directories"):
-        args.append("--allow-directories")
-    if params.get("yes"):
-        args.append("--yes")
-    if params.get("prune"):
-        args.append("--prune")
-    for sv in (params.get("set_vars") or []):
-        args += ["--set", str(sv)]
-    if params.get("resume"):
-        args.append("--resume")
-    if params.get("force"):
-        args.append("--force")
-    if params.get("list_blueprints"):
-        args.append("--list-blueprints")
+    _append_repeat_args(args, params)
+    _append_command_positionals(args, command, params)
+    _append_scalar_args(args, params)
+    _append_bool_args(args, command, params)
 
     return args
 
@@ -1051,6 +1119,7 @@ _DISPATCH: dict[str, tuple[str, str | None]] = {
     "skillbox_render":      ("render",      None),
     "skillbox_skills":      ("skills",      None),
     "skillbox_skill":       ("skill",       "action"),
+    "skillbox_overlay":     ("overlay",     "action"),
     "skillbox_logs":        ("logs",        None),
     "skillbox_sync":        ("sync",        None),
     "skillbox_up":          ("up",          None),
@@ -1131,6 +1200,8 @@ def dispatch_tool(name: str, params: dict, *, request_id: Any = None) -> dict:
     tool_params = dict(params)
     if name == "skillbox_status" and not tool_params.get("full"):
         tool_params["compact"] = True
+    if name == "skillbox_overlay" and not tool_params.get("action"):
+        tool_params["action"] = "list"
     positional = str(tool_params[positional_key]) if positional_key and positional_key in tool_params else None
 
     if positional_key and positional is None and not tool_params.get("list_blueprints"):

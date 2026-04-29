@@ -83,6 +83,41 @@ class SkillboxMcpServerTests(unittest.TestCase):
         self.assertEqual(sent[0]["params"]["data"]["stderr"], "watch this stderr")
         self.assertEqual(sent[0]["params"]["data"]["mcp_tool_name"], "skillbox_status")
 
+    def test_run_manage_reports_missing_manage_py(self) -> None:
+        sent: list[dict] = []
+
+        with mock.patch.object(MODULE, "send", side_effect=sent.append), mock.patch.object(
+            MODULE,
+            "MANAGE_PY",
+            ROOT_DIR / "missing-manage.py",
+        ):
+            ok, exit_code, payload = MODULE.run_manage(["status", "--format", "json"])
+
+        self.assertFalse(ok)
+        self.assertEqual(exit_code, -1)
+        self.assertEqual(payload["error"]["type"], "manage_not_found")
+        self.assertEqual(sent[0]["method"], "notifications/message")
+        self.assertEqual(sent[0]["params"]["level"], "error")
+
+    def test_run_manage_reports_subprocess_timeout(self) -> None:
+        sent: list[dict] = []
+
+        with mock.patch.object(MODULE, "send", side_effect=sent.append), mock.patch.object(
+            MODULE.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["python3"], timeout=120),
+        ):
+            ok, exit_code, payload = MODULE.run_manage(
+                ["status", "--format", "json"],
+                event_context={"mcp_tool_name": "skillbox_status"},
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(exit_code, -1)
+        self.assertEqual(payload["error"]["type"], "timeout")
+        self.assertEqual(sent[0]["params"]["level"], "error")
+        self.assertEqual(sent[0]["params"]["data"]["mcp_tool_name"], "skillbox_status")
+
     def test_handle_tools_call_builds_request_scoped_event_context(self) -> None:
         with mock.patch.object(
             MODULE,
@@ -194,6 +229,8 @@ class SkillboxMcpServerTests(unittest.TestCase):
     def test_skillbox_skill_maps_lifecycle_arguments(self) -> None:
         tool_names = {tool["name"] for tool in MODULE.handle_tools_list({})["tools"]}
         self.assertIn("skillbox_skill", tool_names)
+        skill_tool = next(tool for tool in MODULE.handle_tools_list({})["tools"] if tool["name"] == "skillbox_skill")
+        self.assertIn("activate", skill_tool["inputSchema"]["properties"]["action"]["enum"])
 
         with mock.patch.object(
             MODULE,
@@ -233,6 +270,56 @@ class SkillboxMcpServerTests(unittest.TestCase):
         self.assertEqual(
             run_manage.call_args.kwargs["event_context"]["mcp_tool_name"],
             "skillbox_skill",
+        )
+
+    def test_skillbox_overlay_maps_activate_arguments(self) -> None:
+        tool_names = {tool["name"] for tool in MODULE.handle_tools_list({})["tools"]}
+        self.assertIn("skillbox_overlay", tool_names)
+        overlay_tool = next(tool for tool in MODULE.handle_tools_list({})["tools"] if tool["name"] == "skillbox_overlay")
+        self.assertEqual(overlay_tool["inputSchema"]["properties"]["to"]["default"], "project")
+        self.assertEqual(overlay_tool["inputSchema"]["properties"]["scope"]["default"], "project")
+
+        with mock.patch.object(
+            MODULE,
+            "run_manage",
+            return_value=(True, 0, {"activations": [{"skill": "marketing"}]}),
+        ) as run_manage:
+            result = MODULE.handle_tools_call(
+                {
+                    "name": "skillbox_overlay",
+                    "arguments": {
+                        "action": "activate",
+                        "name": "marketing",
+                        "cwd": "/tmp/repo",
+                        "to": "global",
+                        "scope": "all",
+                        "client": ["personal"],
+                        "profile": ["local-core"],
+                        "dry_run": True,
+                    },
+                },
+                request_id="req-overlay",
+            )
+
+        payload = _content_payload(result)
+        self.assertEqual(payload["activations"][0]["skill"], "marketing")
+        args = run_manage.call_args.args[0]
+        self.assertEqual(args[:3], ["overlay", "activate", "--format"])
+        self.assertIn("marketing", args)
+        self.assertIn("--cwd", args)
+        self.assertIn("/tmp/repo", args)
+        self.assertIn("--to", args)
+        self.assertIn("global", args)
+        self.assertIn("--scope", args)
+        self.assertIn("all", args)
+        self.assertIn("--client", args)
+        self.assertIn("personal", args)
+        self.assertIn("--profile", args)
+        self.assertIn("local-core", args)
+        self.assertIn("--dry-run", args)
+        self.assertEqual(
+            run_manage.call_args.kwargs["event_context"]["mcp_tool_name"],
+            "skillbox_overlay",
         )
 
     def test_skillbox_events_replays_runtime_and_session_events(self) -> None:

@@ -200,6 +200,7 @@ def main() -> int:
     for action_name, help_text in (
         ("plan", "Preview where a skill would be installed."),
         ("add", "Install/link a skill into the selected global, project, or category scope."),
+        ("activate", "Install/link a skill and print an activation packet for the current session."),
         ("move", "Install/link a skill into a new scope and remove old installs for that skill."),
     ):
         action_parser = skill_subparsers.add_parser(action_name, help=help_text)
@@ -234,23 +235,54 @@ def main() -> int:
 
     overlay_parser = subparsers.add_parser(
         "overlay",
-        help="List, enable, disable, or toggle skill scope overlays (e.g. marketing).",
+        help="List, enable, disable, toggle, or activate skill scope overlays (e.g. marketing).",
     )
     overlay_parser.add_argument(
         "action",
         nargs="?",
         default="list",
-        choices=("list", "on", "off", "toggle"),
-        help="list (default), on, off, or toggle.",
+        choices=("list", "on", "off", "toggle", "activate"),
+        help="list (default), on, off, toggle, or activate.",
     )
     overlay_parser.add_argument("name", nargs="?", help="Overlay name, e.g. marketing.")
     overlay_parser.add_argument("--cwd", default=None, help="Target cwd for scoped unlinks. Defaults to $PWD.")
     overlay_parser.add_argument(
         "--keep",
         action="store_true",
-        help="When turning an overlay off, keep existing symlinks. Default is to unlink overlay-scoped symlinks from the cwd and agent homes.",
+        help="When turning an overlay off, keep existing symlinks. Default is to unlink overlay-scoped symlinks for --scope.",
+    )
+    overlay_parser.add_argument(
+        "--to",
+        choices=("project", "global", "category", "auto"),
+        default="project",
+        help="Activation destination. Defaults to project so hot overlays stay scoped to --cwd.",
+    )
+    overlay_parser.add_argument(
+        "--scope",
+        choices=("project", "global", "all"),
+        default="project",
+        help="Symlink removal scope for off/toggle. Defaults to project.",
+    )
+    overlay_parser.add_argument(
+        "--category",
+        action="append",
+        default=[],
+        help="Project category to target when --to category. Can be repeated.",
+    )
+    overlay_parser.add_argument(
+        "--source",
+        default=None,
+        help="Explicit skill directory or parent source directory for activation.",
+    )
+    overlay_parser.add_argument("--dry-run", action="store_true")
+    overlay_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace existing non-symlink files and override global policy blocks.",
     )
     overlay_parser.add_argument("--format", choices=("text", "json"), default="text")
+    add_profile_arg(overlay_parser)
+    add_client_arg(overlay_parser)
 
     bootstrap_parser = subparsers.add_parser(
         "bootstrap",
@@ -1089,7 +1121,7 @@ def main() -> int:
         active_profiles = normalize_active_profiles(getattr(args, "profile", []))
         requested_clients = getattr(args, "client", [])
         active_clients = normalize_active_clients(model, requested_clients)
-        if args.command in {"skills", "skill"} and not requested_clients:
+        if args.command in {"skills", "skill", "overlay"} and not requested_clients:
             skill_cwd = Path(getattr(args, "cwd", None) or os.getcwd())
             matches = matched_skill_clients(model, skill_cwd)
             if matches:
@@ -1239,22 +1271,45 @@ def main() -> int:
             current = sorted(active_overlays())
             now_on = name in current
             removed: list[str] = []
+            activations: list[dict[str, Any]] = []
+            overlay_cwd = Path(
+                getattr(args, "cwd", None) or os.environ.get("PWD") or os.getcwd()
+            )
+            if name and action == "activate":
+                activations = activate_overlay_scoped_skills(
+                    model,
+                    name,
+                    overlay_cwd,
+                    to=str(getattr(args, "to", "project")),
+                    categories=getattr(args, "category", []) or [],
+                    source=getattr(args, "source", None),
+                    dry_run=bool(getattr(args, "dry_run", False)),
+                    force=bool(getattr(args, "force", False)),
+                )
             if (
                 name
-                and was_on
+                and (action == "off" or (action == "toggle" and was_on and not now_on))
                 and not now_on
                 and not bool(getattr(args, "keep", False))
             ):
-                overlay_cwd = Path(
-                    getattr(args, "cwd", None) or os.environ.get("PWD") or os.getcwd()
+                removed = unlink_overlay_scoped_skills(
+                    model,
+                    name,
+                    overlay_cwd,
+                    scope=str(getattr(args, "scope", "project")),
                 )
-                removed = unlink_overlay_scoped_skills(model, name, overlay_cwd)
             if args.format == "json":
                 emit_json({
                     "overlays": current,
                     "action": action,
                     "name": name,
+                    "cwd": str(overlay_cwd),
+                    "to": getattr(args, "to", "project"),
+                    "scope": getattr(args, "scope", "project"),
+                    "dry_run": bool(getattr(args, "dry_run", False)),
+                    "persistent": action in {"on", "off", "toggle"},
                     "unlinked": removed,
+                    "activations": activations,
                 })
             else:
                 if action == "list":
@@ -1263,12 +1318,24 @@ def main() -> int:
                     else:
                         print("overlays: (none)")
                 else:
-                    state = "on" if now_on else "off"
+                    state = "activated" if action == "activate" else ("on" if now_on else "off")
                     print(f"overlay {name}: {state}")
                     if current:
                         print("all on:", ", ".join(current))
                     if removed:
                         print(f"unlinked: {len(removed)} symlinks")
+                    if activations:
+                        print(f"activated: {len(activations)} skills")
+                        for activation in activations:
+                            packet = activation.get("activation_packet")
+                            if not packet:
+                                print(f"activation packet: {activation.get('skill')} unavailable")
+                                continue
+                            print(f"activation packet: {packet.get('name')}")
+                            print(f"source: {packet.get('source')}")
+                            print(f"skill_md_sha256: {packet.get('skill_md_sha256')}")
+                            print("skill_md:")
+                            print(str(packet.get("skill_md") or "").rstrip())
             return EXIT_OK
 
         if args.command == "bootstrap":

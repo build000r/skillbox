@@ -1088,17 +1088,30 @@ Use the singular `skill` command when you want to apply that policy:
 ```bash
 python3 .env-manager/manage.py skill plan mcp-server-design --cwd ~/repos/opensource/skillbox
 python3 .env-manager/manage.py skill add mcp-server-design --cwd ~/repos/opensource/skillbox
+python3 .env-manager/manage.py skill activate mcp-server-design --cwd ~/repos/opensource/skillbox
 python3 .env-manager/manage.py skill add ui --to category --category frontend
 python3 .env-manager/manage.py skill sync --cwd "$PWD" --dry-run
 python3 .env-manager/manage.py skill prune --dry-run
+python3 .env-manager/manage.py overlay activate marketing --cwd "$PWD"
 ```
 
 `skill add` links the source skill into the selected global or repo-local
 Claude/Codex skill roots. `--to auto` follows `skill-scope.yaml`: global
 allowlist skills go into `~/.claude/skills` and `~/.codex/skills`; scoped
 skills go under the matching repo/category as `.claude/skills` and
-`.codex/skills`. `remove`, `move`, and `prune` require `--dry-run` first or
-`--yes` to apply unlinking actions.
+`.codex/skills`. `skill activate` performs the same link operation and also
+prints an activation packet containing the source `SKILL.md`, so the current
+agent session can use the skill immediately while future Claude and Codex
+sessions discover the filesystem links normally. `overlay activate <name>` is
+the cwd-scoped hot path: it does not persist overlay state, links literal
+overlay-scoped skills into the current repo's `.claude/skills` and
+`.codex/skills`, and returns one activation packet per linked skill. Pass
+`--to global` only when you intentionally want operator-wide links in
+`~/.claude/skills` and `~/.codex/skills`; use `overlay on` for persistent
+overlay state. `overlay off <name>` unlinks cwd-local overlay symlinks by
+default; pass `--scope global` or `--scope all` for wider cleanup. `remove`,
+`move`, and `prune` require `--dry-run` first or `--yes` to apply unlinking
+actions.
 
 The personal `sbp` wrapper delegates to the same lifecycle surface:
 
@@ -1108,6 +1121,8 @@ sbp help
 sbp skills --issues-only
 sbp skill plan mcp-server-design
 sbp skill add mcp-server-design
+sbp skill activate mcp-server-design
+sbp overlay activate marketing
 sbp skill add ui --to category --category frontend
 sbp skill sync --dry-run
 ```
@@ -1117,8 +1132,8 @@ home view and next commands, skipping the slower global scan. Runtime mutation
 is explicit with `sbp up`, `sbp down`, `sbp restart`, or `sbp skill ...`; use
 `sbp skills --issues-only` for the full global/project drift check.
 
-Agents can apply the same flow through the `skillbox_skill` MCP tool after a
-dry-run review.
+Agents can apply the same flow through the `skillbox_skill` and
+`skillbox_overlay` MCP tools after a dry-run review.
 
 ### Generated skill lockfiles
 
