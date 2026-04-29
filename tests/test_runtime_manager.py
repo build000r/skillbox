@@ -110,6 +110,40 @@ class RuntimeManagerTests(unittest.TestCase):
             finally:
                 stop_process(server_pid, 1)
 
+    def test_start_services_preserves_fast_self_managed_pid_file(self) -> None:
+        from runtime_manager.runtime_ops import start_services, stop_process
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            log_dir = root / "logs" / "runtime"
+            pid_file = log_dir / "self-managed.pid"
+            service = {
+                "id": "self-managed",
+                "kind": "daemon",
+                "command": f"sh -c 'sleep 30 & echo $! > {shlex.quote(str(pid_file))}'",
+                "healthcheck": {
+                    "type": "path_exists",
+                    "host_path": str(pid_file),
+                },
+            }
+            model = {
+                "root_dir": str(root),
+                "env": {},
+                "logs": [{"id": "runtime", "host_path": str(log_dir)}],
+                "repos": [],
+                "artifacts": [],
+            }
+
+            results = start_services(model, [service], dry_run=False, wait_seconds=2)
+            server_pid = int(pid_file.read_text(encoding="utf-8").strip())
+            try:
+                self.assertEqual(results[0]["result"], "started")
+                self.assertEqual(results[0]["pid"], server_pid)
+                self.assertTrue(pid_file.exists())
+                self.assertTrue(server_pid > 0)
+            finally:
+                stop_process(server_pid, 1)
+
     def test_start_services_tracks_running_launcher_processes_without_resource_warning(self) -> None:
         from runtime_manager import runtime_ops
 
@@ -795,6 +829,47 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(coverage_failures, [], payload["checks"])
             parity_check = next(item for item in payload["checks"] if item["code"] == "parity-ledger")
             self.assertEqual(parity_check["status"], "pass")
+
+    def test_local_up_deferred_parity_surface_reaches_run_up_before_service_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            overlay_path = self._clients_host_root(repo) / "personal" / "overlay.yaml"
+            overlay_doc = MANAGE_MODULE.load_yaml(overlay_path)
+            overlay_doc.setdefault("client", {})["parity_ledger"] = [
+                {
+                    "id": "legacy-builder",
+                    "legacy_surface": "legacy-builder",
+                    "surface_type": "service",
+                    "action": "build",
+                    "ownership_state": "deferred",
+                    "intended_profiles": ["local-core"],
+                    "bridge_dependency": None,
+                    "request_error": "LOCAL_RUNTIME_SERVICE_DEFERRED",
+                }
+            ]
+            overlay_path.write_text(MANAGE_MODULE.render_yaml_document(overlay_doc), encoding="utf-8")
+
+            result = self._run(
+                repo,
+                "up",
+                "--client",
+                "personal",
+                "--profile",
+                "local-core",
+                "--service",
+                "legacy-builder",
+                "--dry-run",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 1, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["error"]["type"], "LOCAL_RUNTIME_SERVICE_DEFERRED")
+            self.assertEqual(payload["services"], [])
+            self.assertEqual(payload["bootstrap_tasks"], [])
 
     def test_up_and_down_manage_selected_service_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -6790,6 +6865,29 @@ class LocalCoreParityLedgerUS4RunUpTests(unittest.TestCase):
             self.assertNotEqual(
                 payload["error"]["type"], "LOCAL_RUNTIME_ENV_BRIDGE_FAILED",
             )
+
+    def test_up_unknown_service_rejected_before_reconcile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = _build_local_core(Path(tmpdir).resolve())
+
+            import runtime_manager.workflows as workflows_mod
+
+            with mock.patch.object(workflows_mod, "reconcile_local_runtime_env") as reconcile:
+                exit_code, payload = MANAGE_MODULE.run_up(
+                    model=model,
+                    client_id="personal",
+                    profile="local-core",
+                    requested_mode="reuse",
+                    service_filter=["not-a-service"],
+                    dry_run=True,
+                )
+
+            reconcile.assert_not_called()
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(payload["error"]["type"], "unknown_service")
+            self.assertEqual(payload["error"]["blocked_services"], ["not-a-service"])
+            self.assertEqual(payload["services"], [])
+            self.assertEqual(payload["bootstrap_tasks"], [])
 
 
 class LocalMinimalRegressionTests(unittest.TestCase):

@@ -2911,6 +2911,24 @@ def start_services(
             continue
 
         if health_state.get("reused_existing"):
+            if self_managed_pid_file:
+                started_pid = live_service_pid(paths["pid_file"])
+                if started_pid is None:
+                    tail = tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)
+                    detail = result | {"result": "failed", "tail": tail}
+                    if "exit_code" in health_state:
+                        detail["exit_code"] = health_state["exit_code"]
+                    if "target" in health_state:
+                        detail["target"] = health_state["target"]
+                    log_runtime_event("service.start_failed", service["id"], {"state": "failed"})
+                    results.append(detail)
+                    continue
+                started_detail = result | {"result": "started", "pid": started_pid}
+                if "target" in health_state:
+                    started_detail["target"] = health_state["target"]
+                results.append(started_detail)
+                log_runtime_event("service.started", service["id"], {"pid": started_pid})
+                continue
             remove_pid_file(paths["pid_file"])
             reused_result = result | {"result": "already-running"}
             if "url" in health_state:

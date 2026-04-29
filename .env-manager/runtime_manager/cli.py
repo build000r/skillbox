@@ -1401,8 +1401,6 @@ def main() -> int:
                     print_local_runtime_error_text(err_payload)
                 return EXIT_ERROR
 
-        requested_services = select_services(model, raw_service_ids)
-
         if args.command == "up":
             # WG-006: route local-runtime profiles through workflows.run_up
             # so the parity ledger, bridge reconciliation, mode validation,
@@ -1438,6 +1436,7 @@ def main() -> int:
             # profiles that are not part of the local_runtime_core_cutover
             # contract.  Parity-ledger classification still runs above via
             # the shared intercept.
+            requested_services = select_services(model, raw_service_ids)
             bridges = model.get("bridges") or []
             if bridges and not args.dry_run:
                 for bridge in bridges:
@@ -1490,6 +1489,8 @@ def main() -> int:
             else:
                 print_service_actions_text(payload)
             return EXIT_OK
+
+        requested_services = select_services(model, raw_service_ids)
 
         if args.command == "down":
             services = resolve_services_for_stop(model, requested_services)
