@@ -12,6 +12,98 @@ from .context_rendering import *
 from .text_renderers import *
 from .workflows import *
 
+
+def _add_profile_arg(command_parser: argparse.ArgumentParser) -> None:
+    command_parser.add_argument(
+        "--profile",
+        action="append",
+        default=[],
+        help="Activate a runtime profile. Can be repeated. Selecting any profile also includes `core`.",
+    )
+
+
+def _add_client_arg(command_parser: argparse.ArgumentParser) -> None:
+    command_parser.add_argument(
+        "--client",
+        action="append",
+        default=[],
+        help="Activate a runtime client overlay. Can be repeated.",
+    )
+
+
+def _add_service_arg(command_parser: argparse.ArgumentParser) -> None:
+    command_parser.add_argument(
+        "--service",
+        action="append",
+        default=[],
+        help="Limit the command to one or more declared service ids. Can be repeated.",
+    )
+
+
+def _add_task_arg(command_parser: argparse.ArgumentParser) -> None:
+    command_parser.add_argument(
+        "--task",
+        action="append",
+        default=[],
+        help="Limit the command to one or more declared task ids. Can be repeated.",
+    )
+
+
+def _add_context_dir_arg(command_parser: argparse.ArgumentParser) -> None:
+    command_parser.add_argument(
+        "--context-dir",
+        default=None,
+        help=(
+            "Write CLAUDE.md and AGENTS.md into this directory instead of the mounted "
+            "home/.claude and home/.codex roots. Path is resolved relative to the repo root."
+        ),
+    )
+
+
+def _add_skill_lifecycle_common(command_parser: argparse.ArgumentParser) -> None:
+    command_parser.add_argument("--format", choices=("text", "json"), default="text")
+    command_parser.add_argument(
+        "--cwd",
+        default=None,
+        help="Working directory used to infer client overlays, repo roots, and project categories.",
+    )
+    command_parser.add_argument(
+        "--to",
+        choices=("auto", "global", "project", "category"),
+        default="auto",
+        help="Where to install/link the skill. auto uses skill-scope policy.",
+    )
+    command_parser.add_argument(
+        "--category",
+        action="append",
+        default=[],
+        help="Project category to target. Can be repeated.",
+    )
+    command_parser.add_argument(
+        "--source",
+        default=None,
+        help="Explicit skill directory or parent source directory.",
+    )
+    command_parser.add_argument("--dry-run", action="store_true")
+    command_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace existing non-symlink files and override global policy blocks.",
+    )
+    command_parser.add_argument(
+        "--allow-directories",
+        action="store_true",
+        help="Allow remove/prune/move to delete real skill directories, not just symlinks/files.",
+    )
+    command_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm remove/prune/move actions that unlink existing installs.",
+    )
+    _add_profile_arg(command_parser)
+    _add_client_arg(command_parser)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Manage the internal skillbox runtime graph.")
     parser.add_argument(
@@ -21,52 +113,10 @@ def main() -> int:
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    def add_profile_arg(command_parser: argparse.ArgumentParser) -> None:
-        command_parser.add_argument(
-            "--profile",
-            action="append",
-            default=[],
-            help="Activate a runtime profile. Can be repeated. Selecting any profile also includes `core`.",
-        )
-
-    def add_client_arg(command_parser: argparse.ArgumentParser) -> None:
-        command_parser.add_argument(
-            "--client",
-            action="append",
-            default=[],
-            help="Activate a runtime client overlay. Can be repeated.",
-        )
-
-    def add_service_arg(command_parser: argparse.ArgumentParser) -> None:
-        command_parser.add_argument(
-            "--service",
-            action="append",
-            default=[],
-            help="Limit the command to one or more declared service ids. Can be repeated.",
-        )
-
-    def add_task_arg(command_parser: argparse.ArgumentParser) -> None:
-        command_parser.add_argument(
-            "--task",
-            action="append",
-            default=[],
-            help="Limit the command to one or more declared task ids. Can be repeated.",
-        )
-
-    def add_context_dir_arg(command_parser: argparse.ArgumentParser) -> None:
-        command_parser.add_argument(
-            "--context-dir",
-            default=None,
-            help=(
-                "Write CLAUDE.md and AGENTS.md into this directory instead of the mounted "
-                "home/.claude and home/.codex roots. Path is resolved relative to the repo root."
-            ),
-        )
-
     render_parser = subparsers.add_parser("render", help="Print the resolved runtime graph.")
     render_parser.add_argument("--format", choices=("text", "json"), default="text")
-    add_profile_arg(render_parser)
-    add_client_arg(render_parser)
+    _add_profile_arg(render_parser)
+    _add_client_arg(render_parser)
 
     sync_parser = subparsers.add_parser(
         "sync",
@@ -74,17 +124,17 @@ def main() -> int:
     )
     sync_parser.add_argument("--dry-run", action="store_true")
     sync_parser.add_argument("--format", choices=("text", "json"), default="text")
-    add_profile_arg(sync_parser)
-    add_client_arg(sync_parser)
-    add_context_dir_arg(sync_parser)
+    _add_profile_arg(sync_parser)
+    _add_client_arg(sync_parser)
+    _add_context_dir_arg(sync_parser)
 
     doctor_parser = subparsers.add_parser(
         "doctor",
         help="Validate runtime graph, filesystem readiness, and installed skill integrity.",
     )
     doctor_parser.add_argument("--format", choices=("text", "json"), default="text")
-    add_profile_arg(doctor_parser)
-    add_client_arg(doctor_parser)
+    _add_profile_arg(doctor_parser)
+    _add_client_arg(doctor_parser)
 
     status_parser = subparsers.add_parser(
         "status",
@@ -96,8 +146,8 @@ def main() -> int:
         action="store_true",
         help="Emit compact JSON for agent inspection instead of the full raw status payload.",
     )
-    add_profile_arg(status_parser)
-    add_client_arg(status_parser)
+    _add_profile_arg(status_parser)
+    _add_client_arg(status_parser)
 
     skills_parser = subparsers.add_parser(
         "skills",
@@ -145,57 +195,14 @@ def main() -> int:
         action="store_true",
         help="Do not inspect project-local .claude/.codex skill directories near --cwd.",
     )
-    add_profile_arg(skills_parser)
-    add_client_arg(skills_parser)
+    _add_profile_arg(skills_parser)
+    _add_client_arg(skills_parser)
 
     skill_parser = subparsers.add_parser(
         "skill",
         help="Plan and apply skill installs, moves, removals, and policy syncs.",
     )
     skill_subparsers = skill_parser.add_subparsers(dest="skill_action", required=True)
-
-    def add_skill_lifecycle_common(command_parser: argparse.ArgumentParser) -> None:
-        command_parser.add_argument("--format", choices=("text", "json"), default="text")
-        command_parser.add_argument(
-            "--cwd",
-            default=None,
-            help="Working directory used to infer client overlays, repo roots, and project categories.",
-        )
-        command_parser.add_argument(
-            "--to",
-            choices=("auto", "global", "project", "category"),
-            default="auto",
-            help="Where to install/link the skill. auto uses skill-scope policy.",
-        )
-        command_parser.add_argument(
-            "--category",
-            action="append",
-            default=[],
-            help="Project category to target. Can be repeated.",
-        )
-        command_parser.add_argument(
-            "--source",
-            default=None,
-            help="Explicit skill directory or parent source directory.",
-        )
-        command_parser.add_argument("--dry-run", action="store_true")
-        command_parser.add_argument(
-            "--force",
-            action="store_true",
-            help="Replace existing non-symlink files and override global policy blocks.",
-        )
-        command_parser.add_argument(
-            "--allow-directories",
-            action="store_true",
-            help="Allow remove/prune/move to delete real skill directories, not just symlinks/files.",
-        )
-        command_parser.add_argument(
-            "--yes",
-            action="store_true",
-            help="Confirm remove/prune/move actions that unlink existing installs.",
-        )
-        add_profile_arg(command_parser)
-        add_client_arg(command_parser)
 
     for action_name, help_text in (
         ("plan", "Preview where a skill would be installed."),
@@ -205,11 +212,11 @@ def main() -> int:
     ):
         action_parser = skill_subparsers.add_parser(action_name, help=help_text)
         action_parser.add_argument("skill_name")
-        add_skill_lifecycle_common(action_parser)
+        _add_skill_lifecycle_common(action_parser)
 
     remove_parser = skill_subparsers.add_parser("remove", help="Remove installed links/files for a skill.")
     remove_parser.add_argument("skill_name")
-    add_skill_lifecycle_common(remove_parser)
+    _add_skill_lifecycle_common(remove_parser)
     remove_parser.add_argument(
         "--from",
         dest="from_scope",
@@ -219,14 +226,14 @@ def main() -> int:
     )
 
     prune_parser = skill_subparsers.add_parser("prune", help="Remove installed skills that violate skill-scope policy.")
-    add_skill_lifecycle_common(prune_parser)
+    _add_skill_lifecycle_common(prune_parser)
 
     sync_skills_parser = skill_subparsers.add_parser(
         "sync",
         help="Install/link a named skill or all literal skills missing for the current cwd policy.",
     )
     sync_skills_parser.add_argument("skill_name", nargs="?")
-    add_skill_lifecycle_common(sync_skills_parser)
+    _add_skill_lifecycle_common(sync_skills_parser)
     sync_skills_parser.add_argument(
         "--prune",
         action="store_true",
@@ -281,8 +288,8 @@ def main() -> int:
         help="Replace existing non-symlink files and override global policy blocks.",
     )
     overlay_parser.add_argument("--format", choices=("text", "json"), default="text")
-    add_profile_arg(overlay_parser)
-    add_client_arg(overlay_parser)
+    _add_profile_arg(overlay_parser)
+    _add_client_arg(overlay_parser)
 
     bootstrap_parser = subparsers.add_parser(
         "bootstrap",
@@ -290,9 +297,9 @@ def main() -> int:
     )
     bootstrap_parser.add_argument("--dry-run", action="store_true")
     bootstrap_parser.add_argument("--format", choices=("text", "json"), default="text")
-    add_profile_arg(bootstrap_parser)
-    add_client_arg(bootstrap_parser)
-    add_task_arg(bootstrap_parser)
+    _add_profile_arg(bootstrap_parser)
+    _add_client_arg(bootstrap_parser)
+    _add_task_arg(bootstrap_parser)
 
     up_parser = subparsers.add_parser(
         "up",
@@ -313,9 +320,9 @@ def main() -> int:
         default=None,
         help="Local runtime startup behavior. One of: reuse (default), prod, fresh.",
     )
-    add_profile_arg(up_parser)
-    add_client_arg(up_parser)
-    add_service_arg(up_parser)
+    _add_profile_arg(up_parser)
+    _add_client_arg(up_parser)
+    _add_service_arg(up_parser)
 
     down_parser = subparsers.add_parser(
         "down",
@@ -324,9 +331,9 @@ def main() -> int:
     down_parser.add_argument("--dry-run", action="store_true")
     down_parser.add_argument("--wait-seconds", type=float, default=DEFAULT_SERVICE_STOP_WAIT_SECONDS)
     down_parser.add_argument("--format", choices=("text", "json"), default="text")
-    add_profile_arg(down_parser)
-    add_client_arg(down_parser)
-    add_service_arg(down_parser)
+    _add_profile_arg(down_parser)
+    _add_client_arg(down_parser)
+    _add_service_arg(down_parser)
 
     restart_parser = subparsers.add_parser(
         "restart",
@@ -335,9 +342,9 @@ def main() -> int:
     restart_parser.add_argument("--dry-run", action="store_true")
     restart_parser.add_argument("--wait-seconds", type=float, default=DEFAULT_SERVICE_START_WAIT_SECONDS)
     restart_parser.add_argument("--format", choices=("text", "json"), default="text")
-    add_profile_arg(restart_parser)
-    add_client_arg(restart_parser)
-    add_service_arg(restart_parser)
+    _add_profile_arg(restart_parser)
+    _add_client_arg(restart_parser)
+    _add_service_arg(restart_parser)
 
     logs_parser = subparsers.add_parser(
         "logs",
@@ -345,9 +352,9 @@ def main() -> int:
     )
     logs_parser.add_argument("--lines", type=int, default=DEFAULT_LOG_TAIL_LINES)
     logs_parser.add_argument("--format", choices=("text", "json"), default="text")
-    add_profile_arg(logs_parser)
-    add_client_arg(logs_parser)
-    add_service_arg(logs_parser)
+    _add_profile_arg(logs_parser)
+    _add_client_arg(logs_parser)
+    _add_service_arg(logs_parser)
 
     context_parser = subparsers.add_parser(
         "context",
@@ -355,9 +362,9 @@ def main() -> int:
     )
     context_parser.add_argument("--dry-run", action="store_true")
     context_parser.add_argument("--format", choices=("text", "json"), default="text")
-    add_profile_arg(context_parser)
-    add_client_arg(context_parser)
-    add_context_dir_arg(context_parser)
+    _add_profile_arg(context_parser)
+    _add_client_arg(context_parser)
+    _add_context_dir_arg(context_parser)
 
     client_init_parser = subparsers.add_parser(
         "client-init",
@@ -426,7 +433,7 @@ def main() -> int:
     client_project_parser.add_argument("--force", action="store_true", help="Replace an existing projection bundle.")
     client_project_parser.add_argument("--dry-run", action="store_true")
     client_project_parser.add_argument("--format", choices=("text", "json"), default="text")
-    add_profile_arg(client_project_parser)
+    _add_profile_arg(client_project_parser)
 
     client_open_parser = subparsers.add_parser(
         "client-open",
@@ -447,7 +454,7 @@ def main() -> int:
         help="Existing client-project bundle to open instead of building a fresh one.",
     )
     client_open_parser.add_argument("--format", choices=("text", "json"), default="text")
-    add_profile_arg(client_open_parser)
+    _add_profile_arg(client_open_parser)
 
     client_publish_parser = subparsers.add_parser(
         "client-publish",
@@ -482,7 +489,7 @@ def main() -> int:
         help="Create one local git commit in the target repo when the publish changes files.",
     )
     client_publish_parser.add_argument("--format", choices=("text", "json"), default="text")
-    add_profile_arg(client_publish_parser)
+    _add_profile_arg(client_publish_parser)
 
     client_diff_parser = subparsers.add_parser(
         "client-diff",
@@ -502,7 +509,7 @@ def main() -> int:
         help="Existing client-project bundle to diff instead of building a fresh one.",
     )
     client_diff_parser.add_argument("--format", choices=("text", "json"), default="text")
-    add_profile_arg(client_diff_parser)
+    _add_profile_arg(client_diff_parser)
 
     onboard_parser = subparsers.add_parser(
         "onboard",
@@ -588,7 +595,7 @@ def main() -> int:
         "--wait-seconds", type=float, default=DEFAULT_SERVICE_START_WAIT_SECONDS,
     )
     first_box_parser.add_argument("--format", choices=("text", "json"), default="text")
-    add_profile_arg(first_box_parser)
+    _add_profile_arg(first_box_parser)
 
     focus_parser = subparsers.add_parser(
         "focus",
@@ -609,13 +616,13 @@ def main() -> int:
         "--wait-seconds", type=float, default=DEFAULT_SERVICE_START_WAIT_SECONDS,
     )
     focus_parser.add_argument("--format", choices=("text", "json"), default="text")
-    add_profile_arg(focus_parser)
+    _add_profile_arg(focus_parser)
     # --client accepted for CLI consistency with up/status/logs/doctor
     # (local_runtime_core_cutover WG-003). The positional client_id remains
     # the primary input; --client is honored when no positional is given.
-    add_client_arg(focus_parser)
-    add_service_arg(focus_parser)
-    add_context_dir_arg(focus_parser)
+    _add_client_arg(focus_parser)
+    _add_service_arg(focus_parser)
+    _add_context_dir_arg(focus_parser)
 
     session_start_parser = subparsers.add_parser(
         "session-start",
@@ -683,7 +690,7 @@ def main() -> int:
     )
     acceptance_parser.add_argument("--wait-seconds", type=float, default=DEFAULT_SERVICE_START_WAIT_SECONDS)
     acceptance_parser.add_argument("--format", choices=("text", "json"), default="text")
-    add_profile_arg(acceptance_parser)
+    _add_profile_arg(acceptance_parser)
 
     args = parser.parse_args()
     if args.command is None:
