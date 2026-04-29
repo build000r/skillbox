@@ -102,6 +102,29 @@ def load_env_defaults(path: Path) -> dict[str, str]:
     return values
 
 
+def load_runtime_env_overrides(path: Path, allowed_keys: Any) -> dict[str, str]:
+    """Load operator overrides from `.env` for keys participating in the runtime env.
+
+    Skips empty values so `${KEY:-default}` still resolves to the manifest default,
+    matching docker compose's substitution semantics. Malformed lines are ignored
+    here (the strict `.env.example` check handles syntax validation).
+    """
+    if not path.is_file():
+        return {}
+    allowed = set(allowed_keys)
+    overrides: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key in allowed and value:
+            overrides[key] = value
+    return overrides
+
+
 def load_json(path: Path) -> dict[str, Any]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -220,6 +243,16 @@ def build_model() -> dict[str, Any]:
         for key, value in expected_env.items()
         if key not in {"SKILLBOX_NAME", "SKILLBOX_MONOSERVER_HOST_ROOT"}
     }
+    # Operators may override runtime env keys via `.env`; docker compose substitutes those values
+    # into the rendered config, so reflect the same overrides here so doctor's compose checks
+    # verify structural alignment rather than rejecting legitimate local overrides. The
+    # `env-defaults` check still validates that `.env.example` itself matches the manifest.
+    runtime_env.update(load_runtime_env_overrides(ROOT_DIR / ".env", runtime_env.keys()))
+    # CLIENTS_HOST_ROOT has dual semantics: on the host it's the source path used by
+    # client-init scaffolding, but inside the container docker-compose.yml maps it to
+    # CLIENTS_ROOT so in-container callers see the same path under either name. The
+    # compose-* checks compare against the container view, so force this alignment after
+    # the operator overlay.
     runtime_env["SKILLBOX_CLIENTS_HOST_ROOT"] = expected_env["SKILLBOX_CLIENTS_ROOT"]
     state_root = str(storage.get("state_root") or "").strip()
 

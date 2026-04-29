@@ -88,6 +88,50 @@ class ReconcileTests(unittest.TestCase):
             mounts = {item["target"]: item["source"] for item in model["expected_mounts"]}
             self.assertEqual(mounts["/workspace/workspace/clients"], "/state-root/clients")
 
+    def test_build_model_overlays_local_dotenv_overrides_on_runtime_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            (repo / ".env").write_text(
+                "SKILLBOX_PULSE_INTERVAL=10\n"
+                "# comment line\n"
+                "SKILLBOX_MONOSERVER_ROOT=/mnt/skillbox/repos\n"
+                "SKILLBOX_EMPTY_OVERRIDE=\n"
+                "SKILLBOX_CLIENTS_HOST_ROOT=/mnt/skillbox-config/clients\n"
+                "SKILLBOX_NAME=ignored-not-runtime-env\n",
+                encoding="utf-8",
+            )
+
+            sandbox_doc, dependencies_doc, persistence_doc, skill_repos_doc, runtime_model = self._model_inputs()
+
+            with self._patch_roots(repo), \
+                mock.patch.object(RECONCILE, "load_yaml", side_effect=[sandbox_doc, dependencies_doc, persistence_doc, skill_repos_doc]), \
+                mock.patch.object(RECONCILE, "load_json", return_value={}), \
+                mock.patch.object(RECONCILE, "build_runtime_model", return_value=runtime_model), \
+                mock.patch.object(RECONCILE, "load_env_defaults", return_value={"SKILLBOX_CLIENTS_HOST_ROOT": "./workspace/clients"}):
+                model = RECONCILE.build_model()
+
+            runtime_env = model["runtime_env"]
+            self.assertEqual(runtime_env["SKILLBOX_PULSE_INTERVAL"], "10")
+            self.assertEqual(runtime_env["SKILLBOX_MONOSERVER_ROOT"], "/mnt/skillbox/repos")
+            # Empty overrides fall back to manifest defaults so `${KEY:-default}` substitution
+            # in compose still resolves consistently.
+            self.assertNotIn("SKILLBOX_EMPTY_OVERRIDE", runtime_env)
+            # CLIENTS_HOST_ROOT has dual semantics; the in-container view stays pinned to
+            # CLIENTS_ROOT regardless of the host-side `.env` override.
+            self.assertEqual(
+                runtime_env["SKILLBOX_CLIENTS_HOST_ROOT"],
+                runtime_env["SKILLBOX_CLIENTS_ROOT"],
+            )
+            # SKILLBOX_NAME is excluded from runtime_env, so .env overrides on it are irrelevant.
+            self.assertNotIn("SKILLBOX_NAME", runtime_env)
+
+    def test_load_runtime_env_overrides_returns_empty_when_dotenv_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.assertEqual(
+                RECONCILE.load_runtime_env_overrides(Path(tmpdir) / ".env", {"SKILLBOX_FOO"}),
+                {},
+            )
+
     def test_check_compose_model_reports_workspace_surface_and_swimmers_drift(self) -> None:
         model = {
             "expected_env": {
