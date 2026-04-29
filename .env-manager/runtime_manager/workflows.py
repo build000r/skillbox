@@ -1827,6 +1827,29 @@ def run_up(
     shared.md:435-469 on both happy and blocked paths.
     """
     effective_mode = (requested_mode or "").strip() or "reuse"
+    if effective_mode not in LOCAL_RUNTIME_START_MODES:
+        supported = ", ".join(LOCAL_RUNTIME_START_MODES)
+        payload: dict[str, Any] = {
+            "client_id": client_id,
+            "profile": profile,
+            "requested_mode": requested_mode,
+            "effective_mode": effective_mode,
+            "bootstrap_tasks": [],
+            "services": [],
+        }
+        payload.update(
+            local_runtime_error(
+                LOCAL_RUNTIME_MODE_UNSUPPORTED,
+                (
+                    f"Unsupported --mode value {effective_mode!r}. "
+                    f"Supported modes: {supported}."
+                ),
+                recoverable=True,
+                next_action=f"Re-run with --mode <{'|'.join(LOCAL_RUNTIME_START_MODES)}>.",
+            )
+        )
+        payload["error"]["requested_mode"] = requested_mode
+        return EXIT_ERROR, payload
 
     # (0) WG-006: parity-ledger enforcement.  Before ANY mutation -- even
     # bridge reconciliation -- reject direct --service requests that the
@@ -1856,6 +1879,45 @@ def run_up(
                 )
             )
             return EXIT_ERROR, deferred_payload
+        if classification["unknown"]:
+            unknown_ids = list(classification["unknown"])
+            available_services = sorted(
+                str(service.get("id", "")).strip()
+                for service in model.get("services") or []
+                if str(service.get("id", "")).strip()
+            )
+            message = f"Unknown service id(s): {', '.join(unknown_ids)}."
+            if available_services:
+                message += f" Available services: {', '.join(available_services)}."
+            payload = {
+                "client_id": client_id,
+                "profile": profile,
+                "requested_mode": requested_mode,
+                "effective_mode": effective_mode,
+                "bootstrap_tasks": [],
+                "services": [],
+            }
+            payload.update(
+                structured_error(
+                    message,
+                    error_type="unknown_service",
+                    recoverable=True,
+                    recovery_hint=(
+                        "Use a declared runtime service id or inspect the "
+                        "parity ledger for deferred legacy surfaces."
+                    ),
+                    next_actions=[
+                        (
+                            f"manage.py render --client {client_id} "
+                            f"--profile {profile} --format json"
+                        ),
+                    ],
+                )
+            )
+            payload["error"]["requested_mode"] = requested_mode
+            payload["error"]["blocked_services"] = unknown_ids
+            payload["error"]["available_services"] = available_services
+            return EXIT_ERROR, payload
 
     # (1) Reconcile bridge/env before any mutation (backend.md Rule 3 + 4).
     overlay_host_path = local_runtime_overlay_path(model, client_id)
