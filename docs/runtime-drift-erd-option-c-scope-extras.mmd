@@ -1,0 +1,89 @@
+erDiagram
+  DEFAULT_SKILLSET ||--|| DEFAULT_CONFIG : keeps
+  DEFAULT_CONFIG ||--o{ DEFAULT_DECLARED_SKILL : declares
+  MEMORY_SKILLSET ||--|| MEMORY_CONFIG : owns
+  MEMORY_CONFIG ||--o{ ADDED_MEMORY_SKILL : adds
+  PERSONAL_SKILLSET ||--|| PERSONAL_CONFIG : owns
+  PERSONAL_CONFIG ||--o{ ADDED_PERSONAL_SKILL : adds
+  PROJECT_POLICY ||--o{ ADDED_PROJECT_SKILL : allows
+  PROFILE_AWARE_INSTALL_ROOT ||--o{ SCOPED_INSTALLED_SKILL : separates
+  DEFAULT_SKILLSET ||--|| REGENERATED_DEFAULT_LOCK : hashes_to
+  LEGEND ||--o{ ADDED_MEMORY_SKILL : green_means_added
+
+  DEFAULT_SKILLSET {
+    string id "UNCHANGED default-skills"
+    string profile "UNCHANGED core"
+    string result "CHANGED no undeclared extras"
+  }
+  DEFAULT_CONFIG {
+    string path "UNCHANGED workspace/skill-repos.yaml"
+    string scope "UNCHANGED lean shared default pack"
+  }
+  DEFAULT_DECLARED_SKILL {
+    string examples "UNCHANGED ask-cascade, commit, skillbox-operator"
+  }
+  MEMORY_SKILLSET {
+    string id "CHANGED memory-skills"
+    string profile "UNCHANGED memory"
+  }
+  MEMORY_CONFIG {
+    string path "CHANGED workspace/skill-repos-memory.yaml"
+  }
+  ADDED_MEMORY_SKILL {
+    string list "ADDED cass, cass-memory"
+  }
+  PERSONAL_SKILLSET {
+    string id "CHANGED personal-skills"
+    string client "UNCHANGED personal"
+  }
+  PERSONAL_CONFIG {
+    string path "CHANGED clients/personal/skill-repos.yaml"
+  }
+  ADDED_PERSONAL_SKILL {
+    string list "ADDED ga4"
+  }
+  PROJECT_POLICY {
+    string path "ADDED or changed skill-scope.yaml"
+    string purpose "DECISION repo-local writing helpers"
+  }
+  ADDED_PROJECT_SKILL {
+    string list "ADDED changelog-md-workmanship, readme-writing, smart"
+  }
+  PROFILE_AWARE_INSTALL_ROOT {
+    string change "ADDED separate profile or validation ownership"
+    string reason "DECISION prevents core doctor warnings"
+  }
+  SCOPED_INSTALLED_SKILL {
+    string result "CHANGED installed skills match owning scope"
+  }
+  REGENERATED_DEFAULT_LOCK {
+    string path "CHANGED workspace/skill-repos.lock.json"
+    string config_sha "CHANGED matches default config"
+  }
+  LEGEND {
+    string green "ADDED"
+    string amber "CHANGED"
+    string purple "DECISION"
+    string grey "UNCHANGED"
+  }
+
+  classDef unchanged fill:#f8fafc,stroke:#64748b,color:#0f172a
+  classDef added fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:2px
+  classDef changed fill:#fef3c7,stroke:#d97706,color:#78350f,stroke-width:2px
+  classDef removed fill:#fee2e2,stroke:#dc2626,color:#7f1d1d,stroke-width:2px
+  classDef decision fill:#ede9fe,stroke:#7c3aed,color:#3b0764,stroke-width:2px
+  class DEFAULT_SKILLSET changed
+  class DEFAULT_CONFIG unchanged
+  class DEFAULT_DECLARED_SKILL unchanged
+  class MEMORY_SKILLSET changed
+  class MEMORY_CONFIG changed
+  class ADDED_MEMORY_SKILL added
+  class PERSONAL_SKILLSET changed
+  class PERSONAL_CONFIG changed
+  class ADDED_PERSONAL_SKILL added
+  class PROJECT_POLICY added
+  class ADDED_PROJECT_SKILL added
+  class PROFILE_AWARE_INSTALL_ROOT decision
+  class SCOPED_INSTALLED_SKILL changed
+  class REGENERATED_DEFAULT_LOCK changed
+  class LEGEND decision
