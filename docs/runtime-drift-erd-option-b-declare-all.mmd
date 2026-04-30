@@ -1,0 +1,63 @@
+erDiagram
+  RUNTIME_SKILLSET ||--|| EXPANDED_SKILL_REPOS_CONFIG : uses
+  EXPANDED_SKILL_REPOS_CONFIG ||--o{ EXISTING_DECLARED_SKILL : keeps
+  EXPANDED_SKILL_REPOS_CONFIG ||--o{ ADDED_DEFAULT_SKILL : adds
+  EXPANDED_SKILL_REPOS_CONFIG ||--|| REGENERATED_LOCKFILE : hashes_to
+  REGENERATED_LOCKFILE ||--o{ LOCKED_SKILL : records
+  RUNTIME_SKILLSET ||--o{ INSTALL_TARGET : installs_into
+  INSTALL_TARGET ||--o{ INSTALLED_SKILL : contains
+  LEGEND ||--o{ ADDED_DEFAULT_SKILL : green_means_added
+
+  RUNTIME_SKILLSET {
+    string id "UNCHANGED default-skills"
+    string profile "CHANGED core becomes bigger"
+    string tradeoff "DECISION simplest but broadest scope"
+  }
+  EXPANDED_SKILL_REPOS_CONFIG {
+    string path "CHANGED workspace/skill-repos.yaml"
+    string declared_count "ADDED 23 skills"
+  }
+  EXISTING_DECLARED_SKILL {
+    string examples "UNCHANGED ask-cascade, commit, skillbox-operator"
+  }
+  ADDED_DEFAULT_SKILL {
+    string memory "ADDED cass, cass-memory"
+    string writing "ADDED changelog-md-workmanship, readme-writing"
+    string operator "ADDED smart"
+    string analytics "ADDED ga4"
+  }
+  REGENERATED_LOCKFILE {
+    string path "CHANGED workspace/skill-repos.lock.json"
+    string config_sha "CHANGED matches expanded config"
+  }
+  LOCKED_SKILL {
+    string entries "CHANGED all installed skills are declared"
+  }
+  INSTALL_TARGET {
+    string claude "UNCHANGED home/.claude/skills"
+    string codex "UNCHANGED home/.codex/skills"
+  }
+  INSTALLED_SKILL {
+    string state "CHANGED extras become first-class defaults"
+  }
+  LEGEND {
+    string green "ADDED"
+    string amber "CHANGED"
+    string purple "DECISION"
+    string grey "UNCHANGED"
+  }
+
+  classDef unchanged fill:#f8fafc,stroke:#64748b,color:#0f172a
+  classDef added fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:2px
+  classDef changed fill:#fef3c7,stroke:#d97706,color:#78350f,stroke-width:2px
+  classDef removed fill:#fee2e2,stroke:#dc2626,color:#7f1d1d,stroke-width:2px
+  classDef decision fill:#ede9fe,stroke:#7c3aed,color:#3b0764,stroke-width:2px
+  class RUNTIME_SKILLSET decision
+  class EXPANDED_SKILL_REPOS_CONFIG changed
+  class EXISTING_DECLARED_SKILL unchanged
+  class ADDED_DEFAULT_SKILL added
+  class REGENERATED_LOCKFILE changed
+  class LOCKED_SKILL changed
+  class INSTALL_TARGET unchanged
+  class INSTALLED_SKILL changed
+  class LEGEND decision

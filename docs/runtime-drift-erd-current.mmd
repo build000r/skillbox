@@ -1,0 +1,62 @@
+erDiagram
+  RUNTIME_SKILLSET ||--|| SKILL_REPOS_CONFIG : uses
+  SKILL_REPOS_CONFIG ||--o{ DECLARED_SKILL : declares
+  SKILL_REPOS_CONFIG ||--|| STALE_LOCKFILE : should_hash_to
+  STALE_LOCKFILE ||--o{ LOCKED_EXTRA_SKILL : still_records
+  RUNTIME_SKILLSET ||--o{ INSTALL_TARGET : installs_into
+  INSTALL_TARGET ||--o{ INSTALLED_EXTRA_SKILL : contains
+  RUNTIME_SKILLSET ||--o{ OPTIONAL_ARTIFACT : checks
+  LEGEND ||--o{ INSTALLED_EXTRA_SKILL : red_means_drift
+
+  RUNTIME_SKILLSET {
+    string id "UNCHANGED default-skills"
+    string profile "UNCHANGED core"
+    string kind "UNCHANGED skill-repo-set"
+  }
+  SKILL_REPOS_CONFIG {
+    string path "UNCHANGED workspace/skill-repos.yaml"
+    string declared_count "UNCHANGED 17 skills"
+  }
+  DECLARED_SKILL {
+    string examples "UNCHANGED ask-cascade, commit, skillbox-operator"
+  }
+  STALE_LOCKFILE {
+    string path "CHANGED workspace/skill-repos.lock.json"
+    string failure "BLOCKER config_sha mismatch"
+  }
+  LOCKED_EXTRA_SKILL {
+    string extras "REMOVED? changelog-md, readme-writing, smart"
+  }
+  INSTALL_TARGET {
+    string claude "UNCHANGED home/.claude/skills"
+    string codex "UNCHANGED home/.codex/skills"
+  }
+  INSTALLED_EXTRA_SKILL {
+    string extras "REMOVED? cass, cass-memory, changelog-md, ga4, readme-writing, smart"
+  }
+  OPTIONAL_ARTIFACT {
+    string dcg "LOW missing optional binary"
+    string swimmers "LOW missing optional binary"
+  }
+  LEGEND {
+    string green "ADDED"
+    string amber "CHANGED"
+    string red "REMOVED or drift"
+    string purple "DECISION"
+    string grey "UNCHANGED"
+  }
+
+  classDef unchanged fill:#f8fafc,stroke:#64748b,color:#0f172a
+  classDef added fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:2px
+  classDef changed fill:#fef3c7,stroke:#d97706,color:#78350f,stroke-width:2px
+  classDef removed fill:#fee2e2,stroke:#dc2626,color:#7f1d1d,stroke-width:2px
+  classDef decision fill:#ede9fe,stroke:#7c3aed,color:#3b0764,stroke-width:2px
+  class RUNTIME_SKILLSET unchanged
+  class SKILL_REPOS_CONFIG unchanged
+  class DECLARED_SKILL unchanged
+  class INSTALL_TARGET unchanged
+  class OPTIONAL_ARTIFACT changed
+  class STALE_LOCKFILE changed
+  class LOCKED_EXTRA_SKILL removed
+  class INSTALLED_EXTRA_SKILL removed
+  class LEGEND decision
