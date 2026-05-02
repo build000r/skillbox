@@ -21,7 +21,7 @@ import urllib.request
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 try:
     import yaml
@@ -219,153 +219,122 @@ def structured_error(
     return payload
 
 
+def _classify_persistence_error(
+    exc: RuntimeError, msg: str, persistence_code: str,
+) -> dict[str, Any] | None:
+    if not (isinstance(exc, PersistenceContractError) or persistence_code in PERSISTENCE_ERROR_CODES):
+        return None
+    return structured_error(
+        msg,
+        error_type=persistence_code or "PERSISTENCE_CONFIG_INVALID",
+        recoverable=True,
+        recovery_hint=(
+            "Fix workspace/persistence.yaml or the related SKILLBOX_STORAGE_* / "
+            "SKILLBOX_STATE_ROOT values, then retry."
+        ),
+        next_actions=["render --format json", "doctor --format json"],
+    )
+
+
+def _classify_message_pattern(msg: str, lower_msg: str) -> dict[str, Any] | None:
+    """Match the message body against a fixed table of known error patterns."""
+    rules: list[tuple[Callable[[], bool], dict[str, Any]]] = [
+        (lambda: "client-init requires" in msg,
+         dict(error_type="missing_argument",
+              recovery_hint="Provide a client_id argument or use --list-blueprints.",
+              next_actions=["client-init --list-blueprints --format json"])),
+        (lambda: "blueprint" in lower_msg and "not found" in lower_msg,
+         dict(error_type="blueprint_not_found",
+              recovery_hint="List available blueprints, then retry with a valid name or path.",
+              next_actions=["client-init --list-blueprints --format json"])),
+        (lambda: ("required" in lower_msg and "variable" in lower_msg) or "missing required values" in lower_msg,
+         dict(error_type="missing_variable",
+              recovery_hint="Add the missing --set KEY=VALUE assignments and retry.")),
+        (lambda: ("already exists" in lower_msg or "without force" in lower_msg
+                  or "already_exists" in lower_msg or "non-projection output directory" in lower_msg),
+         dict(error_type="conflict",
+              recovery_hint="Use --force to overwrite existing files, or choose a different client id.")),
+        (lambda: "target repo has a dirty working tree" in lower_msg,
+         dict(error_type="conflict",
+              recovery_hint="Commit or discard changes in the target repo, then retry.")),
+        (lambda: "no private publish target configured" in lower_msg,
+         dict(error_type="missing_target_repo",
+              recovery_hint="Run private-init to attach a private repo, or pass --target-dir explicitly.",
+              next_actions=["private-init --format json"])),
+        (lambda: "target must be a git repo" in lower_msg,
+         dict(error_type="invalid_target_repo",
+              recovery_hint="Initialize the target repo with git before publishing.")),
+        (lambda: "env file" in lower_msg and ("missing" in lower_msg or "unresolved" in lower_msg),
+         dict(error_type="missing_env_file",
+              recovery_hint="Create the env source file or run sync first.",
+              next_actions=["sync --format json"])),
+        (lambda: "failed to become healthy" in lower_msg,
+         dict(error_type="service_health_failure",
+              recovery_hint="Check service logs for the root cause, then restart.",
+              next_actions=["logs --format json", "doctor --format json"])),
+        (lambda: "invalid client id" in lower_msg,
+         dict(error_type="invalid_client_id", recoverable=True,
+              recovery_hint="Client IDs must be lowercase alphanumeric with single hyphens: my-project.")),
+        (lambda: "unknown client scaffold pack" in lower_msg,
+         dict(error_type="invalid_scaffold_pack", recoverable=True,
+              recovery_hint="Use a supported scaffold pack such as `planning`, `skill-builder`, or `hybrid`.",
+              next_actions=["client-init --list-blueprints --format json"])),
+        (lambda: "session_id is required" in lower_msg or "session event_type is required" in lower_msg,
+         dict(error_type="missing_argument", recoverable=True,
+              recovery_hint="Provide the required session_id and event_type arguments, then retry.")),
+        (lambda: "session not found" in lower_msg,
+         dict(error_type="session_not_found", recoverable=True,
+              recovery_hint="List recent sessions for the client, then retry with a valid session_id.",
+              next_actions=["session-status <client> --format json", "focus <client> --format json"])),
+        (lambda: ("session is not active" in lower_msg
+                  or "session is already active" in lower_msg
+                  or "unsupported session status" in lower_msg),
+         dict(error_type="session_state_conflict", recoverable=True,
+              recovery_hint="Inspect the session state first, then resume or end it with a valid transition.",
+              next_actions=["session-status <client> --format json"])),
+    ]
+    for predicate, kwargs in rules:
+        if predicate():
+            return structured_error(msg, **kwargs)
+    return None
+
+
+_COMMAND_FALLBACK_NEXT_ACTIONS: dict[str, list[str]] = {
+    "sync": ["doctor --format json", "status --format json"],
+    "up": ["doctor --format json", "status --format json"],
+    "bootstrap": ["doctor --format json", "status --format json"],
+    "restart": ["doctor --format json", "status --format json"],
+    "focus": ["doctor --format json", "status --format json"],
+    "client-init": ["client-init --list-blueprints --format json"],
+    "client-open": ["focus --format json", "doctor --format json"],
+    "first-box": ["status --format json", "doctor --format json"],
+    "down": ["status --format json"],
+    "session-start": ["focus --format json", "status --format json"],
+    "session-event": ["focus --format json", "status --format json"],
+    "session-end": ["focus --format json", "status --format json"],
+    "session-resume": ["focus --format json", "status --format json"],
+    "session-status": ["focus --format json", "status --format json"],
+}
+
+
 def classify_error(exc: RuntimeError, command: str) -> dict[str, Any]:
     """Map a RuntimeError to a structured error payload with contextual recovery hints."""
     msg = str(exc)
     lower_msg = msg.lower()
     persistence_code = str(getattr(exc, "code", "") or "").strip()
 
-    if isinstance(exc, PersistenceContractError) or persistence_code in PERSISTENCE_ERROR_CODES:
-        return structured_error(
-            msg,
-            error_type=persistence_code or "PERSISTENCE_CONFIG_INVALID",
-            recoverable=True,
-            recovery_hint=(
-                "Fix workspace/persistence.yaml or the related SKILLBOX_STORAGE_* / "
-                "SKILLBOX_STATE_ROOT values, then retry."
-            ),
-            next_actions=["render --format json", "doctor --format json"],
-        )
+    persistence_payload = _classify_persistence_error(exc, msg, persistence_code)
+    if persistence_payload is not None:
+        return persistence_payload
 
-    if "client-init requires" in msg:
-        return structured_error(
-            msg,
-            error_type="missing_argument",
-            recovery_hint="Provide a client_id argument or use --list-blueprints.",
-            next_actions=["client-init --list-blueprints --format json"],
-        )
-    if "blueprint" in lower_msg and "not found" in lower_msg:
-        return structured_error(
-            msg,
-            error_type="blueprint_not_found",
-            recovery_hint="List available blueprints, then retry with a valid name or path.",
-            next_actions=["client-init --list-blueprints --format json"],
-        )
-    if (
-        ("required" in lower_msg and "variable" in lower_msg)
-        or "missing required values" in lower_msg
-    ):
-        return structured_error(
-            msg,
-            error_type="missing_variable",
-            recovery_hint="Add the missing --set KEY=VALUE assignments and retry.",
-        )
-    if (
-        "already exists" in lower_msg
-        or "without force" in lower_msg
-        or "already_exists" in lower_msg
-        or "non-projection output directory" in lower_msg
-    ):
-        return structured_error(
-            msg,
-            error_type="conflict",
-            recovery_hint="Use --force to overwrite existing files, or choose a different client id.",
-        )
-    if "target repo has a dirty working tree" in lower_msg:
-        return structured_error(
-            msg,
-            error_type="conflict",
-            recovery_hint="Commit or discard changes in the target repo, then retry.",
-        )
-    if "no private publish target configured" in lower_msg:
-        return structured_error(
-            msg,
-            error_type="missing_target_repo",
-            recovery_hint="Run private-init to attach a private repo, or pass --target-dir explicitly.",
-            next_actions=["private-init --format json"],
-        )
-    if "target must be a git repo" in lower_msg:
-        return structured_error(
-            msg,
-            error_type="invalid_target_repo",
-            recovery_hint="Initialize the target repo with git before publishing.",
-        )
-    if "env file" in lower_msg and ("missing" in lower_msg or "unresolved" in lower_msg):
-        return structured_error(
-            msg,
-            error_type="missing_env_file",
-            recovery_hint="Create the env source file or run sync first.",
-            next_actions=[f"sync --format json"],
-        )
-    if "failed to become healthy" in lower_msg:
-        return structured_error(
-            msg,
-            error_type="service_health_failure",
-            recovery_hint="Check service logs for the root cause, then restart.",
-            next_actions=["logs --format json", "doctor --format json"],
-        )
-    if "invalid client id" in lower_msg:
-        return structured_error(
-            msg,
-            error_type="invalid_client_id",
-            recoverable=True,
-            recovery_hint="Client IDs must be lowercase alphanumeric with single hyphens: my-project.",
-        )
-    if "unknown client scaffold pack" in lower_msg:
-        return structured_error(
-            msg,
-            error_type="invalid_scaffold_pack",
-            recoverable=True,
-            recovery_hint="Use a supported scaffold pack such as `planning`, `skill-builder`, or `hybrid`.",
-            next_actions=["client-init --list-blueprints --format json"],
-        )
-    if "session_id is required" in lower_msg or "session event_type is required" in lower_msg:
-        return structured_error(
-            msg,
-            error_type="missing_argument",
-            recoverable=True,
-            recovery_hint="Provide the required session_id and event_type arguments, then retry.",
-        )
-    if "session not found" in lower_msg:
-        return structured_error(
-            msg,
-            error_type="session_not_found",
-            recoverable=True,
-            recovery_hint="List recent sessions for the client, then retry with a valid session_id.",
-            next_actions=["session-status <client> --format json", "focus <client> --format json"],
-        )
-    if (
-        "session is not active" in lower_msg
-        or "session is already active" in lower_msg
-        or "unsupported session status" in lower_msg
-    ):
-        return structured_error(
-            msg,
-            error_type="session_state_conflict",
-            recoverable=True,
-            recovery_hint="Inspect the session state first, then resume or end it with a valid transition.",
-            next_actions=["session-status <client> --format json"],
-        )
-
-    # Contextual fallback based on command
-    fallback_next: list[str] = []
-    if command in ("sync", "up", "bootstrap", "restart", "focus"):
-        fallback_next = ["doctor --format json", "status --format json"]
-    elif command == "client-init":
-        fallback_next = ["client-init --list-blueprints --format json"]
-    elif command == "client-open":
-        fallback_next = ["focus --format json", "doctor --format json"]
-    elif command == "first-box":
-        fallback_next = ["status --format json", "doctor --format json"]
-    elif command in ("down",):
-        fallback_next = ["status --format json"]
-    elif command in ("session-start", "session-event", "session-end", "session-resume", "session-status"):
-        fallback_next = ["focus --format json", "status --format json"]
+    pattern_payload = _classify_message_pattern(msg, lower_msg)
+    if pattern_payload is not None:
+        return pattern_payload
 
     return structured_error(
         msg,
         recovery_hint="Run doctor to diagnose, then check logs for details.",
-        next_actions=fallback_next or ["doctor --format json"],
+        next_actions=_COMMAND_FALLBACK_NEXT_ACTIONS.get(command) or ["doctor --format json"],
     )
 
 
