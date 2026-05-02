@@ -209,109 +209,101 @@ def generate_context_markdown(model: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _live_status_lines(svc_states: list[dict[str, Any]]) -> list[str]:
+    if not svc_states:
+        return []
+    lines = ["", "## Live Status", "", "| Service | State | PID | Healthy |", "|---------|-------|-----|---------|"]
+    for svc in svc_states:
+        pid = str(svc.get("pid") or "-")
+        healthy = "yes" if svc.get("healthy") else "no"
+        lines.append(f"| {svc['id']} | {svc.get('state', 'unknown')} | {pid} | {healthy} |")
+    lines.append("")
+    return lines
+
+
+def _repo_state_lines(repo_states: list[dict[str, Any]]) -> list[str]:
+    git_repos = [r for r in repo_states if r.get("git")]
+    if not git_repos:
+        return []
+    lines = ["## Repo State", "", "| Repo | Branch | Dirty | Untracked | Last Commit |", "|------|--------|-------|-----------|-------------|"]
+    for repo in git_repos:
+        lines.append(
+            f"| {repo['id']} | `{repo.get('branch', '-')}` | "
+            f"{repo.get('dirty', 0)} | {repo.get('untracked', 0)} | "
+            f"{repo.get('last_commit', '-')} |"
+        )
+    lines.append("")
+    return lines
+
+
+def _session_state_lines(session_states: list[dict[str, Any]]) -> list[str]:
+    if not session_states:
+        return []
+    lines = [
+        "## Sessions", "",
+        "| Client | Session | Status | Updated | Label | Last Event |",
+        "|--------|---------|--------|---------|-------|------------|",
+    ]
+    for session in session_states:
+        updated_at = float(session.get("updated_at") or 0)
+        updated_str = time.strftime("%H:%M", time.localtime(updated_at)) if updated_at else "-"
+        label = str(session.get("label") or session.get("goal") or "-").replace("|", "\\|")
+        last_bits = [str(session.get("last_event_type") or "").strip()]
+        last_message = str(session.get("last_message") or "").strip()
+        if last_message:
+            last_bits.append(last_message)
+        last_event = (" ".join(bit for bit in last_bits if bit).strip() or "-").replace("|", "\\|")
+        lines.append(
+            f"| {session['client_id']} | `{session['session_id']}` | "
+            f"{session.get('status', '-')} | {updated_str} | {label} | {last_event} |"
+        )
+    lines.append("")
+    return lines
+
+
+def _collect_attention_items(live_state: dict[str, Any], svc_states: list[dict[str, Any]]) -> list[str]:
+    attention: list[str] = []
+    for check in live_state.get("checks") or []:
+        if not check.get("ok"):
+            attention.append(f"CHECK FAIL: **{check['id']}** ({check['type']})")
+    for svc in svc_states:
+        if svc.get("state") in ("stopped", "not-running", "declared"):
+            attention.append(f"SERVICE DOWN: **{svc['id']}** (state: {svc['state']})")
+        elif svc.get("state") == "starting":
+            attention.append(f"SERVICE STARTING: **{svc['id']}** — may not be healthy yet")
+    for log_item in live_state.get("logs") or []:
+        errors = log_item.get("recent_errors") or []
+        if not errors:
+            continue
+        scanned = log_item.get("scanned_file", "")
+        file_note = f" ({scanned})" if scanned else ""
+        attention.append(f"RECENT ERRORS in **{log_item['id']}**{file_note}:")
+        for err_line in errors[-3:]:
+            attention.append(f"  `{err_line.strip()[:120]}`")
+    return attention
+
+
+def _attention_lines(attention: list[str]) -> list[str]:
+    if not attention:
+        return []
+    lines = ["## Attention", ""]
+    for item in attention:
+        lines.append(item if item.startswith("  ") else f"- {item}")
+    lines.append("")
+    return lines
+
+
 def generate_live_context_markdown(
     model: dict[str, Any], live_state: dict[str, Any],
     root_dir: Path = DEFAULT_ROOT_DIR,
 ) -> str:
     """Generate enriched CLAUDE.md / AGENTS.md with live runtime state."""
-    base = generate_context_markdown(model)
-    lines: list[str] = [base.rstrip()]
-
-    # --- Live Service Status ---
     svc_states = live_state.get("services") or []
-    if svc_states:
-        lines.append("")
-        lines.append("## Live Status")
-        lines.append("")
-        lines.append("| Service | State | PID | Healthy |")
-        lines.append("|---------|-------|-----|---------|")
-        for svc in svc_states:
-            pid = str(svc.get("pid") or "-")
-            healthy = "yes" if svc.get("healthy") else "no"
-            state = svc.get("state", "unknown")
-            lines.append(f"| {svc['id']} | {state} | {pid} | {healthy} |")
-        lines.append("")
-
-    # --- Repo State ---
-    repo_states = live_state.get("repos") or []
-    git_repos = [r for r in repo_states if r.get("git")]
-    if git_repos:
-        lines.append("## Repo State")
-        lines.append("")
-        lines.append("| Repo | Branch | Dirty | Untracked | Last Commit |")
-        lines.append("|------|--------|-------|-----------|-------------|")
-        for repo in git_repos:
-            branch = repo.get("branch", "-")
-            dirty = str(repo.get("dirty", 0))
-            untracked = str(repo.get("untracked", 0))
-            last_commit = repo.get("last_commit", "-")
-            lines.append(
-                f"| {repo['id']} | `{branch}` | {dirty} | {untracked} | {last_commit} |"
-            )
-        lines.append("")
-
-    session_states = live_state.get("sessions") or []
-    if session_states:
-        lines.append("## Sessions")
-        lines.append("")
-        lines.append("| Client | Session | Status | Updated | Label | Last Event |")
-        lines.append("|--------|---------|--------|---------|-------|------------|")
-        for session in session_states:
-            updated_at = float(session.get("updated_at") or 0)
-            updated_str = time.strftime("%H:%M", time.localtime(updated_at)) if updated_at else "-"
-            label = str(session.get("label") or session.get("goal") or "-").replace("|", "\\|")
-            last_bits = [str(session.get("last_event_type") or "").strip()]
-            last_message = str(session.get("last_message") or "").strip()
-            if last_message:
-                last_bits.append(last_message)
-            last_event = " ".join(bit for bit in last_bits if bit).strip() or "-"
-            last_event = last_event.replace("|", "\\|")
-            lines.append(
-                f"| {session['client_id']} | `{session['session_id']}` | {session.get('status', '-')} | {updated_str} | {label} | {last_event} |"
-            )
-        lines.append("")
-
-    # --- Attention ---
-    attention: list[str] = []
-
-    # Failing checks
-    for check in live_state.get("checks") or []:
-        if not check.get("ok"):
-            attention.append(f"CHECK FAIL: **{check['id']}** ({check['type']})")
-
-    # Non-running services
-    for svc in svc_states:
-        if svc.get("state") in ("stopped", "not-running", "declared"):
-            attention.append(
-                f"SERVICE DOWN: **{svc['id']}** (state: {svc['state']})"
-            )
-        elif svc.get("state") == "starting":
-            attention.append(
-                f"SERVICE STARTING: **{svc['id']}** — may not be healthy yet"
-            )
-
-    # Recent errors from logs
-    for log_item in live_state.get("logs") or []:
-        errors = log_item.get("recent_errors") or []
-        if errors:
-            scanned = log_item.get("scanned_file", "")
-            file_note = f" ({scanned})" if scanned else ""
-            attention.append(
-                f"RECENT ERRORS in **{log_item['id']}**{file_note}:"
-            )
-            for err_line in errors[-3:]:
-                attention.append(f"  `{err_line.strip()[:120]}`")
-
-    if attention:
-        lines.append("## Attention")
-        lines.append("")
-        for item in attention:
-            if item.startswith("  "):
-                lines.append(item)
-            else:
-                lines.append(f"- {item}")
-        lines.append("")
-
+    lines: list[str] = [generate_context_markdown(model).rstrip()]
+    lines.extend(_live_status_lines(svc_states))
+    lines.extend(_repo_state_lines(live_state.get("repos") or []))
+    lines.extend(_session_state_lines(live_state.get("sessions") or []))
+    lines.extend(_attention_lines(_collect_attention_items(live_state, svc_states)))
     return "\n".join(lines)
 
 
