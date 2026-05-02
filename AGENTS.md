@@ -32,7 +32,8 @@ Main entry points:
 - Runtime services: `make runtime-up CLIENT=<id> PROFILE=<name>`, `make runtime-down CLIENT=<id> PROFILE=<name>`, `make runtime-status`
 - Box lifecycle: `make box-up BOX=<id>`, `make box-down BOX=<id>`, `make box-status`, `make box-list`, `make box-ssh BOX=<id>`
 - Release/upgrade scripts: `install.sh`, `scripts/06-upgrade-release.sh`, `scripts/07-build-and-push-binary.sh`; verify arguments before use.
-- Unknown / verify first: no repo-level lint command or CI config was found.
+- CI: `.github/workflows/ci.yml` runs `python3 scripts/04-reconcile.py render` and `python3 -m unittest discover -s tests` on push/PR.
+- Unknown / verify first: no repo-level lint command was found.
 
 ## Important Paths
 
