@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Callable
 
 from .shared import *
 from .validation import *
@@ -734,6 +735,430 @@ def _resolve_local_runtime_mode(args: argparse.Namespace) -> tuple[str, dict[str
     return resolved_mode, err
 
 
+def _handle_client_init(args: argparse.Namespace, root_dir: Path) -> int:
+    try:
+        if args.list_blueprints:
+            blueprints = list_client_blueprints(root_dir)
+            if args.format == "json":
+                emit_json({"blueprints": blueprints})
+            else:
+                print_client_blueprints_text(blueprints)
+            return EXIT_OK
+
+        if not args.client_id:
+            raise RuntimeError("client-init requires <client_id> unless --list-blueprints is used.")
+
+        assignments = parse_key_value_assignments(args.set, "--set")
+        actions, blueprint_metadata = scaffold_client_overlay(
+            root_dir=root_dir,
+            client_id=args.client_id,
+            label=args.label,
+            default_cwd=args.default_cwd,
+            root_path=args.root_path,
+            blueprint_name=args.blueprint,
+            blueprint_assignments=assignments,
+            dry_run=args.dry_run,
+            force=args.force,
+        )
+    except RuntimeError as exc:
+        if args.format == "json":
+            emit_json(classify_error(exc, "client-init"))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    cid = validate_client_id(args.client_id)
+    payload: dict[str, Any] = {
+        "client_id": cid,
+        "dry_run": args.dry_run,
+        "force": args.force,
+        "actions": actions,
+        "next_actions": next_actions_for_client_init(cid),
+    }
+    if blueprint_metadata is not None:
+        payload["blueprint"] = blueprint_metadata
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        if blueprint_metadata is not None:
+            print(f"blueprint: {blueprint_metadata['id']}")
+        print("\n".join(actions))
+    return EXIT_OK
+
+
+def _handle_onboard(args: argparse.Namespace, root_dir: Path) -> int:
+    return run_onboard(
+        root_dir=root_dir,
+        client_id=args.client_id,
+        label=args.label,
+        default_cwd=args.default_cwd,
+        root_path=args.root_path,
+        blueprint_name=args.blueprint,
+        set_args=args.set,
+        dry_run=args.dry_run,
+        force=args.force,
+        wait_seconds=max(0.0, float(args.wait_seconds)),
+        fmt=args.format,
+    )
+
+
+def _handle_first_box(args: argparse.Namespace, root_dir: Path) -> int:
+    return run_first_box(
+        root_dir=root_dir,
+        client_id=args.client_id,
+        private_path_arg=args.private_path,
+        profiles=args.profile,
+        output_dir_arg=args.output_dir,
+        label=args.label,
+        default_cwd=args.default_cwd,
+        root_path=args.root_path,
+        blueprint_name=args.blueprint,
+        set_args=args.set,
+        force=args.force,
+        wait_seconds=max(0.0, float(args.wait_seconds)),
+        fmt=args.format,
+    )
+
+
+def _handle_private_init(args: argparse.Namespace, root_dir: Path) -> int:
+    try:
+        payload = init_private_repo(
+            root_dir=root_dir,
+            target_dir_arg=args.path,
+        )
+    except RuntimeError as exc:
+        if args.format == "json":
+            emit_json(classify_error(exc, "private-init"))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print(f"target_dir: {payload['target_dir']}")
+        print(f"clients_host_root: {payload['clients_host_root']}")
+        print()
+        print("\n".join(payload["actions"]))
+    return EXIT_OK
+
+
+def _handle_acceptance(args: argparse.Namespace, root_dir: Path) -> int:
+    return run_acceptance(
+        root_dir=root_dir,
+        client_id=args.client_id,
+        profiles=args.profile,
+        wait_seconds=max(0.0, float(args.wait_seconds)),
+        fmt=args.format,
+    )
+
+
+def _handle_client_project(args: argparse.Namespace, root_dir: Path) -> int:
+    try:
+        payload = project_client_bundle(
+            root_dir=root_dir,
+            client_id=args.client_id,
+            profiles=args.profile,
+            output_dir_arg=args.output_dir,
+            dry_run=args.dry_run,
+            force=args.force,
+        )
+    except RuntimeError as exc:
+        if args.format == "json":
+            emit_json(classify_error(exc, "client-project"))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print(f"client: {payload['client_id']}")
+        print(f"output_dir: {payload['output_dir']}")
+        print(f"files: {payload['file_count']}")
+        print(f"payload_tree_sha256: {payload['payload_tree_sha256']}")
+        print()
+        print("\n".join(payload["actions"]))
+    return EXIT_OK
+
+
+def _handle_client_open(args: argparse.Namespace, root_dir: Path) -> int:
+    try:
+        payload, exit_code = open_client_surface(
+            root_dir=root_dir,
+            client_id=args.client_id,
+            profiles=args.profile,
+            output_dir_arg=args.output_dir,
+            from_bundle_arg=args.from_bundle,
+        )
+    except RuntimeError as exc:
+        if args.format == "json":
+            emit_json(classify_error(exc, "client-open"))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print(f"client: {payload['client_id']}")
+        print(f"output_dir: {payload['output_dir']}")
+        print(f"profiles: {', '.join(payload['active_profiles'])}")
+        print(f"mcp_servers: {', '.join(payload['mcp_servers'])}")
+        print(f"focus: {payload['focus']['status']}")
+        print()
+        print("\n".join(payload["actions"]))
+    return exit_code
+
+
+def _handle_client_publish(args: argparse.Namespace, root_dir: Path) -> int:
+    try:
+        payload = publish_client_bundle(
+            root_dir=root_dir,
+            client_id=args.client_id,
+            target_dir_arg=args.target_dir,
+            from_bundle_arg=args.from_bundle,
+            profiles=args.profile,
+            require_acceptance=args.acceptance,
+            write_deploy_artifact=args.deploy_artifact,
+            commit=args.commit,
+        )
+    except RuntimeError as exc:
+        if args.format == "json":
+            emit_json(classify_error(exc, "client-publish"))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print(f"client: {payload['client_id']}")
+        print(f"target_dir: {payload['target_dir']}")
+        print(f"changed: {payload['changed']}")
+        print(f"payload_tree_sha256: {payload['payload_tree_sha256']}")
+        if payload["acceptance"]["present"]:
+            print(f"accepted_at: {payload['acceptance']['accepted_at']}")
+            print(f"acceptance_profiles: {', '.join(payload['acceptance']['active_profiles'])}")
+        if payload["deploy"]["present"]:
+            print(f"deploy_manifest: {payload['deploy']['manifest']}")
+            print(f"deploy_archive: {payload['deploy']['archive']}")
+        if payload["commit_hash"]:
+            print(f"commit: {payload['commit_hash']}")
+        print()
+        print("\n".join(payload["actions"]))
+    return EXIT_OK
+
+
+def _handle_client_diff(args: argparse.Namespace, root_dir: Path) -> int:
+    try:
+        payload = diff_client_bundle(
+            root_dir=root_dir,
+            client_id=args.client_id,
+            target_dir_arg=args.target_dir,
+            from_bundle_arg=args.from_bundle,
+            profiles=args.profile,
+        )
+    except RuntimeError as exc:
+        if args.format == "json":
+            emit_json(classify_error(exc, "client-diff"))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print_client_diff_text(payload)
+    return EXIT_OK
+
+
+def _handle_focus(args: argparse.Namespace, root_dir: Path) -> int:
+    cid = args.client_id or ""
+    # CLI-consistency (WG-003): fall back to --client for parity with
+    # up/status/logs/doctor when no positional client_id was provided.
+    if not cid:
+        client_flags = getattr(args, "client", []) or []
+        if client_flags:
+            cid = str(client_flags[0]).strip()
+    if not cid and not args.resume:
+        print("focus requires a client_id or --resume.", file=sys.stderr)
+        return EXIT_ERROR
+    return run_focus(
+        root_dir=root_dir,
+        client_id=cid,
+        profiles=args.profile,
+        service_filter=getattr(args, "service", []),
+        resume=args.resume,
+        wait_seconds=max(0.0, float(args.wait_seconds)),
+        fmt=args.format,
+        context_dir=resolve_context_dir(root_dir, getattr(args, "context_dir", None)),
+    )
+
+
+def _handle_session_start(args: argparse.Namespace, root_dir: Path) -> int:
+    try:
+        payload = start_client_session(
+            root_dir,
+            args.client_id,
+            label=args.label,
+            cwd=args.cwd,
+            goal=args.goal,
+            actor=args.actor,
+        )
+    except RuntimeError as exc:
+        if args.format == "json":
+            emit_json(classify_error(exc, "session-start"))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        session = payload["session"]
+        print(f"client: {payload['client_id']}")
+        print(f"session: {session['session_id']}")
+        print(f"status: {session['status']}")
+        if session.get("label"):
+            print(f"label: {session['label']}")
+    return EXIT_OK
+
+
+def _handle_session_event(args: argparse.Namespace, root_dir: Path) -> int:
+    try:
+        detail = {"actor": args.actor} if args.actor else None
+        payload = append_client_session_event(
+            root_dir,
+            args.client_id,
+            args.session_id,
+            event_type=args.event_type,
+            message=args.message,
+            detail=detail,
+        )
+    except RuntimeError as exc:
+        if args.format == "json":
+            emit_json(classify_error(exc, "session-event"))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        session = payload["session"]
+        print(f"client: {payload['client_id']}")
+        print(f"session: {session['session_id']}")
+        print(f"last_event: {session.get('last_event_type', '-')}")
+        if session.get("last_message"):
+            print(f"message: {session['last_message']}")
+    return EXIT_OK
+
+
+def _handle_session_end(args: argparse.Namespace, root_dir: Path) -> int:
+    try:
+        payload = end_client_session(
+            root_dir,
+            args.client_id,
+            args.session_id,
+            final_status=args.status,
+            summary=args.summary,
+        )
+    except RuntimeError as exc:
+        if args.format == "json":
+            emit_json(classify_error(exc, "session-end"))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        session = payload["session"]
+        print(f"client: {payload['client_id']}")
+        print(f"session: {session['session_id']}")
+        print(f"status: {session['status']}")
+    return EXIT_OK
+
+
+def _handle_session_resume(args: argparse.Namespace, root_dir: Path) -> int:
+    try:
+        payload = resume_client_session(
+            root_dir,
+            args.client_id,
+            args.session_id,
+            actor=args.actor,
+            message=args.message,
+        )
+    except RuntimeError as exc:
+        if args.format == "json":
+            emit_json(classify_error(exc, "session-resume"))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        session = payload["session"]
+        print(f"client: {payload['client_id']}")
+        print(f"session: {session['session_id']}")
+        print(f"status: {session['status']}")
+    return EXIT_OK
+
+
+def _handle_session_status(args: argparse.Namespace, root_dir: Path) -> int:
+    try:
+        payload = session_status_payload(
+            root_dir,
+            args.client_id,
+            session_id=args.session_id,
+            limit=max(0, int(args.limit)),
+        )
+    except RuntimeError as exc:
+        if args.format == "json":
+            emit_json(classify_error(exc, "session-status"))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        if payload.get("session"):
+            session = payload["session"]
+            print(f"client: {payload['client_id']}")
+            print(f"session: {session['session_id']}")
+            print(f"status: {session['status']}")
+            print(f"events: {len(session.get('recent_events') or [])}")
+        else:
+            print(f"client: {payload['client_id']}")
+            print(f"sessions: {payload['count']}")
+            for session in payload.get("sessions") or []:
+                label = session.get("label") or "-"
+                print(f"  - {session['session_id']}: {session.get('status', 'unknown')} {label}")
+    return EXIT_OK
+
+
+_EARLY_DISPATCH: dict[str, Callable[[argparse.Namespace, Path], int]] = {
+    "client-init": _handle_client_init,
+    "onboard": _handle_onboard,
+    "first-box": _handle_first_box,
+    "private-init": _handle_private_init,
+    "acceptance": _handle_acceptance,
+    "client-project": _handle_client_project,
+    "client-open": _handle_client_open,
+    "client-publish": _handle_client_publish,
+    "client-diff": _handle_client_diff,
+    "focus": _handle_focus,
+    "session-start": _handle_session_start,
+    "session-event": _handle_session_event,
+    "session-end": _handle_session_end,
+    "session-resume": _handle_session_resume,
+    "session-status": _handle_session_status,
+}
+
+
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
@@ -748,395 +1173,9 @@ def main() -> int:
             print_local_runtime_error_text(mode_error)
         return EXIT_ERROR
 
-    if args.command == "client-init":
-        try:
-            if args.list_blueprints:
-                blueprints = list_client_blueprints(root_dir)
-                if args.format == "json":
-                    emit_json({"blueprints": blueprints})
-                else:
-                    print_client_blueprints_text(blueprints)
-                return EXIT_OK
-
-            if not args.client_id:
-                raise RuntimeError("client-init requires <client_id> unless --list-blueprints is used.")
-
-            assignments = parse_key_value_assignments(args.set, "--set")
-            actions, blueprint_metadata = scaffold_client_overlay(
-                root_dir=root_dir,
-                client_id=args.client_id,
-                label=args.label,
-                default_cwd=args.default_cwd,
-                root_path=args.root_path,
-                blueprint_name=args.blueprint,
-                blueprint_assignments=assignments,
-                dry_run=args.dry_run,
-                force=args.force,
-            )
-        except RuntimeError as exc:
-            if args.format == "json":
-                emit_json(classify_error(exc, "client-init"))
-            else:
-                print(str(exc), file=sys.stderr)
-            return EXIT_ERROR
-
-        cid = validate_client_id(args.client_id)
-        payload: dict[str, Any] = {
-            "client_id": cid,
-            "dry_run": args.dry_run,
-            "force": args.force,
-            "actions": actions,
-            "next_actions": next_actions_for_client_init(cid),
-        }
-        if blueprint_metadata is not None:
-            payload["blueprint"] = blueprint_metadata
-        if args.format == "json":
-            emit_json(payload)
-        else:
-            if blueprint_metadata is not None:
-                print(f"blueprint: {blueprint_metadata['id']}")
-            print("\n".join(actions))
-        return EXIT_OK
-
-    if args.command == "onboard":
-        return run_onboard(
-            root_dir=root_dir,
-            client_id=args.client_id,
-            label=args.label,
-            default_cwd=args.default_cwd,
-            root_path=args.root_path,
-            blueprint_name=args.blueprint,
-            set_args=args.set,
-            dry_run=args.dry_run,
-            force=args.force,
-            wait_seconds=max(0.0, float(args.wait_seconds)),
-            fmt=args.format,
-        )
-
-    if args.command == "first-box":
-        return run_first_box(
-            root_dir=root_dir,
-            client_id=args.client_id,
-            private_path_arg=args.private_path,
-            profiles=args.profile,
-            output_dir_arg=args.output_dir,
-            label=args.label,
-            default_cwd=args.default_cwd,
-            root_path=args.root_path,
-            blueprint_name=args.blueprint,
-            set_args=args.set,
-            force=args.force,
-            wait_seconds=max(0.0, float(args.wait_seconds)),
-            fmt=args.format,
-        )
-
-    if args.command == "private-init":
-        try:
-            payload = init_private_repo(
-                root_dir=root_dir,
-                target_dir_arg=args.path,
-            )
-        except RuntimeError as exc:
-            if args.format == "json":
-                emit_json(classify_error(exc, "private-init"))
-            else:
-                print(str(exc), file=sys.stderr)
-            return EXIT_ERROR
-
-        if args.format == "json":
-            emit_json(payload)
-        else:
-            print(f"target_dir: {payload['target_dir']}")
-            print(f"clients_host_root: {payload['clients_host_root']}")
-            print()
-            print("\n".join(payload["actions"]))
-        return EXIT_OK
-
-    if args.command == "acceptance":
-        return run_acceptance(
-            root_dir=root_dir,
-            client_id=args.client_id,
-            profiles=args.profile,
-            wait_seconds=max(0.0, float(args.wait_seconds)),
-            fmt=args.format,
-        )
-
-    if args.command == "client-project":
-        try:
-            payload = project_client_bundle(
-                root_dir=root_dir,
-                client_id=args.client_id,
-                profiles=args.profile,
-                output_dir_arg=args.output_dir,
-                dry_run=args.dry_run,
-                force=args.force,
-            )
-        except RuntimeError as exc:
-            if args.format == "json":
-                emit_json(classify_error(exc, "client-project"))
-            else:
-                print(str(exc), file=sys.stderr)
-            return EXIT_ERROR
-
-        if args.format == "json":
-            emit_json(payload)
-        else:
-            print(f"client: {payload['client_id']}")
-            print(f"output_dir: {payload['output_dir']}")
-            print(f"files: {payload['file_count']}")
-            print(f"payload_tree_sha256: {payload['payload_tree_sha256']}")
-            print()
-            print("\n".join(payload["actions"]))
-        return EXIT_OK
-
-    if args.command == "client-open":
-        try:
-            payload, exit_code = open_client_surface(
-                root_dir=root_dir,
-                client_id=args.client_id,
-                profiles=args.profile,
-                output_dir_arg=args.output_dir,
-                from_bundle_arg=args.from_bundle,
-            )
-        except RuntimeError as exc:
-            if args.format == "json":
-                emit_json(classify_error(exc, "client-open"))
-            else:
-                print(str(exc), file=sys.stderr)
-            return EXIT_ERROR
-
-        if args.format == "json":
-            emit_json(payload)
-        else:
-            print(f"client: {payload['client_id']}")
-            print(f"output_dir: {payload['output_dir']}")
-            print(f"profiles: {', '.join(payload['active_profiles'])}")
-            print(f"mcp_servers: {', '.join(payload['mcp_servers'])}")
-            print(f"focus: {payload['focus']['status']}")
-            print()
-            print("\n".join(payload["actions"]))
-        return exit_code
-
-    if args.command == "client-publish":
-        try:
-            payload = publish_client_bundle(
-                root_dir=root_dir,
-                client_id=args.client_id,
-                target_dir_arg=args.target_dir,
-                from_bundle_arg=args.from_bundle,
-                profiles=args.profile,
-                require_acceptance=args.acceptance,
-                write_deploy_artifact=args.deploy_artifact,
-                commit=args.commit,
-            )
-        except RuntimeError as exc:
-            if args.format == "json":
-                emit_json(classify_error(exc, "client-publish"))
-            else:
-                print(str(exc), file=sys.stderr)
-            return EXIT_ERROR
-
-        if args.format == "json":
-            emit_json(payload)
-        else:
-            print(f"client: {payload['client_id']}")
-            print(f"target_dir: {payload['target_dir']}")
-            print(f"changed: {payload['changed']}")
-            print(f"payload_tree_sha256: {payload['payload_tree_sha256']}")
-            if payload["acceptance"]["present"]:
-                print(f"accepted_at: {payload['acceptance']['accepted_at']}")
-                print(f"acceptance_profiles: {', '.join(payload['acceptance']['active_profiles'])}")
-            if payload["deploy"]["present"]:
-                print(f"deploy_manifest: {payload['deploy']['manifest']}")
-                print(f"deploy_archive: {payload['deploy']['archive']}")
-            if payload["commit_hash"]:
-                print(f"commit: {payload['commit_hash']}")
-            print()
-            print("\n".join(payload["actions"]))
-        return EXIT_OK
-
-    if args.command == "client-diff":
-        try:
-            payload = diff_client_bundle(
-                root_dir=root_dir,
-                client_id=args.client_id,
-                target_dir_arg=args.target_dir,
-                from_bundle_arg=args.from_bundle,
-                profiles=args.profile,
-            )
-        except RuntimeError as exc:
-            if args.format == "json":
-                emit_json(classify_error(exc, "client-diff"))
-            else:
-                print(str(exc), file=sys.stderr)
-            return EXIT_ERROR
-
-        if args.format == "json":
-            emit_json(payload)
-        else:
-            print_client_diff_text(payload)
-        return EXIT_OK
-
-    if args.command == "focus":
-        cid = args.client_id or ""
-        # CLI-consistency (WG-003): fall back to --client for parity with
-        # up/status/logs/doctor when no positional client_id was provided.
-        if not cid:
-            client_flags = getattr(args, "client", []) or []
-            if client_flags:
-                cid = str(client_flags[0]).strip()
-        if not cid and not args.resume:
-            print("focus requires a client_id or --resume.", file=sys.stderr)
-            return EXIT_ERROR
-        return run_focus(
-            root_dir=root_dir,
-            client_id=cid,
-            profiles=args.profile,
-            service_filter=getattr(args, "service", []),
-            resume=args.resume,
-            wait_seconds=max(0.0, float(args.wait_seconds)),
-            fmt=args.format,
-            context_dir=resolve_context_dir(root_dir, getattr(args, "context_dir", None)),
-        )
-
-    if args.command == "session-start":
-        try:
-            payload = start_client_session(
-                root_dir,
-                args.client_id,
-                label=args.label,
-                cwd=args.cwd,
-                goal=args.goal,
-                actor=args.actor,
-            )
-        except RuntimeError as exc:
-            if args.format == "json":
-                emit_json(classify_error(exc, "session-start"))
-            else:
-                print(str(exc), file=sys.stderr)
-            return EXIT_ERROR
-
-        if args.format == "json":
-            emit_json(payload)
-        else:
-            session = payload["session"]
-            print(f"client: {payload['client_id']}")
-            print(f"session: {session['session_id']}")
-            print(f"status: {session['status']}")
-            if session.get("label"):
-                print(f"label: {session['label']}")
-        return EXIT_OK
-
-    if args.command == "session-event":
-        try:
-            detail = {"actor": args.actor} if args.actor else None
-            payload = append_client_session_event(
-                root_dir,
-                args.client_id,
-                args.session_id,
-                event_type=args.event_type,
-                message=args.message,
-                detail=detail,
-            )
-        except RuntimeError as exc:
-            if args.format == "json":
-                emit_json(classify_error(exc, "session-event"))
-            else:
-                print(str(exc), file=sys.stderr)
-            return EXIT_ERROR
-
-        if args.format == "json":
-            emit_json(payload)
-        else:
-            session = payload["session"]
-            print(f"client: {payload['client_id']}")
-            print(f"session: {session['session_id']}")
-            print(f"last_event: {session.get('last_event_type', '-')}")
-            if session.get("last_message"):
-                print(f"message: {session['last_message']}")
-        return EXIT_OK
-
-    if args.command == "session-end":
-        try:
-            payload = end_client_session(
-                root_dir,
-                args.client_id,
-                args.session_id,
-                final_status=args.status,
-                summary=args.summary,
-            )
-        except RuntimeError as exc:
-            if args.format == "json":
-                emit_json(classify_error(exc, "session-end"))
-            else:
-                print(str(exc), file=sys.stderr)
-            return EXIT_ERROR
-
-        if args.format == "json":
-            emit_json(payload)
-        else:
-            session = payload["session"]
-            print(f"client: {payload['client_id']}")
-            print(f"session: {session['session_id']}")
-            print(f"status: {session['status']}")
-        return EXIT_OK
-
-    if args.command == "session-resume":
-        try:
-            payload = resume_client_session(
-                root_dir,
-                args.client_id,
-                args.session_id,
-                actor=args.actor,
-                message=args.message,
-            )
-        except RuntimeError as exc:
-            if args.format == "json":
-                emit_json(classify_error(exc, "session-resume"))
-            else:
-                print(str(exc), file=sys.stderr)
-            return EXIT_ERROR
-
-        if args.format == "json":
-            emit_json(payload)
-        else:
-            session = payload["session"]
-            print(f"client: {payload['client_id']}")
-            print(f"session: {session['session_id']}")
-            print(f"status: {session['status']}")
-        return EXIT_OK
-
-    if args.command == "session-status":
-        try:
-            payload = session_status_payload(
-                root_dir,
-                args.client_id,
-                session_id=args.session_id,
-                limit=max(0, int(args.limit)),
-            )
-        except RuntimeError as exc:
-            if args.format == "json":
-                emit_json(classify_error(exc, "session-status"))
-            else:
-                print(str(exc), file=sys.stderr)
-            return EXIT_ERROR
-
-        if args.format == "json":
-            emit_json(payload)
-        else:
-            if payload.get("session"):
-                session = payload["session"]
-                print(f"client: {payload['client_id']}")
-                print(f"session: {session['session_id']}")
-                print(f"status: {session['status']}")
-                print(f"events: {len(session.get('recent_events') or [])}")
-            else:
-                print(f"client: {payload['client_id']}")
-                print(f"sessions: {payload['count']}")
-                for session in payload.get("sessions") or []:
-                    label = session.get("label") or "-"
-                    print(f"  - {session['session_id']}: {session.get('status', 'unknown')} {label}")
-        return EXIT_OK
+    early_handler = _EARLY_DISPATCH.get(args.command)
+    if early_handler is not None:
+        return early_handler(args, root_dir)
 
     try:
         model = build_runtime_model(root_dir)
