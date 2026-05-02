@@ -1330,6 +1330,538 @@ def run_acceptance(
     return emit_acceptance(payload)
 
 
+STEWARDSHIP_REPORT_VERSION = 1
+STEWARDSHIP_STALE_EVIDENCE_SECONDS = 24 * 60 * 60
+STEWARDSHIP_PULSE_STATE_RELS = (
+    Path("logs") / "runtime" / "pulse.state.json",
+    Path(".skillbox-state") / "logs" / "runtime" / "pulse.state.json",
+)
+
+
+def _stewardship_utc_now() -> tuple[float, str, str]:
+    now = time.time()
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    slug = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
+    return now, stamp, slug
+
+
+def _load_optional_json_object(path: Path) -> tuple[str, dict[str, Any] | None, str | None]:
+    if not path.is_file():
+        return "missing", None, None
+    try:
+        return "present", load_json_file(path), None
+    except RuntimeError as exc:
+        return "invalid", None, str(exc)
+
+
+def _state_age_seconds(payload: dict[str, Any] | None, key: str, now: float) -> float | None:
+    if not payload:
+        return None
+    try:
+        value = float(payload.get(key) or 0)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return max(0.0, now - value)
+
+
+def _stewardship_focus_evidence(root_dir: Path, cid: str, now: float) -> dict[str, Any]:
+    focus_path = root_dir / FOCUS_STATE_REL
+    status, payload, error = _load_optional_json_object(focus_path)
+    evidence: dict[str, Any] = {
+        "status": status,
+        "path": repo_rel(root_dir, focus_path),
+    }
+    if error:
+        evidence["error"] = error
+    if payload:
+        focus_client = str(payload.get("client_id") or "").strip()
+        age_seconds = _state_age_seconds(payload, "focused_at", now)
+        evidence.update(
+            {
+                "client_id": focus_client,
+                "matches_client": focus_client == cid,
+                "active_profiles": payload.get("active_profiles") or [],
+                "focused_at": payload.get("focused_at"),
+                "age_seconds": age_seconds,
+                "stale": age_seconds is not None and age_seconds > STEWARDSHIP_STALE_EVIDENCE_SECONDS,
+                "skill_context_path": payload.get("skill_context_path"),
+            }
+        )
+        if focus_client and focus_client != cid:
+            evidence["status"] = "other_client"
+    return evidence
+
+
+def _stewardship_pulse_candidates(root_dir: Path, model: dict[str, Any]) -> list[Path]:
+    candidates = [root_dir / rel for rel in STEWARDSHIP_PULSE_STATE_RELS]
+    for log_item in model.get("logs") or []:
+        if str(log_item.get("id") or "").strip() == "runtime":
+            host_path = str(log_item.get("host_path") or "").strip()
+            if host_path:
+                candidates.append(Path(host_path) / "pulse.state.json")
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        marker = str(candidate)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique.append(candidate)
+    return unique
+
+
+def _stewardship_pulse_evidence(root_dir: Path, model: dict[str, Any], now: float) -> dict[str, Any]:
+    candidates = _stewardship_pulse_candidates(root_dir, model)
+    existing = next((path for path in candidates if path.is_file()), None)
+    target = existing or candidates[0]
+    status, payload, error = _load_optional_json_object(target)
+    evidence: dict[str, Any] = {
+        "status": status,
+        "path": repo_rel(root_dir, target),
+        "candidate_paths": [repo_rel(root_dir, path) for path in candidates],
+    }
+    if error:
+        evidence["error"] = error
+    if payload:
+        age_seconds = _state_age_seconds(payload, "updated_at", now)
+        active_clients = payload.get("active_clients") or []
+        active_profiles = payload.get("active_profiles") or []
+        evidence.update(
+            {
+                "pid": payload.get("pid"),
+                "updated_at": payload.get("updated_at"),
+                "age_seconds": age_seconds,
+                "stale": age_seconds is not None and age_seconds > STEWARDSHIP_STALE_EVIDENCE_SECONDS,
+                "cycle_count": payload.get("cycle_count"),
+                "heals": payload.get("heals"),
+                "events_emitted": payload.get("events_emitted"),
+                "active_clients": active_clients,
+                "active_profiles": active_profiles,
+            }
+        )
+    return evidence
+
+
+def _stewardship_recent_error_evidence(live: dict[str, Any]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for log_item in live.get("logs") or []:
+        errors = [str(line) for line in log_item.get("recent_errors") or [] if str(line).strip()]
+        if not errors:
+            continue
+        entries.append(
+            {
+                "id": log_item.get("id"),
+                "path": log_item.get("path"),
+                "present": bool(log_item.get("present")),
+                "scanned_files": log_item.get("scanned_files") or [],
+                "count": len(errors),
+                "samples": errors[-3:],
+            }
+        )
+    return entries
+
+
+def _stewardship_health_evidence(status_payload: dict[str, Any], live: dict[str, Any]) -> dict[str, Any]:
+    checks = live.get("checks") or []
+    failing_checks = [
+        {"id": item.get("id"), "type": item.get("type")}
+        for item in checks
+        if not item.get("ok")
+    ]
+    services = live.get("services") or []
+    down_services = [
+        {
+            "id": item.get("id"),
+            "kind": item.get("kind"),
+            "state": item.get("state"),
+        }
+        for item in services
+        if item.get("state") not in {"running", "ok", "idle"}
+    ]
+    recent_errors = _stewardship_recent_error_evidence(live)
+    return {
+        "checks": {
+            "passing": sum(1 for item in checks if item.get("ok")),
+            "total": len(checks),
+            "failing": failing_checks,
+        },
+        "services": {
+            "running": sum(1 for item in services if item.get("state") in {"running", "ok", "idle"}),
+            "total": len(services),
+            "down": down_services,
+            "blocked": status_payload.get("blocked_services") or [],
+        },
+        "recent_errors": {
+            "count": sum(int(item.get("count") or 0) for item in recent_errors),
+            "logs": recent_errors,
+        },
+    }
+
+
+def _stewardship_session_evidence(live: dict[str, Any]) -> dict[str, Any]:
+    sessions = [
+        {
+            "client_id": item.get("client_id"),
+            "session_id": item.get("session_id"),
+            "status": item.get("status"),
+            "label": item.get("label") or "",
+            "goal": item.get("goal") or "",
+            "updated_at": item.get("updated_at"),
+            "last_event_type": item.get("last_event_type") or "",
+            "last_message": item.get("last_message") or "",
+        }
+        for item in live.get("sessions") or []
+    ]
+    return {"count": len(sessions), "recent": sessions[:5]}
+
+
+def _stewardship_parity_evidence(status_payload: dict[str, Any]) -> dict[str, Any]:
+    parity = status_payload.get("parity_ledger") or {}
+    covered = parity.get("covered_surfaces") or []
+    deferred = parity.get("deferred_surfaces") or []
+    return {
+        "covered_surfaces": covered,
+        "deferred_surfaces": deferred,
+        "covered_count": len(covered),
+        "deferred_count": len(deferred),
+    }
+
+
+def _stewardship_not_assessed() -> list[dict[str, str]]:
+    return [
+        {
+            "id": "backup-recovery",
+            "status": "not_assessed",
+            "reason": "No first-class backup or restore drill evidence is declared in the public runtime graph yet.",
+            "next_action": "Add a restore-drill check before claiming recovery readiness.",
+        },
+        {
+            "id": "cost-review",
+            "status": "not_assessed",
+            "reason": "No cost telemetry or budget review evidence is declared in the public runtime graph yet.",
+            "next_action": "Add a cost snapshot source before claiming spend stewardship.",
+        },
+    ]
+
+
+def _stewardship_risk(
+    risk_id: str,
+    severity: str,
+    title: str,
+    evidence: dict[str, Any],
+    recommendation: str,
+    actions: list[str],
+) -> dict[str, Any]:
+    return {
+        "id": risk_id,
+        "severity": severity,
+        "title": title,
+        "evidence": evidence,
+        "recommendation": recommendation,
+        "next_actions": actions,
+    }
+
+
+def _stewardship_profile_args(active_profiles: list[str]) -> str:
+    profiles = [profile for profile in active_profiles if profile != "core"]
+    return format_profile_args(profiles)
+
+
+def _stewardship_risks(
+    *,
+    cid: str,
+    active_profiles: list[str],
+    focus: dict[str, Any],
+    pulse: dict[str, Any],
+    health: dict[str, Any],
+    parity: dict[str, Any],
+) -> list[dict[str, Any]]:
+    profile_args = _stewardship_profile_args(active_profiles)
+    risks: list[dict[str, Any]] = []
+    failing_checks = (health.get("checks") or {}).get("failing") or []
+    if failing_checks:
+        risks.append(
+            _stewardship_risk(
+                "failing-checks",
+                "high",
+                "Runtime checks are failing",
+                {"checks": failing_checks},
+                "Run doctor for the scoped client and repair required path or env drift first.",
+                [f"doctor --client {cid}{profile_args} --format json"],
+            )
+        )
+    recent_errors = health.get("recent_errors") or {}
+    if int(recent_errors.get("count") or 0) > 0:
+        risks.append(
+            _stewardship_risk(
+                "recent-log-errors",
+                "high",
+                "Recent runtime logs contain error signatures",
+                recent_errors,
+                "Inspect the scoped logs before treating the box as healthy.",
+                [f"logs --client {cid}{profile_args} --format json"],
+            )
+        )
+    down_services = (health.get("services") or {}).get("down") or []
+    if down_services:
+        risks.append(
+            _stewardship_risk(
+                "services-not-running",
+                "medium",
+                "Declared services are not running",
+                {"services": down_services},
+                "Start or intentionally stop the affected services, then regenerate the stewardship report.",
+                [f"up --client {cid}{profile_args} --format json"],
+            )
+        )
+    if focus.get("status") in {"missing", "invalid", "other_client"} or focus.get("stale"):
+        risks.append(
+            _stewardship_risk(
+                "focus-not-current",
+                "medium",
+                "No current focus evidence exists for this client",
+                focus,
+                "Run focus so agent context, live state, and client selection are refreshed.",
+                [f"focus {cid}{profile_args} --format json"],
+            )
+        )
+    pulse_clients = {str(client).strip() for client in pulse.get("active_clients") or [] if str(client).strip()}
+    pulse_out_of_scope = bool(pulse_clients) and cid not in pulse_clients
+    if pulse.get("status") in {"missing", "invalid"} or pulse.get("stale") or pulse_out_of_scope:
+        pulse_evidence = dict(pulse)
+        if pulse_out_of_scope:
+            pulse_evidence["matches_client"] = False
+        risks.append(
+            _stewardship_risk(
+                "pulse-not-observed",
+                "low",
+                "Pulse reconciliation evidence is absent, stale, or scoped elsewhere",
+                pulse_evidence,
+                "Start or refresh pulse for the scoped client before relying on autonomous drift detection.",
+                ["make pulse-status"],
+            )
+        )
+    deferred = parity.get("deferred_surfaces") or []
+    if deferred:
+        risks.append(
+            _stewardship_risk(
+                "deferred-runtime-surfaces",
+                "low",
+                "Some runtime surfaces are declared but deferred",
+                {"deferred_surfaces": deferred},
+                "Keep deferred surfaces out of readiness claims until they are covered or intentionally removed.",
+                [f"status --client {cid}{profile_args} --format json"],
+            )
+        )
+    return risks
+
+
+def _stewardship_next_actions(
+    cid: str,
+    active_profiles: list[str],
+    risks: list[dict[str, Any]],
+) -> list[str]:
+    actions: list[str] = []
+    for risk in risks:
+        for action in risk.get("next_actions") or []:
+            if action not in actions:
+                actions.append(action)
+    profile_args = _stewardship_profile_args(active_profiles)
+    for action in (
+        f"stewardship-report {cid}{profile_args} --format md --write",
+        f"acceptance {cid}{profile_args} --format json",
+    ):
+        if action not in actions:
+            actions.append(action)
+    return actions
+
+
+def _build_stewardship_report(root_dir: Path, cid: str, profiles: list[str]) -> dict[str, Any]:
+    model = build_runtime_model(root_dir)
+    active_profiles = normalize_active_profiles(profiles or [])
+    active_clients = normalize_active_clients(model, [cid])
+    filtered_model = filter_model(model, active_profiles, active_clients)
+    status_payload = runtime_status(filtered_model)
+    live = collect_live_state(filtered_model, root_dir)
+    now, generated_at, report_slug = _stewardship_utc_now()
+    focus = _stewardship_focus_evidence(root_dir, cid, now)
+    pulse = _stewardship_pulse_evidence(root_dir, filtered_model, now)
+    health = _stewardship_health_evidence(status_payload, live)
+    sessions = _stewardship_session_evidence(live)
+    parity = _stewardship_parity_evidence(status_payload)
+    risks = _stewardship_risks(
+        cid=cid,
+        active_profiles=sorted(filtered_model.get("active_profiles") or []),
+        focus=focus,
+        pulse=pulse,
+        health=health,
+        parity=parity,
+    )
+    next_recommendation = (
+        str(risks[0].get("recommendation") or "")
+        if risks
+        else "No blocking runtime risk was found in the current local evidence; keep the packet current after focus or runtime changes."
+    )
+    return {
+        "version": STEWARDSHIP_REPORT_VERSION,
+        "client_id": cid,
+        "active_profiles": sorted(filtered_model.get("active_profiles") or []),
+        "generated_at": generated_at,
+        "report_slug": report_slug,
+        "focus": focus,
+        "health": health,
+        "evidence": {
+            "live_collected_at": live.get("collected_at"),
+            "pulse": pulse,
+            "sessions": sessions,
+            "parity_ledger": parity,
+            "repos": [
+                {
+                    "id": repo.get("id"),
+                    "present": bool(repo.get("present")),
+                    "branch": repo.get("branch"),
+                    "dirty": repo.get("dirty"),
+                    "untracked": repo.get("untracked"),
+                    "last_commit": repo.get("last_commit"),
+                }
+                for repo in live.get("repos") or []
+            ],
+        },
+        "risks": risks,
+        "not_assessed": _stewardship_not_assessed(),
+        "next_recommendation": next_recommendation,
+        "next_actions": _stewardship_next_actions(
+            cid,
+            sorted(filtered_model.get("active_profiles") or []),
+            risks,
+        ),
+    }
+
+
+def _resolve_stewardship_output_dir(root_dir: Path, cid: str, output_dir_arg: str | None) -> Path:
+    value = str(output_dir_arg or "").strip()
+    if value:
+        return resolve_optional_host_dir(root_dir, value, default_rel=Path("reports") / "stewardship")
+    _env_values, overlay_path, _overlay_runtime_path = client_overlay_location(root_dir, cid)
+    return overlay_path.parent / "reports" / "stewardship"
+
+
+def render_stewardship_report_markdown(payload: dict[str, Any]) -> str:
+    lines = [
+        f"# Stewardship Report: {payload['client_id']}",
+        "",
+        f"- Generated: {payload['generated_at']}",
+        f"- Profiles: {', '.join(payload.get('active_profiles') or ['core'])}",
+        f"- Recommendation: {payload.get('next_recommendation') or '-'}",
+        "",
+        "## Risks",
+        "",
+    ]
+    risks = payload.get("risks") or []
+    if not risks:
+        lines.append("- No blocking risks found in current local evidence.")
+    else:
+        for risk in risks:
+            lines.append(
+                f"- {str(risk.get('severity') or 'info').upper()}: "
+                f"{risk.get('title')} (`{risk.get('id')}`)"
+            )
+            lines.append(f"  Recommendation: {risk.get('recommendation')}")
+    health = payload.get("health") or {}
+    checks = health.get("checks") or {}
+    services = health.get("services") or {}
+    recent_errors = health.get("recent_errors") or {}
+    sessions = ((payload.get("evidence") or {}).get("sessions") or {})
+    parity = ((payload.get("evidence") or {}).get("parity_ledger") or {})
+    lines.extend(
+        [
+            "",
+            "## Evidence",
+            "",
+            f"- Focus: {(payload.get('focus') or {}).get('status')} at {(payload.get('focus') or {}).get('path')}",
+            f"- Checks: {checks.get('passing', 0)}/{checks.get('total', 0)} passing",
+            f"- Services: {services.get('running', 0)}/{services.get('total', 0)} running",
+            f"- Recent log errors: {recent_errors.get('count', 0)}",
+            f"- Sessions: {sessions.get('count', 0)} recent session(s)",
+            f"- Parity deferred surfaces: {parity.get('deferred_count', 0)}",
+            "",
+            "## Not Assessed",
+            "",
+        ]
+    )
+    for item in payload.get("not_assessed") or []:
+        lines.append(f"- {item.get('id')}: {item.get('reason')}")
+    lines.extend(["", "## Next Actions", ""])
+    for action in payload.get("next_actions") or []:
+        lines.append(f"- `{action}`")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _write_stewardship_artifact(
+    root_dir: Path,
+    cid: str,
+    payload: dict[str, Any],
+    *,
+    fmt: str,
+    output_dir_arg: str | None,
+) -> dict[str, Any]:
+    output_dir = _resolve_stewardship_output_dir(root_dir, cid, output_dir_arg)
+    extension = "json" if fmt == "json" else "md"
+    report_path = output_dir / f"{cid}-stewardship-{payload['report_slug']}.{extension}"
+    payload["artifact"] = {
+        "written": True,
+        "path": repo_rel(root_dir, report_path),
+        "format": fmt,
+    }
+    if fmt == "json":
+        write_json_file(report_path, payload)
+    else:
+        write_text_file(report_path, render_stewardship_report_markdown(payload), dry_run=False)
+    return payload["artifact"]
+
+
+def run_stewardship_report(
+    *,
+    root_dir: Path,
+    client_id: str,
+    profiles: list[str],
+    fmt: str,
+    write: bool,
+    output_dir_arg: str | None,
+) -> int:
+    try:
+        cid = validate_client_id(client_id)
+        _env_values, overlay_path, overlay_runtime_path = client_overlay_location(root_dir, cid)
+        if not overlay_path.is_file():
+            raise RuntimeError(
+                f"Client '{cid}' has no overlay at {overlay_runtime_path}. "
+                f"Use 'onboard {cid}' to scaffold it first."
+            )
+        payload = _build_stewardship_report(root_dir, cid, profiles)
+        if write or output_dir_arg:
+            _write_stewardship_artifact(
+                root_dir,
+                cid,
+                payload,
+                fmt=fmt,
+                output_dir_arg=output_dir_arg,
+            )
+    except RuntimeError as exc:
+        if fmt == "json":
+            emit_json(classify_error(exc, "stewardship-report"))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    if fmt == "json":
+        emit_json(payload)
+    else:
+        print(render_stewardship_report_markdown(payload), end="")
+    return EXIT_OK
+
+
 def _focus_step(
     steps: list[dict[str, Any]], is_json: bool, name: str, status: str, detail: Any = None
 ) -> dict[str, Any]:

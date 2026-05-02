@@ -148,6 +148,20 @@ Resume the last session without re-running the full pipeline:
 python3 .env-manager/manage.py focus --resume
 ```
 
+Use `stewardship-report` when you need a shareable operator evidence packet
+instead of another raw status dump:
+
+```bash
+python3 .env-manager/manage.py stewardship-report personal --format md --write
+```
+
+The report is read-only unless `--write` or `--output-dir` is passed. It
+combines the current runtime graph, live checks, service probes, recent log
+errors, `.focus.json`, pulse state, durable sessions, and parity-ledger coverage
+into a risk-first packet. It also marks important hardening domains that are not
+yet proven by the public runtime graph, such as backup/restore drills and cost
+review, as `not_assessed`.
+
 ## Local Runtime Profiles
 
 Client overlays declare **local runtime profiles** — namespaced service groups
@@ -726,6 +740,7 @@ make runtime-sync
 | `scripts/guard-destructive-op.sh` | PreToolUse hook gating destructive operator tools | Called automatically by Claude Code hooks |
 | `.env-manager/manage.py context` | Generate CLAUDE.md and AGENTS.md from the resolved runtime graph | `python3 .env-manager/manage.py context --client personal` |
 | `.env-manager/manage.py focus` | Activate a client with live state and enriched context | `python3 .env-manager/manage.py focus personal --format json` |
+| `.env-manager/manage.py stewardship-report` | Build a client-scoped operator evidence packet with risks, proof, and not-assessed hardening gaps | `python3 .env-manager/manage.py stewardship-report personal --format md --write` |
 | `.env-manager/manage.py render` | Print the resolved internal runtime graph | `python3 .env-manager/manage.py render --format json` |
 | `.env-manager/manage.py sync` | Create managed repo/artifact/log directories and install declared skills for the selected core/client scope | `python3 .env-manager/manage.py sync --client personal --dry-run` |
 | `.env-manager/manage.py doctor` | Validate the internal repos/skills/logs/check graph for the selected core/client scope | `python3 .env-manager/manage.py doctor --client personal` |

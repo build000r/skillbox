@@ -314,6 +314,7 @@ _COMMAND_FALLBACK_NEXT_ACTIONS: dict[str, list[str]] = {
     "session-end": ["focus --format json", "status --format json"],
     "session-resume": ["focus --format json", "status --format json"],
     "session-status": ["focus --format json", "status --format json"],
+    "stewardship-report": ["focus --format json", "status --format json"],
 }
 
 
