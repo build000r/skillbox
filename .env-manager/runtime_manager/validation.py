@@ -1123,16 +1123,14 @@ def validate_skill_repo_sets(model: dict[str, Any]) -> list[CheckResult]:
     return results + distribution_results
 
 
-def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
+def _check_top_level_duplicates(model: dict[str, Any]) -> tuple[list[str], set[str]]:
     issues: list[str] = []
-
-    client_ids = find_duplicates(model.get("clients") or [], "id")
-    if client_ids:
-        issues.append(f"clients contain duplicate ids: {', '.join(client_ids)}")
+    client_dup_ids = find_duplicates(model.get("clients") or [], "id")
+    if client_dup_ids:
+        issues.append(f"clients contain duplicate ids: {', '.join(client_dup_ids)}")
     for client in model.get("clients") or []:
         if not client.get("id"):
             issues.append("every client entry must have an id")
-
     declared_client_ids = {
         str(client.get("id", "")).strip()
         for client in model.get("clients") or []
@@ -1142,41 +1140,23 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
     if default_client and default_client not in declared_client_ids:
         issues.append(f"selection.default_client references unknown client {default_client!r}")
 
-    for section in ("repos", "artifacts", "env_files", "skills", "tasks", "services", "logs", "checks", "ingress_routes"):
+    for section in (
+        "repos", "artifacts", "env_files", "skills", "tasks",
+        "services", "logs", "checks", "ingress_routes",
+    ):
         duplicates = find_duplicates(model.get(section) or [], "id")
         if duplicates:
             issues.append(f"{section} contain duplicate ids: {', '.join(duplicates)}")
 
-    duplicate_repo_paths = find_duplicates(model["repos"], "path")
-    if duplicate_repo_paths:
-        issues.append(f"repos contain duplicate paths: {', '.join(duplicate_repo_paths)}")
+    for section in ("repos", "logs", "artifacts", "env_files"):
+        duplicates = find_duplicates(model[section], "path")
+        if duplicates:
+            issues.append(f"{section} contain duplicate paths: {', '.join(duplicates)}")
+    return issues, declared_client_ids
 
-    duplicate_log_paths = find_duplicates(model["logs"], "path")
-    if duplicate_log_paths:
-        issues.append(f"logs contain duplicate paths: {', '.join(duplicate_log_paths)}")
 
-    duplicate_artifact_paths = find_duplicates(model["artifacts"], "path")
-    if duplicate_artifact_paths:
-        issues.append(f"artifacts contain duplicate paths: {', '.join(duplicate_artifact_paths)}")
-
-    duplicate_env_file_paths = find_duplicates(model["env_files"], "path")
-    if duplicate_env_file_paths:
-        issues.append(f"env_files contain duplicate paths: {', '.join(duplicate_env_file_paths)}")
-
-    repo_ids = {repo.get("id") for repo in model["repos"]}
-    artifact_ids = {artifact.get("id") for artifact in model["artifacts"]}
-    task_ids = {
-        str(task.get("id", "")).strip()
-        for task in model["tasks"]
-        if str(task.get("id", "")).strip()
-    }
-    bridge_ids = {
-        str(bridge.get("id", "")).strip()
-        for bridge in model.get("bridges") or []
-        if str(bridge.get("id", "")).strip()
-    }
-    log_ids = {log_item.get("id") for log_item in model["logs"]}
-
+def _check_repo_entries(model: dict[str, Any], declared_client_ids: set[str]) -> list[str]:
+    issues: list[str] = []
     for repo in model["repos"]:
         if not repo.get("id"):
             issues.append("every repo entry must have an id")
@@ -1198,7 +1178,11 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
             issues.append(f"repo {repo.get('id')} has unsupported sync.mode {sync_mode!r}")
         if source_kind == "git" and not source.get("url"):
             issues.append(f"repo {repo.get('id')} is git-backed but missing source.url")
+    return issues
 
+
+def _check_artifact_entries(model: dict[str, Any], declared_client_ids: set[str]) -> list[str]:
+    issues: list[str] = []
     for artifact in model["artifacts"]:
         if not artifact.get("id"):
             issues.append("every artifact entry must have an id")
@@ -1214,7 +1198,8 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
 
         sync = artifact.get("sync") or {}
         sync_mode = sync.get("mode") or (
-            "download-if-missing" if source_kind == "url" else "copy-if-missing" if source_kind == "file" else "manual"
+            "download-if-missing" if source_kind == "url"
+            else "copy-if-missing" if source_kind == "file" else "manual"
         )
         if sync_mode not in VALID_ARTIFACT_SYNC_MODES:
             issues.append(f"artifact {artifact.get('id')} has unsupported sync.mode {sync_mode!r}")
@@ -1223,7 +1208,13 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
                 validate_url_download_source(source, artifact_id=str(artifact.get("id", "(missing id)")))
             except RuntimeError as exc:
                 issues.append(str(exc))
+    return issues
 
+
+def _check_env_file_entries(
+    model: dict[str, Any], declared_client_ids: set[str], repo_ids: set[Any],
+) -> list[str]:
+    issues: list[str] = []
     for env_file in model["env_files"]:
         if not env_file.get("id"):
             issues.append("every env_files entry must have an id")
@@ -1245,7 +1236,11 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
             issues.append(f"env file {env_file.get('id')} has unsupported sync.mode {sync_mode!r}")
         if source_kind == "file" and not source.get("path"):
             issues.append(f"env file {env_file.get('id')} is file-backed but missing source.path")
+    return issues
 
+
+def _check_skill_entries(model: dict[str, Any], declared_client_ids: set[str]) -> list[str]:
+    issues: list[str] = []
     for skillset in model["skills"]:
         if not skillset.get("id"):
             issues.append("every skills entry must have an id")
@@ -1253,14 +1248,13 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
             issues.append(f"skill set {skillset.get('id')} references unknown client {skillset['client']!r}")
 
         kind = skillset.get("kind", "packaged-skill-set")
-        if kind == "skill-repo-set":
-            for field in ("skill_repos_config", "lock_path"):
-                if not skillset.get(field):
-                    issues.append(f"skill set {skillset.get('id', '(missing id)')} is missing {field}")
-        else:
-            for field in ("bundle_dir", "manifest", "sources_config", "lock_path"):
-                if not skillset.get(field):
-                    issues.append(f"skill set {skillset.get('id', '(missing id)')} is missing {field}")
+        required_fields = (
+            ("skill_repos_config", "lock_path") if kind == "skill-repo-set"
+            else ("bundle_dir", "manifest", "sources_config", "lock_path")
+        )
+        for field in required_fields:
+            if not skillset.get(field):
+                issues.append(f"skill set {skillset.get('id', '(missing id)')} is missing {field}")
 
         sync = skillset.get("sync") or {}
         sync_mode = sync.get("mode") or "unpack-bundles"
@@ -1272,16 +1266,86 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
             issues.append(f"skill set {skillset.get('id')} must declare at least one install target")
             continue
 
-        target_ids = find_duplicates(targets, "id")
-        if target_ids:
-            issues.append(f"skill set {skillset.get('id')} contains duplicate target ids: {', '.join(target_ids)}")
+        target_dup_ids = find_duplicates(targets, "id")
+        if target_dup_ids:
+            issues.append(f"skill set {skillset.get('id')} contains duplicate target ids: {', '.join(target_dup_ids)}")
 
         for target in targets:
             if not target.get("id"):
                 issues.append(f"skill set {skillset.get('id')} contains a target without an id")
             if not target.get("path"):
                 issues.append(f"skill set {skillset.get('id')} target {target.get('id', '(missing id)')} is missing path")
+    return issues
 
+
+def _check_dependency_list(
+    raw_dependencies: Any,
+    *,
+    owner_kind: str,
+    owner_id: str,
+    self_id: str,
+    valid_ids: set[str],
+    accept_extra: set[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Validate a depends_on list. Returns (issues, deduped dependency ids)."""
+    issues: list[str] = []
+    dependency_ids: list[str] = []
+    if raw_dependencies and not isinstance(raw_dependencies, list):
+        issues.append(f"{owner_kind} {owner_id} has non-list depends_on")
+        return issues, dependency_ids
+    seen: set[str] = set()
+    accept_extra = accept_extra or set()
+    for raw_dependency in raw_dependencies or []:
+        dependency_id = str(raw_dependency).strip()
+        if not dependency_id:
+            issues.append(f"{owner_kind} {owner_id} contains an empty depends_on entry")
+            continue
+        if dependency_id in seen:
+            issues.append(f"{owner_kind} {owner_id} contains duplicate depends_on entry {dependency_id!r}")
+            continue
+        if dependency_id == self_id:
+            issues.append(f"{owner_kind} {owner_id} cannot depend on itself")
+            continue
+        if dependency_id not in valid_ids and dependency_id not in accept_extra:
+            issues.append(f"{owner_kind} {owner_id} references unknown dependency {dependency_id!r}")
+            continue
+        dependency_ids.append(dependency_id)
+        seen.add(dependency_id)
+    return issues, dependency_ids
+
+
+def _check_task_success(task: dict[str, Any], bridge_ids: set[str]) -> list[str]:
+    issues: list[str] = []
+    success = task.get("success") or {}
+    success_type = success.get("type")
+    if not success_type:
+        issues.append(f"task {task.get('id', '(missing id)')} is missing success.type")
+    elif success_type not in VALID_TASK_SUCCESS_TYPES:
+        issues.append(f"task {task.get('id')} has unsupported success.type {success_type!r}")
+    if success_type == "path_exists" and not success.get("path"):
+        issues.append(f"task {task.get('id')} path_exists success is missing path")
+    if success_type == "all_outputs_exist":
+        target = str(success.get("target") or "").strip()
+        if not target:
+            issues.append(f"task {task.get('id')} all_outputs_exist success is missing target")
+        elif target not in bridge_ids:
+            issues.append(
+                f"task {task.get('id')} all_outputs_exist success references unknown bridge {target!r}"
+            )
+    if success_type == "port_listening" and not _is_int_port(success.get("port")):
+        issues.append(f"task {task.get('id')} port_listening success is missing integer port")
+    return issues
+
+
+def _check_task_entries(
+    model: dict[str, Any],
+    declared_client_ids: set[str],
+    repo_ids: set[Any],
+    log_ids: set[Any],
+    task_ids: set[str],
+    bridge_ids: set[str],
+) -> tuple[list[str], dict[str, list[str]]]:
+    issues: list[str] = []
     task_dependency_map: dict[str, list[str]] = {}
     for task in model["tasks"]:
         task_id = str(task.get("id", "")).strip()
@@ -1301,51 +1365,73 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
             if not isinstance(raw_value, list):
                 issues.append(f"task {task.get('id')} has non-list {field_name}")
 
-        raw_dependencies = task.get("depends_on") or []
-        if raw_dependencies and not isinstance(raw_dependencies, list):
-            issues.append(f"task {task.get('id')} has non-list depends_on")
-            raw_dependencies = []
-
-        dependency_ids: list[str] = []
-        seen_dependency_ids: set[str] = set()
-        for raw_dependency in raw_dependencies:
-            dependency_id = str(raw_dependency).strip()
-            if not dependency_id:
-                issues.append(f"task {task.get('id')} contains an empty depends_on entry")
-                continue
-            if dependency_id in seen_dependency_ids:
-                issues.append(f"task {task.get('id')} contains duplicate depends_on entry {dependency_id!r}")
-                continue
-            if dependency_id == task_id:
-                issues.append(f"task {task.get('id')} cannot depend on itself")
-                continue
-            if dependency_id not in task_ids:
-                issues.append(f"task {task.get('id')} references unknown dependency {dependency_id!r}")
-                continue
-            dependency_ids.append(dependency_id)
-            seen_dependency_ids.add(dependency_id)
+        dep_issues, dependency_ids = _check_dependency_list(
+            task.get("depends_on") or [],
+            owner_kind="task",
+            owner_id=str(task.get("id")),
+            self_id=task_id,
+            valid_ids=task_ids,
+        )
+        issues.extend(dep_issues)
         if task_id:
             task_dependency_map[task_id] = dependency_ids
 
-        success = task.get("success") or {}
-        success_type = success.get("type")
-        if not success_type:
-            issues.append(f"task {task.get('id', '(missing id)')} is missing success.type")
-        elif success_type not in VALID_TASK_SUCCESS_TYPES:
-            issues.append(f"task {task.get('id')} has unsupported success.type {success_type!r}")
-        if success_type == "path_exists" and not success.get("path"):
-            issues.append(f"task {task.get('id')} path_exists success is missing path")
-        if success_type == "all_outputs_exist":
-            target = str(success.get("target") or "").strip()
-            if not target:
-                issues.append(f"task {task.get('id')} all_outputs_exist success is missing target")
-            elif target not in bridge_ids:
-                issues.append(
-                    f"task {task.get('id')} all_outputs_exist success references unknown bridge {target!r}"
-                )
-        if success_type == "port_listening" and not _is_int_port(success.get("port")):
-            issues.append(f"task {task.get('id')} port_listening success is missing integer port")
+        issues.extend(_check_task_success(task, bridge_ids))
+    return issues, task_dependency_map
 
+
+def _check_service_healthcheck(service: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    healthcheck = service.get("healthcheck") or {}
+    healthcheck_type = healthcheck.get("type")
+    if not healthcheck_type:
+        return issues
+    if healthcheck_type not in VALID_HEALTHCHECK_TYPES:
+        issues.append(
+            f"service {service.get('id')} has unsupported healthcheck.type {healthcheck_type!r}"
+        )
+    if healthcheck_type == "http" and not healthcheck.get("url"):
+        issues.append(f"service {service.get('id')} http healthcheck is missing url")
+    if healthcheck_type == "path_exists" and not healthcheck.get("path"):
+        issues.append(f"service {service.get('id')} path_exists healthcheck is missing path")
+    if healthcheck_type == "process_running" and not healthcheck.get("pattern"):
+        issues.append(f"service {service.get('id')} process_running healthcheck is missing pattern")
+    if healthcheck_type == "port" and not _is_int_port(healthcheck.get("port")):
+        issues.append(f"service {service.get('id')} port healthcheck is missing integer port")
+    return issues
+
+
+def _check_service_bootstrap_tasks(service: dict[str, Any], task_ids: set[str]) -> list[str]:
+    issues: list[str] = []
+    raw_bootstrap_tasks = service.get("bootstrap_tasks") or []
+    if raw_bootstrap_tasks and not isinstance(raw_bootstrap_tasks, list):
+        issues.append(f"service {service.get('id')} has non-list bootstrap_tasks")
+        return issues
+    seen: set[str] = set()
+    for raw_task in raw_bootstrap_tasks:
+        task_id = str(raw_task).strip()
+        if not task_id:
+            issues.append(f"service {service.get('id')} contains an empty bootstrap_tasks entry")
+            continue
+        if task_id in seen:
+            issues.append(f"service {service.get('id')} contains duplicate bootstrap_tasks entry {task_id!r}")
+            continue
+        if task_id not in task_ids:
+            issues.append(f"service {service.get('id')} references unknown bootstrap task {task_id!r}")
+            continue
+        seen.add(task_id)
+    return issues
+
+
+def _check_service_entries(
+    model: dict[str, Any],
+    declared_client_ids: set[str],
+    repo_ids: set[Any],
+    artifact_ids: set[Any],
+    log_ids: set[Any],
+    task_ids: set[str],
+) -> tuple[list[str], dict[str, list[str]], dict[str, dict[str, Any]], set[str]]:
+    issues: list[str] = []
     service_ids = {
         str(service.get("id", "")).strip()
         for service in model["services"]
@@ -1373,89 +1459,58 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
         if not str(service.get("command") or "").strip():
             issues.append(f"service {service.get('id', '(missing id)')} is missing command")
 
-        raw_dependencies = service.get("depends_on") or []
-        if raw_dependencies and not isinstance(raw_dependencies, list):
-            issues.append(f"service {service.get('id')} has non-list depends_on")
-            raw_dependencies = []
-
-        dependency_ids: list[str] = []
-        seen_dependency_ids: set[str] = set()
-        for raw_dependency in raw_dependencies:
-            dependency_id = str(raw_dependency).strip()
-            if not dependency_id:
-                issues.append(f"service {service.get('id')} contains an empty depends_on entry")
-                continue
-            if dependency_id in seen_dependency_ids:
-                issues.append(f"service {service.get('id')} contains duplicate depends_on entry {dependency_id!r}")
-                continue
-            if dependency_id == service_id:
-                issues.append(f"service {service.get('id')} cannot depend on itself")
-                continue
-            if dependency_id not in service_ids and dependency_id not in artifact_ids:
-                issues.append(f"service {service.get('id')} references unknown dependency {dependency_id!r}")
-                continue
-            dependency_ids.append(dependency_id)
-            seen_dependency_ids.add(dependency_id)
+        dep_issues, dependency_ids = _check_dependency_list(
+            service.get("depends_on") or [],
+            owner_kind="service",
+            owner_id=str(service.get("id")),
+            self_id=service_id,
+            valid_ids=service_ids,
+            accept_extra=set(artifact_ids),
+        )
+        issues.extend(dep_issues)
         if service_id:
             service_dependency_map[service_id] = dependency_ids
 
-        raw_bootstrap_tasks = service.get("bootstrap_tasks") or []
-        if raw_bootstrap_tasks and not isinstance(raw_bootstrap_tasks, list):
-            issues.append(f"service {service.get('id')} has non-list bootstrap_tasks")
-            raw_bootstrap_tasks = []
+        issues.extend(_check_service_bootstrap_tasks(service, task_ids))
+        issues.extend(_check_service_healthcheck(service))
 
-        seen_bootstrap_tasks: set[str] = set()
-        for raw_task in raw_bootstrap_tasks:
-            task_id = str(raw_task).strip()
-            if not task_id:
-                issues.append(f"service {service.get('id')} contains an empty bootstrap_tasks entry")
-                continue
-            if task_id in seen_bootstrap_tasks:
-                issues.append(f"service {service.get('id')} contains duplicate bootstrap_tasks entry {task_id!r}")
-                continue
-            if task_id not in task_ids:
-                issues.append(f"service {service.get('id')} references unknown bootstrap task {task_id!r}")
-                continue
-            seen_bootstrap_tasks.add(task_id)
+    return issues, service_dependency_map, services_by_id, service_ids
 
-        healthcheck = service.get("healthcheck") or {}
-        healthcheck_type = healthcheck.get("type")
-        if healthcheck_type:
-            if healthcheck_type not in VALID_HEALTHCHECK_TYPES:
-                issues.append(
-                    f"service {service.get('id')} has unsupported healthcheck.type {healthcheck_type!r}"
-                )
-            if healthcheck_type == "http" and not healthcheck.get("url"):
-                issues.append(f"service {service.get('id')} http healthcheck is missing url")
-            if healthcheck_type == "path_exists" and not healthcheck.get("path"):
-                issues.append(f"service {service.get('id')} path_exists healthcheck is missing path")
-            if healthcheck_type == "process_running" and not healthcheck.get("pattern"):
-                issues.append(f"service {service.get('id')} process_running healthcheck is missing pattern")
-            if healthcheck_type == "port" and not _is_int_port(healthcheck.get("port")):
-                issues.append(f"service {service.get('id')} port healthcheck is missing integer port")
 
+def _detect_dependency_cycles(
+    dependency_map: dict[str, list[str]], owner_kind: str,
+) -> list[str]:
+    issues: list[str] = []
     visiting: list[str] = []
     visited: set[str] = set()
 
-    def visit_service_dependency(service_id: str) -> None:
-        if service_id in visited:
+    def visit(node_id: str) -> None:
+        if node_id in visited:
             return
-        if service_id in visiting:
-            cycle_start = visiting.index(service_id)
-            cycle = visiting[cycle_start:] + [service_id]
-            issues.append("service dependency cycle detected: " + " -> ".join(cycle))
+        if node_id in visiting:
+            cycle_start = visiting.index(node_id)
+            cycle = visiting[cycle_start:] + [node_id]
+            issues.append(f"{owner_kind} dependency cycle detected: " + " -> ".join(cycle))
             return
-
-        visiting.append(service_id)
-        for dependency_id in service_dependency_map.get(service_id, []):
-            visit_service_dependency(dependency_id)
+        visiting.append(node_id)
+        for dep_id in dependency_map.get(node_id, []):
+            visit(dep_id)
         visiting.pop()
-        visited.add(service_id)
+        visited.add(node_id)
 
-    for service_id in sorted(service_dependency_map):
-        visit_service_dependency(service_id)
+    for node_id in sorted(dependency_map):
+        visit(node_id)
+    return issues
 
-    ingress_route_conflicts: set[tuple[str, str, str]] = set()
+
+def _check_ingress_route_entries(
+    model: dict[str, Any],
+    declared_client_ids: set[str],
+    service_ids: set[str],
+    services_by_id: dict[str, dict[str, Any]],
+) -> list[str]:
+    issues: list[str] = []
+    seen_keys: set[tuple[str, str, str]] = set()
     for route in model.get("ingress_routes") or []:
         route_id = str(route.get("id", "")).strip()
         if not route_id:
@@ -1491,36 +1546,19 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
                 f"ingress route {route.get('id')} has unsupported match {route.get('match')!r}"
             )
 
-        conflict_key = (listener or "public", path, match or "exact")
         if path:
-            if conflict_key in ingress_route_conflicts:
+            conflict_key = (listener or "public", path, match or "exact")
+            if conflict_key in seen_keys:
                 issues.append(
                     "ingress routes contain duplicate listener/path/match: "
                     f"{listener or 'public'} {path} ({match or 'exact'})"
                 )
-            ingress_route_conflicts.add(conflict_key)
+            seen_keys.add(conflict_key)
+    return issues
 
-    task_visiting: list[str] = []
-    task_visited: set[str] = set()
 
-    def visit_task_dependency(task_id: str) -> None:
-        if task_id in task_visited:
-            return
-        if task_id in task_visiting:
-            cycle_start = task_visiting.index(task_id)
-            cycle = task_visiting[cycle_start:] + [task_id]
-            issues.append("task dependency cycle detected: " + " -> ".join(cycle))
-            return
-
-        task_visiting.append(task_id)
-        for dependency_id in task_dependency_map.get(task_id, []):
-            visit_task_dependency(dependency_id)
-        task_visiting.pop()
-        task_visited.add(task_id)
-
-    for task_id in sorted(task_dependency_map):
-        visit_task_dependency(task_id)
-
+def _check_log_entries(model: dict[str, Any], declared_client_ids: set[str]) -> list[str]:
+    issues: list[str] = []
     for log_item in model["logs"]:
         if not log_item.get("id"):
             issues.append("every log entry must have an id")
@@ -1528,7 +1566,11 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
             issues.append(f"log {log_item.get('id', '(missing id)')} is missing path")
         if log_item.get("client") and log_item["client"] not in declared_client_ids:
             issues.append(f"log {log_item.get('id')} references unknown client {log_item['client']!r}")
+    return issues
 
+
+def _check_check_entries(model: dict[str, Any], declared_client_ids: set[str]) -> list[str]:
+    issues: list[str] = []
     for check in model["checks"]:
         check_type = check.get("type")
         if check_type not in VALID_CHECK_TYPES:
@@ -1537,34 +1579,72 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
             issues.append(f"check {check.get('id')} is missing path")
         if check.get("client") and check["client"] not in declared_client_ids:
             issues.append(f"check {check.get('id')} references unknown client {check['client']!r}")
+    return issues
 
+
+def _build_manifest_check_result(issues: list[str], model: dict[str, Any]) -> list[CheckResult]:
     if issues:
-        return [
-            CheckResult(
-                status="fail",
-                code="runtime-manifest",
-                message="runtime manifest contains invalid definitions",
-                details={"issues": issues},
-            )
-        ]
-
-    return [
-        CheckResult(
-            status="pass",
+        return [CheckResult(
+            status="fail",
             code="runtime-manifest",
-            message="runtime manifest definitions are internally consistent",
-            details={
-                "repos": len(model["repos"]),
-                "artifacts": len(model["artifacts"]),
-                "env_files": len(model["env_files"]),
-                "skills": len(model["skills"]),
-                "tasks": len(model["tasks"]),
-                "services": len(model["services"]),
-                "logs": len(model["logs"]),
-                "checks": len(model["checks"]),
-            },
-        )
-    ]
+            message="runtime manifest contains invalid definitions",
+            details={"issues": issues},
+        )]
+    return [CheckResult(
+        status="pass",
+        code="runtime-manifest",
+        message="runtime manifest definitions are internally consistent",
+        details={
+            "repos": len(model["repos"]),
+            "artifacts": len(model["artifacts"]),
+            "env_files": len(model["env_files"]),
+            "skills": len(model["skills"]),
+            "tasks": len(model["tasks"]),
+            "services": len(model["services"]),
+            "logs": len(model["logs"]),
+            "checks": len(model["checks"]),
+        },
+    )]
+
+
+def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
+    issues, declared_client_ids = _check_top_level_duplicates(model)
+
+    repo_ids = {repo.get("id") for repo in model["repos"]}
+    artifact_ids = {artifact.get("id") for artifact in model["artifacts"]}
+    task_ids = {
+        str(task.get("id", "")).strip()
+        for task in model["tasks"]
+        if str(task.get("id", "")).strip()
+    }
+    bridge_ids = {
+        str(bridge.get("id", "")).strip()
+        for bridge in model.get("bridges") or []
+        if str(bridge.get("id", "")).strip()
+    }
+    log_ids = {log_item.get("id") for log_item in model["logs"]}
+
+    issues.extend(_check_repo_entries(model, declared_client_ids))
+    issues.extend(_check_artifact_entries(model, declared_client_ids))
+    issues.extend(_check_env_file_entries(model, declared_client_ids, repo_ids))
+    issues.extend(_check_skill_entries(model, declared_client_ids))
+    task_issues, task_dependency_map = _check_task_entries(
+        model, declared_client_ids, repo_ids, log_ids, task_ids, bridge_ids,
+    )
+    issues.extend(task_issues)
+    service_issues, service_dependency_map, services_by_id, service_ids = _check_service_entries(
+        model, declared_client_ids, repo_ids, artifact_ids, log_ids, task_ids,
+    )
+    issues.extend(service_issues)
+    issues.extend(_detect_dependency_cycles(service_dependency_map, "service"))
+    issues.extend(_check_ingress_route_entries(
+        model, declared_client_ids, service_ids, services_by_id,
+    ))
+    issues.extend(_detect_dependency_cycles(task_dependency_map, "task"))
+    issues.extend(_check_log_entries(model, declared_client_ids))
+    issues.extend(_check_check_entries(model, declared_client_ids))
+
+    return _build_manifest_check_result(issues, model)
 
 
 def validate_connector_contract(model: dict[str, Any]) -> list[CheckResult]:
