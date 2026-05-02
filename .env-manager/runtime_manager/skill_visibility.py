@@ -6,7 +6,7 @@ import hashlib
 import os
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .shared import (
     atomic_write_text,
@@ -2128,21 +2128,12 @@ def skill_visibility_next_actions(issues: dict[str, list[dict[str, Any]]]) -> li
     return actions
 
 
-def print_skill_visibility_text(
-    payload: dict[str, Any],
-    *,
-    full: bool = False,
-    show_shadowed: bool = False,
-    issues_only: bool = False,
-    limit: int = 80,
-) -> None:
-    summary = payload.get("summary") or {}
+def _print_visibility_header(payload: dict[str, Any], summary: dict[str, Any]) -> None:
     active_clients = ", ".join(payload.get("active_clients") or []) or "(none)"
     active_profiles = ", ".join(payload.get("active_profiles") or []) or "(none)"
     matched = ", ".join(
         f"{item['id']}@{item['match']}" for item in payload.get("matched_clients") or []
     ) or "(none)"
-
     undefined_count = summary.get("undefined_sources", 0)
     undefined_detail = f", {undefined_count} undefined/not synced" if undefined_count else ""
     print(
@@ -2157,24 +2148,31 @@ def print_skill_visibility_text(
     ) or "(none)"
     print(f"project categories: {categories}")
 
-    if not issues_only:
-        print("layers:")
-        for layer in payload.get("layers") or []:
-            detail = f"{layer.get('skill_count', 0)} skills"
-            if layer.get("kind") == "declared":
-                detail += f", {layer.get('healthy_targets', 0)}/{layer.get('target_count', 0)} targets healthy"
-                if layer.get("config_error"):
-                    detail += ", config error"
-                if layer.get("lock_error"):
-                    detail += ", lock error"
-            else:
-                if not layer.get("present"):
-                    detail += ", missing"
-                if layer.get("broken_count"):
-                    detail += f", {layer.get('broken_count')} broken"
-            print(f"  - {layer.get('id')}: {detail}")
 
-    issue_summary = (
+def _layer_detail(layer: dict[str, Any]) -> str:
+    detail = f"{layer.get('skill_count', 0)} skills"
+    if layer.get("kind") == "declared":
+        detail += f", {layer.get('healthy_targets', 0)}/{layer.get('target_count', 0)} targets healthy"
+        if layer.get("config_error"):
+            detail += ", config error"
+        if layer.get("lock_error"):
+            detail += ", lock error"
+        return detail
+    if not layer.get("present"):
+        detail += ", missing"
+    if layer.get("broken_count"):
+        detail += f", {layer.get('broken_count')} broken"
+    return detail
+
+
+def _print_visibility_layers(payload: dict[str, Any]) -> None:
+    print("layers:")
+    for layer in payload.get("layers") or []:
+        print(f"  - {layer.get('id')}: {_layer_detail(layer)}")
+
+
+def _issue_count_total(summary: dict[str, Any]) -> int:
+    return (
         summary.get("broken_global", 0)
         + summary.get("broken_project", 0)
         + summary.get("global_not_allowed", 0)
@@ -2183,130 +2181,198 @@ def print_skill_visibility_text(
         + summary.get("scope_violations", 0)
         + summary.get("missing_for_cwd", 0)
     )
-    if issue_summary or summary.get("shadowed", 0):
-        print("issues:")
+
+
+def _print_visibility_issues(summary: dict[str, Any]) -> None:
+    if not (_issue_count_total(summary) or summary.get("shadowed", 0)):
+        return
+    print("issues:")
+    print(
+        "  - broken_global: "
+        f"{summary.get('broken_global', 0)} links / {summary.get('broken_global_skills', 0)} skills"
+    )
+    if summary.get("broken_project", 0):
         print(
-            "  - broken_global: "
-            f"{summary.get('broken_global', 0)} links / {summary.get('broken_global_skills', 0)} skills"
+            "  - broken_project: "
+            f"{summary.get('broken_project', 0)} links / {summary.get('broken_project_skills', 0)} skills"
         )
-        if summary.get("broken_project", 0):
-            print(
-                "  - broken_project: "
-                f"{summary.get('broken_project', 0)} links / {summary.get('broken_project_skills', 0)} skills"
-            )
-        if summary.get("global_not_allowed", 0):
-            print(
-                "  - global_not_allowed: "
-                f"{summary.get('global_not_allowed', 0)} installs / "
-                f"{summary.get('global_not_allowed_skills', 0)} skills"
-            )
+    if summary.get("global_not_allowed", 0):
         print(
-            "  - extra_global: "
-            f"{summary.get('extra_global', 0)} links / {summary.get('extra_global_skills', 0)} skills"
+            "  - global_not_allowed: "
+            f"{summary.get('global_not_allowed', 0)} installs / "
+            f"{summary.get('global_not_allowed_skills', 0)} skills"
         )
-        print(f"  - shadowed: {summary.get('shadowed', 0)}")
+    print(
+        "  - extra_global: "
+        f"{summary.get('extra_global', 0)} links / {summary.get('extra_global_skills', 0)} skills"
+    )
+    print(f"  - shadowed: {summary.get('shadowed', 0)}")
+    print(
+        "  - archive_sources: "
+        f"{summary.get('archive_sources', 0)} occurrences / {summary.get('archive_source_skills', 0)} skills"
+    )
+    if summary.get("scope_violations", 0):
         print(
-            "  - archive_sources: "
-            f"{summary.get('archive_sources', 0)} occurrences / {summary.get('archive_source_skills', 0)} skills"
+            "  - scope_violations: "
+            f"{summary.get('scope_violations', 0)} installs / "
+            f"{summary.get('scope_violation_skills', 0)} skills"
         )
-        if summary.get("scope_violations", 0):
-            print(
-                "  - scope_violations: "
-                f"{summary.get('scope_violations', 0)} installs / "
-                f"{summary.get('scope_violation_skills', 0)} skills"
-            )
-        if summary.get("missing_for_cwd", 0):
-            print(
-                "  - missing_for_cwd: "
-                f"{summary.get('missing_for_cwd', 0)} rules / "
-                f"{summary.get('missing_for_cwd_skills', 0)} skills"
-            )
+    if summary.get("missing_for_cwd", 0):
+        print(
+            "  - missing_for_cwd: "
+            f"{summary.get('missing_for_cwd', 0)} rules / "
+            f"{summary.get('missing_for_cwd_skills', 0)} skills"
+        )
+
+
+def _print_visibility_effective(payload: dict[str, Any], full: bool, limit: int) -> None:
+    all_items = payload.get("effective") or []
+    effective = all_items if full else all_items[: max(0, limit)]
+    print("effective:")
+    for item in effective:
+        shadow = f" shadows={item.get('shadowed_count')}" if item.get("shadowed_count") else ""
+        state = item.get("state") or item.get("availability")
+        bucket = item.get("source_bucket") or "-"
+        print(f"  - {item.get('name')}: {item.get('layer')} {state} {bucket}{shadow}")
+    remaining = len(all_items) - len(effective)
+    if remaining > 0:
+        print(f"  ... {remaining} more (rerun with --full)")
+
+
+def _print_visibility_shadowed(payload: dict[str, Any]) -> None:
+    shadowed = payload.get("issues", {}).get("shadowed") or []
+    if not shadowed:
+        return
+    print("shadowed:")
+    for item in shadowed:
+        layers = ", ".join(str(layer) for layer in item.get("shadowed_layers") or [])
+        print(f"  - {item.get('name')}: winner={item.get('winner_layer')} hidden={layers}")
+
+
+def _print_limited_issue_list(
+    items: list[dict[str, Any]],
+    header: str,
+    formatter: Callable[[dict[str, Any]], str],
+    limit: int,
+    overflow_suffix: str,
+) -> None:
+    if not items:
+        return
+    print(f"{header}:")
+    visible_count = min(len(items), max(0, limit))
+    for item in items[:visible_count]:
+        print(f"  - {formatter(item)}")
+    remaining = len(items) - visible_count
+    if remaining > 0:
+        print(f"  ... {remaining} more {overflow_suffix}")
+
+
+def _format_scope_violation(item: dict[str, Any]) -> str:
+    allowed = ", ".join(str(path) for path in item.get("allowed_paths") or []) or "(none)"
+    return (
+        f"{item.get('name')}: {item.get('layer')} at {item.get('path')} "
+        f"rule={item.get('scope_rule')} allowed={allowed}"
+    )
+
+
+def _format_global_not_allowed(item: dict[str, Any]) -> str:
+    return f"{item.get('name')}: {item.get('layer')} at {item.get('path')}"
+
+
+def _format_missing_for_cwd(item: dict[str, Any]) -> str:
+    allowed = ", ".join(str(path) for path in item.get("allowed_paths") or []) or "(none)"
+    categories = ", ".join(str(category) for category in item.get("categories") or []) or "(none)"
+    return (
+        f"{item.get('name')}: rule={item.get('scope_rule')} "
+        f"categories={categories} allowed={allowed}"
+    )
+
+
+def _print_visibility_undefined(payload: dict[str, Any], full: bool, limit: int) -> None:
+    undefined = payload.get("undefined_sources") or []
+    if not undefined:
+        return
+    roots_count = len(payload.get("source_roots") or [])
+    print(f"undefined / not synced ({len(undefined)} from {roots_count} source roots):")
+    visible = undefined if full else undefined[: max(0, limit)]
+    for item in visible:
+        print(f"  - {item.get('name')}: {item.get('source_bucket')} {item.get('source')}")
+    remaining = len(undefined) - len(visible)
+    if remaining > 0:
+        print(f"  ... {remaining} more undefined source skills (rerun with --full)")
+
+
+def _print_visibility_next_actions(payload: dict[str, Any]) -> None:
+    next_actions = payload.get("next_actions") or []
+    if not next_actions:
+        return
+    print("next_actions:")
+    for action in next_actions:
+        print(f"  - {action}")
+
+
+def _print_visibility_recommendations(payload: dict[str, Any], full: bool, limit: int) -> None:
+    recommendations = payload.get("recommendations") or []
+    if not recommendations:
+        return
+    print("recommendations:")
+    visible = recommendations if full else recommendations[: max(0, limit)]
+    for item in visible:
+        skill = item.get("skill") or "-"
+        print(f"  - {item.get('action')}: {skill} ({item.get('hint')})")
+    remaining = len(recommendations) - len(visible)
+    if remaining > 0:
+        print(f"  ... {remaining} more recommendations")
+
+
+def print_skill_visibility_text(
+    payload: dict[str, Any],
+    *,
+    full: bool = False,
+    show_shadowed: bool = False,
+    issues_only: bool = False,
+    limit: int = 80,
+) -> None:
+    summary = payload.get("summary") or {}
+    _print_visibility_header(payload, summary)
 
     if not issues_only:
-        if full:
-            effective = payload.get("effective") or []
-        else:
-            effective = (payload.get("effective") or [])[: max(0, limit)]
+        _print_visibility_layers(payload)
 
-        print("effective:")
-        for item in effective:
-            shadow = f" shadows={item.get('shadowed_count')}" if item.get("shadowed_count") else ""
-            state = item.get("state") or item.get("availability")
-            bucket = item.get("source_bucket") or "-"
-            print(f"  - {item.get('name')}: {item.get('layer')} {state} {bucket}{shadow}")
+    _print_visibility_issues(summary)
 
-        remaining = len(payload.get("effective") or []) - len(effective)
-        if remaining > 0:
-            print(f"  ... {remaining} more (rerun with --full)")
+    if not issues_only:
+        _print_visibility_effective(payload, full, limit)
 
     if show_shadowed:
-        shadowed = payload.get("issues", {}).get("shadowed") or []
-        if shadowed:
-            print("shadowed:")
-            for item in shadowed:
-                layers = ", ".join(str(layer) for layer in item.get("shadowed_layers") or [])
-                print(f"  - {item.get('name')}: winner={item.get('winner_layer')} hidden={layers}")
+        _print_visibility_shadowed(payload)
 
-    scope_violations = payload.get("issues", {}).get("scope_violations") or []
-    if scope_violations and (show_shadowed or full):
-        print("scope_violations:")
-        for item in scope_violations[: max(0, limit)]:
-            allowed = ", ".join(str(path) for path in item.get("allowed_paths") or []) or "(none)"
-            print(
-                f"  - {item.get('name')}: {item.get('layer')} at {item.get('path')} "
-                f"rule={item.get('scope_rule')} allowed={allowed}"
-            )
-        remaining_violations = len(scope_violations) - min(len(scope_violations), max(0, limit))
-        if remaining_violations > 0:
-            print(f"  ... {remaining_violations} more scope violations")
+    issues = payload.get("issues", {})
+    if show_shadowed or full:
+        _print_limited_issue_list(
+            issues.get("scope_violations") or [],
+            "scope_violations",
+            _format_scope_violation,
+            limit,
+            "scope violations",
+        )
+        _print_limited_issue_list(
+            issues.get("global_not_allowed") or [],
+            "global_not_allowed",
+            _format_global_not_allowed,
+            limit,
+            "global installs outside allowlist",
+        )
 
-    global_not_allowed = payload.get("issues", {}).get("global_not_allowed") or []
-    if global_not_allowed and (show_shadowed or full):
-        print("global_not_allowed:")
-        for item in global_not_allowed[: max(0, limit)]:
-            print(f"  - {item.get('name')}: {item.get('layer')} at {item.get('path')}")
-        remaining_global = len(global_not_allowed) - min(len(global_not_allowed), max(0, limit))
-        if remaining_global > 0:
-            print(f"  ... {remaining_global} more global installs outside allowlist")
+    if show_shadowed or full or issues_only:
+        _print_limited_issue_list(
+            issues.get("missing_for_cwd") or [],
+            "missing_for_cwd",
+            _format_missing_for_cwd,
+            limit,
+            "missing cwd-scoped skills",
+        )
 
-    missing_for_cwd = payload.get("issues", {}).get("missing_for_cwd") or []
-    if missing_for_cwd and (show_shadowed or full or issues_only):
-        print("missing_for_cwd:")
-        for item in missing_for_cwd[: max(0, limit)]:
-            allowed = ", ".join(str(path) for path in item.get("allowed_paths") or []) or "(none)"
-            categories = ", ".join(str(category) for category in item.get("categories") or []) or "(none)"
-            print(
-                f"  - {item.get('name')}: rule={item.get('scope_rule')} "
-                f"categories={categories} allowed={allowed}"
-            )
-        remaining_missing = len(missing_for_cwd) - min(len(missing_for_cwd), max(0, limit))
-        if remaining_missing > 0:
-            print(f"  ... {remaining_missing} more missing cwd-scoped skills")
-
-    undefined = payload.get("undefined_sources") or []
-    if undefined:
-        roots_count = len(payload.get("source_roots") or [])
-        print(f"undefined / not synced ({len(undefined)} from {roots_count} source roots):")
-        visible = undefined if full else undefined[: max(0, limit)]
-        for item in visible:
-            print(f"  - {item.get('name')}: {item.get('source_bucket')} {item.get('source')}")
-        remaining_undefined = len(undefined) - len(visible)
-        if remaining_undefined > 0:
-            print(f"  ... {remaining_undefined} more undefined source skills (rerun with --full)")
-
-    next_actions = payload.get("next_actions") or []
-    if next_actions:
-        print("next_actions:")
-        for action in next_actions:
-            print(f"  - {action}")
-
-    recommendations = payload.get("recommendations") or []
-    if recommendations:
-        print("recommendations:")
-        visible_recommendations = recommendations if full else recommendations[: max(0, limit)]
-        for item in visible_recommendations:
-            skill = item.get("skill") or "-"
-            print(f"  - {item.get('action')}: {skill} ({item.get('hint')})")
-        remaining_recommendations = len(recommendations) - len(visible_recommendations)
-        if remaining_recommendations > 0:
-            print(f"  ... {remaining_recommendations} more recommendations")
+    _print_visibility_undefined(payload, full, limit)
+    _print_visibility_next_actions(payload)
+    _print_visibility_recommendations(payload, full, limit)
