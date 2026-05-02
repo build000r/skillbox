@@ -591,6 +591,100 @@ def sync_skill_sets(model: dict[str, Any], dry_run: bool) -> list[str]:
     return actions
 
 
+def _check_skillset_required_bundles(skillset: dict[str, Any], inventory: dict[str, Any]) -> list[str]:
+    required_missing: list[str] = []
+    for label, present, display_path in (
+        ("bundle_dir", inventory["bundle_dir_exists"], inventory["bundle_dir_host_path"]),
+        ("manifest", inventory["manifest_exists"], inventory["manifest_host_path"]),
+        ("sources_config", inventory["sources_config_exists"], inventory["sources_config_host_path"]),
+    ):
+        if not present:
+            required_missing.append(f"{skillset['id']}: missing {label} at {display_path}")
+    return required_missing
+
+
+def _check_skillset_bundle_drift(skillset: dict[str, Any], inventory: dict[str, Any]) -> tuple[list[str], list[str]]:
+    failures: list[str] = []
+    warnings: list[str] = []
+    if inventory["missing_bundles"]:
+        failures.append(f"{skillset['id']}: missing bundles for {', '.join(inventory['missing_bundles'])}")
+    if inventory["extra_bundles"]:
+        warnings.append(f"{skillset['id']}: extra bundles present for {', '.join(inventory['extra_bundles'])}")
+    return failures, warnings
+
+
+def _check_skillset_lockfile(skillset: dict[str, Any], inventory: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Returns (lock_failures, lock_warnings)."""
+    if inventory["lock_error"]:
+        return [f"{skillset['id']}: {inventory['lock_error']}"], []
+    if not inventory["lock_present"]:
+        return [], [f"{skillset['id']}: lockfile missing at {inventory['lock_path_host_path']}"]
+
+    failures: list[str] = []
+    lock_payload = inventory["lock_payload"] or {}
+    if lock_payload.get("version") != LOCKFILE_VERSION:
+        failures.append(
+            f"{skillset['id']}: lockfile version {lock_payload.get('version')!r} does not match {LOCKFILE_VERSION}"
+        )
+    if lock_payload.get("id") != skillset["id"]:
+        failures.append(f"{skillset['id']}: lockfile id does not match the skill set id")
+    if lock_payload.get("manifest_sha256") != inventory["manifest_sha256"]:
+        failures.append(f"{skillset['id']}: lockfile manifest digest is stale")
+    if lock_payload.get("sources_config_sha256") != inventory["sources_config_sha256"]:
+        failures.append(f"{skillset['id']}: lockfile sources config digest is stale")
+
+    indexed_lock = lock_skill_map(lock_payload)
+    expected_skill_names = set(inventory["expected_skills"])
+    extras = sorted(set(indexed_lock) - expected_skill_names)
+    if extras:
+        failures.append(f"{skillset['id']}: lockfile contains extra skills: {', '.join(extras)}")
+
+    configured_targets = {target["id"] for target in skillset.get("install_targets") or []}
+    for skill_name in inventory["expected_skills"]:
+        lock_record = indexed_lock.get(skill_name)
+        if lock_record is None:
+            failures.append(f"{skillset['id']}: lockfile is missing skill {skill_name}")
+            continue
+        bundle_record = inventory["bundles"].get(skill_name)
+        if bundle_record is None:
+            continue
+        if lock_record.get("bundle_sha256") != bundle_record["bundle_sha256"]:
+            failures.append(f"{skillset['id']}: lockfile bundle digest is stale for {skill_name}")
+        if lock_record.get("bundle_tree_sha256") != bundle_record["bundle_tree_sha256"]:
+            failures.append(f"{skillset['id']}: lockfile bundle tree digest is stale for {skill_name}")
+        lock_targets = lock_record.get("targets_by_id", {})
+        target_extras = sorted(set(lock_targets) - configured_targets)
+        if target_extras:
+            failures.append(
+                f"{skillset['id']}: lockfile contains unexpected targets for {skill_name}: {', '.join(target_extras)}"
+            )
+        missing_targets = sorted(configured_targets - set(lock_targets))
+        if missing_targets:
+            failures.append(
+                f"{skillset['id']}: lockfile is missing targets for {skill_name}: {', '.join(missing_targets)}"
+            )
+    return failures, []
+
+
+def _check_skillset_install_state(skillset: dict[str, Any], inventory: dict[str, Any]) -> tuple[list[str], list[str]]:
+    failures: list[str] = []
+    warnings: list[str] = []
+    for skill_entry in inventory["skills"]:
+        bundle_state = skill_entry["bundle_state"]
+        if bundle_state == "drift":
+            failures.append(f"{skillset['id']}: bundle digest drift detected for {skill_entry['name']}")
+        elif bundle_state == "untracked" and inventory["lock_present"]:
+            failures.append(f"{skillset['id']}: bundle {skill_entry['name']} is not represented in the lockfile")
+        for target in skill_entry["targets"]:
+            if target["state"] == "drift":
+                failures.append(f"{skillset['id']}: installed drift for {skill_entry['name']} in {target['id']}")
+            elif target["state"] == "untracked":
+                failures.append(f"{skillset['id']}: unmanaged install for {skill_entry['name']} in {target['id']}")
+            elif target["state"] == "missing":
+                warnings.append(f"{skillset['id']}: missing install for {skill_entry['name']} in {target['id']}")
+    return failures, warnings
+
+
 def validate_skill_locks_and_state(model: dict[str, Any]) -> list[CheckResult]:
     if not model["skills"]:
         return []
@@ -607,194 +701,46 @@ def validate_skill_locks_and_state(model: dict[str, Any]) -> list[CheckResult]:
             continue
         inventory = collect_skill_inventory(skillset)
 
-        required_missing: list[str] = []
-        for label, present, display_path in (
-            ("bundle_dir", inventory["bundle_dir_exists"], inventory["bundle_dir_host_path"]),
-            ("manifest", inventory["manifest_exists"], inventory["manifest_host_path"]),
-            ("sources_config", inventory["sources_config_exists"], inventory["sources_config_host_path"]),
-        ):
-            if not present:
-                required_missing.append(f"{skillset['id']}: missing {label} at {display_path}")
-
+        required_missing = _check_skillset_required_bundles(skillset, inventory)
         if required_missing:
             bundle_failures.extend(required_missing)
             continue
 
-        if inventory["missing_bundles"]:
-            bundle_failures.append(
-                f"{skillset['id']}: missing bundles for {', '.join(inventory['missing_bundles'])}"
-            )
-        if inventory["extra_bundles"]:
-            bundle_warnings.append(
-                f"{skillset['id']}: extra bundles present for {', '.join(inventory['extra_bundles'])}"
-            )
+        bf, bw = _check_skillset_bundle_drift(skillset, inventory)
+        bundle_failures.extend(bf)
+        bundle_warnings.extend(bw)
 
-        if inventory["lock_error"]:
-            lock_failures.append(f"{skillset['id']}: {inventory['lock_error']}")
-        elif not inventory["lock_present"]:
-            lock_warnings.append(
-                f"{skillset['id']}: lockfile missing at {inventory['lock_path_host_path']}"
-            )
-        else:
-            lock_payload = inventory["lock_payload"] or {}
-            if lock_payload.get("version") != LOCKFILE_VERSION:
-                lock_failures.append(
-                    f"{skillset['id']}: lockfile version {lock_payload.get('version')!r} does not match {LOCKFILE_VERSION}"
-                )
-            if lock_payload.get("id") != skillset["id"]:
-                lock_failures.append(f"{skillset['id']}: lockfile id does not match the skill set id")
-            if lock_payload.get("manifest_sha256") != inventory["manifest_sha256"]:
-                lock_failures.append(f"{skillset['id']}: lockfile manifest digest is stale")
-            if lock_payload.get("sources_config_sha256") != inventory["sources_config_sha256"]:
-                lock_failures.append(f"{skillset['id']}: lockfile sources config digest is stale")
+        lf, lw = _check_skillset_lockfile(skillset, inventory)
+        lock_failures.extend(lf)
+        lock_warnings.extend(lw)
 
-            indexed_lock = lock_skill_map(lock_payload)
-            expected_skill_names = set(inventory["expected_skills"])
-            if set(indexed_lock) - expected_skill_names:
-                extras = ", ".join(sorted(set(indexed_lock) - expected_skill_names))
-                lock_failures.append(f"{skillset['id']}: lockfile contains extra skills: {extras}")
+        if_, iw = _check_skillset_install_state(skillset, inventory)
+        install_failures.extend(if_)
+        install_warnings.extend(iw)
 
-            for skill_name in inventory["expected_skills"]:
-                lock_record = indexed_lock.get(skill_name)
-                if lock_record is None:
-                    lock_failures.append(f"{skillset['id']}: lockfile is missing skill {skill_name}")
-                    continue
-
-                bundle_record = inventory["bundles"].get(skill_name)
-                if bundle_record is None:
-                    continue
-
-                if lock_record.get("bundle_sha256") != bundle_record["bundle_sha256"]:
-                    lock_failures.append(
-                        f"{skillset['id']}: lockfile bundle digest is stale for {skill_name}"
-                    )
-                if lock_record.get("bundle_tree_sha256") != bundle_record["bundle_tree_sha256"]:
-                    lock_failures.append(
-                        f"{skillset['id']}: lockfile bundle tree digest is stale for {skill_name}"
-                    )
-
-                lock_targets = lock_record.get("targets_by_id", {})
-                configured_targets = {target["id"] for target in skillset.get("install_targets") or []}
-                if set(lock_targets) - configured_targets:
-                    extras = ", ".join(sorted(set(lock_targets) - configured_targets))
-                    lock_failures.append(
-                        f"{skillset['id']}: lockfile contains unexpected targets for {skill_name}: {extras}"
-                    )
-
-                missing_targets = sorted(configured_targets - set(lock_targets))
-                if missing_targets:
-                    lock_failures.append(
-                        f"{skillset['id']}: lockfile is missing targets for {skill_name}: {', '.join(missing_targets)}"
-                    )
-
-        for skill_entry in inventory["skills"]:
-            bundle_state = skill_entry["bundle_state"]
-            if bundle_state == "drift":
-                install_failures.append(
-                    f"{skillset['id']}: bundle digest drift detected for {skill_entry['name']}"
-                )
-            elif bundle_state == "untracked" and inventory["lock_present"]:
-                install_failures.append(
-                    f"{skillset['id']}: bundle {skill_entry['name']} is not represented in the lockfile"
-                )
-
-            for target in skill_entry["targets"]:
-                if target["state"] == "drift":
-                    install_failures.append(
-                        f"{skillset['id']}: installed drift for {skill_entry['name']} in {target['id']}"
-                    )
-                elif target["state"] == "untracked":
-                    install_failures.append(
-                        f"{skillset['id']}: unmanaged install for {skill_entry['name']} in {target['id']}"
-                    )
-                elif target["state"] == "missing":
-                    install_warnings.append(
-                        f"{skillset['id']}: missing install for {skill_entry['name']} in {target['id']}"
-                    )
-
-    results: list[CheckResult] = []
-    if bundle_failures:
-        results.append(
-            CheckResult(
-                status="fail",
-                code="skill-bundle-state",
-                message="managed skill bundles do not satisfy the declared manifest",
-                details={"issues": bundle_failures},
-            )
-        )
-    elif bundle_warnings:
-        results.append(
-            CheckResult(
-                status="warn",
-                code="skill-bundle-state",
-                message="managed skill bundle directory contains undeclared bundles",
-                details={"issues": bundle_warnings},
-            )
-        )
-    else:
-        results.append(
-            CheckResult(
-                status="pass",
-                code="skill-bundle-state",
-                message="managed skill bundle directories satisfy the declared manifests",
-            )
-        )
-
-    if lock_failures:
-        results.append(
-            CheckResult(
-                status="fail",
-                code="skill-lock-state",
-                message="managed skill lockfiles are invalid or stale",
-                details={"issues": lock_failures},
-            )
-        )
-    elif lock_warnings:
-        results.append(
-            CheckResult(
-                status="warn",
-                code="skill-lock-state",
-                message="managed skill lockfiles have not been generated yet",
-                details={"issues": lock_warnings},
-            )
-        )
-    else:
-        results.append(
-            CheckResult(
-                status="pass",
-                code="skill-lock-state",
-                message="managed skill lockfiles match the current bundle and source manifests",
-            )
-        )
-
-    if install_failures:
-        results.append(
-            CheckResult(
-                status="fail",
-                code="skill-install-state",
-                message="installed skill directories drifted from the managed bundles",
-                details={"issues": install_failures},
-            )
-        )
-    elif install_warnings:
-        results.append(
-            CheckResult(
-                status="warn",
-                code="skill-install-state",
-                message="managed skill installs are missing and can be created by sync",
-                details={"issues": install_warnings},
-            )
-        )
-    else:
-        results.append(
-            CheckResult(
-                status="pass",
-                code="skill-install-state",
-                message="managed skill installs match the lockfile and bundle contents",
-            )
-        )
-
-    return results
+    return [
+        _bucketed_check_result(
+            "skill-bundle-state",
+            "managed skill bundles do not satisfy the declared manifest",
+            "managed skill bundle directory contains undeclared bundles",
+            "managed skill bundle directories satisfy the declared manifests",
+            bundle_failures, bundle_warnings,
+        ),
+        _bucketed_check_result(
+            "skill-lock-state",
+            "managed skill lockfiles are invalid or stale",
+            "managed skill lockfiles have not been generated yet",
+            "managed skill lockfiles match the current bundle and source manifests",
+            lock_failures, lock_warnings,
+        ),
+        _bucketed_check_result(
+            "skill-install-state",
+            "installed skill directories drifted from the managed bundles",
+            "managed skill installs are missing and can be created by sync",
+            "managed skill installs match the lockfile and bundle contents",
+            install_failures, install_warnings,
+        ),
+    ]
 
 
 def _declared_skill_names(config: dict[str, Any]) -> set[str]:
