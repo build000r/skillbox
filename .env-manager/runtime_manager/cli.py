@@ -1159,6 +1159,466 @@ _EARLY_DISPATCH: dict[str, Callable[[argparse.Namespace, Path], int]] = {
 }
 
 
+def _handle_render(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    if args.format == "json":
+        emit_json(model)
+    else:
+        print_render_text(model)
+    return EXIT_OK
+
+
+def _handle_sync(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    actions = sync_runtime(model, dry_run=args.dry_run)
+    actions.extend(
+        sync_context(
+            model,
+            root_dir,
+            dry_run=args.dry_run,
+            context_dir=resolve_context_dir(root_dir, getattr(args, "context_dir", None)),
+        )
+    )
+    if args.format == "json":
+        emit_json({"actions": actions, "dry_run": args.dry_run, "next_actions": next_actions_for_sync()})
+    else:
+        print("\n".join(actions))
+    return EXIT_OK
+
+
+def _handle_context(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    actions = sync_context(
+        model,
+        root_dir,
+        dry_run=args.dry_run,
+        context_dir=resolve_context_dir(root_dir, getattr(args, "context_dir", None)),
+    )
+    if args.format == "json":
+        emit_json({"actions": actions, "dry_run": args.dry_run, "next_actions": next_actions_for_context()})
+    else:
+        print("\n".join(actions))
+    return EXIT_OK
+
+
+def _handle_doctor(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    results = doctor_results(model, root_dir)
+    has_fail = any(result.status == "fail" for result in results)
+    if args.format == "json":
+        emit_json({
+            "checks": [asdict(result) for result in results],
+            "next_actions": next_actions_for_doctor(results),
+        })
+    else:
+        print_doctor_text(results)
+    if has_fail:
+        return EXIT_DRIFT
+    return EXIT_OK
+
+
+def _handle_status(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    status_payload = runtime_status(model)
+    if args.format == "json":
+        status_payload["next_actions"] = next_actions_for_status(status_payload)
+        emit_json(compact_runtime_status(status_payload) if args.compact else status_payload)
+    else:
+        print_status_text(status_payload)
+    return EXIT_OK
+
+
+def _handle_skills(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    payload = collect_skill_visibility(
+        model,
+        cwd=args.cwd,
+        include_global=not args.no_global,
+        include_project=not args.no_project,
+        include_sources=args.show_sources,
+    )
+    if args.format == "json":
+        emit_json(payload if args.full else compact_skill_visibility_payload(payload))
+    else:
+        print_skill_visibility_text(
+            payload,
+            full=args.full,
+            show_shadowed=args.show_shadowed,
+            issues_only=args.issues_only,
+            limit=max(0, int(args.limit)),
+        )
+    return EXIT_OK
+
+
+def _handle_skill(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    skill_action = str(args.skill_action)
+    dry_run = bool(args.dry_run or skill_action == "plan")
+    if (
+        not dry_run
+        and not bool(getattr(args, "yes", False))
+        and (
+            skill_action in {"move", "remove", "prune"}
+            or (skill_action == "sync" and bool(getattr(args, "prune", False)))
+        )
+    ):
+        raise RuntimeError(
+            f"`skill {skill_action}` may unlink existing installs. "
+            "Re-run with --dry-run to preview or --yes to apply."
+        )
+    payload = skill_lifecycle_plan(
+        model,
+        skill_action,
+        skill_name=getattr(args, "skill_name", None),
+        cwd=args.cwd,
+        to=args.to,
+        categories=getattr(args, "category", []) or [],
+        source=args.source,
+        from_scope=getattr(args, "from_scope", "all"),
+        prune=bool(getattr(args, "prune", False)),
+        force=bool(args.force),
+    )
+    payload = apply_skill_lifecycle_plan(
+        payload,
+        dry_run=dry_run,
+        allow_directories=bool(args.allow_directories),
+        force=bool(args.force),
+    )
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print_skill_lifecycle_text(payload)
+    if not dry_run:
+        problematic = [
+            item for item in payload.get("actions") or []
+            if str(item.get("status") or "").startswith(("blocked", "conflict", "skipped"))
+        ]
+        if problematic:
+            return EXIT_DRIFT
+    return EXIT_OK
+
+
+def _handle_overlay(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    action = str(getattr(args, "action", "list"))
+    name = str(getattr(args, "name", "") or "").strip()
+    if action != "list" and not name:
+        raise RuntimeError(
+            f"overlay {action}: pass an overlay name, e.g. `overlay {action} marketing`."
+        )
+    was_on = name in active_overlays()
+    if action == "on":
+        set_overlay(name, True)
+    elif action == "off":
+        set_overlay(name, False)
+    elif action == "toggle":
+        toggle_overlay(name)
+    current = sorted(active_overlays())
+    now_on = name in current
+    removed: list[str] = []
+    activations: list[dict[str, Any]] = []
+    overlay_cwd = Path(
+        getattr(args, "cwd", None) or os.environ.get("PWD") or os.getcwd()
+    )
+    if name and action == "activate":
+        activations = activate_overlay_scoped_skills(
+            model,
+            name,
+            overlay_cwd,
+            to=str(getattr(args, "to", "project")),
+            categories=getattr(args, "category", []) or [],
+            source=getattr(args, "source", None),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            force=bool(getattr(args, "force", False)),
+        )
+    if (
+        name
+        and (action == "off" or (action == "toggle" and was_on and not now_on))
+        and not now_on
+        and not bool(getattr(args, "keep", False))
+    ):
+        removed = unlink_overlay_scoped_skills(
+            model,
+            name,
+            overlay_cwd,
+            scope=str(getattr(args, "scope", "project")),
+        )
+    if args.format == "json":
+        emit_json({
+            "overlays": current,
+            "action": action,
+            "name": name,
+            "cwd": str(overlay_cwd),
+            "to": getattr(args, "to", "project"),
+            "scope": getattr(args, "scope", "project"),
+            "dry_run": bool(getattr(args, "dry_run", False)),
+            "persistent": action in {"on", "off", "toggle"},
+            "unlinked": removed,
+            "activations": activations,
+        })
+    else:
+        if action == "list":
+            if current:
+                print("overlays on:", ", ".join(current))
+            else:
+                print("overlays: (none)")
+        else:
+            state = "activated" if action == "activate" else ("on" if now_on else "off")
+            print(f"overlay {name}: {state}")
+            if current:
+                print("all on:", ", ".join(current))
+            if removed:
+                print(f"unlinked: {len(removed)} symlinks")
+            if activations:
+                print(f"activated: {len(activations)} skills")
+                for activation in activations:
+                    packet = activation.get("activation_packet")
+                    if not packet:
+                        print(f"activation packet: {activation.get('skill')} unavailable")
+                        continue
+                    print(f"activation packet: {packet.get('name')}")
+                    print(f"source: {packet.get('source')}")
+                    print(f"skill_md_sha256: {packet.get('skill_md_sha256')}")
+                    print("skill_md:")
+                    print(str(packet.get("skill_md") or "").rstrip())
+    return EXIT_OK
+
+
+def _handle_bootstrap(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    sync_actions = sync_runtime(model, dry_run=args.dry_run)
+    requested_tasks = select_tasks(model, getattr(args, "task", []))
+    tasks = resolve_tasks_for_run(model, requested_tasks)
+    if not args.dry_run:
+        ensure_required_env_files_ready(select_env_files_for_tasks(model, tasks))
+    task_results = run_tasks(
+        model,
+        tasks,
+        dry_run=args.dry_run,
+    )
+    payload: dict[str, Any] = {
+        "dry_run": args.dry_run,
+        "sync_actions": sync_actions,
+        "tasks": task_results,
+        "next_actions": next_actions_for_bootstrap(task_results),
+    }
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print_service_actions_text(payload)
+    return EXIT_OK
+
+
+def _check_logs_deferred_surfaces(args: argparse.Namespace, model: dict[str, Any], raw_service_ids: list[str]) -> int | None:
+    """Return EXIT_ERROR after emitting a structured deferred-surface envelope, else None.
+
+    WG-006: for `logs` we must consult the parity ledger before
+    select_services so that unknown-but-declared-deferred surfaces emit
+    LOCAL_RUNTIME_SERVICE_DEFERRED instead of "Unknown service id"
+    (shared.md:174-177, flows.md Flow 5).
+    """
+    if args.command != "logs" or not raw_service_ids:
+        return None
+    logs_classification = classify_requested_surfaces(model, raw_service_ids)
+    if not logs_classification["deferred"]:
+        return None
+    cid_for_logs = args.client[0] if args.client else "personal"
+    profile_for_logs = (
+        args.profile[0]
+        if args.profile
+        else (local_runtime_active_profile(model) or "local-minimal")
+    )
+    surface_id, item = logs_classification["deferred"][0]
+    err_payload = build_local_runtime_service_deferred_error(
+        item,
+        client_id=cid_for_logs,
+        profile=profile_for_logs,
+        surface_id=surface_id,
+    )
+    if args.format == "json":
+        emit_json(err_payload)
+    else:
+        print_local_runtime_error_text(err_payload)
+    return EXIT_ERROR
+
+
+def _handle_up(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    # WG-006: route local-runtime profiles through workflows.run_up so the
+    # parity ledger, bridge reconciliation, mode validation, bootstrap tasks,
+    # and service start all run through a single contract-aware path.
+    # Non-local profiles keep the legacy inline flow to preserve existing
+    # lifecycle test coverage.
+    active_local_profile = local_runtime_active_profile(model)
+    if active_local_profile:
+        client_id_for_up = args.client[0] if args.client else "personal"
+        service_filter = [s for s in (getattr(args, "service", []) or []) if s]
+        up_exit, up_payload = run_up(
+            model=model,
+            client_id=client_id_for_up,
+            profile=active_local_profile,
+            requested_mode=resolved_mode,
+            service_filter=service_filter,
+            dry_run=args.dry_run,
+            wait_seconds=max(0.0, float(args.wait_seconds)),
+        )
+        if args.format == "json":
+            emit_json(up_payload)
+        else:
+            if up_exit != EXIT_OK and "error" in up_payload:
+                print_local_runtime_error_text(up_payload)
+            else:
+                print_service_actions_text(up_payload)
+        return up_exit
+
+    raw_service_ids = [s for s in (getattr(args, "service", []) or []) if s]
+    requested_services = select_services(model, raw_service_ids)
+    bridges = model.get("bridges") or []
+    if bridges and not args.dry_run:
+        for bridge in bridges:
+            state = bridge_outputs_state(bridge)
+            if state["state"] == "missing":
+                err = local_runtime_error(
+                    "LOCAL_RUNTIME_ENV_BRIDGE_FAILED",
+                    f"Bridge {bridge['id']} outputs missing. Run 'manage.py focus' first.",
+                    recoverable=True,
+                    next_action=f"manage.py focus {args.client[0] if args.client else 'personal'} --profile {' --profile '.join(args.profile) if args.profile else 'local-minimal'}",
+                )
+                if args.format == "json":
+                    emit_json(err)
+                else:
+                    print_local_runtime_error_text(err)
+                return EXIT_ERROR
+
+    sync_actions = sync_runtime(model, dry_run=args.dry_run)
+    services = resolve_services_for_start(model, requested_services)
+    bootstrap_tasks = resolve_tasks_for_services(model, services)
+    if not args.dry_run:
+        ensure_required_env_files_ready(
+            select_env_files_for_tasks(model, bootstrap_tasks) + select_env_files_for_services(model, services)
+        )
+    task_results = run_tasks(
+        model,
+        bootstrap_tasks,
+        dry_run=args.dry_run,
+        mode=resolved_mode,
+    )
+    service_results = start_services(
+        model,
+        services,
+        dry_run=args.dry_run,
+        wait_seconds=max(0.0, float(args.wait_seconds)),
+        mode=resolved_mode,
+    )
+    payload = {
+        "dry_run": args.dry_run,
+        "requested_mode": resolved_mode,
+        "effective_mode": resolved_mode,
+        "sync_actions": sync_actions,
+        "bootstrap_tasks": task_results,
+        "services": service_results,
+        "next_actions": next_actions_for_up(service_results),
+    }
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print_service_actions_text(payload)
+    return EXIT_OK
+
+
+def _handle_down(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    raw_service_ids = [s for s in (getattr(args, "service", []) or []) if s]
+    requested_services = select_services(model, raw_service_ids)
+    services = resolve_services_for_stop(model, requested_services)
+    service_results = stop_services(
+        model,
+        services,
+        dry_run=args.dry_run,
+        wait_seconds=max(0.0, float(args.wait_seconds)),
+    )
+    payload = {
+        "dry_run": args.dry_run,
+        "services": service_results,
+        "next_actions": next_actions_for_down(),
+    }
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print_service_actions_text(payload)
+    return EXIT_OK
+
+
+def _handle_restart(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    raw_service_ids = [s for s in (getattr(args, "service", []) or []) if s]
+    requested_services = select_services(model, raw_service_ids)
+    stop_targets = resolve_services_for_stop(model, requested_services)
+    start_targets = resolve_services_for_start(model, stop_targets)
+    bootstrap_tasks = resolve_tasks_for_services(model, start_targets)
+    stop_results = stop_services(
+        model,
+        stop_targets,
+        dry_run=args.dry_run,
+        wait_seconds=max(0.0, float(args.wait_seconds)),
+    )
+    sync_actions = sync_runtime(model, dry_run=args.dry_run)
+    if not args.dry_run:
+        ensure_required_env_files_ready(
+            select_env_files_for_tasks(model, bootstrap_tasks) + select_env_files_for_services(model, start_targets)
+        )
+    task_results = run_tasks(
+        model,
+        bootstrap_tasks,
+        dry_run=args.dry_run,
+    )
+    start_results = start_services(
+        model,
+        start_targets,
+        dry_run=args.dry_run,
+        wait_seconds=max(0.0, float(args.wait_seconds)),
+    )
+    payload = {
+        "dry_run": args.dry_run,
+        "stop_services": stop_results,
+        "sync_actions": sync_actions,
+        "bootstrap_tasks": task_results,
+        "start_services": start_results,
+        "next_actions": next_actions_for_up(start_results),
+    }
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print("stop:")
+        print_service_actions_text({"services": stop_results})
+        print()
+        print_service_actions_text({"sync_actions": sync_actions, "tasks": task_results, "services": start_results})
+    return EXIT_OK
+
+
+def _handle_logs(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    raw_service_ids = [s for s in (getattr(args, "service", []) or []) if s]
+    requested_services = select_services(model, raw_service_ids)
+    logs_payload: dict[str, Any] = {
+        "services": collect_service_logs(
+            model,
+            requested_services,
+            line_count=max(0, int(args.lines)),
+        ),
+        "next_actions": ["status --format json"],
+    }
+    if args.format == "json":
+        emit_json(logs_payload)
+    else:
+        print_service_logs_text(logs_payload)
+    return EXIT_OK
+
+
+_MODEL_DISPATCH: dict[str, Callable[[argparse.Namespace, Path, dict[str, Any], str], int]] = {
+    "render": _handle_render,
+    "sync": _handle_sync,
+    "context": _handle_context,
+    "doctor": _handle_doctor,
+    "status": _handle_status,
+    "skills": _handle_skills,
+    "skill": _handle_skill,
+    "overlay": _handle_overlay,
+    "bootstrap": _handle_bootstrap,
+    "up": _handle_up,
+    "down": _handle_down,
+    "restart": _handle_restart,
+    "logs": _handle_logs,
+}
+
+
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
@@ -1177,6 +1637,11 @@ def main() -> int:
     if early_handler is not None:
         return early_handler(args, root_dir)
 
+    model_handler = _MODEL_DISPATCH.get(args.command)
+    if model_handler is None:
+        print(f"Unknown command: {args.command}", file=sys.stderr)
+        return EXIT_ERROR
+
     try:
         model = build_runtime_model(root_dir)
         active_profiles = normalize_active_profiles(getattr(args, "profile", []))
@@ -1189,438 +1654,12 @@ def main() -> int:
                 active_clients = normalize_active_clients(model, [matches[0]["id"]])
         model = filter_model(model, active_profiles, active_clients)
 
-        if args.command == "render":
-            if args.format == "json":
-                emit_json(model)
-            else:
-                print_render_text(model)
-            return EXIT_OK
+        raw_service_ids = [s for s in (getattr(args, "service", []) or []) if s]
+        deferred_exit = _check_logs_deferred_surfaces(args, model, raw_service_ids)
+        if deferred_exit is not None:
+            return deferred_exit
 
-        if args.command == "sync":
-            actions = sync_runtime(model, dry_run=args.dry_run)
-            actions.extend(
-                sync_context(
-                    model,
-                    root_dir,
-                    dry_run=args.dry_run,
-                    context_dir=resolve_context_dir(root_dir, getattr(args, "context_dir", None)),
-                )
-            )
-            if args.format == "json":
-                emit_json({"actions": actions, "dry_run": args.dry_run, "next_actions": next_actions_for_sync()})
-            else:
-                print("\n".join(actions))
-            return EXIT_OK
-
-        if args.command == "context":
-            actions = sync_context(
-                model,
-                root_dir,
-                dry_run=args.dry_run,
-                context_dir=resolve_context_dir(root_dir, getattr(args, "context_dir", None)),
-            )
-            if args.format == "json":
-                emit_json({"actions": actions, "dry_run": args.dry_run, "next_actions": next_actions_for_context()})
-            else:
-                print("\n".join(actions))
-            return EXIT_OK
-
-        if args.command == "doctor":
-            results = doctor_results(model, root_dir)
-            has_fail = any(result.status == "fail" for result in results)
-            has_warn = any(result.status == "warn" for result in results)
-            if args.format == "json":
-                emit_json({
-                    "checks": [asdict(result) for result in results],
-                    "next_actions": next_actions_for_doctor(results),
-                })
-            else:
-                print_doctor_text(results)
-            if has_fail:
-                return EXIT_DRIFT
-            return EXIT_OK
-
-        if args.command == "status":
-            status_payload = runtime_status(model)
-            if args.format == "json":
-                status_payload["next_actions"] = next_actions_for_status(status_payload)
-                emit_json(compact_runtime_status(status_payload) if args.compact else status_payload)
-            else:
-                print_status_text(status_payload)
-            return EXIT_OK
-
-        if args.command == "skills":
-            payload = collect_skill_visibility(
-                model,
-                cwd=args.cwd,
-                include_global=not args.no_global,
-                include_project=not args.no_project,
-                include_sources=args.show_sources,
-            )
-            if args.format == "json":
-                emit_json(payload if args.full else compact_skill_visibility_payload(payload))
-            else:
-                print_skill_visibility_text(
-                    payload,
-                    full=args.full,
-                    show_shadowed=args.show_shadowed,
-                    issues_only=args.issues_only,
-                    limit=max(0, int(args.limit)),
-                )
-            return EXIT_OK
-
-        if args.command == "skill":
-            skill_action = str(args.skill_action)
-            dry_run = bool(args.dry_run or skill_action == "plan")
-            if (
-                not dry_run
-                and not bool(getattr(args, "yes", False))
-                and (
-                    skill_action in {"move", "remove", "prune"}
-                    or (skill_action == "sync" and bool(getattr(args, "prune", False)))
-                )
-            ):
-                raise RuntimeError(
-                    f"`skill {skill_action}` may unlink existing installs. "
-                    "Re-run with --dry-run to preview or --yes to apply."
-                )
-            payload = skill_lifecycle_plan(
-                model,
-                skill_action,
-                skill_name=getattr(args, "skill_name", None),
-                cwd=args.cwd,
-                to=args.to,
-                categories=getattr(args, "category", []) or [],
-                source=args.source,
-                from_scope=getattr(args, "from_scope", "all"),
-                prune=bool(getattr(args, "prune", False)),
-                force=bool(args.force),
-            )
-            payload = apply_skill_lifecycle_plan(
-                payload,
-                dry_run=dry_run,
-                allow_directories=bool(args.allow_directories),
-                force=bool(args.force),
-            )
-            if args.format == "json":
-                emit_json(payload)
-            else:
-                print_skill_lifecycle_text(payload)
-            if not dry_run:
-                problematic = [
-                    item for item in payload.get("actions") or []
-                    if str(item.get("status") or "").startswith(("blocked", "conflict", "skipped"))
-                ]
-                if problematic:
-                    return EXIT_DRIFT
-            return EXIT_OK
-
-        if args.command == "overlay":
-            action = str(getattr(args, "action", "list"))
-            name = str(getattr(args, "name", "") or "").strip()
-            if action != "list" and not name:
-                raise RuntimeError(
-                    f"overlay {action}: pass an overlay name, e.g. `overlay {action} marketing`."
-                )
-            was_on = name in active_overlays()
-            if action == "on":
-                set_overlay(name, True)
-            elif action == "off":
-                set_overlay(name, False)
-            elif action == "toggle":
-                toggle_overlay(name)
-            current = sorted(active_overlays())
-            now_on = name in current
-            removed: list[str] = []
-            activations: list[dict[str, Any]] = []
-            overlay_cwd = Path(
-                getattr(args, "cwd", None) or os.environ.get("PWD") or os.getcwd()
-            )
-            if name and action == "activate":
-                activations = activate_overlay_scoped_skills(
-                    model,
-                    name,
-                    overlay_cwd,
-                    to=str(getattr(args, "to", "project")),
-                    categories=getattr(args, "category", []) or [],
-                    source=getattr(args, "source", None),
-                    dry_run=bool(getattr(args, "dry_run", False)),
-                    force=bool(getattr(args, "force", False)),
-                )
-            if (
-                name
-                and (action == "off" or (action == "toggle" and was_on and not now_on))
-                and not now_on
-                and not bool(getattr(args, "keep", False))
-            ):
-                removed = unlink_overlay_scoped_skills(
-                    model,
-                    name,
-                    overlay_cwd,
-                    scope=str(getattr(args, "scope", "project")),
-                )
-            if args.format == "json":
-                emit_json({
-                    "overlays": current,
-                    "action": action,
-                    "name": name,
-                    "cwd": str(overlay_cwd),
-                    "to": getattr(args, "to", "project"),
-                    "scope": getattr(args, "scope", "project"),
-                    "dry_run": bool(getattr(args, "dry_run", False)),
-                    "persistent": action in {"on", "off", "toggle"},
-                    "unlinked": removed,
-                    "activations": activations,
-                })
-            else:
-                if action == "list":
-                    if current:
-                        print("overlays on:", ", ".join(current))
-                    else:
-                        print("overlays: (none)")
-                else:
-                    state = "activated" if action == "activate" else ("on" if now_on else "off")
-                    print(f"overlay {name}: {state}")
-                    if current:
-                        print("all on:", ", ".join(current))
-                    if removed:
-                        print(f"unlinked: {len(removed)} symlinks")
-                    if activations:
-                        print(f"activated: {len(activations)} skills")
-                        for activation in activations:
-                            packet = activation.get("activation_packet")
-                            if not packet:
-                                print(f"activation packet: {activation.get('skill')} unavailable")
-                                continue
-                            print(f"activation packet: {packet.get('name')}")
-                            print(f"source: {packet.get('source')}")
-                            print(f"skill_md_sha256: {packet.get('skill_md_sha256')}")
-                            print("skill_md:")
-                            print(str(packet.get("skill_md") or "").rstrip())
-            return EXIT_OK
-
-        if args.command == "bootstrap":
-            sync_actions = sync_runtime(model, dry_run=args.dry_run)
-            requested_tasks = select_tasks(model, getattr(args, "task", []))
-            tasks = resolve_tasks_for_run(model, requested_tasks)
-            if not args.dry_run:
-                ensure_required_env_files_ready(select_env_files_for_tasks(model, tasks))
-            task_results = run_tasks(
-                model,
-                tasks,
-                dry_run=args.dry_run,
-            )
-            payload: dict[str, Any] = {
-                "dry_run": args.dry_run,
-                "sync_actions": sync_actions,
-                "tasks": task_results,
-                "next_actions": next_actions_for_bootstrap(task_results),
-            }
-            if args.format == "json":
-                emit_json(payload)
-            else:
-                print_service_actions_text(payload)
-            return EXIT_OK
-
-        # WG-006: for logs we must consult the parity ledger BEFORE
-        # select_services -- unknown-but-declared-deferred surfaces would
-        # otherwise raise "Unknown service id" and miss the
-        # LOCAL_RUNTIME_SERVICE_DEFERRED contract (shared.md:174-177,
-        # flows.md Flow 5).  We split requested ids into (covered, deferred,
-        # unknown); if any are deferred we short-circuit.
-        raw_service_ids = [
-            s for s in (getattr(args, "service", []) or []) if s
-        ]
-        if args.command == "logs" and raw_service_ids:
-            logs_classification = classify_requested_surfaces(
-                model, raw_service_ids
-            )
-            if logs_classification["deferred"]:
-                cid_for_logs = args.client[0] if args.client else "personal"
-                profile_for_logs = (
-                    args.profile[0]
-                    if args.profile
-                    else (local_runtime_active_profile(model) or "local-minimal")
-                )
-                surface_id, item = logs_classification["deferred"][0]
-                err_payload = build_local_runtime_service_deferred_error(
-                    item,
-                    client_id=cid_for_logs,
-                    profile=profile_for_logs,
-                    surface_id=surface_id,
-                )
-                if args.format == "json":
-                    emit_json(err_payload)
-                else:
-                    print_local_runtime_error_text(err_payload)
-                return EXIT_ERROR
-
-        if args.command == "up":
-            # WG-006: route local-runtime profiles through workflows.run_up
-            # so the parity ledger, bridge reconciliation, mode validation,
-            # bootstrap tasks, and service start all run through a single
-            # contract-aware path.  Non-local profiles keep using the legacy
-            # inline flow to preserve existing lifecycle test coverage.
-            active_local_profile = local_runtime_active_profile(model)
-            if active_local_profile:
-                client_id_for_up = args.client[0] if args.client else "personal"
-                service_filter = [
-                    s for s in (getattr(args, "service", []) or []) if s
-                ]
-                up_exit, up_payload = run_up(
-                    model=model,
-                    client_id=client_id_for_up,
-                    profile=active_local_profile,
-                    requested_mode=resolved_mode,
-                    service_filter=service_filter,
-                    dry_run=args.dry_run,
-                    wait_seconds=max(0.0, float(args.wait_seconds)),
-                )
-                if args.format == "json":
-                    emit_json(up_payload)
-                else:
-                    if up_exit != EXIT_OK and "error" in up_payload:
-                        print_local_runtime_error_text(up_payload)
-                    else:
-                        print_service_actions_text(up_payload)
-                return up_exit
-
-            # --- Legacy (non local-runtime) path ---------------------------
-            # WG-006 keeps the pre-existing inline up pipeline alive for
-            # profiles that are not part of the local_runtime_core_cutover
-            # contract.  Parity-ledger classification still runs above via
-            # the shared intercept.
-            requested_services = select_services(model, raw_service_ids)
-            bridges = model.get("bridges") or []
-            if bridges and not args.dry_run:
-                for bridge in bridges:
-                    state = bridge_outputs_state(bridge)
-                    if state["state"] == "missing":
-                        err = local_runtime_error(
-                            "LOCAL_RUNTIME_ENV_BRIDGE_FAILED",
-                            f"Bridge {bridge['id']} outputs missing. Run 'manage.py focus' first.",
-                            recoverable=True,
-                            next_action=f"manage.py focus {args.client[0] if args.client else 'personal'} --profile {' --profile '.join(args.profile) if args.profile else 'local-minimal'}",
-                        )
-                        if args.format == "json":
-                            emit_json(err)
-                        else:
-                            print_local_runtime_error_text(err)
-                        return EXIT_ERROR
-
-            sync_actions = sync_runtime(model, dry_run=args.dry_run)
-            services = resolve_services_for_start(model, requested_services)
-            bootstrap_tasks = resolve_tasks_for_services(model, services)
-            if not args.dry_run:
-                ensure_required_env_files_ready(
-                    select_env_files_for_tasks(model, bootstrap_tasks) + select_env_files_for_services(model, services)
-                )
-            task_results = run_tasks(
-                model,
-                bootstrap_tasks,
-                dry_run=args.dry_run,
-                mode=resolved_mode,
-            )
-            service_results = start_services(
-                model,
-                services,
-                dry_run=args.dry_run,
-                wait_seconds=max(0.0, float(args.wait_seconds)),
-                mode=resolved_mode,
-            )
-            effective_mode = resolved_mode
-            payload = {
-                "dry_run": args.dry_run,
-                "requested_mode": resolved_mode,
-                "effective_mode": effective_mode,
-                "sync_actions": sync_actions,
-                "bootstrap_tasks": task_results,
-                "services": service_results,
-                "next_actions": next_actions_for_up(service_results),
-            }
-            if args.format == "json":
-                emit_json(payload)
-            else:
-                print_service_actions_text(payload)
-            return EXIT_OK
-
-        requested_services = select_services(model, raw_service_ids)
-
-        if args.command == "down":
-            services = resolve_services_for_stop(model, requested_services)
-            service_results = stop_services(
-                model,
-                services,
-                dry_run=args.dry_run,
-                wait_seconds=max(0.0, float(args.wait_seconds)),
-            )
-            payload = {
-                "dry_run": args.dry_run,
-                "services": service_results,
-                "next_actions": next_actions_for_down(),
-            }
-            if args.format == "json":
-                emit_json(payload)
-            else:
-                print_service_actions_text(payload)
-            return EXIT_OK
-
-        if args.command == "restart":
-            stop_targets = resolve_services_for_stop(model, requested_services)
-            start_targets = resolve_services_for_start(model, stop_targets)
-            bootstrap_tasks = resolve_tasks_for_services(model, start_targets)
-            stop_results = stop_services(
-                model,
-                stop_targets,
-                dry_run=args.dry_run,
-                wait_seconds=max(0.0, float(args.wait_seconds)),
-            )
-            sync_actions = sync_runtime(model, dry_run=args.dry_run)
-            if not args.dry_run:
-                ensure_required_env_files_ready(
-                    select_env_files_for_tasks(model, bootstrap_tasks) + select_env_files_for_services(model, start_targets)
-                )
-            task_results = run_tasks(
-                model,
-                bootstrap_tasks,
-                dry_run=args.dry_run,
-            )
-            start_results = start_services(
-                model,
-                start_targets,
-                dry_run=args.dry_run,
-                wait_seconds=max(0.0, float(args.wait_seconds)),
-            )
-            payload = {
-                "dry_run": args.dry_run,
-                "stop_services": stop_results,
-                "sync_actions": sync_actions,
-                "bootstrap_tasks": task_results,
-                "start_services": start_results,
-                "next_actions": next_actions_for_up(start_results),
-            }
-            if args.format == "json":
-                emit_json(payload)
-            else:
-                print("stop:")
-                print_service_actions_text({"services": stop_results})
-                print()
-                print_service_actions_text({"sync_actions": sync_actions, "tasks": task_results, "services": start_results})
-            return EXIT_OK
-
-        logs_payload: dict[str, Any] = {
-            "services": collect_service_logs(
-                model,
-                requested_services,
-                line_count=max(0, int(args.lines)),
-            ),
-            "next_actions": ["status --format json"],
-        }
-        if args.format == "json":
-            emit_json(logs_payload)
-        else:
-            print_service_logs_text(logs_payload)
-        return EXIT_OK
+        return model_handler(args, root_dir, model, resolved_mode)
     except RuntimeError as exc:
         if args.format == "json":
             emit_json(classify_error(exc, args.command))
