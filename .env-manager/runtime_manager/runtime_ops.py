@@ -312,238 +312,182 @@ def env_file_state(env_file: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def check_filesystem(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
-    results: list[CheckResult] = []
-    missing_syncable_repo_paths: list[str] = []
-    missing_required_repo_paths: list[str] = []
-    missing_syncable_artifact_paths: list[str] = []
-    stale_syncable_artifact_paths: list[str] = []
-    missing_required_artifact_paths: list[str] = []
-    syncable_env_files: list[str] = []
-    missing_required_env_sources: list[str] = []
-    missing_required_env_targets: list[str] = []
-    missing_log_paths: list[str] = []
-    missing_required_checks: list[str] = []
-    bridge_output_paths = {
-        str(path.resolve())
-        for bridge in model.get("bridges") or []
-        for path in bridge_expected_outputs(bridge)
-    }
-
+def _scan_repo_paths(model: dict[str, Any], root_dir: Path) -> tuple[list[str], list[str]]:
+    missing_syncable: list[str] = []
+    missing_required: list[str] = []
     for repo in model["repos"]:
         path = Path(str(repo["host_path"]))
         if path.exists():
             continue
-
         source = repo.get("source") or {}
         source_kind = source.get("kind", "manual")
         sync = repo.get("sync") or {}
         sync_mode = sync.get("mode") or (
             "ensure-directory" if source_kind == "directory" else "external"
         )
-
         if sync_mode in {"ensure-directory", "clone-if-missing"} or source_kind in {"directory", "git"}:
-            missing_syncable_repo_paths.append(repo_rel(root_dir, path))
+            missing_syncable.append(repo_rel(root_dir, path))
         elif repo.get("required"):
-            missing_required_repo_paths.append(repo_rel(root_dir, path))
+            missing_required.append(repo_rel(root_dir, path))
+    return missing_syncable, missing_required
 
+
+def _scan_artifact_paths(model: dict[str, Any], root_dir: Path) -> tuple[list[str], list[str], list[str]]:
+    missing_syncable: list[str] = []
+    stale_syncable: list[str] = []
+    missing_required: list[str] = []
     for artifact in model["artifacts"]:
         state = artifact_state(artifact)
         display_path = repo_rel(root_dir, Path(state["host_path"]))
-
         if state["state"] == "missing":
             if state["syncable"]:
-                missing_syncable_artifact_paths.append(display_path)
+                missing_syncable.append(display_path)
             elif artifact.get("required"):
-                missing_required_artifact_paths.append(display_path)
+                missing_required.append(display_path)
         elif state["state"] == "stale" and state["syncable"]:
-            stale_syncable_artifact_paths.append(display_path)
+            stale_syncable.append(display_path)
+    return missing_syncable, stale_syncable, missing_required
 
+
+def _scan_env_file_paths(
+    model: dict[str, Any], root_dir: Path, bridge_output_paths: set[str],
+) -> tuple[list[str], list[str], list[str]]:
+    syncable: list[str] = []
+    missing_sources: list[str] = []
+    missing_targets: list[str] = []
     for env_file in model["env_files"]:
         state = env_file_state(env_file)
         display_path = repo_rel(root_dir, Path(state["host_path"]))
         if state["state"] == "source-missing":
-            if env_file.get("required"):
-                source_host_path = str(Path(state["source_host_path"]).resolve()) if state["source_host_path"] else ""
-                if source_host_path and source_host_path in bridge_output_paths:
-                    continue
-                if state["source_host_path"]:
-                    missing_required_env_sources.append(repo_rel(root_dir, Path(state["source_host_path"])))
-                else:
-                    missing_required_env_sources.append(state["source_path"] or display_path)
+            if not env_file.get("required"):
+                continue
+            source_host_path = (
+                str(Path(state["source_host_path"]).resolve())
+                if state["source_host_path"] else ""
+            )
+            if source_host_path and source_host_path in bridge_output_paths:
+                continue
+            if state["source_host_path"]:
+                missing_sources.append(repo_rel(root_dir, Path(state["source_host_path"])))
+            else:
+                missing_sources.append(state["source_path"] or display_path)
         elif state["state"] in {"missing", "stale"}:
             if state["syncable"]:
-                syncable_env_files.append(display_path)
+                syncable.append(display_path)
             elif env_file.get("required"):
-                missing_required_env_targets.append(display_path)
+                missing_targets.append(display_path)
+    return syncable, missing_sources, missing_targets
 
-    for log_item in model["logs"]:
-        path = Path(str(log_item["host_path"]))
-        if not path.exists():
-            missing_log_paths.append(repo_rel(root_dir, path))
 
+def _scan_log_paths(model: dict[str, Any], root_dir: Path) -> list[str]:
+    return [
+        repo_rel(root_dir, Path(str(log_item["host_path"])))
+        for log_item in model["logs"]
+        if not Path(str(log_item["host_path"])).exists()
+    ]
+
+
+def _scan_check_paths(model: dict[str, Any], root_dir: Path) -> list[str]:
+    missing: list[str] = []
     for check in model["checks"]:
         if check.get("type") != "path_exists":
             continue
         path = Path(str(check["host_path"]))
         if not path.exists() and check.get("required"):
-            missing_required_checks.append(repo_rel(root_dir, path))
+            missing.append(repo_rel(root_dir, path))
+    return missing
 
-    if missing_required_repo_paths:
-        results.append(
-            CheckResult(
-                status="fail",
-                code="required-runtime-paths",
-                message="required runtime repo paths are missing",
-                details={"missing": missing_required_repo_paths},
-            )
-        )
-    else:
-        results.append(
-            CheckResult(
-                status="pass",
-                code="required-runtime-paths",
-                message="required runtime repo paths are present",
-            )
-        )
 
-    if missing_syncable_repo_paths:
-        results.append(
-            CheckResult(
-                status="warn",
-                code="syncable-repo-paths",
-                message="managed repo paths are missing but can be created by sync",
-                details={"missing": missing_syncable_repo_paths},
-            )
-        )
-    else:
-        results.append(
-            CheckResult(
-                status="pass",
-                code="syncable-repo-paths",
-                message="managed repo paths do not need sync",
-            )
-        )
+def _filesystem_check_result(
+    code: str,
+    fail_status: str,
+    fail_msg: str,
+    pass_msg: str,
+    details: dict[str, Any] | None,
+) -> CheckResult:
+    """Build pass result when details is empty/None, otherwise fail/warn with details."""
+    if not details:
+        return CheckResult(status="pass", code=code, message=pass_msg)
+    return CheckResult(status=fail_status, code=code, message=fail_msg, details=details)
 
-    if missing_required_artifact_paths:
-        results.append(
-            CheckResult(
-                status="fail",
-                code="required-runtime-artifacts",
-                message="required runtime artifact paths are missing",
-                details={"missing": missing_required_artifact_paths},
-            )
-        )
-    else:
-        results.append(
-            CheckResult(
-                status="pass",
-                code="required-runtime-artifacts",
-                message="required runtime artifact paths are present",
-            )
-        )
 
-    if missing_syncable_artifact_paths or stale_syncable_artifact_paths:
-        details: dict[str, Any] = {}
-        if missing_syncable_artifact_paths:
-            details["missing"] = missing_syncable_artifact_paths
-        if stale_syncable_artifact_paths:
-            details["stale"] = stale_syncable_artifact_paths
-        results.append(
-            CheckResult(
-                status="warn",
-                code="syncable-artifact-paths",
-                message="managed artifact paths are missing or stale but can be reconciled by sync",
-                details=details,
-            )
-        )
-    else:
-        results.append(
-            CheckResult(
-                status="pass",
-                code="syncable-artifact-paths",
-                message="managed artifact paths do not need sync",
-            )
-        )
+def check_filesystem(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
+    bridge_output_paths = {
+        str(path.resolve())
+        for bridge in model.get("bridges") or []
+        for path in bridge_expected_outputs(bridge)
+    }
 
-    if missing_required_env_sources or missing_required_env_targets:
-        details: dict[str, Any] = {}
-        if missing_required_env_sources:
-            details["missing_sources"] = missing_required_env_sources
-        if missing_required_env_targets:
-            details["missing_targets"] = missing_required_env_targets
-        results.append(
-            CheckResult(
-                status="fail",
-                code="required-runtime-env-files",
-                message="required runtime env files cannot be materialized",
-                details=details,
-            )
-        )
-    else:
-        results.append(
-            CheckResult(
-                status="pass",
-                code="required-runtime-env-files",
-                message="required runtime env files are materialized or source-backed",
-            )
-        )
+    syncable_repos, required_repos = _scan_repo_paths(model, root_dir)
+    syncable_artifacts, stale_artifacts, required_artifacts = _scan_artifact_paths(model, root_dir)
+    syncable_env_files, missing_env_sources, missing_env_targets = _scan_env_file_paths(
+        model, root_dir, bridge_output_paths,
+    )
+    missing_logs = _scan_log_paths(model, root_dir)
+    missing_checks = _scan_check_paths(model, root_dir)
 
-    if syncable_env_files:
-        results.append(
-            CheckResult(
-                status="warn",
-                code="syncable-env-files",
-                message="managed env files are missing or stale but can be materialized by sync",
-                details={"targets": syncable_env_files},
-            )
-        )
-    else:
-        results.append(
-            CheckResult(
-                status="pass",
-                code="syncable-env-files",
-                message="managed env files do not need sync",
-            )
-        )
+    artifact_warn_details: dict[str, Any] = {}
+    if syncable_artifacts:
+        artifact_warn_details["missing"] = syncable_artifacts
+    if stale_artifacts:
+        artifact_warn_details["stale"] = stale_artifacts
 
-    if missing_log_paths:
-        results.append(
-            CheckResult(
-                status="warn",
-                code="runtime-log-paths",
-                message="managed log directories are missing but can be created by sync",
-                details={"missing": missing_log_paths},
-            )
-        )
-    else:
-        results.append(
-            CheckResult(
-                status="pass",
-                code="runtime-log-paths",
-                message="managed log directories are present",
-            )
-        )
+    env_fail_details: dict[str, Any] = {}
+    if missing_env_sources:
+        env_fail_details["missing_sources"] = missing_env_sources
+    if missing_env_targets:
+        env_fail_details["missing_targets"] = missing_env_targets
 
-    if missing_required_checks:
-        results.append(
-            CheckResult(
-                status="fail",
-                code="required-runtime-checks",
-                message="required runtime checks failed",
-                details={"missing": missing_required_checks},
-            )
-        )
-    else:
-        results.append(
-            CheckResult(
-                status="pass",
-                code="required-runtime-checks",
-                message="required runtime checks passed",
-            )
-        )
-
-    return results
+    return [
+        _filesystem_check_result(
+            "required-runtime-paths", "fail",
+            "required runtime repo paths are missing",
+            "required runtime repo paths are present",
+            {"missing": required_repos} if required_repos else None,
+        ),
+        _filesystem_check_result(
+            "syncable-repo-paths", "warn",
+            "managed repo paths are missing but can be created by sync",
+            "managed repo paths do not need sync",
+            {"missing": syncable_repos} if syncable_repos else None,
+        ),
+        _filesystem_check_result(
+            "required-runtime-artifacts", "fail",
+            "required runtime artifact paths are missing",
+            "required runtime artifact paths are present",
+            {"missing": required_artifacts} if required_artifacts else None,
+        ),
+        _filesystem_check_result(
+            "syncable-artifact-paths", "warn",
+            "managed artifact paths are missing or stale but can be reconciled by sync",
+            "managed artifact paths do not need sync",
+            artifact_warn_details or None,
+        ),
+        _filesystem_check_result(
+            "required-runtime-env-files", "fail",
+            "required runtime env files cannot be materialized",
+            "required runtime env files are materialized or source-backed",
+            env_fail_details or None,
+        ),
+        _filesystem_check_result(
+            "syncable-env-files", "warn",
+            "managed env files are missing or stale but can be materialized by sync",
+            "managed env files do not need sync",
+            {"targets": syncable_env_files} if syncable_env_files else None,
+        ),
+        _filesystem_check_result(
+            "runtime-log-paths", "warn",
+            "managed log directories are missing but can be created by sync",
+            "managed log directories are present",
+            {"missing": missing_logs} if missing_logs else None,
+        ),
+        _filesystem_check_result(
+            "required-runtime-checks", "fail",
+            "required runtime checks failed",
+            "required runtime checks passed",
+            {"missing": missing_checks} if missing_checks else None,
+        ),
+    ]
 
 
 def validate_task_state(model: dict[str, Any]) -> list[CheckResult]:
