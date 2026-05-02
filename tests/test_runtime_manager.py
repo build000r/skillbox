@@ -6032,6 +6032,133 @@ class RuntimeManagerTests(unittest.TestCase):
                 {"internal-env-manager", "cm-mcp", "fwc-mcp", "dcg-mcp"},
             )
 
+    def test_stewardship_report_json_summarizes_risks_and_unknowns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            shutil.rmtree(repo / ".skillbox-state" / "monoserver")
+            runtime_log_dir = repo / ".skillbox-state" / "logs" / "runtime"
+            runtime_log_dir.mkdir(parents=True, exist_ok=True)
+            (runtime_log_dir / "runtime.log").write_text(
+                "INFO starting\n"
+                "ERROR database connection failed\n",
+                encoding="utf-8",
+            )
+
+            result = self._run(repo, "stewardship-report", "personal", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["version"], 1)
+            self.assertEqual(payload["client_id"], "personal")
+            self.assertEqual(payload["active_profiles"], ["core"])
+            self.assertIn("generated_at", payload)
+            self.assertIn("focus", payload)
+            self.assertIn("health", payload)
+            self.assertIn("evidence", payload)
+            self.assertIn("risks", payload)
+            self.assertIn("next_recommendation", payload)
+
+            risk_ids = {risk["id"] for risk in payload["risks"]}
+            self.assertIn("failing-checks", risk_ids)
+            self.assertIn("recent-log-errors", risk_ids)
+            self.assertIn("focus-not-current", risk_ids)
+            self.assertIn("pulse-not-observed", risk_ids)
+
+            unknown_ids = {item["id"] for item in payload["not_assessed"]}
+            self.assertEqual(unknown_ids, {"backup-recovery", "cost-review"})
+
+    def test_stewardship_report_includes_recent_session_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            started = self._run(
+                repo,
+                "session-start",
+                "personal",
+                "--label",
+                "Hardening run",
+                "--goal",
+                "Produce stewardship packet",
+                "--format",
+                "json",
+            )
+            session_id = json.loads(started.stdout)["session"]["session_id"]
+            self._run(
+                repo,
+                "session-event",
+                "personal",
+                "--session-id",
+                session_id,
+                "--event-type",
+                "note",
+                "--message",
+                "Collected runtime evidence",
+                "--format",
+                "json",
+            )
+
+            result = self._run(repo, "stewardship-report", "personal", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            sessions = payload["evidence"]["sessions"]
+            self.assertEqual(sessions["count"], 1)
+            self.assertEqual(sessions["recent"][0]["session_id"], session_id)
+            self.assertEqual(sessions["recent"][0]["label"], "Hardening run")
+            self.assertEqual(sessions["recent"][0]["last_event_type"], "session.note")
+
+    def test_stewardship_report_writes_markdown_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(
+                repo,
+                "stewardship-report",
+                "personal",
+                "--format",
+                "md",
+                "--write",
+                "--output-dir",
+                "./reports",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("# Stewardship Report: personal", result.stdout)
+            report_files = sorted((repo / "reports").glob("personal-stewardship-*.md"))
+            self.assertEqual(len(report_files), 1)
+            content = report_files[0].read_text(encoding="utf-8")
+            self.assertIn("## Risks", content)
+            self.assertIn("## Not Assessed", content)
+            self.assertIn("backup-recovery", content)
+
+    def test_stewardship_report_supports_client_flag_and_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._write_connector_focus_artifacts(repo)
+
+            result = self._run(
+                repo,
+                "stewardship-report",
+                "--client",
+                "personal",
+                "--profile",
+                "connectors",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["client_id"], "personal")
+            self.assertEqual(payload["active_profiles"], ["connectors", "core"])
+            self.assertTrue(
+                any(action.startswith("stewardship-report personal --profile connectors") for action in payload["next_actions"])
+            )
+
     def test_acceptance_succeeds_for_onboarded_core_client(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)

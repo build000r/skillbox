@@ -625,6 +625,30 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_service_arg(focus_parser)
     _add_context_dir_arg(focus_parser)
 
+    stewardship_parser = subparsers.add_parser(
+        "stewardship-report",
+        help="Summarize current operator evidence, risks, and unassessed hardening gaps for a client.",
+    )
+    stewardship_parser.add_argument(
+        "client_id",
+        nargs="?",
+        default="",
+        help="Existing client slug to report on (e.g. 'personal').",
+    )
+    stewardship_parser.add_argument("--format", choices=("text", "json", "md"), default="text")
+    stewardship_parser.add_argument(
+        "--write",
+        action="store_true",
+        help="Write the report artifact into the client report directory.",
+    )
+    stewardship_parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory for report artifacts. Defaults to the client reports/stewardship directory when --write is used.",
+    )
+    _add_profile_arg(stewardship_parser)
+    _add_client_arg(stewardship_parser)
+
     session_start_parser = subparsers.add_parser(
         "session-start",
         help="Create a durable client-scoped session ledger with metadata and append-only events.",
@@ -996,6 +1020,25 @@ def _handle_focus(args: argparse.Namespace, root_dir: Path) -> int:
     )
 
 
+def _handle_stewardship_report(args: argparse.Namespace, root_dir: Path) -> int:
+    cid = args.client_id or ""
+    if not cid:
+        client_flags = getattr(args, "client", []) or []
+        if client_flags:
+            cid = str(client_flags[0]).strip()
+    if not cid:
+        print("stewardship-report requires a client_id or --client.", file=sys.stderr)
+        return EXIT_ERROR
+    return run_stewardship_report(
+        root_dir=root_dir,
+        client_id=cid,
+        profiles=args.profile,
+        fmt=args.format,
+        write=bool(args.write),
+        output_dir_arg=args.output_dir,
+    )
+
+
 def _handle_session_start(args: argparse.Namespace, root_dir: Path) -> int:
     try:
         payload = start_client_session(
@@ -1151,6 +1194,7 @@ _EARLY_DISPATCH: dict[str, Callable[[argparse.Namespace, Path], int]] = {
     "client-publish": _handle_client_publish,
     "client-diff": _handle_client_diff,
     "focus": _handle_focus,
+    "stewardship-report": _handle_stewardship_report,
     "session-start": _handle_session_start,
     "session-event": _handle_session_event,
     "session-end": _handle_session_end,
