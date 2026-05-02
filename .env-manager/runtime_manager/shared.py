@@ -2675,6 +2675,124 @@ def _clone_or_fetch_repo(
     return ("cloned", clone_path, commit)
 
 
+def _resolve_skill_repo_entry_source(
+    entry: dict[str, Any],
+    config_path: Path,
+    clone_root: Path,
+    skillset: dict[str, Any],
+    dry_run: bool,
+    actions: list[str],
+) -> tuple[Path, str, str | None, str | None] | None:
+    """Resolve an entry to (source_root, repo_name, repo, commit) or None to skip."""
+    if entry.get("repo"):
+        repo = entry["repo"]
+        ref = entry["ref"]
+        action, clone_path, commit = _clone_or_fetch_repo(repo, ref, clone_root, dry_run=dry_run)
+        actions.append(f"skill-repo-{action}: {repo}")
+        if action == "SKILL_REPO_DIRTY":
+            actions.append(f"SKILL_REPO_DIRTY: {repo} — skipping (uncommitted changes)")
+            return None
+        repo_name = repo.split("/")[-1] if "/" in repo else repo
+        if not clone_path.is_dir():
+            pick = entry.get("pick") or [repo_name]
+            for skill_name in pick:
+                for target in skillset.get("install_targets") or []:
+                    target_root = Path(str(target["host_path"]))
+                    actions.append(f"install-skill: {skill_name} -> {target_root / skill_name}")
+            return None
+        return clone_path, repo_name, repo, commit
+
+    local_path = entry["path"]
+    source_root = (
+        Path(local_path) if Path(local_path).is_absolute()
+        else (config_path.parent / local_path).resolve()
+    )
+    if not source_root.is_dir():
+        if dry_run:
+            actions.append(f"skip-local-path: {source_root} (not found)")
+            return None
+        raise RuntimeError(f"SKILL_CONFIG_INVALID: local path does not exist: {source_root}")
+    return source_root, source_root.name, None, None
+
+
+def _install_skill_to_targets(
+    skillset: dict[str, Any],
+    skill_name: str,
+    skill_source: Path,
+    dry_run: bool,
+    actions: list[str],
+) -> dict[str, str]:
+    """Filtered-copy a skill into every install target. Returns target_id -> tree_sha."""
+    install_tree_shas: dict[str, str] = {}
+    for target in skillset.get("install_targets") or []:
+        target_root = Path(str(target["host_path"]))
+        install_dir = target_root / skill_name
+        if dry_run:
+            actions.append(f"install-skill: {skill_name} -> {install_dir}")
+            continue
+        tree_sha = filtered_copy_skill(skill_source, install_dir)
+        install_tree_shas[target["id"]] = tree_sha
+        actions.append(f"install-skill: {skill_name} -> {install_dir}")
+    return install_tree_shas
+
+
+def _build_lock_skill_entry(
+    skill_name: str,
+    entry: dict[str, Any],
+    repo: str | None,
+    commit: str | None,
+    install_tree_shas: dict[str, str],
+    dry_run: bool,
+) -> dict[str, Any]:
+    lock_entry: dict[str, Any] = {
+        "name": skill_name,
+        "declared_ref": entry.get("ref"),
+        "resolved_commit": commit,
+    }
+    if repo:
+        lock_entry["repo"] = repo
+    else:
+        lock_entry["source_path"] = str(entry.get("path", ""))
+    if not dry_run and install_tree_shas:
+        first_target = next(iter(install_tree_shas))
+        lock_entry["install_tree_sha"] = install_tree_shas[first_target]
+    return lock_entry
+
+
+def _persist_skill_repo_lockfile(
+    lock_path: Path,
+    config_path: Path,
+    lock_skills: list[dict[str, Any]],
+    actions: list[str],
+) -> None:
+    """Write the lockfile, preserving synced_at when semantic content is unchanged."""
+    new_config_sha = file_sha256(config_path)
+    synced_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    if lock_path.is_file():
+        try:
+            existing_lock = json.loads(lock_path.read_text(encoding="utf-8"))
+            existing_skills = {
+                (s.get("name"), s.get("resolved_commit"), s.get("install_tree_sha"))
+                for s in existing_lock.get("skills") or []
+            }
+            new_skills = {
+                (s.get("name"), s.get("resolved_commit"), s.get("install_tree_sha"))
+                for s in lock_skills
+            }
+            if existing_lock.get("config_sha") == new_config_sha and existing_skills == new_skills:
+                synced_at = existing_lock.get("synced_at", synced_at)
+        except (json.JSONDecodeError, KeyError):
+            pass
+    lock_payload = {
+        "version": SKILL_REPOS_LOCKFILE_VERSION,
+        "config_sha": new_config_sha,
+        "synced_at": synced_at,
+        "skills": lock_skills,
+    }
+    changed = write_json_file(lock_path, lock_payload)
+    actions.append(f"{'write-lockfile' if changed else 'lockfile-unchanged'}: {lock_path}")
+
+
 def sync_skill_repo_sets(model: dict[str, Any], dry_run: bool) -> list[str]:
     """Sync skill-repo-set skill sets: clone repos, filtered-copy skills, write lock."""
     actions: list[str] = []
@@ -2682,8 +2800,7 @@ def sync_skill_repo_sets(model: dict[str, Any], dry_run: bool) -> list[str]:
     for skillset in model["skills"]:
         if skillset.get("kind") != "skill-repo-set":
             continue
-        sync_mode = (skillset.get("sync") or {}).get("mode", "")
-        if sync_mode != "clone-and-install":
+        if (skillset.get("sync") or {}).get("mode", "") != "clone-and-install":
             continue
 
         config_path = Path(str(skillset.get("skill_repos_config_host_path", "")))
@@ -2691,144 +2808,31 @@ def sync_skill_repo_sets(model: dict[str, Any], dry_run: bool) -> list[str]:
         clone_root = Path(str(skillset.get("clone_root_host_path", "")))
 
         config = load_skill_repos_config(config_path)
-        entries = config.get("skill_repos") or []
-
         for target in skillset.get("install_targets") or []:
-            target_root = Path(str(target["host_path"]))
-            ensure_directory(target_root, dry_run)
+            ensure_directory(Path(str(target["host_path"])), dry_run)
 
-        repo_actions: list[dict[str, Any]] = []
-        skills_installed: list[dict[str, Any]] = []
         lock_skills: list[dict[str, Any]] = []
-
-        for entry in entries:
+        for entry in config.get("skill_repos") or []:
             if entry.get("distributor"):
                 continue
-            has_repo = bool(entry.get("repo"))
-
-            if has_repo:
-                repo = entry["repo"]
-                ref = entry["ref"]
-                action, clone_path, commit = _clone_or_fetch_repo(
-                    repo, ref, clone_root, dry_run=dry_run,
+            resolved = _resolve_skill_repo_entry_source(
+                entry, config_path, clone_root, skillset, dry_run, actions,
+            )
+            if resolved is None:
+                continue
+            source_root, repo_name, repo, commit = resolved
+            for skill_name, skill_source in _resolve_skill_dirs(entry, source_root, repo_name):
+                install_tree_shas = _install_skill_to_targets(
+                    skillset, skill_name, skill_source, dry_run, actions,
                 )
-                repo_actions.append({
-                    "repo": repo,
-                    "action": action,
-                    "ref": ref,
-                    "commit": commit,
-                })
-                actions.append(f"skill-repo-{action}: {repo}")
-
-                if action == "SKILL_REPO_DIRTY":
-                    actions.append(f"SKILL_REPO_DIRTY: {repo} — skipping (uncommitted changes)")
-                    continue
-
-                source_root = clone_path
-                repo_name = repo.split("/")[-1] if "/" in repo else repo
-
-                if not source_root.is_dir():
-                    pick = entry.get("pick") or [repo_name]
-                    for skill_name in pick:
-                        for target in skillset.get("install_targets") or []:
-                            target_root = Path(str(target["host_path"]))
-                            actions.append(f"install-skill: {skill_name} -> {target_root / skill_name}")
-                    continue
-            else:
-                local_path = entry["path"]
-                if not Path(local_path).is_absolute():
-                    source_root = (config_path.parent / local_path).resolve()
-                else:
-                    source_root = Path(local_path)
-
-                if not source_root.is_dir():
-                    if dry_run:
-                        actions.append(f"skip-local-path: {source_root} (not found)")
-                        continue
-                    raise RuntimeError(
-                        f"SKILL_CONFIG_INVALID: local path does not exist: {source_root}"
-                    )
-                repo_name = source_root.name
-                commit = None
-                repo = None
-
-            skill_dirs = _resolve_skill_dirs(entry, source_root, repo_name)
-
-            for skill_name, skill_source in skill_dirs:
-                targets_installed: list[str] = []
-                install_tree_shas: dict[str, str] = {}
-
-                for target in skillset.get("install_targets") or []:
-                    target_root = Path(str(target["host_path"]))
-                    install_dir = target_root / skill_name
-
-                    if dry_run:
-                        actions.append(f"install-skill: {skill_name} -> {install_dir}")
-                        targets_installed.append(target["id"])
-                        continue
-
-                    tree_sha = filtered_copy_skill(skill_source, install_dir)
-                    install_tree_shas[target["id"]] = tree_sha
-                    targets_installed.append(target["id"])
-                    actions.append(f"install-skill: {skill_name} -> {install_dir}")
-
-                skills_installed.append({
-                    "name": skill_name,
-                    "source": repo or str(entry.get("path", "")),
-                    "targets": targets_installed,
-                })
-
-                lock_entry: dict[str, Any] = {
-                    "name": skill_name,
-                    "declared_ref": entry.get("ref"),
-                    "resolved_commit": commit,
-                }
-                if repo:
-                    lock_entry["repo"] = repo
-                else:
-                    lock_entry["source_path"] = str(entry.get("path", ""))
-
-                if not dry_run and install_tree_shas:
-                    first_target = next(iter(install_tree_shas))
-                    lock_entry["install_tree_sha"] = install_tree_shas[first_target]
-
-                lock_skills.append(lock_entry)
+                lock_skills.append(_build_lock_skill_entry(
+                    skill_name, entry, repo, commit, install_tree_shas, dry_run,
+                ))
 
         if dry_run:
             actions.append(f"write-lockfile: {lock_path}")
             continue
-
-        new_config_sha = file_sha256(config_path)
-        synced_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
-
-        # Preserve synced_at from existing lock when semantic content is unchanged
-        if lock_path.is_file():
-            try:
-                existing_lock = json.loads(lock_path.read_text(encoding="utf-8"))
-                existing_skills = {
-                    (s.get("name"), s.get("resolved_commit"), s.get("install_tree_sha"))
-                    for s in existing_lock.get("skills") or []
-                }
-                new_skills = {
-                    (s.get("name"), s.get("resolved_commit"), s.get("install_tree_sha"))
-                    for s in lock_skills
-                }
-                if (
-                    existing_lock.get("config_sha") == new_config_sha
-                    and existing_skills == new_skills
-                ):
-                    synced_at = existing_lock.get("synced_at", synced_at)
-            except (json.JSONDecodeError, KeyError):
-                pass
-
-        lock_payload = {
-            "version": SKILL_REPOS_LOCKFILE_VERSION,
-            "config_sha": new_config_sha,
-            "synced_at": synced_at,
-            "skills": lock_skills,
-        }
-        changed = write_json_file(lock_path, lock_payload)
-        actions.append(f"{'write-lockfile' if changed else 'lockfile-unchanged'}: {lock_path}")
+        _persist_skill_repo_lockfile(lock_path, config_path, lock_skills, actions)
 
     return actions
 
