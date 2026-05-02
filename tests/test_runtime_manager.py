@@ -6109,6 +6109,270 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(sessions["recent"][0]["label"], "Hardening run")
             self.assertEqual(sessions["recent"][0]["last_event_type"], "session.note")
 
+    def test_stewardship_helper_evidence_summarizes_runtime_state(self) -> None:
+        from runtime_manager import workflows
+
+        health = workflows._stewardship_health_evidence(
+            {"blocked_services": ["api"]},
+            {
+                "checks": [
+                    {"id": "workspace-root", "type": "path", "ok": True},
+                    {"id": "runtime-manager", "type": "artifact", "ok": False},
+                ],
+                "services": [
+                    {"id": "api", "kind": "daemon", "state": "running"},
+                    {"id": "web", "kind": "daemon", "state": "stopped"},
+                ],
+                "logs": [
+                    {
+                        "id": "runtime",
+                        "path": "logs/runtime",
+                        "present": True,
+                        "scanned_files": ["runtime.log"],
+                        "recent_errors": ["WARN noisy", "ERROR failed"],
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(health["checks"]["passing"], 1)
+        self.assertEqual(health["checks"]["failing"], [{"id": "runtime-manager", "type": "artifact"}])
+        self.assertEqual(health["services"]["running"], 1)
+        self.assertEqual(health["services"]["down"][0]["id"], "web")
+        self.assertEqual(health["services"]["blocked"], ["api"])
+        self.assertEqual(health["recent_errors"]["count"], 2)
+        self.assertEqual(health["recent_errors"]["logs"][0]["samples"], ["WARN noisy", "ERROR failed"])
+
+    def test_stewardship_helper_doctor_evidence_counts_statuses(self) -> None:
+        from runtime_manager import workflows
+        from runtime_manager.shared import CheckResult
+
+        with mock.patch.object(
+            workflows,
+            "doctor_results",
+            return_value=[
+                CheckResult(status="pass", code="runtime-manifest", message="ok"),
+                CheckResult(status="warn", code="pulse", message="stale", details={"age": 999}),
+                CheckResult(status="fail", code="skill-repo-lock", message="stale", details={"issues": ["sync"]}),
+            ],
+        ):
+            doctor = workflows._stewardship_doctor_evidence({}, ROOT_DIR)
+
+        self.assertEqual(doctor["status"], "fail")
+        self.assertEqual(doctor["counts"], {"fail": 1, "warn": 1, "pass": 1, "total": 3})
+        self.assertEqual([item["code"] for item in doctor["failures"]], ["skill-repo-lock"])
+        self.assertEqual([item["code"] for item in doctor["warnings"]], ["pulse"])
+
+    def test_stewardship_helper_risks_include_doctor_first(self) -> None:
+        from runtime_manager import workflows
+
+        risks = workflows._stewardship_risks(
+            cid="personal",
+            active_profiles=["core", "connectors"],
+            doctor={"failures": [{"code": "skill-repo-lock"}]},
+            focus={"status": "missing"},
+            pulse={"status": "pass", "active_clients": ["other"]},
+            health={
+                "checks": {"failing": [{"id": "runtime-manager", "type": "artifact"}]},
+                "services": {"down": [{"id": "web", "kind": "daemon", "state": "stopped"}]},
+                "recent_errors": {"count": 1, "logs": [{"id": "runtime"}]},
+            },
+            parity={"deferred_surfaces": ["remote-box"]},
+        )
+
+        risk_ids = [risk["id"] for risk in risks]
+        self.assertEqual(risk_ids[0], "doctor-validation")
+        self.assertIn("failing-checks", risk_ids)
+        self.assertIn("recent-log-errors", risk_ids)
+        self.assertIn("services-not-running", risk_ids)
+        self.assertIn("focus-not-current", risk_ids)
+        self.assertIn("pulse-not-observed", risk_ids)
+        self.assertIn("deferred-runtime-surfaces", risk_ids)
+        self.assertEqual(
+            risks[0]["next_actions"],
+            [
+                "sync --client personal --profile connectors --format json",
+                "doctor --client personal --profile connectors --format json",
+            ],
+        )
+
+    def test_stewardship_helper_markdown_renders_doctor_evidence(self) -> None:
+        from runtime_manager import workflows
+
+        markdown = workflows.render_stewardship_report_markdown(
+            {
+                "client_id": "personal",
+                "generated_at": "2026-05-02T00:00:00Z",
+                "active_profiles": ["core"],
+                "next_recommendation": "repair doctor",
+                "focus": {"status": "current", "path": "workspace/.focus.json"},
+                "health": {
+                    "checks": {"passing": 2, "total": 3},
+                    "services": {"running": 1, "total": 2},
+                    "recent_errors": {"count": 1},
+                },
+                "evidence": {
+                    "doctor": {
+                        "status": "fail",
+                        "counts": {"fail": 1},
+                        "failures": [
+                            {
+                                "code": "skill-repo-lock",
+                                "message": "managed skill locks are stale",
+                                "details": {"issues": ["personal: config_sha mismatch"]},
+                            }
+                        ],
+                    },
+                    "sessions": {"count": 2},
+                    "parity_ledger": {"deferred_count": 1},
+                },
+                "risks": [
+                    {
+                        "id": "doctor-validation",
+                        "severity": "high",
+                        "title": "Runtime doctor validation is failing",
+                        "recommendation": "Repair doctor.",
+                    }
+                ],
+                "not_assessed": [{"id": "backup-recovery", "reason": "No restore drill."}],
+                "next_actions": [
+                    "sync --client personal --format json",
+                    "doctor --client personal --format json",
+                ],
+            }
+        )
+
+        self.assertIn("# Stewardship Report: personal", markdown)
+        self.assertIn("HIGH: Runtime doctor validation is failing (`doctor-validation`)", markdown)
+        self.assertIn("- Doctor: fail (1 failing)", markdown)
+        self.assertIn("Failure `skill-repo-lock`: managed skill locks are stale", markdown)
+        self.assertIn("personal: config_sha mismatch", markdown)
+        self.assertIn("- backup-recovery: No restore drill.", markdown)
+        self.assertIn("- `sync --client personal --format json`", markdown)
+        self.assertIn("- `doctor --client personal --format json`", markdown)
+
+    def test_stewardship_helper_builds_report_with_doctor_gate(self) -> None:
+        from runtime_manager import workflows
+
+        filtered_model = {"active_profiles": ["connectors", "core"]}
+        live = {
+            "collected_at": "2026-05-02T00:00:00Z",
+            "checks": [{"id": "runtime-manager", "type": "artifact", "ok": True}],
+            "services": [{"id": "api", "kind": "daemon", "state": "running"}],
+            "logs": [],
+            "sessions": [{"client_id": "personal", "session_id": "s1", "status": "open"}],
+            "repos": [
+                {
+                    "id": "skillbox-self",
+                    "present": True,
+                    "branch": "main",
+                    "dirty": False,
+                    "untracked": [],
+                    "last_commit": "abc123",
+                }
+            ],
+        }
+
+        with (
+            mock.patch.object(workflows, "build_runtime_model", return_value={"runtime": "model"}),
+            mock.patch.object(workflows, "normalize_active_profiles", return_value=["connectors", "core"]),
+            mock.patch.object(workflows, "normalize_active_clients", return_value=["personal"]),
+            mock.patch.object(workflows, "filter_model", return_value=filtered_model),
+            mock.patch.object(
+                workflows,
+                "runtime_status",
+                return_value={"parity_ledger": {"covered_surfaces": ["focus"], "deferred_surfaces": []}},
+            ),
+            mock.patch.object(workflows, "collect_live_state", return_value=live),
+            mock.patch.object(
+                workflows,
+                "_stewardship_utc_now",
+                return_value=(mock.sentinel.now, "2026-05-02T00:00:00Z", "20260502T000000Z"),
+            ),
+            mock.patch.object(workflows, "_stewardship_focus_evidence", return_value={"status": "current"}),
+            mock.patch.object(workflows, "_stewardship_pulse_evidence", return_value={"status": "pass"}),
+            mock.patch.object(
+                workflows,
+                "_stewardship_doctor_evidence",
+                return_value={
+                    "status": "fail",
+                    "failures": [{"code": "skill-repo-lock"}],
+                    "warnings": [],
+                    "counts": {"fail": 1, "warn": 0, "pass": 20, "total": 21},
+                },
+            ),
+        ):
+            payload = workflows._build_stewardship_report(ROOT_DIR, "personal", ["connectors"])
+
+        self.assertEqual(payload["active_profiles"], ["connectors", "core"])
+        self.assertEqual(payload["report_slug"], "20260502T000000Z")
+        self.assertEqual(payload["evidence"]["doctor"]["status"], "fail")
+        self.assertEqual(payload["evidence"]["repos"][0]["id"], "skillbox-self")
+        self.assertEqual(payload["evidence"]["sessions"]["count"], 1)
+        self.assertEqual(payload["risks"][0]["id"], "doctor-validation")
+        self.assertEqual(
+            payload["next_actions"][:2],
+            [
+                "sync --client personal --profile connectors --format json",
+                "doctor --client personal --profile connectors --format json",
+            ],
+        )
+
+    def test_stewardship_helper_next_actions_adds_default_commands(self) -> None:
+        from runtime_manager import workflows
+
+        actions = workflows._stewardship_next_actions(
+            "personal",
+            ["core"],
+            [{"next_actions": ["doctor --client personal --format json"]}],
+        )
+
+        self.assertEqual(
+            actions,
+            [
+                "doctor --client personal --format json",
+                "stewardship-report personal --format md --write",
+                "acceptance personal --format json",
+            ],
+        )
+
+    def test_stewardship_report_surfaces_doctor_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            sync = self._run(repo, "sync", "--format", "json")
+            self.assertEqual(sync.returncode, 0, sync.stderr)
+            skill_config = repo / "workspace" / "skill-repos.yaml"
+            skill_config.write_text(
+                skill_config.read_text(encoding="utf-8") + "# stale lock marker\n",
+                encoding="utf-8",
+            )
+
+            result = self._run(repo, "stewardship-report", "personal", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            doctor = payload["evidence"]["doctor"]
+            self.assertEqual(doctor["status"], "fail")
+            self.assertEqual(doctor["counts"]["fail"], 1)
+            failure_codes = {check["code"] for check in doctor["failures"]}
+            self.assertIn("skill-repo-lock", failure_codes)
+            risk_ids = {risk["id"] for risk in payload["risks"]}
+            self.assertIn("doctor-validation", risk_ids)
+            self.assertEqual(
+                payload["next_actions"][:2],
+                [
+                    "sync --client personal --format json",
+                    "doctor --client personal --format json",
+                ],
+            )
+
+            markdown = self._run(repo, "stewardship-report", "personal", "--format", "md")
+            self.assertEqual(markdown.returncode, 0, markdown.stderr)
+            self.assertIn("Failure `skill-repo-lock`", markdown.stdout)
+            self.assertIn("config_sha mismatch", markdown.stdout)
+            self.assertIn("sync --client personal --format json", markdown.stdout)
+
     def test_stewardship_report_writes_markdown_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -6132,6 +6396,7 @@ class RuntimeManagerTests(unittest.TestCase):
             content = report_files[0].read_text(encoding="utf-8")
             self.assertIn("## Risks", content)
             self.assertIn("## Not Assessed", content)
+            self.assertIn("- Doctor:", content)
             self.assertIn("backup-recovery", content)
 
     def test_stewardship_report_supports_client_flag_and_profiles(self) -> None:

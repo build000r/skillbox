@@ -1465,13 +1465,37 @@ def _stewardship_recent_error_evidence(live: dict[str, Any]) -> list[dict[str, A
 
 def _stewardship_health_evidence(status_payload: dict[str, Any], live: dict[str, Any]) -> dict[str, Any]:
     checks = live.get("checks") or []
-    failing_checks = [
+    services = live.get("services") or []
+    recent_errors = _stewardship_recent_error_evidence(live)
+    return {
+        "checks": {
+            "passing": sum(1 for item in checks if item.get("ok")),
+            "total": len(checks),
+            "failing": _stewardship_failing_checks(checks),
+        },
+        "services": {
+            "running": sum(1 for item in services if item.get("state") in {"running", "ok", "idle"}),
+            "total": len(services),
+            "down": _stewardship_down_services(services),
+            "blocked": status_payload.get("blocked_services") or [],
+        },
+        "recent_errors": {
+            "count": sum(int(item.get("count") or 0) for item in recent_errors),
+            "logs": recent_errors,
+        },
+    }
+
+
+def _stewardship_failing_checks(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
         {"id": item.get("id"), "type": item.get("type")}
         for item in checks
         if not item.get("ok")
     ]
-    services = live.get("services") or []
-    down_services = [
+
+
+def _stewardship_down_services(services: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
         {
             "id": item.get("id"),
             "kind": item.get("kind"),
@@ -1480,24 +1504,6 @@ def _stewardship_health_evidence(status_payload: dict[str, Any], live: dict[str,
         for item in services
         if item.get("state") not in {"running", "ok", "idle"}
     ]
-    recent_errors = _stewardship_recent_error_evidence(live)
-    return {
-        "checks": {
-            "passing": sum(1 for item in checks if item.get("ok")),
-            "total": len(checks),
-            "failing": failing_checks,
-        },
-        "services": {
-            "running": sum(1 for item in services if item.get("state") in {"running", "ok", "idle"}),
-            "total": len(services),
-            "down": down_services,
-            "blocked": status_payload.get("blocked_services") or [],
-        },
-        "recent_errors": {
-            "count": sum(int(item.get("count") or 0) for item in recent_errors),
-            "logs": recent_errors,
-        },
-    }
 
 
 def _stewardship_session_evidence(live: dict[str, Any]) -> dict[str, Any]:
@@ -1526,6 +1532,34 @@ def _stewardship_parity_evidence(status_payload: dict[str, Any]) -> dict[str, An
         "deferred_surfaces": deferred,
         "covered_count": len(covered),
         "deferred_count": len(deferred),
+    }
+
+
+def _stewardship_doctor_check_payload(result: CheckResult) -> dict[str, Any]:
+    return {
+        "status": result.status,
+        "code": result.code,
+        "message": result.message,
+        "details": result.details,
+    }
+
+
+def _stewardship_doctor_evidence(model: dict[str, Any], root_dir: Path) -> dict[str, Any]:
+    checks = [_stewardship_doctor_check_payload(result) for result in doctor_results(model, root_dir)]
+    failures = [check for check in checks if check.get("status") == "fail"]
+    warnings = [check for check in checks if check.get("status") == "warn"]
+    status = "fail" if failures else ("warn" if warnings else "pass")
+    return {
+        "status": status,
+        "failures": failures,
+        "warnings": warnings,
+        "checks": checks,
+        "counts": {
+            "fail": len(failures),
+            "warn": len(warnings),
+            "pass": sum(1 for check in checks if check.get("status") == "pass"),
+            "total": len(checks),
+        },
     }
 
 
@@ -1569,6 +1603,174 @@ def _stewardship_profile_args(active_profiles: list[str]) -> str:
     return format_profile_args(profiles)
 
 
+def _stewardship_doctor_failure_codes(failures: list[dict[str, Any]]) -> set[str]:
+    return {str(failure.get("code") or "").strip() for failure in failures if str(failure.get("code") or "").strip()}
+
+
+def _stewardship_doctor_recommendation(failures: list[dict[str, Any]]) -> str:
+    failure_codes = _stewardship_doctor_failure_codes(failures)
+    if "skill-repo-lock" in failure_codes:
+        return "Run sync to refresh skill-repo locks, then rerun doctor before treating the box as stewarded."
+    if "skill-repo-install" in failure_codes:
+        return "Run sync to repair managed skill installs, then rerun doctor before treating the box as stewarded."
+    return "Repair the failing doctor checks before treating the box as stewarded."
+
+
+def _stewardship_doctor_repair_actions(
+    cid: str,
+    profile_args: str,
+    failures: list[dict[str, Any]],
+) -> list[str]:
+    failure_codes = _stewardship_doctor_failure_codes(failures)
+    actions: list[str] = []
+    if failure_codes & {"skill-repo-lock", "skill-repo-install"}:
+        actions.append(f"sync --client {cid}{profile_args} --format json")
+    actions.append(f"doctor --client {cid}{profile_args} --format json")
+    return actions
+
+
+def _stewardship_doctor_risks(
+    cid: str,
+    profile_args: str,
+    doctor: dict[str, Any],
+) -> list[dict[str, Any]]:
+    failures = doctor.get("failures") or []
+    if not failures:
+        return []
+    return [
+        _stewardship_risk(
+            "doctor-validation",
+            "high",
+            "Runtime doctor validation is failing",
+            {"failures": failures},
+            _stewardship_doctor_recommendation(failures),
+            _stewardship_doctor_repair_actions(cid, profile_args, failures),
+        )
+    ]
+
+
+def _stewardship_check_risks(
+    cid: str,
+    profile_args: str,
+    health: dict[str, Any],
+) -> list[dict[str, Any]]:
+    failing_checks = (health.get("checks") or {}).get("failing") or []
+    if not failing_checks:
+        return []
+    return [
+        _stewardship_risk(
+            "failing-checks",
+            "high",
+            "Runtime checks are failing",
+            {"checks": failing_checks},
+            "Run doctor for the scoped client and repair required path or env drift first.",
+            [f"doctor --client {cid}{profile_args} --format json"],
+        )
+    ]
+
+
+def _stewardship_log_risks(
+    cid: str,
+    profile_args: str,
+    health: dict[str, Any],
+) -> list[dict[str, Any]]:
+    recent_errors = health.get("recent_errors") or {}
+    if int(recent_errors.get("count") or 0) <= 0:
+        return []
+    return [
+        _stewardship_risk(
+            "recent-log-errors",
+            "high",
+            "Recent runtime logs contain error signatures",
+            recent_errors,
+            "Inspect the scoped logs before treating the box as healthy.",
+            [f"logs --client {cid}{profile_args} --format json"],
+        )
+    ]
+
+
+def _stewardship_service_risks(
+    cid: str,
+    profile_args: str,
+    health: dict[str, Any],
+) -> list[dict[str, Any]]:
+    down_services = (health.get("services") or {}).get("down") or []
+    if not down_services:
+        return []
+    return [
+        _stewardship_risk(
+            "services-not-running",
+            "medium",
+            "Declared services are not running",
+            {"services": down_services},
+            "Start or intentionally stop the affected services, then regenerate the stewardship report.",
+            [f"up --client {cid}{profile_args} --format json"],
+        )
+    ]
+
+
+def _stewardship_focus_risks(
+    cid: str,
+    profile_args: str,
+    focus: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if focus.get("status") not in {"missing", "invalid", "other_client"} and not focus.get("stale"):
+        return []
+    return [
+        _stewardship_risk(
+            "focus-not-current",
+            "medium",
+            "No current focus evidence exists for this client",
+            focus,
+            "Run focus so agent context, live state, and client selection are refreshed.",
+            [f"focus {cid}{profile_args} --format json"],
+        )
+    ]
+
+
+def _stewardship_pulse_risks(
+    cid: str,
+    pulse: dict[str, Any],
+) -> list[dict[str, Any]]:
+    pulse_clients = {str(client).strip() for client in pulse.get("active_clients") or [] if str(client).strip()}
+    pulse_out_of_scope = bool(pulse_clients) and cid not in pulse_clients
+    if pulse.get("status") not in {"missing", "invalid"} and not pulse.get("stale") and not pulse_out_of_scope:
+        return []
+    pulse_evidence = dict(pulse)
+    if pulse_out_of_scope:
+        pulse_evidence["matches_client"] = False
+    return [
+        _stewardship_risk(
+            "pulse-not-observed",
+            "low",
+            "Pulse reconciliation evidence is absent, stale, or scoped elsewhere",
+            pulse_evidence,
+            "Start or refresh pulse for the scoped client before relying on autonomous drift detection.",
+            ["make pulse-status"],
+        )
+    ]
+
+
+def _stewardship_parity_risks(
+    cid: str,
+    profile_args: str,
+    parity: dict[str, Any],
+) -> list[dict[str, Any]]:
+    deferred = parity.get("deferred_surfaces") or []
+    if not deferred:
+        return []
+    return [
+        _stewardship_risk(
+            "deferred-runtime-surfaces",
+            "low",
+            "Some runtime surfaces are declared but deferred",
+            {"deferred_surfaces": deferred},
+            "Keep deferred surfaces out of readiness claims until they are covered or intentionally removed.",
+            [f"status --client {cid}{profile_args} --format json"],
+        )
+    ]
+
+
 def _stewardship_risks(
     *,
     cid: str,
@@ -1577,84 +1779,17 @@ def _stewardship_risks(
     pulse: dict[str, Any],
     health: dict[str, Any],
     parity: dict[str, Any],
+    doctor: dict[str, Any],
 ) -> list[dict[str, Any]]:
     profile_args = _stewardship_profile_args(active_profiles)
     risks: list[dict[str, Any]] = []
-    failing_checks = (health.get("checks") or {}).get("failing") or []
-    if failing_checks:
-        risks.append(
-            _stewardship_risk(
-                "failing-checks",
-                "high",
-                "Runtime checks are failing",
-                {"checks": failing_checks},
-                "Run doctor for the scoped client and repair required path or env drift first.",
-                [f"doctor --client {cid}{profile_args} --format json"],
-            )
-        )
-    recent_errors = health.get("recent_errors") or {}
-    if int(recent_errors.get("count") or 0) > 0:
-        risks.append(
-            _stewardship_risk(
-                "recent-log-errors",
-                "high",
-                "Recent runtime logs contain error signatures",
-                recent_errors,
-                "Inspect the scoped logs before treating the box as healthy.",
-                [f"logs --client {cid}{profile_args} --format json"],
-            )
-        )
-    down_services = (health.get("services") or {}).get("down") or []
-    if down_services:
-        risks.append(
-            _stewardship_risk(
-                "services-not-running",
-                "medium",
-                "Declared services are not running",
-                {"services": down_services},
-                "Start or intentionally stop the affected services, then regenerate the stewardship report.",
-                [f"up --client {cid}{profile_args} --format json"],
-            )
-        )
-    if focus.get("status") in {"missing", "invalid", "other_client"} or focus.get("stale"):
-        risks.append(
-            _stewardship_risk(
-                "focus-not-current",
-                "medium",
-                "No current focus evidence exists for this client",
-                focus,
-                "Run focus so agent context, live state, and client selection are refreshed.",
-                [f"focus {cid}{profile_args} --format json"],
-            )
-        )
-    pulse_clients = {str(client).strip() for client in pulse.get("active_clients") or [] if str(client).strip()}
-    pulse_out_of_scope = bool(pulse_clients) and cid not in pulse_clients
-    if pulse.get("status") in {"missing", "invalid"} or pulse.get("stale") or pulse_out_of_scope:
-        pulse_evidence = dict(pulse)
-        if pulse_out_of_scope:
-            pulse_evidence["matches_client"] = False
-        risks.append(
-            _stewardship_risk(
-                "pulse-not-observed",
-                "low",
-                "Pulse reconciliation evidence is absent, stale, or scoped elsewhere",
-                pulse_evidence,
-                "Start or refresh pulse for the scoped client before relying on autonomous drift detection.",
-                ["make pulse-status"],
-            )
-        )
-    deferred = parity.get("deferred_surfaces") or []
-    if deferred:
-        risks.append(
-            _stewardship_risk(
-                "deferred-runtime-surfaces",
-                "low",
-                "Some runtime surfaces are declared but deferred",
-                {"deferred_surfaces": deferred},
-                "Keep deferred surfaces out of readiness claims until they are covered or intentionally removed.",
-                [f"status --client {cid}{profile_args} --format json"],
-            )
-        )
+    risks.extend(_stewardship_doctor_risks(cid, profile_args, doctor))
+    risks.extend(_stewardship_check_risks(cid, profile_args, health))
+    risks.extend(_stewardship_log_risks(cid, profile_args, health))
+    risks.extend(_stewardship_service_risks(cid, profile_args, health))
+    risks.extend(_stewardship_focus_risks(cid, profile_args, focus))
+    risks.extend(_stewardship_pulse_risks(cid, pulse))
+    risks.extend(_stewardship_parity_risks(cid, profile_args, parity))
     return risks
 
 
@@ -1691,6 +1826,7 @@ def _build_stewardship_report(root_dir: Path, cid: str, profiles: list[str]) -> 
     health = _stewardship_health_evidence(status_payload, live)
     sessions = _stewardship_session_evidence(live)
     parity = _stewardship_parity_evidence(status_payload)
+    doctor = _stewardship_doctor_evidence(filtered_model, root_dir)
     risks = _stewardship_risks(
         cid=cid,
         active_profiles=sorted(filtered_model.get("active_profiles") or []),
@@ -1698,6 +1834,7 @@ def _build_stewardship_report(root_dir: Path, cid: str, profiles: list[str]) -> 
         pulse=pulse,
         health=health,
         parity=parity,
+        doctor=doctor,
     )
     next_recommendation = (
         str(risks[0].get("recommendation") or "")
@@ -1715,6 +1852,7 @@ def _build_stewardship_report(root_dir: Path, cid: str, profiles: list[str]) -> 
         "evidence": {
             "live_collected_at": live.get("collected_at"),
             "pulse": pulse,
+            "doctor": doctor,
             "sessions": sessions,
             "parity_ledger": parity,
             "repos": [
@@ -1749,13 +1887,30 @@ def _resolve_stewardship_output_dir(root_dir: Path, cid: str, output_dir_arg: st
 
 
 def render_stewardship_report_markdown(payload: dict[str, Any]) -> str:
+    sections = [
+        _stewardship_markdown_header(payload),
+        _stewardship_markdown_risks(payload),
+        _stewardship_markdown_evidence(payload),
+        _stewardship_markdown_not_assessed(payload),
+        _stewardship_markdown_next_actions(payload),
+    ]
+    return "\n\n".join(section.rstrip() for section in sections if section.strip()).rstrip() + "\n"
+
+
+def _stewardship_markdown_header(payload: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            f"# Stewardship Report: {payload['client_id']}",
+            "",
+            f"- Generated: {payload['generated_at']}",
+            f"- Profiles: {', '.join(payload.get('active_profiles') or ['core'])}",
+            f"- Recommendation: {payload.get('next_recommendation') or '-'}",
+        ]
+    )
+
+
+def _stewardship_markdown_risks(payload: dict[str, Any]) -> str:
     lines = [
-        f"# Stewardship Report: {payload['client_id']}",
-        "",
-        f"- Generated: {payload['generated_at']}",
-        f"- Profiles: {', '.join(payload.get('active_profiles') or ['core'])}",
-        f"- Recommendation: {payload.get('next_recommendation') or '-'}",
-        "",
         "## Risks",
         "",
     ]
@@ -1769,34 +1924,65 @@ def render_stewardship_report_markdown(payload: dict[str, Any]) -> str:
                 f"{risk.get('title')} (`{risk.get('id')}`)"
             )
             lines.append(f"  Recommendation: {risk.get('recommendation')}")
+    return "\n".join(lines)
+
+
+def _stewardship_markdown_evidence(payload: dict[str, Any]) -> str:
     health = payload.get("health") or {}
     checks = health.get("checks") or {}
     services = health.get("services") or {}
     recent_errors = health.get("recent_errors") or {}
-    sessions = ((payload.get("evidence") or {}).get("sessions") or {})
-    parity = ((payload.get("evidence") or {}).get("parity_ledger") or {})
+    evidence = payload.get("evidence") or {}
+    sessions = evidence.get("sessions") or {}
+    parity = evidence.get("parity_ledger") or {}
+    doctor = evidence.get("doctor") or {}
+    doctor_counts = doctor.get("counts") or {}
+    lines = [
+        "## Evidence",
+        "",
+        f"- Focus: {(payload.get('focus') or {}).get('status')} at {(payload.get('focus') or {}).get('path')}",
+        f"- Checks: {checks.get('passing', 0)}/{checks.get('total', 0)} passing",
+        f"- Services: {services.get('running', 0)}/{services.get('total', 0)} running",
+        f"- Recent log errors: {recent_errors.get('count', 0)}",
+        f"- Doctor: {doctor.get('status', 'unknown')} ({doctor_counts.get('fail', 0)} failing)",
+    ]
+    lines.extend(_stewardship_markdown_doctor_findings(doctor))
     lines.extend(
         [
-            "",
-            "## Evidence",
-            "",
-            f"- Focus: {(payload.get('focus') or {}).get('status')} at {(payload.get('focus') or {}).get('path')}",
-            f"- Checks: {checks.get('passing', 0)}/{checks.get('total', 0)} passing",
-            f"- Services: {services.get('running', 0)}/{services.get('total', 0)} running",
-            f"- Recent log errors: {recent_errors.get('count', 0)}",
             f"- Sessions: {sessions.get('count', 0)} recent session(s)",
             f"- Parity deferred surfaces: {parity.get('deferred_count', 0)}",
-            "",
-            "## Not Assessed",
-            "",
         ]
     )
+    return "\n".join(lines)
+
+
+def _stewardship_markdown_doctor_findings(doctor: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    for failure in doctor.get("failures") or []:
+        code = failure.get("code") or "unknown"
+        message = failure.get("message") or "doctor check failed"
+        lines.append(f"  - Failure `{code}`: {message}")
+        for issue in ((failure.get("details") or {}).get("issues") or [])[:3]:
+            lines.append(f"    - {issue}")
+    for warning in doctor.get("warnings") or []:
+        code = warning.get("code") or "unknown"
+        message = warning.get("message") or "doctor check warned"
+        lines.append(f"  - Warning `{code}`: {message}")
+    return lines
+
+
+def _stewardship_markdown_not_assessed(payload: dict[str, Any]) -> str:
+    lines = ["## Not Assessed", ""]
     for item in payload.get("not_assessed") or []:
         lines.append(f"- {item.get('id')}: {item.get('reason')}")
-    lines.extend(["", "## Next Actions", ""])
+    return "\n".join(lines)
+
+
+def _stewardship_markdown_next_actions(payload: dict[str, Any]) -> str:
+    lines = ["## Next Actions", ""]
     for action in payload.get("next_actions") or []:
         lines.append(f"- `{action}`")
-    return "\n".join(lines).rstrip() + "\n"
+    return "\n".join(lines)
 
 
 def _write_stewardship_artifact(
