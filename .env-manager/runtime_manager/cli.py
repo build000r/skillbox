@@ -104,7 +104,7 @@ def _add_skill_lifecycle_common(command_parser: argparse.ArgumentParser) -> None
     _add_client_arg(command_parser)
 
 
-def main() -> int:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manage the internal skillbox runtime graph.")
     parser.add_argument(
         "--root-dir",
@@ -692,45 +692,60 @@ def main() -> int:
     acceptance_parser.add_argument("--format", choices=("text", "json"), default="text")
     _add_profile_arg(acceptance_parser)
 
-    args = parser.parse_args()
+    return parser
+
+
+def _apply_default_command(args: argparse.Namespace) -> None:
+    """When no subcommand is given, fall back to a compact `status` invocation."""
     if args.command is None:
         args.command = "status"
         args.format = "text"
         args.compact = False
         args.profile = []
         args.client = []
-    root_dir = resolve_root_dir(args.root_dir)
 
-    # --- WG-003: --mode selector validation ---------------------------------
-    # Validate the local-runtime startup mode BEFORE any mutation runs.
-    # Unknown values must emit a structured LOCAL_RUNTIME_MODE_UNSUPPORTED
-    # envelope (shared.md:457-469) and exit 1 during CLI arg validation,
-    # not during lifecycle execution. Only the `up` surface accepts --mode
-    # today; other surfaces ignore it. Mode is orthogonal to --profile and
-    # --service (shared.md:518-520, Business Rule 2).
+
+def _resolve_local_runtime_mode(args: argparse.Namespace) -> tuple[str, dict[str, Any] | None]:
+    """Validate `--mode` and return the resolved mode plus an optional structured error.
+
+    WG-003 requires unknown values to surface as a structured
+    LOCAL_RUNTIME_MODE_UNSUPPORTED envelope (shared.md:457-469) rather than
+    an argparse usage error. Only `up` accepts `--mode` today; other
+    surfaces ignore it. Mode is orthogonal to --profile and --service
+    (shared.md:518-520, Business Rule 2).
+    """
     requested_mode_raw = getattr(args, "mode", None)
     default_mode = "reuse"
     if requested_mode_raw is None or str(requested_mode_raw).strip() == "":
-        resolved_mode = default_mode
-        mode_was_explicit = False
-    else:
-        resolved_mode = str(requested_mode_raw).strip()
-        mode_was_explicit = True
+        return default_mode, None
 
-    if mode_was_explicit and resolved_mode not in LOCAL_RUNTIME_START_MODES:
-        supported = ", ".join(LOCAL_RUNTIME_START_MODES)
-        err = local_runtime_error(
-            LOCAL_RUNTIME_MODE_UNSUPPORTED,
-            f"Unsupported --mode value {resolved_mode!r}. Supported modes: {supported}.",
-            recoverable=True,
-            next_action=f"Re-run with --mode <{'|'.join(LOCAL_RUNTIME_START_MODES)}>.",
-        )
-        err["error"]["requested_mode"] = resolved_mode
-        fmt = getattr(args, "format", "text")
-        if fmt == "json":
-            emit_json(err)
+    resolved_mode = str(requested_mode_raw).strip()
+    if resolved_mode in LOCAL_RUNTIME_START_MODES:
+        return resolved_mode, None
+
+    supported = ", ".join(LOCAL_RUNTIME_START_MODES)
+    err = local_runtime_error(
+        LOCAL_RUNTIME_MODE_UNSUPPORTED,
+        f"Unsupported --mode value {resolved_mode!r}. Supported modes: {supported}.",
+        recoverable=True,
+        next_action=f"Re-run with --mode <{'|'.join(LOCAL_RUNTIME_START_MODES)}>.",
+    )
+    err["error"]["requested_mode"] = resolved_mode
+    return resolved_mode, err
+
+
+def main() -> int:
+    parser = _build_parser()
+    args = parser.parse_args()
+    _apply_default_command(args)
+    root_dir = resolve_root_dir(args.root_dir)
+
+    resolved_mode, mode_error = _resolve_local_runtime_mode(args)
+    if mode_error is not None:
+        if getattr(args, "format", "text") == "json":
+            emit_json(mode_error)
         else:
-            print_local_runtime_error_text(err)
+            print_local_runtime_error_text(mode_error)
         return EXIT_ERROR
 
     if args.command == "client-init":
