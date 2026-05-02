@@ -105,91 +105,113 @@ def print_doctor_text(results: list[CheckResult]) -> None:
     )
 
 
-def print_status_text(status_payload: dict[str, Any]) -> None:
+def _print_status_header(status_payload: dict[str, Any]) -> None:
     available_clients = ", ".join(client["id"] for client in status_payload.get("clients") or []) or "(none)"
     print(f"clients: {available_clients}")
-    default_client = status_payload.get("default_client") or "(none)"
-    print(f"default client: {default_client}")
+    print(f"default client: {status_payload.get('default_client') or '(none)'}")
     active_clients = status_payload.get("active_clients") or []
     if active_clients:
         print(f"active clients: {', '.join(active_clients)}")
     active_profiles = status_payload.get("active_profiles") or []
     if active_profiles:
         print(f"active profiles: {', '.join(active_profiles)}")
+
+
+def _format_repo_summary(repo: dict[str, Any]) -> str:
+    summary = "present" if repo["present"] else "missing"
+    if repo.get("git"):
+        summary = (
+            f"{summary}, git {repo.get('branch', '(detached)')}, "
+            f"{repo.get('dirty', 0)} dirty, {repo.get('untracked', 0)} untracked"
+        )
+    return summary
+
+
+def _print_status_repos(status_payload: dict[str, Any]) -> None:
     print("repos:")
     for repo in status_payload["repos"]:
-        summary = "present" if repo["present"] else "missing"
-        if repo.get("git"):
-            summary = (
-                f"{summary}, git {repo.get('branch', '(detached)')}, "
-                f"{repo.get('dirty', 0)} dirty, {repo.get('untracked', 0)} untracked"
-            )
-        print(f"  - {repo['id']}: {summary}")
+        print(f"  - {repo['id']}: {_format_repo_summary(repo)}")
 
+
+def _print_status_artifacts(status_payload: dict[str, Any]) -> None:
     print("artifacts:")
     for artifact in status_payload["artifacts"]:
         print(f"  - {artifact['id']}: {artifact.get('state', 'unknown')} ({artifact.get('source_kind', 'manual')})")
 
+
+def _print_status_env_files(status_payload: dict[str, Any]) -> None:
     print("env files:")
     for env_file in status_payload["env_files"]:
         print(f"  - {env_file['id']}: {env_file['state']} ({env_file['source_kind']})")
 
+
+def _format_skillset_summary(skillset: dict[str, Any]) -> str:
+    total_targets = 0
+    healthy_targets = 0
+    for skill_entry in skillset["skills"]:
+        for target in skill_entry["targets"]:
+            total_targets += 1
+            if target["state"] == "ok":
+                healthy_targets += 1
+    lock_summary = "invalid" if skillset.get("lock_error") else ("present" if skillset["lock_present"] else "missing")
+    return (
+        f"lock {lock_summary}, {len(skillset['skills'])} skills, "
+        f"{healthy_targets}/{total_targets} targets healthy"
+    )
+
+
+def _print_status_skills(status_payload: dict[str, Any]) -> None:
     print("skills:")
     for skillset in status_payload["skills"]:
-        total_targets = 0
-        healthy_targets = 0
-        for skill_entry in skillset["skills"]:
-            for target in skill_entry["targets"]:
-                total_targets += 1
-                if target["state"] == "ok":
-                    healthy_targets += 1
+        print(f"  - {skillset['id']}: {_format_skillset_summary(skillset)}")
 
-        lock_summary = "invalid" if skillset.get("lock_error") else ("present" if skillset["lock_present"] else "missing")
-        print(
-            f"  - {skillset['id']}: lock {lock_summary}, "
-            f"{len(skillset['skills'])} skills, {healthy_targets}/{total_targets} targets healthy"
-        )
 
+def _format_task_summary(task: dict[str, Any]) -> str:
+    summary = task.get("state", "pending")
+    dependency_ids = task.get("depends_on") or []
+    if dependency_ids:
+        summary = f"{summary}, depends on {', '.join(dependency_ids)}"
+    return summary
+
+
+def _print_status_tasks(status_payload: dict[str, Any]) -> None:
     print("tasks:")
     for task in status_payload["tasks"]:
-        summary = task.get("state", "pending")
-        dependency_summary = ""
-        dependency_ids = task.get("depends_on") or []
-        if dependency_ids:
-            dependency_summary = f", depends on {', '.join(dependency_ids)}"
-        print(f"  - {task['id']}: {summary}{dependency_summary}")
+        print(f"  - {task['id']}: {_format_task_summary(task)}")
 
+
+def _format_service_line(service: dict[str, Any]) -> str:
+    summary = service.get("state", "declared")
+    if service.get("pid") is not None:
+        summary = f"{summary} (pid {service['pid']})"
+    elif service.get("managed") is False and service.get("manager_reason"):
+        summary = f"{summary} ({service['manager_reason']})"
+    dependency_ids = service.get("depends_on") or []
+    if dependency_ids:
+        summary = f"{summary}, depends on {', '.join(dependency_ids)}"
+    bootstrap_task_ids = service.get("bootstrap_tasks") or []
+    if bootstrap_task_ids:
+        summary = f"{summary}, bootstrap {', '.join(bootstrap_task_ids)}"
+    # WG-006: ownership_state badge so operators can see at a glance
+    # whether a service is covered, bridge-only, deferred, or external
+    # per the parity ledger (shared.md:148-180, backend.md:77-90).
+    ownership_state = str(service.get("ownership_state") or "").strip()
+    badge = f" [{ownership_state}]" if ownership_state else ""
+    return f"  - {service['id']}{badge}: {summary}"
+
+
+def _print_status_services(status_payload: dict[str, Any]) -> None:
     print("services:")
     for service in status_payload["services"]:
-        summary = service.get("state", "declared")
-        if service.get("pid") is not None:
-            summary = f"{summary} (pid {service['pid']})"
-        elif service.get("managed") is False and service.get("manager_reason"):
-            summary = f"{summary} ({service['manager_reason']})"
-        dependency_summary = ""
-        dependency_ids = service.get("depends_on") or []
-        if dependency_ids:
-            dependency_summary = f", depends on {', '.join(dependency_ids)}"
-        bootstrap_summary = ""
-        bootstrap_task_ids = service.get("bootstrap_tasks") or []
-        if bootstrap_task_ids:
-            bootstrap_summary = f", bootstrap {', '.join(bootstrap_task_ids)}"
-        # WG-006: ownership_state badge so operators can see at a glance
-        # whether a service is covered, bridge-only, deferred, or external
-        # per the parity ledger (shared.md:148-180, backend.md:77-90).
-        ownership_state = str(service.get("ownership_state") or "").strip()
-        badge = f" [{ownership_state}]" if ownership_state else ""
-        print(
-            f"  - {service['id']}{badge}: "
-            f"{summary}{dependency_summary}{bootstrap_summary}"
-        )
+        print(_format_service_line(service))
 
-    # WG-006: summarise parity ledger + blocked services at the end of
-    # the status block so the observational surface tells the operator
-    # what the overlay explicitly chose to defer and which covered
-    # services are currently blocked (backend.md Rule 3a).
-    parity_block = status_payload.get("parity_ledger") or {}
-    deferred = parity_block.get("deferred_surfaces") or []
+
+def _print_status_parity(status_payload: dict[str, Any]) -> None:
+    # WG-006: surface deferred surfaces + blocked services so the
+    # observational surface tells the operator what the overlay explicitly
+    # chose to defer and which covered services are currently blocked
+    # (backend.md Rule 3a).
+    deferred = (status_payload.get("parity_ledger") or {}).get("deferred_surfaces") or []
     if deferred:
         print("deferred surfaces (parity ledger):")
         for surface in deferred:
@@ -200,16 +222,20 @@ def print_status_text(status_payload: dict[str, Any]) -> None:
         for sid in blocked_services:
             print(f"  - {sid}")
 
-    ingress = status_payload.get("ingress") or {}
-    ingress_routes = ingress.get("routes") or []
-    if ingress_routes:
-        print("ingress:")
-        for route in ingress_routes:
-            print(
-                f"  - {route['id']}: {route['listener']} {route['path']} "
-                f"-> {route['service_id']} @ {route['request_url']}"
-            )
 
+def _print_status_ingress(status_payload: dict[str, Any]) -> None:
+    ingress_routes = (status_payload.get("ingress") or {}).get("routes") or []
+    if not ingress_routes:
+        return
+    print("ingress:")
+    for route in ingress_routes:
+        print(
+            f"  - {route['id']}: {route['listener']} {route['path']} "
+            f"-> {route['service_id']} @ {route['request_url']}"
+        )
+
+
+def _print_status_logs(status_payload: dict[str, Any]) -> None:
     print("logs:")
     for log_item in status_payload["logs"]:
         if log_item["present"]:
@@ -220,10 +246,26 @@ def print_status_text(status_payload: dict[str, Any]) -> None:
         else:
             print(f"  - {log_item['id']}: missing")
 
+
+def _print_status_checks(status_payload: dict[str, Any]) -> None:
     print("checks:")
     for check in status_payload["checks"]:
         state = "ok" if check.get("ok") else "missing"
         print(f"  - {check['id']}: {state}")
+
+
+def print_status_text(status_payload: dict[str, Any]) -> None:
+    _print_status_header(status_payload)
+    _print_status_repos(status_payload)
+    _print_status_artifacts(status_payload)
+    _print_status_env_files(status_payload)
+    _print_status_skills(status_payload)
+    _print_status_tasks(status_payload)
+    _print_status_services(status_payload)
+    _print_status_parity(status_payload)
+    _print_status_ingress(status_payload)
+    _print_status_logs(status_payload)
+    _print_status_checks(status_payload)
 
 
 def print_local_runtime_error_text(err: dict[str, Any]) -> None:
