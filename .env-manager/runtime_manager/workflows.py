@@ -1330,60 +1330,84 @@ def run_acceptance(
     return emit_acceptance(payload)
 
 
-def run_focus(
+def _focus_step(
+    steps: list[dict[str, Any]], is_json: bool, name: str, status: str, detail: Any = None
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {"step": name, "status": status}
+    if detail is not None:
+        entry["detail"] = detail
+    steps.append(entry)
+    if not is_json:
+        marker = "ok" if status == "ok" else ("skip" if status == "skip" else "FAIL")
+        print(f"[{marker}] {name}")
+    return entry
+
+
+def _focus_emit_simple_error(message: str, is_json: bool) -> int:
+    if is_json:
+        emit_json({"error": message})
+    else:
+        print(message, file=sys.stderr)
+    return EXIT_ERROR
+
+
+def _focus_emit_classify_error(
+    exc: Exception,
+    cid: str,
+    steps: list[dict[str, Any]],
+    is_json: bool,
     *,
-    root_dir: Path,
-    client_id: str,
-    profiles: list[str],
-    service_filter: list[str],
-    resume: bool,
-    wait_seconds: float,
-    fmt: str,
-    context_dir: Path | None = None,
+    print_text: bool = True,
 ) -> int:
-    """Focus macro: sync → bootstrap → up → collect live state → generate enriched context."""
-    steps: list[dict[str, Any]] = []
-    is_json = fmt == "json"
+    payload: dict[str, Any] = {"client_id": cid, "steps": steps}
+    payload.update(classify_error(exc, "focus"))
+    if is_json:
+        emit_json(payload)
+    elif print_text:
+        print(str(exc), file=sys.stderr)
+    return EXIT_ERROR
 
-    def step(name: str, status: str, detail: Any = None) -> dict[str, Any]:
-        entry: dict[str, Any] = {"step": name, "status": status}
-        if detail is not None:
-            entry["detail"] = detail
-        steps.append(entry)
-        if not is_json:
-            marker = "ok" if status == "ok" else ("skip" if status == "skip" else "FAIL")
-            print(f"[{marker}] {name}")
-        return entry
 
-    focus_path = root_dir / FOCUS_STATE_REL
+def _focus_emit_local_runtime_payload(
+    base: dict[str, Any], extra: dict[str, Any], is_json: bool
+) -> int:
+    payload = {**base, **extra}
+    if is_json:
+        emit_json(payload)
+    elif (payload.get("error") or {}).get("type", "").startswith("LOCAL_RUNTIME_"):
+        print_local_runtime_error_text(payload)
+    return EXIT_ERROR
 
-    # --- Resume path ----------------------------------------------------------
-    if resume:
-        if not focus_path.is_file():
-            err = {"error": "No .focus.json found. Run focus with a client_id first."}
-            if is_json:
-                emit_json(err)
-            else:
-                print(err["error"], file=sys.stderr)
-            return EXIT_ERROR
-        try:
-            saved = json.loads(focus_path.read_text(encoding="utf-8"))
-            client_id = saved.get("client_id", client_id)
-            if not profiles:
-                profiles = [
-                    str(profile)
-                    for profile in saved.get("active_profiles") or []
-                    if str(profile).strip() and str(profile).strip() != "core"
-                ]
-        except (json.JSONDecodeError, OSError) as exc:
-            err = {"error": f"Failed to read .focus.json: {exc}"}
-            if is_json:
-                emit_json(err)
-            else:
-                print(err["error"], file=sys.stderr)
-            return EXIT_ERROR
 
-    # --- Validate client exists -----------------------------------------------
+def _resolve_resume_focus_state(
+    focus_path: Path, client_id: str, profiles: list[str], is_json: bool
+) -> tuple[str, list[str], int | None]:
+    """Apply .focus.json overrides for --resume; returns (client_id, profiles, exit_code)."""
+    if not focus_path.is_file():
+        return client_id, profiles, _focus_emit_simple_error(
+            "No .focus.json found. Run focus with a client_id first.", is_json
+        )
+    try:
+        saved = json.loads(focus_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        return client_id, profiles, _focus_emit_simple_error(
+            f"Failed to read .focus.json: {exc}", is_json
+        )
+    new_client_id = saved.get("client_id", client_id)
+    new_profiles = profiles
+    if not profiles:
+        new_profiles = [
+            str(profile)
+            for profile in saved.get("active_profiles") or []
+            if str(profile).strip() and str(profile).strip() != "core"
+        ]
+    return new_client_id, new_profiles, None
+
+
+def _validate_focus_client(
+    root_dir: Path, client_id: str, is_json: bool
+) -> tuple[str, int | None]:
+    """Validate the client id and overlay file; returns (cid, exit_code)."""
     try:
         cid = validate_client_id(client_id)
     except RuntimeError as exc:
@@ -1391,8 +1415,7 @@ def run_focus(
             emit_json(classify_error(exc, "focus"))
         else:
             print(str(exc), file=sys.stderr)
-        return EXIT_ERROR
-
+        return "", EXIT_ERROR
     _, overlay_path, overlay_runtime_path = client_overlay_location(root_dir, cid)
     if not overlay_path.is_file():
         err_msg = (
@@ -1403,175 +1426,165 @@ def run_focus(
             emit_json(classify_error(RuntimeError(err_msg), "focus"))
         else:
             print(err_msg, file=sys.stderr)
-        return EXIT_ERROR
+        return cid, EXIT_ERROR
+    return cid, None
 
-    # --- Build model ----------------------------------------------------------
+
+def _build_focus_model(
+    root_dir: Path, cid: str, profiles: list[str], steps: list[dict[str, Any]], is_json: bool
+) -> tuple[dict[str, Any] | None, int | None]:
     try:
         model = build_runtime_model(root_dir)
         active_profiles = normalize_active_profiles(profiles or [])
         active_clients = normalize_active_clients(model, [cid])
-        model = filter_model(model, active_profiles, active_clients)
+        return filter_model(model, active_profiles, active_clients), None
     except RuntimeError as exc:
-        payload: dict[str, Any] = {"client_id": cid, "steps": steps}
-        payload.update(classify_error(exc, "focus"))
-        if is_json:
-            emit_json(payload)
-        else:
-            print(str(exc), file=sys.stderr)
-        return EXIT_ERROR
+        return None, _focus_emit_classify_error(exc, cid, steps, is_json)
 
-    # --- Validate local-runtime profiles ----------------------------------------
-    profile_errors = validate_local_runtime_profiles(model)
-    if profile_errors:
-        payload = {"client_id": cid, "steps": steps}
-        payload.update(profile_errors[0])
-        if is_json:
-            emit_json(payload)
-        else:
-            print_local_runtime_error_text(profile_errors[0])
-        return EXIT_ERROR
 
-    active_local_profile = local_runtime_active_profile(model)
-
-    if active_local_profile:
-        try:
-            overlay_host_path = local_runtime_overlay_path(model, cid)
-            pre_reconcile = reconcile_local_runtime_env(
-                model,
-                active_local_profile,
-                overlay_path=overlay_host_path,
-                dry_run=False,
+def _focus_local_runtime_preflight(
+    model: dict[str, Any],
+    active_local_profile: str | None,
+    cid: str,
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> int | None:
+    if not active_local_profile:
+        return None
+    try:
+        overlay_host_path = local_runtime_overlay_path(model, cid)
+        pre_reconcile = reconcile_local_runtime_env(
+            model,
+            active_local_profile,
+            overlay_path=overlay_host_path,
+            dry_run=False,
+        )
+        if pre_reconcile.get("status") == "blocked":
+            _focus_step(
+                steps, is_json, "local-runtime-preflight", "fail",
+                {"profile": active_local_profile, "error": pre_reconcile.get("error")},
             )
-            if pre_reconcile.get("status") == "blocked":
-                step(
-                    "local-runtime-preflight",
-                    "fail",
-                    {
-                        "profile": active_local_profile,
-                        "error": pre_reconcile.get("error"),
-                    },
-                )
-                payload = {"client_id": cid, "steps": steps}
-                if pre_reconcile.get("error"):
-                    payload["error"] = pre_reconcile["error"]
-                if is_json:
-                    emit_json(payload)
-                elif payload.get("error", {}).get("type", "").startswith("LOCAL_RUNTIME_"):
-                    print_local_runtime_error_text(payload)
-                return EXIT_ERROR
-            step(
-                "local-runtime-preflight",
-                "ok",
-                {
-                    "profile": active_local_profile,
-                    "actions": pre_reconcile.get("actions"),
-                },
+            extra: dict[str, Any] = {}
+            if pre_reconcile.get("error"):
+                extra["error"] = pre_reconcile["error"]
+            return _focus_emit_local_runtime_payload(
+                {"client_id": cid, "steps": steps}, extra, is_json
             )
-        except RuntimeError as exc:
-            step("local-runtime-preflight", "fail", {"error": str(exc)})
-            payload = {"client_id": cid, "steps": steps}
-            payload.update(classify_error(exc, "focus"))
-            if is_json:
-                emit_json(payload)
-            return EXIT_ERROR
+        _focus_step(
+            steps, is_json, "local-runtime-preflight", "ok",
+            {"profile": active_local_profile, "actions": pre_reconcile.get("actions")},
+        )
+        return None
+    except RuntimeError as exc:
+        _focus_step(steps, is_json, "local-runtime-preflight", "fail", {"error": str(exc)})
+        return _focus_emit_classify_error(exc, cid, steps, is_json, print_text=False)
 
-    # --- 0. Compose override ---------------------------------------------------
+
+def _focus_compose_override_step(
+    root_dir: Path, model: dict[str, Any], cid: str,
+    steps: list[dict[str, Any]], is_json: bool,
+) -> None:
     try:
         override_path = generate_client_compose_override(root_dir, model, cid)
-        step("compose-override", "ok", {"path": str(override_path)})
+        _focus_step(steps, is_json, "compose-override", "ok", {"path": str(override_path)})
     except Exception as exc:
-        step("compose-override", "fail", {"error": str(exc)})
+        _focus_step(steps, is_json, "compose-override", "fail", {"error": str(exc)})
 
-    # --- 1. Sync --------------------------------------------------------------
+
+def _focus_sync_step(
+    model: dict[str, Any], cid: str, steps: list[dict[str, Any]], is_json: bool,
+) -> int | None:
     try:
         sync_actions = sync_runtime(model, dry_run=False)
-        step("sync", "ok", {"actions": sync_actions})
+        _focus_step(steps, is_json, "sync", "ok", {"actions": sync_actions})
+        return None
     except RuntimeError as exc:
-        step("sync", "fail", {"error": str(exc)})
-        payload = {"client_id": cid, "steps": steps}
-        payload.update(classify_error(exc, "focus"))
-        if is_json:
-            emit_json(payload)
-        return EXIT_ERROR
+        _focus_step(steps, is_json, "sync", "fail", {"error": str(exc)})
+        return _focus_emit_classify_error(exc, cid, steps, is_json, print_text=False)
 
-    # --- 1b. Bridge freshness check ---------------------------------------------
+
+def _focus_bridge_freshness_step(
+    model: dict[str, Any], cid: str, steps: list[dict[str, Any]], is_json: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     bridges = model.get("bridges") or []
     bridge_detail: dict[str, Any] = {}
-    if bridges:
-        overlay_path = None
-        for client in model.get("clients") or []:
-            if client.get("id") == cid and client.get("_overlay_path"):
-                overlay_path = client["_overlay_path"]
-                break
-        for bridge in bridges:
-            freshness = bridge_freshness(bridge, overlay_path)
-            bridge_detail[bridge["id"]] = freshness
-        all_fresh = all(f.get("fresh") for f in bridge_detail.values())
-        if all_fresh:
-            step("bridge-check", "ok", {"bridges": bridge_detail, "action": "skip (fresh)"})
-        else:
-            step("bridge-check", "ok", {"bridges": bridge_detail, "action": "will re-run stale bridges"})
+    if not bridges:
+        return bridges, bridge_detail
+    overlay_path = None
+    for client in model.get("clients") or []:
+        if client.get("id") == cid and client.get("_overlay_path"):
+            overlay_path = client["_overlay_path"]
+            break
+    for bridge in bridges:
+        bridge_detail[bridge["id"]] = bridge_freshness(bridge, overlay_path)
+    all_fresh = all(f.get("fresh") for f in bridge_detail.values())
+    action = "skip (fresh)" if all_fresh else "will re-run stale bridges"
+    _focus_step(steps, is_json, "bridge-check", "ok", {"bridges": bridge_detail, "action": action})
+    return bridges, bridge_detail
 
-    # --- 2. Bootstrap ---------------------------------------------------------
+
+def _focus_bootstrap_step(
+    model: dict[str, Any],
+    root_dir: Path,
+    cid: str,
+    bridge_detail: dict[str, Any],
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> int | None:
     try:
         requested_tasks = select_tasks(model, [])
         tasks = resolve_tasks_for_run(model, requested_tasks)
-        if tasks:
-            doctor = doctor_results(model, root_dir)
-            doctor_failures = [asdict(result) for result in doctor if result.status == "fail"]
-            if doctor_failures:
-                step(
-                    "bootstrap",
-                    "fail",
-                    {
-                        "error": "post-sync doctor checks failed",
-                        "checks": [asdict(result) for result in doctor],
-                    },
-                )
-                payload = {"client_id": cid, "steps": steps}
-                payload.update(
-                    structured_error(
-                        "Pre-bootstrap doctor checks failed after sync.",
-                        error_type="pre_bootstrap_doctor_failed",
-                        recoverable=True,
-                        recovery_hint=(
-                            "Run doctor to materialize or mount the remaining required runtime inputs "
-                            "before retrying focus."
-                        ),
-                        next_actions=[
-                            f"doctor --client {cid} --format json",
-                            f"logs --client {cid} --format json",
-                        ],
-                    )
-                )
-                if is_json:
-                    emit_json(payload)
-                else:
-                    print("Pre-bootstrap doctor checks failed after sync.", file=sys.stderr)
-                return EXIT_ERROR
-            # For bridge-backed tasks, skip if bridge outputs are fresh
-            tasks_to_run = []
-            for task in tasks:
-                bid = str(task.get("bridge_id", "")).strip()
-                if bid and bridge_detail.get(bid, {}).get("fresh"):
-                    step_detail = {"task": task["id"], "bridge": bid, "action": "skipped (fresh)"}
-                    if not is_json:
-                        print(f"  [skip] {task['id']} (bridge {bid} outputs are fresh)")
-                else:
-                    tasks_to_run.append(task)
-            if tasks_to_run:
-                ensure_required_env_files_ready(select_env_files_for_tasks(model, tasks_to_run))
-                task_results = run_tasks(model, tasks_to_run, dry_run=False)
-                step("bootstrap", "ok", {"tasks": task_results})
+        if not tasks:
+            _focus_step(steps, is_json, "bootstrap", "skip", {"reason": "no tasks declared"})
+            return None
+        doctor = doctor_results(model, root_dir)
+        doctor_failures = [asdict(result) for result in doctor if result.status == "fail"]
+        if doctor_failures:
+            _focus_step(
+                steps, is_json, "bootstrap", "fail",
+                {
+                    "error": "post-sync doctor checks failed",
+                    "checks": [asdict(result) for result in doctor],
+                },
+            )
+            payload = {"client_id": cid, "steps": steps}
+            payload.update(structured_error(
+                "Pre-bootstrap doctor checks failed after sync.",
+                error_type="pre_bootstrap_doctor_failed",
+                recoverable=True,
+                recovery_hint=(
+                    "Run doctor to materialize or mount the remaining required runtime inputs "
+                    "before retrying focus."
+                ),
+                next_actions=[
+                    f"doctor --client {cid} --format json",
+                    f"logs --client {cid} --format json",
+                ],
+            ))
+            if is_json:
+                emit_json(payload)
             else:
-                step("bootstrap", "skip", {"reason": "all bridge tasks fresh"})
+                print("Pre-bootstrap doctor checks failed after sync.", file=sys.stderr)
+            return EXIT_ERROR
+        tasks_to_run: list[dict[str, Any]] = []
+        for task in tasks:
+            bid = str(task.get("bridge_id", "")).strip()
+            if bid and bridge_detail.get(bid, {}).get("fresh"):
+                if not is_json:
+                    print(f"  [skip] {task['id']} (bridge {bid} outputs are fresh)")
+            else:
+                tasks_to_run.append(task)
+        if tasks_to_run:
+            ensure_required_env_files_ready(select_env_files_for_tasks(model, tasks_to_run))
+            task_results = run_tasks(model, tasks_to_run, dry_run=False)
+            _focus_step(steps, is_json, "bootstrap", "ok", {"tasks": task_results})
         else:
-            step("bootstrap", "skip", {"reason": "no tasks declared"})
+            _focus_step(steps, is_json, "bootstrap", "skip", {"reason": "all bridge tasks fresh"})
+        return None
     except RuntimeError as exc:
-        step("bootstrap", "fail", {"error": str(exc)})
-        payload = {"client_id": cid, "steps": steps}
-        # Detect bridge-specific failures and use local runtime error codes
+        _focus_step(steps, is_json, "bootstrap", "fail", {"error": str(exc)})
         err_str = str(exc)
+        payload: dict[str, Any] = {"client_id": cid, "steps": steps}
         if any(bid in err_str for bid in bridge_detail):
             payload.update(local_runtime_error(
                 "LOCAL_RUNTIME_ENV_BRIDGE_FAILED",
@@ -1587,30 +1600,43 @@ def run_focus(
             print_local_runtime_error_text(payload)
         return EXIT_ERROR
 
-    # --- 2b. Verify bridge outputs after bootstrap ----------------------------
-    if bridges:
-        missing_outputs: list[str] = []
-        for bridge in bridges:
-            state = bridge_outputs_state(bridge)
-            if state["state"] == "missing":
-                missing_outputs.extend(state.get("missing", []))
-        if missing_outputs:
-            step("bridge-verify", "fail", {"missing": missing_outputs})
-            payload = {"client_id": cid, "steps": steps}
-            payload.update(local_runtime_error(
-                "LOCAL_RUNTIME_ENV_OUTPUT_MISSING",
-                f"Bridge outputs missing after bootstrap: {', '.join(missing_outputs)}",
-                recoverable=True,
-                next_action="re-run sync.sh manually to diagnose",
-            ))
-            if is_json:
-                emit_json(payload)
-            else:
-                print_local_runtime_error_text(payload)
-            return EXIT_ERROR
-        step("bridge-verify", "ok", {"bridges": len(bridges)})
 
-    # --- 3. Up ----------------------------------------------------------------
+def _focus_bridge_verify_step(
+    bridges: list[dict[str, Any]], cid: str, steps: list[dict[str, Any]], is_json: bool,
+) -> int | None:
+    if not bridges:
+        return None
+    missing_outputs: list[str] = []
+    for bridge in bridges:
+        state = bridge_outputs_state(bridge)
+        if state["state"] == "missing":
+            missing_outputs.extend(state.get("missing", []))
+    if missing_outputs:
+        _focus_step(steps, is_json, "bridge-verify", "fail", {"missing": missing_outputs})
+        payload = {"client_id": cid, "steps": steps}
+        payload.update(local_runtime_error(
+            "LOCAL_RUNTIME_ENV_OUTPUT_MISSING",
+            f"Bridge outputs missing after bootstrap: {', '.join(missing_outputs)}",
+            recoverable=True,
+            next_action="re-run sync.sh manually to diagnose",
+        ))
+        if is_json:
+            emit_json(payload)
+        else:
+            print_local_runtime_error_text(payload)
+        return EXIT_ERROR
+    _focus_step(steps, is_json, "bridge-verify", "ok", {"bridges": len(bridges)})
+    return None
+
+
+def _focus_up_step(
+    model: dict[str, Any],
+    service_filter: list[str],
+    wait_seconds: float,
+    cid: str,
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> int | None:
     try:
         requested_services = select_services(model, service_filter)
         services = resolve_services_for_start(model, requested_services)
@@ -1623,24 +1649,25 @@ def run_focus(
             service_results = start_services(
                 model, services, dry_run=False, wait_seconds=wait_seconds,
             )
-            step("up", "ok", {"services": service_results})
+            _focus_step(steps, is_json, "up", "ok", {"services": service_results})
         else:
-            step("up", "skip", {"reason": "no services in scope"})
+            _focus_step(steps, is_json, "up", "skip", {"reason": "no services in scope"})
+        return None
     except RuntimeError as exc:
-        step("up", "fail", {"error": str(exc)})
-        payload = {"client_id": cid, "steps": steps}
-        payload.update(classify_error(exc, "focus"))
-        if is_json:
-            emit_json(payload)
-        return EXIT_ERROR
+        _focus_step(steps, is_json, "up", "fail", {"error": str(exc)})
+        return _focus_emit_classify_error(exc, cid, steps, is_json, print_text=False)
 
-    # --- 4. Collect live state ------------------------------------------------
+
+def _focus_collect_live_step(
+    model: dict[str, Any], root_dir: Path, steps: list[dict[str, Any]], is_json: bool,
+) -> dict[str, Any]:
     try:
         live = collect_live_state(model, root_dir)
-        step("collect", "ok")
+        _focus_step(steps, is_json, "collect", "ok")
+        return live
     except Exception as exc:
-        step("collect", "fail", {"error": str(exc)})
-        live = {
+        _focus_step(steps, is_json, "collect", "fail", {"error": str(exc)})
+        return {
             "collected_at": time.time(),
             "repos": [],
             "services": [],
@@ -1649,24 +1676,40 @@ def run_focus(
             "sessions": [],
         }
 
-    # --- 5. Generate skill context.yaml ---------------------------------------
+
+def _focus_skill_context_step(
+    model: dict[str, Any], root_dir: Path, steps: list[dict[str, Any]], is_json: bool,
+) -> None:
     try:
         skill_ctx_actions = generate_skill_context(model, root_dir, dry_run=False)
         if skill_ctx_actions:
-            step("skill-context", "ok", {"actions": skill_ctx_actions})
+            _focus_step(steps, is_json, "skill-context", "ok", {"actions": skill_ctx_actions})
         else:
-            step("skill-context", "skip", {"reason": "no client context declared"})
+            _focus_step(steps, is_json, "skill-context", "skip", {"reason": "no client context declared"})
     except Exception as exc:
-        step("skill-context", "fail", {"error": str(exc)})
+        _focus_step(steps, is_json, "skill-context", "fail", {"error": str(exc)})
 
-    # --- 6. Generate enriched context -----------------------------------------
+
+def _focus_enriched_context_step(
+    model: dict[str, Any], live: dict[str, Any], root_dir: Path,
+    context_dir: Path | None, steps: list[dict[str, Any]], is_json: bool,
+) -> None:
     try:
         context_actions = sync_live_context(model, live, root_dir, context_dir=context_dir)
-        step("context", "ok", {"actions": context_actions})
+        _focus_step(steps, is_json, "context", "ok", {"actions": context_actions})
     except RuntimeError as exc:
-        step("context", "fail", {"error": str(exc)})
+        _focus_step(steps, is_json, "context", "fail", {"error": str(exc)})
 
-    # --- 7. Persist focus state -----------------------------------------------
+
+def _focus_persist_step(
+    focus_path: Path,
+    model: dict[str, Any],
+    cid: str,
+    service_filter: list[str],
+    root_dir: Path,
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> None:
     _, ctx_yaml_path, ctx_runtime_path = client_context_location(root_dir, cid)
     focus_data: dict[str, Any] = {
         "version": 1,
@@ -1678,37 +1721,46 @@ def run_focus(
     if ctx_yaml_path.is_file():
         focus_data["skill_context_path"] = str(ctx_runtime_path)
     try:
-        focus_path.write_text(
-            json.dumps(focus_data, indent=2), encoding="utf-8",
-        )
-        step("persist", "ok")
+        focus_path.write_text(json.dumps(focus_data, indent=2), encoding="utf-8")
+        _focus_step(steps, is_json, "persist", "ok")
     except OSError as exc:
-        step("persist", "fail", {"error": str(exc)})
+        _focus_step(steps, is_json, "persist", "fail", {"error": str(exc)})
 
-    # --- Build summary --------------------------------------------------------
-    has_fail = any(s.get("status") == "fail" for s in steps)
 
-    # Compact counts for text output
-    repos_present = sum(1 for r in live.get("repos", []) if r.get("present"))
-    repos_dirty = sum(1 for r in live.get("repos", []) if r.get("dirty", 0) > 0)
-    svcs_running = sum(1 for s in live.get("services", []) if s.get("healthy"))
-    svcs_down = sum(
-        1 for s in live.get("services", [])
-        if s.get("state") in ("stopped", "not-running", "declared")
-    )
-    checks_ok = sum(1 for c in live.get("checks", []) if c.get("ok"))
-    checks_total = len(live.get("checks", []))
-    error_count = sum(
-        len(lg.get("recent_errors", []))
-        for lg in live.get("logs", [])
-    )
+def _focus_summary_counts(live: dict[str, Any]) -> dict[str, int]:
+    return {
+        "repos_present": sum(1 for r in live.get("repos", []) if r.get("present")),
+        "repos_dirty": sum(1 for r in live.get("repos", []) if r.get("dirty", 0) > 0),
+        "services_running": sum(1 for s in live.get("services", []) if s.get("healthy")),
+        "services_down": sum(
+            1 for s in live.get("services", [])
+            if s.get("state") in ("stopped", "not-running", "declared")
+        ),
+        "checks_passing": sum(1 for c in live.get("checks", []) if c.get("ok")),
+        "checks_total": len(live.get("checks", [])),
+        "recent_errors": sum(
+            len(lg.get("recent_errors", [])) for lg in live.get("logs", [])
+        ),
+    }
 
-    # Build local_runtime section via WG-004 reconciliation helpers ------------
-    # run_focus used to emit an ad-hoc local_runtime block derived solely from
-    # bridge outputs.  WG-005 wires it into the shared reconciliation surface
-    # (reconcile_local_runtime_env + local_runtime_focus_payload) so focus and
-    # up both agree on the readiness decision and emit the same US-1 shape.
-    local_runtime_section: dict[str, Any] | None = None
+
+def _focus_local_runtime_section(
+    model: dict[str, Any],
+    active_local_profile: str | None,
+    bridges: list[dict[str, Any]],
+    cid: str,
+    live: dict[str, Any],
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> dict[str, Any] | None:
+    """Build the local_runtime section.
+
+    WG-005 wires focus into the shared reconciliation surface
+    (reconcile_local_runtime_env + local_runtime_focus_payload) so focus and
+    up agree on the readiness decision and emit the same US-1 shape. When
+    no local-* profile is active but bridges are declared, fall back to the
+    legacy ad-hoc block for backwards compatibility.
+    """
     if active_local_profile:
         try:
             overlay_host_path = local_runtime_overlay_path(model, cid)
@@ -1719,79 +1771,139 @@ def run_focus(
                 dry_run=False,
             )
             focus_payload = local_runtime_focus_payload(
-                model,
-                reconcile_result,
-                client_id=cid,
+                model, reconcile_result, client_id=cid,
             )
-            local_runtime_section = focus_payload.get("local_runtime")
+            section = focus_payload.get("local_runtime")
             if reconcile_result.get("status") == "blocked":
-                step(
-                    "local-runtime-reconcile",
-                    "fail",
-                    {
-                        "profile": active_local_profile,
-                        "error": reconcile_result.get("error"),
-                    },
+                _focus_step(
+                    steps, is_json, "local-runtime-reconcile", "fail",
+                    {"profile": active_local_profile, "error": reconcile_result.get("error")},
                 )
             else:
-                step(
-                    "local-runtime-reconcile",
-                    "ok",
-                    {
-                        "profile": active_local_profile,
-                        "actions": reconcile_result.get("actions"),
-                    },
+                _focus_step(
+                    steps, is_json, "local-runtime-reconcile", "ok",
+                    {"profile": active_local_profile, "actions": reconcile_result.get("actions")},
                 )
+            return section
         except Exception as exc:  # pragma: no cover - defensive
-            step("local-runtime-reconcile", "fail", {"error": str(exc)})
-    elif bridges:
-        # No active local-* profile but bridges are declared (e.g. tests that
-        # run focus without an explicit profile).  Fall back to the legacy
-        # ad-hoc block so the output shape stays backwards compatible.
-        bridge_states_focus = []
-        for bridge in bridges:
-            state = bridge_outputs_state(bridge)
-            bridge_states_focus.append({"id": bridge["id"], "status": "ready" if state["state"] == "ok" else state["state"]})
-        local_runtime_section = {
-            "env_bridge": bridge_states_focus[0] if len(bridge_states_focus) == 1 else bridge_states_focus,
-            "services": [
-                {"id": s["id"], "state": s.get("state", "stopped")}
-                for s in live.get("services", [])
-            ],
-        }
+            _focus_step(steps, is_json, "local-runtime-reconcile", "fail", {"error": str(exc)})
+            return None
+    if not bridges:
+        return None
+    bridge_states_focus = []
+    for bridge in bridges:
+        state = bridge_outputs_state(bridge)
+        bridge_states_focus.append({
+            "id": bridge["id"],
+            "status": "ready" if state["state"] == "ok" else state["state"],
+        })
+    return {
+        "env_bridge": bridge_states_focus[0] if len(bridge_states_focus) == 1 else bridge_states_focus,
+        "services": [
+            {"id": s["id"], "state": s.get("state", "stopped")}
+            for s in live.get("services", [])
+        ],
+    }
 
-    payload = {
+
+def _focus_emit_summary(payload: dict[str, Any], summary: dict[str, int], cid: str, is_json: bool) -> None:
+    if is_json:
+        emit_json(payload)
+        return
+    print()
+    print(f"  Client:    {cid}")
+    print(f"  Repos:     {summary['repos_present']} present, {summary['repos_dirty']} dirty")
+    print(f"  Services:  {summary['services_running']} running, {summary['services_down']} down")
+    print(f"  Checks:    {summary['checks_passing']}/{summary['checks_total']} passing")
+    if summary["recent_errors"]:
+        print(f"  Errors:    {summary['recent_errors']} recent error(s) in logs")
+
+
+def run_focus(
+    *,
+    root_dir: Path,
+    client_id: str,
+    profiles: list[str],
+    service_filter: list[str],
+    resume: bool,
+    wait_seconds: float,
+    fmt: str,
+    context_dir: Path | None = None,
+) -> int:
+    """Focus macro: sync → bootstrap → up → collect live state → generate enriched context."""
+    steps: list[dict[str, Any]] = []
+    is_json = fmt == "json"
+    focus_path = root_dir / FOCUS_STATE_REL
+
+    if resume:
+        client_id, profiles, exit_code = _resolve_resume_focus_state(
+            focus_path, client_id, profiles, is_json,
+        )
+        if exit_code is not None:
+            return exit_code
+
+    cid, exit_code = _validate_focus_client(root_dir, client_id, is_json)
+    if exit_code is not None:
+        return exit_code
+
+    model, exit_code = _build_focus_model(root_dir, cid, profiles, steps, is_json)
+    if exit_code is not None or model is None:
+        return exit_code if exit_code is not None else EXIT_ERROR
+
+    profile_errors = validate_local_runtime_profiles(model)
+    if profile_errors:
+        return _focus_emit_local_runtime_payload(
+            {"client_id": cid, "steps": steps}, profile_errors[0], is_json,
+        )
+
+    active_local_profile = local_runtime_active_profile(model)
+    exit_code = _focus_local_runtime_preflight(model, active_local_profile, cid, steps, is_json)
+    if exit_code is not None:
+        return exit_code
+
+    _focus_compose_override_step(root_dir, model, cid, steps, is_json)
+
+    exit_code = _focus_sync_step(model, cid, steps, is_json)
+    if exit_code is not None:
+        return exit_code
+
+    bridges, bridge_detail = _focus_bridge_freshness_step(model, cid, steps, is_json)
+
+    exit_code = _focus_bootstrap_step(model, root_dir, cid, bridge_detail, steps, is_json)
+    if exit_code is not None:
+        return exit_code
+
+    exit_code = _focus_bridge_verify_step(bridges, cid, steps, is_json)
+    if exit_code is not None:
+        return exit_code
+
+    exit_code = _focus_up_step(model, service_filter, wait_seconds, cid, steps, is_json)
+    if exit_code is not None:
+        return exit_code
+
+    live = _focus_collect_live_step(model, root_dir, steps, is_json)
+    _focus_skill_context_step(model, root_dir, steps, is_json)
+    _focus_enriched_context_step(model, live, root_dir, context_dir, steps, is_json)
+    _focus_persist_step(focus_path, model, cid, service_filter, root_dir, steps, is_json)
+
+    summary = _focus_summary_counts(live)
+    local_runtime_section = _focus_local_runtime_section(
+        model, active_local_profile, bridges, cid, live, steps, is_json,
+    )
+    has_fail = any(s.get("status") == "fail" for s in steps)
+    payload: dict[str, Any] = {
         "client_id": cid,
         "active_profiles": sorted(model.get("active_profiles") or []),
         "steps": steps,
         "live_state": live,
-        "summary": {
-            "repos_present": repos_present,
-            "repos_dirty": repos_dirty,
-            "services_running": svcs_running,
-            "services_down": svcs_down,
-            "checks_passing": checks_ok,
-            "checks_total": checks_total,
-            "recent_errors": error_count,
-        },
+        "summary": summary,
         "next_actions": next_actions_for_focus(cid, has_fail, live.get("services") or []),
     }
     if local_runtime_section:
         payload["local_runtime"] = local_runtime_section
 
     log_runtime_event("focus.activated", cid, payload.get("summary", {}), root_dir)
-
-    if is_json:
-        emit_json(payload)
-    else:
-        print()
-        print(f"  Client:    {cid}")
-        print(f"  Repos:     {repos_present} present, {repos_dirty} dirty")
-        print(f"  Services:  {svcs_running} running, {svcs_down} down")
-        print(f"  Checks:    {checks_ok}/{checks_total} passing")
-        if error_count:
-            print(f"  Errors:    {error_count} recent error(s) in logs")
-
+    _focus_emit_summary(payload, summary, cid, is_json)
     return EXIT_DRIFT if has_fail else EXIT_OK
 
 
