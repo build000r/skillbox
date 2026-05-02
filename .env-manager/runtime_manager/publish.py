@@ -453,6 +453,196 @@ def commit_client_publish(target_dir: Path, client_id: str) -> str:
     return commit_hash
 
 
+def _validate_publish_target(target_dir: Path) -> None:
+    target_state = git_repo_state(target_dir)
+    if not target_state.get("git"):
+        raise RuntimeError(f"client-publish target must be a git repo: {target_dir}")
+    blocked_dirty = [
+        rel for rel in git_dirty_paths(target_dir)
+        if not rel.startswith(f"{CLIENT_PUBLISH_ROOT_REL.as_posix()}/")
+    ]
+    if blocked_dirty:
+        raise RuntimeError(f"client-publish target repo has a dirty working tree: {target_dir}")
+
+
+def _validate_publish_args(
+    from_bundle_arg: str | None, profiles: list[str] | None, require_acceptance: bool,
+) -> None:
+    if from_bundle_arg and profiles:
+        raise RuntimeError("client-publish cannot combine --from-bundle with --profile.")
+    if from_bundle_arg and require_acceptance:
+        raise RuntimeError("client-publish cannot combine --from-bundle with --acceptance.")
+
+
+def _run_acceptance_for_publish(
+    root_dir: Path, cid: str, profiles: list[str] | None,
+) -> dict[str, Any]:
+    from .workflows import run_manage_json_command
+    profile_args = [arg for profile in profiles or [] for arg in ("--profile", profile)]
+    acceptance_args = ["acceptance", cid, *profile_args, "--format", "json"]
+    acceptance_code, acceptance_payload = run_manage_json_command(root_dir, acceptance_args)
+    if acceptance_code != EXIT_OK or not acceptance_payload.get("ready"):
+        error_payload = acceptance_payload.get("error") or {}
+        error_message = str(error_payload.get("message") or "").strip() or (
+            f"Acceptance failed during client-publish for {cid}."
+        )
+        raise RuntimeError(error_message)
+    return acceptance_payload
+
+
+def _resolve_publish_bundle(
+    root_dir: Path, cid: str, from_bundle_arg: str | None, profiles: list[str] | None,
+) -> tuple[Path, str, "tempfile.TemporaryDirectory[str] | None"]:
+    if from_bundle_arg:
+        bundle_dir = resolve_client_publish_bundle_dir(root_dir, from_bundle_arg)
+        return bundle_dir, f"use-bundle: {repo_rel(root_dir, bundle_dir)}", None
+    temp_bundle = tempfile.TemporaryDirectory(prefix=f".skillbox-client-publish-{cid}-")
+    bundle_dir = Path(temp_bundle.name) / "bundle"
+    project_client_bundle(
+        root_dir, cid, profiles=profiles, output_dir_arg=str(bundle_dir),
+        dry_run=False, force=True,
+    )
+    return bundle_dir, f"build-bundle: {cid}", temp_bundle
+
+
+def _compute_publish_change_state(
+    bundle: dict[str, Any],
+    current_dir: Path,
+    publish_metadata_path: Path,
+    acceptance_metadata: dict[str, Any] | None,
+    current_acceptance_metadata: dict[str, Any] | None,
+    acceptance_metadata_path: Path,
+) -> tuple[bool, bool, bool]:
+    payload_changed = not bundle_matches_publish_target(bundle, current_dir, publish_metadata_path)
+    acceptance_changed = (
+        acceptance_metadata is not None
+        and not acceptance_metadata_matches(current_acceptance_metadata, acceptance_metadata)
+    )
+    acceptance_removed = (
+        payload_changed
+        and acceptance_metadata is None
+        and acceptance_metadata_path.is_file()
+    )
+    return payload_changed, acceptance_changed, acceptance_removed
+
+
+def _resolve_publish_deploy_state(
+    *,
+    write_deploy_artifact: bool,
+    source_commit: str | None,
+    bundle: dict[str, Any],
+    cid: str,
+    root_dir: Path,
+    deploy_artifacts_dir: Path,
+    current_deploy_metadata: dict[str, Any] | None,
+    client_root: Path,
+) -> tuple[dict[str, Any] | None, bool, bool]:
+    deploy_metadata: dict[str, Any] | None = None
+    deploy_changed = False
+    deploy_removed = False
+
+    if write_deploy_artifact:
+        if not source_commit:
+            raise RuntimeError(
+                "client-publish --deploy-artifact requires a git-backed source checkout with a resolvable HEAD commit."
+            )
+        archive_name = f"skillbox-{source_commit[:12]}.tar.gz"
+        archive_rel = (CLIENT_DEPLOY_ARTIFACTS_REL / archive_name).as_posix()
+        archive_path = deploy_artifacts_dir / archive_name
+        archive_sha256 = file_sha256(archive_path) if archive_path.is_file() else ""
+        candidate_deploy_metadata = build_client_deploy_metadata(
+            bundle, client_id=cid, source_commit=source_commit,
+            archive_rel=archive_rel, archive_sha256=archive_sha256,
+        )
+        if archive_path.is_file() and deploy_metadata_matches(
+            current_deploy_metadata, candidate_deploy_metadata,
+        ):
+            return candidate_deploy_metadata, False, False
+        remove_path(deploy_artifacts_dir)
+        write_client_source_archive(root_dir, archive_path, source_commit=source_commit)
+        archive_sha256 = file_sha256(archive_path)
+        deploy_metadata = build_client_deploy_metadata(
+            bundle, client_id=cid, source_commit=source_commit,
+            archive_rel=archive_rel, archive_sha256=archive_sha256,
+        )
+        return deploy_metadata, True, False
+
+    if current_deploy_metadata is None:
+        return None, False, False
+
+    current_archive_rel = str(current_deploy_metadata.get("archive") or "").strip()
+    current_archive_path = (
+        client_root / Path(*PurePosixPath(current_archive_rel).parts)
+        if current_archive_rel else None
+    )
+    deploy_stale = (
+        str(current_deploy_metadata.get("payload_tree_sha256") or "").strip().lower()
+        != str(bundle["payload_tree_sha256"]).strip().lower()
+        or str(current_deploy_metadata.get("source_commit") or "").strip() != str(source_commit or "").strip()
+        or current_archive_path is None
+        or not current_archive_path.is_file()
+    )
+    return None, False, deploy_stale
+
+
+def _apply_publish_changes(
+    *,
+    payload_changed: bool,
+    acceptance_metadata: dict[str, Any] | None,
+    acceptance_removed: bool,
+    deploy_metadata: dict[str, Any] | None,
+    deploy_removed: bool,
+    bundle: dict[str, Any],
+    bundle_dir: Path,
+    current_dir: Path,
+    publish_metadata_path: Path,
+    acceptance_metadata_path: Path,
+    deploy_metadata_path: Path,
+    deploy_artifacts_dir: Path,
+    client_root: Path,
+    target_dir: Path,
+    cid: str,
+    source_commit: str | None,
+    commit: bool,
+    actions: list[str],
+) -> str | None:
+    """Apply staging + writes + optional commit. Returns commit_hash or None."""
+    if payload_changed:
+        stage_bundle_for_publish(bundle_dir, current_dir)
+    if acceptance_metadata is not None:
+        write_json_file(acceptance_metadata_path, acceptance_metadata)
+        actions.append(f"write-file: {repo_rel(target_dir, acceptance_metadata_path)}")
+    elif acceptance_removed:
+        remove_path(acceptance_metadata_path)
+        actions.append(f"remove-file: {repo_rel(target_dir, acceptance_metadata_path)}")
+    publish_payload = build_client_publish_metadata(
+        bundle, client_id=cid, source_commit=source_commit,
+        acceptance_payload=acceptance_metadata,
+    )
+    write_json_file(publish_metadata_path, publish_payload)
+    actions.append(f"publish-current: {repo_rel(target_dir, current_dir)}")
+    actions.append(f"write-file: {repo_rel(target_dir, publish_metadata_path)}")
+
+    if deploy_metadata is not None:
+        write_json_file(deploy_metadata_path, deploy_metadata)
+        archive_path = client_root / Path(*PurePosixPath(str(deploy_metadata["archive"])).parts)
+        actions.append(f"write-file: {repo_rel(target_dir, archive_path)}")
+        actions.append(f"write-file: {repo_rel(target_dir, deploy_metadata_path)}")
+    elif deploy_removed:
+        remove_path(deploy_artifacts_dir)
+        remove_path(deploy_metadata_path)
+        actions.append(f"remove-path: {repo_rel(target_dir, deploy_artifacts_dir)}")
+        actions.append(f"remove-file: {repo_rel(target_dir, deploy_metadata_path)}")
+
+    if not commit:
+        return None
+    committed = commit_client_publish(target_dir, cid)
+    if committed:
+        actions.append(f"git-commit: {committed}")
+        return committed
+    return None
+
+
 def publish_client_bundle(
     root_dir: Path,
     client_id: str,
@@ -464,70 +654,30 @@ def publish_client_bundle(
     write_deploy_artifact: bool = False,
     commit: bool = False,
 ) -> dict[str, Any]:
-    from .workflows import run_manage_json_command
-
     cid = validate_client_id(client_id)
     target_dir = resolve_client_publish_target_dir(root_dir, target_dir_arg)
-    target_state = git_repo_state(target_dir)
-    if not target_state.get("git"):
-        raise RuntimeError(f"client-publish target must be a git repo: {target_dir}")
-    dirty_paths = git_dirty_paths(target_dir)
-    blocked_dirty_paths = [
-        rel_path
-        for rel_path in dirty_paths
-        if not rel_path.startswith(f"{CLIENT_PUBLISH_ROOT_REL.as_posix()}/")
-    ]
-    if blocked_dirty_paths:
-        raise RuntimeError(f"client-publish target repo has a dirty working tree: {target_dir}")
-
-    if from_bundle_arg and profiles:
-        raise RuntimeError("client-publish cannot combine --from-bundle with --profile.")
-    if from_bundle_arg and require_acceptance:
-        raise RuntimeError("client-publish cannot combine --from-bundle with --acceptance.")
+    _validate_publish_target(target_dir)
+    _validate_publish_args(from_bundle_arg, profiles, require_acceptance)
 
     actions: list[str] = []
     source_commit = git_head_commit(root_dir)
-    bundle_dir: Path
-    temp_bundle: tempfile.TemporaryDirectory[str] | None = None
     acceptance_run_payload: dict[str, Any] | None = None
+    temp_bundle: tempfile.TemporaryDirectory[str] | None = None
 
     try:
         if require_acceptance:
-            profile_args = [arg for profile in profiles or [] for arg in ("--profile", profile)]
-            acceptance_args = ["acceptance", cid, *profile_args, "--format", "json"]
-            acceptance_code, acceptance_payload = run_manage_json_command(root_dir, acceptance_args)
-            if acceptance_code != EXIT_OK or not acceptance_payload.get("ready"):
-                error_payload = acceptance_payload.get("error") or {}
-                error_message = str(error_payload.get("message") or "").strip() or (
-                    f"Acceptance failed during client-publish for {cid}."
-                )
-                raise RuntimeError(error_message)
-            acceptance_run_payload = acceptance_payload
+            acceptance_run_payload = _run_acceptance_for_publish(root_dir, cid, profiles)
             actions.append(f"run-acceptance: {cid}")
 
-        if from_bundle_arg:
-            bundle_dir = resolve_client_publish_bundle_dir(root_dir, from_bundle_arg)
-            actions.append(f"use-bundle: {repo_rel(root_dir, bundle_dir)}")
-        else:
-            temp_bundle = tempfile.TemporaryDirectory(prefix=f".skillbox-client-publish-{cid}-")
-            bundle_dir = Path(temp_bundle.name) / "bundle"
-            project_client_bundle(
-                root_dir,
-                cid,
-                profiles=profiles,
-                output_dir_arg=str(bundle_dir),
-                dry_run=False,
-                force=True,
-            )
-            actions.append(f"build-bundle: {cid}")
+        bundle_dir, bundle_action, temp_bundle = _resolve_publish_bundle(
+            root_dir, cid, from_bundle_arg, profiles,
+        )
+        actions.append(bundle_action)
 
         bundle = load_client_projection_bundle(bundle_dir, expected_client_id=cid)
         acceptance_metadata = (
             build_client_acceptance_metadata(
-                bundle,
-                acceptance_run_payload,
-                client_id=cid,
-                source_commit=source_commit,
+                bundle, acceptance_run_payload, client_id=cid, source_commit=source_commit,
             )
             if acceptance_run_payload is not None
             else None
@@ -542,117 +692,51 @@ def publish_client_bundle(
         ) = client_publish_paths(target_dir, cid)
         current_acceptance_metadata = (
             load_json_file(acceptance_metadata_path)
-            if acceptance_metadata_path.is_file()
-            else None
+            if acceptance_metadata_path.is_file() else None
         )
         current_deploy_metadata = (
             load_json_file(deploy_metadata_path)
-            if deploy_metadata_path.is_file()
-            else None
+            if deploy_metadata_path.is_file() else None
         )
-        payload_changed = not bundle_matches_publish_target(bundle, current_dir, publish_metadata_path)
-        acceptance_changed = (
-            acceptance_metadata is not None
-            and not acceptance_metadata_matches(current_acceptance_metadata, acceptance_metadata)
-        )
-        acceptance_removed = (
-            payload_changed
-            and acceptance_metadata is None
-            and acceptance_metadata_path.is_file()
-        )
-        deploy_metadata: dict[str, Any] | None = None
-        deploy_changed = False
-        deploy_removed = False
 
-        if write_deploy_artifact:
-            if not source_commit:
-                raise RuntimeError(
-                    "client-publish --deploy-artifact requires a git-backed source checkout with a resolvable HEAD commit."
-                )
-            archive_name = f"skillbox-{source_commit[:12]}.tar.gz"
-            archive_rel = (CLIENT_DEPLOY_ARTIFACTS_REL / archive_name).as_posix()
-            archive_path = deploy_artifacts_dir / archive_name
-            archive_sha256 = file_sha256(archive_path) if archive_path.is_file() else ""
-            candidate_deploy_metadata = build_client_deploy_metadata(
-                bundle,
-                client_id=cid,
-                source_commit=source_commit,
-                archive_rel=archive_rel,
-                archive_sha256=archive_sha256,
-            )
-            deploy_current = archive_path.is_file() and deploy_metadata_matches(
-                current_deploy_metadata,
-                candidate_deploy_metadata,
-            )
-            if deploy_current:
-                deploy_metadata = candidate_deploy_metadata
-            else:
-                remove_path(deploy_artifacts_dir)
-                write_client_source_archive(root_dir, archive_path, source_commit=source_commit)
-                archive_sha256 = file_sha256(archive_path)
-                deploy_metadata = build_client_deploy_metadata(
-                    bundle,
-                    client_id=cid,
-                    source_commit=source_commit,
-                    archive_rel=archive_rel,
-                    archive_sha256=archive_sha256,
-                )
-                deploy_changed = True
-        elif current_deploy_metadata is not None:
-            current_archive_rel = str(current_deploy_metadata.get("archive") or "").strip()
-            current_archive_path = (
-                client_root / Path(*PurePosixPath(current_archive_rel).parts)
-                if current_archive_rel
-                else None
-            )
-            deploy_stale = (
-                str(current_deploy_metadata.get("payload_tree_sha256") or "").strip().lower()
-                != str(bundle["payload_tree_sha256"]).strip().lower()
-                or str(current_deploy_metadata.get("source_commit") or "").strip() != str(source_commit or "").strip()
-                or current_archive_path is None
-                or not current_archive_path.is_file()
-            )
-            if deploy_stale:
-                deploy_removed = True
-
+        payload_changed, acceptance_changed, acceptance_removed = _compute_publish_change_state(
+            bundle, current_dir, publish_metadata_path,
+            acceptance_metadata, current_acceptance_metadata, acceptance_metadata_path,
+        )
+        deploy_metadata, deploy_changed, deploy_removed = _resolve_publish_deploy_state(
+            write_deploy_artifact=write_deploy_artifact,
+            source_commit=source_commit,
+            bundle=bundle,
+            cid=cid,
+            root_dir=root_dir,
+            deploy_artifacts_dir=deploy_artifacts_dir,
+            current_deploy_metadata=current_deploy_metadata,
+            client_root=client_root,
+        )
         changed = payload_changed or acceptance_changed or acceptance_removed or deploy_changed or deploy_removed
 
         commit_hash: str | None = None
         if changed:
-            if payload_changed:
-                stage_bundle_for_publish(bundle_dir, current_dir)
-            if acceptance_metadata is not None:
-                write_json_file(acceptance_metadata_path, acceptance_metadata)
-                actions.append(f"write-file: {repo_rel(target_dir, acceptance_metadata_path)}")
-            elif acceptance_removed:
-                remove_path(acceptance_metadata_path)
-                actions.append(f"remove-file: {repo_rel(target_dir, acceptance_metadata_path)}")
-            publish_payload = build_client_publish_metadata(
-                bundle,
-                client_id=cid,
+            commit_hash = _apply_publish_changes(
+                payload_changed=payload_changed,
+                acceptance_metadata=acceptance_metadata,
+                acceptance_removed=acceptance_removed,
+                deploy_metadata=deploy_metadata,
+                deploy_removed=deploy_removed,
+                bundle=bundle,
+                bundle_dir=bundle_dir,
+                current_dir=current_dir,
+                publish_metadata_path=publish_metadata_path,
+                acceptance_metadata_path=acceptance_metadata_path,
+                deploy_metadata_path=deploy_metadata_path,
+                deploy_artifacts_dir=deploy_artifacts_dir,
+                client_root=client_root,
+                target_dir=target_dir,
+                cid=cid,
                 source_commit=source_commit,
-                acceptance_payload=acceptance_metadata,
+                commit=commit,
+                actions=actions,
             )
-            write_json_file(publish_metadata_path, publish_payload)
-            actions.append(f"publish-current: {repo_rel(target_dir, current_dir)}")
-            actions.append(f"write-file: {repo_rel(target_dir, publish_metadata_path)}")
-
-            if deploy_metadata is not None:
-                write_json_file(deploy_metadata_path, deploy_metadata)
-                archive_path = client_root / Path(*PurePosixPath(str(deploy_metadata["archive"])).parts)
-                actions.append(f"write-file: {repo_rel(target_dir, archive_path)}")
-                actions.append(f"write-file: {repo_rel(target_dir, deploy_metadata_path)}")
-            elif deploy_removed:
-                remove_path(deploy_artifacts_dir)
-                remove_path(deploy_metadata_path)
-                actions.append(f"remove-path: {repo_rel(target_dir, deploy_artifacts_dir)}")
-                actions.append(f"remove-file: {repo_rel(target_dir, deploy_metadata_path)}")
-
-            if commit:
-                committed = commit_client_publish(target_dir, cid)
-                if committed:
-                    commit_hash = committed
-                    actions.append(f"git-commit: {commit_hash}")
         else:
             actions.append(f"publish-noop: {repo_rel(target_dir, current_dir)}")
 
