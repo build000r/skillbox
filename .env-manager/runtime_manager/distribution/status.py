@@ -131,12 +131,18 @@ def _load_distribution_config(config_path: Path) -> dict[str, Any] | None:
         return None
 
 
-def _read_lockfile(lock_path: Path) -> Lockfile | None:
-    if not lock_path.is_file():
+def _read_json_file(path: Path) -> Any | None:
+    if not path.is_file():
         return None
     try:
-        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
+        return None
+
+
+def _read_lockfile(lock_path: Path) -> Lockfile | None:
+    payload = _read_json_file(lock_path)
+    if payload is None:
         return None
     try:
         return parse_lockfile(payload)
@@ -146,12 +152,7 @@ def _read_lockfile(lock_path: Path) -> Lockfile | None:
 
 def _read_cached_manifest(state_root: Path, distributor_id: str) -> dict[str, Any] | None:
     manifest_path = state_root / "manifests" / f"{distributor_id}.json"
-    if not manifest_path.is_file():
-        return None
-    try:
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
+    payload = _read_json_file(manifest_path)
     if isinstance(payload, dict):
         return payload
     return None
@@ -165,12 +166,7 @@ def _read_cached_auth_probe_result(state_root: Path, distributor_id: str) -> str
         manifests_dir / f"{distributor_id}.doctor.json",
     ]
     for path in candidates:
-        if not path.is_file():
-            continue
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
+        payload = _read_json_file(path)
         if not isinstance(payload, dict):
             continue
         raw_value = (
