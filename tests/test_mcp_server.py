@@ -153,6 +153,47 @@ class SkillboxMcpServerTests(unittest.TestCase):
             },
         )
 
+    def test_tool_event_context_normalizes_scalar_and_repeated_scope(self) -> None:
+        context = MODULE.build_tool_event_context(
+            "skillbox_status",
+            "status",
+            {
+                "client": "personal",
+                "profile": [" local-core ", ""],
+                "service": ["api-stub", "web-stub"],
+            },
+            request_id=123,
+        )
+
+        self.assertEqual(
+            context,
+            {
+                "mcp_tool_name": "skillbox_status",
+                "manage_command": "status",
+                "mcp_request_id": "123",
+                "client_id": "personal",
+                "profile": ["local-core"],
+                "service": ["api-stub", "web-stub"],
+            },
+        )
+
+    def test_dispatch_tool_returns_structured_unknown_tool_error(self) -> None:
+        result = MODULE.dispatch_tool("skillbox_missing", {}, request_id="req-missing")
+
+        payload = _content_payload(result)
+        self.assertTrue(result["isError"])
+        self.assertEqual(payload["error"]["type"], "unknown_tool")
+        self.assertFalse(payload["error"]["recoverable"])
+        self.assertIn("skillbox_status", payload["error"]["available_tools"])
+
+    def test_dispatch_tool_rejects_missing_required_positional(self) -> None:
+        result = MODULE.dispatch_tool("skillbox_focus", {}, request_id="req-focus")
+
+        payload = _content_payload(result)
+        self.assertTrue(result["isError"])
+        self.assertEqual(payload["error"]["type"], "missing_required_parameter")
+        self.assertIn("client_id", payload["error"]["message"])
+
     def test_skillbox_skills_is_exposed_and_maps_scope_arguments(self) -> None:
         tool_names = {tool["name"] for tool in MODULE.handle_tools_list({})["tools"]}
         self.assertIn("skillbox_skills", tool_names)
@@ -322,6 +363,120 @@ class SkillboxMcpServerTests(unittest.TestCase):
             "skillbox_overlay",
         )
 
+    def test_skillbox_mmdx_open_maps_fuzzy_query_without_opening(self) -> None:
+        tool_names = {tool["name"] for tool in MODULE.handle_tools_list({})["tools"]}
+        self.assertIn("skillbox_mmdx_open", tool_names)
+
+        with mock.patch.object(
+            MODULE,
+            "run_manage",
+            return_value=(True, 0, {"action": "resolved"}),
+        ) as run_manage:
+            result = MODULE.handle_tools_call(
+                {
+                    "name": "skillbox_mmdx_open",
+                    "arguments": {
+                        "query": "skill review realms",
+                        "cwd": "/tmp/repo",
+                        "search_root": ["/tmp/repo/docs"],
+                        "open": False,
+                        "limit": 5,
+                    },
+                },
+                request_id="req-mmdx",
+            )
+
+        payload = _content_payload(result)
+        self.assertEqual(payload["action"], "resolved")
+        args = run_manage.call_args.args[0]
+        self.assertEqual(args[:3], ["mmdx", "--format", "json"])
+        self.assertIn("skill review realms", args)
+        self.assertIn("--cwd", args)
+        self.assertIn("/tmp/repo", args)
+        self.assertIn("--search-root", args)
+        self.assertIn("/tmp/repo/docs", args)
+        self.assertIn("--no-open", args)
+        self.assertIn("--limit", args)
+        self.assertIn("5", args)
+        self.assertEqual(
+            run_manage.call_args.kwargs["event_context"]["mcp_tool_name"],
+            "skillbox_mmdx_open",
+        )
+
+    def test_skillbox_operator_booking_maps_book_arguments(self) -> None:
+        tool_names = {tool["name"] for tool in MODULE.handle_tools_list({})["tools"]}
+        self.assertIn("skillbox_operator_booking", tool_names)
+        tool = next(tool for tool in MODULE.handle_tools_list({})["tools"] if tool["name"] == "skillbox_operator_booking")
+        self.assertIn("book", tool["inputSchema"]["properties"]["action"]["enum"])
+
+        with mock.patch.object(
+            MODULE,
+            "run_manage",
+            return_value=(True, 0, {"action": "book"}),
+        ) as run_manage:
+            result = MODULE.handle_tools_call(
+                {
+                    "name": "skillbox_operator_booking",
+                    "arguments": {
+                        "action": "book",
+                        "client": ["personal"],
+                        "profile": ["local-all"],
+                        "date": "2026-05-06",
+                        "slot": "AM",
+                        "email": "customer@example.com",
+                        "name": "Customer Example",
+                        "access_token_env": "SPAPS_AUTH_ACCESS_TOKEN",
+                        "send_magic_link": True,
+                        "dry_run": True,
+                    },
+                },
+                request_id="req-operator-booking",
+            )
+
+        payload = _content_payload(result)
+        self.assertEqual(payload["action"], "book")
+        args = run_manage.call_args.args[0]
+        self.assertEqual(args[:3], ["operator-booking", "book", "--format"])
+        self.assertIn("--client", args)
+        self.assertIn("personal", args)
+        self.assertIn("--profile", args)
+        self.assertIn("local-all", args)
+        self.assertIn("--date", args)
+        self.assertIn("2026-05-06", args)
+        self.assertIn("--slot", args)
+        self.assertIn("AM", args)
+        self.assertIn("--email", args)
+        self.assertIn("customer@example.com", args)
+        self.assertIn("--name", args)
+        self.assertIn("Customer Example", args)
+        self.assertIn("--access-token-env", args)
+        self.assertIn("SPAPS_AUTH_ACCESS_TOKEN", args)
+        self.assertIn("--send-magic-link", args)
+        self.assertIn("--dry-run", args)
+        self.assertEqual(
+            run_manage.call_args.kwargs["event_context"]["mcp_tool_name"],
+            "skillbox_operator_booking",
+        )
+
+    def test_skillbox_operator_booking_defaults_to_availability(self) -> None:
+        with mock.patch.object(
+            MODULE,
+            "run_manage",
+            return_value=(True, 0, {"action": "availability"}),
+        ) as run_manage:
+            result = MODULE.handle_tools_call(
+                {"name": "skillbox_operator_booking", "arguments": {"client": ["personal"]}},
+                request_id="req-operator-booking-default",
+            )
+
+        payload = _content_payload(result)
+        self.assertEqual(payload["action"], "availability")
+        self.assertEqual(run_manage.call_args.args[0][:3], ["operator-booking", "availability", "--format"])
+        self.assertEqual(
+            run_manage.call_args.kwargs["event_context"]["mcp_tool_name"],
+            "skillbox_operator_booking",
+        )
+
     def test_skillbox_events_replays_runtime_and_session_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -393,6 +548,63 @@ class SkillboxMcpServerTests(unittest.TestCase):
         self.assertEqual(errors[0][0], 1)
         self.assertEqual(errors[0][1], -32602)
         self.assertIn("Invalid log level", errors[0][2])
+
+    def test_main_handles_success_parse_error_notification_and_unknown_method(self) -> None:
+        sent: list[dict] = []
+        errors: list[tuple[object, int, str]] = []
+        stdin = io.StringIO(
+            "\n"
+            "{not-json}\n"
+            + json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"
+            + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "ping"}) + "\n"
+            + json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}) + "\n"
+            + json.dumps({"jsonrpc": "2.0", "id": 4, "method": "missing/method"}) + "\n"
+        )
+
+        with mock.patch.object(sys, "stdin", stdin), mock.patch.object(
+            MODULE,
+            "send",
+            side_effect=sent.append,
+        ), mock.patch.object(
+            MODULE,
+            "send_error",
+            side_effect=lambda msg_id, code, message: errors.append((msg_id, code, message)),
+        ):
+            MODULE.main()
+
+        self.assertEqual(errors[0][0], None)
+        self.assertEqual(errors[0][1], -32700)
+        self.assertEqual(errors[1], (4, -32601, "Method not found: missing/method"))
+        self.assertEqual(sent[0]["id"], 2)
+        self.assertEqual(sent[0]["result"], {})
+        self.assertEqual(sent[1]["id"], 3)
+        self.assertIn("tools", sent[1]["result"])
+
+    def test_main_maps_unhandled_handler_exception_to_internal_error(self) -> None:
+        errors: list[tuple[object, int, str]] = []
+        stdin = io.StringIO(
+            json.dumps({"jsonrpc": "2.0", "id": 5, "method": "boom"}) + "\n"
+        )
+
+        def boom(_params: dict, _request_id: object = None) -> dict:
+            raise RuntimeError("boom")
+
+        stderr = io.StringIO()
+        with mock.patch.dict(MODULE._HANDLERS, {"boom": boom}), mock.patch.object(
+            sys,
+            "stdin",
+            stdin,
+        ), mock.patch.object(sys, "stderr", stderr), mock.patch.object(
+            MODULE,
+            "send_error",
+            side_effect=lambda msg_id, code, message: errors.append((msg_id, code, message)),
+        ), mock.patch.object(
+            MODULE,
+            "send",
+        ):
+            MODULE.main()
+
+        self.assertEqual(errors[0], (5, -32603, "Internal error in boom"))
 
 
 if __name__ == "__main__":

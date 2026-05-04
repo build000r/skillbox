@@ -746,6 +746,7 @@ make runtime-sync
 | `.env-manager/manage.py doctor` | Validate the internal repos/skills/logs/check graph for the selected core/client scope | `python3 .env-manager/manage.py doctor --client personal` |
 | `.env-manager/manage.py status` | Summarize repo, artifact, skill, task, service, log, and health state for the selected core/client scope | `python3 .env-manager/manage.py status --client personal` |
 | `.env-manager/manage.py skills` | Show the effective skill set for a cwd/client/profile, with global extras, broken links, scope violations, project-local layers, and shadowed lower-precedence sources | `python3 .env-manager/manage.py skills --client personal --profile local-all --cwd "$PWD"` |
+| `.env-manager/manage.py mmdx` | Fuzzy-find and open local Mermaid/MMDX diagrams through the Buildooor diagrams viewer | `python3 .env-manager/manage.py mmdx --cwd "$PWD" skill review realms --no-open` |
 | `.env-manager/manage.py bootstrap` | Sync runtime state and run declared bootstrap tasks in dependency order | `python3 .env-manager/manage.py bootstrap --client acme-studio --task app-bootstrap` |
 | `.env-manager/manage.py up` | Sync runtime state, run any service-declared bootstrap tasks, and start manageable services, expanding declared `depends_on` prerequisites and waiting for healthchecks when present | `python3 .env-manager/manage.py up --profile surfaces --service api-stub` |
 | `.env-manager/manage.py down` | Stop manageable services started by the runtime manager, stopping selected dependents before their prerequisites | `python3 .env-manager/manage.py down --profile surfaces --service api-stub` |
@@ -1128,9 +1129,13 @@ default; pass `--scope global` or `--scope all` for wider cleanup. `remove`,
 `move`, and `prune` require `--dry-run` first or `--yes` to apply unlinking
 actions.
 
-The personal `sbp` wrapper delegates to the same lifecycle surface:
+The repo-owned `scripts/sbp` and `scripts/sbo` wrappers delegate to the same
+lifecycle surface. Install them as `~/.local/bin/sbp` and `~/.local/bin/sbo`
+with `make wrappers-install`, or pass `--install-wrappers` to `install.sh`
+when provisioning a checkout.
 
 ```bash
+make wrappers-install
 sbp
 sbp help
 sbp skills --issues-only
@@ -1140,15 +1145,24 @@ sbp skill activate mcp-server-design
 sbp overlay activate marketing
 sbp skill add ui --to category --category frontend
 sbp skill sync --dry-run
+sbp mmdx review
+sbp mmdx skill_review_realms/review --no-open
+sbo mmdx review
 ```
 
 `sbp` with no args is intentionally read-only: it prints a fast cwd-aware skill
 home view and next commands, skipping the slower global scan. Runtime mutation
 is explicit with `sbp up`, `sbp down`, `sbp restart`, or `sbp skill ...`; use
-`sbp skills --issues-only` for the full global/project drift check.
+`sbp skills --issues-only` for the full global/project drift check. `sbp mmdx`
+is the short path for downstream Mermaid/MMDX diagrams: it fuzzy-matches from
+the current repo and opens the selected file through the Buildooor diagrams
+viewer, while `--no-open` lists or resolves candidates without launching a
+browser.
 
 Agents can apply the same flow through the `skillbox_skill` and
-`skillbox_overlay` MCP tools after a dry-run review.
+`skillbox_overlay` MCP tools after a dry-run review. For diagrams, use
+`skillbox_mmdx_open` with `open=false` to resolve/list candidates before
+launching the viewer.
 
 ### Generated skill lockfiles
 

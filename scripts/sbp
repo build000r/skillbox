@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+client="${SKILLBOX_CLIENT:-personal}"
+profile="${SKILLBOX_PROFILE:-local-all}"
+mode="${SKILLBOX_MODE:-reuse}"
+action="home"
+services=()
+sync_paths=()
+passthrough_args=()
+invoke_cwd="${SKILLBOX_INVOKE_CWD:-$PWD}"
+overlay_name=""
+
+realpath_portable() {
+  python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+
+script_source="${BASH_SOURCE[0]:-${0:-}}"
+script_path="$(realpath_portable "${script_source}")"
+script_dir="$(cd "$(dirname "${script_path}")" && pwd -P)"
+
+find_skillbox_root() {
+  local candidate=""
+  local candidates=()
+  if [[ -n "${SKILLBOX_ROOT:-}" ]]; then
+    candidates+=("${SKILLBOX_ROOT}")
+  fi
+  candidates+=(
+    "${script_dir}/.."
+    "${HOME}/repos/opensource/skillbox"
+    "${HOME}/skillbox"
+  )
+  for candidate in "${candidates[@]}"; do
+    if [[ -f "${candidate}/.env-manager/manage.py" ]]; then
+      realpath_portable "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+print_help() {
+  cat <<'EOF'
+sbp - personal skillbox runtime and skill helper
+
+Usage:
+  sbp                         Compact home view for this cwd
+  sbp help                    Show this help
+  sbp up [profile] [service]  Start services (default profile: local-all)
+  sbp down [profile] [svc]    Stop services
+  sbp restart [profile] [svc] Restart services
+  sbp status [profile]        Runtime status
+  sbp logs [profile] service  Show service logs
+  sbp mmdx QUERY              Fuzzy-find and open .mmdx/.mmd from this cwd
+  sbp mmdx                    List recent .mmdx/.mmd files from this repo
+  sbp hire times              Show configured human-operator availability
+  sbp hire book [args...]     Send magic-link/signup email and create x402 hold
+                              Set SPAPS_AUTH_ACCESS_TOKEN to bind to a verified account.
+
+Skills:
+  sbp skills [args...]        Show effective skills for this cwd
+  sbp skills --issues-only    Compact skill drift/policy view
+  sbp skill plan NAME         Preview where NAME would be linked
+  sbp skill add NAME          Link NAME into global/project/category roots
+  sbp skill sync --dry-run    Link cwd-required missing skills
+  sbp skill prune --dry-run   Preview policy-violation unlinks
+  sbp sync /path/to/skill     Legacy shorthand for global skill add
+
+Overlays:
+  sbp m                       Toggle the marketing overlay on/off.
+                              Off-flip unlinks overlay-scoped symlinks.
+                              Pass --keep to preserve them.
+  sbp overlay                 List active overlays
+  sbp overlay on NAME         Enable overlay (e.g. marketing)
+  sbp overlay off NAME        Disable overlay + unlink overlay-scoped symlinks
+  sbp overlay off NAME --keep Disable overlay, keep symlinks in place
+  sbp overlay toggle NAME     Flip overlay state (off-flip unlinks unless --keep)
+
+Profiles:
+  all | local-all, core | local-core, minimal | mini | local-minimal,
+  backend | local-backend, frontend | front | local-frontend,
+  openclaw | claw | local-openclaw
+
+Examples:
+  sbp
+  sbp status core
+  sbp skills --issues-only
+  sbp skill plan mcp-server-design
+  sbp skill add ui --to category --category frontend
+  sbp mmdx review
+  sbp mmdx skill review --no-open
+  sbp hire times --limit 3
+  sbp hire book --date 2026-05-06 --slot AM --email person@example.com --name "Person" --send-magic-link
+  sbp up backend spaps
+EOF
+}
+
+skillbox_root="$(find_skillbox_root || true)"
+if [[ -z "${skillbox_root}" ]]; then
+  echo "sbp: missing skillbox repo; set SKILLBOX_ROOT or install from a checkout" >&2
+  exit 1
+fi
+
+case "${1:-}" in
+  "" )
+    ;;
+  -h|--help|help)
+    action="help"
+    shift
+    ;;
+  m|marketing)
+    action="overlay-toggle"
+    overlay_name="marketing"
+    shift
+    ;;
+  overlay)
+    action="overlay"
+    shift
+    ;;
+  up|all)
+    action="up"
+    shift
+    ;;
+  down)
+    action="down"
+    shift
+    ;;
+  re|restart)
+    action="restart"
+    shift
+    ;;
+  status)
+    action="status"
+    shift
+    ;;
+  logs)
+    action="logs"
+    shift
+    ;;
+  mmdx|mmd)
+    action="mmdx"
+    shift
+    ;;
+  hire|operator-booking)
+    action="operator-booking"
+    shift
+    ;;
+  sync)
+    action="sync"
+    shift
+    ;;
+  skill)
+    action="skill"
+    shift
+    ;;
+  skills)
+    action="skills"
+    shift
+    ;;
+esac
+
+if [[ "${action}" != "mmdx" ]]; then
+  case "${1:-}" in
+    all|local-all)
+      profile="local-all"
+      shift
+      ;;
+    core|local-core)
+      profile="local-core"
+      shift
+      ;;
+    minimal|mini|local-minimal)
+      profile="local-minimal"
+      shift
+      ;;
+    backend|local-backend)
+      profile="local-backend"
+      shift
+      ;;
+    frontend|front|local-frontend)
+      profile="local-frontend"
+      shift
+      ;;
+    openclaw|claw|local-openclaw)
+      profile="local-openclaw"
+      shift
+      ;;
+  esac
+fi
+
+append_passthrough_token() {
+  local token="$1"
+  case "${action}" in
+    sync)
+      sync_paths+=("${token}")
+      ;;
+    skills|skill|overlay|overlay-toggle|mmdx|operator-booking)
+      passthrough_args+=("${token}")
+      ;;
+    *)
+      services+=("${token}")
+      ;;
+  esac
+}
+
+while [[ $# -gt 0 ]]; do
+  append_passthrough_token "$1"
+  shift
+done
+
+if [[ ! -t 0 && "${action}" != "home" && "${action}" != "help" ]]; then
+  while IFS= read -r line; do
+    line="${line//,/ }"
+    # Intentional shell-word splitting for simple pipe-friendly wrapper input.
+    # shellcheck disable=SC2206
+    tokens=(${line})
+    for token in "${tokens[@]}"; do
+      [[ -n "${token}" ]] && append_passthrough_token "${token}"
+    done
+  done
+fi
+
+if [[ "${action}" == "sync" ]]; then
+  resolved_sync_paths=()
+  for sync_path in "${sync_paths[@]}"; do
+    if [[ "${sync_path}" != /* ]]; then
+      sync_path="${invoke_cwd}/${sync_path}"
+    fi
+    resolved_sync_paths+=("$(realpath_portable "${sync_path}")")
+  done
+  sync_paths=("${resolved_sync_paths[@]}")
+fi
+
+if [[ "${action}" == "skills" && ${#passthrough_args[@]} -gt 0 ]]; then
+  case "${passthrough_args[0]}" in
+    plan|add|move|remove|prune|sync)
+      action="skill"
+      ;;
+  esac
+fi
+
+service_flags=()
+for service in "${services[@]}"; do
+  service_flags+=(--service "${service}")
+done
+
+cd "${skillbox_root}"
+
+case "${action}" in
+  home)
+    echo "sbp: ${client} ${profile}"
+    echo "cwd: ${invoke_cwd}"
+    python3 .env-manager/manage.py skills --client "${client}" --profile "${profile}" --cwd "${invoke_cwd}" --issues-only --limit 20 --no-global || true
+    echo
+    echo "next:"
+    echo "  sbp status        runtime status"
+    echo "  sbp up            start services"
+    echo "  sbp skills --issues-only full skill drift check"
+    echo "  sbp skills --full full skill view"
+    echo "  sbp help          command reference"
+    ;;
+  help)
+    print_help
+    ;;
+  up)
+    python3 .env-manager/manage.py up --client "${client}" --profile "${profile}" --mode "${mode}" "${service_flags[@]}"
+    ;;
+  down)
+    python3 .env-manager/manage.py down --client "${client}" --profile "${profile}" "${service_flags[@]}"
+    ;;
+  restart)
+    python3 .env-manager/manage.py restart --client "${client}" --profile "${profile}" "${service_flags[@]}"
+    ;;
+  status)
+    python3 .env-manager/manage.py status --client "${client}" --profile "${profile}"
+    ;;
+  logs)
+    if [[ ${#services[@]} -eq 0 ]]; then
+      echo "sbp logs: pass at least one service, e.g. 'sbp logs spaps'" >&2
+      exit 2
+    fi
+    python3 .env-manager/manage.py logs --client "${client}" --profile "${profile}" "${service_flags[@]}"
+    ;;
+  mmdx)
+    python3 .env-manager/manage.py mmdx --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    ;;
+  operator-booking)
+    python3 .env-manager/manage.py operator-booking --client "${client}" --profile "${profile}" "${passthrough_args[@]}"
+    ;;
+  skills)
+    python3 .env-manager/manage.py skills --profile "${profile}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    ;;
+  skill)
+    if [[ ${#passthrough_args[@]} -eq 0 ]]; then
+      echo "sbp skill: pass an action, e.g. 'sbp skill add ui --to project'" >&2
+      exit 2
+    fi
+    skill_action="${passthrough_args[0]}"
+    skill_args=("${passthrough_args[@]:1}")
+    python3 .env-manager/manage.py skill "${skill_action}" --profile "${profile}" --cwd "${invoke_cwd}" "${skill_args[@]}"
+    ;;
+  overlay)
+    python3 .env-manager/manage.py overlay --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    echo
+    echo "applying policy for this cwd..."
+    python3 .env-manager/manage.py skill sync --profile "${profile}" --cwd "${invoke_cwd}" || true
+    ;;
+  overlay-toggle)
+    python3 .env-manager/manage.py overlay toggle "${overlay_name}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    echo
+    echo "applying policy for this cwd..."
+    python3 .env-manager/manage.py skill sync --profile "${profile}" --cwd "${invoke_cwd}" || true
+    ;;
+  sync)
+    if [[ ${#sync_paths[@]} -eq 0 ]]; then
+      echo "sbp sync: pass at least one skill path, e.g. 'sbp sync /path/to/ga4'" >&2
+      exit 2
+    fi
+    for sync_path in "${sync_paths[@]}"; do
+      if [[ ! -d "${sync_path}" ]]; then
+        echo "sbp sync: not a directory: ${sync_path}" >&2
+        exit 1
+      fi
+      if [[ ! -f "${sync_path}/SKILL.md" ]]; then
+        echo "sbp sync: missing SKILL.md in ${sync_path}" >&2
+        exit 1
+      fi
+      skill_name="$(basename "${sync_path}")"
+      python3 .env-manager/manage.py skill add "${skill_name}" \
+        --profile "${profile}" \
+        --cwd "${invoke_cwd}" \
+        --to global \
+        --source "${sync_path}"
+    done
+    ;;
+esac

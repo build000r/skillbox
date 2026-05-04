@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+script_source="${BASH_SOURCE[0]:-${0:-}}"
+script_path="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${script_source}")"
+script_dir="$(cd "$(dirname "${script_path}")" && pwd -P)"
+
+exec "${script_dir}/sbp" "$@"

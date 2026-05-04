@@ -394,6 +394,121 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "skillbox_mmdx_open",
+        "description": (
+            "Fuzzy-find and open a local .mmdx or .mmd diagram through the Buildooor diagrams viewer. "
+            "Use this instead of spelling out the mmdx skill script path. "
+            "Discovery: pass cwd as the downstream repo/current working directory, then pass query as a "
+            "file path, stem, or fuzzy path fragment such as 'skill review realms'. "
+            "Omit query or set open=false to list candidates without launching the browser. "
+            "Returns selected path, alternatives, viewer URL, and next_actions."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "File path, basename, stem, or fuzzy path fragment. Omit to list recent diagrams.",
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Current downstream repo/workspace directory. Defaults to the MCP server process cwd.",
+                },
+                "search_root": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Explicit directories to scan. Omit to scan the cwd git root, then cwd.",
+                },
+                "open": {
+                    "type": "boolean",
+                    "description": "Open the selected match in the browser. Defaults to true when query resolves.",
+                    "default": True,
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum candidate rows to return.",
+                    "default": 8,
+                },
+                "tmux": {
+                    "type": "boolean",
+                    "description": "Open with the MMDX skill's local tmux handoff bridge.",
+                    "default": False,
+                },
+                "tmux_submit": {
+                    "type": "boolean",
+                    "description": "With tmux=true, press Enter after the viewer sends a handoff packet.",
+                    "default": False,
+                },
+                "allow_parser_install": {
+                    "type": "boolean",
+                    "description": "Allow the MMDX script to install its Mermaid parser dependency if missing.",
+                    "default": False,
+                },
+            },
+        },
+    },
+    {
+        "name": "skillbox_operator_booking",
+        "description": (
+            "Fetch configured human-operator availability or create an x402 dayrate booking hold through SPAPS. "
+            "Uses the active client overlay's human_operator/operator_booking config, the configured publishable key, "
+            "and the production rate-limited SPAPS endpoints. For book, pass date, slot, email, and name; "
+            "set send_magic_link=true to request the passwordless account email before creating the hold."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["availability", "times", "config", "book"],
+                    "description": "availability/times lists bookable slots, config returns sanitized endpoint config, book creates an x402 hold.",
+                    "default": "availability",
+                },
+                "client": _CLIENT_PROP,
+                "profile": _PROFILE_PROP,
+                "date": {
+                    "type": "string",
+                    "description": "Booking date in YYYY-MM-DD format. Required for action=book.",
+                },
+                "slot": {
+                    "type": "string",
+                    "description": "Slot type to book, such as AM or PM. Required for action=book.",
+                },
+                "email": {
+                    "type": "string",
+                    "description": "Client email for the booking and optional magic-link account email.",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Client display name for the booking.",
+                },
+                "redirect_url": {
+                    "type": "string",
+                    "description": "Optional magic-link redirect URL for account sign-in.",
+                },
+                "origin": {
+                    "type": "string",
+                    "description": "Optional Origin header override for browser-style publishable-key requests.",
+                },
+                "access_token_env": {
+                    "type": "string",
+                    "description": "Optional env var containing a verified user JWT; when set, bookings bind to that account.",
+                },
+                "send_magic_link": {
+                    "type": "boolean",
+                    "description": "When action=book, request the passwordless account email before creating the x402 hold.",
+                    "default": False,
+                },
+                "dry_run": _DRY_RUN_PROP,
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum availability slots to return.",
+                    "default": 8,
+                },
+            },
+        },
+    },
+    {
         "name": "skillbox_logs",
         "description": (
             "Tail recent log output for declared services. "
@@ -865,6 +980,42 @@ def _compact_log_context(base: dict[str, Any] | None = None, **extra: Any) -> di
     return payload
 
 
+def _clean_param_scalar(params: dict, key: str) -> str:
+    return str(params.get(key) or "").strip()
+
+
+def _clean_param_list(params: dict, key: str) -> list[str]:
+    raw = params.get(key)
+    if raw is None:
+        return []
+    values = raw if isinstance(raw, (list, tuple, set)) else [raw]
+    return [str(item).strip() for item in values if str(item).strip()]
+
+
+def _add_event_identity(context: dict[str, Any], params: dict) -> None:
+    for key in ("client_id", "session_id", "actor"):
+        value = _clean_param_scalar(params, key)
+        if value:
+            context[key] = value
+
+
+def _add_client_scope(context: dict[str, Any], params: dict) -> None:
+    client_scope = _clean_param_list(params, "client")
+    if not client_scope:
+        return
+    if len(client_scope) == 1 and "client_id" not in context:
+        context["client_id"] = client_scope[0]
+        return
+    context["client_scope"] = client_scope
+
+
+def _add_list_scopes(context: dict[str, Any], params: dict) -> None:
+    for key in ("profile", "service", "task"):
+        values = _clean_param_list(params, key)
+        if values:
+            context[key] = values
+
+
 def build_tool_event_context(name: str, command: str, params: dict, request_id: Any) -> dict[str, Any]:
     context: dict[str, Any] = {
         "mcp_tool_name": name,
@@ -873,28 +1024,9 @@ def build_tool_event_context(name: str, command: str, params: dict, request_id: 
     if request_id is not None:
         context["mcp_request_id"] = str(request_id)
 
-    client_id = str(params.get("client_id") or "").strip()
-    session_id = str(params.get("session_id") or "").strip()
-    actor = str(params.get("actor") or "").strip()
-    if client_id:
-        context["client_id"] = client_id
-    if session_id:
-        context["session_id"] = session_id
-    if actor:
-        context["actor"] = actor
-
-    client_scope = [str(item).strip() for item in (params.get("client") or []) if str(item).strip()]
-    if client_scope:
-        if len(client_scope) == 1 and "client_id" not in context:
-            context["client_id"] = client_scope[0]
-        else:
-            context["client_scope"] = client_scope
-
-    for key in ("profile", "service", "task"):
-        values = [str(item).strip() for item in (params.get(key) or []) if str(item).strip()]
-        if values:
-            context[key] = values
-
+    _add_event_identity(context, params)
+    _add_client_scope(context, params)
+    _add_list_scopes(context, params)
     return context
 
 
@@ -1017,6 +1149,7 @@ _REPEAT_ARG_SPECS: tuple[tuple[str, str], ...] = (
     ("service", "--service"),
     ("task", "--task"),
     ("category", "--category"),
+    ("search_root", "--search-root"),
     ("set_vars", "--set"),
 )
 _STRING_ARG_SPECS: tuple[tuple[str, str], ...] = (
@@ -1038,6 +1171,13 @@ _STRING_ARG_SPECS: tuple[tuple[str, str], ...] = (
     ("scope", "--scope"),
     ("source", "--source"),
     ("from_scope", "--from"),
+    ("date", "--date"),
+    ("slot", "--slot"),
+    ("email", "--email"),
+    ("name", "--name"),
+    ("redirect_url", "--redirect-url"),
+    ("origin", "--origin"),
+    ("access_token_env", "--access-token-env"),
 )
 _BOOL_ARG_SPECS: tuple[tuple[str, str], ...] = (
     ("dry_run", "--dry-run"),
@@ -1051,6 +1191,10 @@ _BOOL_ARG_SPECS: tuple[tuple[str, str], ...] = (
     ("force", "--force"),
     ("list_blueprints", "--list-blueprints"),
     ("keep", "--keep"),
+    ("tmux", "--tmux"),
+    ("tmux_submit", "--tmux-submit"),
+    ("allow_parser_install", "--allow-parser-install"),
+    ("send_magic_link", "--send-magic-link"),
 )
 
 
@@ -1084,9 +1228,13 @@ def _append_bool_args(args: list[str], command: str, params: dict) -> None:
         args.append("--full")
     if params.get("compact") and command == "status":
         args.append("--compact")
+    if command == "mmdx" and params.get("open") is False:
+        args.append("--no-open")
 
 
 def _append_command_positionals(args: list[str], command: str, params: dict) -> None:
+    if command == "mmdx" and params.get("query"):
+        args.append(str(params["query"]))
     if params.get("skill"):
         args.append(str(params["skill"]))
     if command == "overlay" and params.get("name"):
@@ -1120,6 +1268,8 @@ _DISPATCH: dict[str, tuple[str, str | None]] = {
     "skillbox_skills":      ("skills",      None),
     "skillbox_skill":       ("skill",       "action"),
     "skillbox_overlay":     ("overlay",     "action"),
+    "skillbox_mmdx_open":   ("mmdx",        None),
+    "skillbox_operator_booking": ("operator-booking", "action"),
     "skillbox_logs":        ("logs",        None),
     "skillbox_sync":        ("sync",        None),
     "skillbox_up":          ("up",          None),
@@ -1181,48 +1331,90 @@ _DIRECT_HANDLERS: dict[str, Any] = {
 }
 
 
-def dispatch_tool(name: str, params: dict, *, request_id: Any = None) -> dict:
-    """Dispatch a tool call to manage.py and return a MCP content block."""
-    if name in _DIRECT_HANDLERS:
-        return _DIRECT_HANDLERS[name](params)
+def _available_tool_names() -> list[str]:
+    return sorted(list(_DISPATCH.keys()) + list(_DIRECT_HANDLERS.keys()))
 
-    if name not in _DISPATCH:
-        return _error_content({
+
+def _unknown_tool_error(name: str) -> dict:
+    return _error_content(
+        {
             "error": {
                 "type": "unknown_tool",
                 "message": f"Unknown tool: '{name}'.",
-                "available_tools": sorted(list(_DISPATCH.keys()) + list(_DIRECT_HANDLERS.keys())),
+                "available_tools": _available_tool_names(),
                 "recoverable": False,
             }
-        })
+        }
+    )
 
-    command, positional_key = _DISPATCH[name]
+
+def _tool_params_with_defaults(name: str, params: dict) -> dict:
     tool_params = dict(params)
     if name == "skillbox_status" and not tool_params.get("full"):
         tool_params["compact"] = True
-    if name == "skillbox_overlay" and not tool_params.get("action"):
-        tool_params["action"] = "list"
-    positional = str(tool_params[positional_key]) if positional_key and positional_key in tool_params else None
+    if name == "skillbox_overlay":
+        tool_params.setdefault("action", "list")
+    if name == "skillbox_operator_booking":
+        tool_params.setdefault("action", "availability")
+    return tool_params
 
-    if positional_key and positional is None and not tool_params.get("list_blueprints"):
-        return _error_content({
+
+def _positional_arg(positional_key: str | None, tool_params: dict) -> str | None:
+    if not positional_key:
+        return None
+    value = _clean_param_scalar(tool_params, positional_key)
+    return value or None
+
+
+def _missing_positional_error(name: str, positional_key: str) -> dict:
+    return _error_content(
+        {
             "error": {
                 "type": "missing_required_parameter",
                 "message": f"'{positional_key}' is required for {name}.",
                 "recoverable": True,
                 "recovery_hint": f"Provide a {positional_key} value, e.g. 'acme-studio'.",
             }
-        })
+        }
+    )
+
+
+def _positional_required(positional_key: str | None, positional: str | None, tool_params: dict) -> bool:
+    return bool(positional_key and positional is None and not tool_params.get("list_blueprints"))
+
+
+def _dispatch_manage_tool(
+    name: str,
+    command: str,
+    positional_key: str | None,
+    params: dict,
+    *,
+    request_id: Any = None,
+) -> dict:
+    tool_params = _tool_params_with_defaults(name, params)
+    positional = _positional_arg(positional_key, tool_params)
+    if _positional_required(positional_key, positional, tool_params):
+        return _missing_positional_error(name, str(positional_key))
 
     args = build_args(command, tool_params, positional)
     event_context = build_tool_event_context(name, command, tool_params, request_id)
     ok, exit_code, data = run_manage(args, event_context=event_context)
-
-    # Annotate exit code so agents know what happened without parsing error fields.
     if isinstance(data, dict):
         data["_exit_code"] = exit_code
-
     return _ok_content(data) if ok else _error_content(data)
+
+
+def dispatch_tool(name: str, params: dict, *, request_id: Any = None) -> dict:
+    """Dispatch a tool call to manage.py and return a MCP content block."""
+    if name in _DIRECT_HANDLERS:
+        return _DIRECT_HANDLERS[name](params)
+
+    route = _DISPATCH.get(name)
+    if route is None:
+        return _unknown_tool_error(name)
+
+    command, positional_key = route
+    return _dispatch_manage_tool(name, command, positional_key, params, request_id=request_id)
 
 
 def _ok_content(data: Any) -> dict:

@@ -24,6 +24,8 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("--dry-run", result.stdout)
         self.assertIn("--skip-build", result.stdout)
         self.assertIn("--skip-up", result.stdout)
+        self.assertIn("--install-wrappers", result.stdout)
+        self.assertIn("--wrapper-bin-dir", result.stdout)
 
     def test_dry_run_does_not_create_targets(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -155,18 +157,52 @@ class InstallScriptTests(unittest.TestCase):
             self.assertFalse((repo_dir / "sand" / "personal").exists())
             self.assertIn("first_box: skipped", result.stdout)
 
+    def test_install_wrappers_creates_repo_owned_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_dir = root / "skillbox"
+            private_dir = root / "skillbox-config"
+            bin_dir = root / "bin"
+
+            result = self._run(
+                "--source-dir",
+                str(ROOT_DIR),
+                "--repo-dir",
+                str(repo_dir),
+                "--private-path",
+                str(private_dir),
+                "--client",
+                "personal",
+                "--skip-first-box",
+                "--skip-build",
+                "--skip-up",
+                "--install-wrappers",
+                "--wrapper-bin-dir",
+                str(bin_dir),
+                "--no-gum",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((bin_dir / "sbp").is_symlink())
+            self.assertTrue((bin_dir / "sbo").is_symlink())
+            self.assertEqual((bin_dir / "sbp").resolve(), (repo_dir / "scripts" / "sbp").resolve())
+            self.assertEqual((bin_dir / "sbo").resolve(), (repo_dir / "scripts" / "sbo").resolve())
+            self.assertIn("wrappers: ok", result.stdout)
+
     def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.setdefault("TERM", "dumb")
-        return subprocess.run(
-            ["bash", str(INSTALL_SCRIPT), *args],
-            cwd=ROOT_DIR,
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=300,
-        )
+        with tempfile.TemporaryDirectory() as lock_tmp:
+            env["TMPDIR"] = lock_tmp
+            return subprocess.run(
+                ["bash", str(INSTALL_SCRIPT), *args],
+                cwd=ROOT_DIR,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=300,
+            )
 
 
 if __name__ == "__main__":

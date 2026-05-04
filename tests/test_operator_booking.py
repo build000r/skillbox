@@ -1,0 +1,126 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import sys
+
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+ENV_MANAGER_DIR = ROOT_DIR / ".env-manager"
+if str(ENV_MANAGER_DIR) not in sys.path:
+    sys.path.insert(0, str(ENV_MANAGER_DIR))
+
+from runtime_manager import operator_booking as MODULE  # noqa: E402
+
+
+class OperatorBookingTests(unittest.TestCase):
+    def test_availability_uses_overlay_endpoint_and_publishable_key_env_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = self._model(tmpdir)
+            response = {
+                "success": True,
+                "data": {
+                    "totalSlots": 2,
+                    "bookedSlots": 0,
+                    "baseRate": 1000,
+                    "slots": [
+                        {"date": "2026-05-06", "slot": "AM", "price": 1000, "available": True},
+                        {"date": "2026-05-06", "slot": "PM", "price": 1200, "available": False},
+                    ],
+                },
+            }
+
+            with mock.patch.object(MODULE, "_http_json", return_value=response) as http_json:
+                payload, exit_code = MODULE.operator_booking_payload(
+                    model,
+                    action="availability",
+                    client_id="personal",
+                    limit=5,
+                )
+
+        self.assertEqual(exit_code, MODULE.EXIT_OK)
+        self.assertEqual(payload["available"], 1)
+        self.assertEqual(payload["slots"][0]["date"], "2026-05-06")
+        self.assertEqual(http_json.call_args.kwargs["headers"]["X-API-Key"], "spaps_pub_test")
+        self.assertEqual(http_json.call_args.kwargs["headers"]["Origin"], "http://localhost:3000")
+        self.assertEqual(http_json.call_args.kwargs["headers"]["Authorization"], "Bearer jwt_test")
+        self.assertEqual(http_json.call_args.args[0], "http://localhost:3301/api/dayrate/availability")
+
+    def test_book_can_send_magic_link_before_x402_hold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = self._model(tmpdir)
+            responses = [
+                {"success": True, "data": {"email": "customer@example.com", "state": "state-1"}},
+                {
+                    "success": True,
+                    "data": {
+                        "bookingId": "booking-1",
+                        "resourceKey": "dayrate-book:booking-1",
+                        "actionKey": "dayrate-book",
+                    },
+                },
+            ]
+
+            with mock.patch.object(MODULE, "_http_json", side_effect=responses) as http_json:
+                payload, exit_code = MODULE.operator_booking_payload(
+                    model,
+                    action="book",
+                    client_id="personal",
+                    date="2026-05-06",
+                    slot="AM",
+                    email="customer@example.com",
+                    name="Customer Example",
+                    send_magic_link=True,
+                )
+
+        self.assertEqual(exit_code, MODULE.EXIT_OK)
+        self.assertEqual(payload["magic_link"]["email"], "customer@example.com")
+        self.assertEqual(payload["booking"]["resourceKey"], "dayrate-book:booking-1")
+        self.assertEqual(http_json.call_count, 2)
+        first_call = http_json.call_args_list[0]
+        second_call = http_json.call_args_list[1]
+        self.assertEqual(first_call.args[0], "http://localhost:3301/api/auth/magic-link")
+        self.assertEqual(first_call.kwargs["body"]["email"], "customer@example.com")
+        self.assertEqual(second_call.args[0], "http://localhost:3301/api/dayrate/book-x402")
+        self.assertEqual(second_call.kwargs["body"]["clientName"], "Customer Example")
+
+    def _model(self, tmpdir: str) -> dict:
+        root = Path(tmpdir)
+        env_file = root / ".env.local"
+        env_file.write_text(
+            "NEXT_PUBLIC_SPAPS_PUBLISHABLE_KEY=spaps_pub_test\n"
+            "SPAPS_AUTH_ACCESS_TOKEN=jwt_test\n",
+            encoding="utf-8",
+        )
+        overlay = root / "overlay.yaml"
+        overlay.write_text(
+            f"""\
+version: 1
+client:
+  id: personal
+  human_operator:
+    env_file: {env_file}
+    booking_url: https://buildooor.com/bookme
+    availability_url: http://localhost:3301/api/dayrate/availability
+    availability_origin: http://localhost:3000
+    preferred_session: AI Build Diagnosis
+    payment_required_before_handoff: true
+""",
+            encoding="utf-8",
+        )
+        return {
+            "active_clients": ["personal"],
+            "clients": [
+                {
+                    "id": "personal",
+                    "_overlay_path": str(overlay),
+                }
+            ],
+        }
+
+
+if __name__ == "__main__":
+    unittest.main()
