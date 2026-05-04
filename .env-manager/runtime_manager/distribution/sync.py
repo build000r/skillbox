@@ -12,6 +12,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -27,7 +28,7 @@ from .lockfile import (
     parse_lockfile,
 )
 from .manifest import parse_manifest, verify_manifest
-from .pin_resolver import resolve_pin
+from .pin_resolver import PinResolutionError, resolve_pin
 from .signing import SignatureVerificationError, load_public_key
 
 from ..shared import atomic_write_text, host_path_to_absolute_path
@@ -40,6 +41,29 @@ from ..shared_distribution import (
 
 class DistributorSyncError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class _SelectedSkill:
+    version: int
+    pinned_by: str
+    reason: str | None
+    sha256: str
+    download_url: str
+    changelog: str | None
+    targets: list[str]
+    capabilities: list[str]
+
+
+@dataclass(frozen=True)
+class _DistributionSyncContext:
+    config_path: Path
+    lock_path: Path
+    state_root: Path
+    install_targets: list[dict[str, Any]]
+    distributors: dict[str, DistributorConfig]
+    sources: list[DistributorSetSource]
+    existing_lock: Lockfile | None
 
 
 # ---------------------------------------------------------------------------
@@ -105,48 +129,13 @@ def sync_distributor_set(
     ``manifest_lock_entry`` is ``None`` when the manifest version is unchanged
     (idempotency short-circuit).
     """
-    api_key = os.environ.get(distributor.auth.key_env)
-    if not api_key:
-        raise DistributorSyncError(
-            f"env var '{distributor.auth.key_env}' not set for distributor '{distributor.id}'"
-        )
-
-    auth_headers = {
-        "Authorization": f"Bearer {api_key}",
-        "X-Client-ID": distributor.client_id,
-    }
-
-    # -- Fetch manifest -------------------------------------------------------
-    manifest_url = f"{distributor.url.rstrip('/')}/manifest"
-    manifest_bytes = _http_get(
-        manifest_url,
-        {**auth_headers, "Accept": "application/json"},
-        _opener=_url_opener,
+    auth_headers = _auth_headers(distributor)
+    manifest, manifest_bytes = _fetch_verified_manifest(
+        distributor,
+        auth_headers,
+        _url_opener=_url_opener,
     )
-
-    manifest = parse_manifest(manifest_bytes)
-    public_key = load_public_key(distributor.verification.public_key)
-    try:
-        verify_manifest(manifest, public_key)
-    except SignatureVerificationError as exc:
-        raise DistributorSyncError(
-            f"manifest signature verification failed for '{distributor.id}': {exc}"
-        ) from exc
-
-    # The manifest signature confirms the manifest came from a holder of the
-    # configured public key, but does not bind it to this distributor. Reject
-    # mismatches before installing anything so a hostile or misconfigured
-    # endpoint cannot impersonate another distributor.
-    if manifest.distributor_id != distributor.id:
-        raise DistributorSyncError(
-            f"manifest distributor_id {manifest.distributor_id!r} does not match "
-            f"configured distributor id {distributor.id!r}"
-        )
-
-    # -- Cache raw manifest ---------------------------------------------------
-    manifest_cache_dir = state_root / "manifests"
-    manifest_cache_dir.mkdir(parents=True, exist_ok=True)
-    (manifest_cache_dir / f"{distributor.id}.json").write_bytes(manifest_bytes)
+    _cache_manifest(state_root, distributor.id, manifest_bytes)
 
     # -- Idempotency ----------------------------------------------------------
     if (
@@ -155,124 +144,37 @@ def sync_distributor_set(
     ):
         return [], None
 
-    # -- Filter skills --------------------------------------------------------
-    skills = list(manifest.skills)
-    if source.pick:
-        pick_set = set(source.pick)
-        skills = [s for s in skills if s.name in pick_set]
-    if target_env:
-        skills = [s for s in skills if target_env in s.targets]
-
     # -- Process each skill ---------------------------------------------------
     bundle_cache_dir = state_root / "bundle-cache"
     lock_entries: list[SkillLockEntry] = []
 
-    for skill in skills:
-        client_pin = source.pin.get(skill.name) if source.pin else None
-        resolution = resolve_pin(skill, client_pin)
-
-        skill_cache = bundle_cache_dir / skill.name
-        skill_cache.mkdir(parents=True, exist_ok=True)
-        bundle_filename = f"{skill.name}-v{resolution.version}.skillbundle.tar.gz"
-        cached_bundle = skill_cache / bundle_filename
-
-        need_download = True
-        if cached_bundle.is_file() and _file_sha256(cached_bundle) == skill.sha256:
-            need_download = False
-
-        if need_download:
-            bundle_url = f"{distributor.url.rstrip('/')}{skill.download_url}"
-            # Defense-in-depth: even though the manifest is signature-verified,
-            # a compromised distributor (or compromised signing key) could
-            # supply a download_url that escapes its own host via userinfo
-            # tricks like '@evil.com/...' (urlparse splits at '@' in netloc).
-            # Pin the bundle host/scheme to the configured distributor.
-            distributor_parsed = urlparse(distributor.url)
-            bundle_parsed = urlparse(bundle_url)
-            if (
-                bundle_parsed.scheme != distributor_parsed.scheme
-                or (bundle_parsed.hostname or "").lower()
-                    != (distributor_parsed.hostname or "").lower()
-                or bundle_parsed.port != distributor_parsed.port
-            ):
-                raise DistributorSyncError(
-                    f"refusing to fetch bundle for {skill.name!r}: "
-                    f"download_url resolves to a different host than the "
-                    f"configured distributor ({bundle_parsed.hostname!r} != "
-                    f"{distributor_parsed.hostname!r})"
-                )
-            bundle_bytes = _http_get(
-                bundle_url,
-                {**auth_headers, "Accept": "application/gzip"},
-                _opener=_url_opener,
-            )
-            cached_bundle.write_bytes(bundle_bytes)
-
-            actual_hash = _file_sha256(cached_bundle)
-            if actual_hash != skill.sha256:
-                cached_bundle.unlink(missing_ok=True)
-                raise DistributorSyncError(
-                    f"bundle SHA256 mismatch for {skill.name}: "
-                    f"expected {skill.sha256}, got {actual_hash}"
-                )
+    for skill in _selected_manifest_skills(manifest.skills, source, target_env):
+        selected = _resolve_selected_skill(skill, source)
+        cached_bundle = _ensure_cached_bundle(
+            distributor=distributor,
+            auth_headers=auth_headers,
+            bundle_cache_dir=bundle_cache_dir,
+            skill_name=skill.name,
+            selected=selected,
+            _url_opener=_url_opener,
+        )
 
         if dry_run:
-            lock_entries.append(SkillLockEntry(
-                name=skill.name,
-                source="distributor",
-                distributor_id=distributor.id,
-                version=resolution.version,
-                bundle_sha256=skill.sha256,
-                pinned_by=resolution.pinned_by,
-                pin_reason=resolution.reason,
-            ))
+            lock_entries.append(_lock_entry_for_selected(skill.name, distributor.id, selected))
             continue
 
-        # Unpack, verify, install.
-        # Open the cached bundle once, hash through that file handle, and
-        # extract from the same handle so the inode is locked: a path-level
-        # swap between verify and extract cannot redirect the unpack reader
-        # to a different file. Closes the TOCTOU window between hash check
-        # and extractall.
-        with tempfile.TemporaryDirectory() as tmp_str:
-            tmp = Path(tmp_str)
-            with cached_bundle.open("rb") as bundle_fh:
-                hasher = hashlib.sha256()
-                for chunk in iter(lambda: bundle_fh.read(65536), b""):
-                    hasher.update(chunk)
-                pre_unpack_hash = hasher.hexdigest()
-                if pre_unpack_hash != skill.sha256:
-                    raise DistributorSyncError(
-                        f"bundle SHA256 mismatch for {skill.name} prior to unpack: "
-                        f"expected {skill.sha256}, got {pre_unpack_hash}"
-                    )
-                bundle_fh.seek(0)
-                bundle_manifest = unpack_skill_bundle(bundle_fh, tmp)
-            verify_bundle_contents(bundle_manifest, tmp)
-
-            meta_dir = tmp / SKILL_META_DIR
-            if meta_dir.is_dir():
-                shutil.rmtree(meta_dir)
-
-            install_tree_sha: str | None = None
-            for target in install_targets:
-                target_root = Path(str(target["host_path"]))
-                install_dir = target_root / skill.name
-                install_dir.parent.mkdir(parents=True, exist_ok=True)
-                tree_sha = _install_skill_content(tmp, install_dir)
-                if install_tree_sha is None:
-                    install_tree_sha = tree_sha
-
-        lock_entries.append(SkillLockEntry(
-            name=skill.name,
-            source="distributor",
-            distributor_id=distributor.id,
-            version=resolution.version,
-            bundle_sha256=skill.sha256,
-            bundle_tree_sha256=bundle_manifest.tree_sha256,
+        bundle_tree_sha, install_tree_sha = _install_cached_bundle(
+            cached_bundle=cached_bundle,
+            expected_sha256=selected.sha256,
+            skill_name=skill.name,
+            install_targets=install_targets,
+        )
+        lock_entries.append(_lock_entry_for_selected(
+            skill.name,
+            distributor.id,
+            selected,
+            bundle_tree_sha256=bundle_tree_sha,
             install_tree_sha=install_tree_sha,
-            pinned_by=resolution.pinned_by,
-            pin_reason=resolution.reason,
         ))
 
     manifest_lock = DistributorManifestLockEntry(
@@ -283,9 +185,236 @@ def sync_distributor_set(
     return lock_entries, manifest_lock
 
 
+def _auth_headers(distributor: DistributorConfig) -> dict[str, str]:
+    api_key = os.environ.get(distributor.auth.key_env)
+    if not api_key:
+        raise DistributorSyncError(
+            f"env var '{distributor.auth.key_env}' not set for distributor '{distributor.id}'"
+        )
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "X-Client-ID": distributor.client_id,
+    }
+
+
+def _fetch_verified_manifest(
+    distributor: DistributorConfig,
+    auth_headers: dict[str, str],
+    *,
+    _url_opener: Callable | None = None,
+):
+    manifest_url = f"{distributor.url.rstrip('/')}/manifest"
+    manifest_bytes = _http_get(
+        manifest_url,
+        {**auth_headers, "Accept": "application/json"},
+        _opener=_url_opener,
+    )
+    manifest = parse_manifest(manifest_bytes)
+    try:
+        verify_manifest(manifest, load_public_key(distributor.verification.public_key))
+    except SignatureVerificationError as exc:
+        raise DistributorSyncError(
+            f"manifest signature verification failed for '{distributor.id}': {exc}"
+        ) from exc
+    if manifest.distributor_id != distributor.id:
+        raise DistributorSyncError(
+            f"manifest distributor_id {manifest.distributor_id!r} does not match "
+            f"configured distributor id {distributor.id!r}"
+        )
+    return manifest, manifest_bytes
+
+
+def _cache_manifest(state_root: Path, distributor_id: str, manifest_bytes: bytes) -> None:
+    manifest_cache_dir = state_root / "manifests"
+    manifest_cache_dir.mkdir(parents=True, exist_ok=True)
+    (manifest_cache_dir / f"{distributor_id}.json").write_bytes(manifest_bytes)
+
+
+def _selected_manifest_skills(
+    skills,
+    source: DistributorSetSource,
+    target_env: str | None,
+):
+    selected = list(skills)
+    if source.pick:
+        pick_set = set(source.pick)
+        selected = [skill for skill in selected if skill.name in pick_set]
+    if target_env:
+        selected = [skill for skill in selected if target_env in skill.targets]
+    return selected
+
+
+def _resolve_selected_skill(skill, source: DistributorSetSource) -> _SelectedSkill:
+    client_pin = source.pin.get(skill.name) if source.pin else None
+    try:
+        resolution = resolve_pin(skill, client_pin)
+    except PinResolutionError as exc:
+        raise DistributorSyncError(str(exc)) from exc
+    artifact = resolution.artifact
+    return _SelectedSkill(
+        version=resolution.version,
+        pinned_by=resolution.pinned_by,
+        reason=resolution.reason,
+        sha256=artifact.sha256 if artifact else skill.sha256,
+        download_url=artifact.download_url if artifact else skill.download_url,
+        changelog=artifact.changelog if artifact and artifact.changelog else skill.changelog,
+        targets=skill.targets,
+        capabilities=skill.capabilities,
+    )
+
+
+def _ensure_cached_bundle(
+    *,
+    distributor: DistributorConfig,
+    auth_headers: dict[str, str],
+    bundle_cache_dir: Path,
+    skill_name: str,
+    selected: _SelectedSkill,
+    _url_opener: Callable | None = None,
+) -> Path:
+    skill_cache = bundle_cache_dir / skill_name
+    skill_cache.mkdir(parents=True, exist_ok=True)
+    cached_bundle = skill_cache / f"{skill_name}-v{selected.version}.skillbundle.tar.gz"
+    if cached_bundle.is_file() and _file_sha256(cached_bundle) == selected.sha256:
+        return cached_bundle
+
+    bundle_url = _validated_bundle_url(distributor, skill_name, selected.download_url)
+    bundle_bytes = _http_get(
+        bundle_url,
+        {**auth_headers, "Accept": "application/gzip"},
+        _opener=_url_opener,
+    )
+    cached_bundle.write_bytes(bundle_bytes)
+    actual_hash = _file_sha256(cached_bundle)
+    if actual_hash != selected.sha256:
+        cached_bundle.unlink(missing_ok=True)
+        raise DistributorSyncError(
+            f"bundle SHA256 mismatch for {skill_name}: "
+            f"expected {selected.sha256}, got {actual_hash}"
+        )
+    return cached_bundle
+
+
+def _validated_bundle_url(
+    distributor: DistributorConfig,
+    skill_name: str,
+    download_url: str,
+) -> str:
+    bundle_url = f"{distributor.url.rstrip('/')}{download_url}"
+    distributor_parsed = urlparse(distributor.url)
+    bundle_parsed = urlparse(bundle_url)
+    if (
+        bundle_parsed.scheme == distributor_parsed.scheme
+        and (bundle_parsed.hostname or "").lower()
+            == (distributor_parsed.hostname or "").lower()
+        and bundle_parsed.port == distributor_parsed.port
+    ):
+        return bundle_url
+    raise DistributorSyncError(
+        f"refusing to fetch bundle for {skill_name!r}: "
+        f"download_url resolves to a different host than the "
+        f"configured distributor ({bundle_parsed.hostname!r} != "
+        f"{distributor_parsed.hostname!r})"
+    )
+
+
+def _install_cached_bundle(
+    *,
+    cached_bundle: Path,
+    expected_sha256: str,
+    skill_name: str,
+    install_targets: list[dict[str, Any]],
+) -> tuple[str, str | None]:
+    with tempfile.TemporaryDirectory() as tmp_str:
+        tmp = Path(tmp_str)
+        with cached_bundle.open("rb") as bundle_fh:
+            hasher = hashlib.sha256()
+            for chunk in iter(lambda: bundle_fh.read(65536), b""):
+                hasher.update(chunk)
+            pre_unpack_hash = hasher.hexdigest()
+            if pre_unpack_hash != expected_sha256:
+                raise DistributorSyncError(
+                    f"bundle SHA256 mismatch for {skill_name} prior to unpack: "
+                    f"expected {expected_sha256}, got {pre_unpack_hash}"
+                )
+            bundle_fh.seek(0)
+            bundle_manifest = unpack_skill_bundle(bundle_fh, tmp)
+        verify_bundle_contents(bundle_manifest, tmp)
+        _remove_bundle_metadata(tmp)
+        install_tree_sha = _install_to_targets(tmp, skill_name, install_targets)
+        return bundle_manifest.tree_sha256, install_tree_sha
+
+
+def _remove_bundle_metadata(tmp: Path) -> None:
+    meta_dir = tmp / SKILL_META_DIR
+    if meta_dir.is_dir():
+        shutil.rmtree(meta_dir)
+
+
+def _install_to_targets(
+    tmp: Path,
+    skill_name: str,
+    install_targets: list[dict[str, Any]],
+) -> str | None:
+    install_tree_sha: str | None = None
+    for target in install_targets:
+        target_root = Path(str(target["host_path"]))
+        install_dir = target_root / skill_name
+        install_dir.parent.mkdir(parents=True, exist_ok=True)
+        tree_sha = _install_skill_content(tmp, install_dir)
+        if install_tree_sha is None:
+            install_tree_sha = tree_sha
+    return install_tree_sha
+
+
+def _lock_entry_for_selected(
+    skill_name: str,
+    distributor_id: str,
+    selected: _SelectedSkill,
+    *,
+    bundle_tree_sha256: str | None = None,
+    install_tree_sha: str | None = None,
+) -> SkillLockEntry:
+    return SkillLockEntry(
+        name=skill_name,
+        source="distributor",
+        distributor_id=distributor_id,
+        version=selected.version,
+        bundle_sha256=selected.sha256,
+        bundle_tree_sha256=bundle_tree_sha256,
+        install_tree_sha=install_tree_sha,
+        pinned_by=selected.pinned_by,
+        pin_reason=selected.reason,
+        extras=_selected_artifact_extras(
+            download_url=selected.download_url,
+            targets=selected.targets,
+            capabilities=selected.capabilities,
+            changelog=selected.changelog,
+        ),
+    )
+
+
 def _install_skill_content(source_dir: Path, target_dir: Path) -> str:
     from ..shared import filtered_copy_skill
     return filtered_copy_skill(source_dir, target_dir)
+
+
+def _selected_artifact_extras(
+    *,
+    download_url: str,
+    targets: list[str],
+    capabilities: list[str],
+    changelog: str | None,
+) -> dict[str, Any]:
+    extras: dict[str, Any] = {
+        "download_url": download_url,
+        "manifest_targets": list(targets),
+    }
+    if capabilities:
+        extras["capabilities"] = list(capabilities)
+    if changelog:
+        extras["changelog"] = changelog
+    return extras
 
 
 # ---------------------------------------------------------------------------
@@ -299,122 +428,185 @@ def sync_distributor_sources(model: dict[str, Any], dry_run: bool) -> list[str]:
     has handled repo/path sources.  Reads the existing lockfile (written by
     the repo-set sync), merges distributor entries, and writes back.
     """
-    from ..shared import file_sha256 as shared_file_sha256, load_skill_repos_config
-
     actions: list[str] = []
+    for context in _distribution_sync_contexts(model):
+        actions.extend(_sync_distribution_context(context, dry_run=dry_run))
+    return actions
 
+
+def _distribution_sync_contexts(model: dict[str, Any]) -> list[_DistributionSyncContext]:
+    contexts: list[_DistributionSyncContext] = []
+    root_dir = Path(str(model.get("root_dir", "")))
+    state_root = _state_root_for_model(model, root_dir)
     for skillset in model.get("skills") or []:
-        if skillset.get("kind") != "skill-repo-set":
+        if not _supports_distributor_sync(skillset):
             continue
-        sync_mode = (skillset.get("sync") or {}).get("mode", "")
-        if sync_mode != "clone-and-install":
-            continue
+        context = _distribution_sync_context(skillset, state_root)
+        if context is not None:
+            contexts.append(context)
+    return contexts
 
-        config_path = Path(str(skillset.get("skill_repos_config_host_path", "")))
-        lock_path = Path(str(skillset.get("lock_path_host_path", "")))
-        root_dir = Path(str(model.get("root_dir", "")))
-        storage = model.get("storage") if isinstance(model.get("storage"), dict) else {}
-        env_values = model.get("env") if isinstance(model.get("env"), dict) else {}
-        raw_state_root = str(
-            (storage or {}).get("state_root")
-            or (env_values or {}).get("SKILLBOX_STATE_ROOT")
-            or ".skillbox-state"
-        ).strip()
-        state_root = host_path_to_absolute_path(root_dir, raw_state_root)
 
-        try:
-            config = load_skill_repos_config(config_path)
-        except Exception:
-            continue
-        distributors, sources = parse_distribution_config(config, config_path)
-        if not sources:
-            continue
+def _supports_distributor_sync(skillset: Any) -> bool:
+    if not isinstance(skillset, dict) or skillset.get("kind") != "skill-repo-set":
+        return False
+    return (skillset.get("sync") or {}).get("mode", "") == "clone-and-install"
 
-        install_targets = skillset.get("install_targets") or []
 
-        # Read existing lockfile (may be v2 from repo-set sync or v3 from prior run)
-        existing_lock: Lockfile | None = None
-        if lock_path.is_file():
-            try:
-                raw_lock = json.loads(lock_path.read_text(encoding="utf-8"))
-                existing_lock = parse_lockfile(raw_lock)
-            except Exception:
-                pass
+def _state_root_for_model(model: dict[str, Any], root_dir: Path) -> Path:
+    storage = model.get("storage") if isinstance(model.get("storage"), dict) else {}
+    env_values = model.get("env") if isinstance(model.get("env"), dict) else {}
+    raw_state_root = str(
+        (storage or {}).get("state_root")
+        or (env_values or {}).get("SKILLBOX_STATE_ROOT")
+        or ".skillbox-state"
+    ).strip()
+    return host_path_to_absolute_path(root_dir, raw_state_root)
 
-        all_dist_entries: list[SkillLockEntry] = []
-        all_manifest_entries: dict[str, DistributorManifestLockEntry] = {}
 
-        for source in sources:
-            dist_config = distributors[source.distributor]
+def _distribution_sync_context(
+    skillset: dict[str, Any],
+    state_root: Path,
+) -> _DistributionSyncContext | None:
+    from ..shared import load_skill_repos_config
 
-            existing_mv: int | None = None
-            if existing_lock:
-                me = existing_lock.distributor_manifests.get(source.distributor)
-                if me:
-                    existing_mv = me.manifest_version
+    config_path = Path(str(skillset.get("skill_repos_config_host_path", "")))
+    lock_path = Path(str(skillset.get("lock_path_host_path", "")))
+    try:
+        config = load_skill_repos_config(config_path)
+    except Exception:
+        return None
+    distributors, sources = parse_distribution_config(config, config_path)
+    if not sources:
+        return None
+    return _DistributionSyncContext(
+        config_path=config_path,
+        lock_path=lock_path,
+        state_root=state_root,
+        install_targets=skillset.get("install_targets") or [],
+        distributors=distributors,
+        sources=sources,
+        existing_lock=_read_existing_lockfile(lock_path),
+    )
 
-            try:
-                entries, manifest_entry = sync_distributor_set(
-                    dist_config,
-                    source,
-                    state_root,
-                    install_targets,
-                    existing_manifest_version=existing_mv,
-                    dry_run=dry_run,
-                )
-            except DistributorSyncError as exc:
-                actions.append(
-                    f"distributor-sync-error: {source.distributor}: {exc}"
-                )
-                _carry_forward(existing_lock, source.distributor,
-                               all_dist_entries, all_manifest_entries)
-                continue
 
-            if manifest_entry is None:
-                actions.append(f"distributor-unchanged: {source.distributor}")
-                _carry_forward(existing_lock, source.distributor,
-                               all_dist_entries, all_manifest_entries)
-                continue
+def _read_existing_lockfile(lock_path: Path) -> Lockfile | None:
+    if not lock_path.is_file():
+        return None
+    try:
+        raw_lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        return parse_lockfile(raw_lock)
+    except Exception:
+        return None
 
-            all_dist_entries.extend(entries)
-            all_manifest_entries[source.distributor] = manifest_entry
-            for e in entries:
-                actions.append(
-                    f"install-distributor-skill: {e.name} (v{e.version}) "
-                    f"from {source.distributor}"
-                )
 
-        if not all_dist_entries and not all_manifest_entries:
-            continue
+def _sync_distribution_context(
+    context: _DistributionSyncContext,
+    *,
+    dry_run: bool,
+) -> list[str]:
+    actions: list[str] = []
+    all_dist_entries: list[SkillLockEntry] = []
+    all_manifest_entries: dict[str, DistributorManifestLockEntry] = {}
 
-        # Merge with existing non-distributor entries
-        non_dist: list[SkillLockEntry] = []
-        if existing_lock:
-            non_dist = [e for e in existing_lock.skills if e.source != "distributor"]
-            for did, me in existing_lock.distributor_manifests.items():
-                all_manifest_entries.setdefault(did, me)
-
-        config_sha = (existing_lock.config_sha if existing_lock
-                       else (shared_file_sha256(config_path)
-                             if config_path.is_file() else ""))
-        synced_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
-
-        lock_payload = emit_lockfile(
-            non_dist + all_dist_entries,
-            all_manifest_entries,
-            config_sha=config_sha,
-            synced_at=synced_at,
+    for source in context.sources:
+        _sync_distribution_source(
+            context,
+            source,
+            dry_run=dry_run,
+            actions=actions,
+            entries_out=all_dist_entries,
+            manifests_out=all_manifest_entries,
         )
 
-        if not dry_run:
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_text(
-                lock_path,
-                json.dumps(lock_payload, indent=2, sort_keys=True) + "\n",
-            )
-        actions.append(f"write-lockfile: {lock_path} (distribution-merged)")
+    if not all_dist_entries and not all_manifest_entries:
+        return actions
 
+    lock_payload = _merged_lock_payload(
+        context,
+        all_dist_entries,
+        all_manifest_entries,
+    )
+    if not dry_run:
+        context.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(
+            context.lock_path,
+            json.dumps(lock_payload, indent=2, sort_keys=True) + "\n",
+        )
+    actions.append(f"write-lockfile: {context.lock_path} (distribution-merged)")
     return actions
+
+
+def _sync_distribution_source(
+    context: _DistributionSyncContext,
+    source: DistributorSetSource,
+    *,
+    dry_run: bool,
+    actions: list[str],
+    entries_out: list[SkillLockEntry],
+    manifests_out: dict[str, DistributorManifestLockEntry],
+) -> None:
+    try:
+        entries, manifest_entry = sync_distributor_set(
+            context.distributors[source.distributor],
+            source,
+            context.state_root,
+            context.install_targets,
+            existing_manifest_version=_existing_manifest_version(context.existing_lock, source),
+            dry_run=dry_run,
+        )
+    except DistributorSyncError as exc:
+        actions.append(f"distributor-sync-error: {source.distributor}: {exc}")
+        _carry_forward(context.existing_lock, source.distributor, entries_out, manifests_out)
+        return
+
+    if manifest_entry is None:
+        actions.append(f"distributor-unchanged: {source.distributor}")
+        _carry_forward(context.existing_lock, source.distributor, entries_out, manifests_out)
+        return
+
+    entries_out.extend(entries)
+    manifests_out[source.distributor] = manifest_entry
+    for entry in entries:
+        actions.append(
+            f"install-distributor-skill: {entry.name} (v{entry.version}) "
+            f"from {source.distributor}"
+        )
+
+
+def _existing_manifest_version(
+    existing_lock: Lockfile | None,
+    source: DistributorSetSource,
+) -> int | None:
+    if not existing_lock:
+        return None
+    manifest_entry = existing_lock.distributor_manifests.get(source.distributor)
+    return manifest_entry.manifest_version if manifest_entry else None
+
+
+def _merged_lock_payload(
+    context: _DistributionSyncContext,
+    dist_entries: list[SkillLockEntry],
+    manifest_entries: dict[str, DistributorManifestLockEntry],
+) -> dict[str, Any]:
+    from ..shared import file_sha256 as shared_file_sha256
+
+    existing_lock = context.existing_lock
+    non_dist: list[SkillLockEntry] = []
+    if existing_lock:
+        non_dist = [entry for entry in existing_lock.skills if entry.source != "distributor"]
+        for distributor_id, manifest_entry in existing_lock.distributor_manifests.items():
+            manifest_entries.setdefault(distributor_id, manifest_entry)
+    config_sha = (
+        existing_lock.config_sha if existing_lock
+        else (shared_file_sha256(context.config_path) if context.config_path.is_file() else "")
+    )
+    return emit_lockfile(
+        non_dist + dist_entries,
+        manifest_entries,
+        config_sha=config_sha,
+        synced_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    )
 
 
 def _carry_forward(

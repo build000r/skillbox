@@ -1063,6 +1063,52 @@ filtered-copy path as repo and local-path sources, and records distributor
 metadata in the generated lockfile. This is a sync-time delivery channel only;
 installed skill content remains local and usable offline after sync.
 
+The local product loop is also available for dogfooding reviewed skill
+releases without a hosted control plane:
+
+```bash
+python3 .env-manager/manage.py distribution-publish ./path/to/skill \
+  --version 1 \
+  --manifest-path ./dist/manifest.json \
+  --artifact-root ./dist/artifacts \
+  --signing-key file:./dist/signing-key.pem \
+  --distributor-id local-skills \
+  --client-id client-42 \
+  --target box \
+  --capability deploy \
+  --changelog "Initial release"
+
+python3 .env-manager/manage.py distribution-preview \
+  --manifest-path ./dist/manifest.json \
+  --public-key "ed25519:..." \
+  --distributor-id local-skills \
+  --state-root ./.skillbox-state \
+  --pick deploy \
+  --format json
+
+python3 .env-manager/manage.py sync --dry-run
+python3 .env-manager/manage.py sync
+
+python3 .env-manager/manage.py distribution-rollback \
+  --manifest-path ./dist/manifest.json \
+  --public-key "ed25519:..." \
+  --distributor-id local-skills \
+  --skill deploy \
+  --version 1 \
+  --state-root ./.skillbox-state \
+  --install-target ~/.claude/skills \
+  --lockfile ./workspace/skill-repos.lock.json \
+  --reason "bad update"
+```
+
+Manifests can use `schema_version: 2` with per-version `artifacts[]`.
+Preview is read-only: it verifies the signed manifest, resolves client pins and
+manifest floors to a concrete artifact, reports cache/signature state, and
+blocks missing selected artifacts before sync. Sync consumes the same selected
+artifact metadata, so a client pin below the recommendation downloads and
+installs the pinned artifact rather than the recommended one. Rollback uses the
+verified bundle cache and records `pinned_by=rollback` in the lockfile.
+
 Client overlays declare their own `skill-repos.yaml` under
 `${SKILLBOX_CLIENTS_HOST_ROOT:-./workspace/clients}/<client>/skill-repos.yaml`.
 
@@ -1682,10 +1728,10 @@ Run `/commit`, push, then re-run with `dry_run: true` first.
 ## Limitations
 
 - This is not a hosted control plane or a multi-user workspace platform.
-- Skill distribution is client-side only today: signed distributor sync is
-  implemented, but the distributor publisher service, standalone laptop CLI,
-  background update checks, and short-lived token exchange are still future
-  work.
+- Skill distribution is still private and explicit: local publisher, preview,
+  sync, and rollback primitives are implemented, but a hosted distributor
+  service, standalone laptop CLI, background update checks, and short-lived
+  token exchange are still future work.
 - The API and web surfaces are inspection stubs, not a full UI.
 - The internal runtime manager now does dependency-aware task and service orchestration plus managed env hydration, but it still does not try to replace app-specific deployment systems or CI.
 - Secrets management and app-specific bootstrap details beyond what you declare in your overlays and blueprints are still your responsibility.

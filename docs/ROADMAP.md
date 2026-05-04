@@ -19,12 +19,13 @@ overlays, service lifecycle, health checks, installer, pulse daemon — all of
 this works today and is in use for real development: building skills, running
 agents, managing clients.
 
-The skill distribution Phase 1 client path is also present: `skill-repos.yaml`
-can mix repo, path, and distributor-backed skill sources; explicit sync verifies
-signed per-client manifests and bundles, installs selected skills locally, and
-records distributor state in the generated lockfile. The distributor publisher,
-standalone laptop UX, short-lived token exchange, and background update checks
-remain later distribution work.
+The private skill distribution loop is also present: `skill-repos.yaml` can mix
+repo, path, and distributor-backed skill sources; local publishing creates
+signed schema v2 manifests with per-version artifacts; preview resolves pins
+and floors without mutating state; explicit sync installs the selected artifact
+and records distributor state; rollback can reinstall a verified cached bundle.
+The hosted distributor service, standalone laptop UX, short-lived token
+exchange, and background update checks remain later distribution work.
 
 What's missing isn't the box — it's the **bridge to whatever nginx/deploy
 layer your prod stack already has** so the box can serve as the staging /

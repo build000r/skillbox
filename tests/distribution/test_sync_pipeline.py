@@ -130,6 +130,72 @@ def _make_bundle_and_manifest(
     return manifest_bytes, bundle_bytes, bundle_sha
 
 
+def _make_v2_bundles_and_manifest(
+    tmpdir: Path,
+    private_key: Ed25519PrivateKey,
+    *,
+    skill_name: str = "deploy",
+    versions: tuple[int, ...] = (6, 8),
+    recommended_version: int = 8,
+    min_version: int | None = None,
+    min_version_reason: str | None = None,
+    targets: list[str] | None = None,
+    manifest_version: int = 20,
+) -> tuple[bytes, dict[str, bytes], dict[int, str]]:
+    bundles: dict[str, bytes] = {}
+    shas: dict[int, str] = {}
+    artifacts: list[dict[str, Any]] = []
+    bundle_output = tmpdir / "bundles"
+    bundle_output.mkdir(parents=True, exist_ok=True)
+
+    for version in versions:
+        skill_dir = _make_skill_dir(tmpdir / f"src-v{version}", skill_name)
+        (skill_dir / "SKILL.md").write_text(
+            f"# {skill_name}\n\nversion {version}\n",
+            encoding="utf-8",
+        )
+        bundle_path = pack_skill_bundle(
+            skill_dir, version, name=skill_name, output_dir=bundle_output,
+        )
+        bundle_bytes = bundle_path.read_bytes()
+        bundle_sha = hashlib.sha256(bundle_bytes).hexdigest()
+        download_path = f"/skills/{skill_name}/{version}/bundle.tar.gz"
+        bundles[download_path] = bundle_bytes
+        shas[version] = bundle_sha
+        artifacts.append({
+            "version": version,
+            "sha256": bundle_sha,
+            "size_bytes": len(bundle_bytes),
+            "download_url": download_path,
+            "changelog": f"v{version}",
+        })
+
+    skill_entry: dict[str, Any] = {
+        "name": skill_name,
+        "recommended_version": recommended_version,
+        "targets": targets or ["box"],
+        "capabilities": ["deploy"],
+        "artifacts": artifacts,
+    }
+    if min_version is not None:
+        skill_entry["min_version"] = min_version
+    if min_version_reason is not None:
+        skill_entry["min_version_reason"] = min_version_reason
+
+    manifest_dict: dict[str, Any] = {
+        "schema_version": 2,
+        "distributor_id": TEST_DISTRIBUTOR_ID,
+        "client_id": TEST_CLIENT_ID,
+        "manifest_version": manifest_version,
+        "updated_at": "2026-05-04T00:00:00Z",
+        "skills": [skill_entry],
+    }
+    signed_manifest = sign_manifest(manifest_dict, private_key)
+    manifest_bytes = json.dumps(signed_manifest, indent=2).encode("utf-8")
+
+    return manifest_bytes, bundles, shas
+
+
 # ---------------------------------------------------------------------------
 # Local HTTP test server
 # ---------------------------------------------------------------------------
@@ -434,6 +500,45 @@ class TestSyncDistributorSetPinResolution(unittest.TestCase):
         )
         self.assertEqual(entries[0].version, 8)
         self.assertEqual(entries[0].pinned_by, "manifest_recommendation")
+
+
+class TestSyncDistributorSetV2Artifacts(unittest.TestCase):
+    """Schema v2 sync uses the artifact selected by pin resolution."""
+
+    def setUp(self) -> None:
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.private, self.public = _make_keypair()
+        self.pub_str = public_key_to_config_str(self.public)
+        self.manifest_bytes, self.bundles, self.shas = _make_v2_bundles_and_manifest(
+            self.tmpdir / "gen",
+            self.private,
+        )
+        self.server, self.base_url = _start_server(self.manifest_bytes, self.bundles)
+        self.state_root = self.tmpdir / "state"
+        self.install_root = self.tmpdir / "install"
+        self.install_root.mkdir(parents=True)
+        self.install_targets = [{"id": "default", "host_path": str(self.install_root)}]
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    @mock.patch.dict(os.environ, {"TEST_DIST_KEY": TEST_API_KEY})
+    def test_client_pin_below_recommended_installs_pinned_artifact(self) -> None:
+        config = _make_distributor_config(self.base_url, self.pub_str)
+        source = _make_source(pin={"deploy": 6})
+
+        entries, _ = sync_distributor_set(
+            config, source, self.state_root, self.install_targets,
+        )
+
+        self.assertEqual(entries[0].version, 6)
+        self.assertEqual(entries[0].pinned_by, "client")
+        self.assertEqual(entries[0].bundle_sha256, self.shas[6])
+        installed = (self.install_root / "deploy" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("version 6", installed)
+        cached = self.state_root / "bundle-cache" / "deploy" / "deploy-v6.skillbundle.tar.gz"
+        self.assertTrue(cached.is_file())
 
 
 class TestSyncDistributorSetTargetFilter(unittest.TestCase):

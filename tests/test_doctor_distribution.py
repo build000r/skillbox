@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import sys
@@ -274,6 +275,168 @@ class DistributionDoctorChecksTests(unittest.TestCase):
             cache_check = by_code["distributor_bundle_cache_integrity"]
             self.assertEqual(cache_check.status, "warn")
             self.assertIn("hash mismatch", " ".join(cache_check.details.get("issues", [])))
+
+    def test_bundle_cache_integrity_passes_when_hash_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self.helpers._write_fixture(repo)
+
+            private_key = Ed25519PrivateKey.generate()
+            bundle_bytes = b"matching-bundle"
+            bundle_sha = hashlib.sha256(bundle_bytes).hexdigest()
+            _write_distributor_config(repo, public_key_to_config_str(private_key.public_key()))
+            _write_distribution_lockfile(repo, bundle_sha=bundle_sha)
+            _write_bundle_cache(repo, bundle_bytes)
+            model = self._model(repo)
+
+            with mock.patch.dict(os.environ, {DIST_KEY_ENV: "token"}, clear=False):
+                checks = validate_distribution_doctor_checks(model)
+
+            by_code = {item.code: item for item in checks}
+            cache_check = by_code["distributor_bundle_cache_integrity"]
+            self.assertEqual(cache_check.status, "pass")
+            self.assertEqual(cache_check.details["checked_entries"], 1)
+
+    def test_bundle_cache_integrity_warns_when_lockfile_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self.helpers._write_fixture(repo)
+
+            private_key = Ed25519PrivateKey.generate()
+            _write_distributor_config(repo, public_key_to_config_str(private_key.public_key()))
+            model = self._model(repo)
+
+            with mock.patch.dict(os.environ, {DIST_KEY_ENV: "token"}, clear=False):
+                checks = validate_distribution_doctor_checks(model)
+
+            by_code = {item.code: item for item in checks}
+            cache_check = by_code["distributor_bundle_cache_integrity"]
+            self.assertEqual(cache_check.status, "warn")
+            self.assertIn("lockfile missing", " ".join(cache_check.details.get("issues", [])))
+
+    def test_bundle_cache_integrity_warns_on_invalid_lockfile_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self.helpers._write_fixture(repo)
+
+            private_key = Ed25519PrivateKey.generate()
+            _write_distributor_config(repo, public_key_to_config_str(private_key.public_key()))
+            (repo / "workspace" / "skill-repos.lock.json").write_text("not json", encoding="utf-8")
+            model = self._model(repo)
+
+            with mock.patch.dict(os.environ, {DIST_KEY_ENV: "token"}, clear=False):
+                checks = validate_distribution_doctor_checks(model)
+
+            by_code = {item.code: item for item in checks}
+            cache_check = by_code["distributor_bundle_cache_integrity"]
+            self.assertEqual(cache_check.status, "warn")
+            self.assertIn("failed to parse lockfile", " ".join(cache_check.details.get("issues", [])))
+
+    def test_bundle_cache_integrity_warns_on_missing_entry_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self.helpers._write_fixture(repo)
+
+            private_key = Ed25519PrivateKey.generate()
+            _write_distributor_config(repo, public_key_to_config_str(private_key.public_key()))
+            payload = {
+                "version": 3,
+                "config_sha": "cfg",
+                "synced_at": "2026-04-21T10:00:10Z",
+                "distributor_manifests": {},
+                "skills": [
+                    {
+                        "name": "deploy",
+                        "source": "distributor",
+                        "distributor_id": DIST_ID,
+                    }
+                ],
+            }
+            (repo / "workspace" / "skill-repos.lock.json").write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+            model = self._model(repo)
+
+            with mock.patch.dict(os.environ, {DIST_KEY_ENV: "token"}, clear=False):
+                checks = validate_distribution_doctor_checks(model)
+
+            by_code = {item.code: item for item in checks}
+            cache_check = by_code["distributor_bundle_cache_integrity"]
+            issues = " ".join(cache_check.details.get("issues", []))
+            self.assertEqual(cache_check.status, "warn")
+            self.assertIn("missing version", issues)
+
+    def test_bundle_cache_integrity_warns_on_missing_bundle_sha(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self.helpers._write_fixture(repo)
+
+            private_key = Ed25519PrivateKey.generate()
+            _write_distributor_config(repo, public_key_to_config_str(private_key.public_key()))
+            payload = {
+                "version": 3,
+                "config_sha": "cfg",
+                "synced_at": "2026-04-21T10:00:10Z",
+                "distributor_manifests": {},
+                "skills": [
+                    {
+                        "name": "deploy",
+                        "source": "distributor",
+                        "distributor_id": DIST_ID,
+                        "version": 8,
+                    }
+                ],
+            }
+            (repo / "workspace" / "skill-repos.lock.json").write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+            model = self._model(repo)
+
+            with mock.patch.dict(os.environ, {DIST_KEY_ENV: "token"}, clear=False):
+                checks = validate_distribution_doctor_checks(model)
+
+            by_code = {item.code: item for item in checks}
+            cache_check = by_code["distributor_bundle_cache_integrity"]
+            self.assertEqual(cache_check.status, "warn")
+            self.assertIn("missing bundle_sha256", " ".join(cache_check.details.get("issues", [])))
+
+    def test_bundle_cache_integrity_warns_when_cached_bundle_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self.helpers._write_fixture(repo)
+
+            private_key = Ed25519PrivateKey.generate()
+            _write_distributor_config(repo, public_key_to_config_str(private_key.public_key()))
+            _write_distribution_lockfile(repo)
+            model = self._model(repo)
+
+            with mock.patch.dict(os.environ, {DIST_KEY_ENV: "token"}, clear=False):
+                checks = validate_distribution_doctor_checks(model)
+
+            by_code = {item.code: item for item in checks}
+            cache_check = by_code["distributor_bundle_cache_integrity"]
+            self.assertEqual(cache_check.status, "warn")
+            self.assertIn("cached bundle missing", " ".join(cache_check.details.get("issues", [])))
+
+    def test_bundle_cache_integrity_skips_unknown_distributor_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self.helpers._write_fixture(repo)
+
+            private_key = Ed25519PrivateKey.generate()
+            _write_distributor_config(repo, public_key_to_config_str(private_key.public_key()))
+            _write_distribution_lockfile(repo, distributor_id="other-dist")
+            model = self._model(repo)
+
+            with mock.patch.dict(os.environ, {DIST_KEY_ENV: "token"}, clear=False):
+                checks = validate_distribution_doctor_checks(model)
+
+            by_code = {item.code: item for item in checks}
+            cache_check = by_code["distributor_bundle_cache_integrity"]
+            self.assertEqual(cache_check.status, "pass")
+            self.assertIn("no distributor bundle cache entries", cache_check.message)
 
     def test_lockfile_consistency_warns_when_manifest_reference_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

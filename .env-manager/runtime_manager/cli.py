@@ -14,6 +14,13 @@ from .operator_booking import *
 from .context_rendering import *
 from .text_renderers import *
 from .workflows import *
+from .distribution.publish import DistributionPublishError, publish_skill_release
+from .distribution.preview import DistributionPreviewError, preview_manifest
+from .distribution.rollback import (
+    DistributionRollbackError,
+    cached_versions,
+    rollback_distributor_skill,
+)
 
 
 def _add_profile_arg(command_parser: argparse.ArgumentParser) -> None:
@@ -601,6 +608,57 @@ def _build_parser() -> argparse.ArgumentParser:
     client_diff_parser.add_argument("--format", choices=("text", "json"), default="text")
     _add_profile_arg(client_diff_parser)
 
+    distribution_publish_parser = subparsers.add_parser(
+        "distribution-publish",
+        help="Publish one local skill version into a signed schema_version=2 manifest.",
+    )
+    distribution_publish_parser.add_argument("skill_path")
+    distribution_publish_parser.add_argument("--version", type=int, required=True)
+    distribution_publish_parser.add_argument("--manifest-path", required=True)
+    distribution_publish_parser.add_argument("--artifact-root", required=True)
+    distribution_publish_parser.add_argument("--signing-key", required=True)
+    distribution_publish_parser.add_argument("--skill-name", default=None)
+    distribution_publish_parser.add_argument("--distributor-id", default="local")
+    distribution_publish_parser.add_argument("--client-id", default="local")
+    distribution_publish_parser.add_argument("--target", action="append", default=[])
+    distribution_publish_parser.add_argument("--capability", action="append", default=[])
+    distribution_publish_parser.add_argument("--changelog", default=None)
+    distribution_publish_parser.add_argument("--min-version", type=int, default=None)
+    distribution_publish_parser.add_argument("--min-version-reason", default=None)
+    distribution_publish_parser.add_argument("--download-prefix", default="/skills")
+    distribution_publish_parser.add_argument("--format", choices=("text", "json"), default="text")
+
+    distribution_preview_parser = subparsers.add_parser(
+        "distribution-preview",
+        help="Preview selected artifacts from a signed manifest without mutating local state.",
+    )
+    distribution_preview_parser.add_argument("--manifest-path", required=True)
+    distribution_preview_parser.add_argument("--public-key", required=True)
+    distribution_preview_parser.add_argument("--distributor-id", default="local")
+    distribution_preview_parser.add_argument("--state-root", default=".skillbox-state")
+    distribution_preview_parser.add_argument("--pick", action="append", default=[])
+    distribution_preview_parser.add_argument("--pin", action="append", default=[])
+    distribution_preview_parser.add_argument("--target-env", default=None)
+    distribution_preview_parser.add_argument("--lockfile", default=None)
+    distribution_preview_parser.add_argument("--format", choices=("text", "json"), default="text")
+
+    distribution_rollback_parser = subparsers.add_parser(
+        "distribution-rollback",
+        help="Rollback one skill to a verified cached bundle version.",
+    )
+    distribution_rollback_parser.add_argument("--manifest-path", required=True)
+    distribution_rollback_parser.add_argument("--public-key", required=True)
+    distribution_rollback_parser.add_argument("--distributor-id", default="local")
+    distribution_rollback_parser.add_argument("--skill", required=True)
+    distribution_rollback_parser.add_argument("--version", type=int, required=True)
+    distribution_rollback_parser.add_argument("--state-root", default=".skillbox-state")
+    distribution_rollback_parser.add_argument("--install-target", action="append", default=[])
+    distribution_rollback_parser.add_argument("--lockfile", required=True)
+    distribution_rollback_parser.add_argument("--reason", default=None)
+    distribution_rollback_parser.add_argument("--emergency-override", action="store_true")
+    distribution_rollback_parser.add_argument("--list", action="store_true")
+    distribution_rollback_parser.add_argument("--format", choices=("text", "json"), default="text")
+
     onboard_parser = subparsers.add_parser(
         "onboard",
         help="Macro: scaffold a client, sync, bootstrap, start services, generate context, and verify.",
@@ -1086,6 +1144,150 @@ def _handle_client_diff(args: argparse.Namespace, root_dir: Path) -> int:
     return EXIT_OK
 
 
+def _handle_distribution_publish(args: argparse.Namespace, root_dir: Path) -> int:
+    try:
+        payload = publish_skill_release(
+            skill_path=host_path_to_absolute_path(root_dir, args.skill_path),
+            version=args.version,
+            manifest_path=host_path_to_absolute_path(root_dir, args.manifest_path),
+            artifact_root=host_path_to_absolute_path(root_dir, args.artifact_root),
+            signing_key_ref=args.signing_key,
+            distributor_id=args.distributor_id,
+            client_id=args.client_id,
+            skill_name=args.skill_name,
+            targets=args.target,
+            capabilities=args.capability,
+            changelog=args.changelog,
+            min_version=args.min_version,
+            min_version_reason=args.min_version_reason,
+            download_prefix=args.download_prefix,
+        )
+    except (RuntimeError, DistributionPublishError) as exc:
+        if args.format == "json":
+            emit_json(classify_error(RuntimeError(str(exc)), "distribution-publish"))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print(f"skill: {payload['skill']}")
+        print(f"version: {payload['version']}")
+        print(f"result: {payload['result']}")
+        print(f"artifact: {payload['artifact_path']}")
+        print(f"manifest: {payload['manifest_path']}")
+        print(f"sha256: {payload['artifact_sha256']}")
+    return EXIT_OK
+
+
+def _handle_distribution_preview(args: argparse.Namespace, root_dir: Path) -> int:
+    try:
+        payload = preview_manifest(
+            manifest_bytes=host_path_to_absolute_path(root_dir, args.manifest_path).read_bytes(),
+            public_key_config=args.public_key,
+            distributor_id=args.distributor_id,
+            state_root=host_path_to_absolute_path(root_dir, args.state_root),
+            pick=args.pick,
+            pin=_parse_distribution_pin_args(args.pin),
+            target_env=args.target_env,
+            lockfile_path=(
+                host_path_to_absolute_path(root_dir, args.lockfile)
+                if args.lockfile else None
+            ),
+        )
+    except (RuntimeError, DistributionPreviewError) as exc:
+        if args.format == "json":
+            emit_json(classify_error(RuntimeError(str(exc)), "distribution-preview"))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print(f"distributor: {payload['distributor_id']}")
+        print(f"manifest_version: {payload['manifest_version']}")
+        print(f"ready: {payload['ready']}")
+        for item in payload["items"]:
+            print(
+                f"{item['action']}: {item['skill']} v{item['selected_version']} "
+                f"{item['pinned_by']} cache={item['cache_state']}"
+            )
+    return EXIT_OK if payload.get("ready") else EXIT_ERROR
+
+
+def _handle_distribution_rollback(args: argparse.Namespace, root_dir: Path) -> int:
+    state_root = host_path_to_absolute_path(root_dir, args.state_root)
+    if args.list:
+        payload = {
+            "ok": True,
+            "skill": args.skill,
+            "cached_versions": cached_versions(
+                state_root=state_root,
+                skill_name=args.skill,
+            ),
+        }
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            print(f"skill: {payload['skill']}")
+            print("cached_versions: " + ", ".join(str(v) for v in payload["cached_versions"]))
+        return EXIT_OK
+
+    try:
+        install_targets = [
+            {"id": f"target-{index + 1}", "host_path": str(host_path_to_absolute_path(root_dir, target))}
+            for index, target in enumerate(args.install_target)
+        ]
+        if not install_targets:
+            raise DistributionRollbackError("distribution-rollback requires --install-target")
+        payload = rollback_distributor_skill(
+            manifest_path=host_path_to_absolute_path(root_dir, args.manifest_path),
+            public_key_config=args.public_key,
+            distributor_id=args.distributor_id,
+            skill_name=args.skill,
+            target_version=args.version,
+            state_root=state_root,
+            install_targets=install_targets,
+            lockfile_path=host_path_to_absolute_path(root_dir, args.lockfile),
+            reason=args.reason,
+            emergency_override=args.emergency_override,
+        )
+    except (RuntimeError, DistributionRollbackError) as exc:
+        if args.format == "json":
+            emit_json(classify_error(RuntimeError(str(exc)), "distribution-rollback"))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print(f"skill: {payload['skill']}")
+        print(f"to_version: {payload['to_version']}")
+        print(f"source: {payload['source']}")
+        print(f"lockfile_updated: {payload['lockfile_updated']}")
+    return EXIT_OK
+
+
+def _parse_distribution_pin_args(raw_items: list[str]) -> dict[str, int]:
+    pins: dict[str, int] = {}
+    for raw_item in raw_items or []:
+        if "=" not in raw_item:
+            raise DistributionPreviewError("--pin must use skill=version")
+        skill, raw_version = raw_item.split("=", 1)
+        skill = skill.strip()
+        if not skill:
+            raise DistributionPreviewError("--pin skill name must be non-empty")
+        try:
+            version = int(raw_version)
+        except ValueError as exc:
+            raise DistributionPreviewError("--pin version must be an integer") from exc
+        pins[skill] = version
+    return pins
+
+
 def _handle_focus(args: argparse.Namespace, root_dir: Path) -> int:
     cid = args.client_id or ""
     # CLI-consistency (WG-003): fall back to --client for parity with
@@ -1391,6 +1593,9 @@ _EARLY_DISPATCH: dict[str, Callable[[argparse.Namespace, Path], int]] = {
     "client-open": _handle_client_open,
     "client-publish": _handle_client_publish,
     "client-diff": _handle_client_diff,
+    "distribution-publish": _handle_distribution_publish,
+    "distribution-preview": _handle_distribution_preview,
+    "distribution-rollback": _handle_distribution_rollback,
     "focus": _handle_focus,
     "stewardship-report": _handle_stewardship_report,
     "session-start": _handle_session_start,
