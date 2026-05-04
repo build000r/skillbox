@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import socket
 
 from .shared import *
@@ -2297,7 +2298,7 @@ def service_healthcheck_state(service: dict[str, Any]) -> dict[str, Any]:
         try:
             with urllib.request.urlopen(url, timeout=timeout) as response:
                 return {"state": "ok", "status_code": response.getcode(), "url": url}
-        except (urllib.error.URLError, TimeoutError, ValueError):
+        except (urllib.error.URLError, TimeoutError, ValueError, http.client.RemoteDisconnected):
             return {"state": "down", "url": url}
 
     if healthcheck_type == "port":

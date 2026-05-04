@@ -12,6 +12,7 @@ python3 .env-manager/manage.py render
 python3 .env-manager/manage.py sync
 python3 .env-manager/manage.py doctor
 python3 .env-manager/manage.py status
+python3 .env-manager/manage.py mmdx --cwd "$PWD" skill review realms --no-open
 python3 .env-manager/manage.py up --profile surfaces
 python3 .env-manager/manage.py down --profile surfaces --service api-stub
 python3 .env-manager/manage.py logs --profile surfaces --service api-stub --lines 80

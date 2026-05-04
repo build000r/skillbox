@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .shared import *
 from .validation import *
 from .publish import *
 from .runtime_ops import *
 from .skill_visibility import *
+from .mmdx_open import *
+from .operator_booking import *
 from .context_rendering import *
 from .text_renderers import *
 from .workflows import *
@@ -198,6 +200,93 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_profile_arg(skills_parser)
     _add_client_arg(skills_parser)
+
+    mmdx_parser = subparsers.add_parser(
+        "mmdx",
+        help="Fuzzy-find and open Mermaid/MMDX files from the current repo.",
+    )
+    mmdx_parser.add_argument(
+        "query",
+        nargs="*",
+        help="File path, stem, or fuzzy path fragment. Omit to list recent diagrams.",
+    )
+    mmdx_parser.add_argument("--format", choices=("text", "json"), default="text")
+    mmdx_parser.add_argument(
+        "--cwd",
+        default=None,
+        help="Working directory used for relative paths and default repo-root discovery. Defaults to $PWD.",
+    )
+    mmdx_parser.add_argument(
+        "--search-root",
+        action="append",
+        default=[],
+        help="Directory to scan for .mmdx/.mmd files. Can be repeated.",
+    )
+    mmdx_parser.add_argument("--limit", type=int, default=MMDX_DEFAULT_LIMIT)
+    open_group = mmdx_parser.add_mutually_exclusive_group()
+    open_group.add_argument("--open", dest="open", action="store_true", default=True)
+    open_group.add_argument("--no-open", dest="open", action="store_false")
+    mmdx_parser.add_argument(
+        "--tmux",
+        action="store_true",
+        help="Open with the MMDX skill's local tmux handoff bridge.",
+    )
+    mmdx_parser.add_argument(
+        "--tmux-submit",
+        action="store_true",
+        help="With --tmux, press Enter after the viewer sends a handoff packet.",
+    )
+    mmdx_parser.add_argument(
+        "--allow-parser-install",
+        action="store_true",
+        help="Allow the MMDX script to install its Mermaid parser dependency if missing.",
+    )
+    _add_profile_arg(mmdx_parser)
+    _add_client_arg(mmdx_parser)
+
+    operator_booking_parser = subparsers.add_parser(
+        "operator-booking",
+        help="Fetch human-operator availability or create an x402 booking hold from client config.",
+    )
+    operator_booking_parser.add_argument(
+        "action",
+        nargs="?",
+        default="availability",
+        choices=("availability", "times", "list", "config", "book"),
+    )
+    operator_booking_parser.add_argument("--format", choices=("text", "json"), default="text")
+    operator_booking_parser.add_argument("--date", default=None, help="Booking date in YYYY-MM-DD format.")
+    operator_booking_parser.add_argument("--slot", default=None, help="Slot type to book, e.g. AM or PM.")
+    operator_booking_parser.add_argument("--email", default=None, help="Client email for booking/account email.")
+    operator_booking_parser.add_argument("--name", default=None, help="Client display name for the booking.")
+    operator_booking_parser.add_argument(
+        "--redirect-url",
+        default=None,
+        help="Optional magic-link redirect URL for account sign-in.",
+    )
+    operator_booking_parser.add_argument(
+        "--origin",
+        default=None,
+        help="Optional Origin header override for browser-style publishable-key requests.",
+    )
+    operator_booking_parser.add_argument(
+        "--access-token-env",
+        default=None,
+        help="Optional env var containing a verified user JWT; binds bookings to that account.",
+    )
+    operator_booking_parser.add_argument(
+        "--send-magic-link",
+        action="store_true",
+        help="Request a passwordless account email before creating the x402 hold.",
+    )
+    operator_booking_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="For book, print the planned SPAPS requests without sending them.",
+    )
+    operator_booking_parser.add_argument("--limit", type=int, default=8)
+    _add_profile_arg(operator_booking_parser)
+    _add_client_arg(operator_booking_parser)
 
     skill_parser = subparsers.add_parser(
         "skill",
@@ -1183,6 +1272,115 @@ def _handle_session_status(args: argparse.Namespace, root_dir: Path) -> int:
     return EXIT_OK
 
 
+def _handle_mmdx(args: argparse.Namespace, root_dir: Path) -> int:
+    try:
+        payload, exit_code = mmdx_open_payload(
+            root_dir=root_dir,
+            cwd=Path(args.cwd) if args.cwd else None,
+            query_parts=getattr(args, "query", []) or [],
+            search_roots=getattr(args, "search_root", []) or [],
+            open_file=bool(getattr(args, "open", True)),
+            limit=max(1, int(getattr(args, "limit", MMDX_DEFAULT_LIMIT))),
+            tmux=bool(getattr(args, "tmux", False)),
+            tmux_submit=bool(getattr(args, "tmux_submit", False)),
+            allow_parser_install=bool(getattr(args, "allow_parser_install", False)),
+        )
+    except RuntimeError as exc:
+        payload = mmdx_error_payload(exc)
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            print_mmdx_payload_text(payload)
+        return EXIT_ERROR
+
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print_mmdx_payload_text(payload)
+    return exit_code
+
+
+def _print_operator_booking_text(payload: dict[str, Any]) -> None:
+    if payload.get("action") == "config":
+        config = payload.get("operator_booking") or {}
+        print(f"operator booking: {config.get('client_id') or '-'}")
+        print(f"availability: {config.get('availability_url') or '-'}")
+        print(f"book hold: {config.get('booking_hold_url') or '-'}")
+        print(f"magic link: {config.get('magic_link_url') or '-'}")
+        print(f"publishable key: {config.get('api_key_env') or '-'} configured={config.get('api_key_configured')}")
+        print(f"access token: {config.get('access_token_env') or '-'} configured={config.get('access_token_configured')}")
+        return
+
+    if payload.get("action") == "availability":
+        print(f"operator booking: {payload.get('client_id') or '-'}")
+        print(f"booking url: {payload.get('booking_url') or '-'}")
+        print(f"timezone: {payload.get('timezone') or '-'}")
+        print(f"available slots: {payload.get('available', 0)}")
+        for slot in payload.get("slots") or []:
+            price = slot.get("price")
+            price_text = f"${price}" if price is not None else "-"
+            print(f"  - {slot.get('date')} {slot.get('slot')} {price_text}")
+        return
+
+    if payload.get("action") == "book":
+        if payload.get("dry_run"):
+            print("operator booking dry run")
+            print(f"book hold: {payload.get('booking_url')}")
+            if payload.get("magic_link_url"):
+                print(f"magic link: {payload.get('magic_link_url')}")
+            return
+        booking = payload.get("booking") or {}
+        magic_link = payload.get("magic_link")
+        print(f"booking id: {booking.get('bookingId') or '-'}")
+        print(f"resource: {booking.get('resourceKey') or '-'}")
+        print(f"action: {booking.get('actionKey') or '-'}")
+        print(f"price: {booking.get('priceDisplay') or booking.get('price') or '-'}")
+        if magic_link:
+            print(f"magic link sent: {magic_link.get('email') or '-'}")
+        for next_action in payload.get("next_actions") or []:
+            print(f"next: {next_action}")
+        return
+
+    print(payload)
+
+
+def _handle_operator_booking(
+    args: argparse.Namespace,
+    root_dir: Path,
+    model: dict[str, Any],
+    resolved_mode: str,
+) -> int:
+    try:
+        payload, exit_code = operator_booking_payload(
+            model,
+            action=str(getattr(args, "action", "availability") or "availability"),
+            client_id=(getattr(args, "client", []) or [None])[0],
+            date=getattr(args, "date", None),
+            slot=getattr(args, "slot", None),
+            email=getattr(args, "email", None),
+            name=getattr(args, "name", None),
+            redirect_url=getattr(args, "redirect_url", None),
+            origin=getattr(args, "origin", None),
+            send_magic_link=bool(getattr(args, "send_magic_link", False)),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            limit=int(getattr(args, "limit", 8) or 8),
+            access_token_env=getattr(args, "access_token_env", None),
+        )
+    except RuntimeError as exc:
+        payload = operator_booking_error_payload(exc)
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            print(payload["error"]["message"], file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        _print_operator_booking_text(payload)
+    return exit_code
+
+
 _EARLY_DISPATCH: dict[str, Callable[[argparse.Namespace, Path], int]] = {
     "client-init": _handle_client_init,
     "onboard": _handle_onboard,
@@ -1200,6 +1398,7 @@ _EARLY_DISPATCH: dict[str, Callable[[argparse.Namespace, Path], int]] = {
     "session-end": _handle_session_end,
     "session-resume": _handle_session_resume,
     "session-status": _handle_session_status,
+    "mmdx": _handle_mmdx,
 }
 
 
@@ -1655,6 +1854,7 @@ _MODEL_DISPATCH: dict[str, Callable[[argparse.Namespace, Path, dict[str, Any], s
     "skills": _handle_skills,
     "skill": _handle_skill,
     "overlay": _handle_overlay,
+    "operator-booking": _handle_operator_booking,
     "bootstrap": _handle_bootstrap,
     "up": _handle_up,
     "down": _handle_down,

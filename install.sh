@@ -17,6 +17,7 @@ NO_GUM=0
 FORCE=0
 DRY_RUN=0
 VERIFY=0
+INSTALL_WRAPPERS=0
 RUN_BUILD=1
 RUN_UP=1
 RUN_FIRST_BOX=1
@@ -32,6 +33,7 @@ OFFLINE_TARBALL=""
 SOURCE_SHA256=""
 REF=""
 BLUEPRINT=""
+WRAPPER_BIN_DIR="${WRAPPER_BIN_DIR:-${HOME}/.local/bin}"
 TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-}"
 TAILSCALE_HOSTNAME="${TAILSCALE_HOSTNAME:-skillbox-dev}"
 
@@ -52,6 +54,7 @@ STATUS_FIRST_BOX="pending"
 STATUS_BUILD="skipped"
 STATUS_UP="skipped"
 STATUS_VERIFY="skipped"
+STATUS_WRAPPERS="skipped"
 
 FIRST_BOX_OUTPUT_DIR=""
 FIRST_BOX_PRIVATE_REPO=""
@@ -97,6 +100,8 @@ Lifecycle:
   --skip-build             Do not run make build after first-box.
   --skip-up                Do not run make up after first-box.
   --verify                 Run post-install runtime verification commands.
+  --install-wrappers       Install sbp/sbo symlinks for this checkout.
+  --wrapper-bin-dir <path> Install wrappers here. Defaults to ~/.local/bin.
   --bootstrap-host         Run scripts/01-bootstrap-do.sh before build/up.
   --tailscale              Run scripts/02-install-tailscale.sh after bootstrap.
 
@@ -938,6 +943,35 @@ run_make_target() {
   )
 }
 
+install_wrappers() {
+  local target_repo="$1"
+
+  if [[ "${INSTALL_WRAPPERS}" -ne 1 ]]; then
+    return 0
+  fi
+
+  STATUS_WRAPPERS="pending"
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    info "dry-run: install sbp/sbo symlinks into ${WRAPPER_BIN_DIR}"
+    STATUS_WRAPPERS="planned"
+    return 0
+  fi
+
+  if [[ ! -f "${target_repo}/scripts/sbp" || ! -f "${target_repo}/scripts/sbo" ]]; then
+    STATUS_WRAPPERS="fail"
+    err "Wrapper scripts are missing from ${target_repo}/scripts."
+    exit 1
+  fi
+
+  mkdir -p "${WRAPPER_BIN_DIR}"
+  chmod +x "${target_repo}/scripts/sbp" "${target_repo}/scripts/sbo"
+  ln -sf "${target_repo}/scripts/sbp" "${WRAPPER_BIN_DIR}/sbp"
+  ln -sf "${target_repo}/scripts/sbo" "${WRAPPER_BIN_DIR}/sbo"
+  SKILLBOX_ROOT="${target_repo}" "${WRAPPER_BIN_DIR}/sbp" --help >/dev/null
+  SKILLBOX_ROOT="${target_repo}" "${WRAPPER_BIN_DIR}/sbo" --help >/dev/null
+  STATUS_WRAPPERS="ok"
+}
+
 run_verify() {
   local target_repo="$1"
   local profile=""
@@ -1001,6 +1035,10 @@ print_summary() {
   lines+=("bootstrap_host: ${STATUS_BOOTSTRAP}")
   lines+=("tailscale: ${STATUS_TAILSCALE}")
   lines+=("first_box: ${STATUS_FIRST_BOX}")
+  lines+=("wrappers: ${STATUS_WRAPPERS}")
+  if [[ "${INSTALL_WRAPPERS}" -eq 1 ]]; then
+    lines+=("wrapper_bin_dir: ${WRAPPER_BIN_DIR}")
+  fi
   lines+=("build: ${STATUS_BUILD}")
   lines+=("up: ${STATUS_UP}")
   lines+=("verify: ${STATUS_VERIFY}")
@@ -1072,6 +1110,14 @@ while [[ $# -gt 0 ]]; do
       VERIFY=1
       shift
       ;;
+    --install-wrappers)
+      INSTALL_WRAPPERS=1
+      shift
+      ;;
+    --wrapper-bin-dir)
+      WRAPPER_BIN_DIR="$2"
+      shift 2
+      ;;
     --bootstrap-host)
       RUN_BOOTSTRAP_HOST=1
       shift
@@ -1107,6 +1153,8 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+WRAPPER_BIN_DIR="$(resolve_abs_path "${WRAPPER_BIN_DIR}")"
 
 print_header
 setup_proxy
@@ -1176,6 +1224,7 @@ if [[ "${DRY_RUN}" -eq 0 ]]; then
   FIRST_BOX_JSON="$(mktemp)"
 fi
 run_first_box "${REPO_DIR}" "${FIRST_BOX_JSON:-/dev/null}"
+install_wrappers "${REPO_DIR}"
 
 if [[ "${RUN_BUILD}" -eq 1 ]]; then
   STATUS_BUILD="pending"
