@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from runtime_manager.distribution.manifest import (
     SUPPORTED_SCHEMA_VERSION,
+    ClientManifestArtifact,
     ClientManifest,
     ClientManifestSkill,
     ManifestSchemaError,
@@ -52,6 +53,45 @@ def _manifest_dict(**overrides):
         "manifest_version": 14,
         "updated_at": "2026-04-21T10:00:00Z",
         "skills": [_skill_dict()],
+    }
+    base.update(overrides)
+    return base
+
+
+def _artifact_dict(version: int, **overrides):
+    base = {
+        "version": version,
+        "sha256": chr(96 + version) * 64,
+        "size_bytes": 28000 + version,
+        "download_url": f"/skills/deploy/{version}/bundle.tar.gz",
+        "changelog": f"Changes for v{version}",
+    }
+    base.update(overrides)
+    return base
+
+
+def _v2_skill_dict(**overrides):
+    base = {
+        "name": "deploy",
+        "recommended_version": 8,
+        "min_version": 6,
+        "min_version_reason": "security floor",
+        "targets": ["box"],
+        "capabilities": ["deploy", "rollback"],
+        "artifacts": [_artifact_dict(6), _artifact_dict(8)],
+    }
+    base.update(overrides)
+    return base
+
+
+def _v2_manifest_dict(**overrides):
+    base = {
+        "schema_version": 2,
+        "distributor_id": "acme-skills",
+        "client_id": "client-42",
+        "manifest_version": 15,
+        "updated_at": "2026-04-22T10:00:00Z",
+        "skills": [_v2_skill_dict()],
     }
     base.update(overrides)
     return base
@@ -216,6 +256,54 @@ class TestParseManifest(unittest.TestCase):
         data = _manifest_dict(manifest_version=True)
         with self.assertRaises(ManifestSchemaError):
             parse_manifest(_to_bytes(data))
+
+    def test_v2_manifest_parses_artifacts(self) -> None:
+        m = parse_manifest(_to_bytes(_v2_manifest_dict()))
+        self.assertEqual(m.schema_version, 2)
+        self.assertEqual(m.manifest_version, 15)
+        self.assertEqual(len(m.skills), 1)
+
+        skill = m.skills[0]
+        self.assertEqual(skill.name, "deploy")
+        self.assertEqual(skill.recommended_version, 8)
+        self.assertEqual(skill.version, 8)
+        self.assertEqual(skill.min_version, 6)
+        self.assertEqual(skill.min_version_reason, "security floor")
+        self.assertEqual(skill.targets, ["box"])
+        self.assertEqual(skill.capabilities, ["deploy", "rollback"])
+        self.assertEqual(len(skill.artifacts), 2)
+        self.assertIsInstance(skill.artifacts[0], ClientManifestArtifact)
+        self.assertEqual(skill.sha256, "h" * 64)
+        self.assertEqual(skill.download_url, "/skills/deploy/8/bundle.tar.gz")
+        self.assertEqual(skill.changelog, "Changes for v8")
+
+    def test_v2_recommended_without_artifact_is_invalid(self) -> None:
+        skill = _v2_skill_dict(recommended_version=9)
+        with self.assertRaises(ManifestSchemaError) as ctx:
+            parse_manifest(_to_bytes(_v2_manifest_dict(skills=[skill])))
+        message = str(ctx.exception)
+        self.assertIn("DISTRIBUTION_MANIFEST_INVALID", message)
+        self.assertIn("recommended_version", message)
+
+    def test_v2_min_version_without_artifact_is_invalid(self) -> None:
+        skill = _v2_skill_dict(min_version=7)
+        with self.assertRaises(ManifestSchemaError) as ctx:
+            parse_manifest(_to_bytes(_v2_manifest_dict(skills=[skill])))
+        message = str(ctx.exception)
+        self.assertIn("DISTRIBUTION_MANIFEST_INVALID", message)
+        self.assertIn("min_version", message)
+
+    def test_v2_artifact_duplicate_versions_are_invalid(self) -> None:
+        skill = _v2_skill_dict(artifacts=[_artifact_dict(8), _artifact_dict(8)])
+        with self.assertRaises(ManifestSchemaError) as ctx:
+            parse_manifest(_to_bytes(_v2_manifest_dict(skills=[skill])))
+        self.assertIn("DISTRIBUTION_MANIFEST_INVALID", str(ctx.exception))
+
+    def test_v2_requires_artifacts(self) -> None:
+        skill = _v2_skill_dict(artifacts=[])
+        with self.assertRaises(ManifestSchemaError) as ctx:
+            parse_manifest(_to_bytes(_v2_manifest_dict(skills=[skill])))
+        self.assertIn("artifacts", str(ctx.exception))
 
 
 class TestVerifyManifest(unittest.TestCase):
