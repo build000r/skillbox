@@ -24,6 +24,14 @@ repo, path, and distributor-backed skill sources; local publishing creates
 signed schema v2 manifests with per-version artifacts; preview resolves pins
 and floors without mutating state; explicit sync installs the selected artifact
 and records distributor state; rollback can reinstall a verified cached bundle.
+The worker-runtime broker contract is present at the CLI/MCP boundary: callers
+can submit open-ended tasks, poll run status, read terminal artifacts, and
+explicitly promote reviewed learning proposals without coupling skillbox to a
+particular chat harness. The launch boundary is explicit now: resolved runs
+write `task.json`, invoke a configured Hermes command, and return
+`WORKER_LAUNCH_FAILED` when no runtime is installed or launch exits non-zero.
+Successful execution still requires a Hermes adapter or binary to be installed
+and registered for the active environment.
 The hosted distributor service, standalone laptop UX, short-lived token
 exchange, and background update checks remain later distribution work.
 

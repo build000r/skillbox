@@ -852,6 +852,47 @@ def _build_parser() -> argparse.ArgumentParser:
     session_status_parser.add_argument("--limit", type=int, default=10, help="Maximum sessions to return when listing.")
     session_status_parser.add_argument("--format", choices=("text", "json"), default="text")
 
+    worker_submit_parser = subparsers.add_parser(
+        "worker-submit",
+        help="Create a broker-managed worker run without launching a runtime before context resolution.",
+    )
+    worker_submit_parser.add_argument("task_class", choices=WORKER_TASK_CLASSES)
+    worker_submit_parser.add_argument("instruction")
+    worker_submit_parser.add_argument("--client", default="", help="Overlay id for context resolution.")
+    worker_submit_parser.add_argument("--cwd", default="", help="Working directory hint for context resolution.")
+    worker_submit_parser.add_argument("--repo-hint", default="", help="Optional repo id or path hint.")
+    worker_submit_parser.add_argument("--runtime", default="", help="Requested runtime id. Defaults to hermes.")
+    worker_submit_parser.add_argument("--write-scope", choices=WORKER_WRITE_SCOPES, default=WORKER_DEFAULT_WRITE_SCOPE)
+    worker_submit_parser.add_argument("--memory-scope", choices=WORKER_MEMORY_SCOPES, default=WORKER_DEFAULT_MEMORY_SCOPE)
+    worker_submit_parser.add_argument("--artifact-policy", default=WORKER_DEFAULT_ARTIFACT_POLICY)
+    worker_submit_parser.add_argument("--harness-session-ref", default="", help="Opaque caller correlation id.")
+    worker_submit_parser.add_argument("--format", choices=("text", "json"), default="text")
+
+    worker_status_parser = subparsers.add_parser(
+        "worker-status",
+        help="Read a broker-managed worker run by run id.",
+    )
+    worker_status_parser.add_argument("run_id")
+    worker_status_parser.add_argument("--format", choices=("text", "json"), default="text")
+
+    worker_artifacts_parser = subparsers.add_parser(
+        "worker-artifacts",
+        help="Read result artifacts for a terminal broker-managed worker run.",
+    )
+    worker_artifacts_parser.add_argument("run_id")
+    worker_artifacts_parser.add_argument("--format", choices=("text", "json"), default="text")
+
+    worker_promote_parser = subparsers.add_parser(
+        "worker-promote-learning",
+        help="Promote a reviewed worker learning proposal into its target.",
+    )
+    worker_promote_parser.add_argument("proposal_id")
+    worker_promote_parser.add_argument("--approved-by", default="", help="Operator or reviewer approving promotion.")
+    worker_promote_parser.add_argument("--target-kind", required=True)
+    worker_promote_parser.add_argument("--target-location", required=True)
+    worker_promote_parser.add_argument("--promotion-mode", default="promote")
+    worker_promote_parser.add_argument("--format", choices=("text", "json"), default="text")
+
     acceptance_parser = subparsers.add_parser(
         "acceptance",
         help="Run the first-box readiness gate: doctor-pre, sync, focus, mcp-smoke, doctor-post.",
@@ -1474,6 +1515,120 @@ def _handle_session_status(args: argparse.Namespace, root_dir: Path) -> int:
     return EXIT_OK
 
 
+def _handle_worker_submit(args: argparse.Namespace, root_dir: Path) -> int:
+    exit_code, payload = _emit_worker_payload_or_error(
+        args,
+        lambda: create_worker_run(
+            root_dir,
+            task_class=args.task_class,
+            instruction=args.instruction,
+            client_id=args.client,
+            cwd=args.cwd,
+            repo_hint=args.repo_hint,
+            runtime=args.runtime,
+            artifact_policy=args.artifact_policy,
+            write_scope=args.write_scope,
+            memory_scope=args.memory_scope,
+            harness_session_ref=args.harness_session_ref,
+        ),
+    )
+    return _emit_worker_cli_payload(args, exit_code, payload, _worker_submit_text)
+
+
+def _emit_worker_payload_or_error(
+    args: argparse.Namespace,
+    operation: Callable[[], dict[str, Any]],
+) -> tuple[int, dict[str, Any]]:
+    try:
+        return EXIT_OK, operation()
+    except WorkerRuntimeError as exc:
+        return EXIT_ERROR, worker_runtime_error_payload(exc)
+    except RuntimeError as exc:
+        return EXIT_ERROR, classify_error(exc, str(getattr(args, "command", "worker")))
+
+
+def _emit_worker_cli_payload(
+    args: argparse.Namespace,
+    exit_code: int,
+    payload: dict[str, Any],
+    text_lines: Callable[[dict[str, Any]], list[str]],
+) -> int:
+    if args.format == "json":
+        emit_json(payload)
+    elif exit_code != EXIT_OK:
+        print(payload["error"]["message"], file=sys.stderr)
+    else:
+        print("\n".join(text_lines(payload)))
+    return exit_code
+
+
+def _worker_submit_text(payload: dict[str, Any]) -> list[str]:
+    return [
+        f"worker run: {payload['run_id']}",
+        f"state: {payload['state']}",
+        f"runtime: {payload['runtime']}",
+        f"context: {payload['context_state']}",
+    ]
+
+
+def _worker_status_text(payload: dict[str, Any]) -> list[str]:
+    return [
+        f"worker run: {payload['run_id']}",
+        f"state: {payload['state']}",
+        f"runtime: {payload['runtime']}",
+    ]
+
+
+def _worker_artifacts_text(payload: dict[str, Any]) -> list[str]:
+    result = payload.get("result") or {}
+    lines = [
+        f"worker run: {payload['run_id']}",
+        f"artifacts: {len(payload.get('artifacts') or [])}",
+    ]
+    if result:
+        lines.append(f"summary: {result.get('summary') or '-'}")
+    return lines
+
+
+def _worker_promote_text(payload: dict[str, Any]) -> list[str]:
+    return [
+        f"proposal: {payload['proposal_id']}",
+        f"status: {payload['status']}",
+        f"target: {payload['target_kind']} {payload['target_location']}",
+    ]
+
+
+def _handle_worker_status(args: argparse.Namespace, root_dir: Path) -> int:
+    exit_code, payload = _emit_worker_payload_or_error(
+        args,
+        lambda: worker_status_payload(root_dir, args.run_id),
+    )
+    return _emit_worker_cli_payload(args, exit_code, payload, _worker_status_text)
+
+
+def _handle_worker_artifacts(args: argparse.Namespace, root_dir: Path) -> int:
+    exit_code, payload = _emit_worker_payload_or_error(
+        args,
+        lambda: worker_artifacts_payload(root_dir, args.run_id),
+    )
+    return _emit_worker_cli_payload(args, exit_code, payload, _worker_artifacts_text)
+
+
+def _handle_worker_promote_learning(args: argparse.Namespace, root_dir: Path) -> int:
+    exit_code, payload = _emit_worker_payload_or_error(
+        args,
+        lambda: promote_worker_learning(
+            root_dir,
+            proposal_id=args.proposal_id,
+            approved_by=args.approved_by,
+            target_kind=args.target_kind,
+            target_location=args.target_location,
+            promotion_mode=args.promotion_mode,
+        ),
+    )
+    return _emit_worker_cli_payload(args, exit_code, payload, _worker_promote_text)
+
+
 def _handle_mmdx(args: argparse.Namespace, root_dir: Path) -> int:
     try:
         payload, exit_code = mmdx_open_payload(
@@ -1502,48 +1657,66 @@ def _handle_mmdx(args: argparse.Namespace, root_dir: Path) -> int:
     return exit_code
 
 
+def _operator_booking_config_lines(payload: dict[str, Any]) -> list[str]:
+    config = payload.get("operator_booking") or {}
+    return [
+        f"operator booking: {config.get('client_id') or '-'}",
+        f"availability: {config.get('availability_url') or '-'}",
+        f"book hold: {config.get('booking_hold_url') or '-'}",
+        f"magic link: {config.get('magic_link_url') or '-'}",
+        f"publishable key: {config.get('api_key_env') or '-'} configured={config.get('api_key_configured')}",
+        f"access token: {config.get('access_token_env') or '-'} configured={config.get('access_token_configured')}",
+    ]
+
+
+def _operator_booking_availability_lines(payload: dict[str, Any]) -> list[str]:
+    lines = [
+        f"operator booking: {payload.get('client_id') or '-'}",
+        f"booking url: {payload.get('booking_url') or '-'}",
+        f"timezone: {payload.get('timezone') or '-'}",
+        f"available slots: {payload.get('available', 0)}",
+    ]
+    for slot in payload.get("slots") or []:
+        price = slot.get("price")
+        price_text = f"${price}" if price is not None else "-"
+        lines.append(f"  - {slot.get('date')} {slot.get('slot')} {price_text}")
+    return lines
+
+
+def _operator_booking_book_lines(payload: dict[str, Any]) -> list[str]:
+    if payload.get("dry_run"):
+        lines = ["operator booking dry run", f"book hold: {payload.get('booking_url')}"]
+        if payload.get("magic_link_url"):
+            lines.append(f"magic link: {payload.get('magic_link_url')}")
+        return lines
+
+    booking = payload.get("booking") or {}
+    magic_link = payload.get("magic_link")
+    lines = [
+        f"booking id: {booking.get('bookingId') or '-'}",
+        f"resource: {booking.get('resourceKey') or '-'}",
+        f"action: {booking.get('actionKey') or '-'}",
+        f"price: {booking.get('priceDisplay') or booking.get('price') or '-'}",
+    ]
+    if magic_link:
+        lines.append(f"magic link sent: {magic_link.get('email') or '-'}")
+    lines.extend(f"next: {next_action}" for next_action in payload.get("next_actions") or [])
+    return lines
+
+
+def _operator_booking_text_lines(payload: dict[str, Any]) -> list[str]:
+    action = payload.get("action")
+    if action == "config":
+        return _operator_booking_config_lines(payload)
+    if action == "availability":
+        return _operator_booking_availability_lines(payload)
+    if action == "book":
+        return _operator_booking_book_lines(payload)
+    return [str(payload)]
+
+
 def _print_operator_booking_text(payload: dict[str, Any]) -> None:
-    if payload.get("action") == "config":
-        config = payload.get("operator_booking") or {}
-        print(f"operator booking: {config.get('client_id') or '-'}")
-        print(f"availability: {config.get('availability_url') or '-'}")
-        print(f"book hold: {config.get('booking_hold_url') or '-'}")
-        print(f"magic link: {config.get('magic_link_url') or '-'}")
-        print(f"publishable key: {config.get('api_key_env') or '-'} configured={config.get('api_key_configured')}")
-        print(f"access token: {config.get('access_token_env') or '-'} configured={config.get('access_token_configured')}")
-        return
-
-    if payload.get("action") == "availability":
-        print(f"operator booking: {payload.get('client_id') or '-'}")
-        print(f"booking url: {payload.get('booking_url') or '-'}")
-        print(f"timezone: {payload.get('timezone') or '-'}")
-        print(f"available slots: {payload.get('available', 0)}")
-        for slot in payload.get("slots") or []:
-            price = slot.get("price")
-            price_text = f"${price}" if price is not None else "-"
-            print(f"  - {slot.get('date')} {slot.get('slot')} {price_text}")
-        return
-
-    if payload.get("action") == "book":
-        if payload.get("dry_run"):
-            print("operator booking dry run")
-            print(f"book hold: {payload.get('booking_url')}")
-            if payload.get("magic_link_url"):
-                print(f"magic link: {payload.get('magic_link_url')}")
-            return
-        booking = payload.get("booking") or {}
-        magic_link = payload.get("magic_link")
-        print(f"booking id: {booking.get('bookingId') or '-'}")
-        print(f"resource: {booking.get('resourceKey') or '-'}")
-        print(f"action: {booking.get('actionKey') or '-'}")
-        print(f"price: {booking.get('priceDisplay') or booking.get('price') or '-'}")
-        if magic_link:
-            print(f"magic link sent: {magic_link.get('email') or '-'}")
-        for next_action in payload.get("next_actions") or []:
-            print(f"next: {next_action}")
-        return
-
-    print(payload)
+    print("\n".join(_operator_booking_text_lines(payload)))
 
 
 def _handle_operator_booking(
@@ -1603,6 +1776,10 @@ _EARLY_DISPATCH: dict[str, Callable[[argparse.Namespace, Path], int]] = {
     "session-end": _handle_session_end,
     "session-resume": _handle_session_resume,
     "session-status": _handle_session_status,
+    "worker-submit": _handle_worker_submit,
+    "worker-status": _handle_worker_status,
+    "worker-artifacts": _handle_worker_artifacts,
+    "worker-promote-learning": _handle_worker_promote_learning,
     "mmdx": _handle_mmdx,
 }
 
@@ -1739,13 +1916,17 @@ def _handle_skill(args: argparse.Namespace, root_dir: Path, model: dict[str, Any
     return EXIT_OK
 
 
-def _handle_overlay(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+def _overlay_action_and_name(args: argparse.Namespace) -> tuple[str, str]:
     action = str(getattr(args, "action", "list"))
     name = str(getattr(args, "name", "") or "").strip()
     if action != "list" and not name:
         raise RuntimeError(
             f"overlay {action}: pass an overlay name, e.g. `overlay {action} marketing`."
         )
+    return action, name
+
+
+def _apply_persistent_overlay_action(action: str, name: str) -> tuple[bool, list[str], bool]:
     was_on = name in active_overlays()
     if action == "on":
         set_overlay(name, True)
@@ -1754,73 +1935,137 @@ def _handle_overlay(args: argparse.Namespace, root_dir: Path, model: dict[str, A
     elif action == "toggle":
         toggle_overlay(name)
     current = sorted(active_overlays())
-    now_on = name in current
-    removed: list[str] = []
-    activations: list[dict[str, Any]] = []
-    overlay_cwd = Path(
-        getattr(args, "cwd", None) or os.environ.get("PWD") or os.getcwd()
+    return was_on, current, name in current
+
+
+def _overlay_cwd(args: argparse.Namespace) -> Path:
+    return Path(getattr(args, "cwd", None) or os.environ.get("PWD") or os.getcwd())
+
+
+def _overlay_activations(
+    args: argparse.Namespace,
+    model: dict[str, Any],
+    action: str,
+    name: str,
+    overlay_cwd: Path,
+) -> list[dict[str, Any]]:
+    if not name or action != "activate":
+        return []
+    return activate_overlay_scoped_skills(
+        model,
+        name,
+        overlay_cwd,
+        to=str(getattr(args, "to", "project")),
+        categories=getattr(args, "category", []) or [],
+        source=getattr(args, "source", None),
+        dry_run=bool(getattr(args, "dry_run", False)),
+        force=bool(getattr(args, "force", False)),
     )
-    if name and action == "activate":
-        activations = activate_overlay_scoped_skills(
-            model,
-            name,
-            overlay_cwd,
-            to=str(getattr(args, "to", "project")),
-            categories=getattr(args, "category", []) or [],
-            source=getattr(args, "source", None),
-            dry_run=bool(getattr(args, "dry_run", False)),
-            force=bool(getattr(args, "force", False)),
-        )
-    if (
+
+
+def _overlay_removed_links(
+    args: argparse.Namespace,
+    model: dict[str, Any],
+    action: str,
+    name: str,
+    was_on: bool,
+    now_on: bool,
+    overlay_cwd: Path,
+) -> list[str]:
+    should_unlink = (
         name
         and (action == "off" or (action == "toggle" and was_on and not now_on))
         and not now_on
         and not bool(getattr(args, "keep", False))
-    ):
-        removed = unlink_overlay_scoped_skills(
-            model,
-            name,
-            overlay_cwd,
-            scope=str(getattr(args, "scope", "project")),
-        )
+    )
+    if not should_unlink:
+        return []
+    return unlink_overlay_scoped_skills(
+        model,
+        name,
+        overlay_cwd,
+        scope=str(getattr(args, "scope", "project")),
+    )
+
+
+def _overlay_payload(
+    args: argparse.Namespace,
+    *,
+    action: str,
+    name: str,
+    current: list[str],
+    overlay_cwd: Path,
+    removed: list[str],
+    activations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "overlays": current,
+        "action": action,
+        "name": name,
+        "cwd": str(overlay_cwd),
+        "to": getattr(args, "to", "project"),
+        "scope": getattr(args, "scope", "project"),
+        "dry_run": bool(getattr(args, "dry_run", False)),
+        "persistent": action in {"on", "off", "toggle"},
+        "unlinked": removed,
+        "activations": activations,
+    }
+
+
+def _print_activation_packet_text(activation: dict[str, Any]) -> None:
+    packet = activation.get("activation_packet")
+    if not packet:
+        print(f"activation packet: {activation.get('skill')} unavailable")
+        return
+    print(f"activation packet: {packet.get('name')}")
+    print(f"source: {packet.get('source')}")
+    print(f"skill_md_sha256: {packet.get('skill_md_sha256')}")
+    print("skill_md:")
+    print(str(packet.get("skill_md") or "").rstrip())
+
+
+def _print_overlay_text(payload: dict[str, Any]) -> None:
+    action = str(payload.get("action") or "list")
+    current = list(payload.get("overlays") or [])
+    if action == "list":
+        print(f"overlays on: {', '.join(current)}" if current else "overlays: (none)")
+        return
+
+    name = str(payload.get("name") or "")
+    now_on = name in current
+    state = "activated" if action == "activate" else ("on" if now_on else "off")
+    print(f"overlay {name}: {state}")
+    if current:
+        print("all on:", ", ".join(current))
+    removed = payload.get("unlinked") or []
+    activations = payload.get("activations") or []
+    if removed:
+        print(f"unlinked: {len(removed)} symlinks")
+    if activations:
+        print(f"activated: {len(activations)} skills")
+        for activation in activations:
+            _print_activation_packet_text(activation)
+
+
+def _handle_overlay(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    action, name = _overlay_action_and_name(args)
+    was_on, current, now_on = _apply_persistent_overlay_action(action, name)
+    overlay_cwd = _overlay_cwd(args)
+    activations = _overlay_activations(args, model, action, name, overlay_cwd)
+    removed = _overlay_removed_links(args, model, action, name, was_on, now_on, overlay_cwd)
+    payload = _overlay_payload(
+        args,
+        action=action,
+        name=name,
+        current=current,
+        overlay_cwd=overlay_cwd,
+        removed=removed,
+        activations=activations,
+    )
     if args.format == "json":
-        emit_json({
-            "overlays": current,
-            "action": action,
-            "name": name,
-            "cwd": str(overlay_cwd),
-            "to": getattr(args, "to", "project"),
-            "scope": getattr(args, "scope", "project"),
-            "dry_run": bool(getattr(args, "dry_run", False)),
-            "persistent": action in {"on", "off", "toggle"},
-            "unlinked": removed,
-            "activations": activations,
-        })
+        emit_json(payload)
     else:
-        if action == "list":
-            if current:
-                print("overlays on:", ", ".join(current))
-            else:
-                print("overlays: (none)")
-        else:
-            state = "activated" if action == "activate" else ("on" if now_on else "off")
-            print(f"overlay {name}: {state}")
-            if current:
-                print("all on:", ", ".join(current))
-            if removed:
-                print(f"unlinked: {len(removed)} symlinks")
-            if activations:
-                print(f"activated: {len(activations)} skills")
-                for activation in activations:
-                    packet = activation.get("activation_packet")
-                    if not packet:
-                        print(f"activation packet: {activation.get('skill')} unavailable")
-                        continue
-                    print(f"activation packet: {packet.get('name')}")
-                    print(f"source: {packet.get('source')}")
-                    print(f"skill_md_sha256: {packet.get('skill_md_sha256')}")
-                    print("skill_md:")
-                    print(str(packet.get("skill_md") or "").rstrip())
+        _print_overlay_text(payload)
     return EXIT_OK
 
 
@@ -1881,53 +2126,63 @@ def _check_logs_deferred_surfaces(args: argparse.Namespace, model: dict[str, Any
     return EXIT_ERROR
 
 
-def _handle_up(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
-    # WG-006: route local-runtime profiles through workflows.run_up so the
-    # parity ledger, bridge reconciliation, mode validation, bootstrap tasks,
-    # and service start all run through a single contract-aware path.
-    # Non-local profiles keep the legacy inline flow to preserve existing
-    # lifecycle test coverage.
-    active_local_profile = local_runtime_active_profile(model)
-    if active_local_profile:
-        client_id_for_up = args.client[0] if args.client else "personal"
-        service_filter = [s for s in (getattr(args, "service", []) or []) if s]
-        up_exit, up_payload = run_up(
-            model=model,
-            client_id=client_id_for_up,
-            profile=active_local_profile,
-            requested_mode=resolved_mode,
-            service_filter=service_filter,
-            dry_run=args.dry_run,
-            wait_seconds=max(0.0, float(args.wait_seconds)),
-        )
-        if args.format == "json":
-            emit_json(up_payload)
-        else:
-            if up_exit != EXIT_OK and "error" in up_payload:
-                print_local_runtime_error_text(up_payload)
-            else:
-                print_service_actions_text(up_payload)
-        return up_exit
+def _emit_up_payload(args: argparse.Namespace, payload: dict[str, Any], exit_code: int) -> int:
+    if args.format == "json":
+        emit_json(payload)
+    elif exit_code != EXIT_OK and "error" in payload:
+        print_local_runtime_error_text(payload)
+    else:
+        print_service_actions_text(payload)
+    return exit_code
 
-    raw_service_ids = [s for s in (getattr(args, "service", []) or []) if s]
-    requested_services = select_services(model, raw_service_ids)
+
+def _handle_local_profile_up(
+    args: argparse.Namespace,
+    model: dict[str, Any],
+    resolved_mode: str,
+    active_local_profile: str,
+) -> int:
+    client_id_for_up = args.client[0] if args.client else "personal"
+    service_filter = [s for s in (getattr(args, "service", []) or []) if s]
+    up_exit, up_payload = run_up(
+        model=model,
+        client_id=client_id_for_up,
+        profile=active_local_profile,
+        requested_mode=resolved_mode,
+        service_filter=service_filter,
+        dry_run=args.dry_run,
+        wait_seconds=max(0.0, float(args.wait_seconds)),
+    )
+    return _emit_up_payload(args, up_payload, up_exit)
+
+
+def _bridge_missing_payload(args: argparse.Namespace, bridge: dict[str, Any]) -> dict[str, Any]:
+    profile_hint = f" --profile {' --profile '.join(args.profile)}" if args.profile else " --profile local-minimal"
+    return local_runtime_error(
+        "LOCAL_RUNTIME_ENV_BRIDGE_FAILED",
+        f"Bridge {bridge['id']} outputs missing. Run 'manage.py focus' first.",
+        recoverable=True,
+        next_action=f"manage.py focus {args.client[0] if args.client else 'personal'}{profile_hint}",
+    )
+
+
+def _emit_missing_bridge_if_needed(args: argparse.Namespace, model: dict[str, Any]) -> int | None:
     bridges = model.get("bridges") or []
-    if bridges and not args.dry_run:
-        for bridge in bridges:
-            state = bridge_outputs_state(bridge)
-            if state["state"] == "missing":
-                err = local_runtime_error(
-                    "LOCAL_RUNTIME_ENV_BRIDGE_FAILED",
-                    f"Bridge {bridge['id']} outputs missing. Run 'manage.py focus' first.",
-                    recoverable=True,
-                    next_action=f"manage.py focus {args.client[0] if args.client else 'personal'} --profile {' --profile '.join(args.profile) if args.profile else 'local-minimal'}",
-                )
-                if args.format == "json":
-                    emit_json(err)
-                else:
-                    print_local_runtime_error_text(err)
-                return EXIT_ERROR
+    if not bridges or args.dry_run:
+        return None
+    for bridge in bridges:
+        if bridge_outputs_state(bridge)["state"] != "missing":
+            continue
+        return _emit_up_payload(args, _bridge_missing_payload(args, bridge), EXIT_ERROR)
+    return None
 
+
+def _legacy_up_payload(
+    args: argparse.Namespace,
+    model: dict[str, Any],
+    requested_services: list[dict[str, Any]],
+    resolved_mode: str,
+) -> dict[str, Any]:
     sync_actions = sync_runtime(model, dry_run=args.dry_run)
     services = resolve_services_for_start(model, requested_services)
     bootstrap_tasks = resolve_tasks_for_services(model, services)
@@ -1935,12 +2190,7 @@ def _handle_up(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], 
         ensure_required_env_files_ready(
             select_env_files_for_tasks(model, bootstrap_tasks) + select_env_files_for_services(model, services)
         )
-    task_results = run_tasks(
-        model,
-        bootstrap_tasks,
-        dry_run=args.dry_run,
-        mode=resolved_mode,
-    )
+    task_results = run_tasks(model, bootstrap_tasks, dry_run=args.dry_run, mode=resolved_mode)
     service_results = start_services(
         model,
         services,
@@ -1948,7 +2198,7 @@ def _handle_up(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], 
         wait_seconds=max(0.0, float(args.wait_seconds)),
         mode=resolved_mode,
     )
-    payload = {
+    return {
         "dry_run": args.dry_run,
         "requested_mode": resolved_mode,
         "effective_mode": resolved_mode,
@@ -1957,11 +2207,25 @@ def _handle_up(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], 
         "services": service_results,
         "next_actions": next_actions_for_up(service_results),
     }
-    if args.format == "json":
-        emit_json(payload)
-    else:
-        print_service_actions_text(payload)
-    return EXIT_OK
+
+
+def _handle_up(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    # Local-runtime profiles use workflows.run_up; legacy profiles keep the
+    # inline path for compatibility with existing lifecycle behavior.
+    active_local_profile = local_runtime_active_profile(model)
+    if active_local_profile:
+        return _handle_local_profile_up(args, model, resolved_mode, active_local_profile)
+
+    raw_service_ids = [s for s in (getattr(args, "service", []) or []) if s]
+    requested_services = select_services(model, raw_service_ids)
+    deferred_exit = _emit_missing_bridge_if_needed(args, model)
+    if deferred_exit is not None:
+        return deferred_exit
+    return _emit_up_payload(
+        args,
+        _legacy_up_payload(args, model, requested_services, resolved_mode),
+        EXIT_OK,
+    )
 
 
 def _handle_down(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:

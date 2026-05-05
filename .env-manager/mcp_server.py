@@ -944,6 +944,86 @@ TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "name": "skillbox_worker_submit",
+        "description": (
+            "Submit an open-ended task to the skillbox worker broker. Returns a broker-managed "
+            "run id, selected runtime, and initial state without coupling the caller to a harness."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["task_class", "instruction"],
+            "properties": {
+                "task_class": {
+                    "type": "string",
+                    "enum": [
+                        "analysis",
+                        "interpretation",
+                        "recommendation",
+                        "drafting",
+                        "research",
+                        "ops_execution",
+                    ],
+                },
+                "instruction": {"type": "string"},
+                "client": {"type": "string", "description": "Overlay id for context resolution."},
+                "cwd": {"type": "string", "description": "Working directory hint for context resolution."},
+                "repo_hint": {"type": "string", "description": "Optional repo id or path hint."},
+                "runtime": {"type": "string", "default": "hermes"},
+                "write_scope": {
+                    "type": "string",
+                    "enum": ["read_only", "propose_only", "repo_patch"],
+                    "default": "propose_only",
+                },
+                "memory_scope": {
+                    "type": "string",
+                    "enum": ["none", "repo", "client"],
+                    "default": "repo",
+                },
+                "artifact_policy": {"type": "string", "default": "summary_and_files"},
+                "harness_session_ref": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "skillbox_worker_status",
+        "description": "Read broker-level state for a worker run without exposing runtime-internal payloads.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["run_id"],
+            "properties": {"run_id": {"type": "string"}},
+        },
+    },
+    {
+        "name": "skillbox_worker_artifacts",
+        "description": (
+            "Return artifacts and learning proposals for a terminal worker run. "
+            "Non-terminal runs return WORKER_RESULT_NOT_READY."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["run_id"],
+            "properties": {"run_id": {"type": "string"}},
+        },
+    },
+    {
+        "name": "skillbox_worker_promote_learning",
+        "description": (
+            "Promote a reviewed learning proposal. Pending proposals are rejected with "
+            "WORKER_LEARNING_REVIEW_REQUIRED; no skill or memory writeback happens without this explicit call."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["proposal_id", "target_kind", "target_location"],
+            "properties": {
+                "proposal_id": {"type": "string"},
+                "approved_by": {"type": "string"},
+                "target_kind": {"type": "string"},
+                "target_location": {"type": "string"},
+                "promotion_mode": {"type": "string", "default": "promote"},
+            },
+        },
+    },
     # --- Pulse (reconciliation daemon) ---
     {
         "name": "skillbox_pulse",
@@ -1178,6 +1258,16 @@ _STRING_ARG_SPECS: tuple[tuple[str, str], ...] = (
     ("redirect_url", "--redirect-url"),
     ("origin", "--origin"),
     ("access_token_env", "--access-token-env"),
+    ("repo_hint", "--repo-hint"),
+    ("runtime", "--runtime"),
+    ("write_scope", "--write-scope"),
+    ("memory_scope", "--memory-scope"),
+    ("artifact_policy", "--artifact-policy"),
+    ("harness_session_ref", "--harness-session-ref"),
+    ("approved_by", "--approved-by"),
+    ("target_kind", "--target-kind"),
+    ("target_location", "--target-location"),
+    ("promotion_mode", "--promotion-mode"),
 )
 _BOOL_ARG_SPECS: tuple[tuple[str, str], ...] = (
     ("dry_run", "--dry-run"),
@@ -1200,7 +1290,9 @@ _BOOL_ARG_SPECS: tuple[tuple[str, str], ...] = (
 
 def _append_repeat_args(args: list[str], params: dict) -> None:
     for key, flag in _REPEAT_ARG_SPECS:
-        for value in params.get(key) or []:
+        raw_values = params.get(key) or []
+        values = [raw_values] if isinstance(raw_values, str) else raw_values
+        for value in values:
             args += [flag, str(value)]
 
 
@@ -1233,6 +1325,17 @@ def _append_bool_args(args: list[str], command: str, params: dict) -> None:
 
 
 def _append_command_positionals(args: list[str], command: str, params: dict) -> None:
+    if command == "worker-submit":
+        for key in ("task_class", "instruction"):
+            if params.get(key):
+                args.append(str(params[key]))
+        return
+    if command in {"worker-status", "worker-artifacts"} and params.get("run_id"):
+        args.append(str(params["run_id"]))
+        return
+    if command == "worker-promote-learning" and params.get("proposal_id"):
+        args.append(str(params["proposal_id"]))
+        return
     if command == "mmdx" and params.get("query"):
         args.append(str(params["query"]))
     if params.get("skill"):
@@ -1284,6 +1387,10 @@ _DISPATCH: dict[str, tuple[str, str | None]] = {
     "skillbox_session_end":   ("session-end", "client_id"),
     "skillbox_session_resume": ("session-resume", "client_id"),
     "skillbox_session_status": ("session-status", "client_id"),
+    "skillbox_worker_submit": ("worker-submit", None),
+    "skillbox_worker_status": ("worker-status", None),
+    "skillbox_worker_artifacts": ("worker-artifacts", None),
+    "skillbox_worker_promote_learning": ("worker-promote-learning", None),
     "skillbox_acceptance":  ("acceptance",  "client_id"),
     "skillbox_client_init": ("client-init", "client_id"),
     "skillbox_client_diff": ("client-diff", "client_id"),

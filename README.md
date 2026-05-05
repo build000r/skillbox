@@ -47,6 +47,7 @@ right client context without standing up a full hosted workspace control plane.
 - start and stop declared service graphs in dependency order with one command
 - focus on a client workspace with live state collection, enriched agent context, and continuous drift monitoring
 - record runtime activity in `runtime.log` and durable client-scoped session timelines
+- broker open-ended worker runs through stable CLI/MCP submit, status, artifact, and learning-promotion surfaces
 - provision and tear down remote boxes from the operator machine via MCP tools
 - declare skill repos and sync skills from GitHub repos or local paths
 - validate outer drift with `make doctor` and inner drift with `make dev-sanity`
@@ -345,6 +346,39 @@ For durable, work-specific notes, use the `skillbox_session_*` MCP tools for
 client-scoped session timelines and `cm` for procedural memory. `focus`
 surfaces recent runtime activity directly from `runtime.log`; there is no
 separate journal ack queue.
+
+## Worker Runtime Broker
+
+Skillbox can accept open-ended worker tasks without becoming the chat harness.
+The broker records the task, selected runtime, state, artifacts, and learning
+proposals under the state root, while callers interact through a stable contract:
+
+```bash
+python3 .env-manager/manage.py worker-submit analysis "Inspect this repo" --client skills --cwd "$PWD" --format json
+python3 .env-manager/manage.py worker-status wr_YYYYMMDD_HHMMSS_abcdef --format json
+python3 .env-manager/manage.py worker-artifacts wr_YYYYMMDD_HHMMSS_abcdef --format json
+python3 .env-manager/manage.py worker-promote-learning lp_001 --target-kind skill --target-location opensource/skills/report-analyst --format json
+```
+
+The first runtime id is `hermes`, kept behind the broker contract. A resolved
+run writes `task.json`, then launches the first configured command from
+`SKILLBOX_WORKER_HERMES_COMMAND`, `SKILLBOX_HERMES_COMMAND`,
+`SKILLBOX_WORKER_HERMES_BIN`, `SKILLBOX_HERMES_BIN`, or `hermes` on `PATH`.
+The command receives `SKILLBOX_ROOT_DIR`, `SKILLBOX_WORKER_RUN_ID`,
+`SKILLBOX_WORKER_TASK_PATH`, and `SKILLBOX_WORKER_RESULT_PATH`; it should write a
+JSON result with `state`, `summary`, optional `artifacts`, and optional
+`learning_proposals`. If no Hermes command is installed or the command exits
+non-zero, the run ends as `failed` with `WORKER_LAUNCH_FAILED`.
+
+Pending learning proposals are never written back automatically; they must be
+promoted explicitly after review.
+
+Use a real active client id from the resolved runtime graph. In this checkout,
+`make dev-sanity CLIENT=skills` is valid, and `CLIENT=skillbox` is valid when
+the attached `SKILLBOX_CLIENTS_HOST_ROOT` contains the Skillbox overlay. The
+broker can record submit/status/artifact/promotion state today and has an
+explicit launch boundary; successful execution still depends on an installed
+Hermes command for the active environment.
 
 ## Swimmers Overlay
 
@@ -1621,6 +1655,8 @@ agents tools to manage their own environment:
 | `skillbox_pulse` | Query pulse daemon status |
 | `skillbox_session_start` / `skillbox_session_event` / `skillbox_session_end` | Manage durable client-scoped session timelines |
 | `skillbox_session_resume` / `skillbox_session_status` | Resume or inspect durable session state |
+| `skillbox_worker_submit` / `skillbox_worker_status` | Submit open-ended worker tasks and poll broker state |
+| `skillbox_worker_artifacts` / `skillbox_worker_promote_learning` | Read terminal run artifacts and explicitly promote reviewed learning proposals |
 
 Opened client surfaces always include the `skillbox` MCP. Core surfaces also
 include `cm` for procedural memory, and connector-capable surfaces add `fwc`
