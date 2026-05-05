@@ -30,8 +30,15 @@ explicitly promote reviewed learning proposals without coupling skillbox to a
 particular chat harness. The launch boundary is explicit now: resolved runs
 write `task.json`, invoke a configured Hermes command, and return
 `WORKER_LAUNCH_FAILED` when no runtime is installed or launch exits non-zero.
-Successful execution still requires a Hermes adapter or binary to be installed
-and registered for the active environment.
+The repo now includes `scripts/hermes_codex_adapter.py` as one concrete
+adapter: operators can set `SKILLBOX_WORKER_HERMES_COMMAND` to that script and
+run Codex-backed workers through the same broker contract. Production use still
+requires the operator to install/authenticate the selected runtime and pin the
+command in the active environment.
+The current local quality bar is explicit: `make python-cov-xml` passes with
+859 tests and 85.02% exact line coverage; full `.env-manager` CRAP is 19.94;
+the Codex adapter CRAP is 9.00; and a real Codex-backed broker run succeeded as
+`wr_20260505_073758_d41cda`.
 The hosted distributor service, standalone laptop UX, short-lived token
 exchange, and background update checks remain later distribution work.
 

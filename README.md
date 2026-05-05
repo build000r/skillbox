@@ -370,6 +370,18 @@ JSON result with `state`, `summary`, optional `artifacts`, and optional
 `learning_proposals`. If no Hermes command is installed or the command exits
 non-zero, the run ends as `failed` with `WORKER_LAUNCH_FAILED`.
 
+This repo ships a Codex-backed adapter for environments where the operator has
+the Codex CLI installed:
+
+```bash
+export SKILLBOX_WORKER_HERMES_COMMAND="python3 scripts/hermes_codex_adapter.py"
+python3 .env-manager/manage.py worker-submit analysis "Inspect this repo" --client skills --cwd "$PWD" --format json
+```
+
+The adapter runs `codex exec` read-only and writes the broker result file. Set
+`SKILLBOX_HERMES_CODEX_BIN` when `codex` is not on `PATH`, and
+`SKILLBOX_HERMES_CODEX_MODEL` to pin a model for dogfood or production runs.
+
 Pending learning proposals are never written back automatically; they must be
 promoted explicitly after review.
 
@@ -377,8 +389,15 @@ Use a real active client id from the resolved runtime graph. In this checkout,
 `make dev-sanity CLIENT=skills` is valid, and `CLIENT=skillbox` is valid when
 the attached `SKILLBOX_CLIENTS_HOST_ROOT` contains the Skillbox overlay. The
 broker can record submit/status/artifact/promotion state today and has an
-explicit launch boundary; successful execution still depends on an installed
+explicit launch boundary; successful execution still depends on a configured
 Hermes command for the active environment.
+
+Current local proof for this broker/runtime surface:
+
+- `make python-cov-xml` passes with 859 tests and 85.02% exact line coverage.
+- `python3 ../skills/crap/scripts/analyze_crap.py .env-manager --languages python --threshold 20 --top 100` passes with `FINAL_SCORE: 19.94`.
+- `python3 ../skills/crap/scripts/analyze_crap.py scripts/hermes_codex_adapter.py --languages python --threshold 20 --top 20` passes with `FINAL_SCORE: 9.00`.
+- A real Codex-backed broker run succeeded as `wr_20260505_073758_d41cda` using `SKILLBOX_WORKER_HERMES_COMMAND='python3 scripts/hermes_codex_adapter.py'`.
 
 ## Swimmers Overlay
 
