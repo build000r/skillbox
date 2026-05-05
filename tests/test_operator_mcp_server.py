@@ -43,6 +43,190 @@ class OperatorMcpServerTests(unittest.TestCase):
                 self.assertEqual(os.environ["FOO"], "existing")
                 self.assertEqual(os.environ["BAR"], "file")
 
+    def test_subprocess_inventory_dispatch_and_protocol_helpers_cover_core_branches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            env_path = root / ".env"
+            env_path.write_text("FOO=file\nBAR=file\nINVALID\n# comment\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"FOO": "existing"}, clear=True):
+                MODULE.load_dotenv(root / "missing.env")
+                MODULE.load_dotenv(env_path)
+                self.assertEqual(os.environ["FOO"], "existing")
+                self.assertEqual(os.environ["BAR"], "file")
+
+            with mock.patch.object(MODULE, "REPO_ROOT", root):
+                self.assertEqual(MODULE._compose_monoserver_layer(), ["-f", "docker-compose.monoserver.yml"])
+
+                focus_path = root / "workspace" / ".focus.json"
+                override_path = root / "workspace" / ".compose-overrides" / "docker-compose.client-acme.yml"
+                override_path.parent.mkdir(parents=True)
+                focus_path.parent.mkdir(parents=True, exist_ok=True)
+                focus_path.write_text('{"client_id": "acme"}', encoding="utf-8")
+                override_path.write_text("services: {}\n", encoding="utf-8")
+                self.assertEqual(
+                    MODULE._compose_monoserver_layer(),
+                    ["-f", "workspace/.compose-overrides/docker-compose.client-acme.yml"],
+                )
+
+                focus_path.write_text("{bad json", encoding="utf-8")
+                self.assertEqual(MODULE._compose_monoserver_layer(), ["-f", "docker-compose.monoserver.yml"])
+
+            compose_script = ROOT_DIR / "docker-compose.yml"
+            with mock.patch.object(MODULE.subprocess, "run", side_effect=FileNotFoundError):
+                ok, _code, payload = MODULE.run_compose(["ps"])
+            self.assertFalse(ok)
+            self.assertEqual(payload["error"]["type"], "docker_not_found")
+
+            with mock.patch.object(
+                MODULE.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(cmd=["docker"], timeout=1),
+            ):
+                ok, _code, payload = MODULE.run_compose(["ps"], timeout=1)
+            self.assertFalse(ok)
+            self.assertEqual(payload["error"]["type"], "timeout")
+
+            with mock.patch.object(
+                MODULE.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(["docker"], 0, stdout='[{"Name": "api"}]', stderr=""),
+            ) as run:
+                ok, _code, payload = MODULE.run_compose(["ps", "--format", "json"])
+            self.assertTrue(ok)
+            self.assertEqual(payload, [{"Name": "api"}])
+            self.assertIn("-f", run.call_args.args[0])
+            self.assertEqual(Path(run.call_args.kwargs["cwd"]), compose_script.parent)
+
+            with mock.patch.object(
+                MODULE.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(["docker"], 1, stdout="plain", stderr="err"),
+            ):
+                ok, code, payload = MODULE.run_compose(["down"])
+            self.assertFalse(ok)
+            self.assertEqual(code, 1)
+            self.assertEqual(payload["stdout"], "plain")
+            self.assertEqual(payload["stderr"], "err")
+
+            with mock.patch.object(MODULE.subprocess, "run", side_effect=FileNotFoundError):
+                ok, _code, payload = MODULE.run_ssh("u", "h", "pwd")
+            self.assertFalse(ok)
+            self.assertEqual(payload["error"]["type"], "ssh_not_found")
+
+            with mock.patch.object(
+                MODULE.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(cmd=["ssh"], timeout=1),
+            ):
+                ok, _code, payload = MODULE.run_ssh("u", "h", "pwd", timeout=1)
+            self.assertFalse(ok)
+            self.assertEqual(payload["error"]["type"], "timeout")
+
+            with mock.patch.object(
+                MODULE.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(["ssh"], 0, stdout='{"stdout": "ok"}', stderr=""),
+            ):
+                ok, _code, payload = MODULE.run_ssh("u", "h", "pwd")
+            self.assertTrue(ok)
+            self.assertEqual(payload, {"stdout": "ok"})
+
+            with mock.patch.object(
+                MODULE.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(["ssh"], 2, stdout="nope", stderr="denied"),
+            ):
+                ok, code, payload = MODULE.run_ssh("u", "h", "pwd")
+            self.assertFalse(ok)
+            self.assertEqual(code, 2)
+            self.assertEqual(payload["stderr"], "denied")
+
+            inventory_path = root / "boxes.json"
+            inventory_path.write_text(
+                json.dumps({"boxes": [{"id": "alpha"}, {"id": "beta"}]}),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"SKILLBOX_BOX_INVENTORY": str(inventory_path)}):
+                self.assertEqual([box["id"] for box in MODULE.load_inventory()], ["alpha", "beta"])
+                self.assertEqual(MODULE.find_box("beta"), {"id": "beta"})
+                self.assertIsNone(MODULE.find_box("gamma"))
+
+            missing_payload = _content_payload(MODULE.dispatch_tool("missing", {}))
+            self.assertEqual(missing_payload["error"]["type"], "unknown_tool")
+
+            with mock.patch.dict(MODULE._DISPATCH, {"known": lambda params: {"content": [params]}}):
+                self.assertEqual(MODULE.dispatch_tool("known", {"ok": True}), {"content": [{"ok": True}]})
+
+            with mock.patch.object(MODULE, "REPO_ROOT", root):
+                MODULE._stamp_dryrun_marker("operator_test", "alpha")
+                marker = root / ".skillbox-state" / "dryrun-markers" / ".skillbox-dryrun-operator_test-alpha"
+                self.assertIn("dry-run completed", marker.read_text(encoding="utf-8"))
+
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                MODULE.send({"jsonrpc": "2.0", "id": 7, "result": {}})
+                MODULE.send_error(8, -32000, "bad")
+            sent = [json.loads(line) for line in stdout.getvalue().splitlines()]
+            self.assertEqual(sent[0]["id"], 7)
+            self.assertEqual(sent[1]["error"]["message"], "bad")
+
+            init = MODULE.handle_initialize({})
+            self.assertEqual(init["protocolVersion"], MODULE.PROTOCOL_VERSION)
+            self.assertIn("operator_boxes", init["instructions"])
+            self.assertEqual(MODULE.handle_tools_list()["tools"], MODULE.TOOLS)
+
+            with mock.patch.object(MODULE, "dispatch_tool", return_value={"content": []}) as dispatch:
+                self.assertEqual(MODULE.handle_tools_call({"name": "operator_boxes"}), {"content": []})
+            dispatch.assert_called_once_with("operator_boxes", {})
+
+    def test_read_only_tool_handlers_and_event_journal_use_structured_outputs(self) -> None:
+        with mock.patch.object(
+            MODULE,
+            "run_script",
+            side_effect=[
+                (True, 0, {"profiles": []}),
+                (False, 1, {"error": {"type": "list_failed"}}),
+                (True, 0, {"status": "ready"}),
+                (False, 1, {"error": {"type": "doctor_failed"}}),
+                (True, 0, {"rendered": True}),
+            ],
+        ) as run_script:
+            profiles = _content_payload(MODULE.handle_operator_profiles({}))
+            boxes = _content_payload(MODULE.handle_operator_boxes({}))
+            status = _content_payload(MODULE.handle_operator_box_status({"box_id": "alpha"}))
+            doctor = _content_payload(MODULE.handle_operator_doctor({}))
+            render = _content_payload(MODULE.handle_operator_render({"with_compose": True}))
+
+        self.assertEqual(profiles, {"profiles": []})
+        self.assertEqual(boxes["error"]["type"], "list_failed")
+        self.assertEqual(status, {"status": "ready"})
+        self.assertEqual(doctor["error"]["type"], "doctor_failed")
+        self.assertEqual(render, {"rendered": True})
+        self.assertEqual(run_script.call_args_list[2].args[1], ["status", "alpha", "--format", "json"])
+        self.assertEqual(run_script.call_args_list[4].args[1], ["render", "--format", "json", "--with-compose"])
+
+        with mock.patch.object(
+            MODULE,
+            "run_compose",
+            return_value=(False, 9, {"stderr": "down failed"}),
+        ), mock.patch.object(MODULE, "emit_event") as emit_event:
+            down = MODULE.handle_operator_compose_down({})
+        payload = _content_payload(down)
+        self.assertTrue(down["isError"])
+        self.assertEqual(payload["exit_code"], 9)
+        emit_event.assert_called_once_with("operator.compose_down", "local", {"ok": False})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with mock.patch.object(MODULE, "REPO_ROOT", root):
+                MODULE.emit_event("operator.test", "local", {"ok": True})
+                journal = root / "logs" / "runtime" / "journal.jsonl"
+                entry = json.loads(journal.read_text(encoding="utf-8"))
+                self.assertEqual(entry["type"], "operator.test")
+                self.assertEqual(entry["detail"], {"ok": True})
+
+            with mock.patch.object(MODULE, "REPO_ROOT", root), mock.patch.object(Path, "open", side_effect=OSError):
+                MODULE.emit_event("operator.ignored", "local")
+
     def test_handle_operator_provision_validates_required_box_id_and_runs_script(self) -> None:
         error_payload = _content_payload(MODULE.handle_operator_provision({}))
         self.assertEqual(error_payload["error"]["type"], "missing_required_parameter")
@@ -248,12 +432,27 @@ class OperatorMcpServerTests(unittest.TestCase):
     def test_main_handles_parse_errors_unknown_methods_and_success(self) -> None:
         sent: list[dict] = []
         errors: list[tuple[object, int, str]] = []
+        handlers = dict(MODULE._HANDLERS)
+        handlers["boom"] = lambda _params: (_ for _ in ()).throw(RuntimeError("boom"))
         stdin = io.StringIO(
             "\n".join(
                 [
                     "not-json",
+                    json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                    "",
                     json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
                     json.dumps({"jsonrpc": "2.0", "id": 2, "method": "missing"}),
+                    json.dumps({"jsonrpc": "2.0", "id": 3, "method": "initialize"}),
+                    json.dumps({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}),
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 5,
+                            "method": "tools/call",
+                            "params": {"name": "operator_profiles", "arguments": {}},
+                        }
+                    ),
+                    json.dumps({"jsonrpc": "2.0", "id": 6, "method": "boom"}),
                 ]
             )
             + "\n"
@@ -266,13 +465,21 @@ class OperatorMcpServerTests(unittest.TestCase):
                 MODULE,
                 "send_error",
                 side_effect=lambda msg_id, code, message: errors.append((msg_id, code, message)),
+            ), mock.patch.object(MODULE, "_HANDLERS", handlers), mock.patch.object(
+                MODULE,
+                "dispatch_tool",
+                return_value={"content": [{"type": "text", "text": "{}"}]},
             ):
             MODULE.main()
 
         self.assertEqual(errors[0][1], -32700)
         self.assertEqual(errors[1][1], -32601)
-        self.assertEqual(sent[-1]["id"], 1)
-        self.assertEqual(sent[-1]["result"], {})
+        self.assertEqual(errors[2], (6, -32603, "Internal error in boom"))
+        self.assertEqual([msg["id"] for msg in sent], [1, 3, 4, 5])
+        self.assertEqual(sent[0]["result"], {})
+        self.assertEqual(sent[1]["result"]["protocolVersion"], MODULE.PROTOCOL_VERSION)
+        self.assertEqual(sent[2]["result"]["tools"], MODULE.TOOLS)
+        self.assertEqual(sent[3]["result"]["content"][0]["text"], "{}")
 
 
 if __name__ == "__main__":

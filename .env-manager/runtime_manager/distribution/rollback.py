@@ -61,6 +61,51 @@ def rollback_distributor_skill(
     emergency_override: bool = False,
 ) -> dict[str, Any]:
     """Install a previously cached signed bundle version and update the lockfile."""
+    manifest = _verified_rollback_manifest(manifest_path, public_key_config, distributor_id)
+    skill = _rollback_skill_entry(manifest, skill_name, target_version, emergency_override)
+    artifact = _rollback_artifact_entry(skill, skill_name, target_version)
+    cached_bundle = _cached_rollback_bundle(state_root, skill_name, target_version, artifact.sha256)
+    install_tree_sha, bundle_tree_sha = _install_cached_rollback_bundle(
+        cached_bundle, skill_name, install_targets,
+    )
+    from_version = _current_lock_version(
+        lockfile_path=lockfile_path,
+        distributor_id=distributor_id,
+        skill_name=skill_name,
+    )
+    _write_rollback_lockfile(
+        lockfile_path=lockfile_path,
+        distributor_id=distributor_id,
+        skill_name=skill_name,
+        target_version=target_version,
+        artifact=artifact,
+        bundle_tree_sha=bundle_tree_sha,
+        install_tree_sha=install_tree_sha,
+        reason=reason,
+        emergency_override=emergency_override,
+        manifest_version=manifest.manifest_version,
+        changelog=artifact.changelog or skill.changelog,
+    )
+    return {
+        "ok": True,
+        "skill": skill_name,
+        "from_version": from_version,
+        "to_version": target_version,
+        "source": "bundle-cache",
+        "bundle_sha256": artifact.sha256,
+        "lockfile_updated": True,
+        "pinned_by": "rollback",
+        "reason": reason,
+        "emergency_override": emergency_override,
+        "cached_versions": cached_versions(state_root=state_root, skill_name=skill_name),
+    }
+
+
+def _verified_rollback_manifest(
+    manifest_path: Path,
+    public_key_config: str,
+    distributor_id: str,
+) -> Any:
     manifest = parse_manifest(Path(manifest_path).read_bytes())
     try:
         verify_manifest(manifest, load_public_key(public_key_config))
@@ -68,7 +113,15 @@ def rollback_distributor_skill(
         raise DistributionRollbackError(f"manifest signature verification failed: {exc}") from exc
     if manifest.distributor_id != distributor_id:
         raise DistributionRollbackError("manifest distributor_id does not match")
+    return manifest
 
+
+def _rollback_skill_entry(
+    manifest: Any,
+    skill_name: str,
+    target_version: int,
+    emergency_override: bool,
+) -> Any:
     skill = next((item for item in manifest.skills if item.name == skill_name), None)
     if skill is None:
         raise DistributionRollbackError(f"skill {skill_name!r} not found in manifest")
@@ -77,25 +130,43 @@ def rollback_distributor_skill(
             f"{DISTRIBUTION_FLOOR_VIOLATION}: {skill_name} v{target_version} is "
             f"below manifest floor v{skill.min_version}"
         )
+    return skill
+
+
+def _rollback_artifact_entry(skill: Any, skill_name: str, target_version: int) -> Any:
     artifact = artifact_for_version(skill, target_version)
     if artifact is None:
         raise DistributionRollbackError(
             f"DISTRIBUTION_ARTIFACT_NOT_AVAILABLE: {skill_name} v{target_version}"
         )
+    return artifact
 
+
+def _cached_rollback_bundle(
+    state_root: Path,
+    skill_name: str,
+    target_version: int,
+    expected_sha256: str,
+) -> Path:
     cached_bundle = Path(state_root) / "bundle-cache" / skill_name / (
         f"{skill_name}-v{target_version}.skillbundle.tar.gz"
     )
     if not cached_bundle.is_file():
         raise DistributionRollbackError(f"{DISTRIBUTION_CACHE_MISSING}: {cached_bundle}")
     actual_sha = _file_sha256(cached_bundle)
-    if actual_sha != artifact.sha256:
+    if actual_sha != expected_sha256:
         raise DistributionRollbackError(
-            f"{DISTRIBUTION_CACHE_MISMATCH}: expected {artifact.sha256}, got {actual_sha}"
+            f"{DISTRIBUTION_CACHE_MISMATCH}: expected {expected_sha256}, got {actual_sha}"
         )
+    return cached_bundle
 
+
+def _install_cached_rollback_bundle(
+    cached_bundle: Path,
+    skill_name: str,
+    install_targets: list[dict[str, Any]],
+) -> tuple[str | None, str]:
     install_tree_sha: str | None = None
-    bundle_tree_sha: str
     with tempfile.TemporaryDirectory(prefix=f"skillbox-rollback-{skill_name}-") as tmp_str:
         tmp = Path(tmp_str)
         bundle_manifest = unpack_skill_bundle(cached_bundle, tmp)
@@ -110,12 +181,23 @@ def rollback_distributor_skill(
             tree_sha = _install_skill_content(tmp, install_dir)
             if install_tree_sha is None:
                 install_tree_sha = tree_sha
+    return install_tree_sha, bundle_tree_sha
 
-    from_version = _current_lock_version(
-        lockfile_path=lockfile_path,
-        distributor_id=distributor_id,
-        skill_name=skill_name,
-    )
+
+def _write_rollback_lockfile(
+    *,
+    lockfile_path: Path,
+    distributor_id: str,
+    skill_name: str,
+    target_version: int,
+    artifact: Any,
+    bundle_tree_sha: str,
+    install_tree_sha: str | None,
+    reason: str | None,
+    emergency_override: bool,
+    manifest_version: int,
+    changelog: str | None,
+) -> None:
     lock_payload = _updated_lockfile_payload(
         lockfile_path=lockfile_path,
         distributor_id=distributor_id,
@@ -132,9 +214,9 @@ def rollback_distributor_skill(
             pin_reason=reason,
             extras=_rollback_extras(
                 emergency_override=emergency_override,
-                manifest_version=manifest.manifest_version,
+                manifest_version=manifest_version,
                 download_url=artifact.download_url,
-                changelog=artifact.changelog or skill.changelog,
+                changelog=changelog,
             ),
         ),
     )
@@ -143,20 +225,6 @@ def rollback_distributor_skill(
         lockfile_path,
         json.dumps(lock_payload, indent=2, sort_keys=True) + "\n",
     )
-
-    return {
-        "ok": True,
-        "skill": skill_name,
-        "from_version": from_version,
-        "to_version": target_version,
-        "source": "bundle-cache",
-        "bundle_sha256": artifact.sha256,
-        "lockfile_updated": True,
-        "pinned_by": "rollback",
-        "reason": reason,
-        "emergency_override": emergency_override,
-        "cached_versions": cached_versions(state_root=state_root, skill_name=skill_name),
-    }
 
 
 def _updated_lockfile_payload(

@@ -123,268 +123,309 @@ def item_matches_clients(item: dict[str, Any], active_clients: set[str]) -> bool
     return item_client in active_clients
 
 
-def filter_model(model: dict[str, Any], active_profiles: set[str], active_clients: set[str]) -> dict[str, Any]:
-    if not active_profiles and not active_clients:
-        return model
+FILTER_MODEL_SCOPED_SECTIONS = (
+    "repos",
+    "artifacts",
+    "env_files",
+    "skills",
+    "tasks",
+    "services",
+    "logs",
+    "checks",
+    "bridges",
+    "ingress_routes",
+)
 
-    filtered_model = dict(model)
-    filtered_model["active_profiles"] = sorted(active_profiles)
-    filtered_model["active_clients"] = sorted(active_clients)
-    filtered_model["clients"] = [
-        copy.deepcopy(client)
-        for client in model["clients"]
-        if not active_clients or str(client.get("id", "")).strip() in active_clients
+
+def _model_item_id(item: dict[str, Any]) -> str:
+    return str(item.get("id", "")).strip()
+
+
+def _unique_raw_ids(item: dict[str, Any], field: str) -> list[str]:
+    raw_values = item.get(field) or []
+    if not isinstance(raw_values, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw_value in raw_values:
+        item_id = str(raw_value).strip()
+        if not item_id or item_id in seen:
+            continue
+        result.append(item_id)
+        seen.add(item_id)
+    return result
+
+
+def raw_task_dependency_ids(task: dict[str, Any]) -> list[str]:
+    return _unique_raw_ids(task, "depends_on")
+
+
+def raw_service_bootstrap_task_ids(service: dict[str, Any]) -> list[str]:
+    return _unique_raw_ids(service, "bootstrap_tasks")
+
+
+def _model_item_in_scope(item: dict[str, Any], active_profiles: set[str], active_clients: set[str]) -> bool:
+    return item_matches_profiles(item, active_profiles) and item_matches_clients(item, active_clients)
+
+
+def _scoped_model_items(
+    model: dict[str, Any],
+    section: str,
+    active_profiles: set[str],
+    active_clients: set[str],
+) -> list[dict[str, Any]]:
+    return [
+        copy.deepcopy(item)
+        for item in model.get(section) or []
+        if _model_item_in_scope(item, active_profiles, active_clients)
     ]
-    filtered_model["repos"] = [
-        copy.deepcopy(repo)
-        for repo in model["repos"]
-        if item_matches_profiles(repo, active_profiles) and item_matches_clients(repo, active_clients)
-    ]
-    filtered_model["artifacts"] = [
-        copy.deepcopy(artifact)
-        for artifact in model["artifacts"]
-        if item_matches_profiles(artifact, active_profiles) and item_matches_clients(artifact, active_clients)
-    ]
-    filtered_model["env_files"] = [
-        copy.deepcopy(env_file)
-        for env_file in model["env_files"]
-        if item_matches_profiles(env_file, active_profiles) and item_matches_clients(env_file, active_clients)
-    ]
-    filtered_model["skills"] = [
-        copy.deepcopy(skillset)
-        for skillset in model["skills"]
-        if item_matches_profiles(skillset, active_profiles) and item_matches_clients(skillset, active_clients)
-    ]
-    filtered_model["tasks"] = [
-        copy.deepcopy(task)
-        for task in model["tasks"]
-        if item_matches_profiles(task, active_profiles) and item_matches_clients(task, active_clients)
-    ]
-    filtered_model["services"] = [
-        copy.deepcopy(service)
-        for service in model["services"]
-        if item_matches_profiles(service, active_profiles) and item_matches_clients(service, active_clients)
-    ]
-    filtered_model["logs"] = [
-        copy.deepcopy(log_item)
-        for log_item in model["logs"]
-        if item_matches_profiles(log_item, active_profiles) and item_matches_clients(log_item, active_clients)
-    ]
-    filtered_model["checks"] = [
-        copy.deepcopy(check)
-        for check in model["checks"]
-        if item_matches_profiles(check, active_profiles) and item_matches_clients(check, active_clients)
-    ]
-    filtered_model["bridges"] = [
-        copy.deepcopy(bridge)
-        for bridge in model.get("bridges") or []
-        if item_matches_profiles(bridge, active_profiles) and item_matches_clients(bridge, active_clients)
-    ]
-    filtered_model["ingress_routes"] = [
-        copy.deepcopy(route)
-        for route in model.get("ingress_routes") or []
-        if item_matches_profiles(route, active_profiles) and item_matches_clients(route, active_clients)
-    ]
-    filtered_model["parity_ledger"] = [
+
+
+def _scoped_parity_ledger(
+    model: dict[str, Any],
+    active_profiles: set[str],
+    active_clients: set[str],
+) -> list[dict[str, Any]]:
+    return [
         copy.deepcopy(item)
         for item in model.get("parity_ledger") or []
         if parity_ledger_item_matches_profiles(item, active_profiles)
         and item_matches_clients(item, active_clients)
     ]
 
-    included_repo_ids = {repo["id"] for repo in filtered_model["repos"]}
-    included_artifact_ids = {artifact["id"] for artifact in filtered_model["artifacts"]}
-    included_task_ids = {task["id"] for task in filtered_model["tasks"]}
-    included_log_ids = {log_item["id"] for log_item in filtered_model["logs"]}
 
-    tasks_by_id = {
-        str(task["id"]): task
-        for task in model["tasks"]
-        if str(task.get("id", "")).strip()
-    }
+def _initial_filtered_model(
+    model: dict[str, Any],
+    active_profiles: set[str],
+    active_clients: set[str],
+) -> dict[str, Any]:
+    filtered_model = dict(model)
+    filtered_model["active_profiles"] = sorted(active_profiles)
+    filtered_model["active_clients"] = sorted(active_clients)
+    filtered_model["clients"] = [
+        copy.deepcopy(client)
+        for client in model.get("clients") or []
+        if not active_clients or _model_item_id(client) in active_clients
+    ]
+    for section in FILTER_MODEL_SCOPED_SECTIONS:
+        filtered_model[section] = _scoped_model_items(model, section, active_profiles, active_clients)
+    filtered_model["parity_ledger"] = _scoped_parity_ledger(model, active_profiles, active_clients)
+    return filtered_model
 
-    def raw_task_dependency_ids(task: dict[str, Any]) -> list[str]:
-        raw_dependencies = task.get("depends_on") or []
-        if not isinstance(raw_dependencies, list):
-            return []
 
-        dependency_ids: list[str] = []
-        seen_dependency_ids: set[str] = set()
-        for raw_dependency in raw_dependencies:
-            dependency_id = str(raw_dependency).strip()
-            if not dependency_id or dependency_id in seen_dependency_ids:
-                continue
-            dependency_ids.append(dependency_id)
-            seen_dependency_ids.add(dependency_id)
-        return dependency_ids
+def _tasks_by_id(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {_model_item_id(task): task for task in model.get("tasks") or [] if _model_item_id(task)}
 
-    def raw_service_bootstrap_task_ids(service: dict[str, Any]) -> list[str]:
-        raw_tasks = service.get("bootstrap_tasks") or []
-        if not isinstance(raw_tasks, list):
-            return []
 
-        task_ids: list[str] = []
-        seen_task_ids: set[str] = set()
-        for raw_task in raw_tasks:
-            task_id = str(raw_task).strip()
-            if not task_id or task_id in seen_task_ids:
-                continue
-            task_ids.append(task_id)
-            seen_task_ids.add(task_id)
-        return task_ids
-
-    def include_task(task_id: str) -> None:
-        task = tasks_by_id.get(task_id)
-        if task is None:
-            return
-        if not item_matches_profiles(task, active_profiles) or not item_matches_clients(task, active_clients):
-            return
-        for dependency_id in raw_task_dependency_ids(task):
-            include_task(dependency_id)
-        if task_id in included_task_ids:
-            return
+def _include_filtered_task(
+    *,
+    task_id: str,
+    tasks_by_id: dict[str, dict[str, Any]],
+    filtered_model: dict[str, Any],
+    included_task_ids: set[str],
+    active_profiles: set[str],
+    active_clients: set[str],
+    visiting: set[str],
+) -> None:
+    task = tasks_by_id.get(task_id)
+    if task is None or task_id in visiting:
+        return
+    if not _model_item_in_scope(task, active_profiles, active_clients):
+        return
+    visiting.add(task_id)
+    for dependency_id in raw_task_dependency_ids(task):
+        _include_filtered_task(
+            task_id=dependency_id,
+            tasks_by_id=tasks_by_id,
+            filtered_model=filtered_model,
+            included_task_ids=included_task_ids,
+            active_profiles=active_profiles,
+            active_clients=active_clients,
+            visiting=visiting,
+        )
+    visiting.discard(task_id)
+    if task_id not in included_task_ids:
         filtered_model["tasks"].append(copy.deepcopy(task))
         included_task_ids.add(task_id)
 
+
+def _include_filtered_task_graph(
+    model: dict[str, Any],
+    filtered_model: dict[str, Any],
+    active_profiles: set[str],
+    active_clients: set[str],
+) -> set[str]:
+    included_task_ids = {_model_item_id(task) for task in filtered_model["tasks"] if _model_item_id(task)}
+    tasks_by_id = _tasks_by_id(model)
+    include_kwargs = {
+        "tasks_by_id": tasks_by_id,
+        "filtered_model": filtered_model,
+        "included_task_ids": included_task_ids,
+        "active_profiles": active_profiles,
+        "active_clients": active_clients,
+    }
     for service in filtered_model["services"]:
         for task_id in raw_service_bootstrap_task_ids(service):
-            include_task(task_id)
-
+            _include_filtered_task(task_id=task_id, visiting=set(), **include_kwargs)
     for task in list(filtered_model["tasks"]):
         for dependency_id in raw_task_dependency_ids(task):
-            include_task(dependency_id)
+            _include_filtered_task(task_id=dependency_id, visiting=set(), **include_kwargs)
+    return included_task_ids
 
+
+def _prune_filtered_task_references(filtered_model: dict[str, Any], included_task_ids: set[str]) -> None:
     for service in filtered_model["services"]:
         service["bootstrap_tasks"] = [
-            task_id
-            for task_id in raw_service_bootstrap_task_ids(service)
+            task_id for task_id in raw_service_bootstrap_task_ids(service)
             if task_id in included_task_ids
         ]
-
     for task in filtered_model["tasks"]:
         task["depends_on"] = [
-            dependency_id
-            for dependency_id in raw_task_dependency_ids(task)
+            dependency_id for dependency_id in raw_task_dependency_ids(task)
             if dependency_id in included_task_ids
         ]
 
-    required_repo_ids = {
-        str(service["repo"])
-        for service in filtered_model["services"]
-        if service.get("repo")
-    } | {
-        str(task["repo"])
-        for task in filtered_model["tasks"]
-        if task.get("repo")
-    }
-    required_artifact_ids = {
-        str(service["artifact"])
-        for service in filtered_model["services"]
-        if service.get("artifact")
-    }
-    required_log_ids = {
-        str(service["log"])
-        for service in filtered_model["services"]
-        if service.get("log")
-    } | {
-        str(task["log"])
-        for task in filtered_model["tasks"]
-        if task.get("log")
-    }
 
-    for repo in model["repos"]:
-        repo_id = str(repo.get("id", "")).strip()
-        if repo_id and repo_id in required_repo_ids and repo_id not in included_repo_ids:
-            filtered_model["repos"].append(copy.deepcopy(repo))
-            included_repo_ids.add(repo_id)
+def _required_reference_ids(items: list[dict[str, Any]], field: str) -> set[str]:
+    return {str(item[field]) for item in items if item.get(field)}
 
-    for artifact in model["artifacts"]:
-        artifact_id = str(artifact.get("id", "")).strip()
-        if artifact_id and artifact_id in required_artifact_ids and artifact_id not in included_artifact_ids:
-            filtered_model["artifacts"].append(copy.deepcopy(artifact))
-            included_artifact_ids.add(artifact_id)
 
-    for log_item in model["logs"]:
-        log_id = str(log_item.get("id", "")).strip()
-        if log_id and log_id in required_log_ids and log_id not in included_log_ids:
-            filtered_model["logs"].append(copy.deepcopy(log_item))
-            included_log_ids.add(log_id)
+def _filtered_required_refs(filtered_model: dict[str, Any]) -> tuple[set[str], set[str], set[str]]:
+    required_repo_ids = (
+        _required_reference_ids(filtered_model["services"], "repo")
+        | _required_reference_ids(filtered_model["tasks"], "repo")
+    )
+    required_artifact_ids = _required_reference_ids(filtered_model["services"], "artifact")
+    required_log_ids = (
+        _required_reference_ids(filtered_model["services"], "log")
+        | _required_reference_ids(filtered_model["tasks"], "log")
+    )
+    return required_repo_ids, required_artifact_ids, required_log_ids
 
+
+def _append_required_model_items(
+    *,
+    model: dict[str, Any],
+    filtered_model: dict[str, Any],
+    section: str,
+    required_ids: set[str],
+) -> None:
+    included_ids = {_model_item_id(item) for item in filtered_model[section] if _model_item_id(item)}
+    for item in model.get(section) or []:
+        item_id = _model_item_id(item)
+        if item_id and item_id in required_ids and item_id not in included_ids:
+            filtered_model[section].append(copy.deepcopy(item))
+            included_ids.add(item_id)
+
+
+def _include_required_runtime_refs(model: dict[str, Any], filtered_model: dict[str, Any]) -> None:
+    required_repo_ids, required_artifact_ids, required_log_ids = _filtered_required_refs(filtered_model)
+    _append_required_model_items(
+        model=model, filtered_model=filtered_model, section="repos", required_ids=required_repo_ids,
+    )
+    _append_required_model_items(
+        model=model, filtered_model=filtered_model, section="artifacts", required_ids=required_artifact_ids,
+    )
+    _append_required_model_items(
+        model=model, filtered_model=filtered_model, section="logs", required_ids=required_log_ids,
+    )
+
+
+def filter_model(model: dict[str, Any], active_profiles: set[str], active_clients: set[str]) -> dict[str, Any]:
+    if not active_profiles and not active_clients:
+        return model
+    filtered_model = _initial_filtered_model(model, active_profiles, active_clients)
+    included_task_ids = _include_filtered_task_graph(
+        model, filtered_model, active_profiles, active_clients,
+    )
+    _prune_filtered_task_references(filtered_model, included_task_ids)
+    _include_required_runtime_refs(model, filtered_model)
     return filtered_model
 
-def lock_skill_map(lock_payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+
+def _lockfile_skill_entries(lock_payload: dict[str, Any]) -> list[dict[str, Any]]:
     skills = lock_payload.get("skills") or []
     if not isinstance(skills, list):
         raise RuntimeError("Lockfile field 'skills' must be a list")
-
-    mapping: dict[str, dict[str, Any]] = {}
     for item in skills:
         if not isinstance(item, dict):
             raise RuntimeError("Lockfile skill entries must be objects")
-        name = str(item.get("name", "")).strip()
-        if not name:
-            raise RuntimeError("Lockfile skill entries must include a non-empty name")
-        if name in mapping:
-            raise RuntimeError(f"Lockfile contains duplicate skill entry {name!r}")
+    return skills
 
-        targets = item.get("targets") or []
-        if not isinstance(targets, list):
-            raise RuntimeError(f"Lockfile skill {name!r} has a non-list targets field")
 
-        targets_by_id: dict[str, dict[str, Any]] = {}
-        for target in targets:
-            if not isinstance(target, dict):
-                raise RuntimeError(f"Lockfile skill {name!r} contains a non-object target entry")
-            target_id = str(target.get("id", "")).strip()
-            if not target_id:
-                raise RuntimeError(f"Lockfile skill {name!r} contains a target without an id")
-            if target_id in targets_by_id:
-                raise RuntimeError(f"Lockfile skill {name!r} contains duplicate target {target_id!r}")
-            targets_by_id[target_id] = target
+def _lockfile_skill_name(item: dict[str, Any], mapping: dict[str, dict[str, Any]]) -> str:
+    name = str(item.get("name", "")).strip()
+    if not name:
+        raise RuntimeError("Lockfile skill entries must include a non-empty name")
+    if name in mapping:
+        raise RuntimeError(f"Lockfile contains duplicate skill entry {name!r}")
+    return name
 
+
+def _lockfile_targets_by_id(name: str, item: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    targets = item.get("targets") or []
+    if not isinstance(targets, list):
+        raise RuntimeError(f"Lockfile skill {name!r} has a non-list targets field")
+
+    targets_by_id: dict[str, dict[str, Any]] = {}
+    for target in targets:
+        if not isinstance(target, dict):
+            raise RuntimeError(f"Lockfile skill {name!r} contains a non-object target entry")
+        target_id = str(target.get("id", "")).strip()
+        if not target_id:
+            raise RuntimeError(f"Lockfile skill {name!r} contains a target without an id")
+        if target_id in targets_by_id:
+            raise RuntimeError(f"Lockfile skill {name!r} contains duplicate target {target_id!r}")
+        targets_by_id[target_id] = target
+    return targets_by_id
+
+
+def lock_skill_map(lock_payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    mapping: dict[str, dict[str, Any]] = {}
+    for item in _lockfile_skill_entries(lock_payload):
+        name = _lockfile_skill_name(item, mapping)
+        targets_by_id = _lockfile_targets_by_id(name, item)
         mapping[name] = item | {"targets_by_id": targets_by_id}
 
     return mapping
 
 
-def collect_skill_inventory(skillset: dict[str, Any]) -> dict[str, Any]:
-    bundle_dir = Path(str(skillset["bundle_dir_host_path"]))
-    manifest_path = Path(str(skillset["manifest_host_path"]))
-    sources_config_path = Path(str(skillset["sources_config_host_path"]))
-    lock_path = Path(str(skillset["lock_path_host_path"]))
-
-    manifest_exists = manifest_path.is_file()
-    sources_exists = sources_config_path.is_file()
-    bundle_dir_exists = bundle_dir.is_dir()
-
-    expected_skills = read_manifest_skills(manifest_path) if manifest_exists else []
+def _collect_bundle_records(bundle_dir: Path) -> dict[str, dict[str, Any]]:
     bundles: dict[str, dict[str, Any]] = {}
-    if bundle_dir_exists:
-        for bundle_path in sorted(bundle_dir.glob("*.skill")):
-            bundles[bundle_path.stem] = bundle_metadata(bundle_path, expected_skill_name=bundle_path.stem)
+    if not bundle_dir.is_dir():
+        return bundles
+    for bundle_path in sorted(bundle_dir.glob("*.skill")):
+        bundles[bundle_path.stem] = bundle_metadata(bundle_path, expected_skill_name=bundle_path.stem)
+    return bundles
 
-    missing_bundles = sorted(name for name in expected_skills if name not in bundles)
-    extra_bundles = sorted(name for name in bundles if name not in expected_skills)
 
+def _load_skill_lock(lock_path: Path) -> tuple[dict[str, Any] | None, str | None, dict[str, dict[str, Any]]]:
     lock_payload: dict[str, Any] | None = None
     lock_error: str | None = None
+    lock_skills: dict[str, dict[str, Any]] = {}
     if lock_path.exists():
         try:
             lock_payload = load_json_file(lock_path)
-            lock_skill_map(lock_payload)
+            lock_skills = lock_skill_map(lock_payload)
         except RuntimeError as exc:
             lock_error = str(exc)
+    return lock_payload, lock_error, lock_skills
 
-    lock_skills: dict[str, dict[str, Any]] = {}
-    if lock_payload and not lock_error:
-        lock_skills = lock_skill_map(lock_payload)
 
+def _inventory_skill_names(
+    expected_skills: list[str],
+    bundles: dict[str, dict[str, Any]],
+    lock_skills: dict[str, dict[str, Any]],
+) -> list[str]:
     skill_names = list(expected_skills)
     for extra_name in sorted(set(bundles) - set(skill_names)):
         skill_names.append(extra_name)
     for lock_name in sorted(set(lock_skills) - set(skill_names)):
         skill_names.append(lock_name)
+    return skill_names
 
+
+def _target_states(skillset: dict[str, Any]) -> list[dict[str, Any]]:
     target_states: list[dict[str, Any]] = []
     for target in skillset.get("install_targets") or []:
         target_root = Path(str(target["host_path"]))
@@ -396,61 +437,125 @@ def collect_skill_inventory(skillset: dict[str, Any]) -> dict[str, Any]:
                 "present": target_root.exists(),
             }
         )
+    return target_states
 
+
+def _bundle_state(
+    bundle_record: dict[str, Any] | None,
+    lock_record: dict[str, Any] | None,
+    lock_payload: dict[str, Any] | None,
+) -> str:
+    if bundle_record is None:
+        return "missing"
+    if bundle_record and lock_record:
+        if (
+            lock_record.get("bundle_sha256") == bundle_record["bundle_sha256"]
+            and lock_record.get("bundle_tree_sha256") == bundle_record["bundle_tree_sha256"]
+        ):
+            return "ok"
+        return "drift"
+    if lock_payload:
+        return "untracked"
+    return "present"
+
+
+def _target_state(
+    install_dir: Path,
+    install_tree_sha: str | None,
+    target_lock: dict[str, Any] | None,
+    lock_payload: dict[str, Any] | None,
+) -> str:
+    target_state = "present" if install_dir.exists() else "missing"
+    if target_lock:
+        if install_tree_sha is None:
+            return "missing"
+        if target_lock.get("tree_sha256") == install_tree_sha:
+            return "ok"
+        return "drift"
+    if install_tree_sha is not None and lock_payload:
+        return "untracked"
+    return target_state
+
+
+def _skill_target_entries(
+    skill_name: str,
+    target_states: list[dict[str, Any]],
+    lock_record: dict[str, Any] | None,
+    lock_payload: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for target in target_states:
+        install_dir = Path(target["host_path"]) / skill_name
+        install_tree_sha = directory_tree_sha256(install_dir)
+        target_lock = lock_record.get("targets_by_id", {}).get(target["id"]) if lock_record else None
+        entries.append(
+            {
+                "id": target["id"],
+                "path": str(target["path"]),
+                "host_path": str(install_dir),
+                "present": install_dir.exists(),
+                "tree_sha256": install_tree_sha,
+                "state": _target_state(install_dir, install_tree_sha, target_lock, lock_payload),
+            }
+        )
+    return entries
+
+
+def _skill_inventory_entry(
+    skill_name: str,
+    bundle_record: dict[str, Any] | None,
+    lock_record: dict[str, Any] | None,
+    lock_payload: dict[str, Any] | None,
+    target_states: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "name": skill_name,
+        "bundle_present": bundle_record is not None,
+        "bundle_state": _bundle_state(bundle_record, lock_record, lock_payload),
+        "bundle_sha256": bundle_record.get("bundle_sha256") if bundle_record else None,
+        "bundle_tree_sha256": bundle_record.get("bundle_tree_sha256") if bundle_record else None,
+        "targets": _skill_target_entries(skill_name, target_states, lock_record, lock_payload),
+    }
+
+
+def _skill_inventory_entries(
+    skill_names: list[str],
+    bundles: dict[str, dict[str, Any]],
+    lock_skills: dict[str, dict[str, Any]],
+    lock_payload: dict[str, Any] | None,
+    target_states: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     skills: list[dict[str, Any]] = []
     for skill_name in skill_names:
-        bundle_record = bundles.get(skill_name)
-        lock_record = lock_skills.get(skill_name)
-        skill_entry = {
-            "name": skill_name,
-            "bundle_present": bundle_record is not None,
-            "bundle_state": "missing" if bundle_record is None else "present",
-            "bundle_sha256": bundle_record.get("bundle_sha256") if bundle_record else None,
-            "bundle_tree_sha256": bundle_record.get("bundle_tree_sha256") if bundle_record else None,
-            "targets": [],
-        }
-
-        if bundle_record and lock_record:
-            if (
-                lock_record.get("bundle_sha256") == bundle_record["bundle_sha256"]
-                and lock_record.get("bundle_tree_sha256") == bundle_record["bundle_tree_sha256"]
-            ):
-                skill_entry["bundle_state"] = "ok"
-            else:
-                skill_entry["bundle_state"] = "drift"
-        elif bundle_record and lock_payload:
-            skill_entry["bundle_state"] = "untracked"
-
-        for target in target_states:
-            install_dir = Path(target["host_path"]) / skill_name
-            install_tree_sha = directory_tree_sha256(install_dir)
-            target_lock = lock_record.get("targets_by_id", {}).get(target["id"]) if lock_record else None
-
-            target_state = "missing"
-            if install_dir.exists():
-                target_state = "present"
-            if target_lock:
-                if install_tree_sha is None:
-                    target_state = "missing"
-                elif target_lock.get("tree_sha256") == install_tree_sha:
-                    target_state = "ok"
-                else:
-                    target_state = "drift"
-            elif install_tree_sha is not None and lock_payload:
-                target_state = "untracked"
-
-            skill_entry["targets"].append(
-                {
-                    "id": target["id"],
-                    "path": str(target["path"]),
-                    "host_path": str(install_dir),
-                    "present": install_dir.exists(),
-                    "tree_sha256": install_tree_sha,
-                    "state": target_state,
-                }
+        skills.append(
+            _skill_inventory_entry(
+                skill_name,
+                bundles.get(skill_name),
+                lock_skills.get(skill_name),
+                lock_payload,
+                target_states,
             )
+        )
+    return skills
 
-        skills.append(skill_entry)
+
+def collect_skill_inventory(skillset: dict[str, Any]) -> dict[str, Any]:
+    bundle_dir = Path(str(skillset["bundle_dir_host_path"]))
+    manifest_path = Path(str(skillset["manifest_host_path"]))
+    sources_config_path = Path(str(skillset["sources_config_host_path"]))
+    lock_path = Path(str(skillset["lock_path_host_path"]))
+
+    manifest_exists = manifest_path.is_file()
+    sources_exists = sources_config_path.is_file()
+    bundle_dir_exists = bundle_dir.is_dir()
+    expected_skills = read_manifest_skills(manifest_path) if manifest_exists else []
+    bundles = _collect_bundle_records(bundle_dir)
+    missing_bundles = sorted(name for name in expected_skills if name not in bundles)
+    extra_bundles = sorted(name for name in bundles if name not in expected_skills)
+    lock_payload, lock_error, lock_skills = _load_skill_lock(lock_path)
+    skill_names = _inventory_skill_names(expected_skills, bundles, lock_skills)
+    target_states = _target_states(skillset)
+    skills = _skill_inventory_entries(skill_names, bundles, lock_skills, lock_payload, target_states)
 
     return {
         "id": skillset["id"],
@@ -524,71 +629,103 @@ def build_skill_lock(
 
 
 def sync_skill_sets(model: dict[str, Any], dry_run: bool) -> list[str]:
-    from .publish import extract_bundle_to_target
-
     actions: list[str] = []
-
     for skillset in model["skills"]:
         if skillset.get("kind") == "skill-repo-set":
             continue
         inventory = collect_skill_inventory(skillset)
-        missing_inputs: list[str] = []
-        for field, present in (
+        actions.extend(_sync_packaged_skill_set(skillset, inventory, dry_run))
+    return actions
+
+
+def _sync_packaged_skill_set(
+    skillset: dict[str, Any],
+    inventory: dict[str, Any],
+    dry_run: bool,
+) -> list[str]:
+    _ensure_skillset_sync_inputs(skillset, inventory)
+    actions = _skillset_extra_bundle_actions(skillset, inventory)
+    actions.extend(_ensure_skillset_target_dirs(skillset, dry_run))
+    install_hashes, install_actions = _install_skillset_bundles(skillset, inventory, dry_run)
+    actions.extend(install_actions)
+    actions.append(_sync_skillset_lockfile(skillset, inventory, install_hashes, dry_run))
+    return actions
+
+
+def _ensure_skillset_sync_inputs(skillset: dict[str, Any], inventory: dict[str, Any]) -> None:
+    missing_inputs = [
+        field for field, present in (
             ("bundle_dir", inventory["bundle_dir_exists"]),
             ("manifest", inventory["manifest_exists"]),
             ("sources_config", inventory["sources_config_exists"]),
-        ):
-            if not present:
-                missing_inputs.append(field)
-        if missing_inputs:
-            raise RuntimeError(
-                f"Skill set {skillset['id']} is missing required files: {', '.join(missing_inputs)}"
-            )
-        if inventory["missing_bundles"]:
-            raise RuntimeError(
-                f"Skill set {skillset['id']} is missing bundles for: {', '.join(inventory['missing_bundles'])}"
-            )
+        )
+        if not present
+    ]
+    if missing_inputs:
+        raise RuntimeError(
+            f"Skill set {skillset['id']} is missing required files: {', '.join(missing_inputs)}"
+        )
+    if inventory["missing_bundles"]:
+        raise RuntimeError(
+            f"Skill set {skillset['id']} is missing bundles for: {', '.join(inventory['missing_bundles'])}"
+        )
 
-        if inventory["extra_bundles"]:
-            actions.append(
-                f"ignore-extra-bundles: {skillset['id']} -> {', '.join(inventory['extra_bundles'])}"
-            )
 
+def _skillset_extra_bundle_actions(skillset: dict[str, Any], inventory: dict[str, Any]) -> list[str]:
+    if not inventory["extra_bundles"]:
+        return []
+    return [f"ignore-extra-bundles: {skillset['id']} -> {', '.join(inventory['extra_bundles'])}"]
+
+
+def _ensure_skillset_target_dirs(skillset: dict[str, Any], dry_run: bool) -> list[str]:
+    actions: list[str] = []
+    for target in skillset.get("install_targets") or []:
+        target_root = Path(str(target["host_path"]))
+        ensure_directory(target_root, dry_run)
+        actions.append(f"ensure-directory: {target_root}")
+    return actions
+
+
+def _install_skillset_bundles(
+    skillset: dict[str, Any],
+    inventory: dict[str, Any],
+    dry_run: bool,
+) -> tuple[dict[str, dict[str, str]], list[str]]:
+    from .publish import extract_bundle_to_target
+
+    actions: list[str] = []
+    install_hashes: dict[str, dict[str, str]] = {}
+    for skill_name in inventory["expected_skills"]:
+        install_hashes[skill_name] = {}
+        bundle_record = inventory["bundles"][skill_name]
+        bundle_path = Path(str(bundle_record["host_path"]))
         for target in skillset.get("install_targets") or []:
             target_root = Path(str(target["host_path"]))
-            ensure_directory(target_root, dry_run)
-            actions.append(f"ensure-directory: {target_root}")
-
-        install_hashes: dict[str, dict[str, str]] = {}
-        for skill_name in inventory["expected_skills"]:
-            install_hashes[skill_name] = {}
-            bundle_record = inventory["bundles"][skill_name]
-            bundle_path = Path(str(bundle_record["host_path"]))
-
-            for target in skillset.get("install_targets") or []:
-                target_root = Path(str(target["host_path"]))
-                install_dir = target_root / skill_name
-                if dry_run:
-                    actions.append(f"install-skill: {bundle_path} -> {install_dir}")
-                    continue
-
-                install_hashes[skill_name][target["id"]] = extract_bundle_to_target(
-                    bundle_path=bundle_path,
-                    target_root=target_root,
-                    skill_name=skill_name,
-                )
+            install_dir = target_root / skill_name
+            if dry_run:
                 actions.append(f"install-skill: {bundle_path} -> {install_dir}")
+                continue
+            install_hashes[skill_name][target["id"]] = extract_bundle_to_target(
+                bundle_path=bundle_path,
+                target_root=target_root,
+                skill_name=skill_name,
+            )
+            actions.append(f"install-skill: {bundle_path} -> {install_dir}")
+    return install_hashes, actions
 
-        lock_path = Path(str(skillset["lock_path_host_path"]))
-        if dry_run:
-            actions.append(f"write-lockfile: {lock_path}")
-            continue
 
-        lock_payload = build_skill_lock(skillset, inventory, install_hashes)
-        changed = write_json_file(lock_path, lock_payload)
-        actions.append(f"{'write-lockfile' if changed else 'lockfile-unchanged'}: {lock_path}")
-
-    return actions
+def _sync_skillset_lockfile(
+    skillset: dict[str, Any],
+    inventory: dict[str, Any],
+    install_hashes: dict[str, dict[str, str]],
+    dry_run: bool,
+) -> str:
+    lock_path = Path(str(skillset["lock_path_host_path"]))
+    if dry_run:
+        return f"write-lockfile: {lock_path}"
+    lock_payload = build_skill_lock(skillset, inventory, install_hashes)
+    changed = write_json_file(lock_path, lock_payload)
+    return f"{'write-lockfile' if changed else 'lockfile-unchanged'}: {lock_path}"
 
 
 def _check_skillset_required_bundles(skillset: dict[str, Any], inventory: dict[str, Any]) -> list[str]:
@@ -620,8 +757,21 @@ def _check_skillset_lockfile(skillset: dict[str, Any], inventory: dict[str, Any]
     if not inventory["lock_present"]:
         return [], [f"{skillset['id']}: lockfile missing at {inventory['lock_path_host_path']}"]
 
-    failures: list[str] = []
     lock_payload = inventory["lock_payload"] or {}
+    failures = _lockfile_header_failures(skillset, inventory, lock_payload)
+
+    indexed_lock = lock_skill_map(lock_payload)
+    failures.extend(_lockfile_extra_skill_failures(skillset, inventory, indexed_lock))
+    failures.extend(_lockfile_skill_record_failures(skillset, inventory, indexed_lock))
+    return failures, []
+
+
+def _lockfile_header_failures(
+    skillset: dict[str, Any],
+    inventory: dict[str, Any],
+    lock_payload: dict[str, Any],
+) -> list[str]:
+    failures: list[str] = []
     if lock_payload.get("version") != LOCKFILE_VERSION:
         failures.append(
             f"{skillset['id']}: lockfile version {lock_payload.get('version')!r} does not match {LOCKFILE_VERSION}"
@@ -632,38 +782,74 @@ def _check_skillset_lockfile(skillset: dict[str, Any], inventory: dict[str, Any]
         failures.append(f"{skillset['id']}: lockfile manifest digest is stale")
     if lock_payload.get("sources_config_sha256") != inventory["sources_config_sha256"]:
         failures.append(f"{skillset['id']}: lockfile sources config digest is stale")
+    return failures
 
-    indexed_lock = lock_skill_map(lock_payload)
+
+def _lockfile_extra_skill_failures(
+    skillset: dict[str, Any],
+    inventory: dict[str, Any],
+    indexed_lock: dict[str, Any],
+) -> list[str]:
     expected_skill_names = set(inventory["expected_skills"])
     extras = sorted(set(indexed_lock) - expected_skill_names)
     if extras:
-        failures.append(f"{skillset['id']}: lockfile contains extra skills: {', '.join(extras)}")
+        return [f"{skillset['id']}: lockfile contains extra skills: {', '.join(extras)}"]
+    return []
 
+
+def _lockfile_skill_record_failures(
+    skillset: dict[str, Any],
+    inventory: dict[str, Any],
+    indexed_lock: dict[str, Any],
+) -> list[str]:
+    failures: list[str] = []
     configured_targets = {target["id"] for target in skillset.get("install_targets") or []}
     for skill_name in inventory["expected_skills"]:
         lock_record = indexed_lock.get(skill_name)
         if lock_record is None:
             failures.append(f"{skillset['id']}: lockfile is missing skill {skill_name}")
             continue
-        bundle_record = inventory["bundles"].get(skill_name)
-        if bundle_record is None:
-            continue
-        if lock_record.get("bundle_sha256") != bundle_record["bundle_sha256"]:
-            failures.append(f"{skillset['id']}: lockfile bundle digest is stale for {skill_name}")
-        if lock_record.get("bundle_tree_sha256") != bundle_record["bundle_tree_sha256"]:
-            failures.append(f"{skillset['id']}: lockfile bundle tree digest is stale for {skill_name}")
-        lock_targets = lock_record.get("targets_by_id", {})
-        target_extras = sorted(set(lock_targets) - configured_targets)
-        if target_extras:
-            failures.append(
-                f"{skillset['id']}: lockfile contains unexpected targets for {skill_name}: {', '.join(target_extras)}"
-            )
-        missing_targets = sorted(configured_targets - set(lock_targets))
-        if missing_targets:
-            failures.append(
-                f"{skillset['id']}: lockfile is missing targets for {skill_name}: {', '.join(missing_targets)}"
-            )
-    return failures, []
+        failures.extend(_lockfile_bundle_record_failures(skillset, inventory, lock_record, skill_name))
+        failures.extend(_lockfile_target_failures(skillset, configured_targets, lock_record, skill_name))
+    return failures
+
+
+def _lockfile_bundle_record_failures(
+    skillset: dict[str, Any],
+    inventory: dict[str, Any],
+    lock_record: dict[str, Any],
+    skill_name: str,
+) -> list[str]:
+    bundle_record = inventory["bundles"].get(skill_name)
+    if bundle_record is None:
+        return []
+    failures: list[str] = []
+    if lock_record.get("bundle_sha256") != bundle_record["bundle_sha256"]:
+        failures.append(f"{skillset['id']}: lockfile bundle digest is stale for {skill_name}")
+    if lock_record.get("bundle_tree_sha256") != bundle_record["bundle_tree_sha256"]:
+        failures.append(f"{skillset['id']}: lockfile bundle tree digest is stale for {skill_name}")
+    return failures
+
+
+def _lockfile_target_failures(
+    skillset: dict[str, Any],
+    configured_targets: set[str],
+    lock_record: dict[str, Any],
+    skill_name: str,
+) -> list[str]:
+    failures: list[str] = []
+    lock_targets = lock_record.get("targets_by_id", {})
+    target_extras = sorted(set(lock_targets) - configured_targets)
+    if target_extras:
+        failures.append(
+            f"{skillset['id']}: lockfile contains unexpected targets for {skill_name}: {', '.join(target_extras)}"
+        )
+    missing_targets = sorted(configured_targets - set(lock_targets))
+    if missing_targets:
+        failures.append(
+            f"{skillset['id']}: lockfile is missing targets for {skill_name}: {', '.join(missing_targets)}"
+        )
+    return failures
 
 
 def _check_skillset_install_state(skillset: dict[str, Any], inventory: dict[str, Any]) -> tuple[list[str], list[str]]:
@@ -756,6 +942,50 @@ def _declared_skill_names(config: dict[str, Any]) -> set[str]:
     return names
 
 
+def _protected_planning_picks(entry: dict[str, Any], protected_names: set[str]) -> list[str]:
+    picked_names = {
+        str(item).strip()
+        for item in entry.get("pick") or []
+        if str(item).strip()
+    }
+    return sorted(picked_names & protected_names)
+
+
+def _resolved_skill_repo_source_path(overlay_dir: Path, local_path: str) -> Path:
+    source_path = Path(local_path).expanduser()
+    if not source_path.is_absolute():
+        source_path = overlay_dir / source_path
+    return source_path
+
+
+def _shared_client_planning_source_failure(
+    *,
+    client_id: str,
+    index: int,
+    protected_picks: list[str],
+    source_path: Path,
+    expected_shared_source: Path,
+) -> str | None:
+    protected_pick_label = ", ".join(protected_picks)
+    if not source_path.exists() and not source_path.is_symlink():
+        return (
+            f"{client_id}: skill_repos[{index}] references missing local path "
+            f"{repo_rel(DEFAULT_ROOT_DIR, source_path)} for protected planning skills "
+            f"{protected_pick_label}; point it at {CLIENT_SHARED_SKILLS_REL} "
+            f"or set {VENDORED_SHARED_SKILLS_ESCAPE_HATCH}: true when divergence is intentional"
+        )
+
+    if source_path.resolve() != expected_shared_source:
+        return (
+            f"{client_id}: skill_repos[{index}] sources protected planning skills "
+            f"{protected_pick_label} from {repo_rel(DEFAULT_ROOT_DIR, source_path)}; "
+            f"point it at {CLIENT_SHARED_SKILLS_REL} or set "
+            f"{VENDORED_SHARED_SKILLS_ESCAPE_HATCH}: true when divergence is intentional"
+        )
+
+    return None
+
+
 def _validate_shared_client_planning_sources(
     skillset: dict[str, Any],
     config_path: Path,
@@ -775,38 +1005,22 @@ def _validate_shared_client_planning_sources(
         if not local_path:
             continue
 
-        picked_names = {
-            str(item).strip()
-            for item in entry.get("pick") or []
-            if str(item).strip()
-        }
-        protected_picks = sorted(picked_names & protected_names)
+        protected_picks = _protected_planning_picks(entry, protected_names)
         if not protected_picks:
             continue
 
         if bool(entry.get(VENDORED_SHARED_SKILLS_ESCAPE_HATCH)):
             continue
 
-        source_path = Path(local_path).expanduser()
-        if not source_path.is_absolute():
-            source_path = overlay_dir / source_path
-
-        if not source_path.exists() and not source_path.is_symlink():
-            failures.append(
-                f"{client_id}: skill_repos[{index}] references missing local path "
-                f"{repo_rel(DEFAULT_ROOT_DIR, source_path)} for protected planning skills "
-                f"{', '.join(protected_picks)}; point it at {CLIENT_SHARED_SKILLS_REL} "
-                f"or set {VENDORED_SHARED_SKILLS_ESCAPE_HATCH}: true when divergence is intentional"
-            )
-            continue
-
-        if source_path.resolve() != expected_shared_source:
-            failures.append(
-                f"{client_id}: skill_repos[{index}] sources protected planning skills "
-                f"{', '.join(protected_picks)} from {repo_rel(DEFAULT_ROOT_DIR, source_path)}; "
-                f"point it at {CLIENT_SHARED_SKILLS_REL} or set "
-                f"{VENDORED_SHARED_SKILLS_ESCAPE_HATCH}: true when divergence is intentional"
-            )
+        failure = _shared_client_planning_source_failure(
+            client_id=client_id,
+            index=index,
+            protected_picks=protected_picks,
+            source_path=_resolved_skill_repo_source_path(overlay_dir, local_path),
+            expected_shared_source=expected_shared_source,
+        )
+        if failure:
+            failures.append(failure)
 
     return failures
 
@@ -1127,33 +1341,56 @@ def _check_repo_entries(model: dict[str, Any], declared_client_ids: set[str]) ->
     return issues
 
 
+def _check_artifact_identity(
+    artifact: dict[str, Any], declared_client_ids: set[str],
+) -> list[str]:
+    issues: list[str] = []
+    if not artifact.get("id"):
+        issues.append("every artifact entry must have an id")
+    if not artifact.get("path"):
+        issues.append(f"artifact {artifact.get('id', '(missing id)')} is missing path")
+    if artifact.get("client") and artifact["client"] not in declared_client_ids:
+        issues.append(f"artifact {artifact.get('id')} references unknown client {artifact['client']!r}")
+    return issues
+
+
+def _check_artifact_source(artifact: dict[str, Any]) -> tuple[list[str], str]:
+    source = artifact.get("source") or {}
+    source_kind = source.get("kind", "manual")
+    issues: list[str] = []
+    if source_kind not in VALID_ARTIFACT_SOURCE_KINDS:
+        issues.append(f"artifact {artifact.get('id')} has unsupported source.kind {source_kind!r}")
+    if source_kind == "url" and str(source.get("url") or "").strip():
+        try:
+            validate_url_download_source(source, artifact_id=str(artifact.get("id", "(missing id)")))
+        except RuntimeError as exc:
+            issues.append(str(exc))
+    return issues, source_kind
+
+
+def _default_artifact_sync_mode(source_kind: str) -> str:
+    if source_kind == "url":
+        return "download-if-missing"
+    if source_kind == "file":
+        return "copy-if-missing"
+    return "manual"
+
+
+def _check_artifact_sync(artifact: dict[str, Any], source_kind: str) -> list[str]:
+    sync = artifact.get("sync") or {}
+    sync_mode = sync.get("mode") or _default_artifact_sync_mode(source_kind)
+    if sync_mode in VALID_ARTIFACT_SYNC_MODES:
+        return []
+    return [f"artifact {artifact.get('id')} has unsupported sync.mode {sync_mode!r}"]
+
+
 def _check_artifact_entries(model: dict[str, Any], declared_client_ids: set[str]) -> list[str]:
     issues: list[str] = []
     for artifact in model["artifacts"]:
-        if not artifact.get("id"):
-            issues.append("every artifact entry must have an id")
-        if not artifact.get("path"):
-            issues.append(f"artifact {artifact.get('id', '(missing id)')} is missing path")
-        if artifact.get("client") and artifact["client"] not in declared_client_ids:
-            issues.append(f"artifact {artifact.get('id')} references unknown client {artifact['client']!r}")
-
-        source = artifact.get("source") or {}
-        source_kind = source.get("kind", "manual")
-        if source_kind not in VALID_ARTIFACT_SOURCE_KINDS:
-            issues.append(f"artifact {artifact.get('id')} has unsupported source.kind {source_kind!r}")
-
-        sync = artifact.get("sync") or {}
-        sync_mode = sync.get("mode") or (
-            "download-if-missing" if source_kind == "url"
-            else "copy-if-missing" if source_kind == "file" else "manual"
-        )
-        if sync_mode not in VALID_ARTIFACT_SYNC_MODES:
-            issues.append(f"artifact {artifact.get('id')} has unsupported sync.mode {sync_mode!r}")
-        if source_kind == "url" and str(source.get("url") or "").strip():
-            try:
-                validate_url_download_source(source, artifact_id=str(artifact.get("id", "(missing id)")))
-            except RuntimeError as exc:
-                issues.append(str(exc))
+        source_issues, source_kind = _check_artifact_source(artifact)
+        issues.extend(_check_artifact_identity(artifact, declared_client_ids))
+        issues.extend(source_issues)
+        issues.extend(_check_artifact_sync(artifact, source_kind))
     return issues
 
 
@@ -1185,42 +1422,65 @@ def _check_env_file_entries(
     return issues
 
 
+def _check_skill_identity(
+    skillset: dict[str, Any], declared_client_ids: set[str],
+) -> list[str]:
+    issues: list[str] = []
+    if not skillset.get("id"):
+        issues.append("every skills entry must have an id")
+    if skillset.get("client") and skillset["client"] not in declared_client_ids:
+        issues.append(f"skill set {skillset.get('id')} references unknown client {skillset['client']!r}")
+    return issues
+
+
+def _required_skill_fields(skillset: dict[str, Any]) -> tuple[str, ...]:
+    kind = skillset.get("kind", "packaged-skill-set")
+    if kind == "skill-repo-set":
+        return "skill_repos_config", "lock_path"
+    return "bundle_dir", "manifest", "sources_config", "lock_path"
+
+
+def _check_skill_required_fields(skillset: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    for field in _required_skill_fields(skillset):
+        if not skillset.get(field):
+            issues.append(f"skill set {skillset.get('id', '(missing id)')} is missing {field}")
+    return issues
+
+
+def _check_skill_sync(skillset: dict[str, Any]) -> list[str]:
+    sync = skillset.get("sync") or {}
+    sync_mode = sync.get("mode") or "unpack-bundles"
+    if sync_mode in VALID_SKILL_SYNC_MODES:
+        return []
+    return [f"skill set {skillset.get('id')} has unsupported sync.mode {sync_mode!r}"]
+
+
+def _check_skill_install_targets(skillset: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    targets = skillset.get("install_targets") or []
+    if not targets:
+        return [f"skill set {skillset.get('id')} must declare at least one install target"]
+
+    target_dup_ids = find_duplicates(targets, "id")
+    if target_dup_ids:
+        issues.append(f"skill set {skillset.get('id')} contains duplicate target ids: {', '.join(target_dup_ids)}")
+
+    for target in targets:
+        if not target.get("id"):
+            issues.append(f"skill set {skillset.get('id')} contains a target without an id")
+        if not target.get("path"):
+            issues.append(f"skill set {skillset.get('id')} target {target.get('id', '(missing id)')} is missing path")
+    return issues
+
+
 def _check_skill_entries(model: dict[str, Any], declared_client_ids: set[str]) -> list[str]:
     issues: list[str] = []
     for skillset in model["skills"]:
-        if not skillset.get("id"):
-            issues.append("every skills entry must have an id")
-        if skillset.get("client") and skillset["client"] not in declared_client_ids:
-            issues.append(f"skill set {skillset.get('id')} references unknown client {skillset['client']!r}")
-
-        kind = skillset.get("kind", "packaged-skill-set")
-        required_fields = (
-            ("skill_repos_config", "lock_path") if kind == "skill-repo-set"
-            else ("bundle_dir", "manifest", "sources_config", "lock_path")
-        )
-        for field in required_fields:
-            if not skillset.get(field):
-                issues.append(f"skill set {skillset.get('id', '(missing id)')} is missing {field}")
-
-        sync = skillset.get("sync") or {}
-        sync_mode = sync.get("mode") or "unpack-bundles"
-        if sync_mode not in VALID_SKILL_SYNC_MODES:
-            issues.append(f"skill set {skillset.get('id')} has unsupported sync.mode {sync_mode!r}")
-
-        targets = skillset.get("install_targets") or []
-        if not targets:
-            issues.append(f"skill set {skillset.get('id')} must declare at least one install target")
-            continue
-
-        target_dup_ids = find_duplicates(targets, "id")
-        if target_dup_ids:
-            issues.append(f"skill set {skillset.get('id')} contains duplicate target ids: {', '.join(target_dup_ids)}")
-
-        for target in targets:
-            if not target.get("id"):
-                issues.append(f"skill set {skillset.get('id')} contains a target without an id")
-            if not target.get("path"):
-                issues.append(f"skill set {skillset.get('id')} target {target.get('id', '(missing id)')} is missing path")
+        issues.extend(_check_skill_identity(skillset, declared_client_ids))
+        issues.extend(_check_skill_required_fields(skillset))
+        issues.extend(_check_skill_sync(skillset))
+        issues.extend(_check_skill_install_targets(skillset))
     return issues
 
 
@@ -1261,26 +1521,51 @@ def _check_dependency_list(
 
 
 def _check_task_success(task: dict[str, Any], bridge_ids: set[str]) -> list[str]:
-    issues: list[str] = []
     success = task.get("success") or {}
     success_type = success.get("type")
+    issues: list[str] = []
     if not success_type:
         issues.append(f"task {task.get('id', '(missing id)')} is missing success.type")
     elif success_type not in VALID_TASK_SUCCESS_TYPES:
         issues.append(f"task {task.get('id')} has unsupported success.type {success_type!r}")
-    if success_type == "path_exists" and not success.get("path"):
-        issues.append(f"task {task.get('id')} path_exists success is missing path")
-    if success_type == "all_outputs_exist":
-        target = str(success.get("target") or "").strip()
-        if not target:
-            issues.append(f"task {task.get('id')} all_outputs_exist success is missing target")
-        elif target not in bridge_ids:
-            issues.append(
-                f"task {task.get('id')} all_outputs_exist success references unknown bridge {target!r}"
-            )
-    if success_type == "port_listening" and not _is_int_port(success.get("port")):
-        issues.append(f"task {task.get('id')} port_listening success is missing integer port")
+    issues.extend(_check_path_exists_success(task, success, success_type))
+    issues.extend(_check_all_outputs_success(task, success, success_type, bridge_ids))
+    issues.extend(_check_port_listening_success(task, success, success_type))
     return issues
+
+
+def _check_path_exists_success(
+    task: dict[str, Any], success: dict[str, Any], success_type: str | None,
+) -> list[str]:
+    if success_type == "path_exists" and not success.get("path"):
+        return [f"task {task.get('id')} path_exists success is missing path"]
+    return []
+
+
+def _check_all_outputs_success(
+    task: dict[str, Any],
+    success: dict[str, Any],
+    success_type: str | None,
+    bridge_ids: set[str],
+) -> list[str]:
+    if success_type != "all_outputs_exist":
+        return []
+    target = str(success.get("target") or "").strip()
+    if not target:
+        return [f"task {task.get('id')} all_outputs_exist success is missing target"]
+    if target not in bridge_ids:
+        return [
+            f"task {task.get('id')} all_outputs_exist success references unknown bridge {target!r}"
+        ]
+    return []
+
+
+def _check_port_listening_success(
+    task: dict[str, Any], success: dict[str, Any], success_type: str | None,
+) -> list[str]:
+    if success_type == "port_listening" and not _is_int_port(success.get("port")):
+        return [f"task {task.get('id')} port_listening success is missing integer port"]
+    return []
 
 
 def _check_task_entries(
@@ -1458,49 +1743,81 @@ def _check_ingress_route_entries(
     issues: list[str] = []
     seen_keys: set[tuple[str, str, str]] = set()
     for route in model.get("ingress_routes") or []:
-        route_id = str(route.get("id", "")).strip()
-        if not route_id:
-            issues.append("every ingress_routes entry must have an id")
-        if route.get("client") and route["client"] not in declared_client_ids:
-            issues.append(f"ingress route {route.get('id')} references unknown client {route['client']!r}")
-
-        service_id = str(route.get("service_id") or "").strip()
-        if not service_id:
-            issues.append(f"ingress route {route.get('id', '(missing id)')} is missing service_id")
-        elif service_id not in service_ids:
-            issues.append(f"ingress route {route.get('id')} references unknown service {service_id!r}")
-        elif not _looks_like_ingress_origin(services_by_id[service_id].get("origin_url")):
-            issues.append(
-                f"ingress route {route.get('id')} references service {service_id!r} without a valid origin_url"
-            )
-
-        listener = str(route.get("listener") or "").strip().lower()
-        if listener not in VALID_INGRESS_ROUTE_LISTENERS:
-            issues.append(
-                f"ingress route {route.get('id')} has unsupported listener {route.get('listener')!r}"
-            )
-
-        path = str(route.get("path") or "").strip()
-        if not path:
-            issues.append(f"ingress route {route.get('id', '(missing id)')} is missing path")
-        elif not path.startswith("/"):
-            issues.append(f"ingress route {route.get('id')} path must start with '/'")
-
-        match = str(route.get("match") or "exact").strip().lower()
-        if match not in VALID_INGRESS_ROUTE_MATCHES:
-            issues.append(
-                f"ingress route {route.get('id')} has unsupported match {route.get('match')!r}"
-            )
-
-        if path:
-            conflict_key = (listener or "public", path, match or "exact")
-            if conflict_key in seen_keys:
-                issues.append(
-                    "ingress routes contain duplicate listener/path/match: "
-                    f"{listener or 'public'} {path} ({match or 'exact'})"
-                )
-            seen_keys.add(conflict_key)
+        issues.extend(_check_ingress_route_identity(route, declared_client_ids))
+        issues.extend(_check_ingress_route_service(route, service_ids, services_by_id))
+        listener = _ingress_route_listener(route, issues)
+        path = _ingress_route_path(route, issues)
+        match = _ingress_route_match(route, issues)
+        issues.extend(_check_ingress_route_duplicate(seen_keys, listener, path, match))
     return issues
+
+
+def _check_ingress_route_identity(route: dict[str, Any], declared_client_ids: set[str]) -> list[str]:
+    issues: list[str] = []
+    if not str(route.get("id", "")).strip():
+        issues.append("every ingress_routes entry must have an id")
+    if route.get("client") and route["client"] not in declared_client_ids:
+        issues.append(f"ingress route {route.get('id')} references unknown client {route['client']!r}")
+    return issues
+
+
+def _check_ingress_route_service(
+    route: dict[str, Any],
+    service_ids: set[str],
+    services_by_id: dict[str, dict[str, Any]],
+) -> list[str]:
+    service_id = str(route.get("service_id") or "").strip()
+    if not service_id:
+        return [f"ingress route {route.get('id', '(missing id)')} is missing service_id"]
+    if service_id not in service_ids:
+        return [f"ingress route {route.get('id')} references unknown service {service_id!r}"]
+    if not _looks_like_ingress_origin(services_by_id[service_id].get("origin_url")):
+        return [
+            f"ingress route {route.get('id')} references service {service_id!r} without a valid origin_url"
+        ]
+    return []
+
+
+def _ingress_route_listener(route: dict[str, Any], issues: list[str]) -> str:
+    listener = str(route.get("listener") or "").strip().lower()
+    if listener not in VALID_INGRESS_ROUTE_LISTENERS:
+        issues.append(f"ingress route {route.get('id')} has unsupported listener {route.get('listener')!r}")
+    return listener
+
+
+def _ingress_route_path(route: dict[str, Any], issues: list[str]) -> str:
+    path = str(route.get("path") or "").strip()
+    if not path:
+        issues.append(f"ingress route {route.get('id', '(missing id)')} is missing path")
+    elif not path.startswith("/"):
+        issues.append(f"ingress route {route.get('id')} path must start with '/'")
+    return path
+
+
+def _ingress_route_match(route: dict[str, Any], issues: list[str]) -> str:
+    match = str(route.get("match") or "exact").strip().lower()
+    if match not in VALID_INGRESS_ROUTE_MATCHES:
+        issues.append(f"ingress route {route.get('id')} has unsupported match {route.get('match')!r}")
+    return match
+
+
+def _check_ingress_route_duplicate(
+    seen_keys: set[tuple[str, str, str]],
+    listener: str,
+    path: str,
+    match: str,
+) -> list[str]:
+    if not path:
+        return []
+    conflict_key = (listener or "public", path, match or "exact")
+    if conflict_key in seen_keys:
+        seen_keys.add(conflict_key)
+        return [
+            "ingress routes contain duplicate listener/path/match: "
+            f"{listener or 'public'} {path} ({match or 'exact'})"
+        ]
+    seen_keys.add(conflict_key)
+    return []
 
 
 def _check_log_entries(model: dict[str, Any], declared_client_ids: set[str]) -> list[str]:
@@ -1653,6 +1970,168 @@ def validate_connector_contract(model: dict[str, Any]) -> list[CheckResult]:
     ]
 
 
+def _declared_model_ids(model: dict[str, Any], key: str) -> set[str]:
+    return {
+        str(item.get("id", "")).strip()
+        for item in model.get(key) or []
+        if str(item.get("id", "")).strip()
+    }
+
+
+def _parity_ledger_graph_ids(model: dict[str, Any]) -> tuple[set[str], set[str], set[str]]:
+    return (
+        _declared_model_ids(model, "bridges"),
+        _declared_model_ids(model, "tasks"),
+        _declared_model_ids(model, "services"),
+    )
+
+
+def _parity_ledger_item_values(item: dict[str, Any]) -> tuple[str, str, str, Any, str, str, bool]:
+    item_id = str(item.get("id", "")).strip() or "(missing id)"
+    action = str(item.get("action", "")).strip()
+    ownership_state = str(item.get("ownership_state", "")).strip()
+    bridge_dependency = item.get("bridge_dependency")
+    request_error_raw = item.get("request_error")
+    request_error = str(request_error_raw).strip() if request_error_raw is not None else ""
+    surface = str(item.get("legacy_surface", "")).strip() or item_id
+    surface_type = str(item.get("surface_type", "service")).strip() or "service"
+    return item_id, action, ownership_state, bridge_dependency, request_error, surface, surface_type == "service"
+
+
+def _parity_enum_issues(
+    item_id: str,
+    *,
+    action: str,
+    ownership_state: str,
+    request_error: str,
+) -> list[str]:
+    issues: list[str] = []
+    if action and action not in PARITY_LEDGER_ACTIONS:
+        issues.append(f"parity_ledger {item_id}: unsupported action {action!r}")
+    if ownership_state and ownership_state not in PARITY_OWNERSHIP_STATES:
+        issues.append(f"parity_ledger {item_id}: unsupported ownership_state {ownership_state!r}")
+    if request_error and request_error not in LOCAL_RUNTIME_ERROR_CODES:
+        issues.append(
+            f"parity_ledger {item_id}: request_error {request_error!r} is not one of "
+            f"the stable error codes"
+        )
+    return issues
+
+
+def _parity_bridge_dependency_issues(
+    item_id: str,
+    bridge_dependency: Any,
+    *,
+    bridge_ids: set[str],
+    task_ids: set[str],
+) -> list[str]:
+    if bridge_dependency is None or not str(bridge_dependency).strip():
+        return []
+
+    dep_id = str(bridge_dependency).strip()
+    if dep_id in task_ids and dep_id not in bridge_ids:
+        return [
+            f"parity_ledger {item_id}: bridge_dependency {dep_id!r} refers to a "
+            f"bootstrap_task id; only legacy_env_bridge ids are allowed"
+        ]
+    if dep_id not in bridge_ids:
+        return [
+            f"parity_ledger {item_id}: bridge_dependency {dep_id!r} is not a "
+            f"declared legacy_env_bridge"
+        ]
+    return []
+
+
+def _covered_parity_service_issues(
+    item_id: str,
+    surface: str,
+    *,
+    service_ids: set[str],
+) -> list[str]:
+    if not item_id or not service_ids or item_id in service_ids or surface in service_ids:
+        return []
+    return [
+        f"parity_ledger {item_id}: ownership_state is 'covered' but no "
+        f"managed_service with that id is declared"
+    ]
+
+
+def _deferred_parity_service_issues(
+    item_id: str,
+    ownership_state: str,
+    *,
+    service_ids: set[str],
+) -> list[str]:
+    if not item_id or item_id not in service_ids:
+        return []
+    return [
+        f"parity_ledger {item_id}: ownership_state is {ownership_state!r} "
+        f"but a managed_service with that id is declared"
+    ]
+
+
+def _parity_service_cross_reference(
+    *,
+    item_id: str,
+    ownership_state: str,
+    surface: str,
+    is_service_row: bool,
+    service_ids: set[str],
+) -> tuple[list[str], str | None, str | None]:
+    if not is_service_row:
+        return [], None, None
+    if ownership_state == "covered":
+        return _covered_parity_service_issues(item_id, surface, service_ids=service_ids), surface, None
+    if ownership_state in ("deferred", "bridge-only"):
+        return _deferred_parity_service_issues(
+            item_id,
+            ownership_state,
+            service_ids=service_ids,
+        ), None, surface
+    return [], None, None
+
+
+def _parity_ledger_item_result(
+    item: dict[str, Any],
+    *,
+    bridge_ids: set[str],
+    task_ids: set[str],
+    service_ids: set[str],
+) -> tuple[list[str], str | None, str | None]:
+    (
+        item_id,
+        action,
+        ownership_state,
+        bridge_dependency,
+        request_error,
+        surface,
+        is_service_row,
+    ) = _parity_ledger_item_values(item)
+    issues = _parity_enum_issues(
+        item_id,
+        action=action,
+        ownership_state=ownership_state,
+        request_error=request_error,
+    )
+    issues.extend(
+        _parity_bridge_dependency_issues(
+            item_id,
+            bridge_dependency,
+            bridge_ids=bridge_ids,
+            task_ids=task_ids,
+        )
+    )
+    service_issues, covered_service, deferred_surface = _parity_service_cross_reference(
+        item_id=item_id,
+        ownership_state=ownership_state,
+        surface=surface,
+        is_service_row=is_service_row,
+        service_ids=service_ids,
+    )
+    issues.extend(service_issues)
+    return issues, covered_service, deferred_surface
+
+
 def validate_parity_ledger(model: dict[str, Any]) -> list[CheckResult]:
     """Detect drift between the runtime graph and the declared parity ledger.
 
@@ -1685,88 +2164,23 @@ def validate_parity_ledger(model: dict[str, Any]) -> list[CheckResult]:
             )
         ]
 
-    bridge_ids = {
-        str(bridge.get("id", "")).strip()
-        for bridge in model.get("bridges") or []
-        if str(bridge.get("id", "")).strip()
-    }
-    task_ids = {
-        str(task.get("id", "")).strip()
-        for task in model.get("tasks") or []
-        if str(task.get("id", "")).strip()
-    }
-    service_ids = {
-        str(service.get("id", "")).strip()
-        for service in model.get("services") or []
-        if str(service.get("id", "")).strip()
-    }
-
+    bridge_ids, task_ids, service_ids = _parity_ledger_graph_ids(model)
     issues: list[str] = []
     covered_services: list[str] = []
     deferred_surfaces: list[str] = []
 
     for item in ledger:
-        item_id = str(item.get("id", "")).strip() or "(missing id)"
-        action = str(item.get("action", "")).strip()
-        ownership_state = str(item.get("ownership_state", "")).strip()
-        bridge_dependency = item.get("bridge_dependency")
-        request_error_raw = item.get("request_error")
-        request_error = str(request_error_raw).strip() if request_error_raw is not None else ""
-        surface = str(item.get("legacy_surface", "")).strip() or item_id
-        # Only rows that represent an actual managed_service participate in the
-        # cross-reference checks against the service graph. Non-service rows
-        # (flag, helper, env_target, bridge, ...) describe legacy surfaces that
-        # are intentionally not modelled as services — e.g. the
-        # ``legacy-mode-selector`` flag row records that the runtime ``--mode``
-        # argument has replaced the legacy ``db=`` selector. Missing
-        # ``surface_type`` defaults to ``"service"`` so pre-existing overlays
-        # that never declared the field keep their stricter check.
-        surface_type = str(item.get("surface_type", "service")).strip() or "service"
-        is_service_row = surface_type == "service"
-
-        if action and action not in PARITY_LEDGER_ACTIONS:
-            issues.append(
-                f"parity_ledger {item_id}: unsupported action {action!r}"
-            )
-        if ownership_state and ownership_state not in PARITY_OWNERSHIP_STATES:
-            issues.append(
-                f"parity_ledger {item_id}: unsupported ownership_state {ownership_state!r}"
-            )
-        if request_error and request_error not in LOCAL_RUNTIME_ERROR_CODES:
-            issues.append(
-                f"parity_ledger {item_id}: request_error {request_error!r} is not one of "
-                f"the stable error codes"
-            )
-
-        if bridge_dependency is not None and str(bridge_dependency).strip():
-            dep_id = str(bridge_dependency).strip()
-            if dep_id in task_ids and dep_id not in bridge_ids:
-                issues.append(
-                    f"parity_ledger {item_id}: bridge_dependency {dep_id!r} refers to a "
-                    f"bootstrap_task id; only legacy_env_bridge ids are allowed"
-                )
-            elif dep_id not in bridge_ids:
-                issues.append(
-                    f"parity_ledger {item_id}: bridge_dependency {dep_id!r} is not a "
-                    f"declared legacy_env_bridge"
-                )
-
-        if ownership_state == "covered":
-            if is_service_row:
-                covered_services.append(surface)
-                if item_id and service_ids and item_id not in service_ids and surface not in service_ids:
-                    issues.append(
-                        f"parity_ledger {item_id}: ownership_state is 'covered' but no "
-                        f"managed_service with that id is declared"
-                    )
-        elif ownership_state in ("deferred", "bridge-only"):
-            if is_service_row:
-                deferred_surfaces.append(surface)
-                if item_id and item_id in service_ids:
-                    issues.append(
-                        f"parity_ledger {item_id}: ownership_state is {ownership_state!r} "
-                        f"but a managed_service with that id is declared"
-                    )
+        item_issues, covered_service, deferred_surface = _parity_ledger_item_result(
+            item,
+            bridge_ids=bridge_ids,
+            task_ids=task_ids,
+            service_ids=service_ids,
+        )
+        issues.extend(item_issues)
+        if covered_service is not None:
+            covered_services.append(covered_service)
+        if deferred_surface is not None:
+            deferred_surfaces.append(deferred_surface)
 
     if issues:
         return [

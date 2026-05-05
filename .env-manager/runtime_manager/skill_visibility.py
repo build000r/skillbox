@@ -170,6 +170,51 @@ def _load_lock_records(lock_path: Path) -> tuple[dict[str, dict[str, Any]], str 
     return records, None
 
 
+def _skill_repo_declared_source(entry: dict[str, Any], config_path: Path) -> tuple[str, str]:
+    if entry.get("repo"):
+        return "repo", str(entry["repo"])
+    if entry.get("path"):
+        raw_source = str(entry["path"])
+        source_path = Path(os.path.expandvars(os.path.expanduser(raw_source)))
+        if not source_path.is_absolute():
+            source_path = (config_path.parent / source_path).resolve()
+        return "path", str(source_path)
+    if entry.get("distributor"):
+        return "distributor", str(entry["distributor"])
+    return "unknown", ""
+
+
+def _skill_repo_declared_names(entry: dict[str, Any], source_kind: str, source: str) -> list[str]:
+    pick = entry.get("pick")
+    if isinstance(pick, list) and pick:
+        return [str(item) for item in pick if str(item).strip()]
+    if source_kind == "repo" and source:
+        return [source.split("/")[-1]]
+    if source_kind == "path" and source:
+        return [Path(source).name]
+    return []
+
+
+def _declared_skill_repo_entries(
+    entry: dict[str, Any],
+    *,
+    config_path: Path,
+    index: int,
+) -> list[dict[str, Any]]:
+    source_kind, source = _skill_repo_declared_source(entry, config_path)
+    declared_ref = entry.get("ref")
+    return [
+        {
+            "name": name,
+            "source_kind": source_kind,
+            "source": source,
+            "declared_ref": declared_ref,
+            "config_index": index,
+        }
+        for name in _skill_repo_declared_names(entry, source_kind, source)
+    ]
+
+
 def _declared_entries_from_config(
     skillset: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], str | None]:
@@ -183,42 +228,7 @@ def _declared_entries_from_config(
     for index, entry in enumerate(config.get("skill_repos") or []):
         if not isinstance(entry, dict):
             continue
-        source_kind = "unknown"
-        source = ""
-        declared_ref = entry.get("ref")
-        if entry.get("repo"):
-            source_kind = "repo"
-            source = str(entry["repo"])
-        elif entry.get("path"):
-            source_kind = "path"
-            raw_source = str(entry["path"])
-            source_path = Path(os.path.expandvars(os.path.expanduser(raw_source)))
-            if not source_path.is_absolute():
-                source_path = (config_path.parent / source_path).resolve()
-            source = str(source_path)
-        elif entry.get("distributor"):
-            source_kind = "distributor"
-            source = str(entry["distributor"])
-
-        pick = entry.get("pick")
-        names: list[str]
-        if isinstance(pick, list) and pick:
-            names = [str(item) for item in pick if str(item).strip()]
-        elif source_kind == "repo" and source:
-            names = [source.split("/")[-1]]
-        elif source_kind == "path" and source:
-            names = [Path(source).name]
-        else:
-            names = []
-
-        for name in names:
-            declared.append({
-                "name": name,
-                "source_kind": source_kind,
-                "source": source,
-                "declared_ref": declared_ref,
-                "config_index": index,
-            })
+        declared.extend(_declared_skill_repo_entries(entry, config_path=config_path, index=index))
     return declared, None
 
 
@@ -579,62 +589,96 @@ def _matched_project_categories(model: dict[str, Any], cwd: Path) -> list[dict[s
     return sorted(matches, key=lambda item: (-len(str(item.get("match") or "")), item["id"]))
 
 
+def _policy_categories_by_id(policy: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(category.get("id")): category
+        for category in _project_categories_for_policy(policy)
+    }
+
+
+def _scope_rule_patterns(raw_rule: dict[str, Any]) -> list[str]:
+    raw_patterns = raw_rule.get("skills") or raw_rule.get("patterns") or raw_rule.get("names") or []
+    return [str(item).strip() for item in raw_patterns if str(item).strip()]
+
+
+def _scope_rule_category_ids(raw_rule: dict[str, Any]) -> list[str]:
+    return [
+        str(item).strip()
+        for item in _as_list(raw_rule.get("categories") or raw_rule.get("project_categories"))
+        if str(item).strip()
+    ]
+
+
+def _scope_rule_direct_paths(raw_rule: dict[str, Any]) -> list[str]:
+    raw_paths = [
+        item
+        for item in _as_list(raw_rule.get("paths") or raw_rule.get("allowed_paths"))
+        if str(item).strip()
+    ]
+    return [_expand_policy_path(item) for item in raw_paths]
+
+
+def _scope_rule_paths(
+    raw_rule: dict[str, Any],
+    categories: dict[str, dict[str, Any]],
+) -> tuple[list[str], list[str], list[str]]:
+    category_ids = _scope_rule_category_ids(raw_rule)
+    paths = _scope_rule_direct_paths(raw_rule)
+    unknown_categories: list[str] = []
+    for category_id in category_ids:
+        category = categories.get(category_id)
+        if not category:
+            unknown_categories.append(category_id)
+            continue
+        paths.extend(str(path) for path in category.get("paths") or [])
+    return sorted(set(paths)), category_ids, unknown_categories
+
+
+def _scope_rule_from_raw(
+    raw_rule: dict[str, Any],
+    *,
+    index: int,
+    policy: dict[str, Any],
+    categories: dict[str, dict[str, Any]],
+    overlays_on: set[str],
+) -> dict[str, Any] | None:
+    overlay = str(raw_rule.get("overlay") or "").strip()
+    if overlay and overlay not in overlays_on:
+        return None
+    patterns = _scope_rule_patterns(raw_rule)
+    if not patterns:
+        return None
+    paths, category_ids, unknown_categories = _scope_rule_paths(raw_rule, categories)
+    return {
+        "id": str(raw_rule.get("id") or f"rule-{index}"),
+        "patterns": patterns,
+        "paths": paths,
+        "categories": category_ids,
+        "unknown_categories": unknown_categories,
+        "allow_global": bool(raw_rule.get("allow_global", False)),
+        "notes": str(raw_rule.get("notes") or raw_rule.get("reason") or ""),
+        "overlay": overlay,
+        "policy_path": str(policy.get("_policy_path") or ""),
+    }
+
+
 def _scope_rules(model: dict[str, Any]) -> list[dict[str, Any]]:
     rules: list[dict[str, Any]] = []
     overlays_on = active_overlays()
     for policy in _operator_scope_policies(model):
-        categories = {
-            str(category.get("id")): category
-            for category in _project_categories_for_policy(policy)
-        }
+        categories = _policy_categories_by_id(policy)
         for index, raw_rule in enumerate(policy.get("rules") or []):
             if not isinstance(raw_rule, dict):
                 continue
-            overlay = str(raw_rule.get("overlay") or "").strip()
-            if overlay and overlay not in overlays_on:
-                continue
-            patterns = [
-                str(item).strip()
-                for item in (
-                    raw_rule.get("skills")
-                    or raw_rule.get("patterns")
-                    or raw_rule.get("names")
-                    or []
-                )
-                if str(item).strip()
-            ]
-            if not patterns:
-                continue
-            category_ids = [
-                str(item).strip()
-                for item in _as_list(raw_rule.get("categories") or raw_rule.get("project_categories"))
-                if str(item).strip()
-            ]
-            raw_paths = [
-                item
-                for item in _as_list(raw_rule.get("paths") or raw_rule.get("allowed_paths"))
-                if str(item).strip()
-            ]
-            paths = [_expand_policy_path(item) for item in raw_paths]
-            unknown_categories: list[str] = []
-            for category_id in category_ids:
-                category = categories.get(category_id)
-                if not category:
-                    unknown_categories.append(category_id)
-                    continue
-                paths.extend(str(path) for path in category.get("paths") or [])
-            paths = sorted(set(paths))
-            rules.append({
-                "id": str(raw_rule.get("id") or f"rule-{index}"),
-                "patterns": patterns,
-                "paths": paths,
-                "categories": category_ids,
-                "unknown_categories": unknown_categories,
-                "allow_global": bool(raw_rule.get("allow_global", False)),
-                "notes": str(raw_rule.get("notes") or raw_rule.get("reason") or ""),
-                "overlay": overlay,
-                "policy_path": str(policy.get("_policy_path") or ""),
-            })
+            rule = _scope_rule_from_raw(
+                raw_rule,
+                index=index,
+                policy=policy,
+                categories=categories,
+                overlays_on=overlays_on,
+            )
+            if rule is not None:
+                rules.append(rule)
     return rules
 
 
@@ -1156,6 +1200,261 @@ def _activation_packet(
     }, None
 
 
+def _require_lifecycle_skill_name(action: str, skill_name: str | None) -> str:
+    if not skill_name:
+        raise RuntimeError(f"`skill {action}` requires a skill name.")
+    return skill_name
+
+
+def _skill_blocked_reason(
+    model: dict[str, Any],
+    skill_name: str,
+    resolved_to: str,
+    force: bool,
+) -> str:
+    if resolved_to == "global" and not _global_install_allowed(model, skill_name) and not force:
+        return "global install is not allowed by skill-scope policy"
+    return ""
+
+
+def _skill_link_actions_for_bases(
+    skill_name: str,
+    source_record: dict[str, Any],
+    bases: list[dict[str, Any]],
+    blocked_reason: str,
+) -> list[dict[str, Any]]:
+    return [
+        _link_skill_action(skill_name, source_record, destination, blocked_reason=blocked_reason)
+        for destination in _skill_destinations_for_bases(skill_name, bases)
+    ]
+
+
+def _plan_primary_skill_links(
+    model: dict[str, Any],
+    action: str,
+    skill_name: str | None,
+    cwd_path: Path,
+    to: str,
+    categories: list[str],
+    source: str | None,
+    force: bool,
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], dict[str, Any] | None, str]:
+    if action not in {"plan", "add", "move", "activate"}:
+        return [], [], [], None, to
+    name = _require_lifecycle_skill_name(action, skill_name)
+    source_options = _skill_source_options(model, name, explicit_source=source)
+    selected_source = source_options[0] if source_options else None
+    if not selected_source:
+        return [], [f"No source directory found for skill {name!r}."], source_options, None, to
+
+    resolved_to, bases, warnings = _skill_destination_bases(
+        model,
+        name,
+        cwd=cwd_path,
+        to=to,
+        categories=categories,
+    )
+    blocked_reason = _skill_blocked_reason(model, name, resolved_to, force)
+    if blocked_reason:
+        warnings.append(blocked_reason)
+    actions = _skill_link_actions_for_bases(name, selected_source, bases, blocked_reason)
+    return actions, warnings, source_options, selected_source, resolved_to
+
+
+def _planned_link_destinations(actions: list[dict[str, Any]]) -> set[str]:
+    return {
+        str(item.get("destination") or "")
+        for item in actions
+        if item.get("op") == "link"
+    }
+
+
+def _plan_skill_removals(
+    model: dict[str, Any],
+    action: str,
+    skill_name: str | None,
+    cwd_path: Path,
+    from_scope: str,
+    existing_actions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if action not in {"remove", "move"}:
+        return []
+    name = _require_lifecycle_skill_name(action, skill_name)
+    destination_paths = _planned_link_destinations(existing_actions)
+    actions: list[dict[str, Any]] = []
+    for occurrence in _installed_occurrences_for_skill(model, name, cwd=cwd_path):
+        if not _scope_filter_matches(occurrence, from_scope):
+            continue
+        if action == "move" and str(occurrence.get("path") or "") in destination_paths:
+            continue
+        actions.append(_unlink_skill_action(
+            occurrence,
+            reason="move source cleanup" if action == "move" else "requested removal",
+        ))
+    return actions
+
+
+def _lifecycle_visibility(model: dict[str, Any], cwd_path: Path) -> dict[str, Any]:
+    return collect_skill_visibility(
+        model,
+        cwd=str(cwd_path),
+        include_global=True,
+        include_project=True,
+        include_sources=False,
+    )
+
+
+def _plan_skill_prune_actions(
+    visibility: dict[str, Any],
+    skill_name: str | None,
+) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+    issue_keys = ("scope_violations", "global_not_allowed", "extra_global", "broken_global", "broken_project")
+    for issue_key in issue_keys:
+        for item in (visibility.get("issues") or {}).get(issue_key) or []:
+            if skill_name and str(item.get("name") or "") != skill_name:
+                continue
+            if item.get("path"):
+                actions.append(_unlink_skill_action(item, reason=issue_key))
+    return actions
+
+
+def _sync_wanted_skill_names(visibility: dict[str, Any], skill_name: str | None) -> list[str]:
+    if skill_name:
+        return [skill_name]
+    return [
+        str(item.get("name") or "")
+        for item in (visibility.get("issues") or {}).get("missing_for_cwd") or []
+        if str(item.get("name") or "")
+    ]
+
+
+def _plan_one_skill_sync(
+    model: dict[str, Any],
+    wanted: str,
+    explicit_source: str | None,
+    cwd_path: Path,
+    to: str,
+    categories: list[str],
+    force: bool,
+) -> tuple[list[dict[str, Any]], list[str], str]:
+    options = _skill_source_options(model, wanted, explicit_source=explicit_source)
+    if not options:
+        return [], [f"No source directory found for skill {wanted!r}."], to
+    chosen = options[0]
+    sync_to, bases, warnings = _skill_destination_bases(
+        model,
+        wanted,
+        cwd=cwd_path,
+        to=to,
+        categories=categories,
+    )
+    blocked_reason = _skill_blocked_reason(model, wanted, sync_to, force)
+    if blocked_reason:
+        warnings.append(f"{wanted}: {blocked_reason}")
+    actions = _skill_link_actions_for_bases(wanted, chosen, bases, blocked_reason)
+    return actions, warnings, sync_to
+
+
+def _plan_skill_sync_actions(
+    model: dict[str, Any],
+    visibility: dict[str, Any],
+    skill_name: str | None,
+    cwd_path: Path,
+    to: str,
+    categories: list[str],
+    source: str | None,
+    force: bool,
+) -> tuple[list[dict[str, Any]], list[str], str]:
+    actions: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    resolved_to = to
+    for wanted in _sync_wanted_skill_names(visibility, skill_name):
+        explicit_source = source if wanted == skill_name else None
+        link_actions, link_warnings, sync_to = _plan_one_skill_sync(
+            model,
+            wanted,
+            explicit_source,
+            cwd_path,
+            to,
+            categories,
+            force,
+        )
+        actions.extend(link_actions)
+        warnings.extend(link_warnings)
+        resolved_to = sync_to if resolved_to == to else resolved_to
+    return actions, warnings, resolved_to
+
+
+def _lifecycle_needs_visibility(action: str, prune: bool) -> bool:
+    return action in {"sync", "prune"} or prune
+
+
+def _append_lifecycle_prune_actions(
+    actions: list[dict[str, Any]],
+    visibility: dict[str, Any],
+    *,
+    action: str,
+    skill_name: str | None,
+    prune: bool,
+) -> None:
+    if action == "prune" or (action == "sync" and prune):
+        actions.extend(_plan_skill_prune_actions(visibility, skill_name))
+
+
+def _append_lifecycle_sync_actions(
+    model: dict[str, Any],
+    actions: list[dict[str, Any]],
+    warnings: list[str],
+    visibility: dict[str, Any],
+    *,
+    action: str,
+    skill_name: str | None,
+    cwd_path: Path,
+    to: str,
+    categories: list[str],
+    source: str | None,
+    force: bool,
+    resolved_to: str,
+) -> str:
+    if action != "sync":
+        return resolved_to
+    sync_actions, sync_warnings, sync_to = _plan_skill_sync_actions(
+        model,
+        visibility,
+        skill_name,
+        cwd_path,
+        to,
+        categories,
+        source,
+        force,
+    )
+    actions.extend(sync_actions)
+    warnings.extend(sync_warnings)
+    return sync_to if resolved_to == to else resolved_to
+
+
+def _lifecycle_activation_packet_if_needed(
+    *,
+    action: str,
+    skill_name: str | None,
+    selected_source: dict[str, Any] | None,
+    actions: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if action == "activate" and skill_name and selected_source:
+        return _activation_packet(skill_name, selected_source, actions)
+    return None, None
+
+
+def _lifecycle_plan_summary(actions: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "actions": len(actions),
+        "link": sum(1 for item in actions if item.get("op") == "link"),
+        "unlink": sum(1 for item in actions if item.get("op") == "unlink"),
+        "blocked": sum(1 for item in actions if item.get("blocked_reason")),
+    }
+
+
 def skill_lifecycle_plan(
     model: dict[str, Any],
     action: str,
@@ -1171,120 +1470,50 @@ def skill_lifecycle_plan(
 ) -> dict[str, Any]:
     cwd_path = Path(cwd or os.getcwd()).resolve()
     categories = [item for item in (categories or []) if item]
-    warnings: list[str] = []
-    actions: list[dict[str, Any]] = []
-    source_options: list[dict[str, Any]] = []
-    selected_source: dict[str, Any] | None = None
-    resolved_to = to
+    actions, warnings, source_options, selected_source, resolved_to = _plan_primary_skill_links(
+        model,
+        action,
+        skill_name,
+        cwd_path,
+        to,
+        categories,
+        source,
+        force,
+    )
+    actions.extend(_plan_skill_removals(model, action, skill_name, cwd_path, from_scope, actions))
 
-    if action in {"plan", "add", "move", "activate"}:
-        if not skill_name:
-            raise RuntimeError(f"`skill {action}` requires a skill name.")
-        source_options = _skill_source_options(model, skill_name, explicit_source=source)
-        selected_source = source_options[0] if source_options else None
-        if not selected_source:
-            warnings.append(f"No source directory found for skill {skill_name!r}.")
-        else:
-            resolved_to, bases, destination_warnings = _skill_destination_bases(
-                model,
-                skill_name,
-                cwd=cwd_path,
-                to=to,
-                categories=categories,
-            )
-            warnings.extend(destination_warnings)
-            blocked_reason = ""
-            if resolved_to == "global" and not _global_install_allowed(model, skill_name) and not force:
-                blocked_reason = "global install is not allowed by skill-scope policy"
-                warnings.append(blocked_reason)
-            for destination in _skill_destinations_for_bases(skill_name, bases):
-                actions.append(_link_skill_action(
-                    skill_name,
-                    selected_source,
-                    destination,
-                    blocked_reason=blocked_reason,
-                ))
-
-    if action in {"remove", "move"}:
-        if not skill_name:
-            raise RuntimeError(f"`skill {action}` requires a skill name.")
-        destination_paths = {
-            str(item.get("destination") or "")
-            for item in actions
-            if item.get("op") == "link"
-        }
-        for occurrence in _installed_occurrences_for_skill(model, skill_name, cwd=cwd_path):
-            if not _scope_filter_matches(occurrence, from_scope):
-                continue
-            if action == "move" and str(occurrence.get("path") or "") in destination_paths:
-                continue
-            actions.append(_unlink_skill_action(
-                occurrence,
-                reason="move source cleanup" if action == "move" else "requested removal",
-            ))
-
-    if action == "prune" or (action == "sync" and prune):
-        visibility = collect_skill_visibility(
-            model,
-            cwd=str(cwd_path),
-            include_global=True,
-            include_project=True,
-            include_sources=False,
-        )
-        for issue_key in ("scope_violations", "global_not_allowed", "extra_global", "broken_global", "broken_project"):
-            for item in (visibility.get("issues") or {}).get(issue_key) or []:
-                if skill_name and str(item.get("name") or "") != skill_name:
-                    continue
-                if not item.get("path"):
-                    continue
-                actions.append(_unlink_skill_action(item, reason=issue_key))
-
-    if action == "sync":
-        visibility = collect_skill_visibility(
-            model,
-            cwd=str(cwd_path),
-            include_global=True,
-            include_project=True,
-            include_sources=False,
-        )
-        wanted_names = [skill_name] if skill_name else [
-            str(item.get("name") or "")
-            for item in (visibility.get("issues") or {}).get("missing_for_cwd") or []
-            if str(item.get("name") or "")
-        ]
-        for wanted in wanted_names:
-            options = _skill_source_options(model, wanted, explicit_source=source if wanted == skill_name else None)
-            if not options:
-                warnings.append(f"No source directory found for skill {wanted!r}.")
-                continue
-            chosen = options[0]
-            sync_to, bases, destination_warnings = _skill_destination_bases(
-                model,
-                wanted,
-                cwd=cwd_path,
-                to=to,
-                categories=categories,
-            )
-            warnings.extend(destination_warnings)
-            resolved_to = sync_to if resolved_to == to else resolved_to
-            blocked_reason = ""
-            if sync_to == "global" and not _global_install_allowed(model, wanted) and not force:
-                blocked_reason = "global install is not allowed by skill-scope policy"
-                warnings.append(f"{wanted}: {blocked_reason}")
-            for destination in _skill_destinations_for_bases(wanted, bases):
-                actions.append(_link_skill_action(
-                    wanted,
-                    chosen,
-                    destination,
-                    blocked_reason=blocked_reason,
-                ))
+    visibility = _lifecycle_visibility(model, cwd_path) if _lifecycle_needs_visibility(action, prune) else {}
+    _append_lifecycle_prune_actions(
+        actions,
+        visibility,
+        action=action,
+        skill_name=skill_name,
+        prune=prune,
+    )
+    resolved_to = _append_lifecycle_sync_actions(
+        model,
+        actions,
+        warnings,
+        visibility,
+        action=action,
+        skill_name=skill_name,
+        cwd_path=cwd_path,
+        to=to,
+        categories=categories,
+        source=source,
+        force=force,
+        resolved_to=resolved_to,
+    )
 
     actions = _dedupe_actions(actions)
-    activation_packet = None
-    if action == "activate" and skill_name and selected_source:
-        activation_packet, packet_warning = _activation_packet(skill_name, selected_source, actions)
-        if packet_warning:
-            warnings.append(packet_warning)
+    activation_packet, packet_warning = _lifecycle_activation_packet_if_needed(
+        action=action,
+        skill_name=skill_name,
+        selected_source=selected_source,
+        actions=actions,
+    )
+    if packet_warning:
+        warnings.append(packet_warning)
     return {
         "action": action,
         "skill": skill_name,
@@ -1298,13 +1527,132 @@ def skill_lifecycle_plan(
         "activation_packet": activation_packet,
         "warnings": warnings,
         "actions": actions,
-        "summary": {
-            "actions": len(actions),
-            "link": sum(1 for item in actions if item.get("op") == "link"),
-            "unlink": sum(1 for item in actions if item.get("op") == "unlink"),
-            "blocked": sum(1 for item in actions if item.get("blocked_reason")),
-        },
+        "summary": _lifecycle_plan_summary(actions),
     }
+
+
+def _apply_lifecycle_link(
+    action: dict[str, Any],
+    destination: Path,
+    *,
+    dry_run: bool,
+    allow_directories: bool,
+    force: bool,
+) -> None:
+    repo_path = action.get("repo_path")
+    if repo_path and not Path(str(repo_path)).is_dir():
+        action["status"] = "would_skip_missing_repo" if dry_run else "skipped_missing_repo"
+        return
+    source = Path(str(action.get("source") or "")).resolve()
+    if dry_run:
+        action["status"] = "ok" if action.get("existing", {}).get("state") == "same_link" else "would_link"
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if os.path.lexists(destination) and not _prepare_lifecycle_link_destination(
+        action,
+        destination,
+        source,
+        allow_directories=allow_directories,
+        force=force,
+    ):
+        return
+    destination.symlink_to(source, target_is_directory=True)
+    action["status"] = "linked"
+
+
+def _prepare_lifecycle_link_destination(
+    action: dict[str, Any],
+    destination: Path,
+    source: Path,
+    *,
+    allow_directories: bool,
+    force: bool,
+) -> bool:
+    if destination.is_symlink() or destination.is_file():
+        if destination.is_symlink() and os.path.realpath(destination) == str(source):
+            action["status"] = "ok"
+            return False
+        if not force and not destination.is_symlink():
+            action["status"] = "conflict_file"
+            return False
+        destination.unlink()
+        return True
+    if destination.is_dir():
+        if not (force and allow_directories):
+            action["status"] = "conflict_directory"
+            return False
+        shutil.rmtree(destination)
+    return True
+
+
+def _apply_lifecycle_unlink(
+    action: dict[str, Any],
+    destination: Path,
+    *,
+    dry_run: bool,
+    allow_directories: bool,
+) -> None:
+    if dry_run:
+        action["status"] = "would_unlink" if os.path.lexists(destination) else "missing"
+        return
+    if not os.path.lexists(destination):
+        action["status"] = "missing"
+    elif destination.is_symlink() or destination.is_file():
+        destination.unlink()
+        action["status"] = "unlinked"
+    elif destination.is_dir():
+        if not allow_directories:
+            action["status"] = "skipped_directory"
+        else:
+            shutil.rmtree(destination)
+            action["status"] = "removed_directory"
+    else:
+        action["status"] = "skipped_unknown"
+
+
+def _apply_lifecycle_action(
+    action: dict[str, Any],
+    *,
+    dry_run: bool,
+    allow_directories: bool,
+    force: bool,
+) -> None:
+    destination = Path(str(action.get("destination") or ""))
+    if action.get("blocked_reason"):
+        action["status"] = "blocked"
+    elif action.get("op") == "link":
+        _apply_lifecycle_link(
+            action,
+            destination,
+            dry_run=dry_run,
+            allow_directories=allow_directories,
+            force=force,
+        )
+    elif action.get("op") == "unlink":
+        _apply_lifecycle_unlink(
+            action,
+            destination,
+            dry_run=dry_run,
+            allow_directories=allow_directories,
+        )
+
+
+def _summarize_applied_lifecycle_plan(plan: dict[str, Any], dry_run: bool) -> None:
+    actions = plan.get("actions") or []
+
+    plan["dry_run"] = dry_run
+    plan["summary"]["applied"] = 0 if dry_run else sum(
+        1 for item in actions
+        if item.get("status") in {"linked", "unlinked", "removed_directory"}
+    )
+    plan["summary"]["unchanged"] = sum(
+        1 for item in actions
+        if item.get("status") == "ok"
+    )
+    plan["summary"]["skipped"] = sum(
+        1 for item in actions
+        if str(item.get("status") or "").startswith(("skipped", "conflict", "blocked"))
+    )
 
 
 def apply_skill_lifecycle_plan(
@@ -1315,69 +1663,13 @@ def apply_skill_lifecycle_plan(
     force: bool = False,
 ) -> dict[str, Any]:
     for action in plan.get("actions") or []:
-        destination = Path(str(action.get("destination") or ""))
-        if action.get("blocked_reason"):
-            action["status"] = "blocked"
-            continue
-        if action.get("op") == "link":
-            repo_path = action.get("repo_path")
-            if repo_path and not Path(str(repo_path)).is_dir():
-                action["status"] = "would_skip_missing_repo" if dry_run else "skipped_missing_repo"
-                continue
-            source = Path(str(action.get("source") or "")).resolve()
-            if dry_run:
-                action["status"] = "ok" if action.get("existing", {}).get("state") == "same_link" else "would_link"
-                continue
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if os.path.lexists(destination):
-                if destination.is_symlink() or destination.is_file():
-                    if destination.is_symlink() and os.path.realpath(destination) == str(source):
-                        action["status"] = "ok"
-                        continue
-                    if not force and not destination.is_symlink():
-                        action["status"] = "conflict_file"
-                        continue
-                    destination.unlink()
-                elif destination.is_dir():
-                    if not (force and allow_directories):
-                        action["status"] = "conflict_directory"
-                        continue
-                    shutil.rmtree(destination)
-            destination.symlink_to(source, target_is_directory=True)
-            action["status"] = "linked"
-            continue
-
-        if action.get("op") == "unlink":
-            if dry_run:
-                action["status"] = "would_unlink" if os.path.lexists(destination) else "missing"
-                continue
-            if not os.path.lexists(destination):
-                action["status"] = "missing"
-            elif destination.is_symlink() or destination.is_file():
-                destination.unlink()
-                action["status"] = "unlinked"
-            elif destination.is_dir():
-                if not allow_directories:
-                    action["status"] = "skipped_directory"
-                else:
-                    shutil.rmtree(destination)
-                    action["status"] = "removed_directory"
-            else:
-                action["status"] = "skipped_unknown"
-
-    plan["dry_run"] = dry_run
-    plan["summary"]["applied"] = 0 if dry_run else sum(
-        1 for item in plan.get("actions") or []
-        if item.get("status") in {"linked", "unlinked", "removed_directory"}
-    )
-    plan["summary"]["unchanged"] = sum(
-        1 for item in plan.get("actions") or []
-        if item.get("status") == "ok"
-    )
-    plan["summary"]["skipped"] = sum(
-        1 for item in plan.get("actions") or []
-        if str(item.get("status") or "").startswith(("skipped", "conflict", "blocked"))
-    )
+        _apply_lifecycle_action(
+            action,
+            dry_run=dry_run,
+            allow_directories=allow_directories,
+            force=force,
+        )
+    _summarize_applied_lifecycle_plan(plan, dry_run)
     return plan
 
 
@@ -1431,6 +1723,93 @@ def _declared_source_bucket(source_kind: str, source: str) -> str:
     return _source_bucket(source)
 
 
+def _declared_entry_from_lock(name: str, lock_record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": name,
+        "source_kind": "repo" if lock_record.get("repo") else "path",
+        "source": str(lock_record.get("repo") or lock_record.get("source_path") or ""),
+        "declared_ref": lock_record.get("declared_ref"),
+        "config_index": None,
+    }
+
+
+def _declared_skill_occurrence(
+    skillset: dict[str, Any],
+    layer: dict[str, Any],
+    name: str,
+    declared_entry: dict[str, Any],
+    lock_record: dict[str, Any],
+) -> dict[str, Any]:
+    source = str(
+        declared_entry.get("source")
+        or lock_record.get("repo")
+        or lock_record.get("source_path")
+        or ""
+    )
+    source_kind = str(declared_entry.get("source_kind") or "unknown")
+    return {
+        "name": name,
+        "availability": "declared",
+        "layer": layer["id"],
+        "layer_label": layer["label"],
+        "layer_rank": layer["rank"],
+        "scope": layer["scope"],
+        "skillset_id": str(skillset.get("id", "")),
+        "source_kind": source_kind,
+        "source": source,
+        "source_bucket": _declared_source_bucket(source_kind, source),
+        "declared_ref": declared_entry.get("declared_ref") or lock_record.get("declared_ref"),
+        "resolved_commit": lock_record.get("resolved_commit"),
+        "targets": _target_states_for_skill(skillset, name, lock_record),
+        "state": "declared",
+    }
+
+
+def _declared_target_counts(
+    occurrences: list[dict[str, Any]],
+    skillset_id: str,
+) -> tuple[int, int]:
+    target_count = 0
+    healthy_targets = 0
+    for occurrence in occurrences:
+        if occurrence.get("skillset_id") != skillset_id:
+            continue
+        for target in occurrence.get("targets") or []:
+            target_count += 1
+            if target.get("state") in {"ok", "present"}:
+                healthy_targets += 1
+    return target_count, healthy_targets
+
+
+def _declared_layer_summary(
+    skillset: dict[str, Any],
+    layer: dict[str, Any],
+    lock_path: Path,
+    lock_error: str | None,
+    config_error: str | None,
+    declared_by_name: dict[str, dict[str, Any]],
+    occurrences: list[dict[str, Any]],
+) -> dict[str, Any]:
+    skillset_id = str(skillset.get("id", ""))
+    target_count, healthy_targets = _declared_target_counts(occurrences, skillset_id)
+    return {
+        "id": layer["id"],
+        "label": layer["label"],
+        "rank": layer["rank"],
+        "scope": layer["scope"],
+        "kind": "declared",
+        "skillset_id": skillset_id,
+        "config_path": str(skillset.get("skill_repos_config_host_path", "")),
+        "lock_path": str(lock_path),
+        "lock_present": lock_path.is_file(),
+        "lock_error": lock_error,
+        "config_error": config_error,
+        "skill_count": len(declared_by_name),
+        "healthy_targets": healthy_targets,
+        "target_count": target_count,
+    }
+
+
 def _declared_skill_occurrences(model: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     occurrences: list[dict[str, Any]] = []
     layer_summaries: list[dict[str, Any]] = []
@@ -1445,69 +1824,25 @@ def _declared_skill_occurrences(model: dict[str, Any]) -> tuple[list[dict[str, A
         declared_by_name = {entry["name"]: entry for entry in declared}
 
         for name, lock_record in lock_records.items():
-            declared_by_name.setdefault(name, {
-                "name": name,
-                "source_kind": "repo" if lock_record.get("repo") else "path",
-                "source": str(lock_record.get("repo") or lock_record.get("source_path") or ""),
-                "declared_ref": lock_record.get("declared_ref"),
-                "config_index": None,
-            })
+            declared_by_name.setdefault(name, _declared_entry_from_lock(name, lock_record))
 
         for name, declared_entry in sorted(declared_by_name.items()):
             lock_record = lock_records.get(name, {})
-            source = str(
-                declared_entry.get("source")
-                or lock_record.get("repo")
-                or lock_record.get("source_path")
-                or ""
+            occurrences.append(
+                _declared_skill_occurrence(skillset, layer, name, declared_entry, lock_record)
             )
-            occurrence = {
-                "name": name,
-                "availability": "declared",
-                "layer": layer["id"],
-                "layer_label": layer["label"],
-                "layer_rank": layer["rank"],
-                "scope": layer["scope"],
-                "skillset_id": str(skillset.get("id", "")),
-                "source_kind": declared_entry.get("source_kind") or "unknown",
-                "source": source,
-                "source_bucket": _declared_source_bucket(
-                    str(declared_entry.get("source_kind") or "unknown"),
-                    source,
-                ),
-                "declared_ref": declared_entry.get("declared_ref") or lock_record.get("declared_ref"),
-                "resolved_commit": lock_record.get("resolved_commit"),
-                "targets": _target_states_for_skill(skillset, name, lock_record),
-                "state": "declared",
-            }
-            occurrences.append(occurrence)
 
-        target_count = 0
-        healthy_targets = 0
-        for occurrence in occurrences:
-            if occurrence.get("skillset_id") != str(skillset.get("id", "")):
-                continue
-            for target in occurrence.get("targets") or []:
-                target_count += 1
-                if target.get("state") in {"ok", "present"}:
-                    healthy_targets += 1
-
-        layer_summaries.append({
-            "id": layer["id"],
-            "label": layer["label"],
-            "rank": layer["rank"],
-            "scope": layer["scope"],
-            "kind": "declared",
-            "skillset_id": str(skillset.get("id", "")),
-            "config_path": str(skillset.get("skill_repos_config_host_path", "")),
-            "lock_path": str(lock_path),
-            "lock_present": lock_path.is_file(),
-            "lock_error": lock_error,
-            "config_error": config_error,
-            "skill_count": len(declared_by_name),
-            "healthy_targets": healthy_targets,
-            "target_count": target_count,
-        })
+        layer_summaries.append(
+            _declared_layer_summary(
+                skillset,
+                layer,
+                lock_path,
+                lock_error,
+                config_error,
+                declared_by_name,
+                occurrences,
+            )
+        )
 
     return occurrences, layer_summaries
 
@@ -1915,6 +2250,147 @@ def _effective_occurrences(occurrences: list[dict[str, Any]]) -> tuple[list[dict
     return sorted(effective, key=lambda item: str(item.get("name", ""))), shadowed
 
 
+def _collect_installed_visibility_layers(
+    cwd_path: Path,
+    *,
+    include_global: bool,
+    include_project: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    occurrences: list[dict[str, Any]] = []
+    layers: list[dict[str, Any]] = []
+    if include_global:
+        for surface, root in _default_global_roots():
+            installed, summary = _scan_installed_root(
+                root,
+                layer=f"global:{surface}",
+                label=f"global {surface}",
+                rank=GLOBAL_LAYER_RANK,
+            )
+            occurrences.extend(installed)
+            layers.append(summary)
+    if include_project:
+        for surface, root in _project_skill_roots(cwd_path):
+            installed, summary = _scan_installed_root(
+                root,
+                layer=f"project:{surface}:{root.parent.parent}",
+                label=f"project {surface}",
+                rank=PROJECT_LAYER_RANK,
+            )
+            occurrences.extend(installed)
+            layers.append(summary)
+    return occurrences, layers
+
+
+def _visibility_installed_by_layer(
+    occurrences: list[dict[str, Any]],
+    layer_prefix: str,
+) -> list[dict[str, Any]]:
+    return [
+        item for item in occurrences
+        if str(item.get("layer", "")).startswith(layer_prefix)
+    ]
+
+
+def _broken_visibility_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [item for item in items if item.get("state") == "broken"]
+
+
+def _global_not_allowed_items(
+    model: dict[str, Any],
+    global_installed: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        item for item in global_installed
+        if item.get("state") != "broken"
+        and not _global_install_allowed(model, str(item.get("name") or ""))
+    ]
+
+
+def _extra_global_items(
+    model: dict[str, Any],
+    global_installed: list[dict[str, Any]],
+    declared_names: set[str],
+) -> list[dict[str, Any]]:
+    return [
+        item for item in global_installed
+        if (
+            item.get("state") != "broken"
+            and str(item.get("name")) not in declared_names
+            and not _scope_allows_global(model, str(item.get("name") or ""))
+        )
+    ]
+
+
+def _archive_source_items(occurrences: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        item for item in occurrences
+        if item.get("source_bucket") == "archive"
+    ]
+
+
+def _visibility_issue_groups(
+    model: dict[str, Any],
+    cwd_path: Path,
+    occurrences: list[dict[str, Any]],
+    declared_occurrences: list[dict[str, Any]],
+    effective: list[dict[str, Any]],
+    shadowed: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    declared_names = {str(item.get("name")) for item in declared_occurrences}
+    global_installed = _visibility_installed_by_layer(occurrences, "global:")
+    project_installed = _visibility_installed_by_layer(occurrences, "project:")
+    return {
+        "broken_global": _broken_visibility_items(global_installed),
+        "broken_project": _broken_visibility_items(project_installed),
+        "global_not_allowed": _global_not_allowed_items(model, global_installed),
+        "extra_global": _extra_global_items(model, global_installed, declared_names),
+        "shadowed": shadowed,
+        "archive_sources": _archive_source_items(occurrences),
+        "scope_violations": _skill_scope_violations(model, occurrences),
+        "missing_for_cwd": _missing_for_cwd(model, cwd_path, effective),
+    }
+
+
+def _visibility_name_count(items: list[dict[str, Any]]) -> int:
+    return len({str(item.get("name")) for item in items})
+
+
+def _skill_visibility_summary(
+    *,
+    effective: list[dict[str, Any]],
+    occurrences: list[dict[str, Any]],
+    layers: list[dict[str, Any]],
+    issues: dict[str, list[dict[str, Any]]],
+    undefined_sources: list[dict[str, Any]],
+    recommendations: list[dict[str, Any]],
+) -> dict[str, int]:
+    scope_violations = issues["scope_violations"]
+    missing_for_cwd = issues["missing_for_cwd"]
+    return {
+        "effective": len(effective),
+        "occurrences": len(occurrences),
+        "layers": len(layers),
+        "broken_global": len(issues["broken_global"]),
+        "broken_global_skills": _visibility_name_count(issues["broken_global"]),
+        "broken_project": len(issues["broken_project"]),
+        "broken_project_skills": _visibility_name_count(issues["broken_project"]),
+        "global_not_allowed": len(issues["global_not_allowed"]),
+        "global_not_allowed_skills": _visibility_name_count(issues["global_not_allowed"]),
+        "extra_global": len(issues["extra_global"]),
+        "extra_global_skills": _visibility_name_count(issues["extra_global"]),
+        "shadowed": len(issues["shadowed"]),
+        "archive_sources": len(issues["archive_sources"]),
+        "archive_source_skills": _visibility_name_count(issues["archive_sources"]),
+        "scope_violations": len(scope_violations),
+        "scope_violation_skills": _visibility_name_count(scope_violations),
+        "missing_for_cwd": len(missing_for_cwd),
+        "missing_for_cwd_skills": _visibility_name_count(missing_for_cwd),
+        "undefined_sources": len(undefined_sources),
+        "undefined_source_skills": _visibility_name_count(undefined_sources),
+        "recommendations": len(recommendations),
+    }
+
+
 def collect_skill_visibility(
     model: dict[str, Any],
     *,
@@ -1926,83 +2402,28 @@ def collect_skill_visibility(
     """Collect a conflict-aware skill availability view for a model."""
     cwd_path = Path(cwd or os.getcwd()).resolve()
     declared_occurrences, declared_layers = _declared_skill_occurrences(model)
-    occurrences = list(declared_occurrences)
-    layers = list(declared_layers)
-
-    if include_global:
-        for surface, root in _default_global_roots():
-            installed, summary = _scan_installed_root(
-                root,
-                layer=f"global:{surface}",
-                label=f"global {surface}",
-                rank=GLOBAL_LAYER_RANK,
-            )
-            occurrences.extend(installed)
-            layers.append(summary)
-
-    if include_project:
-        for surface, root in _project_skill_roots(cwd_path):
-            installed, summary = _scan_installed_root(
-                root,
-                layer=f"project:{surface}:{root.parent.parent}",
-                label=f"project {surface}",
-                rank=PROJECT_LAYER_RANK,
-            )
-            occurrences.extend(installed)
-            layers.append(summary)
+    installed_occurrences, installed_layers = _collect_installed_visibility_layers(
+        cwd_path,
+        include_global=include_global,
+        include_project=include_project,
+    )
+    occurrences = [*declared_occurrences, *installed_occurrences]
+    layers = [*declared_layers, *installed_layers]
 
     effective, shadowed = _effective_occurrences(occurrences)
-    declared_names = {str(item.get("name")) for item in declared_occurrences}
-    global_installed = [
-        item for item in occurrences
-        if str(item.get("layer", "")).startswith("global:")
-    ]
-    project_installed = [
-        item for item in occurrences
-        if str(item.get("layer", "")).startswith("project:")
-    ]
-    broken_global = [item for item in global_installed if item.get("state") == "broken"]
-    broken_project = [item for item in project_installed if item.get("state") == "broken"]
-    global_not_allowed = [
-        item for item in global_installed
-        if item.get("state") != "broken"
-        and not _global_install_allowed(model, str(item.get("name") or ""))
-    ]
-    extra_global = [
-        item for item in global_installed
-        if (
-            item.get("state") != "broken"
-            and str(item.get("name")) not in declared_names
-            and not _scope_allows_global(model, str(item.get("name") or ""))
-        )
-    ]
-    archive_sources = [
-        item for item in occurrences
-        if item.get("source_bucket") == "archive"
-    ]
-    scope_violations = _skill_scope_violations(model, occurrences)
-    missing_for_cwd = _missing_for_cwd(model, cwd_path, effective)
+    issues = _visibility_issue_groups(
+        model,
+        cwd_path,
+        occurrences,
+        declared_occurrences,
+        effective,
+        shadowed,
+    )
     if include_sources:
         undefined_sources, source_roots = _undefined_source_skills(model, occurrences)
     else:
         undefined_sources, source_roots = [], []
 
-    issues = {
-        "broken_global": broken_global,
-        "broken_project": broken_project,
-        "global_not_allowed": global_not_allowed,
-        "extra_global": extra_global,
-        "shadowed": shadowed,
-        "archive_sources": archive_sources,
-        "scope_violations": scope_violations,
-        "missing_for_cwd": missing_for_cwd,
-    }
-    broken_global_names = {str(item.get("name")) for item in broken_global}
-    broken_project_names = {str(item.get("name")) for item in broken_project}
-    global_not_allowed_names = {str(item.get("name")) for item in global_not_allowed}
-    extra_global_names = {str(item.get("name")) for item in extra_global}
-    archive_source_names = {str(item.get("name")) for item in archive_sources}
-    undefined_source_names = {str(item.get("name")) for item in undefined_sources}
     recommendations = _skill_visibility_recommendations(issues)
     policy_files = sorted({
         str(policy.get("_policy_path") or "")
@@ -2028,55 +2449,53 @@ def collect_skill_visibility(
             "project_categories": _project_categories(model),
         },
         "recommendations": recommendations,
-        "summary": {
-            "effective": len(effective),
-            "occurrences": len(occurrences),
-            "layers": len(layers),
-            "broken_global": len(broken_global),
-            "broken_global_skills": len(broken_global_names),
-            "broken_project": len(broken_project),
-            "broken_project_skills": len(broken_project_names),
-            "global_not_allowed": len(global_not_allowed),
-            "global_not_allowed_skills": len(global_not_allowed_names),
-            "extra_global": len(extra_global),
-            "extra_global_skills": len(extra_global_names),
-            "shadowed": len(shadowed),
-            "archive_sources": len(archive_sources),
-            "archive_source_skills": len(archive_source_names),
-            "scope_violations": len(scope_violations),
-            "scope_violation_skills": len({
-                str(item.get("name")) for item in scope_violations
-            }),
-            "missing_for_cwd": len(missing_for_cwd),
-            "missing_for_cwd_skills": len({
-                str(item.get("name")) for item in missing_for_cwd
-            }),
-            "undefined_sources": len(undefined_sources),
-            "undefined_source_skills": len(undefined_source_names),
-            "recommendations": len(recommendations),
-        },
+        "summary": _skill_visibility_summary(
+            effective=effective,
+            occurrences=occurrences,
+            layers=layers,
+            issues=issues,
+            undefined_sources=undefined_sources,
+            recommendations=recommendations,
+        ),
         "next_actions": skill_visibility_next_actions(issues),
     }
+
+
+SKILL_VISIBILITY_COMPACT_ISSUE_KEYS = (
+    "broken_global",
+    "broken_project",
+    "global_not_allowed",
+    "extra_global",
+    "shadowed",
+    "archive_sources",
+    "scope_violations",
+    "missing_for_cwd",
+)
+
+
+def _compact_skill_visibility_skill(item: dict[str, Any]) -> dict[str, Any]:
+    result = {
+        "name": item.get("name"),
+        "availability": item.get("availability"),
+        "layer": item.get("layer"),
+        "state": item.get("state"),
+        "source_bucket": item.get("source_bucket"),
+        "source": item.get("source"),
+        "shadowed_count": item.get("shadowed_count", 0),
+    }
+    if item.get("path"):
+        result["path"] = item.get("path")
+    return {key: value for key, value in result.items() if value not in (None, "")}
+
+
+def _compact_skill_visibility_issues(payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    issues = payload.get("issues") or {}
+    return {key: issues.get(key) or [] for key in SKILL_VISIBILITY_COMPACT_ISSUE_KEYS}
 
 
 def compact_skill_visibility_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Return the agent-facing subset of a full skill visibility payload."""
 
-    def compact_skill(item: dict[str, Any]) -> dict[str, Any]:
-        result = {
-            "name": item.get("name"),
-            "availability": item.get("availability"),
-            "layer": item.get("layer"),
-            "state": item.get("state"),
-            "source_bucket": item.get("source_bucket"),
-            "source": item.get("source"),
-            "shadowed_count": item.get("shadowed_count", 0),
-        }
-        if item.get("path"):
-            result["path"] = item.get("path")
-        return {key: value for key, value in result.items() if value not in (None, "")}
-
-    issues = payload.get("issues") or {}
     return {
         "cwd": payload.get("cwd"),
         "active_clients": payload.get("active_clients") or [],
@@ -2085,20 +2504,8 @@ def compact_skill_visibility_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "matched_project_categories": payload.get("matched_project_categories") or [],
         "matched_scope_rules": payload.get("matched_scope_rules") or [],
         "summary": payload.get("summary") or {},
-        "effective": [compact_skill(item) for item in payload.get("effective") or []],
-        "issues": {
-            key: issues.get(key) or []
-            for key in (
-                "broken_global",
-                "broken_project",
-                "global_not_allowed",
-                "extra_global",
-                "shadowed",
-                "archive_sources",
-                "scope_violations",
-                "missing_for_cwd",
-            )
-        },
+        "effective": [_compact_skill_visibility_skill(item) for item in payload.get("effective") or []],
+        "issues": _compact_skill_visibility_issues(payload),
         "recommendations": payload.get("recommendations") or [],
         "policy": payload.get("policy") or {},
         "source_roots": payload.get("source_roots") or [],

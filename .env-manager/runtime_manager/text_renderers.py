@@ -3,73 +3,151 @@ from __future__ import annotations
 from .shared import *
 from .runtime_ops import service_bootstrap_task_ids, service_dependency_ids, task_dependency_ids
 
-def print_render_text(model: dict[str, Any]) -> None:
+
+def _render_header_lines(model: dict[str, Any]) -> list[str]:
     available_clients = ", ".join(client["id"] for client in model.get("clients") or []) or "(none)"
     default_client = (model.get("selection") or {}).get("default_client") or "(none)"
+    lines = [
+        f"clients: {available_clients}",
+        f"default client: {default_client}",
+    ]
     active_clients = model.get("active_clients") or []
-    print(f"clients: {available_clients}")
-    print(f"default client: {default_client}")
     if active_clients:
-        print(f"active clients: {', '.join(active_clients)}")
+        lines.append(f"active clients: {', '.join(active_clients)}")
     active_profiles = model.get("active_profiles") or []
     if active_profiles:
-        print(f"active profiles: {', '.join(active_profiles)}")
-    print(f"runtime manifest: {model['manifest_file']}")
-    print(f"repos: {len(model['repos'])}")
-    for repo in model["repos"]:
-        print(f"  - {repo['id']}: {repo.get('kind', 'repo')} @ {repo['path']}")
-    print(f"artifacts: {len(model['artifacts'])}")
-    for artifact in model["artifacts"]:
-        print(f"  - {artifact['id']}: {artifact.get('kind', 'artifact')} @ {artifact['path']}")
-    print(f"env files: {len(model['env_files'])}")
-    for env_file in model["env_files"]:
-        print(f"  - {env_file['id']}: {env_file.get('kind', 'env-file')} @ {env_file['path']}")
-    print(f"skills: {len(model['skills'])}")
+        lines.append(f"active profiles: {', '.join(active_profiles)}")
+    lines.append(f"runtime manifest: {model['manifest_file']}")
+    return lines
+
+
+def _render_repo_lines(model: dict[str, Any]) -> list[str]:
+    return [f"repos: {len(model['repos'])}"] + [
+        f"  - {repo['id']}: {repo.get('kind', 'repo')} @ {repo['path']}"
+        for repo in model["repos"]
+    ]
+
+
+def _render_artifact_lines(model: dict[str, Any]) -> list[str]:
+    return [f"artifacts: {len(model['artifacts'])}"] + [
+        f"  - {artifact['id']}: {artifact.get('kind', 'artifact')} @ {artifact['path']}"
+        for artifact in model["artifacts"]
+    ]
+
+
+def _render_env_file_lines(model: dict[str, Any]) -> list[str]:
+    return [f"env files: {len(model['env_files'])}"] + [
+        f"  - {env_file['id']}: {env_file.get('kind', 'env-file')} @ {env_file['path']}"
+        for env_file in model["env_files"]
+    ]
+
+
+def _render_skill_lines(model: dict[str, Any]) -> list[str]:
+    lines = [f"skills: {len(model['skills'])}"]
     for skillset in model["skills"]:
-        kind = skillset.get('kind', 'skill-repo-set')
-        location = skillset.get('skill_repos_config') or skillset.get('bundle_dir') or '(unknown)'
-        print(f"  - {skillset['id']}: {kind} @ {location}")
-    print(f"tasks: {len(model['tasks'])}")
-    for task in model["tasks"]:
-        dependency_summary = ""
-        dependency_ids = task_dependency_ids(task)
-        if dependency_ids:
-            dependency_summary = f" depends on {', '.join(dependency_ids)}"
-        print(f"  - {task['id']}: {task.get('kind', 'task')}{dependency_summary}")
-    print(f"services: {len(model['services'])}")
+        kind = skillset.get("kind", "skill-repo-set")
+        location = skillset.get("skill_repos_config") or skillset.get("bundle_dir") or "(unknown)"
+        lines.append(f"  - {skillset['id']}: {kind} @ {location}")
+    return lines
+
+
+def _task_dependency_summary(task: dict[str, Any]) -> str:
+    dependency_ids = task_dependency_ids(task)
+    return f" depends on {', '.join(dependency_ids)}" if dependency_ids else ""
+
+
+def _render_task_lines(model: dict[str, Any]) -> list[str]:
+    return [f"tasks: {len(model['tasks'])}"] + [
+        f"  - {task['id']}: {task.get('kind', 'task')}{_task_dependency_summary(task)}"
+        for task in model["tasks"]
+    ]
+
+
+def _service_dependency_summary(service: dict[str, Any]) -> str:
+    dependency_ids = service_dependency_ids(service)
+    return f" depends on {', '.join(dependency_ids)}" if dependency_ids else ""
+
+
+def _service_bootstrap_summary(service: dict[str, Any]) -> str:
+    bootstrap_task_ids = service_bootstrap_task_ids(service)
+    return f" bootstrap {', '.join(bootstrap_task_ids)}" if bootstrap_task_ids else ""
+
+
+def _render_service_lines(model: dict[str, Any]) -> list[str]:
+    lines = [f"services: {len(model['services'])}"]
     for service in model["services"]:
         profiles = ", ".join(service.get("profiles") or []) or "core"
-        dependency_summary = ""
-        dependency_ids = service_dependency_ids(service)
-        if dependency_ids:
-            dependency_summary = f" depends on {', '.join(dependency_ids)}"
-        bootstrap_summary = ""
-        bootstrap_task_ids = service_bootstrap_task_ids(service)
-        if bootstrap_task_ids:
-            bootstrap_summary = f" bootstrap {', '.join(bootstrap_task_ids)}"
-        print(f"  - {service['id']}: {service.get('kind', 'service')} [{profiles}]{dependency_summary}{bootstrap_summary}")
-    print(f"logs: {len(model['logs'])}")
-    for log_item in model["logs"]:
-        print(f"  - {log_item['id']}: {log_item['path']}")
-    print(f"checks: {len(model['checks'])}")
-    for check in model["checks"]:
-        print(f"  - {check['id']}: {check['type']}")
+        lines.append(
+            f"  - {service['id']}: {service.get('kind', 'service')} [{profiles}]"
+            f"{_service_dependency_summary(service)}{_service_bootstrap_summary(service)}"
+        )
+    return lines
+
+
+def _render_log_lines(model: dict[str, Any]) -> list[str]:
+    return [f"logs: {len(model['logs'])}"] + [
+        f"  - {log_item['id']}: {log_item['path']}"
+        for log_item in model["logs"]
+    ]
+
+
+def _render_check_lines(model: dict[str, Any]) -> list[str]:
+    return [f"checks: {len(model['checks'])}"] + [
+        f"  - {check['id']}: {check['type']}"
+        for check in model["checks"]
+    ]
+
+
+def _render_bridge_lines(model: dict[str, Any]) -> list[str]:
     bridges = model.get("bridges") or []
-    if bridges:
-        print(f"bridges: {len(bridges)}")
-        for bridge in bridges:
-            targets = ", ".join(str(t) for t in bridge.get("legacy_targets") or [])
-            print(f"  - {bridge['id']}: {bridge.get('env_tier', 'local')} [{targets}]")
+    lines: list[str] = []
+    if not bridges:
+        return lines
+    lines.append(f"bridges: {len(bridges)}")
+    for bridge in bridges:
+        targets = ", ".join(str(t) for t in bridge.get("legacy_targets") or [])
+        lines.append(f"  - {bridge['id']}: {bridge.get('env_tier', 'local')} [{targets}]")
+    return lines
+
+
+def _render_ingress_route_lines(model: dict[str, Any]) -> list[str]:
     ingress_routes = model.get("ingress_routes") or []
-    if ingress_routes:
-        print(f"ingress routes: {len(ingress_routes)}")
-        for route in ingress_routes:
-            listener = str(route.get("listener") or "public")
-            match = str(route.get("match") or "exact")
-            print(
-                f"  - {route['id']}: {listener} {route.get('path', '')} "
-                f"-> {route.get('service_id', '')} ({match})"
-            )
+    lines: list[str] = []
+    if not ingress_routes:
+        return lines
+    lines.append(f"ingress routes: {len(ingress_routes)}")
+    for route in ingress_routes:
+        listener = str(route.get("listener") or "public")
+        match = str(route.get("match") or "exact")
+        lines.append(
+            f"  - {route['id']}: {listener} {route.get('path', '')} "
+            f"-> {route.get('service_id', '')} ({match})"
+        )
+    return lines
+
+
+def render_text_lines(model: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    for renderer in (
+        _render_header_lines,
+        _render_repo_lines,
+        _render_artifact_lines,
+        _render_env_file_lines,
+        _render_skill_lines,
+        _render_task_lines,
+        _render_service_lines,
+        _render_log_lines,
+        _render_check_lines,
+        _render_bridge_lines,
+        _render_ingress_route_lines,
+    ):
+        lines.extend(renderer(model))
+    return lines
+
+
+def print_render_text(model: dict[str, Any]) -> None:
+    for line in render_text_lines(model):
+        print(line)
 
 
 def detail_lines(details: dict[str, Any]) -> list[str]:
@@ -370,57 +448,79 @@ def print_client_blueprints_text(blueprints: list[dict[str, Any]]) -> None:
         print(f"  vars: {', '.join(rendered_variables)}")
 
 
-def print_client_diff_text(payload: dict[str, Any]) -> None:
+def _client_diff_header_lines(payload: dict[str, Any]) -> list[str]:
     current = payload.get("current") or {}
     candidate = payload.get("candidate") or {}
     summary = payload.get("summary") or {}
     publish_metadata = payload.get("publish_metadata") or {}
-    runtime_changes = payload.get("runtime_changes") or {}
-    sections = runtime_changes.get("sections") or {}
-
-    print(f"client: {payload['client_id']}")
-    print(f"target_dir: {payload['target_dir']}")
-    print(f"current_dir: {payload['current_dir']}")
-    print(f"changed: {payload['changed']}")
-    print(f"candidate_payload_tree_sha256: {candidate.get('payload_tree_sha256')}")
-    print(f"current_payload_tree_sha256: {current.get('payload_tree_sha256') or '(none)'}")
-    print(
+    lines = [
+        f"client: {payload['client_id']}",
+        f"target_dir: {payload['target_dir']}",
+        f"current_dir: {payload['current_dir']}",
+        f"changed: {payload['changed']}",
+        f"candidate_payload_tree_sha256: {candidate.get('payload_tree_sha256')}",
+        f"current_payload_tree_sha256: {current.get('payload_tree_sha256') or '(none)'}",
         "files: "
         f"+{summary.get('added', 0)} "
         f"~{summary.get('changed', 0)} "
         f"-{summary.get('removed', 0)} "
-        f"={summary.get('unchanged', 0)}"
-    )
-    print(
+        f"={summary.get('unchanged', 0)}",
         "publish_metadata: "
-        + ("match" if publish_metadata.get("matches_candidate") else "drift")
-    )
+        + ("match" if publish_metadata.get("matches_candidate") else "drift"),
+    ]
     if publish_metadata.get("changed_fields"):
-        print("publish_metadata_fields: " + ", ".join(publish_metadata["changed_fields"]))
+        lines.append("publish_metadata_fields: " + ", ".join(publish_metadata["changed_fields"]))
+    return lines
 
+
+def _runtime_change_parts(change: dict[str, Any]) -> list[str]:
+    parts: list[str] = []
+    if change.get("added"):
+        parts.append("added " + ", ".join(change["added"]))
+    if change.get("removed"):
+        parts.append("removed " + ", ".join(change["removed"]))
+    if change.get("changed"):
+        parts.append("changed " + ", ".join(change["changed"]))
+    return parts
+
+
+def _client_diff_runtime_lines(payload: dict[str, Any]) -> list[str]:
+    runtime_changes = payload.get("runtime_changes") or {}
+    sections = runtime_changes.get("sections") or {}
     changed_sections = runtime_changes.get("changed_sections") or []
-    if changed_sections:
-        print("runtime_changes:")
-        for section in changed_sections:
-            change = sections.get(section) or {}
-            parts: list[str] = []
-            if change.get("added"):
-                parts.append("added " + ", ".join(change["added"]))
-            if change.get("removed"):
-                parts.append("removed " + ", ".join(change["removed"]))
-            if change.get("changed"):
-                parts.append("changed " + ", ".join(change["changed"]))
-            print(f"  - {section}: " + "; ".join(parts))
+    if not changed_sections:
+        return []
+    lines = ["runtime_changes:"]
+    for section in changed_sections:
+        change = sections.get(section) or {}
+        lines.append(f"  - {section}: " + "; ".join(_runtime_change_parts(change)))
+    return lines
 
-    if payload["files"]["added"]:
-        print("added_files:")
-        for rel_path in payload["files"]["added"]:
-            print(f"  - {rel_path}")
-    if payload["files"]["removed"]:
-        print("removed_files:")
-        for rel_path in payload["files"]["removed"]:
-            print(f"  - {rel_path}")
-    if payload["files"]["changed"]:
-        print("changed_files:")
-        for item in payload["files"]["changed"]:
-            print(f"  - {item['path']}")
+
+def _client_diff_file_group_lines(
+    title: str,
+    values: list[Any],
+    value_key: str | None = None,
+) -> list[str]:
+    if not values:
+        return []
+    lines = [f"{title}:"]
+    for item in values:
+        value = item.get(value_key) if value_key and isinstance(item, dict) else item
+        lines.append(f"  - {value}")
+    return lines
+
+
+def client_diff_text_lines(payload: dict[str, Any]) -> list[str]:
+    files = payload["files"]
+    lines = _client_diff_header_lines(payload)
+    lines.extend(_client_diff_runtime_lines(payload))
+    lines.extend(_client_diff_file_group_lines("added_files", files["added"]))
+    lines.extend(_client_diff_file_group_lines("removed_files", files["removed"]))
+    lines.extend(_client_diff_file_group_lines("changed_files", files["changed"], "path"))
+    return lines
+
+
+def print_client_diff_text(payload: dict[str, Any]) -> None:
+    for line in client_diff_text_lines(payload):
+        print(line)

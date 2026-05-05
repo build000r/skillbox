@@ -4,49 +4,52 @@ from .shared import *
 from .runtime_ops import *
 from .distribution.status import render_connected_distributors_section
 
-def generate_context_markdown(model: dict[str, Any]) -> str:
-    """Generate a CLAUDE.md / AGENTS.md from the resolved runtime model."""
-    lines: list[str] = []
 
-    active_clients = model.get("active_clients") or []
-    active_profiles = [p for p in (model.get("active_profiles") or []) if p != "core"]
-    clients_data = {
+def _context_clients_data(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
         str(c.get("id", "")): c
         for c in model.get("clients") or []
     }
 
-    # Build make suffix for commands
+
+def _context_make_suffix(active_clients: list[str]) -> str:
     make_parts: list[str] = []
     if active_clients:
         make_parts.append(f"CLIENT={active_clients[0]}")
+    return " " + " ".join(make_parts) if make_parts else ""
 
-    make_suffix = " " + " ".join(make_parts) if make_parts else ""
 
-    # Determine default CWD from active client
-    default_cwd = ""
+def _context_default_cwd(active_clients: list[str], clients_data: dict[str, dict[str, Any]]) -> str:
     for client_id in active_clients:
         client_data = clients_data.get(client_id, {})
         cwd = str(client_data.get("default_cwd", "")).strip()
         if cwd:
-            default_cwd = cwd
-            break
+            return cwd
+    return ""
 
-    # Regenerate hint
+
+def _context_header_lines(make_suffix: str) -> list[str]:
     regen_cmd = f"make context{make_suffix}"
     sync_cmd = f"make runtime-sync{make_suffix}"
+    return [
+        "# skillbox",
+        "",
+        "> Auto-generated from the runtime graph. Do not edit manually.",
+        f"> Regenerate: `{regen_cmd}` or `{sync_cmd}`.",
+        "",
+        "You are inside a skillbox workspace container.",
+        "",
+    ]
 
-    # Header
-    lines.append("# skillbox")
-    lines.append("")
-    lines.append(f"> Auto-generated from the runtime graph. Do not edit manually.")
-    lines.append(f"> Regenerate: `{regen_cmd}` or `{sync_cmd}`.")
-    lines.append("")
-    lines.append("You are inside a skillbox workspace container.")
-    lines.append("")
 
-    # Environment
-    lines.append("## Environment")
-    lines.append("")
+def _context_environment_lines(
+    model: dict[str, Any],
+    active_clients: list[str],
+    active_profiles: list[str],
+    clients_data: dict[str, dict[str, Any]],
+) -> list[str]:
+    lines = ["## Environment", ""]
+    default_cwd = _context_default_cwd(active_clients, clients_data)
     if active_clients:
         lines.append(f"- Client: **{', '.join(active_clients)}**")
     if default_cwd:
@@ -54,7 +57,6 @@ def generate_context_markdown(model: dict[str, Any]) -> str:
     if active_profiles:
         lines.append(f"- Profiles: {', '.join(active_profiles)}")
 
-    # Skill context pointer
     runtime_env = model.get("env") or {}
     for cid_env in active_clients:
         client_data_env = clients_data.get(cid_env, {})
@@ -63,149 +65,173 @@ def generate_context_markdown(model: dict[str, Any]) -> str:
             lines.append(f"- Skill context: `$SKILLBOX_CLIENT_CONTEXT` → `{ctx_path}`")
             break
     lines.append("")
+    return lines
 
-    lines.append("## Tooling Guidance")
-    lines.append("")
-    lines.append(
+
+def _context_tooling_lines() -> list[str]:
+    return [
+        "## Tooling Guidance",
+        "",
         "- GitHub: use `gh-axi` for GitHub operations when available; "
-        "fall back to `gh` only when `gh-axi` cannot satisfy the task."
-    )
-    lines.append("")
+        "fall back to `gh` only when `gh-axi` cannot satisfy the task.",
+        "",
+    ]
 
-    # Repos
+
+def _context_repo_lines(model: dict[str, Any]) -> list[str]:
     repos = model.get("repos") or []
-    if repos:
-        lines.append("## Repos")
-        lines.append("")
-        lines.append("| ID | Path | Kind |")
-        lines.append("|----|------|------|")
-        for repo in repos:
-            lines.append(
-                f"| {repo['id']} | `{repo['path']}` | {repo.get('kind', 'repo')} |"
-            )
-        lines.append("")
+    if not repos:
+        return []
+    lines = ["## Repos", "", "| ID | Path | Kind |", "|----|------|------|"]
+    for repo in repos:
+        lines.append(f"| {repo['id']} | `{repo['path']}` | {repo.get('kind', 'repo')} |")
+    lines.append("")
+    return lines
 
-    # Services
+
+def _context_service_make_suffix(make_suffix: str, profiles: list[str], sid: str) -> str:
+    svc_parts = [part for part in make_suffix.strip().split(" ") if part]
+    non_core = [profile for profile in profiles if profile != "core"]
+    if non_core:
+        svc_parts.append(f"PROFILE={non_core[0]}")
+    svc_parts.append(f"SERVICE={sid}")
+    return " " + " ".join(svc_parts)
+
+
+def _context_service_lines(model: dict[str, Any], make_suffix: str) -> list[str]:
     services = model.get("services") or []
-    if services:
-        lines.append("## Services")
-        lines.append("")
-        for service in services:
-            sid = service["id"]
-            kind = service.get("kind", "service")
-            profiles = service.get("profiles") or []
-            profile_label = ", ".join(profiles) or "core"
-            manageable, reason = service_supports_lifecycle(service)
+    if not services:
+        return []
+    lines = ["## Services", ""]
+    for service in services:
+        sid = service["id"]
+        kind = service.get("kind", "service")
+        profiles = service.get("profiles") or []
+        profile_label = ", ".join(profiles) or "core"
+        manageable, reason = service_supports_lifecycle(service)
+        if not manageable:
+            lines.append(f"- **{sid}** ({kind}, {profile_label})" f" — {reason or 'not manageable'}")
+            continue
+        deps = service_dependency_ids(service)
+        dep_note = f" (depends on: {', '.join(deps)})" if deps else ""
+        svc_suffix = _context_service_make_suffix(make_suffix, profiles, sid)
+        lines.append(f"- **{sid}** ({kind}, {profile_label}){dep_note}")
+        lines.append(f"  - Start: `make runtime-up{svc_suffix}`")
+        lines.append(f"  - Stop: `make runtime-down{svc_suffix}`")
+        lines.append(f"  - Logs: `make runtime-logs{svc_suffix}`")
+    lines.append("")
+    return lines
 
-            if manageable:
-                svc_parts = list(make_parts)
-                non_core = [p for p in profiles if p != "core"]
-                if non_core:
-                    svc_parts.append(f"PROFILE={non_core[0]}")
-                svc_parts.append(f"SERVICE={sid}")
-                svc_suffix = " " + " ".join(svc_parts)
 
-                deps = service_dependency_ids(service)
-                dep_note = f" (depends on: {', '.join(deps)})" if deps else ""
-
-                lines.append(f"- **{sid}** ({kind}, {profile_label}){dep_note}")
-                lines.append(f"  - Start: `make runtime-up{svc_suffix}`")
-                lines.append(f"  - Stop: `make runtime-down{svc_suffix}`")
-                lines.append(f"  - Logs: `make runtime-logs{svc_suffix}`")
-            else:
-                lines.append(
-                    f"- **{sid}** ({kind}, {profile_label})"
-                    f" — {reason or 'not manageable'}"
-                )
-        lines.append("")
-
-    # Tasks
+def _context_task_lines(model: dict[str, Any], make_suffix: str) -> list[str]:
     tasks = model.get("tasks") or []
-    if tasks:
-        lines.append("## Tasks")
-        lines.append("")
-        for task in tasks:
-            tid = task["id"]
-            deps = task_dependency_ids(task)
-            dep_note = f" (depends on: {', '.join(deps)})" if deps else ""
+    if not tasks:
+        return []
+    lines = ["## Tasks", ""]
+    for task in tasks:
+        tid = task["id"]
+        deps = task_dependency_ids(task)
+        dep_note = f" (depends on: {', '.join(deps)})" if deps else ""
+        task_suffix = f"{make_suffix} TASK={tid}" if make_suffix else f" TASK={tid}"
+        lines.append(f"- **{tid}**{dep_note}: `make runtime-bootstrap{task_suffix}`")
+    lines.append("")
+    return lines
 
-            task_parts = list(make_parts)
-            task_parts.append(f"TASK={tid}")
-            task_suffix = " " + " ".join(task_parts)
 
-            lines.append(
-                f"- **{tid}**{dep_note}: `make runtime-bootstrap{task_suffix}`"
-            )
-        lines.append("")
+def _context_skill_names(skillset: dict[str, Any]) -> list[str]:
+    kind = str(skillset.get("kind") or "").strip()
+    if kind == "skill-repo-set":
+        return _context_skill_repo_names(skillset)
+    manifest_host_path = Path(str(skillset.get("manifest_host_path", "")))
+    if not manifest_host_path.is_file():
+        return []
+    try:
+        return read_manifest_skills(manifest_host_path)
+    except Exception:
+        return []
 
-    # Installed skills
+
+def _context_skill_repo_names(skillset: dict[str, Any]) -> list[str]:
+    lock_host_path = Path(str(skillset.get("lock_path_host_path", "")))
+    if not lock_host_path.is_file():
+        return []
+    try:
+        import json as _json
+        lock_data = _json.loads(lock_host_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    raw_skills = lock_data.get("skills") or []
+    if isinstance(raw_skills, list):
+        return sorted(skill.get("name", "") for skill in raw_skills if skill.get("name"))
+    if isinstance(raw_skills, dict):
+        return sorted(raw_skills.keys())
+    return []
+
+
+def _context_skill_lines(model: dict[str, Any]) -> list[str]:
     skills = model.get("skills") or []
-    if skills:
-        lines.append("## Installed Skills")
-        lines.append("")
-        for skillset in skills:
-            sid = skillset["id"]
-            skill_names: list[str] = []
-            kind = str(skillset.get("kind") or "").strip()
-            if kind == "skill-repo-set":
-                lock_host_path = Path(str(skillset.get("lock_path_host_path", "")))
-                if lock_host_path.is_file():
-                    try:
-                        import json as _json
-                        lock_data = _json.loads(lock_host_path.read_text(encoding="utf-8"))
-                        raw_skills = lock_data.get("skills") or []
-                        if isinstance(raw_skills, list):
-                            skill_names = sorted(s.get("name", "") for s in raw_skills if s.get("name"))
-                        elif isinstance(raw_skills, dict):
-                            skill_names = sorted(raw_skills.keys())
-                    except Exception:
-                        pass
-            else:
-                manifest_host_path = Path(
-                    str(skillset.get("manifest_host_path", ""))
-                )
-                if manifest_host_path.is_file():
-                    try:
-                        skill_names = read_manifest_skills(manifest_host_path)
-                    except Exception:
-                        pass
+    if not skills:
+        return []
+    lines = ["## Installed Skills", ""]
+    for skillset in skills:
+        sid = skillset["id"]
+        skill_names = _context_skill_names(skillset)
+        if skill_names:
+            lines.append(f"- **{sid}**: {', '.join(skill_names)}")
+        else:
+            lines.append(f"- **{sid}**: (empty)")
+    lines.append("")
+    return lines
 
-            if skill_names:
-                lines.append(f"- **{sid}**: {', '.join(skill_names)}")
-            else:
-                lines.append(f"- **{sid}**: (empty)")
-        lines.append("")
 
+def _context_log_lines(model: dict[str, Any]) -> list[str]:
+    logs = model.get("logs") or []
+    if not logs:
+        return []
+    lines = ["## Logs", "", "| ID | Path |", "|----|------|"]
+    for log_item in logs:
+        lines.append(f"| {log_item['id']} | `{log_item['path']}` |")
+    lines.append("")
+    return lines
+
+
+def _context_quick_reference_lines(model: dict[str, Any], make_suffix: str) -> list[str]:
+    lines = [
+        "## Quick Reference",
+        "",
+        "```bash",
+        f"make dev-sanity{make_suffix}",
+        f"make runtime-status{make_suffix}",
+        f"make runtime-sync{make_suffix}",
+        f"make runtime-up{make_suffix} SERVICE=<id>",
+        f"make runtime-down{make_suffix} SERVICE=<id>",
+        f"make runtime-logs{make_suffix} SERVICE=<id>",
+    ]
+    if model.get("tasks") or []:
+        lines.append(f"make runtime-bootstrap{make_suffix} TASK=<id>")
+    lines.extend(["```", ""])
+    return lines
+
+
+def generate_context_markdown(model: dict[str, Any]) -> str:
+    """Generate a CLAUDE.md / AGENTS.md from the resolved runtime model."""
+    active_clients = model.get("active_clients") or []
+    active_profiles = [profile for profile in (model.get("active_profiles") or []) if profile != "core"]
+    clients_data = _context_clients_data(model)
+    make_suffix = _context_make_suffix(active_clients)
+    lines: list[str] = []
+    lines.extend(_context_header_lines(make_suffix))
+    lines.extend(_context_environment_lines(model, active_clients, active_profiles, clients_data))
+    lines.extend(_context_tooling_lines())
+    lines.extend(_context_repo_lines(model))
+    lines.extend(_context_service_lines(model, make_suffix))
+    lines.extend(_context_task_lines(model, make_suffix))
+    lines.extend(_context_skill_lines(model))
     distributor_lines = render_connected_distributors_section(model)
     if distributor_lines:
         lines.extend(distributor_lines)
-
-    # Logs
-    logs = model.get("logs") or []
-    if logs:
-        lines.append("## Logs")
-        lines.append("")
-        lines.append("| ID | Path |")
-        lines.append("|----|------|")
-        for log_item in logs:
-            lines.append(f"| {log_item['id']} | `{log_item['path']}` |")
-        lines.append("")
-
-    # Quick reference
-    lines.append("## Quick Reference")
-    lines.append("")
-    lines.append("```bash")
-    lines.append(f"make dev-sanity{make_suffix}")
-    lines.append(f"make runtime-status{make_suffix}")
-    lines.append(f"make runtime-sync{make_suffix}")
-    lines.append(f"make runtime-up{make_suffix} SERVICE=<id>")
-    lines.append(f"make runtime-down{make_suffix} SERVICE=<id>")
-    lines.append(f"make runtime-logs{make_suffix} SERVICE=<id>")
-    if tasks:
-        lines.append(f"make runtime-bootstrap{make_suffix} TASK=<id>")
-    lines.append("```")
-    lines.append("")
-
+    lines.extend(_context_log_lines(model))
+    lines.extend(_context_quick_reference_lines(model, make_suffix))
     return "\n".join(lines)
 
 

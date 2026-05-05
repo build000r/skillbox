@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -15,18 +17,532 @@ if str(ENV_MANAGER_DIR) not in sys.path:
 
 from runtime_manager.skill_visibility import (  # noqa: E402
     activate_overlay_scoped_skills,
+    active_overlays,
     apply_skill_lifecycle_plan,
+    _apply_lifecycle_unlink,
+    _declared_skill_occurrences,
     _effective_occurrences,
+    _install_path_state,
+    _plan_skill_prune_actions,
+    _plan_skill_removals,
+    _prepare_lifecycle_link_destination,
+    _project_categories_for_policy,
     _project_skill_roots,
     _scan_installed_root,
+    _scope_filter_matches,
+    _skill_destination_bases,
+    _skill_repo_declared_names,
+    _sync_wanted_skill_names,
+    _target_states_for_skill,
     collect_skill_visibility,
+    compact_skill_visibility_payload,
     matched_skill_clients,
+    print_skill_lifecycle_text,
+    print_skill_visibility_text,
     skill_lifecycle_plan,
+    set_overlay,
+    toggle_overlay,
     unlink_overlay_scoped_skills,
 )
+from runtime_manager.shared import directory_tree_sha256  # noqa: E402
 
 
 class SkillVisibilityTests(unittest.TestCase):
+    def test_overlay_state_file_merges_env_comments_and_toggles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "overlays.txt"
+            state_path.write_text("# comment\nexisting\n\n", encoding="utf-8")
+            with (
+                mock.patch.dict(
+                    "runtime_manager.skill_visibility.os.environ",
+                    {
+                        "SKILLBOX_OVERLAY_STATE": str(state_path),
+                        "SKILLBOX_OVERLAYS": "ephemeral, existing",
+                    },
+                    clear=False,
+                ),
+            ):
+                self.assertEqual(active_overlays(), {"existing", "ephemeral"})
+                self.assertTrue(set_overlay("new", True))
+                self.assertEqual(state_path.read_text(encoding="utf-8"), "existing\nnew\n")
+                self.assertFalse(set_overlay("existing", False))
+                self.assertEqual(state_path.read_text(encoding="utf-8"), "new\n")
+                self.assertTrue(toggle_overlay("brand-new"))
+                self.assertFalse(toggle_overlay("brand-new"))
+
+    def test_lifecycle_link_destination_preparation_handles_conflicts_and_force(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            source = root / "source"
+            source.mkdir()
+            same_link = root / "same"
+            same_link.symlink_to(source, target_is_directory=True)
+            action: dict[str, str] = {}
+            self.assertFalse(
+                _prepare_lifecycle_link_destination(
+                    action,
+                    same_link,
+                    source,
+                    allow_directories=False,
+                    force=False,
+                )
+            )
+            self.assertEqual(action["status"], "ok")
+
+            file_destination = root / "file"
+            file_destination.write_text("content\n", encoding="utf-8")
+            action = {}
+            self.assertFalse(
+                _prepare_lifecycle_link_destination(
+                    action,
+                    file_destination,
+                    source,
+                    allow_directories=False,
+                    force=False,
+                )
+            )
+            self.assertEqual(action["status"], "conflict_file")
+            self.assertTrue(file_destination.is_file())
+
+            action = {}
+            self.assertTrue(
+                _prepare_lifecycle_link_destination(
+                    action,
+                    file_destination,
+                    source,
+                    allow_directories=False,
+                    force=True,
+                )
+            )
+            self.assertFalse(file_destination.exists())
+
+            directory_destination = root / "directory"
+            directory_destination.mkdir()
+            action = {}
+            self.assertFalse(
+                _prepare_lifecycle_link_destination(
+                    action,
+                    directory_destination,
+                    source,
+                    allow_directories=False,
+                    force=True,
+                )
+            )
+            self.assertEqual(action["status"], "conflict_directory")
+
+            self.assertTrue(
+                _prepare_lifecycle_link_destination(
+                    {},
+                    directory_destination,
+                    source,
+                    allow_directories=True,
+                    force=True,
+                )
+            )
+            self.assertFalse(directory_destination.exists())
+
+    def test_lifecycle_unlink_and_install_path_state_cover_files_dirs_links_and_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "source"
+            source.mkdir()
+            same_link = root / "same-link"
+            same_link.symlink_to(source, target_is_directory=True)
+            other_source = root / "other-source"
+            other_source.mkdir()
+            different_link = root / "different-link"
+            different_link.symlink_to(other_source, target_is_directory=True)
+            file_path = root / "file"
+            file_path.write_text("content\n", encoding="utf-8")
+            directory_path = root / "directory"
+            directory_path.mkdir()
+            (directory_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+
+            self.assertEqual(_install_path_state(root / "missing"), {"state": "missing"})
+            self.assertEqual(_install_path_state(same_link, str(source))["state"], "same_link")
+            self.assertEqual(_install_path_state(different_link, str(source))["state"], "different_link")
+            self.assertEqual(_install_path_state(file_path)["state"], "file")
+            self.assertEqual(_install_path_state(directory_path)["state"], "directory")
+            self.assertTrue(_install_path_state(directory_path)["has_skill_md"])
+
+            action: dict[str, str] = {}
+            _apply_lifecycle_unlink(action, root / "missing", dry_run=True, allow_directories=False)
+            self.assertEqual(action["status"], "missing")
+
+            action = {}
+            _apply_lifecycle_unlink(action, file_path, dry_run=True, allow_directories=False)
+            self.assertEqual(action["status"], "would_unlink")
+
+            action = {}
+            _apply_lifecycle_unlink(action, file_path, dry_run=False, allow_directories=False)
+            self.assertEqual(action["status"], "unlinked")
+            self.assertFalse(file_path.exists())
+
+            action = {}
+            _apply_lifecycle_unlink(action, directory_path, dry_run=False, allow_directories=False)
+            self.assertEqual(action["status"], "skipped_directory")
+            self.assertTrue(directory_path.exists())
+
+            action = {}
+            _apply_lifecycle_unlink(action, directory_path, dry_run=False, allow_directories=True)
+            self.assertEqual(action["status"], "removed_directory")
+            self.assertFalse(directory_path.exists())
+
+    def test_lifecycle_prune_sync_and_target_state_helpers_classify_visibility(self) -> None:
+        visibility = {
+            "issues": {
+                "scope_violations": [
+                    {"name": "alpha", "path": "/skills/alpha", "layer": "global"},
+                    {"name": "beta", "path": "/skills/beta", "layer": "global"},
+                ],
+                "global_not_allowed": [{"name": "alpha", "path": "/global/alpha"}],
+                "extra_global": [{"name": "alpha"}],
+                "broken_global": [{"name": "alpha", "path": "/broken/alpha"}],
+                "broken_project": [{"name": "gamma", "path": "/project/gamma"}],
+                "missing_for_cwd": [{"name": "alpha"}, {"name": ""}, {}],
+            }
+        }
+
+        alpha_actions = _plan_skill_prune_actions(visibility, "alpha")
+        all_actions = _plan_skill_prune_actions(visibility, None)
+
+        self.assertEqual([action["skill"] for action in alpha_actions], ["alpha", "alpha", "alpha"])
+        self.assertEqual([action["reason"] for action in alpha_actions], [
+            "scope_violations",
+            "global_not_allowed",
+            "broken_global",
+        ])
+        self.assertEqual(len(all_actions), 5)
+        self.assertEqual(_sync_wanted_skill_names(visibility, "explicit"), ["explicit"])
+        self.assertEqual(_sync_wanted_skill_names(visibility, None), ["alpha"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            target_root = root / "target"
+            ok_dir = target_root / "ok-skill"
+            stale_dir = target_root / "stale-skill"
+            present_dir = target_root / "present-skill"
+            ok_dir.mkdir(parents=True)
+            stale_dir.mkdir()
+            present_dir.mkdir()
+            (ok_dir / "SKILL.md").write_text("# OK\n", encoding="utf-8")
+            (stale_dir / "SKILL.md").write_text("# Stale\n", encoding="utf-8")
+            (present_dir / "SKILL.md").write_text("# Present\n", encoding="utf-8")
+            skillset = {"install_targets": [{"id": "codex", "host_path": str(target_root)}]}
+
+            self.assertEqual(
+                _target_states_for_skill(skillset, "missing-skill", {"install_tree_sha": "sha"})[0]["state"],
+                "missing",
+            )
+            self.assertEqual(
+                _target_states_for_skill(
+                    skillset,
+                    "ok-skill",
+                    {"install_tree_sha": directory_tree_sha256(ok_dir)},
+                )[0]["state"],
+                "ok",
+            )
+            self.assertEqual(
+                _target_states_for_skill(skillset, "stale-skill", {"install_tree_sha": "wrong"})[0]["state"],
+                "stale",
+            )
+            self.assertEqual(
+                _target_states_for_skill(skillset, "present-skill", {})[0]["state"],
+                "present",
+            )
+
+    def test_scope_filters_removal_plans_and_compact_payload_helpers(self) -> None:
+        self.assertTrue(_scope_filter_matches({"layer": "global:codex"}, "all"))
+        self.assertTrue(_scope_filter_matches({"layer": "project:claude"}, "all"))
+        self.assertFalse(_scope_filter_matches({"layer": "client:personal"}, "all"))
+        self.assertTrue(_scope_filter_matches({"layer": "global:claude"}, "global"))
+        self.assertFalse(_scope_filter_matches({"layer": "project:claude"}, "global"))
+        self.assertTrue(_scope_filter_matches({"layer": "project:codex"}, "project"))
+        self.assertFalse(_scope_filter_matches({"layer": "global:codex"}, "project"))
+        self.assertTrue(_scope_filter_matches({"layer": "project:codex"}, "unknown"))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            global_path = root / "global"
+            project_path = root / "project"
+            same_path = root / "same"
+            for path in (global_path, project_path, same_path):
+                path.mkdir()
+            occurrences = [
+                {"name": "alpha", "layer": "global:codex", "path": str(global_path), "source": "/src/alpha"},
+                {"name": "alpha", "layer": "project:claude", "path": str(project_path), "source": "/src/alpha"},
+                {"name": "alpha", "layer": "global:claude", "path": str(same_path), "source": "/src/alpha"},
+                {"name": "alpha", "layer": "client:personal", "path": str(root / "client"), "source": "/src/alpha"},
+            ]
+            with mock.patch(
+                "runtime_manager.skill_visibility._installed_occurrences_for_skill",
+                return_value=occurrences,
+            ):
+                self.assertEqual(
+                    _plan_skill_removals({}, "sync", "alpha", root, "all", []),
+                    [],
+                )
+                remove_actions = _plan_skill_removals({}, "remove", "alpha", root, "project", [])
+                move_actions = _plan_skill_removals(
+                    {},
+                    "move",
+                    "alpha",
+                    root,
+                    "all",
+                    [{"op": "link", "destination": str(same_path)}],
+                )
+
+        self.assertEqual([action["destination"] for action in remove_actions], [str(project_path)])
+        self.assertEqual([action["reason"] for action in move_actions], ["move source cleanup", "move source cleanup"])
+        self.assertNotIn(str(same_path), [action["destination"] for action in move_actions])
+
+        compact = compact_skill_visibility_payload(
+            {
+                "cwd": "/repo",
+                "active_clients": ["personal"],
+                "active_profiles": ["core"],
+                "matched_clients": [{"id": "personal"}],
+                "matched_project_categories": [{"id": "frontend"}],
+                "matched_scope_rules": [{"id": "frontend-rule"}],
+                "summary": {"effective": 1},
+                "effective": [
+                    {
+                        "name": "ui",
+                        "layer": "project",
+                        "state": "ok",
+                        "source_bucket": "repo",
+                        "source": "/repo/skills/ui",
+                        "path": "/repo/.codex/skills/ui",
+                        "unused": "drop",
+                    }
+                ],
+                "issues": {"missing_for_cwd": [{"name": "seo"}], "extra": [{"name": "drop"}]},
+                "recommendations": [{"action": "add_project_skill"}],
+                "policy": {"global_allowlist": []},
+                "source_roots": ["/repo/skills"],
+                "undefined_sources": [{"name": "old"}],
+                "next_actions": ["sync"],
+            }
+        )
+
+        self.assertEqual(compact["effective"][0]["name"], "ui")
+        self.assertNotIn("unused", compact["effective"][0])
+        self.assertEqual(compact["issues"]["missing_for_cwd"], [{"name": "seo"}])
+        self.assertNotIn("extra", compact["issues"])
+        self.assertEqual(compact["source_roots"], ["/repo/skills"])
+
+    def test_print_skill_visibility_text_renders_summary_layers_issues_and_limits(self) -> None:
+        payload = {
+            "cwd": "/repo/app",
+            "active_clients": ["personal"],
+            "active_profiles": ["core", "dev"],
+            "matched_clients": [{"id": "personal", "match": "cwd"}],
+            "matched_project_categories": [{"id": "frontend"}],
+            "summary": {
+                "effective": 3,
+                "occurrences": 5,
+                "undefined_sources": 2,
+                "broken_global": 1,
+                "broken_global_skills": 1,
+                "broken_project": 1,
+                "broken_project_skills": 1,
+                "global_not_allowed": 1,
+                "global_not_allowed_skills": 1,
+                "extra_global": 2,
+                "extra_global_skills": 1,
+                "shadowed": 1,
+                "archive_sources": 1,
+                "archive_source_skills": 1,
+                "scope_violations": 1,
+                "scope_violation_skills": 1,
+                "missing_for_cwd": 2,
+                "missing_for_cwd_skills": 2,
+            },
+            "layers": [
+                {
+                    "id": "default",
+                    "kind": "declared",
+                    "skill_count": 2,
+                    "healthy_targets": 1,
+                    "target_count": 2,
+                    "config_error": "bad config",
+                    "lock_error": "bad lock",
+                },
+                {
+                    "id": "global",
+                    "kind": "installed",
+                    "skill_count": 3,
+                    "present": False,
+                    "broken_count": 1,
+                },
+            ],
+            "effective": [
+                {
+                    "name": "domain-planner",
+                    "layer": "client:personal",
+                    "state": "ok",
+                    "source_bucket": "repo",
+                    "shadowed_count": 1,
+                },
+                {
+                    "name": "ui",
+                    "layer": "project",
+                    "availability": "declared",
+                    "source_bucket": "project",
+                },
+            ],
+            "issues": {
+                "shadowed": [
+                    {
+                        "name": "domain-planner",
+                        "winner_layer": "client:personal",
+                        "shadowed_layers": ["default"],
+                    }
+                ],
+                "scope_violations": [
+                    {
+                        "name": "ui",
+                        "layer": "global",
+                        "path": "/skills/ui",
+                        "scope_rule": "frontend",
+                        "allowed_paths": ["/repo/.claude/skills"],
+                    }
+                ],
+                "global_not_allowed": [
+                    {"name": "legacy", "layer": "global", "path": "/skills/legacy"}
+                ],
+                "missing_for_cwd": [
+                    {
+                        "name": "ga4",
+                        "scope_rule": "frontend",
+                        "categories": ["frontend"],
+                        "allowed_paths": ["/repo/.claude/skills"],
+                    },
+                    {
+                        "name": "seo",
+                        "scope_rule": "frontend",
+                        "categories": ["frontend"],
+                        "allowed_paths": [],
+                    },
+                ],
+            },
+            "undefined_sources": [
+                {"name": "unused", "source_bucket": "repo", "source": "/sources/unused"},
+                {"name": "stale", "source_bucket": "archive", "source": "/archive/stale"},
+            ],
+            "source_roots": ["/sources", "/archive"],
+            "next_actions": ["doctor --format json"],
+            "recommendations": [
+                {"action": "add_project_skill", "skill": "ga4", "hint": "frontend"},
+                {"action": "prune_global", "skill": "legacy", "hint": "allowlist"},
+            ],
+        }
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            print_skill_visibility_text(payload, show_shadowed=True, limit=1)
+        output = buffer.getvalue()
+
+        self.assertIn("skills: 3 effective, 5 occurrences, 2 undefined/not synced", output)
+        self.assertIn("active: clients=personal profiles=core, dev", output)
+        self.assertIn("pwd match: personal@cwd", output)
+        self.assertIn("project categories: frontend", output)
+        self.assertIn("  - default: 2 skills, 1/2 targets healthy, config error, lock error", output)
+        self.assertIn("  - global: 3 skills, missing, 1 broken", output)
+        self.assertIn("  - broken_global: 1 links / 1 skills", output)
+        self.assertIn("  - scope_violations: 1 installs / 1 skills", output)
+        self.assertIn("  - missing_for_cwd: 2 rules / 2 skills", output)
+        self.assertIn("  - domain-planner: client:personal ok repo shadows=1", output)
+        self.assertIn("  ... 1 more (rerun with --full)", output)
+        self.assertIn("shadowed:\n  - domain-planner: winner=client:personal hidden=default", output)
+        self.assertIn("scope_violations:\n  - ui: global at /skills/ui", output)
+        self.assertIn("global_not_allowed:\n  - legacy: global at /skills/legacy", output)
+        self.assertIn("missing_for_cwd:\n  - ga4: rule=frontend categories=frontend", output)
+        self.assertIn("  ... 1 more missing cwd-scoped skills", output)
+        self.assertIn("undefined / not synced (2 from 2 source roots):", output)
+        self.assertIn("  - unused: repo /sources/unused", output)
+        self.assertIn("  ... 1 more undefined source skills (rerun with --full)", output)
+        self.assertIn("next_actions:\n  - doctor --format json", output)
+        self.assertIn("recommendations:\n  - add_project_skill: ga4 (frontend)", output)
+        self.assertIn("  ... 1 more recommendations", output)
+
+    def test_print_skill_visibility_text_issues_only_omits_layers_and_effective(self) -> None:
+        payload = {
+            "cwd": "/repo",
+            "summary": {"missing_for_cwd": 1, "missing_for_cwd_skills": 1},
+            "issues": {
+                "missing_for_cwd": [
+                    {
+                        "name": "ui",
+                        "scope_rule": "frontend",
+                        "categories": [],
+                        "allowed_paths": [],
+                    }
+                ]
+            },
+        }
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            print_skill_visibility_text(payload, issues_only=True)
+        output = buffer.getvalue()
+
+        self.assertIn("skills: 0 effective, 0 occurrences", output)
+        self.assertIn("issues:", output)
+        self.assertIn("missing_for_cwd:\n  - ui: rule=frontend categories=(none) allowed=(none)", output)
+        self.assertNotIn("layers:", output)
+        self.assertNotIn("effective:", output)
+
+    def test_print_skill_lifecycle_text_renders_noop_actions_and_activation_packet(self) -> None:
+        no_actions = {
+            "action": "sync",
+            "skill": None,
+            "dry_run": True,
+            "cwd": "/repo",
+            "resolved_to": "project",
+            "actions": [],
+        }
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            print_skill_lifecycle_text(no_actions)
+        self.assertIn("actions: none", buffer.getvalue())
+
+        payload = {
+            "action": "activate",
+            "skill": "domain-planner",
+            "dry_run": False,
+            "cwd": "/repo",
+            "resolved_to": "client",
+            "selected_source": {"source": "/sources/domain-planner"},
+            "warnings": ["already linked elsewhere"],
+            "actions": [
+                {
+                    "status": "linked",
+                    "op": "link",
+                    "skill": "domain-planner",
+                    "destination": "/repo/.codex/skills/domain-planner",
+                }
+            ],
+            "activation_packet": {
+                "name": "domain-planner",
+                "source": "/sources/domain-planner",
+                "skill_md_sha256": "a" * 64,
+                "skill_md": "# Domain Planner\n",
+            },
+        }
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            print_skill_lifecycle_text(payload)
+        output = buffer.getvalue()
+
+        self.assertIn("skill activate: domain-planner (apply)", output)
+        self.assertIn("source: /sources/domain-planner", output)
+        self.assertIn("warning: already linked elsewhere", output)
+        self.assertIn("  - linked: link domain-planner -> /repo/.codex/skills/domain-planner", output)
+        self.assertIn("activation packet:", output)
+        self.assertIn("skill_md_sha256: " + "a" * 64, output)
+        self.assertIn("# Domain Planner", output)
+
     def test_installed_root_reports_broken_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / "skills"
@@ -324,6 +840,141 @@ class SkillVisibilityTests(unittest.TestCase):
             self.assertEqual(missing["ui"]["categories"], ["frontend"])
             actions = {item["action"] for item in payload["recommendations"]}
             self.assertIn("add_project_skill", actions)
+
+    def test_project_category_and_declared_name_helpers_cover_policy_shapes(self) -> None:
+        policy = {
+            "_policy_path": "/policy.yaml",
+            "project_categories": {
+                "frontend": {"paths": ["~/frontend"], "notes": "UI"},
+                "backend": ["~/backend"],
+                "": {"paths": ["ignored"]},
+            },
+        }
+        categories = _project_categories_for_policy(policy)
+        self.assertEqual([category["id"] for category in categories], ["frontend", "backend"])
+        self.assertEqual(categories[0]["notes"], "UI")
+        self.assertEqual(categories[1]["notes"], "")
+        self.assertEqual(categories[0]["policy_path"], "/policy.yaml")
+
+        list_policy = {
+            "project_categories": [
+                {"id": "mobile", "allowed_paths": ["~/ios"], "description": "apps"},
+                {"name": "docs", "paths": ["~/docs"]},
+                "ignored",
+            ],
+        }
+        self.assertEqual(
+            [(category["id"], category["notes"]) for category in _project_categories_for_policy(list_policy)],
+            [("mobile", "apps"), ("docs", "")],
+        )
+        self.assertEqual(_skill_repo_declared_names({"pick": ["alpha", "", "beta"]}, "path", "/repo"), ["alpha", "beta"])
+        self.assertEqual(_skill_repo_declared_names({}, "repo", "owner/gamma"), ["gamma"])
+        self.assertEqual(_skill_repo_declared_names({}, "path", "/tmp/delta"), ["delta"])
+        self.assertEqual(_skill_repo_declared_names({}, "distributor", "acme"), [])
+
+    def test_declared_skill_occurrences_counts_lock_targets_and_lock_only_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config = root / "skill-repos.yaml"
+            config.write_text("skill_repos:\n  - pick: [alpha]\n", encoding="utf-8")
+            install_root = root / "installed"
+            alpha_install = install_root / "alpha"
+            alpha_install.mkdir(parents=True)
+            (alpha_install / "SKILL.md").write_text("# Alpha\n", encoding="utf-8")
+            alpha_tree = directory_tree_sha256(alpha_install)
+            lock_path = root / "skill-repos.lock.json"
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "skills": [
+                            {
+                                "name": "alpha",
+                                "source_path": str(root / "alpha-source"),
+                                "declared_ref": "main",
+                                "resolved_commit": "abc123",
+                                "install_tree_sha": alpha_tree,
+                            },
+                            {
+                                "name": "beta",
+                                "repo": "owner/beta",
+                                "declared_ref": "v1",
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            skillset = {
+                "id": "personal-skills",
+                "kind": "skill-repo-set",
+                "skill_repos_config_host_path": str(config),
+                "lock_path_host_path": str(lock_path),
+                "install_targets": [{"id": "codex", "host_path": str(install_root)}],
+            }
+            model = {
+                "active_clients": ["personal"],
+                "skills": [{"id": "plain"}, skillset],
+            }
+
+            with mock.patch(
+                "runtime_manager.skill_visibility.load_skill_repos_config",
+                return_value={"skill_repos": [{"path": str(root / "alpha-source"), "pick": ["alpha"]}]},
+            ):
+                occurrences, layers = _declared_skill_occurrences(model)
+
+        by_name = {occurrence["name"]: occurrence for occurrence in occurrences}
+        self.assertEqual(set(by_name), {"alpha", "beta"})
+        self.assertEqual(by_name["alpha"]["scope"], "client")
+        self.assertEqual(by_name["alpha"]["targets"][0]["state"], "ok")
+        self.assertEqual(by_name["beta"]["source_kind"], "repo")
+        self.assertEqual(by_name["beta"]["source_bucket"], "repo")
+        self.assertEqual(layers[0]["skill_count"], 2)
+        self.assertEqual(layers[0]["healthy_targets"], 1)
+        self.assertEqual(layers[0]["target_count"], 2)
+
+    def test_skill_destination_bases_cover_auto_category_and_project_fallbacks(self) -> None:
+        cwd = Path("/repo/app")
+        with mock.patch("runtime_manager.skill_visibility._global_install_allowed", return_value=True):
+            self.assertEqual(
+                _skill_destination_bases({}, "ui", cwd=cwd, to="auto", categories=[]),
+                ("global", [{"scope": "global", "path": None, "category": None}], []),
+            )
+
+        with (
+            mock.patch("runtime_manager.skill_visibility._global_install_allowed", return_value=False),
+            mock.patch("runtime_manager.skill_visibility._matching_scope_rule", return_value=None),
+            mock.patch("runtime_manager.skill_visibility._repo_root_for_skill_install", return_value=Path("/repo")),
+        ):
+            resolved_to, bases, warnings = _skill_destination_bases({}, "ui", cwd=cwd, to="category", categories=[])
+        self.assertEqual(resolved_to, "project")
+        self.assertEqual(bases, [{"scope": "project", "path": "/repo", "category": None}])
+        self.assertIn("falling back to the current repo", warnings[0])
+
+        def category_by_id(_model: dict, category_id: str) -> dict | None:
+            if category_id == "frontend":
+                return {"paths": ["/repo/a", "/repo/b"]}
+            return None
+
+        with mock.patch("runtime_manager.skill_visibility._category_by_id", side_effect=category_by_id):
+            resolved_to, bases, warnings = _skill_destination_bases(
+                {},
+                "ui",
+                cwd=cwd,
+                to="category",
+                categories=["frontend", "missing"],
+            )
+        self.assertEqual(resolved_to, "category")
+        self.assertEqual([base["path"] for base in bases], ["/repo/a", "/repo/b"])
+        self.assertEqual(warnings, ["Unknown project category: missing"])
+
+        with (
+            mock.patch("runtime_manager.skill_visibility._matching_scope_rule", return_value={"paths": ["/repo", "/repo/app"]}),
+            mock.patch("runtime_manager.skill_visibility._repo_root_for_skill_install", return_value=Path("/fallback")),
+        ):
+            self.assertEqual(
+                _skill_destination_bases({}, "ui", cwd=cwd, to="project", categories=[])[1],
+                [{"scope": "project", "path": "/repo/app", "category": None}],
+            )
 
     def test_skill_lifecycle_add_links_skill_to_category_repos(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -698,22 +1349,6 @@ class SkillVisibilityTests(unittest.TestCase):
                 "clients": [],
                 "skills": [],
             }
-            occurrences = [
-                {
-                    "name": "always-global",
-                    "availability": "installed",
-                    "layer": "global:claude",
-                    "state": "ok",
-                    "path": str(root / "global" / "always-global"),
-                },
-                {
-                    "name": "too-broad",
-                    "availability": "installed",
-                    "layer": "global:claude",
-                    "state": "ok",
-                    "path": str(root / "global" / "too-broad"),
-                },
-            ]
 
             from runtime_manager.skill_visibility import _global_install_allowed  # noqa: PLC0415
 
