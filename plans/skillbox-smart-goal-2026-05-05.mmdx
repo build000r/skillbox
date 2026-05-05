@@ -1,0 +1,190 @@
+<!-- mmdx
+{
+  "entry": "main",
+  "links": [
+    {
+      "from": "main",
+      "label": "Reality Baseline",
+      "to": "reality-gap",
+      "title": "Open current reality and proof gaps"
+    },
+    {
+      "from": "main",
+      "label": "Goal Contract",
+      "to": "goal-contract",
+      "title": "Open the Phase 0 release candidate contract"
+    },
+    {
+      "from": "main",
+      "label": "Commit And Reproduce",
+      "to": "routing",
+      "title": "Open first execution route"
+    },
+    {
+      "from": "main",
+      "label": "Ambition And Refinement",
+      "to": "ambition-loop",
+      "title": "Open plan-space refinement loop"
+    },
+    {
+      "from": "main",
+      "label": "Proof Hardening",
+      "to": "hardening-loop",
+      "title": "Open recurring hardening loop"
+    },
+    {
+      "from": "main",
+      "label": "Final Proof Gate",
+      "to": "proof-gate",
+      "title": "Open release proof gate"
+    }
+  ]
+}
+-->
+
+## chart main Skillbox Phase 0 Release Candidate Gantt
+```mermaid
+gantt
+  title Skillbox Smart Goal Tracker - Phase 0 Release Candidate
+  dateFormat  YYYY-MM-DD
+  axisFormat  %b %d
+
+  section Now: Reality
+  Reality Baseline       :done, reality, 2026-05-05, 1d
+  Health Gates Green     :done, gates, 2026-05-05, 1d
+  No Beads Initialized   :crit, no-beads, 2026-05-05, 1d
+
+  section Goal Contract
+  Goal Contract          :crit, contract, 2026-05-05, 1d
+  Ambition And Refinement:active, refine, 2026-05-06, 1d
+
+  section Release Candidate
+  Freeze Dirty Scope     :crit, freeze, 2026-05-06, 1d
+  Commit And Reproduce   :crit, commit, 2026-05-06, 2d
+  Proof Hardening        :crit, harden, 2026-05-08, 2d
+  Docs Match Reality     :docs, 2026-05-10, 1d
+  Final Proof Gate       :crit, final, 2026-05-11, 1d
+  Phase 0 RC Met         :milestone, rc, 2026-05-12, 0d
+
+  section Explicitly Later
+  Hosted Distributor Service :later1, 2026-05-13, 3d
+  Laptop UX And Tokens       :later2, 2026-05-13, 3d
+  Dev To Prod Bridge         :later3, 2026-05-16, 5d
+```
+
+## chart goal-contract Phase 0 Release Candidate Contract
+```mermaid
+flowchart TD
+  current["CURRENT: code and docs now claim a production-grade Phase 0 dev runtime"]
+  evidence["WORKING: doctor, dev-sanity, 859 tests, coverage target, CRAP below 20"]
+  gap["GAP: the proof lives in a large dirty worktree, with no beads and no clean-checkout reproduction yet"]
+  goal["LOFTY END GOAL: a committed, reproducible Phase 0 release candidate that a future agent can trust without private context"]
+  bars["QUALITY BARS: green doctor, dev-sanity, coverage XML, CRAP under 20, worker dogfood evidence, docs aligned, no hidden manual state"]
+  done["DONE: logical commits, clean-clone replay, final post-commit reality check agrees"]
+
+  current --> evidence --> gap --> goal --> bars --> done
+
+  classDef ok fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:2px
+  classDef risk fill:#fee2e2,stroke:#dc2626,color:#7f1d1d,stroke-width:2px
+  classDef goalc fill:#ede9fe,stroke:#7c3aed,color:#3b0764,stroke-width:2px
+  class evidence,done ok
+  class gap risk
+  class goal,bars goalc
+```
+
+## chart reality-gap Current Reality And Gaps
+```mermaid
+flowchart LR
+  docs["Docs vision: private Tailnet dev box, durable state, runtime graph, agent context, worker broker"]
+  code["Code reality: runtime manager, distribution client, broker contract, Codex adapter, pulse, client projection"]
+  proof["Proof today: make doctor green; make dev-sanity green with one warning; 859 tests green; coverage 85%; CRAP 19.94 and 9.00"]
+  missing["Missing proof: clean-checkout replay, installer acceptance smoke, live DO/Tailscale path, committed evidence"]
+  beads["Beads: none initialized, so no backlog coverage exists"]
+  later["Later scope: hosted distributor, laptop UX, short-lived tokens, background checks, prod bridge"]
+
+  docs --> code --> proof
+  proof --> missing
+  proof --> beads
+  proof --> later
+
+  classDef ok fill:#dcfce7,stroke:#16a34a,color:#14532d
+  classDef risk fill:#fee2e2,stroke:#dc2626,color:#7f1d1d,stroke-width:2px
+  classDef neutral fill:#f8fafc,stroke:#64748b,color:#0f172a
+  class docs,code,later neutral
+  class proof ok
+  class missing,beads risk
+```
+
+## chart routing Build Vs Clone And First Route
+```mermaid
+flowchart TD
+  start["Start from the dirty but passing worktree"]
+  bvc["Build-vs-clone call: improve and commit the existing runtime; do not create a new platform slice"]
+  freeze["Freeze scope: classify tracked edits, untracked tests, and Codex adapter into logical batches"]
+  commit["Commit batches only after each has native proof"]
+  reproduce["Reproduce from clean clone or temp checkout"]
+  smoke["Run installer or acceptance smoke where non-destructive"]
+  recheck["Run post-commit reality check"]
+
+  start --> bvc --> freeze --> commit --> reproduce --> smoke --> recheck
+
+  classDef crit fill:#fee2e2,stroke:#dc2626,color:#7f1d1d,stroke-width:2px
+  classDef action fill:#f8fafc,stroke:#64748b,color:#0f172a
+  class freeze,commit,reproduce,smoke,recheck crit
+  class start,bvc action
+```
+
+## chart ambition-loop Plan Space Ambition And Refinement
+```mermaid
+flowchart TD
+  baseline["Reality baseline"]
+  round1["Ambition pass 1: make Phase 0 useful without private context"]
+  round2["Ambition pass 2: make proof reproducible from clean checkout"]
+  round3["Domain depth: agent workstation safety, runtime contracts, operator ergonomics"]
+  tasks["Convert remaining gaps to beads or a workgraph before implementation"]
+  refine["Refine 4-5 passes until no proof gap remains"]
+  ready["Ready frontier: commit, reproduce, installer smoke, final reality check"]
+
+  baseline --> round1 --> round2 --> round3 --> tasks --> refine --> ready
+
+  classDef ambition fill:#ede9fe,stroke:#7c3aed,color:#3b0764,stroke-width:2px
+  classDef readyc fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:2px
+  class round1,round2,round3,refine ambition
+  class ready readyc
+```
+
+## chart hardening-loop Recurring Proof Hardening Loop
+```mermaid
+stateDiagram-v2
+  [*] --> Describe
+  Describe --> Reproduce
+  Reproduce --> CRAP
+  CRAP --> ImplementOrCommit
+  ImplementOrCommit --> Tests
+  Tests --> Docs
+  Docs --> RealityCheck
+  RealityCheck --> NextGap: gap remains
+  RealityCheck --> FinalGate: proof passes
+  NextGap --> Describe
+  FinalGate --> [*]
+```
+
+## chart proof-gate Final Release Proof Gate
+```mermaid
+flowchart TD
+  tests["python3 -m unittest discover -s tests: 859 tests pass"]
+  doctor["make doctor: 13 pass, 0 warn, 0 fail"]
+  sanity["make dev-sanity: 23 pass, 1 warning, 0 fail"]
+  coverage["make python-cov-xml: coverage.xml written, total 85%"]
+  crap["CRAP: .env-manager 19.94; Codex adapter 9.00"]
+  clean["Clean-checkout replay proves no hidden state"]
+  commit["Logical commits preserve every new file"]
+  reality["Post-commit reality check agrees Phase 0 is actually done"]
+
+  tests --> doctor --> sanity --> coverage --> crap --> clean --> commit --> reality
+
+  classDef required fill:#fee2e2,stroke:#dc2626,color:#7f1d1d,stroke-width:2px
+  classDef passed fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:2px
+  class tests,doctor,sanity,coverage,crap passed
+  class clean,commit,reality required
+```
