@@ -28,6 +28,8 @@ from runtime_manager.shared import (
     _load_skillignore,
     _matches_skillignore,
     _clone_or_fetch_repo,
+    _persist_skill_repo_lockfile,
+    _resolve_skill_repo_entry_source,
     _resolve_skill_dirs,
     clone_dir_name,
     directory_tree_sha256,
@@ -35,12 +37,44 @@ from runtime_manager.shared import (
     filtered_copy_skill,
     load_json_file,
     load_skill_repos_config,
+    sync_skill_repo_sets,
     write_json_file,
 )
 
 
 def _completed(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+
+def _write_skill(source_root: Path, skill_name: str, body: str = "# Skill\n") -> Path:
+    skill_dir = source_root / skill_name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(body, encoding="utf-8")
+    return skill_dir
+
+
+def _skill_repo_set_model(config_path: Path, lock_path: Path, clone_root: Path, install_root: Path) -> dict[str, object]:
+    return {
+        "skills": [
+            {"kind": "inline-skill", "sync": {"mode": "clone-and-install"}},
+            {
+                "kind": "skill-repo-set",
+                "sync": {"mode": "manual"},
+                "skill_repos_config_host_path": str(config_path),
+                "lock_path_host_path": str(lock_path),
+                "clone_root_host_path": str(clone_root),
+                "install_targets": [{"id": "codex", "host_path": str(install_root)}],
+            },
+            {
+                "kind": "skill-repo-set",
+                "sync": {"mode": "clone-and-install"},
+                "skill_repos_config_host_path": str(config_path),
+                "lock_path_host_path": str(lock_path),
+                "clone_root_host_path": str(clone_root),
+                "install_targets": [{"id": "codex", "host_path": str(install_root)}],
+            },
+        ]
+    }
 
 
 class TestSkillReposConfig(unittest.TestCase):
@@ -117,6 +151,61 @@ class TestCloneDirName(unittest.TestCase):
 
 
 class TestCloneOrFetchRepo(unittest.TestCase):
+    def test_existing_clone_returns_dirty_without_fetching(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clone_root = Path(tmpdir)
+            clone_path = clone_root / "owner-skills"
+            clone_path.mkdir()
+            commands: list[list[str]] = []
+
+            def fake_run_command(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+                del cwd
+                commands.append(args)
+                if args[:2] == ["git", "status"]:
+                    return _completed(stdout=" M SKILL.md\n")
+                self.fail(f"unexpected command after dirty status: {args}")
+
+            with mock.patch("runtime_manager.shared.run_command", side_effect=fake_run_command):
+                action, resolved_path, commit = _clone_or_fetch_repo("owner/skills", "main", clone_root, dry_run=False)
+
+            self.assertEqual(action, "SKILL_REPO_DIRTY")
+            self.assertEqual(resolved_path, clone_path)
+            self.assertIsNone(commit)
+            self.assertEqual(commands, [["git", "status", "--porcelain"]])
+
+    def test_existing_clone_raises_when_fetch_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clone_root = Path(tmpdir)
+            clone_path = clone_root / "owner-skills"
+            clone_path.mkdir()
+
+            def fake_run_command(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+                del cwd
+                if args[:2] == ["git", "status"]:
+                    return _completed()
+                if args[:2] == ["git", "fetch"]:
+                    return _completed(1, stderr="network down")
+                self.fail(f"unexpected command after fetch failure: {args}")
+
+            with mock.patch("runtime_manager.shared.run_command", side_effect=fake_run_command):
+                with self.assertRaises(RuntimeError) as ctx:
+                    _clone_or_fetch_repo("owner/skills", "main", clone_root, dry_run=False)
+
+            self.assertIn("git fetch failed", str(ctx.exception))
+
+    def test_clone_dry_run_returns_target_paths_without_git(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clone_root = Path(tmpdir)
+            existing = clone_root / "owner-skills"
+            existing.mkdir()
+
+            fetched = _clone_or_fetch_repo("owner/skills", "main", clone_root, dry_run=True)
+            shutil.rmtree(existing)
+            cloned = _clone_or_fetch_repo("owner/skills", "main", clone_root, dry_run=True)
+
+            self.assertEqual(fetched, ("fetched", existing, None))
+            self.assertEqual(cloned, ("cloned", existing, None))
+
     def test_existing_clone_raises_when_ref_checkout_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             clone_root = Path(tmpdir)
@@ -215,6 +304,48 @@ class TestCloneOrFetchRepo(unittest.TestCase):
             self.assertEqual(clone_path, clone_root / "owner-skills")
             self.assertEqual(commit, "abc123")
             self.assertIn(["git", "checkout", "main"], commands)
+
+    def test_new_clone_falls_back_to_ssh_and_reports_clone_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clone_root = Path(tmpdir)
+            commands: list[list[str]] = []
+
+            def fake_run_command(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+                del cwd
+                commands.append(args)
+                if args == ["git", "clone", "https://github.com/owner/skills.git", str(clone_root / "owner-skills")]:
+                    return _completed(1, stderr="https denied")
+                if args == ["git", "clone", "git@github.com:owner/skills.git", str(clone_root / "owner-skills")]:
+                    (clone_root / "owner-skills").mkdir()
+                    return _completed()
+                if args[:2] == ["git", "checkout"]:
+                    return _completed()
+                if args[:2] == ["git", "rev-parse"]:
+                    return _completed(stdout="abc123\n")
+                self.fail(f"unexpected command: {args}")
+
+            with mock.patch("runtime_manager.shared.run_command", side_effect=fake_run_command):
+                action, clone_path, commit = _clone_or_fetch_repo("owner/skills", "main", clone_root, dry_run=False)
+
+            self.assertEqual(action, "cloned")
+            self.assertEqual(clone_path, clone_root / "owner-skills")
+            self.assertEqual(commit, "abc123")
+            self.assertEqual(commands[0][2], "https://github.com/owner/skills.git")
+            self.assertEqual(commands[1][2], "git@github.com:owner/skills.git")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clone_root = Path(tmpdir)
+
+            def fail_clone(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+                del cwd
+                if args[:2] == ["git", "clone"]:
+                    return _completed(1, stderr="clone denied")
+                self.fail(f"unexpected command after clone failure: {args}")
+
+            with mock.patch("runtime_manager.shared.run_command", side_effect=fail_clone):
+                with self.assertRaises(RuntimeError) as ctx:
+                    _clone_or_fetch_repo("owner/skills", "main", clone_root, dry_run=False)
+            self.assertIn("failed to clone", str(ctx.exception))
 
 
 class TestSkillignore(unittest.TestCase):
@@ -399,6 +530,193 @@ class TestResolveSkillDirs(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 _resolve_skill_dirs(entry, root, "skills")
             self.assertIn("SKILL_NOT_FOUND_IN_REPO", str(ctx.exception))
+
+
+class TestResolveSkillRepoEntrySource(unittest.TestCase):
+    def test_resolves_local_relative_paths_and_rejects_missing_required_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_path = root / "workspace" / "skill-repos.yaml"
+            config_path.parent.mkdir()
+            source_root = config_path.parent / "local-skills"
+            source_root.mkdir()
+            actions: list[str] = []
+
+            resolved = _resolve_skill_repo_entry_source(
+                {"path": "./local-skills"},
+                config_path,
+                root / "clones",
+                {"install_targets": []},
+                False,
+                actions,
+            )
+
+            self.assertEqual(resolved, (source_root.resolve(), "local-skills", None, None))
+
+            missing_entry = {"path": "./missing-skills"}
+            dry_run_result = _resolve_skill_repo_entry_source(
+                missing_entry,
+                config_path,
+                root / "clones",
+                {"install_targets": []},
+                True,
+                actions,
+            )
+            self.assertIsNone(dry_run_result)
+            self.assertTrue(any(action.startswith("skip-local-path:") for action in actions))
+
+            with self.assertRaises(RuntimeError) as ctx:
+                _resolve_skill_repo_entry_source(
+                    missing_entry,
+                    config_path,
+                    root / "clones",
+                    {"install_targets": []},
+                    False,
+                    actions,
+                )
+            self.assertIn("local path does not exist", str(ctx.exception))
+
+    def test_resolves_repo_sources_and_dry_run_install_plan_without_network(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_path = root / "skill-repos.yaml"
+            clone_root = root / "clones"
+            install_root = root / "installed"
+            actions: list[str] = []
+
+            dry_run_result = _resolve_skill_repo_entry_source(
+                {"repo": "owner/skills", "ref": "main", "pick": ["ask-cascade", "describe"]},
+                config_path,
+                clone_root,
+                {"install_targets": [{"id": "codex", "host_path": str(install_root)}]},
+                True,
+                actions,
+            )
+            self.assertIsNone(dry_run_result)
+            self.assertIn("skill-repo-cloned: owner/skills", actions)
+            self.assertIn(f"install-skill: ask-cascade -> {install_root / 'ask-cascade'}", actions)
+            self.assertIn(f"install-skill: describe -> {install_root / 'describe'}", actions)
+
+            repo_root = clone_root / "owner-skills"
+            repo_root.mkdir(parents=True)
+            with mock.patch(
+                "runtime_manager.shared._clone_or_fetch_repo",
+                return_value=("fetched", repo_root, "abc123"),
+            ):
+                fetched = _resolve_skill_repo_entry_source(
+                    {"repo": "owner/skills", "ref": "main"},
+                    config_path,
+                    clone_root,
+                    {"install_targets": []},
+                    False,
+                    actions,
+                )
+            self.assertEqual(fetched, (repo_root, "skills", "owner/skills", "abc123"))
+
+            with mock.patch(
+                "runtime_manager.shared._clone_or_fetch_repo",
+                return_value=("SKILL_REPO_DIRTY", repo_root, None),
+            ):
+                dirty = _resolve_skill_repo_entry_source(
+                    {"repo": "owner/skills", "ref": "main"},
+                    config_path,
+                    clone_root,
+                    {"install_targets": []},
+                    False,
+                    actions,
+                )
+            self.assertIsNone(dirty)
+            self.assertTrue(any(action.startswith("SKILL_REPO_DIRTY: owner/skills") for action in actions))
+
+
+class TestSyncSkillRepoSets(unittest.TestCase):
+    def test_sync_installs_local_skill_repos_and_preserves_unchanged_lock_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_root = root / "source-skills"
+            _write_skill(source_root, "ask-cascade", "# Ask Cascade\n")
+            _write_skill(source_root, "describe", "# Describe\n")
+            config_path = root / "skill-repos.yaml"
+            lock_path = root / "skill-repos.lock.json"
+            clone_root = root / "clones"
+            install_root = root / "installed"
+            config_path.write_text(
+                "version: 2\n"
+                "distributors:\n"
+                "  - id: acme-skills\n"
+                "    url: https://skills.example.test/api/v1\n"
+                "    client_id: client-42\n"
+                "    auth:\n"
+                "      method: api-key\n"
+                "      key_env: ACME_DISTRIBUTOR_KEY\n"
+                "    verification:\n"
+                "      public_key: test-public-key\n"
+                "skill_repos:\n"
+                "  - distributor: acme-skills\n"
+                "  - path: ./source-skills\n"
+                "    pick: [ask-cascade, describe]\n",
+                encoding="utf-8",
+            )
+            model = _skill_repo_set_model(config_path, lock_path, clone_root, install_root)
+
+            with mock.patch.dict(os.environ, {"ACME_DISTRIBUTOR_KEY": "test-token"}):
+                first_actions = sync_skill_repo_sets(model, dry_run=False)
+                first_lock = load_json_file(lock_path)
+                second_actions = sync_skill_repo_sets(model, dry_run=False)
+                second_lock = load_json_file(lock_path)
+
+            self.assertTrue((install_root / "ask-cascade" / "SKILL.md").is_file())
+            self.assertTrue((install_root / "describe" / "SKILL.md").is_file())
+            self.assertEqual([skill["name"] for skill in first_lock["skills"]], ["ask-cascade", "describe"])
+            self.assertEqual(first_lock["synced_at"], second_lock["synced_at"])
+            self.assertIn(f"write-lockfile: {lock_path}", first_actions)
+            self.assertIn(f"lockfile-unchanged: {lock_path}", second_actions)
+
+    def test_sync_dry_run_records_repo_install_plan_and_defers_lockfile_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_path = root / "skill-repos.yaml"
+            lock_path = root / "skill-repos.lock.json"
+            clone_root = root / "clones"
+            install_root = root / "installed"
+            config_path.write_text(
+                "version: 2\n"
+                "skill_repos:\n"
+                "  - repo: owner/skills\n"
+                "    ref: main\n"
+                "    pick: [ask-cascade]\n",
+                encoding="utf-8",
+            )
+            model = _skill_repo_set_model(config_path, lock_path, clone_root, install_root)
+
+            actions = sync_skill_repo_sets(model, dry_run=True)
+
+            self.assertIn("skill-repo-cloned: owner/skills", actions)
+            self.assertIn(f"install-skill: ask-cascade -> {install_root / 'ask-cascade'}", actions)
+            self.assertIn(f"write-lockfile: {lock_path}", actions)
+            self.assertFalse(lock_path.exists())
+            self.assertFalse(install_root.exists())
+
+    def test_persist_lockfile_recovers_from_invalid_existing_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_path = root / "skill-repos.yaml"
+            lock_path = root / "skill-repos.lock.json"
+            config_path.write_text("version: 2\nskill_repos: []\n", encoding="utf-8")
+            lock_path.write_text("{bad json\n", encoding="utf-8")
+            actions: list[str] = []
+
+            _persist_skill_repo_lockfile(
+                lock_path,
+                config_path,
+                [{"name": "ask-cascade", "resolved_commit": "abc", "install_tree_sha": "def"}],
+                actions,
+            )
+
+            lock = load_json_file(lock_path)
+            self.assertEqual(lock["version"], SKILL_REPOS_LOCKFILE_VERSION)
+            self.assertEqual(lock["skills"][0]["name"], "ask-cascade")
+            self.assertIn(f"write-lockfile: {lock_path}", actions)
 
 
 class TestLockFileFormat(unittest.TestCase):

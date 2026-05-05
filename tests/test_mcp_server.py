@@ -83,6 +83,65 @@ class SkillboxMcpServerTests(unittest.TestCase):
         self.assertEqual(sent[0]["params"]["data"]["stderr"], "watch this stderr")
         self.assertEqual(sent[0]["params"]["data"]["mcp_tool_name"], "skillbox_status")
 
+    def test_run_manage_handles_timeout_plain_text_and_empty_failure(self) -> None:
+        sent: list[dict] = []
+        with mock.patch.object(MODULE, "send", side_effect=sent.append), mock.patch.object(
+            MODULE.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["python3"], timeout=1),
+        ):
+            ok, exit_code, payload = MODULE.run_manage(["up", "--wait-seconds", "bogus"])
+        self.assertFalse(ok)
+        self.assertEqual(exit_code, -1)
+        self.assertEqual(payload["error"]["type"], "timeout")
+
+        plain = subprocess.CompletedProcess(["python3"], 1, stdout="not json", stderr="")
+        with mock.patch.object(MODULE, "send", side_effect=sent.append), mock.patch.object(
+            MODULE.subprocess,
+            "run",
+            return_value=plain,
+        ):
+            ok, exit_code, payload = MODULE.run_manage(["status"])
+        self.assertFalse(ok)
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["text"], "not json")
+
+        empty = subprocess.CompletedProcess(["python3"], 1, stdout="", stderr="")
+        with mock.patch.object(MODULE, "send", side_effect=sent.append), mock.patch.object(
+            MODULE.subprocess,
+            "run",
+            return_value=empty,
+        ):
+            ok, exit_code, payload = MODULE.run_manage(["status"])
+        self.assertFalse(ok)
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["exit_code"], 1)
+
+    def test_tool_event_context_handles_empty_and_multi_client_scope(self) -> None:
+        compact = MODULE._compact_log_context(  # noqa: SLF001
+            {"keep": "yes", "drop_none": None, "drop_empty": "", "drop_list": []},
+            extra="value",
+        )
+        self.assertEqual(compact, {"keep": "yes", "extra": "value"})
+
+        context = MODULE.build_tool_event_context(
+            "skillbox_status",
+            "status",
+            {
+                "client": ["personal", "skillbox"],
+                "profile": ["core"],
+                "service": ["api"],
+                "task": ["bootstrap"],
+                "actor": "operator",
+            },
+            "req-scope",
+        )
+        self.assertEqual(context["client_scope"], ["personal", "skillbox"])
+        self.assertEqual(context["profile"], ["core"])
+        self.assertEqual(context["service"], ["api"])
+        self.assertEqual(context["task"], ["bootstrap"])
+        self.assertEqual(context["actor"], "operator")
+
     def test_run_manage_reports_missing_manage_py(self) -> None:
         sent: list[dict] = []
 
@@ -457,6 +516,93 @@ class SkillboxMcpServerTests(unittest.TestCase):
             run_manage.call_args.kwargs["event_context"]["mcp_tool_name"],
             "skillbox_operator_booking",
         )
+
+    def test_worker_runtime_tools_map_contract_arguments(self) -> None:
+        tool_names = {tool["name"] for tool in MODULE.handle_tools_list({})["tools"]}
+        self.assertIn("skillbox_worker_submit", tool_names)
+        self.assertIn("skillbox_worker_status", tool_names)
+        self.assertIn("skillbox_worker_artifacts", tool_names)
+        self.assertIn("skillbox_worker_promote_learning", tool_names)
+
+        with mock.patch.object(
+            MODULE,
+            "run_manage",
+            return_value=(True, 0, {"run_id": "wr_20260504_120000_abcdef"}),
+        ) as run_manage:
+            result = MODULE.handle_tools_call(
+                {
+                    "name": "skillbox_worker_submit",
+                    "arguments": {
+                        "task_class": "analysis",
+                        "instruction": "Inspect repo.",
+                        "client": "skills",
+                        "cwd": "/tmp/repo",
+                        "runtime": "hermes",
+                        "write_scope": "read_only",
+                        "memory_scope": "repo",
+                        "artifact_policy": "summary_and_files",
+                    },
+                },
+                request_id="req-worker",
+            )
+
+        payload = _content_payload(result)
+        self.assertEqual(payload["run_id"], "wr_20260504_120000_abcdef")
+        args = run_manage.call_args.args[0]
+        self.assertEqual(args[:3], ["worker-submit", "--format", "json"])
+        self.assertIn("analysis", args)
+        self.assertIn("Inspect repo.", args)
+        self.assertIn("--client", args)
+        self.assertIn("skills", args)
+        self.assertIn("--cwd", args)
+        self.assertIn("/tmp/repo", args)
+        self.assertIn("--write-scope", args)
+        self.assertIn("read_only", args)
+        self.assertEqual(
+            run_manage.call_args.kwargs["event_context"]["mcp_tool_name"],
+            "skillbox_worker_submit",
+        )
+
+        with mock.patch.object(
+            MODULE,
+            "run_manage",
+            return_value=(True, 0, {"state": "queued"}),
+        ) as run_manage:
+            MODULE.handle_tools_call(
+                {
+                    "name": "skillbox_worker_status",
+                    "arguments": {"run_id": "wr_20260504_120000_abcdef"},
+                },
+                request_id="req-worker-status",
+            )
+        self.assertEqual(
+            run_manage.call_args.args[0],
+            ["worker-status", "--format", "json", "wr_20260504_120000_abcdef"],
+        )
+
+        with mock.patch.object(
+            MODULE,
+            "run_manage",
+            return_value=(True, 0, {"proposal_id": "lp_001", "status": "promoted"}),
+        ) as run_manage:
+            MODULE.handle_tools_call(
+                {
+                    "name": "skillbox_worker_promote_learning",
+                    "arguments": {
+                        "proposal_id": "lp_001",
+                        "approved_by": "operator",
+                        "target_kind": "skill",
+                        "target_location": "opensource/skills/report-analyst",
+                    },
+                },
+                request_id="req-worker-promote",
+            )
+        args = run_manage.call_args.args[0]
+        self.assertEqual(args[:4], ["worker-promote-learning", "--format", "json", "lp_001"])
+        self.assertIn("--approved-by", args)
+        self.assertIn("operator", args)
+        self.assertIn("--target-kind", args)
+        self.assertIn("skill", args)
 
     def test_skillbox_operator_booking_defaults_to_availability(self) -> None:
         with mock.patch.object(
