@@ -42,7 +42,6 @@ from manage import (  # noqa: E402
     log_runtime_event,
     ensure_directory,
     filter_model,
-    live_service_pid,
     normalize_active_clients,
     normalize_active_profiles,
     process_is_running,
@@ -53,7 +52,6 @@ from manage import (  # noqa: E402
     service_supports_lifecycle,
     stop_process,
     sync_runtime,
-    tail_lines,
     translated_runtime_command,
     wait_for_service_health,
 )
@@ -374,175 +372,305 @@ def reconcile_once(
     """Run one reconciliation cycle."""
     state.cycle_count += 1
 
-    # -----------------------------------------------------------------------
-    # 1. Reload the runtime model (picks up any YAML/env changes).
-    # -----------------------------------------------------------------------
+    loaded = _load_pulse_model(root_dir, active_clients, active_profiles)
+    if loaded is None:
+        return
+    model, profiles, clients = loaded
+    _handle_pulse_config_change(root_dir, state, model, auto_sync=auto_sync)
+    now = time.monotonic()
+    _reconcile_pulse_services(
+        model,
+        state,
+        auto_restart=auto_restart,
+        unhealthy_grace_seconds=unhealthy_grace_seconds,
+        now=now,
+    )
+    _reconcile_pulse_checks(model, state)
+    _write_pulse_state(
+        root_dir,
+        state,
+        now=now,
+        auto_restart=auto_restart,
+        auto_sync=auto_sync,
+        active_clients=clients,
+        active_profiles=profiles,
+        unhealthy_grace_seconds=unhealthy_grace_seconds,
+    )
+
+
+def _load_pulse_model(
+    root_dir: Path,
+    active_clients: list[str] | None,
+    active_profiles: list[str] | None,
+) -> tuple[dict[str, Any], set[str], set[str]] | None:
     try:
         model = build_runtime_model(root_dir)
     except Exception as exc:
         log("error", f"failed to load runtime model: {exc}")
-        return
+        return None
 
     profiles = normalize_active_profiles(active_profiles)
     try:
         clients = normalize_active_clients(model, active_clients)
     except RuntimeError:
         clients = set()
-    model = filter_model(model, profiles, clients)
+    return filter_model(model, profiles, clients), profiles, clients
 
-    # -----------------------------------------------------------------------
-    # 2. Detect config changes.
-    # -----------------------------------------------------------------------
+
+def _handle_pulse_config_change(
+    root_dir: Path,
+    state: PulseState,
+    model: dict[str, Any],
+    *,
+    auto_sync: bool,
+) -> None:
     new_hash = _model_config_hash(root_dir)
-    if state.config_hash and new_hash != state.config_hash:
-        log_runtime_event("pulse.config_changed", "runtime", {
-            "old_hash": state.config_hash,
-            "new_hash": new_hash,
-        })
-        state.events_emitted += 1
-        log("info", "config changed", old=state.config_hash, new=new_hash)
+    if not state.config_hash or new_hash == state.config_hash:
+        state.config_hash = new_hash
+        return
 
-        if auto_sync:
-            try:
-                actions = sync_runtime(model, dry_run=False)
-                log_runtime_event("pulse.auto_sync", "runtime", {
-                    "action_count": len(actions),
-                })
-                state.events_emitted += 1
-                log("info", f"auto-sync completed ({len(actions)} actions)")
-            except Exception as exc:
-                log("error", f"auto-sync failed: {exc}")
+    log_runtime_event("pulse.config_changed", "runtime", {
+        "old_hash": state.config_hash,
+        "new_hash": new_hash,
+    })
+    state.events_emitted += 1
+    log("info", "config changed", old=state.config_hash, new=new_hash)
+    if auto_sync:
+        _pulse_auto_sync(model, state)
     state.config_hash = new_hash
 
-    # -----------------------------------------------------------------------
-    # 3. Check services — detect crashes, state transitions.
-    # -----------------------------------------------------------------------
-    now = time.monotonic()
+
+def _pulse_auto_sync(model: dict[str, Any], state: PulseState) -> None:
+    try:
+        actions = sync_runtime(model, dry_run=False)
+        log_runtime_event("pulse.auto_sync", "runtime", {"action_count": len(actions)})
+        state.events_emitted += 1
+        log("info", f"auto-sync completed ({len(actions)} actions)")
+    except Exception as exc:
+        log("error", f"auto-sync failed: {exc}")
+
+
+def _service_can_autorestart(service: dict[str, Any] | None) -> bool:
+    return bool(service and service_supports_lifecycle(service)[0])
+
+
+def _service_needs_supervision(service: dict[str, Any] | None) -> bool:
+    return bool(service and _service_should_ensure_running(service) and service_supports_lifecycle(service)[0])
+
+
+def _track_unhealthy_http(
+    state: PulseState,
+    service_id: str,
+    *,
+    is_unhealthy_http: bool,
+    now: float,
+) -> None:
+    if is_unhealthy_http:
+        state.unhealthy_since.setdefault(service_id, now)
+    else:
+        state.unhealthy_since.pop(service_id, None)
+
+
+def _pulse_first_service_state(
+    model: dict[str, Any],
+    state: PulseState,
+    service: dict[str, Any] | None,
+    service_id: str,
+    current_state: str,
+    *,
+    auto_restart: bool,
+    now: float,
+) -> str:
+    if (
+        auto_restart
+        and current_state in ("down", "declared")
+        and _service_needs_supervision(service)
+    ):
+        log_runtime_event("pulse.service_down", service_id, {"state": current_state})
+        state.events_emitted += 1
+        restarted = _restart_with_backoff(
+            model,
+            state,
+            service,
+            service_id,
+            now=now,
+            reason="supervised_down",
+        )
+        if restarted:
+            return "running"
+    return current_state
+
+
+def _pulse_service_transition(
+    model: dict[str, Any],
+    state: PulseState,
+    service: dict[str, Any] | None,
+    service_id: str,
+    previous_state: str,
+    current_state: str,
+    *,
+    auto_restart: bool,
+    now: float,
+) -> str:
+    is_crash = previous_state in ("running", "starting") and current_state in ("down", "declared")
+    event_type = "pulse.service_crashed" if is_crash else "pulse.service_state_changed"
+    log_runtime_event(event_type, service_id, {"from": previous_state, "to": current_state})
+    state.events_emitted += 1
+    log("warn" if is_crash else "info", f"service {service_id}: {previous_state} -> {current_state}")
+    if is_crash and auto_restart and _service_can_autorestart(service):
+        restarted = _restart_with_backoff(
+            model,
+            state,
+            service,
+            service_id,
+            now=now,
+            reason="crashed",
+        )
+        if restarted:
+            return "running"
+    return current_state
+
+
+def _pulse_supervised_down_state(
+    model: dict[str, Any],
+    state: PulseState,
+    service: dict[str, Any] | None,
+    service_id: str,
+    current_state: str,
+    *,
+    auto_restart: bool,
+    now: float,
+) -> str:
+    if current_state not in ("down", "declared") or not auto_restart or not _service_needs_supervision(service):
+        return current_state
+    restarted = _restart_with_backoff(
+        model,
+        state,
+        service,
+        service_id,
+        now=now,
+        reason="supervised_down",
+    )
+    return "running" if restarted else current_state
+
+
+def _pulse_unhealthy_http_state(
+    model: dict[str, Any],
+    state: PulseState,
+    service: dict[str, Any] | None,
+    service_id: str,
+    current_state: str,
+    *,
+    has_live_pid: bool,
+    auto_restart: bool,
+    unhealthy_grace_seconds: float,
+    now: float,
+) -> str:
+    if current_state != "starting" or not has_live_pid or not auto_restart:
+        return current_state
+    unhealthy_started_at = state.unhealthy_since.get(service_id, now)
+    unhealthy_for = now - unhealthy_started_at
+    if unhealthy_for < unhealthy_grace_seconds or not _service_can_autorestart(service):
+        return current_state
+    log_runtime_event("pulse.service_unhealthy", service_id, {
+        "state": current_state,
+        "unhealthy_for_seconds": round(unhealthy_for, 1),
+    })
+    state.events_emitted += 1
+    restarted = _restart_with_backoff(
+        model,
+        state,
+        service,
+        service_id,
+        now=now,
+        reason="unhealthy_http",
+    )
+    if restarted:
+        state.unhealthy_since.pop(service_id, None)
+        return "running"
+    return current_state
+
+
+def _reconcile_pulse_service(
+    model: dict[str, Any],
+    state: PulseState,
+    services_by_id: dict[str, dict[str, Any]],
+    service_id: str,
+    probe: dict[str, Any],
+    *,
+    auto_restart: bool,
+    unhealthy_grace_seconds: float,
+    now: float,
+) -> None:
+    current_state = probe.get("state", "declared")
+    previous_state = state.service_states.get(service_id)
+    has_live_pid = probe.get("pid") is not None
+    service = services_by_id.get(service_id)
+    _track_unhealthy_http(
+        state,
+        service_id,
+        is_unhealthy_http=current_state == "starting" and has_live_pid,
+        now=now,
+    )
+
+    if previous_state is None:
+        current_state = _pulse_first_service_state(
+            model, state, service, service_id, current_state,
+            auto_restart=auto_restart, now=now,
+        )
+        state.service_states[service_id] = current_state
+        return
+    if current_state != previous_state:
+        current_state = _pulse_service_transition(
+            model, state, service, service_id, previous_state, current_state,
+            auto_restart=auto_restart, now=now,
+        )
+    current_state = _pulse_supervised_down_state(
+        model, state, service, service_id, current_state,
+        auto_restart=auto_restart, now=now,
+    )
+    current_state = _pulse_unhealthy_http_state(
+        model, state, service, service_id, current_state,
+        has_live_pid=has_live_pid,
+        auto_restart=auto_restart,
+        unhealthy_grace_seconds=unhealthy_grace_seconds,
+        now=now,
+    )
+    state.service_states[service_id] = current_state
+
+
+def _reconcile_pulse_services(
+    model: dict[str, Any],
+    state: PulseState,
+    *,
+    auto_restart: bool,
+    unhealthy_grace_seconds: float,
+    now: float,
+) -> None:
     current_services = _snapshot_services(model)
     services_by_id = {s["id"]: s for s in model.get("services", [])}
 
     for service_id, probe in current_services.items():
-        current_state = probe.get("state", "declared")
-        previous_state = state.service_states.get(service_id)
-        has_live_pid = probe.get("pid") is not None
-        is_unhealthy_http = current_state == "starting" and has_live_pid
-        service = services_by_id.get(service_id)
+        _reconcile_pulse_service(
+            model,
+            state,
+            services_by_id,
+            service_id,
+            probe,
+            auto_restart=auto_restart,
+            unhealthy_grace_seconds=unhealthy_grace_seconds,
+            now=now,
+        )
 
-        if is_unhealthy_http:
-            state.unhealthy_since.setdefault(service_id, now)
-        else:
-            state.unhealthy_since.pop(service_id, None)
 
-        # First cycle — just record, don't react.
-        if previous_state is None:
-            if (
-                auto_restart
-                and current_state in ("down", "declared")
-                and service
-                and _service_should_ensure_running(service)
-                and service_supports_lifecycle(service)[0]
-            ):
-                log_runtime_event("pulse.service_down", service_id, {"state": current_state})
-                state.events_emitted += 1
-                restarted = _restart_with_backoff(
-                    model,
-                    state,
-                    service,
-                    service_id,
-                    now=now,
-                    reason="supervised_down",
-                )
-                if restarted:
-                    current_state = "running"
-            state.service_states[service_id] = current_state
-            continue
-
-        # State transition detected.
-        if current_state != previous_state:
-            is_crash = (
-                previous_state in ("running", "starting")
-                and current_state in ("down", "declared")
-            )
-
-            event_type = "pulse.service_crashed" if is_crash else "pulse.service_state_changed"
-            log_runtime_event(event_type, service_id, {
-                "from": previous_state,
-                "to": current_state,
-            })
-            state.events_emitted += 1
-            log(
-                "warn" if is_crash else "info",
-                f"service {service_id}: {previous_state} -> {current_state}",
-            )
-
-            # Auto-restart crashed managed services.
-            if is_crash and auto_restart:
-                if service and service_supports_lifecycle(service)[0]:
-                    restarted = _restart_with_backoff(
-                        model,
-                        state,
-                        service,
-                        service_id,
-                        now=now,
-                        reason="crashed",
-                    )
-                    if restarted:
-                        current_state = "running"
-
-        if (
-            current_state in ("down", "declared")
-            and auto_restart
-            and service
-            and _service_should_ensure_running(service)
-            and service_supports_lifecycle(service)[0]
-        ):
-            restarted = _restart_with_backoff(
-                model,
-                state,
-                service,
-                service_id,
-                now=now,
-                reason="supervised_down",
-            )
-            if restarted:
-                current_state = "running"
-
-        if current_state == "starting" and has_live_pid and auto_restart:
-            unhealthy_started_at = state.unhealthy_since.get(service_id, now)
-            unhealthy_for = now - unhealthy_started_at
-            if unhealthy_for >= unhealthy_grace_seconds:
-                if service and service_supports_lifecycle(service)[0]:
-                    log_runtime_event("pulse.service_unhealthy", service_id, {
-                        "state": current_state,
-                        "unhealthy_for_seconds": round(unhealthy_for, 1),
-                    })
-                    state.events_emitted += 1
-                    restarted = _restart_with_backoff(
-                        model,
-                        state,
-                        service,
-                        service_id,
-                        now=now,
-                        reason="unhealthy_http",
-                    )
-                    if restarted:
-                        current_state = "running"
-                        state.unhealthy_since.pop(service_id, None)
-
-        state.service_states[service_id] = current_state
-
-    # -----------------------------------------------------------------------
-    # 4. Run declared checks — detect failures and recoveries.
-    # -----------------------------------------------------------------------
+def _reconcile_pulse_checks(model: dict[str, Any], state: PulseState) -> None:
     current_checks = _snapshot_checks(model)
 
     for check_id, ok in current_checks.items():
         previous_ok = state.check_states.get(check_id)
-
         if previous_ok is None:
             state.check_states[check_id] = ok
             continue
-
         if ok != previous_ok:
             event_type = "pulse.check_recovered" if ok else "pulse.check_failed"
             log_runtime_event(event_type, check_id, {"ok": ok})
@@ -554,9 +682,18 @@ def reconcile_once(
 
         state.check_states[check_id] = ok
 
-    # -----------------------------------------------------------------------
-    # 5. Persist state snapshot for the MCP tool to read.
-    # -----------------------------------------------------------------------
+
+def _write_pulse_state(
+    root_dir: Path,
+    state: PulseState,
+    *,
+    now: float,
+    auto_restart: bool,
+    auto_sync: bool,
+    active_clients: set[str],
+    active_profiles: set[str],
+    unhealthy_grace_seconds: float,
+) -> None:
     state_path = root_dir / STATE_REL
     state_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot = {
@@ -565,8 +702,8 @@ def reconcile_once(
         "interval": getattr(reconcile_once, "_interval", DEFAULT_INTERVAL),
         "auto_restart": auto_restart,
         "auto_sync": auto_sync,
-        "active_clients": sorted(clients),
-        "active_profiles": sorted(profiles),
+        "active_clients": sorted(active_clients),
+        "active_profiles": sorted(active_profiles),
         "unhealthy_grace_seconds": unhealthy_grace_seconds,
     } | state.to_dict(now=now)
     try:
@@ -613,7 +750,7 @@ def run_daemon(
         return 1
 
     _open_log(root_dir)
-    pid_path = write_pid(root_dir)
+    write_pid(root_dir)
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
@@ -675,15 +812,10 @@ def run_daemon(
 def print_status(root_dir: Path) -> int:
     """Print current pulse status from the persisted state file."""
     state_path = root_dir / STATE_REL
-    pid_path = root_dir / PID_REL
-
     running_pid = existing_pid(root_dir)
 
     if not state_path.is_file():
-        if running_pid:
-            print(f"pulse: running (pid {running_pid}), no state file yet")
-        else:
-            print("pulse: not running (no state file)")
+        _print_missing_pulse_state(running_pid)
         return 0
 
     try:
@@ -692,6 +824,18 @@ def print_status(root_dir: Path) -> int:
         print(f"pulse: error reading state: {exc}")
         return 1
 
+    _print_pulse_snapshot(snapshot, running_pid)
+    return 0
+
+
+def _print_missing_pulse_state(running_pid: int | None) -> None:
+    if running_pid:
+        print(f"pulse: running (pid {running_pid}), no state file yet")
+    else:
+        print("pulse: not running (no state file)")
+
+
+def _print_pulse_snapshot(snapshot: dict[str, Any], running_pid: int | None) -> None:
     alive = running_pid is not None
     status = "running" if alive else "stopped"
     pid = snapshot.get("pid", "?")
@@ -709,21 +853,25 @@ def print_status(root_dir: Path) -> int:
     print(f"  events:    {events}")
     print(f"  last tick: {age}")
 
-    service_states = snapshot.get("service_states", {})
-    if service_states:
-        print(f"  services:")
-        for sid, sstate in sorted(service_states.items()):
-            marker = "+" if sstate == "running" else "-" if sstate == "down" else "~"
-            print(f"    {marker} {sid}: {sstate}")
+    _print_pulse_services(snapshot.get("service_states", {}))
+    _print_pulse_checks(snapshot.get("check_states", {}))
 
-    check_states = snapshot.get("check_states", {})
+
+def _print_pulse_services(service_states: dict[str, Any]) -> None:
+    if not service_states:
+        return
+    print("  services:")
+    for sid, sstate in sorted(service_states.items()):
+        marker = "+" if sstate == "running" else "-" if sstate == "down" else "~"
+        print(f"    {marker} {sid}: {sstate}")
+
+
+def _print_pulse_checks(check_states: dict[str, Any]) -> None:
     failed = [cid for cid, ok in check_states.items() if not ok]
     if failed:
         print(f"  failed checks: {', '.join(sorted(failed))}")
     elif check_states:
         print(f"  checks: all passing ({len(check_states)})")
-
-    return 0
 
 
 def read_state(root_dir: Path) -> dict[str, Any]:

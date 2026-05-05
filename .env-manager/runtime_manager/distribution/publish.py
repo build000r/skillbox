@@ -50,6 +50,44 @@ def publish_skill_release(
     updated_at: str | None = None,
 ) -> dict[str, Any]:
     """Publish one skill version into a local artifact root and signed v2 manifest."""
+    prepared = _prepare_skill_release(
+        skill_path=skill_path,
+        version=version,
+        skill_name=skill_name,
+        targets=targets,
+        capabilities=capabilities,
+        artifact_root=artifact_root,
+        download_prefix=download_prefix,
+        updated_at=updated_at,
+        signing_key_ref=signing_key_ref,
+    )
+
+    with tempfile.TemporaryDirectory(prefix=f"skillbox-publish-{prepared['name']}-") as tmp_str:
+        return _publish_prepared_skill_release(
+            prepared=prepared,
+            version=version,
+            manifest_path=manifest_path,
+            distributor_id=distributor_id,
+            client_id=client_id,
+            changelog=changelog,
+            min_version=min_version,
+            min_version_reason=min_version_reason,
+            tmp=Path(tmp_str),
+        )
+
+
+def _prepare_skill_release(
+    *,
+    skill_path: Path,
+    version: int,
+    skill_name: str | None,
+    targets: list[str] | None,
+    capabilities: list[str] | None,
+    artifact_root: Path,
+    download_prefix: str,
+    updated_at: str | None,
+    signing_key_ref: str,
+) -> dict[str, Any]:
     if version < 0:
         raise DistributionPublishError("version must be >= 0")
 
@@ -71,77 +109,136 @@ def publish_skill_release(
     artifact_dir = Path(artifact_root).resolve() / "skills" / name / str(version)
     final_bundle = artifact_dir / "bundle.tar.gz"
     download_url = f"{download_prefix.rstrip('/')}/{name}/{version}/bundle.tar.gz"
+    return {
+        "skill_path": skill_path,
+        "name": name,
+        "targets": publish_targets,
+        "capabilities": publish_capabilities,
+        "updated_at": now,
+        "private_key": private_key,
+        "artifact_dir": artifact_dir,
+        "final_bundle": final_bundle,
+        "download_url": download_url,
+    }
 
-    with tempfile.TemporaryDirectory(prefix=f"skillbox-publish-{name}-") as tmp_str:
-        tmp = Path(tmp_str)
-        try:
-            tmp_bundle = pack_skill_bundle(
-                skill_path,
-                version,
-                name=name,
-                output_dir=tmp,
-            )
-        except BundleError as exc:
-            raise DistributionPublishError(str(exc)) from exc
 
-        artifact_sha = _file_sha256(tmp_bundle)
-        artifact_size = tmp_bundle.stat().st_size
+def _packed_skill_bundle(skill_path: Path, version: int, name: str, tmp: Path) -> Path:
+    try:
+        return pack_skill_bundle(skill_path, version, name=name, output_dir=tmp)
+    except BundleError as exc:
+        raise DistributionPublishError(str(exc)) from exc
 
-        manifest_data = _load_or_create_manifest(
+
+def _existing_artifact_or_conflict(
+    skill_entry: dict[str, Any] | None,
+    version: int,
+    name: str,
+    artifact_sha: str,
+) -> dict[str, Any] | None:
+    existing_artifact = _find_artifact_entry(skill_entry, version) if skill_entry else None
+    if existing_artifact and str(existing_artifact.get("sha256")) != artifact_sha:
+        raise DistributionPublishError(
+            f"{DISTRIBUTION_VERSION_CONFLICT}: {name} v{version} already has different artifact bytes"
+        )
+    return existing_artifact
+
+
+def _publish_artifact_changed(
+    existing_artifact: dict[str, Any] | None,
+    final_bundle: Path,
+    artifact_sha: str,
+) -> bool:
+    return not (
+        existing_artifact
+        and str(existing_artifact.get("sha256")) == artifact_sha
+        and final_bundle.is_file()
+        and _file_sha256(final_bundle) == artifact_sha
+    )
+
+
+def _write_changed_skill_release(
+    *,
+    prepared: dict[str, Any],
+    version: int,
+    artifact_sha: str,
+    artifact_size: int,
+    tmp_bundle: Path,
+    manifest_data: dict[str, Any],
+    manifest_path: Path,
+    changelog: str | None,
+    min_version: int | None,
+    min_version_reason: str | None,
+) -> dict[str, Any]:
+    prepared["artifact_dir"].mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(tmp_bundle, prepared["final_bundle"])
+    manifest_data = _upsert_manifest_skill(
+        manifest_data=manifest_data,
+        name=prepared["name"],
+        version=version,
+        sha256=artifact_sha,
+        size_bytes=artifact_size,
+        download_url=prepared["download_url"],
+        targets=prepared["targets"],
+        capabilities=prepared["capabilities"],
+        changelog=changelog,
+        min_version=min_version,
+        min_version_reason=min_version_reason,
+        updated_at=prepared["updated_at"],
+    )
+    signed_manifest = sign_manifest(manifest_data, prepared["private_key"])
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(manifest_path, json.dumps(signed_manifest, indent=2, sort_keys=True) + "\n")
+    return manifest_data
+
+
+def _publish_prepared_skill_release(
+    *,
+    prepared: dict[str, Any],
+    version: int,
+    manifest_path: Path,
+    distributor_id: str,
+    client_id: str,
+    changelog: str | None,
+    min_version: int | None,
+    min_version_reason: str | None,
+    tmp: Path,
+) -> dict[str, Any]:
+    tmp_bundle = _packed_skill_bundle(prepared["skill_path"], version, prepared["name"], tmp)
+    artifact_sha = _file_sha256(tmp_bundle)
+    artifact_size = tmp_bundle.stat().st_size
+    manifest_data = _load_or_create_manifest(
+        manifest_path=manifest_path,
+        distributor_id=distributor_id,
+        client_id=client_id,
+        updated_at=prepared["updated_at"],
+    )
+    skill_entry = _find_skill_entry(manifest_data, prepared["name"])
+    existing_artifact = _existing_artifact_or_conflict(
+        skill_entry, version, prepared["name"], artifact_sha,
+    )
+    changed = _publish_artifact_changed(existing_artifact, prepared["final_bundle"], artifact_sha)
+    if changed:
+        manifest_data = _write_changed_skill_release(
+            prepared=prepared,
+            version=version,
+            artifact_sha=artifact_sha,
+            artifact_size=artifact_size,
+            tmp_bundle=tmp_bundle,
+            manifest_data=manifest_data,
             manifest_path=manifest_path,
-            distributor_id=distributor_id,
-            client_id=client_id,
-            updated_at=now,
+            changelog=changelog,
+            min_version=min_version,
+            min_version_reason=min_version_reason,
         )
-        skill_entry = _find_skill_entry(manifest_data, name)
-
-        existing_artifact = _find_artifact_entry(skill_entry, version) if skill_entry else None
-        if existing_artifact and str(existing_artifact.get("sha256")) != artifact_sha:
-            raise DistributionPublishError(
-                f"{DISTRIBUTION_VERSION_CONFLICT}: {name} v{version} already has "
-                "different artifact bytes"
-            )
-
-        changed = not (
-            existing_artifact
-            and str(existing_artifact.get("sha256")) == artifact_sha
-            and final_bundle.is_file()
-            and _file_sha256(final_bundle) == artifact_sha
-        )
-
-        if changed:
-            artifact_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(tmp_bundle, final_bundle)
-            manifest_data = _upsert_manifest_skill(
-                manifest_data=manifest_data,
-                name=name,
-                version=version,
-                sha256=artifact_sha,
-                size_bytes=artifact_size,
-                download_url=download_url,
-                targets=publish_targets,
-                capabilities=publish_capabilities,
-                changelog=changelog,
-                min_version=min_version,
-                min_version_reason=min_version_reason,
-                updated_at=now,
-            )
-            signed_manifest = sign_manifest(manifest_data, private_key)
-            manifest_path.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_text(
-                manifest_path,
-                json.dumps(signed_manifest, indent=2, sort_keys=True) + "\n",
-            )
-
     return {
         "ok": True,
         "result": "published" if changed else "noop",
-        "skill": name,
+        "skill": prepared["name"],
         "version": version,
-        "artifact_path": str(final_bundle),
+        "artifact_path": str(prepared["final_bundle"]),
         "artifact_sha256": artifact_sha,
         "size_bytes": artifact_size,
-        "download_url": download_url,
+        "download_url": prepared["download_url"],
         "manifest_path": str(manifest_path),
         "manifest_version": int(manifest_data["manifest_version"]),
         "signature_state": "signed",
@@ -203,6 +300,87 @@ def _find_artifact_entry(
     return None
 
 
+def _next_manifest_base(manifest_data: dict[str, Any], updated_at: str) -> dict[str, Any]:
+    next_manifest = dict(manifest_data)
+    next_manifest["manifest_version"] = int(next_manifest.get("manifest_version") or 0) + 1
+    next_manifest["updated_at"] = updated_at
+    return next_manifest
+
+
+def _manifest_skills_without(manifest_data: dict[str, Any], name: str) -> list[dict[str, Any]]:
+    return [
+        dict(skill)
+        for skill in (manifest_data.get("skills") or [])
+        if isinstance(skill, dict) and skill.get("name") != name
+    ]
+
+
+def _manifest_artifacts_without(existing: dict[str, Any], version: int) -> list[dict[str, Any]]:
+    return [
+        dict(artifact)
+        for artifact in (existing.get("artifacts") or [])
+        if isinstance(artifact, dict) and artifact.get("version") != version
+    ]
+
+
+def _client_manifest_artifact_payload(
+    *,
+    version: int,
+    sha256: str,
+    size_bytes: int,
+    download_url: str,
+    changelog: str | None,
+) -> dict[str, Any]:
+    artifact = ClientManifestArtifact(
+        version=version,
+        sha256=sha256,
+        size_bytes=size_bytes,
+        download_url=download_url,
+        changelog=changelog,
+    )
+    payload: dict[str, Any] = {
+        "version": artifact.version,
+        "sha256": artifact.sha256,
+        "size_bytes": artifact.size_bytes,
+        "download_url": artifact.download_url,
+    }
+    if artifact.changelog:
+        payload["changelog"] = artifact.changelog
+    return payload
+
+
+def _manifest_skill_payload(
+    *,
+    name: str,
+    version: int,
+    artifacts: list[dict[str, Any]],
+    targets: list[str],
+    capabilities: list[str],
+    changelog: str | None,
+    min_version: int | None,
+    min_version_reason: str | None,
+    existing: dict[str, Any],
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "name": name,
+        "recommended_version": version,
+        "targets": targets or list(existing.get("targets") or ["box"]),
+        "artifacts": artifacts,
+    }
+    selected_min = min_version if min_version is not None else existing.get("min_version")
+    if selected_min is not None:
+        payload["min_version"] = selected_min
+    selected_reason = min_version_reason or existing.get("min_version_reason")
+    if selected_reason:
+        payload["min_version_reason"] = selected_reason
+    selected_capabilities = capabilities or list(existing.get("capabilities") or [])
+    if selected_capabilities:
+        payload["capabilities"] = selected_capabilities
+    if changelog:
+        payload["changelog"] = changelog
+    return payload
+
+
 def _upsert_manifest_skill(
     *,
     manifest_data: dict[str, Any],
@@ -218,58 +396,30 @@ def _upsert_manifest_skill(
     min_version_reason: str | None,
     updated_at: str,
 ) -> dict[str, Any]:
-    next_manifest = dict(manifest_data)
-    next_manifest["manifest_version"] = int(next_manifest.get("manifest_version") or 0) + 1
-    next_manifest["updated_at"] = updated_at
-
-    skills = [
-        dict(skill)
-        for skill in (manifest_data.get("skills") or [])
-        if isinstance(skill, dict) and skill.get("name") != name
-    ]
+    next_manifest = _next_manifest_base(manifest_data, updated_at)
+    skills = _manifest_skills_without(manifest_data, name)
     existing = _find_skill_entry(manifest_data, name) or {}
-    artifacts = [
-        dict(artifact)
-        for artifact in (existing.get("artifacts") or [])
-        if isinstance(artifact, dict) and artifact.get("version") != version
-    ]
-    artifact = ClientManifestArtifact(
+    artifacts = _manifest_artifacts_without(existing, version)
+    artifacts.append(_client_manifest_artifact_payload(
         version=version,
         sha256=sha256,
         size_bytes=size_bytes,
         download_url=download_url,
         changelog=changelog,
-    )
-    artifact_payload: dict[str, Any] = {
-        "version": artifact.version,
-        "sha256": artifact.sha256,
-        "size_bytes": artifact.size_bytes,
-        "download_url": artifact.download_url,
-    }
-    if artifact.changelog:
-        artifact_payload["changelog"] = artifact.changelog
-    artifacts.append(artifact_payload)
+    ))
     artifacts.sort(key=lambda item: int(item["version"]))
 
-    skill_payload: dict[str, Any] = {
-        "name": name,
-        "recommended_version": version,
-        "targets": targets or list(existing.get("targets") or ["box"]),
-        "artifacts": artifacts,
-    }
-    selected_min = min_version if min_version is not None else existing.get("min_version")
-    if selected_min is not None:
-        skill_payload["min_version"] = selected_min
-    selected_reason = min_version_reason or existing.get("min_version_reason")
-    if selected_reason:
-        skill_payload["min_version_reason"] = selected_reason
-    selected_capabilities = capabilities or list(existing.get("capabilities") or [])
-    if selected_capabilities:
-        skill_payload["capabilities"] = selected_capabilities
-    if changelog:
-        skill_payload["changelog"] = changelog
-
-    skills.append(skill_payload)
+    skills.append(_manifest_skill_payload(
+        name=name,
+        version=version,
+        artifacts=artifacts,
+        targets=targets,
+        capabilities=capabilities,
+        changelog=changelog,
+        min_version=min_version,
+        min_version_reason=min_version_reason,
+        existing=existing,
+    ))
     skills.sort(key=lambda item: str(item.get("name") or ""))
     next_manifest["skills"] = skills
     return next_manifest

@@ -45,96 +45,111 @@ def _storage_filesystem_type(path: Path) -> str:
     return result.stdout.strip()
 
 
-def validate_storage_posture(model: dict[str, Any]) -> list[CheckResult]:
-    storage = model.get("storage") or {}
-    bindings = storage.get("bindings") or []
-    if not isinstance(storage, dict) or not bindings:
-        return []
-
-    provider = str(storage.get("provider") or "local").strip() or "local"
-    required = bool(storage.get("required"))
-    expected_filesystem = str(storage.get("filesystem") or "").strip()
-    min_free_gb = float(storage.get("min_free_gb") or 0.0)
-    state_root = Path(str(storage.get("state_root") or "")).expanduser()
-    persistent_bindings = [
+def _persistent_storage_bindings(bindings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
         binding for binding in bindings
         if str(binding.get("storage_class") or "").strip() == "persistent"
     ]
 
-    if not str(state_root):
-        return [
-            CheckResult(
-                status="fail",
-                code=STATE_ROOT_MISSING,
-                message="storage summary does not include a state_root",
-            )
-        ]
 
-    results: list[CheckResult] = []
-    missing_status = "fail" if provider == "digitalocean" or required else "warn"
-    if not state_root.exists():
-        results.append(
-            CheckResult(
-                status=missing_status,
-                code=STATE_ROOT_MISSING,
-                message="state root is missing",
-                details={"state_root": str(state_root), "provider": provider},
-            )
+def _missing_state_root_status(provider: str, required: bool) -> str:
+    return "fail" if provider == "digitalocean" or required else "warn"
+
+
+def _missing_state_root_result(
+    state_root: Path,
+    provider: str,
+    required: bool,
+) -> CheckResult:
+    return CheckResult(
+        status=_missing_state_root_status(provider, required),
+        code=STATE_ROOT_MISSING,
+        message="state root is missing",
+        details={"state_root": str(state_root), "provider": provider},
+    )
+
+
+def _digitalocean_mount_results(provider: str, required: bool, state_root: Path) -> list[CheckResult]:
+    if provider != "digitalocean" or not required or state_root.is_mount():
+        return []
+    return [
+        CheckResult(
+            status="fail",
+            code=STATE_ROOT_MISSING,
+            message="DigitalOcean state root exists but is not mounted",
+            details={"state_root": str(state_root)},
         )
-        return results
+    ]
 
-    if provider == "digitalocean" and required and not state_root.is_mount():
-        results.append(
-            CheckResult(
-                status="fail",
-                code=STATE_ROOT_MISSING,
-                message="DigitalOcean state root exists but is not mounted",
-                details={"state_root": str(state_root)},
-            )
+
+def _filesystem_posture_results(
+    provider: str,
+    expected_filesystem: str,
+    state_root: Path,
+) -> list[CheckResult]:
+    if provider != "digitalocean" or not expected_filesystem:
+        return []
+    actual_filesystem = _storage_filesystem_type(state_root)
+    if not actual_filesystem or actual_filesystem == expected_filesystem:
+        return []
+    return [
+        CheckResult(
+            status="fail",
+            code=STATE_ROOT_WRONG_FILESYSTEM,
+            message="state root filesystem does not match policy",
+            details={
+                "state_root": str(state_root),
+                "expected_filesystem": expected_filesystem,
+                "actual_filesystem": actual_filesystem,
+            },
         )
+    ]
 
-    if provider == "digitalocean" and expected_filesystem:
-        actual_filesystem = _storage_filesystem_type(state_root)
-        if actual_filesystem and actual_filesystem != expected_filesystem:
-            results.append(
-                CheckResult(
-                    status="fail",
-                    code=STATE_ROOT_WRONG_FILESYSTEM,
-                    message="state root filesystem does not match policy",
-                    details={
-                        "state_root": str(state_root),
-                        "expected_filesystem": expected_filesystem,
-                        "actual_filesystem": actual_filesystem,
-                    },
-                )
-            )
 
-    if not os.access(state_root, os.W_OK | os.X_OK):
-        results.append(
-            CheckResult(
-                status="fail",
-                code=STATE_ROOT_WRONG_OWNERSHIP,
-                message="state root is not writable by the current runtime user",
-                details={"state_root": str(state_root)},
-            )
+def _ownership_posture_results(state_root: Path) -> list[CheckResult]:
+    if os.access(state_root, os.W_OK | os.X_OK):
+        return []
+    return [
+        CheckResult(
+            status="fail",
+            code=STATE_ROOT_WRONG_OWNERSHIP,
+            message="state root is not writable by the current runtime user",
+            details={"state_root": str(state_root)},
         )
+    ]
 
+
+def _state_root_free_gb(state_root: Path) -> float:
     usage = shutil.disk_usage(state_root)
-    free_gb = round(usage.free / (1024 ** 3), 2)
-    if free_gb < min_free_gb:
-        results.append(
-            CheckResult(
-                status="fail",
-                code=STATE_ROOT_LOW_SPACE,
-                message="state root free space is below the configured minimum",
-                details={
-                    "state_root": str(state_root),
-                    "required_free_gb": min_free_gb,
-                    "actual_free_gb": free_gb,
-                },
-            )
-        )
+    return round(usage.free / (1024 ** 3), 2)
 
+
+def _free_space_posture_results(
+    state_root: Path,
+    min_free_gb: float,
+    free_gb: float,
+) -> list[CheckResult]:
+    if free_gb >= min_free_gb:
+        return []
+    return [
+        CheckResult(
+            status="fail",
+            code=STATE_ROOT_LOW_SPACE,
+            message="state root free space is below the configured minimum",
+            details={
+                "state_root": str(state_root),
+                "required_free_gb": min_free_gb,
+                "actual_free_gb": free_gb,
+            },
+        )
+    ]
+
+
+def _off_state_root_binding_results(
+    state_root: Path,
+    persistent_bindings: list[dict[str, Any]],
+) -> list[CheckResult]:
+    results: list[CheckResult] = []
     state_root_resolved = state_root.resolve()
     for binding in persistent_bindings:
         resolved_host_path = Path(str(binding.get("resolved_host_path") or "")).expanduser()
@@ -156,23 +171,65 @@ def validate_storage_posture(model: dict[str, Any]) -> list[CheckResult]:
                     },
                 )
             )
+    return results
+
+
+def _storage_posture_pass_result(
+    provider: str,
+    state_root: Path,
+    persistent_bindings: list[dict[str, Any]],
+    free_gb: float,
+) -> CheckResult:
+    return CheckResult(
+        status="pass",
+        code="storage-posture",
+        message="storage posture matches the compiled persistence contract",
+        details={
+            "provider": provider,
+            "state_root": str(state_root),
+            "persistent_bindings": [str(binding.get("id") or "") for binding in persistent_bindings],
+            "free_gb": free_gb,
+        },
+    )
+
+
+def validate_storage_posture(model: dict[str, Any]) -> list[CheckResult]:
+    storage = model.get("storage") or {}
+    bindings = storage.get("bindings") or []
+    if not isinstance(storage, dict) or not bindings:
+        return []
+
+    provider = str(storage.get("provider") or "local").strip() or "local"
+    required = bool(storage.get("required"))
+    expected_filesystem = str(storage.get("filesystem") or "").strip()
+    min_free_gb = float(storage.get("min_free_gb") or 0.0)
+    state_root = Path(str(storage.get("state_root") or "")).expanduser()
+    persistent_bindings = _persistent_storage_bindings(bindings)
+
+    if not str(state_root):
+        return [
+            CheckResult(
+                status="fail",
+                code=STATE_ROOT_MISSING,
+                message="storage summary does not include a state_root",
+            )
+        ]
+
+    results: list[CheckResult] = []
+    if not state_root.exists():
+        return [_missing_state_root_result(state_root, provider, required)]
+
+    results.extend(_digitalocean_mount_results(provider, required, state_root))
+    results.extend(_filesystem_posture_results(provider, expected_filesystem, state_root))
+    results.extend(_ownership_posture_results(state_root))
+    free_gb = _state_root_free_gb(state_root)
+    results.extend(_free_space_posture_results(state_root, min_free_gb, free_gb))
+    results.extend(_off_state_root_binding_results(state_root, persistent_bindings))
 
     if results:
         return results
 
-    return [
-        CheckResult(
-            status="pass",
-            code="storage-posture",
-            message="storage posture matches the compiled persistence contract",
-            details={
-                "provider": provider,
-                "state_root": str(state_root),
-                "persistent_bindings": [str(binding.get("id") or "") for binding in persistent_bindings],
-                "free_gb": free_gb,
-            },
-        )
-    ]
+    return [_storage_posture_pass_result(provider, state_root, persistent_bindings, free_gb)]
 
 def normalize_file_mode(raw_mode: Any, default: int = 0o600) -> int:
     if raw_mode is None:
@@ -193,51 +250,20 @@ def artifact_state(artifact: dict[str, Any]) -> dict[str, Any]:
     path = Path(str(artifact["host_path"]))
     source = artifact.get("source") or {}
     source_kind = str(source.get("kind", "manual")).strip() or "manual"
-    sync = artifact.get("sync") or {}
-    sync_mode = str(
-        sync.get("mode")
-        or ("download-if-missing" if source_kind == "url" else "copy-if-missing" if source_kind == "file" else "manual")
-    ).strip()
-
-    source_path: Path | None = None
-    raw_source_path = str(source.get("host_path") or source.get("path") or "").strip()
-    if raw_source_path:
-        source_path = Path(raw_source_path)
-
+    sync_mode = _artifact_sync_mode(artifact, source_kind)
+    source_path = _artifact_source_path(source)
     present = path.is_file()
     source_present = bool(source_path and source_path.is_file())
     actual_sha256 = file_sha256(path) if present else ""
-    desired_sha256 = ""
-    state = "ok" if present else "missing"
-    syncable = False
-
-    if source_kind == "file" and sync_mode == "copy-if-missing":
-        if source_present and source_path is not None:
-            desired_sha256 = file_sha256(source_path)
-            syncable = True
-            if not present or actual_sha256 != desired_sha256:
-                state = "missing" if not present else "stale"
-            else:
-                state = "ok"
-        else:
-            state = "present" if present else "missing"
-    elif source_kind == "url" and sync_mode == "download-if-missing":
-        url = str(source.get("url") or "").strip()
-        raw_sha256 = str(source.get("sha256") or "").strip().lower()
-        if url:
-            syncable = True
-        if SHA256_HEX_PATTERN.fullmatch(raw_sha256):
-            desired_sha256 = raw_sha256
-            if not present or actual_sha256 != desired_sha256:
-                state = "missing" if not present else "stale"
-            else:
-                state = "ok"
-        else:
-            state = "present" if present else "missing"
-    elif not present:
-        state = "missing"
-    else:
-        state = "present"
+    state, syncable, desired_sha256 = _artifact_state_details(
+        source=source,
+        source_kind=source_kind,
+        sync_mode=sync_mode,
+        present=present,
+        source_present=source_present,
+        source_path=source_path,
+        actual_sha256=actual_sha256,
+    )
 
     return {
         "id": artifact["id"],
@@ -259,39 +285,95 @@ def artifact_state(artifact: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _artifact_sync_mode(artifact: dict[str, Any], source_kind: str) -> str:
+    sync = artifact.get("sync") or {}
+    default_mode = "download-if-missing" if source_kind == "url" else "copy-if-missing" if source_kind == "file" else "manual"
+    return str(sync.get("mode") or default_mode).strip()
+
+
+def _artifact_source_path(source: dict[str, Any]) -> Path | None:
+    raw_source_path = str(source.get("host_path") or source.get("path") or "").strip()
+    return Path(raw_source_path) if raw_source_path else None
+
+
+def _artifact_digest_state(present: bool, actual_sha256: str, desired_sha256: str) -> str:
+    if not present:
+        return "missing"
+    return "ok" if actual_sha256 == desired_sha256 else "stale"
+
+
+def _file_artifact_state_details(
+    *,
+    present: bool,
+    source_present: bool,
+    source_path: Path | None,
+    actual_sha256: str,
+) -> tuple[str, bool, str]:
+    if not source_present or source_path is None:
+        return ("present" if present else "missing"), False, ""
+    desired_sha256 = file_sha256(source_path)
+    return _artifact_digest_state(present, actual_sha256, desired_sha256), True, desired_sha256
+
+
+def _url_artifact_state_details(
+    *,
+    source: dict[str, Any],
+    present: bool,
+    actual_sha256: str,
+) -> tuple[str, bool, str]:
+    url = str(source.get("url") or "").strip()
+    raw_sha256 = str(source.get("sha256") or "").strip().lower()
+    syncable = bool(url)
+    if not SHA256_HEX_PATTERN.fullmatch(raw_sha256):
+        return ("present" if present else "missing"), syncable, ""
+    state = _artifact_digest_state(present, actual_sha256, raw_sha256)
+    return state, syncable, raw_sha256
+
+
+def _artifact_state_details(
+    *,
+    source: dict[str, Any],
+    source_kind: str,
+    sync_mode: str,
+    present: bool,
+    source_present: bool,
+    source_path: Path | None,
+    actual_sha256: str,
+) -> tuple[str, bool, str]:
+    if source_kind == "file" and sync_mode == "copy-if-missing":
+        return _file_artifact_state_details(
+            present=present,
+            source_present=source_present,
+            source_path=source_path,
+            actual_sha256=actual_sha256,
+        )
+    if source_kind == "url" and sync_mode == "download-if-missing":
+        return _url_artifact_state_details(
+            source=source,
+            present=present,
+            actual_sha256=actual_sha256,
+        )
+    return ("present" if present else "missing"), False, ""
+
+
 def env_file_state(env_file: dict[str, Any]) -> dict[str, Any]:
     path = Path(str(env_file["host_path"]))
     source = env_file.get("source") or {}
     source_kind = str(source.get("kind", "manual")).strip() or "manual"
-    sync = env_file.get("sync") or {}
-    sync_mode = str(sync.get("mode") or ("write" if source_kind == "file" else "manual")).strip()
+    sync_mode = _env_file_sync_mode(env_file, source_kind)
     desired_mode = normalize_file_mode(env_file.get("mode"), default=0o600)
-
-    source_path: Path | None = None
-    raw_source_path = str(source.get("host_path") or source.get("path") or "").strip()
-    if raw_source_path:
-        source_path = Path(raw_source_path)
-
+    source_path = _artifact_source_path(source)
     present = path.is_file()
     source_present = bool(source_path and source_path.is_file())
-    state = "ok" if present else "missing"
-    syncable = False
-
-    if source_kind == "file" and sync_mode == "write":
-        if not source_present:
-            state = "source-missing"
-        elif not present:
-            state = "missing"
-            syncable = True
-        else:
-            target_mode = path.stat().st_mode & 0o777
-            if path.read_bytes() != source_path.read_bytes() or target_mode != desired_mode:
-                state = "stale"
-                syncable = True
-            else:
-                state = "ok"
-    elif not present:
-        state = "missing"
+    state, syncable = _env_file_state_details(
+        source_kind=source_kind,
+        sync_mode=sync_mode,
+        present=present,
+        source_present=source_present,
+        path=path,
+        source_path=source_path,
+        desired_mode=desired_mode,
+    )
 
     return {
         "id": env_file["id"],
@@ -311,6 +393,50 @@ def env_file_state(env_file: dict[str, Any]) -> dict[str, Any]:
         "state": state,
         "syncable": syncable,
     }
+
+
+def _env_file_sync_mode(env_file: dict[str, Any], source_kind: str) -> str:
+    sync = env_file.get("sync") or {}
+    return str(sync.get("mode") or ("write" if source_kind == "file" else "manual")).strip()
+
+
+def _env_file_write_state(
+    *,
+    present: bool,
+    source_present: bool,
+    path: Path,
+    source_path: Path | None,
+    desired_mode: int,
+) -> tuple[str, bool]:
+    if not source_present or source_path is None:
+        return "source-missing", False
+    if not present:
+        return "missing", True
+    target_mode = path.stat().st_mode & 0o777
+    if path.read_bytes() != source_path.read_bytes() or target_mode != desired_mode:
+        return "stale", True
+    return "ok", False
+
+
+def _env_file_state_details(
+    *,
+    source_kind: str,
+    sync_mode: str,
+    present: bool,
+    source_present: bool,
+    path: Path,
+    source_path: Path | None,
+    desired_mode: int,
+) -> tuple[str, bool]:
+    if source_kind == "file" and sync_mode == "write":
+        return _env_file_write_state(
+            present=present,
+            source_present=source_present,
+            path=path,
+            source_path=source_path,
+            desired_mode=desired_mode,
+        )
+    return ("ok" if present else "missing"), False
 
 
 def _scan_repo_paths(model: dict[str, Any], root_dir: Path) -> tuple[list[str], list[str]]:
@@ -413,12 +539,7 @@ def _filesystem_check_result(
 
 
 def check_filesystem(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
-    bridge_output_paths = {
-        str(path.resolve())
-        for bridge in model.get("bridges") or []
-        for path in bridge_expected_outputs(bridge)
-    }
-
+    bridge_output_paths = _filesystem_bridge_output_paths(model)
     syncable_repos, required_repos = _scan_repo_paths(model, root_dir)
     syncable_artifacts, stale_artifacts, required_artifacts = _scan_artifact_paths(model, root_dir)
     syncable_env_files, missing_env_sources, missing_env_targets = _scan_env_file_paths(
@@ -426,19 +547,57 @@ def check_filesystem(model: dict[str, Any], root_dir: Path) -> list[CheckResult]
     )
     missing_logs = _scan_log_paths(model, root_dir)
     missing_checks = _scan_check_paths(model, root_dir)
+    artifact_warn_details = _artifact_warn_details(syncable_artifacts, stale_artifacts)
+    env_fail_details = _env_fail_details(missing_env_sources, missing_env_targets)
+    return _filesystem_results(
+        required_repos=required_repos,
+        syncable_repos=syncable_repos,
+        required_artifacts=required_artifacts,
+        artifact_warn_details=artifact_warn_details,
+        env_fail_details=env_fail_details,
+        syncable_env_files=syncable_env_files,
+        missing_logs=missing_logs,
+        missing_checks=missing_checks,
+    )
 
+
+def _filesystem_bridge_output_paths(model: dict[str, Any]) -> set[str]:
+    return {
+        str(path.resolve())
+        for bridge in model.get("bridges") or []
+        for path in bridge_expected_outputs(bridge)
+    }
+
+
+def _artifact_warn_details(syncable_artifacts: list[str], stale_artifacts: list[str]) -> dict[str, Any]:
     artifact_warn_details: dict[str, Any] = {}
     if syncable_artifacts:
         artifact_warn_details["missing"] = syncable_artifacts
     if stale_artifacts:
         artifact_warn_details["stale"] = stale_artifacts
+    return artifact_warn_details
 
+
+def _env_fail_details(missing_env_sources: list[str], missing_env_targets: list[str]) -> dict[str, Any]:
     env_fail_details: dict[str, Any] = {}
     if missing_env_sources:
         env_fail_details["missing_sources"] = missing_env_sources
     if missing_env_targets:
         env_fail_details["missing_targets"] = missing_env_targets
+    return env_fail_details
 
+
+def _filesystem_results(
+    *,
+    required_repos: list[str],
+    syncable_repos: list[str],
+    required_artifacts: list[str],
+    artifact_warn_details: dict[str, Any],
+    env_fail_details: dict[str, Any],
+    syncable_env_files: list[str],
+    missing_logs: list[str],
+    missing_checks: list[str],
+) -> list[CheckResult]:
     return [
         _filesystem_check_result(
             "required-runtime-paths", "fail",
@@ -627,50 +786,58 @@ def sorted_ingress_routes(routes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 
+def _services_by_id(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(service.get("id") or "").strip(): service
+        for service in model.get("services") or []
+        if str(service.get("id") or "").strip()
+    }
+
+
+def _resolved_ingress_route_entry(
+    model: dict[str, Any],
+    route: dict[str, Any],
+    services_by_id: dict[str, dict[str, Any]],
+    *,
+    include_service_state: bool,
+) -> dict[str, Any]:
+    listener = str(route.get("listener") or "public").strip().lower() or "public"
+    path = str(route.get("path") or "").strip()
+    match = str(route.get("match") or "exact").strip().lower() or "exact"
+    service_id = str(route.get("service_id") or "").strip()
+    service = services_by_id.get(service_id)
+    listener_settings = ingress_listener_settings(model, listener)
+    entry = {
+        "id": str(route.get("id") or "").strip(),
+        "client": str(route.get("client") or "").strip(),
+        "profiles": list(route.get("profiles") or []),
+        "listener": listener,
+        "path": path,
+        "match": match,
+        "service_id": service_id,
+        "request_url": f"{listener_settings['base_url']}{path}" if path else listener_settings["base_url"],
+        "origin_url": service_origin_url(service),
+    }
+    if include_service_state:
+        entry["service_state"] = probe_service(model, service).get("state", "missing") if service else "missing"
+    return entry
+
+
 def resolved_ingress_routes(
     model: dict[str, Any],
     *,
     include_service_state: bool = False,
 ) -> list[dict[str, Any]]:
-    services_by_id = {
-        str(service.get("id") or "").strip(): service
-        for service in model.get("services") or []
-        if str(service.get("id") or "").strip()
-    }
-    entries: list[dict[str, Any]] = []
-    for route in model.get("ingress_routes") or []:
-        listener = str(route.get("listener") or "public").strip().lower() or "public"
-        path = str(route.get("path") or "").strip()
-        match = str(route.get("match") or "exact").strip().lower() or "exact"
-        service_id = str(route.get("service_id") or "").strip()
-        service = services_by_id.get(service_id)
-        listener_settings = ingress_listener_settings(model, listener)
-        request_url = listener_settings["base_url"]
-        if path:
-            request_url = f"{request_url}{path}"
-        entries.append(
-            (
-                {
-                    "id": str(route.get("id") or "").strip(),
-                    "client": str(route.get("client") or "").strip(),
-                    "profiles": list(route.get("profiles") or []),
-                    "listener": listener,
-                    "path": path,
-                    "match": match,
-                    "service_id": service_id,
-                    "request_url": request_url,
-                    "origin_url": service_origin_url(service),
-                }
-                | (
-                    {
-                        "service_state": probe_service(model, service).get("state", "missing")
-                        if service else "missing"
-                    }
-                    if include_service_state else {}
-                )
-            )
+    services_by_id = _services_by_id(model)
+    return sorted_ingress_routes([
+        _resolved_ingress_route_entry(
+            model,
+            route,
+            services_by_id,
+            include_service_state=include_service_state,
         )
-    return sorted_ingress_routes(entries)
+        for route in model.get("ingress_routes") or []
+    ])
 
 
 def ingress_config_paths(model: dict[str, Any]) -> dict[str, Path]:
@@ -926,50 +1093,87 @@ def sync_artifact(artifact: dict[str, Any], dry_run: bool) -> list[str]:
 
     if state["state"] == "ok" or (path.exists() and not state["syncable"]):
         return [f"exists: {path}"]
-
     if sync_mode == "download-if-missing" and source_kind == "url":
-        if not str(source.get("url") or "").strip():
-            return [f"skip: {path} (artifact source url missing)"]
-        url, expected_sha256 = validate_url_download_source(source, artifact_id=str(artifact["id"]))
-        ensure_directory(path.parent, dry_run)
-        action_name = "download-reconcile" if state["state"] == "stale" else "download-if-missing"
-        if dry_run:
-            return [f"{action_name}: {url} -> {path}"]
-
-        with urllib.request.urlopen(url, timeout=30) as response:
-            payload = response.read()
-        actual_sha256 = hashlib.sha256(payload).hexdigest()
-        if actual_sha256 != expected_sha256:
-            raise RuntimeError(
-                f"artifact {artifact['id']} digest mismatch for {url}: "
-                f"expected {expected_sha256}, got {actual_sha256}"
-            )
-        tmp_path = path.parent / f".{path.name}.tmp"
-        tmp_path.write_bytes(payload)
-        if source.get("executable", False):
-            tmp_path.chmod(0o755)
-        tmp_path.replace(path)
-        return [f"{action_name}: {url} -> {path}"]
-
+        return _sync_url_artifact(artifact, source, state, path, dry_run)
     if sync_mode == "copy-if-missing" and source_kind == "file":
-        raw_source_path = str(source.get("host_path") or source.get("path") or "").strip()
-        if not raw_source_path:
-            return [f"skip: {path} (artifact source path missing)"]
-        source_path = Path(raw_source_path)
-        ensure_directory(path.parent, dry_run)
-        action_name = "copy-reconcile" if state["state"] == "stale" else "copy-if-missing"
-        if dry_run:
-            return [f"{action_name}: {source_path} -> {path}"]
-        if not source_path.is_file():
-            raise RuntimeError(f"artifact source file is missing: {source_path}")
-        tmp_path = path.parent / f".{path.name}.tmp"
-        shutil.copyfile(source_path, tmp_path)
-        if source.get("executable", False):
-            tmp_path.chmod(0o755)
-        tmp_path.replace(path)
-        return [f"{action_name}: {source_path} -> {path}"]
-
+        return _sync_file_artifact(source, state, path, dry_run)
     return [f"skip: {path} (sync mode {sync_mode})"]
+
+
+def _artifact_action_name(state: dict[str, Any], stale_action: str, missing_action: str) -> str:
+    return stale_action if state["state"] == "stale" else missing_action
+
+
+def _replace_artifact_payload(path: Path, payload: bytes, executable: bool) -> None:
+    tmp_path = path.parent / f".{path.name}.tmp"
+    tmp_path.write_bytes(payload)
+    if executable:
+        tmp_path.chmod(0o755)
+    tmp_path.replace(path)
+
+
+def _sync_url_artifact(
+    artifact: dict[str, Any],
+    source: dict[str, Any],
+    state: dict[str, Any],
+    path: Path,
+    dry_run: bool,
+) -> list[str]:
+    if not str(source.get("url") or "").strip():
+        return [f"skip: {path} (artifact source url missing)"]
+    url, expected_sha256 = validate_url_download_source(source, artifact_id=str(artifact["id"]))
+    ensure_directory(path.parent, dry_run)
+    action_name = _artifact_action_name(state, "download-reconcile", "download-if-missing")
+    if dry_run:
+        return [f"{action_name}: {url} -> {path}"]
+    _download_artifact_to_path(artifact, source, path, url, expected_sha256)
+    return [f"{action_name}: {url} -> {path}"]
+
+
+def _download_artifact_to_path(
+    artifact: dict[str, Any],
+    source: dict[str, Any],
+    path: Path,
+    url: str,
+    expected_sha256: str,
+) -> None:
+    with urllib.request.urlopen(url, timeout=30) as response:
+        payload = response.read()
+    actual_sha256 = hashlib.sha256(payload).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise RuntimeError(
+            f"artifact {artifact['id']} digest mismatch for {url}: "
+            f"expected {expected_sha256}, got {actual_sha256}"
+        )
+    _replace_artifact_payload(path, payload, bool(source.get("executable", False)))
+
+
+def _sync_file_artifact(
+    source: dict[str, Any],
+    state: dict[str, Any],
+    path: Path,
+    dry_run: bool,
+) -> list[str]:
+    raw_source_path = str(source.get("host_path") or source.get("path") or "").strip()
+    if not raw_source_path:
+        return [f"skip: {path} (artifact source path missing)"]
+    source_path = Path(raw_source_path)
+    ensure_directory(path.parent, dry_run)
+    action_name = _artifact_action_name(state, "copy-reconcile", "copy-if-missing")
+    if dry_run:
+        return [f"{action_name}: {source_path} -> {path}"]
+    _copy_artifact_to_path(source, source_path, path)
+    return [f"{action_name}: {source_path} -> {path}"]
+
+
+def _copy_artifact_to_path(source: dict[str, Any], source_path: Path, path: Path) -> None:
+    if not source_path.is_file():
+        raise RuntimeError(f"artifact source file is missing: {source_path}")
+    tmp_path = path.parent / f".{path.name}.tmp"
+    shutil.copyfile(source_path, tmp_path)
+    if source.get("executable", False):
+        tmp_path.chmod(0o755)
+    tmp_path.replace(path)
 
 
 def sync_env_file(env_file: dict[str, Any], dry_run: bool) -> list[str]:
@@ -978,31 +1182,61 @@ def sync_env_file(env_file: dict[str, Any], dry_run: bool) -> list[str]:
     source_path = Path(state["source_host_path"]) if state["source_host_path"] else None
 
     if state["source_kind"] == "file" and state["sync_mode"] == "write":
-        if source_path is None or not source_path.is_file():
-            if env_file.get("required"):
-                raise RuntimeError(
-                    f"Required env file {env_file['id']} is missing source {state['source_path'] or state['source_host_path'] or path}."
-                )
-            return [f"skip: {path} (env source path missing)"]
+        return _sync_written_env_file(env_file, state, path, source_path, dry_run)
+    return _sync_existing_or_manual_env_file(env_file, state, path)
 
-        ensure_directory(path.parent, dry_run)
-        if dry_run:
-            return [f"hydrate-env: {source_path} -> {path}"]
 
-        payload = source_path.read_bytes()
-        current_payload = path.read_bytes() if path.is_file() else None
-        desired_mode = normalize_file_mode(env_file.get("mode"), default=0o600)
-        current_mode = path.stat().st_mode & 0o777 if path.is_file() else None
-        if current_payload == payload and current_mode == desired_mode:
-            return [f"env-unchanged: {path}"]
+def _sync_written_env_file(
+    env_file: dict[str, Any],
+    state: dict[str, Any],
+    path: Path,
+    source_path: Path | None,
+    dry_run: bool,
+) -> list[str]:
+    if source_path is None or not source_path.is_file():
+        return _missing_env_source_action(env_file, state, path)
 
-        path.write_bytes(payload)
-        path.chmod(desired_mode)
+    ensure_directory(path.parent, dry_run)
+    if dry_run:
         return [f"hydrate-env: {source_path} -> {path}"]
+    return _write_env_payload_if_changed(env_file, path, source_path)
 
+
+def _missing_env_source_action(
+    env_file: dict[str, Any],
+    state: dict[str, Any],
+    path: Path,
+) -> list[str]:
+    if env_file.get("required"):
+        raise RuntimeError(
+            f"Required env file {env_file['id']} is missing source {state['source_path'] or state['source_host_path'] or path}."
+        )
+    return [f"skip: {path} (env source path missing)"]
+
+
+def _write_env_payload_if_changed(
+    env_file: dict[str, Any],
+    path: Path,
+    source_path: Path,
+) -> list[str]:
+    payload = source_path.read_bytes()
+    current_payload = path.read_bytes() if path.is_file() else None
+    desired_mode = normalize_file_mode(env_file.get("mode"), default=0o600)
+    current_mode = path.stat().st_mode & 0o777 if path.is_file() else None
+    if current_payload == payload and current_mode == desired_mode:
+        return [f"env-unchanged: {path}"]
+    path.write_bytes(payload)
+    path.chmod(desired_mode)
+    return [f"hydrate-env: {source_path} -> {path}"]
+
+
+def _sync_existing_or_manual_env_file(
+    env_file: dict[str, Any],
+    state: dict[str, Any],
+    path: Path,
+) -> list[str]:
     if path.exists():
         return [f"exists: {path}"]
-
     if env_file.get("required"):
         raise RuntimeError(f"Required env file {env_file['id']} is missing at {path}.")
     return [f"skip: {path} (sync mode {state['sync_mode']})"]
@@ -1010,32 +1244,44 @@ def sync_env_file(env_file: dict[str, Any], dry_run: bool) -> list[str]:
 
 def sync_dcg_config(model: dict[str, Any], root_dir: Path, dry_run: bool) -> list[str]:
     """Render .dcg.toml from env and client overlay dcg settings."""
-    actions: list[str] = []
     env = model.get("env") or {}
     dcg_bin = env.get("SKILLBOX_DCG_BIN", "").strip()
     if not dcg_bin:
         return [f"skip: .dcg.toml (dcg not configured)"]
 
-    packs_raw = env.get("SKILLBOX_DCG_PACKS", "core.git,core.filesystem").strip()
-    packs = [p.strip() for p in packs_raw.split(",") if p.strip()]
+    packs, allowlist = _dcg_packs_and_allowlist(model, env)
+    content = _dcg_config_content(packs, allowlist)
+    dcg_config_path = root_dir / ".dcg.toml"
+    if _dcg_config_current(dcg_config_path, content):
+        return [f"exists: {dcg_config_path}"]
 
-    # Client overlays can declare extra dcg packs and allowlist rules
-    client_dcg = {}
+    action = f"render-dcg-config: {dcg_config_path} (packs: {', '.join(packs)})"
+    if dry_run:
+        return [action]
+
+    atomic_write_text(dcg_config_path, content)
+    return [action]
+
+
+def _dcg_packs_and_allowlist(model: dict[str, Any], env: dict[str, Any]) -> tuple[list[str], list[Any]]:
+    packs_raw = env.get("SKILLBOX_DCG_PACKS", "core.git,core.filesystem").strip()
+    packs = [pack.strip() for pack in packs_raw.split(",") if pack.strip()]
+    client_dcg: dict[str, Any] = {}
     for client in model.get("clients") or []:
         if "dcg" in client:
             client_dcg = client["dcg"]
             extra_packs = client_dcg.get("packs") or []
-            for p in extra_packs:
-                if p not in packs:
-                    packs.append(p)
+            for pack in extra_packs:
+                if pack not in packs:
+                    packs.append(pack)
+    return packs, client_dcg.get("allowlist") or []
 
-    allowlist = client_dcg.get("allowlist") or []
 
+def _dcg_config_content(packs: list[str], allowlist: list[Any]) -> str:
     lines = ["# Auto-generated by skillbox runtime manager. Do not edit manually.", ""]
     lines.append("[packs]")
     lines.append(f"enabled = [{', '.join(repr(p) for p in packs)}]")
     lines.append("")
-
     if allowlist:
         lines.append("[allowlist]")
         lines.append("rules = [")
@@ -1043,21 +1289,11 @@ def sync_dcg_config(model: dict[str, Any], root_dir: Path, dry_run: bool) -> lis
             lines.append(f"  {rule!r},")
         lines.append("]")
         lines.append("")
+    return "\n".join(lines) + "\n"
 
-    content = "\n".join(lines) + "\n"
 
-    dcg_config_path = root_dir / ".dcg.toml"
-    if dcg_config_path.exists():
-        existing = dcg_config_path.read_text()
-        if existing == content:
-            return [f"exists: {dcg_config_path}"]
-
-    if dry_run:
-        return [f"render-dcg-config: {dcg_config_path} (packs: {', '.join(packs)})"]
-
-    atomic_write_text(dcg_config_path, content)
-    actions.append(f"render-dcg-config: {dcg_config_path} (packs: {', '.join(packs)})")
-    return actions
+def _dcg_config_current(dcg_config_path: Path, content: str) -> bool:
+    return dcg_config_path.exists() and dcg_config_path.read_text() == content
 
 
 def runtime_repo_reference_id(entry: dict[str, Any]) -> str:
@@ -1127,75 +1363,90 @@ def _runtime_status_distributors(model: dict[str, Any]) -> list[dict[str, Any]]:
     return collect_distributor_status(model)
 
 
-def sync_runtime(model: dict[str, Any], dry_run: bool) -> list[str]:
+def _repo_source_kind(source: dict[str, Any]) -> str:
+    return str(source.get("kind", "manual"))
+
+
+def _repo_sync_mode(repo: dict[str, Any], source_kind: str) -> str:
+    sync = repo.get("sync") or {}
+    return str(sync.get("mode") or ("ensure-directory" if source_kind == "directory" else "external"))
+
+
+def _git_clone_args(url: str, branch: str, path: Path) -> list[str]:
+    args = ["git", "clone"]
+    if branch:
+        args.extend(["--branch", branch])
+    args.extend([url, str(path)])
+    return args
+
+
+def _run_git_clone(url: str, branch: str, path: Path) -> None:
+    result = run_command(_git_clone_args(url, branch, path))
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"git clone failed for {url}")
+
+
+def _sync_existing_git_repo(
+    model: dict[str, Any],
+    repo: dict[str, Any],
+    path: Path,
+    url: str,
+    branch: str,
+    dry_run: bool,
+) -> str:
+    if path.is_dir() and git_repo_state(path).get("git"):
+        return f"exists: {path}"
+    if not repo_has_only_regenerable_git_residue(model, repo):
+        return f"exists: {path}"
+    if dry_run:
+        return f"clone-reconcile: {url} -> {path}"
+    clear_repo_git_residue(path)
+    _run_git_clone(url, branch, path)
+    return f"clone-reconcile: {url} -> {path}"
+
+
+def _sync_git_repo(
+    model: dict[str, Any],
+    repo: dict[str, Any],
+    path: Path,
+    source: dict[str, Any],
+    dry_run: bool,
+) -> list[str]:
+    url = str(source["url"])
+    branch = str(source.get("branch", "")).strip()
+    if path.exists():
+        return [_sync_existing_git_repo(model, repo, path, url, branch, dry_run)]
+
+    ensure_directory(path.parent, dry_run)
+    if not dry_run:
+        _run_git_clone(url, branch, path)
+    return [f"clone-if-missing: {url} -> {path}"]
+
+
+def _sync_repo(model: dict[str, Any], repo: dict[str, Any], dry_run: bool) -> list[str]:
+    path = Path(str(repo["host_path"]))
+    source = repo.get("source") or {}
+    source_kind = _repo_source_kind(source)
+    sync_mode = _repo_sync_mode(repo, source_kind)
+    if source_kind == "git" and sync_mode == "clone-if-missing":
+        return _sync_git_repo(model, repo, path, source, dry_run)
+    if path.exists():
+        return [f"exists: {path}"]
+    if sync_mode == "ensure-directory" or source_kind == "directory":
+        ensure_directory(path, dry_run)
+        return [f"ensure-directory: {path}"]
+    return [f"skip: {path} (sync mode {sync_mode})"]
+
+
+def _sync_repos(model: dict[str, Any], dry_run: bool) -> list[str]:
     actions: list[str] = []
-
     for repo in model["repos"]:
-        path = Path(str(repo["host_path"]))
-        source = repo.get("source") or {}
-        source_kind = source.get("kind", "manual")
-        sync = repo.get("sync") or {}
-        sync_mode = sync.get("mode") or (
-            "ensure-directory" if source_kind == "directory" else "external"
-        )
+        actions.extend(_sync_repo(model, repo, dry_run))
+    return actions
 
-        if source_kind == "git" and sync_mode == "clone-if-missing":
-            url = str(source["url"])
-            branch = str(source.get("branch", "")).strip()
-            if path.exists():
-                if path.is_dir() and git_repo_state(path).get("git"):
-                    actions.append(f"exists: {path}")
-                    continue
-                if not repo_has_only_regenerable_git_residue(model, repo):
-                    actions.append(f"exists: {path}")
-                    continue
-                if dry_run:
-                    actions.append(f"clone-reconcile: {url} -> {path}")
-                    continue
-                clear_repo_git_residue(path)
-                args = ["git", "clone"]
-                if branch:
-                    args.extend(["--branch", branch])
-                args.extend([url, str(path)])
-                result = run_command(args)
-                if result.returncode != 0:
-                    raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"git clone failed for {url}")
-                actions.append(f"clone-reconcile: {url} -> {path}")
-                continue
 
-            parent = path.parent
-            ensure_directory(parent, dry_run)
-            if dry_run:
-                actions.append(f"clone-if-missing: {url} -> {path}")
-                continue
-
-            args = ["git", "clone"]
-            if branch:
-                args.extend(["--branch", branch])
-            args.extend([url, str(path)])
-            result = run_command(args)
-            if result.returncode != 0:
-                raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"git clone failed for {url}")
-            actions.append(f"clone-if-missing: {url} -> {path}")
-            continue
-
-        if path.exists():
-            actions.append(f"exists: {path}")
-            continue
-
-        if sync_mode == "ensure-directory" or source_kind == "directory":
-            ensure_directory(path, dry_run)
-            actions.append(f"ensure-directory: {path}")
-            continue
-
-        actions.append(f"skip: {path} (sync mode {sync_mode})")
-
-    for artifact in model["artifacts"]:
-        actions.extend(sync_artifact(artifact, dry_run=dry_run))
-
-    for env_file in model["env_files"]:
-        actions.extend(sync_env_file(env_file, dry_run=dry_run))
-
+def _sync_log_dirs(model: dict[str, Any], dry_run: bool) -> list[str]:
+    actions: list[str] = []
     for log_item in model["logs"]:
         path = Path(str(log_item["host_path"]))
         if path.exists():
@@ -1203,7 +1454,19 @@ def sync_runtime(model: dict[str, Any], dry_run: bool) -> list[str]:
             continue
         ensure_directory(path, dry_run)
         actions.append(f"ensure-directory: {path}")
+    return actions
 
+
+def sync_runtime(model: dict[str, Any], dry_run: bool) -> list[str]:
+    actions: list[str] = []
+    actions.extend(_sync_repos(model, dry_run))
+    for artifact in model["artifacts"]:
+        actions.extend(sync_artifact(artifact, dry_run=dry_run))
+
+    for env_file in model["env_files"]:
+        actions.extend(sync_env_file(env_file, dry_run=dry_run))
+
+    actions.extend(_sync_log_dirs(model, dry_run))
     actions.extend(sync_skill_repo_sets(model, dry_run=dry_run))
     actions.extend(_sync_distributor_sources(model, dry_run=dry_run))
     actions.extend(sync_skill_sets(model, dry_run=dry_run))
@@ -1331,26 +1594,54 @@ def service_supports_lifecycle(
     # non-empty `commands` mapping (per-mode commands introduced by WG-001 for
     # the local_runtime_core_cutover slice).  The actual mode selection is
     # performed later in start_services / resolve_service_mode_command.
+    if not _service_has_lifecycle_command(service):
+        return False, "command missing"
+    if _service_is_idle_ingress(service, model):
+        return False, "no ingress routes active"
+    if _service_is_orchestration(service):
+        return False, "orchestration services are status-only"
+    artifact_reason = _optional_service_artifact_unavailable_reason(service, model)
+    if artifact_reason is not None:
+        return False, artifact_reason
+    return True, None
+
+
+def _service_has_lifecycle_command(service: dict[str, Any]) -> bool:
     has_command = bool(str(service.get("command") or "").strip())
     raw_commands = service.get("commands")
     has_mode_commands = isinstance(raw_commands, dict) and any(
         str(v).strip() for v in raw_commands.values()
     )
-    if not has_command and not has_mode_commands:
-        return False, "command missing"
-    if str(service.get("kind") or "").strip() == "ingress" and model is not None and not model.get("ingress_routes"):
-        return False, "no ingress routes active"
-    if str(service.get("kind") or "").strip() == "orchestration":
-        return False, "orchestration services are status-only"
+    return has_command or has_mode_commands
+
+
+def _service_is_idle_ingress(service: dict[str, Any], model: dict[str, Any] | None) -> bool:
+    return (
+        str(service.get("kind") or "").strip() == "ingress"
+        and model is not None
+        and not model.get("ingress_routes")
+    )
+
+
+def _service_is_orchestration(service: dict[str, Any]) -> bool:
+    return str(service.get("kind") or "").strip() == "orchestration"
+
+
+def _optional_service_artifact_unavailable_reason(
+    service: dict[str, Any],
+    model: dict[str, Any] | None,
+) -> str | None:
     artifact_id = str(service.get("artifact") or "").strip()
-    if artifact_id and model is not None and not service.get("required", True):
-        for artifact in model.get("artifacts") or []:
-            if str(artifact.get("id", "")).strip() == artifact_id:
-                artifact_path = str(artifact.get("host_path") or artifact.get("path") or "").strip()
-                if artifact_path and not Path(artifact_path).exists():
-                    return False, f"artifact {artifact_id!r} not available"
-                break
-    return True, None
+    if not artifact_id or model is None or service.get("required", True):
+        return None
+    for artifact in model.get("artifacts") or []:
+        if str(artifact.get("id", "")).strip() != artifact_id:
+            continue
+        artifact_path = str(artifact.get("host_path") or artifact.get("path") or "").strip()
+        if artifact_path and not Path(artifact_path).exists():
+            return f"artifact {artifact_id!r} not available"
+        break
+    return None
 
 
 def service_dependency_ids(service: dict[str, Any]) -> list[str]:
@@ -1968,6 +2259,157 @@ def run_local_runtime_bridge_tasks(
     return run_tasks(model, ordered, dry_run=dry_run)
 
 
+def _local_runtime_available_profiles(model: dict[str, Any]) -> list[str]:
+    return sorted({
+        str(p).strip()
+        for service in model.get("services") or []
+        for p in service.get("profiles") or []
+        if str(p).strip().startswith("local-")
+    })
+
+
+def _local_runtime_reconcile_result(profile: str) -> tuple[dict[str, Any], list[str]]:
+    actions: list[str] = []
+    return {
+        "status": "ready",
+        "profile": profile,
+        "bridges": [],
+        "env_files": [],
+        "actions": actions,
+    }, actions
+
+
+def _block_local_runtime_result(
+    result: dict[str, Any],
+    error_type: str,
+    detail: str,
+    *,
+    recoverable: bool,
+    next_action: str = "",
+    available_profiles: list[str] | None = None,
+) -> dict[str, Any]:
+    result["status"] = "blocked"
+    result.update(local_runtime_error(
+        error_type,
+        detail,
+        recoverable=recoverable,
+        next_action=next_action,
+        available_profiles=available_profiles,
+    ))
+    return result
+
+
+def _block_unknown_local_runtime_profile(
+    result: dict[str, Any],
+    model: dict[str, Any],
+    detail: str,
+) -> dict[str, Any]:
+    return _block_local_runtime_result(
+        result,
+        "LOCAL_RUNTIME_PROFILE_UNKNOWN",
+        detail,
+        recoverable=False,
+        available_profiles=_local_runtime_available_profiles(model),
+    )
+
+
+def _local_runtime_selected_inputs(
+    model: dict[str, Any],
+    profile: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    bridges = select_local_runtime_bridges(model, profile)
+    bridge_tasks = select_local_runtime_tasks_for_bridges(model, bridges)
+    env_files = select_local_runtime_env_files(model, profile)
+    return bridges, bridge_tasks, env_files
+
+
+def _reconcile_local_runtime_bridges(
+    *,
+    result: dict[str, Any],
+    actions: list[str],
+    model: dict[str, Any],
+    bridges: list[dict[str, Any]],
+    bridge_tasks: list[dict[str, Any]],
+    overlay_path: str | None,
+    dry_run: bool,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any] | None]:
+    needs_rerun, freshness_by_id = bridges_need_rerun(bridges, overlay_path)
+    if needs_rerun and bridge_tasks:
+        actions.append(
+            f"bridge-rerun: stale or missing outputs for "
+            f"{', '.join(sorted(freshness_by_id))}"
+        )
+        try:
+            run_local_runtime_bridge_tasks(model, bridge_tasks, dry_run=dry_run)
+        except RuntimeError as exc:
+            failed = _block_local_runtime_result(
+                result,
+                "LOCAL_RUNTIME_ENV_BRIDGE_FAILED",
+                str(exc),
+                recoverable=True,
+                next_action="Inspect sync.sh bridge logs and rerun focus.",
+            )
+            failed["bridges"] = [
+                {
+                    "id": str(bridge.get("id", "")),
+                    "status": "failed",
+                    "freshness": freshness_by_id.get(str(bridge.get("id", ""))),
+                }
+                for bridge in bridges
+            ]
+            return freshness_by_id, failed
+    elif not bridges:
+        actions.append("bridge-skip: no bridges declared for profile")
+    else:
+        actions.append("bridge-verify: all bridge outputs are fresh")
+    return freshness_by_id, None
+
+
+def _local_runtime_bridge_report(
+    bridges: list[dict[str, Any]],
+    freshness_by_id: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    bridge_report: list[dict[str, Any]] = []
+    missing_outputs: list[str] = []
+    for bridge in bridges:
+        bid = str(bridge.get("id", "")).strip()
+        state = bridge_outputs_state(bridge)
+        ready = state["state"] == "ok"
+        if not ready:
+            missing_outputs.extend(state.get("missing", []))
+        bridge_report.append({
+            "id": bid,
+            "status": "ready" if ready else state["state"],
+            "freshness": freshness_by_id.get(bid),
+            "outputs": state.get("outputs", []),
+            "missing": state.get("missing", []),
+        })
+    return bridge_report, missing_outputs
+
+
+def _local_runtime_env_file_report(env_files: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    missing_sources: list[str] = []
+    env_file_report: list[dict[str, Any]] = []
+    for env_file in env_files:
+        state = env_file_state(env_file)
+        source_present = True
+        source_host_path = state.get("source_host_path") or ""
+        if source_host_path:
+            source_present = Path(source_host_path).is_file()
+        env_file_report.append({
+            "id": env_file.get("id"),
+            "repo": env_file.get("repo"),
+            "target_path": state.get("host_path"),
+            "source_path": source_host_path,
+            "source_present": source_present,
+            "target_present": state.get("present"),
+            "state": state.get("state"),
+        })
+        if env_file.get("required") and source_host_path and not source_present:
+            missing_sources.append(source_host_path)
+    return env_file_report, missing_sources
+
+
 def reconcile_local_runtime_env(
     model: dict[str, Any],
     profile: str,
@@ -1994,158 +2436,77 @@ def reconcile_local_runtime_env(
       4. Validate target_path matches repo contract
       5. Mark blocked on any failure with a stable LOCAL_RUNTIME_* code
     """
-    actions: list[str] = []
-    result: dict[str, Any] = {
-        "status": "ready",
-        "profile": profile,
-        "bridges": [],
-        "env_files": [],
-        "actions": actions,
-    }
+    result, actions = _local_runtime_reconcile_result(profile)
 
     # (0) Unknown / empty profile -> LOCAL_RUNTIME_PROFILE_UNKNOWN
     if not profile or not profile.strip():
-        result["status"] = "blocked"
-        result.update(local_runtime_error(
-            "LOCAL_RUNTIME_PROFILE_UNKNOWN",
+        return _block_unknown_local_runtime_profile(
+            result,
+            model,
             "No local runtime profile selected.",
-            recoverable=False,
-            available_profiles=sorted({
-                str(p).strip()
-                for service in model.get("services") or []
-                for p in service.get("profiles") or []
-                if str(p).strip().startswith("local-")
-            }),
-        ))
-        return result
+        )
 
     services = select_local_runtime_services(model, profile)
     if not services:
-        result["status"] = "blocked"
-        result.update(local_runtime_error(
-            "LOCAL_RUNTIME_PROFILE_UNKNOWN",
+        return _block_unknown_local_runtime_profile(
+            result,
+            model,
             f"Profile {profile!r} has no declared local-runtime services.",
-            recoverable=False,
-            available_profiles=sorted({
-                str(p).strip()
-                for service in model.get("services") or []
-                for p in service.get("profiles") or []
-                if str(p).strip().startswith("local-")
-            }),
-        ))
-        return result
+        )
 
     # (1) Resolve bridges + bridge-backed tasks + env files
-    bridges = select_local_runtime_bridges(model, profile)
-    bridge_tasks = select_local_runtime_tasks_for_bridges(model, bridges)
-    env_files = select_local_runtime_env_files(model, profile)
+    bridges, bridge_tasks, env_files = _local_runtime_selected_inputs(model, profile)
 
     # (2) Bridge freshness decision -- Flow 1 decision point
-    needs_rerun, freshness_by_id = bridges_need_rerun(bridges, overlay_path)
-    if needs_rerun and bridge_tasks:
-        actions.append(
-            f"bridge-rerun: stale or missing outputs for "
-            f"{', '.join(sorted(freshness_by_id))}"
-        )
-        try:
-            run_local_runtime_bridge_tasks(model, bridge_tasks, dry_run=dry_run)
-        except RuntimeError as exc:
-            result["status"] = "blocked"
-            result.update(local_runtime_error(
-                "LOCAL_RUNTIME_ENV_BRIDGE_FAILED",
-                str(exc),
-                recoverable=True,
-                next_action="Inspect sync.sh bridge logs and rerun focus.",
-            ))
-            # Still surface bridge freshness for observability
-            result["bridges"] = [
-                {
-                    "id": str(bridge.get("id", "")),
-                    "status": "failed",
-                    "freshness": freshness_by_id.get(str(bridge.get("id", ""))),
-                }
-                for bridge in bridges
-            ]
-            return result
-    elif not bridges:
-        actions.append("bridge-skip: no bridges declared for profile")
-    else:
-        actions.append("bridge-verify: all bridge outputs are fresh")
+    freshness_by_id, blocked_result = _reconcile_local_runtime_bridges(
+        result=result,
+        actions=actions,
+        model=model,
+        bridges=bridges,
+        bridge_tasks=bridge_tasks,
+        overlay_path=overlay_path,
+        dry_run=dry_run,
+    )
+    if blocked_result is not None:
+        return blocked_result
 
     # Re-probe bridge state after any rerun.
-    bridge_report: list[dict[str, Any]] = []
-    any_bridge_missing = False
-    missing_outputs: list[str] = []
-    for bridge in bridges:
-        bid = str(bridge.get("id", "")).strip()
-        state = bridge_outputs_state(bridge)
-        ready = state["state"] == "ok"
-        if not ready:
-            any_bridge_missing = True
-            missing_outputs.extend(state.get("missing", []))
-        bridge_report.append({
-            "id": bid,
-            "status": "ready" if ready else state["state"],
-            "freshness": freshness_by_id.get(bid),
-            "outputs": state.get("outputs", []),
-            "missing": state.get("missing", []),
-        })
+    bridge_report, missing_outputs = _local_runtime_bridge_report(bridges, freshness_by_id)
     result["bridges"] = bridge_report
 
-    if any_bridge_missing:
-        result["status"] = "blocked"
-        result.update(local_runtime_error(
+    if missing_outputs:
+        return _block_local_runtime_result(
+            result,
             "LOCAL_RUNTIME_ENV_OUTPUT_MISSING",
             "Bridge outputs missing after reconciliation: "
             + ", ".join(missing_outputs),
             recoverable=True,
             next_action="Inspect sync.sh bridge and rerun focus.",
-        ))
-        return result
+        )
 
     # (3) Validate each generated env source exists
-    missing_sources: list[str] = []
-    env_file_report: list[dict[str, Any]] = []
-    for env_file in env_files:
-        state = env_file_state(env_file)
-        source_present = True
-        source_host_path = state.get("source_host_path") or ""
-        if source_host_path:
-            source_present = Path(source_host_path).is_file()
-        env_file_report.append({
-            "id": env_file.get("id"),
-            "repo": env_file.get("repo"),
-            "target_path": state.get("host_path"),
-            "source_path": source_host_path,
-            "source_present": source_present,
-            "target_present": state.get("present"),
-            "state": state.get("state"),
-        })
-        if env_file.get("required") and source_host_path and not source_present:
-            missing_sources.append(source_host_path)
+    env_file_report, missing_sources = _local_runtime_env_file_report(env_files)
     result["env_files"] = env_file_report
 
     if missing_sources:
-        result["status"] = "blocked"
-        result.update(local_runtime_error(
+        return _block_local_runtime_result(
+            result,
             "LOCAL_RUNTIME_ENV_OUTPUT_MISSING",
             "Required env sources missing: " + ", ".join(missing_sources),
             recoverable=True,
             next_action="Inspect sync.sh bridge outputs and rerun focus.",
-        ))
-        return result
+        )
 
     # (4) Validate each target_path matches the repo contract (Rule 4)
     target_violations = validate_env_file_target_paths(env_files, model)
     if target_violations:
-        result["status"] = "blocked"
-        result.update(local_runtime_error(
+        return _block_local_runtime_result(
+            result,
             "LOCAL_RUNTIME_ENV_OUTPUT_MISSING",
             "Env target path contract violated: " + "; ".join(target_violations),
             recoverable=False,
             next_action="Update overlay env_files target_path to match repo contract.",
-        ))
-        return result
+        )
 
     # (5) All prerequisites satisfied
     return result
@@ -2220,40 +2581,43 @@ def task_success_state(task: dict[str, Any], model: dict[str, Any] | None = None
     success_type = success.get("type")
     if success_type == "all_outputs_exist" and model:
         bridge_id = str(success.get("target") or task.get("bridge_id") or "").strip()
-        if not bridge_id:
-            return {"state": "unknown"}
-        bridges = bridge_id_map(model)
-        bridge = bridges.get(bridge_id)
-        if bridge:
-            state = bridge_outputs_state(bridge)
-            if state["state"] == "ok":
-                return {"state": "ok", "target": f"bridge:{bridge_id}"}
-            return {"state": "down", "target": f"bridge:{bridge_id}", "missing": state.get("missing", [])}
-        return {"state": "unknown", "target": f"bridge:{bridge_id} (not found)"}
+        return _bridge_task_success_state(model, bridge_id)
     if success_type == "path_exists":
-        path = Path(str(success["host_path"]))
-        return {"state": "ok" if path.exists() else "down", "target": str(path)}
+        return _path_success_state(success)
     if success_type == "port_listening":
-        try:
-            port = int(success["port"])
-        except (KeyError, TypeError, ValueError):
-            return {"state": "unknown"}
-        host = str(success.get("host") or "127.0.0.1")
-        result = _port_listening_state(port, host=host)
-        return result | {"target": f"{host}:{port}"}
+        return _port_success_state(success)
 
-    # Backward-compatible bridge-backed task: check all bridge outputs exist.
     bridge_id = str(task.get("bridge_id", "")).strip()
     if bridge_id and model:
-        bridges = bridge_id_map(model)
-        bridge = bridges.get(bridge_id)
-        if bridge:
-            state = bridge_outputs_state(bridge)
-            if state["state"] == "ok":
-                return {"state": "ok", "target": f"bridge:{bridge_id}"}
-            return {"state": "down", "target": f"bridge:{bridge_id}", "missing": state.get("missing", [])}
-        return {"state": "unknown", "target": f"bridge:{bridge_id} (not found)"}
+        return _bridge_task_success_state(model, bridge_id)
     return {"state": "unknown"}
+
+
+def _bridge_task_success_state(model: dict[str, Any], bridge_id: str) -> dict[str, Any]:
+    if not bridge_id:
+        return {"state": "unknown"}
+    bridge = bridge_id_map(model).get(bridge_id)
+    if not bridge:
+        return {"state": "unknown", "target": f"bridge:{bridge_id} (not found)"}
+    state = bridge_outputs_state(bridge)
+    if state["state"] == "ok":
+        return {"state": "ok", "target": f"bridge:{bridge_id}"}
+    return {"state": "down", "target": f"bridge:{bridge_id}", "missing": state.get("missing", [])}
+
+
+def _path_success_state(success: dict[str, Any]) -> dict[str, Any]:
+    path = Path(str(success["host_path"]))
+    return {"state": "ok" if path.exists() else "down", "target": str(path)}
+
+
+def _port_success_state(success: dict[str, Any]) -> dict[str, Any]:
+    try:
+        port = int(success["port"])
+    except (KeyError, TypeError, ValueError):
+        return {"state": "unknown"}
+    host = str(success.get("host") or "127.0.0.1")
+    result = _port_listening_state(port, host=host)
+    return result | {"target": f"{host}:{port}"}
 
 
 def probe_task(model: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
@@ -2436,7 +2800,11 @@ def select_tasks(model: dict[str, Any], task_ids: list[str] | None) -> list[dict
         return list(model["tasks"])
 
     requested = set(requested_ids)
-    return [task for task in model["tasks"] if task["id"] in requested]
+    return [
+        task
+        for task in model["tasks"]
+        if str(task.get("id", "")).strip() in requested
+    ]
 
 
 def resolve_tasks_for_run(
@@ -2484,7 +2852,11 @@ def select_services(model: dict[str, Any], service_ids: list[str] | None) -> lis
         return list(model["services"])
 
     requested = set(requested_ids)
-    return [service for service in model["services"] if service["id"] in requested]
+    return [
+        service
+        for service in model["services"]
+        if str(service.get("id", "")).strip() in requested
+    ]
 
 
 def select_env_files_for_services(model: dict[str, Any], services: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2726,6 +3098,228 @@ def run_tasks(
     return results
 
 
+def _service_start_base_result(service: dict[str, Any], paths: dict[str, Path]) -> dict[str, Any]:
+    return {
+        "id": service["id"],
+        "kind": service.get("kind", "service"),
+        "log_file": str(paths["log_file"]),
+        "pid_file": str(paths["pid_file"]),
+    }
+
+
+def _prelaunch_running_result(service: dict[str, Any], result: dict[str, Any]) -> dict[str, Any] | None:
+    prelaunch_health = service_healthcheck_state(service)
+    if prelaunch_health.get("state") != "ok":
+        return None
+    reused_result = result | {"result": "already-running"}
+    for key in ("url", "target", "port"):
+        if key in prelaunch_health:
+            reused_result[key] = prelaunch_health[key]
+    log_runtime_event("service.reused", service["id"])
+    return reused_result
+
+
+def _service_launch_context(
+    model: dict[str, Any],
+    service: dict[str, Any],
+    result: dict[str, Any],
+    paths: dict[str, Path],
+    effective_mode: str | None,
+) -> tuple[list[str], dict[str, str], Path, bool]:
+    launch_service = service
+    mode_command = resolve_service_mode_command(service, effective_mode)
+    if mode_command is not None:
+        launch_service = dict(service)
+        launch_service["command"] = mode_command
+        if effective_mode is not None:
+            result["mode"] = effective_mode
+
+    command, env = translated_runtime_command(model, launch_service)
+    cwd = resolve_runtime_command_cwd(model, launch_service)
+    result["command"] = command
+    result["cwd"] = str(cwd)
+    healthcheck = launch_service.get("healthcheck") or {}
+    self_managed_pid_file = (
+        healthcheck.get("type") == "path_exists"
+        and str(healthcheck.get("host_path") or "") == str(paths["pid_file"])
+    )
+    return command, env, cwd, self_managed_pid_file
+
+
+def _spawn_service_process(command: list[str], cwd: Path, env: dict[str, str], log_file: Path) -> subprocess.Popen[str]:
+    with log_file.open("a", encoding="utf-8") as log_handle:
+        return subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            shell=True,
+            start_new_session=True,
+            text=True,
+        )
+
+
+def _write_managed_service_pid(process: subprocess.Popen[str], pid_file: Path) -> None:
+    try:
+        tmp_pid = pid_file.with_suffix(pid_file.suffix + ".tmp")
+        tmp_pid.write_text(f"{process.pid}\n", encoding="utf-8")
+        os.replace(tmp_pid, pid_file)
+    except OSError:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except OSError:
+            pass
+        raise
+
+
+def _copy_health_fields(detail: dict[str, Any], health_state: dict[str, Any], keys: tuple[str, ...]) -> None:
+    for key in keys:
+        if key in health_state:
+            detail[key] = health_state[key]
+
+
+def _failed_service_start_result(
+    service: dict[str, Any],
+    result: dict[str, Any],
+    paths: dict[str, Path],
+    process: subprocess.Popen[str],
+    health_state: dict[str, Any],
+    self_managed_pid_file: bool,
+) -> dict[str, Any]:
+    stop_process(process.pid, DEFAULT_SERVICE_STOP_WAIT_SECONDS)
+    if not self_managed_pid_file:
+        remove_pid_file(paths["pid_file"])
+    detail = result | {"result": "failed", "tail": tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)}
+    _copy_health_fields(detail, health_state, ("exit_code", "url", "target", "pattern"))
+    log_runtime_event("service.start_failed", service["id"], {"state": "failed"})
+    return detail
+
+
+def _timeout_service_start_result(
+    service: dict[str, Any],
+    result: dict[str, Any],
+    paths: dict[str, Path],
+    process: subprocess.Popen[str],
+    health_state: dict[str, Any],
+) -> dict[str, Any]:
+    track_started_service_process(process)
+    detail = result | {
+        "result": "timeout",
+        "pid": process.pid,
+        "tail": tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES),
+    }
+    _copy_health_fields(detail, health_state, ("url", "target", "pattern"))
+    log_runtime_event("service.start_timeout", service["id"], {"state": "timeout", "pid": process.pid})
+    return detail
+
+
+def _self_managed_reused_result(
+    service: dict[str, Any],
+    result: dict[str, Any],
+    paths: dict[str, Path],
+    health_state: dict[str, Any],
+) -> dict[str, Any]:
+    started_pid = live_service_pid(paths["pid_file"])
+    if started_pid is None:
+        detail = result | {"result": "failed", "tail": tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)}
+        _copy_health_fields(detail, health_state, ("exit_code", "target"))
+        log_runtime_event("service.start_failed", service["id"], {"state": "failed"})
+        return detail
+    started_detail = result | {"result": "started", "pid": started_pid}
+    _copy_health_fields(started_detail, health_state, ("target",))
+    log_runtime_event("service.started", service["id"], {"pid": started_pid})
+    return started_detail
+
+
+def _reused_existing_service_result(
+    service: dict[str, Any],
+    result: dict[str, Any],
+    paths: dict[str, Path],
+    health_state: dict[str, Any],
+    self_managed_pid_file: bool,
+) -> dict[str, Any]:
+    if self_managed_pid_file:
+        return _self_managed_reused_result(service, result, paths, health_state)
+    remove_pid_file(paths["pid_file"])
+    reused_result = result | {"result": "already-running"}
+    _copy_health_fields(reused_result, health_state, ("url", "target"))
+    log_runtime_event("service.reused", service["id"])
+    return reused_result
+
+
+def _healthy_service_start_result(
+    service: dict[str, Any],
+    result: dict[str, Any],
+    paths: dict[str, Path],
+    process: subprocess.Popen[str],
+    self_managed_pid_file: bool,
+) -> dict[str, Any]:
+    started_pid = live_service_pid(paths["pid_file"]) if self_managed_pid_file else process.pid
+    started_detail = result | {"result": "started"}
+    if started_pid is not None:
+        started_detail["pid"] = started_pid
+    log_runtime_event("service.started", service["id"], {"pid": started_pid or process.pid})
+    track_started_service_process(process)
+    return started_detail
+
+
+def _service_health_start_result(
+    service: dict[str, Any],
+    result: dict[str, Any],
+    paths: dict[str, Path],
+    process: subprocess.Popen[str],
+    wait_seconds: float,
+    self_managed_pid_file: bool,
+) -> dict[str, Any]:
+    health_state = wait_for_service_health(service, process, wait_seconds)
+    if health_state.get("state") == "failed":
+        return _failed_service_start_result(service, result, paths, process, health_state, self_managed_pid_file)
+    if health_state.get("state") == "timeout":
+        return _timeout_service_start_result(service, result, paths, process, health_state)
+    if health_state.get("reused_existing"):
+        return _reused_existing_service_result(service, result, paths, health_state, self_managed_pid_file)
+    return _healthy_service_start_result(service, result, paths, process, self_managed_pid_file)
+
+
+def _start_service(
+    model: dict[str, Any],
+    service: dict[str, Any],
+    *,
+    dry_run: bool,
+    wait_seconds: float,
+    effective_mode: str | None,
+) -> dict[str, Any]:
+    manageable, reason = service_supports_lifecycle(service, model)
+    paths = service_paths(model, service)
+    result = _service_start_base_result(service, paths)
+    if not manageable:
+        return result | {"result": "skipped", "reason": reason}
+
+    pid = live_service_pid(paths["pid_file"])
+    if pid is not None:
+        return result | {"result": "already-running", "pid": pid}
+
+    prelaunch_result = _prelaunch_running_result(service, result)
+    if prelaunch_result is not None:
+        return prelaunch_result
+
+    command, env, cwd, self_managed_pid_file = _service_launch_context(
+        model, service, result, paths, effective_mode,
+    )
+    ensure_directory(paths["log_dir"], dry_run)
+    if dry_run:
+        return result | {"result": "dry-run"}
+
+    process = _spawn_service_process(command, cwd, env, paths["log_file"])
+    if not self_managed_pid_file:
+        _write_managed_service_pid(process, paths["pid_file"])
+    return _service_health_start_result(
+        service, result, paths, process, wait_seconds, self_managed_pid_file,
+    )
+
+
 def start_services(
     model: dict[str, Any],
     services: list[dict[str, Any]],
@@ -2734,164 +3328,17 @@ def start_services(
     wait_seconds: float,
     mode: str | None = None,
 ) -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
     effective_mode = (mode or "").strip() or None
-    for service in services:
-        manageable, reason = service_supports_lifecycle(service, model)
-        paths = service_paths(model, service)
-        result = {
-            "id": service["id"],
-            "kind": service.get("kind", "service"),
-            "log_file": str(paths["log_file"]),
-            "pid_file": str(paths["pid_file"]),
-        }
-
-        if not manageable:
-            results.append(result | {"result": "skipped", "reason": reason})
-            continue
-
-        pid = live_service_pid(paths["pid_file"])
-        if pid is not None:
-            results.append(result | {"result": "already-running", "pid": pid})
-            continue
-
-        prelaunch_health = service_healthcheck_state(service)
-        if prelaunch_health.get("state") == "ok":
-            reused_result = result | {"result": "already-running"}
-            if "url" in prelaunch_health:
-                reused_result["url"] = prelaunch_health["url"]
-            if "target" in prelaunch_health:
-                reused_result["target"] = prelaunch_health["target"]
-            if "port" in prelaunch_health:
-                reused_result["port"] = prelaunch_health["port"]
-            results.append(reused_result)
-            log_runtime_event("service.reused", service["id"])
-            continue
-
-        # Resolve the per-mode command for local-runtime services.  Services
-        # that only declare a `commands` mapping (no top-level `command`) are
-        # the local_runtime_core_cutover shape; pick the effective mode (or
-        # fall back to the reuse command when the caller did not thread one).
-        launch_service = service
-        mode_command = resolve_service_mode_command(service, effective_mode)
-        if mode_command is not None:
-            launch_service = dict(service)
-            launch_service["command"] = mode_command
-            if effective_mode is not None:
-                result["mode"] = effective_mode
-
-        command, env = translated_runtime_command(model, launch_service)
-        cwd = resolve_runtime_command_cwd(model, launch_service)
-        result["command"] = command
-        result["cwd"] = str(cwd)
-        healthcheck = launch_service.get("healthcheck") or {}
-        self_managed_pid_file = (
-            healthcheck.get("type") == "path_exists"
-            and str(healthcheck.get("host_path") or "") == str(paths["pid_file"])
+    return [
+        _start_service(
+            model,
+            service,
+            dry_run=dry_run,
+            wait_seconds=wait_seconds,
+            effective_mode=effective_mode,
         )
-
-        ensure_directory(paths["log_dir"], dry_run)
-        if dry_run:
-            results.append(result | {"result": "dry-run"})
-            continue
-
-        with paths["log_file"].open("a", encoding="utf-8") as log_handle:
-            process = subprocess.Popen(
-                command,
-                cwd=cwd,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                shell=True,
-                start_new_session=True,
-                text=True,
-            )
-
-        if not self_managed_pid_file:
-            try:
-                tmp_pid = paths["pid_file"].with_suffix(paths["pid_file"].suffix + ".tmp")
-                tmp_pid.write_text(f"{process.pid}\n", encoding="utf-8")
-                os.replace(tmp_pid, paths["pid_file"])
-            except OSError:
-                # PID write failed — don't leave an orphan child untracked.
-                try:
-                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-                except OSError:
-                    pass
-                raise
-        health_state = wait_for_service_health(service, process, wait_seconds)
-        if health_state.get("state") == "failed":
-            # Process actually exited — clean up PID file.
-            stop_process(process.pid, DEFAULT_SERVICE_STOP_WAIT_SECONDS)
-            if not self_managed_pid_file:
-                remove_pid_file(paths["pid_file"])
-            tail = tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)
-            detail = result | {"result": "failed", "tail": tail}
-            if "exit_code" in health_state:
-                detail["exit_code"] = health_state["exit_code"]
-            if "url" in health_state:
-                detail["url"] = health_state["url"]
-            if "target" in health_state:
-                detail["target"] = health_state["target"]
-            if "pattern" in health_state:
-                detail["pattern"] = health_state["pattern"]
-            log_runtime_event("service.start_failed", service["id"], {"state": "failed"})
-            results.append(detail)
-            continue
-        if health_state.get("state") == "timeout":
-            # Process is still alive but health check hasn't passed yet.
-            # Leave it running — it may still be compiling / booting.
-            track_started_service_process(process)
-            tail = tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)
-            detail = result | {"result": "timeout", "pid": process.pid, "tail": tail}
-            if "url" in health_state:
-                detail["url"] = health_state["url"]
-            if "target" in health_state:
-                detail["target"] = health_state["target"]
-            if "pattern" in health_state:
-                detail["pattern"] = health_state["pattern"]
-            log_runtime_event("service.start_timeout", service["id"], {"state": "timeout", "pid": process.pid})
-            results.append(detail)
-            continue
-
-        if health_state.get("reused_existing"):
-            if self_managed_pid_file:
-                started_pid = live_service_pid(paths["pid_file"])
-                if started_pid is None:
-                    tail = tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)
-                    detail = result | {"result": "failed", "tail": tail}
-                    if "exit_code" in health_state:
-                        detail["exit_code"] = health_state["exit_code"]
-                    if "target" in health_state:
-                        detail["target"] = health_state["target"]
-                    log_runtime_event("service.start_failed", service["id"], {"state": "failed"})
-                    results.append(detail)
-                    continue
-                started_detail = result | {"result": "started", "pid": started_pid}
-                if "target" in health_state:
-                    started_detail["target"] = health_state["target"]
-                results.append(started_detail)
-                log_runtime_event("service.started", service["id"], {"pid": started_pid})
-                continue
-            remove_pid_file(paths["pid_file"])
-            reused_result = result | {"result": "already-running"}
-            if "url" in health_state:
-                reused_result["url"] = health_state["url"]
-            if "target" in health_state:
-                reused_result["target"] = health_state["target"]
-            results.append(reused_result)
-            log_runtime_event("service.reused", service["id"])
-            continue
-
-        started_pid = live_service_pid(paths["pid_file"]) if self_managed_pid_file else process.pid
-        started_detail = result | {"result": "started"}
-        if started_pid is not None:
-            started_detail["pid"] = started_pid
-        results.append(started_detail)
-        log_runtime_event("service.started", service["id"], {"pid": started_pid or process.pid})
-        track_started_service_process(process)
-    return results
+        for service in services
+    ]
 
 
 def stop_services(
@@ -3060,82 +3507,116 @@ MCP_PROTOCOL_VERSION = "2024-11-05"
 MCP_SMOKE_TIMEOUT_SECONDS = 5.0
 
 
-def collect_live_state(
-    model: dict[str, Any],
-    root_dir: Path = DEFAULT_ROOT_DIR,
-) -> dict[str, Any]:
-    """Snapshot volatile runtime state: git branches, service health, check results, recent errors."""
-    repo_states: list[dict[str, Any]] = []
-    for repo in model.get("repos") or []:
-        path = Path(str(repo["host_path"]))
-        item: dict[str, Any] = {
-            "id": repo["id"],
-            "path": str(repo["path"]),
-            "present": path.exists(),
-        }
-        if path.exists() and path.is_dir():
-            git_state = git_repo_state(path)
-            item.update(git_state)
-            if git_state.get("git"):
-                log_result = run_command(
-                    ["git", "log", "--oneline", "-1"], cwd=path,
-                )
-                if log_result.returncode == 0:
-                    item["last_commit"] = log_result.stdout.strip()
-        repo_states.append(item)
+def _live_repo_state(repo: dict[str, Any]) -> dict[str, Any]:
+    path = Path(str(repo["host_path"]))
+    item: dict[str, Any] = {
+        "id": repo["id"],
+        "path": str(repo["path"]),
+        "present": path.exists(),
+    }
+    if not path.exists() or not path.is_dir():
+        return item
 
-    service_states: list[dict[str, Any]] = []
-    for service in model.get("services") or []:
-        probe = probe_service(model, service)
-        service_states.append({
-            "id": service["id"],
-            "kind": service.get("kind", "service"),
-            "state": probe.get("state", "declared"),
-            "pid": probe.get("pid"),
-            "healthy": probe.get("state") == "running",
-        })
+    git_state = git_repo_state(path)
+    item.update(git_state)
+    if git_state.get("git"):
+        log_result = run_command(["git", "log", "--oneline", "-1"], cwd=path)
+        if log_result.returncode == 0:
+            item["last_commit"] = log_result.stdout.strip()
+    return item
 
-    check_states: list[dict[str, Any]] = []
-    for check in model.get("checks") or []:
-        item = {"id": check["id"], "type": check["type"], "ok": False}
-        if check["type"] == "path_exists":
-            item["ok"] = Path(str(check["host_path"])).exists()
-        check_states.append(item)
 
-    log_states: list[dict[str, Any]] = []
-    for log_item in model.get("logs") or []:
-        path = Path(str(log_item["host_path"]))
-        item = {
-            "id": log_item["id"],
-            "path": str(log_item["path"]),
-            "present": path.exists(),
-            "recent_errors": [],
-        }
-        if path.exists():
-            # Scan several recent files; focus itself can touch newer logs
-            # after a failing service wrote the error the operator needs.
-            log_files = sorted(
-                (f for f in path.rglob("*") if f.is_file()),
-                key=lambda f: f.stat().st_mtime,
-                reverse=True,
-            )
-            errors: list[str] = []
-            scanned_files: list[str] = []
-            for log_file in log_files[:5]:
-                scanned_files.append(str(log_file.name))
-                lines = tail_lines(log_file, 100)
-                errors.extend(
-                    line for line in lines if FOCUS_ERROR_PATTERNS.search(line)
-                )
-            item["recent_errors"] = errors[-5:]  # Keep at most 5
-            if scanned_files:
-                item["scanned_files"] = scanned_files
-                item["scanned_file"] = scanned_files[0]
-        log_states.append(item)
+def _live_repo_states(model: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        _live_repo_state(repo)
+        for repo in model.get("repos") or []
+    ]
 
+
+def _live_service_state(model: dict[str, Any], service: dict[str, Any]) -> dict[str, Any]:
+    probe = probe_service(model, service)
+    return {
+        "id": service["id"],
+        "kind": service.get("kind", "service"),
+        "state": probe.get("state", "declared"),
+        "pid": probe.get("pid"),
+        "healthy": probe.get("state") == "running",
+    }
+
+
+def _live_service_states(model: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        _live_service_state(model, service)
+        for service in model.get("services") or []
+    ]
+
+
+def _live_check_state(check: dict[str, Any]) -> dict[str, Any]:
+    item = {"id": check["id"], "type": check["type"], "ok": False}
+    if check["type"] == "path_exists":
+        item["ok"] = Path(str(check["host_path"])).exists()
+    return item
+
+
+def _live_check_states(model: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        _live_check_state(check)
+        for check in model.get("checks") or []
+    ]
+
+
+def _recent_log_errors(path: Path) -> tuple[list[str], list[str]]:
+    log_files = sorted(
+        (file_path for file_path in path.rglob("*") if file_path.is_file()),
+        key=lambda file_path: file_path.stat().st_mtime,
+        reverse=True,
+    )
+    errors: list[str] = []
+    scanned_files: list[str] = []
+    for log_file in log_files[:5]:
+        scanned_files.append(str(log_file.name))
+        lines = tail_lines(log_file, 100)
+        errors.extend(line for line in lines if FOCUS_ERROR_PATTERNS.search(line))
+    return errors[-5:], scanned_files
+
+
+def _live_log_state(log_item: dict[str, Any]) -> dict[str, Any]:
+    path = Path(str(log_item["host_path"]))
+    item = {
+        "id": log_item["id"],
+        "path": str(log_item["path"]),
+        "present": path.exists(),
+        "recent_errors": [],
+    }
+    if not path.exists():
+        return item
+
+    errors, scanned_files = _recent_log_errors(path)
+    item["recent_errors"] = errors
+    if scanned_files:
+        item["scanned_files"] = scanned_files
+        item["scanned_file"] = scanned_files[0]
+    return item
+
+
+def _live_log_states(model: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        _live_log_state(log_item)
+        for log_item in model.get("logs") or []
+    ]
+
+
+def _active_session_client_ids(model: dict[str, Any]) -> list[str]:
+    return [
+        str(client_id)
+        for client_id in model.get("active_clients") or []
+        if str(client_id).strip()
+    ]
+
+
+def _live_session_states(model: dict[str, Any], root_dir: Path) -> list[dict[str, Any]]:
     session_states: list[dict[str, Any]] = []
-    active_clients = [str(client_id) for client_id in model.get("active_clients") or [] if str(client_id).strip()]
-    for client_id in active_clients:
+    for client_id in _active_session_client_ids(model):
         for session in list_client_sessions(root_dir, client_id, limit=5):
             session_states.append(
                 {
@@ -3149,31 +3630,41 @@ def collect_live_state(
                     "last_message": session.get("last_message") or "",
                 }
             )
+    session_states.sort(key=lambda item: float(item.get("updated_at") or 0), reverse=True)
+    return session_states
 
-    session_states.sort(
-        key=lambda item: float(item.get("updated_at") or 0),
-        reverse=True,
-    )
 
-    bridge_states: list[dict[str, Any]] = []
-    for bridge in model.get("bridges") or []:
-        state = bridge_outputs_state(bridge)
-        bridge_states.append({
-            "id": bridge["id"],
-            "env_tier": bridge.get("env_tier", "local"),
-            "targets": bridge.get("legacy_targets", []),
-            "state": state["state"],
-            "missing": state.get("missing", []),
-        })
+def _live_bridge_state(bridge: dict[str, Any]) -> dict[str, Any]:
+    state = bridge_outputs_state(bridge)
+    return {
+        "id": bridge["id"],
+        "env_tier": bridge.get("env_tier", "local"),
+        "targets": bridge.get("legacy_targets", []),
+        "state": state["state"],
+        "missing": state.get("missing", []),
+    }
 
+
+def _live_bridge_states(model: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        _live_bridge_state(bridge)
+        for bridge in model.get("bridges") or []
+    ]
+
+
+def collect_live_state(
+    model: dict[str, Any],
+    root_dir: Path = DEFAULT_ROOT_DIR,
+) -> dict[str, Any]:
+    """Snapshot volatile runtime state: git branches, service health, check results, recent errors."""
     return {
         "collected_at": time.time(),
-        "repos": repo_states,
-        "services": service_states,
-        "checks": check_states,
-        "logs": log_states,
-        "sessions": session_states,
-        "bridges": bridge_states,
+        "repos": _live_repo_states(model),
+        "services": _live_service_states(model),
+        "checks": _live_check_states(model),
+        "logs": _live_log_states(model),
+        "sessions": _live_session_states(model, root_dir),
+        "bridges": _live_bridge_states(model),
     }
 
 
@@ -3513,8 +4004,8 @@ def collect_deferred_log_entries(
     return entries
 
 
-def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
-    repo_statuses: list[dict[str, Any]] = []
+def _runtime_repo_statuses(model: dict[str, Any]) -> list[dict[str, Any]]:
+    statuses: list[dict[str, Any]] = []
     for repo in model["repos"]:
         path = Path(str(repo["host_path"]))
         item = {
@@ -3527,37 +4018,31 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
         }
         if path.exists() and path.is_dir():
             item.update(git_repo_state(path))
-        repo_statuses.append(item)
+        statuses.append(item)
+    return statuses
 
-    artifact_statuses: list[dict[str, Any]] = []
-    for artifact in model["artifacts"]:
-        artifact_statuses.append(artifact_state(artifact))
 
-    env_file_statuses = [env_file_state(env_file) for env_file in model["env_files"]]
+def _runtime_skill_status(skillset: dict[str, Any]) -> dict[str, Any]:
+    if skillset.get("kind") == "skill-repo-set":
+        return _collect_skill_repo_status(skillset)
+    inventory = collect_skill_inventory(skillset)
+    return {
+        "id": inventory["id"],
+        "kind": inventory["kind"],
+        "bundle_dir": inventory["bundle_dir"],
+        "bundle_dir_host_path": inventory["bundle_dir_host_path"],
+        "manifest": inventory["manifest"],
+        "lock_path": inventory["lock_path"],
+        "lock_present": inventory["lock_present"],
+        "lock_error": inventory["lock_error"],
+        "missing_bundles": inventory["missing_bundles"],
+        "extra_bundles": inventory["extra_bundles"],
+        "skills": inventory["skills"],
+    }
 
-    skill_statuses: list[dict[str, Any]] = []
-    for skillset in model["skills"]:
-        if skillset.get("kind") == "skill-repo-set":
-            skill_statuses.append(_collect_skill_repo_status(skillset))
-            continue
-        inventory = collect_skill_inventory(skillset)
-        skill_statuses.append(
-            {
-                "id": inventory["id"],
-                "kind": inventory["kind"],
-                "bundle_dir": inventory["bundle_dir"],
-                "bundle_dir_host_path": inventory["bundle_dir_host_path"],
-                "manifest": inventory["manifest"],
-                "lock_path": inventory["lock_path"],
-                "lock_present": inventory["lock_present"],
-                "lock_error": inventory["lock_error"],
-                "missing_bundles": inventory["missing_bundles"],
-                "extra_bundles": inventory["extra_bundles"],
-                "skills": inventory["skills"],
-            }
-        )
 
-    task_statuses: list[dict[str, Any]] = []
+def _runtime_task_statuses(model: dict[str, Any]) -> list[dict[str, Any]]:
+    statuses: list[dict[str, Any]] = []
     for task in model["tasks"]:
         item = {
             "id": task["id"],
@@ -3568,9 +4053,12 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
             "outputs": list(task.get("outputs") or []),
         }
         item.update(probe_task(model, task))
-        task_statuses.append(item)
+        statuses.append(item)
+    return statuses
 
-    service_statuses: list[dict[str, Any]] = []
+
+def _runtime_service_statuses(model: dict[str, Any]) -> list[dict[str, Any]]:
+    statuses: list[dict[str, Any]] = []
     for service in model["services"]:
         item = {
             "id": service["id"],
@@ -3586,20 +4074,21 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
         item["ownership_state"] = ownership_state_for_service(
             model, str(service.get("id", ""))
         )
-        service_statuses.append(item)
+        statuses.append(item)
+    return statuses
 
-    # WG-006: blocked_services lists declared services whose current probe
-    # did not report a running/ok state.  Status stays observational per
-    # backend.md Rule 3a -- we do NOT re-run bridges or bootstrap tasks;
-    # we just summarise what the graph currently looks like.
-    blocked_services: list[str] = [
+
+def _runtime_blocked_services(service_statuses: list[dict[str, Any]]) -> list[str]:
+    return [
         str(entry.get("id", ""))
         for entry in service_statuses
         if entry.get("state") not in {"running", "ok", "idle"}
         and str(entry.get("id", "")).strip()
     ]
 
-    log_statuses: list[dict[str, Any]] = []
+
+def _runtime_log_statuses(model: dict[str, Any]) -> list[dict[str, Any]]:
+    statuses: list[dict[str, Any]] = []
     for log_item in model["logs"]:
         path = Path(str(log_item["host_path"]))
         item = {
@@ -3608,9 +4097,12 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
             "host_path": str(path),
         }
         item.update(log_directory_state(path))
-        log_statuses.append(item)
+        statuses.append(item)
+    return statuses
 
-    check_statuses: list[dict[str, Any]] = []
+
+def _runtime_check_statuses(model: dict[str, Any]) -> list[dict[str, Any]]:
+    statuses: list[dict[str, Any]] = []
     for check in model["checks"]:
         item = {
             "id": check["id"],
@@ -3621,10 +4113,13 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
             item["path"] = str(check["path"])
             item["host_path"] = str(path)
             item["ok"] = path.exists()
-        check_statuses.append(item)
+        statuses.append(item)
+    return statuses
 
+
+def _runtime_ingress_payload(model: dict[str, Any]) -> dict[str, Any]:
     ingress_paths = ingress_config_paths(model) if has_ingress_runtime(model) else {}
-    ingress_payload = {
+    return {
         "listeners": {
             "public": ingress_listener_settings(model, "public"),
             "private": ingress_listener_settings(model, "private"),
@@ -3636,6 +4131,9 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
         "routes": resolved_ingress_routes(model, include_service_state=True),
     }
 
+
+def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
+    service_statuses = _runtime_service_statuses(model)
     return {
         "clients": copy.deepcopy(model.get("clients") or []),
         "active_clients": model.get("active_clients") or [],
@@ -3643,16 +4141,16 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
         "active_profiles": model.get("active_profiles") or [],
         "distributors": _runtime_status_distributors(model),
         "storage": copy.deepcopy(model.get("storage") or {}),
-        "repos": repo_statuses,
-        "artifacts": artifact_statuses,
-        "env_files": env_file_statuses,
-        "skills": skill_statuses,
-        "tasks": task_statuses,
+        "repos": _runtime_repo_statuses(model),
+        "artifacts": [artifact_state(artifact) for artifact in model["artifacts"]],
+        "env_files": [env_file_state(env_file) for env_file in model["env_files"]],
+        "skills": [_runtime_skill_status(skillset) for skillset in model["skills"]],
+        "tasks": _runtime_task_statuses(model),
         "services": service_statuses,
-        "blocked_services": blocked_services,
-        "logs": log_statuses,
-        "checks": check_statuses,
-        "ingress": ingress_payload,
+        "blocked_services": _runtime_blocked_services(service_statuses),
+        "logs": _runtime_log_statuses(model),
+        "checks": _runtime_check_statuses(model),
+        "ingress": _runtime_ingress_payload(model),
         "parity_ledger": {
             "covered_surfaces": parity_ledger_covered_surfaces(model),
             "deferred_surfaces": parity_ledger_deferred_surfaces(model),
@@ -3660,123 +4158,170 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _compact_client_ids(status_payload: dict[str, Any]) -> list[str]:
+    return [
+        str(client.get("id"))
+        for client in status_payload.get("clients") or []
+        if client.get("id")
+    ]
+
+
+def _compact_status_skill(skillset: dict[str, Any]) -> dict[str, Any]:
+    targets = [
+        target
+        for skill_entry in skillset.get("skills") or []
+        for target in skill_entry.get("targets") or []
+    ]
+    return {
+        "id": skillset.get("id"),
+        "kind": skillset.get("kind"),
+        "lock_present": bool(skillset.get("lock_present")),
+        "lock_error": skillset.get("lock_error"),
+        "skill_count": len(skillset.get("skills") or []),
+        "healthy_targets": sum(1 for target in targets if target.get("state") == "ok"),
+        "total_targets": len(targets),
+    }
+
+
+def _compact_status_skills(status_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        _compact_status_skill(skillset)
+        for skillset in status_payload.get("skills") or []
+    ]
+
+
+def _compact_status_storage(status_payload: dict[str, Any]) -> dict[str, Any]:
+    storage = status_payload.get("storage") or {}
+    return {
+        "provider": storage.get("provider"),
+        "state_root": storage.get("state_root"),
+        "required": bool(storage.get("required")),
+    }
+
+
+def _compact_status_repos(status_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": repo.get("id"),
+            "present": bool(repo.get("present")),
+            "branch": repo.get("branch"),
+            "dirty": repo.get("dirty"),
+            "untracked": repo.get("untracked"),
+        }
+        for repo in status_payload.get("repos") or []
+    ]
+
+
+def _compact_status_artifacts(status_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": artifact.get("id"),
+            "state": artifact.get("state"),
+            "source_kind": artifact.get("source_kind"),
+            "required": bool(artifact.get("required")),
+        }
+        for artifact in status_payload.get("artifacts") or []
+    ]
+
+
+def _compact_status_env_files(status_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": env_file.get("id"),
+            "state": env_file.get("state"),
+            "source_kind": env_file.get("source_kind"),
+            "required": bool(env_file.get("required")),
+        }
+        for env_file in status_payload.get("env_files") or []
+    ]
+
+
+def _compact_status_tasks(status_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": task.get("id"),
+            "state": task.get("state"),
+            "depends_on": task.get("depends_on") or [],
+        }
+        for task in status_payload.get("tasks") or []
+    ]
+
+
+def _compact_status_services(status_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": service.get("id"),
+            "state": service.get("state"),
+            "pid": service.get("pid"),
+            "managed": service.get("managed"),
+            "manager_reason": service.get("manager_reason"),
+            "ownership_state": service.get("ownership_state"),
+            "depends_on": service.get("depends_on") or [],
+            "bootstrap_tasks": service.get("bootstrap_tasks") or [],
+        }
+        for service in status_payload.get("services") or []
+    ]
+
+
+def _compact_status_logs(status_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": log_item.get("id"),
+            "present": bool(log_item.get("present")),
+            "files": log_item.get("files"),
+            "bytes": log_item.get("bytes"),
+        }
+        for log_item in status_payload.get("logs") or []
+    ]
+
+
+def _compact_status_checks(status_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": check.get("id"),
+            "type": check.get("type"),
+            "ok": check.get("ok"),
+        }
+        for check in status_payload.get("checks") or []
+    ]
+
+
+def _compact_status_ingress(status_payload: dict[str, Any]) -> dict[str, Any]:
+    ingress = status_payload.get("ingress") or {}
+    return {
+        "route_file_present": bool(ingress.get("route_file_present")),
+        "nginx_config_present": bool(ingress.get("nginx_config_present")),
+        "route_count": len(ingress.get("routes") or []),
+    }
+
+
+def _compact_status_parity_ledger(status_payload: dict[str, Any]) -> dict[str, Any]:
+    parity_ledger = status_payload.get("parity_ledger") or {}
+    return {
+        "covered_count": len(parity_ledger.get("covered_surfaces") or []),
+        "deferred_surfaces": parity_ledger.get("deferred_surfaces") or [],
+    }
+
+
 def compact_runtime_status(status_payload: dict[str, Any]) -> dict[str, Any]:
     """Return the agent-facing status summary without heavyweight raw config."""
-    compact_skills: list[dict[str, Any]] = []
-    for skillset in status_payload.get("skills") or []:
-        total_targets = 0
-        healthy_targets = 0
-        for skill_entry in skillset.get("skills") or []:
-            for target in skill_entry.get("targets") or []:
-                total_targets += 1
-                if target.get("state") == "ok":
-                    healthy_targets += 1
-        compact_skills.append(
-            {
-                "id": skillset.get("id"),
-                "kind": skillset.get("kind"),
-                "lock_present": bool(skillset.get("lock_present")),
-                "lock_error": skillset.get("lock_error"),
-                "skill_count": len(skillset.get("skills") or []),
-                "healthy_targets": healthy_targets,
-                "total_targets": total_targets,
-            }
-        )
-
-    parity_ledger = status_payload.get("parity_ledger") or {}
-    ingress = status_payload.get("ingress") or {}
-
     return {
-        "client_ids": [
-            str(client.get("id"))
-            for client in status_payload.get("clients") or []
-            if client.get("id")
-        ],
+        "client_ids": _compact_client_ids(status_payload),
         "active_clients": status_payload.get("active_clients") or [],
         "default_client": status_payload.get("default_client"),
         "active_profiles": status_payload.get("active_profiles") or [],
         "distributors": status_payload.get("distributors") or [],
-        "storage": {
-            "provider": (status_payload.get("storage") or {}).get("provider"),
-            "state_root": (status_payload.get("storage") or {}).get("state_root"),
-            "required": bool((status_payload.get("storage") or {}).get("required")),
-        },
-        "repos": [
-            {
-                "id": repo.get("id"),
-                "present": bool(repo.get("present")),
-                "branch": repo.get("branch"),
-                "dirty": repo.get("dirty"),
-                "untracked": repo.get("untracked"),
-            }
-            for repo in status_payload.get("repos") or []
-        ],
-        "artifacts": [
-            {
-                "id": artifact.get("id"),
-                "state": artifact.get("state"),
-                "source_kind": artifact.get("source_kind"),
-                "required": bool(artifact.get("required")),
-            }
-            for artifact in status_payload.get("artifacts") or []
-        ],
-        "env_files": [
-            {
-                "id": env_file.get("id"),
-                "state": env_file.get("state"),
-                "source_kind": env_file.get("source_kind"),
-                "required": bool(env_file.get("required")),
-            }
-            for env_file in status_payload.get("env_files") or []
-        ],
-        "skills": compact_skills,
-        "tasks": [
-            {
-                "id": task.get("id"),
-                "state": task.get("state"),
-                "depends_on": task.get("depends_on") or [],
-            }
-            for task in status_payload.get("tasks") or []
-        ],
-        "services": [
-            {
-                "id": service.get("id"),
-                "state": service.get("state"),
-                "pid": service.get("pid"),
-                "managed": service.get("managed"),
-                "manager_reason": service.get("manager_reason"),
-                "ownership_state": service.get("ownership_state"),
-                "depends_on": service.get("depends_on") or [],
-                "bootstrap_tasks": service.get("bootstrap_tasks") or [],
-            }
-            for service in status_payload.get("services") or []
-        ],
+        "storage": _compact_status_storage(status_payload),
+        "repos": _compact_status_repos(status_payload),
+        "artifacts": _compact_status_artifacts(status_payload),
+        "env_files": _compact_status_env_files(status_payload),
+        "skills": _compact_status_skills(status_payload),
+        "tasks": _compact_status_tasks(status_payload),
+        "services": _compact_status_services(status_payload),
         "blocked_services": status_payload.get("blocked_services") or [],
-        "logs": [
-            {
-                "id": log_item.get("id"),
-                "present": bool(log_item.get("present")),
-                "files": log_item.get("files"),
-                "bytes": log_item.get("bytes"),
-            }
-            for log_item in status_payload.get("logs") or []
-        ],
-        "checks": [
-            {
-                "id": check.get("id"),
-                "type": check.get("type"),
-                "ok": check.get("ok"),
-            }
-            for check in status_payload.get("checks") or []
-        ],
-        "ingress": {
-            "route_file_present": bool(ingress.get("route_file_present")),
-            "nginx_config_present": bool(ingress.get("nginx_config_present")),
-            "route_count": len(ingress.get("routes") or []),
-        },
-        "parity_ledger": {
-            "covered_count": len(parity_ledger.get("covered_surfaces") or []),
-            "deferred_surfaces": parity_ledger.get("deferred_surfaces") or [],
-        },
+        "logs": _compact_status_logs(status_payload),
+        "checks": _compact_status_checks(status_payload),
+        "ingress": _compact_status_ingress(status_payload),
+        "parity_ledger": _compact_status_parity_ledger(status_payload),
         "next_actions": status_payload.get("next_actions") or [],
     }

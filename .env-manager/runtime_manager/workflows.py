@@ -7,6 +7,344 @@ from .context_rendering import *
 from .text_renderers import print_local_runtime_error_text
 from lib.runtime_model import resolve_placeholders
 
+
+def _workflow_step(
+    steps: list[dict[str, Any]],
+    is_json: bool,
+    name: str,
+    status: str,
+    detail: Any = None,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {"step": name, "status": status}
+    if detail is not None:
+        entry["detail"] = detail
+    steps.append(entry)
+    if not is_json:
+        marker = "ok" if status == "ok" else ("skip" if status == "skip" else "FAIL")
+        print(f"[{marker}] {name}")
+    return entry
+
+
+def _emit_onboard_error(
+    *,
+    client_id: str,
+    dry_run: bool,
+    steps: list[dict[str, Any]],
+    exc: RuntimeError,
+    is_json: bool,
+) -> int:
+    payload: dict[str, Any] = {
+        "client_id": client_id,
+        "dry_run": dry_run,
+        "steps": steps,
+    }
+    payload.update(classify_error(exc, "onboard"))
+    if is_json:
+        emit_json(payload)
+    return EXIT_ERROR
+
+
+def _onboard_scaffold_detail(
+    *,
+    root_dir: Path,
+    client_id: str,
+    label: str | None,
+    default_cwd: str | None,
+    root_path: str | None,
+    blueprint_name: str | None,
+    set_args: list[str],
+    dry_run: bool,
+    force: bool,
+) -> tuple[str, dict[str, Any]]:
+    cid = validate_client_id(client_id)
+    assignments = parse_key_value_assignments(set_args, "--set")
+    scaffold_actions, blueprint_metadata = scaffold_client_overlay(
+        root_dir=root_dir,
+        client_id=cid,
+        label=label,
+        default_cwd=default_cwd,
+        root_path=root_path,
+        blueprint_name=blueprint_name,
+        blueprint_assignments=assignments,
+        dry_run=dry_run,
+        force=force,
+    )
+    detail: dict[str, Any] = {"actions": scaffold_actions}
+    if blueprint_metadata is not None:
+        detail["blueprint"] = blueprint_metadata
+    return cid, detail
+
+
+def _emit_onboard_dry_run(
+    *,
+    cid: str,
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> int:
+    for skip_name in ("sync", "bootstrap", "up", "context", "verify"):
+        _workflow_step(steps, is_json, skip_name, "skip", {"reason": "dry-run"})
+    payload = {
+        "client_id": cid,
+        "dry_run": True,
+        "steps": steps,
+        "next_actions": [f"onboard {cid} --format json"],
+    }
+    if is_json:
+        emit_json(payload)
+    return EXIT_OK
+
+
+def _onboard_filtered_model(root_dir: Path, cid: str) -> dict[str, Any]:
+    model = build_runtime_model(root_dir)
+    active_profiles = normalize_active_profiles([])
+    active_clients = normalize_active_clients(model, [cid])
+    return filter_model(model, active_profiles, active_clients)
+
+
+def _onboard_bootstrap_detail(model: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    requested_tasks = select_tasks(model, [])
+    tasks = resolve_tasks_for_run(model, requested_tasks)
+    if not tasks:
+        return "skip", {"reason": "no tasks declared"}
+    ensure_required_env_files_ready(select_env_files_for_tasks(model, tasks))
+    task_results = run_tasks(model, tasks, dry_run=False)
+    return "ok", {"tasks": task_results}
+
+
+def _onboard_up_detail(model: dict[str, Any], wait_seconds: float) -> tuple[str, dict[str, Any]]:
+    requested_services = select_services(model, [])
+    services = resolve_services_for_start(model, requested_services)
+    if not services:
+        return "skip", {"reason": "no services declared"}
+    ensure_required_env_files_ready(select_env_files_for_services(model, services))
+    service_results = start_services(
+        model,
+        services,
+        dry_run=False,
+        wait_seconds=wait_seconds,
+    )
+    return "ok", {"services": service_results}
+
+
+def _onboard_verify_detail(
+    model: dict[str, Any],
+    root_dir: Path,
+) -> tuple[str, dict[str, Any], bool]:
+    doctor = doctor_results(model, root_dir)
+    has_fail = any(result.status == "fail" for result in doctor)
+    has_warn = any(result.status == "warn" for result in doctor)
+    status = "fail" if has_fail else ("warn" if has_warn else "ok")
+    return status, {"checks": [asdict(result) for result in doctor]}, has_fail
+
+
+def _onboard_next_actions(cid: str, has_fail: bool) -> list[str]:
+    if has_fail:
+        return [
+            f"doctor --client {cid} --format json",
+            f"status --client {cid} --format json",
+        ]
+    return [f"status --client {cid} --format json"]
+
+
+def _first_box_step(
+    steps: list[dict[str, Any]],
+    is_json: bool,
+    name: str,
+    status: str,
+    detail: Any = None,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {"step": name, "status": status}
+    if detail is not None:
+        entry["detail"] = detail
+    steps.append(entry)
+    if not is_json:
+        marker = "ok" if status == "ok" else ("skip" if status == "skip" else ("warn" if status == "warn" else "FAIL"))
+        print(f"[{marker}] {name}")
+    return entry
+
+
+def _emit_first_box_payload(payload: dict[str, Any], steps: list[dict[str, Any]], is_json: bool) -> int:
+    if is_json:
+        emit_json(payload)
+    else:
+        print(f"client: {payload['client_id']}")
+        print(f"private_repo: {payload['private_repo']['target_dir']}")
+        print(f"output_dir: {payload.get('output_dir', '')}")
+        print(f"profiles: {', '.join(payload.get('active_profiles') or ['core'])}")
+        print(f"created_client: {payload.get('created_client', False)}")
+        if payload.get("mcp_servers"):
+            print(f"mcp_servers: {', '.join(payload['mcp_servers'])}")
+        print()
+        for item in steps:
+            print(f"{item['step']}: {item['status']}")
+    return payload.get("exit_code", EXIT_OK)
+
+
+def _first_box_failure_payload(
+    *,
+    client_id: str,
+    private_repo: dict[str, Any],
+    created_client: bool,
+    steps: list[dict[str, Any]],
+    profiles: list[str],
+    nested_payload: dict[str, Any] | None = None,
+    command: str,
+    default_message: str,
+    exit_code: int = EXIT_ERROR,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "client_id": client_id,
+        "private_repo": private_repo,
+        "created_client": created_client,
+        "steps": steps,
+        "exit_code": exit_code,
+    }
+    nested_error = (nested_payload or {}).get("error")
+    if isinstance(nested_error, dict):
+        payload["error"] = nested_error
+    else:
+        payload.update(classify_error(RuntimeError(default_message), command))
+    if nested_payload and isinstance(nested_payload.get("next_actions"), list):
+        payload["next_actions"] = nested_payload["next_actions"]
+    elif "next_actions" not in payload:
+        payload["next_actions"] = next_actions_for_first_box(client_id, profiles)
+    return payload
+
+
+def _first_box_private_repo_payload(private_init_payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "target_dir": private_init_payload["target_dir"],
+        "clients_host_root": private_init_payload["clients_host_root"],
+    }
+
+
+def _first_box_onboard_args(
+    *,
+    cid: str,
+    label: str | None,
+    default_cwd: str | None,
+    root_path: str | None,
+    blueprint_name: str | None,
+    set_args: list[str],
+    force: bool,
+    wait_seconds: float,
+) -> list[str]:
+    onboard_args = ["onboard", cid, "--wait-seconds", str(wait_seconds), "--format", "json"]
+    for flag, value in (
+        ("--label", label),
+        ("--default-cwd", default_cwd),
+        ("--root-path", root_path),
+        ("--blueprint", blueprint_name),
+    ):
+        if value is not None:
+            onboard_args.extend([flag, value])
+    for assignment in set_args:
+        onboard_args.extend(["--set", assignment])
+    if force:
+        onboard_args.append("--force")
+    return onboard_args
+
+
+def _first_box_ignored_scaffold_inputs(
+    label: str | None,
+    default_cwd: str | None,
+    root_path: str | None,
+    blueprint_name: str | None,
+    set_args: list[str],
+) -> list[str]:
+    ignored: list[str] = []
+    for name, value in (
+        ("label", label),
+        ("default_cwd", default_cwd),
+        ("root_path", root_path),
+        ("blueprint", blueprint_name),
+    ):
+        if value is not None:
+            ignored.append(name)
+    if set_args:
+        ignored.append("set")
+    return ignored
+
+
+def _first_box_onboard_skip_detail(
+    cid: str,
+    overlay_runtime_path: Path,
+    ignored_scaffold_inputs: list[str],
+) -> dict[str, Any]:
+    detail: dict[str, Any] = {
+        "reason": f"client overlay already present at {overlay_runtime_path}",
+    }
+    if ignored_scaffold_inputs:
+        detail["ignored_scaffold_inputs"] = ignored_scaffold_inputs
+        detail["next_actions"] = [
+            f"onboard {cid} --force --format json",
+            f"client-init {cid} --force --format json",
+        ]
+    return detail
+
+
+def _first_box_profile_args(profiles: list[str]) -> list[str]:
+    return [arg for profile in profiles for arg in ("--profile", profile)]
+
+
+def _first_box_acceptance_args(cid: str, profile_args: list[str], wait_seconds: float) -> list[str]:
+    return ["acceptance", cid, *profile_args, "--wait-seconds", str(wait_seconds), "--format", "json"]
+
+
+def _first_box_open_args(cid: str, profile_args: list[str], output_dir_arg: str | None) -> list[str]:
+    open_args = ["client-open", cid, *profile_args]
+    if output_dir_arg is not None:
+        open_args.extend(["--output-dir", output_dir_arg])
+    open_args.extend(["--format", "json"])
+    return open_args
+
+
+def _first_box_required_mcp_servers(root_dir: Path, cid: str, active_profiles: list[str]) -> list[str]:
+    model = build_runtime_model(root_dir)
+    filtered_model = filter_model(
+        model,
+        normalize_active_profiles(active_profiles),
+        normalize_active_clients(model, [cid]),
+    )
+    return [str(request["name"]) for request in requested_mcp_servers(filtered_model)]
+
+
+def _first_box_active_profiles(open_payload: dict[str, Any], profiles: list[str]) -> list[str]:
+    return [
+        str(value).strip()
+        for value in (open_payload.get("active_profiles") or profiles or [])
+        if str(value).strip()
+    ]
+
+
+def _first_box_mcp_servers(open_payload: dict[str, Any]) -> list[str]:
+    return [
+        str(value).strip()
+        for value in (open_payload.get("mcp_servers") or [])
+        if str(value).strip()
+    ]
+
+
+def _missing_first_box_mcp_servers(expected: list[str], actual: list[str]) -> list[str]:
+    actual_set = set(actual)
+    return [server_name for server_name in expected if server_name not in actual_set]
+
+
+def _missing_mcp_surface_error(missing_mcp_servers: list[str]) -> dict[str, Any]:
+    return {
+        "type": "missing_mcp_surface",
+        "message": (
+            "opened client surface is missing required inner MCP servers: "
+            + ", ".join(missing_mcp_servers)
+        ),
+        "recoverable": True,
+        "recovery_hint": (
+            "Check the root .mcp.json, confirm the active runtime MCP services are declared, "
+            "then rerun client-open or first-box."
+        ),
+    }
+
+
 def run_onboard(
     *,
     root_dir: Path,
@@ -25,142 +363,94 @@ def run_onboard(
     steps: list[dict[str, Any]] = []
     is_json = fmt == "json"
 
-    def step(name: str, status: str, detail: Any = None) -> dict[str, Any]:
-        entry: dict[str, Any] = {"step": name, "status": status}
-        if detail is not None:
-            entry["detail"] = detail
-        steps.append(entry)
-        if not is_json:
-            marker = "ok" if status == "ok" else ("skip" if status == "skip" else "FAIL")
-            print(f"[{marker}] {name}")
-        return entry
-
     # -- 1. Scaffold -----------------------------------------------------------
     try:
-        cid = validate_client_id(client_id)
-        assignments = parse_key_value_assignments(set_args, "--set")
-        scaffold_actions, blueprint_metadata = scaffold_client_overlay(
+        cid, scaffold_detail = _onboard_scaffold_detail(
             root_dir=root_dir,
-            client_id=cid,
+            client_id=client_id,
             label=label,
             default_cwd=default_cwd,
             root_path=root_path,
             blueprint_name=blueprint_name,
-            blueprint_assignments=assignments,
+            set_args=set_args,
             dry_run=dry_run,
             force=force,
         )
-        scaffold_detail: dict[str, Any] = {"actions": scaffold_actions}
-        if blueprint_metadata is not None:
-            scaffold_detail["blueprint"] = blueprint_metadata
-        step("scaffold", "ok", scaffold_detail)
+        _workflow_step(steps, is_json, "scaffold", "ok", scaffold_detail)
     except RuntimeError as exc:
-        step("scaffold", "fail", {"error": str(exc)})
-        payload: dict[str, Any] = {
-            "client_id": client_id,
-            "dry_run": dry_run,
-            "steps": steps,
-        }
-        payload.update(classify_error(exc, "onboard"))
-        if is_json:
-            emit_json(payload)
-        return EXIT_ERROR
+        _workflow_step(steps, is_json, "scaffold", "fail", {"error": str(exc)})
+        return _emit_onboard_error(
+            client_id=client_id,
+            dry_run=dry_run,
+            steps=steps,
+            exc=exc,
+            is_json=is_json,
+        )
 
     # In dry-run mode, the scaffold didn't write files, so the client won't
     # exist in the runtime model.  Report what *would* happen and stop early.
     if dry_run:
-        for skip_name in ("sync", "bootstrap", "up", "context", "verify"):
-            step(skip_name, "skip", {"reason": "dry-run"})
-        payload = {
-            "client_id": cid,
-            "dry_run": True,
-            "steps": steps,
-            "next_actions": [f"onboard {cid} --format json"],
-        }
-        if is_json:
-            emit_json(payload)
-        return EXIT_OK
+        return _emit_onboard_dry_run(cid=cid, steps=steps, is_json=is_json)
 
     # -- 2. Sync ---------------------------------------------------------------
     try:
-        model = build_runtime_model(root_dir)
-        active_profiles = normalize_active_profiles([])
-        active_clients = normalize_active_clients(model, [cid])
-        model = filter_model(model, active_profiles, active_clients)
+        model = _onboard_filtered_model(root_dir, cid)
         sync_actions = sync_runtime(model, dry_run=False)
-        step("sync", "ok", {"actions": sync_actions})
+        _workflow_step(steps, is_json, "sync", "ok", {"actions": sync_actions})
     except RuntimeError as exc:
-        step("sync", "fail", {"error": str(exc)})
-        payload = {"client_id": cid, "dry_run": False, "steps": steps}
-        payload.update(classify_error(exc, "onboard"))
-        if is_json:
-            emit_json(payload)
-        return EXIT_ERROR
+        _workflow_step(steps, is_json, "sync", "fail", {"error": str(exc)})
+        return _emit_onboard_error(
+            client_id=cid,
+            dry_run=False,
+            steps=steps,
+            exc=exc,
+            is_json=is_json,
+        )
 
     # -- 3. Bootstrap ----------------------------------------------------------
     try:
-        requested_tasks = select_tasks(model, [])
-        tasks = resolve_tasks_for_run(model, requested_tasks)
-        if tasks:
-            ensure_required_env_files_ready(select_env_files_for_tasks(model, tasks))
-            task_results = run_tasks(model, tasks, dry_run=False)
-            step("bootstrap", "ok", {"tasks": task_results})
-        else:
-            step("bootstrap", "skip", {"reason": "no tasks declared"})
+        status, detail = _onboard_bootstrap_detail(model)
+        _workflow_step(steps, is_json, "bootstrap", status, detail)
     except RuntimeError as exc:
-        step("bootstrap", "fail", {"error": str(exc)})
-        payload = {"client_id": cid, "dry_run": False, "steps": steps}
-        payload.update(classify_error(exc, "onboard"))
-        if is_json:
-            emit_json(payload)
-        return EXIT_ERROR
+        _workflow_step(steps, is_json, "bootstrap", "fail", {"error": str(exc)})
+        return _emit_onboard_error(
+            client_id=cid,
+            dry_run=False,
+            steps=steps,
+            exc=exc,
+            is_json=is_json,
+        )
 
     # -- 4. Up -----------------------------------------------------------------
     try:
-        requested_services = select_services(model, [])
-        services = resolve_services_for_start(model, requested_services)
-        if services:
-            ensure_required_env_files_ready(select_env_files_for_services(model, services))
-            service_results = start_services(
-                model, services, dry_run=False, wait_seconds=wait_seconds,
-            )
-            step("up", "ok", {"services": service_results})
-        else:
-            step("up", "skip", {"reason": "no services declared"})
+        status, detail = _onboard_up_detail(model, wait_seconds)
+        _workflow_step(steps, is_json, "up", status, detail)
     except RuntimeError as exc:
-        step("up", "fail", {"error": str(exc)})
-        payload = {"client_id": cid, "dry_run": False, "steps": steps}
-        payload.update(classify_error(exc, "onboard"))
-        if is_json:
-            emit_json(payload)
-        return EXIT_ERROR
+        _workflow_step(steps, is_json, "up", "fail", {"error": str(exc)})
+        return _emit_onboard_error(
+            client_id=cid,
+            dry_run=False,
+            steps=steps,
+            exc=exc,
+            is_json=is_json,
+        )
 
     # -- 5. Context ------------------------------------------------------------
     try:
         context_actions = sync_context(model, root_dir, dry_run=False)
-        step("context", "ok", {"actions": context_actions})
+        _workflow_step(steps, is_json, "context", "ok", {"actions": context_actions})
     except RuntimeError as exc:
-        step("context", "fail", {"error": str(exc)})
+        _workflow_step(steps, is_json, "context", "fail", {"error": str(exc)})
 
     # -- 6. Doctor (verify) ----------------------------------------------------
-    doctor = doctor_results(model, root_dir)
-    has_fail = any(r.status == "fail" for r in doctor)
-    has_warn = any(r.status == "warn" for r in doctor)
-    step(
-        "verify",
-        "fail" if has_fail else ("warn" if has_warn else "ok"),
-        {"checks": [asdict(r) for r in doctor]},
-    )
+    verify_status, verify_detail, has_fail = _onboard_verify_detail(model, root_dir)
+    _workflow_step(steps, is_json, "verify", verify_status, verify_detail)
 
     payload = {
         "client_id": cid,
         "dry_run": False,
         "steps": steps,
-        "next_actions": (
-            [f"doctor --client {cid} --format json", f"status --client {cid} --format json"]
-            if has_fail
-            else [f"status --client {cid} --format json"]
-        ),
+        "next_actions": _onboard_next_actions(cid, has_fail),
     }
     log_runtime_event("onboard.completed", cid, {
         "steps_ok": sum(1 for s in steps if s.get("status") == "ok"),
@@ -168,6 +458,268 @@ def run_onboard(
     if is_json:
         emit_json(payload)
     return EXIT_DRIFT if has_fail else EXIT_OK
+
+
+def _first_box_client_error(
+    client_id: str,
+    steps: list[dict[str, Any]],
+    is_json: bool,
+    exc: RuntimeError,
+) -> int:
+    payload: dict[str, Any] = {"client_id": client_id, "steps": steps, "exit_code": EXIT_ERROR}
+    payload.update(classify_error(exc, "first-box"))
+    return _emit_first_box_payload(payload, steps, is_json)
+
+
+def _first_box_private_init_step(
+    root_dir: Path,
+    private_path_arg: str | None,
+    cid: str,
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> tuple[dict[str, Any] | None, int | None]:
+    try:
+        private_init_payload = init_private_repo(root_dir, target_dir_arg=private_path_arg)
+    except RuntimeError as exc:
+        _first_box_step(steps, is_json, "private-init", "fail", {"error": str(exc)})
+        payload = {"client_id": cid, "steps": steps, "exit_code": EXIT_ERROR}
+        payload.update(classify_error(exc, "first-box"))
+        return None, _emit_first_box_payload(payload, steps, is_json)
+
+    private_repo = _first_box_private_repo_payload(private_init_payload)
+    _first_box_step(
+        steps,
+        is_json,
+        "private-init",
+        "ok",
+        {
+            "target_dir": private_init_payload["target_dir"],
+            "clients_host_root": private_init_payload["clients_host_root"],
+            "actions": private_init_payload.get("actions") or [],
+        },
+    )
+    return private_repo, None
+
+
+def _first_box_scaffold_inputs_present(
+    label: str | None,
+    default_cwd: str | None,
+    root_path: str | None,
+    blueprint_name: str | None,
+    set_args: list[str],
+    force: bool,
+) -> bool:
+    return any(
+        value is not None and value != []
+        for value in (label, default_cwd, root_path, blueprint_name, set_args)
+    ) or force
+
+
+def _first_box_onboard_failure(
+    *,
+    cid: str,
+    private_repo: dict[str, Any],
+    created_client: bool,
+    steps: list[dict[str, Any]],
+    profiles: list[str],
+    onboard_payload: dict[str, Any],
+    is_json: bool,
+) -> int:
+    _first_box_step(steps, is_json, "onboard", "fail", onboard_payload)
+    _first_box_step(steps, is_json, "acceptance", "skip", {"reason": "onboard failed"})
+    _first_box_step(steps, is_json, "open", "skip", {"reason": "onboard failed"})
+    payload = _first_box_failure_payload(
+        client_id=cid,
+        private_repo=private_repo,
+        created_client=created_client,
+        steps=steps,
+        profiles=profiles,
+        nested_payload=onboard_payload,
+        command="first-box",
+        default_message=f"first-box onboard failed for {cid}",
+    )
+    return _emit_first_box_payload(payload, steps, is_json)
+
+
+def _first_box_onboard_step(
+    *,
+    root_dir: Path,
+    cid: str,
+    private_repo: dict[str, Any],
+    created_client: bool,
+    onboard_needed: bool,
+    overlay_runtime_path: Path,
+    profiles: list[str],
+    label: str | None,
+    default_cwd: str | None,
+    root_path: str | None,
+    blueprint_name: str | None,
+    set_args: list[str],
+    force: bool,
+    wait_seconds: float,
+    scaffold_inputs_present: bool,
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> int | None:
+    if not onboard_needed:
+        ignored_scaffold_inputs = (
+            _first_box_ignored_scaffold_inputs(label, default_cwd, root_path, blueprint_name, set_args)
+            if scaffold_inputs_present
+            else []
+        )
+        _first_box_step(
+            steps,
+            is_json,
+            "onboard",
+            "skip",
+            _first_box_onboard_skip_detail(cid, overlay_runtime_path, ignored_scaffold_inputs),
+        )
+        return None
+
+    onboard_args = _first_box_onboard_args(
+        cid=cid,
+        label=label,
+        default_cwd=default_cwd,
+        root_path=root_path,
+        blueprint_name=blueprint_name,
+        set_args=set_args,
+        force=force,
+        wait_seconds=wait_seconds,
+    )
+    onboard_code, onboard_payload = run_manage_json_command(root_dir, onboard_args)
+    if onboard_code == EXIT_ERROR:
+        return _first_box_onboard_failure(
+            cid=cid,
+            private_repo=private_repo,
+            created_client=created_client,
+            steps=steps,
+            profiles=profiles,
+            onboard_payload=onboard_payload,
+            is_json=is_json,
+        )
+
+    onboard_status = "warn" if onboard_code == EXIT_DRIFT else "ok"
+    _first_box_step(steps, is_json, "onboard", onboard_status, onboard_payload)
+    return None
+
+
+def _first_box_acceptance_step(
+    *,
+    root_dir: Path,
+    cid: str,
+    private_repo: dict[str, Any],
+    created_client: bool,
+    profiles: list[str],
+    profile_args: list[str],
+    wait_seconds: float,
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> tuple[dict[str, Any] | None, int | None]:
+    acceptance_code, acceptance_payload = run_manage_json_command(
+        root_dir,
+        _first_box_acceptance_args(cid, profile_args, wait_seconds),
+    )
+    if acceptance_code == EXIT_OK and acceptance_payload.get("ready"):
+        _first_box_step(steps, is_json, "acceptance", "ok", acceptance_payload)
+        return acceptance_payload, None
+
+    _first_box_step(steps, is_json, "acceptance", "fail", acceptance_payload)
+    _first_box_step(steps, is_json, "open", "skip", {"reason": "acceptance failed"})
+    payload = _first_box_failure_payload(
+        client_id=cid,
+        private_repo=private_repo,
+        created_client=created_client,
+        steps=steps,
+        profiles=profiles,
+        nested_payload=acceptance_payload,
+        command="first-box",
+        default_message=f"first-box acceptance failed for {cid}",
+    )
+    return None, _emit_first_box_payload(payload, steps, is_json)
+
+
+def _first_box_open_failure(
+    *,
+    cid: str,
+    private_repo: dict[str, Any],
+    created_client: bool,
+    steps: list[dict[str, Any]],
+    profiles: list[str],
+    nested_payload: dict[str, Any],
+    default_message: str,
+    is_json: bool,
+) -> int:
+    payload = _first_box_failure_payload(
+        client_id=cid,
+        private_repo=private_repo,
+        created_client=created_client,
+        steps=steps,
+        profiles=profiles,
+        nested_payload=nested_payload,
+        command="first-box",
+        default_message=default_message,
+    )
+    return _emit_first_box_payload(payload, steps, is_json)
+
+
+def _first_box_open_step(
+    *,
+    root_dir: Path,
+    cid: str,
+    private_repo: dict[str, Any],
+    created_client: bool,
+    profiles: list[str],
+    profile_args: list[str],
+    output_dir_arg: str | None,
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> tuple[dict[str, Any] | None, int | None, int | None]:
+    open_args = _first_box_open_args(cid, profile_args, output_dir_arg)
+    open_code, open_payload = run_manage_json_command(root_dir, open_args)
+    if open_code not in (EXIT_OK, EXIT_DRIFT):
+        _first_box_step(steps, is_json, "open", "fail", open_payload)
+        return None, None, _first_box_open_failure(
+            cid=cid,
+            private_repo=private_repo,
+            created_client=created_client,
+            steps=steps,
+            profiles=profiles,
+            nested_payload=open_payload,
+            default_message=f"first-box client-open failed for {cid}",
+            is_json=is_json,
+        )
+
+    open_active_profiles = _first_box_active_profiles(open_payload, profiles)
+    expected_mcp_servers = _first_box_required_mcp_servers(root_dir, cid, open_active_profiles)
+    actual_mcp_servers = _first_box_mcp_servers(open_payload)
+    missing_mcp_servers = _missing_first_box_mcp_servers(expected_mcp_servers, actual_mcp_servers)
+    if missing_mcp_servers:
+        control_plane_error = _missing_mcp_surface_error(missing_mcp_servers)
+        _first_box_step(
+            steps,
+            is_json,
+            "open",
+            "fail",
+            dict(open_payload) | {
+                "expected_mcp_servers": expected_mcp_servers,
+                "actual_mcp_servers": actual_mcp_servers,
+                "missing_mcp_servers": missing_mcp_servers,
+                "error": control_plane_error,
+            },
+        )
+        return None, None, _first_box_open_failure(
+            cid=cid,
+            private_repo=private_repo,
+            created_client=created_client,
+            steps=steps,
+            profiles=profiles,
+            nested_payload={"error": control_plane_error},
+            default_message=f"first-box open surface missing required MCP servers for {cid}",
+            is_json=is_json,
+        )
+
+    _first_box_step(steps, is_json, "open", "warn" if open_code == EXIT_DRIFT else "ok", open_payload)
+    return open_payload, open_code, None
 
 
 def run_first_box(
@@ -190,262 +742,80 @@ def run_first_box(
     steps: list[dict[str, Any]] = []
     is_json = fmt == "json"
 
-    def step(name: str, status: str, detail: Any = None) -> dict[str, Any]:
-        entry: dict[str, Any] = {"step": name, "status": status}
-        if detail is not None:
-            entry["detail"] = detail
-        steps.append(entry)
-        if not is_json:
-            marker = "ok" if status == "ok" else ("skip" if status == "skip" else ("warn" if status == "warn" else "FAIL"))
-            print(f"[{marker}] {name}")
-        return entry
-
-    def emit_first_box(payload: dict[str, Any]) -> int:
-        if is_json:
-            emit_json(payload)
-        else:
-            print(f"client: {payload['client_id']}")
-            print(f"private_repo: {payload['private_repo']['target_dir']}")
-            print(f"output_dir: {payload.get('output_dir', '')}")
-            print(f"profiles: {', '.join(payload.get('active_profiles') or ['core'])}")
-            print(f"created_client: {payload.get('created_client', False)}")
-            if payload.get("mcp_servers"):
-                print(f"mcp_servers: {', '.join(payload['mcp_servers'])}")
-            print()
-            for item in steps:
-                marker = item["status"]
-                print(f"{item['step']}: {marker}")
-        return payload.get("exit_code", EXIT_OK)
-
-    def failure_payload(
-        *,
-        client_id: str,
-        private_repo: dict[str, Any],
-        created_client: bool,
-        nested_payload: dict[str, Any] | None = None,
-        command: str,
-        default_message: str,
-        exit_code: int = EXIT_ERROR,
-    ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "client_id": client_id,
-            "private_repo": private_repo,
-            "created_client": created_client,
-            "steps": steps,
-            "exit_code": exit_code,
-        }
-        nested_error = (nested_payload or {}).get("error")
-        if isinstance(nested_error, dict):
-            payload["error"] = nested_error
-        else:
-            payload.update(classify_error(RuntimeError(default_message), command))
-        if nested_payload and isinstance(nested_payload.get("next_actions"), list):
-            payload["next_actions"] = nested_payload["next_actions"]
-        elif "next_actions" not in payload:
-            payload["next_actions"] = next_actions_for_first_box(client_id, profiles)
-        return payload
-
-    def required_open_surface_mcp_servers(active_profiles: list[str]) -> list[str]:
-        model = build_runtime_model(root_dir)
-        filtered_model = filter_model(
-            model,
-            normalize_active_profiles(active_profiles),
-            normalize_active_clients(model, [cid]),
-        )
-        return [str(request["name"]) for request in requested_mcp_servers(filtered_model)]
-
     try:
         cid = validate_client_id(client_id)
     except RuntimeError as exc:
-        payload: dict[str, Any] = {"client_id": client_id, "steps": steps, "exit_code": EXIT_ERROR}
-        payload.update(classify_error(exc, "first-box"))
-        return emit_first_box(payload)
+        return _first_box_client_error(client_id, steps, is_json, exc)
 
-    try:
-        private_init_payload = init_private_repo(root_dir, target_dir_arg=private_path_arg)
-        private_repo = {
-            "target_dir": private_init_payload["target_dir"],
-            "clients_host_root": private_init_payload["clients_host_root"],
-        }
-        step(
-            "private-init",
-            "ok",
-            {
-                "target_dir": private_init_payload["target_dir"],
-                "clients_host_root": private_init_payload["clients_host_root"],
-                "actions": private_init_payload.get("actions") or [],
-            },
-        )
-    except RuntimeError as exc:
-        step("private-init", "fail", {"error": str(exc)})
-        payload = {
-            "client_id": cid,
-            "steps": steps,
-            "exit_code": EXIT_ERROR,
-        }
-        payload.update(classify_error(exc, "first-box"))
-        return emit_first_box(payload)
+    private_repo, exit_code = _first_box_private_init_step(
+        root_dir, private_path_arg, cid, steps, is_json,
+    )
+    if exit_code is not None or private_repo is None:
+        return exit_code if exit_code is not None else EXIT_ERROR
 
     _, overlay_path, overlay_runtime_path = client_overlay_location(root_dir, cid)
     overlay_exists = overlay_path.is_file()
     created_client = not overlay_exists
-    scaffold_inputs_present = any(
-        value is not None and value != []
-        for value in (label, default_cwd, root_path, blueprint_name, set_args)
-    ) or force
+    scaffold_inputs_present = _first_box_scaffold_inputs_present(
+        label, default_cwd, root_path, blueprint_name, set_args, force,
+    )
     # Box lifecycle callers pass scaffold defaults defensively.  When the
     # private repo already owns an overlay, first-box must not reinterpret those
     # defaults as permission to overwrite it; use onboard/client-init --force
     # for an intentional replacement.
     onboard_needed = created_client or force
 
-    if onboard_needed:
-        onboard_args = ["onboard", cid, "--wait-seconds", str(wait_seconds), "--format", "json"]
-        if label is not None:
-            onboard_args.extend(["--label", label])
-        if default_cwd is not None:
-            onboard_args.extend(["--default-cwd", default_cwd])
-        if root_path is not None:
-            onboard_args.extend(["--root-path", root_path])
-        if blueprint_name is not None:
-            onboard_args.extend(["--blueprint", blueprint_name])
-        for assignment in set_args:
-            onboard_args.extend(["--set", assignment])
-        if force:
-            onboard_args.append("--force")
-
-        onboard_code, onboard_payload = run_manage_json_command(root_dir, onboard_args)
-        if onboard_code == EXIT_ERROR:
-            step("onboard", "fail", onboard_payload)
-            step("acceptance", "skip", {"reason": "onboard failed"})
-            step("open", "skip", {"reason": "onboard failed"})
-            payload = failure_payload(
-                client_id=cid,
-                private_repo=private_repo,
-                created_client=created_client,
-                nested_payload=onboard_payload,
-                command="first-box",
-                default_message=f"first-box onboard failed for {cid}",
-            )
-            return emit_first_box(payload)
-
-        onboard_status = "warn" if onboard_code == EXIT_DRIFT else "ok"
-        step("onboard", onboard_status, onboard_payload)
-    else:
-        ignored_scaffold_inputs: list[str] = []
-        if scaffold_inputs_present:
-            if label is not None:
-                ignored_scaffold_inputs.append("label")
-            if default_cwd is not None:
-                ignored_scaffold_inputs.append("default_cwd")
-            if root_path is not None:
-                ignored_scaffold_inputs.append("root_path")
-            if blueprint_name is not None:
-                ignored_scaffold_inputs.append("blueprint")
-            if set_args:
-                ignored_scaffold_inputs.append("set")
-        skip_detail: dict[str, Any] = {
-            "reason": f"client overlay already present at {overlay_runtime_path}",
-        }
-        if ignored_scaffold_inputs:
-            skip_detail["ignored_scaffold_inputs"] = ignored_scaffold_inputs
-            skip_detail["next_actions"] = [
-                f"onboard {cid} --force --format json",
-                f"client-init {cid} --force --format json",
-            ]
-        step(
-            "onboard",
-            "skip",
-            skip_detail,
-        )
-
-    profile_args = [arg for profile in profiles for arg in ("--profile", profile)]
-    acceptance_code, acceptance_payload = run_manage_json_command(
-        root_dir,
-        ["acceptance", cid, *profile_args, "--wait-seconds", str(wait_seconds), "--format", "json"],
+    exit_code = _first_box_onboard_step(
+        root_dir=root_dir,
+        cid=cid,
+        private_repo=private_repo,
+        created_client=created_client,
+        onboard_needed=onboard_needed,
+        overlay_runtime_path=overlay_runtime_path,
+        profiles=profiles,
+        label=label,
+        default_cwd=default_cwd,
+        root_path=root_path,
+        blueprint_name=blueprint_name,
+        set_args=set_args,
+        force=force,
+        wait_seconds=wait_seconds,
+        scaffold_inputs_present=scaffold_inputs_present,
+        steps=steps,
+        is_json=is_json,
     )
-    if acceptance_code != EXIT_OK or not acceptance_payload.get("ready"):
-        step("acceptance", "fail", acceptance_payload)
-        step("open", "skip", {"reason": "acceptance failed"})
-        payload = failure_payload(
-            client_id=cid,
-            private_repo=private_repo,
-            created_client=created_client,
-            nested_payload=acceptance_payload,
-            command="first-box",
-            default_message=f"first-box acceptance failed for {cid}",
-        )
-        return emit_first_box(payload)
+    if exit_code is not None:
+        return exit_code
 
-    step("acceptance", "ok", acceptance_payload)
+    profile_args = _first_box_profile_args(profiles)
+    acceptance_payload, exit_code = _first_box_acceptance_step(
+        root_dir=root_dir,
+        cid=cid,
+        private_repo=private_repo,
+        created_client=created_client,
+        profiles=profiles,
+        profile_args=profile_args,
+        wait_seconds=wait_seconds,
+        steps=steps,
+        is_json=is_json,
+    )
+    if exit_code is not None or acceptance_payload is None:
+        return exit_code if exit_code is not None else EXIT_ERROR
 
-    open_args = ["client-open", cid, *profile_args]
-    if output_dir_arg is not None:
-        open_args.extend(["--output-dir", output_dir_arg])
-    open_args.extend(["--format", "json"])
-    open_code, open_payload = run_manage_json_command(root_dir, open_args)
-    if open_code not in (EXIT_OK, EXIT_DRIFT):
-        step("open", "fail", open_payload)
-        payload = failure_payload(
-            client_id=cid,
-            private_repo=private_repo,
-            created_client=created_client,
-            nested_payload=open_payload,
-            command="first-box",
-            default_message=f"first-box client-open failed for {cid}",
-        )
-        return emit_first_box(payload)
+    open_payload, open_code, exit_code = _first_box_open_step(
+        root_dir=root_dir,
+        cid=cid,
+        private_repo=private_repo,
+        created_client=created_client,
+        profiles=profiles,
+        profile_args=profile_args,
+        output_dir_arg=output_dir_arg,
+        steps=steps,
+        is_json=is_json,
+    )
+    if exit_code is not None or open_payload is None or open_code is None:
+        return exit_code if exit_code is not None else EXIT_ERROR
 
-    open_active_profiles = [
-        str(value).strip()
-        for value in (open_payload.get("active_profiles") or profiles or [])
-        if str(value).strip()
-    ]
-    expected_mcp_servers = required_open_surface_mcp_servers(open_active_profiles)
-    actual_mcp_servers = [
-        str(value).strip()
-        for value in (open_payload.get("mcp_servers") or [])
-        if str(value).strip()
-    ]
-    missing_mcp_servers = [
-        server_name
-        for server_name in expected_mcp_servers
-        if server_name not in set(actual_mcp_servers)
-    ]
-    if missing_mcp_servers:
-        control_plane_error = {
-            "type": "missing_mcp_surface",
-            "message": (
-                "opened client surface is missing required inner MCP servers: "
-                + ", ".join(missing_mcp_servers)
-            ),
-            "recoverable": True,
-            "recovery_hint": (
-                "Check the root .mcp.json, confirm the active runtime MCP services are declared, "
-                "then rerun client-open or first-box."
-            ),
-        }
-        step(
-            "open",
-            "fail",
-            dict(open_payload) | {
-                "expected_mcp_servers": expected_mcp_servers,
-                "actual_mcp_servers": actual_mcp_servers,
-                "missing_mcp_servers": missing_mcp_servers,
-                "error": control_plane_error,
-            },
-        )
-        payload = failure_payload(
-            client_id=cid,
-            private_repo=private_repo,
-            created_client=created_client,
-            nested_payload={"error": control_plane_error},
-            command="first-box",
-            default_message=f"first-box open surface missing required MCP servers for {cid}",
-        )
-        return emit_first_box(payload)
-
-    step("open", "warn" if open_code == EXIT_DRIFT else "ok", open_payload)
     payload = {
         "client_id": cid,
         "private_repo": private_repo,
@@ -457,7 +827,7 @@ def run_first_box(
         "next_actions": next_actions_for_first_box(cid, profiles),
         "exit_code": open_code,
     }
-    return emit_first_box(payload)
+    return _emit_first_box_payload(payload, steps, is_json)
 
 
 COMPOSE_OVERRIDES_DIR_REL = Path("workspace") / ".compose-overrides"
@@ -469,9 +839,15 @@ def generate_client_compose_override(
     client_id: str,
 ) -> Path:
     """Generate a docker-compose.client-{id}.yml with per-repo bind mounts."""
-    env_values = model.get("env") or {}
+    mounts = _client_compose_pruned_mounts(root_dir, model)
+    lines = _client_compose_override_lines(client_id, mounts)
+    out_path = _client_compose_override_path(root_dir, client_id)
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out_path
 
-    # Collect bind mounts from all repos in the filtered model.
+
+def _client_compose_repo_mounts(model: dict[str, Any]) -> dict[str, str]:
+    env_values = model.get("env") or {}
     mounts: dict[str, str] = {}  # runtime_path -> host_path
     for repo in model.get("repos", []):
         host_path = repo.get("host_path")
@@ -482,8 +858,11 @@ def generate_client_compose_override(
         if runtime_path.startswith(env_values.get("SKILLBOX_WORKSPACE_ROOT", "/workspace")):
             continue
         mounts[runtime_path] = host_path
+    return mounts
 
-    # Always include the swimmers repo so the binary install path works.
+
+def _add_swimmers_compose_mount(root_dir: Path, model: dict[str, Any], mounts: dict[str, str]) -> None:
+    env_values = model.get("env") or {}
     swimmers_repo = env_values.get("SKILLBOX_SWIMMERS_REPO", "")
     if swimmers_repo and swimmers_repo not in mounts:
         from lib.runtime_model import runtime_path_to_host_path as _rp2hp
@@ -491,18 +870,25 @@ def generate_client_compose_override(
         if Path(swimmers_host).exists():
             mounts[swimmers_repo] = swimmers_host
 
-    # Remove child paths when a parent is already mounted (avoids redundant mounts).
+
+def _prune_child_compose_mounts(mounts: dict[str, str]) -> dict[str, str]:
     sorted_paths = sorted(mounts.keys())
     pruned: dict[str, str] = {}
     for rpath in sorted_paths:
         if any(rpath != parent and rpath.startswith(parent + "/") for parent in pruned):
             continue
         pruned[rpath] = mounts[rpath]
+    return pruned
 
-    # Build volume entries.
-    volume_entries = [f"{host}:{container}" for container, host in sorted(pruned.items())]
 
-    # Build compose override document.
+def _client_compose_pruned_mounts(root_dir: Path, model: dict[str, Any]) -> dict[str, str]:
+    mounts = _client_compose_repo_mounts(model)
+    _add_swimmers_compose_mount(root_dir, model, mounts)
+    return _prune_child_compose_mounts(mounts)
+
+
+def _client_compose_override_lines(client_id: str, mounts: dict[str, str]) -> list[str]:
+    volume_entries = [f"{host}:{container}" for container, host in sorted(mounts.items())]
     lines = [f"# Auto-generated by skillbox for client '{client_id}'. Do not edit."]
     lines.append("services:")
     for svc in ("workspace", "api", "web"):
@@ -510,12 +896,13 @@ def generate_client_compose_override(
         lines.append("    volumes:")
         for entry in volume_entries:
             lines.append(f"      - {entry}")
+    return lines
 
+
+def _client_compose_override_path(root_dir: Path, client_id: str) -> Path:
     out_dir = root_dir / COMPOSE_OVERRIDES_DIR_REL
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"docker-compose.client-{client_id}.yml"
-    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return out_path
+    return out_dir / f"docker-compose.client-{client_id}.yml"
 
 
 MANAGE_JSON_COMMAND_TIMEOUT_SECONDS = 300.0
@@ -734,47 +1121,66 @@ def read_mcp_response(
 
     try:
         while time.monotonic() < deadline:
-            timeout = max(0.0, deadline - time.monotonic())
-            events = selector.select(min(0.2, timeout))
-            if not events:
-                if proc.poll() is not None:
-                    break
-                continue
-
-            line = proc.stdout.readline()
-            if not line:
-                if proc.poll() is not None:
-                    break
-                continue
-
-            text = line.strip()
+            text, should_break = _read_mcp_stdout_text(proc, selector, deadline)
+            if should_break:
+                break
             if not text:
                 continue
-            try:
-                message = json.loads(text)
-            except json.JSONDecodeError:
-                stray_lines.append(text)
-                continue
 
+            message = _decode_mcp_stdout_message(text, stray_lines)
+            if message is None:
+                continue
             if message.get("id") != request_id:
                 stray_lines.append(text)
                 continue
-            if "error" in message:
-                error = message["error"]
-                if isinstance(error, dict):
-                    raise RuntimeError(str(error.get("message") or error))
-                raise RuntimeError(str(error))
-
-            result = message.get("result") or {}
-            if not isinstance(result, dict):
-                raise RuntimeError(f"MCP request {request_id} returned a non-object result.")
-            return result, stray_lines
+            return _mcp_result_from_message(message, request_id), stray_lines
     finally:
         selector.close()
 
     if proc.poll() is not None:
         raise RuntimeError(f"MCP process exited with code {proc.returncode} before responding.")
     raise RuntimeError(f"Timed out waiting for MCP response to request {request_id}.")
+
+
+def _read_mcp_stdout_text(
+    proc: subprocess.Popen[str],
+    selector: selectors.BaseSelector,
+    deadline: float,
+) -> tuple[str | None, bool]:
+    timeout = max(0.0, deadline - time.monotonic())
+    events = selector.select(min(0.2, timeout))
+    if not events:
+        return None, proc.poll() is not None
+
+    if proc.stdout is None:
+        raise RuntimeError("MCP process stdout is unavailable.")
+    line = proc.stdout.readline()
+    if not line:
+        return None, proc.poll() is not None
+    text = line.strip()
+    return text or None, False
+
+
+def _decode_mcp_stdout_message(text: str, stray_lines: list[str]) -> dict[str, Any] | None:
+    try:
+        message = json.loads(text)
+    except json.JSONDecodeError:
+        stray_lines.append(text)
+        return None
+    return message if isinstance(message, dict) else None
+
+
+def _mcp_result_from_message(message: dict[str, Any], request_id: int) -> dict[str, Any]:
+    if "error" in message:
+        error = message["error"]
+        if isinstance(error, dict):
+            raise RuntimeError(str(error.get("message") or error))
+        raise RuntimeError(str(error))
+
+    result = message.get("result") or {}
+    if not isinstance(result, dict):
+        raise RuntimeError(f"MCP request {request_id} returned a non-object result.")
+    return result
 
 
 def finalize_mcp_process(proc: subprocess.Popen[str]) -> tuple[list[str], list[str], int | None]:
@@ -798,71 +1204,91 @@ def smoke_mcp_server(root_dir: Path, server_name: str, config: dict[str, Any]) -
         return detail | {"status": "fail", "error": f"MCP server '{server_name}' has no command configured."}
 
     try:
-        proc = subprocess.Popen(
-            [command, *args],
-            cwd=root_dir,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
+        proc = _start_mcp_smoke_process(root_dir, command, args)
     except OSError as exc:
         return detail | {"status": "fail", "error": str(exc)}
 
     stray_stdout: list[str] = []
     try:
-        send_mcp_message(
-            proc,
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": MCP_PROTOCOL_VERSION,
-                    "capabilities": {},
-                    "clientInfo": {"name": "skillbox-acceptance", "version": "1.0.0"},
-                },
-            },
-        )
-        init_result, init_noise = read_mcp_response(proc, 1, timeout_seconds=MCP_SMOKE_TIMEOUT_SECONDS)
-        stray_stdout.extend(init_noise)
-        detail["server_info"] = init_result.get("serverInfo") or {}
-
-        send_mcp_message(
-            proc,
-            {
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
-                "params": {},
-            },
-        )
-        send_mcp_message(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
-        tools_result, tools_noise = read_mcp_response(proc, 2, timeout_seconds=MCP_SMOKE_TIMEOUT_SECONDS)
-        stray_stdout.extend(tools_noise)
-        tools = tools_result.get("tools")
-        if not isinstance(tools, list):
-            raise RuntimeError("tools/list did not return a tools array.")
-        detail["tool_names"] = [
-            str(tool.get("name"))
-            for tool in tools
-            if isinstance(tool, dict) and str(tool.get("name", "")).strip()
-        ]
+        _smoke_mcp_initialize(proc, detail, stray_stdout)
+        _smoke_mcp_list_tools(proc, detail, stray_stdout)
         detail["status"] = "ok"
     except RuntimeError as exc:
         detail["status"] = "fail"
         detail["error"] = str(exc)
     finally:
-        stdout_tail, stderr_tail, exit_code = finalize_mcp_process(proc)
-        merged_stdout = stray_stdout + stdout_tail
-        if merged_stdout:
-            detail["stdout_tail"] = merged_stdout[-10:]
-        if stderr_tail:
-            detail["stderr_tail"] = stderr_tail
-        if exit_code is not None:
-            detail["exit_code"] = exit_code
+        _record_mcp_process_tail(proc, detail, stray_stdout)
 
     return detail
+
+
+def _start_mcp_smoke_process(root_dir: Path, command: str, args: list[str]) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        [command, *args],
+        cwd=root_dir,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+
+
+def _smoke_mcp_initialize(
+    proc: subprocess.Popen[str],
+    detail: dict[str, Any],
+    stray_stdout: list[str],
+) -> None:
+    send_mcp_message(
+        proc,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "skillbox-acceptance", "version": "1.0.0"},
+            },
+        },
+    )
+    init_result, init_noise = read_mcp_response(proc, 1, timeout_seconds=MCP_SMOKE_TIMEOUT_SECONDS)
+    stray_stdout.extend(init_noise)
+    detail["server_info"] = init_result.get("serverInfo") or {}
+
+
+def _smoke_mcp_list_tools(
+    proc: subprocess.Popen[str],
+    detail: dict[str, Any],
+    stray_stdout: list[str],
+) -> None:
+    send_mcp_message(proc, {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+    send_mcp_message(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+    tools_result, tools_noise = read_mcp_response(proc, 2, timeout_seconds=MCP_SMOKE_TIMEOUT_SECONDS)
+    stray_stdout.extend(tools_noise)
+    tools = tools_result.get("tools")
+    if not isinstance(tools, list):
+        raise RuntimeError("tools/list did not return a tools array.")
+    detail["tool_names"] = [
+        str(tool.get("name"))
+        for tool in tools
+        if isinstance(tool, dict) and str(tool.get("name", "")).strip()
+    ]
+
+
+def _record_mcp_process_tail(
+    proc: subprocess.Popen[str],
+    detail: dict[str, Any],
+    stray_stdout: list[str],
+) -> None:
+    stdout_tail, stderr_tail, exit_code = finalize_mcp_process(proc)
+    merged_stdout = stray_stdout + stdout_tail
+    if merged_stdout:
+        detail["stdout_tail"] = merged_stdout[-10:]
+    if stderr_tail:
+        detail["stderr_tail"] = stderr_tail
+    if exit_code is not None:
+        detail["exit_code"] = exit_code
 
 
 def smoke_requested_mcp_servers(
@@ -878,74 +1304,106 @@ def smoke_requested_mcp_servers(
         return False, detail, []
 
     failed_services: list[str] = []
+    services_by_id = _mcp_services_by_id(model)
     for request in requested_mcp_servers(model):
         server_name = str(request["name"])
         service_id = request.get("service_id")
-        raw_config = server_configs.get(server_name)
-        config = (
-            translate_mcp_server_config(root_dir, raw_config)
-            if isinstance(raw_config, dict)
-            else raw_config
-        )
+        config = _translated_mcp_server_config(root_dir, server_configs.get(server_name))
         if not isinstance(config, dict):
-            # Skip non-required MCP servers whose artifact is unavailable
-            if isinstance(service_id, str) and service_id:
-                services_by_id = {str(s.get("id", "")).strip(): s for s in model.get("services") or []}
-                backing = services_by_id.get(service_id)
-                if backing and not backing.get("required", True):
-                    manageable, reason = service_supports_lifecycle(backing, model)
-                    if not manageable:
-                        detail["servers"][server_name] = {
-                            "status": "skip",
-                            "reason": reason or "backing service unavailable",
-                        }
-                        continue
-            detail["servers"][server_name] = {
-                "status": "fail",
-                "error": f"MCP server '{server_name}' is not configured in {MCP_CONFIG_REL}.",
-            }
-            detail["servers_failed"].append(server_name)
-            if isinstance(service_id, str) and service_id:
-                failed_services.append(service_id)
+            _record_missing_mcp_config(
+                detail, failed_services, model, services_by_id, server_name, service_id,
+            )
             continue
 
         server_detail = smoke_mcp_server(root_dir, server_name, config)
-        detail["servers"][server_name] = server_detail
-        if server_detail.get("status") == "ok":
-            detail["servers_ok"].append(server_name)
-        else:
-            detail["servers_failed"].append(server_name)
-            if isinstance(service_id, str) and service_id:
-                failed_services.append(service_id)
+        _record_mcp_smoke_result(detail, failed_services, server_name, service_id, server_detail)
 
     return not detail["servers_failed"], detail, failed_services
+
+
+def _mcp_services_by_id(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {str(service.get("id", "")).strip(): service for service in model.get("services") or []}
+
+
+def _translated_mcp_server_config(root_dir: Path, raw_config: Any) -> Any:
+    if isinstance(raw_config, dict):
+        return translate_mcp_server_config(root_dir, raw_config)
+    return raw_config
+
+
+def _optional_mcp_service_skip_reason(
+    model: dict[str, Any],
+    services_by_id: dict[str, dict[str, Any]],
+    service_id: Any,
+) -> str | None:
+    if not isinstance(service_id, str) or not service_id:
+        return None
+    backing = services_by_id.get(service_id)
+    if not backing or backing.get("required", True):
+        return None
+    manageable, reason = service_supports_lifecycle(backing, model)
+    if manageable:
+        return None
+    return reason or "backing service unavailable"
+
+
+def _record_missing_mcp_config(
+    detail: dict[str, Any],
+    failed_services: list[str],
+    model: dict[str, Any],
+    services_by_id: dict[str, dict[str, Any]],
+    server_name: str,
+    service_id: Any,
+) -> None:
+    skip_reason = _optional_mcp_service_skip_reason(model, services_by_id, service_id)
+    if skip_reason:
+        detail["servers"][server_name] = {"status": "skip", "reason": skip_reason}
+        return
+    detail["servers"][server_name] = {
+        "status": "fail",
+        "error": f"MCP server '{server_name}' is not configured in {MCP_CONFIG_REL}.",
+    }
+    detail["servers_failed"].append(server_name)
+    if isinstance(service_id, str) and service_id:
+        failed_services.append(service_id)
+
+
+def _record_mcp_smoke_result(
+    detail: dict[str, Any],
+    failed_services: list[str],
+    server_name: str,
+    service_id: Any,
+    server_detail: dict[str, Any],
+) -> None:
+    detail["servers"][server_name] = server_detail
+    if server_detail.get("status") == "ok":
+        detail["servers_ok"].append(server_name)
+        return
+    detail["servers_failed"].append(server_name)
+    if isinstance(service_id, str) and service_id:
+        failed_services.append(service_id)
 
 
 ACCEPTANCE_PROBE_DEFAULT_TIMEOUT_SECONDS = 300.0
 
 
-def load_client_acceptance_probe(
-    *,
-    root_dir: Path,
-    overlay_path: Path,
-) -> dict[str, Any] | None:
+def _acceptance_overlay_doc(root_dir: Path, overlay_path: Path) -> dict[str, Any]:
     overlay_doc = load_yaml(overlay_path)
     if not isinstance(overlay_doc, dict):
         raise RuntimeError(f"Expected overlay document in {overlay_path} to be a mapping.")
+    return resolve_placeholders(overlay_doc, load_runtime_env(root_dir))
 
-    resolved_overlay = resolve_placeholders(overlay_doc, load_runtime_env(root_dir))
+
+def _acceptance_client_doc(resolved_overlay: dict[str, Any], overlay_path: Path) -> dict[str, Any]:
     client_doc = resolved_overlay.get("client")
     if client_doc is None:
         raise RuntimeError(f"Expected top-level `client` mapping in {overlay_path}.")
     if not isinstance(client_doc, dict):
         raise RuntimeError(f"Expected `client` to be a mapping in {overlay_path}.")
+    return client_doc
 
-    probe = client_doc.get("acceptance_probe")
-    if probe is None:
-        return None
-    if not isinstance(probe, dict):
-        raise RuntimeError(f"Expected client.acceptance_probe in {overlay_path} to be a mapping.")
 
+def _acceptance_probe_command(probe: dict[str, Any], overlay_path: Path) -> list[str]:
     raw_command = probe.get("command")
     if not isinstance(raw_command, list) or not raw_command:
         raise RuntimeError(
@@ -956,35 +1414,45 @@ def load_client_acceptance_probe(
         raise RuntimeError(
             f"Expected client.acceptance_probe.command in {overlay_path} to contain only non-empty values."
         )
+    return command
 
+
+def _acceptance_probe_cwd(probe: dict[str, Any], overlay_path: Path) -> str | None:
     raw_cwd = probe.get("cwd")
-    cwd: str | None = None
-    if raw_cwd is not None:
-        cwd = str(raw_cwd).strip()
-        if not cwd:
-            raise RuntimeError(
-                f"Expected client.acceptance_probe.cwd in {overlay_path} to be a non-empty string when provided."
-            )
+    if raw_cwd is None:
+        return None
+    cwd = str(raw_cwd).strip()
+    if not cwd:
+        raise RuntimeError(
+            f"Expected client.acceptance_probe.cwd in {overlay_path} to be a non-empty string when provided."
+        )
+    return cwd
 
+
+def _acceptance_probe_profiles(probe: dict[str, Any], overlay_path: Path) -> list[str]:
     raw_profiles = probe.get("profiles") or []
-    if raw_profiles:
-        if not isinstance(raw_profiles, list):
-            raise RuntimeError(
-                f"Expected client.acceptance_probe.profiles in {overlay_path} to be a list when provided."
-            )
-        profiles = [str(item).strip() for item in raw_profiles if str(item).strip()]
-        if not profiles:
-            raise RuntimeError(
-                f"Expected client.acceptance_probe.profiles in {overlay_path} to contain at least one profile."
-            )
-    else:
-        profiles = []
+    if not raw_profiles:
+        return []
+    if not isinstance(raw_profiles, list):
+        raise RuntimeError(
+            f"Expected client.acceptance_probe.profiles in {overlay_path} to be a list when provided."
+        )
+    profiles = [str(item).strip() for item in raw_profiles if str(item).strip()]
+    if not profiles:
+        raise RuntimeError(
+            f"Expected client.acceptance_probe.profiles in {overlay_path} to contain at least one profile."
+        )
+    return profiles
 
+
+def _acceptance_probe_env(probe: dict[str, Any], overlay_path: Path) -> dict[str, str]:
     raw_env = probe.get("env") or {}
     if not isinstance(raw_env, dict):
         raise RuntimeError(f"Expected client.acceptance_probe.env in {overlay_path} to be a mapping.")
-    env = {str(key).strip(): str(value) for key, value in raw_env.items() if str(key).strip()}
+    return {str(key).strip(): str(value) for key, value in raw_env.items() if str(key).strip()}
 
+
+def _acceptance_probe_timeout(probe: dict[str, Any], overlay_path: Path) -> float:
     raw_timeout = probe.get("timeout_seconds", ACCEPTANCE_PROBE_DEFAULT_TIMEOUT_SECONDS)
     try:
         timeout_seconds = float(raw_timeout)
@@ -996,49 +1464,75 @@ def load_client_acceptance_probe(
         raise RuntimeError(
             f"Expected client.acceptance_probe.timeout_seconds in {overlay_path} to be greater than zero."
         )
+    return timeout_seconds
 
+
+def load_client_acceptance_probe(
+    *,
+    root_dir: Path,
+    overlay_path: Path,
+) -> dict[str, Any] | None:
+    resolved_overlay = _acceptance_overlay_doc(root_dir, overlay_path)
+    client_doc = _acceptance_client_doc(resolved_overlay, overlay_path)
+    probe = client_doc.get("acceptance_probe")
+    if probe is None:
+        return None
+    if not isinstance(probe, dict):
+        raise RuntimeError(f"Expected client.acceptance_probe in {overlay_path} to be a mapping.")
     return {
-        "command": command,
-        "cwd": cwd,
-        "profiles": profiles,
-        "env": env,
-        "timeout_seconds": timeout_seconds,
+        "command": _acceptance_probe_command(probe, overlay_path),
+        "cwd": _acceptance_probe_cwd(probe, overlay_path),
+        "profiles": _acceptance_probe_profiles(probe, overlay_path),
+        "env": _acceptance_probe_env(probe, overlay_path),
+        "timeout_seconds": _acceptance_probe_timeout(probe, overlay_path),
     }
 
 
-def run_client_acceptance_probe(
-    *,
+def _probe_value_translator(
     root_dir: Path,
-    client_id: str,
-    profiles: list[str],
-    probe: dict[str, Any],
-) -> tuple[bool, dict[str, Any]]:
-    runtime_env = load_runtime_env(root_dir)
-    translated_env = translated_runtime_env(root_dir, runtime_env)
-
+    runtime_env: dict[str, Any],
+    translated_env: dict[str, str],
+) -> Callable[[Any], str]:
     def translate_probe_value(raw_value: Any) -> str:
         value = str(raw_value)
         if value.startswith("/"):
             return str(runtime_path_to_host_path(root_dir, runtime_env, value))
         return translate_runtime_paths(value, runtime_env, translated_env)
 
+    return translate_probe_value
+
+
+def _probe_cwd(root_dir: Path, probe: dict[str, Any], translate_probe_value: Callable[[Any], str]) -> Path:
     raw_cwd = str(probe.get("cwd") or "").strip()
-    translated_cwd = translate_probe_value(raw_cwd) if raw_cwd else str(root_dir)
-    cwd = root_dir if not raw_cwd else Path(translated_cwd)
-    if raw_cwd and not cwd.is_absolute():
-        cwd = (root_dir / cwd).resolve()
-    translated_command = [
-        absolutize_local_path_argument(
-            root_dir,
-            translate_probe_value(arg),
-        )
+    if not raw_cwd:
+        return root_dir
+    cwd = Path(translate_probe_value(raw_cwd))
+    return cwd if cwd.is_absolute() else (root_dir / cwd).resolve()
+
+
+def _probe_command(
+    root_dir: Path,
+    probe: dict[str, Any],
+    translate_probe_value: Callable[[Any], str],
+) -> list[str]:
+    return [
+        absolutize_local_path_argument(root_dir, translate_probe_value(arg))
         for arg in probe["command"]
     ]
-    probe_env = {
+
+
+def _translated_probe_env(
+    probe: dict[str, Any],
+    translate_probe_value: Callable[[Any], str],
+) -> dict[str, str]:
+    return {
         str(key): translate_probe_value(value)
         for key, value in (probe.get("env") or {}).items()
     }
-    runtime_probe_env = {
+
+
+def _runtime_probe_env(runtime_env: dict[str, Any]) -> dict[str, str]:
+    return {
         key: str(runtime_env.get(key) or "")
         for key in (
             "SKILLBOX_INGRESS_PUBLIC_BASE_URL",
@@ -1051,29 +1545,63 @@ def run_client_acceptance_probe(
         if str(runtime_env.get(key) or "").strip()
     }
 
-    detail: dict[str, Any] = {
+
+def _acceptance_probe_detail(
+    translated_command: list[str],
+    cwd: Path,
+    probe_env: dict[str, str],
+    runtime_probe_env: dict[str, str],
+    probe: dict[str, Any],
+) -> dict[str, Any]:
+    return {
         "command": translated_command,
         "cwd": str(cwd),
         "env_keys": sorted({*probe_env.keys(), *runtime_probe_env.keys()}),
         "timeout_seconds": probe["timeout_seconds"],
     }
 
-    if not cwd.is_dir():
-        detail["error"] = f"Probe cwd does not exist: {cwd}"
-        return False, detail
 
+def _acceptance_process_env(
+    root_dir: Path,
+    client_id: str,
+    profiles: list[str],
+    probe_env: dict[str, str],
+    runtime_probe_env: dict[str, str],
+) -> dict[str, str]:
     env = os.environ.copy()
     env.update(runtime_probe_env)
     env.update(probe_env)
     env.setdefault("SKILLBOX_ACCEPTANCE_CLIENT_ID", client_id)
     env.setdefault("SKILLBOX_ACCEPTANCE_PROFILES", ",".join(sorted(normalize_active_profiles(profiles))))
     env.setdefault("SKILLBOX_ACCEPTANCE_ROOT_DIR", str(root_dir))
+    return env
+
+
+def run_client_acceptance_probe(
+    *,
+    root_dir: Path,
+    client_id: str,
+    profiles: list[str],
+    probe: dict[str, Any],
+) -> tuple[bool, dict[str, Any]]:
+    runtime_env = load_runtime_env(root_dir)
+    translated_env = translated_runtime_env(root_dir, runtime_env)
+    translate_probe_value = _probe_value_translator(root_dir, runtime_env, translated_env)
+    cwd = _probe_cwd(root_dir, probe, translate_probe_value)
+    translated_command = _probe_command(root_dir, probe, translate_probe_value)
+    probe_env = _translated_probe_env(probe, translate_probe_value)
+    runtime_probe_env = _runtime_probe_env(runtime_env)
+    detail = _acceptance_probe_detail(translated_command, cwd, probe_env, runtime_probe_env, probe)
+
+    if not cwd.is_dir():
+        detail["error"] = f"Probe cwd does not exist: {cwd}"
+        return False, detail
 
     try:
         result = subprocess.run(
             translated_command,
             cwd=cwd,
-            env=env,
+            env=_acceptance_process_env(root_dir, client_id, profiles, probe_env, runtime_probe_env),
             capture_output=True,
             text=True,
             check=False,
@@ -1096,6 +1624,327 @@ def run_client_acceptance_probe(
     return result.returncode == 0, detail
 
 
+def _acceptance_step(
+    steps: list[dict[str, Any]],
+    is_json: bool,
+    name: str,
+    status: str,
+    detail: Any = None,
+) -> None:
+    entry: dict[str, Any] = {"step": name, "status": status}
+    if detail is not None:
+        entry["detail"] = detail
+    steps.append(entry)
+    if not is_json:
+        marker = {"ok": "ok", "warn": "warn", "skip": "skip"}.get(status, "FAIL")
+        print(f"[{marker}] {name}")
+
+
+def _emit_acceptance(payload: dict[str, Any], is_json: bool) -> int:
+    if is_json:
+        emit_json(payload)
+    else:
+        print()
+        print(f"  Client:  {payload['client_id']}")
+        print(f"  Ready:   {'yes' if payload.get('ready') else 'no'}")
+        print(f"  Profiles: {', '.join(payload.get('active_profiles') or ['core'])}")
+        if payload.get("error"):
+            print(f"  Error:   {payload['error']['message']}")
+    return EXIT_OK if payload.get("ready") else EXIT_ERROR
+
+
+def _acceptance_payload(
+    cid: str,
+    active_profiles: list[str],
+    steps: list[dict[str, Any]],
+    *,
+    ready: bool = False,
+) -> dict[str, Any]:
+    return {
+        "client_id": cid,
+        "active_profiles": active_profiles,
+        "steps": steps,
+        "ready": ready,
+    }
+
+
+def _acceptance_validated_client(
+    client_id: str,
+    active_profiles: list[str],
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> tuple[str | None, int | None]:
+    try:
+        return validate_client_id(client_id), None
+    except RuntimeError as exc:
+        payload = _acceptance_payload(client_id, active_profiles, steps)
+        payload.update(classify_error(exc, "acceptance"))
+        return None, _emit_acceptance(payload, is_json)
+
+
+def _acceptance_probe_or_exit(
+    root_dir: Path,
+    cid: str,
+    active_profiles: list[str],
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> tuple[dict[str, Any] | None, int | None]:
+    _, overlay_path, overlay_runtime_path = client_overlay_location(root_dir, cid)
+    if not overlay_path.is_file():
+        payload = _acceptance_payload(cid, active_profiles, steps)
+        payload.update(structured_error(
+            (
+                f"Client '{cid}' has no overlay at {overlay_runtime_path}. "
+                f"Run onboard {cid} before acceptance."
+            ),
+            error_type="client_not_onboarded",
+            recovery_hint=f"Run onboard {cid} to scaffold the client overlay.",
+            next_actions=[f"onboard {cid} --format json"],
+        ))
+        return None, _emit_acceptance(payload, is_json)
+    try:
+        return load_client_acceptance_probe(root_dir=root_dir, overlay_path=overlay_path), None
+    except RuntimeError as exc:
+        payload = _acceptance_payload(cid, active_profiles, steps)
+        payload.update(structured_error(
+            str(exc),
+            error_type="acceptance_probe_invalid",
+            recovery_hint=f"Fix client.acceptance_probe in {overlay_runtime_path} or remove it.",
+            next_actions=[f"doctor --client {cid} --format json"],
+        ))
+        return None, _emit_acceptance(payload, is_json)
+
+
+def _acceptance_probe_in_scope(
+    acceptance_probe: dict[str, Any] | None,
+    active_profiles: list[str],
+) -> dict[str, Any] | None:
+    if acceptance_probe is None or not acceptance_probe.get("profiles"):
+        return acceptance_probe
+    probe_profiles = normalize_active_profiles(acceptance_probe["profiles"])
+    return acceptance_probe if probe_profiles.issubset(set(active_profiles)) else None
+
+
+def _acceptance_command_args(
+    cid: str,
+    profiles: list[str],
+    wait_seconds: float,
+) -> tuple[list[str], list[str], list[str]]:
+    profile_args = [arg for profile in profiles for arg in ("--profile", profile)]
+    doctor_args = ["doctor", "--client", cid, *profile_args, "--format", "json"]
+    sync_args = ["sync", "--client", cid, *profile_args, "--format", "json"]
+    focus_args = ["focus", cid, *profile_args, "--wait-seconds", str(wait_seconds), "--format", "json"]
+    return doctor_args, sync_args, focus_args
+
+
+def _doctor_pre_status(doctor_pre_checks: list[dict[str, Any]]) -> str:
+    pre_flight_blocking_codes = {"runtime-manifest", "connector-contract"}
+    has_blocking_failure = any(
+        str(item.get("status")) == "fail" and str(item.get("code", "")) in pre_flight_blocking_codes
+        for item in doctor_pre_checks
+    )
+    if has_blocking_failure:
+        return "fail"
+    if any(str(item.get("status")) in ("fail", "warn") for item in doctor_pre_checks):
+        return "warn"
+    return "ok"
+
+
+def _acceptance_skip_after_failure(
+    steps: list[dict[str, Any]],
+    is_json: bool,
+    failed_stage: str,
+    skip_stages: tuple[str, ...],
+) -> None:
+    reason = f"{failed_stage} failed"
+    for stage in skip_stages:
+        _acceptance_step(steps, is_json, stage, "skip", {"reason": reason})
+
+
+def _acceptance_doctor_pre(
+    root_dir: Path,
+    doctor_args: list[str],
+    cid: str,
+    active_profiles: list[str],
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> int | None:
+    _, doctor_pre_payload = run_manage_json_command(root_dir, doctor_args)
+    doctor_pre_checks = doctor_pre_payload.get("checks") or []
+    doctor_pre_status = _doctor_pre_status(doctor_pre_checks)
+    _acceptance_step(steps, is_json, "doctor-pre", doctor_pre_status, {"checks": doctor_pre_checks})
+    if doctor_pre_status != "fail":
+        return None
+    _acceptance_skip_after_failure(
+        steps, is_json, "doctor-pre", ("sync", "focus", "mcp-smoke", "doctor-post"),
+    )
+    payload = _acceptance_payload(cid, active_profiles, steps)
+    payload.update(structured_error(
+        "Pre-flight doctor checks failed.",
+        error_type="doctor_pre_failed",
+        next_actions=doctor_pre_payload.get("next_actions") or ["doctor --format json"],
+    ))
+    return _emit_acceptance(payload, is_json)
+
+
+def _acceptance_sync(
+    root_dir: Path,
+    sync_args: list[str],
+    cid: str,
+    profiles: list[str],
+    active_profiles: list[str],
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> int | None:
+    sync_code, sync_payload = run_manage_json_command(root_dir, sync_args)
+    sync_status = "ok" if sync_code == EXIT_OK else "fail"
+    _acceptance_step(steps, is_json, "sync", sync_status, {"actions": sync_payload.get("actions") or []})
+    if sync_status == "ok":
+        return None
+    _acceptance_skip_after_failure(steps, is_json, "sync", ("focus", "mcp-smoke", "doctor-post"))
+    payload = _acceptance_payload(cid, active_profiles, steps)
+    payload["error"] = sync_payload.get("error") or {
+        "type": "sync_failed",
+        "message": "Sync failed during acceptance.",
+        "recoverable": True,
+    }
+    payload["next_actions"] = sync_payload.get("next_actions") or [f"sync{format_profile_args(profiles)} --format json"]
+    return _emit_acceptance(payload, is_json)
+
+
+def _acceptance_focus(
+    root_dir: Path,
+    focus_args: list[str],
+    cid: str,
+    profiles: list[str],
+    active_profiles: list[str],
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> int | None:
+    focus_code, focus_payload = run_manage_json_command(root_dir, focus_args)
+    focus_status = "ok" if focus_code == EXIT_OK else "fail"
+    _acceptance_step(steps, is_json, "focus", focus_status, focus_step_detail(focus_payload, active_profiles))
+    if focus_status == "ok":
+        return None
+    _acceptance_skip_after_failure(steps, is_json, "focus", ("mcp-smoke", "doctor-post"))
+    payload = _acceptance_payload(cid, active_profiles, steps)
+    payload["error"] = focus_payload.get("error") or {
+        "type": "focus_failed",
+        "message": "Focus failed during acceptance.",
+        "recoverable": True,
+    }
+    payload["next_actions"] = focus_payload.get("next_actions") or [f"focus {cid}{format_profile_args(profiles)} --format json"]
+    return _emit_acceptance(payload, is_json)
+
+
+def _acceptance_mcp_and_probe(
+    root_dir: Path,
+    cid: str,
+    profiles: list[str],
+    acceptance_probe: dict[str, Any] | None,
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> tuple[bool, dict[str, Any], list[str], bool, dict[str, Any] | None]:
+    model = build_runtime_model(root_dir)
+    filtered_model = filter_model(model, normalize_active_profiles(profiles), normalize_active_clients(model, [cid]))
+    mcp_ok, mcp_detail, failed_services = smoke_requested_mcp_servers(root_dir, filtered_model)
+    _acceptance_step(steps, is_json, "mcp-smoke", "ok" if mcp_ok else "fail", mcp_detail)
+
+    probe_ok = True
+    probe_detail: dict[str, Any] | None = None
+    if mcp_ok and acceptance_probe is not None:
+        probe_ok, probe_detail = run_client_acceptance_probe(
+            root_dir=root_dir,
+            client_id=cid,
+            profiles=profiles,
+            probe=acceptance_probe,
+        )
+        _acceptance_step(steps, is_json, "workflow-probe", "ok" if probe_ok else "fail", probe_detail)
+    return mcp_ok, mcp_detail, failed_services, probe_ok, probe_detail
+
+
+def _acceptance_failure_error(
+    mcp_ok: bool,
+    mcp_detail: dict[str, Any],
+    probe_ok: bool,
+    probe_detail: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not mcp_ok:
+        return {
+            "type": "mcp_smoke_failed",
+            "message": "MCP smoke failed for: " + ", ".join(mcp_detail.get("servers_failed") or ["unknown"]),
+            "recoverable": True,
+        }
+    if not probe_ok:
+        return {
+            "type": "acceptance_probe_failed",
+            "message": "Acceptance probe failed.",
+            "recoverable": True,
+            "detail": probe_detail or {},
+        }
+    return {
+        "type": "doctor_post_failed",
+        "message": "Post-focus doctor checks failed.",
+        "recoverable": True,
+    }
+
+
+def _acceptance_next_actions(
+    *,
+    ready: bool,
+    cid: str,
+    profiles: list[str],
+    mcp_ok: bool,
+    failed_services: list[str],
+    probe_ok: bool,
+    doctor_post_payload: dict[str, Any],
+) -> list[str]:
+    if ready:
+        return next_actions_for_acceptance_success(cid, profiles)
+    if not mcp_ok:
+        return next_actions_for_acceptance_mcp_failure(profiles, failed_services)
+    if not probe_ok:
+        return [
+            f"status --client {cid}{format_profile_args(profiles)} --format json",
+            f"logs --client {cid}{format_profile_args(profiles)} --format json",
+        ]
+    return doctor_post_payload.get("next_actions") or ["doctor --format json"]
+
+
+def _acceptance_finish(
+    *,
+    root_dir: Path,
+    doctor_args: list[str],
+    cid: str,
+    profiles: list[str],
+    active_profiles: list[str],
+    steps: list[dict[str, Any]],
+    is_json: bool,
+    mcp_ok: bool,
+    mcp_detail: dict[str, Any],
+    failed_services: list[str],
+    probe_ok: bool,
+    probe_detail: dict[str, Any] | None,
+) -> int:
+    doctor_post_code, doctor_post_payload = run_manage_json_command(root_dir, doctor_args)
+    doctor_post_status = doctor_step_status(doctor_post_payload, doctor_post_code)
+    _acceptance_step(steps, is_json, "doctor-post", doctor_post_status, {"checks": doctor_post_payload.get("checks") or []})
+    ready = mcp_ok and probe_ok and doctor_post_status != "fail"
+    payload = _acceptance_payload(cid, active_profiles, steps, ready=ready)
+    payload["next_actions"] = _acceptance_next_actions(
+        ready=ready,
+        cid=cid,
+        profiles=profiles,
+        mcp_ok=mcp_ok,
+        failed_services=failed_services,
+        probe_ok=probe_ok,
+        doctor_post_payload=doctor_post_payload,
+    )
+    if not ready:
+        payload["error"] = _acceptance_failure_error(mcp_ok, mcp_detail, probe_ok, probe_detail)
+    return _emit_acceptance(payload, is_json)
+
+
 def run_acceptance(
     *,
     root_dir: Path,
@@ -1108,226 +1957,43 @@ def run_acceptance(
     is_json = fmt == "json"
     active_profiles = sorted(normalize_active_profiles(profiles))
 
-    def step(name: str, status: str, detail: Any = None) -> None:
-        entry: dict[str, Any] = {"step": name, "status": status}
-        if detail is not None:
-            entry["detail"] = detail
-        steps.append(entry)
-        if not is_json:
-            marker = {
-                "ok": "ok",
-                "warn": "warn",
-                "skip": "skip",
-            }.get(status, "FAIL")
-            print(f"[{marker}] {name}")
+    cid, exit_code = _acceptance_validated_client(client_id, active_profiles, steps, is_json)
+    if exit_code is not None or cid is None:
+        return exit_code if exit_code is not None else EXIT_ERROR
 
-    def emit_acceptance(payload: dict[str, Any]) -> int:
-        if is_json:
-            emit_json(payload)
-        else:
-            print()
-            print(f"  Client:  {payload['client_id']}")
-            print(f"  Ready:   {'yes' if payload.get('ready') else 'no'}")
-            print(f"  Profiles: {', '.join(payload.get('active_profiles') or ['core'])}")
-            if payload.get("error"):
-                print(f"  Error:   {payload['error']['message']}")
-        return EXIT_OK if payload.get("ready") else EXIT_ERROR
+    acceptance_probe, exit_code = _acceptance_probe_or_exit(root_dir, cid, active_profiles, steps, is_json)
+    if exit_code is not None:
+        return exit_code
+    acceptance_probe = _acceptance_probe_in_scope(acceptance_probe, active_profiles)
+    doctor_args, sync_args, focus_args = _acceptance_command_args(cid, profiles, wait_seconds)
 
-    try:
-        cid = validate_client_id(client_id)
-    except RuntimeError as exc:
-        payload = {"client_id": client_id, "active_profiles": active_profiles, "steps": steps, "ready": False}
-        payload.update(classify_error(exc, "acceptance"))
-        return emit_acceptance(payload)
+    exit_code = _acceptance_doctor_pre(root_dir, doctor_args, cid, active_profiles, steps, is_json)
+    if exit_code is not None:
+        return exit_code
+    exit_code = _acceptance_sync(root_dir, sync_args, cid, profiles, active_profiles, steps, is_json)
+    if exit_code is not None:
+        return exit_code
+    exit_code = _acceptance_focus(root_dir, focus_args, cid, profiles, active_profiles, steps, is_json)
+    if exit_code is not None:
+        return exit_code
 
-    _, overlay_path, overlay_runtime_path = client_overlay_location(root_dir, cid)
-    if not overlay_path.is_file():
-        payload = {
-            "client_id": cid,
-            "active_profiles": active_profiles,
-            "steps": steps,
-            "ready": False,
-        }
-        payload.update(
-            structured_error(
-                (
-                    f"Client '{cid}' has no overlay at {overlay_runtime_path}. "
-                    f"Run onboard {cid} before acceptance."
-                ),
-                error_type="client_not_onboarded",
-                recovery_hint=f"Run onboard {cid} to scaffold the client overlay.",
-                next_actions=[f"onboard {cid} --format json"],
-            )
-        )
-        return emit_acceptance(payload)
-
-    try:
-        acceptance_probe = load_client_acceptance_probe(root_dir=root_dir, overlay_path=overlay_path)
-    except RuntimeError as exc:
-        payload = {
-            "client_id": cid,
-            "active_profiles": active_profiles,
-            "steps": steps,
-            "ready": False,
-        }
-        payload.update(
-            structured_error(
-                str(exc),
-                error_type="acceptance_probe_invalid",
-                recovery_hint=f"Fix client.acceptance_probe in {overlay_runtime_path} or remove it.",
-                next_actions=[f"doctor --client {cid} --format json"],
-            )
-        )
-        return emit_acceptance(payload)
-
-    profile_args = [arg for profile in profiles for arg in ("--profile", profile)]
-    doctor_args = ["doctor", "--client", cid, *profile_args, "--format", "json"]
-    sync_args = ["sync", "--client", cid, *profile_args, "--format", "json"]
-    focus_args = ["focus", cid, *profile_args, "--wait-seconds", str(wait_seconds), "--format", "json"]
-    if acceptance_probe is not None and acceptance_probe.get("profiles"):
-        probe_profiles = normalize_active_profiles(acceptance_probe["profiles"])
-        if not probe_profiles.issubset(set(active_profiles)):
-            acceptance_probe = None
-
-    # Doctor pre-flight: only block on config-level failures that sync can't fix
-    # (e.g. connector-contract, runtime-manifest). Path/artifact/lock checks are
-    # sync-resolvable and should not abort before sync has run.
-    PRE_FLIGHT_BLOCKING_CODES = {"runtime-manifest", "connector-contract"}
-    doctor_pre_code, doctor_pre_payload = run_manage_json_command(root_dir, doctor_args)
-    doctor_pre_checks = doctor_pre_payload.get("checks") or []
-    has_blocking_failure = any(
-        str(item.get("status")) == "fail" and str(item.get("code", "")) in PRE_FLIGHT_BLOCKING_CODES
-        for item in doctor_pre_checks
+    mcp_ok, mcp_detail, failed_services, probe_ok, probe_detail = _acceptance_mcp_and_probe(
+        root_dir, cid, profiles, acceptance_probe, steps, is_json,
     )
-    if has_blocking_failure:
-        doctor_pre_status = "fail"
-    elif any(str(item.get("status")) in ("fail", "warn") for item in doctor_pre_checks):
-        doctor_pre_status = "warn"
-    else:
-        doctor_pre_status = "ok"
-    step("doctor-pre", doctor_pre_status, {"checks": doctor_pre_checks})
-    if doctor_pre_status == "fail":
-        step("sync", "skip", {"reason": "doctor-pre failed"})
-        step("focus", "skip", {"reason": "doctor-pre failed"})
-        step("mcp-smoke", "skip", {"reason": "doctor-pre failed"})
-        step("doctor-post", "skip", {"reason": "doctor-pre failed"})
-        payload = {
-            "client_id": cid,
-            "active_profiles": active_profiles,
-            "steps": steps,
-            "ready": False,
-        }
-        payload.update(
-            structured_error(
-                "Pre-flight doctor checks failed.",
-                error_type="doctor_pre_failed",
-                next_actions=doctor_pre_payload.get("next_actions") or ["doctor --format json"],
-            )
-        )
-        return emit_acceptance(payload)
-
-    sync_code, sync_payload = run_manage_json_command(root_dir, sync_args)
-    sync_status = "ok" if sync_code == EXIT_OK else "fail"
-    step("sync", sync_status, {"actions": sync_payload.get("actions") or []})
-    if sync_status != "ok":
-        step("focus", "skip", {"reason": "sync failed"})
-        step("mcp-smoke", "skip", {"reason": "sync failed"})
-        step("doctor-post", "skip", {"reason": "sync failed"})
-        payload = {
-            "client_id": cid,
-            "active_profiles": active_profiles,
-            "steps": steps,
-            "ready": False,
-        }
-        payload["error"] = sync_payload.get("error") or {
-            "type": "sync_failed",
-            "message": "Sync failed during acceptance.",
-            "recoverable": True,
-        }
-        payload["next_actions"] = sync_payload.get("next_actions") or [f"sync{format_profile_args(profiles)} --format json"]
-        return emit_acceptance(payload)
-
-    focus_code, focus_payload = run_manage_json_command(root_dir, focus_args)
-    focus_status = "ok" if focus_code == EXIT_OK else "fail"
-    step("focus", focus_status, focus_step_detail(focus_payload, active_profiles))
-    if focus_status != "ok":
-        step("mcp-smoke", "skip", {"reason": "focus failed"})
-        step("doctor-post", "skip", {"reason": "focus failed"})
-        payload = {
-            "client_id": cid,
-            "active_profiles": active_profiles,
-            "steps": steps,
-            "ready": False,
-        }
-        payload["error"] = focus_payload.get("error") or {
-            "type": "focus_failed",
-            "message": "Focus failed during acceptance.",
-            "recoverable": True,
-        }
-        payload["next_actions"] = focus_payload.get("next_actions") or [f"focus {cid}{format_profile_args(profiles)} --format json"]
-        return emit_acceptance(payload)
-
-    model = build_runtime_model(root_dir)
-    filtered_model = filter_model(model, normalize_active_profiles(profiles), normalize_active_clients(model, [cid]))
-    mcp_ok, mcp_detail, failed_services = smoke_requested_mcp_servers(root_dir, filtered_model)
-    step("mcp-smoke", "ok" if mcp_ok else "fail", mcp_detail)
-
-    probe_ok = True
-    probe_detail: dict[str, Any] | None = None
-    if mcp_ok and acceptance_probe is not None:
-        probe_ok, probe_detail = run_client_acceptance_probe(
-            root_dir=root_dir,
-            client_id=cid,
-            profiles=profiles,
-            probe=acceptance_probe,
-        )
-        step("workflow-probe", "ok" if probe_ok else "fail", probe_detail)
-
-    doctor_post_code, doctor_post_payload = run_manage_json_command(root_dir, doctor_args)
-    doctor_post_status = doctor_step_status(doctor_post_payload, doctor_post_code)
-    step("doctor-post", doctor_post_status, {"checks": doctor_post_payload.get("checks") or []})
-
-    ready = mcp_ok and probe_ok and doctor_post_status != "fail"
-    payload = {
-        "client_id": cid,
-        "active_profiles": active_profiles,
-        "steps": steps,
-        "ready": ready,
-        "next_actions": (
-            next_actions_for_acceptance_success(cid, profiles)
-            if ready
-            else next_actions_for_acceptance_mcp_failure(profiles, failed_services)
-            if not mcp_ok
-            else [
-                f"status --client {cid}{format_profile_args(profiles)} --format json",
-                f"logs --client {cid}{format_profile_args(profiles)} --format json",
-            ]
-            if not probe_ok
-            else doctor_post_payload.get("next_actions") or ["doctor --format json"]
-        ),
-    }
-    if not ready:
-        payload["error"] = (
-            {
-                "type": "mcp_smoke_failed",
-                "message": "MCP smoke failed for: " + ", ".join(mcp_detail.get("servers_failed") or ["unknown"]),
-                "recoverable": True,
-            }
-            if not mcp_ok
-            else {
-                "type": "acceptance_probe_failed",
-                "message": "Acceptance probe failed.",
-                "recoverable": True,
-                "detail": probe_detail or {},
-            }
-            if not probe_ok
-            else {
-                "type": "doctor_post_failed",
-                "message": "Post-focus doctor checks failed.",
-                "recoverable": True,
-            }
-        )
-    return emit_acceptance(payload)
+    return _acceptance_finish(
+        root_dir=root_dir,
+        doctor_args=doctor_args,
+        cid=cid,
+        profiles=profiles,
+        active_profiles=active_profiles,
+        steps=steps,
+        is_json=is_json,
+        mcp_ok=mcp_ok,
+        mcp_detail=mcp_detail,
+        failed_services=failed_services,
+        probe_ok=probe_ok,
+        probe_detail=probe_detail,
+    )
 
 
 STEWARDSHIP_REPORT_VERSION = 1
@@ -2250,73 +2916,118 @@ def _focus_bootstrap_step(
     is_json: bool,
 ) -> int | None:
     try:
-        requested_tasks = select_tasks(model, [])
-        tasks = resolve_tasks_for_run(model, requested_tasks)
+        tasks = _focus_bootstrap_tasks(model)
         if not tasks:
             _focus_step(steps, is_json, "bootstrap", "skip", {"reason": "no tasks declared"})
             return None
-        doctor = doctor_results(model, root_dir)
-        doctor_failures = [asdict(result) for result in doctor if result.status == "fail"]
-        if doctor_failures:
-            _focus_step(
-                steps, is_json, "bootstrap", "fail",
-                {
-                    "error": "post-sync doctor checks failed",
-                    "checks": [asdict(result) for result in doctor],
-                },
-            )
-            payload = {"client_id": cid, "steps": steps}
-            payload.update(structured_error(
-                "Pre-bootstrap doctor checks failed after sync.",
-                error_type="pre_bootstrap_doctor_failed",
-                recoverable=True,
-                recovery_hint=(
-                    "Run doctor to materialize or mount the remaining required runtime inputs "
-                    "before retrying focus."
-                ),
-                next_actions=[
-                    f"doctor --client {cid} --format json",
-                    f"logs --client {cid} --format json",
-                ],
-            ))
-            if is_json:
-                emit_json(payload)
-            else:
-                print("Pre-bootstrap doctor checks failed after sync.", file=sys.stderr)
-            return EXIT_ERROR
-        tasks_to_run: list[dict[str, Any]] = []
-        for task in tasks:
-            bid = str(task.get("bridge_id", "")).strip()
-            if bid and bridge_detail.get(bid, {}).get("fresh"):
-                if not is_json:
-                    print(f"  [skip] {task['id']} (bridge {bid} outputs are fresh)")
-            else:
-                tasks_to_run.append(task)
-        if tasks_to_run:
-            ensure_required_env_files_ready(select_env_files_for_tasks(model, tasks_to_run))
-            task_results = run_tasks(model, tasks_to_run, dry_run=False)
-            _focus_step(steps, is_json, "bootstrap", "ok", {"tasks": task_results})
-        else:
-            _focus_step(steps, is_json, "bootstrap", "skip", {"reason": "all bridge tasks fresh"})
+        doctor_exit = _focus_emit_bootstrap_doctor_failure(model, root_dir, cid, steps, is_json)
+        if doctor_exit is not None:
+            return doctor_exit
+        tasks_to_run = _focus_tasks_requiring_run(tasks, bridge_detail, is_json)
+        _focus_run_bootstrap_tasks(model, tasks_to_run, steps, is_json)
         return None
     except RuntimeError as exc:
-        _focus_step(steps, is_json, "bootstrap", "fail", {"error": str(exc)})
-        err_str = str(exc)
-        payload: dict[str, Any] = {"client_id": cid, "steps": steps}
-        if any(bid in err_str for bid in bridge_detail):
-            payload.update(local_runtime_error(
-                "LOCAL_RUNTIME_ENV_BRIDGE_FAILED",
-                err_str,
-                recoverable=True,
-                next_action="re-run sync.sh manually to diagnose",
-            ))
-        else:
-            payload.update(classify_error(exc, "focus"))
-        if is_json:
-            emit_json(payload)
-        elif (payload.get("error") or {}).get("type", "").startswith("LOCAL_RUNTIME_"):
-            print_local_runtime_error_text(payload)
-        return EXIT_ERROR
+        return _focus_emit_bootstrap_runtime_error(exc, cid, bridge_detail, steps, is_json)
+
+
+def _focus_bootstrap_tasks(model: dict[str, Any]) -> list[dict[str, Any]]:
+    requested_tasks = select_tasks(model, [])
+    return resolve_tasks_for_run(model, requested_tasks)
+
+
+def _focus_emit_bootstrap_doctor_failure(
+    model: dict[str, Any],
+    root_dir: Path,
+    cid: str,
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> int | None:
+    doctor = doctor_results(model, root_dir)
+    doctor_failures = [asdict(result) for result in doctor if result.status == "fail"]
+    if not doctor_failures:
+        return None
+    _focus_step(
+        steps, is_json, "bootstrap", "fail",
+        {
+            "error": "post-sync doctor checks failed",
+            "checks": [asdict(result) for result in doctor],
+        },
+    )
+    payload = {"client_id": cid, "steps": steps}
+    payload.update(structured_error(
+        "Pre-bootstrap doctor checks failed after sync.",
+        error_type="pre_bootstrap_doctor_failed",
+        recoverable=True,
+        recovery_hint=(
+            "Run doctor to materialize or mount the remaining required runtime inputs "
+            "before retrying focus."
+        ),
+        next_actions=[
+            f"doctor --client {cid} --format json",
+            f"logs --client {cid} --format json",
+        ],
+    ))
+    if is_json:
+        emit_json(payload)
+    else:
+        print("Pre-bootstrap doctor checks failed after sync.", file=sys.stderr)
+    return EXIT_ERROR
+
+
+def _focus_tasks_requiring_run(
+    tasks: list[dict[str, Any]],
+    bridge_detail: dict[str, Any],
+    is_json: bool,
+) -> list[dict[str, Any]]:
+    tasks_to_run: list[dict[str, Any]] = []
+    for task in tasks:
+        bid = str(task.get("bridge_id", "")).strip()
+        if bid and bridge_detail.get(bid, {}).get("fresh"):
+            if not is_json:
+                print(f"  [skip] {task['id']} (bridge {bid} outputs are fresh)")
+            continue
+        tasks_to_run.append(task)
+    return tasks_to_run
+
+
+def _focus_run_bootstrap_tasks(
+    model: dict[str, Any],
+    tasks_to_run: list[dict[str, Any]],
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> None:
+    if not tasks_to_run:
+        _focus_step(steps, is_json, "bootstrap", "skip", {"reason": "all bridge tasks fresh"})
+        return
+    ensure_required_env_files_ready(select_env_files_for_tasks(model, tasks_to_run))
+    task_results = run_tasks(model, tasks_to_run, dry_run=False)
+    _focus_step(steps, is_json, "bootstrap", "ok", {"tasks": task_results})
+
+
+def _focus_emit_bootstrap_runtime_error(
+    exc: RuntimeError,
+    cid: str,
+    bridge_detail: dict[str, Any],
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> int:
+    _focus_step(steps, is_json, "bootstrap", "fail", {"error": str(exc)})
+    err_str = str(exc)
+    payload: dict[str, Any] = {"client_id": cid, "steps": steps}
+    if any(bid in err_str for bid in bridge_detail):
+        payload.update(local_runtime_error(
+            "LOCAL_RUNTIME_ENV_BRIDGE_FAILED",
+            err_str,
+            recoverable=True,
+            next_action="re-run sync.sh manually to diagnose",
+        ))
+    else:
+        payload.update(classify_error(exc, "focus"))
+    if is_json:
+        emit_json(payload)
+    elif (payload.get("error") or {}).get("type", "").startswith("LOCAL_RUNTIME_"):
+        print_local_runtime_error_text(payload)
+    return EXIT_ERROR
 
 
 def _focus_bridge_verify_step(
@@ -2537,73 +3248,106 @@ def _focus_emit_summary(payload: dict[str, Any], summary: dict[str, int], cid: s
         print(f"  Errors:    {summary['recent_errors']} recent error(s) in logs")
 
 
-def run_focus(
+def _focus_initial_state(
     *,
     root_dir: Path,
     client_id: str,
     profiles: list[str],
-    service_filter: list[str],
     resume: bool,
-    wait_seconds: float,
-    fmt: str,
-    context_dir: Path | None = None,
-) -> int:
-    """Focus macro: sync → bootstrap → up → collect live state → generate enriched context."""
-    steps: list[dict[str, Any]] = []
-    is_json = fmt == "json"
-    focus_path = root_dir / FOCUS_STATE_REL
-
+    focus_path: Path,
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> tuple[str | None, list[str], dict[str, Any] | None, int | None]:
     if resume:
         client_id, profiles, exit_code = _resolve_resume_focus_state(
             focus_path, client_id, profiles, is_json,
         )
         if exit_code is not None:
-            return exit_code
+            return None, profiles, None, exit_code
 
     cid, exit_code = _validate_focus_client(root_dir, client_id, is_json)
     if exit_code is not None:
-        return exit_code
+        return None, profiles, None, exit_code
 
     model, exit_code = _build_focus_model(root_dir, cid, profiles, steps, is_json)
     if exit_code is not None or model is None:
-        return exit_code if exit_code is not None else EXIT_ERROR
+        return cid, profiles, None, exit_code if exit_code is not None else EXIT_ERROR
 
     profile_errors = validate_local_runtime_profiles(model)
     if profile_errors:
-        return _focus_emit_local_runtime_payload(
+        exit_code = _focus_emit_local_runtime_payload(
             {"client_id": cid, "steps": steps}, profile_errors[0], is_json,
         )
+        return cid, profiles, None, exit_code
+    return cid, profiles, model, None
 
-    active_local_profile = local_runtime_active_profile(model)
+
+def _focus_prepare_runtime(
+    *,
+    root_dir: Path,
+    model: dict[str, Any],
+    cid: str,
+    active_local_profile: str | None,
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> int | None:
     exit_code = _focus_local_runtime_preflight(model, active_local_profile, cid, steps, is_json)
     if exit_code is not None:
         return exit_code
-
     _focus_compose_override_step(root_dir, model, cid, steps, is_json)
+    return _focus_sync_step(model, cid, steps, is_json)
 
-    exit_code = _focus_sync_step(model, cid, steps, is_json)
-    if exit_code is not None:
-        return exit_code
 
+def _focus_bootstrap_and_start(
+    *,
+    model: dict[str, Any],
+    root_dir: Path,
+    cid: str,
+    service_filter: list[str],
+    wait_seconds: float,
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any], int | None]:
     bridges, bridge_detail = _focus_bridge_freshness_step(model, cid, steps, is_json)
-
     exit_code = _focus_bootstrap_step(model, root_dir, cid, bridge_detail, steps, is_json)
     if exit_code is not None:
-        return exit_code
-
+        return bridges, bridge_detail, exit_code
     exit_code = _focus_bridge_verify_step(bridges, cid, steps, is_json)
     if exit_code is not None:
-        return exit_code
-
+        return bridges, bridge_detail, exit_code
     exit_code = _focus_up_step(model, service_filter, wait_seconds, cid, steps, is_json)
-    if exit_code is not None:
-        return exit_code
+    return bridges, bridge_detail, exit_code
 
+
+def _focus_collect_and_persist(
+    *,
+    focus_path: Path,
+    model: dict[str, Any],
+    root_dir: Path,
+    cid: str,
+    service_filter: list[str],
+    context_dir: Path | None,
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> dict[str, Any]:
     live = _focus_collect_live_step(model, root_dir, steps, is_json)
     _focus_skill_context_step(model, root_dir, steps, is_json)
     _focus_enriched_context_step(model, live, root_dir, context_dir, steps, is_json)
     _focus_persist_step(focus_path, model, cid, service_filter, root_dir, steps, is_json)
+    return live
 
+
+def _focus_finish(
+    *,
+    model: dict[str, Any],
+    active_local_profile: str | None,
+    bridges: list[dict[str, Any]],
+    cid: str,
+    live: dict[str, Any],
+    steps: list[dict[str, Any]],
+    is_json: bool,
+    root_dir: Path,
+) -> int:
     summary = _focus_summary_counts(live)
     local_runtime_section = _focus_local_runtime_section(
         model, active_local_profile, bridges, cid, live, steps, is_json,
@@ -2625,6 +3369,456 @@ def run_focus(
     return EXIT_DRIFT if has_fail else EXIT_OK
 
 
+def run_focus(
+    *,
+    root_dir: Path,
+    client_id: str,
+    profiles: list[str],
+    service_filter: list[str],
+    resume: bool,
+    wait_seconds: float,
+    fmt: str,
+    context_dir: Path | None = None,
+) -> int:
+    """Focus macro: sync → bootstrap → up → collect live state → generate enriched context."""
+    steps: list[dict[str, Any]] = []
+    is_json = fmt == "json"
+    focus_path = root_dir / FOCUS_STATE_REL
+
+    cid, profiles, model, exit_code = _focus_initial_state(
+        root_dir=root_dir,
+        client_id=client_id,
+        profiles=profiles,
+        resume=resume,
+        focus_path=focus_path,
+        steps=steps,
+        is_json=is_json,
+    )
+    if exit_code is not None or cid is None or model is None:
+        return exit_code if exit_code is not None else EXIT_ERROR
+    active_local_profile = local_runtime_active_profile(model)
+
+    exit_code = _focus_prepare_runtime(
+        root_dir=root_dir,
+        model=model,
+        cid=cid,
+        active_local_profile=active_local_profile,
+        steps=steps,
+        is_json=is_json,
+    )
+    if exit_code is not None:
+        return exit_code
+
+    bridges, _, exit_code = _focus_bootstrap_and_start(
+        model=model,
+        root_dir=root_dir,
+        cid=cid,
+        service_filter=service_filter,
+        wait_seconds=wait_seconds,
+        steps=steps,
+        is_json=is_json,
+    )
+    if exit_code is not None:
+        return exit_code
+
+    live = _focus_collect_and_persist(
+        focus_path=focus_path,
+        model=model,
+        root_dir=root_dir,
+        cid=cid,
+        service_filter=service_filter,
+        context_dir=context_dir,
+        steps=steps,
+        is_json=is_json,
+    )
+    return _focus_finish(
+        model=model,
+        active_local_profile=active_local_profile,
+        bridges=bridges,
+        cid=cid,
+        live=live,
+        steps=steps,
+        is_json=is_json,
+        root_dir=root_dir,
+    )
+
+
+def _up_payload_base(
+    client_id: str,
+    profile: str,
+    requested_mode: str,
+    effective_mode: str,
+    *,
+    bootstrap_tasks: list[dict[str, Any]] | None = None,
+    services: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "client_id": client_id,
+        "profile": profile,
+        "requested_mode": requested_mode,
+        "effective_mode": effective_mode,
+        "bootstrap_tasks": bootstrap_tasks or [],
+        "services": services or [],
+    }
+
+
+def _up_unsupported_mode(
+    client_id: str,
+    profile: str,
+    requested_mode: str,
+    effective_mode: str,
+) -> tuple[int, dict[str, Any]] | None:
+    if effective_mode in LOCAL_RUNTIME_START_MODES:
+        return None
+    supported = ", ".join(LOCAL_RUNTIME_START_MODES)
+    payload = _up_payload_base(client_id, profile, requested_mode, effective_mode)
+    payload.update(local_runtime_error(
+        LOCAL_RUNTIME_MODE_UNSUPPORTED,
+        f"Unsupported --mode value {effective_mode!r}. Supported modes: {supported}.",
+        recoverable=True,
+        next_action=f"Re-run with --mode <{'|'.join(LOCAL_RUNTIME_START_MODES)}>.",
+    ))
+    payload["error"]["requested_mode"] = requested_mode
+    return EXIT_ERROR, payload
+
+
+def _up_surface_filter_error(
+    model: dict[str, Any],
+    client_id: str,
+    profile: str,
+    requested_mode: str,
+    effective_mode: str,
+    service_filter: list[str] | None,
+) -> tuple[int, dict[str, Any]] | None:
+    if not service_filter:
+        return None
+    classification = classify_requested_surfaces(model, service_filter)
+    if classification["deferred"]:
+        return _up_deferred_surface_error(
+            classification["deferred"][0], client_id, profile, requested_mode, effective_mode,
+        )
+    if classification["unknown"]:
+        return _up_unknown_surface_error(
+            model, classification["unknown"], client_id, profile, requested_mode, effective_mode,
+        )
+    return None
+
+
+def _up_deferred_surface_error(
+    deferred: tuple[str, dict[str, Any]],
+    client_id: str,
+    profile: str,
+    requested_mode: str,
+    effective_mode: str,
+) -> tuple[int, dict[str, Any]]:
+    surface_id, item = deferred
+    payload = _up_payload_base(client_id, profile, requested_mode, effective_mode)
+    payload.update(
+        build_local_runtime_service_deferred_error(
+            item,
+            client_id=client_id,
+            profile=profile,
+            requested_mode=requested_mode,
+            surface_id=surface_id,
+        )
+    )
+    return EXIT_ERROR, payload
+
+
+def _up_available_service_ids(model: dict[str, Any]) -> list[str]:
+    return sorted(
+        str(service.get("id", "")).strip()
+        for service in model.get("services") or []
+        if str(service.get("id", "")).strip()
+    )
+
+
+def _up_unknown_surface_error(
+    model: dict[str, Any],
+    unknown: list[str],
+    client_id: str,
+    profile: str,
+    requested_mode: str,
+    effective_mode: str,
+) -> tuple[int, dict[str, Any]]:
+    unknown_ids = list(unknown)
+    available_services = _up_available_service_ids(model)
+    message = f"Unknown service id(s): {', '.join(unknown_ids)}."
+    if available_services:
+        message += f" Available services: {', '.join(available_services)}."
+    payload = _up_payload_base(client_id, profile, requested_mode, effective_mode)
+    payload.update(structured_error(
+        message,
+        error_type="unknown_service",
+        recoverable=True,
+        recovery_hint="Use a declared runtime service id or inspect the parity ledger for deferred legacy surfaces.",
+        next_actions=[f"manage.py render --client {client_id} --profile {profile} --format json"],
+    ))
+    payload["error"]["requested_mode"] = requested_mode
+    payload["error"]["blocked_services"] = unknown_ids
+    payload["error"]["available_services"] = available_services
+    return EXIT_ERROR, payload
+
+
+def _up_reconcile_error(
+    model: dict[str, Any],
+    client_id: str,
+    profile: str,
+    requested_mode: str,
+    effective_mode: str,
+    dry_run: bool,
+) -> tuple[int, dict[str, Any]] | None:
+    reconcile_result = reconcile_local_runtime_env(
+        model,
+        profile,
+        overlay_path=local_runtime_overlay_path(model, client_id),
+        dry_run=dry_run,
+    )
+    if reconcile_result.get("status") != "blocked":
+        return None
+    payload = _up_payload_base(client_id, profile, requested_mode, effective_mode)
+    payload["error"] = dict(reconcile_result.get("error") or {})
+    payload["error"].setdefault("requested_mode", requested_mode)
+    payload["error"].setdefault("blocked_services", [])
+    return EXIT_ERROR, payload
+
+
+def _up_ordered_services(
+    model: dict[str, Any],
+    profile: str,
+    service_filter: list[str] | None,
+    effective_mode: str,
+) -> list[dict[str, Any]]:
+    filter_ids = [service_id for service_id in (service_filter or []) if service_id]
+    requested = select_services(model, filter_ids) if filter_ids else select_local_runtime_services(model, profile)
+    return resolve_services_for_start(model, requested, mode=effective_mode)
+
+
+def _up_no_services_error(
+    client_id: str,
+    profile: str,
+    requested_mode: str,
+    effective_mode: str,
+) -> tuple[int, dict[str, Any]] | None:
+    payload = _up_payload_base(client_id, profile, requested_mode, effective_mode)
+    payload.update(local_runtime_error(
+        LOCAL_RUNTIME_PROFILE_UNKNOWN,
+        f"Profile {profile!r} has no declared local-runtime services.",
+        recoverable=False,
+    ))
+    payload["error"]["requested_mode"] = requested_mode
+    return EXIT_ERROR, payload
+
+
+def _up_mode_support_error(
+    ordered_services: list[dict[str, Any]],
+    client_id: str,
+    profile: str,
+    requested_mode: str,
+    effective_mode: str,
+) -> tuple[int, dict[str, Any]] | None:
+    unsupported = validate_services_support_mode(ordered_services, effective_mode)
+    if not unsupported:
+        return None
+    payload = _up_payload_base(client_id, profile, requested_mode, effective_mode)
+    payload.update(local_runtime_error(
+        LOCAL_RUNTIME_MODE_UNSUPPORTED,
+        f"Mode {effective_mode!r} is not supported by all requested services: {', '.join(unsupported)}",
+        recoverable=True,
+        blocked_services=unsupported,
+        next_action=f"Re-run with a mode declared by every service in {profile}.",
+    ))
+    payload["error"]["requested_mode"] = requested_mode
+    return EXIT_ERROR, payload
+
+
+def _planned_bootstrap_summary(bootstrap_task_specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{"id": str(task.get("id", "")), "status": "planned"} for task in bootstrap_task_specs]
+
+
+def _bootstrap_summary(bootstrap_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": str(entry.get("id", "")),
+            "status": "ok" if entry.get("result") in {"ready", "completed", "dry-run"} else "pending",
+        }
+        for entry in bootstrap_results
+    ]
+
+
+def _up_env_ready_error(
+    exc: RuntimeError,
+    ordered_services: list[dict[str, Any]],
+    client_id: str,
+    profile: str,
+    requested_mode: str,
+    effective_mode: str,
+) -> tuple[int, dict[str, Any]]:
+    payload = _up_payload_base(client_id, profile, requested_mode, effective_mode)
+    payload.update(local_runtime_error(
+        LOCAL_RUNTIME_ENV_OUTPUT_MISSING,
+        str(exc),
+        recoverable=True,
+        blocked_services=[str(service.get("id", "")) for service in ordered_services],
+        next_action=f"manage.py focus --client {client_id} --profile {profile}",
+    ))
+    payload["error"]["requested_mode"] = requested_mode
+    return EXIT_ERROR, payload
+
+
+def _up_bootstrap_error(
+    exc: RuntimeError,
+    bootstrap_task_specs: list[dict[str, Any]],
+    ordered_services: list[dict[str, Any]],
+    client_id: str,
+    profile: str,
+    requested_mode: str,
+    effective_mode: str,
+) -> tuple[int, dict[str, Any]]:
+    payload = _up_payload_base(
+        client_id,
+        profile,
+        requested_mode,
+        effective_mode,
+        bootstrap_tasks=_planned_bootstrap_summary(bootstrap_task_specs),
+    )
+    payload.update(local_runtime_error(
+        LOCAL_RUNTIME_START_BLOCKED,
+        f"Bootstrap task failed: {exc}",
+        recoverable=True,
+        blocked_services=[str(service.get("id", "")) for service in ordered_services],
+        next_action=f"manage.py status --client {client_id} --profile {profile}",
+    ))
+    payload["error"]["requested_mode"] = requested_mode
+    return EXIT_ERROR, payload
+
+
+def _up_bootstrap(
+    model: dict[str, Any],
+    ordered_services: list[dict[str, Any]],
+    client_id: str,
+    profile: str,
+    requested_mode: str,
+    effective_mode: str,
+    dry_run: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], tuple[int, dict[str, Any]] | None]:
+    bootstrap_task_specs = resolve_tasks_for_services(model, ordered_services)
+    if bootstrap_task_specs and not dry_run:
+        try:
+            ensure_required_env_files_ready(
+                select_env_files_for_tasks(model, bootstrap_task_specs)
+                + select_env_files_for_services(model, ordered_services)
+            )
+        except RuntimeError as exc:
+            return [], [], _up_env_ready_error(
+                exc, ordered_services, client_id, profile, requested_mode, effective_mode,
+            )
+    try:
+        bootstrap_results = run_tasks(model, bootstrap_task_specs, dry_run=dry_run, mode=effective_mode)
+    except RuntimeError as exc:
+        return bootstrap_task_specs, [], _up_bootstrap_error(
+            exc, bootstrap_task_specs, ordered_services, client_id, profile, requested_mode, effective_mode,
+        )
+    return bootstrap_task_specs, _bootstrap_summary(bootstrap_results), None
+
+
+def _up_dry_run_payload(
+    client_id: str,
+    profile: str,
+    requested_mode: str,
+    effective_mode: str,
+    ordered_services: list[dict[str, Any]],
+    bootstrap_task_specs: list[dict[str, Any]],
+    bootstrap_summary: list[dict[str, Any]],
+) -> dict[str, Any]:
+    planned_services = [
+        {
+            "id": str(service.get("id", "")),
+            "state": "planned",
+            "mode": effective_mode,
+            "command": resolve_service_mode_command(service, effective_mode),
+        }
+        for service in ordered_services
+    ]
+    payload = _up_payload_base(
+        client_id,
+        profile,
+        requested_mode,
+        effective_mode,
+        bootstrap_tasks=bootstrap_summary or _planned_bootstrap_summary(bootstrap_task_specs),
+        services=planned_services,
+    )
+    payload["dry_run"] = True
+    return payload
+
+
+def _up_service_state(entry: dict[str, Any]) -> tuple[str, bool]:
+    result_val = entry.get("result", "unknown")
+    if result_val in {"started", "already-running"}:
+        return "running", False
+    if result_val == "timeout":
+        return "starting", True
+    if result_val == "failed":
+        return "failed", True
+    return result_val, False
+
+
+def _up_services_payload(started: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    services_payload: list[dict[str, Any]] = []
+    has_failure = False
+    for entry in started:
+        enriched = dict(entry)
+        enriched["state"], entry_failed = _up_service_state(entry)
+        has_failure = has_failure or entry_failed
+        services_payload.append(enriched)
+    return services_payload, has_failure
+
+
+def _up_failed_service_ids(started: list[dict[str, Any]]) -> list[str]:
+    return [str(entry.get("id", "")) for entry in started if entry.get("result") in {"failed", "timeout"}]
+
+
+def _up_start_result(
+    *,
+    model: dict[str, Any],
+    ordered_services: list[dict[str, Any]],
+    client_id: str,
+    profile: str,
+    requested_mode: str,
+    effective_mode: str,
+    wait_seconds: float,
+    bootstrap_summary: list[dict[str, Any]],
+) -> tuple[int, dict[str, Any]]:
+    started = start_services(
+        model,
+        ordered_services,
+        dry_run=False,
+        wait_seconds=wait_seconds,
+        mode=effective_mode,
+    )
+    services_payload, has_failure = _up_services_payload(started)
+    payload = _up_payload_base(
+        client_id,
+        profile,
+        requested_mode,
+        effective_mode,
+        bootstrap_tasks=bootstrap_summary,
+        services=services_payload,
+    )
+    if not has_failure:
+        return EXIT_OK, payload
+    failed_ids = _up_failed_service_ids(started)
+    payload.update(local_runtime_error(
+        LOCAL_RUNTIME_START_BLOCKED,
+        f"Some services did not become healthy: {', '.join(failed_ids)}",
+        recoverable=True,
+        blocked_services=failed_ids,
+        next_action=f"manage.py status --client {client_id} --profile {profile}",
+    ))
+    payload["error"]["requested_mode"] = requested_mode
+    return EXIT_ERROR, payload
+
+
 def run_up(
     *,
     model: dict[str, Any],
@@ -2635,349 +3829,45 @@ def run_up(
     dry_run: bool = False,
     wait_seconds: float = 0.0,
 ) -> tuple[int, dict[str, Any]]:
-    """Mode-aware up orchestration for local_runtime_core_cutover (WG-005).
-
-    Implements the contract from shared.md:428-469 and backend.md:25-35:
-
-      1. Reconcile bridge/env readiness via the WG-004 helper.  Any blocked
-         result is returned as-is with the LOCAL_RUNTIME_* code that
-         reconciliation produced -- NO service mutation happens.
-      2. Resolve the requested service graph (topologically sorted, with
-         every declared dependency included).
-      3. Validate the effective mode against every requested service BEFORE
-         any mutation.  Mixed support rejects the whole request with
-         LOCAL_RUNTIME_MODE_UNSUPPORTED (backend.md:33-35, Rule 2).
-      4. Run bootstrap tasks in declared dependency order.
-      5. Start services via their mode-specific declared commands, gating
-         each downstream service on the upstream health check.  Any failure
-         returns LOCAL_RUNTIME_START_BLOCKED with the full list of services
-         that never started.
-
-    Returns a ``(exit_code, payload)`` tuple.  The payload shape matches
-    shared.md:435-469 on both happy and blocked paths.
-    """
+    """Mode-aware up orchestration for local runtime services."""
     effective_mode = (requested_mode or "").strip() or "reuse"
-    if effective_mode not in LOCAL_RUNTIME_START_MODES:
-        supported = ", ".join(LOCAL_RUNTIME_START_MODES)
-        payload: dict[str, Any] = {
-            "client_id": client_id,
-            "profile": profile,
-            "requested_mode": requested_mode,
-            "effective_mode": effective_mode,
-            "bootstrap_tasks": [],
-            "services": [],
-        }
-        payload.update(
-            local_runtime_error(
-                LOCAL_RUNTIME_MODE_UNSUPPORTED,
-                (
-                    f"Unsupported --mode value {effective_mode!r}. "
-                    f"Supported modes: {supported}."
-                ),
-                recoverable=True,
-                next_action=f"Re-run with --mode <{'|'.join(LOCAL_RUNTIME_START_MODES)}>.",
-            )
-        )
-        payload["error"]["requested_mode"] = requested_mode
-        return EXIT_ERROR, payload
-
-    # (0) WG-006: parity-ledger enforcement.  Before ANY mutation -- even
-    # bridge reconciliation -- reject direct --service requests that the
-    # parity ledger classifies as deferred/bridge-only/external.  This
-    # closes US-4 so operators cannot silently fall into an inconsistent
-    # state when asking for an uncovered surface (flows.md Flow 5,
-    # backend.md:159-169).
-    if service_filter:
-        classification = classify_requested_surfaces(model, service_filter)
-        if classification["deferred"]:
-            surface_id, item = classification["deferred"][0]
-            deferred_payload: dict[str, Any] = {
-                "client_id": client_id,
-                "profile": profile,
-                "requested_mode": requested_mode,
-                "effective_mode": effective_mode,
-                "bootstrap_tasks": [],
-                "services": [],
-            }
-            deferred_payload.update(
-                build_local_runtime_service_deferred_error(
-                    item,
-                    client_id=client_id,
-                    profile=profile,
-                    requested_mode=requested_mode,
-                    surface_id=surface_id,
-                )
-            )
-            return EXIT_ERROR, deferred_payload
-        if classification["unknown"]:
-            unknown_ids = list(classification["unknown"])
-            available_services = sorted(
-                str(service.get("id", "")).strip()
-                for service in model.get("services") or []
-                if str(service.get("id", "")).strip()
-            )
-            message = f"Unknown service id(s): {', '.join(unknown_ids)}."
-            if available_services:
-                message += f" Available services: {', '.join(available_services)}."
-            payload = {
-                "client_id": client_id,
-                "profile": profile,
-                "requested_mode": requested_mode,
-                "effective_mode": effective_mode,
-                "bootstrap_tasks": [],
-                "services": [],
-            }
-            payload.update(
-                structured_error(
-                    message,
-                    error_type="unknown_service",
-                    recoverable=True,
-                    recovery_hint=(
-                        "Use a declared runtime service id or inspect the "
-                        "parity ledger for deferred legacy surfaces."
-                    ),
-                    next_actions=[
-                        (
-                            f"manage.py render --client {client_id} "
-                            f"--profile {profile} --format json"
-                        ),
-                    ],
-                )
-            )
-            payload["error"]["requested_mode"] = requested_mode
-            payload["error"]["blocked_services"] = unknown_ids
-            payload["error"]["available_services"] = available_services
-            return EXIT_ERROR, payload
-
-    # (1) Reconcile bridge/env before any mutation (backend.md Rule 3 + 4).
-    overlay_host_path = local_runtime_overlay_path(model, client_id)
-    reconcile_result = reconcile_local_runtime_env(
-        model,
-        profile,
-        overlay_path=overlay_host_path,
-        dry_run=dry_run,
+    possible_error = _up_unsupported_mode(client_id, profile, requested_mode, effective_mode)
+    if possible_error is not None:
+        return possible_error
+    possible_error = _up_surface_filter_error(
+        model, client_id, profile, requested_mode, effective_mode, service_filter,
     )
-    if reconcile_result.get("status") == "blocked":
-        payload: dict[str, Any] = {
-            "client_id": client_id,
-            "profile": profile,
-            "requested_mode": requested_mode,
-            "effective_mode": effective_mode,
-            "bootstrap_tasks": [],
-            "services": [],
-        }
-        err = reconcile_result.get("error") or {}
-        payload["error"] = dict(err)
-        payload["error"].setdefault("requested_mode", requested_mode)
-        payload["error"].setdefault("blocked_services", [])
-        return EXIT_ERROR, payload
+    if possible_error is not None:
+        return possible_error
+    possible_error = _up_reconcile_error(model, client_id, profile, requested_mode, effective_mode, dry_run)
+    if possible_error is not None:
+        return possible_error
 
-    # (2) Resolve the requested service graph.
-    filter_ids = [s for s in (service_filter or []) if s]
-    if filter_ids:
-        requested = select_services(model, filter_ids)
-    else:
-        requested = select_local_runtime_services(model, profile)
-    ordered_services = resolve_services_for_start(
-        model, requested, mode=effective_mode,
-    )
-
+    ordered_services = _up_ordered_services(model, profile, service_filter, effective_mode)
     if not ordered_services:
-        payload = {
-            "client_id": client_id,
-            "profile": profile,
-            "requested_mode": requested_mode,
-            "effective_mode": effective_mode,
-            "bootstrap_tasks": [],
-            "services": [],
-        }
-        payload.update(local_runtime_error(
-            LOCAL_RUNTIME_PROFILE_UNKNOWN,
-            f"Profile {profile!r} has no declared local-runtime services.",
-            recoverable=False,
-        ))
-        payload["error"]["requested_mode"] = requested_mode
-        return EXIT_ERROR, payload
+        return _up_no_services_error(client_id, profile, requested_mode, effective_mode)
 
-    # (3) Pre-mutation mode validation (backend.md Rule 2 / shared.md US-2).
-    unsupported = validate_services_support_mode(ordered_services, effective_mode)
-    if unsupported:
-        payload = {
-            "client_id": client_id,
-            "profile": profile,
-            "requested_mode": requested_mode,
-            "effective_mode": effective_mode,
-            "bootstrap_tasks": [],
-            "services": [],
-        }
-        payload.update(local_runtime_error(
-            LOCAL_RUNTIME_MODE_UNSUPPORTED,
-            (
-                f"Mode {effective_mode!r} is not supported by all requested "
-                f"services: {', '.join(unsupported)}"
-            ),
-            recoverable=True,
-            blocked_services=unsupported,
-            next_action=(
-                f"Re-run with a mode declared by every service in {profile}."
-            ),
-        ))
-        payload["error"]["requested_mode"] = requested_mode
-        return EXIT_ERROR, payload
+    possible_error = _up_mode_support_error(ordered_services, client_id, profile, requested_mode, effective_mode)
+    if possible_error is not None:
+        return possible_error
 
-    # (4) Bootstrap tasks (env bridge + repo-specific DB bootstraps, etc.) in declared
-    #     dependency order (shared.md:116-137, flows.md:69-89).
-    bootstrap_task_specs = resolve_tasks_for_services(model, ordered_services)
-    bootstrap_results: list[dict[str, Any]] = []
-    if bootstrap_task_specs and not dry_run:
-        try:
-            ensure_required_env_files_ready(
-                select_env_files_for_tasks(model, bootstrap_task_specs)
-                + select_env_files_for_services(model, ordered_services)
-            )
-        except RuntimeError as exc:
-            payload = {
-                "client_id": client_id,
-                "profile": profile,
-                "requested_mode": requested_mode,
-                "effective_mode": effective_mode,
-                "bootstrap_tasks": [],
-                "services": [],
-            }
-            payload.update(local_runtime_error(
-                LOCAL_RUNTIME_ENV_OUTPUT_MISSING,
-                str(exc),
-                recoverable=True,
-                blocked_services=[str(s.get("id", "")) for s in ordered_services],
-                next_action=(
-                    f"manage.py focus --client {client_id} --profile {profile}"
-                ),
-            ))
-            payload["error"]["requested_mode"] = requested_mode
-            return EXIT_ERROR, payload
-
-    try:
-        bootstrap_results = run_tasks(
-            model,
-            bootstrap_task_specs,
-            dry_run=dry_run,
-            mode=effective_mode,
-        )
-    except RuntimeError as exc:
-        payload = {
-            "client_id": client_id,
-            "profile": profile,
-            "requested_mode": requested_mode,
-            "effective_mode": effective_mode,
-            "bootstrap_tasks": [
-                {"id": str(t.get("id", "")), "status": "planned"}
-                for t in bootstrap_task_specs
-            ],
-            "services": [],
-        }
-        payload.update(local_runtime_error(
-            LOCAL_RUNTIME_START_BLOCKED,
-            f"Bootstrap task failed: {exc}",
-            recoverable=True,
-            blocked_services=[str(s.get("id", "")) for s in ordered_services],
-            next_action=(
-                f"manage.py status --client {client_id} --profile {profile}"
-            ),
-        ))
-        payload["error"]["requested_mode"] = requested_mode
-        return EXIT_ERROR, payload
-
-    bootstrap_summary = [
-        {
-            "id": str(entry.get("id", "")),
-            "status": "ok"
-            if entry.get("result") in {"ready", "completed", "dry-run"}
-            else "pending",
-        }
-        for entry in bootstrap_results
-    ]
-
-    # (5) Start the services in topological order.  Dry-run short-circuits
-    #     before any mutation and returns the planned launch order.
-    if dry_run:
-        planned_services = []
-        for service in ordered_services:
-            svc_id = str(service.get("id", ""))
-            mode_command = resolve_service_mode_command(service, effective_mode)
-            planned_services.append({
-                "id": svc_id,
-                "state": "planned",
-                "mode": effective_mode,
-                "command": mode_command,
-            })
-        payload = {
-            "client_id": client_id,
-            "profile": profile,
-            "requested_mode": requested_mode,
-            "effective_mode": effective_mode,
-            "dry_run": True,
-            "bootstrap_tasks": bootstrap_summary
-            or [
-                {"id": str(t.get("id", "")), "status": "planned"}
-                for t in bootstrap_task_specs
-            ],
-            "services": planned_services,
-        }
-        return EXIT_OK, payload
-
-    started = start_services(
-        model,
-        ordered_services,
-        dry_run=False,
-        wait_seconds=wait_seconds,
-        mode=effective_mode,
+    bootstrap_task_specs, bootstrap_summary, possible_error = _up_bootstrap(
+        model, ordered_services, client_id, profile, requested_mode, effective_mode, dry_run,
     )
-
-    # Merge the shared.md:435-469 ``state`` field onto the raw start_services
-    # entries so legacy ``result``/``pid``/``log_file`` keys are preserved
-    # for existing lifecycle tests (WG-006).
-    services_payload = []
-    has_failure = False
-    for entry in started:
-        enriched = dict(entry)
-        result_val = entry.get("result", "unknown")
-        if result_val in {"started", "already-running"}:
-            enriched["state"] = "running"
-        elif result_val == "timeout":
-            enriched["state"] = "starting"
-            has_failure = True
-        elif result_val == "failed":
-            enriched["state"] = "failed"
-            has_failure = True
-        else:
-            enriched["state"] = result_val
-        services_payload.append(enriched)
-
-    payload = {
-        "client_id": client_id,
-        "profile": profile,
-        "requested_mode": requested_mode,
-        "effective_mode": effective_mode,
-        "bootstrap_tasks": bootstrap_summary,
-        "services": services_payload,
-    }
-
-    if has_failure:
-        failed_ids = [
-            str(e.get("id", ""))
-            for e in started
-            if e.get("result") in {"failed", "timeout"}
-        ]
-        payload.update(local_runtime_error(
-            LOCAL_RUNTIME_START_BLOCKED,
-            f"Some services did not become healthy: {', '.join(failed_ids)}",
-            recoverable=True,
-            blocked_services=failed_ids,
-            next_action=(
-                f"manage.py status --client {client_id} --profile {profile}"
-            ),
-        ))
-        payload["error"]["requested_mode"] = requested_mode
-        return EXIT_ERROR, payload
-
-    return EXIT_OK, payload
+    if possible_error is not None:
+        return possible_error
+    if dry_run:
+        return EXIT_OK, _up_dry_run_payload(
+            client_id, profile, requested_mode, effective_mode,
+            ordered_services, bootstrap_task_specs, bootstrap_summary,
+        )
+    return _up_start_result(
+        model=model,
+        ordered_services=ordered_services,
+        client_id=client_id,
+        profile=profile,
+        requested_mode=requested_mode,
+        effective_mode=effective_mode,
+        wait_seconds=wait_seconds,
+        bootstrap_summary=bootstrap_summary,
+    )

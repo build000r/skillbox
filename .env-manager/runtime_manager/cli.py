@@ -2332,6 +2332,64 @@ _MODEL_DISPATCH: dict[str, Callable[[argparse.Namespace, Path, dict[str, Any], s
 }
 
 
+def _emit_mode_error(args: argparse.Namespace, mode_error: dict[str, Any]) -> int:
+    if getattr(args, "format", "text") == "json":
+        emit_json(mode_error)
+    else:
+        print_local_runtime_error_text(mode_error)
+    return EXIT_ERROR
+
+
+def _emit_main_exception(args: argparse.Namespace, exc: Exception) -> int:
+    if isinstance(exc, RuntimeError):
+        payload_error = exc
+    else:
+        payload_error = RuntimeError(f"Unexpected error: {exc}")
+    if args.format == "json":
+        emit_json(classify_error(payload_error, args.command))
+    elif isinstance(exc, RuntimeError):
+        print(str(exc), file=sys.stderr)
+    else:
+        import traceback
+        traceback.print_exc()
+    return EXIT_ERROR
+
+
+def _active_clients_for_args(args: argparse.Namespace, model: dict[str, Any]) -> list[str]:
+    requested_clients = getattr(args, "client", [])
+    active_clients = normalize_active_clients(model, requested_clients)
+    if args.command not in {"skills", "skill", "overlay"} or requested_clients:
+        return active_clients
+    skill_cwd = Path(getattr(args, "cwd", None) or os.getcwd())
+    matches = matched_skill_clients(model, skill_cwd)
+    if not matches:
+        return active_clients
+    return normalize_active_clients(model, [matches[0]["id"]])
+
+
+def _filtered_model_for_args(args: argparse.Namespace, root_dir: Path) -> dict[str, Any]:
+    model = build_runtime_model(root_dir)
+    active_profiles = normalize_active_profiles(getattr(args, "profile", []))
+    return filter_model(model, active_profiles, _active_clients_for_args(args, model))
+
+
+def _dispatch_model_command(
+    args: argparse.Namespace,
+    root_dir: Path,
+    resolved_mode: str,
+    model_handler: Callable[[argparse.Namespace, Path, dict[str, Any], str], int],
+) -> int:
+    try:
+        model = _filtered_model_for_args(args, root_dir)
+        raw_service_ids = [s for s in (getattr(args, "service", []) or []) if s]
+        deferred_exit = _check_logs_deferred_surfaces(args, model, raw_service_ids)
+        if deferred_exit is not None:
+            return deferred_exit
+        return model_handler(args, root_dir, model, resolved_mode)
+    except Exception as exc:
+        return _emit_main_exception(args, exc)
+
+
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
@@ -2340,11 +2398,7 @@ def main() -> int:
 
     resolved_mode, mode_error = _resolve_local_runtime_mode(args)
     if mode_error is not None:
-        if getattr(args, "format", "text") == "json":
-            emit_json(mode_error)
-        else:
-            print_local_runtime_error_text(mode_error)
-        return EXIT_ERROR
+        return _emit_mode_error(args, mode_error)
 
     early_handler = _EARLY_DISPATCH.get(args.command)
     if early_handler is not None:
@@ -2354,35 +2408,4 @@ def main() -> int:
     if model_handler is None:
         print(f"Unknown command: {args.command}", file=sys.stderr)
         return EXIT_ERROR
-
-    try:
-        model = build_runtime_model(root_dir)
-        active_profiles = normalize_active_profiles(getattr(args, "profile", []))
-        requested_clients = getattr(args, "client", [])
-        active_clients = normalize_active_clients(model, requested_clients)
-        if args.command in {"skills", "skill", "overlay"} and not requested_clients:
-            skill_cwd = Path(getattr(args, "cwd", None) or os.getcwd())
-            matches = matched_skill_clients(model, skill_cwd)
-            if matches:
-                active_clients = normalize_active_clients(model, [matches[0]["id"]])
-        model = filter_model(model, active_profiles, active_clients)
-
-        raw_service_ids = [s for s in (getattr(args, "service", []) or []) if s]
-        deferred_exit = _check_logs_deferred_surfaces(args, model, raw_service_ids)
-        if deferred_exit is not None:
-            return deferred_exit
-
-        return model_handler(args, root_dir, model, resolved_mode)
-    except RuntimeError as exc:
-        if args.format == "json":
-            emit_json(classify_error(exc, args.command))
-        else:
-            print(str(exc), file=sys.stderr)
-        return EXIT_ERROR
-    except Exception as exc:
-        if args.format == "json":
-            emit_json(classify_error(RuntimeError(f"Unexpected error: {exc}"), args.command))
-        else:
-            import traceback
-            traceback.print_exc()
-        return EXIT_ERROR
+    return _dispatch_model_command(args, root_dir, resolved_mode, model_handler)

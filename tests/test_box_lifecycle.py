@@ -17,6 +17,198 @@ BOX_MODULE = SourceFileLoader(
 
 
 class BoxLifecycleTests(unittest.TestCase):
+    def test_cmd_upgrade_covers_dry_run_success_and_failure_branches(self) -> None:
+        profile = BOX_MODULE.BoxProfile(
+            id="dev-small",
+            storage=BOX_MODULE.BoxProfileStorage(
+                provider="digitalocean",
+                mount_path="/skillbox-state",
+                filesystem="ext4",
+                required=True,
+                min_free_gb=10.0,
+            ),
+        )
+        box = BOX_MODULE.Box(
+            id="box-1",
+            profile="dev-small",
+            state="ready",
+            droplet_ip="1.2.3.4",
+            tailscale_ip="100.64.0.8",
+            ssh_user="skillbox",
+            storage_provider="digitalocean",
+            state_root="/skillbox-state",
+            storage_filesystem="ext4",
+            storage_required=True,
+            storage_min_free_gb=10.0,
+        )
+        release = BOX_MODULE.DeployRelease(
+            manifest_path=Path("/deploy.json"),
+            client_id="box-1",
+            source_commit="abc123def4567890",
+            payload_tree_sha256="1" * 64,
+            archive_path=Path("/tmp/skillbox.tar.gz"),
+            archive_sha256="2" * 64,
+            active_profiles=["core", "swimmers"],
+        )
+
+        emitted: list[dict[str, object]] = []
+        with (
+            mock.patch.object(BOX_MODULE, "load_inventory", return_value=[box]),
+            mock.patch.object(BOX_MODULE, "load_deploy_manifest", return_value=release),
+            mock.patch.object(BOX_MODULE, "load_profile", return_value=profile),
+            mock.patch.object(BOX_MODULE, "emit_json", side_effect=emitted.append),
+        ):
+            self.assertEqual(
+                BOX_MODULE.cmd_upgrade(
+                    "box-1",
+                    deploy_manifest="/deploy.json",
+                    dry_run=True,
+                    fmt="json",
+                ),
+                BOX_MODULE.EXIT_OK,
+            )
+        self.assertTrue(emitted[-1]["dry_run"])
+        self.assertEqual([step["status"] for step in emitted[-1]["steps"]], ["skip", "skip", "skip", "skip"])
+
+        with (
+            mock.patch.object(BOX_MODULE, "load_inventory", return_value=[box]),
+            mock.patch.object(BOX_MODULE, "load_deploy_manifest", return_value=release),
+            mock.patch.object(BOX_MODULE, "load_profile", return_value=profile),
+            mock.patch.object(BOX_MODULE, "_resolve_existing_box_target", return_value="100.64.0.8"),
+            mock.patch.object(
+                BOX_MODULE,
+                "scp_file",
+                return_value=subprocess.CompletedProcess(["scp"], 0, stdout="", stderr=""),
+            ) as scp_file,
+            mock.patch.object(BOX_MODULE, "_patch_remote_runtime_contract", return_value={"env_updates": ["A"]}),
+            mock.patch.object(
+                BOX_MODULE,
+                "ssh_script",
+                return_value=subprocess.CompletedProcess(["ssh"], 0, stdout="upgraded", stderr=""),
+            ) as ssh_script,
+            mock.patch.object(
+                BOX_MODULE,
+                "ssh_cmd",
+                return_value=subprocess.CompletedProcess(["ssh"], 0, stdout='{"Service":"workspace"}', stderr=""),
+            ),
+            mock.patch.object(BOX_MODULE, "save_inventory") as save_inventory,
+            mock.patch.object(BOX_MODULE, "emit_json", side_effect=emitted.append),
+        ):
+            self.assertEqual(
+                BOX_MODULE.cmd_upgrade(
+                    "box-1",
+                    deploy_manifest="/deploy.json",
+                    dry_run=False,
+                    fmt="json",
+                ),
+                BOX_MODULE.EXIT_OK,
+            )
+        scp_file.assert_called_once()
+        self.assertIn("--archive", ssh_script.call_args.kwargs["script_args"])
+        save_inventory.assert_called_once()
+        self.assertFalse(emitted[-1]["dry_run"])
+        self.assertEqual(emitted[-1]["steps"][-1]["status"], "ok")
+
+        failure_cases = [
+            (
+                "missing",
+                {"load_inventory": []},
+                "not_found",
+            ),
+            (
+                "bad-state",
+                {"load_inventory": [BOX_MODULE.Box(id="box-1", profile="dev-small", state="creating")]},
+                "invalid_state",
+            ),
+            (
+                "bad-manifest",
+                {"load_deploy_manifest": RuntimeError("bad manifest")},
+                "deploy_manifest_invalid",
+            ),
+            (
+                "bad-profile",
+                {"load_profile": RuntimeError("bad profile")},
+                "profile_not_found",
+            ),
+            (
+                "ssh-missing",
+                {"resolve_target": RuntimeError("no ssh")},
+                "ssh_unreachable",
+            ),
+            (
+                "upload-failed",
+                {"scp_file": subprocess.CompletedProcess(["scp"], 1, stdout="", stderr="no upload")},
+                "upload_failed",
+            ),
+            (
+                "contract-failed",
+                {"patch_contract": RuntimeError("contract bad")},
+                "remote_contract_failed",
+            ),
+            (
+                "upgrade-failed",
+                {"ssh_script": subprocess.CompletedProcess(["ssh"], 1, stdout="", stderr="upgrade bad")},
+                "upgrade_failed",
+            ),
+            (
+                "verify-failed",
+                {"ssh_cmd": subprocess.CompletedProcess(["ssh"], 0, stdout='{"Service":"api"}', stderr="")},
+                "verify_failed",
+            ),
+        ]
+
+        for _label, overrides, error_type in failure_cases:
+            emitted.clear()
+            inventory = overrides.get("load_inventory", [box])
+            load_deploy_manifest = overrides.get("load_deploy_manifest", release)
+            load_profile = overrides.get("load_profile", profile)
+            resolve_target = overrides.get("resolve_target", "100.64.0.8")
+            scp_result = overrides.get("scp_file", subprocess.CompletedProcess(["scp"], 0, stdout="", stderr=""))
+            patch_contract = overrides.get("patch_contract", {"env_updates": ["A"]})
+            ssh_script_result = overrides.get("ssh_script", subprocess.CompletedProcess(["ssh"], 0, stdout="ok", stderr=""))
+            ssh_cmd_result = overrides.get("ssh_cmd", subprocess.CompletedProcess(["ssh"], 0, stdout='{"Service":"workspace"}', stderr=""))
+            with (
+                mock.patch.object(BOX_MODULE, "load_inventory", return_value=inventory),
+                mock.patch.object(
+                    BOX_MODULE,
+                    "load_deploy_manifest",
+                    side_effect=load_deploy_manifest if isinstance(load_deploy_manifest, RuntimeError) else None,
+                    return_value=None if isinstance(load_deploy_manifest, RuntimeError) else load_deploy_manifest,
+                ),
+                mock.patch.object(
+                    BOX_MODULE,
+                    "load_profile",
+                    side_effect=load_profile if isinstance(load_profile, RuntimeError) else None,
+                    return_value=None if isinstance(load_profile, RuntimeError) else load_profile,
+                ),
+                mock.patch.object(
+                    BOX_MODULE,
+                    "_resolve_existing_box_target",
+                    side_effect=resolve_target if isinstance(resolve_target, RuntimeError) else None,
+                    return_value=None if isinstance(resolve_target, RuntimeError) else resolve_target,
+                ),
+                mock.patch.object(BOX_MODULE, "scp_file", return_value=scp_result),
+                mock.patch.object(
+                    BOX_MODULE,
+                    "_patch_remote_runtime_contract",
+                    side_effect=patch_contract if isinstance(patch_contract, RuntimeError) else None,
+                    return_value=None if isinstance(patch_contract, RuntimeError) else patch_contract,
+                ),
+                mock.patch.object(BOX_MODULE, "ssh_script", return_value=ssh_script_result),
+                mock.patch.object(BOX_MODULE, "ssh_cmd", return_value=ssh_cmd_result),
+                mock.patch.object(BOX_MODULE, "emit_json", side_effect=emitted.append),
+            ):
+                self.assertEqual(
+                    BOX_MODULE.cmd_upgrade(
+                        "box-1",
+                        deploy_manifest="/deploy.json",
+                        dry_run=False,
+                        fmt="json",
+                    ),
+                    BOX_MODULE.EXIT_ERROR,
+                )
+            self.assertEqual(emitted[-1]["error"]["type"], error_type)
+
     def test_cmd_up_successful_run_records_steps(self) -> None:
         profile = BOX_MODULE.BoxProfile(
             id="dev-small",

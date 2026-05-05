@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +18,54 @@ from runtime_manager import operator_booking as MODULE  # noqa: E402
 
 
 class OperatorBookingTests(unittest.TestCase):
+    def test_http_json_covers_success_http_error_and_network_error(self) -> None:
+        class Response:
+            def __init__(self, body: bytes) -> None:
+                self.body = body
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return self.body
+
+        with mock.patch.object(MODULE.urllib.request, "urlopen", return_value=Response(b'{"ok": true}')) as urlopen:
+            self.assertEqual(
+                MODULE._http_json(  # noqa: SLF001
+                    "http://localhost/api",
+                    method="POST",
+                    headers={"X-Test": "yes"},
+                    body={"hello": "world"},
+                    timeout=3,
+                ),
+                {"ok": True},
+            )
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(request.data, b'{"hello": "world"}')
+
+        http_error = MODULE.urllib.error.HTTPError(
+            "http://localhost/api",
+            429,
+            "Too Many Requests",
+            hdrs={},
+            fp=io.BytesIO(b'{"error": {"message": "rate limited"}}'),
+        )
+        with mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=http_error):
+            with self.assertRaises(MODULE.OperatorBookingError) as ctx:
+                MODULE._http_json("http://localhost/api", method="GET", headers={})  # noqa: SLF001
+        self.assertEqual(ctx.exception.error_type, "operator_booking_http_error")
+        self.assertEqual(str(ctx.exception), "rate limited")
+        self.assertEqual(ctx.exception.data["status"], 429)
+
+        with mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=OSError("offline")):
+            with self.assertRaises(MODULE.OperatorBookingError) as ctx:
+                MODULE._http_json("http://localhost/api", method="GET", headers={})  # noqa: SLF001
+        self.assertEqual(ctx.exception.error_type, "operator_booking_network_error")
+
     def test_availability_uses_overlay_endpoint_and_publishable_key_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             model = self._model(tmpdir)

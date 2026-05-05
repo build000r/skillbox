@@ -445,6 +445,168 @@ def _open_selected_mmdx(
     }
 
 
+def _mmdx_query_context(
+    cwd: Path | None,
+    query_parts: list[str] | tuple[str, ...] | None,
+    limit: int,
+) -> tuple[Path, list[str], str, int]:
+    resolved_cwd = (cwd or Path(os.environ.get("PWD") or os.getcwd())).expanduser().resolve(strict=False)
+    variants = _query_variants(query_parts)
+    query = variants[0] if variants else ""
+    effective_limit = max(1, int(limit or MMDX_DEFAULT_LIMIT))
+    return resolved_cwd, variants, query, effective_limit
+
+
+def _mmdx_roots_for_query(
+    resolved_cwd: Path,
+    variants: list[str],
+    search_roots: list[str] | tuple[str, ...] | None,
+) -> tuple[Path | None, Path | None, list[Path]]:
+    exact = _candidate_from_exact_query(resolved_cwd, variants)
+    directory = None if exact else _directory_from_query(resolved_cwd, variants)
+    roots = [directory] if directory else _default_search_roots(resolved_cwd, search_roots)
+    return exact, directory, [root for root in roots if root.is_dir()]
+
+
+def _ensure_mmdx_roots(roots: list[Path], exact: Path | None, resolved_cwd: Path) -> None:
+    if roots or exact is not None:
+        return
+    raise MmdxOpenError(
+        "mmdx_search_root_not_found",
+        f"No readable MMDX search roots for cwd {resolved_cwd}.",
+        recoverable=True,
+        recovery_hint="Pass --cwd or --search-root pointing at a repo or directory that contains .mmdx files.",
+        next_actions=["mmdx --cwd \"$PWD\" --no-open --format json"],
+        data={"cwd": str(resolved_cwd)},
+    )
+
+
+def _mmdx_exact_match_payload(
+    exact: Path,
+    resolved_cwd: Path,
+    search_roots: list[str] | tuple[str, ...] | None,
+) -> dict[str, Any]:
+    exact_roots = _default_search_roots(resolved_cwd, search_roots)
+    selected = _candidate_payload(exact, resolved_cwd, exact_roots, score=1.5)
+    selected.pop("_mtime", None)
+    return selected
+
+
+def _mmdx_select_matches(
+    *,
+    exact: Path | None,
+    directory: Path | None,
+    roots: list[Path],
+    resolved_cwd: Path,
+    search_roots: list[str] | tuple[str, ...] | None,
+    query: str,
+    limit: int,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]], int, bool]:
+    if exact is not None:
+        selected = _mmdx_exact_match_payload(exact, resolved_cwd, search_roots)
+        return selected, [selected], 1, False
+
+    files, truncated = _iter_mmdx_files(roots)
+    matches = _rank_candidates(files, resolved_cwd, roots, "" if directory else query, limit=limit)
+    selected = matches[0] if query and matches else None
+    if selected is not None and directory is None and float(selected.get("score") or 0.0) < MMDX_MIN_MATCH_SCORE:
+        selected = None
+    return selected, matches, len(files), truncated
+
+
+def _raise_mmdx_no_match(
+    query: str,
+    *,
+    resolved_cwd: Path,
+    roots: list[Path],
+    matches: list[dict[str, Any]],
+) -> None:
+    if not query:
+        return
+    raise MmdxOpenError(
+        "mmdx_no_match",
+        f"No .mmdx or .mmd files matched {query!r}.",
+        recoverable=True,
+        recovery_hint="Run without a query to list recent diagrams, or pass --search-root for a wider directory.",
+        next_actions=["mmdx --no-open", "mmdx --search-root <dir> <query>"],
+        data={
+            "query": query,
+            "cwd": str(resolved_cwd),
+            "search_roots": [str(root) for root in roots],
+            "alternatives": matches[: min(3, len(matches))],
+        },
+    )
+
+
+def _mmdx_open_selection(
+    selected: dict[str, Any] | None,
+    *,
+    open_file: bool,
+    root_dir: Path,
+    tmux: bool,
+    tmux_submit: bool,
+    allow_parser_install: bool,
+    mmd_script: Path | None,
+) -> tuple[dict[str, Any] | None, str]:
+    if selected is None:
+        return None, "listed"
+    if not open_file:
+        return None, "resolved"
+    opened = _open_selected_mmdx(
+        selected,
+        root_dir=root_dir,
+        tmux=tmux,
+        tmux_submit=tmux_submit,
+        allow_parser_install=allow_parser_install,
+        mmd_script=mmd_script,
+    )
+    return opened, "opened"
+
+
+def _mmdx_next_actions(selected: dict[str, Any] | None) -> list[str]:
+    next_actions = ["mmdx --no-open"]
+    if selected is not None:
+        next_actions.insert(0, f"mmdx {selected['rel_path']} --no-open --format json")
+    return next_actions
+
+
+def _mmdx_payload(
+    *,
+    action: str,
+    query: str,
+    resolved_cwd: Path,
+    roots: list[Path],
+    scanned: int,
+    truncated: bool,
+    matches: list[dict[str, Any]],
+    selected: dict[str, Any] | None,
+    open_file: bool,
+    opened: dict[str, Any] | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "ok": True,
+        "action": action,
+        "query": query,
+        "cwd": str(resolved_cwd),
+        "search_roots": [str(root) for root in roots],
+        "scanned": scanned,
+        "truncated": truncated,
+        "returned": len(matches),
+        "selected": selected,
+        "matches": matches,
+        "open": bool(open_file),
+        "next_actions": _mmdx_next_actions(selected),
+    }
+    if opened is not None:
+        payload["viewer"] = {
+            "url": opened["url"],
+            "command": opened["command"],
+        }
+        if opened["stderr"]:
+            payload["viewer"]["stderr"] = opened["stderr"]
+    return payload
+
+
 def mmdx_open_payload(
     *,
     root_dir: Path = DEFAULT_ROOT_DIR,
@@ -458,142 +620,114 @@ def mmdx_open_payload(
     allow_parser_install: bool = False,
     mmd_script: Path | None = None,
 ) -> tuple[dict[str, Any], int]:
-    resolved_cwd = (cwd or Path(os.environ.get("PWD") or os.getcwd())).expanduser().resolve(strict=False)
-    variants = _query_variants(query_parts)
-    query = variants[0] if variants else ""
-    effective_limit = max(1, int(limit or MMDX_DEFAULT_LIMIT))
-
-    exact = _candidate_from_exact_query(resolved_cwd, variants)
-    directory = None if exact else _directory_from_query(resolved_cwd, variants)
-    roots = [directory] if directory else _default_search_roots(resolved_cwd, search_roots)
-    roots = [root for root in roots if root.is_dir()]
-    if not roots and exact is None:
-        raise MmdxOpenError(
-            "mmdx_search_root_not_found",
-            f"No readable MMDX search roots for cwd {resolved_cwd}.",
-            recoverable=True,
-            recovery_hint="Pass --cwd or --search-root pointing at a repo or directory that contains .mmdx files.",
-            next_actions=["mmdx --cwd \"$PWD\" --no-open --format json"],
-            data={"cwd": str(resolved_cwd)},
-        )
-
-    selected: dict[str, Any] | None = None
-    matches: list[dict[str, Any]]
-    scanned = 0
-    truncated = False
-
-    if exact is not None:
-        exact_roots = _default_search_roots(resolved_cwd, search_roots)
-        selected = _candidate_payload(exact, resolved_cwd, exact_roots, score=1.5)
-        selected.pop("_mtime", None)
-        matches = [selected]
-        scanned = 1
-    else:
-        files, truncated = _iter_mmdx_files(roots)
-        scanned = len(files)
-        matches = _rank_candidates(files, resolved_cwd, roots, "" if directory else query, limit=effective_limit)
-        if query and matches:
-            selected = matches[0]
-            if directory is None and float(selected.get("score") or 0.0) < MMDX_MIN_MATCH_SCORE:
-                selected = None
-
-    if query and selected is None:
-        raise MmdxOpenError(
-            "mmdx_no_match",
-            f"No .mmdx or .mmd files matched {query!r}.",
-            recoverable=True,
-            recovery_hint="Run without a query to list recent diagrams, or pass --search-root for a wider directory.",
-            next_actions=["mmdx --no-open", "mmdx --search-root <dir> <query>"],
-            data={
-                "query": query,
-                "cwd": str(resolved_cwd),
-                "search_roots": [str(root) for root in roots],
-                "alternatives": matches[: min(3, len(matches))],
-            },
-        )
-
-    opened: dict[str, Any] | None = None
-    action = "listed"
-    if selected is not None:
-        action = "resolved"
-        if open_file:
-            opened = _open_selected_mmdx(
-                selected,
-                root_dir=root_dir,
-                tmux=tmux,
-                tmux_submit=tmux_submit,
-                allow_parser_install=allow_parser_install,
-                mmd_script=mmd_script,
-            )
-            action = "opened"
-
-    next_actions = [
-        "mmdx --no-open",
-    ]
-    if selected is not None:
-        next_actions.insert(0, f"mmdx {selected['rel_path']} --no-open --format json")
-
-    payload: dict[str, Any] = {
-        "ok": True,
-        "action": action,
-        "query": query,
-        "cwd": str(resolved_cwd),
-        "search_roots": [str(root) for root in roots],
-        "scanned": scanned,
-        "truncated": truncated,
-        "returned": len(matches),
-        "selected": selected,
-        "matches": matches,
-        "open": bool(open_file),
-        "next_actions": next_actions,
-    }
-    if opened is not None:
-        payload["viewer"] = {
-            "url": opened["url"],
-            "command": opened["command"],
-        }
-        if opened["stderr"]:
-            payload["viewer"]["stderr"] = opened["stderr"]
+    resolved_cwd, variants, query, effective_limit = _mmdx_query_context(cwd, query_parts, limit)
+    exact, directory, roots = _mmdx_roots_for_query(resolved_cwd, variants, search_roots)
+    _ensure_mmdx_roots(roots, exact, resolved_cwd)
+    selected, matches, scanned, truncated = _mmdx_select_matches(
+        exact=exact,
+        directory=directory,
+        roots=roots,
+        resolved_cwd=resolved_cwd,
+        search_roots=search_roots,
+        query=query,
+        limit=effective_limit,
+    )
+    if selected is None:
+        _raise_mmdx_no_match(query, resolved_cwd=resolved_cwd, roots=roots, matches=matches)
+    opened, action = _mmdx_open_selection(
+        selected,
+        open_file=open_file,
+        root_dir=root_dir,
+        tmux=tmux,
+        tmux_submit=tmux_submit,
+        allow_parser_install=allow_parser_install,
+        mmd_script=mmd_script,
+    )
+    payload = _mmdx_payload(
+        action=action,
+        query=query,
+        resolved_cwd=resolved_cwd,
+        roots=roots,
+        scanned=scanned,
+        truncated=truncated,
+        matches=matches,
+        selected=selected,
+        open_file=open_file,
+        opened=opened,
+    )
     return payload, EXIT_OK
 
 
-def print_mmdx_payload_text(payload: dict[str, Any]) -> None:
-    if "error" in payload:
-        error = payload["error"]
-        print(f"mmdx: error {error.get('type', 'mmdx_error')}", file=sys.stderr)
-        print(str(error.get("message") or ""), file=sys.stderr)
-        if error.get("recovery_hint"):
-            print(f"hint: {error['recovery_hint']}", file=sys.stderr)
-        for action in error.get("next_actions") or []:
-            print(f"next: {action}", file=sys.stderr)
-        return
+def _mmdx_error_text_lines(error: dict[str, Any]) -> list[str]:
+    lines = [
+        f"mmdx: error {error.get('type', 'mmdx_error')}",
+        str(error.get("message") or ""),
+    ]
+    if error.get("recovery_hint"):
+        lines.append(f"hint: {error['recovery_hint']}")
+    lines.extend(f"next: {action}" for action in error.get("next_actions") or [])
+    return lines
 
-    print(f"mmdx: {payload.get('action')}")
-    print(f"cwd: {payload.get('cwd')}")
+
+def _mmdx_selected_text_lines(payload: dict[str, Any]) -> list[str]:
     selected = payload.get("selected")
-    if selected:
-        print(f"path: {selected.get('rel_path')}")
-        print(f"score: {selected.get('score')}")
-    viewer = payload.get("viewer") or {}
-    if viewer.get("url"):
-        print(f"url: {viewer['url']}")
-    print(f"matches: {payload.get('returned', 0)} of {payload.get('scanned', 0)}")
-    if payload.get("truncated"):
-        print(f"truncated: true (scan limit {MMDX_MAX_SCAN_FILES})")
+    if not selected:
+        return []
+    return [
+        f"path: {selected.get('rel_path')}",
+        f"score: {selected.get('score')}",
+    ]
 
+
+def _mmdx_match_text_lines(payload: dict[str, Any]) -> list[str]:
+    selected = payload.get("selected")
     matches = payload.get("matches") or []
     if matches and not selected:
-        for match in matches:
-            print(f"  - {match.get('rel_path')} {match.get('modified_at')}")
-    elif len(matches) > 1:
-        print("alternates:")
+        return [
+            f"  - {match.get('rel_path')} {match.get('modified_at')}"
+            for match in matches
+        ]
+    if len(matches) > 1:
+        lines = ["alternates:"]
         for match in matches[1:4]:
             score = match.get("score")
             score_text = f" score={score}" if score is not None else ""
-            print(f"  - {match.get('rel_path')}{score_text}")
+            lines.append(f"  - {match.get('rel_path')}{score_text}")
+        return lines
+    return []
 
+
+def _mmdx_next_action_lines(payload: dict[str, Any]) -> list[str]:
     actions = payload.get("next_actions") or []
-    if actions:
-        print("next:")
-        for action in actions[:3]:
-            print(f"  {action}")
+    if not actions:
+        return []
+    lines = ["next:"]
+    lines.extend(f"  {action}" for action in actions[:3])
+    return lines
+
+
+def mmdx_payload_text_lines(payload: dict[str, Any]) -> tuple[list[str], list[str]]:
+    if "error" in payload:
+        return [], _mmdx_error_text_lines(payload["error"])
+    lines = [
+        f"mmdx: {payload.get('action')}",
+        f"cwd: {payload.get('cwd')}",
+    ]
+    lines.extend(_mmdx_selected_text_lines(payload))
+    viewer = payload.get("viewer") or {}
+    if viewer.get("url"):
+        lines.append(f"url: {viewer['url']}")
+    lines.append(f"matches: {payload.get('returned', 0)} of {payload.get('scanned', 0)}")
+    if payload.get("truncated"):
+        lines.append(f"truncated: true (scan limit {MMDX_MAX_SCAN_FILES})")
+    lines.extend(_mmdx_match_text_lines(payload))
+    lines.extend(_mmdx_next_action_lines(payload))
+    return lines, []
+
+
+def print_mmdx_payload_text(payload: dict[str, Any]) -> None:
+    stdout_lines, stderr_lines = mmdx_payload_text_lines(payload)
+    for line in stderr_lines:
+        print(line, file=sys.stderr)
+    for line in stdout_lines:
+        print(line)

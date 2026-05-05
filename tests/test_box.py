@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import shlex
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 BOX_SCRIPT = ROOT_DIR / "scripts" / "box.py"
@@ -254,6 +257,153 @@ class BoxTests(unittest.TestCase):
 
     def test_extract_tailscale_ipv4_returns_none_without_marker(self) -> None:
         self.assertIsNone(BOX_MODULE.extract_tailscale_ipv4("no marker here"))
+
+    def test_box_helpers_cover_env_probe_unregister_status_and_ssh_branches(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "Required environment variable MISSING"):
+                BOX_MODULE.require_env("MISSING")
+            self.assertEqual(BOX_MODULE.optional_env("OPTIONAL", "fallback"), "fallback")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dotenv = Path(tmpdir) / ".env"
+            dotenv.write_text("# comment\nFOO=file\nINVALID\nBAR= file-bar \n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"FOO": "existing"}, clear=True):
+                BOX_MODULE.load_dotenv(dotenv)
+                self.assertEqual(os.environ["FOO"], "existing")
+                self.assertEqual(os.environ["BAR"], "file-bar")
+            BOX_MODULE.load_dotenv(Path(tmpdir) / "missing.env")
+
+        self.assertTrue(BOX_MODULE.is_ipv4_address("1.2.3.4"))
+        self.assertFalse(BOX_MODULE.is_ipv4_address("999.1.1.1"))
+        self.assertTrue(BOX_MODULE.is_tailscale_ipv4("100.64.0.1"))
+        self.assertFalse(BOX_MODULE.is_tailscale_ipv4("8.8.8.8"))
+        self.assertEqual(BOX_MODULE.derive_box_id_from_host("skillbox-Team.Example.com"), "team")
+        self.assertEqual(BOX_MODULE.derive_box_id_from_host(""), "shared-box")
+        self.assertEqual(BOX_MODULE.seed_registered_box_fields("100.64.0.8"), {"tailscale_ip": "100.64.0.8"})
+        self.assertEqual(BOX_MODULE.seed_registered_box_fields("8.8.8.8"), {"droplet_ip": "8.8.8.8"})
+        self.assertEqual(
+            BOX_MODULE.seed_registered_box_fields("skillbox-team"),
+            {"tailscale_hostname": "skillbox-team"},
+        )
+        self.assertEqual(BOX_MODULE.seed_registered_box_fields(""), {})
+        self.assertEqual(
+            BOX_MODULE.parse_register_probe(
+                "SKILLBOX_PROBE_TAILSCALE_IPV4=100.64.0.9\n"
+                "SKILLBOX_PROBE_CONTAINER_RUNNING=yes\n"
+            ),
+            {"tailscale_ip": "100.64.0.9", "container_running": True},
+        )
+
+        external_box = BOX_MODULE.Box(
+            id="external",
+            profile="dev-small",
+            state="ready",
+            management_mode="external",
+            tailscale_hostname="skillbox-external",
+        )
+        self.assertFalse(BOX_MODULE.probe_registered_box(external_box, enabled=False)["ssh_reachable"])
+        with mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value=None):
+            self.assertFalse(BOX_MODULE.probe_registered_box(external_box, enabled=True)["ssh_reachable"])
+        with (
+            mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="100.64.0.8"),
+            mock.patch.object(
+                BOX_MODULE,
+                "ssh_cmd",
+                return_value=subprocess.CompletedProcess(["ssh"], 1, stdout="", stderr="nope"),
+            ),
+        ):
+            probe = BOX_MODULE.probe_registered_box(external_box, enabled=True)
+        self.assertTrue(probe["ssh_reachable"])
+        self.assertFalse(probe["container_running"])
+        with (
+            mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="100.64.0.8"),
+            mock.patch.object(
+                BOX_MODULE,
+                "ssh_cmd",
+                return_value=subprocess.CompletedProcess(
+                    ["ssh"],
+                    0,
+                    stdout=(
+                        "SKILLBOX_PROBE_TAILSCALE_IPV4=100.64.0.10\n"
+                        "SKILLBOX_PROBE_CONTAINER_RUNNING=yes\n"
+                    ),
+                    stderr="",
+                ),
+            ),
+        ):
+            probe = BOX_MODULE.probe_registered_box(external_box, enabled=True)
+        self.assertEqual(probe["tailscale_ip"], "100.64.0.10")
+        self.assertTrue(probe["container_running"])
+
+        emitted: list[dict[str, object]] = []
+        managed_box = BOX_MODULE.Box(id="managed", profile="dev-small", state="ready")
+        with (
+            mock.patch.object(BOX_MODULE, "load_inventory", return_value=[]),
+            mock.patch.object(BOX_MODULE, "emit_json", side_effect=emitted.append),
+        ):
+            self.assertEqual(BOX_MODULE.cmd_unregister("missing", fmt="json"), BOX_MODULE.EXIT_ERROR)
+        self.assertEqual(emitted[-1]["error"]["type"], "not_found")
+
+        with (
+            mock.patch.object(BOX_MODULE, "load_inventory", return_value=[managed_box]),
+            mock.patch.object(BOX_MODULE, "emit_json", side_effect=emitted.append),
+        ):
+            self.assertEqual(BOX_MODULE.cmd_unregister("managed", fmt="json"), BOX_MODULE.EXIT_ERROR)
+        self.assertEqual(emitted[-1]["error"]["type"], "invalid_state")
+
+        with (
+            mock.patch.object(BOX_MODULE, "load_inventory", return_value=[external_box]),
+            mock.patch.object(BOX_MODULE, "save_inventory") as save_inventory,
+            mock.patch.object(BOX_MODULE, "emit_json", side_effect=emitted.append),
+        ):
+            self.assertEqual(BOX_MODULE.cmd_unregister("external", fmt="json"), BOX_MODULE.EXIT_OK)
+        self.assertEqual(external_box.state, "destroyed")
+        save_inventory.assert_called_once()
+        self.assertTrue(emitted[-1]["unregistered"])
+
+        status = {
+            "id": "external",
+            "state": "ready",
+            "profile": "dev-small",
+            "management_mode": "external",
+            "droplet_id": "123",
+            "droplet_ip": "1.2.3.4",
+            "tailscale_hostname": "skillbox-external",
+            "tailscale_ip": "100.64.0.8",
+            "ssh_user": "skillbox",
+            "ssh_reachable": True,
+            "ssh_target": "100.64.0.8",
+            "container_running": True,
+            "state_root": "/state",
+            "storage_filesystem": "ext4",
+            "volume_name": "vol",
+            "volume_size_gb": 50,
+        }
+        with redirect_stdout(io.StringIO()) as stdout:
+            BOX_MODULE.print_box_status_text(status)
+        self.assertIn("mode=external", stdout.getvalue())
+        self.assertIn("connect: ssh skillbox@100.64.0.8", stdout.getvalue())
+
+        with (
+            mock.patch.object(BOX_MODULE, "load_inventory", return_value=[]),
+            redirect_stderr(io.StringIO()) as stderr,
+        ):
+            self.assertEqual(BOX_MODULE.cmd_ssh("missing"), BOX_MODULE.EXIT_ERROR)
+        self.assertIn("not found", stderr.getvalue())
+        with (
+            mock.patch.object(BOX_MODULE, "load_inventory", return_value=[managed_box]),
+            mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value=None),
+            redirect_stderr(io.StringIO()) as stderr,
+        ):
+            self.assertEqual(BOX_MODULE.cmd_ssh("managed"), BOX_MODULE.EXIT_ERROR)
+        self.assertIn("no reachable address", stderr.getvalue())
+        with (
+            mock.patch.object(BOX_MODULE, "load_inventory", return_value=[managed_box]),
+            mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="1.2.3.4"),
+            mock.patch.object(BOX_MODULE.os, "execvp") as execvp,
+        ):
+            self.assertEqual(BOX_MODULE.cmd_ssh("managed"), BOX_MODULE.EXIT_ERROR)
+        execvp.assert_called_once()
 
     def test_wait_for_ssh_retries_after_timeout(self) -> None:
         original_ssh_cmd = BOX_MODULE.ssh_cmd

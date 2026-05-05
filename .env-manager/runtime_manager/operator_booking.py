@@ -7,7 +7,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from .shared import EXIT_ERROR, EXIT_OK, load_yaml
+from .shared import EXIT_OK, load_yaml
 
 DEFAULT_OPERATOR_ENV_FILE = "~/repos/buildooor/.env.local"
 DEFAULT_API_URL = "https://api.sweetpotato.dev"
@@ -98,6 +98,50 @@ def operator_booking_payload(
     )
 
 
+def _operator_api_base(overlay_config: dict[str, Any], env_values: dict[str, str]) -> str:
+    return str(
+        overlay_config.get("spaps_api_url")
+        or env_values.get("NEXT_PUBLIC_SPAPS_API_URL")
+        or os.environ.get("NEXT_PUBLIC_SPAPS_API_URL")
+        or DEFAULT_API_URL
+    ).rstrip("/")
+
+
+def _operator_booking_urls(overlay_config: dict[str, Any], api_base: str) -> tuple[str, str, str]:
+    availability_url = str(
+        overlay_config.get("availability_url")
+        or f"{api_base}/api/dayrate/availability"
+    )
+    resolved_api_base = _api_base_from_url(availability_url) or api_base
+    booking_hold_url = str(
+        overlay_config.get("booking_hold_url")
+        or f"{resolved_api_base}/api/dayrate/book-x402"
+    )
+    magic_link_url = str(
+        overlay_config.get("magic_link_url")
+        or overlay_config.get("auth_magic_link_url")
+        or f"{resolved_api_base}/api/auth/magic-link"
+    )
+    return availability_url, booking_hold_url, magic_link_url
+
+
+def _operator_auth_env_names(
+    overlay_config: dict[str, Any],
+    access_token_env: str | None,
+) -> tuple[str, str]:
+    api_key_env = str(
+        overlay_config.get("api_key_env")
+        or overlay_config.get("availability_api_key_env")
+        or DEFAULT_API_KEY_ENV
+    )
+    resolved_access_token_env = str(
+        access_token_env
+        or overlay_config.get("access_token_env")
+        or DEFAULT_ACCESS_TOKEN_ENV
+    )
+    return api_key_env, resolved_access_token_env
+
+
 def resolve_operator_booking_config(
     model: dict[str, Any],
     *,
@@ -110,47 +154,24 @@ def resolve_operator_booking_config(
     env_file = _expand_path(str(overlay_config.get("env_file") or DEFAULT_OPERATOR_ENV_FILE))
     env_values = _read_env_file(env_file)
 
-    api_base = str(
-        overlay_config.get("spaps_api_url")
-        or env_values.get("NEXT_PUBLIC_SPAPS_API_URL")
-        or os.environ.get("NEXT_PUBLIC_SPAPS_API_URL")
-        or DEFAULT_API_URL
-    ).rstrip("/")
-    availability_url = str(
-        overlay_config.get("availability_url")
-        or f"{api_base}/api/dayrate/availability"
-    )
-    api_base = _api_base_from_url(availability_url) or api_base
+    api_base = _operator_api_base(overlay_config, env_values)
+    availability_url, booking_hold_url, magic_link_url = _operator_booking_urls(overlay_config, api_base)
+    api_key_env, resolved_access_token_env = _operator_auth_env_names(overlay_config, access_token_env)
     config = {
         "client_id": client.get("id"),
         "booking_url": str(overlay_config.get("booking_url") or DEFAULT_BOOKING_URL),
         "availability_url": availability_url,
         "availability_method": str(overlay_config.get("availability_method") or "GET").upper(),
-        "booking_hold_url": str(
-            overlay_config.get("booking_hold_url")
-            or f"{api_base}/api/dayrate/book-x402"
-        ),
+        "booking_hold_url": booking_hold_url,
         "booking_hold_method": str(overlay_config.get("booking_hold_method") or "POST").upper(),
-        "magic_link_url": str(
-            overlay_config.get("magic_link_url")
-            or overlay_config.get("auth_magic_link_url")
-            or f"{api_base}/api/auth/magic-link"
-        ),
+        "magic_link_url": magic_link_url,
         "magic_link_method": str(overlay_config.get("magic_link_method") or "POST").upper(),
         "magic_link_redirect_url": overlay_config.get("magic_link_redirect_url"),
         "timezone": str(overlay_config.get("timezone") or "America/Toronto"),
         "preferred_session": str(overlay_config.get("preferred_session") or "AI Build Diagnosis"),
         "payment_required_before_handoff": bool(overlay_config.get("payment_required_before_handoff", True)),
-        "api_key_env": str(
-            overlay_config.get("api_key_env")
-            or overlay_config.get("availability_api_key_env")
-            or DEFAULT_API_KEY_ENV
-        ),
-        "access_token_env": str(
-            access_token_env
-            or overlay_config.get("access_token_env")
-            or DEFAULT_ACCESS_TOKEN_ENV
-        ),
+        "api_key_env": api_key_env,
+        "access_token_env": resolved_access_token_env,
         "origin": origin or overlay_config.get("availability_origin") or overlay_config.get("origin"),
         "env_file": str(env_file),
         "_env_values": env_values,
