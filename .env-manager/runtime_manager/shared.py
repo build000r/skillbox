@@ -3516,14 +3516,21 @@ def filtered_copy_skill(source_dir: Path, target_dir: Path) -> str:
     target_dir.mkdir(parents=True, exist_ok=True)
 
     for source_file in sorted(source_dir.rglob("*")):
-        if not source_file.is_file():
-            continue
         rel = source_file.relative_to(source_dir).as_posix()
 
         if _matches_skillignore(rel, patterns):
             continue
 
         if rel == ".skillignore":
+            continue
+
+        if source_file.is_symlink():
+            raise RuntimeError(
+                "Refusing to install skill with symlinked file: "
+                f"{source_file.relative_to(source_dir)}"
+            )
+
+        if not source_file.is_file():
             continue
 
         dest = target_dir / rel
@@ -4850,23 +4857,5 @@ CLIENT_ACCEPTANCE_MATCH_FIELDS = (
 )
 
 
-
-
-
-
-
-
-
-
-
-
 def emit_json(payload: Any) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
-
-
-
-
-
-
-if __name__ == "__main__":
-    sys.exit(main())
