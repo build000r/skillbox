@@ -164,6 +164,22 @@ class TestDistributionRollback(unittest.TestCase):
             )
         self.assertIn(DISTRIBUTION_CACHE_MISSING, str(ctx.exception))
 
+    def test_malformed_public_key_is_stable_error(self) -> None:
+        self._seed_two_versions()
+
+        with self.assertRaises(DistributionRollbackError) as ctx:
+            rollback_distributor_skill(
+                manifest_path=self.manifest_path,
+                public_key_config="ed25519:not-valid-base64!!!",
+                distributor_id="local-dist",
+                skill_name="deploy",
+                target_version=1,
+                state_root=self.state_root,
+                install_targets=[{"id": "default", "host_path": str(self.install_root)}],
+                lockfile_path=self.lockfile_path,
+            )
+        self.assertIn("manifest signature verification failed", str(ctx.exception))
+
     def test_floor_violation_requires_override(self) -> None:
         v1, _ = self._seed_two_versions(min_version=2)
         self._cache_artifact(1, v1)

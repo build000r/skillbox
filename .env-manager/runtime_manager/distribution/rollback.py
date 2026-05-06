@@ -12,7 +12,7 @@ from ..shared import atomic_write_text
 from .bundle import SKILL_META_DIR, unpack_skill_bundle, verify_bundle_contents, _file_sha256
 from .lockfile import SkillLockEntry, emit_lockfile, parse_lockfile
 from .manifest import artifact_for_version, parse_manifest, verify_manifest
-from .signing import SignatureVerificationError, load_public_key
+from .signing import KeyFormatError, SignatureVerificationError, load_public_key
 from .sync import _install_skill_content
 
 DISTRIBUTION_CACHE_MISSING = "DISTRIBUTION_CACHE_MISSING"
@@ -109,7 +109,7 @@ def _verified_rollback_manifest(
     manifest = parse_manifest(Path(manifest_path).read_bytes())
     try:
         verify_manifest(manifest, load_public_key(public_key_config))
-    except SignatureVerificationError as exc:
+    except (KeyFormatError, SignatureVerificationError) as exc:
         raise DistributionRollbackError(f"manifest signature verification failed: {exc}") from exc
     if manifest.distributor_id != distributor_id:
         raise DistributionRollbackError("manifest distributor_id does not match")

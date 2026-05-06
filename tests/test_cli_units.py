@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -33,6 +35,67 @@ def _ns(**kwargs: object) -> argparse.Namespace:
 
 
 class CliUnitTests(unittest.TestCase):
+    def test_cli_import_does_not_require_distribution_crypto_modules(self) -> None:
+        code = r"""
+import builtins
+import sys
+
+sys.path.insert(0, ".env-manager")
+real_import = builtins.__import__
+
+def blocked_import(name, *args, **kwargs):
+    if name == "cryptography" or name.startswith("cryptography."):
+        raise ModuleNotFoundError("blocked cryptography import")
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = blocked_import
+import runtime_manager.cli
+print("ok")
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "PYTHONPATH": str(ENV_MANAGER_DIR)},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ok", result.stdout)
+
+    def test_distribution_lazy_import_reports_missing_crypto(self) -> None:
+        code = r"""
+import builtins
+import sys
+
+sys.path.insert(0, ".env-manager")
+real_import = builtins.__import__
+
+def blocked_import(name, *args, **kwargs):
+    if name == "cryptography" or name.startswith("cryptography."):
+        raise ModuleNotFoundError("blocked cryptography import", name="cryptography")
+    return real_import(name, *args, **kwargs)
+
+import runtime_manager.cli as cli
+builtins.__import__ = blocked_import
+try:
+    cli.publish_skill_release()
+except RuntimeError as exc:
+    print(str(exc))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "PYTHONPATH": str(ENV_MANAGER_DIR)},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("requires the optional 'cryptography' package", result.stdout)
+
     def test_overlay_handler_covers_persistent_activate_and_unlink_paths(self) -> None:
         state: set[str] = set()
         emitted: list[dict[str, object]] = []
@@ -703,6 +766,32 @@ class CliUnitTests(unittest.TestCase):
             mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
         ):
             self.assertEqual(CLI._handle_distribution_rollback(rollback_args, root), CLI.EXIT_ERROR)
+
+        parser = CLI._build_parser()
+        parsed = parser.parse_args([
+            "distribution-rollback",
+            "--list",
+            "--skill",
+            "deploy",
+            "--state-root",
+            "state",
+        ])
+        self.assertTrue(parsed.list)
+        self.assertIsNone(parsed.manifest_path)
+        self.assertIsNone(parsed.public_key)
+        self.assertIsNone(parsed.version)
+        self.assertIsNone(parsed.lockfile)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir) / "bundle-cache" / "deploy"
+            cache_dir.mkdir(parents=True)
+            (cache_dir / "deploy-v2.skillbundle.tar.gz").write_bytes(b"two")
+            (cache_dir / "deploy-v1.skillbundle.tar.gz").write_bytes(b"one")
+            (cache_dir / "deploy-vbad.skillbundle.tar.gz").write_bytes(b"bad")
+            self.assertEqual(
+                CLI.cached_versions(state_root=Path(tmpdir), skill_name="deploy"),
+                [1, 2],
+            )
 
         preview_args = _ns(
             manifest_path="manifest.json",

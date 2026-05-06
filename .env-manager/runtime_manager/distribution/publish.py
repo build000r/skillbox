@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -20,11 +21,13 @@ from .manifest import (
     ClientManifestArtifact,
     ManifestSchemaError,
     parse_manifest,
+    verify_manifest,
 )
-from .signing import KEY_PREFIX, sign_manifest
+from .signing import KEY_PREFIX, SignatureVerificationError, sign_manifest
 
 DISTRIBUTION_SKILL_METADATA_MISSING = "DISTRIBUTION_SKILL_METADATA_MISSING"
 DISTRIBUTION_VERSION_CONFLICT = "DISTRIBUTION_VERSION_CONFLICT"
+SKILL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
 class DistributionPublishError(RuntimeError):
@@ -98,10 +101,9 @@ def _prepare_skill_release(
         )
 
     name = (skill_name or skill_path.name).strip()
-    if not name:
-        raise DistributionPublishError("skill_name must be non-empty")
+    _validate_skill_name(name)
 
-    publish_targets = targets or ["box"]
+    publish_targets = targets or []
     publish_capabilities = capabilities or []
     now = updated_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     private_key = _load_private_key_ref(signing_key_ref)
@@ -120,6 +122,22 @@ def _prepare_skill_release(
         "final_bundle": final_bundle,
         "download_url": download_url,
     }
+
+
+def _validate_skill_name(name: str) -> None:
+    if not name:
+        raise DistributionPublishError("skill_name must be non-empty")
+    if (
+        not SKILL_NAME_PATTERN.fullmatch(name)
+        or name in {".", ".."}
+        or ".." in name.split(".")
+        or "/" in name
+        or "\\" in name
+        or Path(name).name != name
+    ):
+        raise DistributionPublishError(
+            "skill_name must be a slug using letters, numbers, dots, underscores, or hyphens"
+        )
 
 
 def _packed_skill_bundle(skill_path: Path, version: int, name: str, tmp: Path) -> Path:
@@ -191,6 +209,59 @@ def _write_changed_skill_release(
     return manifest_data
 
 
+def _candidate_manifest_skill(
+    *,
+    prepared: dict[str, Any],
+    version: int,
+    artifact_sha: str,
+    artifact_size: int,
+    manifest_data: dict[str, Any],
+    changelog: str | None,
+    min_version: int | None,
+    min_version_reason: str | None,
+) -> dict[str, Any] | None:
+    candidate = _upsert_manifest_skill(
+        manifest_data=manifest_data,
+        name=prepared["name"],
+        version=version,
+        sha256=artifact_sha,
+        size_bytes=artifact_size,
+        download_url=prepared["download_url"],
+        targets=prepared["targets"],
+        capabilities=prepared["capabilities"],
+        changelog=changelog,
+        min_version=min_version,
+        min_version_reason=min_version_reason,
+        updated_at=prepared["updated_at"],
+    )
+    return _find_skill_entry(candidate, prepared["name"])
+
+
+def _publish_manifest_changed(
+    *,
+    prepared: dict[str, Any],
+    version: int,
+    artifact_sha: str,
+    artifact_size: int,
+    manifest_data: dict[str, Any],
+    changelog: str | None,
+    min_version: int | None,
+    min_version_reason: str | None,
+) -> bool:
+    existing_skill = _find_skill_entry(manifest_data, prepared["name"])
+    candidate_skill = _candidate_manifest_skill(
+        prepared=prepared,
+        version=version,
+        artifact_sha=artifact_sha,
+        artifact_size=artifact_size,
+        manifest_data=manifest_data,
+        changelog=changelog,
+        min_version=min_version,
+        min_version_reason=min_version_reason,
+    )
+    return candidate_skill != existing_skill
+
+
 def _publish_prepared_skill_release(
     *,
     prepared: dict[str, Any],
@@ -211,12 +282,26 @@ def _publish_prepared_skill_release(
         distributor_id=distributor_id,
         client_id=client_id,
         updated_at=prepared["updated_at"],
+        public_key=prepared["private_key"].public_key(),
     )
     skill_entry = _find_skill_entry(manifest_data, prepared["name"])
     existing_artifact = _existing_artifact_or_conflict(
         skill_entry, version, prepared["name"], artifact_sha,
     )
-    changed = _publish_artifact_changed(existing_artifact, prepared["final_bundle"], artifact_sha)
+    artifact_changed = _publish_artifact_changed(
+        existing_artifact, prepared["final_bundle"], artifact_sha,
+    )
+    manifest_changed = _publish_manifest_changed(
+        prepared=prepared,
+        version=version,
+        artifact_sha=artifact_sha,
+        artifact_size=artifact_size,
+        manifest_data=manifest_data,
+        changelog=changelog,
+        min_version=min_version,
+        min_version_reason=min_version_reason,
+    )
+    changed = artifact_changed or manifest_changed
     if changed:
         manifest_data = _write_changed_skill_release(
             prepared=prepared,
@@ -251,6 +336,7 @@ def _load_or_create_manifest(
     distributor_id: str,
     client_id: str,
     updated_at: str,
+    public_key: Any,
 ) -> dict[str, Any]:
     if not manifest_path.is_file():
         return {
@@ -264,7 +350,8 @@ def _load_or_create_manifest(
     try:
         raw = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest = parse_manifest(json.dumps(raw).encode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError, ManifestSchemaError) as exc:
+        verify_manifest(manifest, public_key)
+    except (json.JSONDecodeError, UnicodeDecodeError, ManifestSchemaError, SignatureVerificationError) as exc:
         raise DistributionPublishError(f"{MANIFEST_INVALID_CODE}: {exc}") from exc
     if manifest.schema_version != 2:
         raise DistributionPublishError(
@@ -399,13 +486,15 @@ def _upsert_manifest_skill(
     next_manifest = _next_manifest_base(manifest_data, updated_at)
     skills = _manifest_skills_without(manifest_data, name)
     existing = _find_skill_entry(manifest_data, name) or {}
+    existing_artifact = _find_artifact_entry(existing, version) or {}
+    selected_changelog = changelog if changelog is not None else existing_artifact.get("changelog")
     artifacts = _manifest_artifacts_without(existing, version)
     artifacts.append(_client_manifest_artifact_payload(
         version=version,
         sha256=sha256,
         size_bytes=size_bytes,
         download_url=download_url,
-        changelog=changelog,
+        changelog=selected_changelog,
     ))
     artifacts.sort(key=lambda item: int(item["version"]))
 
@@ -415,7 +504,7 @@ def _upsert_manifest_skill(
         artifacts=artifacts,
         targets=targets,
         capabilities=capabilities,
-        changelog=changelog,
+        changelog=changelog if changelog is not None else existing.get("changelog"),
         min_version=min_version,
         min_version_reason=min_version_reason,
         existing=existing,

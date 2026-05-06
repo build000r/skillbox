@@ -136,14 +136,80 @@ class OperatorBookingTests(unittest.TestCase):
         self.assertEqual(second_call.args[0], "http://localhost:3301/api/dayrate/book-x402")
         self.assertEqual(second_call.kwargs["body"]["clientName"], "Customer Example")
 
-    def _model(self, tmpdir: str) -> dict:
+    def test_config_and_book_dry_run_do_not_require_publishable_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = self._model(tmpdir, env_text="")
+
+            with mock.patch.dict(MODULE.os.environ, {}, clear=True):
+                config_payload, config_exit = MODULE.operator_booking_payload(
+                    model,
+                    action="config",
+                    client_id="personal",
+                )
+                dry_payload, dry_exit = MODULE.operator_booking_payload(
+                    model,
+                    action="book",
+                    client_id="personal",
+                    date="2026-05-06",
+                    slot="AM",
+                    email="customer@example.com",
+                    name="Customer Example",
+                    dry_run=True,
+                    send_magic_link=True,
+                )
+
+        self.assertEqual(config_exit, MODULE.EXIT_OK)
+        self.assertFalse(config_payload["operator_booking"]["api_key_configured"])
+        self.assertEqual(dry_exit, MODULE.EXIT_OK)
+        self.assertTrue(dry_payload["dry_run"])
+        self.assertEqual(dry_payload["booking_body"]["clientEmail"], "customer@example.com")
+        self.assertEqual(dry_payload["magic_link_body"]["email"], "customer@example.com")
+
+    def test_availability_still_requires_publishable_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = self._model(tmpdir, env_text="")
+
+            with mock.patch.dict(MODULE.os.environ, {}, clear=True):
+                with self.assertRaises(MODULE.OperatorBookingError) as ctx:
+                    MODULE.operator_booking_payload(
+                        model,
+                        action="availability",
+                        client_id="personal",
+                    )
+
+        self.assertEqual(ctx.exception.error_type, "operator_booking_api_key_missing")
+
+    def test_credentialed_requests_reject_non_local_http_urls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = self._model(
+                tmpdir,
+                availability_url="http://example.com/api/dayrate/availability",
+            )
+
+            with self.assertRaises(MODULE.OperatorBookingError) as ctx:
+                MODULE.operator_booking_payload(
+                    model,
+                    action="availability",
+                    client_id="personal",
+                )
+
+        self.assertEqual(ctx.exception.error_type, "operator_booking_insecure_url")
+        self.assertEqual(ctx.exception.data["field"], "availability_url")
+
+    def _model(
+        self,
+        tmpdir: str,
+        env_text: str | None = None,
+        availability_url: str = "http://localhost:3301/api/dayrate/availability",
+    ) -> dict:
         root = Path(tmpdir)
         env_file = root / ".env.local"
-        env_file.write_text(
-            "NEXT_PUBLIC_SPAPS_PUBLISHABLE_KEY=spaps_pub_test\n"
-            "SPAPS_AUTH_ACCESS_TOKEN=jwt_test\n",
-            encoding="utf-8",
-        )
+        if env_text is None:
+            env_text = (
+                "NEXT_PUBLIC_SPAPS_PUBLISHABLE_KEY=spaps_pub_test\n"
+                "SPAPS_AUTH_ACCESS_TOKEN=jwt_test\n"
+            )
+        env_file.write_text(env_text, encoding="utf-8")
         overlay = root / "overlay.yaml"
         overlay.write_text(
             f"""\
@@ -153,7 +219,7 @@ client:
   human_operator:
     env_file: {env_file}
     booking_url: https://buildooor.com/bookme
-    availability_url: http://localhost:3301/api/dayrate/availability
+    availability_url: {availability_url}
     availability_origin: http://localhost:3000
     preferred_session: AI Build Diagnosis
     payment_required_before_handoff: true

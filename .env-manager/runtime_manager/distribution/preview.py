@@ -10,7 +10,7 @@ from .bundle import _file_sha256
 from .lockfile import Lockfile, SkillLockEntry, parse_lockfile
 from .manifest import ClientManifest, ClientManifestSkill, parse_manifest, verify_manifest
 from .pin_resolver import PinResolution, PinResolutionError, resolve_pin
-from .signing import SignatureVerificationError, load_public_key
+from .signing import KeyFormatError, SignatureVerificationError, load_public_key
 
 
 class DistributionPreviewError(RuntimeError):
@@ -74,6 +74,17 @@ def preview_manifest(
     signature_state = "verified"
     try:
         verify_manifest(manifest, load_public_key(public_key_config))
+    except KeyFormatError as exc:
+        signature_state = "invalid"
+        return {
+            "ok": True,
+            "ready": False,
+            "distributor_id": distributor_id,
+            "manifest_version": manifest.manifest_version,
+            "items": [],
+            "warnings": [f"manifest public key invalid: {exc}"],
+            "signature_state": signature_state,
+        }
     except SignatureVerificationError as exc:
         signature_state = "invalid"
         return {

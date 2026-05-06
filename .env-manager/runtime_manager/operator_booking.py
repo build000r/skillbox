@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -74,6 +75,7 @@ def operator_booking_payload(
         client_id=client_id,
         origin=origin,
         access_token_env=access_token_env,
+        require_api_key=action not in {"config"} and not (action == "book" and dry_run),
     )
     if action in {"availability", "times", "list"}:
         return _availability_payload(config, limit=limit), EXIT_OK
@@ -148,6 +150,7 @@ def resolve_operator_booking_config(
     client_id: str | None = None,
     origin: str | None = None,
     access_token_env: str | None = None,
+    require_api_key: bool = True,
 ) -> dict[str, Any]:
     client = _select_client(model, client_id)
     overlay_config = _read_overlay_config(client)
@@ -177,7 +180,7 @@ def resolve_operator_booking_config(
         "_env_values": env_values,
         "_overlay_path": client.get("_overlay_path"),
     }
-    config["api_key"] = _resolve_api_key(config, overlay_config)
+    config["api_key"] = _resolve_api_key(config, overlay_config, required=require_api_key)
     config["access_token"] = _resolve_access_token(config, overlay_config)
     return config
 
@@ -256,15 +259,9 @@ def _api_base_from_url(url: str) -> str | None:
     return None
 
 
-def _resolve_api_key(config: dict[str, Any], overlay_config: dict[str, Any]) -> str:
-    direct = overlay_config.get("api_key") or overlay_config.get("availability_api_key")
-    if direct:
-        return str(direct)
+def _missing_api_key_error(config: dict[str, Any]) -> OperatorBookingError:
     key_env = str(config.get("api_key_env") or DEFAULT_API_KEY_ENV)
-    value = config["_env_values"].get(key_env) or os.environ.get(key_env)
-    if value:
-        return value
-    raise OperatorBookingError(
+    return OperatorBookingError(
         "operator_booking_api_key_missing",
         f"Publishable key env var {key_env} is not configured.",
         recovery_hint=(
@@ -273,6 +270,24 @@ def _resolve_api_key(config: dict[str, Any], overlay_config: dict[str, Any]) -> 
         ),
         data={"api_key_env": key_env, "env_file": config["env_file"]},
     )
+
+
+def _resolve_api_key(
+    config: dict[str, Any],
+    overlay_config: dict[str, Any],
+    *,
+    required: bool,
+) -> str | None:
+    direct = overlay_config.get("api_key") or overlay_config.get("availability_api_key")
+    if direct:
+        return str(direct)
+    key_env = str(config.get("api_key_env") or DEFAULT_API_KEY_ENV)
+    value = config["_env_values"].get(key_env) or os.environ.get(key_env)
+    if value:
+        return value
+    if required:
+        raise _missing_api_key_error(config)
+    return None
 
 
 def _resolve_access_token(config: dict[str, Any], overlay_config: dict[str, Any]) -> str | None:
@@ -284,6 +299,9 @@ def _resolve_access_token(config: dict[str, Any], overlay_config: dict[str, Any]
 
 
 def _headers(config: dict[str, Any], *, json_body: bool = False) -> dict[str, str]:
+    if not config.get("api_key"):
+        raise _missing_api_key_error(config)
+    _validate_credentialed_urls(config)
     headers = {
         "Accept": "application/json",
         "X-API-Key": str(config["api_key"]),
@@ -295,6 +313,26 @@ def _headers(config: dict[str, Any], *, json_body: bool = False) -> dict[str, st
     if config.get("access_token"):
         headers["Authorization"] = f"Bearer {config['access_token']}"
     return headers
+
+
+def _validate_credentialed_urls(config: dict[str, Any]) -> None:
+    for key in ("availability_url", "booking_hold_url", "magic_link_url"):
+        _validate_credentialed_url(str(config.get(key) or ""), key)
+
+
+def _validate_credentialed_url(url: str, label: str) -> None:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme == "https":
+        return
+    if parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}:
+        return
+    raise OperatorBookingError(
+        "operator_booking_insecure_url",
+        f"{label} must use HTTPS, or HTTP on localhost for local development.",
+        recoverable=True,
+        recovery_hint="Update the client overlay operator booking URL to an HTTPS endpoint.",
+        data={"url": url, "field": label},
+    )
 
 
 def _http_json(
