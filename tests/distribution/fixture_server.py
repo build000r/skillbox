@@ -52,6 +52,7 @@ class SkillArtifacts:
 @dataclass
 class DistributorFixture:
     server: http.server.HTTPServer
+    thread: threading.Thread
     url: str
     api_key: str
     public_key_str: str
@@ -61,6 +62,8 @@ class DistributorFixture:
 
     def shutdown(self) -> None:
         self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=1.0)
 
 
 def build_test_skill_artifacts(
@@ -241,6 +244,7 @@ def start_test_distributor_server(
 
     return DistributorFixture(
         server=server,
+        thread=thread,
         url=url,
         api_key=api_key,
         public_key_str=public_key_str,
