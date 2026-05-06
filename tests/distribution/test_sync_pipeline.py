@@ -257,8 +257,17 @@ def _start_server(
     server.fail_code = fail_code  # type: ignore[attr-type]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    server.thread = thread  # type: ignore[attr-defined]
     host, port = server.server_address
     return server, f"http://{host}:{port}"
+
+
+def _stop_server(server: http.server.HTTPServer) -> None:
+    server.shutdown()
+    server.server_close()
+    thread = getattr(server, "thread", None)
+    if thread is not None:
+        thread.join(timeout=1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +325,7 @@ class TestSyncDistributorSetHappyPath(unittest.TestCase):
         self.install_targets = [{"id": "default", "host_path": str(self.install_root)}]
 
     def tearDown(self) -> None:
-        self.server.shutdown()
+        _stop_server(self.server)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     @mock.patch.dict(os.environ, {"TEST_DIST_KEY": TEST_API_KEY})
@@ -398,7 +407,7 @@ class TestSyncDistributorSetSignatureFailure(unittest.TestCase):
         self.pub_str = public_key_to_config_str(pub)
 
     def tearDown(self) -> None:
-        self.server.shutdown()
+        _stop_server(self.server)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     @mock.patch.dict(os.environ, {"TEST_DIST_KEY": TEST_API_KEY})
@@ -436,7 +445,7 @@ class TestSyncDistributorSetNetworkError(unittest.TestCase):
                 )
             self.assertIn("500", str(ctx.exception))
         finally:
-            server.shutdown()
+            _stop_server(server)
 
     def test_missing_api_key_raises(self) -> None:
         config = _make_distributor_config("http://localhost:1", self.pub_str,
@@ -473,7 +482,7 @@ class TestSyncDistributorSetPinResolution(unittest.TestCase):
         self.install_targets = [{"id": "default", "host_path": str(self.install_root)}]
 
     def tearDown(self) -> None:
-        self.server.shutdown()
+        _stop_server(self.server)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     @mock.patch.dict(os.environ, {"TEST_DIST_KEY": TEST_API_KEY})
@@ -520,7 +529,7 @@ class TestSyncDistributorSetV2Artifacts(unittest.TestCase):
         self.install_targets = [{"id": "default", "host_path": str(self.install_root)}]
 
     def tearDown(self) -> None:
-        self.server.shutdown()
+        _stop_server(self.server)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     @mock.patch.dict(os.environ, {"TEST_DIST_KEY": TEST_API_KEY})
@@ -564,7 +573,7 @@ class TestSyncDistributorSetTargetFilter(unittest.TestCase):
         self.install_targets = [{"id": "default", "host_path": str(self.install_root)}]
 
     def tearDown(self) -> None:
-        self.server.shutdown()
+        _stop_server(self.server)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     @mock.patch.dict(os.environ, {"TEST_DIST_KEY": TEST_API_KEY})
@@ -625,7 +634,7 @@ class TestSyncDistributorSetCacheHit(unittest.TestCase):
             self.assertEqual(entries[0].name, "deploy")
             self.assertTrue((self.install_root / "deploy" / "SKILL.md").is_file())
         finally:
-            server.shutdown()
+            _stop_server(server)
 
 
 class TestSyncDistributorSetIdempotency(unittest.TestCase):
@@ -650,7 +659,7 @@ class TestSyncDistributorSetIdempotency(unittest.TestCase):
         self.install_targets = [{"id": "default", "host_path": str(self.install_root)}]
 
     def tearDown(self) -> None:
-        self.server.shutdown()
+        _stop_server(self.server)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     @mock.patch.dict(os.environ, {"TEST_DIST_KEY": TEST_API_KEY})
@@ -697,7 +706,7 @@ class TestSyncDistributorSetPickFilter(unittest.TestCase):
         self.install_targets = [{"id": "default", "host_path": str(self.install_root)}]
 
     def tearDown(self) -> None:
-        self.server.shutdown()
+        _stop_server(self.server)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     @mock.patch.dict(os.environ, {"TEST_DIST_KEY": TEST_API_KEY})
@@ -783,7 +792,7 @@ class TestSyncDistributorSources(unittest.TestCase):
         }
 
     def tearDown(self) -> None:
-        self.server.shutdown()
+        _stop_server(self.server)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     @mock.patch.dict(os.environ, {"TEST_DIST_KEY": TEST_API_KEY})
@@ -1052,7 +1061,7 @@ class TestSyncDistributorSetDryRun(unittest.TestCase):
         self.install_targets = [{"id": "default", "host_path": str(self.install_root)}]
 
     def tearDown(self) -> None:
-        self.server.shutdown()
+        _stop_server(self.server)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     @mock.patch.dict(os.environ, {"TEST_DIST_KEY": TEST_API_KEY})

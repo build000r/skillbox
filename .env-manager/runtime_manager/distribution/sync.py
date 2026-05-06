@@ -84,11 +84,14 @@ def _http_get(
     req = Request(url, headers=headers, method="GET")
     open_fn = _opener or secure_opener().open
     try:
-        resp = open_fn(req, timeout=timeout)
-        return resp.read()
+        with open_fn(req, timeout=timeout) as resp:
+            return resp.read()
     except HTTPError as exc:
+        code = exc.code
+        reason = exc.reason
+        exc.close()
         raise DistributorSyncError(
-            f"HTTP {exc.code} from {url}: {exc.reason}"
+            f"HTTP {code} from {url}: {reason}"
         ) from exc
     except (URLError, OSError) as exc:
         raise DistributorSyncError(

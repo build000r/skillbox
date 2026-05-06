@@ -35,6 +35,7 @@ from test_sync_pipeline import (
     _make_distributor_config,
     _make_source,
     _start_server,
+    _stop_server,
 )
 
 
@@ -69,8 +70,7 @@ class TestDistributionProductLoop(unittest.TestCase):
 
     def tearDown(self) -> None:
         if self.server is not None:
-            self.server.shutdown()
-            self.server.server_close()
+            _stop_server(self.server)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _publish(self, version: int, changelog: str):
