@@ -436,6 +436,24 @@ class TestFilteredCopy(unittest.TestCase):
             self.assertFalse((target / "secret.key").exists())
             self.assertFalse((target / ".skillignore").exists())
 
+    def test_refuses_symlinked_skill_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "source"
+            target = root / "target"
+            secret = root / "outside-secret.txt"
+            source.mkdir()
+            (source / "SKILL.md").write_text("# Test\n", encoding="utf-8")
+            secret.write_text("do not copy\n", encoding="utf-8")
+            (source / "references").mkdir()
+            (source / "references" / "secret.txt").symlink_to(secret)
+
+            with self.assertRaises(RuntimeError) as ctx:
+                filtered_copy_skill(source, target)
+
+            self.assertIn("symlinked file", str(ctx.exception))
+            self.assertFalse((target / "references" / "secret.txt").exists())
+
     def test_idempotent_tree_sha(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "source"
