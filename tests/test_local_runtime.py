@@ -1374,11 +1374,12 @@ class RealOverlayParityLedgerRegressionTests(unittest.TestCase):
     """
 
     def _build_model_from_real_overlay(self) -> dict:
-        self.assertTrue(
-            REAL_PERSONAL_OVERLAY_PATH.is_file(),
-            f"Real overlay missing at {REAL_PERSONAL_OVERLAY_PATH}. "
-            "This regression test relies on the shipped personal overlay.",
-        )
+        if not REAL_PERSONAL_OVERLAY_PATH.is_file():
+            self.skipTest(
+                f"Real overlay missing at {REAL_PERSONAL_OVERLAY_PATH}; "
+                "this regression test runs only where the private personal "
+                "overlay is available."
+            )
         overlay_doc = runtime_model.load_yaml(REAL_PERSONAL_OVERLAY_PATH)
         raw_client = overlay_doc.get("client")
         self.assertIsInstance(
