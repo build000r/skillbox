@@ -113,6 +113,12 @@ class ReconcileTests(unittest.TestCase):
             runtime_env = model["runtime_env"]
             self.assertEqual(runtime_env["SKILLBOX_PULSE_INTERVAL"], "10")
             self.assertEqual(runtime_env["SKILLBOX_MONOSERVER_ROOT"], "/mnt/skillbox/repos")
+            self.assertEqual(runtime_env["SKILLBOX_CASS_BIN"], "/workspace/home/.local/bin/cass")
+            self.assertEqual(runtime_env["SKILLBOX_CM_MCP_PORT"], "3222")
+            self.assertEqual(
+                runtime_env["SKILLBOX_PULSE_UNHEALTHY_GRACE_SECONDS"],
+                "60",
+            )
             # Empty overrides fall back to manifest defaults so `${KEY:-default}` substitution
             # in compose still resolves consistently.
             self.assertNotIn("SKILLBOX_EMPTY_OVERRIDE", runtime_env)

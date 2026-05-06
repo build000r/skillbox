@@ -200,6 +200,11 @@ class RuntimeModelUnitTests(unittest.TestCase):
                 Path(client_entry["default_cwd_host_path"]).resolve(),
                 (repo / "workspace" / "clients" / "acme").resolve(),
             )
+            self.assertEqual(model["env"]["SKILLBOX_CASS_BIN"], "/home/sandbox/.local/bin/cass")
+            self.assertEqual(model["env"]["SKILLBOX_CM_BIN"], "/home/sandbox/.local/bin/cm")
+            self.assertEqual(model["env"]["SKILLBOX_CM_MCP_PORT"], "3222")
+            self.assertEqual(model["env"]["SKILLBOX_APR_BIN"], "/home/sandbox/.local/bin/apr")
+            self.assertEqual(model["env"]["SKILLBOX_PULSE_UNHEALTHY_GRACE_SECONDS"], "60")
 
     def _write_runtime_fixture(self, repo: Path) -> None:
         (repo / "workspace" / "clients" / "acme").mkdir(parents=True, exist_ok=True)
