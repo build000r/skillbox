@@ -101,6 +101,58 @@ class TestDistributionPublish(unittest.TestCase):
         raw = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(raw["manifest_version"], 1)
 
+    def test_republishing_same_bytes_with_new_metadata_updates_manifest(self) -> None:
+        first = self._publish()
+        second = self._publish(
+            targets=["codex"],
+            capabilities=["deploy", "review"],
+            changelog="Expanded rollout",
+            min_version=7,
+            min_version_reason="security floor",
+        )
+
+        self.assertEqual(second["result"], "published")
+        self.assertEqual(second["artifact_sha256"], first["artifact_sha256"])
+        raw = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["manifest_version"], 2)
+        skill = raw["skills"][0]
+        self.assertEqual(skill["targets"], ["codex"])
+        self.assertEqual(skill["capabilities"], ["deploy", "review"])
+        self.assertEqual(skill["changelog"], "Expanded rollout")
+        self.assertEqual(skill["min_version"], 7)
+        self.assertEqual(skill["min_version_reason"], "security floor")
+        self.assertEqual(skill["artifacts"][0]["changelog"], "Expanded rollout")
+
+    def test_republishing_with_omitted_changelog_preserves_existing_metadata(self) -> None:
+        first = self._publish(targets=["codex"], changelog="Initial release")
+        second = self._publish(targets=[], changelog=None)
+
+        self.assertEqual(second["result"], "noop")
+        self.assertEqual(second["artifact_sha256"], first["artifact_sha256"])
+        raw = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["manifest_version"], 1)
+        skill = raw["skills"][0]
+        self.assertEqual(skill["targets"], ["codex"])
+        self.assertEqual(skill["changelog"], "Initial release")
+        self.assertEqual(skill["artifacts"][0]["changelog"], "Initial release")
+
+    def test_republishing_rejects_tampered_existing_manifest(self) -> None:
+        self._publish()
+        raw = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        raw["skills"][0]["targets"] = ["tampered"]
+        self.manifest_path.write_text(json.dumps(raw), encoding="utf-8")
+
+        with self.assertRaises(DistributionPublishError) as ctx:
+            self._publish()
+        self.assertIn("DISTRIBUTION_MANIFEST_INVALID", str(ctx.exception))
+        self.assertIn("signature", str(ctx.exception))
+
+    def test_skill_name_rejects_path_traversal(self) -> None:
+        with self.assertRaises(DistributionPublishError) as ctx:
+            self._publish(skill_name="../escape")
+        self.assertIn("skill_name must be a slug", str(ctx.exception))
+        self.assertFalse((self.artifact_root / "escape").exists())
+
     def test_same_version_different_bytes_is_conflict(self) -> None:
         self._publish()
         (self.skill / "reference.md").write_text("changed\n", encoding="utf-8")

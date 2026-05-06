@@ -185,6 +185,14 @@ class TestDistributionPreview(unittest.TestCase):
         self.assertEqual(payload["signature_state"], "invalid")
         self.assertEqual(payload["items"], [])
 
+    def test_malformed_public_key_blocks_before_plan(self) -> None:
+        payload = self._preview(public_key_config="ed25519:not-valid-base64!!!")
+
+        self.assertFalse(payload["ready"])
+        self.assertEqual(payload["signature_state"], "invalid")
+        self.assertEqual(payload["items"], [])
+        self.assertIn("manifest public key invalid", payload["warnings"][0])
+
 
 if __name__ == "__main__":
     unittest.main()

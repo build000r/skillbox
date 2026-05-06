@@ -26,7 +26,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install PyYAML
+          python3 -m pip install PyYAML cryptography
 
       - name: Render outer model
         run: python3 scripts/04-reconcile.py render >/tmp/skillbox-render.json

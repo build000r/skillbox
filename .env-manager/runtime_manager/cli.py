@@ -14,13 +14,73 @@ from .operator_booking import *
 from .context_rendering import *
 from .text_renderers import *
 from .workflows import *
-from .distribution.publish import DistributionPublishError, publish_skill_release
-from .distribution.preview import DistributionPreviewError, preview_manifest
-from .distribution.rollback import (
-    DistributionRollbackError,
-    cached_versions,
-    rollback_distributor_skill,
-)
+
+
+class DistributionPreviewError(RuntimeError):
+    pass
+
+
+class DistributionRollbackError(RuntimeError):
+    pass
+
+
+def publish_skill_release(**kwargs: Any) -> dict[str, Any]:
+    try:
+        from .distribution.publish import publish_skill_release as publish
+    except ModuleNotFoundError as exc:
+        if exc.name and exc.name.startswith("cryptography"):
+            raise RuntimeError(
+                "distribution-publish requires the optional 'cryptography' package"
+            ) from exc
+        raise
+
+    return publish(**kwargs)
+
+
+def preview_manifest(**kwargs: Any) -> dict[str, Any]:
+    try:
+        from .distribution.preview import preview_manifest as preview
+    except ModuleNotFoundError as exc:
+        if exc.name and exc.name.startswith("cryptography"):
+            raise RuntimeError(
+                "distribution-preview requires the optional 'cryptography' package"
+            ) from exc
+        raise
+
+    return preview(**kwargs)
+
+
+def cached_versions(**kwargs: Any) -> list[int]:
+    state_root = Path(kwargs["state_root"])
+    skill_name = str(kwargs["skill_name"])
+    cache_dir = state_root / "bundle-cache" / skill_name
+    if not cache_dir.is_dir():
+        return []
+    prefix = f"{skill_name}-v"
+    suffix = ".skillbundle.tar.gz"
+    versions: list[int] = []
+    for path in cache_dir.iterdir():
+        name = path.name
+        if not path.is_file() or not name.startswith(prefix) or not name.endswith(suffix):
+            continue
+        try:
+            versions.append(int(name[len(prefix):-len(suffix)]))
+        except ValueError:
+            continue
+    return sorted(set(versions))
+
+
+def rollback_distributor_skill(**kwargs: Any) -> dict[str, Any]:
+    try:
+        from .distribution.rollback import rollback_distributor_skill as rollback
+    except ModuleNotFoundError as exc:
+        if exc.name and exc.name.startswith("cryptography"):
+            raise RuntimeError(
+                "distribution-rollback requires the optional 'cryptography' package"
+            ) from exc
+        raise
+
+    return rollback(**kwargs)
 
 
 def _add_profile_arg(command_parser: argparse.ArgumentParser) -> None:
@@ -646,14 +706,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "distribution-rollback",
         help="Rollback one skill to a verified cached bundle version.",
     )
-    distribution_rollback_parser.add_argument("--manifest-path", required=True)
-    distribution_rollback_parser.add_argument("--public-key", required=True)
+    distribution_rollback_parser.add_argument("--manifest-path", default=None)
+    distribution_rollback_parser.add_argument("--public-key", default=None)
     distribution_rollback_parser.add_argument("--distributor-id", default="local")
     distribution_rollback_parser.add_argument("--skill", required=True)
-    distribution_rollback_parser.add_argument("--version", type=int, required=True)
+    distribution_rollback_parser.add_argument("--version", type=int, default=None)
     distribution_rollback_parser.add_argument("--state-root", default=".skillbox-state")
     distribution_rollback_parser.add_argument("--install-target", action="append", default=[])
-    distribution_rollback_parser.add_argument("--lockfile", required=True)
+    distribution_rollback_parser.add_argument("--lockfile", default=None)
     distribution_rollback_parser.add_argument("--reason", default=None)
     distribution_rollback_parser.add_argument("--emergency-override", action="store_true")
     distribution_rollback_parser.add_argument("--list", action="store_true")
@@ -1203,7 +1263,7 @@ def _handle_distribution_publish(args: argparse.Namespace, root_dir: Path) -> in
             min_version_reason=args.min_version_reason,
             download_prefix=args.download_prefix,
         )
-    except (RuntimeError, DistributionPublishError) as exc:
+    except RuntimeError as exc:
         if args.format == "json":
             emit_json(classify_error(RuntimeError(str(exc)), "distribution-publish"))
         else:
@@ -1237,7 +1297,7 @@ def _handle_distribution_preview(args: argparse.Namespace, root_dir: Path) -> in
                 if args.lockfile else None
             ),
         )
-    except (RuntimeError, DistributionPreviewError) as exc:
+    except RuntimeError as exc:
         if args.format == "json":
             emit_json(classify_error(RuntimeError(str(exc)), "distribution-preview"))
         else:
@@ -1277,6 +1337,20 @@ def _handle_distribution_rollback(args: argparse.Namespace, root_dir: Path) -> i
         return EXIT_OK
 
     try:
+        missing = [
+            option
+            for option, value in (
+                ("--manifest-path", args.manifest_path),
+                ("--public-key", args.public_key),
+                ("--version", args.version),
+                ("--lockfile", args.lockfile),
+            )
+            if value is None
+        ]
+        if missing:
+            raise DistributionRollbackError(
+                "distribution-rollback requires " + ", ".join(missing)
+            )
         install_targets = [
             {"id": f"target-{index + 1}", "host_path": str(host_path_to_absolute_path(root_dir, target))}
             for index, target in enumerate(args.install_target)
@@ -1295,7 +1369,7 @@ def _handle_distribution_rollback(args: argparse.Namespace, root_dir: Path) -> i
             reason=args.reason,
             emergency_override=args.emergency_override,
         )
-    except (RuntimeError, DistributionRollbackError) as exc:
+    except RuntimeError as exc:
         if args.format == "json":
             emit_json(classify_error(RuntimeError(str(exc)), "distribution-rollback"))
         else:
