@@ -394,8 +394,8 @@ Hermes command for the active environment.
 
 Current local proof for this broker/runtime surface:
 
-- `make python-cov-xml` passes with 859 tests and 85.02% exact line coverage.
-- `python3 ../skills/crap/scripts/analyze_crap.py .env-manager --languages python --threshold 20 --top 100` passes with `FINAL_SCORE: 19.94`.
+- `make python-cov-xml` passes with 877 tests, 1 skipped, and 85% total line coverage.
+- `python3 ../skills/crap/scripts/analyze_crap.py .env-manager --languages python --threshold 30 --top 20` passes with `FINAL_SCORE: 22.20`.
 - `python3 ../skills/crap/scripts/analyze_crap.py scripts/hermes_codex_adapter.py --languages python --threshold 20 --top 20` passes with `FINAL_SCORE: 9.00`.
 - A real Codex-backed broker run succeeded as `wr_20260505_073758_d41cda` using `SKILLBOX_WORKER_HERMES_COMMAND='python3 scripts/hermes_codex_adapter.py'`.
 
