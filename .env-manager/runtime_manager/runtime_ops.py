@@ -4135,6 +4135,7 @@ def _runtime_ingress_payload(model: dict[str, Any]) -> dict[str, Any]:
 def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
     service_statuses = _runtime_service_statuses(model)
     return {
+        "box_access": runtime_box_access_from_env(),
         "clients": copy.deepcopy(model.get("clients") or []),
         "active_clients": model.get("active_clients") or [],
         "default_client": (model.get("selection") or {}).get("default_client"),
@@ -4155,6 +4156,24 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
             "covered_surfaces": parity_ledger_covered_surfaces(model),
             "deferred_surfaces": parity_ledger_deferred_surfaces(model),
         },
+    }
+
+
+def runtime_box_access_from_env() -> dict[str, Any]:
+    box_id = os.environ.get("SKILLBOX_BOX_ID", "").strip()
+    tailnet_ip = os.environ.get("SKILLBOX_BOX_TAILSCALE_IP", "").strip()
+    magicdns = os.environ.get("SKILLBOX_BOX_TAILSCALE_HOSTNAME", "").strip()
+    port = os.environ.get("SKILLBOX_SWIMMERS_PORT", "3210").strip() or "3210"
+    phone_url = f"http://{tailnet_ip}:{port}/" if tailnet_ip else None
+    magicdns_url = f"http://{magicdns}:{port}/" if magicdns else None
+    return {
+        "self": os.environ.get("SKILLBOX_BOX_SELF", "").strip().lower() == "true",
+        "box_id": box_id or None,
+        "tailscale_ip": tailnet_ip or None,
+        "tailscale_hostname": magicdns or None,
+        "phone_url": phone_url,
+        "browser_url": phone_url,
+        "magicdns_url": magicdns_url,
     }
 
 
@@ -4310,6 +4329,7 @@ def compact_runtime_status(status_payload: dict[str, Any]) -> dict[str, Any]:
         "active_clients": status_payload.get("active_clients") or [],
         "default_client": status_payload.get("default_client"),
         "active_profiles": status_payload.get("active_profiles") or [],
+        "box_access": status_payload.get("box_access") or {},
         "distributors": status_payload.get("distributors") or [],
         "storage": _compact_status_storage(status_payload),
         "repos": _compact_status_repos(status_payload),

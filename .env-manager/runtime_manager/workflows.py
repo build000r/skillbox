@@ -1812,6 +1812,47 @@ def _acceptance_sync(
     return _emit_acceptance(payload, is_json)
 
 
+def _skill_availability_status(skill_checks: list[dict[str, Any]]) -> str:
+    if any(str(item.get("status")) == "fail" for item in skill_checks):
+        return "fail"
+    if any(str(item.get("status")) == "warn" for item in skill_checks):
+        return "warn"
+    return "ok"
+
+
+def _acceptance_skill_availability(
+    root_dir: Path,
+    doctor_args: list[str],
+    cid: str,
+    profiles: list[str],
+    active_profiles: list[str],
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> int | None:
+    _, doctor_payload = run_manage_json_command(root_dir, doctor_args)
+    skill_codes = {"skill-repo-config", "skill-repo-lock", "skill-repo-install"}
+    checks = [
+        item for item in doctor_payload.get("checks") or []
+        if str(item.get("code") or "") in skill_codes
+    ]
+    status = _skill_availability_status(checks)
+    _acceptance_step(steps, is_json, "skill-availability", status, {"checks": checks})
+    if status != "fail":
+        return None
+
+    _acceptance_skip_after_failure(steps, is_json, "skill-availability", ("focus", "mcp-smoke", "doctor-post"))
+    payload = _acceptance_payload(cid, active_profiles, steps)
+    payload.update(structured_error(
+        "Skill availability preflight failed after sync.",
+        error_type="skill_availability_failed",
+        next_actions=doctor_payload.get("next_actions") or [
+            f"sync --client {cid}{format_profile_args(profiles)} --format json",
+            f"doctor --client {cid}{format_profile_args(profiles)} --format json",
+        ],
+    ))
+    return _emit_acceptance(payload, is_json)
+
+
 def _acceptance_focus(
     root_dir: Path,
     focus_args: list[str],
@@ -1971,6 +2012,9 @@ def run_acceptance(
     if exit_code is not None:
         return exit_code
     exit_code = _acceptance_sync(root_dir, sync_args, cid, profiles, active_profiles, steps, is_json)
+    if exit_code is not None:
+        return exit_code
+    exit_code = _acceptance_skill_availability(root_dir, doctor_args, cid, profiles, active_profiles, steps, is_json)
     if exit_code is not None:
         return exit_code
     exit_code = _acceptance_focus(root_dir, focus_args, cid, profiles, active_profiles, steps, is_json)

@@ -99,7 +99,9 @@ TOOLS: list[dict] = [
             "enroll in Tailscale → clone skillbox → build + start container → onboard project → verify. "
             "This is the primary macro — one call replaces 7 manual steps. "
             "ALWAYS use dry_run=true first. "
-            "Requires env: SKILLBOX_DO_TOKEN, SKILLBOX_DO_SSH_KEY_ID, SKILLBOX_TS_AUTHKEY."
+            "Dry-run returns credential_status; if missing is non-empty, stop and ask the operator "
+            "to populate .env.box with SKILLBOX_DO_TOKEN, SKILLBOX_DO_SSH_KEY_ID, and "
+            "SKILLBOX_TS_AUTHKEY before running real provisioning."
         ),
         "inputSchema": {
             "type": "object",
@@ -741,7 +743,8 @@ def handle_initialize(_params: dict) -> dict:
             "skillbox operator — fleet and container lifecycle from outside the box. "
             "1. Run operator_boxes to see the current fleet. "
             "2. Run operator_profiles to see available box sizes. "
-            "3. Use operator_provision with dry_run=true before creating infrastructure. "
+            "3. Use operator_provision with dry_run=true before creating infrastructure and inspect "
+            "credential_status; missing credentials must be added to .env.box by the operator. "
             "4. CONFIRM WITH USER before operator_teardown — it destroys infrastructure. "
             "5. Use operator_box_exec to run commands on remote boxes. "
             "6. Use operator_doctor to validate the local repo state. "

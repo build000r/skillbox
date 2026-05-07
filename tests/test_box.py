@@ -484,6 +484,8 @@ class BoxTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertEqual(payload["box_id"], "dry-test")
             self.assertTrue(payload["dry_run"])
+            self.assertTrue(payload["credential_status"]["ready"])
+            self.assertEqual(payload["credential_status"]["missing"], [])
             self.assertIn("steps", payload)
             step_names = [s["step"] for s in payload["steps"]]
             self.assertEqual(step_names, ["create", "storage", "bootstrap", "ssh-ready", "enroll", "deploy", "contract", "launch", "first-box", "verify"])
@@ -566,7 +568,31 @@ class BoxTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 1)
             payload = json.loads(result.stdout)
+            self.assertEqual(payload["error"]["type"], "provisioning_credentials_missing")
             self.assertIn("SKILLBOX_DO_TOKEN", payload["error"]["message"])
+            self.assertEqual(
+                payload["credential_status"]["missing"],
+                ["SKILLBOX_DO_TOKEN", "SKILLBOX_DO_SSH_KEY_ID", "SKILLBOX_TS_AUTHKEY"],
+            )
+            self.assertTrue(any("Re-run:" in action for action in payload["next_actions"]))
+
+    def test_up_dry_run_reports_missing_provisioning_credentials_before_real_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._env_with_inventory(tmpdir)
+
+            result = self._run(
+                "up", "needs-creds", "--profile", "dev-small", "--dry-run", "--format", "json",
+                env=env,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertFalse(payload["credential_status"]["ready"])
+            self.assertEqual(
+                payload["credential_status"]["missing"],
+                ["SKILLBOX_DO_TOKEN", "SKILLBOX_DO_SSH_KEY_ID", "SKILLBOX_TS_AUTHKEY"],
+            )
+            self.assertIn("Create or update .env.box", " ".join(payload["next_actions"]))
 
     def test_up_rejects_existing_active_box(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

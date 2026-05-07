@@ -426,6 +426,7 @@ Safety model:
 - the compose overlay publishes only to `127.0.0.1` by default
 - remote access requires opting in with `SKILLBOX_SWIMMERS_PUBLISH_HOST=0.0.0.0` (the helper exports this as `SWIMMERS_BIND`)
 - non-loopback publishing is blocked unless `SKILLBOX_SWIMMERS_AUTH_MODE=token` and `SKILLBOX_SWIMMERS_AUTH_TOKEN` are set
+- remote box status prints the canonical phone/browser URL as `Open this on phone: http://<tailnet-ip>:3210/` and separately reports public SSH, Tailnet ping, MagicDNS resolution, and port reachability
 
 Remote operator example:
 
@@ -775,7 +776,7 @@ make runtime-sync
 | `make swimmers-runtime-status` | Shows the runtime-manager view of the swimmers overlay |
 | `make box-up` | Provision a new remote box (DO + Tailscale) with the SPAPS auth/RBAC blueprint by default, or resume a partial provision with `RESUME=1` |
 | `make box-down` | Tear down a remote box |
-| `make box-status` | Health-check a remote box |
+| `make box-status` | Health-check a remote box, including the phone URL, public SSH, Tailnet ping, MagicDNS, and swimmers port reachability |
 | `make box-list` | List all boxes from inventory |
 | `make box-ssh` | SSH into a remote box |
 | `make box-profiles` | List available box profiles |
@@ -890,6 +891,10 @@ for inspection or development, add `--profile connectors-dev` explicitly.
 
 `SKILLBOX_DO_TOKEN`, `SKILLBOX_DO_SSH_KEY_ID`, and `SKILLBOX_TS_AUTHKEY` are
 required only for fleet management (`operator_provision` / `make box-up`).
+Run `python3 scripts/box.py up <box-id> --profile dev-small --dry-run --format
+json` first and check `credential_status`. If credentials are missing, add the
+missing `KEY=value` lines to `.env.box` on the operator machine before running
+real provisioning.
 
 ### Optional private repo split
 
@@ -1719,6 +1724,16 @@ python3 .env-manager/manage.py doctor --format json
 ```
 
 Check for `SKILL_REPO_UNREACHABLE` (auth/network) or `SKILL_NOT_FOUND_IN_REPO` (bad pick list).
+First-box acceptance also runs a `skill-availability` preflight after sync; if
+it fails, declared skills are not installed cleanly into both managed
+`~/.claude/skills` and `~/.codex/skills` roots.
+
+### SSH login says identity is unknown
+
+The shared SSH login hook no longer prints a warning for every non-interactive
+SSH command. For an interactive diagnostic, set `SKILLBOX_LOGIN_WARN_IDENTITY=1`
+and reconnect; then check `SSH_CLIENT`, `tailscale whois <client-ip>`, and
+Tailnet reachability.
 
 ### SSH works to the host but not the box
 

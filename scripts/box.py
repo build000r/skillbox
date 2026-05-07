@@ -17,6 +17,7 @@ import math
 import os
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -46,6 +47,12 @@ DEFAULT_ROOT_MCP_CONFIG = {
 }
 RESUMABLE_UP_STATES = {"ssh-ready", "deploying", "acceptance", "onboarding"}
 SWIMMERS_ENV_PREFIX = "SKILLBOX_SWIMMERS_"
+DEFAULT_SWIMMERS_PORT = "3210"
+PROVISIONING_ENV_VARS = (
+    "SKILLBOX_DO_TOKEN",
+    "SKILLBOX_DO_SSH_KEY_ID",
+    "SKILLBOX_TS_AUTHKEY",
+)
 
 
 def inventory_path() -> Path:
@@ -302,6 +309,79 @@ def require_env(name: str) -> str:
     return val
 
 
+def missing_env_vars(names: tuple[str, ...] | list[str]) -> list[str]:
+    return [name for name in names if not os.environ.get(name, "").strip()]
+
+
+def provisioning_credentials_next_actions(
+    missing: list[str],
+    *,
+    box_id: str,
+    profile_name: str,
+) -> list[str]:
+    if not missing:
+        return [f"box up {box_id} --profile {profile_name} --deploy-manifest <path>"]
+    return [
+        "Ask the operator for the missing DigitalOcean/Tailscale provisioning values.",
+        "Create or update .env.box on the operator machine with the missing KEY=value lines.",
+        f"Missing: {', '.join(missing)}",
+        f"Re-run: python3 scripts/box.py up {box_id} --profile {profile_name} --dry-run --format json",
+    ]
+
+
+def provisioning_credentials_status() -> dict[str, Any]:
+    missing = missing_env_vars(PROVISIONING_ENV_VARS)
+    configured = [name for name in PROVISIONING_ENV_VARS if name not in missing]
+    return {
+        "ready": not missing,
+        "required": list(PROVISIONING_ENV_VARS),
+        "configured": configured,
+        "missing": missing,
+        "env_files": [".env", ".env.box"],
+        "message": (
+            "Provisioning credentials are ready."
+            if not missing
+            else "Provisioning is blocked until the missing operator-machine credentials are set."
+        ),
+    }
+
+
+def emit_provisioning_credentials_error(*, box_id: str, profile_name: str, is_json: bool) -> int:
+    missing = missing_env_vars(PROVISIONING_ENV_VARS)
+    if not missing:
+        return EXIT_OK
+
+    message = (
+        "Required provisioning credentials are unset: "
+        + ", ".join(missing)
+        + ". Add them to .env.box or export them before running box provisioning."
+    )
+    next_actions = provisioning_credentials_next_actions(
+        missing,
+        box_id=box_id,
+        profile_name=profile_name,
+    )
+    if is_json:
+        payload = structured_error(
+            message,
+            error_type="provisioning_credentials_missing",
+            recovery_hint=(
+                "These are operator-machine credentials, not values to invent inside the box. "
+                "Ask the operator to populate .env.box with SKILLBOX_DO_TOKEN, "
+                "SKILLBOX_DO_SSH_KEY_ID, and SKILLBOX_TS_AUTHKEY, then rerun the dry-run."
+            ),
+            next_actions=next_actions,
+        )
+        payload["credential_status"] = provisioning_credentials_status()
+        emit_json(payload)
+    else:
+        print(message, file=sys.stderr)
+        print("Next actions:", file=sys.stderr)
+        for action in next_actions:
+            print(f"  - {action}", file=sys.stderr)
+    return EXIT_ERROR
+
+
 def optional_env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
@@ -465,6 +545,91 @@ def probe_registered_box(box: "Box", *, enabled: bool) -> dict[str, Any]:
     if parsed["tailscale_ip"]:
         payload["tailscale_ip"] = parsed["tailscale_ip"]
     return payload
+
+
+def swimmers_port() -> str:
+    return os.environ.get("SKILLBOX_SWIMMERS_PORT", DEFAULT_SWIMMERS_PORT).strip() or DEFAULT_SWIMMERS_PORT
+
+
+def browser_url_for(host: str | None, *, port: str | None = None) -> str | None:
+    value = str(host or "").strip()
+    if not value:
+        return None
+    return f"http://{value}:{port or swimmers_port()}/"
+
+
+def _check_public_ssh(box: "Box") -> dict[str, Any]:
+    target = str(box.droplet_ip or "").strip()
+    payload: dict[str, Any] = {"target": target or None, "ok": False}
+    if not target:
+        return payload
+    try:
+        result = ssh_cmd(box.ssh_user, target, "echo ok", timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        payload["error"] = str(exc)
+        return payload
+    payload["ok"] = result.returncode == 0 and "ok" in result.stdout
+    if not payload["ok"] and result.stderr:
+        payload["error"] = result.stderr[-200:]
+    return payload
+
+
+def _check_tailnet_ping(box: "Box") -> dict[str, Any]:
+    target = str(box.tailscale_ip or box.tailscale_hostname or "").strip()
+    payload: dict[str, Any] = {"target": target or None, "ok": False}
+    if not target:
+        return payload
+    try:
+        result = run(["tailscale", "ping", "--timeout=2s", "--c=1", target], check=False, timeout=5)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+        payload["error"] = str(exc)
+        return payload
+    payload["ok"] = result.returncode == 0
+    if not payload["ok"]:
+        detail = (result.stderr or result.stdout).strip()
+        if detail:
+            payload["error"] = detail[-200:]
+    return payload
+
+
+def _check_magicdns_resolution(hostname: str | None) -> dict[str, Any]:
+    host = str(hostname or "").strip()
+    payload: dict[str, Any] = {"hostname": host or None, "ok": False, "resolved_ip": None}
+    if not host:
+        return payload
+    try:
+        resolved_ip = socket.gethostbyname(host)
+    except OSError as exc:
+        payload["error"] = str(exc)
+        return payload
+    payload["ok"] = True
+    payload["resolved_ip"] = resolved_ip
+    return payload
+
+
+def _check_port_reachability(host: str | None, port: str) -> dict[str, Any]:
+    target = str(host or "").strip()
+    payload: dict[str, Any] = {"target": target or None, "port": port, "ok": False}
+    if not target:
+        return payload
+    try:
+        with socket.create_connection((target, int(port)), timeout=2):
+            payload["ok"] = True
+    except (OSError, ValueError) as exc:
+        payload["error"] = str(exc)
+    return payload
+
+
+def box_network_health(box: "Box") -> dict[str, Any]:
+    port = swimmers_port()
+    magicdns = _check_magicdns_resolution(box.tailscale_hostname)
+    port_target = str(box.tailscale_ip or "").strip() or str(magicdns.get("resolved_ip") or "").strip()
+    return {
+        "public_ssh": _check_public_ssh(box),
+        "tailnet_ping": _check_tailnet_ping(box),
+        "magicdns_resolution": magicdns,
+        "port_reachability": _check_port_reachability(port_target, port),
+    }
 
 
 def scp_file(local_path: Path, user: str, host: str, remote_path: str, *, timeout: int = 600) -> subprocess.CompletedProcess[str]:
@@ -705,6 +870,13 @@ def remote_box_contract_payload(context: "BoxUpContext") -> dict[str, Any]:
         storage_min_free_gb = context.profile.storage.min_free_gb
 
     env_updates: dict[str, str] = {}
+    env_updates.update({
+        "SKILLBOX_BOX_ID": context.box_id,
+        "SKILLBOX_BOX_SELF": "true",
+        "SKILLBOX_BOX_TAILSCALE_HOSTNAME": context.ts_hostname,
+    })
+    if context.box.tailscale_ip:
+        env_updates["SKILLBOX_BOX_TAILSCALE_IP"] = context.box.tailscale_ip
     if context.profile.storage is not None:
         env_updates.update({
             "SKILLBOX_STORAGE_PROVIDER": context.box.storage_provider or context.profile.storage.provider,
@@ -1426,9 +1598,14 @@ def _box_up_dry_run_payload(context: BoxUpContext) -> dict[str, Any]:
         "profile": asdict(context.profile),
         "dry_run": True,
         "steps": context.steps,
+        "credential_status": provisioning_credentials_status(),
         "storage": storage_payload(context.profile.storage),
         "volume": volume_payload(context.box),
-        "next_actions": [f"box up {context.box_id} --profile {context.profile_name} --deploy-manifest <path>"],
+        "next_actions": provisioning_credentials_next_actions(
+            missing_env_vars(PROVISIONING_ENV_VARS),
+            box_id=context.box_id,
+            profile_name=context.profile_name,
+        ),
     }
     if context.deploy_release is not None:
         payload["deploy_release"] = deploy_release_payload(context.deploy_release)
@@ -1696,7 +1873,7 @@ def _verify_operator_swimmers_surface(context: BoxUpContext) -> dict[str, Any]:
             f"SKILLBOX_SWIMMERS_AUTH_TOKEN or {derived_swimmers_auth_token_env(context.box_id)}."
         )
 
-    port = os.environ.get("SKILLBOX_SWIMMERS_PORT", "3210").strip() or "3210"
+    port = swimmers_port()
     url = f"http://{ts_ip}:{port}/v1/sessions"
     request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
     try:
@@ -1763,6 +1940,7 @@ def _run_box_first_box(context: BoxUpContext, *, blueprint: str | None, set_args
 
 def _box_up_success_payload(context: BoxUpContext) -> dict[str, Any]:
     ssh_target = context.ssh_target or context.box.tailscale_ip or context.ts_hostname or context.box.droplet_ip
+    phone_url = browser_url_for(context.box.tailscale_ip)
     payload = {
         "box_id": context.box_id,
         "profile": asdict(context.profile),
@@ -1771,6 +1949,9 @@ def _box_up_success_payload(context: BoxUpContext) -> dict[str, Any]:
         "droplet_ip": context.box.droplet_ip,
         "tailscale_hostname": context.ts_hostname,
         "tailscale_ip": context.box.tailscale_ip,
+        "phone_url": phone_url,
+        "browser_url": phone_url,
+        "magicdns_url": browser_url_for(context.ts_hostname),
         "ssh": f"ssh {context.profile.ssh_user}@{ssh_target}" if ssh_target else None,
         "steps": context.steps,
         "storage": storage_payload(context.profile.storage),
@@ -2053,6 +2234,14 @@ def cmd_up(
         if is_json:
             emit_json(payload)
         return EXIT_OK
+
+    credentials_result = emit_provisioning_credentials_error(
+        box_id=box_id,
+        profile_name=profile_name,
+        is_json=is_json,
+    )
+    if credentials_result != EXIT_OK:
+        return credentials_result
 
     do_token = require_env("SKILLBOX_DO_TOKEN")
     ssh_key_id = require_env("SKILLBOX_DO_SSH_KEY_ID")
@@ -2728,6 +2917,7 @@ def cmd_status(box_id: str | None, *, fmt: str) -> int:
 
 
 def box_health(box: Box) -> dict[str, Any]:
+    phone_url = browser_url_for(box.tailscale_ip)
     status: dict[str, Any] = {
         "id": box.id,
         "state": box.state,
@@ -2749,6 +2939,10 @@ def box_health(box: Box) -> dict[str, Any]:
         "ssh_target": None,
         "ssh_reachable": False,
         "container_running": False,
+        "phone_url": phone_url,
+        "browser_url": phone_url,
+        "magicdns_url": None,
+        "network_checks": {},
     }
 
     if box.state in ("destroyed", "creating"):
@@ -2766,6 +2960,11 @@ def box_health(box: Box) -> dict[str, Any]:
                 timeout=15,
             )
             status["container_running"] = container_probe.returncode == 0 and "workspace" in container_probe.stdout
+
+    network_checks = box_network_health(box)
+    status["network_checks"] = network_checks
+    if network_checks["magicdns_resolution"].get("ok"):
+        status["magicdns_url"] = browser_url_for(box.tailscale_hostname)
 
     next_actions: list[str] = []
     if not status["ssh_reachable"]:
@@ -2795,6 +2994,22 @@ def print_box_status_text(status: dict[str, Any]) -> None:
     if status.get("ssh_reachable"):
         connect_target = status.get("ssh_target") or status.get("tailscale_ip") or ts
         print(f"  connect: ssh {status['ssh_user']}@{connect_target}")
+    if status.get("phone_url"):
+        print(f"Open this on phone: {status['phone_url']}")
+    if status.get("magicdns_url"):
+        print(f"MagicDNS: {status['magicdns_url']}")
+    network_checks = status.get("network_checks") or {}
+    if network_checks:
+        print("  network:")
+        for label, check in (
+            ("public SSH", network_checks.get("public_ssh") or {}),
+            ("Tailnet ping", network_checks.get("tailnet_ping") or {}),
+            ("MagicDNS", network_checks.get("magicdns_resolution") or {}),
+            ("port", network_checks.get("port_reachability") or {}),
+        ):
+            state = "ok" if check.get("ok") else "fail"
+            target = check.get("target") or check.get("hostname") or "n/a"
+            print(f"    - {label}: {state} ({target})")
 
 
 # ---------------------------------------------------------------------------

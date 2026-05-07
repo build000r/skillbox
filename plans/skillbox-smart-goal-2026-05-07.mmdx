@@ -1,0 +1,244 @@
+<!-- mmdx
+{
+  "entry": "main",
+  "links": [
+    {
+      "from": "main",
+      "label": "Reality Baseline",
+      "to": "reality-gap",
+      "title": "Open current reality and proof gaps"
+    },
+    {
+      "from": "main",
+      "label": "Goal Contract",
+      "to": "goal-contract",
+      "title": "Open the remote operator trust release contract"
+    },
+    {
+      "from": "main",
+      "label": "Build Vs Clone",
+      "to": "build-vs-clone",
+      "title": "Open placement decisions for each workstream"
+    },
+    {
+      "from": "main",
+      "label": "Skill Drift Gate",
+      "to": "routing",
+      "title": "Open the first hardening route"
+    },
+    {
+      "from": "main",
+      "label": "Ambition And Refinement",
+      "to": "ambition-loop",
+      "title": "Open plan-space ambition and refinement loops"
+    },
+    {
+      "from": "main",
+      "label": "Hotspot Hardening",
+      "to": "hardening-loop",
+      "title": "Open recurring hardening loop"
+    },
+    {
+      "from": "main",
+      "label": "Final Proof Gate",
+      "to": "proof-gate",
+      "title": "Open final proof gate"
+    }
+  ]
+}
+-->
+
+## chart main Skillbox Remote Operator Trust Gantt
+```mermaid
+gantt
+  title Smart Goal Tracker - Skillbox Remote Operator Trust RC
+  dateFormat  YYYY-MM-DD
+  axisFormat  %b %d
+
+  section Now: Reality
+  Reality Baseline          :done, reality, 2026-05-07, 1d
+  Unit Test Baseline Green  :done, tests-green, 2026-05-07, 1d
+  Doctor Skill Drift        :crit, active, skill-drift, 2026-05-07, 1d
+  CRAP Hotspots Above Bar   :crit, active, crap-hotspots, 2026-05-07, 1d
+
+  section Goal Contract
+  Goal Contract             :crit, contract, 2026-05-07, 1d
+  Build Vs Clone            :bvc, 2026-05-07, 1d
+  Tracker Baseline          :milestone, baseline, 2026-05-08, 0d
+
+  section P0 Restore Local Trust
+  Sync Default Skills       :crit, sync-skills, 2026-05-08, 1d
+  Doctor Zero Fail          :milestone, doctor-zero, after sync-skills, 0d
+  Acceptance Drift Proof    :crit, acceptance-drift, 2026-05-08, 1d
+
+  section P1 Box Lifecycle Proof
+  Describe Operator Contract :active, describe-contract, after doctor-zero, 1d
+  Reproduce Dry Run And Status:reproduce, after describe-contract, 1d
+  First Hardening Round      :crit, harden1, after reproduce, 2d
+  P1 Reality Recheck         :milestone, recheck1, after harden1, 0d
+
+  section P2 Hotspot Reduction
+  scripts/box.py Under 30    :crit, box-crap, after recheck1, 3d
+  workflows Acceptance Proof :crit, workflow-proof, after recheck1, 2d
+  Mutation Or Deferral Note  :mutate, after box-crap, 1d
+  P2 Reality Recheck         :milestone, recheck2, after workflow-proof, 0d
+
+  section P3 Operator Evidence
+  Operator MCP Smoke         :operator-smoke, after recheck2, 1d
+  First Box Acceptance Smoke :crit, first-box, after operator-smoke, 1d
+  Phone URL Status Proof     :status-proof, after first-box, 1d
+
+  section Finish
+  Docs And Skill Text Align  :docs, after status-proof, 1d
+  Validate Commit Recheck    :crit, final-check, after docs, 1d
+  Remote Operator Trust RC Met:milestone, rc-met, after final-check, 0d
+```
+
+## chart goal-contract Remote Operator Trust Contract
+```mermaid
+flowchart TD
+  current["CURRENT: skillbox already has runtime graphs, first-box acceptance, box lifecycle tooling, operator MCP, shared-jam docs, and tests"]
+  working["WORKING: 875 unittest tests pass; box dry-run exposes credential_status; status paths expose phone_url and MagicDNS fields in code and tests"]
+  gaps["GAPS: make doctor fails on default skill install drift; scripts/box.py CRAP is above 30; the remote operator path has not been proven from clean state"]
+  goal["LOFTY END GOAL: a committed remote operator trust release candidate that can provision, accept, status-check, and explain a box without hidden local state"]
+  bars["QUALITY BARS: doctor zero fail, current coverage XML, scoped CRAP below 30 or explicit blocker, reproduce evidence, aligned README and skill docs"]
+  proof["DONE: validate, commit if authorized, then post-commit reality check agrees the remote operator path is trustworthy"]
+
+  current --> working --> gaps --> goal --> bars --> proof
+
+  classDef ok fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:2px
+  classDef risk fill:#fee2e2,stroke:#dc2626,color:#7f1d1d,stroke-width:2px
+  classDef goalc fill:#ede9fe,stroke:#7c3aed,color:#3b0764,stroke-width:2px
+  class working,proof ok
+  class gaps risk
+  class goal,bars goalc
+```
+
+## chart reality-gap Current Reality And Proof Gaps
+```mermaid
+flowchart LR
+  vision["Vision: one private Tailnet workstation with durable state, explicit runtime contracts, and low ceremony"]
+  code["Code delta: credential preflight, box access env, phone URLs, network checks, login warning control, skill-availability acceptance"]
+  tests["Proof: python3 -m unittest discover -s tests passes 875 tests, 1 skipped"]
+  doctor["BLOCKER: make doctor fails because default skill installs drift from lockfile"]
+  coverage["Proof: make python-cov-xml refreshes coverage.xml with 85% total line coverage"]
+  crap["BLOCKER: scripts/box.py FINAL_SCORE 333.61; workflows.py 19.47 and runtime_ops.py 19.94 are below 30"]
+  plans["Plans: overlay plan dirs absent; tracked distribution workgraph is done; May 5 smart tracker now superseded by this operator-trust slice"]
+  unknown["UNKNOWN: live remote box/phone-browser proof requires explicit operator infrastructure run"]
+
+  vision --> code --> tests
+  tests --> coverage
+  coverage --> doctor
+  tests --> crap
+  code --> plans
+  code --> unknown
+
+  classDef ok fill:#dcfce7,stroke:#16a34a,color:#14532d
+  classDef high fill:#fee2e2,stroke:#dc2626,color:#7f1d1d,stroke-width:2px
+  classDef med fill:#fef3c7,stroke:#d97706,color:#78350f
+  classDef neutral fill:#f8fafc,stroke:#64748b,color:#0f172a
+  class tests ok
+  class doctor,crap high
+  class unknown med
+  class vision,code,plans neutral
+```
+
+## chart routing First Hardening Route
+```mermaid
+flowchart TD
+  start["Start from current dirty worktree"]
+  drift["Skill Drift Gate: default skills have 28 healthy targets out of 34"]
+  dryrun["sync dry-run shows reinstall actions for all default skills and context writes"]
+  sync["Run python3 .env-manager/manage.py sync --format json"]
+  doctor["Run make doctor until zero fail"]
+  acceptance["Prove first-box acceptance fails before focus when skill-availability fails, then passes after sync"]
+  describe["Use describe for credential_status, phone URL, network checks, login warning, and acceptance behavior"]
+  reproduce["Use reproduce for dry-run, status, MCP initialize text, and docs examples"]
+
+  start --> drift --> dryrun --> sync --> doctor --> acceptance --> describe --> reproduce
+
+  classDef crit fill:#fee2e2,stroke:#dc2626,color:#7f1d1d,stroke-width:2px
+  classDef action fill:#f8fafc,stroke:#64748b,color:#0f172a
+  class drift,sync,doctor,acceptance crit
+  class start,dryrun,describe,reproduce action
+```
+
+## chart build-vs-clone Placement Calls
+```mermaid
+flowchart TD
+  start["Remote operator trust slice"]
+  runtime["EXISTING REPO: runtime status, acceptance, box lifecycle, operator MCP, and docs belong in skillbox"]
+  skills["SKILL / MODULE: reusable operator guidance stays in skills/skillbox-operator/SKILL.md inside this repo until extracted pressure is real"]
+  no_new["NO NEW REPO: the ownership boundary is already the box runtime/distribution platform"]
+  later["LATER CROSS-REPO: hosted distributor server and laptop UX stay out of this RC"]
+
+  start --> runtime
+  start --> skills
+  start --> no_new
+  start --> later
+
+  classDef decision fill:#ede9fe,stroke:#7c3aed,color:#3b0764,stroke-width:2px
+  classDef action fill:#f8fafc,stroke:#64748b,color:#0f172a
+  class start decision
+  class runtime,skills,no_new,later action
+```
+
+## chart ambition-loop Ambition And Refinement
+```mermaid
+flowchart TD
+  baseline["Reality baseline: tests pass, doctor fails, CRAP high, remote proof not yet clean"]
+  round1["Ambition pass 1: make failures impossible to miss before infrastructure is touched"]
+  round2["Ambition pass 2: make phone/browser access discoverable from every relevant status surface"]
+  round3["Domain depth: operator safety, Tailnet reachability, skill installation integrity, shell login attribution"]
+  workgraph["Convert remaining gaps to beads or WORKGRAPH nodes only after the proof contract is sharp"]
+  refine["Refine until every claim maps to one command, test, or explicit operator gate"]
+  frontier["Ready frontier: sync, doctor, describe, reproduce, CRAP, docs, final reality check"]
+
+  baseline --> round1 --> round2 --> round3 --> workgraph --> refine --> frontier
+
+  classDef ambition fill:#ede9fe,stroke:#7c3aed,color:#3b0764,stroke-width:2px
+  classDef ready fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:2px
+  class round1,round2,round3,refine ambition
+  class frontier ready
+```
+
+## chart hardening-loop Recurring Hotspot Hardening Loop
+```mermaid
+stateDiagram-v2
+  [*] --> Describe
+  Describe --> Reproduce
+  Reproduce --> RefreshCoverage
+  RefreshCoverage --> CRAP
+  CRAP --> Implement
+  Implement --> Tests
+  Tests --> Docs
+  Docs --> RealityCheck
+  RealityCheck --> NextWave: gaps remain
+  RealityCheck --> Mutation: CRAP below 30 and scope is stable
+  RealityCheck --> ProofGate: evidence passes
+  Mutation --> ProofGate
+  NextWave --> Describe
+  ProofGate --> [*]
+```
+
+## chart proof-gate Final Proof Gate
+```mermaid
+flowchart TD
+  tests["python3 -m unittest discover -s tests passes"]
+  coverage["make python-cov-xml refreshes coverage.xml"]
+  doctor["make doctor has zero failures"]
+  dryrun["scripts/box.py up <id> --dry-run --format json reports credential_status and next_actions"]
+  status["box status and runtime status expose phone_url, browser_url, MagicDNS, and network checks"]
+  crap["scoped CRAP below 30 or explicit blocker with describe plan"]
+  docs["README and skillbox-operator SKILL.md match behavior"]
+  commit["Commit if authorized"]
+  reality["Post-commit reality check agrees"]
+  done["REMOTE OPERATOR TRUST RC MET"]
+
+  tests --> coverage --> doctor --> dryrun --> status --> crap --> docs --> commit --> reality --> done
+
+  classDef required fill:#fee2e2,stroke:#dc2626,color:#7f1d1d,stroke-width:2px
+  classDef passed fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:2px
+  class tests,dryrun passed
+  class coverage,doctor,status,crap,docs,commit,reality required
+```

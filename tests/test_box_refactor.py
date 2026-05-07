@@ -17,6 +17,12 @@ BOX = SourceFileLoader(
     str(BOX_SCRIPT.resolve()),
 ).load_module()
 
+FAKE_PROVISIONING_ENV = {
+    "SKILLBOX_DO_TOKEN": "do-token",
+    "SKILLBOX_DO_SSH_KEY_ID": "ssh-key",
+    "SKILLBOX_TS_AUTHKEY": "ts-auth",
+}
+
 
 def _completed(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(["mock"], returncode, stdout=stdout, stderr=stderr)
@@ -101,6 +107,7 @@ class BoxRefactorTests(unittest.TestCase):
         with mock.patch.object(BOX, "load_profile", return_value=profile), \
             mock.patch.object(BOX, "load_inventory", return_value=[]), \
             mock.patch.object(BOX, "load_deploy_manifest", return_value=_release()), \
+            mock.patch.dict(os.environ, FAKE_PROVISIONING_ENV), \
             mock.patch.object(BOX, "require_env", side_effect=["do-token", "ssh-key", "ts-auth"]), \
             mock.patch.object(BOX, "do_create_droplet", return_value={"id": 42}), \
             mock.patch.object(BOX, "do_droplet_public_ip", return_value="1.2.3.4"), \
@@ -154,6 +161,7 @@ class BoxRefactorTests(unittest.TestCase):
         with mock.patch.object(BOX, "load_profile", return_value=profile), \
             mock.patch.object(BOX, "load_inventory", return_value=[]), \
             mock.patch.object(BOX, "load_deploy_manifest", return_value=_release()), \
+            mock.patch.dict(os.environ, FAKE_PROVISIONING_ENV), \
             mock.patch.object(BOX, "require_env", side_effect=["do-token", "ssh-key", "ts-auth"]), \
             mock.patch.object(BOX, "do_create_droplet", return_value={"id": 42}), \
             mock.patch.object(BOX, "do_droplet_public_ip", return_value="1.2.3.4"), \
@@ -282,6 +290,7 @@ class BoxRefactorTests(unittest.TestCase):
         with mock.patch.object(BOX, "load_profile", return_value=profile), \
             mock.patch.object(BOX, "load_inventory", return_value=[]), \
             mock.patch.object(BOX, "load_deploy_manifest", return_value=_release()), \
+            mock.patch.dict(os.environ, FAKE_PROVISIONING_ENV), \
             mock.patch.object(BOX, "require_env", side_effect=["do-token", "ssh-key", "ts-auth"]), \
             mock.patch.object(BOX, "do_create_droplet", return_value={"id": 42}), \
             mock.patch.object(BOX, "do_droplet_public_ip", return_value="1.2.3.4"), \

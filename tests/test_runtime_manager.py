@@ -933,6 +933,27 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(payload["skills"][0]["skill_count"], 0)
             self.assertIn("internal-env-manager", {item["id"] for item in payload["services"]})
 
+    def test_status_reports_in_box_phone_url_from_remote_contract_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            with mock.patch.dict(os.environ, {
+                "SKILLBOX_BOX_SELF": "true",
+                "SKILLBOX_BOX_ID": "portfolio-devbox",
+                "SKILLBOX_BOX_TAILSCALE_IP": "100.86.253.9",
+                "SKILLBOX_BOX_TAILSCALE_HOSTNAME": "portfolio-devbox",
+                "SKILLBOX_SWIMMERS_PORT": "3210",
+            }):
+                text_result = self._run(repo, "status")
+                json_result = self._run(repo, "status", "--format", "json", "--compact")
+
+            self.assertEqual(text_result.returncode, 0, text_result.stderr)
+            self.assertIn("Open this on phone: http://100.86.253.9:3210/", text_result.stdout)
+            payload = json.loads(json_result.stdout)
+            self.assertTrue(payload["box_access"]["self"])
+            self.assertEqual(payload["box_access"]["phone_url"], "http://100.86.253.9:3210/")
+
     def test_up_skips_status_only_services_and_logs_show_recent_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -6439,10 +6460,11 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertTrue(payload["ready"])
             self.assertEqual(
                 [step["step"] for step in payload["steps"]],
-                ["doctor-pre", "sync", "focus", "mcp-smoke", "doctor-post"],
+                ["doctor-pre", "sync", "skill-availability", "focus", "mcp-smoke", "doctor-post"],
             )
             self.assertEqual(payload["active_profiles"], ["core"])
-            tool_names = payload["steps"][3]["detail"]["servers"]["skillbox"]["tool_names"]
+            self.assertEqual(payload["steps"][2]["status"], "ok")
+            tool_names = payload["steps"][4]["detail"]["servers"]["skillbox"]["tool_names"]
             self.assertIn("skillbox_status", tool_names)
             self.assertIn("skillbox_focus", tool_names)
 
@@ -6493,6 +6515,59 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(focus_args, ["focus", "personal", "--wait-seconds", "42.5", "--format", "json"])
             self.assertTrue(captured_payloads[0]["ready"])
 
+    def test_acceptance_fails_before_focus_when_skill_availability_fails_after_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            captured_payloads: list[dict[str, object]] = []
+            doctor_calls = 0
+
+            def fake_run_manage_json_command(root_dir: Path, args: list[str]) -> tuple[int, dict[str, object]]:
+                nonlocal doctor_calls
+                del root_dir
+                command = args[0]
+                if command == "doctor":
+                    doctor_calls += 1
+                    if doctor_calls == 1:
+                        return MANAGE_MODULE.EXIT_OK, {"checks": []}
+                    return MANAGE_MODULE.EXIT_DRIFT, {
+                        "checks": [
+                            {
+                                "status": "fail",
+                                "code": "skill-repo-install",
+                                "message": "installed skills drifted from declared repos",
+                            }
+                        ],
+                        "next_actions": ["sync --client personal --format json"],
+                    }
+                if command == "sync":
+                    return MANAGE_MODULE.EXIT_OK, {"actions": []}
+                if command == "focus":
+                    raise AssertionError("focus should not run after skill availability failure")
+                raise AssertionError(f"Unexpected command: {args}")
+
+            with mock.patch.dict(
+                MANAGE_MODULE.run_acceptance.__globals__,
+                {
+                    "run_manage_json_command": fake_run_manage_json_command,
+                    "emit_json": captured_payloads.append,
+                },
+            ):
+                result = MANAGE_MODULE.run_acceptance(
+                    root_dir=repo,
+                    client_id="personal",
+                    profiles=[],
+                    wait_seconds=1.0,
+                    fmt="json",
+                )
+
+            self.assertEqual(result, MANAGE_MODULE.EXIT_ERROR)
+            payload = captured_payloads[0]
+            steps = {step["step"]: step for step in payload["steps"]}  # type: ignore[index]
+            self.assertEqual(payload["error"]["type"], "skill_availability_failed")  # type: ignore[index]
+            self.assertEqual(steps["skill-availability"]["status"], "fail")
+            self.assertEqual(steps["focus"]["status"], "skip")
+
     def test_acceptance_succeeds_only_when_connector_mcp_surfaces_are_live(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -6509,9 +6584,9 @@ class RuntimeManagerTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertTrue(payload["ready"])
             self.assertEqual(payload["active_profiles"], ["connectors", "core"])
-            self.assertEqual(payload["steps"][3]["detail"]["servers_ok"], ["skillbox", "cm", "fwc", "dcg"])
+            self.assertEqual(payload["steps"][4]["detail"]["servers_ok"], ["skillbox", "cm", "fwc", "dcg"])
             self.assertEqual(
-                set(payload["steps"][2]["detail"]["services"]),
+                set(payload["steps"][3]["detail"]["services"]),
                 {"internal-env-manager", "cm-mcp", "fwc-mcp", "dcg-mcp"},
             )
 
@@ -6553,9 +6628,9 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertTrue(payload["ready"])
             self.assertEqual(
                 step_names,
-                ["doctor-pre", "sync", "focus", "mcp-smoke", "workflow-probe", "doctor-post"],
+                ["doctor-pre", "sync", "skill-availability", "focus", "mcp-smoke", "workflow-probe", "doctor-post"],
             )
-            probe_step = payload["steps"][4]
+            probe_step = payload["steps"][5]
             self.assertEqual(probe_step["status"], "ok")
             self.assertEqual(probe_step["detail"]["cwd"], str((repo / "workspace").resolve()))
             probe_payload = json.loads(probe_output.read_text(encoding="utf-8"))
@@ -6685,7 +6760,7 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertTrue(payload["ready"])
             self.assertEqual(
                 [step["step"] for step in payload["steps"]],
-                ["doctor-pre", "sync", "focus", "mcp-smoke", "doctor-post"],
+                ["doctor-pre", "sync", "skill-availability", "focus", "mcp-smoke", "doctor-post"],
             )
 
     def test_acceptance_fails_before_activation_when_client_connectors_exceed_box_superset(self) -> None:

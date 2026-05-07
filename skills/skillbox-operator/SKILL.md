@@ -210,6 +210,41 @@ python3 .env-manager/manage.py down --client <id> [--service <id>]
 
 Create and destroy full infrastructure from the operator's machine using `scripts/box.py`.
 
+### Provisioning Credential Preflight
+
+Before any real `box up` or `operator_provision` run, dry-run and inspect
+`credential_status`:
+
+```bash
+python3 scripts/box.py up <client-id> --profile dev-small --dry-run --format json
+```
+
+If `credential_status.ready` is `false`, stop before provisioning and give the
+operator this unblock packet:
+
+```text
+I am blocked before provisioning because these operator-machine credentials are unset:
+- SKILLBOX_DO_TOKEN
+- SKILLBOX_DO_SSH_KEY_ID
+- SKILLBOX_TS_AUTHKEY
+
+Please add the missing KEY=value lines to .env.box at the skillbox repo root,
+or export them in the shell that launches the agent:
+
+SKILLBOX_DO_TOKEN=<DigitalOcean API token with droplet/volume/SSH-key access>
+SKILLBOX_DO_SSH_KEY_ID=<DigitalOcean SSH key ID>
+SKILLBOX_TS_AUTHKEY=<Tailscale auth key>
+
+Then rerun:
+python3 scripts/box.py up <client-id> --profile dev-small --dry-run --format json
+```
+
+`SKILLBOX_DO_SSH_KEY_ID` is the DigitalOcean SSH key ID, not the local public
+key text. The operator can find it with `doctl compute ssh-key list --format
+ID,Name,Fingerprint` or in the DigitalOcean UI. `SKILLBOX_TS_AUTHKEY` must come
+from the Tailscale admin console. Do not invent, echo, or commit these values;
+`.env.box` is local operator state.
+
 ```bash
 # List available box profiles
 python3 scripts/box.py profiles --format json
@@ -233,7 +268,24 @@ python3 scripts/box.py down <client-id> --format json
 python3 scripts/box.py list --format json
 ```
 
-Required env vars in `.env` or `.env.box`: `SKILLBOX_DO_TOKEN`, `SKILLBOX_DO_SSH_KEY_ID`, `SKILLBOX_TS_AUTHKEY`.
+The dry-run returns `credential_status.required`, `configured`, and `missing`.
+Missing credentials mean real provisioning is blocked until `.env.box` or the
+agent-launching shell contains the required values.
+
+`box status` includes `phone_url` / `browser_url`, `magicdns_url`, and
+`network_checks` for public SSH, Tailnet ping, MagicDNS resolution, and port
+reachability. In text mode, surface the line beginning `Open this on phone:`
+when the operator wants to test from a phone browser.
+
+Remote first-box acceptance runs a `skill-availability` gate after sync. Treat a
+failure there as a hard blocker: declared runtime skills did not install into
+the managed Claude/Codex skill roots and the agent session will not reliably
+recognize the expected `$skill` invocations.
+
+Remote boxes are marked with `SKILLBOX_BOX_SELF=true`, `SKILLBOX_BOX_ID`, and
+the Tailscale hostname/IP in `.env` so in-box status surfaces can identify
+self-targets instead of treating the same VPS as a separate remote launch
+target.
 
 Box profiles live in `workspace/box-profiles/*.yaml` and declare region, size, image, and ssh user.
 

@@ -55,10 +55,6 @@ resolve_identity() {
 SKILLBOX_DEV="$(resolve_identity)"
 export SKILLBOX_DEV
 
-if [[ "$SKILLBOX_DEV" == "unknown" ]]; then
-  echo "skillbox-login: WARNING — could not resolve Tailscale identity. Continuing as 'unknown'." >&2
-fi
-
 # --- Sanitize session name (strip @domain, replace non-alnum with dash) ---
 sanitize_session_name() {
   local name="$1"
@@ -80,6 +76,10 @@ if [[ -n "${SSH_ORIGINAL_COMMAND:-}" ]]; then
     GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-unknown}" \
     GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-unknown}" \
     bash -c "$SSH_ORIGINAL_COMMAND"
+fi
+
+if [[ "$SKILLBOX_DEV" == "unknown" && "${SKILLBOX_LOGIN_WARN_IDENTITY:-0}" == "1" ]]; then
+  echo "skillbox-login: identity unresolved; continuing as 'unknown'. Check SSH_CLIENT, tailscale whois, and tailnet reachability." >&2
 fi
 
 # --- PROMPT_COMMAND for shared history logging ---
