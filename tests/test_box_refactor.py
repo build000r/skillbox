@@ -5,7 +5,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from importlib.machinery import SourceFileLoader
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -329,6 +331,36 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertEqual(payloads[-1]["error"]["type"], "first_box_failed")
         self.assertEqual(payloads[-1]["steps"][-1]["step"], "first-box")
         self.assertEqual(payloads[-1]["steps"][-1]["status"], "fail")
+
+    def test_cmd_profiles_json_and_text_outputs_profiles(self) -> None:
+        profile = BOX.BoxProfile(id="tiny", region="sfo3", size="s-1vcpu-1gb", image="ubuntu", storage=_storage())
+        payloads: list[dict[str, object]] = []
+
+        with mock.patch.object(BOX, "list_profiles", return_value=[profile]), \
+            mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
+            result = BOX.cmd_profiles(fmt="json")
+
+        self.assertEqual(result, BOX.EXIT_OK)
+        self.assertEqual(payloads[-1]["profiles"][0]["id"], "tiny")
+
+        stdout = StringIO()
+        with mock.patch.object(BOX, "list_profiles", return_value=[profile]), redirect_stdout(stdout):
+            result = BOX.cmd_profiles(fmt="text")
+
+        self.assertEqual(result, BOX.EXIT_OK)
+        self.assertIn("tiny", stdout.getvalue())
+        self.assertIn("state_root=/srv/skillbox", stdout.getvalue())
+
+    def test_cmd_profiles_text_handles_empty_profile_dir(self) -> None:
+        stdout = StringIO()
+
+        with mock.patch.object(BOX, "list_profiles", return_value=[]), \
+            mock.patch.object(BOX, "PROFILES_DIR", Path("/profiles")), \
+            redirect_stdout(stdout):
+            result = BOX.cmd_profiles(fmt="text")
+
+        self.assertEqual(result, BOX.EXIT_OK)
+        self.assertIn("No profiles found in /profiles", stdout.getvalue())
 
     def test_cmd_down_marks_box_destroyed_and_reports_steps(self) -> None:
         box = BOX.Box(

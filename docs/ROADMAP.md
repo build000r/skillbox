@@ -36,7 +36,7 @@ run Codex-backed workers through the same broker contract. Production use still
 requires the operator to install/authenticate the selected runtime and pin the
 command in the active environment.
 The current local quality bar is explicit: `make python-cov-xml` passes with
-859 tests and 85.02% exact line coverage; full `.env-manager` CRAP is 19.94;
+877 tests, 1 skipped, and 85% total line coverage; full `.env-manager` CRAP is 22.20;
 the Codex adapter CRAP is 9.00; and a real Codex-backed broker run succeeded as
 `wr_20260505_073758_d41cda`.
 The hosted distributor service, standalone laptop UX, short-lived token
