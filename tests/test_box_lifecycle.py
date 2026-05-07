@@ -3,7 +3,9 @@ from __future__ import annotations
 import os
 import subprocess
 import unittest
+from contextlib import redirect_stdout
 from importlib.machinery import SourceFileLoader
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -14,6 +16,12 @@ BOX_MODULE = SourceFileLoader(
     "skillbox_box_lifecycle",
     str(BOX_SCRIPT.resolve()),
 ).load_module()
+
+FAKE_PROVISIONING_ENV = {
+    "SKILLBOX_DO_TOKEN": "do-token",
+    "SKILLBOX_DO_SSH_KEY_ID": "ssh-key",
+    "SKILLBOX_TS_AUTHKEY": "ts-auth",
+}
 
 
 class BoxLifecycleTests(unittest.TestCase):
@@ -250,6 +258,7 @@ class BoxLifecycleTests(unittest.TestCase):
         with (
             mock.patch.object(BOX_MODULE, "load_profile", return_value=profile),
             mock.patch.object(BOX_MODULE, "load_inventory", return_value=[]),
+            mock.patch.dict(os.environ, FAKE_PROVISIONING_ENV),
             mock.patch.object(BOX_MODULE, "require_env", side_effect=["do-token", "ssh-key", "ts-auth"]),
             mock.patch.object(BOX_MODULE, "load_deploy_manifest", return_value=None),
             mock.patch.object(BOX_MODULE, "_create_box_droplet", side_effect=fake_create_box_droplet),
@@ -323,6 +332,7 @@ class BoxLifecycleTests(unittest.TestCase):
         with (
             mock.patch.object(BOX_MODULE, "load_profile", return_value=profile),
             mock.patch.object(BOX_MODULE, "load_inventory", return_value=[]),
+            mock.patch.dict(os.environ, FAKE_PROVISIONING_ENV),
             mock.patch.object(BOX_MODULE, "require_env", side_effect=["do-token", "ssh-key", "ts-auth"]),
             mock.patch.object(BOX_MODULE, "load_deploy_manifest", return_value=None),
             mock.patch.object(BOX_MODULE, "_create_box_droplet", side_effect=fake_create_box_droplet),
@@ -487,6 +497,9 @@ class BoxLifecycleTests(unittest.TestCase):
         self.assertEqual(env_updates["SKILLBOX_STATE_ROOT"], "/srv/skillbox")
         self.assertEqual(env_updates["SKILLBOX_CLIENTS_HOST_ROOT"], "/srv/skillbox/clients")
         self.assertEqual(env_updates["SKILLBOX_MONOSERVER_HOST_ROOT"], "/srv/skillbox/monoserver")
+        self.assertEqual(env_updates["SKILLBOX_BOX_ID"], "spaps-website")
+        self.assertEqual(env_updates["SKILLBOX_BOX_SELF"], "true")
+        self.assertEqual(env_updates["SKILLBOX_BOX_TAILSCALE_HOSTNAME"], "skillbox-spaps-website")
         self.assertEqual(env_updates["SKILLBOX_SWIMMERS_PUBLISH_HOST"], "0.0.0.0")
         self.assertEqual(env_updates["SKILLBOX_SWIMMERS_AUTH_MODE"], "token")
         self.assertEqual(env_updates["SKILLBOX_SWIMMERS_AUTH_TOKEN"], "secret-token")
@@ -536,13 +549,51 @@ class BoxLifecycleTests(unittest.TestCase):
             side_effect=[
                 subprocess.CompletedProcess([], 0, "ok\n", ""),
                 subprocess.CompletedProcess([], 0, '{"Service":"workspace"}\n', ""),
+                subprocess.CompletedProcess([], 0, "ok\n", ""),
             ],
-        ):
+        ), mock.patch.object(
+            BOX_MODULE, "run", return_value=subprocess.CompletedProcess([], 0, "pong\n", ""),
+        ), mock.patch.object(
+            BOX_MODULE.socket, "gethostbyname", return_value="100.64.0.8",
+        ), mock.patch.object(
+            BOX_MODULE.socket, "create_connection",
+        ) as create_connection:
+            create_connection.return_value.__enter__.return_value = object()
             status = BOX_MODULE.box_health(box)
 
         self.assertTrue(status["ssh_reachable"])
         self.assertTrue(status["container_running"])
+        self.assertTrue(status["network_checks"]["public_ssh"]["ok"])
+        self.assertTrue(status["network_checks"]["tailnet_ping"]["ok"])
+        self.assertEqual(status["magicdns_url"], "http://skillbox-box-1:3210/")
         self.assertEqual(status["next_actions"], ["box ssh box-1"])
+
+    def test_print_box_status_text_surfaces_phone_url_without_indentation(self) -> None:
+        status = {
+            "id": "box-1",
+            "state": "ready",
+            "profile": "dev-small",
+            "management_mode": "managed",
+            "droplet_id": "123",
+            "droplet_ip": "1.2.3.4",
+            "tailscale_hostname": "skillbox-box-1",
+            "tailscale_ip": "100.64.0.8",
+            "ssh_user": "skillbox",
+            "state_root": "",
+            "volume_name": "",
+            "ssh_reachable": True,
+            "container_running": True,
+            "ssh_target": "100.64.0.8",
+            "phone_url": "http://100.64.0.8:3210/",
+            "magicdns_url": "http://skillbox-box-1:3210/",
+            "network_checks": {},
+        }
+        stdout = StringIO()
+
+        with redirect_stdout(stdout):
+            BOX_MODULE.print_box_status_text(status)
+
+        self.assertIn("\nOpen this on phone: http://100.64.0.8:3210/\n", stdout.getvalue())
 
 
 if __name__ == "__main__":

@@ -184,6 +184,11 @@ def print_doctor_text(results: list[CheckResult]) -> None:
 
 
 def _print_status_header(status_payload: dict[str, Any]) -> None:
+    box_access = status_payload.get("box_access") or {}
+    if box_access.get("phone_url"):
+        print(f"Open this on phone: {box_access['phone_url']}")
+    if box_access.get("magicdns_url"):
+        print(f"MagicDNS: {box_access['magicdns_url']}")
     available_clients = ", ".join(client["id"] for client in status_payload.get("clients") or []) or "(none)"
     print(f"clients: {available_clients}")
     print(f"default client: {status_payload.get('default_client') or '(none)'}")
