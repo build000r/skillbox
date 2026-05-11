@@ -52,6 +52,8 @@ class CliUnitTests(unittest.TestCase):
         self.assertIn("capabilities", payload["agent_surfaces"])
         self.assertIn("--json", payload["agent_surfaces"]["json_aliases"])
         self.assertTrue(any(command["name"] == "status" for command in payload["commands"]))
+        launch = next(command for command in payload["commands"] if command["name"] == "swimmers-launch")
+        self.assertIn("--dry-run", launch["safe_first_try"])
         robot_docs = next(command for command in payload["commands"] if command["name"] == "robot-docs")
         self.assertTrue(robot_docs["json"])
         self.assertIn("python3 scripts/04-reconcile.py capabilities --json", payload["agent_surfaces"]["outer_reconcile"])
@@ -76,6 +78,45 @@ class CliUnitTests(unittest.TestCase):
         self.assertIn("Skillbox agent guide", result.stdout)
         self.assertIn("capabilities --json", result.stdout)
         self.assertIn("Safe mutation pattern", result.stdout)
+        self.assertIn("swimmers-launch <dirs...>", result.stdout)
+
+    def test_swimmers_launch_cli_dry_run_resolves_against_invoke_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            invoke_cwd = Path(tmpdir) / "repo"
+            invoke_cwd.mkdir()
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    ".env-manager/manage.py",
+                    "swimmers-launch",
+                    "core",
+                    "../api",
+                    "--invoke-cwd",
+                    str(invoke_cwd),
+                    "--request",
+                    "Audit auth drift",
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+                cwd=ROOT_DIR,
+                capture_output=True,
+                text=True,
+                check=False,
+                env={**os.environ, "PYTHONPATH": str(ENV_MANAGER_DIR)},
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["dry_run"])
+        self.assertEqual(
+            payload["request_body"],
+            {
+                "dirs": [str(invoke_cwd / "core"), str(invoke_cwd.parent / "api")],
+                "spawn_tool": "codex",
+                "initial_request": "Audit auth drift",
+            },
+        )
 
     def test_json_typo_alias_keeps_stdout_parseable_and_warns_on_stderr(self) -> None:
         result = subprocess.run(

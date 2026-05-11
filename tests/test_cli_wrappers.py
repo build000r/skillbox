@@ -27,6 +27,8 @@ class CliWrapperTests(unittest.TestCase):
         self.assertIn("sbp recalibrate", result.stdout)
         self.assertIn("sbp mcp", result.stdout)
         self.assertIn("sbp beads", result.stdout)
+        self.assertIn("sbp launch", result.stdout)
+        self.assertIn("Alias for launch", result.stdout)
 
     def test_sbo_help_uses_sbo_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -52,7 +54,48 @@ class CliWrapperTests(unittest.TestCase):
         self.assertEqual(payload["tool"], "skillbox-sbp")
         self.assertIn("stdout_stderr_contract", payload)
         self.assertIn("sbp down <profile> <service> --dry-run --json", payload["safety"]["dry_run_first"])
+        self.assertIn("sbp launch <dir> <dir> --request '<prompt>' --dry-run --json", payload["safety"]["dry_run_first"])
         self.assertEqual(json.loads(triage.stdout)["tool"], "skillbox-sbp")
+
+    def test_sbp_launch_maps_to_swimmers_launch_without_profile_consuming_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            downstream = root / "launcher"
+            downstream.mkdir()
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "launch",
+                "core",
+                "../api",
+                "--request",
+                "Audit auth drift",
+                "--dry-run",
+                "--json",
+                fake_root=fake_root,
+                invoke_cwd=downstream,
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                record["argv"],
+                [
+                    "swimmers-launch",
+                    "--invoke-cwd",
+                    str(downstream),
+                    "core",
+                    "../api",
+                    "--request",
+                    "Audit auth drift",
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+            )
 
     def test_sbp_status_json_alias_keeps_stdout_parseable_and_warns_on_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
