@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import difflib
 import hashlib
 import json
 import math
@@ -64,6 +65,23 @@ def inventory_path() -> Path:
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_DRIFT = 2
+BOX_COMMAND_NAMES = {
+    "capabilities",
+    "down",
+    "import",
+    "list",
+    "profiles",
+    "register",
+    "robot-docs",
+    "robot-triage",
+    "ssh",
+    "status",
+    "unregister",
+    "up",
+    "upgrade",
+}
+BOX_JSON_COMMANDS = BOX_COMMAND_NAMES - {"robot-docs", "ssh"}
+BOX_JSON_FLAG_ALIASES = {"--json", "--jason", "--jsno", "--jsson"}
 
 STATES = [
     "creating",
@@ -315,6 +333,155 @@ def emit_error_or_print(
     else:
         print(message, file=sys.stderr)
     return EXIT_ERROR
+
+
+def _box_agent_command(name: str) -> dict[str, Any]:
+    safe_first_try = {
+        "capabilities": "python3 scripts/box.py capabilities --json",
+        "down": "python3 scripts/box.py down <box-id> --dry-run --format json",
+        "import": "python3 scripts/box.py profiles --format json",
+        "list": "python3 scripts/box.py list --format json",
+        "profiles": "python3 scripts/box.py profiles --format json",
+        "register": "python3 scripts/box.py profiles --format json",
+        "robot-docs": "python3 scripts/box.py robot-docs guide",
+        "robot-triage": "python3 scripts/box.py --robot-triage",
+        "ssh": "Use MCP operator_box_exec for non-interactive commands, or make box-ssh BOX=<id> for a TTY.",
+        "status": "python3 scripts/box.py status --format json",
+        "unregister": "python3 scripts/box.py status <box-id> --format json",
+        "up": "python3 scripts/box.py up <box-id> --profile dev-small --dry-run --format json",
+        "upgrade": (
+            "python3 scripts/box.py upgrade <box-id> --deploy-manifest <deploy.json> "
+            "--dry-run --format json"
+        ),
+    }[name]
+    return {
+        "name": name,
+        "json": name in BOX_JSON_COMMANDS,
+        "mutates": name in {"down", "import", "register", "unregister", "up", "upgrade"},
+        "destructive": name == "down",
+        "dry_run": name in {"down", "up", "upgrade"},
+        "safe_first_try": safe_first_try,
+        "mutation_command": {
+            "import": "python3 scripts/box.py import <box-id> --host <host> --no-probe --format json",
+            "register": "python3 scripts/box.py register <box-id> --host <host> --no-probe --format json",
+            "unregister": "python3 scripts/box.py unregister <box-id> --format json",
+        }.get(name),
+    }
+
+
+def box_capabilities_payload() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "tool": "skillbox-box",
+        "contract_version": "2026-05-11",
+        "root_dir": str(REPO_ROOT),
+        "entrypoint": "python3 scripts/box.py",
+        "commands": [_box_agent_command(name) for name in sorted(BOX_COMMAND_NAMES)],
+        "agent_surfaces": {
+            "capabilities": "python3 scripts/box.py capabilities --json",
+            "robot_docs": "python3 scripts/box.py robot-docs guide",
+            "robot_triage": "python3 scripts/box.py --robot-triage",
+            "json_aliases": sorted(BOX_JSON_FLAG_ALIASES),
+        },
+        "stdout_stderr_contract": {
+            "json_stdout": "When JSON is requested, stdout is parseable JSON only.",
+            "diagnostics_stderr": "JSON typo alias notices and parser errors go to stderr.",
+        },
+        "safety": {
+            "dry_run_first": [
+                "python3 scripts/box.py up <box-id> --profile dev-small --dry-run --format json",
+                "python3 scripts/box.py down <box-id> --dry-run --format json",
+                (
+                    "python3 scripts/box.py upgrade <box-id> --deploy-manifest <deploy.json> "
+                    "--dry-run --format json"
+                ),
+            ],
+            "confirm_with_user_before": [
+                "python3 scripts/box.py down <box-id> --format json",
+            ],
+            "non_tty_alternative": "Use MCP operator_box_exec for remote commands instead of box.py ssh.",
+        },
+        "mcp_equivalents": {
+            "profiles": "operator_profiles",
+            "list": "operator_boxes",
+            "status": "operator_box_status",
+            "up": "operator_provision",
+            "down": "operator_teardown",
+            "ssh": "operator_box_exec",
+        },
+        "exit_codes": {
+            "0": "success",
+            "1": "runtime, environment, or user input error",
+            "2": "argparse usage error or drift-style status from surrounding tools",
+        },
+        "next_actions": [
+            "python3 scripts/box.py profiles --format json",
+            "python3 scripts/box.py list --format json",
+            "python3 scripts/box.py status --format json",
+            "python3 scripts/box.py up <box-id> --profile dev-small --dry-run --format json",
+        ],
+    }
+
+
+def box_robot_docs_guide() -> str:
+    return """Skillbox box agent guide
+
+Primary entrypoint:
+  python3 scripts/box.py <command> [options]
+
+Start here:
+  python3 scripts/box.py capabilities --json
+  python3 scripts/box.py profiles --format json
+  python3 scripts/box.py list --format json
+  python3 scripts/box.py status --format json
+  python3 scripts/box.py --robot-triage
+
+Structured output:
+  Read-side and lifecycle preview commands accept --format json.
+  Agent-friendly aliases are accepted: --json, --jason, --jsno, --jsson.
+  Diagnostics and typo-alias notices are printed to stderr, not stdout.
+
+Safe mutation pattern:
+  Provision, teardown, and upgrade should be previewed first:
+  python3 scripts/box.py up <box-id> --profile dev-small --dry-run --format json
+  python3 scripts/box.py down <box-id> --dry-run --format json
+  python3 scripts/box.py upgrade <box-id> --deploy-manifest <deploy.json> --dry-run --format json
+  Confirm with the user before real teardown because it destroys infrastructure.
+
+Remote commands:
+  box.py ssh is for interactive terminals. Agents should use MCP operator_box_exec
+  for non-interactive commands on a box.
+"""
+
+
+def box_robot_triage_payload() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "tool": "skillbox-box",
+        "quick_ref": box_capabilities_payload()["next_actions"],
+        "recommendations": [
+            {
+                "id": "inspect-profiles",
+                "command": "python3 scripts/box.py profiles --format json",
+                "why": "Find valid sizes and SSH users before provisioning.",
+            },
+            {
+                "id": "inspect-fleet",
+                "command": "python3 scripts/box.py list --format json",
+                "why": "Avoid colliding with an existing box id.",
+            },
+            {
+                "id": "preview-provision",
+                "command": "python3 scripts/box.py up <box-id> --profile dev-small --dry-run --format json",
+                "why": "Checks credentials and planned lifecycle steps without creating infrastructure.",
+            },
+            {
+                "id": "preview-teardown",
+                "command": "python3 scripts/box.py down <box-id> --dry-run --format json",
+                "why": "Required safe alternative before destroying infrastructure.",
+            },
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3184,14 +3351,96 @@ def cmd_profiles(*, fmt: str) -> int:
 # main
 # ---------------------------------------------------------------------------
 
-def main() -> int:
-    load_dotenv(REPO_ROOT / ".env")
-    load_dotenv(REPO_ROOT / ".env.box")
+def _suggest_box_command(message: str) -> str | None:
+    marker = "invalid choice: '"
+    if marker not in message:
+        return None
+    bad = message.split(marker, 1)[1].split("'", 1)[0]
+    matches = difflib.get_close_matches(bad, sorted(BOX_COMMAND_NAMES), n=1)
+    return matches[0] if matches else None
 
-    parser = argparse.ArgumentParser(
+
+class BoxArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:  # pragma: no cover - argparse exits
+        suggestion = _suggest_box_command(message)
+        if suggestion:
+            message = (
+                f"{message}\nDid you mean: `{self.prog} {suggestion}`?\n"
+                f"Discover commands: `{self.prog} capabilities --json`."
+            )
+        super().error(message)
+
+
+def _normalize_agent_argv(argv: list[str]) -> tuple[list[str], list[str]]:
+    normalized: list[str] = []
+    diagnostics: list[str] = []
+    command_seen = False
+    current_command: str | None = None
+    pending_json = False
+    for token in argv:
+        if token == "--robot-help":
+            normalized.extend(["robot-docs", "guide"])
+            command_seen = True
+            current_command = "robot-docs"
+            continue
+        if token == "--robot-triage":
+            normalized.append("robot-triage")
+            command_seen = True
+            current_command = "robot-triage"
+            continue
+        if token in BOX_JSON_FLAG_ALIASES:
+            if token != "--json":
+                diagnostics.append(
+                    f"Interpreting {token} as --format json. "
+                    "Exact command: box.py <command> --format json"
+                )
+            if command_seen:
+                if current_command in BOX_JSON_COMMANDS or current_command is None:
+                    normalized.extend(["--format", "json"])
+                else:
+                    normalized.append(token)
+            else:
+                pending_json = True
+            continue
+        if not token.startswith("-") and not command_seen:
+            command_seen = True
+            current_command = token
+            normalized.append(token)
+            if pending_json and token in BOX_JSON_COMMANDS:
+                normalized.extend(["--format", "json"])
+                pending_json = False
+            continue
+        normalized.append(token)
+    if pending_json and not command_seen:
+        normalized.extend(["status", "--format", "json"])
+    return normalized, diagnostics
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = BoxArgumentParser(
+        prog="box.py",
         description="Skillbox box lifecycle manager: create, bootstrap, and destroy DigitalOcean + Tailscale boxes.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    capabilities_parser = subparsers.add_parser(
+        "capabilities",
+        help="Print the machine-readable agent contract.",
+    )
+    capabilities_parser.add_argument("--format", choices=("json",), default="json")
+
+    robot_docs_parser = subparsers.add_parser(
+        "robot-docs",
+        help="Print agent-facing command guidance.",
+    )
+    robot_docs_parser.add_argument("topic", nargs="?", default="guide", choices=("guide",))
+    robot_docs_parser.add_argument("--format", choices=("text", "json"), default="text")
+
+    robot_triage_parser = subparsers.add_parser(
+        "robot-triage",
+        help="Print compact machine-readable first actions.",
+    )
+    robot_triage_parser.add_argument("--format", choices=("json",), default="json")
 
     up_parser = subparsers.add_parser("up", help="Create and provision a new box from a pinned deploy artifact.")
     up_parser.add_argument("box_id", help="Box identifier (becomes droplet name and client id).")
@@ -3257,10 +3506,33 @@ def main() -> int:
     subparsers.add_parser("profiles", help="List available box profiles.").add_argument(
         "--format", choices=("text", "json"), default="text",
     )
+    return parser
 
-    args = parser.parse_args()
+
+def main(argv: list[str] | None = None) -> int:
+    load_dotenv(REPO_ROOT / ".env")
+    load_dotenv(REPO_ROOT / ".env.box")
+
+    parser = build_parser()
+    normalized_argv, diagnostics = _normalize_agent_argv(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(normalized_argv)
+    for diagnostic in diagnostics:
+        print(diagnostic, file=sys.stderr)
 
     try:
+        if args.command == "capabilities":
+            emit_json(box_capabilities_payload())
+            return EXIT_OK
+        if args.command == "robot-docs":
+            guide = box_robot_docs_guide()
+            if args.format == "json":
+                emit_json({"ok": True, "topic": args.topic, "guide": guide})
+            else:
+                print(guide.rstrip())
+            return EXIT_OK
+        if args.command == "robot-triage":
+            emit_json(box_robot_triage_payload())
+            return EXIT_OK
         if args.command == "up":
             return cmd_up(
                 args.box_id,

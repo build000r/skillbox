@@ -32,6 +32,24 @@ class OperatorMcpServerTests(unittest.TestCase):
         self.assertIn("git-repo-http-service-bootstrap-spaps-auth", description)
         self.assertIn("SPAPS local auth/RBAC fixtures", description)
         self.assertEqual(blueprint_prop["default"], MODULE.DEFAULT_FIRST_BOX_BLUEPRINT)
+        contract = tool["x_skillbox_contract"]
+        self.assertTrue(contract["dry_run_required"])
+        self.assertIn("--dry-run --format json", contract["exact_cli"])
+
+    def test_operator_tool_contract_metadata_surfaces_safe_first_calls(self) -> None:
+        teardown = next(item for item in MODULE.TOOLS if item["name"] == "operator_teardown")
+        self.assertTrue(teardown["annotations"]["destructiveHint"])
+        self.assertTrue(teardown["x_skillbox_contract"]["requires_user_confirmation"])
+        self.assertEqual(
+            teardown["x_skillbox_contract"]["safe_first_call"],
+            "operator_teardown(box_id='<id>', dry_run=true)",
+        )
+        profiles = next(item for item in MODULE.TOOLS if item["name"] == "operator_profiles")
+        self.assertTrue(profiles["annotations"]["readOnlyHint"])
+        self.assertEqual(
+            profiles["x_skillbox_contract"]["exact_cli"],
+            "python3 scripts/box.py profiles --format json",
+        )
 
     def test_load_dotenv_only_sets_missing_keys(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -153,6 +171,7 @@ class OperatorMcpServerTests(unittest.TestCase):
 
             missing_payload = _content_payload(MODULE.dispatch_tool("missing", {}))
             self.assertEqual(missing_payload["error"]["type"], "unknown_tool")
+            self.assertIn("operator_boxes", missing_payload["error"]["next_actions"])
 
             with mock.patch.dict(MODULE._DISPATCH, {"known": lambda params: {"content": [params]}}):
                 self.assertEqual(MODULE.dispatch_tool("known", {"ok": True}), {"content": [{"ok": True}]})
@@ -208,12 +227,21 @@ class OperatorMcpServerTests(unittest.TestCase):
             MODULE,
             "run_compose",
             return_value=(False, 9, {"stderr": "down failed"}),
-        ), mock.patch.object(MODULE, "emit_event") as emit_event:
+        ), mock.patch.object(MODULE, "emit_event") as emit_event, mock.patch.object(
+            MODULE,
+            "_has_dryrun_marker",
+            return_value=True,
+        ):
             down = MODULE.handle_operator_compose_down({})
         payload = _content_payload(down)
         self.assertTrue(down["isError"])
         self.assertEqual(payload["exit_code"], 9)
         emit_event.assert_called_once_with("operator.compose_down", "local", {"ok": False})
+
+        with mock.patch.object(MODULE, "_has_dryrun_marker", return_value=False):
+            blocked = _content_payload(MODULE.handle_operator_compose_down({}))
+        self.assertEqual(blocked["error"]["type"], "dry_run_required")
+        self.assertIn("operator_compose_down(dry_run=true)", blocked["error"]["next_actions"])
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -230,12 +258,16 @@ class OperatorMcpServerTests(unittest.TestCase):
     def test_handle_operator_provision_validates_required_box_id_and_runs_script(self) -> None:
         error_payload = _content_payload(MODULE.handle_operator_provision({}))
         self.assertEqual(error_payload["error"]["type"], "missing_required_parameter")
+        self.assertIn("operator_profiles", error_payload["error"]["next_actions"])
 
         with mock.patch.object(
             MODULE,
             "run_script",
             return_value=(True, 0, {"box_id": "alpha"}),
-        ) as run_script, mock.patch.object(MODULE, "emit_event") as emit_event:
+        ) as run_script, mock.patch.object(MODULE, "emit_event") as emit_event, mock.patch.object(
+            MODULE,
+            "_stamp_dryrun_marker",
+        ) as stamp:
             result = MODULE.handle_operator_provision(
                 {
                     "box_id": "alpha",
@@ -261,17 +293,31 @@ class OperatorMcpServerTests(unittest.TestCase):
         self.assertIn("--dry-run", args)
         self.assertEqual(run_script.call_args.kwargs["timeout"], MODULE.PROVISION_TIMEOUT_SECONDS)
         emit_event.assert_called_once()
+        stamp.assert_called_once_with("operator_provision", "alpha")
 
     def test_handle_operator_provision_relies_on_box_default_blueprint_when_unspecified(self) -> None:
         with mock.patch.object(
             MODULE,
             "run_script",
             return_value=(True, 0, {"box_id": "alpha"}),
-        ) as run_script, mock.patch.object(MODULE, "emit_event"):
+        ) as run_script, mock.patch.object(MODULE, "emit_event"), mock.patch.object(
+            MODULE,
+            "_has_dryrun_marker",
+            return_value=True,
+        ):
             MODULE.handle_operator_provision({"box_id": "alpha"})
 
         args = run_script.call_args.args[1]
         self.assertNotIn("--blueprint", args)
+
+        with mock.patch.object(MODULE, "_has_dryrun_marker", return_value=False), mock.patch.object(
+            MODULE,
+            "run_script",
+        ) as run_script:
+            blocked = _content_payload(MODULE.handle_operator_provision({"box_id": "alpha"}))
+        self.assertEqual(blocked["error"]["type"], "dry_run_required")
+        self.assertIn("operator_provision(box_id='<id>', dry_run=true)", blocked["error"]["next_actions"])
+        run_script.assert_not_called()
 
     def test_handle_operator_teardown_stamps_marker_for_dry_run(self) -> None:
         error_payload = _content_payload(MODULE.handle_operator_teardown({}))
@@ -291,6 +337,15 @@ class OperatorMcpServerTests(unittest.TestCase):
         self.assertEqual(payload["box_id"], "alpha")
         emit_event.assert_called_once()
         stamp.assert_called_once_with("operator_teardown", "alpha")
+
+        with mock.patch.object(MODULE, "_has_dryrun_marker", return_value=False), mock.patch.object(
+            MODULE,
+            "run_script",
+        ) as run_script:
+            blocked = _content_payload(MODULE.handle_operator_teardown({"box_id": "alpha"}))
+        self.assertEqual(blocked["error"]["type"], "dry_run_required")
+        self.assertIn("operator_teardown(box_id='<id>', dry_run=true)", blocked["error"]["next_actions"])
+        run_script.assert_not_called()
 
     def test_handle_operator_box_exec_covers_validation_and_success(self) -> None:
         missing = _content_payload(MODULE.handle_operator_box_exec({"box_id": "alpha"}))

@@ -1942,7 +1942,7 @@ def _capabilities_payload(root_dir: Path) -> dict[str, Any]:
     commands = [
         {
             "name": name,
-            "json": name not in {"robot-docs"},
+            "json": True,
             "safe_first_try": _safe_first_try_command(name),
         }
         for name in sorted(MANAGE_COMMAND_NAMES)
@@ -1965,7 +1965,21 @@ def _capabilities_payload(root_dir: Path) -> dict[str, Any]:
             "robot_docs": "python3 .env-manager/manage.py robot-docs guide",
             "robot_triage": "python3 .env-manager/manage.py --robot-triage",
             "json_aliases": sorted(JSON_FLAG_ALIASES),
+            "outer_reconcile": "python3 scripts/04-reconcile.py capabilities --json",
+            "box_lifecycle": "python3 scripts/box.py capabilities --json",
+            "wrappers": ["scripts/sbp capabilities --json", "scripts/sbo capabilities --json"],
         },
+        "safe_previews": [
+            "python3 .env-manager/manage.py client-init --list-blueprints --format json",
+            "python3 .env-manager/manage.py client-project <client> --dry-run --format json",
+            "python3 .env-manager/manage.py client-diff <client> --target-dir <control-plane-repo> --format json",
+            (
+                "python3 .env-manager/manage.py distribution-preview --manifest-path <manifest.json> "
+                "--public-key <public-key.pem> --format json"
+            ),
+            "python3 scripts/04-reconcile.py doctor --format json --skip-compose --skip-skill-sync",
+            "python3 scripts/box.py up <box-id> --profile dev-small --dry-run --format json",
+        ],
         "exit_codes": {
             "0": "success",
             "1": "user input, runtime, or environment error",
@@ -1994,6 +2008,20 @@ def _safe_first_try_command(name: str) -> str:
         return "manage.py robot-docs guide"
     if name in {"client-init"}:
         return "manage.py client-init --list-blueprints --format json"
+    if name in {"client-project"}:
+        return "manage.py client-project <client> --dry-run --format json"
+    if name in {"client-diff"}:
+        return "manage.py client-diff <client> --target-dir <control-plane-repo> --format json"
+    if name in {"client-publish"}:
+        return "manage.py client-diff <client> --target-dir <control-plane-repo> --format json"
+    if name in {"client-open"}:
+        return "manage.py client-project <client> --dry-run --format json"
+    if name in {"distribution-preview"}:
+        return "manage.py distribution-preview --manifest-path <manifest.json> --public-key <public-key.pem> --format json"
+    if name in {"distribution-publish"}:
+        return "manage.py distribution-preview --manifest-path <manifest.json> --public-key <public-key.pem> --format json"
+    if name in {"distribution-rollback"}:
+        return "manage.py distribution-rollback --list --skill <skill> --format json"
     if name in {"status", "render", "doctor", "skills", "skill-audit", "mcp-audit"}:
         return f"manage.py {name} --format json"
     if name in {"up", "down", "restart", "sync", "bootstrap", "context"}:

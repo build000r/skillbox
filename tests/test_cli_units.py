@@ -52,6 +52,15 @@ class CliUnitTests(unittest.TestCase):
         self.assertIn("capabilities", payload["agent_surfaces"])
         self.assertIn("--json", payload["agent_surfaces"]["json_aliases"])
         self.assertTrue(any(command["name"] == "status" for command in payload["commands"]))
+        robot_docs = next(command for command in payload["commands"] if command["name"] == "robot-docs")
+        self.assertTrue(robot_docs["json"])
+        self.assertIn("python3 scripts/04-reconcile.py capabilities --json", payload["agent_surfaces"]["outer_reconcile"])
+        self.assertIn(
+            "python3 .env-manager/manage.py distribution-preview --manifest-path <manifest.json> --public-key <public-key.pem> --format json",
+            payload["safe_previews"],
+        )
+        client_project = next(command for command in payload["commands"] if command["name"] == "client-project")
+        self.assertIn("--dry-run", client_project["safe_first_try"])
 
     def test_robot_docs_guide_is_available_in_tool(self) -> None:
         result = subprocess.run(

@@ -10,6 +10,8 @@ action="home"
 services=()
 sync_paths=()
 passthrough_args=()
+runtime_args=()
+json_alias_diagnostics=()
 invoke_cwd="${SKILLBOX_INVOKE_CWD:-$PWD}"
 overlay_name=""
 
@@ -20,6 +22,7 @@ realpath_portable() {
 script_source="${BASH_SOURCE[0]:-${0:-}}"
 script_path="$(realpath_portable "${script_source}")"
 script_dir="$(cd "$(dirname "${script_path}")" && pwd -P)"
+wrapper_name="${SKILLBOX_WRAPPER_NAME:-$(basename "${script_path}")}"
 
 find_skillbox_root() {
   local candidate=""
@@ -42,45 +45,48 @@ find_skillbox_root() {
 }
 
 print_help() {
-  cat <<'EOF'
-sbp - personal skillbox runtime and skill helper
+  cat <<'EOF' | sed "s/__WRAPPER__/${wrapper_name}/g"
+__WRAPPER__ - personal skillbox runtime and skill helper
 
 Usage:
-  sbp                         Compact home view for this cwd
-  sbp help                    Show this help
-  sbp up [profile] [service]  Start services (default profile: local-all)
-  sbp down [profile] [svc]    Stop services
-  sbp restart [profile] [svc] Restart services
-  sbp status [profile]        Runtime status
-  sbp logs [profile] service  Show service logs
-  sbp recalibrate [args...]   Read-only cwd skill add/remove recalibration
-  sbp mcp [args...]           Read-only Claude JSON / Codex TOML MCP audit
-  sbp beads [status|init|sync] Check or initialize repo-local beads state
-  sbp mmdx QUERY              Fuzzy-find and open .mmdx/.mmd from this cwd
-  sbp mmdx                    List recent .mmdx/.mmd files from this repo
-  sbp hire times              Show configured human-operator availability
-  sbp hire book [args...]     Send magic-link/signup email and create x402 hold
+  __WRAPPER__                         Compact home view for this cwd
+  __WRAPPER__ help                    Show this help
+  __WRAPPER__ capabilities --json     Print the wrapper machine contract
+  __WRAPPER__ robot-docs guide        Print agent-facing command guidance
+  __WRAPPER__ robot-triage            Print compact first actions
+  __WRAPPER__ up [profile] [service]  Start services (default profile: local-all)
+  __WRAPPER__ down [profile] [svc]    Stop services
+  __WRAPPER__ restart [profile] [svc] Restart services
+  __WRAPPER__ status [profile]        Runtime status
+  __WRAPPER__ logs [profile] service  Show service logs
+  __WRAPPER__ recalibrate [args...]   Read-only cwd skill add/remove recalibration
+  __WRAPPER__ mcp [args...]           Read-only Claude JSON / Codex TOML MCP audit
+  __WRAPPER__ beads [status|init|sync] Check or initialize repo-local beads state
+  __WRAPPER__ mmdx QUERY              Fuzzy-find and open .mmdx/.mmd from this cwd
+  __WRAPPER__ mmdx                    List recent .mmdx/.mmd files from this repo
+  __WRAPPER__ hire times              Show configured human-operator availability
+  __WRAPPER__ hire book [args...]     Send magic-link/signup email and create x402 hold
                               Set SPAPS_AUTH_ACCESS_TOKEN to bind to a verified account.
 
 Skills:
-  sbp skills [args...]        Show effective skills for this cwd
-  sbp skills --issues-only    Compact skill drift/policy view
-  sbp skills audit            Scan downstream repos for skill policy drift
-  sbp skill plan NAME         Preview where NAME would be linked
-  sbp skill add NAME          Link NAME into global/project/category roots
-  sbp skill sync --dry-run    Link cwd-required missing skills
-  sbp skill prune --dry-run   Preview policy-violation unlinks
-  sbp sync /path/to/skill     Legacy shorthand for global skill add
+  __WRAPPER__ skills [args...]        Show effective skills for this cwd
+  __WRAPPER__ skills --issues-only    Compact skill drift/policy view
+  __WRAPPER__ skills audit            Scan downstream repos for skill policy drift
+  __WRAPPER__ skill plan NAME         Preview where NAME would be linked
+  __WRAPPER__ skill add NAME          Link NAME into global/project/category roots
+  __WRAPPER__ skill sync --dry-run    Link cwd-required missing skills
+  __WRAPPER__ skill prune --dry-run   Preview policy-violation unlinks
+  __WRAPPER__ sync /path/to/skill     Legacy shorthand for global skill add
 
 Overlays:
-  sbp m                       Toggle the marketing overlay on/off.
+  __WRAPPER__ m                       Toggle the marketing overlay on/off.
                               Off-flip unlinks overlay-scoped symlinks.
                               Pass --keep to preserve them.
-  sbp overlay                 List active overlays
-  sbp overlay on NAME         Enable overlay (e.g. marketing)
-  sbp overlay off NAME        Disable overlay + unlink overlay-scoped symlinks
-  sbp overlay off NAME --keep Disable overlay, keep symlinks in place
-  sbp overlay toggle NAME     Flip overlay state (off-flip unlinks unless --keep)
+  __WRAPPER__ overlay                 List active overlays
+  __WRAPPER__ overlay on NAME         Enable overlay (e.g. marketing)
+  __WRAPPER__ overlay off NAME        Disable overlay + unlink overlay-scoped symlinks
+  __WRAPPER__ overlay off NAME --keep Disable overlay, keep symlinks in place
+  __WRAPPER__ overlay toggle NAME     Flip overlay state (off-flip unlinks unless --keep)
 
 Profiles:
   all | local-all, core | local-core, minimal | mini | local-minimal,
@@ -88,27 +94,140 @@ Profiles:
   openclaw | claw | local-openclaw
 
 Examples:
-  sbp
-  sbp status core
-  sbp skills --issues-only
-  sbp recalibrate
-  sbp mcp
-  sbp beads status
-  sbp beads init
-  sbp recalibrate --fleet --limit 20
-  sbp skill plan mcp-server-design
-  sbp skill add ui --to category --category frontend
-  sbp mmdx review
-  sbp mmdx skill review --no-open
-  sbp hire times --limit 3
-  sbp hire book --date 2026-05-06 --slot AM --email person@example.com --name "Person" --send-magic-link
-  sbp up backend spaps
+  __WRAPPER__
+  __WRAPPER__ status core --json
+  __WRAPPER__ down core api --dry-run --json
+  __WRAPPER__ skills --issues-only
+  __WRAPPER__ recalibrate
+  __WRAPPER__ mcp
+  __WRAPPER__ beads status
+  __WRAPPER__ beads init
+  __WRAPPER__ recalibrate --fleet --limit 20
+  __WRAPPER__ skill plan mcp-server-design
+  __WRAPPER__ skill add ui --to category --category frontend
+  __WRAPPER__ mmdx review
+  __WRAPPER__ mmdx skill review --no-open
+  __WRAPPER__ hire times --limit 3
+  __WRAPPER__ hire book --date 2026-05-06 --slot AM --email person@example.com --name "Person" --send-magic-link
+  __WRAPPER__ up backend spaps
 EOF
+}
+
+print_capabilities() {
+  python3 - "${wrapper_name}" "${invoke_cwd}" <<'PY'
+from __future__ import annotations
+
+import json
+import sys
+
+wrapper = sys.argv[1]
+cwd = sys.argv[2]
+payload = {
+    "ok": True,
+    "tool": f"skillbox-{wrapper}",
+    "contract_version": "2026-05-11",
+    "entrypoint": f"scripts/{wrapper}",
+    "cwd": cwd,
+    "aliases": ["sbo"] if wrapper == "sbp" else ["sbp"],
+    "commands": [
+        {"name": "capabilities", "json": True, "safe_first_try": f"{wrapper} capabilities --json"},
+        {"name": "robot-docs", "json": True, "safe_first_try": f"{wrapper} robot-docs guide"},
+        {"name": "robot-triage", "json": True, "safe_first_try": f"{wrapper} --robot-triage"},
+        {"name": "status", "json": True, "safe_first_try": f"{wrapper} status --json"},
+        {"name": "logs", "json": True, "safe_first_try": f"{wrapper} logs <profile> <service> --json"},
+        {"name": "up", "json": True, "safe_first_try": f"{wrapper} up <profile> <service> --dry-run --json"},
+        {"name": "down", "json": True, "safe_first_try": f"{wrapper} down <profile> <service> --dry-run --json"},
+        {"name": "restart", "json": True, "safe_first_try": f"{wrapper} restart <profile> <service> --dry-run --json"},
+        {"name": "skills", "json": True, "safe_first_try": f"{wrapper} skills --issues-only --json"},
+        {"name": "mcp", "json": True, "safe_first_try": f"{wrapper} mcp --json"},
+        {"name": "recalibrate", "json": False, "safe_first_try": f"{wrapper} recalibrate"},
+    ],
+    "agent_surfaces": {
+        "capabilities": f"{wrapper} capabilities --json",
+        "robot_docs": f"{wrapper} robot-docs guide",
+        "robot_triage": f"{wrapper} --robot-triage",
+        "json_aliases": ["--jason", "--json", "--jsno", "--jsson"],
+    },
+    "stdout_stderr_contract": {
+        "json_stdout": "When JSON is requested, stdout is parseable JSON from manage.py or this wrapper.",
+        "diagnostics_stderr": "JSON typo alias notices and parser errors go to stderr.",
+    },
+    "safety": {
+        "dry_run_first": [
+            f"{wrapper} up <profile> <service> --dry-run --json",
+            f"{wrapper} down <profile> <service> --dry-run --json",
+            f"{wrapper} restart <profile> <service> --dry-run --json",
+            f"{wrapper} skill prune --dry-run",
+        ],
+        "confirm_with_user_before": [f"{wrapper} down <profile> <service>"],
+    },
+    "next_actions": [
+        f"{wrapper} status --json",
+        f"{wrapper} skills --issues-only --json",
+        f"{wrapper} mcp --json",
+        f"{wrapper} up <profile> <service> --dry-run --json",
+    ],
+}
+print(json.dumps(payload, indent=2, sort_keys=True))
+PY
+}
+
+print_robot_docs() {
+  cat <<EOF
+Skillbox wrapper agent guide
+
+Primary entrypoint:
+  ${wrapper_name} <command> [options]
+
+Start here:
+  ${wrapper_name} capabilities --json
+  ${wrapper_name} status --json
+  ${wrapper_name} skills --issues-only --json
+  ${wrapper_name} mcp --json
+  ${wrapper_name} --robot-triage
+
+Structured output:
+  Use --json, or typo aliases --jason, --jsno, --jsson. Alias diagnostics go to stderr.
+  Wrapper JSON mode forwards --format json to manage.py where supported.
+
+Safe mutation pattern:
+  ${wrapper_name} up <profile> <service> --dry-run --json
+  ${wrapper_name} down <profile> <service> --dry-run --json
+  ${wrapper_name} restart <profile> <service> --dry-run --json
+EOF
+}
+
+print_robot_triage() {
+  python3 - "${wrapper_name}" <<'PY'
+from __future__ import annotations
+
+import json
+import sys
+
+wrapper = sys.argv[1]
+payload = {
+    "ok": True,
+    "tool": f"skillbox-{wrapper}",
+    "quick_ref": [
+        f"{wrapper} status --json",
+        f"{wrapper} skills --issues-only --json",
+        f"{wrapper} mcp --json",
+        f"{wrapper} up <profile> <service> --dry-run --json",
+    ],
+    "recommendations": [
+        {"id": "runtime-status", "command": f"{wrapper} status --json", "why": "Fastest runtime state read."},
+        {"id": "skill-drift", "command": f"{wrapper} skills --issues-only --json", "why": "Compact cwd skill-policy view."},
+        {"id": "mcp-parity", "command": f"{wrapper} mcp --json", "why": "Checks Claude/Codex MCP visibility."},
+        {"id": "preview-services", "command": f"{wrapper} up <profile> <service> --dry-run --json", "why": "Preview service actions before mutation."},
+    ],
+}
+print(json.dumps(payload, indent=2, sort_keys=True))
+PY
 }
 
 skillbox_root="$(find_skillbox_root || true)"
 if [[ -z "${skillbox_root}" ]]; then
-  echo "sbp: missing skillbox repo; set SKILLBOX_ROOT or install from a checkout" >&2
+  echo "${wrapper_name}: missing skillbox repo; set SKILLBOX_ROOT or install from a checkout" >&2
   exit 1
 fi
 
@@ -118,6 +237,21 @@ case "${1:-}" in
   -h|--help|help)
     action="help"
     shift
+    ;;
+  capabilities|cap|caps)
+    action="capabilities"
+    shift
+    ;;
+  robot-docs|docs|guide|--robot-help)
+    action="robot-docs"
+    shift
+    ;;
+  robot-triage|triage|--robot-triage)
+    action="robot-triage"
+    shift
+    ;;
+  --json|--jason|--jsno|--jsson)
+    action="status"
     ;;
   m|marketing)
     action="overlay-toggle"
@@ -180,6 +314,33 @@ case "${1:-}" in
     action="skills"
     shift
     ;;
+  -*)
+    ;;
+  *)
+    if [[ -n "${1:-}" ]]; then
+      case "${1}" in
+        statu|stats|state)
+          suggestion="status"
+          ;;
+        log|logz)
+          suggestion="logs"
+          ;;
+        skillz)
+          suggestion="skills"
+          ;;
+        mc)
+          suggestion="mcp"
+          ;;
+        *)
+          suggestion="status"
+          ;;
+      esac
+      echo "${wrapper_name}: unknown command '${1}'." >&2
+      echo "Did you mean: ${wrapper_name} ${suggestion} --json" >&2
+      echo "Discover commands: ${wrapper_name} capabilities --json" >&2
+      exit 2
+    fi
+    ;;
 esac
 
 if [[ "${action}" != "mmdx" ]]; then
@@ -226,8 +387,80 @@ append_passthrough_token() {
   esac
 }
 
+append_json_flag() {
+  local token="$1"
+  if [[ "${token}" != "--json" ]]; then
+    json_alias_diagnostics+=("Interpreting ${token} as --format json. Exact command: ${wrapper_name} <command> --json")
+  fi
+  case "${action}" in
+    up|down|restart|status|logs)
+      runtime_args+=(--format json)
+      ;;
+    capabilities|robot-triage)
+      ;;
+    *)
+      passthrough_args+=(--format json)
+      ;;
+  esac
+}
+
+append_runtime_or_passthrough_flag() {
+  local token="$1"
+  case "${action}" in
+    up|down|restart|status|logs)
+      runtime_args+=("${token}")
+      ;;
+    *)
+      append_passthrough_token "${token}"
+      ;;
+  esac
+}
+
+append_input_token() {
+  local token="$1"
+  case "${token}" in
+    --json|--jason|--jsno|--jsson)
+      append_json_flag "${token}"
+      ;;
+    --dry-run|--force|--yes|--full|--issues-only|--no-global|--no-project|--show-sources|--show-shadowed|--no-open|--tmux|--tmux-submit)
+      append_runtime_or_passthrough_flag "${token}"
+      ;;
+    *)
+      append_passthrough_token "${token}"
+      ;;
+  esac
+}
+
 while [[ $# -gt 0 ]]; do
-  append_passthrough_token "$1"
+  case "${1}" in
+    --format)
+      if [[ "${2:-}" == "json" ]]; then
+        append_json_flag "--json"
+        shift 2
+        continue
+      fi
+      append_input_token "$1"
+      ;;
+    --wait-seconds|--mode|--lines|--limit)
+      if [[ $# -lt 2 ]]; then
+        echo "${wrapper_name}: ${1} requires a value" >&2
+        exit 2
+      fi
+      case "${action}" in
+        up|down|restart|status|logs)
+          runtime_args+=("$1" "$2")
+          ;;
+        *)
+          passthrough_args+=("$1" "$2")
+          ;;
+      esac
+      shift 2
+      continue
+      ;;
+    *)
+      append_input_token "$1"
+      ;;
+  esac
   shift
 done
 
@@ -238,10 +471,14 @@ if [[ ! -t 0 && "${action}" != "home" && "${action}" != "help" ]]; then
     # shellcheck disable=SC2206
     tokens=(${line})
     for token in "${tokens[@]}"; do
-      [[ -n "${token}" ]] && append_passthrough_token "${token}"
+      [[ -n "${token}" ]] && append_input_token "${token}"
     done
   done
 fi
+
+for diagnostic in "${json_alias_diagnostics[@]}"; do
+  echo "${diagnostic}" >&2
+done
 
 if [[ "${action}" == "sync" ]]; then
   resolved_sync_paths=()
@@ -281,39 +518,60 @@ cd "${skillbox_root}"
 
 case "${action}" in
   home)
-    echo "sbp: ${client:-auto} ${profile}"
+    echo "${wrapper_name}: ${client:-auto} ${profile}"
     echo "cwd: ${invoke_cwd}"
     python3 .env-manager/manage.py skills "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" --issues-only --limit 20 --no-global || true
     echo
     echo "next:"
-    echo "  sbp status        runtime status"
-    echo "  sbp up            start services"
-    echo "  sbp skills --issues-only full skill drift check"
-    echo "  sbp mcp           Claude/Codex MCP config parity"
-    echo "  sbp skills --full full skill view"
-    echo "  sbp help          command reference"
+    echo "  ${wrapper_name} status --json runtime status"
+    echo "  ${wrapper_name} up --dry-run  preview services"
+    echo "  ${wrapper_name} skills --issues-only full skill drift check"
+    echo "  ${wrapper_name} mcp           Claude/Codex MCP config parity"
+    echo "  ${wrapper_name} skills --full full skill view"
+    echo "  ${wrapper_name} help          command reference"
     ;;
   help)
     print_help
     ;;
+  capabilities)
+    print_capabilities
+    ;;
+  robot-docs)
+    if [[ " ${passthrough_args[*]} " == *" --format json "* ]]; then
+      python3 - "${wrapper_name}" "$(print_robot_docs)" <<'PY'
+from __future__ import annotations
+
+import json
+import sys
+
+print(json.dumps({"ok": True, "topic": "guide", "guide": sys.argv[2]}, indent=2, sort_keys=True))
+PY
+    else
+      print_robot_docs
+    fi
+    ;;
+  robot-triage)
+    print_robot_triage
+    ;;
   up)
-    python3 .env-manager/manage.py up "${runtime_client_flags[@]}" --profile "${profile}" --mode "${mode}" "${service_flags[@]}"
+    python3 .env-manager/manage.py up "${runtime_client_flags[@]}" --profile "${profile}" --mode "${mode}" "${runtime_args[@]}" "${service_flags[@]}"
     ;;
   down)
-    python3 .env-manager/manage.py down "${runtime_client_flags[@]}" --profile "${profile}" "${service_flags[@]}"
+    python3 .env-manager/manage.py down "${runtime_client_flags[@]}" --profile "${profile}" "${runtime_args[@]}" "${service_flags[@]}"
     ;;
   restart)
-    python3 .env-manager/manage.py restart "${runtime_client_flags[@]}" --profile "${profile}" "${service_flags[@]}"
+    python3 .env-manager/manage.py restart "${runtime_client_flags[@]}" --profile "${profile}" "${runtime_args[@]}" "${service_flags[@]}"
     ;;
   status)
-    python3 .env-manager/manage.py status "${runtime_client_flags[@]}" --profile "${profile}"
+    python3 .env-manager/manage.py status "${runtime_client_flags[@]}" --profile "${profile}" "${runtime_args[@]}"
     ;;
   logs)
     if [[ ${#services[@]} -eq 0 ]]; then
-      echo "sbp logs: pass at least one service, e.g. 'sbp logs spaps'" >&2
+      echo "${wrapper_name} logs: pass at least one service. Exact command: ${wrapper_name} logs <profile> <service> --json" >&2
+      echo "List services first: ${wrapper_name} status --json" >&2
       exit 2
     fi
-    python3 .env-manager/manage.py logs "${runtime_client_flags[@]}" --profile "${profile}" "${service_flags[@]}"
+    python3 .env-manager/manage.py logs "${runtime_client_flags[@]}" --profile "${profile}" "${runtime_args[@]}" "${service_flags[@]}"
     ;;
   mmdx)
     python3 .env-manager/manage.py mmdx --cwd "${invoke_cwd}" "${passthrough_args[@]}"

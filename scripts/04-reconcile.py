@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import shutil
 import subprocess
@@ -52,6 +53,8 @@ EXPECTED_DIRECTORIES = [
     "workspace",
     "workspace/client-blueprints",
 ]
+RECONCILE_COMMAND_NAMES = {"capabilities", "doctor", "render", "robot-docs", "robot-triage"}
+JSON_FLAG_ALIASES = {"--json", "--jason", "--jsno", "--jsson"}
 
 
 @dataclass
@@ -998,8 +1001,13 @@ def doctor_results(skip_compose: bool, skip_skill_sync: bool) -> list[CheckResul
         results.append(
             CheckResult(
                 status="warn",
-                code="skill-sync-dry-run",
-                message="skill-sync dry run skipped",
+                code="skill-repo-sync-dry-run",
+                message="skill-repo sync dry run skipped",
+                details={
+                    "command": (
+                        "python3 .env-manager/manage.py sync --dry-run --format json"
+                    )
+                },
             )
         )
     else:
@@ -1008,13 +1016,197 @@ def doctor_results(skip_compose: bool, skip_skill_sync: bool) -> list[CheckResul
     return results
 
 
+def _agent_command(name: str) -> dict[str, Any]:
+    safe_first_try = {
+        "capabilities": "python3 scripts/04-reconcile.py capabilities --json",
+        "doctor": "python3 scripts/04-reconcile.py doctor --format json --skip-compose --skip-skill-sync",
+        "render": "python3 scripts/04-reconcile.py render --format json",
+        "robot-docs": "python3 scripts/04-reconcile.py robot-docs guide",
+        "robot-triage": "python3 scripts/04-reconcile.py --robot-triage",
+    }[name]
+    return {
+        "name": name,
+        "json": True,
+        "safe_first_try": safe_first_try,
+    }
+
+
+def capabilities_payload() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "tool": "skillbox-reconcile",
+        "contract_version": "2026-05-11",
+        "root_dir": str(ROOT_DIR),
+        "entrypoint": "python3 scripts/04-reconcile.py",
+        "commands": [_agent_command(name) for name in sorted(RECONCILE_COMMAND_NAMES)],
+        "agent_surfaces": {
+            "capabilities": "python3 scripts/04-reconcile.py capabilities --json",
+            "robot_docs": "python3 scripts/04-reconcile.py robot-docs guide",
+            "robot_triage": "python3 scripts/04-reconcile.py --robot-triage",
+            "json_aliases": sorted(JSON_FLAG_ALIASES),
+        },
+        "stdout_stderr_contract": {
+            "json_stdout": "When JSON is requested, stdout is parseable JSON only.",
+            "diagnostics_stderr": "JSON typo alias notices and parser errors go to stderr.",
+        },
+        "safe_previews": [
+            "python3 scripts/04-reconcile.py render --format json",
+            "python3 scripts/04-reconcile.py doctor --format json --skip-compose --skip-skill-sync",
+            "python3 .env-manager/manage.py sync --dry-run --format json",
+        ],
+        "exit_codes": {
+            "0": "success",
+            "1": "validation failure or runtime/environment error",
+            "2": "argparse usage error",
+        },
+        "next_actions": [
+            "python3 scripts/04-reconcile.py render --format json",
+            "python3 scripts/04-reconcile.py doctor --format json --skip-compose --skip-skill-sync",
+            "python3 scripts/04-reconcile.py robot-docs guide",
+        ],
+    }
+
+
+def robot_docs_guide() -> str:
+    return """Skillbox reconcile agent guide
+
+Primary entrypoint:
+  python3 scripts/04-reconcile.py <command> [options]
+
+Start here:
+  python3 scripts/04-reconcile.py capabilities --json
+  python3 scripts/04-reconcile.py render --format json
+  python3 scripts/04-reconcile.py doctor --format json --skip-compose --skip-skill-sync
+  python3 scripts/04-reconcile.py --robot-triage
+
+Structured output:
+  render, doctor, capabilities, and robot-triage support JSON output.
+  Agent-friendly aliases are accepted: --json, --jason, --jsno, --jsson.
+  Diagnostics and typo-alias notices are printed to stderr, not stdout.
+
+Safe validation pattern:
+  Use doctor --format json --skip-compose --skip-skill-sync for a fast read-side
+  check, then run full doctor when Docker and manage.py dry-run checks are safe.
+  The skill sync check is a dry-run command:
+  python3 .env-manager/manage.py sync --dry-run --format json
+"""
+
+
+def robot_triage_payload() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "tool": "skillbox-reconcile",
+        "quick_ref": capabilities_payload()["next_actions"],
+        "recommendations": [
+            {
+                "id": "render-model",
+                "command": "python3 scripts/04-reconcile.py render --format json",
+                "why": "Fastest read-only outer model inspection.",
+            },
+            {
+                "id": "fast-doctor",
+                "command": (
+                    "python3 scripts/04-reconcile.py doctor --format json "
+                    "--skip-compose --skip-skill-sync"
+                ),
+                "why": "Separates manifest drift from Docker and runtime dry-run availability.",
+            },
+            {
+                "id": "full-doctor",
+                "command": "python3 scripts/04-reconcile.py doctor --format json",
+                "why": "Runs the full outer validation once side effects are acceptable.",
+            },
+        ],
+    }
+
+
 def emit_json(payload: Any) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Render and validate the skillbox sandbox model.")
+def _suggest_command(message: str) -> str | None:
+    marker = "invalid choice: '"
+    if marker not in message:
+        return None
+    bad = message.split(marker, 1)[1].split("'", 1)[0]
+    matches = difflib.get_close_matches(bad, sorted(RECONCILE_COMMAND_NAMES), n=1)
+    return matches[0] if matches else None
+
+
+class ReconcileArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:  # pragma: no cover - argparse exits
+        suggestion = _suggest_command(message)
+        if suggestion:
+            message = (
+                f"{message}\nDid you mean: `{self.prog} {suggestion}`?\n"
+                f"Discover commands: `{self.prog} capabilities --json`."
+            )
+        super().error(message)
+
+
+def _normalize_agent_argv(argv: list[str]) -> tuple[list[str], list[str]]:
+    normalized: list[str] = []
+    diagnostics: list[str] = []
+    command_seen = False
+    pending_json = False
+    for token in argv:
+        if token == "--robot-help":
+            normalized.extend(["robot-docs", "guide"])
+            command_seen = True
+            continue
+        if token == "--robot-triage":
+            normalized.append("robot-triage")
+            command_seen = True
+            continue
+        if token in JSON_FLAG_ALIASES:
+            if token != "--json":
+                diagnostics.append(
+                    f"Interpreting {token} as --format json. "
+                    "Exact command: 04-reconcile.py <command> --format json"
+                )
+            if command_seen:
+                normalized.extend(["--format", "json"])
+            else:
+                pending_json = True
+            continue
+        if not token.startswith("-") and not command_seen:
+            command_seen = True
+            normalized.append(token)
+            if pending_json:
+                normalized.extend(["--format", "json"])
+                pending_json = False
+            continue
+        normalized.append(token)
+    if pending_json and not command_seen:
+        normalized.extend(["doctor", "--format", "json"])
+    return normalized, diagnostics
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = ReconcileArgumentParser(
+        prog="04-reconcile.py",
+        description="Render and validate the skillbox sandbox model.",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    capabilities_parser = subparsers.add_parser(
+        "capabilities",
+        help="Print the machine-readable agent contract.",
+    )
+    capabilities_parser.add_argument("--format", choices=("json",), default="json")
+
+    robot_docs_parser = subparsers.add_parser(
+        "robot-docs",
+        help="Print agent-facing command guidance.",
+    )
+    robot_docs_parser.add_argument("topic", nargs="?", default="guide", choices=("guide",))
+    robot_docs_parser.add_argument("--format", choices=("text", "json"), default="text")
+
+    robot_triage_parser = subparsers.add_parser(
+        "robot-triage",
+        help="Print compact machine-readable first actions.",
+    )
+    robot_triage_parser.add_argument("--format", choices=("json",), default="json")
 
     render_parser = subparsers.add_parser("render", help="Print the resolved sandbox model.")
     render_parser.add_argument("--format", choices=("text", "json"), default="text")
@@ -1036,23 +1228,50 @@ def main() -> int:
         action="store_true",
         help="Skip the manage.py sync --dry-run check for the default skill-repo-set.",
     )
+    return parser
 
-    args = parser.parse_args()
 
-    if args.command == "render":
-        payload = build_render_payload(with_compose=args.with_compose)
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    normalized_argv, diagnostics = _normalize_agent_argv(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(normalized_argv)
+    for diagnostic in diagnostics:
+        print(diagnostic, file=sys.stderr)
+
+    try:
+        if args.command == "capabilities":
+            emit_json(capabilities_payload())
+            return 0
+
+        if args.command == "robot-docs":
+            guide = robot_docs_guide()
+            if args.format == "json":
+                emit_json({"ok": True, "topic": args.topic, "guide": guide})
+            else:
+                print(guide.rstrip())
+            return 0
+
+        if args.command == "robot-triage":
+            emit_json(robot_triage_payload())
+            return 0
+
+        if args.command == "render":
+            payload = build_render_payload(with_compose=args.with_compose)
+            if args.format == "json":
+                emit_json(payload)
+            else:
+                print_render_text(payload)
+            return 0
+
+        results = doctor_results(skip_compose=args.skip_compose, skip_skill_sync=args.skip_skill_sync)
         if args.format == "json":
-            emit_json(payload)
+            emit_json([asdict(result) for result in results])
         else:
-            print_render_text(payload)
-        return 0
-
-    results = doctor_results(skip_compose=args.skip_compose, skip_skill_sync=args.skip_skill_sync)
-    if args.format == "json":
-        emit_json([asdict(result) for result in results])
-    else:
-        print_doctor_text(results)
-    return 1 if any(result.status == "fail" for result in results) else 0
+            print_doctor_text(results)
+        return 1 if any(result.status == "fail" for result in results) else 0
+    except RuntimeError as exc:
+        print(f"04-reconcile.py: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
