@@ -16,6 +16,7 @@ from .context_rendering import *
 from .text_renderers import *
 from .workflows import *
 from .mcp_visibility import *
+from .swimmers_launch import launch_swimmers_batch, swimmers_launch_text_lines
 
 
 class DistributionPreviewError(RuntimeError):
@@ -64,6 +65,7 @@ MANAGE_COMMAND_NAMES = {
     "skills",
     "status",
     "stewardship-report",
+    "swimmers-launch",
     "sync",
     "up",
     "worker-artifacts",
@@ -515,6 +517,85 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_profile_arg(mmdx_parser)
     _add_client_arg(mmdx_parser)
+
+    swimmers_launch_parser = subparsers.add_parser(
+        "swimmers-launch",
+        help="Launch one Swimmers agent session per directory through /v1/sessions/batch.",
+    )
+    swimmers_launch_parser.add_argument("dirs", nargs="*", help="Directories to launch agents in.")
+    swimmers_launch_parser.add_argument(
+        "--dir",
+        dest="dir_flags",
+        action="append",
+        default=[],
+        help="Directory to launch. Can be repeated.",
+    )
+    swimmers_launch_parser.add_argument(
+        "--cwd",
+        dest="cwd_flags",
+        action="append",
+        default=[],
+        help="Directory to launch. Alias for --dir for agent command consistency.",
+    )
+    swimmers_launch_parser.add_argument(
+        "--dirs-file",
+        default=None,
+        help="File containing one launch directory per line.",
+    )
+    swimmers_launch_parser.add_argument(
+        "--group",
+        default=None,
+        help="Resolve launch directories from a Swimmers /v1/dirs group.",
+    )
+    swimmers_launch_parser.add_argument(
+        "--path",
+        dest="group_path",
+        default=None,
+        help="Optional /v1/dirs path used with --group.",
+    )
+    swimmers_launch_parser.add_argument(
+        "--managed-only",
+        action="store_true",
+        help="With --group, ask /v1/dirs for managed entries only.",
+    )
+    swimmers_launch_parser.add_argument(
+        "--request",
+        "--prompt",
+        dest="request",
+        default=None,
+        help="Initial request sent to every launched agent.",
+    )
+    swimmers_launch_parser.add_argument(
+        "--request-file",
+        "--prompt-file",
+        dest="request_file",
+        default=None,
+        help="Read the initial request from a file.",
+    )
+    swimmers_launch_parser.add_argument("--tool", choices=("codex", "claude"), default="codex")
+    swimmers_launch_parser.add_argument(
+        "--target",
+        default=None,
+        help="Optional Swimmers launch target id. Defaults to local.",
+    )
+    swimmers_launch_parser.add_argument(
+        "--base-url",
+        default=None,
+        help="Swimmers API base URL. Defaults to SWIMMERS_URL, SWIMMERS_TUI_URL, or http://127.0.0.1:3210.",
+    )
+    swimmers_launch_parser.add_argument(
+        "--auth-token-env",
+        default=None,
+        help="Environment variable containing the bearer token for token-auth Swimmers APIs.",
+    )
+    swimmers_launch_parser.add_argument("--timeout", type=float, default=30.0)
+    swimmers_launch_parser.add_argument("--dry-run", action="store_true")
+    swimmers_launch_parser.add_argument(
+        "--invoke-cwd",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    swimmers_launch_parser.add_argument("--format", choices=("text", "json"), default="text")
 
     operator_booking_parser = subparsers.add_parser(
         "operator-booking",
@@ -1910,6 +1991,40 @@ def _handle_worker_promote_learning(args: argparse.Namespace, root_dir: Path) ->
     return _emit_worker_cli_payload(args, exit_code, payload, _worker_promote_text)
 
 
+def _handle_swimmers_launch(args: argparse.Namespace, root_dir: Path) -> int:
+    try:
+        exit_code, payload = launch_swimmers_batch(
+            positional_dirs=list(getattr(args, "dirs", []) or []),
+            dir_flags=list(getattr(args, "dir_flags", []) or []),
+            cwd_flags=list(getattr(args, "cwd_flags", []) or []),
+            dirs_file=getattr(args, "dirs_file", None),
+            group=getattr(args, "group", None),
+            group_path=getattr(args, "group_path", None),
+            managed_only=bool(getattr(args, "managed_only", False)),
+            request=getattr(args, "request", None),
+            request_file=getattr(args, "request_file", None),
+            tool=str(getattr(args, "tool", "codex") or "codex"),
+            launch_target=getattr(args, "target", None),
+            base_url=getattr(args, "base_url", None),
+            auth_token_env=getattr(args, "auth_token_env", None),
+            invoke_cwd=getattr(args, "invoke_cwd", None),
+            timeout=float(getattr(args, "timeout", 30.0) or 30.0),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+    except RuntimeError as exc:
+        if args.format == "json":
+            emit_json(classify_error(exc, "swimmers-launch"))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print("\n".join(swimmers_launch_text_lines(payload)))
+    return exit_code
+
+
 def _handle_mmdx(args: argparse.Namespace, root_dir: Path) -> int:
     try:
         payload, exit_code = mmdx_open_payload(
@@ -2024,6 +2139,8 @@ def _safe_first_try_command(name: str) -> str:
         return "manage.py distribution-rollback --list --skill <skill> --format json"
     if name in {"status", "render", "doctor", "skills", "skill-audit", "mcp-audit"}:
         return f"manage.py {name} --format json"
+    if name == "swimmers-launch":
+        return "manage.py swimmers-launch <dir> <dir> --request '<prompt>' --dry-run --format json"
     if name in {"up", "down", "restart", "sync", "bootstrap", "context"}:
         return f"manage.py {name} --dry-run --format json"
     return f"manage.py {name} --help"
@@ -2056,6 +2173,7 @@ Useful command families:
   doctor --format json          Runtime validation checks.
   skills --issues-only          Skill visibility issues for the current cwd.
   mcp-audit --format json       Claude/Codex MCP parity audit.
+  swimmers-launch <dirs...>     Launch one Swimmers agent session per dir.
   focus <client> --format json  Sync, bootstrap, start, collect live state, context.
 """
 
@@ -2248,6 +2366,7 @@ _EARLY_DISPATCH: dict[str, Callable[[argparse.Namespace, Path], int]] = {
     "worker-status": _handle_worker_status,
     "worker-artifacts": _handle_worker_artifacts,
     "worker-promote-learning": _handle_worker_promote_learning,
+    "swimmers-launch": _handle_swimmers_launch,
     "mmdx": _handle_mmdx,
 }
 

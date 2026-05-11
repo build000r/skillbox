@@ -1277,6 +1277,7 @@ sbp skill add ui --to category --category frontend
 sbp skill sync --dry-run
 sbp mmdx review
 sbp mmdx skill_review_realms/review --no-open
+sbp launch ../api ../web --request "Audit auth drift" --dry-run
 sbo mmdx review
 ```
 
@@ -1296,6 +1297,12 @@ commands to review before applying repo-local, global, or overlay cleanup.
 downstream Mermaid/MMDX diagrams: it fuzzy-matches from the current repo and
 opens the selected file through the Buildooor diagrams viewer, while
 `--no-open` lists or resolves candidates without launching a browser.
+
+`sbp launch` and its `sbp bulk` alias are Swimmers batch launchers for agents:
+pass one or more directories plus `--request` (or `--request-file`) and they
+POST to the running Swimmers `/v1/sessions/batch` API, creating one agent
+session per directory. Use `--dry-run --json` first to inspect the exact
+payload; set `--base-url` or `SWIMMERS_TUI_URL` for a non-default Swimmers API.
 
 Agents can apply the same flow through the `skillbox_skill` and
 `skillbox_overlay` MCP tools after a dry-run review. For diagrams, use

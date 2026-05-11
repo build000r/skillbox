@@ -59,6 +59,8 @@ Usage:
   __WRAPPER__ restart [profile] [svc] Restart services
   __WRAPPER__ status [profile]        Runtime status
   __WRAPPER__ logs [profile] service  Show service logs
+  __WRAPPER__ launch DIR... --request "..."  Launch one Swimmers agent per dir
+  __WRAPPER__ bulk DIR... --request "..."    Alias for launch
   __WRAPPER__ recalibrate [args...]   Read-only cwd skill add/remove recalibration
   __WRAPPER__ mcp [args...]           Read-only Claude JSON / Codex TOML MCP audit
   __WRAPPER__ beads [status|init|sync] Check or initialize repo-local beads state
@@ -107,6 +109,7 @@ Examples:
   __WRAPPER__ skill add ui --to category --category frontend
   __WRAPPER__ mmdx review
   __WRAPPER__ mmdx skill review --no-open
+  __WRAPPER__ launch ../api ../web --request "Audit auth drift" --dry-run
   __WRAPPER__ hire times --limit 3
   __WRAPPER__ hire book --date 2026-05-06 --slot AM --email person@example.com --name "Person" --send-magic-link
   __WRAPPER__ up backend spaps
@@ -138,6 +141,7 @@ payload = {
         {"name": "up", "json": True, "safe_first_try": f"{wrapper} up <profile> <service> --dry-run --json"},
         {"name": "down", "json": True, "safe_first_try": f"{wrapper} down <profile> <service> --dry-run --json"},
         {"name": "restart", "json": True, "safe_first_try": f"{wrapper} restart <profile> <service> --dry-run --json"},
+        {"name": "launch", "json": True, "safe_first_try": f"{wrapper} launch <dir> <dir> --request '<prompt>' --dry-run --json"},
         {"name": "skills", "json": True, "safe_first_try": f"{wrapper} skills --issues-only --json"},
         {"name": "mcp", "json": True, "safe_first_try": f"{wrapper} mcp --json"},
         {"name": "recalibrate", "json": False, "safe_first_try": f"{wrapper} recalibrate"},
@@ -157,6 +161,7 @@ payload = {
             f"{wrapper} up <profile> <service> --dry-run --json",
             f"{wrapper} down <profile> <service> --dry-run --json",
             f"{wrapper} restart <profile> <service> --dry-run --json",
+            f"{wrapper} launch <dir> <dir> --request '<prompt>' --dry-run --json",
             f"{wrapper} skill prune --dry-run",
         ],
         "confirm_with_user_before": [f"{wrapper} down <profile> <service>"],
@@ -194,6 +199,7 @@ Safe mutation pattern:
   ${wrapper_name} up <profile> <service> --dry-run --json
   ${wrapper_name} down <profile> <service> --dry-run --json
   ${wrapper_name} restart <profile> <service> --dry-run --json
+  ${wrapper_name} launch <dir> <dir> --request "..." --dry-run --json
 EOF
 }
 
@@ -282,6 +288,10 @@ case "${1:-}" in
     action="logs"
     shift
     ;;
+  launch|bulk|bulk-launch|swimmers-launch)
+    action="swimmers-launch"
+    shift
+    ;;
   recalibrate|calibrate|rc)
     action="recalibrate"
     shift
@@ -343,7 +353,7 @@ case "${1:-}" in
     ;;
 esac
 
-if [[ "${action}" != "mmdx" ]]; then
+if [[ "${action}" != "mmdx" && "${action}" != "swimmers-launch" ]]; then
   case "${1:-}" in
     all|local-all)
       profile="local-all"
@@ -378,7 +388,7 @@ append_passthrough_token() {
     sync)
       sync_paths+=("${token}")
       ;;
-    skills|skill|overlay|overlay-toggle|recalibrate|mcp-audit|beads|mmdx|operator-booking)
+    skills|skill|overlay|overlay-toggle|recalibrate|mcp-audit|beads|mmdx|operator-booking|swimmers-launch)
       passthrough_args+=("${token}")
       ;;
     *)
@@ -572,6 +582,9 @@ PY
       exit 2
     fi
     python3 .env-manager/manage.py logs "${runtime_client_flags[@]}" --profile "${profile}" "${runtime_args[@]}" "${service_flags[@]}"
+    ;;
+  swimmers-launch)
+    python3 .env-manager/manage.py swimmers-launch --invoke-cwd "${invoke_cwd}" "${passthrough_args[@]}"
     ;;
   mmdx)
     python3 .env-manager/manage.py mmdx --cwd "${invoke_cwd}" "${passthrough_args[@]}"
