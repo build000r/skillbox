@@ -1,0 +1,122 @@
+<!-- mmdx
+{
+  "entry": "main",
+  "links": [
+    {"from": "main", "label": "Goal Contract", "to": "goal-contract"},
+    {"from": "main", "label": "Reality Gap", "to": "reality-gap"},
+    {"from": "main", "label": "Routing", "to": "routing"},
+    {"from": "main", "label": "Hardening Loop", "to": "hardening-loop"},
+    {"from": "main", "label": "Proof Gate", "to": "proof-gate"}
+  ]
+}
+-->
+
+## chart main Skill Mapping Control Plane Gantt
+```mermaid
+gantt
+  title Smart Goal Tracker - Repo-Aware Skill Mapping Control Plane
+  dateFormat  YYYY-MM-DD
+  axisFormat  %b %d
+
+  section Now: Reality
+  Skill visibility exists for one cwd        :done, onecwd, 2026-05-08, 1d
+  Marketing overlay exists but docs drifted  :done, overlay, 2026-05-08, 1d
+  Global skill drift is noisy                :crit, drift, 2026-05-08, 1d
+
+  section P0 Cross-Repo Map
+  Add skill-audit CLI and MCP surface        :active, audit, 2026-05-08, 1d
+  Wire sbp skills audit shortcut             :active, sbp, 2026-05-08, 1d
+  Fix cwd client inference for sbp skills    :active, infer, 2026-05-08, 1d
+  Cross-repo map usable                      :milestone, mapdone, 2026-05-08, 0d
+
+  section P1 Mode Contract
+  Align marketing overlay docs and config    :active, mode, 2026-05-08, 1d
+  Prove overlay off/on does not leak global  :crit, modeproof, after mode, 1d
+  Mode contract stable                       :milestone, modedone, after modeproof, 0d
+
+  section P2 Cleanup Wave
+  Review audit rows by repo owner            :repoowners, after mapdone, 1d
+  Dry-run sync missing repo-local skills     :crit, syncdry, after repoowners, 1d
+  Dry-run prune broken or misplaced links    :crit, prunedry, after syncdry, 1d
+  Apply only reviewed safe links             :apply, after prunedry, 1d
+
+  section Finish
+  Full tests and doctor                      :crit, validate, after apply, 1d
+  Commit reviewed runtime and config deltas  :crit, commit, after validate, 1d
+  Post-commit reality check                  :crit, reality, after commit, 1d
+  Skill mapping control plane met            :milestone, done, after reality, 0d
+```
+
+## chart goal-contract Skill Mapping Goal Contract
+```mermaid
+flowchart TD
+  current["CURRENT: manage.py skills can inspect one cwd; skill-scope.yaml declares global/local/category/overlay policy; sbp has skill and overlay shortcuts"]
+  gap["GAP: agents cannot ask for a whole-downstream map; sbp skill commands forced personal by default; marketing docs named a stale env var; global drift repeated too much noise"]
+  goal["LOFTY END GOAL: every downstream repo has the right reusable skills in the right local/global/mode scope, with no hidden global pile masking missing project links"]
+  bars["QUALITY BARS: read-only audit first, dry-run before unlink/link, mode flips are reversible, cli output is compact, MCP exposes the same view, tests cover mappings"]
+  done["DONE: skill-audit identifies repo rows, sbp uses cwd inference for skill work, marketing overlay contract is true, reviewed sync/prune commands pass, post-commit reality check agrees"]
+
+  current --> gap --> goal --> bars --> done
+```
+
+## chart reality-gap Current Reality And Gaps
+```mermaid
+flowchart LR
+  onecwd["one-cwd visibility: working"]
+  audit["cross-repo audit: added in current wave"]
+  sbp["sbp skill commands: changed to cwd-infer unless SKILLBOX_CLIENT is set"]
+  mode["marketing mode: active via SKILLBOX_OVERLAYS or sbp overlay commands"]
+  global["global drift: still high and must not be mass-pruned without review"]
+  repos["repo rows: broken brasshands, missing iOS/catalog skills, misplaced ui/wrangler/domain links"]
+
+  onecwd --> audit --> repos
+  onecwd --> sbp
+  mode --> repos
+  global --> repos
+```
+
+## chart routing Skill And Repo Routing
+```mermaid
+flowchart TD
+  start["Start with sbp skills audit"]
+  runtime["skillbox repo owns manage.py skill-audit, MCP tool, sbp wrapper, tests, README"]
+  config["skillbox-config owns operator policy: skill-scope.yaml categories, allowlist, overlays, client mappings"]
+  publicskills["opensource/skills owns portable public skill contracts"]
+  privateskills["skills-private owns reusable private operator skills"]
+  marketing["marketingskills owns opt-in growth/CRO/SEO skills activated by marketing mode"]
+  noauto["No mass cleanup without dry-run review"]
+
+  start --> runtime
+  start --> config
+  config --> publicskills
+  config --> privateskills
+  config --> marketing
+  runtime --> noauto
+```
+
+## chart hardening-loop Repeated Proof Loop
+```mermaid
+flowchart TD
+  audit["1. Audit: sbp skills audit --limit 20"]
+  choose["2. Choose one repo/category row"]
+  drysync["3. Dry-run: manage.py skill sync --cwd REPO --dry-run"]
+  dryprune["4. Dry-run: manage.py skill prune --cwd REPO --dry-run"]
+  apply["5. Apply reviewed safe link/unlink only"]
+  verify["6. Verify: skill-audit, focused tests, doctor"]
+  repeat["Repeat until high-value rows are closed"]
+
+  audit --> choose --> drysync --> dryprune --> apply --> verify --> repeat --> audit
+```
+
+## chart proof-gate Final Evidence Gate
+```mermaid
+flowchart TD
+  tests["Focused tests: cli wrappers, skill visibility, MCP server"]
+  auditcmd["Command proof: sbp skills audit and manage.py skill-audit"]
+  modecmd["Mode proof: sbp m / overlay activate/off with project-scoped links"]
+  doctor["Outer doctor and dev-sanity after reviewed cleanup"]
+  commit["Commit runtime and private-config deltas intentionally"]
+  reality["Post-commit reality check confirms repo-aware skill mapping is trustworthy"]
+
+  tests --> auditcmd --> modecmd --> doctor --> commit --> reality
+```

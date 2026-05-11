@@ -22,6 +22,214 @@ class CliWrapperTests(unittest.TestCase):
         self.assertIn("sbp mmdx QUERY", result.stdout)
         self.assertIn("Fuzzy-find and open .mmdx/.mmd", result.stdout)
         self.assertIn("sbp hire times", result.stdout)
+        self.assertIn("sbp skills audit", result.stdout)
+        self.assertIn("sbp recalibrate", result.stdout)
+        self.assertIn("sbp mcp", result.stdout)
+        self.assertIn("sbp beads", result.stdout)
+
+    def test_sbp_skills_infers_client_from_downstream_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            downstream = root / "downstream"
+            downstream.mkdir()
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "skills",
+                "--issues-only",
+                fake_root=fake_root,
+                invoke_cwd=downstream,
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                record["argv"],
+                [
+                    "skills",
+                    "--profile",
+                    "local-all",
+                    "--cwd",
+                    str(downstream),
+                    "--issues-only",
+                ],
+            )
+
+    def test_sbp_skills_audit_maps_to_skill_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            downstream = root / "downstream"
+            downstream.mkdir()
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "skills",
+                "audit",
+                "--limit",
+                "5",
+                fake_root=fake_root,
+                invoke_cwd=downstream,
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                record["argv"],
+                [
+                    "skill-audit",
+                    "--profile",
+                    "local-all",
+                    "--cwd",
+                    str(downstream),
+                    "--limit",
+                    "5",
+                ],
+            )
+
+    def test_sbp_recalibrate_defaults_to_cwd_sync_and_project_prune_dry_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            downstream = root / "downstream"
+            downstream.mkdir()
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "recalibrate",
+                fake_root=fake_root,
+                invoke_cwd=downstream,
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("policy issues for this repo:", result.stdout)
+            self.assertIn("add missing repo-local skills:", result.stdout)
+            self.assertIn("remove repo-local policy violations:", result.stdout)
+            self.assertIn("beads graph:", result.stdout)
+            self.assertIn("beads: not required by currently effective skills", result.stdout)
+            self.assertIn("mcp config parity:", result.stdout)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                record["argv"],
+                [
+                    "mcp-audit",
+                    "--profile",
+                    "local-all",
+                    "--cwd",
+                    str(downstream),
+                ],
+            )
+
+    def test_sbp_recalibrate_cwd_override_applies_to_closeout_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            invoke_cwd = root / "launcher"
+            target_cwd = root / "target"
+            invoke_cwd.mkdir()
+            target_cwd.mkdir()
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "recalibrate",
+                "--cwd",
+                str(target_cwd),
+                fake_root=fake_root,
+                invoke_cwd=invoke_cwd,
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"cwd: {target_cwd}", result.stdout)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                record["argv"],
+                [
+                    "mcp-audit",
+                    "--profile",
+                    "local-all",
+                    "--cwd",
+                    str(target_cwd),
+                ],
+            )
+
+    def test_sbp_mcp_maps_to_mcp_audit_for_downstream_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            downstream = root / "downstream"
+            downstream.mkdir()
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "mcp",
+                "--config-root",
+                str(downstream),
+                fake_root=fake_root,
+                invoke_cwd=downstream,
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                record["argv"],
+                [
+                    "mcp-audit",
+                    "--profile",
+                    "local-all",
+                    "--cwd",
+                    str(downstream),
+                    "--config-root",
+                    str(downstream),
+                ],
+            )
+
+    def test_sbp_recalibrate_fleet_maps_to_skill_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            downstream = root / "downstream"
+            downstream.mkdir()
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "recalibrate",
+                "--fleet",
+                "--limit",
+                "9",
+                fake_root=fake_root,
+                invoke_cwd=downstream,
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("review dry-runs before applying:", result.stdout)
+            self.assertIn("sbp skill sync --cwd <repo> --dry-run", result.stdout)
+            self.assertNotIn("sbp skill sync <skill>", result.stdout)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                record["argv"],
+                [
+                    "skill-audit",
+                    "--profile",
+                    "local-all",
+                    "--cwd",
+                    str(downstream),
+                    "--limit",
+                    "9",
+                ],
+            )
 
     def test_sbp_mmdx_preserves_downstream_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

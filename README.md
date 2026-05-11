@@ -1191,6 +1191,26 @@ Use `--issues-only` for a compact agent/operator check, and `--show-sources`
 when you intentionally want the larger inventory of source-tree skills that are
 not currently synced.
 
+Use `skill-audit` when the question is broader than the current cwd. It scans
+the configured downstream repo roots from `skill-scope.yaml`, reports repo-local
+missing skills and scope violations per repo, and summarizes global drift once
+so agents do not repeat the same global warning for every checkout.
+
+```bash
+python3 .env-manager/manage.py skill-audit --cwd "$PWD"
+python3 .env-manager/manage.py skill-audit --scan-root ~/repos --limit 20
+```
+
+Use `mcp-audit` when the question is whether the same repo exposes the right
+MCP servers to both agent runtimes. It reads Claude Code project config from
+`.mcp.json`, Codex project config from `.codex/config.toml`, and reports
+missing, extra, disabled, invalid, and Claude-only/Codex-only MCP entries.
+
+```bash
+python3 .env-manager/manage.py mcp-audit --cwd "$PWD"
+sbp mcp
+```
+
 An operator config root may also define `skill-scope.yaml` or
 `skills-scope.yaml` beside `clients/`. Those files declare repo-only or
 global-allowed skill rules; `manage.py skills` reports `scope_violations` when
@@ -1211,7 +1231,9 @@ python3 .env-manager/manage.py skill add mcp-server-design --cwd ~/repos/opensou
 python3 .env-manager/manage.py skill activate mcp-server-design --cwd ~/repos/opensource/skillbox
 python3 .env-manager/manage.py skill add ui --to category --category frontend
 python3 .env-manager/manage.py skill sync --cwd "$PWD" --dry-run
-python3 .env-manager/manage.py skill prune --dry-run
+python3 .env-manager/manage.py skill prune --cwd "$PWD" --from project --dry-run
+python3 .env-manager/manage.py skill prune --from global --dry-run
+python3 .env-manager/manage.py skill-audit --cwd "$PWD"
 python3 .env-manager/manage.py overlay activate marketing --cwd "$PWD"
 ```
 
@@ -1243,6 +1265,10 @@ make wrappers-install
 sbp
 sbp help
 sbp skills --issues-only
+sbp recalibrate
+sbp mcp
+sbp recalibrate --fleet --limit 20
+sbp skills audit --limit 20
 sbp skill plan mcp-server-design
 sbp skill add mcp-server-design
 sbp skill activate mcp-server-design
@@ -1255,13 +1281,21 @@ sbo mmdx review
 ```
 
 `sbp` with no args is intentionally read-only: it prints a fast cwd-aware skill
-home view and next commands, skipping the slower global scan. Runtime mutation
-is explicit with `sbp up`, `sbp down`, `sbp restart`, or `sbp skill ...`; use
-`sbp skills --issues-only` for the full global/project drift check. `sbp mmdx`
-is the short path for downstream Mermaid/MMDX diagrams: it fuzzy-matches from
-the current repo and opens the selected file through the Buildooor diagrams
-viewer, while `--no-open` lists or resolves candidates without launching a
-browser.
+home view and next commands, skipping the slower global scan. Skill and overlay
+commands infer the active client from the downstream cwd unless
+`SKILLBOX_CLIENT` is set; runtime service commands keep the existing
+`personal` default unless overridden. Runtime mutation is explicit with
+`sbp up`, `sbp down`, `sbp restart`, or `sbp skill ...`; use
+`sbp skills --issues-only` for the full global/project drift check and
+`sbp recalibrate` for the cwd-local add/remove recommendation, and
+`sbp skills audit` or `sbp recalibrate --fleet` for the cross-repo map.
+`sbp recalibrate` prints the dry-run sync/prune commands for the current repo
+and the Claude/Codex MCP parity check; the fleet form prints the narrow dry-run
+commands to review before applying repo-local, global, or overlay cleanup.
+`sbp mcp` runs only the read-only MCP audit. `sbp mmdx` is the short path for
+downstream Mermaid/MMDX diagrams: it fuzzy-matches from the current repo and
+opens the selected file through the Buildooor diagrams viewer, while
+`--no-open` lists or resolves candidates without launching a browser.
 
 Agents can apply the same flow through the `skillbox_skill` and
 `skillbox_overlay` MCP tools after a dry-run review. For diagrams, use

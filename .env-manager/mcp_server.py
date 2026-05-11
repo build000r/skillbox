@@ -18,7 +18,6 @@ import os
 import re
 import subprocess
 import sys
-import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -258,6 +257,75 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "skillbox_skill_audit",
+        "description": (
+            "Audit skill-scope policy across configured downstream repos. "
+            "Use this when skill links feel messy across many repos: it scans repo roots, "
+            "reports missing cwd-scoped skills and project scope violations per repo, and "
+            "summarizes global drift once. Read-only, no side effects."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "client": _CLIENT_PROP,
+                "profile": _PROFILE_PROP,
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory used for cwd-aware client matching and the global drift summary.",
+                },
+                "scan_root": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional roots to scan for git repos. Defaults to skill_install_scan_roots from skill-scope.yaml.",
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "Maximum directory depth under each scan root when finding git repos.",
+                    "default": 3,
+                },
+                "include_global": {
+                    "type": "boolean",
+                    "description": "Include the one-time global skill drift summary. Defaults to true.",
+                    "default": True,
+                },
+                "include_clean": {
+                    "type": "boolean",
+                    "description": "Include clean repo rows, not only repos with issues. Defaults to false.",
+                    "default": False,
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum repo rows and names for text-oriented output.",
+                    "default": 40,
+                },
+            },
+        },
+    },
+    {
+        "name": "skillbox_mcp_audit",
+        "description": (
+            "Audit MCP server visibility for both Claude Code and Codex config formats. "
+            "Reads Claude project JSON (.mcp.json) and Codex TOML (.codex/config.toml), "
+            "compares them against the active Skillbox runtime MCP expectations, and reports "
+            "missing, extra, disabled, invalid, and cross-surface parity mismatches. Read-only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "client": _CLIENT_PROP,
+                "profile": _PROFILE_PROP,
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory used to find the target repo root.",
+                },
+                "config_root": {
+                    "type": "string",
+                    "description": "Explicit repo/config root containing .mcp.json and .codex/config.toml.",
+                },
+            },
+        },
+    },
+    {
         "name": "skillbox_skill",
         "description": (
             "Plan or apply one skill lifecycle action: add/link, activate, move, remove, prune, or sync "
@@ -303,7 +371,7 @@ TOOLS: list[dict] = [
                 "from_scope": {
                     "type": "string",
                     "enum": ["global", "project", "all"],
-                    "description": "Scope to remove from for remove/move.",
+                    "description": "Scope to remove from for remove/move/prune.",
                     "default": "all",
                 },
                 "dry_run": _DRY_RUN_PROP,
@@ -1230,6 +1298,7 @@ _REPEAT_ARG_SPECS: tuple[tuple[str, str], ...] = (
     ("task", "--task"),
     ("category", "--category"),
     ("search_root", "--search-root"),
+    ("scan_root", "--scan-root"),
     ("set_vars", "--set"),
 )
 _STRING_ARG_SPECS: tuple[tuple[str, str], ...] = (
@@ -1247,6 +1316,7 @@ _STRING_ARG_SPECS: tuple[tuple[str, str], ...] = (
     ("summary", "--summary"),
     ("status", "--status"),
     ("cwd", "--cwd"),
+    ("config_root", "--config-root"),
     ("to", "--to"),
     ("scope", "--scope"),
     ("source", "--source"),
@@ -1306,6 +1376,8 @@ def _append_scalar_args(args: list[str], params: dict) -> None:
         args += ["--wait-seconds", str(float(params["wait_seconds"]))]
     if params.get("limit") is not None:
         args += ["--limit", str(int(params["limit"]))]
+    if params.get("max_depth") is not None:
+        args += ["--max-depth", str(int(params["max_depth"]))]
 
 
 def _append_bool_args(args: list[str], command: str, params: dict) -> None:
@@ -1316,6 +1388,8 @@ def _append_bool_args(args: list[str], command: str, params: dict) -> None:
         args.append("--no-global")
     if params.get("include_project") is False or params.get("no_project"):
         args.append("--no-project")
+    if command == "skill-audit" and params.get("include_clean"):
+        args.append("--all")
     if params.get("full") and command == "skills":
         args.append("--full")
     if params.get("compact") and command == "status":
@@ -1369,6 +1443,8 @@ _DISPATCH: dict[str, tuple[str, str | None]] = {
     "skillbox_doctor":      ("doctor",      None),
     "skillbox_render":      ("render",      None),
     "skillbox_skills":      ("skills",      None),
+    "skillbox_skill_audit": ("skill-audit", None),
+    "skillbox_mcp_audit":   ("mcp-audit",   None),
     "skillbox_skill":       ("skill",       "action"),
     "skillbox_overlay":     ("overlay",     "action"),
     "skillbox_mmdx_open":   ("mmdx",        None),

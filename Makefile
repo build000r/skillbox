@@ -20,7 +20,7 @@ FORCE_ARGS := $(if $(strip $(FORCE)),--force,)
 RESUME_ARGS := $(if $(strip $(RESUME)),--resume,)
 WRAPPER_BIN_DIR ?= $(HOME)/.local/bin
 
-.PHONY: help bootstrap-env render doctor acceptance runtime-render runtime-sync runtime-status runtime-skills runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context dev-sanity python-cov-xml wrappers-install build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles box-register box-unregister
+.PHONY: help bootstrap-env render doctor acceptance runtime-render runtime-sync runtime-status runtime-skills runtime-skill-audit runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context dev-sanity python-cov-xml wrappers-install build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles box-register box-unregister
 
 help:
 	@printf "  make bootstrap-env  Copy .env.example to .env if missing\n"
@@ -31,6 +31,7 @@ help:
 	@printf "  make runtime-sync   Create managed repo/log dirs and install default skills (optional CLIENT=name PROFILE=name)\n"
 	@printf "  make runtime-status Summarize repo/skill/service/log state (optional CLIENT=name PROFILE=name)\n"
 	@printf "  make runtime-skills Show effective skills and global/project drift (optional CLIENT=name PROFILE=name)\n"
+	@printf "  make runtime-skill-audit Audit skill policy across downstream repos (optional CLIENT=name PROFILE=name)\n"
 	@printf "  make runtime-bootstrap Sync runtime state and run bootstrap tasks (optional CLIENT=name PROFILE=name TASK=id)\n"
 	@printf "  make runtime-up     Sync runtime state and start manageable services (optional CLIENT=name PROFILE=name SERVICE=id)\n"
 	@printf "  make runtime-down   Stop manageable services (optional CLIENT=name PROFILE=name SERVICE=id)\n"
@@ -89,6 +90,9 @@ runtime-status:
 
 runtime-skills:
 	@python3 .env-manager/manage.py skills $(CLIENT_ARGS) $(PROFILE_ARGS)
+
+runtime-skill-audit:
+	@python3 .env-manager/manage.py skill-audit $(CLIENT_ARGS) $(PROFILE_ARGS)
 
 runtime-bootstrap:
 	@python3 .env-manager/manage.py bootstrap $(CLIENT_ARGS) $(PROFILE_ARGS) $(TASK_ARGS)

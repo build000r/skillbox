@@ -295,6 +295,79 @@ class SkillboxMcpServerTests(unittest.TestCase):
             "skillbox_skills",
         )
 
+    def test_skillbox_skill_audit_maps_scan_arguments(self) -> None:
+        tool_names = {tool["name"] for tool in MODULE.handle_tools_list({})["tools"]}
+        self.assertIn("skillbox_skill_audit", tool_names)
+
+        with mock.patch.object(
+            MODULE,
+            "run_manage",
+            return_value=(True, 0, {"summary": {"candidate_repos": 0}}),
+        ) as run_manage:
+            result = MODULE.handle_tools_call(
+                {
+                    "name": "skillbox_skill_audit",
+                    "arguments": {
+                        "cwd": "/tmp/repo",
+                        "scan_root": ["/tmp"],
+                        "max_depth": 2,
+                        "include_global": False,
+                        "include_clean": True,
+                        "limit": 5,
+                    },
+                },
+                request_id="req-skill-audit",
+            )
+
+        payload = _content_payload(result)
+        self.assertEqual(payload["summary"]["candidate_repos"], 0)
+        args = run_manage.call_args.args[0]
+        self.assertEqual(args[:3], ["skill-audit", "--format", "json"])
+        self.assertIn("--cwd", args)
+        self.assertIn("/tmp/repo", args)
+        self.assertIn("--scan-root", args)
+        self.assertIn("/tmp", args)
+        self.assertIn("--max-depth", args)
+        self.assertIn("2", args)
+        self.assertIn("--no-global", args)
+        self.assertIn("--all", args)
+        self.assertIn("--limit", args)
+        self.assertIn("5", args)
+
+    def test_skillbox_mcp_audit_maps_config_root_argument(self) -> None:
+        tool_names = {tool["name"] for tool in MODULE.handle_tools_list({})["tools"]}
+        self.assertIn("skillbox_mcp_audit", tool_names)
+
+        with mock.patch.object(
+            MODULE,
+            "run_manage",
+            return_value=(True, 0, {"summary": {"expected": 1}}),
+        ) as run_manage:
+            result = MODULE.handle_tools_call(
+                {
+                    "name": "skillbox_mcp_audit",
+                    "arguments": {
+                        "cwd": "/tmp/repo",
+                        "config_root": "/tmp/repo",
+                        "profile": ["local-all"],
+                    },
+                },
+                request_id="req-mcp-audit",
+            )
+
+        payload = _content_payload(result)
+        self.assertEqual(payload["summary"]["expected"], 1)
+        args = run_manage.call_args.args[0]
+        self.assertEqual(args[:3], ["mcp-audit", "--format", "json"])
+        self.assertIn("--cwd", args)
+        self.assertIn("/tmp/repo", args)
+        self.assertIn("--config-root", args)
+        self.assertIn("--profile", args)
+        self.assertEqual(
+            run_manage.call_args.kwargs["event_context"]["mcp_tool_name"],
+            "skillbox_mcp_audit",
+        )
+
     def test_skillbox_status_defaults_to_compact_with_full_escape_hatch(self) -> None:
         tool = next(tool for tool in MODULE.handle_tools_list({})["tools"] if tool["name"] == "skillbox_status")
         self.assertIn("full", tool["inputSchema"]["properties"])

@@ -1,0 +1,7 @@
+{"surface_id":"manage:root-help","kind":"help","command":"python3 .env-manager/manage.py --help","evidence":"runtime invocation; top-level argparse command list","phase":"1"}
+{"surface_id":"manage:status-json","kind":"read-command","command":"python3 .env-manager/manage.py status --format json","evidence":"runtime invocation; existing --format json surface","phase":"1"}
+{"surface_id":"manage:capabilities","kind":"self-documentation","command":"python3 .env-manager/manage.py capabilities --json","evidence":".env-manager/runtime_manager/cli.py","phase":"1"}
+{"surface_id":"manage:robot-docs","kind":"self-documentation","command":"python3 .env-manager/manage.py robot-docs guide","evidence":".env-manager/runtime_manager/cli.py","phase":"1"}
+{"surface_id":"manage:robot-triage","kind":"mega-command","command":"python3 .env-manager/manage.py --robot-triage","evidence":".env-manager/runtime_manager/cli.py","phase":"1"}
+{"surface_id":"manage:json-aliases","kind":"intent-inference","command":"python3 .env-manager/manage.py status --jsno","evidence":".env-manager/runtime_manager/cli.py","phase":"1"}
+{"surface_id":"manage:unknown-command","kind":"error-message","command":"python3 .env-manager/manage.py statu --json","evidence":".env-manager/runtime_manager/cli.py","phase":"1"}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -35,6 +36,68 @@ def _ns(**kwargs: object) -> argparse.Namespace:
 
 
 class CliUnitTests(unittest.TestCase):
+    def test_capabilities_json_contract_is_agent_readable(self) -> None:
+        result = subprocess.run(
+            [sys.executable, ".env-manager/manage.py", "capabilities", "--json"],
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "PYTHONPATH": str(ENV_MANAGER_DIR)},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["tool"], "skillbox-manage")
+        self.assertIn("capabilities", payload["agent_surfaces"])
+        self.assertIn("--json", payload["agent_surfaces"]["json_aliases"])
+        self.assertTrue(any(command["name"] == "status" for command in payload["commands"]))
+
+    def test_robot_docs_guide_is_available_in_tool(self) -> None:
+        result = subprocess.run(
+            [sys.executable, ".env-manager/manage.py", "robot-docs", "guide"],
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "PYTHONPATH": str(ENV_MANAGER_DIR)},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Skillbox agent guide", result.stdout)
+        self.assertIn("capabilities --json", result.stdout)
+        self.assertIn("Safe mutation pattern", result.stdout)
+
+    def test_json_typo_alias_keeps_stdout_parseable_and_warns_on_stderr(self) -> None:
+        result = subprocess.run(
+            [sys.executable, ".env-manager/manage.py", "status", "--jsno"],
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "PYTHONPATH": str(ENV_MANAGER_DIR)},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertIn("active_profiles", payload)
+        self.assertIn("Interpreting --jsno as --format json", result.stderr)
+
+    def test_unknown_command_error_suggests_correct_command_and_capabilities(self) -> None:
+        result = subprocess.run(
+            [sys.executable, ".env-manager/manage.py", "statu", "--json"],
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "PYTHONPATH": str(ENV_MANAGER_DIR)},
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("Did you mean: `manage.py status`?", result.stderr)
+        self.assertIn("manage.py capabilities --json", result.stderr)
+
     def test_cli_import_does_not_require_distribution_crypto_modules(self) -> None:
         code = r"""
 import builtins
@@ -524,6 +587,21 @@ except RuntimeError as exc:
         self.assertEqual(emitted[-1], {"compact": True})
 
         with (
+            mock.patch.object(CLI, "collect_mcp_audit", return_value={"summary": {"ok": True}}),
+            mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
+        ):
+            self.assertEqual(
+                CLI._handle_mcp_audit(  # noqa: SLF001
+                    _ns(cwd="/repo", config_root="/repo", format="json"),
+                    root,
+                    model,
+                    "reuse",
+                ),
+                CLI.EXIT_OK,
+            )
+        self.assertEqual(emitted[-1], {"summary": {"ok": True}})
+
+        with (
             mock.patch.object(CLI, "sync_runtime", return_value=["sync"]),
             mock.patch.object(CLI, "select_tasks", return_value=[{"id": "bootstrap"}]),
             mock.patch.object(CLI, "resolve_tasks_for_run", return_value=[{"id": "bootstrap"}]),
@@ -781,6 +859,29 @@ except RuntimeError as exc:
         self.assertIsNone(parsed.public_key)
         self.assertIsNone(parsed.version)
         self.assertIsNone(parsed.lockfile)
+
+        parsed = parser.parse_args([
+            "mcp-audit",
+            "--cwd",
+            "/tmp/repo",
+            "--config-root",
+            "/tmp/config",
+        ])
+        self.assertEqual(parsed.command, "mcp-audit")
+        self.assertEqual(parsed.cwd, "/tmp/repo")
+        self.assertEqual(parsed.config_root, "/tmp/config")
+
+        parsed = parser.parse_args([
+            "skill",
+            "prune",
+            "--from",
+            "project",
+            "--cwd",
+            "/tmp/repo",
+        ])
+        self.assertEqual(parsed.skill_action, "prune")
+        self.assertEqual(parsed.from_scope, "project")
+        self.assertEqual(parsed.cwd, "/tmp/repo")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_dir = Path(tmpdir) / "bundle-cache" / "deploy"
