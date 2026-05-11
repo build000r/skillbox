@@ -869,6 +869,50 @@ class BoxTests(unittest.TestCase):
             listed_payload = json.loads(listed.stdout)
             self.assertEqual(listed_payload["boxes"], [])
 
+    def test_agent_contract_commands_are_deterministic_and_safe_by_default(self) -> None:
+        first = self._run("capabilities", "--json")
+        second = self._run("capabilities", "--json")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(first.stdout, second.stdout)
+        payload = json.loads(first.stdout)
+        self.assertEqual(payload["tool"], "skillbox-box")
+        self.assertIn("stdout_stderr_contract", payload)
+        self.assertIn("--jsno", payload["agent_surfaces"]["json_aliases"])
+        self.assertIn(
+            "python3 scripts/box.py down <box-id> --dry-run --format json",
+            payload["safety"]["dry_run_first"],
+        )
+        down = next(command for command in payload["commands"] if command["name"] == "down")
+        self.assertTrue(down["destructive"])
+        self.assertTrue(down["dry_run"])
+        register = next(command for command in payload["commands"] if command["name"] == "register")
+        self.assertEqual(register["safe_first_try"], "python3 scripts/box.py profiles --format json")
+        self.assertIn("register <box-id>", register["mutation_command"])
+
+        docs = self._run("robot-docs", "guide")
+        self.assertEqual(docs.returncode, 0, docs.stderr)
+        self.assertIn("Skillbox box agent guide", docs.stdout)
+        self.assertIn("operator_box_exec", docs.stdout)
+
+        triage = self._run("--robot-triage")
+        self.assertEqual(triage.returncode, 0, triage.stderr)
+        self.assertEqual(json.loads(triage.stdout)["tool"], "skillbox-box")
+
+    def test_box_json_alias_keeps_stdout_parseable_and_warns_on_stderr(self) -> None:
+        result = self._run("profiles", "--jsno")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertIn("profiles", payload)
+        self.assertIn("Interpreting --jsno as --format json", result.stderr)
+
+    def test_box_unknown_command_suggests_exact_agent_command(self) -> None:
+        result = self._run("statuz", "--json")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("Did you mean: `box.py status`?", result.stderr)
+        self.assertIn("box.py capabilities --json", result.stderr)
+
     def _run(self, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         run_env = dict(os.environ)
         if env:

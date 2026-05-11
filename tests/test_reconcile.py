@@ -6,7 +6,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest import mock
@@ -390,6 +390,61 @@ class ReconcileTests(unittest.TestCase):
         print_doctor_text.assert_called_once_with(doctor_results)
         emit_json.assert_not_called()
         print_render_text.assert_not_called()
+
+    def test_agent_contract_commands_are_machine_readable(self) -> None:
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            self.assertEqual(RECONCILE.main(["capabilities", "--json"]), 0)
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["tool"], "skillbox-reconcile")
+        self.assertIn("stdout_stderr_contract", payload)
+        self.assertIn("--jsno", payload["agent_surfaces"]["json_aliases"])
+        self.assertIn(
+            "python3 scripts/04-reconcile.py doctor --format json --skip-compose --skip-skill-sync",
+            payload["safe_previews"],
+        )
+
+        docs = io.StringIO()
+        with redirect_stdout(docs):
+            self.assertEqual(RECONCILE.main(["robot-docs", "guide"]), 0)
+        self.assertIn("Skillbox reconcile agent guide", docs.getvalue())
+        self.assertIn("sync --dry-run --format json", docs.getvalue())
+
+        triage = io.StringIO()
+        with redirect_stdout(triage):
+            self.assertEqual(RECONCILE.main(["--robot-triage"]), 0)
+        self.assertEqual(json.loads(triage.getvalue())["tool"], "skillbox-reconcile")
+
+    def test_json_alias_and_error_paths_keep_stdout_stderr_split(self) -> None:
+        doctor_results = [RECONCILE.CheckResult(status="pass", code="ok", message="ok")]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(RECONCILE, "doctor_results", return_value=doctor_results):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                self.assertEqual(RECONCILE.main(["doctor", "--jsno"]), 0)
+        self.assertEqual(json.loads(stdout.getvalue())[0]["code"], "ok")
+        self.assertIn("Interpreting --jsno as --format json", stderr.getvalue())
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as raised:
+                RECONCILE.main(["doctro", "--json"])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("Did you mean: `04-reconcile.py doctor`?", stderr.getvalue())
+        self.assertIn("04-reconcile.py capabilities --json", stderr.getvalue())
+
+    def test_runtime_error_is_concise_stderr_only(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(RECONCILE, "build_render_payload", side_effect=RuntimeError("boom")):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                self.assertEqual(RECONCILE.main(["render", "--format", "json"]), 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("04-reconcile.py: boom", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
 
     def _model_inputs(
         self,

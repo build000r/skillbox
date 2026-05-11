@@ -19,6 +19,7 @@ class CliWrapperTests(unittest.TestCase):
         result = self._run_wrapper(SBP, "--help")
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sbp capabilities --json", result.stdout)
         self.assertIn("sbp mmdx QUERY", result.stdout)
         self.assertIn("Fuzzy-find and open .mmdx/.mmd", result.stdout)
         self.assertIn("sbp hire times", result.stdout)
@@ -26,6 +27,109 @@ class CliWrapperTests(unittest.TestCase):
         self.assertIn("sbp recalibrate", result.stdout)
         self.assertIn("sbp mcp", result.stdout)
         self.assertIn("sbp beads", result.stdout)
+
+    def test_sbo_help_uses_sbo_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+
+            result = self._run_wrapper(SBO, "--help", fake_root=fake_root)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sbo - personal skillbox runtime and skill helper", result.stdout)
+        self.assertIn("sbo capabilities --json", result.stdout)
+
+    def test_sbp_capabilities_and_robot_triage_are_parseable_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+
+            result = self._run_wrapper(SBP, "capabilities", "--json", fake_root=fake_root)
+            triage = self._run_wrapper(SBP, "--robot-triage", fake_root=fake_root)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["tool"], "skillbox-sbp")
+        self.assertIn("stdout_stderr_contract", payload)
+        self.assertIn("sbp down <profile> <service> --dry-run --json", payload["safety"]["dry_run_first"])
+        self.assertEqual(json.loads(triage.stdout)["tool"], "skillbox-sbp")
+
+    def test_sbp_status_json_alias_keeps_stdout_parseable_and_warns_on_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "status",
+                "core",
+                "--jsno",
+                fake_root=fake_root,
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            json.loads(result.stdout)
+            self.assertIn("Interpreting --jsno as --format json", result.stderr)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                record["argv"],
+                ["status", "--client", "personal", "--profile", "local-core", "--format", "json"],
+            )
+
+    def test_sbp_up_dry_run_is_not_treated_as_service(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "up",
+                "backend",
+                "spaps",
+                "--dry-run",
+                "--json",
+                fake_root=fake_root,
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                record["argv"],
+                [
+                    "up",
+                    "--client",
+                    "personal",
+                    "--profile",
+                    "local-backend",
+                    "--mode",
+                    "reuse",
+                    "--dry-run",
+                    "--format",
+                    "json",
+                    "--service",
+                    "spaps",
+                ],
+            )
+
+    def test_sbp_unknown_and_logs_errors_name_exact_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+
+            unknown = self._run_wrapper(SBP, "statu", fake_root=fake_root)
+            logs = self._run_wrapper(SBP, "logs", fake_root=fake_root)
+
+        self.assertEqual(unknown.returncode, 2)
+        self.assertEqual(unknown.stdout, "")
+        self.assertIn("Did you mean: sbp status --json", unknown.stderr)
+        self.assertIn("sbp capabilities --json", unknown.stderr)
+        self.assertEqual(logs.returncode, 2)
+        self.assertIn("Exact command: sbp logs <profile> <service> --json", logs.stderr)
+        self.assertIn("List services first: sbp status --json", logs.stderr)
 
     def test_sbp_skills_infers_client_from_downstream_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -49,6 +49,33 @@ _DRY_RUN_PROP: dict = {
     "default": False,
 }
 
+
+def _tool_metadata(
+    *,
+    read_only: bool,
+    destructive: bool = False,
+    dry_run_required: bool = False,
+    requires_user_confirmation: bool = False,
+    side_effects: str = "none",
+    safe_first_call: str,
+    exact_cli: str,
+    next_tools: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "annotations": {
+            "readOnlyHint": read_only,
+            "destructiveHint": destructive,
+        },
+        "x_skillbox_contract": {
+            "dry_run_required": dry_run_required,
+            "requires_user_confirmation": requires_user_confirmation,
+            "side_effects": side_effects,
+            "safe_first_call": safe_first_call,
+            "exact_cli": exact_cli,
+            "next_tools": next_tools or [],
+        },
+    }
+
 # ---------------------------------------------------------------------------
 # Tool definitions
 # ---------------------------------------------------------------------------
@@ -62,6 +89,12 @@ TOOLS: list[dict] = [
             "Each profile declares region, size, image, and SSH user for a DigitalOcean droplet. "
             "Use to choose a profile before provisioning."
         ),
+        **_tool_metadata(
+            read_only=True,
+            safe_first_call="operator_profiles",
+            exact_cli="python3 scripts/box.py profiles --format json",
+            next_tools=["operator_boxes", "operator_provision"],
+        ),
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
@@ -70,6 +103,12 @@ TOOLS: list[dict] = [
             "List all active boxes from inventory (workspace/boxes.json). "
             "Shows box ID, state, profile, droplet IP, and Tailscale hostname. "
             "RUN THIS FIRST to understand the current fleet before any operation."
+        ),
+        **_tool_metadata(
+            read_only=True,
+            safe_first_call="operator_boxes",
+            exact_cli="python3 scripts/box.py list --format json",
+            next_tools=["operator_box_status", "operator_profiles"],
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
@@ -80,6 +119,12 @@ TOOLS: list[dict] = [
             "droplet IP, Tailscale hostname, profile details. "
             "Omit box_id to check all boxes. "
             "Run before provisioning to check for conflicts, or after to verify health."
+        ),
+        **_tool_metadata(
+            read_only=True,
+            safe_first_call="operator_box_status",
+            exact_cli="python3 scripts/box.py status --format json",
+            next_tools=["operator_boxes", "operator_box_exec"],
         ),
         "inputSchema": {
             "type": "object",
@@ -102,6 +147,14 @@ TOOLS: list[dict] = [
             "Dry-run returns credential_status; if missing is non-empty, stop and ask the operator "
             "to populate .env.box with SKILLBOX_DO_TOKEN, SKILLBOX_DO_SSH_KEY_ID, and "
             "SKILLBOX_TS_AUTHKEY before running real provisioning."
+        ),
+        **_tool_metadata(
+            read_only=False,
+            dry_run_required=True,
+            side_effects="creates DigitalOcean droplet, enrolls Tailscale, clones/builds skillbox",
+            safe_first_call="operator_provision(box_id='<id>', dry_run=true)",
+            exact_cli="python3 scripts/box.py up <box-id> --profile dev-small --dry-run --format json",
+            next_tools=["operator_profiles", "operator_boxes", "operator_box_status"],
         ),
         "inputSchema": {
             "type": "object",
@@ -156,6 +209,16 @@ TOOLS: list[dict] = [
             "CONFIRM WITH USER before running — this destroys infrastructure. "
             "ALWAYS use dry_run=true first."
         ),
+        **_tool_metadata(
+            read_only=False,
+            destructive=True,
+            dry_run_required=True,
+            requires_user_confirmation=True,
+            side_effects="drains services, removes Tailnet enrollment, destroys droplet",
+            safe_first_call="operator_teardown(box_id='<id>', dry_run=true)",
+            exact_cli="python3 scripts/box.py down <box-id> --dry-run --format json",
+            next_tools=["operator_boxes", "operator_box_status"],
+        ),
         "inputSchema": {
             "type": "object",
             "required": ["box_id"],
@@ -172,6 +235,16 @@ TOOLS: list[dict] = [
             "Use for ad-hoc operations: checking logs, running manage.py commands, inspecting state. "
             "The command runs as the box's SSH user (typically 'skillbox'). "
             "For interactive SSH, use 'make box-ssh BOX=<id>' instead."
+        ),
+        **_tool_metadata(
+            read_only=False,
+            side_effects="runs caller-supplied command over SSH",
+            safe_first_call=(
+                "operator_box_exec(box_id='<id>', command='cd ~/skillbox && "
+                "python3 .env-manager/manage.py status --format json')"
+            ),
+            exact_cli="make box-ssh BOX=<id>",
+            next_tools=["operator_boxes", "operator_box_status"],
         ),
         "inputSchema": {
             "type": "object",
@@ -201,6 +274,13 @@ TOOLS: list[dict] = [
             "Use on the operator machine to bring up the local skillbox workspace. "
             "Pass build=false to skip the image build and only start."
         ),
+        **_tool_metadata(
+            read_only=False,
+            side_effects="builds and starts local Docker containers",
+            safe_first_call="operator_doctor",
+            exact_cli="make doctor",
+            next_tools=["operator_doctor", "operator_render"],
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -224,6 +304,16 @@ TOOLS: list[dict] = [
             "This stops the workspace, api, and web containers. "
             "ALWAYS use dry_run=true first to preview what will be stopped."
         ),
+        **_tool_metadata(
+            read_only=False,
+            destructive=True,
+            dry_run_required=True,
+            requires_user_confirmation=True,
+            side_effects="stops local Docker containers",
+            safe_first_call="operator_compose_down(dry_run=true)",
+            exact_cli="docker compose ps --format json",
+            next_tools=["operator_doctor"],
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -239,6 +329,12 @@ TOOLS: list[dict] = [
             "skill sync state. Uses scripts/04-reconcile.py doctor. "
             "Run after cloning, after config changes, or to verify the repo is healthy."
         ),
+        **_tool_metadata(
+            read_only=True,
+            safe_first_call="operator_doctor",
+            exact_cli="python3 scripts/04-reconcile.py doctor --format json",
+            next_tools=["operator_render"],
+        ),
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
@@ -247,6 +343,12 @@ TOOLS: list[dict] = [
             "Print the resolved sandbox model: box shape, runtime paths, ports, dependencies. "
             "Uses scripts/04-reconcile.py render. Read-only, no side effects. "
             "Use to understand what the current configuration will produce."
+        ),
+        **_tool_metadata(
+            read_only=True,
+            safe_first_call="operator_render",
+            exact_cli="python3 scripts/04-reconcile.py render --format json",
+            next_tools=["operator_doctor"],
         ),
         "inputSchema": {
             "type": "object",
@@ -481,13 +583,15 @@ def handle_operator_box_status(params: dict) -> dict:
 def handle_operator_provision(params: dict) -> dict:
     box_id = params.get("box_id")
     if not box_id:
-        return _error_content({
-            "error": {
-                "type": "missing_required_parameter",
-                "message": "'box_id' is required for operator_provision.",
-                "recoverable": True,
-            }
-        })
+        return _missing_required_error(
+            "operator_provision",
+            "'box_id' is required for operator_provision.",
+            [
+                "operator_boxes",
+                "operator_profiles",
+                "operator_provision(box_id='<id>', dry_run=true)",
+            ],
+        )
 
     args = ["up", str(box_id), "--format", "json"]
     if params.get("profile"):
@@ -500,33 +604,52 @@ def handle_operator_provision(params: dict) -> dict:
         args += ["--set", str(sv)]
     if params.get("resume"):
         args.append("--resume")
-    if params.get("dry_run"):
+    is_dry_run = bool(params.get("dry_run"))
+    if is_dry_run:
         args.append("--dry-run")
+    elif not _has_dryrun_marker("operator_provision", str(box_id)):
+        return _dry_run_required_error(
+            "operator_provision",
+            str(box_id),
+            "operator_provision(box_id='<id>', dry_run=true)",
+            "python3 scripts/box.py up <box-id> --profile dev-small --dry-run --format json",
+        )
 
     ok, _code, data = run_script(BOX_PY, args, timeout=PROVISION_TIMEOUT_SECONDS)
     emit_event(
         "operator.provision",
         str(box_id),
-        {"ok": ok, "dry_run": bool(params.get("dry_run")), "resume": bool(params.get("resume"))},
+        {"ok": ok, "dry_run": is_dry_run, "resume": bool(params.get("resume"))},
     )
+    if ok and is_dry_run:
+        _stamp_dryrun_marker("operator_provision", str(box_id))
     return _ok_content(data) if ok else _error_content(data)
 
 
 def handle_operator_teardown(params: dict) -> dict:
     box_id = params.get("box_id")
     if not box_id:
-        return _error_content({
-            "error": {
-                "type": "missing_required_parameter",
-                "message": "'box_id' is required for operator_teardown.",
-                "recoverable": True,
-            }
-        })
+        return _missing_required_error(
+            "operator_teardown",
+            "'box_id' is required for operator_teardown.",
+            [
+                "operator_boxes",
+                "operator_box_status",
+                "operator_teardown(box_id='<id>', dry_run=true)",
+            ],
+        )
 
     args = ["down", str(box_id), "--format", "json"]
     is_dry_run = bool(params.get("dry_run"))
     if is_dry_run:
         args.append("--dry-run")
+    elif not _has_dryrun_marker("operator_teardown", str(box_id)):
+        return _dry_run_required_error(
+            "operator_teardown",
+            str(box_id),
+            "operator_teardown(box_id='<id>', dry_run=true)",
+            "python3 scripts/box.py down <box-id> --dry-run --format json",
+        )
 
     ok, _code, data = run_script(BOX_PY, args, timeout=300)
     emit_event("operator.teardown", str(box_id), {"ok": ok, "dry_run": is_dry_run})
@@ -542,13 +665,15 @@ def handle_operator_box_exec(params: dict) -> dict:
     box_id = params.get("box_id")
     command = params.get("command")
     if not box_id or not command:
-        return _error_content({
-            "error": {
-                "type": "missing_required_parameter",
-                "message": "'box_id' and 'command' are required for operator_box_exec.",
-                "recoverable": True,
-            }
-        })
+        return _missing_required_error(
+            "operator_box_exec",
+            "'box_id' and 'command' are required for operator_box_exec.",
+            [
+                "operator_boxes",
+                "operator_box_status",
+                "operator_box_exec(box_id='<id>', command='cd ~/skillbox && python3 .env-manager/manage.py status --format json')",
+            ],
+        )
 
     box = find_box(str(box_id))
     if box is None or box.get("state") == "destroyed":
@@ -634,6 +759,14 @@ def handle_operator_compose_down(params: dict) -> dict:
         _stamp_dryrun_marker("operator_compose_down", "local")
         return _ok_content(payload)
 
+    if not _has_dryrun_marker("operator_compose_down", "local"):
+        return _dry_run_required_error(
+            "operator_compose_down",
+            "local",
+            "operator_compose_down(dry_run=true)",
+            "docker compose ps --format json",
+        )
+
     ok, code, data = run_compose(["down"], timeout=120)
     emit_event("operator.compose_down", "local", {"ok": ok})
     payload = {"ok": ok, "exit_code": code, "detail": data}
@@ -686,16 +819,47 @@ def _stamp_dryrun_marker(tool_name: str, box_id: str) -> None:
     marker.write_text(f"dry-run completed for {tool_name} box={box_id}\n")
 
 
+def _has_dryrun_marker(tool_name: str, box_id: str) -> bool:
+    marker = REPO_ROOT / ".skillbox-state" / "dryrun-markers" / f".skillbox-dryrun-{tool_name}-{box_id}"
+    return marker.is_file()
+
+
 # ---------------------------------------------------------------------------
 # Content helpers
 # ---------------------------------------------------------------------------
 
 def _ok_content(data: Any) -> dict:
-    return {"content": [{"type": "text", "text": json.dumps(data, indent=2, default=str)}]}
+    return {"content": [{"type": "text", "text": json.dumps(data, indent=2, sort_keys=True, default=str)}]}
 
 
 def _error_content(data: Any) -> dict:
-    return {"content": [{"type": "text", "text": json.dumps(data, indent=2, default=str)}], "isError": True}
+    return {
+        "content": [{"type": "text", "text": json.dumps(data, indent=2, sort_keys=True, default=str)}],
+        "isError": True,
+    }
+
+
+def _missing_required_error(tool_name: str, message: str, next_actions: list[str]) -> dict:
+    return _error_content({
+        "error": {
+            "type": "missing_required_parameter",
+            "message": message,
+            "recoverable": True,
+            "next_actions": next_actions,
+        }
+    })
+
+
+def _dry_run_required_error(tool_name: str, subject: str, safe_first_call: str, exact_cli: str) -> dict:
+    return _error_content({
+        "error": {
+            "type": "dry_run_required",
+            "message": f"{tool_name} requires a successful dry_run=true preview before the real operation.",
+            "recoverable": True,
+            "subject": subject,
+            "next_actions": [safe_first_call, exact_cli],
+        }
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -724,6 +888,7 @@ def dispatch_tool(name: str, params: dict) -> dict:
                 "type": "unknown_tool",
                 "message": f"Unknown tool: '{name}'.",
                 "available_tools": sorted(_DISPATCH.keys()),
+                "next_actions": ["operator_boxes", "operator_profiles", "operator_doctor"],
                 "recoverable": False,
             }
         })
@@ -776,7 +941,7 @@ _HANDLERS: dict[str, Any] = {
 
 
 def send(msg: dict) -> None:
-    sys.stdout.write(json.dumps(msg) + "\n")
+    sys.stdout.write(json.dumps(msg, sort_keys=True) + "\n")
     sys.stdout.flush()
 
 

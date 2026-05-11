@@ -42,9 +42,43 @@
         "simulations_pre": "audit/agent_simulations/pre_pass_N/",
         "simulations_post": "audit/agent_simulations/post_pass_N/"
       }
+    },
+    {
+      "pass": 2,
+      "started_at": "2026-05-11T18:49:00Z",
+      "completed_at": "2026-05-11T20:11:58Z",
+      "mode": "full-resume",
+      "target_sha": "22519dd3f79bc406e4fb2107b5f9472822c8fd4f",
+      "target_branch": "main",
+      "feature_branch": null,
+      "summary": {
+        "surfaces_inventoried": 8,
+        "surfaces_scored": 8,
+        "recommendations_total": 6,
+        "recommendations_applied": 6,
+        "substantive_commits": 1,
+        "dimensions_touched": 9,
+        "ambition_bar_met": true,
+        "ambition_bar_self_prompt_run": false,
+        "median_uplift_pts": 220,
+        "regressions_count": 0,
+        "fresh_eyes_rounds": 1
+      },
+      "artifacts": {
+        "surface_inventory": "audit/surface_inventory.jsonl",
+        "agent_surfaces": "audit/agent_surfaces.jsonl",
+        "recommendations": "audit/recommendations.jsonl",
+        "playbook": "audit/playbook.md",
+        "applied_changes": "audit/applied_changes.jsonl",
+        "scorecard": "audit/scorecard.md",
+        "regression_alerts": "audit/regression_alerts.md",
+        "handoff": "audit/HANDOFF.md",
+        "regression_test": "audit/regression_tests/R-002__full_surface_agent_contracts.test.sh",
+        "simulations_post": "audit/agent_simulations/pass_2_post/"
+      }
     }
   ],
-  "current_pass": 1,
+  "current_pass": 2,
   "pass_N+1_ready": false,
-  "next_pass_focus": null
+  "next_pass_focus": "Keep command inventories generated or centrally shared if future CLI surfaces drift."
 }
