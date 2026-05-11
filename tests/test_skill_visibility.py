@@ -34,9 +34,11 @@ from runtime_manager.skill_visibility import (  # noqa: E402
     _skill_repo_declared_names,
     _sync_wanted_skill_names,
     _target_states_for_skill,
+    collect_skill_audit,
     collect_skill_visibility,
     compact_skill_visibility_payload,
     matched_skill_clients,
+    print_skill_audit_text,
     print_skill_lifecycle_text,
     print_skill_visibility_text,
     skill_lifecycle_plan,
@@ -192,19 +194,20 @@ class SkillVisibilityTests(unittest.TestCase):
         visibility = {
             "issues": {
                 "scope_violations": [
-                    {"name": "alpha", "path": "/skills/alpha", "layer": "global"},
-                    {"name": "beta", "path": "/skills/beta", "layer": "global"},
+                    {"name": "alpha", "path": "/skills/alpha", "layer": "global:claude"},
+                    {"name": "beta", "path": "/skills/beta", "layer": "global:codex"},
                 ],
-                "global_not_allowed": [{"name": "alpha", "path": "/global/alpha"}],
+                "global_not_allowed": [{"name": "alpha", "path": "/global/alpha", "layer": "global:claude"}],
                 "extra_global": [{"name": "alpha"}],
-                "broken_global": [{"name": "alpha", "path": "/broken/alpha"}],
-                "broken_project": [{"name": "gamma", "path": "/project/gamma"}],
+                "broken_global": [{"name": "alpha", "path": "/broken/alpha", "layer": "global:codex"}],
+                "broken_project": [{"name": "gamma", "path": "/project/gamma", "layer": "project:claude"}],
                 "missing_for_cwd": [{"name": "alpha"}, {"name": ""}, {}],
             }
         }
 
         alpha_actions = _plan_skill_prune_actions(visibility, "alpha")
         all_actions = _plan_skill_prune_actions(visibility, None)
+        project_actions = _plan_skill_prune_actions(visibility, None, from_scope="project")
 
         self.assertEqual([action["skill"] for action in alpha_actions], ["alpha", "alpha", "alpha"])
         self.assertEqual([action["reason"] for action in alpha_actions], [
@@ -213,6 +216,7 @@ class SkillVisibilityTests(unittest.TestCase):
             "broken_global",
         ])
         self.assertEqual(len(all_actions), 5)
+        self.assertEqual([action["skill"] for action in project_actions], ["gamma"])
         self.assertEqual(_sync_wanted_skill_names(visibility, "explicit"), ["explicit"])
         self.assertEqual(_sync_wanted_skill_names(visibility, None), ["alpha"])
 
@@ -733,6 +737,7 @@ class SkillVisibilityTests(unittest.TestCase):
             (install_root / "installed-elsewhere").symlink_to(installed_elsewhere)
             (root / "skill-scope.yaml").write_text(
                 "version: 1\n"
+                "global_allowlist: []\n"
                 f"skill_source_roots: [{source_root}]\n"
                 f"skill_install_scan_roots: [{root}]\n",
                 encoding="utf-8",
@@ -840,6 +845,70 @@ class SkillVisibilityTests(unittest.TestCase):
             self.assertEqual(missing["ui"]["categories"], ["frontend"])
             actions = {item["action"] for item in payload["recommendations"]}
             self.assertIn("add_project_skill", actions)
+
+    def test_collect_skill_audit_scans_configured_repos_and_global_drift_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            clients_root = root / "clients"
+            frontend = root / "repos" / "web-app"
+            cli_repo = root / "repos" / "cli-tool"
+            source_root = root / "source-skills"
+            global_root = root / "home" / ".claude" / "skills"
+            for path in (clients_root, frontend, cli_repo, source_root / "ui", source_root / "cli-ergonomics", global_root):
+                path.mkdir(parents=True)
+            for skill in ("ui", "cli-ergonomics", "extra-global"):
+                skill_dir = source_root / skill
+                skill_dir.mkdir(exist_ok=True)
+                (skill_dir / "SKILL.md").write_text(f"# {skill}\n", encoding="utf-8")
+            (global_root / "extra-global").symlink_to(source_root / "extra-global", target_is_directory=True)
+            (frontend / ".git").mkdir()
+            (cli_repo / ".git").mkdir()
+            (root / "skill-scope.yaml").write_text(
+                "version: 1\n"
+                "global_allowlist: [always-global]\n"
+                f"skill_source_roots: [{source_root}]\n"
+                f"skill_install_scan_roots: [{root / 'repos'}]\n"
+                "project_categories:\n"
+                "  frontend:\n"
+                f"    paths: [{frontend}]\n"
+                "  cli:\n"
+                f"    paths: [{cli_repo}]\n"
+                "rules:\n"
+                "  - id: frontend-local\n"
+                "    skills: [ui]\n"
+                "    categories: [frontend]\n"
+                "  - id: cli-local\n"
+                "    skills: [cli-ergonomics]\n"
+                "    categories: [cli]\n",
+                encoding="utf-8",
+            )
+            model = {
+                "env": {"SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root)},
+                "active_clients": [],
+                "active_profiles": ["core"],
+                "clients": [],
+                "skills": [],
+            }
+
+            with mock.patch("runtime_manager.skill_visibility.Path.home", return_value=root / "home"):
+                payload = collect_skill_audit(model, cwd=str(frontend), include_clean=False)
+
+            self.assertEqual(payload["summary"]["candidate_repos"], 2)
+            self.assertEqual(payload["summary"]["repos_with_issues"], 2)
+            self.assertEqual(payload["summary"]["missing_for_cwd"], 2)
+            self.assertEqual(payload["summary"]["global_not_allowed"], 1)
+            by_path = {repo["path"]: repo for repo in payload["repos"]}
+            self.assertEqual(by_path[str(frontend.resolve())]["missing_for_cwd"], ["ui"])
+            self.assertEqual(by_path[str(cli_repo.resolve())]["missing_for_cwd"], ["cli-ergonomics"])
+            self.assertIn("manage.py skill sync --cwd", payload["next_actions"][0])
+
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                print_skill_audit_text(payload, limit=10)
+            output = buffer.getvalue()
+            self.assertIn("skill audit: 2 candidate repos", output)
+            self.assertIn("global: broken=0 not_allowed=1 extra=1", output)
+            self.assertIn("missing=ui", output)
 
     def test_project_category_and_declared_name_helpers_cover_policy_shapes(self) -> None:
         policy = {
@@ -991,6 +1060,7 @@ class SkillVisibilityTests(unittest.TestCase):
             (skill_dir / "SKILL.md").write_text("# UI\n", encoding="utf-8")
             (root / "skill-scope.yaml").write_text(
                 "version: 1\n"
+                "global_allowlist: []\n"
                 f"skill_source_roots: [{source_root}]\n"
                 "project_categories:\n"
                 "  frontend:\n"
@@ -1084,6 +1154,7 @@ class SkillVisibilityTests(unittest.TestCase):
             (skill_dir / "SKILL.md").write_text("# Hot Skill\n\nUse immediately.\n", encoding="utf-8")
             (root / "skill-scope.yaml").write_text(
                 "version: 1\n"
+                "global_allowlist: []\n"
                 f"skill_source_roots: [{source_root}]\n"
                 "rules:\n"
                 "  - id: marketing-local\n"
@@ -1247,6 +1318,102 @@ class SkillVisibilityTests(unittest.TestCase):
             self.assertEqual({item["scope"] for item in auto_plan["actions"]}, {"project"})
             self.assertEqual(global_plan["summary"]["blocked"], 2)
 
+    def test_skill_sync_links_repo_required_skill_even_when_global_install_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            clients_root = root / "clients"
+            source_root = root / "source-skills"
+            project = root / "repos" / "ios-app"
+            fake_home = root / "home"
+            clients_root.mkdir()
+            project.mkdir(parents=True)
+            skill_dir = source_root / "recipe-ios-ui-catalog"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("# Recipe iOS UI Catalog\n", encoding="utf-8")
+            global_root = fake_home / ".claude" / "skills"
+            global_root.mkdir(parents=True)
+            (global_root / "recipe-ios-ui-catalog").symlink_to(skill_dir, target_is_directory=True)
+            (root / "skill-scope.yaml").write_text(
+                "version: 1\n"
+                "global_allowlist: []\n"
+                f"skill_source_roots: [{source_root}]\n"
+                "project_categories:\n"
+                "  ios:\n"
+                f"    paths: [{project}]\n"
+                "rules:\n"
+                "  - id: ios-local\n"
+                "    skills: [recipe-ios-ui-catalog]\n"
+                "    categories: [ios]\n",
+                encoding="utf-8",
+            )
+            model = {
+                "env": {"SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root)},
+                "clients": [],
+                "skills": [],
+            }
+
+            with mock.patch("runtime_manager.skill_visibility.Path.home", return_value=fake_home):
+                plan = skill_lifecycle_plan(model, "sync", cwd=str(project), to="auto")
+
+            self.assertEqual(plan["summary"]["link"], 2)
+            self.assertEqual({item["scope"] for item in plan["actions"]}, {"project"})
+            self.assertEqual(
+                {Path(str(item["destination"])).parent.parent.name for item in plan["actions"]},
+                {".claude", ".codex"},
+            )
+
+    def test_on_demand_rule_routes_explicit_activation_to_current_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            clients_root = root / "clients"
+            source_root = root / "source-skills"
+            repos_root = root / "repos"
+            project = repos_root / "app"
+            skill_dir = source_root / "divide-and-conquer"
+            for path in (clients_root, skill_dir, project):
+                path.mkdir(parents=True)
+            (project / ".git").mkdir()
+            (skill_dir / "SKILL.md").write_text("# Divide and Conquer\n", encoding="utf-8")
+            (root / "skill-scope.yaml").write_text(
+                "version: 1\n"
+                "global_allowlist: [smart, sbp]\n"
+                f"skill_source_roots: [{source_root}]\n"
+                "rules:\n"
+                "  - id: dispatcher-global\n"
+                "    skills: [smart, sbp]\n"
+                "    allow_global: true\n"
+                "  - id: routed-on-demand\n"
+                "    skills: [divide-and-conquer]\n"
+                f"    paths: [{repos_root}]\n"
+                "    default: off\n"
+                "    activation: on-demand\n",
+                encoding="utf-8",
+            )
+            model = {
+                "env": {"SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root)},
+                "clients": [],
+                "skills": [],
+            }
+
+            visibility = collect_skill_visibility(model, cwd=str(project), include_global=False)
+            self.assertEqual(visibility["issues"]["missing_for_cwd"], [])
+
+            plan = skill_lifecycle_plan(
+                model,
+                "activate",
+                skill_name="divide-and-conquer",
+                cwd=str(project),
+                to="auto",
+            )
+
+            self.assertEqual(plan["resolved_to"], "project")
+            self.assertEqual({item["scope"] for item in plan["actions"]}, {"project"})
+            self.assertEqual(
+                {Path(str(item["destination"])).parent.parent for item in plan["actions"]},
+                {(project / ".claude").resolve(), (project / ".codex").resolve()},
+            )
+            self.assertIsNotNone(plan["activation_packet"])
+
     def test_scope_policy_flags_project_install_outside_allowed_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -1333,6 +1500,55 @@ class SkillVisibilityTests(unittest.TestCase):
             self.assertEqual(payload["summary"]["broken_project"], 1)
             self.assertEqual(payload["issues"]["broken_project"][0]["name"], "local-only")
 
+    def test_collects_beads_requirement_from_skill_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            project = root / "project"
+            (project / ".git").mkdir(parents=True)
+            source = root / "skills" / "smart"
+            source.mkdir(parents=True)
+            (source / "SKILL.md").write_text(
+                "---\n"
+                "name: smart\n"
+                "metadata:\n"
+                "  requires_beads: true\n"
+                "---\n"
+                "# Smart\n",
+                encoding="utf-8",
+            )
+            install_root = project / ".codex" / "skills"
+            install_root.mkdir(parents=True)
+            (install_root / "smart").symlink_to(source, target_is_directory=True)
+
+            with mock.patch("runtime_manager.skill_visibility.shutil.which", return_value="/usr/local/bin/br"):
+                payload = collect_skill_visibility(
+                    {"clients": [], "skills": []},
+                    cwd=str(project),
+                    include_global=False,
+                    include_project=True,
+                )
+
+                beads = payload["beads"]
+                self.assertTrue(beads["required"])
+                self.assertEqual(beads["required_skills"][0]["name"], "smart")
+                self.assertFalse(beads["initialized"])
+                self.assertEqual(beads["issues"][0]["code"], "no_beads_dir")
+                self.assertTrue(
+                    any(action.startswith("sbp beads init") for action in payload["next_actions"])
+                )
+                self.assertEqual(payload["summary"]["beads_required_skills"], 1)
+                self.assertEqual(payload["summary"]["beads_issues"], 1)
+
+                (project / ".beads").mkdir()
+                initialized_payload = collect_skill_visibility(
+                    {"clients": [], "skills": []},
+                    cwd=str(project),
+                    include_global=False,
+                    include_project=True,
+                )
+                self.assertTrue(initialized_payload["beads"]["ok"])
+                self.assertEqual(initialized_payload["beads"]["issues"], [])
+
     def test_global_allowlist_flags_unapproved_global_installs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -1354,6 +1570,41 @@ class SkillVisibilityTests(unittest.TestCase):
 
             self.assertTrue(_global_install_allowed(model, "always-global"))
             self.assertFalse(_global_install_allowed(model, "too-broad"))
+
+    def test_global_allowlist_prevents_extra_global_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            clients_root = root / "clients"
+            home = root / "home"
+            allowed_source = root / "sources" / "always-global"
+            extra_source = root / "sources" / "too-broad"
+            global_root = home / ".codex" / "skills"
+            for path in (clients_root, allowed_source, extra_source, global_root):
+                path.mkdir(parents=True)
+            (allowed_source / "SKILL.md").write_text("# Always\n", encoding="utf-8")
+            (extra_source / "SKILL.md").write_text("# Extra\n", encoding="utf-8")
+            (global_root / "always-global").symlink_to(allowed_source, target_is_directory=True)
+            (global_root / "too-broad").symlink_to(extra_source, target_is_directory=True)
+            (root / "skill-scope.yaml").write_text(
+                "version: 1\n"
+                "global_allowlist: [always-global]\n",
+                encoding="utf-8",
+            )
+            model = {
+                "env": {"SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root)},
+                "clients": [],
+                "skills": [],
+            }
+
+            with mock.patch("runtime_manager.skill_visibility.Path.home", return_value=home):
+                payload = collect_skill_visibility(model, cwd=str(root), include_project=False)
+
+            self.assertEqual(payload["issues"]["global_not_allowed"][0]["name"], "too-broad")
+            self.assertEqual(payload["issues"]["extra_global"][0]["name"], "too-broad")
+            self.assertNotIn(
+                "always-global",
+                {item["name"] for item in payload["issues"]["extra_global"]},
+            )
 
     def test_project_skill_roots_stop_at_nearest_git_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

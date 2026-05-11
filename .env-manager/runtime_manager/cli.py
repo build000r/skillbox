@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import os
 from pathlib import Path
 from typing import Any, Callable
@@ -14,6 +15,7 @@ from .operator_booking import *
 from .context_rendering import *
 from .text_renderers import *
 from .workflows import *
+from .mcp_visibility import *
 
 
 class DistributionPreviewError(RuntimeError):
@@ -22,6 +24,116 @@ class DistributionPreviewError(RuntimeError):
 
 class DistributionRollbackError(RuntimeError):
     pass
+
+
+MANAGE_COMMAND_NAMES = {
+    "acceptance",
+    "bootstrap",
+    "capabilities",
+    "client-diff",
+    "client-init",
+    "client-open",
+    "client-project",
+    "client-publish",
+    "context",
+    "distribution-preview",
+    "distribution-publish",
+    "distribution-rollback",
+    "doctor",
+    "down",
+    "first-box",
+    "focus",
+    "logs",
+    "mcp-audit",
+    "mmdx",
+    "onboard",
+    "operator-booking",
+    "overlay",
+    "private-init",
+    "render",
+    "restart",
+    "robot-docs",
+    "robot-triage",
+    "session-end",
+    "session-event",
+    "session-resume",
+    "session-start",
+    "session-status",
+    "skill",
+    "skill-audit",
+    "skills",
+    "status",
+    "stewardship-report",
+    "sync",
+    "up",
+    "worker-artifacts",
+    "worker-promote-learning",
+    "worker-status",
+    "worker-submit",
+}
+JSON_FLAG_ALIASES = {
+    "--json": "--format json",
+    "--jason": "--format json",
+    "--jsno": "--format json",
+    "--jsson": "--format json",
+}
+
+
+class SkillboxArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        command_hint = _command_suggestion_from_error(message)
+        hint_lines = [
+            "",
+            "Agent hint: run `manage.py capabilities --json` for the machine-readable command contract.",
+        ]
+        if command_hint:
+            hint_lines.append(f"Did you mean: `manage.py {command_hint}`?")
+        self.print_usage(sys.stderr)
+        self.exit(2, f"{self.prog}: error: {message}\n" + "\n".join(hint_lines) + "\n")
+
+
+def _command_suggestion_from_error(message: str) -> str:
+    marker = "invalid choice: "
+    if marker not in message:
+        return ""
+    remainder = message.split(marker, 1)[1]
+    raw = remainder.split("(", 1)[0].strip().strip("'\"")
+    matches = difflib.get_close_matches(raw, sorted(MANAGE_COMMAND_NAMES), n=1, cutoff=0.68)
+    return matches[0] if matches else ""
+
+
+def _normalize_agent_argv(argv: list[str] | None) -> tuple[list[str], list[str]]:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    normalized: list[str] = []
+    diagnostics: list[str] = []
+    command_seen = False
+    pending_json = False
+
+    for token in raw:
+        if token == "--robot-help":
+            normalized.extend(["robot-docs", "guide"])
+            command_seen = True
+            continue
+        if token in JSON_FLAG_ALIASES:
+            if token != "--json":
+                diagnostics.append(
+                    f"Interpreting {token} as --format json. Exact command: manage.py <command> --format json"
+                )
+            if command_seen:
+                normalized.extend(["--format", "json"])
+            else:
+                pending_json = True
+            continue
+        normalized.append(token)
+        if not command_seen and token in MANAGE_COMMAND_NAMES:
+            command_seen = True
+            if pending_json:
+                normalized.extend(["--format", "json"])
+                pending_json = False
+
+    if pending_json:
+        normalized.extend(["status", "--format", "json"])
+    return normalized, diagnostics
 
 
 def publish_skill_release(**kwargs: Any) -> dict[str, Any]:
@@ -174,14 +286,48 @@ def _add_skill_lifecycle_common(command_parser: argparse.ArgumentParser) -> None
     _add_client_arg(command_parser)
 
 
+def _add_skill_from_scope_arg(command_parser: argparse.ArgumentParser, *, help_text: str) -> None:
+    command_parser.add_argument(
+        "--from",
+        dest="from_scope",
+        choices=("global", "project", "all"),
+        default="all",
+        help=help_text,
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Manage the internal skillbox runtime graph.")
+    parser = SkillboxArgumentParser(description="Manage the internal skillbox runtime graph.")
     parser.add_argument(
         "--root-dir",
         default=None,
         help="Override the repo root for testing or embedding.",
     )
+    parser.add_argument(
+        "--robot-triage",
+        action="store_true",
+        help="Emit a compact JSON triage packet for agents and exit.",
+    )
     subparsers = parser.add_subparsers(dest="command")
+
+    capabilities_parser = subparsers.add_parser(
+        "capabilities",
+        help="Print the machine-readable Skillbox CLI contract.",
+    )
+    capabilities_parser.add_argument("--format", choices=("json",), default="json")
+
+    robot_docs_parser = subparsers.add_parser(
+        "robot-docs",
+        help="Print agent-oriented in-tool documentation.",
+    )
+    robot_docs_parser.add_argument("topic", nargs="?", default="guide", choices=("guide",))
+    robot_docs_parser.add_argument("--format", choices=("text", "json"), default="text")
+
+    robot_triage_parser = subparsers.add_parser(
+        "robot-triage",
+        help="Emit a compact JSON triage packet for agents.",
+    )
+    robot_triage_parser.add_argument("--format", choices=("json",), default="json")
 
     render_parser = subparsers.add_parser("render", help="Print the resolved runtime graph.")
     render_parser.add_argument("--format", choices=("text", "json"), default="text")
@@ -267,6 +413,65 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_profile_arg(skills_parser)
     _add_client_arg(skills_parser)
+
+    skill_audit_parser = subparsers.add_parser(
+        "skill-audit",
+        help="Audit skill scope policy across configured downstream repos.",
+    )
+    skill_audit_parser.add_argument("--format", choices=("text", "json"), default="text")
+    skill_audit_parser.add_argument(
+        "--cwd",
+        default=None,
+        help="Working directory used for the one-time global drift summary. Defaults to the current cwd.",
+    )
+    skill_audit_parser.add_argument(
+        "--scan-root",
+        action="append",
+        default=None,
+        help="Root to scan for git repos. Can be repeated. Defaults to skill_install_scan_roots from skill-scope.yaml.",
+    )
+    skill_audit_parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=3,
+        help="Maximum directory depth under each scan root when finding git repos.",
+    )
+    skill_audit_parser.add_argument(
+        "--limit",
+        type=int,
+        default=40,
+        help="Maximum repo rows and names to show in text output.",
+    )
+    skill_audit_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Report clean repos as well as repos with skill policy issues.",
+    )
+    skill_audit_parser.add_argument(
+        "--no-global",
+        action="store_true",
+        help="Skip the one-time global skill drift summary.",
+    )
+    _add_profile_arg(skill_audit_parser)
+    _add_client_arg(skill_audit_parser)
+
+    mcp_audit_parser = subparsers.add_parser(
+        "mcp-audit",
+        help="Audit Claude JSON and Codex TOML MCP config parity for a repo.",
+    )
+    mcp_audit_parser.add_argument("--format", choices=("text", "json"), default="text")
+    mcp_audit_parser.add_argument(
+        "--cwd",
+        default=None,
+        help="Working directory used to find the target repo root. Defaults to the current cwd.",
+    )
+    mcp_audit_parser.add_argument(
+        "--config-root",
+        default=None,
+        help="Explicit repo/config root containing .mcp.json and .codex/config.toml.",
+    )
+    _add_profile_arg(mcp_audit_parser)
+    _add_client_arg(mcp_audit_parser)
 
     mmdx_parser = subparsers.add_parser(
         "mmdx",
@@ -374,16 +579,14 @@ def _build_parser() -> argparse.ArgumentParser:
     remove_parser = skill_subparsers.add_parser("remove", help="Remove installed links/files for a skill.")
     remove_parser.add_argument("skill_name")
     _add_skill_lifecycle_common(remove_parser)
-    remove_parser.add_argument(
-        "--from",
-        dest="from_scope",
-        choices=("global", "project", "all"),
-        default="all",
-        help="Installed scope to remove from.",
-    )
+    _add_skill_from_scope_arg(remove_parser, help_text="Installed scope to remove from.")
 
     prune_parser = skill_subparsers.add_parser("prune", help="Remove installed skills that violate skill-scope policy.")
     _add_skill_lifecycle_common(prune_parser)
+    _add_skill_from_scope_arg(
+        prune_parser,
+        help_text="Installed scope to prune. Use project for repo-local cleanup without touching global skills.",
+    )
 
     sync_skills_parser = skill_subparsers.add_parser(
         "sync",
@@ -395,6 +598,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--prune",
         action="store_true",
         help="Also unlink existing policy violations after installing missing skills.",
+    )
+    _add_skill_from_scope_arg(
+        sync_skills_parser,
+        help_text="Installed scope to prune when --prune is set.",
     )
 
     overlay_parser = subparsers.add_parser(
@@ -1731,6 +1938,162 @@ def _handle_mmdx(args: argparse.Namespace, root_dir: Path) -> int:
     return exit_code
 
 
+def _capabilities_payload(root_dir: Path) -> dict[str, Any]:
+    commands = [
+        {
+            "name": name,
+            "json": name not in {"robot-docs"},
+            "safe_first_try": _safe_first_try_command(name),
+        }
+        for name in sorted(MANAGE_COMMAND_NAMES)
+    ]
+    return {
+        "ok": True,
+        "tool": "skillbox-manage",
+        "contract_version": "2026-05-09",
+        "root_dir": str(root_dir),
+        "entrypoints": [
+            "python3 .env-manager/manage.py",
+            "python3 scripts/04-reconcile.py",
+            "python3 scripts/box.py",
+            "scripts/sbp",
+            "scripts/sbo",
+        ],
+        "commands": commands,
+        "agent_surfaces": {
+            "capabilities": "python3 .env-manager/manage.py capabilities --json",
+            "robot_docs": "python3 .env-manager/manage.py robot-docs guide",
+            "robot_triage": "python3 .env-manager/manage.py --robot-triage",
+            "json_aliases": sorted(JSON_FLAG_ALIASES),
+        },
+        "exit_codes": {
+            "0": "success",
+            "1": "user input, runtime, or environment error",
+            "2": "drift detected or argparse usage error, depending on command surface",
+            "3": "operator input required",
+        },
+        "env": {
+            "SKILLBOX_STATE_ROOT": "Persistent runtime state root.",
+            "SKILLBOX_MONOSERVER_ROOT": "Host or container repo universe root.",
+            "SKILLBOX_CLIENTS_ROOT": "Runtime client overlay root.",
+            "NO_COLOR": "Suppress ANSI styling in supported surfaces.",
+            "CI": "Prefer non-interactive behavior in supported surfaces.",
+        },
+        "next_actions": [
+            "python3 .env-manager/manage.py status --format json",
+            "python3 .env-manager/manage.py doctor --format json",
+            "python3 .env-manager/manage.py robot-docs guide",
+        ],
+    }
+
+
+def _safe_first_try_command(name: str) -> str:
+    if name in {"capabilities", "robot-triage"}:
+        return f"manage.py {name} --json"
+    if name == "robot-docs":
+        return "manage.py robot-docs guide"
+    if name in {"client-init"}:
+        return "manage.py client-init --list-blueprints --format json"
+    if name in {"status", "render", "doctor", "skills", "skill-audit", "mcp-audit"}:
+        return f"manage.py {name} --format json"
+    if name in {"up", "down", "restart", "sync", "bootstrap", "context"}:
+        return f"manage.py {name} --dry-run --format json"
+    return f"manage.py {name} --help"
+
+
+def _robot_docs_guide() -> str:
+    return """Skillbox agent guide
+
+Primary entrypoint:
+  python3 .env-manager/manage.py <command> [options]
+
+Start here:
+  python3 .env-manager/manage.py capabilities --json
+  python3 .env-manager/manage.py status --format json
+  python3 .env-manager/manage.py doctor --format json
+  python3 .env-manager/manage.py --robot-triage
+
+Structured output:
+  Most read-side and runtime commands accept --format json.
+  Agent-friendly aliases are accepted: --json, --jason, --jsno, --jsson.
+  Diagnostics and typo-alias notices are printed to stderr, not stdout.
+
+Safe mutation pattern:
+  Preview first when available: sync --dry-run, bootstrap --dry-run,
+  up --dry-run, down --dry-run, restart --dry-run, context --dry-run.
+  For skill lifecycle removals or pruning, use --dry-run before --yes.
+
+Useful command families:
+  status --format json          Compact runtime state.
+  doctor --format json          Runtime validation checks.
+  skills --issues-only          Skill visibility issues for the current cwd.
+  mcp-audit --format json       Claude/Codex MCP parity audit.
+  focus <client> --format json  Sync, bootstrap, start, collect live state, context.
+"""
+
+
+def _handle_capabilities(args: argparse.Namespace, root_dir: Path) -> int:
+    emit_json(_capabilities_payload(root_dir))
+    return EXIT_OK
+
+
+def _handle_robot_docs(args: argparse.Namespace, root_dir: Path) -> int:
+    guide = _robot_docs_guide()
+    if args.format == "json":
+        emit_json({"ok": True, "topic": args.topic, "guide": guide})
+    else:
+        print(guide.rstrip())
+    return EXIT_OK
+
+
+def _handle_robot_triage(args: argparse.Namespace, root_dir: Path) -> int:
+    payload: dict[str, Any] = {
+        "ok": True,
+        "tool": "skillbox-manage",
+        "quick_ref": _capabilities_payload(root_dir)["next_actions"],
+        "recommendations": [
+            {
+                "id": "start-status",
+                "command": "python3 .env-manager/manage.py status --format json",
+                "why": "Fastest non-mutating runtime inspection.",
+            },
+            {
+                "id": "validate-runtime",
+                "command": "python3 .env-manager/manage.py doctor --format json",
+                "why": "Find graph, filesystem, and skill-integrity drift.",
+            },
+            {
+                "id": "preview-before-mutation",
+                "command": "python3 .env-manager/manage.py up --dry-run --format json",
+                "why": "Preview service graph actions before starting services.",
+            },
+        ],
+        "commands": {
+            "capabilities": "python3 .env-manager/manage.py capabilities --json",
+            "guide": "python3 .env-manager/manage.py robot-docs guide",
+            "status": "python3 .env-manager/manage.py status --format json",
+            "doctor": "python3 .env-manager/manage.py doctor --format json",
+        },
+    }
+    try:
+        model = build_runtime_model(root_dir)
+        payload["health"] = {
+            "model_loaded": True,
+            "repos": len(model.get("repos") or []),
+            "services": len(model.get("services") or []),
+            "checks": len(model.get("checks") or []),
+        }
+    except Exception as exc:
+        payload["ok"] = False
+        payload["health"] = {
+            "model_loaded": False,
+            "error": str(exc),
+            "next_action": "python3 .env-manager/manage.py doctor --format json",
+        }
+    emit_json(payload)
+    return EXIT_OK if payload["ok"] else EXIT_ERROR
+
+
 def _operator_booking_config_lines(payload: dict[str, Any]) -> list[str]:
     config = payload.get("operator_booking") or {}
     return [
@@ -1831,6 +2194,9 @@ def _handle_operator_booking(
 
 
 _EARLY_DISPATCH: dict[str, Callable[[argparse.Namespace, Path], int]] = {
+    "capabilities": _handle_capabilities,
+    "robot-docs": _handle_robot_docs,
+    "robot-triage": _handle_robot_triage,
     "client-init": _handle_client_init,
     "onboard": _handle_onboard,
     "first-box": _handle_first_box,
@@ -1940,6 +2306,36 @@ def _handle_skills(args: argparse.Namespace, root_dir: Path, model: dict[str, An
             issues_only=args.issues_only,
             limit=max(0, int(args.limit)),
         )
+    return EXIT_OK
+
+
+def _handle_skill_audit(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    payload = collect_skill_audit(
+        model,
+        cwd=args.cwd,
+        scan_roots=getattr(args, "scan_root", None),
+        max_depth=max(0, int(args.max_depth)),
+        include_global=not bool(args.no_global),
+        include_clean=bool(getattr(args, "all", False)),
+    )
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print_skill_audit_text(payload, limit=max(0, int(args.limit)))
+    return EXIT_OK
+
+
+def _handle_mcp_audit(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    payload = collect_mcp_audit(
+        root_dir,
+        model,
+        cwd=args.cwd,
+        config_root=getattr(args, "config_root", None),
+    )
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print_mcp_audit_text(payload, root_dir=root_dir)
     return EXIT_OK
 
 
@@ -2395,6 +2791,8 @@ _MODEL_DISPATCH: dict[str, Callable[[argparse.Namespace, Path, dict[str, Any], s
     "doctor": _handle_doctor,
     "status": _handle_status,
     "skills": _handle_skills,
+    "skill-audit": _handle_skill_audit,
+    "mcp-audit": _handle_mcp_audit,
     "skill": _handle_skill,
     "overlay": _handle_overlay,
     "operator-booking": _handle_operator_booking,
@@ -2432,7 +2830,7 @@ def _emit_main_exception(args: argparse.Namespace, exc: Exception) -> int:
 def _active_clients_for_args(args: argparse.Namespace, model: dict[str, Any]) -> list[str]:
     requested_clients = getattr(args, "client", [])
     active_clients = normalize_active_clients(model, requested_clients)
-    if args.command not in {"skills", "skill", "overlay"} or requested_clients:
+    if args.command not in {"skills", "skill", "overlay", "mcp-audit"} or requested_clients:
         return active_clients
     skill_cwd = Path(getattr(args, "cwd", None) or os.getcwd())
     matches = matched_skill_clients(model, skill_cwd)
@@ -2464,9 +2862,15 @@ def _dispatch_model_command(
         return _emit_main_exception(args, exc)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
-    args = parser.parse_args()
+    normalized_argv, diagnostics = _normalize_agent_argv(argv)
+    args = parser.parse_args(normalized_argv)
+    for diagnostic in diagnostics:
+        print(diagnostic, file=sys.stderr)
+    if getattr(args, "robot_triage", False):
+        args.command = "robot-triage"
+        args.format = "json"
     _apply_default_command(args)
     root_dir = resolve_root_dir(args.root_dir)
 

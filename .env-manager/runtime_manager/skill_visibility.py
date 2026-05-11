@@ -8,6 +8,11 @@ import shutil
 from pathlib import Path
 from typing import Any, Callable
 
+try:
+    import yaml
+except ModuleNotFoundError:
+    yaml = None
+
 from .shared import (
     atomic_write_text,
     directory_tree_sha256,
@@ -54,6 +59,122 @@ SKILL_SOURCE_SCAN_SKIP_DIRS = {
     ".venv",
     "venv",
 }
+
+
+def _frontmatter_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _git_repo_root_for_beads(cwd: Path) -> Path | None:
+    current = cwd.resolve() if cwd.is_dir() else cwd.resolve().parent
+    for parent in [current, *current.parents]:
+        if (parent / ".git").exists():
+            return parent
+    return None
+
+
+def _skill_metadata_source_dir(item: dict[str, Any]) -> Path | None:
+    source = str(item.get("source") or "").strip()
+    name = str(item.get("name") or "").strip()
+    if not source:
+        return None
+    source_path = Path(os.path.expandvars(os.path.expanduser(source)))
+    if not source_path.is_absolute():
+        return None
+    source_path = source_path.resolve()
+    if (source_path / "SKILL.md").is_file():
+        return source_path
+    if name and (source_path / name / "SKILL.md").is_file():
+        return (source_path / name).resolve()
+    return None
+
+
+def _parse_skill_frontmatter(skill_dir: Path) -> dict[str, Any]:
+    skill_md = skill_dir / "SKILL.md"
+    try:
+        text = skill_md.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return {}
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}
+    body = text[3:end].strip()
+    if not body:
+        return {}
+    if yaml is None:
+        return {}
+    try:
+        parsed = yaml.safe_load(body)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _skill_requires_beads(skill_dir: Path) -> bool:
+    frontmatter = _parse_skill_frontmatter(skill_dir)
+    metadata = frontmatter.get("metadata") if isinstance(frontmatter.get("metadata"), dict) else {}
+    return _frontmatter_truthy(frontmatter.get("requires_beads")) or _frontmatter_truthy(
+        metadata.get("requires_beads")
+    )
+
+
+def _beads_required_skills(effective: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    required: dict[str, dict[str, Any]] = {}
+    for item in effective:
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        skill_dir = _skill_metadata_source_dir(item)
+        if skill_dir is None or not _skill_requires_beads(skill_dir):
+            continue
+        required[name] = {
+            "name": name,
+            "source": str(skill_dir),
+            "layer": item.get("layer"),
+        }
+    return sorted(required.values(), key=lambda entry: entry["name"])
+
+
+def _beads_status_for_cwd(effective: list[dict[str, Any]], cwd: Path) -> dict[str, Any]:
+    required = _beads_required_skills(effective)
+    repo_root = _git_repo_root_for_beads(cwd)
+    beads_dir = repo_root / ".beads" if repo_root else None
+    br_path = shutil.which("br")
+    initialized = bool(beads_dir and beads_dir.is_dir())
+    issues: list[dict[str, Any]] = []
+    if required and repo_root is None:
+        issues.append({
+            "code": "no_git_repo",
+            "message": "BEADS DRIFT: beads-aware skills are active, but cwd is not inside a git repo",
+            "hint": "run from a repo root or repo subdirectory before initializing beads",
+        })
+    if required and br_path is None:
+        issues.append({
+            "code": "missing_br",
+            "message": "BEADS DRIFT: beads-aware skills are active, but `br` is not on PATH",
+            "hint": "install beads_rust, then rerun sbp recalibrate",
+        })
+    if required and repo_root is not None and not initialized:
+        issues.append({
+            "code": "no_beads_dir",
+            "message": f"BEADS DRIFT: {len(required)} active skill(s) require .beads/ in this repo",
+            "hint": f"sbp beads init --cwd {repo_root}",
+        })
+    return {
+        "required": bool(required),
+        "required_skills": required,
+        "repo_root": str(repo_root) if repo_root else None,
+        "beads_dir": str(beads_dir) if beads_dir else None,
+        "initialized": initialized,
+        "br": br_path,
+        "ok": not issues,
+        "issues": issues,
+        "next_actions": [issue["hint"] for issue in issues if issue.get("hint")],
+    }
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -656,6 +777,8 @@ def _scope_rule_from_raw(
         "categories": category_ids,
         "unknown_categories": unknown_categories,
         "allow_global": bool(raw_rule.get("allow_global", False)),
+        "default": raw_rule.get("default", "on"),
+        "activation": str(raw_rule.get("activation") or "").strip(),
         "notes": str(raw_rule.get("notes") or raw_rule.get("reason") or ""),
         "overlay": overlay,
         "policy_path": str(policy.get("_policy_path") or ""),
@@ -826,6 +949,22 @@ def _matched_scope_rules_for_cwd(model: dict[str, Any], cwd: Path) -> list[dict[
     return sorted(matched, key=lambda item: (-len(str(item.get("match") or "")), item["id"]))
 
 
+def _scope_rule_is_expected_by_default(rule: dict[str, Any]) -> bool:
+    raw_default = rule.get("default", "on")
+    if isinstance(raw_default, bool):
+        default_on = raw_default
+    else:
+        default_on = str(raw_default or "on").strip().lower() not in {
+            "off",
+            "false",
+            "manual",
+            "on-demand",
+            "on_demand",
+        }
+    activation = str(rule.get("activation") or "").strip().lower()
+    return default_on and activation not in {"manual", "on-demand", "on_demand"}
+
+
 def _missing_for_cwd(
     model: dict[str, Any],
     cwd: Path,
@@ -833,6 +972,8 @@ def _missing_for_cwd(
 ) -> list[dict[str, Any]]:
     missing: list[dict[str, Any]] = []
     for rule in _matched_scope_rules_for_cwd(model, cwd):
+        if not _scope_rule_is_expected_by_default(rule):
+            continue
         for pattern in rule.get("patterns") or []:
             skill_name = str(pattern)
             if not _is_literal_skill_pattern(skill_name):
@@ -850,10 +991,27 @@ def _missing_for_cwd(
     return sorted(missing, key=lambda item: (item["name"], str(item.get("scope_rule") or "")))
 
 
+def _add_skill_visibility_recommendation(
+    recommendations: list[dict[str, Any]],
+    seen: set[tuple[str, str, str]],
+    item: dict[str, Any],
+) -> None:
+    key = (
+        str(item.get("action") or ""),
+        str(item.get("skill") or ""),
+        str(item.get("scope_rule") or ""),
+    )
+    if key in seen:
+        return
+    seen.add(key)
+    recommendations.append(item)
+
+
 def _skill_visibility_recommendations(issues: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
     recommendations: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
     for item in issues.get("missing_for_cwd") or []:
-        recommendations.append({
+        _add_skill_visibility_recommendation(recommendations, seen, {
             "action": "add_project_skill",
             "skill": item.get("name"),
             "scope_rule": item.get("scope_rule"),
@@ -865,7 +1023,7 @@ def _skill_visibility_recommendations(issues: dict[str, list[dict[str, Any]]]) -
             ),
         })
     for item in issues.get("scope_violations") or []:
-        recommendations.append({
+        _add_skill_visibility_recommendation(recommendations, seen, {
             "action": "move_or_unlink_skill",
             "skill": item.get("name"),
             "scope_rule": item.get("scope_rule"),
@@ -874,7 +1032,7 @@ def _skill_visibility_recommendations(issues: dict[str, list[dict[str, Any]]]) -
             "hint": "Move this project-local install under an allowed repo path, or unlink it here.",
         })
     for item in issues.get("global_not_allowed") or []:
-        recommendations.append({
+        _add_skill_visibility_recommendation(recommendations, seen, {
             "action": "move_global_to_project",
             "skill": item.get("name"),
             "source_path": item.get("path"),
@@ -884,7 +1042,7 @@ def _skill_visibility_recommendations(issues: dict[str, list[dict[str, Any]]]) -
             ),
         })
     for item in issues.get("extra_global") or []:
-        recommendations.append({
+        _add_skill_visibility_recommendation(recommendations, seen, {
             "action": "declare_or_unlink_global",
             "skill": item.get("name"),
             "source_path": item.get("path"),
@@ -1009,7 +1167,11 @@ def _skill_destination_bases(
             if _path_prefix_matches(cwd, path)
         ]
     if matched_paths:
-        base = max(matched_paths, key=len)
+        repo_root = _repo_root_for_skill_install(cwd)
+        if _path_is_under(str(repo_root), matched_paths):
+            base = str(repo_root)
+        else:
+            base = max(matched_paths, key=len)
     else:
         base = str(_repo_root_for_skill_install(cwd))
     return "project", [{"scope": "project", "path": base, "category": None}], warnings
@@ -1210,10 +1372,16 @@ def _skill_blocked_reason(
     model: dict[str, Any],
     skill_name: str,
     resolved_to: str,
+    cwd: Path,
     force: bool,
 ) -> str:
     if resolved_to == "global" and not _global_install_allowed(model, skill_name) and not force:
         return "global install is not allowed by skill-scope policy"
+    if resolved_to == "project" and not force:
+        rule = _matching_scope_rule(skill_name, _scope_rules(model))
+        allowed_paths = list(rule.get("paths") or []) if rule else []
+        if allowed_paths and not any(_path_prefix_matches(cwd, path) for path in allowed_paths):
+            return "project install is outside allowed skill-scope paths"
     return ""
 
 
@@ -1254,7 +1422,7 @@ def _plan_primary_skill_links(
         to=to,
         categories=categories,
     )
-    blocked_reason = _skill_blocked_reason(model, name, resolved_to, force)
+    blocked_reason = _skill_blocked_reason(model, name, resolved_to, cwd_path, force)
     if blocked_reason:
         warnings.append(blocked_reason)
     actions = _skill_link_actions_for_bases(name, selected_source, bases, blocked_reason)
@@ -1294,11 +1462,16 @@ def _plan_skill_removals(
     return actions
 
 
-def _lifecycle_visibility(model: dict[str, Any], cwd_path: Path) -> dict[str, Any]:
+def _lifecycle_visibility(
+    model: dict[str, Any],
+    cwd_path: Path,
+    *,
+    include_global: bool = True,
+) -> dict[str, Any]:
     return collect_skill_visibility(
         model,
         cwd=str(cwd_path),
-        include_global=True,
+        include_global=include_global,
         include_project=True,
         include_sources=False,
     )
@@ -1307,12 +1480,16 @@ def _lifecycle_visibility(model: dict[str, Any], cwd_path: Path) -> dict[str, An
 def _plan_skill_prune_actions(
     visibility: dict[str, Any],
     skill_name: str | None,
+    *,
+    from_scope: str = "all",
 ) -> list[dict[str, Any]]:
     actions: list[dict[str, Any]] = []
     issue_keys = ("scope_violations", "global_not_allowed", "extra_global", "broken_global", "broken_project")
     for issue_key in issue_keys:
         for item in (visibility.get("issues") or {}).get(issue_key) or []:
             if skill_name and str(item.get("name") or "") != skill_name:
+                continue
+            if not _scope_filter_matches(item, from_scope):
                 continue
             if item.get("path"):
                 actions.append(_unlink_skill_action(item, reason=issue_key))
@@ -1349,7 +1526,7 @@ def _plan_one_skill_sync(
         to=to,
         categories=categories,
     )
-    blocked_reason = _skill_blocked_reason(model, wanted, sync_to, force)
+    blocked_reason = _skill_blocked_reason(model, wanted, sync_to, cwd_path, force)
     if blocked_reason:
         warnings.append(f"{wanted}: {blocked_reason}")
     actions = _skill_link_actions_for_bases(wanted, chosen, bases, blocked_reason)
@@ -1396,10 +1573,11 @@ def _append_lifecycle_prune_actions(
     *,
     action: str,
     skill_name: str | None,
+    from_scope: str,
     prune: bool,
 ) -> None:
     if action == "prune" or (action == "sync" and prune):
-        actions.extend(_plan_skill_prune_actions(visibility, skill_name))
+        actions.extend(_plan_skill_prune_actions(visibility, skill_name, from_scope=from_scope))
 
 
 def _append_lifecycle_sync_actions(
@@ -1482,19 +1660,27 @@ def skill_lifecycle_plan(
     )
     actions.extend(_plan_skill_removals(model, action, skill_name, cwd_path, from_scope, actions))
 
-    visibility = _lifecycle_visibility(model, cwd_path) if _lifecycle_needs_visibility(action, prune) else {}
+    needs_prune_visibility = action == "prune" or (action == "sync" and prune)
+    needs_sync_visibility = action == "sync"
+    visibility = _lifecycle_visibility(model, cwd_path) if needs_prune_visibility else {}
+    sync_visibility = (
+        _lifecycle_visibility(model, cwd_path, include_global=False)
+        if needs_sync_visibility
+        else visibility
+    )
     _append_lifecycle_prune_actions(
         actions,
         visibility,
         action=action,
         skill_name=skill_name,
+        from_scope=from_scope,
         prune=prune,
     )
     resolved_to = _append_lifecycle_sync_actions(
         model,
         actions,
         warnings,
-        visibility,
+        sync_visibility,
         action=action,
         skill_name=skill_name,
         cwd_path=cwd_path,
@@ -2028,6 +2214,11 @@ def _operator_install_scan_roots(model: dict[str, Any]) -> list[Path]:
     return deduped
 
 
+def _configured_skill_audit_scan_roots(model: dict[str, Any]) -> list[Path]:
+    """Return default repo scan roots for a cross-repo skill audit."""
+    return _operator_install_scan_roots(model)
+
+
 def _all_skill_install_roots(model: dict[str, Any]) -> list[Path]:
     home = Path.home()
     roots = [
@@ -2311,14 +2502,15 @@ def _extra_global_items(
     global_installed: list[dict[str, Any]],
     declared_names: set[str],
 ) -> list[dict[str, Any]]:
-    return [
-        item for item in global_installed
-        if (
-            item.get("state") != "broken"
-            and str(item.get("name")) not in declared_names
-            and not _scope_allows_global(model, str(item.get("name") or ""))
-        )
-    ]
+    extras: list[dict[str, Any]] = []
+    for item in global_installed:
+        name = str(item.get("name") or "")
+        if item.get("state") == "broken" or name in declared_names:
+            continue
+        if _global_install_allowed(model, name) or _scope_allows_global(model, name):
+            continue
+        extras.append(item)
+    return extras
 
 
 def _archive_source_items(occurrences: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2425,11 +2617,26 @@ def collect_skill_visibility(
         undefined_sources, source_roots = [], []
 
     recommendations = _skill_visibility_recommendations(issues)
+    beads = _beads_status_for_cwd(effective, cwd_path)
     policy_files = sorted({
         str(policy.get("_policy_path") or "")
         for policy in _operator_scope_policies(model)
         if str(policy.get("_policy_path") or "")
     })
+    summary = _skill_visibility_summary(
+        effective=effective,
+        occurrences=occurrences,
+        layers=layers,
+        issues=issues,
+        undefined_sources=undefined_sources,
+        recommendations=recommendations,
+    )
+    summary["beads_required_skills"] = len(beads.get("required_skills") or [])
+    summary["beads_issues"] = len(beads.get("issues") or [])
+    next_actions = skill_visibility_next_actions(issues)
+    for action in beads.get("next_actions") or []:
+        if action not in next_actions:
+            next_actions.append(action)
 
     return {
         "cwd": str(cwd_path),
@@ -2443,21 +2650,343 @@ def collect_skill_visibility(
         "effective": effective,
         "occurrences": occurrences,
         "undefined_sources": undefined_sources,
+        "beads": beads,
         "issues": issues,
         "policy": {
             "files": policy_files,
             "project_categories": _project_categories(model),
         },
         "recommendations": recommendations,
-        "summary": _skill_visibility_summary(
-            effective=effective,
-            occurrences=occurrences,
-            layers=layers,
-            issues=issues,
-            undefined_sources=undefined_sources,
-            recommendations=recommendations,
+        "summary": summary,
+        "next_actions": next_actions,
+    }
+
+
+SKILL_AUDIT_REPO_ISSUE_KEYS = (
+    "broken_project",
+    "scope_violations",
+    "missing_for_cwd",
+)
+
+SKILL_AUDIT_GLOBAL_ISSUE_KEYS = (
+    "broken_global",
+    "global_not_allowed",
+    "extra_global",
+)
+
+
+def _skill_audit_candidate_from_path(
+    candidates: dict[str, dict[str, Any]],
+    path: Any,
+    *,
+    source: str,
+) -> None:
+    raw = str(path or "").strip()
+    if not raw:
+        return
+    expanded = _expand_policy_path(raw)
+    item = candidates.setdefault(expanded, {"path": expanded, "sources": []})
+    if source not in item["sources"]:
+        item["sources"].append(source)
+
+
+def _skill_audit_client_paths(
+    candidates: dict[str, dict[str, Any]],
+    model: dict[str, Any],
+) -> None:
+    for client in model.get("clients") or []:
+        client_id = str(client.get("id") or "client")
+        _skill_audit_candidate_from_path(
+            candidates,
+            client.get("default_cwd"),
+            source=f"client:{client_id}:default_cwd",
+        )
+        context = client.get("context") or {}
+        raw_matches = context.get("cwd_match") or []
+        if isinstance(raw_matches, str):
+            raw_matches = [raw_matches]
+        for raw_match in raw_matches:
+            _skill_audit_candidate_from_path(
+                candidates,
+                raw_match,
+                source=f"client:{client_id}:cwd_match",
+            )
+        for repo in (client.get("repo_roots") or []) + (client.get("repos") or []):
+            if isinstance(repo, dict):
+                _skill_audit_candidate_from_path(
+                    candidates,
+                    repo.get("path"),
+                    source=f"client:{client_id}:repo",
+                )
+
+
+def _skill_audit_category_paths(
+    candidates: dict[str, dict[str, Any]],
+    model: dict[str, Any],
+) -> None:
+    for category in _project_categories(model):
+        category_id = str(category.get("id") or "category")
+        for raw_path in category.get("paths") or []:
+            _skill_audit_candidate_from_path(
+                candidates,
+                raw_path,
+                source=f"category:{category_id}",
+            )
+
+
+def _git_repo_paths_under(root: Path, *, max_depth: int) -> list[Path]:
+    if not root.is_dir():
+        return []
+    repos: list[Path] = []
+    root = root.resolve()
+    for current, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(
+            dirname for dirname in dirnames
+            if dirname not in SKILL_SOURCE_SCAN_SKIP_DIRS
+        )
+        current_path = Path(current)
+        try:
+            rel = current_path.relative_to(root)
+        except ValueError:
+            rel = Path()
+        if len(rel.parts) > max_depth:
+            dirnames[:] = []
+            continue
+        if ".git" in dirnames or ".git" in filenames:
+            repos.append(current_path)
+            dirnames[:] = []
+    return repos
+
+
+def _skill_audit_scan_root_paths(
+    candidates: dict[str, dict[str, Any]],
+    scan_roots: list[str] | None,
+    model: dict[str, Any],
+    *,
+    max_depth: int,
+) -> None:
+    if scan_roots is None:
+        roots = _configured_skill_audit_scan_roots(model)
+    else:
+        roots = _expand_skill_source_patterns(scan_roots)
+    for root in roots:
+        for repo_path in _git_repo_paths_under(root, max_depth=max(0, max_depth)):
+            _skill_audit_candidate_from_path(
+                candidates,
+                str(repo_path),
+                source=f"scan_root:{root}",
+            )
+
+
+def _skill_audit_candidate_paths(
+    model: dict[str, Any],
+    *,
+    scan_roots: list[str] | None,
+    max_depth: int,
+) -> list[dict[str, Any]]:
+    candidates: dict[str, dict[str, Any]] = {}
+    _skill_audit_category_paths(candidates, model)
+    _skill_audit_client_paths(candidates, model)
+    _skill_audit_scan_root_paths(candidates, scan_roots, model, max_depth=max_depth)
+    return sorted(candidates.values(), key=lambda item: str(item.get("path") or ""))
+
+
+def _skill_names(items: list[dict[str, Any]]) -> list[str]:
+    return sorted({
+        str(item.get("name") or "")
+        for item in items
+        if str(item.get("name") or "")
+    })
+
+
+def _skill_audit_issue_counts(
+    issues: dict[str, list[dict[str, Any]]],
+    keys: tuple[str, ...],
+) -> dict[str, int]:
+    return {key: len(issues.get(key) or []) for key in keys}
+
+
+def _skill_audit_has_repo_issues(repo: dict[str, Any]) -> bool:
+    return any(int(value) > 0 for value in (repo.get("issues") or {}).values())
+
+
+def _skill_audit_repo_row(
+    candidate: dict[str, Any],
+    payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "path": candidate["path"],
+        "sources": sorted(candidate.get("sources") or []),
+    }
+    path = Path(str(candidate["path"]))
+    if not path.is_dir():
+        row["state"] = "missing"
+        row["issues"] = {"missing_repo": 1}
+        return row
+    if payload is None:
+        row["state"] = "error"
+        row["issues"] = {"error": 1}
+        return row
+
+    issues = payload.get("issues") or {}
+    row.update({
+        "state": "ok",
+        "matched_clients": [
+            str(item.get("id") or "")
+            for item in payload.get("matched_clients") or []
+            if str(item.get("id") or "")
+        ],
+        "categories": [
+            str(item.get("id") or "")
+            for item in payload.get("matched_project_categories") or []
+            if str(item.get("id") or "")
+        ],
+        "matched_scope_rules": [
+            str(item.get("id") or "")
+            for item in payload.get("matched_scope_rules") or []
+            if str(item.get("id") or "")
+        ],
+        "issues": _skill_audit_issue_counts(issues, SKILL_AUDIT_REPO_ISSUE_KEYS),
+        "missing_for_cwd": _skill_names(issues.get("missing_for_cwd") or []),
+        "scope_violations": _skill_names(issues.get("scope_violations") or []),
+        "broken_project": _skill_names(issues.get("broken_project") or []),
+    })
+    return row
+
+
+def _skill_audit_global_row(model: dict[str, Any], cwd: str | None) -> dict[str, Any]:
+    payload = collect_skill_visibility(
+        model,
+        cwd=cwd,
+        include_global=True,
+        include_project=False,
+        include_sources=False,
+    )
+    issues = payload.get("issues") or {}
+    return {
+        "issues": _skill_audit_issue_counts(issues, SKILL_AUDIT_GLOBAL_ISSUE_KEYS),
+        "broken_global": _skill_names(issues.get("broken_global") or []),
+        "global_not_allowed": _skill_names(issues.get("global_not_allowed") or []),
+        "extra_global": _skill_names(issues.get("extra_global") or []),
+    }
+
+
+def _available_skill_overlays(model: dict[str, Any]) -> list[str]:
+    overlays: set[str] = set()
+    for policy in _operator_scope_policies(model):
+        for raw_rule in policy.get("rules") or []:
+            if not isinstance(raw_rule, dict):
+                continue
+            overlay = str(raw_rule.get("overlay") or "").strip()
+            if overlay:
+                overlays.add(overlay)
+    return sorted(overlays)
+
+
+def _skill_audit_next_actions(
+    repos_with_issues: list[dict[str, Any]],
+    global_row: dict[str, Any] | None,
+    overlays: list[str],
+    active: list[str],
+) -> list[str]:
+    actions: list[str] = []
+    first_missing = next(
+        (repo for repo in repos_with_issues if repo.get("missing_for_cwd")),
+        None,
+    )
+    if first_missing:
+        actions.append(f"manage.py skill sync --cwd {first_missing['path']} --dry-run")
+    first_prune = next(
+        (
+            repo for repo in repos_with_issues
+            if repo.get("scope_violations") or repo.get("broken_project")
         ),
-        "next_actions": skill_visibility_next_actions(issues),
+        None,
+    )
+    if first_prune:
+        actions.append(f"manage.py skill prune --cwd {first_prune['path']} --from project --dry-run")
+    if global_row and any(int(value) > 0 for value in (global_row.get("issues") or {}).values()):
+        actions.append("manage.py skill prune --from global --dry-run")
+    inactive_overlays = [overlay for overlay in overlays if overlay not in active]
+    if inactive_overlays:
+        overlay = inactive_overlays[0]
+        actions.append(f"manage.py overlay activate {overlay} --cwd <repo>")
+        actions.append(f"manage.py overlay on {overlay}")
+    if not actions:
+        actions.append("manage.py skills --issues-only")
+    return actions
+
+
+def collect_skill_audit(
+    model: dict[str, Any],
+    *,
+    cwd: str | None = None,
+    scan_roots: list[str] | None = None,
+    max_depth: int = 3,
+    include_global: bool = True,
+    include_clean: bool = False,
+) -> dict[str, Any]:
+    """Collect a compact cross-repo skill policy audit."""
+    candidates = _skill_audit_candidate_paths(
+        model,
+        scan_roots=scan_roots,
+        max_depth=max_depth,
+    )
+    repos: list[dict[str, Any]] = []
+    for candidate in candidates:
+        path = Path(str(candidate["path"]))
+        payload = None
+        if path.is_dir():
+            payload = collect_skill_visibility(
+                model,
+                cwd=str(path),
+                include_global=False,
+                include_project=True,
+                include_sources=False,
+            )
+        row = _skill_audit_repo_row(candidate, payload)
+        if include_clean or _skill_audit_has_repo_issues(row):
+            repos.append(row)
+
+    global_row = _skill_audit_global_row(model, cwd) if include_global else None
+    overlays = _available_skill_overlays(model)
+    active = sorted(active_overlays())
+    repos_with_issues = [repo for repo in repos if _skill_audit_has_repo_issues(repo)]
+
+    issue_totals = {key: 0 for key in SKILL_AUDIT_REPO_ISSUE_KEYS}
+    missing_repos = 0
+    for repo in repos:
+        if repo.get("state") == "missing":
+            missing_repos += 1
+        for key in SKILL_AUDIT_REPO_ISSUE_KEYS:
+            issue_totals[key] += int((repo.get("issues") or {}).get(key) or 0)
+
+    return {
+        "cwd": str(Path(cwd or os.getcwd()).resolve()),
+        "scan_roots": [
+            str(root)
+            for root in (
+                _configured_skill_audit_scan_roots(model)
+                if scan_roots is None
+                else _expand_skill_source_patterns(scan_roots)
+            )
+        ],
+        "max_depth": max_depth,
+        "active_clients": model.get("active_clients") or [],
+        "active_profiles": model.get("active_profiles") or [],
+        "overlays": {"available": overlays, "active": active},
+        "summary": {
+            "candidate_repos": len(candidates),
+            "reported_repos": len(repos),
+            "repos_with_issues": len(repos_with_issues),
+            "missing_repos": missing_repos,
+            **issue_totals,
+            "global_not_allowed": int((global_row or {}).get("issues", {}).get("global_not_allowed") or 0),
+            "extra_global": int((global_row or {}).get("issues", {}).get("extra_global") or 0),
+        },
+        "global": global_row,
+        "repos": repos,
+        "next_actions": _skill_audit_next_actions(repos_with_issues, global_row, overlays, active),
     }
 
 
@@ -2506,6 +3035,7 @@ def compact_skill_visibility_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "summary": payload.get("summary") or {},
         "effective": [_compact_skill_visibility_skill(item) for item in payload.get("effective") or []],
         "issues": _compact_skill_visibility_issues(payload),
+        "beads": payload.get("beads") or {},
         "recommendations": payload.get("recommendations") or [],
         "policy": payload.get("policy") or {},
         "source_roots": payload.get("source_roots") or [],
@@ -2554,6 +3084,22 @@ def _print_visibility_header(payload: dict[str, Any], summary: dict[str, Any]) -
         str(item.get("id") or "") for item in payload.get("matched_project_categories") or []
     ) or "(none)"
     print(f"project categories: {categories}")
+    beads = payload.get("beads") or {}
+    if beads.get("required"):
+        required = ", ".join(
+            str(item.get("name") or "") for item in beads.get("required_skills") or []
+        ) or "(none)"
+        initialized = "yes" if beads.get("initialized") else "no"
+        br_ready = "yes" if beads.get("br") else "no"
+        repo_root = beads.get("repo_root") or "(no git repo)"
+        print(
+            f"beads: required by {required}; repo={repo_root}; "
+            f"initialized={initialized}; br={br_ready}"
+        )
+        for issue in beads.get("issues") or []:
+            print(f"  - {issue.get('message')}")
+            if issue.get("hint"):
+                print(f"    next: {issue.get('hint')}")
 
 
 def _layer_detail(layer: dict[str, Any]) -> str:
@@ -2783,3 +3329,87 @@ def print_skill_visibility_text(
     _print_visibility_undefined(payload, full, limit)
     _print_visibility_next_actions(payload)
     _print_visibility_recommendations(payload, full, limit)
+
+
+def _join_or_none(values: list[Any]) -> str:
+    return ", ".join(str(value) for value in values if str(value)) or "(none)"
+
+
+def _truncate_names(names: list[str], limit: int) -> str:
+    visible = names[: max(0, limit)]
+    text = ", ".join(visible) if visible else "-"
+    remaining = len(names) - len(visible)
+    if remaining > 0:
+        text += f" (+{remaining})"
+    return text
+
+
+def _print_skill_audit_global(payload: dict[str, Any], limit: int) -> None:
+    global_row = payload.get("global")
+    if not global_row:
+        return
+    issues = global_row.get("issues") or {}
+    print(
+        "global: "
+        f"broken={issues.get('broken_global', 0)} "
+        f"not_allowed={issues.get('global_not_allowed', 0)} "
+        f"extra={issues.get('extra_global', 0)}"
+    )
+    if global_row.get("global_not_allowed"):
+        print("  not_allowed:", _truncate_names(global_row["global_not_allowed"], limit))
+    if global_row.get("extra_global"):
+        print("  extra:", _truncate_names(global_row["extra_global"], limit))
+
+
+def _repo_audit_problem_summary(repo: dict[str, Any], limit: int) -> list[str]:
+    if repo.get("state") == "missing":
+        return ["missing repo path"]
+    problems: list[str] = []
+    if repo.get("missing_for_cwd"):
+        problems.append(f"missing={_truncate_names(repo['missing_for_cwd'], limit)}")
+    if repo.get("scope_violations"):
+        problems.append(f"scope={_truncate_names(repo['scope_violations'], limit)}")
+    if repo.get("broken_project"):
+        problems.append(f"broken={_truncate_names(repo['broken_project'], limit)}")
+    return problems or ["clean"]
+
+
+def print_skill_audit_text(payload: dict[str, Any], *, limit: int = 40) -> None:
+    summary = payload.get("summary") or {}
+    overlays = payload.get("overlays") or {}
+    print(
+        "skill audit: "
+        f"{summary.get('candidate_repos', 0)} candidate repos, "
+        f"{summary.get('reported_repos', 0)} reported, "
+        f"{summary.get('repos_with_issues', 0)} with issues"
+    )
+    print(f"cwd: {payload.get('cwd')}")
+    print(
+        "active: "
+        f"clients={_join_or_none(payload.get('active_clients') or [])} "
+        f"profiles={_join_or_none(payload.get('active_profiles') or [])}"
+    )
+    print(
+        "overlays: "
+        f"active={_join_or_none(overlays.get('active') or [])} "
+        f"available={_join_or_none(overlays.get('available') or [])}"
+    )
+    _print_skill_audit_global(payload, max(0, min(limit, 20)))
+
+    repos = payload.get("repos") or []
+    if repos:
+        print("repos:")
+    for repo in repos[: max(0, limit)]:
+        categories = _join_or_none(repo.get("categories") or [])
+        clients = _join_or_none(repo.get("matched_clients") or [])
+        problems = "; ".join(_repo_audit_problem_summary(repo, max(1, min(limit, 8))))
+        print(f"  - {repo.get('path')}: clients={clients} categories={categories} {problems}")
+    remaining = len(repos) - min(len(repos), max(0, limit))
+    if remaining > 0:
+        print(f"  ... {remaining} more repos (rerun with --limit {len(repos)} or --format json)")
+
+    next_actions = payload.get("next_actions") or []
+    if next_actions:
+        print("next_actions:")
+        for action in next_actions:
+            print(f"  - {action}")

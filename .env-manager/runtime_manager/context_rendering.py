@@ -82,9 +82,20 @@ def _context_repo_lines(model: dict[str, Any]) -> list[str]:
     repos = model.get("repos") or []
     if not repos:
         return []
-    lines = ["## Repos", "", "| ID | Path | Kind |", "|----|------|------|"]
+    lines = [
+        "## Repos",
+        "",
+        "| ID | Path | Kind | Project | Command Lanes |",
+        "|----|------|------|---------|---------------|",
+    ]
     for repo in repos:
-        lines.append(f"| {repo['id']} | `{repo['path']}` | {repo.get('kind', 'repo')} |")
+        project_kind = str(repo.get("project_kind") or "-")
+        command_lanes = repo.get("command_lanes") or {}
+        lane_names = ", ".join(str(lane_id) for lane_id in command_lanes) if isinstance(command_lanes, dict) else "-"
+        lines.append(
+            f"| {repo['id']} | `{repo['path']}` | {repo.get('kind', 'repo')} | "
+            f"{project_kind} | {lane_names or '-'} |"
+        )
     lines.append("")
     return lines
 

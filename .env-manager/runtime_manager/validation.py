@@ -20,6 +20,9 @@ from lib.runtime_model import (  # noqa: E402
     PARITY_OWNERSHIP_STATES,
     CANONICAL_RUNTIME_RECORDS,
     LocalRuntimeContractError,
+    PROJECT_KIND_IOS,
+    VALID_PROJECT_KINDS,
+    IOS_COMMAND_LANES,
 )
 
 VALID_INGRESS_ROUTE_LISTENERS = {"public", "private"}
@@ -1338,7 +1341,57 @@ def _check_repo_entries(model: dict[str, Any], declared_client_ids: set[str]) ->
             issues.append(f"repo {repo.get('id')} has unsupported sync.mode {sync_mode!r}")
         if source_kind == "git" and not source.get("url"):
             issues.append(f"repo {repo.get('id')} is git-backed but missing source.url")
+        issues.extend(_check_repo_project_contract(repo))
     return issues
+
+
+def _check_repo_project_contract(repo: dict[str, Any]) -> list[str]:
+    project_kind = str(repo.get("project_kind") or "").strip()
+    lanes = repo.get("command_lanes") or {}
+    issues: list[str] = []
+
+    if not project_kind and lanes:
+        issues.append(f"repo {repo.get('id')} declares command_lanes without project_kind")
+        return issues
+    if not project_kind:
+        return issues
+    if project_kind not in VALID_PROJECT_KINDS:
+        issues.append(f"repo {repo.get('id')} has unsupported project_kind {project_kind!r}")
+        return issues
+    if not isinstance(lanes, dict):
+        return [f"repo {repo.get('id')} command_lanes must be a mapping"]
+
+    if project_kind == PROJECT_KIND_IOS:
+        lane_ids = {str(lane_id).strip() for lane_id in lanes if str(lane_id).strip()}
+        missing = [lane_id for lane_id in IOS_COMMAND_LANES if lane_id not in lane_ids]
+        if missing:
+            issues.append(
+                f"repo {repo.get('id')} project_kind ios is missing command_lanes: "
+                + ", ".join(missing)
+            )
+        unsupported = sorted(lane_id for lane_id in lane_ids if lane_id not in IOS_COMMAND_LANES)
+        if unsupported:
+            issues.append(
+                f"repo {repo.get('id')} project_kind ios has unsupported command_lanes: "
+                + ", ".join(unsupported)
+            )
+
+    for lane_id, lane in lanes.items():
+        if not isinstance(lane, dict):
+            issues.append(f"repo {repo.get('id')} command_lanes.{lane_id} must be a mapping")
+            continue
+        if not _command_lane_has_action(lane):
+            issues.append(f"repo {repo.get('id')} command_lanes.{lane_id} is missing command")
+    return issues
+
+
+def _command_lane_has_action(lane: dict[str, Any]) -> bool:
+    if str(lane.get("command") or "").strip():
+        return True
+    status = str(lane.get("status") or "").strip()
+    if status not in {"manual", "deferred", "unsupported"}:
+        return False
+    return bool(str(lane.get("reason") or lane.get("notes") or "").strip())
 
 
 def _check_artifact_identity(

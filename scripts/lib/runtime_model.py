@@ -114,6 +114,20 @@ RUNTIME_PATH_PREFIXES: tuple[PurePosixPath, ...] = (
     PurePosixPath("/monoserver"),
 )
 
+PROJECT_KIND_IOS = "ios"
+VALID_PROJECT_KINDS: frozenset[str] = frozenset({PROJECT_KIND_IOS})
+IOS_COMMAND_LANES: tuple[str, ...] = (
+    "build",
+    "test",
+    "sim",
+    "device-local",
+    "device-fixtures",
+    "device-prod",
+    "archive",
+    "upload",
+    "screenshots",
+)
+
 
 # ---------------------------------------------------------------------------
 # local_runtime_core_cutover canonical contract
@@ -879,6 +893,44 @@ def _flatten_repo_record(repo: dict[str, Any]) -> None:
     if raw_path is not None:
         repo.setdefault("path", raw_path)
         repo.setdefault("repo_path", raw_path)
+
+    raw_lanes = repo.get("command_lanes")
+    if raw_lanes is not None:
+        repo["command_lanes"] = _normalize_command_lanes(raw_lanes, repo.get("id"))
+
+
+def _normalize_command_lanes(raw_lanes: Any, repo_id: Any) -> dict[str, dict[str, Any]]:
+    if isinstance(raw_lanes, dict):
+        normalized: dict[str, dict[str, Any]] = {}
+        for raw_lane_id, raw_lane in raw_lanes.items():
+            lane_id = str(raw_lane_id).strip()
+            if not lane_id:
+                raise RuntimeError(f"repo {repo_id or '(missing id)'} has an empty command_lanes key")
+            normalized[lane_id] = _normalize_command_lane(raw_lane)
+        return normalized
+
+    if isinstance(raw_lanes, list):
+        normalized = {}
+        for raw_lane in raw_lanes:
+            if not isinstance(raw_lane, dict):
+                raise RuntimeError(f"repo {repo_id or '(missing id)'} command_lanes entries must be mappings")
+            lane_id = str(raw_lane.get("id") or "").strip()
+            if not lane_id:
+                raise RuntimeError(f"repo {repo_id or '(missing id)'} command_lanes entry is missing id")
+            lane = dict(raw_lane)
+            lane.pop("id", None)
+            normalized[lane_id] = _normalize_command_lane(lane)
+        return normalized
+
+    raise RuntimeError(f"repo {repo_id or '(missing id)'} command_lanes must be a mapping or list")
+
+
+def _normalize_command_lane(raw_lane: Any) -> dict[str, Any]:
+    if isinstance(raw_lane, str):
+        return {"command": raw_lane}
+    if isinstance(raw_lane, dict):
+        return dict(raw_lane)
+    raise RuntimeError("command lane declarations must be strings or mappings")
 
 
 def _flatten_env_file_record(env_file: dict[str, Any]) -> None:

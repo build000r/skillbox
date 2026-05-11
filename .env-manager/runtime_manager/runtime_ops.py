@@ -3514,6 +3514,10 @@ def _live_repo_state(repo: dict[str, Any]) -> dict[str, Any]:
         "path": str(repo["path"]),
         "present": path.exists(),
     }
+    if repo.get("project_kind"):
+        item["project_kind"] = repo.get("project_kind")
+    if repo.get("command_lanes"):
+        item["command_lanes"] = list((repo.get("command_lanes") or {}).keys())
     if not path.exists() or not path.is_dir():
         return item
 
@@ -4011,6 +4015,8 @@ def _runtime_repo_statuses(model: dict[str, Any]) -> list[dict[str, Any]]:
         item = {
             "id": repo["id"],
             "kind": repo.get("kind", "repo"),
+            "project_kind": repo.get("project_kind", ""),
+            "command_lanes": list((repo.get("command_lanes") or {}).keys()),
             "path": str(repo["path"]),
             "host_path": str(path),
             "present": path.exists(),
@@ -4223,6 +4229,8 @@ def _compact_status_repos(status_payload: dict[str, Any]) -> list[dict[str, Any]
         {
             "id": repo.get("id"),
             "present": bool(repo.get("present")),
+            "project_kind": repo.get("project_kind") or "",
+            "command_lanes": repo.get("command_lanes") or [],
             "branch": repo.get("branch"),
             "dirty": repo.get("dirty"),
             "untracked": repo.get("untracked"),

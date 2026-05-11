@@ -2,7 +2,8 @@
 
 set -euo pipefail
 
-client="${SKILLBOX_CLIENT:-personal}"
+client="${SKILLBOX_CLIENT:-}"
+runtime_client="${client:-personal}"
 profile="${SKILLBOX_PROFILE:-local-all}"
 mode="${SKILLBOX_MODE:-reuse}"
 action="home"
@@ -52,6 +53,9 @@ Usage:
   sbp restart [profile] [svc] Restart services
   sbp status [profile]        Runtime status
   sbp logs [profile] service  Show service logs
+  sbp recalibrate [args...]   Read-only cwd skill add/remove recalibration
+  sbp mcp [args...]           Read-only Claude JSON / Codex TOML MCP audit
+  sbp beads [status|init|sync] Check or initialize repo-local beads state
   sbp mmdx QUERY              Fuzzy-find and open .mmdx/.mmd from this cwd
   sbp mmdx                    List recent .mmdx/.mmd files from this repo
   sbp hire times              Show configured human-operator availability
@@ -61,6 +65,7 @@ Usage:
 Skills:
   sbp skills [args...]        Show effective skills for this cwd
   sbp skills --issues-only    Compact skill drift/policy view
+  sbp skills audit            Scan downstream repos for skill policy drift
   sbp skill plan NAME         Preview where NAME would be linked
   sbp skill add NAME          Link NAME into global/project/category roots
   sbp skill sync --dry-run    Link cwd-required missing skills
@@ -86,6 +91,11 @@ Examples:
   sbp
   sbp status core
   sbp skills --issues-only
+  sbp recalibrate
+  sbp mcp
+  sbp beads status
+  sbp beads init
+  sbp recalibrate --fleet --limit 20
   sbp skill plan mcp-server-design
   sbp skill add ui --to category --category frontend
   sbp mmdx review
@@ -136,6 +146,18 @@ case "${1:-}" in
     ;;
   logs)
     action="logs"
+    shift
+    ;;
+  recalibrate|calibrate|rc)
+    action="recalibrate"
+    shift
+    ;;
+  mcp|mcps)
+    action="mcp-audit"
+    shift
+    ;;
+  beads|br)
+    action="beads"
     shift
     ;;
   mmdx|mmd)
@@ -195,7 +217,7 @@ append_passthrough_token() {
     sync)
       sync_paths+=("${token}")
       ;;
-    skills|skill|overlay|overlay-toggle|mmdx|operator-booking)
+    skills|skill|overlay|overlay-toggle|recalibrate|mcp-audit|beads|mmdx|operator-booking)
       passthrough_args+=("${token}")
       ;;
     *)
@@ -234,6 +256,10 @@ fi
 
 if [[ "${action}" == "skills" && ${#passthrough_args[@]} -gt 0 ]]; then
   case "${passthrough_args[0]}" in
+    audit)
+      action="skill-audit"
+      passthrough_args=("${passthrough_args[@]:1}")
+      ;;
     plan|add|move|remove|prune|sync)
       action="skill"
       ;;
@@ -245,18 +271,25 @@ for service in "${services[@]}"; do
   service_flags+=(--service "${service}")
 done
 
+client_flags=()
+if [[ -n "${client}" ]]; then
+  client_flags=(--client "${client}")
+fi
+runtime_client_flags=(--client "${runtime_client}")
+
 cd "${skillbox_root}"
 
 case "${action}" in
   home)
-    echo "sbp: ${client} ${profile}"
+    echo "sbp: ${client:-auto} ${profile}"
     echo "cwd: ${invoke_cwd}"
-    python3 .env-manager/manage.py skills --client "${client}" --profile "${profile}" --cwd "${invoke_cwd}" --issues-only --limit 20 --no-global || true
+    python3 .env-manager/manage.py skills "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" --issues-only --limit 20 --no-global || true
     echo
     echo "next:"
     echo "  sbp status        runtime status"
     echo "  sbp up            start services"
     echo "  sbp skills --issues-only full skill drift check"
+    echo "  sbp mcp           Claude/Codex MCP config parity"
     echo "  sbp skills --full full skill view"
     echo "  sbp help          command reference"
     ;;
@@ -264,32 +297,203 @@ case "${action}" in
     print_help
     ;;
   up)
-    python3 .env-manager/manage.py up --client "${client}" --profile "${profile}" --mode "${mode}" "${service_flags[@]}"
+    python3 .env-manager/manage.py up "${runtime_client_flags[@]}" --profile "${profile}" --mode "${mode}" "${service_flags[@]}"
     ;;
   down)
-    python3 .env-manager/manage.py down --client "${client}" --profile "${profile}" "${service_flags[@]}"
+    python3 .env-manager/manage.py down "${runtime_client_flags[@]}" --profile "${profile}" "${service_flags[@]}"
     ;;
   restart)
-    python3 .env-manager/manage.py restart --client "${client}" --profile "${profile}" "${service_flags[@]}"
+    python3 .env-manager/manage.py restart "${runtime_client_flags[@]}" --profile "${profile}" "${service_flags[@]}"
     ;;
   status)
-    python3 .env-manager/manage.py status --client "${client}" --profile "${profile}"
+    python3 .env-manager/manage.py status "${runtime_client_flags[@]}" --profile "${profile}"
     ;;
   logs)
     if [[ ${#services[@]} -eq 0 ]]; then
       echo "sbp logs: pass at least one service, e.g. 'sbp logs spaps'" >&2
       exit 2
     fi
-    python3 .env-manager/manage.py logs --client "${client}" --profile "${profile}" "${service_flags[@]}"
+    python3 .env-manager/manage.py logs "${runtime_client_flags[@]}" --profile "${profile}" "${service_flags[@]}"
     ;;
   mmdx)
     python3 .env-manager/manage.py mmdx --cwd "${invoke_cwd}" "${passthrough_args[@]}"
     ;;
   operator-booking)
-    python3 .env-manager/manage.py operator-booking --client "${client}" --profile "${profile}" "${passthrough_args[@]}"
+    python3 .env-manager/manage.py operator-booking "${runtime_client_flags[@]}" --profile "${profile}" "${passthrough_args[@]}"
     ;;
   skills)
-    python3 .env-manager/manage.py skills --profile "${profile}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    python3 .env-manager/manage.py skills "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    ;;
+  skill-audit)
+    python3 .env-manager/manage.py skill-audit "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    ;;
+  mcp-audit)
+    python3 .env-manager/manage.py mcp-audit "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    ;;
+  recalibrate)
+    recalibrate_fleet="false"
+    recalibrate_cwd="${invoke_cwd}"
+    recalibrate_args=()
+    index=0
+    while [[ ${index} -lt ${#passthrough_args[@]} ]]; do
+      token="${passthrough_args[$index]}"
+      case "${token}" in
+        --fleet|fleet|--all-repos)
+          recalibrate_fleet="true"
+          ;;
+        --cwd)
+          index=$((index + 1))
+          if [[ ${index} -ge ${#passthrough_args[@]} ]]; then
+            echo "sbp recalibrate: --cwd requires a path" >&2
+            exit 2
+          fi
+          recalibrate_cwd="${passthrough_args[$index]}"
+          ;;
+        --cwd=*)
+          recalibrate_cwd="${token#--cwd=}"
+          ;;
+        *)
+          recalibrate_args+=("${token}")
+          ;;
+      esac
+      index=$((index + 1))
+    done
+    if [[ "${recalibrate_fleet}" == "true" ]]; then
+      python3 .env-manager/manage.py skill-audit "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" "${recalibrate_args[@]}"
+      echo
+      echo "review dry-runs before applying:"
+      echo "  sbp skill sync --cwd <repo> --dry-run"
+      echo "  sbp skill prune --cwd <repo> --from project --dry-run"
+      echo "  sbp skill remove <skill> --cwd <repo> --from project --dry-run"
+      echo "  sbp skill prune --from global --dry-run"
+      echo "  sbp overlay activate marketing --cwd <repo>"
+    else
+      echo "sbp recalibrate: ${client:-auto} ${profile}"
+      echo "cwd: ${recalibrate_cwd}"
+      echo
+      echo "policy issues for this repo:"
+      python3 .env-manager/manage.py skills "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --issues-only --no-global "${recalibrate_args[@]}" || true
+      echo
+      echo "add missing repo-local skills:"
+      python3 .env-manager/manage.py skill sync "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --dry-run || true
+      echo
+      echo "remove repo-local policy violations:"
+      python3 .env-manager/manage.py skill prune "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --from project --dry-run || true
+      echo
+      echo "beads graph:"
+      python3 .env-manager/manage.py skills "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --issues-only --format json \
+        | python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+beads = payload.get("beads") or {}
+if not beads.get("required"):
+    print("beads: not required by currently effective skills")
+else:
+    skills = ", ".join(item.get("name", "") for item in beads.get("required_skills", [])) or "(none)"
+    repo = beads.get("repo_root") or "(no git repo)"
+    initialized = "yes" if beads.get("initialized") else "no"
+    br_ready = "yes" if beads.get("br") else "no"
+    print(f"beads: required by {skills}; repo={repo}; initialized={initialized}; br={br_ready}")
+    for issue in beads.get("issues") or []:
+        message = issue.get("message")
+        print(f"  - {message}")
+        hint = issue.get("hint")
+        if hint:
+            print(f"    next: {hint}")
+' || true
+      echo
+      echo "mcp config parity:"
+      python3 .env-manager/manage.py mcp-audit "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" || true
+      echo
+      echo "broader checks:"
+      echo "  sbp mcp"
+      echo "  sbp recalibrate --fleet --limit 20"
+      echo "  sbp skill prune --from global --dry-run"
+      echo "  sbp overlay activate marketing --cwd \"${recalibrate_cwd}\""
+    fi
+    ;;
+  beads)
+    beads_action="${passthrough_args[0]:-status}"
+    if [[ ${#passthrough_args[@]} -gt 0 ]]; then
+      beads_args=("${passthrough_args[@]:1}")
+    else
+      beads_args=()
+    fi
+    beads_cwd="${invoke_cwd}"
+    normalized_beads_args=()
+    index=0
+    while [[ ${index} -lt ${#beads_args[@]} ]]; do
+      token="${beads_args[$index]}"
+      case "${token}" in
+        --cwd)
+          index=$((index + 1))
+          if [[ ${index} -ge ${#beads_args[@]} ]]; then
+            echo "sbp beads: --cwd requires a path" >&2
+            exit 2
+          fi
+          beads_cwd="${beads_args[$index]}"
+          ;;
+        --cwd=*)
+          beads_cwd="${token#--cwd=}"
+          ;;
+        *)
+          normalized_beads_args+=("${token}")
+          ;;
+      esac
+      index=$((index + 1))
+    done
+    if ! command -v br >/dev/null 2>&1; then
+      echo "sbp beads: br is not on PATH" >&2
+      exit 1
+    fi
+    beads_has_git="false"
+    if repo_root="$(git -C "${beads_cwd}" rev-parse --show-toplevel 2>/dev/null)"; then
+      beads_has_git="true"
+      repo_root="$(realpath_portable "${repo_root}")"
+    else
+      repo_root="$(realpath_portable "${beads_cwd}")"
+    fi
+    case "${beads_action}" in
+      status|"")
+        echo "sbp beads status"
+        echo "cwd: ${beads_cwd}"
+        echo "repo: ${repo_root}"
+        if [[ "${beads_has_git}" != "true" ]]; then
+          echo "BEADS DRIFT: cwd is not inside a git repo"
+          echo "next: run from the target repo root or a repo subdirectory"
+        elif [[ ! -d "${repo_root}/.beads" ]]; then
+          echo "BEADS DRIFT: .beads/ is not initialized for this repo"
+          echo "next: sbp beads init --cwd \"${repo_root}\""
+        else
+          (cd "${repo_root}" && br where && br status "${normalized_beads_args[@]}")
+        fi
+        ;;
+      init)
+        if [[ "${beads_has_git}" != "true" || ! -e "${repo_root}/.git" ]]; then
+          echo "sbp beads init: ${beads_cwd} is not inside a git repo; refusing to create .beads outside a repo root" >&2
+          exit 1
+        fi
+        (
+          cd "${repo_root}"
+          if [[ ! -d ".beads" ]]; then
+            br init
+          fi
+          br agents --add --force
+          br doctor --json
+        )
+        ;;
+      sync)
+        if [[ ! -d "${repo_root}/.beads" ]]; then
+          echo "sbp beads sync: .beads/ is not initialized; run sbp beads init --cwd \"${repo_root}\"" >&2
+          exit 1
+        fi
+        (cd "${repo_root}" && br sync --flush-only "${normalized_beads_args[@]}")
+        ;;
+      *)
+        echo "sbp beads: unknown action '${beads_action}' (expected status, init, or sync)" >&2
+        exit 2
+        ;;
+    esac
     ;;
   skill)
     if [[ ${#passthrough_args[@]} -eq 0 ]]; then
@@ -298,19 +502,19 @@ case "${action}" in
     fi
     skill_action="${passthrough_args[0]}"
     skill_args=("${passthrough_args[@]:1}")
-    python3 .env-manager/manage.py skill "${skill_action}" --profile "${profile}" --cwd "${invoke_cwd}" "${skill_args[@]}"
+    python3 .env-manager/manage.py skill "${skill_action}" "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${skill_args[@]}"
     ;;
   overlay)
-    python3 .env-manager/manage.py overlay --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    python3 .env-manager/manage.py overlay "${client_flags[@]}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
     echo
     echo "applying policy for this cwd..."
-    python3 .env-manager/manage.py skill sync --profile "${profile}" --cwd "${invoke_cwd}" || true
+    python3 .env-manager/manage.py skill sync "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" || true
     ;;
   overlay-toggle)
-    python3 .env-manager/manage.py overlay toggle "${overlay_name}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    python3 .env-manager/manage.py overlay toggle "${overlay_name}" "${client_flags[@]}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
     echo
     echo "applying policy for this cwd..."
-    python3 .env-manager/manage.py skill sync --profile "${profile}" --cwd "${invoke_cwd}" || true
+    python3 .env-manager/manage.py skill sync "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" || true
     ;;
   sync)
     if [[ ${#sync_paths[@]} -eq 0 ]]; then
@@ -328,6 +532,7 @@ case "${action}" in
       fi
       skill_name="$(basename "${sync_path}")"
       python3 .env-manager/manage.py skill add "${skill_name}" \
+        "${client_flags[@]}" \
         --profile "${profile}" \
         --cwd "${invoke_cwd}" \
         --to global \
