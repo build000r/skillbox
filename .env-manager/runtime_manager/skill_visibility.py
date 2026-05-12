@@ -866,11 +866,35 @@ def _global_allow_patterns(model: dict[str, Any]) -> list[str] | None:
     return sorted(set(patterns))
 
 
-def _matching_scope_rule(skill_name: str, rules: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _matching_scope_rule(
+    skill_name: str,
+    rules: list[dict[str, Any]],
+    *,
+    cwd: Path | None = None,
+) -> dict[str, Any] | None:
+    matches: list[dict[str, Any]] = []
     for rule in rules:
         for pattern in rule.get("patterns") or []:
             if fnmatch.fnmatchcase(skill_name, str(pattern)):
-                return rule
+                matches.append(rule)
+                break
+    if cwd is not None:
+        cwd = Path(os.path.abspath(os.path.expandvars(os.path.expanduser(str(cwd)))))
+        path_matches = [
+            rule for rule in matches
+            if any(_path_prefix_matches(cwd, path) for path in rule.get("paths") or [])
+        ]
+        if path_matches:
+            return max(
+                path_matches,
+                key=lambda rule: max(
+                    len(str(path))
+                    for path in rule.get("paths") or []
+                    if _path_prefix_matches(cwd, path)
+                ),
+            )
+    if matches:
+        return matches[0]
     return None
 
 
@@ -898,12 +922,16 @@ def _skill_scope_violations(
         if occurrence.get("availability") != "installed":
             continue
         name = str(occurrence.get("name") or "")
-        rule = _matching_scope_rule(name, rules)
+        install_path = str(occurrence.get("path") or "")
+        rule = _matching_scope_rule(
+            name,
+            rules,
+            cwd=Path(install_path) if install_path else None,
+        )
         if not rule:
             continue
 
         layer = str(occurrence.get("layer") or "")
-        install_path = str(occurrence.get("path") or "")
         allowed = False
         reason = ""
         if layer.startswith("global:"):
@@ -1139,7 +1167,7 @@ def _skill_destination_bases(
     if requested == "category":
         category_ids = categories
         if not category_ids:
-            rule = _matching_scope_rule(skill_name, _scope_rules(model))
+            rule = _matching_scope_rule(skill_name, _scope_rules(model), cwd=cwd)
             category_ids = list(rule.get("categories") or []) if rule else []
         if not category_ids:
             warnings.append("No project category was supplied or inferred; falling back to the current repo.")
@@ -1159,7 +1187,7 @@ def _skill_destination_bases(
                 })
         return requested, bases, warnings
 
-    rule = _matching_scope_rule(skill_name, _scope_rules(model))
+    rule = _matching_scope_rule(skill_name, _scope_rules(model), cwd=cwd)
     matched_paths: list[str] = []
     if rule:
         matched_paths = [
@@ -1378,7 +1406,7 @@ def _skill_blocked_reason(
     if resolved_to == "global" and not _global_install_allowed(model, skill_name) and not force:
         return "global install is not allowed by skill-scope policy"
     if resolved_to == "project" and not force:
-        rule = _matching_scope_rule(skill_name, _scope_rules(model))
+        rule = _matching_scope_rule(skill_name, _scope_rules(model), cwd=cwd)
         allowed_paths = list(rule.get("paths") or []) if rule else []
         if allowed_paths and not any(_path_prefix_matches(cwd, path) for path in allowed_paths):
             return "project install is outside allowed skill-scope paths"
