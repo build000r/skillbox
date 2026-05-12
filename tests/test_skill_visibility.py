@@ -1318,6 +1318,63 @@ class SkillVisibilityTests(unittest.TestCase):
             self.assertEqual({item["scope"] for item in auto_plan["actions"]}, {"project"})
             self.assertEqual(global_plan["summary"]["blocked"], 2)
 
+    def test_skill_lifecycle_prefers_path_specific_rule_for_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            clients_root = root / "clients"
+            source_root = root / "source-skills"
+            blocked_project = root / "repos" / "blocked"
+            allowed_project = root / "repos" / "notes-grep"
+            for path in (clients_root, blocked_project, allowed_project):
+                path.mkdir(parents=True)
+            skill_dir = source_root / "rust-crates-publishing"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("# Rust Crates Publishing\n", encoding="utf-8")
+            (root / "skill-scope.yaml").write_text(
+                "version: 1\n"
+                "global_allowlist: [smart]\n"
+                f"skill_source_roots: [{source_root}]\n"
+                "rules:\n"
+                "  - id: broad-rust-local\n"
+                "    skills: [rust-crates-publishing]\n"
+                f"    paths: [{blocked_project}]\n"
+                "  - id: notes-grep-package-local\n"
+                "    skills: [rust-crates-publishing]\n"
+                f"    paths: [{allowed_project}]\n"
+                "    default: off\n"
+                "    activation: on-demand\n",
+                encoding="utf-8",
+            )
+            model = {
+                "env": {"SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root)},
+                "clients": [],
+                "skills": [],
+            }
+
+            plan = skill_lifecycle_plan(
+                model,
+                "activate",
+                skill_name="rust-crates-publishing",
+                cwd=str(allowed_project),
+                to="auto",
+            )
+
+            self.assertEqual(plan["summary"]["blocked"], 0)
+            self.assertEqual({item["scope"] for item in plan["actions"]}, {"project"})
+            self.assertEqual(
+                {Path(str(item["repo_path"])) for item in plan["actions"]},
+                {allowed_project.resolve()},
+            )
+
+            apply_skill_lifecycle_plan(plan, dry_run=False)
+            visibility = collect_skill_visibility(
+                model,
+                cwd=str(allowed_project),
+                include_global=False,
+                include_project=True,
+            )
+            self.assertEqual(visibility["summary"]["scope_violations"], 0)
+
     def test_skill_sync_links_repo_required_skill_even_when_global_install_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
