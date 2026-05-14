@@ -16,6 +16,20 @@ SBH_SAFE_PROBES = (
     ("stats", ("stats", "--window", "24h")),
     ("blame", ("blame", "--json")),
 )
+SBH_RELEASE_CAVEATS = [
+    {
+        "id": "sbh-v0.4.23-linux-x86_64-asset-mismatch",
+        "status": "known_bad",
+        "observed_at": "2026-05-14",
+        "version": "v0.4.23",
+        "repository": "Dicklesworthstone/storage_ballast_helper",
+        "affected_asset": "sbh-v0.4.23-x86_64-unknown-linux-gnu.tar.xz",
+        "observed_file_type": "Mach-O 64-bit executable arm64",
+        "expected_file_type": "ELF 64-bit LSB executable, x86-64",
+        "policy": "do_not_promote_latest_linux_asset",
+        "safe_fallback": "Use the verified v0.4.22 Linux x86_64 canary pin until the upstream asset is republished.",
+    }
+]
 
 
 def _json_or_none(text: str) -> Any:
@@ -260,23 +274,36 @@ def classify_sbh_posture(binary_present: bool, probes: list[dict[str, Any]]) -> 
     }
 
 
-def _sbh_next_actions(binary_present: bool, posture: dict[str, Any]) -> list[str]:
+def _sbh_next_actions(
+    binary_present: bool,
+    posture: dict[str, Any],
+    release_caveats: list[dict[str, Any]] | None = None,
+) -> list[str]:
     if not binary_present:
-        return [
+        actions = [
             "SBH is not installed here; keep storage guard in planning mode.",
             "Do not run `sbh install`, `sbh clean`, or ballast mutation commands without explicit approval.",
             "Use `python3 .env-manager/manage.py pressure-report --format json` for the current read-only disk view.",
         ]
-    if posture.get("state") == "observer-ready":
-        return [
+    elif posture.get("state") == "observer-ready":
+        actions = [
             "Use `sbh status --json`, `sbh stats --window 24h`, and `sbh blame --json` for observation.",
             "Keep cleanup and ballast actions approval-gated until a separate enforce/canary issue exists.",
         ]
-    return [
-        "Run `sbh doctor --pal` and inspect the reported platform/service blockers.",
-        "Use `sbh protect --list` and the Skillbox protected path policy before any cleanup planning.",
-        "Keep SBH in observe-first mode; do not run `sbh clean` or ballast release/provision commands without approval.",
-    ]
+    else:
+        actions = [
+            "Run `sbh doctor --pal` and inspect the reported platform/service blockers.",
+            "Use `sbh protect --list` and the Skillbox protected path policy before any cleanup planning.",
+            "Keep SBH in observe-first mode; do not run `sbh clean` or ballast release/provision commands without approval.",
+        ]
+
+    for caveat in release_caveats or []:
+        if caveat.get("status") == "known_bad":
+            actions.append(
+                f"Do not promote SBH {caveat.get('version')} Linux assets here: "
+                f"{caveat.get('affected_asset')} was observed as {caveat.get('observed_file_type')}."
+            )
+    return actions
 
 
 def collect_sbh_report(
@@ -322,7 +349,11 @@ def collect_sbh_report(
             "service_install_allowed": False,
             "protect_marker_write_allowed": False,
             "requires_explicit_approval_for_mutation": True,
+            "release_asset_promotion_allowed": False,
+            "release_asset_promotion_requires_file_check": True,
+            "linux_x86_64_canary_pin": "v0.4.22",
         },
+        "release_caveats": SBH_RELEASE_CAVEATS,
         "protected_paths": protected_paths,
         "review_only_paths": review_only_paths,
         "safe_probe_commands": [
@@ -342,7 +373,7 @@ def collect_sbh_report(
         ],
         "posture": posture,
         "probes": probes,
-        "next_actions": _sbh_next_actions(binary_present, posture),
+        "next_actions": _sbh_next_actions(binary_present, posture, SBH_RELEASE_CAVEATS),
     }
 
 
@@ -356,10 +387,19 @@ def sbh_report_text_lines(payload: dict[str, Any]) -> list[str]:
         f"state: {posture.get('state')} daemon={posture.get('daemon_state')}",
         f"auto delete allowed: {policy.get('auto_delete_allowed')}",
         f"ballast mutation allowed: {policy.get('ballast_mutation_allowed')}",
+        f"release asset promotion allowed: {policy.get('release_asset_promotion_allowed')}",
         "protected:",
     ]
     for entry in payload.get("protected_paths") or []:
         lines.append(f"  - {entry.get('id')}: {entry.get('display_path')} ({entry.get('policy')})")
+    caveats = payload.get("release_caveats") or []
+    if caveats:
+        lines.append("release caveats:")
+        for caveat in caveats:
+            lines.append(
+                f"  - {caveat.get('version')} {caveat.get('affected_asset')}: "
+                f"{caveat.get('status')} ({caveat.get('observed_file_type')})"
+            )
     lines.append("next:")
     lines.extend(f"  - {action}" for action in payload.get("next_actions") or [])
     return lines

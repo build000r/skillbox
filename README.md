@@ -861,6 +861,12 @@ SBH integration starts in observe-first mode. `sbh doctor --pal`,
 `sbh protect`, service installation, ballast provision/release, and uninstall
 are blocked until a follow-up approval explicitly allows mutation.
 
+The current SBH Linux x86_64 canary pin is v0.4.22. Do not promote the
+v0.4.23 Linux-named assets without a fresh file-type check: the
+`sbh-v0.4.23-x86_64-unknown-linux-gnu.tar.xz` asset was rechecked on
+2026-05-14, matched its published checksum, but extracted as a Mach-O arm64
+binary rather than a Linux x86_64 executable.
+
 Generated agent context, compact status, stewardship reports, and pulse state
 include the same pressure/offload advisory. Protected buckets such as
 `~/.codex`, `~/.claude`, and `~/.ssh` are hard no-touch paths; review-only

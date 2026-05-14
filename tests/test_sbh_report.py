@@ -37,7 +37,12 @@ class SbhReportTests(unittest.TestCase):
         self.assertEqual(payload["posture"]["daemon_state"], "missing-daemon")
         self.assertFalse(payload["policy"]["auto_delete_allowed"])
         self.assertFalse(payload["policy"]["ballast_mutation_allowed"])
+        self.assertFalse(payload["policy"]["release_asset_promotion_allowed"])
+        self.assertEqual(payload["policy"]["linux_x86_64_canary_pin"], "v0.4.22")
+        self.assertEqual(payload["release_caveats"][0]["version"], "v0.4.23")
+        self.assertEqual(payload["release_caveats"][0]["status"], "known_bad")
         self.assertIn("sbh clean", "\n".join(payload["blocked_mutation_commands"]))
+        self.assertIn("Do not promote SBH v0.4.23", "\n".join(payload["next_actions"]))
 
     def test_observer_ready_fixture_classifies_running_daemon(self) -> None:
         probes = [
@@ -126,21 +131,37 @@ class SbhReportTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["mode"], "read_only")
         self.assertFalse(payload["policy"]["auto_delete_allowed"])
+        self.assertFalse(payload["policy"]["release_asset_promotion_allowed"])
         self.assertIn("sbh doctor --pal", payload["safe_probe_commands"])
+        self.assertEqual(payload["release_caveats"][0]["affected_asset"], "sbh-v0.4.23-x86_64-unknown-linux-gnu.tar.xz")
 
     def test_sbh_text_mentions_observe_first_policy(self) -> None:
         lines = sbh_report_text_lines(
             {
                 "binary": {"present": False, "path": None},
                 "posture": {"state": "not-configured", "daemon_state": "missing-daemon"},
-                "policy": {"auto_delete_allowed": False, "ballast_mutation_allowed": False},
+                "policy": {
+                    "auto_delete_allowed": False,
+                    "ballast_mutation_allowed": False,
+                    "release_asset_promotion_allowed": False,
+                },
                 "protected_paths": [{"id": "codex-state", "display_path": "~/.codex", "policy": "hard_veto"}],
+                "release_caveats": [
+                    {
+                        "version": "v0.4.23",
+                        "affected_asset": "sbh-v0.4.23-x86_64-unknown-linux-gnu.tar.xz",
+                        "status": "known_bad",
+                        "observed_file_type": "Mach-O 64-bit executable arm64",
+                    }
+                ],
                 "next_actions": ["Do not run `sbh clean` without explicit approval."],
             }
         )
 
         self.assertTrue(any("auto delete allowed: False" in line for line in lines))
         self.assertTrue(any("ballast mutation allowed: False" in line for line in lines))
+        self.assertTrue(any("release asset promotion allowed: False" in line for line in lines))
+        self.assertIn("known_bad", "\n".join(lines))
         self.assertIn("Do not run `sbh clean`", "\n".join(lines))
 
 
