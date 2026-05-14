@@ -24,6 +24,7 @@ class CliWrapperTests(unittest.TestCase):
         self.assertIn("Fuzzy-find and open .mmdx/.mmd", result.stdout)
         self.assertIn("sbp hire times", result.stdout)
         self.assertIn("sbp skills audit", result.stdout)
+        self.assertIn("sbp candidates", result.stdout)
         self.assertIn("sbp recalibrate", result.stdout)
         self.assertIn("sbp mcp", result.stdout)
         self.assertIn("sbp beads", result.stdout)
@@ -53,6 +54,7 @@ class CliWrapperTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["tool"], "skillbox-sbp")
         self.assertIn("stdout_stderr_contract", payload)
+        self.assertTrue(any(command["name"] == "candidates" for command in payload["commands"]))
         self.assertIn("sbp down <profile> <service> --dry-run --json", payload["safety"]["dry_run_first"])
         self.assertIn("sbp launch <dir> <dir> --request '<prompt>' --dry-run --json", payload["safety"]["dry_run_first"])
         self.assertEqual(json.loads(triage.stdout)["tool"], "skillbox-sbp")
@@ -118,7 +120,7 @@ class CliWrapperTests(unittest.TestCase):
             record = json.loads(record_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 record["argv"],
-                ["status", "--client", "personal", "--profile", "local-core", "--format", "json"],
+                ["status", "--cwd", str(ROOT_DIR), "--profile", "local-core", "--format", "json"],
             )
 
     def test_sbp_up_dry_run_is_not_treated_as_service(self) -> None:
@@ -144,8 +146,8 @@ class CliWrapperTests(unittest.TestCase):
                 record["argv"],
                 [
                     "up",
-                    "--client",
-                    "personal",
+                    "--cwd",
+                    str(ROOT_DIR),
                     "--profile",
                     "local-backend",
                     "--mode",
@@ -239,6 +241,78 @@ class CliWrapperTests(unittest.TestCase):
                 ],
             )
 
+    def test_sbp_candidates_maps_to_full_source_inventory_without_global_layer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            downstream = root / "downstream"
+            downstream.mkdir()
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "candidates",
+                "--json",
+                fake_root=fake_root,
+                invoke_cwd=downstream,
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                record["argv"],
+                [
+                    "skills",
+                    "--profile",
+                    "local-all",
+                    "--cwd",
+                    str(downstream),
+                    "--show-sources",
+                    "--full",
+                    "--no-global",
+                    "--format",
+                    "json",
+                ],
+            )
+
+    def test_sbp_skills_candidates_alias_uses_same_candidate_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            downstream = root / "downstream"
+            downstream.mkdir()
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "skills",
+                "candidates",
+                "--limit",
+                "5",
+                fake_root=fake_root,
+                invoke_cwd=downstream,
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                record["argv"],
+                [
+                    "skills",
+                    "--profile",
+                    "local-all",
+                    "--cwd",
+                    str(downstream),
+                    "--show-sources",
+                    "--full",
+                    "--no-global",
+                    "--limit",
+                    "5",
+                ],
+            )
+
     def test_sbp_recalibrate_defaults_to_cwd_sync_and_project_prune_dry_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -262,6 +336,7 @@ class CliWrapperTests(unittest.TestCase):
             self.assertIn("beads graph:", result.stdout)
             self.assertIn("beads: not required by currently effective skills", result.stdout)
             self.assertIn("mcp config parity:", result.stdout)
+            self.assertIn("sbp candidates --json", result.stdout)
             record = json.loads(record_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 record["argv"],
@@ -465,7 +540,7 @@ class CliWrapperTests(unittest.TestCase):
             record = json.loads(record_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 record["argv"],
-                ["status", "--client", "personal", "--profile", "local-core"],
+                ["status", "--cwd", str(ROOT_DIR), "--profile", "local-core"],
             )
 
     def test_sbp_hire_maps_operator_booking(self) -> None:
@@ -490,8 +565,8 @@ class CliWrapperTests(unittest.TestCase):
                 record["argv"],
                 [
                     "operator-booking",
-                    "--client",
-                    "personal",
+                    "--cwd",
+                    str(ROOT_DIR),
                     "--profile",
                     "local-all",
                     "times",

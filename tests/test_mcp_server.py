@@ -368,6 +368,35 @@ class SkillboxMcpServerTests(unittest.TestCase):
             "skillbox_mcp_audit",
         )
 
+    def test_skillbox_parity_report_requires_and_maps_client_id(self) -> None:
+        tool = next(tool for tool in MODULE.handle_tools_list({})["tools"] if tool["name"] == "skillbox_parity_report")
+        self.assertEqual(tool["inputSchema"]["required"], ["client_id"])
+        self.assertNotIn("client", tool["inputSchema"]["properties"])
+
+        missing = MODULE.handle_tools_call({"name": "skillbox_parity_report", "arguments": {}}, request_id="req-parity")
+        missing_payload = _content_payload(missing)
+        self.assertTrue(missing["isError"])
+        self.assertEqual(missing_payload["error"]["type"], "missing_required_parameter")
+
+        with mock.patch.object(
+            MODULE,
+            "run_manage",
+            return_value=(True, 0, {"status": "ready"}),
+        ) as run_manage:
+            result = MODULE.handle_tools_call(
+                {
+                    "name": "skillbox_parity_report",
+                    "arguments": {"client_id": "personal", "profile": ["local-core"]},
+                },
+                request_id="req-parity",
+            )
+
+        payload = _content_payload(result)
+        self.assertEqual(payload["status"], "ready")
+        args = run_manage.call_args.args[0]
+        self.assertEqual(args[:4], ["parity-report", "personal", "--format", "json"])
+        self.assertIn("--profile", args)
+
     def test_skillbox_status_defaults_to_compact_with_full_escape_hatch(self) -> None:
         tool = next(tool for tool in MODULE.handle_tools_list({})["tools"] if tool["name"] == "skillbox_status")
         self.assertIn("full", tool["inputSchema"]["properties"])

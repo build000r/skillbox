@@ -16,6 +16,7 @@ from .context_rendering import *
 from .text_renderers import *
 from .workflows import *
 from .mcp_visibility import *
+from .parity_report import *
 from .swimmers_launch import launch_swimmers_batch, swimmers_launch_text_lines
 
 
@@ -50,6 +51,7 @@ MANAGE_COMMAND_NAMES = {
     "onboard",
     "operator-booking",
     "overlay",
+    "parity-report",
     "private-init",
     "render",
     "restart",
@@ -215,6 +217,14 @@ def _add_client_arg(command_parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_cwd_arg(command_parser: argparse.ArgumentParser) -> None:
+    command_parser.add_argument(
+        "--cwd",
+        default=None,
+        help="Working directory used to infer the active client overlay when --client is omitted.",
+    )
+
+
 def _add_service_arg(command_parser: argparse.ArgumentParser) -> None:
     command_parser.add_argument(
         "--service",
@@ -366,6 +376,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_profile_arg(status_parser)
     _add_client_arg(status_parser)
+    _add_cwd_arg(status_parser)
 
     skills_parser = subparsers.add_parser(
         "skills",
@@ -640,6 +651,7 @@ def _build_parser() -> argparse.ArgumentParser:
     operator_booking_parser.add_argument("--limit", type=int, default=8)
     _add_profile_arg(operator_booking_parser)
     _add_client_arg(operator_booking_parser)
+    _add_cwd_arg(operator_booking_parser)
 
     skill_parser = subparsers.add_parser(
         "skill",
@@ -744,6 +756,7 @@ def _build_parser() -> argparse.ArgumentParser:
     bootstrap_parser.add_argument("--format", choices=("text", "json"), default="text")
     _add_profile_arg(bootstrap_parser)
     _add_client_arg(bootstrap_parser)
+    _add_cwd_arg(bootstrap_parser)
     _add_task_arg(bootstrap_parser)
 
     up_parser = subparsers.add_parser(
@@ -767,6 +780,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_profile_arg(up_parser)
     _add_client_arg(up_parser)
+    _add_cwd_arg(up_parser)
     _add_service_arg(up_parser)
 
     down_parser = subparsers.add_parser(
@@ -778,6 +792,7 @@ def _build_parser() -> argparse.ArgumentParser:
     down_parser.add_argument("--format", choices=("text", "json"), default="text")
     _add_profile_arg(down_parser)
     _add_client_arg(down_parser)
+    _add_cwd_arg(down_parser)
     _add_service_arg(down_parser)
 
     restart_parser = subparsers.add_parser(
@@ -789,6 +804,7 @@ def _build_parser() -> argparse.ArgumentParser:
     restart_parser.add_argument("--format", choices=("text", "json"), default="text")
     _add_profile_arg(restart_parser)
     _add_client_arg(restart_parser)
+    _add_cwd_arg(restart_parser)
     _add_service_arg(restart_parser)
 
     logs_parser = subparsers.add_parser(
@@ -799,6 +815,7 @@ def _build_parser() -> argparse.ArgumentParser:
     logs_parser.add_argument("--format", choices=("text", "json"), default="text")
     _add_profile_arg(logs_parser)
     _add_client_arg(logs_parser)
+    _add_cwd_arg(logs_parser)
     _add_service_arg(logs_parser)
 
     context_parser = subparsers.add_parser(
@@ -1143,6 +1160,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_profile_arg(stewardship_parser)
     _add_client_arg(stewardship_parser)
+
+    parity_report_parser = subparsers.add_parser(
+        "parity-report",
+        help="Compare a client runtime graph against its production-stack parity contract.",
+    )
+    parity_report_parser.add_argument(
+        "client_id",
+        nargs="?",
+        default="",
+        help="Existing client slug to report on (e.g. 'personal').",
+    )
+    parity_report_parser.add_argument("--format", choices=("text", "json"), default="text")
+    _add_profile_arg(parity_report_parser)
+    _add_client_arg(parity_report_parser)
+    _add_cwd_arg(parity_report_parser)
 
     session_start_parser = subparsers.add_parser(
         "session-start",
@@ -2139,6 +2171,8 @@ def _safe_first_try_command(name: str) -> str:
         return "manage.py distribution-rollback --list --skill <skill> --format json"
     if name in {"status", "render", "doctor", "skills", "skill-audit", "mcp-audit"}:
         return f"manage.py {name} --format json"
+    if name == "parity-report":
+        return "manage.py parity-report <client> --format json"
     if name == "swimmers-launch":
         return "manage.py swimmers-launch <dir> <dir> --request '<prompt>' --dry-run --format json"
     if name in {"up", "down", "restart", "sync", "bootstrap", "context"}:
@@ -2173,6 +2207,7 @@ Useful command families:
   doctor --format json          Runtime validation checks.
   skills --issues-only          Skill visibility issues for the current cwd.
   mcp-audit --format json       Claude/Codex MCP parity audit.
+  parity-report <client>        Dev/prod parity report for a client.
   swimmers-launch <dirs...>     Launch one Swimmers agent session per dir.
   focus <client> --format json  Sync, bootstrap, start, collect live state, context.
 """
@@ -2312,7 +2347,7 @@ def _handle_operator_booking(
         payload, exit_code = operator_booking_payload(
             model,
             action=str(getattr(args, "action", "availability") or "availability"),
-            client_id=(getattr(args, "client", []) or [None])[0],
+            client_id=_primary_client_id(args, model, default=""),
             date=getattr(args, "date", None),
             slot=getattr(args, "slot", None),
             email=getattr(args, "email", None),
@@ -2484,6 +2519,13 @@ def _handle_mcp_audit(args: argparse.Namespace, root_dir: Path, model: dict[str,
     else:
         print_mcp_audit_text(payload, root_dir=root_dir)
     return EXIT_OK
+
+
+def _handle_parity_report(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    del root_dir, resolved_mode
+    client_id = _primary_client_id(args, model, default=getattr(args, "client_id", "") or "")
+    payload = collect_dev_prod_parity_report(model, client_id=client_id)
+    return emit_dev_prod_parity_report(payload, fmt=args.format)
 
 
 def _handle_skill(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
@@ -2723,7 +2765,7 @@ def _check_logs_deferred_surfaces(args: argparse.Namespace, model: dict[str, Any
     logs_classification = classify_requested_surfaces(model, raw_service_ids)
     if not logs_classification["deferred"]:
         return None
-    cid_for_logs = args.client[0] if args.client else "personal"
+    cid_for_logs = _primary_client_id(args, model)
     profile_for_logs = (
         args.profile[0]
         if args.profile
@@ -2753,13 +2795,31 @@ def _emit_up_payload(args: argparse.Namespace, payload: dict[str, Any], exit_cod
     return exit_code
 
 
+def _primary_client_id(args: argparse.Namespace, model: dict[str, Any], default: str = "personal") -> str:
+    requested_clients = [
+        str(value).strip()
+        for value in (getattr(args, "client", []) or [])
+        if str(value).strip()
+    ]
+    if requested_clients:
+        return requested_clients[0]
+    active_clients = [
+        str(value).strip()
+        for value in (model.get("active_clients") or [])
+        if str(value).strip()
+    ]
+    if active_clients:
+        return active_clients[0]
+    return default
+
+
 def _handle_local_profile_up(
     args: argparse.Namespace,
     model: dict[str, Any],
     resolved_mode: str,
     active_local_profile: str,
 ) -> int:
-    client_id_for_up = args.client[0] if args.client else "personal"
+    client_id_for_up = _primary_client_id(args, model)
     service_filter = [s for s in (getattr(args, "service", []) or []) if s]
     up_exit, up_payload = run_up(
         model=model,
@@ -2940,6 +3000,7 @@ _MODEL_DISPATCH: dict[str, Callable[[argparse.Namespace, Path, dict[str, Any], s
     "skills": _handle_skills,
     "skill-audit": _handle_skill_audit,
     "mcp-audit": _handle_mcp_audit,
+    "parity-report": _handle_parity_report,
     "skill": _handle_skill,
     "overlay": _handle_overlay,
     "operator-booking": _handle_operator_booking,
@@ -2976,10 +3037,30 @@ def _emit_main_exception(args: argparse.Namespace, exc: Exception) -> int:
 
 def _active_clients_for_args(args: argparse.Namespace, model: dict[str, Any]) -> list[str]:
     requested_clients = getattr(args, "client", [])
+    positional_client = str(getattr(args, "client_id", "") or "").strip()
+    if args.command == "parity-report" and positional_client and not requested_clients:
+        requested_clients = [positional_client]
     active_clients = normalize_active_clients(model, requested_clients)
-    if args.command not in {"skills", "skill", "overlay", "mcp-audit"} or requested_clients:
+    cwd_inferred_commands = {
+        "skills",
+        "skill",
+        "overlay",
+        "mcp-audit",
+        "parity-report",
+        "bootstrap",
+        "up",
+        "down",
+        "restart",
+        "status",
+        "logs",
+        "operator-booking",
+    }
+    if args.command not in cwd_inferred_commands or requested_clients:
         return active_clients
-    skill_cwd = Path(getattr(args, "cwd", None) or os.getcwd())
+    raw_cwd = getattr(args, "cwd", None)
+    if args.command not in {"skills", "skill", "overlay", "mcp-audit"} and not raw_cwd:
+        return active_clients
+    skill_cwd = Path(raw_cwd or os.getcwd())
     matches = matched_skill_clients(model, skill_cwd)
     if not matches:
         return active_clients
