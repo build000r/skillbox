@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 
 payload = json.load(open(sys.argv[1], encoding="utf-8"))
 robot_docs = next(item for item in payload["commands"] if item["name"] == "robot-docs")
@@ -32,7 +33,7 @@ python3 scripts/04-reconcile.py capabilities --json >"${tmpdir}/reconcile-b.json
 cmp "${tmpdir}/reconcile-a.json" "${tmpdir}/reconcile-b.json"
 assert_json "${tmpdir}/reconcile-a.json"
 
-python3 scripts/04-reconcile.py doctor --jsno --skip-compose --skip-skill-sync \
+python3 scripts/04-reconcile.py render --jsno \
   >"${tmpdir}/reconcile-alias.json" 2>"${tmpdir}/reconcile-alias.err"
 assert_json "${tmpdir}/reconcile-alias.json"
 grep -q "Interpreting --jsno as --format json" "${tmpdir}/reconcile-alias.err"
@@ -101,9 +102,18 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 
 payload = json.load(open(sys.argv[1], encoding="utf-8"))
-assert payload["argv"] == ["status", "--client", "personal", "--profile", "local-core", "--format", "json"]
+assert payload["argv"] == [
+    "status",
+    "--cwd",
+    str(Path.cwd()),
+    "--profile",
+    "local-core",
+    "--format",
+    "json",
+]
 PY
 
 SKILLBOX_ROOT="${fake_root}" SKILLBOX_RECORD="${tmpdir}/record.json" \
