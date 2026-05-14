@@ -48,6 +48,7 @@ from manage import (  # noqa: E402
     probe_service,
     remove_pid_file,
     resolve_runtime_command_cwd,
+    runtime_pressure_advisory,
     service_paths,
     service_supports_lifecycle,
     stop_process,
@@ -331,6 +332,8 @@ class PulseState:
         self.check_states: dict[str, bool] = {}    # check_id → ok
         self.restart_backoff: dict[str, float] = {}  # service_id → next eligible restart time
         self.unhealthy_since: dict[str, float] = {}  # service_id → monotonic timestamp
+        self.pressure_warnings: list[str] = []
+        self.pressure_advisory: dict[str, Any] = {}
         self.cycle_count: int = 0
         self.heals: int = 0
         self.events_emitted: int = 0
@@ -349,6 +352,8 @@ class PulseState:
             "config_hash": self.config_hash,
             "service_states": dict(self.service_states),
             "check_states": dict(self.check_states),
+            "pressure_warnings": list(self.pressure_warnings),
+            "pressure_advisory": dict(self.pressure_advisory),
             "unhealthy_for_seconds": unhealthy_for,
         }
 
@@ -386,6 +391,7 @@ def reconcile_once(
         now=now,
     )
     _reconcile_pulse_checks(model, state)
+    _reconcile_pressure_advisory(root_dir, state)
     _write_pulse_state(
         root_dir,
         state,
@@ -683,6 +689,29 @@ def _reconcile_pulse_checks(model: dict[str, Any], state: PulseState) -> None:
         state.check_states[check_id] = ok
 
 
+def _reconcile_pressure_advisory(root_dir: Path, state: PulseState) -> None:
+    advisory = runtime_pressure_advisory(root_dir)
+    warnings = [str(warning) for warning in advisory.get("warnings") or [] if str(warning).strip()]
+    if warnings != state.pressure_warnings:
+        log_runtime_event(
+            "pulse.pressure_advisory",
+            "pressure",
+            {
+                "warnings": warnings,
+                "mutates": False,
+                "safe_first_commands": advisory.get("safe_first_commands") or [],
+            },
+            root_dir,
+        )
+        state.events_emitted += 1
+        if warnings:
+            log("warn", "pressure/offload advisory changed", warnings=warnings)
+        else:
+            log("info", "pressure/offload advisory cleared")
+    state.pressure_warnings = warnings
+    state.pressure_advisory = advisory
+
+
 def _write_pulse_state(
     root_dir: Path,
     state: PulseState,
@@ -855,6 +884,7 @@ def _print_pulse_snapshot(snapshot: dict[str, Any], running_pid: int | None) -> 
 
     _print_pulse_services(snapshot.get("service_states", {}))
     _print_pulse_checks(snapshot.get("check_states", {}))
+    _print_pulse_pressure(snapshot.get("pressure_warnings", []))
 
 
 def _print_pulse_services(service_states: dict[str, Any]) -> None:
@@ -872,6 +902,15 @@ def _print_pulse_checks(check_states: dict[str, Any]) -> None:
         print(f"  failed checks: {', '.join(sorted(failed))}")
     elif check_states:
         print(f"  checks: all passing ({len(check_states)})")
+
+
+def _print_pulse_pressure(pressure_warnings: list[Any]) -> None:
+    warnings = [str(item) for item in pressure_warnings if str(item).strip()]
+    if not warnings:
+        return
+    print("  pressure/offload warnings:")
+    for warning in warnings:
+        print(f"    ! {warning}")
 
 
 def read_state(root_dir: Path) -> dict[str, Any]:

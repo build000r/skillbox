@@ -318,6 +318,26 @@ def _print_status_ingress(status_payload: dict[str, Any]) -> None:
         )
 
 
+def _print_status_pressure(status_payload: dict[str, Any]) -> None:
+    advisory = status_payload.get("pressure_advisory") or {}
+    if not advisory:
+        return
+    disk = advisory.get("local_disk") or {}
+    target = advisory.get("target_worker") or {}
+    rch = advisory.get("rch") or {}
+    sbh = advisory.get("sbh") or {}
+    print("pressure/offload:")
+    print(
+        f"  - local: {disk.get('free_gib')}GiB free "
+        f"({disk.get('free_percent')}%, {disk.get('pressure_level')})"
+    )
+    print(f"  - target: {target.get('id')} state={target.get('state') or 'unknown'}")
+    print(f"  - rch: {rch.get('state')} worker={rch.get('worker_state')}")
+    print(f"  - sbh: {sbh.get('state')} daemon={sbh.get('daemon_state')}")
+    for warning in advisory.get("warnings") or []:
+        print(f"  ! {warning}")
+
+
 def _print_status_logs(status_payload: dict[str, Any]) -> None:
     print("logs:")
     for log_item in status_payload["logs"]:
@@ -347,6 +367,7 @@ def print_status_text(status_payload: dict[str, Any]) -> None:
     _print_status_services(status_payload)
     _print_status_parity(status_payload)
     _print_status_ingress(status_payload)
+    _print_status_pressure(status_payload)
     _print_status_logs(status_payload)
     _print_status_checks(status_payload)
 

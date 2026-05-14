@@ -65,6 +65,12 @@ class CliUnitTests(unittest.TestCase):
         self.assertIn("--dry-run", client_project["safe_first_try"])
         parity_report = next(command for command in payload["commands"] if command["name"] == "parity-report")
         self.assertIn("parity-report <client> --format json", parity_report["safe_first_try"])
+        pressure_report = next(command for command in payload["commands"] if command["name"] == "pressure-report")
+        self.assertIn("pressure-report --format json", pressure_report["safe_first_try"])
+        rch_report = next(command for command in payload["commands"] if command["name"] == "rch-report")
+        self.assertIn("rch-report --format json", rch_report["safe_first_try"])
+        sbh_report = next(command for command in payload["commands"] if command["name"] == "sbh-report")
+        self.assertIn("sbh-report --format json", sbh_report["safe_first_try"])
 
     def test_robot_docs_guide_is_available_in_tool(self) -> None:
         result = subprocess.run(
@@ -81,6 +87,12 @@ class CliUnitTests(unittest.TestCase):
         self.assertIn("capabilities --json", result.stdout)
         self.assertIn("Safe mutation pattern", result.stdout)
         self.assertIn("parity-report <client>", result.stdout)
+        self.assertIn("pressure-report --format json", result.stdout)
+        self.assertIn("rch-report --format json", result.stdout)
+        self.assertIn("sbh-report --format json", result.stdout)
+        self.assertIn("portfolio-devbox", result.stdout)
+        self.assertIn("sweet-potato-prod", result.stdout)
+        self.assertIn("Protected paths", result.stdout)
         self.assertIn("swimmers-launch <dirs...>", result.stdout)
 
     def test_swimmers_launch_cli_dry_run_resolves_against_invoke_cwd(self) -> None:

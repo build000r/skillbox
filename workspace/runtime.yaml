@@ -405,6 +405,164 @@ core:
         - connectors
       notes: Flywheel connectors CLI should be installed for the connectors profile.
 
+pressure-tools:
+  artifacts:
+    - id: rch-bin
+      kind: binary
+      path: ${SKILLBOX_RCH_BIN}
+      required: false
+      source:
+        kind: url
+        url: ${SKILLBOX_RCH_DOWNLOAD_URL}
+        sha256: ${SKILLBOX_RCH_DOWNLOAD_SHA256}
+        executable: true
+      sync:
+        mode: download-if-missing
+      notes: >
+        Remote Compilation Helper CLI. Offloads expensive build/test
+        commands to remote workers when explicitly configured.
+
+    - id: rchd-bin
+      kind: binary
+      path: ${SKILLBOX_RCHD_BIN}
+      required: false
+      source:
+        kind: url
+        url: ${SKILLBOX_RCH_DOWNLOAD_URL}
+        sha256: ${SKILLBOX_RCH_DOWNLOAD_SHA256}
+        executable: true
+      sync:
+        mode: download-if-missing
+      notes: Optional RCH daemon binary. Missing is reported as not configured.
+
+    - id: rch-worker-bin
+      kind: binary
+      path: ${SKILLBOX_RCH_WORKER_BIN}
+      required: false
+      source:
+        kind: url
+        url: ${SKILLBOX_RCH_DOWNLOAD_URL}
+        sha256: ${SKILLBOX_RCH_DOWNLOAD_SHA256}
+        executable: true
+      sync:
+        mode: download-if-missing
+      notes: Optional RCH worker binary for boxes that will execute remote builds.
+
+    - id: rch-workers-config
+      kind: config
+      path: ${SKILLBOX_RCH_WORKERS_CONFIG}
+      required: false
+      source:
+        kind: manual
+      sync:
+        mode: manual
+      notes: Optional RCH worker inventory. Keep manual until the target box policy is proven.
+
+    - id: sbh-bin
+      kind: binary
+      path: ${SKILLBOX_SBH_BIN}
+      required: false
+      source:
+        kind: url
+        url: ${SKILLBOX_SBH_DOWNLOAD_URL}
+        sha256: ${SKILLBOX_SBH_DOWNLOAD_SHA256}
+        executable: true
+      sync:
+        mode: download-if-missing
+      notes: >
+        Storage Ballast Helper CLI. Should start in observe/dry-run posture
+        before any ballast or cleanup enforcement is enabled.
+
+    - id: sbh-config
+      kind: config
+      path: ${SKILLBOX_SBH_CONFIG}
+      required: false
+      source:
+        kind: manual
+      sync:
+        mode: manual
+      notes: Optional SBH config. Missing means storage guard is not configured.
+
+  services:
+    - id: rchd
+      kind: daemon
+      owner: local
+      artifact: rch-bin
+      required: false
+      command: ${SKILLBOX_RCH_BIN} daemon start
+      healthcheck:
+        type: process_running
+        pattern: rchd
+      depends_on:
+        - rch-bin
+        - rchd-bin
+        - rch-workers-config
+      log: pressure-tools
+      notes: >
+        Optional RCH daemon. Disabled unless the pressure-tools profile is
+        requested and RCH has been installed/configured.
+
+    - id: sbh-daemon
+      kind: daemon
+      owner: local
+      artifact: sbh-bin
+      required: false
+      command: ${SKILLBOX_SBH_BIN} daemon
+      healthcheck:
+        type: process_running
+        pattern: sbh daemon
+      depends_on:
+        - sbh-bin
+        - sbh-config
+      log: pressure-tools
+      notes: >
+        Optional SBH daemon. Keep in observe mode until canary/enforce policy
+        is explicitly approved.
+
+  logs:
+    - id: pressure-tools
+      path: ${SKILLBOX_LOG_ROOT}/pressure-tools
+      required: false
+      retention_days: 14
+      notes: RCH/SBH observe-mode logs and diagnostics.
+
+  checks:
+    - id: rch-binary
+      type: path_exists
+      path: ${SKILLBOX_RCH_BIN}
+      required: false
+      notes: RCH CLI is optional; missing means build offload is not configured.
+
+    - id: rchd-binary
+      type: path_exists
+      path: ${SKILLBOX_RCHD_BIN}
+      required: false
+      notes: RCH daemon binary is optional until build offload is enabled.
+
+    - id: rch-worker-binary
+      type: path_exists
+      path: ${SKILLBOX_RCH_WORKER_BIN}
+      required: false
+      notes: RCH worker binary is optional until this box becomes a worker.
+
+    - id: rch-workers-config
+      type: path_exists
+      path: ${SKILLBOX_RCH_WORKERS_CONFIG}
+      required: false
+      notes: RCH worker config is optional and manual.
+
+    - id: sbh-binary
+      type: path_exists
+      path: ${SKILLBOX_SBH_BIN}
+      required: false
+      notes: SBH CLI is optional; missing means storage guard is not configured.
+
+    - id: sbh-config
+      type: path_exists
+      path: ${SKILLBOX_SBH_CONFIG}
+      required: false
+      notes: SBH config is optional and manual until observe mode is enabled.
+
 connectors:
   artifacts:
     - id: fwc-bin

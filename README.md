@@ -815,6 +815,9 @@ make runtime-sync
 | `.env-manager/manage.py sync` | Create managed repo/artifact/log directories and install declared skills for the selected core/client scope | `python3 .env-manager/manage.py sync --client personal --dry-run` |
 | `.env-manager/manage.py doctor` | Validate the internal repos/skills/logs/check graph for the selected core/client scope | `python3 .env-manager/manage.py doctor --client personal` |
 | `.env-manager/manage.py status` | Summarize repo, artifact, skill, task, service, log, and health state for the selected core/client scope | `python3 .env-manager/manage.py status --client personal` |
+| `.env-manager/manage.py pressure-report` | Read-only disk pressure, protected buckets, approved non-production worker target, and RCH/SBH posture | `python3 .env-manager/manage.py pressure-report --format json` |
+| `.env-manager/manage.py rch-report` | Read-only Remote Compilation Helper worker/check/status/hook readiness; never installs hooks | `python3 .env-manager/manage.py rch-report --format json` |
+| `.env-manager/manage.py sbh-report` | Read-only Storage Ballast Helper doctor/status/stats/blame posture with observe-first mutation gates | `python3 .env-manager/manage.py sbh-report --format json` |
 | `.env-manager/manage.py skills` | Show the effective skill set for a cwd/client/profile, with global extras, broken links, scope violations, project-local layers, and shadowed lower-precedence sources | `python3 .env-manager/manage.py skills --client personal --profile local-all --cwd "$PWD"` |
 | `.env-manager/manage.py mmdx` | Fuzzy-find and open local Mermaid/MMDX diagrams through the Buildooor diagrams viewer | `python3 .env-manager/manage.py mmdx --cwd "$PWD" skill review realms --no-open` |
 | `.env-manager/manage.py bootstrap` | Sync runtime state and run declared bootstrap tasks in dependency order | `python3 .env-manager/manage.py bootstrap --client acme-studio --task app-bootstrap` |
@@ -830,6 +833,38 @@ make runtime-sync
 | `.env-manager/manage.py client-diff` | Compare a client projection bundle against the current published payload and show both file-level and runtime-surface changes | `python3 .env-manager/manage.py client-diff personal --profile surfaces` |
 | `.env-manager/manage.py client-publish` | Promote a client projection bundle into the attached private git repo under `clients/<client>/current/`, optionally persisting acceptance evidence | `python3 .env-manager/manage.py client-publish personal --acceptance --commit` |
 | `.env-manager/pulse.py` | Pulse reconciliation daemon for continuous drift detection and auto-heal | `python3 .env-manager/pulse.py run --interval 30` |
+
+### Pressure-aware builds and storage guard
+
+When disk is tight or an agent is about to run expensive build/test commands,
+start with the read-only pressure surface:
+
+```bash
+python3 .env-manager/manage.py pressure-report --format json
+python3 .env-manager/manage.py rch-report --format json
+python3 .env-manager/manage.py sbh-report --format json
+python3 .env-manager/manage.py status --profile pressure-tools --format json --compact
+```
+
+The first approved worker target is `portfolio-devbox` on the Tailnet. The
+policy explicitly excludes `jeremy`, `ssh-info`, and `sweet-potato-prod`; do not
+use Sweet Potato production boxes for this lane.
+
+RCH integration is fail-open and approval-gated. It may report safe probes such
+as `rch --robot-triage --json`, `rch status --workers --jobs --json`,
+`rch check --json`, and `rch hook status --json`, but `rch hook install`,
+daemon setup, worker deployment, or source builds are separate mutation steps.
+
+SBH integration starts in observe-first mode. `sbh doctor --pal`,
+`sbh status --json`, `sbh stats --window 24h`, `sbh blame --json`, and
+`sbh explain --id <decision-id>` are the intended visibility path. `sbh clean`,
+`sbh protect`, service installation, ballast provision/release, and uninstall
+are blocked until a follow-up approval explicitly allows mutation.
+
+Generated agent context, compact status, stewardship reports, and pulse state
+include the same pressure/offload advisory. Protected buckets such as
+`~/.codex`, `~/.claude`, and `~/.ssh` are hard no-touch paths; review-only
+candidate caches are inventory, not an auto-delete list.
 
 ## Configuration
 
@@ -867,6 +902,16 @@ SKILLBOX_DCG_DOWNLOAD_URL=
 SKILLBOX_DCG_DOWNLOAD_SHA256=
 SKILLBOX_DCG_PACKS=core.git,core.filesystem
 SKILLBOX_PULSE_INTERVAL=30
+SKILLBOX_RCH_BIN=/home/sandbox/.local/bin/rch
+SKILLBOX_RCHD_BIN=/home/sandbox/.local/bin/rchd
+SKILLBOX_RCH_WORKER_BIN=/home/sandbox/.local/bin/rch-wkr
+SKILLBOX_RCH_WORKERS_CONFIG=/home/sandbox/.config/rch/workers.toml
+SKILLBOX_RCH_DOWNLOAD_URL=
+SKILLBOX_RCH_DOWNLOAD_SHA256=
+SKILLBOX_SBH_BIN=/home/sandbox/.local/bin/sbh
+SKILLBOX_SBH_CONFIG=/home/sandbox/.config/sbh/config.toml
+SKILLBOX_SBH_DOWNLOAD_URL=
+SKILLBOX_SBH_DOWNLOAD_SHA256=
 SKILLBOX_DCG_MCP_PORT=3220
 SKILLBOX_FWC_BIN=/home/sandbox/.local/bin/fwc
 SKILLBOX_FWC_DOWNLOAD_URL=

@@ -17,6 +17,9 @@ from .text_renderers import *
 from .workflows import *
 from .mcp_visibility import *
 from .parity_report import *
+from .pressure_report import *
+from .rch_report import *
+from .sbh_report import *
 from .swimmers_launch import launch_swimmers_batch, swimmers_launch_text_lines
 
 
@@ -53,6 +56,9 @@ MANAGE_COMMAND_NAMES = {
     "overlay",
     "parity-report",
     "private-init",
+    "pressure-report",
+    "rch-report",
+    "sbh-report",
     "render",
     "restart",
     "robot-docs",
@@ -377,6 +383,76 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_profile_arg(status_parser)
     _add_client_arg(status_parser)
     _add_cwd_arg(status_parser)
+
+    pressure_report_parser = subparsers.add_parser(
+        "pressure-report",
+        help="Report local disk pressure, protected buckets, and build-offload/storage guard posture.",
+    )
+    pressure_report_parser.add_argument("--format", choices=("text", "json"), default="text")
+    pressure_report_parser.add_argument(
+        "--home",
+        default=None,
+        help="Home directory to inspect. Defaults to the current user's home.",
+    )
+    pressure_report_parser.add_argument(
+        "--target-box",
+        default=DEFAULT_TARGET_BOX,
+        help="Non-production box inventory id to report against.",
+    )
+    pressure_report_parser.add_argument(
+        "--scan-candidate-sizes",
+        action="store_true",
+        help="Run read-only du probes for review-only cleanup candidates.",
+    )
+
+    rch_report_parser = subparsers.add_parser(
+        "rch-report",
+        help="Report RCH build-offload readiness without installing hooks or mutating config.",
+    )
+    rch_report_parser.add_argument("--format", choices=("text", "json"), default="text")
+    rch_report_parser.add_argument(
+        "--binary",
+        default=None,
+        help="Explicit rch binary path. Defaults to SKILLBOX_RCH_BIN then PATH lookup.",
+    )
+    rch_report_parser.add_argument(
+        "--target-box",
+        default=DEFAULT_TARGET_BOX,
+        help="Approved non-production worker target to name in policy output.",
+    )
+    rch_report_parser.add_argument("--timeout", type=float, default=5.0)
+    rch_report_parser.add_argument(
+        "--no-probes",
+        action="store_true",
+        help="Do not run rch; only report configured policy and binary presence.",
+    )
+
+    sbh_report_parser = subparsers.add_parser(
+        "sbh-report",
+        help="Report SBH storage guard readiness without installing services, cleaning, or mutating ballast.",
+    )
+    sbh_report_parser.add_argument("--format", choices=("text", "json"), default="text")
+    sbh_report_parser.add_argument(
+        "--home",
+        default=None,
+        help="Home directory to inspect. Defaults to the current user's home.",
+    )
+    sbh_report_parser.add_argument(
+        "--binary",
+        default=None,
+        help="Explicit sbh binary path. Defaults to SKILLBOX_SBH_BIN then PATH lookup.",
+    )
+    sbh_report_parser.add_argument(
+        "--decision-id",
+        default=None,
+        help="Optional SBH decision id to explain with a read-only `sbh explain` probe.",
+    )
+    sbh_report_parser.add_argument("--timeout", type=float, default=5.0)
+    sbh_report_parser.add_argument(
+        "--no-probes",
+        action="store_true",
+        help="Do not run sbh; only report configured policy and binary presence.",
+    )
 
     skills_parser = subparsers.add_parser(
         "skills",
@@ -2125,6 +2201,9 @@ def _capabilities_payload(root_dir: Path) -> dict[str, Any]:
                 "--public-key <public-key.pem> --format json"
             ),
             "python3 scripts/04-reconcile.py doctor --format json --skip-compose --skip-skill-sync",
+            "python3 .env-manager/manage.py pressure-report --format json",
+            "python3 .env-manager/manage.py rch-report --format json",
+            "python3 .env-manager/manage.py sbh-report --format json",
             "python3 scripts/box.py up <box-id> --profile dev-small --dry-run --format json",
         ],
         "exit_codes": {
@@ -2137,6 +2216,8 @@ def _capabilities_payload(root_dir: Path) -> dict[str, Any]:
             "SKILLBOX_STATE_ROOT": "Persistent runtime state root.",
             "SKILLBOX_MONOSERVER_ROOT": "Host or container repo universe root.",
             "SKILLBOX_CLIENTS_ROOT": "Runtime client overlay root.",
+            "SKILLBOX_RCH_BIN": "Optional RCH CLI path for build-offload checks.",
+            "SKILLBOX_SBH_BIN": "Optional SBH CLI path for storage-guard checks.",
             "NO_COLOR": "Suppress ANSI styling in supported surfaces.",
             "CI": "Prefer non-interactive behavior in supported surfaces.",
         },
@@ -2171,6 +2252,12 @@ def _safe_first_try_command(name: str) -> str:
         return "manage.py distribution-rollback --list --skill <skill> --format json"
     if name in {"status", "render", "doctor", "skills", "skill-audit", "mcp-audit"}:
         return f"manage.py {name} --format json"
+    if name == "pressure-report":
+        return "manage.py pressure-report --format json"
+    if name == "rch-report":
+        return "manage.py rch-report --format json"
+    if name == "sbh-report":
+        return "manage.py sbh-report --format json"
     if name == "parity-report":
         return "manage.py parity-report <client> --format json"
     if name == "swimmers-launch":
@@ -2205,11 +2292,21 @@ Safe mutation pattern:
 Useful command families:
   status --format json          Compact runtime state.
   doctor --format json          Runtime validation checks.
+  pressure-report --format json Disk pressure and RCH/SBH posture.
+  rch-report --format json      RCH worker/hook readiness without mutation.
+  sbh-report --format json      SBH observe-first storage guard posture.
   skills --issues-only          Skill visibility issues for the current cwd.
   mcp-audit --format json       Claude/Codex MCP parity audit.
   parity-report <client>        Dev/prod parity report for a client.
   swimmers-launch <dirs...>     Launch one Swimmers agent session per dir.
   focus <client> --format json  Sync, bootstrap, start, collect live state, context.
+
+Pressure/offload rule:
+  The approved non-production worker target is portfolio-devbox.
+  Excluded targets are jeremy, ssh-info, and sweet-potato-prod.
+  Protected paths like ~/.codex, ~/.claude, and ~/.ssh are hard no-touch.
+  Use pressure-report, rch-report, and sbh-report before expensive builds or cleanup.
+  Do not install RCH hooks, run SBH cleanup, mutate ballast, or touch production boxes without explicit approval.
 """
 
 
@@ -2244,6 +2341,21 @@ def _handle_robot_triage(args: argparse.Namespace, root_dir: Path) -> int:
                 "why": "Find graph, filesystem, and skill-integrity drift.",
             },
             {
+                "id": "inspect-pressure",
+                "command": "python3 .env-manager/manage.py pressure-report --format json",
+                "why": "Read-only disk pressure, protected buckets, and RCH/SBH posture.",
+            },
+            {
+                "id": "inspect-rch",
+                "command": "python3 .env-manager/manage.py rch-report --format json",
+                "why": "Read-only RCH worker, check, status, and hook posture.",
+            },
+            {
+                "id": "inspect-sbh",
+                "command": "python3 .env-manager/manage.py sbh-report --format json",
+                "why": "Read-only SBH doctor, status, stats, blame, and mutation-gate posture.",
+            },
+            {
                 "id": "preview-before-mutation",
                 "command": "python3 .env-manager/manage.py up --dry-run --format json",
                 "why": "Preview service graph actions before starting services.",
@@ -2254,6 +2366,9 @@ def _handle_robot_triage(args: argparse.Namespace, root_dir: Path) -> int:
             "guide": "python3 .env-manager/manage.py robot-docs guide",
             "status": "python3 .env-manager/manage.py status --format json",
             "doctor": "python3 .env-manager/manage.py doctor --format json",
+            "pressure-report": "python3 .env-manager/manage.py pressure-report --format json",
+            "rch-report": "python3 .env-manager/manage.py rch-report --format json",
+            "sbh-report": "python3 .env-manager/manage.py sbh-report --format json",
         },
     }
     try:
@@ -2273,6 +2388,51 @@ def _handle_robot_triage(args: argparse.Namespace, root_dir: Path) -> int:
         }
     emit_json(payload)
     return EXIT_OK if payload["ok"] else EXIT_ERROR
+
+
+def _handle_pressure_report(args: argparse.Namespace, root_dir: Path) -> int:
+    payload = collect_pressure_report(
+        root_dir,
+        home=Path(args.home) if getattr(args, "home", None) else None,
+        target_box=str(getattr(args, "target_box", DEFAULT_TARGET_BOX) or DEFAULT_TARGET_BOX),
+        scan_candidate_sizes=bool(getattr(args, "scan_candidate_sizes", False)),
+    )
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print("\n".join(pressure_report_text_lines(payload)))
+    return EXIT_OK
+
+
+def _handle_rch_report(args: argparse.Namespace, root_dir: Path) -> int:
+    payload = collect_rch_report(
+        root_dir,
+        binary=getattr(args, "binary", None),
+        run_probes=not bool(getattr(args, "no_probes", False)),
+        timeout_seconds=max(0.1, float(getattr(args, "timeout", 5.0) or 5.0)),
+        target_box=str(getattr(args, "target_box", DEFAULT_TARGET_BOX) or DEFAULT_TARGET_BOX),
+    )
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print("\n".join(rch_report_text_lines(payload)))
+    return EXIT_OK
+
+
+def _handle_sbh_report(args: argparse.Namespace, root_dir: Path) -> int:
+    payload = collect_sbh_report(
+        root_dir,
+        home=Path(args.home) if getattr(args, "home", None) else None,
+        binary=getattr(args, "binary", None),
+        run_probes=not bool(getattr(args, "no_probes", False)),
+        timeout_seconds=max(0.1, float(getattr(args, "timeout", 5.0) or 5.0)),
+        decision_id=getattr(args, "decision_id", None),
+    )
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print("\n".join(sbh_report_text_lines(payload)))
+    return EXIT_OK
 
 
 def _operator_booking_config_lines(payload: dict[str, Any]) -> list[str]:
@@ -2378,6 +2538,9 @@ _EARLY_DISPATCH: dict[str, Callable[[argparse.Namespace, Path], int]] = {
     "capabilities": _handle_capabilities,
     "robot-docs": _handle_robot_docs,
     "robot-triage": _handle_robot_triage,
+    "pressure-report": _handle_pressure_report,
+    "rch-report": _handle_rch_report,
+    "sbh-report": _handle_sbh_report,
     "client-init": _handle_client_init,
     "onboard": _handle_onboard,
     "first-box": _handle_first_box,
