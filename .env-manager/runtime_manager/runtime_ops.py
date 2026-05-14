@@ -4192,6 +4192,8 @@ def _pressure_warning_messages(advisory: dict[str, Any]) -> list[str]:
         warnings.append("RCH build offload is not worker-ready; expensive builds may run locally.")
     if sbh.get("state") in {"not-configured", "remediation"}:
         warnings.append("SBH storage guard is not observing; cleanup remains manual review only.")
+    if sbh.get("release_caveats"):
+        warnings.append("SBH latest Linux release asset has a known mismatch; keep the verified canary pin.")
     if advisory.get("protected_paths"):
         warnings.append("Protected paths are hard vetoes; do not delete agent state or SSH material.")
     return warnings
@@ -4266,6 +4268,7 @@ def runtime_pressure_advisory(root_dir: Path, *, home: Path | None = None) -> di
                 *list(sbh.get("safe_probe_commands") or []),
             ],
             "blocked_mutation_commands": sbh.get("blocked_mutation_commands") or [],
+            "release_caveats": sbh.get("release_caveats") or [],
         },
         "protected_paths": [
             {
