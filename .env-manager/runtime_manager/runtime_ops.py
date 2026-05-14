@@ -5,6 +5,9 @@ import socket
 
 from .shared import *
 from .validation import *
+from .pressure_report import collect_pressure_report
+from .rch_report import collect_rch_report
+from .sbh_report import collect_sbh_report
 from lib.runtime_model import (
     PERSISTENT_PATH_OFF_STATE_ROOT,
     STATE_ROOT_LOW_SPACE,
@@ -1639,7 +1642,7 @@ def _optional_service_artifact_unavailable_reason(
             continue
         artifact_path = str(artifact.get("host_path") or artifact.get("path") or "").strip()
         if artifact_path and not Path(artifact_path).exists():
-            return f"artifact {artifact_id!r} not available"
+            return f"optional artifact {artifact_id!r} not configured"
         break
     return None
 
@@ -3472,6 +3475,12 @@ def probe_service(model: dict[str, Any], service: dict[str, Any]) -> dict[str, A
         and manager_state.get("manager_reason") == "no ingress routes active"
     ):
         state = "idle"
+    elif (
+        pid is None
+        and manager_state.get("managed") is False
+        and str(manager_state.get("manager_reason") or "").startswith("optional artifact ")
+    ):
+        state = "not-configured"
     elif pid is not None:
         if health_state.get("state") == "ok":
             state = "running"
@@ -3669,6 +3678,7 @@ def collect_live_state(
         "logs": _live_log_states(model),
         "sessions": _live_session_states(model, root_dir),
         "bridges": _live_bridge_states(model),
+        "pressure_advisory": runtime_pressure_advisory(root_dir),
     }
 
 
@@ -4088,7 +4098,7 @@ def _runtime_blocked_services(service_statuses: list[dict[str, Any]]) -> list[st
     return [
         str(entry.get("id", ""))
         for entry in service_statuses
-        if entry.get("state") not in {"running", "ok", "idle"}
+        if entry.get("state") not in {"running", "ok", "idle", "not-configured"}
         and str(entry.get("id", "")).strip()
     ]
 
@@ -4140,6 +4150,7 @@ def _runtime_ingress_payload(model: dict[str, Any]) -> dict[str, Any]:
 
 def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
     service_statuses = _runtime_service_statuses(model)
+    root_dir = Path(str(model.get("root_dir") or DEFAULT_ROOT_DIR))
     return {
         "box_access": runtime_box_access_from_env(),
         "clients": copy.deepcopy(model.get("clients") or []),
@@ -4158,11 +4169,129 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
         "logs": _runtime_log_statuses(model),
         "checks": _runtime_check_statuses(model),
         "ingress": _runtime_ingress_payload(model),
+        "pressure_advisory": runtime_pressure_advisory(root_dir),
         "parity_ledger": {
             "covered_surfaces": parity_ledger_covered_surfaces(model),
             "deferred_surfaces": parity_ledger_deferred_surfaces(model),
         },
     }
+
+
+def _pressure_warning_messages(advisory: dict[str, Any]) -> list[str]:
+    local_disk = advisory.get("local_disk") or {}
+    rch = advisory.get("rch") or {}
+    sbh = advisory.get("sbh") or {}
+    warnings: list[str] = []
+    level = str(local_disk.get("pressure_level") or "").strip()
+    if level in {"critical", "high", "elevated"}:
+        warnings.append(
+            "Local disk pressure is "
+            f"{level}; avoid expensive local build storms and inspect pressure-report first."
+        )
+    if rch.get("state") in {"not-configured", "remediation"}:
+        warnings.append("RCH build offload is not worker-ready; expensive builds may run locally.")
+    if sbh.get("state") in {"not-configured", "remediation"}:
+        warnings.append("SBH storage guard is not observing; cleanup remains manual review only.")
+    if advisory.get("protected_paths"):
+        warnings.append("Protected paths are hard vetoes; do not delete agent state or SSH material.")
+    return warnings
+
+
+def runtime_pressure_advisory(root_dir: Path, *, home: Path | None = None) -> dict[str, Any]:
+    """Collect a compact read-only pressure/offload policy packet for agent-facing surfaces."""
+    try:
+        pressure = collect_pressure_report(root_dir, home=home, scan_candidate_sizes=False)
+        rch = collect_rch_report(root_dir, run_probes=False)
+        sbh = collect_sbh_report(root_dir, home=home, run_probes=False)
+    except Exception as exc:  # pragma: no cover - defensive surface guard
+        return {
+            "ok": False,
+            "mode": "read_only",
+            "mutates": False,
+            "error": str(exc),
+            "safe_first_commands": [
+                "python3 .env-manager/manage.py pressure-report --format json",
+                "python3 .env-manager/manage.py rch-report --format json",
+                "python3 .env-manager/manage.py sbh-report --format json",
+            ],
+            "warnings": ["Pressure advisory could not be collected; run pressure-report directly."],
+        }
+
+    local_disk = pressure.get("local_disk") or {}
+    box = pressure.get("box") or {}
+    rch_posture = rch.get("posture") or {}
+    sbh_posture = sbh.get("posture") or {}
+    sbh_policy = sbh.get("policy") or {}
+    advisory = {
+        "ok": True,
+        "mode": "read_only",
+        "mutates": False,
+        "local_disk": {
+            "path": local_disk.get("path"),
+            "free_gib": local_disk.get("free_gib"),
+            "total_gib": local_disk.get("total_gib"),
+            "free_percent": local_disk.get("free_percent"),
+            "pressure_level": local_disk.get("pressure_level"),
+        },
+        "target_worker": {
+            "id": box.get("target_box"),
+            "found": bool(box.get("found")),
+            "state": box.get("state"),
+            "tailscale_hostname": box.get("tailscale_hostname"),
+            "tailscale_ip": box.get("tailscale_ip"),
+            "state_root": box.get("state_root"),
+            "min_free_gib": box.get("min_free_gib"),
+            "excluded_box_ids": box.get("excluded_box_ids") or [],
+        },
+        "rch": {
+            "binary_present": bool((rch.get("binary") or {}).get("present")),
+            "state": rch_posture.get("state"),
+            "worker_state": rch_posture.get("worker_state"),
+            "fail_open_expected": bool(rch_posture.get("fail_open_expected")),
+            "hook_install_allowed": bool((rch.get("global_hook_install") or {}).get("allowed")),
+            "safe_first_commands": [
+                "python3 .env-manager/manage.py rch-report --format json",
+                *list(rch.get("safe_probe_commands") or []),
+            ],
+        },
+        "sbh": {
+            "binary_present": bool((sbh.get("binary") or {}).get("present")),
+            "state": sbh_posture.get("state"),
+            "daemon_state": sbh_posture.get("daemon_state"),
+            "rollout_mode": sbh_policy.get("rollout_mode"),
+            "auto_delete_allowed": bool(sbh_policy.get("auto_delete_allowed")),
+            "ballast_mutation_allowed": bool(sbh_policy.get("ballast_mutation_allowed")),
+            "safe_first_commands": [
+                "python3 .env-manager/manage.py sbh-report --format json",
+                *list(sbh.get("safe_probe_commands") or []),
+            ],
+            "blocked_mutation_commands": sbh.get("blocked_mutation_commands") or [],
+        },
+        "protected_paths": [
+            {
+                "id": entry.get("id"),
+                "path": entry.get("display_path") or entry.get("path"),
+                "policy": entry.get("policy"),
+            }
+            for entry in pressure.get("protected_buckets") or []
+        ],
+        "review_only_paths": [
+            {
+                "id": entry.get("id"),
+                "path": entry.get("display_path") or entry.get("path"),
+                "class": entry.get("class"),
+                "policy": entry.get("policy"),
+            }
+            for entry in pressure.get("review_only_candidates") or []
+        ],
+        "safe_first_commands": [
+            "python3 .env-manager/manage.py pressure-report --format json",
+            "python3 .env-manager/manage.py rch-report --format json",
+            "python3 .env-manager/manage.py sbh-report --format json",
+        ],
+    }
+    advisory["warnings"] = _pressure_warning_messages(advisory)
+    return advisory
 
 
 def runtime_box_access_from_env() -> dict[str, Any]:
@@ -4350,6 +4479,7 @@ def compact_runtime_status(status_payload: dict[str, Any]) -> dict[str, Any]:
         "logs": _compact_status_logs(status_payload),
         "checks": _compact_status_checks(status_payload),
         "ingress": _compact_status_ingress(status_payload),
+        "pressure_advisory": status_payload.get("pressure_advisory") or {},
         "parity_ledger": _compact_status_parity_ledger(status_payload),
         "next_actions": status_payload.get("next_actions") or [],
     }

@@ -232,6 +232,16 @@ def build_model() -> dict[str, Any]:
         "SKILLBOX_DCG_DOWNLOAD_URL": "",
         "SKILLBOX_DCG_DOWNLOAD_SHA256": "",
         "SKILLBOX_DCG_PACKS": "core.git,core.filesystem",
+        "SKILLBOX_RCH_BIN": f"{home_root}/.local/bin/rch",
+        "SKILLBOX_RCHD_BIN": f"{home_root}/.local/bin/rchd",
+        "SKILLBOX_RCH_WORKER_BIN": f"{home_root}/.local/bin/rch-wkr",
+        "SKILLBOX_RCH_WORKERS_CONFIG": f"{home_root}/.config/rch/workers.toml",
+        "SKILLBOX_RCH_DOWNLOAD_URL": "",
+        "SKILLBOX_RCH_DOWNLOAD_SHA256": "",
+        "SKILLBOX_SBH_BIN": f"{home_root}/.local/bin/sbh",
+        "SKILLBOX_SBH_CONFIG": f"{home_root}/.config/sbh/config.toml",
+        "SKILLBOX_SBH_DOWNLOAD_URL": "",
+        "SKILLBOX_SBH_DOWNLOAD_SHA256": "",
         "SKILLBOX_CASS_BIN": f"{home_root}/.local/bin/cass",
         "SKILLBOX_CASS_DOWNLOAD_URL": (
             "https://github.com/Dicklesworthstone/coding_agent_session_search/"

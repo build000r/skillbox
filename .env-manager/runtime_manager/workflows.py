@@ -2246,6 +2246,22 @@ def _stewardship_parity_evidence(status_payload: dict[str, Any]) -> dict[str, An
     }
 
 
+def _stewardship_pressure_evidence(status_payload: dict[str, Any]) -> dict[str, Any]:
+    pressure = status_payload.get("pressure_advisory") or {}
+    return {
+        "status": "present" if pressure else "missing",
+        "mode": pressure.get("mode"),
+        "mutates": bool(pressure.get("mutates")),
+        "local_disk": pressure.get("local_disk") or {},
+        "target_worker": pressure.get("target_worker") or {},
+        "rch": pressure.get("rch") or {},
+        "sbh": pressure.get("sbh") or {},
+        "protected_paths": pressure.get("protected_paths") or [],
+        "warnings": pressure.get("warnings") or [],
+        "safe_first_commands": pressure.get("safe_first_commands") or [],
+    }
+
+
 def _stewardship_doctor_check_payload(result: CheckResult) -> dict[str, Any]:
     return {
         "status": result.status,
@@ -2510,6 +2526,34 @@ def _stewardship_dev_prod_parity_risks(
     ]
 
 
+def _stewardship_pressure_risks(pressure: dict[str, Any]) -> list[dict[str, Any]]:
+    warnings = pressure.get("warnings") or []
+    local_disk = pressure.get("local_disk") or {}
+    level = str(local_disk.get("pressure_level") or "")
+    if not warnings or level not in {"critical", "high", "elevated"}:
+        return []
+    severity = "high" if level in {"critical", "high"} else "medium"
+    return [
+        _stewardship_risk(
+            "pressure-offload-advisory",
+            severity,
+            "Local disk pressure or offload posture needs attention",
+            {
+                "local_disk": local_disk,
+                "rch": pressure.get("rch") or {},
+                "sbh": pressure.get("sbh") or {},
+                "warnings": warnings,
+            },
+            "Inspect read-only pressure and offload reports before running expensive builds or cleanup.",
+            [
+                "pressure-report --format json",
+                "rch-report --format json",
+                "sbh-report --format json",
+            ],
+        )
+    ]
+
+
 def _stewardship_dev_prod_parity_evidence(filtered_model: dict[str, Any], cid: str) -> dict[str, Any]:
     try:
         return parity_report_evidence_summary(
@@ -2537,6 +2581,7 @@ def _stewardship_risks(
     health: dict[str, Any],
     parity: dict[str, Any],
     doctor: dict[str, Any],
+    pressure: dict[str, Any] | None = None,
     dev_prod_parity: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     profile_args = _stewardship_profile_args(active_profiles)
@@ -2547,6 +2592,7 @@ def _stewardship_risks(
     risks.extend(_stewardship_service_risks(cid, profile_args, health))
     risks.extend(_stewardship_focus_risks(cid, profile_args, focus))
     risks.extend(_stewardship_pulse_risks(cid, pulse))
+    risks.extend(_stewardship_pressure_risks(pressure or {}))
     risks.extend(_stewardship_parity_risks(cid, profile_args, parity))
     risks.extend(_stewardship_dev_prod_parity_risks(cid, profile_args, dev_prod_parity))
     return risks
@@ -2585,6 +2631,7 @@ def _build_stewardship_report(root_dir: Path, cid: str, profiles: list[str]) -> 
     health = _stewardship_health_evidence(status_payload, live)
     sessions = _stewardship_session_evidence(live)
     parity = _stewardship_parity_evidence(status_payload)
+    pressure = _stewardship_pressure_evidence(status_payload)
     dev_prod_parity = _stewardship_dev_prod_parity_evidence(filtered_model, cid)
     doctor = _stewardship_doctor_evidence(filtered_model, root_dir)
     risks = _stewardship_risks(
@@ -2595,6 +2642,7 @@ def _build_stewardship_report(root_dir: Path, cid: str, profiles: list[str]) -> 
         health=health,
         parity=parity,
         doctor=doctor,
+        pressure=pressure,
         dev_prod_parity=dev_prod_parity,
     )
     next_recommendation = (
@@ -2614,6 +2662,7 @@ def _build_stewardship_report(root_dir: Path, cid: str, profiles: list[str]) -> 
             "live_collected_at": live.get("collected_at"),
             "pulse": pulse,
             "doctor": doctor,
+            "pressure_advisory": pressure,
             "sessions": sessions,
             "parity_ledger": parity,
             "dev_prod_parity": dev_prod_parity,
@@ -2700,6 +2749,11 @@ def _stewardship_markdown_evidence(payload: dict[str, Any]) -> str:
     dev_prod_parity = evidence.get("dev_prod_parity") or {}
     doctor = evidence.get("doctor") or {}
     doctor_counts = doctor.get("counts") or {}
+    pressure = evidence.get("pressure_advisory") or {}
+    pressure_disk = pressure.get("local_disk") or {}
+    pressure_target = pressure.get("target_worker") or {}
+    pressure_rch = pressure.get("rch") or {}
+    pressure_sbh = pressure.get("sbh") or {}
     lines = [
         "## Evidence",
         "",
@@ -2708,6 +2762,7 @@ def _stewardship_markdown_evidence(payload: dict[str, Any]) -> str:
         f"- Services: {services.get('running', 0)}/{services.get('total', 0)} running",
         f"- Recent log errors: {recent_errors.get('count', 0)}",
         f"- Doctor: {doctor.get('status', 'unknown')} ({doctor_counts.get('fail', 0)} failing)",
+        f"- Pressure: {pressure_disk.get('pressure_level', 'unknown')} ({pressure_disk.get('free_gib')}GiB free); target={pressure_target.get('id')}; rch={pressure_rch.get('state')}; sbh={pressure_sbh.get('state')}",
         f"- Dev/prod parity: {dev_prod_parity.get('status', 'not_assessed')} ({dev_prod_parity.get('blocking_count', 0)} blocking)",
     ]
     lines.extend(_stewardship_markdown_doctor_findings(doctor))
@@ -3255,6 +3310,7 @@ def _focus_persist_step(
 
 
 def _focus_summary_counts(live: dict[str, Any]) -> dict[str, int]:
+    pressure_warnings = (live.get("pressure_advisory") or {}).get("warnings") or []
     return {
         "repos_present": sum(1 for r in live.get("repos", []) if r.get("present")),
         "repos_dirty": sum(1 for r in live.get("repos", []) if r.get("dirty", 0) > 0),
@@ -3268,6 +3324,7 @@ def _focus_summary_counts(live: dict[str, Any]) -> dict[str, int]:
         "recent_errors": sum(
             len(lg.get("recent_errors", [])) for lg in live.get("logs", [])
         ),
+        "pressure_warnings": len(pressure_warnings),
     }
 
 
@@ -3344,6 +3401,8 @@ def _focus_emit_summary(payload: dict[str, Any], summary: dict[str, int], cid: s
     print(f"  Checks:    {summary['checks_passing']}/{summary['checks_total']} passing")
     if summary["recent_errors"]:
         print(f"  Errors:    {summary['recent_errors']} recent error(s) in logs")
+    if summary.get("pressure_warnings"):
+        print(f"  Pressure:  {summary['pressure_warnings']} warning(s); run pressure-report before cleanup/build storms")
 
 
 def _focus_initial_state(

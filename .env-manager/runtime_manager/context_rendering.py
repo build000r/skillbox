@@ -78,6 +78,60 @@ def _context_tooling_lines() -> list[str]:
     ]
 
 
+def _context_pressure_lines(model: dict[str, Any]) -> list[str]:
+    root_dir = Path(str(model.get("root_dir") or DEFAULT_ROOT_DIR))
+    advisory = runtime_pressure_advisory(root_dir)
+    if not advisory.get("ok", True):
+        return [
+            "## Pressure And Offload Policy",
+            "",
+            "- Pressure advisory could not be collected; run `python3 .env-manager/manage.py pressure-report --format json`.",
+            "- Do not delete files, install hooks, or mutate ballast from this context alone.",
+            "",
+        ]
+    disk = advisory.get("local_disk") or {}
+    target = advisory.get("target_worker") or {}
+    rch = advisory.get("rch") or {}
+    sbh = advisory.get("sbh") or {}
+    protected = ", ".join(
+        f"{entry.get('id')} `{entry.get('path')}`"
+        for entry in advisory.get("protected_paths") or []
+    ) or "none declared"
+    excluded = ", ".join(str(item) for item in target.get("excluded_box_ids") or []) or "none"
+    lines = [
+        "## Pressure And Offload Policy",
+        "",
+        (
+            f"- Local disk: {disk.get('free_gib')}GiB free "
+            f"({disk.get('free_percent')}%, {disk.get('pressure_level')})."
+        ),
+        (
+            f"- Build worker target: `{target.get('id')}` "
+            f"state={target.get('state') or 'unknown'} "
+            f"tailscale={target.get('tailscale_hostname') or target.get('tailscale_ip') or 'unknown'}; "
+            f"excluded targets: {excluded}."
+        ),
+        (
+            f"- RCH: state={rch.get('state')} worker={rch.get('worker_state')} "
+            f"fail-open={rch.get('fail_open_expected')} hook-install-allowed={rch.get('hook_install_allowed')}."
+        ),
+        (
+            f"- SBH: state={sbh.get('state')} daemon={sbh.get('daemon_state')} "
+            f"auto-delete={sbh.get('auto_delete_allowed')} ballast-mutation={sbh.get('ballast_mutation_allowed')}."
+        ),
+        f"- Protected no-touch paths: {protected}.",
+        "- Safe first commands: `python3 .env-manager/manage.py pressure-report --format json`; "
+        "`python3 .env-manager/manage.py rch-report --format json`; "
+        "`python3 .env-manager/manage.py sbh-report --format json`.",
+        "- Do not run cleanup, hook installation, service installation, protect writes, or ballast mutation without explicit approval.",
+        "",
+    ]
+    warnings = advisory.get("warnings") or []
+    if warnings:
+        lines.insert(-1, "- Current warnings: " + " ".join(str(warning) for warning in warnings))
+    return lines
+
+
 def _context_repo_lines(model: dict[str, Any]) -> list[str]:
     repos = model.get("repos") or []
     if not repos:
@@ -234,6 +288,7 @@ def generate_context_markdown(model: dict[str, Any]) -> str:
     lines.extend(_context_header_lines(make_suffix))
     lines.extend(_context_environment_lines(model, active_clients, active_profiles, clients_data))
     lines.extend(_context_tooling_lines())
+    lines.extend(_context_pressure_lines(model))
     lines.extend(_context_repo_lines(model))
     lines.extend(_context_service_lines(model, make_suffix))
     lines.extend(_context_task_lines(model, make_suffix))
@@ -300,6 +355,8 @@ def _session_state_lines(session_states: list[dict[str, Any]]) -> list[str]:
 
 def _collect_attention_items(live_state: dict[str, Any], svc_states: list[dict[str, Any]]) -> list[str]:
     attention: list[str] = []
+    for warning in (live_state.get("pressure_advisory") or {}).get("warnings") or []:
+        attention.append(f"PRESSURE: {warning}")
     for check in live_state.get("checks") or []:
         if not check.get("ok"):
             attention.append(f"CHECK FAIL: **{check['id']}** ({check['type']})")

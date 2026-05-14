@@ -69,6 +69,36 @@ runtime_artifacts:
       Destructive command guard binary. PreToolUse hook AND MCP server
       for proactive command safety checking.
 
+  - id: rch-bin
+    path: /home/sandbox/.local/bin/rch
+    required: false
+    notes: Optional Remote Compilation Helper CLI for pressure-aware build offload.
+
+  - id: rchd-bin
+    path: /home/sandbox/.local/bin/rchd
+    required: false
+    notes: Optional RCH daemon binary.
+
+  - id: rch-worker-bin
+    path: /home/sandbox/.local/bin/rch-wkr
+    required: false
+    notes: Optional RCH worker binary for build-worker boxes.
+
+  - id: rch-workers-config
+    path: /home/sandbox/.config/rch/workers.toml
+    required: false
+    notes: Optional RCH worker inventory config for approved non-production targets.
+
+  - id: sbh-bin
+    path: /home/sandbox/.local/bin/sbh
+    required: false
+    notes: Optional Storage Ballast Helper CLI for observe-first disk-pressure guardrails.
+
+  - id: sbh-config
+    path: /home/sandbox/.config/sbh/config.toml
+    required: false
+    notes: Optional SBH observe-mode config; missing means storage guard is not configured.
+
 connector_source_repos:
   - id: flywheel-connectors
     path: /workspace/repos/flywheel_connectors
@@ -161,3 +191,15 @@ runtime_services:
       DCG MCP server. Agents can proactively check command safety
       via check_command, scan files for destructive patterns, and
       get explanations for why a pattern was flagged.
+
+  - id: rchd
+    kind: daemon
+    owner: local
+    required: false
+    notes: Optional RCH daemon for remote build/test offload; enabled only in the pressure-tools profile.
+
+  - id: sbh-daemon
+    kind: daemon
+    owner: local
+    required: false
+    notes: Optional SBH observe-mode daemon for disk-pressure monitoring; enabled only in the pressure-tools profile.

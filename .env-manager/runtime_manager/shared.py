@@ -117,6 +117,12 @@ PATH_LIKE_ENV_KEYS = {
     "SKILLBOX_SWIMMERS_INSTALL_DIR",
     "SKILLBOX_SWIMMERS_BIN",
     "SKILLBOX_DCG_BIN",
+    "SKILLBOX_RCH_BIN",
+    "SKILLBOX_RCHD_BIN",
+    "SKILLBOX_RCH_WORKER_BIN",
+    "SKILLBOX_RCH_WORKERS_CONFIG",
+    "SKILLBOX_SBH_BIN",
+    "SKILLBOX_SBH_CONFIG",
     "SKILLBOX_CASS_BIN",
     "SKILLBOX_CM_BIN",
     "SKILLBOX_APR_BIN",
@@ -412,6 +418,8 @@ def next_actions_for_doctor(results: list["CheckResult"]) -> list[str]:
 
 def next_actions_for_status(status_payload: dict[str, Any]) -> list[str]:
     actions: list[str] = []
+    pressure_advisory = status_payload.get("pressure_advisory") or {}
+    pressure_warnings = pressure_advisory.get("warnings") or []
 
     stopped_services = [
         s for s in status_payload.get("services", [])
@@ -432,6 +440,14 @@ def next_actions_for_status(status_payload: dict[str, Any]) -> list[str]:
         actions.append("bootstrap --format json")
     if stopped_services:
         actions.append("up --format json")
+    if pressure_warnings:
+        for action in (
+            "pressure-report --format json",
+            "rch-report --format json",
+            "sbh-report --format json",
+        ):
+            if action not in actions:
+                actions.append(action)
     if not actions:
         actions.append("doctor --format json")
     return actions
