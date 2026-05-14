@@ -2865,6 +2865,7 @@ class ValidationAndMmdxHotspotTests(unittest.TestCase):
                 "returned": 2,
                 "scanned": 20,
                 "truncated": True,
+                "import_candidate_note": "Generated/build artifact roots are omitted.",
                 "matches": [
                     {"rel_path": "docs/a.mmdx", "score": 9},
                     {"rel_path": "docs/b.mmdx", "score": 7},
@@ -2874,6 +2875,7 @@ class ValidationAndMmdxHotspotTests(unittest.TestCase):
         )
         self.assertEqual(stderr_lines, [])
         self.assertIn("path: docs/a.mmdx", stdout_lines)
+        self.assertIn("note: Generated/build artifact roots are omitted.", stdout_lines)
         self.assertIn("url: http://127.0.0.1:8080", stdout_lines)
         self.assertIn(f"truncated: true (scan limit {mmdx_open_module.MMDX_MAX_SCAN_FILES})", stdout_lines)
         self.assertIn("alternates:", stdout_lines)

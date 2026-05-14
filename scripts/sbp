@@ -3,7 +3,6 @@
 set -euo pipefail
 
 client="${SKILLBOX_CLIENT:-}"
-runtime_client="${client:-personal}"
 profile="${SKILLBOX_PROFILE:-local-all}"
 mode="${SKILLBOX_MODE:-reuse}"
 action="home"
@@ -62,6 +61,7 @@ Usage:
   __WRAPPER__ launch DIR... --request "..."  Launch one Swimmers agent per dir
   __WRAPPER__ bulk DIR... --request "..."    Alias for launch
   __WRAPPER__ recalibrate [args...]   Read-only cwd skill add/remove recalibration
+  __WRAPPER__ candidates [args...]    Explore linkable skill sources for this cwd
   __WRAPPER__ mcp [args...]           Read-only Claude JSON / Codex TOML MCP audit
   __WRAPPER__ beads [status|init|sync] Check or initialize repo-local beads state
   __WRAPPER__ mmdx QUERY              Fuzzy-find and open .mmdx/.mmd from this cwd
@@ -100,6 +100,7 @@ Examples:
   __WRAPPER__ status core --json
   __WRAPPER__ down core api --dry-run --json
   __WRAPPER__ skills --issues-only
+  __WRAPPER__ candidates --json
   __WRAPPER__ recalibrate
   __WRAPPER__ mcp
   __WRAPPER__ beads status
@@ -143,6 +144,7 @@ payload = {
         {"name": "restart", "json": True, "safe_first_try": f"{wrapper} restart <profile> <service> --dry-run --json"},
         {"name": "launch", "json": True, "safe_first_try": f"{wrapper} launch <dir> <dir> --request '<prompt>' --dry-run --json"},
         {"name": "skills", "json": True, "safe_first_try": f"{wrapper} skills --issues-only --json"},
+        {"name": "candidates", "json": True, "safe_first_try": f"{wrapper} candidates --json"},
         {"name": "mcp", "json": True, "safe_first_try": f"{wrapper} mcp --json"},
         {"name": "recalibrate", "json": False, "safe_first_try": f"{wrapper} recalibrate"},
     ],
@@ -188,6 +190,7 @@ Start here:
   ${wrapper_name} capabilities --json
   ${wrapper_name} status --json
   ${wrapper_name} skills --issues-only --json
+  ${wrapper_name} candidates --json
   ${wrapper_name} mcp --json
   ${wrapper_name} --robot-triage
 
@@ -217,12 +220,14 @@ payload = {
     "quick_ref": [
         f"{wrapper} status --json",
         f"{wrapper} skills --issues-only --json",
+        f"{wrapper} candidates --json",
         f"{wrapper} mcp --json",
         f"{wrapper} up <profile> <service> --dry-run --json",
     ],
     "recommendations": [
         {"id": "runtime-status", "command": f"{wrapper} status --json", "why": "Fastest runtime state read."},
         {"id": "skill-drift", "command": f"{wrapper} skills --issues-only --json", "why": "Compact cwd skill-policy view."},
+        {"id": "skill-candidates", "command": f"{wrapper} candidates --json", "why": "Explore linkable source skills before declaring the cwd surface complete."},
         {"id": "mcp-parity", "command": f"{wrapper} mcp --json", "why": "Checks Claude/Codex MCP visibility."},
         {"id": "preview-services", "command": f"{wrapper} up <profile> <service> --dry-run --json", "why": "Preview service actions before mutation."},
     ],
@@ -294,6 +299,10 @@ case "${1:-}" in
     ;;
   recalibrate|calibrate|rc)
     action="recalibrate"
+    shift
+    ;;
+  candidates|candidate|explore|inventory)
+    action="skill-candidates"
     shift
     ;;
   mcp|mcps)
@@ -388,7 +397,7 @@ append_passthrough_token() {
     sync)
       sync_paths+=("${token}")
       ;;
-    skills|skill|overlay|overlay-toggle|recalibrate|mcp-audit|beads|mmdx|operator-booking|swimmers-launch)
+    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|beads|mmdx|operator-booking|swimmers-launch)
       passthrough_args+=("${token}")
       ;;
     *)
@@ -507,6 +516,10 @@ if [[ "${action}" == "skills" && ${#passthrough_args[@]} -gt 0 ]]; then
       action="skill-audit"
       passthrough_args=("${passthrough_args[@]:1}")
       ;;
+    candidates|candidate|explore|inventory)
+      action="skill-candidates"
+      passthrough_args=("${passthrough_args[@]:1}")
+      ;;
     plan|add|move|remove|prune|sync)
       action="skill"
       ;;
@@ -522,7 +535,12 @@ client_flags=()
 if [[ -n "${client}" ]]; then
   client_flags=(--client "${client}")
 fi
-runtime_client_flags=(--client "${runtime_client}")
+runtime_client_flags=()
+if [[ -n "${client}" ]]; then
+  runtime_client_flags=(--client "${client}")
+else
+  runtime_client_flags=(--cwd "${invoke_cwd}")
+fi
 
 cd "${skillbox_root}"
 
@@ -536,6 +554,7 @@ case "${action}" in
     echo "  ${wrapper_name} status --json runtime status"
     echo "  ${wrapper_name} up --dry-run  preview services"
     echo "  ${wrapper_name} skills --issues-only full skill drift check"
+    echo "  ${wrapper_name} candidates   source inventory for definitely/maybe/no review"
     echo "  ${wrapper_name} mcp           Claude/Codex MCP config parity"
     echo "  ${wrapper_name} skills --full full skill view"
     echo "  ${wrapper_name} help          command reference"
@@ -594,6 +613,9 @@ PY
     ;;
   skills)
     python3 .env-manager/manage.py skills "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    ;;
+  skill-candidates)
+    python3 .env-manager/manage.py skills "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" --show-sources --full --no-global "${passthrough_args[@]}"
     ;;
   skill-audit)
     python3 .env-manager/manage.py skill-audit "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
@@ -678,6 +700,7 @@ else:
       echo
       echo "broader checks:"
       echo "  sbp mcp"
+      echo "  sbp candidates --json"
       echo "  sbp recalibrate --fleet --limit 20"
       echo "  sbp skill prune --from global --dry-run"
       echo "  sbp overlay activate marketing --cwd \"${recalibrate_cwd}\""

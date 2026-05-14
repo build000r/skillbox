@@ -326,6 +326,25 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "skillbox_parity_report",
+        "description": (
+            "Read-only dev/prod parity report for one client. Compares runtime routes, env files, "
+            "healthchecks, deploy modes, and network assumptions against the client's production_stack "
+            "contract and returns ready/missing/drift/deferred/not_assessed rows."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["client_id"],
+            "properties": {
+                "client_id": {
+                    "type": "string",
+                    "description": "Existing client slug to report on, for example 'personal'.",
+                },
+                "profile": _PROFILE_PROP,
+            },
+        },
+    },
+    {
         "name": "skillbox_skill",
         "description": (
             "Plan or apply one skill lifecycle action: add/link, activate, move, remove, prune, or sync "
@@ -1445,6 +1464,7 @@ _DISPATCH: dict[str, tuple[str, str | None]] = {
     "skillbox_skills":      ("skills",      None),
     "skillbox_skill_audit": ("skill-audit", None),
     "skillbox_mcp_audit":   ("mcp-audit",   None),
+    "skillbox_parity_report": ("parity-report", "client_id"),
     "skillbox_skill":       ("skill",       "action"),
     "skillbox_overlay":     ("overlay",     "action"),
     "skillbox_mmdx_open":   ("mmdx",        None),

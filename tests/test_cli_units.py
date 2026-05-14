@@ -63,6 +63,8 @@ class CliUnitTests(unittest.TestCase):
         )
         client_project = next(command for command in payload["commands"] if command["name"] == "client-project")
         self.assertIn("--dry-run", client_project["safe_first_try"])
+        parity_report = next(command for command in payload["commands"] if command["name"] == "parity-report")
+        self.assertIn("parity-report <client> --format json", parity_report["safe_first_try"])
 
     def test_robot_docs_guide_is_available_in_tool(self) -> None:
         result = subprocess.run(
@@ -78,6 +80,7 @@ class CliUnitTests(unittest.TestCase):
         self.assertIn("Skillbox agent guide", result.stdout)
         self.assertIn("capabilities --json", result.stdout)
         self.assertIn("Safe mutation pattern", result.stdout)
+        self.assertIn("parity-report <client>", result.stdout)
         self.assertIn("swimmers-launch <dirs...>", result.stdout)
 
     def test_swimmers_launch_cli_dry_run_resolves_against_invoke_cwd(self) -> None:

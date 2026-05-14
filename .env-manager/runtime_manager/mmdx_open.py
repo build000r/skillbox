@@ -15,6 +15,24 @@ MMDX_EXTENSIONS = (".mmdx", ".mmd")
 MMDX_DEFAULT_LIMIT = 8
 MMDX_MAX_SCAN_FILES = 20000
 MMDX_MIN_MATCH_SCORE = 0.65
+MMDX_GENERATED_ROOT_DIRS = {
+    ".next",
+    ".nyc_output",
+    ".open-next",
+    ".output",
+    ".parcel-cache",
+    ".svelte-kit",
+    ".turbo",
+    ".vercel",
+    ".vite",
+    "coverage",
+    "htmlcov",
+    "out",
+}
+MMDX_IMPORT_CANDIDATE_NOTE = (
+    "Generated/build artifact roots are omitted from MMDX discovery; "
+    "import canonical source files such as docs/diagrams/*.mmdx instead."
+)
 MMDX_SKIP_DIRS = {
     ".cache",
     ".git",
@@ -29,7 +47,6 @@ MMDX_SKIP_DIRS = {
     "__pycache__",
     "build",
     "builds",
-    "coverage",
     "dist",
     "invocations",
     "logs",
@@ -38,7 +55,7 @@ MMDX_SKIP_DIRS = {
     "skill-repos",
     "target",
     "vendor",
-}
+} | MMDX_GENERATED_ROOT_DIRS
 
 
 class MmdxOpenError(RuntimeError):
@@ -184,13 +201,28 @@ def _is_relative_to(path: Path, root: Path) -> bool:
         return False
 
 
+def _generated_root_for_path(path: Path) -> str | None:
+    for part in path.parts:
+        if part in MMDX_GENERATED_ROOT_DIRS:
+            return part
+    return None
+
+
+def _is_generated_mmdx_candidate(path: Path) -> bool:
+    return _generated_root_for_path(path) is not None
+
+
 def _candidate_from_exact_query(cwd: Path, variants: list[str]) -> Path | None:
     for variant in variants:
         raw = Path(os.path.expandvars(os.path.expanduser(variant)))
         candidates = [raw] if raw.is_absolute() else [cwd / raw, raw]
         for candidate in candidates:
             path = candidate.resolve(strict=False)
-            if path.is_file() and path.suffix.lower() in MMDX_EXTENSIONS:
+            if (
+                path.is_file()
+                and path.suffix.lower() in MMDX_EXTENSIONS
+                and not _is_generated_mmdx_candidate(path)
+            ):
                 return path
     return None
 
@@ -214,6 +246,9 @@ def _iter_mmdx_files(roots: list[Path]) -> tuple[list[Path], bool]:
         if not root.is_dir():
             continue
         for current, dirnames, filenames in os.walk(root):
+            if _is_generated_mmdx_candidate(Path(current).resolve(strict=False)):
+                dirnames[:] = []
+                continue
             dirnames[:] = [
                 dirname for dirname in sorted(dirnames)
                 if dirname not in MMDX_SKIP_DIRS and not dirname.startswith(".tmp")
@@ -221,6 +256,8 @@ def _iter_mmdx_files(roots: list[Path]) -> tuple[list[Path], bool]:
             for filename in sorted(filenames):
                 path = Path(current) / filename
                 if path.suffix.lower() not in MMDX_EXTENSIONS:
+                    continue
+                if _is_generated_mmdx_candidate(path.resolve(strict=False)):
                     continue
                 key = str(path.resolve(strict=False))
                 if key in seen:
@@ -595,6 +632,8 @@ def _mmdx_payload(
         "selected": selected,
         "matches": matches,
         "open": bool(open_file),
+        "excluded_generated_roots": sorted(MMDX_GENERATED_ROOT_DIRS),
+        "import_candidate_note": MMDX_IMPORT_CANDIDATE_NOTE,
         "next_actions": _mmdx_next_actions(selected),
     }
     if opened is not None:
@@ -713,6 +752,8 @@ def mmdx_payload_text_lines(payload: dict[str, Any]) -> tuple[list[str], list[st
         f"mmdx: {payload.get('action')}",
         f"cwd: {payload.get('cwd')}",
     ]
+    if payload.get("import_candidate_note"):
+        lines.append(f"note: {payload['import_candidate_note']}")
     lines.extend(_mmdx_selected_text_lines(payload))
     viewer = payload.get("viewer") or {}
     if viewer.get("url"):

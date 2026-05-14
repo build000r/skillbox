@@ -72,6 +72,51 @@ class MmdxOpenTests(unittest.TestCase):
         self.assertEqual(payload["selected"]["path"], str(target.resolve()))
         self.assertGreaterEqual(payload["returned"], 2)
 
+    def test_inventory_excludes_generated_roots_for_import_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            canonical = repo / "docs" / "diagrams" / "runtime-drift-demo.mmdx"
+            generated_open_next = (
+                repo
+                / ".open-next"
+                / "server-functions"
+                / "default"
+                / "docs"
+                / "diagrams"
+                / "runtime-drift-demo.mmdx"
+            )
+            generated_next = repo / ".next" / "server" / "docs" / "diagrams" / "other.mmdx"
+            generated_coverage = repo / "coverage" / "docs" / "diagrams" / "coverage-copy.mmdx"
+            _write_mmdx(canonical)
+            _write_mmdx(generated_open_next)
+            _write_mmdx(generated_next)
+            _write_mmdx(generated_coverage)
+            os.utime(canonical, (100, 100))
+            os.utime(generated_open_next, (300, 300))
+            os.utime(generated_next, (400, 400))
+            os.utime(generated_coverage, (500, 500))
+
+            payload, exit_code = MODULE.mmdx_open_payload(
+                root_dir=ROOT_DIR,
+                cwd=repo,
+                query_parts=[],
+                open_file=False,
+                limit=10,
+            )
+
+        self.assertEqual(exit_code, MODULE.EXIT_OK)
+        self.assertEqual(payload["action"], "listed")
+        self.assertEqual(payload["scanned"], 1)
+        self.assertEqual(payload["returned"], 1)
+        self.assertEqual(payload["matches"][0]["rel_path"], "docs/diagrams/runtime-drift-demo.mmdx")
+        self.assertEqual(payload["matches"][0]["modified_at"], "1970-01-01T00:01:40Z")
+        reported_paths = " ".join(match["rel_path"] for match in payload["matches"])
+        self.assertNotIn(".open-next", reported_paths)
+        self.assertNotIn(".next", reported_paths)
+        self.assertNotIn("coverage", reported_paths)
+        self.assertIn(".open-next", payload["excluded_generated_roots"])
+        self.assertIn("canonical source files", payload["import_candidate_note"])
+
     def test_open_invokes_mmd_script_with_selected_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)

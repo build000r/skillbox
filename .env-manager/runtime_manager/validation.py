@@ -136,6 +136,7 @@ FILTER_MODEL_SCOPED_SECTIONS = (
     "logs",
     "checks",
     "bridges",
+    "service_mode_commands",
     "ingress_routes",
 )
 

@@ -866,6 +866,9 @@ def _collect_client_metadata(
             client_meta["dcg"] = client["dcg"]
         if client.get("context"):
             client_meta["context"] = client["context"]
+        for contract_key in ("production_stack", "prod_stack", "dev_prod_parity"):
+            if isinstance(client.get(contract_key), dict):
+                client_meta[contract_key] = copy.deepcopy(client[contract_key])
         clients_meta.append(client_meta)
         _extend_sections_with_client_items(sections, client_id, client)
 

@@ -163,6 +163,21 @@ into a risk-first packet. It also marks important hardening domains that are not
 yet proven by the public runtime graph, such as backup/restore drills and cost
 review, as `not_assessed`.
 
+Use `parity-report` before claiming a client is shaped like production:
+
+```bash
+python3 .env-manager/manage.py parity-report personal --format json
+```
+
+The report is read-only. It compares the selected client's runtime graph
+against the client's `production_stack` contract in its overlay, covering
+reverse-proxy routes, env-file expectations, health endpoints, deploy modes,
+optional network assumptions, and the existing runtime parity ledger. Rows are
+classified as `ready`, `missing`, `drift`, `deferred`, or `not_assessed`; JSON
+output includes the source declaration, expected contract, actual runtime
+evidence, and next safe action for every non-ready row. `stewardship-report`
+includes a compact dev/prod parity evidence summary.
+
 ## Local Runtime Profiles
 
 Client overlays declare **local runtime profiles** — namespaced service groups
@@ -795,6 +810,7 @@ make runtime-sync
 | `.env-manager/manage.py context` | Generate CLAUDE.md and AGENTS.md from the resolved runtime graph | `python3 .env-manager/manage.py context --client personal` |
 | `.env-manager/manage.py focus` | Activate a client with live state and enriched context | `python3 .env-manager/manage.py focus personal --format json` |
 | `.env-manager/manage.py stewardship-report` | Build a client-scoped operator evidence packet with risks, proof, and not-assessed hardening gaps | `python3 .env-manager/manage.py stewardship-report personal --format md --write` |
+| `.env-manager/manage.py parity-report` | Compare a client runtime graph against its production-stack parity contract | `python3 .env-manager/manage.py parity-report personal --format json` |
 | `.env-manager/manage.py render` | Print the resolved internal runtime graph | `python3 .env-manager/manage.py render --format json` |
 | `.env-manager/manage.py sync` | Create managed repo/artifact/log directories and install declared skills for the selected core/client scope | `python3 .env-manager/manage.py sync --client personal --dry-run` |
 | `.env-manager/manage.py doctor` | Validate the internal repos/skills/logs/check graph for the selected core/client scope | `python3 .env-manager/manage.py doctor --client personal` |
@@ -1189,7 +1205,9 @@ current cwd but are not available yet.
 
 Use `--issues-only` for a compact agent/operator check, and `--show-sources`
 when you intentionally want the larger inventory of source-tree skills that are
-not currently synced.
+not currently synced. The `sbp candidates` wrapper is the short exploratory
+path for that larger inventory when a clean policy check is not enough and the
+agent needs to consider every linkable source skill.
 
 Use `skill-audit` when the question is broader than the current cwd. It scans
 the configured downstream repo roots from `skill-scope.yaml`, reports repo-local
@@ -1265,6 +1283,7 @@ make wrappers-install
 sbp
 sbp help
 sbp skills --issues-only
+sbp candidates --json
 sbp recalibrate
 sbp mcp
 sbp recalibrate --fleet --limit 20
@@ -1284,11 +1303,15 @@ sbo mmdx review
 `sbp` with no args is intentionally read-only: it prints a fast cwd-aware skill
 home view and next commands, skipping the slower global scan. Skill and overlay
 commands infer the active client from the downstream cwd unless
-`SKILLBOX_CLIENT` is set; runtime service commands keep the existing
-`personal` default unless overridden. Runtime mutation is explicit with
+`SKILLBOX_CLIENT` is set; wrapper runtime service commands pass the downstream
+cwd through for the same client inference. Direct `manage.py` runtime calls
+still use the configured default unless you pass `--client` or `--cwd`.
+Runtime mutation is explicit with
 `sbp up`, `sbp down`, `sbp restart`, or `sbp skill ...`; use
 `sbp skills --issues-only` for the full global/project drift check and
-`sbp recalibrate` for the cwd-local add/remove recommendation, and
+`sbp candidates` for the full cwd-local linkable source inventory before
+bucketing candidates into definitely, maybe, and no. Use `sbp recalibrate` for
+the cwd-local add/remove recommendation, and
 `sbp skills audit` or `sbp recalibrate --fleet` for the cross-repo map.
 `sbp recalibrate` prints the dry-run sync/prune commands for the current repo
 and the Claude/Codex MCP parity check; the fleet form prints the narrow dry-run

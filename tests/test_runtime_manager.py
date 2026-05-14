@@ -5020,6 +5020,105 @@ class RuntimeManagerTests(unittest.TestCase):
         )
         self._install_absolute_mcp_stub(self._fixture_mcp_stub_path(repo, "cm"), tool_names=["memory_search"])
 
+    def _write_personal_parity_contract(self, repo: Path, *, drift: bool = False) -> None:
+        overlay_path = self._clients_host_root(repo) / "personal" / "overlay.yaml"
+        overlay_doc = MANAGE_MODULE.load_yaml(overlay_path)
+        client = overlay_doc.setdefault("client", {})
+        client.setdefault("env_files", []).append(
+            {
+                "id": "app-env",
+                "kind": "dotenv",
+                "repo": "personal-root",
+                "path": "${SKILLBOX_MONOSERVER_ROOT}/.env.local",
+                "required": True,
+                "required_keys": ["DATABASE_URL"],
+                "source": {"kind": "file", "path": "./workspace/secrets/clients/personal/app.env"},
+                "sync": {"mode": "write"},
+            }
+        )
+        client.setdefault("services", []).append(
+            {
+                "id": "app-dev",
+                "kind": "http",
+                "repo": "personal-root",
+                "origin_url": "http://127.0.0.1:4010",
+                "commands": {"skillbox-local": "npm run dev"},
+                "networks": ["skillbox-dev"],
+                "healthcheck": {
+                    "type": "http",
+                    "url": "http://127.0.0.1:4010/health",
+                    "timeout_seconds": 1,
+                },
+            }
+        )
+        client.setdefault("ingress_routes", []).append(
+            {
+                "id": "app-route",
+                "service_id": "app-dev",
+                "listener": "private",
+                "path": "/app",
+                "match": "prefix",
+            }
+        )
+        client.setdefault("parity_ledger", []).append(
+            {
+                "id": "app-dev-runtime",
+                "surface_type": "service",
+                "legacy_surface": "app-dev",
+                "ownership_state": "covered",
+                "action": "build",
+            }
+        )
+        client["production_stack"] = {
+            "reverse_proxy": {
+                "routes": [
+                    {
+                        "id": "app-route",
+                        "service": "app-dev",
+                        "listener": "private",
+                        "path": "/prod" if drift else "/app",
+                        "match": "prefix",
+                        "upstream": "http://127.0.0.1:4010",
+                    }
+                ]
+            },
+            "env": {
+                "files": [
+                    {
+                        "id": "app-env",
+                        "path": "${SKILLBOX_MONOSERVER_ROOT}/.env.local",
+                        "required_keys": ["DATABASE_URL", "SPAPS_AUTH_BASE_URL"] if drift else ["DATABASE_URL"],
+                    }
+                ]
+            },
+            "healthchecks": {
+                "services": [
+                    {
+                        "service": "app-dev",
+                        "type": "http",
+                        "target": "http://127.0.0.1:4010/ready" if drift else "http://127.0.0.1:4010/health",
+                        "timeout_seconds": 1,
+                    }
+                ]
+            },
+            "deploy": {
+                "modes": [
+                    {
+                        "service": "app-dev",
+                        "mode": "prod" if drift else "skillbox-local",
+                        "command": "npm run dev",
+                    }
+                ]
+            },
+            "networks": [
+                {
+                    "service": "app-dev",
+                    "name": "skillbox-prod" if drift else "skillbox-dev",
+                }
+            ],
+        }
+        overlay_path.write_text(MANAGE_MODULE.render_yaml_document(overlay_doc), encoding="utf-8")
+
     def _ingress_model(self, repo: Path) -> dict:
         return {
             "root_dir": str(repo),
@@ -6055,6 +6154,136 @@ class RuntimeManagerTests(unittest.TestCase):
                 {service["id"] for service in payload["live_state"]["services"]},
                 {"internal-env-manager", "cm-mcp", "fwc-mcp", "dcg-mcp"},
             )
+
+    def test_parity_report_without_contract_is_explicitly_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+
+            result = self._run(repo, "parity-report", "personal", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertFalse(payload["ok"])
+            self.assertFalse(payload["ready"])
+            self.assertFalse(payload["contract_present"])
+            self.assertEqual(payload["status"], "not_ready")
+            self.assertEqual(payload["summary"]["domains"]["not_assessed"], 6)
+
+    def test_parity_report_supports_cwd_client_inference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            matched = repo / ".skillbox-state" / "monoserver"
+            overlay_path = self._clients_host_root(repo) / "personal" / "overlay.yaml"
+            overlay_doc = MANAGE_MODULE.load_yaml(overlay_path)
+            overlay_doc.setdefault("client", {})["context"] = {"cwd_match": [str(matched)]}
+            overlay_path.write_text(MANAGE_MODULE.render_yaml_document(overlay_doc), encoding="utf-8")
+
+            result = self._run(repo, "parity-report", "--cwd", str(matched), "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["client_id"], "personal")
+
+    def test_parity_report_json_marks_ready_contract_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._write_personal_parity_contract(repo)
+
+            result = self._run(repo, "parity-report", "personal", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["client_id"], "personal")
+            self.assertTrue(payload["contract_present"])
+            self.assertEqual(payload["summary"]["domains"]["ready"], 6)
+            self.assertEqual(payload["blocking_count"], 0)
+            domain_statuses = {domain["id"]: domain["status"] for domain in payload["domains"]}
+            self.assertEqual(domain_statuses["reverse_proxy"], "ready")
+            self.assertEqual(domain_statuses["env"], "ready")
+            self.assertEqual(domain_statuses["healthcheck"], "ready")
+            self.assertEqual(domain_statuses["deploy_mode"], "ready")
+            self.assertEqual(domain_statuses["network"], "ready")
+
+    def test_parity_report_reports_drift_and_stewardship_risk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._write_personal_parity_contract(repo, drift=True)
+
+            result = self._run(repo, "parity-report", "personal", "--format", "json")
+
+            self.assertEqual(result.returncode, MANAGE_MODULE.EXIT_DRIFT, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertFalse(payload["ok"])
+            self.assertGreaterEqual(payload["blocking_count"], 4)
+            domain_statuses = {domain["id"]: domain["status"] for domain in payload["domains"]}
+            self.assertEqual(domain_statuses["reverse_proxy"], "drift")
+            self.assertEqual(domain_statuses["env"], "drift")
+            self.assertEqual(domain_statuses["healthcheck"], "drift")
+            self.assertEqual(domain_statuses["deploy_mode"], "missing")
+            self.assertEqual(domain_statuses["network"], "drift")
+            self.assertTrue(any(finding.get("next_action") for finding in payload["findings"]))
+
+            stewardship = self._run(repo, "stewardship-report", "personal", "--format", "json")
+            self.assertEqual(stewardship.returncode, 0, stewardship.stderr)
+            stewardship_payload = json.loads(stewardship.stdout)
+            self.assertEqual(stewardship_payload["evidence"]["dev_prod_parity"]["status"], "drift")
+            risk_ids = {risk["id"] for risk in stewardship_payload["risks"]}
+            self.assertIn("dev-prod-parity-drift", risk_ids)
+
+    def test_parity_report_scopes_service_mode_commands_by_client(self) -> None:
+        from runtime_manager.parity_report import collect_dev_prod_parity_report
+
+        model = {
+            "selection": {},
+            "clients": [
+                {
+                    "id": "alpha",
+                    "production_stack": {
+                        "deploy": {
+                            "modes": [
+                                {
+                                    "service": "app-dev",
+                                    "mode": "skillbox-local",
+                                    "command": "npm run dev",
+                                }
+                            ]
+                        }
+                    },
+                },
+                {"id": "beta"},
+            ],
+            "repos": [],
+            "artifacts": [],
+            "env_files": [],
+            "skills": [],
+            "tasks": [],
+            "services": [{"id": "app-dev", "client": "alpha", "profiles": ["core"]}],
+            "logs": [],
+            "checks": [],
+            "bridges": [],
+            "ingress_routes": [],
+            "parity_ledger": [],
+            "service_mode_commands": [
+                {
+                    "id": "app-dev:skillbox-local",
+                    "service_id": "app-dev",
+                    "mode": "skillbox-local",
+                    "command": "npm run dev",
+                    "client": "beta",
+                    "profiles": ["core"],
+                }
+            ],
+        }
+
+        filtered = MANAGE_MODULE.filter_model(model, {"core"}, {"alpha"})
+        payload = collect_dev_prod_parity_report(filtered, client_id="alpha")
+        domain_statuses = {domain["id"]: domain["status"] for domain in payload["domains"]}
+        self.assertEqual(domain_statuses["deploy_mode"], "missing")
 
     def test_stewardship_report_json_summarizes_risks_and_unknowns(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

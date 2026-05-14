@@ -5,6 +5,7 @@ from .validation import *
 from .runtime_ops import *
 from .context_rendering import *
 from .text_renderers import print_local_runtime_error_text
+from .parity_report import collect_dev_prod_parity_report, parity_report_evidence_summary
 from lib.runtime_model import resolve_placeholders
 
 
@@ -2481,6 +2482,52 @@ def _stewardship_parity_risks(
     ]
 
 
+def _stewardship_dev_prod_parity_risks(
+    cid: str,
+    profile_args: str,
+    dev_prod_parity: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    parity = dev_prod_parity or {}
+    if not int(parity.get("blocking_count") or 0):
+        return []
+    return [
+        _stewardship_risk(
+            "dev-prod-parity-drift",
+            "medium",
+            "Client runtime differs from the production-stack parity contract",
+            {
+                "status": parity.get("status"),
+                "blocking_count": parity.get("blocking_count"),
+                "domains": [
+                    domain
+                    for domain in parity.get("domains") or []
+                    if domain.get("status") in {"missing", "drift"}
+                ],
+            },
+            "Fix or explicitly defer missing and drifting dev/prod parity rows before using this client as a prod-shaped staging tier.",
+            [f"parity-report {cid}{profile_args} --format json"],
+        )
+    ]
+
+
+def _stewardship_dev_prod_parity_evidence(filtered_model: dict[str, Any], cid: str) -> dict[str, Any]:
+    try:
+        return parity_report_evidence_summary(
+            collect_dev_prod_parity_report(filtered_model, client_id=cid)
+        )
+    except RuntimeError as exc:
+        return {
+            "status": "not_assessed",
+            "ok": True,
+            "contract_present": False,
+            "blocking_count": 0,
+            "summary": {},
+            "domains": [],
+            "next_actions": [f"parity-report {cid} --format json"],
+            "error": str(exc),
+        }
+
+
 def _stewardship_risks(
     *,
     cid: str,
@@ -2490,6 +2537,7 @@ def _stewardship_risks(
     health: dict[str, Any],
     parity: dict[str, Any],
     doctor: dict[str, Any],
+    dev_prod_parity: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     profile_args = _stewardship_profile_args(active_profiles)
     risks: list[dict[str, Any]] = []
@@ -2500,6 +2548,7 @@ def _stewardship_risks(
     risks.extend(_stewardship_focus_risks(cid, profile_args, focus))
     risks.extend(_stewardship_pulse_risks(cid, pulse))
     risks.extend(_stewardship_parity_risks(cid, profile_args, parity))
+    risks.extend(_stewardship_dev_prod_parity_risks(cid, profile_args, dev_prod_parity))
     return risks
 
 
@@ -2536,6 +2585,7 @@ def _build_stewardship_report(root_dir: Path, cid: str, profiles: list[str]) -> 
     health = _stewardship_health_evidence(status_payload, live)
     sessions = _stewardship_session_evidence(live)
     parity = _stewardship_parity_evidence(status_payload)
+    dev_prod_parity = _stewardship_dev_prod_parity_evidence(filtered_model, cid)
     doctor = _stewardship_doctor_evidence(filtered_model, root_dir)
     risks = _stewardship_risks(
         cid=cid,
@@ -2545,6 +2595,7 @@ def _build_stewardship_report(root_dir: Path, cid: str, profiles: list[str]) -> 
         health=health,
         parity=parity,
         doctor=doctor,
+        dev_prod_parity=dev_prod_parity,
     )
     next_recommendation = (
         str(risks[0].get("recommendation") or "")
@@ -2565,6 +2616,7 @@ def _build_stewardship_report(root_dir: Path, cid: str, profiles: list[str]) -> 
             "doctor": doctor,
             "sessions": sessions,
             "parity_ledger": parity,
+            "dev_prod_parity": dev_prod_parity,
             "repos": [
                 {
                     "id": repo.get("id"),
@@ -2645,6 +2697,7 @@ def _stewardship_markdown_evidence(payload: dict[str, Any]) -> str:
     evidence = payload.get("evidence") or {}
     sessions = evidence.get("sessions") or {}
     parity = evidence.get("parity_ledger") or {}
+    dev_prod_parity = evidence.get("dev_prod_parity") or {}
     doctor = evidence.get("doctor") or {}
     doctor_counts = doctor.get("counts") or {}
     lines = [
@@ -2655,6 +2708,7 @@ def _stewardship_markdown_evidence(payload: dict[str, Any]) -> str:
         f"- Services: {services.get('running', 0)}/{services.get('total', 0)} running",
         f"- Recent log errors: {recent_errors.get('count', 0)}",
         f"- Doctor: {doctor.get('status', 'unknown')} ({doctor_counts.get('fail', 0)} failing)",
+        f"- Dev/prod parity: {dev_prod_parity.get('status', 'not_assessed')} ({dev_prod_parity.get('blocking_count', 0)} blocking)",
     ]
     lines.extend(_stewardship_markdown_doctor_findings(doctor))
     lines.extend(

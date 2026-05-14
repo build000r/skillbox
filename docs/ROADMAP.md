@@ -108,6 +108,14 @@ core box, with health checks passing.
 **Goal:** What runs in the box matches what runs in prod, minus the
 domain/SSL.
 
+First compiler slice is present: `python3 .env-manager/manage.py parity-report
+<client> --format json` reads the selected runtime graph plus the client's
+overlay `production_stack` contract and reports reverse-proxy, env,
+healthcheck, deploy-mode, network, and runtime parity-ledger rows as `ready`,
+`missing`, `drift`, `deferred`, or `not_assessed`. The command is read-only and
+is summarized inside `stewardship-report`; it does not yet generate or apply
+nginx/compose/deploy files.
+
 - **Mirror your prod reverse-proxy config locally.** Take your prod
   `nginx.conf` (or equivalent) and create a `skillbox-dev` variant — same
   upstream blocks, same rate-limit zones, but pointing at local containers

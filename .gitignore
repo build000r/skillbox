@@ -47,3 +47,8 @@ sand/
 /WIZARD_*.md
 /cov_*.json
 refactor/
+
+# beads local database
+.beads/*.db
+.beads/*.db-shm
+.beads/*.db-wal
