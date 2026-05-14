@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import difflib
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Callable
 
@@ -19,6 +21,7 @@ from .mcp_visibility import *
 from .parity_report import *
 from .pressure_report import *
 from .rch_report import *
+from .rch_adapter import *
 from .sbh_report import *
 from .swimmers_launch import launch_swimmers_batch, swimmers_launch_text_lines
 
@@ -57,6 +60,7 @@ MANAGE_COMMAND_NAMES = {
     "parity-report",
     "private-init",
     "pressure-report",
+    "rch-stage",
     "rch-report",
     "sbh-report",
     "render",
@@ -426,6 +430,84 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not run rch; only report configured policy and binary presence.",
     )
+
+    rch_stage_parser = subparsers.add_parser(
+        "rch-stage",
+        help="Prepare or run a no-sudo RCH staging lane with ssh/rsync path translation.",
+    )
+    rch_stage_parser.add_argument("--format", choices=("text", "json"), default="text")
+    rch_stage_parser.add_argument(
+        "--source",
+        default=None,
+        help="Repo/project directory to stage. Defaults to the current working directory.",
+    )
+    rch_stage_parser.add_argument(
+        "--stage-root",
+        default=None,
+        help="Local adapter state root. Defaults to .skillbox-state/rch-adapter.",
+    )
+    rch_stage_parser.add_argument(
+        "--stage-id",
+        default=None,
+        help="Stable stage id for repeatable tests or operator-managed staging.",
+    )
+    rch_stage_parser.add_argument(
+        "--target-box",
+        default=DEFAULT_TARGET_BOX,
+        help="Approved non-production worker target named in manifests.",
+    )
+    rch_stage_parser.add_argument(
+        "--remote-root",
+        default=DEFAULT_ADAPTER_REMOTE_ROOT,
+        help="Writable remote adapter root. Defaults to /srv/skillbox/rch-adapter.",
+    )
+    rch_stage_parser.add_argument(
+        "--rch-binary",
+        default=None,
+        help="RCH binary to execute when --run is set. Defaults to PATH lookup.",
+    )
+    rch_stage_parser.add_argument(
+        "--real-ssh",
+        default=None,
+        help="Underlying ssh command for the adapter wrapper. Defaults to Skillbox managed ssh if present.",
+    )
+    rch_stage_parser.add_argument(
+        "--real-rsync",
+        default=None,
+        help="Underlying rsync command for the adapter wrapper. Defaults to /usr/bin/rsync or PATH.",
+    )
+    rch_stage_parser.add_argument(
+        "--rch-home",
+        default=None,
+        help="HOME to use for RCH config when --run is set.",
+    )
+    rch_stage_parser.add_argument(
+        "--xdg-state-home",
+        default=None,
+        help="Short XDG_STATE_HOME for RCH/OpenSSH control sockets when --run is set.",
+    )
+    rch_stage_parser.add_argument(
+        "--prepare",
+        action="store_true",
+        help="Create the local staging tree, wrappers, source mirror, and manifest without running RCH.",
+    )
+    rch_stage_parser.add_argument(
+        "--run",
+        action="store_true",
+        help="Prepare, then run `rch exec -- <command>` from the staged project.",
+    )
+    rch_stage_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Plan only. This is the default when --prepare/--run are omitted.",
+    )
+    rch_stage_parser.add_argument(
+        "--no-copy",
+        action="store_true",
+        help="Do not mirror source files while preparing. Wrappers and manifest may still be written.",
+    )
+    rch_stage_parser.add_argument("--timeout", type=float, default=1800.0)
+    rch_stage_parser.add_argument("stage_command", nargs=argparse.REMAINDER)
 
     sbh_report_parser = subparsers.add_parser(
         "sbh-report",
@@ -2203,6 +2285,7 @@ def _capabilities_payload(root_dir: Path) -> dict[str, Any]:
             "python3 scripts/04-reconcile.py doctor --format json --skip-compose --skip-skill-sync",
             "python3 .env-manager/manage.py pressure-report --format json",
             "python3 .env-manager/manage.py rch-report --format json",
+            "python3 .env-manager/manage.py rch-stage --dry-run --format json -- cargo check",
             "python3 .env-manager/manage.py sbh-report --format json",
             "python3 scripts/box.py up <box-id> --profile dev-small --dry-run --format json",
         ],
@@ -2256,6 +2339,8 @@ def _safe_first_try_command(name: str) -> str:
         return "manage.py pressure-report --format json"
     if name == "rch-report":
         return "manage.py rch-report --format json"
+    if name == "rch-stage":
+        return "manage.py rch-stage --dry-run --format json -- cargo check"
     if name == "sbh-report":
         return "manage.py sbh-report --format json"
     if name == "parity-report":
@@ -2294,6 +2379,7 @@ Useful command families:
   doctor --format json          Runtime validation checks.
   pressure-report --format json Disk pressure and RCH/SBH posture.
   rch-report --format json      RCH worker/hook readiness without mutation.
+  rch-stage --dry-run -- ...    Plan a no-sudo RCH staging lane.
   sbh-report --format json      SBH observe-first storage guard posture.
   skills --issues-only          Skill visibility issues for the current cwd.
   mcp-audit --format json       Claude/Codex MCP parity audit.
@@ -2306,6 +2392,7 @@ Pressure/offload rule:
   Excluded targets are jeremy, ssh-info, and sweet-potato-prod.
   Protected paths like ~/.codex, ~/.claude, and ~/.ssh are hard no-touch.
   Use pressure-report, rch-report, and sbh-report before expensive builds or cleanup.
+  Use rch-stage --dry-run before any staged remote build; it strips remote delete flags by default.
   Do not install RCH hooks, run SBH cleanup, mutate ballast, or touch production boxes without explicit approval.
 """
 
@@ -2368,6 +2455,7 @@ def _handle_robot_triage(args: argparse.Namespace, root_dir: Path) -> int:
             "doctor": "python3 .env-manager/manage.py doctor --format json",
             "pressure-report": "python3 .env-manager/manage.py pressure-report --format json",
             "rch-report": "python3 .env-manager/manage.py rch-report --format json",
+            "rch-stage": "python3 .env-manager/manage.py rch-stage --dry-run --format json -- cargo check",
             "sbh-report": "python3 .env-manager/manage.py sbh-report --format json",
         },
     }
@@ -2417,6 +2505,72 @@ def _handle_rch_report(args: argparse.Namespace, root_dir: Path) -> int:
     else:
         print("\n".join(rch_report_text_lines(payload)))
     return EXIT_OK
+
+
+def _handle_rch_stage(args: argparse.Namespace, root_dir: Path) -> int:
+    command_parts = list(getattr(args, "stage_command", []) or [])
+    plan = build_rch_stage_plan(
+        root_dir,
+        source=Path(args.source) if getattr(args, "source", None) else None,
+        stage_root=Path(args.stage_root) if getattr(args, "stage_root", None) else None,
+        stage_id=getattr(args, "stage_id", None),
+        command_parts=command_parts,
+        target_box=str(getattr(args, "target_box", DEFAULT_TARGET_BOX) or DEFAULT_TARGET_BOX),
+        remote_root=str(getattr(args, "remote_root", DEFAULT_ADAPTER_REMOTE_ROOT) or DEFAULT_ADAPTER_REMOTE_ROOT),
+        rch_binary=getattr(args, "rch_binary", None),
+        real_ssh=getattr(args, "real_ssh", None),
+        real_rsync=getattr(args, "real_rsync", None),
+        rch_home=Path(args.rch_home) if getattr(args, "rch_home", None) else None,
+        xdg_state_home=Path(args.xdg_state_home) if getattr(args, "xdg_state_home", None) else None,
+    )
+    run_requested = bool(getattr(args, "run", False))
+    prepare_requested = bool(getattr(args, "prepare", False))
+    if run_requested and not plan["command"]["argv"]:
+        plan.update(
+            {
+                "ok": False,
+                "mode": "error",
+                "error": {
+                    "type": "missing_command",
+                    "message": "rch-stage --run requires a command after --, for example: -- cargo check",
+                },
+            }
+        )
+        if args.format == "json":
+            emit_json(plan)
+        else:
+            print(plan["error"]["message"], file=sys.stderr)
+        return EXIT_ERROR
+
+    if run_requested or prepare_requested:
+        plan["mode"] = "run" if run_requested else "prepare"
+        plan["mutates"] = True
+        plan["remote_writes"] = run_requested
+        try:
+            prepare_result = prepare_rch_stage(
+                plan,
+                copy_source=not bool(getattr(args, "no_copy", False)),
+                write_manifest=True,
+            )
+            plan["prepare_result"] = prepare_result
+            if run_requested:
+                result = execute_rch_stage(plan, timeout_seconds=max(1.0, float(getattr(args, "timeout", 1800.0))))
+                plan["result"] = result
+                write_stage_manifest(plan, result=result)
+                plan["ok"] = bool(result.get("ok"))
+            else:
+                plan["result"] = prepare_result
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+            plan["ok"] = False
+            plan["error"] = {"type": exc.__class__.__name__, "message": str(exc)}
+    else:
+        plan["mode"] = "dry_run"
+
+    if args.format == "json":
+        emit_json(plan)
+    else:
+        print("\n".join(rch_stage_text_lines(plan)))
+    return EXIT_OK if plan.get("ok") else EXIT_ERROR
 
 
 def _handle_sbh_report(args: argparse.Namespace, root_dir: Path) -> int:
@@ -2540,6 +2694,7 @@ _EARLY_DISPATCH: dict[str, Callable[[argparse.Namespace, Path], int]] = {
     "robot-triage": _handle_robot_triage,
     "pressure-report": _handle_pressure_report,
     "rch-report": _handle_rch_report,
+    "rch-stage": _handle_rch_stage,
     "sbh-report": _handle_sbh_report,
     "client-init": _handle_client_init,
     "onboard": _handle_onboard,

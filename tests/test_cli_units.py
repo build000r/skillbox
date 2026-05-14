@@ -69,6 +69,8 @@ class CliUnitTests(unittest.TestCase):
         self.assertIn("pressure-report --format json", pressure_report["safe_first_try"])
         rch_report = next(command for command in payload["commands"] if command["name"] == "rch-report")
         self.assertIn("rch-report --format json", rch_report["safe_first_try"])
+        rch_stage = next(command for command in payload["commands"] if command["name"] == "rch-stage")
+        self.assertIn("rch-stage --dry-run --format json", rch_stage["safe_first_try"])
         sbh_report = next(command for command in payload["commands"] if command["name"] == "sbh-report")
         self.assertIn("sbh-report --format json", sbh_report["safe_first_try"])
 
@@ -89,6 +91,7 @@ class CliUnitTests(unittest.TestCase):
         self.assertIn("parity-report <client>", result.stdout)
         self.assertIn("pressure-report --format json", result.stdout)
         self.assertIn("rch-report --format json", result.stdout)
+        self.assertIn("rch-stage --dry-run", result.stdout)
         self.assertIn("sbh-report --format json", result.stdout)
         self.assertIn("portfolio-devbox", result.stdout)
         self.assertIn("sweet-potato-prod", result.stdout)
