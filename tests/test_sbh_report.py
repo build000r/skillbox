@@ -71,6 +71,39 @@ class SbhReportTests(unittest.TestCase):
         self.assertEqual(posture["daemon_state"], "not-running")
         self.assertIn("doctor_pal", posture["failed_probe_ids"])
 
+    def test_text_status_not_running_is_not_misread_as_running(self) -> None:
+        # Regression: 'running' substring used to match inside 'not running' first.
+        probes = [
+            {"id": "status", "ok": True, "json": None, "stdout": "sbh is not running", "stderr": ""},
+        ]
+
+        posture = classify_sbh_posture(True, probes)
+
+        self.assertEqual(posture["daemon_state"], "not-running")
+        self.assertEqual(posture["state"], "remediation")
+
+    def test_text_broken_does_not_match_ok_substring_as_healthy(self) -> None:
+        # Regression: 'ok' is a 2-char substring that lit up inside 'broken'.
+        probes = [
+            {"id": "status", "ok": True, "json": None, "stdout": "", "stderr": "service is broken"},
+        ]
+
+        posture = classify_sbh_posture(True, probes)
+
+        self.assertEqual(posture["daemon_state"], "not-running")
+        self.assertEqual(posture["state"], "remediation")
+
+    def test_doctor_no_failures_text_is_not_a_failure(self) -> None:
+        # Regression: substring 'fail' matched inside 'no failures detected'.
+        probes = [
+            {"id": "doctor_pal", "ok": True, "json": {}, "stdout": "no failures detected", "stderr": ""},
+            {"id": "status", "ok": True, "json": {"daemon_running": True}, "stdout": "", "stderr": ""},
+        ]
+
+        posture = classify_sbh_posture(True, probes)
+
+        self.assertEqual(posture["state"], "observer-ready")
+
     def test_collect_sbh_report_runs_only_safe_probe_commands(self) -> None:
         calls: list[list[str]] = []
 

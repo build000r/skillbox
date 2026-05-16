@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -98,6 +99,16 @@ def _probe_named(probes: list[dict[str, Any]], probe_id: str) -> dict[str, Any] 
     return next((probe for probe in probes if probe.get("id") == probe_id), None)
 
 
+_DOCTOR_FAILURE_WORD_RE = re.compile(
+    r"(?<!no )(?<!zero )(?<!0 )\b(fail(?:ed|ure|ures)?|broken)\b",
+    re.IGNORECASE,
+)
+_DAEMON_NEGATIVE_RE = re.compile(
+    r"\b(not[\s-]+running|no[\s-]+daemon|stopped|failed|broken|dead)\b", re.IGNORECASE
+)
+_DAEMON_POSITIVE_RE = re.compile(r"\b(running|healthy|ready)\b", re.IGNORECASE)
+
+
 def _doctor_has_failure(probes: list[dict[str, Any]]) -> bool:
     doctor = _probe_named(probes, "doctor_pal")
     if doctor is None:
@@ -112,8 +123,8 @@ def _doctor_has_failure(probes: list[dict[str, Any]]) -> bool:
                 return True
         elif isinstance(value, str) and value.lower() in {"fail", "failed", "broken", "critical"}:
             return True
-    text = (str(doctor.get("stdout") or "") + "\n" + str(doctor.get("stderr") or "")).lower()
-    return "fail" in text or "broken" in text
+    text = str(doctor.get("stdout") or "") + "\n" + str(doctor.get("stderr") or "")
+    return bool(_DOCTOR_FAILURE_WORD_RE.search(text))
 
 
 def _daemon_running_from_status(probes: list[dict[str, Any]]) -> bool | None:
@@ -135,11 +146,11 @@ def _daemon_running_from_status(probes: list[dict[str, Any]]) -> bool | None:
                 return False
     if status.get("ok") is False:
         return False
-    text = (str(status.get("stdout") or "") + "\n" + str(status.get("stderr") or "")).lower()
-    if any(marker in text for marker in ("running", "healthy", "ok")):
-        return True
-    if any(marker in text for marker in ("not running", "stopped", "failed", "broken")):
+    text = str(status.get("stdout") or "") + "\n" + str(status.get("stderr") or "")
+    if _DAEMON_NEGATIVE_RE.search(text):
         return False
+    if _DAEMON_POSITIVE_RE.search(text):
+        return True
     return None
 
 

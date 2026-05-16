@@ -60,6 +60,24 @@ class RchReportTests(unittest.TestCase):
         self.assertEqual(posture["total_workers"], 1)
         self.assertFalse(posture["hook"]["installed"])
 
+    def test_hook_inactive_text_is_not_misread_as_active(self) -> None:
+        # Regression: 'active' substring used to fire inside 'inactive', so an
+        # inactive hook was reported as installed=True.
+        probes = [
+            {
+                "id": "status",
+                "ok": True,
+                "json": {"workers": [{"id": "portfolio-devbox", "healthy": True}]},
+                "stdout": "",
+                "stderr": "",
+            },
+            {"id": "hook_status", "ok": True, "json": None, "stdout": "hook is inactive", "stderr": ""},
+        ]
+
+        posture = classify_rch_posture(True, probes)
+
+        self.assertFalse(posture["hook"]["installed"])
+
     def test_no_workers_and_failed_probe_reports_remediation(self) -> None:
         probes = [
             {"id": "status", "ok": True, "json": {"workers": []}, "stdout": "", "stderr": ""},

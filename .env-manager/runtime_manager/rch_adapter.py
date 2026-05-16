@@ -386,7 +386,20 @@ def prepare_rch_stage(plan: dict[str, Any], *, copy_source: bool = True, write_m
     local_alias_root = Path(plan["stage"]["local_alias_root"])
     stage_root.mkdir(parents=True, exist_ok=True)
     local_projects_root.mkdir(parents=True, exist_ok=True)
-    if not local_alias_root.exists():
+    if local_alias_root.is_symlink():
+        try:
+            current_target = os.readlink(local_alias_root)
+        except OSError:
+            current_target = ""
+        if Path(current_target) != local_projects_root:
+            local_alias_root.unlink()
+            local_alias_root.symlink_to(local_projects_root, target_is_directory=True)
+    elif local_alias_root.exists():
+        raise RuntimeError(
+            f"alias path {local_alias_root} exists and is not a symlink; "
+            "remove it manually or pick a different --stage-id"
+        )
+    else:
         local_alias_root.symlink_to(local_projects_root, target_is_directory=True)
     wrappers = write_adapter_wrappers(plan)
     copy_result = None

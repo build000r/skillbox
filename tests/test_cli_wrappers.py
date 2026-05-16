@@ -55,9 +55,39 @@ class CliWrapperTests(unittest.TestCase):
         self.assertEqual(payload["tool"], "skillbox-sbp")
         self.assertIn("stdout_stderr_contract", payload)
         self.assertTrue(any(command["name"] == "candidates" for command in payload["commands"]))
+        launch = next(command for command in payload["commands"] if command["name"] == "launch")
+        bulk = next(command for command in payload["commands"] if command["name"] == "bulk")
+        self.assertEqual(launch["aliases"], ["bulk"])
+        self.assertEqual(bulk["alias_for"], "launch")
         self.assertIn("sbp down <profile> <service> --dry-run --json", payload["safety"]["dry_run_first"])
         self.assertIn("sbp launch <dir> <dir> --request '<prompt>' --dry-run --json", payload["safety"]["dry_run_first"])
-        self.assertEqual(json.loads(triage.stdout)["tool"], "skillbox-sbp")
+        self.assertIn("sbp bulk <dir> <dir> --request '<prompt>' --dry-run --json", payload["safety"]["dry_run_first"])
+        self.assertIn("sbp launch <dir> <dir> --request '<prompt>' --dry-run --json", payload["next_actions"])
+        triage_payload = json.loads(triage.stdout)
+        self.assertEqual(triage_payload["tool"], "skillbox-sbp")
+        self.assertIn("sbp launch <dir> <dir> --request '<prompt>' --dry-run --json", triage_payload["quick_ref"])
+        self.assertTrue(any(item["id"] == "preview-launch" for item in triage_payload["recommendations"]))
+
+    def test_sbp_home_surfaces_batch_launcher_safe_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            downstream = root / "downstream"
+            downstream.mkdir()
+
+            result = self._run_wrapper(SBP, fake_root=fake_root, invoke_cwd=downstream)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sbp launch <dir> <dir> --request '<prompt>' --dry-run --json", result.stdout)
+        self.assertIn("preview Swimmers batch launch (bulk alias)", result.stdout)
+
+    def test_sbp_robot_docs_names_bulk_alias_and_prompt_quoting(self) -> None:
+        result = self._run_wrapper(SBP, "robot-docs", "guide")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sbp bulk <dir> <dir> --request 'Audit auth drift' --dry-run --json", result.stdout)
+        self.assertIn("bulk is an alias for launch", result.stdout)
+        self.assertIn("Use single quotes when prompts contain $smart", result.stdout)
 
     def test_sbp_launch_maps_to_swimmers_launch_without_profile_consuming_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

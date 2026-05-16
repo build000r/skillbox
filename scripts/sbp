@@ -110,7 +110,7 @@ Examples:
   __WRAPPER__ skill add ui --to category --category frontend
   __WRAPPER__ mmdx review
   __WRAPPER__ mmdx skill review --no-open
-  __WRAPPER__ launch ../api ../web --request "Audit auth drift" --dry-run
+  __WRAPPER__ launch ../api ../web --request 'Audit auth drift' --dry-run --json
   __WRAPPER__ hire times --limit 3
   __WRAPPER__ hire book --date 2026-05-06 --slot AM --email person@example.com --name "Person" --send-magic-link
   __WRAPPER__ up backend spaps
@@ -142,7 +142,8 @@ payload = {
         {"name": "up", "json": True, "safe_first_try": f"{wrapper} up <profile> <service> --dry-run --json"},
         {"name": "down", "json": True, "safe_first_try": f"{wrapper} down <profile> <service> --dry-run --json"},
         {"name": "restart", "json": True, "safe_first_try": f"{wrapper} restart <profile> <service> --dry-run --json"},
-        {"name": "launch", "json": True, "safe_first_try": f"{wrapper} launch <dir> <dir> --request '<prompt>' --dry-run --json"},
+        {"name": "launch", "json": True, "safe_first_try": f"{wrapper} launch <dir> <dir> --request '<prompt>' --dry-run --json", "aliases": ["bulk"]},
+        {"name": "bulk", "json": True, "safe_first_try": f"{wrapper} bulk <dir> <dir> --request '<prompt>' --dry-run --json", "alias_for": "launch"},
         {"name": "skills", "json": True, "safe_first_try": f"{wrapper} skills --issues-only --json"},
         {"name": "candidates", "json": True, "safe_first_try": f"{wrapper} candidates --json"},
         {"name": "mcp", "json": True, "safe_first_try": f"{wrapper} mcp --json"},
@@ -164,6 +165,7 @@ payload = {
             f"{wrapper} down <profile> <service> --dry-run --json",
             f"{wrapper} restart <profile> <service> --dry-run --json",
             f"{wrapper} launch <dir> <dir> --request '<prompt>' --dry-run --json",
+            f"{wrapper} bulk <dir> <dir> --request '<prompt>' --dry-run --json",
             f"{wrapper} skill prune --dry-run",
         ],
         "confirm_with_user_before": [f"{wrapper} down <profile> <service>"],
@@ -172,6 +174,7 @@ payload = {
         f"{wrapper} status --json",
         f"{wrapper} skills --issues-only --json",
         f"{wrapper} mcp --json",
+        f"{wrapper} launch <dir> <dir> --request '<prompt>' --dry-run --json",
         f"{wrapper} up <profile> <service> --dry-run --json",
     ],
 }
@@ -203,6 +206,11 @@ Safe mutation pattern:
   ${wrapper_name} down <profile> <service> --dry-run --json
   ${wrapper_name} restart <profile> <service> --dry-run --json
   ${wrapper_name} launch <dir> <dir> --request "..." --dry-run --json
+
+Batch launcher:
+  ${wrapper_name} launch <dir> <dir> --request 'Audit auth drift' --dry-run --json
+  ${wrapper_name} bulk <dir> <dir> --request 'Audit auth drift' --dry-run --json
+  bulk is an alias for launch. Use single quotes when prompts contain \$smart or other \$skill tokens.
 EOF
 }
 
@@ -222,6 +230,7 @@ payload = {
         f"{wrapper} skills --issues-only --json",
         f"{wrapper} candidates --json",
         f"{wrapper} mcp --json",
+        f"{wrapper} launch <dir> <dir> --request '<prompt>' --dry-run --json",
         f"{wrapper} up <profile> <service> --dry-run --json",
     ],
     "recommendations": [
@@ -229,6 +238,7 @@ payload = {
         {"id": "skill-drift", "command": f"{wrapper} skills --issues-only --json", "why": "Compact cwd skill-policy view."},
         {"id": "skill-candidates", "command": f"{wrapper} candidates --json", "why": "Explore linkable source skills before declaring the cwd surface complete."},
         {"id": "mcp-parity", "command": f"{wrapper} mcp --json", "why": "Checks Claude/Codex MCP visibility."},
+        {"id": "preview-launch", "command": f"{wrapper} launch <dir> <dir> --request '<prompt>' --dry-run --json", "why": "Preview Swimmers batch-launch payloads before spawning agents."},
         {"id": "preview-services", "command": f"{wrapper} up <profile> <service> --dry-run --json", "why": "Preview service actions before mutation."},
     ],
 }
@@ -556,6 +566,8 @@ case "${action}" in
     echo "  ${wrapper_name} skills --issues-only full skill drift check"
     echo "  ${wrapper_name} candidates   source inventory for definitely/maybe/no review"
     echo "  ${wrapper_name} mcp           Claude/Codex MCP config parity"
+    echo "  ${wrapper_name} launch <dir> <dir> --request '<prompt>' --dry-run --json"
+    echo "                         preview Swimmers batch launch (bulk alias)"
     echo "  ${wrapper_name} skills --full full skill view"
     echo "  ${wrapper_name} help          command reference"
     ;;
