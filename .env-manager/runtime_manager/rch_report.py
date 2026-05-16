@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
+
+
+_HOOK_NEGATIVE_RE = re.compile(r"\b(not[\s-]+installed|missing|disabled|inactive)\b")
+_HOOK_POSITIVE_RE = re.compile(r"\b(installed|active|enabled)\b")
 
 
 RCH_SAFE_PROBES = (
@@ -95,10 +100,10 @@ def _hook_summary(probes: list[dict[str, Any]]) -> dict[str, Any]:
         return {"known": False, "installed": None}
     text = json.dumps(hook_probe.get("json"), sort_keys=True, default=str).lower()
     text += "\n" + str(hook_probe.get("stdout") or "").lower()
-    if any(marker in text for marker in ("installed", "active", "enabled")) and "not installed" not in text:
-        installed: bool | None = True
-    elif any(marker in text for marker in ("not installed", "missing", "disabled")):
-        installed = False
+    if _HOOK_NEGATIVE_RE.search(text):
+        installed: bool | None = False
+    elif _HOOK_POSITIVE_RE.search(text):
+        installed = True
     else:
         installed = None
     return {

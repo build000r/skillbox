@@ -238,6 +238,57 @@ class RchAdapterTests(unittest.TestCase):
         self.assertIn(plan["remote"]["projects_root"], result.stdout)
         self.assertNotIn("/data/projects/repo", result.stdout)
 
+    def test_prepare_replaces_dangling_alias_symlink(self) -> None:
+        # Regression: a stale symlink pointing at a removed target raised
+        # FileExistsError because Path.exists() follows symlinks and reported
+        # False, while symlink_to() refused to overwrite the existing link.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "repo"
+            source.mkdir()
+            plan = build_rch_stage_plan(
+                root,
+                source=source,
+                stage_root=root / "stage",
+                stage_id="canary",
+                command_parts=["cargo", "check"],
+                real_ssh="/bin/echo",
+                real_rsync="/bin/echo",
+            )
+            alias = Path(plan["stage"]["local_alias_root"])
+            alias.parent.mkdir(parents=True, exist_ok=True)
+            alias.symlink_to(Path(tmpdir) / "missing-target")
+
+            prepare_rch_stage(plan, copy_source=False)
+
+            self.assertTrue(alias.is_symlink())
+            self.assertEqual(os.readlink(alias), plan["stage"]["local_projects_root"])
+
+    def test_prepare_refuses_to_overwrite_real_alias_directory(self) -> None:
+        # Regression: a real directory at the alias path used to silently pass
+        # and then path translation diverged because the alias was no longer a
+        # symlink to the projects root.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "repo"
+            source.mkdir()
+            plan = build_rch_stage_plan(
+                root,
+                source=source,
+                stage_root=root / "stage",
+                stage_id="canary",
+                command_parts=["cargo", "check"],
+                real_ssh="/bin/echo",
+                real_rsync="/bin/echo",
+            )
+            alias = Path(plan["stage"]["local_alias_root"])
+            alias.mkdir(parents=True)
+
+            with self.assertRaises(RuntimeError) as ctx:
+                prepare_rch_stage(plan, copy_source=False)
+
+            self.assertIn("not a symlink", str(ctx.exception))
+
     def test_cli_dry_run_json_is_plan_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
