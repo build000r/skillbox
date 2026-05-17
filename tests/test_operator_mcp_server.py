@@ -618,5 +618,79 @@ class OperatorMcpDryRunMarkerTests(unittest.TestCase):
         self.assertEqual(payload["error"]["type"], "invalid_parameter")
 
 
+class OperatorMcpSshHardeningTests(unittest.TestCase):
+    """Regression coverage for AUDIT_2026-05-17 H-SEC-1 and H-SEC-2.
+
+    box.py:ssh_cmd hardened ssh argv and validated user/host last week;
+    operator_mcp_server.py:run_ssh and handle_operator_box_exec must match.
+    """
+
+    def test_run_ssh_argv_includes_double_dash_separator(self) -> None:
+        captured: dict[str, list[str]] = {}
+
+        def fake_run(cmd, **_kwargs):
+            captured["cmd"] = list(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with mock.patch.object(MODULE.subprocess, "run", side_effect=fake_run):
+            MODULE.run_ssh("skillbox", "100.64.0.1", "echo ok")
+
+        cmd = captured["cmd"]
+        self.assertEqual(cmd[0], "ssh")
+        self.assertIn("--", cmd)
+        self.assertLess(cmd.index("--"), cmd.index("skillbox@100.64.0.1"))
+
+    def test_box_exec_rejects_flag_injection_host(self) -> None:
+        poisoned = {
+            "id": "alpha",
+            "state": "ready",
+            "tailscale_ip": "-oProxyCommand=touch /tmp/pwn",
+            "ssh_user": "skillbox",
+        }
+        with mock.patch.object(MODULE, "find_box", return_value=poisoned), mock.patch.object(
+            MODULE, "run_ssh"
+        ) as run_ssh:
+            result = MODULE.handle_operator_box_exec({"box_id": "alpha", "command": "pwd"})
+
+        payload = _content_payload(result)
+        self.assertTrue(result.get("isError"))
+        self.assertEqual(payload["error"]["type"], "invalid_box_config")
+        run_ssh.assert_not_called()
+
+    def test_box_exec_rejects_malformed_ssh_user(self) -> None:
+        poisoned = {
+            "id": "alpha",
+            "state": "ready",
+            "tailscale_ip": "100.64.0.8",
+            "ssh_user": "root; id;",
+        }
+        with mock.patch.object(MODULE, "find_box", return_value=poisoned), mock.patch.object(
+            MODULE, "run_ssh"
+        ) as run_ssh:
+            result = MODULE.handle_operator_box_exec({"box_id": "alpha", "command": "pwd"})
+
+        payload = _content_payload(result)
+        self.assertTrue(result.get("isError"))
+        self.assertEqual(payload["error"]["type"], "invalid_box_config")
+        run_ssh.assert_not_called()
+
+    def test_box_exec_happy_path_still_invokes_run_ssh(self) -> None:
+        clean = {
+            "id": "alpha",
+            "state": "ready",
+            "tailscale_ip": "100.64.0.8",
+            "ssh_user": "skillbox",
+        }
+        with mock.patch.object(MODULE, "find_box", return_value=clean), mock.patch.object(
+            MODULE, "run_ssh", return_value=(True, 0, {"stdout": "ok"})
+        ) as run_ssh:
+            result = MODULE.handle_operator_box_exec(
+                {"box_id": "alpha", "command": "pwd", "timeout": 15}
+            )
+
+        self.assertEqual(_content_payload(result)["stdout"], "ok")
+        run_ssh.assert_called_once_with("skillbox", "100.64.0.8", "pwd", timeout=15)
+
+
 if __name__ == "__main__":
     unittest.main()
