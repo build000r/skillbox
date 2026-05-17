@@ -56,6 +56,8 @@ _DRY_RUN_PROP: dict = {
 # ---------------------------------------------------------------------------
 
 _IDENTIFIER_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+_SSH_USER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$")
+_HOST_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,253}[a-zA-Z0-9])?$")
 
 DRYRUN_MARKER_TTL_SECONDS = 600  # 10 minutes
 
@@ -78,6 +80,18 @@ def _validate_identifier(value: str, kind: str) -> str:
         raise ValueError(
             f"Invalid {kind}: must be a slug matching [a-zA-Z0-9][a-zA-Z0-9._-]{{0,63}}"
         )
+    return value
+
+
+def _validate_ssh_user(value: str, kind: str = "ssh_user") -> str:
+    if not isinstance(value, str) or not _SSH_USER_RE.match(value):
+        raise ValueError(f"Invalid {kind}: {value!r}")
+    return value
+
+
+def _validate_host(value: str, kind: str = "host") -> str:
+    if not isinstance(value, str) or not _HOST_RE.match(value):
+        raise ValueError(f"Invalid {kind}: {value!r}")
     return value
 
 
@@ -528,7 +542,7 @@ def run_ssh(
         "-o", "ConnectTimeout=10",
         "-o", "BatchMode=yes",
     ]
-    cmd = ["ssh", *ssh_opts, f"{user}@{host}", command]
+    cmd = ["ssh", *ssh_opts, "--", f"{user}@{host}", command]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except FileNotFoundError:
@@ -765,8 +779,24 @@ def handle_operator_box_exec(params: dict) -> dict:
             }
         })
 
+    try:
+        validated_user = _validate_ssh_user(str(user), "ssh_user")
+        validated_host = _validate_host(str(host), "host")
+    except ValueError as exc:
+        return _error_content({
+            "error": {
+                "type": "invalid_box_config",
+                "message": str(exc),
+                "recoverable": False,
+                "recovery_hint": (
+                    "Inventory entry for this box has an unsafe ssh_user or host. "
+                    "Fix workspace/boxes.json (or re-register the box) before retrying."
+                ),
+            }
+        })
+
     timeout = int(params.get("timeout", 120))
-    ok, _code, data = run_ssh(user, host, str(command), timeout=timeout)
+    ok, _code, data = run_ssh(validated_user, validated_host, str(command), timeout=timeout)
     return _ok_content(data) if ok else _error_content(data)
 
 
