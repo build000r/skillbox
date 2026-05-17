@@ -8,6 +8,7 @@ import tempfile
 import threading
 import textwrap
 import unittest
+from unittest import mock
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -513,6 +514,15 @@ class BridgeBackedTaskTests(unittest.TestCase):
             state = service_healthcheck_state({"healthcheck": {"type": "port", "port": port}})
             self.assertEqual(state["state"], "ok")
             self.assertEqual(state["port"], port)
+
+    def test_service_healthcheck_state_treats_http_connection_reset_as_down(self) -> None:
+        service = {"healthcheck": {"type": "http", "url": "http://127.0.0.1:9/health"}}
+
+        with mock.patch.object(MANAGE_MODULE.urllib.request, "urlopen", side_effect=ConnectionResetError(54)):
+            state = service_healthcheck_state(service)
+
+        self.assertEqual(state["state"], "down")
+        self.assertEqual(state["url"], "http://127.0.0.1:9/health")
 
     def test_start_services_reuses_existing_healthy_http_service(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
