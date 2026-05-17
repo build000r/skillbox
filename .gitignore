@@ -52,3 +52,9 @@ refactor/
 .beads/*.db
 .beads/*.db-shm
 .beads/*.db-wal
+
+# bv (beads viewer) local config and caches
+.bv/
+
+# buildooor local config (symlinks to host-private paths)
+.buildooor/
