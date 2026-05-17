@@ -944,5 +944,109 @@ class BoxTests(unittest.TestCase):
         }
 
 
+class BoxArgvHardeningTests(unittest.TestCase):
+    """Security guards for ssh argv injection and the swimmers expose gate."""
+
+    def test_validate_ssh_user_rejects_leading_dash(self) -> None:
+        with self.assertRaises(ValueError):
+            BOX_MODULE._validate_ssh_user("-oProxyCommand=evil")
+
+    def test_validate_ssh_user_rejects_special_chars(self) -> None:
+        for bad in ("user;evil", "user space", "user$x", "user@evil", ""):
+            with self.assertRaises(ValueError, msg=f"accepted bad ssh user: {bad!r}"):
+                BOX_MODULE._validate_ssh_user(bad)
+
+    def test_validate_ssh_user_accepts_standard_unix_names(self) -> None:
+        for good in ("skillbox", "root", "deploy_user", "ci-bot", "_svc"):
+            self.assertEqual(BOX_MODULE._validate_ssh_user(good), good)
+
+    def test_validate_host_rejects_leading_dash(self) -> None:
+        with self.assertRaises(ValueError):
+            BOX_MODULE._validate_host("-oProxyCommand=evil")
+
+    def test_validate_host_accepts_dns_and_ipv4(self) -> None:
+        for good in ("box.example.com", "10.0.0.1", "host01", "node-1.tailnet"):
+            self.assertEqual(BOX_MODULE._validate_host(good), good)
+
+    def test_ssh_cmd_inserts_double_dash_before_destination(self) -> None:
+        """ssh_cmd argv must contain '--' before user@host so a malformed user
+        can never be parsed as an ssh option."""
+        captured: dict = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(BOX_MODULE, "run", side_effect=fake_run):
+            BOX_MODULE.ssh_cmd("skillbox", "box.example.com", "echo ok")
+
+        argv = captured["argv"]
+        self.assertIn("--", argv)
+        dash_idx = argv.index("--")
+        self.assertEqual(argv[dash_idx + 1], "skillbox@box.example.com")
+
+    def test_scp_file_inserts_double_dash_before_paths(self) -> None:
+        captured: dict = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(BOX_MODULE, "run", side_effect=fake_run):
+            BOX_MODULE.scp_file(Path("/tmp/x"), "skillbox", "box.example.com", "/remote")
+
+        argv = captured["argv"]
+        self.assertIn("--", argv)
+
+    def test_swimmers_expose_gate_raises_without_explicit_optin(self) -> None:
+        """remote_box_contract_payload must refuse to silently rewrite the
+        swimmers publish host to 0.0.0.0 unless SKILLBOX_SWIMMERS_EXPOSE=1 and
+        an auth token are both present."""
+        # Build a minimal context whose deploy_release activates 'swimmers' and
+        # leaves SKILLBOX_SWIMMERS_PUBLISH_HOST empty (i.e. loopback by helper).
+        context = _swimmers_context_for_test()
+        env = {
+            "SKILLBOX_SWIMMERS_PUBLISH_HOST": "",
+            # Note: no SKILLBOX_SWIMMERS_EXPOSE set
+        }
+        with mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch.object(BOX_MODULE, "local_swimmers_auth_token", return_value=("", None)):
+            with self.assertRaises(RuntimeError) as cm:
+                BOX_MODULE.remote_box_contract_payload(context)
+            self.assertIn("SKILLBOX_SWIMMERS_EXPOSE", str(cm.exception))
+
+    def test_swimmers_expose_gate_accepts_explicit_optin_with_token(self) -> None:
+        context = _swimmers_context_for_test()
+        env = {
+            "SKILLBOX_SWIMMERS_PUBLISH_HOST": "127.0.0.1",
+            "SKILLBOX_SWIMMERS_EXPOSE": "1",
+        }
+        with mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch.object(BOX_MODULE, "local_swimmers_auth_token", return_value=("tok-abc", "local")):
+            payload = BOX_MODULE.remote_box_contract_payload(context)
+        self.assertEqual(payload["env_updates"]["SKILLBOX_SWIMMERS_PUBLISH_HOST"], "0.0.0.0")
+
+
+def _swimmers_context_for_test():
+    """Minimal stand-in for BoxUpContext that activates the 'swimmers' profile."""
+    from types import SimpleNamespace
+    deploy_release = SimpleNamespace(active_profiles=["swimmers"])
+    profile = SimpleNamespace(storage=None)
+    box = SimpleNamespace(
+        state_root="",
+        storage_filesystem="",
+        storage_min_free_gb=None,
+        storage_provider="",
+        tailscale_ip="",
+    )
+    return SimpleNamespace(
+        box_id="test-box",
+        box=box,
+        profile=profile,
+        deploy_release=deploy_release,
+        ts_hostname="test-box.tailnet",
+    )
+
+
 if __name__ == "__main__":
     unittest.main()

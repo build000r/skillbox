@@ -25,6 +25,34 @@ FAKE_PROVISIONING_ENV = {
 
 
 class BoxLifecycleTests(unittest.TestCase):
+    def test_cmd_up_requires_deploy_manifest_for_non_dry_run(self) -> None:
+        profile = BOX_MODULE.BoxProfile(id="dev-small")
+        payloads: list[dict[str, object]] = []
+
+        with (
+            mock.patch.object(BOX_MODULE, "load_profile", return_value=profile),
+            mock.patch.object(BOX_MODULE, "load_inventory", return_value=[]),
+            mock.patch.object(BOX_MODULE, "load_deploy_manifest") as load_deploy_manifest,
+            mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
+        ):
+            result = BOX_MODULE.cmd_up(
+                "box-1",
+                profile_name="dev-small",
+                blueprint=None,
+                set_args=[],
+                deploy_manifest=None,
+                resume=False,
+                dry_run=False,
+                fmt="json",
+            )
+
+        self.assertEqual(result, BOX_MODULE.EXIT_ERROR)
+        load_deploy_manifest.assert_not_called()
+        self.assertEqual(len(payloads), 1)
+        payload = payloads[0]
+        self.assertEqual(payload["error"]["type"], "deploy_manifest_required")
+        self.assertIn("--deploy-manifest <path>", payload["next_actions"][0])
+
     def test_cmd_upgrade_covers_dry_run_success_and_failure_branches(self) -> None:
         profile = BOX_MODULE.BoxProfile(
             id="dev-small",

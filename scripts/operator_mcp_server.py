@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -48,6 +50,35 @@ _DRY_RUN_PROP: dict = {
     "description": "Preview changes without applying them. ALWAYS use first for destructive operations.",
     "default": False,
 }
+
+# ---------------------------------------------------------------------------
+# Identifier validation (path traversal / flag injection guard)
+# ---------------------------------------------------------------------------
+
+_IDENTIFIER_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+
+DRYRUN_MARKER_TTL_SECONDS = 600  # 10 minutes
+
+
+def _validate_identifier(value: str, kind: str) -> str:
+    """Validate that *value* is a safe slug identifier.
+
+    Rejects path separators, leading dashes, and anything not matching
+    the slug pattern ``^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$``.
+
+    Returns the validated value on success; raises ValueError otherwise.
+    """
+    if not value:
+        raise ValueError(f"Invalid {kind}: must not be empty")
+    if "/" in value or "\\" in value:
+        raise ValueError(f"Invalid {kind}: must not contain path separators")
+    if value.startswith("-"):
+        raise ValueError(f"Invalid {kind}: must not start with '-'")
+    if not _IDENTIFIER_RE.match(value):
+        raise ValueError(
+            f"Invalid {kind}: must be a slug matching [a-zA-Z0-9][a-zA-Z0-9._-]{{0,63}}"
+        )
+    return value
 
 
 def _tool_metadata(
@@ -575,6 +606,10 @@ def handle_operator_box_status(params: dict) -> dict:
     args = ["status", "--format", "json"]
     box_id = params.get("box_id")
     if box_id:
+        try:
+            _validate_identifier(str(box_id), "box_id")
+        except ValueError as exc:
+            return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
         args.insert(1, str(box_id))
     ok, _code, data = run_script(BOX_PY, args)
     return _ok_content(data) if ok else _error_content(data)
@@ -592,6 +627,22 @@ def handle_operator_provision(params: dict) -> dict:
                 "operator_provision(box_id='<id>', dry_run=true)",
             ],
         )
+
+    try:
+        _validate_identifier(str(box_id), "box_id")
+    except ValueError as exc:
+        return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
+
+    if params.get("profile"):
+        try:
+            _validate_identifier(str(params["profile"]), "profile")
+        except ValueError as exc:
+            return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
+    if params.get("blueprint"):
+        try:
+            _validate_identifier(str(params["blueprint"]), "blueprint")
+        except ValueError as exc:
+            return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
 
     args = ["up", str(box_id), "--format", "json"]
     if params.get("profile"):
@@ -623,6 +674,8 @@ def handle_operator_provision(params: dict) -> dict:
     )
     if ok and is_dry_run:
         _stamp_dryrun_marker("operator_provision", str(box_id))
+    elif ok and not is_dry_run:
+        _clear_dryrun_marker("operator_provision", str(box_id))
     return _ok_content(data) if ok else _error_content(data)
 
 
@@ -638,6 +691,11 @@ def handle_operator_teardown(params: dict) -> dict:
                 "operator_teardown(box_id='<id>', dry_run=true)",
             ],
         )
+
+    try:
+        _validate_identifier(str(box_id), "box_id")
+    except ValueError as exc:
+        return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
 
     args = ["down", str(box_id), "--format", "json"]
     is_dry_run = bool(params.get("dry_run"))
@@ -657,6 +715,8 @@ def handle_operator_teardown(params: dict) -> dict:
     # Stamp dry-run marker so the PreToolUse hook allows the real run next.
     if ok and is_dry_run:
         _stamp_dryrun_marker("operator_teardown", str(box_id))
+    elif ok and not is_dry_run:
+        _clear_dryrun_marker("operator_teardown", str(box_id))
 
     return _ok_content(data) if ok else _error_content(data)
 
@@ -674,6 +734,11 @@ def handle_operator_box_exec(params: dict) -> dict:
                 "operator_box_exec(box_id='<id>', command='cd ~/skillbox && python3 .env-manager/manage.py status --format json')",
             ],
         )
+
+    try:
+        _validate_identifier(str(box_id), "box_id")
+    except ValueError as exc:
+        return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
 
     box = find_box(str(box_id))
     if box is None or box.get("state") == "destroyed":
@@ -769,6 +834,8 @@ def handle_operator_compose_down(params: dict) -> dict:
 
     ok, code, data = run_compose(["down"], timeout=120)
     emit_event("operator.compose_down", "local", {"ok": ok})
+    if ok:
+        _clear_dryrun_marker("operator_compose_down", "local")
     payload = {"ok": ok, "exit_code": code, "detail": data}
     return _ok_content(payload) if ok else _error_content(payload)
 
@@ -812,16 +879,46 @@ def emit_event(event_type: str, subject: str, detail: dict | None = None) -> Non
 # Dry-run marker (coordinates with PreToolUse hook)
 # ---------------------------------------------------------------------------
 
+def _dryrun_marker_path(tool_name: str, box_id: str) -> Path:
+    """Return the marker path after validating identifiers."""
+    _validate_identifier(tool_name, "tool_name")
+    _validate_identifier(box_id, "box_id")
+    return REPO_ROOT / ".skillbox-state" / "dryrun-markers" / f".skillbox-dryrun-{tool_name}-{box_id}"
+
+
 def _stamp_dryrun_marker(tool_name: str, box_id: str) -> None:
     """Create a temp marker so the PreToolUse hook knows a dry-run was done."""
-    marker = REPO_ROOT / ".skillbox-state" / "dryrun-markers" / f".skillbox-dryrun-{tool_name}-{box_id}"
+    marker = _dryrun_marker_path(tool_name, box_id)
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(f"dry-run completed for {tool_name} box={box_id}\n")
 
 
 def _has_dryrun_marker(tool_name: str, box_id: str) -> bool:
-    marker = REPO_ROOT / ".skillbox-state" / "dryrun-markers" / f".skillbox-dryrun-{tool_name}-{box_id}"
-    return marker.is_file()
+    """Check if a valid, non-expired dry-run marker exists (TTL: 10 minutes)."""
+    marker = _dryrun_marker_path(tool_name, box_id)
+    if not marker.is_file():
+        return False
+    try:
+        age = time.time() - marker.stat().st_mtime
+    except OSError:
+        return False
+    if age > DRYRUN_MARKER_TTL_SECONDS:
+        # Expired — clean up and report absent.
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _clear_dryrun_marker(tool_name: str, box_id: str) -> None:
+    """Remove the dry-run marker after a successful real operation."""
+    try:
+        marker = _dryrun_marker_path(tool_name, box_id)
+        marker.unlink(missing_ok=True)
+    except (OSError, ValueError):
+        pass
 
 
 # ---------------------------------------------------------------------------
