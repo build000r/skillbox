@@ -31,6 +31,7 @@ SOURCE_DIR=""
 SOURCE_REPO="${DEFAULT_REPO_URL}"
 OFFLINE_TARBALL=""
 SOURCE_SHA256=""
+ALLOW_UNVERIFIED=0
 REF=""
 BLUEPRINT=""
 WRAPPER_BIN_DIR="${WRAPPER_BIN_DIR:-${HOME}/.local/bin}"
@@ -94,6 +95,7 @@ Source acquisition:
                            latest release tag when resolvable, otherwise main.
   --offline <tarball>      Extract from a local source tarball instead of cloning.
   --sha256 <hex>           Expected SHA256 for --offline tarball or downloaded tarball.
+  --allow-unverified       Bypass SHA256/sigstore checks. Refuse-by-default otherwise.
 
 Lifecycle:
   --skip-first-box         Do not run first-box after acquiring the source.
@@ -280,8 +282,13 @@ verify_checksum() {
   local expected="$2"
   local actual=""
   if [[ -z "${expected}" ]]; then
-    warn "No SHA256 provided for ${path}; skipping checksum verification."
-    return 0
+    if [[ "${ALLOW_UNVERIFIED}" -eq 1 ]]; then
+      warn "No SHA256 provided for ${path}; skipping checksum verification (--allow-unverified)."
+      return 0
+    fi
+    err "No SHA256 provided for ${path}. Cannot verify integrity."
+    err "Pass --allow-unverified to bypass checksum verification."
+    exit 1
   fi
   actual="$(sha256_file "${path}")"
   if [[ "${actual}" != "${expected}" ]]; then
@@ -299,8 +306,13 @@ maybe_verify_sigstore_bundle() {
     return 0
   fi
   if ! have_cmd cosign; then
-    warn "Found ${bundle_path}, but cosign is not installed; skipping sigstore verification."
-    return 0
+    if [[ "${ALLOW_UNVERIFIED}" -eq 1 ]]; then
+      warn "Found ${bundle_path}, but cosign is not installed; skipping sigstore verification (--allow-unverified)."
+      return 0
+    fi
+    err "Found ${bundle_path}, but cosign is not installed. Cannot verify signature."
+    err "Install cosign or pass --allow-unverified to bypass."
+    exit 1
   fi
   warn "Sigstore bundle found for ${path}, but identity policy is not configured for source installs yet."
 }
@@ -1093,6 +1105,10 @@ while [[ $# -gt 0 ]]; do
     --sha256)
       SOURCE_SHA256="$2"
       shift 2
+      ;;
+    --allow-unverified)
+      ALLOW_UNVERIFIED=1
+      shift
       ;;
     --skip-build)
       RUN_BUILD=0

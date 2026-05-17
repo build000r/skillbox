@@ -205,5 +205,128 @@ class InstallScriptTests(unittest.TestCase):
             )
 
 
+class InstallScriptChecksumGateTests(unittest.TestCase):
+    """install.sh must refuse to skip checksum verification by default.
+
+    Added by the sec-hardening-20260516 slice (C2). Prior to the fix,
+    verify_checksum() warned-and-returned-0 when the expected SHA was empty,
+    silently allowing a curl|bash install of an unverified tarball.
+    """
+
+    @staticmethod
+    def _extract_function(func_name: str) -> str:
+        """Pull a single bash function body out of install.sh."""
+        text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        marker = f"{func_name}() {{"
+        start = text.index(marker)
+        depth = 0
+        i = start
+        while i < len(text):
+            ch = text[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+            i += 1
+        raise ValueError(f"Could not find end of {func_name}() in install.sh")
+
+    def _harness(self, body: str) -> str:
+        """Bash snippet that defines verify_checksum + its deps, then runs body."""
+        deps = "\n".join(
+            self._extract_function(name)
+            for name in ("have_cmd", "sha256_file", "verify_checksum")
+        )
+        # warn/err are tiny — provide stubs that just emit to stderr so we
+        # don't have to drag in install.sh's color/QUIET/has_gum globals.
+        return f"""
+set -u
+warn() {{ printf 'WARN: %s\\n' "$*" >&2; }}
+err()  {{ printf 'ERROR: %s\\n' "$*" >&2; }}
+{deps}
+
+{body}
+"""
+
+    def test_help_advertises_allow_unverified_flag(self) -> None:
+        result = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--allow-unverified", result.stdout)
+
+    def test_verify_checksum_fails_on_empty_expected_sha(self) -> None:
+        """verify_checksum() must exit non-zero when expected SHA is empty."""
+        with tempfile.NamedTemporaryFile("w", suffix=".bin", delete=False) as tf:
+            tf.write("hello world")
+            target = tf.name
+        try:
+            script = self._harness(f"ALLOW_UNVERIFIED=0\nverify_checksum {target} ''")
+            result = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+            self.assertNotEqual(
+                result.returncode, 0,
+                f"verify_checksum returned 0 on empty SHA; stderr={result.stderr!r}",
+            )
+            combined = (result.stdout + result.stderr).lower()
+            self.assertIn("allow-unverified", combined)
+        finally:
+            os.unlink(target)
+
+    def test_verify_checksum_accepts_explicit_allow_unverified(self) -> None:
+        """With ALLOW_UNVERIFIED=1, empty SHA should warn-and-pass."""
+        with tempfile.NamedTemporaryFile("w", suffix=".bin", delete=False) as tf:
+            tf.write("hello world")
+            target = tf.name
+        try:
+            script = self._harness(
+                f"ALLOW_UNVERIFIED=1\nverify_checksum {target} ''\necho exit=$?"
+            )
+            result = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+            self.assertEqual(result.returncode, 0, f"stderr={result.stderr!r}")
+            self.assertIn("exit=0", result.stdout)
+        finally:
+            os.unlink(target)
+
+    def test_verify_checksum_accepts_matching_sha(self) -> None:
+        """Sanity: with a correct SHA, verify_checksum passes."""
+        import hashlib as _hashlib
+        with tempfile.NamedTemporaryFile("w", suffix=".bin", delete=False) as tf:
+            tf.write("hello world")
+            target = tf.name
+        try:
+            expected = _hashlib.sha256(b"hello world").hexdigest()
+            script = self._harness(
+                f"ALLOW_UNVERIFIED=0\nverify_checksum {target} {expected}\necho exit=$?"
+            )
+            result = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+            self.assertEqual(result.returncode, 0, f"stderr={result.stderr!r}")
+            self.assertIn("exit=0", result.stdout)
+        finally:
+            os.unlink(target)
+
+
 if __name__ == "__main__":
     unittest.main()
