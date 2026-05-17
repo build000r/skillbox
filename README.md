@@ -140,7 +140,7 @@ The enriched context adds live sections that the static `context` command does n
 
 - a **Live Status** table showing service state, PID, and health
 - a **Repo State** table showing branch, dirty file count, and last commit
-- a **Recent Activity** feed from the runtime log and active durable sessions
+- a **Runtime Activity** feed from the runtime log and active durable sessions
 - an **Attention** section highlighting failing checks, downed services, and recent log errors
 
 Resume the last session without re-running the full pipeline:
@@ -217,14 +217,30 @@ python3 .env-manager/manage.py logs --client <client> --service <service-id>
 `local-core` covers whatever services your overlay declares for it. Repo
 roots are resolved under `${SKILLBOX_MONOSERVER_ROOT}` and each repo
 provides its own start command; the overlay declares dependency order, env
-targets, and health probes. A typical overlay might look like:
+targets, and health probes.
 
-| Service | Repo root | Depends on | Health |
-|---------|-----------|------------|--------|
-| `auth-api` | `auth` | — | `http://localhost:3301/health` |
-| `core-api` | `core-api` | `auth-api` | `http://localhost:8000/health` |
-| `worker` | `worker` | `auth-api` | `http://localhost:8001/health` |
-| `web` | `web` | `auth-api`, `core-api` | `http://localhost:5173` |
+The cut-over contract that backs this path is the six-service legacy core
+loop:
+
+- `spaps`: repo root `sweet-potato`; depends on none; health
+  `http://localhost:3301/health`; modes `reuse`, `prod`, `fresh`.
+- `htma_server`: repo root `htma_server`; depends on `spaps`; health
+  `http://localhost:8000/health`; modes `reuse`, `prod`, `fresh`.
+- `ingredient_server`: repo root `ingredient_server`; depends on `spaps`;
+  health `http://localhost:8001/health`; modes `reuse`, `prod`, `fresh`.
+- `approval_feedback_api`: repo root
+  `unclawg/services/approval_feedback_api`; depends on `spaps`; health
+  `http://localhost:8010/health`; modes `reuse`, `prod`, `fresh`.
+- `cfo`: repo root `cfo`; depends on `spaps`; health `localhost:8050`;
+  modes `reuse`, `prod`, `fresh`.
+- `htma`: repo root `htma`; depends on `spaps` and `htma_server`; health
+  `http://localhost:5173`; modes `reuse`, `prod`, `fresh`.
+
+Do not infer coverage for adjacent local surfaces such as `buildooor`,
+`cca-website`, `unclawg`, `voice-to-text`, `swimmers`, or `videos` from this
+table. Their current lifecycle behavior comes from the selected client's
+`parity_ledger`; only rows marked `covered` are managed by the normal runtime
+lifecycle.
 
 Covered services may declare any subset of `--mode reuse`, `--mode prod`, and
 `--mode fresh`. The runtime validates the selected mode against each service
@@ -359,8 +375,7 @@ What it does each cycle:
 
 For durable, work-specific notes, use the `skillbox_session_*` MCP tools for
 client-scoped session timelines and `cm` for procedural memory. `focus`
-surfaces recent runtime activity directly from `runtime.log`; there is no
-separate journal ack queue.
+surfaces recent runtime activity directly from `runtime.log`.
 
 ## Worker Runtime Broker
 
@@ -2031,13 +2046,13 @@ service health, git state, recent errors, and runtime activity.
 A plain-text log at `.skillbox-state/logs/runtime/runtime.log` on the host,
 mounted at `/workspace/logs/runtime/runtime.log` inside the container. Pulse,
 sync, focus, and other runtime paths append human-readable status lines there
-so recent activity can be surfaced without a separate journal service.
+so recent activity can be surfaced without another public activity service.
 
 ### How should agents store durable notes or memory?
 
 Use the `skillbox_session_*` MCP tools for client-scoped session timelines and
 `cm` for longer-lived procedural memory. `focus` reads recent runtime activity
-from `runtime.log`; there is no `ack` command or journal sidecar flow anymore.
+from `runtime.log`; no separate public sidecar flow is required.
 
 ### How does the destructive-op guard work?
 
