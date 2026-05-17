@@ -23,6 +23,32 @@ RECONCILE = SourceFileLoader(
 
 
 class ReconcileTests(unittest.TestCase):
+    def test_public_contract_surfaces_do_not_advertise_retired_activity_flow(self) -> None:
+        surfaces = [
+            ROOT_DIR / "README.md",
+            ROOT_DIR / "docs" / "ROADMAP.md",
+            ROOT_DIR / "Makefile",
+            ROOT_DIR / ".env-manager" / "mcp_server.py",
+        ]
+        forbidden_terms = [
+            "skillbox_ack",
+            "skillbox_journal",
+            "JSONL journal",
+            "separate journal",
+            "journal sidecar",
+            "`ack`",
+            "Recent Activity",
+        ]
+
+        hits: list[str] = []
+        for surface in surfaces:
+            text = surface.read_text(encoding="utf-8")
+            for term in forbidden_terms:
+                if term in text:
+                    hits.append(f"{surface.relative_to(ROOT_DIR)}: {term}")
+
+        self.assertEqual(hits, [])
+
     def test_build_model_uses_client_override_mounts_when_focus_file_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir).resolve()
