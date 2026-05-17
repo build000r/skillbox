@@ -855,5 +855,33 @@ class SkillboxMcpServerTests(unittest.TestCase):
         self.assertEqual(errors[0], (5, -32603, "Internal error in boom"))
 
 
+class SkillboxMcpIdentifierValidationTests(unittest.TestCase):
+    """Security guards added by the sec-hardening-20260516 slice."""
+
+    def test_validate_identifier_rejects_path_separator(self) -> None:
+        for bad in ("foo/bar", "foo\\bar", "../etc/passwd", "a/../b"):
+            with self.assertRaises(ValueError, msg=f"accepted bad id: {bad!r}"):
+                MODULE._validate_identifier(bad, "client_id")
+
+    def test_validate_identifier_rejects_leading_dash(self) -> None:
+        for bad in ("--help", "-x", "--config-root=/etc"):
+            with self.assertRaises(ValueError, msg=f"accepted bad id: {bad!r}"):
+                MODULE._validate_identifier(bad, "client_id")
+
+    def test_validate_identifier_rejects_empty(self) -> None:
+        with self.assertRaises(ValueError):
+            MODULE._validate_identifier("", "client_id")
+
+    def test_validate_identifier_accepts_well_formed_slug(self) -> None:
+        for good in ("personal", "acme-studio", "client_01", "a.b.c", "X"):
+            self.assertEqual(MODULE._validate_identifier(good, "client_id"), good)
+
+    def test_handle_events_rejects_traversal_client_id(self) -> None:
+        result = MODULE._handle_events({"client_id": "../etc/passwd"})
+        payload = _content_payload(result)
+        self.assertTrue(result.get("isError"))
+        self.assertEqual(payload["error"]["type"], "invalid_parameter")
+
+
 if __name__ == "__main__":
     unittest.main()

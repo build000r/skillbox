@@ -118,6 +118,34 @@ def emit_log_message(level: str, data: Any, *, logger: str = SERVER_NAME) -> Non
 # Shared schema fragments
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Identifier validation (path traversal / flag injection guard)
+# ---------------------------------------------------------------------------
+
+_IDENTIFIER_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+
+
+def _validate_identifier(value: str, kind: str) -> str:
+    """Validate that *value* is a safe slug identifier.
+
+    Rejects path separators, leading dashes, and anything not matching
+    the slug pattern ``^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$``.
+
+    Returns the validated value on success; raises ValueError otherwise.
+    """
+    if not value:
+        raise ValueError(f"Invalid {kind}: must not be empty")
+    if "/" in value or "\\" in value:
+        raise ValueError(f"Invalid {kind}: must not contain path separators")
+    if value.startswith("-"):
+        raise ValueError(f"Invalid {kind}: must not start with '-'")
+    if not _IDENTIFIER_RE.match(value):
+        raise ValueError(
+            f"Invalid {kind}: must be a slug matching [a-zA-Z0-9][a-zA-Z0-9._-]{{0,63}}"
+        )
+    return value
+
+
 _CLIENT_PROP: dict = {
     "type": "array",
     "items": {"type": "string"},
@@ -1502,6 +1530,17 @@ def _handle_pulse(_params: dict) -> dict:
 
 
 def _handle_events(params: dict) -> dict:
+    # Validate identifier params before use
+    for key in ("client_id", "session_id"):
+        value = str(params.get(key) or "").strip()
+        if value:
+            try:
+                _validate_identifier(value, key)
+            except ValueError as exc:
+                return _error_content(
+                    {"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}}
+                )
+
     runtime_manager = _runtime_manager_module()
     try:
         limit = int(params.get("limit") or runtime_manager.DEFAULT_EVENT_FEED_LIMIT)
@@ -1586,6 +1625,73 @@ def _positional_required(positional_key: str | None, positional: str | None, too
     return bool(positional_key and positional is None and not tool_params.get("list_blueprints"))
 
 
+def _validate_tool_identifiers(tool_params: dict) -> str | None:
+    """Validate identifier-shaped params. Returns an error message or None."""
+    # Validate client_id (scalar, used as positional for onboard/focus/session/acceptance/etc.)
+    client_id = str(tool_params.get("client_id") or "").strip()
+    if client_id:
+        try:
+            _validate_identifier(client_id, "client_id")
+        except ValueError as exc:
+            return str(exc)
+
+    # Validate session_id
+    session_id = str(tool_params.get("session_id") or "").strip()
+    if session_id:
+        try:
+            _validate_identifier(session_id, "session_id")
+        except ValueError as exc:
+            return str(exc)
+
+    # Validate run_id
+    run_id = str(tool_params.get("run_id") or "").strip()
+    if run_id:
+        try:
+            _validate_identifier(run_id, "run_id")
+        except ValueError as exc:
+            return str(exc)
+
+    # Validate proposal_id
+    proposal_id = str(tool_params.get("proposal_id") or "").strip()
+    if proposal_id:
+        try:
+            _validate_identifier(proposal_id, "proposal_id")
+        except ValueError as exc:
+            return str(exc)
+
+    # Validate list-type identifier params (client, profile, service, task)
+    for key in ("client", "profile", "service", "task"):
+        raw = tool_params.get(key)
+        if raw is None:
+            continue
+        values = raw if isinstance(raw, (list, tuple, set)) else [raw]
+        for item in values:
+            item_str = str(item).strip()
+            if item_str:
+                try:
+                    _validate_identifier(item_str, key)
+                except ValueError as exc:
+                    return str(exc)
+
+    # Validate skill name
+    skill = str(tool_params.get("skill") or "").strip()
+    if skill:
+        try:
+            _validate_identifier(skill, "skill")
+        except ValueError as exc:
+            return str(exc)
+
+    # Validate overlay name
+    overlay_name = str(tool_params.get("name") or "").strip()
+    if overlay_name:
+        try:
+            _validate_identifier(overlay_name, "name")
+        except ValueError as exc:
+            return str(exc)
+
+    return None
+
+
 def _dispatch_manage_tool(
     name: str,
     command: str,
@@ -1595,6 +1701,12 @@ def _dispatch_manage_tool(
     request_id: Any = None,
 ) -> dict:
     tool_params = _tool_params_with_defaults(name, params)
+
+    # Validate identifiers before passing to subprocess
+    id_error = _validate_tool_identifiers(tool_params)
+    if id_error:
+        return _error_content({"error": {"type": "invalid_parameter", "message": id_error, "recoverable": True}})
+
     positional = _positional_arg(positional_key, tool_params)
     if _positional_required(positional_key, positional, tool_params):
         return _missing_positional_error(name, str(positional_key))

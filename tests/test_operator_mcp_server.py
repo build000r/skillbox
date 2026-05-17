@@ -537,5 +537,86 @@ class OperatorMcpServerTests(unittest.TestCase):
         self.assertEqual(sent[3]["result"]["content"][0]["text"], "{}")
 
 
+class OperatorMcpIdentifierValidationTests(unittest.TestCase):
+    """Security guards added by the sec-hardening-20260516 slice."""
+
+    def test_validate_identifier_rejects_path_separator(self) -> None:
+        for bad in ("foo/bar", "foo\\bar", "../etc/passwd"):
+            with self.assertRaises(ValueError, msg=f"accepted bad id: {bad!r}"):
+                MODULE._validate_identifier(bad, "box_id")
+
+    def test_validate_identifier_rejects_leading_dash(self) -> None:
+        with self.assertRaises(ValueError):
+            MODULE._validate_identifier("--help", "box_id")
+
+    def test_validate_identifier_rejects_empty(self) -> None:
+        with self.assertRaises(ValueError):
+            MODULE._validate_identifier("", "box_id")
+
+    def test_validate_identifier_accepts_well_formed_slug(self) -> None:
+        for good in ("dev-small", "box01", "my.box", "a", "A_b-c.d"):
+            self.assertEqual(MODULE._validate_identifier(good, "box_id"), good)
+
+
+class OperatorMcpDryRunMarkerTests(unittest.TestCase):
+    """Marker TTL + clearance contract added by sec-hardening-20260516."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._repo_root_patch = mock.patch.object(MODULE, "REPO_ROOT", Path(self._tmp.name))
+        self._repo_root_patch.start()
+
+    def tearDown(self) -> None:
+        self._repo_root_patch.stop()
+        self._tmp.cleanup()
+
+    def test_marker_path_rejects_traversal_in_box_id(self) -> None:
+        with self.assertRaises(ValueError):
+            MODULE._dryrun_marker_path("operator_provision", "../../etc/passwd")
+
+    def test_has_marker_false_when_missing(self) -> None:
+        self.assertFalse(MODULE._has_dryrun_marker("operator_provision", "box01"))
+
+    def test_marker_round_trip_fresh(self) -> None:
+        MODULE._stamp_dryrun_marker("operator_provision", "box01")
+        self.assertTrue(MODULE._has_dryrun_marker("operator_provision", "box01"))
+
+    def test_marker_expires_after_ttl(self) -> None:
+        MODULE._stamp_dryrun_marker("operator_provision", "box01")
+        marker = MODULE._dryrun_marker_path("operator_provision", "box01")
+        self.assertTrue(marker.is_file())
+        # Backdate mtime well past TTL.
+        old = marker.stat().st_mtime - MODULE.DRYRUN_MARKER_TTL_SECONDS - 60
+        os.utime(marker, (old, old))
+        self.assertFalse(MODULE._has_dryrun_marker("operator_provision", "box01"))
+        # Stale marker was auto-cleaned.
+        self.assertFalse(marker.is_file())
+
+    def test_clear_marker_removes_file(self) -> None:
+        MODULE._stamp_dryrun_marker("operator_provision", "box01")
+        marker = MODULE._dryrun_marker_path("operator_provision", "box01")
+        self.assertTrue(marker.is_file())
+        MODULE._clear_dryrun_marker("operator_provision", "box01")
+        self.assertFalse(marker.is_file())
+
+    def test_clear_marker_tolerates_bad_id(self) -> None:
+        """Clearance with a malformed id should be a no-op, not raise."""
+        # _clear_dryrun_marker swallows ValueError so callers don't crash on
+        # malformed input after dispatch errors.
+        MODULE._clear_dryrun_marker("operator_provision", "../bad")
+
+    def test_provision_handler_rejects_traversal_box_id(self) -> None:
+        result = MODULE.handle_operator_provision({"box_id": "../etc/passwd"})
+        payload = _content_payload(result)
+        self.assertTrue(result.get("isError"))
+        self.assertEqual(payload["error"]["type"], "invalid_parameter")
+
+    def test_teardown_handler_rejects_leading_dash_box_id(self) -> None:
+        result = MODULE.handle_operator_teardown({"box_id": "--force"})
+        payload = _content_payload(result)
+        self.assertTrue(result.get("isError"))
+        self.assertEqual(payload["error"]["type"], "invalid_parameter")
+
+
 if __name__ == "__main__":
     unittest.main()

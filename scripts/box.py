@@ -116,6 +116,22 @@ DEFAULT_SSH_OPTS = [
 REMOTE_ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SHA256_HEX_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")
 IPV4_PATTERN = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+_SSH_USER_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$')
+_HOST_RE = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,253}[a-zA-Z0-9])?$')
+
+
+def _validate_ssh_user(user: str) -> str:
+    if not _SSH_USER_RE.match(user):
+        raise ValueError(f"Invalid ssh user: {user!r}")
+    return user
+
+
+def _validate_host(host: str) -> str:
+    if not _HOST_RE.match(host):
+        raise ValueError(f"Invalid host: {host!r}")
+    return host
+
+
 REGISTER_PROBE_COMMAND = (
     "TS_IP=\"$(tailscale ip -4 2>/dev/null | head -n1 || true)\"; "
     "CONTAINER=no; "
@@ -611,8 +627,10 @@ def doctl(*args: str, timeout: int = 120) -> subprocess.CompletedProcess[str]:
 
 
 def ssh_cmd(user: str, host: str, command: str, *, timeout: int = 300) -> subprocess.CompletedProcess[str]:
+    _validate_ssh_user(user)
+    _validate_host(host)
     return run(
-        ["ssh", *DEFAULT_SSH_OPTS, f"{user}@{host}", command],
+        ["ssh", *DEFAULT_SSH_OPTS, "--", f"{user}@{host}", command],
         check=False,
         timeout=timeout,
     )
@@ -628,13 +646,15 @@ def ssh_script(
     timeout: int = 600,
 ) -> subprocess.CompletedProcess[str]:
     """Run a local script on a remote host via ssh + stdin."""
+    _validate_ssh_user(user)
+    _validate_host(host)
     remote_argv = ["bash", "-s"]
     if script_args:
         remote_argv.extend(["--", *script_args])
     remote_cmd = build_remote_env_command(remote_argv, env_vars)
     with script_path.open("r") as f:
         return subprocess.run(
-            ["ssh", *DEFAULT_SSH_OPTS, f"{user}@{host}", remote_cmd],
+            ["ssh", *DEFAULT_SSH_OPTS, "--", f"{user}@{host}", remote_cmd],
             stdin=f,
             capture_output=True,
             text=True,
@@ -822,8 +842,10 @@ def box_network_health(box: "Box") -> dict[str, Any]:
 
 
 def scp_file(local_path: Path, user: str, host: str, remote_path: str, *, timeout: int = 600) -> subprocess.CompletedProcess[str]:
+    _validate_ssh_user(user)
+    _validate_host(host)
     return run(
-        ["scp", *DEFAULT_SSH_OPTS, str(local_path), f"{user}@{host}:{remote_path}"],
+        ["scp", *DEFAULT_SSH_OPTS, "--", str(local_path), f"{user}@{host}:{remote_path}"],
         check=False,
         timeout=timeout,
     )
@@ -1099,6 +1121,13 @@ def remote_box_contract_payload(context: "BoxUpContext") -> dict[str, Any]:
     if has_swimmers_profile:
         publish_host = env_updates.get("SKILLBOX_SWIMMERS_PUBLISH_HOST")
         if is_loopback_publish_host(publish_host):
+            expose_enabled = os.environ.get("SKILLBOX_SWIMMERS_EXPOSE") == "1"
+            if not expose_enabled or not token:
+                raise RuntimeError(
+                    "Swimmers profile requires public bind (0.0.0.0) but safety "
+                    "prerequisites are not met. Set SKILLBOX_SWIMMERS_EXPOSE=1 and "
+                    "provide a non-empty SKILLBOX_SWIMMERS_AUTH_TOKEN to proceed."
+                )
             env_updates["SKILLBOX_SWIMMERS_PUBLISH_HOST"] = "0.0.0.0"
     if token:
         env_updates["SKILLBOX_SWIMMERS_AUTH_TOKEN"] = token
@@ -3297,7 +3326,9 @@ def cmd_ssh(box_id: str) -> int:
         print(f"Box {box_id!r} has no reachable address.", file=sys.stderr)
         return EXIT_ERROR
 
-    os.execvp("ssh", ["ssh", *DEFAULT_SSH_OPTS, f"{box.ssh_user}@{target}"])
+    _validate_ssh_user(box.ssh_user)
+    _validate_host(target)
+    os.execvp("ssh", ["ssh", *DEFAULT_SSH_OPTS, "--", f"{box.ssh_user}@{target}"])
     return EXIT_ERROR  # unreachable
 
 
@@ -3479,18 +3510,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     register_parser = subparsers.add_parser("register", help="Register an existing shared or manually created box in local inventory.")
     register_parser.add_argument("box_id", nargs="?", default=None, help="Local box identifier. Defaults to a host-derived alias.")
-    register_parser.add_argument("--host", required=True, help="Reachable host: Tailscale hostname, Tailscale IP, or public IP.")
+    register_parser.add_argument("--host", required=True, type=_validate_host, help="Reachable host: Tailscale hostname, Tailscale IP, or public IP.")
     register_parser.add_argument("--profile", default="shared", help="Local profile label (default: shared).")
-    register_parser.add_argument("--ssh-user", default=None, help="SSH login user. Defaults to the profile ssh_user or 'skillbox'.")
+    register_parser.add_argument("--ssh-user", default=None, type=_validate_ssh_user, help="SSH login user. Defaults to the profile ssh_user or 'skillbox'.")
     register_parser.add_argument("--force", action="store_true", help="Replace an existing active inventory entry with the same id.")
     register_parser.add_argument("--no-probe", action="store_true", help="Skip the SSH probe and save known fields only.")
     register_parser.add_argument("--format", choices=("text", "json"), default="text")
 
     import_parser = subparsers.add_parser("import", help="Alias for register.")
     import_parser.add_argument("box_id", nargs="?", default=None, help="Local box identifier. Defaults to a host-derived alias.")
-    import_parser.add_argument("--host", required=True, help="Reachable host: Tailscale hostname, Tailscale IP, or public IP.")
+    import_parser.add_argument("--host", required=True, type=_validate_host, help="Reachable host: Tailscale hostname, Tailscale IP, or public IP.")
     import_parser.add_argument("--profile", default="shared", help="Local profile label (default: shared).")
-    import_parser.add_argument("--ssh-user", default=None, help="SSH login user. Defaults to the profile ssh_user or 'skillbox'.")
+    import_parser.add_argument("--ssh-user", default=None, type=_validate_ssh_user, help="SSH login user. Defaults to the profile ssh_user or 'skillbox'.")
     import_parser.add_argument("--force", action="store_true", help="Replace an existing active inventory entry with the same id.")
     import_parser.add_argument("--no-probe", action="store_true", help="Skip the SSH probe and save known fields only.")
     import_parser.add_argument("--format", choices=("text", "json"), default="text")
