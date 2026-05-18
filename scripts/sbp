@@ -43,6 +43,33 @@ find_skillbox_root() {
   return 1
 }
 
+configure_operator_defaults() {
+  local config_candidate=""
+  local config_root=""
+  local config_candidates=()
+  if [[ -n "${SKILLBOX_CONFIG_ROOT:-}" ]]; then
+    config_candidates+=("${SKILLBOX_CONFIG_ROOT}")
+  fi
+  config_candidates+=("${HOME}/repos/skillbox-config")
+
+  for config_candidate in "${config_candidates[@]}"; do
+    if [[ -d "${config_candidate}/clients" ]]; then
+      config_root="$(realpath_portable "${config_candidate}")"
+      break
+    fi
+  done
+
+  if [[ -n "${config_root}" && -z "${SKILLBOX_CLIENTS_HOST_ROOT:-}" ]]; then
+    export SKILLBOX_CLIENTS_HOST_ROOT="${config_root}/clients"
+  fi
+  if [[ -z "${SKILLBOX_MONOSERVER_ROOT:-}" && -d "${HOME}/repos" ]]; then
+    export SKILLBOX_MONOSERVER_ROOT="${HOME}/repos"
+  fi
+  if [[ -z "${SKILLBOX_MONOSERVER_HOST_ROOT:-}" && -d "${HOME}/repos" ]]; then
+    export SKILLBOX_MONOSERVER_HOST_ROOT="${HOME}/repos"
+  fi
+}
+
 print_help() {
   cat <<'EOF' | sed "s/__WRAPPER__/${wrapper_name}/g"
 __WRAPPER__ - personal skillbox runtime and skill helper
@@ -63,6 +90,7 @@ Usage:
   __WRAPPER__ recalibrate [args...]   Read-only cwd skill add/remove recalibration
   __WRAPPER__ candidates [args...]    Explore linkable skill sources for this cwd
   __WRAPPER__ mcp [args...]           Read-only Claude JSON / Codex TOML MCP audit
+  __WRAPPER__ registry doctor [args...] Check registry/repos.yaml against local Git repos
   __WRAPPER__ beads [status|init|sync] Check or initialize repo-local beads state
   __WRAPPER__ mmdx QUERY              Fuzzy-find and open .mmdx/.mmd from this cwd
   __WRAPPER__ mmdx                    List recent .mmdx/.mmd files from this repo
@@ -147,6 +175,7 @@ payload = {
         {"name": "skills", "json": True, "safe_first_try": f"{wrapper} skills --issues-only --json"},
         {"name": "candidates", "json": True, "safe_first_try": f"{wrapper} candidates --json"},
         {"name": "mcp", "json": True, "safe_first_try": f"{wrapper} mcp --json"},
+        {"name": "registry", "json": True, "safe_first_try": f"{wrapper} registry doctor --json"},
         {"name": "recalibrate", "json": False, "safe_first_try": f"{wrapper} recalibrate"},
     ],
     "agent_surfaces": {
@@ -251,6 +280,7 @@ if [[ -z "${skillbox_root}" ]]; then
   echo "${wrapper_name}: missing skillbox repo; set SKILLBOX_ROOT or install from a checkout" >&2
   exit 1
 fi
+configure_operator_defaults
 
 case "${1:-}" in
   "" )
@@ -317,6 +347,10 @@ case "${1:-}" in
     ;;
   mcp|mcps)
     action="mcp-audit"
+    shift
+    ;;
+  registry|repos|repo-registry)
+    action="repo-registry"
     shift
     ;;
   beads|br)
@@ -407,7 +441,7 @@ append_passthrough_token() {
     sync)
       sync_paths+=("${token}")
       ;;
-    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|beads|mmdx|operator-booking|swimmers-launch)
+    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|repo-registry|beads|mmdx|operator-booking|swimmers-launch)
       passthrough_args+=("${token}")
       ;;
     *)
@@ -426,6 +460,9 @@ append_json_flag() {
       runtime_args+=(--format json)
       ;;
     capabilities|robot-triage)
+      ;;
+    repo-registry)
+      passthrough_args+=(--json)
       ;;
     *)
       passthrough_args+=(--format json)
@@ -634,6 +671,32 @@ PY
     ;;
   mcp-audit)
     python3 .env-manager/manage.py mcp-audit "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    ;;
+  repo-registry)
+    config_root="${SKILLBOX_CONFIG_ROOT:-${HOME}/repos/skillbox-config}"
+    registry_doctor="${config_root}/scripts/registry_doctor.py"
+    registry_action="${passthrough_args[0]:-doctor}"
+    if [[ "${registry_action}" == --* ]]; then
+      registry_action="doctor"
+      registry_args=("${passthrough_args[@]}")
+    elif [[ ${#passthrough_args[@]} -gt 0 ]]; then
+      registry_args=("${passthrough_args[@]:1}")
+    else
+      registry_args=()
+    fi
+    if [[ ! -f "${registry_doctor}" ]]; then
+      echo "${wrapper_name} registry: missing registry doctor at ${registry_doctor}" >&2
+      exit 1
+    fi
+    case "${registry_action}" in
+      doctor|status|"")
+        python3 "${registry_doctor}" "${registry_args[@]}"
+        ;;
+      *)
+        echo "${wrapper_name} registry: unknown action '${registry_action}' (expected doctor)" >&2
+        exit 2
+        ;;
+    esac
     ;;
   recalibrate)
     recalibrate_fleet="false"
