@@ -573,6 +573,58 @@ class CliWrapperTests(unittest.TestCase):
                 ["status", "--cwd", str(ROOT_DIR), "--profile", "local-core"],
             )
 
+    def test_sbp_status_prefers_canonical_operator_config_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            home = root / "home"
+            clients_root = home / "repos" / "skillbox-config" / "clients"
+            clients_root.mkdir(parents=True)
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "status",
+                fake_root=fake_root,
+                home=home,
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                record["env"]["SKILLBOX_CLIENTS_HOST_ROOT"],
+                str(clients_root.resolve()),
+            )
+            self.assertEqual(record["env"]["SKILLBOX_MONOSERVER_ROOT"], str(home / "repos"))
+            self.assertEqual(record["env"]["SKILLBOX_MONOSERVER_HOST_ROOT"], str(home / "repos"))
+
+    def test_sbp_status_preserves_explicit_clients_root_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            home = root / "home"
+            (home / "repos" / "skillbox-config" / "clients").mkdir(parents=True)
+            custom_clients_root = root / "custom-clients"
+            custom_clients_root.mkdir()
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "status",
+                fake_root=fake_root,
+                home=home,
+                extra_env={"SKILLBOX_CLIENTS_HOST_ROOT": str(custom_clients_root)},
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                record["env"]["SKILLBOX_CLIENTS_HOST_ROOT"],
+                str(custom_clients_root),
+            )
+
     def test_sbp_hire_maps_operator_booking(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -636,7 +688,15 @@ class CliWrapperTests(unittest.TestCase):
                 import os
                 import sys
 
-                payload = {"argv": sys.argv[1:], "cwd": os.getcwd()}
+                payload = {
+                    "argv": sys.argv[1:],
+                    "cwd": os.getcwd(),
+                    "env": {
+                        "SKILLBOX_CLIENTS_HOST_ROOT": os.environ.get("SKILLBOX_CLIENTS_HOST_ROOT"),
+                        "SKILLBOX_MONOSERVER_HOST_ROOT": os.environ.get("SKILLBOX_MONOSERVER_HOST_ROOT"),
+                        "SKILLBOX_MONOSERVER_ROOT": os.environ.get("SKILLBOX_MONOSERVER_ROOT"),
+                    },
+                }
                 with open(os.environ["SKILLBOX_RECORD"], "w", encoding="utf-8") as handle:
                     json.dump(payload, handle)
                 print(json.dumps(payload))
@@ -651,15 +711,21 @@ class CliWrapperTests(unittest.TestCase):
         wrapper: Path,
         *args: str,
         fake_root: Path | None = None,
+        home: Path | None = None,
         invoke_cwd: Path | None = None,
+        extra_env: dict[str, str] | None = None,
         record_path: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.setdefault("TERM", "dumb")
         if fake_root is not None:
             env["SKILLBOX_ROOT"] = str(fake_root)
+        if home is not None:
+            env["HOME"] = str(home)
         if invoke_cwd is not None:
             env["SKILLBOX_INVOKE_CWD"] = str(invoke_cwd)
+        if extra_env:
+            env.update(extra_env)
         if record_path is not None:
             env["SKILLBOX_RECORD"] = str(record_path)
         else:
