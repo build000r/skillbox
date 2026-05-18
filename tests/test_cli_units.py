@@ -782,6 +782,225 @@ except RuntimeError as exc:
             self.assertEqual(run_main(["--root-dir", tmpdir, "status", "--format", "json"]), CLI.EXIT_ERROR)
         self.assertEqual(emitted[-1]["error"]["message"], "broken")
 
+    def test_runtime_cwd_inference_prefers_client_with_local_runtime_service_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            shared_dep = root / "ingredient_server"
+            shared_dep.mkdir()
+            model = {
+                "selection": {},
+                "clients": [
+                    {
+                        "id": "personal",
+                        "label": "Personal",
+                        "default_cwd": str(root),
+                        "context": {"cwd_match": [str(root)]},
+                    },
+                    {
+                        "id": "cca",
+                        "label": "CCA",
+                        "default_cwd": str(root / "cca-website"),
+                        "context": {"cwd_match": [str(shared_dep)]},
+                    },
+                    {
+                        "id": "htma",
+                        "label": "HTMA",
+                        "default_cwd": str(root / "htma"),
+                        "context": {"cwd_match": [str(shared_dep)]},
+                    },
+                ],
+                "repos": [
+                    {
+                        "id": "ingredient_server",
+                        "host_path": str(shared_dep),
+                        "client": "htma",
+                    },
+                    {
+                        "id": "personal-ingredient",
+                        "host_path": str(shared_dep),
+                        "client": "personal",
+                    },
+                ],
+                "services": [
+                    {
+                        "id": "personal-ingredient",
+                        "client": "personal",
+                        "repo": "personal-ingredient",
+                        "profiles": ["local-all"],
+                        "commands": {"reuse": "make personal-local-up"},
+                    },
+                    {
+                        "id": "ingredient_server",
+                        "client": "htma",
+                        "repo": "ingredient_server",
+                        "profiles": ["local-all"],
+                        "commands": {"reuse": "make local-up"},
+                    },
+                ],
+                "artifacts": [],
+                "env_files": [],
+                "skills": [],
+                "tasks": [],
+                "logs": [],
+                "checks": [],
+                "bridges": [],
+                "service_mode_commands": [],
+                "ingress_routes": [],
+                "parity_ledger": [],
+            }
+
+            args = _ns(command="up", cwd=str(shared_dep), profile=["local-all"])
+
+            self.assertEqual(CLI._active_clients_for_args(args, model), {"htma"})
+
+    def test_skill_cwd_inference_keeps_visibility_match_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            shared_dep = root / "ingredient_server"
+            shared_dep.mkdir()
+            model = {
+                "selection": {},
+                "clients": [
+                    {
+                        "id": "personal",
+                        "label": "Personal",
+                        "default_cwd": str(root),
+                        "context": {"cwd_match": [str(root)]},
+                    },
+                    {
+                        "id": "cca",
+                        "label": "CCA",
+                        "default_cwd": str(root / "cca-website"),
+                        "context": {"cwd_match": [str(shared_dep)]},
+                    },
+                    {
+                        "id": "htma",
+                        "label": "HTMA",
+                        "default_cwd": str(root / "htma"),
+                        "context": {"cwd_match": [str(shared_dep)]},
+                    },
+                ],
+                "repos": [
+                    {
+                        "id": "ingredient_server",
+                        "host_path": str(shared_dep),
+                        "client": "htma",
+                    },
+                    {
+                        "id": "personal-ingredient",
+                        "host_path": str(shared_dep),
+                        "client": "personal",
+                    },
+                ],
+                "services": [
+                    {
+                        "id": "personal-ingredient",
+                        "client": "personal",
+                        "repo": "personal-ingredient",
+                        "profiles": ["local-all"],
+                        "commands": {"reuse": "make personal-local-up"},
+                    },
+                    {
+                        "id": "ingredient_server",
+                        "client": "htma",
+                        "repo": "ingredient_server",
+                        "profiles": ["local-all"],
+                        "commands": {"reuse": "make local-up"},
+                    },
+                ],
+                "artifacts": [],
+                "env_files": [],
+                "skills": [],
+                "tasks": [],
+                "logs": [],
+                "checks": [],
+                "bridges": [],
+                "service_mode_commands": [],
+                "ingress_routes": [],
+                "parity_ledger": [],
+            }
+
+            args = _ns(command="skills", cwd=str(shared_dep), profile=["local-all"])
+
+            self.assertEqual(CLI._active_clients_for_args(args, model), {"cca"})
+
+    def test_runtime_cwd_inference_uses_existing_match_order_before_graph_size(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            app_root = root / "sweet-potato"
+            app_root.mkdir()
+            model = {
+                "selection": {},
+                "clients": [
+                    {
+                        "id": "sweet-potato",
+                        "label": "Sweet Potato",
+                        "default_cwd": str(app_root),
+                        "context": {"cwd_match": [str(app_root)]},
+                    },
+                    {
+                        "id": "htma",
+                        "label": "HTMA",
+                        "default_cwd": str(root / "htma"),
+                        "context": {"cwd_match": [str(app_root)]},
+                    },
+                ],
+                "repos": [
+                    {
+                        "id": "spaps-local",
+                        "host_path": str(app_root),
+                        "client": "sweet-potato",
+                    },
+                    {
+                        "id": "spaps-htma",
+                        "host_path": str(app_root),
+                        "client": "htma",
+                    },
+                    {
+                        "id": "htma-api",
+                        "host_path": str(root / "htma_server"),
+                        "client": "htma",
+                    },
+                ],
+                "services": [
+                    {
+                        "id": "spaps-local",
+                        "client": "sweet-potato",
+                        "repo": "spaps-local",
+                        "profiles": ["local-all"],
+                        "commands": {"reuse": "make local-up"},
+                    },
+                    {
+                        "id": "spaps-htma",
+                        "client": "htma",
+                        "repo": "spaps-htma",
+                        "profiles": ["local-all"],
+                        "commands": {"reuse": "make local-up"},
+                    },
+                    {
+                        "id": "htma-api",
+                        "client": "htma",
+                        "repo": "htma-api",
+                        "profiles": ["local-all"],
+                        "commands": {"reuse": "make local-up"},
+                    },
+                ],
+                "artifacts": [],
+                "env_files": [],
+                "skills": [],
+                "tasks": [],
+                "logs": [],
+                "checks": [],
+                "bridges": [],
+                "service_mode_commands": [],
+                "ingress_routes": [],
+                "parity_ledger": [],
+            }
+
+            args = _ns(command="up", cwd=str(app_root), profile=["local-all"])
+
+            self.assertEqual(CLI._active_clients_for_args(args, model), {"sweet-potato"})
+
     def test_high_risk_handlers_emit_structured_payloads(self) -> None:
         emitted: list[dict[str, object]] = []
         root = Path("/tmp/skillbox")

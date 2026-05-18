@@ -3353,6 +3353,128 @@ def _emit_main_exception(args: argparse.Namespace, exc: Exception) -> int:
     return EXIT_ERROR
 
 
+def _path_is_under_or_equal(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+        return True
+    except ValueError:
+        return candidate == root
+
+
+def _runtime_path_from_repo(repo: dict[str, Any]) -> Path | None:
+    raw_path = str(repo.get("host_path") or repo.get("path") or "").strip()
+    if not raw_path:
+        return None
+    return Path(os.path.expandvars(os.path.expanduser(raw_path))).resolve()
+
+
+def _longest_matching_runtime_root(cwd: Path, repos: list[dict[str, Any]]) -> int:
+    best_len = 0
+    for repo in repos:
+        root = _runtime_path_from_repo(repo)
+        if root is None or not _path_is_under_or_equal(cwd, root):
+            continue
+        best_len = max(best_len, len(str(root)))
+    return best_len
+
+
+def _runtime_item_owned_by_client(
+    item: dict[str, Any],
+    repo_map: dict[str, dict[str, Any]],
+    client_id: str,
+) -> bool:
+    item_client = str(item.get("client") or "").strip()
+    if item_client:
+        return item_client == client_id
+    repo = repo_map.get(runtime_repo_reference_id(item))
+    return str((repo or {}).get("client") or "").strip() == client_id
+
+
+def _local_runtime_services_for_profiles(
+    model: dict[str, Any],
+    active_profiles: set[str],
+) -> list[dict[str, Any]]:
+    services_by_id: dict[str, dict[str, Any]] = {}
+    for profile in sorted(active_profiles):
+        if not profile.startswith("local-"):
+            continue
+        for service in select_local_runtime_services(model, profile):
+            service_id = str(service.get("id") or "").strip()
+            if service_id:
+                services_by_id.setdefault(service_id, service)
+    return list(services_by_id.values())
+
+
+def _runtime_client_cwd_score(
+    model: dict[str, Any],
+    active_profiles: set[str],
+    client_id: str,
+    cwd: Path,
+) -> tuple[int, ...]:
+    repo_map = runtime_repo_map(model)
+    client_services = [
+        service
+        for service in _local_runtime_services_for_profiles(model, active_profiles)
+        if _runtime_item_owned_by_client(service, repo_map, client_id)
+    ]
+    client_repos = [
+        repo
+        for repo in model.get("repos") or []
+        if str(repo.get("client") or "").strip() == client_id
+    ]
+    service_repos = [
+        repo_map[repo_id]
+        for service in client_services
+        for repo_id in [runtime_repo_reference_id(service)]
+        if repo_id in repo_map
+    ]
+    matching_service_root_len = _longest_matching_runtime_root(cwd, service_repos)
+    matching_client_root_len = _longest_matching_runtime_root(cwd, client_repos)
+    manageable_count = sum(
+        1 for service in client_services
+        if service_supports_lifecycle(service, model)[0]
+    )
+    return (
+        int(matching_service_root_len > 0),
+        matching_service_root_len,
+        int(bool(client_services)),
+        int(matching_client_root_len > 0),
+        matching_client_root_len,
+        manageable_count,
+        len(client_services),
+    )
+
+
+def _runtime_client_for_cwd(
+    args: argparse.Namespace,
+    model: dict[str, Any],
+    cwd: Path,
+    matches: list[dict[str, Any]],
+) -> str:
+    active_profiles = normalize_active_profiles(getattr(args, "profile", []))
+    ranked: list[tuple[tuple[int, int], int, tuple[int, ...], str]] = []
+    for index, match in enumerate(matches):
+        client_id = str(match.get("id") or "").strip()
+        if not client_id:
+            continue
+        filtered = filter_model(
+            model,
+            active_profiles,
+            normalize_active_clients(model, [client_id]),
+        )
+        runtime_score = _runtime_client_cwd_score(filtered, active_profiles, client_id, cwd)
+        match_len = len(str(match.get("match") or ""))
+        ranked.append((
+            (runtime_score[0], match_len),
+            -index,
+            runtime_score,
+            client_id,
+        ))
+    if not ranked:
+        return str(matches[0]["id"])
+    return max(ranked)[3]
+
+
 def _active_clients_for_args(args: argparse.Namespace, model: dict[str, Any]) -> list[str]:
     requested_clients = getattr(args, "client", [])
     positional_client = str(getattr(args, "client_id", "") or "").strip()
@@ -3382,6 +3504,8 @@ def _active_clients_for_args(args: argparse.Namespace, model: dict[str, Any]) ->
     matches = matched_skill_clients(model, skill_cwd)
     if not matches:
         return active_clients
+    if args.command in {"bootstrap", "up", "down", "restart", "status", "logs"}:
+        return normalize_active_clients(model, [_runtime_client_for_cwd(args, model, skill_cwd.resolve(), matches)])
     return normalize_active_clients(model, [matches[0]["id"]])
 
 
