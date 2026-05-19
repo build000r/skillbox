@@ -415,7 +415,7 @@ def print_service_actions_text(payload: dict[str, Any]) -> None:
     if task_results:
         print("tasks:")
         for item in task_results:
-            summary = item.get("result", "unknown")
+            summary = item.get("result") or item.get("status") or "unknown"
             if item.get("target"):
                 summary = f"{summary} ({item['target']})"
             print(f"  - {item['id']}: {summary}")
@@ -428,6 +428,39 @@ def print_service_actions_text(payload: dict[str, Any]) -> None:
         if item.get("reason"):
             summary = f"{summary} ({item['reason']})"
         print(f"  - {item['id']}: {summary}")
+
+
+def print_endpoint_summary(summary: dict[str, list[dict[str, Any]]]) -> None:
+    apps = summary.get("apps") or []
+    apis = summary.get("apis") or []
+    if not apps and not apis:
+        return
+
+    def _row(item: dict[str, Any], id_width: int, url_width: int) -> str:
+        alias = item.get("alias")
+        status = item.get("status")
+        suffix_parts: list[str] = []
+        if status:
+            suffix_parts.append(status)
+        if alias:
+            suffix_parts.append(f"({alias})")
+        suffix = "   " + "   ".join(suffix_parts) if suffix_parts else ""
+        return f"  {item['id']:<{id_width}}  {item['url']:<{url_width}}{suffix}".rstrip()
+
+    if apps:
+        id_w = max(len(a["id"]) for a in apps)
+        url_w = max(len(a["url"]) for a in apps)
+        print()
+        print("apps:")
+        for app in apps:
+            print(_row(app, id_w, url_w))
+    if apis:
+        id_w = max(len(a["id"]) for a in apis)
+        url_w = max(len(a["url"]) for a in apis)
+        print()
+        print("APIs:")
+        for api in apis:
+            print(_row(api, id_w, url_w))
 
 
 def print_service_logs_text(payload: dict[str, Any]) -> None:

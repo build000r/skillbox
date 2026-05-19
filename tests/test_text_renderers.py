@@ -21,6 +21,7 @@ MANAGE_MODULE = SourceFileLoader(
 ).load_module()
 
 print_local_runtime_error_text = MANAGE_MODULE.print_local_runtime_error_text
+print_service_actions_text = MANAGE_MODULE.print_service_actions_text
 local_runtime_error = MANAGE_MODULE.local_runtime_error
 emit_json = MANAGE_MODULE.emit_json
 
@@ -118,6 +119,22 @@ class LocalRuntimeErrorRendererTests(unittest.TestCase):
             "next action: manage.py status --client personal --profile local-core",
             out,
         )
+
+    def test_service_actions_task_rows_prefer_status_when_result_absent(self) -> None:
+        payload = {
+            "bootstrap_tasks": [
+                {"id": "cycle-chef-web-install", "status": "ready"},
+                {"id": "other-bootstrap", "result": "completed"},
+            ],
+            "services": [],
+        }
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            print_service_actions_text(payload)
+        out = buf.getvalue()
+        self.assertIn("  - cycle-chef-web-install: ready", out)
+        self.assertIn("  - other-bootstrap: completed", out)
+        self.assertNotIn("cycle-chef-web-install: unknown", out)
 
     def test_tc4_service_deferred_logs_short_circuit(self) -> None:
         # TC-4: logs deferred surface — has next_action, no blocked_services.

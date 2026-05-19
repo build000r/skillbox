@@ -2737,7 +2737,7 @@ def wait_for_service_health(
             return {"state": "failed", "exit_code": process.returncode}
         time.sleep(0.25)
 
-    return {"state": "timeout"} | service_healthcheck_state(service)
+    return service_healthcheck_state(service) | {"state": "timeout"}
 
 
 def tail_lines(path: Path, line_count: int) -> list[str]:
@@ -3122,6 +3122,69 @@ def _prelaunch_running_result(service: dict[str, Any], result: dict[str, Any]) -
     return reused_result
 
 
+def _service_has_declared_healthcheck(service: dict[str, Any]) -> bool:
+    healthcheck = service.get("healthcheck") or {}
+    return bool(healthcheck.get("type"))
+
+
+def _running_pid_service_result(
+    service: dict[str, Any],
+    result: dict[str, Any],
+    paths: dict[str, Path],
+    *,
+    pid: int,
+    dry_run: bool,
+) -> dict[str, Any] | None:
+    if not _service_has_declared_healthcheck(service):
+        return result | {"result": "already-running", "pid": pid}
+
+    health_state = service_healthcheck_state(service)
+    if health_state.get("state") == "ok":
+        reused_result = result | {"result": "already-running", "pid": pid}
+        _copy_health_fields(reused_result, health_state, ("url", "target", "port", "pattern"))
+        log_runtime_event("service.reused", service["id"])
+        return reused_result
+
+    if dry_run:
+        detail = result | {
+            "result": "would-restart",
+            "pid": pid,
+            "health_state": health_state.get("state", "unknown"),
+        }
+        _copy_health_fields(detail, health_state, ("url", "target", "port", "pattern"))
+        return detail
+
+    stop_result, signal_used = stop_process(pid, DEFAULT_SERVICE_STOP_WAIT_SECONDS)
+    if stop_result not in {"stopped", "killed", "not-running"}:
+        detail = result | {
+            "result": "failed",
+            "pid": pid,
+            "reason": "already-running service is unhealthy and could not be stopped for restart",
+            "stop_result": stop_result,
+        }
+        if signal_used is not None:
+            detail["signal"] = signal_used
+        _copy_health_fields(detail, health_state, ("url", "target", "port", "pattern"))
+        log_runtime_event(
+            "service.restart_blocked",
+            service["id"],
+            {"pid": pid, "health_state": health_state.get("state"), "stop_result": stop_result},
+        )
+        return detail
+
+    remove_pid_file(paths["pid_file"])
+    result["previous_pid"] = pid
+    result["recovered_from"] = "unhealthy-already-running"
+    result["previous_health_state"] = health_state.get("state", "unknown")
+    _copy_health_fields(result, health_state, ("url", "target", "port", "pattern"))
+    log_runtime_event(
+        "service.restarting_unhealthy",
+        service["id"],
+        {"previous_pid": pid, "health_state": health_state.get("state"), "stop_result": stop_result},
+    )
+    return None
+
+
 def _service_launch_context(
     model: dict[str, Any],
     service: dict[str, Any],
@@ -3302,7 +3365,15 @@ def _start_service(
 
     pid = live_service_pid(paths["pid_file"])
     if pid is not None:
-        return result | {"result": "already-running", "pid": pid}
+        running_result = _running_pid_service_result(
+            service,
+            result,
+            paths,
+            pid=pid,
+            dry_run=dry_run,
+        )
+        if running_result is not None:
+            return running_result
 
     prelaunch_result = _prelaunch_running_result(service, result)
     if prelaunch_result is not None:
@@ -3323,6 +3394,23 @@ def _start_service(
     )
 
 
+def _start_result_allows_dependents(entry: dict[str, Any]) -> bool:
+    return entry.get("result") in {"started", "already-running", "dry-run", "would-restart"}
+
+
+def _blocked_service_start_result(
+    service: dict[str, Any],
+    model: dict[str, Any],
+    blocked_on: list[str],
+) -> dict[str, Any]:
+    paths = service_paths(model, service)
+    return _service_start_base_result(service, paths) | {
+        "result": "blocked",
+        "blocked_on": blocked_on,
+        "reason": "dependency did not become healthy",
+    }
+
+
 def start_services(
     model: dict[str, Any],
     services: list[dict[str, Any]],
@@ -3332,16 +3420,30 @@ def start_services(
     mode: str | None = None,
 ) -> list[dict[str, Any]]:
     effective_mode = (mode or "").strip() or None
-    return [
-        _start_service(
-            model,
-            service,
-            dry_run=dry_run,
-            wait_seconds=wait_seconds,
-            effective_mode=effective_mode,
-        )
-        for service in services
-    ]
+    results: list[dict[str, Any]] = []
+    results_by_id: dict[str, dict[str, Any]] = {}
+    for service in services:
+        blocked_on = [
+            dependency_id
+            for dependency_id in service_dependency_ids(service)
+            if dependency_id in results_by_id
+            and not _start_result_allows_dependents(results_by_id[dependency_id])
+        ]
+        if blocked_on:
+            result = _blocked_service_start_result(service, model, blocked_on)
+        else:
+            result = _start_service(
+                model,
+                service,
+                dry_run=dry_run,
+                wait_seconds=wait_seconds,
+                effective_mode=effective_mode,
+            )
+        results.append(result)
+        service_id = str(service.get("id", "")).strip()
+        if service_id:
+            results_by_id[service_id] = result
+    return results
 
 
 def stop_services(
