@@ -3103,13 +3103,33 @@ def _check_logs_deferred_surfaces(args: argparse.Namespace, model: dict[str, Any
     return EXIT_ERROR
 
 
-def _emit_up_payload(args: argparse.Namespace, payload: dict[str, Any], exit_code: int) -> int:
+def _emit_up_payload(
+    args: argparse.Namespace,
+    payload: dict[str, Any],
+    exit_code: int,
+    model: dict[str, Any] | None = None,
+) -> int:
     if args.format == "json":
         emit_json(payload)
     elif exit_code != EXIT_OK and "error" in payload:
         print_local_runtime_error_text(payload)
     else:
         print_service_actions_text(payload)
+        if model is not None and not getattr(args, "dry_run", False):
+            try:
+                from .endpoints import build_endpoint_summary
+
+                started = {
+                    s["id"]
+                    for s in (payload.get("services") or [])
+                    if s.get("id") and s.get("result") not in {"failed", "skip", "skipped"}
+                }
+                summary = build_endpoint_summary(model, started or None)
+                print_endpoint_summary(summary)
+            except Exception:
+                # Endpoint summary is purely informational; never let it fail
+                # the `up` command.
+                pass
     return exit_code
 
 
@@ -3148,7 +3168,7 @@ def _handle_local_profile_up(
         dry_run=args.dry_run,
         wait_seconds=max(0.0, float(args.wait_seconds)),
     )
-    return _emit_up_payload(args, up_payload, up_exit)
+    return _emit_up_payload(args, up_payload, up_exit, model=model)
 
 
 def _bridge_missing_payload(args: argparse.Namespace, bridge: dict[str, Any]) -> dict[str, Any]:
@@ -3220,6 +3240,7 @@ def _handle_up(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], 
         args,
         _legacy_up_payload(args, model, requested_services, resolved_mode),
         EXIT_OK,
+        model=model,
     )
 
 
@@ -3451,6 +3472,12 @@ def _runtime_client_for_cwd(
     cwd: Path,
     matches: list[dict[str, Any]],
 ) -> str:
+    # Prefer the client whose `cwd_match` prefix is the most specific (longest
+    # expanded match), regardless of whether the client owns a managed
+    # service. The broader `personal` overlay covers ~/repos and would
+    # otherwise win for every repo because it owns the canonical service
+    # definition for each one. Falls back to the service-ownership signal
+    # only as a tiebreak.
     active_profiles = normalize_active_profiles(getattr(args, "profile", []))
     ranked: list[tuple[tuple[int, int], int, tuple[int, ...], str]] = []
     for index, match in enumerate(matches):
@@ -3465,7 +3492,7 @@ def _runtime_client_for_cwd(
         runtime_score = _runtime_client_cwd_score(filtered, active_profiles, client_id, cwd)
         match_len = len(str(match.get("match") or ""))
         ranked.append((
-            (runtime_score[0], match_len),
+            (match_len, runtime_score[0]),
             -index,
             runtime_score,
             client_id,

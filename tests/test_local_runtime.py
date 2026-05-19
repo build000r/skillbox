@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import http.server
+import subprocess
 import sys
 import socket
 import tempfile
@@ -35,6 +36,7 @@ runtime_status = MANAGE_MODULE.runtime_status
 select_local_runtime_services = MANAGE_MODULE.select_local_runtime_services
 service_healthcheck_state = MANAGE_MODULE.service_healthcheck_state
 start_services = MANAGE_MODULE.start_services
+stop_process = MANAGE_MODULE.stop_process
 validate_env_file_target_paths = MANAGE_MODULE.validate_env_file_target_paths
 validate_parity_ledger = MANAGE_MODULE.validate_parity_ledger
 normalize_active_clients = MANAGE_MODULE.normalize_active_clients
@@ -570,6 +572,126 @@ class BridgeBackedTaskTests(unittest.TestCase):
             self.assertEqual(results[0]["result"], "already-running")
             self.assertEqual(results[0]["url"], f"http://127.0.0.1:{port}/")
             self.assertFalse((logs_dir / "cm-mcp.pid").exists())
+
+    def test_start_services_restarts_unhealthy_live_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            logs_dir = root / "logs" / "runtime"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+
+            stale = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                start_new_session=True,
+            )
+            pid_file = logs_dir / "cm-mcp.pid"
+            pid_file.write_text(f"{stale.pid}\n", encoding="utf-8")
+            model = {
+                "root_dir": str(root),
+                "env": {},
+                "artifacts": [],
+                "logs": [{"id": "runtime", "host_path": str(logs_dir)}],
+                "repos": [{"id": "skillbox-self", "host_path": str(root), "path": str(root)}],
+                "services": [],
+            }
+            service = {
+                "id": "cm-mcp",
+                "kind": "http",
+                "repo": "skillbox-self",
+                "command": f"{sys.executable} -m http.server {port} --bind 127.0.0.1",
+                "healthcheck": {"type": "http", "url": f"http://127.0.0.1:{port}/"},
+                "log": "runtime",
+            }
+
+            results: list[dict[str, Any]] = []
+            try:
+                results = start_services(model, [service], dry_run=False, wait_seconds=3)
+                self.assertEqual(results[0]["result"], "started")
+                self.assertEqual(results[0]["previous_pid"], stale.pid)
+                self.assertEqual(results[0]["recovered_from"], "unhealthy-already-running")
+                self.assertNotEqual(results[0]["pid"], stale.pid)
+                self.assertIsNotNone(stale.poll())
+            finally:
+                if results and results[0].get("pid"):
+                    stop_process(int(results[0]["pid"]), 1)
+                if stale.poll() is None:
+                    stop_process(stale.pid, 1)
+
+    def test_start_services_blocks_dependents_after_dependency_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            logs_dir = root / "logs" / "runtime"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            marker = root / "web-started"
+            model = {
+                "root_dir": str(root),
+                "env": {},
+                "artifacts": [],
+                "logs": [{"id": "runtime", "host_path": str(logs_dir)}],
+                "repos": [{"id": "skillbox-self", "host_path": str(root), "path": str(root)}],
+                "services": [],
+            }
+            services = [
+                {
+                    "id": "auth",
+                    "kind": "service",
+                    "repo": "skillbox-self",
+                    "command": f"{sys.executable} -c \"import sys; sys.exit(1)\"",
+                    "healthcheck": {"type": "http", "url": "http://127.0.0.1:9/health"},
+                    "log": "runtime",
+                },
+                {
+                    "id": "web",
+                    "kind": "service",
+                    "repo": "skillbox-self",
+                    "depends_on": ["auth"],
+                    "command": (
+                        f"{sys.executable} -c "
+                        f"\"from pathlib import Path; Path({str(marker)!r}).write_text('started')\""
+                    ),
+                    "log": "runtime",
+                },
+            ]
+
+            results = start_services(model, services, dry_run=False, wait_seconds=0.5)
+
+            self.assertEqual(results[0]["result"], "failed")
+            self.assertEqual(results[1]["result"], "blocked")
+            self.assertEqual(results[1]["blocked_on"], ["auth"])
+            self.assertFalse(marker.exists())
+
+    def test_start_services_times_out_when_process_lives_but_health_stays_down(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            logs_dir = root / "logs" / "runtime"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            model = {
+                "root_dir": str(root),
+                "env": {},
+                "artifacts": [],
+                "logs": [{"id": "runtime", "host_path": str(logs_dir)}],
+                "repos": [{"id": "skillbox-self", "host_path": str(root), "path": str(root)}],
+                "services": [],
+            }
+            service = {
+                "id": "api",
+                "kind": "http",
+                "repo": "skillbox-self",
+                "command": f"{sys.executable} -c \"import time; time.sleep(30)\"",
+                "healthcheck": {"type": "http", "url": "http://127.0.0.1:9/health"},
+                "log": "runtime",
+            }
+
+            results = start_services(model, [service], dry_run=False, wait_seconds=0.3)
+
+            try:
+                self.assertEqual(results[0]["result"], "timeout")
+                self.assertEqual(results[0]["url"], "http://127.0.0.1:9/health")
+            finally:
+                if results[0].get("pid"):
+                    stop_process(int(results[0]["pid"]), 1)
 
 
 class LocalRuntimeProfileValidationTests(unittest.TestCase):

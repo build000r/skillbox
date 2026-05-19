@@ -3915,7 +3915,7 @@ def _up_service_state(entry: dict[str, Any]) -> tuple[str, bool]:
         return "running", False
     if result_val == "timeout":
         return "starting", True
-    if result_val == "failed":
+    if result_val in {"failed", "blocked"}:
         return "failed", True
     return result_val, False
 
@@ -3932,7 +3932,11 @@ def _up_services_payload(started: list[dict[str, Any]]) -> tuple[list[dict[str, 
 
 
 def _up_failed_service_ids(started: list[dict[str, Any]]) -> list[str]:
-    return [str(entry.get("id", "")) for entry in started if entry.get("result") in {"failed", "timeout"}]
+    return [
+        str(entry.get("id", ""))
+        for entry in started
+        if entry.get("result") in {"failed", "timeout", "blocked"}
+    ]
 
 
 def _up_start_result(
