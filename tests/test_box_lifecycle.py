@@ -515,6 +515,7 @@ class BoxLifecycleTests(unittest.TestCase):
             os.environ,
             {
                 "SKILLBOX_SWIMMERS_PUBLISH_HOST": "127.0.0.1",
+                "SKILLBOX_SWIMMERS_EXPOSE": "1",
                 "SWIMMERS_SPAPS_WEBSITE_AUTH_TOKEN": "secret-token",
             },
             clear=False,
@@ -532,6 +533,45 @@ class BoxLifecycleTests(unittest.TestCase):
         self.assertEqual(env_updates["SKILLBOX_SWIMMERS_AUTH_MODE"], "token")
         self.assertEqual(env_updates["SKILLBOX_SWIMMERS_AUTH_TOKEN"], "secret-token")
         self.assertEqual(payload["swimmers_auth_token_env"], "SWIMMERS_SPAPS_WEBSITE_AUTH_TOKEN")
+
+    def test_remote_box_contract_payload_rejects_swimmers_token_without_expose_opt_in(self) -> None:
+        profile = BOX_MODULE.BoxProfile(id="dev-small")
+        box = BOX_MODULE.Box(
+            id="spaps-website",
+            profile="dev-small",
+            state="acceptance",
+            ssh_user="skillbox",
+        )
+        release = BOX_MODULE.DeployRelease(
+            manifest_path=Path("deploy.json"),
+            client_id="spaps-website",
+            source_commit="abc123def456",
+            payload_tree_sha256="1" * 64,
+            archive_path=Path("skillbox.tar.gz"),
+            archive_sha256="2" * 64,
+            active_profiles=["swimmers"],
+        )
+        context = BOX_MODULE.BoxUpContext(
+            box_id="spaps-website",
+            profile_name="dev-small",
+            profile=profile,
+            box=box,
+            boxes=[box],
+            ts_hostname="skillbox-spaps-website",
+            is_json=True,
+            deploy_release=release,
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SKILLBOX_SWIMMERS_PUBLISH_HOST": "127.0.0.1",
+                "SWIMMERS_SPAPS_WEBSITE_AUTH_TOKEN": "secret-token",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "SKILLBOX_SWIMMERS_EXPOSE=1"):
+                BOX_MODULE.remote_box_contract_payload(context)
 
     def test_cmd_down_success_marks_box_destroyed(self) -> None:
         box = BOX_MODULE.Box(

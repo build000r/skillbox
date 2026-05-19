@@ -455,6 +455,7 @@ Safety model:
 - the swimmers port is `3210`
 - the compose overlay publishes only to `127.0.0.1` by default
 - remote access requires opting in with `SKILLBOX_SWIMMERS_PUBLISH_HOST=0.0.0.0` (the helper exports this as `SWIMMERS_BIND`)
+- remote box helpers only promote loopback defaults to public bind when `SKILLBOX_SWIMMERS_EXPOSE=1` is set
 - non-loopback publishing is blocked unless `SKILLBOX_SWIMMERS_AUTH_MODE=token` and `SKILLBOX_SWIMMERS_AUTH_TOKEN` are set
 - remote box status prints the canonical phone/browser URL as `Open this on phone: http://<tailnet-ip>:3210/` and separately reports public SSH, Tailnet ping, MagicDNS resolution, and port reachability
 
@@ -463,6 +464,7 @@ Remote operator example:
 ```bash
 # on the client skillbox
 cat >> .env <<'EOF'
+SKILLBOX_SWIMMERS_EXPOSE=1
 SKILLBOX_SWIMMERS_PUBLISH_HOST=0.0.0.0
 SKILLBOX_SWIMMERS_AUTH_MODE=token
 SKILLBOX_SWIMMERS_AUTH_TOKEN=replace-me

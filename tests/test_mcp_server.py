@@ -524,6 +524,22 @@ class SkillboxMcpServerTests(unittest.TestCase):
             "skillbox_overlay",
         )
 
+    def test_skillbox_overlay_validates_name_as_identifier(self) -> None:
+        with mock.patch.object(MODULE, "run_manage") as run_manage:
+            result = MODULE.handle_tools_call(
+                {
+                    "name": "skillbox_overlay",
+                    "arguments": {"action": "activate", "name": "../marketing"},
+                },
+                request_id="req-overlay-invalid",
+            )
+
+        payload = _content_payload(result)
+        self.assertTrue(result.get("isError"))
+        self.assertEqual(payload["error"]["type"], "invalid_parameter")
+        self.assertIn("path separators", payload["error"]["message"])
+        run_manage.assert_not_called()
+
     def test_skillbox_mmdx_open_maps_fuzzy_query_without_opening(self) -> None:
         tool_names = {tool["name"] for tool in MODULE.handle_tools_list({})["tools"]}
         self.assertIn("skillbox_mmdx_open", tool_names)

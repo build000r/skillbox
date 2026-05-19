@@ -1625,7 +1625,7 @@ def _positional_required(positional_key: str | None, positional: str | None, too
     return bool(positional_key and positional is None and not tool_params.get("list_blueprints"))
 
 
-def _validate_tool_identifiers(tool_params: dict) -> str | None:
+def _validate_tool_identifiers(tool_name: str, tool_params: dict) -> str | None:
     """Validate identifier-shaped params. Returns an error message or None."""
     # Validate client_id (scalar, used as positional for onboard/focus/session/acceptance/etc.)
     client_id = str(tool_params.get("client_id") or "").strip()
@@ -1681,9 +1681,10 @@ def _validate_tool_identifiers(tool_params: dict) -> str | None:
         except ValueError as exc:
             return str(exc)
 
-    # Validate overlay name
+    # Only overlay uses `name` as an identifier. Other tools, notably
+    # operator-booking, use it as a free-form display name.
     overlay_name = str(tool_params.get("name") or "").strip()
-    if overlay_name:
+    if tool_name == "skillbox_overlay" and overlay_name:
         try:
             _validate_identifier(overlay_name, "name")
         except ValueError as exc:
@@ -1703,7 +1704,7 @@ def _dispatch_manage_tool(
     tool_params = _tool_params_with_defaults(name, params)
 
     # Validate identifiers before passing to subprocess
-    id_error = _validate_tool_identifiers(tool_params)
+    id_error = _validate_tool_identifiers(name, tool_params)
     if id_error:
         return _error_content({"error": {"type": "invalid_parameter", "message": id_error, "recoverable": True}})
 
