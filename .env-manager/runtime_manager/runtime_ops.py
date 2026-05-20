@@ -1989,6 +1989,105 @@ def _port_listening_state(port: int, *, host: str = "127.0.0.1", timeout: float 
         return {"state": "down", "host": host, "port": port}
 
 
+def _service_declared_listen_port(service: dict[str, Any]) -> tuple[str, int] | None:
+    healthcheck = service.get("healthcheck") or {}
+    hc_type = healthcheck.get("type")
+    if hc_type == "port":
+        try:
+            port = int(healthcheck["port"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        host = str(healthcheck.get("host") or "127.0.0.1")
+        return host, port
+    if hc_type in {"http", "https"}:
+        url = str(healthcheck.get("url") or "")
+        if not url:
+            return None
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except ValueError:
+            return None
+        host = parsed.hostname or "127.0.0.1"
+        if parsed.port is not None:
+            return host, int(parsed.port)
+        if parsed.scheme == "https":
+            return host, 443
+        if parsed.scheme == "http":
+            return host, 80
+        return None
+    return None
+
+
+def _external_listener_owner(host: str, port: int) -> dict[str, Any] | None:
+    if shutil.which("lsof") is None:
+        return None
+    result = run_command(["lsof", "-nP", f"-iTCP@{host}:{port}", "-sTCP:LISTEN", "-Fpcn"])
+    if result.returncode != 0 or not result.stdout:
+        return None
+    owner: dict[str, Any] = {}
+    for line in result.stdout.splitlines():
+        if not line:
+            continue
+        tag, _, value = line[:1], line[1:2], line[1:]
+        if tag == "p":
+            try:
+                owner["pid"] = int(value)
+            except ValueError:
+                continue
+        elif tag == "c":
+            owner["command"] = value
+        if "pid" in owner and "command" in owner:
+            break
+    if "pid" not in owner:
+        return None
+    try:
+        ps_result = run_command(["ps", "-o", "etime=,command=", "-p", str(owner["pid"])])
+        if ps_result.returncode == 0:
+            head = ps_result.stdout.strip().split(None, 1)
+            if head:
+                owner["age"] = head[0]
+                if len(head) > 1 and "command" not in owner:
+                    owner["command"] = head[1]
+    except OSError:
+        pass
+    return owner
+
+
+def _port_conflict_blocked_result(
+    service: dict[str, Any],
+    result: dict[str, Any],
+    host: str,
+    port: int,
+    owner: dict[str, Any] | None,
+) -> dict[str, Any]:
+    detail = result | {
+        "result": "blocked",
+        "reason": "port_already_in_use",
+        "host": host,
+        "port": port,
+    }
+    if owner:
+        detail["external_pid"] = owner.get("pid")
+        if "command" in owner:
+            detail["external_command"] = owner["command"]
+        if "age" in owner:
+            detail["external_age"] = owner["age"]
+        hint_target = f"PID {owner['pid']}"
+    else:
+        hint_target = f"the process holding {host}:{port}"
+    detail["actionable"] = (
+        f"{host}:{port} is held by {hint_target}; free it (e.g. `kill {owner['pid']}`) "
+        if owner
+        else f"{host}:{port} is held by an unknown process; identify and stop it (try `lsof -nP -iTCP:{port} -sTCP:LISTEN`) "
+    ) + f"before re-running `sbp up {service.get('id', '<service>')}`."
+    log_runtime_event(
+        "service.start_blocked",
+        service["id"],
+        {"reason": "port_already_in_use", "port": port, "external_pid": owner.get("pid") if owner else None},
+    )
+    return detail
+
+
 def bridge_freshness(bridge: dict[str, Any], overlay_path: str | None = None) -> dict[str, Any]:
     outputs = bridge_expected_outputs(bridge)
     if not outputs:
@@ -3379,6 +3478,14 @@ def _start_service(
     if prelaunch_result is not None:
         return prelaunch_result
 
+    declared = _service_declared_listen_port(service)
+    if declared is not None:
+        host, port = declared
+        port_state = _port_listening_state(port, host=host)
+        if port_state.get("state") == "ok":
+            owner = _external_listener_owner(host, port)
+            return _port_conflict_blocked_result(service, result, host, port, owner)
+
     command, env, cwd, self_managed_pid_file = _service_launch_context(
         model, service, result, paths, effective_mode,
     )
@@ -3411,6 +3518,39 @@ def _blocked_service_start_result(
     }
 
 
+def _already_running_short_circuit(
+    model: dict[str, Any],
+    service: dict[str, Any],
+    blocked_on: list[str],
+) -> dict[str, Any] | None:
+    manageable, _reason = service_supports_lifecycle(service, model)
+    if not manageable:
+        return None
+    paths = service_paths(model, service)
+    base = _service_start_base_result(service, paths)
+    pid = live_service_pid(paths["pid_file"])
+    if pid is None:
+        prelaunch = _prelaunch_running_result(service, base)
+        return _annotate_degraded_deps(prelaunch, blocked_on)
+    if not _service_has_declared_healthcheck(service):
+        return _annotate_degraded_deps(base | {"result": "already-running", "pid": pid}, blocked_on)
+    health_state = service_healthcheck_state(service)
+    if health_state.get("state") != "ok":
+        return None
+    reused_result = base | {"result": "already-running", "pid": pid}
+    _copy_health_fields(reused_result, health_state, ("url", "target", "port", "pattern"))
+    log_runtime_event("service.reused", service["id"])
+    return _annotate_degraded_deps(reused_result, blocked_on)
+
+
+def _annotate_degraded_deps(result: dict[str, Any] | None, blocked_on: list[str]) -> dict[str, Any] | None:
+    if result is None:
+        return None
+    if blocked_on:
+        result["dependency_unhealthy"] = list(blocked_on)
+    return result
+
+
 def start_services(
     model: dict[str, Any],
     services: list[dict[str, Any]],
@@ -3430,7 +3570,11 @@ def start_services(
             and not _start_result_allows_dependents(results_by_id[dependency_id])
         ]
         if blocked_on:
-            result = _blocked_service_start_result(service, model, blocked_on)
+            already_running = _already_running_short_circuit(model, service, blocked_on)
+            if already_running is not None:
+                result = already_running
+            else:
+                result = _blocked_service_start_result(service, model, blocked_on)
         else:
             result = _start_service(
                 model,
