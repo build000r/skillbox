@@ -693,6 +693,99 @@ class BridgeBackedTaskTests(unittest.TestCase):
                 if results[0].get("pid"):
                     stop_process(int(results[0]["pid"]), 1)
 
+    def test_start_services_reports_port_conflict_with_external_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            logs_dir = root / "logs" / "runtime"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            squatter = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            squatter.bind(("127.0.0.1", 0))
+            squatter.listen(128)
+            port = squatter.getsockname()[1]
+            model = {
+                "root_dir": str(root),
+                "env": {},
+                "artifacts": [],
+                "logs": [{"id": "runtime", "host_path": str(logs_dir)}],
+                "repos": [{"id": "skillbox-self", "host_path": str(root), "path": str(root)}],
+                "services": [],
+            }
+            service = {
+                "id": "design-system-registry",
+                "kind": "http",
+                "repo": "skillbox-self",
+                "command": f"{sys.executable} -c \"raise SystemExit('should not spawn')\"",
+                "healthcheck": {"type": "http", "url": f"http://127.0.0.1:{port}/"},
+                "log": "runtime",
+            }
+
+            try:
+                results = start_services(model, [service], dry_run=False, wait_seconds=0.5)
+            finally:
+                squatter.close()
+
+            self.assertEqual(results[0]["result"], "blocked")
+            self.assertEqual(results[0]["reason"], "port_already_in_use")
+            self.assertEqual(results[0]["port"], port)
+            self.assertEqual(results[0]["host"], "127.0.0.1")
+            self.assertIn("actionable", results[0])
+            self.assertFalse((logs_dir / "design-system-registry.pid").exists())
+
+    def test_start_services_treats_dependency_blocked_running_service_as_already_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            logs_dir = root / "logs" / "runtime"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+
+            class QuietHandler(http.server.SimpleHTTPRequestHandler):
+                def log_message(self, format: str, *args: object) -> None:
+                    del format, args
+
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), QuietHandler)
+            port = server.server_address[1]
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+
+            model = {
+                "root_dir": str(root),
+                "env": {},
+                "artifacts": [],
+                "logs": [{"id": "runtime", "host_path": str(logs_dir)}],
+                "repos": [{"id": "skillbox-self", "host_path": str(root), "path": str(root)}],
+                "services": [],
+            }
+            services = [
+                {
+                    "id": "registry",
+                    "kind": "http",
+                    "repo": "skillbox-self",
+                    "command": f"{sys.executable} -c \"import sys; sys.exit(1)\"",
+                    "healthcheck": {"type": "http", "url": "http://127.0.0.1:9/health"},
+                    "log": "runtime",
+                },
+                {
+                    "id": "web",
+                    "kind": "http",
+                    "repo": "skillbox-self",
+                    "depends_on": ["registry"],
+                    "command": f"{sys.executable} -c \"raise SystemExit('should not spawn')\"",
+                    "healthcheck": {"type": "http", "url": f"http://127.0.0.1:{port}/"},
+                    "log": "runtime",
+                },
+            ]
+
+            try:
+                results = start_services(model, services, dry_run=False, wait_seconds=0.5)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+            self.assertEqual(results[0]["result"], "failed")
+            self.assertEqual(results[1]["result"], "already-running")
+            self.assertEqual(results[1].get("dependency_unhealthy"), ["registry"])
+            self.assertEqual(results[1]["url"], f"http://127.0.0.1:{port}/")
+
 
 class LocalRuntimeProfileValidationTests(unittest.TestCase):
     """WG-002/WG-004: Profile validation for local-* profiles."""
