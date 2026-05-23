@@ -29,7 +29,7 @@ from .lockfile import (
 )
 from .manifest import parse_manifest, verify_manifest
 from .pin_resolver import PinResolutionError, resolve_pin
-from .signing import SignatureVerificationError, load_public_key
+from .signing import KeyFormatError, SignatureVerificationError, load_public_key
 
 from ..shared import atomic_write_text, host_path_to_absolute_path
 from ..shared_distribution import (
@@ -70,11 +70,36 @@ class _DistributionSyncContext:
 # HTTP
 # ---------------------------------------------------------------------------
 
+# Hard ceiling for any single fetch. Far larger than any reasonable skill
+# manifest or bundle, but bounded so a malicious, compromised, or MITM'd
+# endpoint cannot exhaust memory before signature/hash verification runs
+# (the verification reads the whole body, so an unbounded read would OOM
+# before it could reject bad content).
+_MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
+
+
+def _read_capped(resp: Any, url: str, max_bytes: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = resp.read(65536)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise DistributorSyncError(
+                f"refusing oversized response from {url}: exceeds {max_bytes} byte cap"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _http_get(
     url: str,
     headers: dict[str, str],
     *,
     timeout: float = 30.0,
+    max_bytes: int = _MAX_DOWNLOAD_BYTES,
     _opener: Callable | None = None,
 ) -> bytes:
     try:
@@ -85,7 +110,7 @@ def _http_get(
     open_fn = _opener or secure_opener().open
     try:
         with open_fn(req, timeout=timeout) as resp:
-            return resp.read()
+            return _read_capped(resp, url, max_bytes)
     except HTTPError as exc:
         code = exc.code
         reason = exc.reason
@@ -215,7 +240,7 @@ def _fetch_verified_manifest(
     manifest = parse_manifest(manifest_bytes)
     try:
         verify_manifest(manifest, load_public_key(distributor.verification.public_key))
-    except SignatureVerificationError as exc:
+    except (KeyFormatError, SignatureVerificationError) as exc:
         raise DistributorSyncError(
             f"manifest signature verification failed for '{distributor.id}': {exc}"
         ) from exc
