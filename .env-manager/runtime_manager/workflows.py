@@ -3303,7 +3303,7 @@ def _focus_persist_step(
     if ctx_yaml_path.is_file():
         focus_data["skill_context_path"] = str(ctx_runtime_path)
     try:
-        focus_path.write_text(json.dumps(focus_data, indent=2), encoding="utf-8")
+        atomic_write_text(focus_path, json.dumps(focus_data, indent=2) + "\n")
         _focus_step(steps, is_json, "persist", "ok")
     except OSError as exc:
         _focus_step(steps, is_json, "persist", "fail", {"error": str(exc)})
