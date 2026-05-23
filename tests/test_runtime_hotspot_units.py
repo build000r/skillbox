@@ -758,7 +758,10 @@ class RuntimeScanHotspotTests(unittest.TestCase):
         )
 
         self.assertEqual(packs, ["core.filesystem", "local.shell", "core.git", "custom.net", "ignored"])
-        self.assertEqual(allowlist, [])
+        # Allowlist rules are unioned across clients, just like packs: an
+        # earlier client's rules must not be dropped because a later client
+        # declares a dcg block without an allowlist.
+        self.assertEqual(allowlist, [{"cmd": "git status"}])
 
     def test_scan_repo_paths_classifies_syncable_and_required_missing_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

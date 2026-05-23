@@ -1269,15 +1269,21 @@ def sync_dcg_config(model: dict[str, Any], root_dir: Path, dry_run: bool) -> lis
 def _dcg_packs_and_allowlist(model: dict[str, Any], env: dict[str, Any]) -> tuple[list[str], list[Any]]:
     packs_raw = env.get("SKILLBOX_DCG_PACKS", "core.git,core.filesystem").strip()
     packs = [pack.strip() for pack in packs_raw.split(",") if pack.strip()]
-    client_dcg: dict[str, Any] = {}
+    allowlist: list[Any] = []
     for client in model.get("clients") or []:
-        if "dcg" in client:
-            client_dcg = client["dcg"]
-            extra_packs = client_dcg.get("packs") or []
-            for pack in extra_packs:
-                if pack not in packs:
-                    packs.append(pack)
-    return packs, client_dcg.get("allowlist") or []
+        client_dcg = client.get("dcg")
+        if not isinstance(client_dcg, dict):
+            continue
+        for pack in client_dcg.get("packs") or []:
+            if pack not in packs:
+                packs.append(pack)
+        # Union allowlist rules across clients too. Returning only the last
+        # client's allowlist would silently drop earlier clients' command rules
+        # from the generated .dcg.toml even though their packs were merged.
+        for rule in client_dcg.get("allowlist") or []:
+            if rule not in allowlist:
+                allowlist.append(rule)
+    return packs, allowlist
 
 
 def _dcg_config_content(packs: list[str], allowlist: list[Any]) -> str:
