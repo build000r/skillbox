@@ -3610,6 +3610,16 @@ def main(argv: list[str] | None = None) -> int:
     except subprocess.TimeoutExpired as exc:
         emit_json(structured_error(f"Command timed out: {exc.cmd}", error_type="timeout"))
         return EXIT_ERROR
+    except json.JSONDecodeError as exc:
+        # doctl returned a 0 exit code but non-JSON stdout (warning banner,
+        # empty body, rate-limit notice). Surface a structured error instead of
+        # an unhandled traceback so the --format json contract still holds.
+        emit_json(structured_error(
+            f"Expected JSON from underlying command but parsing failed: {exc}",
+            error_type="invalid_output",
+            recovery_hint="Re-run the doctl/tailscale command manually to inspect its raw output.",
+        ))
+        return EXIT_ERROR
 
     return EXIT_OK
 
