@@ -127,6 +127,11 @@ def _normalize_agent_argv(argv: list[str] | None) -> tuple[list[str], list[str]]
         if token == "--robot-help":
             normalized.extend(["robot-docs", "guide"])
             command_seen = True
+            # robot-docs accepts --format; flush a JSON alias that arrived
+            # before it so we don't later inject a spurious `status` command.
+            if pending_json:
+                normalized.extend(["--format", "json"])
+                pending_json = False
             continue
         if token in JSON_FLAG_ALIASES:
             if token != "--json":
@@ -3122,7 +3127,8 @@ def _emit_up_payload(
                 started = {
                     s["id"]
                     for s in (payload.get("services") or [])
-                    if s.get("id") and s.get("result") not in {"failed", "skip", "skipped"}
+                    if s.get("id")
+                    and s.get("result") in {"started", "already-running", "would-restart", "dry-run"}
                 }
                 summary = build_endpoint_summary(model, started or None)
                 print_endpoint_summary(summary)
