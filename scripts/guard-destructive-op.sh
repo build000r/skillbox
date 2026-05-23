@@ -200,6 +200,10 @@ if [ "$FRIENDLY_NAME" = "operator_compose_down" ]; then
     PROBLEMS=$(python3 -c "$check_repo_script" "$REPO_ROOT" 2>/dev/null || true)
 elif [ "$FRIENDLY_NAME" = "operator_teardown" ] && [ "$BOX_ID" != "local" ]; then
     # Remote: look up box SSH details from inventory, run check on the box
+    # Resolve the SSH target using the same address priority as box.py
+    # (tailscale_ip > tailscale_hostname > droplet_ip). A box present in the
+    # inventory but without any reachable address prints __NOHOST__ so we can
+    # refuse to assume it is clean rather than silently skip the remote check.
     SSH_TARGET=$(python3 -c '
 import json, sys
 from pathlib import Path
@@ -210,16 +214,33 @@ if not inv_path.is_file():
 boxes = json.loads(inv_path.read_text()).get("boxes", [])
 for b in boxes:
     if b.get("id") == box_id:
-        host = b.get("tailscale_hostname") or b.get("droplet_ip", "")
+        host = b.get("tailscale_ip") or b.get("tailscale_hostname") or b.get("droplet_ip", "")
         user = b.get("ssh_user", "skillbox")
-        if host:
-            print(f"{user}@{host}")
+        print(f"{user}@{host}" if host else "__NOHOST__")
         break
 ' "$REPO_ROOT" "$BOX_ID" 2>/dev/null || true)
 
-    if [ -n "$SSH_TARGET" ]; then
-        PROBLEMS=$(ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes \
-            "$SSH_TARGET" "python3 -c $(printf '%q' "$remote_check_script")" 2>/dev/null || true)
+    if [ "$SSH_TARGET" = "__NOHOST__" ]; then
+        # Box exists in inventory but has no reachable address — cannot verify.
+        PROBLEMS="inaccessible:${BOX_ID}: box has no reachable address in inventory (could not verify remote repos)"
+    elif [ -n "$SSH_TARGET" ]; then
+        # Capture the SSH/remote-check exit status. The remote script exits 1
+        # when it finds dirty/unpushed repos (expected) and 0 when clean; any
+        # other status means we could NOT verify the box (connection refused,
+        # auth failure, missing python3, timeout). Refuse to assume clean in
+        # that case instead of failing open.
+        if PROBLEMS=$(ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes \
+            "$SSH_TARGET" "python3 -c $(printf '%q' "$remote_check_script")" 2>/dev/null); then
+            :  # exit 0 — remote repos verified clean
+        else
+            ssh_rc=$?
+            if [ "$ssh_rc" -ne 1 ]; then
+                PROBLEMS="inaccessible:${SSH_TARGET}: remote check exited ${ssh_rc} (could not verify remote repos)"
+            fi
+        fi
+    else
+        # box_id not found in inventory — nothing remote to verify.
+        PROBLEMS=""
     fi
 
     # Also check the local skillbox repo (operator's copy)
