@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -243,6 +244,58 @@ class WorkerRuntimeContractTests(unittest.TestCase):
             self.assertEqual(payload["artifacts"][0]["kind"], "summary")
             self.assertEqual(SHARED.worker_artifacts_payload(root, payload["run_id"])["result"]["summary"], "Hermes done.")
 
+    def test_create_worker_run_returns_running_and_status_reconciles_later_result(self) -> None:
+        model = _active_worker_model()
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch.object(SHARED, "build_runtime_model", return_value=model),
+            mock.patch.object(SHARED.shutil, "which", return_value=None),
+            mock.patch.dict("os.environ", _no_hermes_env()),
+        ):
+            root = Path(tmpdir)
+            command = root / "fake_hermes_async.py"
+            command.write_text(
+                "\n".join(
+                    [
+                        "import json, os, time",
+                        "result_path = os.environ['SKILLBOX_WORKER_RESULT_PATH']",
+                        "run_id = os.environ['SKILLBOX_WORKER_RUN_ID']",
+                        "time.sleep(1.0)",
+                        "json.dump({'run_id': run_id, 'state': 'succeeded', 'summary': 'Async Hermes done.'}, open(result_path, 'w'))",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict("os.environ", {"SKILLBOX_WORKER_HERMES_COMMAND": f"{sys.executable} {command}"}):
+                payload = SHARED.create_worker_run(
+                    root,
+                    task_class="analysis",
+                    instruction="Launch async Hermes.",
+                    client_id="skills",
+                    cwd="/tmp/skills/docs",
+                )
+
+            self.assertEqual(payload["state"], "running")
+            self.assertTrue(payload["launch"]["attempted"])
+            self.assertIsInstance(payload["launch"]["pid"], int)
+            self.assertFalse(Path(payload["paths"]["run"]).with_name("result.json").exists())
+
+            status = payload
+            for _ in range(40):
+                status = SHARED.worker_status_payload(root, payload["run_id"])
+                if status["state"] == "succeeded":
+                    break
+                time.sleep(0.05)
+
+            self.assertEqual(status["state"], "succeeded")
+            self.assertEqual(status["summary"], "Async Hermes done.")
+            self.assertTrue(status["artifacts_ready"])
+            self.assertEqual(
+                SHARED.worker_artifacts_payload(root, payload["run_id"])["result"]["summary"],
+                "Async Hermes done.",
+            )
+
     def test_create_worker_run_records_hermes_start_exception(self) -> None:
         env = _no_hermes_env()
         env["SKILLBOX_WORKER_HERMES_COMMAND"] = "hermes"
@@ -250,7 +303,7 @@ class WorkerRuntimeContractTests(unittest.TestCase):
             tempfile.TemporaryDirectory() as tmpdir,
             mock.patch.object(SHARED, "build_runtime_model", return_value=_active_worker_model()),
             mock.patch.dict("os.environ", env),
-            mock.patch.object(SHARED.subprocess, "run", side_effect=OSError("boom")),
+            mock.patch.object(SHARED.subprocess, "Popen", side_effect=OSError("boom")),
         ):
             payload = SHARED.create_worker_run(
                 Path(tmpdir),
