@@ -123,6 +123,72 @@ class BinaryPushScriptTests(unittest.TestCase):
         self.assertIn("validation: ok", result.stdout)
 
 
+class GuardDestructiveOpScriptTests(unittest.TestCase):
+    SCRIPT = SCRIPTS_DIR / "guard-destructive-op.sh"
+
+    def _copy_guard(self, root: Path) -> Path:
+        scripts_dir = root / "scripts"
+        scripts_dir.mkdir(parents=True)
+        target = scripts_dir / "guard-destructive-op.sh"
+        target.write_text(self.SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+        target.chmod(0o755)
+        return target
+
+    def _run_guard(
+        self,
+        script: Path,
+        *,
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        root = script.parent.parent
+        mono_root = root / "empty-mono"
+        mono_root.mkdir(exist_ok=True)
+        env = os.environ.copy()
+        env["SKILLBOX_MONOSERVER_HOST_ROOT"] = str(mono_root)
+        if extra_env:
+            env.update(extra_env)
+        payload = {
+            "tool_name": "mcp__skillbox-operator__operator_compose_down",
+            "tool_input": {"dry_run": False},
+        }
+        return subprocess.run(
+            ["bash", str(script)],
+            input=json.dumps(payload),
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+
+    def test_guard_destructive_default_ttl_matches_operator_server(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script = self._copy_guard(Path(tmpdir))
+
+            result = self._run_guard(script)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Configured marker TTL: 600s", result.stderr)
+        self.assertIn("Observed marker age: unavailable", result.stderr)
+
+    def test_guard_destructive_env_ttl_reports_observed_age(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            script = self._copy_guard(root)
+            marker = root / ".skillbox-state" / "dryrun-markers" / ".skillbox-dryrun-operator_compose_down-local"
+            marker.parent.mkdir(parents=True)
+            marker.write_text("dry-run completed\n", encoding="utf-8")
+            old = marker.stat().st_mtime - 10
+            os.utime(marker, (old, old))
+
+            result = self._run_guard(script, extra_env={"SKILLBOX_DRYRUN_MARKER_TTL_SECONDS": "5"})
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Configured marker TTL: 5s", result.stderr)
+        self.assertRegex(result.stderr, r"Observed marker age: [0-9]+s")
+
+
 class QuickValidateScriptTests(unittest.TestCase):
     def test_validate_skill_reports_document_frontmatter_name_description_and_todo_failures(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

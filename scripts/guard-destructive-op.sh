@@ -299,11 +299,19 @@ fi
 
 # --- Gate 3: Require dry_run=true on first real invocation ---
 # Marker is invalidated after MARKER_TTL_SECONDS so a stale dry-run from a
-# prior day cannot authorize today's teardown. Default 1 hour.
+# prior day cannot authorize today's teardown. Default 10 minutes, matching
+# the operator MCP server.
 MARKER="${REPO_ROOT}/.skillbox-state/dryrun-markers/.skillbox-dryrun-${FRIENDLY_NAME}-${BOX_ID}"
-MARKER_TTL_SECONDS="${SKILLBOX_DRYRUN_MARKER_TTL_SECONDS:-3600}"
+MARKER_TTL_SECONDS="${SKILLBOX_DRYRUN_MARKER_TTL_SECONDS:-600}"
+case "$MARKER_TTL_SECONDS" in
+    ''|*[!0-9]*) MARKER_TTL_SECONDS=600 ;;
+esac
+if [ "$MARKER_TTL_SECONDS" -le 0 ]; then
+    MARKER_TTL_SECONDS=600
+fi
 
 MARKER_AGE_OK=false
+MARKER_AGE=""
 if [ -f "$MARKER" ]; then
     MARKER_AGE=$(python3 -c '
 import os, sys, time
@@ -318,6 +326,10 @@ except OSError:
 fi
 
 if [ "$MARKER_AGE_OK" != "true" ]; then
+    MARKER_AGE_DISPLAY="${MARKER_AGE:-unavailable}"
+    if [ -n "$MARKER_AGE" ]; then
+        MARKER_AGE_DISPLAY="${MARKER_AGE}s"
+    fi
     cat >&2 <<EOF
 BLOCKED: ${FRIENDLY_NAME} requires a fresh dry-run first.
 
@@ -329,6 +341,9 @@ Before executing a destructive operation, you must:
 
 This is either the first call for ${FRIENDLY_NAME} (box: ${BOX_ID}) or
 the previous dry-run marker has expired. Run with dry_run=true first.
+
+Configured marker TTL: ${MARKER_TTL_SECONDS}s
+Observed marker age: ${MARKER_AGE_DISPLAY}
 EOF
     exit 1
 fi

@@ -581,6 +581,14 @@ class OperatorMcpDryRunMarkerTests(unittest.TestCase):
         MODULE._stamp_dryrun_marker("operator_provision", "box01")
         self.assertTrue(MODULE._has_dryrun_marker("operator_provision", "box01"))
 
+    def test_marker_ttl_reads_env_override_with_default_fallback(self) -> None:
+        with mock.patch.dict(os.environ, {"SKILLBOX_DRYRUN_MARKER_TTL_SECONDS": "7"}):
+            self.assertEqual(MODULE._dryrun_marker_ttl_seconds(), 7)
+        with mock.patch.dict(os.environ, {"SKILLBOX_DRYRUN_MARKER_TTL_SECONDS": "bad"}):
+            self.assertEqual(MODULE._dryrun_marker_ttl_seconds(), MODULE.DRYRUN_MARKER_TTL_SECONDS)
+        with mock.patch.dict(os.environ, {"SKILLBOX_DRYRUN_MARKER_TTL_SECONDS": "0"}):
+            self.assertEqual(MODULE._dryrun_marker_ttl_seconds(), MODULE.DRYRUN_MARKER_TTL_SECONDS)
+
     def test_marker_expires_after_ttl(self) -> None:
         MODULE._stamp_dryrun_marker("operator_provision", "box01")
         marker = MODULE._dryrun_marker_path("operator_provision", "box01")
@@ -591,6 +599,25 @@ class OperatorMcpDryRunMarkerTests(unittest.TestCase):
         self.assertFalse(MODULE._has_dryrun_marker("operator_provision", "box01"))
         # Stale marker was auto-cleaned.
         self.assertFalse(marker.is_file())
+
+    def test_dry_run_required_error_reports_marker_age_and_configured_ttl(self) -> None:
+        MODULE._stamp_dryrun_marker("operator_teardown", "box01")
+        marker = MODULE._dryrun_marker_path("operator_teardown", "box01")
+        old = marker.stat().st_mtime - 10
+        os.utime(marker, (old, old))
+
+        with mock.patch.dict(os.environ, {"SKILLBOX_DRYRUN_MARKER_TTL_SECONDS": "5"}), mock.patch.object(
+            MODULE,
+            "run_script",
+        ) as run_script:
+            payload = _content_payload(MODULE.handle_operator_teardown({"box_id": "box01"}))
+
+        self.assertEqual(payload["error"]["type"], "dry_run_required")
+        self.assertIn("observed marker age", payload["error"]["message"])
+        self.assertEqual(payload["error"]["marker"]["ttl_seconds"], 5)
+        self.assertGreaterEqual(payload["error"]["marker"]["age_seconds"], 5)
+        self.assertTrue(payload["error"]["marker"]["expired"])
+        run_script.assert_not_called()
 
     def test_clear_marker_removes_file(self) -> None:
         MODULE._stamp_dryrun_marker("operator_provision", "box01")
