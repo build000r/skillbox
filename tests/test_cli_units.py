@@ -302,6 +302,38 @@ except RuntimeError as exc:
         self.assertIn("activated: 2 skills", text.getvalue())
         self.assertIn("activation packet: missing unavailable", text.getvalue())
 
+    def test_overlay_dry_run_previews_without_persisting_or_unlinking(self) -> None:
+        emitted: list[dict[str, object]] = []
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch.object(CLI, "active_overlays", return_value={"marketing"}),
+            mock.patch.object(CLI, "set_overlay") as set_overlay,
+            mock.patch.object(CLI, "toggle_overlay") as toggle_overlay,
+            mock.patch.object(CLI, "unlink_overlay_scoped_skills") as unlink_overlay_scoped_skills,
+            mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
+        ):
+            root = Path(tmpdir)
+            off_args = _ns(
+                action="off",
+                name="marketing",
+                cwd=str(root),
+                keep=False,
+                to="project",
+                scope="project",
+                dry_run=True,
+            )
+
+            self.assertEqual(CLI._handle_overlay(off_args, root, {}, "reuse"), CLI.EXIT_OK)
+
+        set_overlay.assert_not_called()
+        toggle_overlay.assert_not_called()
+        unlink_overlay_scoped_skills.assert_not_called()
+        self.assertEqual(emitted[0]["overlays"], [])
+        self.assertFalse(emitted[0]["persistent"])
+        self.assertTrue(emitted[0]["would_persist"])
+        self.assertEqual(emitted[0]["unlinked"], [])
+
     def test_operator_booking_text_lines_cover_each_action(self) -> None:
         config_lines = CLI._operator_booking_text_lines(
             {
