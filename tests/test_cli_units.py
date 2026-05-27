@@ -772,6 +772,27 @@ except RuntimeError as exc:
             self.assertEqual(CLI._handle_up(args, root, {"bridges": []}, "reuse"), CLI.EXIT_OK)
         self.assertEqual(emitted[-1]["sync_actions"], ["sync"])
 
+    def test_handle_up_legacy_failed_start_returns_nonzero(self) -> None:
+        emitted: list[dict[str, object]] = []
+        root = Path("/tmp/skillbox")
+        with (
+            mock.patch.object(CLI, "local_runtime_active_profile", return_value=None),
+            mock.patch.object(CLI, "select_services", return_value=[{"id": "api"}]),
+            mock.patch.object(CLI, "sync_runtime", return_value=["sync"]),
+            mock.patch.object(CLI, "resolve_services_for_start", return_value=[{"id": "api"}]),
+            mock.patch.object(CLI, "resolve_tasks_for_services", return_value=[]),
+            mock.patch.object(CLI, "select_env_files_for_tasks", return_value=[]),
+            mock.patch.object(CLI, "select_env_files_for_services", return_value=[]),
+            mock.patch.object(CLI, "ensure_required_env_files_ready"),
+            mock.patch.object(CLI, "run_tasks", return_value=[]),
+            mock.patch.object(CLI, "start_services", return_value=[{"id": "api", "result": "failed"}]),
+            mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
+        ):
+            args = _ns(format="json", service=["api"], dry_run=False, wait_seconds=1.0)
+            self.assertEqual(CLI._handle_up(args, root, {"bridges": []}, "reuse"), CLI.EXIT_ERROR)
+        self.assertEqual(emitted[-1]["error"]["type"], "LOCAL_RUNTIME_START_BLOCKED")
+        self.assertEqual(emitted[-1]["error"]["blocked_services"], ["api"])
+
     def test_main_dispatches_mode_errors_model_handlers_and_catches_errors(self) -> None:
         emitted: list[dict[str, object]] = []
 
@@ -1374,6 +1395,29 @@ except RuntimeError as exc:
             mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
         ):
             self.assertEqual(CLI._handle_restart(restart_args, root, {}, "reuse"), CLI.EXIT_OK)
+
+    def test_handle_restart_legacy_failed_start_returns_nonzero(self) -> None:
+        emitted: list[dict[str, object]] = []
+        root = Path("/tmp/skillbox")
+        restart_args = _ns(service=["api"], dry_run=False, wait_seconds=1.0)
+        with (
+            mock.patch.object(CLI, "select_services", return_value=[{"id": "api"}]),
+            mock.patch.object(CLI, "resolve_services_for_stop", return_value=[{"id": "api"}]),
+            mock.patch.object(CLI, "resolve_services_for_start", return_value=[{"id": "api"}]),
+            mock.patch.object(CLI, "resolve_tasks_for_services", return_value=[]),
+            mock.patch.object(CLI, "stop_services", return_value=[{"id": "api", "result": "stopped"}]),
+            mock.patch.object(CLI, "sync_runtime", return_value=["sync"]),
+            mock.patch.object(CLI, "select_env_files_for_tasks", return_value=[]),
+            mock.patch.object(CLI, "select_env_files_for_services", return_value=[]),
+            mock.patch.object(CLI, "ensure_required_env_files_ready"),
+            mock.patch.object(CLI, "run_tasks", return_value=[]),
+            mock.patch.object(CLI, "start_services", return_value=[{"id": "api", "result": "timeout"}]),
+            mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
+        ):
+            self.assertEqual(CLI._handle_restart(restart_args, root, {}, "reuse"), CLI.EXIT_ERROR)
+
+        self.assertEqual(emitted[-1]["error"]["type"], "LOCAL_RUNTIME_START_BLOCKED")
+        self.assertEqual(emitted[-1]["error"]["blocked_services"], ["api"])
 
 
 if __name__ == "__main__":

@@ -961,12 +961,18 @@ class RuntimeManagerTests(unittest.TestCase):
             self._install_fixture_daemon(repo)
             self.addCleanup(self._run, repo, "down", "--service", "fixture-daemon", "--format", "json")
 
-            up = self._run(repo, "up", "--format", "json")
+            status_only_up = self._run(repo, "up", "--service", "internal-env-manager", "--format", "json")
+
+            self.assertEqual(status_only_up.returncode, 0, status_only_up.stderr)
+            status_only_payload = json.loads(status_only_up.stdout)
+            status_only_results = {item["id"]: item for item in status_only_payload["services"]}
+            self.assertEqual(status_only_results["internal-env-manager"]["result"], "skipped")
+
+            up = self._run(repo, "up", "--service", "fixture-daemon", "--format", "json")
 
             self.assertEqual(up.returncode, 0, up.stderr)
             up_payload = json.loads(up.stdout)
             results_by_id = {item["id"]: item for item in up_payload["services"]}
-            self.assertEqual(results_by_id["internal-env-manager"]["result"], "skipped")
             self.assertEqual(results_by_id["fixture-daemon"]["result"], "started")
 
             logs = self._run(repo, "logs", "--service", "fixture-daemon", "--format", "json")
