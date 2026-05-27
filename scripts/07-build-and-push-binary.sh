@@ -37,6 +37,36 @@ if [[ $# -lt 3 ]]; then
   exit 2
 fi
 
+die() {
+  echo "error: $*" >&2
+  exit 2
+}
+
+require_match() {
+  local label="$1"
+  local value="$2"
+  local pattern="$3"
+  if [[ ! "${value}" =~ ${pattern} ]]; then
+    die "invalid ${label}: ${value}"
+  fi
+}
+
+quote_arg() {
+  printf "%q" "$1"
+}
+
+validate_package_tokens() {
+  local dep=""
+  for dep in "$@"; do
+    require_match "apt dependency" "${dep}" '^[A-Za-z0-9][A-Za-z0-9.+:-]*$'
+  done
+}
+
+validate_mount_spec() {
+  local mount="$1"
+  require_match "extra mount" "${mount}" '^[A-Za-z0-9_./:@%+=,-]+$'
+}
+
 SRC_DIR="$(cd "$1" && pwd)"
 BIN_NAME="$2"
 TARGET="$3"
@@ -49,6 +79,16 @@ SYMLINK_DIR="${SKILLBOX_SYMLINK_DIR:-/usr/local/bin}"
 SSH_USER="${SKILLBOX_SSH_USER:-skillbox}"
 EXTRA_APT="${SKILLBOX_BUILD_APT_DEPS:-}"
 EXTRA_MOUNTS="${SKILLBOX_BUILD_EXTRA_MOUNTS:-}"
+VALIDATE_ONLY="${SKILLBOX_BUILD_PUSH_VALIDATE_ONLY:-0}"
+
+require_match "binary name" "${BIN_NAME}" '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+require_match "cargo package" "${PKG}" '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+require_match "target host" "${TARGET}" '^[A-Za-z0-9][A-Za-z0-9.-]{0,253}$'
+require_match "ssh user" "${SSH_USER}" '^[A-Za-z_][A-Za-z0-9._-]{0,63}$'
+require_match "target bin dir" "${TARGET_BIN_DIR}" '^/[A-Za-z0-9_./@%+=,:-]+$'
+require_match "symlink dir" "${SYMLINK_DIR}" '^/[A-Za-z0-9_./@%+=,:-]+$'
+require_match "cache root" "${CACHE_ROOT}" '^/[A-Za-z0-9_./@%+=,:-]+$'
+require_match "rust image" "${RUST_IMAGE}" '^[A-Za-z0-9][A-Za-z0-9._/@%+=,:-]{0,255}$'
 
 SSH_TARGET="${SSH_USER}@${TARGET}"
 
@@ -56,11 +96,28 @@ mkdir -p "${CACHE_ROOT}"/{cargo-registry,cargo-git,out} "${CACHE_ROOT}/${BIN_NAM
 
 APT_CMD=""
 if [[ -n "${EXTRA_APT}" ]]; then
-  APT_CMD="apt-get update -qq && apt-get install -y -qq ${EXTRA_APT} && "
+  APT_DEPS=()
+  for dep in ${EXTRA_APT}; do
+    validate_package_tokens "${dep}"
+    APT_DEPS+=("$(quote_arg "${dep}")")
+  done
+  APT_CMD="apt-get update -qq && apt-get install -y -qq ${APT_DEPS[*]} && "
 fi
 
 MOUNT_ARGS=()
-for m in ${EXTRA_MOUNTS}; do MOUNT_ARGS+=(-v "${m}"); done
+for m in ${EXTRA_MOUNTS}; do
+  validate_mount_spec "${m}"
+  MOUNT_ARGS+=(-v "${m}")
+done
+
+PKG_Q="$(quote_arg "${PKG}")"
+BIN_Q="$(quote_arg "${BIN_NAME}")"
+BUILD_CMD="${APT_CMD}cargo build --release --package ${PKG_Q} && cp /target/release/${BIN_Q} /out/${BIN_Q} && file /out/${BIN_Q}"
+
+if [[ "${VALIDATE_ONLY}" == "1" ]]; then
+  echo "validation: ok"
+  exit 0
+fi
 
 echo "[1/4] Building ${BIN_NAME} (package=${PKG}) in ${RUST_IMAGE} for linux/amd64..."
 docker run --rm --platform linux/amd64 \
@@ -73,7 +130,7 @@ docker run --rm --platform linux/amd64 \
   -e CARGO_TARGET_DIR=/target \
   -w /src \
   "${RUST_IMAGE}" bash -c \
-  "${APT_CMD}cargo build --release --package ${PKG} && cp /target/release/${BIN_NAME} /out/${BIN_NAME} && file /out/${BIN_NAME}"
+  "${BUILD_CMD}"
 
 echo
 echo "[2/4] Uploading to ${SSH_TARGET}:${TARGET_BIN_DIR}/${BIN_NAME}..."

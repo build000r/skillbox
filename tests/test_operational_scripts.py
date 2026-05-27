@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -51,6 +53,74 @@ HERMES_CODEX = SourceFileLoader(
 def _write_skill(root: Path, frontmatter: str, body: str = "\nUse this skill.\n") -> None:
     root.mkdir(parents=True, exist_ok=True)
     (root / "SKILL.md").write_text(f"---\n{frontmatter}\n---\n{body}", encoding="utf-8")
+
+
+class BinaryPushScriptTests(unittest.TestCase):
+    SCRIPT = SCRIPTS_DIR / "07-build-and-push-binary.sh"
+
+    def _run_validate_only(
+        self,
+        src_dir: Path,
+        bin_name: str,
+        target: str = "skillbox-host",
+        package: str | None = None,
+        *,
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        env["SKILLBOX_BUILD_PUSH_VALIDATE_ONLY"] = "1"
+        if extra_env:
+            env.update(extra_env)
+        args = ["bash", str(self.SCRIPT), str(src_dir), bin_name, target]
+        if package is not None:
+            args.append(package)
+        return subprocess.run(
+            args,
+            cwd=ROOT_DIR,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+
+    def test_build_push_rejects_shell_metacharacter_identifiers_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir)
+            result = self._run_validate_only(src, "bad;touch")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid binary name", result.stderr)
+
+    def test_build_push_rejects_shell_metacharacter_paths_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir)
+            result = self._run_validate_only(
+                src,
+                "fwc",
+                extra_env={"SKILLBOX_TARGET_BIN_DIR": "/tmp/bin;touch-pwned"},
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid target bin dir", result.stderr)
+
+    def test_build_push_validates_operator_inputs_without_docker_or_ssh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir)
+            result = self._run_validate_only(
+                src,
+                "fwc",
+                package="flywheel-connectors",
+                extra_env={
+                    "SKILLBOX_BUILD_APT_DEPS": "libdbus-1-dev pkg-config libssl-dev",
+                    "SKILLBOX_BUILD_EXTRA_MOUNTS": f"{src}:/dp/source:ro",
+                    "SKILLBOX_TARGET_BIN_DIR": "/home/skillbox/.local/bin",
+                    "SKILLBOX_SYMLINK_DIR": "/usr/local/bin",
+                },
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("validation: ok", result.stdout)
 
 
 class QuickValidateScriptTests(unittest.TestCase):
