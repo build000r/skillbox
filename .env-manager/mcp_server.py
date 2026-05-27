@@ -13,11 +13,13 @@ Discipline the server enforces: assess → scope → dry-run → act → verify.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,8 @@ MANAGE_PY = SCRIPT_DIR / "manage.py"
 SERVER_NAME = "skillbox"
 SERVER_VERSION = "1.0.0"
 PROTOCOL_VERSION = "2024-11-05"
+DRYRUN_MARKER_TTL_SECONDS = 600
+DRYRUN_MARKER_ROOT = SCRIPT_DIR.parent / ".skillbox-state" / "dryrun-markers"
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -1520,6 +1524,17 @@ _DISPATCH: dict[str, tuple[str, str | None]] = {
     "skillbox_client_diff": ("client-diff", "client_id"),
 }
 
+_DRY_RUN_REQUIRED_TOOLS = frozenset(
+    {
+        "skillbox_sync",
+        "skillbox_up",
+        "skillbox_down",
+        "skillbox_restart",
+        "skillbox_bootstrap",
+        "skillbox_onboard",
+    }
+)
+
 
 def _handle_pulse(_params: dict) -> dict:
     """Read pulse daemon state directly (no manage.py subprocess)."""
@@ -1565,6 +1580,97 @@ def _handle_events(params: dict) -> dict:
         wait_seconds=wait_seconds,
     )
     return _ok_content(payload)
+
+
+def _args_without_dry_run(args: list[str]) -> list[str]:
+    return [arg for arg in args if arg != "--dry-run"]
+
+
+def _dryrun_marker_subject(tool_name: str, args: list[str]) -> str:
+    material = json.dumps(
+        {"tool": tool_name, "args": _args_without_dry_run(args)},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def _dryrun_marker_path(tool_name: str, subject_hash: str) -> Path:
+    safe_tool = re.sub(r"[^a-zA-Z0-9_.-]", "_", tool_name)
+    safe_subject = re.sub(r"[^a-zA-Z0-9_.-]", "_", subject_hash)
+    return DRYRUN_MARKER_ROOT / f".skillbox-dryrun-{safe_tool}-{safe_subject}"
+
+
+def _dryrun_marker_info(tool_name: str, args: list[str]) -> dict[str, Any]:
+    subject_hash = _dryrun_marker_subject(tool_name, args)
+    return {
+        "tool": tool_name,
+        "subject_hash": subject_hash,
+        "ttl_seconds": DRYRUN_MARKER_TTL_SECONDS,
+        "next_action": (
+            f"Review this preview, then repeat {tool_name} for the same scope without "
+            "dry_run before the marker expires."
+        ),
+    }
+
+
+def _stamp_dryrun_marker(tool_name: str, args: list[str]) -> dict[str, Any]:
+    info = _dryrun_marker_info(tool_name, args)
+    marker = _dryrun_marker_path(tool_name, str(info["subject_hash"]))
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps(info, sort_keys=True) + "\n", encoding="utf-8")
+    return info
+
+
+def _has_dryrun_marker(tool_name: str, args: list[str]) -> bool:
+    subject_hash = _dryrun_marker_subject(tool_name, args)
+    marker = _dryrun_marker_path(tool_name, subject_hash)
+    if not marker.is_file():
+        return False
+    try:
+        age = time.time() - marker.stat().st_mtime
+    except OSError:
+        return False
+    if age > DRYRUN_MARKER_TTL_SECONDS:
+        try:
+            marker.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _clear_dryrun_marker(tool_name: str, args: list[str]) -> None:
+    subject_hash = _dryrun_marker_subject(tool_name, args)
+    marker = _dryrun_marker_path(tool_name, subject_hash)
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _runtime_dry_run_required_error(tool_name: str, args: list[str]) -> dict:
+    info = _dryrun_marker_info(tool_name, args)
+    return _error_content(
+        {
+            "error": {
+                "type": "dry_run_required",
+                "message": f"{tool_name} requires a successful dry_run=true preview before dispatching a real runtime mutation.",
+                "recoverable": True,
+                "tool": tool_name,
+                "subject_hash": info["subject_hash"],
+                "ttl_seconds": info["ttl_seconds"],
+                "next_actions": [
+                    f"Call {tool_name} with dry_run=true for this exact scope.",
+                    "After reviewing the preview, repeat the same tool call without dry_run before the marker expires.",
+                ],
+            }
+        }
+    )
 
 
 _DIRECT_HANDLERS: dict[str, Any] = {
@@ -1713,10 +1819,21 @@ def _dispatch_manage_tool(
         return _missing_positional_error(name, str(positional_key))
 
     args = build_args(command, tool_params, positional)
+    is_dry_run = bool(tool_params.get("dry_run"))
+    if name in _DRY_RUN_REQUIRED_TOOLS and not is_dry_run and not _has_dryrun_marker(name, args):
+        return _runtime_dry_run_required_error(name, args)
+
     event_context = build_tool_event_context(name, command, tool_params, request_id)
     ok, exit_code, data = run_manage(args, event_context=event_context)
+    marker_info = None
+    if ok and name in _DRY_RUN_REQUIRED_TOOLS and is_dry_run:
+        marker_info = _stamp_dryrun_marker(name, args)
     if isinstance(data, dict):
         data["_exit_code"] = exit_code
+        if marker_info is not None:
+            data["mcp_dry_run_marker"] = marker_info
+    if ok and name in _DRY_RUN_REQUIRED_TOOLS and not is_dry_run:
+        _clear_dryrun_marker(name, args)
     return _ok_content(data) if ok else _error_content(data)
 
 

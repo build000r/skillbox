@@ -253,6 +253,81 @@ class SkillboxMcpServerTests(unittest.TestCase):
         self.assertEqual(payload["error"]["type"], "missing_required_parameter")
         self.assertIn("client_id", payload["error"]["message"])
 
+    def test_mutating_runtime_tools_require_dry_run_before_dispatch(self) -> None:
+        cases = {
+            "skillbox_sync": {},
+            "skillbox_up": {},
+            "skillbox_down": {},
+            "skillbox_restart": {},
+            "skillbox_bootstrap": {},
+            "skillbox_onboard": {"client_id": "acme"},
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(
+            MODULE,
+            "DRYRUN_MARKER_ROOT",
+            Path(tmpdir),
+        ):
+            for tool_name, arguments in cases.items():
+                with self.subTest(tool_name=tool_name), mock.patch.object(MODULE, "run_manage") as run_manage:
+                    result = MODULE.dispatch_tool(tool_name, arguments, request_id=f"req-{tool_name}")
+
+                payload = _content_payload(result)
+                self.assertTrue(result["isError"])
+                self.assertEqual(payload["error"]["type"], "dry_run_required")
+                self.assertTrue(payload["error"]["recoverable"])
+                self.assertEqual(payload["error"]["tool"], tool_name)
+                run_manage.assert_not_called()
+
+    def test_runtime_mcp_dry_run_marker_allows_matching_real_action(self) -> None:
+        arguments = {
+            "client": ["personal"],
+            "profile": ["local-core"],
+            "service": ["api"],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(
+            MODULE,
+            "DRYRUN_MARKER_ROOT",
+            Path(tmpdir),
+        ):
+            with mock.patch.object(MODULE, "run_manage", return_value=(True, 0, {"ok": True})) as run_manage:
+                preview = MODULE.dispatch_tool(
+                    "skillbox_up",
+                    {**arguments, "dry_run": True},
+                    request_id="req-up-preview",
+                )
+
+            preview_payload = _content_payload(preview)
+            self.assertTrue(preview_payload["ok"])
+            self.assertIn("mcp_dry_run_marker", preview_payload)
+            self.assertIn("--dry-run", run_manage.call_args.args[0])
+            self.assertEqual(len(list(Path(tmpdir).iterdir())), 1)
+
+            with mock.patch.object(MODULE, "run_manage") as run_manage:
+                mismatched = MODULE.dispatch_tool(
+                    "skillbox_up",
+                    {**arguments, "service": ["web"]},
+                    request_id="req-up-mismatch",
+                )
+
+            mismatch_payload = _content_payload(mismatched)
+            self.assertTrue(mismatched["isError"])
+            self.assertEqual(mismatch_payload["error"]["type"], "dry_run_required")
+            run_manage.assert_not_called()
+
+            with mock.patch.object(MODULE, "run_manage", return_value=(True, 0, {"ok": True})) as run_manage:
+                real = MODULE.dispatch_tool(
+                    "skillbox_up",
+                    arguments,
+                    request_id="req-up-real",
+                )
+
+            real_payload = _content_payload(real)
+            self.assertTrue(real_payload["ok"])
+            self.assertNotIn("--dry-run", run_manage.call_args.args[0])
+            self.assertEqual(list(Path(tmpdir).iterdir()), [])
+
     def test_skillbox_skills_is_exposed_and_maps_scope_arguments(self) -> None:
         tool_names = {tool["name"] for tool in MODULE.handle_tools_list({})["tools"]}
         self.assertIn("skillbox_skills", tool_names)
