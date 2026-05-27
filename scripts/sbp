@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 
-set -euo pipefail
+set -eo pipefail
+# macOS still ships Bash 3.2, where nounset treats empty arrays as unbound.
+# This wrapper intentionally builds many optional argv arrays, so keep nounset
+# only on Bash releases with the fixed empty-array behavior.
+if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
+  set -u
+fi
 
 client="${SKILLBOX_CLIENT:-}"
 profile="${SKILLBOX_PROFILE:-local-all}"
