@@ -2920,6 +2920,22 @@ def _apply_persistent_overlay_action(action: str, name: str) -> tuple[bool, list
     return was_on, current, name in current
 
 
+def _preview_overlay_action(action: str, name: str) -> tuple[bool, list[str], bool]:
+    current_set = set(active_overlays())
+    was_on = name in current_set
+    if action == "on":
+        current_set.add(name)
+    elif action == "off":
+        current_set.discard(name)
+    elif action == "toggle":
+        if name in current_set:
+            current_set.remove(name)
+        else:
+            current_set.add(name)
+    current = sorted(current_set)
+    return was_on, current, name in current
+
+
 def _overlay_cwd(args: argparse.Namespace) -> Path:
     return Path(getattr(args, "cwd", None) or os.environ.get("PWD") or os.getcwd())
 
@@ -2959,6 +2975,7 @@ def _overlay_removed_links(
         and (action == "off" or (action == "toggle" and was_on and not now_on))
         and not now_on
         and not bool(getattr(args, "keep", False))
+        and not bool(getattr(args, "dry_run", False))
     )
     if not should_unlink:
         return []
@@ -2988,7 +3005,8 @@ def _overlay_payload(
         "to": getattr(args, "to", "project"),
         "scope": getattr(args, "scope", "project"),
         "dry_run": bool(getattr(args, "dry_run", False)),
-        "persistent": action in {"on", "off", "toggle"},
+        "persistent": action in {"on", "off", "toggle"} and not bool(getattr(args, "dry_run", False)),
+        "would_persist": action in {"on", "off", "toggle"} and bool(getattr(args, "dry_run", False)),
         "unlinked": removed,
         "activations": activations,
     }
@@ -3031,7 +3049,10 @@ def _print_overlay_text(payload: dict[str, Any]) -> None:
 
 def _handle_overlay(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
     action, name = _overlay_action_and_name(args)
-    was_on, current, now_on = _apply_persistent_overlay_action(action, name)
+    if bool(getattr(args, "dry_run", False)):
+        was_on, current, now_on = _preview_overlay_action(action, name)
+    else:
+        was_on, current, now_on = _apply_persistent_overlay_action(action, name)
     overlay_cwd = _overlay_cwd(args)
     activations = _overlay_activations(args, model, action, name, overlay_cwd)
     removed = _overlay_removed_links(args, model, action, name, was_on, now_on, overlay_cwd)

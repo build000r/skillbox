@@ -385,6 +385,40 @@ class CliWrapperTests(unittest.TestCase):
                 ],
             )
 
+    def test_sbp_overlay_dry_run_keeps_policy_sync_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            downstream = root / "downstream"
+            downstream.mkdir()
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "overlay",
+                "on",
+                "marketing",
+                "--dry-run",
+                fake_root=fake_root,
+                invoke_cwd=downstream,
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                record["argv"],
+                [
+                    "skill",
+                    "sync",
+                    "--profile",
+                    "local-all",
+                    "--cwd",
+                    str(downstream),
+                    "--dry-run",
+                ],
+            )
+
     def test_sbp_recalibrate_defaults_to_cwd_sync_and_project_prune_dry_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

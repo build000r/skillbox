@@ -503,6 +503,17 @@ append_input_token() {
   esac
 }
 
+passthrough_has_arg() {
+  local wanted="$1"
+  local token=""
+  for token in "${passthrough_args[@]}"; do
+    if [[ "${token}" == "${wanted}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 while [[ $# -gt 0 ]]; do
   case "${1}" in
     --format)
@@ -883,13 +894,21 @@ else:
     python3 .env-manager/manage.py overlay "${client_flags[@]}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
     echo
     echo "applying policy for this cwd..."
-    python3 .env-manager/manage.py skill sync "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" || true
+    overlay_sync_args=()
+    if passthrough_has_arg "--dry-run"; then
+      overlay_sync_args+=(--dry-run)
+    fi
+    python3 .env-manager/manage.py skill sync "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${overlay_sync_args[@]}" || true
     ;;
   overlay-toggle)
     python3 .env-manager/manage.py overlay toggle "${overlay_name}" "${client_flags[@]}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
     echo
     echo "applying policy for this cwd..."
-    python3 .env-manager/manage.py skill sync "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" || true
+    overlay_sync_args=()
+    if passthrough_has_arg "--dry-run"; then
+      overlay_sync_args+=(--dry-run)
+    fi
+    python3 .env-manager/manage.py skill sync "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${overlay_sync_args[@]}" || true
     ;;
   sync)
     if [[ ${#sync_paths[@]} -eq 0 ]]; then
