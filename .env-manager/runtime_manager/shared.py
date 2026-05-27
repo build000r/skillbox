@@ -213,6 +213,8 @@ WORKER_DEFAULT_WRITE_SCOPE = "propose_only"
 WORKER_DEFAULT_MEMORY_SCOPE = "repo"
 WORKER_DEFAULT_ARTIFACT_POLICY = "summary_and_files"
 WORKER_DEFAULT_LAUNCH_TIMEOUT_SECONDS = 300.0
+WORKER_LAUNCH_SETTLE_SECONDS = 0.2
+_WORKER_ACTIVE_PROCESSES: dict[int, subprocess.Popen[Any]] = {}
 WORKER_RUN_ID_PATTERN = re.compile(r"^wr_[0-9]{8}_[0-9]{6}_[a-f0-9]{6}$")
 WORKER_TERMINAL_STATES = ("succeeded", "failed", "cancelled", "review_pending")
 WORKER_BROKER_MCP_SURFACES = (
@@ -1066,6 +1068,8 @@ def _worker_launch_paths(paths: dict[str, Path]) -> dict[str, Path]:
         "task_path": run_dir / "task.json",
         "result_path": run_dir / "result.json",
         "summary_path": run_dir / "summary.md",
+        "stdout_path": run_dir / "stdout.log",
+        "stderr_path": run_dir / "stderr.log",
     }
 
 
@@ -1159,6 +1163,13 @@ def _worker_mark_launching(payload: dict[str, Any], started_at: float, command: 
     }
 
 
+def _worker_mark_running(payload: dict[str, Any], *, pid: int) -> None:
+    payload["state"] = "running"
+    payload["run"]["state"] = "running"
+    payload["run"]["blocked_reason"] = None
+    payload["launch"]["pid"] = pid
+
+
 def _worker_mark_launch_failed(
     payload: dict[str, Any],
     *,
@@ -1208,6 +1219,111 @@ def _worker_loaded_result(
         artifacts = [summary_artifact] if summary_artifact else []
     learning_proposals = [item for item in raw_result.get("learning_proposals") or [] if isinstance(item, dict)]
     return state, result, artifacts, learning_proposals
+
+
+def _worker_apply_terminal_from_launch_paths(
+    root_dir: Path,
+    paths: dict[str, Path],
+    payload: dict[str, Any],
+    launch_paths: dict[str, Path],
+    *,
+    finished_at: float | None = None,
+    returncode: int | None = None,
+) -> dict[str, Any]:
+    resolved_finished_at = finished_at if finished_at is not None else _worker_now()
+    state, result, artifacts, learning_proposals = _worker_loaded_result(payload, launch_paths)
+    _worker_apply_terminal_result(
+        payload,
+        state=state,
+        finished_at=resolved_finished_at,
+        result=result,
+        artifacts=artifacts,
+        learning_proposals=learning_proposals,
+    )
+    payload["launch"]["finished_at"] = resolved_finished_at
+    if returncode is not None:
+        payload["launch"]["returncode"] = returncode
+    _persist_worker_payload(root_dir, paths, payload, f"worker.{state}")
+    return payload
+
+
+def _worker_launch_pid(payload: dict[str, Any]) -> int:
+    launch = payload.get("launch") or {}
+    raw_pid = launch.get("pid")
+    try:
+        return int(raw_pid)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _worker_reap_active_process(pid: int) -> int | None:
+    process = _WORKER_ACTIVE_PROCESSES.get(pid)
+    if not process:
+        return None
+    returncode = process.poll()
+    if returncode is not None:
+        _WORKER_ACTIVE_PROCESSES.pop(pid, None)
+    return returncode
+
+
+def _worker_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if _worker_reap_active_process(pid) is not None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _worker_stderr_tail(launch_paths: dict[str, Path], limit: int = 4000) -> str:
+    stderr_path = launch_paths.get("stderr_path")
+    if not stderr_path or not stderr_path.is_file():
+        return ""
+    try:
+        return stderr_path.read_text(encoding="utf-8", errors="replace")[-limit:]
+    except OSError:
+        return ""
+
+
+def _reconcile_worker_payload(root_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    state = _worker_payload_state(payload)
+    if state not in {"launching", "running"}:
+        return payload
+
+    paths = worker_run_paths(root_dir, payload["run_id"])
+    launch_paths = _worker_launch_paths(paths)
+    if launch_paths["result_path"].is_file():
+        _worker_reap_active_process(_worker_launch_pid(payload))
+        return _worker_apply_terminal_from_launch_paths(root_dir, paths, payload, launch_paths)
+
+    launch = payload.get("launch") or {}
+    pid = _worker_launch_pid(payload)
+    if _worker_pid_running(pid):
+        return payload
+
+    details: dict[str, Any] = {
+        "runtime": payload.get("runtime"),
+        "pid": pid or None,
+        "stderr": _worker_stderr_tail(launch_paths),
+    }
+    command = launch.get("command")
+    if command:
+        details["command"] = command
+    _worker_mark_launch_failed(
+        payload,
+        finished_at=_worker_now(),
+        message="Hermes worker runtime exited before writing a result.",
+        details=details,
+    )
+    _persist_worker_payload(root_dir, paths, payload, "worker.launch_failed")
+    return payload
 
 
 def _persist_worker_payload(
@@ -1261,18 +1377,19 @@ def _launch_worker_if_ready(root_dir: Path, paths: dict[str, Path], payload: dic
     _worker_mark_launching(payload, _worker_now(), command)
     _persist_worker_payload(root_dir, paths, payload, "worker.launching")
     try:
-        process = subprocess.run(
-            command,
-            cwd=_worker_effective_cwd(root_dir, payload),
-            env=_worker_launch_env(root_dir, payload, launch_paths),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=_worker_launch_timeout_seconds(),
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
+        with (
+            launch_paths["stdout_path"].open("a", encoding="utf-8") as stdout_file,
+            launch_paths["stderr_path"].open("a", encoding="utf-8") as stderr_file,
+        ):
+            process = subprocess.Popen(
+                command,
+                cwd=_worker_effective_cwd(root_dir, payload),
+                env=_worker_launch_env(root_dir, payload, launch_paths),
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+            )
+    except OSError as exc:
         _worker_mark_launch_failed(
             payload,
             finished_at=_worker_now(),
@@ -1281,7 +1398,15 @@ def _launch_worker_if_ready(root_dir: Path, paths: dict[str, Path], payload: dic
         )
         _persist_worker_payload(root_dir, paths, payload, "worker.launch_failed")
         return payload
-    if process.returncode != 0:
+    try:
+        returncode = process.wait(timeout=WORKER_LAUNCH_SETTLE_SECONDS)
+    except subprocess.TimeoutExpired:
+        _WORKER_ACTIVE_PROCESSES[process.pid] = process
+        _worker_mark_running(payload, pid=process.pid)
+        _persist_worker_payload(root_dir, paths, payload, "worker.running")
+        return payload
+
+    if returncode != 0:
         _worker_mark_launch_failed(
             payload,
             finished_at=_worker_now(),
@@ -1289,27 +1414,20 @@ def _launch_worker_if_ready(root_dir: Path, paths: dict[str, Path], payload: dic
             details={
                 "runtime": payload["runtime"],
                 "command": command,
-                "returncode": process.returncode,
-                "stderr": process.stderr[-4000:],
+                "returncode": returncode,
+                "stderr": _worker_stderr_tail(launch_paths),
             },
         )
         _persist_worker_payload(root_dir, paths, payload, "worker.launch_failed")
         return payload
 
-    finished_at = _worker_now()
-    state, result, artifacts, learning_proposals = _worker_loaded_result(payload, launch_paths)
-    _worker_apply_terminal_result(
+    return _worker_apply_terminal_from_launch_paths(
+        root_dir,
+        paths,
         payload,
-        state=state,
-        finished_at=finished_at,
-        result=result,
-        artifacts=artifacts,
-        learning_proposals=learning_proposals,
+        launch_paths,
+        returncode=returncode,
     )
-    payload["launch"]["finished_at"] = finished_at
-    payload["launch"]["returncode"] = process.returncode
-    _persist_worker_payload(root_dir, paths, payload, f"worker.{state}")
-    return payload
 
 
 def create_worker_run(
@@ -1442,7 +1560,7 @@ def create_worker_run(
 
 
 def worker_status_payload(root_dir: Path, run_id: str) -> dict[str, Any]:
-    payload = read_worker_run(root_dir, run_id)
+    payload = _reconcile_worker_payload(root_dir, read_worker_run(root_dir, run_id))
     run = payload.get("run") or {}
     state = _worker_payload_state(payload)
     return {
@@ -1458,7 +1576,7 @@ def worker_status_payload(root_dir: Path, run_id: str) -> dict[str, Any]:
 
 
 def worker_artifacts_payload(root_dir: Path, run_id: str) -> dict[str, Any]:
-    payload = read_worker_run(root_dir, run_id)
+    payload = _reconcile_worker_payload(root_dir, read_worker_run(root_dir, run_id))
     state = _worker_payload_state(payload)
     if state not in WORKER_TERMINAL_STATES:
         raise WorkerRuntimeError(
