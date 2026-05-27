@@ -358,10 +358,54 @@ directory_has_entries() {
   find "${path}" -mindepth 1 -maxdepth 1 | grep -q .
 }
 
+target_is_skillbox_checkout() {
+  local target="$1"
+  [[ -f "${target}/.env-manager/manage.py" && -f "${target}/install.sh" && -f "${target}/README.md" ]]
+}
+
+target_is_protected_install_path() {
+  local target="$1"
+  local home_real=""
+  local script_real=""
+  if [[ -z "${target}" || "${target}" == "/" ]]; then
+    return 0
+  fi
+  home_real="$(resolve_abs_path "${HOME}")"
+  if [[ "${target}" == "${home_real}" ]]; then
+    return 0
+  fi
+  if [[ -n "${SCRIPT_DIR}" ]]; then
+    script_real="$(resolve_abs_path "${SCRIPT_DIR}")"
+    if [[ "${target}" == "${script_real}" ]]; then
+      return 0
+    fi
+    case "${script_real}/" in
+      "${target}/"*) return 0 ;;
+    esac
+  fi
+  return 1
+}
+
+assert_force_replace_checkout_target() {
+  local target="$1"
+  target="$(resolve_abs_path "${target}")"
+  if target_is_protected_install_path "${target}"; then
+    err "Refusing --force replacement of protected install target: ${target}"
+    err "Choose a dedicated checkout directory or remove the target manually."
+    exit 1
+  fi
+  if ! target_is_skillbox_checkout "${target}"; then
+    err "Refusing --force replacement of non-Skillbox directory: ${target}"
+    err "Remove it manually or choose an empty --repo-dir."
+    exit 1
+  fi
+}
+
 ensure_checkout_target_ready() {
   local target="$1"
   if [[ -d "${target}" ]] && directory_has_entries "${target}"; then
     if [[ "${FORCE}" -eq 1 ]]; then
+      assert_force_replace_checkout_target "${target}"
       warn "Removing existing checkout target: ${target}"
       rm -rf "${target}"
     else

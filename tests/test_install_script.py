@@ -106,6 +106,95 @@ class InstallScriptTests(unittest.TestCase):
             self.assertIn("Checkout target already exists", result.stderr)
             self.assertEqual(note_path.read_text(encoding="utf-8"), "keep me\n")
 
+    def test_force_refuses_non_skillbox_target_and_preserves_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_dir = root / "not-skillbox"
+            private_dir = root / "skillbox-config"
+            repo_dir.mkdir(parents=True, exist_ok=True)
+            note_path = repo_dir / "sentinel.txt"
+            note_path.write_text("do not delete\n", encoding="utf-8")
+
+            result = self._run(
+                "--source-dir",
+                str(ROOT_DIR),
+                "--repo-dir",
+                str(repo_dir),
+                "--private-path",
+                str(private_dir),
+                "--client",
+                "personal",
+                "--skip-build",
+                "--skip-up",
+                "--force",
+                "--no-gum",
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Refusing --force replacement of non-Skillbox directory", result.stderr)
+            self.assertEqual(note_path.read_text(encoding="utf-8"), "do not delete\n")
+
+    def test_force_refuses_home_target_and_preserves_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home = root / "home"
+            private_dir = root / "skillbox-config"
+            home.mkdir(parents=True, exist_ok=True)
+            note_path = home / "sentinel.txt"
+            note_path.write_text("do not delete\n", encoding="utf-8")
+
+            result = self._run(
+                "--source-dir",
+                str(ROOT_DIR),
+                "--repo-dir",
+                str(home),
+                "--private-path",
+                str(private_dir),
+                "--client",
+                "personal",
+                "--skip-build",
+                "--skip-up",
+                "--force",
+                "--no-gum",
+                extra_env={"HOME": str(home)},
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Refusing --force replacement of protected install target", result.stderr)
+            self.assertEqual(note_path.read_text(encoding="utf-8"), "do not delete\n")
+
+    def test_force_allows_existing_skillbox_checkout_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_dir = root / "skillbox"
+            private_dir = root / "skillbox-config"
+            (repo_dir / ".env-manager").mkdir(parents=True, exist_ok=True)
+            (repo_dir / ".env-manager" / "manage.py").write_text("# existing\n", encoding="utf-8")
+            (repo_dir / "install.sh").write_text("# existing\n", encoding="utf-8")
+            (repo_dir / "README.md").write_text("# existing\n", encoding="utf-8")
+            old_file = repo_dir / "old.txt"
+            old_file.write_text("replace me\n", encoding="utf-8")
+
+            result = self._run(
+                "--source-dir",
+                str(ROOT_DIR),
+                "--repo-dir",
+                str(repo_dir),
+                "--private-path",
+                str(private_dir),
+                "--client",
+                "personal",
+                "--skip-first-box",
+                "--skip-build",
+                "--skip-up",
+                "--force",
+                "--no-gum",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((repo_dir / ".env").is_file())
+            self.assertFalse(old_file.exists())
+
     def test_verify_runs_post_install_checks(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -189,9 +278,11 @@ class InstallScriptTests(unittest.TestCase):
             self.assertEqual((bin_dir / "sbo").resolve(), (repo_dir / "scripts" / "sbo").resolve())
             self.assertIn("wrappers: ok", result.stdout)
 
-    def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
+    def _run(self, *args: str, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.setdefault("TERM", "dumb")
+        if extra_env:
+            env.update(extra_env)
         with tempfile.TemporaryDirectory() as lock_tmp:
             env["TMPDIR"] = lock_tmp
             return subprocess.run(
