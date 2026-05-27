@@ -190,6 +190,48 @@ class CliWrapperTests(unittest.TestCase):
                 ],
             )
 
+    def test_sbp_up_dry_run_survives_system_bash_empty_arrays(self) -> None:
+        system_bash = Path("/bin/bash")
+        if not system_bash.exists():
+            self.skipTest("/bin/bash is not available on this platform")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+
+            for json_flag in ("--json", "--jason"):
+                with self.subTest(json_flag=json_flag):
+                    record_path = root / f"record-{json_flag[2:]}.json"
+                    result = self._run_wrapper(
+                        SBP,
+                        "up",
+                        "--dry-run",
+                        json_flag,
+                        fake_root=fake_root,
+                        record_path=record_path,
+                        bash_path=system_bash,
+                    )
+
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    record = json.loads(record_path.read_text(encoding="utf-8"))
+                    self.assertEqual(
+                        record["argv"],
+                        [
+                            "up",
+                            "--cwd",
+                            str(ROOT_DIR),
+                            "--profile",
+                            "local-all",
+                            "--mode",
+                            "reuse",
+                            "--dry-run",
+                            "--format",
+                            "json",
+                        ],
+                    )
+                    if json_flag != "--json":
+                        self.assertIn("Interpreting --jason as --format json", result.stderr)
+
     def test_sbp_unknown_and_logs_errors_name_exact_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -715,6 +757,7 @@ class CliWrapperTests(unittest.TestCase):
         invoke_cwd: Path | None = None,
         extra_env: dict[str, str] | None = None,
         record_path: Path | None = None,
+        bash_path: str | Path = "bash",
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.setdefault("TERM", "dumb")
@@ -731,7 +774,7 @@ class CliWrapperTests(unittest.TestCase):
         else:
             env["SKILLBOX_RECORD"] = os.devnull
         return subprocess.run(
-            ["bash", str(wrapper), *args],
+            [str(bash_path), str(wrapper), *args],
             cwd=ROOT_DIR,
             env=env,
             capture_output=True,
