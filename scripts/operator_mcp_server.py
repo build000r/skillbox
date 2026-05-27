@@ -60,6 +60,7 @@ _SSH_USER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$")
 _HOST_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,253}[a-zA-Z0-9])?$")
 
 DRYRUN_MARKER_TTL_SECONDS = 600  # 10 minutes
+_DRYRUN_MARKER_STATUS_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 def _validate_identifier(value: str, kind: str) -> str:
@@ -678,6 +679,7 @@ def handle_operator_provision(params: dict) -> dict:
             str(box_id),
             "operator_provision(box_id='<id>', dry_run=true)",
             "python3 scripts/box.py up <box-id> --profile dev-small --dry-run --format json",
+            marker_status=_dryrun_marker_rejection_status("operator_provision", str(box_id)),
         )
 
     ok, _code, data = run_script(BOX_PY, args, timeout=PROVISION_TIMEOUT_SECONDS)
@@ -721,6 +723,7 @@ def handle_operator_teardown(params: dict) -> dict:
             str(box_id),
             "operator_teardown(box_id='<id>', dry_run=true)",
             "python3 scripts/box.py down <box-id> --dry-run --format json",
+            marker_status=_dryrun_marker_rejection_status("operator_teardown", str(box_id)),
         )
 
     ok, _code, data = run_script(BOX_PY, args, timeout=300)
@@ -860,6 +863,7 @@ def handle_operator_compose_down(params: dict) -> dict:
             "local",
             "operator_compose_down(dry_run=true)",
             "docker compose ps --format json",
+            marker_status=_dryrun_marker_rejection_status("operator_compose_down", "local"),
         )
 
     ok, code, data = run_compose(["down"], timeout=120)
@@ -916,6 +920,19 @@ def _dryrun_marker_path(tool_name: str, box_id: str) -> Path:
     return REPO_ROOT / ".skillbox-state" / "dryrun-markers" / f".skillbox-dryrun-{tool_name}-{box_id}"
 
 
+def _dryrun_marker_ttl_seconds() -> int:
+    raw_ttl = str(os.environ.get("SKILLBOX_DRYRUN_MARKER_TTL_SECONDS") or "").strip()
+    if raw_ttl:
+        try:
+            ttl = int(raw_ttl)
+        except ValueError:
+            ttl = DRYRUN_MARKER_TTL_SECONDS
+        else:
+            if ttl > 0:
+                return ttl
+    return DRYRUN_MARKER_TTL_SECONDS
+
+
 def _stamp_dryrun_marker(tool_name: str, box_id: str) -> None:
     """Create a temp marker so the PreToolUse hook knows a dry-run was done."""
     marker = _dryrun_marker_path(tool_name, box_id)
@@ -923,23 +940,50 @@ def _stamp_dryrun_marker(tool_name: str, box_id: str) -> None:
     marker.write_text(f"dry-run completed for {tool_name} box={box_id}\n")
 
 
-def _has_dryrun_marker(tool_name: str, box_id: str) -> bool:
-    """Check if a valid, non-expired dry-run marker exists (TTL: 10 minutes)."""
+def _dryrun_marker_status(tool_name: str, box_id: str) -> dict[str, Any]:
     marker = _dryrun_marker_path(tool_name, box_id)
+    ttl_seconds = _dryrun_marker_ttl_seconds()
+    status: dict[str, Any] = {
+        "path": str(marker),
+        "exists": False,
+        "valid": False,
+        "expired": False,
+        "age_seconds": None,
+        "ttl_seconds": ttl_seconds,
+    }
     if not marker.is_file():
-        return False
+        return status
+    status["exists"] = True
     try:
-        age = time.time() - marker.stat().st_mtime
+        age_seconds = max(0, int(time.time() - marker.stat().st_mtime))
     except OSError:
-        return False
-    if age > DRYRUN_MARKER_TTL_SECONDS:
+        return status
+    status["age_seconds"] = age_seconds
+    status["expired"] = age_seconds > ttl_seconds
+    status["valid"] = not status["expired"]
+    return status
+
+
+def _has_dryrun_marker(tool_name: str, box_id: str) -> bool:
+    """Check if a valid, non-expired dry-run marker exists."""
+    status = _dryrun_marker_status(tool_name, box_id)
+    cache_key = (tool_name, box_id)
+    if status["valid"]:
+        _DRYRUN_MARKER_STATUS_CACHE.pop(cache_key, None)
+    else:
+        _DRYRUN_MARKER_STATUS_CACHE[cache_key] = status
+    if status["expired"]:
         # Expired — clean up and report absent.
         try:
-            marker.unlink(missing_ok=True)
+            Path(str(status["path"])).unlink(missing_ok=True)
         except OSError:
             pass
         return False
-    return True
+    return bool(status["valid"])
+
+
+def _dryrun_marker_rejection_status(tool_name: str, box_id: str) -> dict[str, Any]:
+    return _DRYRUN_MARKER_STATUS_CACHE.pop((tool_name, box_id), None) or _dryrun_marker_status(tool_name, box_id)
 
 
 def _clear_dryrun_marker(tool_name: str, box_id: str) -> None:
@@ -977,13 +1021,36 @@ def _missing_required_error(tool_name: str, message: str, next_actions: list[str
     })
 
 
-def _dry_run_required_error(tool_name: str, subject: str, safe_first_call: str, exact_cli: str) -> dict:
+def _dry_run_required_error(
+    tool_name: str,
+    subject: str,
+    safe_first_call: str,
+    exact_cli: str,
+    *,
+    marker_status: dict[str, Any] | None = None,
+) -> dict:
+    marker = marker_status or {"ttl_seconds": _dryrun_marker_ttl_seconds(), "age_seconds": None}
+    ttl_seconds = marker.get("ttl_seconds")
+    age_seconds = marker.get("age_seconds")
+    if age_seconds is None:
+        marker_note = f"no marker age observed; configured marker ttl is {ttl_seconds}s"
+    else:
+        marker_note = f"observed marker age is {age_seconds}s; configured marker ttl is {ttl_seconds}s"
     return _error_content({
         "error": {
             "type": "dry_run_required",
-            "message": f"{tool_name} requires a successful dry_run=true preview before the real operation.",
+            "message": (
+                f"{tool_name} requires a successful dry_run=true preview before the real operation "
+                f"({marker_note})."
+            ),
             "recoverable": True,
             "subject": subject,
+            "marker": {
+                "exists": bool(marker.get("exists")),
+                "expired": bool(marker.get("expired")),
+                "age_seconds": age_seconds,
+                "ttl_seconds": ttl_seconds,
+            },
             "next_actions": [safe_first_call, exact_cli],
         }
     })
