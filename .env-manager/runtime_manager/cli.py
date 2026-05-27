@@ -3251,6 +3251,30 @@ def _legacy_up_payload(
     }
 
 
+def _start_failure_ids(service_results: list[dict[str, Any]]) -> list[str]:
+    failed_ids: list[str] = []
+    for index, entry in enumerate(service_results, start=1):
+        if entry.get("result") not in {"failed", "timeout", "blocked"}:
+            continue
+        service_id = str(entry.get("id") or entry.get("service") or f"service-{index}")
+        failed_ids.append(service_id)
+    return failed_ids
+
+
+def _apply_start_failure_error(payload: dict[str, Any], service_results: list[dict[str, Any]]) -> int:
+    failed_ids = _start_failure_ids(service_results)
+    if not failed_ids:
+        return EXIT_OK
+    payload.update(local_runtime_error(
+        LOCAL_RUNTIME_START_BLOCKED,
+        f"Some services did not become healthy: {', '.join(failed_ids)}",
+        recoverable=True,
+        blocked_services=failed_ids,
+        next_action="manage.py status --format json",
+    ))
+    return EXIT_ERROR
+
+
 def _handle_up(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
     # Local-runtime profiles use workflows.run_up; legacy profiles keep the
     # inline path for compatibility with existing lifecycle behavior.
@@ -3263,10 +3287,12 @@ def _handle_up(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], 
     deferred_exit = _emit_missing_bridge_if_needed(args, model)
     if deferred_exit is not None:
         return deferred_exit
+    payload = _legacy_up_payload(args, model, requested_services, resolved_mode)
+    exit_code = _apply_start_failure_error(payload, payload.get("services") or [])
     return _emit_up_payload(
         args,
-        _legacy_up_payload(args, model, requested_services, resolved_mode),
-        EXIT_OK,
+        payload,
+        exit_code,
         model=model,
     )
 
@@ -3329,6 +3355,7 @@ def _handle_restart(args: argparse.Namespace, root_dir: Path, model: dict[str, A
         "start_services": start_results,
         "next_actions": next_actions_for_up(start_results),
     }
+    exit_code = _apply_start_failure_error(payload, start_results)
     if args.format == "json":
         emit_json(payload)
     else:
@@ -3336,7 +3363,10 @@ def _handle_restart(args: argparse.Namespace, root_dir: Path, model: dict[str, A
         print_service_actions_text({"services": stop_results})
         print()
         print_service_actions_text({"sync_actions": sync_actions, "tasks": task_results, "services": start_results})
-    return EXIT_OK
+        if exit_code != EXIT_OK and "error" in payload:
+            print()
+            print_local_runtime_error_text(payload)
+    return exit_code
 
 
 def _handle_logs(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
