@@ -872,6 +872,9 @@ def box_ssh_candidates(box: "Box", *, prefer_public: bool = False) -> list[str]:
         box.tailscale_hostname,
         box.droplet_ip,
     ]
+    cached = str(getattr(box, "last_ssh_target", "") or "").strip()
+    if cached:
+        ordered = [cached, *ordered]
     candidates: list[str] = []
     for candidate in ordered:
         value = str(candidate or "").strip()
@@ -887,9 +890,35 @@ def resolve_box_ssh_target(
     interval: int = 2,
     prefer_public: bool = False,
 ) -> str | None:
-    for target in box_ssh_candidates(box, prefer_public=prefer_public):
-        if wait_for_ssh(target, user=box.ssh_user, max_wait=max_wait, interval=interval):
+    candidates = box_ssh_candidates(box, prefer_public=prefer_public)
+    if not candidates:
+        return None
+
+    cached = str(getattr(box, "last_ssh_target", "") or "").strip()
+    remaining = candidates
+    if cached and cached in candidates:
+        if wait_for_ssh(cached, user=box.ssh_user, max_wait=max_wait, interval=interval):
+            box.last_ssh_target = cached
+            return cached
+        remaining = [candidate for candidate in candidates if candidate != cached]
+
+    if not remaining:
+        box.last_ssh_target = None
+        return None
+
+    max_workers = min(3, len(remaining))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = list(
+            executor.map(
+                lambda target: wait_for_ssh(target, user=box.ssh_user, max_wait=max_wait, interval=interval),
+                remaining,
+            )
+        )
+    for target, reachable in zip(remaining, results):
+        if reachable:
+            box.last_ssh_target = target
             return target
+    box.last_ssh_target = None
     return None
 
 
@@ -1400,6 +1429,7 @@ class Box:
     droplet_ip: str | None = None
     tailscale_hostname: str | None = None
     tailscale_ip: str | None = None
+    last_ssh_target: str | None = None
     ssh_user: str = "skillbox"
     created_at: str = ""
     updated_at: str = ""
@@ -1447,6 +1477,17 @@ def update_box(box: Box, **kwargs: Any) -> None:
         if hasattr(box, k):
             setattr(box, k, v)
     box.updated_at = datetime.now(timezone.utc).isoformat()
+
+
+def inventory_ssh_target_snapshot(boxes: list[Box]) -> dict[str, str | None]:
+    return {box.id: box.last_ssh_target for box in boxes}
+
+
+def persist_inventory_if_ssh_targets_changed(boxes: list[Box], before: dict[str, str | None]) -> None:
+    if inventory_ssh_target_snapshot(boxes) == before:
+        return
+    if inventory_path().is_file():
+        save_inventory(boxes)
 
 
 def volume_payload(box: Box) -> dict[str, Any] | None:
@@ -3180,6 +3221,7 @@ def cmd_register(
 def cmd_status(box_id: str | None, *, fmt: str) -> int:
     is_json = fmt == "json"
     boxes = load_inventory()
+    ssh_target_snapshot = inventory_ssh_target_snapshot(boxes)
 
     if box_id:
         box = find_box(boxes, box_id)
@@ -3192,6 +3234,7 @@ def cmd_status(box_id: str | None, *, fmt: str) -> int:
             return EXIT_ERROR
 
         status = box_health(box)
+        persist_inventory_if_ssh_targets_changed(boxes, ssh_target_snapshot)
         if is_json:
             emit_json(status)
         else:
@@ -3209,6 +3252,7 @@ def cmd_status(box_id: str | None, *, fmt: str) -> int:
             "boxes": statuses,
             "next_actions": ["box up <id> --profile <name>", "box register <id> --host <tailscale-hostname>"] if not statuses else [],
         }
+        persist_inventory_if_ssh_targets_changed(boxes, ssh_target_snapshot)
         if is_json:
             emit_json(payload)
         else:

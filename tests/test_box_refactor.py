@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -551,6 +552,98 @@ class BoxRefactorTests(unittest.TestCase):
                 {"id": "charlie", "state": "ready"},
             ],
         )
+
+    def test_resolve_box_ssh_target_tries_cached_target_first(self) -> None:
+        box = BOX.Box(
+            id="warm",
+            profile="dev-small",
+            state="ready",
+            tailscale_ip="100.64.0.8",
+            tailscale_hostname="skillbox-warm",
+            droplet_ip="1.2.3.4",
+            last_ssh_target="cached-host",
+        )
+        calls: list[str] = []
+
+        def wait(host: str, user: str = "root", *, max_wait: int = 120, interval: int = 5) -> bool:
+            calls.append(host)
+            return host == "cached-host"
+
+        with mock.patch.object(BOX, "wait_for_ssh", side_effect=wait):
+            target = BOX.resolve_box_ssh_target(box, max_wait=5, interval=1)
+
+        self.assertEqual(target, "cached-host")
+        self.assertEqual(calls, ["cached-host"])
+        self.assertEqual(box.last_ssh_target, "cached-host")
+
+    def test_resolve_box_ssh_target_parallel_probes_candidates_and_caches_winner(self) -> None:
+        box = BOX.Box(
+            id="cold",
+            profile="dev-small",
+            state="ready",
+            tailscale_ip="100.64.0.8",
+            tailscale_hostname="skillbox-cold",
+            droplet_ip="1.2.3.4",
+        )
+        started: list[str] = []
+        lock = threading.Lock()
+        all_started = threading.Event()
+
+        def wait(host: str, user: str = "root", *, max_wait: int = 120, interval: int = 5) -> bool:
+            with lock:
+                started.append(host)
+                if len(started) == 3:
+                    all_started.set()
+            if not all_started.wait(1.0):
+                raise AssertionError("candidate probes did not overlap")
+            return host == "skillbox-cold"
+
+        with mock.patch.object(BOX, "wait_for_ssh", side_effect=wait):
+            target = BOX.resolve_box_ssh_target(box, max_wait=5, interval=1)
+
+        self.assertEqual(target, "skillbox-cold")
+        self.assertEqual(box.last_ssh_target, "skillbox-cold")
+        self.assertCountEqual(started, ["100.64.0.8", "skillbox-cold", "1.2.3.4"])
+
+    def test_cmd_status_persists_last_ssh_target_when_inventory_file_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            inventory = Path(tmpdir) / "boxes.json"
+            inventory.write_text(
+                json.dumps(
+                    {
+                        "boxes": [
+                            {
+                                "id": "cached",
+                                "profile": "dev-small",
+                                "state": "ready",
+                                "tailscale_ip": "100.64.0.8",
+                                "ssh_user": "skillbox",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            payloads: list[dict[str, object]] = []
+            network = {
+                "public_ssh": {"ok": False},
+                "tailnet_ping": {"ok": False},
+                "magicdns_resolution": {"ok": False},
+                "port_reachability": {"ok": False},
+            }
+
+            with mock.patch.dict(os.environ, {"SKILLBOX_BOX_INVENTORY": str(inventory)}), \
+                mock.patch.object(BOX, "wait_for_ssh", return_value=True), \
+                mock.patch.object(BOX, "ssh_cmd", return_value=_completed(returncode=1)), \
+                mock.patch.object(BOX, "box_network_health", return_value=network), \
+                mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
+                result = BOX.cmd_status(None, fmt="json")
+
+            saved = json.loads(inventory.read_text(encoding="utf-8"))
+
+        self.assertEqual(result, BOX.EXIT_OK)
+        self.assertEqual(payloads[-1]["boxes"][0]["ssh_target"], "100.64.0.8")
+        self.assertEqual(saved["boxes"][0]["last_ssh_target"], "100.64.0.8")
 
     def test_cmd_status_unknown_box_returns_error_payload(self) -> None:
         payloads: list[dict[str, object]] = []
