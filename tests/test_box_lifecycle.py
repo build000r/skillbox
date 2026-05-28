@@ -598,7 +598,7 @@ class BoxLifecycleTests(unittest.TestCase):
 
         self.assertEqual(result, BOX_MODULE.EXIT_OK)
         self.assertEqual(box.state, "destroyed")
-        self.assertEqual([step["status"] for step in payloads[0]["steps"]], ["ok", "ok", "ok"])
+        self.assertEqual([step["status"] for step in payloads[0]["steps"]], ["ok", "ok", "ok", "skip"])
 
     def test_box_health_reports_reachable_container(self) -> None:
         box = BOX_MODULE.Box(

@@ -1686,6 +1686,24 @@ def do_attach_volume(volume_id: str, droplet_id: str) -> None:
     )
 
 
+def do_detach_volume(volume_id: str, droplet_id: str) -> bool:
+    result = run(
+        ["doctl", "compute", "volume-action", "detach", volume_id, droplet_id, "--wait"],
+        check=False,
+        timeout=300,
+    )
+    return result.returncode == 0
+
+
+def do_delete_volume(volume_id: str) -> bool:
+    result = run(
+        ["doctl", "compute", "volume", "delete", volume_id, "--force"],
+        check=False,
+        timeout=300,
+    )
+    return result.returncode == 0
+
+
 # ---------------------------------------------------------------------------
 # Tailscale operations
 # ---------------------------------------------------------------------------
@@ -2939,6 +2957,11 @@ def _emit_box_down_dry_run(box: Box, box_id: str, steps: list[dict[str, Any]], *
     _box_down_step(steps, is_json, "drain", "skip", "dry-run")
     _box_down_step(steps, is_json, "remove", "skip", "dry-run")
     _box_down_step(steps, is_json, "destroy", "skip", f"would destroy droplet {box.droplet_id}")
+    if box.volume_id:
+        volume_label = box.volume_name or box.volume_id
+        _box_down_step(steps, is_json, "volume", "skip", f"would detach/delete volume {volume_label}")
+    else:
+        _box_down_step(steps, is_json, "volume", "skip", "no volume id")
     payload: dict[str, Any] = {"box_id": box_id, "dry_run": True, "steps": steps, "next_actions": [f"box down {box_id}"]}
     if is_json:
         emit_json(payload)
@@ -2989,6 +3012,63 @@ def _destroy_box_droplet(box: Box, steps: list[dict[str, Any]], *, is_json: bool
 
     _box_down_step(steps, is_json, "destroy", "skip", "no droplet id")
     return True
+
+
+def _cleanup_box_volume(box: Box, steps: list[dict[str, Any]], *, is_json: bool) -> bool:
+    volume_id = str(box.volume_id or "").strip()
+    if not volume_id:
+        _box_down_step(steps, is_json, "volume", "skip", "no volume id")
+        return True
+
+    volume_label = box.volume_name or volume_id
+    droplet_id = str(box.droplet_id or "").strip()
+    try:
+        volume = do_get_volume(volume_id)
+    except Exception as exc:
+        _box_down_step(steps, is_json, "volume", "warn", f"could not inspect volume {volume_label}: {exc}")
+        return False
+
+    attached_ids = _volume_droplet_ids(volume)
+    foreign_ids = [attached_id for attached_id in attached_ids if not droplet_id or attached_id != droplet_id]
+    if foreign_ids:
+        detail = (
+            f"volume {volume_label} is still attached to droplet(s) {', '.join(foreign_ids)}; "
+            "not deleting"
+        )
+        _box_down_step(steps, is_json, "volume", "warn", detail)
+        return False
+
+    if droplet_id and droplet_id in attached_ids:
+        try:
+            if not is_json:
+                print(f"[...] volume  Detaching volume {volume_label} from droplet {droplet_id}...")
+            if not do_detach_volume(volume_id, droplet_id):
+                _box_down_step(steps, is_json, "volume", "warn", f"detach failed for volume {volume_label}")
+                return False
+            volume = do_get_volume(volume_id)
+        except Exception as exc:
+            _box_down_step(steps, is_json, "volume", "warn", f"detach failed for volume {volume_label}: {exc}")
+            return False
+
+    remaining_ids = _volume_droplet_ids(volume)
+    if remaining_ids:
+        detail = (
+            f"volume {volume_label} is still attached to droplet(s) {', '.join(remaining_ids)}; "
+            "not deleting"
+        )
+        _box_down_step(steps, is_json, "volume", "warn", detail)
+        return False
+
+    try:
+        if not is_json:
+            print(f"[...] volume  Deleting volume {volume_label}...")
+        if do_delete_volume(volume_id):
+            _box_down_step(steps, is_json, "volume", "ok", f"volume {volume_label} deleted")
+            return True
+        _box_down_step(steps, is_json, "volume", "warn", f"delete failed for volume {volume_label}")
+    except Exception as exc:
+        _box_down_step(steps, is_json, "volume", "warn", f"delete failed for volume {volume_label}: {exc}")
+    return False
 
 
 def _emit_box_down_destroy_failure(box: Box, box_id: str, steps: list[dict[str, Any]], *, is_json: bool) -> int:
@@ -3057,6 +3137,7 @@ def cmd_down(box_id: str, *, dry_run: bool, fmt: str) -> int:
     if not _destroy_box_droplet(box, steps, is_json=is_json):
         save_inventory(boxes)
         return _emit_box_down_destroy_failure(box, box_id, steps, is_json=is_json)
+    _cleanup_box_volume(box, steps, is_json=is_json)
     return _emit_box_down_success(boxes, box, box_id, steps, is_json=is_json)
 
 
