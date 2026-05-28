@@ -19,6 +19,7 @@ import gzip
 import hashlib
 import io
 import json
+import re
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,13 @@ from typing import Any, BinaryIO, Union
 SKILL_META_DIR = ".skill-meta"
 MANIFEST_FILENAME = "manifest.json"
 BUNDLE_SUFFIX = ".skillbundle.tar.gz"
+_WINDOWS_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[/\\]")
+
+
+def _unsafe_bundle_member_name(name: str) -> bool:
+    normalized = name.replace("\\", "/")
+    parts = [part for part in normalized.split("/") if part]
+    return normalized.startswith("/") or ".." in parts or bool(_WINDOWS_DRIVE_PATH_RE.match(name))
 
 _TAR_MTIME = 0
 _TAR_UID = 0
@@ -272,7 +280,7 @@ def unpack_skill_bundle(
                     raise BundleStructureError(
                         f"link member not allowed in bundle: {member.name}"
                     )
-                if member.name.startswith("/") or ".." in member.name.split("/"):
+                if _unsafe_bundle_member_name(member.name):
                     raise BundleStructureError(f"unsafe path in bundle: {member.name}")
             tar.extractall(dest_dir, filter="data")
     except BundleStructureError:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import io
 import json
 import os
 import sys
@@ -46,6 +47,20 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: fh.read(65536), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+def _write_raw_bundle(path: Path, members: list[tarfile.TarInfo | tuple[str, bytes]]) -> None:
+    with path.open("wb") as raw:
+        with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz:
+            with tarfile.open(fileobj=gz, mode="w") as tar:
+                for member in members:
+                    if isinstance(member, tarfile.TarInfo):
+                        tar.addfile(member)
+                    else:
+                        name, data = member
+                        info = tarfile.TarInfo(name=name)
+                        info.size = len(data)
+                        tar.addfile(info, io.BytesIO(data))
 
 
 class TestPackUnpackRoundTrip(unittest.TestCase):
@@ -249,6 +264,58 @@ class TestUnpackErrors(unittest.TestCase):
             with self.assertRaises(BundleStructureError) as ctx:
                 unpack_skill_bundle(bundle_path, ext)
             self.assertIn("missing required fields", str(ctx.exception))
+
+    def test_rejects_absolute_parent_and_backslash_traversal_paths(self) -> None:
+        bad_names = [
+            "/tmp/skillbox-pwned",
+            "../outside",
+            "nested/../../outside",
+            "..\\outside",
+            "nested\\..\\outside",
+            "C:\\outside",
+        ]
+        for bad_name in bad_names:
+            with self.subTest(bad_name=bad_name), tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                bundle_path = tmp / "unsafe.skillbundle.tar.gz"
+                _write_raw_bundle(
+                    bundle_path,
+                    [
+                        (bad_name, b"pwned"),
+                        (f"{SKILL_META_DIR}/{MANIFEST_FILENAME}", b"{}"),
+                    ],
+                )
+                ext = tmp / "ext"
+                ext.mkdir()
+
+                with self.assertRaises(BundleStructureError) as ctx:
+                    unpack_skill_bundle(bundle_path, ext)
+
+                self.assertIn("unsafe path", str(ctx.exception))
+                self.assertFalse((tmp / "outside").exists())
+
+    def test_rejects_symlink_and_hardlink_members(self) -> None:
+        for link_type in (tarfile.SYMTYPE, tarfile.LNKTYPE):
+            with self.subTest(link_type=link_type), tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                bundle_path = tmp / "link.skillbundle.tar.gz"
+                link = tarfile.TarInfo(name="references/link.md")
+                link.type = link_type
+                link.linkname = "SKILL.md"
+                _write_raw_bundle(
+                    bundle_path,
+                    [
+                        link,
+                        (f"{SKILL_META_DIR}/{MANIFEST_FILENAME}", b"{}"),
+                    ],
+                )
+                ext = tmp / "ext"
+                ext.mkdir()
+
+                with self.assertRaises(BundleStructureError) as ctx:
+                    unpack_skill_bundle(bundle_path, ext)
+
+                self.assertIn("link member not allowed", str(ctx.exception))
 
 
 class TestVerifyBundleContents(unittest.TestCase):
