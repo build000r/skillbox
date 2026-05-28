@@ -412,6 +412,51 @@ class OperatorMcpServerTests(unittest.TestCase):
         payload = _content_payload(result)
         self.assertEqual(payload["error"]["type"], "build_failed")
 
+    def test_handle_operator_compose_up_surface_failure_is_partial_success(self) -> None:
+        with mock.patch.object(
+            MODULE,
+            "run_compose",
+            side_effect=[
+                (True, 0, {"step": "build"}),
+                (True, 0, {"step": "up"}),
+                (False, 1, {"stderr": "surface failed"}),
+            ],
+        ), mock.patch.object(MODULE, "emit_event") as emit_event:
+            result = MODULE.handle_operator_compose_up({"build": True, "surfaces": True})
+
+        payload = _content_payload(result)
+        self.assertFalse(result.get("isError", False))
+        self.assertTrue(payload["headline_ok"])
+        self.assertEqual([step["step"] for step in payload["partial_failures"]], ["up-surfaces"])
+        self.assertIn("steps[]", payload["next_actions"][0])
+        emit_event.assert_called_once_with(
+            "operator.compose_up",
+            "local",
+            {"ok": True, "headline_ok": True, "all_steps_ok": False},
+        )
+
+    def test_handle_operator_compose_up_up_failure_is_error(self) -> None:
+        with mock.patch.object(
+            MODULE,
+            "run_compose",
+            side_effect=[
+                (True, 0, {"step": "build"}),
+                (False, 1, {"stderr": "up failed"}),
+            ],
+        ), mock.patch.object(MODULE, "emit_event") as emit_event:
+            result = MODULE.handle_operator_compose_up({"build": True, "surfaces": True})
+
+        payload = _content_payload(result)
+        self.assertTrue(result["isError"])
+        self.assertFalse(payload["headline_ok"])
+        self.assertEqual(payload["error"]["type"], "up_failed")
+        self.assertEqual([step["step"] for step in payload["steps"]], ["build", "up"])
+        emit_event.assert_called_once_with(
+            "operator.compose_up",
+            "local",
+            {"ok": False, "headline_ok": False},
+        )
+
     def test_handle_operator_compose_down_dry_run_preserves_preview_failure(self) -> None:
         with mock.patch.object(
             MODULE,
