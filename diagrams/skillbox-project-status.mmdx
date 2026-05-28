@@ -1,0 +1,122 @@
+<!-- mmdx
+{
+  "entry": "main",
+  "shortLink": { "username": "buildooor", "slug": "" },
+  "links": [
+    {
+      "from": "main",
+      "label": "Open proof status",
+      "to": "proof-status",
+      "title": "Open proof status"
+    },
+    {
+      "from": "main",
+      "label": "Open Bead coverage",
+      "to": "bead-coverage",
+      "title": "Open Bead coverage"
+    },
+    {
+      "from": "main",
+      "label": "Next moves",
+      "to": "next-moves",
+      "title": "Next moves"
+    }
+  ]
+}
+-->
+
+## chart main Skillbox Project Status
+```mermaid
+flowchart TD
+  vision["Vision: private single-tenant Tailnet/Docker dev box for one operator and coding agents"]
+  green["GREEN Current proof-backed core: runtime graph, doctor/dev-sanity, pressure report, pulse, box inventory, skill visibility"]
+  yellow["YELLOW Bead-covered validation and disk gates: skillbox-smart-20260518-validation-trust-gkn"]
+  redClient["RED No active personal client in this checkout: no direct implementation Bead"]
+  redMcp["RED MCP parity drift for Claude-only cm/dcg/fwc: no direct implementation Bead"]
+  gray["GRAY Side-effecting infra paths not run: up, box-up, provision, teardown, worker launch"]
+  next["Next: use h1k.2-h1k.5 to rank and mint implementation Beads for accepted gaps"]
+
+  vision --> green
+  vision --> yellow
+  vision --> redClient
+  vision --> redMcp
+  vision --> gray
+  yellow --> next
+  redClient --> next
+  redMcp --> next
+
+  class green green
+  class yellow yellow
+  class redClient,redMcp red
+  class gray gray
+  classDef green fill:#dff7df,stroke:#20833a,stroke-width:2px,color:#0f2f18
+  classDef yellow fill:#fff3bf,stroke:#b7791f,stroke-width:2px,color:#3a2a00
+  classDef red fill:#ffd6d6,stroke:#c53030,stroke-width:2px,color:#3a0505
+  classDef gray fill:#edf2f7,stroke:#718096,stroke-width:2px,color:#1a202c
+```
+
+## chart proof-status Proof Status
+```mermaid
+flowchart TD
+  pass["GREEN Passed now: make doctor; make dev-sanity; render core; pressure-report; pulse status; box list; skills view; skill-audit"]
+  warn["YELLOW Covered by skillbox-smart-20260518-validation-trust-gkn: broad unittest lane and disk-safe proof strategy"]
+  disk["YELLOW Critical disk pressure: 1.6 GiB free, covered by skillbox-smart-20260518-validation-trust-gkn"]
+  client["RED personal client unavailable: active_clients is empty and --client personal fails"]
+  mcp["RED MCP parity drift: Claude-only cm/dcg/fwc not mirrored in Codex TOML"]
+  infra["GRAY Not executed: runtime-up, up-surfaces, box-up, operator provision, teardown, worker launch"]
+
+  pass --> warn
+  pass --> disk
+  warn --> client
+  warn --> mcp
+  pass --> infra
+
+  class pass green
+  class warn,disk yellow
+  class client,mcp red
+  class infra gray
+  classDef green fill:#dff7df,stroke:#20833a,stroke-width:2px,color:#0f2f18
+  classDef yellow fill:#fff3bf,stroke:#b7791f,stroke-width:2px,color:#3a2a00
+  classDef red fill:#ffd6d6,stroke:#c53030,stroke-width:2px,color:#3a0505
+  classDef gray fill:#edf2f7,stroke:#718096,stroke-width:2px,color:#1a202c
+```
+
+## chart bead-coverage Open Bead Coverage
+```mermaid
+gantt
+  title Open Bead Coverage
+  dateFormat YYYY-MM-DD
+  section GREEN Proof-backed
+  GREEN Reality and status baseline created :done, green1, 2026-05-28, 1d
+  section YELLOW Bead-covered
+  YELLOW Validation trust and disk gate skillbox-smart-20260518-validation-trust-gkn :active, yellow1, 2026-05-28, 2d
+  YELLOW Idea and wiki-duel slate h1k.2 :active, yellow2, 2026-05-28, 1d
+  YELLOW Power-map ranking h1k.3 :active, yellow3, 2026-05-28, 1d
+  YELLOW Profiling and refactor candidate plan h1k.4 :active, yellow4, 2026-05-28, 1d
+  YELLOW Final implementation Bead mint h1k.5 :active, yellow5, 2026-05-28, 1d
+  section RED Uncovered
+  RED Active personal client gap needs accepted implementation Bead :crit, red1, 2026-05-28, 1d
+  RED MCP parity drift needs accepted implementation Bead :crit, red2, 2026-05-28, 1d
+  section GRAY Deferred proof
+  GRAY Infra start/provision paths intentionally not executed :gray1, 2026-05-28, 1d
+```
+
+## chart next-moves Next Moves
+```mermaid
+flowchart LR
+  reality["GREEN Reality artifact: docs/status/skillbox-reality-check-2026-05-28.md"]
+  mmdx["GREEN Status stack: diagrams/skillbox-project-status.mmdx"]
+  trust["YELLOW Update validation trust Bead with current doctor/dev-sanity proof"]
+  ideas["YELLOW Run h1k.2, h1k.3, h1k.4 planning from this evidence"]
+  mint["YELLOW h1k.5 decides whether to mint implementation Beads"]
+  uncovered["RED Candidate uncovered gaps: personal client activation; MCP parity drift"]
+
+  reality --> mmdx --> trust --> ideas --> mint --> uncovered
+
+  class reality,mmdx green
+  class trust,ideas,mint yellow
+  class uncovered red
+  classDef green fill:#dff7df,stroke:#20833a,stroke-width:2px,color:#0f2f18
+  classDef yellow fill:#fff3bf,stroke:#b7791f,stroke-width:2px,color:#3a2a00
+  classDef red fill:#ffd6d6,stroke:#c53030,stroke-width:2px,color:#3a0505
+```
