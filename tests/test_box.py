@@ -913,6 +913,25 @@ class BoxTests(unittest.TestCase):
         self.assertIn("Did you mean: `box.py status`?", result.stderr)
         self.assertIn("box.py capabilities --json", result.stderr)
 
+    def test_box_id_arguments_reject_path_and_flag_like_values(self) -> None:
+        cases = [
+            ("up", "../bad", "--dry-run", "--format", "json"),
+            ("down", "bad/id", "--dry-run", "--format", "json"),
+            ("upgrade", "bad\\id", "--deploy-manifest", "/tmp/deploy.json", "--dry-run", "--format", "json"),
+            ("status", "../bad", "--format", "json"),
+            ("ssh", "--", "-bad"),
+            ("register", "../bad", "--host", "localhost", "--format", "json"),
+            ("import", "bad/id", "--host", "localhost", "--format", "json"),
+            ("unregister", "../bad", "--format", "json"),
+        ]
+
+        for args in cases:
+            with self.subTest(args=args):
+                result = self._run(*args)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("invalid box_id", result.stderr)
+
     def _run(self, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         run_env = dict(os.environ)
         if env:
