@@ -653,7 +653,7 @@ class BoxTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertTrue(payload["dry_run"])
             step_names = [s["step"] for s in payload["steps"]]
-            self.assertEqual(step_names, ["drain", "remove", "destroy"])
+            self.assertEqual(step_names, ["drain", "remove", "destroy", "volume"])
 
     def test_upgrade_dry_run_shows_release_and_steps(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

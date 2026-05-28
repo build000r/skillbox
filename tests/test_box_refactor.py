@@ -388,7 +388,7 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertEqual(result, BOX.EXIT_OK)
         self.assertEqual(box.state, "destroyed")
         payload = payloads[-1]
-        self.assertEqual([step["status"] for step in payload["steps"]], ["warn", "ok", "ok"])
+        self.assertEqual([step["status"] for step in payload["steps"]], ["warn", "ok", "ok", "skip"])
 
     def test_cmd_down_returns_destroy_failed_and_preserves_state(self) -> None:
         box = BOX.Box(
@@ -418,6 +418,92 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertEqual(payload["steps"][-1]["step"], "destroy")
         self.assertEqual(payload["steps"][-1]["status"], "fail")
 
+    def test_cmd_down_deletes_box_volume_after_droplet_destroy(self) -> None:
+        box = BOX.Box(
+            id="teardown",
+            profile="dev-small",
+            state="ready",
+            droplet_id="77",
+            droplet_ip="1.2.3.4",
+            tailscale_hostname="skillbox-teardown",
+            ssh_user="skillbox",
+            volume_id="vol-1",
+            volume_name="skillbox-state-teardown",
+        )
+        payloads: list[dict[str, object]] = []
+        calls: list[str] = []
+
+        def delete_droplet(_droplet_id: str) -> bool:
+            calls.append("delete-droplet")
+            return True
+
+        def get_volume(_volume_id: str) -> dict[str, object]:
+            calls.append("get-volume")
+            if calls.count("get-volume") == 1:
+                return {"id": "vol-1", "droplet_ids": ["77"]}
+            return {"id": "vol-1", "droplet_ids": []}
+
+        def detach_volume(_volume_id: str, _droplet_id: str) -> bool:
+            calls.append("detach-volume")
+            return True
+
+        def delete_volume(_volume_id: str) -> bool:
+            calls.append("delete-volume")
+            return True
+
+        with mock.patch.object(BOX, "load_inventory", return_value=[box]), \
+            mock.patch.object(BOX, "optional_env", return_value=""), \
+            mock.patch.object(BOX, "resolve_box_ssh_target", return_value="1.2.3.4"), \
+            mock.patch.object(BOX, "ssh_cmd", side_effect=[_completed(), _completed()]), \
+            mock.patch.object(BOX, "do_delete_droplet", side_effect=delete_droplet), \
+            mock.patch.object(BOX, "do_get_volume", side_effect=get_volume), \
+            mock.patch.object(BOX, "do_detach_volume", side_effect=detach_volume), \
+            mock.patch.object(BOX, "do_delete_volume", side_effect=delete_volume), \
+            mock.patch.object(BOX, "save_inventory"), \
+            mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
+            result = BOX.cmd_down("teardown", dry_run=False, fmt="json")
+
+        self.assertEqual(result, BOX.EXIT_OK)
+        self.assertEqual(box.state, "destroyed")
+        self.assertEqual(calls, ["delete-droplet", "get-volume", "detach-volume", "get-volume", "delete-volume"])
+        payload = payloads[-1]
+        self.assertEqual([step["step"] for step in payload["steps"]], ["drain", "remove", "destroy", "volume"])
+        self.assertEqual(payload["steps"][-1]["status"], "ok")
+
+    def test_cmd_down_does_not_delete_volume_attached_elsewhere(self) -> None:
+        box = BOX.Box(
+            id="teardown",
+            profile="dev-small",
+            state="ready",
+            droplet_id="77",
+            droplet_ip="1.2.3.4",
+            tailscale_hostname="skillbox-teardown",
+            ssh_user="skillbox",
+            volume_id="vol-1",
+            volume_name="skillbox-state-teardown",
+        )
+        payloads: list[dict[str, object]] = []
+
+        with mock.patch.object(BOX, "load_inventory", return_value=[box]), \
+            mock.patch.object(BOX, "optional_env", return_value=""), \
+            mock.patch.object(BOX, "resolve_box_ssh_target", return_value="1.2.3.4"), \
+            mock.patch.object(BOX, "ssh_cmd", side_effect=[_completed(), _completed()]), \
+            mock.patch.object(BOX, "do_delete_droplet", return_value=True), \
+            mock.patch.object(BOX, "do_get_volume", return_value={"id": "vol-1", "droplet_ids": ["999"]}), \
+            mock.patch.object(BOX, "do_detach_volume") as detach_volume, \
+            mock.patch.object(BOX, "do_delete_volume") as delete_volume, \
+            mock.patch.object(BOX, "save_inventory"), \
+            mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
+            result = BOX.cmd_down("teardown", dry_run=False, fmt="json")
+
+        self.assertEqual(result, BOX.EXIT_OK)
+        detach_volume.assert_not_called()
+        delete_volume.assert_not_called()
+        payload = payloads[-1]
+        self.assertEqual(payload["steps"][-1]["step"], "volume")
+        self.assertEqual(payload["steps"][-1]["status"], "warn")
+        self.assertIn("999", payload["steps"][-1]["detail"])
+
     def test_cmd_down_returns_not_found_payload(self) -> None:
         payloads: list[dict[str, object]] = []
 
@@ -441,7 +527,7 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertEqual(payloads[-1]["next_actions"], ["box unregister shared-pal"])
 
     def test_cmd_down_dry_run_skips_all_steps(self) -> None:
-        box = BOX.Box(id="teardown", profile="dev-small", state="ready", droplet_id="77")
+        box = BOX.Box(id="teardown", profile="dev-small", state="ready", droplet_id="77", volume_id="vol-1")
         payloads: list[dict[str, object]] = []
 
         with mock.patch.object(BOX, "load_inventory", return_value=[box]), \
@@ -452,8 +538,9 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertEqual(result, BOX.EXIT_OK)
         self.assertEqual(
             [step["status"] for step in payloads[-1]["steps"]],
-            ["skip", "skip", "skip"],
+            ["skip", "skip", "skip", "skip"],
         )
+        self.assertEqual(payloads[-1]["steps"][-1]["step"], "volume")
 
     def test_cmd_down_skips_unreachable_cleanup_paths(self) -> None:
         box = BOX.Box(id="teardown", profile="dev-small", state="creating", droplet_id=None, droplet_ip=None)
@@ -469,7 +556,7 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertEqual(result, BOX.EXIT_OK)
         self.assertEqual(
             [step["status"] for step in payloads[-1]["steps"]],
-            ["skip", "skip", "skip"],
+            ["skip", "skip", "skip", "skip"],
         )
 
     def test_cmd_down_text_mode_covers_warning_and_failure_branches(self) -> None:
