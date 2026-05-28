@@ -318,7 +318,8 @@ TOOLS: list[dict] = [
         "description": (
             "Build the workspace image and start the local container (docker compose build + up -d). "
             "Use on the operator machine to bring up the local skillbox workspace. "
-            "Pass build=false to skip the image build and only start."
+            "Pass build=false to skip the image build and only start. "
+            "Check response steps[] for optional surface start failures even when the headline up succeeds."
         ),
         **_tool_metadata(
             read_only=False,
@@ -817,18 +818,31 @@ def handle_operator_compose_up(params: dict) -> dict:
 
     ok, code, data = run_compose(["up", "-d"], timeout=120)
     results.append({"step": "up", "ok": ok, "exit_code": code, "detail": data})
+    headline_ok = ok
+    if not headline_ok:
+        emit_event("operator.compose_up", "local", {"ok": False, "headline_ok": False})
+        return _error_content({
+            "steps": results,
+            "headline_step": "up",
+            "headline_ok": False,
+            "error": {"type": "up_failed", "message": "docker compose up failed.", "recoverable": True},
+        })
 
     if params.get("surfaces") and ok:
         ok_s, code_s, data_s = run_compose(["--profile", "surfaces", "up", "-d"], timeout=60)
         results.append({"step": "up-surfaces", "ok": ok_s, "exit_code": code_s, "detail": data_s})
 
-    all_ok = all(r["ok"] for r in results)
-    emit_event("operator.compose_up", "local", {"ok": all_ok})
+    partial_failures = [step for step in results if not step["ok"]]
+    all_ok = not partial_failures
+    emit_event("operator.compose_up", "local", {"ok": headline_ok, "headline_ok": headline_ok, "all_steps_ok": all_ok})
     payload = {
         "steps": results,
-        "next_actions": ["operator_doctor"] if all_ok else [],
+        "headline_step": "up",
+        "headline_ok": headline_ok,
+        "partial_failures": partial_failures,
+        "next_actions": ["operator_doctor"] if all_ok else ["Inspect steps[] for optional surface failures."],
     }
-    return _ok_content(payload) if all_ok else _error_content(payload)
+    return _ok_content(payload)
 
 
 def handle_operator_compose_down(params: dict) -> dict:
