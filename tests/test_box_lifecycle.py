@@ -616,6 +616,7 @@ class BoxLifecycleTests(unittest.TestCase):
             "ssh_cmd",
             side_effect=[
                 subprocess.CompletedProcess([], 0, "ok\n", ""),
+                subprocess.CompletedProcess([], 0, "ok\n", ""),
                 subprocess.CompletedProcess([], 0, '{"Service":"workspace"}\n', ""),
                 subprocess.CompletedProcess([], 0, "ok\n", ""),
             ],
