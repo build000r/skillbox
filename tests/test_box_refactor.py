@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from importlib.machinery import SourceFileLoader
@@ -514,6 +515,42 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertEqual(result, BOX.EXIT_OK)
         self.assertEqual(payloads[-1]["boxes"], [{"id": "active", "state": "ready"}])
         self.assertEqual(payloads[-1]["next_actions"], [])
+
+    def test_cmd_status_checks_active_boxes_concurrently_in_inventory_order(self) -> None:
+        boxes = [
+            BOX.Box(id="alpha", profile="dev-small", state="ready"),
+            BOX.Box(id="bravo", profile="dev-small", state="ready"),
+            BOX.Box(id="charlie", profile="dev-small", state="ready"),
+        ]
+        payloads: list[dict[str, object]] = []
+        started: list[str] = []
+        lock = threading.Lock()
+        all_started = threading.Event()
+
+        def health(box: object) -> dict[str, object]:
+            with lock:
+                started.append(box.id)
+                if len(started) == len(boxes):
+                    all_started.set()
+            if not all_started.wait(1.0):
+                raise AssertionError("box_health calls did not overlap")
+            return {"id": box.id, "state": "ready"}
+
+        with mock.patch.object(BOX, "load_inventory", return_value=boxes), \
+            mock.patch.object(BOX, "box_health", side_effect=health), \
+            mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
+            result = BOX.cmd_status(None, fmt="json")
+
+        self.assertEqual(result, BOX.EXIT_OK)
+        self.assertCountEqual(started, ["alpha", "bravo", "charlie"])
+        self.assertEqual(
+            payloads[-1]["boxes"],
+            [
+                {"id": "alpha", "state": "ready"},
+                {"id": "bravo", "state": "ready"},
+                {"id": "charlie", "state": "ready"},
+            ],
+        )
 
     def test_cmd_status_unknown_box_returns_error_payload(self) -> None:
         payloads: list[dict[str, object]] = []

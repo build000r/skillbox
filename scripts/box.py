@@ -24,6 +24,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -3197,7 +3198,13 @@ def cmd_status(box_id: str | None, *, fmt: str) -> int:
             print_box_status_text(status)
         return EXIT_OK
     else:
-        statuses = [box_health(b) for b in boxes if b.state != "destroyed"]
+        active_boxes = [box for box in boxes if box.state != "destroyed"]
+        if active_boxes:
+            max_workers = min(5, len(active_boxes))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                statuses = list(executor.map(box_health, active_boxes))
+        else:
+            statuses = []
         payload: dict[str, Any] = {
             "boxes": statuses,
             "next_actions": ["box up <id> --profile <name>", "box register <id> --host <tailscale-hostname>"] if not statuses else [],
