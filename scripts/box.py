@@ -119,6 +119,21 @@ SHA256_HEX_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")
 IPV4_PATTERN = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 _SSH_USER_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$')
 _HOST_RE = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,253}[a-zA-Z0-9])?$')
+_BOX_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+
+
+def _validate_box_id(box_id: str) -> str:
+    if not box_id:
+        raise argparse.ArgumentTypeError("invalid box_id: must not be empty")
+    if "/" in box_id or "\\" in box_id:
+        raise argparse.ArgumentTypeError("invalid box_id: must not contain path separators")
+    if box_id.startswith("-"):
+        raise argparse.ArgumentTypeError("invalid box_id: must not start with '-'")
+    if not _BOX_ID_RE.match(box_id):
+        raise argparse.ArgumentTypeError(
+            "invalid box_id: must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,63}"
+        )
+    return box_id
 
 
 def _validate_ssh_user(user: str) -> str:
@@ -3525,7 +3540,7 @@ def build_parser() -> argparse.ArgumentParser:
     robot_triage_parser.add_argument("--format", choices=("json",), default="json")
 
     up_parser = subparsers.add_parser("up", help="Create and provision a new box from a pinned deploy artifact.")
-    up_parser.add_argument("box_id", help="Box identifier (becomes droplet name and client id).")
+    up_parser.add_argument("box_id", type=_validate_box_id, help="Box identifier (becomes droplet name and client id).")
     up_parser.add_argument("--profile", default="dev-small", help="Box profile from workspace/box-profiles/.")
     up_parser.add_argument(
         "--blueprint",
@@ -3542,25 +3557,25 @@ def build_parser() -> argparse.ArgumentParser:
     up_parser.add_argument("--format", choices=("text", "json"), default="text")
 
     down_parser = subparsers.add_parser("down", help="Drain and destroy a box.")
-    down_parser.add_argument("box_id", help="Box identifier.")
+    down_parser.add_argument("box_id", type=_validate_box_id, help="Box identifier.")
     down_parser.add_argument("--dry-run", action="store_true")
     down_parser.add_argument("--format", choices=("text", "json"), default="text")
 
     upgrade_parser = subparsers.add_parser("upgrade", help="Upgrade an existing ready box from a pinned deploy manifest.")
-    upgrade_parser.add_argument("box_id", help="Box identifier.")
+    upgrade_parser.add_argument("box_id", type=_validate_box_id, help="Box identifier.")
     upgrade_parser.add_argument("--deploy-manifest", required=True, help="Pinned deploy.json from client-publish --deploy-artifact.")
     upgrade_parser.add_argument("--dry-run", action="store_true")
     upgrade_parser.add_argument("--format", choices=("text", "json"), default="text")
 
     status_parser = subparsers.add_parser("status", help="Check health of one or all boxes.")
-    status_parser.add_argument("box_id", nargs="?", default=None, help="Box identifier (omit for all).")
+    status_parser.add_argument("box_id", nargs="?", default=None, type=_validate_box_id, help="Box identifier (omit for all).")
     status_parser.add_argument("--format", choices=("text", "json"), default="text")
 
     ssh_parser = subparsers.add_parser("ssh", help="SSH into a box.")
-    ssh_parser.add_argument("box_id", help="Box identifier.")
+    ssh_parser.add_argument("box_id", type=_validate_box_id, help="Box identifier.")
 
     register_parser = subparsers.add_parser("register", help="Register an existing shared or manually created box in local inventory.")
-    register_parser.add_argument("box_id", nargs="?", default=None, help="Local box identifier. Defaults to a host-derived alias.")
+    register_parser.add_argument("box_id", nargs="?", default=None, type=_validate_box_id, help="Local box identifier. Defaults to a host-derived alias.")
     register_parser.add_argument("--host", required=True, type=_validate_host, help="Reachable host: Tailscale hostname, Tailscale IP, or public IP.")
     register_parser.add_argument("--profile", default="shared", help="Local profile label (default: shared).")
     register_parser.add_argument("--ssh-user", default=None, type=_validate_ssh_user, help="SSH login user. Defaults to the profile ssh_user or 'skillbox'.")
@@ -3569,7 +3584,7 @@ def build_parser() -> argparse.ArgumentParser:
     register_parser.add_argument("--format", choices=("text", "json"), default="text")
 
     import_parser = subparsers.add_parser("import", help="Alias for register.")
-    import_parser.add_argument("box_id", nargs="?", default=None, help="Local box identifier. Defaults to a host-derived alias.")
+    import_parser.add_argument("box_id", nargs="?", default=None, type=_validate_box_id, help="Local box identifier. Defaults to a host-derived alias.")
     import_parser.add_argument("--host", required=True, type=_validate_host, help="Reachable host: Tailscale hostname, Tailscale IP, or public IP.")
     import_parser.add_argument("--profile", default="shared", help="Local profile label (default: shared).")
     import_parser.add_argument("--ssh-user", default=None, type=_validate_ssh_user, help="SSH login user. Defaults to the profile ssh_user or 'skillbox'.")
@@ -3578,7 +3593,7 @@ def build_parser() -> argparse.ArgumentParser:
     import_parser.add_argument("--format", choices=("text", "json"), default="text")
 
     unregister_parser = subparsers.add_parser("unregister", help="Remove a registered external box from local inventory.")
-    unregister_parser.add_argument("box_id", help="Box identifier.")
+    unregister_parser.add_argument("box_id", type=_validate_box_id, help="Box identifier.")
     unregister_parser.add_argument("--format", choices=("text", "json"), default="text")
 
     subparsers.add_parser("list", help="List all active boxes.").add_argument(
