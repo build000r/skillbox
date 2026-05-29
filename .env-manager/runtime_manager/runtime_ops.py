@@ -2850,7 +2850,7 @@ def tail_lines(path: Path, line_count: int) -> list[str]:
         return []
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     if line_count <= 0:
-        return lines
+        return []
     return lines[-line_count:]
 
 

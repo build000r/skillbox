@@ -138,6 +138,7 @@ class GuardDestructiveOpScriptTests(unittest.TestCase):
         self,
         script: Path,
         *,
+        tool_name: str = "mcp__skillbox-operator__operator_compose_down",
         extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         root = script.parent.parent
@@ -148,7 +149,7 @@ class GuardDestructiveOpScriptTests(unittest.TestCase):
         if extra_env:
             env.update(extra_env)
         payload = {
-            "tool_name": "mcp__skillbox-operator__operator_compose_down",
+            "tool_name": tool_name,
             "tool_input": {"dry_run": False},
         }
         return subprocess.run(
@@ -161,6 +162,33 @@ class GuardDestructiveOpScriptTests(unittest.TestCase):
             check=False,
             timeout=30,
         )
+
+    def test_guard_destructive_gates_underscore_operator_mcp_tool_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script = self._copy_guard(Path(tmpdir))
+
+            result = self._run_guard(
+                script,
+                tool_name="mcp__skillbox_operator__operator_compose_down",
+            )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("BLOCKED: operator_compose_down", result.stderr)
+
+    def test_guard_destructive_finds_nested_workspace_client_repos(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            script = self._copy_guard(root)
+            nested_repo = root / "workspace" / "clients" / "acme" / "app"
+            nested_repo.mkdir(parents=True)
+            subprocess.run(["git", "init"], cwd=nested_repo, check=True, capture_output=True, text=True)
+            (nested_repo / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+
+            result = self._run_guard(script)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Uncommitted changes in:", result.stderr)
+        self.assertIn(str(nested_repo), result.stderr)
 
     def test_guard_destructive_default_ttl_matches_operator_server(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -642,6 +642,7 @@ TOOLS: list[dict] = [
                 "service": _SERVICE_PROP,
                 "lines": {
                     "type": "integer",
+                    "minimum": 1,
                     "description": "Lines to return per service (default: 40).",
                     "default": 40,
                 },
@@ -1417,18 +1418,38 @@ def _append_repeat_args(args: list[str], params: dict) -> None:
             args += [flag, str(value)]
 
 
+def _int_param(params: dict, key: str, *, minimum: int | None = None) -> int:
+    try:
+        value = int(params[key])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be an integer") from exc
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{key} must be >= {minimum}")
+    return value
+
+
+def _float_param(params: dict, key: str, *, minimum: float | None = None) -> float:
+    try:
+        value = float(params[key])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a number") from exc
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{key} must be >= {minimum:g}")
+    return value
+
+
 def _append_scalar_args(args: list[str], params: dict) -> None:
     for key, flag in _STRING_ARG_SPECS:
         if params.get(key):
             args += [flag, str(params[key])]
     if params.get("lines") is not None:
-        args += ["--lines", str(int(params["lines"]))]
+        args += ["--lines", str(_int_param(params, "lines", minimum=1))]
     if params.get("wait_seconds") is not None:
-        args += ["--wait-seconds", str(float(params["wait_seconds"]))]
+        args += ["--wait-seconds", str(_float_param(params, "wait_seconds", minimum=0.0))]
     if params.get("limit") is not None:
-        args += ["--limit", str(int(params["limit"]))]
+        args += ["--limit", str(_int_param(params, "limit", minimum=1))]
     if params.get("max_depth") is not None:
-        args += ["--max-depth", str(int(params["max_depth"]))]
+        args += ["--max-depth", str(_int_param(params, "max_depth", minimum=0))]
 
 
 def _append_bool_args(args: list[str], command: str, params: dict) -> None:
@@ -1531,6 +1552,7 @@ _DRY_RUN_REQUIRED_TOOLS = frozenset(
         "skillbox_down",
         "skillbox_restart",
         "skillbox_bootstrap",
+        "skillbox_context",
         "skillbox_onboard",
     }
 )
@@ -1818,7 +1840,16 @@ def _dispatch_manage_tool(
     if _positional_required(positional_key, positional, tool_params):
         return _missing_positional_error(name, str(positional_key))
 
-    args = build_args(command, tool_params, positional)
+    try:
+        args = build_args(command, tool_params, positional)
+    except (TypeError, ValueError) as exc:
+        return _error_content({
+            "error": {
+                "type": "invalid_parameter",
+                "message": str(exc),
+                "recoverable": True,
+            }
+        })
     is_dry_run = bool(tool_params.get("dry_run"))
     if name in _DRY_RUN_REQUIRED_TOOLS and not is_dry_run and not _has_dryrun_marker(name, args):
         return _runtime_dry_run_required_error(name, args)

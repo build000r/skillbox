@@ -197,6 +197,20 @@ class OperatorMcpServerTests(unittest.TestCase):
                 self.assertEqual(MODULE.handle_tools_call({"name": "operator_boxes"}), {"content": []})
             dispatch.assert_called_once_with("operator_boxes", {})
 
+    def test_run_script_treats_nonzero_json_exit_as_error(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["python3"],
+            2,
+            stdout='{"error":{"type":"bad_args"}}',
+            stderr="",
+        )
+        with mock.patch.object(MODULE.subprocess, "run", return_value=completed):
+            ok, code, payload = MODULE.run_script(Path("scripts/box.py"), ["list"])
+
+        self.assertFalse(ok)
+        self.assertEqual(code, 2)
+        self.assertEqual(payload["error"]["type"], "bad_args")
+
     def test_read_only_tool_handlers_and_event_journal_use_structured_outputs(self) -> None:
         with mock.patch.object(
             MODULE,
@@ -688,6 +702,23 @@ class OperatorMcpDryRunMarkerTests(unittest.TestCase):
         payload = _content_payload(result)
         self.assertTrue(result.get("isError"))
         self.assertEqual(payload["error"]["type"], "invalid_parameter")
+
+    def test_box_exec_rejects_bad_timeout_as_invalid_parameter(self) -> None:
+        box = {
+            "id": "alpha",
+            "state": "ready",
+            "tailscale_hostname": "alpha.tailnet.test",
+            "ssh_user": "skillbox",
+        }
+        with mock.patch.object(MODULE, "find_box", return_value=box):
+            result = MODULE.handle_operator_box_exec(
+                {"box_id": "alpha", "command": "pwd", "timeout": "bad"}
+            )
+
+        payload = _content_payload(result)
+        self.assertTrue(result.get("isError"))
+        self.assertEqual(payload["error"]["type"], "invalid_parameter")
+        self.assertIn("timeout must be an integer", payload["error"]["message"])
 
 
 class OperatorMcpSshHardeningTests(unittest.TestCase):

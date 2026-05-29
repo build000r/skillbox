@@ -185,7 +185,7 @@ class PulseTests(unittest.TestCase):
     def test_pid_hash_status_state_and_config_change_helpers_cover_persisted_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            pid_path = root / PULSE_MODULE.PID_REL
+            pid_path = PULSE_MODULE.pulse_pid_path(root)
             with mock.patch.object(PULSE_MODULE.os, "getpid", return_value=321):
                 self.assertEqual(PULSE_MODULE.write_pid(root), pid_path)
             self.assertEqual(pid_path.read_text(encoding="utf-8"), "321\n")
@@ -233,9 +233,11 @@ class PulseTests(unittest.TestCase):
                 mock.patch.object(PULSE_MODULE, "normalize_active_profiles", return_value={"core"}),
                 mock.patch.object(PULSE_MODULE, "normalize_active_clients", side_effect=RuntimeError("bad client")),
                 mock.patch.object(PULSE_MODULE, "filter_model", return_value={"filtered": True}),
+                mock.patch.object(PULSE_MODULE, "log_runtime_event"),
+                mock.patch.object(PULSE_MODULE, "log"),
             ):
                 loaded = PULSE_MODULE._load_pulse_model(root, ["missing"], ["core"])  # noqa: SLF001
-            self.assertEqual(loaded, ({"filtered": True}, {"core"}, set()))
+            self.assertIsNone(loaded)
 
             state = PULSE_MODULE.PulseState()
             with mock.patch.object(PULSE_MODULE, "_model_config_hash", return_value="hash-1"):
@@ -275,7 +277,7 @@ class PulseTests(unittest.TestCase):
                 self.assertEqual(PULSE_MODULE.print_status(root), 0)
             self.assertIn("running (pid 999), no state file", stdout.getvalue())
 
-            state_path = root / PULSE_MODULE.STATE_REL
+            state_path = PULSE_MODULE.pulse_state_path(root)
             state_path.parent.mkdir(parents=True, exist_ok=True)
             state_path.write_text("{bad-json", encoding="utf-8")
             with (
@@ -326,6 +328,126 @@ class PulseTests(unittest.TestCase):
             self.assertTrue(PULSE_MODULE._shutdown)
             self.assertIn("received signal 15", log.call_args.args[1])
             PULSE_MODULE._shutdown = False
+
+    def test_pid_and_state_readers_scan_state_root_when_model_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state_root_log_dir = root / ".skillbox-state" / "logs" / "runtime"
+            state_root_log_dir.mkdir(parents=True)
+            (state_root_log_dir / "pulse.pid").write_text("777\n", encoding="utf-8")
+            (state_root_log_dir / "pulse.state.json").write_text(
+                json.dumps({"pid": 777, "updated_at": 10.0, "cycle_count": 1}),
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.object(PULSE_MODULE, "build_runtime_model", side_effect=RuntimeError("broken")),
+                mock.patch.object(PULSE_MODULE, "process_is_running", return_value=True),
+                mock.patch.object(PULSE_MODULE.time, "time", return_value=15.0),
+                redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.assertEqual(PULSE_MODULE.existing_pid(root), 777)
+                self.assertEqual(PULSE_MODULE.print_status(root), 0)
+                state = PULSE_MODULE.read_state(root)
+
+            self.assertIn("pulse: running (pid 777)", stdout.getvalue())
+            self.assertTrue(state["running"])
+            self.assertEqual(state["seconds_since_tick"], 5.0)
+
+    def test_runtime_model_pulse_paths_use_manager_service_log_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            log_dir = root / ".skillbox-state" / "logs" / "runtime"
+            model = {"services": [{"id": "pulse"}]}
+            with (
+                mock.patch.object(PULSE_MODULE, "build_runtime_model", return_value=model),
+                mock.patch.object(PULSE_MODULE, "service_paths", return_value={"log_dir": log_dir}),
+            ):
+                self.assertEqual(PULSE_MODULE.pulse_pid_path(root), log_dir / "pulse.pid")
+                self.assertEqual(PULSE_MODULE.pulse_state_path(root), log_dir / "pulse.state.json")
+                self.assertEqual(PULSE_MODULE.pulse_log_path(root), log_dir / "pulse.log")
+
+    def test_restart_with_backoff_suppresses_after_max_attempts_and_resets_on_success(self) -> None:
+        state = PULSE_MODULE.PulseState()
+        service = {"id": "web"}
+        with (
+            mock.patch.object(PULSE_MODULE, "_restart_service", return_value=False) as restart,
+            mock.patch.object(PULSE_MODULE, "log_runtime_event") as event,
+            mock.patch.object(PULSE_MODULE, "log"),
+        ):
+            self.assertFalse(PULSE_MODULE._restart_with_backoff({}, state, service, "web", now=10.0, reason="down"))  # noqa: SLF001
+            self.assertFalse(PULSE_MODULE._restart_with_backoff({}, state, service, "web", now=131.0, reason="down"))  # noqa: SLF001
+            self.assertFalse(PULSE_MODULE._restart_with_backoff({}, state, service, "web", now=252.0, reason="down"))  # noqa: SLF001
+            self.assertIsNone(PULSE_MODULE._restart_with_backoff({}, state, service, "web", now=373.0, reason="down"))  # noqa: SLF001
+
+        self.assertEqual(restart.call_count, PULSE_MODULE.MAX_RESTART_ATTEMPTS)
+        self.assertEqual(state.restart_attempts["web"], PULSE_MODULE.MAX_RESTART_ATTEMPTS)
+        event.assert_called_once_with(
+            "pulse.restart_suppressed",
+            "web",
+            {"reason": "down", "attempts": 3, "max_attempts": PULSE_MODULE.MAX_RESTART_ATTEMPTS},
+        )
+
+        state.restart_attempts["web"] = PULSE_MODULE.MAX_RESTART_ATTEMPTS - 1
+        state.restart_backoff.pop("web", None)
+        with mock.patch.object(PULSE_MODULE, "_restart_service", return_value=True):
+            self.assertTrue(PULSE_MODULE._restart_with_backoff({}, state, service, "web", now=500.0, reason="down"))  # noqa: SLF001
+        self.assertNotIn("web", state.restart_attempts)
+
+    def test_invalid_pulse_client_scope_emits_error_and_skips_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = PULSE_MODULE.PulseState()
+            with (
+                mock.patch.object(PULSE_MODULE, "build_runtime_model", return_value={"clients": []}),
+                mock.patch.object(PULSE_MODULE, "normalize_active_profiles", return_value={"core"}),
+                mock.patch.object(PULSE_MODULE, "normalize_active_clients", side_effect=RuntimeError("unknown client")),
+                mock.patch.object(PULSE_MODULE, "filter_model") as filter_model,
+                mock.patch.object(PULSE_MODULE, "log_runtime_event") as event,
+                mock.patch.object(PULSE_MODULE, "log"),
+            ):
+                PULSE_MODULE.reconcile_once(root, state, active_clients=["missing"])
+
+            filter_model.assert_not_called()
+            event.assert_called_once_with(
+                "pulse.scope_error",
+                "clients",
+                {"requested": ["missing"], "error": "unknown client"},
+                root,
+            )
+            self.assertFalse(PULSE_MODULE.pulse_state_path(root).exists())
+
+    def test_main_run_uses_env_file_pulse_defaults_when_shell_env_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            env_values = {
+                "SKILLBOX_PULSE_INTERVAL": "11",
+                "SKILLBOX_PULSE_CLIENTS": "personal, team",
+                "SKILLBOX_PULSE_PROFILES": "local-core",
+                "SKILLBOX_PULSE_UNHEALTHY_GRACE_SECONDS": "7.5",
+            }
+            with (
+                mock.patch.object(PULSE_MODULE.sys, "argv", ["pulse.py", "--root-dir", str(root), "run"]),
+                mock.patch.object(PULSE_MODULE, "load_runtime_env", return_value=env_values),
+                mock.patch.dict(PULSE_MODULE.os.environ, {
+                    "SKILLBOX_PULSE_INTERVAL": "",
+                    "SKILLBOX_PULSE_CLIENTS": "",
+                    "SKILLBOX_PULSE_PROFILES": "",
+                    "SKILLBOX_PULSE_UNHEALTHY_GRACE_SECONDS": "",
+                }, clear=False),
+                mock.patch.object(PULSE_MODULE, "run_daemon", return_value=0) as run_daemon,
+            ):
+                self.assertEqual(PULSE_MODULE.main(), 0)
+
+            run_daemon.assert_called_once_with(
+                root.resolve(),
+                interval=11,
+                auto_restart=True,
+                auto_sync=False,
+                active_clients=["personal", "team"],
+                active_profiles=["local-core"],
+                unhealthy_grace_seconds=7.5,
+            )
 
     def test_pulse_service_transition_logs_crashes_changes_and_autorestart(self) -> None:
         state = PULSE_MODULE.PulseState()

@@ -466,7 +466,7 @@ def run_script(
     stdout = proc.stdout.strip()
     if stdout:
         try:
-            return proc.returncode in (0, 2), proc.returncode, json.loads(stdout)
+            return proc.returncode == 0, proc.returncode, json.loads(stdout)
         except json.JSONDecodeError:
             return proc.returncode == 0, proc.returncode, {"text": stdout}
 
@@ -799,7 +799,16 @@ def handle_operator_box_exec(params: dict) -> dict:
             }
         })
 
-    timeout = int(params.get("timeout", 120))
+    try:
+        timeout = int(params.get("timeout", 120))
+    except (TypeError, ValueError):
+        return _error_content({
+            "error": {
+                "type": "invalid_parameter",
+                "message": "timeout must be an integer number of seconds.",
+                "recoverable": True,
+            }
+        })
     ok, _code, data = run_ssh(validated_user, validated_host, str(command), timeout=timeout)
     return _ok_content(data) if ok else _error_content(data)
 

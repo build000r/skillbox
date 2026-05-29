@@ -496,10 +496,12 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
             result = BOX.cmd_down("teardown", dry_run=False, fmt="json")
 
-        self.assertEqual(result, BOX.EXIT_OK)
+        self.assertEqual(result, BOX.EXIT_ERROR)
+        self.assertEqual(box.state, "volume-cleanup-failed")
         detach_volume.assert_not_called()
         delete_volume.assert_not_called()
         payload = payloads[-1]
+        self.assertEqual(payload["error"]["type"], "volume_cleanup_failed")
         self.assertEqual(payload["steps"][-1]["step"], "volume")
         self.assertEqual(payload["steps"][-1]["status"], "warn")
         self.assertIn("999", payload["steps"][-1]["detail"])
