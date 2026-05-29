@@ -118,6 +118,16 @@ What that gives you:
 - installed default skills under `.skillbox-state/home/.claude/skills/` and `.skillbox-state/home/.codex/skills/`
 - generated agent context at `home/.claude/CLAUDE.md` with a symlink at `home/.codex/AGENTS.md`
 
+> **About the `personal` client.** Throughout this README, `personal` is an
+> example client slug. Clients are operator-owned private overlays — they are
+> **not** part of a fresh clone, so a default checkout reports `active_clients: []`
+> and any `--client personal` / `CLIENT=personal` command fails with an explicit
+> "no client overlays are attached" recovery message until you attach one. Create
+> your own with `python3 .env-manager/manage.py client-init <id>` (or the
+> `onboard <id>` / `make first-box CLIENT=<id>` macros), then substitute that slug
+> for `personal` below. Core-scoped commands (`render`, `doctor`, `dev-sanity`,
+> `up`) need no client.
+
 ## Focus
 
 The `focus` command is the single-command path from "I want to work on this
@@ -836,6 +846,8 @@ make runtime-sync
 | `.env-manager/manage.py rch-report` | Read-only Remote Compilation Helper worker/check/status/hook readiness; never installs hooks | `python3 .env-manager/manage.py rch-report --format json` |
 | `.env-manager/manage.py sbh-report` | Read-only Storage Ballast Helper doctor/status/stats/blame posture with observe-first mutation gates | `python3 .env-manager/manage.py sbh-report --format json` |
 | `.env-manager/manage.py skills` | Show the effective skill set for a cwd/client/profile, with global extras, broken links, scope violations, project-local layers, and shadowed lower-precedence sources | `python3 .env-manager/manage.py skills --client personal --profile local-all --cwd "$PWD"` |
+| `.env-manager/manage.py mcp-audit` | Audit Claude/Codex MCP config parity; declared `kind:mcp` services (any profile) are intentional, only undeclared servers count as `unexplained_drift` | `python3 .env-manager/manage.py mcp-audit --cwd "$PWD" --format json` |
+| `.env-manager/manage.py evidence` | Read-only runtime evidence packet (doctor, status, pressure, pulse, skills, MCP parity, git dirty, Beads pointer) with stable keys and explicit blocked/gray conditions; optionally `--write` an artifact | `python3 .env-manager/manage.py evidence --cwd "$PWD" --format json --write` |
 | `.env-manager/manage.py mmdx` | Fuzzy-find and open local Mermaid/MMDX diagrams through the Buildooor diagrams viewer | `python3 .env-manager/manage.py mmdx --cwd "$PWD" skill review realms --no-open` |
 | `.env-manager/manage.py bootstrap` | Sync runtime state and run declared bootstrap tasks in dependency order | `python3 .env-manager/manage.py bootstrap --client acme-studio --task app-bootstrap` |
 | `.env-manager/manage.py up` | Sync runtime state, run any service-declared bootstrap tasks, and start manageable services, expanding declared `depends_on` prerequisites and waiting for healthchecks when present | `python3 .env-manager/manage.py up --profile surfaces --service api-stub` |

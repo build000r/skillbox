@@ -358,6 +358,42 @@ def _classify_message_pattern(msg: str, lower_msg: str) -> dict[str, Any] | None
          dict(error_type="session_state_conflict", recoverable=True,
               recovery_hint="Inspect the session state first, then resume or end it with a valid transition.",
               next_actions=["session-status <client> --format json"])),
+        (lambda: "has no overlay at" in lower_msg,
+         dict(error_type="client_overlay_missing", recoverable=True,
+              recovery_hint=(
+                  "This client has no overlay yet. Client overlays are operator-owned "
+                  "private config — the `personal` examples in the README assume one is "
+                  "attached. Scaffold it with `onboard <id>` (or `client-init <id>`) "
+                  "before focus/sync/status target it."
+              ),
+              next_actions=[
+                  "client-init --list-blueprints --format json",
+                  "render --format json",
+              ])),
+        (lambda: "unknown runtime client" in lower_msg and "available clients: (none)" in lower_msg,
+         dict(error_type="unknown_client", recoverable=True,
+              recovery_hint=(
+                  "No client overlays are attached in this checkout. Clients are "
+                  "operator-owned private config, not part of a default clone — the "
+                  "`personal` examples in the README assume you have attached one. "
+                  "Create one with `client-init <id>` (then `first-box <id>`), or run "
+                  "the command without `--client` to use the core scope."
+              ),
+              next_actions=[
+                  "client-init --list-blueprints --format json",
+                  "render --format json",
+              ])),
+        (lambda: "unknown runtime client" in lower_msg,
+         dict(error_type="unknown_client", recoverable=True,
+              recovery_hint=(
+                  "The requested client is not declared in this checkout. Use one of "
+                  "the available clients named in the message, or attach it with "
+                  "`client-init <id>`."
+              ),
+              next_actions=[
+                  "render --format json",
+                  "client-init --list-blueprints --format json",
+              ])),
     ]
     for predicate, kwargs in rules:
         if predicate():

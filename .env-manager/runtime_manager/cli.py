@@ -23,6 +23,7 @@ from .pressure_report import *
 from .rch_report import *
 from .rch_adapter import *
 from .sbh_report import *
+from .evidence import *
 from .swimmers_launch import launch_swimmers_batch, swimmers_launch_text_lines
 
 
@@ -633,7 +634,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     mcp_audit_parser = subparsers.add_parser(
         "mcp-audit",
-        help="Audit Claude JSON and Codex TOML MCP config parity for a repo.",
+        help=(
+            "Audit Claude JSON and Codex TOML MCP config parity for a repo. Servers "
+            "declared as kind:mcp services in workspace/runtime.yaml (any profile) are "
+            "treated as intentional even when single-surface or profile-gated; only "
+            "undeclared servers count as unexplained_drift."
+        ),
     )
     mcp_audit_parser.add_argument("--format", choices=("text", "json"), default="text")
     mcp_audit_parser.add_argument(
@@ -648,6 +654,33 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_profile_arg(mcp_audit_parser)
     _add_client_arg(mcp_audit_parser)
+
+    evidence_parser = subparsers.add_parser(
+        "evidence",
+        help=(
+            "Read-only runtime evidence packet: doctor, status, pressure, pulse, "
+            "skills, MCP parity, git dirty, and a Beads pointer in one machine-readable "
+            "payload with explicit blocked/gray conditions. Never mutates runtime state."
+        ),
+    )
+    evidence_parser.add_argument("--format", choices=("text", "json", "md"), default="json")
+    evidence_parser.add_argument(
+        "--cwd",
+        default=None,
+        help="Working directory used to scope skills/MCP surfaces. Defaults to the current cwd.",
+    )
+    evidence_parser.add_argument(
+        "--write",
+        action="store_true",
+        help="Also write the packet to tests/artifacts/perf/<run-id>/runtime-evidence/.",
+    )
+    evidence_parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Override the run-id directory name used with --write.",
+    )
+    _add_profile_arg(evidence_parser)
+    _add_client_arg(evidence_parser)
 
     mmdx_parser = subparsers.add_parser(
         "mmdx",
@@ -2834,18 +2867,65 @@ def _handle_skill_audit(args: argparse.Namespace, root_dir: Path, model: dict[st
     return EXIT_OK
 
 
+def _full_declared_mcp_servers(root_dir: Path) -> list[str] | None:
+    """Names of every kind:mcp service declared in the unfiltered model.
+
+    The dispatched model is profile-filtered, which would make profile-gated MCP
+    services (memory/connectors) look like drift. Returns None (expected-only
+    baseline) when the full model cannot be built.
+    """
+    try:
+        full_model = build_runtime_model(root_dir)
+    except RuntimeError:
+        return None
+    return [str(item["name"]) for item in requested_mcp_servers(full_model) if item.get("name")]
+
+
 def _handle_mcp_audit(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
     payload = collect_mcp_audit(
         root_dir,
         model,
         cwd=args.cwd,
         config_root=getattr(args, "config_root", None),
+        declared_servers=_full_declared_mcp_servers(root_dir),
     )
     if args.format == "json":
         emit_json(payload)
     else:
         print_mcp_audit_text(payload, root_dir=root_dir)
     return EXIT_OK
+
+
+def _handle_evidence(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    del resolved_mode
+    payload = collect_runtime_evidence(
+        root_dir,
+        model,
+        cwd=args.cwd,
+        declared_servers=_full_declared_mcp_servers(root_dir),
+    )
+    if getattr(args, "write", False):
+        payload["artifact"] = _write_runtime_evidence_artifact(root_dir, payload, getattr(args, "run_id", None))
+    if args.format == "json":
+        emit_json(payload)
+    elif args.format == "md":
+        print(runtime_evidence_markdown(payload))
+    else:
+        print_runtime_evidence_text(payload)
+    return EXIT_OK
+
+
+def _write_runtime_evidence_artifact(root_dir: Path, payload: dict[str, Any], run_id: str | None) -> dict[str, str]:
+    from datetime import datetime, timezone
+
+    run_id = run_id or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
+    out_dir = root_dir / "tests" / "artifacts" / "perf" / run_id / "runtime-evidence"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    json_path = out_dir / "evidence.json"
+    md_path = out_dir / "evidence.md"
+    json_path.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
+    md_path.write_text(runtime_evidence_markdown(payload), encoding="utf-8")
+    return {"json": str(json_path), "markdown": str(md_path)}
 
 
 def _handle_parity_report(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
@@ -3400,6 +3480,7 @@ _MODEL_DISPATCH: dict[str, Callable[[argparse.Namespace, Path, dict[str, Any], s
     "skills": _handle_skills,
     "skill-audit": _handle_skill_audit,
     "mcp-audit": _handle_mcp_audit,
+    "evidence": _handle_evidence,
     "parity-report": _handle_parity_report,
     "skill": _handle_skill,
     "overlay": _handle_overlay,

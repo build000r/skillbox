@@ -65,6 +65,25 @@ class RuntimeGuidanceUnitTests(unittest.TestCase):
                 "session_state_conflict",
                 ["session-status <client> --format json"],
             ),
+            (
+                "Unknown runtime client(s): personal. Available clients: (none)",
+                "skills",
+                "unknown_client",
+                ["client-init --list-blueprints --format json", "render --format json"],
+            ),
+            (
+                "Unknown runtime client(s): acme. Available clients: beta, gamma",
+                "focus",
+                "unknown_client",
+                ["render --format json", "client-init --list-blueprints --format json"],
+            ),
+            (
+                "Client 'personal' has no overlay at /workspace/clients/personal/overlay.yaml. "
+                "Use 'onboard personal' to scaffold it first.",
+                "focus",
+                "client_overlay_missing",
+                ["client-init --list-blueprints --format json", "render --format json"],
+            ),
         ]
 
         for message, command, expected_type, expected_actions in cases:
@@ -75,6 +94,44 @@ class RuntimeGuidanceUnitTests(unittest.TestCase):
                 self.assertIn("recovery_hint", payload["error"])
                 if expected_actions is not None:
                     self.assertEqual(payload["next_actions"], expected_actions)
+
+    def test_unknown_client_with_no_overlays_explains_operator_owned_recovery(self) -> None:
+        """A default checkout (no clients attached) must fail with an explicit,
+        recoverable action rather than the generic doctor/log fallback."""
+        no_clients = SHARED.classify_error(
+            RuntimeError("Unknown runtime client(s): personal. Available clients: (none)"),
+            "skills",
+        )
+        self.assertEqual(no_clients["error"]["type"], "unknown_client")
+        hint = no_clients["error"]["recovery_hint"].lower()
+        self.assertIn("client-init", hint)
+        self.assertNotIn("run doctor to diagnose", hint)
+        # Distinct guidance when clients exist but the requested one does not.
+        with_clients = SHARED.classify_error(
+            RuntimeError("Unknown runtime client(s): acme. Available clients: beta"),
+            "focus",
+        )
+        self.assertEqual(with_clients["error"]["type"], "unknown_client")
+        self.assertNotEqual(
+            no_clients["error"]["recovery_hint"],
+            with_clients["error"]["recovery_hint"],
+        )
+
+    def test_missing_client_overlay_upgrades_generic_fallback(self) -> None:
+        payload = SHARED.classify_error(
+            RuntimeError(
+                "Client 'personal' has no overlay at /workspace/clients/personal/overlay.yaml. "
+                "Use 'onboard personal' to scaffold it first."
+            ),
+            "focus",
+        )
+        self.assertEqual(payload["error"]["type"], "client_overlay_missing")
+        self.assertTrue(payload["error"]["recoverable"])
+        self.assertNotIn("run doctor to diagnose", payload["error"]["recovery_hint"].lower())
+        self.assertEqual(
+            payload["next_actions"],
+            ["client-init --list-blueprints --format json", "render --format json"],
+        )
 
     def test_classify_error_handles_persistence_codes_and_fallback_commands(self) -> None:
         persistence = SHARED.PersistenceContractError("STATE_ROOT_MISSING", "state root missing")

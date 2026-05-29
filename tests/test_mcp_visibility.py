@@ -72,6 +72,84 @@ class McpVisibilityTests(unittest.TestCase):
         self.assertEqual(payload["parity"]["codex_only"], ["codex-only"])
         self.assertTrue(any("add cm" in action for action in payload["next_actions"]))
 
+    def test_declared_profile_gated_servers_are_intentional_not_drift(self) -> None:
+        """Servers declared as kind:mcp services (under any profile) that appear
+        only in the Claude surface are a deliberate status, not unexplained drift."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / ".git").mkdir()
+            (root / ".codex").mkdir()
+            (root / ".mcp.json").write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "skillbox": {"command": "python3"},
+                            "fwc": {"command": "fwc"},
+                            "dcg": {"command": "dcg"},
+                            "rogue": {"command": "custom"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / ".codex" / "config.toml").write_text(
+                "[mcp_servers.skillbox]\ncommand = \"python3\"\n",
+                encoding="utf-8",
+            )
+
+            # Active model only declares skillbox; fwc/dcg live behind inactive
+            # profiles but are declared in the full model passed via declared_servers.
+            payload = collect_mcp_audit(
+                root,
+                {"services": []},
+                config_root=str(root),
+                declared_servers=["skillbox", "fwc", "dcg"],
+            )
+
+        claude = payload["surfaces"]["claude"]
+        # fwc/dcg are declared -> intentional; rogue is undeclared -> drift.
+        self.assertEqual(claude["unexpected"], ["rogue"])
+        self.assertEqual(claude["extra_intentional"], ["dcg", "fwc"])
+        self.assertEqual(payload["parity"]["claude_only_declared"], ["dcg", "fwc"])
+        self.assertEqual(payload["parity"]["claude_only_unexpected"], ["rogue"])
+        self.assertEqual(payload["summary"]["unexplained_drift"], 1)
+        # Only the undeclared server is nagged about; declared ones are silent.
+        joined = " ".join(payload["next_actions"])
+        self.assertIn("rogue", joined)
+        self.assertNotIn("fwc", joined)
+        self.assertNotIn("dcg", joined)
+
+    def test_declared_servers_ignored_when_auditing_foreign_repo(self) -> None:
+        """A foreign --cwd must not borrow this repo's declarations to excuse drift."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "skillbox"
+            root.mkdir()
+            (root / ".git").mkdir()
+            repo = Path(tmpdir) / "other"
+            repo.mkdir()
+            (repo / ".git").mkdir()
+            (repo / ".codex").mkdir()
+            (repo / ".mcp.json").write_text(
+                json.dumps({"mcpServers": {"skillbox": {"command": "python3"}, "fwc": {"command": "fwc"}}}),
+                encoding="utf-8",
+            )
+            (repo / ".codex" / "config.toml").write_text(
+                "[mcp_servers.skillbox]\ncommand = \"python3\"\n",
+                encoding="utf-8",
+            )
+
+            payload = collect_mcp_audit(
+                root,
+                {"services": []},
+                cwd=str(repo),
+                declared_servers=["skillbox", "fwc"],
+            )
+
+        # declared_servers belongs to root (skillbox), not the foreign repo, so fwc
+        # is still surfaced as unexplained drift there.
+        self.assertEqual(payload["surfaces"]["claude"]["unexpected"], ["fwc"])
+        self.assertEqual(payload["summary"]["unexplained_drift"], 1)
+
     def test_collect_mcp_audit_reports_invalid_configs_without_raising(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
