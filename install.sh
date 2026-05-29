@@ -78,7 +78,8 @@ usage() {
 Usage: install.sh [options]
 
 Core options:
-  --client <id>            Client slug to prepare. Defaults to personal.
+  --client <id>            Client slug to scaffold via first-box. `personal` is an
+                           example default; pass your own slug to attach that client.
   --repo-dir <path>        Checkout/install directory. Defaults to the current
                            repo when run from a checkout, otherwise ~/skillbox.
   --private-path <path>    Private overlay repo path. Defaults to ../skillbox-config
