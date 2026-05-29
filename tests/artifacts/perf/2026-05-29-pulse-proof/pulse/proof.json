@@ -1,0 +1,94 @@
+{
+  "kind": "pulse-regression-proof",
+  "generated_at_utc": "2026-05-29T17:21:49+00:00",
+  "python": "3.12.13",
+  "behavioral": {
+    "service_transitions": {
+      "scenario": "service crash then auto-heal",
+      "cycles": 3,
+      "final_service_states": {
+        "web": "running"
+      },
+      "events_emitted": 1,
+      "heals": 1
+    },
+    "check_transitions": {
+      "scenario": "check fail then recover",
+      "cycles": 3,
+      "final_check_states": {
+        "disk": true
+      },
+      "events_emitted": 2
+    },
+    "pressure_advisory": {
+      "scenario": "pressure advisory raise then clear (read-only)",
+      "cycles": 3,
+      "final_pressure_warnings": [],
+      "events_emitted": 2,
+      "advisory_mutates": false
+    },
+    "state_file_shape": {
+      "state_path_rel": "logs/runtime/pulse.state.json",
+      "top_level_keys": [
+        "active_clients",
+        "active_profiles",
+        "auto_restart",
+        "auto_sync",
+        "check_states",
+        "config_hash",
+        "cycle_count",
+        "events_emitted",
+        "heals",
+        "interval",
+        "pid",
+        "pressure_advisory",
+        "pressure_warnings",
+        "restart_attempts",
+        "service_states",
+        "unhealthy_for_seconds",
+        "unhealthy_grace_seconds",
+        "updated_at"
+      ],
+      "sample": {
+        "service_states": {
+          "web": "running"
+        },
+        "check_states": {
+          "disk": true
+        },
+        "interval": 30,
+        "auto_restart": true
+      }
+    },
+    "status_rendering": {
+      "command": "pulse.py --root-dir <tmp> status",
+      "exit_code": 0,
+      "stdout_normalized": [
+        "pulse: stopped (pid 4242)",
+        "  interval:  30s",
+        "  cycles:    3",
+        "  heals:     1",
+        "  events:    4",
+        "  last tick: <age>",
+        "  services:",
+        "    - api: down",
+        "    + web: running",
+        "  failed checks: tls",
+        "  pressure/offload warnings:",
+        "    ! disk free below 10 GiB"
+      ]
+    }
+  },
+  "behavioral_fingerprint_sha256": "4b8db16b0f02adb21e5ce162f935f30107d35751d63af3e794dc5e34af5d2ed3",
+  "timing": {
+    "cycles": 200,
+    "total_ms": 66.94,
+    "avg_ms": 0.3347,
+    "p50_ms": 0.3288,
+    "p95_ms": 0.3731,
+    "max_ms": 0.6281
+  },
+  "blocked_conditions": [
+    "none \u2014 proof runs without infrastructure or live services"
+  ]
+}
