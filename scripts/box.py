@@ -3093,6 +3093,34 @@ def _emit_box_down_destroy_failure(box: Box, box_id: str, steps: list[dict[str, 
     return EXIT_ERROR
 
 
+def _emit_box_down_volume_failure(boxes: list[Box], box: Box, box_id: str, steps: list[dict[str, Any]], *, is_json: bool) -> int:
+    update_box(box, state="volume-cleanup-failed")
+    save_inventory(boxes)
+    message = f"Droplet was destroyed for box {box_id!r}, but volume cleanup did not complete."
+    payload = {
+        "box_id": box_id,
+        "dry_run": False,
+        "steps": steps,
+        "next_actions": [f"box status {box_id}", f"box down {box_id}", "box list"],
+    }
+    payload.update(
+        structured_error(
+            message,
+            error_type="volume_cleanup_failed",
+            recovery_hint=(
+                "Inspect the volume warning, then retry box down after confirming the "
+                "volume can be detached or deleted safely."
+            ),
+            next_actions=[f"box status {box_id}", f"box down {box_id}", "box list"],
+        )
+    )
+    if is_json:
+        emit_json(payload)
+    else:
+        print(message, file=sys.stderr)
+    return EXIT_ERROR
+
+
 def _emit_box_down_success(boxes: list[Box], box: Box, box_id: str, steps: list[dict[str, Any]], *, is_json: bool) -> int:
     update_box(box, state="destroyed")
     save_inventory(boxes)
@@ -3137,7 +3165,8 @@ def cmd_down(box_id: str, *, dry_run: bool, fmt: str) -> int:
     if not _destroy_box_droplet(box, steps, is_json=is_json):
         save_inventory(boxes)
         return _emit_box_down_destroy_failure(box, box_id, steps, is_json=is_json)
-    _cleanup_box_volume(box, steps, is_json=is_json)
+    if not _cleanup_box_volume(box, steps, is_json=is_json):
+        return _emit_box_down_volume_failure(boxes, box, box_id, steps, is_json=is_json)
     return _emit_box_down_success(boxes, box, box_id, steps, is_json=is_json)
 
 

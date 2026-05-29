@@ -31,6 +31,17 @@ MANAGE_MODULE = SourceFileLoader(
 
 
 class RuntimeManagerTests(unittest.TestCase):
+    def test_tail_lines_zero_or_negative_is_empty_not_full_file(self) -> None:
+        from runtime_manager.runtime_ops import tail_lines
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "service.log"
+            log_path.write_text("one\ntwo\nthree\n", encoding="utf-8")
+
+            self.assertEqual(tail_lines(log_path, 0), [])
+            self.assertEqual(tail_lines(log_path, -1), [])
+            self.assertEqual(tail_lines(log_path, 2), ["two", "three"])
+
     def test_default_skill_repos_config_matches_hardened_shared_pack(self) -> None:
         config = MANAGE_MODULE.load_skill_repos_config(
             ROOT_DIR / "workspace" / "skill-repos.yaml",

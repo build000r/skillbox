@@ -1895,7 +1895,11 @@ def _handle_focus(args: argparse.Namespace, root_dir: Path) -> int:
         if client_flags:
             cid = str(client_flags[0]).strip()
     if not cid and not args.resume:
-        print("focus requires a client_id or --resume.", file=sys.stderr)
+        message = "focus requires a client_id or --resume."
+        if args.format == "json":
+            emit_json(classify_error(RuntimeError(message), "focus"))
+        else:
+            print(message, file=sys.stderr)
         return EXIT_ERROR
     return run_focus(
         root_dir=root_dir,

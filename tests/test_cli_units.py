@@ -36,6 +36,19 @@ def _ns(**kwargs: object) -> argparse.Namespace:
 
 
 class CliUnitTests(unittest.TestCase):
+    def test_focus_json_missing_client_returns_structured_error(self) -> None:
+        args = _ns(client_id="", resume=False, context_dir=None)
+        stdout = StringIO()
+        stderr = StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = CLI._handle_focus(args, Path("/repo"))  # noqa: SLF001
+
+        self.assertEqual(exit_code, CLI.EXIT_ERROR)
+        self.assertEqual(stderr.getvalue(), "")
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["error"]["type"], "runtime_error")
+        self.assertIn("focus requires a client_id or --resume", payload["error"]["message"])
+
     def test_capabilities_json_contract_is_agent_readable(self) -> None:
         result = subprocess.run(
             [sys.executable, ".env-manager/manage.py", "capabilities", "--json"],

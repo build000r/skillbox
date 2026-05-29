@@ -21,7 +21,9 @@ TOOL_INPUT=$(echo "$HOOK_INPUT" | python3 -c "import sys,json; print(json.dumps(
 # Only gate destructive tools
 case "$TOOL_NAME" in
     mcp__skillbox-operator__operator_teardown|\
-    mcp__skillbox-operator__operator_compose_down)
+    mcp__skillbox-operator__operator_compose_down|\
+    mcp__skillbox_operator__operator_teardown|\
+    mcp__skillbox_operator__operator_compose_down)
         ;;
     *)
         exit 0
@@ -92,33 +94,51 @@ def check(path):
         problems.append(f"inaccessible:{path}: {exc.__class__.__name__}: {exc}")
     return problems
 
-# Find all git repos: the repo root itself, plus any .git dirs under
-# workspace/repos and the monoserver mount.
-search_roots = []
 repo_root = sys.argv[1] if len(sys.argv) > 1 else "."
 
-# The skillbox repo itself
-if os.path.isdir(os.path.join(repo_root, ".git")):
-    search_roots.append(repo_root)
+def discover_git_roots(base):
+    roots = []
+    if not base or not os.path.isdir(base):
+        return roots
+    for current, dirs, _files in os.walk(base):
+        if ".git" in dirs:
+            roots.append(current)
+            dirs[:] = []
+            continue
+        dirs[:] = [
+            name for name in dirs
+            if name not in {
+                ".git",
+                ".skillbox-state",
+                "node_modules",
+                "__pycache__",
+                ".venv",
+                "venv",
+            }
+        ]
+    return roots
 
-# Local workspace repos dir
-repos_dir = os.path.join(repo_root, "repos")
-if os.path.isdir(repos_dir):
-    for entry in os.listdir(repos_dir):
-        candidate = os.path.join(repos_dir, entry)
-        if os.path.isdir(os.path.join(candidate, ".git")):
-            search_roots.append(candidate)
+search_roots = []
+for base in [
+    repo_root,
+    os.path.join(repo_root, "repos"),
+    os.path.join(repo_root, "workspace", "clients"),
+    os.environ.get("SKILLBOX_CLIENTS_HOST_ROOT", os.path.join(repo_root, ".skillbox-state", "clients")),
+    os.environ.get("SKILLBOX_MONOSERVER_HOST_ROOT", os.path.join(repo_root, "..")),
+]:
+    search_roots.extend(discover_git_roots(base))
 
-# Monoserver root (sibling repos mounted from host parent)
-mono_root = os.environ.get("SKILLBOX_MONOSERVER_HOST_ROOT", os.path.join(repo_root, ".."))
-if os.path.isdir(mono_root):
-    for entry in os.listdir(mono_root):
-        candidate = os.path.join(mono_root, entry)
-        if os.path.isdir(os.path.join(candidate, ".git")):
-            search_roots.append(candidate)
+deduped_roots = []
+seen = set()
+for root in search_roots:
+    marker = os.path.realpath(root)
+    if marker in seen:
+        continue
+    seen.add(marker)
+    deduped_roots.append(root)
 
 all_problems = []
-for r in search_roots:
+for r in deduped_roots:
     all_problems.extend(check(r))
 
 for p in all_problems:
@@ -165,19 +185,43 @@ def check(path):
         problems.append(f"inaccessible:{path}: {exc.__class__.__name__}: {exc}")
     return problems
 
-search_roots = []
-for base in ["/workspace", "/workspace/repos", "/monoserver"]:
+def discover_git_roots(base):
+    roots = []
     if not os.path.isdir(base):
+        return roots
+    for current, dirs, _files in os.walk(base):
+        if ".git" in dirs:
+            roots.append(current)
+            dirs[:] = []
+            continue
+        dirs[:] = [
+            name for name in dirs
+            if name not in {
+                ".git",
+                ".skillbox-state",
+                "node_modules",
+                "__pycache__",
+                ".venv",
+                "venv",
+            }
+        ]
+    return roots
+
+search_roots = []
+for base in ["/workspace", "/workspace/repos", "/workspace/workspace/clients", "/monoserver"]:
+    search_roots.extend(discover_git_roots(base))
+
+deduped_roots = []
+seen = set()
+for root in search_roots:
+    marker = os.path.realpath(root)
+    if marker in seen:
         continue
-    if os.path.isdir(os.path.join(base, ".git")):
-        search_roots.append(base)
-    for entry in os.listdir(base):
-        candidate = os.path.join(base, entry)
-        if os.path.isdir(os.path.join(candidate, ".git")):
-            search_roots.append(candidate)
+    seen.add(marker)
+    deduped_roots.append(root)
 
 all_problems = []
-for r in search_roots:
+for r in deduped_roots:
     all_problems.extend(check(r))
 for p in all_problems:
     print(p)

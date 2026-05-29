@@ -35,7 +35,12 @@ if str(SCRIPT_DIR) not in sys.path:
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from lib.runtime_model import build_runtime_model, client_overlay_paths, load_runtime_env  # noqa: E402
+from lib.runtime_model import (  # noqa: E402
+    build_runtime_model,
+    client_overlay_paths,
+    load_runtime_env,
+    runtime_path_to_host_path,
+)
 from manage import (  # noqa: E402
     DEFAULT_SERVICE_START_WAIT_SECONDS,
     DEFAULT_SERVICE_STOP_WAIT_SECONDS,
@@ -62,10 +67,102 @@ from manage import (  # noqa: E402
 # ---------------------------------------------------------------------------
 
 DEFAULT_INTERVAL = 30
-PID_REL = Path("logs") / "runtime" / "pulse.pid"
-STATE_REL = Path("logs") / "runtime" / "pulse.state.json"
-LOG_REL = Path("logs") / "runtime" / "pulse.log"
+# pulse persists its pid/state/log inside the SAME runtime log directory the
+# runtime manager resolves for the pulse service. The manager's path_exists
+# healthcheck plus its stop/status logic all read <runtime-log-dir>/pulse.pid,
+# where the directory comes from SKILLBOX_LOG_ROOT (host path
+# .skillbox-state/logs/runtime). Writing the pid anywhere else means the manager
+# can never see pulse: it reports the daemon "down" forever, and every `up`
+# spawns another orphan. Resolve the directory from the runtime model so pulse
+# and the manager always agree.
+PID_NAME = "pulse.pid"
+STATE_NAME = "pulse.state.json"
+LOG_NAME = "pulse.log"
 DEFAULT_UNHEALTHY_GRACE_SECONDS = 60.0
+
+_runtime_dir_cache: dict[Path, Path] = {}
+
+
+def _unique_paths(paths: list[Path]) -> list[Path]:
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        marker = str(path)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique.append(path)
+    return unique
+
+
+def _state_runtime_dir(root_dir: Path) -> Path:
+    env_values = load_runtime_env(root_dir)
+    log_root = str(env_values.get("SKILLBOX_LOG_ROOT") or "/workspace/logs").rstrip("/")
+    return runtime_path_to_host_path(root_dir, env_values, f"{log_root}/runtime")
+
+
+def _runtime_dir(root_dir: Path) -> Path:
+    """Runtime log directory the manager uses for the pulse service.
+
+    Falls back to <root_dir>/logs/runtime when the model can't be built (the
+    bare ``stop``/``status`` CLI paths, degraded environments). Only a
+    successful model resolution is cached, so a transient failure never pins
+    the fallback.
+    """
+    cached = _runtime_dir_cache.get(root_dir)
+    if cached is not None:
+        return cached
+    try:
+        model = build_runtime_model(root_dir)
+        pulse_service = next(
+            (svc for svc in model.get("services", []) if svc.get("id") == "pulse"),
+            None,
+        )
+        if pulse_service is not None:
+            runtime_dir = service_paths(model, pulse_service)["log_dir"]
+            _runtime_dir_cache[root_dir] = runtime_dir
+            return runtime_dir
+    except Exception:
+        pass
+    try:
+        return _state_runtime_dir(root_dir)
+    except Exception:
+        return root_dir / "logs" / "runtime"
+
+
+def _runtime_dir_candidates(root_dir: Path) -> list[Path]:
+    candidates = [_runtime_dir(root_dir)]
+    try:
+        candidates.append(_state_runtime_dir(root_dir))
+    except Exception:
+        pass
+    candidates.extend(
+        [
+            root_dir / ".skillbox-state" / "logs" / "runtime",
+            root_dir / "logs" / "runtime",
+        ]
+    )
+    return _unique_paths(candidates)
+
+
+def pulse_pid_path(root_dir: Path) -> Path:
+    return _runtime_dir(root_dir) / PID_NAME
+
+
+def pulse_pid_candidates(root_dir: Path) -> list[Path]:
+    return [path / PID_NAME for path in _runtime_dir_candidates(root_dir)]
+
+
+def pulse_state_path(root_dir: Path) -> Path:
+    return _runtime_dir(root_dir) / STATE_NAME
+
+
+def pulse_state_candidates(root_dir: Path) -> list[Path]:
+    return [path / STATE_NAME for path in _runtime_dir_candidates(root_dir)]
+
+
+def pulse_log_path(root_dir: Path) -> Path:
+    return _runtime_dir(root_dir) / LOG_NAME
 
 # ---------------------------------------------------------------------------
 # Logging (structured, to file + stderr)
@@ -76,7 +173,7 @@ _log_handle = None
 
 def _open_log(root_dir: Path) -> None:
     global _log_handle
-    log_path = root_dir / LOG_REL
+    log_path = pulse_log_path(root_dir)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     _log_handle = log_path.open("a", encoding="utf-8")
 
@@ -100,7 +197,7 @@ def log(level: str, message: str, **extra: Any) -> None:
 # ---------------------------------------------------------------------------
 
 def write_pid(root_dir: Path) -> Path:
-    pid_path = root_dir / PID_REL
+    pid_path = pulse_pid_path(root_dir)
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = pid_path.with_suffix(pid_path.suffix + ".tmp")
     tmp_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
@@ -109,25 +206,28 @@ def write_pid(root_dir: Path) -> Path:
 
 
 def remove_pid(root_dir: Path) -> None:
-    pid_path = root_dir / PID_REL
-    try:
-        pid_path.unlink()
-    except FileNotFoundError:
-        pass
+    for pid_path in pulse_pid_candidates(root_dir):
+        try:
+            pid_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def existing_pid(root_dir: Path) -> int | None:
-    pid_path = root_dir / PID_REL
-    if not pid_path.exists():
-        return None
-    try:
-        pid = int(pid_path.read_text().strip())
-    except (ValueError, OSError):
-        return None
-    if process_is_running(pid):
-        return pid
-    # Stale PID file — clean up.
-    remove_pid(root_dir)
+    for pid_path in pulse_pid_candidates(root_dir):
+        if not pid_path.exists():
+            continue
+        try:
+            pid = int(pid_path.read_text().strip())
+        except (ValueError, OSError):
+            continue
+        if process_is_running(pid):
+            return pid
+        # Stale PID file — clean up.
+        try:
+            pid_path.unlink()
+        except FileNotFoundError:
+            pass
     return None
 
 
@@ -308,13 +408,26 @@ def _restart_with_backoff(
         remaining = int(backoff_until - now)
         log("info", f"skipping restart for {service_id} (backoff {remaining}s)")
         return None
+    attempts = state.restart_attempts.get(service_id, 0)
+    if attempts >= MAX_RESTART_ATTEMPTS:
+        state.restart_backoff[service_id] = now + RESTART_BACKOFF_SECONDS
+        log_runtime_event("pulse.restart_suppressed", service_id, {
+            "reason": reason,
+            "attempts": attempts,
+            "max_attempts": MAX_RESTART_ATTEMPTS,
+        })
+        state.events_emitted += 1
+        log("warn", f"suppressing restart for {service_id} after {attempts} failed attempts")
+        return None
 
     ok = _restart_service(model, service, reason=reason)
     if ok:
         state.heals += 1
         state.restart_backoff.pop(service_id, None)
+        state.restart_attempts.pop(service_id, None)
         return True
 
+    state.restart_attempts[service_id] = attempts + 1
     state.restart_backoff[service_id] = now + RESTART_BACKOFF_SECONDS
     return False
 
@@ -331,6 +444,7 @@ class PulseState:
         self.service_states: dict[str, str] = {}  # service_id → state string
         self.check_states: dict[str, bool] = {}    # check_id → ok
         self.restart_backoff: dict[str, float] = {}  # service_id → next eligible restart time
+        self.restart_attempts: dict[str, int] = {}  # service_id → consecutive failed restart attempts
         self.unhealthy_since: dict[str, float] = {}  # service_id → monotonic timestamp
         self.pressure_warnings: list[str] = []
         self.pressure_advisory: dict[str, Any] = {}
@@ -354,6 +468,7 @@ class PulseState:
             "check_states": dict(self.check_states),
             "pressure_warnings": list(self.pressure_warnings),
             "pressure_advisory": dict(self.pressure_advisory),
+            "restart_attempts": dict(self.restart_attempts),
             "unhealthy_for_seconds": unhealthy_for,
         }
 
@@ -418,8 +533,13 @@ def _load_pulse_model(
     profiles = normalize_active_profiles(active_profiles)
     try:
         clients = normalize_active_clients(model, active_clients)
-    except RuntimeError:
-        clients = set()
+    except RuntimeError as exc:
+        log_runtime_event("pulse.scope_error", "clients", {
+            "requested": active_clients or [],
+            "error": str(exc),
+        }, root_dir)
+        log("error", f"invalid pulse client scope: {exc}")
+        return None
     return filter_model(model, profiles, clients), profiles, clients
 
 
@@ -642,6 +762,9 @@ def _reconcile_pulse_service(
         unhealthy_grace_seconds=unhealthy_grace_seconds,
         now=now,
     )
+    if current_state == "running":
+        state.restart_attempts.pop(service_id, None)
+        state.restart_backoff.pop(service_id, None)
     state.service_states[service_id] = current_state
 
 
@@ -723,7 +846,7 @@ def _write_pulse_state(
     active_profiles: set[str],
     unhealthy_grace_seconds: float,
 ) -> None:
-    state_path = root_dir / STATE_REL
+    state_path = pulse_state_path(root_dir)
     state_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot = {
         "pid": os.getpid(),
@@ -840,7 +963,10 @@ def run_daemon(
 
 def print_status(root_dir: Path) -> int:
     """Print current pulse status from the persisted state file."""
-    state_path = root_dir / STATE_REL
+    state_path = next(
+        (candidate for candidate in pulse_state_candidates(root_dir) if candidate.is_file()),
+        pulse_state_path(root_dir),
+    )
     running_pid = existing_pid(root_dir)
 
     if not state_path.is_file():
@@ -915,7 +1041,10 @@ def _print_pulse_pressure(pressure_warnings: list[Any]) -> None:
 
 def read_state(root_dir: Path) -> dict[str, Any]:
     """Read pulse state for programmatic consumers (MCP tool)."""
-    state_path = root_dir / STATE_REL
+    state_path = next(
+        (candidate for candidate in pulse_state_candidates(root_dir) if candidate.is_file()),
+        pulse_state_path(root_dir),
+    )
     running_pid = existing_pid(root_dir)
 
     result: dict[str, Any] = {
@@ -950,20 +1079,33 @@ def _split_scope_values(raw_value: str) -> list[str]:
     ]
 
 
-def _scope_from_cli_or_env(cli_values: list[str] | None, env_name: str) -> list[str] | None:
+def _scope_from_cli_or_env(
+    cli_values: list[str] | None,
+    env_name: str,
+    env_values: dict[str, str] | None = None,
+) -> list[str] | None:
     values = [value.strip() for value in cli_values or [] if value and value.strip()]
     if values:
         return values
     env_value = os.environ.get(env_name, "").strip()
+    if not env_value and env_values is not None:
+        env_value = str(env_values.get(env_name) or "").strip()
     if not env_value:
         return None
     return _split_scope_values(env_value)
 
 
-def _float_from_cli_or_env(cli_value: float | None, env_name: str, default: float) -> float:
+def _float_from_cli_or_env(
+    cli_value: float | None,
+    env_name: str,
+    default: float,
+    env_values: dict[str, str] | None = None,
+) -> float:
     if cli_value is not None:
         return cli_value
     env_value = os.environ.get(env_name, "").strip()
+    if not env_value and env_values is not None:
+        env_value = str(env_values.get(env_name) or "").strip()
     if not env_value:
         return default
     try:
@@ -1040,16 +1182,28 @@ def main() -> int:
         return 0
 
     # Default: run the daemon.
+    env_values = load_runtime_env(root_dir)
     interval = args.interval if hasattr(args, "interval") and args.interval else None
     if interval is None:
         env_interval = os.environ.get("SKILLBOX_PULSE_INTERVAL", "").strip()
+        if not env_interval:
+            env_interval = str(env_values.get("SKILLBOX_PULSE_INTERVAL") or "").strip()
         interval = int(env_interval) if env_interval else DEFAULT_INTERVAL
-    active_clients = _scope_from_cli_or_env(getattr(args, "client", None), "SKILLBOX_PULSE_CLIENTS")
-    active_profiles = _scope_from_cli_or_env(getattr(args, "profile", None), "SKILLBOX_PULSE_PROFILES")
+    active_clients = _scope_from_cli_or_env(
+        getattr(args, "client", None),
+        "SKILLBOX_PULSE_CLIENTS",
+        env_values,
+    )
+    active_profiles = _scope_from_cli_or_env(
+        getattr(args, "profile", None),
+        "SKILLBOX_PULSE_PROFILES",
+        env_values,
+    )
     unhealthy_grace_seconds = _float_from_cli_or_env(
         getattr(args, "unhealthy_grace_seconds", None),
         "SKILLBOX_PULSE_UNHEALTHY_GRACE_SECONDS",
         DEFAULT_UNHEALTHY_GRACE_SECONDS,
+        env_values,
     )
 
     return run_daemon(

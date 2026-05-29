@@ -260,6 +260,7 @@ class SkillboxMcpServerTests(unittest.TestCase):
             "skillbox_down": {},
             "skillbox_restart": {},
             "skillbox_bootstrap": {},
+            "skillbox_context": {},
             "skillbox_onboard": {"client_id": "acme"},
         }
 
@@ -278,6 +279,33 @@ class SkillboxMcpServerTests(unittest.TestCase):
                 self.assertTrue(payload["error"]["recoverable"])
                 self.assertEqual(payload["error"]["tool"], tool_name)
                 run_manage.assert_not_called()
+
+    def test_dispatch_tool_rejects_malformed_numeric_arguments_before_manage(self) -> None:
+        with mock.patch.object(MODULE, "run_manage") as run_manage:
+            result = MODULE.dispatch_tool(
+                "skillbox_logs",
+                {"lines": "abc"},
+                request_id="req-bad-lines",
+            )
+
+        payload = _content_payload(result)
+        self.assertTrue(result["isError"])
+        self.assertEqual(payload["error"]["type"], "invalid_parameter")
+        self.assertIn("lines must be an integer", payload["error"]["message"])
+        run_manage.assert_not_called()
+
+        with mock.patch.object(MODULE, "run_manage") as run_manage:
+            result = MODULE.dispatch_tool(
+                "skillbox_logs",
+                {"lines": 0},
+                request_id="req-zero-lines",
+            )
+
+        payload = _content_payload(result)
+        self.assertTrue(result["isError"])
+        self.assertEqual(payload["error"]["type"], "invalid_parameter")
+        self.assertIn("lines must be >= 1", payload["error"]["message"])
+        run_manage.assert_not_called()
 
     def test_runtime_mcp_dry_run_marker_allows_matching_real_action(self) -> None:
         arguments = {
