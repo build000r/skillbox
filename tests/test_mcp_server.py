@@ -873,7 +873,10 @@ class SkillboxMcpServerTests(unittest.TestCase):
             runtime_log = repo / "logs" / "runtime" / "runtime.log"
             runtime_log.parent.mkdir(parents=True, exist_ok=True)
             runtime_log.write_text(
-                '2026-04-17T12:00:00 session.note personal:sess-1 {"client_id":"personal","session_id":"sess-1","message":"runtime mirror"}\n',
+                '2026-04-17T12:00:00 session.note personal:sess-1 '
+                '{"client_id":"personal","session_id":"sess-1",'
+                '"message":"runtime mirror password=runtime-secret",'
+                '"env":"SKILLBOX_DO_TOKEN=runtime-token"}\n',
                 encoding="utf-8",
             )
 
@@ -890,7 +893,10 @@ class SkillboxMcpServerTests(unittest.TestCase):
                         "type": "session.note",
                         "client_id": "personal",
                         "session_id": "sess-1",
-                        "detail": {"message": "session event"},
+                        "detail": {
+                            "message": "session event Authorization: Bearer session-bearer",
+                            "env": "SPAPS_AUTH_ACCESS_TOKEN=session-token",
+                        },
                     }
                 )
                 + "\n",
@@ -911,7 +917,13 @@ class SkillboxMcpServerTests(unittest.TestCase):
         self.assertEqual(payload["returned"], 2)
         self.assertEqual(payload["next_cursor"], "2")
         self.assertEqual({item["source"] for item in payload["events"]}, {"runtime_log", "session"})
-        self.assertEqual({item["message"] for item in payload["events"]}, {"runtime mirror", "session event"})
+        messages = {item["source"]: item["message"] for item in payload["events"]}
+        self.assertIn("runtime mirror", messages["runtime_log"])
+        self.assertIn("session event", messages["session"])
+        serialized = json.dumps(payload["events"])
+        self.assertIn("[REDACTED]", serialized)
+        for secret in ("runtime-secret", "runtime-token", "session-bearer", "session-token"):
+            self.assertNotIn(secret, serialized)
 
     def test_main_maps_invalid_logging_requests_to_jsonrpc_errors(self) -> None:
         errors: list[tuple[object, int, str]] = []

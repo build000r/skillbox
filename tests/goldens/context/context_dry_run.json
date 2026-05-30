@@ -1,0 +1,10 @@
+{
+  "actions": [
+    "write-context: home/.claude/CLAUDE.md",
+    "exists: home/.codex/AGENTS.md -> ../.claude/CLAUDE.md"
+  ],
+  "dry_run": true,
+  "next_actions": [
+    "doctor --format json"
+  ]
+}

@@ -454,6 +454,45 @@ def next_actions_for_doctor(results: list["CheckResult"]) -> list[str]:
     return actions
 
 
+def is_elevated_pressure_level(level: Any) -> bool:
+    """True when a local-disk pressure level is in the advisory-worthy band.
+
+    Shared so the advisory warning builder, stewardship risk gate, and
+    pressure-report next-actions all classify ``critical``/``high``/``elevated``
+    identically and never drift apart.
+    """
+    return str(level or "").strip() in {"critical", "high", "elevated"}
+
+
+def pressure_advisory_warning_messages(advisory: dict[str, Any]) -> list[str]:
+    """Build the agent-facing pressure/offload advisory warning strings.
+
+    Single source of truth for the advisory ``warnings`` text consumed by
+    status, context, pulse, stewardship, and evidence surfaces. The exact
+    strings and ordering here are the byte-for-byte contract; surfaces only
+    render the resulting list, they do not reconstruct it.
+    """
+    local_disk = advisory.get("local_disk") or {}
+    rch = advisory.get("rch") or {}
+    sbh = advisory.get("sbh") or {}
+    warnings: list[str] = []
+    level = str(local_disk.get("pressure_level") or "").strip()
+    if is_elevated_pressure_level(level):
+        warnings.append(
+            "Local disk pressure is "
+            f"{level}; avoid expensive local build storms and inspect pressure-report first."
+        )
+    if rch.get("state") in {"not-configured", "remediation"}:
+        warnings.append("RCH build offload is not worker-ready; expensive builds may run locally.")
+    if sbh.get("state") in {"not-configured", "remediation"}:
+        warnings.append("SBH storage guard is not observing; cleanup remains manual review only.")
+    if sbh.get("release_caveats"):
+        warnings.append("SBH latest Linux release asset has a known mismatch; keep the verified canary pin.")
+    if advisory.get("protected_paths"):
+        warnings.append("Protected paths are hard vetoes; do not delete agent state or SSH material.")
+    return warnings
+
+
 def next_actions_for_status(status_payload: dict[str, Any]) -> list[str]:
     actions: list[str] = []
     pressure_advisory = status_payload.get("pressure_advisory") or {}

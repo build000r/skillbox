@@ -2530,7 +2530,7 @@ def _stewardship_pressure_risks(pressure: dict[str, Any]) -> list[dict[str, Any]
     warnings = pressure.get("warnings") or []
     local_disk = pressure.get("local_disk") or {}
     level = str(local_disk.get("pressure_level") or "")
-    if not warnings or level not in {"critical", "high", "elevated"}:
+    if not warnings or not is_elevated_pressure_level(level):
         return []
     severity = "high" if level in {"critical", "high"} else "medium"
     return [

@@ -7,6 +7,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .shared import is_elevated_pressure_level
+
 
 GIB = 1024 ** 3
 DEFAULT_TARGET_BOX = "portfolio-devbox"
@@ -331,7 +333,7 @@ def _next_actions(local_disk: dict[str, Any], tools: dict[str, Any], box: dict[s
         "Do not delete, truncate, or clean protected buckets without explicit operator approval.",
         "Use this report before expensive local build/test runs.",
     ]
-    if local_disk["pressure_level"] in {"critical", "high", "elevated"}:
+    if is_elevated_pressure_level(local_disk["pressure_level"]):
         actions.append("Avoid local build storms; prefer a configured remote build lane for expensive validation.")
     if not tools["rch"]["installed"]:
         actions.append("RCH is not configured here yet; keep build offload in planning/probe mode.")

@@ -1594,6 +1594,37 @@ def _handle_pulse(_params: dict) -> dict:
     return _ok_content(state)
 
 
+def _redact_event_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_diagnostic_text(value)
+    if isinstance(value, list):
+        return [_redact_event_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _redact_event_value(item) for key, item in value.items()}
+    return value
+
+
+def _redact_event_feed_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    events = payload.get("events")
+    if not isinstance(events, list):
+        return payload
+
+    redacted = dict(payload)
+    redacted_events: list[Any] = []
+    for item in events:
+        if not isinstance(item, dict):
+            redacted_events.append(item)
+            continue
+        event = dict(item)
+        if isinstance(event.get("message"), str):
+            event["message"] = redact_diagnostic_text(event["message"])
+        if "detail" in event:
+            event["detail"] = _redact_event_value(event["detail"])
+        redacted_events.append(event)
+    redacted["events"] = redacted_events
+    return redacted
+
+
 def _handle_events(params: dict) -> dict:
     # Validate identifier params before use
     for key in ("client_id", "session_id"):
@@ -1608,8 +1639,8 @@ def _handle_events(params: dict) -> dict:
 
     runtime_manager = _runtime_manager_module()
     try:
-        limit = int(params.get("limit") or runtime_manager.DEFAULT_EVENT_FEED_LIMIT)
-        wait_seconds = float(params.get("wait_seconds") or 0.0)
+        limit = max(1, min(200, int(params.get("limit") or runtime_manager.DEFAULT_EVENT_FEED_LIMIT)))
+        wait_seconds = max(0.0, min(30.0, float(params.get("wait_seconds") or 0.0)))
     except (TypeError, ValueError) as exc:
         return _error_content(
             {
@@ -1629,7 +1660,7 @@ def _handle_events(params: dict) -> dict:
         limit=limit,
         wait_seconds=wait_seconds,
     )
-    return _ok_content(payload)
+    return _ok_content(_redact_event_feed_payload(payload))
 
 
 def _args_without_dry_run(args: list[str]) -> list[str]:
