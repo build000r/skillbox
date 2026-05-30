@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -30,12 +31,14 @@ class InstallScriptTests(unittest.TestCase):
     def test_dry_run_does_not_create_targets(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
+            source_dir = root / "source"
             repo_dir = root / "skillbox"
             private_dir = root / "skillbox-config"
+            self._write_fake_source(source_dir)
 
             result = self._run(
                 "--source-dir",
-                str(ROOT_DIR),
+                str(source_dir),
                 "--repo-dir",
                 str(repo_dir),
                 "--private-path",
@@ -56,12 +59,14 @@ class InstallScriptTests(unittest.TestCase):
     def test_local_source_install_creates_private_repo_and_open_surface(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
+            source_dir = root / "source"
             repo_dir = root / "skillbox"
             private_dir = root / "skillbox-config"
+            self._write_fake_source(source_dir)
 
             result = self._run(
                 "--source-dir",
-                str(ROOT_DIR),
+                str(source_dir),
                 "--repo-dir",
                 str(repo_dir),
                 "--private-path",
@@ -82,15 +87,17 @@ class InstallScriptTests(unittest.TestCase):
     def test_existing_nonempty_target_requires_force(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
+            source_dir = root / "source"
             repo_dir = root / "skillbox"
             private_dir = root / "skillbox-config"
+            self._write_fake_source(source_dir)
             repo_dir.mkdir(parents=True, exist_ok=True)
             note_path = repo_dir / "note.txt"
             note_path.write_text("keep me\n", encoding="utf-8")
 
             result = self._run(
                 "--source-dir",
-                str(ROOT_DIR),
+                str(source_dir),
                 "--repo-dir",
                 str(repo_dir),
                 "--private-path",
@@ -109,15 +116,17 @@ class InstallScriptTests(unittest.TestCase):
     def test_force_refuses_non_skillbox_target_and_preserves_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
+            source_dir = root / "source"
             repo_dir = root / "not-skillbox"
             private_dir = root / "skillbox-config"
+            self._write_fake_source(source_dir)
             repo_dir.mkdir(parents=True, exist_ok=True)
             note_path = repo_dir / "sentinel.txt"
             note_path.write_text("do not delete\n", encoding="utf-8")
 
             result = self._run(
                 "--source-dir",
-                str(ROOT_DIR),
+                str(source_dir),
                 "--repo-dir",
                 str(repo_dir),
                 "--private-path",
@@ -137,15 +146,17 @@ class InstallScriptTests(unittest.TestCase):
     def test_force_refuses_home_target_and_preserves_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
+            source_dir = root / "source"
             home = root / "home"
             private_dir = root / "skillbox-config"
+            self._write_fake_source(source_dir)
             home.mkdir(parents=True, exist_ok=True)
             note_path = home / "sentinel.txt"
             note_path.write_text("do not delete\n", encoding="utf-8")
 
             result = self._run(
                 "--source-dir",
-                str(ROOT_DIR),
+                str(source_dir),
                 "--repo-dir",
                 str(home),
                 "--private-path",
@@ -166,8 +177,10 @@ class InstallScriptTests(unittest.TestCase):
     def test_force_allows_existing_skillbox_checkout_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
+            source_dir = root / "source"
             repo_dir = root / "skillbox"
             private_dir = root / "skillbox-config"
+            self._write_fake_source(source_dir)
             (repo_dir / ".env-manager").mkdir(parents=True, exist_ok=True)
             (repo_dir / ".env-manager" / "manage.py").write_text("# existing\n", encoding="utf-8")
             (repo_dir / "install.sh").write_text("# existing\n", encoding="utf-8")
@@ -177,7 +190,7 @@ class InstallScriptTests(unittest.TestCase):
 
             result = self._run(
                 "--source-dir",
-                str(ROOT_DIR),
+                str(source_dir),
                 "--repo-dir",
                 str(repo_dir),
                 "--private-path",
@@ -198,12 +211,14 @@ class InstallScriptTests(unittest.TestCase):
     def test_verify_runs_post_install_checks(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
+            source_dir = root / "source"
             repo_dir = root / "skillbox"
             private_dir = root / "skillbox-config"
+            self._write_fake_source(source_dir)
 
             result = self._run(
                 "--source-dir",
-                str(ROOT_DIR),
+                str(source_dir),
                 "--repo-dir",
                 str(repo_dir),
                 "--private-path",
@@ -218,16 +233,23 @@ class InstallScriptTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("verify: ok", result.stdout)
+            invocations = [
+                json.loads(line)["argv"][0]
+                for line in (repo_dir / "manage-invocations.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(invocations, ["first-box", "doctor", "status"])
 
     def test_skip_first_box_leaves_private_repo_uncreated(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
+            source_dir = root / "source"
             repo_dir = root / "skillbox"
             private_dir = root / "skillbox-config"
+            self._write_fake_source(source_dir)
 
             result = self._run(
                 "--source-dir",
-                str(ROOT_DIR),
+                str(source_dir),
                 "--repo-dir",
                 str(repo_dir),
                 "--private-path",
@@ -249,13 +271,15 @@ class InstallScriptTests(unittest.TestCase):
     def test_install_wrappers_creates_repo_owned_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
+            source_dir = root / "source"
             repo_dir = root / "skillbox"
             private_dir = root / "skillbox-config"
             bin_dir = root / "bin"
+            self._write_fake_source(source_dir)
 
             result = self._run(
                 "--source-dir",
-                str(ROOT_DIR),
+                str(source_dir),
                 "--repo-dir",
                 str(repo_dir),
                 "--private-path",
@@ -277,6 +301,81 @@ class InstallScriptTests(unittest.TestCase):
             self.assertEqual((bin_dir / "sbp").resolve(), (repo_dir / "scripts" / "sbp").resolve())
             self.assertEqual((bin_dir / "sbo").resolve(), (repo_dir / "scripts" / "sbo").resolve())
             self.assertIn("wrappers: ok", result.stdout)
+
+    def _write_fake_source(self, source_dir: Path) -> None:
+        (source_dir / ".env-manager").mkdir(parents=True, exist_ok=True)
+        (source_dir / "scripts").mkdir(parents=True, exist_ok=True)
+        (source_dir / "README.md").write_text("# Skillbox test fixture\n", encoding="utf-8")
+        (source_dir / "install.sh").write_text("# test fixture\n", encoding="utf-8")
+        (source_dir / ".env.example").write_text(
+            "\n".join(
+                [
+                    "SKILLBOX_STATE_ROOT=./.skillbox-state",
+                    "SKILLBOX_MONOSERVER_HOST_ROOT=${SKILLBOX_STATE_ROOT}/monoserver",
+                    "SKILLBOX_CM_MCP_PORT=0",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        for wrapper_name in ("sbp", "sbo"):
+            wrapper_path = source_dir / "scripts" / wrapper_name
+            wrapper_path.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"${1:-}\" == \"--help\" ]]; then echo help; exit 0; fi\n"
+                "echo ok\n",
+                encoding="utf-8",
+            )
+            wrapper_path.chmod(0o755)
+        (source_dir / ".env-manager" / "manage.py").write_text(
+            """from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+
+def arg_value(flag: str) -> str:
+    try:
+        return sys.argv[sys.argv.index(flag) + 1]
+    except (ValueError, IndexError):
+        return ""
+
+
+root = Path.cwd()
+argv = sys.argv[1:]
+command = argv[0] if argv else ""
+with (root / "manage-invocations.jsonl").open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({"argv": argv}) + "\\n")
+
+if command == "first-box":
+    client = argv[1] if len(argv) > 1 else "personal"
+    output_dir = root / "sand" / client
+    private_path = Path(arg_value("--private-path") or root.parent / "skillbox-config")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    private_path.mkdir(parents=True, exist_ok=True)
+    (output_dir / "CLAUDE.md").write_text("# test context\\n", encoding="utf-8")
+    (private_path / ".git").mkdir(parents=True, exist_ok=True)
+    client_dir = private_path / "clients" / client
+    client_dir.mkdir(parents=True, exist_ok=True)
+    (client_dir / "overlay.yaml").write_text("client: test\\n", encoding="utf-8")
+    print(json.dumps({
+        "client_id": client,
+        "output_dir": str(output_dir),
+        "private_repo": {"target_dir": str(private_path)},
+        "steps": [],
+    }))
+    raise SystemExit(0)
+
+if command in {"doctor", "status"}:
+    print(json.dumps({"ok": True, "command": command}))
+    raise SystemExit(0)
+
+print(json.dumps({"ok": False, "command": command}), file=sys.stderr)
+raise SystemExit(2)
+""",
+            encoding="utf-8",
+        )
 
     def _run(self, *args: str, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()

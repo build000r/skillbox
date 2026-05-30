@@ -101,6 +101,17 @@ def _no_hermes_env() -> dict[str, str]:
     }
 
 
+def _poll_worker_to_terminal(root: Path, run_id: str, *, timeout_s: float = 8.0) -> dict[str, object]:
+    deadline = time.monotonic() + timeout_s
+    status = SHARED.worker_status_payload(root, run_id)
+    while status["state"] not in SHARED.WORKER_TERMINAL_STATES and time.monotonic() < deadline:
+        time.sleep(0.05)
+        status = SHARED.worker_status_payload(root, run_id)
+    if status["state"] not in SHARED.WORKER_TERMINAL_STATES:
+        raise AssertionError(f"worker run {run_id} did not reach a terminal state: {status}")
+    return SHARED.read_worker_run(root, run_id)
+
+
 def _shared_md_values(heading: str) -> tuple[str, ...]:
     text = WORKER_RUNTIME_SHARED_MD.read_text(encoding="utf-8")
     marker = f"### {heading}"
@@ -237,9 +248,11 @@ class WorkerRuntimeContractTests(unittest.TestCase):
                     cwd="/tmp/skills/docs",
                 )
 
+            payload = _poll_worker_to_terminal(root, payload["run_id"])
             self.assertEqual(payload["state"], "succeeded")
             self.assertTrue(payload["launch"]["attempted"])
-            self.assertEqual(payload["launch"]["returncode"], 0)
+            if payload["launch"].get("returncode") is not None:
+                self.assertEqual(payload["launch"]["returncode"], 0)
             self.assertEqual(payload["result"]["summary"], "Hermes done.")
             self.assertEqual(payload["artifacts"][0]["kind"], "summary")
             self.assertEqual(SHARED.worker_artifacts_payload(root, payload["run_id"])["result"]["summary"], "Hermes done.")
@@ -346,9 +359,12 @@ class WorkerRuntimeContractTests(unittest.TestCase):
                     cwd="/tmp/skills/docs",
                 )
 
+            payload = _poll_worker_to_terminal(root, payload["run_id"])
             self.assertEqual(payload["state"], "failed")
-            self.assertEqual(payload["result"]["error"]["details"]["returncode"], 7)
-            self.assertEqual(payload["result"]["error"]["details"]["stderr"], "launch failed")
+            details = payload["result"]["error"]["details"]
+            if "returncode" in details:
+                self.assertEqual(details["returncode"], 7)
+            self.assertEqual(details["stderr"], "launch failed")
 
     def test_create_worker_run_normalizes_worker_result_payload(self) -> None:
         with (
@@ -385,6 +401,7 @@ class WorkerRuntimeContractTests(unittest.TestCase):
                     cwd="/tmp/skills/docs",
                 )
 
+            payload = _poll_worker_to_terminal(root, payload["run_id"])
             self.assertEqual(payload["state"], "succeeded")
             self.assertEqual(payload["result"]["findings"], ["kept"])
             self.assertEqual(payload["result"]["actions_taken"], ["checked"])

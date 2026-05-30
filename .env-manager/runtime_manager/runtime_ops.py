@@ -2842,7 +2842,21 @@ def wait_for_service_health(
             return {"state": "failed", "exit_code": process.returncode}
         time.sleep(0.25)
 
-    return service_healthcheck_state(service) | {"state": "timeout"}
+    if process.poll() is not None:
+        return {"state": "failed", "exit_code": process.returncode}
+
+    final_probe = service_healthcheck_state(service)
+    if final_probe.get("state") == "ok":
+        reused_existing = process.poll() is not None
+        state = {"state": "ok"} | final_probe
+        if reused_existing:
+            state["reused_existing"] = True
+            state["exit_code"] = process.returncode
+        return state
+    if process.poll() is not None:
+        return {"state": "failed", "exit_code": process.returncode}
+
+    return final_probe | {"state": "timeout"}
 
 
 def tail_lines(path: Path, line_count: int) -> list[str]:
@@ -4430,25 +4444,9 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
 
 
 def _pressure_warning_messages(advisory: dict[str, Any]) -> list[str]:
-    local_disk = advisory.get("local_disk") or {}
-    rch = advisory.get("rch") or {}
-    sbh = advisory.get("sbh") or {}
-    warnings: list[str] = []
-    level = str(local_disk.get("pressure_level") or "").strip()
-    if level in {"critical", "high", "elevated"}:
-        warnings.append(
-            "Local disk pressure is "
-            f"{level}; avoid expensive local build storms and inspect pressure-report first."
-        )
-    if rch.get("state") in {"not-configured", "remediation"}:
-        warnings.append("RCH build offload is not worker-ready; expensive builds may run locally.")
-    if sbh.get("state") in {"not-configured", "remediation"}:
-        warnings.append("SBH storage guard is not observing; cleanup remains manual review only.")
-    if sbh.get("release_caveats"):
-        warnings.append("SBH latest Linux release asset has a known mismatch; keep the verified canary pin.")
-    if advisory.get("protected_paths"):
-        warnings.append("Protected paths are hard vetoes; do not delete agent state or SSH material.")
-    return warnings
+    # Delegates to the shared formatter in shared.py so status, context, pulse,
+    # stewardship, and evidence surfaces all build identical advisory warnings.
+    return pressure_advisory_warning_messages(advisory)
 
 
 def runtime_pressure_advisory(root_dir: Path, *, home: Path | None = None) -> dict[str, Any]:
