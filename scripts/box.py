@@ -3158,6 +3158,18 @@ def cmd_down(box_id: str, *, dry_run: bool, fmt: str) -> int:
     if dry_run:
         return _emit_box_down_dry_run(box, box_id, steps, is_json=is_json)
 
+    if box.state == "volume-cleanup-failed":
+        _box_down_step(
+            steps,
+            is_json,
+            "destroy",
+            "skip",
+            "droplet was already destroyed; retrying volume cleanup",
+        )
+        if not _cleanup_box_volume(box, steps, is_json=is_json):
+            return _emit_box_down_volume_failure(boxes, box, box_id, steps, is_json=is_json)
+        return _emit_box_down_success(boxes, box, box_id, steps, is_json=is_json)
+
     ssh_target = _drain_box_for_down(box, steps, is_json=is_json)
     update_box(box, state="draining")
     save_inventory(boxes)

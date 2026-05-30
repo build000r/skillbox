@@ -139,6 +139,7 @@ class GuardDestructiveOpScriptTests(unittest.TestCase):
         script: Path,
         *,
         tool_name: str = "mcp__skillbox-operator__operator_compose_down",
+        tool_input: dict[str, object] | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         root = script.parent.parent
@@ -150,7 +151,7 @@ class GuardDestructiveOpScriptTests(unittest.TestCase):
             env.update(extra_env)
         payload = {
             "tool_name": tool_name,
-            "tool_input": {"dry_run": False},
+            "tool_input": tool_input or {"dry_run": False},
         }
         return subprocess.run(
             ["bash", str(script)],
@@ -185,6 +186,25 @@ class GuardDestructiveOpScriptTests(unittest.TestCase):
             (nested_repo / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
 
             result = self._run_guard(script)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Uncommitted changes in:", result.stderr)
+        self.assertIn(str(nested_repo), result.stderr)
+
+    def test_guard_destructive_teardown_local_scans_local_repos(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            script = self._copy_guard(root)
+            nested_repo = root / "workspace" / "clients" / "local" / "app"
+            nested_repo.mkdir(parents=True)
+            subprocess.run(["git", "init"], cwd=nested_repo, check=True, capture_output=True, text=True)
+            (nested_repo / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+
+            result = self._run_guard(
+                script,
+                tool_name="mcp__skillbox-operator__operator_teardown",
+                tool_input={"dry_run": False, "box_id": "local"},
+            )
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("Uncommitted changes in:", result.stderr)
@@ -307,7 +327,9 @@ class QuickValidateScriptTests(unittest.TestCase):
                 "description: short",
             )
             (skill / "references").mkdir()
-            (skill / "notes.txt").write_text('token = "abcdefghijklmnop"\n', encoding="utf-8")
+            key = "tok" + "en"
+            value = "abcd" * 4
+            (skill / "notes.txt").write_text(f'{key} = "{value}"\n', encoding="utf-8")
 
             valid, message = QUICK_VALIDATE.validate_skill(skill)
             self.assertTrue(valid)
