@@ -58,9 +58,53 @@ _DRY_RUN_PROP: dict = {
 _IDENTIFIER_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 _SSH_USER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$")
 _HOST_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,253}[a-zA-Z0-9])?$")
+REDACTION_MARKER = "[REDACTED]"
+_SECRET_KEY_PATTERN = (
+    r"TOKEN|SECRET|PASSWORD|PASSWD|API[_-]?KEY|AUTH[_-]?KEY|PRIVATE[_-]?KEY|ACCESS[_-]?KEY"
+)
+_SECRET_KEY_RE = re.compile(rf"(?:{_SECRET_KEY_PATTERN})", re.IGNORECASE)
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"("
+    r"(?:\b|[\"'])"
+    rf"[A-Z0-9_.-]*(?:{_SECRET_KEY_PATTERN})[A-Z0-9_.-]*"
+    r"(?:\b|[\"'])"
+    r"\s*[:=]\s*"
+    r"[\"']?"
+    r")"
+    r"([^\"'\s,;]+)"
+    r"([\"']?)",
+    re.IGNORECASE,
+)
+_BEARER_TOKEN_RE = re.compile(
+    r"(\b(?:authorization|proxy-authorization)\s*:\s*bearer\s+)([^\s,;]+)",
+    re.IGNORECASE,
+)
 
 DRYRUN_MARKER_TTL_SECONDS = 600  # 10 minutes
 _DRYRUN_MARKER_STATUS_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+
+
+def redact_diagnostic_text(text: str) -> str:
+    redacted = _BEARER_TOKEN_RE.sub(lambda match: f"{match.group(1)}{REDACTION_MARKER}", text)
+    return _SECRET_ASSIGNMENT_RE.sub(
+        lambda match: f"{match.group(1)}{REDACTION_MARKER}{match.group(3)}",
+        redacted,
+    )
+
+
+def _redact_diagnostic_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_diagnostic_text(value)
+    if isinstance(value, list):
+        return [_redact_diagnostic_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: REDACTION_MARKER
+            if isinstance(key, str) and _SECRET_KEY_RE.search(key)
+            else _redact_diagnostic_value(child)
+            for key, child in value.items()
+        }
+    return value
 
 
 def _validate_identifier(value: str, kind: str) -> str:
@@ -461,14 +505,15 @@ def run_script(
         }
 
     if proc.stderr.strip():
-        print(f"[operator-mcp] {script.name} stderr: {proc.stderr.strip()}", file=sys.stderr, flush=True)
+        stderr_text = redact_diagnostic_text(proc.stderr.strip())
+        print(f"[operator-mcp] {script.name} stderr: {stderr_text}", file=sys.stderr, flush=True)
 
     stdout = proc.stdout.strip()
     if stdout:
         try:
-            return proc.returncode == 0, proc.returncode, json.loads(stdout)
+            return proc.returncode == 0, proc.returncode, _redact_diagnostic_value(json.loads(stdout))
         except json.JSONDecodeError:
-            return proc.returncode == 0, proc.returncode, {"text": stdout}
+            return proc.returncode == 0, proc.returncode, {"text": redact_diagnostic_text(stdout)}
 
     return proc.returncode == 0, proc.returncode, {"exit_code": proc.returncode}
 
@@ -520,14 +565,14 @@ def run_compose(args: list[str], *, timeout: int = 300) -> tuple[bool, int, Any]
     # Try JSON parse (docker compose ps --format json)
     if stdout:
         try:
-            return ok, proc.returncode, json.loads(stdout)
+            return ok, proc.returncode, _redact_diagnostic_value(json.loads(stdout))
         except json.JSONDecodeError:
             pass
 
     return ok, proc.returncode, {
         "exit_code": proc.returncode,
-        "stdout": stdout,
-        "stderr": stderr,
+        "stdout": redact_diagnostic_text(stdout),
+        "stderr": redact_diagnostic_text(stderr),
     }
 
 
@@ -571,14 +616,14 @@ def run_ssh(
     # Try JSON parse
     if stdout:
         try:
-            return ok, proc.returncode, json.loads(stdout)
+            return ok, proc.returncode, _redact_diagnostic_value(json.loads(stdout))
         except json.JSONDecodeError:
             pass
 
     return ok, proc.returncode, {
         "exit_code": proc.returncode,
-        "stdout": stdout,
-        "stderr": proc.stderr.strip(),
+        "stdout": redact_diagnostic_text(stdout),
+        "stderr": redact_diagnostic_text(proc.stderr.strip()),
     }
 
 

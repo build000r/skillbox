@@ -197,6 +197,78 @@ class OperatorMcpServerTests(unittest.TestCase):
                 self.assertEqual(MODULE.handle_tools_call({"name": "operator_boxes"}), {"content": []})
             dispatch.assert_called_once_with("operator_boxes", {})
 
+    def test_subprocess_diagnostics_redact_secrets_but_keep_benign_context(self) -> None:
+        script_path = ROOT_DIR / "scripts" / "box.py"
+        script_stderr = io.StringIO()
+        with mock.patch.object(
+            MODULE.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(
+                ["python"],
+                0,
+                stdout='{"ok": true}',
+                stderr=(
+                    "build failed SKILLBOX_DO_TOKEN=do-secret "
+                    "Authorization: Bearer token-secret password=secret123 api_key=api-secret"
+                ),
+            ),
+        ), mock.patch.object(sys, "stderr", script_stderr):
+            ok, code, payload = MODULE.run_script(script_path, [])
+
+        self.assertTrue(ok)
+        self.assertEqual(code, 0)
+        self.assertEqual(payload, {"ok": True})
+        script_mirror = script_stderr.getvalue()
+        self.assertIn("build failed", script_mirror)
+        self.assertIn("SKILLBOX_DO_TOKEN=", script_mirror)
+        self.assertIn("Authorization: Bearer", script_mirror)
+        self.assertIn("[REDACTED]", script_mirror)
+        for raw_secret in ("do-secret", "token-secret", "secret123", "api-secret"):
+            self.assertNotIn(raw_secret, script_mirror)
+
+        with mock.patch.object(
+            MODULE.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(
+                ["ssh"],
+                2,
+                stdout="remote failed api_key=ssh-secret",
+                stderr="denied Authorization: Bearer ssh-bearer SKILLBOX_TS_AUTHKEY=ts-secret",
+            ),
+        ):
+            ok, code, payload = MODULE.run_ssh("u", "h", "pwd")
+
+        self.assertFalse(ok)
+        self.assertEqual(code, 2)
+        self.assertIn("remote failed", payload["stdout"])
+        self.assertIn("denied", payload["stderr"])
+        self.assertIn("[REDACTED]", payload["stdout"])
+        self.assertIn("[REDACTED]", payload["stderr"])
+        for raw_secret in ("ssh-secret", "ssh-bearer", "ts-secret"):
+            self.assertNotIn(raw_secret, payload["stdout"])
+            self.assertNotIn(raw_secret, payload["stderr"])
+
+        with mock.patch.object(
+            MODULE.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(
+                ["docker"],
+                1,
+                stdout="plain SKILLBOX_DO_TOKEN=compose-secret",
+                stderr="err password=compose-pass",
+            ),
+        ):
+            ok, code, payload = MODULE.run_compose(["down"])
+
+        self.assertFalse(ok)
+        self.assertEqual(code, 1)
+        self.assertIn("plain", payload["stdout"])
+        self.assertIn("err", payload["stderr"])
+        self.assertIn("[REDACTED]", payload["stdout"])
+        self.assertIn("[REDACTED]", payload["stderr"])
+        self.assertNotIn("compose-secret", payload["stdout"])
+        self.assertNotIn("compose-pass", payload["stderr"])
+
     def test_run_script_treats_nonzero_json_exit_as_error(self) -> None:
         completed = subprocess.CompletedProcess(
             ["python3"],

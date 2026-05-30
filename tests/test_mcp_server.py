@@ -46,18 +46,23 @@ class SkillboxMcpServerTests(unittest.TestCase):
 
     def test_run_manage_passes_event_context_env_and_emits_stderr_notification(self) -> None:
         sent: list[dict] = []
+        stderr_capture = io.StringIO()
         completed = subprocess.CompletedProcess(
             ["python3"],
             0,
             stdout='{"ok": true}',
-            stderr="watch this stderr",
+            stderr=(
+                "watch this stderr\n"
+                "SKILLBOX_DO_TOKEN=do-secret Authorization: Bearer token-secret "
+                "password=secret123 api_key=api-secret"
+            ),
         )
 
         with mock.patch.object(MODULE, "send", side_effect=sent.append), mock.patch.object(
             MODULE.subprocess,
             "run",
             return_value=completed,
-        ) as run:
+        ) as run, mock.patch.object(sys, "stderr", stderr_capture):
             ok, exit_code, payload = MODULE.run_manage(
                 ["status", "--format", "json"],
                 event_context={
@@ -80,7 +85,17 @@ class SkillboxMcpServerTests(unittest.TestCase):
         self.assertEqual(sent[0]["method"], "notifications/message")
         self.assertEqual(sent[0]["params"]["level"], "warning")
         self.assertEqual(sent[0]["params"]["logger"], "skillbox.manage.stderr")
-        self.assertEqual(sent[0]["params"]["data"]["stderr"], "watch this stderr")
+        emitted_stderr = sent[0]["params"]["data"]["stderr"]
+        mirrored_stderr = stderr_capture.getvalue()
+        for exposed in (emitted_stderr, mirrored_stderr):
+            self.assertIn("watch this stderr", exposed)
+            self.assertIn("SKILLBOX_DO_TOKEN=", exposed)
+            self.assertIn("Authorization: Bearer", exposed)
+            self.assertIn("[REDACTED]", exposed)
+            self.assertNotIn("do-secret", exposed)
+            self.assertNotIn("token-secret", exposed)
+            self.assertNotIn("secret123", exposed)
+            self.assertNotIn("api-secret", exposed)
         self.assertEqual(sent[0]["params"]["data"]["mcp_tool_name"], "skillbox_status")
 
     def test_run_manage_handles_timeout_plain_text_and_empty_failure(self) -> None:
@@ -95,7 +110,12 @@ class SkillboxMcpServerTests(unittest.TestCase):
         self.assertEqual(exit_code, -1)
         self.assertEqual(payload["error"]["type"], "timeout")
 
-        plain = subprocess.CompletedProcess(["python3"], 1, stdout="not json", stderr="")
+        plain = subprocess.CompletedProcess(
+            ["python3"],
+            1,
+            stdout="not json SKILLBOX_DO_TOKEN=stdout-secret Authorization: Bearer stdout-bearer",
+            stderr="",
+        )
         with mock.patch.object(MODULE, "send", side_effect=sent.append), mock.patch.object(
             MODULE.subprocess,
             "run",
@@ -104,7 +124,10 @@ class SkillboxMcpServerTests(unittest.TestCase):
             ok, exit_code, payload = MODULE.run_manage(["status"])
         self.assertFalse(ok)
         self.assertEqual(exit_code, 1)
-        self.assertEqual(payload["text"], "not json")
+        self.assertIn("not json", payload["text"])
+        self.assertIn("[REDACTED]", payload["text"])
+        self.assertNotIn("stdout-secret", payload["text"])
+        self.assertNotIn("stdout-bearer", payload["text"])
 
         empty = subprocess.CompletedProcess(["python3"], 1, stdout="", stderr="")
         with mock.patch.object(MODULE, "send", side_effect=sent.append), mock.patch.object(
