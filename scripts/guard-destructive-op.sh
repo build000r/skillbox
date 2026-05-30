@@ -239,7 +239,7 @@ except:
 
 PROBLEMS=""
 
-if [ "$FRIENDLY_NAME" = "operator_compose_down" ]; then
+if [ "$FRIENDLY_NAME" = "operator_compose_down" ] || { [ "$FRIENDLY_NAME" = "operator_teardown" ] && [ "$BOX_ID" = "local" ]; }; then
     # Local: scan host-side paths
     PROBLEMS=$(python3 -c "$check_repo_script" "$REPO_ROOT" 2>/dev/null || true)
 elif [ "$FRIENDLY_NAME" = "operator_teardown" ] && [ "$BOX_ID" != "local" ]; then
