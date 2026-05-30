@@ -49,6 +49,26 @@ LOG_LEVEL_ORDER = {level: index for index, level in enumerate(LOG_LEVELS)}
 CURRENT_LOG_LEVEL = "warning"
 MCP_EVENT_CONTEXT_ENV = "SKILLBOX_MCP_EVENT_CONTEXT"
 _RUNTIME_MANAGER: Any = None
+REDACTION_MARKER = "[REDACTED]"
+_SECRET_KEY_PATTERN = (
+    r"TOKEN|SECRET|PASSWORD|PASSWD|API[_-]?KEY|AUTH[_-]?KEY|PRIVATE[_-]?KEY|ACCESS[_-]?KEY"
+)
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"("
+    r"(?:\b|[\"'])"
+    rf"[A-Z0-9_.-]*(?:{_SECRET_KEY_PATTERN})[A-Z0-9_.-]*"
+    r"(?:\b|[\"'])"
+    r"\s*[:=]\s*"
+    r"[\"']?"
+    r")"
+    r"([^\"'\s,;]+)"
+    r"([\"']?)",
+    re.IGNORECASE,
+)
+_BEARER_TOKEN_RE = re.compile(
+    r"(\b(?:authorization|proxy-authorization)\s*:\s*bearer\s+)([^\s,;]+)",
+    re.IGNORECASE,
+)
 
 
 class JsonRpcError(RuntimeError):
@@ -56,6 +76,14 @@ class JsonRpcError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+def redact_diagnostic_text(text: str) -> str:
+    redacted = _BEARER_TOKEN_RE.sub(lambda match: f"{match.group(1)}{REDACTION_MARKER}", text)
+    return _SECRET_ASSIGNMENT_RE.sub(
+        lambda match: f"{match.group(1)}{REDACTION_MARKER}{match.group(3)}",
+        redacted,
+    )
 
 
 def _runtime_manager_search_roots() -> list[Path]:
@@ -1301,13 +1329,13 @@ def run_manage(args: list[str], *, event_context: dict[str, Any] | None = None) 
         return False, -1, payload
 
     if proc.stderr.strip():
-        stderr_text = proc.stderr.strip()
+        stderr_text = redact_diagnostic_text(proc.stderr.strip())
         emit_log_message(
             "warning" if proc.returncode in (0, 2) else "error",
             _compact_log_context(log_context, exit_code=proc.returncode, stderr=stderr_text),
             logger="skillbox.manage.stderr",
         )
-        print(f"[skillbox-mcp] stderr: {proc.stderr.strip()}", file=sys.stderr, flush=True)
+        print(f"[skillbox-mcp] stderr: {stderr_text}", file=sys.stderr, flush=True)
 
     stdout = proc.stdout.strip()
     if stdout:
@@ -1322,7 +1350,7 @@ def run_manage(args: list[str], *, event_context: dict[str, Any] | None = None) 
                 )
             return ok, proc.returncode, data
         except json.JSONDecodeError:
-            data = {"text": stdout}
+            data = {"text": redact_diagnostic_text(stdout)}
             ok = proc.returncode == 0
             if not ok:
                 emit_log_message(
