@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .pressure_report import PROTECTED_BUCKETS, REVIEW_ONLY_CANDIDATES
+from .shared import json_or_none, walk_values
 
 
 SBH_SAFE_PROBES = (
@@ -31,16 +32,6 @@ SBH_RELEASE_CAVEATS = [
         "safe_fallback": "Use the verified v0.4.22 Linux x86_64 canary pin until the upstream asset is republished.",
     }
 ]
-
-
-def _json_or_none(text: str) -> Any:
-    raw = str(text or "").strip()
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return None
 
 
 def _run_sbh_probe(binary: str, probe_id: str, args: tuple[str, ...], timeout_seconds: float) -> dict[str, Any]:
@@ -69,21 +60,10 @@ def _run_sbh_probe(binary: str, probe_id: str, args: tuple[str, ...], timeout_se
         "command": " ".join(command),
         "ok": result.returncode == 0,
         "returncode": result.returncode,
-        "json": _json_or_none(result.stdout),
+        "json": json_or_none(result.stdout),
         "stdout": result.stdout.strip()[-2000:],
         "stderr": result.stderr.strip()[-2000:],
     }
-
-
-def _walk_values(value: Any) -> list[Any]:
-    values = [value]
-    if isinstance(value, dict):
-        for nested in value.values():
-            values.extend(_walk_values(nested))
-    elif isinstance(value, list):
-        for nested in value:
-            values.extend(_walk_values(nested))
-    return values
 
 
 def _text_for_probes(probes: list[dict[str, Any]]) -> str:
@@ -116,7 +96,7 @@ def _doctor_has_failure(probes: list[dict[str, Any]]) -> bool:
     if doctor.get("ok") is False:
         return True
     payload = doctor.get("json")
-    for value in _walk_values(payload):
+    for value in walk_values(payload):
         if isinstance(value, dict):
             state = str(value.get("state") or value.get("status") or value.get("level") or "").lower()
             if state in {"fail", "failed", "broken", "error", "critical"}:
@@ -132,7 +112,7 @@ def _daemon_running_from_status(probes: list[dict[str, Any]]) -> bool | None:
     if status is None:
         return None
     payload = status.get("json")
-    for value in _walk_values(payload):
+    for value in walk_values(payload):
         if isinstance(value, dict):
             for key in ("daemon_running", "running", "healthy", "ok"):
                 if value.get(key) is True:
@@ -160,7 +140,7 @@ def _activity_seen(probes: list[dict[str, Any]]) -> bool:
         if probe is None or probe.get("ok") is not True:
             continue
         payload = probe.get("json")
-        for value in _walk_values(payload):
+        for value in walk_values(payload):
             if isinstance(value, dict):
                 for key in ("events", "decisions", "deletions", "candidates", "processes", "agents"):
                     raw = value.get(key)

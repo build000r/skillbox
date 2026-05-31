@@ -3471,6 +3471,27 @@ def unique_string_field_values(item: dict[str, Any], field: str) -> list[str]:
     return values
 
 
+def json_or_none(text: str) -> Any:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def walk_values(value: Any) -> list[Any]:
+    values = [value]
+    if isinstance(value, dict):
+        for nested in value.values():
+            values.extend(walk_values(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            values.extend(walk_values(nested))
+    return values
+
+
 def ensure_directory(path: Path, dry_run: bool) -> None:
     if dry_run:
         return

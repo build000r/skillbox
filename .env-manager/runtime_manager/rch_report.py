@@ -8,6 +8,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .shared import json_or_none, walk_values
+
 
 _HOOK_NEGATIVE_RE = re.compile(r"\b(not[\s-]+installed|missing|disabled|inactive)\b")
 _HOOK_POSITIVE_RE = re.compile(r"\b(installed|active|enabled)\b")
@@ -19,16 +21,6 @@ RCH_SAFE_PROBES = (
     ("check", ("check", "--json")),
     ("hook_status", ("hook", "status", "--json")),
 )
-
-
-def _json_or_none(text: str) -> Any:
-    raw = str(text or "").strip()
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return None
 
 
 def _run_rch_probe(binary: str, probe_id: str, args: tuple[str, ...], timeout_seconds: float) -> dict[str, Any]:
@@ -57,28 +49,17 @@ def _run_rch_probe(binary: str, probe_id: str, args: tuple[str, ...], timeout_se
         "command": " ".join(command),
         "ok": result.returncode == 0,
         "returncode": result.returncode,
-        "json": _json_or_none(result.stdout),
+        "json": json_or_none(result.stdout),
         "stdout": result.stdout.strip()[-2000:],
         "stderr": result.stderr.strip()[-2000:],
     }
-
-
-def _walk_values(value: Any) -> list[Any]:
-    values = [value]
-    if isinstance(value, dict):
-        for nested in value.values():
-            values.extend(_walk_values(nested))
-    elif isinstance(value, list):
-        for nested in value:
-            values.extend(_walk_values(nested))
-    return values
 
 
 def _worker_lists(probes: list[dict[str, Any]]) -> list[list[Any]]:
     lists: list[list[Any]] = []
     for probe in probes:
         payload = probe.get("json")
-        for value in _walk_values(payload):
+        for value in walk_values(payload):
             if isinstance(value, dict) and isinstance(value.get("workers"), list):
                 lists.append(value["workers"])
     return lists
