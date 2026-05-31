@@ -145,27 +145,12 @@ def _model_item_id(item: dict[str, Any]) -> str:
     return str(item.get("id", "")).strip()
 
 
-def _unique_raw_ids(item: dict[str, Any], field: str) -> list[str]:
-    raw_values = item.get(field) or []
-    if not isinstance(raw_values, list):
-        return []
-    result: list[str] = []
-    seen: set[str] = set()
-    for raw_value in raw_values:
-        item_id = str(raw_value).strip()
-        if not item_id or item_id in seen:
-            continue
-        result.append(item_id)
-        seen.add(item_id)
-    return result
-
-
 def raw_task_dependency_ids(task: dict[str, Any]) -> list[str]:
-    return _unique_raw_ids(task, "depends_on")
+    return unique_string_field_values(task, "depends_on")
 
 
 def raw_service_bootstrap_task_ids(service: dict[str, Any]) -> list[str]:
-    return _unique_raw_ids(service, "bootstrap_tasks")
+    return unique_string_field_values(service, "bootstrap_tasks")
 
 
 def _model_item_in_scope(item: dict[str, Any], active_profiles: set[str], active_clients: set[str]) -> bool:
