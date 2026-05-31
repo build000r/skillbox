@@ -53,14 +53,7 @@ def _read_lines_file(path_arg: str, invoke_cwd: Path) -> list[str]:
 
 
 def _dedupe(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        result.append(value)
-    return result
+    return list(dict.fromkeys(values))
 
 
 def _resolve_prompt(
