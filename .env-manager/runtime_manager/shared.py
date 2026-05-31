@@ -3455,6 +3455,22 @@ def find_duplicates(items: list[dict[str, Any]], field: str) -> list[str]:
     return duplicates
 
 
+def unique_string_field_values(item: dict[str, Any], field: str) -> list[str]:
+    raw_values = item.get(field) or []
+    if not isinstance(raw_values, list):
+        return []
+
+    values: list[str] = []
+    seen: set[str] = set()
+    for raw_value in raw_values:
+        value = str(raw_value).strip()
+        if not value or value in seen:
+            continue
+        values.append(value)
+        seen.add(value)
+    return values
+
+
 def ensure_directory(path: Path, dry_run: bool) -> None:
     if dry_run:
         return

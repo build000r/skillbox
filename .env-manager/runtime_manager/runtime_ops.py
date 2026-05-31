@@ -1511,35 +1511,11 @@ def task_id_map(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def task_dependency_ids(task: dict[str, Any]) -> list[str]:
-    raw_dependencies = task.get("depends_on") or []
-    if not isinstance(raw_dependencies, list):
-        return []
-
-    dependencies: list[str] = []
-    seen: set[str] = set()
-    for raw_dependency in raw_dependencies:
-        dependency_id = str(raw_dependency).strip()
-        if not dependency_id or dependency_id in seen:
-            continue
-        dependencies.append(dependency_id)
-        seen.add(dependency_id)
-    return dependencies
+    return unique_string_field_values(task, "depends_on")
 
 
 def service_bootstrap_task_ids(service: dict[str, Any]) -> list[str]:
-    raw_tasks = service.get("bootstrap_tasks") or []
-    if not isinstance(raw_tasks, list):
-        return []
-
-    task_ids: list[str] = []
-    seen: set[str] = set()
-    for raw_task in raw_tasks:
-        task_id = str(raw_task).strip()
-        if not task_id or task_id in seen:
-            continue
-        task_ids.append(task_id)
-        seen.add(task_id)
-    return task_ids
+    return unique_string_field_values(service, "bootstrap_tasks")
 
 
 def task_dependency_graph(model: dict[str, Any]) -> dict[str, list[str]]:
@@ -1654,19 +1630,7 @@ def _optional_service_artifact_unavailable_reason(
 
 
 def service_dependency_ids(service: dict[str, Any]) -> list[str]:
-    raw_dependencies = service.get("depends_on") or []
-    if not isinstance(raw_dependencies, list):
-        return []
-
-    dependencies: list[str] = []
-    seen: set[str] = set()
-    for raw_dependency in raw_dependencies:
-        dependency_id = str(raw_dependency).strip()
-        if not dependency_id or dependency_id in seen:
-            continue
-        dependencies.append(dependency_id)
-        seen.add(dependency_id)
-    return dependencies
+    return unique_string_field_values(service, "depends_on")
 
 
 def service_id_map(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
