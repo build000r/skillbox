@@ -1334,6 +1334,19 @@ def _build_parser() -> argparse.ArgumentParser:
     forge_propose_parser.add_argument("--dry-run", action="store_true")
     forge_propose_parser.add_argument("--min-sessions", type=int, default=5)
     forge_propose_parser.add_argument("--format", choices=("text", "json"), default="json")
+    forge_accept_parser = forge_subparsers.add_parser(
+        "accept",
+        help="Fast-forward merge a reviewed forge/<skill> proposal branch and log the decision.",
+    )
+    forge_accept_parser.add_argument("skill", help="Skill name to accept.")
+    forge_accept_parser.add_argument("--format", choices=("text", "json"), default="json")
+    forge_reject_parser = forge_subparsers.add_parser(
+        "reject",
+        help="Delete a forge/<skill> proposal branch and log a rejection reason.",
+    )
+    forge_reject_parser.add_argument("skill", help="Skill name to reject.")
+    forge_reject_parser.add_argument("--reason", default=None, help="Required non-empty rejection reason.")
+    forge_reject_parser.add_argument("--format", choices=("text", "json"), default="json")
 
     focus_parser = subparsers.add_parser(
         "focus",
@@ -1677,6 +1690,40 @@ def _handle_forge(args: argparse.Namespace, root_dir: Path) -> int:
             print(f"{prefix}: {payload['branch']}")
             print(f"repo: {payload['repo']}")
             print(f"watch_metric: {payload['watch_metric']}")
+        return EXIT_OK
+
+    if args.forge_action in {"accept", "reject"}:
+        try:
+            if args.forge_action == "accept":
+                payload = forge_accept(args.skill, root_dir=root_dir)
+            else:
+                payload = forge_reject(args.skill, reason=getattr(args, "reason", None), root_dir=root_dir)
+        except ForgeDecisionError as exc:
+            payload = {
+                "ok": False,
+                "code": exc.code,
+                "error": {
+                    "type": exc.code,
+                    "message": str(exc),
+                },
+            }
+            payload.update(exc.payload)
+            if args.format == "json":
+                emit_json(payload)
+            else:
+                print(f"{exc.code}: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            print(f"{payload['action']}: {payload['skill']}")
+            if payload.get("commit"):
+                print(f"commit: {payload['commit']}")
+            if payload.get("reason"):
+                print(f"reason: {payload['reason']}")
+            if payload.get("sync_next_action"):
+                print(payload["sync_next_action"])
         return EXIT_OK
 
     if args.forge_action != "init":
