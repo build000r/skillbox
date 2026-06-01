@@ -4693,10 +4693,19 @@ class ManifestValidationHotspotTests(unittest.TestCase):
             "runtime_manager.distribution.doctor.validate_distribution_doctor_checks",
             return_value=[distribution_result],
         ):
-            self.assertEqual(
-                validation_module.validate_skill_repo_sets({"skills": [{"id": "plain"}]}),
-                [distribution_result],
-            )
+            results = validation_module.validate_skill_repo_sets({"skills": [{"id": "plain"}]})
+
+        self.assertIn(distribution_result, results)
+        by_code = {result.code: result for result in results}
+        self.assertEqual(by_code["distribution"], distribution_result)
+        forge_codes = {
+            validation_module.SKILL_FORGE_HOOK_MISSING,
+            validation_module.SKILL_FORGE_UNSCORED,
+        }
+        unexpected_codes = set(by_code) - {"distribution"} - forge_codes
+        self.assertEqual(unexpected_codes, set())
+        for code in forge_codes & set(by_code):
+            self.assertEqual(by_code[code].status, "warn")
 
         repo_result = text_renderers_module.CheckResult("warn", "skill-repo-lock", "warn", {})
         with (
@@ -4712,12 +4721,18 @@ class ManifestValidationHotspotTests(unittest.TestCase):
             ),
             mock.patch("runtime_manager.validation._build_skill_repo_results", return_value=[repo_result]) as build_results,
         ):
-            self.assertEqual(
-                validation_module.validate_skill_repo_sets(
-                    {"skills": [{"id": "repo-set", "kind": "skill-repo-set"}]}
-                ),
-                [repo_result, distribution_result],
+            results = validation_module.validate_skill_repo_sets(
+                {"skills": [{"id": "repo-set", "kind": "skill-repo-set"}]}
             )
+        self.assertIn(repo_result, results)
+        self.assertIn(distribution_result, results)
+        by_code = {result.code: result for result in results}
+        self.assertEqual(by_code["skill-repo-lock"], repo_result)
+        self.assertEqual(by_code["distribution"], distribution_result)
+        unexpected_codes = set(by_code) - {"skill-repo-lock", "distribution"} - forge_codes
+        self.assertEqual(unexpected_codes, set())
+        for code in forge_codes & set(by_code):
+            self.assertEqual(by_code[code].status, "warn")
         build_results.assert_called_once()
 
     def test_install_skillset_bundles_reports_dry_run_and_extract_hashes(self) -> None:
