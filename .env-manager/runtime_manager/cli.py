@@ -1320,6 +1320,12 @@ def _build_parser() -> argparse.ArgumentParser:
     forge_init_parser.add_argument("--with-cron", action="store_true")
     forge_init_parser.add_argument("--scoring-script", default=None)
     forge_init_parser.add_argument("--format", choices=("text", "json"), default="json")
+    forge_status_parser = forge_subparsers.add_parser(
+        "status",
+        help="Show per-skill forge health from the skill review signal store.",
+    )
+    forge_status_parser.add_argument("--format", choices=("table", "json"), default="table")
+    forge_status_parser.add_argument("--skill", default=None, help="Limit status to one skill name.")
 
     focus_parser = subparsers.add_parser(
         "focus",
@@ -1624,7 +1630,14 @@ def _handle_first_box(args: argparse.Namespace, root_dir: Path) -> int:
 
 
 def _handle_forge(args: argparse.Namespace, root_dir: Path) -> int:
-    del root_dir
+    if args.forge_action == "status":
+        payload = forge_status(skill=args.skill, root_dir=root_dir)
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            print("\n".join(format_forge_status_table(payload)))
+        return EXIT_OK
+
     if args.forge_action != "init":
         message = f"Unsupported forge action: {args.forge_action}"
         if args.format == "json":

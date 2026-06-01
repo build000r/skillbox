@@ -4,9 +4,12 @@ import json
 import os
 import shlex
 import subprocess
+from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+FORGE_NO_SIGNAL = "FORGE_NO_SIGNAL"
 FORGE_INIT_SETTINGS_LOCKED = "FORGE_INIT_SETTINGS_LOCKED"
 FORGE_INIT_SETTINGS_INVALID = "FORGE_INIT_SETTINGS_INVALID"
 FORGE_INIT_CODEX_TMUX_MISSING = "FORGE_INIT_CODEX_TMUX_MISSING"
@@ -15,6 +18,22 @@ FORGE_INIT_CRON_UNAVAILABLE = "FORGE_INIT_CRON_UNAVAILABLE"
 CODEX_TMUX_MARKER_START = "# skillbox-forge-scoring-start"
 CODEX_TMUX_MARKER_END = "# skillbox-forge-scoring-end"
 CRON_MARKER = "# skillbox-forge-score-session"
+FORGE_METRICS = (
+    "ack_rate",
+    "validation_rate",
+    "checkpoint_rate",
+    "risk_gating_rate",
+    "correction_rate",
+    "completion_rate",
+)
+FORGE_LOW_IS_GOOD_METRICS = {"checkpoint_rate", "risk_gating_rate", "correction_rate"}
+FORGE_STATUS_THRESHOLDS = (
+    ("ack_rate", "<", 0.5),
+    ("validation_rate", "<", 0.4),
+    ("correction_rate", ">", 0.3),
+    ("completion_rate", "<", 0.5),
+)
+FORGE_TREND_EPSILON = 0.05
 
 
 class ForgeInitError(RuntimeError):
@@ -29,6 +48,10 @@ def default_scoring_script() -> Path:
 
 def _home_dir(home: Path | str | None = None) -> Path:
     return Path(home).expanduser() if home is not None else Path.home()
+
+
+def default_review_history_path(home: Path | str | None = None) -> Path:
+    return _home_dir(home) / ".claude" / "skill-review-history.jsonl"
 
 
 def _scoring_command(scoring_script: Path, source: str, extra: list[str] | None = None) -> str:
@@ -174,6 +197,262 @@ def ensure_cron_entry(scoring_script: Path, *, subprocess_run: Any = subprocess.
             "stderr": write.stderr.strip(),
         }
     return {"action": "added"}
+
+
+def _record_skill_name(record: dict[str, Any]) -> str:
+    return str(record.get("skill") or record.get("skill_name") or record.get("name") or "").strip()
+
+
+def _coerce_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _record_metrics(record: dict[str, Any]) -> dict[str, float]:
+    metrics = record.get("metrics")
+    if not isinstance(metrics, dict):
+        summary = record.get("summary")
+        metrics = summary.get("metrics") if isinstance(summary, dict) else {}
+    if not isinstance(metrics, dict):
+        metrics = {}
+    return {metric: round(_coerce_float(metrics.get(metric)), 3) for metric in FORGE_METRICS}
+
+
+def _record_scored_at(record: dict[str, Any]) -> str:
+    for key in ("timestamp", "scored_at", "generated_at", "date"):
+        value = record.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _parse_datetime(value: str) -> datetime:
+    if not value:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    text = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        try:
+            parsed = datetime.fromisoformat(f"{text}T00:00:00+00:00")
+        except ValueError:
+            return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def load_review_history(
+    history_path: Path | str | None = None,
+    *,
+    home: Path | str | None = None,
+    skill: str | None = None,
+) -> list[dict[str, Any]]:
+    path = Path(history_path).expanduser() if history_path is not None else default_review_history_path(home)
+    if not path.exists():
+        return []
+
+    records: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            skill_name = _record_skill_name(record)
+            if not skill_name:
+                continue
+            if skill and skill_name != skill:
+                continue
+            records.append(record)
+    return records
+
+
+def _average_metrics(records: list[dict[str, Any]]) -> dict[str, float]:
+    if not records:
+        return {metric: 0.0 for metric in FORGE_METRICS}
+    totals = {metric: 0.0 for metric in FORGE_METRICS}
+    for record in records:
+        metrics = _record_metrics(record)
+        for metric in FORGE_METRICS:
+            totals[metric] += metrics[metric]
+    return {metric: round(totals[metric] / len(records), 3) for metric in FORGE_METRICS}
+
+
+def _health_score(metrics: dict[str, float]) -> float:
+    values: list[float] = []
+    for metric in FORGE_METRICS:
+        value = max(0.0, min(1.0, metrics.get(metric, 0.0)))
+        values.append(1.0 - value if metric in FORGE_LOW_IS_GOOD_METRICS else value)
+    return sum(values) / len(values) if values else 0.0
+
+
+def _trend(records: list[dict[str, Any]]) -> str:
+    if len(records) < 6:
+        return "stable"
+    previous_score = _health_score(_average_metrics(records[-6:-3]))
+    recent_score = _health_score(_average_metrics(records[-3:]))
+    delta = recent_score - previous_score
+    if delta <= -FORGE_TREND_EPSILON:
+        return "declining"
+    if delta >= FORGE_TREND_EPSILON:
+        return "improving"
+    return "stable"
+
+
+def _threshold_label(metric: str, operator: str, threshold: float) -> str:
+    return f"{metric} {operator} {threshold:g}"
+
+
+def thresholds_crossed(metrics: dict[str, float]) -> list[str]:
+    crossed: list[str] = []
+    for metric, operator, threshold in FORGE_STATUS_THRESHOLDS:
+        value = metrics.get(metric, 0.0)
+        if operator == "<" and value < threshold:
+            crossed.append(_threshold_label(metric, operator, threshold))
+        elif operator == ">" and value > threshold:
+            crossed.append(_threshold_label(metric, operator, threshold))
+    return crossed
+
+
+def pending_forge_skills(
+    root_dir: Path | str,
+    *,
+    subprocess_run: Any = subprocess.run,
+) -> set[str]:
+    clone_root = Path(root_dir) / "workspace" / "skill-repos"
+    if not clone_root.is_dir():
+        return set()
+
+    pending: set[str] = set()
+    for repo_dir in clone_root.iterdir():
+        if not repo_dir.is_dir():
+            continue
+        result = subprocess_run(
+            [
+                "git",
+                "-C",
+                str(repo_dir),
+                "branch",
+                "--list",
+                "forge/*",
+                "--format",
+                "%(refname:short)",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            continue
+        for line in (result.stdout or "").splitlines():
+            branch = line.strip()
+            if branch.startswith("forge/") and len(branch) > len("forge/"):
+                pending.add(branch[len("forge/"):])
+    return pending
+
+
+def scoring_hook_installed(
+    *,
+    home: Path | str | None = None,
+    scoring_script: Path | str | None = None,
+) -> bool:
+    settings_path = _home_dir(home) / ".claude" / "settings.json"
+    if not settings_path.exists():
+        return False
+    score_path = Path(scoring_script).expanduser() if scoring_script else default_scoring_script()
+    try:
+        settings = _load_json_object(settings_path)
+    except ForgeInitError:
+        return False
+    hooks = settings.get("hooks")
+    session_end = hooks.get("SessionEnd") if isinstance(hooks, dict) else []
+    return _session_end_hook_present(session_end, score_path.resolve())
+
+
+def forge_status(
+    *,
+    skill: str | None = None,
+    home: Path | str | None = None,
+    history_path: Path | str | None = None,
+    root_dir: Path | str | None = None,
+    scoring_script: Path | str | None = None,
+    subprocess_run: Any = subprocess.run,
+) -> dict[str, Any]:
+    records = load_review_history(history_path, home=home, skill=skill)
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        grouped[_record_skill_name(record)].append(record)
+
+    pending = pending_forge_skills(root_dir or Path.cwd(), subprocess_run=subprocess_run)
+    skills: list[dict[str, Any]] = []
+    for skill_name in sorted(grouped):
+        skill_records = sorted(grouped[skill_name], key=lambda item: _parse_datetime(_record_scored_at(item)))
+        metrics = _average_metrics(skill_records[-3:])
+        skills.append(
+            {
+                "name": skill_name,
+                "sessions_scored": len(skill_records),
+                "trend": _trend(skill_records),
+                "metrics": metrics,
+                "thresholds_crossed": thresholds_crossed(metrics),
+                "proposal_pending": skill_name in pending,
+                "last_scored": _record_scored_at(skill_records[-1]) if skill_records else None,
+            }
+        )
+
+    payload: dict[str, Any] = {
+        "skills": skills,
+        "total_sessions_scored": sum(item["sessions_scored"] for item in skills),
+        "scoring_hook_installed": scoring_hook_installed(home=home, scoring_script=scoring_script),
+        "unscored_sessions": 0,
+    }
+    if not skills:
+        payload["code"] = FORGE_NO_SIGNAL
+        payload["message"] = "no signal yet"
+    return payload
+
+
+def format_forge_status_table(payload: dict[str, Any]) -> list[str]:
+    skills = payload.get("skills") if isinstance(payload.get("skills"), list) else []
+    if not skills:
+        return [f"{payload.get('code', FORGE_NO_SIGNAL)}: {payload.get('message', 'no signal yet')}"]
+
+    headers = ["Skill", "Sessions", "Trend", "Thresholds Crossed", "Pending", "Last Scored"]
+    rows: list[list[str]] = []
+    for item in skills:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            [
+                str(item.get("name") or ""),
+                str(item.get("sessions_scored") or 0),
+                str(item.get("trend") or "stable"),
+                ", ".join(str(value) for value in item.get("thresholds_crossed") or []) or "(none)",
+                "yes" if item.get("proposal_pending") else "no",
+                str(item.get("last_scored") or ""),
+            ]
+        )
+
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(cell))
+
+    def render_row(row: list[str]) -> str:
+        return "  ".join(cell.ljust(widths[index]) for index, cell in enumerate(row)).rstrip()
+
+    return [
+        render_row(headers),
+        render_row(["-" * width for width in widths]),
+        *[render_row(row) for row in rows],
+    ]
 
 
 def forge_init(
