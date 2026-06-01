@@ -7103,7 +7103,14 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertFalse(payload["ready"])
             self.assertEqual(steps["mcp-smoke"]["status"], "ok")
             self.assertEqual(steps["workflow-probe"]["status"], "fail")
-            self.assertEqual(steps["doctor-post"]["status"], "ok")
+            self.assertIn(steps["doctor-post"]["status"], {"ok", "warn"})
+            self.assertFalse(
+                [
+                    check
+                    for check in steps["doctor-post"]["detail"]["checks"]
+                    if check.get("status") == "fail"
+                ]
+            )
             self.assertEqual(payload["error"]["type"], "acceptance_probe_failed")
             self.assertIn("logs --client personal --format json", payload["next_actions"])
             self.assertEqual(steps["workflow-probe"]["detail"]["exit_code"], 3)

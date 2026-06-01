@@ -25,6 +25,7 @@ from runtime_manager.forge import (  # noqa: E402
     FORGE_NO_SIGNAL,
     FORGE_REASON_REQUIRED,
     FORGE_REPO_DIRTY,
+    FORGE_SKILL_NOT_FOUND,
     ForgeDecisionError,
     ForgeProposeError,
     forge_accept,
@@ -462,6 +463,102 @@ class ForgeDoctorTests(unittest.TestCase):
         self.assertEqual(by_code[SKILL_FORGE_HOOK_MISSING]["status"], "warn")
         self.assertEqual(by_code[SKILL_FORGE_UNSCORED]["status"], "warn")
 
+    def test_doctor_hook_present_suppresses_hook_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "root"
+            home = Path(tmpdir) / "home"
+            scoring_script = Path(tmpdir) / "score-session.sh"
+            root.mkdir()
+            scoring_script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+            forge_init(
+                home=home,
+                scoring_script=scoring_script,
+                codex_tmux_run_py=Path(tmpdir) / "missing.py",
+            )
+
+            results = validate_forge_health(
+                self._minimal_model(root),
+                home=home,
+                scoring_script=scoring_script,
+            )
+
+        self.assertNotIn(SKILL_FORGE_HOOK_MISSING, {result.code for result in results})
+
+    def test_doctor_stale_state_is_reported_without_pending_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "root"
+            home = Path(tmpdir) / "home"
+            scoring_script = Path(tmpdir) / "score-session.sh"
+            root.mkdir()
+            scoring_script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+            forge_init(
+                home=home,
+                scoring_script=scoring_script,
+                codex_tmux_run_py=Path(tmpdir) / "missing.py",
+            )
+            for index in range(3):
+                self._append_history(home, "describe", index, self._metrics(validation_rate=0.9))
+            for index in range(3, 6):
+                self._append_history(home, "describe", index, self._metrics(validation_rate=0.1))
+
+            results = validate_forge_health(
+                self._minimal_model(root),
+                home=home,
+                scoring_script=scoring_script,
+            )
+
+        by_code = {result.code: result for result in results}
+        self.assertEqual(set(by_code), {SKILL_FORGE_STALE})
+        self.assertEqual(by_code[SKILL_FORGE_STALE].details["skill"], "describe")
+
+    def test_doctor_pending_state_is_reported_without_stale_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "root"
+            home = Path(tmpdir) / "home"
+            scoring_script = Path(tmpdir) / "score-session.sh"
+            root.mkdir()
+            scoring_script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+            forge_init(
+                home=home,
+                scoring_script=scoring_script,
+                codex_tmux_run_py=Path(tmpdir) / "missing.py",
+            )
+            self._create_pending_branch(root, "ask-cascade")
+
+            results = validate_forge_health(
+                self._minimal_model(root),
+                home=home,
+                scoring_script=scoring_script,
+            )
+
+        by_code = {result.code: result for result in results}
+        self.assertEqual(set(by_code), {SKILL_FORGE_PENDING})
+        self.assertEqual(by_code[SKILL_FORGE_PENDING].details["skill"], "ask-cascade")
+
+    def test_doctor_unscored_state_is_reported_without_stale_or_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "root"
+            home = Path(tmpdir) / "home"
+            scoring_script = Path(tmpdir) / "score-session.sh"
+            root.mkdir()
+            scoring_script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+            forge_init(
+                home=home,
+                scoring_script=scoring_script,
+                codex_tmux_run_py=Path(tmpdir) / "missing.py",
+            )
+            self._write_unscored_transcripts(home, 3)
+
+            results = validate_forge_health(
+                self._minimal_model(root),
+                home=home,
+                scoring_script=scoring_script,
+            )
+
+        by_code = {result.code: result for result in results}
+        self.assertEqual(set(by_code), {SKILL_FORGE_UNSCORED})
+        self.assertEqual(by_code[SKILL_FORGE_UNSCORED].details["unscored_sessions"], 3)
+
 
 class ForgeProposeTests(unittest.TestCase):
     def _git(self, repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -500,8 +597,13 @@ class ForgeProposeTests(unittest.TestCase):
                 handle.write(json.dumps(record) + "\n")
         return history
 
-    def _create_skill_repo(self, root: Path, skill: str = "ask-cascade") -> Path:
-        repo = root / "workspace" / "skill-repos" / "fixture-skills"
+    def _create_skill_repo(
+        self,
+        root: Path,
+        skill: str = "ask-cascade",
+        repo_name: str = "fixture-skills",
+    ) -> Path:
+        repo = root / "workspace" / "skill-repos" / repo_name
         skill_dir = repo / skill
         skill_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(
@@ -633,6 +735,63 @@ class ForgeProposeTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.code, FORGE_BRANCH_EXISTS)
 
+    def test_propose_missing_skill_source_returns_stable_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "root"
+            home = Path(tmpdir) / "home"
+            self._append_history(home, "missing-skill", 5)
+
+            with self.assertRaises(ForgeProposeError) as ctx:
+                forge_propose("missing-skill", root_dir=root, home=home)
+
+        self.assertEqual(ctx.exception.code, FORGE_SKILL_NOT_FOUND)
+        self.assertEqual(ctx.exception.payload["skill"], "missing-skill")
+
+    def test_propose_uses_first_matching_managed_skill_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "root"
+            home = Path(tmpdir) / "home"
+            first = self._create_skill_repo(root, repo_name="a-first-skills")
+            second = self._create_skill_repo(root, repo_name="z-second-skills")
+            self._append_history(home, "ask-cascade", 5)
+
+            payload = forge_propose("ask-cascade", root_dir=root, home=home)
+
+            self.assertEqual(Path(payload["repo"]), first.resolve())
+            self.assertIn(
+                "Skillbox Forge Proposal",
+                (first / "ask-cascade" / "SKILL.md").read_text(encoding="utf-8"),
+            )
+            self.assertNotIn(
+                "Skillbox Forge Proposal",
+                (second / "ask-cascade" / "SKILL.md").read_text(encoding="utf-8"),
+            )
+
+    def test_missing_skill_issue_leaves_empty_signal_and_propose_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "root"
+            home = Path(tmpdir) / "home"
+            self._create_skill_repo(root)
+            env = {**os.environ, "HOME": str(home)}
+
+            score = subprocess.run(
+                ["bash", "scripts/score-session.sh", "--source", "claude"],
+                cwd=ROOT_DIR,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            status = forge_status(home=home, root_dir=root)
+            with self.assertRaises(ForgeProposeError) as ctx:
+                forge_propose("ask-cascade", root_dir=root, home=home)
+
+        self.assertEqual(score.returncode, 0, score.stderr)
+        self.assertEqual(status["code"], FORGE_NO_SIGNAL)
+        self.assertEqual(ctx.exception.code, FORGE_INSUFFICIENT_SIGNAL)
+        self.assertEqual(ctx.exception.payload["sessions_scored"], 0)
+
     def test_accept_merges_forge_branch_deletes_it_and_logs_decision(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / "root"
@@ -701,6 +860,42 @@ class ForgeProposeTests(unittest.TestCase):
                 forge_accept("ask-cascade", root_dir=root, home=home)
 
         self.assertEqual(ctx.exception.code, FORGE_REPO_DIRTY)
+
+    def test_accept_diverged_base_branch_returns_error_and_keeps_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "root"
+            home = Path(tmpdir) / "home"
+            repo = self._create_skill_repo(root)
+            self._append_history(home, "ask-cascade", 5)
+            forge_propose("ask-cascade", root_dir=root, home=home)
+            self._git(repo, "checkout", "-q", "main")
+            skill_md = repo / "ask-cascade" / "SKILL.md"
+            skill_md.write_text(
+                skill_md.read_text(encoding="utf-8") + "\nMain branch edit.\n",
+                encoding="utf-8",
+            )
+            self._git(repo, "add", "ask-cascade/SKILL.md")
+            self._git(
+                repo,
+                "-c",
+                "user.email=forge@example.test",
+                "-c",
+                "user.name=Forge Test",
+                "commit",
+                "-q",
+                "-m",
+                "diverge main",
+            )
+
+            with self.assertRaises(ForgeDecisionError) as ctx:
+                forge_accept("ask-cascade", root_dir=root, home=home)
+
+            branches = self._git(repo, "branch", "--list", "forge/*", "--format", "%(refname:short)").stdout
+
+        self.assertEqual(ctx.exception.code, FORGE_NO_PROPOSAL)
+        self.assertEqual(ctx.exception.payload["branch"], "forge/ask-cascade")
+        self.assertEqual(ctx.exception.payload["base_branch"], "main")
+        self.assertIn("forge/ask-cascade", branches)
 
     def test_accept_without_forge_branch_returns_stable_code(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

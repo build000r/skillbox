@@ -188,6 +188,72 @@ output includes the source declaration, expected contract, actual runtime
 evidence, and next safe action for every non-ready row. `stewardship-report`
 includes a compact dev/prod parity evidence summary.
 
+## Skillbox Forge
+
+Skillbox Forge is the operator loop for turning real agent-session signal into
+reviewed skill updates. It is passive by default: hooks collect evidence, status
+summarizes the signal store, and proposals stay on `forge/<skill>` branches
+until you explicitly accept or reject them.
+
+Bootstrap the scoring hooks once:
+
+```bash
+python3 .env-manager/manage.py forge init --format json
+# optional fallback for missed session hooks
+python3 .env-manager/manage.py forge init --with-cron --format json
+```
+
+`forge init` is idempotent. It adds a Claude Code `SessionEnd` hook, patches the
+installed `codex-tmux` wrapper when present, and can add a cron fallback. The
+hook target is `scripts/score-session.sh`; it exits 0 when `skill-issue` is not
+installed or no new transcripts are available, so session teardown is not
+blocked by scoring.
+
+After normal Claude/Codex work accumulates signal in
+`~/.claude/skill-review-history.jsonl`, inspect it:
+
+```bash
+python3 .env-manager/manage.py forge status
+python3 .env-manager/manage.py forge status --skill ask-cascade --format json
+```
+
+When a skill has enough scored sessions, create a reviewable proposal:
+
+```bash
+python3 .env-manager/manage.py forge propose ask-cascade --dry-run
+python3 .env-manager/manage.py forge propose ask-cascade --min-sessions 5
+```
+
+`forge propose` requires a clean skill repo, sufficient signal, and no existing
+`forge/<skill>` branch. It writes a minimal `SKILL.md` mutation on that branch
+and logs the proposal to `~/.claude/forge-proposals.jsonl`. Review the branch
+diff in the skill repo before deciding:
+
+```bash
+git -C workspace/skill-repos/<repo> diff main..forge/ask-cascade
+python3 .env-manager/manage.py forge accept ask-cascade
+# or
+python3 .env-manager/manage.py forge reject ask-cascade --reason "too broad"
+```
+
+Accept fast-forward merges the proposal, deletes the forge branch, and logs to
+`~/.claude/forge-decisions.jsonl`. Reject deletes the branch and records the
+reason. After accepting, run the normal skill installation path so agent homes
+pick up the reviewed skill change:
+
+```bash
+make runtime-sync
+make dev-sanity
+```
+
+`make doctor` surfaces Forge trust checks without mutating state:
+`SKILL_FORGE_HOOK_MISSING` when hooks are absent, `SKILL_FORGE_STALE` when
+declining scored signal has no proposal, `SKILL_FORGE_PENDING` for open
+`forge/*` branches, and `SKILL_FORGE_UNSCORED` when recent transcripts have not
+been scored. Dirty repos, existing proposal branches, missing skills, and
+fast-forward failures are intentional stop conditions; inspect and resolve the
+skill repo before rerunning the Forge command.
+
 ## Local Runtime Profiles
 
 Client overlays declare **local runtime profiles** — namespaced service groups
