@@ -21,11 +21,16 @@ from runtime_manager.forge import (  # noqa: E402
     CRON_MARKER,
     FORGE_BRANCH_EXISTS,
     FORGE_INSUFFICIENT_SIGNAL,
+    FORGE_NO_PROPOSAL,
     FORGE_NO_SIGNAL,
+    FORGE_REASON_REQUIRED,
     FORGE_REPO_DIRTY,
+    ForgeDecisionError,
     ForgeProposeError,
+    forge_accept,
     forge_init,
     forge_propose,
+    forge_reject,
     forge_status,
 )
 
@@ -497,6 +502,97 @@ class ForgeProposeTests(unittest.TestCase):
             self.assertEqual(len(ledger.read_text(encoding="utf-8").splitlines()), 1)
 
         self.assertEqual(ctx.exception.code, FORGE_BRANCH_EXISTS)
+
+    def test_accept_merges_forge_branch_deletes_it_and_logs_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "root"
+            home = Path(tmpdir) / "home"
+            repo = self._create_skill_repo(root)
+            self._append_history(home, "ask-cascade", 5)
+            proposal = forge_propose("ask-cascade", root_dir=root, home=home)
+
+            payload = forge_accept("ask-cascade", root_dir=root, home=home)
+
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["action"], "accepted")
+            self.assertEqual(payload["skill"], "ask-cascade")
+            self.assertEqual(payload["commit"], proposal["commit"])
+            self.assertEqual(payload["base_branch"], "main")
+            self.assertIn("runtime-sync", payload["sync_next_action"])
+            self.assertEqual(payload["observation_window"]["sessions"], 5)
+            self.assertEqual(self._git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip(), "main")
+            branches = self._git(repo, "branch", "--list", "forge/*", "--format", "%(refname:short)").stdout
+            self.assertEqual(branches.strip(), "")
+            self.assertIn("Skillbox Forge Proposal", (repo / "ask-cascade" / "SKILL.md").read_text(encoding="utf-8"))
+
+            ledger = home / ".claude" / "forge-decisions.jsonl"
+            records = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["skill"], "ask-cascade")
+            self.assertEqual(records[0]["action"], "accepted")
+            self.assertEqual(records[0]["commit"], proposal["commit"])
+            self.assertEqual(records[0]["observation_window"]["sessions"], 5)
+
+    def test_reject_deletes_forge_branch_and_logs_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "root"
+            home = Path(tmpdir) / "home"
+            repo = self._create_skill_repo(root)
+            self._append_history(home, "ask-cascade", 5)
+            forge_propose("ask-cascade", root_dir=root, home=home)
+
+            payload = forge_reject("ask-cascade", reason="too vague", root_dir=root, home=home)
+
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["action"], "rejected")
+            self.assertEqual(payload["reason"], "too vague")
+            self.assertEqual(payload["base_branch"], "main")
+            self.assertEqual(payload["observation_window"]["sessions"], 5)
+            self.assertEqual(self._git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip(), "main")
+            branches = self._git(repo, "branch", "--list", "forge/*", "--format", "%(refname:short)").stdout
+            self.assertEqual(branches.strip(), "")
+
+            ledger = home / ".claude" / "forge-decisions.jsonl"
+            records = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(records[0]["skill"], "ask-cascade")
+            self.assertEqual(records[0]["action"], "rejected")
+            self.assertEqual(records[0]["reason"], "too vague")
+
+    def test_accept_dirty_repo_returns_stable_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "root"
+            home = Path(tmpdir) / "home"
+            repo = self._create_skill_repo(root)
+            self._append_history(home, "ask-cascade", 5)
+            forge_propose("ask-cascade", root_dir=root, home=home)
+            (repo / "README.md").write_text("dirty\n", encoding="utf-8")
+
+            with self.assertRaises(ForgeDecisionError) as ctx:
+                forge_accept("ask-cascade", root_dir=root, home=home)
+
+        self.assertEqual(ctx.exception.code, FORGE_REPO_DIRTY)
+
+    def test_accept_without_forge_branch_returns_stable_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "root"
+            home = Path(tmpdir) / "home"
+            self._create_skill_repo(root)
+
+            with self.assertRaises(ForgeDecisionError) as ctx:
+                forge_accept("ask-cascade", root_dir=root, home=home)
+
+        self.assertEqual(ctx.exception.code, FORGE_NO_PROPOSAL)
+
+    def test_reject_without_reason_returns_stable_code(self) -> None:
+        emitted: list[dict[str, object]] = []
+        with (
+            mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
+        ):
+            exit_code = CLI.main(["forge", "reject", "ask-cascade", "--format", "json"])
+
+        self.assertEqual(exit_code, CLI.EXIT_ERROR)
+        self.assertEqual(emitted[-1]["code"], FORGE_REASON_REQUIRED)
+        self.assertEqual(emitted[-1]["error"]["type"], FORGE_REASON_REQUIRED)
 
     def test_propose_cli_outputs_json_error_code(self) -> None:
         emitted: list[dict[str, object]] = []

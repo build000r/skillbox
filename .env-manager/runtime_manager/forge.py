@@ -13,6 +13,8 @@ FORGE_NO_SIGNAL = "FORGE_NO_SIGNAL"
 FORGE_INSUFFICIENT_SIGNAL = "FORGE_INSUFFICIENT_SIGNAL"
 FORGE_REPO_DIRTY = "FORGE_REPO_DIRTY"
 FORGE_BRANCH_EXISTS = "FORGE_BRANCH_EXISTS"
+FORGE_NO_PROPOSAL = "FORGE_NO_PROPOSAL"
+FORGE_REASON_REQUIRED = "FORGE_REASON_REQUIRED"
 FORGE_SKILL_NOT_FOUND = "FORGE_SKILL_NOT_FOUND"
 FORGE_INIT_SETTINGS_LOCKED = "FORGE_INIT_SETTINGS_LOCKED"
 FORGE_INIT_SETTINGS_INVALID = "FORGE_INIT_SETTINGS_INVALID"
@@ -53,6 +55,13 @@ class ForgeProposeError(RuntimeError):
         self.payload = payload or {}
 
 
+class ForgeDecisionError(RuntimeError):
+    def __init__(self, code: str, message: str, payload: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.payload = payload or {}
+
+
 def default_scoring_script() -> Path:
     return Path(__file__).resolve().parents[2] / "scripts" / "score-session.sh"
 
@@ -67,6 +76,10 @@ def default_review_history_path(home: Path | str | None = None) -> Path:
 
 def default_proposals_path(home: Path | str | None = None) -> Path:
     return _home_dir(home) / ".claude" / "forge-proposals.jsonl"
+
+
+def default_decisions_path(home: Path | str | None = None) -> Path:
+    return _home_dir(home) / ".claude" / "forge-decisions.jsonl"
 
 
 def _scoring_command(scoring_script: Path, source: str, extra: list[str] | None = None) -> str:
@@ -600,6 +613,118 @@ def _append_ledger(path: Path, payload: dict[str, Any]) -> None:
         handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
+def _load_latest_proposal(
+    skill: str,
+    *,
+    home: Path | str | None = None,
+    proposals_path: Path | str | None = None,
+) -> dict[str, Any] | None:
+    path = Path(proposals_path).expanduser() if proposals_path is not None else default_proposals_path(home)
+    if not path.exists():
+        return None
+    latest: dict[str, Any] | None = None
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict) and str(record.get("skill") or "") == skill:
+                latest = record
+    return latest
+
+
+def _proposal_context(proposal: dict[str, Any] | None) -> dict[str, Any]:
+    if not proposal:
+        return {}
+    evidence_sessions = [str(item) for item in proposal.get("evidence_sessions") or [] if str(item).strip()]
+    context: dict[str, Any] = {
+        "proposal_id": proposal.get("proposal_id"),
+        "watch_metric": proposal.get("watch_metric"),
+        "baseline": proposal.get("baseline"),
+        "evidence_sessions": evidence_sessions,
+    }
+    if evidence_sessions:
+        context["observation_window"] = {
+            "sessions": len(evidence_sessions),
+            "from": evidence_sessions[0],
+            "to": evidence_sessions[-1],
+        }
+    else:
+        sessions_scored = proposal.get("sessions_scored")
+        if sessions_scored is not None:
+            context["observation_window"] = {"sessions": sessions_scored}
+    return {key: value for key, value in context.items() if value not in (None, "", [])}
+
+
+def _local_branches(repo: Path, *, subprocess_run: Any = subprocess.run) -> set[str]:
+    result = _run_git(repo, ["branch", "--format", "%(refname:short)"], subprocess_run=subprocess_run)
+    if result.returncode != 0:
+        return set()
+    return {line.strip() for line in (result.stdout or "").splitlines() if line.strip()}
+
+
+def _current_branch(repo: Path, *, subprocess_run: Any = subprocess.run) -> str:
+    return _git_stdout(repo, ["rev-parse", "--abbrev-ref", "HEAD"], subprocess_run=subprocess_run)
+
+
+def _default_base_branch(repo: Path, forge_branch: str, *, subprocess_run: Any = subprocess.run) -> str:
+    branches = _local_branches(repo, subprocess_run=subprocess_run)
+    for candidate in ("main", "master"):
+        if candidate in branches and candidate != forge_branch:
+            return candidate
+    current = _current_branch(repo, subprocess_run=subprocess_run)
+    if current and current != forge_branch:
+        return current
+    for branch in sorted(branches):
+        if branch != forge_branch and not branch.startswith("forge/"):
+            return branch
+    raise ForgeDecisionError(
+        FORGE_NO_PROPOSAL,
+        f"could not identify a base branch for {forge_branch}",
+        {"branch": forge_branch, "branches": sorted(branches)},
+    )
+
+
+def _ensure_proposal_branch(repo: Path, branch: str, skill: str, *, subprocess_run: Any = subprocess.run) -> None:
+    if not _branch_exists(repo, branch, subprocess_run=subprocess_run):
+        raise ForgeDecisionError(
+            FORGE_NO_PROPOSAL,
+            f"forge branch does not exist: {branch}",
+            {"skill": skill, "repo": str(repo), "branch": branch},
+        )
+
+
+def _checkout_branch(repo: Path, branch: str, *, subprocess_run: Any = subprocess.run) -> None:
+    result = _run_git(repo, ["checkout", "-q", branch], subprocess_run=subprocess_run)
+    if result.returncode != 0:
+        raise ForgeDecisionError(FORGE_NO_PROPOSAL, result.stderr.strip() or f"could not checkout {branch}", {"branch": branch})
+
+
+def _decision_payload(
+    *,
+    action: str,
+    skill: str,
+    repo: Path,
+    branch: str,
+    home: Path | str | None,
+    proposals_path: Path | str | None,
+) -> dict[str, Any]:
+    proposal = _load_latest_proposal(skill, home=home, proposals_path=proposals_path)
+    payload: dict[str, Any] = {
+        "ok": True,
+        "skill": skill,
+        "action": action,
+        "repo": str(repo),
+        "branch": branch,
+        "decided_at": datetime.now(timezone.utc).isoformat(),
+    }
+    payload.update(_proposal_context(proposal))
+    return payload
+
+
 def forge_propose(
     skill: str,
     *,
@@ -712,6 +837,127 @@ def forge_propose(
 
     payload["commit"] = _git_stdout(repo, ["rev-parse", "HEAD"], subprocess_run=subprocess_run)
     ledger = Path(proposals_path).expanduser() if proposals_path is not None else default_proposals_path(home)
+    _append_ledger(ledger, payload)
+    payload["ledger"] = str(ledger)
+    return payload
+
+
+def forge_accept(
+    skill: str,
+    *,
+    home: Path | str | None = None,
+    root_dir: Path | str | None = None,
+    skill_dir: Path | str | None = None,
+    proposals_path: Path | str | None = None,
+    decisions_path: Path | str | None = None,
+    base_branch: str | None = None,
+    subprocess_run: Any = subprocess.run,
+) -> dict[str, Any]:
+    source = resolve_skill_source(
+        skill,
+        root_dir=root_dir,
+        home=home,
+        skill_dir=skill_dir,
+        subprocess_run=subprocess_run,
+    )
+    repo = Path(source["repo"])
+    branch = f"forge/{skill}"
+    _ensure_proposal_branch(repo, branch, skill, subprocess_run=subprocess_run)
+    try:
+        _ensure_clean_repo(repo, subprocess_run=subprocess_run)
+    except ForgeProposeError as exc:
+        raise ForgeDecisionError(exc.code, str(exc), exc.payload) from exc
+
+    target_branch = base_branch or _default_base_branch(repo, branch, subprocess_run=subprocess_run)
+    _checkout_branch(repo, target_branch, subprocess_run=subprocess_run)
+    merge = _run_git(repo, ["merge", "--ff-only", branch], subprocess_run=subprocess_run)
+    if merge.returncode != 0:
+        raise ForgeDecisionError(
+            FORGE_NO_PROPOSAL,
+            merge.stderr.strip() or f"could not fast-forward merge {branch}",
+            {"skill": skill, "repo": str(repo), "branch": branch, "base_branch": target_branch},
+        )
+    commit = _git_stdout(repo, ["rev-parse", "HEAD"], subprocess_run=subprocess_run)
+    delete = _run_git(repo, ["branch", "-d", branch], subprocess_run=subprocess_run)
+    if delete.returncode != 0:
+        raise ForgeDecisionError(
+            FORGE_NO_PROPOSAL,
+            delete.stderr.strip() or f"could not delete {branch}",
+            {"skill": skill, "repo": str(repo), "branch": branch, "base_branch": target_branch},
+        )
+
+    payload = _decision_payload(
+        action="accepted",
+        skill=skill,
+        repo=repo,
+        branch=branch,
+        home=home,
+        proposals_path=proposals_path,
+    )
+    payload.update(
+        {
+            "commit": commit,
+            "base_branch": target_branch,
+            "sync_next_action": "Run `make runtime-sync` to install reviewed skill changes.",
+        }
+    )
+    ledger = Path(decisions_path).expanduser() if decisions_path is not None else default_decisions_path(home)
+    _append_ledger(ledger, payload)
+    payload["ledger"] = str(ledger)
+    return payload
+
+
+def forge_reject(
+    skill: str,
+    *,
+    reason: str | None,
+    home: Path | str | None = None,
+    root_dir: Path | str | None = None,
+    skill_dir: Path | str | None = None,
+    proposals_path: Path | str | None = None,
+    decisions_path: Path | str | None = None,
+    base_branch: str | None = None,
+    subprocess_run: Any = subprocess.run,
+) -> dict[str, Any]:
+    clean_reason = str(reason or "").strip()
+    if not clean_reason:
+        raise ForgeDecisionError(FORGE_REASON_REQUIRED, "reject requires a non-empty --reason", {"skill": skill})
+
+    source = resolve_skill_source(
+        skill,
+        root_dir=root_dir,
+        home=home,
+        skill_dir=skill_dir,
+        subprocess_run=subprocess_run,
+    )
+    repo = Path(source["repo"])
+    branch = f"forge/{skill}"
+    _ensure_proposal_branch(repo, branch, skill, subprocess_run=subprocess_run)
+    current_branch = _current_branch(repo, subprocess_run=subprocess_run)
+    if current_branch == branch:
+        target_branch = base_branch or _default_base_branch(repo, branch, subprocess_run=subprocess_run)
+        _checkout_branch(repo, target_branch, subprocess_run=subprocess_run)
+    else:
+        target_branch = current_branch
+
+    delete = _run_git(repo, ["branch", "-D", branch], subprocess_run=subprocess_run)
+    if delete.returncode != 0:
+        raise ForgeDecisionError(
+            FORGE_NO_PROPOSAL,
+            delete.stderr.strip() or f"could not delete {branch}",
+            {"skill": skill, "repo": str(repo), "branch": branch},
+        )
+
+    payload = _decision_payload(
+        action="rejected",
+        skill=skill,
+        repo=repo,
+        branch=branch,
+        home=home,
+        proposals_path=proposals_path,
+    )
+    payload.update({"reason": clean_reason, "base_branch": target_branch})
+    ledger = Path(decisions_path).expanduser() if decisions_path is not None else default_decisions_path(home)
     _append_ledger(ledger, payload)
     payload["ledger"] = str(ledger)
     return payload
