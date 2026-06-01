@@ -24,6 +24,7 @@ from .rch_report import *
 from .rch_adapter import *
 from .sbh_report import *
 from .evidence import *
+from .forge import *
 from .swimmers_launch import launch_swimmers_batch, swimmers_launch_text_lines
 
 
@@ -52,6 +53,7 @@ MANAGE_COMMAND_NAMES = {
     "down",
     "first-box",
     "focus",
+    "forge",
     "logs",
     "mcp-audit",
     "mmdx",
@@ -1306,6 +1308,19 @@ def _build_parser() -> argparse.ArgumentParser:
     first_box_parser.add_argument("--format", choices=("text", "json"), default="text")
     _add_profile_arg(first_box_parser)
 
+    forge_parser = subparsers.add_parser(
+        "forge",
+        help="Bootstrap and inspect the skill-forge feedback loop.",
+    )
+    forge_subparsers = forge_parser.add_subparsers(dest="forge_action", required=True)
+    forge_init_parser = forge_subparsers.add_parser(
+        "init",
+        help="Install idempotent score-session hooks for Claude, codex-tmux, and optional cron.",
+    )
+    forge_init_parser.add_argument("--with-cron", action="store_true")
+    forge_init_parser.add_argument("--scoring-script", default=None)
+    forge_init_parser.add_argument("--format", choices=("text", "json"), default="json")
+
     focus_parser = subparsers.add_parser(
         "focus",
         help="Activate a client workspace with live state and enriched agent context.",
@@ -1606,6 +1621,45 @@ def _handle_first_box(args: argparse.Namespace, root_dir: Path) -> int:
         wait_seconds=max(0.0, float(args.wait_seconds)),
         fmt=args.format,
     )
+
+
+def _handle_forge(args: argparse.Namespace, root_dir: Path) -> int:
+    del root_dir
+    if args.forge_action != "init":
+        message = f"Unsupported forge action: {args.forge_action}"
+        if args.format == "json":
+            emit_json(classify_error(RuntimeError(message), "forge"))
+        else:
+            print(message, file=sys.stderr)
+        return EXIT_ERROR
+    try:
+        payload = forge_init(
+            with_cron=bool(args.with_cron),
+            scoring_script=getattr(args, "scoring_script", None),
+        )
+    except ForgeInitError as exc:
+        payload = {
+            "ok": False,
+            "error": {
+                "type": exc.code,
+                "message": str(exc),
+            },
+        }
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            print(f"{exc.code}: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print(f"settings: {payload['settings']['action']}")
+        print(f"codex-tmux: {payload['codex_tmux']['action']}")
+        print(f"cron: {payload['cron']['action']}")
+        for warning in payload.get("warnings") or []:
+            print(f"warning: {warning}")
+    return EXIT_OK
 
 
 def _handle_private_init(args: argparse.Namespace, root_dir: Path) -> int:
@@ -2741,6 +2795,7 @@ _EARLY_DISPATCH: dict[str, Callable[[argparse.Namespace, Path], int]] = {
     "client-init": _handle_client_init,
     "onboard": _handle_onboard,
     "first-box": _handle_first_box,
+    "forge": _handle_forge,
     "private-init": _handle_private_init,
     "acceptance": _handle_acceptance,
     "client-project": _handle_client_project,
