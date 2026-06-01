@@ -17,7 +17,17 @@ if str(ENV_MANAGER_DIR) not in sys.path:
     sys.path.insert(0, str(ENV_MANAGER_DIR))
 
 from runtime_manager import cli as CLI  # noqa: E402
-from runtime_manager.forge import FORGE_NO_SIGNAL, CRON_MARKER, forge_init, forge_status  # noqa: E402
+from runtime_manager.forge import (  # noqa: E402
+    CRON_MARKER,
+    FORGE_BRANCH_EXISTS,
+    FORGE_INSUFFICIENT_SIGNAL,
+    FORGE_NO_SIGNAL,
+    FORGE_REPO_DIRTY,
+    ForgeProposeError,
+    forge_init,
+    forge_propose,
+    forge_status,
+)
 
 
 class ForgeInitTests(unittest.TestCase):
@@ -316,6 +326,191 @@ class ForgeStatusTests(unittest.TestCase):
         self.assertEqual(exit_code, CLI.EXIT_OK)
         self.assertEqual(emitted[-1], payload)
         status_mock.assert_called_once_with(skill="ask-cascade", root_dir=expected_root)
+
+
+class ForgeProposeTests(unittest.TestCase):
+    def _git(self, repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
+
+    def _metrics(
+        self,
+        *,
+        ack_rate: float = 0.35,
+        validation_rate: float = 0.25,
+        checkpoint_rate: float = 0.0,
+        risk_gating_rate: float = 0.0,
+        correction_rate: float = 0.45,
+        completion_rate: float = 0.4,
+    ) -> dict[str, float]:
+        return {
+            "ack_rate": ack_rate,
+            "validation_rate": validation_rate,
+            "checkpoint_rate": checkpoint_rate,
+            "risk_gating_rate": risk_gating_rate,
+            "correction_rate": correction_rate,
+            "completion_rate": completion_rate,
+        }
+
+    def _append_history(self, home: Path, skill: str, count: int) -> Path:
+        history = home / ".claude" / "skill-review-history.jsonl"
+        history.parent.mkdir(parents=True, exist_ok=True)
+        with history.open("a", encoding="utf-8") as handle:
+            for index in range(count):
+                record = {
+                    "timestamp": f"2026-06-{index + 1:02d}T12:00:00Z",
+                    "skill": skill,
+                    "source": "claude",
+                    "metrics": self._metrics(),
+                }
+                handle.write(json.dumps(record) + "\n")
+        return history
+
+    def _create_skill_repo(self, root: Path, skill: str = "ask-cascade") -> Path:
+        repo = root / "workspace" / "skill-repos" / "fixture-skills"
+        skill_dir = repo / skill
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            textwrap.dedent(
+                f"""\
+                ---
+                name: {skill}
+                ---
+
+                # {skill}
+
+                Existing instructions.
+                """
+            ),
+            encoding="utf-8",
+        )
+        (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+        self._git(repo, "init", "-q")
+        self._git(repo, "branch", "-M", "main")
+        self._git(repo, "add", ".")
+        self._git(
+            repo,
+            "-c",
+            "user.email=forge@example.test",
+            "-c",
+            "user.name=Forge Test",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        )
+        return repo
+
+    def test_propose_creates_forge_branch_minimal_skill_diff_and_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "root"
+            home = Path(tmpdir) / "home"
+            repo = self._create_skill_repo(root)
+            self._append_history(home, "ask-cascade", 5)
+
+            payload = forge_propose("ask-cascade", root_dir=root, home=home)
+
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["branch"], "forge/ask-cascade")
+            self.assertEqual(payload["packet_family"], "deterministic-local-proposal")
+            current = self._git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+            self.assertEqual(current, "forge/ask-cascade")
+            diff = self._git(repo, "diff", "main..forge/ask-cascade", "--", "ask-cascade/SKILL.md").stdout
+            self.assertIn("Skillbox Forge Proposal", diff)
+            self.assertIn("Watch metric", diff)
+            self.assertNotIn("README.md", diff)
+            ledger = home / ".claude" / "forge-proposals.jsonl"
+            ledger_records = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(ledger_records), 1)
+            self.assertEqual(ledger_records[0]["skill"], "ask-cascade")
+            self.assertEqual(ledger_records[0]["commit"], payload["commit"])
+
+    def test_propose_insufficient_signal_returns_stable_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "root"
+            home = Path(tmpdir) / "home"
+            self._create_skill_repo(root)
+            self._append_history(home, "ask-cascade", 4)
+
+            with self.assertRaises(ForgeProposeError) as ctx:
+                forge_propose("ask-cascade", root_dir=root, home=home, min_sessions=5)
+
+        self.assertEqual(ctx.exception.code, FORGE_INSUFFICIENT_SIGNAL)
+        self.assertEqual(ctx.exception.payload["sessions_scored"], 4)
+
+    def test_propose_dirty_repo_returns_stable_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "root"
+            home = Path(tmpdir) / "home"
+            repo = self._create_skill_repo(root)
+            self._append_history(home, "ask-cascade", 5)
+            (repo / "README.md").write_text("dirty\n", encoding="utf-8")
+
+            with self.assertRaises(ForgeProposeError) as ctx:
+                forge_propose("ask-cascade", root_dir=root, home=home)
+
+        self.assertEqual(ctx.exception.code, FORGE_REPO_DIRTY)
+
+    def test_propose_existing_branch_returns_stable_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "root"
+            home = Path(tmpdir) / "home"
+            repo = self._create_skill_repo(root)
+            self._append_history(home, "ask-cascade", 5)
+            self._git(repo, "checkout", "-q", "-b", "forge/ask-cascade")
+            self._git(repo, "checkout", "-q", "main")
+
+            with self.assertRaises(ForgeProposeError) as ctx:
+                forge_propose("ask-cascade", root_dir=root, home=home)
+
+        self.assertEqual(ctx.exception.code, FORGE_BRANCH_EXISTS)
+        self.assertEqual(ctx.exception.payload["branch"], "forge/ask-cascade")
+
+    def test_propose_dry_run_does_not_mutate_repo_or_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "root"
+            home = Path(tmpdir) / "home"
+            repo = self._create_skill_repo(root)
+            self._append_history(home, "ask-cascade", 5)
+            skill_md = repo / "ask-cascade" / "SKILL.md"
+            original = skill_md.read_text(encoding="utf-8")
+
+            payload = forge_propose("ask-cascade", root_dir=root, home=home, dry_run=True)
+
+            self.assertTrue(payload["would_create_branch"])
+            self.assertEqual(skill_md.read_text(encoding="utf-8"), original)
+            branches = self._git(repo, "branch", "--list", "forge/*", "--format", "%(refname:short)").stdout
+            self.assertEqual(branches.strip(), "")
+            self.assertFalse((home / ".claude" / "forge-proposals.jsonl").exists())
+
+    def test_propose_twice_refuses_existing_branch_without_second_ledger_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "root"
+            home = Path(tmpdir) / "home"
+            self._create_skill_repo(root)
+            self._append_history(home, "ask-cascade", 5)
+
+            forge_propose("ask-cascade", root_dir=root, home=home)
+            with self.assertRaises(ForgeProposeError) as ctx:
+                forge_propose("ask-cascade", root_dir=root, home=home)
+
+            ledger = home / ".claude" / "forge-proposals.jsonl"
+            self.assertEqual(len(ledger.read_text(encoding="utf-8").splitlines()), 1)
+
+        self.assertEqual(ctx.exception.code, FORGE_BRANCH_EXISTS)
+
+    def test_propose_cli_outputs_json_error_code(self) -> None:
+        emitted: list[dict[str, object]] = []
+        error = ForgeProposeError(FORGE_INSUFFICIENT_SIGNAL, "not enough signal", {"sessions_scored": 0})
+        with (
+            mock.patch.object(CLI, "forge_propose", side_effect=error) as propose_mock,
+            mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
+        ):
+            exit_code = CLI.main(["forge", "propose", "ask-cascade", "--format", "json"])
+
+        self.assertEqual(exit_code, CLI.EXIT_ERROR)
+        self.assertEqual(emitted[-1]["code"], FORGE_INSUFFICIENT_SIGNAL)
+        self.assertEqual(emitted[-1]["sessions_scored"], 0)
+        propose_mock.assert_called_once()
 
 
 class ScoreSessionScriptTests(unittest.TestCase):

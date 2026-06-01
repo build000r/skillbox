@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import Any
 
 FORGE_NO_SIGNAL = "FORGE_NO_SIGNAL"
+FORGE_INSUFFICIENT_SIGNAL = "FORGE_INSUFFICIENT_SIGNAL"
+FORGE_REPO_DIRTY = "FORGE_REPO_DIRTY"
+FORGE_BRANCH_EXISTS = "FORGE_BRANCH_EXISTS"
+FORGE_SKILL_NOT_FOUND = "FORGE_SKILL_NOT_FOUND"
 FORGE_INIT_SETTINGS_LOCKED = "FORGE_INIT_SETTINGS_LOCKED"
 FORGE_INIT_SETTINGS_INVALID = "FORGE_INIT_SETTINGS_INVALID"
 FORGE_INIT_CODEX_TMUX_MISSING = "FORGE_INIT_CODEX_TMUX_MISSING"
@@ -42,6 +46,13 @@ class ForgeInitError(RuntimeError):
         self.code = code
 
 
+class ForgeProposeError(RuntimeError):
+    def __init__(self, code: str, message: str, payload: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.payload = payload or {}
+
+
 def default_scoring_script() -> Path:
     return Path(__file__).resolve().parents[2] / "scripts" / "score-session.sh"
 
@@ -52,6 +63,10 @@ def _home_dir(home: Path | str | None = None) -> Path:
 
 def default_review_history_path(home: Path | str | None = None) -> Path:
     return _home_dir(home) / ".claude" / "skill-review-history.jsonl"
+
+
+def default_proposals_path(home: Path | str | None = None) -> Path:
+    return _home_dir(home) / ".claude" / "forge-proposals.jsonl"
 
 
 def _scoring_command(scoring_script: Path, source: str, extra: list[str] | None = None) -> str:
@@ -416,6 +431,289 @@ def forge_status(
     if not skills:
         payload["code"] = FORGE_NO_SIGNAL
         payload["message"] = "no signal yet"
+    return payload
+
+
+def _run_git(
+    repo: Path,
+    args: list[str],
+    *,
+    subprocess_run: Any = subprocess.run,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess_run(
+        ["git", *args],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _git_stdout(repo: Path, args: list[str], *, subprocess_run: Any = subprocess.run) -> str:
+    result = _run_git(repo, args, subprocess_run=subprocess_run)
+    return (result.stdout or "").strip() if result.returncode == 0 else ""
+
+
+def _git_root_for(path: Path, *, subprocess_run: Any = subprocess.run) -> Path | None:
+    result = subprocess_run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    text = (result.stdout or "").strip()
+    return Path(text).resolve() if text else None
+
+
+def _skill_repo_candidates(skill: str, root_dir: Path, home_dir: Path) -> list[Path]:
+    candidates: list[Path] = []
+    clone_root = root_dir / "workspace" / "skill-repos"
+    if clone_root.is_dir():
+        candidates.extend(sorted(clone_root.glob(f"*/{skill}/SKILL.md")))
+
+    client_builder_root = root_dir / "workspace" / "client-skill-builder-skills"
+    if client_builder_root.is_dir():
+        candidates.append(client_builder_root / skill / "SKILL.md")
+
+    for agent in (".claude", ".codex"):
+        candidates.append(home_dir / agent / "skills" / skill / "SKILL.md")
+    return candidates
+
+
+def resolve_skill_source(
+    skill: str,
+    *,
+    root_dir: Path | str | None = None,
+    home: Path | str | None = None,
+    skill_dir: Path | str | None = None,
+    subprocess_run: Any = subprocess.run,
+) -> dict[str, Any]:
+    root_path = Path(root_dir).resolve() if root_dir is not None else Path.cwd().resolve()
+    home_dir = _home_dir(home)
+    candidates = [Path(skill_dir).expanduser() / "SKILL.md"] if skill_dir is not None else _skill_repo_candidates(skill, root_path, home_dir)
+
+    for skill_md in candidates:
+        try:
+            resolved_skill_md = skill_md.resolve()
+        except FileNotFoundError:
+            resolved_skill_md = skill_md
+        if not resolved_skill_md.exists():
+            continue
+        repo_root = _git_root_for(resolved_skill_md.parent, subprocess_run=subprocess_run)
+        if repo_root is None:
+            continue
+        return {
+            "skill": skill,
+            "skill_dir": str(resolved_skill_md.parent),
+            "skill_md": str(resolved_skill_md),
+            "repo": str(repo_root),
+        }
+
+    raise ForgeProposeError(
+        FORGE_SKILL_NOT_FOUND,
+        f"skill source not found in managed skill repos or agent skill roots: {skill}",
+        {"skill": skill},
+    )
+
+
+def _branch_exists(repo: Path, branch: str, *, subprocess_run: Any = subprocess.run) -> bool:
+    result = _run_git(repo, ["branch", "--list", branch, "--format", "%(refname:short)"], subprocess_run=subprocess_run)
+    if result.returncode != 0:
+        return False
+    return any(line.strip() == branch for line in (result.stdout or "").splitlines())
+
+
+def _ensure_clean_repo(repo: Path, *, subprocess_run: Any = subprocess.run) -> None:
+    status = _run_git(repo, ["status", "--porcelain"], subprocess_run=subprocess_run)
+    if status.returncode != 0:
+        raise ForgeProposeError(FORGE_REPO_DIRTY, f"could not inspect git status for {repo}")
+    dirty = [line for line in (status.stdout or "").splitlines() if line.strip()]
+    if dirty:
+        raise ForgeProposeError(
+            FORGE_REPO_DIRTY,
+            f"skill repo has uncommitted changes: {repo}",
+            {"dirty_count": len(dirty), "dirty": dirty[:20]},
+        )
+
+
+def _proposal_id(skill: str, records: list[dict[str, Any]]) -> str:
+    latest = _record_scored_at(records[-1]) if records else "none"
+    token = "".join(ch if ch.isalnum() else "-" for ch in f"{skill}-{len(records)}-{latest}".lower())
+    return "-".join(part for part in token.split("-") if part)[:96]
+
+
+def _select_watch_metric(metrics: dict[str, float]) -> str:
+    crossed = thresholds_crossed(metrics)
+    if crossed:
+        return crossed[0].split(" ", 1)[0]
+    scored: list[tuple[float, str]] = []
+    for metric in FORGE_METRICS:
+        value = metrics.get(metric, 0.0)
+        concern = value if metric in FORGE_LOW_IS_GOOD_METRICS else 1.0 - value
+        scored.append((concern, metric))
+    return max(scored)[1] if scored else "completion_rate"
+
+
+def _render_proposal_section(
+    *,
+    skill: str,
+    proposal_id: str,
+    watch_metric: str,
+    baseline: dict[str, float],
+    thresholds: list[str],
+    evidence_sessions: list[str],
+) -> str:
+    lines = [
+        "",
+        f"<!-- skillbox-forge-proposal-start:{proposal_id} -->",
+        "## Skillbox Forge Proposal",
+        "",
+        f"- Skill: `{skill}`",
+        f"- Watch metric: `{watch_metric}`",
+        "- Baseline: "
+        + ", ".join(f"{metric}={baseline.get(metric, 0.0):.3f}" for metric in FORGE_METRICS),
+        "- Thresholds crossed: " + (", ".join(thresholds) if thresholds else "(none)"),
+        "- Evidence sessions: " + (", ".join(evidence_sessions) if evidence_sessions else "(none)"),
+        "",
+        "### Proposed adjustment",
+        "",
+        "Review recent low-scoring sessions for this skill before the next release. "
+        "Tighten the SKILL.md guidance around the watch metric above, then rerun the same scorer window.",
+        f"<!-- skillbox-forge-proposal-end:{proposal_id} -->",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _append_proposal_to_skill(skill_md: Path, section: str) -> None:
+    text = skill_md.read_text(encoding="utf-8")
+    separator = "" if text.endswith("\n") else "\n"
+    skill_md.write_text(text + separator + section, encoding="utf-8")
+
+
+def _append_ledger(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def forge_propose(
+    skill: str,
+    *,
+    dry_run: bool = False,
+    min_sessions: int = 5,
+    home: Path | str | None = None,
+    history_path: Path | str | None = None,
+    root_dir: Path | str | None = None,
+    skill_dir: Path | str | None = None,
+    proposals_path: Path | str | None = None,
+    subprocess_run: Any = subprocess.run,
+) -> dict[str, Any]:
+    if min_sessions < 1:
+        min_sessions = 1
+
+    source = resolve_skill_source(
+        skill,
+        root_dir=root_dir,
+        home=home,
+        skill_dir=skill_dir,
+        subprocess_run=subprocess_run,
+    )
+    repo = Path(source["repo"])
+    skill_md = Path(source["skill_md"])
+    branch = f"forge/{skill}"
+
+    records = sorted(
+        load_review_history(history_path, home=home, skill=skill),
+        key=lambda item: _parse_datetime(_record_scored_at(item)),
+    )
+    if len(records) < min_sessions:
+        raise ForgeProposeError(
+            FORGE_INSUFFICIENT_SIGNAL,
+            f"{skill} has {len(records)} scored sessions; {min_sessions} required",
+            {"skill": skill, "sessions_scored": len(records), "min_sessions": min_sessions},
+        )
+
+    _ensure_clean_repo(repo, subprocess_run=subprocess_run)
+    if _branch_exists(repo, branch, subprocess_run=subprocess_run):
+        raise ForgeProposeError(
+            FORGE_BRANCH_EXISTS,
+            f"forge branch already exists: {branch}",
+            {"skill": skill, "repo": str(repo), "branch": branch},
+        )
+
+    recent = records[-min_sessions:]
+    baseline = _average_metrics(recent)
+    watch_metric = _select_watch_metric(baseline)
+    evidence_sessions = [_record_scored_at(record) for record in recent if _record_scored_at(record)]
+    proposal_id = _proposal_id(skill, recent)
+    thresholds = thresholds_crossed(baseline)
+    diff_summary = "append deterministic Skillbox Forge proposal section to SKILL.md"
+    now = datetime.now(timezone.utc).isoformat()
+    payload: dict[str, Any] = {
+        "ok": True,
+        "skill": skill,
+        "repo": str(repo),
+        "skill_md": str(skill_md),
+        "branch": branch,
+        "packet_family": "deterministic-local-proposal",
+        "diff_summary": diff_summary,
+        "evidence_sessions": evidence_sessions,
+        "watch_metric": watch_metric,
+        "baseline": baseline,
+        "thresholds_crossed": thresholds,
+        "sessions_scored": len(records),
+        "min_sessions": min_sessions,
+        "proposal_id": proposal_id,
+        "created_at": now,
+        "dry_run": dry_run,
+    }
+
+    if dry_run:
+        payload["would_create_branch"] = True
+        payload["would_write_ledger"] = True
+        return payload
+
+    current_branch = _git_stdout(repo, ["rev-parse", "--abbrev-ref", "HEAD"], subprocess_run=subprocess_run)
+    checkout = _run_git(repo, ["checkout", "-b", branch], subprocess_run=subprocess_run)
+    if checkout.returncode != 0:
+        raise ForgeProposeError(FORGE_BRANCH_EXISTS, checkout.stderr.strip() or f"could not create {branch}", payload)
+
+    section = _render_proposal_section(
+        skill=skill,
+        proposal_id=proposal_id,
+        watch_metric=watch_metric,
+        baseline=baseline,
+        thresholds=thresholds,
+        evidence_sessions=evidence_sessions,
+    )
+    _append_proposal_to_skill(skill_md, section)
+    _run_git(repo, ["add", "--", str(skill_md.relative_to(repo))], subprocess_run=subprocess_run)
+    commit = _run_git(
+        repo,
+        [
+            "-c",
+            "user.email=forge@example.test",
+            "-c",
+            "user.name=Skillbox Forge",
+            "commit",
+            "-m",
+            f"forge: propose {skill} update",
+        ],
+        subprocess_run=subprocess_run,
+    )
+    if commit.returncode != 0:
+        if current_branch:
+            _run_git(repo, ["checkout", current_branch], subprocess_run=subprocess_run)
+        raise ForgeProposeError(FORGE_REPO_DIRTY, commit.stderr.strip() or "forge proposal commit failed", payload)
+
+    payload["commit"] = _git_stdout(repo, ["rev-parse", "HEAD"], subprocess_run=subprocess_run)
+    ledger = Path(proposals_path).expanduser() if proposals_path is not None else default_proposals_path(home)
+    _append_ledger(ledger, payload)
+    payload["ledger"] = str(ledger)
     return payload
 
 
