@@ -33,6 +33,13 @@ from runtime_manager.forge import (  # noqa: E402
     forge_reject,
     forge_status,
 )
+from runtime_manager.validation import (  # noqa: E402
+    SKILL_FORGE_HOOK_MISSING,
+    SKILL_FORGE_PENDING,
+    SKILL_FORGE_STALE,
+    SKILL_FORGE_UNSCORED,
+    validate_forge_health,
+)
 
 
 class ForgeInitTests(unittest.TestCase):
@@ -331,6 +338,129 @@ class ForgeStatusTests(unittest.TestCase):
         self.assertEqual(exit_code, CLI.EXIT_OK)
         self.assertEqual(emitted[-1], payload)
         status_mock.assert_called_once_with(skill="ask-cascade", root_dir=expected_root)
+
+
+class ForgeDoctorTests(unittest.TestCase):
+    def _minimal_model(self, root: Path) -> dict[str, object]:
+        return {
+            "version": 1,
+            "root_dir": str(root),
+            "env": {},
+            "selection": {},
+            "clients": [],
+            "repos": [],
+            "artifacts": [],
+            "env_files": [],
+            "skills": [],
+            "tasks": [],
+            "services": [],
+            "logs": [],
+            "checks": [],
+            "bridges": [],
+            "ingress_routes": [],
+            "parity_ledger": [],
+            "service_mode_commands": [],
+            "storage": {},
+        }
+
+    def _metrics(
+        self,
+        *,
+        validation_rate: float,
+        completion_rate: float = 0.9,
+    ) -> dict[str, float]:
+        return {
+            "ack_rate": 0.9,
+            "validation_rate": validation_rate,
+            "checkpoint_rate": 0.0,
+            "risk_gating_rate": 0.0,
+            "correction_rate": 0.0,
+            "completion_rate": completion_rate,
+        }
+
+    def _append_history(self, home: Path, skill: str, index: int, metrics: dict[str, float]) -> None:
+        history = home / ".claude" / "skill-review-history.jsonl"
+        history.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "timestamp": f"2020-01-{index + 1:02d}T12:00:00Z",
+            "skill": skill,
+            "source": "claude",
+            "metrics": metrics,
+        }
+        with history.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+
+    def _create_pending_branch(self, root: Path, skill: str) -> None:
+        repo = root / "workspace" / "skill-repos" / "fixture-skills"
+        repo.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.email=forge@example.test",
+                "-c",
+                "user.name=Forge Test",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+            cwd=repo,
+            check=True,
+        )
+        subprocess.run(["git", "checkout", "-q", "-b", f"forge/{skill}"], cwd=repo, check=True)
+
+    def _write_unscored_transcripts(self, home: Path, count: int) -> None:
+        transcript_dir = home / ".claude" / "projects" / "fixture"
+        transcript_dir.mkdir(parents=True, exist_ok=True)
+        for index in range(count):
+            (transcript_dir / f"session-{index}.jsonl").write_text("{}\n", encoding="utf-8")
+
+    def test_doctor_forge_health_emits_contract_codes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "root"
+            home = Path(tmpdir) / "home"
+            root.mkdir()
+            self._create_pending_branch(root, "ask-cascade")
+            for index in range(3):
+                self._append_history(home, "describe", index, self._metrics(validation_rate=0.9))
+            for index in range(3, 6):
+                self._append_history(home, "describe", index, self._metrics(validation_rate=0.1))
+            self._write_unscored_transcripts(home, 3)
+
+            results = validate_forge_health(self._minimal_model(root), home=home)
+
+        by_code = {result.code: result for result in results}
+        self.assertEqual(by_code[SKILL_FORGE_HOOK_MISSING].status, "warn")
+        self.assertEqual(by_code[SKILL_FORGE_STALE].status, "info")
+        self.assertEqual(by_code[SKILL_FORGE_STALE].details["skill"], "describe")
+        self.assertEqual(by_code[SKILL_FORGE_PENDING].status, "info")
+        self.assertEqual(by_code[SKILL_FORGE_PENDING].details["skill"], "ask-cascade")
+        self.assertEqual(by_code[SKILL_FORGE_UNSCORED].status, "warn")
+        self.assertEqual(by_code[SKILL_FORGE_UNSCORED].details["unscored_sessions"], 3)
+
+    def test_doctor_json_includes_forge_findings_without_failure(self) -> None:
+        emitted: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "root"
+            home = Path(tmpdir) / "home"
+            root.mkdir()
+            self._write_unscored_transcripts(home, 3)
+            args = mock.Mock(format="json")
+            with (
+                mock.patch.dict(os.environ, {"HOME": str(home)}),
+                mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
+            ):
+                exit_code = CLI._handle_doctor(args, root, self._minimal_model(root), "reuse")
+
+        self.assertEqual(exit_code, CLI.EXIT_OK)
+        checks = emitted[-1]["checks"]
+        by_code = {check["code"]: check for check in checks}
+        self.assertEqual(by_code[SKILL_FORGE_HOOK_MISSING]["status"], "warn")
+        self.assertEqual(by_code[SKILL_FORGE_UNSCORED]["status"], "warn")
 
 
 class ForgeProposeTests(unittest.TestCase):

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime as DateTime, timezone
+
 from .shared import *
 
 # Stable error codes from the local_runtime_core_cutover shared contract
@@ -29,6 +31,11 @@ VALID_INGRESS_ROUTE_LISTENERS = {"public", "private"}
 VALID_INGRESS_ROUTE_MATCHES = {"exact", "prefix"}
 CLIENT_SHARED_SKILLS_REL = "../_shared/skills"
 VENDORED_SHARED_SKILLS_ESCAPE_HATCH = "allow_vendored_shared_skills"
+SKILL_FORGE_HOOK_MISSING = "SKILL_FORGE_HOOK_MISSING"
+SKILL_FORGE_STALE = "SKILL_FORGE_STALE"
+SKILL_FORGE_PENDING = "SKILL_FORGE_PENDING"
+SKILL_FORGE_UNSCORED = "SKILL_FORGE_UNSCORED"
+SKILL_FORGE_UNSCORED_THRESHOLD = 3
 
 
 def _looks_like_ingress_origin(raw_value: Any) -> bool:
@@ -1240,7 +1247,7 @@ def validate_skill_repo_sets(model: dict[str, Any]) -> list[CheckResult]:
     distribution_results = validate_distribution_doctor_checks(model)
     has_repo_sets = any(s.get("kind") == "skill-repo-set" for s in model["skills"])
     if not has_repo_sets:
-        return distribution_results
+        return distribution_results + validate_forge_health(model)
 
     declared_skills_by_skillset, effective_skill_owner = _build_effective_skill_owners(model)
     all_declared = _collect_all_declared_skill_names(model)
@@ -1269,7 +1276,188 @@ def validate_skill_repo_sets(model: dict[str, Any]) -> list[CheckResult]:
         config_failures, shared_source_failures, lock_failures,
         lock_warnings, install_failures, install_warnings,
     )
-    return results + distribution_results
+    return results + distribution_results + validate_forge_health(model)
+
+
+def _forge_root_dir(model: dict[str, Any]) -> Path:
+    root_dir = str(model.get("root_dir") or "").strip()
+    if root_dir:
+        return Path(root_dir)
+    for skillset in model.get("skills") or []:
+        clone_root = str(skillset.get("clone_root_host_path") or "").strip()
+        if clone_root:
+            clone_path = Path(clone_root)
+            if len(clone_path.parents) > 1:
+                return clone_path.parents[1]
+    return DEFAULT_ROOT_DIR
+
+
+def _forge_latest_score_time(home: Path) -> DateTime:
+    from .forge import _parse_datetime, _record_scored_at, load_review_history
+
+    latest = DateTime.min.replace(tzinfo=timezone.utc)
+    for record in load_review_history(home=home):
+        scored_at = _parse_datetime(_record_scored_at(record))
+        if scored_at > latest:
+            latest = scored_at
+    return latest
+
+
+def _forge_transcript_paths(home: Path) -> list[Path]:
+    roots = (
+        home / ".claude" / "projects",
+        home / ".codex" / "sessions",
+    )
+    paths: list[Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        paths.extend(path for path in root.rglob("*.jsonl") if path.is_file())
+    return paths
+
+
+def _forge_unscored_transcript_count(home: Path) -> int:
+    latest_score = _forge_latest_score_time(home)
+    count = 0
+    for transcript in _forge_transcript_paths(home):
+        try:
+            modified = DateTime.fromtimestamp(transcript.stat().st_mtime, tz=timezone.utc)
+        except OSError:
+            continue
+        if modified > latest_score:
+            count += 1
+    return count
+
+
+def _check_forge_hook(home: Path, scoring_script: Path) -> list[CheckResult]:
+    from .forge import scoring_hook_installed
+
+    if scoring_hook_installed(home=home, scoring_script=scoring_script):
+        return []
+    return [
+        CheckResult(
+            status="warn",
+            code=SKILL_FORGE_HOOK_MISSING,
+            message="Forge scoring hook not installed. Run `manage.py forge init`.",
+            details={
+                "settings_path": str(home / ".claude" / "settings.json"),
+                "scoring_script": str(scoring_script),
+            },
+        )
+    ]
+
+
+def _check_forge_pending(root_dir: Path) -> list[CheckResult]:
+    from .forge import pending_forge_skills
+
+    results: list[CheckResult] = []
+    for skill_name in sorted(pending_forge_skills(root_dir)):
+        results.append(
+            CheckResult(
+                status="info",
+                code=SKILL_FORGE_PENDING,
+                message=(
+                    f"Pending forge proposal for '{skill_name}'. "
+                    f"Review with `manage.py forge accept/reject {skill_name}`."
+                ),
+                details={"skill": skill_name},
+            )
+        )
+    return results
+
+
+def _stale_forge_metric(skill_status: dict[str, Any]) -> str:
+    for label in skill_status.get("thresholds_crossed") or []:
+        text = str(label).strip()
+        if text:
+            return text.split(" ", 1)[0]
+    return "metrics"
+
+
+def _check_forge_stale(status_payload: dict[str, Any]) -> list[CheckResult]:
+    results: list[CheckResult] = []
+    for skill_status in status_payload.get("skills") or []:
+        if int(skill_status.get("sessions_scored") or 0) < 3:
+            continue
+        if skill_status.get("trend") != "declining":
+            continue
+        if not skill_status.get("thresholds_crossed"):
+            continue
+        if bool(skill_status.get("proposal_pending")):
+            continue
+        skill_name = str(skill_status.get("name") or "").strip()
+        if not skill_name:
+            continue
+        metric = _stale_forge_metric(skill_status)
+        results.append(
+            CheckResult(
+                status="info",
+                code=SKILL_FORGE_STALE,
+                message=(
+                    f"Skill '{skill_name}' has declining {metric}. "
+                    f"Consider `manage.py forge propose {skill_name}`."
+                ),
+                details={
+                    "skill": skill_name,
+                    "metric": metric,
+                    "sessions_scored": skill_status.get("sessions_scored"),
+                    "thresholds_crossed": skill_status.get("thresholds_crossed") or [],
+                },
+            )
+        )
+    return results
+
+
+def _check_forge_unscored(home: Path) -> list[CheckResult]:
+    unscored_count = _forge_unscored_transcript_count(home)
+    if unscored_count < SKILL_FORGE_UNSCORED_THRESHOLD:
+        return []
+    return [
+        CheckResult(
+            status="warn",
+            code=SKILL_FORGE_UNSCORED,
+            message=(
+                f"Found {unscored_count} unscored sessions. "
+                "Run `score-session.sh --source both --since week`."
+            ),
+            details={
+                "unscored_sessions": unscored_count,
+                "threshold": SKILL_FORGE_UNSCORED_THRESHOLD,
+            },
+        )
+    ]
+
+
+def validate_forge_health(
+    model: dict[str, Any],
+    *,
+    home: Path | str | None = None,
+    scoring_script: Path | str | None = None,
+) -> list[CheckResult]:
+    """Surface passive skill-forge state in doctor without mutating operator files."""
+    from .forge import default_scoring_script, forge_status
+
+    home_dir = Path(home).expanduser() if home is not None else Path.home()
+    score_path = Path(scoring_script).expanduser() if scoring_script is not None else default_scoring_script()
+    root_dir = _forge_root_dir(model)
+    try:
+        status_payload = forge_status(home=home_dir, root_dir=root_dir, scoring_script=score_path)
+    except Exception as exc:
+        return [
+            CheckResult(
+                status="warn",
+                code="skill-forge-health",
+                message="forge health could not be inspected",
+                details={"error": str(exc)},
+            )
+        ]
+
+    results: list[CheckResult] = []
+    results.extend(_check_forge_hook(home_dir, score_path))
+    results.extend(_check_forge_stale(status_payload))
+    results.extend(_check_forge_pending(root_dir))
+    results.extend(_check_forge_unscored(home_dir))
+    return results
 
 
 def _check_top_level_duplicates(model: dict[str, Any]) -> tuple[list[str], set[str]]:
