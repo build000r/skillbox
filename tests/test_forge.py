@@ -17,7 +17,7 @@ if str(ENV_MANAGER_DIR) not in sys.path:
     sys.path.insert(0, str(ENV_MANAGER_DIR))
 
 from runtime_manager import cli as CLI  # noqa: E402
-from runtime_manager.forge import CRON_MARKER, forge_init  # noqa: E402
+from runtime_manager.forge import FORGE_NO_SIGNAL, CRON_MARKER, forge_init, forge_status  # noqa: E402
 
 
 class ForgeInitTests(unittest.TestCase):
@@ -118,6 +118,204 @@ class ForgeInitTests(unittest.TestCase):
         self.assertEqual(emitted[-1], payload)
         forge_mock.assert_called_once()
         self.assertTrue(forge_mock.call_args.kwargs["with_cron"])
+
+
+class ForgeStatusTests(unittest.TestCase):
+    def _append_history(
+        self,
+        history_path: Path,
+        *,
+        skill: str,
+        timestamp: str,
+        metrics: dict[str, float],
+    ) -> None:
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "timestamp": timestamp,
+            "skill": skill,
+            "source": "claude",
+            "invocations": 1,
+            "metrics": metrics,
+        }
+        with history_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+
+    def _metrics(
+        self,
+        *,
+        ack_rate: float = 0.9,
+        validation_rate: float = 0.9,
+        checkpoint_rate: float = 0.0,
+        risk_gating_rate: float = 0.0,
+        correction_rate: float = 0.0,
+        completion_rate: float = 0.9,
+    ) -> dict[str, float]:
+        return {
+            "ack_rate": ack_rate,
+            "validation_rate": validation_rate,
+            "checkpoint_rate": checkpoint_rate,
+            "risk_gating_rate": risk_gating_rate,
+            "correction_rate": correction_rate,
+            "completion_rate": completion_rate,
+        }
+
+    def _git(self, repo: Path, *args: str) -> None:
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
+
+    def _create_pending_branch(self, root: Path, skill: str) -> None:
+        repo = root / "workspace" / "skill-repos" / "fixture-skills"
+        repo.mkdir(parents=True)
+        self._git(repo, "init", "-q")
+        (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+        self._git(repo, "add", "README.md")
+        self._git(
+            repo,
+            "-c",
+            "user.email=forge@example.test",
+            "-c",
+            "user.name=Forge Test",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        )
+        self._git(repo, "checkout", "-q", "-b", f"forge/{skill}")
+
+    def test_status_no_signal_returns_informational_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "repo"
+            payload = forge_status(home=Path(tmpdir) / "home", root_dir=root)
+
+        self.assertEqual(payload["code"], FORGE_NO_SIGNAL)
+        self.assertEqual(payload["message"], "no signal yet")
+        self.assertEqual(payload["skills"], [])
+        self.assertEqual(payload["total_sessions_scored"], 0)
+
+    def test_status_aggregates_counts_thresholds_and_pending_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "repo"
+            home = Path(tmpdir) / "home"
+            history = home / ".claude" / "skill-review-history.jsonl"
+            self._create_pending_branch(root, "ask-cascade")
+            weak_metrics = self._metrics(
+                ack_rate=0.4,
+                validation_rate=0.35,
+                correction_rate=0.4,
+                completion_rate=0.45,
+            )
+            for index in range(6):
+                self._append_history(
+                    history,
+                    skill="ask-cascade",
+                    timestamp=f"2026-06-{index + 1:02d}T12:00:00Z",
+                    metrics=weak_metrics,
+                )
+            for index in range(4):
+                self._append_history(
+                    history,
+                    skill="describe",
+                    timestamp=f"2026-06-{index + 1:02d}T13:00:00Z",
+                    metrics=self._metrics(),
+                )
+
+            payload = forge_status(home=home, root_dir=root)
+
+        by_name = {item["name"]: item for item in payload["skills"]}
+        self.assertEqual(payload["total_sessions_scored"], 10)
+        self.assertEqual(by_name["ask-cascade"]["sessions_scored"], 6)
+        self.assertTrue(by_name["ask-cascade"]["proposal_pending"])
+        self.assertEqual(
+            by_name["ask-cascade"]["thresholds_crossed"],
+            [
+                "ack_rate < 0.5",
+                "validation_rate < 0.4",
+                "correction_rate > 0.3",
+                "completion_rate < 0.5",
+            ],
+        )
+        self.assertEqual(by_name["describe"]["sessions_scored"], 4)
+        self.assertFalse(by_name["describe"]["proposal_pending"])
+        self.assertEqual(by_name["describe"]["thresholds_crossed"], [])
+
+    def test_status_detects_declining_three_session_average(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "repo"
+            home = Path(tmpdir) / "home"
+            history = home / ".claude" / "skill-review-history.jsonl"
+            for index in range(3):
+                self._append_history(
+                    history,
+                    skill="ask-cascade",
+                    timestamp=f"2026-06-{index + 1:02d}T12:00:00Z",
+                    metrics=self._metrics(validation_rate=0.9),
+                )
+            for index in range(3):
+                self._append_history(
+                    history,
+                    skill="ask-cascade",
+                    timestamp=f"2026-06-{index + 4:02d}T12:00:00Z",
+                    metrics=self._metrics(validation_rate=0.1),
+                )
+
+            payload = forge_status(home=home, root_dir=root)
+
+        self.assertEqual(payload["skills"][0]["trend"], "declining")
+        self.assertIn("validation_rate < 0.4", payload["skills"][0]["thresholds_crossed"])
+
+    def test_status_filters_to_single_skill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "repo"
+            home = Path(tmpdir) / "home"
+            history = home / ".claude" / "skill-review-history.jsonl"
+            self._append_history(
+                history,
+                skill="ask-cascade",
+                timestamp="2026-06-01T12:00:00Z",
+                metrics=self._metrics(),
+            )
+            self._append_history(
+                history,
+                skill="describe",
+                timestamp="2026-06-01T13:00:00Z",
+                metrics=self._metrics(),
+            )
+
+            payload = forge_status(skill="describe", home=home, root_dir=root)
+
+        self.assertEqual([item["name"] for item in payload["skills"]], ["describe"])
+        self.assertEqual(payload["total_sessions_scored"], 1)
+
+    def test_status_cli_outputs_json(self) -> None:
+        emitted: list[dict[str, object]] = []
+        payload = {
+            "skills": [{"name": "ask-cascade", "sessions_scored": 1}],
+            "total_sessions_scored": 1,
+            "scoring_hook_installed": False,
+            "unscored_sessions": 0,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            expected_root = root.resolve()
+            with (
+                mock.patch.object(CLI, "forge_status", return_value=payload) as status_mock,
+                mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
+            ):
+                exit_code = CLI.main(
+                    [
+                        "--root-dir",
+                        str(root),
+                        "forge",
+                        "status",
+                        "--format",
+                        "json",
+                        "--skill",
+                        "ask-cascade",
+                    ]
+                )
+
+        self.assertEqual(exit_code, CLI.EXIT_OK)
+        self.assertEqual(emitted[-1], payload)
+        status_mock.assert_called_once_with(skill="ask-cascade", root_dir=expected_root)
 
 
 class ScoreSessionScriptTests(unittest.TestCase):
