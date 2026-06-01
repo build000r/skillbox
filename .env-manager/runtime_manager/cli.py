@@ -1326,6 +1326,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     forge_status_parser.add_argument("--format", choices=("table", "json"), default="table")
     forge_status_parser.add_argument("--skill", default=None, help="Limit status to one skill name.")
+    forge_propose_parser = forge_subparsers.add_parser(
+        "propose",
+        help="Create a deterministic forge/<skill> proposal branch from scored signal.",
+    )
+    forge_propose_parser.add_argument("skill", help="Skill name to propose an update for.")
+    forge_propose_parser.add_argument("--dry-run", action="store_true")
+    forge_propose_parser.add_argument("--min-sessions", type=int, default=5)
+    forge_propose_parser.add_argument("--format", choices=("text", "json"), default="json")
 
     focus_parser = subparsers.add_parser(
         "focus",
@@ -1636,6 +1644,39 @@ def _handle_forge(args: argparse.Namespace, root_dir: Path) -> int:
             emit_json(payload)
         else:
             print("\n".join(format_forge_status_table(payload)))
+        return EXIT_OK
+
+    if args.forge_action == "propose":
+        try:
+            payload = forge_propose(
+                args.skill,
+                dry_run=bool(args.dry_run),
+                min_sessions=int(args.min_sessions),
+                root_dir=root_dir,
+            )
+        except ForgeProposeError as exc:
+            payload = {
+                "ok": False,
+                "code": exc.code,
+                "error": {
+                    "type": exc.code,
+                    "message": str(exc),
+                },
+            }
+            payload.update(exc.payload)
+            if args.format == "json":
+                emit_json(payload)
+            else:
+                print(f"{exc.code}: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            prefix = "would create" if payload.get("dry_run") else "created"
+            print(f"{prefix}: {payload['branch']}")
+            print(f"repo: {payload['repo']}")
+            print(f"watch_metric: {payload['watch_metric']}")
         return EXIT_OK
 
     if args.forge_action != "init":
