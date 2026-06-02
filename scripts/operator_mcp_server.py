@@ -694,9 +694,10 @@ def handle_operator_provision(params: dict) -> dict:
     except ValueError as exc:
         return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
 
-    if params.get("profile"):
+    profile_param = str(params["profile"]).strip() if params.get("profile") else ""
+    if profile_param:
         try:
-            _validate_identifier(str(params["profile"]), "profile")
+            _validate_identifier(profile_param, "profile")
         except ValueError as exc:
             return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
     if params.get("blueprint"):
@@ -706,8 +707,8 @@ def handle_operator_provision(params: dict) -> dict:
             return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
 
     args = ["up", str(box_id), "--format", "json"]
-    if params.get("profile"):
-        args += ["--profile", str(params["profile"])]
+    if profile_param:
+        args += ["--profile", profile_param]
     if params.get("deploy_manifest"):
         args += ["--deploy-manifest", str(params["deploy_manifest"])]
     if params.get("blueprint"):

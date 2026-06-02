@@ -357,7 +357,7 @@ class OperatorMcpServerTests(unittest.TestCase):
             result = MODULE.handle_operator_provision(
                 {
                     "box_id": "alpha",
-                    "profile": "dev-small",
+                    "profile": " dev-small ",
                     "deploy_manifest": "/tmp/deploy.json",
                     "blueprint": "git-repo",
                     "set_vars": ["FOO=bar"],
@@ -372,6 +372,7 @@ class OperatorMcpServerTests(unittest.TestCase):
         args = run_script.call_args.args[1]
         self.assertIn("up", args)
         self.assertIn("--profile", args)
+        self.assertEqual(args[args.index("--profile") + 1], "dev-small")
         self.assertIn("--deploy-manifest", args)
         self.assertIn("--blueprint", args)
         self.assertIn("--set", args)
