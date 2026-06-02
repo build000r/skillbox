@@ -694,8 +694,9 @@ def handle_operator_provision(params: dict) -> dict:
     except ValueError as exc:
         return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
 
-    profile_param = str(params["profile"]).strip() if params.get("profile") else ""
-    if profile_param:
+    profile_param = ""
+    if "profile" in params and params["profile"] is not None:
+        profile_param = str(params["profile"]).strip()
         try:
             _validate_identifier(profile_param, "profile")
         except ValueError as exc:
