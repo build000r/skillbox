@@ -128,6 +128,31 @@ def _validate_identifier(value: str, kind: str) -> str:
     return value
 
 
+def _validate_string_identifier(value: Any, kind: str, *, trim: bool = False) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"Invalid {kind}: must be a string")
+    candidate = value.strip() if trim else value
+    return _validate_identifier(candidate, kind)
+
+
+def _validate_string(value: Any, kind: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"Invalid {kind}: must be a string")
+    return value
+
+
+def _validate_bool(value: Any, kind: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"Invalid {kind}: must be a boolean")
+    return value
+
+
+def _validate_int(value: Any, kind: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"Invalid {kind}: must be an integer")
+    return value
+
+
 def _validate_ssh_user(value: str, kind: str = "ssh_user") -> str:
     if not isinstance(value, str) or not _SSH_USER_RE.match(value):
         raise ValueError(f"Invalid {kind}: {value!r}")
@@ -665,20 +690,18 @@ def handle_operator_boxes(_params: dict) -> dict:
 
 def handle_operator_box_status(params: dict) -> dict:
     args = ["status", "--format", "json"]
-    box_id = params.get("box_id")
-    if box_id:
+    if "box_id" in params and params["box_id"] is not None:
         try:
-            _validate_identifier(str(box_id), "box_id")
+            box_id_param = _validate_string_identifier(params["box_id"], "box_id")
         except ValueError as exc:
             return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
-        args.insert(1, str(box_id))
+        args.insert(1, box_id_param)
     ok, _code, data = run_script(BOX_PY, args)
     return _ok_content(data) if ok else _error_content(data)
 
 
 def handle_operator_provision(params: dict) -> dict:
-    box_id = params.get("box_id")
-    if not box_id:
+    if "box_id" not in params or params["box_id"] is None:
         return _missing_required_error(
             "operator_provision",
             "'box_id' is required for operator_provision.",
@@ -688,72 +711,89 @@ def handle_operator_provision(params: dict) -> dict:
                 "operator_provision(box_id='<id>', dry_run=true)",
             ],
         )
+    box_id = params["box_id"]
 
     try:
-        _validate_identifier(str(box_id), "box_id")
+        box_id_param = _validate_string_identifier(box_id, "box_id")
     except ValueError as exc:
         return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
 
     profile_param = ""
     if "profile" in params and params["profile"] is not None:
-        if not isinstance(params["profile"], str):
+        try:
+            profile_param = _validate_string_identifier(params["profile"], "profile", trim=True)
+        except ValueError as exc:
+            return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
+    blueprint_param = None
+    if "blueprint" in params and params["blueprint"] is not None:
+        try:
+            blueprint_param = _validate_string_identifier(params["blueprint"], "blueprint")
+        except ValueError as exc:
+            return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
+    deploy_manifest_param = None
+    if "deploy_manifest" in params and params["deploy_manifest"] is not None:
+        try:
+            deploy_manifest_param = _validate_string(params["deploy_manifest"], "deploy_manifest")
+        except ValueError as exc:
+            return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
+    set_vars_param = []
+    if "set_vars" in params and params["set_vars"] is not None:
+        if not isinstance(params["set_vars"], list):
             return _error_content({
                 "error": {
                     "type": "invalid_parameter",
-                    "message": "Invalid profile: must be a string",
+                    "message": "Invalid set_vars: must be an array",
                     "recoverable": True,
                 }
             })
-        profile_param = params["profile"].strip()
-        try:
-            _validate_identifier(profile_param, "profile")
-        except ValueError as exc:
-            return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
-    if params.get("blueprint"):
-        try:
-            _validate_identifier(str(params["blueprint"]), "blueprint")
-        except ValueError as exc:
-            return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
+        for sv in params["set_vars"]:
+            try:
+                set_vars_param.append(_validate_string(sv, "set_vars item"))
+            except ValueError as exc:
+                return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
+    try:
+        resume_param = _validate_bool(params["resume"], "resume") if "resume" in params and params["resume"] is not None else False
+        dry_run_param = _validate_bool(params["dry_run"], "dry_run") if "dry_run" in params and params["dry_run"] is not None else False
+    except ValueError as exc:
+        return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
 
-    args = ["up", str(box_id), "--format", "json"]
+    args = ["up", box_id_param, "--format", "json"]
     if profile_param:
         args += ["--profile", profile_param]
-    if params.get("deploy_manifest"):
-        args += ["--deploy-manifest", str(params["deploy_manifest"])]
-    if params.get("blueprint"):
-        args += ["--blueprint", str(params["blueprint"])]
-    for sv in (params.get("set_vars") or []):
-        args += ["--set", str(sv)]
-    if params.get("resume"):
+    if deploy_manifest_param:
+        args += ["--deploy-manifest", deploy_manifest_param]
+    if blueprint_param:
+        args += ["--blueprint", blueprint_param]
+    for sv in set_vars_param:
+        args += ["--set", sv]
+    if resume_param:
         args.append("--resume")
-    is_dry_run = bool(params.get("dry_run"))
-    if is_dry_run:
+    if dry_run_param:
         args.append("--dry-run")
-    elif not _has_dryrun_marker("operator_provision", str(box_id)):
+    elif not _has_dryrun_marker("operator_provision", box_id_param):
         return _dry_run_required_error(
             "operator_provision",
-            str(box_id),
+            box_id_param,
             "operator_provision(box_id='<id>', dry_run=true)",
             "python3 scripts/box.py up <box-id> --profile dev-small --dry-run --format json",
-            marker_status=_dryrun_marker_rejection_status("operator_provision", str(box_id)),
+            marker_status=_dryrun_marker_rejection_status("operator_provision", box_id_param),
         )
 
     ok, _code, data = run_script(BOX_PY, args, timeout=PROVISION_TIMEOUT_SECONDS)
     emit_event(
         "operator.provision",
-        str(box_id),
-        {"ok": ok, "dry_run": is_dry_run, "resume": bool(params.get("resume"))},
+        box_id_param,
+        {"ok": ok, "dry_run": dry_run_param, "resume": resume_param},
     )
-    if ok and is_dry_run:
-        _stamp_dryrun_marker("operator_provision", str(box_id))
-    elif ok and not is_dry_run:
-        _clear_dryrun_marker("operator_provision", str(box_id))
+    if ok and dry_run_param:
+        _stamp_dryrun_marker("operator_provision", box_id_param)
+    elif ok and not dry_run_param:
+        _clear_dryrun_marker("operator_provision", box_id_param)
     return _ok_content(data) if ok else _error_content(data)
 
 
 def handle_operator_teardown(params: dict) -> dict:
-    box_id = params.get("box_id")
-    if not box_id:
+    if "box_id" not in params or params["box_id"] is None:
         return _missing_required_error(
             "operator_teardown",
             "'box_id' is required for operator_teardown.",
@@ -765,39 +805,45 @@ def handle_operator_teardown(params: dict) -> dict:
         )
 
     try:
-        _validate_identifier(str(box_id), "box_id")
+        box_id_param = _validate_string_identifier(params["box_id"], "box_id")
+    except ValueError as exc:
+        return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
+    try:
+        dry_run_param = _validate_bool(params["dry_run"], "dry_run") if "dry_run" in params and params["dry_run"] is not None else False
     except ValueError as exc:
         return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
 
-    args = ["down", str(box_id), "--format", "json"]
-    is_dry_run = bool(params.get("dry_run"))
-    if is_dry_run:
+    args = ["down", box_id_param, "--format", "json"]
+    if dry_run_param:
         args.append("--dry-run")
-    elif not _has_dryrun_marker("operator_teardown", str(box_id)):
+    elif not _has_dryrun_marker("operator_teardown", box_id_param):
         return _dry_run_required_error(
             "operator_teardown",
-            str(box_id),
+            box_id_param,
             "operator_teardown(box_id='<id>', dry_run=true)",
             "python3 scripts/box.py down <box-id> --dry-run --format json",
-            marker_status=_dryrun_marker_rejection_status("operator_teardown", str(box_id)),
+            marker_status=_dryrun_marker_rejection_status("operator_teardown", box_id_param),
         )
 
     ok, _code, data = run_script(BOX_PY, args, timeout=300)
-    emit_event("operator.teardown", str(box_id), {"ok": ok, "dry_run": is_dry_run})
+    emit_event("operator.teardown", box_id_param, {"ok": ok, "dry_run": dry_run_param})
 
     # Stamp dry-run marker so the PreToolUse hook allows the real run next.
-    if ok and is_dry_run:
-        _stamp_dryrun_marker("operator_teardown", str(box_id))
-    elif ok and not is_dry_run:
-        _clear_dryrun_marker("operator_teardown", str(box_id))
+    if ok and dry_run_param:
+        _stamp_dryrun_marker("operator_teardown", box_id_param)
+    elif ok and not dry_run_param:
+        _clear_dryrun_marker("operator_teardown", box_id_param)
 
     return _ok_content(data) if ok else _error_content(data)
 
 
 def handle_operator_box_exec(params: dict) -> dict:
-    box_id = params.get("box_id")
-    command = params.get("command")
-    if not box_id or not command:
+    if (
+        "box_id" not in params
+        or params["box_id"] is None
+        or "command" not in params
+        or params["command"] is None
+    ):
         return _missing_required_error(
             "operator_box_exec",
             "'box_id' and 'command' are required for operator_box_exec.",
@@ -809,16 +855,27 @@ def handle_operator_box_exec(params: dict) -> dict:
         )
 
     try:
-        _validate_identifier(str(box_id), "box_id")
+        box_id_param = _validate_string_identifier(params["box_id"], "box_id")
+        command_param = _validate_string(params["command"], "command")
     except ValueError as exc:
         return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
+    if not command_param:
+        return _missing_required_error(
+            "operator_box_exec",
+            "'box_id' and 'command' are required for operator_box_exec.",
+            [
+                "operator_boxes",
+                "operator_box_status",
+                "operator_box_exec(box_id='<id>', command='cd ~/skillbox && python3 .env-manager/manage.py status --format json')",
+            ],
+        )
 
-    box = find_box(str(box_id))
+    box = find_box(box_id_param)
     if box is None or box.get("state") == "destroyed":
         return _error_content({
             "error": {
                 "type": "box_not_found",
-                "message": f"Box '{box_id}' not found or destroyed.",
+                "message": f"Box '{box_id_param}' not found or destroyed.",
                 "recoverable": True,
                 "recovery_hint": (
                     "Run operator_boxes to list active boxes, or register an existing shared box "
@@ -833,7 +890,7 @@ def handle_operator_box_exec(params: dict) -> dict:
         return _error_content({
             "error": {
                 "type": "no_ssh_target",
-                "message": f"Box '{box_id}' has no reachable address.",
+                "message": f"Box '{box_id_param}' has no reachable address.",
                 "recoverable": False,
             }
         })
@@ -855,8 +912,8 @@ def handle_operator_box_exec(params: dict) -> dict:
         })
 
     try:
-        timeout = int(params.get("timeout", 120))
-    except (TypeError, ValueError):
+        timeout = _validate_int(params["timeout"], "timeout") if "timeout" in params and params["timeout"] is not None else 120
+    except ValueError:
         return _error_content({
             "error": {
                 "type": "invalid_parameter",
@@ -864,7 +921,7 @@ def handle_operator_box_exec(params: dict) -> dict:
                 "recoverable": True,
             }
         })
-    ok, _code, data = run_ssh(validated_user, validated_host, str(command), timeout=timeout)
+    ok, _code, data = run_ssh(validated_user, validated_host, command_param, timeout=timeout)
     return _ok_content(data) if ok else _error_content(data)
 
 
