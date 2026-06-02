@@ -330,6 +330,25 @@ class SkillboxMcpServerTests(unittest.TestCase):
         self.assertIn("lines must be >= 1", payload["error"]["message"])
         run_manage.assert_not_called()
 
+    def test_dispatch_tool_rejects_malformed_boolean_arguments_before_manage(self) -> None:
+        cases = (
+            ("skillbox_up", {"dry_run": "false"}, "dry_run"),
+            ("skillbox_skill", {"action": "prune", "yes": "false"}, "yes"),
+            ("skillbox_mmdx_open", {"query": "review", "open": None}, "open"),
+            ("skillbox_skills", {"include_global": "false"}, "include_global"),
+            ("skillbox_status", {"full": "false"}, "full"),
+        )
+
+        for tool_name, arguments, field in cases:
+            with self.subTest(tool_name=tool_name, field=field), mock.patch.object(MODULE, "run_manage") as run_manage:
+                result = MODULE.dispatch_tool(tool_name, arguments, request_id=f"req-{tool_name}")
+
+            payload = _content_payload(result)
+            self.assertTrue(result["isError"])
+            self.assertEqual(payload["error"]["type"], "invalid_parameter")
+            self.assertIn(f"{field} must be a boolean", payload["error"]["message"])
+            run_manage.assert_not_called()
+
     def test_runtime_mcp_dry_run_marker_allows_matching_real_action(self) -> None:
         arguments = {
             "client": ["personal"],

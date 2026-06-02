@@ -1436,6 +1436,18 @@ _BOOL_ARG_SPECS: tuple[tuple[str, str], ...] = (
     ("allow_parser_install", "--allow-parser-install"),
     ("send_magic_link", "--send-magic-link"),
 )
+_BOOLEAN_PARAM_KEYS = frozenset(
+    key for key, _flag in _BOOL_ARG_SPECS
+) | {
+    "compact",
+    "full",
+    "include_clean",
+    "include_global",
+    "include_project",
+    "no_global",
+    "no_project",
+    "open",
+}
 
 
 def _append_repeat_args(args: list[str], params: dict) -> None:
@@ -1466,6 +1478,21 @@ def _float_param(params: dict, key: str, *, minimum: float | None = None) -> flo
     return value
 
 
+def _bool_param(params: dict, key: str, *, default: bool = False) -> bool:
+    if key not in params:
+        return default
+    value = params[key]
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be a boolean")
+    return value
+
+
+def _validate_bool_params(params: dict) -> None:
+    for key in sorted(_BOOLEAN_PARAM_KEYS):
+        if key in params and not isinstance(params[key], bool):
+            raise ValueError(f"{key} must be a boolean")
+
+
 def _append_scalar_args(args: list[str], params: dict) -> None:
     for key, flag in _STRING_ARG_SPECS:
         if params.get(key):
@@ -1482,19 +1509,19 @@ def _append_scalar_args(args: list[str], params: dict) -> None:
 
 def _append_bool_args(args: list[str], command: str, params: dict) -> None:
     for key, flag in _BOOL_ARG_SPECS:
-        if params.get(key):
+        if _bool_param(params, key):
             args.append(flag)
-    if params.get("include_global") is False or params.get("no_global"):
+    if _bool_param(params, "include_global", default=True) is False or _bool_param(params, "no_global"):
         args.append("--no-global")
-    if params.get("include_project") is False or params.get("no_project"):
+    if _bool_param(params, "include_project", default=True) is False or _bool_param(params, "no_project"):
         args.append("--no-project")
-    if command == "skill-audit" and params.get("include_clean"):
+    if command == "skill-audit" and _bool_param(params, "include_clean"):
         args.append("--all")
-    if params.get("full") and command == "skills":
+    if _bool_param(params, "full") and command == "skills":
         args.append("--full")
-    if params.get("compact") and command == "status":
+    if _bool_param(params, "compact") and command == "status":
         args.append("--compact")
-    if command == "mmdx" and params.get("open") is False:
+    if command == "mmdx" and _bool_param(params, "open", default=True) is False:
         args.append("--no-open")
 
 
@@ -1520,6 +1547,8 @@ def _append_command_positionals(args: list[str], command: str, params: dict) -> 
 
 def build_args(command: str, params: dict, positional: str | None = None) -> list[str]:
     """Translate tool params into a manage.py argv list."""
+    _validate_bool_params(params)
+
     args: list[str] = [command]
     if positional is not None:
         args.append(positional)
