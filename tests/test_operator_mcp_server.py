@@ -309,6 +309,12 @@ class OperatorMcpServerTests(unittest.TestCase):
         self.assertEqual(run_script.call_args_list[2].args[1], ["status", "alpha", "--format", "json"])
         self.assertEqual(run_script.call_args_list[4].args[1], ["render", "--format", "json", "--with-compose"])
 
+        with mock.patch.object(MODULE, "run_script") as run_script:
+            invalid_status = _content_payload(MODULE.handle_operator_box_status({"box_id": True}))
+        self.assertEqual(invalid_status["error"]["type"], "invalid_parameter")
+        self.assertIn("box_id", invalid_status["error"]["message"])
+        run_script.assert_not_called()
+
         with mock.patch.object(
             MODULE,
             "run_compose",
@@ -382,7 +388,7 @@ class OperatorMcpServerTests(unittest.TestCase):
         emit_event.assert_called_once()
         stamp.assert_called_once_with("operator_provision", "alpha")
 
-        for bad_profile in ("", "   ", False, 0):
+        for bad_profile in ("", "   ", False, 0, ["dev-small"], {"id": "dev-small"}):
             with self.subTest(profile=bad_profile), mock.patch.object(
                 MODULE,
                 "run_script",
@@ -394,6 +400,26 @@ class OperatorMcpServerTests(unittest.TestCase):
                 )
             self.assertEqual(blank_profile["error"]["type"], "invalid_parameter")
             self.assertIn("profile", blank_profile["error"]["message"])
+            run_script.assert_not_called()
+
+        for params, field in (
+            ({"box_id": True, "dry_run": True}, "box_id"),
+            ({"box_id": False, "dry_run": True}, "box_id"),
+            ({"box_id": 0, "dry_run": True}, "box_id"),
+            ({"box_id": "", "dry_run": True}, "box_id"),
+            ({"box_id": " alpha ", "dry_run": True}, "box_id"),
+            ({"box_id": "alpha", "blueprint": True, "dry_run": True}, "blueprint"),
+            ({"box_id": "alpha", "blueprint": " git-repo ", "dry_run": True}, "blueprint"),
+            ({"box_id": "alpha", "deploy_manifest": True, "dry_run": True}, "deploy_manifest"),
+            ({"box_id": "alpha", "set_vars": "FOO=bar", "dry_run": True}, "set_vars"),
+            ({"box_id": "alpha", "set_vars": [False], "dry_run": True}, "set_vars"),
+            ({"box_id": "alpha", "resume": "false", "dry_run": True}, "resume"),
+            ({"box_id": "alpha", "dry_run": "true"}, "dry_run"),
+        ):
+            with self.subTest(params=params), mock.patch.object(MODULE, "run_script") as run_script:
+                invalid_payload = _content_payload(MODULE.handle_operator_provision(params))
+            self.assertEqual(invalid_payload["error"]["type"], "invalid_parameter")
+            self.assertIn(field, invalid_payload["error"]["message"])
             run_script.assert_not_called()
 
     def test_handle_operator_provision_relies_on_box_default_blueprint_when_unspecified(self) -> None:
@@ -412,6 +438,21 @@ class OperatorMcpServerTests(unittest.TestCase):
         self.assertNotIn("--profile", args)
         self.assertNotIn("--blueprint", args)
 
+        with mock.patch.object(
+            MODULE,
+            "run_script",
+            return_value=(True, 0, {"box_id": "alpha"}),
+        ) as run_script, mock.patch.object(MODULE, "emit_event"), mock.patch.object(
+            MODULE,
+            "_has_dryrun_marker",
+            return_value=True,
+        ):
+            MODULE.handle_operator_provision({"box_id": "alpha", "profile": None, "blueprint": None})
+
+        args = run_script.call_args.args[1]
+        self.assertNotIn("--profile", args)
+        self.assertNotIn("--blueprint", args)
+
         with mock.patch.object(MODULE, "_has_dryrun_marker", return_value=False), mock.patch.object(
             MODULE,
             "run_script",
@@ -424,6 +465,16 @@ class OperatorMcpServerTests(unittest.TestCase):
     def test_handle_operator_teardown_stamps_marker_for_dry_run(self) -> None:
         error_payload = _content_payload(MODULE.handle_operator_teardown({}))
         self.assertEqual(error_payload["error"]["type"], "missing_required_parameter")
+
+        for params, field in (
+            ({"box_id": True, "dry_run": True}, "box_id"),
+            ({"box_id": "alpha", "dry_run": "true"}, "dry_run"),
+        ):
+            with self.subTest(params=params), mock.patch.object(MODULE, "run_script") as run_script:
+                invalid_payload = _content_payload(MODULE.handle_operator_teardown(params))
+            self.assertEqual(invalid_payload["error"]["type"], "invalid_parameter")
+            self.assertIn(field, invalid_payload["error"]["message"])
+            run_script.assert_not_called()
 
         with mock.patch.object(
             MODULE,
@@ -452,6 +503,16 @@ class OperatorMcpServerTests(unittest.TestCase):
     def test_handle_operator_box_exec_covers_validation_and_success(self) -> None:
         missing = _content_payload(MODULE.handle_operator_box_exec({"box_id": "alpha"}))
         self.assertEqual(missing["error"]["type"], "missing_required_parameter")
+
+        for params, field in (
+            ({"box_id": True, "command": "pwd"}, "box_id"),
+            ({"box_id": "alpha", "command": False}, "command"),
+        ):
+            with self.subTest(params=params), mock.patch.object(MODULE, "find_box") as find_box:
+                invalid_payload = _content_payload(MODULE.handle_operator_box_exec(params))
+            self.assertEqual(invalid_payload["error"]["type"], "invalid_parameter")
+            self.assertIn(field, invalid_payload["error"]["message"])
+            find_box.assert_not_called()
 
         with mock.patch.object(MODULE, "find_box", return_value=None):
             missing_box = _content_payload(
@@ -798,15 +859,16 @@ class OperatorMcpDryRunMarkerTests(unittest.TestCase):
             "tailscale_hostname": "alpha.tailnet.test",
             "ssh_user": "skillbox",
         }
-        with mock.patch.object(MODULE, "find_box", return_value=box):
-            result = MODULE.handle_operator_box_exec(
-                {"box_id": "alpha", "command": "pwd", "timeout": "bad"}
-            )
+        for timeout in ("bad", "15", True):
+            with self.subTest(timeout=timeout), mock.patch.object(MODULE, "find_box", return_value=box):
+                result = MODULE.handle_operator_box_exec(
+                    {"box_id": "alpha", "command": "pwd", "timeout": timeout}
+                )
 
-        payload = _content_payload(result)
-        self.assertTrue(result.get("isError"))
-        self.assertEqual(payload["error"]["type"], "invalid_parameter")
-        self.assertIn("timeout must be an integer", payload["error"]["message"])
+            payload = _content_payload(result)
+            self.assertTrue(result.get("isError"))
+            self.assertEqual(payload["error"]["type"], "invalid_parameter")
+            self.assertIn("timeout must be an integer", payload["error"]["message"])
 
 
 class OperatorMcpSshHardeningTests(unittest.TestCase):
