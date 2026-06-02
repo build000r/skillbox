@@ -230,6 +230,30 @@ class BoxTests(unittest.TestCase):
         self.assertEqual(dev_small["image"], "ubuntu-24-04-x64")
         self.assertEqual(dev_small["ssh_user"], "skillbox")
 
+    def test_load_profile_rejects_absolute_yaml_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outside_profile = Path(tmpdir) / "outside.yaml"
+            outside_profile.write_text(
+                "\n".join(
+                    [
+                        "provider: digitalocean",
+                        "region: sfo3",
+                        "size: s-1vcpu-1gb",
+                        "storage:",
+                        "  provider: digitalocean",
+                        "  mount_path: /srv/skillbox",
+                        "  filesystem: ext4",
+                        "  required: true",
+                        "  min_free_gb: 1",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "path separators"):
+                BOX_MODULE.load_profile(str(outside_profile.with_suffix("")))
+
     def test_volume_filesystem_label_drops_state_prefix_for_ext4(self) -> None:
         self.assertEqual(
             BOX_MODULE.volume_filesystem_label("skillbox-state-jeremy", "ext4"),

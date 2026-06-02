@@ -120,6 +120,7 @@ IPV4_PATTERN = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 _SSH_USER_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$')
 _HOST_RE = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,253}[a-zA-Z0-9])?$')
 _BOX_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+_PROFILE_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 
 
 def _validate_box_id(box_id: str) -> str:
@@ -134,6 +135,21 @@ def _validate_box_id(box_id: str) -> str:
             "invalid box_id: must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,63}"
         )
     return box_id
+
+
+def _validate_profile_name(profile_name: str) -> str:
+    name = str(profile_name or "").strip()
+    if not name:
+        raise RuntimeError("Invalid box profile name: must not be empty")
+    if "/" in name or "\\" in name:
+        raise RuntimeError("Invalid box profile name: must not contain path separators")
+    if name.startswith("-"):
+        raise RuntimeError("Invalid box profile name: must not start with '-'")
+    if not _PROFILE_NAME_RE.match(name):
+        raise RuntimeError(
+            "Invalid box profile name: must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,63}"
+        )
+    return name
 
 
 def _validate_ssh_user(user: str) -> str:
@@ -1375,6 +1391,7 @@ def build_release_upgrade_args(
 
 
 def load_profile(name: str) -> BoxProfile:
+    name = _validate_profile_name(name)
     try:
         import yaml as yaml_mod
     except ModuleNotFoundError:
