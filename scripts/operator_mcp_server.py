@@ -147,6 +147,12 @@ def _validate_bool(value: Any, kind: str) -> bool:
     return value
 
 
+def _validate_optional_bool(params: dict, key: str, *, default: bool = False) -> bool:
+    if key not in params or params[key] is None:
+        return default
+    return _validate_bool(params[key], key)
+
+
 def _validate_int(value: Any, kind: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         raise ValueError(f"Invalid {kind}: must be an integer")
@@ -928,7 +934,13 @@ def handle_operator_box_exec(params: dict) -> dict:
 def handle_operator_compose_up(params: dict) -> dict:
     results: list[dict[str, Any]] = []
 
-    if params.get("build", True):
+    try:
+        build_param = _validate_optional_bool(params, "build", default=True)
+        surfaces_param = _validate_optional_bool(params, "surfaces")
+    except ValueError as exc:
+        return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
+
+    if build_param:
         ok, code, data = run_compose(["build"], timeout=600)
         results.append({"step": "build", "ok": ok, "exit_code": code, "detail": data})
         if not ok:
@@ -949,7 +961,7 @@ def handle_operator_compose_up(params: dict) -> dict:
             "error": {"type": "up_failed", "message": "docker compose up failed.", "recoverable": True},
         })
 
-    if params.get("surfaces") and ok:
+    if surfaces_param and ok:
         ok_s, code_s, data_s = run_compose(["--profile", "surfaces", "up", "-d"], timeout=60)
         results.append({"step": "up-surfaces", "ok": ok_s, "exit_code": code_s, "detail": data_s})
 
@@ -967,7 +979,10 @@ def handle_operator_compose_up(params: dict) -> dict:
 
 
 def handle_operator_compose_down(params: dict) -> dict:
-    is_dry_run = bool(params.get("dry_run"))
+    try:
+        is_dry_run = _validate_optional_bool(params, "dry_run")
+    except ValueError as exc:
+        return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
     if is_dry_run:
         # Compose doesn't have native dry-run; simulate it.
         ok, code, data = run_compose(["ps", "--format", "json"], timeout=30)
@@ -1016,7 +1031,11 @@ def handle_operator_doctor(_params: dict) -> dict:
 
 def handle_operator_render(params: dict) -> dict:
     args = ["render", "--format", "json"]
-    if params.get("with_compose"):
+    try:
+        with_compose_param = _validate_optional_bool(params, "with_compose")
+    except ValueError as exc:
+        return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
+    if with_compose_param:
         args.append("--with-compose")
     ok, _code, data = run_script(RECONCILE_PY, args)
     return _ok_content(data) if ok else _error_content(data)
