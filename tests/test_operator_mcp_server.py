@@ -577,7 +577,9 @@ class OperatorMcpServerTests(unittest.TestCase):
 
         for params, field in (
             ({"build": "false"}, "build"),
+            ({"build": None}, "build"),
             ({"surfaces": "true"}, "surfaces"),
+            ({"surfaces": None}, "surfaces"),
         ):
             with self.subTest(params=params), mock.patch.object(MODULE, "run_compose") as run_compose:
                 invalid_payload = _content_payload(MODULE.handle_operator_compose_up(params))
@@ -631,15 +633,16 @@ class OperatorMcpServerTests(unittest.TestCase):
         )
 
     def test_handle_operator_compose_down_dry_run_preserves_preview_failure(self) -> None:
-        with mock.patch.object(MODULE, "run_compose") as run_compose, mock.patch.object(
-            MODULE,
-            "_has_dryrun_marker",
-        ) as has_marker:
-            invalid_payload = _content_payload(MODULE.handle_operator_compose_down({"dry_run": "true"}))
-        self.assertEqual(invalid_payload["error"]["type"], "invalid_parameter")
-        self.assertIn("dry_run", invalid_payload["error"]["message"])
-        run_compose.assert_not_called()
-        has_marker.assert_not_called()
+        for params in ({"dry_run": "true"}, {"dry_run": None}):
+            with self.subTest(params=params), mock.patch.object(MODULE, "run_compose") as run_compose, mock.patch.object(
+                MODULE,
+                "_has_dryrun_marker",
+            ) as has_marker:
+                invalid_payload = _content_payload(MODULE.handle_operator_compose_down(params))
+            self.assertEqual(invalid_payload["error"]["type"], "invalid_parameter")
+            self.assertIn("dry_run", invalid_payload["error"]["message"])
+            run_compose.assert_not_called()
+            has_marker.assert_not_called()
 
         with mock.patch.object(
             MODULE,
@@ -667,11 +670,12 @@ class OperatorMcpServerTests(unittest.TestCase):
         stamp.assert_called_once_with("operator_compose_down", "local")
 
     def test_handle_operator_render_rejects_non_boolean_with_compose(self) -> None:
-        with mock.patch.object(MODULE, "run_script") as run_script:
-            invalid_payload = _content_payload(MODULE.handle_operator_render({"with_compose": "true"}))
-        self.assertEqual(invalid_payload["error"]["type"], "invalid_parameter")
-        self.assertIn("with_compose", invalid_payload["error"]["message"])
-        run_script.assert_not_called()
+        for params in ({"with_compose": "true"}, {"with_compose": None}):
+            with self.subTest(params=params), mock.patch.object(MODULE, "run_script") as run_script:
+                invalid_payload = _content_payload(MODULE.handle_operator_render(params))
+            self.assertEqual(invalid_payload["error"]["type"], "invalid_parameter")
+            self.assertIn("with_compose", invalid_payload["error"]["message"])
+            run_script.assert_not_called()
 
     def test_run_script_covers_missing_timeout_json_text_and_empty_output(self) -> None:
         missing_ok, missing_code, missing_payload = MODULE.run_script(Path("/missing-script.py"), [])
