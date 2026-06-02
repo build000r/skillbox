@@ -1452,10 +1452,24 @@ _BOOLEAN_PARAM_KEYS = frozenset(
 
 def _append_repeat_args(args: list[str], params: dict) -> None:
     for key, flag in _REPEAT_ARG_SPECS:
-        raw_values = params.get(key) or []
-        values = [raw_values] if isinstance(raw_values, str) else raw_values
-        for value in values:
-            args += [flag, str(value)]
+        for value in _repeat_param_values(params, key):
+            args += [flag, value]
+
+
+def _repeat_param_values(params: dict, key: str) -> list[str]:
+    if key not in params or params[key] is None or params[key] == "":
+        return []
+    raw_values = params[key]
+    if isinstance(raw_values, str):
+        return [raw_values]
+    if not isinstance(raw_values, (list, tuple, set)):
+        raise ValueError(f"{key} must be a string or array of strings")
+    values: list[str] = []
+    for value in raw_values:
+        if not isinstance(value, str):
+            raise ValueError(f"{key} values must be strings")
+        values.append(value)
+    return values
 
 
 def _int_param(params: dict, key: str, *, minimum: int | None = None) -> int:
@@ -1877,12 +1891,12 @@ def _validate_tool_identifiers(tool_name: str, tool_params: dict) -> str | None:
 
     # Validate list-type identifier params (client, profile, service, task)
     for key in ("client", "profile", "service", "task"):
-        raw = tool_params.get(key)
-        if raw is None:
-            continue
-        values = raw if isinstance(raw, (list, tuple, set)) else [raw]
+        try:
+            values = _repeat_param_values(tool_params, key)
+        except ValueError as exc:
+            return str(exc)
         for item in values:
-            item_str = str(item).strip()
+            item_str = item.strip()
             if item_str:
                 try:
                     _validate_identifier(item_str, key)
