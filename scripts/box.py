@@ -1392,6 +1392,7 @@ def build_release_upgrade_args(
 
 def load_profile(name: str) -> BoxProfile:
     name = _validate_profile_name(name)
+    profile_id = name
     try:
         import yaml as yaml_mod
     except ModuleNotFoundError:
@@ -1406,6 +1407,8 @@ def load_profile(name: str) -> BoxProfile:
             raise RuntimeError(
                 f"Box profile {name!r} not found. Available: {', '.join(available) or '(none)'}"
             )
+        if path.suffix == ".yaml":
+            profile_id = path.stem
 
     if yaml_mod is None:
         raise RuntimeError("PyYAML is required to load box profiles: pip install pyyaml")
@@ -1416,13 +1419,13 @@ def load_profile(name: str) -> BoxProfile:
 
     provider = str(data.get("provider", "digitalocean"))
     storage = parse_box_profile_storage(
-        profile_id=name,
+        profile_id=profile_id,
         profile_provider=provider,
         raw_storage=data.get("storage"),
     )
 
     return BoxProfile(
-        id=name,
+        id=profile_id,
         provider=provider,
         region=data.get("region", "nyc3"),
         size=data.get("size", "s-2vcpu-4gb"),
@@ -2657,6 +2660,7 @@ def cmd_up(
     profile = _load_box_up_profile(profile_name, is_json=is_json)
     if profile is None:
         return EXIT_ERROR
+    profile_name = profile.id
 
     boxes = load_inventory()
     existing = find_box(boxes, box_id)
@@ -3243,6 +3247,11 @@ def cmd_unregister(box_id: str, *, fmt: str) -> int:
 # ---------------------------------------------------------------------------
 
 def _load_registration_profile(profile_name: str, *, is_json: bool) -> BoxProfile | None:
+    try:
+        profile_name = _validate_profile_name(profile_name)
+    except RuntimeError as exc:
+        emit_error_or_print(str(exc), is_json=is_json, error_type="profile_not_found")
+        raise
     if profile_name == "shared":
         return None
     try:
@@ -3342,6 +3351,7 @@ def cmd_register(
         profile = _load_registration_profile(profile_name, is_json=is_json)
     except RuntimeError:
         return EXIT_ERROR
+    profile_name = profile.id if profile is not None else "shared"
 
     boxes = load_inventory()
     existing = find_box(boxes, resolved_box_id)
