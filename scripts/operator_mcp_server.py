@@ -148,7 +148,7 @@ def _validate_bool(value: Any, kind: str) -> bool:
 
 
 def _validate_optional_bool(params: dict, key: str, *, default: bool = False) -> bool:
-    if key not in params or params[key] is None:
+    if key not in params:
         return default
     return _validate_bool(params[key], key)
 
