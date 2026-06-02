@@ -382,6 +382,14 @@ class OperatorMcpServerTests(unittest.TestCase):
         emit_event.assert_called_once()
         stamp.assert_called_once_with("operator_provision", "alpha")
 
+        with mock.patch.object(MODULE, "run_script") as run_script:
+            blank_profile = _content_payload(
+                MODULE.handle_operator_provision({"box_id": "alpha", "profile": "   ", "dry_run": True})
+            )
+        self.assertEqual(blank_profile["error"]["type"], "invalid_parameter")
+        self.assertIn("profile", blank_profile["error"]["message"])
+        run_script.assert_not_called()
+
     def test_handle_operator_provision_relies_on_box_default_blueprint_when_unspecified(self) -> None:
         with mock.patch.object(
             MODULE,
