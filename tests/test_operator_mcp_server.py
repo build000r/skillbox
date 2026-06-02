@@ -414,7 +414,9 @@ class OperatorMcpServerTests(unittest.TestCase):
             ({"box_id": "alpha", "set_vars": "FOO=bar", "dry_run": True}, "set_vars"),
             ({"box_id": "alpha", "set_vars": [False], "dry_run": True}, "set_vars"),
             ({"box_id": "alpha", "resume": "false", "dry_run": True}, "resume"),
+            ({"box_id": "alpha", "resume": None, "dry_run": True}, "resume"),
             ({"box_id": "alpha", "dry_run": "true"}, "dry_run"),
+            ({"box_id": "alpha", "dry_run": None}, "dry_run"),
         ):
             with self.subTest(params=params), mock.patch.object(MODULE, "run_script") as run_script:
                 invalid_payload = _content_payload(MODULE.handle_operator_provision(params))
@@ -469,6 +471,7 @@ class OperatorMcpServerTests(unittest.TestCase):
         for params, field in (
             ({"box_id": True, "dry_run": True}, "box_id"),
             ({"box_id": "alpha", "dry_run": "true"}, "dry_run"),
+            ({"box_id": "alpha", "dry_run": None}, "dry_run"),
         ):
             with self.subTest(params=params), mock.patch.object(MODULE, "run_script") as run_script:
                 invalid_payload = _content_payload(MODULE.handle_operator_teardown(params))
