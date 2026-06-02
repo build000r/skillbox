@@ -254,6 +254,33 @@ class BoxTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "path separators"):
                 BOX_MODULE.load_profile(str(outside_profile.with_suffix("")))
 
+    def test_load_profile_canonicalizes_valid_profile_aliases(self) -> None:
+        self.assertEqual(BOX_MODULE.load_profile(" dev-small ").id, "dev-small")
+        self.assertEqual(BOX_MODULE.load_profile("dev-small.yaml").id, "dev-small")
+
+    def test_box_up_canonicalizes_profile_in_recovery_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._env_with_inventory(tmpdir)
+            result = self._run(
+                "up",
+                "testbox",
+                "--profile",
+                " dev-small ",
+                "--dry-run",
+                "--format",
+                "json",
+                env=env,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["profile"]["id"], "dev-small")
+            self.assertIn(
+                "Re-run: python3 scripts/box.py up testbox --profile dev-small --dry-run --format json",
+                payload["next_actions"],
+            )
+            self.assertNotIn("--profile  dev-small ", "\n".join(payload["next_actions"]))
+
     def test_volume_filesystem_label_drops_state_prefix_for_ext4(self) -> None:
         self.assertEqual(
             BOX_MODULE.volume_filesystem_label("skillbox-state-jeremy", "ext4"),
