@@ -349,6 +349,26 @@ class SkillboxMcpServerTests(unittest.TestCase):
             self.assertIn(f"{field} must be a boolean", payload["error"]["message"])
             run_manage.assert_not_called()
 
+    def test_dispatch_tool_rejects_non_string_repeat_arguments_before_manage(self) -> None:
+        cases = (
+            ({"client": True}, "client must be a string or array of strings"),
+            ({"client": False}, "client must be a string or array of strings"),
+            ({"client": 0}, "client must be a string or array of strings"),
+            ({"client": [True]}, "client values must be strings"),
+            ({"profile": [1]}, "profile values must be strings"),
+            ({"service": True}, "service must be a string or array of strings"),
+        )
+
+        for arguments, message in cases:
+            with self.subTest(arguments=arguments), mock.patch.object(MODULE, "run_manage") as run_manage:
+                result = MODULE.dispatch_tool("skillbox_status", arguments, request_id="req-repeat")
+
+            payload = _content_payload(result)
+            self.assertTrue(result["isError"])
+            self.assertEqual(payload["error"]["type"], "invalid_parameter")
+            self.assertIn(message, payload["error"]["message"])
+            run_manage.assert_not_called()
+
     def test_runtime_mcp_dry_run_marker_allows_matching_real_action(self) -> None:
         arguments = {
             "client": ["personal"],
