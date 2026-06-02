@@ -758,8 +758,8 @@ def handle_operator_provision(params: dict) -> dict:
             except ValueError as exc:
                 return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
     try:
-        resume_param = _validate_bool(params["resume"], "resume") if "resume" in params and params["resume"] is not None else False
-        dry_run_param = _validate_bool(params["dry_run"], "dry_run") if "dry_run" in params and params["dry_run"] is not None else False
+        resume_param = _validate_optional_bool(params, "resume")
+        dry_run_param = _validate_optional_bool(params, "dry_run")
     except ValueError as exc:
         return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
 
@@ -815,7 +815,7 @@ def handle_operator_teardown(params: dict) -> dict:
     except ValueError as exc:
         return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
     try:
-        dry_run_param = _validate_bool(params["dry_run"], "dry_run") if "dry_run" in params and params["dry_run"] is not None else False
+        dry_run_param = _validate_optional_bool(params, "dry_run")
     except ValueError as exc:
         return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
 
