@@ -31,6 +31,21 @@ MANAGE_MODULE = SourceFileLoader(
 
 
 class RuntimeManagerTests(unittest.TestCase):
+    def test_normalize_file_mode_rejects_out_of_range_modes(self) -> None:
+        from runtime_manager.runtime_ops import normalize_file_mode
+
+        self.assertEqual(normalize_file_mode(None), 0o600)
+        self.assertEqual(normalize_file_mode(""), 0o600)
+        self.assertEqual(normalize_file_mode("0600"), 0o600)
+        self.assertEqual(normalize_file_mode("0o640"), 0o640)
+        self.assertEqual(normalize_file_mode(0o600), 0o600)
+
+        for raw_mode in (-1, "-1", 0o1000, "1000", True):
+            with self.subTest(raw_mode=raw_mode):
+                with self.assertRaises(RuntimeError) as ctx:
+                    normalize_file_mode(raw_mode)
+                self.assertIn("Invalid file mode", str(ctx.exception))
+
     def test_tail_lines_zero_or_negative_is_empty_not_full_file(self) -> None:
         from runtime_manager.runtime_ops import tail_lines
 

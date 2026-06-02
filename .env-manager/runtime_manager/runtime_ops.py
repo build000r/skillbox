@@ -237,16 +237,24 @@ def validate_storage_posture(model: dict[str, Any]) -> list[CheckResult]:
 def normalize_file_mode(raw_mode: Any, default: int = 0o600) -> int:
     if raw_mode is None:
         return default
+    if isinstance(raw_mode, bool):
+        raise RuntimeError(f"Invalid file mode {raw_mode!r}. Use an octal string such as '0600'.")
     if isinstance(raw_mode, int):
-        return raw_mode & 0o777
+        mode = raw_mode
+    else:
+        text = str(raw_mode).strip()
+        if not text:
+            return default
+        try:
+            mode = int(text, 8)
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid file mode {raw_mode!r}. Use an octal string such as '0600'.") from exc
 
-    text = str(raw_mode).strip()
-    if not text:
-        return default
-    try:
-        return int(text, 8) & 0o777
-    except ValueError as exc:
-        raise RuntimeError(f"Invalid file mode {raw_mode!r}. Use an octal string such as '0600'.") from exc
+    if mode < 0 or mode > 0o777:
+        raise RuntimeError(
+            f"Invalid file mode {raw_mode!r}. Use an octal value between '0000' and '0777'."
+        )
+    return mode
 
 
 def artifact_state(artifact: dict[str, Any]) -> dict[str, Any]:
