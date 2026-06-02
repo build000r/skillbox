@@ -258,6 +258,30 @@ class BoxTests(unittest.TestCase):
         self.assertEqual(BOX_MODULE.load_profile(" dev-small ").id, "dev-small")
         self.assertEqual(BOX_MODULE.load_profile("dev-small.yaml").id, "dev-small")
 
+    def test_box_profile_storage_required_rejects_null_and_string_values(self) -> None:
+        base_storage = {
+            "provider": "digitalocean",
+            "mount_path": "/srv/skillbox",
+            "filesystem": "ext4",
+            "min_free_gb": 20,
+        }
+
+        for value in (None, "false", 0, 1):
+            with self.subTest(value=value), self.assertRaisesRegex(RuntimeError, "storage.required.*boolean"):
+                BOX_MODULE.parse_box_profile_storage(
+                    profile_id="bad-profile",
+                    profile_provider="digitalocean",
+                    raw_storage={**base_storage, "required": value},
+                )
+
+        storage = BOX_MODULE.parse_box_profile_storage(
+            profile_id="default-profile",
+            profile_provider="digitalocean",
+            raw_storage=base_storage,
+        )
+        self.assertIsNotNone(storage)
+        self.assertTrue(storage.required)
+
     def test_box_up_canonicalizes_profile_in_recovery_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             env = self._env_with_inventory(tmpdir)

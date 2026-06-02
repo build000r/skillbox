@@ -152,6 +152,12 @@ def _validate_profile_name(profile_name: str) -> str:
     return name
 
 
+def _validate_config_bool(value: Any, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise RuntimeError(f"{field} must be a boolean")
+    return value
+
+
 def _validate_ssh_user(user: str) -> str:
     if not _SSH_USER_RE.match(user):
         raise ValueError(f"Invalid ssh user: {user!r}")
@@ -1364,11 +1370,19 @@ def parse_box_profile_storage(
     if min_free_gb < 0:
         raise RuntimeError(f"Box profile {profile_id!r} storage.min_free_gb cannot be negative")
 
+    if "required" in raw_storage:
+        required = _validate_config_bool(
+            raw_storage["required"],
+            f"Box profile {profile_id!r} storage.required",
+        )
+    else:
+        required = True
+
     return BoxProfileStorage(
         provider=storage_provider,
         mount_path=mount_path,
         filesystem=filesystem,
-        required=bool(raw_storage.get("required", True)),
+        required=required,
         min_free_gb=min_free_gb,
     )
 
