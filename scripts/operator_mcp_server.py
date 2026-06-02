@@ -696,7 +696,15 @@ def handle_operator_provision(params: dict) -> dict:
 
     profile_param = ""
     if "profile" in params and params["profile"] is not None:
-        profile_param = str(params["profile"]).strip()
+        if not isinstance(params["profile"], str):
+            return _error_content({
+                "error": {
+                    "type": "invalid_parameter",
+                    "message": "Invalid profile: must be a string",
+                    "recoverable": True,
+                }
+            })
+        profile_param = params["profile"].strip()
         try:
             _validate_identifier(profile_param, "profile")
         except ValueError as exc:
