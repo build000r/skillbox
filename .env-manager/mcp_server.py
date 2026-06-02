@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -1486,24 +1487,20 @@ def _string_param(params: dict, key: str) -> str | None:
 
 
 def _int_param(params: dict, key: str, *, minimum: int | None = None) -> int:
-    if isinstance(params[key], bool):
+    if not isinstance(params[key], int) or isinstance(params[key], bool):
         raise ValueError(f"{key} must be an integer")
-    try:
-        value = int(params[key])
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{key} must be an integer") from exc
+    value = params[key]
     if minimum is not None and value < minimum:
         raise ValueError(f"{key} must be >= {minimum}")
     return value
 
 
 def _float_param(params: dict, key: str, *, minimum: float | None = None) -> float:
-    if isinstance(params[key], bool):
+    if not isinstance(params[key], (int, float)) or isinstance(params[key], bool):
         raise ValueError(f"{key} must be a number")
-    try:
-        value = float(params[key])
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{key} must be a number") from exc
+    value = float(params[key])
+    if not math.isfinite(value):
+        raise ValueError(f"{key} must be a finite number")
     if minimum is not None and value < minimum:
         raise ValueError(f"{key} must be >= {minimum:g}")
     return value

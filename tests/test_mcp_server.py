@@ -304,31 +304,26 @@ class SkillboxMcpServerTests(unittest.TestCase):
                 run_manage.assert_not_called()
 
     def test_dispatch_tool_rejects_malformed_numeric_arguments_before_manage(self) -> None:
-        with mock.patch.object(MODULE, "run_manage") as run_manage:
-            result = MODULE.dispatch_tool(
-                "skillbox_logs",
-                {"lines": "abc"},
-                request_id="req-bad-lines",
-            )
+        cases = (
+            ("skillbox_logs", {"lines": "abc"}, "lines must be an integer"),
+            ("skillbox_logs", {"lines": "5"}, "lines must be an integer"),
+            ("skillbox_logs", {"lines": 2.5}, "lines must be an integer"),
+            ("skillbox_logs", {"lines": 0}, "lines must be >= 1"),
+            ("skillbox_logs", {"wait_seconds": "1.5"}, "wait_seconds must be a number"),
+            ("skillbox_logs", {"wait_seconds": float("inf")}, "wait_seconds must be a finite number"),
+            ("skillbox_skill_audit", {"max_depth": "2"}, "max_depth must be an integer"),
+            ("skillbox_mmdx_open", {"query": "review", "limit": 5.0}, "limit must be an integer"),
+        )
 
-        payload = _content_payload(result)
-        self.assertTrue(result["isError"])
-        self.assertEqual(payload["error"]["type"], "invalid_parameter")
-        self.assertIn("lines must be an integer", payload["error"]["message"])
-        run_manage.assert_not_called()
+        for tool_name, arguments, message in cases:
+            with self.subTest(tool_name=tool_name, arguments=arguments), mock.patch.object(MODULE, "run_manage") as run_manage:
+                result = MODULE.dispatch_tool(tool_name, arguments, request_id=f"req-{tool_name}")
 
-        with mock.patch.object(MODULE, "run_manage") as run_manage:
-            result = MODULE.dispatch_tool(
-                "skillbox_logs",
-                {"lines": 0},
-                request_id="req-zero-lines",
-            )
-
-        payload = _content_payload(result)
-        self.assertTrue(result["isError"])
-        self.assertEqual(payload["error"]["type"], "invalid_parameter")
-        self.assertIn("lines must be >= 1", payload["error"]["message"])
-        run_manage.assert_not_called()
+            payload = _content_payload(result)
+            self.assertTrue(result["isError"])
+            self.assertEqual(payload["error"]["type"], "invalid_parameter")
+            self.assertIn(message, payload["error"]["message"])
+            run_manage.assert_not_called()
 
     def test_dispatch_tool_rejects_malformed_boolean_arguments_before_manage(self) -> None:
         cases = (
@@ -431,7 +426,11 @@ class SkillboxMcpServerTests(unittest.TestCase):
             ({"session_id": False}, "session_id must be a string"),
             ({"cursor": True}, "cursor must be a string"),
             ({"limit": True}, "limit must be an integer"),
+            ({"limit": "50"}, "limit must be an integer"),
+            ({"limit": 50.0}, "limit must be an integer"),
             ({"wait_seconds": False}, "wait_seconds must be a number"),
+            ({"wait_seconds": "1.5"}, "wait_seconds must be a number"),
+            ({"wait_seconds": float("inf")}, "wait_seconds must be a finite number"),
         )
 
         fake_runtime_manager = mock.Mock()
