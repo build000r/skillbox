@@ -369,6 +369,88 @@ class SkillboxMcpServerTests(unittest.TestCase):
             self.assertIn(message, payload["error"]["message"])
             run_manage.assert_not_called()
 
+    def test_dispatch_tool_rejects_non_string_scalar_identifiers_before_manage(self) -> None:
+        cases = (
+            ("skillbox_focus", {"client_id": True}, "client_id must be a string"),
+            ("skillbox_session_event", {"client_id": "personal", "session_id": True}, "session_id must be a string"),
+            ("skillbox_worker_status", {"run_id": True}, "run_id must be a string"),
+            ("skillbox_worker_promote_learning", {"proposal_id": False}, "proposal_id must be a string"),
+            ("skillbox_skill", {"action": "add", "skill": True}, "skill must be a string"),
+            ("skillbox_overlay", {"action": "activate", "name": True}, "name must be a string"),
+        )
+
+        for tool_name, arguments, message in cases:
+            with self.subTest(tool_name=tool_name), mock.patch.object(MODULE, "run_manage") as run_manage:
+                result = MODULE.dispatch_tool(tool_name, arguments, request_id=f"req-{tool_name}")
+
+            payload = _content_payload(result)
+            self.assertTrue(result["isError"])
+            self.assertEqual(payload["error"]["type"], "invalid_parameter")
+            self.assertIn(message, payload["error"]["message"])
+            run_manage.assert_not_called()
+
+    def test_dispatch_tool_rejects_non_string_scalar_options_before_manage(self) -> None:
+        cases = (
+            ("skillbox_skill", {"action": "add", "skill": "ui", "cwd": True}, "cwd must be a string"),
+            ("skillbox_mmdx_open", {"query": True}, "query must be a string"),
+            ("skillbox_worker_submit", {"task_class": True, "instruction": "Inspect"}, "task_class must be a string"),
+            ("skillbox_worker_submit", {"task_class": "analysis", "instruction": False}, "instruction must be a string"),
+        )
+
+        for tool_name, arguments, message in cases:
+            with self.subTest(tool_name=tool_name), mock.patch.object(MODULE, "run_manage") as run_manage:
+                result = MODULE.dispatch_tool(tool_name, arguments, request_id=f"req-{tool_name}")
+
+            payload = _content_payload(result)
+            self.assertTrue(result["isError"])
+            self.assertEqual(payload["error"]["type"], "invalid_parameter")
+            self.assertIn(message, payload["error"]["message"])
+            run_manage.assert_not_called()
+
+    def test_dispatch_tool_rejects_boolean_numeric_arguments_before_manage(self) -> None:
+        cases = (
+            ("skillbox_logs", {"lines": True}, "lines must be an integer"),
+            ("skillbox_logs", {"wait_seconds": False}, "wait_seconds must be a number"),
+            ("skillbox_skill_audit", {"max_depth": True}, "max_depth must be an integer"),
+            ("skillbox_mmdx_open", {"query": "review", "limit": False}, "limit must be an integer"),
+        )
+
+        for tool_name, arguments, message in cases:
+            with self.subTest(tool_name=tool_name), mock.patch.object(MODULE, "run_manage") as run_manage:
+                result = MODULE.dispatch_tool(tool_name, arguments, request_id=f"req-{tool_name}")
+
+            payload = _content_payload(result)
+            self.assertTrue(result["isError"])
+            self.assertEqual(payload["error"]["type"], "invalid_parameter")
+            self.assertIn(message, payload["error"]["message"])
+            run_manage.assert_not_called()
+
+    def test_skillbox_events_rejects_coerced_scalar_and_numeric_arguments(self) -> None:
+        cases = (
+            ({"client_id": True}, "client_id must be a string"),
+            ({"session_id": False}, "session_id must be a string"),
+            ({"cursor": True}, "cursor must be a string"),
+            ({"limit": True}, "limit must be an integer"),
+            ({"wait_seconds": False}, "wait_seconds must be a number"),
+        )
+
+        fake_runtime_manager = mock.Mock()
+        fake_runtime_manager.DEFAULT_EVENT_FEED_LIMIT = 50
+        fake_runtime_manager.DEFAULT_ROOT_DIR = ROOT_DIR
+
+        for arguments, message in cases:
+            with self.subTest(arguments=arguments), mock.patch.object(
+                MODULE,
+                "_runtime_manager_module",
+                return_value=fake_runtime_manager,
+            ):
+                result = MODULE.dispatch_tool("skillbox_events", arguments, request_id="req-events")
+
+            payload = _content_payload(result)
+            self.assertTrue(result["isError"])
+            self.assertEqual(payload["error"]["type"], "invalid_parameter")
+            self.assertIn(message, payload["error"]["message"])
+
     def test_runtime_mcp_dry_run_marker_allows_matching_real_action(self) -> None:
         arguments = {
             "client": ["personal"],

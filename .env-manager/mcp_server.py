@@ -1461,18 +1461,33 @@ def _repeat_param_values(params: dict, key: str) -> list[str]:
         return []
     raw_values = params[key]
     if isinstance(raw_values, str):
-        return [raw_values]
+        value = raw_values.strip()
+        return [value] if value else []
     if not isinstance(raw_values, (list, tuple, set)):
         raise ValueError(f"{key} must be a string or array of strings")
     values: list[str] = []
     for value in raw_values:
         if not isinstance(value, str):
             raise ValueError(f"{key} values must be strings")
-        values.append(value)
+        item = value.strip()
+        if item:
+            values.append(item)
     return values
 
 
+def _string_param(params: dict, key: str) -> str | None:
+    if key not in params or params[key] is None:
+        return None
+    value = params[key]
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a string")
+    cleaned = value.strip()
+    return cleaned or None
+
+
 def _int_param(params: dict, key: str, *, minimum: int | None = None) -> int:
+    if isinstance(params[key], bool):
+        raise ValueError(f"{key} must be an integer")
     try:
         value = int(params[key])
     except (TypeError, ValueError) as exc:
@@ -1483,6 +1498,8 @@ def _int_param(params: dict, key: str, *, minimum: int | None = None) -> int:
 
 
 def _float_param(params: dict, key: str, *, minimum: float | None = None) -> float:
+    if isinstance(params[key], bool):
+        raise ValueError(f"{key} must be a number")
     try:
         value = float(params[key])
     except (TypeError, ValueError) as exc:
@@ -1509,8 +1526,9 @@ def _validate_bool_params(params: dict) -> None:
 
 def _append_scalar_args(args: list[str], params: dict) -> None:
     for key, flag in _STRING_ARG_SPECS:
-        if params.get(key):
-            args += [flag, str(params[key])]
+        value = _string_param(params, key)
+        if value:
+            args += [flag, value]
     if params.get("lines") is not None:
         args += ["--lines", str(_int_param(params, "lines", minimum=1))]
     if params.get("wait_seconds") is not None:
@@ -1542,21 +1560,31 @@ def _append_bool_args(args: list[str], command: str, params: dict) -> None:
 def _append_command_positionals(args: list[str], command: str, params: dict) -> None:
     if command == "worker-submit":
         for key in ("task_class", "instruction"):
-            if params.get(key):
-                args.append(str(params[key]))
+            value = _string_param(params, key)
+            if value:
+                args.append(value)
         return
-    if command in {"worker-status", "worker-artifacts"} and params.get("run_id"):
-        args.append(str(params["run_id"]))
+    if command in {"worker-status", "worker-artifacts"}:
+        run_id = _string_param(params, "run_id")
+        if run_id:
+            args.append(run_id)
         return
-    if command == "worker-promote-learning" and params.get("proposal_id"):
-        args.append(str(params["proposal_id"]))
+    if command == "worker-promote-learning":
+        proposal_id = _string_param(params, "proposal_id")
+        if proposal_id:
+            args.append(proposal_id)
         return
-    if command == "mmdx" and params.get("query"):
-        args.append(str(params["query"]))
-    if params.get("skill"):
-        args.append(str(params["skill"]))
-    if command == "overlay" and params.get("name"):
-        args.append(str(params["name"]))
+    if command == "mmdx":
+        query = _string_param(params, "query")
+        if query:
+            args.append(query)
+    skill = _string_param(params, "skill")
+    if skill:
+        args.append(skill)
+    if command == "overlay":
+        name = _string_param(params, "name")
+        if name:
+            args.append(name)
 
 
 def build_args(command: str, params: dict, positional: str | None = None) -> list[str]:
@@ -1671,7 +1699,12 @@ def _redact_event_feed_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def _handle_events(params: dict) -> dict:
     # Validate identifier params before use
     for key in ("client_id", "session_id"):
-        value = str(params.get(key) or "").strip()
+        try:
+            value = _string_param(params, key)
+        except ValueError as exc:
+            return _error_content(
+                {"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}}
+            )
         if value:
             try:
                 _validate_identifier(value, key)
@@ -1682,8 +1715,19 @@ def _handle_events(params: dict) -> dict:
 
     runtime_manager = _runtime_manager_module()
     try:
-        limit = max(1, min(200, int(params.get("limit") or runtime_manager.DEFAULT_EVENT_FEED_LIMIT)))
-        wait_seconds = max(0.0, min(30.0, float(params.get("wait_seconds") or 0.0)))
+        limit = (
+            _int_param(params, "limit")
+            if "limit" in params and params["limit"] is not None
+            else int(runtime_manager.DEFAULT_EVENT_FEED_LIMIT)
+        )
+        wait_seconds = (
+            _float_param(params, "wait_seconds")
+            if "wait_seconds" in params and params["wait_seconds"] is not None
+            else 0.0
+        )
+        limit = max(1, min(200, limit))
+        wait_seconds = max(0.0, min(30.0, wait_seconds))
+        cursor = _string_param(params, "cursor")
     except (TypeError, ValueError) as exc:
         return _error_content(
             {
@@ -1697,9 +1741,9 @@ def _handle_events(params: dict) -> dict:
 
     payload = runtime_manager.event_feed_payload(
         runtime_manager.DEFAULT_ROOT_DIR,
-        client_id=str(params.get("client_id") or "").strip() or None,
-        session_id=str(params.get("session_id") or "").strip() or None,
-        cursor=str(params.get("cursor") or "").strip() or None,
+        client_id=_string_param(params, "client_id"),
+        session_id=_string_param(params, "session_id"),
+        cursor=cursor,
         limit=limit,
         wait_seconds=wait_seconds,
     )
@@ -1834,8 +1878,7 @@ def _tool_params_with_defaults(name: str, params: dict) -> dict:
 def _positional_arg(positional_key: str | None, tool_params: dict) -> str | None:
     if not positional_key:
         return None
-    value = _clean_param_scalar(tool_params, positional_key)
-    return value or None
+    return _string_param(tool_params, positional_key)
 
 
 def _missing_positional_error(name: str, positional_key: str) -> dict:
@@ -1858,7 +1901,16 @@ def _positional_required(positional_key: str | None, positional: str | None, too
 def _validate_tool_identifiers(tool_name: str, tool_params: dict) -> str | None:
     """Validate identifier-shaped params. Returns an error message or None."""
     # Validate client_id (scalar, used as positional for onboard/focus/session/acceptance/etc.)
-    client_id = str(tool_params.get("client_id") or "").strip()
+    try:
+        client_id = _string_param(tool_params, "client_id")
+        session_id = _string_param(tool_params, "session_id")
+        run_id = _string_param(tool_params, "run_id")
+        proposal_id = _string_param(tool_params, "proposal_id")
+        skill = _string_param(tool_params, "skill")
+        overlay_name = _string_param(tool_params, "name")
+    except ValueError as exc:
+        return str(exc)
+
     if client_id:
         try:
             _validate_identifier(client_id, "client_id")
@@ -1866,7 +1918,6 @@ def _validate_tool_identifiers(tool_name: str, tool_params: dict) -> str | None:
             return str(exc)
 
     # Validate session_id
-    session_id = str(tool_params.get("session_id") or "").strip()
     if session_id:
         try:
             _validate_identifier(session_id, "session_id")
@@ -1874,7 +1925,6 @@ def _validate_tool_identifiers(tool_name: str, tool_params: dict) -> str | None:
             return str(exc)
 
     # Validate run_id
-    run_id = str(tool_params.get("run_id") or "").strip()
     if run_id:
         try:
             _validate_identifier(run_id, "run_id")
@@ -1882,7 +1932,6 @@ def _validate_tool_identifiers(tool_name: str, tool_params: dict) -> str | None:
             return str(exc)
 
     # Validate proposal_id
-    proposal_id = str(tool_params.get("proposal_id") or "").strip()
     if proposal_id:
         try:
             _validate_identifier(proposal_id, "proposal_id")
@@ -1904,7 +1953,6 @@ def _validate_tool_identifiers(tool_name: str, tool_params: dict) -> str | None:
                     return str(exc)
 
     # Validate skill name
-    skill = str(tool_params.get("skill") or "").strip()
     if skill:
         try:
             _validate_identifier(skill, "skill")
@@ -1913,7 +1961,6 @@ def _validate_tool_identifiers(tool_name: str, tool_params: dict) -> str | None:
 
     # Only overlay uses `name` as an identifier. Other tools, notably
     # operator-booking, use it as a free-form display name.
-    overlay_name = str(tool_params.get("name") or "").strip()
     if tool_name == "skillbox_overlay" and overlay_name:
         try:
             _validate_identifier(overlay_name, "name")
@@ -1938,7 +1985,16 @@ def _dispatch_manage_tool(
     if id_error:
         return _error_content({"error": {"type": "invalid_parameter", "message": id_error, "recoverable": True}})
 
-    positional = _positional_arg(positional_key, tool_params)
+    try:
+        positional = _positional_arg(positional_key, tool_params)
+    except ValueError as exc:
+        return _error_content({
+            "error": {
+                "type": "invalid_parameter",
+                "message": str(exc),
+                "recoverable": True,
+            }
+        })
     if _positional_required(positional_key, positional, tool_params):
         return _missing_positional_error(name, str(positional_key))
 
