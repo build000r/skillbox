@@ -11,5 +11,5 @@ storage:
   mount_path: /srv/skillbox
   filesystem: ext4
   required: true
-  volume_size_gb: 50
+  volume_size_gb: 100
   min_free_gb: 45
