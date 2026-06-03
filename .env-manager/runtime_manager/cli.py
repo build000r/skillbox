@@ -4,7 +4,7 @@ import difflib
 import os
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from .shared import *
@@ -3375,6 +3375,8 @@ def _emit_up_payload(
     exit_code: int,
     model: dict[str, Any] | None = None,
 ) -> int:
+    if model is not None:
+        _attach_runtime_access_payload(model, payload)
     if args.format == "json":
         emit_json(payload)
     elif exit_code != EXIT_OK and "error" in payload:
@@ -3391,13 +3393,47 @@ def _emit_up_payload(
                     if s.get("id")
                     and s.get("result") in {"started", "already-running", "would-restart", "dry-run"}
                 }
-                summary = build_endpoint_summary(model, started or None)
+                summary = build_endpoint_summary(
+                    model,
+                    started or None,
+                    box_access=payload.get("box_access") or {},
+                )
                 print_endpoint_summary(summary)
             except Exception:
                 # Endpoint summary is purely informational; never let it fail
                 # the `up` command.
                 pass
     return exit_code
+
+
+def _append_unique_warnings(payload: dict[str, Any], warnings: list[str]) -> None:
+    existing = [
+        str(value)
+        for value in (payload.get("warnings") or [])
+        if str(value).strip()
+    ]
+    seen = set(existing)
+    for warning in warnings:
+        if warning not in seen:
+            existing.append(warning)
+            seen.add(warning)
+    payload["warnings"] = existing
+
+
+def _attach_runtime_access_payload(model: dict[str, Any], payload: dict[str, Any]) -> None:
+    box_access = payload.get("box_access") or runtime_box_access_from_env(model.get("env") or {})
+    payload["box_access"] = box_access
+    services = payload.get("services")
+    if not isinstance(services, list):
+        payload.setdefault("warnings", payload.get("warnings") or [])
+        return
+    try:
+        from .endpoints import annotate_service_rows
+
+        warnings = annotate_service_rows(model, services, box_access=box_access)
+    except Exception:
+        warnings = []
+    _append_unique_warnings(payload, warnings)
 
 
 def _primary_client_id(args: argparse.Namespace, model: dict[str, Any], default: str = "personal") -> str:
@@ -3709,6 +3745,171 @@ def _runtime_item_owned_by_client(
     return str((repo or {}).get("client") or "").strip() == client_id
 
 
+def _runtime_path_under_or_equal(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+        return True
+    except ValueError:
+        return candidate == root
+
+
+def _runtime_safe_resolve(path: Path) -> Path:
+    try:
+        return path.expanduser().resolve()
+    except OSError:
+        return path.expanduser().absolute()
+
+
+def _runtime_model_match_path(model: dict[str, Any], raw_path: Any) -> Path | None:
+    value = str(raw_path or "").strip()
+    if not value:
+        return None
+    root_dir = Path(str(model.get("root_dir") or DEFAULT_ROOT_DIR))
+    env = model.get("env") or {}
+    try:
+        translated = runtime_path_to_host_path(
+            root_dir,
+            env,
+            os.path.expandvars(os.path.expanduser(value)),
+            storage=model.get("storage"),
+        )
+        return _runtime_safe_resolve(Path(str(translated)))
+    except Exception:
+        return _runtime_safe_resolve(Path(os.path.expandvars(os.path.expanduser(value))))
+
+
+def _runtime_repo_tail(raw_path: Any) -> Path | None:
+    value = str(raw_path or "").strip()
+    if not value:
+        return None
+    path = PurePosixPath(value.replace("\\", "/"))
+    parts = path.parts
+    repo_index = -1
+    for index, part in enumerate(parts):
+        if part == "repos":
+            repo_index = index
+    if repo_index < 0 or repo_index + 1 >= len(parts):
+        return None
+    tail_parts = parts[repo_index + 1:]
+    if not tail_parts:
+        return None
+    if tail_parts[0] in {".", ".."} or any(part == ".." for part in tail_parts):
+        return None
+    return Path(*tail_parts)
+
+
+def _runtime_operator_repo_roots(model: dict[str, Any]) -> list[Path]:
+    env = model.get("env") or {}
+    raw_roots = [
+        env.get("SKILLBOX_MONOSERVER_HOST_ROOT"),
+        env.get("SKILLBOX_MONOSERVER_ROOT"),
+        env.get("SKILLBOX_OPERATOR_REPOS_ROOT"),
+    ]
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for raw_root in raw_roots:
+        path = _runtime_model_match_path(model, raw_root)
+        if path is None:
+            continue
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(path)
+    return roots
+
+
+def _runtime_model_match_paths(model: dict[str, Any], raw_path: Any) -> list[Path]:
+    paths: list[Path] = []
+    primary = _runtime_model_match_path(model, raw_path)
+    if primary is not None:
+        paths.append(primary)
+    repo_tail = _runtime_repo_tail(raw_path)
+    if repo_tail is not None:
+        paths.extend(root / repo_tail for root in _runtime_operator_repo_roots(model))
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return deduped
+
+
+def _runtime_client_match_paths(model: dict[str, Any], client: dict[str, Any]) -> list[Path]:
+    raw_paths: list[Any] = [
+        client.get("default_cwd_host_path"),
+        client.get("default_cwd"),
+    ]
+    context = client.get("context") or {}
+    if isinstance(context, dict):
+        raw_matches = context.get("cwd_match") or []
+        if isinstance(raw_matches, str):
+            raw_matches = [raw_matches]
+        raw_paths.extend(raw_matches)
+        deploy = context.get("deploy") or {}
+        if isinstance(deploy, dict):
+            raw_paths.append(deploy.get("repo_root"))
+    paths = [
+        path
+        for value in raw_paths
+        for path in _runtime_model_match_paths(model, value)
+    ]
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return deduped
+
+
+def _runtime_client_name_matches_cwd(client_id: str, cwd: Path) -> bool:
+    normalized_id = client_id.lower().replace("-", "_")
+    if not normalized_id:
+        return False
+    normalized_name = cwd.name.lower().replace("-", "_")
+    return normalized_name == normalized_id
+
+
+def _runtime_client_matches_for_cwd(model: dict[str, Any], cwd: Path) -> list[dict[str, Any]]:
+    matches = list(matched_skill_clients(model, cwd))
+    seen = {str(match.get("id") or "") for match in matches}
+    resolved_cwd = _runtime_safe_resolve(cwd)
+    extra_matches: list[dict[str, Any]] = []
+    for client in model.get("clients") or []:
+        client_id = str(client.get("id") or "").strip()
+        if not client_id or client_id in seen:
+            continue
+        best_path = ""
+        best_len = -1
+        for path in _runtime_client_match_paths(model, client):
+            if not _runtime_path_under_or_equal(resolved_cwd, path):
+                continue
+            path_text = str(path)
+            if len(path_text) > best_len:
+                best_path = path_text
+                best_len = len(path_text)
+        if not best_path and not _runtime_client_name_matches_cwd(client_id, resolved_cwd):
+            continue
+        extra_matches.append(
+            {
+                "id": client_id,
+                "label": str(client.get("label") or client_id),
+                "match": best_path or str(resolved_cwd),
+            }
+        )
+        seen.add(client_id)
+    return sorted(
+        matches + extra_matches,
+        key=lambda item: (-len(str(item.get("match") or "")), str(item.get("id") or "")),
+    )
+
+
 def _local_runtime_services_for_profiles(
     model: dict[str, Any],
     active_profiles: set[str],
@@ -3823,10 +4024,8 @@ def _active_clients_for_args(args: argparse.Namespace, model: dict[str, Any]) ->
     if args.command not in cwd_inferred_commands or requested_clients:
         return active_clients
     raw_cwd = getattr(args, "cwd", None)
-    if args.command not in {"skills", "skill", "overlay", "mcp-audit"} and not raw_cwd:
-        return active_clients
     skill_cwd = Path(raw_cwd or os.getcwd())
-    matches = matched_skill_clients(model, skill_cwd)
+    matches = _runtime_client_matches_for_cwd(model, skill_cwd)
     if not matches:
         return active_clients
     if args.command in {"bootstrap", "up", "down", "restart", "status", "logs"}:

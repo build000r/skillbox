@@ -45,18 +45,36 @@ DEBIAN_FRONTEND=noninteractive apt-get -y upgrade
 
 echo "[2/9] Installing baseline packages..."
 apt-get install -y \
+  bat \
+  build-essential \
   ca-certificates \
   curl \
+  direnv \
   fail2ban \
+  fd-find \
+  fzf \
+  gh \
   git \
+  golang-go \
   gnupg \
   jq \
+  less \
+  libssl-dev \
   make \
+  openssh-client \
+  pipx \
+  pkg-config \
   python3 \
+  python3-pip \
+  python3-venv \
   python3-yaml \
+  ripgrep \
+  rustc \
+  cargo \
   tmux \
   ufw \
   unzip \
+  zsh \
   xfsprogs
 
 echo "[3/9] Installing Node.js 22 LTS..."
@@ -86,6 +104,52 @@ if ! id -u "${APP_USER}" >/dev/null 2>&1; then
 fi
 usermod -aG sudo,docker,adm "${APP_USER}"
 install -d -m 700 -o "${APP_USER}" -g "${APP_USER}" "/home/${APP_USER}/.ssh"
+install -d -m 755 -o "${APP_USER}" -g "${APP_USER}" "/home/${APP_USER}/.local" "/home/${APP_USER}/.local/bin"
+install -d -m 700 -o "${APP_USER}" -g "${APP_USER}" \
+  "/home/${APP_USER}/.config" \
+  "/home/${APP_USER}/.config/claude-code" \
+  "/home/${APP_USER}/.config/git" \
+  "/home/${APP_USER}/.config/gh" \
+  "/home/${APP_USER}/.grok"
+cat >"/home/${APP_USER}/.profile.d-skillbox-paths" <<'EOF'
+# Skillbox operator shell baseline.
+for dir in "$HOME/.grok/bin" "$HOME/.npm-global/bin" "$HOME/.cargo/bin" "$HOME/.local/bin" "$HOME/bin"; do
+  case ":$PATH:" in
+    *":$dir:"*) ;;
+    *) [ -d "$dir" ] && PATH="$dir:$PATH" ;;
+  esac
+done
+export PATH
+EOF
+chown "${APP_USER}:${APP_USER}" "/home/${APP_USER}/.profile.d-skillbox-paths"
+chmod 644 "/home/${APP_USER}/.profile.d-skillbox-paths"
+bashrc_file="/home/${APP_USER}/.bashrc"
+if [[ -f "${bashrc_file}" ]] && ! grep -qF '. "$HOME/.profile.d-skillbox-paths"' "${bashrc_file}"; then
+  bashrc_tmp="$(mktemp)"
+  {
+    echo '# Skillbox operator PATH baseline'
+    echo '[ -f "$HOME/.profile.d-skillbox-paths" ] && . "$HOME/.profile.d-skillbox-paths"'
+    echo
+    cat "${bashrc_file}"
+  } >"${bashrc_tmp}"
+  install -m 644 -o "${APP_USER}" -g "${APP_USER}" "${bashrc_tmp}" "${bashrc_file}"
+  rm -f "${bashrc_tmp}"
+fi
+profile_file="/home/${APP_USER}/.profile"
+if [[ -f "${profile_file}" ]] && ! grep -qF '. "$HOME/.profile.d-skillbox-paths"' "${profile_file}"; then
+  {
+    echo
+    echo '# Skillbox operator PATH baseline'
+    echo '[ -f "$HOME/.profile.d-skillbox-paths" ] && . "$HOME/.profile.d-skillbox-paths"'
+  } >>"${profile_file}"
+fi
+if command -v fdfind >/dev/null 2>&1 && [[ ! -e "/home/${APP_USER}/.local/bin/fd" ]]; then
+  ln -sf /usr/bin/fdfind "/home/${APP_USER}/.local/bin/fd"
+fi
+if command -v batcat >/dev/null 2>&1 && [[ ! -e "/home/${APP_USER}/.local/bin/bat" ]]; then
+  ln -sf /usr/bin/batcat "/home/${APP_USER}/.local/bin/bat"
+fi
+chown -h "${APP_USER}:${APP_USER}" "/home/${APP_USER}/.local/bin/fd" "/home/${APP_USER}/.local/bin/bat" 2>/dev/null || true
 if [[ -f /root/.ssh/authorized_keys ]]; then
   install -m 600 -o "${APP_USER}" -g "${APP_USER}" /root/.ssh/authorized_keys "/home/${APP_USER}/.ssh/authorized_keys"
 fi
@@ -130,14 +194,49 @@ if [[ -n "${STATE_ROOT}" && -n "${STORAGE_FILESYSTEM}" && -n "${VOLUME_DEVICE}" 
   findmnt --verify --verbose
   findmnt "${STATE_ROOT}"
 
+  SANDBOX_GID="${SANDBOX_GID:-1001}"
   chown "${APP_USER}:${APP_USER}" "${STATE_ROOT}"
-  install -d -o "${APP_USER}" -g "${APP_USER}" -m 0755 \
+  install -d -o "${APP_USER}" -g "${SANDBOX_GID}" -m 2775 \
     "${STATE_ROOT}/home/.claude" \
     "${STATE_ROOT}/home/.codex" \
+    "${STATE_ROOT}/home/.config" \
+    "${STATE_ROOT}/home/.config/claude-code" \
+    "${STATE_ROOT}/home/.config/git" \
+    "${STATE_ROOT}/home/.config/gh" \
+    "${STATE_ROOT}/home/.grok" \
     "${STATE_ROOT}/home/.local" \
+    "${STATE_ROOT}/backups" \
     "${STATE_ROOT}/clients" \
     "${STATE_ROOT}/logs" \
+    "${STATE_ROOT}/repos" \
     "${STATE_ROOT}/monoserver"
+  for shared_dir in \
+    "${STATE_ROOT}/home/.claude" \
+    "${STATE_ROOT}/home/.codex" \
+    "${STATE_ROOT}/home/.config" \
+    "${STATE_ROOT}/home/.grok" \
+    "${STATE_ROOT}/home/.local" \
+    "${STATE_ROOT}/backups" \
+    "${STATE_ROOT}/clients" \
+    "${STATE_ROOT}/logs" \
+    "${STATE_ROOT}/repos" \
+    "${STATE_ROOT}/monoserver"; do
+    chown -R "${APP_USER}:${SANDBOX_GID}" "${shared_dir}"
+    chmod -R u+rwX,g+rwX "${shared_dir}"
+    find "${shared_dir}" -type d -exec chmod g+s {} +
+  done
+  if [[ "$(dirname "${STATE_ROOT}")" == "/srv" ]]; then
+    state_name="$(basename "${STATE_ROOT}")"
+    for alias_name in repos home logs backups; do
+      alias_path="/srv/${alias_name}"
+      alias_target="${state_name}/${alias_name}"
+      if [[ -L "${alias_path}" ]]; then
+        ln -sfn "${alias_target}" "${alias_path}"
+      elif [[ ! -e "${alias_path}" ]]; then
+        ln -s "${alias_target}" "${alias_path}"
+      fi
+    done
+  fi
 else
   echo "  No state-volume metadata provided; skipping durable-state mount setup."
 fi

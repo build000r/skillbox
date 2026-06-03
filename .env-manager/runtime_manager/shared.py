@@ -125,6 +125,7 @@ PATH_LIKE_ENV_KEYS = {
     "SKILLBOX_SBH_CONFIG",
     "SKILLBOX_CASS_BIN",
     "SKILLBOX_CM_BIN",
+    "SKILLBOX_UBS_BIN",
     "SKILLBOX_APR_BIN",
     "SKILLBOX_INGRESS_ROUTE_FILE",
     "SKILLBOX_INGRESS_NGINX_CONFIG",
@@ -3963,7 +3964,47 @@ def _install_skill_to_targets(
         tree_sha = filtered_copy_skill(skill_source, install_dir)
         install_tree_shas[target["id"]] = tree_sha
         actions.append(f"install-skill: {skill_name} -> {install_dir}")
+        _mirror_installed_skill_to_host_home(skill_name, target_root, dry_run, actions)
     return install_tree_shas
+
+
+def _host_skill_mirror_root(target_root: Path) -> Path | None:
+    host_home = os.environ.get("SKILLBOX_HOST_HOME_ROOT", "").strip()
+    if not host_home:
+        return None
+    if target_root.name != "skills" or target_root.parent.name not in {".claude", ".codex"}:
+        return None
+    host_root = Path(host_home).expanduser() / target_root.parent.name / "skills"
+    if host_root.resolve(strict=False) == target_root.resolve(strict=False):
+        return None
+    return host_root
+
+
+def _mirror_installed_skill_to_host_home(
+    skill_name: str,
+    target_root: Path,
+    dry_run: bool,
+    actions: list[str],
+) -> None:
+    mirror_root = _host_skill_mirror_root(target_root)
+    if mirror_root is None:
+        return
+    source_dir = target_root / skill_name
+    mirror_dir = mirror_root / skill_name
+    if dry_run:
+        actions.append(f"mirror-host-skill: {skill_name} -> {mirror_dir}")
+        return
+    ensure_directory(mirror_root, dry_run=False)
+    if mirror_dir.is_symlink():
+        if os.readlink(mirror_dir) == str(source_dir):
+            actions.append(f"mirror-host-skill-unchanged: {skill_name} -> {mirror_dir}")
+            return
+        mirror_dir.unlink()
+    elif mirror_dir.exists():
+        actions.append(f"mirror-host-skill-skip: {skill_name} -> {mirror_dir} (exists)")
+        return
+    mirror_dir.symlink_to(source_dir, target_is_directory=True)
+    actions.append(f"mirror-host-skill: {skill_name} -> {mirror_dir}")
 
 
 def _build_lock_skill_entry(

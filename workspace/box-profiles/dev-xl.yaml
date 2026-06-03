@@ -1,6 +1,6 @@
 provider: digitalocean
 region: nyc3
-size: s-4vcpu-8gb
+size: s-8vcpu-16gb
 image: ubuntu-24-04-x64
 ssh_user: skillbox
 tailscale_hostname_prefix: skillbox
@@ -11,5 +11,4 @@ storage:
   mount_path: /srv/skillbox
   filesystem: ext4
   required: true
-  volume_size_gb: 50
-  min_free_gb: 45
+  min_free_gb: 50

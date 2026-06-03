@@ -30,6 +30,11 @@ bindings:
     storage_class: persistent
     relative_path: home/.local
 
+  - id: ntm-config
+    runtime_path: /home/sandbox/.config/ntm
+    storage_class: persistent
+    relative_path: home/.config/ntm
+
   - id: clients-root
     runtime_path: /workspace/workspace/clients
     storage_class: persistent

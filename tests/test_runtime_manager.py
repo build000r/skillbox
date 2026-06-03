@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import io
 import json
 import os
 import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import unittest
@@ -555,6 +557,68 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(payload["matched_clients"][0]["id"], "personal")
             self.assertIn("sample-skill", effective_names)
             self.assertIn("personal-skill", effective_names)
+
+    def test_runtime_commands_infer_client_from_current_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._write_client_overlay(
+                repo,
+                "buildooor",
+                label="Buildooor",
+                default_cwd="${SKILLBOX_MONOSERVER_ROOT}/buildooor",
+                root_path="${SKILLBOX_MONOSERVER_ROOT}/buildooor",
+                include_context=True,
+            )
+            clients_root = self._clients_host_root(repo)
+            (clients_root / "buildooor" / "skill-repos.yaml").write_text(
+                "version: 2\nskill_repos: []\n",
+                encoding="utf-8",
+            )
+            client_cwd = repo / ".skillbox-state" / "monoserver" / "buildooor"
+            client_cwd.mkdir(parents=True, exist_ok=True)
+            overlay_path = clients_root / "buildooor" / "overlay.yaml"
+            overlay_doc = MANAGE_MODULE.load_yaml(overlay_path)
+            overlay_doc["client"].setdefault("services", []).append(
+                {
+                    "id": "buildooor-web",
+                    "kind": "http",
+                    "repo_id": "buildooor-root",
+                    "command": "python3 -m http.server 3000",
+                    "origin_url": "http://127.0.0.1:3000",
+                    "healthcheck": {"type": "http", "url": "http://127.0.0.1:3000/health"},
+                    "profiles": ["core"],
+                }
+            )
+            overlay_path.write_text(MANAGE_MODULE.render_yaml_document(overlay_doc), encoding="utf-8")
+
+            status = subprocess.run(
+                ["python3", str(MANAGER), "--root-dir", str(repo), "status", "--format", "json"],
+                cwd=client_cwd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(status.returncode, 0, status.stderr)
+            status_payload = json.loads(status.stdout)
+            self.assertEqual(status_payload["active_clients"], ["buildooor"])
+            service = next(item for item in status_payload["services"] if item["id"] == "buildooor-web")
+            self.assertEqual(service["endpoint"]["exposure"], "loopback-only")
+            self.assertTrue(any("buildooor-web is loopback-only" in item for item in status_payload["warnings"]))
+
+            up = subprocess.run(
+                ["python3", str(MANAGER), "--root-dir", str(repo), "up", "--dry-run", "--format", "json"],
+                cwd=client_cwd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(up.returncode, 0, up.stderr)
+            up_payload = json.loads(up.stdout)
+            self.assertIn("box_access", up_payload)
+            up_service = next(item for item in up_payload["services"] if item["id"] == "buildooor-web")
+            self.assertEqual(up_service["endpoint"]["exposure"], "loopback-only")
+            self.assertTrue(any("buildooor-web is loopback-only" in item for item in up_payload["warnings"]))
 
     def test_sync_reconciles_safe_git_repo_residue_into_a_real_clone(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4578,6 +4642,10 @@ class RuntimeManagerTests(unittest.TestCase):
             "    runtime_path: /home/sandbox/.local\n"
             "    storage_class: persistent\n"
             "    relative_path: home/.local\n"
+            "  - id: ntm-config\n"
+            "    runtime_path: /home/sandbox/.config/ntm\n"
+            "    storage_class: persistent\n"
+            "    relative_path: home/.config/ntm\n"
             "  - id: clients-root\n"
             "    runtime_path: /workspace/workspace/clients\n"
             "    storage_class: persistent\n"
@@ -4604,6 +4672,7 @@ class RuntimeManagerTests(unittest.TestCase):
             "SKILLBOX_SKILLS_ROOT=/workspace/skills\n"
             "SKILLBOX_LOG_ROOT=/workspace/logs\n"
             "SKILLBOX_HOME_ROOT=/home/sandbox\n"
+            "SKILLBOX_HOST_HOME_ROOT=\n"
             "SKILLBOX_MONOSERVER_ROOT=/monoserver\n"
             "SKILLBOX_CLIENTS_ROOT=/workspace/workspace/clients\n"
             "SKILLBOX_CLIENTS_HOST_ROOT=./.skillbox-state/clients\n"
@@ -4635,6 +4704,9 @@ class RuntimeManagerTests(unittest.TestCase):
             "SKILLBOX_CM_DOWNLOAD_URL=\n"
             "SKILLBOX_CM_DOWNLOAD_SHA256=\n"
             "SKILLBOX_CM_MCP_PORT=3222\n"
+            "SKILLBOX_UBS_BIN=/home/sandbox/.local/bin/ubs\n"
+            "SKILLBOX_UBS_DOWNLOAD_URL=\n"
+            "SKILLBOX_UBS_DOWNLOAD_SHA256=\n"
             "SKILLBOX_FWC_BIN=/home/sandbox/.local/bin/fwc\n"
             "SKILLBOX_FWC_DOWNLOAD_URL=\n"
             "SKILLBOX_FWC_DOWNLOAD_SHA256=\n"
@@ -7240,6 +7312,40 @@ class RuntimeManagerTests(unittest.TestCase):
             urlopen.assert_called_once()
             self.assertEqual(actions, [f"download-reconcile: https://example.com/tool -> {target}"])
             self.assertEqual(target.read_bytes(), payload)
+
+    def test_sync_artifact_download_extracts_single_file_tar_gz(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "bin" / "tool"
+            binary_payload = b"#!/bin/sh\necho archived\n"
+            archive_buffer = io.BytesIO()
+            with tarfile.open(fileobj=archive_buffer, mode="w:gz") as archive:
+                info = tarfile.TarInfo("tool")
+                info.size = len(binary_payload)
+                archive.addfile(info, io.BytesIO(binary_payload))
+            archive_payload = archive_buffer.getvalue()
+            expected_sha256 = hashlib.sha256(archive_payload).hexdigest()
+            artifact = {
+                "id": "fixture-bin",
+                "host_path": str(target),
+                "source": {
+                    "kind": "url",
+                    "url": "https://example.com/tool.tar.gz",
+                    "sha256": expected_sha256,
+                    "executable": True,
+                    "archive": "tar.gz",
+                },
+                "sync": {"mode": "download-if-missing"},
+            }
+
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = archive_payload
+
+            with mock.patch.object(MANAGE_MODULE.urllib.request, "urlopen", return_value=response):
+                actions = MANAGE_MODULE.sync_artifact(artifact, dry_run=False)
+
+            self.assertEqual(actions, [f"download-if-missing: https://example.com/tool.tar.gz -> {target}"])
+            self.assertEqual(target.read_bytes(), binary_payload)
+            self.assertTrue(target.stat().st_mode & 0o111)
 
     def test_sync_artifact_rejects_non_https_or_mismatched_digest(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
