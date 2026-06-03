@@ -59,14 +59,21 @@ configure_operator_defaults() {
   local config_candidate=""
   local config_root=""
   local config_candidates=()
+  local inferred_operator_repos_root=""
   local repos_candidate=""
   local repos_root=""
   local repos_candidates=()
+  if [[ -n "${SKILLBOX_ROOT:-}" ]]; then
+    inferred_operator_repos_root="$(realpath_portable "${SKILLBOX_ROOT}/../..")"
+  fi
   if [[ -n "${SKILLBOX_CONFIG_ROOT:-}" ]]; then
     config_candidates+=("${SKILLBOX_CONFIG_ROOT}")
   fi
   if [[ -n "${SKILLBOX_OPERATOR_REPOS_ROOT:-}" ]]; then
     config_candidates+=("${SKILLBOX_OPERATOR_REPOS_ROOT}/skillbox-config")
+  fi
+  if [[ -n "${inferred_operator_repos_root}" && -d "${inferred_operator_repos_root}/skillbox-config/clients" ]]; then
+    config_candidates+=("${inferred_operator_repos_root}/skillbox-config")
   fi
   if [[ -z "${SKILLBOX_ROOT:-}" ]]; then
     config_candidates+=("/srv/skillbox/repos/skillbox-config")
@@ -94,6 +101,9 @@ configure_operator_defaults() {
   fi
   if [[ -n "${SKILLBOX_OPERATOR_REPOS_ROOT:-}" ]]; then
     repos_candidates+=("${SKILLBOX_OPERATOR_REPOS_ROOT}")
+  fi
+  if [[ -n "${inferred_operator_repos_root}" && -d "${inferred_operator_repos_root}/skillbox-config/clients" ]]; then
+    repos_candidates+=("${inferred_operator_repos_root}")
   fi
   if [[ -z "${SKILLBOX_ROOT:-}" ]]; then
     repos_candidates+=("/srv/skillbox/repos")
