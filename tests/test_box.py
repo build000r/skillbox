@@ -1125,7 +1125,7 @@ def _swimmers_context_for_test():
     """Minimal stand-in for BoxUpContext that activates the 'swimmers' profile."""
     from types import SimpleNamespace
     deploy_release = SimpleNamespace(active_profiles=["swimmers"])
-    profile = SimpleNamespace(storage=None)
+    profile = SimpleNamespace(storage=None, ssh_user="skillbox")
     box = SimpleNamespace(
         state_root="",
         storage_filesystem="",

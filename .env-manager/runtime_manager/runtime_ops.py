@@ -1849,12 +1849,32 @@ def read_service_pid(pid_path: Path) -> int | None:
         return None
 
 
+def _process_is_zombie(pid: int) -> bool:
+    # A zombie (defunct) process has already exited; it holds no resources,
+    # runs no code, and listens on no ports, but it lingers in the process
+    # table until its parent reaps it. os.kill(pid, 0) still succeeds for a
+    # zombie, so callers that only probe with signal 0 would wrongly treat a
+    # dead-but-unreaped child as live. On Linux the kernel exposes the process
+    # state as the first token after the (parenthesised) comm field in
+    # /proc/<pid>/stat; "Z" means zombie. Platforms without /proc fall through
+    # to the signal-0 result.
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    # comm may contain spaces/parens, so split on the last ')' to isolate the
+    # state field that immediately follows it.
+    _, _, after = raw.rpartition(")")
+    state_field = after.split(None, 1)
+    return bool(state_field) and state_field[0] == "Z"
+
+
 def process_is_running(pid: int) -> bool:
     try:
         os.kill(pid, 0)
     except OSError:
         return False
-    return True
+    return not _process_is_zombie(pid)
 
 
 def remove_pid_file(pid_path: Path) -> None:

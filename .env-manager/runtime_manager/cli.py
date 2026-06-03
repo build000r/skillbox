@@ -3904,9 +3904,16 @@ def _runtime_client_matches_for_cwd(model: dict[str, Any], cwd: Path) -> list[di
             }
         )
         seen.add(client_id)
+    # `matched_skill_clients` already orders its results by a richer key
+    # (path-name match, match length, default_cwd match, then id). Sort the
+    # combined list *stably* on match length alone so that ties preserve that
+    # upstream ordering instead of collapsing back to an alphabetical id
+    # tiebreak — otherwise a client whose default_cwd is exactly this directory
+    # could lose to an alphabetically earlier client that merely shares a
+    # cwd_match prefix.
     return sorted(
         matches + extra_matches,
-        key=lambda item: (-len(str(item.get("match") or "")), str(item.get("id") or "")),
+        key=lambda item: -len(str(item.get("match") or "")),
     )
 
 

@@ -212,6 +212,57 @@ class RuntimeManagerTests(unittest.TestCase):
                 time.sleep(1.1)
                 runtime_ops.reap_started_service_processes()
 
+    @unittest.skipUnless(
+        Path("/proc/self/stat").exists(),
+        "zombie-state detection relies on /proc",
+    )
+    def test_process_is_running_treats_zombie_as_dead(self) -> None:
+        from runtime_manager import runtime_ops
+
+        # A child that exits immediately becomes a zombie until this parent
+        # reaps it. os.kill(pid, 0) still succeeds for the zombie, so the old
+        # signal-0-only probe reported it as alive; process_is_running must
+        # instead recognise the defunct state and report it dead.
+        child = subprocess.Popen([sys.executable, "-c", "import os; os._exit(0)"])
+        try:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                raw = Path(f"/proc/{child.pid}/stat").read_text(encoding="utf-8")
+                if raw.rpartition(")")[2].split()[0] == "Z":
+                    break
+                time.sleep(0.02)
+            else:
+                self.skipTest("child did not enter zombie state in time")
+
+            # Sanity check: the zombie is still addressable via signal 0.
+            os.kill(child.pid, 0)
+            self.assertFalse(runtime_ops.process_is_running(child.pid))
+        finally:
+            child.wait()
+
+    def test_stop_process_reports_killed_for_reaped_zombie(self) -> None:
+        from runtime_manager import runtime_ops
+
+        # Regression for the auto-heal restart path: stopping an unhealthy
+        # service whose process has become a defunct child must not get stuck
+        # waiting on a zombie that will never disappear from the table until
+        # something calls wait(). The reaper in stop_process plus zombie-aware
+        # liveness detection should resolve to a terminal stop result. The
+        # child gets its own session so stop_process's process-group kill only
+        # targets the child, never the test runner.
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            start_new_session=True,
+        )
+        try:
+            result, _signal = runtime_ops.stop_process(child.pid, 1)
+            self.assertIn(result, {"stopped", "killed", "not-running"})
+            self.assertFalse(runtime_ops.process_is_running(child.pid))
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait()
+
     def test_sync_creates_core_runtime_state_and_installs_default_skills(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -619,6 +670,53 @@ class RuntimeManagerTests(unittest.TestCase):
             up_service = next(item for item in up_payload["services"] if item["id"] == "buildooor-web")
             self.assertEqual(up_service["endpoint"]["exposure"], "loopback-only")
             self.assertTrue(any("buildooor-web is loopback-only" in item for item in up_payload["warnings"]))
+
+    def test_runtime_commands_infer_client_from_nested_operator_repo_with_mac_overlay_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._write_client_overlay(
+                repo,
+                "buildooor",
+                label="Buildooor",
+                default_cwd="/Users/b/repos/buildooor",
+                root_path="/Users/b/repos/buildooor",
+                include_context=True,
+            )
+            clients_root = self._clients_host_root(repo)
+            (clients_root / "buildooor" / "skill-repos.yaml").write_text(
+                "version: 2\nskill_repos: []\n",
+                encoding="utf-8",
+            )
+            overlay_path = clients_root / "buildooor" / "overlay.yaml"
+            overlay_doc = MANAGE_MODULE.load_yaml(overlay_path)
+            overlay_doc["client"].setdefault("services", []).append(
+                {
+                    "id": "buildooor-web",
+                    "kind": "http",
+                    "repo_id": "buildooor-root",
+                    "command": "npm run dev -- --hostname 127.0.0.1 --port 3000",
+                    "healthcheck": {"type": "http", "url": "http://127.0.0.1:3000/health"},
+                    "profiles": ["core"],
+                }
+            )
+            overlay_path.write_text(MANAGE_MODULE.render_yaml_document(overlay_doc), encoding="utf-8")
+            nested_cwd = repo / ".skillbox-state" / "monoserver" / "buildooor" / "src" / "components"
+            nested_cwd.mkdir(parents=True, exist_ok=True)
+
+            status = subprocess.run(
+                ["python3", str(MANAGER), "--root-dir", str(repo), "status", "--format", "json"],
+                cwd=nested_cwd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(status.returncode, 0, status.stderr)
+            status_payload = json.loads(status.stdout)
+            self.assertEqual(status_payload["active_clients"], ["buildooor"])
+            service = next(item for item in status_payload["services"] if item["id"] == "buildooor-web")
+            self.assertEqual(service["endpoint"]["exposure"], "loopback-only")
 
     def test_sync_reconciles_safe_git_repo_residue_into_a_real_clone(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

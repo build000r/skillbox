@@ -525,7 +525,7 @@ class BoxLifecycleTests(unittest.TestCase):
         env_updates = payload["env_updates"]
         self.assertEqual(env_updates["SKILLBOX_STATE_ROOT"], "/srv/skillbox")
         self.assertEqual(env_updates["SKILLBOX_CLIENTS_HOST_ROOT"], "/srv/skillbox/clients")
-        self.assertEqual(env_updates["SKILLBOX_MONOSERVER_HOST_ROOT"], "/srv/skillbox/monoserver")
+        self.assertEqual(env_updates["SKILLBOX_MONOSERVER_HOST_ROOT"], "/srv/skillbox/repos")
         self.assertEqual(env_updates["SKILLBOX_BOX_ID"], "spaps-website")
         self.assertEqual(env_updates["SKILLBOX_BOX_SELF"], "true")
         self.assertEqual(env_updates["SKILLBOX_BOX_TAILSCALE_HOSTNAME"], "skillbox-spaps-website")
