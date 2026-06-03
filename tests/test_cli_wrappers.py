@@ -675,6 +675,32 @@ class CliWrapperTests(unittest.TestCase):
             self.assertEqual(record["env"]["SKILLBOX_MONOSERVER_ROOT"], str(home / "repos"))
             self.assertEqual(record["env"]["SKILLBOX_MONOSERVER_HOST_ROOT"], str(home / "repos"))
 
+    def test_sbp_status_prefers_operator_repo_roots_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            home = root / "home"
+            operator_repos = root / "srv" / "skillbox" / "repos"
+            clients_root = operator_repos / "skillbox-config" / "clients"
+            clients_root.mkdir(parents=True)
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "status",
+                fake_root=fake_root,
+                home=home,
+                extra_env={"SKILLBOX_OPERATOR_REPOS_ROOT": str(operator_repos)},
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["env"]["SKILLBOX_CONFIG_ROOT"], str((operator_repos / "skillbox-config").resolve()))
+            self.assertEqual(record["env"]["SKILLBOX_CLIENTS_HOST_ROOT"], str(clients_root.resolve()))
+            self.assertEqual(record["env"]["SKILLBOX_MONOSERVER_ROOT"], str(operator_repos.resolve()))
+            self.assertEqual(record["env"]["SKILLBOX_MONOSERVER_HOST_ROOT"], str(operator_repos.resolve()))
+
     def test_sbp_status_preserves_explicit_clients_root_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -768,6 +794,7 @@ class CliWrapperTests(unittest.TestCase):
                     "argv": sys.argv[1:],
                     "cwd": os.getcwd(),
                     "env": {
+                        "SKILLBOX_CONFIG_ROOT": os.environ.get("SKILLBOX_CONFIG_ROOT"),
                         "SKILLBOX_CLIENTS_HOST_ROOT": os.environ.get("SKILLBOX_CLIENTS_HOST_ROOT"),
                         "SKILLBOX_MONOSERVER_HOST_ROOT": os.environ.get("SKILLBOX_MONOSERVER_HOST_ROOT"),
                         "SKILLBOX_MONOSERVER_ROOT": os.environ.get("SKILLBOX_MONOSERVER_ROOT"),

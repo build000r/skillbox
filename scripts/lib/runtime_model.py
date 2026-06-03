@@ -60,6 +60,9 @@ RUNTIME_ENV_KEYS = [
     "SKILLBOX_CM_DOWNLOAD_URL",
     "SKILLBOX_CM_DOWNLOAD_SHA256",
     "SKILLBOX_CM_MCP_PORT",
+    "SKILLBOX_UBS_BIN",
+    "SKILLBOX_UBS_DOWNLOAD_URL",
+    "SKILLBOX_UBS_DOWNLOAD_SHA256",
     "SKILLBOX_APR_BIN",
     "SKILLBOX_APR_DOWNLOAD_URL",
     "SKILLBOX_APR_DOWNLOAD_SHA256",
@@ -85,6 +88,7 @@ RUNTIME_ENV_KEYS = [
 ]
 MANIFEST_ENV_KEYS = RUNTIME_ENV_KEYS + [
     "SKILLBOX_CLIENTS_HOST_ROOT",
+    "SKILLBOX_HOST_HOME_ROOT",
     "SKILLBOX_MONOSERVER_HOST_ROOT",
 ]
 
@@ -375,6 +379,7 @@ def load_runtime_env(root_dir: Path) -> dict[str, str]:
         "SKILLBOX_SKILLS_ROOT": "/workspace/skills",
         "SKILLBOX_LOG_ROOT": "/workspace/logs",
         "SKILLBOX_HOME_ROOT": "/home/sandbox",
+        "SKILLBOX_HOST_HOME_ROOT": "",
         "SKILLBOX_MONOSERVER_ROOT": "/monoserver",
         "SKILLBOX_API_PORT": "8000",
         "SKILLBOX_WEB_PORT": "3000",
@@ -409,6 +414,9 @@ def load_runtime_env(root_dir: Path) -> dict[str, str]:
         "SKILLBOX_CM_DOWNLOAD_URL": "",
         "SKILLBOX_CM_DOWNLOAD_SHA256": "",
         "SKILLBOX_CM_MCP_PORT": "3222",
+        "SKILLBOX_UBS_BIN": "/home/sandbox/.local/bin/ubs",
+        "SKILLBOX_UBS_DOWNLOAD_URL": "",
+        "SKILLBOX_UBS_DOWNLOAD_SHA256": "",
         "SKILLBOX_APR_BIN": "/home/sandbox/.local/bin/apr",
         "SKILLBOX_APR_DOWNLOAD_URL": "",
         "SKILLBOX_APR_DOWNLOAD_SHA256": "",

@@ -245,10 +245,10 @@ def build_model() -> dict[str, Any]:
         "SKILLBOX_CASS_BIN": f"{home_root}/.local/bin/cass",
         "SKILLBOX_CASS_DOWNLOAD_URL": (
             "https://github.com/Dicklesworthstone/coding_agent_session_search/"
-            "releases/download/v0.2.5/cass-linux-amd64.tar.gz"
+            "releases/download/v0.6.9/cass-linux-amd64-baseline.tar.gz"
         ),
         "SKILLBOX_CASS_DOWNLOAD_SHA256": (
-            "006532d5b3e2e1ec0ccb864c6c9eb3bc10cef6fa6c709bb1d56efb2b745d1d40"
+            "cfcf7b7b4a25e5627344bf02a5c437d79e8253fb6dc9a93e9a317df48f2c37f8"
         ),
         "SKILLBOX_CM_BIN": f"{home_root}/.local/bin/cm",
         "SKILLBOX_CM_DOWNLOAD_URL": (
@@ -259,6 +259,14 @@ def build_model() -> dict[str, Any]:
             "c1cf33be88ca819f8c457f4519334fa99727da42e29832c71e99fd423f1a29f4"
         ),
         "SKILLBOX_CM_MCP_PORT": "3222",
+        "SKILLBOX_UBS_BIN": f"{home_root}/.local/bin/ubs",
+        "SKILLBOX_UBS_DOWNLOAD_URL": (
+            "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/"
+            "v5.3.2/ubs"
+        ),
+        "SKILLBOX_UBS_DOWNLOAD_SHA256": (
+            "5a1765f05029e571e9d7da71ebb972b777e3ecbdafe540cdd17bd54eaf543132"
+        ),
         "SKILLBOX_APR_BIN": f"{home_root}/.local/bin/apr",
         "SKILLBOX_APR_DOWNLOAD_URL": (
             "https://github.com/Dicklesworthstone/automated_plan_reviser_pro/"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import tempfile
 import types
@@ -29,6 +30,7 @@ from runtime_manager.runtime_ops import (  # noqa: E402
 from runtime_manager import runtime_ops as runtime_ops_module  # noqa: E402
 from runtime_manager import validation as validation_module  # noqa: E402
 from runtime_manager import context_rendering as context_rendering_module  # noqa: E402
+from runtime_manager import endpoints as endpoints_module  # noqa: E402
 from runtime_manager import mmdx_open as mmdx_open_module  # noqa: E402
 from runtime_manager import publish as publish_module  # noqa: E402
 from runtime_manager import text_renderers as text_renderers_module  # noqa: E402
@@ -596,6 +598,7 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
                 mock.patch("runtime_manager.runtime_ops.ingress_listener_settings", side_effect=lambda _m, name: {"name": name}),
                 mock.patch("runtime_manager.runtime_ops.resolved_ingress_routes", return_value=[{"id": "route"}]),
                 mock.patch("runtime_manager.runtime_ops._runtime_status_distributors", return_value=[{"id": "dist"}]),
+                mock.patch("runtime_manager.runtime_ops.runtime_box_access_from_env", return_value={}),
                 mock.patch("runtime_manager.runtime_ops.parity_ledger_covered_surfaces", return_value=["api"]),
                 mock.patch("runtime_manager.runtime_ops.parity_ledger_deferred_surfaces", return_value=["worker"]),
             ):
@@ -610,6 +613,93 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
         self.assertTrue(status["checks"][0]["ok"])
         self.assertEqual(status["ingress"]["routes"], [{"id": "route"}])
         self.assertEqual(status["parity_ledger"]["deferred_surfaces"], ["worker"])
+
+    def test_runtime_box_access_falls_back_to_tailscale_status(self) -> None:
+        tailscale_status = {
+            "BackendState": "Running",
+            "TailscaleIPs": ["100.64.0.10", "fd7a:115c:a1e0::1"],
+            "CurrentTailnet": {"Name": "example.github"},
+            "Self": {
+                "HostName": "skillbox-dev",
+                "DNSName": "skillbox-dev.tailnet.test.",
+                "TailscaleIPs": ["100.64.0.10"],
+            },
+        }
+        result = mock.Mock(returncode=0, stdout=json.dumps(tailscale_status), stderr="")
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("runtime_manager.runtime_ops.shutil.which", return_value="/usr/bin/tailscale"),
+            mock.patch("runtime_manager.runtime_ops.run_command", return_value=result),
+        ):
+            access = runtime_ops_module.runtime_box_access_from_env({"SKILLBOX_SWIMMERS_PORT": "4444"})
+
+        self.assertEqual(access["tailscale_ip"], "100.64.0.10")
+        self.assertEqual(access["tailscale_hostname"], "skillbox-dev.tailnet.test")
+        self.assertEqual(access["phone_url"], "http://100.64.0.10:4444/")
+        self.assertEqual(access["magicdns_url"], "http://skillbox-dev.tailnet.test:4444/")
+        self.assertEqual(access["source"], "tailscale")
+
+    def test_annotate_service_rows_classifies_http_exposure_and_loopback_warnings(self) -> None:
+        model = {
+            "env": {
+                "SKILLBOX_INGRESS_PRIVATE_HOST": "0.0.0.0",
+                "SKILLBOX_INGRESS_PRIVATE_PORT": "9080",
+            },
+            "services": [
+                {
+                    "id": "buildooor-web",
+                    "kind": "http",
+                    "healthcheck": {"type": "http", "url": "http://127.0.0.1:3000/health"},
+                },
+                {
+                    "id": "api",
+                    "kind": "http",
+                    "healthcheck": {"type": "http", "url": "http://0.0.0.0:9100/health"},
+                },
+                {
+                    "id": "wide-web",
+                    "kind": "http",
+                    "commands": {
+                        "reuse": "npm run dev -- --host 0.0.0.0 --port 5175 --strictPort",
+                    },
+                    "healthcheck": {"type": "http", "url": "http://127.0.0.1:5175/"},
+                },
+                {
+                    "id": "routed",
+                    "kind": "http",
+                    "healthcheck": {"type": "http", "url": "http://127.0.0.1:9200/health"},
+                },
+            ],
+            "ingress_routes": [
+                {
+                    "id": "routed-private",
+                    "service_id": "routed",
+                    "listener": "private",
+                    "path": "/routed",
+                    "match": "prefix",
+                }
+            ],
+        }
+        rows = [{"id": "buildooor-web"}, {"id": "api"}, {"id": "wide-web"}, {"id": "routed"}]
+
+        warnings = endpoints_module.annotate_service_rows(
+            model,
+            rows,
+            box_access={"tailscale_ip": "100.64.0.10"},
+        )
+
+        by_id = {row["id"]: row for row in rows}
+        self.assertEqual(by_id["buildooor-web"]["endpoint"]["exposure"], "loopback-only")
+        self.assertFalse(by_id["buildooor-web"]["viewable_from_tailnet"])
+        self.assertEqual(by_id["api"]["endpoint"]["exposure"], "tailnet-direct")
+        self.assertEqual(by_id["api"]["endpoint_url"], "http://100.64.0.10:9100")
+        self.assertEqual(by_id["wide-web"]["endpoint"]["exposure"], "tailnet-direct")
+        self.assertEqual(by_id["wide-web"]["endpoint_url"], "http://100.64.0.10:5175")
+        self.assertTrue(by_id["wide-web"]["viewable_from_tailnet"])
+        self.assertEqual(by_id["routed"]["endpoint"]["exposure"], "ingress-routed")
+        self.assertEqual(by_id["routed"]["endpoint"]["ingress_routes"][0]["request_url"], "http://127.0.0.1:9080/routed")
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("buildooor-web is loopback-only", warnings[0])
 
 
 class RuntimeScanHotspotTests(unittest.TestCase):

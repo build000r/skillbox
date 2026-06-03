@@ -85,6 +85,38 @@ class BoxRefactorTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, r"Available: .*known"):
                     BOX.load_profile("missing")
 
+    def test_profile_storage_supports_explicit_volume_size(self) -> None:
+        storage = BOX.parse_box_profile_storage(
+            profile_id="custom",
+            profile_provider="digitalocean",
+            raw_storage={
+                "provider": "digitalocean",
+                "mount_path": "/srv/skillbox",
+                "filesystem": "ext4",
+                "required": True,
+                "volume_size_gb": "50",
+                "min_free_gb": 45,
+            },
+        )
+
+        self.assertEqual(storage.volume_size_gb, 50)
+        self.assertEqual(BOX.storage_volume_size_gb(storage), 50)
+
+    def test_profile_storage_rejects_volume_smaller_than_free_space_gate(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "storage.volume_size_gb must be >= storage.min_free_gb"):
+            BOX.parse_box_profile_storage(
+                profile_id="custom",
+                profile_provider="digitalocean",
+                raw_storage={
+                    "provider": "digitalocean",
+                    "mount_path": "/srv/skillbox",
+                    "filesystem": "ext4",
+                    "required": True,
+                    "volume_size_gb": 40,
+                    "min_free_gb": 45,
+                },
+            )
+
     def test_load_dotenv_only_sets_missing_variables(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             env_path = Path(tmpdir) / ".env"

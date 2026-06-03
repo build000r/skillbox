@@ -984,6 +984,7 @@ class BoxProfileStorage:
     filesystem: str
     required: bool = True
     min_free_gb: float = 0.0
+    volume_size_gb: int | None = None
 
 
 @dataclass
@@ -1162,6 +1163,7 @@ def remote_box_contract_payload(context: "BoxUpContext") -> dict[str, Any]:
         "SKILLBOX_BOX_ID": context.box_id,
         "SKILLBOX_BOX_SELF": "true",
         "SKILLBOX_BOX_TAILSCALE_HOSTNAME": context.ts_hostname,
+        "SKILLBOX_HOST_HOME_ROOT": f"/home/{context.profile.ssh_user}",
     })
     if context.box.tailscale_ip:
         env_updates["SKILLBOX_BOX_TAILSCALE_IP"] = context.box.tailscale_ip
@@ -1176,7 +1178,7 @@ def remote_box_contract_payload(context: "BoxUpContext") -> dict[str, Any]:
         env_updates.update({
             "SKILLBOX_STATE_ROOT": state_root,
             "SKILLBOX_CLIENTS_HOST_ROOT": f"{state_root.rstrip('/')}/clients",
-            "SKILLBOX_MONOSERVER_HOST_ROOT": f"{state_root.rstrip('/')}/monoserver",
+            "SKILLBOX_MONOSERVER_HOST_ROOT": f"{state_root.rstrip('/')}/repos",
         })
 
     active_profiles = active_profiles_for_release(context.deploy_release)
@@ -1334,6 +1336,8 @@ def volume_filesystem_label(name: str, filesystem: str) -> str:
 
 
 def storage_volume_size_gb(storage: BoxProfileStorage) -> int:
+    if storage.volume_size_gb is not None:
+        return storage.volume_size_gb
     return max(20, int(math.ceil(storage.min_free_gb or 0.0)))
 
 
@@ -1370,6 +1374,20 @@ def parse_box_profile_storage(
     if min_free_gb < 0:
         raise RuntimeError(f"Box profile {profile_id!r} storage.min_free_gb cannot be negative")
 
+    volume_size_gb: int | None = None
+    if "volume_size_gb" in raw_storage:
+        volume_size_raw = raw_storage.get("volume_size_gb")
+        try:
+            volume_size_gb = int(volume_size_raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Box profile {profile_id!r} storage.volume_size_gb must be an integer") from exc
+        if volume_size_gb < 1:
+            raise RuntimeError(f"Box profile {profile_id!r} storage.volume_size_gb must be positive")
+        if volume_size_gb < int(math.ceil(min_free_gb)):
+            raise RuntimeError(
+                f"Box profile {profile_id!r} storage.volume_size_gb must be >= storage.min_free_gb"
+            )
+
     if "required" in raw_storage:
         required = _validate_config_bool(
             raw_storage["required"],
@@ -1384,6 +1402,7 @@ def parse_box_profile_storage(
         filesystem=filesystem,
         required=required,
         min_free_gb=min_free_gb,
+        volume_size_gb=volume_size_gb,
     )
 
 

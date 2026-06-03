@@ -35,6 +35,12 @@ find_skillbox_root() {
   if [[ -n "${SKILLBOX_ROOT:-}" ]]; then
     candidates+=("${SKILLBOX_ROOT}")
   fi
+  if [[ -n "${SKILLBOX_OPERATOR_REPOS_ROOT:-}" ]]; then
+    candidates+=("${SKILLBOX_OPERATOR_REPOS_ROOT}/opensource/skillbox")
+  fi
+  if [[ -z "${SKILLBOX_ROOT:-}" ]]; then
+    candidates+=("/srv/skillbox/repos/opensource/skillbox")
+  fi
   candidates+=(
     "${script_dir}/.."
     "${HOME}/repos/opensource/skillbox"
@@ -53,8 +59,17 @@ configure_operator_defaults() {
   local config_candidate=""
   local config_root=""
   local config_candidates=()
+  local repos_candidate=""
+  local repos_root=""
+  local repos_candidates=()
   if [[ -n "${SKILLBOX_CONFIG_ROOT:-}" ]]; then
     config_candidates+=("${SKILLBOX_CONFIG_ROOT}")
+  fi
+  if [[ -n "${SKILLBOX_OPERATOR_REPOS_ROOT:-}" ]]; then
+    config_candidates+=("${SKILLBOX_OPERATOR_REPOS_ROOT}/skillbox-config")
+  fi
+  if [[ -z "${SKILLBOX_ROOT:-}" ]]; then
+    config_candidates+=("/srv/skillbox/repos/skillbox-config")
   fi
   config_candidates+=("${HOME}/repos/skillbox-config")
 
@@ -65,14 +80,38 @@ configure_operator_defaults() {
     fi
   done
 
+  if [[ -n "${config_root}" && -z "${SKILLBOX_CONFIG_ROOT:-}" ]]; then
+    export SKILLBOX_CONFIG_ROOT="${config_root}"
+  fi
   if [[ -n "${config_root}" && -z "${SKILLBOX_CLIENTS_HOST_ROOT:-}" ]]; then
     export SKILLBOX_CLIENTS_HOST_ROOT="${config_root}/clients"
   fi
-  if [[ -z "${SKILLBOX_MONOSERVER_ROOT:-}" && -d "${HOME}/repos" ]]; then
-    export SKILLBOX_MONOSERVER_ROOT="${HOME}/repos"
+  if [[ -n "${SKILLBOX_MONOSERVER_ROOT:-}" ]]; then
+    repos_candidates+=("${SKILLBOX_MONOSERVER_ROOT}")
   fi
-  if [[ -z "${SKILLBOX_MONOSERVER_HOST_ROOT:-}" && -d "${HOME}/repos" ]]; then
-    export SKILLBOX_MONOSERVER_HOST_ROOT="${HOME}/repos"
+  if [[ -n "${SKILLBOX_MONOSERVER_HOST_ROOT:-}" ]]; then
+    repos_candidates+=("${SKILLBOX_MONOSERVER_HOST_ROOT}")
+  fi
+  if [[ -n "${SKILLBOX_OPERATOR_REPOS_ROOT:-}" ]]; then
+    repos_candidates+=("${SKILLBOX_OPERATOR_REPOS_ROOT}")
+  fi
+  if [[ -z "${SKILLBOX_ROOT:-}" ]]; then
+    repos_candidates+=("/srv/skillbox/repos")
+  fi
+  repos_candidates+=("${HOME}/repos")
+
+  for repos_candidate in "${repos_candidates[@]}"; do
+    if [[ -d "${repos_candidate}" ]]; then
+      repos_root="$(realpath_portable "${repos_candidate}")"
+      break
+    fi
+  done
+
+  if [[ -n "${repos_root}" && -z "${SKILLBOX_MONOSERVER_ROOT:-}" ]]; then
+    export SKILLBOX_MONOSERVER_ROOT="${repos_root}"
+  fi
+  if [[ -n "${repos_root}" && -z "${SKILLBOX_MONOSERVER_HOST_ROOT:-}" ]]; then
+    export SKILLBOX_MONOSERVER_HOST_ROOT="${repos_root}"
   fi
 }
 

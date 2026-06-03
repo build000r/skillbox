@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import http.client
+import io
 import socket
+import tarfile
 
 from .shared import *
 from .validation import *
@@ -1156,7 +1158,35 @@ def _download_artifact_to_path(
             f"artifact {artifact['id']} digest mismatch for {url}: "
             f"expected {expected_sha256}, got {actual_sha256}"
         )
+    payload = _downloaded_artifact_payload(artifact, source, payload)
     _replace_artifact_payload(path, payload, bool(source.get("executable", False)))
+
+
+def _downloaded_artifact_payload(
+    artifact: dict[str, Any],
+    source: dict[str, Any],
+    payload: bytes,
+) -> bytes:
+    archive_kind = str(source.get("archive") or "").strip().lower()
+    if not archive_kind:
+        return payload
+    if archive_kind not in {"tar.gz", "tgz"}:
+        raise RuntimeError(f"artifact {artifact['id']} has unsupported source.archive {archive_kind!r}")
+
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+        members = [member for member in archive.getmembers() if member.isfile()]
+        if len(members) != 1:
+            raise RuntimeError(
+                f"artifact {artifact['id']} archive must contain exactly one regular file; found {len(members)}"
+            )
+        member = members[0]
+        member_path = PurePosixPath(member.name)
+        if member_path.is_absolute() or ".." in member_path.parts:
+            raise RuntimeError(f"artifact {artifact['id']} archive member has unsafe path {member.name!r}")
+        extracted = archive.extractfile(member)
+        if extracted is None:
+            raise RuntimeError(f"artifact {artifact['id']} archive member {member.name!r} could not be read")
+        return extracted.read()
 
 
 def _sync_file_artifact(
@@ -4386,11 +4416,28 @@ def _runtime_ingress_payload(model: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _annotate_runtime_service_exposure(
+    model: dict[str, Any],
+    service_statuses: list[dict[str, Any]],
+    box_access: dict[str, Any],
+) -> list[str]:
+    try:
+        from .endpoints import annotate_service_rows
+    except Exception:
+        return []
+    try:
+        return annotate_service_rows(model, service_statuses, box_access=box_access)
+    except Exception:
+        return []
+
+
 def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
     service_statuses = _runtime_service_statuses(model)
+    box_access = runtime_box_access_from_env(model.get("env") or {})
+    warnings = _annotate_runtime_service_exposure(model, service_statuses, box_access)
     root_dir = Path(str(model.get("root_dir") or DEFAULT_ROOT_DIR))
     return {
-        "box_access": runtime_box_access_from_env(),
+        "box_access": box_access,
         "clients": copy.deepcopy(model.get("clients") or []),
         "active_clients": model.get("active_clients") or [],
         "default_client": (model.get("selection") or {}).get("default_client"),
@@ -4407,6 +4454,7 @@ def runtime_status(model: dict[str, Any]) -> dict[str, Any]:
         "logs": _runtime_log_statuses(model),
         "checks": _runtime_check_statuses(model),
         "ingress": _runtime_ingress_payload(model),
+        "warnings": warnings,
         "pressure_advisory": runtime_pressure_advisory(root_dir),
         "parity_ledger": {
             "covered_surfaces": parity_ledger_covered_surfaces(model),
@@ -4519,18 +4567,78 @@ def runtime_pressure_advisory(root_dir: Path, *, home: Path | None = None) -> di
     return advisory
 
 
-def runtime_box_access_from_env() -> dict[str, Any]:
-    box_id = os.environ.get("SKILLBOX_BOX_ID", "").strip()
-    tailnet_ip = os.environ.get("SKILLBOX_BOX_TAILSCALE_IP", "").strip()
-    magicdns = os.environ.get("SKILLBOX_BOX_TAILSCALE_HOSTNAME", "").strip()
-    port = os.environ.get("SKILLBOX_SWIMMERS_PORT", "3210").strip() or "3210"
+def _runtime_env_value(env_values: dict[str, Any] | None, key: str, default: str = "") -> str:
+    raw = os.environ.get(key)
+    if raw is None and env_values is not None:
+        raw = env_values.get(key)
+    if raw is None:
+        raw = default
+    return str(raw).strip()
+
+
+def _tailscale_status_payload() -> dict[str, Any]:
+    if not shutil.which("tailscale"):
+        return {}
+    result = run_command(["tailscale", "status", "--json"])
+    if result.returncode != 0:
+        return {}
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _first_ipv4(values: list[Any]) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text and "." in text and ":" not in text:
+            return text
+    return ""
+
+
+def _tailscale_box_access_fallback() -> dict[str, Any]:
+    payload = _tailscale_status_payload()
+    if not payload:
+        return {}
+    self_node = payload.get("Self") if isinstance(payload.get("Self"), dict) else {}
+    ips = payload.get("TailscaleIPs") or self_node.get("TailscaleIPs") or []
+    dns_name = str(self_node.get("DNSName") or "").strip().rstrip(".")
+    hostname = str(self_node.get("HostName") or "").strip()
+    return {
+        "box_id": hostname or None,
+        "tailscale_ip": _first_ipv4(list(ips)) or None,
+        "tailscale_hostname": dns_name or hostname or None,
+        "tailscale_available": True,
+        "tailscale_state": str(payload.get("BackendState") or "").strip() or None,
+        "tailnet": (payload.get("CurrentTailnet") or {}).get("Name"),
+        "source": "tailscale",
+    }
+
+
+def runtime_box_access_from_env(env_values: dict[str, Any] | None = None) -> dict[str, Any]:
+    fallback = _tailscale_box_access_fallback()
+    box_id = _runtime_env_value(env_values, "SKILLBOX_BOX_ID") or str(fallback.get("box_id") or "").strip()
+    tailnet_ip = (
+        _runtime_env_value(env_values, "SKILLBOX_BOX_TAILSCALE_IP")
+        or str(fallback.get("tailscale_ip") or "").strip()
+    )
+    magicdns = (
+        _runtime_env_value(env_values, "SKILLBOX_BOX_TAILSCALE_HOSTNAME")
+        or str(fallback.get("tailscale_hostname") or "").strip()
+    )
+    port = _runtime_env_value(env_values, "SKILLBOX_SWIMMERS_PORT", "3210") or "3210"
     phone_url = f"http://{tailnet_ip}:{port}/" if tailnet_ip else None
     magicdns_url = f"http://{magicdns}:{port}/" if magicdns else None
     return {
-        "self": os.environ.get("SKILLBOX_BOX_SELF", "").strip().lower() == "true",
+        "self": _runtime_env_value(env_values, "SKILLBOX_BOX_SELF").lower() == "true" or bool(fallback),
         "box_id": box_id or None,
         "tailscale_ip": tailnet_ip or None,
         "tailscale_hostname": magicdns or None,
+        "tailscale_available": bool(fallback),
+        "tailscale_state": fallback.get("tailscale_state"),
+        "tailnet": fallback.get("tailnet"),
+        "source": "env" if _runtime_env_value(env_values, "SKILLBOX_BOX_TAILSCALE_IP") else fallback.get("source") or "env",
         "phone_url": phone_url,
         "browser_url": phone_url,
         "magicdns_url": magicdns_url,
@@ -4639,6 +4747,10 @@ def _compact_status_services(status_payload: dict[str, Any]) -> list[dict[str, A
             "ownership_state": service.get("ownership_state"),
             "depends_on": service.get("depends_on") or [],
             "bootstrap_tasks": service.get("bootstrap_tasks") or [],
+            "exposure": service.get("exposure"),
+            "endpoint": service.get("endpoint") or {},
+            "endpoint_url": service.get("endpoint_url"),
+            "viewable_from_tailnet": service.get("viewable_from_tailnet"),
         }
         for service in status_payload.get("services") or []
     ]
@@ -4701,6 +4813,7 @@ def compact_runtime_status(status_payload: dict[str, Any]) -> dict[str, Any]:
         "tasks": _compact_status_tasks(status_payload),
         "services": _compact_status_services(status_payload),
         "blocked_services": status_payload.get("blocked_services") or [],
+        "warnings": status_payload.get("warnings") or [],
         "logs": _compact_status_logs(status_payload),
         "checks": _compact_status_checks(status_payload),
         "ingress": _compact_status_ingress(status_payload),

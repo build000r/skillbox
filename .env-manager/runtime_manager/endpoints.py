@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 import socket
 import urllib.error
 import urllib.request
@@ -18,6 +19,7 @@ except ImportError:
 APP_SERVICE_IDS = {
     "htma",
     "buildooor",
+    "buildooor-web",
     "cca-website",
     "mhb",
     "unclawg",
@@ -106,9 +108,305 @@ def _overlay_metadata(model: dict[str, Any]) -> dict[str, dict[str, str]]:
 def _categorize(service_id: str, healthcheck_url: str, overlay_category: str | None) -> str:
     if overlay_category:
         return overlay_category
-    if service_id in APP_SERVICE_IDS:
+    if service_id in APP_SERVICE_IDS or service_id.endswith(("-web", "-frontend")):
         return "app"
     return "api"
+
+
+_LOOPBACK_HOSTS = {
+    "localhost",
+    "127.0.0.1",
+    "::1",
+    "0:0:0:0:0:0:0:1",
+}
+_WILDCARD_HOSTS = {"0.0.0.0", "::"}
+
+
+def _url_host_port(url: str) -> tuple[str, int | None, str]:
+    if not url:
+        return "", None, ""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return "", None, ""
+    if not parsed.scheme or not parsed.netloc:
+        return "", None, ""
+    port = parsed.port
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80 if parsed.scheme == "http" else None
+    return parsed.hostname or "", port, parsed.scheme
+
+
+def _replace_url_host(url: str, host: str) -> str:
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return url
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    return parsed._replace(netloc=f"{host}{port}").geturl()
+
+
+def _box_tailnet_hosts(box_access: dict[str, Any]) -> list[str]:
+    state = str(box_access.get("tailscale_state") or "").strip().lower()
+    if state and state != "running":
+        return []
+    hosts: list[str] = []
+    for key in ("tailscale_ip", "tailscale_hostname"):
+        value = str(box_access.get(key) or "").strip().rstrip(".")
+        if value:
+            hosts.append(value)
+    return hosts
+
+
+def _preferred_tailnet_host(box_access: dict[str, Any]) -> str:
+    hosts = _box_tailnet_hosts(box_access)
+    return hosts[0] if hosts else ""
+
+
+def _normalized_host_values(values: list[str]) -> set[str]:
+    return {value.lower().rstrip(".") for value in values if value}
+
+
+def _ingress_listener_settings(model: dict[str, Any], listener: str) -> dict[str, Any]:
+    env = model.get("env") or {}
+    normalized_listener = "private" if str(listener or "").strip().lower() == "private" else "public"
+    host_key = f"SKILLBOX_INGRESS_{normalized_listener.upper()}_HOST"
+    port_key = f"SKILLBOX_INGRESS_{normalized_listener.upper()}_PORT"
+    base_url_key = f"SKILLBOX_INGRESS_{normalized_listener.upper()}_BASE_URL"
+    host = str(env.get(host_key) or "").strip() or "127.0.0.1"
+    port_raw = str(env.get(port_key) or "").strip() or ("9080" if normalized_listener == "private" else "8080")
+    try:
+        port = int(port_raw)
+    except ValueError:
+        port = 9080 if normalized_listener == "private" else 8080
+    display_host = "127.0.0.1" if host in _WILDCARD_HOSTS else host
+    raw_base_url = str(env.get(base_url_key) or "").strip().rstrip("/")
+    base_url = raw_base_url or f"http://{display_host}:{port}"
+    return {"listener": normalized_listener, "host": host, "port": port, "base_url": base_url}
+
+
+def _service_ingress_routes(model: dict[str, Any], service_id: str) -> list[dict[str, Any]]:
+    routes: list[dict[str, Any]] = []
+    for route in model.get("ingress_routes") or []:
+        if str(route.get("service_id") or "").strip() != service_id:
+            continue
+        listener = str(route.get("listener") or "public").strip().lower() or "public"
+        path = str(route.get("path") or "").strip()
+        settings = _ingress_listener_settings(model, listener)
+        routes.append(
+            {
+                "id": str(route.get("id") or "").strip(),
+                "listener": listener,
+                "path": path,
+                "match": str(route.get("match") or "exact").strip().lower() or "exact",
+                "request_url": f"{settings['base_url']}{path}" if path else settings["base_url"],
+                "host": settings["host"],
+                "port": settings["port"],
+            }
+        )
+    return sorted(routes, key=lambda item: (item["listener"], item["path"], item["id"]))
+
+
+def _service_command_strings(service: dict[str, Any]) -> list[str]:
+    commands: list[str] = []
+    command = service.get("command")
+    if isinstance(command, str) and command.strip():
+        commands.append(command)
+    mode_commands = service.get("commands") or {}
+    if isinstance(mode_commands, dict):
+        for value in mode_commands.values():
+            if isinstance(value, str) and value.strip():
+                commands.append(value)
+    return commands
+
+
+def _command_token_value(tokens: list[str], names: set[str]) -> str:
+    for index, token in enumerate(tokens):
+        if token in names and index + 1 < len(tokens):
+            return tokens[index + 1]
+        for name in names:
+            prefix = f"{name}="
+            if token.startswith(prefix):
+                return token[len(prefix):]
+    return ""
+
+
+def _service_command_bind_url(service: dict[str, Any], fallback_url: str) -> str:
+    fallback_host, fallback_port, fallback_scheme = _url_host_port(fallback_url)
+    scheme = fallback_scheme or "http"
+    for command in _service_command_strings(service):
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            tokens = command.split()
+        host = _command_token_value(tokens, {"--host", "--hostname"})
+        port = _command_token_value(tokens, {"--port"})
+        if not host:
+            continue
+        try:
+            port_number = int(port) if port else fallback_port
+        except ValueError:
+            port_number = fallback_port
+        if port_number is None:
+            continue
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        return f"{scheme}://{host}:{port_number}"
+    return ""
+
+
+def _service_local_url(service: dict[str, Any], meta: dict[str, str]) -> str:
+    healthcheck = service.get("healthcheck") or {}
+    healthcheck_url = str(healthcheck.get("url") or "")
+    command_url = _service_command_bind_url(service, _local_url(healthcheck_url))
+    if command_url:
+        return command_url
+    return (
+        _local_url(str(service.get("origin_url") or ""))
+        or meta.get("local_url")
+        or _local_url(healthcheck_url)
+        or ""
+    )
+
+
+def _tailnet_direct_url(local_url: str, box_access: dict[str, Any]) -> str:
+    host, _port, _scheme = _url_host_port(local_url)
+    if not host:
+        return ""
+    normalized_host = host.lower()
+    if normalized_host in _LOOPBACK_HOSTS:
+        return ""
+    if normalized_host in _WILDCARD_HOSTS:
+        tailnet_host = _preferred_tailnet_host(box_access)
+        return _replace_url_host(local_url, tailnet_host) if tailnet_host else ""
+    if normalized_host in _normalized_host_values(_box_tailnet_hosts(box_access)):
+        return local_url
+    return ""
+
+
+def _ingress_route_tailnet_url(route: dict[str, Any], box_access: dict[str, Any]) -> str:
+    request_url = str(route.get("request_url") or "").strip()
+    if not request_url:
+        return ""
+    url_host, _port, _scheme = _url_host_port(request_url)
+    route_host = str(route.get("host") or url_host or "").strip().lower()
+    normalized_url_host = url_host.lower()
+    if route_host in _WILDCARD_HOSTS or normalized_url_host in _WILDCARD_HOSTS:
+        tailnet_host = _preferred_tailnet_host(box_access)
+        return _replace_url_host(request_url, tailnet_host) if tailnet_host else ""
+    if route_host in _LOOPBACK_HOSTS or normalized_url_host in _LOOPBACK_HOSTS:
+        return ""
+    if normalized_url_host in _normalized_host_values(_box_tailnet_hosts(box_access)):
+        return request_url
+    return ""
+
+
+def service_endpoint_exposure(
+    model: dict[str, Any],
+    service: dict[str, Any],
+    *,
+    box_access: dict[str, Any] | None = None,
+    overlay_meta: dict[str, dict[str, str]] | None = None,
+) -> dict[str, Any] | None:
+    if service.get("kind") != "http":
+        return None
+    service_id = str(service.get("id") or "").strip()
+    if not service_id:
+        return None
+    meta = (overlay_meta or _overlay_metadata(model)).get(service_id, {})
+    local_url = _service_local_url(service, meta)
+    if not local_url:
+        return None
+    routes = _service_ingress_routes(model, service_id)
+    category = _categorize(service_id, local_url, meta.get("category"))
+    box_access = box_access or {}
+    direct_url = _tailnet_direct_url(local_url, box_access)
+    annotated_routes: list[dict[str, Any]] = []
+    for route in routes:
+        annotated = dict(route)
+        route_tailnet_url = _ingress_route_tailnet_url(route, box_access)
+        annotated["tailnet_url"] = route_tailnet_url
+        annotated["viewable_from_tailnet"] = bool(route_tailnet_url)
+        annotated_routes.append(annotated)
+    viewable_routes = [route for route in annotated_routes if route.get("viewable_from_tailnet")]
+    if viewable_routes:
+        exposure = "ingress-routed"
+        access_url = str(viewable_routes[0].get("tailnet_url") or viewable_routes[0].get("request_url") or "")
+        tailnet_url = access_url
+    elif annotated_routes:
+        exposure = "loopback-only"
+        access_url = str(annotated_routes[0].get("request_url") or local_url)
+        tailnet_url = ""
+    elif direct_url:
+        exposure = "tailnet-direct"
+        access_url = direct_url
+        tailnet_url = direct_url
+    else:
+        exposure = "loopback-only"
+        access_url = local_url
+        tailnet_url = ""
+    endpoint = {
+        "url": local_url,
+        "local_url": local_url,
+        "access_url": access_url,
+        "tailnet_url": tailnet_url,
+        "category": category,
+        "exposure": exposure,
+        "viewable_from_tailnet": bool(tailnet_url),
+        "ingress_routes": annotated_routes,
+    }
+    host, port, scheme = _url_host_port(local_url)
+    if host:
+        endpoint["host"] = host
+    if port is not None:
+        endpoint["port"] = port
+    if scheme:
+        endpoint["scheme"] = scheme
+    if exposure == "loopback-only" and category == "app":
+        if annotated_routes:
+            endpoint["warning"] = (
+                f"{service_id} has only loopback-only ingress/local access at {access_url}; "
+                "make the ingress listener Tailnet-reachable before treating it as phone-viewable."
+            )
+        else:
+            endpoint["warning"] = (
+                f"{service_id} is loopback-only at {local_url}; add an ingress route "
+                "or bind it to a Tailnet-reachable listener before treating it as phone-viewable."
+            )
+    return endpoint
+
+
+def annotate_service_rows(
+    model: dict[str, Any],
+    rows: list[dict[str, Any]],
+    *,
+    box_access: dict[str, Any] | None = None,
+) -> list[str]:
+    services = {
+        str(service.get("id") or "").strip(): service
+        for service in model.get("services") or []
+        if str(service.get("id") or "").strip()
+    }
+    overlay_meta = _overlay_metadata(model)
+    warnings: list[str] = []
+    for row in rows:
+        service_id = str(row.get("id") or "").strip()
+        endpoint = service_endpoint_exposure(
+            model,
+            services.get(service_id) or {},
+            box_access=box_access,
+            overlay_meta=overlay_meta,
+        )
+        if endpoint is None:
+            continue
+        row["endpoint"] = endpoint
+        row["exposure"] = endpoint["exposure"]
+        row["endpoint_url"] = endpoint["access_url"]
+        row["viewable_from_tailnet"] = endpoint["viewable_from_tailnet"]
+        if endpoint.get("warning"):
+            warnings.append(str(endpoint["warning"]))
+    return warnings
 
 
 def _probe(url: str, timeout: float) -> str:
@@ -138,6 +436,7 @@ def build_endpoint_summary(
     *,
     probe: bool = True,
     timeout: float = 0.5,
+    box_access: dict[str, Any] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Build a {"apps": [...], "apis": [...]} listing of HTTP services with
     their local URLs and (optionally) live probe results.
@@ -161,6 +460,12 @@ def build_endpoint_summary(
             continue
         probe_url = hc_url or url
         alias = _HARDCODED_ALIASES.get(svc_id) or meta.get("alias")
+        endpoint = service_endpoint_exposure(
+            model,
+            svc,
+            box_access=box_access,
+            overlay_meta=overlay_meta,
+        )
         rows.append(
             {
                 "id": svc_id,
@@ -169,6 +474,8 @@ def build_endpoint_summary(
                 "alias": alias,
                 "probe_url": probe_url,
                 "status": None,
+                "endpoint": endpoint or {},
+                "exposure": (endpoint or {}).get("exposure"),
             }
         )
 

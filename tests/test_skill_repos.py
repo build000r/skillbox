@@ -690,6 +690,35 @@ class TestSyncSkillRepoSets(unittest.TestCase):
             self.assertIn(f"write-lockfile: {lock_path}", first_actions)
             self.assertIn(f"lockfile-unchanged: {lock_path}", second_actions)
 
+    def test_sync_mirrors_agent_skill_targets_to_host_home_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_root = root / "source-skills"
+            _write_skill(source_root, "ntm", "# NTM\n")
+            config_path = root / "skill-repos.yaml"
+            lock_path = root / "skill-repos.lock.json"
+            clone_root = root / "clones"
+            install_root = root / "state" / "home" / ".codex" / "skills"
+            host_home = root / "host-home"
+            config_path.write_text(
+                "version: 2\n"
+                "skill_repos:\n"
+                "  - path: ./source-skills\n"
+                "    pick: [ntm]\n",
+                encoding="utf-8",
+            )
+            model = _skill_repo_set_model(config_path, lock_path, clone_root, install_root)
+
+            with mock.patch.dict(os.environ, {"SKILLBOX_HOST_HOME_ROOT": str(host_home)}):
+                actions = sync_skill_repo_sets(model, dry_run=False)
+
+            installed = install_root / "ntm"
+            mirrored = host_home / ".codex" / "skills" / "ntm"
+            self.assertTrue((installed / "SKILL.md").is_file())
+            self.assertTrue(mirrored.is_symlink())
+            self.assertEqual(mirrored.resolve(), installed.resolve())
+            self.assertIn(f"mirror-host-skill: ntm -> {mirrored}", actions)
+
     def test_sync_dry_run_records_repo_install_plan_and_defers_lockfile_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

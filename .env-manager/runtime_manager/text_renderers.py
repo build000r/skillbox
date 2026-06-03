@@ -275,6 +275,10 @@ def _format_service_line(service: dict[str, Any]) -> str:
     bootstrap_task_ids = service.get("bootstrap_tasks") or []
     if bootstrap_task_ids:
         summary = f"{summary}, bootstrap {', '.join(bootstrap_task_ids)}"
+    endpoint = service.get("endpoint") or {}
+    exposure = str(endpoint.get("exposure") or service.get("exposure") or "").strip()
+    if exposure:
+        summary = f"{summary}, exposure {exposure}"
     # WG-006: ownership_state badge so operators can see at a glance
     # whether a service is covered, bridge-only, deferred, or external
     # per the parity ledger (shared.md:148-180, backend.md:77-90).
@@ -405,6 +409,12 @@ def print_local_runtime_error_text(err: dict[str, Any]) -> None:
 
 
 def print_service_actions_text(payload: dict[str, Any]) -> None:
+    warnings = payload.get("warnings") or []
+    if warnings:
+        print("warnings:")
+        for warning in warnings:
+            print(f"  - {warning}")
+
     sync_actions = payload.get("sync_actions") or []
     if sync_actions:
         print("sync:")
@@ -442,6 +452,9 @@ def print_endpoint_summary(summary: dict[str, list[dict[str, Any]]]) -> None:
         suffix_parts: list[str] = []
         if status:
             suffix_parts.append(status)
+        exposure = item.get("exposure") or (item.get("endpoint") or {}).get("exposure")
+        if exposure:
+            suffix_parts.append(str(exposure))
         if alias:
             suffix_parts.append(f"({alias})")
         suffix = "   " + "   ".join(suffix_parts) if suffix_parts else ""

@@ -117,6 +117,23 @@ core:
         guards. Runs LLM-free (CASS_MEMORY_LLM=none); agents add rules
         directly via cm add or the cm MCP server.
 
+    - id: ubs-bin
+      kind: binary
+      path: ${SKILLBOX_UBS_BIN}
+      required: false
+      profiles:
+        - core
+      source:
+        kind: url
+        url: ${SKILLBOX_UBS_DOWNLOAD_URL}
+        sha256: ${SKILLBOX_UBS_DOWNLOAD_SHA256}
+        executable: true
+      sync:
+        mode: download-if-missing
+      notes: >
+        Ultimate Bug Scanner (ubs). Optional NTM flywheel/code-audit helper
+        used by agents for broad bug and security sweeps.
+
   skills:
     - id: default-skills
       kind: skill-repo-set
@@ -396,6 +413,14 @@ core:
       profiles:
         - memory
       notes: CASS Memory System (cm) should be installed for agent procedural memory.
+
+    - id: ubs-binary
+      type: path_exists
+      path: ${SKILLBOX_UBS_BIN}
+      required: false
+      profiles:
+        - core
+      notes: Ultimate Bug Scanner should be installed for agent audit sweeps.
 
     - id: fwc-binary
       type: path_exists
