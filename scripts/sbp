@@ -113,7 +113,11 @@ configure_operator_defaults() {
 
   for repos_candidate in "${repos_candidates[@]}"; do
     if [[ -d "${repos_candidate}" ]]; then
-      repos_root="$(realpath_portable "${repos_candidate}")"
+      if [[ "${repos_candidate}" == "${HOME}/repos" ]]; then
+        repos_root="${repos_candidate}"
+      else
+        repos_root="$(realpath_portable "${repos_candidate}")"
+      fi
       break
     fi
   done

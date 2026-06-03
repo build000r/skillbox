@@ -1150,6 +1150,7 @@ def active_profiles_for_release(release: DeployRelease | None) -> list[str]:
 
 def remote_box_contract_payload(context: "BoxUpContext") -> dict[str, Any]:
     state_root = str(context.box.state_root or (context.profile.storage.mount_path if context.profile.storage else "")).strip()
+    ssh_user = str(getattr(context.profile, "ssh_user", "") or "skillbox").strip()
     storage_filesystem = str(
         context.box.storage_filesystem
         or (context.profile.storage.filesystem if context.profile.storage else "")
@@ -1163,7 +1164,7 @@ def remote_box_contract_payload(context: "BoxUpContext") -> dict[str, Any]:
         "SKILLBOX_BOX_ID": context.box_id,
         "SKILLBOX_BOX_SELF": "true",
         "SKILLBOX_BOX_TAILSCALE_HOSTNAME": context.ts_hostname,
-        "SKILLBOX_HOST_HOME_ROOT": f"/home/{context.profile.ssh_user}",
+        "SKILLBOX_HOST_HOME_ROOT": f"/home/{ssh_user}",
     })
     if context.box.tailscale_ip:
         env_updates["SKILLBOX_BOX_TAILSCALE_IP"] = context.box.tailscale_ip
@@ -1178,7 +1179,7 @@ def remote_box_contract_payload(context: "BoxUpContext") -> dict[str, Any]:
         env_updates.update({
             "SKILLBOX_STATE_ROOT": state_root,
             "SKILLBOX_CLIENTS_HOST_ROOT": f"{state_root.rstrip('/')}/clients",
-            "SKILLBOX_MONOSERVER_HOST_ROOT": f"{state_root.rstrip('/')}/repos",
+            "SKILLBOX_MONOSERVER_HOST_ROOT": f"{state_root.rstrip('/')}/monoserver",
         })
 
     active_profiles = active_profiles_for_release(context.deploy_release)
