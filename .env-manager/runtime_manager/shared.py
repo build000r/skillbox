@@ -2479,6 +2479,18 @@ def read_durable_session_events(
             event = _durable_session_event_payload(root_dir, events_path, line_number, item, meta)
             if _event_matches_scope(event, client_id=client_id, session_id=session_id):
                 events.append(event)
+    # `_durable_session_event_paths` globs session directories, so the raw
+    # append order follows filesystem iteration order rather than time. Sort
+    # deterministically by timestamp (then source/line/subject) so callers that
+    # do not run their own sort still get a stable, chronological feed.
+    events.sort(
+        key=lambda item: (
+            float(item.get("ts") or 0.0),
+            str(item.get("source") or ""),
+            int(item.get("line_number") or 0),
+            str(item.get("subject") or ""),
+        )
+    )
     return events
 
 
