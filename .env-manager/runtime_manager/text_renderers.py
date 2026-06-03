@@ -437,6 +437,13 @@ def print_service_actions_text(payload: dict[str, Any]) -> None:
             summary = f"{summary} (pid {item['pid']})"
         if item.get("reason"):
             summary = f"{summary} ({item['reason']})"
+        endpoint = item.get("endpoint") or {}
+        endpoint_url = item.get("endpoint_url") or endpoint.get("access_url")
+        exposure = item.get("exposure") or endpoint.get("exposure")
+        if endpoint_url:
+            summary = f"{summary} -> {endpoint_url}"
+        if exposure:
+            summary = f"{summary} [{exposure}]"
         print(f"  - {item['id']}: {summary}")
 
 
@@ -449,6 +456,7 @@ def print_endpoint_summary(summary: dict[str, list[dict[str, Any]]]) -> None:
     def _row(item: dict[str, Any], id_width: int, url_width: int) -> str:
         alias = item.get("alias")
         status = item.get("status")
+        display_url = item.get("access_url") or (item.get("endpoint") or {}).get("access_url") or item["url"]
         suffix_parts: list[str] = []
         if status:
             suffix_parts.append(status)
@@ -458,18 +466,18 @@ def print_endpoint_summary(summary: dict[str, list[dict[str, Any]]]) -> None:
         if alias:
             suffix_parts.append(f"({alias})")
         suffix = "   " + "   ".join(suffix_parts) if suffix_parts else ""
-        return f"  {item['id']:<{id_width}}  {item['url']:<{url_width}}{suffix}".rstrip()
+        return f"  {item['id']:<{id_width}}  {display_url:<{url_width}}{suffix}".rstrip()
 
     if apps:
         id_w = max(len(a["id"]) for a in apps)
-        url_w = max(len(a["url"]) for a in apps)
+        url_w = max(len(a.get("access_url") or (a.get("endpoint") or {}).get("access_url") or a["url"]) for a in apps)
         print()
         print("apps:")
         for app in apps:
             print(_row(app, id_w, url_w))
     if apis:
         id_w = max(len(a["id"]) for a in apis)
-        url_w = max(len(a["url"]) for a in apis)
+        url_w = max(len(a.get("access_url") or (a.get("endpoint") or {}).get("access_url") or a["url"]) for a in apis)
         print()
         print("APIs:")
         for api in apis:
