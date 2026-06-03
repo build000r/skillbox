@@ -455,10 +455,6 @@ def build_endpoint_summary(
         hc = svc.get("healthcheck") or {}
         hc_url = hc.get("url") or ""
         meta = overlay_meta.get(svc_id, {})
-        url = _local_url(hc_url) or meta.get("local_url") or ""
-        if not url:
-            continue
-        probe_url = hc_url or url
         alias = _HARDCODED_ALIASES.get(svc_id) or meta.get("alias")
         endpoint = service_endpoint_exposure(
             model,
@@ -466,11 +462,17 @@ def build_endpoint_summary(
             box_access=box_access,
             overlay_meta=overlay_meta,
         )
+        url = (endpoint or {}).get("local_url") or _local_url(hc_url) or meta.get("local_url") or ""
+        if not url:
+            continue
+        access_url = (endpoint or {}).get("access_url") or url
+        probe_url = hc_url or url
         rows.append(
             {
                 "id": svc_id,
                 "url": url,
-                "category": _categorize(svc_id, hc_url, meta.get("category")),
+                "access_url": access_url,
+                "category": (endpoint or {}).get("category") or _categorize(svc_id, url, meta.get("category")),
                 "alias": alias,
                 "probe_url": probe_url,
                 "status": None,
