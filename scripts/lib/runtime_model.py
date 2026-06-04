@@ -225,7 +225,10 @@ CANONICAL_RUNTIME_RECORDS: dict[str, tuple[str, ...]] = {
         "service_id",
         "listener",
         "path",
+        "path_prefix",
         "match",
+        "strip_prefix",
+        "host",
     ),
     "parity_ledger_item": (
         "id",
@@ -1184,6 +1187,9 @@ def _flatten_ingress_route_record(route: dict[str, Any]) -> None:
     """Normalize ingress_route records in place."""
     if "service_id" not in route and route.get("service"):
         route["service_id"] = route.get("service")
+    raw_path = route.get("path")
+    if (raw_path is None or str(raw_path).strip() == "") and route.get("path_prefix") is not None:
+        route["path"] = route.get("path_prefix")
     if "path" in route and route["path"] is None:
         route["path"] = ""
     if "match" in route and route["match"] is None:
@@ -1444,6 +1450,8 @@ def _populate_ingress_route_defaults(model: dict[str, Any], root_dir: Path) -> N
         route.setdefault("listener", "public")
         route.setdefault("path", "")
         route.setdefault("match", "exact")
+        route.setdefault("strip_prefix", False)
+        route.setdefault("host", "")
 
 
 def _populate_parity_ledger_defaults(model: dict[str, Any], root_dir: Path) -> None:

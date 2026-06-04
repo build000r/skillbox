@@ -32,11 +32,15 @@ def sort_routes(routes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         routes,
         key=lambda route: (
             0 if str(route.get("match") or "exact") == "exact" else 1,
-            -len(str(route.get("path") or "")),
-            str(route.get("path") or ""),
+            -len(route_path(route)),
+            route_path(route),
             str(route.get("id") or ""),
         ),
     )
+
+
+def route_path(route: dict[str, Any]) -> str:
+    return str(route.get("path") or route.get("path_prefix") or "").strip()
 
 
 class RouteStore:
@@ -104,15 +108,15 @@ class RouteStore:
 
 
 def path_matches(route: dict[str, Any], request_path: str) -> bool:
-    route_path = str(route.get("path") or "").strip() or "/"
+    path = route_path(route) or "/"
     match = str(route.get("match") or "exact").strip().lower() or "exact"
     if match == "exact":
-        return request_path == route_path
-    if route_path == "/":
+        return request_path == path
+    if path == "/":
         return True
-    if request_path == route_path:
+    if request_path == path:
         return True
-    normalized = route_path.rstrip("/")
+    normalized = path.rstrip("/")
     return request_path.startswith(f"{normalized}/")
 
 

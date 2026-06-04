@@ -168,6 +168,10 @@ def _routes(model: dict[str, Any]) -> list[dict[str, Any]]:
     return [route for route in model.get("ingress_routes") or [] if isinstance(route, dict)]
 
 
+def _route_path(route: dict[str, Any]) -> str:
+    return _clean(route.get("path") or route.get("path_prefix"))
+
+
 def _env_files_by_id(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {_clean(env_file.get("id")): env_file for env_file in model.get("env_files") or [] if _clean(env_file.get("id"))}
 
@@ -224,12 +228,12 @@ def _find_route(expected: dict[str, Any], routes: list[dict[str, Any]]) -> dict[
             if _clean(route.get("id")) == expected_id:
                 return route
     service_id = _expected_service_id(expected)
-    expected_path = _clean(expected.get("path"))
+    expected_path = _clean(expected.get("path") or expected.get("path_prefix"))
     expected_listener = _clean(expected.get("listener"))
     for route in routes:
         if service_id and _route_service_id(route) != service_id:
             continue
-        if expected_path and _clean(route.get("path")) != expected_path:
+        if expected_path and _route_path(route) != expected_path:
             continue
         if expected_listener and _clean(route.get("listener") or "public") != expected_listener:
             continue
@@ -300,11 +304,13 @@ def _reverse_proxy_domain(model: dict[str, Any], client: dict[str, Any], contrac
             "id": _clean(route.get("id")),
             "service_id": _route_service_id(route),
             "listener": _clean(route.get("listener") or "public"),
-            "path": _clean(route.get("path")),
+            "path": _route_path(route),
             "match": _clean(route.get("match") or "exact"),
             "upstream": _route_origin(route, services),
         }
         expected_compare = dict(expected)
+        if expected_compare.get("path_prefix") and not expected_compare.get("path"):
+            expected_compare["path"] = expected_compare["path_prefix"]
         if expected_compare.get("service") and not expected_compare.get("service_id"):
             expected_compare["service_id"] = expected_compare["service"]
         if expected_compare.get("origin_url") and not expected_compare.get("upstream"):

@@ -1975,6 +1975,7 @@ def _check_ingress_route_entries(
         listener = _ingress_route_listener(route, issues)
         path = _ingress_route_path(route, issues)
         match = _ingress_route_match(route, issues)
+        issues.extend(_check_ingress_route_strip_prefix(route))
         issues.extend(_check_ingress_route_duplicate(seen_keys, listener, path, match))
     return issues
 
@@ -2014,11 +2015,19 @@ def _ingress_route_listener(route: dict[str, Any], issues: list[str]) -> str:
 
 def _ingress_route_path(route: dict[str, Any], issues: list[str]) -> str:
     path = str(route.get("path") or "").strip()
-    if not path:
+    path_prefix = str(route.get("path_prefix") or "").strip()
+    if path_prefix and not path_prefix.startswith("/"):
+        issues.append(f"ingress route {route.get('id')} path_prefix must start with '/'")
+    if path and path_prefix and path != path_prefix:
+        issues.append(
+            f"ingress route {route.get('id')} path and path_prefix must match when both are set"
+        )
+    effective_path = path or path_prefix
+    if not effective_path:
         issues.append(f"ingress route {route.get('id', '(missing id)')} is missing path")
-    elif not path.startswith("/"):
+    elif not effective_path.startswith("/"):
         issues.append(f"ingress route {route.get('id')} path must start with '/'")
-    return path
+    return effective_path
 
 
 def _ingress_route_match(route: dict[str, Any], issues: list[str]) -> str:
@@ -2026,6 +2035,12 @@ def _ingress_route_match(route: dict[str, Any], issues: list[str]) -> str:
     if match not in VALID_INGRESS_ROUTE_MATCHES:
         issues.append(f"ingress route {route.get('id')} has unsupported match {route.get('match')!r}")
     return match
+
+
+def _check_ingress_route_strip_prefix(route: dict[str, Any]) -> list[str]:
+    if "strip_prefix" in route and not isinstance(route.get("strip_prefix"), bool):
+        return [f"ingress route {route.get('id')} strip_prefix must be a boolean"]
+    return []
 
 
 def _check_ingress_route_duplicate(

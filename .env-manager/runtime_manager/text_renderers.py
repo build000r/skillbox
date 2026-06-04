@@ -119,8 +119,9 @@ def _render_ingress_route_lines(model: dict[str, Any]) -> list[str]:
     for route in ingress_routes:
         listener = str(route.get("listener") or "public")
         match = str(route.get("match") or "exact")
+        path = str(route.get("path") or route.get("path_prefix") or "")
         lines.append(
-            f"  - {route['id']}: {listener} {route.get('path', '')} "
+            f"  - {route['id']}: {listener} {path} "
             f"-> {route.get('service_id', '')} ({match})"
         )
     return lines
@@ -317,7 +318,7 @@ def _print_status_ingress(status_payload: dict[str, Any]) -> None:
     print("ingress:")
     for route in ingress_routes:
         print(
-            f"  - {route['id']}: {route['listener']} {route['path']} "
+            f"  - {route['id']}: {route['listener']} {route.get('path') or route.get('path_prefix') or ''} "
             f"-> {route['service_id']} @ {route['request_url']}"
         )
 

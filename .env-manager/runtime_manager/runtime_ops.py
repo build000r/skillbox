@@ -786,14 +786,22 @@ def service_origin_url(service: dict[str, Any] | None) -> str:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
 
 
+def ingress_route_path(route: dict[str, Any]) -> str:
+    return str(route.get("path") or route.get("path_prefix") or "").strip()
+
+
+def ingress_route_strip_prefix(route: dict[str, Any]) -> bool:
+    return route.get("strip_prefix") is True
+
+
 def sorted_ingress_routes(routes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(
         routes,
         key=lambda route: (
             str(route.get("listener") or "public"),
             0 if str(route.get("match") or "exact") == "exact" else 1,
-            -len(str(route.get("path") or "")),
-            str(route.get("path") or ""),
+            -len(ingress_route_path(route)),
+            ingress_route_path(route),
             str(route.get("id") or ""),
         ),
     )
@@ -815,7 +823,7 @@ def _resolved_ingress_route_entry(
     include_service_state: bool,
 ) -> dict[str, Any]:
     listener = str(route.get("listener") or "public").strip().lower() or "public"
-    path = str(route.get("path") or "").strip()
+    path = ingress_route_path(route)
     match = str(route.get("match") or "exact").strip().lower() or "exact"
     service_id = str(route.get("service_id") or "").strip()
     service = services_by_id.get(service_id)
@@ -826,7 +834,10 @@ def _resolved_ingress_route_entry(
         "profiles": list(route.get("profiles") or []),
         "listener": listener,
         "path": path,
+        "path_prefix": str(route.get("path_prefix") or "").strip(),
         "match": match,
+        "strip_prefix": ingress_route_strip_prefix(route),
+        "host": str(route.get("host") or "").strip(),
         "service_id": service_id,
         "request_url": f"{listener_settings['base_url']}{path}" if path else listener_settings["base_url"],
         "origin_url": service_origin_url(service),
@@ -889,7 +900,10 @@ def render_ingress_routes_document(model: dict[str, Any]) -> str:
                 "profiles": route["profiles"],
                 "listener": route["listener"],
                 "path": route["path"],
+                "path_prefix": route["path_prefix"],
                 "match": route["match"],
+                "strip_prefix": route["strip_prefix"],
+                "host": route["host"],
                 "service_id": route["service_id"],
                 "origin_url": route["origin_url"],
             }
