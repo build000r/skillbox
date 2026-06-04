@@ -432,6 +432,29 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(route["request_url"], "https://reports.example.test/v1/report")
             self.assertEqual(route["origin_url"], "http://127.0.0.1:9100")
 
+    def test_resolved_ingress_routes_carries_path_prefix_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = self._ingress_model(repo)
+            route = model["ingress_routes"][0]
+            route.pop("path")
+            route["path_prefix"] = "/reports"
+            route["strip_prefix"] = True
+            route["host"] = "reports.example.test"
+
+            routes = MANAGE_MODULE.resolved_ingress_routes(model)
+            manifest = json.loads(MANAGE_MODULE.render_ingress_routes_document(model))
+
+            self.assertEqual(routes[0]["path"], "/reports")
+            self.assertEqual(routes[0]["path_prefix"], "/reports")
+            self.assertTrue(routes[0]["strip_prefix"])
+            self.assertEqual(routes[0]["host"], "reports.example.test")
+            self.assertEqual(routes[0]["request_url"], "https://reports.example.test/reports")
+            self.assertEqual(manifest["routes"][0]["path"], "/reports")
+            self.assertEqual(manifest["routes"][0]["path_prefix"], "/reports")
+            self.assertTrue(manifest["routes"][0]["strip_prefix"])
+            self.assertEqual(manifest["routes"][0]["host"], "reports.example.test")
+
     def test_check_manifest_requires_service_origin_url_for_ingress_routes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir).resolve()
@@ -448,6 +471,45 @@ class RuntimeManagerTests(unittest.TestCase):
 
             self.assertTrue(
                 any("without a valid origin_url" in issue for issue in issues)
+            )
+
+    def test_check_manifest_validates_path_prefix_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = self._ingress_model(repo)
+            route = model["ingress_routes"][0]
+            route.pop("path")
+            route["path_prefix"] = "reports"
+
+            results = MANAGE_MODULE.check_manifest(model)
+            issues = [
+                issue
+                for result in results
+                if result.code == "runtime-manifest"
+                for issue in result.details.get("issues", [])
+            ]
+
+            self.assertTrue(
+                any("path_prefix must start with '/'" in issue for issue in issues)
+            )
+
+    def test_check_manifest_rejects_conflicting_path_prefix_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            model = self._ingress_model(repo)
+            route = model["ingress_routes"][0]
+            route["path_prefix"] = "/other"
+
+            results = MANAGE_MODULE.check_manifest(model)
+            issues = [
+                issue
+                for result in results
+                if result.code == "runtime-manifest"
+                for issue in result.details.get("issues", [])
+            ]
+
+            self.assertTrue(
+                any("path and path_prefix must match" in issue for issue in issues)
             )
 
     def test_validate_ingress_requires_service_origin_url(self) -> None:

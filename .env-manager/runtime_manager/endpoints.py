@@ -192,14 +192,17 @@ def _service_ingress_routes(model: dict[str, Any], service_id: str) -> list[dict
         if str(route.get("service_id") or "").strip() != service_id:
             continue
         listener = str(route.get("listener") or "public").strip().lower() or "public"
-        path = str(route.get("path") or "").strip()
+        path = str(route.get("path") or route.get("path_prefix") or "").strip()
         settings = _ingress_listener_settings(model, listener)
         routes.append(
             {
                 "id": str(route.get("id") or "").strip(),
                 "listener": listener,
                 "path": path,
+                "path_prefix": str(route.get("path_prefix") or "").strip(),
                 "match": str(route.get("match") or "exact").strip().lower() or "exact",
+                "strip_prefix": route.get("strip_prefix") is True,
+                "route_host": str(route.get("host") or "").strip(),
                 "request_url": f"{settings['base_url']}{path}" if path else settings["base_url"],
                 "host": settings["host"],
                 "port": settings["port"],

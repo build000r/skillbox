@@ -718,7 +718,15 @@ class IngressProxyScriptTests(unittest.TestCase):
         self.assertTrue(INGRESS.path_matches({"path": "/api/users"}, "/api/users"))
         self.assertFalse(INGRESS.path_matches({"path": "/api/users"}, "/api/users/1"))
         self.assertTrue(INGRESS.path_matches({"path": "/api", "match": "prefix"}, "/api/users"))
+        self.assertTrue(INGRESS.path_matches({"path_prefix": "/haas", "match": "prefix"}, "/haas/assets/app.js"))
         self.assertTrue(INGRESS.path_matches({"path": "/", "match": "prefix"}, "/anything"))
+        self.assertEqual(
+            [route["id"] for route in INGRESS.sort_routes([
+                {"id": "prefix-short", "path": "/api", "match": "prefix"},
+                {"id": "prefix-alias", "path_prefix": "/api/reports", "match": "prefix"},
+            ])],
+            ["prefix-alias", "prefix-short"],
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             route_file = Path(tmpdir) / "routes.json"

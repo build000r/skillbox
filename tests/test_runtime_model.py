@@ -53,7 +53,11 @@ class RuntimeModelTests(unittest.TestCase):
             self.assertEqual(services["web"]["profiles"], ["surfaces"])
             self.assertEqual(ingress_routes["overlay-api"]["service_id"], "api")
             self.assertEqual(ingress_routes["overlay-api"]["client"], "overlayed")
+            self.assertEqual(ingress_routes["overlay-api"]["path"], "/reports")
+            self.assertEqual(ingress_routes["overlay-api"]["path_prefix"], "/reports")
             self.assertEqual(ingress_routes["overlay-api"]["match"], "prefix")
+            self.assertTrue(ingress_routes["overlay-api"]["strip_prefix"])
+            self.assertEqual(ingress_routes["overlay-api"]["host"], "reports.example.test")
             self.assertEqual(logs["runtime"]["host_path"], str(repo / ".skillbox-state" / "logs" / "runtime.log"))
             self.assertEqual(checks["repo-root"]["host_path"], str(repo / "repos"))
             self.assertEqual(clients["inline"]["default_cwd_host_path"], str(repo / "repos" / "inline"))
@@ -305,8 +309,10 @@ class RuntimeModelTests(unittest.TestCase):
                     - id: overlay-api
                       service_id: api
                       listener: private
-                      path: /reports
+                      path_prefix: /reports
                       match: prefix
+                      strip_prefix: true
+                      host: reports.example.test
                 """
             ),
             encoding="utf-8",
