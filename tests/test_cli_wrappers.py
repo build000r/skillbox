@@ -701,6 +701,31 @@ class CliWrapperTests(unittest.TestCase):
             self.assertEqual(record["env"]["SKILLBOX_MONOSERVER_ROOT"], str(operator_repos.resolve()))
             self.assertEqual(record["env"]["SKILLBOX_MONOSERVER_HOST_ROOT"], str(operator_repos.resolve()))
 
+    def test_sbp_status_infers_operator_roots_from_explicit_source_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            operator_repos = root / "srv" / "skillbox" / "repos"
+            fake_root = self._make_fake_skillbox(operator_repos / "opensource" / "skillbox")
+            home = root / "home"
+            clients_root = operator_repos / "skillbox-config" / "clients"
+            clients_root.mkdir(parents=True)
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "status",
+                fake_root=fake_root,
+                home=home,
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["env"]["SKILLBOX_CONFIG_ROOT"], str((operator_repos / "skillbox-config").resolve()))
+            self.assertEqual(record["env"]["SKILLBOX_CLIENTS_HOST_ROOT"], str(clients_root.resolve()))
+            self.assertEqual(record["env"]["SKILLBOX_MONOSERVER_ROOT"], str(operator_repos.resolve()))
+            self.assertEqual(record["env"]["SKILLBOX_MONOSERVER_HOST_ROOT"], str(operator_repos.resolve()))
+
     def test_sbp_status_preserves_explicit_clients_root_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
