@@ -333,7 +333,11 @@ def service_endpoint_exposure(
         annotated["viewable_from_tailnet"] = bool(route_tailnet_url)
         annotated_routes.append(annotated)
     viewable_routes = [route for route in annotated_routes if route.get("viewable_from_tailnet")]
-    if viewable_routes:
+    if direct_url:
+        exposure = "tailnet-direct"
+        access_url = direct_url
+        tailnet_url = direct_url
+    elif viewable_routes:
         exposure = "ingress-routed"
         access_url = str(viewable_routes[0].get("tailnet_url") or viewable_routes[0].get("request_url") or "")
         tailnet_url = access_url
@@ -341,10 +345,6 @@ def service_endpoint_exposure(
         exposure = "loopback-only"
         access_url = str(annotated_routes[0].get("request_url") or local_url)
         tailnet_url = ""
-    elif direct_url:
-        exposure = "tailnet-direct"
-        access_url = direct_url
-        tailnet_url = direct_url
     else:
         exposure = "loopback-only"
         access_url = local_url

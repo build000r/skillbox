@@ -690,6 +690,13 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
                     "match": "prefix",
                 },
                 {
+                    "id": "wide-web-private",
+                    "service_id": "wide-web",
+                    "listener": "private",
+                    "path": "/",
+                    "match": "prefix",
+                },
+                {
                     "id": "local-routed-public",
                     "service_id": "local-routed-web",
                     "listener": "public",
@@ -722,6 +729,10 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
         self.assertFalse(by_id["lan-api"]["viewable_from_tailnet"])
         self.assertEqual(by_id["wide-web"]["endpoint"]["exposure"], "tailnet-direct")
         self.assertEqual(by_id["wide-web"]["endpoint_url"], "http://100.64.0.10:5175")
+        self.assertEqual(
+            by_id["wide-web"]["endpoint"]["ingress_routes"][0]["tailnet_url"],
+            "http://100.64.0.10:9080/",
+        )
         self.assertTrue(by_id["wide-web"]["viewable_from_tailnet"])
         self.assertEqual(by_id["routed"]["endpoint"]["exposure"], "ingress-routed")
         self.assertEqual(by_id["routed"]["endpoint"]["ingress_routes"][0]["request_url"], "http://127.0.0.1:9080/routed")

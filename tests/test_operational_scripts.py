@@ -48,6 +48,10 @@ HERMES_CODEX = SourceFileLoader(
     "skillbox_hermes_codex_adapter",
     str((SCRIPTS_DIR / "hermes_codex_adapter.py").resolve()),
 ).load_module()
+TAILNET_SMOKE = SourceFileLoader(
+    "skillbox_tailnet_app_smoke",
+    str((SCRIPTS_DIR / "tailnet_app_smoke.py").resolve()),
+).load_module()
 
 
 def _write_skill(root: Path, frontmatter: str, body: str = "\nUse this skill.\n") -> None:
@@ -121,6 +125,72 @@ class BinaryPushScriptTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("validation: ok", result.stdout)
+
+
+class TailnetAppSmokeTests(unittest.TestCase):
+    def test_smoke_accepts_tailnet_direct_service_and_same_origin_assets(self) -> None:
+        def status_loader(_root: Path, client: str, profile: str) -> dict[str, object]:
+            self.assertEqual(client, "haas")
+            self.assertEqual(profile, "local-all")
+            return {
+                "services": [
+                    {
+                        "id": "haas-web",
+                        "state": "running",
+                        "endpoint_url": "http://tailnet.test:8787/",
+                        "exposure": "tailnet-direct",
+                        "viewable_from_tailnet": True,
+                    }
+                ]
+            }
+
+        def fetcher(url: str, _timeout: float) -> object:
+            if url == "http://tailnet.test:8787/":
+                return TAILNET_SMOKE.FetchResult(
+                    200,
+                    "text/html",
+                    b'<link rel="stylesheet" href="/app.css"><script src="/app.js"></script>',
+                )
+            return TAILNET_SMOKE.FetchResult(200, "application/javascript", b"ok")
+
+        payload = TAILNET_SMOKE.run_smoke(
+            root_dir=ROOT_DIR,
+            clients=["haas"],
+            profile="local-all",
+            timeout=0.1,
+            asset_limit=8,
+            status_loader=status_loader,
+            fetcher=fetcher,
+        )
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["service_count"], 1)
+        self.assertEqual(payload["asset_count"], 2)
+        self.assertEqual(payload["results"][0]["url"], "http://tailnet.test:8787/")
+
+    def test_smoke_rejects_ingress_routed_service_for_port_per_app_contract(self) -> None:
+        payload = TAILNET_SMOKE.run_smoke(
+            root_dir=ROOT_DIR,
+            clients=["haas"],
+            profile="local-all",
+            timeout=0.1,
+            asset_limit=8,
+            status_loader=lambda _root, _client, _profile: {
+                "services": [
+                    {
+                        "id": "haas-web",
+                        "state": "running",
+                        "endpoint_url": "http://tailnet.test:9080/",
+                        "exposure": "ingress-routed",
+                        "viewable_from_tailnet": True,
+                    }
+                ]
+            },
+            fetcher=lambda _url, _timeout: TAILNET_SMOKE.FetchResult(200, "text/html", b""),
+        )
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["results"][0]["error"], "service is not tailnet-direct")
 
 
 class GuardDestructiveOpScriptTests(unittest.TestCase):
