@@ -167,7 +167,7 @@ def _validate_name(name: object) -> tuple[bool, str]:
 
     name = name.strip()
     if not name:
-        return True, ""
+        return False, "Name cannot be empty"
     if not re.match(r"^[a-z0-9-]+$", name):
         return False, f"Name '{name}' should be hyphen-case (lowercase letters, digits, and hyphens only)"
     if name.startswith("-") or name.endswith("-") or "--" in name:
@@ -183,7 +183,7 @@ def _validate_description(description: object, warnings: list[str]) -> tuple[boo
 
     description = description.strip()
     if not description:
-        return True, ""
+        return False, "Description cannot be empty"
     if "<" in description or ">" in description:
         return False, "Description cannot contain angle brackets (< or >)"
     if len(description) > 1024:
