@@ -14,7 +14,6 @@ skill_repos:
       - ask-cascade
       - audit-plans
       - build-vs-clone
-      - cli-ergonomics
       - commit
       - crap
       - describe

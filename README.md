@@ -1244,7 +1244,7 @@ version: 2
 skill_repos:
   - repo: build000r/skills
     ref: main
-    pick: [ask-cascade, audit-plans, build-vs-clone, cli-ergonomics, commit, crap, describe, divide-and-conquer, domain-planner, domain-reviewer, domain-scaffolder, mutate, oss-doc-audit, reproduce, skill-issue]
+    pick: [ask-cascade, audit-plans, build-vs-clone, commit, crap, describe, divide-and-conquer, domain-planner, domain-reviewer, domain-scaffolder, mutate, oss-doc-audit, reproduce, skill-issue]
 
   - path: ../skills
     pick: [dev-sanity, skillbox-operator]

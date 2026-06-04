@@ -134,7 +134,6 @@ HARDENED_SHARED_DEFAULT_SKILLS = [
     "ask-cascade",
     "audit-plans",
     "build-vs-clone",
-    "cli-ergonomics",
     "describe",
     "reproduce",
     "commit",
