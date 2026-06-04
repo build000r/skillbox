@@ -3887,6 +3887,7 @@ def _up_dry_run_payload(
     ordered_services: list[dict[str, Any]],
     bootstrap_task_specs: list[dict[str, Any]],
     bootstrap_summary: list[dict[str, Any]],
+    ingress_actions: list[str],
 ) -> dict[str, Any]:
     planned_services = [
         {
@@ -3906,6 +3907,7 @@ def _up_dry_run_payload(
         services=planned_services,
     )
     payload["dry_run"] = True
+    payload["ingress_actions"] = ingress_actions
     return payload
 
 
@@ -3949,6 +3951,7 @@ def _up_start_result(
     effective_mode: str,
     wait_seconds: float,
     bootstrap_summary: list[dict[str, Any]],
+    ingress_actions: list[str],
 ) -> tuple[int, dict[str, Any]]:
     started = start_services(
         model,
@@ -3966,6 +3969,7 @@ def _up_start_result(
         bootstrap_tasks=bootstrap_summary,
         services=services_payload,
     )
+    payload["ingress_actions"] = ingress_actions
     if not has_failure:
         return EXIT_OK, payload
     failed_ids = _up_failed_service_ids(started)
@@ -4017,10 +4021,12 @@ def run_up(
     )
     if possible_error is not None:
         return possible_error
+    ingress_actions = sync_ingress_artifacts(model, dry_run=dry_run)
     if dry_run:
         return EXIT_OK, _up_dry_run_payload(
             client_id, profile, requested_mode, effective_mode,
             ordered_services, bootstrap_task_specs, bootstrap_summary,
+            ingress_actions,
         )
     return _up_start_result(
         model=model,
@@ -4031,4 +4037,5 @@ def run_up(
         effective_mode=effective_mode,
         wait_seconds=wait_seconds,
         bootstrap_summary=bootstrap_summary,
+        ingress_actions=ingress_actions,
     )
