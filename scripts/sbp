@@ -17,7 +17,7 @@ sync_paths=()
 passthrough_args=()
 runtime_args=()
 json_alias_diagnostics=()
-invoke_cwd="${SKILLBOX_INVOKE_CWD:-$PWD}"
+invoke_cwd=""
 overlay_name=""
 
 realpath_portable() {
@@ -28,6 +28,7 @@ script_source="${BASH_SOURCE[0]:-${0:-}}"
 script_path="$(realpath_portable "${script_source}")"
 script_dir="$(cd "$(dirname "${script_path}")" && pwd -P)"
 wrapper_name="${SKILLBOX_WRAPPER_NAME:-$(basename "${script_path}")}"
+invoke_cwd="${SKILLBOX_INVOKE_CWD:-$(pwd -P)}"
 
 find_skillbox_root() {
   local candidate=""
@@ -39,10 +40,10 @@ find_skillbox_root() {
     candidates+=("${SKILLBOX_OPERATOR_REPOS_ROOT}/opensource/skillbox")
   fi
   if [[ -z "${SKILLBOX_ROOT:-}" ]]; then
+    candidates+=("${script_dir}/..")
     candidates+=("/srv/skillbox/repos/opensource/skillbox")
   fi
   candidates+=(
-    "${script_dir}/.."
     "${HOME}/repos/opensource/skillbox"
     "${HOME}/skillbox"
   )
