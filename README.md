@@ -386,10 +386,10 @@ it does not introduce new services outside `local-core`. Any legacy target
 that is not yet native is recorded in the parity ledger (see below) and
 rejected at request time with `LOCAL_RUNTIME_SERVICE_DEFERRED`.
 
-Local web services that should be reachable from a Tailnet browser use the
-single private ingress listener with path-prefix-per-app addressing. See
-[Tailnet Ingress Addressing](docs/tailnet-ingress.md) for the route contract,
-base-path trade-offs, and why subdomain-per-app routing is deferred.
+Local web services that should be reachable from a Tailnet browser use stable
+per-app ports bound to the Tailnet address. See
+[Tailnet App Addressing](docs/tailnet-ingress.md) for the browser URL contract,
+app config checklist, and deferred ingress alternatives.
 
 ### Parity ledger
 
