@@ -32,6 +32,59 @@ the same direct Tailnet URL:
 Loopback services remain valid for same-box automation, but `127.0.0.1` and
 `localhost` are not phone-viewable Tailnet URLs.
 
+Scene-style multi-tier apps are an exception to the direct-port contract when
+their browser bundles point at loopback-only API/auth services. Keep those as
+local-box workflows until a dedicated proxy or backend/auth refactor makes the
+whole dependency graph Tailnet-capable.
+
+## Current Local-All App Ports
+
+The selected single-process local web apps use these stable ports:
+
+| Client | Service | Phone URL |
+| --- | --- | --- |
+| `haas` | `haas-web` | `http://<tailnet-host>:8787/` |
+| `raas` | `raas-web` | `http://<tailnet-host>:8788/` |
+| `mhb` | `mhb-web` | `http://<tailnet-host>:3170/` |
+| `unclawg` | `unclawg-web` | `http://<tailnet-host>:5174/` |
+| `buildooor` | `buildooor-web` | `http://<tailnet-host>:3000/` |
+| `cca` | `cca-website` | `http://<tailnet-host>:3001/` |
+| `sweet-potato__nextra_documentation_site` | `sweet-potato-docs-web` | `http://<tailnet-host>:3003/` |
+| `design-system-registry` | `design-system-registry-web` | `http://<tailnet-host>:3212/` |
+
+## Phone Verification
+
+Start from the active `local-all` runtime:
+
+```sh
+python3 .env-manager/manage.py focus portfolio-devbox --profile local-all
+python3 scripts/tailnet_app_smoke.py
+```
+
+The smoke script derives the active clients from pulse state when `--client` is
+not provided. It requires each selected app service to be `running`,
+`tailnet-direct`, and `viewable_from_tailnet`, then fetches the app root plus
+same-origin CSS and JS assets. A passing run should report the selected client,
+service, and asset counts.
+
+For a real second-device check, open each `http://<tailnet-host>:<app-port>/`
+URL above from a phone or laptop already joined to the Tailnet. The runtime
+status text should also show each direct URL on the service row:
+
+```text
+services:
+  - haas-web [covered]: running (...) -> http://<tailnet-host>:8787 [tailnet-direct]
+```
+
+Use JSON when automation needs to read the same contract:
+
+```sh
+python3 .env-manager/manage.py status --client haas --profile local-all --format json --compact
+```
+
+The app service row should include `endpoint_url`,
+`exposure: "tailnet-direct"`, and `viewable_from_tailnet: true`.
+
 ## Overlay Shape
 
 Client overlays should make the app port and browser URL explicit. The exact

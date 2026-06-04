@@ -277,8 +277,13 @@ def _format_service_line(service: dict[str, Any]) -> str:
     if bootstrap_task_ids:
         summary = f"{summary}, bootstrap {', '.join(bootstrap_task_ids)}"
     endpoint = service.get("endpoint") or {}
+    endpoint_url = str(service.get("endpoint_url") or endpoint.get("access_url") or "").strip()
     exposure = str(endpoint.get("exposure") or service.get("exposure") or "").strip()
-    if exposure:
+    if endpoint_url:
+        summary = f"{summary} -> {endpoint_url}"
+    if exposure and endpoint_url:
+        summary = f"{summary} [{exposure}]"
+    elif exposure:
         summary = f"{summary}, exposure {exposure}"
     # WG-006: ownership_state badge so operators can see at a glance
     # whether a service is covered, bridge-only, deferred, or external

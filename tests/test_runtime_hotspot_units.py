@@ -3133,6 +3133,8 @@ class RuntimeTextRendererHotspotTests(unittest.TestCase):
                     "pid": 123,
                     "depends_on": ["db"],
                     "bootstrap_tasks": ["sync"],
+                    "endpoint_url": "http://100.64.0.10:9100",
+                    "exposure": "tailnet-direct",
                     "ownership_state": "covered",
                 },
                 {
@@ -3171,7 +3173,11 @@ class RuntimeTextRendererHotspotTests(unittest.TestCase):
         self.assertIn("  - app: present, git main, 1 dirty, 2 untracked", output)
         self.assertIn("  - skills: lock invalid, 1 skills, 1/2 targets healthy", output)
         self.assertIn("  - sync: pending, depends on prepare", output)
-        self.assertIn("  - api [covered]: running (pid 123), depends on db, bootstrap sync", output)
+        self.assertIn(
+            "  - api [covered]: running (pid 123), depends on db, bootstrap sync -> "
+            "http://100.64.0.10:9100 [tailnet-direct]",
+            output,
+        )
         self.assertIn("  - worker: declared (external process)", output)
         self.assertIn("deferred surfaces (parity ledger):\n  - billing", output)
         self.assertIn("blocked services:\n  - worker", output)
