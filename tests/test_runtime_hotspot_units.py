@@ -657,6 +657,12 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
                     "healthcheck": {"type": "http", "url": "http://0.0.0.0:9100/health"},
                 },
                 {
+                    "id": "lan-api",
+                    "kind": "http",
+                    "origin_url": "http://192.168.1.50:9400",
+                    "healthcheck": {"type": "http", "url": "http://192.168.1.50:9400/health"},
+                },
+                {
                     "id": "wide-web",
                     "kind": "http",
                     "commands": {
@@ -669,6 +675,11 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
                     "kind": "http",
                     "healthcheck": {"type": "http", "url": "http://127.0.0.1:9200/health"},
                 },
+                {
+                    "id": "local-routed-web",
+                    "kind": "http",
+                    "healthcheck": {"type": "http", "url": "http://127.0.0.1:9300/health"},
+                },
             ],
             "ingress_routes": [
                 {
@@ -677,10 +688,24 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
                     "listener": "private",
                     "path": "/routed",
                     "match": "prefix",
+                },
+                {
+                    "id": "local-routed-public",
+                    "service_id": "local-routed-web",
+                    "listener": "public",
+                    "path": "/local-routed",
+                    "match": "prefix",
                 }
             ],
         }
-        rows = [{"id": "buildooor-web"}, {"id": "api"}, {"id": "wide-web"}, {"id": "routed"}]
+        rows = [
+            {"id": "buildooor-web"},
+            {"id": "api"},
+            {"id": "lan-api"},
+            {"id": "wide-web"},
+            {"id": "routed"},
+            {"id": "local-routed-web"},
+        ]
 
         warnings = endpoints_module.annotate_service_rows(
             model,
@@ -693,13 +718,50 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
         self.assertFalse(by_id["buildooor-web"]["viewable_from_tailnet"])
         self.assertEqual(by_id["api"]["endpoint"]["exposure"], "tailnet-direct")
         self.assertEqual(by_id["api"]["endpoint_url"], "http://100.64.0.10:9100")
+        self.assertEqual(by_id["lan-api"]["endpoint"]["exposure"], "loopback-only")
+        self.assertFalse(by_id["lan-api"]["viewable_from_tailnet"])
         self.assertEqual(by_id["wide-web"]["endpoint"]["exposure"], "tailnet-direct")
         self.assertEqual(by_id["wide-web"]["endpoint_url"], "http://100.64.0.10:5175")
         self.assertTrue(by_id["wide-web"]["viewable_from_tailnet"])
         self.assertEqual(by_id["routed"]["endpoint"]["exposure"], "ingress-routed")
         self.assertEqual(by_id["routed"]["endpoint"]["ingress_routes"][0]["request_url"], "http://127.0.0.1:9080/routed")
-        self.assertEqual(len(warnings), 1)
+        self.assertEqual(by_id["routed"]["endpoint"]["ingress_routes"][0]["tailnet_url"], "http://100.64.0.10:9080/routed")
+        self.assertEqual(by_id["routed"]["endpoint_url"], "http://100.64.0.10:9080/routed")
+        self.assertEqual(by_id["local-routed-web"]["endpoint"]["exposure"], "loopback-only")
+        self.assertFalse(by_id["local-routed-web"]["viewable_from_tailnet"])
+        self.assertEqual(len(warnings), 2)
         self.assertIn("buildooor-web is loopback-only", warnings[0])
+        self.assertTrue(any("local-routed-web has only loopback-only ingress" in warning for warning in warnings))
+
+    def test_endpoint_summary_prints_tailnet_access_url_when_available(self) -> None:
+        model = {
+            "services": [
+                {
+                    "id": "cycle-chef-web",
+                    "kind": "http",
+                    "commands": {
+                        "reuse": "npm run dev -- --host 0.0.0.0 --port 5175 --strictPort",
+                    },
+                    "healthcheck": {"type": "http", "url": "http://127.0.0.1:5175/"},
+                },
+            ],
+        }
+
+        summary = endpoints_module.build_endpoint_summary(
+            model,
+            {"cycle-chef-web"},
+            probe=False,
+            box_access={"tailscale_ip": "100.64.0.10"},
+        )
+
+        self.assertEqual(summary["apps"][0]["url"], "http://0.0.0.0:5175")
+        self.assertEqual(summary["apps"][0]["access_url"], "http://100.64.0.10:5175")
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            text_renderers_module.print_endpoint_summary(summary)
+        output = buffer.getvalue()
+        self.assertIn("http://100.64.0.10:5175", output)
+        self.assertNotIn("http://127.0.0.1:5175", output)
 
 
 class RuntimeScanHotspotTests(unittest.TestCase):
@@ -3114,7 +3176,12 @@ class RuntimeTextRendererHotspotTests(unittest.TestCase):
                 {"id": "sync"},
             ],
             "services": [
-                {"id": "api", "result": "started", "pid": 123},
+                {
+                    "id": "api",
+                    "result": "started",
+                    "pid": 123,
+                    "endpoint": {"access_url": "http://100.64.0.10:9100", "exposure": "tailnet-direct"},
+                },
                 {"id": "worker", "result": "skipped", "reason": "external"},
                 {"id": "cron"},
             ],
@@ -3128,7 +3195,7 @@ class RuntimeTextRendererHotspotTests(unittest.TestCase):
         self.assertIn("sync:\n  - clone repo\n  - write env", output)
         self.assertIn("tasks:\n  - prepare: done (/tmp/ready)\n  - sync: unknown", output)
         self.assertIn("services:", output)
-        self.assertIn("  - api: started (pid 123)", output)
+        self.assertIn("  - api: started (pid 123) -> http://100.64.0.10:9100 [tailnet-direct]", output)
         self.assertIn("  - worker: skipped (external)", output)
         self.assertIn("  - cron: unknown", output)
 
