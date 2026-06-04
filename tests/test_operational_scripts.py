@@ -361,6 +361,24 @@ class QuickValidateScriptTests(unittest.TestCase):
                 (False, "Missing 'description' in frontmatter"),
             )
 
+            empty_name = root / "empty-name"
+            _write_skill(
+                empty_name,
+                'name: "   "\n'
+                "description: This description is long enough to validate.",
+            )
+            self.assertEqual(
+                QUICK_VALIDATE.validate_skill(empty_name),
+                (False, "Name cannot be empty"),
+            )
+
+            empty_description = root / "empty-description"
+            _write_skill(empty_description, 'name: valid-name\ndescription: "   "')
+            self.assertEqual(
+                QUICK_VALIDATE.validate_skill(empty_description),
+                (False, "Description cannot be empty"),
+            )
+
             bad_name = root / "bad-name"
             _write_skill(
                 bad_name,
@@ -434,7 +452,7 @@ class QuickValidateScriptTests(unittest.TestCase):
                 self.assertEqual(QUICK_VALIDATE.main(), 0)
             self.assertIn("Skill is valid with warnings", stdout.getvalue())
 
-    def test_validate_name_and_description_accept_empty_optional_values(self) -> None:
+    def test_validate_name_and_description_reject_empty_required_values(self) -> None:
         self.assertEqual(QUICK_VALIDATE._skill_body("---\nunterminated"), "")  # noqa: SLF001
         self.assertEqual(
             QUICK_VALIDATE._parse_frontmatter("---\nname: valid-name"),  # noqa: SLF001
@@ -453,12 +471,20 @@ class QuickValidateScriptTests(unittest.TestCase):
             QUICK_VALIDATE._collect_privacy_warnings(Path("/skill"), warnings)  # noqa: SLF001
         self.assertEqual(warnings, [])
 
-        self.assertEqual(QUICK_VALIDATE._validate_name(""), (True, ""))  # noqa: SLF001
+        self.assertEqual(QUICK_VALIDATE._validate_name(""), (False, "Name cannot be empty"))  # noqa: SLF001
+        self.assertEqual(QUICK_VALIDATE._validate_name("  "), (False, "Name cannot be empty"))  # noqa: SLF001
         self.assertFalse(QUICK_VALIDATE._validate_name(123)[0])  # noqa: SLF001
         self.assertFalse(QUICK_VALIDATE._validate_name("-bad")[0])  # noqa: SLF001
         self.assertFalse(QUICK_VALIDATE._validate_name("a" * 65)[0])  # noqa: SLF001
         warnings: list[str] = []
-        self.assertEqual(QUICK_VALIDATE._validate_description("", warnings), (True, ""))  # noqa: SLF001
+        self.assertEqual(
+            QUICK_VALIDATE._validate_description("", warnings),  # noqa: SLF001
+            (False, "Description cannot be empty"),
+        )
+        self.assertEqual(
+            QUICK_VALIDATE._validate_description("  ", warnings),  # noqa: SLF001
+            (False, "Description cannot be empty"),
+        )
         self.assertFalse(QUICK_VALIDATE._validate_description(123, warnings)[0])  # noqa: SLF001
         self.assertFalse(QUICK_VALIDATE._validate_description("x" * 1025, warnings)[0])  # noqa: SLF001
 
