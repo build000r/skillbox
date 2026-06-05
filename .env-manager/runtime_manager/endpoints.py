@@ -288,6 +288,11 @@ def _tailnet_direct_url(local_url: str, box_access: dict[str, Any]) -> str:
     return ""
 
 
+def _url_uses_wildcard_host(url: str) -> bool:
+    host, _port, _scheme = _url_host_port(url)
+    return host.lower() in _WILDCARD_HOSTS
+
+
 def _ingress_route_tailnet_url(route: dict[str, Any], box_access: dict[str, Any]) -> str:
     request_url = str(route.get("request_url") or "").strip()
     if not request_url:
@@ -325,6 +330,7 @@ def service_endpoint_exposure(
     category = _categorize(service_id, local_url, meta.get("category"))
     box_access = box_access or {}
     direct_url = _tailnet_direct_url(local_url, box_access)
+    direct_uses_wildcard = _url_uses_wildcard_host(local_url)
     annotated_routes: list[dict[str, Any]] = []
     for route in routes:
         annotated = dict(route)
@@ -334,7 +340,7 @@ def service_endpoint_exposure(
         annotated_routes.append(annotated)
     viewable_routes = [route for route in annotated_routes if route.get("viewable_from_tailnet")]
     if direct_url:
-        exposure = "tailnet-direct"
+        exposure = "wildcard-direct" if direct_uses_wildcard else "tailnet-direct"
         access_url = direct_url
         tailnet_url = direct_url
     elif viewable_routes:
@@ -366,7 +372,13 @@ def service_endpoint_exposure(
         endpoint["port"] = port
     if scheme:
         endpoint["scheme"] = scheme
-    if exposure == "loopback-only" and category == "app":
+    if direct_uses_wildcard:
+        endpoint["all_interfaces"] = True
+        endpoint["warning"] = (
+            f"{service_id} uses wildcard host {host or '0.0.0.0'}:{port or ''} on all interfaces; "
+            f"Tailnet access is {tailnet_url or 'unavailable'}, but this is not Tailnet-only."
+        )
+    elif exposure == "loopback-only" and category == "app":
         if annotated_routes:
             endpoint["warning"] = (
                 f"{service_id} has only loopback-only ingress/local access at {access_url}; "
