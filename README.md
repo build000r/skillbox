@@ -1669,16 +1669,17 @@ SPAPS blueprint uses that installed `spaps` command by default; override
 as `npx --yes spaps@x.y.z`.
 
 For a remote box that should be usable from your tailnet browser, set the
-browser-facing URLs explicitly. For example, with a Tailscale IP of
-`100.76.6.41` and an app on `5173`:
+browser-facing URLs explicitly. For example, with a Tailnet IP of
+`<tailnet-ip>` and an app on `5173`, bind the app to that Tailnet host instead
+of a wildcard or loopback interface:
 
 ```bash
---set SERVICE_COMMAND='npm run dev -- --host 0.0.0.0 --port 5173' \
---set SERVICE_HEALTHCHECK_URL=http://127.0.0.1:5173/ \
---set SPAPS_AUTH_BASE_URL=http://100.76.6.41:5173 \
---set SPAPS_FIXTURE_BASE_URL=http://100.76.6.41:5173 \
---set SPAPS_BROWSER_API_URL=http://100.76.6.41:3301 \
---set SPAPS_CORS_ALLOW_ORIGINS=http://100.76.6.41:5173,http://localhost:5173,http://127.0.0.1:5173
+--set SERVICE_COMMAND='npm run dev -- --host <tailnet-ip> --port 5173' \
+--set SERVICE_HEALTHCHECK_URL=http://<tailnet-ip>:5173/ \
+--set SPAPS_AUTH_BASE_URL=http://<tailnet-ip>:5173 \
+--set SPAPS_FIXTURE_BASE_URL=http://<tailnet-ip>:5173 \
+--set SPAPS_BROWSER_API_URL=http://<tailnet-ip>:3301 \
+--set SPAPS_CORS_ALLOW_ORIGINS=http://<tailnet-ip>:5173,http://localhost:5173,http://127.0.0.1:5173
 ```
 
 `box up` fills those SPAPS browser/CORS values from the enrolled Tailscale IP
