@@ -84,6 +84,10 @@ python3 .env-manager/manage.py status --client haas --profile local-all --format
 
 The app service row should include `endpoint_url`,
 `exposure: "tailnet-direct"`, and `viewable_from_tailnet: true`.
+Services that bind `0.0.0.0` or `::` are reported as
+`exposure: "wildcard-direct"` when a Tailnet host can be substituted. Treat that
+as a warning state, not as a passing Tailnet-only app port: the service is
+addressable through the Tailnet host but is also bound to every host interface.
 
 ## Rollout And Rollback
 
@@ -156,6 +160,9 @@ For apps with local auth, fixture generation, or CORS bootstrapping, use the
 same browser URL in those environment values. A service that only reports a
 loopback healthcheck may still start, but status should not claim it is
 Tailnet-viewable unless its command or metadata exposes a direct Tailnet URL.
+Likewise, a wildcard bind can be useful while debugging a local-only app, but
+it remains `wildcard-direct` until the runtime command binds to a Tailnet-only
+host.
 
 ## Deferred Ingress Models
 

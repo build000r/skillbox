@@ -723,12 +723,14 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
         by_id = {row["id"]: row for row in rows}
         self.assertEqual(by_id["buildooor-web"]["endpoint"]["exposure"], "loopback-only")
         self.assertFalse(by_id["buildooor-web"]["viewable_from_tailnet"])
-        self.assertEqual(by_id["api"]["endpoint"]["exposure"], "tailnet-direct")
+        self.assertEqual(by_id["api"]["endpoint"]["exposure"], "wildcard-direct")
         self.assertEqual(by_id["api"]["endpoint_url"], "http://100.64.0.10:9100")
+        self.assertTrue(by_id["api"]["endpoint"]["all_interfaces"])
         self.assertEqual(by_id["lan-api"]["endpoint"]["exposure"], "loopback-only")
         self.assertFalse(by_id["lan-api"]["viewable_from_tailnet"])
-        self.assertEqual(by_id["wide-web"]["endpoint"]["exposure"], "tailnet-direct")
+        self.assertEqual(by_id["wide-web"]["endpoint"]["exposure"], "wildcard-direct")
         self.assertEqual(by_id["wide-web"]["endpoint_url"], "http://100.64.0.10:5175")
+        self.assertTrue(by_id["wide-web"]["endpoint"]["all_interfaces"])
         self.assertEqual(
             by_id["wide-web"]["endpoint"]["ingress_routes"][0]["tailnet_url"],
             "http://100.64.0.10:9080/",
@@ -740,8 +742,10 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
         self.assertEqual(by_id["routed"]["endpoint_url"], "http://100.64.0.10:9080/routed")
         self.assertEqual(by_id["local-routed-web"]["endpoint"]["exposure"], "loopback-only")
         self.assertFalse(by_id["local-routed-web"]["viewable_from_tailnet"])
-        self.assertEqual(len(warnings), 2)
+        self.assertEqual(len(warnings), 4)
         self.assertIn("buildooor-web is loopback-only", warnings[0])
+        self.assertTrue(any("api uses wildcard host 0.0.0.0:9100" in warning for warning in warnings))
+        self.assertTrue(any("wide-web uses wildcard host 0.0.0.0:5175" in warning for warning in warnings))
         self.assertTrue(any("local-routed-web has only loopback-only ingress" in warning for warning in warnings))
 
     def test_endpoint_summary_prints_tailnet_access_url_when_available(self) -> None:
@@ -767,11 +771,14 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
 
         self.assertEqual(summary["apps"][0]["url"], "http://0.0.0.0:5175")
         self.assertEqual(summary["apps"][0]["access_url"], "http://100.64.0.10:5175")
+        self.assertEqual(summary["apps"][0]["exposure"], "wildcard-direct")
+        self.assertTrue(summary["apps"][0]["endpoint"]["all_interfaces"])
         buffer = io.StringIO()
         with redirect_stdout(buffer):
             text_renderers_module.print_endpoint_summary(summary)
         output = buffer.getvalue()
         self.assertIn("http://100.64.0.10:5175", output)
+        self.assertIn("wildcard-direct", output)
         self.assertNotIn("http://127.0.0.1:5175", output)
 
 
