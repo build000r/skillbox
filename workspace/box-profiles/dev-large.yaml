@@ -1,6 +1,6 @@
 provider: digitalocean
 region: nyc3
-size: s-4vcpu-8gb
+size: s-8vcpu-32gb-amd
 image: ubuntu-24-04-x64
 ssh_user: skillbox
 tailscale_hostname_prefix: skillbox
