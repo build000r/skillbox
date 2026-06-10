@@ -47,7 +47,7 @@ DEFAULT_ROOT_MCP_CONFIG = {
         }
     }
 }
-RESUMABLE_UP_STATES = {"ssh-ready", "deploying", "acceptance", "onboarding"}
+RESUMABLE_UP_STATES = {"ssh-ready", "lockdown", "deploying", "acceptance", "onboarding"}
 SWIMMERS_ENV_PREFIX = "SKILLBOX_SWIMMERS_"
 DEFAULT_SWIMMERS_PORT = "3210"
 PROVISIONING_ENV_VARS = (
@@ -89,6 +89,7 @@ STATES = [
     "bootstrapping",
     "ssh-ready",
     "enrolling",
+    "lockdown",
     "deploying",
     "acceptance",
     "onboarding",
@@ -101,7 +102,8 @@ VALID_TRANSITIONS = {
     "creating": ["bootstrapping", "destroyed"],
     "bootstrapping": ["ssh-ready", "destroyed"],
     "ssh-ready": ["enrolling", "destroyed"],
-    "enrolling": ["deploying", "destroyed"],
+    "enrolling": ["lockdown", "destroyed"],
+    "lockdown": ["deploying", "destroyed"],
     "deploying": ["acceptance", "onboarding", "destroyed"],
     "acceptance": ["ready", "destroyed"],
     "onboarding": ["ready", "destroyed"],
@@ -1143,6 +1145,106 @@ def is_loopback_publish_host(value: str | None) -> bool:
     return host in {"", "localhost", "::1", "0:0:0:0:0:0:0:1"} or host.startswith("127.")
 
 
+# ---------------------------------------------------------------------------
+# Network posture policy
+# ---------------------------------------------------------------------------
+
+POSTURE_TAILNET_ONLY = "tailnet_only"
+POSTURE_PUBLIC = "public"
+POSTURE_UNMANAGED = "unmanaged"
+VALID_POSTURES = {POSTURE_TAILNET_ONLY, POSTURE_PUBLIC, POSTURE_UNMANAGED}
+
+EXPOSURE_WILDCARD_DIRECT = "wildcard-direct"
+EXPOSURE_TAILNET_DIRECT = "tailnet-direct"
+EXPOSURE_INGRESS_ROUTED = "ingress-routed"
+EXPOSURE_LOOPBACK_ONLY = "loopback-only"
+
+
+def resolve_network_posture(box: "Box") -> str:
+    """Return the effective network posture for a box.
+
+    Old inventory entries without the field get a safe default:
+    managed boxes default to tailnet_only, external boxes to unmanaged.
+    """
+    explicit = str(box.network_posture or "").strip()
+    if explicit in VALID_POSTURES:
+        return explicit
+    if box.management_mode == "external":
+        return POSTURE_UNMANAGED
+    return POSTURE_TAILNET_ONLY
+
+
+def posture_allows_public_ssh(posture: str) -> bool:
+    return posture == POSTURE_PUBLIC
+
+
+def posture_requires_cloud_firewall(posture: str) -> bool:
+    return posture == POSTURE_TAILNET_ONLY
+
+
+def posture_requires_host_ssh_lockdown(posture: str) -> bool:
+    return posture == POSTURE_TAILNET_ONLY
+
+
+def posture_allows_exposure(posture: str, exposure: str) -> bool:
+    """Return whether the given app exposure classification is allowed under this posture."""
+    if posture == POSTURE_UNMANAGED:
+        return True
+    if posture == POSTURE_PUBLIC:
+        return True
+    # tailnet_only: wildcard-direct is a violation
+    return exposure != EXPOSURE_WILDCARD_DIRECT
+
+
+def evaluate_posture_violations(
+    box: "Box",
+    *,
+    network_checks: dict[str, Any] | None = None,
+    app_exposures: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Compare observed network state against desired posture and return violations."""
+    posture = resolve_network_posture(box)
+    violations: list[dict[str, Any]] = []
+
+    if posture == POSTURE_UNMANAGED:
+        return violations
+
+    if network_checks:
+        public_ssh = network_checks.get("public_ssh", {})
+        if public_ssh.get("ok") and not posture_allows_public_ssh(posture):
+            violations.append({
+                "type": "public_ssh_reachable",
+                "severity": "error",
+                "message": f"SSH is publicly reachable at {public_ssh.get('target')} but posture is {posture}",
+                "posture": posture,
+            })
+
+    if posture_requires_cloud_firewall(posture) and not box.cloud_firewall_id:
+        violations.append({
+            "type": "cloud_firewall_missing",
+            "severity": "warning",
+            "message": "No cloud firewall is associated with this box",
+            "posture": posture,
+        })
+
+    for app in (app_exposures or []):
+        exposure = str(app.get("exposure", ""))
+        if not posture_allows_exposure(posture, exposure):
+            violations.append({
+                "type": "app_exposure_violation",
+                "severity": "error",
+                "message": (
+                    f"{app.get('service_id', 'unknown')} uses {exposure} "
+                    f"which violates {posture} posture"
+                ),
+                "posture": posture,
+                "service_id": app.get("service_id"),
+                "exposure": exposure,
+            })
+
+    return violations
+
+
 def active_profiles_for_release(release: DeployRelease | None) -> list[str]:
     profiles = release.active_profiles if release is not None else []
     return sorted(dict.fromkeys(["core", *profiles]))
@@ -1512,6 +1614,8 @@ class Box:
     volume_id: str | None = None
     volume_name: str | None = None
     volume_size_gb: int | None = None
+    network_posture: str = ""
+    cloud_firewall_id: str | None = None
 
 
 def load_inventory() -> list[Box]:
@@ -1759,6 +1863,81 @@ def do_delete_volume(volume_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# DigitalOcean firewall lifecycle
+# ---------------------------------------------------------------------------
+
+def do_create_firewall(
+    name: str,
+    droplet_ids: list[str],
+    *,
+    allow_ssh_cidrs: list[str] | None = None,
+) -> dict[str, Any]:
+    """Create a DO firewall with bootstrap or lockdown rules."""
+    inbound = []
+    if allow_ssh_cidrs:
+        inbound.append(f"protocol:tcp,ports:22,address:{','.join(allow_ssh_cidrs)}")
+    inbound.append("protocol:udp,ports:41641,address:0.0.0.0/0,address:::/0")
+    result = doctl(
+        "compute", "firewall", "create",
+        "--name", name,
+        "--droplet-ids", ",".join(droplet_ids),
+        "--inbound-rules", ";".join(inbound),
+        "--outbound-rules",
+        "protocol:tcp,ports:all,address:0.0.0.0/0,address:::/0;"
+        "protocol:udp,ports:all,address:0.0.0.0/0,address:::/0;"
+        "protocol:icmp,address:0.0.0.0/0,address:::/0",
+        "--output", "json",
+        timeout=120,
+    )
+    firewalls = json.loads(result.stdout or "[]")
+    if not firewalls:
+        raise RuntimeError(f"doctl returned empty result when creating firewall {name}")
+    return firewalls[0] if isinstance(firewalls, list) else firewalls
+
+
+def do_update_firewall_lockdown(firewall_id: str, name: str, droplet_ids: list[str]) -> dict[str, Any]:
+    """Update firewall to lockdown rules: no public SSH, only Tailscale UDP."""
+    result = doctl(
+        "compute", "firewall", "update", firewall_id,
+        "--name", name,
+        "--droplet-ids", ",".join(droplet_ids),
+        "--inbound-rules",
+        "protocol:udp,ports:41641,address:0.0.0.0/0,address:::/0",
+        "--outbound-rules",
+        "protocol:tcp,ports:all,address:0.0.0.0/0,address:::/0;"
+        "protocol:udp,ports:all,address:0.0.0.0/0,address:::/0;"
+        "protocol:icmp,address:0.0.0.0/0,address:::/0",
+        "--output", "json",
+        timeout=120,
+    )
+    firewalls = json.loads(result.stdout or "[]")
+    if not firewalls:
+        raise RuntimeError(f"doctl returned empty result when updating firewall {firewall_id}")
+    return firewalls[0] if isinstance(firewalls, list) else firewalls
+
+
+def do_delete_firewall(firewall_id: str) -> bool:
+    result = run(
+        ["doctl", "compute", "firewall", "delete", firewall_id, "--force"],
+        check=False,
+        timeout=120,
+    )
+    return result.returncode == 0
+
+
+def do_get_firewall(firewall_id: str) -> dict[str, Any] | None:
+    result = run(
+        ["doctl", "compute", "firewall", "get", firewall_id, "--output", "json"],
+        check=False,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        return None
+    firewalls = json.loads(result.stdout or "[]")
+    return firewalls[0] if firewalls else None
+
+
+# ---------------------------------------------------------------------------
 # Tailscale operations
 # ---------------------------------------------------------------------------
 
@@ -1970,6 +2149,7 @@ def _box_up_dry_run_payload(context: BoxUpContext) -> dict[str, Any]:
     _record_box_up_step(context, "bootstrap", "skip", "dry-run")
     _record_box_up_step(context, "ssh-ready", "skip", f"would verify ssh {context.profile.ssh_user}@<public-ip>")
     _record_box_up_step(context, "enroll", "skip", f"would enroll as {context.ts_hostname}")
+    _record_box_up_step(context, "lockdown", "skip", "would verify host and cloud firewall posture")
     _record_box_up_step(context, "deploy", "skip", "dry-run")
     _record_box_up_step(context, "contract", "skip", "dry-run")
     _record_box_up_step(context, "launch", "skip", "dry-run")
@@ -2009,7 +2189,35 @@ def _create_box_droplet(context: BoxUpContext, *, ssh_key_id: str) -> str:
     if not ip:
         raise RuntimeError("Droplet created but no public IP assigned")
     context.ip = ip
-    update_box(context.box, droplet_id=str(droplet["id"]), droplet_ip=ip, state="bootstrapping")
+    droplet_id_str = str(droplet["id"])
+    posture = resolve_network_posture(context.box)
+    fw_id: str | None = None
+    if posture_requires_cloud_firewall(posture):
+        try:
+            fw = do_create_firewall(
+                f"skillbox-{context.box_id}",
+                [droplet_id_str],
+                allow_ssh_cidrs=["0.0.0.0/0", "::/0"],
+            )
+            fw_id = str(fw.get("id") or "")
+            context.steps.append({
+                "stage": "cloud_firewall_bootstrap",
+                "firewall_id": fw_id,
+                "posture": posture,
+            })
+        except Exception as exc:
+            context.steps.append({
+                "stage": "cloud_firewall_bootstrap",
+                "error": str(exc)[:200],
+                "posture": posture,
+            })
+    update_box(
+        context.box,
+        droplet_id=droplet_id_str,
+        droplet_ip=ip,
+        cloud_firewall_id=fw_id,
+        state="bootstrapping",
+    )
     context.boxes.append(context.box)
     save_inventory(context.boxes)
     return f"droplet {droplet['id']} at {ip}"
@@ -2103,6 +2311,8 @@ def _enroll_box_tailscale(context: BoxUpContext, *, ts_authkey: str) -> str:
         print(f"[...] enroll  Joining tailnet as {context.ts_hostname}...")
     update_box(context.box, state="enrolling")
     save_inventory(context.boxes)
+    posture = resolve_network_posture(context.box)
+    tailnet_only_ssh = "true" if posture_requires_host_ssh_lockdown(posture) else "false"
     result = ssh_script(
         "root",
         context.ip,
@@ -2111,6 +2321,7 @@ def _enroll_box_tailscale(context: BoxUpContext, *, ts_authkey: str) -> str:
             "TAILSCALE_AUTHKEY": ts_authkey,
             "TAILSCALE_HOSTNAME": context.ts_hostname,
             "SSH_LOGIN_USER": context.profile.ssh_user,
+            "TAILNET_ONLY_SSH": tailnet_only_ssh,
         },
         timeout=300,
     )
@@ -2120,7 +2331,36 @@ def _enroll_box_tailscale(context: BoxUpContext, *, ts_authkey: str) -> str:
     if not ts_ip:
         ts_ip_result = ssh_cmd("root", context.ip, "tailscale ip -4", timeout=15)
         ts_ip = ts_ip_result.stdout.strip().split("\n")[0] if ts_ip_result.returncode == 0 else None
-    update_box(context.box, tailscale_ip=ts_ip, state="deploying")
+    update_box(context.box, tailscale_ip=ts_ip, state="lockdown")
+    save_inventory(context.boxes)
+    if posture_requires_host_ssh_lockdown(posture):
+        ufw_check = ssh_cmd("root", context.ip, "ufw status numbered 2>/dev/null || true", timeout=15)
+        context.steps.append({
+            "stage": "host_firewall_verify",
+            "posture": posture,
+            "tailnet_only_ssh": tailnet_only_ssh,
+            "ufw_output": ufw_check.stdout[:500] if ufw_check.returncode == 0 else "ufw check failed",
+        })
+    if posture_requires_cloud_firewall(posture) and context.box.cloud_firewall_id:
+        droplet_id_str = str(context.box.droplet_id or "")
+        try:
+            do_update_firewall_lockdown(
+                context.box.cloud_firewall_id,
+                f"skillbox-{context.box_id}",
+                [droplet_id_str],
+            )
+            context.steps.append({
+                "stage": "cloud_firewall_lockdown",
+                "firewall_id": context.box.cloud_firewall_id,
+                "posture": posture,
+            })
+        except Exception as exc:
+            context.steps.append({
+                "stage": "cloud_firewall_lockdown",
+                "error": str(exc)[:200],
+                "posture": posture,
+            })
+    update_box(context.box, state="deploying")
     save_inventory(context.boxes)
     return f"tailscale {context.ts_hostname} at {ts_ip or 'unknown'}"
 
@@ -2394,6 +2634,7 @@ def _emit_resumed_box_up_dry_run(context: BoxUpContext) -> int:
     _record_box_up_step(context, "bootstrap", "skip", "would reuse existing host")
     _record_box_up_step(context, "ssh-ready", "skip", "would verify existing SSH")
     _record_box_up_step(context, "enroll", "skip", "would enroll only if Tailscale IP is missing")
+    _record_box_up_step(context, "lockdown", "skip", "would verify host and cloud firewall posture")
     _record_box_up_step(context, "deploy", "skip", "would reinstall pinned release")
     _record_box_up_step(context, "contract", "skip", "would write remote .env and .mcp.json contract")
     _record_box_up_step(context, "launch", "skip", "would build and start remote workspace")
@@ -3052,6 +3293,23 @@ def _remove_box_from_tailnet(box: Box, ssh_target: str | None, steps: list[dict[
         _box_down_step(steps, is_json, "remove", "skip", "no ssh target")
 
 
+def _cleanup_box_firewall(box: Box, steps: list[dict[str, Any]], *, is_json: bool) -> bool:
+    fw_id = str(box.cloud_firewall_id or "").strip()
+    if not fw_id:
+        _box_down_step(steps, is_json, "firewall", "skip", "no cloud firewall id")
+        return True
+    try:
+        if not is_json:
+            print(f"[...] firewall  Deleting cloud firewall {fw_id}...")
+        if do_delete_firewall(fw_id):
+            _box_down_step(steps, is_json, "firewall", "ok", f"firewall {fw_id} deleted")
+            return True
+        _box_down_step(steps, is_json, "firewall", "fail", "doctl delete returned non-zero")
+    except Exception as exc:
+        _box_down_step(steps, is_json, "firewall", "fail", str(exc))
+    return False
+
+
 def _destroy_box_droplet(box: Box, steps: list[dict[str, Any]], *, is_json: bool) -> bool:
     if box.droplet_id:
         try:
@@ -3229,6 +3487,7 @@ def cmd_down(box_id: str, *, dry_run: bool, fmt: str) -> int:
     update_box(box, state="draining")
     save_inventory(boxes)
     _remove_box_from_tailnet(box, ssh_target, steps, is_json=is_json)
+    _cleanup_box_firewall(box, steps, is_json=is_json)
     if not _destroy_box_droplet(box, steps, is_json=is_json):
         save_inventory(boxes)
         return _emit_box_down_destroy_failure(box, box_id, steps, is_json=is_json)
@@ -3513,6 +3772,12 @@ def box_health(box: Box) -> dict[str, Any]:
     if network_checks["magicdns_resolution"].get("ok"):
         status["magicdns_url"] = browser_url_for(box.tailscale_hostname)
 
+    posture = resolve_network_posture(box)
+    status["network_posture"] = posture
+    status["cloud_firewall_id"] = box.cloud_firewall_id
+    violations = evaluate_posture_violations(box, network_checks=network_checks)
+    status["posture_violations"] = violations
+
     next_actions: list[str] = []
     if not status["ssh_reachable"]:
         if box.management_mode == "external":
@@ -3521,6 +3786,13 @@ def box_health(box: Box) -> dict[str, Any]:
             next_actions.append(f"box down {box.id}")
     elif not status["container_running"]:
         next_actions.append(f"box ssh {box.id}")
+    for v in violations:
+        if v["type"] == "public_ssh_reachable":
+            next_actions.append(f"Lockdown: restrict public SSH on {box.id}")
+        elif v["type"] == "cloud_firewall_missing":
+            next_actions.append(f"Create cloud firewall for {box.id}")
+        elif v["type"] == "app_exposure_violation":
+            next_actions.append(f"Fix {v.get('service_id', 'unknown')} bind: {v.get('exposure', '')}")
     status["next_actions"] = next_actions or [f"box ssh {box.id}"]
     return status
 
@@ -3545,6 +3817,9 @@ def print_box_status_text(status: dict[str, Any]) -> None:
         print(f"Open this on phone: {status['phone_url']}")
     if status.get("magicdns_url"):
         print(f"MagicDNS: {status['magicdns_url']}")
+    posture = status.get("network_posture") or "unknown"
+    fw_id = status.get("cloud_firewall_id") or "none"
+    print(f"  posture={posture}  cloud_firewall={fw_id}")
     network_checks = status.get("network_checks") or {}
     if network_checks:
         print("  network:")
@@ -3557,6 +3832,66 @@ def print_box_status_text(status: dict[str, Any]) -> None:
             state = "ok" if check.get("ok") else "fail"
             target = check.get("target") or check.get("hostname") or "n/a"
             print(f"    - {label}: {state} ({target})")
+    violations = status.get("posture_violations") or []
+    if violations:
+        print("  posture violations:")
+        for v in violations:
+            severity = v.get("severity", "warning")
+            print(f"    - [{severity}] {v.get('message', v.get('type', 'unknown'))}")
+
+
+# ---------------------------------------------------------------------------
+# box posture-proof
+# ---------------------------------------------------------------------------
+
+def cmd_posture_proof(box_id: str, *, fmt: str) -> int:
+    is_json = fmt == "json"
+    boxes = load_inventory()
+    box = find_box(boxes, box_id)
+    if box is None:
+        msg = f"Box {box_id!r} not found."
+        if is_json:
+            emit_json(structured_error(msg, error_type="not_found", next_actions=["box list"]))
+        else:
+            print(msg, file=sys.stderr)
+        return EXIT_ERROR
+
+    posture = resolve_network_posture(box)
+    public_ssh_probe = _check_public_ssh(box)
+    tailnet_probe = _check_tailnet_ping(box)
+
+    cloud_firewall_rules: dict[str, Any] | None = None
+    if box.cloud_firewall_id:
+        cloud_firewall_rules = do_get_firewall(box.cloud_firewall_id)
+
+    network_checks = {"public_ssh": public_ssh_probe, "tailnet_ping": tailnet_probe}
+    violations = evaluate_posture_violations(box, network_checks=network_checks)
+
+    proof: dict[str, Any] = {
+        "box_id": box.id,
+        "posture": posture,
+        "cloud_firewall_rules": cloud_firewall_rules,
+        "public_ssh_probe": public_ssh_probe,
+        "tailnet_probe": tailnet_probe,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "violations": violations,
+    }
+
+    if is_json:
+        emit_json(proof)
+    else:
+        print(f"Box: {box.id}")
+        print(f"Posture: {posture}")
+        print(f"Cloud firewall: {'present' if cloud_firewall_rules else 'none'}")
+        print(f"Public SSH: {'reachable' if public_ssh_probe.get('ok') else 'unreachable'}")
+        print(f"Tailnet: {'reachable' if tailnet_probe.get('ok') else 'unreachable'}")
+        if violations:
+            print(f"Violations ({len(violations)}):")
+            for v in violations:
+                print(f"  - [{v.get('severity', 'unknown')}] {v.get('message', v.get('type', 'unknown'))}")
+        else:
+            print("Violations: none")
+    return EXIT_OK
 
 
 # ---------------------------------------------------------------------------
@@ -3754,6 +4089,10 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("box_id", nargs="?", default=None, type=_validate_box_id, help="Box identifier (omit for all).")
     status_parser.add_argument("--format", choices=("text", "json"), default="text")
 
+    posture_proof_parser = subparsers.add_parser("posture-proof", help="Generate a network posture proof artifact for a box.")
+    posture_proof_parser.add_argument("box_id", type=_validate_box_id, help="Box identifier.")
+    posture_proof_parser.add_argument("--format", choices=("text", "json"), default="json")
+
     ssh_parser = subparsers.add_parser("ssh", help="SSH into a box.")
     ssh_parser.add_argument("box_id", type=_validate_box_id, help="Box identifier.")
 
@@ -3835,6 +4174,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.command == "status":
             return cmd_status(args.box_id, fmt=args.format)
+        if args.command == "posture-proof":
+            return cmd_posture_proof(args.box_id, fmt=args.format)
         if args.command == "ssh":
             return cmd_ssh(args.box_id)
         if args.command in ("register", "import"):

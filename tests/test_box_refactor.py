@@ -145,6 +145,7 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(BOX, "load_deploy_manifest", return_value=_release()), \
             mock.patch.dict(os.environ, FAKE_PROVISIONING_ENV), \
             mock.patch.object(BOX, "require_env", side_effect=["do-token", "ssh-key", "ts-auth"]), \
+            mock.patch.object(BOX, "resolve_network_posture", return_value="unmanaged"), \
             mock.patch.object(BOX, "do_create_droplet", return_value={"id": 42}), \
             mock.patch.object(BOX, "do_droplet_public_ip", return_value="1.2.3.4"), \
             mock.patch.object(BOX, "do_find_volume_by_name", return_value=None), \
@@ -199,6 +200,7 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(BOX, "load_deploy_manifest", return_value=_release()), \
             mock.patch.dict(os.environ, FAKE_PROVISIONING_ENV), \
             mock.patch.object(BOX, "require_env", side_effect=["do-token", "ssh-key", "ts-auth"]), \
+            mock.patch.object(BOX, "resolve_network_posture", return_value="unmanaged"), \
             mock.patch.object(BOX, "do_create_droplet", return_value={"id": 42}), \
             mock.patch.object(BOX, "do_droplet_public_ip", return_value="1.2.3.4"), \
             mock.patch.object(BOX, "do_find_volume_by_name", return_value=None), \
@@ -254,7 +256,7 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertTrue(payloads[-1]["dry_run"])
         self.assertEqual(
             [step["status"] for step in payloads[-1]["steps"]],
-            ["skip", "skip", "skip", "skip", "skip", "skip", "skip", "skip", "skip"],
+            ["skip", "skip", "skip", "skip", "skip", "skip", "skip", "skip", "skip", "skip"],
         )
 
     def test_cmd_up_returns_conflict_for_existing_active_box(self) -> None:
@@ -328,6 +330,7 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(BOX, "load_deploy_manifest", return_value=_release()), \
             mock.patch.dict(os.environ, FAKE_PROVISIONING_ENV), \
             mock.patch.object(BOX, "require_env", side_effect=["do-token", "ssh-key", "ts-auth"]), \
+            mock.patch.object(BOX, "resolve_network_posture", return_value="unmanaged"), \
             mock.patch.object(BOX, "do_create_droplet", return_value={"id": 42}), \
             mock.patch.object(BOX, "do_droplet_public_ip", return_value="1.2.3.4"), \
             mock.patch.object(BOX, "do_find_volume_by_name", return_value=None), \
@@ -420,7 +423,7 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertEqual(result, BOX.EXIT_OK)
         self.assertEqual(box.state, "destroyed")
         payload = payloads[-1]
-        self.assertEqual([step["status"] for step in payload["steps"]], ["warn", "ok", "ok", "skip"])
+        self.assertEqual([step["status"] for step in payload["steps"]], ["warn", "ok", "skip", "ok", "skip"])
 
     def test_cmd_down_returns_destroy_failed_and_preserves_state(self) -> None:
         box = BOX.Box(
@@ -499,7 +502,7 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertEqual(box.state, "destroyed")
         self.assertEqual(calls, ["delete-droplet", "get-volume", "detach-volume", "get-volume", "delete-volume"])
         payload = payloads[-1]
-        self.assertEqual([step["step"] for step in payload["steps"]], ["drain", "remove", "destroy", "volume"])
+        self.assertEqual([step["step"] for step in payload["steps"]], ["drain", "remove", "firewall", "destroy", "volume"])
         self.assertEqual(payload["steps"][-1]["status"], "ok")
 
     def test_cmd_down_does_not_delete_volume_attached_elsewhere(self) -> None:
@@ -622,7 +625,7 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertEqual(result, BOX.EXIT_OK)
         self.assertEqual(
             [step["status"] for step in payloads[-1]["steps"]],
-            ["skip", "skip", "skip", "skip"],
+            ["skip", "skip", "skip", "skip", "skip"],
         )
 
     def test_cmd_down_text_mode_covers_warning_and_failure_branches(self) -> None:
@@ -822,7 +825,7 @@ class BoxRefactorTests(unittest.TestCase):
             status = BOX.box_health(box)
 
         self.assertFalse(status["ssh_reachable"])
-        self.assertEqual(status["next_actions"], ["box down broken"])
+        self.assertEqual(status["next_actions"], ["box down broken", "Create cloud firewall for broken"])
 
     def test_box_health_prefers_unregister_for_external_box(self) -> None:
         box = BOX.Box(
