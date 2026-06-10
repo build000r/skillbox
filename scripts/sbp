@@ -151,7 +151,7 @@ Usage:
   __WRAPPER__ candidates [args...]    Explore linkable skill sources for this cwd
   __WRAPPER__ mcp [args...]           Read-only Claude JSON / Codex TOML MCP audit
   __WRAPPER__ registry doctor [args...] Check registry/repos.yaml against local Git repos
-  __WRAPPER__ cass status|search|rebuild  Remote portfolio-devbox Cass front door
+  __WRAPPER__ cass status|search|rebuild|doctor  Remote portfolio-devbox Cass front door
   __WRAPPER__ cron [status|apply]     Declared crontab + script links from skillbox-config
   __WRAPPER__ beads [status|init|sync] Check or initialize repo-local beads state
   __WRAPPER__ mmdx QUERY              Fuzzy-find and open .mmdx/.mmd from this cwd
