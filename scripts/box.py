@@ -906,14 +906,21 @@ def wait_for_ssh(host: str, user: str = "root", *, max_wait: int = 120, interval
 
 
 def box_ssh_candidates(box: "Box", *, prefer_public: bool = False) -> list[str]:
+    posture = resolve_network_posture(box)
+    suppress_public_cache = posture == POSTURE_TAILNET_ONLY and not prefer_public
+
     ordered = [box.droplet_ip, box.tailscale_ip, box.tailscale_hostname] if prefer_public else [
         box.tailscale_ip,
         box.tailscale_hostname,
         box.droplet_ip,
     ]
     cached = str(getattr(box, "last_ssh_target", "") or "").strip()
+    public_ip = str(box.droplet_ip or "").strip()
     if cached:
-        ordered = [cached, *ordered]
+        if suppress_public_cache and public_ip and cached == public_ip:
+            pass
+        else:
+            ordered = [cached, *ordered]
     candidates: list[str] = []
     for candidate in ordered:
         value = str(candidate or "").strip()
@@ -953,9 +960,14 @@ def resolve_box_ssh_target(
                 remaining,
             )
         )
+    posture = resolve_network_posture(box)
+    public_ip = str(box.droplet_ip or "").strip()
     for target, reachable in zip(remaining, results):
         if reachable:
-            box.last_ssh_target = target
+            if posture == POSTURE_TAILNET_ONLY and public_ip and target == public_ip:
+                box.last_ssh_target = None
+            else:
+                box.last_ssh_target = target
             return target
     box.last_ssh_target = None
     return None
@@ -3909,6 +3921,11 @@ def cmd_ssh(box_id: str) -> int:
     if not target:
         print(f"Box {box_id!r} has no reachable address.", file=sys.stderr)
         return EXIT_ERROR
+
+    posture = resolve_network_posture(box)
+    public_ip = str(box.droplet_ip or "").strip()
+    if posture == POSTURE_TAILNET_ONLY and public_ip and target == public_ip:
+        print(f"Warning: connecting via public IP ({target}) — posture is {posture}; recovery mode only", file=sys.stderr)
 
     _validate_ssh_user(box.ssh_user)
     _validate_host(target)
