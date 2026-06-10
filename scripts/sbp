@@ -152,6 +152,7 @@ Usage:
   __WRAPPER__ mcp [args...]           Read-only Claude JSON / Codex TOML MCP audit
   __WRAPPER__ registry doctor [args...] Check registry/repos.yaml against local Git repos
   __WRAPPER__ cass status|search|rebuild  Remote portfolio-devbox Cass front door
+  __WRAPPER__ cron [status|apply]     Declared crontab + script links from skillbox-config
   __WRAPPER__ beads [status|init|sync] Check or initialize repo-local beads state
   __WRAPPER__ mmdx QUERY              Fuzzy-find and open .mmdx/.mmd from this cwd
   __WRAPPER__ mmdx                    List recent .mmdx/.mmd files from this repo
@@ -238,6 +239,7 @@ payload = {
         {"name": "mcp", "json": True, "safe_first_try": f"{wrapper} mcp --json"},
         {"name": "registry", "json": True, "safe_first_try": f"{wrapper} registry doctor --json"},
         {"name": "cass", "json": True, "safe_first_try": f"{wrapper} cass status --json"},
+        {"name": "cron", "json": True, "safe_first_try": f"{wrapper} cron status --json"},
         {"name": "recalibrate", "json": False, "safe_first_try": f"{wrapper} recalibrate"},
     ],
     "agent_surfaces": {
@@ -419,6 +421,10 @@ case "${1:-}" in
     action="cass"
     shift
     ;;
+  cron)
+    action="cron"
+    shift
+    ;;
   beads|br)
     action="beads"
     shift
@@ -507,7 +513,7 @@ append_passthrough_token() {
     sync)
       sync_paths+=("${token}")
       ;;
-    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|repo-registry|cass|beads|mmdx|operator-booking|swimmers-launch)
+    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|repo-registry|cass|cron|beads|mmdx|operator-booking|swimmers-launch)
       passthrough_args+=("${token}")
       ;;
     *)
@@ -527,7 +533,7 @@ append_json_flag() {
       ;;
     capabilities|robot-triage)
       ;;
-    repo-registry|cass)
+    repo-registry|cass|cron)
       passthrough_args+=(--json)
       ;;
     *)
@@ -757,6 +763,15 @@ PY
       exit 1
     fi
     python3 "${cass_wrapper}" "${passthrough_args[@]}"
+    ;;
+  cron)
+    config_root="${SKILLBOX_CONFIG_ROOT:-${HOME}/repos/skillbox-config}"
+    cron_wrapper="${config_root}/scripts/cron-sync.sh"
+    if [[ ! -f "${cron_wrapper}" ]]; then
+      echo "${wrapper_name} cron: missing cron-sync at ${cron_wrapper}" >&2
+      exit 1
+    fi
+    bash "${cron_wrapper}" "${passthrough_args[@]}"
     ;;
   repo-registry)
     config_root="${SKILLBOX_CONFIG_ROOT:-${HOME}/repos/skillbox-config}"
