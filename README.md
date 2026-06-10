@@ -631,6 +631,18 @@ Available MCP tools:
 | `operator_doctor` | Run outer validation checks |
 | `operator_render` | Print the resolved sandbox model |
 
+### Network Posture
+
+Managed boxes default to `tailnet_only` posture: public SSH is a bootstrap
+aperture that closes after Tailscale enrollment. See
+[docs/tailnet-only-lifecycle.md](docs/tailnet-only-lifecycle.md) for the full
+lifecycle, recovery paths, and posture verification commands.
+
+```bash
+python3 scripts/box.py posture-proof <box-id>          # verify lockdown
+python3 scripts/box.py status <box-id> --format json   # includes violations
+```
+
 ### Destructive Operation Guard
 
 Destructive tools (`operator_teardown`, `operator_compose_down`) are gated by

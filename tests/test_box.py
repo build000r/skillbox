@@ -1429,6 +1429,72 @@ class NetworkPostureContractTests(unittest.TestCase):
         self.assertIn("[error]", output)
         self.assertIn("publicly reachable", output)
 
+    def test_ssh_candidates_skips_stale_public_cache_under_tailnet_only(self):
+        box = self._make_box(
+            droplet_ip="1.2.3.4",
+            tailscale_ip="100.100.1.1",
+            tailscale_hostname="skillbox-test",
+            last_ssh_target="1.2.3.4",
+        )
+        candidates = BOX_MODULE.box_ssh_candidates(box)
+        self.assertEqual(candidates[0], "100.100.1.1")
+        self.assertIn("1.2.3.4", candidates)
+
+    def test_ssh_candidates_allows_public_cache_under_public_posture(self):
+        box = self._make_box(
+            network_posture="public",
+            droplet_ip="1.2.3.4",
+            tailscale_ip="100.100.1.1",
+            last_ssh_target="1.2.3.4",
+        )
+        candidates = BOX_MODULE.box_ssh_candidates(box)
+        self.assertEqual(candidates[0], "1.2.3.4")
+
+    def test_ssh_candidates_allows_public_first_during_bootstrap(self):
+        box = self._make_box(
+            state="ssh-ready",
+            droplet_ip="1.2.3.4",
+            tailscale_ip="100.100.1.1",
+        )
+        candidates = BOX_MODULE.box_ssh_candidates(box, prefer_public=True)
+        self.assertEqual(candidates[0], "1.2.3.4")
+
+    def test_ssh_candidates_external_box_keeps_public_cache(self):
+        box = self._make_box(
+            management_mode="external",
+            droplet_ip="1.2.3.4",
+            tailscale_ip="100.100.1.1",
+            last_ssh_target="1.2.3.4",
+        )
+        candidates = BOX_MODULE.box_ssh_candidates(box)
+        self.assertEqual(candidates[0], "1.2.3.4")
+
+    def test_resolve_ssh_target_no_cache_public_under_tailnet_only(self):
+        box = self._make_box(
+            droplet_ip="1.2.3.4",
+            tailscale_ip=None,
+            tailscale_hostname=None,
+            ssh_user="skillbox",
+        )
+        with mock.patch.object(BOX_MODULE, "wait_for_ssh", return_value=True):
+            target = BOX_MODULE.resolve_box_ssh_target(box, max_wait=1, interval=1)
+        self.assertEqual(target, "1.2.3.4")
+        self.assertIsNone(box.last_ssh_target)
+
+    def test_cmd_ssh_warns_public_under_tailnet_only(self):
+        box = self._make_box(
+            droplet_ip="1.2.3.4",
+            tailscale_ip=None,
+            ssh_user="skillbox",
+        )
+        with mock.patch.object(BOX_MODULE, "load_inventory", return_value=[box]), \
+            mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="1.2.3.4"), \
+            mock.patch("os.execvp") as mock_exec, \
+            mock.patch("sys.stderr", new_callable=__import__("io").StringIO) as mock_err:
+            BOX_MODULE.cmd_ssh("test-box")
+        self.assertIn("recovery mode", mock_err.getvalue())
+        mock_exec.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

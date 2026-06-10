@@ -1066,6 +1066,50 @@ def validate_ingress(model: dict[str, Any]) -> list[CheckResult]:
     return results
 
 
+def validate_service_exposure(model: dict[str, Any]) -> list[CheckResult]:
+    """Lint service exposure against the box's network posture policy."""
+    box_access = runtime_box_access_from_env(model.get("env") or {})
+    posture = str(os.environ.get("SKILLBOX_NETWORK_POSTURE") or "").strip()
+    if not posture:
+        return []
+    try:
+        from .endpoints import service_endpoint_exposure
+    except Exception:
+        return []
+    violations: list[dict[str, Any]] = []
+    for svc in model.get("services") or []:
+        endpoint = service_endpoint_exposure(model, svc, box_access=box_access)
+        if endpoint is None:
+            continue
+        exposure = endpoint.get("exposure", "")
+        if posture == "tailnet_only" and exposure == "wildcard-direct":
+            violations.append({
+                "service_id": svc.get("id"),
+                "exposure": exposure,
+                "warning": endpoint.get("warning", ""),
+            })
+    if violations:
+        return [
+            CheckResult(
+                status="warn",
+                code="service-exposure-violation",
+                message=(
+                    f"{len(violations)} service(s) use wildcard-direct exposure "
+                    f"which violates {posture} posture"
+                ),
+                details={"posture": posture, "violations": violations},
+            )
+        ]
+    return [
+        CheckResult(
+            status="pass",
+            code="service-exposure-posture",
+            message=f"all service exposures comply with {posture} posture",
+            details={"posture": posture},
+        )
+    ]
+
+
 def doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
     results = check_manifest(model)
     if any(result.status == "fail" for result in results):
@@ -1107,6 +1151,7 @@ def doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
         + validate_storage_posture(model)
         + validate_bridges(model)
         + validate_ingress(model)
+        + validate_service_exposure(model)
         + parity_results
     )
 
