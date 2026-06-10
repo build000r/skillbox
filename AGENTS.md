@@ -56,6 +56,24 @@ Slow/side-effecting commands: `make build`, `make up`, `make runtime-sync`,
 `make runtime-up`, `make box-up`, `make box-down`, and `install.sh` can build
 containers, clone/download artifacts, start services, or touch infrastructure.
 
+## Background Task Polling
+
+Do not hand-roll `while/for` loops with `sleep` and `grep` to poll for
+background task completion. Use the Monitor tool to stream events from a
+background process (each stdout line becomes a notification), or use `Bash` with
+`run_in_background` and wait for the notification. For a polling pattern, use
+Monitor with an until-loop: `until <check>; do sleep 2; done` — you get a
+notification when the loop exits. Only use `sleep` in a poll loop when no
+notification mechanism is available.
+
+## Network Posture
+
+Managed boxes default to `tailnet_only`. Public SSH closes after Tailscale
+enrollment (lockdown stage). Use `posture-proof <box-id>` to verify, and
+`box status` to see violations. Do not bind services to `0.0.0.0` on
+tailnet-only boxes — use loopback or Tailnet IP. See
+`docs/tailnet-only-lifecycle.md` for recovery and exposure rules.
+
 ## Coding Notes
 
 - Python is standard-library first; PyYAML is optional but required for YAML

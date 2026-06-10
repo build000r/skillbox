@@ -7947,5 +7947,50 @@ class LocalMinimalRegressionTests(unittest.TestCase):
             self.assertEqual(ordered, ["svc-auth", "svc-api", "svc-web"])
 
 
+class ServiceExposureLintTests(unittest.TestCase):
+    """Tests for validate_service_exposure runtime lint."""
+
+    def test_no_posture_env_returns_empty(self):
+        from runtime_manager.runtime_ops import validate_service_exposure
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SKILLBOX_NETWORK_POSTURE", None)
+            results = validate_service_exposure({"services": []})
+        self.assertEqual(results, [])
+
+    def test_tailnet_only_with_no_violations_passes(self):
+        from runtime_manager.runtime_ops import validate_service_exposure
+        fake_endpoint = {
+            "exposure": "loopback-only",
+            "url": "http://127.0.0.1:3000",
+        }
+        with mock.patch.dict(os.environ, {"SKILLBOX_NETWORK_POSTURE": "tailnet_only"}), \
+             mock.patch("runtime_manager.endpoints.service_endpoint_exposure", return_value=fake_endpoint):
+            results = validate_service_exposure({
+                "services": [{"id": "test-svc", "kind": "http"}],
+                "env": {},
+            })
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, "pass")
+        self.assertEqual(results[0].code, "service-exposure-posture")
+
+    def test_tailnet_only_with_wildcard_warns(self):
+        from runtime_manager.runtime_ops import validate_service_exposure
+        fake_endpoint = {
+            "exposure": "wildcard-direct",
+            "url": "http://0.0.0.0:3000",
+            "warning": "test uses wildcard",
+        }
+        with mock.patch.dict(os.environ, {"SKILLBOX_NETWORK_POSTURE": "tailnet_only"}), \
+             mock.patch("runtime_manager.endpoints.service_endpoint_exposure", return_value=fake_endpoint):
+            results = validate_service_exposure({
+                "services": [{"id": "bad-svc", "kind": "http"}],
+                "env": {},
+            })
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, "warn")
+        self.assertEqual(results[0].code, "service-exposure-violation")
+        self.assertIn("wildcard-direct", results[0].message)
+
+
 if __name__ == "__main__":
     unittest.main()
