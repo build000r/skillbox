@@ -598,7 +598,7 @@ class BoxLifecycleTests(unittest.TestCase):
 
         self.assertEqual(result, BOX_MODULE.EXIT_OK)
         self.assertEqual(box.state, "destroyed")
-        self.assertEqual([step["status"] for step in payloads[0]["steps"]], ["ok", "ok", "ok", "skip"])
+        self.assertEqual([step["status"] for step in payloads[0]["steps"]], ["ok", "ok", "skip", "ok", "skip"])
 
     def test_box_health_reports_reachable_container(self) -> None:
         box = BOX_MODULE.Box(
@@ -635,7 +635,7 @@ class BoxLifecycleTests(unittest.TestCase):
         self.assertTrue(status["network_checks"]["public_ssh"]["ok"])
         self.assertTrue(status["network_checks"]["tailnet_ping"]["ok"])
         self.assertEqual(status["magicdns_url"], "http://skillbox-box-1:3210/")
-        self.assertEqual(status["next_actions"], ["box ssh box-1"])
+        self.assertEqual(status["next_actions"], ["Lockdown: restrict public SSH on box-1", "Create cloud firewall for box-1"])
 
     def test_print_box_status_text_surfaces_phone_url_without_indentation(self) -> None:
         status = {

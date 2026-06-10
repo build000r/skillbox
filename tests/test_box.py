@@ -563,7 +563,7 @@ class BoxTests(unittest.TestCase):
             self.assertEqual(payload["credential_status"]["missing"], [])
             self.assertIn("steps", payload)
             step_names = [s["step"] for s in payload["steps"]]
-            self.assertEqual(step_names, ["create", "storage", "bootstrap", "ssh-ready", "enroll", "deploy", "contract", "launch", "first-box", "verify"])
+            self.assertEqual(step_names, ["create", "storage", "bootstrap", "ssh-ready", "enroll", "lockdown", "deploy", "contract", "launch", "first-box", "verify"])
             for s in payload["steps"]:
                 self.assertEqual(s["status"], "skip", f"step {s['step']} should be skip in dry-run")
             self.assertIn("profile", payload)
@@ -1140,6 +1140,294 @@ def _swimmers_context_for_test():
         deploy_release=deploy_release,
         ts_hostname="test-box.tailnet",
     )
+
+
+class NetworkPostureContractTests(unittest.TestCase):
+    """Tests for the BoxNetworkPosture policy contract."""
+
+    def _make_box(self, **overrides):
+        defaults = {
+            "id": "test-box",
+            "profile": "dev-small",
+            "state": "ready",
+            "management_mode": "managed",
+        }
+        defaults.update(overrides)
+        return BOX_MODULE.Box(**defaults)
+
+    def test_old_inventory_loads_without_posture_field(self):
+        old_inventory = {
+            "boxes": [{
+                "id": "legacy-box",
+                "profile": "dev-small",
+                "state": "ready",
+                "management_mode": "managed",
+                "droplet_id": "123",
+                "droplet_ip": "1.2.3.4",
+                "tailscale_ip": "100.100.1.1",
+                "ssh_user": "skillbox",
+            }]
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(old_inventory, f)
+            f.flush()
+            with mock.patch.object(BOX_MODULE, "inventory_path", return_value=Path(f.name)):
+                boxes = BOX_MODULE.load_inventory()
+        os.unlink(f.name)
+        self.assertEqual(len(boxes), 1)
+        self.assertEqual(boxes[0].id, "legacy-box")
+        self.assertEqual(boxes[0].network_posture, "")
+        self.assertIsNone(boxes[0].cloud_firewall_id)
+
+    def test_old_managed_box_resolves_to_tailnet_only(self):
+        box = self._make_box(network_posture="")
+        posture = BOX_MODULE.resolve_network_posture(box)
+        self.assertEqual(posture, "tailnet_only")
+
+    def test_old_external_box_resolves_to_unmanaged(self):
+        box = self._make_box(management_mode="external", network_posture="")
+        posture = BOX_MODULE.resolve_network_posture(box)
+        self.assertEqual(posture, "unmanaged")
+
+    def test_explicit_posture_is_respected(self):
+        for posture_value in ("tailnet_only", "public", "unmanaged"):
+            box = self._make_box(network_posture=posture_value)
+            self.assertEqual(BOX_MODULE.resolve_network_posture(box), posture_value)
+
+    def test_new_managed_box_defaults_to_tailnet_only(self):
+        box = BOX_MODULE.Box(id="new-box", profile="dev-small")
+        posture = BOX_MODULE.resolve_network_posture(box)
+        self.assertEqual(posture, "tailnet_only")
+
+    def test_tailnet_only_forbids_public_ssh(self):
+        self.assertFalse(BOX_MODULE.posture_allows_public_ssh("tailnet_only"))
+
+    def test_public_allows_public_ssh(self):
+        self.assertTrue(BOX_MODULE.posture_allows_public_ssh("public"))
+
+    def test_tailnet_only_requires_cloud_firewall(self):
+        self.assertTrue(BOX_MODULE.posture_requires_cloud_firewall("tailnet_only"))
+
+    def test_public_does_not_require_cloud_firewall(self):
+        self.assertFalse(BOX_MODULE.posture_requires_cloud_firewall("public"))
+
+    def test_tailnet_only_requires_host_ssh_lockdown(self):
+        self.assertTrue(BOX_MODULE.posture_requires_host_ssh_lockdown("tailnet_only"))
+
+    def test_tailnet_only_forbids_wildcard_direct_exposure(self):
+        self.assertFalse(
+            BOX_MODULE.posture_allows_exposure("tailnet_only", "wildcard-direct")
+        )
+
+    def test_tailnet_only_allows_tailnet_direct_exposure(self):
+        self.assertTrue(
+            BOX_MODULE.posture_allows_exposure("tailnet_only", "tailnet-direct")
+        )
+
+    def test_tailnet_only_allows_loopback_only_exposure(self):
+        self.assertTrue(
+            BOX_MODULE.posture_allows_exposure("tailnet_only", "loopback-only")
+        )
+
+    def test_tailnet_only_allows_ingress_routed_exposure(self):
+        self.assertTrue(
+            BOX_MODULE.posture_allows_exposure("tailnet_only", "ingress-routed")
+        )
+
+    def test_unmanaged_allows_all_exposures(self):
+        for exposure in ("wildcard-direct", "tailnet-direct", "loopback-only", "ingress-routed"):
+            self.assertTrue(BOX_MODULE.posture_allows_exposure("unmanaged", exposure))
+
+    def test_public_allows_all_exposures(self):
+        for exposure in ("wildcard-direct", "tailnet-direct", "loopback-only", "ingress-routed"):
+            self.assertTrue(BOX_MODULE.posture_allows_exposure("public", exposure))
+
+    def test_evaluate_violations_public_ssh_on_tailnet_only(self):
+        box = self._make_box(network_posture="tailnet_only")
+        violations = BOX_MODULE.evaluate_posture_violations(
+            box,
+            network_checks={"public_ssh": {"ok": True, "target": "1.2.3.4"}},
+        )
+        types = [v["type"] for v in violations]
+        self.assertIn("public_ssh_reachable", types)
+
+    def test_evaluate_violations_no_ssh_violation_when_public_unreachable(self):
+        box = self._make_box(network_posture="tailnet_only")
+        violations = BOX_MODULE.evaluate_posture_violations(
+            box,
+            network_checks={"public_ssh": {"ok": False, "target": "1.2.3.4"}},
+        )
+        types = [v["type"] for v in violations]
+        self.assertNotIn("public_ssh_reachable", types)
+
+    def test_evaluate_violations_missing_cloud_firewall(self):
+        box = self._make_box(network_posture="tailnet_only", cloud_firewall_id=None)
+        violations = BOX_MODULE.evaluate_posture_violations(box)
+        types = [v["type"] for v in violations]
+        self.assertIn("cloud_firewall_missing", types)
+
+    def test_evaluate_violations_cloud_firewall_present(self):
+        box = self._make_box(network_posture="tailnet_only", cloud_firewall_id="fw-123")
+        violations = BOX_MODULE.evaluate_posture_violations(box)
+        types = [v["type"] for v in violations]
+        self.assertNotIn("cloud_firewall_missing", types)
+
+    def test_evaluate_violations_wildcard_app_on_tailnet_only(self):
+        box = self._make_box(network_posture="tailnet_only")
+        violations = BOX_MODULE.evaluate_posture_violations(
+            box,
+            app_exposures=[{"service_id": "web-app", "exposure": "wildcard-direct"}],
+        )
+        types = [v["type"] for v in violations]
+        self.assertIn("app_exposure_violation", types)
+
+    def test_evaluate_violations_no_app_violation_for_tailnet_direct(self):
+        box = self._make_box(network_posture="tailnet_only")
+        violations = BOX_MODULE.evaluate_posture_violations(
+            box,
+            app_exposures=[{"service_id": "web-app", "exposure": "tailnet-direct"}],
+        )
+        types = [v["type"] for v in violations]
+        self.assertNotIn("app_exposure_violation", types)
+
+    def test_evaluate_violations_unmanaged_returns_nothing(self):
+        box = self._make_box(management_mode="external", network_posture="unmanaged")
+        violations = BOX_MODULE.evaluate_posture_violations(
+            box,
+            network_checks={"public_ssh": {"ok": True, "target": "1.2.3.4"}},
+            app_exposures=[{"service_id": "web-app", "exposure": "wildcard-direct"}],
+        )
+        self.assertEqual(violations, [])
+
+    def test_posture_roundtrips_through_inventory(self):
+        box = self._make_box(
+            network_posture="tailnet_only",
+            cloud_firewall_id="fw-abc",
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            pass
+        try:
+            with mock.patch.object(BOX_MODULE, "inventory_path", return_value=Path(f.name)):
+                BOX_MODULE.save_inventory([box])
+                loaded = BOX_MODULE.load_inventory()
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0].network_posture, "tailnet_only")
+            self.assertEqual(loaded[0].cloud_firewall_id, "fw-abc")
+        finally:
+            os.unlink(f.name)
+
+    def test_box_health_includes_posture_and_violations(self):
+        box = self._make_box(
+            network_posture="tailnet_only",
+            droplet_ip="1.2.3.4",
+            tailscale_ip="100.100.1.1",
+            tailscale_hostname="test-box",
+        )
+        fake_checks = {
+            "public_ssh": {"ok": True, "target": "1.2.3.4"},
+            "tailnet_ping": {"ok": True, "target": "100.100.1.1"},
+            "magicdns_resolution": {"ok": True, "hostname": "test-box"},
+            "port_reachability": {"ok": False},
+        }
+        with mock.patch.object(BOX_MODULE, "box_network_health", return_value=fake_checks), \
+             mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="100.100.1.1"), \
+             mock.patch.object(BOX_MODULE, "ssh_cmd", return_value=mock.Mock(returncode=0, stdout="workspace")):
+            status = BOX_MODULE.box_health(box)
+
+        self.assertEqual(status["network_posture"], "tailnet_only")
+        self.assertIsNone(status["cloud_firewall_id"])
+        self.assertIsInstance(status["posture_violations"], list)
+        self.assertTrue(len(status["posture_violations"]) >= 1)
+        types = [v["type"] for v in status["posture_violations"]]
+        self.assertIn("public_ssh_reachable", types)
+        self.assertIn("cloud_firewall_missing", types)
+        lockdown_actions = [a for a in status["next_actions"] if "Lockdown" in a]
+        self.assertTrue(len(lockdown_actions) > 0)
+
+    def test_box_health_no_violations_when_compliant(self):
+        box = self._make_box(
+            network_posture="tailnet_only",
+            cloud_firewall_id="fw-123",
+            droplet_ip="1.2.3.4",
+            tailscale_ip="100.100.1.1",
+            tailscale_hostname="test-box",
+        )
+        fake_checks = {
+            "public_ssh": {"ok": False, "target": "1.2.3.4"},
+            "tailnet_ping": {"ok": True, "target": "100.100.1.1"},
+            "magicdns_resolution": {"ok": True, "hostname": "test-box"},
+            "port_reachability": {"ok": False},
+        }
+        with mock.patch.object(BOX_MODULE, "box_network_health", return_value=fake_checks), \
+             mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="100.100.1.1"), \
+             mock.patch.object(BOX_MODULE, "ssh_cmd", return_value=mock.Mock(returncode=0, stdout="workspace")):
+            status = BOX_MODULE.box_health(box)
+
+        self.assertEqual(status["posture_violations"], [])
+
+    def test_enroll_passes_tailnet_only_ssh_for_managed_box(self):
+        """Verify that _enroll_box_tailscale passes TAILNET_ONLY_SSH=true for managed boxes."""
+        self.assertTrue(BOX_MODULE.posture_requires_host_ssh_lockdown("tailnet_only"))
+        self.assertFalse(BOX_MODULE.posture_requires_host_ssh_lockdown("public"))
+        posture = BOX_MODULE.resolve_network_posture(
+            self._make_box(management_mode="managed", network_posture="")
+        )
+        self.assertEqual(posture, "tailnet_only")
+        self.assertTrue(BOX_MODULE.posture_requires_host_ssh_lockdown(posture))
+
+    def test_do_firewall_lifecycle_functions_exist(self):
+        """Verify DO firewall CRUD functions are defined."""
+        self.assertTrue(callable(BOX_MODULE.do_create_firewall))
+        self.assertTrue(callable(BOX_MODULE.do_update_firewall_lockdown))
+        self.assertTrue(callable(BOX_MODULE.do_delete_firewall))
+        self.assertTrue(callable(BOX_MODULE.do_get_firewall))
+
+    def test_cleanup_box_firewall_skips_without_id(self):
+        box = self._make_box(cloud_firewall_id=None)
+        steps: list = []
+        result = BOX_MODULE._cleanup_box_firewall(box, steps, is_json=True)
+        self.assertTrue(result)
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["status"], "skip")
+
+    def test_print_box_status_shows_violations(self):
+        status = {
+            "id": "test-box",
+            "state": "ready",
+            "profile": "dev-small",
+            "droplet_id": "123",
+            "droplet_ip": "1.2.3.4",
+            "tailscale_hostname": "test-box",
+            "ssh_reachable": True,
+            "container_running": True,
+            "ssh_user": "skillbox",
+            "ssh_target": "100.100.1.1",
+            "phone_url": None,
+            "magicdns_url": None,
+            "network_posture": "tailnet_only",
+            "cloud_firewall_id": None,
+            "network_checks": {
+                "public_ssh": {"ok": True, "target": "1.2.3.4"},
+                "tailnet_ping": {"ok": True, "target": "100.100.1.1"},
+                "magicdns_resolution": {"ok": True, "hostname": "test-box"},
+                "port_reachability": {"ok": False},
+            },
+            "posture_violations": [
+                {
+                    "type": "public_ssh_reachable",
+                    "severity": "error",
+                    "message": "SSH is publicly reachable at 1.2.3.4 but posture is tailnet_only",
+                },
+            ],
+        }
+        import io
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+            BOX_MODULE.print_box_status_text(status)
+        output = mock_out.getvalue()
+        self.assertIn("posture=tailnet_only", output)
+        self.assertIn("cloud_firewall=none", output)
+        self.assertIn("[error]", output)
+        self.assertIn("publicly reachable", output)
 
 
 if __name__ == "__main__":
