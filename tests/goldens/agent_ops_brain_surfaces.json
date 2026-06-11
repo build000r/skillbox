@@ -1,0 +1,46 @@
+{
+  "capabilities": {
+    "registry_ids": [
+      "runtime.capabilities",
+      "brain.next",
+      "brain.graph",
+      "brain.explain",
+      "brain.search",
+      "brain.snap"
+    ],
+    "mcp_tools": [
+      "skillbox_capabilities",
+      "skillbox_next",
+      "skillbox_graph",
+      "skillbox_explain",
+      "skillbox_search",
+      "skillbox_snap"
+    ]
+  },
+  "explain": {
+    "command": "brain.next",
+    "kind": "command",
+    "target": "command:brain.next"
+  },
+  "graph": {
+    "algorithm": "critical-path",
+    "critical_path": [
+      "service:db",
+      "service:api",
+      "check:smoke"
+    ],
+    "edge_count": 3,
+    "node_count": 5
+  },
+  "next": {
+    "top_command": "br update ready-1 --status=in_progress",
+    "top_id": "claim-ready:ready-1",
+    "top_reason": "BR reports ready-1 as ready"
+  },
+  "snap_replay": {
+    "graph_edges": 1,
+    "graph_nodes": 2,
+    "overall": "green",
+    "snapshot_id": "golden-fixture"
+  }
+}

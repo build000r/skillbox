@@ -19,8 +19,8 @@ AI-assisted coding should not require either:
 
 The long-term vision for `skillbox` is a default shape for private,
 single-tenant agent workstations: one box with persistent homes, repo overlays,
-runtime declarations, live state, and enough operator tooling to stay sane
-without turning into a platform company.
+runtime declarations, live state, graph-aware command discovery, and enough
+operator tooling to stay sane without turning into a platform company.
 
 ## Values
 
@@ -38,7 +38,8 @@ from zero.
 ### 3. Explicit systems over hidden magic
 
 The box should describe itself with files you can inspect and validate:
-runtime graphs, manifests, overlays, logs, and checks.
+runtime graphs, command registries, manifests, overlays, logs, checks, and
+redacted snapshots.
 
 ### 4. Private infrastructure by default
 

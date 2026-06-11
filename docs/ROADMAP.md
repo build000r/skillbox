@@ -19,6 +19,14 @@ overlays, service lifecycle, health checks, installer, pulse daemon — all of
 this works today and is in use for real development: building skills, running
 agents, managing clients.
 
+The agent operations brain is also present at the CLI/MCP boundary. Agents can
+start with `capabilities`, ask `next` for ranked work with claim commands and
+validation steps, inspect the typed graph with `graph`, explain any command or
+node with `explain`, search commands/docs/Beads/evidence with `search`, and
+replay or diff redacted state fixtures with `snap`. This turns the runtime
+graph into an agent-native orientation and triage API instead of another set of
+docs an agent has to rediscover by hand.
+
 The private skill distribution loop is also present: `skill-repos.yaml` can mix
 repo, path, and distributor-backed skill sources; local publishing creates
 signed schema v2 manifests with per-version artifacts; preview resolves pins

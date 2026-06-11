@@ -69,6 +69,17 @@ def _surface_payload(
     error: str | None = None,
 ) -> dict[str, Any]:
     all_names = sorted(str(key) for key in servers.keys())
+    # A config that is a symlink whose target no longer exists reads as
+    # "absent" through is_file(); report the dangling link explicitly so the
+    # repair action targets the link instead of suggesting writes through it.
+    is_symlink = path.is_symlink()
+    broken_symlink = is_symlink and not path.exists()
+    symlink_target: str | None = None
+    if is_symlink:
+        try:
+            symlink_target = os.readlink(str(path))
+        except OSError:
+            symlink_target = None
     disabled = sorted(
         str(key)
         for key, value in servers.items()
@@ -88,6 +99,8 @@ def _surface_payload(
         "format": fmt,
         "path": str(path),
         "present": path.is_file(),
+        "broken_symlink": broken_symlink,
+        "symlink_target": symlink_target,
         "valid": error is None,
         "servers": all_names,
         "effective_servers": effective,
@@ -171,7 +184,13 @@ def _mcp_next_actions(payload: dict[str, Any]) -> list[str]:
         surface = surfaces.get(key) or {}
         if surface.get("error"):
             actions.append(f"fix {surface['path']}: {surface['error']}")
-        if surface.get("missing"):
+        if surface.get("broken_symlink"):
+            target = surface.get("symlink_target") or "?"
+            actions.append(
+                f"repair broken symlink {surface['path']} -> {target}: "
+                "relink to an existing config before adding servers"
+            )
+        elif surface.get("missing"):
             missing = ", ".join(surface["missing"])
             actions.append(f"add {missing} to {surface['path']}")
         if surface.get("unexpected"):
@@ -308,6 +327,8 @@ def _print_surface(root_dir: Path, label: str, surface: dict[str, Any]) -> None:
         f"present={str(surface.get('present')).lower()} "
         f"valid={str(surface.get('valid')).lower()}"
     )
+    if surface.get("broken_symlink"):
+        print(f"  symlink: broken -> {surface.get('symlink_target') or '?'}")
     print(f"  servers: {_join_or_none(surface.get('effective_servers') or [])}")
     if surface.get("missing"):
         print(f"  missing: {_join_or_none(surface['missing'])}")

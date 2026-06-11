@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
@@ -19,6 +20,7 @@ if str(ENV_MANAGER_DIR) not in sys.path:
     sys.path.insert(0, str(ENV_MANAGER_DIR))
 
 from runtime_manager import cli as CLI  # noqa: E402
+from runtime_manager.command_registry import default_registry  # noqa: E402
 
 
 def _ns(**kwargs: object) -> argparse.Namespace:
@@ -33,6 +35,26 @@ def _ns(**kwargs: object) -> argparse.Namespace:
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
+
+
+def _run_manage(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, ".env-manager/manage.py", *args],
+        cwd=ROOT_DIR,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(ENV_MANAGER_DIR)},
+    )
+
+
+def _load_mcp_server_module():
+    module_path = ROOT_DIR / ".env-manager" / "mcp_server.py"
+    spec = importlib.util.spec_from_file_location("skillbox_mcp_server_for_tests", module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class CliUnitTests(unittest.TestCase):
@@ -50,21 +72,31 @@ class CliUnitTests(unittest.TestCase):
         self.assertIn("focus requires a client_id or --resume", payload["error"]["message"])
 
     def test_capabilities_json_contract_is_agent_readable(self) -> None:
-        result = subprocess.run(
-            [sys.executable, ".env-manager/manage.py", "capabilities", "--json"],
-            cwd=ROOT_DIR,
-            capture_output=True,
-            text=True,
-            check=False,
-            env={**os.environ, "PYTHONPATH": str(ENV_MANAGER_DIR)},
-        )
+        result = _run_manage("capabilities", "--json")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["tool"], "skillbox-manage")
+        self.assertEqual(payload["contract_version"], "2026-05-09")
         self.assertIn("capabilities", payload["agent_surfaces"])
+        self.assertTrue(any(command["name"] == "next" for command in payload["commands"]))
+        self.assertTrue(any(command["name"] == "graph" for command in payload["commands"]))
+        self.assertTrue(any(command["name"] == "explain" for command in payload["commands"]))
+        self.assertTrue(any(command["name"] == "search" for command in payload["commands"]))
+        self.assertTrue(any(command["name"] == "snap" for command in payload["commands"]))
         self.assertIn("--json", payload["agent_surfaces"]["json_aliases"])
         self.assertTrue(any(command["name"] == "status" for command in payload["commands"]))
+        self.assertIn("registry", payload)
+        self.assertEqual(payload["registry"]["abi_version"], "2026-06-11+agent_ops_brain")
+        self.assertGreaterEqual(payload["registry"]["counts"]["tier1"], 6)
+        registry_entries = {entry["id"]: entry for entry in payload["registry"]["capabilities"]}
+        self.assertIn("brain.next", registry_entries)
+        next_entry = registry_entries["brain.next"]
+        self.assertEqual(next_entry["risk"], "low")
+        self.assertEqual(next_entry["side_effect"], "none")
+        self.assertIn("inputs", next_entry)
+        self.assertIn("outputs", next_entry)
+        self.assertIn("examples", next_entry)
         launch = next(command for command in payload["commands"] if command["name"] == "swimmers-launch")
         self.assertIn("--dry-run", launch["safe_first_try"])
         robot_docs = next(command for command in payload["commands"] if command["name"] == "robot-docs")
@@ -86,16 +118,26 @@ class CliUnitTests(unittest.TestCase):
         self.assertIn("rch-stage --dry-run --format json", rch_stage["safe_first_try"])
         sbh_report = next(command for command in payload["commands"] if command["name"] == "sbh-report")
         self.assertIn("sbh-report --format json", sbh_report["safe_first_try"])
+        next_command = next(command for command in payload["commands"] if command["name"] == "next")
+        self.assertIn("--no-adapters", next_command["safe_first_try"])
+
+    def test_capabilities_compact_registry_is_parser_backed(self) -> None:
+        result = _run_manage("capabilities", "--compact", "--json")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["contract_version"], "2026-05-09")
+        registry_entries = {entry["id"]: entry for entry in payload["registry"]["capabilities"]}
+        next_entry = registry_entries["brain.next"]
+        self.assertEqual(next_entry["risk"], "low")
+        self.assertEqual(next_entry["side_effect"], "none")
+        self.assertIn("summary", next_entry)
+        self.assertNotIn("inputs", next_entry)
+        self.assertNotIn("outputs", next_entry)
+        self.assertNotIn("examples", next_entry)
 
     def test_robot_docs_guide_is_available_in_tool(self) -> None:
-        result = subprocess.run(
-            [sys.executable, ".env-manager/manage.py", "robot-docs", "guide"],
-            cwd=ROOT_DIR,
-            capture_output=True,
-            text=True,
-            check=False,
-            env={**os.environ, "PYTHONPATH": str(ENV_MANAGER_DIR)},
-        )
+        result = _run_manage("robot-docs", "guide")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Skillbox agent guide", result.stdout)
@@ -110,6 +152,305 @@ class CliUnitTests(unittest.TestCase):
         self.assertIn("sweet-potato-prod", result.stdout)
         self.assertIn("Protected paths", result.stdout)
         self.assertIn("swimmers-launch <dirs...>", result.stdout)
+        self.assertIn("next --format json", result.stdout)
+        self.assertIn("graph --format json", result.stdout)
+
+    def test_agent_ops_brain_cli_surfaces_emit_json(self) -> None:
+        commands = [
+            ("graph", "--algorithm", "critical-path", "--format", "json", "--no-adapters"),
+            ("next", "--format", "json", "--no-adapters", "--limit", "1"),
+            ("explain", "brain.next", "--format", "json", "--no-adapters"),
+            ("search", "graph", "--format", "json", "--no-adapters", "--limit", "1"),
+            ("snap", "replay", "tests/goldens/agent_ops_snapshot.json", "--format", "json"),
+        ]
+        payloads = []
+        for command in commands:
+            with self.subTest(command=command[0]):
+                result = _run_manage(*command)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                payloads.append(json.loads(result.stdout))
+
+        self.assertEqual(payloads[0]["algorithm"]["name"], "critical-path")
+        self.assertTrue(payloads[1]["recommendations"])
+        self.assertEqual(payloads[2]["kind"], "command")
+        self.assertTrue(payloads[3]["hits"])
+        self.assertEqual(payloads[4]["snapshot_id"], "golden-fixture")
+
+    def test_agent_ops_brain_text_renderers_cover_success_and_errors(self) -> None:
+        stdout = StringIO()
+        stderr = StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            CLI._print_next_text(
+                {
+                    "summary": {"returned": 1, "recommendation_count": 2},
+                    "recommendations": [
+                        {
+                            "id": "claim-ready:one",
+                            "score": 10,
+                            "risk": "low",
+                            "side_effect": "none",
+                            "reasons": ["BR reports ready work"],
+                            "commands": ["br update one --status=in_progress"],
+                        }
+                    ],
+                    "disagreements": [{"code": "BV_BR_DISAGREE", "message": "bv and br differ"}],
+                }
+            )
+            CLI._print_explain_text(
+                {
+                    "target": "command:brain.next",
+                    "kind": "command",
+                    "summary": "Rank work",
+                    "relationships": {"incoming_count": 1, "outgoing_count": 2},
+                    "commands": [{"id": "brain.next", "summary": "Rank next actions"}],
+                }
+            )
+            CLI._print_search_text(
+                {
+                    "query": "graph",
+                    "count": 1,
+                    "total_count": 2,
+                    "hits": [
+                        {
+                            "source": "registry",
+                            "kind": "command",
+                            "id": "brain.graph",
+                            "score": 7,
+                            "snippet": "Inspect graph",
+                            "next_action": "explain brain.graph",
+                        }
+                    ],
+                    "warnings": [{"code": "MISSING_DOC", "message": "doc unavailable"}],
+                }
+            )
+            CLI._print_snap_text({"snapshot_id": "abc", "label": "fixture", "inputs": {}, "artifact": "/tmp/abc.json"})
+            CLI._print_snap_text(
+                {
+                    "change_count": 1,
+                    "changes": [{"severity": "high", "change": "modified", "entity": "doctor.check:runtime"}],
+                }
+            )
+            CLI._print_snap_text({"snapshot_id": "abc", "summary": {"services": 1, "graph_nodes": 2}})
+            CLI._print_explain_text({"error": {"message": "missing node"}})
+            CLI._print_search_text({"error": {"message": "empty query"}})
+            CLI._print_snap_text({"error": {"message": "bad snapshot"}})
+
+        rendered = stdout.getvalue()
+        self.assertIn("next: 1/2 recommendations", rendered)
+        self.assertIn("BV_BR_DISAGREE", rendered)
+        self.assertIn("explain: command:brain.next", rendered)
+        self.assertIn("search: 1/2 hits", rendered)
+        self.assertIn("snapshot: abc", rendered)
+        self.assertIn("snapshot diff: 1 changes", rendered)
+        self.assertIn("snapshot replay: abc services=1 graph_nodes=2", rendered)
+        self.assertIn("missing node", stderr.getvalue())
+        self.assertIn("empty query", stderr.getvalue())
+        self.assertIn("bad snapshot", stderr.getvalue())
+
+    def test_agent_ops_brain_handlers_cover_direct_text_json_and_snap_branches(self) -> None:
+        emitted: list[dict[str, object]] = []
+        graph_payload = {"nodes": [], "edges": [], "warnings": []}
+        recommendation_payload = {
+            "summary": {"returned": 0, "recommendation_count": 0},
+            "recommendations": [],
+            "disagreements": [],
+        }
+        search_result = {
+            "query": "graph",
+            "count": 0,
+            "total_count": 0,
+            "hits": [],
+            "warnings": [],
+        }
+
+        class TinyGraph:
+            def to_payload(self) -> dict[str, object]:
+                return graph_payload
+
+        before = CLI.create_snapshot_payload(created_at="2026-06-11T00:00:00Z")
+        after = CLI.create_snapshot_payload(
+            status={"services": [{"id": "api", "state": "down"}]},
+            created_at="2026-06-11T00:01:00Z",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            before_path = root / "before.json"
+            after_path = root / "after.json"
+            before_path.write_text(json.dumps(before), encoding="utf-8")
+            after_path.write_text(json.dumps(after), encoding="utf-8")
+
+            with (
+                mock.patch.object(CLI, "_brain_adapters_for_args", return_value={"evidence": {"payload": {}}}),
+                mock.patch.object(CLI, "_brain_graph_payload", return_value=graph_payload),
+                mock.patch.object(CLI, "next_action_payload", return_value=recommendation_payload),
+                mock.patch.object(CLI, "graph_command_payload", return_value={"ok": True, "graph": graph_payload}),
+                mock.patch.object(CLI, "render_graph_payload", return_value="graph text"),
+                mock.patch.object(CLI, "explain_payload", return_value={"error": {"message": "missing node"}}),
+                mock.patch.object(CLI, "search_payload", return_value=search_result) as search_mock,
+                mock.patch.object(CLI, "runtime_status", return_value={"services": []}),
+                mock.patch.object(CLI, "doctor_results", return_value=[]),
+                mock.patch.object(CLI, "collect_runtime_evidence", return_value={"overall": "green"}),
+                mock.patch.object(CLI, "_full_declared_mcp_servers", return_value=[]),
+                mock.patch.object(CLI, "build_agent_graph", return_value=TinyGraph()),
+                mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
+                redirect_stdout(StringIO()) as stdout,
+                redirect_stderr(StringIO()) as stderr,
+            ):
+                self.assertEqual(
+                    CLI._handle_next(_ns(format="text", limit=2, no_adapters=False), root, {}, "reuse"),
+                    CLI.EXIT_OK,
+                )
+                self.assertEqual(
+                    CLI._handle_graph(
+                        _ns(format="text", algorithm=None, node=None, source=None, target=None, blocked_node=[]),
+                        root,
+                        {},
+                        "reuse",
+                    ),
+                    CLI.EXIT_OK,
+                )
+                self.assertEqual(
+                    CLI._handle_explain(_ns(format="text", target="missing"), root, {}, "reuse"),
+                    CLI.EXIT_ERROR,
+                )
+                self.assertEqual(
+                    CLI._handle_search(
+                        _ns(
+                            format="json",
+                            query=["graph"],
+                            source_filter=["registry"],
+                            kind_filter=["command"],
+                            limit=3,
+                        ),
+                        root,
+                        {},
+                        "reuse",
+                    ),
+                    CLI.EXIT_OK,
+                )
+                self.assertEqual(
+                    CLI._handle_snap(
+                        _ns(
+                            format="text",
+                            snap_action="create",
+                            name="fixture",
+                            created_at="2026-06-11T00:00:00Z",
+                            write=True,
+                            cwd=None,
+                            ntm_session=None,
+                            no_adapters=False,
+                        ),
+                        root,
+                        {},
+                        "reuse",
+                    ),
+                    CLI.EXIT_OK,
+                )
+                self.assertEqual(
+                    CLI._handle_snap(
+                        _ns(format="text", snap_action="diff", paths=[], from_path=str(before_path), to_path=str(after_path)),
+                        root,
+                        {},
+                        "reuse",
+                    ),
+                    CLI.EXIT_OK,
+                )
+                self.assertEqual(
+                    CLI._handle_snap(
+                        _ns(format="json", snap_action="replay", path=str(before_path)),
+                        root,
+                        {},
+                        "reuse",
+                    ),
+                    CLI.EXIT_OK,
+                )
+                self.assertEqual(
+                    CLI._handle_snap(_ns(format="text", snap_action="unknown"), root, {}, "reuse"),
+                    CLI.EXIT_ERROR,
+                )
+
+        self.assertTrue(emitted)
+        search_mock.assert_called_once()
+        self.assertIn("graph text", stdout.getvalue())
+        self.assertIn("missing node", stderr.getvalue())
+        self.assertIn("unknown snap action", stderr.getvalue())
+
+    def test_agent_ops_brain_mcp_tools_are_declared_and_routed_once(self) -> None:
+        mcp_server = _load_mcp_server_module()
+        tool_names = {tool["name"] for tool in mcp_server.TOOLS}
+        dispatch_names = set(mcp_server._DISPATCH)  # noqa: SLF001
+        registry_mcp_tools = {
+            spec.mcp_tool
+            for spec in default_registry()
+            if spec.id in {
+                "runtime.capabilities",
+                "brain.next",
+                "brain.graph",
+                "brain.explain",
+                "brain.search",
+                "brain.snap",
+            }
+        }
+
+        self.assertEqual(
+            registry_mcp_tools,
+            {
+                "skillbox_capabilities",
+                "skillbox_next",
+                "skillbox_graph",
+                "skillbox_explain",
+                "skillbox_search",
+                "skillbox_snap",
+            },
+        )
+        self.assertTrue(registry_mcp_tools <= tool_names)
+        self.assertTrue(registry_mcp_tools <= dispatch_names)
+        self.assertEqual(mcp_server._DISPATCH["skillbox_next"], ("next", None))  # noqa: SLF001
+        self.assertEqual(mcp_server._DISPATCH["skillbox_snap"], ("snap", "action"))  # noqa: SLF001
+
+        search_args = mcp_server.build_args("search", {"query": "graph", "no_adapters": True})
+        self.assertEqual(search_args, ["search", "--format", "json", "graph", "--no-adapters"])
+        snap_args = mcp_server.build_args(
+            "snap",
+            {"action": "replay", "path": "tests/goldens/agent_ops_snapshot.json"},
+            "replay",
+        )
+        self.assertEqual(
+            snap_args,
+            ["snap", "replay", "--format", "json", "tests/goldens/agent_ops_snapshot.json"],
+        )
+
+    def test_agent_ops_brain_mcp_dispatch_matches_cli_representatives(self) -> None:
+        mcp_server = _load_mcp_server_module()
+
+        cli_snap = json.loads(
+            _run_manage("snap", "replay", "tests/goldens/agent_ops_snapshot.json", "--format", "json").stdout
+        )
+        mcp_snap = mcp_server.dispatch_tool(
+            "skillbox_snap",
+            {"action": "replay", "path": "tests/goldens/agent_ops_snapshot.json"},
+        )
+        mcp_snap_payload = json.loads(mcp_snap["content"][0]["text"])
+
+        self.assertNotIn("isError", mcp_snap)
+        self.assertEqual(mcp_snap_payload["_exit_code"], 0)
+        self.assertEqual(mcp_snap_payload["snapshot_id"], cli_snap["snapshot_id"])
+        self.assertEqual(mcp_snap_payload["summary"], cli_snap["summary"])
+
+        cli_search = json.loads(
+            _run_manage("search", "graph", "--format", "json", "--no-adapters", "--limit", "1").stdout
+        )
+        mcp_search = mcp_server.dispatch_tool(
+            "skillbox_search",
+            {"query": "graph", "no_adapters": True, "limit": 1},
+        )
+        mcp_search_payload = json.loads(mcp_search["content"][0]["text"])
+
+        self.assertNotIn("isError", mcp_search)
+        self.assertEqual(mcp_search_payload["_exit_code"], 0)
+        self.assertEqual(mcp_search_payload["hits"][0]["id"], cli_search["hits"][0]["id"])
+        self.assertEqual(mcp_search_payload["hits"][0]["score"], cli_search["hits"][0]["score"])
 
     def test_swimmers_launch_cli_dry_run_resolves_against_invoke_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

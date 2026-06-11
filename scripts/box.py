@@ -1293,7 +1293,7 @@ def remote_box_contract_payload(context: "BoxUpContext") -> dict[str, Any]:
         env_updates.update({
             "SKILLBOX_STATE_ROOT": state_root,
             "SKILLBOX_CLIENTS_HOST_ROOT": f"{state_root.rstrip('/')}/clients",
-            "SKILLBOX_MONOSERVER_HOST_ROOT": f"{state_root.rstrip('/')}/monoserver",
+            "SKILLBOX_MONOSERVER_HOST_ROOT": f"{state_root.rstrip('/')}/repos",
         })
 
     active_profiles = active_profiles_for_release(context.deploy_release)

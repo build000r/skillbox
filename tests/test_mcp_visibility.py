@@ -164,6 +164,62 @@ class McpVisibilityTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["invalid_configs"], 2)
         self.assertTrue(any("fix" in action for action in payload["next_actions"]))
 
+    def test_broken_symlink_config_is_surfaced_not_just_absent(self) -> None:
+        """A dangling config symlink (e.g. after a host migration) must be
+        reported as a broken link to repair, not as a missing file to write
+        through; writing through the dangling link fails or mis-targets."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / ".git").mkdir()
+            (root / ".mcp.json").write_text(
+                json.dumps({"mcpServers": {"skillbox": {"command": "python3"}}}),
+                encoding="utf-8",
+            )
+            (root / ".codex").mkdir()
+            dangling_target = root / "gone" / "skillbox.toml"
+            (root / ".codex" / "config.toml").symlink_to(dangling_target)
+
+            payload = collect_mcp_audit(root, {"services": []}, config_root=str(root))
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                print_mcp_audit_text(payload, root_dir=root)
+
+        codex = payload["surfaces"]["codex"]
+        self.assertFalse(codex["present"])
+        self.assertTrue(codex["broken_symlink"])
+        self.assertEqual(codex["symlink_target"], str(dangling_target))
+        # Regular-file surfaces keep the same stable keys.
+        claude = payload["surfaces"]["claude"]
+        self.assertFalse(claude["broken_symlink"])
+        self.assertIsNone(claude["symlink_target"])
+        # The repair action replaces the misleading "add servers" action.
+        actions = payload["next_actions"]
+        self.assertTrue(any("repair broken symlink" in action for action in actions))
+        self.assertFalse(
+            any(action.startswith("add ") and "config.toml" in action for action in actions)
+        )
+        self.assertIn("symlink: broken ->", stdout.getvalue())
+
+    def test_working_symlink_config_is_present_and_not_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / ".git").mkdir()
+            real_config = root / "real-config.toml"
+            real_config.write_text(
+                "[mcp_servers.skillbox]\ncommand = \"python3\"\n",
+                encoding="utf-8",
+            )
+            (root / ".codex").mkdir()
+            (root / ".codex" / "config.toml").symlink_to(real_config)
+
+            payload = collect_mcp_audit(root, {"services": []}, config_root=str(root))
+
+        codex = payload["surfaces"]["codex"]
+        self.assertTrue(codex["present"])
+        self.assertFalse(codex["broken_symlink"])
+        self.assertEqual(codex["symlink_target"], str(real_config))
+        self.assertIn("skillbox", codex["effective_servers"])
+
     def test_print_mcp_audit_text_is_compact(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
