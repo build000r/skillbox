@@ -10,6 +10,7 @@ You are inside a skillbox workspace container.
 
 ## Tooling Guidance
 
+- Start agent navigation with `python3 .env-manager/manage.py capabilities --json`, then `python3 .env-manager/manage.py next --format json`.
 - GitHub: use `gh-axi` for GitHub operations when available; fall back to `gh` only when `gh-axi` cannot satisfy the task.
 
 ## Pressure And Offload Policy
@@ -45,6 +46,8 @@ You are inside a skillbox workspace container.
 ## Quick Reference
 
 ```bash
+python3 .env-manager/manage.py capabilities --json
+python3 .env-manager/manage.py next --format json
 make dev-sanity
 make runtime-status
 make runtime-sync

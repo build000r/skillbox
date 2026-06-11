@@ -26,6 +26,19 @@ from .sbh_report import *
 from .evidence import *
 from .forge import *
 from .swimmers_launch import launch_swimmers_batch, swimmers_launch_text_lines
+from .command_registry import registry_payload
+from .agent_adapters import collect_agent_adapter_evidence
+from .agent_graph import build_agent_graph, build_agent_graph_payload
+from .agent_graph_engine import GRAPH_ALGORITHMS, GRAPH_OUTPUT_FORMATS, graph_command_payload, render_graph_payload
+from .agent_decisions import explain_payload, next_action_payload
+from .agent_search import search_payload
+from .agent_snapshots import (
+    create_snapshot_payload,
+    diff_snapshots,
+    load_snapshot,
+    replay_snapshot,
+    save_snapshot,
+)
 
 
 class DistributionPreviewError(RuntimeError):
@@ -51,12 +64,15 @@ MANAGE_COMMAND_NAMES = {
     "distribution-rollback",
     "doctor",
     "down",
+    "explain",
     "first-box",
     "focus",
     "forge",
+    "graph",
     "logs",
     "mcp-audit",
     "mmdx",
+    "next",
     "onboard",
     "operator-booking",
     "overlay",
@@ -70,6 +86,7 @@ MANAGE_COMMAND_NAMES = {
     "restart",
     "robot-docs",
     "robot-triage",
+    "search",
     "session-end",
     "session-event",
     "session-resume",
@@ -78,6 +95,7 @@ MANAGE_COMMAND_NAMES = {
     "skill",
     "skill-audit",
     "skills",
+    "snap",
     "status",
     "stewardship-report",
     "swimmers-launch",
@@ -345,6 +363,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print the machine-readable Skillbox CLI contract.",
     )
     capabilities_parser.add_argument("--format", choices=("json",), default="json")
+    capabilities_parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="Emit compact registry entries while preserving the top-level capabilities contract.",
+    )
 
     robot_docs_parser = subparsers.add_parser(
         "robot-docs",
@@ -683,6 +706,94 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_profile_arg(evidence_parser)
     _add_client_arg(evidence_parser)
+
+    next_parser = subparsers.add_parser(
+        "next",
+        help="Rank explainable next actions from runtime evidence, graph facts, Beads/BV, SBP, and NTM state.",
+    )
+    next_parser.add_argument("--format", choices=("text", "json"), default="json")
+    next_parser.add_argument("--limit", type=int, default=5)
+    next_parser.add_argument("--cwd", default=None, help="Working directory used for evidence scoping.")
+    next_parser.add_argument("--ntm-session", default=None, help="Optional NTM session id for load-state evidence.")
+    next_parser.add_argument("--no-adapters", action="store_true", help="Skip optional br/bv/sbp/ntm adapters.")
+    _add_profile_arg(next_parser)
+    _add_client_arg(next_parser)
+
+    graph_parser = subparsers.add_parser(
+        "graph",
+        help="Inspect the agent operations graph and optional graph algorithms.",
+    )
+    graph_parser.add_argument("--format", choices=tuple(sorted(GRAPH_OUTPUT_FORMATS)), default="json")
+    graph_parser.add_argument("--algorithm", choices=tuple(sorted(GRAPH_ALGORITHMS)), default=None)
+    graph_parser.add_argument("--node", default=None, help="Node id for node-scoped graph algorithms.")
+    graph_parser.add_argument("--source", default=None, help="Source node id for shortest-path.")
+    graph_parser.add_argument("--target", default=None, help="Target node id for shortest-path.")
+    graph_parser.add_argument(
+        "--blocked-node",
+        action="append",
+        default=[],
+        help="Blocked node id for min-unblock analysis. Can be repeated.",
+    )
+    graph_parser.add_argument("--cwd", default=None, help="Working directory used for evidence scoping.")
+    graph_parser.add_argument("--ntm-session", default=None, help="Optional NTM session id for load-state evidence.")
+    graph_parser.add_argument("--no-adapters", action="store_true", help="Skip optional br/bv/sbp/ntm adapters.")
+    _add_profile_arg(graph_parser)
+    _add_client_arg(graph_parser)
+
+    explain_parser = subparsers.add_parser(
+        "explain",
+        help="Explain a graph node or registered command using graph, registry, and adapter evidence.",
+    )
+    explain_parser.add_argument("target", help="Graph node id or registry command id to explain.")
+    explain_parser.add_argument("--format", choices=("text", "json"), default="json")
+    explain_parser.add_argument("--cwd", default=None, help="Working directory used for evidence scoping.")
+    explain_parser.add_argument("--ntm-session", default=None, help="Optional NTM session id for load-state evidence.")
+    explain_parser.add_argument("--no-adapters", action="store_true", help="Skip optional br/bv/sbp/ntm adapters.")
+    _add_profile_arg(explain_parser)
+    _add_client_arg(explain_parser)
+
+    search_parser = subparsers.add_parser(
+        "search",
+        help="Search registry commands, graph nodes, docs, Beads, and evidence with grouped JSON hits.",
+    )
+    search_parser.add_argument("query", nargs="*", help="Search terms.")
+    search_parser.add_argument("--format", choices=("text", "json"), default="json")
+    search_parser.add_argument("--source", dest="source_filter", action="append", default=[])
+    search_parser.add_argument("--kind", dest="kind_filter", action="append", default=[])
+    search_parser.add_argument("--limit", type=int, default=10)
+    search_parser.add_argument("--cwd", default=None, help="Working directory used for evidence scoping.")
+    search_parser.add_argument("--ntm-session", default=None, help="Optional NTM session id for load-state evidence.")
+    search_parser.add_argument("--no-adapters", action="store_true", help="Skip optional br/bv/sbp/ntm adapters.")
+    _add_profile_arg(search_parser)
+    _add_client_arg(search_parser)
+
+    snap_parser = subparsers.add_parser(
+        "snap",
+        help="Create, diff, or replay redacted agent operations snapshots.",
+    )
+    snap_subparsers = snap_parser.add_subparsers(dest="snap_action", required=True)
+    snap_create_parser = snap_subparsers.add_parser("create", help="Create a redacted runtime/evidence/graph snapshot.")
+    snap_create_parser.add_argument("--format", choices=("text", "json"), default="json")
+    snap_create_parser.add_argument("--name", "--label", dest="name", default=None)
+    snap_create_parser.add_argument("--created-at", default=None, help="Override timestamp for deterministic fixtures.")
+    snap_create_parser.add_argument("--write", action="store_true", help="Write the snapshot under .skillbox-state.")
+    snap_create_parser.add_argument("--cwd", default=None, help="Working directory used for evidence scoping.")
+    snap_create_parser.add_argument("--ntm-session", default=None, help="Optional NTM session id for load-state evidence.")
+    snap_create_parser.add_argument("--no-adapters", action="store_true", help="Skip optional br/bv/sbp/ntm adapters.")
+    _add_profile_arg(snap_create_parser)
+    _add_client_arg(snap_create_parser)
+    snap_diff_parser = snap_subparsers.add_parser("diff", help="Diff two saved snapshot JSON files.")
+    snap_diff_parser.add_argument("paths", nargs="*", help="Optional positional before/after snapshot paths.")
+    snap_diff_parser.add_argument("--from", dest="from_path", default=None)
+    snap_diff_parser.add_argument("--to", dest="to_path", default=None)
+    snap_diff_parser.add_argument("--format", choices=("text", "json"), default="json")
+    _add_profile_arg(snap_diff_parser)
+    _add_client_arg(snap_diff_parser)
+    snap_replay_parser = snap_subparsers.add_parser("replay", help="Replay one snapshot fixture without live services.")
+    snap_replay_parser.add_argument("path", help="Snapshot JSON path.")
+    snap_replay_parser.add_argument("--format", choices=("text", "json"), default="json")
+    _add_profile_arg(snap_replay_parser)
+    _add_client_arg(snap_replay_parser)
 
     mmdx_parser = subparsers.add_parser(
         "mmdx",
@@ -2440,7 +2551,32 @@ def _handle_mmdx(args: argparse.Namespace, root_dir: Path) -> int:
     return exit_code
 
 
-def _capabilities_payload(root_dir: Path) -> dict[str, Any]:
+def _compact_registry_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    compact_entries: list[dict[str, Any]] = []
+    for entry in payload.get("capabilities") or []:
+        compact_entry = {
+            key: entry[key]
+            for key in (
+                "id",
+                "tier",
+                "surface",
+                "summary",
+                "side_effect",
+                "risk",
+                "entrypoint",
+                "mcp_tool",
+            )
+            if key in entry
+        }
+        compact_entries.append(compact_entry)
+    return {
+        "abi_version": payload.get("abi_version"),
+        "counts": payload.get("counts") or {},
+        "capabilities": compact_entries,
+    }
+
+
+def _capabilities_payload(root_dir: Path, *, compact: bool = False) -> dict[str, Any]:
     commands = [
         {
             "name": name,
@@ -2449,6 +2585,9 @@ def _capabilities_payload(root_dir: Path) -> dict[str, Any]:
         }
         for name in sorted(MANAGE_COMMAND_NAMES)
     ]
+    registry = registry_payload()
+    if compact:
+        registry = _compact_registry_payload(registry)
     return {
         "ok": True,
         "tool": "skillbox-manage",
@@ -2462,6 +2601,7 @@ def _capabilities_payload(root_dir: Path) -> dict[str, Any]:
             "scripts/sbo",
         ],
         "commands": commands,
+        "registry": registry,
         "agent_surfaces": {
             "capabilities": "python3 .env-manager/manage.py capabilities --json",
             "robot_docs": "python3 .env-manager/manage.py robot-docs guide",
@@ -2502,6 +2642,8 @@ def _capabilities_payload(root_dir: Path) -> dict[str, Any]:
             "CI": "Prefer non-interactive behavior in supported surfaces.",
         },
         "next_actions": [
+            "python3 .env-manager/manage.py next --format json",
+            "python3 .env-manager/manage.py graph --format json --no-adapters",
             "python3 .env-manager/manage.py status --format json",
             "python3 .env-manager/manage.py doctor --format json",
             "python3 .env-manager/manage.py robot-docs guide",
@@ -2514,6 +2656,12 @@ def _safe_first_try_command(name: str) -> str:
         return f"manage.py {name} --json"
     if name == "robot-docs":
         return "manage.py robot-docs guide"
+    if name in {"next", "graph", "search"}:
+        return f"manage.py {name} --format json --no-adapters"
+    if name == "explain":
+        return "manage.py explain brain.next --format json --no-adapters"
+    if name == "snap":
+        return "manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json"
     if name in {"client-init"}:
         return "manage.py client-init --list-blueprints --format json"
     if name in {"client-project"}:
@@ -2557,6 +2705,7 @@ Primary entrypoint:
 
 Start here:
   python3 .env-manager/manage.py capabilities --json
+  python3 .env-manager/manage.py next --format json
   python3 .env-manager/manage.py status --format json
   python3 .env-manager/manage.py doctor --format json
   python3 .env-manager/manage.py --robot-triage
@@ -2572,6 +2721,11 @@ Safe mutation pattern:
   For skill lifecycle removals or pruning, use --dry-run before --yes.
 
 Useful command families:
+  next --format json            Rank explainable next actions from evidence.
+  graph --format json           Inspect the agent operations graph.
+  explain <node> --format json  Explain graph nodes, Beads, tools, and commands.
+  search <query> --format json  Search commands, graph nodes, docs, Beads, evidence.
+  snap replay <file>            Replay redacted snapshot fixtures without live services.
   status --format json          Compact runtime state.
   doctor --format json          Runtime validation checks.
   pressure-report --format json Disk pressure and RCH/SBH posture.
@@ -2595,7 +2749,7 @@ Pressure/offload rule:
 
 
 def _handle_capabilities(args: argparse.Namespace, root_dir: Path) -> int:
-    emit_json(_capabilities_payload(root_dir))
+    emit_json(_capabilities_payload(root_dir, compact=bool(getattr(args, "compact", False))))
     return EXIT_OK
 
 
@@ -2614,6 +2768,11 @@ def _handle_robot_triage(args: argparse.Namespace, root_dir: Path) -> int:
         "tool": "skillbox-manage",
         "quick_ref": _capabilities_payload(root_dir)["next_actions"],
         "recommendations": [
+            {
+                "id": "start-next",
+                "command": "python3 .env-manager/manage.py next --format json",
+                "why": "Evidence-driven ranked next actions with reasons, commands, validations, and blockers.",
+            },
             {
                 "id": "start-status",
                 "command": "python3 .env-manager/manage.py status --format json",
@@ -3082,6 +3241,206 @@ def _write_runtime_evidence_artifact(root_dir: Path, payload: dict[str, Any], ru
     json_path.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
     md_path.write_text(runtime_evidence_markdown(payload), encoding="utf-8")
     return {"json": str(json_path), "markdown": str(md_path)}
+
+
+def _brain_adapters_for_args(root_dir: Path, model: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    if bool(getattr(args, "no_adapters", False)):
+        return {}
+    payload = collect_agent_adapter_evidence(
+        root_dir,
+        model=model,
+        cwd=getattr(args, "cwd", None),
+        ntm_session=getattr(args, "ntm_session", None),
+    )
+    return payload.get("adapters") or {}
+
+
+def _brain_graph_payload(model: dict[str, Any], adapters: dict[str, Any]) -> dict[str, Any]:
+    return build_agent_graph_payload(model, adapters=adapters)
+
+
+def _print_next_text(payload: dict[str, Any]) -> None:
+    print(
+        f"next: {payload['summary']['returned']}/{payload['summary']['recommendation_count']} "
+        f"recommendations"
+    )
+    for item in payload.get("recommendations") or []:
+        print(f"- {item['id']} score={item['score']} risk={item['risk']} side_effect={item['side_effect']}")
+        for reason in item.get("reasons") or []:
+            print(f"  reason: {reason}")
+        for command in item.get("commands") or []:
+            print(f"  command: {command}")
+    if payload.get("disagreements"):
+        print("disagreements:")
+        for item in payload["disagreements"]:
+            print(f"- {item['code']}: {item['message']}")
+
+
+def _print_explain_text(payload: dict[str, Any]) -> None:
+    if "error" in payload:
+        print(payload["error"]["message"], file=sys.stderr)
+        return
+    print(f"explain: {payload['target']} ({payload['kind']})")
+    print(f"summary: {payload['summary']}")
+    relationships = payload.get("relationships") or {}
+    print(f"incoming: {relationships.get('incoming_count', 0)}")
+    print(f"outgoing: {relationships.get('outgoing_count', 0)}")
+    for command in payload.get("commands") or []:
+        print(f"command: {command['id']} - {command['summary']}")
+
+
+def _print_search_text(payload: dict[str, Any]) -> None:
+    if "error" in payload:
+        print(payload["error"]["message"], file=sys.stderr)
+        return
+    print(f"search: {payload['count']}/{payload['total_count']} hits for {payload['query']!r}")
+    for hit in payload.get("hits") or []:
+        print(f"- {hit['source']}:{hit['kind']}:{hit['id']} score={hit['score']}")
+        print(f"  {hit['snippet']}")
+        print(f"  next: {hit['next_action']}")
+    for warning in payload.get("warnings") or []:
+        print(f"warning: {warning['code']}: {warning['message']}")
+
+
+def _print_snap_text(payload: dict[str, Any]) -> None:
+    if "error" in payload:
+        print(payload["error"]["message"], file=sys.stderr)
+        return
+    if "snapshot_id" in payload and "inputs" in payload:
+        print(f"snapshot: {payload['snapshot_id']} label={payload.get('label')}")
+        artifact = payload.get("artifact")
+        if artifact:
+            print(f"artifact: {artifact}")
+        return
+    if "changes" in payload:
+        print(f"snapshot diff: {payload['change_count']} changes")
+        for item in payload.get("changes") or []:
+            print(f"- {item['severity']} {item['change']} {item['entity']}")
+        return
+    if "summary" in payload:
+        summary = payload["summary"]
+        print(
+            f"snapshot replay: {payload.get('snapshot_id')} "
+            f"services={summary['services']} graph_nodes={summary['graph_nodes']}"
+        )
+
+
+def _handle_next(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    del resolved_mode
+    adapters = _brain_adapters_for_args(root_dir, model, args)
+    graph_payload = _brain_graph_payload(model, adapters)
+    payload = next_action_payload(
+        graph_payload,
+        adapters=adapters,
+        limit=max(0, int(getattr(args, "limit", 5))),
+    )
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        _print_next_text(payload)
+    return EXIT_OK
+
+
+def _handle_graph(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    del resolved_mode
+    adapters = _brain_adapters_for_args(root_dir, model, args)
+    graph_payload = _brain_graph_payload(model, adapters)
+    payload = graph_command_payload(
+        graph_payload,
+        algorithm=getattr(args, "algorithm", None),
+        node_id=getattr(args, "node", None),
+        source=getattr(args, "source", None),
+        target=getattr(args, "target", None),
+        blocked_nodes=getattr(args, "blocked_node", None),
+    )
+    if args.format == "json":
+        emit_json(payload)
+    elif "error" in payload:
+        print(payload["error"]["message"], file=sys.stderr)
+        return EXIT_ERROR
+    else:
+        print(render_graph_payload(payload, args.format))
+    return EXIT_ERROR if "error" in payload else EXIT_OK
+
+
+def _handle_explain(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    del resolved_mode
+    adapters = _brain_adapters_for_args(root_dir, model, args)
+    graph_payload = _brain_graph_payload(model, adapters)
+    payload = explain_payload(graph_payload, args.target, adapters=adapters)
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        _print_explain_text(payload)
+    return EXIT_ERROR if "error" in payload else EXIT_OK
+
+
+def _handle_search(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    del resolved_mode
+    adapters = _brain_adapters_for_args(root_dir, model, args)
+    graph_payload = _brain_graph_payload(model, adapters)
+    evidence_payload = None
+    evidence_adapter = adapters.get("evidence") if isinstance(adapters, dict) else None
+    if isinstance(evidence_adapter, dict) and isinstance(evidence_adapter.get("payload"), dict):
+        evidence_payload = evidence_adapter["payload"]
+    payload = search_payload(
+        " ".join(getattr(args, "query", []) or []),
+        graph=graph_payload,
+        adapters=adapters,
+        evidence=evidence_payload,
+        root_dir=root_dir,
+        source_filter=getattr(args, "source_filter", []) or [],
+        kind_filter=getattr(args, "kind_filter", []) or [],
+        limit=max(0, int(getattr(args, "limit", 10))),
+    )
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        _print_search_text(payload)
+    return EXIT_ERROR if "error" in payload else EXIT_OK
+
+
+def _snap_diff_paths(args: argparse.Namespace) -> tuple[Path, Path]:
+    paths = [Path(item) for item in getattr(args, "paths", []) or []]
+    from_path = Path(args.from_path) if getattr(args, "from_path", None) else (paths[0] if paths else None)
+    to_path = Path(args.to_path) if getattr(args, "to_path", None) else (paths[1] if len(paths) > 1 else None)
+    if from_path is None or to_path is None:
+        raise RuntimeError("snap diff requires --from/--to or two positional snapshot paths")
+    return from_path, to_path
+
+
+def _handle_snap(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    del resolved_mode
+    if args.snap_action == "create":
+        adapters = _brain_adapters_for_args(root_dir, model, args)
+        payload = create_snapshot_payload(
+            status=runtime_status(model),
+            doctor={"checks": [asdict(result) for result in doctor_results(model, root_dir)]},
+            evidence=collect_runtime_evidence(
+                root_dir,
+                model,
+                cwd=getattr(args, "cwd", None),
+                declared_servers=_full_declared_mcp_servers(root_dir),
+            ),
+            graph=build_agent_graph(model, adapters=adapters).to_payload(),
+            label=getattr(args, "name", None),
+            created_at=getattr(args, "created_at", None),
+        )
+        if getattr(args, "write", False):
+            payload["artifact"] = str(save_snapshot(root_dir, payload))
+    elif args.snap_action == "diff":
+        from_path, to_path = _snap_diff_paths(args)
+        payload = diff_snapshots(load_snapshot(from_path), load_snapshot(to_path))
+    elif args.snap_action == "replay":
+        payload = replay_snapshot(load_snapshot(Path(args.path)))
+    else:
+        payload = {"error": {"message": f"unknown snap action: {args.snap_action}"}}
+
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        _print_snap_text(payload)
+    return EXIT_ERROR if "error" in payload else EXIT_OK
 
 
 def _handle_parity_report(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
@@ -3673,6 +4032,11 @@ _MODEL_DISPATCH: dict[str, Callable[[argparse.Namespace, Path, dict[str, Any], s
     "skill-audit": _handle_skill_audit,
     "mcp-audit": _handle_mcp_audit,
     "evidence": _handle_evidence,
+    "next": _handle_next,
+    "graph": _handle_graph,
+    "explain": _handle_explain,
+    "search": _handle_search,
+    "snap": _handle_snap,
     "parity-report": _handle_parity_report,
     "skill": _handle_skill,
     "overlay": _handle_overlay,
@@ -4019,6 +4383,11 @@ def _active_clients_for_args(args: argparse.Namespace, model: dict[str, Any]) ->
         "skill",
         "overlay",
         "mcp-audit",
+        "next",
+        "graph",
+        "explain",
+        "search",
+        "snap",
         "parity-report",
         "bootstrap",
         "up",

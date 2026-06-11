@@ -72,6 +72,8 @@ def _context_tooling_lines() -> list[str]:
     return [
         "## Tooling Guidance",
         "",
+        "- Start agent navigation with `python3 .env-manager/manage.py capabilities --json`, "
+        "then `python3 .env-manager/manage.py next --format json`.",
         "- GitHub: use `gh-axi` for GitHub operations when available; "
         "fall back to `gh` only when `gh-axi` cannot satisfy the task.",
         "",
@@ -265,6 +267,8 @@ def _context_quick_reference_lines(model: dict[str, Any], make_suffix: str) -> l
         "## Quick Reference",
         "",
         "```bash",
+        "python3 .env-manager/manage.py capabilities --json",
+        "python3 .env-manager/manage.py next --format json",
         f"make dev-sanity{make_suffix}",
         f"make runtime-status{make_suffix}",
         f"make runtime-sync{make_suffix}",

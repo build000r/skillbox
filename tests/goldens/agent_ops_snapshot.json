@@ -1,0 +1,67 @@
+{
+  "created_at": "2026-06-11T00:00:00Z",
+  "inputs": {
+    "doctor": {
+      "checks": [
+        {
+          "code": "runtime",
+          "message": "runtime is healthy",
+          "status": "pass"
+        }
+      ]
+    },
+    "evidence": {
+      "blocked_conditions": [],
+      "next_actions": [
+        "status --format json"
+      ],
+      "overall": "green",
+      "sections": {}
+    },
+    "graph": {
+      "edge_count": 1,
+      "edges": [
+        {
+          "kind": "depends_on",
+          "source": "service:api",
+          "target": "service:db"
+        }
+      ],
+      "node_count": 2,
+      "nodes": [
+        {
+          "id": "service:api",
+          "kind": "service",
+          "label": "api"
+        },
+        {
+          "id": "service:db",
+          "kind": "service",
+          "label": "db"
+        }
+      ],
+      "warnings": []
+    },
+    "status": {
+      "active_clients": [
+        "personal"
+      ],
+      "active_profiles": [
+        "core"
+      ],
+      "blocked_services": [],
+      "repos": [],
+      "services": [
+        {
+          "id": "api",
+          "state": "running"
+        }
+      ],
+      "tasks": []
+    }
+  },
+  "label": "golden-fixture",
+  "ok": true,
+  "schema_version": "2026-06-11+agent_ops_brain.snapshot",
+  "snapshot_id": "golden-fixture"
+}

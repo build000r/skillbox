@@ -387,6 +387,155 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "skillbox_capabilities",
+        "description": (
+            "Return the machine-readable Skillbox command registry and capabilities ABI. "
+            "Use this first when an agent needs to discover safe commands, side effects, "
+            "risk classes, examples, and MCP/CLI parity metadata."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "compact": {
+                    "type": "boolean",
+                    "description": "Return compact registry entries without full schemas.",
+                    "default": False,
+                }
+            },
+        },
+    },
+    {
+        "name": "skillbox_next",
+        "description": (
+            "Rank explainable next actions from runtime evidence, graph facts, Beads/BV, SBP, "
+            "and optional NTM load state. Read-only; recommendations include score, reasons, "
+            "commands, validations, evidence, and explicit BR/BV disagreements."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "client": _CLIENT_PROP,
+                "profile": _PROFILE_PROP,
+                "cwd": {"type": "string", "description": "Working directory used for evidence scoping."},
+                "limit": {"type": "integer", "description": "Maximum recommendations to return.", "default": 5},
+                "ntm_session": {"type": "string", "description": "Optional NTM session id for load evidence."},
+                "no_adapters": {
+                    "type": "boolean",
+                    "description": "Skip optional br/bv/sbp/ntm adapters for deterministic fixture runs.",
+                    "default": False,
+                },
+            },
+        },
+    },
+    {
+        "name": "skillbox_graph",
+        "description": (
+            "Inspect the agent operations graph and optional graph algorithms. Read-only. "
+            "Algorithms include topology, cycles, SCC, critical-path, min-unblock, blast-radius, "
+            "shortest-path, and all."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "client": _CLIENT_PROP,
+                "profile": _PROFILE_PROP,
+                "algorithm": {
+                    "type": "string",
+                    "enum": ["all", "blast-radius", "critical-path", "cycles", "min-unblock", "scc", "shortest-path", "topology"],
+                    "description": "Optional algorithm to run.",
+                },
+                "node": {"type": "string", "description": "Node id for node-scoped algorithms."},
+                "source": {"type": "string", "description": "Source node id for shortest-path."},
+                "target": {"type": "string", "description": "Target node id for shortest-path."},
+                "blocked_node": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Blocked nodes for min-unblock. Can include multiple node ids.",
+                },
+                "cwd": {"type": "string", "description": "Working directory used for evidence scoping."},
+                "ntm_session": {"type": "string", "description": "Optional NTM session id for load evidence."},
+                "no_adapters": {"type": "boolean", "default": False},
+            },
+        },
+    },
+    {
+        "name": "skillbox_explain",
+        "description": (
+            "Explain a graph node, Bead, MCP tool, skill, check, service, or registered command "
+            "using graph relationships, registry metadata, and adapter evidence. Read-only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["target"],
+            "properties": {
+                "target": {"type": "string", "description": "Graph node id or registry command id."},
+                "client": _CLIENT_PROP,
+                "profile": _PROFILE_PROP,
+                "cwd": {"type": "string", "description": "Working directory used for evidence scoping."},
+                "ntm_session": {"type": "string", "description": "Optional NTM session id for load evidence."},
+                "no_adapters": {"type": "boolean", "default": False},
+            },
+        },
+    },
+    {
+        "name": "skillbox_search",
+        "description": (
+            "Search registry commands, graph nodes, selected docs, Beads, and current evidence. "
+            "Returns grouped hits with kind, source, score, snippet, and next_action. Read-only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {"type": "string", "description": "Search terms."},
+                "client": _CLIENT_PROP,
+                "profile": _PROFILE_PROP,
+                "source_filter": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional sources such as registry, graph, docs, br_ready, evidence.",
+                },
+                "kind_filter": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional kinds such as command, service, bead, doc, evidence.",
+                },
+                "limit": {"type": "integer", "description": "Maximum hits to return.", "default": 10},
+                "cwd": {"type": "string", "description": "Working directory used for evidence scoping."},
+                "no_adapters": {"type": "boolean", "default": False},
+            },
+        },
+    },
+    {
+        "name": "skillbox_snap",
+        "description": (
+            "Create, diff, or replay redacted agent operations snapshots. create may write a local "
+            "snapshot file only when write=true; diff and replay operate on existing JSON fixtures "
+            "without touching live services."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["action"],
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["create", "diff", "replay"],
+                    "description": "Snapshot action.",
+                },
+                "name": {"type": "string", "description": "Snapshot label for create."},
+                "created_at": {"type": "string", "description": "Timestamp override for deterministic fixtures."},
+                "from_path": {"type": "string", "description": "Before snapshot path for diff."},
+                "to_path": {"type": "string", "description": "After snapshot path for diff."},
+                "path": {"type": "string", "description": "Snapshot path for replay."},
+                "client": _CLIENT_PROP,
+                "profile": _PROFILE_PROP,
+                "cwd": {"type": "string", "description": "Working directory used for evidence scoping."},
+                "write": {"type": "boolean", "description": "Write create output under .skillbox-state.", "default": False},
+                "no_adapters": {"type": "boolean", "default": False},
+            },
+        },
+    },
+    {
         "name": "skillbox_parity_report",
         "description": (
             "Read-only dev/prod parity report for one client. Compares runtime routes, env files, "
@@ -1381,10 +1530,20 @@ _REPEAT_ARG_SPECS: tuple[tuple[str, str], ...] = (
     ("search_root", "--search-root"),
     ("scan_root", "--scan-root"),
     ("set_vars", "--set"),
+    ("blocked_node", "--blocked-node"),
+    ("source_filter", "--source"),
+    ("kind_filter", "--kind"),
 )
 _STRING_ARG_SPECS: tuple[tuple[str, str], ...] = (
     ("blueprint", "--blueprint"),
     ("label", "--label"),
+    ("algorithm", "--algorithm"),
+    ("node", "--node"),
+    ("target", "--target"),
+    ("ntm_session", "--ntm-session"),
+    ("from_path", "--from"),
+    ("to_path", "--to"),
+    ("created_at", "--created-at"),
     ("target_dir", "--target-dir"),
     ("from_bundle", "--from-bundle"),
     ("root_path", "--root-path"),
@@ -1436,6 +1595,8 @@ _BOOL_ARG_SPECS: tuple[tuple[str, str], ...] = (
     ("tmux_submit", "--tmux-submit"),
     ("allow_parser_install", "--allow-parser-install"),
     ("send_magic_link", "--send-magic-link"),
+    ("no_adapters", "--no-adapters"),
+    ("write", "--write"),
 )
 _BOOLEAN_PARAM_KEYS = frozenset(
     key for key, _flag in _BOOL_ARG_SPECS
@@ -1548,7 +1709,7 @@ def _append_bool_args(args: list[str], command: str, params: dict) -> None:
         args.append("--all")
     if _bool_param(params, "full") and command == "skills":
         args.append("--full")
-    if _bool_param(params, "compact") and command == "status":
+    if _bool_param(params, "compact") and command in {"status", "capabilities"}:
         args.append("--compact")
     if command == "mmdx" and _bool_param(params, "open", default=True) is False:
         args.append("--no-open")
@@ -1575,6 +1736,24 @@ def _append_command_positionals(args: list[str], command: str, params: dict) -> 
         query = _string_param(params, "query")
         if query:
             args.append(query)
+        return
+    if command == "explain":
+        target = _string_param(params, "target")
+        if target:
+            args.append(target)
+        return
+    if command == "search":
+        query = _string_param(params, "query")
+        if query:
+            args.append(query)
+        return
+    if command == "snap":
+        action = _string_param(params, "action")
+        if action == "replay":
+            path = _string_param(params, "path")
+            if path:
+                args.append(path)
+        return
     skill = _string_param(params, "skill")
     if skill:
         args.append(skill)
@@ -1607,6 +1786,12 @@ def build_args(command: str, params: dict, positional: str | None = None) -> lis
 
 # Maps tool name → (manage command, key in params for positional arg or None)
 _DISPATCH: dict[str, tuple[str, str | None]] = {
+    "skillbox_capabilities": ("capabilities", None),
+    "skillbox_next":        ("next",        None),
+    "skillbox_graph":       ("graph",       None),
+    "skillbox_explain":     ("explain",     None),
+    "skillbox_search":      ("search",      None),
+    "skillbox_snap":        ("snap",        "action"),
     "skillbox_status":      ("status",      None),
     "skillbox_doctor":      ("doctor",      None),
     "skillbox_render":      ("render",      None),

@@ -24,6 +24,9 @@ Main entry points:
 - Bootstrap env: `make bootstrap-env` or `cp .env.example .env`
 - Outer render/check: `make render`, `make doctor`
 - Runtime render/sync/check: `make runtime-render`, `make runtime-sync`, `make dev-sanity`
+- Agent ops brain: `python3 .env-manager/manage.py capabilities --format json`, then `python3 .env-manager/manage.py next --format json`
+- Agent graph/search: `python3 .env-manager/manage.py graph --format json`, `python3 .env-manager/manage.py explain brain.next --format json`, `python3 .env-manager/manage.py search "<query>" --format json`
+- Agent snapshots: `python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json`; `snap create --write` writes redacted local state under `.skillbox-state/`
 - Run tests: `python3 -m unittest discover -s tests`
 - Coverage: `make python-cov-xml`
 - Build image: `make build`
@@ -50,11 +53,16 @@ Main entry points:
 ## Testing Expectations
 
 Run focused `python3 -m unittest ...` tests for touched modules, then broaden to
-`python3 -m unittest discover -s tests` when practical. Use `make doctor` for outer drift and `make dev-sanity` for internal runtime validation.
+`python3 -m unittest discover -s tests` when practical. For the agent ops brain,
+use `python3 -m unittest tests.test_agent_ops_adapters tests.test_agent_ops_command_registry tests.test_agent_ops_graph tests.test_agent_ops_graph_algorithms tests.test_agent_ops_graph_engine tests.test_agent_ops_decisions tests.test_agent_ops_search tests.test_agent_ops_snapshots tests.test_agent_ops_golden_outputs tests.test_cli_units`.
+Use `make doctor` for outer drift and `make dev-sanity` for internal runtime validation.
 
 Slow/side-effecting commands: `make build`, `make up`, `make runtime-sync`,
 `make runtime-up`, `make box-up`, `make box-down`, and `install.sh` can build
 containers, clone/download artifacts, start services, or touch infrastructure.
+`capabilities`, `next`, `graph`, `explain`, `search`, `snap replay`, and
+`snap diff` are read-only; `snap create --write` is the only brain command that
+writes local generated state.
 
 ## Background Task Polling
 
@@ -82,6 +90,10 @@ tailnet-only boxes — use loopback or Tailnet IP. See
 - Keep CLI/MCP output structured and compact. Many handlers return JSON payloads
   with `ok`, `steps`, `checks`, `next_actions`, or structured error objects.
 - Runtime commands should respect `--client`, repeatable `--profile`, and repeatable `--service`/`--task` scoping where applicable.
+- New agent-facing commands should be registered in
+  `.env-manager/runtime_manager/command_registry.py`, exposed through both CLI
+  and in-box MCP when useful, and covered by focused `tests/test_agent_ops_*`
+  tests when they touch graph, search, decision, snapshot, or registry behavior.
 - Preserve user/local state. This repo commonly has dirty generated state and
   local secrets; do not clean ignored directories as part of code edits.
 

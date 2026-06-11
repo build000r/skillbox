@@ -586,6 +586,15 @@ home `CLAUDE.md` or `AGENTS.md` and immediately knows:
 - where logs go
 - the exact make commands for health checks, status, and sync
 
+Generated context also points agents at the agent operations brain, which is
+the read-first command surface for understanding what this box can do and what
+work is most actionable right now:
+
+```bash
+python3 .env-manager/manage.py capabilities --format json
+python3 .env-manager/manage.py next --format json
+```
+
 This means the agent does not need to be told any of this manually. Every repo,
 service, task, or skill you add to `runtime.yaml` or a client overlay
 automatically appears in the agent context the next time `sync` or `context`
@@ -593,6 +602,45 @@ runs.
 
 Both files are gitignored because they are generated state that varies by
 environment and client selection.
+
+### Agent operations brain
+
+The brain commands turn the runtime graph, command registry, Beads/BV state,
+SBP visibility, MCP parity, and recent evidence into a compact agent-native
+API. They are designed to be safe defaults for a new agent session:
+
+```bash
+python3 .env-manager/manage.py capabilities --format json
+python3 .env-manager/manage.py next --format json --limit 5
+python3 .env-manager/manage.py graph --algorithm critical-path --format json
+python3 .env-manager/manage.py explain brain.next --format json
+python3 .env-manager/manage.py search "mcp parity" --format json
+python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json
+```
+
+`capabilities`, `next`, `graph`, `explain`, and `search` are read-only.
+`snap replay` and `snap diff` are read-only fixture operations. `snap create`
+prints a redacted snapshot by default and writes under `.skillbox-state/` only
+when `--write` is passed.
+
+Use `--no-adapters` when you need deterministic local output without invoking
+optional `br`, `bv`, `sbp`, or NTM probes. The MCP mirrors are
+`skillbox_capabilities`, `skillbox_next`, `skillbox_graph`,
+`skillbox_explain`, `skillbox_search`, and `skillbox_snap`, with the same
+read-only/default-write behavior.
+
+Focused validation for this surface:
+
+```bash
+python3 -m unittest tests.test_agent_ops_adapters tests.test_agent_ops_command_registry tests.test_agent_ops_graph tests.test_agent_ops_graph_algorithms tests.test_agent_ops_graph_engine tests.test_agent_ops_decisions tests.test_agent_ops_search tests.test_agent_ops_snapshots tests.test_agent_ops_golden_outputs tests.test_cli_units
+```
+
+Broaden to `python3 -m unittest discover -s tests`, then `make render`,
+`make doctor`, and `make dev-sanity` before claiming production readiness. In
+operator-migrated checkouts, current environmental blockers are expected to
+surface as structured checks rather than silent drift: broken global skill or
+MCP config symlinks report `broken_symlink`, and stale managed skill installs
+can report missing shared support files until `runtime-sync` repairs them.
 
 ## Fleet Management
 
@@ -921,6 +969,12 @@ make runtime-sync
 | `.env-manager/manage.py focus` | Activate a client with live state and enriched context | `python3 .env-manager/manage.py focus personal --format json` |
 | `.env-manager/manage.py stewardship-report` | Build a client-scoped operator evidence packet with risks, proof, and not-assessed hardening gaps | `python3 .env-manager/manage.py stewardship-report personal --format md --write` |
 | `.env-manager/manage.py parity-report` | Compare a client runtime graph against its production-stack parity contract | `python3 .env-manager/manage.py parity-report personal --format json` |
+| `.env-manager/manage.py capabilities` | Return the machine-readable command registry, risks, examples, and MCP mirrors | `python3 .env-manager/manage.py capabilities --format json` |
+| `.env-manager/manage.py next` | Rank explainable next actions from runtime, Beads/BV, SBP, MCP, and evidence signals | `python3 .env-manager/manage.py next --format json` |
+| `.env-manager/manage.py graph` | Inspect the agent operations graph and run graph algorithms such as critical path, cycles, blast radius, and min-unblock | `python3 .env-manager/manage.py graph --algorithm critical-path --format json` |
+| `.env-manager/manage.py explain` | Explain a command, graph node, Bead, skill, check, service, or MCP tool with evidence and next actions | `python3 .env-manager/manage.py explain brain.next --format json` |
+| `.env-manager/manage.py search` | Search commands, graph nodes, docs, Beads, and evidence with grouped hits | `python3 .env-manager/manage.py search "skill sync" --format json` |
+| `.env-manager/manage.py snap` | Create, diff, or replay redacted runtime snapshots; writes only on `snap create --write` | `python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json` |
 | `.env-manager/manage.py render` | Print the resolved internal runtime graph | `python3 .env-manager/manage.py render --format json` |
 | `.env-manager/manage.py sync` | Create managed repo/artifact/log directories and install declared skills for the selected core/client scope | `python3 .env-manager/manage.py sync --client personal --dry-run` |
 | `.env-manager/manage.py doctor` | Validate the internal repos/skills/logs/check graph for the selected core/client scope | `python3 .env-manager/manage.py doctor --client personal` |
@@ -1386,6 +1440,9 @@ Use `mcp-audit` when the question is whether the same repo exposes the right
 MCP servers to both agent runtimes. It reads Claude Code project config from
 `.mcp.json`, Codex project config from `.codex/config.toml`, and reports
 missing, extra, disabled, invalid, and Claude-only/Codex-only MCP entries.
+A config that is a dangling symlink (for example after a host migration) is
+reported as `broken_symlink` with its target and a repair next-action instead
+of being treated as merely absent.
 
 ```bash
 python3 .env-manager/manage.py mcp-audit --cwd "$PWD"
@@ -1892,6 +1949,12 @@ agents tools to manage their own environment:
 
 | Tool | Purpose |
 |---|---|
+| `skillbox_capabilities` | Machine-readable command registry, risk metadata, examples, and MCP mirrors |
+| `skillbox_next` | Ranked next actions from runtime, graph, Beads/BV, SBP, NTM, and evidence signals |
+| `skillbox_graph` | Typed agent operations graph plus algorithms such as cycles, critical path, blast radius, and min-unblock |
+| `skillbox_explain` | Explanation packet for a graph node, command, Bead, skill, check, service, or MCP tool |
+| `skillbox_search` | Grouped search across registry commands, graph nodes, selected docs, Beads, and evidence |
+| `skillbox_snap` | Create, diff, or replay redacted snapshots; writes only when requested |
 | `skillbox_status` | Runtime status for repos, services, tasks, checks |
 | `skillbox_render` | Resolved runtime graph |
 | `skillbox_skills` | Effective skill availability, scope violations, and install/move recommendations |
