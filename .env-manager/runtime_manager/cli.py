@@ -987,6 +987,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Per-query Cass front-door timeout in seconds.",
     )
+    cass_evidence_parser.add_argument(
+        "--proposals",
+        action="store_true",
+        help=(
+            "PROPOSALS mode: emit demotion (linked >90d AND zero structural "
+            "invocations) and promotion (used-but-invisible, or repeatedly "
+            "activated on-demand in one repo) candidates, each carrying the exact "
+            "skill-scope.yaml policy edit it implies. PROPOSALS ONLY - never "
+            "auto-applied (sbp read-only-first)."
+        ),
+    )
 
     next_parser = subparsers.add_parser(
         "next",
@@ -3392,6 +3403,62 @@ def _handle_structure_doctor(args: argparse.Namespace, root_dir: Path) -> int:
     return int(payload.get("exit_code", 0))
 
 
+def _load_sbp_evidence_module():
+    """Best-effort import of the skillbox-config evidence backend.
+
+    Returns the loaded module or None. NEVER raises: a missing/unimportable
+    backend simply means candidates carry no evidence (graceful degradation).
+    """
+    config_root = Path(
+        os.environ.get("SKILLBOX_CONFIG_ROOT")
+        or (Path(os.path.expanduser("~")) / "repos" / "skillbox-config")
+    )
+    helper = config_root / "scripts" / "sbp_evidence.py"
+    if not helper.is_file():
+        return None
+    try:
+        import importlib.util
+
+        scripts_dir = str(helper.parent)
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        spec = importlib.util.spec_from_file_location("sbp_evidence", helper)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception:
+        return None
+
+
+def _skill_evidence_provider(cwd: str | None) -> Callable[[], dict[str, Any] | None] | None:
+    """Build the OPTIONAL per-candidate evidence provider for ``cwd``.
+
+    Returns a zero-arg callable that yields a per-skill evidence index for the
+    repo at ``cwd`` (from the Cass-backed evidence backend), or None when the
+    backend is unavailable. The callable itself NEVER raises and returns None on
+    any Cass/front-door failure, so candidate rows simply carry no evidence and
+    no recalibrate is ever blocked.
+    """
+    module = _load_sbp_evidence_module()
+    if module is None or not hasattr(module, "skill_evidence_index"):
+        return None
+    repo_path = str(Path(cwd or os.getcwd()).resolve())
+
+    def _provider() -> dict[str, Any] | None:
+        try:
+            result = module.skill_evidence_index(repo_path=repo_path)
+        except Exception:
+            return None
+        if not isinstance(result, dict) or not result.get("cass_available"):
+            return None
+        index = result.get("index")
+        return index if isinstance(index, dict) else None
+
+    return _provider
+
+
 def _handle_cass_evidence(args: argparse.Namespace, root_dir: Path) -> int:
     """Delegate to the skillbox-config Cass evidence helper.
 
@@ -3417,6 +3484,8 @@ def _handle_cass_evidence(args: argparse.Namespace, root_dir: Path) -> int:
         )
         return EXIT_ERROR
     cmd = [sys.executable, str(helper), "--format", str(getattr(args, "format", "json") or "json")]
+    if getattr(args, "proposals", False):
+        cmd += ["--proposals"]
     if getattr(args, "repo", None):
         cmd += ["--repo", str(args.repo)]
     if getattr(args, "skill", None):
@@ -3533,12 +3602,20 @@ def _handle_status(args: argparse.Namespace, root_dir: Path, model: dict[str, An
 
 
 def _handle_skills(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    # Attach OPTIONAL per-candidate evidence only in candidates mode
+    # (`--show-sources`, i.e. `sbp candidates`), so a plain `sbp skills` never
+    # pays the Cass round-trip. The provider degrades to None when Cass is down,
+    # leaving candidate rows with no evidence rather than blocking.
+    evidence_provider = (
+        _skill_evidence_provider(args.cwd) if getattr(args, "show_sources", False) else None
+    )
     payload = collect_skill_visibility(
         model,
         cwd=args.cwd,
         include_global=not args.no_global,
         include_project=not args.no_project,
         include_sources=args.show_sources,
+        evidence_provider=evidence_provider,
     )
     if args.format == "json":
         emit_json(payload if args.full else compact_skill_visibility_payload(payload))

@@ -3498,6 +3498,40 @@ def broken_link_class_counts(
     return counts
 
 
+def attach_skill_evidence(
+    payload: dict[str, Any],
+    evidence_index: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Attach OPTIONAL per-candidate ``evidence`` onto the candidate rows.
+
+    ``evidence_index`` maps a skill name to a small evidence dict (produced by the
+    skillbox-config evidence backend) of the shape::
+
+        {<skill>: {invocations_in_repo, last_used, fleet_wide_count}}
+
+    The candidate/effective and source-backed (``undefined_sources``) rows get an
+    ``evidence`` field WHEN — and only when — the backend has data for that skill.
+    When ``evidence_index`` is falsy (Cass unavailable, no provider) NOTHING is
+    attached: rows keep their existing shape and the absence means "unknown". This
+    is mutate-in-place on ``payload`` and returns it for convenience. It never
+    raises and never blocks a recalibrate.
+    """
+    if not evidence_index:
+        return payload
+    if not isinstance(evidence_index, dict):
+        return payload
+    for key in ("effective", "undefined_sources"):
+        for row in payload.get(key) or []:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name") or "")
+            facts = evidence_index.get(name)
+            if isinstance(facts, dict) and facts:
+                # Copy so the caller's index is never mutated through the payload.
+                row["evidence"] = dict(facts)
+    return payload
+
+
 def collect_skill_visibility(
     model: dict[str, Any],
     *,
@@ -3505,8 +3539,16 @@ def collect_skill_visibility(
     include_global: bool = True,
     include_project: bool = True,
     include_sources: bool = False,
+    evidence_provider: Callable[[], dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
-    """Collect a conflict-aware skill availability view for a model."""
+    """Collect a conflict-aware skill availability view for a model.
+
+    ``evidence_provider`` (optional) is a zero-arg callable returning a per-skill
+    evidence index (see ``attach_skill_evidence``). When supplied AND it yields
+    data, candidate rows gain an OPTIONAL ``evidence`` field. The provider is
+    called defensively — any failure is swallowed so missing/unreachable evidence
+    never blocks or crashes the visibility view (and a recalibrate that uses it).
+    """
     cwd_path = Path(cwd or os.getcwd()).resolve()
     declared_occurrences, declared_layers = _declared_skill_occurrences(model)
     installed_occurrences, installed_layers = _collect_installed_visibility_layers(
@@ -3568,7 +3610,7 @@ def collect_skill_visibility(
         if action not in next_actions:
             next_actions.append(action)
 
-    return {
+    payload = {
         "cwd": str(cwd_path),
         "matched_clients": matched_skill_clients(model, cwd_path),
         "matched_project_categories": _matched_project_categories(model, cwd_path),
@@ -3592,6 +3634,18 @@ def collect_skill_visibility(
         "summary": summary,
         "next_actions": next_actions,
     }
+
+    # OPTIONAL per-candidate evidence. The provider is best-effort: any failure
+    # (Cass down, import error, timeout) is swallowed so candidate rows simply
+    # carry no `evidence` and the recalibrate is never blocked.
+    if evidence_provider is not None:
+        try:
+            evidence_index = evidence_provider()
+        except Exception:
+            evidence_index = None
+        attach_skill_evidence(payload, evidence_index)
+
+    return payload
 
 
 SKILL_AUDIT_REPO_ISSUE_KEYS = (
@@ -4086,7 +4140,12 @@ def _compact_skill_visibility_skill(item: dict[str, Any]) -> dict[str, Any]:
     }
     if item.get("path"):
         result["path"] = item.get("path")
-    return {key: value for key, value in result.items() if value not in (None, "")}
+    compacted = {key: value for key, value in result.items() if value not in (None, "")}
+    # Preserve the OPTIONAL evidence annotation through compaction so
+    # `sbp candidates --json` (which may not pass --full) still carries it.
+    if isinstance(item.get("evidence"), dict) and item.get("evidence"):
+        compacted["evidence"] = item["evidence"]
+    return compacted
 
 
 def _compact_skill_visibility_issues(payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:

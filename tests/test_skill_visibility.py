@@ -19,6 +19,7 @@ from runtime_manager.skill_visibility import (  # noqa: E402
     activate_overlay_scoped_skills,
     active_overlays,
     apply_skill_lifecycle_plan,
+    attach_skill_evidence,
     _apply_lifecycle_unlink,
     _declared_skill_occurrences,
     _effective_occurrences,
@@ -1679,6 +1680,78 @@ class SkillVisibilityTests(unittest.TestCase):
 
             self.assertIn((repo / ".claude" / "skills").resolve(), roots)
             self.assertNotIn((parent / ".claude" / "skills").resolve(), roots)
+
+
+class SkillEvidenceAnnotationTests(unittest.TestCase):
+    """OPTIONAL per-candidate evidence annotation on candidate rows."""
+
+    def _payload(self):
+        return {
+            "effective": [
+                {"name": "sbp", "availability": "installed", "layer": "global:claude"},
+                {"name": "ui", "availability": "installed", "layer": "project:claude:/r"},
+            ],
+            "undefined_sources": [{"name": "ga4"}],
+        }
+
+    def test_attach_annotates_only_skills_with_evidence(self) -> None:
+        index = {
+            "sbp": {"invocations_in_repo": 4, "last_used": "2026-06-05T10:00:00.000Z", "fleet_wide_count": 12},
+            "ga4": {"invocations_in_repo": 0, "last_used": None, "fleet_wide_count": 3},
+        }
+        payload = attach_skill_evidence(self._payload(), index)
+        effective = {row["name"]: row for row in payload["effective"]}
+        # sbp has evidence; ui does not -> ui keeps no evidence field.
+        self.assertEqual(effective["sbp"]["evidence"]["invocations_in_repo"], 4)
+        self.assertEqual(effective["sbp"]["evidence"]["fleet_wide_count"], 12)
+        self.assertNotIn("evidence", effective["ui"])
+        # undefined_sources (source-backed candidates) get annotated too.
+        self.assertEqual(payload["undefined_sources"][0]["evidence"]["fleet_wide_count"], 3)
+
+    def test_attach_is_noop_when_index_empty_or_none(self) -> None:
+        # Cass down / no provider: NOTHING attached, rows keep their shape.
+        for empty in (None, {}, []):
+            payload = attach_skill_evidence(self._payload(), empty)
+            for row in payload["effective"]:
+                self.assertNotIn("evidence", row)
+            for row in payload["undefined_sources"]:
+                self.assertNotIn("evidence", row)
+
+    def test_collect_visibility_provider_failure_does_not_crash(self) -> None:
+        # A throwing provider must be swallowed: visibility still returns.
+        def _boom():
+            raise RuntimeError("cass exploded")
+
+        model = {"skillsets": [], "clients": [], "active_clients": []}
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = collect_skill_visibility(
+                model, cwd=tmp, include_global=False, evidence_provider=_boom
+            )
+        self.assertIn("effective", payload)
+
+    def test_collect_visibility_provider_annotates_effective(self) -> None:
+        model = {"skillsets": [], "clients": [], "active_clients": []}
+        with tempfile.TemporaryDirectory() as tmp:
+            project_skills = Path(tmp) / ".claude" / "skills"
+            project_skills.mkdir(parents=True)
+            source = Path(tmp) / "src" / "demo"
+            source.mkdir(parents=True)
+            (source / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+            (project_skills / "demo").symlink_to(source)
+
+            def _provider():
+                return {"demo": {"invocations_in_repo": 7, "last_used": "2026-06-05T00:00:00Z", "fleet_wide_count": 9}}
+
+            payload = collect_skill_visibility(
+                model, cwd=tmp, include_global=False, evidence_provider=_provider
+            )
+        effective = {row.get("name"): row for row in payload["effective"]}
+        self.assertIn("demo", effective)
+        self.assertEqual(effective["demo"]["evidence"]["invocations_in_repo"], 7)
+        # Compaction preserves the evidence annotation.
+        compact = compact_skill_visibility_payload(payload)
+        compact_demo = {row.get("name"): row for row in compact["effective"]}["demo"]
+        self.assertEqual(compact_demo["evidence"]["fleet_wide_count"], 9)
 
 
 if __name__ == "__main__":
