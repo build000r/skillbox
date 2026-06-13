@@ -3277,6 +3277,456 @@ def compact_skill_visibility_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+EXPLAIN_SCHEMA_VERSION = "2026-06-13+skill_explain"
+
+# Maps an occurrence ``layer`` id (e.g. ``default``, ``client:foo``,
+# ``global:claude``, ``project:codex:/repo``) to one of the four ranking
+# families the policy ladder is built on (DEFAULT_LAYER_RANK ..
+# PROJECT_LAYER_RANK, near the top of this module). PROJECT wins over GLOBAL
+# wins over CLIENT wins over DEFAULT.
+def _layer_family(occurrence: dict[str, Any]) -> str:
+    layer = str(occurrence.get("layer") or "")
+    rank = int(occurrence.get("layer_rank") or 0)
+    if layer.startswith("project:") or rank >= PROJECT_LAYER_RANK:
+        return "PROJECT"
+    if layer.startswith("global:") or rank == GLOBAL_LAYER_RANK:
+        return "GLOBAL"
+    if layer.startswith("client:") or layer.startswith("skillset:") or rank == CLIENT_LAYER_RANK or rank == CLIENT_LAYER_RANK - 1:
+        return "CLIENT"
+    return "DEFAULT"
+
+
+def _explain_occurrence_view(occurrence: dict[str, Any], *, won: bool) -> dict[str, Any]:
+    """Trim a raw occurrence to the provenance-relevant fields plus a verdict."""
+    view = {
+        "layer": occurrence.get("layer"),
+        "layer_label": occurrence.get("layer_label"),
+        "layer_rank": occurrence.get("layer_rank"),
+        "layer_family": _layer_family(occurrence),
+        "availability": occurrence.get("availability"),
+        "state": occurrence.get("state"),
+        "source": occurrence.get("source"),
+        "source_bucket": occurrence.get("source_bucket"),
+        "path": occurrence.get("path"),
+        "won": won,
+    }
+    return {key: value for key, value in view.items() if value not in (None, "")} | {"won": won}
+
+
+def _explain_lost_reason(
+    winner: dict[str, Any] | None,
+    loser: dict[str, Any],
+) -> str:
+    """Why this occurrence is NOT the effective one."""
+    if loser.get("state") == "broken":
+        return "broken link (source target does not resolve here)"
+    if winner is None:
+        return "no effective occurrence for this skill"
+    winner_rank = int(winner.get("layer_rank") or 0)
+    loser_rank = int(loser.get("layer_rank") or 0)
+    if _same_source(winner, loser):
+        return "same source as the effective occurrence (duplicate, not a material shadow)"
+    if loser_rank < winner_rank:
+        return (
+            f"shadowed: lower layer ({_layer_family(loser)}, rank {loser_rank}) "
+            f"loses to {_layer_family(winner)} (rank {winner_rank})"
+        )
+    if loser_rank == winner_rank:
+        return "same layer rank; lost the surface tie-break (claude/codex ordering)"
+    return "lower precedence than the effective occurrence"
+
+
+def _explain_inactive_overlay_rules(
+    model: dict[str, Any],
+    skill_name: str,
+    cwd_path: Path,
+) -> list[dict[str, Any]]:
+    """Overlay-gated rules that WOULD match this skill+cwd if the overlay were on.
+
+    ``_scope_rules`` (and therefore ``_explain_scope_rules``) filters out rules
+    whose ``overlay`` is not in ``active_overlays`` — so an invisible skill that
+    is only gated by an inactive overlay would otherwise show "no rule matches".
+    This walks the raw policies and re-materializes each overlay-gated rule with
+    its own overlay forced on, so the explanation can point at the exact overlay
+    to flip. The active set is never mutated.
+    """
+    found: list[dict[str, Any]] = []
+    overlays_on = active_overlays()
+    for policy in _operator_scope_policies(model):
+        categories = _policy_categories_by_id(policy)
+        for index, raw_rule in enumerate(policy.get("rules") or []):
+            if not isinstance(raw_rule, dict):
+                continue
+            overlay = str(raw_rule.get("overlay") or "").strip()
+            if not overlay or overlay in overlays_on:
+                continue
+            rule = _scope_rule_from_raw(
+                raw_rule,
+                index=index,
+                policy=policy,
+                categories=categories,
+                overlays_on=overlays_on | {overlay},
+            )
+            if rule is None:
+                continue
+            if not any(
+                fnmatch.fnmatchcase(skill_name, str(pattern))
+                for pattern in rule.get("patterns") or []
+            ):
+                continue
+            paths = list(rule.get("paths") or [])
+            matched_paths = [path for path in paths if _path_prefix_matches(cwd_path, path)]
+            if not matched_paths and paths:
+                continue
+            found.append({
+                "id": rule.get("id"),
+                "policy_path": rule.get("policy_path"),
+                "overlay": overlay,
+                "matched_paths": matched_paths,
+            })
+    return found
+
+
+def _explain_scope_rules(model: dict[str, Any], skill_name: str, cwd_path: Path) -> list[dict[str, Any]]:
+    """Every scope rule whose pattern matches this skill, with cwd verdict.
+
+    Reuses the same ``_scope_rules`` / pattern-matching machinery the resolver
+    uses, so the explanation never drifts from the evaluator. Each entry carries
+    the rule id, source policy path, the pattern that matched, whether the rule
+    is overlay-gated, and whether the rule actually matches ``cwd``.
+    """
+    rules: list[dict[str, Any]] = []
+    for rule in _scope_rules(model):
+        matched_pattern = next(
+            (
+                pattern
+                for pattern in rule.get("patterns") or []
+                if fnmatch.fnmatchcase(skill_name, str(pattern))
+            ),
+            None,
+        )
+        if matched_pattern is None:
+            continue
+        paths = list(rule.get("paths") or [])
+        matched_paths = [path for path in paths if _path_prefix_matches(cwd_path, path)]
+        rules.append({
+            "id": rule.get("id"),
+            "policy_path": rule.get("policy_path"),
+            "matched_pattern": matched_pattern,
+            "overlay": rule.get("overlay") or None,
+            "allow_global": bool(rule.get("allow_global")),
+            "categories": list(rule.get("categories") or []),
+            "allowed_paths": paths,
+            "matched_paths": matched_paths,
+            "matches_cwd": bool(matched_paths),
+            "expected_by_default": _scope_rule_is_expected_by_default(rule),
+        })
+    # cwd-matching rules first, then by id for stable output.
+    return sorted(rules, key=lambda item: (not item["matches_cwd"], str(item.get("id") or "")))
+
+
+def _explain_machine_profile() -> dict[str, Any]:
+    """Forward-compatible machine-profile resolution for the explanation.
+
+    Resolution flows through ``runtime_manager.machines`` (the same profile API
+    used elsewhere) so a path like ``/srv/repos/...`` vs ``/Users/b/repos/...``
+    can be reasoned about. Best-effort: a missing/unparseable machines.yaml
+    yields a ``resolved: false`` stub rather than raising, because skill
+    provenance must answer even on boxes that have not declared a profile.
+    """
+    stub: dict[str, Any] = {"resolved": False, "machine_id": None, "source_path": None}
+    try:
+        from . import machines as _machines
+    except Exception:  # pragma: no cover - import guard
+        return stub
+    try:
+        config = _machines.load_machines_config()
+    except Exception:
+        return stub
+    machine_id = None
+    try:
+        machine_id = config.detect_machine_id()
+    except Exception:
+        machine_id = None
+    return {
+        "resolved": machine_id is not None,
+        "machine_id": machine_id,
+        "source_path": config.source_path,
+        "declared_machines": sorted(config.machines),
+    }
+
+
+def _explain_source_options(model: dict[str, Any], skill_name: str) -> list[dict[str, Any]]:
+    """Source dirs that could supply this skill (drives the activate command)."""
+    try:
+        options = _skill_source_options(model, skill_name)
+    except RuntimeError:
+        return []
+    return [
+        {
+            "source": option.get("source"),
+            "source_bucket": option.get("source_bucket"),
+        }
+        for option in options
+    ]
+
+
+def _explain_remediation(
+    model: dict[str, Any],
+    skill_name: str,
+    cwd_path: Path,
+    *,
+    scope_rules: list[dict[str, Any]],
+    inactive_overlay_rules: list[dict[str, Any]],
+    source_options: list[dict[str, Any]],
+    occurrences: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Ranked narrowest-path-to-visibility steps, each with an EXACT command.
+
+    Ranking is narrowest-first:
+      1. activate (a source exists -> one symlink makes it visible now),
+      2. overlay flip (an overlay-gated rule matches this cwd),
+      3. rule edit (the skill has no cwd-matching rule -> scope edit needed),
+      4. source restore (no source anywhere -> declare/restore the skill first).
+    """
+    remediation: list[dict[str, Any]] = []
+    cwd = str(cwd_path)
+
+    overlay_rules = [rule for rule in scope_rules if rule.get("overlay")] + list(
+        inactive_overlay_rules
+    )
+    cwd_rules = [rule for rule in scope_rules if rule.get("matches_cwd")]
+    cwd_rules.extend(rule for rule in inactive_overlay_rules if rule.get("matched_paths"))
+    broken_here = [
+        item for item in occurrences
+        if item.get("state") == "broken" and str(item.get("availability")) == "installed"
+    ]
+
+    if source_options:
+        # A real source exists: the narrowest fix is a scoped activate, which
+        # both prints the SKILL.md packet now and links it for future sessions.
+        remediation.append({
+            "rank": 1,
+            "kind": "activate",
+            "command": f"sbp skill activate {skill_name} --cwd {cwd}",
+            "manage_command": (
+                f"python3 .env-manager/manage.py skill activate {skill_name} --cwd {cwd}"
+            ),
+            "why": (
+                f"a source for {skill_name!r} exists ({source_options[0].get('source')}); "
+                "activating links it here and returns the SKILL.md packet immediately"
+            ),
+        })
+
+    seen_overlays: set[str] = set()
+    for rule in overlay_rules:
+        overlay = str(rule.get("overlay") or "")
+        if not overlay or overlay in seen_overlays:
+            continue
+        seen_overlays.add(overlay)
+        remediation.append({
+            "rank": 2,
+            "kind": "overlay_flip",
+            "command": f"sbp overlay activate {overlay} --cwd {cwd}",
+            "manage_command": (
+                f"python3 .env-manager/manage.py overlay activate {overlay} --cwd {cwd}"
+            ),
+            "why": (
+                f"rule {rule.get('id')!r} that would expect {skill_name!r} here is gated by "
+                f"overlay {overlay!r}; activate it (ephemerally) to apply the rule for this cwd"
+            ),
+        })
+
+    if not cwd_rules:
+        # No scope rule pins this skill to this cwd: a policy edit is required
+        # before the resolver will treat it as expected here.
+        policy_files = sorted({
+            str(policy.get("_policy_path") or "")
+            for policy in _operator_scope_policies(model)
+            if str(policy.get("_policy_path") or "")
+        })
+        remediation.append({
+            "rank": 3,
+            "kind": "rule_edit",
+            "command": (
+                f"edit skill-scope.yaml: add a rule with skills:[{skill_name}] "
+                f"and a path/category covering {cwd}"
+            ),
+            "policy_files": policy_files,
+            "why": (
+                f"no skill-scope rule currently matches {skill_name!r} for this cwd, so the "
+                "resolver does not consider it in-scope here"
+            ),
+        })
+
+    if not source_options and not broken_here:
+        remediation.append({
+            "rank": 4,
+            "kind": "source_restore",
+            "command": (
+                f"restore or declare a source for {skill_name!r} (e.g. add it to the active "
+                "client's skill-repos.yaml or create skills-private/<name>/SKILL.md)"
+            ),
+            "why": (
+                f"no source directory for {skill_name!r} was found under any configured source "
+                "root; there is nothing to link until a source exists"
+            ),
+        })
+    elif broken_here:
+        for item in broken_here:
+            remediation.append({
+                "rank": 4,
+                "kind": "source_restore",
+                "command": (
+                    f"sbp skill prune --cwd {cwd}  # then re-activate; broken link at "
+                    f"{item.get('path')}"
+                ),
+                "manage_command": (
+                    f"python3 .env-manager/manage.py skill prune --cwd {cwd}"
+                ),
+                "why": (
+                    f"an installed link for {skill_name!r} at {item.get('path')} is broken "
+                    f"(target {item.get('source')} does not resolve here); prune it, then activate"
+                ),
+            })
+
+    return sorted(remediation, key=lambda item: (int(item.get("rank", 9)), str(item.get("kind"))))
+
+
+def explain_skill_visibility(
+    model: dict[str, Any],
+    skill_name: str,
+    *,
+    cwd: str | None = None,
+    include_global: bool = True,
+    include_project: bool = True,
+) -> dict[str, Any]:
+    """Full provenance for ONE skill at ONE cwd.
+
+    Answers, reusing the same machinery ``collect_skill_visibility`` uses (no
+    parallel evaluator):
+
+    * IS it visible here, via which occurrence / layer family?
+    * Which scope rule(s) matched (rule id + policy source + matched pattern)?
+    * Which occurrence(s) LOST and why (lower layer / broken / not in sources)?
+    * When NOT visible: the ranked, narrowest path to visibility with the EXACT
+      command to run for each option.
+
+    Returns a structured dict. Forward-compatible ``machine`` and ``registry``
+    blocks are always present so registry-id and machine-routing consumers can
+    grow without a schema break.
+    """
+    skill_name = str(skill_name or "").strip()
+    cwd_path = Path(cwd or os.getcwd()).resolve()
+    payload = collect_skill_visibility(
+        model,
+        cwd=str(cwd_path),
+        include_global=include_global,
+        include_project=include_project,
+        include_sources=True,
+    )
+
+    occurrences = [
+        item for item in payload.get("occurrences") or []
+        if str(item.get("name") or "") == skill_name
+    ]
+    winner = next(
+        (item for item in payload.get("effective") or [] if str(item.get("name") or "") == skill_name),
+        None,
+    )
+    visible = bool(winner) and winner.get("state") != "broken"
+
+    scope_rules = _explain_scope_rules(model, skill_name, cwd_path)
+    inactive_overlay_rules = _explain_inactive_overlay_rules(model, skill_name, cwd_path)
+    source_options = _explain_source_options(model, skill_name)
+
+    occurrence_views: list[dict[str, Any]] = []
+    losers: list[dict[str, Any]] = []
+    winner_path = str(winner.get("path") or "") if winner else ""
+    winner_layer = str(winner.get("layer") or "") if winner else ""
+    for item in sorted(
+        occurrences,
+        key=lambda occ: (-int(occ.get("layer_rank") or 0), str(occ.get("layer") or "")),
+    ):
+        is_winner = bool(
+            winner
+            and str(item.get("layer") or "") == winner_layer
+            and str(item.get("path") or "") == winner_path
+            and item.get("availability") == winner.get("availability")
+        )
+        view = _explain_occurrence_view(item, won=is_winner)
+        if not is_winner:
+            view["lost_reason"] = _explain_lost_reason(winner, item)
+            losers.append(view)
+        occurrence_views.append(view)
+
+    if visible:
+        reason = (
+            f"{skill_name!r} IS visible at cwd via the {_layer_family(winner)} layer "
+            f"({winner.get('layer')})"
+        )
+        remediation: list[dict[str, Any]] = []
+    else:
+        if not occurrences and not source_options:
+            reason = (
+                f"{skill_name!r} is NOT visible: no occurrence and no source found under any "
+                "configured root (unknown skill or removed source)"
+            )
+        elif winner and winner.get("state") == "broken":
+            reason = (
+                f"{skill_name!r} is NOT visible: the only occurrence is a broken link "
+                f"({winner.get('path')})"
+            )
+        elif source_options:
+            reason = (
+                f"{skill_name!r} is NOT visible here, but a source exists and it can be activated"
+            )
+        else:
+            reason = f"{skill_name!r} is NOT visible at this cwd"
+        remediation = _explain_remediation(
+            model,
+            skill_name,
+            cwd_path,
+            scope_rules=scope_rules,
+            inactive_overlay_rules=inactive_overlay_rules,
+            source_options=source_options,
+            occurrences=occurrences,
+        )
+
+    return {
+        "schema_version": EXPLAIN_SCHEMA_VERSION,
+        "skill": skill_name,
+        "cwd": str(cwd_path),
+        "visible": visible,
+        "reason": reason,
+        "layer": winner.get("layer") if winner else None,
+        "layer_family": _layer_family(winner) if winner else None,
+        "layer_label": winner.get("layer_label") if winner else None,
+        "layer_rank": winner.get("layer_rank") if winner else None,
+        "winner": _explain_occurrence_view(winner, won=True) if winner else None,
+        "occurrences": occurrence_views,
+        "lost": losers,
+        "scope_rules": scope_rules,
+        "inactive_overlay_rules": inactive_overlay_rules,
+        "source_options": source_options,
+        "active_overlays": sorted(active_overlays()),
+        "active_clients": payload.get("active_clients") or [],
+        "matched_clients": payload.get("matched_clients") or [],
+        "matched_project_categories": payload.get("matched_project_categories") or [],
+        "remediation": remediation,
+        # Forward-compatible blocks: present (and stable-keyed) even when empty
+        # so machine-routing and registry-id consumers can extend without a
+        # schema break.
+        "machine": _explain_machine_profile(),
+        "registry": {"skill_id": None, "registry_ids": []},
+        "next_actions": [
+            str(step.get("command"))
+            for step in remediation
+            if step.get("command")
+        ] or (["already visible; no action needed"] if visible else []),
+    }
+
+
 def skill_visibility_next_actions(issues: dict[str, list[dict[str, Any]]]) -> list[str]:
     actions: list[str] = []
     if issues.get("broken_global"):
