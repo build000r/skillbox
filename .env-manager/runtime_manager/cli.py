@@ -18,6 +18,10 @@ from .context_rendering import *
 from .text_renderers import *
 from .workflows import *
 from .mcp_visibility import *
+from .mcp_render import (
+    print_mcp_render_text,
+    render_mcp_sync,
+)
 from .parity_report import *
 from .pressure_report import *
 from .rch_report import *
@@ -70,6 +74,7 @@ MANAGE_COMMAND_NAMES = {
     "forge",
     "graph",
     "logs",
+    "mcp",
     "mcp-audit",
     "mmdx",
     "next",
@@ -679,6 +684,65 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_profile_arg(mcp_audit_parser)
     _add_client_arg(mcp_audit_parser)
+
+    mcp_parser = subparsers.add_parser(
+        "mcp",
+        help=(
+            "Single-source MCP config. `mcp sync` renders BOTH .mcp.json (Claude) "
+            "and .codex/config.toml (Codex) from the same declaration `mcp-audit` "
+            "checks against. (`sbp mcp` with no subcommand runs the read-only audit.)"
+        ),
+    )
+    mcp_subparsers = mcp_parser.add_subparsers(dest="mcp_action", required=True)
+
+    mcp_sync_parser = mcp_subparsers.add_parser(
+        "sync",
+        help=(
+            "Render .mcp.json + .codex/config.toml from the single MCP declaration. "
+            "Operator-managed and unmanaged entries are preserved; --dry-run prints "
+            "exactly what --apply would write."
+        ),
+        description=(
+            "Render Claude (.mcp.json) and Codex (.codex/config.toml) MCP config "
+            "from the one declaration that `mcp-audit` audits against, so audit and "
+            "render agree. Output paths and the Codex `cwd` resolve through machine "
+            "profiles (skillbox-config/machines.yaml) so a devbox TOML never gets a "
+            "foreign /Users/b path. Entries marked operator_managed in the "
+            "declaration, and any entry present on a surface but not declared, are "
+            "PRESERVED (review-before-remove). The user-global ~/.codex/config.toml "
+            "is operator-managed and is NEVER rewritten by this command. --dry-run "
+            "(default) is symmetric with --apply: it prints the exact rendered text "
+            "and diff that --apply writes."
+        ),
+    )
+    mcp_sync_parser.add_argument("--format", choices=("text", "json"), default="text")
+    mcp_sync_parser.add_argument(
+        "--cwd",
+        default=None,
+        help="Working directory used to find the target repo root. Defaults to the current cwd.",
+    )
+    mcp_sync_parser.add_argument(
+        "--config-root",
+        default=None,
+        help="Explicit repo/config root containing .mcp.json and .codex/config.toml.",
+    )
+    mcp_sync_apply_group = mcp_sync_parser.add_mutually_exclusive_group()
+    mcp_sync_apply_group.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=None,
+        help="Preview the exact rendered files and diff without writing (default).",
+    )
+    mcp_sync_apply_group.add_argument(
+        "--apply",
+        dest="apply",
+        action="store_true",
+        default=False,
+        help="Write the rendered .mcp.json and .codex/config.toml to disk.",
+    )
+    _add_profile_arg(mcp_sync_parser)
+    _add_client_arg(mcp_sync_parser)
 
     evidence_parser = subparsers.add_parser(
         "evidence",
@@ -3224,6 +3288,47 @@ def _handle_mcp_audit(args: argparse.Namespace, root_dir: Path, model: dict[str,
     return EXIT_OK
 
 
+def _handle_mcp(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    action = str(getattr(args, "mcp_action", "") or "")
+    if action == "sync":
+        return _handle_mcp_sync(args, root_dir, model, resolved_mode)
+    raise RuntimeError(f"unknown mcp action: {action!r}")
+
+
+def _handle_mcp_sync(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    del resolved_mode
+    # --dry-run is the default; --apply is the only thing that writes. The two
+    # paths compute the identical plan, so dry-run prints exactly what apply
+    # would write.
+    apply = bool(getattr(args, "apply", False))
+    # Render from the FULL (unfiltered) model so profile-gated MCP services are
+    # rendered, matching the audit's full-declared baseline rather than the
+    # profile-filtered dispatch model.
+    try:
+        full_model = build_runtime_model(root_dir)
+    except RuntimeError:
+        full_model = model
+    payload = render_mcp_sync(
+        root_dir,
+        full_model,
+        cwd=getattr(args, "cwd", None),
+        config_root=getattr(args, "config_root", None),
+        apply=apply,
+    )
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print_mcp_render_text(payload, root_dir=root_dir)
+    changed = bool(payload.get("summary", {}).get("claude_changed")) or bool(
+        payload.get("summary", {}).get("codex_changed")
+    )
+    # In dry-run, surface drift via EXIT_DRIFT so audits/CI can gate on it; an
+    # apply that wrote the files exits OK.
+    if changed and not apply:
+        return EXIT_DRIFT
+    return EXIT_OK
+
+
 def _handle_evidence(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
     del resolved_mode
     payload = collect_runtime_evidence(
@@ -4051,6 +4156,7 @@ _MODEL_DISPATCH: dict[str, Callable[[argparse.Namespace, Path, dict[str, Any], s
     "skills": _handle_skills,
     "skill-audit": _handle_skill_audit,
     "mcp-audit": _handle_mcp_audit,
+    "mcp": _handle_mcp,
     "evidence": _handle_evidence,
     "next": _handle_next,
     "graph": _handle_graph,
