@@ -706,6 +706,110 @@ except RuntimeError as exc:
         self.assertTrue(emitted[0]["would_persist"])
         self.assertEqual(emitted[0]["unlinked"], [])
 
+    def _write_overlay_policy_fixture(self, base: Path, skill_names: list[str]) -> tuple[dict[str, object], Path, Path]:
+        """Scaffold a real skill-scope policy with a path-scoped marketing overlay.
+
+        Returns (model, marketing_cwd, other_cwd). The marketing overlay rule is
+        scoped to marketing_cwd only, so policy evaluation in other_cwd yields an
+        empty wanted set even though every name is a literal overlay-tagged skill.
+        """
+        clients_root = base / "config" / "clients"
+        clients_root.mkdir(parents=True)
+        config_root = clients_root.parent
+        skills_root = base / "skills"
+        skills_root.mkdir()
+        for name in skill_names:
+            skill_dir = skills_root / name
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text(f"# {name}\nbody\n", encoding="utf-8")
+        marketing_cwd = base / "marketing_repo"
+        marketing_cwd.mkdir()
+        other_cwd = base / "backend_repo"
+        other_cwd.mkdir()
+        skills_block = "\n".join(f"          - {name}" for name in skill_names)
+        policy_yaml = (
+            "skill_source_roots:\n"
+            f"  - {skills_root}\n"
+            "rules:\n"
+            "  - id: marketing-overlay\n"
+            "    overlay: marketing\n"
+            "    paths:\n"
+            f"      - {marketing_cwd}\n"
+            "    default: on\n"
+            "    skills:\n"
+            f"{skills_block}\n"
+        )
+        (config_root / "skill-scope.yaml").write_text(policy_yaml, encoding="utf-8")
+        model = {"env": {"SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root)}}
+        return model, marketing_cwd, other_cwd
+
+    def test_overlay_activate_is_policy_evaluated_not_literal_link(self) -> None:
+        # Regression for repos-sbp-overlay-semantics-vq0.1: `overlay activate`
+        # must run the SAME policy evaluation as `skill sync` with the named
+        # overlay forced active for this call only — NOT blindly link every
+        # literal overlay-tagged skill. In a cwd the overlay rule does not match,
+        # the policy-correct set is empty (0), even though the overlay declares
+        # many literal skills.
+        skill_names = [f"mk{i:02d}" for i in range(35)]
+        prior_env = os.environ.get(CLI.OVERLAY_ENV_VAR)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            model, marketing_cwd, other_cwd = self._write_overlay_policy_fixture(base, skill_names)
+
+            # The overlay literally declares all 35 skills (the old activate path
+            # would have linked every one of these regardless of cwd).
+            literal = CLI.overlay_scoped_skill_names(model, "marketing")
+            self.assertEqual(len(literal), 35)
+
+            # Non-matching cwd: policy evaluation links ZERO, not 35.
+            non_matching = CLI.activate_overlay_scoped_skills(
+                model, "marketing", str(other_cwd), to="project", dry_run=True
+            )
+            self.assertEqual(non_matching, [])
+            self.assertFalse((other_cwd / ".claude" / "skills").exists())
+
+            # Forcing the overlay active is ephemeral: no SKILLBOX_OVERLAYS state
+            # persists past the call.
+            self.assertEqual(os.environ.get(CLI.OVERLAY_ENV_VAR), prior_env)
+
+            # Matching cwd: the policy-evaluated set is exactly the declared skills.
+            def plan_link_destinations(activations: list[dict[str, object]]) -> dict[str, list[str]]:
+                return {
+                    str(activation["skill"]): sorted(
+                        str(action.get("destination"))
+                        for action in (activation.get("actions") or [])
+                        if action.get("op") == "link"
+                    )
+                    for activation in activations
+                }
+
+            dry = CLI.activate_overlay_scoped_skills(
+                model, "marketing", str(marketing_cwd), to="project", dry_run=True
+            )
+            self.assertEqual(sorted(a["skill"] for a in dry), sorted(skill_names))
+            # --dry-run plan must equal the plan apply executes (zero-surprise links).
+            applied = CLI.activate_overlay_scoped_skills(
+                model, "marketing", str(marketing_cwd), to="project", dry_run=False
+            )
+            self.assertEqual(plan_link_destinations(dry), plan_link_destinations(applied))
+
+            # apply actually created exactly the policy-evaluated symlinks, and
+            # every activation carries a usable packet (SKILL.md + sha) so the
+            # requesting agent can use the skill immediately.
+            created = sorted(
+                p.name for p in (marketing_cwd / ".claude" / "skills").iterdir()
+            )
+            self.assertEqual(created, sorted(skill_names))
+            self.assertTrue(
+                all(
+                    a["activation_packet"] and a["activation_packet"]["skill_md_sha256"]
+                    for a in applied
+                )
+            )
+
+        # Env stays clean after the whole flow (no persisted overlay state).
+        self.assertEqual(os.environ.get(CLI.OVERLAY_ENV_VAR), prior_env)
+
     def test_operator_booking_text_lines_cover_each_action(self) -> None:
         config_lines = CLI._operator_booking_text_lines(
             {
