@@ -16,6 +16,15 @@ import shutil
 from pathlib import Path
 from typing import Any, Callable
 
+# NOTE: ``shlex`` is imported function-locally (not here) on purpose. This module
+# is re-executed into ``skill_visibility``'s shared namespace by a facade that
+# STRIPS every top-level import and replays only a FIXED header import set
+# (fnmatch/glob/hashlib/os/shutil/Path/Any/Callable + .shared). A top-level
+# ``import shlex`` would therefore be dropped on the facade path, leaving the
+# fix_command builders with an undefined ``shlex`` at runtime. Importing shlex
+# inside the functions that need it survives the strip and works on both the
+# direct-import and facade paths without editing the facade.
+
 try:
     import yaml
 except ModuleNotFoundError:
@@ -284,6 +293,8 @@ def _issue_row_fix_command(issue_type: str, row: dict[str, Any]) -> str:
     issue type maps to the one narrowest manage.py command an agent can run
     without re-deriving anything from the policy.
     """
+    import shlex  # facade-safe local import (see module header note)
+
     name = str(row.get("name") or "")
     path = str(row.get("path") or "")
     if issue_type in _BROKEN_ISSUE_TYPES:
@@ -292,7 +303,7 @@ def _issue_row_fix_command(issue_type: str, row: dict[str, Any]) -> str:
             return existing
         # Defensive: an unenriched broken row defaults to prune (mirrors
         # ``broken_link_class_counts`` / ``_classified_broken_rows``).
-        return f"rm {path}  # prune dead link {name!r}" if path else ""
+        return f"rm {shlex.quote(path)}  # prune dead link {name!r}" if path else ""
     if issue_type == "missing_for_cwd":
         return f"sbp skill activate {name} --cwd <repo>"
     if issue_type == "scope_violations":
@@ -468,20 +479,26 @@ def _broken_link_fix_command(
       migrate  -> remove a link that belongs to another machine's tree.
       investigate -> surface the unreadable link for a human.
     """
+    import shlex  # facade-safe local import (see module header note)
+
     path = str(occurrence.get("path") or "")
     name = str(occurrence.get("name") or "")
+    # Every interpolated filesystem path is shell-quoted: these strings are
+    # advertised as the EXACT command to run, so a path with a space / glob /
+    # ``;`` / ``$`` / quote must paste safely (the ``rm`` prune commands are the
+    # dangerous ones). The trailing ``# ...`` comments are descriptive only.
     if origin == "moved" and source_options:
         source = str(source_options[0].get("source") or "")
-        return f"ln -sfn {source} {path}"
+        return f"ln -sfn {shlex.quote(source)} {shlex.quote(path)}"
     if origin == "dangling":
-        return f"rm {path}  # prune dead link {name!r}"
+        return f"rm {shlex.quote(path)}  # prune dead link {name!r}"
     if origin == "other-machine":
         target = str(occurrence.get("link_target") or occurrence.get("link_target_abs") or "")
         suffix = f" (target {target} belongs to another machine"
         suffix += f", not {machine_id!r})" if machine_id else ")"
-        return f"rm {path}  # migrate: drop foreign-machine link{suffix}"
+        return f"rm {shlex.quote(path)}  # migrate: drop foreign-machine link{suffix}"
     # unreadable: do not guess; show the operator what to inspect.
-    return f"ls -ld {path}  # investigate unreadable link (permission/loop?)"
+    return f"ls -ld {shlex.quote(path)}  # investigate unreadable link (permission/loop?)"
 
 
 def _classify_broken_link(

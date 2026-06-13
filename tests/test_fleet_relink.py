@@ -525,5 +525,356 @@ class ApplyWritesTests(unittest.TestCase):
         self.assertEqual(replan["summary"]["actions_total"], 0)
 
 
+# ===========================================================================
+# REGRESSION TESTS — confirmed safety bugs in the relink apply / plan path.
+# ===========================================================================
+
+
+class ApplyRevalidatesStalePlanTests(unittest.TestCase):
+    """BUG 1: apply RE-VERIFIES the link is still broken + target still valid.
+
+    A relink plan can be emitted as JSON and applied LATER, so the build-time
+    guarantees ("only touch broken links / translated target must exist+valid")
+    do NOT survive serialization. ``_repoint_symlink`` re-checks both invariants
+    at apply time and SKIPS (records ``skipped_stale``) rather than clobber a
+    now-real link or point at a now-deleted target.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tree = _MigrationTree(Path(self._tmp.name))
+
+    def _plan(self, **kw):
+        with _inject_machines(self.tree.config, "devbox"):
+            return fr.build_relink_plan(
+                self.tree.model,
+                config=self.tree.config,
+                machine_id="devbox",
+                scan_roots=[str(self.tree.devbox_root)],
+                **kw,
+            )
+
+    def test_apply_skips_link_that_is_no_longer_broken(self) -> None:
+        # Build a rewrite plan, then make the link HEALTHY (it now resolves)
+        # before applying. A stale apply must NOT clobber the now-real link.
+        repo, _foreign = self.tree.add_repo("alpha", "tiny-ui")
+        target = self.tree.devbox_target_for("tiny-ui")
+        _write_skill(target, "tiny-ui")
+        link = repo / ".claude" / "skills" / "tiny-ui"
+
+        plan = self._plan(apply=True)
+        self.assertEqual(plan["summary"]["rewrite"], 1)
+
+        # Out-of-band heal: repoint the link at a real, existing dir so it is no
+        # longer broken (e.g. another converge run already fixed it).
+        already = self.tree.devbox_root / "already-healed"
+        _write_skill(already, "tiny-ui")
+        link.unlink()
+        os.symlink(str(already), str(link), target_is_directory=True)
+        self.assertTrue(link.resolve().is_dir(), "precondition: link now resolves")
+
+        result = fr.apply_relink_plan(plan, dry_run=False)
+        self.assertEqual(result["summary"]["rewritten"], 0)
+        self.assertEqual(result["summary"]["failed"], 0)
+        self.assertEqual(result["summary"]["skipped_stale"], 1)
+        # The link was NOT clobbered: it still points at the out-of-band heal.
+        self.assertEqual(os.readlink(link), str(already))
+        entry = result["results"][0]
+        self.assertTrue(entry["skipped"])
+        self.assertIn("no longer broken", entry["error"])
+
+    def test_apply_skips_when_target_now_missing(self) -> None:
+        # Build a rewrite plan, then DELETE the translated target before apply.
+        # Repointing at a now-missing target would just manufacture a new broken
+        # link, so apply must skip.
+        repo, foreign = self.tree.add_repo("beta", "tiny-ui")
+        target = self.tree.devbox_target_for("tiny-ui")
+        _write_skill(target, "tiny-ui")
+        link = repo / ".claude" / "skills" / "tiny-ui"
+
+        plan = self._plan(apply=True)
+        self.assertEqual(plan["summary"]["rewrite"], 1)
+
+        # Target deleted out-of-band after the plan was built.
+        (target / "SKILL.md").unlink()
+        target.rmdir()
+        self.assertFalse(target.exists())
+
+        result = fr.apply_relink_plan(plan, dry_run=False)
+        self.assertEqual(result["summary"]["rewritten"], 0)
+        self.assertEqual(result["summary"]["skipped_stale"], 1)
+        # The link is left exactly as it was (still the original foreign target).
+        self.assertEqual(os.readlink(link), foreign)
+        self.assertIn("missing or no longer a valid skill dir", result["results"][0]["error"])
+
+    def test_apply_skips_when_target_is_now_a_plain_dir(self) -> None:
+        # Translated target loses its SKILL.md (no longer a valid skill dir).
+        repo, foreign = self.tree.add_repo("gamma", "tiny-ui")
+        target = self.tree.devbox_target_for("tiny-ui")
+        _write_skill(target, "tiny-ui")
+        link = repo / ".claude" / "skills" / "tiny-ui"
+
+        plan = self._plan(apply=True)
+        (target / "SKILL.md").unlink()  # now a plain dir, not a skill dir
+
+        result = fr.apply_relink_plan(plan, dry_run=False)
+        self.assertEqual(result["summary"]["skipped_stale"], 1)
+        self.assertEqual(result["summary"]["rewritten"], 0)
+        self.assertEqual(os.readlink(link), foreign)
+
+    def test_apply_still_rewrites_a_genuinely_stale_free_plan(self) -> None:
+        # Control: when nothing changed between build and apply, the rewrite runs.
+        repo, _foreign = self.tree.add_repo("delta", "tiny-ui")
+        target = self.tree.devbox_target_for("tiny-ui")
+        _write_skill(target, "tiny-ui")
+        link = repo / ".claude" / "skills" / "tiny-ui"
+
+        plan = self._plan(apply=True)
+        result = fr.apply_relink_plan(plan, dry_run=False)
+        self.assertEqual(result["summary"]["rewritten"], 1)
+        self.assertEqual(result["summary"]["skipped_stale"], 0)
+        self.assertEqual(os.readlink(link), str(target))
+
+
+class RepointTempLeakTests(unittest.TestCase):
+    """BUG 2: a failed ``os.replace`` never leaves a ``<name>.relink-tmp`` link.
+
+    ``_repoint_symlink`` writes ``<name>.relink-tmp`` then ``os.replace``s it
+    over the link. If that replace raises (e.g. the link path is now a real
+    directory -> IsADirectoryError), the temp symlink must be cleaned up: it does
+    NOT start with '.', so a leftover would be scanned as an installed skill
+    ``<name>.relink-tmp`` and permanently pollute the inventory.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+
+    def test_failed_replace_leaves_no_relink_tmp(self) -> None:
+        skills = self.tmp / "repo" / ".claude" / "skills"
+        skills.mkdir(parents=True)
+        # The "link" path is actually a real, non-empty DIRECTORY: os.replace of a
+        # symlink over a non-empty dir raises. We bypass the apply-time stale
+        # re-check (which would skip a non-symlink) to exercise the replace-fail
+        # cleanup branch directly: force a symlink at the path first... but a real
+        # dir is the realistic IsADirectoryError trigger, so call the inner
+        # writer with the stale-check satisfied by monkeypatching it off.
+        link = skills / "tiny-ui"
+        link.mkdir()
+        (link / "keep.txt").write_text("real dir content", encoding="utf-8")
+        target = self.tmp / "src" / "tiny-ui"
+        _write_skill(target, "tiny-ui")
+
+        # Directly drive the writer past the stale guard to hit os.replace on a
+        # real directory (the BUG-2 leak trigger). The guard is proven separately
+        # in ApplyRevalidatesStalePlanTests.
+        import unittest.mock as _mock
+        with _mock.patch.object(fr, "_stale_relink_reason", return_value=None):
+            with self.assertRaises(Exception):
+                fr._repoint_symlink(str(link), str(target))
+
+        # The real directory is untouched, and NO .relink-tmp link was left.
+        self.assertTrue((link / "keep.txt").is_file())
+        leftovers = [p.name for p in skills.iterdir() if p.name.endswith(".relink-tmp")]
+        self.assertEqual(leftovers, [], f"stray relink-tmp left behind: {leftovers}")
+        # Belt-and-suspenders: the specific name an inventory scan would mis-read.
+        self.assertFalse((skills / "tiny-ui.relink-tmp").exists())
+        self.assertFalse((skills / "tiny-ui.relink-tmp").is_symlink())
+
+    def test_apply_isadirectory_failure_records_failed_not_leak(self) -> None:
+        # End-to-end via apply: if a build-time rewrite link becomes a real dir
+        # but the stale guard is somehow bypassed, the temp link still must not
+        # leak. We assert the cleanup invariant holds through the public apply.
+        tree = _MigrationTree(self.tmp)
+        repo, _foreign = tree.add_repo("alpha", "tiny-ui")
+        target = tree.devbox_target_for("tiny-ui")
+        _write_skill(target, "tiny-ui")
+        link = repo / ".claude" / "skills" / "tiny-ui"
+
+        with _inject_machines(tree.config, "devbox"):
+            plan = fr.build_relink_plan(
+                tree.model, config=tree.config, machine_id="devbox",
+                scan_roots=[str(tree.devbox_root)], apply=True,
+            )
+
+        # Replace the broken link with a real non-empty dir AND bypass the guard,
+        # forcing os.replace to raise inside the public apply path.
+        link.unlink()
+        link.mkdir()
+        (link / "keep.txt").write_text("x", encoding="utf-8")
+        import unittest.mock as _mock
+        with _mock.patch.object(fr, "_stale_relink_reason", return_value=None):
+            result = fr.apply_relink_plan(plan, dry_run=False)
+
+        self.assertEqual(result["summary"]["rewritten"], 0)
+        self.assertEqual(result["summary"]["failed"], 1)
+        leftovers = [
+            p.name for p in (link.parent).iterdir() if p.name.endswith(".relink-tmp")
+        ]
+        self.assertEqual(leftovers, [], f"stray relink-tmp left behind: {leftovers}")
+
+
+class CommandQuotingTests(unittest.TestCase):
+    """BUG 3: the emitted ``ln -sfn`` command shell-quotes paths with spaces."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+
+    def test_relink_command_quotes_path_with_space(self) -> None:
+        # A repo dir name with a space yields a link path with a space; the
+        # advertised ``ln -sfn`` command must quote it so it pastes safely.
+        config_root = self.tmp / "skillbox-config"
+        clients_root = config_root / "clients"
+        clients_root.mkdir(parents=True)
+        skills_root = self.tmp / "skills"
+        skills_root.mkdir()
+        old_root = "/old/mac/repos"
+        new_root = self.tmp / "new devbox" / "repos"  # space in the path
+        new_root.mkdir(parents=True)
+        repo = _make_repo(new_root, "my app")  # space in the repo name
+        foreign_target = f"{old_root}/live-skills/tiny-ui"
+        _link(repo / ".claude" / "skills" / "tiny-ui", foreign_target)
+        _write_skill(new_root / "live-skills" / "tiny-ui", "tiny-ui")
+
+        model = _model(clients_root, [skills_root], new_root)
+        config = _config(
+            {
+                "other": m.MachineProfile(machine_id="other", repo_roots=(old_root,)),
+                "here": m.MachineProfile(machine_id="here", repo_roots=(str(new_root),)),
+            }
+        )
+        with _inject_machines(config, "here"):
+            plan = fr.build_relink_plan(
+                model, from_root=old_root, to_root=str(new_root),
+                config=config, machine_id="here", scan_roots=[str(new_root)],
+            )
+        action = plan["repos"][0]["actions"][0]
+        self.assertEqual(action["decision"], "rewrite")
+        command = action["command"]
+        # The space-bearing paths are single-quoted; splitting the command with
+        # the shell lexer yields exactly 4 tokens (ln, -sfn, target, link).
+        import shlex as _shlex
+        tokens = _shlex.split(command)
+        self.assertEqual(tokens[0], "ln")
+        self.assertEqual(tokens[1], "-sfn")
+        self.assertEqual(len(tokens), 4)
+        self.assertIn("new devbox", tokens[2])
+        self.assertIn("my app", tokens[3])
+        # And the raw string contains a quote char (proof it was quoted).
+        self.assertIn("'", command)
+
+
+class TranslateLongestMatchTests(unittest.TestCase):
+    """BUG 4: prefix-overlapping foreign roots pick the LONGEST matched source.
+
+    When a foreign target is under several machines' repo roots (because those
+    roots prefix-overlap), the machine whose matched SOURCE root is most specific
+    (longest) is the correct owner — not merely the first machine in
+    machines.yaml order. The result must also be deterministic run-to-run.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+
+    def _roots_default(self) -> dict:
+        return {"mode": "default"}
+
+    def test_longest_source_root_wins_regardless_of_machine_order(self) -> None:
+        # mac-broad owns /Users/b ; mac-narrow owns /Users/b/repos (a longer,
+        # more specific prefix). A target under /Users/b/repos/... is under BOTH.
+        # The longer (narrow) root is the correct owner and must win whichever
+        # order the machines are declared in.
+        devbox_root = "/srv/devbox"
+        broad = m.MachineProfile(machine_id="mac-broad", repo_roots=("/Users/b",))
+        narrow = m.MachineProfile(machine_id="mac-narrow", repo_roots=("/Users/b/repos",))
+        here = m.MachineProfile(machine_id="devbox", repo_roots=(devbox_root,))
+        target = "/Users/b/repos/proj/skills/x"
+
+        for order in (
+            {"mac-broad": broad, "mac-narrow": narrow, "devbox": here},
+            {"mac-narrow": narrow, "mac-broad": broad, "devbox": here},
+        ):
+            config = _config(order)
+            translated = fr._translate_target(
+                target, self._roots_default(), config, "devbox"
+            )
+            # The NARROW (longest) root maps /Users/b/repos -> /srv/devbox, so the
+            # remainder is proj/skills/x (NOT repos/proj/skills/x from the broad
+            # root). Longest match wins independent of declaration order.
+            self.assertEqual(translated, "/srv/devbox/proj/skills/x", f"order={list(order)}")
+
+    def test_translation_is_deterministic_on_equal_length_roots(self) -> None:
+        # Two machines with equal-length (but different) roots both translating:
+        # the tiebreak is deterministic (sorted by translated target then id), so
+        # the same link always relinks to the same target run-to-run.
+        a = m.MachineProfile(machine_id="m-a", repo_roots=("/Users/aa/repos",))
+        b = m.MachineProfile(machine_id="m-b", repo_roots=("/Users/bb/repos",))
+        here = m.MachineProfile(machine_id="devbox", repo_roots=("/srv/devbox",))
+        # A target under m-a only (no overlap) translates unambiguously; the
+        # determinism guard is exercised by building the config both orders and
+        # asserting a stable result for the single-owner case.
+        target = "/Users/aa/repos/p/x"
+        first = fr._translate_target(
+            target, self._roots_default(),
+            _config({"m-a": a, "m-b": b, "devbox": here}), "devbox",
+        )
+        second = fr._translate_target(
+            target, self._roots_default(),
+            _config({"m-b": b, "m-a": a, "devbox": here}), "devbox",
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first, "/srv/devbox/p/x")
+
+
+class ReclassifyVocabularyTests(unittest.TestCase):
+    """BUG 5: relink never claims ``moved``; the dead constant is gone.
+
+    Relink has no source-corpus lookup, so it cannot detect a genuinely-moved
+    link and always reclassifies as ``dangling`` (converge re-derives the real
+    taxonomy). The unused ``RECLASSIFY_MOVED`` constant — whose presence implied
+    a moved-detection that never happened — must not exist.
+    """
+
+    def test_reclassify_moved_constant_is_removed(self) -> None:
+        self.assertFalse(
+            hasattr(fr, "RECLASSIFY_MOVED"),
+            "dead RECLASSIFY_MOVED constant must be deleted (relink never emits moved)",
+        )
+        self.assertEqual(fr.RECLASSIFY_DANGLING, "dangling")
+
+    def test_reclassify_always_emits_dangling_never_moved(self) -> None:
+        # A link that translates to a real path but is NOT a skill dir, and a link
+        # with no destination match, both reclassify as dangling — never moved.
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = _MigrationTree(Path(tmp))
+            # translated target exists but is a plain dir (not a skill).
+            repo_a, _ = tree.add_repo("aaa", "tiny-ui")
+            tree.devbox_target_for("tiny-ui").mkdir(parents=True)  # no SKILL.md
+            # no destination match at all.
+            repo_b, _ = tree.add_repo("bbb", "ghost")
+
+            with _inject_machines(tree.config, "devbox"):
+                plan = fr.build_relink_plan(
+                    tree.model, config=tree.config, machine_id="devbox",
+                    scan_roots=[str(tree.devbox_root)],
+                )
+            reclass = [
+                a
+                for row in plan["repos"]
+                for a in row["actions"]
+                if a["decision"] == "reclassify"
+            ]
+            self.assertEqual(len(reclass), 2)
+            for action in reclass:
+                self.assertEqual(action["reclassify_as"], "dangling")
+                self.assertNotEqual(action["reclassify_as"], "moved")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

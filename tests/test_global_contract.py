@@ -144,6 +144,51 @@ class GlobalContractLintTests(unittest.TestCase):
         results = validate_global_skill_contract({"rules": []})
         self.assertEqual(self._statuses(results), ["pass"], results)
 
+    def test_allow_global_rule_authored_with_patterns_is_seen(self) -> None:
+        """BUG 2 regression: the runtime reads a rule's skills via
+        ``skills or patterns or names``. A rule that grants ``allow_global`` via a
+        ``patterns:`` list (no ``skills:`` key) must be visible to this lint, or it
+        falsely fails ("in allowlist but no rule grants them"). The allowlist below
+        lists exactly the patterns-authored global, so a synonym-aware lint is GREEN."""
+        policy = {
+            "global_allowlist": ["smart", "sbp"],
+            "rules": [
+                # allow_global granted via `patterns:` instead of `skills:`.
+                {"id": "dispatcher-global", "patterns": ["smart", "sbp"], "allow_global": True},
+            ],
+        }
+        results = validate_global_skill_contract(policy)
+        self.assertEqual(
+            self._statuses(results),
+            ["pass"],
+            f"patterns-authored allow_global rule was invisible: {results[0].details}",
+        )
+        self.assertEqual(set(results[0].details["global_skills"]), {"smart", "sbp"})
+
+    def test_allow_global_rule_authored_with_names_is_seen(self) -> None:
+        """Same as above for the third synonym, ``names:``."""
+        policy = {
+            "global_allowlist": ["smart"],
+            "rules": [
+                {"id": "dispatcher-global", "names": ["smart"], "allow_global": True},
+            ],
+        }
+        results = validate_global_skill_contract(policy)
+        self.assertEqual(self._statuses(results), ["pass"], results[0].details)
+
+    def test_patterns_authored_global_still_detects_real_drift(self) -> None:
+        """Synonym-awareness must not blunt the lint: a patterns-granted skill
+        missing from the allowlist is still real drift."""
+        policy = {
+            "global_allowlist": ["smart"],
+            "rules": [
+                {"id": "g", "patterns": ["smart", "smuggled"], "allow_global": True},
+            ],
+        }
+        results = validate_global_skill_contract(policy)
+        self.assertEqual(self._statuses(results), ["fail"], results)
+        self.assertIn("smuggled", results[0].details["in_rules_only"])
+
 
 if __name__ == "__main__":
     unittest.main()

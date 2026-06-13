@@ -65,6 +65,7 @@ is independent and IO-bound.
 from __future__ import annotations
 
 import os
+import shlex
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -238,9 +239,12 @@ def _sync_actions(
                 "scope_rule": rule,
                 "scope_policy_path": str(item.get("scope_policy_path") or ""),
                 "reason": str(item.get("reason") or ""),
+                # Shell-quote the skill name and repo path: this is advertised as
+                # the EXACT single-repo command, so a name/path with a space or
+                # shell metachar must paste safely.
                 "command": (
-                    f"{_manage_py()} skill sync {name} "
-                    f"--cwd {repo_path} --dry-run"
+                    f"{_manage_py()} skill sync {shlex.quote(name)} "
+                    f"--cwd {shlex.quote(repo_path)} --dry-run"
                 ),
             }
         )
@@ -278,9 +282,12 @@ def _policy_actions(
                 "allowed_paths": allowed_paths,
                 "reason": str(item.get("reason") or ""),
                 "path": str(item.get("path") or ""),
-                # Default heal: prune the install that violates policy.
+                # Default heal: prune the install that violates policy. The repo
+                # path is shell-quoted: this prune command is advertised as the
+                # exact command to run, so a path with a space/metachar must not
+                # mangle into an unsafe paste.
                 "command": (
-                    f"{_manage_py()} skill prune --cwd {repo_path} "
+                    f"{_manage_py()} skill prune --cwd {shlex.quote(repo_path)} "
                     f"--from project --dry-run"
                 ),
                 # Alternative heal: edit the rule to permit this install.
@@ -307,7 +314,8 @@ def _mcp_actions(
     """
     actions: list[dict[str, Any]] = []
     surfaces = mcp_payload.get("surfaces") or {}
-    sync_command = f"{_manage_py()} mcp sync --cwd {repo_path} --dry-run"
+    # Shell-quote the repo path in the advertised exact ``mcp sync`` command.
+    sync_command = f"{_manage_py()} mcp sync --cwd {shlex.quote(repo_path)} --dry-run"
     seen: set[tuple[str, str, str]] = set()
     for surface_name in ("claude", "codex"):
         surface = surfaces.get(surface_name) or {}

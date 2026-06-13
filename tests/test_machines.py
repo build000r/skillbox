@@ -377,5 +377,122 @@ class MachinesLocationTests(unittest.TestCase):
         self.assertEqual(profile.machine_id, "mac-laptop")
 
 
+@unittest.skipUnless(_HAVE_YAML, "PyYAML required to parse machines.yaml")
+class ForeignHomeExpansionTests(unittest.TestCase):
+    """BUG E: a FOREIGN machine's ``~``-relative root must NOT be expanded against
+    the LOCAL ``$HOME``.
+
+    Before the fix, the mac profile's ``~/repos`` root was expanded with
+    ``os.path.expanduser`` against whatever ``$HOME`` the devbox process had, so a
+    devbox managed-home path (e.g. ``/srv/skillbox/home/repos/...`` when
+    ``$HOME=/srv/skillbox/home``) wrongly resolved under the mac's ``~/repos`` and
+    was misclassified ``mac-laptop`` / reported foreign to the devbox — which a
+    fleet relink could then mis-translate / re-point. The fix anchors a profile's
+    ``~`` roots to THAT profile's declared ``home``/``managed_home`` instead.
+    """
+
+    # mac declares ~/repos with home /Users/b; devbox declares an absolute repo
+    # root plus a managed_home at /srv/skillbox/home. We set $HOME = the devbox
+    # managed_home to reproduce the exact mis-expansion the bug describes.
+    FIXTURE = textwrap.dedent(
+        """
+        version: 1
+        machines:
+          mac-laptop:
+            hostnames: [bs-macbook-air]
+            home: /Users/b
+            repo_roots:
+              - ~/repos
+            projects_roots:
+              - ~/projects
+          portfolio-devbox:
+            hostnames: [portfolio-devbox]
+            home: /home/skillbox
+            managed_home: /srv/skillbox/home
+            repo_roots:
+              - /srv/skillbox/repos
+            projects_roots:
+              - /srv/skillbox/projects
+        """
+    ).strip()
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        path = Path(self._tmp.name) / "machines.yaml"
+        path.write_text(self.FIXTURE + "\n", encoding="utf-8")
+        self.config = m.load_machines_config(path)
+        # Force the local $HOME to the devbox managed-home so the OLD expanduser
+        # would resolve the mac's ~/repos to /srv/skillbox/home/repos.
+        self._prev_home = os.environ.get("HOME")
+        os.environ["HOME"] = "/srv/skillbox/home"
+        self.addCleanup(self._restore_home)
+
+    def _restore_home(self) -> None:
+        if self._prev_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._prev_home
+
+    def test_managed_home_path_not_classified_as_foreign_machine(self) -> None:
+        # The devbox managed-home path must NOT be captured by the mac's ~/repos.
+        result = self.config.classify_path("/srv/skillbox/home/repos/something")
+        self.assertNotIn("mac-laptop", result["machines"])
+        # It is under no declared root at all (managed_home is not a repo root),
+        # so it makes no machine claim.
+        self.assertEqual(result["machines"], [])
+
+    def test_managed_home_path_not_foreign_to_devbox(self) -> None:
+        self.assertFalse(
+            self.config.is_foreign_path(
+                "/srv/skillbox/home/repos/something", "portfolio-devbox"
+            )
+        )
+
+    def test_current_machine_tilde_root_still_expands_to_declared_home(self) -> None:
+        # The mac's ~/repos is anchored to ITS declared home (/Users/b), not the
+        # local $HOME — so a /Users/b path classifies as the mac.
+        result = self.config.classify_path("/Users/b/repos/foo")
+        self.assertEqual(result["machines"], ["mac-laptop"])
+        match = result["matches"][0]
+        self.assertEqual(match["category"], "repos")
+        self.assertEqual(match["remainder"], "foo")
+        # And the reported root is the home-anchored form, not the raw "~/repos".
+        self.assertEqual(match["root"], "/Users/b/repos")
+
+    def test_devbox_absolute_root_unaffected(self) -> None:
+        result = self.config.classify_path("/srv/skillbox/repos/htma")
+        self.assertEqual(result["machines"], ["portfolio-devbox"])
+
+    def test_translate_mac_tilde_root_to_devbox_uses_declared_home(self) -> None:
+        # A mac ~/repos path translates to the devbox root via the mac's declared
+        # home, NOT the local $HOME.
+        out = self.config.translate_path(
+            "/Users/b/repos/pkg/x", "mac-laptop", "portfolio-devbox"
+        )
+        self.assertEqual(out, "/srv/skillbox/repos/pkg/x")
+
+    def test_profile_with_no_declared_home_skips_tilde_root(self) -> None:
+        # A profile that declares a ~ root but NO home cannot anchor it, so the ~
+        # root is skipped rather than matched against the local $HOME.
+        fixture = textwrap.dedent(
+            """
+            version: 1
+            machines:
+              homeless:
+                hostnames: [homeless]
+                repo_roots:
+                  - ~/repos
+            """
+        ).strip()
+        path = Path(self._tmp.name) / "homeless.yaml"
+        path.write_text(fixture + "\n", encoding="utf-8")
+        config = m.load_machines_config(path)
+        # With $HOME=/srv/skillbox/home, the OLD code would match this path under
+        # the homeless machine's ~/repos; now it must NOT.
+        result = config.classify_path("/srv/skillbox/home/repos/x")
+        self.assertEqual(result["machines"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

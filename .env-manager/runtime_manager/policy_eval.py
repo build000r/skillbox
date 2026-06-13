@@ -91,6 +91,7 @@ __all__ = [
     '_scope_rule_paths',
     '_scope_rule_from_raw',
     '_scope_rules',
+    'last_scope_rule_errors',
     '_policy_skill_source_patterns',
     '_policy_skill_install_scan_patterns',
     '_expand_skill_source_patterns',
@@ -832,11 +833,28 @@ def _did_you_mean(target: str, candidates: list[str]) -> str | None:
     return matches[0] if matches else None
 
 
+def _machine_detected() -> bool:
+    """True when the current machine is positively identified.
+
+    Distinguishes "machine detected (just no repo_roots declared)" from "machine
+    undetected" — the two collapse to an empty :func:`_machine_repo_roots` set but
+    have OPPOSITE meaning for registry-id resolution. ``_machines_classifier``
+    swallows every failure (missing/broken machines.yaml, unmatched hostname, a
+    renamed host, a worker container) to ``(None, None)``; an undetected machine
+    must NOT silently re-root to the home-form-only set, so callers fail loud.
+    """
+    config, machine_id = _machines_classifier()
+    return config is not None and bool(machine_id)
+
+
 def _machine_repo_roots() -> list[str]:
     """Current machine's declared repo roots (expanded), longest-first.
 
-    Empty when machines.yaml is missing or the machine is undetected, in which
-    case registry-id resolution falls back to the registry's home-relative form.
+    Empty when machines.yaml is missing, the machine is undetected, OR the
+    detected machine simply declares no repo_roots. Callers that re-root a
+    registry id MUST first gate on :func:`_machine_detected` — an empty set from
+    an UNDETECTED machine means "cannot re-root" (a hard error), not "fall back to
+    the home-relative form".
     """
     config, machine_id = _machines_classifier()
     if config is None or not machine_id:
@@ -887,6 +905,40 @@ def _resolve_registry_path(declared_path: str) -> list[str]:
             spellings.append(os.path.join(root, remainder) if remainder else root)
     resolved = sorted({_expand_policy_path(item) for item in spellings if str(item).strip()})
     return resolved
+
+
+def _resolve_registry_entry_path(entry: dict[str, Any]) -> list[str]:
+    """Resolve ONE registry entry's declared path to current-machine spellings.
+
+    Fail-loud guards (match the project's posture — unknown-id already raises):
+
+    * BUG B — a known id whose registry entry has a missing/empty ``path`` is a
+      MALFORMED entry, not a silent no-op: it would otherwise resolve to ``[]``
+      and make the rule match nothing. Raise :class:`RegistryResolutionError`.
+
+    * BUG A — a path under ``~/repos`` MUST be re-rooted under the current
+      machine's repo roots. When the machine is UNDETECTED
+      (:func:`_machine_detected` is False — broken/missing machines.yaml, a
+      renamed host, a worker container, etc.) we cannot re-root, so re-rooting
+      would silently collapse to the home-form-only spelling and the rule would
+      match NO real ``/srv/skillbox/repos/<repo>`` cwd. Raise instead of mis-scoping.
+    """
+    declared_path = str(entry.get("path") or "").strip()
+    if not declared_path:
+        raise RegistryResolutionError(
+            f"registry id {str(entry.get('id') or '')!r} has a missing/empty "
+            "`path` in registry/repos.yaml -- malformed entry; cannot resolve "
+            "it to a current-machine path."
+        )
+    _remainder, under_repos = _registry_path_remainder(declared_path)
+    if under_repos and not _machine_detected():
+        raise RegistryResolutionError(
+            "registry-id rule used but current machine undetected -- cannot "
+            "re-root; check machines.yaml / SKILLBOX_MACHINE "
+            f"(resolving registry id {str(entry.get('id') or '')!r} -> "
+            f"{declared_path!r})."
+        )
+    return _resolve_registry_path(declared_path)
 
 
 def _scope_rule_repo_ids(raw_rule: dict[str, Any]) -> list[str]:
@@ -940,7 +992,7 @@ def _resolve_scope_rule_repos(
                 f"id {repo_id!r} not in registry/repos.yaml{suggestion} "
                 f"declared ids: {', '.join(declared_ids)}"
             )
-        paths.extend(_resolve_registry_path(str(entry.get("path") or "")))
+        paths.extend(_resolve_registry_entry_path(entry))
 
     matched_categories: list[str] = []
     for category_id in category_ids:
@@ -952,14 +1004,19 @@ def _resolve_scope_rule_repos(
             continue
         matched_categories.append(category_id)
         for entry in members:
-            paths.extend(_resolve_registry_path(str(entry.get("path") or "")))
+            paths.extend(_resolve_registry_entry_path(entry))
 
     return sorted(set(paths)), matched_categories
 
 
 def _scope_rule_patterns(raw_rule: dict[str, Any]) -> list[str]:
+    # `skills:`/`patterns:`/`names:` may be authored as a scalar (`skills: foo`)
+    # or a list. Coerce via _as_list so a scalar STRING becomes a single-element
+    # list instead of being char-iterated (`skills: foo` -> ['f','o','o']). The
+    # `or` chain preserves the prior fall-through (an empty/absent key tries the
+    # next alias); _as_list only wraps the chosen value.
     raw_patterns = raw_rule.get("skills") or raw_rule.get("patterns") or raw_rule.get("names") or []
-    return [str(item).strip() for item in raw_patterns if str(item).strip()]
+    return [str(item).strip() for item in _as_list(raw_patterns) if str(item).strip()]
 
 
 def _scope_rule_category_ids(raw_rule: dict[str, Any]) -> list[str]:
@@ -1057,8 +1114,28 @@ def _scope_rule_from_raw(
     }
 
 
+# Per-pass collector for non-fatal scope-rule resolution errors (BUG C). A
+# single typo'd `repos:` id must NOT nuke the WHOLE report: `_scope_rules`
+# SKIPS the bad rule (so the rest still resolve) and records its error here so a
+# doctor lint can surface the typo. Reset at the start of every `_scope_rules`
+# pass; read via `last_scope_rule_errors()`.
+_LAST_SCOPE_RULE_ERRORS: list[dict[str, Any]] = []
+
+
+def last_scope_rule_errors() -> list[dict[str, Any]]:
+    """Non-fatal scope-rule resolution errors from the most recent ``_scope_rules`` pass.
+
+    Each entry is ``{"policy_path", "rule_id", "index", "error", "type"}``. A
+    doctor lint reads this to report a typo'd ``repos:`` id (or a malformed
+    registry entry) WITHOUT the bad rule taking down the rest of the report.
+    Returns a copy so callers cannot mutate the collector.
+    """
+    return [dict(item) for item in _LAST_SCOPE_RULE_ERRORS]
+
+
 def _scope_rules(model: dict[str, Any]) -> list[dict[str, Any]]:
     rules: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
     overlays_on = active_overlays()
     # Load the registry id->path taxonomy once per pass (not per rule) so
     # `repos:`/registry-`categories:` resolution stays cheap.
@@ -1068,16 +1145,35 @@ def _scope_rules(model: dict[str, Any]) -> list[dict[str, Any]]:
         for index, raw_rule in enumerate(policy.get("rules") or []):
             if not isinstance(raw_rule, dict):
                 continue
-            rule = _scope_rule_from_raw(
-                raw_rule,
-                index=index,
-                policy=policy,
-                categories=categories,
-                overlays_on=overlays_on,
-                registry_entries=registry_entries,
-            )
+            try:
+                rule = _scope_rule_from_raw(
+                    raw_rule,
+                    index=index,
+                    policy=policy,
+                    categories=categories,
+                    overlays_on=overlays_on,
+                    registry_entries=registry_entries,
+                )
+            except RegistryResolutionError as exc:
+                # BUG C: one bad rule (typo'd repos: id / malformed registry
+                # entry / undetected-machine re-root) must not take down every
+                # caller (skills report, skill sync, scope-violations,
+                # missing-for-cwd). SKIP it, keep resolving the rest, and record
+                # the error so a doctor lint can surface the typo.
+                errors.append(
+                    {
+                        "policy_path": str(policy.get("_policy_path") or ""),
+                        "rule_id": str(raw_rule.get("id") or f"rule-{index}"),
+                        "index": index,
+                        "error": str(exc),
+                        "type": type(exc).__name__,
+                    }
+                )
+                continue
             if rule is not None:
                 rules.append(rule)
+    # Publish this pass's collected errors (replace, not append).
+    _LAST_SCOPE_RULE_ERRORS[:] = errors
     return rules
 
 

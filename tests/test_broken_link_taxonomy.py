@@ -183,6 +183,66 @@ class BrokenLinkTaxonomyUnitTests(unittest.TestCase):
         self.assertEqual(result["suggested_action"], "prune")
         self.assertIn("rm /repo/.claude/skills/ghost", result["fix_command"])
 
+    def test_dangling_fix_command_quotes_path_with_space(self) -> None:
+        # BUG 3: the advertised ``rm`` prune fix_command must shell-quote a path
+        # with a space so the dangerous prune pastes safely. Also proves the
+        # facade-safe (function-local) shlex import works on the production
+        # ``_classify_broken_link`` entry point (it is re-exec'd into the
+        # skill_visibility namespace by the facade, which strips top-level
+        # imports — a top-level ``import shlex`` would NameError here).
+        import shlex as _shlex
+
+        occ = {
+            "name": "ghost",
+            "availability": "installed",
+            "state": "broken",
+            "path": "/repo with space/.claude/skills/ghost",
+            "link_target": "/gone/ghost",
+            "link_target_abs": "/gone/ghost",
+            "broken_reason": "missing-target",
+        }
+        with mock.patch.object(sv, "_skill_source_options", return_value=[]):
+            result = sv._classify_broken_link(
+                occ, {"clients": [], "skills": []}, machines_config=None, machine_id=None
+            )
+        self.assertEqual(result["origin"], "dangling")
+        command = result["fix_command"]
+        self.assertTrue(command.startswith("rm "))
+        # The path before the trailing ``# ...`` comment must lex as ONE token.
+        rm_part = command.split("  #", 1)[0]
+        tokens = _shlex.split(rm_part)
+        self.assertEqual(tokens[0], "rm")
+        self.assertEqual(tokens[1], "/repo with space/.claude/skills/ghost")
+        self.assertIn("'", command)
+
+    def test_moved_fix_command_quotes_source_and_path_with_space(self) -> None:
+        # BUG 3: the ``ln -sfn`` relink fix_command quotes BOTH the source and
+        # the install path when either carries a space.
+        import shlex as _shlex
+
+        occ = {
+            "name": "x",
+            "availability": "installed",
+            "state": "broken",
+            "path": "/repo with space/.claude/skills/x",
+            "link_target": "/old/x",
+            "link_target_abs": "/old/x",
+            "broken_reason": "missing-target",
+        }
+        with mock.patch.object(
+            sv, "_skill_source_options", return_value=[{"source": "/new src/x"}]
+        ):
+            result = sv._classify_broken_link(
+                occ, {"clients": [], "skills": []}, machines_config=None, machine_id=None
+            )
+        self.assertEqual(result["origin"], "moved")
+        command = result["fix_command"]
+        tokens = _shlex.split(command)
+        self.assertEqual(tokens[0], "ln")
+        self.assertEqual(tokens[1], "-sfn")
+        self.assertEqual(tokens[2], "/new src/x")
+        self.assertEqual(tokens[3], "/repo with space/.claude/skills/x")
+
     def test_class_counts_default_unenriched_to_dangling(self) -> None:
         counts = sv.broken_link_class_counts(
             [

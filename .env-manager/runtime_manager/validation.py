@@ -1306,14 +1306,39 @@ def _skill_scope_policy_path() -> Path:
     return runtime_root.parent / "skillbox-config" / "skill-scope.yaml"
 
 
+def _rule_skill_names(rule: dict[str, Any]) -> list[str]:
+    """The skills a rule declares, via the SAME accessor the runtime evaluates.
+
+    The runtime reads a rule's skill list through
+    ``skill_visibility._scope_rule_patterns``: ``skills`` OR ``patterns`` OR
+    ``names`` (first non-empty wins), stripped of blanks. A rule authored with
+    ``patterns:`` / ``names:`` instead of ``skills:`` is therefore fully live, so
+    every lint that enumerates a rule's skills MUST read the same synonyms or it
+    goes blind to those rules (false contract/precedence/overlay findings).
+
+    We reuse the runtime's own accessor (lazy-imported to keep validation
+    import-cycle-free, like ``_registry_id_resolved_paths``) so this can never
+    diverge from what the evaluator sees. Falls back to the inline triple-OR if
+    ``skill_visibility`` is somehow unavailable.
+    """
+    if not isinstance(rule, dict):
+        return []
+    try:
+        from . import skill_visibility as sv  # noqa: PLC0415
+
+        return sv._scope_rule_patterns(rule)
+    except Exception:  # pragma: no cover - defensive: never break the lint
+        raw = rule.get("skills") or rule.get("patterns") or rule.get("names") or []
+        return [str(item).strip() for item in raw if str(item).strip()]
+
+
 def _scope_allow_global_union(policy: dict[str, Any]) -> set[str]:
     """Union of every skill named by a rule with ``allow_global: true``."""
     union: set[str] = set()
     for rule in policy.get("rules") or []:
         if not isinstance(rule, dict) or not bool(rule.get("allow_global", False)):
             continue
-        for skill in rule.get("skills") or []:
-            name = str(skill).strip()
+        for name in _rule_skill_names(rule):
             if name:
                 union.add(name)
     return union
@@ -1678,11 +1703,39 @@ def _policy_overlay_gated_skills(policy: dict[str, Any]) -> dict[str, list[str]]
             continue
         rule_id = str(rule.get("id") or "").strip() or "(unnamed rule)"
         label = f"{rule_id} (overlay: {tag})"
-        for skill in rule.get("skills") or []:
-            name = str(skill).strip()
+        for name in _rule_skill_names(rule):
             if name:
                 gated.setdefault(name, []).append(label)
     return gated
+
+
+_GLOB_CHARS = ("*", "?", "[")
+
+
+def _always_global_covers(always_global: set[str], gated_skill: str) -> bool:
+    """Is an overlay-gated literal skill ALSO always-global, glob-aware?
+
+    The runtime's ``_global_install_allowed`` decides "is this skill always-global"
+    via ``fnmatch`` of the skill name against every always-global pattern, so an
+    ``allow_global`` rule granting ``beads-*`` makes the literal ``beads-br``
+    always-global on EVERY box. An overlay rule that then names ``beads-br`` IS the
+    global-vs-overlay contradiction this lint exists to catch, but a plain
+    exact-string set intersection misses it because ``beads-br != beads-*``.
+
+    So we match like the runtime: exact membership first (the common case), then
+    fnmatch the gated literal name against any always-global entry that carries a
+    glob metacharacter. Glob-vs-glob is left to exact membership (two glob patterns
+    are "the same global grant" only when identical), mirroring the install path
+    which fnmatches concrete skill names, not patterns, against the allowlist.
+    """
+    import fnmatch  # noqa: PLC0415
+
+    if gated_skill in always_global:
+        return True
+    for entry in always_global:
+        if any(ch in entry for ch in _GLOB_CHARS) and fnmatch.fnmatchcase(gated_skill, entry):
+            return True
+    return False
 
 
 def validate_global_overlay_precedence(
@@ -1737,7 +1790,9 @@ def validate_global_overlay_precedence(
             )
         ]
 
-    conflicts = sorted(name for name in overlay_gated if name in always_global)
+    conflicts = sorted(
+        name for name in overlay_gated if _always_global_covers(always_global, name)
+    )
 
     if conflicts:
         offenders = {name: overlay_gated[name] for name in conflicts}
@@ -1830,8 +1885,16 @@ def validate_global_overlay_precedence_file(
 REGISTRY_PATH_DUPLICATION_CODE = "registry-path-duplication"
 
 
-def _registry_id_path_index() -> dict[str, str]:
-    """Map every current-machine resolved repo path -> the registry id that owns it.
+def _registry_id_resolved_paths() -> dict[str, set[str]]:
+    """Map each registry id -> the FULL set of resolved spellings it expands to.
+
+    This is the equality basis for the duplication lint (bug y8w-fix). A literal
+    ``paths:`` entry is only a no-op-replaceable duplicate of ``repos: [<id>]``
+    when the rule's literals enumerate the WHOLE resolved set of that id; a single
+    home-form spelling like ``~/repos/buildooor`` is a strict SUBSET of the id's
+    resolved set (which on a machine with ``~/repos`` repo roots also includes the
+    ``/srv/.../buildooor`` re-rooting), so swapping it for ``repos:`` would WIDEN
+    the match set — a real behavior change the lint must NOT recommend.
 
     Reuses ``skill_visibility``'s registry loader + the SAME machine-aware
     id->path resolution the evaluator uses, so this lint can never disagree with
@@ -1842,7 +1905,7 @@ def _registry_id_path_index() -> dict[str, str]:
     """
     from . import skill_visibility as sv  # noqa: PLC0415
 
-    index: dict[str, str] = {}
+    by_id: dict[str, set[str]] = {}
     try:
         entries = sv._load_registry_entries()
     except Exception:  # pragma: no cover - defensive: registry never breaks the lint
@@ -1856,9 +1919,10 @@ def _registry_id_path_index() -> dict[str, str]:
             resolved_paths = sv._resolve_registry_path(declared)
         except Exception:  # pragma: no cover - defensive
             continue
-        for resolved in resolved_paths:
-            index.setdefault(resolved, repo_id)
-    return index
+        resolved_set = {p for p in resolved_paths if p}
+        if resolved_set:
+            by_id.setdefault(repo_id, set()).update(resolved_set)
+    return by_id
 
 
 def _resolve_literal_scope_path(raw_path: str) -> str:
@@ -1872,20 +1936,33 @@ def validate_registry_path_duplication(
     *,
     policy_path: str | None = None,
 ) -> list[CheckResult]:
-    """Flag a raw ``paths:`` entry that a registry id already covers.
+    """Flag raw ``paths:`` that a registry id covers EXACTLY (no-op replaceable).
 
     Raw ``paths:`` stay fully supported for back-compat — this lint does NOT fail
-    them; it WARNS so the duplication a registry id makes redundant is visibly
-    discouraged, not silently allowed. For each rule's literal ``paths:`` it
-    resolves the path on the current machine and checks whether a registry id's
-    resolved path set already covers it; if so it names the rule, the redundant
-    path, and the covering registry id, and states the fix: replace the literal
-    with ``repos: [<id>]`` so the repo is named ONCE (bead y8w.3).
+    them; it WARNS so a duplication a registry id makes redundant is visibly
+    discouraged, not silently allowed. BUT it only warns when migrating to
+    ``repos: [<id>]`` would be BEHAVIOR-PRESERVING.
+
+    The subtlety (the y8w fix): a registry id resolves to a SET of spellings on
+    the current machine — its home-relative form PLUS every re-rooting under the
+    machine's repo roots (e.g. ``buildooor`` -> ``~/repos/buildooor`` AND
+    ``/srv/.../buildooor`` on a ``~/repos``-rooted box). A literal path like
+    ``~/repos/buildooor`` matches only ONE of those spellings. Replacing that one
+    literal with ``repos: [buildooor]`` would WIDEN the rule's match set to the
+    whole superset — a real behavior change. So a literal that is a strict SUBSET
+    of an id's resolved set is INTENTIONALLY narrower and must NOT be flagged.
+
+    Therefore the lint groups each rule's resolved literal ``paths:`` by the
+    registry id whose resolved set contains them, and warns for a ``(rule, id)``
+    pair ONLY when the rule's literals under that id ENUMERATE the id's FULL
+    resolved set (set equality, not membership). At equality the swap is a no-op on
+    every machine, so naming the repo once via ``repos: [<id>]`` is purely
+    redundant — exactly what we want to discourage.
 
     Machine-aware: a path written in another machine's canonical form (which does
-    not resolve to a registry path on THIS box) simply will not match the index,
-    so the lint never nags about known-foreign spellings. An empty/unreadable
-    registry yields a PASS (nothing to compare against).
+    not resolve to a registry path on THIS box) simply will not match any id's
+    resolved set, so the lint never nags about known-foreign spellings. An
+    empty/unreadable registry yields a PASS (nothing to compare against).
     """
     if not isinstance(policy, dict):
         return [
@@ -1896,8 +1973,8 @@ def validate_registry_path_duplication(
             )
         ]
 
-    index = _registry_id_path_index()
-    if not index:
+    id_resolved = _registry_id_resolved_paths()
+    if not id_resolved:
         return [
             CheckResult(
                 status="pass",
@@ -1914,18 +1991,31 @@ def validate_registry_path_duplication(
         raw_paths = rule.get("paths") or rule.get("allowed_paths") or []
         if isinstance(raw_paths, str):
             raw_paths = [raw_paths]
+        # Map each resolved literal back to its original text, so the report can
+        # name the exact literal(s) a `repos:` swap would replace.
+        resolved_to_text: dict[str, str] = {}
         for raw_path in raw_paths:
             text = str(raw_path).strip()
             if not text:
                 continue
-            resolved = _resolve_literal_scope_path(text)
-            covering_id = index.get(resolved)
-            if covering_id:
+            resolved_to_text.setdefault(_resolve_literal_scope_path(text), text)
+        resolved_literals = set(resolved_to_text)
+        if not resolved_literals:
+            continue
+        for registry_id, resolved_set in sorted(id_resolved.items()):
+            covered = resolved_literals & resolved_set
+            # Only a no-op swap warrants a warning: the rule's literals must
+            # enumerate the id's FULL resolved set. A strict subset is the
+            # deliberately-narrower case (e.g. home-form-only) and is left alone.
+            if covered and covered == resolved_set:
+                paths_text = ", ".join(
+                    resolved_to_text[resolved] for resolved in sorted(covered)
+                )
                 redundant.append(
                     {
                         "rule": rule_id,
-                        "path": text,
-                        "registry_id": covering_id,
+                        "path": paths_text,
+                        "registry_id": registry_id,
                     }
                 )
 
