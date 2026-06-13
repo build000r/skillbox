@@ -690,6 +690,19 @@ class TestSyncSkillRepoSets(unittest.TestCase):
             self.assertIn(f"write-lockfile: {lock_path}", first_actions)
             self.assertIn(f"lockfile-unchanged: {lock_path}", second_actions)
 
+    def test_filtered_copy_skill_replaces_existing_symlink_to_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = _write_skill(root / "source-skills", "beads-br", "# Beads\n")
+            target = root / "installed" / "beads-br"
+            target.parent.mkdir(parents=True)
+            target.symlink_to(source, target_is_directory=True)
+
+            filtered_copy_skill(source, target)
+
+            self.assertFalse(target.is_symlink())
+            self.assertEqual((target / "SKILL.md").read_text(encoding="utf-8"), "# Beads\n")
+
     def test_sync_mirrors_agent_skill_targets_to_host_home_when_configured(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -700,6 +713,13 @@ class TestSyncSkillRepoSets(unittest.TestCase):
             clone_root = root / "clones"
             install_root = root / "state" / "home" / ".codex" / "skills"
             host_home = root / "host-home"
+            host_skills = host_home / ".codex" / "skills"
+            host_skills.mkdir(parents=True)
+            (host_skills / ".system").mkdir()
+            (host_skills / "old-skill").symlink_to(install_root / "old-skill", target_is_directory=True)
+            manual_skill = root / "manual" / "skill"
+            manual_skill.mkdir(parents=True)
+            (host_skills / "manual-skill").symlink_to(manual_skill, target_is_directory=True)
             config_path.write_text(
                 "version: 2\n"
                 "skill_repos:\n"
@@ -707,9 +727,18 @@ class TestSyncSkillRepoSets(unittest.TestCase):
                 "    pick: [ntm]\n",
                 encoding="utf-8",
             )
+            write_json_file(lock_path, {
+                "version": SKILL_REPOS_LOCKFILE_VERSION,
+                "config_sha": "old",
+                "synced_at": "2026-01-01T00:00:00+00:00",
+                "skills": [{"name": "old-skill"}],
+            })
             model = _skill_repo_set_model(config_path, lock_path, clone_root, install_root)
+            model["env"] = {"SKILLBOX_HOST_HOME_ROOT": str(host_home)}
 
-            with mock.patch.dict(os.environ, {"SKILLBOX_HOST_HOME_ROOT": str(host_home)}):
+            with mock.patch.dict(os.environ, {"SKILLBOX_HOST_HOME_ROOT": ""}):
+                dry_actions = sync_skill_repo_sets(model, dry_run=True)
+                self.assertTrue((host_skills / "old-skill").is_symlink())
                 actions = sync_skill_repo_sets(model, dry_run=False)
 
             installed = install_root / "ntm"
@@ -717,7 +746,13 @@ class TestSyncSkillRepoSets(unittest.TestCase):
             self.assertTrue((installed / "SKILL.md").is_file())
             self.assertTrue(mirrored.is_symlink())
             self.assertEqual(mirrored.resolve(), installed.resolve())
+            self.assertTrue((host_skills / ".system").is_dir())
+            self.assertFalse((host_skills / "old-skill").is_symlink())
+            self.assertTrue((host_skills / "manual-skill").is_symlink())
+            self.assertIn(f"mirror-host-skill: ntm -> {mirrored}", dry_actions)
+            self.assertIn(f"mirror-host-skill-would-remove: old-skill -> {host_skills / 'old-skill'}", dry_actions)
             self.assertIn(f"mirror-host-skill: ntm -> {mirrored}", actions)
+            self.assertIn(f"mirror-host-skill-remove: old-skill -> {host_skills / 'old-skill'}", actions)
 
     def test_sync_dry_run_records_repo_install_plan_and_defers_lockfile_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

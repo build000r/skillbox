@@ -3631,8 +3631,14 @@ def _print_overlay_text(payload: dict[str, Any]) -> None:
         return
 
     name = str(payload.get("name") or "")
+    dry_run = bool(payload.get("dry_run"))
     now_on = name in current
-    state = "activated" if action == "activate" else ("on" if now_on else "off")
+    if action == "activate":
+        state = "would activate" if dry_run else "activated"
+    elif dry_run:
+        state = "would turn on" if now_on else "would turn off"
+    else:
+        state = "on" if now_on else "off"
     print(f"overlay {name}: {state}")
     if current:
         print("all on:", ", ".join(current))
@@ -3641,7 +3647,8 @@ def _print_overlay_text(payload: dict[str, Any]) -> None:
     if removed:
         print(f"unlinked: {len(removed)} symlinks")
     if activations:
-        print(f"activated: {len(activations)} skills")
+        activation_label = "would activate" if dry_run and action == "activate" else "activated"
+        print(f"{activation_label}: {len(activations)} skills")
         for activation in activations:
             _print_activation_packet_text(activation)
 
