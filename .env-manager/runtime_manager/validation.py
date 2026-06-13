@@ -1647,6 +1647,186 @@ def validate_overlay_declarations_file(
     return validate_overlay_declarations(policy, policy_path=str(resolved))
 
 
+GLOBAL_OVERLAY_PRECEDENCE_CODE = "global-overlay-precedence"
+
+
+def _policy_always_global_skills(policy: dict[str, Any]) -> set[str]:
+    """The always-global skill set: ``global_allowlist`` ∪ allow_global rules.
+
+    These are linked into every repo unconditionally (layer 1+2 of the global
+    skill contract). Both sources are unioned so the precedence lint stays
+    correct even mid-edit, before ``validate_global_skill_contract`` has been
+    re-reconciled (that lint owns the *equality* of the two; this one only needs
+    membership).
+    """
+    return _scope_global_allowlist(policy) | _scope_allow_global_union(policy)
+
+
+def _policy_overlay_gated_skills(policy: dict[str, Any]) -> dict[str, list[str]]:
+    """Map each overlay-gated skill -> the rule ids (with overlay tag) gating it.
+
+    A rule is overlay-gated when it carries a non-empty ``overlay:`` tag. The
+    skill is recorded with a ``<rule_id> (overlay: <tag>)`` provenance label so a
+    precedence failure can point at the exact offending rule + overlay.
+    """
+    gated: dict[str, list[str]] = {}
+    for rule in policy.get("rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        tag = str(rule.get("overlay") or "").strip()
+        if not tag:
+            continue
+        rule_id = str(rule.get("id") or "").strip() or "(unnamed rule)"
+        label = f"{rule_id} (overlay: {tag})"
+        for skill in rule.get("skills") or []:
+            name = str(skill).strip()
+            if name:
+                gated.setdefault(name, []).append(label)
+    return gated
+
+
+def validate_global_overlay_precedence(
+    policy: dict[str, Any],
+    *,
+    policy_path: str | None = None,
+) -> list[CheckResult]:
+    """Assert no skill is BOTH always-global AND overlay-gated.
+
+    The global skill contract has a strict precedence (repos-sbp-policy-estate-
+    oh1.2): an always-global skill -- one granted by an ``allow_global: true``
+    rule (the dispatcher core + ``operator-global-exceptions``, e.g.
+    ``divide-and-conquer``) or listed in ``global_allowlist`` -- is linked into
+    EVERY repo unconditionally. Flipping a mode-pack overlay can neither add nor
+    remove it. **Global wins.**
+
+    Therefore an overlay rule only meaningfully adds NON-global skills. Naming an
+    already-global skill in an overlay rule is ambiguous noise: it implies the
+    overlay gates a skill it cannot actually gate (the global layer already
+    provides it everywhere, overlay on or off), and it invites a reader to think
+    toggling the overlay changes that skill's availability. It does not.
+
+    This lint makes that contradiction loud. It intersects the always-global set
+    with the overlay-gated set:
+
+        always_global(policy)  ∩  overlay_gated(policy)  ==  ∅
+
+    On any overlap it FAILS, naming each double-declared skill, the overlay
+    rule(s) that gate it, and the fix (drop it from the overlay rule; the global
+    layer already provides it). An empty policy (no global surface and no
+    overlay-gated rules) is a PASS, mirroring the sibling lints' empty-policy
+    posture. Declared-but-distinct sets are a PASS.
+    """
+    if not isinstance(policy, dict):
+        return [
+            CheckResult(
+                status="pass",
+                code=GLOBAL_OVERLAY_PRECEDENCE_CODE,
+                message="no skill-scope policy to validate",
+            )
+        ]
+
+    always_global = _policy_always_global_skills(policy)
+    overlay_gated = _policy_overlay_gated_skills(policy)
+
+    if not always_global and not overlay_gated:
+        return [
+            CheckResult(
+                status="pass",
+                code=GLOBAL_OVERLAY_PRECEDENCE_CODE,
+                message="skill-scope policy declares no global/overlay surface",
+            )
+        ]
+
+    conflicts = sorted(name for name in overlay_gated if name in always_global)
+
+    if conflicts:
+        offenders = {name: overlay_gated[name] for name in conflicts}
+        offender_text = "; ".join(
+            f"{name} (gated by {', '.join(rule_labels)})"
+            for name, rule_labels in offenders.items()
+        )
+        location = f" in {policy_path}" if policy_path else ""
+        return [
+            CheckResult(
+                status="fail",
+                code=GLOBAL_OVERLAY_PRECEDENCE_CODE,
+                message=(
+                    f"global-vs-overlay precedence conflict{location}: {offender_text}. "
+                    "A skill that is always-global (granted by an allow_global rule or "
+                    "global_allowlist) is linked into every repo unconditionally; an "
+                    "overlay cannot add or remove it (global wins). Naming it in an "
+                    "overlay rule is ambiguous. "
+                    "Fix: drop the skill from the overlay rule (the global layer already "
+                    "provides it everywhere), or remove its global grant if it should be "
+                    "overlay-gated instead."
+                ),
+                details={
+                    "conflicts": conflicts,
+                    "offending_overlay_rules": offenders,
+                    "always_global": sorted(always_global),
+                    "overlay_gated": sorted(overlay_gated),
+                },
+            )
+        ]
+
+    return [
+        CheckResult(
+            status="pass",
+            code=GLOBAL_OVERLAY_PRECEDENCE_CODE,
+            message=(
+                "no global/overlay precedence conflict "
+                f"({len(always_global)} always-global skill(s), "
+                f"{len(overlay_gated)} overlay-gated skill(s), disjoint)"
+            ),
+            details={
+                "always_global": sorted(always_global),
+                "overlay_gated": sorted(overlay_gated),
+            },
+        )
+    ]
+
+
+def validate_global_overlay_precedence_file(
+    policy_path: Path | str | None = None,
+) -> list[CheckResult]:
+    """Load skill-scope.yaml and run :func:`validate_global_overlay_precedence`.
+
+    Convenience wrapper for doctor / CLI callers, mirroring
+    :func:`validate_overlay_declarations_file`: resolves the canonical
+    ``skill-scope.yaml`` (or an explicit path), parses it, and runs the
+    precedence lint. A missing policy file is a pass (nothing to enforce); a
+    parse failure is a fail.
+    """
+    resolved = Path(policy_path) if policy_path else _skill_scope_policy_path()
+    if not resolved.is_file():
+        return [
+            CheckResult(
+                status="pass",
+                code=GLOBAL_OVERLAY_PRECEDENCE_CODE,
+                message=f"no skill-scope policy found at {resolved}",
+            )
+        ]
+    try:
+        policy = load_yaml(resolved)
+    except RuntimeError as exc:
+        return [
+            CheckResult(
+                status="fail",
+                code=GLOBAL_OVERLAY_PRECEDENCE_CODE,
+                message=f"could not parse skill-scope policy at {resolved}: {exc}",
+            )
+        ]
+    if not isinstance(policy, dict):
+        return [
+            CheckResult(
+                status="fail",
+                code=GLOBAL_OVERLAY_PRECEDENCE_CODE,
+                message=f"skill-scope policy at {resolved} is not a mapping",
+            )
+        ]
+    return validate_global_overlay_precedence(policy, policy_path=str(resolved))
+
+
 REGISTRY_PATH_DUPLICATION_CODE = "registry-path-duplication"
 
 
