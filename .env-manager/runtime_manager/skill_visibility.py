@@ -1102,6 +1102,26 @@ def _add_skill_visibility_recommendation(
     recommendations.append(item)
 
 
+def _recommendation_provenance(item: dict[str, Any], issue_type: str) -> dict[str, Any]:
+    """Pull the four canonical provenance fields off an (enriched) issue row.
+
+    The issue rows have already been stamped by ``_enrich_issue_rows`` with
+    ``type``/``rule_id``/``policy_path``/``origin``/``fix_command``; this mirrors
+    them onto the suggestion so a recommendation is actionable on its own,
+    falling back to the upstream ``scope_rule``/``scope_policy_path`` if an
+    unenriched row is passed in.
+    """
+    return {
+        "issue_type": str(item.get("type") or issue_type),
+        "rule_id": item.get("rule_id") if item.get("rule_id") is not None else item.get("scope_rule"),
+        "policy_path": item.get("policy_path") if item.get("policy_path") is not None else item.get("scope_policy_path"),
+        "origin": item.get("origin"),
+        "fix_command": str(
+            item.get("fix_command") or _issue_row_fix_command(issue_type, item)
+        ),
+    }
+
+
 def _skill_visibility_recommendations(issues: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
     recommendations: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
@@ -1112,9 +1132,13 @@ def _skill_visibility_recommendations(issues: dict[str, list[dict[str, Any]]]) -
             "scope_rule": item.get("scope_rule"),
             "target": "project_or_client_skill_repos",
             "allowed_paths": item.get("allowed_paths") or [],
+            **_recommendation_provenance(item, "missing_for_cwd"),
             "hint": (
-                "Add this skill to the active client's skill-repos.yaml or install it "
-                "under a repo-local .claude/skills or .codex/skills in one of the allowed paths."
+                "Add this skill to the active client's skill-repos.yaml, or activate it "
+                "for this cwd ephemerally with `sbp skill activate <skill> --cwd <repo>`. "
+                "Use `sbp overlay activate <name> --cwd <repo>` for a one-session/cwd "
+                "policy-evaluated flip, or `sbp overlay on <name>` to PERSIST the overlay "
+                "across sessions until `overlay off`."
             ),
         })
     for item in issues.get("scope_violations") or []:
@@ -1124,6 +1148,7 @@ def _skill_visibility_recommendations(issues: dict[str, list[dict[str, Any]]]) -
             "scope_rule": item.get("scope_rule"),
             "source_path": item.get("path"),
             "allowed_paths": item.get("allowed_paths") or [],
+            **_recommendation_provenance(item, "scope_violations"),
             "hint": "Move this project-local install under an allowed repo path, or unlink it here.",
         })
     for item in issues.get("global_not_allowed") or []:
@@ -1131,6 +1156,7 @@ def _skill_visibility_recommendations(issues: dict[str, list[dict[str, Any]]]) -
             "action": "move_global_to_project",
             "skill": item.get("name"),
             "source_path": item.get("path"),
+            **_recommendation_provenance(item, "global_not_allowed"),
             "hint": (
                 "Remove this user-global install or add an explicit allow_global rule "
                 "if it really should be available in every repo."
@@ -1141,6 +1167,7 @@ def _skill_visibility_recommendations(issues: dict[str, list[dict[str, Any]]]) -
             "action": "declare_or_unlink_global",
             "skill": item.get("name"),
             "source_path": item.get("path"),
+            **_recommendation_provenance(item, "extra_global"),
             "hint": "Declare this skill in the global policy or remove the user-global link.",
         })
     return recommendations
@@ -3095,6 +3122,112 @@ def _visibility_issue_groups(
     }
 
 
+# Issue groups whose rows describe a non-broken installed/global skill link
+# (broken_* rows are already classified by the broken-link taxonomy and get
+# their fix_command/origin from ``_enrich_broken_links``).
+_BROKEN_ISSUE_TYPES = ("broken_global", "broken_project")
+
+
+def _issue_row_fix_command(issue_type: str, row: dict[str, Any]) -> str:
+    """The EXACT copy-pasteable command that resolves one issue row.
+
+    Broken rows already carry a taxonomy ``fix_command`` (relink/prune/migrate/
+    investigate) from ``_enrich_broken_links``; reuse it verbatim. Every other
+    issue type maps to the one narrowest manage.py command an agent can run
+    without re-deriving anything from the policy.
+    """
+    name = str(row.get("name") or "")
+    path = str(row.get("path") or "")
+    if issue_type in _BROKEN_ISSUE_TYPES:
+        existing = str(row.get("fix_command") or "")
+        if existing:
+            return existing
+        # Defensive: an unenriched broken row defaults to prune (mirrors
+        # ``broken_link_class_counts`` / ``_classified_broken_rows``).
+        return f"rm {path}  # prune dead link {name!r}" if path else ""
+    if issue_type == "missing_for_cwd":
+        return f"sbp skill activate {name} --cwd <repo>"
+    if issue_type == "scope_violations":
+        return f"sbp skill remove {name} --from project --cwd {path or '<repo>'} --yes"
+    if issue_type == "global_not_allowed":
+        return f"sbp skill remove {name} --from global --yes"
+    if issue_type == "extra_global":
+        return f"sbp skill remove {name} --from global --yes"
+    if issue_type == "archive_sources":
+        return (
+            f"copy {name!r} into skills-private, then repoint its source root "
+            f"(stale archive copy at {row.get('source') or path})"
+        )
+    if issue_type == "shadowed":
+        return (
+            f"review the {name!r} declarations; unlink the lower-precedence layer "
+            "if the shadow is unintended"
+        )
+    return ""
+
+
+def _enrich_issue_rows(
+    issues: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Stamp every issue row with the four act-without-re-derivation fields.
+
+    EVERY row in every group gains, in place:
+      * ``type``        — the issue group it belongs to (the dict key).
+      * ``rule_id``     — the matched/violated skill-scope rule id, when the row
+                          carries one (``scope_rule`` for scope/missing rows).
+      * ``policy_path`` — the policy file that rule came from (``scope_policy_path``).
+      * ``origin``      — broken-link triage class (other-machine/moved/dangling/
+                          unreadable) for broken rows; ``None`` otherwise.
+      * ``fix_command`` — the exact copy-pasteable command to resolve the row.
+
+    The data already exists internally (scope rows carry ``scope_rule`` /
+    ``scope_policy_path``; broken rows are pre-classified by
+    ``_enrich_broken_links``); this surfaces it at the serialization boundary so
+    an audit row is actionable on its own.
+
+    Each group's rows are REPLACED with shallow copies before stamping. A single
+    occurrence dict can belong to more than one group (``global_not_allowed`` and
+    ``extra_global`` filter the same installed-link list), so mutating the shared
+    dict in place would make ``type``/``fix_command`` last-writer-wins and wrong
+    for one of the groups. Copying per group keeps every row's provenance
+    self-consistent without disturbing the shared ``occurrences`` list. Mutates
+    and returns ``issues``.
+    """
+    for issue_type, rows in issues.items():
+        enriched: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                enriched.append(row)
+                continue
+            new_row = dict(row)
+            new_row["type"] = issue_type
+            # rule provenance: prefer an already-resolved scope_rule/policy_path,
+            # falling back to whatever the row already declared so we never blank
+            # a value that was set upstream.
+            new_row["rule_id"] = (
+                row.get("rule_id")
+                if row.get("rule_id") is not None
+                else row.get("scope_rule")
+            )
+            new_row["policy_path"] = (
+                row.get("policy_path")
+                if row.get("policy_path") is not None
+                else row.get("scope_policy_path")
+            )
+            # origin only applies to the broken-link taxonomy; non-broken rows
+            # carry an explicit None so the key is always present (stable schema).
+            if issue_type in _BROKEN_ISSUE_TYPES:
+                new_row["origin"] = row.get("origin") or "dangling"
+            else:
+                new_row.setdefault("origin", None)
+            new_row["fix_command"] = row.get("fix_command") or _issue_row_fix_command(
+                issue_type, new_row
+            )
+            enriched.append(new_row)
+        issues[issue_type] = enriched
+    return issues
+
+
 def _visibility_name_count(items: list[dict[str, Any]]) -> int:
     return len({str(item.get("name")) for item in items})
 
@@ -3397,6 +3530,9 @@ def collect_skill_visibility(
         effective,
         shadowed,
     )
+    # Surface rule provenance + origin + an exact fix_command on EVERY issue row
+    # so each row is actionable without re-deriving anything from the policy.
+    _enrich_issue_rows(issues)
     if include_sources:
         undefined_sources, source_roots = _undefined_source_skills(model, occurrences)
     else:
@@ -3618,21 +3754,36 @@ def _skill_audit_has_repo_issues(repo: dict[str, Any]) -> bool:
     return any(int(value) > 0 for value in (repo.get("issues") or {}).values())
 
 
-def _classified_broken_rows(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _classified_broken_rows(
+    items: list[dict[str, Any]],
+    *,
+    issue_type: str = "broken_project",
+) -> list[dict[str, Any]]:
     """Compact per-link taxonomy rows for the audit (one row per broken link).
 
-    Each row carries the classification a triager acts on: ``name``, ``path``,
-    ``origin``, ``suggested_action`` and the exact ``fix_command``. ``origin``
-    defaults to ``dangling`` if an item was never enriched, mirroring
-    :func:`broken_link_class_counts`.
+    Each row carries the classification a triager acts on plus the rule
+    provenance every audit row now guarantees: ``type``, ``name``, ``path``,
+    ``rule_id``, ``policy_path``, ``origin``, ``suggested_action`` and the exact
+    ``fix_command``. ``origin`` defaults to ``dangling`` if an item was never
+    enriched, mirroring :func:`broken_link_class_counts`. ``rule_id`` /
+    ``policy_path`` are usually ``None`` for broken links (a dead symlink has no
+    matched scope rule) but are emitted for a stable, self-describing schema.
     """
     rows: list[dict[str, Any]] = []
     for item in items:
         rows.append(
             {
+                # Use the caller's group as the authoritative type: a single
+                # occurrence dict can be a member of more than one issue group
+                # (e.g. global_not_allowed AND extra_global share the same dict),
+                # so the in-place ``type`` stamp is last-writer-wins and unsafe
+                # to trust here.
+                "type": issue_type,
                 "name": str(item.get("name") or ""),
                 "path": str(item.get("path") or ""),
                 "link_target": str(item.get("link_target") or ""),
+                "rule_id": item.get("rule_id") if item.get("rule_id") is not None else item.get("scope_rule"),
+                "policy_path": item.get("policy_path") if item.get("policy_path") is not None else item.get("scope_policy_path"),
                 "origin": str(item.get("origin") or "dangling"),
                 "suggested_action": str(
                     item.get("suggested_action")
@@ -3643,6 +3794,39 @@ def _classified_broken_rows(items: list[dict[str, Any]]) -> list[dict[str, Any]]
         )
     # Stable order: group by class, then by path, so repeated migrations cluster.
     rows.sort(key=lambda row: (row["origin"], row["path"]))
+    return rows
+
+
+def _classified_issue_rows(
+    items: list[dict[str, Any]],
+    issue_type: str,
+) -> list[dict[str, Any]]:
+    """Provenance rows for a non-broken issue group in the fleet audit.
+
+    The fleet audit historically flattened ``missing_for_cwd`` /
+    ``scope_violations`` to a bare list of skill names (``_skill_names``), which
+    threw away the rule id, policy path, and fix command — exactly the data a
+    downstream agent needs. This keeps the compact name list AND emits a parallel
+    rows list so ``--format json`` carries the full provenance for each row.
+    """
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        # The caller's group is authoritative for both ``type`` and the derived
+        # ``fix_command``: a shared occurrence dict (global_not_allowed AND
+        # extra_global) has a last-writer-wins in-place ``type``/``fix_command``,
+        # so re-derive from ``issue_type`` rather than trusting the stamp.
+        rows.append(
+            {
+                "type": issue_type,
+                "name": str(item.get("name") or ""),
+                "path": str(item.get("path") or ""),
+                "rule_id": item.get("rule_id") if item.get("rule_id") is not None else item.get("scope_rule"),
+                "policy_path": item.get("policy_path") if item.get("policy_path") is not None else item.get("scope_policy_path"),
+                "origin": item.get("origin"),
+                "fix_command": _issue_row_fix_command(issue_type, item),
+            }
+        )
+    rows.sort(key=lambda row: (row["name"], row["path"]))
     return rows
 
 
@@ -3687,13 +3871,24 @@ def _skill_audit_repo_row(
             if str(item.get("id") or "")
         ],
         "issues": _skill_audit_issue_counts(issues, SKILL_AUDIT_REPO_ISSUE_KEYS),
+        # Compact name lists (back-compat for human/summary surfaces) ...
         "missing_for_cwd": _skill_names(issues.get("missing_for_cwd") or []),
         "scope_violations": _skill_names(issues.get("scope_violations") or []),
         "broken_project": _skill_names(issues.get("broken_project") or []),
+        # ... plus the full provenance rows (rule_id/policy_path/origin/fix_command)
+        # so every audit row is actionable without re-deriving from the policy.
+        "missing_for_cwd_rows": _classified_issue_rows(
+            issues.get("missing_for_cwd") or [], "missing_for_cwd"
+        ),
+        "scope_violation_rows": _classified_issue_rows(
+            issues.get("scope_violations") or [], "scope_violations"
+        ),
         # Per-link triage taxonomy + counts-by-class so the audit answers
         # "what kind of broken is this" (relink / prune / migrate / investigate)
         # rather than re-listing N undifferentiated names.
-        "broken_project_links": _classified_broken_rows(issues.get("broken_project") or []),
+        "broken_project_links": _classified_broken_rows(
+            issues.get("broken_project") or [], issue_type="broken_project"
+        ),
         "broken_project_by_class": broken_link_class_counts(issues.get("broken_project") or []),
     })
     return row
@@ -3713,7 +3908,17 @@ def _skill_audit_global_row(model: dict[str, Any], cwd: str | None) -> dict[str,
         "broken_global": _skill_names(issues.get("broken_global") or []),
         "global_not_allowed": _skill_names(issues.get("global_not_allowed") or []),
         "extra_global": _skill_names(issues.get("extra_global") or []),
-        "broken_global_links": _classified_broken_rows(issues.get("broken_global") or []),
+        # Full provenance rows mirror the per-repo audit so the global block also
+        # carries rule_id/policy_path/origin/fix_command on every issue row.
+        "global_not_allowed_rows": _classified_issue_rows(
+            issues.get("global_not_allowed") or [], "global_not_allowed"
+        ),
+        "extra_global_rows": _classified_issue_rows(
+            issues.get("extra_global") or [], "extra_global"
+        ),
+        "broken_global_links": _classified_broken_rows(
+            issues.get("broken_global") or [], issue_type="broken_global"
+        ),
         "broken_global_by_class": broken_link_class_counts(issues.get("broken_global") or []),
     }
 
