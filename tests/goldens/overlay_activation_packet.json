@@ -1,0 +1,35 @@
+{
+  "_comment": "Golden SHAPE for one overlay-activation entry returned by activate_overlay_scoped_skills (see tests/test_overlay_regression.py). Locks the activation-packet contract: entry keys, packet keys, the two agent surfaces, and the per-skill summary for a single broad-only marketing skill (broad-mk) activated into a repo that matches ONLY the broad path rule. Absolute paths (source/destination/skill_md_path/surface_targets values) are intentionally NOT pinned -- they live under a pytest tmp tree. The skill_md_sha256 IS pinned because it is content-only (sha256 of the SKILL.md text the test writes). Regenerate only when the activation-packet shape deliberately changes.",
+  "skill": "broad-mk",
+  "skill_md": "---\nname: broad-mk\ndescription: marketing fixture skill broad-mk.\n---\n# broad-mk\n",
+  "summary": {
+    "actions": 2,
+    "link": 2,
+    "blocked": 0
+  },
+  "warnings": [],
+  "entry_keys": [
+    "actions",
+    "activation_packet",
+    "skill",
+    "summary",
+    "warnings"
+  ],
+  "activation_packet_keys": [
+    "instructions",
+    "name",
+    "skill_md",
+    "skill_md_path",
+    "skill_md_sha256",
+    "source",
+    "source_bucket",
+    "surface_targets"
+  ],
+  "surfaces": [
+    "claude",
+    "codex"
+  ],
+  "links_per_surface": 1,
+  "packet_name": "broad-mk",
+  "source_bucket": "external"
+}
