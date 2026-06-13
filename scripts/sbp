@@ -787,6 +787,8 @@ PY
     ;;
   fleet)
     # `sbp fleet converge [...]` -> read-only per-repo heal PLAN (no apply).
+    # `sbp fleet relink  [...]` -> machine-migration link rewrite (dry-run by
+    #                              default; --yes applies the rewrites).
     fleet_action="${passthrough_args[0]:-converge}"
     if [[ "${fleet_action}" == --* ]]; then
       fleet_action="converge"
@@ -800,8 +802,11 @@ PY
       converge)
         python3 .env-manager/manage.py fleet converge "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${fleet_args[@]}"
         ;;
+      relink)
+        python3 .env-manager/manage.py fleet relink "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${fleet_args[@]}"
+        ;;
       *)
-        echo "${wrapper_name} fleet: unknown action '${fleet_action}' (expected converge)" >&2
+        echo "${wrapper_name} fleet: unknown action '${fleet_action}' (expected converge|relink)" >&2
         exit 2
         ;;
     esac
