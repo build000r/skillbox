@@ -1,0 +1,59 @@
+{
+  "_doc": "Baseline-capture golden for the fixture-fleet harness (tests/fixture_fleet.py). Locks CURRENT behavior of collect_skill_visibility / collect_skill_audit / skill_lifecycle_plan against an unchanged runtime. Keyed by repo/skill NAME (never absolute temp paths) so it is reproducible across machines. Regenerate intentionally only when a runtime visibility change is deliberate; an unexpected diff here means a visibility surface moved.",
+  "resolution": {
+    "overlay-repo": {
+      "matched_scope_rules": ["frontend-local"],
+      "matched_project_categories": ["frontend"],
+      "effective": ["tiny-marketing", "tiny-ui"],
+      "missing_for_cwd": [],
+      "broken_project": []
+    },
+    "healthy": {
+      "matched_scope_rules": ["cli-local"],
+      "matched_project_categories": ["cli"],
+      "effective": ["tiny-cli", "tiny-ui"],
+      "missing_for_cwd": [],
+      "broken_project": []
+    },
+    "dangling": {
+      "broken_project": ["ghost"]
+    },
+    "other-machine": {
+      "broken_project": ["tiny-ui"]
+    }
+  },
+  "beads": {
+    "repo": "healthy",
+    "activated_skill": "needs-beads",
+    "required": true,
+    "required_skills": ["needs-beads"],
+    "initialized": false
+  },
+  "audit": {
+    "summary": {
+      "candidate_repos": 4,
+      "reported_repos": 4,
+      "repos_with_issues": 3,
+      "missing_repos": 0,
+      "broken_project": 2,
+      "scope_violations": 1,
+      "missing_for_cwd": 1,
+      "global_not_allowed": 1,
+      "extra_global": 1
+    },
+    "repos": {
+      "healthy": {"categories": ["cli"], "broken_project": []},
+      "overlay-repo": {"categories": ["frontend"], "broken_project": []},
+      "dangling": {"categories": [], "broken_project": ["ghost"]},
+      "other-machine": {"categories": [], "broken_project": ["tiny-ui"]}
+    }
+  },
+  "apply_plan": {
+    "add_cli_to_cli_repo": {
+      "summary": {"actions": 2, "link": 2, "blocked": 0}
+    },
+    "add_cli_to_frontend_repo_blocked": {
+      "summary": {"actions": 2, "link": 2, "blocked": 2}
+    }
+  }
+}
