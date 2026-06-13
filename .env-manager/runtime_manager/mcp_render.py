@@ -33,7 +33,11 @@ Design guarantees (mirroring the audit's stance):
 
 The user-global ``~/.codex/config.toml`` is intentionally OUT OF SCOPE: it is
 operator-managed and this renderer only ever touches a repo/config root's
-``.codex/config.toml`` (and ``.mcp.json``), never the home-global file.
+``.codex/config.toml`` (and ``.mcp.json``), never the home-global file. This is
+ENFORCED (not merely documented): :func:`collect_mcp_render` resolves the target
+and, if the Codex surface path equals ``~/.codex/config.toml`` (which happens for
+``mcp sync --cwd ~`` when home has no ``.git`` ancestor), the surface is REFUSED
+and never written — see :func:`_is_user_global_codex`.
 """
 
 from __future__ import annotations
@@ -63,8 +67,34 @@ from .workflows import requested_mcp_servers, selected_mcp_server_configs
 
 
 # The home-global Codex config is explicitly operator-managed; this renderer
-# refuses to write it. Documented here and enforced in :func:`render_mcp_sync`.
+# refuses to write it. Documented here and enforced in :func:`collect_mcp_render`
+# / :func:`render_mcp_sync` via :func:`_is_user_global_codex`.
 USER_GLOBAL_CODEX_REL = Path(".codex") / "config.toml"
+# The home-global Claude config is likewise operator-managed and out of scope.
+USER_GLOBAL_CLAUDE_REL = Path(".claude.json")
+
+
+def _is_user_global_codex(path: Path, *, home: Path | None = None) -> bool:
+    """True iff ``path`` resolves to the operator's global ``~/.codex/config.toml``.
+
+    A ``mcp sync --cwd ~`` (a cwd with no ``.git`` ancestor above home) resolves
+    the Codex target to exactly this file, which is the operator's global Codex
+    source of truth. The renderer must NEVER overwrite it lossily, so we refuse.
+    """
+    base = (home if home is not None else Path.home())
+    try:
+        return path.expanduser().resolve() == (base / USER_GLOBAL_CODEX_REL).expanduser().resolve()
+    except (OSError, RuntimeError):  # pragma: no cover - resolve edge cases
+        return False
+
+
+def _is_user_global_claude(path: Path, *, home: Path | None = None) -> bool:
+    """True iff ``path`` resolves to the operator's global ``~/.claude.json``."""
+    base = (home if home is not None else Path.home())
+    try:
+        return path.expanduser().resolve() == (base / USER_GLOBAL_CLAUDE_REL).expanduser().resolve()
+    except (OSError, RuntimeError):  # pragma: no cover - resolve edge cases
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +289,54 @@ def _toml_table_key(name: str) -> str:
     return json.dumps(name)
 
 
+def _emit_server_body(name: str, body: dict[str, Any], *, cwd: str) -> list[str]:
+    """Faithfully emit one ``[mcp_servers.<name>]`` table from its body.
+
+    The body is re-emitted LOSSLESSLY so no operator/declared key is dropped:
+
+      * ``command`` then ``args`` first (Codex's conventional ordering), then
+        every OTHER scalar/list key in a stable (sorted) order — e.g.
+        ``startup_timeout_ms``, and for http-type servers ``type``/``url``/
+        ``headers``/``bearer_token_env_var``;
+      * each nested-dict key as its own ``[mcp_servers.<name>.<subtable>]``
+        (recursively, so ``env`` is just one such subtable and a deeper
+        ``tools.<x>`` table survives too).
+
+    The machine-resolved ``cwd`` is injected ONLY when the body has no ``cwd``
+    of its own — an operator's explicit ``cwd`` always wins. ``cwd`` is never
+    forced onto a body that carries no ``command`` (e.g. an http-type server),
+    so we don't brick a remote server with a bogus working directory.
+    """
+    table = f"[mcp_servers.{_toml_table_key(name)}]"
+    lines: list[str] = [table]
+
+    scalars = {k: v for k, v in body.items() if not isinstance(v, dict)}
+    nested = {k: v for k, v in body.items() if isinstance(v, dict)}
+
+    # command / args first (conventional Codex ordering), then the remaining
+    # scalar/list keys in a stable order so renders are byte-identical.
+    if "command" in scalars:
+        lines.append(f"command = {_toml_value(scalars['command'])}")
+    if "args" in scalars and scalars["args"]:
+        lines.append(f"args = {_toml_value(list(scalars['args']))}")
+
+    has_own_cwd = "cwd" in scalars
+    # Inject the machine-resolved cwd only when the body lacks its own and it
+    # is a launched (command-based) server. Operator cwd wins; remote/http
+    # servers (no command) are never given a working directory.
+    if not has_own_cwd and "command" in scalars:
+        lines.append(f"cwd = {_toml_value(cwd)}")
+
+    for key in sorted(k for k in scalars if k not in {"command", "args"}):
+        lines.append(f"{_toml_table_key(key)} = {_toml_value(scalars[key])}")
+
+    for key in sorted(nested):
+        prefix = f"mcp_servers.{_toml_table_key(name)}"
+        lines.extend(_emit_toml_section(key, nested[key], prefix=prefix))
+
+    return lines
+
+
 def render_codex_toml(
     servers: dict[str, dict[str, Any]],
     *,
@@ -267,32 +345,19 @@ def render_codex_toml(
 ) -> str:
     """Render ``.codex/config.toml`` text from the merged server map.
 
-    ``preamble`` carries any preserved non-MCP TOML (``[features]``,
-    ``[apps.*]``) verbatim so operator-managed Codex sections survive a sync.
-    Each ``[mcp_servers.<name>]`` table gets ``command``/``args``/``env`` from
-    the declaration plus the machine-resolved ``cwd``.
+    ``preamble`` carries any preserved non-MCP TOML (top-level scalars like
+    ``model``/``approval_policy`` plus tables like ``[features]``/``[apps.*]``)
+    verbatim so operator-managed Codex sections survive a sync. Each
+    ``[mcp_servers.<name>]`` table is re-emitted FAITHFULLY from its body (see
+    :func:`_emit_server_body`); the machine-resolved ``cwd`` is injected only
+    when the body carries no ``cwd`` of its own.
     """
     lines: list[str] = []
     if preamble.strip():
         lines.append(preamble.rstrip("\n"))
         lines.append("")
     for name in sorted(servers):
-        body = servers[name]
-        lines.append(f"[mcp_servers.{_toml_table_key(name)}]")
-        command = body.get("command")
-        if command is not None:
-            lines.append(f"command = {_toml_value(command)}")
-        args = body.get("args")
-        if args:
-            lines.append(f"args = {_toml_value(list(args))}")
-        # Machine-resolved repo root so Codex launches the server in the right
-        # place; never a foreign /Users/b path on a devbox.
-        lines.append(f"cwd = {_toml_value(cwd)}")
-        env = body.get("env")
-        if isinstance(env, dict) and env:
-            lines.append(f"[mcp_servers.{_toml_table_key(name)}.env]")
-            for key in sorted(env):
-                lines.append(f"{_toml_table_key(key)} = {_toml_value(env[key])}")
+        lines.extend(_emit_server_body(name, servers[name], cwd=cwd))
         lines.append("")
     text = "\n".join(lines).rstrip("\n") + "\n"
     return text
@@ -320,12 +385,23 @@ def _codex_preamble(doc: dict[str, Any], raw_text: str) -> str:
 
 
 def _render_preserved_sections(doc: dict[str, Any]) -> str:
-    """Emit every top-level TOML section EXCEPT ``mcp_servers`` verbatim-ish."""
+    """Emit every top-level TOML entry EXCEPT ``mcp_servers`` verbatim-ish.
+
+    Top-level SCALAR keys (``model = "gpt-5.5"``, ``approval_policy``,
+    ``sandbox_mode``, ``cli_auth_credentials_store`` …) are emitted FIRST, as
+    bare ``key = value`` lines, because in TOML any key after a ``[table]``
+    header belongs to that table. Then every nested table is emitted. Without
+    the leading scalars, those settings were silently dropped on every sync.
+    """
     lines: list[str] = []
-    for key in doc:
-        if key == "mcp_servers":
-            continue
-        lines.extend(_emit_toml_section(key, doc[key]))
+    top_scalars = {k: v for k, v in doc.items() if k != "mcp_servers" and not isinstance(v, dict)}
+    top_tables = {k: v for k, v in doc.items() if k != "mcp_servers" and isinstance(v, dict)}
+    for key in top_scalars:
+        lines.append(f"{_toml_table_key(key)} = {_toml_value(top_scalars[key])}")
+    if top_scalars and top_tables:
+        lines.append("")
+    for key in top_tables:
+        lines.extend(_emit_toml_section(key, top_tables[key]))
     return "\n".join(lines).rstrip("\n")
 
 
@@ -381,6 +457,20 @@ def collect_mcp_render(
     claude_path = target_root / CLAUDE_MCP_REL
     codex_path = target_root / CODEX_MCP_REL
 
+    # SAFETY GUARD: never overwrite the operator's home-global Codex/Claude
+    # source-of-truth. A `mcp sync --cwd ~` resolves the Codex target to exactly
+    # `~/.codex/config.toml`; writing it would lossily clobber the global config.
+    codex_refused = (
+        "refusing to write the user-global ~/.codex/config.toml (operator-managed)"
+        if _is_user_global_codex(codex_path)
+        else None
+    )
+    claude_refused = (
+        "refusing to write the user-global ~/.claude.json (operator-managed)"
+        if _is_user_global_claude(claude_path)
+        else None
+    )
+
     declared, declared_order = canonical_server_map(root_dir, model)
     operator_managed = _operator_managed_servers(model)
     codex_cwd = resolve_codex_cwd(target_root, machines=machines, env=env)
@@ -416,6 +506,7 @@ def collect_mcp_render(
             servers=sorted(claude_servers),
             provenance=claude_prov,
             root_dir=root_dir,
+            refused=claude_refused,
         ),
         "codex": _surface_render_payload(
             name="codex",
@@ -426,6 +517,7 @@ def collect_mcp_render(
             servers=sorted(codex_servers),
             provenance=codex_prov,
             root_dir=root_dir,
+            refused=codex_refused,
         ),
     }
     payload: dict[str, Any] = {
@@ -462,8 +554,11 @@ def _surface_render_payload(
     servers: list[str],
     provenance: dict[str, str],
     root_dir: Path,
+    refused: str | None = None,
 ) -> dict[str, Any]:
-    changed = current != rendered
+    # A refused surface (e.g. the home-global ~/.codex/config.toml) is NEVER
+    # written: report changed=False so apply skips it, and carry the reason.
+    changed = (current != rendered) and not refused
     try:
         rel = repo_rel(root_dir, path)
     except ValueError:
@@ -475,6 +570,8 @@ def _surface_render_payload(
         "rel_path": rel,
         "present": path.is_file(),
         "changed": changed,
+        "refused": bool(refused),
+        "refused_reason": refused,
         "servers": servers,
         "provenance": provenance,
         "rendered": rendered,
@@ -511,8 +608,14 @@ def render_mcp_sync(
     payload["applied"] = bool(apply)
     payload["dry_run"] = not bool(apply)
     written: list[str] = []
+    refused: list[str] = []
     if apply:
         for surface in payload["surfaces"].values():
+            # Defense in depth: never write a refused surface (e.g. the
+            # home-global ~/.codex/config.toml), even if upstream said changed.
+            if surface.get("refused"):
+                refused.append(str(surface["path"]))
+                continue
             if not surface["changed"]:
                 continue
             dest = Path(surface["path"])
@@ -520,6 +623,11 @@ def render_mcp_sync(
             dest.write_text(surface["rendered"], encoding="utf-8")
             written.append(str(dest))
     payload["written"] = written
+    payload["refused"] = sorted(
+        s["path"]
+        for s in payload["surfaces"].values()
+        if s.get("refused")
+    )
     payload["next_actions"] = _render_next_actions(payload, apply=bool(apply))
     return payload
 
@@ -527,9 +635,14 @@ def render_mcp_sync(
 def _render_next_actions(payload: dict[str, Any], *, apply: bool) -> list[str]:
     actions: list[str] = []
     surfaces = payload.get("surfaces") or {}
+    for surface in surfaces.values():
+        if surface.get("refused"):
+            reason = surface.get("refused_reason") or "refused (out of scope)"
+            actions.append(f"skipped {surface['rel_path']}: {reason}")
     changed = [s for s in surfaces.values() if s.get("changed")]
     if not changed:
-        actions.append("mcp config already matches the declaration; nothing to write")
+        if not actions:
+            actions.append("mcp config already matches the declaration; nothing to write")
         return actions
     if apply:
         for surface in changed:
