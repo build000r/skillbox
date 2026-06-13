@@ -50,6 +50,7 @@ from .shared import (
 from .validation import (
     validate_global_skill_contract_file,
     validate_overlay_declarations_file,
+    validate_registry_path_duplication_file,
     validate_skill_locks_and_state,
     validate_skill_repo_sets,
 )
@@ -246,6 +247,18 @@ def _run_overlay_declaration(ctx: DoctorContext) -> tuple[str, str]:
     return status, detail
 
 
+def _run_registry_path_duplication(ctx: DoctorContext) -> tuple[str, str]:
+    """The registry-path-duplication lint (validation.validate_registry_path_duplication).
+
+    WARNS (never FAILs — raw paths stay supported for back-compat) when a rule's
+    literal ``paths:`` entry is already covered by a registry id, so the
+    duplication a `repos: [<id>]` would remove is visibly discouraged.
+    """
+    results = validate_registry_path_duplication_file()
+    status, detail, _ = _checkresults_status(results)
+    return status, detail
+
+
 # Codes emitted by the lock-parity concern (config_sha desync + downstream
 # install state) so the lock gate and the policy gate don't double-count.
 _LOCK_CODES = frozenset({"skill-repo-lock", "skill-repo-install"})
@@ -385,6 +398,17 @@ def _gate_specs() -> tuple[_GateSpec, ...]:
                 "or correct the rule's overlay tag so every overlay: tag is declared"
             ),
             runner=_run_overlay_declaration,
+        ),
+        _GateSpec(
+            name="registry_path_duplication",
+            kind=KIND_STRUCTURE,
+            cap_s=CAP_FAST_LINT,
+            fix_command=(
+                "replace a duplicated literal path in skillbox-config/skill-scope.yaml "
+                "with `repos: [<id>]` so the repo's per-machine path is derived from "
+                "registry/repos.yaml + machines.yaml (bead y8w.3)"
+            ),
+            runner=_run_registry_path_duplication,
         ),
         _GateSpec(
             name="lock_parity",

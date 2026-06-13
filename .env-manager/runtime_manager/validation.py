@@ -1647,6 +1647,178 @@ def validate_overlay_declarations_file(
     return validate_overlay_declarations(policy, policy_path=str(resolved))
 
 
+REGISTRY_PATH_DUPLICATION_CODE = "registry-path-duplication"
+
+
+def _registry_id_path_index() -> dict[str, str]:
+    """Map every current-machine resolved repo path -> the registry id that owns it.
+
+    Reuses ``skill_visibility``'s registry loader + the SAME machine-aware
+    id->path resolution the evaluator uses, so this lint can never disagree with
+    what ``repos:`` would resolve to. Returns ``{}`` when the registry is
+    unreadable (lazy import keeps validation import-cycle-free). Lazy-imported
+    inside the function because ``skill_visibility`` imports back through this
+    package's ``shared`` surface.
+    """
+    from . import skill_visibility as sv  # noqa: PLC0415
+
+    index: dict[str, str] = {}
+    try:
+        entries = sv._load_registry_entries()
+    except Exception:  # pragma: no cover - defensive: registry never breaks the lint
+        return {}
+    for entry in entries:
+        repo_id = str(entry.get("id") or "").strip()
+        declared = str(entry.get("path") or "").strip()
+        if not repo_id or not declared:
+            continue
+        try:
+            resolved_paths = sv._resolve_registry_path(declared)
+        except Exception:  # pragma: no cover - defensive
+            continue
+        for resolved in resolved_paths:
+            index.setdefault(resolved, repo_id)
+    return index
+
+
+def _resolve_literal_scope_path(raw_path: str) -> str:
+    from . import skill_visibility as sv  # noqa: PLC0415
+
+    return sv._expand_policy_path(raw_path)
+
+
+def validate_registry_path_duplication(
+    policy: dict[str, Any],
+    *,
+    policy_path: str | None = None,
+) -> list[CheckResult]:
+    """Flag a raw ``paths:`` entry that a registry id already covers.
+
+    Raw ``paths:`` stay fully supported for back-compat — this lint does NOT fail
+    them; it WARNS so the duplication a registry id makes redundant is visibly
+    discouraged, not silently allowed. For each rule's literal ``paths:`` it
+    resolves the path on the current machine and checks whether a registry id's
+    resolved path set already covers it; if so it names the rule, the redundant
+    path, and the covering registry id, and states the fix: replace the literal
+    with ``repos: [<id>]`` so the repo is named ONCE (bead y8w.3).
+
+    Machine-aware: a path written in another machine's canonical form (which does
+    not resolve to a registry path on THIS box) simply will not match the index,
+    so the lint never nags about known-foreign spellings. An empty/unreadable
+    registry yields a PASS (nothing to compare against).
+    """
+    if not isinstance(policy, dict):
+        return [
+            CheckResult(
+                status="pass",
+                code=REGISTRY_PATH_DUPLICATION_CODE,
+                message="no skill-scope policy to validate",
+            )
+        ]
+
+    index = _registry_id_path_index()
+    if not index:
+        return [
+            CheckResult(
+                status="pass",
+                code=REGISTRY_PATH_DUPLICATION_CODE,
+                message="no registry id->path index available on this machine",
+            )
+        ]
+
+    redundant: list[dict[str, str]] = []
+    for rule in policy.get("rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        rule_id = str(rule.get("id") or "(unnamed rule)").strip()
+        raw_paths = rule.get("paths") or rule.get("allowed_paths") or []
+        if isinstance(raw_paths, str):
+            raw_paths = [raw_paths]
+        for raw_path in raw_paths:
+            text = str(raw_path).strip()
+            if not text:
+                continue
+            resolved = _resolve_literal_scope_path(text)
+            covering_id = index.get(resolved)
+            if covering_id:
+                redundant.append(
+                    {
+                        "rule": rule_id,
+                        "path": text,
+                        "registry_id": covering_id,
+                    }
+                )
+
+    location = f" in {policy_path}" if policy_path else ""
+    if redundant:
+        offender_text = "; ".join(
+            f"rule {item['rule']!r} path {item['path']!r} is covered by registry id "
+            f"{item['registry_id']!r}"
+            for item in redundant
+        )
+        return [
+            CheckResult(
+                status="warn",
+                code=REGISTRY_PATH_DUPLICATION_CODE,
+                message=(
+                    f"raw path(s) duplicate a registry id{location}: {offender_text}. "
+                    "Fix: replace the literal path with `repos: [<id>]` so the repo is "
+                    "named once and its per-machine path is derived from "
+                    "registry/repos.yaml + machines.yaml (bead y8w.3)."
+                ),
+                details={"redundant": redundant},
+            )
+        ]
+
+    return [
+        CheckResult(
+            status="pass",
+            code=REGISTRY_PATH_DUPLICATION_CODE,
+            message="no raw path duplicates a registry id",
+        )
+    ]
+
+
+def validate_registry_path_duplication_file(
+    policy_path: Path | str | None = None,
+) -> list[CheckResult]:
+    """Load skill-scope.yaml and run :func:`validate_registry_path_duplication`.
+
+    Mirrors :func:`validate_global_skill_contract_file`: resolves the canonical
+    ``skill-scope.yaml`` (or an explicit path), parses it, and runs the
+    registry-path-duplication lint. A missing policy file is a pass; a parse
+    failure is a fail.
+    """
+    resolved = Path(policy_path) if policy_path else _skill_scope_policy_path()
+    if not resolved.is_file():
+        return [
+            CheckResult(
+                status="pass",
+                code=REGISTRY_PATH_DUPLICATION_CODE,
+                message=f"no skill-scope policy found at {resolved}",
+            )
+        ]
+    try:
+        policy = load_yaml(resolved)
+    except RuntimeError as exc:
+        return [
+            CheckResult(
+                status="fail",
+                code=REGISTRY_PATH_DUPLICATION_CODE,
+                message=f"could not parse skill-scope policy at {resolved}: {exc}",
+            )
+        ]
+    if not isinstance(policy, dict):
+        return [
+            CheckResult(
+                status="fail",
+                code=REGISTRY_PATH_DUPLICATION_CODE,
+                message=f"skill-scope policy at {resolved} is not a mapping",
+            )
+        ]
+    return validate_registry_path_duplication(policy, policy_path=str(resolved))
+
+
 def _forge_root_dir(model: dict[str, Any]) -> Path:
     root_dir = str(model.get("root_dir") or "").strip()
     if root_dir:
