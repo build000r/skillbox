@@ -2379,6 +2379,300 @@ def global_home_surfaces_report() -> list[dict[str, Any]]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Claude <-> Codex skill-surface parity
+# ---------------------------------------------------------------------------
+#
+# sbp's core promise is that BOTH agents see the same world. That promise was
+# only ever audited for MCP (mcp_visibility.collect_mcp_audit / _parity_payload).
+# The functions below extend the identical parity-drift reporting pattern to the
+# global *skill* surfaces: the effective skill sets exposed under
+# ``.claude/skills`` vs ``.codex/skills`` across every resolved global home
+# (resolve_global_homes()). Output mirrors the MCP parity block shape
+# (``claude_only`` / ``codex_only`` / ``shared``) so an agent can ``jq`` either
+# audit the same way.
+#
+# ``_shared`` is the cross-root payload link skills depend on (see fixture_fleet
+# and the live skills-private/_shared chain); it is not a real skill, so it is
+# excluded from the parity diff by default and surfaced separately under
+# ``ignored`` for transparency.
+
+SKILL_PARITY_IGNORED_NAMES = ("_shared",)
+
+
+def _global_surface_entry_sets(
+    *,
+    home_root_env: str | None = None,
+) -> tuple[dict[str, set[str]], list[dict[str, Any]]]:
+    """Union of installed skill entry names per global surface across homes.
+
+    Walks every resolved global home (``resolve_global_homes``) and, for each
+    ``GLOBAL_HOME_SURFACES`` surface (``claude`` / ``codex``), unions the entry
+    names visible in that surface's ``.<surface>/skills`` root. Roots whose
+    ``realpath`` collapses to one another (the symlinked two-home layout) are
+    counted once so a shared dir is never double-attributed.
+
+    Returns ``(by_surface, roots)`` where ``by_surface`` maps a surface name to
+    the set of entry names seen there, and ``roots`` is the ordered per-(home,
+    surface) detail used for the audit's home breakdown.
+    """
+    by_surface: dict[str, set[str]] = {surface: set() for surface in GLOBAL_HOME_SURFACES}
+    roots: list[dict[str, Any]] = []
+    seen_real: set[str] = set()
+    for home in resolve_global_homes(home_root_env=home_root_env):
+        for surface in GLOBAL_HOME_SURFACES:
+            root = Path(home["home"]) / f".{surface}" / "skills"
+            real = _realpath(root)
+            collapsed = real in seen_real
+            seen_real.add(real)
+            names = _global_root_entry_names(root)
+            roots.append(
+                {
+                    "origin": str(home["origin"]),
+                    "surface": surface,
+                    "root": str(root),
+                    "realpath": real,
+                    "present": root.is_dir(),
+                    "collapsed": collapsed,
+                    "entries": names,
+                }
+            )
+            # A realpath-collapsed root has already contributed its entries via
+            # the first home that owns it; unioning again is harmless (it is the
+            # same set) but skipping keeps the per-surface union honest about
+            # distinct roots only.
+            if not collapsed:
+                by_surface[surface].update(names)
+    return by_surface, roots
+
+
+def collect_skill_parity(
+    *,
+    home_root_env: str | None = None,
+    ignored_names: tuple[str, ...] = SKILL_PARITY_IGNORED_NAMES,
+) -> dict[str, Any]:
+    """Diff the effective GLOBAL skill sets of Claude vs Codex.
+
+    The skill-surface analogue of ``mcp_visibility.collect_mcp_audit``'s parity
+    block. It answers the question the MCP audit answers for servers, for
+    skills: which global skills does ONE agent see that the OTHER does not?
+
+    The shape mirrors ``mcp_visibility._parity_payload`` so callers (and ``jq``
+    pipelines) treat skill drift and MCP drift identically:
+
+    * ``claude_only`` / ``codex_only`` / ``shared`` — the partition.
+    * ``in_sync`` — convenience boolean (no divergence).
+    * ``ignored`` — entries excluded from the diff (e.g. the ``_shared`` payload
+      link), reported so the exclusion is never silent.
+    * ``homes`` — per-(home, surface) root detail (origin, realpath, entries,
+      whether the root realpath-collapsed) so an operator can see exactly which
+      home contributes which divergence.
+    * ``summary`` — counts mirroring the MCP audit summary block.
+
+    Read-only: it scans the resolved homes and never mutates anything.
+    """
+    by_surface, roots = _global_surface_entry_sets(home_root_env=home_root_env)
+    ignore = set(ignored_names)
+
+    claude_all = by_surface.get("claude", set())
+    codex_all = by_surface.get("codex", set())
+    claude_set = claude_all - ignore
+    codex_set = codex_all - ignore
+
+    claude_only = sorted(claude_set - codex_set)
+    codex_only = sorted(codex_set - claude_set)
+    shared = sorted(claude_set & codex_set)
+    ignored = sorted((claude_all | codex_all) & ignore)
+
+    return {
+        "claude_only": claude_only,
+        "codex_only": codex_only,
+        "shared": shared,
+        "ignored": ignored,
+        "in_sync": not claude_only and not codex_only,
+        "homes": roots,
+        "summary": {
+            "claude_total": len(claude_set),
+            "codex_total": len(codex_set),
+            "shared": len(shared),
+            "claude_only": len(claude_only),
+            "codex_only": len(codex_only),
+            "divergent": len(claude_only) + len(codex_only),
+            "ignored": len(ignored),
+        },
+    }
+
+
+def skill_parity_next_actions(parity: dict[str, Any]) -> list[str]:
+    """Operator-review actions for the skill parity block.
+
+    Mirrors ``mcp_visibility._mcp_next_actions``' parity advice: name the
+    divergent skills and point at the (operator-reviewed) relink dry-run. These
+    are *suggestions for an operator to review*, never an auto-apply.
+    """
+    actions: list[str] = []
+    claude_only = parity.get("claude_only") or []
+    codex_only = parity.get("codex_only") or []
+    if claude_only:
+        actions.append(
+            "mirror Claude-only global skills into the Codex surface (or unlink if obsolete): "
+            + ", ".join(claude_only)
+        )
+    if codex_only:
+        actions.append(
+            "mirror Codex-only global skills into the Claude surface (or unlink if obsolete): "
+            + ", ".join(codex_only)
+        )
+    if claude_only or codex_only:
+        actions.append(
+            "review the symmetric-layout relink plan (DRY RUN, no live mutation): "
+            "skill_visibility.relink_global_homes_to_symmetric_layout()"
+        )
+    return actions
+
+
+# Which layout hooks the OS home's per-agent skill surfaces to the managed home.
+# See skillbox-config/docs/HOME_LAYOUT.md for the decision + rationale. The
+# canonical layout is ``directory-symlink``: ``<home>/.<surface>/skills`` is a
+# single symlink to the managed surface dir, so the two agents share ONE inode
+# and can never drift entry-by-entry.
+SKILL_HOME_CANONICAL_LAYOUT = "directory-symlink"
+
+
+def _classify_surface_layout(root: Path) -> str:
+    """Classify how a ``.<surface>/skills`` root is hooked up.
+
+    * ``dir-symlink``  — the skills dir itself is a symlink (canonical layout).
+    * ``per-entry``    — a real dir whose entries are individual symlinks.
+    * ``real-dir``     — a real dir holding real (non-symlink) skill dirs.
+    * ``missing``      — the root does not exist.
+    """
+    if not os.path.lexists(root):
+        return "missing"
+    if root.is_symlink():
+        return "dir-symlink"
+    if not root.is_dir():
+        return "missing"
+    try:
+        entries = [e for e in root.iterdir() if not e.name.startswith(".")]
+    except OSError:
+        return "real-dir"
+    if entries and all(e.is_symlink() for e in entries):
+        return "per-entry"
+    return "real-dir"
+
+
+def relink_global_homes_to_symmetric_layout(
+    *,
+    home_root_env: str | None = None,
+    target_layout: str = SKILL_HOME_CANONICAL_LAYOUT,
+    managed_home_root: str | None = None,
+) -> dict[str, Any]:
+    """DRY-RUN: describe the relinks that WOULD make the global homes symmetric.
+
+    This function NEVER mutates the filesystem. It computes the relink plan that
+    would converge every resolved global home's per-agent skill surfaces onto
+    the canonical ``directory-symlink`` layout (a single
+    ``<home>/.<surface>/skills`` symlink into the managed surface dir), so Claude
+    and Codex share one inode and cannot drift entry-by-entry.
+
+    Applying the plan against LIVE operator homes is an operator-reviewed step,
+    deliberately out of scope here: callers get the planned actions to review,
+    not a mutation. ``managed_home_root`` (defaults to ``SKILLBOX_HOME_ROOT``)
+    names the managed home whose ``.<surface>/skills`` dirs are the link targets.
+
+    Returns ``{"dry_run": True, "target_layout", "managed_home", "actions",
+    "summary"}`` where each action is ``{op: "relink", surface, home_origin,
+    link, current_layout, would_point_to, reason}``.
+    """
+    if target_layout != SKILL_HOME_CANONICAL_LAYOUT:
+        raise RuntimeError(
+            f"unsupported target layout {target_layout!r}; "
+            f"only {SKILL_HOME_CANONICAL_LAYOUT!r} is supported"
+        )
+
+    raw_managed = managed_home_root
+    if raw_managed is None:
+        raw_managed = (
+            os.environ.get(GLOBAL_HOME_ROOT_ENV, "")
+            if home_root_env is None
+            else home_root_env
+        )
+    managed_raw = str(raw_managed or "").strip()
+    managed_home = (
+        Path(os.path.expandvars(os.path.expanduser(managed_raw))) if managed_raw else None
+    )
+
+    actions: list[dict[str, Any]] = []
+    homes = resolve_global_homes(home_root_env=home_root_env)
+    for home in homes:
+        origin = str(home["origin"])
+        for surface in GLOBAL_HOME_SURFACES:
+            root = Path(home["home"]) / f".{surface}" / "skills"
+            layout = _classify_surface_layout(root)
+            # The managed home's OWN surface dirs are the canonical link targets;
+            # nothing relinks them onto themselves.
+            target_dir = (
+                managed_home / f".{surface}" / "skills" if managed_home is not None else None
+            )
+            is_managed_self = (
+                managed_home is not None
+                and _realpath(root) == _realpath(target_dir)
+            )
+            already_symmetric = layout == "dir-symlink" and (
+                target_dir is None or _realpath(root) == _realpath(target_dir)
+            )
+            if is_managed_self or already_symmetric:
+                continue
+            # Without a managed home there is no shared target to point at; the
+            # divergence is real but only an operator can pick the target.
+            if target_dir is None:
+                actions.append(
+                    {
+                        "op": "relink",
+                        "surface": surface,
+                        "home_origin": origin,
+                        "link": str(root),
+                        "current_layout": layout,
+                        "would_point_to": None,
+                        "reason": (
+                            "no SKILLBOX_HOME_ROOT managed home is set; an operator must "
+                            "choose the shared target before relinking to the canonical layout"
+                        ),
+                    }
+                )
+                continue
+            actions.append(
+                {
+                    "op": "relink",
+                    "surface": surface,
+                    "home_origin": origin,
+                    "link": str(root),
+                    "current_layout": layout,
+                    "would_point_to": str(target_dir),
+                    "reason": (
+                        f"converge {layout} surface onto the canonical "
+                        f"{SKILL_HOME_CANONICAL_LAYOUT} (single shared inode with the managed home)"
+                    ),
+                }
+            )
+
+    return {
+        "dry_run": True,
+        "target_layout": target_layout,
+        "managed_home": str(managed_home) if managed_home is not None else None,
+        "actions": actions,
+        "summary": {
+            "homes": len(homes),
+            "surfaces": len(GLOBAL_HOME_SURFACES),
+            "relinks_planned": len(actions),
+            "blocked_no_managed_home": sum(
+                1 for action in actions if action.get("would_point_to") is None
+            ),
+        },
+    }
+
+
 def _global_root_entry_names(root: Path) -> list[str]:
     if not root.is_dir():
         return []
@@ -3093,8 +3387,16 @@ def collect_skill_visibility(
     )
     summary["beads_required_skills"] = len(beads.get("required_skills") or [])
     summary["beads_issues"] = len(beads.get("issues") or [])
+    # Claude<->Codex global skill-surface parity: the skill analogue of the MCP
+    # audit's parity block. Only meaningful when global surfaces are in scope.
+    parity = collect_skill_parity() if include_global else {}
+    summary["parity_divergent"] = int((parity.get("summary") or {}).get("divergent") or 0)
+
     next_actions = skill_visibility_next_actions(issues)
     for action in beads.get("next_actions") or []:
+        if action not in next_actions:
+            next_actions.append(action)
+    for action in skill_parity_next_actions(parity):
         if action not in next_actions:
             next_actions.append(action)
 
@@ -3106,6 +3408,7 @@ def collect_skill_visibility(
         "active_clients": model.get("active_clients") or [],
         "active_profiles": model.get("active_profiles") or [],
         "global_surfaces": global_home_surfaces_report() if include_global else [],
+        "parity": parity,
         "layers": sorted(layers, key=lambda item: int(item.get("rank", 0))),
         "source_roots": sorted(source_roots, key=lambda item: str(item.get("path") or "")),
         "effective": effective,
@@ -3445,6 +3748,10 @@ def collect_skill_audit(
             repos.append(row)
 
     global_row = _skill_audit_global_row(model, cwd) if include_global else None
+    # Claude<->Codex global skill-surface parity for the cross-repo audit, mirrored
+    # from the per-cwd visibility payload so `sbp skills audit --format json` shows
+    # the same parity block as `sbp skills`.
+    parity = collect_skill_parity() if include_global else {}
     overlays = _available_skill_overlays(model)
     active = sorted(active_overlays())
     repos_with_issues = [repo for repo in repos if _skill_audit_has_repo_issues(repo)]
@@ -3490,10 +3797,15 @@ def collect_skill_audit(
             "extra_global": int((global_row or {}).get("issues", {}).get("extra_global") or 0),
             "broken_links": sum(broken_by_class.values()),
             "broken_by_class": broken_by_class,
+            "parity_divergent": int((parity.get("summary") or {}).get("divergent") or 0),
         },
         "global": global_row,
+        "parity": parity,
         "repos": repos,
-        "next_actions": _skill_audit_next_actions(repos_with_issues, global_row, overlays, active),
+        "next_actions": [
+            *_skill_audit_next_actions(repos_with_issues, global_row, overlays, active),
+            *skill_parity_next_actions(parity),
+        ],
     }
 
 
@@ -3540,6 +3852,10 @@ def compact_skill_visibility_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "matched_project_categories": payload.get("matched_project_categories") or [],
         "matched_scope_rules": payload.get("matched_scope_rules") or [],
         "summary": payload.get("summary") or {},
+        # Claude<->Codex global skill-surface parity travels in the agent-facing
+        # compact payload too, so `sbp skills --format json | jq '.parity'`
+        # surfaces drift without needing --full.
+        "parity": payload.get("parity") or {},
         "effective": [_compact_skill_visibility_skill(item) for item in payload.get("effective") or []],
         "issues": _compact_skill_visibility_issues(payload),
         "beads": payload.get("beads") or {},
@@ -4041,6 +4357,15 @@ def _print_visibility_header(payload: dict[str, Any], summary: dict[str, Any]) -
         str(item.get("id") or "") for item in payload.get("matched_project_categories") or []
     ) or "(none)"
     print(f"project categories: {categories}")
+    parity = payload.get("parity") or {}
+    if parity.get("claude_only") or parity.get("codex_only"):
+        print(
+            "skill parity: "
+            f"claude_only={_join_or_none(parity.get('claude_only') or [])} "
+            f"codex_only={_join_or_none(parity.get('codex_only') or [])}"
+        )
+    elif parity:
+        print("skill parity: in sync (claude == codex global surfaces)")
     beads = payload.get("beads") or {}
     if beads.get("required"):
         required = ", ".join(
