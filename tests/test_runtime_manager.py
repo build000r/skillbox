@@ -68,12 +68,15 @@ class RuntimeManagerTests(unittest.TestCase):
             pick = entry.get("pick")
             if pick:
                 all_skills.extend(pick)
+        # The global default install set (skill-repos.yaml picks) must equal the
+        # hardened shared-default pack. The client *planning* pack
+        # (HARDENED_CLIENT_PLANNING_SKILLS: domain-planner/reviewer/scaffolder)
+        # is a distinct client-scaffold concern that is no longer bundled into
+        # the global install set, so it is intentionally excluded from this
+        # comparison.
         self.assertEqual(
             sorted(all_skills),
-            sorted(
-                MANAGE_MODULE.HARDENED_SHARED_DEFAULT_SKILLS
-                + MANAGE_MODULE.HARDENED_CLIENT_PLANNING_SKILLS,
-            ),
+            sorted(MANAGE_MODULE.HARDENED_SHARED_DEFAULT_SKILLS),
         )
 
     def test_optional_service_artifact_check_uses_host_path(self) -> None:
