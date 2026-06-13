@@ -1,0 +1,158 @@
+{
+  "classes": [
+    "relink",
+    "prune",
+    "sync",
+    "policy",
+    "mcp"
+  ],
+  "cwd": "<ROOT>/repos_real/overlay-repo",
+  "dry_run": true,
+  "kind": "fleet-converge-plan",
+  "max_depth": 3,
+  "next_actions": [
+    "[relink] rm <ROOT>/repos_real/other-machine/.claude/skills/tiny-ui  # migrate: drop foreign-machine link (target <ROOT>/fake-mac-root/skills/tiny-ui belongs to another machine, not 'devbox-like')",
+    "[prune] rm <ROOT>/repos_real/dangling/.claude/skills/ghost  # prune dead link 'ghost'",
+    "[sync] manage.py skill sync tiny-ui --cwd <ROOT>/repos_real/overlay-repo --dry-run",
+    "[policy] manage.py skill prune --cwd <ROOT>/repos_real/other-machine --from project --dry-run"
+  ],
+  "repos": [
+    {
+      "actions": {
+        "mcp": [],
+        "policy": [],
+        "prune": [
+          {
+            "class": "prune",
+            "command": "rm <ROOT>/repos_real/dangling/.claude/skills/ghost  # prune dead link 'ghost'",
+            "link_target": "<ROOT>/deleted-source",
+            "origin": "dangling",
+            "path": "<ROOT>/repos_real/dangling/.claude/skills/ghost",
+            "skill": "ghost",
+            "suggested_action": "prune"
+          }
+        ],
+        "relink": [],
+        "sync": []
+      },
+      "categories": [],
+      "counts": {
+        "mcp": 0,
+        "policy": 0,
+        "prune": 1,
+        "relink": 0,
+        "sync": 0
+      },
+      "matched_scope_rules": [],
+      "path": "<ROOT>/repos_real/dangling",
+      "sources": [
+        "scan_root:<ROOT>/repos_real"
+      ],
+      "state": "ok",
+      "total": 1
+    },
+    {
+      "actions": {
+        "mcp": [],
+        "policy": [
+          {
+            "allowed_paths": [
+              "<ROOT>/repos_real/overlay-repo"
+            ],
+            "class": "policy",
+            "command": "manage.py skill prune --cwd <ROOT>/repos_real/other-machine --from project --dry-run",
+            "path": "<ROOT>/repos_real/other-machine/.claude/skills/tiny-ui",
+            "policy_edit": "edit rule 'frontend-local' in <ROOT>/skillbox-config/skill-scope.yaml to allow 'tiny-ui' at <ROOT>/repos_real/other-machine",
+            "reason": "installed outside allowed repo path",
+            "scope_policy_path": "<ROOT>/skillbox-config/skill-scope.yaml",
+            "scope_rule": "frontend-local",
+            "skill": "tiny-ui"
+          }
+        ],
+        "prune": [],
+        "relink": [
+          {
+            "class": "relink",
+            "command": "rm <ROOT>/repos_real/other-machine/.claude/skills/tiny-ui  # migrate: drop foreign-machine link (target <ROOT>/fake-mac-root/skills/tiny-ui belongs to another machine, not 'devbox-like')",
+            "link_target": "<ROOT>/fake-mac-root/skills/tiny-ui",
+            "origin": "other-machine",
+            "path": "<ROOT>/repos_real/other-machine/.claude/skills/tiny-ui",
+            "skill": "tiny-ui",
+            "suggested_action": "migrate"
+          }
+        ],
+        "sync": []
+      },
+      "categories": [],
+      "counts": {
+        "mcp": 0,
+        "policy": 1,
+        "prune": 0,
+        "relink": 1,
+        "sync": 0
+      },
+      "matched_scope_rules": [],
+      "path": "<ROOT>/repos_real/other-machine",
+      "sources": [
+        "scan_root:<ROOT>/repos_real"
+      ],
+      "state": "ok",
+      "total": 2
+    },
+    {
+      "actions": {
+        "mcp": [],
+        "policy": [],
+        "prune": [],
+        "relink": [],
+        "sync": [
+          {
+            "class": "sync",
+            "command": "manage.py skill sync tiny-ui --cwd <ROOT>/repos_real/overlay-repo --dry-run",
+            "reason": "skill is expected for this cwd but is not currently effective",
+            "scope_policy_path": "<ROOT>/skillbox-config/skill-scope.yaml",
+            "scope_rule": "frontend-local",
+            "skill": "tiny-ui"
+          }
+        ]
+      },
+      "categories": [
+        "frontend"
+      ],
+      "counts": {
+        "mcp": 0,
+        "policy": 0,
+        "prune": 0,
+        "relink": 0,
+        "sync": 1
+      },
+      "matched_scope_rules": [
+        "frontend-local"
+      ],
+      "path": "<ROOT>/repos_real/overlay-repo",
+      "sources": [
+        "category:frontend",
+        "scan_root:<ROOT>/repos_real"
+      ],
+      "state": "ok",
+      "total": 1
+    }
+  ],
+  "scan_roots": [
+    "<ROOT>/repos_real"
+  ],
+  "summary": {
+    "actions_total": 4,
+    "by_class": {
+      "mcp": 0,
+      "policy": 1,
+      "prune": 1,
+      "relink": 1,
+      "sync": 1
+    },
+    "candidate_repos": 4,
+    "missing_repos": 0,
+    "reported_repos": 3,
+    "repos_with_plan": 3
+  }
+}
