@@ -874,6 +874,244 @@ def _policy_categories_by_id(policy: dict[str, Any]) -> dict[str, dict[str, Any]
     }
 
 
+# --------------------------------------------------------------------------- #
+# Registry id/category -> path resolution (skill-scope `repos:` / `categories:`)
+#
+# A scope rule may name repos by their registry id (``repos: [htma, htma-server]``)
+# and/or by a registry classification (``categories: [backend]`` matching a
+# repo's ``bucket``) instead of hand-listing literal ``paths:``. The id->path
+# taxonomy is the canonical operator registry at
+# ``skillbox-config/registry/repos.yaml`` (the SAME file
+# ``scripts/registry_doctor.py`` validates), and the per-machine path is derived
+# at eval time from ``machines.yaml`` so a policy edit names a repo ONCE.
+#
+# Resolution is ADDITIVE: the resolved paths are appended to whatever literal
+# ``paths:`` the rule already carries and handed to the existing path-matching
+# logic unchanged (``_scope_rule_paths`` -> ``_matching_scope_rule`` /
+# ``_path_prefix_matches``). Raw ``paths:`` keep working untouched.
+# --------------------------------------------------------------------------- #
+
+# Env override pointing directly at a registry/repos.yaml file (test seam +
+# operator escape hatch), mirroring SKILLBOX_MACHINES_FILE.
+REGISTRY_FILE_ENV_VAR = "SKILLBOX_REGISTRY_FILE"
+# repos.yaml lives in the private config repo beside skill-scope.yaml/machines.yaml.
+REGISTRY_FILE_REL = ("registry", "repos.yaml")
+
+
+class RegistryResolutionError(ValueError):
+    """A scope rule named a registry id/category that the registry does not declare.
+
+    The message embeds a fix hint: the nearest declared id (did-you-mean) and the
+    full declared id list, so a typo is self-healing rather than a silent miss.
+    """
+
+
+def _registry_doctor_module() -> Any | None:
+    """Import skillbox-config ``scripts/registry_doctor.py`` (the canonical loader).
+
+    We reuse registry_doctor's ``load_registry``/``normalize_registry`` so ids are
+    validated against the SAME source and parsing logic the registry doctor uses,
+    rather than inventing a second validator. Located relative to the runtime root
+    exactly like ``machines.py`` finds machines.yaml (sibling-of-runtime-root, then
+    the devbox sibling-of-opensource nesting). Best-effort: a missing config repo
+    or PyYAML returns ``None`` so resolution degrades to "no registry" rather than
+    raising on boxes without the private config checked out.
+    """
+    override = globals().get("_registry_doctor_module_override")
+    if override is not None:
+        return override()
+    import importlib.util  # noqa: PLC0415
+
+    here = os.path.abspath(__file__)
+    runtime_root = os.path.dirname(os.path.dirname(os.path.dirname(here)))
+    candidates = [
+        os.path.join(runtime_root, "..", "skillbox-config", "scripts", "registry_doctor.py"),
+        os.path.join(runtime_root, "..", "..", "skillbox-config", "scripts", "registry_doctor.py"),
+    ]
+    for candidate in candidates:
+        path = os.path.abspath(candidate)
+        if not os.path.isfile(path):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location("_skillbox_registry_doctor", path)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+        except Exception:  # pragma: no cover - defensive: missing PyYAML etc.
+            return None
+    return None
+
+
+def _registry_file_path(doctor: Any) -> Path | None:
+    """Resolve the repos.yaml path: env override, else registry_doctor's default."""
+    override = str(os.environ.get(REGISTRY_FILE_ENV_VAR) or "").strip()
+    if override:
+        return Path(os.path.expandvars(os.path.expanduser(override)))
+    default = getattr(doctor, "DEFAULT_REGISTRY", None)
+    if default is not None and Path(default).is_file():
+        return Path(default)
+    return None
+
+
+def _load_registry_entries() -> list[dict[str, Any]]:
+    """Return the registry's repo entries (id/path/bucket/...), or [].
+
+    Reuses registry_doctor.load_registry to read repos.yaml from the canonical
+    location. Each entry keeps its declared (un-expanded) ``path`` so machine
+    translation can re-root it; ``id`` and ``bucket`` drive id/category lookup.
+    """
+    doctor = _registry_doctor_module()
+    if doctor is None:
+        return []
+    registry_path = _registry_file_path(doctor)
+    if registry_path is None or not registry_path.is_file():
+        return []
+    try:
+        payload = doctor.load_registry(registry_path)
+    except Exception:  # pragma: no cover - defensive parse guard
+        return []
+    entries: list[dict[str, Any]] = []
+    for item in payload.get("repos") or []:
+        if isinstance(item, dict) and str(item.get("id") or "").strip():
+            entries.append(item)
+    return entries
+
+
+def _did_you_mean(target: str, candidates: list[str]) -> str | None:
+    """Nearest candidate id by difflib ratio (>=0.6), for the fix hint."""
+    import difflib  # noqa: PLC0415
+
+    matches = difflib.get_close_matches(target, candidates, n=1, cutoff=0.6)
+    return matches[0] if matches else None
+
+
+def _machine_repo_roots() -> list[str]:
+    """Current machine's declared repo roots (expanded), longest-first.
+
+    Empty when machines.yaml is missing or the machine is undetected, in which
+    case registry-id resolution falls back to the registry's home-relative form.
+    """
+    config, machine_id = _machines_classifier()
+    if config is None or not machine_id:
+        return []
+    profile = config.get(machine_id)
+    if profile is None:
+        return []
+    roots = [str(root) for root in profile.repo_roots if str(root).strip()]
+    return sorted(roots, key=len, reverse=True)
+
+
+def _registry_path_remainder(declared_path: str) -> tuple[str, bool]:
+    """Split a registry path into (remainder, was_under_repos_root).
+
+    The registry authors paths home-relative (``~/repos/htma``, ``~/hard/x``).
+    Paths under the ``~/repos`` family get re-rooted under the CURRENT machine's
+    repo roots (so ``htma`` -> ``/srv/skillbox/repos/htma`` on the devbox); paths
+    under other roots (``~/hard/...``) carry no machine mapping and are expanded
+    home-relative as-is. Returns ``("", False)`` when there is no remainder.
+    """
+    expanded = _expand_policy_path(declared_path)
+    home_repos = _expand_policy_path("~/repos")
+    prefix = home_repos.rstrip("/") + "/"
+    if expanded == home_repos:
+        return "", True
+    if expanded.startswith(prefix):
+        return expanded[len(prefix):], True
+    return expanded, False
+
+
+def _resolve_registry_path(declared_path: str) -> list[str]:
+    """Map one registry repo path to every spelling on the CURRENT machine.
+
+    Emits the repo's path under (a) the registry's home-relative form and (b)
+    each of the current machine's repo roots, so the resolved set is a superset
+    of the spellings an operator would otherwise hand-list. All spellings collapse
+    under ``_expand_policy_path``'s ``Path.resolve()`` (e.g. the ``/srv/repos``
+    symlink alias folds into ``/srv/skillbox/repos``), so the EFFECTIVE matched
+    set equals the hand-listed literals — proving back-compat equivalence.
+    """
+    remainder, under_repos = _registry_path_remainder(declared_path)
+    spellings: list[str] = []
+    # (a) home-relative form (the registry's own spelling).
+    spellings.append(declared_path)
+    if under_repos:
+        # (b) re-root the remainder under each current-machine repo root.
+        for root in _machine_repo_roots():
+            spellings.append(os.path.join(root, remainder) if remainder else root)
+    resolved = sorted({_expand_policy_path(item) for item in spellings if str(item).strip()})
+    return resolved
+
+
+def _scope_rule_repo_ids(raw_rule: dict[str, Any]) -> list[str]:
+    return [
+        str(item).strip()
+        for item in _as_list(raw_rule.get("repos"))
+        if str(item).strip()
+    ]
+
+
+def _resolve_scope_rule_repos(
+    repo_ids: list[str],
+    category_ids: list[str],
+    entries: list[dict[str, Any]],
+) -> tuple[list[str], list[str]]:
+    """Resolve registry ids + registry-category ids to current-machine paths.
+
+    ``repos:`` names registry ids directly; ``categories:`` additionally matches a
+    repo's registry ``bucket`` (registry-derived category membership). Returns
+    ``(paths, registry_category_ids_that_matched)``. An unknown ``repos:`` id is a
+    hard :class:`RegistryResolutionError` with a did-you-mean fix hint; a
+    ``categories:`` id that matches no registry bucket is NOT an error here (the
+    policy ``project_categories`` block is the other resolution path for category
+    ids and owns that miss), so this only reports buckets it positively matched.
+    """
+    if not repo_ids and not category_ids:
+        return [], []
+    if not entries:
+        # Registry unreadable: a literal id can't be validated/resolved. Unknown
+        # ids would normally raise; with no registry at all we surface that the
+        # ids could not be resolved rather than silently dropping them, but only
+        # for explicit ``repos:`` (categories degrade to policy resolution).
+        if repo_ids:
+            raise RegistryResolutionError(
+                "cannot resolve repos: "
+                + ", ".join(repr(rid) for rid in repo_ids)
+                + " -- registry/repos.yaml not found or unreadable on this machine."
+            )
+        return [], []
+
+    by_id = {str(entry.get("id")): entry for entry in entries}
+    declared_ids = sorted(by_id)
+    paths: list[str] = []
+
+    for repo_id in repo_ids:
+        entry = by_id.get(repo_id)
+        if entry is None:
+            hint = _did_you_mean(repo_id, declared_ids)
+            suggestion = f"; did you mean {hint!r}?" if hint else ""
+            raise RegistryResolutionError(
+                f"id {repo_id!r} not in registry/repos.yaml{suggestion} "
+                f"declared ids: {', '.join(declared_ids)}"
+            )
+        paths.extend(_resolve_registry_path(str(entry.get("path") or "")))
+
+    matched_categories: list[str] = []
+    for category_id in category_ids:
+        members = [
+            entry for entry in entries
+            if str(entry.get("bucket") or "").strip() == category_id
+        ]
+        if not members:
+            continue
+        matched_categories.append(category_id)
+        for entry in members:
+            paths.extend(_resolve_registry_path(str(entry.get("path") or "")))
+
+    return sorted(set(paths)), matched_categories
+
+
 def _scope_rule_patterns(raw_rule: dict[str, Any]) -> list[str]:
     raw_patterns = raw_rule.get("skills") or raw_rule.get("patterns") or raw_rule.get("names") or []
     return [str(item).strip() for item in raw_patterns if str(item).strip()]
@@ -899,17 +1137,45 @@ def _scope_rule_direct_paths(raw_rule: dict[str, Any]) -> list[str]:
 def _scope_rule_paths(
     raw_rule: dict[str, Any],
     categories: dict[str, dict[str, Any]],
-) -> tuple[list[str], list[str], list[str]]:
+    *,
+    registry_entries: list[dict[str, Any]] | None = None,
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    """Build a rule's effective path list (literal + category + registry).
+
+    Returns ``(paths, category_ids, unknown_categories, repo_ids)``. Resolution
+    order is purely ADDITIVE — literal ``paths:`` first (unchanged), then policy
+    ``project_categories`` expansion (unchanged), then registry ``repos:`` and
+    registry-bucket ``categories:`` expansion appended. The merged set is deduped
+    and sorted, then handed downstream to the EXISTING path matcher untouched.
+    An unknown ``repos:`` id raises :class:`RegistryResolutionError`.
+    """
     category_ids = _scope_rule_category_ids(raw_rule)
+    repo_ids = _scope_rule_repo_ids(raw_rule)
     paths = _scope_rule_direct_paths(raw_rule)
     unknown_categories: list[str] = []
+    matched_policy_categories: set[str] = set()
     for category_id in category_ids:
         category = categories.get(category_id)
         if not category:
-            unknown_categories.append(category_id)
             continue
+        matched_policy_categories.add(category_id)
         paths.extend(str(path) for path in category.get("paths") or [])
-    return sorted(set(paths)), category_ids, unknown_categories
+
+    # Registry-derived expansion: `repos:` ids and registry-bucket `categories:`.
+    if registry_entries is None:
+        registry_entries = _load_registry_entries()
+    registry_paths, registry_categories = _resolve_scope_rule_repos(
+        repo_ids, category_ids, registry_entries
+    )
+    paths.extend(registry_paths)
+
+    # A category id is "unknown" only when NEITHER the policy project_categories
+    # block NOR the registry bucket taxonomy knows it — so a registry-only
+    # category no longer reads as unknown, and a typo still surfaces.
+    known_categories = matched_policy_categories | set(registry_categories)
+    unknown_categories = [cid for cid in category_ids if cid not in known_categories]
+
+    return sorted(set(paths)), category_ids, unknown_categories, repo_ids
 
 
 def _scope_rule_from_raw(
@@ -919,6 +1185,7 @@ def _scope_rule_from_raw(
     policy: dict[str, Any],
     categories: dict[str, dict[str, Any]],
     overlays_on: set[str],
+    registry_entries: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     overlay = str(raw_rule.get("overlay") or "").strip()
     if overlay and overlay not in overlays_on:
@@ -926,12 +1193,15 @@ def _scope_rule_from_raw(
     patterns = _scope_rule_patterns(raw_rule)
     if not patterns:
         return None
-    paths, category_ids, unknown_categories = _scope_rule_paths(raw_rule, categories)
+    paths, category_ids, unknown_categories, repo_ids = _scope_rule_paths(
+        raw_rule, categories, registry_entries=registry_entries
+    )
     return {
         "id": str(raw_rule.get("id") or f"rule-{index}"),
         "patterns": patterns,
         "paths": paths,
         "categories": category_ids,
+        "repos": repo_ids,
         "unknown_categories": unknown_categories,
         "allow_global": bool(raw_rule.get("allow_global", False)),
         "default": raw_rule.get("default", "on"),
@@ -945,6 +1215,9 @@ def _scope_rule_from_raw(
 def _scope_rules(model: dict[str, Any]) -> list[dict[str, Any]]:
     rules: list[dict[str, Any]] = []
     overlays_on = active_overlays()
+    # Load the registry id->path taxonomy once per pass (not per rule) so
+    # `repos:`/registry-`categories:` resolution stays cheap.
+    registry_entries = _load_registry_entries()
     for policy in _operator_scope_policies(model):
         categories = _policy_categories_by_id(policy)
         for index, raw_rule in enumerate(policy.get("rules") or []):
@@ -956,6 +1229,7 @@ def _scope_rules(model: dict[str, Any]) -> list[dict[str, Any]]:
                 policy=policy,
                 categories=categories,
                 overlays_on=overlays_on,
+                registry_entries=registry_entries,
             )
             if rule is not None:
                 rules.append(rule)
