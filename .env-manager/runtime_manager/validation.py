@@ -1279,6 +1279,193 @@ def validate_skill_repo_sets(model: dict[str, Any]) -> list[CheckResult]:
     return results + distribution_results + validate_forge_health(model)
 
 
+GLOBAL_SKILL_CONTRACT_CODE = "global-skill-contract"
+
+
+def _skill_scope_policy_path() -> Path:
+    """Canonical location of the operator skill-scope policy.
+
+    skill-scope.yaml lives in the private config repo (``skillbox-config``),
+    located *relative to* the runtime root rather than at a hard-coded absolute
+    (mirrors how machines.py resolves machines.yaml). We honour an explicit
+    ``SKILLBOX_SKILL_SCOPE_FILE`` override, then fall back to the
+    ``<runtime_root>/../skillbox-config`` and ``<repos_root>/skillbox-config``
+    devbox layouts.
+    """
+    override = str(os.environ.get("SKILLBOX_SKILL_SCOPE_FILE") or "").strip()
+    if override:
+        return Path(os.path.expandvars(os.path.expanduser(override)))
+    runtime_root = DEFAULT_ROOT_DIR
+    for config_root in (
+        runtime_root.parent / "skillbox-config",
+        runtime_root.parent.parent / "skillbox-config",
+    ):
+        candidate = config_root / "skill-scope.yaml"
+        if candidate.is_file():
+            return candidate
+    return runtime_root.parent / "skillbox-config" / "skill-scope.yaml"
+
+
+def _scope_allow_global_union(policy: dict[str, Any]) -> set[str]:
+    """Union of every skill named by a rule with ``allow_global: true``."""
+    union: set[str] = set()
+    for rule in policy.get("rules") or []:
+        if not isinstance(rule, dict) or not bool(rule.get("allow_global", False)):
+            continue
+        for skill in rule.get("skills") or []:
+            name = str(skill).strip()
+            if name:
+                union.add(name)
+    return union
+
+
+def _scope_global_allowlist(policy: dict[str, Any]) -> set[str]:
+    return {
+        str(skill).strip()
+        for skill in policy.get("global_allowlist") or []
+        if str(skill).strip()
+    }
+
+
+def validate_global_skill_contract(
+    policy: dict[str, Any],
+    *,
+    policy_path: str | None = None,
+) -> list[CheckResult]:
+    """Assert the global skill contract is internally consistent.
+
+    The operator's ``skill-scope.yaml`` declares the always-global surface in
+    two hand-synced places: the ``global_allowlist`` list (gates install-path
+    patterns) and every rule carrying ``allow_global: true`` (carries the
+    per-rule scope rationale). These are intentionally kept as separate lists --
+    one is a flat allowlist consumed by the install planner, the other is the
+    structured, commented rule set -- but they describe the *same* canonical
+    global set and can silently drift apart.
+
+    DECISION: rather than collapse to one list (which would lose the per-rule
+    rationale the rules carry and that ``sbp`` reads), this lint keeps both lists
+    and makes drift impossible by asserting they are EQUAL:
+
+        global_allowlist  ==  union(skills of rules where allow_global: true)
+
+    On drift it names exactly which skills are in one list but not the other and
+    states the fix (edit the relevant ``allow_global`` rule and
+    ``global_allowlist`` together). Mirrors the three sources reconciled in the
+    sbp dispatcher contract: dispatcher core + named operator exceptions +
+    mode-pack overlays, where the always-global set is exactly this union.
+    """
+    if not isinstance(policy, dict):
+        return [
+            CheckResult(
+                status="pass",
+                code=GLOBAL_SKILL_CONTRACT_CODE,
+                message="no skill-scope policy to validate",
+            )
+        ]
+
+    allowlist = _scope_global_allowlist(policy)
+    allow_global_union = _scope_allow_global_union(policy)
+
+    # An empty policy (no allowlist and no allow_global rules) is not drift; it
+    # just means this policy does not declare a global surface.
+    if not allowlist and not allow_global_union:
+        return [
+            CheckResult(
+                status="pass",
+                code=GLOBAL_SKILL_CONTRACT_CODE,
+                message="skill-scope policy declares no global skill surface",
+            )
+        ]
+
+    in_allowlist_only = sorted(allowlist - allow_global_union)
+    in_rules_only = sorted(allow_global_union - allowlist)
+
+    if in_allowlist_only or in_rules_only:
+        issues: list[str] = []
+        if in_allowlist_only:
+            issues.append(
+                "in global_allowlist but no allow_global rule grants them: "
+                + ", ".join(in_allowlist_only)
+            )
+        if in_rules_only:
+            issues.append(
+                "granted by an allow_global rule but missing from global_allowlist: "
+                + ", ".join(in_rules_only)
+            )
+        location = f" in {policy_path}" if policy_path else ""
+        return [
+            CheckResult(
+                status="fail",
+                code=GLOBAL_SKILL_CONTRACT_CODE,
+                message=(
+                    f"global skill contract drift{location}: global_allowlist must equal "
+                    "the union of skills from all rules with allow_global: true. "
+                    "Fix: edit the relevant allow_global rule and global_allowlist together "
+                    "so they list the same skills."
+                ),
+                details={
+                    "issues": issues,
+                    "global_allowlist": sorted(allowlist),
+                    "allow_global_union": sorted(allow_global_union),
+                    "in_allowlist_only": in_allowlist_only,
+                    "in_rules_only": in_rules_only,
+                },
+            )
+        ]
+
+    return [
+        CheckResult(
+            status="pass",
+            code=GLOBAL_SKILL_CONTRACT_CODE,
+            message=(
+                "global_allowlist equals the union of allow_global rules "
+                f"({len(allowlist)} operator skills)"
+            ),
+            details={"global_skills": sorted(allowlist)},
+        )
+    ]
+
+
+def validate_global_skill_contract_file(
+    policy_path: Path | str | None = None,
+) -> list[CheckResult]:
+    """Load skill-scope.yaml and run :func:`validate_global_skill_contract`.
+
+    Convenience wrapper for doctor / CLI callers: resolves the canonical
+    ``skill-scope.yaml`` (or an explicit path), parses it, and runs the
+    consistency lint. A missing policy file is a pass (nothing to enforce); a
+    parse failure is a fail.
+    """
+    resolved = Path(policy_path) if policy_path else _skill_scope_policy_path()
+    if not resolved.is_file():
+        return [
+            CheckResult(
+                status="pass",
+                code=GLOBAL_SKILL_CONTRACT_CODE,
+                message=f"no skill-scope policy found at {resolved}",
+            )
+        ]
+    try:
+        policy = load_yaml(resolved)
+    except RuntimeError as exc:
+        return [
+            CheckResult(
+                status="fail",
+                code=GLOBAL_SKILL_CONTRACT_CODE,
+                message=f"could not parse skill-scope policy at {resolved}: {exc}",
+            )
+        ]
+    if not isinstance(policy, dict):
+        return [
+            CheckResult(
+                status="fail",
+                code=GLOBAL_SKILL_CONTRACT_CODE,
+                message=f"skill-scope policy at {resolved} is not a mapping",
+            )
+        ]
+    return validate_global_skill_contract(policy, policy_path=str(resolved))
+
+
 def _forge_root_dir(model: dict[str, Any]) -> Path:
     root_dir = str(model.get("root_dir") or "").strip()
     if root_dir:
