@@ -905,7 +905,10 @@ def _expand_skill_source_patterns(patterns: list[str]) -> list[Path]:
             matches = [expanded]
         for match in matches:
             root = Path(match).resolve()
-            key = str(root)
+            # Dedup by the alias-canonicalized path so a scan-root list that
+            # names both ``/srv/repos`` and ``/srv/skillbox/repos`` (the same
+            # tree, two names) yields ONE root and the fleet walk runs once.
+            key = _canonicalize_repo_path(str(root))
             if key not in seen:
                 seen.add(key)
                 roots.append(root)
@@ -2752,7 +2755,10 @@ def _operator_install_scan_roots(model: dict[str, Any]) -> list[Path]:
     deduped: list[Path] = []
     seen: set[str] = set()
     for root in roots:
-        key = str(root.resolve())
+        # Alias-canonicalize the dedup key so the dual ``/srv/repos`` +
+        # ``/srv/skillbox/repos`` scan-root pair from skill-scope.yaml collapses
+        # to a single resolved root (no double fleet walk, no 2x repo count).
+        key = _canonicalize_repo_path(str(root.resolve()))
         if key in seen:
             continue
         seen.add(key)
@@ -3195,6 +3201,32 @@ def _machines_classifier() -> tuple[Any, str | None]:
     return config, machine_id
 
 
+def _canonicalize_repo_path(path: str) -> str:
+    """Collapse declared symlink/bind aliases to the canonical tree.
+
+    ``/srv/repos`` is a symlink alias of ``/srv/skillbox/repos`` on the devbox,
+    so the same repo can be named two ways. ``machines.canonicalize_alias`` folds
+    the alias form into the canonical form by string prefix -- machine-agnostic,
+    so it works even when the alias symlink is not resolvable on the current box
+    (e.g. a ``/srv/repos/...`` path evaluated where the link is absent, or a
+    foreign Mac path). This is strictly stronger than ``Path.resolve()`` for
+    dedup, because ``resolve()`` only collapses links that exist on this host and
+    silently leaves un-resolvable aliases as a distinct path -> a double-counted
+    repo. Non-alias paths pass through unchanged. Falls back to the input on any
+    machines.yaml failure so the audit still runs on profile-less boxes.
+    """
+    raw = str(path or "")
+    if not raw:
+        return raw
+    config, _machine_id = _machines_classifier()
+    if config is None:
+        return raw
+    try:
+        return config.canonicalize_alias(raw)
+    except Exception:  # pragma: no cover - defensive: never break the audit
+        return raw
+
+
 def _broken_link_fix_command(
     origin: str,
     occurrence: dict[str, Any],
@@ -3448,10 +3480,22 @@ def _skill_audit_candidate_from_path(
     raw = str(path or "").strip()
     if not raw:
         return
+    # ``_expand_policy_path`` expands ~/$VARS and resolves links that EXIST on
+    # this box. We additionally fold declared aliases (``/srv/repos`` ->
+    # ``/srv/skillbox/repos``) by string prefix so the dedup is robust even when
+    # the alias symlink is not resolvable here -- otherwise the same repo is
+    # reported twice under its two names (the historic 2x-inflated fleet count).
     expanded = _expand_policy_path(raw)
-    item = candidates.setdefault(expanded, {"path": expanded, "sources": []})
+    canonical = _canonicalize_repo_path(expanded)
+    item = candidates.setdefault(canonical, {"path": canonical, "sources": [], "aliases": []})
     if source not in item["sources"]:
         item["sources"].append(source)
+    # Record any alias spelling of this repo (the expanded-but-pre-canonical path
+    # and the originally-declared ``raw``) so a triager can see every name the
+    # repo answers to under its single canonical row.
+    for alias in (expanded, raw):
+        if alias and alias != canonical and alias not in item["aliases"]:
+            item["aliases"].append(alias)
 
 
 def _skill_audit_client_paths(
@@ -3608,6 +3652,10 @@ def _skill_audit_repo_row(
 ) -> dict[str, Any]:
     row: dict[str, Any] = {
         "path": candidate["path"],
+        # Alias spellings the canonical repo also answers to (e.g.
+        # ``/srv/repos/<name>`` for ``/srv/skillbox/repos/<name>``). Empty when
+        # the repo was only ever named by its canonical path.
+        "aliases": sorted(candidate.get("aliases") or []),
         "sources": sorted(candidate.get("sources") or []),
     }
     path = Path(str(candidate["path"]))
