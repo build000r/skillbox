@@ -14,6 +14,8 @@ except ModuleNotFoundError:
     yaml = None
 
 from .shared import (
+    GLOBAL_HOME_ROOT_ENV,
+    GLOBAL_HOME_SURFACES,
     atomic_write_text,
     directory_tree_sha256,
     load_json_file,
@@ -543,10 +545,10 @@ def unlink_overlay_scoped_skills(
             Path(cwd) / ".codex" / "skills",
         ])
     if scope in {"global", "all"}:
-        targets.extend([
-            Path.home() / ".claude" / "skills",
-            Path.home() / ".codex" / "skills",
-        ])
+        # Route through the canonical global-home resolution so the managed
+        # home (SKILLBOX_HOME_ROOT) is unlinked alongside the OS home; roots
+        # that realpath-collapse to one surface are visited once.
+        targets.extend(root for _surface, root in _default_global_roots())
     removed: list[str] = []
     for target_dir in targets:
         if not target_dir.is_dir():
@@ -2224,12 +2226,152 @@ def _scan_installed_root(root: Path, *, layer: str, label: str, rank: int) -> tu
     return occurrences, summary
 
 
-def _default_global_roots() -> list[tuple[str, Path]]:
-    home = Path.home()
-    return [
-        ("claude", home / ".claude" / "skills"),
-        ("codex", home / ".codex" / "skills"),
+def _realpath(path: Path | str) -> str:
+    return os.path.realpath(os.path.expandvars(os.path.expanduser(str(path))))
+
+
+def resolve_global_homes(
+    *,
+    home_root_env: str | None = None,
+) -> list[dict[str, Any]]:
+    """Canonical resolution of every distinct *global home* surface.
+
+    This is the single source of truth for "which homes count as a global
+    skill surface". The OS home (``Path.home()``) is always a surface. When
+    ``SKILLBOX_HOME_ROOT`` (the *managed* home, e.g. ``/srv/skillbox/home``) is
+    set, it is **also** a global surface — both are scanned. If the managed
+    home resolves (via ``realpath``) to the same directory as the OS home (for
+    example because the managed home symlinks back into the OS home), the two
+    collapse into a single surface so installs are never double-counted.
+
+    Returns an ordered list of ``{"origin", "home", "realpath"}`` dicts where
+    ``origin`` is ``"os-home"``, ``"managed-home"``, or ``"both"`` (when the OS
+    and managed homes are realpath-equivalent). The OS home, when distinct,
+    always sorts first.
+    """
+    raw_env = os.environ.get(GLOBAL_HOME_ROOT_ENV, "") if home_root_env is None else home_root_env
+    managed_raw = str(raw_env or "").strip()
+
+    os_home = Path.home()
+    os_real = _realpath(os_home)
+
+    surfaces: list[dict[str, Any]] = [
+        {"origin": "os-home", "home": os_home, "realpath": os_real},
     ]
+
+    if managed_raw:
+        managed_home = Path(os.path.expandvars(os.path.expanduser(managed_raw)))
+        managed_real = _realpath(managed_home)
+        if managed_real == os_real:
+            # Symlinked-equivalent: one surface, attributed to both origins.
+            surfaces[0]["origin"] = "both"
+        else:
+            surfaces.append(
+                {"origin": "managed-home", "home": managed_home, "realpath": managed_real}
+            )
+    return surfaces
+
+
+def _default_global_roots() -> list[tuple[str, Path]]:
+    """Every distinct global skill root across all resolved global homes.
+
+    Routes through :func:`resolve_global_homes`, so the managed home declared
+    by ``SKILLBOX_HOME_ROOT`` is now scanned alongside the OS home. Roots whose
+    ``realpath`` collapses to the same directory (e.g. an OS-home
+    ``.claude/skills`` symlinked to the managed home's) are emitted once.
+    """
+    roots: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for home in resolve_global_homes():
+        for surface in GLOBAL_HOME_SURFACES:
+            root = Path(home["home"]) / f".{surface}" / "skills"
+            key = _realpath(root)
+            if key in seen:
+                continue
+            seen.add(key)
+            roots.append((surface, root))
+    return roots
+
+
+def global_home_surfaces_report() -> list[dict[str, Any]]:
+    """Audit-facing view: each distinct global *home* surface with realpath.
+
+    For every resolved global home, list its per-surface skill roots with the
+    realpath used to de-duplicate them and which installed skill entries are
+    visible there. ``os_only`` / ``managed_only`` partition entries by where
+    they live so the audit can show that the MANAGED home's installs are no
+    longer invisible.
+    """
+    homes = resolve_global_homes()
+    os_entries: dict[str, set[str]] = {}
+    managed_entries: dict[str, set[str]] = {}
+    report: list[dict[str, Any]] = []
+    seen_roots: set[str] = set()
+
+    for home in homes:
+        origin = str(home["origin"])
+        surfaces: list[dict[str, Any]] = []
+        for surface in GLOBAL_HOME_SURFACES:
+            root = Path(home["home"]) / f".{surface}" / "skills"
+            real = _realpath(root)
+            names = _global_root_entry_names(root)
+            collapsed = real in seen_roots
+            seen_roots.add(real)
+            surfaces.append(
+                {
+                    "surface": surface,
+                    "root": str(root),
+                    "realpath": real,
+                    "present": root.is_dir(),
+                    "entries": names,
+                    "collapsed": collapsed,
+                }
+            )
+            bucket = os_entries if origin in {"os-home", "both"} else managed_entries
+            bucket.setdefault(surface, set()).update(names)
+            if origin == "both":
+                managed_entries.setdefault(surface, set()).update(names)
+        report.append(
+            {
+                "origin": origin,
+                "home": str(home["home"]),
+                "realpath": str(home["realpath"]),
+                "surfaces": surfaces,
+            }
+        )
+
+    os_only: list[dict[str, str]] = []
+    managed_only: list[dict[str, str]] = []
+    for surface in GLOBAL_HOME_SURFACES:
+        os_names = os_entries.get(surface, set())
+        managed_names = managed_entries.get(surface, set())
+        for name in sorted(os_names - managed_names):
+            os_only.append({"surface": surface, "name": name})
+        for name in sorted(managed_names - os_names):
+            managed_only.append({"surface": surface, "name": name})
+
+    return [
+        {
+            "homes": report,
+            "os_only": os_only,
+            "managed_only": managed_only,
+        }
+    ]
+
+
+def _global_root_entry_names(root: Path) -> list[str]:
+    if not root.is_dir():
+        return []
+    names: list[str] = []
+    try:
+        entries = sorted(root.iterdir(), key=lambda item: item.name)
+    except OSError:
+        return []
+    for entry in entries:
+        if entry.name.startswith("."):
+            continue
+        names.append(_installed_skill_name(entry))
+    return names
 
 
 def _project_skill_roots(cwd: Path) -> list[tuple[str, Path]]:
@@ -2735,6 +2877,7 @@ def collect_skill_visibility(
         "matched_scope_rules": _matched_scope_rules_for_cwd(model, cwd_path),
         "active_clients": model.get("active_clients") or [],
         "active_profiles": model.get("active_profiles") or [],
+        "global_surfaces": global_home_surfaces_report() if include_global else [],
         "layers": sorted(layers, key=lambda item: int(item.get("rank", 0))),
         "source_roots": sorted(source_roots, key=lambda item: str(item.get("path") or "")),
         "effective": effective,

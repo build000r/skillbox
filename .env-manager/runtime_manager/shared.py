@@ -130,6 +130,28 @@ PATH_LIKE_ENV_KEYS = {
     "SKILLBOX_INGRESS_ROUTE_FILE",
     "SKILLBOX_INGRESS_NGINX_CONFIG",
 }
+# Canonical managed-home definition. ``SKILLBOX_HOME_ROOT`` names the managed
+# global home and ``GLOBAL_HOME_SURFACES`` are the per-agent skill surfaces
+# under it. ``skill_visibility.resolve_global_homes`` resolves the *runtime*
+# home from this same env var; keeping the name + surfaces here means the model
+# defaults emitted below describe exactly the surfaces the auditor scans.
+GLOBAL_HOME_ROOT_ENV = "SKILLBOX_HOME_ROOT"
+GLOBAL_HOME_SURFACES = ("claude", "codex")
+
+
+def managed_home_install_targets() -> list[dict[str, str]]:
+    """Install targets for the managed home's global skill surfaces.
+
+    Each target is a ``${SKILLBOX_HOME_ROOT}/.<surface>/skills`` placeholder,
+    derived from the canonical env-var name and surface list rather than being
+    hand-spelled, so model defaults and runtime resolution can never drift.
+    """
+    return [
+        {"id": surface, "path": f"${{{GLOBAL_HOME_ROOT_ENV}}}/.{surface}/skills"}
+        for surface in GLOBAL_HOME_SURFACES
+    ]
+
+
 HARDENED_SHARED_DEFAULT_SKILLS = [
     "beads-br",
     "beads-bv",
@@ -2921,16 +2943,7 @@ def base_client_overlay(
                 "lock_path": f"${{SKILLBOX_CLIENTS_ROOT}}/{client_id}/skill-repos.lock.json",
                 "clone_root": "${SKILLBOX_WORKSPACE_ROOT}/workspace/skill-repos",
                 "sync": {"mode": "clone-and-install"},
-                "install_targets": [
-                    {
-                        "id": "claude",
-                        "path": "${SKILLBOX_HOME_ROOT}/.claude/skills",
-                    },
-                    {
-                        "id": "codex",
-                        "path": "${SKILLBOX_HOME_ROOT}/.codex/skills",
-                    },
-                ],
+                "install_targets": managed_home_install_targets(),
                 "notes": "Client-scoped skills layered on top of the shared defaults.",
             }
         ],
