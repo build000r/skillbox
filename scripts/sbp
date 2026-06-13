@@ -150,6 +150,9 @@ Usage:
   __WRAPPER__ recalibrate [args...]   Read-only cwd skill add/remove recalibration
   __WRAPPER__ candidates [args...]    Explore linkable skill sources for this cwd
   __WRAPPER__ mcp [args...]           Read-only Claude JSON / Codex TOML MCP audit
+  __WRAPPER__ doctor [--format json]  One front door for all STRUCTURAL gates
+                              (INCO/FAIL/PASS); complements `make doctor`.
+                              Exits nonzero on FAIL only.
   __WRAPPER__ registry doctor [args...] Check registry/repos.yaml against local Git repos
   __WRAPPER__ cass status|search|rebuild|doctor  Remote portfolio-devbox Cass front door
   __WRAPPER__ cron [status|apply]     Declared crontab + script links from skillbox-config
@@ -413,6 +416,10 @@ case "${1:-}" in
     action="mcp-audit"
     shift
     ;;
+  doctor|structure-doctor)
+    action="structure-doctor"
+    shift
+    ;;
   registry|repos|repo-registry)
     action="repo-registry"
     shift
@@ -513,7 +520,7 @@ append_passthrough_token() {
     sync)
       sync_paths+=("${token}")
       ;;
-    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|repo-registry|cass|cron|beads|mmdx|operator-booking|swimmers-launch)
+    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|structure-doctor|repo-registry|cass|cron|beads|mmdx|operator-booking|swimmers-launch)
       passthrough_args+=("${token}")
       ;;
     *)
@@ -766,6 +773,9 @@ PY
     ;;
   mcp-audit)
     python3 .env-manager/manage.py mcp-audit "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    ;;
+  structure-doctor)
+    python3 .env-manager/manage.py structure-doctor --cwd "${invoke_cwd}" "${passthrough_args[@]}"
     ;;
   cass)
     config_root="${SKILLBOX_CONFIG_ROOT:-${HOME}/repos/skillbox-config}"
