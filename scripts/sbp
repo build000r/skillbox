@@ -155,6 +155,8 @@ Usage:
                               Exits nonzero on FAIL only.
   __WRAPPER__ registry doctor [args...] Check registry/repos.yaml against local Git repos
   __WRAPPER__ cass status|search|rebuild|doctor  Remote portfolio-devbox Cass front door
+  __WRAPPER__ evidence [--repo P|--skill N] --format json  Measure skill invocations per
+                              repo from Cass (contamination-safe), joined to current policy
   __WRAPPER__ cron [status|apply]     Declared crontab + script links from skillbox-config
   __WRAPPER__ beads [status|init|sync] Check or initialize repo-local beads state
   __WRAPPER__ mmdx QUERY              Fuzzy-find and open .mmdx/.mmd from this cwd
@@ -242,6 +244,7 @@ payload = {
         {"name": "mcp", "json": True, "safe_first_try": f"{wrapper} mcp --json"},
         {"name": "registry", "json": True, "safe_first_try": f"{wrapper} registry doctor --json"},
         {"name": "cass", "json": True, "safe_first_try": f"{wrapper} cass status --json"},
+        {"name": "evidence", "json": True, "safe_first_try": f"{wrapper} evidence --repo <path> --format json"},
         {"name": "cron", "json": True, "safe_first_try": f"{wrapper} cron status --json"},
         {"name": "recalibrate", "json": False, "safe_first_try": f"{wrapper} recalibrate"},
     ],
@@ -432,6 +435,10 @@ case "${1:-}" in
     action="cass"
     shift
     ;;
+  evidence)
+    action="cass-evidence"
+    shift
+    ;;
   cron)
     action="cron"
     shift
@@ -524,7 +531,7 @@ append_passthrough_token() {
     sync)
       sync_paths+=("${token}")
       ;;
-    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|structure-doctor|repo-registry|cass|cron|beads|mmdx|operator-booking|swimmers-launch|fleet)
+    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|structure-doctor|repo-registry|cass|cass-evidence|cron|beads|mmdx|operator-booking|swimmers-launch|fleet)
       passthrough_args+=("${token}")
       ;;
     *)
@@ -810,6 +817,15 @@ PY
       exit 1
     fi
     python3 "${cass_wrapper}" "${passthrough_args[@]}"
+    ;;
+  cass-evidence)
+    config_root="${SKILLBOX_CONFIG_ROOT:-${HOME}/repos/skillbox-config}"
+    evidence_wrapper="${config_root}/scripts/sbp_evidence.py"
+    if [[ ! -f "${evidence_wrapper}" ]]; then
+      echo "${wrapper_name} evidence: missing evidence helper at ${evidence_wrapper}" >&2
+      exit 1
+    fi
+    python3 "${evidence_wrapper}" "${passthrough_args[@]}"
     ;;
   cron)
     config_root="${SKILLBOX_CONFIG_ROOT:-${HOME}/repos/skillbox-config}"

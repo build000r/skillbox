@@ -867,6 +867,42 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_profile_arg(evidence_parser)
     _add_client_arg(evidence_parser)
 
+    cass_evidence_parser = subparsers.add_parser(
+        "cass-evidence",
+        help=(
+            "Measure skill INVOCATIONS per repo from the Cass index using "
+            "contamination-safe structural detection (Skill-tool records, "
+            "first-progress-markers, /slash invocations - never raw doc-echo "
+            "mentions), joined against the current skill-visibility policy. "
+            "Surfaced as `sbp evidence`. Degrades INCO-style when Cass is "
+            "unreachable and never blocks recalibrate."
+        ),
+    )
+    cass_evidence_group = cass_evidence_parser.add_mutually_exclusive_group()
+    cass_evidence_group.add_argument(
+        "--repo",
+        default=None,
+        help="Restrict to one repo path (its transcript cwd is mapped to a repo slug).",
+    )
+    cass_evidence_group.add_argument(
+        "--skill",
+        default=None,
+        help="Restrict to one skill name.",
+    )
+    cass_evidence_parser.add_argument("--format", choices=("text", "json"), default="json")
+    cass_evidence_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Max Cass hits per locator query to scan for invocations.",
+    )
+    cass_evidence_parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=None,
+        help="Per-query Cass front-door timeout in seconds.",
+    )
+
     next_parser = subparsers.add_parser(
         "next",
         help="Rank explainable next actions from runtime evidence, graph facts, Beads/BV, SBP, and NTM state.",
@@ -2942,6 +2978,7 @@ Useful command families:
   rch-stage --dry-run -- ...    Plan a no-sudo RCH staging lane.
   sbh-report --format json      SBH observe-first storage guard posture.
   skills --issues-only          Skill visibility issues for the current cwd.
+  cass-evidence --format json   Skill invocations per repo from Cass (sbp evidence).
   mcp-audit --format json       Claude/Codex MCP parity audit.
   parity-report <client>        Dev/prod parity report for a client.
   swimmers-launch <dirs...>     Launch one Swimmers agent session per dir.
@@ -3270,7 +3307,45 @@ def _handle_structure_doctor(args: argparse.Namespace, root_dir: Path) -> int:
     return int(payload.get("exit_code", 0))
 
 
+def _handle_cass_evidence(args: argparse.Namespace, root_dir: Path) -> int:
+    """Delegate to the skillbox-config Cass evidence helper.
+
+    Measures skill INVOCATIONS per repo from the Cass index (contamination-safe
+    structural detection) joined against current skill-visibility policy. The
+    helper lives beside the Cass front door (``sbp_cass.py``) in skillbox-config
+    and degrades INCO-style when Cass is unreachable, so this never blocks.
+    """
+    config_root = Path(
+        os.environ.get("SKILLBOX_CONFIG_ROOT")
+        or (Path(os.path.expanduser("~")) / "repos" / "skillbox-config")
+    )
+    helper = config_root / "scripts" / "sbp_evidence.py"
+    if not helper.is_file():
+        emit_json(
+            {
+                "command": "evidence",
+                "ok": False,
+                "status": "evidence_helper_missing",
+                "expected_path": str(helper),
+                "note": "Set SKILLBOX_CONFIG_ROOT or install skillbox-config to enable sbp evidence.",
+            }
+        )
+        return EXIT_ERROR
+    cmd = [sys.executable, str(helper), "--format", str(getattr(args, "format", "json") or "json")]
+    if getattr(args, "repo", None):
+        cmd += ["--repo", str(args.repo)]
+    if getattr(args, "skill", None):
+        cmd += ["--skill", str(args.skill)]
+    if getattr(args, "limit", None) is not None:
+        cmd += ["--limit", str(args.limit)]
+    if getattr(args, "timeout_seconds", None) is not None:
+        cmd += ["--timeout-seconds", str(args.timeout_seconds)]
+    proc = subprocess.run(cmd, check=False)
+    return int(proc.returncode)
+
+
 _EARLY_DISPATCH: dict[str, Callable[[argparse.Namespace, Path], int]] = {
+    "cass-evidence": _handle_cass_evidence,
     "capabilities": _handle_capabilities,
     "robot-docs": _handle_robot_docs,
     "robot-triage": _handle_robot_triage,

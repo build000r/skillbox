@@ -532,6 +532,31 @@ def default_registry() -> tuple[CommandSpec, ...]:
             graph_nodes=("check", "skill", "mcp_tool"),
         ),
         CommandSpec(
+            id="runtime.cass_evidence",
+            tier=2,
+            surface=("cli",),
+            summary=(
+                "Measure skill invocations per repo from Cass via structural "
+                "detection, joined to current policy; INCO when Cass is down."
+            ),
+            inputs={"repo": "string?", "skill": "string?", "format": "enum[json|text]?"},
+            outputs={
+                "command": "string",
+                "cass_available": "boolean",
+                "status": "string",
+                "structural_signals": "string[]",
+                "repos": "object[]",
+            },
+            side_effect="network",
+            risk="low",
+            entrypoint="manage.py",
+            owner_binary="sbp",
+            scopes=("cwd",),
+            examples=("sbp evidence --repo /srv/skillbox/repos/sweet-potato --format json",),
+            validations=("cd skillbox-config && python3 -m pytest tests/ -k evidence",),
+            graph_nodes=("evidence", "skill", "repo"),
+        ),
+        CommandSpec(
             id="runtime.render",
             tier=2,
             surface=("cli", "mcp"),
