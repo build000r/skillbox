@@ -146,6 +146,7 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
         "tiny-ui"
       ],
       "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
+      "repos": [],
       "unknown_categories": []
     }
   ],
@@ -223,6 +224,7 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
     "scope_violation_skills": 0,
     "scope_violations": 0,
     "shadowed": 0,
+    "undeclared_active_overlays": 0,
     "undefined_source_skills": 0,
     "undefined_sources": 0
   },
@@ -259,6 +261,7 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
 | `beads` | CONTRACT | Beads requirement/readiness derived from effective skills' frontmatter. |
 | `issues` | CONTRACT | Policy problems grouped by kind (broken_project, missing_for_cwd, scope_violations, ...). |
 | `policy` | CONTRACT | Which policy files + project categories drove this view. |
+| `overlay_audit` | info | Declared-overlay registry audit: declared + active overlays and warnings for active overlays not in the registry (advisory, never a hard fail; only when an overlays: block is declared). |
 | `recommendations` | info | Ranked human-facing remediation suggestions. |
 | `summary` | CONTRACT | Roll-up counters; keys are stable, add-only. Branch on these first. |
 | `next_actions` | info | Ordered, copy-pasteable next commands for a human/agent. |
@@ -363,12 +366,21 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "notes": "",
       "overlay": "",
       "paths": [
+        "/home/skillbox/repos/meaning",
+        "/home/skillbox/repos/notes-grep",
+        "/home/skillbox/repos/opensource/clawgs",
+        "/home/skillbox/repos/opensource/swimmers",
+        "/srv/skillbox/repos/meaning",
+        "/srv/skillbox/repos/notes-grep",
+        "/srv/skillbox/repos/opensource/clawgs",
+        "/srv/skillbox/repos/opensource/swimmers",
         "<FLEET>/repos_real/healthy"
       ],
       "patterns": [
         "tiny-cli"
       ],
       "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
+      "repos": [],
       "unknown_categories": []
     }
   ],
@@ -392,6 +404,12 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "state": "ok"
     }
   ],
+  "overlay_audit": {
+    "active": [],
+    "declared": [],
+    "undeclared_active": [],
+    "warnings": []
+  },
   "parity": {},
   "policy": {
     "files": [
@@ -475,8 +493,8 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "path": "/srv/skillbox/repos/skills-private",
       "present": true,
       "rank": 0,
-      "skill_count": 120,
-      "undefined_count": 120
+      "skill_count": 121,
+      "undefined_count": 121
     },
     {
       "id": "source:<FLEET>/skills",
@@ -528,8 +546,9 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
     "scope_violation_skills": 0,
     "scope_violations": 0,
     "shadowed": 0,
-    "undefined_source_skills": 207,
-    "undefined_sources": 209
+    "undeclared_active_overlays": 0,
+    "undefined_source_skills": 208,
+    "undefined_sources": 210
   },
   "undefined_sources": [
     {
@@ -655,6 +674,13 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "name": "beads-bv",
       "root": "/srv/skillbox/repos/skills-private",
       "source": "/srv/skillbox/repos/skills-private/beads-bv",
+      "source_bucket": "external",
+      "state": "undefined"
+    },
+    {
+      "name": "beads-compliance-and-completion-verification",
+      "root": "/srv/skillbox/repos/skills-private",
+      "source": "/srv/skillbox/repos/skills-private/beads-compliance-and-completion-verification",
       "source_bucket": "external",
       "state": "undefined"
     },
@@ -2237,6 +2263,7 @@ A COMPOSITE human surface that stitches together several dry-run sub-calls (`sbp
         "tiny-ui"
       ],
       "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
+      "repos": [],
       "unknown_categories": []
     }
   ],
@@ -2289,6 +2316,7 @@ A COMPOSITE human surface that stitches together several dry-run sub-calls (`sbp
     "scope_violation_skills": 0,
     "scope_violations": 0,
     "shadowed": 0,
+    "undeclared_active_overlays": 0,
     "undefined_source_skills": 0,
     "undefined_sources": 0
   }
