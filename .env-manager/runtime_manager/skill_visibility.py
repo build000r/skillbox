@@ -2167,17 +2167,24 @@ def _scan_installed_root(root: Path, *, layer: str, label: str, rank: int) -> tu
             resolved = entry
             resolve_error = str(exc)
         name = _installed_skill_name(entry)
+        broken_reason = ""
 
         if resolve_error:
             state = "broken"
             broken += 1
             kind = "symlink" if is_link else "file"
             has_skill_md = False
+            # Permission error / symlink loop / other resolution failure: the
+            # link cannot even be read, so taxonomy must treat it as unreadable
+            # rather than guessing where the target lives.
+            broken_reason = "unreadable"
         elif is_link and not _path_exists(entry):
             state = "broken"
             broken += 1
             kind = "symlink"
             has_skill_md = False
+            # The link reads fine but its target does not exist on this box.
+            broken_reason = "missing-target"
         elif entry.is_dir():
             kind = "directory"
             has_skill_md = (entry / "SKILL.md").is_file()
@@ -2196,7 +2203,7 @@ def _scan_installed_root(root: Path, *, layer: str, label: str, rank: int) -> tu
             continue
 
         source_path = str(resolved)
-        occurrences.append({
+        occurrence = {
             "name": name,
             "availability": "installed",
             "layer": layer,
@@ -2210,7 +2217,20 @@ def _scan_installed_root(root: Path, *, layer: str, label: str, rank: int) -> tu
             "link_target": link_target,
             "has_skill_md": has_skill_md,
             "state": state,
-        })
+        }
+        if state == "broken":
+            occurrence["broken_reason"] = broken_reason
+            # The absolute target a classifier should reason about: prefer the
+            # raw readlink resolved against the link's parent (so relative links
+            # become absolute), falling back to the realpath for non-link breaks.
+            if is_link and link_target:
+                abs_target = os.path.normpath(
+                    os.path.join(str(entry.parent), os.path.expanduser(link_target))
+                )
+            else:
+                abs_target = source_path
+            occurrence["link_target_abs"] = abs_target
+        occurrences.append(occurrence)
 
     summary = {
         "id": layer,
@@ -2790,6 +2810,8 @@ def _skill_visibility_summary(
 ) -> dict[str, int]:
     scope_violations = issues["scope_violations"]
     missing_for_cwd = issues["missing_for_cwd"]
+    broken_all = [*issues["broken_global"], *issues["broken_project"]]
+    broken_by_class = broken_link_class_counts(broken_all)
     return {
         "effective": len(effective),
         "occurrences": len(occurrences),
@@ -2798,6 +2820,9 @@ def _skill_visibility_summary(
         "broken_global_skills": _visibility_name_count(issues["broken_global"]),
         "broken_project": len(issues["broken_project"]),
         "broken_project_skills": _visibility_name_count(issues["broken_project"]),
+        # Counts-by-class over all broken installed links (global + project), so
+        # every surface that reads this summary sees the taxonomy breakdown.
+        "broken_by_class": broken_by_class,
         "global_not_allowed": len(issues["global_not_allowed"]),
         "global_not_allowed_skills": _visibility_name_count(issues["global_not_allowed"]),
         "extra_global": len(issues["extra_global"]),
@@ -2813,6 +2838,205 @@ def _skill_visibility_summary(
         "undefined_source_skills": _visibility_name_count(undefined_sources),
         "recommendations": len(recommendations),
     }
+
+
+# --- broken-link taxonomy ---------------------------------------------------
+#
+# A broken installed skill symlink is not a mystery: it is one of exactly four
+# things. Classifying it turns "317 broken links" (mostly the same migration
+# repeated N times) into "~3 decisions". The four classes and how each is
+# detected:
+#
+#   other-machine  the link target lives under a root that machines.yaml maps to
+#                  a DIFFERENT machine profile (e.g. /Users/b/repos/... seen from
+#                  the devbox). Detected via runtime_manager.machines:
+#                  ``is_foreign_path(target, current_machine)``. Action: migrate.
+#   moved          a skill with the SAME name still exists under some current
+#                  skill_source_roots, so the link can simply be re-pointed.
+#                  Detected via ``_skill_source_options(model, name)``. Action:
+#                  relink.
+#   dangling       no source for that name exists anywhere on this box and the
+#                  target is not foreign -> the link is dead weight. Action:
+#                  prune.
+#   unreadable     the link itself cannot be read (permission error / symlink
+#                  loop). Detected from the scanner's resolve error. Action:
+#                  investigate.
+BROKEN_LINK_CLASSES = ("other-machine", "moved", "dangling", "unreadable")
+
+# Stable per-class suggested action verbs surfaced in each audit row.
+BROKEN_LINK_ACTIONS = {
+    "other-machine": "migrate",
+    "moved": "relink",
+    "dangling": "prune",
+    "unreadable": "investigate",
+}
+
+
+def _machines_classifier() -> tuple[Any, str | None]:
+    """Best-effort ``(MachinesConfig, current_machine_id)`` for foreign-path checks.
+
+    Resolution flows through ``runtime_manager.machines`` (the same profile API
+    used by ``_explain_machine_profile``). A missing/unparseable machines.yaml or
+    an undetectable machine yields ``(None, None)`` so taxonomy degrades to
+    moved/dangling rather than raising — broken-link triage must answer even on
+    boxes that have not declared a profile. Overridable via the module-level
+    ``_machines_classifier_override`` hook so tests can inject a canonical-schema
+    config without depending on the live host identity.
+    """
+    override = globals().get("_machines_classifier_override")
+    if override is not None:
+        return override()
+    try:
+        from . import machines as _machines  # noqa: PLC0415
+    except Exception:  # pragma: no cover - import guard
+        return None, None
+    try:
+        config = _machines.load_machines_config()
+    except Exception:
+        return None, None
+    try:
+        machine_id = config.detect_machine_id()
+    except Exception:
+        machine_id = None
+    return config, machine_id
+
+
+def _broken_link_fix_command(
+    origin: str,
+    occurrence: dict[str, Any],
+    source_options: list[dict[str, Any]],
+    *,
+    machine_id: str | None,
+) -> str:
+    """The EXACT command an operator runs to heal one broken link.
+
+    Each class has one narrowest heal:
+      relink   -> repoint the link at the live source we found.
+      prune    -> remove the dead link.
+      migrate  -> remove a link that belongs to another machine's tree.
+      investigate -> surface the unreadable link for a human.
+    """
+    path = str(occurrence.get("path") or "")
+    name = str(occurrence.get("name") or "")
+    if origin == "moved" and source_options:
+        source = str(source_options[0].get("source") or "")
+        return f"ln -sfn {source} {path}"
+    if origin == "dangling":
+        return f"rm {path}  # prune dead link {name!r}"
+    if origin == "other-machine":
+        target = str(occurrence.get("link_target") or occurrence.get("link_target_abs") or "")
+        suffix = f" (target {target} belongs to another machine"
+        suffix += f", not {machine_id!r})" if machine_id else ")"
+        return f"rm {path}  # migrate: drop foreign-machine link{suffix}"
+    # unreadable: do not guess; show the operator what to inspect.
+    return f"ls -ld {path}  # investigate unreadable link (permission/loop?)"
+
+
+def _classify_broken_link(
+    occurrence: dict[str, Any],
+    model: dict[str, Any],
+    *,
+    machines_config: Any,
+    machine_id: str | None,
+) -> dict[str, str]:
+    """Return ``{origin, suggested_action, fix_command}`` for one broken link.
+
+    Precedence is deliberate:
+      1. unreadable  — if we could not even read the link, classify nothing else.
+      2. other-machine — a foreign target is a migration, never a mystery (this
+         is the mhb case: 47 links all under /Users/b are ONE decision).
+      3. moved        — a same-named live source means a one-symlink relink.
+      4. dangling     — otherwise the link is dead and should be pruned.
+    """
+    name = str(occurrence.get("name") or "")
+    reason = str(occurrence.get("broken_reason") or "")
+
+    # 1) unreadable wins: a link we cannot read tells us nothing about its target.
+    if reason == "unreadable":
+        origin = "unreadable"
+        source_options: list[dict[str, Any]] = []
+    else:
+        target = str(
+            occurrence.get("link_target_abs") or occurrence.get("link_target") or ""
+        )
+        # 2) other-machine: target under a DIFFERENT machine's declared roots.
+        foreign = False
+        if machines_config is not None and machine_id and target:
+            try:
+                foreign = bool(machines_config.is_foreign_path(target, machine_id))
+            except Exception:
+                foreign = False
+        # Resolve relink candidates once; reused for moved + fix command.
+        try:
+            source_options = _skill_source_options(model, name)
+        except Exception:
+            source_options = []
+        if foreign:
+            origin = "other-machine"
+        elif source_options:
+            # 3) moved: a live same-named source exists under a current root.
+            origin = "moved"
+        else:
+            # 4) dangling: no source anywhere, target not foreign.
+            origin = "dangling"
+
+    return {
+        "origin": origin,
+        "suggested_action": BROKEN_LINK_ACTIONS[origin],
+        "fix_command": _broken_link_fix_command(
+            origin, occurrence, source_options, machine_id=machine_id
+        ),
+    }
+
+
+def _enrich_broken_links(
+    model: dict[str, Any],
+    occurrences: list[dict[str, Any]],
+) -> None:
+    """Attach origin/suggested_action/fix_command to every broken installed link.
+
+    Mutates the occurrence dicts in place. Because ``issues['broken_global']`` /
+    ``issues['broken_project']`` reference these same dicts, the audit rows they
+    feed gain the taxonomy fields for free. The machines config + current machine
+    id are resolved once per call (best-effort) and reused across all links.
+    """
+    broken = [
+        occurrence
+        for occurrence in occurrences
+        if occurrence.get("state") == "broken"
+        and str(occurrence.get("availability")) == "installed"
+    ]
+    if not broken:
+        return
+    machines_config, machine_id = _machines_classifier()
+    for occurrence in broken:
+        occurrence.update(
+            _classify_broken_link(
+                occurrence,
+                model,
+                machines_config=machines_config,
+                machine_id=machine_id,
+            )
+        )
+
+
+def broken_link_class_counts(
+    broken_items: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Counts-by-class over already-classified broken-link occurrences.
+
+    Returns a dict with every key in :data:`BROKEN_LINK_CLASSES` present (zero
+    when absent) so the fleet summary shape is stable. An unclassified item (one
+    that never went through ``_enrich_broken_links``) is bucketed as dangling so
+    it is never silently dropped from the totals.
+    """
+    counts = {origin: 0 for origin in BROKEN_LINK_CLASSES}
+    for item in broken_items:
+        origin = str(item.get("origin") or "dangling")
+        if origin not in counts:
+            origin = "dangling"
+        counts[origin] += 1
+    return counts
 
 
 def collect_skill_visibility(
@@ -2833,6 +3057,10 @@ def collect_skill_visibility(
     )
     occurrences = [*declared_occurrences, *installed_occurrences]
     layers = [*declared_layers, *installed_layers]
+    # Classify broken installed links up front so the taxonomy fields (origin,
+    # suggested_action, fix_command) flow into both occurrences and the issue
+    # groups that reference the same dicts.
+    _enrich_broken_links(model, occurrences)
 
     effective, shadowed = _effective_occurrences(occurrences)
     issues = _visibility_issue_groups(
@@ -3043,6 +3271,34 @@ def _skill_audit_has_repo_issues(repo: dict[str, Any]) -> bool:
     return any(int(value) > 0 for value in (repo.get("issues") or {}).values())
 
 
+def _classified_broken_rows(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compact per-link taxonomy rows for the audit (one row per broken link).
+
+    Each row carries the classification a triager acts on: ``name``, ``path``,
+    ``origin``, ``suggested_action`` and the exact ``fix_command``. ``origin``
+    defaults to ``dangling`` if an item was never enriched, mirroring
+    :func:`broken_link_class_counts`.
+    """
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        rows.append(
+            {
+                "name": str(item.get("name") or ""),
+                "path": str(item.get("path") or ""),
+                "link_target": str(item.get("link_target") or ""),
+                "origin": str(item.get("origin") or "dangling"),
+                "suggested_action": str(
+                    item.get("suggested_action")
+                    or BROKEN_LINK_ACTIONS.get(str(item.get("origin") or "dangling"), "prune")
+                ),
+                "fix_command": str(item.get("fix_command") or ""),
+            }
+        )
+    # Stable order: group by class, then by path, so repeated migrations cluster.
+    rows.sort(key=lambda row: (row["origin"], row["path"]))
+    return rows
+
+
 def _skill_audit_repo_row(
     candidate: dict[str, Any],
     payload: dict[str, Any] | None,
@@ -3083,6 +3339,11 @@ def _skill_audit_repo_row(
         "missing_for_cwd": _skill_names(issues.get("missing_for_cwd") or []),
         "scope_violations": _skill_names(issues.get("scope_violations") or []),
         "broken_project": _skill_names(issues.get("broken_project") or []),
+        # Per-link triage taxonomy + counts-by-class so the audit answers
+        # "what kind of broken is this" (relink / prune / migrate / investigate)
+        # rather than re-listing N undifferentiated names.
+        "broken_project_links": _classified_broken_rows(issues.get("broken_project") or []),
+        "broken_project_by_class": broken_link_class_counts(issues.get("broken_project") or []),
     })
     return row
 
@@ -3101,6 +3362,8 @@ def _skill_audit_global_row(model: dict[str, Any], cwd: str | None) -> dict[str,
         "broken_global": _skill_names(issues.get("broken_global") or []),
         "global_not_allowed": _skill_names(issues.get("global_not_allowed") or []),
         "extra_global": _skill_names(issues.get("extra_global") or []),
+        "broken_global_links": _classified_broken_rows(issues.get("broken_global") or []),
+        "broken_global_by_class": broken_link_class_counts(issues.get("broken_global") or []),
     }
 
 
@@ -3188,11 +3451,20 @@ def collect_skill_audit(
 
     issue_totals = {key: 0 for key in SKILL_AUDIT_REPO_ISSUE_KEYS}
     missing_repos = 0
+    # Fleet-wide broken-link counts-by-class: turns "N broken links" into the
+    # ~3 decisions they actually are (relink / prune / migrate / investigate).
+    broken_by_class = {origin: 0 for origin in BROKEN_LINK_CLASSES}
     for repo in repos:
         if repo.get("state") == "missing":
             missing_repos += 1
         for key in SKILL_AUDIT_REPO_ISSUE_KEYS:
             issue_totals[key] += int((repo.get("issues") or {}).get(key) or 0)
+        for origin, count in (repo.get("broken_project_by_class") or {}).items():
+            if origin in broken_by_class:
+                broken_by_class[origin] += int(count or 0)
+    for origin, count in ((global_row or {}).get("broken_global_by_class") or {}).items():
+        if origin in broken_by_class:
+            broken_by_class[origin] += int(count or 0)
 
     return {
         "cwd": str(Path(cwd or os.getcwd()).resolve()),
@@ -3216,6 +3488,8 @@ def collect_skill_audit(
             **issue_totals,
             "global_not_allowed": int((global_row or {}).get("issues", {}).get("global_not_allowed") or 0),
             "extra_global": int((global_row or {}).get("issues", {}).get("extra_global") or 0),
+            "broken_links": sum(broken_by_class.values()),
+            "broken_by_class": broken_by_class,
         },
         "global": global_row,
         "repos": repos,
