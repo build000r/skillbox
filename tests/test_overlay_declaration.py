@@ -68,9 +68,17 @@ class OverlayDeclarationLintTests(unittest.TestCase):
             f"live skill-scope.yaml has an undeclared overlay tag: "
             f"{results[0].message} :: {results[0].details}",
         )
-        # The live registry declares marketing, and the rules use exactly it.
-        self.assertEqual(results[0].details["declared"], ["marketing"])
-        self.assertEqual(results[0].details["rule_overlay_tags"], ["marketing"])
+        # The live registry declares marketing plus the four mode packs
+        # (repos-sbp-policy-estate-oh1.2), and every declared overlay is used by
+        # a rule (no declared-but-unused entries).
+        self.assertEqual(
+            results[0].details["declared"],
+            ["hardening", "marketing", "operator-maintenance", "research", "swarm"],
+        )
+        self.assertEqual(
+            results[0].details["rule_overlay_tags"],
+            ["hardening", "marketing", "operator-maintenance", "research", "swarm"],
+        )
 
     def test_lint_green_when_every_rule_tag_is_declared(self) -> None:
         policy = _policy(

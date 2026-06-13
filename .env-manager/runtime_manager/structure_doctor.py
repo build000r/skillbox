@@ -48,6 +48,7 @@ from .shared import (
     build_runtime_model,
 )
 from .validation import (
+    validate_global_overlay_precedence_file,
     validate_global_skill_contract_file,
     validate_overlay_declarations_file,
     validate_registry_path_duplication_file,
@@ -247,6 +248,21 @@ def _run_overlay_declaration(ctx: DoctorContext) -> tuple[str, str]:
     return status, detail
 
 
+def _run_global_overlay_precedence(ctx: DoctorContext) -> tuple[str, str]:
+    """The global-overlay-precedence lint (validation.validate_global_overlay_precedence).
+
+    Asserts no skill in skill-scope.yaml is BOTH always-global (granted by an
+    ``allow_global`` rule / ``global_allowlist``) and overlay-gated. Global wins,
+    so an overlay rule may only add NON-global skills; a double-declaration (e.g.
+    naming always-global ``divide-and-conquer`` in the ``swarm`` overlay) is a
+    FAIL that names the offending skill + overlay rule rather than a silent
+    ambiguity.
+    """
+    results = validate_global_overlay_precedence_file()
+    status, detail, _ = _checkresults_status(results)
+    return status, detail
+
+
 def _run_registry_path_duplication(ctx: DoctorContext) -> tuple[str, str]:
     """The registry-path-duplication lint (validation.validate_registry_path_duplication).
 
@@ -398,6 +414,17 @@ def _gate_specs() -> tuple[_GateSpec, ...]:
                 "or correct the rule's overlay tag so every overlay: tag is declared"
             ),
             runner=_run_overlay_declaration,
+        ),
+        _GateSpec(
+            name="global_overlay_precedence",
+            kind=KIND_STRUCTURE,
+            cap_s=CAP_FAST_LINT,
+            fix_command=(
+                "drop the double-declared skill from its overlay rule in "
+                "skillbox-config/skill-scope.yaml (an always-global skill is linked "
+                "everywhere; an overlay cannot gate it — global wins)"
+            ),
+            runner=_run_global_overlay_precedence,
         ),
         _GateSpec(
             name="registry_path_duplication",
