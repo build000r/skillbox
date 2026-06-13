@@ -806,11 +806,47 @@ def _build_parser() -> argparse.ArgumentParser:
 
     explain_parser = subparsers.add_parser(
         "explain",
-        help="Explain a graph node or registered command using graph, registry, and adapter evidence.",
+        help=(
+            "Explain skill visibility provenance for a skill, OR a graph node / "
+            "registered command. A bare slug (e.g. `explain wiki`) is treated as a "
+            "skill: is it visible at --cwd, via which layer and scope rule, which "
+            "occurrence lost and why, and — when invisible — the ranked, exact "
+            "commands to make it visible. A brain node/command id (e.g. "
+            "`explain brain.next`) or `--node` routes to the graph/registry explainer."
+        ),
     )
-    explain_parser.add_argument("target", help="Graph node id or registry command id to explain.")
+    explain_parser.add_argument(
+        "target",
+        help="Skill name (default), or a graph node / registry command id.",
+    )
     explain_parser.add_argument("--format", choices=("text", "json"), default="json")
-    explain_parser.add_argument("--cwd", default=None, help="Working directory used for evidence scoping.")
+    explain_parser.add_argument(
+        "--cwd",
+        default=None,
+        help="Working directory used for skill provenance and brain evidence scoping.",
+    )
+    explain_parser.add_argument(
+        "--skill",
+        dest="explain_skill",
+        action="store_true",
+        help="Force skill-visibility provenance even if target also names a graph node.",
+    )
+    explain_parser.add_argument(
+        "--node",
+        dest="explain_node",
+        action="store_true",
+        help="Force the graph/registry explainer (the legacy brain explain) for target.",
+    )
+    explain_parser.add_argument(
+        "--no-global",
+        action="store_true",
+        help="Skill mode: do not inspect ~/.claude/skills or ~/.codex/skills.",
+    )
+    explain_parser.add_argument(
+        "--no-project",
+        action="store_true",
+        help="Skill mode: do not inspect project-local .claude/.codex skill dirs near --cwd.",
+    )
     explain_parser.add_argument("--ntm-session", default=None, help="Optional NTM session id for load-state evidence.")
     explain_parser.add_argument("--no-adapters", action="store_true", help="Skip optional br/bv/sbp/ntm adapters.")
     _add_profile_arg(explain_parser)
@@ -3481,8 +3517,64 @@ def _handle_graph(args: argparse.Namespace, root_dir: Path, model: dict[str, Any
     return EXIT_ERROR if "error" in payload else EXIT_OK
 
 
+def _explain_target_is_brain(args: argparse.Namespace) -> bool:
+    """Decide whether ``explain <target>`` routes to the brain/graph explainer.
+
+    Skill names are bare slugs (``wiki``, ``tiny-cli``); brain node/command ids
+    carry a ``.`` or ``:`` (``brain.next``, ``runtime.skills``, ``service:foo``)
+    or name a registered command. ``--node`` forces brain; ``--skill`` forces
+    skill (and wins over ``--node`` only if both are passed, which argparse does
+    not prevent — skill is the documented primary, so it takes precedence).
+    """
+    if getattr(args, "explain_skill", False):
+        return False
+    if getattr(args, "explain_node", False):
+        return True
+    target = str(getattr(args, "target", "") or "").strip()
+    if "." in target or ":" in target:
+        return True
+    try:
+        from .command_registry import load_default_registry
+
+        if target in load_default_registry():
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _handle_explain(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
     del resolved_mode
+    if not _explain_target_is_brain(args):
+        payload = explain_skill_visibility(
+            model,
+            args.target,
+            cwd=getattr(args, "cwd", None),
+            include_global=not getattr(args, "no_global", False),
+            include_project=not getattr(args, "no_project", False),
+        )
+        unresolved = (
+            not payload.get("visible")
+            and not payload.get("occurrences")
+            and not payload.get("source_options")
+        )
+        # A bare target that resolves to NEITHER a skill NOR a brain node is a
+        # genuine "unknown target". Unless `--skill` forces skill mode, fall
+        # back to the graph/registry explainer so the unknown-target error path
+        # stays a single, consistent message. `--skill` keeps the structured
+        # "how would I make it visible" answer (source_restore) even when the
+        # skill is unknown today.
+        if unresolved and not getattr(args, "explain_skill", False):
+            return _handle_explain_brain(args, root_dir, model)
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            _print_explain_skill_text(payload)
+        return EXIT_ERROR if unresolved else EXIT_OK
+    return _handle_explain_brain(args, root_dir, model)
+
+
+def _handle_explain_brain(args: argparse.Namespace, root_dir: Path, model: dict[str, Any]) -> int:
     adapters = _brain_adapters_for_args(root_dir, model, args)
     graph_payload = _brain_graph_payload(model, adapters)
     payload = explain_payload(graph_payload, args.target, adapters=adapters)
@@ -3491,6 +3583,54 @@ def _handle_explain(args: argparse.Namespace, root_dir: Path, model: dict[str, A
     else:
         _print_explain_text(payload)
     return EXIT_ERROR if "error" in payload else EXIT_OK
+
+
+def _print_explain_skill_text(payload: dict[str, Any]) -> None:
+    skill = payload.get("skill")
+    visible = "VISIBLE" if payload.get("visible") else "NOT VISIBLE"
+    print(f"explain {skill}: {visible}")
+    print(f"cwd: {payload.get('cwd')}")
+    print(f"reason: {payload.get('reason')}")
+    if payload.get("visible"):
+        print(
+            f"layer: {payload.get('layer')} "
+            f"[{payload.get('layer_family')}] rank={payload.get('layer_rank')}"
+        )
+        winner = payload.get("winner") or {}
+        if winner.get("source"):
+            print(f"source: {winner.get('source')}")
+        if winner.get("path"):
+            print(f"path: {winner.get('path')}")
+    scope_rules = payload.get("scope_rules") or []
+    if scope_rules:
+        print("scope rules:")
+        for rule in scope_rules:
+            cwd_flag = "matches-cwd" if rule.get("matches_cwd") else "no-cwd-match"
+            overlay = f" overlay={rule.get('overlay')}" if rule.get("overlay") else ""
+            print(
+                f"  - {rule.get('id')} (pattern={rule.get('matched_pattern')}) "
+                f"{cwd_flag}{overlay} [{rule.get('policy_path')}]"
+            )
+    lost = payload.get("lost") or []
+    if lost:
+        print("lost occurrences:")
+        for item in lost:
+            print(f"  - {item.get('layer')}: {item.get('lost_reason')}")
+    overlays = payload.get("active_overlays") or []
+    if overlays:
+        print(f"active overlays: {', '.join(overlays)}")
+    remediation = payload.get("remediation") or []
+    if remediation:
+        print("paths to visibility (ranked):")
+        for step in remediation:
+            print(f"  {step.get('rank')}. [{step.get('kind')}] {step.get('command')}")
+            if step.get("why"):
+                print(f"     why: {step.get('why')}")
+    next_actions = payload.get("next_actions") or []
+    if next_actions:
+        print("next_actions:")
+        for action in next_actions:
+            print(f"  - {action}")
 
 
 def _handle_search(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:

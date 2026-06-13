@@ -1,0 +1,52 @@
+{
+  "_comment": "Golden invariants for `sbp explain <skill>` (explain_skill_visibility). Keyed by case. Paths are tmp-specific so we assert structure/verdicts, not absolute paths. Built on tests/fixture_fleet so every case is reproducible.",
+  "schema_version": "2026-06-13+skill_explain",
+  "cases": {
+    "visible": {
+      "skill": "tiny-cli",
+      "repo": "healthy",
+      "visible": true,
+      "layer_family": "PROJECT",
+      "remediation_kinds": [],
+      "reason_contains": "IS visible"
+    },
+    "invisible_activatable": {
+      "skill": "needs-beads",
+      "repo": "healthy",
+      "visible": false,
+      "layer_family": null,
+      "remediation_kinds": ["activate", "rule_edit"],
+      "top_remediation_kind": "activate",
+      "reason_contains": "can be activated",
+      "has_source_options": true
+    },
+    "invisible_no_source": {
+      "skill": "totally-unknown-skill",
+      "repo": "healthy",
+      "visible": false,
+      "layer_family": null,
+      "remediation_kinds": ["rule_edit", "source_restore"],
+      "reason_contains": "no occurrence and no source",
+      "has_source_options": false
+    },
+    "overlay_gated": {
+      "skill": "tiny-marketing",
+      "repo": "overlay-repo",
+      "unlink_first": true,
+      "overlay_off": true,
+      "visible": false,
+      "remediation_kinds": ["activate", "overlay_flip"],
+      "overlay_flip_overlay": "marketing",
+      "inactive_overlay_rule_id": "marketing-overlay-local"
+    },
+    "shadowed": {
+      "skill": "tiny-ui",
+      "repo": "other-machine",
+      "visible": false,
+      "winner_layer_family": "PROJECT",
+      "winner_state": "broken",
+      "lost_layer_families": ["GLOBAL"],
+      "lost_reason_contains": "shadowed"
+    }
+  }
+}
