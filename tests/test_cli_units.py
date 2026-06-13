@@ -706,6 +706,121 @@ except RuntimeError as exc:
         self.assertTrue(emitted[0]["would_persist"])
         self.assertEqual(emitted[0]["unlinked"], [])
 
+    def test_overlay_no_args_lists_declared_overlays_with_on_off_state(self) -> None:
+        # repos-sbp-overlay-semantics-vq0.3: `overlay` (no args) is the one-command
+        # mode-discovery surface -- it lists the DECLARED registry annotated with
+        # each overlay's live on/off state (not just the on-set).
+        emitted: list[dict[str, object]] = []
+        declared = [
+            {"name": "marketing", "description": "GTM mode", "default_off": True},
+            {"name": "research", "description": "", "default_off": True},
+        ]
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch.object(CLI, "declared_overlay_records", return_value=declared),
+            mock.patch.object(CLI, "active_overlays", return_value={"marketing"}),
+            mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
+        ):
+            root = Path(tmpdir)
+            list_args = _ns(action="list", name="", cwd=str(root))
+            self.assertEqual(CLI._handle_overlay(list_args, root, {}, "reuse"), CLI.EXIT_OK)
+
+        payload = emitted[0]
+        states = {row["name"]: row["state"] for row in payload["declared"]}
+        self.assertEqual(states, {"marketing": "on", "research": "off"})
+        self.assertEqual(payload["overlays"], ["marketing"])
+
+        # And the text renderer prints declared rows + per-overlay state.
+        text = StringIO()
+        with redirect_stdout(text):
+            CLI._print_overlay_text(payload)
+        rendered = text.getvalue()
+        self.assertIn("declared overlays:", rendered)
+        self.assertIn("marketing: on", rendered)
+        self.assertIn("research: off", rendered)
+
+    def test_overlay_list_warns_on_undeclared_active_overlay(self) -> None:
+        emitted: list[dict[str, object]] = []
+        declared = [{"name": "marketing", "description": "", "default_off": True}]
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch.object(CLI, "declared_overlay_records", return_value=declared),
+            # "marketng" is a ghost typo present in overlay state.
+            mock.patch.object(CLI, "active_overlays", return_value={"marketing", "marketng"}),
+            mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
+        ):
+            root = Path(tmpdir)
+            self.assertEqual(
+                CLI._handle_overlay(_ns(action="list", name="", cwd=str(root)), root, {}, "reuse"),
+                CLI.EXIT_OK,
+            )
+        self.assertEqual(emitted[0]["undeclared_active"], ["marketng"])
+        text = StringIO()
+        with redirect_stdout(text):
+            CLI._print_overlay_text(emitted[0])
+        self.assertIn("WARNING", text.getvalue())
+        self.assertIn("marketng", text.getvalue())
+
+    def test_overlay_on_undeclared_name_fails_with_declared_list(self) -> None:
+        # An on/activate/toggle/off of an UNDECLARED overlay raises (EXIT_ERROR via
+        # the top-level handler) BEFORE any state write, printing the declared list.
+        declared = [{"name": "marketing", "description": "", "default_off": True}]
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch.object(CLI, "declared_overlay_records", return_value=declared),
+            mock.patch.object(CLI, "active_overlays", return_value=set()),
+            mock.patch.object(CLI, "set_overlay") as set_overlay,
+            mock.patch.object(CLI, "activate_overlay_scoped_skills") as activate,
+        ):
+            root = Path(tmpdir)
+            for action in ("on", "activate", "toggle", "off"):
+                args = _ns(
+                    action=action, name="marketng", cwd=str(root), keep=False,
+                    to="project", scope="project", category=[], source=None,
+                )
+                with self.assertRaises(RuntimeError) as cm:
+                    CLI._handle_overlay(args, root, {}, "reuse")
+                msg = str(cm.exception)
+                self.assertIn("marketng", msg)
+                self.assertIn("not a declared overlay", msg)
+                self.assertIn("marketing", msg)  # the declared registry is printed
+        # No state was written and no activation was attempted for the ghost name.
+        set_overlay.assert_not_called()
+        activate.assert_not_called()
+
+    def test_overlay_on_declared_name_is_not_blocked_by_the_guard(self) -> None:
+        declared = [{"name": "marketing", "description": "", "default_off": True}]
+        state: set[str] = set()
+        emitted: list[dict[str, object]] = []
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch.object(CLI, "declared_overlay_records", return_value=declared),
+            mock.patch.object(CLI, "active_overlays", side_effect=lambda: set(state)),
+            mock.patch.object(CLI, "set_overlay", side_effect=lambda n, e: state.add(n) if e else state.discard(n)),
+            mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
+        ):
+            root = Path(tmpdir)
+            on_args = _ns(action="on", name="marketing", cwd=str(root), keep=False, to="project", scope="project")
+            self.assertEqual(CLI._handle_overlay(on_args, root, {}, "reuse"), CLI.EXIT_OK)
+        self.assertEqual(emitted[0]["overlays"], ["marketing"])
+
+    def test_overlay_guard_is_noop_when_no_registry_declared(self) -> None:
+        # The empty-model / no-registry path must NOT block on/off (legacy boxes
+        # and the existing `{}`-model tests rely on this pass-through).
+        state: set[str] = set()
+        emitted: list[dict[str, object]] = []
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch.object(CLI, "declared_overlay_records", return_value=[]),
+            mock.patch.object(CLI, "active_overlays", side_effect=lambda: set(state)),
+            mock.patch.object(CLI, "set_overlay", side_effect=lambda n, e: state.add(n) if e else state.discard(n)),
+            mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
+        ):
+            root = Path(tmpdir)
+            on_args = _ns(action="on", name="anything", cwd=str(root), keep=False, to="project", scope="project")
+            self.assertEqual(CLI._handle_overlay(on_args, root, {}, "reuse"), CLI.EXIT_OK)
+        self.assertEqual(emitted[0]["overlays"], ["anything"])
+
     def _write_overlay_policy_fixture(self, base: Path, skill_names: list[str]) -> tuple[dict[str, object], Path, Path]:
         """Scaffold a real skill-scope policy with a path-scoped marketing overlay.
 

@@ -207,11 +207,16 @@ class GateLabelingTests(unittest.TestCase):
             "structure_invariants",
             "policy_lint",
             "global_skill_contract",
+            "overlay_declaration",
             "lock_parity",
             "mcp_parity",
             "skill_drift",
         }:
             self.assertIn(expected, names)
+        # The overlay-declaration gate is a structure lint (the analogue of
+        # global_skill_contract), not a runtime gate.
+        kinds = {s.name: s.kind for s in specs}
+        self.assertEqual(kinds["overlay_declaration"], KIND_STRUCTURE)
         kinds = {s.name: s.kind for s in specs}
         self.assertEqual(kinds["structure_invariants"], KIND_STRUCTURE)
         self.assertEqual(kinds["lock_parity"], KIND_STRUCTURE)
