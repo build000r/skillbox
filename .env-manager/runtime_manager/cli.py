@@ -30,6 +30,7 @@ from .sbh_report import *
 from .evidence import *
 from .forge import *
 from .swimmers_launch import launch_swimmers_batch, swimmers_launch_text_lines
+from .structure_doctor import run_structure_doctor, structure_doctor_text_lines
 from .command_registry import registry_payload
 from .agent_adapters import collect_agent_adapter_evidence
 from .agent_graph import build_agent_graph, build_agent_graph_payload
@@ -103,6 +104,7 @@ MANAGE_COMMAND_NAMES = {
     "snap",
     "status",
     "stewardship-report",
+    "structure-doctor",
     "swimmers-launch",
     "sync",
     "up",
@@ -409,6 +411,25 @@ def _build_parser() -> argparse.ArgumentParser:
     doctor_parser.add_argument("--format", choices=("text", "json"), default="text")
     _add_profile_arg(doctor_parser)
     _add_client_arg(doctor_parser)
+
+    structure_doctor_parser = subparsers.add_parser(
+        "structure-doctor",
+        help=(
+            "One front door for STRUCTURAL gates (INCO/FAIL/PASS). Complements "
+            "(does not replace) the runtime `make doctor`: runs the structure "
+            "invariant suite, policy + global-skill-contract lints, lock parity, "
+            "MCP parity, skill drift, and — when reachable — the runtime `make "
+            "doctor` as a RUNTIME gate. Exits nonzero on FAIL only; INCO/PASS "
+            "exit 0. Structure gates complete in <60s (per-gate caps; a gate over "
+            "its cap is INCO, not FAIL). Surfaced as `sbp doctor`."
+        ),
+    )
+    structure_doctor_parser.add_argument("--format", choices=("text", "json"), default="text")
+    structure_doctor_parser.add_argument(
+        "--cwd",
+        default=None,
+        help="Directory to evaluate cwd-scoped gates (skill/MCP drift) against. Defaults to $PWD.",
+    )
 
     status_parser = subparsers.add_parser(
         "status",
@@ -3157,6 +3178,23 @@ def _handle_operator_booking(
     return exit_code
 
 
+def _handle_structure_doctor(args: argparse.Namespace, root_dir: Path) -> int:
+    """`sbp doctor` — the structural verification front door.
+
+    Read-only: every gate is a lint/audit/subprocess that does not mutate state,
+    so this runs as an early-dispatch handler (no runtime-model prefilter). Exits
+    nonzero ONLY when a gate is FAIL; INCO and PASS both exit 0.
+    """
+    cwd = Path(getattr(args, "cwd", None) or os.getcwd())
+    payload = run_structure_doctor(runtime_root=root_dir, cwd=cwd)
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        for line in structure_doctor_text_lines(payload):
+            print(line)
+    return int(payload.get("exit_code", 0))
+
+
 _EARLY_DISPATCH: dict[str, Callable[[argparse.Namespace, Path], int]] = {
     "capabilities": _handle_capabilities,
     "robot-docs": _handle_robot_docs,
@@ -3191,6 +3229,7 @@ _EARLY_DISPATCH: dict[str, Callable[[argparse.Namespace, Path], int]] = {
     "worker-promote-learning": _handle_worker_promote_learning,
     "swimmers-launch": _handle_swimmers_launch,
     "mmdx": _handle_mmdx,
+    "structure-doctor": _handle_structure_doctor,
 }
 
 
