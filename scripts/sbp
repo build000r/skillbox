@@ -580,6 +580,18 @@ passthrough_has_arg() {
   return 1
 }
 
+overlay_should_sync_policy() {
+  local overlay_action="${passthrough_args[0]:-list}"
+  case "${overlay_action}" in
+    on|off|toggle|activate)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 while [[ $# -gt 0 ]]; do
   case "${1}" in
     --format)
@@ -976,13 +988,15 @@ else:
     ;;
   overlay)
     python3 .env-manager/manage.py overlay "${client_flags[@]}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
-    echo
-    echo "applying policy for this cwd..."
-    overlay_sync_args=()
-    if passthrough_has_arg "--dry-run"; then
-      overlay_sync_args+=(--dry-run)
+    if overlay_should_sync_policy; then
+      echo
+      echo "applying policy for this cwd..."
+      overlay_sync_args=()
+      if passthrough_has_arg "--dry-run"; then
+        overlay_sync_args+=(--dry-run)
+      fi
+      python3 .env-manager/manage.py skill sync "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${overlay_sync_args[@]}" || true
     fi
-    python3 .env-manager/manage.py skill sync "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${overlay_sync_args[@]}" || true
     ;;
   overlay-toggle)
     python3 .env-manager/manage.py overlay toggle "${overlay_name}" "${client_flags[@]}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"

@@ -419,6 +419,36 @@ class CliWrapperTests(unittest.TestCase):
                 ],
             )
 
+    def test_sbp_overlay_list_does_not_policy_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            downstream = root / "downstream"
+            downstream.mkdir()
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "overlay",
+                "list",
+                fake_root=fake_root,
+                invoke_cwd=downstream,
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("applying policy for this cwd", result.stdout)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                record["argv"],
+                [
+                    "overlay",
+                    "--cwd",
+                    str(downstream),
+                    "list",
+                ],
+            )
+
     def test_sbp_recalibrate_defaults_to_cwd_sync_and_project_prune_dry_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

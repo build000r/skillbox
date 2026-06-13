@@ -656,6 +656,24 @@ except RuntimeError as exc:
         self.assertIn("activated: 2 skills", text.getvalue())
         self.assertIn("activation packet: missing unavailable", text.getvalue())
 
+        dry_run_text = StringIO()
+        with redirect_stdout(dry_run_text):
+            CLI._print_overlay_text(
+                {
+                    "action": "activate",
+                    "name": "marketing",
+                    "overlays": [],
+                    "dry_run": True,
+                    "unlinked": [],
+                    "activations": [
+                        {"skill": "demo", "activation_packet": {"name": "demo", "source": "overlay", "skill_md_sha256": "abc", "skill_md": "# Demo\n"}},
+                    ],
+                }
+            )
+        self.assertIn("overlay marketing: would activate", dry_run_text.getvalue())
+        self.assertIn("would activate: 1 skills", dry_run_text.getvalue())
+        self.assertNotIn("activated: 1 skills", dry_run_text.getvalue())
+
     def test_overlay_dry_run_previews_without_persisting_or_unlinking(self) -> None:
         emitted: list[dict[str, object]] = []
 

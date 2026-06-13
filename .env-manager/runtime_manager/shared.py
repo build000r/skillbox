@@ -3751,7 +3751,10 @@ def _matches_skillignore(rel_path: str, patterns: list[str]) -> bool:
 def filtered_copy_skill(source_dir: Path, target_dir: Path) -> str:
     """Copy a skill directory to target, respecting .skillignore. Returns tree SHA."""
     resolved_source = source_dir.resolve()
-    resolved_target = target_dir.resolve()
+    if target_dir.is_symlink():
+        resolved_target = target_dir.parent.resolve() / target_dir.name
+    else:
+        resolved_target = target_dir.resolve()
     try:
         resolved_source.relative_to(resolved_target)
         overlaps = True
@@ -3963,6 +3966,7 @@ def _install_skill_to_targets(
     skill_source: Path,
     dry_run: bool,
     actions: list[str],
+    host_home_root: str | None = None,
 ) -> dict[str, str]:
     """Filtered-copy a skill into every install target. Returns target_id -> tree_sha."""
     install_tree_shas: dict[str, str] = {}
@@ -3971,16 +3975,17 @@ def _install_skill_to_targets(
         install_dir = target_root / skill_name
         if dry_run:
             actions.append(f"install-skill: {skill_name} -> {install_dir}")
+            _mirror_installed_skill_to_host_home(skill_name, target_root, dry_run, actions, host_home_root)
             continue
         tree_sha = filtered_copy_skill(skill_source, install_dir)
         install_tree_shas[target["id"]] = tree_sha
         actions.append(f"install-skill: {skill_name} -> {install_dir}")
-        _mirror_installed_skill_to_host_home(skill_name, target_root, dry_run, actions)
+        _mirror_installed_skill_to_host_home(skill_name, target_root, dry_run, actions, host_home_root)
     return install_tree_shas
 
 
-def _host_skill_mirror_root(target_root: Path) -> Path | None:
-    host_home = os.environ.get("SKILLBOX_HOST_HOME_ROOT", "").strip()
+def _host_skill_mirror_root(target_root: Path, host_home_root: str | None = None) -> Path | None:
+    host_home = (host_home_root if host_home_root is not None else os.environ.get("SKILLBOX_HOST_HOME_ROOT", "")).strip()
     if not host_home:
         return None
     if target_root.name != "skills" or target_root.parent.name not in {".claude", ".codex"}:
@@ -3996,8 +4001,9 @@ def _mirror_installed_skill_to_host_home(
     target_root: Path,
     dry_run: bool,
     actions: list[str],
+    host_home_root: str | None = None,
 ) -> None:
-    mirror_root = _host_skill_mirror_root(target_root)
+    mirror_root = _host_skill_mirror_root(target_root, host_home_root)
     if mirror_root is None:
         return
     source_dir = target_root / skill_name
@@ -4016,6 +4022,59 @@ def _mirror_installed_skill_to_host_home(
         return
     mirror_dir.symlink_to(source_dir, target_is_directory=True)
     actions.append(f"mirror-host-skill: {skill_name} -> {mirror_dir}")
+
+
+def _symlink_points_inside(path: Path, root: Path) -> bool:
+    if not path.is_symlink():
+        return False
+    try:
+        raw_target = Path(os.readlink(path))
+    except OSError:
+        return False
+    target = raw_target if raw_target.is_absolute() else path.parent / raw_target
+    try:
+        target.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
+
+
+def _reconcile_host_skill_mirrors(
+    wanted_by_target_root: dict[Path, set[str]],
+    stale_by_target_root: dict[Path, set[str]],
+    dry_run: bool,
+    actions: list[str],
+    host_home_root: str | None = None,
+) -> None:
+    for target_root, stale_names in sorted(stale_by_target_root.items(), key=lambda item: str(item[0])):
+        mirror_root = _host_skill_mirror_root(target_root, host_home_root)
+        if mirror_root is None or not mirror_root.exists():
+            continue
+        wanted_names = wanted_by_target_root.get(target_root, set())
+        for entry in sorted(mirror_root.iterdir(), key=lambda path: path.name):
+            if entry.name.startswith(".") or entry.name not in stale_names or entry.name in wanted_names:
+                continue
+            if not _symlink_points_inside(entry, target_root):
+                continue
+            if dry_run:
+                actions.append(f"mirror-host-skill-would-remove: {entry.name} -> {entry}")
+                continue
+            entry.unlink()
+            actions.append(f"mirror-host-skill-remove: {entry.name} -> {entry}")
+
+
+def _skill_repo_lock_skill_names(lock_path: Path) -> set[str]:
+    if not lock_path.is_file():
+        return set()
+    try:
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return set()
+    return {
+        str(skill.get("name"))
+        for skill in payload.get("skills") or []
+        if str(skill.get("name") or "").strip()
+    }
 
 
 def _build_lock_skill_entry(
@@ -4078,6 +4137,9 @@ def _persist_skill_repo_lockfile(
 def sync_skill_repo_sets(model: dict[str, Any], dry_run: bool) -> list[str]:
     """Sync skill-repo-set skill sets: clone repos, filtered-copy skills, write lock."""
     actions: list[str] = []
+    mirror_wanted_by_target_root: dict[Path, set[str]] = {}
+    mirror_stale_by_target_root: dict[Path, set[str]] = {}
+    host_home_root = str((model.get("env") or {}).get("SKILLBOX_HOST_HOME_ROOT") or "").strip() or None
 
     for skillset in model["skills"]:
         if skillset.get("kind") != "skill-repo-set":
@@ -4088,6 +4150,7 @@ def sync_skill_repo_sets(model: dict[str, Any], dry_run: bool) -> list[str]:
         config_path = Path(str(skillset.get("skill_repos_config_host_path", "")))
         lock_path = Path(str(skillset.get("lock_path_host_path", "")))
         clone_root = Path(str(skillset.get("clone_root_host_path", "")))
+        previous_lock_names = _skill_repo_lock_skill_names(lock_path)
 
         config = load_skill_repos_config(config_path)
         for target in skillset.get("install_targets") or []:
@@ -4104,17 +4167,41 @@ def sync_skill_repo_sets(model: dict[str, Any], dry_run: bool) -> list[str]:
                 continue
             source_root, repo_name, repo, commit = resolved
             for skill_name, skill_source in _resolve_skill_dirs(entry, source_root, repo_name):
+                for target in skillset.get("install_targets") or []:
+                    target_root = Path(str(target["host_path"]))
+                    if _host_skill_mirror_root(target_root, host_home_root) is not None:
+                        mirror_wanted_by_target_root.setdefault(target_root, set()).add(skill_name)
                 install_tree_shas = _install_skill_to_targets(
-                    skillset, skill_name, skill_source, dry_run, actions,
+                    skillset, skill_name, skill_source, dry_run, actions, host_home_root,
                 )
                 lock_skills.append(_build_lock_skill_entry(
                     skill_name, entry, repo, commit, install_tree_shas, dry_run,
                 ))
 
+        current_lock_names = {
+            str(skill.get("name"))
+            for skill in lock_skills
+            if str(skill.get("name") or "").strip()
+        }
+        stale_lock_names = previous_lock_names - current_lock_names
+        if stale_lock_names:
+            for target in skillset.get("install_targets") or []:
+                target_root = Path(str(target["host_path"]))
+                if _host_skill_mirror_root(target_root, host_home_root) is not None:
+                    mirror_stale_by_target_root.setdefault(target_root, set()).update(stale_lock_names)
+
         if dry_run:
             actions.append(f"write-lockfile: {lock_path}")
             continue
         _persist_skill_repo_lockfile(lock_path, config_path, lock_skills, actions)
+
+    _reconcile_host_skill_mirrors(
+        mirror_wanted_by_target_root,
+        mirror_stale_by_target_root,
+        dry_run,
+        actions,
+        host_home_root,
+    )
 
     return actions
 
