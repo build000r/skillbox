@@ -296,6 +296,37 @@ def test_non_matching_cwd_links_zero_not_the_literal_overlay_set(
     assert not (scenario.non_matching / ".claude" / "skills").exists()
 
 
+def test_force_cannot_link_the_literal_overlay_set_in_a_non_matching_cwd(
+    scenario: MarketingScenario,
+) -> None:
+    """No silent over-linking path: ``--force`` is NOT a literal-pack backdoor.
+
+    Decision for repos-sbp-overlay-semantics-vq0.2: the literal-pack activation
+    path was REMOVED (vq0.1 made activate policy-evaluated); no replacement flag
+    was added. ``--force`` is the only remaining knob on activate, and it only
+    affects link-conflict / global-block resolution inside the plan -- it does
+    NOT widen the skill universe, which is derived from the cwd-narrowed
+    ``missing_for_cwd`` set. So forcing activation in a cwd the policy does not
+    match STILL links zero, never the ~37 literal overlay skills. This is the
+    durable proof that the only way to link the full literal set is for the
+    policy to genuinely match the cwd (the full_match test) -- there is no
+    explicit-flag or force escape hatch.
+    """
+    with scenario.fleet._home_patched():
+        forced = sv.activate_overlay_scoped_skills(
+            scenario.model,
+            "marketing",
+            str(scenario.non_matching),
+            to="project",
+            dry_run=True,
+            force=True,
+        )
+    # force changes nothing about scope selection: zero, not the literal set.
+    assert forced == []
+    # And dry-run with force still creates nothing on disk.
+    assert not (scenario.non_matching / ".claude" / "skills").exists()
+
+
 def test_broad_only_cwd_links_exactly_the_broad_subset(
     scenario: MarketingScenario,
 ) -> None:
