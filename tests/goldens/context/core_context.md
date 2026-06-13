@@ -34,7 +34,7 @@ You are inside a skillbox workspace container.
 
 ## Installed Skills
 
-- **default-skills**: ask-cascade, audit-plans, build-vs-clone, commit, crap, describe, dev-sanity, divide-and-conquer, domain-planner, domain-reviewer, domain-scaffolder, mutate, oss-doc-audit, reproduce, skill-issue, skillbox-operator
+- **default-skills**: beads-br, beads-bv, beads-workflow, codebase-audit, divide-and-conquer, git-stash-janitor, lube, mmdx, no-ragrets, project-status-mmdx, sbp, skill-issue, smart, ui-fresh-eyes
 
 ## Logs
 
