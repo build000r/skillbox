@@ -1466,6 +1466,187 @@ def validate_global_skill_contract_file(
     return validate_global_skill_contract(policy, policy_path=str(resolved))
 
 
+OVERLAY_DECLARATION_CODE = "overlay-declaration"
+
+
+def _policy_declared_overlays(policy: dict[str, Any]) -> set[str]:
+    """Overlay names declared by a policy's top-level ``overlays:`` block.
+
+    Accepts a list of mappings (``- name: marketing``), a list of bare strings
+    (``- marketing``), or a mapping (``marketing: {description: ...}``) so the
+    declaration shape stays forgiving while the validation stays strict.
+    """
+    declared: set[str] = set()
+    raw = policy.get("overlays")
+    if isinstance(raw, dict):
+        for key in raw:
+            name = str(key).strip()
+            if name:
+                declared.add(name)
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+            else:
+                name = str(item).strip()
+            if name:
+                declared.add(name)
+    return declared
+
+
+def _policy_rule_overlay_tags(policy: dict[str, Any]) -> dict[str, list[str]]:
+    """Map each ``overlay:`` tag found in rules -> the rule ids carrying it."""
+    tags: dict[str, list[str]] = {}
+    for rule in policy.get("rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        tag = str(rule.get("overlay") or "").strip()
+        if not tag:
+            continue
+        rule_id = str(rule.get("id") or "").strip() or "(unnamed rule)"
+        tags.setdefault(tag, []).append(rule_id)
+    return tags
+
+
+def validate_overlay_declarations(
+    policy: dict[str, Any],
+    *,
+    policy_path: str | None = None,
+) -> list[CheckResult]:
+    """Assert every rule ``overlay:`` tag references a DECLARED overlay.
+
+    Mode-pack overlays (layer 3 of the global skill contract) are now declared in
+    a single top-level ``overlays:`` registry. Before this registry existed,
+    overlay tags were enumerated from rules with no declaration point and no
+    validation, so a typo (``overlay: marketng``) silently created a ghost
+    overlay: a tag that no ``sbp overlay on`` could meaningfully match and that
+    filtered nothing, failing closed without a word.
+
+    This lint makes that drift loud. It compares the registry against the tags
+    the rules actually carry:
+
+        every rule overlay tag  in  declared overlays(`overlays:` block)
+
+    On a tag with no declaration it FAILS, naming the offending tag, the rule(s)
+    carrying it, and the declared list (the fix). An empty policy (no declared
+    overlays and no rule overlay tags) is a PASS -- there is no overlay surface to
+    enforce, mirroring ``validate_global_skill_contract``'s empty-policy posture.
+    Declared-but-unused overlays are NOT a failure (a registry entry may be
+    declared ahead of its rules); they are reported as advisory detail only.
+    """
+    if not isinstance(policy, dict):
+        return [
+            CheckResult(
+                status="pass",
+                code=OVERLAY_DECLARATION_CODE,
+                message="no skill-scope policy to validate",
+            )
+        ]
+
+    declared = _policy_declared_overlays(policy)
+    rule_tags = _policy_rule_overlay_tags(policy)
+
+    if not declared and not rule_tags:
+        return [
+            CheckResult(
+                status="pass",
+                code=OVERLAY_DECLARATION_CODE,
+                message="skill-scope policy declares no overlay surface",
+            )
+        ]
+
+    undeclared = sorted(tag for tag in rule_tags if tag not in declared)
+    unused = sorted(name for name in declared if name not in rule_tags)
+
+    if undeclared:
+        offenders = {tag: rule_tags[tag] for tag in undeclared}
+        offender_text = "; ".join(
+            f"{tag} (rule(s): {', '.join(rule_ids)})"
+            for tag, rule_ids in offenders.items()
+        )
+        location = f" in {policy_path}" if policy_path else ""
+        return [
+            CheckResult(
+                status="fail",
+                code=OVERLAY_DECLARATION_CODE,
+                message=(
+                    f"undeclared overlay tag(s){location}: {offender_text}. "
+                    "Every rule overlay: tag must reference an overlay declared in the "
+                    "skill-scope.yaml `overlays:` block. "
+                    f"Declared overlays: {', '.join(sorted(declared)) or '(none)'}. "
+                    "Fix: declare the overlay in `overlays:` or correct the rule's overlay tag."
+                ),
+                details={
+                    "undeclared": undeclared,
+                    "offending_rules": offenders,
+                    "declared": sorted(declared),
+                    "rule_overlay_tags": sorted(rule_tags),
+                    "declared_but_unused": unused,
+                },
+            )
+        ]
+
+    message = (
+        f"every rule overlay tag is declared ({len(rule_tags)} tag(s) over "
+        f"{len(declared)} declared overlay(s))"
+    )
+    if unused:
+        message += f"; declared-but-unused (advisory): {', '.join(unused)}"
+    return [
+        CheckResult(
+            status="pass",
+            code=OVERLAY_DECLARATION_CODE,
+            message=message,
+            details={
+                "declared": sorted(declared),
+                "rule_overlay_tags": sorted(rule_tags),
+                "declared_but_unused": unused,
+            },
+        )
+    ]
+
+
+def validate_overlay_declarations_file(
+    policy_path: Path | str | None = None,
+) -> list[CheckResult]:
+    """Load skill-scope.yaml and run :func:`validate_overlay_declarations`.
+
+    Convenience wrapper for doctor / CLI callers, mirroring
+    :func:`validate_global_skill_contract_file`: resolves the canonical
+    ``skill-scope.yaml`` (or an explicit path), parses it, and runs the
+    overlay-declaration lint. A missing policy file is a pass (nothing to
+    enforce); a parse failure is a fail.
+    """
+    resolved = Path(policy_path) if policy_path else _skill_scope_policy_path()
+    if not resolved.is_file():
+        return [
+            CheckResult(
+                status="pass",
+                code=OVERLAY_DECLARATION_CODE,
+                message=f"no skill-scope policy found at {resolved}",
+            )
+        ]
+    try:
+        policy = load_yaml(resolved)
+    except RuntimeError as exc:
+        return [
+            CheckResult(
+                status="fail",
+                code=OVERLAY_DECLARATION_CODE,
+                message=f"could not parse skill-scope policy at {resolved}: {exc}",
+            )
+        ]
+    if not isinstance(policy, dict):
+        return [
+            CheckResult(
+                status="fail",
+                code=OVERLAY_DECLARATION_CODE,
+                message=f"skill-scope policy at {resolved} is not a mapping",
+            )
+        ]
+    return validate_overlay_declarations(policy, policy_path=str(resolved))
+
+
 def _forge_root_dir(model: dict[str, Any]) -> Path:
     root_dir = str(model.get("root_dir") or "").strip()
     if root_dir:

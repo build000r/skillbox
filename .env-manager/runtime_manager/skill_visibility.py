@@ -491,6 +491,99 @@ def toggle_overlay(name: str) -> bool:
     return set_overlay(name, name not in active_overlays())
 
 
+def _overlay_default_off(raw: Any) -> bool:
+    """Interpret a declared overlay's `default:` field as off (True) or on.
+
+    Overlays are opt-in: a missing or unparseable default is treated as ``off``
+    (the conservative mode-pack posture). YAML may parse ``off``/``on`` as
+    booleans (False/True) or leave them as strings depending on quoting, so we
+    normalise both.
+    """
+    if isinstance(raw, bool):
+        return not raw  # YAML `off` -> False -> default-off True
+    text = str(raw or "").strip().lower()
+    if text in {"on", "true", "enabled", "yes"}:
+        return False
+    return True
+
+
+def declared_overlay_records(model: dict[str, Any]) -> list[dict[str, Any]]:
+    """Declared overlays from every in-scope policy's top-level `overlays:` block.
+
+    Each record is ``{name, description, default_off, policy_path}``. The
+    ``overlays:`` block is the single declaration point for mode-pack overlays
+    (layer 3 of the global skill contract). A list of mappings (``- name: ...``)
+    or a mapping (``marketing: {description: ...}``) are both accepted; bare
+    string entries (``- marketing``) declare a name with no metadata. Later
+    policies (client overlays) win on duplicate names so a client can re-describe
+    an operator overlay without creating a phantom duplicate.
+    """
+    by_name: dict[str, dict[str, Any]] = {}
+    for policy in _operator_scope_policies(model):
+        policy_path = str(policy.get("_policy_path") or "")
+        raw_overlays = policy.get("overlays")
+        entries: list[tuple[str, dict[str, Any]]] = []
+        if isinstance(raw_overlays, dict):
+            entries = [
+                (str(key).strip(), value if isinstance(value, dict) else {})
+                for key, value in raw_overlays.items()
+            ]
+        elif isinstance(raw_overlays, list):
+            for item in raw_overlays:
+                if isinstance(item, dict):
+                    name = str(item.get("name") or "").strip()
+                    entries.append((name, item))
+                else:
+                    entries.append((str(item).strip(), {}))
+        for name, meta in entries:
+            if not name:
+                continue
+            by_name[name] = {
+                "name": name,
+                "description": str(meta.get("description") or "").strip(),
+                "default_off": _overlay_default_off(meta.get("default", "off")),
+                "policy_path": policy_path,
+            }
+    return [by_name[name] for name in sorted(by_name)]
+
+
+def declared_overlays(model: dict[str, Any]) -> set[str]:
+    """Set of overlay names declared by an in-scope policy `overlays:` block."""
+    return {record["name"] for record in declared_overlay_records(model)}
+
+
+def rule_overlay_tags(model: dict[str, Any]) -> set[str]:
+    """Every distinct ``overlay:`` tag enumerated from scope-policy rules.
+
+    This is the enumeration the unlink/activate paths walk; comparing it against
+    :func:`declared_overlays` is what surfaces a ghost (undeclared) overlay tag.
+    """
+    tags: set[str] = set()
+    for policy in _operator_scope_policies(model):
+        for raw_rule in policy.get("rules") or []:
+            if not isinstance(raw_rule, dict):
+                continue
+            tag = str(raw_rule.get("overlay") or "").strip()
+            if tag:
+                tags.add(tag)
+    return tags
+
+
+def undeclared_active_overlays(model: dict[str, Any]) -> list[str]:
+    """Active overlay-state entries that name an UNDECLARED overlay.
+
+    An overlay-state-file entry (or ``SKILLBOX_OVERLAYS`` opt-in) for a name with
+    no declaration silently filters nothing -- it can never match a rule -- so it
+    is a footgun, not an error. The caller surfaces these as AUDIT WARNINGS. When
+    no overlay is declared anywhere, there is no registry to validate against, so
+    nothing is flagged (mirrors the global-contract lint's empty-policy pass).
+    """
+    declared = declared_overlays(model)
+    if not declared:
+        return []
+    return sorted(name for name in active_overlays() if name not in declared)
+
+
 def overlay_scoped_skill_names(model: dict[str, Any], overlay_name: str) -> set[str]:
     """Literal skill names declared by rules tagged with this overlay.
 
@@ -3602,6 +3695,29 @@ def collect_skill_visibility(
     parity = collect_skill_parity() if include_global else {}
     summary["parity_divergent"] = int((parity.get("summary") or {}).get("divergent") or 0)
 
+    # Overlay-registry audit: overlay-state entries naming an UNDECLARED overlay
+    # filter nothing and so fail silent. Surface them as AUDIT WARNINGS (never a
+    # hard fail) with the declared registry so the operator can fix the typo or
+    # declare the overlay. This is the skill-visibility analogue of the
+    # overlay-declaration doctor lint (which guards rule `overlay:` tags).
+    declared_overlay_names = sorted(declared_overlays(model))
+    undeclared_state = undeclared_active_overlays(model)
+    overlay_audit = {
+        "declared": declared_overlay_names,
+        "active": sorted(active_overlays()),
+        "undeclared_active": undeclared_state,
+        "warnings": [
+            (
+                f"overlay-state entry '{name}' is not a declared overlay; it "
+                "filters nothing (no rule can match it). Declare it in "
+                "skill-scope.yaml `overlays:` or remove it from the overlay state. "
+                f"Declared overlays: {', '.join(declared_overlay_names) or '(none)'}."
+            )
+            for name in undeclared_state
+        ],
+    }
+    summary["undeclared_active_overlays"] = len(undeclared_state)
+
     next_actions = skill_visibility_next_actions(issues)
     for action in beads.get("next_actions") or []:
         if action not in next_actions:
@@ -3609,6 +3725,9 @@ def collect_skill_visibility(
     for action in skill_parity_next_actions(parity):
         if action not in next_actions:
             next_actions.append(action)
+    for warning in overlay_audit["warnings"]:
+        if warning not in next_actions:
+            next_actions.append(warning)
 
     payload = {
         "cwd": str(cwd_path),
@@ -3630,6 +3749,7 @@ def collect_skill_visibility(
             "files": policy_files,
             "project_categories": _project_categories(model),
         },
+        "overlay_audit": overlay_audit,
         "recommendations": recommendations,
         "summary": summary,
         "next_actions": next_actions,

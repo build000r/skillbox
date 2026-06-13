@@ -49,6 +49,7 @@ from .shared import (
 )
 from .validation import (
     validate_global_skill_contract_file,
+    validate_overlay_declarations_file,
     validate_skill_locks_and_state,
     validate_skill_repo_sets,
 )
@@ -233,6 +234,18 @@ def _run_global_skill_contract(ctx: DoctorContext) -> tuple[str, str]:
     return status, detail
 
 
+def _run_overlay_declaration(ctx: DoctorContext) -> tuple[str, str]:
+    """The overlay-declaration lint (validation.validate_overlay_declarations).
+
+    Asserts every rule ``overlay:`` tag in skill-scope.yaml references a declared
+    overlay in the ``overlays:`` registry, so a typo is a FAIL that names the
+    ghost tag rather than a silent never-matching overlay.
+    """
+    results = validate_overlay_declarations_file()
+    status, detail, _ = _checkresults_status(results)
+    return status, detail
+
+
 # Codes emitted by the lock-parity concern (config_sha desync + downstream
 # install state) so the lock gate and the policy gate don't double-count.
 _LOCK_CODES = frozenset({"skill-repo-lock", "skill-repo-install"})
@@ -362,6 +375,16 @@ def _gate_specs() -> tuple[_GateSpec, ...]:
                 "the union of allow_global rules"
             ),
             runner=_run_global_skill_contract,
+        ),
+        _GateSpec(
+            name="overlay_declaration",
+            kind=KIND_STRUCTURE,
+            cap_s=CAP_FAST_LINT,
+            fix_command=(
+                "declare the overlay in skillbox-config/skill-scope.yaml `overlays:` "
+                "or correct the rule's overlay tag so every overlay: tag is declared"
+            ),
+            runner=_run_overlay_declaration,
         ),
         _GateSpec(
             name="lock_parity",

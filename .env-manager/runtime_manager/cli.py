@@ -4192,6 +4192,41 @@ def _overlay_action_and_name(args: argparse.Namespace) -> tuple[str, str]:
     return action, name
 
 
+def _overlay_declared_records(model: dict[str, Any]) -> list[dict[str, Any]]:
+    """Declared-overlay records (name/description/default) for this model.
+
+    Best-effort: a malformed/absent policy yields no declarations rather than
+    breaking the overlay command (so `overlay` stays usable on a box with no
+    skill-scope policy, and the on/off paths simply skip the undeclared guard).
+    """
+    try:
+        return list(declared_overlay_records(model))
+    except Exception:
+        return []
+
+
+def _guard_overlay_is_declared(
+    action: str, name: str, declared_records: list[dict[str, Any]]
+) -> None:
+    """Fail an on/off/toggle/activate of an UNDECLARED overlay, printing the registry.
+
+    No declared registry (legacy/empty policy) means there is nothing to validate
+    against, so the guard is a no-op (mirrors the lint's empty-policy pass and
+    keeps the existing `overlay on` tests that pass an empty model green).
+    """
+    if action == "list" or not name or not declared_records:
+        return
+    declared_names = [str(record.get("name") or "") for record in declared_records]
+    if name in declared_names:
+        return
+    raise RuntimeError(
+        f"overlay {action}: '{name}' is not a declared overlay. "
+        f"Declared overlays: {', '.join(declared_names) or '(none)'}. "
+        "Declare it in skill-scope.yaml `overlays:` (then re-run), "
+        "or use one of the declared names above."
+    )
+
+
 def _apply_persistent_overlay_action(action: str, name: str) -> tuple[bool, list[str], bool]:
     was_on = name in active_overlays()
     if action == "on":
@@ -4271,6 +4306,25 @@ def _overlay_removed_links(
     )
 
 
+def _overlay_declared_state(
+    declared_records: list[dict[str, Any]], current: list[str]
+) -> list[dict[str, Any]]:
+    """Declared overlays annotated with their live on/off state for the list view."""
+    active = set(current)
+    rows: list[dict[str, Any]] = []
+    for record in declared_records:
+        name = str(record.get("name") or "")
+        rows.append(
+            {
+                "name": name,
+                "description": str(record.get("description") or ""),
+                "default": "off" if record.get("default_off", True) else "on",
+                "state": "on" if name in active else "off",
+            }
+        )
+    return rows
+
+
 def _overlay_payload(
     args: argparse.Namespace,
     *,
@@ -4280,7 +4334,13 @@ def _overlay_payload(
     overlay_cwd: Path,
     removed: list[str],
     activations: list[dict[str, Any]],
+    declared_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    declared_records = declared_records or []
+    undeclared_active = sorted(
+        item for item in current
+        if declared_records and item not in {str(r.get("name") or "") for r in declared_records}
+    )
     return {
         "overlays": current,
         "action": action,
@@ -4293,6 +4353,8 @@ def _overlay_payload(
         "would_persist": action in {"on", "off", "toggle"} and bool(getattr(args, "dry_run", False)),
         "unlinked": removed,
         "activations": activations,
+        "declared": _overlay_declared_state(declared_records, current),
+        "undeclared_active": undeclared_active,
     }
 
 
@@ -4311,8 +4373,28 @@ def _print_activation_packet_text(activation: dict[str, Any]) -> None:
 def _print_overlay_text(payload: dict[str, Any]) -> None:
     action = str(payload.get("action") or "list")
     current = list(payload.get("overlays") or [])
+    declared = list(payload.get("declared") or [])
+    undeclared_active = list(payload.get("undeclared_active") or [])
     if action == "list":
-        print(f"overlays on: {', '.join(current)}" if current else "overlays: (none)")
+        if declared:
+            print("declared overlays:")
+            for row in declared:
+                name = str(row.get("name") or "")
+                state = str(row.get("state") or "off")
+                desc = str(row.get("description") or "").strip()
+                line = f"  {name}: {state}  (default {row.get('default', 'off')})"
+                if desc:
+                    line += f" — {desc}"
+                print(line)
+            if undeclared_active:
+                print(
+                    "WARNING: active overlay(s) not declared (filter nothing): "
+                    + ", ".join(undeclared_active)
+                )
+            print(f"on: {', '.join(current)}" if current else "on: (none)")
+        else:
+            # No declaration registry on this box: fall back to the on-only view.
+            print(f"overlays on: {', '.join(current)}" if current else "overlays: (none)")
         return
 
     name = str(payload.get("name") or "")
@@ -4340,6 +4422,10 @@ def _print_overlay_text(payload: dict[str, Any]) -> None:
 
 def _handle_overlay(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
     action, name = _overlay_action_and_name(args)
+    declared_records = _overlay_declared_records(model)
+    # An on/off/toggle/activate of an UNDECLARED overlay fails here (before any
+    # state write), printing the declared registry. list is unaffected.
+    _guard_overlay_is_declared(action, name, declared_records)
     if bool(getattr(args, "dry_run", False)):
         was_on, current, now_on = _preview_overlay_action(action, name)
     else:
@@ -4355,6 +4441,7 @@ def _handle_overlay(args: argparse.Namespace, root_dir: Path, model: dict[str, A
         overlay_cwd=overlay_cwd,
         removed=removed,
         activations=activations,
+        declared_records=declared_records,
     )
     if args.format == "json":
         emit_json(payload)
