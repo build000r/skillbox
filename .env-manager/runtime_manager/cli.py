@@ -45,6 +45,11 @@ from .agent_snapshots import (
     save_snapshot,
 )
 from .fleet_converge import build_fleet_converge_plan, fleet_converge_text_lines
+from .fleet_relink import (
+    apply_relink_plan,
+    build_relink_plan,
+    relink_text_lines,
+)
 
 
 class DistributionPreviewError(RuntimeError):
@@ -839,6 +844,86 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_profile_arg(fleet_converge_parser)
     _add_client_arg(fleet_converge_parser)
+
+    fleet_relink_parser = fleet_subparsers.add_parser(
+        "relink",
+        help=(
+            "Machine-migration bulk rewrite: repoint other-machine skill links onto "
+            "this box's tree (old-root -> new-root). --dry-run is the DEFAULT; --yes "
+            "applies. Only rewrites a link when the translated target EXISTS and is a "
+            "valid skill dir; otherwise leaves it for converge. NEVER touches healthy links."
+        ),
+        description=(
+            "First-class the single biggest drift generator: a machine move. For every "
+            "other-machine installed link in the fleet, translate its target from the "
+            "source root onto the destination root via machines.yaml. If the translated "
+            "target EXISTS and is a valid skill dir, repoint the link in place "
+            "(ln -sfn). Otherwise reclassify it (moved/dangling) and LEAVE it for "
+            "`fleet converge` — relink never prunes and never guesses. Roots default "
+            "from machines.yaml: --to-root is this machine's canonical repo root and "
+            "--from-root is every other machine's repo roots, so `fleet relink` with no "
+            "roots means 'relink everything foreign to this box back onto it'. --dry-run "
+            "is the DEFAULT and is symmetric with apply (same plan); --yes is required "
+            "to write. --cwd scopes to one repo. Healthy links are never candidates."
+        ),
+    )
+    fleet_relink_parser.add_argument("--format", choices=("text", "json"), default="text")
+    fleet_relink_parser.add_argument(
+        "--from-root",
+        dest="from_root",
+        default=None,
+        help="Source root to rewrite FROM (e.g. /Users/b/repos). Defaults to every other machine's repo roots from machines.yaml.",
+    )
+    fleet_relink_parser.add_argument(
+        "--to-root",
+        dest="to_root",
+        default=None,
+        help="Destination root to rewrite TO (e.g. /srv/skillbox/repos). Defaults to this machine's canonical repo root from machines.yaml.",
+    )
+    fleet_relink_parser.add_argument(
+        "--cwd",
+        default=None,
+        help="Scope the relink to a single repo dir. Defaults to the whole deduped canonical fleet.",
+    )
+    fleet_relink_parser.add_argument(
+        "--scan-root",
+        action="append",
+        default=None,
+        help="Root to scan for git repos. Can be repeated. Defaults to skill_install_scan_roots from skill-scope.yaml.",
+    )
+    fleet_relink_parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=3,
+        help="Maximum directory depth under each scan root when finding git repos.",
+    )
+    fleet_relink_parser.add_argument(
+        "--limit",
+        type=int,
+        default=40,
+        help="Maximum repo sections to show in text output (0 = unlimited).",
+    )
+    fleet_relink_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Include repos with no relink actions in the plan as well.",
+    )
+    fleet_relink_parser.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=True,
+        help="Plan only (the DEFAULT). Symmetric with apply: prints exactly what --yes would write. No-op affordance; relink is dry-run unless --yes is passed.",
+    )
+    fleet_relink_parser.add_argument(
+        "--yes",
+        dest="apply",
+        action="store_true",
+        default=False,
+        help="Apply the rewrite actions (repoint the links). Without --yes this is a dry-run.",
+    )
+    _add_profile_arg(fleet_relink_parser)
+    _add_client_arg(fleet_relink_parser)
 
     evidence_parser = subparsers.add_parser(
         "evidence",
@@ -3524,6 +3609,8 @@ def _handle_fleet(args: argparse.Namespace, root_dir: Path, model: dict[str, Any
     action = str(getattr(args, "fleet_action", "") or "")
     if action == "converge":
         return _handle_fleet_converge(args, root_dir, model, resolved_mode)
+    if action == "relink":
+        return _handle_fleet_relink(args, root_dir, model, resolved_mode)
     raise RuntimeError(f"unknown fleet action: {action!r}")
 
 
@@ -3548,6 +3635,49 @@ def _handle_fleet_converge(args: argparse.Namespace, root_dir: Path, model: dict
     else:
         for line in fleet_converge_text_lines(plan, limit=max(0, int(args.limit))):
             print(line)
+    return EXIT_OK
+
+
+def _handle_fleet_relink(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    del root_dir, resolved_mode
+    # --dry-run is the DEFAULT and is symmetric with apply: the plan an apply
+    # executes is byte-for-byte the plan a dry-run prints. --yes (args.apply) is
+    # the only thing that writes, and it executes ONLY the rewrite actions the
+    # plan already enumerates (reclassify links are left for converge).
+    apply = bool(getattr(args, "apply", False))
+    plan = build_relink_plan(
+        model,
+        from_root=getattr(args, "from_root", None),
+        to_root=getattr(args, "to_root", None),
+        cwd=getattr(args, "cwd", None),
+        scan_roots=getattr(args, "scan_root", None),
+        max_depth=max(0, int(args.max_depth)),
+        include_clean=bool(getattr(args, "all", False)),
+        apply=apply,
+    )
+    applied: dict[str, Any] | None = None
+    if apply:
+        applied = apply_relink_plan(plan, dry_run=False)
+
+    if args.format == "json":
+        payload = dict(plan)
+        if applied is not None:
+            payload["applied"] = applied
+        emit_json(payload)
+    else:
+        for line in relink_text_lines(plan, limit=max(0, int(args.limit))):
+            print(line)
+        if applied is not None:
+            summary = applied.get("summary") or {}
+            print("")
+            print(
+                f"applied: rewritten={summary.get('rewritten', 0)} "
+                f"failed={summary.get('failed', 0)} "
+                f"skipped_reclassify={summary.get('skipped_reclassify', 0)}"
+            )
+    # Surface a root-resolution error as drift so callers/CI can gate on it.
+    if (plan.get("roots") or {}).get("error"):
+        return EXIT_DRIFT
     return EXIT_OK
 
 
