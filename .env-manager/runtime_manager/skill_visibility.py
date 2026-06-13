@@ -562,6 +562,48 @@ def unlink_overlay_scoped_skills(
     return sorted(removed)
 
 
+def _activations_from_sync_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Group a sync plan's link actions per skill and build activation packets.
+
+    The plan (built by ``skill_lifecycle_plan(model, "sync", ...)``) is the
+    contract: whatever it plans to link is exactly what activate reports. We
+    derive one activation entry per linked skill so the requesting agent can
+    use the SKILL.md content immediately, while the on-disk symlinks make the
+    skill visible to future sessions. Because dry-run and apply build the same
+    plan, the activation list is identical in both modes — zero surprises.
+    """
+    by_skill: dict[str, list[dict[str, Any]]] = {}
+    for action in plan.get("actions") or []:
+        if action.get("op") != "link":
+            continue
+        skill_name = str(action.get("skill") or "")
+        if not skill_name:
+            continue
+        by_skill.setdefault(skill_name, []).append(action)
+
+    activations: list[dict[str, Any]] = []
+    for skill_name in sorted(by_skill):
+        actions = by_skill[skill_name]
+        source = str(actions[0].get("source") or "")
+        selected_source = {
+            "source": source,
+            "source_bucket": actions[0].get("source_bucket"),
+        }
+        packet, packet_warning = _activation_packet(skill_name, selected_source, actions)
+        activations.append({
+            "skill": skill_name,
+            "summary": {
+                "actions": len(actions),
+                "link": sum(1 for item in actions if item.get("op") == "link"),
+                "blocked": sum(1 for item in actions if item.get("blocked_reason")),
+            },
+            "warnings": [packet_warning] if packet_warning else [],
+            "actions": actions,
+            "activation_packet": packet,
+        })
+    return activations
+
+
 def activate_overlay_scoped_skills(
     model: dict[str, Any],
     overlay_name: str,
@@ -574,33 +616,53 @@ def activate_overlay_scoped_skills(
     allow_directories: bool = False,
     force: bool = False,
 ) -> list[dict[str, Any]]:
-    """Activate literal skills for one overlay without changing overlay state."""
-    activations: list[dict[str, Any]] = []
-    for skill_name in sorted(overlay_scoped_skill_names(model, overlay_name)):
-        activation_plan = skill_lifecycle_plan(
+    """Policy-evaluate one overlay for THIS invocation, scoped to ``cwd``.
+
+    This is equivalent to ``SKILLBOX_OVERLAYS=<overlay_name> skill sync``
+    narrowed to ``cwd`` — it runs the SAME policy evaluation as ``skill sync``
+    rather than blindly linking every literal overlay-tagged skill. The named
+    overlay is treated as active only for the duration of this call (the
+    ``SKILLBOX_OVERLAYS`` env var that ``active_overlays`` reads is patched and
+    restored), so NO overlay state is persisted.
+
+    The sync plan it builds is the contract: ``--dry-run`` previews exactly the
+    set ``apply`` would link, so activating an overlay in a cwd that the policy
+    does not match links the policy-correct set (often zero), never all of the
+    overlay's literal skills.
+    """
+    target = (overlay_name or "").strip()
+    if not target:
+        return []
+
+    previous = os.environ.get(OVERLAY_ENV_VAR)
+    forced = [item for item in (previous or "").split(",") if item.strip()]
+    if target not in forced:
+        forced.append(target)
+    os.environ[OVERLAY_ENV_VAR] = ",".join(forced)
+    try:
+        plan = skill_lifecycle_plan(
             model,
-            "activate",
-            skill_name=skill_name,
+            "sync",
+            skill_name=None,
             cwd=str(cwd),
             to=to,
             categories=categories or [],
             source=source,
             force=force,
         )
-        activation_result = apply_skill_lifecycle_plan(
-            activation_plan,
+        plan = apply_skill_lifecycle_plan(
+            plan,
             dry_run=dry_run,
             allow_directories=allow_directories,
             force=force,
         )
-        activations.append({
-            "skill": skill_name,
-            "summary": activation_result.get("summary"),
-            "warnings": activation_result.get("warnings") or [],
-            "actions": activation_result.get("actions") or [],
-            "activation_packet": activation_result.get("activation_packet"),
-        })
-    return activations
+    finally:
+        if previous is None:
+            os.environ.pop(OVERLAY_ENV_VAR, None)
+        else:
+            os.environ[OVERLAY_ENV_VAR] = previous
+
+    return _activations_from_sync_plan(plan)
 
 
 def _load_scope_policy(path: Path) -> dict[str, Any] | None:

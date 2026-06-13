@@ -1159,7 +1159,8 @@ class SkillVisibilityTests(unittest.TestCase):
                 "rules:\n"
                 "  - id: marketing-local\n"
                 "    overlay: marketing\n"
-                "    skills: [hot-skill]\n",
+                "    skills: [hot-skill]\n"
+                f"    paths: [{root / 'repos'}]\n",
                 encoding="utf-8",
             )
             model = {
@@ -1205,7 +1206,8 @@ class SkillVisibilityTests(unittest.TestCase):
                 "rules:\n"
                 "  - id: marketing-local\n"
                 "    overlay: marketing\n"
-                "    skills: [hot-skill]\n",
+                "    skills: [hot-skill]\n"
+                f"    paths: [{project}]\n",
                 encoding="utf-8",
             )
             model = {

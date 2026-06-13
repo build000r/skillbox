@@ -1009,13 +1009,26 @@ def _build_parser() -> argparse.ArgumentParser:
     overlay_parser = subparsers.add_parser(
         "overlay",
         help="List, enable, disable, toggle, or activate skill scope overlays (e.g. marketing).",
+        description=(
+            "Manage skill-scope overlays. `activate` is policy-evaluated and ephemeral: "
+            "it runs the SAME policy evaluation as `skill sync` with the named overlay "
+            "treated as active for THIS invocation only (equivalent to "
+            "`SKILLBOX_OVERLAYS=<name> skill sync` scoped to --cwd), persists NO overlay "
+            "state, and links only the policy-correct set for --cwd (often zero in a "
+            "non-matching dir) — never every literal overlay-tagged skill. `--dry-run` "
+            "previews exactly the plan `activate` would apply."
+        ),
     )
     overlay_parser.add_argument(
         "action",
         nargs="?",
         default="list",
         choices=("list", "on", "off", "toggle", "activate"),
-        help="list (default), on, off, toggle, or activate.",
+        help=(
+            "list (default), on, off, toggle, or activate. activate is "
+            "policy-evaluated and cwd-scoped (same evaluation as `skill sync` with "
+            "the overlay forced active for this call only); it persists no state."
+        ),
     )
     overlay_parser.add_argument("name", nargs="?", help="Overlay name, e.g. marketing.")
     overlay_parser.add_argument("--cwd", default=None, help="Target cwd for scoped unlinks. Defaults to $PWD.")
