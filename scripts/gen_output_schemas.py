@@ -93,6 +93,7 @@ FIELD_NOTES: dict[str, dict[str, tuple[str, str]]] = {
         "matched_scope_rules": (CONTRACT, "skill-scope.yaml rules in force for this cwd (id + provenance)."),
         "summary": (CONTRACT, "Roll-up counters; keys are stable, add-only. Branch on these first."),
         "parity": (CONTRACT, "Claude<->Codex GLOBAL skill-surface parity (empty when --no-global)."),
+        "overlay_audit": (INFO, "Declared-overlay registry audit: declared + active overlays and warnings for active overlays not in the registry (advisory, never a hard fail; only when an overlays: block is declared)."),
         "effective": (CONTRACT, "The skills actually visible at this cwd after layer resolution."),
         "issues": (CONTRACT, "Policy problems grouped by kind (broken_project, missing_for_cwd, scope_violations, ...)."),
         "beads": (CONTRACT, "Beads requirement/readiness derived from effective skills' frontmatter."),
