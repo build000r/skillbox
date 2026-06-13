@@ -256,18 +256,30 @@ class RepoIdentityE2ETests(unittest.TestCase):
             )
             self.assertEqual(payload_app["matched_scope_rules"], [])
 
-    # -- unknown id -> clear error WITH did-you-mean -------------------------
-    def test_unknown_id_raises_with_did_you_mean_hint(self) -> None:
-        """An unknown ``repos:`` id surfaces RegistryResolutionError + a fix hint."""
-        rule = {"id": "typo", "skills": ["x"], "repos": ["app-cor"]}  # near app-core
+    # -- unknown id -> error surfaced WITH did-you-mean, rule SKIPPED ---------
+    def test_unknown_id_is_surfaced_without_nuking_the_report(self) -> None:
+        """An unknown ``repos:`` id is reported via ``last_scope_rule_errors`` with
+        a did-you-mean hint, but it is SKIPPED so the rest of the report survives
+        (BUG C: one typo'd rule must not take down the whole report).
+        """
+        typo_rule = {"id": "typo", "skills": ["x"], "repos": ["app-cor"]}  # near app-core
+        good_rule = {"id": "app-local", "skills": ["app-*"], "repos": ["app-core"]}
         with _FleetRegistryHarness(machine_id="devbox-like", repo_roots=DEVBOX_ROOTS):
-            model = _model_with_inline_policy([rule])
-            with self.assertRaises(sv.RegistryResolutionError) as ctx:
-                sv.collect_skill_visibility(
-                    model, cwd="/srv/skillbox/repos/app_core",
-                    include_global=False, include_project=False,
-                )
-        message = str(ctx.exception)
+            model = _model_with_inline_policy([typo_rule, good_rule])
+            # The report resolves cleanly (no raise) even with a typo'd rule.
+            payload = sv.collect_skill_visibility(
+                model, cwd="/srv/skillbox/repos/app_core/src",
+                include_global=False, include_project=False,
+            )
+            errors = sv.last_scope_rule_errors()
+        # The GOOD rule still matched — the typo did not nuke it.
+        matched = payload["matched_scope_rules"]
+        self.assertEqual([item["id"] for item in matched], ["app-local"])
+        self.assertIn("/srv/skillbox/repos/app_core", matched[0]["paths"])
+        # The typo is surfaced as a collected error with the self-healing hint.
+        self.assertEqual([e["rule_id"] for e in errors], ["typo"])
+        self.assertEqual(errors[0]["type"], "RegistryResolutionError")
+        message = errors[0]["error"]
         self.assertIn("'app-cor' not in registry/repos.yaml", message)
         self.assertIn("did you mean 'app-core'", message)
         self.assertIn("declared ids:", message)
@@ -361,11 +373,19 @@ class RepoIdentityE2ETests(unittest.TestCase):
         self.assertEqual(id_matched[0]["match"], literal_matched[0]["match"])
 
     # -- registry-path-duplication lint: fires / does NOT fire ----------------
-    def test_lint_fires_on_literal_path_covered_by_id(self) -> None:
-        """The lint WARNS on a literal path a registry id already covers."""
+    def test_lint_fires_when_literals_enumerate_the_full_resolved_set(self) -> None:
+        """The lint WARNS only when the rule's literals enumerate the id's FULL
+        resolved set (a no-op ``repos:`` swap). On the devbox-like profile the
+        ``api-server`` id resolves to BOTH the home form and the /srv re-rooting, so
+        the rule must list both spellings to be a genuine duplicate (the y8w fix:
+        equality, not membership)."""
         policy = {
             "rules": [
-                {"id": "api-old", "skills": ["x"], "paths": ["/srv/skillbox/repos/api_server"]},
+                {
+                    "id": "api-old",
+                    "skills": ["x"],
+                    "paths": ["~/repos/api_server", "/srv/skillbox/repos/api_server"],
+                },
             ]
         }
         with _FleetRegistryHarness(machine_id="devbox-like", repo_roots=DEVBOX_ROOTS):
@@ -380,6 +400,24 @@ class RepoIdentityE2ETests(unittest.TestCase):
         redundant = result.details["redundant"]
         self.assertEqual(redundant[0]["rule"], "api-old")
         self.assertEqual(redundant[0]["registry_id"], "api-server")
+
+    def test_lint_does_not_fire_on_subset_literal_that_repos_would_widen(self) -> None:
+        """BUG 1 regression at the fleet level: a single /srv-form literal is a
+        STRICT SUBSET of the id's two-spelling resolved set on the devbox-like
+        profile, so swapping it for ``repos: [api-server]`` would WIDEN the match
+        set (add the home form). The lint must STAY SILENT."""
+        policy = {
+            "rules": [
+                {"id": "api-narrow", "skills": ["x"], "paths": ["/srv/skillbox/repos/api_server"]},
+            ]
+        }
+        with _FleetRegistryHarness(machine_id="devbox-like", repo_roots=DEVBOX_ROOTS):
+            results = validate_registry_path_duplication(policy, policy_path="inline:e2e")
+        self.assertEqual(
+            results[0].status,
+            "pass",
+            f"subset literal must not be flagged: {results[0].details}",
+        )
 
     def test_lint_does_not_fire_on_uncovered_path(self) -> None:
         """The lint PASSES on a literal path no registry id covers."""

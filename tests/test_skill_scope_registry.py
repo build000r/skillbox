@@ -245,5 +245,220 @@ class MigratedRuleEquivalenceTests(unittest.TestCase):
         self.assertTrue(before.issubset(set(after)), f"{before - set(after)} missing")
 
 
+class _UndetectedMachineHarness:
+    """Like _ResolverHarness but reports the machine as UNDETECTED (None, None).
+
+    Reproduces the failure mode where ``_machines_classifier`` swallowed every
+    error (missing/broken machines.yaml, unmatched hostname, a renamed host, a
+    worker container) to ``(None, None)``. The registry is still readable so an id
+    is "known" — only re-rooting is impossible.
+    """
+
+    def __enter__(self) -> None:
+        sv._registry_doctor_module_override = _fake_registry_doctor  # type: ignore[attr-defined]
+        sv._machines_classifier_override = lambda: (None, None)  # type: ignore[attr-defined]
+        self._prev_env = sv.os.environ.get(sv.REGISTRY_FILE_ENV_VAR)
+        sv.os.environ[sv.REGISTRY_FILE_ENV_VAR] = __file__
+
+    def __exit__(self, *_exc: object) -> None:
+        sv.__dict__.pop("_registry_doctor_module_override", None)
+        sv.__dict__.pop("_machines_classifier_override", None)
+        if self._prev_env is None:
+            sv.os.environ.pop(sv.REGISTRY_FILE_ENV_VAR, None)
+        else:
+            sv.os.environ[sv.REGISTRY_FILE_ENV_VAR] = self._prev_env
+
+
+class UndetectedMachineFailLoudTests(unittest.TestCase):
+    """BUG A: a registry-id rule used while the current machine is UNDETECTED must
+    FAIL LOUD rather than silently collapse to the home-form-only spelling (which
+    matches NO real ``/srv/skillbox/repos/<repo>`` cwd → skills silently vanish).
+    """
+
+    def test_repos_id_under_repos_root_raises_when_machine_undetected(self) -> None:
+        with _UndetectedMachineHarness():
+            entries = sv._load_registry_entries()
+            with self.assertRaises(sv.RegistryResolutionError) as ctx:
+                sv._resolve_scope_rule_repos(["htma"], [], entries)
+        message = str(ctx.exception)
+        self.assertIn("current machine undetected", message)
+        self.assertIn("machines.yaml", message)
+        self.assertIn("SKILLBOX_MACHINE", message)
+
+    def test_category_under_repos_root_raises_when_machine_undetected(self) -> None:
+        # A registry-bucket category that expands to ~/repos repos is equally
+        # unresolvable when the machine is undetected.
+        with _UndetectedMachineHarness():
+            entries = sv._load_registry_entries()
+            with self.assertRaises(sv.RegistryResolutionError):
+                sv._resolve_scope_rule_repos([], ["backend"], entries)
+
+    def test_non_repos_root_id_still_resolves_when_machine_undetected(self) -> None:
+        # mmd-pcb lives under ~/hard (NOT a repo root that needs re-rooting), so it
+        # expands home-relative as-is even with the machine undetected — the
+        # fail-loud guard fires ONLY for paths that actually need re-rooting.
+        with _UndetectedMachineHarness():
+            entries = sv._load_registry_entries()
+            paths, _ = sv._resolve_scope_rule_repos(["mmd-pcb"], [], entries)
+        self.assertEqual(paths, [sv._expand_policy_path("~/hard/mmd-pcb")])
+
+    def test_detected_machine_still_resolves_unchanged(self) -> None:
+        # The healthy path is unaffected: a detected machine re-roots normally.
+        with _ResolverHarness(repo_roots=("/srv/skillbox/repos",)):
+            entries = sv._load_registry_entries()
+            paths, _ = sv._resolve_scope_rule_repos(["htma"], [], entries)
+        self.assertIn("/srv/skillbox/repos/htma", paths)
+
+
+class MalformedRegistryEntryTests(unittest.TestCase):
+    """BUG B: a known registry id whose entry has a missing/empty ``path`` is a
+    MALFORMED entry — it must raise (consistent with unknown-id), not silently
+    resolve to [] and make the rule match nothing.
+    """
+
+    def _harness_with(self, repos: list[dict]) -> None:
+        # Install a fake registry exposing the supplied repos + a detected machine.
+        def fake() -> types.SimpleNamespace:
+            return types.SimpleNamespace(
+                load_registry=lambda _p: {"repos": [dict(r) for r in repos]},
+                DEFAULT_REGISTRY="/fake/registry/repos.yaml",
+            )
+
+        sv._registry_doctor_module_override = fake  # type: ignore[attr-defined]
+        config = _machines_config(repo_roots=("/srv/skillbox/repos",))
+        sv._machines_classifier_override = lambda: (config, "test-machine")  # type: ignore[attr-defined]
+        self._prev_env = sv.os.environ.get(sv.REGISTRY_FILE_ENV_VAR)
+        sv.os.environ[sv.REGISTRY_FILE_ENV_VAR] = __file__
+
+    def tearDown(self) -> None:
+        sv.__dict__.pop("_registry_doctor_module_override", None)
+        sv.__dict__.pop("_machines_classifier_override", None)
+        prev = getattr(self, "_prev_env", None)
+        if prev is None:
+            sv.os.environ.pop(sv.REGISTRY_FILE_ENV_VAR, None)
+        else:
+            sv.os.environ[sv.REGISTRY_FILE_ENV_VAR] = prev
+
+    def test_empty_path_entry_raises(self) -> None:
+        self._harness_with([{"id": "broke", "path": "", "bucket": "app"}])
+        entries = sv._load_registry_entries()
+        with self.assertRaises(sv.RegistryResolutionError) as ctx:
+            sv._resolve_scope_rule_repos(["broke"], [], entries)
+        message = str(ctx.exception)
+        self.assertIn("broke", message)
+        self.assertIn("missing/empty", message)
+
+    def test_missing_path_key_entry_raises(self) -> None:
+        self._harness_with([{"id": "broke", "bucket": "app"}])
+        entries = sv._load_registry_entries()
+        with self.assertRaises(sv.RegistryResolutionError):
+            sv._resolve_scope_rule_repos(["broke"], [], entries)
+
+    def test_category_with_one_malformed_member_raises(self) -> None:
+        # A bucket whose member has an empty path is equally malformed.
+        self._harness_with([{"id": "broke", "path": "", "bucket": "backend"}])
+        entries = sv._load_registry_entries()
+        with self.assertRaises(sv.RegistryResolutionError):
+            sv._resolve_scope_rule_repos([], ["backend"], entries)
+
+
+class ScalarSkillsPatternTests(unittest.TestCase):
+    """BUG D: a SCALAR ``skills:`` string must become a single-element pattern
+    list, not be char-iterated (``skills: foo`` → ``['f','o','o']``).
+    """
+
+    def test_scalar_skills_string_is_single_pattern(self) -> None:
+        self.assertEqual(sv._scope_rule_patterns({"skills": "foo"}), ["foo"])
+
+    def test_list_skills_unchanged(self) -> None:
+        self.assertEqual(
+            sv._scope_rule_patterns({"skills": ["foo", "bar"]}), ["foo", "bar"]
+        )
+
+    def test_scalar_patterns_alias_is_single_pattern(self) -> None:
+        self.assertEqual(sv._scope_rule_patterns({"patterns": "baz"}), ["baz"])
+
+    def test_scalar_names_alias_is_single_pattern(self) -> None:
+        self.assertEqual(sv._scope_rule_patterns({"names": "qux"}), ["qux"])
+
+    def test_empty_skills_falls_through_to_patterns(self) -> None:
+        # Back-compat: an empty/absent key still falls through to the next alias.
+        self.assertEqual(
+            sv._scope_rule_patterns({"skills": [], "patterns": ["p"]}), ["p"]
+        )
+
+    def test_scalar_skills_threads_through_scope_rule_from_raw(self) -> None:
+        # End-to-end: a rule authored with a scalar skills string yields ONE
+        # pattern (so the rule survives instead of becoming char-fragment patterns).
+        raw_rule = {"id": "scalar", "skills": "htma-deploy", "paths": ["~/repos/x"]}
+        rule = sv._scope_rule_from_raw(
+            raw_rule,
+            index=0,
+            policy={"_policy_path": "/p.yaml"},
+            categories={},
+            overlays_on=set(),
+            registry_entries=[],
+        )
+        assert rule is not None
+        self.assertEqual(rule["patterns"], ["htma-deploy"])
+
+
+class ResilientScopeRulesTests(unittest.TestCase):
+    """BUG C: one bad rule must not nuke the WHOLE report. ``_scope_rules`` SKIPS
+    the bad rule, keeps resolving the rest, and surfaces the error via
+    ``last_scope_rule_errors`` so a doctor lint can report the typo.
+    """
+
+    def _model(self, rules: list[dict]) -> dict:
+        return {
+            "env": {},
+            "active_clients": [],
+            "active_profiles": ["core"],
+            "clients": [
+                {
+                    "id": "c",
+                    "context": {
+                        "skill_scope": {"_policy_path": "inline:c", "rules": rules}
+                    },
+                }
+            ],
+            "skills": [],
+        }
+
+    def test_one_typo_does_not_drop_the_other_rules(self) -> None:
+        good = {"id": "good", "skills": ["g-*"], "repos": ["htma"]}
+        typo = {"id": "typo", "skills": ["t-*"], "repos": ["htmaa"]}  # near htma
+        with _ResolverHarness(repo_roots=("/srv/skillbox/repos",)):
+            rules = sv._scope_rules(self._model([typo, good]))
+            errors = sv.last_scope_rule_errors()
+        # The good rule survived; the typo'd rule was skipped.
+        ids = [r["id"] for r in rules]
+        self.assertIn("good", ids)
+        self.assertNotIn("typo", ids)
+        # The typo is surfaced with the self-healing hint.
+        self.assertEqual([e["rule_id"] for e in errors], ["typo"])
+        self.assertEqual(errors[0]["type"], "RegistryResolutionError")
+        self.assertIn("'htmaa' not in registry/repos.yaml", errors[0]["error"])
+        self.assertIn("did you mean 'htma'", errors[0]["error"])
+
+    def test_clean_pass_records_no_errors(self) -> None:
+        good = {"id": "good", "skills": ["g-*"], "repos": ["htma"]}
+        with _ResolverHarness(repo_roots=("/srv/skillbox/repos",)):
+            rules = sv._scope_rules(self._model([good]))
+            errors = sv.last_scope_rule_errors()
+        self.assertEqual([r["id"] for r in rules], ["good"])
+        self.assertEqual(errors, [])
+
+    def test_errors_are_reset_each_pass(self) -> None:
+        typo = {"id": "typo", "skills": ["t-*"], "repos": ["htmaa"]}
+        good = {"id": "good", "skills": ["g-*"], "repos": ["htma"]}
+        with _ResolverHarness(repo_roots=("/srv/skillbox/repos",)):
+            sv._scope_rules(self._model([typo]))
+            self.assertEqual(len(sv.last_scope_rule_errors()), 1)
+            # A subsequent clean pass clears the prior pass's errors.
+            sv._scope_rules(self._model([good]))
+            self.assertEqual(sv.last_scope_rule_errors(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

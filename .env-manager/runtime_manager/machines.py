@@ -225,14 +225,22 @@ class MachinesConfig:
         canon = self.canonicalize_alias(path)
 
         for src_roots, dst_roots in self._root_pairs(src, dst, category):
-            match = _match_under_roots(canon, src_roots)
+            # Home-anchor the SOURCE profile's ~ roots to its declared home, so a
+            # foreign machine's ~/repos is not expanded against the local $HOME.
+            match = _match_under_roots(canon, src_roots, profile=src)
             if match is None:
                 continue
             _matched_root, remainder = match
             dst_root = dst_roots[0] if dst_roots else None
             if dst_root is None:
                 return None
-            return _join_under(dst_root, remainder)
+            # Home-anchor the DST canonical root to the dst profile's declared
+            # home when it is ~-relative, so the translated path lands under the
+            # foreign machine's home rather than this box's local $HOME.
+            dst_base = _resolve_dst_root(dst_root, dst)
+            if dst_base is None:
+                return None
+            return _join_under(dst_base, remainder)
         return None
 
     def _root_pairs(
@@ -271,7 +279,9 @@ class MachinesConfig:
                 ("repos", profile.repo_roots),
                 ("projects", profile.projects_roots),
             ):
-                hit = _match_under_roots(canon, roots)
+                # Home-anchor this profile's ~ roots to ITS declared home, so a
+                # foreign machine's ~/repos never matches a local-home path.
+                hit = _match_under_roots(canon, roots, profile=profile)
                 if hit is None:
                     continue
                 root, remainder = hit
@@ -549,9 +559,42 @@ def current_profile(
 
 
 def _expand(path: str) -> str:
-    """Expand ~ and env vars, then normalize. No symlink resolution."""
+    """Expand ~ and env vars against the LOCAL env, then normalize.
+
+    Use ONLY for the current machine's own roots (or non-``~`` paths). For a
+    FOREIGN machine's ``~``-relative root, see :func:`_expand_profile_root`:
+    expanding the mac's ``~/repos`` against the devbox's local ``$HOME`` wrongly
+    resolves it to ``/srv/skillbox/home/repos`` and misclassifies a managed-home
+    path as belonging to the other machine (BUG E). No symlink resolution.
+    """
     expanded = os.path.expanduser(os.path.expandvars(path))
     return _normalize(expanded)
+
+
+def _starts_with_home_ref(path: str) -> bool:
+    """True when ``path`` is ``~``-relative (``~`` or ``~/...``); NOT ``~user``."""
+    text = str(path or "")
+    return text == "~" or text.startswith("~/")
+
+
+def _expand_profile_root(root: str, home: str | None) -> str | None:
+    """Expand a profile root for matching, honoring the profile's declared home.
+
+    A ``~``-relative root is expanded against ``home`` (the profile's declared
+    ``home``/``managed_home``), NOT the local ``$HOME``, so a FOREIGN machine's
+    ``~/repos`` resolves under THAT machine's home rather than this box's. When a
+    ``~``-relative root has no declared home to anchor it, return ``None`` so the
+    caller SKIPS it (a local-home path must not match an unanchored foreign ``~``
+    root). Non-``~`` roots and ``$VAR`` expansion are unchanged.
+    """
+    raw = str(root or "")
+    if _starts_with_home_ref(raw):
+        if not home:
+            return None
+        remainder = raw[1:].lstrip("/")  # drop the leading "~"
+        base = _normalize(os.path.expandvars(home))
+        return _join_under(base, remainder) if remainder else base
+    return _expand(raw)
 
 
 def _normalize(path: str | os.PathLike[str]) -> str:
@@ -605,20 +648,93 @@ def _is_under(root: str, candidate: str) -> str | None:
     return None
 
 
+def _profile_home_bases(profile: "MachineProfile | None") -> list[str]:
+    """Candidate home bases for expanding a profile's ``~``-relative roots.
+
+    Both the declared ``home`` and (when present) the agent-managed
+    ``managed_home`` anchor ``~`` for that machine, so a ``~/repos`` root matches
+    under either home tree. Empty when the profile declares no home — its ``~``
+    roots are then skipped rather than matched against the local ``$HOME``.
+    """
+    if profile is None:
+        return []
+    bases: list[str] = []
+    for candidate in (profile.home, profile.managed_home):
+        if candidate and str(candidate).strip():
+            bases.append(str(candidate))
+    return bases
+
+
+def _expand_roots_for_match(
+    roots: Iterable[str], profile: "MachineProfile | None"
+) -> list[str]:
+    """Expand a profile's roots for matching, home-anchoring its ``~`` roots.
+
+    Non-``~`` roots expand against the local env (deployment-absolute paths). A
+    ``~``-relative root expands against EACH of the profile's declared home bases
+    (:func:`_profile_home_bases`); with no declared home it is SKIPPED — never
+    matched against the local ``$HOME`` (BUG E). When no profile is supplied the
+    legacy local-``~`` behavior is preserved so the current-machine path is
+    unaffected.
+    """
+    expanded: list[str] = []
+    homes = _profile_home_bases(profile)
+    for root in roots:
+        raw = str(root or "")
+        if _starts_with_home_ref(raw):
+            if profile is None:
+                expanded.append(_expand(raw))  # legacy: current-machine local ~
+                continue
+            for home in homes:
+                resolved = _expand_profile_root(raw, home)
+                if resolved is not None:
+                    expanded.append(resolved)
+            # No declared home -> skip this ~ root entirely.
+        else:
+            expanded.append(_expand(raw))
+    return expanded
+
+
+def _resolve_dst_root(root: str, profile: "MachineProfile | None") -> str | None:
+    """Expand a translation DESTINATION root, home-anchoring a ~ root.
+
+    A ~-relative dst canonical root expands against the dst profile's declared
+    home (NOT the local $HOME); with no declared home it cannot be anchored, so
+    return ``None`` (nothing to translate to). Non-~ roots expand normally.
+    """
+    raw = str(root or "")
+    if _starts_with_home_ref(raw):
+        for home in _profile_home_bases(profile):
+            resolved = _expand_profile_root(raw, home)
+            if resolved is not None:
+                return resolved
+        return None
+    return _expand(raw)
+
+
 def _match_under_roots(
-    path: str, roots: Iterable[str]
+    path: str,
+    roots: Iterable[str],
+    *,
+    profile: "MachineProfile | None" = None,
 ) -> tuple[str, str] | None:
-    """Return ``(matched_root, remainder)`` for the longest matching root."""
+    """Return ``(matched_root, remainder)`` for the longest matching root.
+
+    ``profile`` (when given) home-anchors the profile's ``~``-relative roots so a
+    FOREIGN machine's ``~/repos`` is NOT expanded against the local ``$HOME``
+    (BUG E). The returned ``matched_root`` is the EXPANDED path actually matched
+    (so a ``~`` root reports its home-anchored form, not the raw ``~`` spelling).
+    """
     best: tuple[str, str] | None = None
     best_len = -1
-    for root in roots:
-        remainder = _is_under(_expand(root), path)
+    for expanded_root in _expand_roots_for_match(roots, profile):
+        remainder = _is_under(expanded_root, path)
         if remainder is None:
             continue
-        root_len = len(_expand(root))
+        root_len = len(expanded_root)
         if root_len > best_len:
             best_len = root_len
-            best = (root, remainder)
+            best = (expanded_root, remainder)
     return best
 
 

@@ -66,6 +66,7 @@ byte-for-byte the plan a dry-run prints — the only difference is whether the
 from __future__ import annotations
 
 import os
+import shlex
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -76,9 +77,13 @@ from . import skill_visibility as _sv
 # Stable decision vocabulary. ``rewrite`` is the only action an apply executes.
 RELINK_DECISIONS = ("rewrite", "reclassify")
 
-# The reclassify reasons mirror the broken-link taxonomy origins a relink hands
-# back to converge when it declines to rewrite.
-RECLASSIFY_MOVED = "moved"
+# The reclassify origin a relink hands back to converge when it declines to
+# rewrite. Relink itself never re-derives moved-vs-dangling (it has no
+# source-corpus lookup), so it always reclassifies as ``dangling`` and lets
+# converge's own taxonomy re-classify the link (moved/dangling/etc.) from the
+# full source corpus. There is intentionally no ``RECLASSIFY_MOVED``: relink
+# cannot distinguish a moved link, so claiming it could would be a lie in the
+# plan text.
 RECLASSIFY_DANGLING = "dangling"
 
 
@@ -187,7 +192,15 @@ def _translate_target(
             canon = target
 
     if roots.get("mode") == "default" and config is not None and machine_id:
-        # Try translating from each other machine into the current one.
+        # Try translating from each other machine into the current one. A target
+        # can be under several machines' roots when those roots prefix-overlap
+        # (e.g. /Users/b and /Users/b/repos belong to different profiles); the
+        # first machine in machines.yaml order is NOT necessarily the correct
+        # owner. Collect EVERY candidate and pick the translation whose matched
+        # SOURCE root is the longest (most specific), with a deterministic
+        # tiebreak (translated target, then machine id) on equal length so the
+        # same link always relinks to the same target run-to-run.
+        best: tuple[int, str, str] | None = None  # (-match_len, translated, other_id)
         for other_id, profile in config.machines.items():
             if other_id == machine_id:
                 continue
@@ -195,9 +208,13 @@ def _translate_target(
                 translated = config.translate_path(canon, other_id, machine_id, category="repos")
             except Exception:
                 translated = None
-            if translated:
-                return translated
-        return None
+            if not translated:
+                continue
+            match_len = _matched_source_root_len(canon, profile)
+            candidate = (-match_len, str(translated), str(other_id))
+            if best is None or candidate < best:
+                best = candidate
+        return best[1] if best is not None else None
 
     # Explicit mode: literal prefix swap on the single declared pair.
     from_roots = roots.get("from_roots") or []
@@ -210,6 +227,24 @@ def _translate_target(
             continue
         return _join_under(to_root, remainder)
     return None
+
+
+def _matched_source_root_len(canon: str, profile: Any) -> int:
+    """Length of the longest of ``profile``'s repo roots that ``canon`` is under.
+
+    Drives the default-mode longest-match tiebreak in :func:`_translate_target`:
+    when a foreign target is under several machines' (prefix-overlapping) repo
+    roots, the machine whose matched SOURCE root is the most specific (longest)
+    is the correct owner. Returns 0 when ``canon`` is under none of the roots
+    (the caller only consults this for machines that already translated, so a
+    match always exists, but we degrade to 0 rather than raise).
+    """
+    best = 0
+    for root in getattr(profile, "repo_roots", ()) or ():
+        expanded = _machines._expand(str(root))
+        if _machines._is_under(expanded, _machines._normalize(canon)) is not None:
+            best = max(best, len(expanded))
+    return best
 
 
 def _relative_under(root: str, candidate: str, config: Any) -> str | None:
@@ -242,12 +277,19 @@ def decide_link(
     ``link`` is a classified ``broken_project`` occurrence dict (carrying
     ``name`` / ``path`` / ``link_target`` / ``link_target_abs`` / ``origin``).
     Only ``origin == "other-machine"`` links reach a rewrite decision; the
-    caller is responsible for filtering, but we re-check defensively.
+    CALLER (:func:`_other_machine_links`) is responsible for that filtering, and
+    this function does NOT re-check the origin here (it trusts the filtered
+    input). The load-bearing safety re-check happens at APPLY time, not build
+    time: :func:`_repoint_symlink` re-verifies the link is still broken and the
+    translated target is still a valid skill dir before it rewrites anything, so
+    a stale plan never clobbers a now-real link or a now-deleted target.
 
     Returns an action dict with ``decision`` (``rewrite`` | ``reclassify``),
     the link identity, the resolved ``translated_target`` (when any), the
     ``command`` an apply runs, and — for reclassify — the ``reclassify_as``
-    origin handed back to converge.
+    origin handed back to converge. Relink always reclassifies as ``dangling``
+    (it has no source-corpus lookup to detect ``moved``); converge re-derives the
+    real taxonomy from the full corpus, so this is plan-text only.
     """
     name = str(link.get("name") or "")
     path = str(link.get("path") or "")
@@ -267,19 +309,18 @@ def decide_link(
             {
                 "decision": "rewrite",
                 "translated_target": translated,
-                "command": f"ln -sfn {translated} {path}",
+                "command": f"ln -sfn {shlex.quote(translated)} {shlex.quote(path)}",
             }
         )
         return base
 
-    # Reclassify: never guess, never prune. Hand the link back to converge.
-    # If a same-named live source exists under a current root the link is a
-    # local "moved" relink converge can repoint; otherwise it is dangling.
+    # Reclassify: never guess, never prune. Hand the link back to converge,
+    # ALWAYS as ``dangling`` — relink has no source-corpus lookup, so it cannot
+    # tell a genuinely-moved link (a same-named live source still exists) from a
+    # dead one. Converge re-derives the real moved-vs-dangling taxonomy from the
+    # full source corpus; this ``reclassify_as`` is plan text only, so emitting
+    # the honest ``dangling`` rather than a guessed ``moved`` keeps it truthful.
     reclassify_as = RECLASSIFY_DANGLING
-    if translated:
-        # Translated target resolved but is not a valid skill dir on this box:
-        # the repo moved but the skill is gone -> dangling, leave for converge.
-        reclassify_as = RECLASSIFY_DANGLING
     base.update(
         {
             "decision": "reclassify",
@@ -517,6 +558,17 @@ def _relink_next_actions(
 # --- apply ------------------------------------------------------------------
 
 
+class RelinkSkip(Exception):
+    """A rewrite was declined at APPLY time because the plan went stale.
+
+    Raised by :func:`_repoint_symlink` when an apply-time re-validation finds the
+    link is no longer a broken ``other-machine`` symlink, or the translated
+    target is no longer a valid skill dir. Carries a human reason; the apply loop
+    records it as ``skipped_stale`` (NOT ``failed`` — the on-disk state is fine,
+    we simply declined to touch it).
+    """
+
+
 def apply_relink_plan(
     plan: dict[str, Any],
     *,
@@ -531,14 +583,25 @@ def apply_relink_plan(
     (``ln -sfn`` semantics). Reclassify actions are never executed: they are
     left for ``fleet converge``.
 
-    Returns a result dict with per-action ``applied`` / ``error`` and a rolled-up
-    summary. Refuses to apply when the plan's root resolution carries an error.
+    A relink plan can be emitted as JSON and applied LATER, so at apply time the
+    plan may be stale: a link that was a broken foreign symlink at build time may
+    now be a real directory, and a translated target that existed may now be
+    deleted. Build-time guarantees ("only touch broken links / target must
+    exist+valid") do NOT survive serialization, so :func:`_repoint_symlink`
+    RE-VERIFIES both invariants immediately before each rewrite and refuses
+    (records ``skipped_stale``) rather than clobber a now-real link or point at a
+    now-missing target.
+
+    Returns a result dict with per-action ``applied`` / ``error`` /
+    ``skipped`` and a rolled-up summary. Refuses to apply when the plan's root
+    resolution carries an error.
     """
     roots = plan.get("roots") or {}
     results: list[dict[str, Any]] = []
     rewritten = 0
     failed = 0
     skipped_reclassify = 0
+    skipped_stale = 0
 
     root_error = roots.get("error")
     for row in plan.get("repos") or []:
@@ -552,6 +615,7 @@ def apply_relink_plan(
                 "path": action.get("path"),
                 "translated_target": action.get("translated_target"),
                 "applied": False,
+                "skipped": False,
                 "error": None,
             }
             if root_error:
@@ -566,6 +630,12 @@ def apply_relink_plan(
                 _repoint_symlink(str(action.get("path") or ""), str(action.get("translated_target") or ""))
                 entry["applied"] = True
                 rewritten += 1
+            except RelinkSkip as skip:
+                # Stale plan: the link is no longer broken-foreign, or the target
+                # vanished. Leave the on-disk state alone and record the skip.
+                entry["skipped"] = True
+                entry["error"] = f"skipped (stale plan): {skip}"
+                skipped_stale += 1
             except Exception as exc:  # pragma: no cover - exercised via tmp-tree tests
                 entry["error"] = str(exc)
                 failed += 1
@@ -578,27 +648,77 @@ def apply_relink_plan(
             "rewritten": rewritten,
             "failed": failed,
             "skipped_reclassify": skipped_reclassify,
+            "skipped_stale": skipped_stale,
             "planned_rewrites": int((plan.get("summary") or {}).get("rewrite") or 0),
         },
         "results": results,
     }
 
 
+def _stale_relink_reason(link: Path, target: str) -> str | None:
+    """Apply-time re-validation: why this rewrite must be SKIPPED, or None.
+
+    A relink plan can be applied long after it was built, so the two build-time
+    guarantees must be re-checked against the live filesystem before any rewrite:
+
+    * ``link`` must STILL be a symlink whose target does NOT exist — i.e. still a
+      broken link. If it is now a real directory (or a healthy link, or absent)
+      we must not clobber it.
+    * ``target`` must STILL be a valid skill dir (``SKILL.md`` present). If the
+      translated target was deleted since the plan was built, repointing at it
+      would just manufacture a new broken link.
+
+    Returns a short reason string when the rewrite is unsafe, or None when both
+    invariants still hold and the rewrite may proceed.
+    """
+    if not link.is_symlink():
+        # Not a symlink anymore: a real dir/file now lives here (or it is gone).
+        # Never overwrite a materialized path with our link.
+        return "link is no longer a symlink (now a real path or removed)"
+    # ``os.path.exists`` follows the symlink: True means the target resolves, so
+    # the link is no longer broken and must be left alone.
+    if os.path.exists(str(link)):
+        return "link is no longer broken (its target now exists)"
+    if not _sv._path_is_skill_dir(Path(target)):
+        return "translated target is missing or no longer a valid skill dir"
+    return None
+
+
 def _repoint_symlink(link_path: str, target: str) -> None:
     """Atomically repoint ``link_path`` at ``target`` (``ln -sfn`` semantics).
 
-    Writes the new link beside the old one and ``os.replace``s it into place so a
-    crash never leaves the install link absent. Only ever called by an explicit
-    non-dry-run apply.
+    Re-validates the plan against the live filesystem first (see
+    :func:`_stale_relink_reason`) and raises :class:`RelinkSkip` rather than
+    rewrite a now-real link or point at a now-deleted target. When the
+    re-validation passes, it writes the new link beside the old one and
+    ``os.replace``s it into place so a crash never leaves the install link
+    absent. The temp ``<name>.relink-tmp`` symlink is ALWAYS cleaned up — even
+    when ``os.replace`` raises (e.g. the path is now a real directory) — so a
+    failed/stale apply never leaves a stray ``.relink-tmp`` link that the next
+    inventory scan would mistake for an installed skill. Only ever called by an
+    explicit non-dry-run apply.
     """
     if not link_path or not target:
         raise ValueError("relink requires both a link path and a target")
     link = Path(link_path)
+
+    stale = _stale_relink_reason(link, target)
+    if stale is not None:
+        raise RelinkSkip(stale)
+
     tmp = link.parent / (link.name + ".relink-tmp")
-    if tmp.is_symlink() or tmp.exists():
-        tmp.unlink()
-    os.symlink(target, str(tmp))
-    os.replace(str(tmp), str(link))
+    try:
+        if tmp.is_symlink() or tmp.exists():
+            tmp.unlink()
+        os.symlink(target, str(tmp))
+        os.replace(str(tmp), str(link))
+    except BaseException:
+        # On ANY failure (e.g. ``link`` is now a real directory -> os.replace
+        # raises IsADirectoryError) leave nothing behind: a leftover
+        # ``<name>.relink-tmp`` symlink does not start with '.' and would be
+        # scanned as an installed skill, permanently polluting the inventory.
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 # --- text renderer ----------------------------------------------------------

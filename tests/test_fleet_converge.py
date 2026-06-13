@@ -266,3 +266,51 @@ def test_text_renderer_is_stable_and_labels_classes(fixture_fleet) -> None:
     assert any("or: edit rule 'frontend-local'" in line for line in lines)
     # Rendering twice is byte-stable.
     assert lines == fc.fleet_converge_text_lines(plan, limit=0)
+
+
+# --- BUG 3 regression: emitted commands shell-quote paths/names -------------
+
+import shlex as _shlex  # noqa: E402
+
+
+def test_sync_command_quotes_repo_path_and_skill_name_with_space() -> None:
+    """A repo path / skill name with a space yields a properly-quoted command.
+
+    ``skill sync`` commands are advertised as the EXACT single-repo command, so a
+    path or name carrying a space (or shell metachar) must paste safely.
+    """
+    actions = fc._sync_actions(
+        [{"name": "my skill", "scope_rule": "r1"}],
+        "/srv/repo with space",
+    )
+    command = actions[0]["command"]
+    tokens = _shlex.split(command)
+    # manage.py skill sync '<name>' --cwd '<path>' --dry-run -> the lexer must
+    # re-assemble the space-bearing name and path as single tokens.
+    assert "my skill" in tokens
+    assert "/srv/repo with space" in tokens
+    assert tokens[-1] == "--dry-run"
+    assert "'" in command, "space-bearing args must be quoted in the command"
+
+
+def test_policy_prune_command_quotes_repo_path_with_space() -> None:
+    """The dangerous ``skill prune`` command quotes the repo path (a space-safe rm)."""
+    actions = fc._policy_actions(
+        [{"name": "x", "scope_rule": "r1", "allowed_paths": [], "path": "/p"}],
+        "/srv/repo with space",
+    )
+    command = actions[0]["command"]
+    tokens = _shlex.split(command)
+    assert "/srv/repo with space" in tokens
+    assert "--cwd" in tokens
+    assert "'" in command
+
+
+def test_mcp_sync_command_quotes_repo_path_with_space() -> None:
+    """The ``mcp sync`` command also quotes the repo path."""
+    payload = {"surfaces": {"claude": {"missing": ["foo"]}, "codex": {}}}
+    actions = fc._mcp_actions(payload, "/srv/repo with space")
+    command = actions[0]["command"]
+    tokens = _shlex.split(command)
+    assert "/srv/repo with space" in tokens
+    assert "'" in command

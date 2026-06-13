@@ -200,6 +200,68 @@ class GlobalOverlayPrecedenceLintTests(unittest.TestCase):
         results = validate_global_overlay_precedence(policy)
         self.assertEqual(self._statuses(results), ["pass"], results[0].details)
 
+    def test_glob_granted_global_collides_with_literal_overlay_skill(self) -> None:
+        """BUG 3 regression: the runtime's ``_global_install_allowed`` decides
+        always-global membership via ``fnmatch``, so an ``allow_global`` rule
+        granting ``beads-*`` makes the literal ``beads-br`` always-global on every
+        box. An overlay rule naming ``beads-br`` IS the global-vs-overlay
+        contradiction this lint must catch — an exact-string set intersection would
+        miss it (``beads-br != beads-*``). The glob-aware matcher catches it."""
+        policy = {
+            "global_allowlist": ["beads-*"],
+            "overlays": [{"name": "swarm"}],
+            "rules": [
+                {"id": "g", "skills": ["beads-*"], "allow_global": True},
+                {"id": "swarm-overlay", "overlay": "swarm", "skills": ["beads-br", "ntm"]},
+            ],
+        }
+        results = validate_global_overlay_precedence(
+            policy, policy_path="/fake/skill-scope.yaml"
+        )
+        self.assertEqual(self._statuses(results), ["fail"], results[0].details)
+        # The literal beads-br is caught; the disjoint ntm is not.
+        self.assertIn("beads-br", results[0].details["conflicts"])
+        self.assertNotIn("ntm", results[0].details["conflicts"])
+        self.assertEqual(
+            results[0].details["offending_overlay_rules"]["beads-br"],
+            ["swarm-overlay (overlay: swarm)"],
+        )
+
+    def test_non_matching_glob_global_does_not_false_conflict(self) -> None:
+        """A glob global must only collide with names it actually matches: a
+        ``beads-*`` global does NOT make an overlay's ``ntm`` a conflict."""
+        policy = {
+            "global_allowlist": ["beads-*"],
+            "overlays": [{"name": "swarm"}],
+            "rules": [
+                {"id": "g", "skills": ["beads-*"], "allow_global": True},
+                {"id": "swarm-overlay", "overlay": "swarm", "skills": ["ntm"]},
+            ],
+        }
+        results = validate_global_overlay_precedence(policy)
+        self.assertEqual(self._statuses(results), ["pass"], results[0].details)
+
+    def test_overlay_rule_authored_with_patterns_is_seen(self) -> None:
+        """BUG 2 regression: an overlay rule that names its skills via ``patterns:``
+        (no ``skills:`` key) must still be enumerated, so a global skill smuggled
+        into a patterns-authored overlay rule is caught."""
+        policy = {
+            "global_allowlist": ["divide-and-conquer"],
+            "overlays": [{"name": "swarm"}],
+            "rules": [
+                {"id": "g", "skills": ["divide-and-conquer"], "allow_global": True},
+                # Overlay rule uses `patterns:` instead of `skills:`.
+                {
+                    "id": "swarm-overlay",
+                    "overlay": "swarm",
+                    "patterns": ["divide-and-conquer", "ntm"],
+                },
+            ],
+        }
+        results = validate_global_overlay_precedence(policy)
+        self.assertEqual(self._statuses(results), ["fail"], results[0].details)
+        self.assertIn("divide-and-conquer", results[0].details["conflicts"])
+
     def test_empty_policy_is_pass(self) -> None:
         results = validate_global_overlay_precedence({"rules": []})
         self.assertEqual(self._statuses(results), ["pass"], results)
