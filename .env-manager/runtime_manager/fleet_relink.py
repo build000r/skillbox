@@ -72,6 +72,11 @@ from typing import Any, Iterable
 
 from . import machines as _machines
 from . import skill_visibility as _sv
+# Reuse the converge build-scoped memo: relink classifies every fleet link via
+# collect_skill_visibility -> _skill_source_options, which re-parses the whole
+# skill-source corpus per link (O(links x sources)). Memoizing the repo-
+# independent source lookups for one plan build collapses that to ~one parse.
+from .fleet_converge import _memoized_source_lookups
 
 
 # Stable decision vocabulary. ``rewrite`` is the only action an apply executes.
@@ -435,10 +440,11 @@ def build_relink_plan(
         model, cwd=cwd, scan_roots=scan_roots, max_depth=max_depth
     )
 
-    rows = [
-        _build_repo_relink(model, repo_path, roots, config, machine_id)
-        for repo_path in repo_paths
-    ]
+    with _memoized_source_lookups():
+        rows = [
+            _build_repo_relink(model, repo_path, roots, config, machine_id)
+            for repo_path in repo_paths
+        ]
     rows.sort(key=lambda row: str(row.get("path") or ""))
     reported = [row for row in rows if include_clean or int(row.get("total") or 0) > 0]
 
