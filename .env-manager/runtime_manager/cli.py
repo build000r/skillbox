@@ -44,6 +44,7 @@ from .agent_snapshots import (
     replay_snapshot,
     save_snapshot,
 )
+from .fleet_converge import build_fleet_converge_plan, fleet_converge_text_lines
 
 
 class DistributionPreviewError(RuntimeError):
@@ -764,6 +765,80 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_profile_arg(mcp_sync_parser)
     _add_client_arg(mcp_sync_parser)
+
+    fleet_parser = subparsers.add_parser(
+        "fleet",
+        help=(
+            "Fleet-wide skill/MCP convergence. `fleet converge --dry-run` emits a "
+            "per-repo heal PLAN (relink/prune/sync/policy/mcp), every action carrying "
+            "its exact single-repo command. PLAN ONLY — never writes."
+        ),
+    )
+    fleet_subparsers = fleet_parser.add_subparsers(dest="fleet_action", required=True)
+
+    fleet_converge_parser = fleet_subparsers.add_parser(
+        "converge",
+        help=(
+            "Per-repo heal plan over the deduped canonical fleet, grouped by triage "
+            "class (relink/prune/sync/policy/mcp). PLAN ONLY: --dry-run is the only "
+            "mode; nothing is written."
+        ),
+        description=(
+            "Walk the deduped canonical repo list (the same candidate set the skill "
+            "audit scans, deduped by realpath) and emit ONE diffable document: every "
+            "repo's skill/MCP drift grouped into five triage classes — relink "
+            "(repoint/migrate broken links), prune (remove dead/unreadable links), "
+            "sync (link cwd-expected missing skills), policy (scope violations, with "
+            "the rule id), and mcp (Claude/Codex parity). Every action carries its "
+            "EXACT single-repo command so an agent can apply per-repo or in bulk. "
+            "Output is stable/diffable (deterministically sorted) as a human table or "
+            "--format json. PLAN ONLY: --dry-run is the default and only mode; this "
+            "command NEVER writes, links, prunes, or migrates anything."
+        ),
+    )
+    fleet_converge_parser.add_argument("--format", choices=("text", "json"), default="text")
+    fleet_converge_parser.add_argument(
+        "--cwd",
+        default=None,
+        help="Working directory used for fleet anchoring/global summary. Defaults to the current cwd.",
+    )
+    fleet_converge_parser.add_argument(
+        "--scan-root",
+        action="append",
+        default=None,
+        help="Root to scan for git repos. Can be repeated. Defaults to skill_install_scan_roots from skill-scope.yaml.",
+    )
+    fleet_converge_parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=3,
+        help="Maximum directory depth under each scan root when finding git repos.",
+    )
+    fleet_converge_parser.add_argument(
+        "--limit",
+        type=int,
+        default=40,
+        help="Maximum repo sections to show in text output (0 = unlimited).",
+    )
+    fleet_converge_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Include clean (converged) repos in the plan as well.",
+    )
+    fleet_converge_parser.add_argument(
+        "--no-mcp",
+        action="store_true",
+        help="Skip the per-repo Claude/Codex MCP parity pass.",
+    )
+    fleet_converge_parser.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=True,
+        help="Plan only (default and only mode). This command never writes.",
+    )
+    _add_profile_arg(fleet_converge_parser)
+    _add_client_arg(fleet_converge_parser)
 
     evidence_parser = subparsers.add_parser(
         "evidence",
@@ -3370,6 +3445,37 @@ def _handle_mcp(args: argparse.Namespace, root_dir: Path, model: dict[str, Any],
     raise RuntimeError(f"unknown mcp action: {action!r}")
 
 
+def _handle_fleet(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    action = str(getattr(args, "fleet_action", "") or "")
+    if action == "converge":
+        return _handle_fleet_converge(args, root_dir, model, resolved_mode)
+    raise RuntimeError(f"unknown fleet action: {action!r}")
+
+
+def _handle_fleet_converge(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    del resolved_mode
+    # PLAN ONLY: --dry-run is the default and only mode. The MCP parity pass
+    # uses the FULL (unfiltered) declared-server baseline so profile-gated MCP
+    # services (memory/connectors) are not mistaken for drift, mirroring the
+    # mcp-audit handler.
+    plan = build_fleet_converge_plan(
+        model,
+        cwd=args.cwd,
+        scan_roots=getattr(args, "scan_root", None),
+        max_depth=max(0, int(args.max_depth)),
+        include_clean=bool(getattr(args, "all", False)),
+        include_mcp=not bool(getattr(args, "no_mcp", False)),
+        root_dir=root_dir,
+        declared_servers=_full_declared_mcp_servers(root_dir),
+    )
+    if args.format == "json":
+        emit_json(plan)
+    else:
+        for line in fleet_converge_text_lines(plan, limit=max(0, int(args.limit))):
+            print(line)
+    return EXIT_OK
+
+
 def _handle_mcp_sync(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
     del resolved_mode
     # --dry-run is the default; --apply is the only thing that writes. The two
@@ -4336,6 +4442,7 @@ _MODEL_DISPATCH: dict[str, Callable[[argparse.Namespace, Path, dict[str, Any], s
     "skill-audit": _handle_skill_audit,
     "mcp-audit": _handle_mcp_audit,
     "mcp": _handle_mcp,
+    "fleet": _handle_fleet,
     "evidence": _handle_evidence,
     "next": _handle_next,
     "graph": _handle_graph,

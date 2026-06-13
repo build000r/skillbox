@@ -416,6 +416,10 @@ case "${1:-}" in
     action="mcp-audit"
     shift
     ;;
+  fleet)
+    action="fleet"
+    shift
+    ;;
   doctor|structure-doctor)
     action="structure-doctor"
     shift
@@ -520,7 +524,7 @@ append_passthrough_token() {
     sync)
       sync_paths+=("${token}")
       ;;
-    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|structure-doctor|repo-registry|cass|cron|beads|mmdx|operator-booking|swimmers-launch)
+    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|structure-doctor|repo-registry|cass|cron|beads|mmdx|operator-booking|swimmers-launch|fleet)
       passthrough_args+=("${token}")
       ;;
     *)
@@ -773,6 +777,27 @@ PY
     ;;
   mcp-audit)
     python3 .env-manager/manage.py mcp-audit "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    ;;
+  fleet)
+    # `sbp fleet converge [...]` -> read-only per-repo heal PLAN (no apply).
+    fleet_action="${passthrough_args[0]:-converge}"
+    if [[ "${fleet_action}" == --* ]]; then
+      fleet_action="converge"
+      fleet_args=("${passthrough_args[@]}")
+    elif [[ ${#passthrough_args[@]} -gt 0 ]]; then
+      fleet_args=("${passthrough_args[@]:1}")
+    else
+      fleet_args=()
+    fi
+    case "${fleet_action}" in
+      converge)
+        python3 .env-manager/manage.py fleet converge "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${fleet_args[@]}"
+        ;;
+      *)
+        echo "${wrapper_name} fleet: unknown action '${fleet_action}' (expected converge)" >&2
+        exit 2
+        ;;
+    esac
     ;;
   structure-doctor)
     python3 .env-manager/manage.py structure-doctor --cwd "${invoke_cwd}" "${passthrough_args[@]}"
