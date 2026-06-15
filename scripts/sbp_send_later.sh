@@ -23,6 +23,7 @@ usage() {
 Usage:
   sbp send-later
   sbp send-later list
+  sbp send-later cancel ID
   sbp send-later install-cron
   sbp send-later schedule --minutes N --id ID --session SESSION --pane PANE --message TEXT [gate flags]
   sbp send-later schedule --minutes N --id ID --target TMUX_TARGET --key KEY [--key KEY ...] [--key-delay SECONDS] [gate flags]
@@ -384,6 +385,24 @@ list_jobs() {
   echo "next: sbp send-later run-pending"
 }
 
+cancel_job() {
+  local id="${1:-}"
+  [[ -n "$id" ]] || die "usage: sbp send-later cancel ID"
+  id="$(sanitize_id "$id")"
+  local removed=0 f
+  for f in env done last sentfp lastsent lock; do
+    if [[ -e "$STATE_DIR/$id.$f" ]]; then
+      rm -f "$STATE_DIR/$id.$f"
+      removed=1
+    fi
+  done
+  if [[ "$removed" == "1" ]]; then
+    echo "cancelled: id=$id (job + state removed; cron wrapper left in place)"
+  else
+    echo "no such job: id=$id"
+  fi
+}
+
 main() {
   local cmd="${1:-}"
   shift || true
@@ -392,6 +411,7 @@ main() {
     schedule) schedule_job "$@" ;;
     run-pending) run_pending ;;
     list) list_jobs ;;
+    cancel|remove) cancel_job "$@" ;;
     -h|--help) usage ;;
     "") list_jobs ;;
     *) die "unknown command: $cmd" ;;

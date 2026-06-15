@@ -493,8 +493,8 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "path": "/srv/skillbox/repos/skills-private",
       "present": true,
       "rank": 0,
-      "skill_count": 121,
-      "undefined_count": 121
+      "skill_count": 129,
+      "undefined_count": 129
     },
     {
       "id": "source:<FLEET>/skills",
@@ -547,8 +547,8 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
     "scope_violations": 0,
     "shadowed": 0,
     "undeclared_active_overlays": 0,
-    "undefined_source_skills": 208,
-    "undefined_sources": 210
+    "undefined_source_skills": 216,
+    "undefined_sources": 218
   },
   "undefined_sources": [
     {
@@ -1175,6 +1175,34 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "state": "undefined"
     },
     {
+      "name": "htma-e2e-testing",
+      "root": "/srv/skillbox/repos/skills-private",
+      "source": "/srv/skillbox/repos/skills-private/htma-e2e-testing",
+      "source_bucket": "external",
+      "state": "undefined"
+    },
+    {
+      "name": "htma-marketing",
+      "root": "/srv/skillbox/repos/skills-private",
+      "source": "/srv/skillbox/repos/skills-private/htma-marketing",
+      "source_bucket": "external",
+      "state": "undefined"
+    },
+    {
+      "name": "htma-patterns",
+      "root": "/srv/skillbox/repos/skills-private",
+      "source": "/srv/skillbox/repos/skills-private/htma-patterns",
+      "source_bucket": "external",
+      "state": "undefined"
+    },
+    {
+      "name": "htma-product-creator",
+      "root": "/srv/skillbox/repos/skills-private",
+      "source": "/srv/skillbox/repos/skills-private/htma-product-creator",
+      "source_bucket": "external",
+      "state": "undefined"
+    },
+    {
       "name": "idea-wizard",
       "root": "/srv/skillbox/repos/skills-private",
       "source": "/srv/skillbox/repos/skills-private/idea-wizard",
@@ -1199,6 +1227,13 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "name": "installer-workmanship",
       "root": "/srv/skillbox/repos/skills-private",
       "source": "/srv/skillbox/repos/skills-private/installer-workmanship",
+      "source_bucket": "external",
+      "state": "undefined"
+    },
+    {
+      "name": "intake-baseline",
+      "root": "/srv/skillbox/repos/skills-private",
+      "source": "/srv/skillbox/repos/skills-private/intake-baseline",
       "source_bucket": "external",
       "state": "undefined"
     },
@@ -1423,6 +1458,13 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "name": "oss-doc-audit",
       "root": "/srv/skillbox/repos/skills",
       "source": "/srv/skillbox/repos/skills/oss-doc-audit",
+      "source_bucket": "external",
+      "state": "undefined"
+    },
+    {
+      "name": "page-cro",
+      "root": "/srv/skillbox/repos/skills-private",
+      "source": "/srv/skillbox/repos/skills-private/page-cro",
       "source_bucket": "external",
       "state": "undefined"
     },
@@ -1798,6 +1840,13 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "state": "undefined"
     },
     {
+      "name": "split-testing",
+      "root": "/srv/skillbox/repos/skills-private",
+      "source": "/srv/skillbox/repos/skills-private/split-testing",
+      "source_bucket": "external",
+      "state": "undefined"
+    },
+    {
       "name": "ssh-info",
       "root": "/srv/skillbox/repos/skills",
       "source": "/srv/skillbox/repos/skills/ssh-info",
@@ -2011,6 +2060,13 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "name": "write-a-skill",
       "root": "/srv/skillbox/repos/skills-private",
       "source": "/srv/skillbox/repos/skills-private/write-a-skill",
+      "source_bucket": "external",
+      "state": "undefined"
+    },
+    {
+      "name": "write-mineral-page",
+      "root": "/srv/skillbox/repos/skills-private",
+      "source": "/srv/skillbox/repos/skills-private/write-mineral-page",
       "source_bucket": "external",
       "state": "undefined"
     },
