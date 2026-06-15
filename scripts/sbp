@@ -158,6 +158,7 @@ Usage:
   __WRAPPER__ evidence [--repo P|--skill N] --format json  Measure skill invocations per
                               repo from Cass (contamination-safe), joined to current policy
   __WRAPPER__ cron [status|apply]     Declared crontab + script links from skillbox-config
+  __WRAPPER__ send-later schedule --minutes N ...  One-shot delayed NTM/tmux send
   __WRAPPER__ beads [status|init|sync] Check or initialize repo-local beads state
   __WRAPPER__ mmdx QUERY              Fuzzy-find and open .mmdx/.mmd from this cwd
   __WRAPPER__ mmdx                    List recent .mmdx/.mmd files from this repo
@@ -246,6 +247,7 @@ payload = {
         {"name": "cass", "json": True, "safe_first_try": f"{wrapper} cass status --json"},
         {"name": "evidence", "json": True, "safe_first_try": f"{wrapper} evidence --repo <path> --format json"},
         {"name": "cron", "json": True, "safe_first_try": f"{wrapper} cron status --json"},
+        {"name": "send-later", "json": False, "safe_first_try": f"{wrapper} send-later list"},
         {"name": "recalibrate", "json": False, "safe_first_try": f"{wrapper} recalibrate"},
     ],
     "agent_surfaces": {
@@ -443,6 +445,10 @@ case "${1:-}" in
     action="cron"
     shift
     ;;
+  send-later|later|ntm-send-later)
+    action="send-later"
+    shift
+    ;;
   beads|br)
     action="beads"
     shift
@@ -531,7 +537,7 @@ append_passthrough_token() {
     sync)
       sync_paths+=("${token}")
       ;;
-    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|structure-doctor|repo-registry|cass|cass-evidence|cron|beads|mmdx|operator-booking|swimmers-launch|fleet)
+    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|structure-doctor|repo-registry|cass|cass-evidence|cron|send-later|beads|mmdx|operator-booking|swimmers-launch|fleet)
       passthrough_args+=("${token}")
       ;;
     *)
@@ -840,6 +846,14 @@ PY
       exit 1
     fi
     bash "${cron_wrapper}" "${passthrough_args[@]}"
+    ;;
+  send-later)
+    send_later_wrapper="${script_dir}/sbp_send_later.sh"
+    if [[ ! -f "${send_later_wrapper}" ]]; then
+      echo "${wrapper_name} send-later: missing helper at ${send_later_wrapper}" >&2
+      exit 1
+    fi
+    bash "${send_later_wrapper}" "${passthrough_args[@]}"
     ;;
   repo-registry)
     config_root="${SKILLBOX_CONFIG_ROOT:-${HOME}/repos/skillbox-config}"
