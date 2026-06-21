@@ -32,6 +32,7 @@ from .forge import *
 from .swimmers_launch import launch_swimmers_batch, swimmers_launch_text_lines
 from .structure_doctor import run_structure_doctor, structure_doctor_text_lines
 from .command_registry import registry_payload
+from .port_registry import port_registry_payload, port_registry_text_lines
 from .agent_adapters import collect_agent_adapter_evidence
 from .agent_graph import build_agent_graph, build_agent_graph_payload
 from .agent_graph_engine import GRAPH_ALGORITHMS, GRAPH_OUTPUT_FORMATS, graph_command_payload, render_graph_payload
@@ -89,6 +90,7 @@ MANAGE_COMMAND_NAMES = {
     "operator-booking",
     "overlay",
     "parity-report",
+    "ports",
     "private-init",
     "pressure-report",
     "rch-stage",
@@ -450,6 +452,26 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_profile_arg(status_parser)
     _add_client_arg(status_parser)
     _add_cwd_arg(status_parser)
+
+    ports_parser = subparsers.add_parser(
+        "ports",
+        help=(
+            "List the machine-readable port registry for the active scope: every "
+            "declared port mapped to its owning service/ingress/env_surface, with "
+            "source (file+key), profiles, client, and bind scope. Health targets "
+            "with no parseable port emit a warning entry and are never guessed. "
+            "Read-only. Use --resolve <service-id> to resolve one owner's port(s)."
+        ),
+    )
+    ports_parser.add_argument("--format", choices=("text", "json"), default="json")
+    ports_parser.add_argument(
+        "--resolve",
+        default=None,
+        help="Resolve the declared port(s) for a single service/owner id.",
+    )
+    _add_profile_arg(ports_parser)
+    _add_client_arg(ports_parser)
+    _add_cwd_arg(ports_parser)
 
     pressure_report_parser = subparsers.add_parser(
         "pressure-report",
@@ -3576,6 +3598,17 @@ def _handle_context(args: argparse.Namespace, root_dir: Path, model: dict[str, A
     return EXIT_OK
 
 
+def _handle_ports(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    model.setdefault("active_profiles", normalize_active_profiles(getattr(args, "profile", [])))
+    model.setdefault("active_clients", _active_clients_for_args(args, model))
+    payload = port_registry_payload(model, resolve=getattr(args, "resolve", None))
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print("\n".join(port_registry_text_lines(payload)))
+    return EXIT_OK
+
+
 def _handle_doctor(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
     results = doctor_results(model, root_dir)
     has_fail = any(result.status == "fail" for result in results)
@@ -4803,6 +4836,7 @@ def _handle_logs(args: argparse.Namespace, root_dir: Path, model: dict[str, Any]
 
 _MODEL_DISPATCH: dict[str, Callable[[argparse.Namespace, Path, dict[str, Any], str], int]] = {
     "render": _handle_render,
+    "ports": _handle_ports,
     "sync": _handle_sync,
     "context": _handle_context,
     "doctor": _handle_doctor,
@@ -5170,6 +5204,7 @@ def _active_clients_for_args(args: argparse.Namespace, model: dict[str, Any]) ->
         "search",
         "snap",
         "parity-report",
+        "ports",
         "bootstrap",
         "up",
         "down",

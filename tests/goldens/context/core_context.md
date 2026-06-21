@@ -32,6 +32,24 @@ You are inside a skillbox workspace container.
   - Stop: `make runtime-down SERVICE=pulse`
   - Logs: `make runtime-logs SERVICE=pulse`
 
+## Ports
+
+Single source of truth for declared ports. Run `python3 .env-manager/manage.py ports --format json` for the live registry.
+
+| Port | Owner | Kind | Client | Profiles | Bind | Source |
+|------|-------|------|--------|----------|------|--------|
+| 3000 | SKILLBOX_WEB_PORT | env_surface | - | - | loopback | `.env:SKILLBOX_WEB_PORT` |
+| 3210 | SKILLBOX_SWIMMERS_PORT | env_surface | - | - | loopback | `.env:SKILLBOX_SWIMMERS_PORT` |
+| 3220 | SKILLBOX_DCG_MCP_PORT | env_surface | - | - | loopback | `.env:SKILLBOX_DCG_MCP_PORT` |
+| 3221 | SKILLBOX_FWC_MCP_PORT | env_surface | - | - | loopback | `.env:SKILLBOX_FWC_MCP_PORT` |
+| 3222 | SKILLBOX_CM_MCP_PORT | env_surface | - | - | loopback | `.env:SKILLBOX_CM_MCP_PORT` |
+| 8000 | SKILLBOX_API_PORT | env_surface | - | - | loopback | `.env:SKILLBOX_API_PORT` |
+| 8080 | SKILLBOX_INGRESS_PUBLIC_PORT | env_surface | - | - | loopback | `.env:SKILLBOX_INGRESS_PUBLIC_PORT` |
+| 9080 | SKILLBOX_INGRESS_PRIVATE_PORT | env_surface | - | - | loopback | `.env:SKILLBOX_INGRESS_PRIVATE_PORT` |
+
+- WARNING: service 'internal-env-manager' health check (unknown type) declares no port; not registered
+- WARNING: service 'pulse' health check (path_exists) declares no port; not registered
+
 ## Installed Skills
 
 - **default-skills**: beads-br, beads-bv, beads-workflow, codebase-audit, divide-and-conquer, git-stash-janitor, lube, mmdx, no-ragrets, project-status-mmdx, sbp, skill-issue, smart, ui-fresh-eyes

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .shared import *
 from .runtime_ops import *
+from .port_registry import build_port_registry
 from .distribution.status import render_connected_distributors_section
 
 
@@ -190,6 +191,48 @@ def _context_service_lines(model: dict[str, Any], make_suffix: str) -> list[str]
     return lines
 
 
+def _context_ports_lines(model: dict[str, Any]) -> list[str]:
+    """Render the port-registry contract so in-box agents see who owns what.
+
+    Conservative: health targets with no parseable port are not invented; they
+    surface as a trailing warning bullet so an agent knows the contract is
+    incomplete rather than seeing a fabricated port.
+    """
+    try:
+        entries = build_port_registry(model)
+    except Exception:
+        return []
+    declared = [e for e in entries if e.get("port") is not None]
+    if not declared:
+        return []
+    lines = [
+        "## Ports",
+        "",
+        "Single source of truth for declared ports. Run "
+        "`python3 .env-manager/manage.py ports --format json` for the live registry.",
+        "",
+        "| Port | Owner | Kind | Client | Profiles | Bind | Source |",
+        "|------|-------|------|--------|----------|------|--------|",
+    ]
+    for entry in declared:
+        source = entry.get("source") or {}
+        src = f"{source.get('file', '')}:{source.get('key', '')}".strip(":")
+        client = entry.get("client") or "-"
+        profiles = ", ".join(entry.get("profiles") or []) or "-"
+        lines.append(
+            f"| {entry['port']} | {entry.get('owner_id', '')} | "
+            f"{entry.get('owner_kind', '')} | {client} | {profiles} | "
+            f"{entry.get('bind_scope', '')} | `{src}` |"
+        )
+    warnings = [e for e in entries if e.get("warning")]
+    if warnings:
+        lines.append("")
+        for entry in warnings:
+            lines.append(f"- WARNING: {entry['warning']}")
+    lines.append("")
+    return lines
+
+
 def _context_task_lines(model: dict[str, Any], make_suffix: str) -> list[str]:
     tasks = model.get("tasks") or []
     if not tasks:
@@ -295,6 +338,7 @@ def generate_context_markdown(model: dict[str, Any]) -> str:
     lines.extend(_context_pressure_lines(model))
     lines.extend(_context_repo_lines(model))
     lines.extend(_context_service_lines(model, make_suffix))
+    lines.extend(_context_ports_lines(model))
     lines.extend(_context_task_lines(model, make_suffix))
     lines.extend(_context_skill_lines(model))
     distributor_lines = render_connected_distributors_section(model)

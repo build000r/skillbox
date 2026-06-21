@@ -740,6 +740,99 @@ def host_path_to_absolute_path(root_dir: Path, raw_path: str) -> Path:
     return (root_dir / path).resolve()
 
 
+# ---------------------------------------------------------------------------
+# Port extraction helpers (box.py-independent)
+# ---------------------------------------------------------------------------
+#
+# Phase 0 of the port-guard stack builds a machine-readable port registry from
+# the resolved runtime model. These helpers parse ports CONSERVATIVELY: a
+# target with no unambiguous integer port returns ``None`` so callers can emit
+# a WARNING entry instead of guessing.
+
+LOOPBACK_BIND_HOSTS: frozenset[str] = frozenset(
+    {"localhost", "127.0.0.1", "::1", "0:0:0:0:0:0:0:1"}
+)
+WILDCARD_BIND_HOSTS: frozenset[str] = frozenset({"0.0.0.0", "::"})
+
+_HOST_PORT_PATTERN = re.compile(r"^\[?(?P<host>[^\]]*?)\]?:(?P<port>\d{1,5})$")
+_PORT_FLAG_PATTERN = re.compile(r"(?:^|\s)--port(?:[=\s]+)(\d{1,5})(?:\s|$)")
+
+
+def classify_bind_scope(host: str) -> str:
+    """Map a bind host to ``loopback``/``tailnet``/``wildcard``.
+
+    Anything that is neither a known loopback nor a known wildcard host (e.g.
+    a Tailnet IP or MagicDNS name) is treated as ``tailnet`` scope.
+    """
+    normalized = str(host or "").strip().lower().rstrip(".")
+    if not normalized:
+        return "loopback"
+    if normalized in WILDCARD_BIND_HOSTS:
+        return "wildcard"
+    if normalized in LOOPBACK_BIND_HOSTS:
+        return "loopback"
+    return "tailnet"
+
+
+def extract_host_port(raw_target: str) -> tuple[str, int | None, str]:
+    """Parse ``host``, ``port``, and ``scheme`` from a health/bind target.
+
+    Handles three shapes conservatively:
+
+    - A full URL (``http://127.0.0.1:8000/health``) — host/port/scheme.
+    - A bare ``host:port`` authority (``localhost:8050``) — host/port, no scheme.
+    - Anything else (``/var/run/x.pid``, ``localhost`` with no port) — returns
+      ``port=None`` so the caller emits a warning rather than guessing.
+
+    Default ports for ``http``/``https`` are intentionally NOT inferred: an
+    omitted port is ambiguous for the registry contract, so it stays ``None``.
+    """
+    text = str(raw_target or "").strip()
+    if not text:
+        return "", None, ""
+
+    if "://" in text:
+        try:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(text)
+        except ValueError:
+            return "", None, ""
+        if not parsed.scheme or not parsed.netloc:
+            return "", None, ""
+        return (parsed.hostname or "", parsed.port, parsed.scheme)
+
+    match = _HOST_PORT_PATTERN.match(text)
+    if match:
+        try:
+            port = int(match.group("port"))
+        except ValueError:
+            return "", None, ""
+        if 0 < port <= 65535:
+            return (match.group("host") or "", port, "")
+        return "", None, ""
+
+    return "", None, ""
+
+
+def extract_command_port(command: str) -> int | None:
+    """Return an integer ``--port <n>`` / ``--port=<n>`` value from a command.
+
+    Returns ``None`` when no unambiguous ``--port`` flag is present.
+    """
+    text = str(command or "")
+    if not text:
+        return None
+    match = _PORT_FLAG_PATTERN.search(text)
+    if not match:
+        return None
+    try:
+        port = int(match.group(1))
+    except ValueError:
+        return None
+    return port if 0 < port <= 65535 else None
+
+
 def _normalized_items(raw_items: Any, section: str) -> list[dict[str, Any]]:
     if raw_items is None:
         return []
