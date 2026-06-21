@@ -1,10 +1,18 @@
 COMPOSE := docker compose
 
+# Resolve operator env file for non-secret overrides. Secrets moved out of the
+# workspace bind mount to $(SKILLBOX_STATE_ROOT)/operator/.env, so compose can no
+# longer auto-load .env from the project dir. Prefer the relocated file, fall back
+# to a legacy repo-root .env, else omit --env-file (compose ${VAR:-default}s hold).
+_STATE_ROOT := $(if $(strip $(SKILLBOX_STATE_ROOT)),$(SKILLBOX_STATE_ROOT),./.skillbox-state)
+_OPERATOR_ENV := $(firstword $(wildcard $(_STATE_ROOT)/operator/.env) $(wildcard ./.env))
+_ENV_FILE_ARG := $(if $(_OPERATOR_ENV),--env-file $(_OPERATOR_ENV),)
+
 # Resolve monoserver layer: per-client override when focused, fat default otherwise.
 _FOCUS_CLIENT := $(shell python3 -c "import json; print(json.load(open('workspace/.focus.json')).get('client_id',''))" 2>/dev/null)
 _CLIENT_OVERRIDE := workspace/.compose-overrides/docker-compose.client-$(_FOCUS_CLIENT).yml
 _MONOSERVER_LAYER := $(if $(and $(_FOCUS_CLIENT),$(wildcard $(_CLIENT_OVERRIDE))),$(_CLIENT_OVERRIDE),docker-compose.monoserver.yml)
-COMPOSEF := $(COMPOSE) -f docker-compose.yml -f $(_MONOSERVER_LAYER)
+COMPOSEF := $(COMPOSE) $(_ENV_FILE_ARG) -f docker-compose.yml -f $(_MONOSERVER_LAYER)
 
 PROFILE_ARGS := $(if $(strip $(PROFILE)),--profile $(PROFILE),)
 CLIENT_ARGS := $(if $(strip $(CLIENT)),--client $(CLIENT),)
@@ -23,7 +31,7 @@ WRAPPER_BIN_DIR ?= $(HOME)/.local/bin
 .PHONY: help bootstrap-env render doctor acceptance runtime-render runtime-sync runtime-status runtime-skills runtime-skill-audit runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context dev-sanity python-cov-xml wrappers-install build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles box-register box-unregister
 
 help:
-	@printf "  make bootstrap-env  Copy .env.example to .env if missing\n"
+	@printf "  make bootstrap-env  Seed .skillbox-state/operator/.env from .env.example if missing\n"
 	@printf "  make render         Print the resolved sandbox model\n"
 	@printf "  make doctor         Validate outer manifests, compose drift, and default skill-repo-set sync\n"
 	@printf "  make acceptance     Run first-box acceptance for CLIENT=id (optional PROFILE=name)\n"
@@ -68,7 +76,8 @@ help:
 	@printf "  make box-unregister Remove a registered shared box from local inventory (BOX=id)\n"
 
 bootstrap-env:
-	@test -f .env || cp .env.example .env
+	@mkdir -p $(_STATE_ROOT)/operator
+	@test -f $(_STATE_ROOT)/operator/.env || test -f ./.env || cp .env.example $(_STATE_ROOT)/operator/.env
 
 render:
 	@python3 scripts/04-reconcile.py render

@@ -667,7 +667,10 @@ class BoxTests(unittest.TestCase):
                 payload["credential_status"]["missing"],
                 ["SKILLBOX_DO_TOKEN", "SKILLBOX_DO_SSH_KEY_ID", "SKILLBOX_TS_AUTHKEY"],
             )
-            self.assertIn("Create or update .env.box", " ".join(payload["next_actions"]))
+            next_actions_text = " ".join(payload["next_actions"])
+            self.assertIn("Create or update ", next_actions_text)
+            # Secrets now live under the state-root operator dir, out of the workspace mount.
+            self.assertIn("operator/.env.box", next_actions_text)
 
     def test_up_rejects_existing_active_box(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -549,7 +549,7 @@ def require_env(name: str) -> str:
     if not val:
         raise RuntimeError(
             f"Required environment variable {name} is not set. "
-            f"Add it to .env or export it before running box commands."
+            f"Add it to {operator_secret_dir() / '.env'} or export it before running box commands."
         )
     return val
 
@@ -568,7 +568,8 @@ def provisioning_credentials_next_actions(
         return [f"box up {box_id} --profile {profile_name} --deploy-manifest <path>"]
     return [
         "Ask the operator for the missing DigitalOcean/Tailscale provisioning values.",
-        "Create or update .env.box on the operator machine with the missing KEY=value lines.",
+        f"Create or update {operator_secret_dir() / '.env.box'} on the operator machine "
+        "with the missing KEY=value lines.",
         f"Missing: {', '.join(missing)}",
         f"Re-run: python3 scripts/box.py up {box_id} --profile {profile_name} --dry-run --format json",
     ]
@@ -582,7 +583,10 @@ def provisioning_credentials_status() -> dict[str, Any]:
         "required": list(PROVISIONING_ENV_VARS),
         "configured": configured,
         "missing": missing,
-        "env_files": [".env", ".env.box"],
+        "env_files": [
+            str(operator_secret_dir() / ".env"),
+            str(operator_secret_dir() / ".env.box"),
+        ],
         "message": (
             "Provisioning credentials are ready."
             if not missing
@@ -599,7 +603,8 @@ def emit_provisioning_credentials_error(*, box_id: str, profile_name: str, is_js
     message = (
         "Required provisioning credentials are unset: "
         + ", ".join(missing)
-        + ". Add them to .env.box or export them before running box provisioning."
+        + f". Add them to {operator_secret_dir() / '.env.box'} or export them "
+        "before running box provisioning."
     )
     next_actions = provisioning_credentials_next_actions(
         missing,
@@ -612,8 +617,9 @@ def emit_provisioning_credentials_error(*, box_id: str, profile_name: str, is_js
             error_type="provisioning_credentials_missing",
             recovery_hint=(
                 "These are operator-machine credentials, not values to invent inside the box. "
-                "Ask the operator to populate .env.box with SKILLBOX_DO_TOKEN, "
-                "SKILLBOX_DO_SSH_KEY_ID, and SKILLBOX_TS_AUTHKEY, then rerun the dry-run."
+                f"Ask the operator to populate {operator_secret_dir() / '.env.box'} with "
+                "SKILLBOX_DO_TOKEN, SKILLBOX_DO_SSH_KEY_ID, and SKILLBOX_TS_AUTHKEY, "
+                "then rerun the dry-run."
             ),
             next_actions=next_actions,
         )
@@ -646,6 +652,48 @@ def load_dotenv(path: Path) -> None:
         value = value.strip()
         if key and key not in os.environ:
             os.environ[key] = value
+
+
+# Operator secret files (DigitalOcean token, Tailscale authkey, *_TOKEN/*_KEY/*_SECRET).
+# These are consumed host-side only; they must live OUTSIDE the `.:/workspace` bind
+# mount so in-container agents cannot read them. Canonical home is
+# ${SKILLBOX_STATE_ROOT}/operator/ (the state root is mounted only at specific
+# subpaths, never wholesale). Repo-root copies are deprecated and warn.
+# NOTE: workspace/boxes.json is NOT a credential (droplet IDs/IPs/topology only),
+# so it intentionally stays in the workspace mount.
+OPERATOR_SECRET_FILENAMES = (".env", ".env.box")
+
+
+def operator_secret_dir() -> Path:
+    """Resolve the canonical operator-secret directory under the state root."""
+    state_root = os.environ.get("SKILLBOX_STATE_ROOT", "").strip() or "./.skillbox-state"
+    base = Path(state_root)
+    if not base.is_absolute():
+        base = REPO_ROOT / base
+    return (base / "operator").resolve()
+
+
+def load_operator_secret(name: str) -> None:
+    """Load an operator secret file, preferring the relocated state-root copy.
+
+    Falls back to the deprecated repo-root location (inside the workspace mount)
+    with a loud stderr warning; no-op when neither file exists.
+    """
+    new_path = operator_secret_dir() / name
+    legacy_path = REPO_ROOT / name
+    if new_path.is_file():
+        load_dotenv(new_path)
+        return
+    if legacy_path.is_file():
+        sys.stderr.write(
+            f"[skillbox] DEPRECATED secret location: {legacy_path} is inside the workspace "
+            f"bind mount and readable by in-container agents.\n"
+            f"[skillbox] Move it out of the mount with:\n"
+            f"    mkdir -p {operator_secret_dir()} && mv {legacy_path} {new_path}\n"
+        )
+        load_dotenv(legacy_path)
+        return
+    # neither present: leave os.environ untouched; existing missing-credential UX handles it.
 
 
 # ---------------------------------------------------------------------------
@@ -4146,8 +4194,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    load_dotenv(REPO_ROOT / ".env")
-    load_dotenv(REPO_ROOT / ".env.box")
+    load_operator_secret(".env")
+    load_operator_secret(".env.box")
 
     parser = build_parser()
     normalized_argv, diagnostics = _normalize_agent_argv(sys.argv[1:] if argv is None else argv)

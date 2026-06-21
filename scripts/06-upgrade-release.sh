@@ -13,6 +13,10 @@ SUCCESS=0
 STOPPED_OLD=0
 PROFILE_ARGS=()
 
+# NOTE: .skillbox-state/operator/ is the canonical home for operator secrets
+# (.env, .env.box) — it lives out of the workspace bind mount and is preserved
+# transitively via the .skillbox-state entry below. The legacy repo-root .env /
+# .env.box entries remain so upgrades don't clobber not-yet-migrated operators.
 PRESERVE_PATHS=(
   ".env"
   ".env.box"

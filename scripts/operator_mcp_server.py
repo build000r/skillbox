@@ -24,6 +24,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 BOX_PY = SCRIPT_DIR / "box.py"
 RECONCILE_PY = SCRIPT_DIR / "04-reconcile.py"
+# DEPRECATED repo-root secret locations (inside the workspace bind mount).
+# Retained for reference/back-compat; main() loads via load_operator_secret(),
+# which prefers operator_secret_dir() and only falls back here with a warning.
 ENV_FILE = REPO_ROOT / ".env"
 ENV_BOX_FILE = REPO_ROOT / ".env.box"
 
@@ -266,8 +269,9 @@ TOOLS: list[dict] = [
             "This is the primary macro — one call replaces 7 manual steps. "
             "ALWAYS use dry_run=true first. "
             "Dry-run returns credential_status; if missing is non-empty, stop and ask the operator "
-            "to populate .env.box with SKILLBOX_DO_TOKEN, SKILLBOX_DO_SSH_KEY_ID, and "
-            "SKILLBOX_TS_AUTHKEY before running real provisioning."
+            "to populate the operator secret file (${SKILLBOX_STATE_ROOT}/operator/.env.box, "
+            "default ./.skillbox-state/operator/.env.box) with SKILLBOX_DO_TOKEN, "
+            "SKILLBOX_DO_SSH_KEY_ID, and SKILLBOX_TS_AUTHKEY before running real provisioning."
         ),
         **_tool_metadata(
             read_only=False,
@@ -502,6 +506,47 @@ def load_dotenv(path: Path) -> None:
         value = value.strip()
         if key and key not in os.environ:
             os.environ[key] = value
+
+
+# Operator secret files (DigitalOcean token, Tailscale authkey, *_TOKEN/*_KEY/*_SECRET).
+# These are consumed host-side only; they must live OUTSIDE the `.:/workspace` bind
+# mount so in-container agents cannot read them. Canonical home is
+# ${SKILLBOX_STATE_ROOT}/operator/ (the state root is mounted only at specific
+# subpaths, never wholesale). The legacy repo-root ENV_FILE/ENV_BOX_FILE locations
+# are deprecated and warn.
+OPERATOR_SECRET_FILENAMES = (".env", ".env.box")
+
+
+def operator_secret_dir() -> Path:
+    """Resolve the canonical operator-secret directory under the state root."""
+    state_root = os.environ.get("SKILLBOX_STATE_ROOT", "").strip() or "./.skillbox-state"
+    base = Path(state_root)
+    if not base.is_absolute():
+        base = REPO_ROOT / base
+    return (base / "operator").resolve()
+
+
+def load_operator_secret(name: str) -> None:
+    """Load an operator secret file, preferring the relocated state-root copy.
+
+    Falls back to the deprecated repo-root location (inside the workspace mount)
+    with a loud stderr warning; no-op when neither file exists.
+    """
+    new_path = operator_secret_dir() / name
+    legacy_path = REPO_ROOT / name
+    if new_path.is_file():
+        load_dotenv(new_path)
+        return
+    if legacy_path.is_file():
+        sys.stderr.write(
+            f"[skillbox] DEPRECATED secret location: {legacy_path} is inside the workspace "
+            f"bind mount and readable by in-container agents.\n"
+            f"[skillbox] Move it out of the mount with:\n"
+            f"    mkdir -p {operator_secret_dir()} && mv {legacy_path} {new_path}\n"
+        )
+        load_dotenv(legacy_path)
+        return
+    # neither present: leave os.environ untouched; existing missing-credential UX handles it.
 
 
 def run_script(
@@ -1257,7 +1302,10 @@ def handle_initialize(_params: dict) -> dict:
             "1. Run operator_boxes to see the current fleet. "
             "2. Run operator_profiles to see available box sizes. "
             "3. Use operator_provision with dry_run=true before creating infrastructure and inspect "
-            "credential_status; missing credentials must be added to .env.box by the operator. "
+            "credential_status; missing credentials must be added by the operator to the operator "
+            "secret file (${SKILLBOX_STATE_ROOT}/operator/.env.box, default "
+            "./.skillbox-state/operator/.env.box) — NOT to the repo root, which is readable by "
+            "in-container agents. "
             "4. CONFIRM WITH USER before operator_teardown — it destroys infrastructure. "
             "5. Use operator_box_exec to run commands on remote boxes. "
             "6. Use operator_doctor to validate the local repo state. "
@@ -1298,8 +1346,8 @@ def send_error(msg_id: Any, code: int, message: str) -> None:
 
 
 def main() -> None:
-    load_dotenv(ENV_FILE)
-    load_dotenv(ENV_BOX_FILE)
+    load_operator_secret(".env")
+    load_operator_secret(".env.box")
     print(f"[operator-mcp] starting — repo: {REPO_ROOT}", file=sys.stderr, flush=True)
 
     for raw in sys.stdin:
