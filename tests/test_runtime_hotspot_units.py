@@ -849,6 +849,7 @@ class RuntimeScanHotspotTests(unittest.TestCase):
             mock.patch("runtime_manager.runtime_ops.validate_storage_posture", return_value=[]),
             mock.patch("runtime_manager.runtime_ops.validate_bridges", return_value=[]),
             mock.patch("runtime_manager.runtime_ops.validate_ingress", return_value=[]),
+            mock.patch("runtime_manager.runtime_ops.validate_port_registry", return_value=[]),
         ):
             results = runtime_ops_module.doctor_results({}, Path("/repo"))
 
