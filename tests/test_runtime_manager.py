@@ -215,6 +215,48 @@ class RuntimeManagerTests(unittest.TestCase):
                 time.sleep(1.1)
                 runtime_ops.reap_started_service_processes()
 
+    def test_lifecycle_events_are_written_under_model_root(self) -> None:
+        from runtime_manager.runtime_ops import start_services
+
+        marker = f"event-root-fixture-{time.time_ns()}"
+        checkout_log = ROOT_DIR / "logs" / "runtime" / "runtime.log"
+        before_checkout_log = checkout_log.read_text(encoding="utf-8") if checkout_log.is_file() else ""
+        self.assertNotIn(marker, before_checkout_log)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "checkout"
+            state_root = Path(tmpdir) / "state"
+            log_dir = state_root / "logs" / "runtime"
+            root.mkdir()
+            model = {
+                "root_dir": str(root),
+                "env": {},
+                "artifacts": [],
+                "logs": [{"id": "runtime", "host_path": str(log_dir)}],
+                "repos": [{"id": "skillbox-self", "host_path": str(root), "path": str(root)}],
+                "services": [],
+                "storage": {"state_root": str(state_root)},
+            }
+            service = {
+                "id": marker,
+                "kind": "daemon",
+                "repo": "skillbox-self",
+                "command": f"{sys.executable} -c \"import sys; sys.exit(17)\"",
+                "healthcheck": {"type": "http", "url": "http://127.0.0.1:9/health"},
+                "log": "runtime",
+            }
+
+            results = start_services(model, [service], dry_run=False, wait_seconds=1)
+
+            self.assertEqual(results[0]["result"], "failed")
+            model_log = state_root / "logs" / "runtime" / "runtime.log"
+            self.assertIn(f"service.start_failed {marker}", model_log.read_text(encoding="utf-8"))
+            checkout_model_log = root / "logs" / "runtime" / "runtime.log"
+            self.assertFalse(checkout_model_log.exists())
+
+        after_checkout_log = checkout_log.read_text(encoding="utf-8") if checkout_log.is_file() else ""
+        self.assertNotIn(marker, after_checkout_log)
+
     @unittest.skipUnless(
         Path("/proc/self/stat").exists(),
         "zombie-state detection relies on /proc",

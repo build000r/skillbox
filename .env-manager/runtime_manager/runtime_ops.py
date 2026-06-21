@@ -43,6 +43,54 @@ def track_started_service_process(process: subprocess.Popen[str]) -> None:
         _STARTED_SERVICE_PROCESSES.append(process)
 
 
+def _root_for_runtime_log_dir(log_dir: Path) -> Path | None:
+    expected_parts = RUNTIME_LOG_REL.parent.parts
+    parts = log_dir.expanduser().parts
+    if len(parts) < len(expected_parts):
+        return None
+    if parts[-len(expected_parts):] != expected_parts:
+        return None
+    root_parts = parts[:-len(expected_parts)]
+    if not root_parts:
+        return Path(".")
+    return Path(*root_parts)
+
+
+def _model_absolute_path(model: dict[str, Any], raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    if path.is_absolute():
+        return path
+    return Path(str(model.get("root_dir") or DEFAULT_ROOT_DIR)) / path
+
+
+def _runtime_event_root(model: dict[str, Any]) -> Path:
+    for log in model.get("logs") or []:
+        if str(log.get("id") or "") != "runtime":
+            continue
+        raw_host_path = str(log.get("host_path") or "").strip()
+        if not raw_host_path:
+            continue
+        event_root = _root_for_runtime_log_dir(_model_absolute_path(model, raw_host_path))
+        if event_root is not None:
+            return event_root
+
+    storage = model.get("storage") if isinstance(model.get("storage"), dict) else {}
+    raw_state_root = str((storage or {}).get("state_root") or "").strip()
+    if raw_state_root:
+        return _model_absolute_path(model, raw_state_root)
+
+    return Path(str(model.get("root_dir") or DEFAULT_ROOT_DIR))
+
+
+def _log_model_runtime_event(
+    model: dict[str, Any],
+    event_type: str,
+    subject: str,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    log_runtime_event(event_type, subject, detail, root_dir=_runtime_event_root(model))
+
+
 def _storage_filesystem_type(path: Path) -> str:
     result = run_command(["findmnt", "-no", "FSTYPE", "--target", str(path)])
     if result.returncode != 0:
@@ -1579,7 +1627,7 @@ def sync_runtime(model: dict[str, Any], dry_run: bool) -> list[str]:
     actions.extend(sync_dcg_config(model, Path(str(model["root_dir"])), dry_run=dry_run))
     actions.extend(sync_ingress_artifacts(model, dry_run=dry_run))
     if not dry_run:
-        log_runtime_event("sync.completed", "runtime", {"action_count": len(actions)})
+        _log_model_runtime_event(model, "sync.completed", "runtime", {"action_count": len(actions)})
     return actions
 
 
@@ -2146,6 +2194,7 @@ def _port_conflict_blocked_result(
     host: str,
     port: int,
     owner: dict[str, Any] | None,
+    event_root: Path,
 ) -> dict[str, Any]:
     detail = result | {
         "result": "blocked",
@@ -2171,6 +2220,7 @@ def _port_conflict_blocked_result(
         "service.start_blocked",
         service["id"],
         {"reason": "port_already_in_use", "port": port, "external_pid": owner.get("pid") if owner else None},
+        root_dir=event_root,
     )
     return detail
 
@@ -3210,6 +3260,7 @@ def run_tasks(
     # a single command); the parameter is threaded here so WG-005 lifecycle
     # callers can pass the resolved mode without a second signature.
     del mode  # reserved for future mode-gated bootstrap commands
+    event_root = _runtime_event_root(model)
     results: list[dict[str, Any]] = []
     for task in tasks:
         paths = task_paths(model, task)
@@ -3243,7 +3294,7 @@ def run_tasks(
             results.append(result | {"result": "dry-run"})
             continue
 
-        log_runtime_event("task.started", task["id"])
+        log_runtime_event("task.started", task["id"], root_dir=event_root)
         task_timeout = float(task.get("timeout_seconds") or DEFAULT_TASK_TIMEOUT_SECONDS)
         with paths["log_file"].open("a", encoding="utf-8") as log_handle:
             # Run in a new session so the shell + every descendant share a
@@ -3272,7 +3323,7 @@ def run_tasks(
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass
-                log_runtime_event("task.failed", task["id"], {"reason": "timeout"})
+                log_runtime_event("task.failed", task["id"], {"reason": "timeout"}, root_dir=event_root)
                 raise RuntimeError(
                     f"Task {task['id']} timed out after {task_timeout:.0f}s. "
                     "Increase 'timeout_seconds' on the task to allow more time."
@@ -3280,7 +3331,7 @@ def run_tasks(
 
         if returncode != 0:
             tail = tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)
-            log_runtime_event("task.failed", task["id"], {"exit_code": returncode})
+            log_runtime_event("task.failed", task["id"], {"exit_code": returncode}, root_dir=event_root)
             raise RuntimeError(
                 f"Task {task['id']} failed with exit code {returncode}."
                 + (f" Recent logs: {' | '.join(tail)}" if tail else "")
@@ -3289,7 +3340,12 @@ def run_tasks(
         post_state = probe_task(model, task)
         if post_state["state"] != "ready":
             tail = tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)
-            log_runtime_event("task.failed", task["id"], {"reason": "success_check_unsatisfied"})
+            log_runtime_event(
+                "task.failed",
+                task["id"],
+                {"reason": "success_check_unsatisfied"},
+                root_dir=event_root,
+            )
             raise RuntimeError(
                 f"Task {task['id']} completed but did not satisfy its success check."
                 + (f" Success target: {post_state['target']}." if post_state.get("target") else "")
@@ -3297,7 +3353,7 @@ def run_tasks(
             )
 
         results.append(result | {"result": "completed", "target": post_state.get("target")})
-        log_runtime_event("task.completed", task["id"])
+        log_runtime_event("task.completed", task["id"], root_dir=event_root)
     return results
 
 
@@ -3310,7 +3366,11 @@ def _service_start_base_result(service: dict[str, Any], paths: dict[str, Path]) 
     }
 
 
-def _prelaunch_running_result(service: dict[str, Any], result: dict[str, Any]) -> dict[str, Any] | None:
+def _prelaunch_running_result(
+    service: dict[str, Any],
+    result: dict[str, Any],
+    event_root: Path,
+) -> dict[str, Any] | None:
     prelaunch_health = service_healthcheck_state(service)
     if prelaunch_health.get("state") != "ok":
         return None
@@ -3318,7 +3378,7 @@ def _prelaunch_running_result(service: dict[str, Any], result: dict[str, Any]) -
     for key in ("url", "target", "port"):
         if key in prelaunch_health:
             reused_result[key] = prelaunch_health[key]
-    log_runtime_event("service.reused", service["id"])
+    log_runtime_event("service.reused", service["id"], root_dir=event_root)
     return reused_result
 
 
@@ -3334,6 +3394,7 @@ def _running_pid_service_result(
     *,
     pid: int,
     dry_run: bool,
+    event_root: Path,
 ) -> dict[str, Any] | None:
     if not _service_has_declared_healthcheck(service):
         return result | {"result": "already-running", "pid": pid}
@@ -3342,7 +3403,7 @@ def _running_pid_service_result(
     if health_state.get("state") == "ok":
         reused_result = result | {"result": "already-running", "pid": pid}
         _copy_health_fields(reused_result, health_state, ("url", "target", "port", "pattern"))
-        log_runtime_event("service.reused", service["id"])
+        log_runtime_event("service.reused", service["id"], root_dir=event_root)
         return reused_result
 
     if dry_run:
@@ -3369,6 +3430,7 @@ def _running_pid_service_result(
             "service.restart_blocked",
             service["id"],
             {"pid": pid, "health_state": health_state.get("state"), "stop_result": stop_result},
+            root_dir=event_root,
         )
         return detail
 
@@ -3381,6 +3443,7 @@ def _running_pid_service_result(
         "service.restarting_unhealthy",
         service["id"],
         {"previous_pid": pid, "health_state": health_state.get("state"), "stop_result": stop_result},
+        root_dir=event_root,
     )
     return None
 
@@ -3453,13 +3516,14 @@ def _failed_service_start_result(
     process: subprocess.Popen[str],
     health_state: dict[str, Any],
     self_managed_pid_file: bool,
+    event_root: Path,
 ) -> dict[str, Any]:
     stop_process(process.pid, DEFAULT_SERVICE_STOP_WAIT_SECONDS)
     if not self_managed_pid_file:
         remove_pid_file(paths["pid_file"])
     detail = result | {"result": "failed", "tail": tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)}
     _copy_health_fields(detail, health_state, ("exit_code", "url", "target", "pattern"))
-    log_runtime_event("service.start_failed", service["id"], {"state": "failed"})
+    log_runtime_event("service.start_failed", service["id"], {"state": "failed"}, root_dir=event_root)
     return detail
 
 
@@ -3469,6 +3533,7 @@ def _timeout_service_start_result(
     paths: dict[str, Path],
     process: subprocess.Popen[str],
     health_state: dict[str, Any],
+    event_root: Path,
 ) -> dict[str, Any]:
     track_started_service_process(process)
     detail = result | {
@@ -3477,7 +3542,12 @@ def _timeout_service_start_result(
         "tail": tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES),
     }
     _copy_health_fields(detail, health_state, ("url", "target", "pattern"))
-    log_runtime_event("service.start_timeout", service["id"], {"state": "timeout", "pid": process.pid})
+    log_runtime_event(
+        "service.start_timeout",
+        service["id"],
+        {"state": "timeout", "pid": process.pid},
+        root_dir=event_root,
+    )
     return detail
 
 
@@ -3486,16 +3556,17 @@ def _self_managed_reused_result(
     result: dict[str, Any],
     paths: dict[str, Path],
     health_state: dict[str, Any],
+    event_root: Path,
 ) -> dict[str, Any]:
     started_pid = live_service_pid(paths["pid_file"])
     if started_pid is None:
         detail = result | {"result": "failed", "tail": tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)}
         _copy_health_fields(detail, health_state, ("exit_code", "target"))
-        log_runtime_event("service.start_failed", service["id"], {"state": "failed"})
+        log_runtime_event("service.start_failed", service["id"], {"state": "failed"}, root_dir=event_root)
         return detail
     started_detail = result | {"result": "started", "pid": started_pid}
     _copy_health_fields(started_detail, health_state, ("target",))
-    log_runtime_event("service.started", service["id"], {"pid": started_pid})
+    log_runtime_event("service.started", service["id"], {"pid": started_pid}, root_dir=event_root)
     return started_detail
 
 
@@ -3505,13 +3576,14 @@ def _reused_existing_service_result(
     paths: dict[str, Path],
     health_state: dict[str, Any],
     self_managed_pid_file: bool,
+    event_root: Path,
 ) -> dict[str, Any]:
     if self_managed_pid_file:
-        return _self_managed_reused_result(service, result, paths, health_state)
+        return _self_managed_reused_result(service, result, paths, health_state, event_root)
     remove_pid_file(paths["pid_file"])
     reused_result = result | {"result": "already-running"}
     _copy_health_fields(reused_result, health_state, ("url", "target"))
-    log_runtime_event("service.reused", service["id"])
+    log_runtime_event("service.reused", service["id"], root_dir=event_root)
     return reused_result
 
 
@@ -3521,12 +3593,18 @@ def _healthy_service_start_result(
     paths: dict[str, Path],
     process: subprocess.Popen[str],
     self_managed_pid_file: bool,
+    event_root: Path,
 ) -> dict[str, Any]:
     started_pid = live_service_pid(paths["pid_file"]) if self_managed_pid_file else process.pid
     started_detail = result | {"result": "started"}
     if started_pid is not None:
         started_detail["pid"] = started_pid
-    log_runtime_event("service.started", service["id"], {"pid": started_pid or process.pid})
+    log_runtime_event(
+        "service.started",
+        service["id"],
+        {"pid": started_pid or process.pid},
+        root_dir=event_root,
+    )
     track_started_service_process(process)
     return started_detail
 
@@ -3538,15 +3616,31 @@ def _service_health_start_result(
     process: subprocess.Popen[str],
     wait_seconds: float,
     self_managed_pid_file: bool,
+    event_root: Path,
 ) -> dict[str, Any]:
     health_state = wait_for_service_health(service, process, wait_seconds)
     if health_state.get("state") == "failed":
-        return _failed_service_start_result(service, result, paths, process, health_state, self_managed_pid_file)
+        return _failed_service_start_result(
+            service,
+            result,
+            paths,
+            process,
+            health_state,
+            self_managed_pid_file,
+            event_root,
+        )
     if health_state.get("state") == "timeout":
-        return _timeout_service_start_result(service, result, paths, process, health_state)
+        return _timeout_service_start_result(service, result, paths, process, health_state, event_root)
     if health_state.get("reused_existing"):
-        return _reused_existing_service_result(service, result, paths, health_state, self_managed_pid_file)
-    return _healthy_service_start_result(service, result, paths, process, self_managed_pid_file)
+        return _reused_existing_service_result(
+            service,
+            result,
+            paths,
+            health_state,
+            self_managed_pid_file,
+            event_root,
+        )
+    return _healthy_service_start_result(service, result, paths, process, self_managed_pid_file, event_root)
 
 
 def _start_service(
@@ -3557,6 +3651,7 @@ def _start_service(
     wait_seconds: float,
     effective_mode: str | None,
 ) -> dict[str, Any]:
+    event_root = _runtime_event_root(model)
     manageable, reason = service_supports_lifecycle(service, model)
     paths = service_paths(model, service)
     result = _service_start_base_result(service, paths)
@@ -3571,11 +3666,12 @@ def _start_service(
             paths,
             pid=pid,
             dry_run=dry_run,
+            event_root=event_root,
         )
         if running_result is not None:
             return running_result
 
-    prelaunch_result = _prelaunch_running_result(service, result)
+    prelaunch_result = _prelaunch_running_result(service, result, event_root)
     if prelaunch_result is not None:
         return prelaunch_result
 
@@ -3585,7 +3681,7 @@ def _start_service(
         port_state = _port_listening_state(port, host=host)
         if port_state.get("state") == "ok":
             owner = _external_listener_owner(host, port)
-            return _port_conflict_blocked_result(service, result, host, port, owner)
+            return _port_conflict_blocked_result(service, result, host, port, owner, event_root)
 
     command, env, cwd, self_managed_pid_file = _service_launch_context(
         model, service, result, paths, effective_mode,
@@ -3598,7 +3694,13 @@ def _start_service(
     if not self_managed_pid_file:
         _write_managed_service_pid(process, paths["pid_file"])
     return _service_health_start_result(
-        service, result, paths, process, wait_seconds, self_managed_pid_file,
+        service,
+        result,
+        paths,
+        process,
+        wait_seconds,
+        self_managed_pid_file,
+        event_root,
     )
 
 
@@ -3624,6 +3726,7 @@ def _already_running_short_circuit(
     service: dict[str, Any],
     blocked_on: list[str],
 ) -> dict[str, Any] | None:
+    event_root = _runtime_event_root(model)
     manageable, _reason = service_supports_lifecycle(service, model)
     if not manageable:
         return None
@@ -3631,7 +3734,7 @@ def _already_running_short_circuit(
     base = _service_start_base_result(service, paths)
     pid = live_service_pid(paths["pid_file"])
     if pid is None:
-        prelaunch = _prelaunch_running_result(service, base)
+        prelaunch = _prelaunch_running_result(service, base, event_root)
         return _annotate_degraded_deps(prelaunch, blocked_on)
     if not _service_has_declared_healthcheck(service):
         return _annotate_degraded_deps(base | {"result": "already-running", "pid": pid}, blocked_on)
@@ -3640,7 +3743,7 @@ def _already_running_short_circuit(
         return None
     reused_result = base | {"result": "already-running", "pid": pid}
     _copy_health_fields(reused_result, health_state, ("url", "target", "port", "pattern"))
-    log_runtime_event("service.reused", service["id"])
+    log_runtime_event("service.reused", service["id"], root_dir=event_root)
     return _annotate_degraded_deps(reused_result, blocked_on)
 
 
@@ -3698,6 +3801,7 @@ def stop_services(
     dry_run: bool,
     wait_seconds: float,
 ) -> list[dict[str, Any]]:
+    event_root = _runtime_event_root(model)
     results: list[dict[str, Any]] = []
     for service in services:
         manageable, reason = service_supports_lifecycle(service, model)
@@ -3742,7 +3846,7 @@ def stop_services(
                 "signal": signal_used,
             }
         )
-        log_runtime_event("service.stopped", service["id"], {"signal": signal_used})
+        log_runtime_event("service.stopped", service["id"], {"signal": signal_used}, root_dir=event_root)
     return results
 
 
