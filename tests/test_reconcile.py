@@ -272,13 +272,21 @@ class ReconcileTests(unittest.TestCase):
         buf = io.StringIO()
         results = [
             RECONCILE.CheckResult(status="pass", code="ok", message="all good"),
-            RECONCILE.CheckResult(status="warn", code="warn-code", message="warning", details={"items": ["a", "b"]}),
+            RECONCILE.CheckResult(
+                status="warn",
+                code="warn-code",
+                message="warning",
+                details={"items": ["a", "b"]},
+                fix_command="make render",
+            ),
         ]
         with redirect_stdout(buf):
             RECONCILE.print_doctor_text(results)
         output = buf.getvalue()
         self.assertIn("PASS ok", output)
+        self.assertIn("fix: make render", output)
         self.assertIn("summary:", output)
+        self.assertEqual(RECONCILE.asdict(results[1])["fix_command"], "make render")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir).resolve()
@@ -293,6 +301,7 @@ class ReconcileTests(unittest.TestCase):
 
         self.assertEqual(drift.status, "fail")
         self.assertEqual(drift.details["hits"], ["docs/note.txt:1"])
+        self.assertEqual(drift.fix_command, 'rg "00-skill-sync.sh" .')
 
         process = mock.Mock(returncode=0, stdout=json.dumps({"checks": [{"status": "warn", "code": "skill-repo-lock-state"}]}), stderr="")
         with mock.patch.object(RECONCILE, "run_command", return_value=process):
@@ -319,6 +328,7 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(lock_state.status, "warn")
         self.assertEqual(lock_state.code, "skill-repo-lock-state")
         self.assertEqual(lock_state.details["missing"], ["describe"])
+        self.assertEqual(lock_state.fix_command, RECONCILE.SKILL_SYNC_FIX_COMMAND)
 
         process = mock.Mock(
             returncode=0,
@@ -330,6 +340,74 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(dry_run.status, "pass")
         self.assertEqual(dry_run.code, "skill-repo-sync-dry-run")
         self.assertEqual(dry_run.details["preview"], ["skill-repo-fetched: build000r/skills"])
+
+        failed_process = mock.Mock(returncode=1, stdout="", stderr="sync failed")
+        with mock.patch.object(RECONCILE, "run_command", return_value=failed_process):
+            failed_dry_run = RECONCILE.check_skill_sync_dry_run({})
+        self.assertEqual(failed_dry_run.status, "fail")
+        self.assertEqual(failed_dry_run.fix_command, RECONCILE.SKILL_SYNC_FIX_COMMAND)
+
+    def test_beads_state_reports_copy_pasteable_fix_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            with self._patch_roots(repo):
+                missing = RECONCILE.check_beads_state()
+        self.assertEqual(missing.status, "warn")
+        self.assertEqual(missing.code, "beads-state")
+        self.assertEqual(missing.fix_command, RECONCILE.BEADS_INIT_FIX_COMMAND)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            beads = repo / ".beads"
+            beads.mkdir()
+            (beads / "beads.db").write_text("", encoding="utf-8")
+            with self._patch_roots(repo):
+                unsynced = RECONCILE.check_beads_state()
+        self.assertEqual(unsynced.status, "warn")
+        self.assertEqual(unsynced.fix_command, RECONCILE.BEADS_SYNC_FIX_COMMAND)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            beads = repo / ".beads"
+            beads.mkdir()
+            (beads / "beads.db").write_text("", encoding="utf-8")
+            (beads / "issues.jsonl").write_text("", encoding="utf-8")
+            process = mock.Mock(
+                returncode=0,
+                stdout=json.dumps({"dirty_count": 1, "db_newer": False, "jsonl_exists": True}),
+                stderr="",
+            )
+            with self._patch_roots(repo), \
+                mock.patch.object(RECONCILE.shutil, "which", return_value="/usr/bin/br"), \
+                mock.patch.object(RECONCILE, "run_command", return_value=process):
+                dirty = RECONCILE.check_beads_state()
+        self.assertEqual(dirty.status, "warn")
+        self.assertEqual(dirty.fix_command, RECONCILE.BEADS_SYNC_FIX_COMMAND)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            beads = repo / ".beads"
+            beads.mkdir()
+            (beads / "beads.db").write_text("", encoding="utf-8")
+            (beads / "issues.jsonl").write_text("", encoding="utf-8")
+            process = mock.Mock(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "dirty_count": 0,
+                        "db_newer": False,
+                        "jsonl_exists": True,
+                        "last_export_time": "2026-06-19T15:05:46Z",
+                    }
+                ),
+                stderr="",
+            )
+            with self._patch_roots(repo), \
+                mock.patch.object(RECONCILE.shutil, "which", return_value="/usr/bin/br"), \
+                mock.patch.object(RECONCILE, "run_command", return_value=process):
+                synced = RECONCILE.check_beads_state()
+        self.assertEqual(synced.status, "pass")
+        self.assertIsNone(synced.fix_command)
 
     def test_check_manifest_alignment_and_compose_config_helpers(self) -> None:
         model = {
@@ -425,6 +503,7 @@ class ReconcileTests(unittest.TestCase):
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["tool"], "skillbox-reconcile")
         self.assertIn("stdout_stderr_contract", payload)
+        self.assertEqual(payload["doctor_remediation"]["json_field"], "fix_command")
         self.assertIn("--jsno", payload["agent_surfaces"]["json_aliases"])
         self.assertIn(
             "python3 scripts/04-reconcile.py doctor --format json --skip-compose --skip-skill-sync",
@@ -435,6 +514,7 @@ class ReconcileTests(unittest.TestCase):
         with redirect_stdout(docs):
             self.assertEqual(RECONCILE.main(["robot-docs", "guide"]), 0)
         self.assertIn("Skillbox reconcile agent guide", docs.getvalue())
+        self.assertIn("fix_command", docs.getvalue())
         self.assertIn("sync --dry-run --format json", docs.getvalue())
 
         triage = io.StringIO()
@@ -450,6 +530,7 @@ class ReconcileTests(unittest.TestCase):
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 self.assertEqual(RECONCILE.main(["doctor", "--jsno"]), 0)
         self.assertEqual(json.loads(stdout.getvalue())[0]["code"], "ok")
+        self.assertIsNone(json.loads(stdout.getvalue())[0]["fix_command"])
         self.assertIn("Interpreting --jsno as --format json", stderr.getvalue())
 
         stdout = io.StringIO()
