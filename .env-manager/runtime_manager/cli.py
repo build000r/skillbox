@@ -4,6 +4,7 @@ import difflib
 import os
 import subprocess
 import sys
+import traceback
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
@@ -365,6 +366,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--root-dir",
         default=None,
         help="Override the repo root for testing or embedding.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Include the traceback for unexpected (INTERNAL) errors. Off by default so tracebacks never leak.",
     )
     parser.add_argument(
         "--robot-triage",
@@ -4872,18 +4878,67 @@ def _emit_mode_error(args: argparse.Namespace, mode_error: dict[str, Any]) -> in
     return EXIT_ERROR
 
 
+def _typed_error_payload(exc: SkillboxError, command: str) -> dict[str, Any]:
+    """Render a SkillboxError into the back-compat envelope.
+
+    Runs the message-pattern classifier (preserving recovery_hint/next_actions
+    for known messages), then makes the typed code authoritative and layers in
+    the structured context + the error's own next_actions. Code stays unchanged:
+    the typed code is the same value classify_error derives for this message.
+    """
+    payload = classify_error(exc, command)
+    error_obj = payload.setdefault("error", {})
+    error_obj["code"] = exc.code
+    error_obj["type"] = exc.code
+    payload["error_code"] = exc.code
+    if exc.context:
+        error_obj["context"] = dict(exc.context)
+    if exc.next_actions:
+        error_obj["next_actions"] = list(exc.next_actions)
+        payload["next_actions"] = list(exc.next_actions)
+    return payload
+
+
 def _emit_main_exception(args: argparse.Namespace, exc: Exception) -> int:
+    is_json = getattr(args, "format", "text") == "json"
+    verbose = bool(getattr(args, "verbose", False))
+
+    # Typed errors carry their stable code + structured context. We still run
+    # the message-pattern table (classify_error) so the recovery_hint and
+    # next_actions affordances are preserved, then let the typed code/context be
+    # authoritative. The typed code MUST equal what classify_error would derive
+    # for the same message (codes are unchanged), so this only enriches.
+    if isinstance(exc, SkillboxError):
+        if is_json:
+            emit_json(_typed_error_payload(exc, args.command))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    # Legacy RuntimeError raisers still classify through the message table; the
+    # enriched ``structured_error`` carrier gives them the new envelope keys.
     if isinstance(exc, RuntimeError):
-        payload_error = exc
-    else:
-        payload_error = RuntimeError(f"Unexpected error: {exc}")
-    if args.format == "json":
-        emit_json(classify_error(payload_error, args.command))
-    elif isinstance(exc, RuntimeError):
-        print(str(exc), file=sys.stderr)
-    else:
-        import traceback
+        if is_json:
+            emit_json(classify_error(exc, args.command))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    # Truly unexpected exception: generic INTERNAL envelope. Never leak the
+    # traceback by default — only when --verbose is set.
+    if is_json:
+        context = {"traceback": traceback.format_exc()} if verbose else None
+        emit_json(
+            internal_error_payload(
+                f"Unexpected error: {exc}",
+                context=context,
+                next_actions=["doctor --format json"],
+            )
+        )
+    elif verbose:
         traceback.print_exc()
+    else:
+        print(f"Unexpected error: {exc}", file=sys.stderr)
     return EXIT_ERROR
 
 

@@ -1425,6 +1425,96 @@ except RuntimeError as exc:
         ):
             self.assertEqual(run_main(["--root-dir", tmpdir, "status", "--format", "json"]), CLI.EXIT_ERROR)
         self.assertEqual(emitted[-1]["error"]["message"], "broken")
+        # Carrier change: even a bare RuntimeError raiser now gets the new
+        # envelope keys (ok/error.code/error_code/deprecation) alongside legacy.
+        self.assertIs(emitted[-1]["ok"], False)
+        self.assertEqual(emitted[-1]["error"]["code"], "runtime_error")
+        self.assertEqual(emitted[-1]["error_code"], "runtime_error")
+        self.assertIn("deprecation", emitted[-1])
+
+    def _run_dispatch_with_handler(self, handler, *, argv, emitted):
+        def run_main(args: list[str]) -> int:
+            with mock.patch.object(sys, "argv", ["manage.py", *args]):
+                return CLI.main()
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch.dict(CLI._MODEL_DISPATCH, {"doctor": handler}),
+            mock.patch.object(CLI, "build_runtime_model", return_value={}),
+            mock.patch.object(CLI, "normalize_active_profiles", return_value=[]),
+            mock.patch.object(CLI, "normalize_active_clients", return_value=[]),
+            mock.patch.object(CLI, "filter_model", return_value={}),
+            mock.patch.object(CLI, "_check_logs_deferred_surfaces", return_value=None),
+            mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
+        ):
+            return run_main(["--root-dir", tmpdir, *argv])
+
+    def test_typed_error_envelope_has_new_and_legacy_keys_coexisting(self) -> None:
+        # ACCEPTANCE (1)+(2): a typed raise on a doctor/sync/up/down path emits
+        # the envelope in JSON mode, and legacy keys (error, error_code,
+        # error.type, error.recoverable) COEXIST with the deprecation marker.
+        from runtime_manager.errors import ValidationError
+
+        def typed_handler(args, root_dir, model, mode):
+            raise ValidationError(
+                "unknown_client",
+                "Unknown runtime client(s): ghost.",
+                context={"unknown": ["ghost"]},
+            )
+
+        emitted: list[dict[str, object]] = []
+        exit_code = self._run_dispatch_with_handler(
+            typed_handler, argv=["doctor", "--format", "json"], emitted=emitted
+        )
+        self.assertEqual(exit_code, CLI.EXIT_ERROR)
+        payload = emitted[-1]
+        # New canonical keys.
+        self.assertIs(payload["ok"], False)
+        self.assertEqual(payload["error"]["code"], "unknown_client")
+        self.assertEqual(payload["error"]["context"], {"unknown": ["ghost"]})
+        # Legacy mirrors COEXIST.
+        self.assertEqual(payload["error"]["type"], "unknown_client")
+        self.assertTrue(payload["error"]["recoverable"])
+        self.assertEqual(payload["error_code"], "unknown_client")
+        # Deprecation marker present.
+        self.assertEqual(payload["deprecation"]["use_instead"][0], "error.code")
+        # The known message pattern still enriched recovery_hint/next_actions.
+        self.assertIn("recovery_hint", payload["error"])
+        self.assertIn("next_actions", payload)
+
+    def test_unexpected_exception_emits_internal_envelope_without_traceback(self) -> None:
+        # ACCEPTANCE (3): unknown exceptions -> generic INTERNAL envelope; the
+        # traceback is NOT leaked unless --verbose is set.
+        def boom_handler(args, root_dir, model, mode):
+            raise ValueError("kaboom")
+
+        emitted: list[dict[str, object]] = []
+        exit_code = self._run_dispatch_with_handler(
+            boom_handler, argv=["doctor", "--format", "json"], emitted=emitted
+        )
+        self.assertEqual(exit_code, CLI.EXIT_ERROR)
+        payload = emitted[-1]
+        self.assertIs(payload["ok"], False)
+        self.assertEqual(payload["error"]["code"], "INTERNAL")
+        self.assertEqual(payload["error_code"], "INTERNAL")
+        self.assertFalse(payload["error"]["recoverable"])
+        self.assertIn("kaboom", payload["error"]["message"])
+        # No traceback leaked by default.
+        self.assertNotIn("context", payload["error"])
+
+    def test_unexpected_exception_includes_traceback_when_verbose(self) -> None:
+        def boom_handler(args, root_dir, model, mode):
+            raise ValueError("kaboom")
+
+        emitted: list[dict[str, object]] = []
+        exit_code = self._run_dispatch_with_handler(
+            boom_handler, argv=["--verbose", "doctor", "--format", "json"], emitted=emitted
+        )
+        self.assertEqual(exit_code, CLI.EXIT_ERROR)
+        payload = emitted[-1]
+        self.assertEqual(payload["error"]["code"], "INTERNAL")
+        self.assertIn("traceback", payload["error"]["context"])
+        self.assertIn("ValueError", payload["error"]["context"]["traceback"])
 
     def test_runtime_cwd_inference_prefers_client_with_local_runtime_service_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
