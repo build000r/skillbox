@@ -102,6 +102,16 @@ tailnet-only boxes — use loopback or Tailnet IP. See
 - Do not commit secrets from `.env`, `.env.box`, `workspace/secrets/`, or local
   client overlays.
 - Treat `make box-down`, `scripts/box.py down`, droplet destroy paths, Tailscale removal, and upgrade rollback paths as destructive; use dry-run or confirmation where supported.
+- The `operator_box_exec` MCP tool is gated server-side
+  (`scripts/operator_mcp_server.py`): a short read-only allowlist
+  (status/journalctl/df/`docker ps`/`docker logs`/`git status`/`cat` of
+  non-secret paths/etc.) runs unconditionally, but any mutating or unknown
+  command — or anything with shell chaining/redirection — is rejected until you
+  re-issue the IDENTICAL command with `dry_run=true` first. The preview stamps a
+  marker bound to `box_id + sha256(normalized command)`, so a marker for one
+  command never authorizes another. Every invocation is audited
+  (`operator.box_exec`) with the command redacted. `posture-proof`/`box status`
+  do NOT route through `operator_box_exec`, so the gate adds no friction there.
 - Do not run commands that download, clone, provision, or destroy unless the
   task requires that side effect.
 - Avoid editing generated/runtime state unless the bug is specifically in that

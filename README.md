@@ -672,10 +672,10 @@ Available MCP tools:
 | `operator_profiles` | List available box profiles (region, size, image) |
 | `operator_box_status` | Deep health probe for a specific box |
 | `operator_provision` | Full zero-to-running provision flow |
-| `operator_teardown` | Full teardown: drain, remove from Tailnet, destroy droplet |
-| `operator_box_exec` | Run a command on a remote box over Tailscale SSH |
+| `operator_teardown` | Full teardown: drain, remove from Tailnet, destroy droplet — **gated** (dry-run + clean repos) |
+| `operator_box_exec` | Run a command on a remote box over Tailscale SSH — **gated** (read-only allowlist runs free; mutating/unknown commands need a per-command `dry_run=true` preview) |
 | `operator_compose_up` | Build and start local containers |
-| `operator_compose_down` | Stop all local containers |
+| `operator_compose_down` | Stop all local containers — **gated** (dry-run + clean repos) |
 | `operator_doctor` | Run outer validation checks |
 | `operator_render` | Print the resolved sandbox model |
 
@@ -702,6 +702,39 @@ unless:
 3. A dry-run was already executed this session
 
 This prevents accidental infrastructure destruction with uncommitted work.
+
+### operator_box_exec command gate
+
+`operator_box_exec` runs arbitrary shell over Tailscale SSH, so it has its own
+gate enforced **server-side** in `scripts/operator_mcp_server.py` (works for
+every MCP client, not just Claude Code):
+
+- **Read-only allowlist** runs unconditionally — no friction. The allowlist is
+  short and conservative, matched on the leading token(s):
+  `cat df du free head hostname id journalctl ls nproc ps pwd stat tail uname
+  uptime wc whoami`, plus `docker {ps,logs,images,inspect,stats,version,top}`,
+  `git {status,log,diff,show,branch,remote,rev-parse}`, and
+  `systemctl {status,is-active,is-enabled,list-units,show}`. A command that
+  contains shell chaining/redirection (`; | & > \` $( ${`, newlines), an
+  env-var/path prefix, or that `cat`/`tail`s a secret-looking path does **not**
+  get the fast path.
+- **Everything else** (mutating verbs, unknown commands, chained commands)
+  requires a fresh `dry_run=true` preview of the **identical** command. The
+  preview returns exactly what would run and stamps a marker bound to
+  `box_id + sha256(normalized command)`, so a marker for command A cannot
+  authorize command B. Whitespace runs are normalized before hashing.
+- **Every** invocation emits an `operator.box_exec` audit event (box id,
+  command hash, redacted command, verdict, reason). Secrets are redacted before
+  they reach the journal.
+
+The PreToolUse hook (`guard-destructive-op.sh`) also matches `operator_box_exec`
+as a backup: it lets previews through and blocks only unambiguously
+catastrophic patterns (`rm -rf /`, `mkfs`, fork bombs, raw-device writes);
+the server gate is authoritative.
+
+> Note: `posture-proof` and `box status` probes shell out through `box.py`'s
+> own SSH helpers, **not** through `operator_box_exec`, so this gate adds no
+> friction to fleet posture/health automation.
 
 ## Design Stance
 
@@ -2220,7 +2253,11 @@ from `runtime.log`; no separate public sidecar flow is required.
 It is a bash script (`scripts/guard-destructive-op.sh`) registered as a
 Claude Code PreToolUse hook. It intercepts `operator_teardown` and
 `operator_compose_down` calls and blocks them unless all repos are clean and
-pushed, and a dry-run was already executed this session.
+pushed, and a dry-run was already executed this session. It also matches
+`operator_box_exec` as a backup screen (catastrophic-pattern block only) — the
+real `operator_box_exec` command gate lives server-side in
+`scripts/operator_mcp_server.py` so it protects every MCP client. See
+[operator_box_exec command gate](#operator_box_exec-command-gate).
 
 ## About Contributions
 

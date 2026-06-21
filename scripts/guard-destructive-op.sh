@@ -85,7 +85,9 @@ case "$TOOL_NAME" in
     mcp__skillbox-operator__operator_teardown|\
     mcp__skillbox-operator__operator_compose_down|\
     mcp__skillbox_operator__operator_teardown|\
-    mcp__skillbox_operator__operator_compose_down)
+    mcp__skillbox_operator__operator_compose_down|\
+    mcp__skillbox-operator__operator_box_exec|\
+    mcp__skillbox_operator__operator_box_exec)
         ;;
     *)
         exit 0
@@ -107,6 +109,83 @@ The tool arguments could not be parsed, so the guard cannot confirm whether
 this is a dry run or which box is targeted. Blocking ${FRIENDLY_NAME} rather
 than assuming it is safe.
 EOF
+fi
+
+# --- operator_box_exec: server-side gate is authoritative; hook is backup ----
+# The operator MCP server classifies box_exec commands and enforces a per-
+# command dry-run marker (bound to box_id + command hash) that bash cannot
+# reproduce here, so this branch does NOT re-derive that policy or fall into the
+# teardown/compose_down repo-cleanliness + box-id-marker gates below (which are
+# wired to single-effect tools, not arbitrary commands). It is a conservative
+# backup: allow dry_run previews and ordinary commands through (the server is
+# the real gate), and BLOCK only the unambiguously catastrophic patterns that
+# should never run un-previewed even if the server gate were bypassed. It is
+# deliberately additive — it never over-blocks read-only inspection commands.
+if [ "$FRIENDLY_NAME" = "operator_box_exec" ]; then
+    BOX_EXEC_DRY_RUN=$(printf '%s' "$TOOL_INPUT" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    if not isinstance(d, dict):
+        raise ValueError("tool_input is not an object")
+    print("true" if d.get("dry_run") else "false")
+except Exception:
+    print("ERROR")
+' 2>/dev/null) || BOX_EXEC_DRY_RUN="ERROR"
+
+    if [ "$BOX_EXEC_DRY_RUN" = "ERROR" ]; then
+        block "box_exec:dry_run-parse" <<EOF
+BLOCKED: guard could not evaluate dry_run for operator_box_exec, blocking by default.
+
+The tool_input could not be parsed to confirm whether this is a (safe)
+dry_run=true preview, so the guard fails closed.
+EOF
+    fi
+
+    # Preview calls are always safe — the server stamps the per-command marker.
+    if [ "$BOX_EXEC_DRY_RUN" = "true" ]; then
+        exit 0
+    fi
+
+    # Backup screen for non-dry-run: block only catastrophic, unambiguous
+    # destructive patterns. Read-only inspection commands never match these, so
+    # this cannot introduce friction for legitimate ops automation. The server
+    # gate is what actually requires the dry-run marker for ALL mutating verbs.
+    BOX_EXEC_CMD=$(printf '%s' "$TOOL_INPUT" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get("command", "") if isinstance(d, dict) else "")
+except Exception:
+    print("__ERROR__")
+' 2>/dev/null) || BOX_EXEC_CMD="__ERROR__"
+
+    if [ "$BOX_EXEC_CMD" = "__ERROR__" ]; then
+        block "box_exec:command-parse" <<EOF
+BLOCKED: guard could not read the operator_box_exec command, blocking by default.
+
+The command argument could not be parsed, so the guard cannot screen it.
+EOF
+    fi
+
+    case "$BOX_EXEC_CMD" in
+        *"rm -rf /"*|*"rm -fr /"*|*":(){ :|:& };:"*|*"mkfs"*|*"dd if="*"of=/dev/"*|*"> /dev/sda"*)
+            block "box_exec:catastrophic-pattern" <<EOF
+BLOCKED: operator_box_exec command matches a catastrophic destructive pattern.
+
+This is the PreToolUse backup guard; the operator MCP server is the primary
+gate and already requires a per-command dry_run=true preview for mutating
+commands. The submitted command matches a pattern (e.g. 'rm -rf /', mkfs,
+fork bomb, raw-device dd/redirect) that must never run un-reviewed.
+
+Re-issue operator_box_exec with dry_run=true, confirm the exact command with
+the user, then run the IDENTICAL command for real.
+EOF
+            ;;
+    esac
+
+    # Not dry-run and not catastrophic: defer to the authoritative server gate.
+    exit 0
 fi
 
 # --- Gate 1: Allow dry_run through unconditionally ---
