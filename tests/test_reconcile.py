@@ -164,6 +164,82 @@ class ReconcileTests(unittest.TestCase):
                 {},
             )
 
+    def test_check_secrets_visible_passes_on_migrated_layout(self) -> None:
+        # Binds whose host dirs contain no secret files -> pass.
+        with tempfile.TemporaryDirectory() as tmp:
+            host_dir = Path(tmp)
+            config = {
+                "services": {
+                    "workspace": {
+                        "volumes": [
+                            {"type": "bind", "source": str(host_dir), "target": "/workspace"},
+                            {"type": "volume", "source": "named", "target": "/data"},
+                        ]
+                    }
+                }
+            }
+            with mock.patch.object(RECONCILE, "compose_config", return_value=config):
+                result = RECONCILE.check_secrets_visible_in_workspace()
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(result.code, "secrets-visible-in-workspace")
+            self.assertEqual(result.details, {"exposed": []})
+
+    def test_check_secrets_visible_fails_with_planted_env_box(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            host_dir = Path(tmp)
+            (host_dir / ".env.box").write_text("SKILLBOX_DO_TOKEN=secret\n", encoding="utf-8")
+            config = {
+                "services": {
+                    "workspace": {
+                        "volumes": [
+                            {"type": "bind", "source": str(host_dir), "target": "/workspace"},
+                        ]
+                    }
+                }
+            }
+            with mock.patch.object(RECONCILE, "compose_config", return_value=config):
+                result = RECONCILE.check_secrets_visible_in_workspace()
+            self.assertEqual(result.status, "fail")
+            self.assertEqual(result.code, "secrets-visible-in-workspace")
+            self.assertIn(".env.box", result.details["exposed"])
+            self.assertIsNotNone(result.fix_command)
+            self.assertIn("mv ./.env.box ./.skillbox-state/operator/.env.box", result.fix_command)
+            self.assertIn("mkdir -p ./.skillbox-state/operator", result.fix_command)
+            # Only the present file should appear in the migration command.
+            self.assertNotIn("mv ./.env ", result.fix_command)
+
+    def test_check_secrets_visible_handles_compose_config_failure(self) -> None:
+        with mock.patch.object(
+            RECONCILE, "compose_config", side_effect=RuntimeError("docker missing")
+        ):
+            result = RECONCILE.check_secrets_visible_in_workspace()
+        self.assertEqual(result.status, "fail")
+        self.assertEqual(result.code, "secrets-visible-in-workspace")
+        self.assertIn("docker missing", result.details["error"])
+        self.assertEqual(result.fix_command, "docker compose config")
+
+    def test_compose_yaml_does_not_bind_mount_secret_files(self) -> None:
+        # Parse compose YAML directly (no docker dependency) and assert no volume
+        # `source` is literally a secret file. Mirrors the compose helper test approach.
+        if RECONCILE.yaml is None:
+            self.skipTest("PyYAML not available")
+        for compose_name in ("docker-compose.yml", "docker-compose.monoserver.yml"):
+            compose = RECONCILE.yaml.safe_load(
+                (ROOT_DIR / compose_name).read_text(encoding="utf-8")
+            )
+            for service in (compose.get("services") or {}).values():
+                for entry in service.get("volumes") or []:
+                    if isinstance(entry, str):
+                        source = entry.split(":", 1)[0]
+                    else:
+                        source = entry.get("source", "")
+                    base = source.rstrip("/").rsplit("/", 1)[-1]
+                    self.assertNotIn(
+                        base,
+                        RECONCILE.OPERATOR_SECRET_FILENAMES,
+                        f"{compose_name} bind-mounts secret file {source}",
+                    )
+
     def test_check_compose_model_reports_workspace_surface_and_swimmers_drift(self) -> None:
         model = {
             "expected_env": {

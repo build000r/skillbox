@@ -710,7 +710,16 @@ preflight_checks() {
 
 hydrate_env() {
   local target_repo="$1"
-  local env_file="${target_repo}/.env"
+  # Secrets live OUTSIDE the workspace bind mount so in-container agents can't read
+  # them. Default to ${target_repo}/.skillbox-state/operator, honoring an exported
+  # SKILLBOX_STATE_ROOT (relative paths resolve against target_repo).
+  local state_root="${SKILLBOX_STATE_ROOT:-./.skillbox-state}"
+  local operator_dir
+  case "${state_root}" in
+    /*) operator_dir="${state_root}/operator" ;;
+    *)  operator_dir="${target_repo}/${state_root#./}/operator" ;;
+  esac
+  local env_file="${operator_dir}/.env"
   local env_example="${target_repo}/.env.example"
   local cass_path=""
   local cm_path=""
@@ -724,6 +733,8 @@ hydrate_env() {
     err "Missing ${env_example}"
     exit 1
   fi
+  mkdir -p "${operator_dir}"
+  chmod 700 "${operator_dir}" 2>/dev/null || true
   if [[ -f "${env_file}" ]]; then
     STATUS_ENV="kept"
     return 0
@@ -821,7 +832,14 @@ PY
 
 ensure_local_state_layout() {
   local target_repo="$1"
-  local env_file="${target_repo}/.env"
+  # The operator .env now lives under the state-root operator dir (out of the mount).
+  local state_root="${SKILLBOX_STATE_ROOT:-./.skillbox-state}"
+  local operator_dir
+  case "${state_root}" in
+    /*) operator_dir="${state_root}/operator" ;;
+    *)  operator_dir="${target_repo}/${state_root#./}/operator" ;;
+  esac
+  local env_file="${operator_dir}/.env"
   local dir_path=""
 
   if [[ "${DRY_RUN}" -eq 1 ]]; then
@@ -867,6 +885,7 @@ monoserver_root = resolve_host_path(monoserver_raw)
 
 dirs = [
     state_root,
+    state_root / "operator",
     state_root / "home" / ".claude",
     state_root / "home" / ".codex",
     state_root / "home" / ".local",
@@ -1100,6 +1119,8 @@ print_summary() {
   lines+=("up: ${STATUS_UP}")
   lines+=("verify: ${STATUS_VERIFY}")
   lines+=("private source of truth lives under ${FIRST_BOX_PRIVATE_REPO:-${PRIVATE_PATH}}")
+  lines+=("operator secrets live under ${REPO_DIR}/.skillbox-state/operator/ (out of the workspace mount)")
+  lines+=("place box-provisioning secrets in ${REPO_DIR}/.skillbox-state/operator/.env.box")
   lines+=("sand/${CLIENT_ID} is generated and can be rebuilt")
   lines+=("uninstall: rm -rf ${REPO_DIR} ${FIRST_BOX_PRIVATE_REPO:-${PRIVATE_PATH}}")
   draw_box '\033[0;32m' "${lines[@]}"

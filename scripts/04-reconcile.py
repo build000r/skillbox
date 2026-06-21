@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -73,6 +74,29 @@ BEADS_SYNC_STATUS_COMMAND = "br sync --status --json"
 SKILL_SYNC_FIX_COMMAND = "make runtime-sync"
 SKILL_SYNC_DRY_RUN_COMMAND = "python3 .env-manager/manage.py sync --dry-run --format json"
 RUNTIME_DOCTOR_COMMAND = "python3 .env-manager/manage.py doctor --format json"
+
+# Operator secret files that must never sit directly under a bind-mounted host dir
+# (e.g. the `.:/workspace` mount), where in-container agents could read them. The
+# canonical home is ${SKILLBOX_STATE_ROOT}/operator/. Kept in sync with the helpers
+# in scripts/box.py and scripts/operator_mcp_server.py.
+OPERATOR_SECRET_FILENAMES = (".env", ".env.box")
+
+
+def _operator_state_root() -> Path:
+    state_root = os.environ.get("SKILLBOX_STATE_ROOT", "").strip() or "./.skillbox-state"
+    base = Path(state_root)
+    if not base.is_absolute():
+        base = ROOT_DIR / base
+    return base
+
+
+def _operator_env_path() -> Path:
+    """Resolve the operator `.env` (non-secret overrides), preferring the relocated
+    state-root copy and falling back to the deprecated repo-root location."""
+    relocated = (_operator_state_root() / "operator" / ".env").resolve()
+    if relocated.is_file():
+        return relocated
+    return ROOT_DIR / ".env"
 
 
 def repo_rel(path: Path) -> str:
@@ -306,7 +330,11 @@ def build_model() -> dict[str, Any]:
     # into the rendered config, so reflect the same overrides here so doctor's compose checks
     # verify structural alignment rather than rejecting legitimate local overrides. The
     # `env-defaults` check still validates that `.env.example` itself matches the manifest.
-    runtime_env.update(load_runtime_env_overrides(ROOT_DIR / ".env", runtime_env.keys()))
+    # The operator `.env` now lives under ${SKILLBOX_STATE_ROOT}/operator/ (out of the
+    # workspace bind mount); prefer it, falling back to a legacy repo-root copy. This
+    # mirrors the --env-file compose passes in the Makefile and the load_operator_secret
+    # resolution order in box.py / operator_mcp_server.py.
+    runtime_env.update(load_runtime_env_overrides(_operator_env_path(), runtime_env.keys()))
     # CLIENTS_HOST_ROOT has dual semantics: on the host it's the source path used by
     # client-init scaffolding, but inside the container docker-compose.yml maps it to
     # CLIENTS_ROOT so in-container callers see the same path under either name. The
@@ -688,6 +716,75 @@ def check_compose_model(model: dict[str, Any]) -> list[CheckResult]:
             _swimmers_compose_issues(swimmers_config, model),
         ),
     ]
+
+
+def _secret_migration_fix_command(exposed: list[str]) -> str:
+    """Build the exact (manual) migration command for the exposed secret files."""
+    parts = ["mkdir -p ./.skillbox-state/operator"]
+    for name in OPERATOR_SECRET_FILENAMES:
+        if name in exposed:
+            parts.append(f"mv ./{name} ./.skillbox-state/operator/{name}")
+    return " && ".join(parts)
+
+
+def check_secrets_visible_in_workspace() -> CheckResult:
+    """Fail if any operator secret file sits directly under a bind-mounted host dir.
+
+    Parses `docker compose config` and inspects every bind-mount host source path.
+    For the `.:/workspace` mount the host source is ROOT_DIR, so this catches
+    ROOT_DIR/.env and ROOT_DIR/.env.box. NEVER moves files automatically — on a
+    failure it only emits the manual migration command.
+    """
+    try:
+        config = compose_config(include_surfaces=False)
+    except RuntimeError as exc:
+        return CheckResult(
+            status="fail",
+            code="secrets-visible-in-workspace",
+            message="docker compose config could not be resolved to check secret exposure",
+            details={"error": str(exc)},
+            fix_command="docker compose config",
+        )
+
+    host_sources: set[Path] = set()
+    for service in (config.get("services") or {}).values():
+        for volume in service.get("volumes") or []:
+            if volume.get("type") != "bind":
+                continue
+            source = volume.get("source")
+            if not source:
+                continue
+            try:
+                host_sources.add(Path(source).resolve())
+            except (OSError, ValueError):
+                continue
+
+    exposed: list[str] = []
+    for host_dir in host_sources:
+        if not host_dir.is_dir():
+            continue
+        for name in OPERATOR_SECRET_FILENAMES:
+            if (host_dir / name).is_file() and name not in exposed:
+                exposed.append(name)
+
+    if exposed:
+        return CheckResult(
+            status="fail",
+            code="secrets-visible-in-workspace",
+            message=(
+                "operator secret files are readable by in-container agents — they sit "
+                "inside a bind-mounted host directory"
+            ),
+            details={"exposed": exposed},
+            fix_command=_secret_migration_fix_command(exposed),
+        )
+
+    return CheckResult(
+        status="pass",
+        code="secrets-visible-in-workspace",
+        message="no operator secret files are exposed inside workspace bind mounts",
+        details={"exposed": []},
+    )
 
 
 def check_skill_sync_dry_run(model: dict[str, Any]) -> CheckResult:
@@ -1144,8 +1241,17 @@ def doctor_results(skip_compose: bool, skip_skill_sync: bool) -> list[CheckResul
                 fix_command="python3 scripts/04-reconcile.py doctor --format json",
             )
         )
+        results.append(
+            CheckResult(
+                status="warn",
+                code="secrets-visible-in-workspace",
+                message="workspace secret-exposure check skipped (needs docker compose config)",
+                fix_command="python3 scripts/04-reconcile.py doctor --format json",
+            )
+        )
     else:
         results.extend(check_compose_model(model))
+        results.append(check_secrets_visible_in_workspace())
 
     if skip_skill_sync:
         results.append(
