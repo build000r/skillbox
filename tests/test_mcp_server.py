@@ -276,6 +276,44 @@ class SkillboxMcpServerTests(unittest.TestCase):
         self.assertEqual(payload["error"]["type"], "missing_required_parameter")
         self.assertIn("client_id", payload["error"]["message"])
 
+    def test_skillbox_error_envelope_has_mcp_parity(self) -> None:
+        # ACCEPTANCE (4): an MCP error-parity test. When the CLI emits the typed
+        # back-compat envelope (a SkillboxError rendered via to_payload), the MCP
+        # tool must mirror it verbatim into isError content — no key dropped, no
+        # shape rewritten. Build the envelope from the SAME errors.py the CLI uses.
+        env_manager_dir = ROOT_DIR / ".env-manager"
+        if str(env_manager_dir) not in sys.path:
+            sys.path.insert(0, str(env_manager_dir))
+        from runtime_manager.errors import ValidationError
+
+        envelope = ValidationError(
+            "unknown_client",
+            "Unknown runtime client(s): ghost.",
+            context={"unknown": ["ghost"], "available": ["personal"]},
+            next_actions=["render --format json"],
+        ).to_payload()
+
+        with mock.patch.object(MODULE, "run_manage", return_value=(False, 1, dict(envelope))) as run_manage:
+            result = MODULE.dispatch_tool("skillbox_doctor", {}, request_id="req-parity")
+
+        run_manage.assert_called_once()
+        payload = _content_payload(result)
+        # isError set, exit code carried.
+        self.assertTrue(result["isError"])
+        self.assertEqual(payload["_exit_code"], 1)
+        # New canonical envelope preserved.
+        self.assertIs(payload["ok"], False)
+        self.assertEqual(payload["error"]["code"], "unknown_client")
+        self.assertEqual(payload["error"]["context"], {"unknown": ["ghost"], "available": ["personal"]})
+        self.assertEqual(payload["error"]["next_actions"], ["render --format json"])
+        # Legacy mirrors COEXIST through the MCP surface.
+        self.assertEqual(payload["error"]["type"], "unknown_client")
+        self.assertEqual(payload["error_code"], "unknown_client")
+        self.assertIn("deprecation", payload)
+        # The MCP content is byte-identical to the CLI envelope (plus _exit_code).
+        for key, value in envelope.items():
+            self.assertEqual(payload[key], value, f"MCP dropped/rewrote key {key!r}")
+
     def test_mutating_runtime_tools_require_dry_run_before_dispatch(self) -> None:
         cases = {
             "skillbox_sync": {},

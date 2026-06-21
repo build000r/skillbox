@@ -289,7 +289,11 @@ def normalize_file_mode(raw_mode: Any, default: int = 0o600) -> int:
     if raw_mode is None:
         return default
     if isinstance(raw_mode, bool):
-        raise RuntimeError(f"Invalid file mode {raw_mode!r}. Use an octal string such as '0600'.")
+        raise ValidationError(
+            "runtime_error",
+            f"Invalid file mode {raw_mode!r}. Use an octal string such as '0600'.",
+            context={"mode": raw_mode},
+        )
     if isinstance(raw_mode, int):
         mode = raw_mode
     else:
@@ -299,11 +303,17 @@ def normalize_file_mode(raw_mode: Any, default: int = 0o600) -> int:
         try:
             mode = int(text, 8)
         except ValueError as exc:
-            raise RuntimeError(f"Invalid file mode {raw_mode!r}. Use an octal string such as '0600'.") from exc
+            raise ValidationError(
+                "runtime_error",
+                f"Invalid file mode {raw_mode!r}. Use an octal string such as '0600'.",
+                context={"mode": raw_mode},
+            ) from exc
 
     if mode < 0 or mode > 0o777:
-        raise RuntimeError(
-            f"Invalid file mode {raw_mode!r}. Use an octal value between '0000' and '0777'."
+        raise ValidationError(
+            "runtime_error",
+            f"Invalid file mode {raw_mode!r}. Use an octal value between '0000' and '0777'.",
+            context={"mode": raw_mode},
         )
     return mode
 
@@ -1536,9 +1546,16 @@ def _download_artifact_to_path(
         payload = response.read()
     actual_sha256 = hashlib.sha256(payload).hexdigest()
     if actual_sha256 != expected_sha256:
-        raise RuntimeError(
+        raise NetworkError(
+            "runtime_error",
             f"artifact {artifact['id']} digest mismatch for {url}: "
-            f"expected {expected_sha256}, got {actual_sha256}"
+            f"expected {expected_sha256}, got {actual_sha256}",
+            context={
+                "artifact": artifact["id"],
+                "url": url,
+                "expected_sha256": expected_sha256,
+                "actual_sha256": actual_sha256,
+            },
         )
     payload = _downloaded_artifact_payload(artifact, source, payload)
     _replace_artifact_payload(path, payload, bool(source.get("executable", False)))
@@ -1553,21 +1570,35 @@ def _downloaded_artifact_payload(
     if not archive_kind:
         return payload
     if archive_kind not in {"tar.gz", "tgz"}:
-        raise RuntimeError(f"artifact {artifact['id']} has unsupported source.archive {archive_kind!r}")
+        raise AdapterError(
+            "runtime_error",
+            f"artifact {artifact['id']} has unsupported source.archive {archive_kind!r}",
+            context={"artifact": artifact["id"], "archive": archive_kind},
+        )
 
     with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
         members = [member for member in archive.getmembers() if member.isfile()]
         if len(members) != 1:
-            raise RuntimeError(
-                f"artifact {artifact['id']} archive must contain exactly one regular file; found {len(members)}"
+            raise AdapterError(
+                "runtime_error",
+                f"artifact {artifact['id']} archive must contain exactly one regular file; found {len(members)}",
+                context={"artifact": artifact["id"], "member_count": len(members)},
             )
         member = members[0]
         member_path = PurePosixPath(member.name)
         if member_path.is_absolute() or ".." in member_path.parts:
-            raise RuntimeError(f"artifact {artifact['id']} archive member has unsafe path {member.name!r}")
+            raise AdapterError(
+                "runtime_error",
+                f"artifact {artifact['id']} archive member has unsafe path {member.name!r}",
+                context={"artifact": artifact["id"], "member": member.name},
+            )
         extracted = archive.extractfile(member)
         if extracted is None:
-            raise RuntimeError(f"artifact {artifact['id']} archive member {member.name!r} could not be read")
+            raise AdapterError(
+                "runtime_error",
+                f"artifact {artifact['id']} archive member {member.name!r} could not be read",
+                context={"artifact": artifact["id"], "member": member.name},
+            )
         return extracted.read()
 
 
@@ -1591,7 +1622,11 @@ def _sync_file_artifact(
 
 def _copy_artifact_to_path(source: dict[str, Any], source_path: Path, path: Path) -> None:
     if not source_path.is_file():
-        raise RuntimeError(f"artifact source file is missing: {source_path}")
+        raise AdapterError(
+            "runtime_error",
+            f"artifact source file is missing: {source_path}",
+            context={"source_path": str(source_path)},
+        )
     tmp_path = path.parent / f".{path.name}.tmp"
     shutil.copyfile(source_path, tmp_path)
     if source.get("executable", False):
@@ -1631,8 +1666,10 @@ def _missing_env_source_action(
     path: Path,
 ) -> list[str]:
     if env_file.get("required"):
-        raise RuntimeError(
-            f"Required env file {env_file['id']} is missing source {state['source_path'] or state['source_host_path'] or path}."
+        raise ValidationError(
+            "missing_env_file",
+            f"Required env file {env_file['id']} is missing source {state['source_path'] or state['source_host_path'] or path}.",
+            context={"env_file": env_file["id"]},
         )
     return [f"skip: {path} (env source path missing)"]
 
@@ -1661,7 +1698,11 @@ def _sync_existing_or_manual_env_file(
     if path.exists():
         return [f"exists: {path}"]
     if env_file.get("required"):
-        raise RuntimeError(f"Required env file {env_file['id']} is missing at {path}.")
+        raise ValidationError(
+            "missing_env_file",
+            f"Required env file {env_file['id']} is missing at {path}.",
+            context={"env_file": env_file["id"], "path": str(path)},
+        )
     return [f"skip: {path} (sync mode {state['sync_mode']})"]
 
 
@@ -1812,7 +1853,11 @@ def _git_clone_args(url: str, branch: str, path: Path) -> list[str]:
 def _run_git_clone(url: str, branch: str, path: Path) -> None:
     result = run_command(_git_clone_args(url, branch, path))
     if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"git clone failed for {url}")
+        raise AdapterError(
+            "runtime_error",
+            result.stderr.strip() or result.stdout.strip() or f"git clone failed for {url}",
+            context={"url": url, "returncode": result.returncode},
+        )
 
 
 def _sync_existing_git_repo(
@@ -1971,9 +2016,17 @@ def order_task_ids(model: dict[str, Any], selected_ids: set[str]) -> list[str]:
         if task_id in visited:
             return
         if task_id in visiting:
-            raise RuntimeError(f"Task dependency cycle detected at {task_id}.")
+            raise StateConflictError(
+                "runtime_error",
+                f"Task dependency cycle detected at {task_id}.",
+                context={"task_id": task_id},
+            )
         if task_id not in tasks_by_id:
-            raise RuntimeError(f"Task dependency references unknown task {task_id!r}.")
+            raise ValidationError(
+                "runtime_error",
+                f"Task dependency references unknown task {task_id!r}.",
+                context={"task_id": task_id},
+            )
 
         visiting.add(task_id)
         for dependency_id in dependency_graph.get(task_id, []):
@@ -2091,11 +2144,19 @@ def order_service_ids(model: dict[str, Any], selected_ids: set[str]) -> list[str
         if service_id in visited:
             return
         if service_id in visiting:
-            raise RuntimeError(f"Service dependency cycle detected at {service_id}.")
+            raise StateConflictError(
+                "runtime_error",
+                f"Service dependency cycle detected at {service_id}.",
+                context={"service_id": service_id},
+            )
         if service_id not in services_by_id:
             if service_id in artifact_ids:
                 return
-            raise RuntimeError(f"Service dependency references unknown service {service_id!r}.")
+            raise ValidationError(
+                "runtime_error",
+                f"Service dependency references unknown service {service_id!r}.",
+                context={"service_id": service_id},
+            )
 
         visiting.add(service_id)
         for dependency_id in dependency_graph.get(service_id, []):
@@ -3318,11 +3379,13 @@ def select_tasks(model: dict[str, Any], task_ids: list[str] | None) -> list[dict
     }
     unknown = sorted(task_id for task_id in requested_ids if task_id not in available)
     if unknown:
-        raise RuntimeError(
+        raise ValidationError(
+            "runtime_error",
             "Unknown task id(s): "
             + ", ".join(unknown)
             + ". Available tasks: "
-            + (", ".join(sorted(available)) or "(none)")
+            + (", ".join(sorted(available)) or "(none)"),
+            context={"unknown": unknown, "available": sorted(available)},
         )
     if not requested_ids:
         return list(model["tasks"])
@@ -3370,11 +3433,13 @@ def select_services(model: dict[str, Any], service_ids: list[str] | None) -> lis
     }
     unknown = sorted(service_id for service_id in requested_ids if service_id not in available)
     if unknown:
-        raise RuntimeError(
+        raise ValidationError(
+            "runtime_error",
             "Unknown service id(s): "
             + ", ".join(unknown)
             + ". Available services: "
-            + (", ".join(sorted(available)) or "(none)")
+            + (", ".join(sorted(available)) or "(none)"),
+            context={"unknown": unknown, "available": sorted(available)},
         )
     if not requested_ids:
         return list(model["services"])
@@ -3431,7 +3496,11 @@ def ensure_required_env_files_ready(env_files: list[dict[str, Any]]) -> None:
         unresolved.append(f"{env_file['id']} ({detail})")
 
     if unresolved:
-        raise RuntimeError(f"Required env files are not ready: {', '.join(unresolved)}")
+        raise ValidationError(
+            "missing_env_file",
+            f"Required env files are not ready: {', '.join(unresolved)}",
+            context={"unresolved": unresolved},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3555,8 +3624,10 @@ def run_tasks(
                 for dependency_id, dependency_state in task_state.get("dependency_states", {}).items()
                 if dependency_state != "ok"
             ]
-            raise RuntimeError(
-                f"Task {task['id']} is blocked by incomplete dependencies: {', '.join(blocked_on)}"
+            raise StateConflictError(
+                "runtime_error",
+                f"Task {task['id']} is blocked by incomplete dependencies: {', '.join(blocked_on)}",
+                context={"task": task["id"], "blocked_on": blocked_on},
             )
 
         command, env = translated_runtime_command(model, task)
@@ -3599,17 +3670,21 @@ def run_tasks(
                 except subprocess.TimeoutExpired:
                     pass
                 log_runtime_event("task.failed", task["id"], {"reason": "timeout"}, root_dir=event_root)
-                raise RuntimeError(
+                raise RuntimeLifecycleError(
+                    "runtime_error",
                     f"Task {task['id']} timed out after {task_timeout:.0f}s. "
-                    "Increase 'timeout_seconds' on the task to allow more time."
+                    "Increase 'timeout_seconds' on the task to allow more time.",
+                    context={"task": task["id"], "timeout_seconds": task_timeout},
                 )
 
         if returncode != 0:
             tail = tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)
             log_runtime_event("task.failed", task["id"], {"exit_code": returncode}, root_dir=event_root)
-            raise RuntimeError(
+            raise RuntimeLifecycleError(
+                "runtime_error",
                 f"Task {task['id']} failed with exit code {returncode}."
-                + (f" Recent logs: {' | '.join(tail)}" if tail else "")
+                + (f" Recent logs: {' | '.join(tail)}" if tail else ""),
+                context={"task": task["id"], "exit_code": returncode},
             )
 
         post_state = probe_task(model, task)
@@ -3621,10 +3696,12 @@ def run_tasks(
                 {"reason": "success_check_unsatisfied"},
                 root_dir=event_root,
             )
-            raise RuntimeError(
+            raise RuntimeLifecycleError(
+                "runtime_error",
                 f"Task {task['id']} completed but did not satisfy its success check."
                 + (f" Success target: {post_state['target']}." if post_state.get("target") else "")
-                + (f" Recent logs: {' | '.join(tail)}" if tail else "")
+                + (f" Recent logs: {' | '.join(tail)}" if tail else ""),
+                context={"task": task["id"], "target": post_state.get("target")},
             )
 
         results.append(result | {"result": "completed", "target": post_state.get("target")})

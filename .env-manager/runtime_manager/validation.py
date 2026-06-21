@@ -69,11 +69,16 @@ def normalize_active_clients(model: dict[str, Any], raw_clients: list[str] | Non
 
     unknown_clients = sorted(requested_clients - available_clients)
     if unknown_clients:
-        raise RuntimeError(
+        raise ValidationError(
+            "unknown_client",
             "Unknown runtime client(s): "
             + ", ".join(unknown_clients)
             + ". Available clients: "
-            + (", ".join(sorted(available_clients)) or "(none)")
+            + (", ".join(sorted(available_clients)) or "(none)"),
+            context={
+                "unknown": unknown_clients,
+                "available": sorted(available_clients),
+            },
         )
 
     return requested_clients
@@ -342,36 +347,56 @@ def filter_model(model: dict[str, Any], active_profiles: set[str], active_client
 def _lockfile_skill_entries(lock_payload: dict[str, Any]) -> list[dict[str, Any]]:
     skills = lock_payload.get("skills") or []
     if not isinstance(skills, list):
-        raise RuntimeError("Lockfile field 'skills' must be a list")
+        raise ValidationError("runtime_error", "Lockfile field 'skills' must be a list")
     for item in skills:
         if not isinstance(item, dict):
-            raise RuntimeError("Lockfile skill entries must be objects")
+            raise ValidationError("runtime_error", "Lockfile skill entries must be objects")
     return skills
 
 
 def _lockfile_skill_name(item: dict[str, Any], mapping: dict[str, dict[str, Any]]) -> str:
     name = str(item.get("name", "")).strip()
     if not name:
-        raise RuntimeError("Lockfile skill entries must include a non-empty name")
+        raise ValidationError("runtime_error", "Lockfile skill entries must include a non-empty name")
     if name in mapping:
-        raise RuntimeError(f"Lockfile contains duplicate skill entry {name!r}")
+        raise ValidationError(
+            "runtime_error",
+            f"Lockfile contains duplicate skill entry {name!r}",
+            context={"skill": name},
+        )
     return name
 
 
 def _lockfile_targets_by_id(name: str, item: dict[str, Any]) -> dict[str, dict[str, Any]]:
     targets = item.get("targets") or []
     if not isinstance(targets, list):
-        raise RuntimeError(f"Lockfile skill {name!r} has a non-list targets field")
+        raise ValidationError(
+            "runtime_error",
+            f"Lockfile skill {name!r} has a non-list targets field",
+            context={"skill": name},
+        )
 
     targets_by_id: dict[str, dict[str, Any]] = {}
     for target in targets:
         if not isinstance(target, dict):
-            raise RuntimeError(f"Lockfile skill {name!r} contains a non-object target entry")
+            raise ValidationError(
+                "runtime_error",
+                f"Lockfile skill {name!r} contains a non-object target entry",
+                context={"skill": name},
+            )
         target_id = str(target.get("id", "")).strip()
         if not target_id:
-            raise RuntimeError(f"Lockfile skill {name!r} contains a target without an id")
+            raise ValidationError(
+                "runtime_error",
+                f"Lockfile skill {name!r} contains a target without an id",
+                context={"skill": name},
+            )
         if target_id in targets_by_id:
-            raise RuntimeError(f"Lockfile skill {name!r} contains duplicate target {target_id!r}")
+            raise ValidationError(
+                "runtime_error",
+                f"Lockfile skill {name!r} contains duplicate target {target_id!r}",
+                context={"skill": name, "target": target_id},
+            )
         targets_by_id[target_id] = target
     return targets_by_id
 
@@ -658,12 +683,16 @@ def _ensure_skillset_sync_inputs(skillset: dict[str, Any], inventory: dict[str, 
         if not present
     ]
     if missing_inputs:
-        raise RuntimeError(
-            f"Skill set {skillset['id']} is missing required files: {', '.join(missing_inputs)}"
+        raise ValidationError(
+            "runtime_error",
+            f"Skill set {skillset['id']} is missing required files: {', '.join(missing_inputs)}",
+            context={"skillset": skillset["id"], "missing": missing_inputs},
         )
     if inventory["missing_bundles"]:
-        raise RuntimeError(
-            f"Skill set {skillset['id']} is missing bundles for: {', '.join(inventory['missing_bundles'])}"
+        raise ValidationError(
+            "runtime_error",
+            f"Skill set {skillset['id']} is missing bundles for: {', '.join(inventory['missing_bundles'])}",
+            context={"skillset": skillset["id"], "missing_bundles": inventory["missing_bundles"]},
         )
 
 

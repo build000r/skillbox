@@ -39,6 +39,33 @@ SCRIPTS_DIR = DEFAULT_ROOT_DIR / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
+try:
+    from .errors import (  # noqa: E402
+        DEPRECATION_MARKER,
+        INTERNAL_ERROR_CODE,
+        AdapterError,
+        NetworkError,
+        RuntimeLifecycleError,
+        SkillboxError,
+        StateConflictError,
+        ValidationError,
+        internal_error_payload,
+    )
+except ImportError:  # loaded standalone (SourceFileLoader) without a package
+    if str(PACKAGE_DIR) not in sys.path:
+        sys.path.insert(0, str(PACKAGE_DIR))
+    from errors import (  # type: ignore[no-redef]  # noqa: E402
+        DEPRECATION_MARKER,
+        INTERNAL_ERROR_CODE,
+        AdapterError,
+        NetworkError,
+        RuntimeLifecycleError,
+        SkillboxError,
+        StateConflictError,
+        ValidationError,
+        internal_error_payload,
+    )
+
 from lib.runtime_model import (  # noqa: E402
     LOOPBACK_BIND_HOSTS,
     PERSISTENCE_ERROR_CODES,
@@ -301,16 +328,26 @@ def structured_error(
     recovery_hint: str | None = None,
     next_actions: list[str] | None = None,
 ) -> dict[str, Any]:
+    # Single CARRIER for the back-compat error envelope. ``error_type`` IS the
+    # stable code, mirrored into the new ``error.code`` and the legacy top-level
+    # ``error_code`` so a snapshot test can pin them together. Legacy keys
+    # (``error.type``, ``error.recoverable``, top-level ``error_code``) and the
+    # ``deprecation`` marker coexist with the new shape for one release.
     payload: dict[str, Any] = {
+        "ok": False,
         "error": {
+            "code": error_type,
             "type": error_type,
             "message": message,
             "recoverable": recoverable,
         },
+        "error_code": error_type,
+        "deprecation": copy.deepcopy(DEPRECATION_MARKER),
     }
     if recovery_hint is not None:
         payload["error"]["recovery_hint"] = recovery_hint
     if next_actions is not None:
+        payload["error"]["next_actions"] = next_actions
         payload["next_actions"] = next_actions
     return payload
 
