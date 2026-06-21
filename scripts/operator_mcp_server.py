@@ -10,9 +10,11 @@ Protocol: JSON-RPC 2.0 over stdio (MCP 2024-11-05).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -108,6 +110,190 @@ def _redact_diagnostic_value(value: Any) -> Any:
             for key, child in value.items()
         }
     return value
+
+
+# ---------------------------------------------------------------------------
+# operator_box_exec command policy (server-side gate)
+#
+# operator_box_exec runs ARBITRARY shell over Tailscale SSH on any inventory
+# box. Unlike teardown/compose_down (single fixed effect), the command itself
+# is the payload, so the gate lives here on the server (works for every MCP
+# client, like the provision dry-run gate) rather than only in the hook.
+#
+# Policy, in two tiers:
+#   1. READ-ONLY ALLOWLIST — a SHORT, BORING set of inspection commands that
+#      cannot mutate state. These pass unconditionally (no dry-run friction).
+#      We match on the LEADING command token(s) and refuse the command if it
+#      contains shell metacharacters that could chain a second command
+#      (`;`, `|`, `&`, `>`, backticks, `$(`, `&&`, `||`, newlines used as
+#      separators, etc.) — an allowlisted prefix must NOT be a smuggling
+#      vector for an arbitrary tail.
+#   2. EVERYTHING ELSE — mutating verbs, unknown commands, or anything with
+#      chaining metacharacters — requires a fresh dry_run=true preview that
+#      stamps a marker keyed by box_id + a hash of the NORMALIZED command, so
+#      a marker minted for command A cannot authorize command B.
+# ---------------------------------------------------------------------------
+
+# Shell metacharacters that can chain/redirect a second command. Their presence
+# disqualifies the read-only fast path: even `cat foo` becomes mutating-capable
+# as `cat foo > /etc/passwd` or `cat foo; rm -rf /`. A command with any of these
+# must go through the dry-run marker path regardless of its leading token.
+_SHELL_CHAIN_RE = re.compile(r"[;&|><`\n\r]|\$\(|\$\{|\\\n")
+
+# Read-only allowlist. Keyed by the leading token; the value is either:
+#   - None: any args allowed (e.g. `df`, `uptime`).
+#   - a set of allowed SECOND tokens (e.g. `docker` -> {"ps", "logs", ...},
+#     `git` -> {"status", "log", ...}, `systemctl` -> {"status", ...}).
+# Conservative on purpose: subcommands like `docker exec`, `git push`,
+# `systemctl restart` are NOT here and fall through to the dry-run gate.
+_READONLY_ALLOWLIST: dict[str, set[str] | None] = {
+    # Plain inspection commands (any args).
+    "cat": None,
+    "df": None,
+    "du": None,
+    "free": None,
+    "head": None,
+    "hostname": None,
+    "id": None,
+    "journalctl": None,
+    "ls": None,
+    "nproc": None,
+    "ps": None,
+    "pwd": None,
+    "stat": None,
+    "tail": None,
+    "uname": None,
+    "uptime": None,
+    "wc": None,
+    "whoami": None,
+    # Subcommand-scoped: only the read-only verbs below are allowlisted.
+    "docker": {"ps", "logs", "images", "inspect", "stats", "version", "top"},
+    "git": {"status", "log", "diff", "show", "branch", "remote", "rev-parse"},
+    "systemctl": {"status", "is-active", "is-enabled", "list-units", "show"},
+}
+
+# Paths whose `cat`/`head`/`tail` would leak secrets. If the read-only command
+# touches one of these, it does NOT get the fast path — it must dry-run first so
+# the preview (and audit) records exactly what would be read.
+_SECRET_PATH_RE = re.compile(
+    r"(?:^|[\s=])"
+    r"(?:[^\s]*/)?"
+    r"(?:\.env(?:\.[\w.-]+)?|\.netrc|id_rsa|id_ed25519|"
+    r"[^\s]*secret[^\s]*|[^\s]*credential[^\s]*|authkey|\.ssh/[^\s]*)",
+    re.IGNORECASE,
+)
+
+
+def normalize_command(command: str) -> str:
+    """Collapse insignificant whitespace so trivially-different spellings of
+    the SAME command hash to the same marker key.
+
+    Collapses runs of any whitespace (spaces, tabs, newlines) to a single
+    space and strips leading/trailing whitespace. This makes
+    ``"ls   -la"`` == ``"ls -la"`` and tolerates a trailing newline, but does
+    NOT alter token order, quoting, or operators, so two semantically distinct
+    commands never collide.
+    """
+    return re.sub(r"\s+", " ", command).strip()
+
+
+def command_hash(command: str) -> str:
+    """Stable short hash of the normalized command, used in the marker key.
+
+    Binds a dry-run marker to the EXACT command previewed: a marker for
+    command A cannot authorize command B because their hashes differ.
+    """
+    return hashlib.sha256(normalize_command(command).encode("utf-8")).hexdigest()[:16]
+
+
+def _leading_tokens(command: str) -> list[str]:
+    """Best-effort split of the normalized command into its leading tokens.
+
+    We only need the first two tokens to consult the allowlist. ``shlex`` would
+    raise on unbalanced quotes; for classification a simple whitespace split of
+    the normalized command is sufficient and never raises.
+    """
+    return normalize_command(command).split(" ")
+
+
+def classify_box_exec_command(command: str) -> dict[str, Any]:
+    """Classify *command* as 'read-only' (allowlisted) or 'mutating'.
+
+    Returns a dict: {"verdict": "read-only"|"mutating", "reason": str}.
+    'read-only' means it passes unconditionally; 'mutating' means a matching
+    dry-run marker is required. The classifier is conservative: anything it is
+    not SURE is read-only is treated as mutating.
+    """
+    normalized = normalize_command(command)
+    if not normalized:
+        return {"verdict": "mutating", "reason": "empty command"}
+
+    if _SHELL_CHAIN_RE.search(command):
+        return {
+            "verdict": "mutating",
+            "reason": "contains shell chaining/redirection metacharacters",
+        }
+
+    tokens = _leading_tokens(command)
+    head = tokens[0]
+
+    # Reject an env-var prefix (FOO=bar cmd ...) or absolute/relative path
+    # invocation on the fast path — we only allowlist bare, known tokens.
+    if "=" in head or "/" in head:
+        return {"verdict": "mutating", "reason": f"non-allowlisted invocation: {head!r}"}
+
+    if head not in _READONLY_ALLOWLIST:
+        return {"verdict": "mutating", "reason": f"command {head!r} not in read-only allowlist"}
+
+    allowed_sub = _READONLY_ALLOWLIST[head]
+    if allowed_sub is not None:
+        sub = tokens[1] if len(tokens) > 1 else ""
+        if sub not in allowed_sub:
+            return {
+                "verdict": "mutating",
+                "reason": f"{head} subcommand {sub or '<none>'!r} not in read-only allowlist",
+            }
+
+    # `cat`/`head`/`tail`/`stat`/`ls` of a secret-looking path is NOT free:
+    # it could exfiltrate secrets, so route it through the dry-run preview.
+    if head in {"cat", "head", "tail", "stat", "ls", "wc"} and _SECRET_PATH_RE.search(command):
+        return {
+            "verdict": "mutating",
+            "reason": "reads a secret-looking path; preview required",
+        }
+
+    return {"verdict": "read-only", "reason": f"allowlisted: {head}"}
+
+
+def _dcg_verdict(command: str) -> dict[str, Any] | None:
+    """Optionally pipe *command* through `dcg check` and surface its verdict.
+
+    Best-effort and never a hard dependency: returns None if dcg is not
+    installed or errors. Output is advisory only — the server-side classifier
+    is the real gate.
+    """
+    dcg_bin = shutil.which("dcg")
+    if not dcg_bin:
+        return None
+    try:
+        proc = subprocess.run(
+            [dcg_bin, "check", "--stdin"],
+            input=command,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    verdict: dict[str, Any] = {"available": True, "exit_code": proc.returncode}
+    out = proc.stdout.strip()
+    if out:
+        try:
+            verdict["report"] = json.loads(out)
+        except json.JSONDecodeError:
+            verdict["report"] = redact_diagnostic_text(out)
+    verdict["blocked"] = proc.returncode != 0
+    return verdict
 
 
 def _validate_identifier(value: str, kind: str) -> str:
@@ -359,7 +545,12 @@ TOOLS: list[dict] = [
             "Run a command on a box over Tailscale SSH. "
             "Use for ad-hoc operations: checking logs, running manage.py commands, inspecting state. "
             "The command runs as the box's SSH user (typically 'skillbox'). "
-            "For interactive SSH, use 'make box-ssh BOX=<id>' instead."
+            "For interactive SSH, use 'make box-ssh BOX=<id>' instead. "
+            "GATED: read-only inspection commands (status/logs/df/cat/ls/etc.) run "
+            "immediately. Any MUTATING or unrecognized command must first be "
+            "previewed with dry_run=true (which returns exactly what would run and "
+            "stamps a marker bound to box_id + the command hash); only then will the "
+            "identical command execute for real."
         ),
         **_tool_metadata(
             read_only=False,
@@ -387,6 +578,15 @@ TOOLS: list[dict] = [
                     "type": "integer",
                     "description": "Command timeout in seconds (default: 120).",
                     "default": 120,
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": (
+                        "Preview a mutating/unknown command without running it. Returns the exact "
+                        "command that would execute and stamps a marker bound to box_id + command hash, "
+                        "authorizing one real run of THIS command. Read-only commands do not need this."
+                    ),
+                    "default": False,
                 },
             },
         },
@@ -972,7 +1172,117 @@ def handle_operator_box_exec(params: dict) -> dict:
                 "recoverable": True,
             }
         })
+
+    try:
+        dry_run_param = _validate_optional_bool(params, "dry_run")
+    except ValueError as exc:
+        return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
+
+    # --- Command policy gate (server-side, every-client) -------------------
+    classification = classify_box_exec_command(command_param)
+    marker_key = _box_exec_marker_key(box_id_param, command_param)
+    cmd_hash = command_hash(command_param)
+
+    # Read-only allowlisted commands run unconditionally — no dry-run friction.
+    if classification["verdict"] == "read-only" and not dry_run_param:
+        emit_box_exec_audit(
+            box_id_param,
+            command_param,
+            verdict="allow-readonly",
+            reason=classification["reason"],
+        )
+        ok, _code, data = run_ssh(validated_user, validated_host, command_param, timeout=timeout)
+        return _ok_content(data) if ok else _error_content(data)
+
+    # Mutating/unknown (or an explicit dry_run). In dry_run mode we preview the
+    # EXACT command and stamp a marker bound to box_id + command hash.
+    if dry_run_param:
+        _stamp_dryrun_marker("operator_box_exec", marker_key)
+        emit_box_exec_audit(
+            box_id_param,
+            command_param,
+            verdict="preview",
+            reason=classification["reason"],
+            dry_run=True,
+        )
+        payload: dict[str, Any] = {
+            "dry_run": True,
+            "box_id": box_id_param,
+            "classification": classification["verdict"],
+            "reason": classification["reason"],
+            "would_run": {
+                "ssh_user": validated_user,
+                "host": validated_host,
+                "command": command_param,
+                "command_hash": cmd_hash,
+                "timeout": timeout,
+            },
+            "next_actions": [
+                "Confirm the command above with the user, then re-issue the IDENTICAL "
+                "operator_box_exec call WITHOUT dry_run to execute it.",
+            ],
+        }
+        dcg = _dcg_verdict(command_param)
+        if dcg is not None:
+            payload["dcg"] = dcg
+        return _ok_content(payload)
+
+    # Mutating, non-dry-run: require a fresh marker bound to THIS command.
+    if not _has_dryrun_marker("operator_box_exec", marker_key):
+        emit_box_exec_audit(
+            box_id_param,
+            command_param,
+            verdict="reject",
+            reason=f"no dry-run marker for command hash {cmd_hash}: {classification['reason']}",
+        )
+        marker_status = _dryrun_marker_rejection_status("operator_box_exec", marker_key)
+        ttl_seconds = marker_status.get("ttl_seconds")
+        age_seconds = marker_status.get("age_seconds")
+        if age_seconds is None:
+            marker_note = f"no marker for this command; configured marker ttl is {ttl_seconds}s"
+        else:
+            marker_note = f"observed marker age is {age_seconds}s; configured marker ttl is {ttl_seconds}s"
+        return _error_content({
+            "error": {
+                "type": "dry_run_required",
+                "message": (
+                    f"operator_box_exec classified this command as '{classification['verdict']}' "
+                    f"({classification['reason']}). A mutating/unknown command requires a successful "
+                    f"dry_run=true preview of the IDENTICAL command first ({marker_note})."
+                ),
+                "recoverable": True,
+                "subject": box_id_param,
+                "classification": classification["verdict"],
+                "command_hash": cmd_hash,
+                "marker": {
+                    "exists": bool(marker_status.get("exists")),
+                    "expired": bool(marker_status.get("expired")),
+                    "age_seconds": age_seconds,
+                    "ttl_seconds": ttl_seconds,
+                },
+                "next_actions": [
+                    {
+                        "tool": "operator_box_exec",
+                        "arguments": {
+                            "box_id": box_id_param,
+                            "command": command_param,
+                            "dry_run": True,
+                        },
+                    },
+                ],
+            }
+        })
+
+    # Marker present and valid — authorize a single real run, then consume it.
+    emit_box_exec_audit(
+        box_id_param,
+        command_param,
+        verdict="allow-marker",
+        reason=f"matching dry-run marker for command hash {cmd_hash}",
+    )
     ok, _code, data = run_ssh(validated_user, validated_host, command_param, timeout=timeout)
+    if ok:
+        _clear_dryrun_marker("operator_box_exec", marker_key)
     return _ok_content(data) if ok else _error_content(data)
 
 
@@ -1108,6 +1418,35 @@ def emit_event(event_type: str, subject: str, detail: dict | None = None) -> Non
         pass
 
 
+def emit_box_exec_audit(
+    box_id: str,
+    command: str,
+    *,
+    verdict: str,
+    reason: str,
+    dry_run: bool = False,
+) -> None:
+    """Record an audit event for EVERY operator_box_exec invocation.
+
+    Logs box_id, the command HASH (never raw secrets), a REDACTED command
+    preview, the gate verdict (allow-readonly / allow-marker / reject /
+    preview), and a human reason. The raw command is redacted (KEY=value and
+    bearer-token shaped substrings) before it ever touches the journal so a
+    command carrying a secret cannot leak it into the audit trail.
+    """
+    emit_event(
+        "operator.box_exec",
+        box_id,
+        {
+            "verdict": verdict,
+            "reason": reason,
+            "dry_run": dry_run,
+            "command_hash": command_hash(command),
+            "command_redacted": redact_diagnostic_text(normalize_command(command)),
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Dry-run marker (coordinates with PreToolUse hook)
 # ---------------------------------------------------------------------------
@@ -1117,6 +1456,22 @@ def _dryrun_marker_path(tool_name: str, box_id: str) -> Path:
     _validate_identifier(tool_name, "tool_name")
     _validate_identifier(box_id, "box_id")
     return REPO_ROOT / ".skillbox-state" / "dryrun-markers" / f".skillbox-dryrun-{tool_name}-{box_id}"
+
+
+def _box_exec_marker_key(box_id: str, command: str) -> str:
+    """Marker subject for operator_box_exec, binding box_id + command hash.
+
+    The marker store keys on a single slug; we combine the (already validated)
+    box_id with the normalized-command hash so a marker minted for command A on
+    box X cannot authorize command B (different hash) or command A on box Y
+    (different box_id). To stay within the 64-char identifier limit for any
+    box_id length, the box_id is folded into a short hash and joined with the
+    command hash: ``{box_hash}.{command_hash}`` (only ``[a-z0-9.]``). Distinct
+    box_ids and distinct (normalized) commands therefore land on distinct
+    markers; identical ones collide intentionally.
+    """
+    box_hash = hashlib.sha256(box_id.encode("utf-8")).hexdigest()[:16]
+    return f"{box_hash}.{command_hash(command)}"
 
 
 def _dryrun_marker_ttl_seconds() -> int:
@@ -1307,11 +1662,14 @@ def handle_initialize(_params: dict) -> dict:
             "./.skillbox-state/operator/.env.box) — NOT to the repo root, which is readable by "
             "in-container agents. "
             "4. CONFIRM WITH USER before operator_teardown — it destroys infrastructure. "
-            "5. Use operator_box_exec to run commands on remote boxes. "
+            "5. Use operator_box_exec to run commands on remote boxes. Read-only inspection "
+            "commands run immediately; a MUTATING or unknown command is rejected until you "
+            "preview the IDENTICAL command with dry_run=true (which stamps a per-command marker). "
             "6. Use operator_doctor to validate the local repo state. "
-            "SAFETY: Destructive tools (teardown, compose_down) are gated by a PreToolUse hook. "
-            "The hook BLOCKS execution if: (a) there are uncommitted changes (run /commit first), "
-            "or (b) no dry_run=true was run first. Always dry-run, then confirm with user, then execute."
+            "SAFETY: Destructive tools (teardown, compose_down) AND mutating operator_box_exec "
+            "commands are gated server-side and by a PreToolUse hook. The gate BLOCKS execution if: "
+            "(a) there are uncommitted changes (run /commit first), or (b) no matching dry_run=true "
+            "was run first. Always dry-run, then confirm with user, then execute."
         ),
     }
 
