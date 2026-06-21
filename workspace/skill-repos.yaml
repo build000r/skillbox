@@ -17,6 +17,7 @@ skill_repos:
       - divide-and-conquer
       - lube
       - mmdx
+      - project-status-mmdx
       - skill-issue
       - smart
 
@@ -29,6 +30,5 @@ skill_repos:
       - codebase-audit
       - git-stash-janitor
       - no-ragrets
-      - project-status-mmdx
       - sbp
       - ui-fresh-eyes
