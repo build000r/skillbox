@@ -9,7 +9,14 @@ _OPERATOR_ENV := $(firstword $(wildcard $(_STATE_ROOT)/operator/.env) $(wildcard
 _ENV_FILE_ARG := $(if $(_OPERATOR_ENV),--env-file $(_OPERATOR_ENV),)
 
 # Resolve monoserver layer: per-client override when focused, fat default otherwise.
-_FOCUS_CLIENT := $(shell python3 -c "import json; print(json.load(open('workspace/.focus.json')).get('client_id',''))" 2>/dev/null)
+# Read the focused client id. A momentarily-invalid .focus.json silently falls
+# back to empty here, which flips _MONOSERVER_LAYER to the fat default — i.e. it
+# changes WHICH FILESYSTEM gets mounted. Keep the empty fallback (so a clean
+# absent-file case stays quiet) but warn on stderr when the file EXISTS yet
+# fails to parse, so that silent mis-steer becomes visible.
+_FOCUS_CLIENT := $(shell python3 -c "import json,os;p='workspace/.focus.json';\
+print(json.load(open(p)).get('client_id','')) if os.path.exists(p) else print('')" 2>/dev/null \
+|| (echo >&2 'make: warning: workspace/.focus.json exists but failed to parse; falling back to monoserver default mount'; echo ''))
 _CLIENT_OVERRIDE := workspace/.compose-overrides/docker-compose.client-$(_FOCUS_CLIENT).yml
 _MONOSERVER_LAYER := $(if $(and $(_FOCUS_CLIENT),$(wildcard $(_CLIENT_OVERRIDE))),$(_CLIENT_OVERRIDE),docker-compose.monoserver.yml)
 COMPOSEF := $(COMPOSE) $(_ENV_FILE_ARG) -f docker-compose.yml -f $(_MONOSERVER_LAYER)
