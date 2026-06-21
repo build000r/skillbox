@@ -5297,6 +5297,18 @@ class RuntimeManagerTests(unittest.TestCase):
             (ROOT_DIR / ".env-manager" / "mcp_server.py").read_text(encoding="utf-8"),
             encoding="utf-8",
         )
+        # mcp_server.py imports the shared secret-redaction leaf (scripts/lib/
+        # redaction.py) the same way it runs in /workspace (full repo present).
+        # Stage it so the fixture faithfully mirrors the real launch environment.
+        (repo / "scripts" / "lib").mkdir(parents=True, exist_ok=True)
+        (repo / "scripts" / "lib" / "__init__.py").write_text(
+            (ROOT_DIR / "scripts" / "lib" / "__init__.py").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        (repo / "scripts" / "lib" / "redaction.py").write_text(
+            (ROOT_DIR / "scripts" / "lib" / "redaction.py").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
         (repo / ".mcp.json").write_text(
             json.dumps(
                 {
