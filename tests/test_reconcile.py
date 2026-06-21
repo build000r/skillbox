@@ -377,7 +377,10 @@ class ReconcileTests(unittest.TestCase):
 
         self.assertEqual(drift.status, "fail")
         self.assertEqual(drift.details["hits"], ["docs/note.txt:1"])
-        self.assertEqual(drift.fix_command, 'rg "00-skill-sync.sh" .')
+        # Build the expected fix_command without a literal sentinel so this
+        # test file does not itself trip check_reference_drift (mirrors the
+        # split-string convention used for `legacy_script` above).
+        self.assertEqual(drift.fix_command, f'rg "{legacy_script}" .')
 
         process = mock.Mock(returncode=0, stdout=json.dumps({"checks": [{"status": "warn", "code": "skill-repo-lock-state"}]}), stderr="")
         with mock.patch.object(RECONCILE, "run_command", return_value=process):
