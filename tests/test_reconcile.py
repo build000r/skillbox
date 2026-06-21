@@ -735,5 +735,148 @@ class ReconcileTests(unittest.TestCase):
         return mock.patch.multiple(RECONCILE, ROOT_DIR=repo, WORKSPACE_DIR=repo / "workspace")
 
 
+import subprocess  # noqa: E402
+
+MANAGER = ROOT_DIR / ".env-manager" / "manage.py"
+
+_PERSISTENCE_YAML = (
+    "version: 1\n"
+    "state_root_env: SKILLBOX_STATE_ROOT\n"
+    "targets:\n"
+    "  local:\n"
+    "    provider: local\n"
+    "    default_state_root: ./.skillbox-state\n"
+    "  digitalocean:\n"
+    "    provider: digitalocean\n"
+    "    default_state_root: /srv/skillbox\n"
+    "bindings:\n"
+    "  - id: workspace-root\n"
+    "    runtime_path: /workspace\n"
+    "    storage_class: external\n"
+    "    source_ref: root_dir\n"
+    "  - id: clients-root\n"
+    "    runtime_path: /workspace/workspace/clients\n"
+    "    storage_class: persistent\n"
+    "    relative_path: clients\n"
+)
+
+_ENV_EXAMPLE = (
+    "SKILLBOX_NAME=skillbox\n"
+    "SKILLBOX_WORKSPACE_ROOT=/workspace\n"
+    "SKILLBOX_REPOS_ROOT=/workspace/repos\n"
+    "SKILLBOX_SKILLS_ROOT=/workspace/skills\n"
+    "SKILLBOX_LOG_ROOT=/workspace/logs\n"
+    "SKILLBOX_HOME_ROOT=/home/sandbox\n"
+    "SKILLBOX_MONOSERVER_ROOT=/monoserver\n"
+    "SKILLBOX_CLIENTS_ROOT=/workspace/workspace/clients\n"
+    "SKILLBOX_CLIENTS_HOST_ROOT=./workspace/clients\n"
+    "SKILLBOX_MONOSERVER_HOST_ROOT=./monoserver-host\n"
+)
+
+
+class RuntimeIdRejectionCliTests(unittest.TestCase):
+    """skillbox-typed-contracts-epic-ugcx.4: render/doctor must reject an id
+    that violates the canonical slug grammar with code RUNTIME_ID_INVALID and
+    provenance (kind + source file), and client-init must refuse a bad slug.
+    """
+
+    def _run(self, repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["python3", str(MANAGER), "--root-dir", str(repo), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def _write_minimal_repo(self, repo: Path, *, service_id: str) -> None:
+        (repo / "workspace").mkdir(parents=True, exist_ok=True)
+        (repo / "workspace" / "persistence.yaml").write_text(
+            _PERSISTENCE_YAML, encoding="utf-8"
+        )
+        (repo / ".env.example").write_text(_ENV_EXAMPLE, encoding="utf-8")
+        (repo / "workspace" / "runtime.yaml").write_text(
+            "version: 2\n"
+            "selection:\n"
+            "  profiles:\n"
+            "    - core\n"
+            "core:\n"
+            "  services:\n"
+            f"    - id: {service_id}\n"
+            "      path: ${SKILLBOX_WORKSPACE_ROOT}/.env-manager/manage.py\n",
+            encoding="utf-8",
+        )
+
+    def test_render_rejects_bad_service_id_with_code_and_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_minimal_repo(repo, service_id="env/manager")
+
+            result = self._run(repo, "render", "--format", "json")
+
+            self.assertEqual(result.returncode, 1, result.stderr or result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertFalse(payload.get("ok", True))
+            error = payload["error"]
+            self.assertEqual(error["code"], "RUNTIME_ID_INVALID")
+            self.assertEqual(error["type"], "RUNTIME_ID_INVALID")
+            self.assertEqual(payload["error_code"], "RUNTIME_ID_INVALID")
+            context = error["context"]
+            self.assertEqual(context["id"], "env/manager")
+            self.assertEqual(context["kind"], "service")
+            self.assertEqual(Path(context["source_file"]).name, "runtime.yaml")
+            self.assertTrue(error["next_actions"])
+
+    def test_doctor_rejects_bad_service_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_minimal_repo(repo, service_id="../escape")
+
+            result = self._run(repo, "doctor", "--format", "json")
+
+            self.assertEqual(result.returncode, 1, result.stderr or result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["error"]["code"], "RUNTIME_ID_INVALID")
+            self.assertEqual(payload["error"]["context"]["id"], "../escape")
+            self.assertEqual(payload["error"]["context"]["kind"], "service")
+
+    def test_clean_minimal_repo_renders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_minimal_repo(repo, service_id="env-manager")
+
+            result = self._run(repo, "render", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertNotIn("RUNTIME_ID_INVALID", result.stdout)
+            self.assertTrue(
+                any(s["id"] == "env-manager" for s in payload.get("services", []))
+            )
+
+    def test_client_init_refuses_bad_slug(self) -> None:
+        # client-init must reject a bad slug at creation time with the same
+        # grammar (here: a path-separator slug), before any directory is made.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_minimal_repo(repo, service_id="env-manager")
+
+            result = self._run(repo, "client-init", "bad/slug", "--format", "json")
+
+            self.assertEqual(result.returncode, 1, result.stderr or result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertIn("Invalid client id", payload["error"]["message"])
+
+    def test_client_init_refuses_uppercase_slug(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_minimal_repo(repo, service_id="env-manager")
+
+            result = self._run(repo, "client-init", "Acme", "--format", "json")
+
+            self.assertEqual(result.returncode, 1, result.stderr or result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertIn("Invalid client id", payload["error"]["message"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -25,6 +25,16 @@ from lib.runtime_model import (  # noqa: E402
     PROJECT_KIND_IOS,
     VALID_PROJECT_KINDS,
     IOS_COMMAND_LANES,
+    # Runtime-id slug grammar (security: path-join footgun). Re-exported here
+    # so consumers that already pull in the validation module get the stable
+    # RUNTIME_ID_INVALID code + validator without also importing
+    # scripts.lib.runtime_model directly. Enforcement runs inside
+    # build_runtime_model; this re-export is the shared seam.
+    RUNTIME_ID_INVALID,
+    RUNTIME_ID_PATTERN,
+    RUNTIME_ID_PATTERN_TEXT,
+    RuntimeIdValidationError,
+    validate_runtime_id,
 )
 
 VALID_INGRESS_ROUTE_LISTENERS = {"public", "private"}

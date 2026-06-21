@@ -151,6 +151,12 @@ SHA256_HEX_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")
 IPV4_PATTERN = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 _SSH_USER_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$')
 _HOST_RE = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,253}[a-zA-Z0-9])?$')
+# Box ids / box-profile names are an ALIGNED-but-separate surface from runtime
+# ids. The canonical slug grammar (and why these allow the slightly wider
+# `[a-zA-Z0-9._-]` class — historic `.` and uppercase box ids) is documented
+# once in docs/runtime-id-grammar.md, the same reference
+# scripts/lib/runtime_model.py points at. No runtime id uses `.`/uppercase, so
+# the runtime grammar there is the stricter `^[a-z0-9][a-z0-9_-]{0,63}$`.
 _BOX_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 _PROFILE_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 

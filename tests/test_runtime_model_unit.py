@@ -206,6 +206,32 @@ class RuntimeModelUnitTests(unittest.TestCase):
             self.assertEqual(model["env"]["SKILLBOX_APR_BIN"], "/home/sandbox/.local/bin/apr")
             self.assertEqual(model["env"]["SKILLBOX_PULSE_UNHEALTHY_GRACE_SECONDS"], "60")
 
+    def test_build_runtime_model_rejects_planted_bad_service_id(self) -> None:
+        # Integration: a path-shape service id planted in the manifest must be
+        # rejected by build_runtime_model itself (the enforcement is wired into
+        # the build, not just the standalone validator), with provenance.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_runtime_fixture(repo)
+            manifest = repo / "workspace" / "runtime.yaml"
+            manifest.write_text(
+                manifest.read_text(encoding="utf-8").replace(
+                    "    - id: env-manager\n", "    - id: env/manager\n"
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(
+                runtime_model_module.RuntimeIdValidationError
+            ) as ctx:
+                runtime_model_module.build_runtime_model(repo)
+            exc = ctx.exception
+            self.assertEqual(exc.code, runtime_model_module.RUNTIME_ID_INVALID)
+            self.assertEqual(exc.context["kind"], "service")
+            self.assertEqual(exc.context["id"], "env/manager")
+            self.assertEqual(
+                Path(exc.context["source_file"]).name, "runtime.yaml"
+            )
+
     def _write_runtime_fixture(self, repo: Path) -> None:
         (repo / "workspace" / "clients" / "acme").mkdir(parents=True, exist_ok=True)
         (repo / "artifacts").mkdir(parents=True, exist_ok=True)
@@ -579,6 +605,132 @@ class LocalRuntimeCoreModelTests(unittest.TestCase):
             [entry["mode"] for entry in sections["service_mode_commands"]],
             ["reuse", "prod"],
         )
+
+
+class RuntimeIdGrammarTests(unittest.TestCase):
+    """skillbox-typed-contracts-epic-ugcx.4: strict-slug grammar enforced
+    before any service/task/client/repo/artifact/skill/check id is joined into
+    a filesystem path. Rejects path-shape (`a/b`) and escape (`../x`) footguns
+    loudly with code RUNTIME_ID_INVALID + provenance, never sanitizing.
+    """
+
+    # Canonical accept set: the in-tree shapes that MUST keep working — single
+    # char, digits, hyphens, underscores (incl. the real
+    # sweet-potato__nextra_documentation_site client), and a full-length 64.
+    ACCEPT = [
+        "a",
+        "z9",
+        "personal",
+        "my-svc",
+        "my_svc",
+        "a0_-b",
+        "sweet-potato__nextra_documentation_site",
+        "x" * 64,
+    ]
+
+    # Reject set from the acceptance criteria + adjacent path footguns.
+    REJECT = [
+        "a/b",          # path separator -> reshapes directory tree
+        "../x",         # traversal -> escapes intended root
+        "-lead",        # leading dash -> looks like a CLI flag
+        "",             # empty
+        "a" * 200,      # over-long (200 chars)
+        "Upper",        # uppercase
+        "a.b",          # dot (so `..` can never appear)
+        "a\\b",         # backslash separator
+        "has space",    # whitespace
+        "a:b",          # colon
+        "x" * 65,       # one past the 64-char cap
+    ]
+
+    def test_accept_set_passes(self) -> None:
+        for value in self.ACCEPT:
+            with self.subTest(value=value):
+                self.assertEqual(
+                    runtime_model_module.validate_runtime_id(
+                        "service", value, source_file="runtime.yaml"
+                    ),
+                    value,
+                )
+                self.assertTrue(runtime_model_module.RUNTIME_ID_PATTERN.match(value))
+
+    def test_reject_set_raises_with_code_and_provenance(self) -> None:
+        for value in self.REJECT:
+            with self.subTest(value=value):
+                with self.assertRaises(
+                    runtime_model_module.RuntimeIdValidationError
+                ) as ctx:
+                    runtime_model_module.validate_runtime_id(
+                        "check", value, source_file="overlay.yaml"
+                    )
+                exc = ctx.exception
+                self.assertEqual(exc.code, runtime_model_module.RUNTIME_ID_INVALID)
+                self.assertEqual(exc.context["kind"], "check")
+                self.assertEqual(exc.context["source_file"], "overlay.yaml")
+                self.assertEqual(exc.context["id"], value)
+                # The rename playbook names the files to update together.
+                self.assertTrue(exc.next_actions)
+
+    def test_validate_runtime_model_ids_attributes_overlay_provenance(self) -> None:
+        model = {
+            "manifest_file": "/repo/workspace/runtime.yaml",
+            "clients": [
+                {"id": "acme", "_overlay_path": "/repo/clients/acme/overlay.yaml"},
+            ],
+            # A client-scoped service with a bad id is attributed to the
+            # client's overlay, not the core manifest.
+            "services": [{"id": "bad/svc", "client": "acme"}],
+            "tasks": [],
+            "repos": [],
+            "artifacts": [],
+            "skills": [],
+            "checks": [],
+        }
+        with self.assertRaises(
+            runtime_model_module.RuntimeIdValidationError
+        ) as ctx:
+            runtime_model_module.validate_runtime_model_ids(model)
+        exc = ctx.exception
+        self.assertEqual(exc.code, runtime_model_module.RUNTIME_ID_INVALID)
+        self.assertEqual(exc.context["kind"], "service")
+        self.assertEqual(exc.context["id"], "bad/svc")
+        self.assertEqual(
+            exc.context["source_file"], "/repo/clients/acme/overlay.yaml"
+        )
+
+    def test_validate_runtime_model_ids_falls_back_to_manifest(self) -> None:
+        model = {
+            "manifest_file": "/repo/workspace/runtime.yaml",
+            "clients": [],
+            "services": [],
+            "tasks": [],
+            "repos": [{"id": "../escape"}],  # core repo, no client scope
+            "artifacts": [],
+            "skills": [],
+            "checks": [],
+        }
+        with self.assertRaises(
+            runtime_model_module.RuntimeIdValidationError
+        ) as ctx:
+            runtime_model_module.validate_runtime_model_ids(model)
+        self.assertEqual(ctx.exception.context["kind"], "repo")
+        self.assertEqual(
+            ctx.exception.context["source_file"], "/repo/workspace/runtime.yaml"
+        )
+
+    def test_validate_runtime_model_ids_accepts_clean_model(self) -> None:
+        model = {
+            "manifest_file": "/repo/workspace/runtime.yaml",
+            "clients": [{"id": "acme"}],
+            "services": [{"id": "api-svc", "client": "acme"}],
+            "tasks": [{"id": "bootstrap"}],
+            "repos": [{"id": "skillbox_self"}],
+            "artifacts": [],
+            "skills": [{"id": "default-skills"}],
+            "checks": [{"id": "workspace-root"}],
+        }
+        # Must not raise.
+        runtime_model_module.validate_runtime_model_ids(model)
 
 
 if __name__ == "__main__":

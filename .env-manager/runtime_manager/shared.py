@@ -70,6 +70,10 @@ from lib.runtime_model import (  # noqa: E402
     LOOPBACK_BIND_HOSTS,
     PERSISTENCE_ERROR_CODES,
     PersistenceContractError,
+    RUNTIME_ID_INVALID,
+    RUNTIME_ID_PATTERN,
+    RUNTIME_ID_PATTERN_TEXT,
+    RuntimeIdValidationError,
     WILDCARD_BIND_HOSTS,
     build_runtime_model,
     classify_bind_scope,
@@ -85,6 +89,7 @@ from lib.runtime_model import (  # noqa: E402
     runtime_manifest_path,
     runtime_path_to_host_path,
     storage_binding_by_id,
+    validate_runtime_id,
 )
 
 # Single source of truth for secret redaction (see scripts/lib/redaction.py).
@@ -141,6 +146,11 @@ CLIENT_DEPLOY_ARTIFACTS_REL = Path("artifacts")
 DEFAULT_PRIVATE_REPO_REL = Path("..") / "skillbox-config"
 CLIENT_PLANNING_SKILL_TEMPLATE_REL = Path("workspace") / "client-planning-skills"
 CLIENT_SKILL_BUILDER_TEMPLATE_REL = Path("workspace") / "client-skill-builder-skills"
+# Superseded by the canonical RUNTIME_ID_PATTERN (lib.runtime_model) which
+# validate_client_id now uses; kept only so the historic constant resolves.
+# The canonical grammar additionally allows '_' (e.g. the in-tree
+# sweet-potato__nextra_documentation_site client) which this stricter pattern
+# rejected. See docs/runtime-id-grammar.md.
 CLIENT_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 BLUEPRINT_VARIABLE_PATTERN = re.compile(r"^[A-Z0-9_]+$")
 SCAFFOLD_PLACEHOLDER_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
@@ -502,9 +512,21 @@ def classify_error(exc: RuntimeError, command: str) -> dict[str, Any]:
     """Map a RuntimeError to a structured error payload with contextual recovery hints."""
     msg = str(exc)
     lower_msg = msg.lower()
-    persistence_code = str(getattr(exc, "code", "") or "").strip()
+    code = str(getattr(exc, "code", "") or "").strip()
 
-    persistence_payload = _classify_persistence_error(exc, msg, persistence_code)
+    if code == RUNTIME_ID_INVALID:
+        return structured_error(
+            msg,
+            error_type=RUNTIME_ID_INVALID,
+            recoverable=True,
+            recovery_hint=(
+                f"Runtime ids must match {RUNTIME_ID_PATTERN_TEXT}. Rename the offending id in "
+                "workspace/runtime.yaml or the client overlay.yaml, then re-render."
+            ),
+            next_actions=["render --format json", "doctor --format json"],
+        )
+
+    persistence_payload = _classify_persistence_error(exc, msg, code)
     if persistence_payload is not None:
         return persistence_payload
 
@@ -2636,10 +2658,29 @@ def titleize_client_id(client_id: str) -> str:
 
 
 def validate_client_id(client_id: str) -> str:
+    """Reject a bad client slug at creation time (client-init / onboard).
+
+    Decides accept/reject with the SAME canonical runtime-id grammar the
+    model-load gate uses (``RUNTIME_ID_PATTERN`` ==
+    ``^[a-z0-9][a-z0-9_-]{0,63}$``), so a slug accepted here is exactly a slug
+    ``build_runtime_model`` will later accept — no client can be scaffolded
+    that the model then rejects, and an ``a/b`` / ``../x`` / leading-dash /
+    empty / 200-char / uppercase slug is refused before any directory is
+    created.
+
+    Surfaces via a plain ``RuntimeError`` carrying the established
+    ``invalid_client_id`` recovery affordance (``classify_error`` keys off the
+    "Invalid client id" message) rather than the lower-level
+    ``RUNTIME_ID_INVALID`` model code, since this is the operator-facing
+    create-time front door with its own stable code. The grammar is the single
+    shared one (STEP 4) even though the surfaced code differs by surface.
+    """
     normalized = client_id.strip()
-    if not CLIENT_ID_PATTERN.fullmatch(normalized):
+    if not RUNTIME_ID_PATTERN.match(normalized):
         raise RuntimeError(
-            f"Invalid client id {client_id!r}. Use lowercase letters, numbers, and single hyphens."
+            f"Invalid client id {client_id!r}. Use lowercase letters, numbers, "
+            f"'-' or '_' (must start alphanumeric, 1-64 chars): matches "
+            f"{RUNTIME_ID_PATTERN_TEXT}."
         )
     return normalized
 
