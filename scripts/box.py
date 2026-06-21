@@ -32,6 +32,15 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
+
+# Single source of truth for secret redaction (scripts/lib/redaction.py), the
+# same leaf-import direction shared.py uses for lib.runtime_model. box.py shells
+# out to doctl/ssh; their stdout/stderr can echo a DigitalOcean token or a
+# Tailscale authkey, which must never reach operator JSON or transcripts.
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+from lib.redaction import redact_text as redact_diagnostic_text  # noqa: E402
+
 PROFILES_DIR = REPO_ROOT / "workspace" / "box-profiles"
 BOOTSTRAP_SCRIPT = SCRIPT_DIR / "01-bootstrap-do.sh"
 TAILSCALE_SCRIPT = SCRIPT_DIR / "02-install-tailscale.sh"
@@ -721,14 +730,42 @@ def load_operator_secret(name: str) -> None:
 # CLI runners
 # ---------------------------------------------------------------------------
 
+def _redact_completed_process(
+    result: subprocess.CompletedProcess[str],
+) -> subprocess.CompletedProcess[str]:
+    """Redact secrets out of a remote subprocess's captured stdout/stderr.
+
+    This is THE single boundary where remote (doctl/ssh) output enters
+    operator-visible payloads, status checks, error tails, and JSON parses.
+    Redaction is value-targeted (KEY=value, bearer tokens, URL userinfo,
+    tskey-/dop_v1_ tokens), so it never alters JSON structure of clean output
+    that callers re-parse with ``json.loads``.
+    """
+    if isinstance(result.stdout, str) and result.stdout:
+        result.stdout = redact_diagnostic_text(result.stdout)
+    if isinstance(result.stderr, str) and result.stderr:
+        result.stderr = redact_diagnostic_text(result.stderr)
+    return result
+
+
 def run(args: list[str], *, check: bool = True, capture: bool = True, timeout: int = 120) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        args,
-        capture_output=capture,
-        text=True,
-        check=check,
-        timeout=timeout,
-    )
+    try:
+        completed = subprocess.run(
+            args,
+            capture_output=capture,
+            text=True,
+            check=check,
+            timeout=timeout,
+        )
+    except subprocess.CalledProcessError as exc:
+        # Redact secrets out of the raised error's captured output too, so a
+        # failing doctl/ssh command cannot leak a token via an exception tail.
+        if isinstance(exc.stdout, str):
+            exc.stdout = redact_diagnostic_text(exc.stdout)
+        if isinstance(exc.stderr, str):
+            exc.stderr = redact_diagnostic_text(exc.stderr)
+        raise
+    return _redact_completed_process(completed)
 
 
 def doctl(*args: str, timeout: int = 120) -> subprocess.CompletedProcess[str]:
@@ -762,13 +799,15 @@ def ssh_script(
         remote_argv.extend(["--", *script_args])
     remote_cmd = build_remote_env_command(remote_argv, env_vars)
     with script_path.open("r") as f:
-        return subprocess.run(
-            ["ssh", *DEFAULT_SSH_OPTS, "--", f"{user}@{host}", remote_cmd],
-            stdin=f,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout,
+        return _redact_completed_process(
+            subprocess.run(
+                ["ssh", *DEFAULT_SSH_OPTS, "--", f"{user}@{host}", remote_cmd],
+                stdin=f,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
         )
 
 

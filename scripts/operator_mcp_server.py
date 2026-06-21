@@ -63,53 +63,21 @@ _DRY_RUN_PROP: dict = {
 _IDENTIFIER_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 _SSH_USER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$")
 _HOST_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,253}[a-zA-Z0-9])?$")
-REDACTION_MARKER = "[REDACTED]"
-_SECRET_KEY_PATTERN = (
-    r"TOKEN|SECRET|PASSWORD|PASSWD|API[_-]?KEY|AUTH[_-]?KEY|PRIVATE[_-]?KEY|ACCESS[_-]?KEY"
-)
-_SECRET_KEY_RE = re.compile(rf"(?:{_SECRET_KEY_PATTERN})", re.IGNORECASE)
-_SECRET_ASSIGNMENT_RE = re.compile(
-    r"("
-    r"(?:\b|[\"'])"
-    rf"[A-Z0-9_.-]*(?:{_SECRET_KEY_PATTERN})[A-Z0-9_.-]*"
-    r"(?:\b|[\"'])"
-    r"\s*[:=]\s*"
-    r"[\"']?"
-    r")"
-    r"([^\"'\s,;]+)"
-    r"([\"']?)",
-    re.IGNORECASE,
-)
-_BEARER_TOKEN_RE = re.compile(
-    r"(\b(?:authorization|proxy-authorization)\s*:\s*bearer\s+)([^\s,;]+)",
-    re.IGNORECASE,
+
+# Single source of truth for secret redaction (scripts/lib/redaction.py), same
+# leaf-import direction as lib.runtime_model. ``redact_diagnostic_text`` and
+# ``_redact_diagnostic_value`` are preserved as thin aliases because call sites
+# (including the box_exec audit path) and tests reference these exact names.
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+from lib.redaction import (  # noqa: E402
+    REDACTION_MARKER,
+    redact_text as redact_diagnostic_text,
+    redact_value as _redact_diagnostic_value,
 )
 
 DRYRUN_MARKER_TTL_SECONDS = 600  # 10 minutes
 _DRYRUN_MARKER_STATUS_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
-
-
-def redact_diagnostic_text(text: str) -> str:
-    redacted = _BEARER_TOKEN_RE.sub(lambda match: f"{match.group(1)}{REDACTION_MARKER}", text)
-    return _SECRET_ASSIGNMENT_RE.sub(
-        lambda match: f"{match.group(1)}{REDACTION_MARKER}{match.group(3)}",
-        redacted,
-    )
-
-
-def _redact_diagnostic_value(value: Any) -> Any:
-    if isinstance(value, str):
-        return redact_diagnostic_text(value)
-    if isinstance(value, list):
-        return [_redact_diagnostic_value(item) for item in value]
-    if isinstance(value, dict):
-        return {
-            key: REDACTION_MARKER
-            if isinstance(key, str) and _SECRET_KEY_RE.search(key)
-            else _redact_diagnostic_value(child)
-            for key, child in value.items()
-        }
-    return value
 
 
 # ---------------------------------------------------------------------------
