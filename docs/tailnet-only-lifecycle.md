@@ -104,11 +104,46 @@ fallback and is not cached as `last_ssh_target`.
 
 ## Teardown
 
-`box down` deletes the cloud firewall before destroying the droplet:
+`box down` deletes the cloud firewall before destroying the droplet, and only
+marks the box `destroyed` after the droplet's absence is **API-confirmed**:
 
 ```
-drain → remove from tailnet → delete firewall → destroy droplet → cleanup volume
+drain → remove from tailnet → delete firewall → destroy droplet
+      → confirm absent (read-after-delete) → cleanup volume → destroyed
 ```
+
+### Teardown truth invariant
+
+A fleet inventory that says `destroyed` while a droplet still bills is the most
+expensive lie. `box down` therefore never trusts the `doctl ... droplet delete`
+exit code alone: after the delete call it issues a bounded read-after-delete
+confirmation (`doctl compute droplet get <id> --output json`, the same JSON
+parse used elsewhere) and only writes `destroyed` once the droplet is observed
+absent (a 404 / empty result). DigitalOcean's delete is eventually consistent,
+so the confirm performs **one bounded retry with linear backoff** and then lands
+in a truthful pending state — it never spins or hangs.
+
+Tailscale removal is best-effort: a failed `tailscale logout` is reported as a
+`remove` step `warn` but never blocks droplet destruction.
+
+### Teardown states
+
+| State | Meaning | Billing risk | Reachable next state(s) | Retry |
+|-------|---------|--------------|-------------------------|-------|
+| `draining` | Services stopped; tailnet/firewall/droplet teardown in progress | Possible (droplet may still exist) | `destroy-pending`, `volume-cleanup-failed`, `destroyed` | `box down <id>` |
+| `destroy-pending` | Droplet delete was requested but the droplet is **still API-listed** (read-after-delete not yet confirmed) | **Yes** — droplet may still bill; inventory deliberately does NOT say `destroyed` | `destroy-pending`, `volume-cleanup-failed`, `destroyed` | `box down <id>` (re-confirms absence; never re-deletes) |
+| `volume-cleanup-failed` | Droplet **confirmed gone**, but the attached volume could not be detached/deleted | No — droplet is gone | `volume-cleanup-failed`, `destroyed` | `box down <id>` (retries volume cleanup only) |
+| `destroyed` | Droplet confirmed absent and volume cleanup complete (or no volume) | None | terminal | n/a |
+
+Both `destroy-pending` and `volume-cleanup-failed` are surfaced in
+`box status <id>` and `box list` (a `teardown_pending` block carrying the exact
+`box down <id>` retry command and a `billing_risk` flag), not just in the
+output of the `box down` command that produced them. Re-running `box down` from
+either state is idempotent and converges to `destroyed` once the underlying
+infrastructure cooperates.
+
+> Registered/external boxes (`management_mode: external`) have no managed
+> droplet to confirm and are out of scope for teardown — use `box unregister`.
 
 ## Cautions
 

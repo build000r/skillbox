@@ -95,6 +95,13 @@ STATES = [
     "onboarding",
     "ready",
     "draining",
+    # Teardown truth states: a droplet that was asked to delete but is still
+    # API-listed lands in `destroy-pending` (NOT destroyed — it may still bill).
+    # A droplet confirmed-absent whose volume cleanup did not finish lands in
+    # `volume-cleanup-failed` (no billing lie; resumable). Both are reported by
+    # box-status / box-list with the exact retry command.
+    "destroy-pending",
+    "volume-cleanup-failed",
     "destroyed",
 ]
 
@@ -108,8 +115,22 @@ VALID_TRANSITIONS = {
     "acceptance": ["ready", "destroyed"],
     "onboarding": ["ready", "destroyed"],
     "ready": ["draining", "destroyed"],
-    "draining": ["destroyed"],
+    # draining can converge to destroyed, or fall into a truthful pending state
+    # when the droplet is still listed (destroy-pending) or the volume cleanup
+    # did not finish after the droplet was confirmed gone (volume-cleanup-failed).
+    "draining": ["destroy-pending", "volume-cleanup-failed", "destroyed"],
+    # destroy-pending re-runs the read-after-delete confirmation; it stays
+    # pending, advances to volume-cleanup-failed, or converges to destroyed.
+    "destroy-pending": ["destroy-pending", "volume-cleanup-failed", "destroyed"],
+    # volume-cleanup-failed re-runs volume cleanup only (droplet already gone).
+    "volume-cleanup-failed": ["volume-cleanup-failed", "destroyed"],
 }
+
+# States from which `box down` (rerun / --resume) must idempotently converge to
+# `destroyed` when the underlying infra cooperates. The droplet is already gone
+# (volume-cleanup-failed) or may still be present (destroy-pending), so a rerun
+# re-confirms truth rather than blindly trusting a prior delete call.
+RESUMABLE_DOWN_STATES = {"destroy-pending", "volume-cleanup-failed"}
 
 DEFAULT_SSH_OPTS = [
     "-o", "StrictHostKeyChecking=accept-new",
@@ -1813,6 +1834,45 @@ def do_delete_droplet(droplet_id: str) -> bool:
     return result.returncode == 0
 
 
+# Bounded read-after-delete confirmation for DigitalOcean eventual consistency.
+# We never spin: a single delete call followed by CONFIRM_DROPLET_ABSENT_ATTEMPTS
+# bounded reads (with backoff), then a truthful pending state if still listed.
+CONFIRM_DROPLET_ABSENT_ATTEMPTS = 3
+CONFIRM_DROPLET_ABSENT_BACKOFF_SECONDS = 2.0
+
+
+def confirm_droplet_absent(
+    droplet_id: str,
+    *,
+    attempts: int = CONFIRM_DROPLET_ABSENT_ATTEMPTS,
+    backoff_seconds: float = CONFIRM_DROPLET_ABSENT_BACKOFF_SECONDS,
+    sleep: Any = time.sleep,
+) -> bool:
+    """Read-after-delete confirmation that a droplet is truly gone.
+
+    Returns True only after `doctl compute droplet get` reports the droplet is
+    absent (404 / empty result -> do_get_droplet returns None). If the droplet is
+    still listed after a bounded number of attempts, returns False so the caller
+    keeps the inventory in a truthful pending state instead of lying `destroyed`.
+    A read error (doctl failure that is not a clean not-found) is treated as
+    *not confirmed* — we never assume absence we did not observe.
+    """
+    if not str(droplet_id or "").strip():
+        # Nothing to confirm; absence is vacuously true.
+        return True
+    last_attempt = max(1, attempts)
+    for attempt in range(1, last_attempt + 1):
+        try:
+            droplet = do_get_droplet(droplet_id)
+        except Exception:
+            droplet = {"_confirm_read_error": True}
+        if droplet is None:
+            return True
+        if attempt < last_attempt:
+            sleep(backoff_seconds * attempt)
+    return False
+
+
 def do_droplet_public_ip(droplet: dict[str, Any]) -> str | None:
     for net in droplet.get("networks", {}).get("v4", []):
         if net.get("type") == "public":
@@ -3370,21 +3430,64 @@ def _cleanup_box_firewall(box: Box, steps: list[dict[str, Any]], *, is_json: boo
     return False
 
 
-def _destroy_box_droplet(box: Box, steps: list[dict[str, Any]], *, is_json: bool) -> bool:
-    if box.droplet_id:
-        try:
-            if not is_json:
-                print(f"[...] destroy  Deleting droplet {box.droplet_id}...")
-            if do_delete_droplet(box.droplet_id):
-                _box_down_step(steps, is_json, "destroy", "ok", f"droplet {box.droplet_id} deleted")
-                return True
-            _box_down_step(steps, is_json, "destroy", "fail", "doctl delete returned non-zero")
-        except Exception as exc:
-            _box_down_step(steps, is_json, "destroy", "fail", str(exc))
-        return False
+DESTROY_CONFIRMED_ABSENT = "confirmed-absent"
+DESTROY_PENDING = "destroy-pending"
+DESTROY_FAILED = "delete-failed"
 
-    _box_down_step(steps, is_json, "destroy", "skip", "no droplet id")
-    return True
+
+def _destroy_box_droplet(box: Box, steps: list[dict[str, Any]], *, is_json: bool) -> str:
+    """Delete the droplet, then CONFIRM absence via read-after-delete.
+
+    Returns one of:
+      - DESTROY_CONFIRMED_ABSENT: doctl delete succeeded AND a follow-up
+        `doctl compute droplet get` reported the droplet gone (404/empty). Only
+        this result lets the caller write the `destroyed` state.
+      - DESTROY_PENDING: delete succeeded but the droplet is still API-listed
+        after a bounded confirm-retry; inventory must stay truthful (the droplet
+        may still bill). Caller parks the box in `destroy-pending`.
+      - DESTROY_FAILED: the delete call itself failed (non-zero / exception);
+        inventory state is preserved for a clean retry.
+
+    The skip-without-droplet branch returns CONFIRMED_ABSENT: there is no droplet
+    to bill, so absence is vacuously confirmed.
+    """
+    if not box.droplet_id:
+        _box_down_step(steps, is_json, "destroy", "skip", "no droplet id")
+        return DESTROY_CONFIRMED_ABSENT
+
+    try:
+        if not is_json:
+            print(f"[...] destroy  Deleting droplet {box.droplet_id}...")
+        deleted = do_delete_droplet(box.droplet_id)
+    except Exception as exc:
+        _box_down_step(steps, is_json, "destroy", "fail", str(exc))
+        return DESTROY_FAILED
+
+    if not deleted:
+        _box_down_step(steps, is_json, "destroy", "fail", "doctl delete returned non-zero")
+        return DESTROY_FAILED
+
+    _box_down_step(steps, is_json, "destroy", "ok", f"droplet {box.droplet_id} delete requested")
+
+    # Read-after-delete: never trust the delete exit code alone. A delete that
+    # succeeds but leaves the droplet listed would otherwise become the most
+    # expensive lie — an inventory that says `destroyed` while DO still bills.
+    if not is_json:
+        print(f"[...] confirm  Verifying droplet {box.droplet_id} is gone...")
+    if confirm_droplet_absent(box.droplet_id):
+        _box_down_step(
+            steps, is_json, "confirm", "ok", f"droplet {box.droplet_id} confirmed absent via API read"
+        )
+        return DESTROY_CONFIRMED_ABSENT
+
+    _box_down_step(
+        steps,
+        is_json,
+        "confirm",
+        "warn",
+        f"droplet {box.droplet_id} delete requested but still API-listed; not marking destroyed",
+    )
+    return DESTROY_PENDING
 
 
 def _cleanup_box_volume(box: Box, steps: list[dict[str, Any]], *, is_json: bool) -> bool:
@@ -3466,6 +3569,39 @@ def _emit_box_down_destroy_failure(box: Box, box_id: str, steps: list[dict[str, 
     return EXIT_ERROR
 
 
+def _emit_box_down_destroy_pending(boxes: list[Box], box: Box, box_id: str, steps: list[dict[str, Any]], *, is_json: bool) -> int:
+    update_box(box, state="destroy-pending")
+    save_inventory(boxes)
+    message = (
+        f"Droplet delete was requested for box {box_id!r}, but DigitalOcean still lists the "
+        f"droplet (read-after-delete not yet confirmed). Inventory stays {box.state!r} so it does "
+        "not falsely report destroyed while the droplet may still bill."
+    )
+    next_actions = [f"box status {box_id}", f"box down {box_id}", "box list"]
+    payload = {
+        "box_id": box_id,
+        "dry_run": False,
+        "steps": steps,
+        "next_actions": next_actions,
+    }
+    payload.update(
+        structured_error(
+            message,
+            error_type="destroy_pending",
+            recovery_hint=(
+                "DigitalOcean delete is eventually consistent. Re-run box down to re-confirm "
+                "absence; if it persists, verify the droplet in the DO console."
+            ),
+            next_actions=next_actions,
+        )
+    )
+    if is_json:
+        emit_json(payload)
+    else:
+        print(message, file=sys.stderr)
+    return EXIT_ERROR
+
+
 def _emit_box_down_volume_failure(boxes: list[Box], box: Box, box_id: str, steps: list[dict[str, Any]], *, is_json: bool) -> int:
     update_box(box, state="volume-cleanup-failed")
     save_inventory(boxes)
@@ -3532,6 +3668,9 @@ def cmd_down(box_id: str, *, dry_run: bool, fmt: str) -> int:
         return _emit_box_down_dry_run(box, box_id, steps, is_json=is_json)
 
     if box.state == "volume-cleanup-failed":
+        # Droplet already confirmed gone on a prior run; only volume cleanup is
+        # outstanding. Rerun is idempotent: re-attempt volume cleanup and
+        # converge to destroyed when the volume can be released.
         _box_down_step(
             steps,
             is_json,
@@ -3539,18 +3678,79 @@ def cmd_down(box_id: str, *, dry_run: bool, fmt: str) -> int:
             "skip",
             "droplet was already destroyed; retrying volume cleanup",
         )
-        if not _cleanup_box_volume(box, steps, is_json=is_json):
-            return _emit_box_down_volume_failure(boxes, box, box_id, steps, is_json=is_json)
-        return _emit_box_down_success(boxes, box, box_id, steps, is_json=is_json)
+        return _finish_box_down_after_droplet_gone(boxes, box, box_id, steps, is_json=is_json)
+
+    if box.state == "destroy-pending":
+        # A prior run requested droplet delete but could not confirm absence.
+        # Skip drain/tailnet/firewall (already attempted) and re-run the
+        # read-after-delete confirmation only. Idempotent: converges once DO
+        # finishes the delete; stays pending while the droplet is still listed.
+        _box_down_step(steps, is_json, "drain", "skip", "droplet delete already requested")
+        _box_down_step(steps, is_json, "remove", "skip", "droplet delete already requested")
+        _box_down_step(steps, is_json, "firewall", "skip", "droplet delete already requested")
+        return _resume_box_down_confirm_destroy(boxes, box, box_id, steps, is_json=is_json)
 
     ssh_target = _drain_box_for_down(box, steps, is_json=is_json)
     update_box(box, state="draining")
     save_inventory(boxes)
     _remove_box_from_tailnet(box, ssh_target, steps, is_json=is_json)
     _cleanup_box_firewall(box, steps, is_json=is_json)
-    if not _destroy_box_droplet(box, steps, is_json=is_json):
+    return _finish_box_down_destroy_phase(boxes, box, box_id, steps, is_json=is_json)
+
+
+def _finish_box_down_destroy_phase(
+    boxes: list[Box], box: Box, box_id: str, steps: list[dict[str, Any]], *, is_json: bool
+) -> int:
+    """Run droplet destroy + read-after-delete confirm, then volume cleanup.
+
+    `destroyed` is only ever written after a confirmed-absent observation:
+      - DESTROY_FAILED: preserve state, structured destroy_failed error.
+      - DESTROY_PENDING: park in destroy-pending (truthful; droplet may bill).
+      - DESTROY_CONFIRMED_ABSENT: safe to proceed to volume cleanup.
+    """
+    destroy_status = _destroy_box_droplet(box, steps, is_json=is_json)
+    if destroy_status == DESTROY_FAILED:
         save_inventory(boxes)
         return _emit_box_down_destroy_failure(box, box_id, steps, is_json=is_json)
+    if destroy_status == DESTROY_PENDING:
+        return _emit_box_down_destroy_pending(boxes, box, box_id, steps, is_json=is_json)
+    return _finish_box_down_after_droplet_gone(boxes, box, box_id, steps, is_json=is_json)
+
+
+def _resume_box_down_confirm_destroy(
+    boxes: list[Box], box: Box, box_id: str, steps: list[dict[str, Any]], *, is_json: bool
+) -> int:
+    """Resume path for destroy-pending: re-confirm absence without re-deleting.
+
+    The droplet delete was already requested; we only need the read-after-delete
+    confirmation to converge. If the droplet is gone we proceed to volume
+    cleanup; otherwise the box stays in destroy-pending.
+    """
+    if not box.droplet_id or confirm_droplet_absent(box.droplet_id):
+        detail = (
+            "no droplet id" if not box.droplet_id
+            else f"droplet {box.droplet_id} confirmed absent via API read"
+        )
+        _box_down_step(steps, is_json, "confirm", "ok", detail)
+        return _finish_box_down_after_droplet_gone(boxes, box, box_id, steps, is_json=is_json)
+    _box_down_step(
+        steps,
+        is_json,
+        "confirm",
+        "warn",
+        f"droplet {box.droplet_id} still API-listed; staying in destroy-pending",
+    )
+    return _emit_box_down_destroy_pending(boxes, box, box_id, steps, is_json=is_json)
+
+
+def _finish_box_down_after_droplet_gone(
+    boxes: list[Box], box: Box, box_id: str, steps: list[dict[str, Any]], *, is_json: bool
+) -> int:
+    """Droplet is confirmed gone — run volume cleanup and finalize.
+
+    Volume cleanup failing here is not a billing lie (the droplet is gone), so we
+    park in volume-cleanup-failed (queryable + resumable) rather than destroyed.
+    """
     if not _cleanup_box_volume(box, steps, is_json=is_json):
         return _emit_box_down_volume_failure(boxes, box, box_id, steps, is_json=is_json)
     return _emit_box_down_success(boxes, box, box_id, steps, is_json=is_json)
@@ -3814,6 +4014,23 @@ def box_health(box: Box) -> dict[str, Any]:
     if box.state in ("destroyed", "creating"):
         return status
 
+    # Teardown-pending states are surfaced truthfully without probing SSH: the
+    # droplet is being torn down (or already gone) so there is nothing to reach.
+    # box-status and box-list both expose the exact retry command.
+    if box.state in ("destroy-pending", "volume-cleanup-failed"):
+        if box.state == "destroy-pending":
+            status["teardown_pending"] = {
+                "reason": "droplet delete requested but not yet confirmed absent via API read",
+                "billing_risk": True,
+            }
+        else:
+            status["teardown_pending"] = {
+                "reason": "droplet confirmed gone but volume cleanup did not complete",
+                "billing_risk": False,
+            }
+        status["next_actions"] = [f"box down {box.id}", f"box status {box.id}", "box list"]
+        return status
+
     ssh_target = resolve_box_ssh_target(box, max_wait=5, interval=1, prefer_public=box.state == "ssh-ready")
     if ssh_target:
         status["ssh_target"] = ssh_target
@@ -3985,15 +4202,40 @@ def cmd_ssh(box_id: str) -> int:
 # box list
 # ---------------------------------------------------------------------------
 
+def _teardown_pending_hint(box: Box) -> dict[str, Any] | None:
+    """Per-box retry hint for teardown-pending boxes, surfaced from box-list."""
+    if box.state == "destroy-pending":
+        return {
+            "box_id": box.id,
+            "state": box.state,
+            "reason": "droplet delete requested but not yet confirmed absent via API read",
+            "billing_risk": True,
+            "next_action": f"box down {box.id}",
+        }
+    if box.state == "volume-cleanup-failed":
+        return {
+            "box_id": box.id,
+            "state": box.state,
+            "reason": "droplet confirmed gone but volume cleanup did not complete",
+            "billing_risk": False,
+            "next_action": f"box down {box.id}",
+        }
+    return None
+
+
 def cmd_list(*, fmt: str) -> int:
     boxes = load_inventory()
     active = [b for b in boxes if b.state != "destroyed"]
+    pending = [hint for hint in (_teardown_pending_hint(b) for b in active) if hint]
 
     if fmt == "json":
-        emit_json({
+        payload: dict[str, Any] = {
             "boxes": [asdict(b) for b in active],
             "next_actions": ["box up <id> --profile <name>", "box register <id> --host <tailscale-hostname>"] if not active else [],
-        })
+        }
+        if pending:
+            payload["teardown_pending"] = pending
+        emit_json(payload)
     else:
         if not active:
             print("No active boxes.")
@@ -4006,6 +4248,8 @@ def cmd_list(*, fmt: str) -> int:
                     f"  {b.id}  state={b.state}  ts={ts}  ip={b.droplet_ip}  "
                     f"profile={b.profile}  mode={b.management_mode}  state_root={root}  volume={volume}"
                 )
+            for hint in pending:
+                print(f"    ! {hint['box_id']} teardown pending ({hint['state']}); retry: {hint['next_action']}")
     return EXIT_OK
 
 

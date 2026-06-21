@@ -591,6 +591,8 @@ class BoxLifecycleTests(unittest.TestCase):
             mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="1.2.3.4"),
             mock.patch.object(BOX_MODULE, "ssh_cmd", return_value=subprocess.CompletedProcess([], 0, "", "")),
             mock.patch.object(BOX_MODULE, "do_delete_droplet", return_value=True),
+            # Read-after-delete confirmation: droplet is gone (404 -> None).
+            mock.patch.object(BOX_MODULE, "do_get_droplet", return_value=None) as do_get_droplet,
             mock.patch.object(BOX_MODULE, "save_inventory"),
             mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
         ):
@@ -598,7 +600,16 @@ class BoxLifecycleTests(unittest.TestCase):
 
         self.assertEqual(result, BOX_MODULE.EXIT_OK)
         self.assertEqual(box.state, "destroyed")
-        self.assertEqual([step["status"] for step in payloads[0]["steps"]], ["ok", "ok", "skip", "ok", "skip"])
+        # destroy step now followed by an API-confirmed `confirm` step before volume.
+        self.assertEqual(
+            [step["step"] for step in payloads[0]["steps"]],
+            ["drain", "remove", "firewall", "destroy", "confirm", "volume"],
+        )
+        self.assertEqual(
+            [step["status"] for step in payloads[0]["steps"]],
+            ["ok", "ok", "skip", "ok", "ok", "skip"],
+        )
+        do_get_droplet.assert_called_once_with("123")
 
     def test_box_health_reports_reachable_container(self) -> None:
         box = BOX_MODULE.Box(
@@ -663,6 +674,381 @@ class BoxLifecycleTests(unittest.TestCase):
             BOX_MODULE.print_box_status_text(status)
 
         self.assertIn("\nOpen this on phone: http://100.64.0.8:3210/\n", stdout.getvalue())
+
+
+def _completed(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+
+def _ready_box() -> "BOX_MODULE.Box":
+    return BOX_MODULE.Box(
+        id="teardown",
+        profile="dev-small",
+        state="ready",
+        droplet_id="77",
+        droplet_ip="1.2.3.4",
+        tailscale_hostname="skillbox-teardown",
+        ssh_user="skillbox",
+        volume_id="vol-1",
+        volume_name="skillbox-state-teardown",
+    )
+
+
+class BoxDownTeardownTruthTests(unittest.TestCase):
+    """S5: a fleet inventory must never report `destroyed` for a droplet that is
+    still API-listed (a billing lie). These tests pin the read-after-delete
+    confirmation, the truthful pending states, idempotent reruns, and the
+    mock-call-ordering guarantee that no path writes `destroyed` before a
+    confirmed-absent observation.
+    """
+
+    # --- the four mocked acceptance scenarios -----------------------------
+
+    def test_state_machine_includes_teardown_truth_states(self) -> None:
+        self.assertIn("destroy-pending", BOX_MODULE.STATES)
+        self.assertIn("volume-cleanup-failed", BOX_MODULE.STATES)
+        # draining can fall into either pending state, or converge to destroyed.
+        self.assertIn("destroy-pending", BOX_MODULE.VALID_TRANSITIONS["draining"])
+        self.assertIn("volume-cleanup-failed", BOX_MODULE.VALID_TRANSITIONS["draining"])
+        self.assertIn("destroyed", BOX_MODULE.VALID_TRANSITIONS["draining"])
+        # pending states must be able to converge to destroyed (resumable).
+        self.assertIn("destroyed", BOX_MODULE.VALID_TRANSITIONS["destroy-pending"])
+        self.assertIn("destroyed", BOX_MODULE.VALID_TRANSITIONS["volume-cleanup-failed"])
+        self.assertEqual(
+            BOX_MODULE.RESUMABLE_DOWN_STATES,
+            {"destroy-pending", "volume-cleanup-failed"},
+        )
+
+    def test_delete_ok_but_still_listed_parks_in_destroy_pending(self) -> None:
+        """Scenario 1: delete succeeds but the droplet is still API-listed.
+
+        Inventory MUST NOT become destroyed; it parks in destroy-pending with an
+        actionable retry, because the droplet may still bill.
+        """
+        box = _ready_box()
+        payloads: list[dict[str, object]] = []
+        with (
+            mock.patch.object(BOX_MODULE, "load_inventory", return_value=[box]),
+            mock.patch.object(BOX_MODULE, "optional_env", return_value=""),
+            mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="1.2.3.4"),
+            mock.patch.object(BOX_MODULE, "ssh_cmd", return_value=_completed()),
+            mock.patch.object(BOX_MODULE, "do_delete_droplet", return_value=True),
+            # Read-after-delete keeps returning the droplet -> still listed.
+            mock.patch.object(BOX_MODULE, "do_get_droplet", return_value={"id": "77"}),
+            mock.patch.object(BOX_MODULE, "time") as fake_time,
+            mock.patch.object(BOX_MODULE, "do_get_volume") as do_get_volume,
+            mock.patch.object(BOX_MODULE, "do_delete_volume") as do_delete_volume,
+            mock.patch.object(BOX_MODULE, "save_inventory"),
+            mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
+        ):
+            fake_time.sleep = mock.Mock()  # bounded retry must not actually sleep
+            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json")
+
+        self.assertEqual(result, BOX_MODULE.EXIT_ERROR)
+        self.assertEqual(box.state, "destroy-pending")
+        # Volume cleanup must NOT run while the droplet is unconfirmed.
+        do_get_volume.assert_not_called()
+        do_delete_volume.assert_not_called()
+        payload = payloads[-1]
+        self.assertEqual(payload["error"]["type"], "destroy_pending")
+        self.assertEqual(payload["steps"][-1]["step"], "confirm")
+        self.assertEqual(payload["steps"][-1]["status"], "warn")
+        self.assertIn(f"box down teardown", payload["next_actions"])
+
+    def test_404_confirmed_absent_marks_destroyed(self) -> None:
+        """Scenario 2: read-after-delete returns 404 (None) -> confirmed absent
+        -> safe to mark destroyed."""
+        box = _ready_box()
+        box.volume_id = None  # isolate the destroy/confirm path
+        box.volume_name = None
+        payloads: list[dict[str, object]] = []
+        with (
+            mock.patch.object(BOX_MODULE, "load_inventory", return_value=[box]),
+            mock.patch.object(BOX_MODULE, "optional_env", return_value=""),
+            mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="1.2.3.4"),
+            mock.patch.object(BOX_MODULE, "ssh_cmd", return_value=_completed()),
+            mock.patch.object(BOX_MODULE, "do_delete_droplet", return_value=True),
+            mock.patch.object(BOX_MODULE, "do_get_droplet", return_value=None) as do_get_droplet,
+            mock.patch.object(BOX_MODULE, "save_inventory"),
+            mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
+        ):
+            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json")
+
+        self.assertEqual(result, BOX_MODULE.EXIT_OK)
+        self.assertEqual(box.state, "destroyed")
+        do_get_droplet.assert_called_once_with("77")
+        steps = payloads[-1]["steps"]
+        confirm = next(s for s in steps if s["step"] == "confirm")
+        self.assertEqual(confirm["status"], "ok")
+
+    def test_volume_cleanup_fails_after_droplet_confirmed_gone(self) -> None:
+        """Scenario 3: droplet confirmed gone, but volume cleanup fails -> a
+        distinct, queryable, resumable volume-cleanup-failed state (no billing
+        lie)."""
+        box = _ready_box()
+        payloads: list[dict[str, object]] = []
+        with (
+            mock.patch.object(BOX_MODULE, "load_inventory", return_value=[box]),
+            mock.patch.object(BOX_MODULE, "optional_env", return_value=""),
+            mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="1.2.3.4"),
+            mock.patch.object(BOX_MODULE, "ssh_cmd", return_value=_completed()),
+            mock.patch.object(BOX_MODULE, "do_delete_droplet", return_value=True),
+            mock.patch.object(BOX_MODULE, "do_get_droplet", return_value=None),
+            # Volume still attached to a foreign droplet -> cleanup refuses.
+            mock.patch.object(BOX_MODULE, "do_get_volume", return_value={"id": "vol-1", "droplet_ids": ["999"]}),
+            mock.patch.object(BOX_MODULE, "do_detach_volume") as do_detach_volume,
+            mock.patch.object(BOX_MODULE, "do_delete_volume") as do_delete_volume,
+            mock.patch.object(BOX_MODULE, "save_inventory"),
+            mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
+        ):
+            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json")
+
+        self.assertEqual(result, BOX_MODULE.EXIT_ERROR)
+        self.assertEqual(box.state, "volume-cleanup-failed")
+        do_detach_volume.assert_not_called()
+        do_delete_volume.assert_not_called()
+        payload = payloads[-1]
+        self.assertEqual(payload["error"]["type"], "volume_cleanup_failed")
+        self.assertIn(f"box down teardown", payload["next_actions"])
+
+    def test_tailscale_removal_failure_never_blocks_destroy_but_is_reported(self) -> None:
+        """Scenario 4: tailnet removal fails -> reported in steps but never
+        blocks droplet destruction; the box still converges to destroyed."""
+        box = _ready_box()
+        box.volume_id = None
+        box.volume_name = None
+        payloads: list[dict[str, object]] = []
+        with (
+            mock.patch.object(BOX_MODULE, "load_inventory", return_value=[box]),
+            mock.patch.object(BOX_MODULE, "optional_env", return_value=""),
+            mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="1.2.3.4"),
+            # First ssh_cmd is the drain; the tailscale logout raises.
+            mock.patch.object(
+                BOX_MODULE,
+                "ssh_cmd",
+                side_effect=[_completed(), RuntimeError("tailscale logout failed")],
+            ),
+            mock.patch.object(BOX_MODULE, "do_delete_droplet", return_value=True),
+            mock.patch.object(BOX_MODULE, "do_get_droplet", return_value=None),
+            mock.patch.object(BOX_MODULE, "save_inventory"),
+            mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
+        ):
+            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json")
+
+        self.assertEqual(result, BOX_MODULE.EXIT_OK)
+        self.assertEqual(box.state, "destroyed")
+        steps = payloads[-1]["steps"]
+        remove = next(s for s in steps if s["step"] == "remove")
+        self.assertEqual(remove["status"], "warn")  # reported, not fatal
+        destroy = next(s for s in steps if s["step"] == "destroy")
+        self.assertEqual(destroy["status"], "ok")
+
+    # --- idempotent reruns from each intermediate state -------------------
+
+    def test_rerun_from_destroy_pending_converges_to_destroyed(self) -> None:
+        """Idempotency: a destroy-pending box reruns down, re-confirms absence
+        (now gone), and converges to destroyed WITHOUT re-deleting."""
+        box = BOX_MODULE.Box(
+            id="teardown",
+            profile="dev-small",
+            state="destroy-pending",
+            droplet_id="77",
+            volume_id=None,
+        )
+        payloads: list[dict[str, object]] = []
+        with (
+            mock.patch.object(BOX_MODULE, "load_inventory", return_value=[box]),
+            mock.patch.object(BOX_MODULE, "optional_env", return_value=""),
+            mock.patch.object(BOX_MODULE, "resolve_box_ssh_target") as resolve_ssh,
+            mock.patch.object(BOX_MODULE, "ssh_cmd") as ssh_cmd,
+            mock.patch.object(BOX_MODULE, "do_delete_droplet") as do_delete_droplet,
+            mock.patch.object(BOX_MODULE, "do_get_droplet", return_value=None),
+            mock.patch.object(BOX_MODULE, "save_inventory"),
+            mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
+        ):
+            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json")
+
+        self.assertEqual(result, BOX_MODULE.EXIT_OK)
+        self.assertEqual(box.state, "destroyed")
+        # No re-drain, no re-delete; only the read-after-delete confirm runs.
+        resolve_ssh.assert_not_called()
+        ssh_cmd.assert_not_called()
+        do_delete_droplet.assert_not_called()
+        steps = payloads[-1]["steps"]
+        self.assertEqual([s["step"] for s in steps], ["drain", "remove", "firewall", "confirm", "volume"])
+
+    def test_rerun_from_destroy_pending_still_listed_stays_pending(self) -> None:
+        """Idempotency without convergence: still-listed droplet keeps the box
+        in destroy-pending (never spins, never lies)."""
+        box = BOX_MODULE.Box(
+            id="teardown",
+            profile="dev-small",
+            state="destroy-pending",
+            droplet_id="77",
+        )
+        payloads: list[dict[str, object]] = []
+        with (
+            mock.patch.object(BOX_MODULE, "load_inventory", return_value=[box]),
+            mock.patch.object(BOX_MODULE, "optional_env", return_value=""),
+            mock.patch.object(BOX_MODULE, "do_delete_droplet") as do_delete_droplet,
+            mock.patch.object(BOX_MODULE, "do_get_droplet", return_value={"id": "77"}),
+            mock.patch.object(BOX_MODULE, "time") as fake_time,
+            mock.patch.object(BOX_MODULE, "save_inventory"),
+            mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
+        ):
+            fake_time.sleep = mock.Mock()
+            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json")
+
+        self.assertEqual(result, BOX_MODULE.EXIT_ERROR)
+        self.assertEqual(box.state, "destroy-pending")
+        do_delete_droplet.assert_not_called()
+        self.assertEqual(payloads[-1]["error"]["type"], "destroy_pending")
+
+    def test_rerun_from_volume_cleanup_failed_converges_to_destroyed(self) -> None:
+        """Idempotency: volume-cleanup-failed box reruns down, cleans the volume,
+        and converges to destroyed without re-deleting the droplet."""
+        box = BOX_MODULE.Box(
+            id="teardown",
+            profile="dev-small",
+            state="volume-cleanup-failed",
+            droplet_id="77",
+            volume_id="vol-1",
+            volume_name="skillbox-state-teardown",
+        )
+        payloads: list[dict[str, object]] = []
+        with (
+            mock.patch.object(BOX_MODULE, "load_inventory", return_value=[box]),
+            mock.patch.object(BOX_MODULE, "optional_env", return_value=""),
+            mock.patch.object(BOX_MODULE, "do_delete_droplet") as do_delete_droplet,
+            mock.patch.object(BOX_MODULE, "do_get_droplet") as do_get_droplet,
+            mock.patch.object(BOX_MODULE, "do_get_volume", return_value={"id": "vol-1", "droplet_ids": []}),
+            mock.patch.object(BOX_MODULE, "do_delete_volume", return_value=True),
+            mock.patch.object(BOX_MODULE, "save_inventory"),
+            mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
+        ):
+            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json")
+
+        self.assertEqual(result, BOX_MODULE.EXIT_OK)
+        self.assertEqual(box.state, "destroyed")
+        do_delete_droplet.assert_not_called()
+        do_get_droplet.assert_not_called()  # droplet already confirmed gone earlier
+        self.assertEqual([s["step"] for s in payloads[-1]["steps"]], ["destroy", "volume"])
+
+    # --- the load-bearing call-ordering invariant -------------------------
+
+    def test_destroyed_is_never_written_before_confirmed_absent_read(self) -> None:
+        """ASSERT VIA MOCK CALL ORDERING: the read-after-delete confirm
+        (do_get_droplet) must be observed BEFORE the `destroyed` state write.
+        This is the core S5 invariant — no `destroyed` without confirmed absence.
+        """
+        box = _ready_box()
+        box.volume_id = None
+        box.volume_name = None
+        order: list[str] = []
+
+        def record_get(_droplet_id: str):
+            order.append("confirm_read")
+            return None  # confirmed absent
+
+        original_update_box = BOX_MODULE.update_box
+
+        def record_update(target, **kwargs):
+            if kwargs.get("state") == "destroyed":
+                order.append("write_destroyed")
+            return original_update_box(target, **kwargs)
+
+        with (
+            mock.patch.object(BOX_MODULE, "load_inventory", return_value=[box]),
+            mock.patch.object(BOX_MODULE, "optional_env", return_value=""),
+            mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="1.2.3.4"),
+            mock.patch.object(BOX_MODULE, "ssh_cmd", return_value=_completed()),
+            mock.patch.object(BOX_MODULE, "do_delete_droplet", return_value=True),
+            mock.patch.object(BOX_MODULE, "do_get_droplet", side_effect=record_get),
+            mock.patch.object(BOX_MODULE, "update_box", side_effect=record_update),
+            mock.patch.object(BOX_MODULE, "save_inventory"),
+            mock.patch.object(BOX_MODULE, "emit_json"),
+        ):
+            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json")
+
+        self.assertEqual(result, BOX_MODULE.EXIT_OK)
+        self.assertIn("confirm_read", order)
+        self.assertIn("write_destroyed", order)
+        self.assertLess(
+            order.index("confirm_read"),
+            order.index("write_destroyed"),
+            "destroyed must never be written before a confirmed-absent read",
+        )
+
+    def test_confirm_droplet_absent_is_bounded_and_never_spins(self) -> None:
+        """The confirm-retry is bounded (no infinite spin) and backs off."""
+        sleeps: list[float] = []
+        get_calls: list[str] = []
+
+        def get(_droplet_id: str):
+            get_calls.append(_droplet_id)
+            return {"id": "77"}  # never goes away
+
+        with mock.patch.object(BOX_MODULE, "do_get_droplet", side_effect=get):
+            result = BOX_MODULE.confirm_droplet_absent(
+                "77",
+                attempts=3,
+                backoff_seconds=1.0,
+                sleep=sleeps.append,
+            )
+
+        self.assertFalse(result)
+        # Exactly `attempts` reads, and one fewer sleep than reads (bounded).
+        self.assertEqual(len(get_calls), 3)
+        self.assertEqual(sleeps, [1.0, 2.0])  # linear backoff, then stop
+
+    def test_confirm_droplet_absent_read_error_is_not_treated_as_absent(self) -> None:
+        """A doctl read error must NOT be mistaken for confirmed absence."""
+        with mock.patch.object(BOX_MODULE, "do_get_droplet", side_effect=RuntimeError("doctl boom")):
+            result = BOX_MODULE.confirm_droplet_absent("77", attempts=2, backoff_seconds=0.0, sleep=lambda _s: None)
+        self.assertFalse(result)
+
+
+class BoxTeardownPendingVisibilityTests(unittest.TestCase):
+    """Failure states must surface in box-status AND box-list, not just in the
+    failing `down` command's output."""
+
+    def test_box_health_surfaces_destroy_pending_with_retry_command(self) -> None:
+        box = BOX_MODULE.Box(id="teardown", profile="dev-small", state="destroy-pending", droplet_id="77")
+        with mock.patch.object(BOX_MODULE, "resolve_box_ssh_target") as resolve_ssh:
+            status = BOX_MODULE.box_health(box)
+        # Must not even probe SSH on a torn-down box.
+        resolve_ssh.assert_not_called()
+        self.assertEqual(status["state"], "destroy-pending")
+        self.assertTrue(status["teardown_pending"]["billing_risk"])
+        self.assertIn("box down teardown", status["next_actions"])
+
+    def test_box_health_surfaces_volume_cleanup_failed_without_billing_risk(self) -> None:
+        box = BOX_MODULE.Box(id="teardown", profile="dev-small", state="volume-cleanup-failed", droplet_id="77")
+        status = BOX_MODULE.box_health(box)
+        self.assertEqual(status["state"], "volume-cleanup-failed")
+        self.assertFalse(status["teardown_pending"]["billing_risk"])
+        self.assertIn("box down teardown", status["next_actions"])
+
+    def test_box_list_surfaces_teardown_pending_hint(self) -> None:
+        boxes = [
+            BOX_MODULE.Box(id="pending", profile="dev-small", state="destroy-pending", droplet_id="77"),
+            BOX_MODULE.Box(id="volpend", profile="dev-small", state="volume-cleanup-failed", droplet_id="88"),
+            BOX_MODULE.Box(id="healthy", profile="dev-small", state="ready", droplet_id="99"),
+        ]
+        payloads: list[dict[str, object]] = []
+        with (
+            mock.patch.object(BOX_MODULE, "load_inventory", return_value=boxes),
+            mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
+        ):
+            result = BOX_MODULE.cmd_list(fmt="json")
+
+        self.assertEqual(result, BOX_MODULE.EXIT_OK)
+        pending = payloads[-1]["teardown_pending"]
+        by_id = {entry["box_id"]: entry for entry in pending}
+        self.assertEqual(set(by_id), {"pending", "volpend"})
+        self.assertTrue(by_id["pending"]["billing_risk"])
+        self.assertFalse(by_id["volpend"]["billing_risk"])
+        self.assertEqual(by_id["pending"]["next_action"], "box down pending")
 
 
 if __name__ == "__main__":
