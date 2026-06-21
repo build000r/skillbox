@@ -3303,8 +3303,13 @@ def _focus_persist_step(
     if ctx_yaml_path.is_file():
         focus_data["skill_context_path"] = str(ctx_runtime_path)
     try:
-        atomic_write_text(focus_path, json.dumps(focus_data, indent=2) + "\n")
+        # Serialize focus writes against each other and against the pulse-write
+        # window via the shared lock + atomic-rename helper. focus is a full
+        # snapshot (not read-modify-write), so the mutate fn ignores current.
+        locked_json_update(focus_path, lambda _current: focus_data)
         _focus_step(steps, is_json, "persist", "ok")
+    except StateLockTimeout as exc:
+        _focus_step(steps, is_json, "persist", "fail", {"error": str(exc)})
     except OSError as exc:
         _focus_step(steps, is_json, "persist", "fail", {"error": str(exc)})
 

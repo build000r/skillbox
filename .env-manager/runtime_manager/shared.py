@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -2617,6 +2618,214 @@ def write_text_file(path: Path, content: str, dry_run: bool) -> None:
     if dry_run:
         return
     atomic_write_text(path, content)
+
+
+# ---------------------------------------------------------------------------
+# Locked, atomic JSON state writes (focus / pulse shared mutable files)
+# ---------------------------------------------------------------------------
+#
+# Shared mutable JSON state files (workspace/.focus.json, pulse.state.json)
+# have multiple independent readers and writers across the tree with zero
+# fcntl/flock anywhere. That admits two race classes:
+#   * torn reads — a reader observes a half-written file mid-overwrite;
+#   * lost updates — two read-modify-write cycles interleave and clobber.
+#
+# The fix is BORING by design: an advisory flock on a sidecar ``<path>.lock``
+# serializes read-modify-write cycles, and a temp-write -> fsync -> os.replace
+# atomic rename makes the published file flip from old to new in one inode
+# swap. Atomic rename does the heavy lifting; the lock only guards the
+# read-modify-write window. No PID lockfiles, no stale-lock heuristics beyond
+# flock's own process-death semantics.
+
+DEFAULT_STATE_LOCK_TIMEOUT_SECONDS = 5.0
+_STATE_LOCK_POLL_INTERVAL_SECONDS = 0.02
+_STATE_LOCK_WAIT_WARN_SECONDS = 0.1
+_flock_unsupported_warned = False
+
+
+class StateLockTimeout(RuntimeError):
+    """Raised when a state lock cannot be acquired within the timeout.
+
+    Carries the lock path and the lock file's age (seconds since its mtime) so
+    callers can surface *which* lock is stuck and roughly how long it has been
+    held without ever blocking forever.
+    """
+
+    def __init__(self, lock_path: Path, age_seconds: float | None) -> None:
+        self.lock_path = Path(lock_path)
+        self.age_seconds = age_seconds
+        age_text = "unknown" if age_seconds is None else f"{age_seconds:.3f}s"
+        super().__init__(
+            f"Timed out acquiring state lock {self.lock_path} (held for {age_text})."
+        )
+
+
+def _state_lock_age_seconds(lock_path: Path) -> float | None:
+    try:
+        return max(0.0, time.time() - lock_path.stat().st_mtime)
+    except OSError:
+        return None
+
+
+def _warn_flock_unsupported(lock_path: Path, exc: OSError) -> None:
+    """Emit a one-time stderr warning that flock is unavailable here."""
+    global _flock_unsupported_warned
+    if _flock_unsupported_warned:
+        return
+    _flock_unsupported_warned = True
+    print(
+        f"[state-fs] advisory flock unsupported on {lock_path} ({exc}); "
+        "falling back to atomic-rename-only writes (no read-modify-write "
+        "serialization).",
+        file=sys.stderr,
+    )
+
+
+def read_json_tolerant(path: Path, default: Any = None) -> Any:
+    """Read+parse a JSON file, tolerating a single torn-read.
+
+    On ``JSONDecodeError`` (which can happen on NFS-ish filesystems where a
+    rename is briefly observed mid-flight) we retry the read ONCE before
+    giving up and returning ``default``. Missing files return ``default``
+    immediately.
+
+    INVARIANT: pure reads need NO lock. Because every writer publishes via an
+    atomic ``os.replace`` rename, a reader either sees the whole old file or
+    the whole new file — never a partial one. Do NOT add ritual read-locks
+    around callers of this function; that only reintroduces contention without
+    buying any consistency.
+    """
+    path = Path(path)
+    for attempt in range(2):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return default
+        except json.JSONDecodeError:
+            if attempt == 0:
+                continue
+            return default
+        except OSError:
+            return default
+    return default
+
+
+def _atomic_write_json_serialized(path: Path, serialized: str) -> None:
+    """Temp-write + flush + fsync + atomic rename of pre-serialized JSON."""
+    path = Path(path)
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def atomic_write_json(path: Path, data: Any, *, indent: int = 2) -> None:
+    """Crash-safe overwrite of a JSON file (no lock).
+
+    For plain overwrites (full-snapshot writers, not read-modify-write) this is
+    sufficient on its own: a mid-write crash leaves the previous file intact,
+    and readers using ``read_json_tolerant`` never see a partial file. When a
+    writer must read-then-modify shared state, use ``locked_json_update``.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(data, indent=indent, default=str) + "\n"
+    _atomic_write_json_serialized(path, serialized)
+
+
+def locked_json_update(
+    path: Path,
+    mutate_fn: Callable[[Any], Any],
+    *,
+    timeout: float = DEFAULT_STATE_LOCK_TIMEOUT_SECONDS,
+    indent: int = 2,
+) -> Any:
+    """Serialize + atomize a read-modify-write cycle on a JSON state file.
+
+    Acquires an advisory ``fcntl.flock`` on a sidecar ``<path>.lock`` (created
+    if absent) using a bounded ``LOCK_NB`` retry loop — NEVER a blocking flock,
+    so contention always times out rather than deadlocking. Then reads the
+    current JSON tolerantly, calls ``mutate_fn(current)`` to produce the new
+    value, writes it to a temp file in the SAME directory, ``flush``es +
+    ``os.fsync``s, and ``os.replace``s it into place (atomic rename). The lock
+    is always released in a ``finally``.
+
+    Returns whatever ``mutate_fn`` returned (the persisted value).
+
+    Raises ``StateLockTimeout`` (carrying the lock path + age) if the lock is
+    not acquired within ``timeout`` seconds.
+
+    Degrades gracefully where flock is unsupported: if ``fcntl.flock`` raises an
+    ``OSError`` (e.g. on a filesystem without lock support), it falls back to
+    an atomic-rename-only write with a one-time stderr warning — the write
+    still succeeds, it just loses read-modify-write serialization.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+
+    def _commit() -> Any:
+        current = read_json_tolerant(path, default=None)
+        new_value = mutate_fn(current)
+        serialized = json.dumps(new_value, indent=indent, default=str) + "\n"
+        _atomic_write_json_serialized(path, serialized)
+        return new_value
+
+    lock_fd: int | None = None
+    try:
+        try:
+            lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+        except OSError:
+            # Could not even create the sidecar lock (read-only dir, etc.).
+            # Atomic rename still protects readers; proceed without the lock.
+            _warn_flock_unsupported(lock_path, OSError("cannot open lock file"))
+            return _commit()
+
+        deadline = time.monotonic() + max(0.0, timeout)
+        wait_started = time.monotonic()
+        acquired = False
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise StateLockTimeout(lock_path, _state_lock_age_seconds(lock_path))
+                time.sleep(_STATE_LOCK_POLL_INTERVAL_SECONDS)
+            except OSError as exc:
+                # flock unsupported on this filesystem — degrade gracefully.
+                _warn_flock_unsupported(lock_path, exc)
+                return _commit()
+
+        waited = time.monotonic() - wait_started
+        if acquired and waited > _STATE_LOCK_WAIT_WARN_SECONDS:
+            print(
+                f"[state-fs] waited {waited * 1000:.0f}ms for state lock {lock_path}.",
+                file=sys.stderr,
+            )
+        return _commit()
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(lock_fd)
 
 
 def normalize_host_rel_path(root_dir: Path, path: Path) -> str:

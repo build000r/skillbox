@@ -44,9 +44,11 @@ from lib.runtime_model import (  # noqa: E402
 from manage import (  # noqa: E402
     DEFAULT_SERVICE_START_WAIT_SECONDS,
     DEFAULT_SERVICE_STOP_WAIT_SECONDS,
+    StateLockTimeout,
     log_runtime_event,
     ensure_directory,
     filter_model,
+    locked_json_update,
     normalize_active_clients,
     normalize_active_profiles,
     process_is_running,
@@ -859,13 +861,13 @@ def _write_pulse_state(
         "unhealthy_grace_seconds": unhealthy_grace_seconds,
     } | state.to_dict(now=now)
     try:
-        tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
-        tmp_path.write_text(
-            json.dumps(snapshot, indent=2, default=str) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(tmp_path, state_path)
-    except OSError:
+        # Serialize the pulse snapshot against focus writers and publish it via
+        # an atomic fsync+rename so concurrent readers never observe a torn
+        # file. pulse state is a full snapshot, so the mutate fn ignores the
+        # current value. Best-effort: a stuck lock or write error must not crash
+        # the daemon cycle (StateLockTimeout subclasses RuntimeError).
+        locked_json_update(state_path, lambda _current: snapshot)
+    except (StateLockTimeout, OSError):
         pass
 
 
