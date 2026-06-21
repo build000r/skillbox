@@ -215,11 +215,17 @@ KNOWN_PERSISTENCE_CODES = frozenset({
 
 KNOWN_INTERNAL_CODES = frozenset({"INTERNAL"})
 
+# Runtime-id slug grammar gate (skillbox-typed-contracts-epic-ugcx.4). Raised by
+# the leaf runtime_model layer and promoted to ValidationError at the cli
+# boundary; classify_error maps it by code (not by message pattern).
+KNOWN_RUNTIME_ID_CODES = frozenset({"RUNTIME_ID_INVALID"})
+
 KNOWN_ERROR_CODES = (
     KNOWN_CLASSIFY_CODES
     | KNOWN_LOCAL_RUNTIME_CODES
     | KNOWN_PERSISTENCE_CODES
     | KNOWN_INTERNAL_CODES
+    | KNOWN_RUNTIME_ID_CODES
 )
 
 
@@ -257,10 +263,18 @@ class KnownCodesSnapshotTests(unittest.TestCase):
         self.assertEqual(ERR.INTERNAL_ERROR_CODE, "INTERNAL")
         self.assertIn("INTERNAL", KNOWN_ERROR_CODES)
 
+    def test_runtime_id_code_matches_runtime_model_constant(self) -> None:
+        from lib import runtime_model
+
+        self.assertEqual(
+            {runtime_model.RUNTIME_ID_INVALID},
+            set(KNOWN_RUNTIME_ID_CODES),
+        )
+
     def test_full_known_codes_snapshot_is_frozen(self) -> None:
         # The single enumeration the acceptance criterion references. Adding or
         # renaming a code requires editing this snapshot ON PURPOSE.
-        self.assertEqual(len(KNOWN_ERROR_CODES), 32)
+        self.assertEqual(len(KNOWN_ERROR_CODES), 33)
 
 
 if __name__ == "__main__":

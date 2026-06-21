@@ -4903,6 +4903,21 @@ def _emit_main_exception(args: argparse.Namespace, exc: Exception) -> int:
     is_json = getattr(args, "format", "text") == "json"
     verbose = bool(getattr(args, "verbose", False))
 
+    # Runtime-id grammar violations are raised by the leaf runtime_model layer
+    # as a plain RuntimeIdValidationError (it must not import the typed-error
+    # hierarchy — runtime_manager imports runtime_model, not the reverse). Here,
+    # at the runtime_manager boundary, we PROMOTE it to a typed ValidationError
+    # so the surfaced envelope carries code RUNTIME_ID_INVALID + the structured
+    # provenance (id/kind/source_file) + the rename playbook.
+    if isinstance(exc, RuntimeIdValidationError):
+        exc = ValidationError(
+            exc.code,
+            str(exc),
+            context=exc.context,
+            next_actions=exc.next_actions,
+            recoverable=True,
+        )
+
     # Typed errors carry their stable code + structured context. We still run
     # the message-pattern table (classify_error) so the recovery_hint and
     # next_actions affordances are preserved, then let the typed code/context be

@@ -265,6 +265,157 @@ class PersistenceContractError(RuntimeError):
         self.code = code
 
 
+# ---------------------------------------------------------------------------
+# Canonical runtime-ID grammar (security: path-join footgun)
+# ---------------------------------------------------------------------------
+#
+# Every service/task/client/profile/repo/artifact/skill/check id is joined into
+# a filesystem path at some point (``logs/<service-id>/``,
+# ``.skillbox-state/<client>/``, pid/lock names, overlay dirs, install targets).
+# An id like ``a/b`` reshapes that directory tree and ``../x`` escapes the
+# intended root. Operator-authored YAML is trusted-ish, but agents author
+# overlays (client-init / blueprints) too, so a malformed slug is a real
+# footgun that must be REJECTED LOUDLY at model load — never sanitized
+# (silently rewriting an id desyncs the model, the brain graph, and the
+# on-disk layout from each other).
+#
+# CANONICAL GRAMMAR (the single source of truth — also documented in
+# docs/runtime-id-grammar.md and referenced by scripts/box.py's
+# _validate_box_id):
+#
+#     ^[a-z0-9][a-z0-9_-]{0,63}$
+#
+#   * lowercase ascii letters + digits, plus ``_`` and ``-`` after the first
+#     character; must start with an alphanumeric; 1..64 chars total.
+#   * NO ``/`` or ``\`` (path separators), NO ``.`` (so ``..`` can never
+#     appear), NO leading ``-`` (so an id can never look like a CLI flag),
+#     NO uppercase, NO whitespace, NO empty string.
+#
+# AUDIT (skillbox-typed-contracts-epic-ugcx.4): every in-tree id of every
+# enforced kind (service/task/client/profile/repo/artifact/skill/check) in
+# workspace/runtime.yaml + all client overlays was enumerated and matches this
+# pattern with zero violations; the longest real id is 40 chars (a check id)
+# and the ``sweet-potato__nextra_documentation_site`` client (39 chars, double
+# underscores) confirms ``_`` is legitimately in use, so the class allows it.
+# box.py historically allowed ``.`` and uppercase for box ids; those are box
+# ids (a separate surface) and intentionally NOT widened into here — no runtime
+# id uses either. See _validate_box_id for the aligned (box-side) grammar.
+RUNTIME_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+RUNTIME_ID_PATTERN_TEXT = "^[a-z0-9][a-z0-9_-]{0,63}$"
+
+# Stable error code surfaced to operators/agents when an id violates the
+# grammar. Lives here (the leaf) so runtime_model never has to import the
+# runtime_manager typed-error hierarchy (wrong-direction: runtime_manager
+# imports runtime_model, not the reverse). validation.py re-exports this and
+# the cli layer wraps RuntimeIdValidationError into the typed
+# ValidationError(RUNTIME_ID_INVALID, ...) envelope so the surfaced error
+# carries the code + structured provenance + the rename playbook.
+RUNTIME_ID_INVALID = "RUNTIME_ID_INVALID"
+
+# Kinds enforced at model load, mapped to the model section they live in.
+RUNTIME_ID_KIND_SECTIONS: tuple[tuple[str, str], ...] = (
+    ("service", "services"),
+    ("task", "tasks"),
+    ("client", "clients"),
+    ("repo", "repos"),
+    ("artifact", "artifacts"),
+    ("skill", "skills"),
+    ("check", "checks"),
+)
+
+
+class RuntimeIdValidationError(RuntimeError):
+    """Raised when a runtime id violates the canonical slug grammar.
+
+    A plain ``RuntimeError`` subclass (mirroring ``LocalRuntimeContractError`` /
+    ``PersistenceContractError``) so this leaf module never imports the
+    runtime_manager typed-error hierarchy. Carries the stable
+    ``RUNTIME_ID_INVALID`` code plus structured ``context`` (id/kind/
+    source_file) and a ``next_actions`` rename playbook; the cli layer promotes
+    it to a typed ``ValidationError`` so the surfaced envelope keeps the code +
+    provenance.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        context: dict[str, Any] | None = None,
+        next_actions: list[str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = RUNTIME_ID_INVALID
+        self.context = dict(context or {})
+        self.next_actions = list(next_actions or [])
+
+
+def _runtime_id_rename_playbook(kind: str, raw_id: str) -> list[str]:
+    """Concrete files to update *together* when renaming an id.
+
+    Renaming an id is a multi-file edit: the manifest/overlay declaration, the
+    generated compose override, the dev/prod parity ledger, and the focus
+    state all key off the same id, so a partial rename desyncs them. This is
+    the recovery playbook surfaced in ``next_actions``.
+    """
+    return [
+        f"Choose a slug matching {RUNTIME_ID_PATTERN_TEXT} for this {kind} id",
+        "Rename it in workspace/runtime.yaml (or the client overlay.yaml that declares it)",
+        "Update any matching workspace/.compose-overrides/docker-compose.client-*.yml entry",
+        "Update the dev/prod parity ledger and workspace/.focus.json references",
+        "Re-run: python3 .env-manager/manage.py render --format json",
+    ]
+
+
+def validate_runtime_id(kind: str, raw_id: Any, *, source_file: str) -> str:
+    """Validate one runtime id against the canonical grammar.
+
+    Returns the id unchanged on success; raises ``RuntimeIdValidationError``
+    (code ``RUNTIME_ID_INVALID``) with id/kind/source_file provenance and a
+    rename playbook on violation. Never sanitizes — a bad id is a loud reject.
+    """
+    text = "" if raw_id is None else str(raw_id)
+    if RUNTIME_ID_PATTERN.match(text):
+        return text
+    context = {"id": text, "kind": kind, "source_file": source_file}
+    raise RuntimeIdValidationError(
+        f"Invalid {kind} id {text!r} in {source_file}: must match {RUNTIME_ID_PATTERN_TEXT} "
+        "(lowercase alphanumeric start, then [a-z0-9_-], 1-64 chars; no '/', '\\', '.', "
+        "leading '-', whitespace, or uppercase).",
+        context=context,
+        next_actions=_runtime_id_rename_playbook(kind, text),
+    )
+
+
+def _client_overlay_source_map(model: dict[str, Any]) -> dict[str, str]:
+    """Map client id -> the overlay.yaml that declared it (for provenance)."""
+    overlay_by_client: dict[str, str] = {}
+    for client in model.get("clients") or []:
+        client_id = str(client.get("id") or "")
+        overlay_path = str(client.get("_overlay_path") or "")
+        if client_id and overlay_path:
+            overlay_by_client[client_id] = overlay_path
+    return overlay_by_client
+
+
+def validate_runtime_model_ids(model: dict[str, Any]) -> None:
+    """Reject any service/task/client/repo/artifact/skill/check id that
+    violates the canonical slug grammar BEFORE any caller joins it into a path.
+
+    Provenance: an item that carries a ``client`` scope is attributed to that
+    client's overlay.yaml when one is known, otherwise to the runtime manifest.
+    """
+    manifest_file = str(model.get("manifest_file") or "")
+    overlay_by_client = _client_overlay_source_map(model)
+    for kind, section in RUNTIME_ID_KIND_SECTIONS:
+        for item in model.get(section) or []:
+            if kind == "client":
+                source_file = str(item.get("_overlay_path") or manifest_file)
+            else:
+                client_id = str(item.get("client") or "")
+                source_file = overlay_by_client.get(client_id, manifest_file)
+            validate_runtime_id(kind, item.get("id"), source_file=source_file)
+
+
 def runtime_manifest_path(root_dir: Path) -> Path:
     return root_dir / "workspace" / "runtime.yaml"
 
@@ -1595,4 +1746,9 @@ def build_runtime_model(root_dir: Path) -> dict[str, Any]:
     normalized = _normalize_runtime_sections(resolved, overlay_clients=overlay_clients)
     model = _base_runtime_model(root_dir, resolved, env_values, normalized)
     _populate_runtime_model_defaults(model, root_dir)
+    # Security gate: reject any id that would reshape/escape the on-disk layout
+    # once it is joined into a path. Runs last so every overlay-merged item is
+    # present; raises RuntimeIdValidationError (code RUNTIME_ID_INVALID) which
+    # the cli layer promotes to a typed ValidationError with provenance.
+    validate_runtime_model_ids(model)
     return model
