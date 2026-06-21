@@ -241,8 +241,33 @@ def _add_clients_and_profiles(builder: _GraphBuilder, model: dict[str, Any]) -> 
             )
 
 
+def _annotate_service_ports(builder: _GraphBuilder, model: dict[str, Any]) -> None:
+    """Cheap port-attr enrichment: copy declared port/bind_scope onto service nodes.
+
+    Reuses the port registry view so the graph agrees with `manage.py ports`
+    and the doctor. Skips silently if the registry cannot be built.
+    """
+    try:
+        from .port_registry import build_port_registry
+
+        entries = build_port_registry(model)
+    except Exception:
+        return
+    by_service: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        if entry.get("owner_kind") != "service" or entry.get("port") is None:
+            continue
+        by_service.setdefault(str(entry["owner_id"]), entry)
+    for service_id, entry in by_service.items():
+        node = builder.nodes.get(graph_node_id("service", service_id))
+        if node is not None and "port" not in node.attrs:
+            node.attrs["port"] = entry["port"]
+            node.attrs["bind_scope"] = entry["bind_scope"]
+
+
 def _add_services_and_tasks(builder: _GraphBuilder, model: dict[str, Any]) -> None:
     _add_model_collection(builder, model, "services", "service")
+    _annotate_service_ports(builder, model)
     _add_model_collection(builder, model, "tasks", "task")
 
     for service_id, dependency_ids in service_dependency_graph(model).items():

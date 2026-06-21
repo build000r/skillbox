@@ -7,6 +7,7 @@ import tarfile
 
 from .shared import *
 from .validation import *
+from .port_registry import build_port_registry
 from .pressure_report import collect_pressure_report
 from .rch_report import collect_rch_report
 from .sbh_report import collect_sbh_report
@@ -1158,6 +1159,279 @@ def validate_service_exposure(model: dict[str, Any]) -> list[CheckResult]:
     ]
 
 
+PORT_COLLISION = "PORT_COLLISION"
+PORT_WILDCARD_BIND = "PORT_WILDCARD_BIND"
+PORT_UNDECLARED_RESERVED = "PORT_UNDECLARED_RESERVED"
+PORT_REGISTRY_WARNING = "PORT_REGISTRY_WARNING"
+PORT_CROSS_CLIENT_OVERLAP = "PORT_CROSS_CLIENT_OVERLAP"
+
+# Box network postures under which a wildcard (0.0.0.0/::) bind is a violation.
+_WILDCARD_DENY_POSTURES = frozenset({"tailnet_only"})
+
+
+def _resolved_network_posture(model: dict[str, Any]) -> str:
+    """Resolve the box network posture from env, falling back to the process env.
+
+    Managed boxes default to ``tailnet_only`` (see AGENTS.md Network Posture),
+    but we only treat the posture as wildcard-denying when it is explicitly
+    declared so local dev (no posture set) stays permissive.
+    """
+    env = model.get("env") or {}
+    posture = str(env.get("SKILLBOX_NETWORK_POSTURE") or "").strip()
+    if not posture:
+        posture = str(os.environ.get("SKILLBOX_NETWORK_POSTURE") or "").strip()
+    return posture.lower()
+
+
+def _reserved_port_ranges(model: dict[str, Any]) -> list[tuple[int, int, str]]:
+    """Parse declared reserved port ranges into ``(low, high, label)`` tuples.
+
+    Sources, in order: a model-level ``port_reserved_ranges`` list (each item
+    ``{low,high,label?}`` or ``[low,high]``) and the
+    ``SKILLBOX_RESERVED_PORT_RANGES`` env key (``"9000-9100:agents,4000"``).
+    Unparseable ranges are skipped silently so a typo never crashes doctor.
+    """
+    ranges: list[tuple[int, int, str]] = []
+
+    for raw in model.get("port_reserved_ranges") or []:
+        try:
+            if isinstance(raw, dict):
+                low = int(raw["low"])
+                high = int(raw.get("high", raw["low"]))
+                label = str(raw.get("label") or "")
+            elif isinstance(raw, (list, tuple)) and raw:
+                low = int(raw[0])
+                high = int(raw[1]) if len(raw) > 1 else low
+                label = str(raw[2]) if len(raw) > 2 else ""
+            else:
+                continue
+        except (KeyError, ValueError, TypeError):
+            continue
+        if low <= high:
+            ranges.append((low, high, label))
+
+    env = model.get("env") or {}
+    raw_env = str(env.get("SKILLBOX_RESERVED_PORT_RANGES") or "").strip()
+    for chunk in raw_env.split(","):
+        token = chunk.strip()
+        if not token:
+            continue
+        label = ""
+        if ":" in token:
+            token, label = token.split(":", 1)
+            token, label = token.strip(), label.strip()
+        try:
+            if "-" in token:
+                low_s, high_s = token.split("-", 1)
+                low, high = int(low_s), int(high_s)
+            else:
+                low = high = int(token)
+        except ValueError:
+            continue
+        if low <= high:
+            ranges.append((low, high, label))
+    return ranges
+
+
+def _active_scope_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Entries that actively bind a port, declared ports only.
+
+    Only ``service`` entries are real listeners for collision purposes:
+
+    - ``env_surface`` entries document the declared env value, not a live
+      listener, so flagging an env key against the service that consumes it
+      would be a false positive.
+    - ``ingress`` listener entries are synthesized from env and are realized by
+      the ingress-router SERVICE (already a service entry on the same port), so
+      counting both would double-claim the listener port.
+    """
+    return [
+        entry
+        for entry in entries
+        if entry.get("port") is not None and entry.get("owner_kind") == "service"
+    ]
+
+
+def _collision_results(entries: list[dict[str, Any]]) -> list[CheckResult]:
+    """PORT_COLLISION within the active scope, plus a cross-client ADVISORY.
+
+    Two active-scope owners on the same port collide. Collisions where the
+    owners belong to DIFFERENT clients are downgraded to a non-fatal advisory
+    (warn) because client overlays load only when that client is active; same
+    or core scope collisions are hard failures.
+    """
+    by_port: dict[int, list[dict[str, Any]]] = {}
+    for entry in _active_scope_entries(entries):
+        by_port.setdefault(int(entry["port"]), []).append(entry)
+
+    results: list[CheckResult] = []
+    for port in sorted(by_port):
+        owners = by_port[port]
+        if len(owners) < 2:
+            continue
+        clients = {str(o.get("client") or "") for o in owners}
+        named = [
+            {
+                "owner_id": o["owner_id"],
+                "owner_kind": o["owner_kind"],
+                "client": o.get("client") or "",
+                "source": o.get("source"),
+            }
+            for o in owners
+        ]
+        owner_phrase = " and ".join(
+            f"{o['owner_id']} ({o['source'].get('file')}:{o['source'].get('key')})"
+            for o in named
+        )
+        cross_client_only = len(clients) > 1 and not _same_scope_collision(owners)
+        if cross_client_only:
+            results.append(
+                CheckResult(
+                    status="warn",
+                    code=PORT_CROSS_CLIENT_OVERLAP,
+                    message=(
+                        f"port {port} is claimed across clients by {owner_phrase}; "
+                        "advisory only — these overlays do not load simultaneously"
+                    ),
+                    details={"port": port, "owners": named, "advisory": True},
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    status="fail",
+                    code=PORT_COLLISION,
+                    message=f"port {port} is claimed by {owner_phrase}",
+                    details={"port": port, "owners": named},
+                )
+            )
+    return results
+
+
+def _same_scope_collision(owners: list[dict[str, Any]]) -> bool:
+    """True when at least two colliding owners share the active (core/same) scope.
+
+    A core-scope owner (client == "") collides with everything in the active
+    scope; two owners under the SAME client also collide hard.
+    """
+    core_owners = [o for o in owners if not str(o.get("client") or "")]
+    if len(core_owners) >= 2:
+        return True
+    if core_owners and len(owners) > len(core_owners):
+        return True
+    seen_clients: set[str] = set()
+    for owner in owners:
+        client = str(owner.get("client") or "")
+        if client and client in seen_clients:
+            return True
+        if client:
+            seen_clients.add(client)
+    return False
+
+
+def _wildcard_results(entries: list[dict[str, Any]], posture: str) -> list[CheckResult]:
+    if posture not in _WILDCARD_DENY_POSTURES:
+        return []
+    offenders = [
+        {
+            "port": entry["port"],
+            "owner_id": entry["owner_id"],
+            "owner_kind": entry["owner_kind"],
+            "client": entry.get("client") or "",
+            "source": entry.get("source"),
+        }
+        for entry in entries
+        if entry.get("bind_scope") == "wildcard" and entry.get("port") is not None
+    ]
+    if not offenders:
+        return []
+    return [
+        CheckResult(
+            status="fail",
+            code=PORT_WILDCARD_BIND,
+            message=(
+                f"{len(offenders)} port(s) bind 0.0.0.0/:: while box posture is "
+                f"{posture}: " + ", ".join(f"{o['owner_id']}:{o['port']}" for o in offenders)
+            ),
+            details={"posture": posture, "offenders": offenders},
+        )
+    ]
+
+
+def _reserved_results(entries: list[dict[str, Any]], model: dict[str, Any]) -> list[CheckResult]:
+    ranges = _reserved_port_ranges(model)
+    if not ranges:
+        return []
+    owned_ports = {int(e["port"]) for e in entries if e.get("port") is not None}
+    undeclared: list[dict[str, Any]] = []
+    for low, high, label in ranges:
+        for port in range(low, high + 1):
+            if port not in owned_ports:
+                undeclared.append({"port": port, "range": [low, high], "label": label})
+    if not undeclared:
+        return [
+            CheckResult(
+                status="pass",
+                code="port-reserved-ranges",
+                message=f"all {len(ranges)} reserved port range(s) are fully owned",
+                details={"ranges": [{"low": r[0], "high": r[1], "label": r[2]} for r in ranges]},
+            )
+        ]
+    return [
+        CheckResult(
+            status="fail",
+            code=PORT_UNDECLARED_RESERVED,
+            message=(
+                f"{len(undeclared)} reserved port(s) have no declared owner: "
+                + ", ".join(str(item["port"]) for item in undeclared[:8])
+                + ("..." if len(undeclared) > 8 else "")
+            ),
+            details={"undeclared": undeclared},
+        )
+    ]
+
+
+def validate_port_registry(model: dict[str, Any]) -> list[CheckResult]:
+    """Port-guard doctor checks built on the scope-aware port registry view.
+
+    Emits ``PORT_COLLISION`` (hard, names both declarations),
+    ``PORT_WILDCARD_BIND`` (hard under tailnet_only), and
+    ``PORT_UNDECLARED_RESERVED`` (hard, only when reserved ranges are
+    declared). Cross-client overlaps are downgraded to a non-fatal advisory
+    (``PORT_CROSS_CLIENT_OVERLAP``) because client overlays are mutually
+    exclusive at load time. A clean active scope yields a single PASS plus any
+    extraction warnings surfaced as warn entries.
+    """
+    entries = build_port_registry(model)
+    results: list[CheckResult] = []
+    results.extend(_collision_results(entries))
+    results.extend(_wildcard_results(entries, _resolved_network_posture(model)))
+    results.extend(_reserved_results(entries, model))
+
+    for entry in entries:
+        if entry.get("warning"):
+            results.append(
+                CheckResult(
+                    status="warn",
+                    code=PORT_REGISTRY_WARNING,
+                    message=entry["warning"],
+                    details={"owner_id": entry["owner_id"], "source": entry.get("source")},
+                )
+            )
+
+    if not any(r.status in {"fail", "warn"} for r in results):
+        declared = sum(1 for e in entries if e.get("port") is not None)
+        results.append(
+            CheckResult(
+                status="pass",
+                code="port-registry",
+                message=f"{declared} declared port(s) in active scope have no collisions",
+                details={"count": declared},
+            )
+        )
+    return results
+
+
 def doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
     results = check_manifest(model)
     if any(result.status == "fail" for result in results):
@@ -1200,6 +1474,7 @@ def doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
         + validate_bridges(model)
         + validate_ingress(model)
         + validate_service_exposure(model)
+        + validate_port_registry(model)
         + parity_results
     )
 

@@ -277,6 +277,28 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "skillbox_ports",
+        "description": (
+            "List the machine-readable port registry for the active scope: every "
+            "declared port mapped to its owning service/ingress/env_surface, with "
+            "source (file+key), profiles, client, bind scope, and protocol. "
+            "Health targets with no parseable port are NEVER guessed; they surface "
+            "as warning entries. Pass resolve=<service-id> to resolve one owner's "
+            "port(s). Read-only, no side effects."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "resolve": {
+                    "type": "string",
+                    "description": "Resolve the declared port(s) for a single service/owner id.",
+                },
+                "client": _CLIENT_PROP,
+                "profile": _PROFILE_PROP,
+            },
+        },
+    },
+    {
         "name": "skillbox_skills",
         "description": (
             "Show effective skill availability and scope-policy issues for a cwd/client/profile. "
@@ -1540,6 +1562,7 @@ _STRING_ARG_SPECS: tuple[tuple[str, str], ...] = (
     ("algorithm", "--algorithm"),
     ("node", "--node"),
     ("target", "--target"),
+    ("resolve", "--resolve"),
     ("ntm_session", "--ntm-session"),
     ("from_path", "--from"),
     ("to_path", "--to"),
@@ -1795,6 +1818,7 @@ _DISPATCH: dict[str, tuple[str, str | None]] = {
     "skillbox_status":      ("status",      None),
     "skillbox_doctor":      ("doctor",      None),
     "skillbox_render":      ("render",      None),
+    "skillbox_ports":       ("ports",       None),
     "skillbox_skills":      ("skills",      None),
     "skillbox_skill_audit": ("skill-audit", None),
     "skillbox_mcp_audit":   ("mcp-audit",   None),
