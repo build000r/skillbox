@@ -63,6 +63,16 @@ class CheckResult:
     code: str
     message: str
     details: dict[str, Any] | None = None
+    fix_command: str | None = None
+
+
+DRIFT_FIX_COMMAND = "make render"
+BEADS_INIT_FIX_COMMAND = "sbp beads init --cwd ."
+BEADS_SYNC_FIX_COMMAND = "br sync --flush-only"
+BEADS_SYNC_STATUS_COMMAND = "br sync --status --json"
+SKILL_SYNC_FIX_COMMAND = "make runtime-sync"
+SKILL_SYNC_DRY_RUN_COMMAND = "python3 .env-manager/manage.py sync --dry-run --format json"
+RUNTIME_DOCTOR_COMMAND = "python3 .env-manager/manage.py doctor --format json"
 
 
 def repo_rel(path: Path) -> str:
@@ -469,6 +479,7 @@ def check_expected_directories() -> CheckResult:
             code="expected-directories",
             message="expected workspace directories are missing",
             details={"missing": missing},
+            fix_command=f"mkdir -p {' '.join(missing)}",
         )
     return CheckResult(status="pass", code="expected-directories", message="expected workspace directories are present")
 
@@ -518,6 +529,7 @@ def check_manifest_alignment(model: dict[str, Any]) -> CheckResult:
             code="manifest-alignment",
             message="manifest files disagree on runtime paths",
             details={"issues": issues},
+            fix_command=DRIFT_FIX_COMMAND,
         )
     return CheckResult(status="pass", code="manifest-alignment", message="manifest files agree on runtime paths")
 
@@ -536,6 +548,7 @@ def check_env_defaults(model: dict[str, Any]) -> CheckResult:
             code="env-defaults",
             message=".env.example is out of sync with the manifest",
             details={"mismatches": mismatches},
+            fix_command=DRIFT_FIX_COMMAND,
         )
     return CheckResult(status="pass", code="env-defaults", message=".env.example matches manifest defaults")
 
@@ -547,6 +560,7 @@ def _compose_config_failure(exc: RuntimeError) -> list[CheckResult]:
             code="compose-config",
             message="docker compose config could not be resolved",
             details={"error": str(exc)},
+            fix_command="docker compose config",
         )
     ]
 
@@ -640,6 +654,7 @@ def _compose_check_result(code: str, success_message: str, failure_message: str,
             code=code,
             message=failure_message,
             details={"issues": issues},
+            fix_command=DRIFT_FIX_COMMAND,
         )
     return CheckResult(status="pass", code=code, message=success_message)
 
@@ -686,6 +701,7 @@ def check_skill_sync_dry_run(model: dict[str, Any]) -> CheckResult:
                 "stdout": result.stdout.strip(),
                 "stderr": result.stderr.strip(),
             },
+            fix_command=SKILL_SYNC_FIX_COMMAND,
         )
 
     try:
@@ -696,6 +712,7 @@ def check_skill_sync_dry_run(model: dict[str, Any]) -> CheckResult:
             code="skill-repo-sync-dry-run",
             message="manage.py sync --dry-run emitted invalid JSON",
             details={"error": str(exc)},
+            fix_command=SKILL_SYNC_DRY_RUN_COMMAND,
         )
 
     actions = payload.get("actions") if isinstance(payload, dict) else None
@@ -705,6 +722,7 @@ def check_skill_sync_dry_run(model: dict[str, Any]) -> CheckResult:
             code="skill-repo-sync-dry-run",
             message="manage.py sync --dry-run emitted an unexpected JSON shape",
             details={"payload_type": type(payload).__name__},
+            fix_command=SKILL_SYNC_DRY_RUN_COMMAND,
         )
 
     return CheckResult(
@@ -725,6 +743,7 @@ def check_bundle_state(model: dict[str, Any]) -> CheckResult:
             code="skill-repo-lock-state",
             message="workspace skill repo lockfile is missing",
             details={"expected_path": repo_rel(lock_path)},
+            fix_command=SKILL_SYNC_FIX_COMMAND,
         )
 
     missing = sorted(expected - locked)
@@ -735,6 +754,7 @@ def check_bundle_state(model: dict[str, Any]) -> CheckResult:
             code="skill-repo-lock-state",
             message="workspace skill repo lockfile does not exactly match the declared picks",
             details={"missing": missing, "extra": extra},
+            fix_command=SKILL_SYNC_FIX_COMMAND,
         )
 
     return CheckResult(
@@ -742,6 +762,110 @@ def check_bundle_state(model: dict[str, Any]) -> CheckResult:
         code="skill-repo-lock-state",
         message="workspace skill repo lockfile matches the declared picks",
         details={"skills": sorted(locked)},
+    )
+
+
+def check_beads_state() -> CheckResult:
+    beads_dir = ROOT_DIR / ".beads"
+    db_path = beads_dir / "beads.db"
+    jsonl_path = beads_dir / "issues.jsonl"
+
+    if not beads_dir.is_dir():
+        return CheckResult(
+            status="warn",
+            code="beads-state",
+            message="Beads issue state is not initialized",
+            details={"expected_path": ".beads"},
+            fix_command=BEADS_INIT_FIX_COMMAND,
+        )
+
+    if not db_path.is_file():
+        return CheckResult(
+            status="warn",
+            code="beads-state",
+            message="Beads database is missing",
+            details={"expected_path": repo_rel(db_path)},
+            fix_command=BEADS_INIT_FIX_COMMAND,
+        )
+
+    if not jsonl_path.is_file():
+        return CheckResult(
+            status="warn",
+            code="beads-state",
+            message="Beads JSONL export is missing",
+            details={"expected_path": repo_rel(jsonl_path)},
+            fix_command=BEADS_SYNC_FIX_COMMAND,
+        )
+
+    if shutil.which("br"):
+        result = run_command(["br", "sync", "--status", "--json"])
+        if result.returncode != 0:
+            return CheckResult(
+                status="warn",
+                code="beads-state",
+                message="Beads sync status could not be checked",
+                details={
+                    "stdout": result.stdout.strip(),
+                    "stderr": result.stderr.strip(),
+                },
+                fix_command=BEADS_SYNC_STATUS_COMMAND,
+            )
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            return CheckResult(
+                status="warn",
+                code="beads-state",
+                message="Beads sync status emitted invalid JSON",
+                details={"error": str(exc)},
+                fix_command=BEADS_SYNC_STATUS_COMMAND,
+            )
+
+        dirty_count = int(payload.get("dirty_count") or 0) if isinstance(payload, dict) else 0
+        db_newer = bool(payload.get("db_newer")) if isinstance(payload, dict) else False
+        jsonl_exists = bool(payload.get("jsonl_exists", True)) if isinstance(payload, dict) else True
+        if dirty_count or db_newer or not jsonl_exists:
+            return CheckResult(
+                status="warn",
+                code="beads-state",
+                message="Beads JSONL export is not synced with the local database",
+                details={
+                    "dirty_count": dirty_count,
+                    "db_newer": db_newer,
+                    "jsonl_exists": jsonl_exists,
+                },
+                fix_command=BEADS_SYNC_FIX_COMMAND,
+            )
+        return CheckResult(
+            status="pass",
+            code="beads-state",
+            message="Beads issue state is initialized and synced",
+            details={
+                "jsonl": repo_rel(jsonl_path),
+                "dirty_count": dirty_count,
+                "last_export_time": payload.get("last_export_time") if isinstance(payload, dict) else None,
+            },
+        )
+
+    db_mtime = db_path.stat().st_mtime
+    jsonl_mtime = jsonl_path.stat().st_mtime
+    if db_mtime - jsonl_mtime > 2:
+        return CheckResult(
+            status="warn",
+            code="beads-state",
+            message="Beads database appears newer than the JSONL export",
+            details={
+                "database": repo_rel(db_path),
+                "jsonl": repo_rel(jsonl_path),
+            },
+            fix_command=BEADS_SYNC_FIX_COMMAND,
+        )
+
+    return CheckResult(
+        status="pass",
+        code="beads-state",
+        message="Beads issue state is initialized",
+        details={"jsonl": repo_rel(jsonl_path)},
     )
 
 
@@ -779,6 +903,7 @@ def check_reference_drift() -> CheckResult:
             code="reference-drift",
             message="stale references to 00-skill-sync.sh remain in the repo",
             details={"hits": hits},
+            fix_command='rg "00-skill-sync.sh" .',
         )
     return CheckResult(
         status="pass",
@@ -818,6 +943,7 @@ def check_runtime_manager_doctor() -> CheckResult:
                 "stdout": result.stdout.strip(),
                 "stderr": result.stderr.strip(),
             },
+            fix_command=RUNTIME_DOCTOR_COMMAND,
         )
 
     try:
@@ -828,6 +954,7 @@ def check_runtime_manager_doctor() -> CheckResult:
             code="runtime-manager-doctor",
             message="internal runtime manager doctor emitted invalid JSON",
             details={"error": str(exc)},
+            fix_command=RUNTIME_DOCTOR_COMMAND,
         )
 
     items = payload.get("checks", payload) if isinstance(payload, dict) else payload
@@ -837,6 +964,7 @@ def check_runtime_manager_doctor() -> CheckResult:
             code="runtime-manager-doctor",
             message="internal runtime manager doctor emitted an unexpected JSON shape",
             details={"payload_type": type(payload).__name__},
+            fix_command=RUNTIME_DOCTOR_COMMAND,
         )
 
     warnings = sum(1 for item in items if item.get("status") == "warn")
@@ -976,6 +1104,8 @@ def print_doctor_text(results: list[CheckResult]) -> None:
         if result.details:
             for line in detail_lines(result.details):
                 print(f"     {line}")
+        if result.fix_command:
+            print(f"     fix: {result.fix_command}")
 
     counts = {
         "pass": sum(1 for item in results if item.status == "pass"),
@@ -999,6 +1129,7 @@ def doctor_results(skip_compose: bool, skip_skill_sync: bool) -> list[CheckResul
         check_manifest_alignment(model),
         check_env_defaults(model),
         check_bundle_state(model),
+        check_beads_state(),
         check_reference_drift(),
         check_runtime_manager_model(model),
         check_runtime_manager_doctor(),
@@ -1010,6 +1141,7 @@ def doctor_results(skip_compose: bool, skip_skill_sync: bool) -> list[CheckResul
                 status="warn",
                 code="compose-config",
                 message="compose validation skipped",
+                fix_command="python3 scripts/04-reconcile.py doctor --format json",
             )
         )
     else:
@@ -1023,9 +1155,10 @@ def doctor_results(skip_compose: bool, skip_skill_sync: bool) -> list[CheckResul
                 message="skill-repo sync dry run skipped",
                 details={
                     "command": (
-                        "python3 .env-manager/manage.py sync --dry-run --format json"
+                        SKILL_SYNC_DRY_RUN_COMMAND
                     )
                 },
+                fix_command=SKILL_SYNC_DRY_RUN_COMMAND,
             )
         )
     else:
@@ -1067,6 +1200,16 @@ def capabilities_payload() -> dict[str, Any]:
             "json_stdout": "When JSON is requested, stdout is parseable JSON only.",
             "diagnostics_stderr": "JSON typo alias notices and parser errors go to stderr.",
         },
+        "doctor_remediation": {
+            "json_field": "fix_command",
+            "text_prefix": "fix:",
+            "extract_commands": (
+                "python3 scripts/04-reconcile.py doctor --format json "
+                "| python3 -c 'import json,sys; "
+                "print(\"\\n\".join(item[\"fix_command\"] for item in json.load(sys.stdin) "
+                "if item.get(\"status\") != \"pass\" and item.get(\"fix_command\")))'"
+            ),
+        },
         "safe_previews": [
             "python3 scripts/04-reconcile.py render --format json",
             "python3 scripts/04-reconcile.py doctor --format json --skip-compose --skip-skill-sync",
@@ -1101,6 +1244,7 @@ Structured output:
   render, doctor, capabilities, and robot-triage support JSON output.
   Agent-friendly aliases are accepted: --json, --jason, --jsno, --jsson.
   Diagnostics and typo-alias notices are printed to stderr, not stdout.
+  Doctor findings include fix_command when a check has a copy-pasteable next command.
 
 Safe validation pattern:
   Use doctor --format json --skip-compose --skip-skill-sync for a fast read-side
