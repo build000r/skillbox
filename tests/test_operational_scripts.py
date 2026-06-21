@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -305,6 +306,340 @@ class GuardDestructiveOpScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("Configured marker TTL: 5s", result.stderr)
         self.assertRegex(result.stderr, r"Observed marker age: [0-9]+s")
+
+    # ------------------------------------------------------------------
+    # Fail-closed matrix: any internal error while evaluating a *gated*
+    # tool must BLOCK (non-zero exit) and name the failing stage, while a
+    # NON-gated tool always passes and the happy path (clean+pushed+valid
+    # marker) still exits 0. See skillbox-safety-trust-boundary-epic-lzz1.3.
+    # ------------------------------------------------------------------
+
+    # Both dash- and underscore-namespaced forms of each gated tool. The matrix
+    # runs against both compose_down and teardown.
+    GATED_COMPOSE_DOWN = "mcp__skillbox-operator__operator_compose_down"
+    GATED_TEARDOWN = "mcp__skillbox-operator__operator_teardown"
+
+    def _run_guard_raw(
+        self,
+        script: Path,
+        stdin_text: str,
+        *,
+        extra_env: dict[str, str] | None = None,
+        timeout: float = 30,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the guard with arbitrary (possibly malformed) stdin."""
+        root = script.parent.parent
+        mono_root = root / "empty-mono"
+        mono_root.mkdir(exist_ok=True)
+        clients_root = root / "empty-clients"
+        clients_root.mkdir(exist_ok=True)
+        env = os.environ.copy()
+        env["SKILLBOX_MONOSERVER_HOST_ROOT"] = str(mono_root)
+        env["SKILLBOX_CLIENTS_HOST_ROOT"] = str(clients_root)
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(
+            ["bash", str(script)],
+            input=stdin_text,
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+
+    def _make_python_shim_dir(self, root: Path, *, mode: str) -> Path:
+        """Create a PATH dir with a python3 shim.
+
+        mode="missing": directory has the usual shell utils but NO python3, so
+            the very first python3 call (tool_name parse) fails closed.
+        mode="repo_scan_crash": python3 delegates to the real interpreter for
+            the small inline parsers but exits 99 for the big repo-cleanliness
+            scan (detected by the unique ``discover_git_roots`` token), so the
+            scan-crash branch is exercised without breaking JSON parsing.
+        """
+        shim_dir = root / f"shim-{mode}"
+        shim_dir.mkdir(parents=True, exist_ok=True)
+        # Symlink the shell utilities the guard relies on so a restricted PATH
+        # still has bash/git/etc. (we only want to control python3).
+        for tool in (
+            "bash", "sh", "cat", "date", "mkdir", "printf", "tr", "rm",
+            "mktemp", "dirname", "pwd", "git", "timeout", "ssh", "sleep", "env",
+        ):
+            src = shutil.which(tool)
+            if src:
+                link = shim_dir / tool
+                if not link.exists():
+                    link.symlink_to(src)
+        if mode == "missing":
+            # No python3 at all in this dir.
+            return shim_dir
+        if mode == "repo_scan_crash":
+            real_python = shutil.which("python3") or sys.executable
+            shim = shim_dir / "python3"
+            shim.write_text(
+                "#!/usr/bin/env bash\n"
+                "for a in \"$@\"; do\n"
+                "  case \"$a\" in\n"
+                "    *discover_git_roots*)\n"
+                "      echo 'simulated repo-scan crash' >&2; exit 99 ;;\n"
+                "  esac\n"
+                "done\n"
+                f'exec "{real_python}" "$@"\n',
+                encoding="utf-8",
+            )
+            shim.chmod(0o755)
+            return shim_dir
+        raise ValueError(f"unknown shim mode: {mode}")
+
+    def test_guard_malformed_hook_input_blocks_naming_stage(self) -> None:
+        for tool in (self.GATED_COMPOSE_DOWN, self.GATED_TEARDOWN):
+            with self.subTest(tool=tool), tempfile.TemporaryDirectory() as tmpdir:
+                script = self._copy_guard(Path(tmpdir))
+                # Malformed JSON cannot be parsed even to learn the tool name.
+                result = self._run_guard_raw(script, "{bad json")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("BLOCKED", result.stderr)
+            self.assertIn("hook input (tool_name)", result.stderr)
+            self.assertIn("blocking by default", result.stderr)
+
+    def test_guard_malformed_tool_input_blocks_on_dry_run_stage(self) -> None:
+        # tool_name parses, but tool_input is a non-object that cannot yield a
+        # trustworthy dry_run decision -> block naming dry_run.
+        for tool in (self.GATED_COMPOSE_DOWN, self.GATED_TEARDOWN):
+            with self.subTest(tool=tool), tempfile.TemporaryDirectory() as tmpdir:
+                script = self._copy_guard(Path(tmpdir))
+                stdin_text = json.dumps({"tool_name": tool, "tool_input": ["not", "an", "object"]})
+                result = self._run_guard_raw(script, stdin_text)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("BLOCKED", result.stderr)
+            self.assertIn("dry_run", result.stderr)
+            self.assertIn("blocking by default", result.stderr)
+
+    def test_guard_missing_python3_blocks(self) -> None:
+        # python3 absent from PATH: the first python3 call (tool_name parse)
+        # fails, so the guard fails closed instead of passing on empty output.
+        for tool in (self.GATED_COMPOSE_DOWN, self.GATED_TEARDOWN):
+            with self.subTest(tool=tool), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                script = self._copy_guard(root)
+                shim_dir = self._make_python_shim_dir(root, mode="missing")
+                result = self._run_guard(
+                    script,
+                    tool_name=tool,
+                    extra_env={"PATH": str(shim_dir)},
+                )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("BLOCKED", result.stderr)
+            self.assertIn("blocking by default", result.stderr)
+
+    def test_guard_repo_scan_crash_blocks_naming_repo_cleanliness(self) -> None:
+        # The big repo-cleanliness scan crashes (exit != 0/1) while the small
+        # JSON parsers still work. The guard must block and name the repo
+        # cleanliness stage rather than treat empty output as "clean".
+        for tool in (self.GATED_COMPOSE_DOWN, self.GATED_TEARDOWN):
+            with self.subTest(tool=tool), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                script = self._copy_guard(root)
+                shim_dir = self._make_python_shim_dir(root, mode="repo_scan_crash")
+                result = self._run_guard(
+                    script,
+                    tool_name=tool,
+                    tool_input={"dry_run": False, "box_id": "local"},
+                    extra_env={"PATH": f"{shim_dir}{os.pathsep}{os.environ.get('PATH', '')}"},
+                )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("BLOCKED", result.stderr)
+            self.assertIn("repo cleanliness", result.stderr)
+            self.assertIn("blocking by default", result.stderr)
+
+    def test_guard_ssh_timeout_during_remote_verification_blocks(self) -> None:
+        # A hanging SSH on the teardown remote path must be killed by the
+        # overall timeout and reported as "could not verify", not allowed.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            script = self._copy_guard(root)
+            # Inventory with a box that has a reachable address so we take the
+            # SSH branch.
+            (root / "workspace").mkdir(parents=True, exist_ok=True)
+            (root / "workspace" / "boxes.json").write_text(
+                json.dumps(
+                    {"boxes": [{"id": "box-remote", "tailscale_ip": "100.64.0.9", "ssh_user": "skillbox"}]}
+                ),
+                encoding="utf-8",
+            )
+            ssh_stub = root / "ssh-hang"
+            ssh_stub.write_text("#!/usr/bin/env bash\nsleep 60\n", encoding="utf-8")
+            ssh_stub.chmod(0o755)
+
+            result = self._run_guard(
+                script,
+                tool_name=self.GATED_TEARDOWN,
+                tool_input={"dry_run": False, "box_id": "box-remote"},
+                extra_env={
+                    "SKILLBOX_GUARD_SSH_BIN": str(ssh_stub),
+                    "SKILLBOX_GUARD_SSH_TIMEOUT_SECONDS": "2",
+                },
+            )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("BLOCKED", result.stderr)
+        self.assertIn("timed out", result.stderr)
+        self.assertIn("could not verify remote repos", result.stderr)
+
+    def test_guard_non_gated_tool_fast_path_exits_zero(self) -> None:
+        # Non-destructive tools must always pass without evaluation.
+        for tool in ("mcp__skillbox-operator__operator_boxes", "Read", "some_other_tool"):
+            with self.subTest(tool=tool), tempfile.TemporaryDirectory() as tmpdir:
+                script = self._copy_guard(Path(tmpdir))
+                result = self._run_guard(script, tool_name=tool)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+
+    def test_guard_dry_run_true_passes(self) -> None:
+        for tool in (self.GATED_COMPOSE_DOWN, self.GATED_TEARDOWN):
+            with self.subTest(tool=tool), tempfile.TemporaryDirectory() as tmpdir:
+                script = self._copy_guard(Path(tmpdir))
+                result = self._run_guard(
+                    script,
+                    tool_name=tool,
+                    tool_input={"dry_run": True},
+                )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_guard_happy_path_clean_pushed_repo_with_valid_marker_passes(self) -> None:
+        # Clean + pushed repo with a fresh dry-run marker must PASS (exit 0).
+        for tool, friendly in (
+            (self.GATED_COMPOSE_DOWN, "operator_compose_down"),
+            (self.GATED_TEARDOWN, "operator_teardown"),
+        ):
+            with self.subTest(tool=tool), tempfile.TemporaryDirectory() as tmpdir, tempfile.TemporaryDirectory() as baredir:
+                root = Path(tmpdir)
+                script = self._copy_guard(root)
+
+                bare = Path(baredir) / "upstream.git"
+                subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True, capture_output=True, text=True)
+
+                # Make the guard's REPO_ROOT (root) a clean, pushed git repo.
+                self._git_init_clean_pushed(root, bare)
+
+                # Empty workspace scan roots so only `root` is inspected.
+                (root / "empty-clients").mkdir(exist_ok=True)
+                (root / "empty-mono").mkdir(exist_ok=True)
+
+                # Fresh dry-run marker for this tool/box.
+                marker = (
+                    root / ".skillbox-state" / "dryrun-markers"
+                    / f".skillbox-dryrun-{friendly}-local"
+                )
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text("dry-run completed\n", encoding="utf-8")
+
+                result = self._run_guard(
+                    script,
+                    tool_name=tool,
+                    tool_input={"dry_run": False, "box_id": "local"},
+                    extra_env={
+                        "SKILLBOX_MONOSERVER_HOST_ROOT": str(root / "empty-mono"),
+                        "SKILLBOX_CLIENTS_HOST_ROOT": str(root / "empty-clients"),
+                    },
+                )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_guard_default_scan_does_not_walk_repo_parent(self) -> None:
+        # Scope-inflation guard: by default the scan must NOT reach a dirty
+        # sibling repo in the parent of REPO_ROOT (the old repo_root/.. default).
+        with tempfile.TemporaryDirectory() as parentdir, tempfile.TemporaryDirectory() as baredir:
+            parent = Path(parentdir)
+            root = parent / "skillbox"
+            root.mkdir()
+            script = self._copy_guard(root)
+
+            # Dirty sibling repo next to REPO_ROOT.
+            sibling = parent / "unrelated-sibling"
+            sibling.mkdir()
+            subprocess.run(["git", "init", "-q", str(sibling)], check=True, capture_output=True, text=True)
+            (sibling / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+
+            # REPO_ROOT itself is clean+pushed with a valid marker.
+            bare = Path(baredir) / "upstream.git"
+            subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True, capture_output=True, text=True)
+            self._git_init_clean_pushed(root, bare)
+            (root / "empty-clients").mkdir(exist_ok=True)
+            marker = (
+                root / ".skillbox-state" / "dryrun-markers"
+                / ".skillbox-dryrun-operator_compose_down-local"
+            )
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("dry-run completed\n", encoding="utf-8")
+
+            # No SKILLBOX_MONOSERVER_HOST_ROOT -> bounded default, sibling ignored.
+            env = os.environ.copy()
+            env.pop("SKILLBOX_MONOSERVER_HOST_ROOT", None)
+            env["SKILLBOX_CLIENTS_HOST_ROOT"] = str(root / "empty-clients")
+            allowed = subprocess.run(
+                ["bash", str(script)],
+                input=json.dumps(
+                    {
+                        "tool_name": self.GATED_COMPOSE_DOWN,
+                        "tool_input": {"dry_run": False},
+                    }
+                ),
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(allowed.returncode, 0, allowed.stderr)
+            self.assertNotIn("unrelated-sibling", allowed.stderr)
+
+            # Explicit opt-in (operator monorepo layout) DOES scan the parent.
+            env["SKILLBOX_MONOSERVER_HOST_ROOT"] = str(parent)
+            blocked = subprocess.run(
+                ["bash", str(script)],
+                input=json.dumps(
+                    {
+                        "tool_name": self.GATED_COMPOSE_DOWN,
+                        "tool_input": {"dry_run": False},
+                    }
+                ),
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(blocked.returncode, 1)
+            self.assertIn("unrelated-sibling", blocked.stderr)
+
+    def _git_init_clean_pushed(self, repo: Path, bare: Path) -> None:
+        """Initialise ``repo`` as a clean working tree pushed to ``bare``."""
+        def git(*args: str) -> None:
+            subprocess.run(
+                ["git", "-C", str(repo), *args],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        git("init", "-q")
+        git("config", "user.email", "guard-test@example.com")
+        git("config", "user.name", "guard-test")
+        git("config", "commit.gpgsign", "false")
+        # Ignore the volatile state dir so creating the marker/log keeps the
+        # tree clean.
+        (repo / ".gitignore").write_text(
+            ".skillbox-state/\nempty-clients/\nempty-mono/\n", encoding="utf-8"
+        )
+        git("add", "-A")
+        git("commit", "-q", "-m", "init")
+        git("remote", "add", "origin", str(bare))
+        git("push", "-q", "-u", "origin", "HEAD")
 
 
 class QuickValidateScriptTests(unittest.TestCase):
