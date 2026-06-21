@@ -3,28 +3,29 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import time
 from pathlib import Path
 from typing import Any, Mapping
 
+# Redaction primitives come from the single shared table. ``redact_diagnostic_text``
+# is the thin alias kept on agent_adapters; ``_is_secret_key`` reuses the shared
+# key matcher so this surface never carries its own pattern copy. The snapshot
+# variant adds its OWN deterministic sorting/stringifying of mapping keys (needed
+# for stable snapshot hashes), so it stays a local recursion rather than calling
+# the generic ``redact_value``.
 from .agent_adapters import REDACTION_MARKER, redact_diagnostic_text
+from .shared import is_secret_key as _is_secret_key
 
 SNAPSHOT_SCHEMA_VERSION = "2026-06-11+agent_ops_brain.snapshot"
 SNAPSHOT_DIR = Path(".skillbox-state") / "snapshots" / "agent_ops"
 
-_SECRET_KEY_RE = re.compile(
-    r"(token|secret|password|passwd|api[_-]?key|auth[_-]?key|private[_-]?key|access[_-]?key)",
-    re.IGNORECASE,
-)
-
-
-def _is_secret_key(key: Any) -> bool:
-    return bool(_SECRET_KEY_RE.search(str(key or "")))
-
 
 def redact_snapshot_value(value: Any, *, key: str = "") -> Any:
-    """Recursively redact secret-looking keys and string assignments."""
+    """Recursively redact secret-looking keys and string assignments.
+
+    Like the shared ``redact_value`` but additionally sorts and stringifies
+    mapping keys so committed snapshots hash deterministically.
+    """
     if _is_secret_key(key):
         return REDACTION_MARKER
     if isinstance(value, str):

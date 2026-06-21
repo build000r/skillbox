@@ -87,6 +87,17 @@ from lib.runtime_model import (  # noqa: E402
     storage_binding_by_id,
 )
 
+# Single source of truth for secret redaction (see scripts/lib/redaction.py).
+# Re-exported here so internal callers can pull it from runtime_manager.shared
+# the same way they pull other lib helpers, without re-importing lib directly.
+from lib.redaction import (  # noqa: E402
+    REDACTION_MARKER,
+    SECRET_KEY_PATTERN,
+    is_secret_key,
+    redact_text,
+    redact_value,
+)
+
 
 VALID_REPO_SOURCE_KINDS = {"bind", "directory", "git", "manual"}
 VALID_SYNC_MODES = {"external", "ensure-directory", "clone-if-missing", "manual"}

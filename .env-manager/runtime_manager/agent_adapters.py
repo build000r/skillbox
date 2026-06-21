@@ -8,13 +8,16 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import time
 from pathlib import Path
 from typing import Any, Mapping
 
 from .evidence import collect_runtime_evidence
+# Single source of truth for redaction. ``redact_diagnostic_text`` is kept as a
+# thin alias to the shared ``redact_text`` because agent_snapshots and the
+# adapter tests import this name from here.
+from .shared import REDACTION_MARKER, redact_text as redact_diagnostic_text
 
 DEFAULT_TIMEOUTS = {
     "br": 1.5,
@@ -24,36 +27,6 @@ DEFAULT_TIMEOUTS = {
 }
 DEFAULT_PULSE_MAX_AGE_SECONDS = 120.0
 PREVIEW_LIMIT = 500
-REDACTION_MARKER = "[REDACTED]"
-
-_SECRET_KEY_PATTERN = (
-    r"TOKEN|SECRET|PASSWORD|PASSWD|API[_-]?KEY|AUTH[_-]?KEY|PRIVATE[_-]?KEY|ACCESS[_-]?KEY"
-)
-_SECRET_ASSIGNMENT_RE = re.compile(
-    r"("
-    r"(?:\b|[\"'])"
-    rf"[A-Z0-9_.-]*(?:{_SECRET_KEY_PATTERN})[A-Z0-9_.-]*"
-    r"(?:\b|[\"'])"
-    r"\s*[:=]\s*"
-    r"[\"']?"
-    r")"
-    r"([^\"'\s,;]+)"
-    r"([\"']?)",
-    re.IGNORECASE,
-)
-_BEARER_TOKEN_RE = re.compile(
-    r"(\b(?:authorization|proxy-authorization)\s*:\s*bearer\s+)([^\s,;]+)",
-    re.IGNORECASE,
-)
-
-
-def redact_diagnostic_text(text: str) -> str:
-    """Redact secret-looking values while preserving actionable context."""
-    redacted = _BEARER_TOKEN_RE.sub(lambda match: f"{match.group(1)}{REDACTION_MARKER}", text)
-    return _SECRET_ASSIGNMENT_RE.sub(
-        lambda match: f"{match.group(1)}{REDACTION_MARKER}{match.group(3)}",
-        redacted,
-    )
 
 
 def _preview(text: str | None, *, limit: int = PREVIEW_LIMIT) -> str:

@@ -36,6 +36,15 @@ DRYRUN_MARKER_ROOT = SCRIPT_DIR.parent / ".skillbox-state" / "dryrun-markers"
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+# Single source of truth for secret redaction (scripts/lib/redaction.py), the
+# same leaf-import direction shared.py uses for lib.runtime_model. ``redact_text``
+# is exposed locally as ``redact_diagnostic_text`` because call sites/tests in
+# this server use that name.
+_SCRIPTS_DIR = SCRIPT_DIR.parent / "scripts"
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+from lib.redaction import REDACTION_MARKER, redact_text as redact_diagnostic_text  # noqa: E402
+
 LOG_LEVELS = (
     "debug",
     "info",
@@ -50,26 +59,6 @@ LOG_LEVEL_ORDER = {level: index for index, level in enumerate(LOG_LEVELS)}
 CURRENT_LOG_LEVEL = "warning"
 MCP_EVENT_CONTEXT_ENV = "SKILLBOX_MCP_EVENT_CONTEXT"
 _RUNTIME_MANAGER: Any = None
-REDACTION_MARKER = "[REDACTED]"
-_SECRET_KEY_PATTERN = (
-    r"TOKEN|SECRET|PASSWORD|PASSWD|API[_-]?KEY|AUTH[_-]?KEY|PRIVATE[_-]?KEY|ACCESS[_-]?KEY"
-)
-_SECRET_ASSIGNMENT_RE = re.compile(
-    r"("
-    r"(?:\b|[\"'])"
-    rf"[A-Z0-9_.-]*(?:{_SECRET_KEY_PATTERN})[A-Z0-9_.-]*"
-    r"(?:\b|[\"'])"
-    r"\s*[:=]\s*"
-    r"[\"']?"
-    r")"
-    r"([^\"'\s,;]+)"
-    r"([\"']?)",
-    re.IGNORECASE,
-)
-_BEARER_TOKEN_RE = re.compile(
-    r"(\b(?:authorization|proxy-authorization)\s*:\s*bearer\s+)([^\s,;]+)",
-    re.IGNORECASE,
-)
 
 
 class JsonRpcError(RuntimeError):
@@ -77,14 +66,6 @@ class JsonRpcError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.message = message
-
-
-def redact_diagnostic_text(text: str) -> str:
-    redacted = _BEARER_TOKEN_RE.sub(lambda match: f"{match.group(1)}{REDACTION_MARKER}", text)
-    return _SECRET_ASSIGNMENT_RE.sub(
-        lambda match: f"{match.group(1)}{REDACTION_MARKER}{match.group(3)}",
-        redacted,
-    )
 
 
 def _runtime_manager_search_roots() -> list[Path]:
