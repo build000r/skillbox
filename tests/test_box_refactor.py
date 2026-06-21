@@ -416,6 +416,7 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(BOX, "resolve_box_ssh_target", return_value="1.2.3.4"), \
             mock.patch.object(BOX, "ssh_cmd", side_effect=[_completed(returncode=1), _completed()]), \
             mock.patch.object(BOX, "do_delete_droplet", return_value=True), \
+            mock.patch.object(BOX, "do_get_droplet", return_value=None), \
             mock.patch.object(BOX, "save_inventory"), \
             mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
             result = BOX.cmd_down("teardown", dry_run=False, fmt="json")
@@ -423,7 +424,8 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertEqual(result, BOX.EXIT_OK)
         self.assertEqual(box.state, "destroyed")
         payload = payloads[-1]
-        self.assertEqual([step["status"] for step in payload["steps"]], ["warn", "ok", "skip", "ok", "skip"])
+        # read-after-delete inserts a `confirm` step between destroy and volume.
+        self.assertEqual([step["status"] for step in payload["steps"]], ["warn", "ok", "skip", "ok", "ok", "skip"])
 
     def test_cmd_down_returns_destroy_failed_and_preserves_state(self) -> None:
         box = BOX.Box(
@@ -491,6 +493,7 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(BOX, "resolve_box_ssh_target", return_value="1.2.3.4"), \
             mock.patch.object(BOX, "ssh_cmd", side_effect=[_completed(), _completed()]), \
             mock.patch.object(BOX, "do_delete_droplet", side_effect=delete_droplet), \
+            mock.patch.object(BOX, "do_get_droplet", return_value=None), \
             mock.patch.object(BOX, "do_get_volume", side_effect=get_volume), \
             mock.patch.object(BOX, "do_detach_volume", side_effect=detach_volume), \
             mock.patch.object(BOX, "do_delete_volume", side_effect=delete_volume), \
@@ -502,7 +505,8 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertEqual(box.state, "destroyed")
         self.assertEqual(calls, ["delete-droplet", "get-volume", "detach-volume", "get-volume", "delete-volume"])
         payload = payloads[-1]
-        self.assertEqual([step["step"] for step in payload["steps"]], ["drain", "remove", "firewall", "destroy", "volume"])
+        # read-after-delete `confirm` step sits between destroy and volume.
+        self.assertEqual([step["step"] for step in payload["steps"]], ["drain", "remove", "firewall", "destroy", "confirm", "volume"])
         self.assertEqual(payload["steps"][-1]["status"], "ok")
 
     def test_cmd_down_does_not_delete_volume_attached_elsewhere(self) -> None:
@@ -524,6 +528,7 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(BOX, "resolve_box_ssh_target", return_value="1.2.3.4"), \
             mock.patch.object(BOX, "ssh_cmd", side_effect=[_completed(), _completed()]), \
             mock.patch.object(BOX, "do_delete_droplet", return_value=True), \
+            mock.patch.object(BOX, "do_get_droplet", return_value=None), \
             mock.patch.object(BOX, "do_get_volume", return_value={"id": "vol-1", "droplet_ids": ["999"]}), \
             mock.patch.object(BOX, "do_detach_volume") as detach_volume, \
             mock.patch.object(BOX, "do_delete_volume") as delete_volume, \
