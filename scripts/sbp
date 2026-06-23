@@ -158,7 +158,7 @@ Usage:
   __WRAPPER__ evidence [--repo P|--skill N] --format json  Measure skill invocations per
                               repo from Cass (contamination-safe), joined to current policy
   __WRAPPER__ cron [status|apply]     Declared crontab + script links from skillbox-config
-  __WRAPPER__ send-later schedule --minutes N ...  One-shot delayed NTM/tmux send
+  __WRAPPER__ send-later [new|panes]  Schedule a delayed/recurring tmux/NTM send (new=interactive)
   __WRAPPER__ beads [status|init|sync] Check or initialize repo-local beads state
   __WRAPPER__ mmdx QUERY              Fuzzy-find and open .mmdx/.mmd from this cwd
   __WRAPPER__ mmdx                    List recent .mmdx/.mmd files from this repo
@@ -649,7 +649,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-if [[ ! -t 0 && "${action}" != "home" && "${action}" != "help" ]]; then
+if [[ ! -t 0 && "${action}" != "home" && "${action}" != "help" && "${action}" != "send-later" ]]; then
   while IFS= read -r line; do
     line="${line//,/ }"
     # Intentional shell-word splitting for simple pipe-friendly wrapper input.
