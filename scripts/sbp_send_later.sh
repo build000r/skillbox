@@ -21,13 +21,27 @@ CAPTURE_LINES="${SBP_SEND_LATER_CAPTURE_LINES:-40}"
 usage() {
   cat <<'EOF'
 Usage:
-  sbp send-later
-  sbp send-later list
-  sbp send-later cancel ID
-  sbp send-later install-cron
-  sbp send-later schedule --minutes N --id ID --session SESSION --pane PANE --message TEXT [gate flags]
-  sbp send-later schedule --minutes N --id ID --target TMUX_TARGET --key KEY [--key KEY ...] [--key-delay SECONDS] [gate flags]
-  sbp send-later run-pending
+  sbp send-later                       Show scheduled jobs (home view)
+  sbp send-later panes [--json]        List live tmux panes you can target
+  sbp send-later new                   Interactive scheduler (pick pane, when, message)
+  sbp send-later list                  List scheduled jobs
+  sbp send-later cancel ID             Remove a scheduled job
+  sbp send-later install-cron          Install the per-minute run-pending tick
+  sbp send-later run-pending           Fire any due jobs (called by cron)
+
+  sbp send-later schedule --to <#|target|name> --message TEXT [--in 5h|--at 9am] [gate flags]
+  sbp send-later schedule --target SESS:WIN.PANE --key KEY [--key KEY ...] [--key-delay S] [when] [gate flags]
+  sbp send-later schedule --session S --pane P --message TEXT [when] [gate flags]
+
+When (default = now / next tick):
+  --in DURATION          90s | 30m | 5h | 2d
+  --at TIME              "9am" | "14:30" | "tomorrow 09:00"   (GNU date expressions)
+  --minutes N            fire N minutes from now
+
+Targeting:
+  --to <#|target|name>   pick by panes-list number, session:win.pane, or fuzzy agent/title
+  --force                schedule even if the target pane is not live yet
+  --id ID                job id (auto-generated from target + time if omitted)
 
 Gate / recurring flags (optional):
   --recurring            Keep re-evaluating every cron tick instead of firing once.
@@ -39,14 +53,17 @@ Gate / recurring flags (optional):
   --busy-regex RE        Override the "running" signature (extended regex).
 
 Examples:
-  # One-shot, fire after 5h regardless of state (rate-limit window):
-  sbp send-later schedule --minutes 300 --id my-job --session devbox-1 --pane 0 --message continue
+  # Easiest: pick a pane and answer a few prompts
+  sbp send-later new
 
-  # Recurring auto-continue: every minute, type "continue" ONLY when grok pane 0 is idle:
-  sbp send-later schedule --minutes 0 --id grok-continue --target devbox-1:0.0 \
-    --key continue --key Enter --recurring --when-waiting
+  # One-shot, fire in 5h into pane #3 from `sbp send-later panes`:
+  sbp send-later schedule --to 3 --in 5h --message "continue"
 
-  sbp send-later schedule --minutes 300 --id my-rate-limit-job --target devbox-1:0.0 --key 1 --key Enter --key continue --key Enter
+  # Auto-continue: nudge a pane ONLY when it goes idle, forever:
+  sbp send-later schedule --to grok --message continue --recurring --when-waiting
+
+  # Raw keys (advanced) at a wall-clock time:
+  sbp send-later schedule --target devbox-1:0.0 --key 1 --key Enter --key continue --key Enter --at "tomorrow 09:00"
 EOF
 }
 
@@ -90,20 +107,168 @@ install_cron() {
   echo "installed cron: $CRON_LINE"
 }
 
+have_tty() {
+  [[ -t 0 && -t 1 ]]
+}
+
+# Emit one TSV row per live tmux pane: idx, target, agent, state, title, here.
+# Default is instant (tmux only): AGENT is the pane's current command, STATE blank.
+# Pass "rich" as $1 to enrich AGENT/STATE from `ntm --robot-snapshot` — that call
+# can be slow (seconds), so it is opt-in and hard-capped by `timeout`.
+list_panes_tsv() {
+  local rich="${1:-}"
+  local me="${TMUX_PANE:-}"
+  declare -A NTM_TYPE NTM_STATE
+  if [[ "$rich" == "rich" ]] && command -v ntm >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    local k t s
+    while IFS=$'\t' read -r k t s; do
+      [[ -n "$k" ]] || continue
+      NTM_TYPE["$k"]="$t"
+      NTM_STATE["$k"]="$s"
+    done < <(timeout 8 ntm --robot-snapshot --robot-format=json 2>/dev/null \
+      | jq -r '.sessions[]? | .name as $s | (((.agents // "[]") | fromjson?) // []) | .[]? | "\($s):\(.pane)\t\(.type // "")\t\(.state // "")"' 2>/dev/null || true)
+  fi
+  local fmt idx=0 target pane_id active cmd title agent state here
+  fmt=$'#{session_name}:#{window_index}.#{pane_index}\t#{pane_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_title}'
+  while IFS=$'\t' read -r target pane_id active cmd title; do
+    [[ -n "$target" ]] || continue
+    idx=$((idx + 1))
+    agent="${NTM_TYPE[$target]:-$cmd}"
+    state="${NTM_STATE[$target]:-}"
+    here=""
+    [[ -n "$me" && "$pane_id" == "$me" ]] && here="here"
+    printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' "$idx" "$target" "$agent" "$state" "$title" "$here"
+  done < <(tmux list-panes -a -F "$fmt" 2>/dev/null || true)
+}
+
+# Show the pane inventory: a human table, or --json for agents/scripts.
+# --rich adds live agent type + busy/idle state via ntm (slower).
+cmd_panes() {
+  local json="false" rich=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) json="true" ;;
+      # The sbp wrapper normalizes --json to "--format json"; accept both.
+      --format) [[ "${2:-}" == "json" ]] || die "panes: --format only supports json"; json="true"; shift ;;
+      --rich) rich="rich" ;;
+      *) die "unknown panes arg: $1 (use --json and/or --rich)" ;;
+    esac
+    shift
+  done
+  local rows; rows="$(list_panes_tsv "$rich")"
+  if [[ "$json" == "true" ]]; then
+    if [[ -z "$rows" ]]; then echo "[]"; return 0; fi
+    printf '%s\n' "$rows" | jq -R -s '
+      split("\n") | map(select(length > 0)) | map(split("\u001f"))
+      | map({idx:(.[0]|tonumber), target:.[1], agent:.[2], state:.[3], title:.[4], here:(.[5]=="here")})'
+    return 0
+  fi
+  if [[ -z "$rows" ]]; then
+    echo "0 panes (no tmux server on this box)"
+    return 0
+  fi
+  echo "Live panes you can target:"
+  printf '  %-3s %-15s %-8s %-7s %s\n' "#" "TARGET" "AGENT" "STATE" "TITLE"
+  local idx target agent state title here mark
+  while IFS=$'\x1f' read -r idx target agent state title here; do
+    mark=""; [[ "$here" == "here" ]] && mark="   <- you are here"
+    printf '  %-3s %-15s %-8s %-7s %s%s\n' "$idx" "$target" "${agent:-?}" "${state:-—}" "$title" "$mark"
+  done <<< "$rows"
+  echo
+  [[ "$rich" == "rich" ]] || echo '(AGENT = process; add --rich for live agent type + busy/idle state)'
+  echo 'schedule:    sbp send-later schedule --to <#|target|name> --in 5h --message "continue"'
+  echo 'interactive: sbp send-later new'
+}
+
+# Resolve a --to value (row number | session:win.pane | fuzzy agent/title) to a
+# canonical tmux target. Dies with an actionable message on miss/ambiguity.
+resolve_target() {
+  local val="$1" rows idx target agent state title here
+  rows="$(list_panes_tsv)"
+  if [[ "$val" =~ ^[0-9]+$ ]]; then
+    while IFS=$'\x1f' read -r idx target agent state title here; do
+      [[ "$idx" == "$val" ]] && { printf '%s' "$target"; return 0; }
+    done <<< "$rows"
+    die "no pane #$val; run: sbp send-later panes"
+  fi
+  if [[ "$val" == *:* ]]; then
+    printf '%s' "$val"; return 0
+  fi
+  local matches=()
+  while IFS=$'\x1f' read -r idx target agent state title here; do
+    [[ -n "$target" ]] || continue
+    if [[ "${target,,}" == *"${val,,}"* || "${agent,,}" == *"${val,,}"* || "${title,,}" == *"${val,,}"* ]]; then
+      matches+=("$target")
+    fi
+  done <<< "$rows"
+  case "${#matches[@]}" in
+    1) printf '%s' "${matches[0]}"; return 0 ;;
+    0) die "no pane matches '$val'; run: sbp send-later panes" ;;
+    *) die "'$val' matches ${#matches[@]} panes: ${matches[*]} — be more specific (use # or session:win.pane)" ;;
+  esac
+}
+
+# True if TARGET resolves to a live tmux pane right now.
+target_exists() {
+  local target="$1" pid
+  pid="$(tmux display-message -p -t "$target" '#{pane_id}' 2>/dev/null || true)"
+  [[ -n "$pid" ]]
+}
+
+# Interactive scheduler for humans. Refuses to run without a TTY so agents/cron
+# always take the flag path instead of blocking on a prompt.
+wizard_new() {
+  have_tty || die "interactive wizard needs a terminal. Use: sbp send-later schedule --to <#|target> --in 5h --message \"...\""
+  cmd_panes
+  local sel when msg gate recur target when_label
+  read -r -p $'\nTarget? [#|session:win.pane|name] > ' sel
+  [[ -n "$sel" ]] || die "no target chosen"
+  target="$(resolve_target "$sel")"
+  read -r -p 'When?     [e.g. 5h, 30m, 9am, now] > ' when
+  [[ -n "$when" ]] || when="now"
+  read -r -p 'Message?  > ' msg
+  [[ -n "$msg" ]] || die "no message"
+  read -r -p 'Only when the pane is idle? [y/N] > ' gate
+  read -r -p 'Repeat (recurring)?        [y/N] > ' recur
+
+  local when_flag=()
+  case "$when" in
+    now)          when_flag=(--minutes 0); when_label="now" ;;
+    *[0-9][smhd]) when_flag=(--in "$when"); when_label="in $when" ;;
+    *)            when_flag=(--at "$when"); when_label="at $when" ;;
+  esac
+  local extra=() gate_label="" recur_label=""
+  if [[ "$gate" =~ ^[Yy] ]]; then extra+=(--when-waiting); gate_label=" (only when idle)"; fi
+  if [[ "$recur" =~ ^[Yy] ]]; then extra+=(--recurring); recur_label=" (recurring)"; fi
+
+  echo
+  echo "> Will send \"$msg\" to $target $when_label$gate_label$recur_label"
+  local ok
+  read -r -p 'Confirm? [Y/n] > ' ok
+  [[ -z "$ok" || "$ok" =~ ^[Yy] ]] || { echo "cancelled"; return 0; }
+  echo
+  local args=(--to "$target" "${when_flag[@]}" --message "$msg")
+  [[ "${#extra[@]}" -gt 0 ]] && args+=("${extra[@]}")
+  schedule_job "${args[@]}"
+}
+
 schedule_job() {
-  local minutes="" id="" session="" pane="" message="" target="" key_delay="1"
+  local minutes="" in_spec="" at_spec="" id="" session="" pane="" message="" target="" to="" key_delay="1"
   local recurring="false" when_waiting="false" cooldown_min="0" renudge_min="0"
-  local idle_re="" busy_re=""
+  local idle_re="" busy_re="" force="false"
   local keys=()
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --minutes) require_value "$1" "$#"; minutes="$2"; shift 2 ;;
+      --in) require_value "$1" "$#"; in_spec="$2"; shift 2 ;;
+      --at) require_value "$1" "$#"; at_spec="$2"; shift 2 ;;
       --id) require_value "$1" "$#"; id="$(sanitize_id "$2")"; shift 2 ;;
       --session) require_value "$1" "$#"; session="$2"; shift 2 ;;
       --pane) require_value "$1" "$#"; pane="$2"; shift 2 ;;
       --message) require_value "$1" "$#"; message="$2"; shift 2 ;;
       --target) require_value "$1" "$#"; target="$2"; shift 2 ;;
+      --to) require_value "$1" "$#"; to="$2"; shift 2 ;;
       --key) require_value "$1" "$#"; keys+=("$2"); shift 2 ;;
       --key-delay) require_value "$1" "$#"; key_delay="$2"; shift 2 ;;
       --recurring) recurring="true"; shift 1 ;;
@@ -112,19 +277,29 @@ schedule_job() {
       --renudge-minutes) require_value "$1" "$#"; renudge_min="$2"; shift 2 ;;
       --idle-regex) require_value "$1" "$#"; idle_re="$2"; shift 2 ;;
       --busy-regex) require_value "$1" "$#"; busy_re="$2"; shift 2 ;;
+      --force) force="true"; shift 1 ;;
       -h|--help) usage; exit 0 ;;
       *) die "unknown schedule arg: $1" ;;
     esac
   done
 
-  [[ "$minutes" =~ ^[0-9]+$ ]] || die "--minutes must be a non-negative integer"
-  [[ -n "$id" ]] || die "--id is required"
   validate_key_delay "$key_delay"
   [[ "$cooldown_min" =~ ^[0-9]+$ ]] || die "--cooldown-minutes must be a non-negative integer"
   [[ "$renudge_min" =~ ^[0-9]+$ ]] || die "--renudge-minutes must be a non-negative integer"
 
+  # ---- resolve destination + mode -----------------------------------------
   local mode=""
-  if [[ -n "$message" ]]; then
+  if [[ -n "$to" ]]; then
+    [[ -z "$session" && -z "$pane" && -z "$target" ]] \
+      || die "use --to OR --session/--pane OR --target, not several at once"
+    target="$(resolve_target "$to")"
+    if [[ "${#keys[@]}" -eq 0 ]]; then
+      [[ -n "$message" ]] || die "--to needs --message (or one or more --key)"
+      keys=("$message" "Enter")
+      message=""
+    fi
+    mode="tmux_keys"
+  elif [[ -n "$message" ]]; then
     [[ -n "$session" ]] || die "--session is required with --message"
     [[ -n "$pane" ]] || die "--pane is required with --message"
     [[ "${#keys[@]}" -eq 0 ]] || die "use either --message/--session/--pane or --target/--key, not both"
@@ -135,16 +310,56 @@ schedule_job() {
     [[ -z "$session" && -z "$pane" ]] || die "use either --message/--session/--pane or --target/--key, not both"
     mode="tmux_keys"
   else
-    die "provide either --message or at least one --key"
+    die "provide a destination: --to <#|target|name> --message TEXT  (or --message with --session/--pane, or --target with --key)"
+  fi
+
+  # ---- resolve when (--at / --in / --minutes; default: now/next tick) ------
+  local now due due_utc
+  now="$(date -u +%s)"
+  if [[ -n "$at_spec" ]]; then
+    due="$(date -u -d "$at_spec" +%s 2>/dev/null)" \
+      || die "could not parse --at '$at_spec' (try '9am', '14:30', 'tomorrow 09:00')"
+    if (( due < now )); then due=$((due + 86400)); fi
+  elif [[ -n "$in_spec" ]]; then
+    [[ "$in_spec" =~ ^([0-9]+)([smhd])$ ]] || die "--in must look like 90s / 30m / 5h / 2d"
+    local n="${BASH_REMATCH[1]}" unit="${BASH_REMATCH[2]}" secs=0
+    case "$unit" in
+      s) secs=$((n)) ;; m) secs=$((n * 60)) ;; h) secs=$((n * 3600)) ;; d) secs=$((n * 86400)) ;;
+    esac
+    due=$((now + secs))
+  elif [[ -n "$minutes" ]]; then
+    [[ "$minutes" =~ ^[0-9]+$ ]] || die "--minutes must be a non-negative integer"
+    due=$((now + minutes * 60))
+  else
+    due=$now
+  fi
+  due_utc="$(date -u -d "@$due" +%Y-%m-%dT%H:%M:%SZ)"
+
+  # ---- preflight: destination must be live now (unless --force) ------------
+  if [[ "$force" != "true" ]]; then
+    if [[ "$mode" == "tmux_keys" && -n "$target" ]] && ! target_exists "$target"; then
+      die "target '$target' is not a live tmux pane right now.
+  see targets:     sbp send-later panes
+  schedule anyway: re-run with --force"
+    elif [[ "$mode" == "ntm_send" ]] && ! tmux has-session -t "=$session" 2>/dev/null; then
+      die "session '$session' is not a live tmux session right now.
+  see targets:     sbp send-later panes
+  schedule anyway: re-run with --force"
+    fi
+  fi
+
+  # ---- auto-generate id when not supplied ----------------------------------
+  if [[ -z "$id" ]]; then
+    local base
+    if [[ "$mode" == "tmux_keys" ]]; then base="$target"; else base="${session}-${pane}"; fi
+    base="$(printf 'sl-%s-%s' "$base" "$(date -u +%H%M%S)" | tr -c 'A-Za-z0-9_.-' '-')"
+    id="$(sanitize_id "$base")"
   fi
 
   mkdir -p "$STATE_DIR" "$LOG_DIR"
   install_cron >/dev/null
 
-  local now due due_utc job keys_joined
-  now="$(date -u +%s)"
-  due=$((now + minutes * 60))
-  due_utc="$(date -u -d "@$due" +%Y-%m-%dT%H:%M:%SZ)"
+  local job keys_joined
   job="$STATE_DIR/$id.env"
   local replaced="false"
   if [[ -f "$job" ]]; then
@@ -176,9 +391,12 @@ IDLE_RE_B64='$(b64 "$idle_re")'
 BUSY_RE_B64='$(b64 "$busy_re")'
 EOF
 
-  echo "scheduled: id=$id due_utc=$due_utc mode=$mode recurring=$recurring when_waiting=$when_waiting replaced=$replaced"
-  echo "state: job=$job log=$STATE_DIR/$id.log"
-  echo "next: sbp send-later list"
+  local dest
+  if [[ "$mode" == "tmux_keys" ]]; then dest="$target"; else dest="session $session pane $pane"; fi
+  echo "scheduled: id=$id -> $dest"
+  echo "  when=$due_utc  mode=$mode  recurring=$recurring  when_waiting=$when_waiting  replaced=$replaced"
+  echo "  state: $job"
+  echo "next: sbp send-later list   |   cancel: sbp send-later cancel $id"
 }
 
 send_tmux_key() {
@@ -211,8 +429,11 @@ gate_target() {
 # ticks (strip the cursor block and trailing whitespace).
 capture_norm() {
   local target="$1"
+  # A missing/dead target pane must not abort the batch: under `set -e` +
+  # `pipefail` a failing tmux capture would otherwise propagate out of the
+  # command substitution and kill run-pending. Swallow it -> empty capture.
   tmux capture-pane -p -t "$target" -S "-${CAPTURE_LINES}" 2>/dev/null \
-    | sed -e 's/█//g' -e 's/[[:space:]]*$//'
+    | sed -e 's/█//g' -e 's/[[:space:]]*$//' || true
 }
 
 # Classify a capture as waiting|running|unknown.
@@ -249,7 +470,9 @@ run_job() {
 
   local now done_file log_file lock_file last_file fp_file sent_file
   now="$(date -u +%s)"
-  [[ "$now" -ge "$DUE_EPOCH" ]] || return 0
+  # Default DUE_EPOCH so jobs written before this field existed don't trip set -u.
+  local due_epoch="${DUE_EPOCH:-0}"
+  [[ "$now" -ge "$due_epoch" ]] || return 0
 
   done_file="$STATE_DIR/$ID.done"
   log_file="$STATE_DIR/$ID.log"
@@ -354,10 +577,16 @@ run_job() {
 
 run_pending() {
   mkdir -p "$STATE_DIR" "$LOG_DIR"
-  local job
+  local job rc
   shopt -s nullglob
   for job in "$STATE_DIR"/*.env; do
-    run_job "$job"
+    # Isolate each job in a subshell so ANY failure in one job (vanished gate
+    # target, malformed env, set -e/-u abort) can never wedge the whole batch.
+    rc=0
+    ( run_job "$job" ) || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+      echo "$(date -u +%FT%TZ) run_job failed job=$job rc=$rc" >> "$LOG_DIR/ntm-send-later.cron.log"
+    fi
   done
 }
 
@@ -368,21 +597,21 @@ list_jobs() {
   local jobs=("$STATE_DIR"/*.env)
   echo "jobs: ${#jobs[@]}"
   if [[ "${#jobs[@]}" -eq 0 ]]; then
-    echo "next: sbp send-later schedule --minutes N --id ID --session SESSION --pane PANE --message TEXT"
+    echo "next: sbp send-later new   (interactive)   |   sbp send-later panes   (list targets)"
     return 0
   fi
   for job in "${jobs[@]}"; do
     # shellcheck disable=SC1090
     source "$job"
-    id="$ID"
-    due="$DUE_UTC"
-    mode="$MODE"
+    id="${ID:-$(basename "$job" .env)}"
+    due="${DUE_UTC:-?}"
+    mode="${MODE:-?}"
     status="pending"
     [[ "${RECURRING:-false}" == "true" ]] && status="recurring"
     [[ -f "$STATE_DIR/$id.done" ]] && status="done"
     echo "- id=$id status=$status due_utc=$due mode=$mode recurring=${RECURRING:-false} gate=${WHEN_WAITING:-false} job=$job"
   done
-  echo "next: sbp send-later run-pending"
+  echo "next: sbp send-later new | panes | cancel ID | run-pending"
 }
 
 cancel_job() {
@@ -411,6 +640,8 @@ main() {
     schedule) schedule_job "$@" ;;
     run-pending) run_pending ;;
     list) list_jobs ;;
+    panes|targets) cmd_panes "$@" ;;
+    new|wizard) wizard_new ;;
     cancel|remove) cancel_job "$@" ;;
     -h|--help) usage ;;
     "") list_jobs ;;
