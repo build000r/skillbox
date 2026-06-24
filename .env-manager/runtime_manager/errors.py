@@ -140,6 +140,7 @@ class NetworkError(SkillboxError):
 # top-level handler. Distinct from the per-domain codes so an INTERNAL envelope
 # is never mistaken for a known failure.
 INTERNAL_ERROR_CODE = "INTERNAL"
+OVERRIDE_PARSE_ERROR = "OVERRIDE_PARSE_ERROR"
 
 
 def internal_error_payload(
@@ -162,6 +163,7 @@ __all__ = [
     "DEPRECATION_MARKER",
     "DEPRECATION_NOTE",
     "INTERNAL_ERROR_CODE",
+    "OVERRIDE_PARSE_ERROR",
     "SkillboxError",
     "ValidationError",
     "RuntimeLifecycleError",

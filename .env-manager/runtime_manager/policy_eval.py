@@ -32,7 +32,6 @@ from .shared import (
 )
 
 from ._skill_common import *
-
 __all__ = [
     'SKILL_SCOPE_POLICY_FILES',
     'OVERLAY_STATE_ENV',
@@ -69,6 +68,7 @@ __all__ = [
     'overlay_scoped_skill_names',
     '_load_scope_policy',
     '_operator_scope_policies',
+    '_repo_override_policy',
     '_project_categories_for_policy',
     '_project_categories',
     '_matched_project_categories',
@@ -111,12 +111,25 @@ __all__ = [
 
 
 SKILL_SCOPE_POLICY_FILES = ("skill-scope.yaml", "skills-scope.yaml")
+SKILL_OVERRIDES_REL = Path(".skillbox") / "skill-overrides.yaml"
 OVERLAY_STATE_ENV = "SKILLBOX_OVERLAY_STATE"
 OVERLAY_STATE_DEFAULT = "~/.skillbox-state/overlays"
 OVERLAY_ENV_VAR = "SKILLBOX_OVERLAYS"
 SKILL_SOURCE_ROOT_KEYS = ("skill_source_roots", "source_roots", "skill_roots")
 SKILL_INSTALL_SCAN_ROOT_KEYS = ("skill_install_scan_roots", "install_scan_roots")
 WILDCARD_CHARS = set("*?[")
+OVERRIDE_POLICY_VERSION = 1
+OVERRIDE_LIST_KEYS = ("pin_on", "pin_off", "opt_out_global", "defaults")
+OVERRIDE_OVERLAY_KEYS = ("enable", "disable")
+OVERRIDE_ALLOWED_KEYS = {
+    "version",
+    "pin_on",
+    "pin_off",
+    "opt_out_global",
+    "overlays",
+    "defaults",
+    "reason",
+}
 
 
 def _frontmatter_truthy(value: Any) -> bool:
@@ -613,6 +626,126 @@ def _load_scope_policy(path: Path) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
     return raw
+
+
+def _empty_repo_override_policy(
+    repo_root: Path,
+    policy_path: Path,
+    *,
+    errors: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    error_list = list(errors or [])
+    return {
+        "ok": not error_list,
+        "version": OVERRIDE_POLICY_VERSION,
+        "pin_on": [],
+        "pin_off": [],
+        "opt_out_global": [],
+        "overlays": {"enable": [], "disable": []},
+        "defaults": [],
+        "reason": "",
+        "errors": error_list,
+        "_repo_root": str(repo_root),
+        "_policy_path": str(policy_path),
+    }
+
+
+def _override_error(
+    policy_path: Path,
+    message: str,
+    *,
+    key: str | None = None,
+) -> dict[str, Any]:
+    from .errors import OVERRIDE_PARSE_ERROR  # noqa: PLC0415
+
+    error: dict[str, Any] = {
+        "code": OVERRIDE_PARSE_ERROR,
+        "message": message,
+        "path": str(policy_path),
+    }
+    if key is not None:
+        error["key"] = key
+    return error
+
+
+def _override_name_list(value: Any) -> list[str]:
+    return sorted(
+        {
+            str(item).strip()
+            for item in _as_list(value)
+            if str(item).strip()
+        }
+    )
+
+
+def _repo_override_policy(cwd: str | os.PathLike[str] | Path) -> dict[str, Any]:
+    """Read the repo-local skill override policy anchored at the git root.
+
+    Missing files resolve to an empty policy. Malformed YAML or schema
+    violations are reported in ``errors`` while the effective override payload
+    fails safe to empty lists.
+    """
+    cwd_path = Path(os.path.expandvars(os.path.expanduser(str(cwd))))
+    repo_root = _repo_root_for_skill_install(cwd_path)
+    policy_path = repo_root / SKILL_OVERRIDES_REL
+    empty_policy = _empty_repo_override_policy(repo_root, policy_path)
+
+    if not policy_path.is_file():
+        return empty_policy
+
+    try:
+        raw = load_yaml(policy_path)
+    except RuntimeError as exc:
+        return _empty_repo_override_policy(
+            repo_root,
+            policy_path,
+            errors=[_override_error(policy_path, str(exc))],
+        )
+
+    errors: list[dict[str, Any]] = []
+    unknown_keys = sorted(str(key) for key in set(raw) - OVERRIDE_ALLOWED_KEYS)
+    for key in unknown_keys:
+        errors.append(
+            _override_error(policy_path, f"unknown skill override key: {key}", key=key)
+        )
+
+    if raw.get("version") != OVERRIDE_POLICY_VERSION:
+        errors.append(
+            _override_error(
+                policy_path,
+                f"skill override version must be {OVERRIDE_POLICY_VERSION}",
+                key="version",
+            )
+        )
+
+    overlays_value = raw.get("overlays")
+    overlays_raw = overlays_value or {}
+    if overlays_value is not None and not isinstance(overlays_value, dict):
+        errors.append(
+            _override_error(policy_path, "overlays must be a mapping", key="overlays")
+        )
+        overlays_raw = {}
+    for key in sorted(set(overlays_raw) - set(OVERRIDE_OVERLAY_KEYS)):
+        errors.append(
+            _override_error(
+                policy_path,
+                f"unknown overlays key: {key}",
+                key=f"overlays.{key}",
+            )
+        )
+
+    policy = _empty_repo_override_policy(repo_root, policy_path, errors=errors)
+    if errors:
+        return policy
+
+    for key in OVERRIDE_LIST_KEYS:
+        policy[key] = _override_name_list(raw.get(key))
+    policy["overlays"] = {
+        key: _override_name_list(overlays_raw.get(key))
+        for key in OVERRIDE_OVERLAY_KEYS
+    }
+    policy["reason"] = str(raw.get("reason") or "").strip()
+    return policy
 
 
 def _operator_scope_policies(model: dict[str, Any]) -> list[dict[str, Any]]:
