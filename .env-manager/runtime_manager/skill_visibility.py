@@ -79,6 +79,7 @@ from .shared import (
     load_yaml,
     load_skill_repos_config,
 )
+from .errors import PRUNE_SKIPPED_PINNED
 """
 
 # Decomposed modules in strict dependency (layer) order.
