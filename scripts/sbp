@@ -158,7 +158,7 @@ Usage:
   __WRAPPER__ evidence [--repo P|--skill N] --format json  Measure skill invocations per
                               repo from Cass (contamination-safe), joined to current policy
   __WRAPPER__ cron [status|apply]     Declared crontab + script links from skillbox-config
-  __WRAPPER__ send-later [new|panes]  Schedule a delayed/recurring tmux/NTM send (new=interactive)
+  __WRAPPER__ send-later [list|doctor|new|panes] Schedule/inspect delayed/recurring tmux/NTM sends (--json on list/doctor/panes)
   __WRAPPER__ beads [status|init|sync] Check or initialize repo-local beads state
   __WRAPPER__ mmdx QUERY              Fuzzy-find and open .mmdx/.mmd from this cwd
   __WRAPPER__ mmdx                    List recent .mmdx/.mmd files from this repo
@@ -247,7 +247,7 @@ payload = {
         {"name": "cass", "json": True, "safe_first_try": f"{wrapper} cass status --json"},
         {"name": "evidence", "json": True, "safe_first_try": f"{wrapper} evidence --repo <path> --format json"},
         {"name": "cron", "json": True, "safe_first_try": f"{wrapper} cron status --json"},
-        {"name": "send-later", "json": False, "safe_first_try": f"{wrapper} send-later list"},
+        {"name": "send-later", "json": True, "safe_first_try": f"{wrapper} send-later list --json"},
         {"name": "recalibrate", "json": False, "safe_first_try": f"{wrapper} recalibrate"},
     ],
     "agent_surfaces": {
