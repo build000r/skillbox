@@ -9,10 +9,13 @@ cwd*. Depends only on ._skill_common.
 from __future__ import annotations
 
 import fnmatch
+import fcntl
 import glob
 import hashlib
 import os
 import shutil
+import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -29,6 +32,7 @@ from .shared import (
     load_json_file,
     load_yaml,
     load_skill_repos_config,
+    require_yaml,
 )
 
 from ._skill_common import *
@@ -69,6 +73,9 @@ __all__ = [
     '_load_scope_policy',
     '_operator_scope_policies',
     '_repo_override_policy',
+    'update_repo_override_policy',
+    'OVERRIDE_WRITE_LOCK_TIMEOUT_SECONDS',
+    'OverrideWriteLockTimeout',
     '_project_categories_for_policy',
     '_project_categories',
     '_matched_project_categories',
@@ -121,6 +128,8 @@ WILDCARD_CHARS = set("*?[")
 OVERRIDE_POLICY_VERSION = 1
 OVERRIDE_LIST_KEYS = ("pin_on", "pin_off", "opt_out_global", "defaults")
 OVERRIDE_OVERLAY_KEYS = ("enable", "disable")
+OVERRIDE_WRITE_LOCK_TIMEOUT_SECONDS = 5.0
+_OVERRIDE_WRITE_POLL_INTERVAL_SECONDS = 0.02
 OVERRIDE_ALLOWED_KEYS = {
     "version",
     "pin_on",
@@ -130,6 +139,14 @@ OVERRIDE_ALLOWED_KEYS = {
     "defaults",
     "reason",
 }
+
+
+class OverrideWriteLockTimeout(RuntimeError):
+    """Raised when the repo override writer cannot acquire its sidecar lock."""
+
+    def __init__(self, lock_path: Path) -> None:
+        self.lock_path = Path(lock_path)
+        super().__init__(f"Timed out acquiring skill override lock {self.lock_path}.")
 
 
 def _frontmatter_truthy(value: Any) -> bool:
@@ -746,6 +763,135 @@ def _repo_override_policy(cwd: str | os.PathLike[str] | Path) -> dict[str, Any]:
     }
     policy["reason"] = str(raw.get("reason") or "").strip()
     return policy
+
+
+def _repo_override_paths(cwd: str | os.PathLike[str] | Path) -> tuple[Path, Path]:
+    cwd_path = Path(os.path.expandvars(os.path.expanduser(str(cwd))))
+    repo_root = _repo_root_for_skill_install(cwd_path)
+    return repo_root, repo_root / SKILL_OVERRIDES_REL
+
+
+def _override_policy_for_write(policy_path: Path) -> dict[str, Any]:
+    if not policy_path.is_file():
+        return {
+            "version": OVERRIDE_POLICY_VERSION,
+            "pin_on": [],
+            "pin_off": [],
+            "opt_out_global": [],
+            "overlays": {"enable": [], "disable": []},
+            "defaults": [],
+            "reason": "",
+        }
+    raw = load_yaml(policy_path)
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"skill override policy must be a mapping: {policy_path}")
+    return dict(raw)
+
+
+def _serialize_override_policy(policy: dict[str, Any]) -> str:
+    yaml_mod = require_yaml("write skill override policy")
+    payload = dict(policy)
+    payload.setdefault("version", OVERRIDE_POLICY_VERSION)
+    payload.setdefault("pin_on", [])
+    payload.setdefault("pin_off", [])
+    payload.setdefault("opt_out_global", [])
+    payload.setdefault("overlays", {"enable": [], "disable": []})
+    payload.setdefault("defaults", [])
+    payload.setdefault("reason", "")
+    return yaml_mod.safe_dump(payload, sort_keys=False).rstrip() + "\n"
+
+
+def _fsync_parent_dir(path: Path) -> None:
+    parent_fd = os.open(str(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _atomic_write_override_text(path: Path, content: str, *, fsync: bool) -> None:
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            if fsync:
+                os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        if fsync:
+            _fsync_parent_dir(path)
+    except BaseException:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _wait_for_override_text(path: Path, expected: str) -> None:
+    deadline = time.monotonic() + 0.5
+    while True:
+        try:
+            if path.read_text(encoding="utf-8") == expected:
+                return
+        except OSError:
+            pass
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.01)
+
+
+def update_repo_override_policy(
+    cwd: str | os.PathLike[str] | Path,
+    mutate_fn: Callable[[dict[str, Any]], dict[str, Any] | None],
+    *,
+    fsync: bool = True,
+    timeout: float = OVERRIDE_WRITE_LOCK_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Locked, crash-safe read-modify-write for .skillbox/skill-overrides.yaml."""
+    _repo_root, policy_path = _repo_override_paths(cwd)
+    policy_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = policy_path.with_name(policy_path.name + ".lock")
+
+    def _commit() -> dict[str, Any]:
+        current = _override_policy_for_write(policy_path)
+        updated = mutate_fn(dict(current))
+        if updated is None:
+            updated = current
+        serialized = _serialize_override_policy(updated)
+        previous = policy_path.read_text(encoding="utf-8") if policy_path.is_file() else ""
+        changed = previous != serialized
+        if changed:
+            _atomic_write_override_text(policy_path, serialized, fsync=fsync)
+            _wait_for_override_text(policy_path, serialized)
+        policy = _repo_override_policy(policy_path.parent)
+        policy["changed"] = changed
+        policy["lock_path"] = str(lock_path)
+        return policy
+
+    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise OverrideWriteLockTimeout(lock_path)
+                time.sleep(_OVERRIDE_WRITE_POLL_INTERVAL_SECONDS)
+        return _commit()
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(lock_fd)
 
 
 def _operator_scope_policies(model: dict[str, Any]) -> list[dict[str, Any]]:

@@ -58,10 +58,13 @@ _SKILL_VISIBILITY_HEADER = """\
 from __future__ import annotations
 
 import fnmatch
+import fcntl
 import glob
 import hashlib
 import os
 import shutil
+import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -78,6 +81,7 @@ from .shared import (
     load_json_file,
     load_yaml,
     load_skill_repos_config,
+    require_yaml,
 )
 from .errors import PRUNE_SKIPPED_PINNED
 """
