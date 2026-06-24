@@ -5,6 +5,7 @@ import argparse
 import difflib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -22,29 +23,67 @@ from lib.runtime_model import build_runtime_model
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 WORKSPACE_DIR = ROOT_DIR / "workspace"
-EXPECTED_FILES = [
-    ".env.example",
-    "Dockerfile",
-    "docker-compose.yml",
-    "docker-compose.monoserver.yml",
-    "docker-compose.swimmers.yml",
-    ".env-manager/README.md",
-    ".env-manager/manage.py",
-    "docker/sandbox-entrypoint.sh",
-    "scripts/01-bootstrap-do.sh",
-    "scripts/02-install-tailscale.sh",
-    "scripts/05-swimmers.sh",
-    "scripts/quick_validate.py",
-    "scripts/lib/__init__.py",
-    "scripts/lib/runtime_model.py",
+
+# ---------------------------------------------------------------------------
+# Expected files: hand-curated CORE + manifest/Makefile-DERIVED (provenance)
+# ---------------------------------------------------------------------------
+#
+# K2 root fix (skillbox-safety-trust-boundary-epic-lzz1.5): the must-exist file
+# list is the credibility surface `make doctor` sells in the README. A static
+# list silently ROTS whenever someone renames/removes a listed file (or forgets
+# to add a newly-required one). So we DERIVE the bulk of the list from the real
+# sources that already reference each file — every derived entry carries
+# PROVENANCE ("expected because <source>:<reference>") — and keep only a small
+# CORE set of genuinely hand-curated files that NO source references. Killing
+# the failure CLASS, not patching instances.
+#
+# CORE is the residual: files that no Makefile target / compose composition /
+# workspace manifest / installer / Dockerfile references, so they cannot be
+# derived. Each MUST carry an inline justification. Keep this list <= 10.
+CORE_EXPECTED_FILES: list[tuple[str, str]] = [
+    # The credibility/handshake docs the README + AGENTS.md sell to operators and
+    # agents; pure prose, referenced by no build/compose/manifest source.
+    ("README.md", "operator-facing project README; not referenced by any build source"),
+    ("AGENTS.md", "coding-agent guide; not referenced by any build source"),
+    (".env-manager/README.md", "runtime-manager subtree README; documentation only, no source references it"),
+    # The curl|bash installer is the entry point a fresh host runs BEFORE any
+    # Makefile/compose exists; nothing upstream references it, so it cannot be
+    # derived — yet it must ship.
+    ("install.sh", "curl|bash bootstrap installer; the root entry point, referenced by nothing upstream"),
+    # `.env.example` is the manifest-validated env template. It is consumed by
+    # load_env_defaults()/check_env_defaults (a value check, not a path
+    # reference) and `make bootstrap-env`; treated as core so its existence is
+    # asserted even when those value checks are skipped.
+    (".env.example", "manifest-validated env template seeded by bootstrap-env; existence is load-bearing for env-defaults check"),
+    # The Dockerfile is the image contract. The Makefile builds it via
+    # `$(COMPOSEF) build` (compose resolves `build.dockerfile`), not by naming
+    # the path, so it is not statically derivable from the Makefile text.
+    ("Dockerfile", "workspace image contract; built via compose `build`, never named as a path in any source"),
+]
+CORE_EXPECTED_FILE_NAMES: list[str] = [path for path, _ in CORE_EXPECTED_FILES]
+
+# Compose files that participate in the Makefile `$(COMPOSEF)` BASE composition
+# (docker-compose.yml -f $(_MONOSERVER_LAYER)). The per-client override
+# (_CLIENT_OVERRIDE) and the swimmers overlay are intentionally NOT here: the
+# override is optional/generated and the swimmers overlay is derived from
+# scripts/05-swimmers.sh instead (see _derive_compose_overlay_files).
+MAKEFILE_BASE_COMPOSE_FILES = ("docker-compose.yml", "docker-compose.monoserver.yml")
+
+# Workspace manifests loaded by build_model() — the declared outer model inputs.
+WORKSPACE_MANIFEST_FILES = (
     "workspace/sandbox.yaml",
     "workspace/dependencies.yaml",
     "workspace/persistence.yaml",
     "workspace/runtime.yaml",
     "workspace/skill-repos.yaml",
-    "workspace/client-blueprints/git-repo.yaml",
-    "workspace/client-blueprints/git-repo-http-service.yaml",
-]
+)
+
+# Regexes used to harvest file references out of Makefile / installer text.
+_SCRIPT_REF_PATTERN = re.compile(
+    r"(?:scripts/[A-Za-z0-9_./-]+\.(?:py|sh)|\.env-manager/[A-Za-z0-9_./-]+\.py)"
+)
+_COMPOSE_REF_PATTERN = re.compile(r"docker-compose[A-Za-z0-9_.-]*\.yml")
+
 EXPECTED_DIRECTORIES = [
     ".env-manager",
     "docker",
@@ -80,6 +119,228 @@ RUNTIME_DOCTOR_COMMAND = "python3 .env-manager/manage.py doctor --format json"
 # canonical home is ${SKILLBOX_STATE_ROOT}/operator/. Kept in sync with the helpers
 # in scripts/box.py and scripts/operator_mcp_server.py.
 OPERATOR_SECRET_FILENAMES = (".env", ".env.box")
+
+
+# ---------------------------------------------------------------------------
+# Expected-files derivation (K2 root fix)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ExpectedFile:
+    """A must-exist repo file with the SOURCE that makes it expected.
+
+    ``path`` is repo-relative. ``provenance`` is the human-readable reason
+    (surfaced in render + in any missing-file finding). ``source`` is the
+    repo-relative file whose text/declaration produced this entry — the doctor
+    self-check verifies that source still PARSES (or, for CORE, is the file
+    itself) so a derivation that silently stops emitting an entry is caught.
+    ``optional`` derivations never produce entries; only present-on-disk files
+    that are referenced become required (see the helper docstrings).
+    """
+
+    path: str
+    provenance: str
+    source: str
+
+
+def _read_text_if_present(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except UnicodeDecodeError:  # pragma: no cover - defensive
+        return None
+
+
+def _derive_makefile_script_files(root_dir: Path) -> list[ExpectedFile]:
+    """Scripts referenced by Makefile targets (scripts/*.py|sh, .env-manager/*.py).
+
+    A file is required because a make target invokes it; if the script is
+    renamed/removed the target breaks, so doctor should fail until the rename
+    is reflected everywhere. Optionality is implicit: a script the Makefile
+    never names simply never appears here.
+    """
+    text = _read_text_if_present(root_dir / "Makefile")
+    if text is None:
+        return []
+    entries: dict[str, ExpectedFile] = {}
+    for match in sorted(set(_SCRIPT_REF_PATTERN.findall(text))):
+        entries.setdefault(
+            match,
+            ExpectedFile(path=match, provenance="referenced by Makefile target", source="Makefile"),
+        )
+    return list(entries.values())
+
+
+def _derive_makefile_compose_files(root_dir: Path) -> list[ExpectedFile]:
+    """Compose files in the Makefile `$(COMPOSEF)` BASE composition.
+
+    Only the always-on base files (docker-compose.yml + the fat-default
+    monoserver layer) are required. The per-client override is OPTIONAL
+    (generated, may be absent) and the swimmers overlay is derived from
+    scripts/05-swimmers.sh instead — neither is forced here.
+    """
+    text = _read_text_if_present(root_dir / "Makefile")
+    if text is None:
+        return []
+    present = set(_COMPOSE_REF_PATTERN.findall(text))
+    return [
+        ExpectedFile(
+            path=name,
+            provenance="Makefile $(COMPOSEF) base compose composition",
+            source="Makefile",
+        )
+        for name in MAKEFILE_BASE_COMPOSE_FILES
+        if name in present
+    ]
+
+
+def _derive_swimmers_compose_overlay(root_dir: Path) -> list[ExpectedFile]:
+    """The swimmers compose overlay, derived from scripts/05-swimmers.sh.
+
+    05-swimmers.sh hard-references docker-compose.swimmers.yml in its
+    COMPOSE_FILES array (unconditionally), so the overlay is required whenever
+    that script ships. We only emit a compose file the script actually names;
+    the per-client override it may also pick up is optional and not emitted.
+    """
+    text = _read_text_if_present(root_dir / "scripts" / "05-swimmers.sh")
+    if text is None:
+        return []
+    refs = set(_COMPOSE_REF_PATTERN.findall(text))
+    name = "docker-compose.swimmers.yml"
+    if name not in refs:
+        return []
+    return [
+        ExpectedFile(
+            path=name,
+            provenance="referenced by scripts/05-swimmers.sh COMPOSE_FILES overlay",
+            source="scripts/05-swimmers.sh",
+        )
+    ]
+
+
+def _derive_installer_script_files(root_dir: Path) -> list[ExpectedFile]:
+    """Scripts referenced by the curl|bash installer (install.sh).
+
+    install.sh runs the DO bootstrap + Tailscale install scripts by path; if
+    they are renamed the installer silently breaks. Derived (not CORE) so a
+    rename forces a coordinated update. Only files install.sh actually names
+    are emitted.
+    """
+    text = _read_text_if_present(root_dir / "install.sh")
+    if text is None:
+        return []
+    entries: dict[str, ExpectedFile] = {}
+    for match in sorted(set(_SCRIPT_REF_PATTERN.findall(text))):
+        entries.setdefault(
+            match,
+            ExpectedFile(path=match, provenance="referenced by install.sh", source="install.sh"),
+        )
+    return list(entries.values())
+
+
+def _derive_dockerfile_entrypoint(root_dir: Path) -> list[ExpectedFile]:
+    """The container entrypoint script COPYed by the Dockerfile.
+
+    The Dockerfile `COPY docker/sandbox-entrypoint.sh ...` is what backs the
+    sandbox.yaml `entrypoints`. Derived from the literal COPY source so a
+    rename of the entrypoint script is caught. Only scripts/* paths the
+    Dockerfile names via COPY are emitted.
+    """
+    text = _read_text_if_present(root_dir / "Dockerfile")
+    if text is None:
+        return []
+    entries: dict[str, ExpectedFile] = {}
+    copy_pattern = re.compile(r"^\s*COPY\s+(\S+)\s", re.MULTILINE)
+    for raw in copy_pattern.findall(text):
+        candidate = raw.strip()
+        if candidate.endswith(".sh") and (root_dir / candidate).is_file():
+            entries.setdefault(
+                candidate,
+                ExpectedFile(
+                    path=candidate,
+                    provenance="COPYed into the image by Dockerfile",
+                    source="Dockerfile",
+                ),
+            )
+    return list(entries.values())
+
+
+def _derive_workspace_manifest_files(root_dir: Path) -> list[ExpectedFile]:
+    """Workspace manifests build_model() loads as the outer model inputs."""
+    return [
+        ExpectedFile(
+            path=name,
+            provenance="declared workspace manifest loaded by build_model()",
+            source=name,
+        )
+        for name in WORKSPACE_MANIFEST_FILES
+    ]
+
+
+def _derive_reconcile_lib_files(root_dir: Path) -> list[ExpectedFile]:
+    """The lib package this script imports (`from lib.runtime_model import ...`).
+
+    scripts/04-reconcile.py imports scripts/lib/runtime_model.py, which makes
+    the module + its package __init__ load-bearing for the reconcile tool
+    itself. Both are required whenever the import statement is present.
+    """
+    text = _read_text_if_present(root_dir / "scripts" / "04-reconcile.py")
+    if text is None or "from lib.runtime_model import" not in text:
+        return []
+    return [
+        ExpectedFile(
+            path="scripts/lib/__init__.py",
+            provenance="lib package init imported by scripts/04-reconcile.py",
+            source="scripts/04-reconcile.py",
+        ),
+        ExpectedFile(
+            path="scripts/lib/runtime_model.py",
+            provenance="imported by scripts/04-reconcile.py (`from lib.runtime_model import ...`)",
+            source="scripts/04-reconcile.py",
+        ),
+    ]
+
+
+_DERIVATION_SOURCES = (
+    _derive_makefile_script_files,
+    _derive_makefile_compose_files,
+    _derive_swimmers_compose_overlay,
+    _derive_installer_script_files,
+    _derive_dockerfile_entrypoint,
+    _derive_workspace_manifest_files,
+    _derive_reconcile_lib_files,
+)
+
+
+def derive_expected_files(root_dir: Path) -> list[ExpectedFile]:
+    """Compute the DERIVED expected-file list from the real sources.
+
+    Deduplicates by path (first provenance wins, deterministic source order).
+    CORE files are intentionally not included here — they are merged by
+    ``resolved_expected_files``.
+    """
+    by_path: dict[str, ExpectedFile] = {}
+    for derive in _DERIVATION_SOURCES:
+        for entry in derive(root_dir):
+            by_path.setdefault(entry.path, entry)
+    return [by_path[path] for path in sorted(by_path)]
+
+
+def resolved_expected_files(root_dir: Path) -> list[ExpectedFile]:
+    """CORE (hand-curated) + DERIVED, deduplicated, sorted by path.
+
+    The single source of truth for both the required-files check and the
+    inspectable render surface. CORE wins ties (a hand-curated justification is
+    more specific than a derivation).
+    """
+    by_path: dict[str, ExpectedFile] = {}
+    for name, reason in CORE_EXPECTED_FILES:
+        by_path[name] = ExpectedFile(path=name, provenance=f"core: {reason}", source=name)
+    for entry in derive_expected_files(root_dir):
+        by_path.setdefault(entry.path, entry)
+    return [by_path[path] for path in sorted(by_path)]
 
 
 def _operator_state_root() -> Path:
@@ -488,15 +749,86 @@ def expected_runtime_paths(model: dict[str, Any]) -> dict[str, str]:
 
 
 def check_required_files() -> CheckResult:
-    missing = [path for path in EXPECTED_FILES if not (ROOT_DIR / path).is_file()]
+    """Assert every resolved expected file (CORE + DERIVED) exists, naming the
+    PROVENANCE of any missing one so the operator knows WHY it was expected.
+
+    A missing DERIVED file means a real reference (Makefile/install.sh/compose/
+    Dockerfile/manifest) still points at a file that is gone — fix the rename at
+    its source, not by patching this list.
+    """
+    expected = resolved_expected_files(ROOT_DIR)
+    missing = [entry for entry in expected if not (ROOT_DIR / entry.path).is_file()]
     if missing:
         return CheckResult(
             status="fail",
             code="required-files",
             message="required files are missing",
-            details={"missing": missing},
+            details={
+                "missing": [entry.path for entry in missing],
+                "missing_with_provenance": [
+                    f"{entry.path} ({entry.provenance})" for entry in missing
+                ],
+            },
         )
-    return CheckResult(status="pass", code="required-files", message="required files are present")
+    return CheckResult(
+        status="pass",
+        code="required-files",
+        message="required files are present",
+        details={"checked": len(expected)},
+    )
+
+
+def check_expected_files_sources() -> CheckResult:
+    """Doctor self-check for the expected-files derivation itself.
+
+    Two failure classes:
+
+    1. A static CORE entry is missing on disk — report the exact CORE tuple to
+       delete (the stale instance) so the rot is fixable without spelunking.
+    2. A DERIVED entry's source no longer PARSES as expected (the source file
+       vanished while the derivation still names it) — surfaced as a warning so
+       a half-applied rename is visible before it silently drops coverage.
+    """
+    issues: list[str] = []
+    warnings: list[str] = []
+
+    for path, _reason in CORE_EXPECTED_FILES:
+        if not (ROOT_DIR / path).is_file():
+            issues.append(
+                f"{path}: stale CORE entry — file is gone; delete its tuple from "
+                "CORE_EXPECTED_FILES in scripts/04-reconcile.py"
+            )
+
+    derived = derive_expected_files(ROOT_DIR)
+    for entry in derived:
+        if not (ROOT_DIR / entry.source).is_file():
+            warnings.append(
+                f"{entry.path}: derivation source {entry.source} is missing "
+                f"({entry.provenance})"
+            )
+
+    if issues:
+        return CheckResult(
+            status="fail",
+            code="expected-files-sources",
+            message="the expected-files CORE list has stale entries",
+            details={"stale_core": issues, "stale_sources": warnings},
+            fix_command="python3 scripts/04-reconcile.py render --format json",
+        )
+    if warnings:
+        return CheckResult(
+            status="warn",
+            code="expected-files-sources",
+            message="an expected-files derivation source could not be resolved",
+            details={"stale_sources": warnings},
+            fix_command="python3 scripts/04-reconcile.py render --format json",
+        )
+    return CheckResult(
+        status="pass",
+        code="expected-files-sources",
+        message="expected-files CORE list and derivation sources resolve cleanly",
+        details={"core": len(CORE_EXPECTED_FILES), "derived": len(derived)},
+    )
 
 
 def check_expected_directories() -> CheckResult:
@@ -1104,11 +1436,24 @@ def compose_summary(model: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def expected_files_payload() -> list[dict[str, str]]:
+    """The resolved expected-files list with provenance, for the render surface.
+
+    Inspectable so an operator can see exactly which files doctor will require
+    and WHY each one is expected (core justification or derivation source).
+    """
+    return [
+        {"path": entry.path, "provenance": entry.provenance, "source": entry.source}
+        for entry in resolved_expected_files(ROOT_DIR)
+    ]
+
+
 def build_render_payload(with_compose: bool) -> dict[str, Any]:
     model = build_model()
     payload = {
         "sandbox": model["sandbox"],
         "expected_env": model["expected_env"],
+        "expected_files": expected_files_payload(),
         "expected_mounts": model["expected_mounts"],
         "dependencies": model["dependencies"],
         "storage": model["storage"],
@@ -1131,6 +1476,11 @@ def print_render_text(payload: dict[str, Any]) -> None:
     print("env defaults:")
     for key, value in payload["expected_env"].items():
         print(f"  {key}={value}")
+    if payload.get("expected_files"):
+        print()
+        print("expected files:")
+        for entry in payload["expected_files"]:
+            print(f"  {entry['path']}  <- {entry['provenance']}")
     print()
     print("expected mounts:")
     for mount in payload["expected_mounts"]:
@@ -1222,6 +1572,7 @@ def doctor_results(skip_compose: bool, skip_skill_sync: bool) -> list[CheckResul
     model = build_model()
     results = [
         check_required_files(),
+        check_expected_files_sources(),
         check_expected_directories(),
         check_manifest_alignment(model),
         check_env_defaults(model),
