@@ -32,10 +32,10 @@ What the factory builds
       symlink to a source skill dir), and
     - ``managed_home``: a dir-symlink home (``~/.claude/skills`` itself is a
       symlink to a managed skills directory).
-* **Skill source roots**: a mini ``skills/`` and ``skills-private/`` carrying
+* **Skill source roots**: a mini ``skills/`` and ``private-skills/`` carrying
   4 tiny skills, one of which (``needs-beads``) declares
   ``requires_beads: true`` frontmatter.
-* **The ``_shared`` symlink chain**: ``skills-private/_shared`` -> the shared
+* **The ``_shared`` symlink chain**: ``private-skills/_shared`` -> the shared
   payload under ``skills/_shared_payload`` (mirrors the real cross-root
   ``_shared`` link skills depend on).
 * **A ``registry/repos.yaml`` and a ``skill-scope.yaml``** policy fixture
@@ -356,9 +356,9 @@ def build_fixture_fleet(tmp_root: str | os.PathLike[str]) -> FixtureFleet:
     registry_dir = config_root / "registry"
     registry_dir.mkdir(parents=True)
 
-    # --- skill source roots: mini skills/ + skills-private/ ---------------
+    # --- skill source roots: mini skills/ + private-skills/ ---------------
     skills_root = root / "skills"
-    skills_private_root = root / "skills-private"
+    skills_private_root = root / "private-skills"
     skills_root.mkdir(parents=True)
     skills_private_root.mkdir(parents=True)
 
@@ -376,7 +376,7 @@ def build_fixture_fleet(tmp_root: str | os.PathLike[str]) -> FixtureFleet:
 
     # --- _shared symlink chain --------------------------------------------
     # Real estate: skills depend on a cross-root `_shared` payload reached via
-    # a symlink. Model it as skills-private/_shared -> skills/_shared_payload.
+    # a symlink. Model it as private-skills/_shared -> skills/_shared_payload.
     shared_payload = skills_root / "_shared_payload"
     shared_payload.mkdir(parents=True)
     (shared_payload / "README.md").write_text("# shared payload\n", encoding="utf-8")

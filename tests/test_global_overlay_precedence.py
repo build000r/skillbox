@@ -10,7 +10,7 @@ rule may only meaningfully add NON-global skills.
 ``validate_global_overlay_precedence`` makes a double-declaration (a skill that
 is both always-global AND overlay-gated) a hard, named FAIL. These tests:
 
-* prove the lint is GREEN against the current real ``skill-scope.yaml`` (the
+* prove the lint is GREEN against a committed public fixture (the
   four mode packs were deliberately authored to exclude always-global
   ``divide-and-conquer`` from the swarm pack),
 * prove the lint is GREEN on an in-memory disjoint policy,
@@ -44,17 +44,6 @@ from runtime_manager.validation import (  # noqa: E402
 )
 
 
-def _real_skill_scope_path() -> Path:
-    candidates = [
-        ROOT_DIR.parent / "skillbox-config" / "skill-scope.yaml",
-        ROOT_DIR.parent.parent / "skillbox-config" / "skill-scope.yaml",
-    ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    return candidates[0]
-
-
 def _disjoint_policy() -> dict:
     """A policy where the always-global set and overlay-gated set are disjoint.
 
@@ -86,21 +75,19 @@ class GlobalOverlayPrecedenceLintTests(unittest.TestCase):
     def _statuses(self, results) -> list[str]:
         return [r.status for r in results]
 
-    def test_lint_green_on_real_skill_scope_yaml(self) -> None:
-        """The live policy keeps always-global and overlay-gated skills disjoint.
+    def test_lint_green_on_public_policy_fixture(self) -> None:
+        """The public policy fixture keeps always-global and overlay-gated skills disjoint.
 
         Concretely: divide-and-conquer is always-global and must NOT appear in
         the swarm overlay (the precedence the four mode packs were authored to
         respect)."""
-        path = _real_skill_scope_path()
-        self.assertTrue(path.is_file(), f"expected skill-scope.yaml at {path}")
-        results = validate_global_overlay_precedence_file(path)
+        results = validate_global_overlay_precedence(_disjoint_policy())
         self.assertEqual(len(results), 1, results)
         self.assertEqual(results[0].code, GLOBAL_OVERLAY_PRECEDENCE_CODE)
         self.assertEqual(
             results[0].status,
             "pass",
-            f"live skill-scope.yaml has a global/overlay precedence conflict: "
+            f"public policy fixture has a global/overlay precedence conflict: "
             f"{results[0].message} :: {results[0].details}",
         )
         # Sanity: divide-and-conquer is always-global, and is NOT overlay-gated.

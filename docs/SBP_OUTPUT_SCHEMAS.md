@@ -82,7 +82,7 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
       "name": "tiny-marketing",
       "path": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-marketing",
       "shadowed_count": 0,
-      "source": "<FLEET>/skills-private/tiny-marketing",
+      "source": "<FLEET>/private-skills/tiny-marketing",
       "source_bucket": "external",
       "state": "ok"
     }
@@ -429,6 +429,16 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
   "recommendations": [],
   "source_roots": [
     {
+      "id": "source:<FLEET>/private-skills",
+      "kind": "source",
+      "label": "<FLEET>/private-skills",
+      "path": "<FLEET>/private-skills",
+      "present": true,
+      "rank": 0,
+      "skill_count": 2,
+      "undefined_count": 1
+    },
+    {
       "id": "source:<FLEET>/skills",
       "kind": "source",
       "label": "<FLEET>/skills",
@@ -437,16 +447,6 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "rank": 0,
       "skill_count": 2,
       "undefined_count": 0
-    },
-    {
-      "id": "source:<FLEET>/skills-private",
-      "kind": "source",
-      "label": "<FLEET>/skills-private",
-      "path": "<FLEET>/skills-private",
-      "present": true,
-      "rank": 0,
-      "skill_count": 2,
-      "undefined_count": 1
     }
   ],
   "summary": {
@@ -485,8 +485,8 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
   "undefined_sources": [
     {
       "name": "needs-beads",
-      "root": "<FLEET>/skills-private",
-      "source": "<FLEET>/skills-private/needs-beads",
+      "root": "<FLEET>/private-skills",
+      "source": "<FLEET>/private-skills/needs-beads",
       "source_bucket": "external",
       "state": "undefined"
     }
@@ -881,7 +881,7 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
       "kind": "activate",
       "manage_command": "python3 .env-manager/manage.py skill activate needs-beads --cwd <FLEET>/repos_real/healthy",
       "rank": 1,
-      "why": "a source for 'needs-beads' exists (<FLEET>/skills-private/needs-beads); activating links it here and returns the SKILL.md packet immediately"
+      "why": "a source for 'needs-beads' exists (<FLEET>/private-skills/needs-beads); activating links it here and returns the SKILL.md packet immediately"
     },
     {
       "command": "edit skill-scope.yaml: add a rule with skills:[needs-beads] and a path/category covering <FLEET>/repos_real/healthy",
@@ -898,7 +898,7 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
   "skill": "needs-beads",
   "source_options": [
     {
-      "source": "<FLEET>/skills-private/needs-beads",
+      "source": "<FLEET>/private-skills/needs-beads",
       "source_bucket": "external"
     }
   ],

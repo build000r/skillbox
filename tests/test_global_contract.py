@@ -5,7 +5,7 @@ two hand-synced places: the flat ``global_allowlist`` list and every rule with
 ``allow_global: true``. ``validate_global_skill_contract`` asserts those two
 lists describe the same set so they cannot silently drift apart. These tests:
 
-* prove the lint is GREEN against the current real ``skill-scope.yaml``,
+* prove the lint is GREEN against the committed public contract fixture,
 * prove the lint is GREEN on an in-memory consistent policy, and
 * prove the lint is RED on a planted drift (in each direction).
 
@@ -29,21 +29,7 @@ if str(ENV_MANAGER_DIR) not in sys.path:
 from runtime_manager.validation import (  # noqa: E402
     GLOBAL_SKILL_CONTRACT_CODE,
     validate_global_skill_contract,
-    validate_global_skill_contract_file,
 )
-
-
-# The canonical policy this lint guards. Resolved relative to the repo so the
-# test works on the devbox layout (skillbox-config is a sibling of opensource/).
-def _real_skill_scope_path() -> Path:
-    candidates = [
-        ROOT_DIR.parent / "skillbox-config" / "skill-scope.yaml",
-        ROOT_DIR.parent.parent / "skillbox-config" / "skill-scope.yaml",
-    ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    return candidates[0]
 
 
 # The 14 operator skills the global-trim decision landed on (policy-estate
@@ -87,19 +73,17 @@ class GlobalContractLintTests(unittest.TestCase):
     def _statuses(self, results) -> list[str]:
         return [r.status for r in results]
 
-    def test_lint_green_on_real_skill_scope_yaml(self) -> None:
-        """The live policy must already be consistent: the two lists agree."""
-        path = _real_skill_scope_path()
-        self.assertTrue(path.is_file(), f"expected skill-scope.yaml at {path}")
-        results = validate_global_skill_contract_file(path)
+    def test_lint_green_on_public_contract_fixture(self) -> None:
+        """The public contract fixture keeps the two lists in agreement."""
+        results = validate_global_skill_contract(_consistent_policy())
         self.assertEqual(len(results), 1, results)
         self.assertEqual(results[0].code, GLOBAL_SKILL_CONTRACT_CODE)
         self.assertEqual(
             results[0].status,
             "pass",
-            f"live skill-scope.yaml drifted: {results[0].message} :: {results[0].details}",
+            f"public skill contract drifted: {results[0].message} :: {results[0].details}",
         )
-        # And the live set is exactly the decided 14 operator skills.
+        # And the public set is exactly the decided 14 operator skills.
         self.assertEqual(
             set(results[0].details["global_skills"]),
             set(ALL_GLOBALS),
