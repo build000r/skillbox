@@ -433,6 +433,20 @@ def build_fixture_fleet(tmp_root: str | os.PathLike[str]) -> FixtureFleet:
     # 1) healthy: per-entry link that resolves on-box.
     healthy = _make_repo("healthy")
     _relink(healthy / ".claude" / "skills" / "tiny-cli", skills["tiny-cli"])
+    override_dir = healthy / ".skillbox"
+    override_dir.mkdir()
+    (override_dir / "skill-overrides.yaml").write_text(
+        "version: 1\n"
+        "pin_on: [needs-beads]\n"
+        "pin_off: [tiny-marketing]\n"
+        "opt_out_global: [project-status-mmdx]\n"
+        "overlays:\n"
+        "  enable: [marketing]\n"
+        "  disable: [swarm]\n"
+        "defaults: [tiny-ui]\n"
+        "reason: fixture override\n",
+        encoding="utf-8",
+    )
 
     # 2) other-machine: link target lives under /fake-mac-root (valid on the
     #    mac, dangling here -> simulates a cross-machine link).
