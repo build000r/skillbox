@@ -1227,13 +1227,12 @@ def _global_allow_patterns(model: dict[str, Any]) -> list[str] | None:
     patterns: list[str] = []
     has_explicit_policy = False
     for policy in _operator_scope_policies(model):
-        raw_allowlist = policy.get("global_allowlist")
-        if raw_allowlist is not None:
+        if policy.get("global_allowlist") is not None:
             has_explicit_policy = True
-            patterns.extend(str(item).strip() for item in raw_allowlist or [] if str(item).strip())
         for rule in policy.get("rules") or []:
             if not isinstance(rule, dict) or not bool(rule.get("allow_global", False)):
                 continue
+            has_explicit_policy = True
             raw_patterns = rule.get("skills") or rule.get("patterns") or rule.get("names") or []
             patterns.extend(str(item).strip() for item in raw_patterns if str(item).strip())
     if not has_explicit_policy:

@@ -33,6 +33,7 @@ from .shared import (
 )
 
 __all__ = [
+    'DISPATCHER_CORE',
     'DEFAULT_LAYER_RANK',
     'CLIENT_LAYER_RANK',
     'GLOBAL_LAYER_RANK',
@@ -53,6 +54,7 @@ __all__ = [
 ]
 
 
+DISPATCHER_CORE = ("smart", "sbp")
 DEFAULT_LAYER_RANK = 10
 CLIENT_LAYER_RANK = 20
 GLOBAL_LAYER_RANK = 30

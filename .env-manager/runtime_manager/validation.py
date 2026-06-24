@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import datetime as DateTime, timezone
 
 from .shared import *
-
 # Stable error codes from the local_runtime_core_cutover shared contract
 # (shared.md:245-254). Re-exported here so consumers that already pull in
 # the validation module get the full set without also importing
@@ -1399,24 +1398,22 @@ def validate_global_skill_contract(
     """Assert the global skill contract is internally consistent.
 
     The operator's ``skill-scope.yaml`` declares the always-global surface in
-    two hand-synced places: the ``global_allowlist`` list (gates install-path
-    patterns) and every rule carrying ``allow_global: true`` (carries the
-    per-rule scope rationale). These are intentionally kept as separate lists --
-    one is a flat allowlist consumed by the install planner, the other is the
-    structured, commented rule set -- but they describe the *same* canonical
-    global set and can silently drift apart.
+    rules carrying ``allow_global: true``. That structured rule set is the source
+    of truth because it carries the per-rule scope rationale that ``sbp`` reads.
+    The flat ``global_allowlist`` key is now only an optional snapshot for human
+    readability and backward-compatible policy files; it must be derived from
+    the rules and never grants a skill by itself.
 
-    DECISION: rather than collapse to one list (which would lose the per-rule
-    rationale the rules carry and that ``sbp`` reads), this lint keeps both lists
-    and makes drift impossible by asserting they are EQUAL:
+    DECISION: allow_global rules are canonical. If ``global_allowlist`` is
+    present, this lint asserts that the snapshot equals the derived projection:
 
         global_allowlist  ==  union(skills of rules where allow_global: true)
 
     On drift it names exactly which skills are in one list but not the other and
-    states the fix (edit the relevant ``allow_global`` rule and
-    ``global_allowlist`` together). Mirrors the three sources reconciled in the
-    sbp dispatcher contract: dispatcher core + named operator exceptions +
-    mode-pack overlays, where the always-global set is exactly this union.
+    states the fix: edit the relevant ``allow_global`` rule, then regenerate or
+    remove the derived snapshot. Mirrors the sbp dispatcher contract: dispatcher
+    core + named operator exceptions + mode-pack overlays, where the
+    always-global set is exactly this union.
     """
     if not isinstance(policy, dict):
         return [
@@ -1427,17 +1424,35 @@ def validate_global_skill_contract(
             )
         ]
 
+    has_allowlist_snapshot = policy.get("global_allowlist") is not None
     allowlist = _scope_global_allowlist(policy)
     allow_global_union = _scope_allow_global_union(policy)
 
-    # An empty policy (no allowlist and no allow_global rules) is not drift; it
-    # just means this policy does not declare a global surface.
-    if not allowlist and not allow_global_union:
+    # An empty policy (no allowlist snapshot and no allow_global rules) is not
+    # drift; it just means this policy does not declare a global surface.
+    if not has_allowlist_snapshot and not allow_global_union:
         return [
             CheckResult(
                 status="pass",
                 code=GLOBAL_SKILL_CONTRACT_CODE,
                 message="skill-scope policy declares no global skill surface",
+            )
+        ]
+
+    if not has_allowlist_snapshot:
+        return [
+            CheckResult(
+                status="pass",
+                code=GLOBAL_SKILL_CONTRACT_CODE,
+                message=(
+                    "global_allowlist is derived from allow_global rules "
+                    f"({len(allow_global_union)} operator skills)"
+                ),
+                details={
+                    "global_skills": sorted(allow_global_union),
+                    "derived_global_allowlist": sorted(allow_global_union),
+                    "global_allowlist_present": False,
+                },
             )
         ]
 
@@ -1462,14 +1477,15 @@ def validate_global_skill_contract(
                 status="fail",
                 code=GLOBAL_SKILL_CONTRACT_CODE,
                 message=(
-                    f"global skill contract drift{location}: global_allowlist must equal "
-                    "the union of skills from all rules with allow_global: true. "
-                    "Fix: edit the relevant allow_global rule and global_allowlist together "
-                    "so they list the same skills."
+                    f"global skill contract drift{location}: global_allowlist is a "
+                    "derived snapshot and must equal the union of skills from all "
+                    "rules with allow_global: true. This list is derived; edit rules "
+                    "instead, then regenerate or remove global_allowlist."
                 ),
                 details={
                     "issues": issues,
                     "global_allowlist": sorted(allowlist),
+                    "derived_global_allowlist": sorted(allow_global_union),
                     "allow_global_union": sorted(allow_global_union),
                     "in_allowlist_only": in_allowlist_only,
                     "in_rules_only": in_rules_only,
@@ -1482,10 +1498,14 @@ def validate_global_skill_contract(
             status="pass",
             code=GLOBAL_SKILL_CONTRACT_CODE,
             message=(
-                "global_allowlist equals the union of allow_global rules "
+                "global_allowlist snapshot equals the union of allow_global rules "
                 f"({len(allowlist)} operator skills)"
             ),
-            details={"global_skills": sorted(allowlist)},
+            details={
+                "global_skills": sorted(allow_global_union),
+                "derived_global_allowlist": sorted(allow_global_union),
+                "global_allowlist_present": True,
+            },
         )
     ]
 
@@ -1715,15 +1735,14 @@ GLOBAL_OVERLAY_PRECEDENCE_CODE = "global-overlay-precedence"
 
 
 def _policy_always_global_skills(policy: dict[str, Any]) -> set[str]:
-    """The always-global skill set: ``global_allowlist`` ∪ allow_global rules.
+    """The always-global skill set derived from ``allow_global`` rules.
 
     These are linked into every repo unconditionally (layer 1+2 of the global
-    skill contract). Both sources are unioned so the precedence lint stays
-    correct even mid-edit, before ``validate_global_skill_contract`` has been
-    re-reconciled (that lint owns the *equality* of the two; this one only needs
-    membership).
+    skill contract). ``global_allowlist`` is only an optional derived snapshot;
+    it never grants a skill by itself, and
+    ``validate_global_skill_contract`` owns snapshot drift.
     """
-    return _scope_global_allowlist(policy) | _scope_allow_global_union(policy)
+    return _scope_allow_global_union(policy)
 
 
 def _policy_overlay_gated_skills(policy: dict[str, Any]) -> dict[str, list[str]]:
@@ -1787,9 +1806,8 @@ def validate_global_overlay_precedence(
     The global skill contract has a strict precedence (repos-sbp-policy-estate-
     oh1.2): an always-global skill -- one granted by an ``allow_global: true``
     rule (the dispatcher core + ``operator-global-exceptions``, e.g.
-    ``divide-and-conquer``) or listed in ``global_allowlist`` -- is linked into
-    EVERY repo unconditionally. Flipping a mode-pack overlay can neither add nor
-    remove it. **Global wins.**
+    ``divide-and-conquer``) -- is linked into EVERY repo unconditionally.
+    Flipping a mode-pack overlay can neither add nor remove it. **Global wins.**
 
     Therefore an overlay rule only meaningfully adds NON-global skills. Naming an
     already-global skill in an overlay rule is ambiguous noise: it implies the
@@ -1846,8 +1864,8 @@ def validate_global_overlay_precedence(
                 code=GLOBAL_OVERLAY_PRECEDENCE_CODE,
                 message=(
                     f"global-vs-overlay precedence conflict{location}: {offender_text}. "
-                    "A skill that is always-global (granted by an allow_global rule or "
-                    "global_allowlist) is linked into every repo unconditionally; an "
+                    "A skill that is always-global (granted by an allow_global rule) "
+                    "is linked into every repo unconditionally; an "
                     "overlay cannot add or remove it (global wins). Naming it in an "
                     "overlay rule is ambiguous. "
                     "Fix: drop the skill from the overlay rule (the global layer already "
