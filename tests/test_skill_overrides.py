@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import fcntl
+import multiprocessing as mp
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -13,8 +17,13 @@ ENV_MANAGER_DIR = ROOT_DIR / ".env-manager"
 if str(ENV_MANAGER_DIR) not in sys.path:
     sys.path.insert(0, str(ENV_MANAGER_DIR))
 
+from runtime_manager import policy_eval as POLICY_EVAL  # noqa: E402
 from runtime_manager.errors import OVERRIDE_PARSE_ERROR  # noqa: E402
-from runtime_manager.policy_eval import _repo_override_policy  # noqa: E402
+from runtime_manager.policy_eval import (  # noqa: E402
+    OverrideWriteLockTimeout,
+    _repo_override_policy,
+    update_repo_override_policy,
+)
 from tests.fixture_fleet import build_fixture_fleet  # noqa: E402
 
 
@@ -23,6 +32,18 @@ def _make_repo(root: Path) -> Path:
     repo.mkdir()
     (repo / ".git").mkdir()
     return repo
+
+
+def _append_pin(policy: dict[str, object], name: str) -> dict[str, object]:
+    pins = list(policy.get("pin_on") or [])
+    if name not in pins:
+        pins.append(name)
+    policy["pin_on"] = pins
+    return policy
+
+
+def _override_writer_worker(repo_path: str, name: str) -> None:
+    update_repo_override_policy(Path(repo_path), lambda policy: _append_pin(policy, name))
 
 
 class RepoSkillOverridePolicyTests(unittest.TestCase):
@@ -117,6 +138,88 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
         self.assertEqual(policy["pin_on"], [])
         self.assertEqual(policy["pin_off"], [])
         self.assertEqual(policy["defaults"], [])
+
+    def test_override_writer_preserves_sequential_read_modify_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = _make_repo(Path(tmpdir))
+
+            first = update_repo_override_policy(repo, lambda policy: _append_pin(policy, "alpha"))
+            second = update_repo_override_policy(repo, lambda policy: _append_pin(policy, "beta"))
+            policy = _repo_override_policy(repo)
+
+        self.assertTrue(first["changed"])
+        self.assertTrue(second["changed"])
+        self.assertEqual(policy["pin_on"], ["alpha", "beta"])
+
+    def test_override_writer_serializes_concurrent_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = _make_repo(Path(tmpdir))
+            ctx = mp.get_context("spawn")
+            names = ["alpha", "beta", "gamma"]
+            procs = [
+                ctx.Process(target=_override_writer_worker, args=(str(repo), name))
+                for name in names
+            ]
+            for proc in procs:
+                proc.start()
+            for proc in procs:
+                proc.join(timeout=10)
+                self.assertIsNotNone(proc.exitcode, "writer process hung")
+                self.assertEqual(proc.exitcode, 0, "writer process failed")
+
+            policy = _repo_override_policy(repo)
+
+        self.assertEqual(policy["pin_on"], names)
+
+    def test_override_writer_failed_replace_leaves_old_file_intact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = _make_repo(Path(tmpdir))
+            update_repo_override_policy(repo, lambda policy: _append_pin(policy, "alpha"))
+            policy_path = repo / ".skillbox" / "skill-overrides.yaml"
+            before = policy_path.read_text(encoding="utf-8")
+
+            with mock.patch.object(POLICY_EVAL.os, "replace", side_effect=RuntimeError("crash")):
+                with self.assertRaises(RuntimeError):
+                    update_repo_override_policy(repo, lambda policy: _append_pin(policy, "beta"))
+
+            leftovers = [
+                path.name for path in policy_path.parent.iterdir()
+                if path.name.startswith(".skill-overrides.yaml.") and path.suffix == ".tmp"
+            ]
+            after = policy_path.read_text(encoding="utf-8")
+
+        self.assertEqual(after, before)
+        self.assertEqual(leftovers, [])
+
+    def test_override_writer_fsyncs_file_and_parent_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = _make_repo(Path(tmpdir))
+
+            with mock.patch.object(POLICY_EVAL.os, "fsync") as fsync_mock:
+                update_repo_override_policy(repo, lambda policy: _append_pin(policy, "alpha"))
+
+        self.assertGreaterEqual(fsync_mock.call_count, 2)
+
+    def test_override_writer_lock_timeout_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = _make_repo(Path(tmpdir))
+            policy_dir = repo / ".skillbox"
+            policy_dir.mkdir()
+            lock_path = policy_dir / "skill-overrides.yaml.lock"
+            lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                with self.assertRaises(OverrideWriteLockTimeout) as ctx:
+                    update_repo_override_policy(
+                        repo,
+                        lambda policy: _append_pin(policy, "blocked"),
+                        timeout=0.05,
+                    )
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+
+        self.assertEqual(ctx.exception.lock_path, lock_path)
 
 
 if __name__ == "__main__":
