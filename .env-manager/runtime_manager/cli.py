@@ -8,6 +8,7 @@ import traceback
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
+from .errors import PRUNE_SKIPPED_PINNED
 from .shared import *
 from .validation import *
 from .publish import *
@@ -4215,6 +4216,7 @@ def _handle_skill(args: argparse.Namespace, root_dir: Path, model: dict[str, Any
         problematic = [
             item for item in payload.get("actions") or []
             if str(item.get("status") or "").startswith(("blocked", "conflict", "skipped"))
+            and str(item.get("code") or "") != PRUNE_SKIPPED_PINNED
         ]
         if problematic:
             return EXIT_DRIFT

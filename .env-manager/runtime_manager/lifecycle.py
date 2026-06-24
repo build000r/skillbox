@@ -31,6 +31,7 @@ from .shared import (
     load_yaml,
     load_skill_repos_config,
 )
+from .errors import PRUNE_SKIPPED_PINNED
 
 from ._skill_common import *
 from .policy_eval import *
@@ -887,6 +888,10 @@ def _apply_lifecycle_unlink(
     dry_run: bool,
     allow_directories: bool,
 ) -> None:
+    if action.get("pinned"):
+        action["status"] = "skipped_pinned"
+        action["code"] = PRUNE_SKIPPED_PINNED
+        return
     if dry_run:
         action["status"] = "would_unlink" if os.path.lexists(destination) else "missing"
         return

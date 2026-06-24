@@ -21,6 +21,7 @@ if str(ENV_MANAGER_DIR) not in sys.path:
 
 from runtime_manager import cli as CLI  # noqa: E402
 from runtime_manager.command_registry import default_registry  # noqa: E402
+from runtime_manager.errors import PRUNE_SKIPPED_PINNED  # noqa: E402
 
 
 def _ns(**kwargs: object) -> argparse.Namespace:
@@ -1772,6 +1773,19 @@ except RuntimeError as exc:
             mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
         ):
             self.assertEqual(CLI._handle_skill(skill_args, root, {}, "reuse"), CLI.EXIT_DRIFT)
+
+        with (
+            mock.patch.object(CLI, "skill_lifecycle_plan", return_value={"actions": []}),
+            mock.patch.object(
+                CLI,
+                "apply_skill_lifecycle_plan",
+                return_value={
+                    "actions": [{"status": "skipped_pinned", "code": PRUNE_SKIPPED_PINNED}]
+                },
+            ),
+            mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
+        ):
+            self.assertEqual(CLI._handle_skill(skill_args, root, {}, "reuse"), CLI.EXIT_OK)
 
         client_args = _ns(
             list_blueprints=True,

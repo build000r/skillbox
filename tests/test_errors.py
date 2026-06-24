@@ -6,7 +6,7 @@ Covers:
   * back-compat: legacy keys (error, error_code, error.type, error.recoverable)
     COEXIST with the new keys (error.code, error.context, error.next_actions),
   * the deprecation marker,
-  * a KNOWN-CODES snapshot proving codes are UNCHANGED by this carrier change,
+  * a KNOWN-CODES snapshot proving stable codes only change deliberately,
   * 100% branch coverage of errors.py (internal_error_payload both branches,
     empty vs non-empty context/next_actions, __str__).
 """
@@ -163,15 +163,29 @@ class InternalErrorTests(unittest.TestCase):
         self.assertEqual(payload["error"]["next_actions"], ["doctor --format json"])
 
 
+class OverrideErrorCodeContractTests(unittest.TestCase):
+    def test_override_codes_render_as_stable_typed_payloads(self) -> None:
+        for code in sorted(ERR.OVERRIDE_ERROR_CODES):
+            with self.subTest(code=code):
+                payload = ValidationError(code, "override refused").to_payload()
+                self.assertEqual(payload["error"]["code"], code)
+                self.assertEqual(payload["error"]["type"], code)
+                self.assertEqual(payload["error_code"], code)
+                self.assertEqual(ERR.exit_status_for_code(code), 1)
+
+    def test_prune_skipped_pinned_is_informational(self) -> None:
+        self.assertEqual(ERR.exit_status_for_code(ERR.PRUNE_SKIPPED_PINNED), 0)
+        self.assertEqual(ERR.exit_status_for_code("SOME_FUTURE_CODE", default=7), 7)
+
+
 # ---------------------------------------------------------------------------
 # KNOWN-CODES SNAPSHOT
 # ---------------------------------------------------------------------------
 #
-# This is a CARRIER change, not a renumbering. The codes below are the EXACT
-# string codes that existed before the typed hierarchy: the message-pattern
-# error_types from classify_error, the LOCAL_RUNTIME_* contract codes, the
-# PERSISTENCE_* / state-root codes, plus the generic INTERNAL fallback. If this
-# set changes, a code was renamed/added/removed — review deliberately.
+# Codes below are stable machine contracts: message-pattern error_types from
+# classify_error, LOCAL_RUNTIME_* codes, PERSISTENCE_* / state-root codes,
+# override policy codes, informational codes, and generic INTERNAL fallback. If
+# this set changes, a code was renamed/added/removed — review deliberately.
 
 KNOWN_CLASSIFY_CODES = frozenset({
     "runtime_error",
@@ -220,12 +234,23 @@ KNOWN_INTERNAL_CODES = frozenset({"INTERNAL"})
 # boundary; classify_error maps it by code (not by message pattern).
 KNOWN_RUNTIME_ID_CODES = frozenset({"RUNTIME_ID_INVALID"})
 
+KNOWN_OVERRIDE_CODES = frozenset({
+    "OVERRIDE_PARSE_ERROR",
+    "OVERRIDE_REFUSED_FLOOR",
+    "OVERRIDE_REFUSED_GLOBAL_ESCALATION",
+    "OVERRIDE_SKILL_UNKNOWN",
+})
+
+KNOWN_INFO_CODES = frozenset({"PRUNE_SKIPPED_PINNED"})
+
 KNOWN_ERROR_CODES = (
     KNOWN_CLASSIFY_CODES
     | KNOWN_LOCAL_RUNTIME_CODES
     | KNOWN_PERSISTENCE_CODES
     | KNOWN_INTERNAL_CODES
     | KNOWN_RUNTIME_ID_CODES
+    | KNOWN_OVERRIDE_CODES
+    | KNOWN_INFO_CODES
 )
 
 
@@ -271,10 +296,14 @@ class KnownCodesSnapshotTests(unittest.TestCase):
             set(KNOWN_RUNTIME_ID_CODES),
         )
 
+    def test_override_codes_match_error_module_constants(self) -> None:
+        self.assertEqual(set(ERR.OVERRIDE_ERROR_CODES), set(KNOWN_OVERRIDE_CODES))
+        self.assertEqual(set(ERR.INFO_EXIT_CODES), set(KNOWN_INFO_CODES))
+
     def test_full_known_codes_snapshot_is_frozen(self) -> None:
         # The single enumeration the acceptance criterion references. Adding or
         # renaming a code requires editing this snapshot ON PURPOSE.
-        self.assertEqual(len(KNOWN_ERROR_CODES), 33)
+        self.assertEqual(len(KNOWN_ERROR_CODES), 38)
 
 
 if __name__ == "__main__":

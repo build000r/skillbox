@@ -47,6 +47,7 @@ from runtime_manager.skill_visibility import (  # noqa: E402
     toggle_overlay,
     unlink_overlay_scoped_skills,
 )
+from runtime_manager.errors import PRUNE_SKIPPED_PINNED  # noqa: E402
 from runtime_manager.shared import directory_tree_sha256  # noqa: E402
 
 
@@ -190,6 +191,14 @@ class SkillVisibilityTests(unittest.TestCase):
             _apply_lifecycle_unlink(action, directory_path, dry_run=False, allow_directories=True)
             self.assertEqual(action["status"], "removed_directory")
             self.assertFalse(directory_path.exists())
+
+            pinned_path = root / "pinned-skill"
+            pinned_path.mkdir()
+            action = {"pinned": True}
+            _apply_lifecycle_unlink(action, pinned_path, dry_run=False, allow_directories=True)
+            self.assertEqual(action["status"], "skipped_pinned")
+            self.assertEqual(action["code"], PRUNE_SKIPPED_PINNED)
+            self.assertTrue(pinned_path.exists())
 
     def test_lifecycle_prune_sync_and_target_state_helpers_classify_visibility(self) -> None:
         visibility = {

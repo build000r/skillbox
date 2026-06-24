@@ -140,7 +140,36 @@ class NetworkError(SkillboxError):
 # top-level handler. Distinct from the per-domain codes so an INTERNAL envelope
 # is never mistaken for a known failure.
 INTERNAL_ERROR_CODE = "INTERNAL"
+OVERRIDE_REFUSED_FLOOR = "OVERRIDE_REFUSED_FLOOR"
+OVERRIDE_REFUSED_GLOBAL_ESCALATION = "OVERRIDE_REFUSED_GLOBAL_ESCALATION"
 OVERRIDE_PARSE_ERROR = "OVERRIDE_PARSE_ERROR"
+OVERRIDE_SKILL_UNKNOWN = "OVERRIDE_SKILL_UNKNOWN"
+PRUNE_SKIPPED_PINNED = "PRUNE_SKIPPED_PINNED"
+
+OVERRIDE_ERROR_CODES = frozenset({
+    OVERRIDE_PARSE_ERROR,
+    OVERRIDE_REFUSED_FLOOR,
+    OVERRIDE_REFUSED_GLOBAL_ESCALATION,
+    OVERRIDE_SKILL_UNKNOWN,
+})
+
+INFO_EXIT_CODES = frozenset({PRUNE_SKIPPED_PINNED})
+NONZERO_EXIT_CODES = frozenset({
+    OVERRIDE_PARSE_ERROR,
+    OVERRIDE_REFUSED_FLOOR,
+    OVERRIDE_REFUSED_GLOBAL_ESCALATION,
+    OVERRIDE_SKILL_UNKNOWN,
+})
+
+
+def exit_status_for_code(code: str, *, default: int = 1) -> int:
+    """Return the process status implied by a stable machine code."""
+    normalized = str(code)
+    if normalized in INFO_EXIT_CODES:
+        return 0
+    if normalized in NONZERO_EXIT_CODES:
+        return 1
+    return default
 
 
 def internal_error_payload(
@@ -162,13 +191,21 @@ def internal_error_payload(
 __all__ = [
     "DEPRECATION_MARKER",
     "DEPRECATION_NOTE",
+    "INFO_EXIT_CODES",
     "INTERNAL_ERROR_CODE",
+    "NONZERO_EXIT_CODES",
+    "OVERRIDE_ERROR_CODES",
     "OVERRIDE_PARSE_ERROR",
+    "OVERRIDE_REFUSED_FLOOR",
+    "OVERRIDE_REFUSED_GLOBAL_ESCALATION",
+    "OVERRIDE_SKILL_UNKNOWN",
+    "PRUNE_SKIPPED_PINNED",
     "SkillboxError",
     "ValidationError",
     "RuntimeLifecycleError",
     "StateConflictError",
     "AdapterError",
     "NetworkError",
+    "exit_status_for_code",
     "internal_error_payload",
 ]
