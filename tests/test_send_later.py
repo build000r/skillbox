@@ -290,6 +290,19 @@ class SendLaterTests(unittest.TestCase):
         self.assertEqual(data["jobs"]["total"], 1)
         self.assertIsInstance(data["issues"], list)
 
+    def test_run_pending_writes_heartbeat_and_doctor_reads_it(self) -> None:
+        # Empty queue: run-pending writes nothing else, but must still heartbeat
+        # so doctor can prove the tick is firing (not dead).
+        self._run("run-pending")
+        tick = self.state / ".last-tick"
+        self.assertTrue(tick.exists(), "run-pending must write a heartbeat")
+        self.cronstore.write_text(
+            "* * * * * /bin/true send-later run-pending # sbp-send-later-wrapper\n")
+        r = self._run("doctor", "--json")
+        data = json.loads(r.stdout)
+        self.assertFalse(data["tick_stale"], f"fresh heartbeat must read as not stale: {data}")
+        self.assertGreaterEqual(data["tick_age_s"], 0)
+
     def test_doctor_flags_missing_cron(self) -> None:
         # Empty crontab store -> marker absent -> doctor must complain.
         self.cronstore.write_text("# nothing here\n")
