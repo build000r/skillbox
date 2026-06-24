@@ -93,23 +93,23 @@ def test_candidate_collector_folds_unresolvable_alias_to_one_row() -> None:
         candidates: dict[str, dict] = {}
         # Same repo, two spellings, two different sources.
         sv._skill_audit_candidate_from_path(
-            candidates, "/nope/srv/repos/htma", source="category:htma"
+            candidates, "/nope/srv/repos/app_core", source="category:app_core"
         )
         sv._skill_audit_candidate_from_path(
             candidates,
-            "/nope/srv/skillbox/repos/htma",
+            "/nope/srv/skillbox/repos/app_core",
             source="scan_root:/nope/srv/skillbox/repos",
         )
 
     # ONE canonical row, not two.
-    assert list(candidates.keys()) == ["/nope/srv/skillbox/repos/htma"]
-    row = candidates["/nope/srv/skillbox/repos/htma"]
-    assert row["path"] == "/nope/srv/skillbox/repos/htma"
+    assert list(candidates.keys()) == ["/nope/srv/skillbox/repos/app_core"]
+    row = candidates["/nope/srv/skillbox/repos/app_core"]
+    assert row["path"] == "/nope/srv/skillbox/repos/app_core"
     # The alias spelling is recorded under the canonical row.
-    assert row["aliases"] == ["/nope/srv/repos/htma"]
+    assert row["aliases"] == ["/nope/srv/repos/app_core"]
     # Sources from BOTH spellings merge onto the one row (issue reported once).
     assert sorted(row["sources"]) == [
-        "category:htma",
+        "category:app_core",
         "scan_root:/nope/srv/skillbox/repos",
     ]
 

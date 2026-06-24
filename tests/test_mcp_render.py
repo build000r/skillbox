@@ -224,7 +224,7 @@ class MachineProfilePathTests(unittest.TestCase):
         mac = MachineProfile(
             machine_id="mac",
             hostnames=("mac",),
-            repo_roots=("/Users/b/repos",),
+            repo_roots=("/Users/operator/repos",),
         )
         return MachinesConfig(
             machines={"devbox": devbox, "mac": mac},
@@ -234,14 +234,14 @@ class MachineProfilePathTests(unittest.TestCase):
     def test_foreign_mac_path_translates_onto_devbox_root(self) -> None:
         config = self._config()
         devbox = config.get("devbox")
-        # A /Users/b path handed to a devbox must NOT survive into config.
+        # A /Users/operator path handed to a devbox must NOT survive into config.
         resolved = resolve_codex_cwd(
-            Path("/Users/b/repos/opensource/skillbox"),
+            Path("/Users/operator/repos/opensource/skillbox"),
             machines=config,
             profile=devbox,
         )
         self.assertEqual(resolved, "/srv/skillbox/repos/opensource/skillbox")
-        self.assertNotIn("/Users/b", resolved)
+        self.assertNotIn("/Users/operator", resolved)
 
     def test_local_devbox_path_is_unchanged(self) -> None:
         config = self._config()

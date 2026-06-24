@@ -647,7 +647,7 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
             },
             "services": [
                 {
-                    "id": "buildooor-web",
+                    "id": "example-web",
                     "kind": "http",
                     "healthcheck": {"type": "http", "url": "http://127.0.0.1:3000/health"},
                 },
@@ -706,7 +706,7 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
             ],
         }
         rows = [
-            {"id": "buildooor-web"},
+            {"id": "example-web"},
             {"id": "api"},
             {"id": "lan-api"},
             {"id": "wide-web"},
@@ -721,8 +721,8 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
         )
 
         by_id = {row["id"]: row for row in rows}
-        self.assertEqual(by_id["buildooor-web"]["endpoint"]["exposure"], "loopback-only")
-        self.assertFalse(by_id["buildooor-web"]["viewable_from_tailnet"])
+        self.assertEqual(by_id["example-web"]["endpoint"]["exposure"], "loopback-only")
+        self.assertFalse(by_id["example-web"]["viewable_from_tailnet"])
         self.assertEqual(by_id["api"]["endpoint"]["exposure"], "wildcard-direct")
         self.assertEqual(by_id["api"]["endpoint_url"], "http://100.64.0.10:9100")
         self.assertTrue(by_id["api"]["endpoint"]["all_interfaces"])
@@ -743,7 +743,7 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
         self.assertEqual(by_id["local-routed-web"]["endpoint"]["exposure"], "loopback-only")
         self.assertFalse(by_id["local-routed-web"]["viewable_from_tailnet"])
         self.assertEqual(len(warnings), 4)
-        self.assertIn("buildooor-web is loopback-only", warnings[0])
+        self.assertIn("example-web is loopback-only", warnings[0])
         self.assertTrue(any("api uses wildcard host 0.0.0.0:9100" in warning for warning in warnings))
         self.assertTrue(any("wide-web uses wildcard host 0.0.0.0:5175" in warning for warning in warnings))
         self.assertTrue(any("local-routed-web has only loopback-only ingress" in warning for warning in warnings))

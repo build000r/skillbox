@@ -66,7 +66,7 @@ from fixture_fleet import build_fixture_fleet  # noqa: E402
 REGISTRY_REPOS = [
     {"id": "app-core", "path": "~/repos/app_core", "bucket": "app"},
     {"id": "api-server", "path": "~/repos/api_server", "bucket": "backend"},
-    {"id": "ingredient-server", "path": "~/repos/ingredient_server", "bucket": "backend"},
+    {"id": "ingredient-server", "path": "~/repos/shared_service", "bucket": "backend"},
     {"id": "design-registry", "path": "~/repos/design_registry", "bucket": "registry"},
 ]
 
@@ -234,7 +234,7 @@ class RepoIdentityE2ETests(unittest.TestCase):
         with _FleetRegistryHarness(machine_id="devbox-like", repo_roots=DEVBOX_ROOTS):
             model = _model_with_inline_policy([rule])
             # Both backend repos resolve; matched from a cwd under each.
-            for repo in ("api_server", "ingredient_server"):
+            for repo in ("api_server", "shared_service"):
                 payload = sv.collect_skill_visibility(
                     model, cwd=f"/srv/skillbox/repos/{repo}/pkg",
                     include_global=False, include_project=False,
@@ -246,7 +246,7 @@ class RepoIdentityE2ETests(unittest.TestCase):
             # the app/registry-bucket repos.
             both = matched[0]["paths"]
             self.assertIn("/srv/skillbox/repos/api_server", both)
-            self.assertIn("/srv/skillbox/repos/ingredient_server", both)
+            self.assertIn("/srv/skillbox/repos/shared_service", both)
             self.assertNotIn("/srv/skillbox/repos/app_core", both)
             self.assertNotIn("/srv/skillbox/repos/design_registry", both)
             # A cwd under a NON-backend repo does not match the backend rule.

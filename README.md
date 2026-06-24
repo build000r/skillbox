@@ -295,28 +295,14 @@ roots are resolved under `${SKILLBOX_MONOSERVER_ROOT}` and each repo
 provides its own start command; the overlay declares dependency order, env
 targets, and health probes.
 
-The cut-over contract that backs this path is the six-service legacy core
-loop:
+The cut-over contract that backs this path is declared in the selected private
+client overlay. A typical `local-core` overlay contains an API service, one or
+more dependent backend services, and a browser-facing frontend. Each row
+declares its repo root, dependencies, health URL, and supported modes.
 
-- `spaps`: repo root `sweet-potato`; depends on none; health
-  `http://localhost:3301/health`; modes `reuse`, `prod`, `fresh`.
-- `htma_server`: repo root `htma_server`; depends on `spaps`; health
-  `http://localhost:8000/health`; modes `reuse`, `prod`, `fresh`.
-- `ingredient_server`: repo root `ingredient_server`; depends on `spaps`;
-  health `http://localhost:8001/health`; modes `reuse`, `prod`, `fresh`.
-- `approval_feedback_api`: repo root
-  `unclawg/services/approval_feedback_api`; depends on `spaps`; health
-  `http://localhost:8010/health`; modes `reuse`, `prod`, `fresh`.
-- `cfo`: repo root `cfo`; depends on `spaps`; health `localhost:8050`;
-  modes `reuse`, `prod`, `fresh`.
-- `htma`: repo root `htma`; depends on `spaps` and `htma_server`; health
-  `http://localhost:5173`; modes `reuse`, `prod`, `fresh`.
-
-Do not infer coverage for adjacent local surfaces such as `buildooor`,
-`cca-website`, `unclawg`, `voice-to-text`, `swimmers`, or `videos` from this
-table. Their current lifecycle behavior comes from the selected client's
-`parity_ledger`; only rows marked `covered` are managed by the normal runtime
-lifecycle.
+Do not infer coverage for adjacent local surfaces from prose docs. Their
+current lifecycle behavior comes from the selected client's `parity_ledger`;
+only rows marked `covered` are managed by the normal runtime lifecycle.
 
 Covered services may declare any subset of `--mode reuse`, `--mode prod`, and
 `--mode fresh`. The runtime validates the selected mode against each service
@@ -1045,9 +1031,9 @@ python3 .env-manager/manage.py sbh-report --format json
 python3 .env-manager/manage.py status --profile pressure-tools --format json --compact
 ```
 
-The first approved worker target is `portfolio-devbox` on the Tailnet. The
-policy explicitly excludes `jeremy`, `ssh-info`, and `sweet-potato-prod`; do not
-use Sweet Potato production boxes for this lane.
+Approved worker targets and excluded production boxes are operator policy, not
+public defaults. Declare them in private box/client overlays before using this
+lane.
 
 RCH integration is fail-open and approval-gated. It may report safe probes such
 as `rch --robot-triage --json`, `rch status --workers --jobs --json`,

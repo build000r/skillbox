@@ -10,9 +10,9 @@ from typing import Any
 
 from .shared import EXIT_OK, load_yaml
 
-DEFAULT_OPERATOR_ENV_FILE = "~/repos/buildooor/.env.local"
-DEFAULT_API_URL = "https://api.sweetpotato.dev"
-DEFAULT_BOOKING_URL = "https://buildooor.com/bookme"
+DEFAULT_OPERATOR_ENV_FILE = "~/.config/skillbox/operator-booking.env"
+DEFAULT_API_URL = "http://localhost:3301"
+DEFAULT_BOOKING_URL = ""
 DEFAULT_API_KEY_ENV = "NEXT_PUBLIC_SPAPS_PUBLISHABLE_KEY"
 DEFAULT_ACCESS_TOKEN_ENV = "SPAPS_AUTH_ACCESS_TOKEN"
 

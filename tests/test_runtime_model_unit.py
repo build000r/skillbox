@@ -616,7 +616,7 @@ class RuntimeIdGrammarTests(unittest.TestCase):
 
     # Canonical accept set: the in-tree shapes that MUST keep working — single
     # char, digits, hyphens, underscores (incl. the real
-    # sweet-potato__nextra_documentation_site client), and a full-length 64.
+    # example-app__documentation_site client), and a full-length 64.
     ACCEPT = [
         "a",
         "z9",
@@ -624,7 +624,7 @@ class RuntimeIdGrammarTests(unittest.TestCase):
         "my-svc",
         "my_svc",
         "a0_-b",
-        "sweet-potato__nextra_documentation_site",
+        "example-app__documentation_site",
         "x" * 64,
     ]
 

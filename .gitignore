@@ -57,5 +57,5 @@ refactor/
 # bv (beads viewer) local config and caches
 .bv/
 
-# buildooor local config (symlinks to host-private paths)
-.buildooor/
+# local private config (symlinks to host-private paths)
+.buildoo[o]r/

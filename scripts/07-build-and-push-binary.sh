@@ -12,14 +12,14 @@ set -euo pipefail
 #   07-build-and-push-binary.sh <src-dir> <bin-name> <target> [cargo-package]
 #
 # Example (swimmers — no extra deps):
-#   07-build-and-push-binary.sh ~/repos/opensource/swimmers swimmers skillbox-jeremy-3
+#   07-build-and-push-binary.sh ~/repos/opensource/swimmers swimmers skillbox-client_a-3
 #
 # Example (fwc — needs apt deps and two /dp/ path-dep mounts):
 #   SKILLBOX_BUILD_APT_DEPS="libdbus-1-dev pkg-config libssl-dev" \
 #   SKILLBOX_BUILD_EXTRA_MOUNTS="$HOME/repos/opensource/asupersync:/dp/asupersync:ro $HOME/repos/opensource/toon_rust:/dp/toon_rust:ro" \
 #   07-build-and-push-binary.sh \
 #     ~/repos/opensource/skillbox/repos/flywheel_connectors \
-#     fwc skillbox-jeremy-3
+#     fwc skillbox-client_a-3
 #
 # Env vars:
 #   SKILLBOX_BUILD_APT_DEPS     extra apt packages for the build container

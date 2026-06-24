@@ -723,7 +723,7 @@ def _policy_categories_by_id(policy: dict[str, Any]) -> dict[str, dict[str, Any]
 # --------------------------------------------------------------------------- #
 # Registry id/category -> path resolution (skill-scope `repos:` / `categories:`)
 #
-# A scope rule may name repos by their registry id (``repos: [htma, htma-server]``)
+# A scope rule may name repos by their registry id (``repos: [app_core, app_core-server]``)
 # and/or by a registry classification (``categories: [backend]`` matching a
 # repo's ``bucket``) instead of hand-listing literal ``paths:``. The id->path
 # taxonomy is the canonical operator registry at
@@ -869,9 +869,9 @@ def _machine_repo_roots() -> list[str]:
 def _registry_path_remainder(declared_path: str) -> tuple[str, bool]:
     """Split a registry path into (remainder, was_under_repos_root).
 
-    The registry authors paths home-relative (``~/repos/htma``, ``~/hard/x``).
+    The registry authors paths home-relative (``~/repos/app_core``, ``~/hard/x``).
     Paths under the ``~/repos`` family get re-rooted under the CURRENT machine's
-    repo roots (so ``htma`` -> ``/srv/skillbox/repos/htma`` on the devbox); paths
+    repo roots (so ``app_core`` -> ``/srv/skillbox/repos/app_core`` on the devbox); paths
     under other roots (``~/hard/...``) carry no machine mapping and are expanded
     home-relative as-is. Returns ``("", False)`` when there is no remainder.
     """

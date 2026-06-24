@@ -218,7 +218,7 @@ client:
   id: personal
   human_operator:
     env_file: {env_file}
-    booking_url: https://buildooor.com/bookme
+    booking_url: https://example.com/book
     availability_url: {availability_url}
     availability_origin: http://localhost:3000
     preferred_session: AI Build Diagnosis

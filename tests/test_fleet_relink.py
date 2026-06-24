@@ -1,6 +1,6 @@
 """Machine-migration relink: old-root -> new-root bulk link rewrite.
 
-A machine move (e.g. a Mac laptop at ``/Users/b/repos`` -> a devbox at
+A machine move (e.g. a Mac laptop at ``/Users/operator/repos`` -> a devbox at
 ``/srv/skillbox/repos``) is the single biggest drift generator in the skill
 estate: every installed skill symlink that pointed at the source tree now points
 at a path that does not exist on the new box (the broken-link taxonomy's
@@ -179,7 +179,7 @@ class ResolveRootsTests(unittest.TestCase):
         config = _config(
             {
                 "mac": m.MachineProfile(
-                    machine_id="mac", repo_roots=("/Users/b/repos", "/Users/b/alt")
+                    machine_id="mac", repo_roots=("/Users/operator/repos", "/Users/operator/alt")
                 ),
                 "devbox": m.MachineProfile(
                     machine_id="devbox", repo_roots=("/srv/skillbox/repos",)
@@ -189,7 +189,7 @@ class ResolveRootsTests(unittest.TestCase):
         roots = fr.resolve_relink_roots(config, "devbox")
         self.assertEqual(roots["mode"], "default")
         self.assertEqual(roots["to_root"], "/srv/skillbox/repos")
-        self.assertEqual(roots["from_roots"], ["/Users/b/repos", "/Users/b/alt"])
+        self.assertEqual(roots["from_roots"], ["/Users/operator/repos", "/Users/operator/alt"])
         self.assertIsNone(roots["error"])
 
     def test_explicit_roots_short_circuit_machine_table(self) -> None:
@@ -786,15 +786,15 @@ class TranslateLongestMatchTests(unittest.TestCase):
         return {"mode": "default"}
 
     def test_longest_source_root_wins_regardless_of_machine_order(self) -> None:
-        # mac-broad owns /Users/b ; mac-narrow owns /Users/b/repos (a longer,
-        # more specific prefix). A target under /Users/b/repos/... is under BOTH.
+        # mac-broad owns /Users/operator ; mac-narrow owns /Users/operator/repos (a longer,
+        # more specific prefix). A target under /Users/operator/repos/... is under BOTH.
         # The longer (narrow) root is the correct owner and must win whichever
         # order the machines are declared in.
         devbox_root = "/srv/devbox"
-        broad = m.MachineProfile(machine_id="mac-broad", repo_roots=("/Users/b",))
-        narrow = m.MachineProfile(machine_id="mac-narrow", repo_roots=("/Users/b/repos",))
+        broad = m.MachineProfile(machine_id="mac-broad", repo_roots=("/Users/operator",))
+        narrow = m.MachineProfile(machine_id="mac-narrow", repo_roots=("/Users/operator/repos",))
         here = m.MachineProfile(machine_id="devbox", repo_roots=(devbox_root,))
-        target = "/Users/b/repos/proj/skills/x"
+        target = "/Users/operator/repos/proj/skills/x"
 
         for order in (
             {"mac-broad": broad, "mac-narrow": narrow, "devbox": here},
@@ -804,7 +804,7 @@ class TranslateLongestMatchTests(unittest.TestCase):
             translated = fr._translate_target(
                 target, self._roots_default(), config, "devbox"
             )
-            # The NARROW (longest) root maps /Users/b/repos -> /srv/devbox, so the
+            # The NARROW (longest) root maps /Users/operator/repos -> /srv/devbox, so the
             # remainder is proj/skills/x (NOT repos/proj/skills/x from the broad
             # root). Longest match wins independent of declaration order.
             self.assertEqual(translated, "/srv/devbox/proj/skills/x", f"order={list(order)}")
@@ -814,7 +814,7 @@ class TranslateLongestMatchTests(unittest.TestCase):
         # the tiebreak is deterministic (sorted by translated target then id), so
         # the same link always relinks to the same target run-to-run.
         a = m.MachineProfile(machine_id="m-a", repo_roots=("/Users/aa/repos",))
-        b = m.MachineProfile(machine_id="m-b", repo_roots=("/Users/bb/repos",))
+        b = m.MachineProfile(machine_id="m-b", repo_roots=("/Users/userbb/repos",))
         here = m.MachineProfile(machine_id="devbox", repo_roots=("/srv/devbox",))
         # A target under m-a only (no overlap) translates unambiguously; the
         # determinism guard is exercised by building the config both orders and

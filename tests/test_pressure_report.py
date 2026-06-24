@@ -29,15 +29,15 @@ class PressureReportTests(unittest.TestCase):
                 {
                     "boxes": [
                         {
-                            "id": "portfolio-devbox",
+                            "id": "worker-devbox",
                             "state": "ready",
                             "profile": "dev-small",
-                            "tailscale_hostname": "skillbox-portfolio-devbox",
+                            "tailscale_hostname": "skillbox-worker-devbox",
                             "tailscale_ip": "100.86.253.9",
                             "state_root": "/srv/skillbox",
                             "storage_filesystem": "ext4",
                             "storage_min_free_gb": 10.0,
-                            "volume_name": "skillbox-state-portfolio-devbox",
+                            "volume_name": "skillbox-state-worker-devbox",
                             "volume_size_gb": 20,
                         }
                     ]
@@ -70,9 +70,9 @@ class PressureReportTests(unittest.TestCase):
         self.assertFalse(payload["mutates"])
         self.assertFalse(payload["target_policy"]["cleanup_allowed"])
         self.assertFalse(payload["target_policy"]["remote_writes_allowed"])
-        self.assertIn("sweet-potato-prod", payload["target_policy"]["excluded_box_ids"])
+        self.assertIn("primary-prod", payload["target_policy"]["excluded_box_ids"])
         self.assertEqual(payload["local_disk"]["pressure_level"], "normal")
-        self.assertEqual(payload["box"]["target_box"], "portfolio-devbox")
+        self.assertEqual(payload["box"]["target_box"], "worker-devbox")
         self.assertFalse(payload["box"]["live_free_known"])
         self.assertEqual(payload["box"]["volume_size_gib"], 20.0)
 
@@ -129,7 +129,7 @@ class PressureReportTests(unittest.TestCase):
             },
             "box": {
                 "found": True,
-                "target_box": "portfolio-devbox",
+                "target_box": "worker-devbox",
                 "state": "ready",
                 "volume_size_gib": 20.0,
                 "min_free_gib": 10.0,
@@ -147,7 +147,7 @@ class PressureReportTests(unittest.TestCase):
         lines = pressure_report_text_lines(payload)
 
         self.assertIn("pressure report: read-only", lines[0])
-        self.assertTrue(any("box: portfolio-devbox" in line for line in lines))
+        self.assertTrue(any("box: worker-devbox" in line for line in lines))
         self.assertTrue(any("codex-state" in line and "no-touch" in line for line in lines))
         self.assertIn("Do not delete", "\n".join(lines))
 
@@ -175,7 +175,7 @@ class PressureReportTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["mode"], "read_only")
-        self.assertEqual(payload["target_policy"]["target_box"], "portfolio-devbox")
+        self.assertEqual(payload["target_policy"]["target_box"], "worker-devbox")
         self.assertTrue(any(bucket["id"] == "codex-state" for bucket in payload["protected_buckets"]))
 
 

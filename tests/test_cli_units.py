@@ -148,8 +148,8 @@ class CliUnitTests(unittest.TestCase):
         self.assertIn("rch-report --format json", result.stdout)
         self.assertIn("rch-stage --dry-run", result.stdout)
         self.assertIn("sbh-report --format json", result.stdout)
-        self.assertIn("portfolio-devbox", result.stdout)
-        self.assertIn("sweet-potato-prod", result.stdout)
+        self.assertIn("worker-devbox", result.stdout)
+        self.assertIn("primary-prod", result.stdout)
         self.assertIn("Protected paths", result.stdout)
         self.assertIn("swimmers-launch <dirs...>", result.stdout)
         self.assertIn("next --format json", result.stdout)
@@ -1519,7 +1519,7 @@ except RuntimeError as exc:
     def test_runtime_cwd_inference_prefers_client_with_local_runtime_service_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            shared_dep = root / "ingredient_server"
+            shared_dep = root / "shared_service"
             shared_dep.mkdir()
             model = {
                 "selection": {},
@@ -1533,21 +1533,21 @@ except RuntimeError as exc:
                     {
                         "id": "cca",
                         "label": "CCA",
-                        "default_cwd": str(root / "cca-website"),
+                        "default_cwd": str(root / "example-website"),
                         "context": {"cwd_match": [str(shared_dep)]},
                     },
                     {
-                        "id": "htma",
-                        "label": "HTMA",
-                        "default_cwd": str(root / "htma"),
+                        "id": "app_core",
+                        "label": "App Core",
+                        "default_cwd": str(root / "app_core"),
                         "context": {"cwd_match": [str(shared_dep)]},
                     },
                 ],
                 "repos": [
                     {
-                        "id": "ingredient_server",
+                        "id": "shared_service",
                         "host_path": str(shared_dep),
-                        "client": "htma",
+                        "client": "app_core",
                     },
                     {
                         "id": "personal-ingredient",
@@ -1564,9 +1564,9 @@ except RuntimeError as exc:
                         "commands": {"reuse": "make personal-local-up"},
                     },
                     {
-                        "id": "ingredient_server",
-                        "client": "htma",
-                        "repo": "ingredient_server",
+                        "id": "shared_service",
+                        "client": "app_core",
+                        "repo": "shared_service",
                         "profiles": ["local-all"],
                         "commands": {"reuse": "make local-up"},
                     },
@@ -1585,12 +1585,12 @@ except RuntimeError as exc:
 
             args = _ns(command="up", cwd=str(shared_dep), profile=["local-all"])
 
-            self.assertEqual(CLI._active_clients_for_args(args, model), {"htma"})
+            self.assertEqual(CLI._active_clients_for_args(args, model), {"app_core"})
 
     def test_skill_cwd_inference_keeps_visibility_match_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            shared_dep = root / "ingredient_server"
+            shared_dep = root / "shared_service"
             shared_dep.mkdir()
             model = {
                 "selection": {},
@@ -1604,21 +1604,21 @@ except RuntimeError as exc:
                     {
                         "id": "cca",
                         "label": "CCA",
-                        "default_cwd": str(root / "cca-website"),
+                        "default_cwd": str(root / "example-website"),
                         "context": {"cwd_match": [str(shared_dep)]},
                     },
                     {
-                        "id": "htma",
-                        "label": "HTMA",
-                        "default_cwd": str(root / "htma"),
+                        "id": "service_app",
+                        "label": "Service App",
+                        "default_cwd": str(root / "service_app"),
                         "context": {"cwd_match": [str(shared_dep)]},
                     },
                 ],
                 "repos": [
                     {
-                        "id": "ingredient_server",
+                        "id": "shared_service",
                         "host_path": str(shared_dep),
-                        "client": "htma",
+                        "client": "service_app",
                     },
                     {
                         "id": "personal-ingredient",
@@ -1635,9 +1635,9 @@ except RuntimeError as exc:
                         "commands": {"reuse": "make personal-local-up"},
                     },
                     {
-                        "id": "ingredient_server",
-                        "client": "htma",
-                        "repo": "ingredient_server",
+                        "id": "shared_service",
+                        "client": "service_app",
+                        "repo": "shared_service",
                         "profiles": ["local-all"],
                         "commands": {"reuse": "make local-up"},
                     },
@@ -1661,21 +1661,21 @@ except RuntimeError as exc:
     def test_runtime_cwd_inference_uses_existing_match_order_before_graph_size(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            app_root = root / "sweet-potato"
+            app_root = root / "example-app"
             app_root.mkdir()
             model = {
                 "selection": {},
                 "clients": [
                     {
-                        "id": "sweet-potato",
+                        "id": "example-app",
                         "label": "Sweet Potato",
                         "default_cwd": str(app_root),
                         "context": {"cwd_match": [str(app_root)]},
                     },
                     {
-                        "id": "htma",
-                        "label": "HTMA",
-                        "default_cwd": str(root / "htma"),
+                        "id": "app_core",
+                        "label": "App Core",
+                        "default_cwd": str(root / "app_core"),
                         "context": {"cwd_match": [str(app_root)]},
                     },
                 ],
@@ -1683,38 +1683,38 @@ except RuntimeError as exc:
                     {
                         "id": "spaps-local",
                         "host_path": str(app_root),
-                        "client": "sweet-potato",
+                        "client": "example-app",
                     },
                     {
-                        "id": "spaps-htma",
+                        "id": "spaps-app_core",
                         "host_path": str(app_root),
-                        "client": "htma",
+                        "client": "app_core",
                     },
                     {
-                        "id": "htma-api",
-                        "host_path": str(root / "htma_server"),
-                        "client": "htma",
+                        "id": "app_core-api",
+                        "host_path": str(root / "api_server"),
+                        "client": "app_core",
                     },
                 ],
                 "services": [
                     {
                         "id": "spaps-local",
-                        "client": "sweet-potato",
+                        "client": "example-app",
                         "repo": "spaps-local",
                         "profiles": ["local-all"],
                         "commands": {"reuse": "make local-up"},
                     },
                     {
-                        "id": "spaps-htma",
-                        "client": "htma",
-                        "repo": "spaps-htma",
+                        "id": "spaps-app_core",
+                        "client": "app_core",
+                        "repo": "spaps-app_core",
                         "profiles": ["local-all"],
                         "commands": {"reuse": "make local-up"},
                     },
                     {
-                        "id": "htma-api",
-                        "client": "htma",
-                        "repo": "htma-api",
+                        "id": "app_core-api",
+                        "client": "app_core",
+                        "repo": "app_core-api",
                         "profiles": ["local-all"],
                         "commands": {"reuse": "make local-up"},
                     },
@@ -1733,7 +1733,7 @@ except RuntimeError as exc:
 
             args = _ns(command="up", cwd=str(app_root), profile=["local-all"])
 
-            self.assertEqual(CLI._active_clients_for_args(args, model), {"sweet-potato"})
+            self.assertEqual(CLI._active_clients_for_args(args, model), {"example-app"})
 
     def test_high_risk_handlers_emit_structured_payloads(self) -> None:
         emitted: list[dict[str, object]] = []

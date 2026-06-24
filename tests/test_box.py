@@ -307,8 +307,8 @@ class BoxTests(unittest.TestCase):
 
     def test_volume_filesystem_label_drops_state_prefix_for_ext4(self) -> None:
         self.assertEqual(
-            BOX_MODULE.volume_filesystem_label("skillbox-state-jeremy", "ext4"),
-            "skillbox-jeremy",
+            BOX_MODULE.volume_filesystem_label("skillbox-state-clienta", "ext4"),
+            "skillbox-clienta",
         )
 
     def test_volume_filesystem_label_respects_xfs_length_limit(self) -> None:
@@ -740,9 +740,9 @@ class BoxTests(unittest.TestCase):
             inv_path.parent.mkdir(parents=True)
             inv_path.write_text(json.dumps({
                 "boxes": [
-                    {"id": "jeremy", "profile": "dev-small", "state": "ready",
+                    {"id": "client_a", "profile": "dev-small", "state": "ready",
                      "droplet_id": "321", "droplet_ip": "1.2.3.4",
-                     "tailscale_hostname": "skillbox-jeremy", "tailscale_ip": "100.64.1.9",
+                     "tailscale_hostname": "skillbox-client_a", "tailscale_ip": "100.64.1.9",
                      "ssh_user": "skillbox", "created_at": "", "updated_at": "",
                      "region": "nyc3", "size": "s-2vcpu-4gb"},
                 ],
@@ -752,7 +752,7 @@ class BoxTests(unittest.TestCase):
             archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
             manifest_path = root / "deploy.json"
             manifest_path.write_text(json.dumps({
-                "client_id": "jeremy",
+                "client_id": "client_a",
                 "source_commit": "abc123def456",
                 "payload_tree_sha256": "1" * 64,
                 "active_profiles": ["connectors", "core"],
@@ -763,7 +763,7 @@ class BoxTests(unittest.TestCase):
             env = self._env_with_inventory(tmpdir)
             result = self._run(
                 "upgrade",
-                "jeremy",
+                "client_a",
                 "--deploy-manifest",
                 str(manifest_path),
                 "--dry-run",
@@ -787,9 +787,9 @@ class BoxTests(unittest.TestCase):
             inv_path.parent.mkdir(parents=True)
             inv_path.write_text(json.dumps({
                 "boxes": [
-                    {"id": "jeremy", "profile": "dev-small", "state": "deploying",
+                    {"id": "client_a", "profile": "dev-small", "state": "deploying",
                      "droplet_id": "321", "droplet_ip": "1.2.3.4",
-                     "tailscale_hostname": "skillbox-jeremy", "tailscale_ip": "100.64.1.9",
+                     "tailscale_hostname": "skillbox-client_a", "tailscale_ip": "100.64.1.9",
                      "ssh_user": "skillbox", "created_at": "", "updated_at": "",
                      "region": "nyc3", "size": "s-2vcpu-4gb"},
                 ],
@@ -799,7 +799,7 @@ class BoxTests(unittest.TestCase):
             archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
             manifest_path = root / "deploy.json"
             manifest_path.write_text(json.dumps({
-                "client_id": "jeremy",
+                "client_id": "client_a",
                 "source_commit": "abc123def456",
                 "payload_tree_sha256": "1" * 64,
                 "archive": "skillbox.tar.gz",
@@ -809,7 +809,7 @@ class BoxTests(unittest.TestCase):
             env = self._env_with_inventory(tmpdir)
             result = self._run(
                 "upgrade",
-                "jeremy",
+                "client_a",
                 "--deploy-manifest",
                 str(manifest_path),
                 "--format",
@@ -828,9 +828,9 @@ class BoxTests(unittest.TestCase):
             inv_path.parent.mkdir(parents=True)
             inv_path.write_text(json.dumps({
                 "boxes": [
-                    {"id": "jeremy", "profile": "dev-small", "state": "ready",
+                    {"id": "client_a", "profile": "dev-small", "state": "ready",
                      "droplet_id": "321", "droplet_ip": "1.2.3.4",
-                     "tailscale_hostname": "skillbox-jeremy", "tailscale_ip": "100.64.1.9",
+                     "tailscale_hostname": "skillbox-client_a", "tailscale_ip": "100.64.1.9",
                      "ssh_user": "skillbox", "created_at": "", "updated_at": "",
                      "region": "nyc3", "size": "s-2vcpu-4gb"},
                 ],
@@ -850,7 +850,7 @@ class BoxTests(unittest.TestCase):
             env = self._env_with_inventory(tmpdir)
             result = self._run(
                 "upgrade",
-                "jeremy",
+                "client_a",
                 "--deploy-manifest",
                 str(manifest_path),
                 "--format",

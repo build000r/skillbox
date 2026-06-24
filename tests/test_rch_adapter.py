@@ -97,7 +97,7 @@ class RchAdapterTests(unittest.TestCase):
                     plan["wrappers"]["ssh"],
                     "-i",
                     local_key,
-                    "portfolio-devbox-rch-ossshd",
+                    "worker-devbox-rch-ossshd",
                     "sh",
                     "-c",
                     f"mkdir -p {plan['stage']['local_projects_root']} && cd /data/projects/repo",
@@ -137,7 +137,7 @@ class RchAdapterTests(unittest.TestCase):
             result = subprocess.run(
                 [
                     plan["wrappers"]["ssh"],
-                    "portfolio-devbox-rch-ossshd",
+                    "worker-devbox-rch-ossshd",
                     f"sh -lc '{probe}'",
                 ],
                 capture_output=True,
@@ -182,7 +182,7 @@ class RchAdapterTests(unittest.TestCase):
             result = subprocess.run(
                 [
                     plan["wrappers"]["ssh"],
-                    "portfolio-devbox-rch-ossshd",
+                    "worker-devbox-rch-ossshd",
                     "sh",
                     "-s",
                 ],
@@ -194,7 +194,7 @@ class RchAdapterTests(unittest.TestCase):
             )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("ARGS: [portfolio-devbox-rch-ossshd] [sh] [-s]", result.stdout)
+        self.assertIn("ARGS: [worker-devbox-rch-ossshd] [sh] [-s]", result.stdout)
         self.assertIn("touch /srv/skillbox/rch-adapter/canary/projects/repo", result.stdout)
         self.assertIn("cd /srv/skillbox/rch-adapter/canary/projects/repo", result.stdout)
         self.assertNotIn("/data/projects/repo", result.stdout)
@@ -224,7 +224,7 @@ class RchAdapterTests(unittest.TestCase):
                     "--rsync-path",
                     "mkdir -p /data/projects/repo && rsync",
                     "src/",
-                    "skillbox@portfolio-devbox-rch-ossshd:/data/projects/repo",
+                    "skillbox@worker-devbox-rch-ossshd:/data/projects/repo",
                 ],
                 capture_output=True,
                 text=True,

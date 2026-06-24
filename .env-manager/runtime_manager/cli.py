@@ -762,7 +762,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "from the one declaration that `mcp-audit` audits against, so audit and "
             "render agree. Output paths and the Codex `cwd` resolve through machine "
             "profiles (skillbox-config/machines.yaml) so a devbox TOML never gets a "
-            "foreign /Users/b path. Entries marked operator_managed in the "
+            "foreign /Users/operator path. Entries marked operator_managed in the "
             "declaration, and any entry present on a surface but not declared, are "
             "PRESERVED (review-before-remove). The user-global ~/.codex/config.toml "
             "is operator-managed and is NEVER rewritten by this command. --dry-run "
@@ -900,7 +900,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--from-root",
         dest="from_root",
         default=None,
-        help="Source root to rewrite FROM (e.g. /Users/b/repos). Defaults to every other machine's repo roots from machines.yaml.",
+        help="Source root to rewrite FROM (e.g. /Users/operator/repos). Defaults to every other machine's repo roots from machines.yaml.",
     )
     fleet_relink_parser.add_argument(
         "--to-root",
@@ -3109,8 +3109,8 @@ Useful command families:
   focus <client> --format json  Sync, bootstrap, start, collect live state, context.
 
 Pressure/offload rule:
-  The approved non-production worker target is portfolio-devbox.
-  Excluded targets are jeremy, ssh-info, and sweet-potato-prod.
+  The approved non-production worker target is worker-devbox.
+  Excluded targets are prod, production, and primary-prod.
   Protected paths like ~/.codex, ~/.claude, and ~/.ssh are hard no-touch.
   Use pressure-report, rch-report, and sbh-report before expensive builds or cleanup.
   Use rch-stage --dry-run before any staged remote build; it strips remote delete flags by default.

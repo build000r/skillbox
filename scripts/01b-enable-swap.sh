@@ -7,7 +7,7 @@ set -euo pipefail
 #   Small droplets (e.g. s-2vcpu-4gb) ship with zero swap. Running Docker +
 #   cargo/rustc + tailscaled on 4 GB of RAM OOM-thrashes the box, which
 #   knocks tailscaled offline and stalls new SSH handshakes — the exact
-#   failure that took skillbox-jeremy-3 out on 2026-04-08.
+#   failure that took skillbox-client_a-3 out on 2026-04-08.
 #
 # This script is safe to re-run: if /swapfile already exists and is active,
 # it exits without changes.

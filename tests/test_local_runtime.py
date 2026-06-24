@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import http.server
+import os
 import subprocess
 import sys
 import socket
@@ -313,7 +314,7 @@ class BridgeModelCompilationTests(unittest.TestCase):
 
     def test_filter_model_scopes_parity_ledger_by_client_and_intended_profile(self) -> None:
         model = {
-            "clients": [{"id": "personal"}, {"id": "jeremy"}],
+            "clients": [{"id": "personal"}, {"id": "client_a"}],
             "repos": [],
             "artifacts": [],
             "env_files": [],
@@ -335,19 +336,19 @@ class BridgeModelCompilationTests(unittest.TestCase):
                     "intended_profiles": ["local-all"],
                 },
                 {
-                    "id": "jeremy-local-ecom",
-                    "client": "jeremy",
+                    "id": "client_a-local-ecom",
+                    "client": "client_a",
                     "intended_profiles": ["local-ecom"],
                 },
             ],
         }
 
-        jeremy_profiles = normalize_active_profiles(["local-ecom"])
-        jeremy_clients = normalize_active_clients(model, ["jeremy"])
-        jeremy_filtered = filter_model(model, jeremy_profiles, jeremy_clients)
+        client_a_profiles = normalize_active_profiles(["local-ecom"])
+        client_a_clients = normalize_active_clients(model, ["client_a"])
+        client_a_filtered = filter_model(model, client_a_profiles, client_a_clients)
         self.assertEqual(
-            {item["id"] for item in jeremy_filtered["parity_ledger"]},
-            {"jeremy-local-ecom"},
+            {item["id"] for item in client_a_filtered["parity_ledger"]},
+            {"client_a-local-ecom"},
         )
 
         personal_profiles = normalize_active_profiles(["local-core"])
@@ -1581,7 +1582,7 @@ class LocalCoreParityLedgerUS4Tests(unittest.TestCase):
 
 
 REAL_PERSONAL_OVERLAY_PATH = Path(
-    "/Users/b/repos/skillbox-config/clients/personal/overlay.yaml"
+    os.environ.get("SKILLBOX_TEST_PERSONAL_OVERLAY", "")
 )
 
 
@@ -1601,9 +1602,8 @@ class RealOverlayParityLedgerRegressionTests(unittest.TestCase):
     def _build_model_from_real_overlay(self) -> dict:
         if not REAL_PERSONAL_OVERLAY_PATH.is_file():
             self.skipTest(
-                f"Real overlay missing at {REAL_PERSONAL_OVERLAY_PATH}; "
-                "this regression test runs only where the private personal "
-                "overlay is available."
+                "Set SKILLBOX_TEST_PERSONAL_OVERLAY to a private personal "
+                "overlay path to run this regression test."
             )
         overlay_doc = runtime_model.load_yaml(REAL_PERSONAL_OVERLAY_PATH)
         raw_client = overlay_doc.get("client")

@@ -85,9 +85,7 @@ SKILL_INSTALL_SCAN_MAX_DEPTH = 4
 DEFAULT_SKILL_SOURCE_ROOT_PATTERNS = (
     "~/repos/opensource/skills",
     "~/repos/opensource/skillbox/skills",
-    "~/repos/skills-private",
     "~/repos/skills/skills",
-    "~/repos/marketingskills/skills",
     "~/projects/jsm-skill-archive-*",
 )
 DEFAULT_SKILL_INSTALL_SCAN_ROOT_PATTERNS: tuple[str, ...] = ()
@@ -109,9 +107,6 @@ SKILL_SOURCE_SCAN_SKIP_DIRS = {
 }
 SOURCE_BUCKET_ORDER = {
     "opensource/skills": 0,
-    "skills-private": 1,
-    "marketingskills": 2,
-    "sweet-potato": 3,
     "local": 4,
     "archive": 9,
     "external": 10,
