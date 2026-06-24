@@ -10,6 +10,10 @@ fi
 CRON_MARKER="sbp-send-later-wrapper"
 CRON_LINE="* * * * * ${SBP_BIN} send-later run-pending >> ${LOG_DIR}/ntm-send-later.cron.log 2>&1 # ${CRON_MARKER}"
 CRON_LOG="${LOG_DIR}/ntm-send-later.cron.log"
+# Heartbeat written every tick so `doctor` can prove the per-minute run-pending
+# is firing even when the queue is empty (an idle run-pending writes nothing
+# else, so CRON_LOG mtime alone cannot distinguish "dead" from "idle").
+TICK_FILE="${STATE_DIR}/.last-tick"
 
 # A one-shot job past its due time by more than this with no .done is "overdue"
 # (suspicious — it should have fired). Below this it is merely "due".
@@ -753,6 +757,8 @@ run_pending() {
       echo "$(date -u +%FT%TZ) run_job failed job=$job rc=$rc" >> "$CRON_LOG"
     fi
   done
+  # Heartbeat last: a stale TICK_FILE => the tick itself stopped firing.
+  date -u +%s > "$TICK_FILE" 2>/dev/null || true
 }
 
 # Manually fire a single job NOW, ignoring its due time and .done marker. For
@@ -909,10 +915,17 @@ cmd_doctor() {
   local now; now="$(date -u +%s)"
 
   # --- cron tick health ---
+  # Prefer the per-tick heartbeat (proves the tick fires even with an empty
+  # queue); fall back to CRON_LOG mtime for installs predating the heartbeat.
   local cron_ok="false"; cron_installed && cron_ok="true"
   local tick_epoch=0 tick_age=-1 tick_stale="false"
-  if [[ -f "$CRON_LOG" ]]; then
+  if [[ -f "$TICK_FILE" ]]; then
+    tick_epoch="$(cat "$TICK_FILE" 2>/dev/null || echo 0)"
+  elif [[ -f "$CRON_LOG" ]]; then
     tick_epoch="$(stat -c %Y "$CRON_LOG" 2>/dev/null || echo 0)"
+  fi
+  [[ "$tick_epoch" =~ ^[0-9]+$ ]] || tick_epoch=0
+  if (( tick_epoch > 0 )); then
     tick_age=$(( now - tick_epoch ))
     (( tick_age > TICK_STALE_S )) && tick_stale="true"
   fi
