@@ -400,8 +400,8 @@ def _gate_specs() -> tuple[_GateSpec, ...]:
             kind=KIND_STRUCTURE,
             cap_s=CAP_FAST_LINT,
             fix_command=(
-                "edit skillbox-config/skill-scope.yaml so global_allowlist equals "
-                "the union of allow_global rules"
+                "edit allow_global rules in skillbox-config/skill-scope.yaml, "
+                "then regenerate or remove the derived global_allowlist snapshot"
             ),
             runner=_run_global_skill_contract,
         ),

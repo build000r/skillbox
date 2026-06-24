@@ -1609,14 +1609,18 @@ class SkillVisibilityTests(unittest.TestCase):
                 self.assertTrue(initialized_payload["beads"]["ok"])
                 self.assertEqual(initialized_payload["beads"]["issues"], [])
 
-    def test_global_allowlist_flags_unapproved_global_installs(self) -> None:
+    def test_allow_global_rules_flag_unapproved_global_installs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             clients_root = root / "clients"
             clients_root.mkdir()
             (root / "skill-scope.yaml").write_text(
                 "version: 1\n"
-                "global_allowlist: [always-global]\n",
+                "global_allowlist: [always-global]\n"
+                "rules:\n"
+                "  - id: global\n"
+                "    skills: [always-global]\n"
+                "    allow_global: true\n",
                 encoding="utf-8",
             )
 
@@ -1631,7 +1635,27 @@ class SkillVisibilityTests(unittest.TestCase):
             self.assertTrue(_global_install_allowed(model, "always-global"))
             self.assertFalse(_global_install_allowed(model, "too-broad"))
 
-    def test_global_allowlist_prevents_extra_global_noise(self) -> None:
+    def test_global_allowlist_snapshot_does_not_grant_global_install(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            clients_root = root / "clients"
+            clients_root.mkdir()
+            (root / "skill-scope.yaml").write_text(
+                "version: 1\n"
+                "global_allowlist: [snapshot-only]\n",
+                encoding="utf-8",
+            )
+            model = {
+                "env": {"SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root)},
+                "clients": [],
+                "skills": [],
+            }
+
+            from runtime_manager.skill_visibility import _global_install_allowed  # noqa: PLC0415
+
+            self.assertFalse(_global_install_allowed(model, "snapshot-only"))
+
+    def test_allow_global_rules_prevent_extra_global_noise(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             clients_root = root / "clients"
@@ -1647,7 +1671,11 @@ class SkillVisibilityTests(unittest.TestCase):
             (global_root / "too-broad").symlink_to(extra_source, target_is_directory=True)
             (root / "skill-scope.yaml").write_text(
                 "version: 1\n"
-                "global_allowlist: [always-global]\n",
+                "global_allowlist: [always-global]\n"
+                "rules:\n"
+                "  - id: global\n"
+                "    skills: [always-global]\n"
+                "    allow_global: true\n",
                 encoding="utf-8",
             )
             model = {

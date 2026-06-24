@@ -1,12 +1,12 @@
 """Lint coverage for the global skill contract (repos-sbp-canon-hdl.2).
 
 The operator's ``skill-scope.yaml`` declares the always-global skill surface in
-two hand-synced places: the flat ``global_allowlist`` list and every rule with
-``allow_global: true``. ``validate_global_skill_contract`` asserts those two
-lists describe the same set so they cannot silently drift apart. These tests:
+``allow_global: true`` rules. The flat ``global_allowlist`` key is an optional
+derived snapshot, not a second authority. ``validate_global_skill_contract``
+asserts that any committed snapshot matches the rule-derived set. These tests:
 
 * prove the lint is GREEN against the committed public contract fixture,
-* prove the lint is GREEN on an in-memory consistent policy, and
+* prove the lint is GREEN on an in-memory policy without a snapshot, and
 * prove the lint is RED on a planted drift (in each direction).
 
 Run just these with::
@@ -30,11 +30,9 @@ from runtime_manager.validation import (  # noqa: E402
     GLOBAL_SKILL_CONTRACT_CODE,
     validate_global_skill_contract,
 )
+from runtime_manager._skill_common import DISPATCHER_CORE  # noqa: E402
 
 
-# The 14 operator skills the global-trim decision landed on (policy-estate
-# oh1.1): the 2 dispatcher-core skills + the 12 named operator exceptions.
-DISPATCHER_CORE = ["smart", "sbp"]
 OPERATOR_EXCEPTIONS = [
     "beads-br",
     "beads-bv",
@@ -49,24 +47,45 @@ OPERATOR_EXCEPTIONS = [
     "skill-issue",
     "ui-fresh-eyes",
 ]
-ALL_GLOBALS = DISPATCHER_CORE + OPERATOR_EXCEPTIONS
 
 
-def _consistent_policy() -> dict:
-    """A policy where global_allowlist == union of allow_global rules."""
-    return {
-        "global_allowlist": list(ALL_GLOBALS),
+def _policy_rules() -> list[dict]:
+    return [
+        {"id": "dispatcher-global", "skills": list(DISPATCHER_CORE), "allow_global": True},
+        {
+            "id": "operator-global-exceptions",
+            "skills": list(OPERATOR_EXCEPTIONS),
+            "allow_global": True,
+        },
+        # A task-skill rule with no allow_global must be ignored by the union.
+        {"id": "task-on-demand", "skills": ["cass", "describe"], "default": "off"},
+    ]
+
+
+def _derived_global_skills(policy: dict) -> set[str]:
+    names: set[str] = set()
+    for rule in policy.get("rules") or []:
+        if not rule.get("allow_global"):
+            continue
+        for key in ("skills", "patterns", "names"):
+            for name in rule.get(key) or []:
+                if str(name).strip():
+                    names.add(str(name).strip())
+            if rule.get(key):
+                break
+    return names
+
+
+def _consistent_policy(*, include_snapshot: bool = True) -> dict:
+    """A policy where any global_allowlist snapshot matches allow_global rules."""
+    policy = {
         "rules": [
-            {"id": "dispatcher-global", "skills": list(DISPATCHER_CORE), "allow_global": True},
-            {
-                "id": "operator-global-exceptions",
-                "skills": list(OPERATOR_EXCEPTIONS),
-                "allow_global": True,
-            },
-            # A task-skill rule with no allow_global must be ignored by the union.
-            {"id": "task-on-demand", "skills": ["cass", "describe"], "default": "off"},
+            dict(rule) for rule in _policy_rules()
         ],
     }
+    if include_snapshot:
+        policy["global_allowlist"] = sorted(_derived_global_skills(policy))
+    return policy
 
 
 class GlobalContractLintTests(unittest.TestCase):
@@ -84,18 +103,34 @@ class GlobalContractLintTests(unittest.TestCase):
             f"public skill contract drifted: {results[0].message} :: {results[0].details}",
         )
         # And the public set is exactly the decided 14 operator skills.
+        expected = _derived_global_skills(_consistent_policy())
         self.assertEqual(
             set(results[0].details["global_skills"]),
-            set(ALL_GLOBALS),
+            expected,
         )
+        self.assertEqual(len(expected), 14)
+        self.assertTrue(set(DISPATCHER_CORE).issubset(expected))
 
     def test_lint_green_on_consistent_policy(self) -> None:
         results = validate_global_skill_contract(_consistent_policy())
         self.assertEqual(self._statuses(results), ["pass"], results[0].details)
-        self.assertEqual(set(results[0].details["global_skills"]), set(ALL_GLOBALS))
+        self.assertEqual(
+            set(results[0].details["global_skills"]),
+            _derived_global_skills(_consistent_policy()),
+        )
+
+    def test_global_allowlist_snapshot_is_optional(self) -> None:
+        policy = _consistent_policy(include_snapshot=False)
+        results = validate_global_skill_contract(policy)
+        self.assertEqual(self._statuses(results), ["pass"], results[0].details)
+        self.assertFalse(results[0].details["global_allowlist_present"])
+        self.assertEqual(
+            set(results[0].details["global_skills"]),
+            _derived_global_skills(policy),
+        )
 
     def test_lint_red_when_allowlist_has_extra_skill(self) -> None:
-        """A skill in global_allowlist but granted by no allow_global rule = drift."""
+        """A skill in the snapshot but granted by no allow_global rule = drift."""
         policy = _consistent_policy()
         policy["global_allowlist"].append("rogue-skill")
         results = validate_global_skill_contract(policy)
@@ -103,9 +138,10 @@ class GlobalContractLintTests(unittest.TestCase):
         self.assertEqual(results[0].code, GLOBAL_SKILL_CONTRACT_CODE)
         self.assertIn("rogue-skill", results[0].details["in_allowlist_only"])
         self.assertIn("rogue-skill", results[0].message + str(results[0].details))
+        self.assertIn("This list is derived; edit rules instead", results[0].message)
 
     def test_lint_red_when_rule_grants_skill_missing_from_allowlist(self) -> None:
-        """A skill granted by an allow_global rule but absent from global_allowlist = drift."""
+        """A skill granted by an allow_global rule but absent from the snapshot = drift."""
         policy = _consistent_policy()
         policy["rules"][1]["skills"].append("smuggled-global")
         results = validate_global_skill_contract(policy)
@@ -122,7 +158,7 @@ class GlobalContractLintTests(unittest.TestCase):
         self.assertIn("only-in-rule", results[0].details["in_rules_only"])
         # Failure message points at the file and states the fix.
         self.assertIn("/fake/skill-scope.yaml", results[0].message)
-        self.assertIn("together", results[0].message)
+        self.assertIn("This list is derived; edit rules instead", results[0].message)
 
     def test_empty_policy_is_pass(self) -> None:
         results = validate_global_skill_contract({"rules": []})
