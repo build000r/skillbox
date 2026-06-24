@@ -1363,6 +1363,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help_text="Installed scope to prune when --prune is set.",
     )
 
+    skill_lint_parser = skill_subparsers.add_parser(
+        "lint",
+        help="Lint the repo-local .skillbox/skill-overrides.yaml file.",
+    )
+    skill_lint_parser.add_argument("--format", choices=("text", "json"), default="text")
+    _add_profile_arg(skill_lint_parser)
+    _add_client_arg(skill_lint_parser)
+    _add_cwd_arg(skill_lint_parser)
+
     overlay_parser = subparsers.add_parser(
         "overlay",
         help="List, enable, disable, toggle, or activate skill scope overlays (e.g. marketing).",
@@ -4175,8 +4184,47 @@ def _handle_parity_report(args: argparse.Namespace, root_dir: Path, model: dict[
     return emit_dev_prod_parity_report(payload, fmt=args.format)
 
 
+def _print_skill_override_lint_text(payload: dict[str, Any]) -> None:
+    print("skill override lint")
+    print(f"path: {payload.get('policy_path')}")
+    if not payload.get("exists"):
+        print("findings: none (no override file)")
+        return
+    findings = payload.get("findings") or []
+    if not findings:
+        print("findings: none")
+        return
+    print("findings:")
+    for finding in findings:
+        severity = str(finding.get("severity") or "warn").upper()
+        rule = finding.get("rule")
+        skill = finding.get("skill") or "(file)"
+        location = ""
+        if finding.get("line") is not None:
+            location = f":{finding.get('line')}"
+        elif finding.get("lines"):
+            rendered = ", ".join(
+                f"{key}:{value}" for key, value in (finding.get("lines") or {}).items()
+            )
+            location = f" ({rendered})"
+        print(f"  - {severity} {rule} {skill}{location}")
+        print(f"    {finding.get('explanation')}")
+        print(f"    fix: {finding.get('suggested_fix')}")
+
+
 def _handle_skill(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
     skill_action = str(args.skill_action)
+    if skill_action == "lint":
+        payload = repo_skill_override_lint_payload(model, cwd=args.cwd)
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            _print_skill_override_lint_text(payload)
+        return EXIT_ERROR if any(
+            item.get("severity") == "error"
+            for item in payload.get("findings") or []
+        ) else EXIT_OK
+
     dry_run = bool(args.dry_run or skill_action == "plan")
     if (
         not dry_run

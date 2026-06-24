@@ -1550,6 +1550,94 @@ def validate_global_skill_contract_file(
     return validate_global_skill_contract(policy, policy_path=str(resolved))
 
 
+REPO_SKILL_OVERRIDE_LINT_CODE = "repo-skill-override-lint"
+
+
+def _known_skill_names_for_override_lint(model: dict[str, Any]) -> list[str]:
+    """Declared/discoverable skill names used to detect stale override entries."""
+    names: set[str] = set()
+    try:
+        from .skill_visibility import (  # noqa: PLC0415
+            _declared_skill_occurrences,
+            _skill_source_roots,
+            _skill_source_candidates,
+        )
+
+        declared_occurrences, _ = _declared_skill_occurrences(model)
+        names.update(
+            str(item.get("name") or "").strip()
+            for item in declared_occurrences
+            if str(item.get("name") or "").strip()
+        )
+        for root in _skill_source_roots(model, declared_occurrences):
+            for candidate in _skill_source_candidates(root):
+                name = str(candidate.get("name") or "").strip()
+                if name:
+                    names.add(name)
+    except Exception:
+        return sorted(names)
+    return sorted(names)
+
+
+def repo_skill_override_lint_payload(
+    model: dict[str, Any],
+    *,
+    cwd: str | os.PathLike[str] | Path | None = None,
+) -> dict[str, Any]:
+    """Machine payload for `sbp skill lint`."""
+    from .skill_visibility import lint_repo_override_policy  # noqa: PLC0415
+
+    lint_cwd = Path(cwd or os.environ.get("PWD") or os.getcwd())
+    return lint_repo_override_policy(
+        lint_cwd,
+        known_skill_names=_known_skill_names_for_override_lint(model),
+    )
+
+
+def validate_repo_skill_override_policy(
+    model: dict[str, Any],
+    *,
+    cwd: str | os.PathLike[str] | Path | None = None,
+) -> list[CheckResult]:
+    """Fold repo-local skill override lint into doctor-style CheckResults."""
+    payload = repo_skill_override_lint_payload(model, cwd=cwd)
+    findings = list(payload.get("findings") or [])
+    errors = [item for item in findings if item.get("severity") == "error"]
+    warnings = [item for item in findings if item.get("severity") == "warn"]
+    details = {
+        "policy_path": payload.get("policy_path"),
+        "repo_root": payload.get("repo_root"),
+        "exists": payload.get("exists"),
+        "findings": findings,
+    }
+    if errors:
+        return [
+            CheckResult(
+                status="fail",
+                code=REPO_SKILL_OVERRIDE_LINT_CODE,
+                message=f"{len(errors)} repo skill override error(s)",
+                details=details,
+            )
+        ]
+    if warnings:
+        return [
+            CheckResult(
+                status="warn",
+                code=REPO_SKILL_OVERRIDE_LINT_CODE,
+                message=f"{len(warnings)} repo skill override warning(s)",
+                details=details,
+            )
+        ]
+    return [
+        CheckResult(
+            status="pass",
+            code=REPO_SKILL_OVERRIDE_LINT_CODE,
+            message="repo skill override policy is clean",
+            details=details,
+        )
+    ]
+
+
 OVERLAY_DECLARATION_CODE = "overlay-declaration"
 
 
