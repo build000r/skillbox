@@ -204,6 +204,7 @@ Examples:
   __WRAPPER__ recalibrate --fleet --limit 20
   __WRAPPER__ skill plan mcp-server-design
   __WRAPPER__ skill add ui --to category --category frontend
+  __WRAPPER__ skill lint             Lint .skillbox/skill-overrides.yaml
   __WRAPPER__ mmdx review
   __WRAPPER__ mmdx skill review --no-open
   __WRAPPER__ launch ../api ../web --request 'Audit auth drift' --dry-run --json
@@ -924,6 +925,9 @@ PY
       echo
       echo "policy issues for this repo:"
       python3 .env-manager/manage.py skills "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --issues-only --no-global "${recalibrate_args[@]}" || true
+      echo
+      echo "repo skill override lint:"
+      python3 .env-manager/manage.py skill lint "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" || true
       echo
       echo "add missing repo-local skills:"
       python3 .env-manager/manage.py skill sync "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --dry-run || true

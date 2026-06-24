@@ -52,6 +52,7 @@ from .validation import (
     validate_global_skill_contract_file,
     validate_overlay_declarations_file,
     validate_registry_path_duplication_file,
+    validate_repo_skill_override_policy,
     validate_skill_locks_and_state,
     validate_skill_repo_sets,
 )
@@ -263,6 +264,13 @@ def _run_global_overlay_precedence(ctx: DoctorContext) -> tuple[str, str]:
     return status, detail
 
 
+def _run_repo_skill_override_lint(ctx: DoctorContext) -> tuple[str, str]:
+    """Repo-local .skillbox/skill-overrides.yaml lint for the current cwd."""
+    results = validate_repo_skill_override_policy(ctx.model, cwd=ctx.cwd)
+    status, detail, _ = _checkresults_status(results)
+    return status, detail
+
+
 def _run_registry_path_duplication(ctx: DoctorContext) -> tuple[str, str]:
     """The registry-path-duplication lint (validation.validate_registry_path_duplication).
 
@@ -425,6 +433,16 @@ def _gate_specs() -> tuple[_GateSpec, ...]:
                 "everywhere; an overlay cannot gate it — global wins)"
             ),
             runner=_run_global_overlay_precedence,
+        ),
+        _GateSpec(
+            name="repo_skill_override_lint",
+            kind=KIND_STRUCTURE,
+            cap_s=CAP_FAST_LINT,
+            fix_command=(
+                "sbp skill lint --cwd <repo>  # remove contradictory, floor, "
+                "or dangling .skillbox/skill-overrides.yaml entries"
+            ),
+            runner=_run_repo_skill_override_lint,
         ),
         _GateSpec(
             name="registry_path_duplication",

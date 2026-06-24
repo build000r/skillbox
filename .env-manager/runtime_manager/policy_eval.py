@@ -73,6 +73,7 @@ __all__ = [
     '_load_scope_policy',
     '_operator_scope_policies',
     '_repo_override_policy',
+    'lint_repo_override_policy',
     'update_repo_override_policy',
     'OVERRIDE_WRITE_LOCK_TIMEOUT_SECONDS',
     'OverrideWriteLockTimeout',
@@ -139,6 +140,8 @@ OVERRIDE_ALLOWED_KEYS = {
     "defaults",
     "reason",
 }
+OVERRIDE_LINT_SEVERITY_ERROR = "error"
+OVERRIDE_LINT_SEVERITY_WARN = "warn"
 
 
 class OverrideWriteLockTimeout(RuntimeError):
@@ -718,6 +721,12 @@ def _repo_override_policy(cwd: str | os.PathLike[str] | Path) -> dict[str, Any]:
             policy_path,
             errors=[_override_error(policy_path, str(exc))],
         )
+    if not isinstance(raw, dict):
+        return _empty_repo_override_policy(
+            repo_root,
+            policy_path,
+            errors=[_override_error(policy_path, "skill override policy must be a mapping")],
+        )
 
     errors: list[dict[str, Any]] = []
     unknown_keys = sorted(str(key) for key in set(raw) - OVERRIDE_ALLOWED_KEYS)
@@ -763,6 +772,232 @@ def _repo_override_policy(cwd: str | os.PathLike[str] | Path) -> dict[str, Any]:
     }
     policy["reason"] = str(raw.get("reason") or "").strip()
     return policy
+
+
+def _override_entry_locations(policy_path: Path) -> dict[str, dict[str, list[int]]]:
+    """Best-effort map of override list entries to 1-based YAML line numbers."""
+    locations: dict[str, dict[str, list[int]]] = {}
+    if yaml is None or not policy_path.is_file():
+        return locations
+    try:
+        document = yaml.compose(policy_path.read_text(encoding="utf-8"))
+    except Exception:
+        return locations
+    if document is None:
+        return locations
+
+    def _line(node: Any) -> int:
+        mark = getattr(node, "start_mark", None)
+        return int(getattr(mark, "line", 0)) + 1
+
+    def _record(section: str, raw_name: Any, line: int) -> None:
+        name = str(raw_name).strip()
+        if not name:
+            return
+        locations.setdefault(section, {}).setdefault(name, []).append(line)
+
+    def _scalar_entries(value_node: Any) -> list[tuple[str, int]]:
+        node_id = str(getattr(value_node, "id", ""))
+        if node_id == "scalar":
+            return [(str(getattr(value_node, "value", "")).strip(), _line(value_node))]
+        if node_id != "sequence":
+            return []
+        entries: list[tuple[str, int]] = []
+        for item_node in getattr(value_node, "value", []) or []:
+            if str(getattr(item_node, "id", "")) != "scalar":
+                continue
+            entries.append((str(getattr(item_node, "value", "")).strip(), _line(item_node)))
+        return entries
+
+    if str(getattr(document, "id", "")) != "mapping":
+        return locations
+
+    for key_node, value_node in getattr(document, "value", []) or []:
+        key = str(getattr(key_node, "value", "")).strip()
+        if key in OVERRIDE_LIST_KEYS:
+            for name, line in _scalar_entries(value_node):
+                _record(key, name, line)
+        elif key == "overlays" and str(getattr(value_node, "id", "")) == "mapping":
+            for overlay_key_node, overlay_value_node in getattr(value_node, "value", []) or []:
+                overlay_key = str(getattr(overlay_key_node, "value", "")).strip()
+                if overlay_key not in OVERRIDE_OVERLAY_KEYS:
+                    continue
+                section = f"overlays.{overlay_key}"
+                for name, line in _scalar_entries(overlay_value_node):
+                    _record(section, name, line)
+    return locations
+
+
+def _first_location(
+    locations: dict[str, dict[str, list[int]]],
+    section: str,
+    name: str,
+) -> int | None:
+    lines = locations.get(section, {}).get(name) or []
+    return lines[0] if lines else None
+
+
+def _override_lint_finding(
+    *,
+    rule: str,
+    severity: str,
+    skill: str | None,
+    explanation: str,
+    suggested_fix: str,
+    policy_path: str,
+    line: int | None = None,
+    lines: dict[str, int | None] | None = None,
+    code: str | None = None,
+    did_you_mean: str | None = None,
+) -> dict[str, Any]:
+    finding: dict[str, Any] = {
+        "rule": rule,
+        "severity": severity,
+        "explanation": explanation,
+        "suggested_fix": suggested_fix,
+        "policy_path": policy_path,
+    }
+    if code:
+        finding["code"] = code
+    if skill:
+        finding["skill"] = skill
+    if line is not None:
+        finding["line"] = line
+    if lines:
+        finding["lines"] = lines
+    if did_you_mean:
+        finding["did_you_mean"] = did_you_mean
+    return finding
+
+
+def _override_parse_findings(policy: dict[str, Any]) -> list[dict[str, Any]]:
+    policy_path = str(policy.get("_policy_path") or "")
+    findings: list[dict[str, Any]] = []
+    for error in policy.get("errors") or []:
+        message = str(error.get("message") or "could not parse skill override policy")
+        findings.append(
+            _override_lint_finding(
+                rule="parse_error",
+                severity=OVERRIDE_LINT_SEVERITY_ERROR,
+                skill=None,
+                explanation=message,
+                suggested_fix="Fix the override YAML/schema issue, then rerun `sbp skill lint`.",
+                policy_path=policy_path,
+                code=str(error.get("code") or "OVERRIDE_PARSE_ERROR"),
+            )
+        )
+    return findings
+
+
+def lint_repo_override_policy(
+    cwd: str | os.PathLike[str] | Path,
+    *,
+    known_skill_names: list[str] | set[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Static lint for ``.skillbox/skill-overrides.yaml``.
+
+    The reader already fails safe on malformed files. This layer converts those
+    non-fatal reader errors plus semantic contradictions into structured
+    findings so doctor/recalibrate can report every issue they can still see.
+    """
+    policy = _repo_override_policy(cwd)
+    policy_path = str(policy.get("_policy_path") or "")
+    locations = _override_entry_locations(Path(policy_path))
+    findings = _override_parse_findings(policy)
+    known = {
+        str(name).strip()
+        for name in (known_skill_names or [])
+        if str(name).strip()
+    }
+
+    if policy.get("ok"):
+        for skill_name in sorted(set(policy.get("pin_on") or []) & set(policy.get("pin_off") or [])):
+            pin_on_line = _first_location(locations, "pin_on", skill_name)
+            pin_off_line = _first_location(locations, "pin_off", skill_name)
+            findings.append(
+                _override_lint_finding(
+                    rule="contradiction",
+                    severity=OVERRIDE_LINT_SEVERITY_ERROR,
+                    skill=skill_name,
+                    explanation=(
+                        f"{skill_name!r} appears in both pin_on and pin_off, "
+                        "so the override asks for mutually exclusive outcomes."
+                    ),
+                    suggested_fix=(
+                        "Keep exactly one of `pin_on` or `pin_off` for this skill, "
+                        "or remove both entries."
+                    ),
+                    policy_path=policy_path,
+                    lines={"pin_on": pin_on_line, "pin_off": pin_off_line},
+                )
+            )
+
+        for skill_name in sorted(set(policy.get("opt_out_global") or []) & set(DISPATCHER_CORE)):
+            findings.append(
+                _override_lint_finding(
+                    rule="floor_opt_out",
+                    severity=OVERRIDE_LINT_SEVERITY_ERROR,
+                    skill=skill_name,
+                    explanation=(
+                        f"{skill_name!r} is dispatcher-core floor policy and cannot "
+                        "be opted out by repo-local overrides."
+                    ),
+                    suggested_fix=(
+                        f"Remove {skill_name!r} from `opt_out_global`; dispatcher "
+                        "floor skills must remain available."
+                    ),
+                    policy_path=policy_path,
+                    line=_first_location(locations, "opt_out_global", skill_name),
+                    code="OVERRIDE_REFUSED_FLOOR",
+                )
+            )
+
+        if known:
+            referenced_sections = ("pin_on", "pin_off", "opt_out_global", "defaults")
+            for section in referenced_sections:
+                for skill_name in sorted(set(policy.get(section) or [])):
+                    if skill_name in known:
+                        continue
+                    suggestion = _did_you_mean(skill_name, sorted(known))
+                    suggested_fix = "Remove the stale override entry or restore the skill source."
+                    if suggestion:
+                        suggested_fix = f"Did you mean {suggestion!r}? Otherwise {suggested_fix[0].lower()}{suggested_fix[1:]}"
+                    findings.append(
+                        _override_lint_finding(
+                            rule="dangling",
+                            severity=OVERRIDE_LINT_SEVERITY_ERROR,
+                            skill=skill_name,
+                            explanation=(
+                                f"{section} references {skill_name!r}, but no declared "
+                                "or discoverable skill source by that name was found."
+                            ),
+                            suggested_fix=suggested_fix,
+                            policy_path=policy_path,
+                            line=_first_location(locations, section, skill_name),
+                            did_you_mean=suggestion,
+                        )
+                    )
+
+    errors = [
+        finding for finding in findings
+        if finding.get("severity") == OVERRIDE_LINT_SEVERITY_ERROR
+    ]
+    warnings = [
+        finding for finding in findings
+        if finding.get("severity") == OVERRIDE_LINT_SEVERITY_WARN
+    ]
+    return {
+        "ok": not errors,
+        "policy_path": policy_path,
+        "repo_root": str(policy.get("_repo_root") or ""),
+        "exists": Path(policy_path).is_file() if policy_path else False,
+        "findings": findings,
+        "summary": {
+            "total": len(findings),
+            "error": len(errors),
+            "warn": len(warnings),
+        },
+    }
 
 
 def _repo_override_paths(cwd: str | os.PathLike[str] | Path) -> tuple[Path, Path]:
