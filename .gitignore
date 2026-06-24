@@ -25,6 +25,7 @@ home/.codex/skills/
 home/.codex/AGENTS.md
 home/.local/
 workspace/skill-repos.lock.json
+workspace/skill-repos-memory.lock.json
 workspace/skill-repos/
 workspace/clients/
 workspace/secrets/
@@ -36,6 +37,7 @@ data/
 .env.box
 .dcg.toml
 sand/
+# Keep only runtime state ignored; .skillbox/ contains committed repo policy.
 .skillbox-state/
 /.codex/
 /.ntm/
