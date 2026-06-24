@@ -20,7 +20,7 @@ Design guarantees (mirroring the audit's stance):
     ``{name: body}`` map, so they can never disagree after a sync.
   * **Machine-profile path resolution.** The Codex ``cwd`` (and any
     machine-rooted path) resolves through :mod:`runtime_manager.machines` so a
-    devbox TOML never contains a foreign ``/Users/b`` path: a target root that
+    devbox TOML never contains a foreign ``/Users/operator`` path: a target root that
     belongs to *another* machine's declared roots is translated onto the current
     machine's canonical root before it is written.
   * **Operator-managed entries are preserved.** Entries already present in a
@@ -167,7 +167,7 @@ def resolve_codex_cwd(
 
     The Codex ``cwd`` must be a path that exists on the box that will run Codex.
     If ``target_root`` is rooted under some *other* machine's declared roots
-    (e.g. a Mac ``/Users/b/...`` path handed to a devbox), translate it onto the
+    (e.g. a Mac ``/Users/operator/...`` path handed to a devbox), translate it onto the
     current machine's canonical root via :mod:`runtime_manager.machines`. When no
     machines.yaml is available, or the path is already local, the resolved
     absolute path is returned unchanged.

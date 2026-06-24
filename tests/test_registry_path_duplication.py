@@ -9,8 +9,8 @@ WARNS (never FAILS) on such a path so the duplication is visibly discouraged.
 Crucially the warn is gated on EQUALITY, not membership (the y8w fix): a registry
 id resolves to a SET of spellings on the current machine (its home form PLUS every
 re-rooting under the machine's repo roots), so a single home-form literal like
-``~/repos/buildooor`` is a strict SUBSET of the id's resolved set. Swapping that
-one literal for ``repos: [buildooor]`` would WIDEN the rule's match set to the
+``~/repos/example-app`` is a strict SUBSET of the id's resolved set. Swapping that
+one literal for ``repos: [example-app]`` would WIDEN the rule's match set to the
 whole superset — a real behavior change — so the lint must NOT recommend it. It
 only warns when the rule's literals enumerate the id's FULL resolved set, making
 the swap a no-op on every machine.
@@ -40,8 +40,8 @@ from runtime_manager.validation import (  # noqa: E402
 
 
 FAKE_REGISTRY_REPOS = [
-    {"id": "htma", "path": "~/repos/htma", "bucket": "app"},
-    {"id": "htma-server", "path": "~/repos/htma_server", "bucket": "backend"},
+    {"id": "app_core", "path": "~/repos/app_core", "bucket": "app"},
+    {"id": "app_core-server", "path": "~/repos/api_server", "bucket": "backend"},
 ]
 
 
@@ -79,15 +79,15 @@ class _Harness:
 
 class RegistryPathDuplicationTests(unittest.TestCase):
     def test_warns_when_literals_enumerate_the_full_resolved_set(self) -> None:
-        # On a `~/repos`-rooted box, the `htma` id resolves to BOTH the home form
+        # On a `~/repos`-rooted box, the `app_core` id resolves to BOTH the home form
         # and the /srv re-rooting. A rule whose literal paths enumerate that FULL
         # set is a true no-op-replaceable duplicate, so the lint WARNS.
         policy = {
             "rules": [
                 {
-                    "id": "htma-old",
+                    "id": "app_core-old",
                     "skills": ["x"],
-                    "paths": ["~/repos/htma", "/srv/skillbox/repos/htma"],
+                    "paths": ["~/repos/app_core", "/srv/skillbox/repos/app_core"],
                 },
             ]
         }
@@ -97,32 +97,32 @@ class RegistryPathDuplicationTests(unittest.TestCase):
         result = results[0]
         self.assertEqual(result.status, "warn")
         self.assertEqual(result.code, REGISTRY_PATH_DUPLICATION_CODE)
-        self.assertIn("htma-old", result.message)
-        self.assertIn("'htma'", result.message)
+        self.assertIn("app_core-old", result.message)
+        self.assertIn("'app_core'", result.message)
         self.assertIn("repos: [<id>]", result.message)
         redundant = result.details["redundant"]
-        self.assertEqual(redundant[0]["rule"], "htma-old")
-        self.assertEqual(redundant[0]["registry_id"], "htma")
+        self.assertEqual(redundant[0]["rule"], "app_core-old")
+        self.assertEqual(redundant[0]["registry_id"], "app_core")
 
     def test_warns_on_single_spelling_id_with_no_repo_root_rerooting(self) -> None:
-        # With NO machine repo roots, `htma` resolves to exactly its home form, so
-        # a lone `~/repos/htma` literal already equals the FULL set -> WARN. This is
+        # With NO machine repo roots, `app_core` resolves to exactly its home form, so
+        # a lone `~/repos/app_core` literal already equals the FULL set -> WARN. This is
         # the genuine no-op case the lint is meant to discourage.
         policy = {
-            "rules": [{"id": "htma-old", "skills": ["x"], "paths": ["~/repos/htma"]}]
+            "rules": [{"id": "app_core-old", "skills": ["x"], "paths": ["~/repos/app_core"]}]
         }
         with _Harness(repo_roots=()):
             results = validate_registry_path_duplication(policy, policy_path="/p.yaml")
         self.assertEqual(results[0].status, "warn")
-        self.assertEqual(results[0].details["redundant"][0]["registry_id"], "htma")
+        self.assertEqual(results[0].details["redundant"][0]["registry_id"], "app_core")
 
     def test_does_not_warn_when_literal_is_a_strict_subset_of_resolved_set(self) -> None:
         # BUG 1 regression: a single home-form literal on a `~/repos`-rooted box is a
         # strict SUBSET of the id's resolved set (which also includes the /srv
-        # re-rooting). Swapping it for `repos: [htma]` would WIDEN the match set, so
+        # re-rooting). Swapping it for `repos: [app_core]` would WIDEN the match set, so
         # the lint must STAY SILENT — keeping the literal is intentional.
         policy = {
-            "rules": [{"id": "htma-narrow", "skills": ["x"], "paths": ["~/repos/htma"]}]
+            "rules": [{"id": "app_core-narrow", "skills": ["x"], "paths": ["~/repos/app_core"]}]
         }
         with _Harness(repo_roots=("/srv/skillbox/repos",)):
             results = validate_registry_path_duplication(policy, policy_path="/p.yaml")
@@ -138,7 +138,7 @@ class RegistryPathDuplicationTests(unittest.TestCase):
         # two-spelling resolved set, so it is a subset -> no warn.
         policy = {
             "rules": [
-                {"id": "srv-only", "skills": ["x"], "paths": ["/srv/skillbox/repos/htma"]}
+                {"id": "srv-only", "skills": ["x"], "paths": ["/srv/skillbox/repos/app_core"]}
             ]
         }
         with _Harness(repo_roots=("/srv/skillbox/repos",)):
@@ -149,7 +149,7 @@ class RegistryPathDuplicationTests(unittest.TestCase):
         # The migrated form: no literal paths -> nothing to flag.
         policy = {
             "rules": [
-                {"id": "htma-local", "skills": ["x"], "repos": ["htma", "htma-server"]},
+                {"id": "app_core-local", "skills": ["x"], "repos": ["app_core", "app_core-server"]},
             ]
         }
         with _Harness(repo_roots=("/srv/skillbox/repos",)):
@@ -169,7 +169,7 @@ class RegistryPathDuplicationTests(unittest.TestCase):
     def test_warn_is_advisory_not_a_failure(self) -> None:
         # A WARN must never be a FAIL: raw paths stay supported. Use a genuine
         # full-enumeration warn case (the no-repo-root single-spelling id).
-        policy = {"rules": [{"id": "r", "skills": ["x"], "paths": ["~/repos/htma"]}]}
+        policy = {"rules": [{"id": "r", "skills": ["x"], "paths": ["~/repos/app_core"]}]}
         with _Harness(repo_roots=()):
             results = validate_registry_path_duplication(policy, policy_path="/p.yaml")
         self.assertEqual(results[0].status, "warn")
@@ -179,7 +179,7 @@ class RegistryPathDuplicationTests(unittest.TestCase):
         # No override installed + an env file that yields no entries -> pass.
         sv._registry_doctor_module_override = lambda: None  # type: ignore[attr-defined]
         try:
-            policy = {"rules": [{"id": "r", "skills": ["x"], "paths": ["/srv/skillbox/repos/htma"]}]}
+            policy = {"rules": [{"id": "r", "skills": ["x"], "paths": ["/srv/skillbox/repos/app_core"]}]}
             results = validate_registry_path_duplication(policy, policy_path="/p.yaml")
         finally:
             sv.__dict__.pop("_registry_doctor_module_override", None)

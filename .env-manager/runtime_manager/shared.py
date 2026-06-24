@@ -148,8 +148,8 @@ CLIENT_PLANNING_SKILL_TEMPLATE_REL = Path("workspace") / "client-planning-skills
 CLIENT_SKILL_BUILDER_TEMPLATE_REL = Path("workspace") / "client-skill-builder-skills"
 # Superseded by the canonical RUNTIME_ID_PATTERN (lib.runtime_model) which
 # validate_client_id now uses; kept only so the historic constant resolves.
-# The canonical grammar additionally allows '_' (e.g. the in-tree
-# sweet-potato__nextra_documentation_site client) which this stricter pattern
+# The canonical grammar additionally allows '_' (e.g. a generated docs client
+# id such as example_app__documentation_site) which this stricter pattern
 # rejected. See docs/runtime-id-grammar.md.
 CLIENT_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 BLUEPRINT_VARIABLE_PATTERN = re.compile(r"^[A-Z0-9_]+$")

@@ -668,7 +668,7 @@ connectors-dev:
         - connectors-dev
       source:
         kind: git
-        url: https://github.com/Dicklesworthstone/flywheel_connectors.git
+        url: https://example.com/flywheel-connectors.git
         branch: main
       sync:
         mode: clone-if-missing
@@ -685,7 +685,7 @@ connectors-dev:
         - connectors-dev
       source:
         kind: git
-        url: https://github.com/Dicklesworthstone/destructive_command_guard.git
+        url: https://example.com/destructive-command-guard.git
         branch: main
       sync:
         mode: clone-if-missing

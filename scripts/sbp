@@ -154,7 +154,7 @@ Usage:
                               (INCO/FAIL/PASS); complements `make doctor`.
                               Exits nonzero on FAIL only.
   __WRAPPER__ registry doctor [args...] Check registry/repos.yaml against local Git repos
-  __WRAPPER__ cass status|search|rebuild|doctor  Remote portfolio-devbox Cass front door
+  __WRAPPER__ cass status|search|rebuild|doctor  Remote worker-devbox Cass front door
   __WRAPPER__ evidence [--repo P|--skill N] --format json  Measure skill invocations per
                               repo from Cass (contamination-safe), joined to current policy
   __WRAPPER__ cron [status|apply]     Declared crontab + script links from skillbox-config

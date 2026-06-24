@@ -1,6 +1,6 @@
 """Registry-id / category -> path resolution for skill-scope rules (bead y8w.3).
 
-A scope rule may name its repos by registry id (``repos: [htma, htma-server]``)
+A scope rule may name its repos by registry id (``repos: [app_core, app_core-server]``)
 and/or registry-bucket category (``categories: [backend]``) instead of literal
 ``paths:``. The id->path taxonomy is the canonical operator registry
 (``skillbox-config/registry/repos.yaml`` — the SAME file
@@ -31,9 +31,9 @@ from runtime_manager import machines as machines_mod  # noqa: E402
 # A small fake registry mirroring the real repos.yaml shape (id/path/bucket).
 # Paths are home-relative (~/repos/..., ~/hard/...) exactly like the real file.
 FAKE_REGISTRY_REPOS = [
-    {"id": "htma", "path": "~/repos/htma", "bucket": "app"},
-    {"id": "htma-server", "path": "~/repos/htma_server", "bucket": "backend"},
-    {"id": "ingredient-server", "path": "~/repos/ingredient_server", "bucket": "backend"},
+    {"id": "app_core", "path": "~/repos/app_core", "bucket": "app"},
+    {"id": "app_core-server", "path": "~/repos/api_server", "bucket": "backend"},
+    {"id": "ingredient-server", "path": "~/repos/shared_service", "bucket": "backend"},
     {"id": "design-system-registry", "path": "~/repos/design-system-registry", "bucket": "registry"},
     {"id": "mmd-pcb", "path": "~/hard/mmd-pcb", "bucket": "hardware"},
 ]
@@ -85,35 +85,35 @@ class _ResolverHarness:
 
 class RegistryResolutionTests(unittest.TestCase):
     def test_repo_id_resolves_to_current_machine_path(self) -> None:
-        # Devbox-style roots: the registry's ~/repos/htma re-roots under each.
+        # Devbox-style roots: the registry's ~/repos/app_core re-roots under each.
         with _ResolverHarness(repo_roots=("/srv/skillbox/repos", "/srv/repos")):
             entries = sv._load_registry_entries()
-            paths, cats = sv._resolve_scope_rule_repos(["htma", "htma-server"], [], entries)
+            paths, cats = sv._resolve_scope_rule_repos(["app_core", "app_core-server"], [], entries)
         self.assertEqual(cats, [])
         # Both the /srv/skillbox/repos and /srv/repos roots produce the repo's
         # remainder path; _expand_policy_path's resolve() folds the /srv/repos
         # symlink-alias into /srv/skillbox/repos when that alias is real on the
         # host (as on the devbox), so the canonical spelling is always present.
-        self.assertIn("/srv/skillbox/repos/htma", paths)
-        self.assertIn("/srv/skillbox/repos/htma_server", paths)
+        self.assertIn("/srv/skillbox/repos/app_core", paths)
+        self.assertIn("/srv/skillbox/repos/api_server", paths)
         # The /srv/repos spelling is present either as itself (no symlink) or
         # already collapsed into /srv/skillbox/repos (real symlink): the canonical
         # resolved form must cover it.
-        self.assertIn(sv._expand_policy_path("/srv/repos/htma"), paths)
-        self.assertIn(sv._expand_policy_path("~/repos/htma"), paths)
+        self.assertIn(sv._expand_policy_path("/srv/repos/app_core"), paths)
+        self.assertIn(sv._expand_policy_path("~/repos/app_core"), paths)
 
     def test_same_id_resolves_differently_per_machine(self) -> None:
         with _ResolverHarness(repo_roots=("/srv/skillbox/repos",)):
             entries = sv._load_registry_entries()
-            devbox, _ = sv._resolve_scope_rule_repos(["htma"], [], entries)
-        with _ResolverHarness(repo_roots=("/Users/b/repos",)):
+            devbox, _ = sv._resolve_scope_rule_repos(["app_core"], [], entries)
+        with _ResolverHarness(repo_roots=("/Users/operator/repos",)):
             entries = sv._load_registry_entries()
-            laptop, _ = sv._resolve_scope_rule_repos(["htma"], [], entries)
-        self.assertIn("/srv/skillbox/repos/htma", devbox)
-        self.assertIn("/Users/b/repos/htma", laptop)
+            laptop, _ = sv._resolve_scope_rule_repos(["app_core"], [], entries)
+        self.assertIn("/srv/skillbox/repos/app_core", devbox)
+        self.assertIn("/Users/operator/repos/app_core", laptop)
         # Same registry id, machine-specific resolution.
-        self.assertNotIn("/Users/b/repos/htma", devbox)
-        self.assertNotIn("/srv/skillbox/repos/htma", laptop)
+        self.assertNotIn("/Users/operator/repos/app_core", devbox)
+        self.assertNotIn("/srv/skillbox/repos/app_core", laptop)
 
     def test_non_repos_root_path_is_expanded_home_relative(self) -> None:
         # mmd-pcb lives under ~/hard (NOT a machine repo_root) so it carries no
@@ -127,10 +127,10 @@ class RegistryResolutionTests(unittest.TestCase):
         with _ResolverHarness(repo_roots=("/srv/skillbox/repos",)):
             entries = sv._load_registry_entries()
             with self.assertRaises(sv.RegistryResolutionError) as ctx:
-                sv._resolve_scope_rule_repos(["htmaa"], [], entries)
+                sv._resolve_scope_rule_repos(["app_coree"], [], entries)
         message = str(ctx.exception)
-        self.assertIn("'htmaa' not in registry/repos.yaml", message)
-        self.assertIn("did you mean 'htma'", message)
+        self.assertIn("'app_coree' not in registry/repos.yaml", message)
+        self.assertIn("did you mean 'app_core'", message)
         self.assertIn("declared ids:", message)
         # The full declared id list is part of the hint.
         self.assertIn("design-system-registry", message)
@@ -141,10 +141,10 @@ class RegistryResolutionTests(unittest.TestCase):
             entries = sv._load_registry_entries()
             paths, cats = sv._resolve_scope_rule_repos([], ["backend"], entries)
         self.assertEqual(cats, ["backend"])
-        self.assertIn("/srv/skillbox/repos/htma_server", paths)
-        self.assertIn("/srv/skillbox/repos/ingredient_server", paths)
-        # app-bucket htma is NOT a backend repo.
-        self.assertNotIn("/srv/skillbox/repos/htma", paths)
+        self.assertIn("/srv/skillbox/repos/api_server", paths)
+        self.assertIn("/srv/skillbox/repos/shared_service", paths)
+        # app-bucket app_core is NOT a backend repo.
+        self.assertNotIn("/srv/skillbox/repos/app_core", paths)
 
     def test_unknown_category_is_not_a_registry_match(self) -> None:
         # A category id that matches no registry bucket simply does not expand
@@ -159,14 +159,14 @@ class RegistryResolutionTests(unittest.TestCase):
         # No registry entries + an explicit repos: id -> a clear resolution error,
         # not a silent drop (categories degrade quietly to policy resolution).
         with self.assertRaises(sv.RegistryResolutionError):
-            sv._resolve_scope_rule_repos(["htma"], [], [])
+            sv._resolve_scope_rule_repos(["app_core"], [], [])
         self.assertEqual(sv._resolve_scope_rule_repos([], ["frontend"], []), ([], []))
 
     def test_scope_rule_from_raw_threads_repos_into_paths(self) -> None:
         raw_rule = {
-            "id": "htma-local",
-            "skills": ["htma-*"],
-            "repos": ["htma", "htma-server"],
+            "id": "app_core-local",
+            "skills": ["app_core-*"],
+            "repos": ["app_core", "app_core-server"],
         }
         with _ResolverHarness(repo_roots=("/srv/skillbox/repos",)):
             entries = sv._load_registry_entries()
@@ -179,9 +179,9 @@ class RegistryResolutionTests(unittest.TestCase):
                 registry_entries=entries,
             )
         assert rule is not None
-        self.assertEqual(rule["repos"], ["htma", "htma-server"])
-        self.assertIn("/srv/skillbox/repos/htma", rule["paths"])
-        self.assertIn("/srv/skillbox/repos/htma_server", rule["paths"])
+        self.assertEqual(rule["repos"], ["app_core", "app_core-server"])
+        self.assertIn("/srv/skillbox/repos/app_core", rule["paths"])
+        self.assertIn("/srv/skillbox/repos/api_server", rule["paths"])
         self.assertEqual(rule["unknown_categories"], [])
 
     def test_literal_paths_still_resolve_unchanged_alongside_repos(self) -> None:
@@ -189,7 +189,7 @@ class RegistryResolutionTests(unittest.TestCase):
         raw_rule = {
             "id": "mixed",
             "skills": ["x"],
-            "repos": ["htma"],
+            "repos": ["app_core"],
             "paths": ["~/repos/some-unregistered-repo"],
         }
         with _ResolverHarness(repo_roots=("/srv/skillbox/repos",)):
@@ -203,19 +203,19 @@ class RegistryResolutionTests(unittest.TestCase):
                 registry_entries=entries,
             )
         assert rule is not None
-        self.assertIn("/srv/skillbox/repos/htma", rule["paths"])
+        self.assertIn("/srv/skillbox/repos/app_core", rule["paths"])
         self.assertIn(sv._expand_policy_path("~/repos/some-unregistered-repo"), rule["paths"])
 
 
 class MigratedRuleEquivalenceTests(unittest.TestCase):
-    """Prove the migrated htma-local/ui-local rules resolve to the SAME effective
+    """Prove the migrated app_core-local/ui-local rules resolve to the SAME effective
     paths as their prior literal lists, on this machine, with no behavior change.
     """
 
     # Prior literal path lists, verbatim from skill-scope.yaml before migration.
-    HTMA_LOCAL_BEFORE = [
-        "~/repos/htma", "/srv/repos/htma", "/srv/skillbox/repos/htma",
-        "~/repos/htma_server", "/srv/repos/htma_server", "/srv/skillbox/repos/htma_server",
+    APP_CORE_LOCAL_BEFORE = [
+        "~/repos/app_core", "/srv/repos/app_core", "/srv/skillbox/repos/app_core",
+        "~/repos/api_server", "/srv/repos/api_server", "/srv/skillbox/repos/api_server",
     ]
     UI_LOCAL_REGISTRY_BEFORE = [
         "~/repos/design-system-registry",
@@ -227,10 +227,10 @@ class MigratedRuleEquivalenceTests(unittest.TestCase):
         return {sv._expand_policy_path(p) for p in paths}
 
     def test_htma_local_after_equals_before_on_devbox_roots(self) -> None:
-        before = self._literal_effective_set(self.HTMA_LOCAL_BEFORE)
+        before = self._literal_effective_set(self.APP_CORE_LOCAL_BEFORE)
         with _ResolverHarness(repo_roots=("/srv/skillbox/repos", "/srv/repos")):
             entries = sv._load_registry_entries()
-            after, _ = sv._resolve_scope_rule_repos(["htma", "htma-server"], [], entries)
+            after, _ = sv._resolve_scope_rule_repos(["app_core", "app_core-server"], [], entries)
         # The /srv/repos symlink-alias collapses into /srv/skillbox/repos under
         # _expand_policy_path's resolve() on the real devbox; in this hermetic
         # test the roots are not real symlinks, so assert BEFORE is a subset of
@@ -279,7 +279,7 @@ class UndetectedMachineFailLoudTests(unittest.TestCase):
         with _UndetectedMachineHarness():
             entries = sv._load_registry_entries()
             with self.assertRaises(sv.RegistryResolutionError) as ctx:
-                sv._resolve_scope_rule_repos(["htma"], [], entries)
+                sv._resolve_scope_rule_repos(["app_core"], [], entries)
         message = str(ctx.exception)
         self.assertIn("current machine undetected", message)
         self.assertIn("machines.yaml", message)
@@ -306,8 +306,8 @@ class UndetectedMachineFailLoudTests(unittest.TestCase):
         # The healthy path is unaffected: a detected machine re-roots normally.
         with _ResolverHarness(repo_roots=("/srv/skillbox/repos",)):
             entries = sv._load_registry_entries()
-            paths, _ = sv._resolve_scope_rule_repos(["htma"], [], entries)
-        self.assertIn("/srv/skillbox/repos/htma", paths)
+            paths, _ = sv._resolve_scope_rule_repos(["app_core"], [], entries)
+        self.assertIn("/srv/skillbox/repos/app_core", paths)
 
 
 class MalformedRegistryEntryTests(unittest.TestCase):
@@ -390,7 +390,7 @@ class ScalarSkillsPatternTests(unittest.TestCase):
     def test_scalar_skills_threads_through_scope_rule_from_raw(self) -> None:
         # End-to-end: a rule authored with a scalar skills string yields ONE
         # pattern (so the rule survives instead of becoming char-fragment patterns).
-        raw_rule = {"id": "scalar", "skills": "htma-deploy", "paths": ["~/repos/x"]}
+        raw_rule = {"id": "scalar", "skills": "app_core-deploy", "paths": ["~/repos/x"]}
         rule = sv._scope_rule_from_raw(
             raw_rule,
             index=0,
@@ -400,7 +400,7 @@ class ScalarSkillsPatternTests(unittest.TestCase):
             registry_entries=[],
         )
         assert rule is not None
-        self.assertEqual(rule["patterns"], ["htma-deploy"])
+        self.assertEqual(rule["patterns"], ["app_core-deploy"])
 
 
 class ResilientScopeRulesTests(unittest.TestCase):
@@ -426,8 +426,8 @@ class ResilientScopeRulesTests(unittest.TestCase):
         }
 
     def test_one_typo_does_not_drop_the_other_rules(self) -> None:
-        good = {"id": "good", "skills": ["g-*"], "repos": ["htma"]}
-        typo = {"id": "typo", "skills": ["t-*"], "repos": ["htmaa"]}  # near htma
+        good = {"id": "good", "skills": ["g-*"], "repos": ["app_core"]}
+        typo = {"id": "typo", "skills": ["t-*"], "repos": ["app_coree"]}  # near app_core
         with _ResolverHarness(repo_roots=("/srv/skillbox/repos",)):
             rules = sv._scope_rules(self._model([typo, good]))
             errors = sv.last_scope_rule_errors()
@@ -438,11 +438,11 @@ class ResilientScopeRulesTests(unittest.TestCase):
         # The typo is surfaced with the self-healing hint.
         self.assertEqual([e["rule_id"] for e in errors], ["typo"])
         self.assertEqual(errors[0]["type"], "RegistryResolutionError")
-        self.assertIn("'htmaa' not in registry/repos.yaml", errors[0]["error"])
-        self.assertIn("did you mean 'htma'", errors[0]["error"])
+        self.assertIn("'app_coree' not in registry/repos.yaml", errors[0]["error"])
+        self.assertIn("did you mean 'app_core'", errors[0]["error"])
 
     def test_clean_pass_records_no_errors(self) -> None:
-        good = {"id": "good", "skills": ["g-*"], "repos": ["htma"]}
+        good = {"id": "good", "skills": ["g-*"], "repos": ["app_core"]}
         with _ResolverHarness(repo_roots=("/srv/skillbox/repos",)):
             rules = sv._scope_rules(self._model([good]))
             errors = sv.last_scope_rule_errors()
@@ -451,7 +451,7 @@ class ResilientScopeRulesTests(unittest.TestCase):
 
     def test_errors_are_reset_each_pass(self) -> None:
         typo = {"id": "typo", "skills": ["t-*"], "repos": ["htmaa"]}
-        good = {"id": "good", "skills": ["g-*"], "repos": ["htma"]}
+        good = {"id": "good", "skills": ["g-*"], "repos": ["app_core"]}
         with _ResolverHarness(repo_roots=("/srv/skillbox/repos",)):
             sv._scope_rules(self._model([typo]))
             self.assertEqual(len(sv.last_scope_rule_errors()), 1)

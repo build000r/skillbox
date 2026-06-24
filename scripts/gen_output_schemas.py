@@ -45,6 +45,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 from unittest import mock
 
@@ -57,6 +58,7 @@ for _path in (ENV_MANAGER_DIR, TESTS_DIR):
 
 from fixture_fleet import build_fixture_fleet  # noqa: E402
 from runtime_manager import fleet_converge as fc  # noqa: E402
+from runtime_manager.machines import MachineProfile, MachinesConfig  # noqa: E402
 from runtime_manager import mcp_visibility as mv  # noqa: E402
 from runtime_manager import skill_visibility as sv  # noqa: E402
 from runtime_manager import structure_doctor as sd  # noqa: E402
@@ -265,7 +267,47 @@ def _fleet_example(fn: Callable[["FixtureFleetT", str], dict[str, Any]]) -> dict
     tmp = tempfile.mkdtemp()
     try:
         fleet = build_fixture_fleet(tmp)
-        with fleet._home_patched():
+        source_roots = (str(fleet.skills_root), str(fleet.skills_private_root))
+        machines_config = MachinesConfig(
+            machines={
+                "devbox-like": MachineProfile(
+                    machine_id="devbox-like",
+                    repo_roots=(str(fleet.aliased_root),),
+                ),
+                "mac-like": MachineProfile(
+                    machine_id="mac-like",
+                    repo_roots=("/fake-mac-root/repos",),
+                ),
+            },
+            source_path=str(fleet.machines_path),
+        )
+        registry_doctor = SimpleNamespace(
+            DEFAULT_REGISTRY=str(fleet.registry_path),
+            load_registry=lambda _path: {"repos": []},
+        )
+        with fleet._home_patched(), mock.patch.object(
+            sv, "DEFAULT_SKILL_SOURCE_ROOT_PATTERNS", source_roots
+        ), mock.patch.object(
+            sv,
+            "_machines_classifier_override",
+            lambda: (machines_config, "devbox-like"),
+            create=True,
+        ), mock.patch.object(
+            sv,
+            "_registry_doctor_module_override",
+            lambda: registry_doctor,
+            create=True,
+        ), mock.patch.object(
+            sv,
+            "_explain_machine_profile",
+            lambda: {
+                "resolved": True,
+                "machine_id": "devbox-like",
+                "source_path": str(fleet.machines_path),
+                "declared_machines": sorted(machines_config.machines),
+            },
+            create=True,
+        ):
             payload = fn(fleet, tmp)
         return _norm(payload, [(tmp, FLEET_PLACEHOLDER)])
     finally:

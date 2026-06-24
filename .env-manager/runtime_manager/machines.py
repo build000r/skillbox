@@ -2,7 +2,7 @@
 
 Standalone loader for ``skillbox-config/machines.yaml``. It lets policy readers
 stop branching on ``socket.gethostname()`` and stop hard-coding root paths like
-``/srv/skillbox/repos`` vs ``/Users/b/repos`` all over the place.
+``/srv/skillbox/repos`` vs ``/Users/operator/repos`` all over the place.
 
 This module is intentionally **standalone**: it is NOT wired into policy
 evaluation or any existing code path yet. Consumers land in sibling beads.

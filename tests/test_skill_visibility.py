@@ -1520,27 +1520,27 @@ class SkillVisibilityTests(unittest.TestCase):
             self.assertEqual(violations[0]["scope_rule"], "restricted-local")
 
     def test_matched_clients_prefers_repo_specific_overlay_on_equal_prefix(self) -> None:
-        cwd = Path("/tmp/repos/htma_server")
+        cwd = Path("/tmp/repos/api_server")
         model = {
             "clients": [
                 {
                     "id": "cca",
                     "label": "CCA",
-                    "default_cwd": "/tmp/repos/cca-website",
-                    "context": {"cwd_match": ["/tmp/repos/htma_server"]},
+                    "default_cwd": "/tmp/repos/example-website",
+                    "context": {"cwd_match": ["/tmp/repos/api_server"]},
                 },
                 {
-                    "id": "htma",
-                    "label": "HTMA",
-                    "default_cwd": "/tmp/repos/htma",
-                    "context": {"cwd_match": ["/tmp/repos/htma_server"]},
+                    "id": "api",
+                    "label": "API",
+                    "default_cwd": "/tmp/repos/api",
+                    "context": {"cwd_match": ["/tmp/repos/api_server"]},
                 },
             ]
         }
 
         matches = matched_skill_clients(model, cwd)
 
-        self.assertEqual(matches[0]["id"], "htma")
+        self.assertEqual(matches[0]["id"], "api")
 
     def test_collects_broken_project_links_as_issues(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

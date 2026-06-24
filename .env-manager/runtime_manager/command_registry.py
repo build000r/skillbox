@@ -561,7 +561,7 @@ def default_registry() -> tuple[CommandSpec, ...]:
             owner_binary="sbp",
             scopes=("cwd",),
             examples=(
-                "sbp evidence --repo /srv/skillbox/repos/sweet-potato --format json",
+                "sbp evidence --repo /srv/skillbox/repos/example-app --format json",
                 "sbp evidence --proposals --format json",
             ),
             validations=("cd skillbox-config && python3 -m pytest tests/ -k evidence",),

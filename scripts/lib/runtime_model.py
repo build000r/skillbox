@@ -295,7 +295,7 @@ class PersistenceContractError(RuntimeError):
 # enforced kind (service/task/client/profile/repo/artifact/skill/check) in
 # workspace/runtime.yaml + all client overlays was enumerated and matches this
 # pattern with zero violations; the longest real id is 40 chars (a check id)
-# and the ``sweet-potato__nextra_documentation_site`` client (39 chars, double
+# and an ``example-app__documentation_site`` client (double
 # underscores) confirms ``_`` is legitimately in use, so the class allows it.
 # box.py historically allowed ``.`` and uppercase for box ids; those are box
 # ids (a separate surface) and intentionally NOT widened into here — no runtime

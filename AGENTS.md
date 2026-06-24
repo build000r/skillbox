@@ -123,7 +123,7 @@ tailnet-only boxes — use loopback or Tailnet IP. See
 
 ## Beads Workflow Integration
 
-This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
+This project uses [beads_rust](https://github.com/example/beads_rust) (`br`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
 
 ### Essential Commands
 
@@ -190,7 +190,7 @@ git push                # Push to remote
 
 ## Beads Workflow Integration
 
-This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`) for issue tracking and [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) (`bv`) for graph-aware triage. Issues are stored in `.beads/` and tracked in git.
+This project uses [beads_rust](https://github.com/example/beads_rust) (`br`) for issue tracking and [beads_viewer](https://github.com/example/beads_viewer) (`bv`) for graph-aware triage. Issues are stored in `.beads/` and tracked in git.
 
 ### Using bv as an AI sidecar
 

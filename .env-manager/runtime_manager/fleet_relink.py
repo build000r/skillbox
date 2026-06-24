@@ -5,7 +5,7 @@ Why this exists
 
 A machine move is the single biggest drift generator in the skill estate. When
 the operator's repos move from one box to another (e.g. a Mac laptop at
-``/Users/b/repos`` to a devbox at ``/srv/skillbox/repos``), every installed
+``/Users/operator/repos`` to a devbox at ``/srv/skillbox/repos``), every installed
 skill symlink that pointed at the *source* tree now points at a path that does
 not exist on the new box. The broken-link taxonomy already names this:
 ``origin == "other-machine"`` — a link whose target lives under a root that
@@ -14,7 +14,7 @@ not exist on the new box. The broken-link taxonomy already names this:
 ``fleet converge`` reports those links and (by class) suggests *migrate* (drop
 the link). But dropping-then-resyncing is the slow path: after a clean machine
 move the SAME repo simply lives under the new root, so the link can be
-*repointed* in place — ``/Users/b/repos/x/skills/y`` becomes
+*repointed* in place — ``/Users/operator/repos/x/skills/y`` becomes
 ``/srv/skillbox/repos/x/skills/y`` — IF that translated target exists and is a
 valid skill dir. This module first-classes that operation so the next box
 migration is a one-liner.
@@ -199,7 +199,7 @@ def _translate_target(
     if roots.get("mode") == "default" and config is not None and machine_id:
         # Try translating from each other machine into the current one. A target
         # can be under several machines' roots when those roots prefix-overlap
-        # (e.g. /Users/b and /Users/b/repos belong to different profiles); the
+        # (e.g. /Users/operator and /Users/operator/repos belong to different profiles); the
         # first machine in machines.yaml order is NOT necessarily the correct
         # owner. Collect EVERY candidate and pick the translation whose matched
         # SOURCE root is the longest (most specific), with a deterministic

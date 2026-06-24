@@ -15,22 +15,14 @@ except ImportError:
     yaml = None  # type: ignore
 
 # Services whose UI is what an operator typically opens in a browser.
-# Everything else with kind=http is treated as a backend API.
-APP_SERVICE_IDS = {
-    "htma",
-    "buildooor",
-    "buildooor-web",
-    "cca-website",
-    "mhb",
-    "unclawg",
-    "videos",
-}
+# Everything else with kind=http is treated as a backend API. Private estates
+# should declare concrete app ids in their overlays rather than relying on
+# public defaults.
+APP_SERVICE_IDS = {"web", "app", "frontend", "example-web"}
 
 # Service ids whose user-facing name differs from the id. Fall back to
 # overlay-derived aliases when the overlay can be read.
-_HARDCODED_ALIASES = {
-    "ingredient_server": "cyclechef",
-}
+_HARDCODED_ALIASES: dict[str, str] = {}
 
 
 def _local_url(healthcheck_url: str) -> str:
@@ -44,10 +36,7 @@ def _local_url(healthcheck_url: str) -> str:
 
 
 # Domain-block keys in overlay context.domains that don't match service ids.
-_DOMAIN_KEY_TO_SERVICE = {
-    "cca": "cca-website",
-    "ingredient": "ingredient_server",
-}
+_DOMAIN_KEY_TO_SERVICE: dict[str, str] = {}
 
 
 def _alias_from_production(production: str, svc_id: str) -> str | None:

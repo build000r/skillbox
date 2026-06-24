@@ -440,7 +440,7 @@ def _skill_visibility_summary(
 # detected:
 #
 #   other-machine  the link target lives under a root that machines.yaml maps to
-#                  a DIFFERENT machine profile (e.g. /Users/b/repos/... seen from
+#                  a DIFFERENT machine profile (e.g. /Users/operator/repos/... seen from
 #                  the devbox). Detected via runtime_manager.machines:
 #                  ``is_foreign_path(target, current_machine)``. Action: migrate.
 #   moved          a skill with the SAME name still exists under some current
@@ -513,7 +513,7 @@ def _classify_broken_link(
     Precedence is deliberate:
       1. unreadable  — if we could not even read the link, classify nothing else.
       2. other-machine — a foreign target is a migration, never a mystery (this
-         is the mhb case: 47 links all under /Users/b are ONE decision).
+         is the migration case: 47 links all under /Users/operator are ONE decision).
       3. moved        — a same-named live source means a one-symlink relink.
       4. dangling     — otherwise the link is dead and should be pruned.
     """
@@ -1468,7 +1468,7 @@ def _explain_machine_profile() -> dict[str, Any]:
     """Forward-compatible machine-profile resolution for the explanation.
 
     Resolution flows through ``runtime_manager.machines`` (the same profile API
-    used elsewhere) so a path like ``/srv/repos/...`` vs ``/Users/b/repos/...``
+    used elsewhere) so a path like ``/srv/repos/...`` vs ``/Users/operator/repos/...``
     can be reasoned about. Best-effort: a missing/unparseable machines.yaml
     yields a ``resolved: false`` stub rather than raising, because skill
     provenance must answer even on boxes that have not declared a profile.

@@ -3,7 +3,7 @@
 Why this exists
 ===============
 
-A codex session healed one drifted repo (``sweet-potato``) by hand in ~20 tool
+A codex session healed one drifted repo by hand in ~20 tool
 calls; ~23 repos remain. Re-deriving "what is wrong here and what is the exact
 command to fix it" once per repo does not scale and is not reviewable. This
 module walks the deduped canonical fleet (the same candidate set

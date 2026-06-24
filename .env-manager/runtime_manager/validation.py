@@ -1930,9 +1930,9 @@ def _registry_id_resolved_paths() -> dict[str, set[str]]:
     This is the equality basis for the duplication lint (bug y8w-fix). A literal
     ``paths:`` entry is only a no-op-replaceable duplicate of ``repos: [<id>]``
     when the rule's literals enumerate the WHOLE resolved set of that id; a single
-    home-form spelling like ``~/repos/buildooor`` is a strict SUBSET of the id's
+    home-form spelling like ``~/repos/example-app`` is a strict SUBSET of the id's
     resolved set (which on a machine with ``~/repos`` repo roots also includes the
-    ``/srv/.../buildooor`` re-rooting), so swapping it for ``repos:`` would WIDEN
+    ``/srv/.../example-app`` re-rooting), so swapping it for ``repos:`` would WIDEN
     the match set — a real behavior change the lint must NOT recommend.
 
     Reuses ``skill_visibility``'s registry loader + the SAME machine-aware
@@ -1984,10 +1984,10 @@ def validate_registry_path_duplication(
 
     The subtlety (the y8w fix): a registry id resolves to a SET of spellings on
     the current machine — its home-relative form PLUS every re-rooting under the
-    machine's repo roots (e.g. ``buildooor`` -> ``~/repos/buildooor`` AND
-    ``/srv/.../buildooor`` on a ``~/repos``-rooted box). A literal path like
-    ``~/repos/buildooor`` matches only ONE of those spellings. Replacing that one
-    literal with ``repos: [buildooor]`` would WIDEN the rule's match set to the
+    machine's repo roots (e.g. ``example-app`` -> ``~/repos/example-app`` AND
+    ``/srv/.../example-app`` on a ``~/repos``-rooted box). A literal path like
+    ``~/repos/example-app`` matches only ONE of those spellings. Replacing that one
+    literal with ``repos: [example-app]`` would WIDEN the rule's match set to the
     whole superset — a real behavior change. So a literal that is a strict SUBSET
     of an id's resolved set is INTENTIONALLY narrower and must NOT be flagged.
 

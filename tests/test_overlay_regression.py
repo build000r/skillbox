@@ -280,7 +280,7 @@ def test_overlay_declares_many_literal_skills(scenario: MarketingScenario) -> No
 def test_non_matching_cwd_links_zero_not_the_literal_overlay_set(
     scenario: MarketingScenario,
 ) -> None:
-    """The 35-vs-0 sweet-potato case: a cwd matching NO rule links ZERO.
+    """The 35-vs-0 example-app case: a cwd matching NO rule links ZERO.
 
     activate's plan must equal the policy-evaluated sync plan (both empty),
     NOT the full literal overlay set.

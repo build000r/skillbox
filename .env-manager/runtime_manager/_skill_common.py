@@ -95,9 +95,6 @@ def _source_bucket(path: str) -> str:
     home = str(Path.home())
     buckets = [
         (f"{home}/repos/opensource/skills", "opensource/skills"),
-        (f"{home}/repos/skills-private", "skills-private"),
-        (f"{home}/repos/marketingskills", "marketingskills"),
-        (f"{home}/repos/sweet-potato", "sweet-potato"),
         (f"{home}/projects/jsm-skill-archive", "archive"),
         (f"{home}/projects/jsm-skill-archive-", "archive"),
     ]

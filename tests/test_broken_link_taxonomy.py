@@ -93,8 +93,8 @@ class BrokenLinkTaxonomyUnitTests(unittest.TestCase):
             "availability": "installed",
             "state": "broken",
             "path": "/repo/.claude/skills/x",
-            "link_target": "/Users/b/repos/skills/x",
-            "link_target_abs": "/Users/b/repos/skills/x",
+            "link_target": "/Users/operator/repos/skills/x",
+            "link_target_abs": "/Users/operator/repos/skills/x",
             "broken_reason": "unreadable",
         }
         result = sv._classify_broken_link(
