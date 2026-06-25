@@ -135,6 +135,7 @@ class AgentSnapshotTests(unittest.TestCase):
         self.assertEqual(replay["snapshot_id"], "golden-fixture")
         self.assertEqual(replay["summary"]["overall"], "green")
         self.assertEqual(replay["summary"]["graph_edges"], 1)
+        self.assertTrue(all(action.startswith("python3 .env-manager/manage.py ") for action in replay["next_actions"]))
 
 
 if __name__ == "__main__":

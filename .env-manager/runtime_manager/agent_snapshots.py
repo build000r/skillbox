@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping
 
+from .agent_cli_hints import manage_py_command
 # Redaction primitives come from the single shared table. ``redact_diagnostic_text``
 # is the thin alias kept on agent_adapters; ``_is_secret_key`` reuses the shared
 # key matcher so this surface never carries its own pattern copy. The snapshot
@@ -386,7 +387,10 @@ def replay_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
             "graph_edges": len(graph.get("edges") or []),
             "graph_warnings": len(graph.get("warnings") or []),
         },
-        "next_actions": ["snap diff <before> <after>", "brain.graph --format json"],
+        "next_actions": [
+            manage_py_command("snap", "diff", "--from", "<before>", "--to", "<after>", "--format", "json"),
+            manage_py_command("graph", "--format", "json"),
+        ],
     }
 
 

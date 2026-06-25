@@ -1,0 +1,13 @@
+{
+  "target_path": "/srv/skillbox/repos/opensource/skillbox",
+  "discovered_at": "2026-06-25T06:22:24Z",
+  "languages": [],
+  "binaries": [],
+  "env_var_prefix": "",
+  "existing_surfaces": {
+    "robot_mode": false,
+    "capabilities": false,
+    "robot_docs": false
+  },
+  "recommended_mode": "full"
+}

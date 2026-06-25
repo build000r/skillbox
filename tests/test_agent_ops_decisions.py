@@ -156,6 +156,8 @@ class AgentDecisionTests(unittest.TestCase):
             "bead:ready-1",
             "command:brain.next",
             "brain.next",
+            "next",
+            "snap",
         ):
             with self.subTest(target=target):
                 payload = DECISIONS.explain_payload(_graph(), target, adapters=adapters)

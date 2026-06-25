@@ -1,0 +1,11 @@
+{"id":"brain.capabilities","kind":"cli+mcp","command":"python3 .env-manager/manage.py capabilities --format json","risk":"low","safe_first_try":"python3 .env-manager/manage.py capabilities --format json"}
+{"id":"brain.next","kind":"cli+mcp","command":"python3 .env-manager/manage.py next --format json","risk":"low","safe_first_try":"python3 .env-manager/manage.py next --format json --no-adapters"}
+{"id":"brain.graph","kind":"cli+mcp","command":"python3 .env-manager/manage.py graph --format json","risk":"low","safe_first_try":"python3 .env-manager/manage.py graph --format json --no-adapters"}
+{"id":"brain.explain","kind":"cli+mcp","command":"python3 .env-manager/manage.py explain brain.next --format json","risk":"low","safe_first_try":"python3 .env-manager/manage.py explain brain.next --format json --no-adapters"}
+{"id":"brain.search","kind":"cli+mcp","command":"python3 .env-manager/manage.py search doctor --format json","risk":"low","safe_first_try":"python3 .env-manager/manage.py search graph --format json --no-adapters"}
+{"id":"brain.snap","kind":"cli+mcp","command":"python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json","risk":"low","safe_first_try":"python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json"}
+{"id":"sbp.capabilities","kind":"wrapper","command":"scripts/sbp capabilities --json","risk":"low","safe_first_try":"scripts/sbp capabilities --json"}
+{"id":"sbp.recalibrate","kind":"wrapper","command":"scripts/sbp recalibrate","risk":"low-to-medium","safe_first_try":"scripts/sbp recalibrate"}
+{"id":"outer.doctor","kind":"cli","command":"python3 scripts/04-reconcile.py doctor --format json --skip-compose --skip-skill-sync","risk":"low","safe_first_try":"python3 scripts/04-reconcile.py doctor --format json --skip-compose --skip-skill-sync"}
+{"id":"box.capabilities","kind":"cli","command":"python3 scripts/box.py capabilities --json","risk":"low","safe_first_try":"python3 scripts/box.py capabilities --json"}
+{"id":"box.up.preview","kind":"cli+mcp","command":"python3 scripts/box.py up <box-id> --profile dev-small --dry-run --format json","risk":"high without dry-run","safe_first_try":"python3 scripts/box.py up <box-id> --profile dev-small --dry-run --format json"}
