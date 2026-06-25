@@ -30,6 +30,7 @@ from runtime_manager.errors import (  # noqa: E402
     OVERRIDE_PARSE_ERROR,
     OVERRIDE_REFUSED_FLOOR,
     OVERRIDE_REFUSED_GLOBAL_ESCALATION,
+    PRUNE_SKIPPED_PINNED,
     ValidationError,
 )
 from runtime_manager.policy_eval import (  # noqa: E402
@@ -199,6 +200,13 @@ def _plan_action_signature(plan: dict[str, object]) -> list[tuple[str, str, str,
 
 def _override_writer_worker(repo_path: str, name: str) -> None:
     update_repo_override_policy(Path(repo_path), lambda policy: _append_pin(policy, name))
+
+
+def _run_runtime_cli(argv: list[str]) -> tuple[int, str]:
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        code = RUNTIME_CLI.main(argv)
+    return code, output.getvalue()
 
 
 class RepoSkillOverridePolicyTests(unittest.TestCase):
@@ -387,6 +395,60 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
         self.assertEqual(effective["alpha"]["layer"], "repo-override-file")
         self.assertTrue(effective["alpha"]["policy_path"].startswith(str(root)))
 
+    def test_skill_why_cli_is_portable_under_temp_clients_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            fake_home = root / "home"
+            clients_root = root / "clients"
+            clients_root.mkdir()
+            source_root = root / "sources"
+            _write_source_skill(source_root, "alpha")
+            _write_override(repo, "version: 1\npin_on: [alpha]\n")
+            machines_file = root / "machines.yaml"
+            machines_file.write_text(
+                "version: 1\n"
+                "machines:\n"
+                "  fixture-box:\n"
+                "    hostnames: [fixture-box]\n"
+                f"    home: {fake_home}\n"
+                f"    repo_roots: [{root}]\n",
+                encoding="utf-8",
+            )
+            model = _write_scope_policy(root, source_root, "alpha", repo)
+            model["env"] = {"SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root)}
+
+            self.assertFalse((root / "skillbox-config").exists())
+            env = {
+                "SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root),
+                "SKILLBOX_MACHINES_FILE": str(machines_file),
+                "SKILLBOX_MACHINE": "fixture-box",
+            }
+            with (
+                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch("runtime_manager.skill_visibility.Path.home", return_value=fake_home),
+                mock.patch.object(RUNTIME_CLI, "_filtered_model_for_args", return_value=model),
+            ):
+                code, text = _run_runtime_cli([
+                    "skill",
+                    "why",
+                    "alpha",
+                    "--cwd",
+                    str(repo),
+                    "--format",
+                    "json",
+                ])
+
+        self.assertEqual(code, 0)
+        rendered = json.dumps(json.loads(text), sort_keys=True)
+        external_config_roots = [
+            str((ROOT_DIR.parent / "skillbox-config").resolve()),
+            str((ROOT_DIR.parent.parent / "skillbox-config").resolve()),
+        ]
+        for forbidden in [str(Path.home().resolve()), *external_config_roots, "/srv/skillbox"]:
+            self.assertNotIn(forbidden, rendered)
+        self.assertIn(str(root), rendered)
+
     def test_override_writer_preserves_sequential_read_modify_writes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = _make_repo(Path(tmpdir))
@@ -524,6 +586,32 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
         )
         self.assertIn("disabled by the OVERRIDE layer", disabled_explanation["reason"])
 
+    def test_pin_on_beats_default_off_and_why_reports_override_layer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            source_root = root / "sources"
+            _write_source_skill(source_root, "alpha")
+            model = _write_global_floor_policy(root, source_root, "alpha", repo)
+            _write_override(repo, "version: 1\npin_on: [alpha]\n")
+
+            explanation = explain_skill_visibility(
+                model,
+                "alpha",
+                cwd=str(repo),
+                include_global=False,
+                include_project=True,
+            )
+
+        self.assertTrue(explanation["visible"])
+        self.assertEqual(explanation["winning_layer"], "repo-override-file")
+        self.assertEqual(explanation["layer"], "repo-override-file")
+        self.assertEqual(explanation["winner"]["override_action"], "pin_on")
+        self.assertEqual(
+            [layer["layer"] for layer in explanation["layers"] if layer.get("wins")],
+            ["repo-override-file"],
+        )
+
     def test_repo_override_pin_off_cannot_disable_dispatcher_floor(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = _make_repo(Path(tmpdir))
@@ -650,14 +738,18 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
             with mock.patch("runtime_manager.skill_visibility.Path.home", return_value=fake_home):
                 dry_plan = skill_lifecycle_plan(model, "prune", cwd=str(repo), from_scope="project")
                 applied_plan = skill_lifecycle_plan(model, "prune", cwd=str(repo), from_scope="project")
+                dry_plan_json = json.dumps(dry_plan, sort_keys=True)
+                applied_plan_json = json.dumps(applied_plan, sort_keys=True)
                 dry = apply_skill_lifecycle_plan(dry_plan, dry_run=True)
                 applied = apply_skill_lifecycle_plan(applied_plan, dry_run=False)
 
+            self.assertEqual(dry_plan_json, applied_plan_json)
             self.assertEqual(dry["actions"], [])
             self.assertEqual(applied["actions"], [])
             self.assertEqual(dry["skipped"], applied["skipped"])
             self.assertEqual(dry["skipped"][0]["name"], "alpha")
             self.assertEqual(dry["skipped"][0]["reason"], "pinned")
+            self.assertEqual(dry["skipped"][0]["code"], PRUNE_SKIPPED_PINNED)
             self.assertEqual(dry["summary"]["skipped"], 1)
             self.assertTrue(link.is_symlink())
 
@@ -807,6 +899,89 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
                 json.dumps(third, sort_keys=True),
             )
 
+    def test_skill_on_and_off_cli_are_idempotent_after_first_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            fake_home = root / "home"
+            source_root = root / "sources"
+            _write_source_skill(source_root, "alpha")
+            model = _write_scope_policy(root, source_root, "alpha", repo)
+
+            with (
+                mock.patch("runtime_manager.skill_visibility.Path.home", return_value=fake_home),
+                mock.patch.object(RUNTIME_CLI, "_filtered_model_for_args", return_value=model),
+            ):
+                first_on_code, _first_on_text = _run_runtime_cli([
+                    "skill",
+                    "on",
+                    "alpha",
+                    "--cwd",
+                    str(repo),
+                    "--format",
+                    "json",
+                ])
+                second_on_code, second_on_text = _run_runtime_cli([
+                    "skill",
+                    "on",
+                    "alpha",
+                    "--cwd",
+                    str(repo),
+                    "--format",
+                    "json",
+                ])
+                third_on_code, third_on_text = _run_runtime_cli([
+                    "skill",
+                    "on",
+                    "alpha",
+                    "--cwd",
+                    str(repo),
+                    "--format",
+                    "json",
+                ])
+                first_off_code, _first_off_text = _run_runtime_cli([
+                    "skill",
+                    "off",
+                    "alpha",
+                    "--cwd",
+                    str(repo),
+                    "--format",
+                    "json",
+                ])
+                second_off_code, second_off_text = _run_runtime_cli([
+                    "skill",
+                    "off",
+                    "alpha",
+                    "--cwd",
+                    str(repo),
+                    "--format",
+                    "json",
+                ])
+                third_off_code, third_off_text = _run_runtime_cli([
+                    "skill",
+                    "off",
+                    "alpha",
+                    "--cwd",
+                    str(repo),
+                    "--format",
+                    "json",
+                ])
+
+        second_on = json.loads(second_on_text)
+        second_off = json.loads(second_off_text)
+        self.assertEqual(first_on_code, 0)
+        self.assertEqual(second_on_code, 0)
+        self.assertEqual(third_on_code, 0)
+        self.assertEqual(second_on["actions"], [])
+        self.assertTrue(second_on["noop"])
+        self.assertEqual(second_on_text, third_on_text)
+        self.assertEqual(first_off_code, 0)
+        self.assertEqual(second_off_code, 0)
+        self.assertEqual(third_off_code, 0)
+        self.assertEqual(second_off["actions"], [])
+        self.assertTrue(second_off["noop"])
+        self.assertEqual(second_off_text, third_off_text)
+
     def test_skill_on_dry_run_does_not_write_or_link(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -924,6 +1099,31 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
                         (repo / ".skillbox" / "skill-overrides.yaml").read_bytes(),
                         before,
                     )
+
+    def test_skill_off_cli_refuses_dispatcher_floor_with_nonzero_exit_before_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = _make_repo(Path(tmpdir))
+            _write_override(repo, "version: 1\npin_on: [alpha]\n")
+            before = (repo / ".skillbox" / "skill-overrides.yaml").read_bytes()
+
+            with mock.patch.object(RUNTIME_CLI, "_filtered_model_for_args", return_value={}):
+                code, text = _run_runtime_cli([
+                    "skill",
+                    "off",
+                    "sbp",
+                    "--cwd",
+                    str(repo),
+                    "--format",
+                    "json",
+                ])
+
+            payload = json.loads(text)
+            after = (repo / ".skillbox" / "skill-overrides.yaml").read_bytes()
+
+            self.assertNotEqual(code, 0)
+            self.assertEqual(payload["error_code"], OVERRIDE_REFUSED_FLOOR)
+            self.assertEqual(payload["error"]["code"], OVERRIDE_REFUSED_FLOOR)
+            self.assertEqual(after, before)
 
     def test_skill_on_global_refuses_non_global_skill_before_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
