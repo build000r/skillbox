@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, Mapping
 
+from .agent_decisions import MAX_FUZZY_SUGGESTIONS, fuzzy_suggestions, resolve_brain_target
 from .agent_graph import AgentGraph
 from .agent_cli_hints import manage_py_command
 from .agent_graph_algorithms import (
@@ -86,23 +87,59 @@ def _graph_payload(graph: AgentGraph | Mapping[str, Any]) -> dict[str, Any]:
     return normalized_payload
 
 
-def _require_node(graph_payload: Mapping[str, Any], node_id: str, role: str) -> dict[str, Any] | None:
+def _resolve_graph_node_id(
+    graph_payload: Mapping[str, Any],
+    node_id: str,
+    role: str,
+) -> tuple[dict[str, Any] | None, str | None]:
     node_id = str(node_id or "").strip()
     if not node_id:
-        return _error_payload(
-            "INVALID_ARGUMENT",
-            f"{role} is required",
-            next_actions=[manage_py_command("graph", "--algorithm", "blast-radius", "--node", "<node-id>", "--format", "json")],
+        return (
+            _error_payload(
+                "INVALID_ARGUMENT",
+                f"{role} is required",
+                next_actions=[
+                    manage_py_command("graph", "--algorithm", "blast-radius", "--node", "<node-id>", "--format", "json")
+                ],
+            ),
+            None,
         )
-    node_ids = {str(node.get("id") or "") for node in graph_payload.get("nodes") or [] if isinstance(node, Mapping)}
-    if node_id not in node_ids:
-        return _error_payload(
-            "UNKNOWN_NODE",
-            f"unknown graph node: {node_id}",
-            next_actions=[manage_py_command("graph", "--format", "json")],
-            details={"node_id": node_id, "role": role},
+    resolution = resolve_brain_target(node_id, graph_payload)
+    if resolution["status"] == "ambiguous":
+        candidates = resolution.get("candidates") or []
+        candidate_ids = [str(item.get("id") or "") for item in candidates if str(item.get("id") or "")]
+        return (
+            _error_payload(
+                "AMBIGUOUS_NODE",
+                f"ambiguous graph {role}: {resolution.get('target') or node_id}",
+                next_actions=[
+                    manage_py_command("graph", "--algorithm", "blast-radius", "--node", candidate_id, "--format", "json")
+                    for candidate_id in candidate_ids[:3]
+                ],
+                details={
+                    "node_id": node_id,
+                    "role": role,
+                    "target": resolution.get("target") or node_id,
+                    "candidates": candidates,
+                },
+            ),
+            None,
         )
-    return None
+    if resolution["status"] != "resolved":
+        suggestions = resolution.get("suggestions") or []
+        return (
+            _error_payload(
+                "UNKNOWN_NODE",
+                f"unknown graph node: {node_id}",
+                next_actions=[
+                    manage_py_command("graph", "--algorithm", "blast-radius", "--node", item["id"], "--format", "json")
+                    for item in suggestions[:3]
+                ],
+                details={"node_id": node_id, "role": role, "suggestions": suggestions},
+            ),
+            None,
+        )
+    return None, str(resolution["id"])
 
 
 def _algorithm_payload(
@@ -115,14 +152,32 @@ def _algorithm_payload(
     blocked_nodes: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     if algorithm not in GRAPH_ALGORITHMS:
+        import difflib
+
+        algorithm_suggestions = difflib.get_close_matches(
+            str(algorithm or ""),
+            sorted(GRAPH_ALGORITHMS),
+            n=MAX_FUZZY_SUGGESTIONS,
+            cutoff=0.5,
+        )
+        next_actions = [
+            manage_py_command("graph", "--algorithm", suggestion, "--format", "json")
+            for suggestion in algorithm_suggestions[:3]
+        ]
+        if not next_actions:
+            next_actions = [
+                manage_py_command("graph", "--algorithm", "all", "--format", "json"),
+                manage_py_command("graph", "--algorithm", "cycles", "--format", "json"),
+            ]
         return _error_payload(
             "INVALID_ARGUMENT",
             f"unknown graph algorithm: {algorithm}",
-            next_actions=[
-                manage_py_command("graph", "--algorithm", "all", "--format", "json"),
-                manage_py_command("graph", "--algorithm", "cycles", "--format", "json"),
-            ],
-            details={"allowed": sorted(GRAPH_ALGORITHMS)},
+            next_actions=next_actions,
+            details={
+                "allowed": sorted(GRAPH_ALGORITHMS),
+                "algorithm": algorithm,
+                "suggestions": algorithm_suggestions,
+            },
         )
     if algorithm == "all":
         return analyze_graph(graph_payload, blocked_nodes=blocked_nodes)
@@ -137,16 +192,18 @@ def _algorithm_payload(
     if algorithm == "critical-path":
         return critical_path(graph_payload)
     if algorithm == "blast-radius":
-        error = _require_node(graph_payload, str(node_id or ""), "node")
+        error, resolved_node = _resolve_graph_node_id(graph_payload, str(node_id or ""), "node")
         if error:
             return error
-        return blast_radius(graph_payload, str(node_id))
+        return blast_radius(graph_payload, str(resolved_node))
     if algorithm == "shortest-path":
-        for role, value in (("source", source), ("target", target)):
-            error = _require_node(graph_payload, str(value or ""), role)
-            if error:
-                return error
-        return shortest_path(graph_payload, str(source), str(target))
+        error, resolved_source = _resolve_graph_node_id(graph_payload, str(source or ""), "source")
+        if error:
+            return error
+        error, resolved_target = _resolve_graph_node_id(graph_payload, str(target or ""), "target")
+        if error:
+            return error
+        return shortest_path(graph_payload, str(resolved_source), str(resolved_target))
     raise AssertionError(f"unhandled graph algorithm: {algorithm}")
 
 

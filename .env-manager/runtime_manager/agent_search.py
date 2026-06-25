@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from .agent_decisions import MAX_FUZZY_SUGGESTIONS, fuzzy_suggestions
 from .agent_graph import AgentGraph
 from .agent_graph_algorithms import normalize_graph
 from .agent_cli_hints import manage_py_command
@@ -282,6 +283,48 @@ def _doc_hits(
     return hits, warnings
 
 
+def _search_corpus_ids(
+    graph: AgentGraph | Mapping[str, Any] | None,
+) -> list[str]:
+    ids: set[str] = set()
+    for spec in default_registry():
+        ids.add(spec.id)
+    if graph is not None:
+        normalized = normalize_graph(graph.to_payload() if isinstance(graph, AgentGraph) else graph)
+        ids.update(normalized.nodes.keys())
+    return sorted(ids)
+
+
+def _empty_search_suggestions(
+    query_tokens: list[str],
+    *,
+    graph: AgentGraph | Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    corpus = _search_corpus_ids(graph)
+    query = " ".join(query_tokens)
+    suggestions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for node_id in corpus:
+        lowered = node_id.lower()
+        if not any(token in lowered for token in query_tokens):
+            continue
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        kind = node_id.split(":", 1)[0] if ":" in node_id else "command"
+        suggestions.append({"id": node_id, "kind": kind, "score": 0.75})
+
+    for item in fuzzy_suggestions(query, corpus, cutoff=0.45):
+        if item["id"] in seen:
+            continue
+        seen.add(item["id"])
+        suggestions.append(item)
+
+    suggestions.sort(key=lambda item: (-float(item.get("score") or 0), str(item.get("id"))))
+    return suggestions[:MAX_FUZZY_SUGGESTIONS]
+
+
 def _group_hits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
     groups: dict[str, list[dict[str, Any]]] = {}
     for hit in hits:
@@ -332,7 +375,17 @@ def search_payload(
 
     hits.sort(key=lambda hit: (-int(hit["score"]), str(hit["source"]), str(hit["id"])))
     limited = hits[: max(0, int(limit))]
-    return {
+    suggestions = _empty_search_suggestions(query_tokens, graph=graph) if not limited else []
+    next_actions = [limited[0]["next_action"]] if limited else [
+        manage_py_command("search", suggestion["id"], "--format", "json")
+        for suggestion in suggestions[:3]
+    ]
+    if not next_actions:
+        next_actions = [
+            manage_py_command("search", "graph", "--format", "json"),
+            manage_py_command("next", "--format", "json"),
+        ]
+    payload: dict[str, Any] = {
         "ok": True,
         "schema_version": SEARCH_SCHEMA_VERSION,
         "query": query,
@@ -342,11 +395,11 @@ def search_payload(
         "hits": limited,
         "groups": _group_hits(limited),
         "warnings": warnings,
-        "next_actions": [limited[0]["next_action"]] if limited else [
-            manage_py_command("search", "graph", "--format", "json"),
-            manage_py_command("next", "--format", "json"),
-        ],
+        "next_actions": next_actions,
     }
+    if suggestions:
+        payload["suggestions"] = suggestions
+    return payload
 
 
 __all__ = [

@@ -12,6 +12,7 @@ if str(ENV_MANAGER_DIR) not in sys.path:
     sys.path.insert(0, str(ENV_MANAGER_DIR))
 
 from runtime_manager import agent_decisions as DECISIONS  # noqa: E402
+from runtime_manager.text_renderers import explain_brain_text_lines  # noqa: E402
 
 
 def _node(node_id: str, kind: str, label: str | None = None, **attrs: object) -> dict[str, object]:
@@ -172,6 +173,54 @@ class AgentDecisionTests(unittest.TestCase):
 
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "UNKNOWN_NODE")
+
+    def test_explain_prefixed_command_falls_back_to_registry_without_graph_node(self) -> None:
+        payload = DECISIONS.explain_payload({"nodes": [], "edges": []}, "command:brain.next")
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["target"], "brain.next")
+        self.assertEqual(payload["kind"], "command")
+
+    def test_explain_bare_pulse_resolves_with_resolved_from(self) -> None:
+        graph = _graph()
+        graph["nodes"].append(_node("service:pulse", "service", "Pulse daemon"))
+
+        payload = DECISIONS.explain_payload(graph, "pulse")
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["target"], "service:pulse")
+        self.assertEqual(payload["resolved_from"], "pulse")
+
+    def test_explain_typo_pluse_returns_unknown_with_pulse_suggestion(self) -> None:
+        graph = _graph()
+        graph["nodes"].append(_node("service:pulse", "service", "Pulse daemon"))
+
+        payload = DECISIONS.explain_payload(graph, "pluse")
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["code"], "UNKNOWN_NODE")
+        suggestion_ids = [item["id"] for item in payload.get("suggestions") or []]
+        self.assertIn("service:pulse", suggestion_ids)
+
+    def test_explain_ambiguous_bare_word_lists_candidates_without_guessing(self) -> None:
+        graph = _graph()
+        graph["nodes"].append(_node("check:api", "check", "API check"))
+
+        payload = DECISIONS.explain_payload(graph, "api")
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["code"], "AMBIGUOUS_NODE")
+        candidate_ids = [item["id"] for item in payload["error"]["details"]["candidates"]]
+        self.assertEqual(sorted(candidate_ids), ["check:api", "service:api"])
+
+    def test_explain_text_renderer_prints_copy_pasteable_suggestions(self) -> None:
+        graph = _graph()
+        graph["nodes"].append(_node("service:pulse", "service", "Pulse daemon"))
+        payload = DECISIONS.explain_payload(graph, "pluse")
+        lines = explain_brain_text_lines(payload)
+
+        self.assertTrue(any("service:pulse" in line for line in lines))
+        self.assertTrue(any("manage.py explain service:pulse" in line for line in lines))
 
 
 if __name__ == "__main__":

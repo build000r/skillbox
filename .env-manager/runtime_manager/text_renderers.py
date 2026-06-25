@@ -616,3 +616,117 @@ def client_diff_text_lines(payload: dict[str, Any]) -> list[str]:
 def print_client_diff_text(payload: dict[str, Any]) -> None:
     for line in client_diff_text_lines(payload):
         print(line)
+
+
+def _brain_suggestion_lines(payload: dict[str, Any]) -> list[str]:
+    from .agent_cli_hints import manage_py_command
+
+    lines: list[str] = []
+    suggestions = payload.get("suggestions")
+    if not isinstance(suggestions, list):
+        error = payload.get("error")
+        details = error.get("details") if isinstance(error, dict) else None
+        if isinstance(details, dict):
+            raw = details.get("suggestions")
+            suggestions = raw if isinstance(raw, list) else []
+        else:
+            suggestions = []
+    for item in suggestions[:5]:
+        if isinstance(item, str):
+            node_id = item.strip()
+            if not node_id:
+                continue
+            lines.append(f"suggestion: {node_id}")
+            if node_id in {"critical-path", "blast-radius", "min-unblock", "shortest-path", "topology", "cycles", "scc", "all"}:
+                lines.append(f"  try: {manage_py_command('graph', '--algorithm', node_id, '--format', 'json')}")
+            else:
+                lines.append(f"  try: {manage_py_command('search', node_id, '--format', 'json')}")
+            continue
+        if not isinstance(item, dict):
+            continue
+        node_id = str(item.get("id") or "").strip()
+        if not node_id:
+            continue
+        kind = str(item.get("kind") or "unknown")
+        score = item.get("score")
+        score_text = f" score={score}" if score is not None else ""
+        lines.append(f"suggestion: {node_id} ({kind}){score_text}")
+        if ":" in node_id or "." in node_id or node_id.startswith("brain."):
+            lines.append(f"  try: {manage_py_command('explain', node_id, '--format', 'json')}")
+        elif node_id in {"critical-path", "blast-radius", "min-unblock", "shortest-path", "topology", "cycles", "scc", "all"}:
+            lines.append(f"  try: {manage_py_command('graph', '--algorithm', node_id, '--format', 'json')}")
+        else:
+            lines.append(f"  try: {manage_py_command('search', node_id, '--format', 'json')}")
+    return lines
+
+
+def explain_brain_text_lines(payload: dict[str, Any]) -> list[str]:
+    if "error" in payload:
+        lines = [str(payload["error"].get("message") or "explain failed")]
+        lines.extend(_brain_suggestion_lines(payload))
+        next_actions = payload.get("next_actions")
+        if isinstance(next_actions, list):
+            for action in next_actions[:3]:
+                lines.append(f"next: {action}")
+        return lines
+    lines = [
+        f"explain: {payload.get('target')} ({payload.get('kind')})",
+        f"summary: {payload.get('summary')}",
+    ]
+    if payload.get("resolved_from"):
+        lines.append(f"resolved_from: {payload['resolved_from']}")
+    relationships = payload.get("relationships") or {}
+    lines.append(f"incoming: {relationships.get('incoming_count', 0)}")
+    lines.append(f"outgoing: {relationships.get('outgoing_count', 0)}")
+    for command in payload.get("commands") or []:
+        if isinstance(command, dict):
+            lines.append(f"command: {command.get('id')} - {command.get('summary')}")
+    return lines
+
+
+def print_explain_brain_text(payload: dict[str, Any]) -> None:
+    for line in explain_brain_text_lines(payload):
+        print(line, file=sys.stderr if "error" in payload else sys.stdout)
+
+
+def search_brain_text_lines(payload: dict[str, Any]) -> list[str]:
+    if "error" in payload:
+        lines = [str(payload["error"].get("message") or "search failed")]
+        lines.extend(_brain_suggestion_lines(payload))
+        return lines
+    lines = [f"search: {payload.get('count')}/{payload.get('total_count')} hits for {payload.get('query')!r}"]
+    for hit in payload.get("hits") or []:
+        if not isinstance(hit, dict):
+            continue
+        lines.append(f"- {hit.get('source')}:{hit.get('kind')}:{hit.get('id')} score={hit.get('score')}")
+        lines.append(f"  {hit.get('snippet')}")
+        lines.append(f"  next: {hit.get('next_action')}")
+    if not payload.get("hits"):
+        lines.extend(_brain_suggestion_lines(payload))
+        for action in payload.get("next_actions") or []:
+            lines.append(f"next: {action}")
+    for warning in payload.get("warnings") or []:
+        if isinstance(warning, dict):
+            lines.append(f"warning: {warning.get('code')}: {warning.get('message')}")
+    return lines
+
+
+def print_search_brain_text(payload: dict[str, Any]) -> None:
+    for line in search_brain_text_lines(payload):
+        print(line, file=sys.stderr if "error" in payload else sys.stdout)
+
+
+def graph_error_text_lines(payload: dict[str, Any]) -> list[str]:
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return []
+    lines = [str(error.get("message") or "graph failed")]
+    lines.extend(_brain_suggestion_lines(payload))
+    for action in payload.get("next_actions") or []:
+        lines.append(f"next: {action}")
+    return lines
+
+
+def print_graph_error_text(payload: dict[str, Any]) -> None:
+    for line in graph_error_text_lines(payload):
+        print(line, file=sys.stderr)
