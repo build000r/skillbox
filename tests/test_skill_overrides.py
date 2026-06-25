@@ -750,6 +750,51 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
         self.assertEqual(payload["remediation"][0]["command"], "sbp skill on needs-beads --cwd $PWD")
         self.assertEqual(payload["next_actions"][0], "sbp skill on needs-beads --cwd $PWD")
 
+    def test_skill_togglable_payload_lists_flip_commands_for_current_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fleet = build_fixture_fleet(tmpdir)
+            repo = fleet.repo("overlay-repo").resolve()
+
+            with fleet._home_patched():
+                payload = RUNTIME_CLI._build_skill_togglable_payload(
+                    fleet.model(),
+                    cwd=repo,
+                )
+
+        self.assertEqual(payload["cwd"], str(repo))
+        items = {item["skill"]: item for item in payload["items"]}
+        self.assertEqual(items["tiny-ui"]["state"], "missing_for_cwd")
+        self.assertEqual(items["tiny-ui"]["pinned_by"], "policy")
+        self.assertEqual(items["tiny-ui"]["command_to_flip"], f"sbp skill on tiny-ui --cwd {repo}")
+        self.assertEqual(items["tiny-marketing"]["state"], "on")
+        self.assertEqual(items["tiny-marketing"]["pinned_by"], "policy")
+        self.assertEqual(items["tiny-marketing"]["command_to_flip"], f"sbp skill off tiny-marketing --cwd {repo}")
+        self.assertEqual(items["tiny-cli"]["state"], "pinned_off")
+        self.assertEqual(items["tiny-cli"]["pinned_by"], "override")
+        self.assertEqual(items["tiny-cli"]["command_to_flip"], f"sbp skill on tiny-cli --cwd {repo}")
+
+    def test_skill_togglable_cli_emits_parseable_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fleet = build_fixture_fleet(tmpdir)
+            repo = fleet.repo("overlay-repo").resolve()
+
+            with (
+                fleet._home_patched(),
+                mock.patch.object(RUNTIME_CLI, "_filtered_model_for_args", return_value=fleet.model()),
+            ):
+                code, text = _run_runtime_cli([
+                    "skill",
+                    "togglable",
+                    "--cwd",
+                    str(repo),
+                    "--json",
+                ])
+
+        payload = json.loads(text)
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["cwd"], str(repo))
+        self.assertIn("tiny-cli", {item["skill"] for item in payload["items"]})
+
     def test_prune_firewall_skips_pinned_override_at_plan_construction(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

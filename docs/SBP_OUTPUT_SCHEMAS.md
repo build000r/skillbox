@@ -20,6 +20,10 @@ This page is **generated** from `scripts/gen_output_schemas.py`. The example pay
 - [`sbp candidates`](#sbp-candidates)
 - [`sbp mcp`](#sbp-mcp)
 - [`sbp recalibrate`](#sbp-recalibrate)
+- [`sbp skill why`](#sbp-skill-why)
+- [`sbp skill on`](#sbp-skill-on)
+- [`sbp skill off`](#sbp-skill-off)
+- [`sbp skill togglable`](#sbp-skill-togglable)
 - [`sbp explain`](#sbp-explain)
 - [`sbp doctor`](#sbp-doctor)
 - [`fleet converge`](#fleet-converge)
@@ -31,7 +35,7 @@ This page is **generated** from `scripts/gen_output_schemas.py`. The example pay
 **Invocation:** `sbp capabilities --json`
 **Produced by:** `scripts/sbp print_capabilities`
 
-The wrapper discovery contract. Agents should start here to learn the stable command inventory, stdout/stderr rules, dry-run guidance, and the machine-readable `skill_verbs` decision map for choosing between recalibrate/activate/sync/prune/on/off/heal/why and maintenance verbs.
+The wrapper discovery contract. Agents should start here to learn the stable command inventory, stdout/stderr rules, dry-run guidance, and the machine-readable `skill_verbs` decision map for choosing between recalibrate/activate/sync/prune/on/off/heal/why/togglable and maintenance verbs.
 
 ### Fields
 
@@ -147,6 +151,11 @@ The wrapper discovery contract. Agents should start here to learn the stable com
       "json": true,
       "name": "skill-why",
       "safe_first_try": "sbp skill why <skill> --json"
+    },
+    {
+      "json": true,
+      "name": "skill-togglable",
+      "safe_first_try": "sbp skill togglable --json"
     },
     {
       "json": true,
@@ -349,6 +358,26 @@ The wrapper discovery contract. Agents should start here to learn the stable com
       "scope": "current cwd policy, project by default",
       "survives_recalibrate": false,
       "when_to_use": "Use when policy already requires a skill and only links are missing."
+    },
+    "togglable": {
+      "do_NOT": "Do not use togglable as proof a flip already happened; run the returned command to mutate state.",
+      "links_disk": false,
+      "mutates": "none",
+      "purpose": "List every skill flippable at this cwd and the exact command to flip it.",
+      "returns_packet": false,
+      "scope": "current cwd",
+      "survives_recalibrate": false,
+      "when_to_use": "Use when you need a one-read switchboard of repo skill on/off affordances."
+    },
+    "toggleable": {
+      "do_NOT": "Do not use toggleable as proof a flip already happened; run the returned command to mutate state.",
+      "links_disk": false,
+      "mutates": "none",
+      "purpose": "Alias for togglable; lists every skill flippable at this cwd and the exact command to flip it.",
+      "returns_packet": false,
+      "scope": "current cwd",
+      "survives_recalibrate": false,
+      "when_to_use": "Use when you need a one-read switchboard of repo skill on/off affordances."
     },
     "why": {
       "do_NOT": "Do not infer policy from memory when why can return the live layers.",
@@ -1449,6 +1478,503 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
     "undefined_source_skills": 0,
     "undefined_sources": 0
   }
+}
+```
+
+---
+
+## `sbp skill why`
+
+**Invocation:** `sbp skill why <skill> [--cwd <repo>] --format json`
+**Produced by:** `explain_skill_visibility`
+
+Read-only provenance for ONE skill at ONE cwd, including absence. Same payload shape as `sbp explain` but routed through the `skill why` verb. Walks the precedence spine, names the winning layer (if any), and — when invisible — emits ranked remediation rows with literal `command` strings agents can run without re-deriving policy.
+
+### Fields
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `schema_version` | CONTRACT | Versioned tag for the explain payload shape. |
+| `skill` | CONTRACT | The skill name explained. |
+| `cwd` | CONTRACT | Absolute resolved cwd the provenance is for. |
+| `visible` | CONTRACT | True iff the skill resolves to a non-broken effective occurrence here. |
+| `reason` | info | Human sentence explaining the verdict. |
+| `layer` | CONTRACT | Resolution winner layer id, including disabled/broken winners, or null when none. |
+| `winning_layer` | CONTRACT | Canonical winning_layer copied from the same visibility decision that drives the effective set. |
+| `layer_family` | CONTRACT | PROJECT|GLOBAL|CLIENT|DEFAULT|OVERRIDE of the resolution winner, or null. |
+| `layer_label` | info | Human label for the resolution winner layer, or null. |
+| `layer_rank` | CONTRACT | Numeric rank of the resolution winner layer, or null. |
+| `winner` | CONTRACT | Trimmed view of the resolution winner (won=true), or null. |
+| `layers` | CONTRACT | Ordered provenance trace for this skill; exactly one row has wins=true when a winning layer exists. |
+| `occurrences` | CONTRACT | Every occurrence of this skill across layers, each with a won verdict. |
+| `lost` | CONTRACT | Non-winning occurrences with a lost_reason. |
+| `scope_rules` | CONTRACT | skill-scope.yaml rules naming this skill at this cwd. |
+| `inactive_overlay_rules` | CONTRACT | Overlay-gated rules that would apply if the overlay were active. |
+| `source_options` | CONTRACT | Discoverable source dirs that could be linked to make it visible. |
+| `active_overlays` | CONTRACT | Overlays currently active. |
+| `active_clients` | CONTRACT | Active client overlays. |
+| `matched_clients` | CONTRACT | Client overlays matching this cwd. |
+| `matched_project_categories` | CONTRACT | Project categories for this cwd. |
+| `remediation` | CONTRACT | Ranked, narrowest-first paths to visibility, each with kind + exact command. |
+| `machine` | CONTRACT | Forward-compatible machine-routing block (always present, may be partial). |
+| `registry` | CONTRACT | Forward-compatible {skill_id, registry_ids} block (always present). |
+| `next_actions` | info | Commands from remediation, or the already-visible sentinel. |
+
+### Example payload
+
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
+
+```json
+{
+  "active_clients": [],
+  "active_overlays": [],
+  "cwd": "<FLEET>/repos_real/overlay-repo",
+  "inactive_overlay_rules": [],
+  "layer": null,
+  "layer_family": null,
+  "layer_label": null,
+  "layer_rank": null,
+  "layers": [],
+  "lost": [],
+  "machine": {
+    "declared_machines": [
+      "devbox-like",
+      "mac-like"
+    ],
+    "machine_id": "devbox-like",
+    "resolved": true,
+    "source_path": "<FLEET>/skillbox-config/machines.yaml"
+  },
+  "matched_clients": [],
+  "matched_project_categories": [
+    {
+      "id": "frontend",
+      "match": "<FLEET>/repos_real/overlay-repo",
+      "notes": "",
+      "paths": [
+        "<FLEET>/repos_real/overlay-repo"
+      ],
+      "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml"
+    }
+  ],
+  "next_actions": [
+    "sbp skill on needs-beads --cwd $PWD",
+    "edit skill-scope.yaml: add a rule with skills:[needs-beads] and a path/category covering <FLEET>/repos_real/overlay-repo"
+  ],
+  "occurrences": [],
+  "reason": "'needs-beads' is NOT visible here, but a source exists and it can be activated",
+  "registry": {
+    "registry_ids": [],
+    "skill_id": null
+  },
+  "remediation": [
+    {
+      "command": "sbp skill on needs-beads --cwd $PWD",
+      "kind": "on",
+      "manage_command": "python3 .env-manager/manage.py skill on needs-beads --cwd <FLEET>/repos_real/overlay-repo",
+      "rank": 1,
+      "resolved_command": "sbp skill on needs-beads --cwd <FLEET>/repos_real/overlay-repo",
+      "why": "a source for 'needs-beads' exists (<FLEET>/private-skills/needs-beads); turning it on pins it for this repo, links it, and returns the SKILL.md packet"
+    },
+    {
+      "command": "edit skill-scope.yaml: add a rule with skills:[needs-beads] and a path/category covering <FLEET>/repos_real/overlay-repo",
+      "kind": "rule_edit",
+      "policy_files": [
+        "<FLEET>/skillbox-config/skill-scope.yaml"
+      ],
+      "rank": 3,
+      "why": "no skill-scope rule currently matches 'needs-beads' for this cwd, so the resolver does not consider it in-scope here"
+    }
+  ],
+  "schema_version": "2026-06-25+skill_explain_layers",
+  "scope_rules": [],
+  "skill": "needs-beads",
+  "source_options": [
+    {
+      "source": "<FLEET>/private-skills/needs-beads",
+      "source_bucket": "external"
+    }
+  ],
+  "visible": false,
+  "winner": null,
+  "winning_layer": null
+}
+```
+
+---
+
+## `sbp skill on`
+
+**Invocation:** `sbp skill on <skill> [--cwd <repo>] [--dry-run] --format json`
+**Produced by:** `_handle_skill_toggle (on / activate plan + override pin_on)`
+
+Durable repo-local pin ON plus disk links. Writes `pin_on` to `.skillbox/skill-overrides.yaml` (survives recalibrate) and links project skills when needed. Returns an `activation_packet` for immediate session use. `--dry-run` previews override + link actions without writing; a repeat apply is a clean no-op (`noop: true`).
+
+### Fields
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `action` | CONTRACT | Verb executed: 'on' or 'off'. |
+| `skill` | CONTRACT | Skill name toggled. |
+| `cwd` | CONTRACT | Absolute resolved repo cwd the toggle ran against. |
+| `requested_to` | CONTRACT | Scope the caller requested (project-only today). |
+| `resolved_to` | CONTRACT | Scope the plan resolved to. |
+| `categories` | CONTRACT | Project categories targeted when --to category (often empty). |
+| `from_scope` | CONTRACT | Installed scope considered for off/unlink (project for skill off). |
+| `source_options` | CONTRACT | Resolvable source directories for on/activate. |
+| `selected_source` | CONTRACT | Chosen source for on/activate, or null for off. |
+| `activation_packet` | CONTRACT | Immediate-use SKILL.md packet on on; null on off. |
+| `warnings` | info | Non-fatal plan warnings. |
+| `actions` | CONTRACT | Link/unlink rows the toggle would apply; see the action field table. |
+| `skipped` | CONTRACT | Skills skipped by the plan (e.g. prune firewall pinned rows). |
+| `summary` | CONTRACT | Roll-up counters for planned/applied link+unlink actions. |
+| `override` | CONTRACT | Repo override-file mutation preview/result; see the override field table. |
+| `changed` | CONTRACT | True when disk and/or override state changed (apply mode). |
+| `noop` | CONTRACT | True when neither override nor link actions would change state. |
+| `dry_run` | CONTRACT | True when the payload previews without writing. |
+| `verification` | info | Optional post-on verify block when --verify is set; null otherwise. |
+
+#### `override` (repo override-file mutation)
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `changed` | CONTRACT | True when the override file was written (apply mode). |
+| `would_change` | CONTRACT | True when a dry-run would mutate the override file. |
+| `policy_path` | CONTRACT | Absolute path of .skillbox/skill-overrides.yaml. |
+| `pin` | CONTRACT | Override list touched: pin_on or pin_off. |
+
+#### `activation_packet` (immediate SKILL.md packet)
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `name` | CONTRACT | Skill name in the activation packet. |
+| `source` | CONTRACT | Resolved source directory backing the skill. |
+| `source_bucket` | CONTRACT | Source bucket id (external/private/etc.). |
+| `skill_md_path` | CONTRACT | Absolute path to SKILL.md used for the packet. |
+| `skill_md_sha256` | CONTRACT | SHA-256 of SKILL.md for verify consumers. |
+| `skill_md` | CONTRACT | Full SKILL.md body for immediate session use. |
+| `surface_targets` | CONTRACT | Per-surface link destinations the packet covers. |
+| `instructions` | info | Human guidance for using the packet in-session. |
+
+#### `actions[]` (one lifecycle link/unlink row)
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `op` | CONTRACT | Lifecycle op: link or unlink. |
+| `skill` | CONTRACT | Skill name for this action row. |
+| `source` | CONTRACT | Source path for link rows; prior target for unlink rows. |
+| `source_bucket` | info | Source bucket for link rows. |
+| `destination` | CONTRACT | Installed symlink path affected. |
+| `root` | CONTRACT | Skills root directory under the repo for link rows. |
+| `scope` | CONTRACT | project or global scope of the action. |
+| `surface` | CONTRACT | claude or codex surface. |
+| `category` | info | Project category when scoped by category. |
+| `repo_path` | CONTRACT | Repo root owning the destination. |
+| `existing` | CONTRACT | Prior install state at the destination. |
+| `blocked_reason` | CONTRACT | Empty when allowed; otherwise why the row is blocked. |
+| `status` | CONTRACT | Dry-run/applied status (would_link, would_unlink, linked, ...). |
+
+#### `summary` (action counters)
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `actions` | CONTRACT | Total planned/applied action rows. |
+| `link` | CONTRACT | Link action count. |
+| `unlink` | CONTRACT | Unlink action count. |
+| `blocked` | CONTRACT | Blocked action count. |
+| `skipped` | CONTRACT | Skipped action count. |
+| `applied` | CONTRACT | Applied action count (apply mode). |
+| `unchanged` | CONTRACT | Actions that left destination unchanged. |
+
+### Example payload
+
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
+
+```json
+{
+  "action": "on",
+  "actions": [
+    {
+      "blocked_reason": "",
+      "category": null,
+      "destination": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui",
+      "existing": {
+        "state": "missing"
+      },
+      "op": "link",
+      "repo_path": "<FLEET>/repos_real/overlay-repo",
+      "root": "<FLEET>/repos_real/overlay-repo/.claude/skills",
+      "scope": "project",
+      "skill": "tiny-ui",
+      "source": "<FLEET>/skills/tiny-ui",
+      "source_bucket": "external",
+      "status": "would_link",
+      "surface": "claude"
+    },
+    {
+      "blocked_reason": "",
+      "category": null,
+      "destination": "<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui",
+      "existing": {
+        "state": "missing"
+      },
+      "op": "link",
+      "repo_path": "<FLEET>/repos_real/overlay-repo",
+      "root": "<FLEET>/repos_real/overlay-repo/.codex/skills",
+      "scope": "project",
+      "skill": "tiny-ui",
+      "source": "<FLEET>/skills/tiny-ui",
+      "source_bucket": "external",
+      "status": "would_link",
+      "surface": "codex"
+    }
+  ],
+  "activation_packet": {
+    "instructions": "Use this SKILL.md content immediately in the current agent session. The filesystem links make the skill visible to future Claude and Codex sessions.",
+    "name": "tiny-ui",
+    "skill_md": "---\nname: tiny-ui\ndescription: Tiny fixture skill tiny-ui.\n---\n\n# tiny-ui\n\nFixture skill body for tiny-ui.\n",
+    "skill_md_path": "<FLEET>/skills/tiny-ui/SKILL.md",
+    "skill_md_sha256": "953824e6b88a4753851d0309b740812747d507dd780b037e47fdcea540a41e04",
+    "source": "<FLEET>/skills/tiny-ui",
+    "source_bucket": "external",
+    "surface_targets": {
+      "claude": [
+        "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui"
+      ],
+      "codex": [
+        "<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui"
+      ]
+    }
+  },
+  "categories": [],
+  "changed": false,
+  "cwd": "<FLEET>/repos_real/overlay-repo",
+  "dry_run": true,
+  "from_scope": "all",
+  "noop": false,
+  "override": {
+    "changed": false,
+    "pin": "pin_on",
+    "policy_path": "<FLEET>/repos_real/overlay-repo/.skillbox/skill-overrides.yaml",
+    "would_change": true
+  },
+  "requested_to": "project",
+  "resolved_to": "project",
+  "selected_source": {
+    "explicit": false,
+    "name": "tiny-ui",
+    "root": "<FLEET>/skills",
+    "source": "<FLEET>/skills/tiny-ui",
+    "source_bucket": "external"
+  },
+  "skill": "tiny-ui",
+  "skipped": [],
+  "source_options": [
+    {
+      "explicit": false,
+      "name": "tiny-ui",
+      "root": "<FLEET>/skills",
+      "source": "<FLEET>/skills/tiny-ui",
+      "source_bucket": "external"
+    }
+  ],
+  "summary": {
+    "actions": 2,
+    "applied": 0,
+    "blocked": 0,
+    "link": 2,
+    "skipped": 0,
+    "unchanged": 0,
+    "unlink": 0
+  },
+  "verification": null,
+  "warnings": []
+}
+```
+
+---
+
+## `sbp skill off`
+
+**Invocation:** `sbp skill off <skill> [--cwd <repo>] [--dry-run] --format json`
+**Produced by:** `_handle_skill_toggle (off / prune plan + override pin_off)`
+
+Durable repo-local pin OFF plus project unlink. Writes `pin_off` to `.skillbox/skill-overrides.yaml` and unlinks project installs. Refuses floor skills (smart/sbp). `--dry-run` previews override + unlink rows; `activation_packet` is always null.
+
+### Fields
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `action` | CONTRACT | Verb executed: 'on' or 'off'. |
+| `skill` | CONTRACT | Skill name toggled. |
+| `cwd` | CONTRACT | Absolute resolved repo cwd the toggle ran against. |
+| `requested_to` | CONTRACT | Scope the caller requested (project-only today). |
+| `resolved_to` | CONTRACT | Scope the plan resolved to. |
+| `categories` | CONTRACT | Project categories targeted when --to category (often empty). |
+| `from_scope` | CONTRACT | Installed scope considered for off/unlink (project for skill off). |
+| `source_options` | CONTRACT | Resolvable source directories for on/activate. |
+| `selected_source` | CONTRACT | Chosen source for on/activate, or null for off. |
+| `activation_packet` | CONTRACT | Immediate-use SKILL.md packet on on; null on off. |
+| `warnings` | info | Non-fatal plan warnings. |
+| `actions` | CONTRACT | Link/unlink rows the toggle would apply; see the action field table. |
+| `skipped` | CONTRACT | Skills skipped by the plan (e.g. prune firewall pinned rows). |
+| `summary` | CONTRACT | Roll-up counters for planned/applied link+unlink actions. |
+| `override` | CONTRACT | Repo override-file mutation preview/result; see the override field table. |
+| `changed` | CONTRACT | True when disk and/or override state changed (apply mode). |
+| `noop` | CONTRACT | True when neither override nor link actions would change state. |
+| `dry_run` | CONTRACT | True when the payload previews without writing. |
+| `verification` | info | Optional post-on verify block when --verify is set; null otherwise. |
+
+#### `override` (repo override-file mutation)
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `changed` | CONTRACT | True when the override file was written (apply mode). |
+| `would_change` | CONTRACT | True when a dry-run would mutate the override file. |
+| `policy_path` | CONTRACT | Absolute path of .skillbox/skill-overrides.yaml. |
+| `pin` | CONTRACT | Override list touched: pin_on or pin_off. |
+
+#### `actions[]` (one lifecycle unlink row)
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `op` | CONTRACT | Lifecycle op: link or unlink. |
+| `skill` | CONTRACT | Skill name for this action row. |
+| `destination` | CONTRACT | Installed symlink path affected. |
+| `scope` | CONTRACT | project or global scope of the action. |
+| `surface` | CONTRACT | claude or codex surface. |
+| `source` | CONTRACT | Source path for link rows; prior target for unlink rows. |
+| `layer` | info | Layer id for unlink rows derived from visibility. |
+| `reason` | info | Human reason for unlink (e.g. pin_off, prune). |
+| `existing` | CONTRACT | Prior install state at the destination. |
+| `status` | CONTRACT | Dry-run/applied status (would_link, would_unlink, linked, ...). |
+
+#### `summary` (action counters)
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `actions` | CONTRACT | Total planned/applied action rows. |
+| `link` | CONTRACT | Link action count. |
+| `unlink` | CONTRACT | Unlink action count. |
+| `blocked` | CONTRACT | Blocked action count. |
+| `skipped` | CONTRACT | Skipped action count. |
+| `applied` | CONTRACT | Applied action count (apply mode). |
+| `unchanged` | CONTRACT | Actions that left destination unchanged. |
+
+### Example payload
+
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
+
+```json
+{
+  "action": "off",
+  "actions": [
+    {
+      "destination": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-marketing",
+      "existing": {
+        "link_target": "<FLEET>/private-skills/tiny-marketing",
+        "resolved": "<FLEET>/private-skills/tiny-marketing",
+        "state": "different_link"
+      },
+      "layer": "project:claude:<FLEET>/repos_real/overlay-repo",
+      "op": "unlink",
+      "reason": "pin_off",
+      "scope": "project",
+      "skill": "tiny-marketing",
+      "source": "<FLEET>/private-skills/tiny-marketing",
+      "status": "would_unlink",
+      "surface": "claude"
+    }
+  ],
+  "activation_packet": null,
+  "categories": [],
+  "changed": false,
+  "cwd": "<FLEET>/repos_real/overlay-repo",
+  "dry_run": true,
+  "from_scope": "project",
+  "noop": false,
+  "override": {
+    "changed": false,
+    "pin": "pin_off",
+    "policy_path": "<FLEET>/repos_real/overlay-repo/.skillbox/skill-overrides.yaml",
+    "would_change": true
+  },
+  "requested_to": "project",
+  "resolved_to": "project",
+  "selected_source": null,
+  "skill": "tiny-marketing",
+  "skipped": [],
+  "source_options": [],
+  "summary": {
+    "actions": 1,
+    "applied": 0,
+    "blocked": 0,
+    "link": 0,
+    "skipped": 0,
+    "unchanged": 0,
+    "unlink": 1
+  },
+  "verification": null,
+  "warnings": []
+}
+```
+
+---
+
+## `sbp skill togglable`
+
+**Invocation:** `sbp skill togglable [--cwd <repo>] --format json`
+**Produced by:** `build_skill_togglable_payload`
+
+Write-affordance switchboard for one cwd: every skill the policy marks as flippable here, its current state (`on`, `off`, `missing_for_cwd`, `pinned_on`, `pinned_off`), who pinned it (`override` vs `policy`), and the literal `command_to_flip` to transition state. Distinct from `sbp skills` (visibility/read).
+
+### Fields
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `cwd` | CONTRACT | Absolute resolved cwd the switchboard was computed for. |
+| `items` | CONTRACT | Every flippable skill at this cwd; see the item field table. |
+
+#### `items[]` (one flippable skill row)
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `skill` | CONTRACT | Skill name. |
+| `state` | CONTRACT | on | off | missing_for_cwd | pinned_on | pinned_off. |
+| `source` | CONTRACT | Installed path when on; null when absent. |
+| `pinned_by` | CONTRACT | override when repo override lists drive state; else policy. |
+| `command_to_flip` | CONTRACT | Literal sbp skill on/off command to transition state. |
+
+### Example payload
+
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
+
+```json
+{
+  "cwd": "<FLEET>/repos_real/overlay-repo",
+  "items": [
+    {
+      "command_to_flip": "sbp skill on tiny-cli --cwd <FLEET>/repos_real/overlay-repo",
+      "pinned_by": "override",
+      "skill": "tiny-cli",
+      "source": null,
+      "state": "pinned_off"
+    },
+    {
+      "command_to_flip": "sbp skill off tiny-marketing --cwd <FLEET>/repos_real/overlay-repo",
+      "pinned_by": "policy",
+      "skill": "tiny-marketing",
+      "source": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-marketing",
+      "state": "on"
+    },
+    {
+      "command_to_flip": "sbp skill on tiny-ui --cwd <FLEET>/repos_real/overlay-repo",
+      "pinned_by": "policy",
+      "skill": "tiny-ui",
+      "source": null,
+      "state": "missing_for_cwd"
+    }
+  ]
 }
 ```
 

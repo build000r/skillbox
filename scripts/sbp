@@ -173,6 +173,7 @@ Skills:
   __WRAPPER__ skill plan NAME         Preview where NAME would be linked
   __WRAPPER__ skill add NAME          Link NAME into global/project/category roots
   __WRAPPER__ skill why NAME          Explain visibility layers and exact fixes
+  __WRAPPER__ skill togglable         List cwd-flippable skills and exact flip commands
   __WRAPPER__ skill on NAME           Durably pin NAME on for this repo
   __WRAPPER__ skill off NAME          Durably pin NAME off for this repo
   __WRAPPER__ skill default on NAME --repo --dry-run
@@ -212,6 +213,7 @@ Examples:
   __WRAPPER__ skill plan mcp-server-design
   __WRAPPER__ skill add ui --to category --category frontend
   __WRAPPER__ skill why wiki --json
+  __WRAPPER__ skill togglable --json
   __WRAPPER__ skill on wiki --verify
   __WRAPPER__ skill off wiki --dry-run
   __WRAPPER__ skill default on wiki --repo --dry-run
@@ -365,6 +367,26 @@ skill_verbs = {
         "when_to_use": "Use when choosing the narrowest correct fix for one skill.",
         "do_NOT": "Do not infer policy from memory when why can return the live layers.",
     },
+    "togglable": {
+        "purpose": "List every skill flippable at this cwd and the exact command to flip it.",
+        "mutates": "none",
+        "links_disk": False,
+        "returns_packet": False,
+        "scope": "current cwd",
+        "survives_recalibrate": False,
+        "when_to_use": "Use when you need a one-read switchboard of repo skill on/off affordances.",
+        "do_NOT": "Do not use togglable as proof a flip already happened; run the returned command to mutate state.",
+    },
+    "toggleable": {
+        "purpose": "Alias for togglable; lists every skill flippable at this cwd and the exact command to flip it.",
+        "mutates": "none",
+        "links_disk": False,
+        "returns_packet": False,
+        "scope": "current cwd",
+        "survives_recalibrate": False,
+        "when_to_use": "Use when you need a one-read switchboard of repo skill on/off affordances.",
+        "do_NOT": "Do not use toggleable as proof a flip already happened; run the returned command to mutate state.",
+    },
     "default": {
         "purpose": "Set repo or operator-global skill defaults with a reviewable unified diff.",
         "mutates": "repo_or_operator_policy",
@@ -396,6 +418,7 @@ payload = {
         {"name": "bulk", "json": True, "safe_first_try": f"{wrapper} bulk <dir> <dir> --request '<prompt>' --dry-run --json", "alias_for": "launch"},
         {"name": "skills", "json": True, "safe_first_try": f"{wrapper} skills --issues-only --json"},
         {"name": "skill-why", "json": True, "safe_first_try": f"{wrapper} skill why <skill> --json"},
+        {"name": "skill-togglable", "json": True, "safe_first_try": f"{wrapper} skill togglable --json"},
         {"name": "skill-heal", "json": True, "safe_first_try": f"{wrapper} skill heal <skill> --dry-run --format json"},
         {"name": "candidates", "json": True, "safe_first_try": f"{wrapper} candidates --json"},
         {"name": "mcp", "json": True, "safe_first_try": f"{wrapper} mcp --json"},
