@@ -210,6 +210,7 @@ KNOWN_LOCAL_RUNTIME_CODES = frozenset({
     "LOCAL_RUNTIME_ENV_OUTPUT_MISSING",
     "LOCAL_RUNTIME_PROFILE_UNKNOWN",
     "LOCAL_RUNTIME_START_BLOCKED",
+    "LOCAL_RUNTIME_PORT_MISMATCH",
     "LOCAL_RUNTIME_SERVICE_DEFERRED",
     "LOCAL_RUNTIME_MODE_UNSUPPORTED",
     "LOCAL_RUNTIME_COVERAGE_GAP",
@@ -303,7 +304,7 @@ class KnownCodesSnapshotTests(unittest.TestCase):
     def test_full_known_codes_snapshot_is_frozen(self) -> None:
         # The single enumeration the acceptance criterion references. Adding or
         # renaming a code requires editing this snapshot ON PURPOSE.
-        self.assertEqual(len(KNOWN_ERROR_CODES), 38)
+        self.assertEqual(len(KNOWN_ERROR_CODES), 39)
 
 
 if __name__ == "__main__":

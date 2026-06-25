@@ -3977,6 +3977,11 @@ def _up_start_result(
     payload["ingress_actions"] = ingress_actions
     if not has_failure:
         return EXIT_OK, payload
+    specific_error = first_service_error_payload(started)
+    if specific_error is not None:
+        payload.update(specific_error)
+        payload["error"]["requested_mode"] = requested_mode
+        return EXIT_ERROR, payload
     failed_ids = _up_failed_service_ids(started)
     payload.update(local_runtime_error(
         LOCAL_RUNTIME_START_BLOCKED,

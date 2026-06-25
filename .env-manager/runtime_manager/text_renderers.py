@@ -413,6 +413,12 @@ def print_local_runtime_error_text(err: dict[str, Any]) -> None:
     if next_action:
         print(f"next action: {next_action}", file=sys.stderr)
 
+    next_actions = error_block.get("next_actions") or []
+    if next_actions:
+        print("next actions:", file=sys.stderr)
+        for action in next_actions:
+            print(f"  - {action}", file=sys.stderr)
+
 
 def print_service_actions_text(payload: dict[str, Any]) -> None:
     warnings = payload.get("warnings") or []
