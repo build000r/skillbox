@@ -27,8 +27,10 @@ from runtime_manager.policy_eval import (  # noqa: E402
 )
 from runtime_manager.skill_visibility import (  # noqa: E402
     active_overlays,
+    apply_skill_lifecycle_plan,
     collect_skill_visibility,
     explain_skill_visibility,
+    skill_lifecycle_plan,
 )
 from tests.fixture_fleet import build_fixture_fleet  # noqa: E402
 
@@ -57,6 +59,41 @@ def _write_project_skill(repo: Path, name: str) -> None:
     skill_dir = repo / ".codex" / "skills" / name
     skill_dir.mkdir(parents=True, exist_ok=True)
     (skill_dir / "SKILL.md").write_text(f"# {name}\n", encoding="utf-8")
+
+
+def _write_source_skill(root: Path, name: str) -> Path:
+    source = root / name
+    source.mkdir(parents=True, exist_ok=True)
+    (source / "SKILL.md").write_text(f"# {name}\n", encoding="utf-8")
+    return source
+
+
+def _install_project_skill(repo: Path, name: str, source: Path, *, surface: str = "claude") -> Path:
+    install_root = repo / f".{surface}" / "skills"
+    install_root.mkdir(parents=True, exist_ok=True)
+    link = install_root / name
+    link.symlink_to(source, target_is_directory=True)
+    return link
+
+
+def _write_scope_policy(root: Path, source_root: Path, skill_name: str, allowed_path: Path) -> dict[str, object]:
+    clients_root = root / "clients"
+    clients_root.mkdir(exist_ok=True)
+    (root / "skill-scope.yaml").write_text(
+        "version: 1\n"
+        "skill_source_roots:\n"
+        f"  - {source_root}\n"
+        "rules:\n"
+        "  - id: skill-scope\n"
+        f"    skills: [{skill_name}]\n"
+        f"    paths: [{allowed_path}]\n",
+        encoding="utf-8",
+    )
+    return {
+        "env": {"SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root)},
+        "clients": [],
+        "skills": [],
+    }
 
 
 def _override_writer_worker(repo_path: str, name: str) -> None:
@@ -334,6 +371,57 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
         self.assertFalse(explanation["visible"])
         self.assertEqual(explanation["winner"]["state"], "broken")
         self.assertIn("no installed occurrence or source was found", explanation["reason"])
+
+    def test_prune_firewall_skips_pinned_override_at_plan_construction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            fake_home = root / "home"
+            allowed = root / "allowed"
+            source_root = root / "sources"
+            allowed.mkdir()
+            source = _write_source_skill(source_root, "alpha")
+            link = _install_project_skill(repo, "alpha", source)
+            _write_override(repo, "version: 1\npin_on: [alpha]\n")
+            model = _write_scope_policy(root, source_root, "alpha", allowed)
+
+            with mock.patch("runtime_manager.skill_visibility.Path.home", return_value=fake_home):
+                dry_plan = skill_lifecycle_plan(model, "prune", cwd=str(repo), from_scope="project")
+                applied_plan = skill_lifecycle_plan(model, "prune", cwd=str(repo), from_scope="project")
+                dry = apply_skill_lifecycle_plan(dry_plan, dry_run=True)
+                applied = apply_skill_lifecycle_plan(applied_plan, dry_run=False)
+
+            self.assertEqual(dry["actions"], [])
+            self.assertEqual(applied["actions"], [])
+            self.assertEqual(dry["skipped"], applied["skipped"])
+            self.assertEqual(dry["skipped"][0]["name"], "alpha")
+            self.assertEqual(dry["skipped"][0]["reason"], "pinned")
+            self.assertEqual(dry["summary"]["skipped"], 1)
+            self.assertTrue(link.is_symlink())
+
+    def test_prune_firewall_unlinks_pin_off_even_without_visibility_issue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            fake_home = root / "home"
+            source_root = root / "sources"
+            source = _write_source_skill(source_root, "alpha")
+            link = _install_project_skill(repo, "alpha", source)
+            _write_override(repo, "version: 1\npin_off: [alpha]\n")
+            model = _write_scope_policy(root, source_root, "alpha", repo)
+
+            with mock.patch("runtime_manager.skill_visibility.Path.home", return_value=fake_home):
+                dry_plan = skill_lifecycle_plan(model, "prune", cwd=str(repo), from_scope="project")
+                applied_plan = skill_lifecycle_plan(model, "prune", cwd=str(repo), from_scope="project")
+                dry = apply_skill_lifecycle_plan(dry_plan, dry_run=True)
+                applied = apply_skill_lifecycle_plan(applied_plan, dry_run=False)
+
+            self.assertEqual(dry["skipped"], [])
+            self.assertEqual(len(dry["actions"]), 1)
+            self.assertEqual(dry["actions"][0]["reason"], "pin_off")
+            self.assertEqual(dry["actions"][0]["destination"], str(link))
+            self.assertEqual(applied["actions"][0]["status"], "unlinked")
+            self.assertFalse(link.exists())
 
     def test_overlay_precedence_cli_env_repo_operator_base_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
