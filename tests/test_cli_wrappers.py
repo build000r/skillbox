@@ -567,6 +567,110 @@ class CliWrapperTests(unittest.TestCase):
                 ],
             )
 
+    def test_sbp_recalibrate_auto_fix_previews_heal_for_missing_skills(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox_with_missing_skills(root / "skillbox")
+            downstream = root / "downstream"
+            downstream.mkdir()
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "recalibrate",
+                "--auto-fix",
+                fake_root=fake_root,
+                invoke_cwd=downstream,
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("auto-fix missing repo-local skills:", result.stdout)
+            self.assertIn("mode: dry-run (pass --yes to apply)", result.stdout)
+            calls = json.loads(record_path.read_text(encoding="utf-8"))
+            heal_calls = [
+                item["argv"] for item in calls
+                if item["argv"][:2] == ["skill", "heal"]
+            ]
+            self.assertEqual(
+                heal_calls,
+                [
+                    [
+                        "skill",
+                        "heal",
+                        "alpha",
+                        "--profile",
+                        "local-all",
+                        "--cwd",
+                        str(downstream),
+                        "--dry-run",
+                        "--format",
+                        "json",
+                    ],
+                    [
+                        "skill",
+                        "heal",
+                        "beta",
+                        "--profile",
+                        "local-all",
+                        "--cwd",
+                        str(downstream),
+                        "--dry-run",
+                        "--format",
+                        "json",
+                    ],
+                ],
+            )
+
+    def test_sbp_recalibrate_auto_fix_yes_applies_heal_for_missing_skills(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox_with_missing_skills(root / "skillbox")
+            downstream = root / "downstream"
+            downstream.mkdir()
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "recalibrate",
+                "--auto-fix",
+                "--yes",
+                fake_root=fake_root,
+                invoke_cwd=downstream,
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("mode: apply (--yes)", result.stdout)
+            self.assertIn('"activation_packet"', result.stdout)
+            calls = json.loads(record_path.read_text(encoding="utf-8"))
+            heal_calls = [
+                item["argv"] for item in calls
+                if item["argv"][:2] == ["skill", "heal"]
+            ]
+            self.assertEqual(len(heal_calls), 2)
+            self.assertTrue(all("--dry-run" not in call for call in heal_calls))
+            self.assertEqual([call[2] for call in heal_calls], ["alpha", "beta"])
+
+    def test_sbp_recalibrate_auto_fix_rejects_fleet_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            downstream = root / "downstream"
+            downstream.mkdir()
+
+            result = self._run_wrapper(
+                SBP,
+                "recalibrate",
+                "--fleet",
+                "--auto-fix",
+                fake_root=fake_root,
+                invoke_cwd=downstream,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("--auto-fix is cwd-only", result.stderr)
+
     def test_sbp_mcp_maps_to_mcp_audit_for_downstream_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -906,6 +1010,56 @@ class CliWrapperTests(unittest.TestCase):
                 with open(os.environ["SKILLBOX_RECORD"], "w", encoding="utf-8") as handle:
                     json.dump(payload, handle)
                 print(json.dumps(payload))
+                """
+            ),
+            encoding="utf-8",
+        )
+        return root
+
+    def _make_fake_skillbox_with_missing_skills(self, root: Path) -> Path:
+        env_dir = root / ".env-manager"
+        env_dir.mkdir(parents=True)
+        (env_dir / "manage.py").write_text(
+            textwrap.dedent(
+                """\
+                from __future__ import annotations
+
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                record_path = Path(os.environ["SKILLBOX_RECORD"])
+                if record_path.exists() and record_path.read_text(encoding="utf-8"):
+                    rows = json.loads(record_path.read_text(encoding="utf-8"))
+                else:
+                    rows = []
+                rows.append({"argv": sys.argv[1:], "cwd": os.getcwd()})
+                record_path.write_text(json.dumps(rows), encoding="utf-8")
+
+                argv = sys.argv[1:]
+                payload = {
+                    "issues": {
+                        "missing_for_cwd": [
+                            {"name": "alpha"},
+                            {"name": "beta"},
+                            {"name": "alpha"},
+                        ]
+                    },
+                    "beads": {"required": False},
+                    "summary": {},
+                }
+                if argv[:1] == ["skills"] and "--format" in argv and "json" in argv:
+                    print(json.dumps(payload))
+                elif argv[:2] == ["skill", "heal"]:
+                    skill = argv[2]
+                    print(json.dumps({
+                        "action": "heal",
+                        "skill": skill,
+                        "activation_packet": {"name": skill, "skill_md_sha256": "sha"},
+                    }))
+                else:
+                    print("ok")
                 """
             ),
             encoding="utf-8",

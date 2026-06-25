@@ -147,7 +147,7 @@ Usage:
   __WRAPPER__ logs [profile] service  Show service logs
   __WRAPPER__ launch DIR... --request "..."  Launch one Swimmers agent per dir
   __WRAPPER__ bulk DIR... --request "..."    Alias for launch
-  __WRAPPER__ recalibrate [args...]   Read-only cwd skill add/remove recalibration
+  __WRAPPER__ recalibrate [args...]   Read cwd skill drift; --auto-fix previews heal, --yes applies
   __WRAPPER__ candidates [args...]    Explore linkable skill sources for this cwd
   __WRAPPER__ mcp [args...]           Read-only Claude JSON / Codex TOML MCP audit
   __WRAPPER__ doctor [--format json]  One front door for all STRUCTURAL gates
@@ -202,6 +202,7 @@ Examples:
   __WRAPPER__ skills --issues-only
   __WRAPPER__ candidates --json
   __WRAPPER__ recalibrate
+  __WRAPPER__ recalibrate --auto-fix
   __WRAPPER__ mcp
   __WRAPPER__ beads status
   __WRAPPER__ beads init
@@ -232,14 +233,14 @@ wrapper = sys.argv[1]
 cwd = sys.argv[2]
 skill_verbs = {
     "recalibrate": {
-        "purpose": "Read-only cwd/fleet skill visibility audit with exact next commands.",
+        "purpose": "Read-only cwd/fleet skill visibility audit with exact next commands; --auto-fix previews heal, --yes applies.",
         "mutates": "none",
         "links_disk": False,
         "returns_packet": False,
         "scope": "cwd or fleet",
         "survives_recalibrate": False,
         "when_to_use": "Use first when unsure what the repo or fleet needs.",
-        "do_NOT": "Do not treat recalibrate as a mutator; it recommends commands.",
+        "do_NOT": "Do not treat bare recalibrate as a mutator; --auto-fix previews and --auto-fix --yes applies heal.",
     },
     "plan": {
         "purpose": "Preview where a skill lifecycle operation would install or remove links.",
@@ -460,6 +461,7 @@ Safe mutation pattern:
   ${wrapper_name} down <profile> <service> --dry-run --json
   ${wrapper_name} restart <profile> <service> --dry-run --json
   ${wrapper_name} launch <dir> <dir> --request "..." --dry-run --json
+  ${wrapper_name} recalibrate --auto-fix
 
 Skill verb contract:
   Machine map: ${wrapper_name} capabilities --json | jq .skill_verbs
@@ -467,6 +469,7 @@ Skill verb contract:
   Session handoff: activate (mutates=cwd-ephemeral, returns_packet=true)
   Durable repo pins: on, off, heal (survive recalibrate)
   Link-only maintenance: add, move, remove, prune, sync
+  Missing-skill fold: ${wrapper_name} recalibrate --auto-fix previews heal; add --yes to apply
 
 Batch launcher:
   ${wrapper_name} launch <dir> <dir> --request 'Audit auth drift' --dry-run --json
@@ -1043,6 +1046,8 @@ PY
     ;;
   recalibrate)
     recalibrate_fleet="false"
+    recalibrate_auto_fix="false"
+    recalibrate_apply="false"
     recalibrate_cwd="${invoke_cwd}"
     recalibrate_args=()
     index=0
@@ -1051,6 +1056,12 @@ PY
       case "${token}" in
         --fleet|fleet|--all-repos)
           recalibrate_fleet="true"
+          ;;
+        --auto-fix)
+          recalibrate_auto_fix="true"
+          ;;
+        --yes)
+          recalibrate_apply="true"
           ;;
         --cwd)
           index=$((index + 1))
@@ -1070,6 +1081,10 @@ PY
       index=$((index + 1))
     done
     if [[ "${recalibrate_fleet}" == "true" ]]; then
+      if [[ "${recalibrate_auto_fix}" == "true" ]]; then
+        echo "sbp recalibrate: --auto-fix is cwd-only; omit --fleet or use fleet converge dry-runs" >&2
+        exit 2
+      fi
       python3 .env-manager/manage.py skill-audit "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" "${recalibrate_args[@]}"
       echo
       echo "review dry-runs before applying:"
@@ -1093,6 +1108,54 @@ PY
       echo
       echo "remove repo-local policy violations:"
       python3 .env-manager/manage.py skill prune "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --from project --dry-run || true
+      if [[ "${recalibrate_auto_fix}" == "true" ]]; then
+        echo
+        echo "auto-fix missing repo-local skills:"
+        if [[ "${recalibrate_apply}" == "true" ]]; then
+          echo "mode: apply (--yes)"
+        else
+          echo "mode: dry-run (pass --yes to apply)"
+        fi
+        missing_json="$(mktemp)"
+        missing_names="$(mktemp)"
+        if ! python3 .env-manager/manage.py skills "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --issues-only --no-global --format json > "${missing_json}"; then
+          printf '{}\n' > "${missing_json}"
+        fi
+        python3 - "${missing_json}" > "${missing_names}" <<'PY'
+from __future__ import annotations
+
+import json
+import sys
+
+try:
+    payload = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    payload = {}
+names: list[str] = []
+seen: set[str] = set()
+for item in ((payload.get("issues") or {}).get("missing_for_cwd") or []):
+    name = str(item.get("name") or item.get("skill") or "").strip()
+    if not name or name in seen:
+        continue
+    seen.add(name)
+    names.append(name)
+for name in names:
+    print(name)
+PY
+        if [[ ! -s "${missing_names}" ]]; then
+          echo "  none"
+        else
+          while IFS= read -r missing_skill; do
+            [[ -z "${missing_skill}" ]] && continue
+            if [[ "${recalibrate_apply}" == "true" ]]; then
+              python3 .env-manager/manage.py skill heal "${missing_skill}" "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --format json || true
+            else
+              python3 .env-manager/manage.py skill heal "${missing_skill}" "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --dry-run --format json || true
+            fi
+          done < "${missing_names}"
+        fi
+        rm -f "${missing_json}" "${missing_names}"
+      fi
       echo
       echo "beads graph:"
       python3 .env-manager/manage.py skills "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --issues-only --format json \
