@@ -274,6 +274,7 @@ REQUIRED_TIER1_IDS = frozenset(
 REQUIRED_TIER2_IDS = frozenset(
     {
         "runtime.status",
+        "runtime.registry_docs",
         "runtime.doctor",
         "runtime.structure_doctor",
         "runtime.render",
@@ -491,6 +492,32 @@ def default_registry() -> tuple[CommandSpec, ...]:
             graph_nodes=("snapshot", "diff", "evidence"),
         ),
         # ---- Tier 2: existing runtime CLI / MCP surfaces ----
+        CommandSpec(
+            id="runtime.registry_docs",
+            tier=2,
+            surface=("cli",),
+            summary="Render the human-readable API reference from the shared command registry.",
+            inputs={"format": "enum[md|json]?", "write": "boolean?"},
+            outputs={
+                "ok": "boolean",
+                "abi_version": "string",
+                "count": "integer",
+                "path": "string",
+                "written": "boolean",
+                "bytes": "integer",
+                "sha256": "string",
+                "content": "string?",
+            },
+            side_effect="local_write",
+            risk="low",
+            entrypoint="manage.py",
+            examples=(
+                "python3 .env-manager/manage.py registry-docs --format md",
+                "python3 .env-manager/manage.py registry-docs --write --format json",
+            ),
+            validations=("python3 -m unittest tests.test_registry_docs",),
+            graph_nodes=("command", "doc"),
+        ),
         CommandSpec(
             id="runtime.status",
             tier=2,

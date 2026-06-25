@@ -46,6 +46,7 @@ from .forge import *
 from .swimmers_launch import launch_swimmers_batch, swimmers_launch_text_lines
 from .structure_doctor import run_structure_doctor, structure_doctor_text_lines
 from .command_registry import registry_payload
+from .registry_docs import registry_docs_payload
 from .port_registry import port_registry_payload, port_registry_text_lines
 from .agent_adapters import collect_agent_adapter_evidence
 from .agent_graph import build_agent_graph, build_agent_graph_payload
@@ -114,6 +115,7 @@ MANAGE_COMMAND_NAMES = {
     "rch-report",
     "sbh-report",
     "render",
+    "registry-docs",
     "restart",
     "robot-docs",
     "robot-triage",
@@ -409,6 +411,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-adapters",
         action="store_true",
         help=argparse.SUPPRESS,
+    )
+
+    registry_docs_parser = subparsers.add_parser(
+        "registry-docs",
+        help="Render docs/API_REFERENCE.md from the command registry.",
+    )
+    registry_docs_parser.add_argument("--format", choices=("md", "json"), default="md")
+    registry_docs_parser.add_argument(
+        "--write",
+        action="store_true",
+        help="Write docs/API_REFERENCE.md instead of only printing the generated reference.",
     )
 
     robot_docs_parser = subparsers.add_parser(
@@ -3185,6 +3198,8 @@ def _safe_first_try_command(name: str) -> str:
         return "manage.py explain brain.next --format json --no-adapters"
     if name == "snap":
         return "manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json"
+    if name == "registry-docs":
+        return "manage.py registry-docs --format md"
     if name in {"client-init"}:
         return "manage.py client-init --list-blueprints --format json"
     if name in {"client-project"}:
@@ -3274,6 +3289,19 @@ Pressure/offload rule:
 
 def _handle_capabilities(args: argparse.Namespace, root_dir: Path) -> int:
     emit_json(_capabilities_payload(root_dir, compact=bool(getattr(args, "compact", False))))
+    return EXIT_OK
+
+
+def _handle_registry_docs(args: argparse.Namespace, root_dir: Path) -> int:
+    payload = registry_docs_payload(
+        root_dir,
+        write=bool(getattr(args, "write", False)),
+        include_content=args.format == "md",
+    )
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print(payload["content"], end="")
     return EXIT_OK
 
 
@@ -3683,6 +3711,7 @@ def _handle_cass_evidence(args: argparse.Namespace, root_dir: Path) -> int:
 _EARLY_DISPATCH: dict[str, Callable[[argparse.Namespace, Path], int]] = {
     "cass-evidence": _handle_cass_evidence,
     "capabilities": _handle_capabilities,
+    "registry-docs": _handle_registry_docs,
     "robot-docs": _handle_robot_docs,
     "robot-triage": _handle_robot_triage,
     "pressure-report": _handle_pressure_report,
