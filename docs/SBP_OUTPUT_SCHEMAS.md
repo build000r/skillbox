@@ -178,6 +178,7 @@ The wrapper discovery contract. Agents should start here to learn the stable com
       "safe_first_try": "sbp registry doctor --json"
     },
     {
+      "fallback": "If status is error/degraded/stale during active work, report degraded_cass evidence mode and use the local transcript scanner; do not rebuild Cass mid-task.",
       "json": true,
       "name": "cass",
       "safe_first_try": "sbp cass status --json"
