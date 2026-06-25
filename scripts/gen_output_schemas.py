@@ -59,6 +59,9 @@ for _path in (ENV_MANAGER_DIR, TESTS_DIR):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
+from argparse import Namespace
+
+from runtime_manager import cli as runtime_cli  # noqa: E402
 from runtime_manager import fleet_converge as fc  # noqa: E402
 from runtime_manager import lifecycle as lc  # noqa: E402
 from runtime_manager.machines import MachineProfile, MachinesConfig  # noqa: E402
@@ -279,6 +282,96 @@ FIELD_NOTES: dict[str, dict[str, tuple[str, str]]] = {
 FIELD_NOTES["candidates"] = dict(FIELD_NOTES["skills"]) | {
     "source_roots": (CONTRACT, "Every skill source root discovered under the configured roots — the linkable universe."),
     "undefined_sources": (CONTRACT, "Linkable source skills with no policy occurrence — the candidate pool."),
+}
+
+# `sbp skill why` routes to the same explain payload as `sbp explain`.
+FIELD_NOTES["skill_why"] = dict(FIELD_NOTES["explain"])
+
+_SKILL_TOGGLE_NOTES: dict[str, tuple[str, str]] = {
+    "action": (CONTRACT, "Verb executed: 'on' or 'off'."),
+    "skill": (CONTRACT, "Skill name toggled."),
+    "cwd": (CONTRACT, "Absolute resolved repo cwd the toggle ran against."),
+    "requested_to": (CONTRACT, "Scope the caller requested (project-only today)."),
+    "resolved_to": (CONTRACT, "Scope the plan resolved to."),
+    "categories": (CONTRACT, "Project categories targeted when --to category (often empty)."),
+    "from_scope": (CONTRACT, "Installed scope considered for off/unlink (project for skill off)."),
+    "source_options": (CONTRACT, "Resolvable source directories for on/activate."),
+    "selected_source": (CONTRACT, "Chosen source for on/activate, or null for off."),
+    "activation_packet": (CONTRACT, "Immediate-use SKILL.md packet on on; null on off."),
+    "warnings": (INFO, "Non-fatal plan warnings."),
+    "actions": (CONTRACT, "Link/unlink rows the toggle would apply; see the action field table."),
+    "skipped": (CONTRACT, "Skills skipped by the plan (e.g. prune firewall pinned rows)."),
+    "summary": (CONTRACT, "Roll-up counters for planned/applied link+unlink actions."),
+    "dry_run": (CONTRACT, "True when the payload previews without writing."),
+    "override": (CONTRACT, "Repo override-file mutation preview/result; see the override field table."),
+    "changed": (CONTRACT, "True when disk and/or override state changed (apply mode)."),
+    "noop": (CONTRACT, "True when neither override nor link actions would change state."),
+    "verification": (INFO, "Optional post-on verify block when --verify is set; null otherwise."),
+}
+FIELD_NOTES["skill_on"] = dict(_SKILL_TOGGLE_NOTES)
+FIELD_NOTES["skill_off"] = dict(_SKILL_TOGGLE_NOTES)
+
+FIELD_NOTES["skill_on.override"] = {
+    "changed": (CONTRACT, "True when the override file was written (apply mode)."),
+    "pin": (CONTRACT, "Override list touched: pin_on or pin_off."),
+    "policy_path": (CONTRACT, "Absolute path of .skillbox/skill-overrides.yaml."),
+    "would_change": (CONTRACT, "True when a dry-run would mutate the override file."),
+}
+FIELD_NOTES["skill_off.override"] = dict(FIELD_NOTES["skill_on.override"])
+
+_FIELD_NOTES_SKILL_ACTIVATION_PACKET = {
+    "name": (CONTRACT, "Skill name in the activation packet."),
+    "source": (CONTRACT, "Resolved source directory backing the skill."),
+    "source_bucket": (CONTRACT, "Source bucket id (external/private/etc.)."),
+    "skill_md_path": (CONTRACT, "Absolute path to SKILL.md used for the packet."),
+    "skill_md_sha256": (CONTRACT, "SHA-256 of SKILL.md for verify consumers."),
+    "skill_md": (CONTRACT, "Full SKILL.md body for immediate session use."),
+    "surface_targets": (CONTRACT, "Per-surface link destinations the packet covers."),
+    "instructions": (INFO, "Human guidance for using the packet in-session."),
+}
+FIELD_NOTES["skill_on.activation_packet"] = dict(_FIELD_NOTES_SKILL_ACTIVATION_PACKET)
+
+_FIELD_NOTES_SKILL_LIFECYCLE_ACTION = {
+    "op": (CONTRACT, "Lifecycle op: link or unlink."),
+    "skill": (CONTRACT, "Skill name for this action row."),
+    "source": (CONTRACT, "Source path for link rows; prior target for unlink rows."),
+    "destination": (CONTRACT, "Installed symlink path affected."),
+    "scope": (CONTRACT, "project or global scope of the action."),
+    "surface": (CONTRACT, "claude or codex surface."),
+    "status": (CONTRACT, "Dry-run/applied status (would_link, would_unlink, linked, ...)."),
+    "blocked_reason": (CONTRACT, "Empty when allowed; otherwise why the row is blocked."),
+    "reason": (INFO, "Human reason for unlink (e.g. pin_off, prune)."),
+    "repo_path": (CONTRACT, "Repo root owning the destination."),
+    "root": (CONTRACT, "Skills root directory under the repo for link rows."),
+    "existing": (CONTRACT, "Prior install state at the destination."),
+    "category": (INFO, "Project category when scoped by category."),
+    "source_bucket": (INFO, "Source bucket for link rows."),
+    "layer": (INFO, "Layer id for unlink rows derived from visibility."),
+}
+FIELD_NOTES["skill_on.action"] = dict(_FIELD_NOTES_SKILL_LIFECYCLE_ACTION)
+FIELD_NOTES["skill_off.action"] = dict(_FIELD_NOTES_SKILL_LIFECYCLE_ACTION)
+
+FIELD_NOTES["skill_on.summary"] = {
+    "actions": (CONTRACT, "Total planned/applied action rows."),
+    "link": (CONTRACT, "Link action count."),
+    "unlink": (CONTRACT, "Unlink action count."),
+    "blocked": (CONTRACT, "Blocked action count."),
+    "skipped": (CONTRACT, "Skipped action count."),
+    "applied": (CONTRACT, "Applied action count (apply mode)."),
+    "unchanged": (CONTRACT, "Actions that left destination unchanged."),
+}
+FIELD_NOTES["skill_off.summary"] = dict(FIELD_NOTES["skill_on.summary"])
+
+FIELD_NOTES["skill_togglable"] = {
+    "cwd": (CONTRACT, "Absolute resolved cwd the switchboard was computed for."),
+    "items": (CONTRACT, "Every flippable skill at this cwd; see the item field table."),
+}
+FIELD_NOTES["skill_togglable.item"] = {
+    "skill": (CONTRACT, "Skill name."),
+    "state": (CONTRACT, "on | off | missing_for_cwd | pinned_on | pinned_off."),
+    "source": (CONTRACT, "Installed path when on; null when absent."),
+    "pinned_by": (CONTRACT, "override when repo override lists drive state; else policy."),
+    "command_to_flip": (CONTRACT, "Literal sbp skill on/off command to transition state."),
 }
 
 
@@ -621,6 +714,104 @@ def example_recalibrate() -> dict[str, Any]:
     return _fleet_example(run)
 
 
+def _skill_toggle_args(
+    fleet: FixtureFleetT,
+    *,
+    repo: str,
+    action: str,
+    skill_name: str,
+    dry_run: bool = True,
+) -> Namespace:
+    return Namespace(
+        skill_action=action,
+        skill_name=skill_name,
+        cwd=str(fleet.repo(repo)),
+        to="project",
+        from_scope="project",
+        category=[],
+        source=None,
+        dry_run=dry_run,
+        verify=False,
+        allow_directories=False,
+        force=False,
+    )
+
+
+def _skill_toggle_payload(
+    fleet: FixtureFleetT,
+    *,
+    repo: str,
+    action: str,
+    skill_name: str,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    args = _skill_toggle_args(
+        fleet, repo=repo, action=action, skill_name=skill_name, dry_run=dry_run,
+    )
+    return runtime_cli._handle_skill_toggle(args, fleet.model(), dry_run=dry_run)
+
+
+def build_skill_togglable_payload(
+    model: dict[str, Any],
+    *,
+    cwd: str | Path,
+) -> dict[str, Any]:
+    """Write-affordance switchboard: every skill flippable at one cwd."""
+    return runtime_cli._build_skill_togglable_payload(model, cwd=cwd)
+
+
+def example_skill_why() -> dict[str, Any]:
+    """`sbp skill why <skill>` — absence diagnosis with exact fix command."""
+
+    def run(fleet: FixtureFleetT, _tmp: str) -> dict[str, Any]:
+        return sv.explain_skill_visibility(
+            fleet.model(),
+            "needs-beads",
+            cwd=str(fleet.repo("overlay-repo")),
+            include_global=False,
+            include_project=True,
+        )
+
+    return _fleet_example(run)
+
+
+def example_skill_on() -> dict[str, Any]:
+    """`sbp skill on <skill> --dry-run --format json` — missing_for_cwd link preview."""
+
+    def run(fleet: FixtureFleetT, _tmp: str) -> dict[str, Any]:
+        return _skill_toggle_payload(
+            fleet, repo="overlay-repo", action="on", skill_name="tiny-ui", dry_run=True,
+        )
+
+    return _fleet_example(run)
+
+
+def example_skill_off() -> dict[str, Any]:
+    """`sbp skill off <skill> --dry-run --format json` — unlink preview for an installed skill."""
+
+    def run(fleet: FixtureFleetT, _tmp: str) -> dict[str, Any]:
+        return _skill_toggle_payload(
+            fleet,
+            repo="overlay-repo",
+            action="off",
+            skill_name="tiny-marketing",
+            dry_run=True,
+        )
+
+    return _fleet_example(run)
+
+
+def example_skill_togglable() -> dict[str, Any]:
+    """`sbp skill togglable --json` — write-affordance switchboard at the overlay repo."""
+
+    def run(fleet: FixtureFleetT, _tmp: str) -> dict[str, Any]:
+        return build_skill_togglable_payload(
+            fleet.model(), cwd=fleet.repo("overlay-repo"),
+        )
+
+    return _fleet_example(run)
+
+
 def example_explain() -> dict[str, Any]:
     """`sbp explain <skill>` — the invisible-but-activatable case (richest remediation)."""
 
@@ -704,7 +895,7 @@ SURFACES: list[dict[str, Any]] = [
             "The wrapper discovery contract. Agents should start here to learn the stable "
             "command inventory, stdout/stderr rules, dry-run guidance, and the machine-readable "
             "`skill_verbs` decision map for choosing between recalibrate/activate/sync/prune/"
-            "on/off/heal/why and maintenance verbs."
+            "on/off/heal/why/togglable and maintenance verbs."
         ),
         "example": example_capabilities,
         "nested": [("capabilities.skill_verb", "`skill_verbs.<verb>` (one skill verb row)", None)],
@@ -770,6 +961,73 @@ SURFACES: list[dict[str, Any]] = [
             ("recalibrate.beads", "`beads` (beads requirement/readiness)", None),
             ("recalibrate.fix", "`fixes[]` (one machine-actionable remediation row)", None),
         ],
+    },
+    {
+        "key": "skill_why",
+        "command": "sbp skill why",
+        "long": "`sbp skill why <skill> [--cwd <repo>] --format json`",
+        "fn": "explain_skill_visibility",
+        "intro": (
+            "Read-only provenance for ONE skill at ONE cwd, including absence. Same payload "
+            "shape as `sbp explain` but routed through the `skill why` verb. Walks the "
+            "precedence spine, names the winning layer (if any), and — when invisible — emits "
+            "ranked remediation rows with literal `command` strings agents can run without "
+            "re-deriving policy."
+        ),
+        "example": example_skill_why,
+        "nested": [],
+    },
+    {
+        "key": "skill_on",
+        "command": "sbp skill on",
+        "long": "`sbp skill on <skill> [--cwd <repo>] [--dry-run] --format json`",
+        "fn": "_handle_skill_toggle (on / activate plan + override pin_on)",
+        "intro": (
+            "Durable repo-local pin ON plus disk links. Writes `pin_on` to "
+            "`.skillbox/skill-overrides.yaml` (survives recalibrate) and links project "
+            "skills when needed. Returns an `activation_packet` for immediate session use. "
+            "`--dry-run` previews override + link actions without writing; a repeat apply "
+            "is a clean no-op (`noop: true`)."
+        ),
+        "example": example_skill_on,
+        "nested": [
+            ("skill_on.override", "`override` (repo override-file mutation)", None),
+            ("skill_on.activation_packet", "`activation_packet` (immediate SKILL.md packet)", None),
+            ("skill_on.action", "`actions[]` (one lifecycle link/unlink row)", None),
+            ("skill_on.summary", "`summary` (action counters)", None),
+        ],
+    },
+    {
+        "key": "skill_off",
+        "command": "sbp skill off",
+        "long": "`sbp skill off <skill> [--cwd <repo>] [--dry-run] --format json`",
+        "fn": "_handle_skill_toggle (off / prune plan + override pin_off)",
+        "intro": (
+            "Durable repo-local pin OFF plus project unlink. Writes `pin_off` to "
+            "`.skillbox/skill-overrides.yaml` and unlinks project installs. Refuses floor "
+            "skills (smart/sbp). `--dry-run` previews override + unlink rows; `activation_packet` "
+            "is always null."
+        ),
+        "example": example_skill_off,
+        "nested": [
+            ("skill_off.override", "`override` (repo override-file mutation)", None),
+            ("skill_off.action", "`actions[]` (one lifecycle unlink row)", None),
+            ("skill_off.summary", "`summary` (action counters)", None),
+        ],
+    },
+    {
+        "key": "skill_togglable",
+        "command": "sbp skill togglable",
+        "long": "`sbp skill togglable [--cwd <repo>] --format json`",
+        "fn": "build_skill_togglable_payload",
+        "intro": (
+            "Write-affordance switchboard for one cwd: every skill the policy marks as "
+            "flippable here, its current state (`on`, `off`, `missing_for_cwd`, `pinned_on`, "
+            "`pinned_off`), who pinned it (`override` vs `policy`), and the literal "
+            "`command_to_flip` to transition state. Distinct from `sbp skills` (visibility/read)."
+        ),
+        "example": example_skill_togglable,
+        "nested": [("skill_togglable.item", "`items[]` (one flippable skill row)", None)],
     },
     {
         "key": "explain",
@@ -843,6 +1101,18 @@ def _first_nested(example: dict[str, Any], notes_key: str) -> dict[str, Any] | N
     if leaf == "fix":
         fixes = example.get("fixes") or []
         return fixes[0] if fixes else None
+    if leaf == "override":
+        return example.get("override") or None
+    if leaf == "activation_packet":
+        return example.get("activation_packet") or None
+    if leaf == "action":
+        actions = example.get("actions") or []
+        return actions[0] if actions else None
+    if leaf == "summary" and isinstance(example.get("summary"), dict):
+        return example.get("summary") or None
+    if leaf == "item":
+        items = example.get("items") or []
+        return items[0] if items else None
     if leaf == "repo":
         repos = example.get("repos") or []
         return repos[0] if repos else None

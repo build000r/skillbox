@@ -1487,6 +1487,23 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_client_arg(skill_why_parser)
     _add_cwd_arg(skill_why_parser)
 
+    skill_togglable_parser = skill_subparsers.add_parser(
+        "togglable",
+        aliases=["toggleable"],
+        help="List every skill flippable at this cwd and the command to flip it.",
+    )
+    skill_togglable_parser.add_argument("--format", choices=("text", "json"), default="text")
+    skill_togglable_parser.add_argument(
+        "--json",
+        dest="format",
+        action="store_const",
+        const="json",
+        help="Alias for --format json.",
+    )
+    _add_profile_arg(skill_togglable_parser)
+    _add_client_arg(skill_togglable_parser)
+    _add_cwd_arg(skill_togglable_parser)
+
     overlay_parser = subparsers.add_parser(
         "overlay",
         help="List, enable, disable, toggle, or activate skill scope overlays (e.g. marketing).",
@@ -4886,6 +4903,89 @@ def _print_skill_default_text(payload: dict[str, Any]) -> None:
         print("diff: none")
 
 
+def _build_skill_togglable_payload(
+    model: dict[str, Any],
+    *,
+    cwd: str | Path | None = None,
+) -> dict[str, Any]:
+    cwd_path = Path(cwd or os.getcwd()).resolve()
+    visibility = collect_skill_visibility(
+        model,
+        cwd=str(cwd_path),
+        include_global=False,
+        include_project=True,
+        include_sources=True,
+    )
+    override = _repo_override_policy(str(cwd_path))
+    pin_on = {str(name) for name in _override_list(override, "pin_on")}
+    pin_off = {str(name) for name in _override_list(override, "pin_off")}
+    effective = {
+        str(item.get("name")): item
+        for item in visibility.get("effective") or []
+        if item.get("name")
+    }
+    missing = {
+        str(item.get("name")): item
+        for item in (visibility.get("issues") or {}).get("missing_for_cwd") or []
+        if item.get("name")
+    }
+    names: set[str] = set()
+    for rule in visibility.get("matched_scope_rules") or []:
+        for skill_name in rule.get("skills") or []:
+            text = str(skill_name).strip()
+            if text:
+                names.add(text)
+    names.update(pin_on)
+    names.update(pin_off)
+    names.update(effective)
+    names.update(missing)
+
+    items: list[dict[str, Any]] = []
+    for skill_name in sorted(names):
+        source: str | None = None
+        if skill_name in effective:
+            winner = effective[skill_name]
+            source = str(winner.get("path") or winner.get("source") or "") or None
+
+        if skill_name in pin_on:
+            state = "pinned_on"
+            pinned_by = "override"
+        elif skill_name in pin_off:
+            state = "pinned_off"
+            pinned_by = "override"
+        elif skill_name in missing:
+            state = "missing_for_cwd"
+            pinned_by = "policy"
+        elif skill_name in effective:
+            state = "on"
+            pinned_by = "policy"
+        else:
+            state = "off"
+            pinned_by = "policy"
+
+        next_action = "on" if state in {"missing_for_cwd", "off", "pinned_off"} else "off"
+        items.append({
+            "skill": skill_name,
+            "state": state,
+            "source": source,
+            "pinned_by": pinned_by,
+            "command_to_flip": f"sbp skill {next_action} {skill_name} --cwd {cwd_path}",
+        })
+
+    return {"cwd": str(cwd_path), "items": items}
+
+
+def _print_skill_togglable_text(payload: dict[str, Any]) -> None:
+    print(f"skill togglable: {payload.get('cwd')}")
+    for item in payload.get("items") or []:
+        print(
+            f"  - {item.get('skill')}: {item.get('state')} "
+            f"({item.get('pinned_by')}) -> {item.get('command_to_flip')}"
+        )
+    if not payload.get("items"):
+        print("  (none)")
+
+
 def _drop_same_link_actions(plan: dict[str, Any]) -> dict[str, Any]:
     filtered = [
         action for action in plan.get("actions") or []
@@ -5404,6 +5504,14 @@ def _handle_skill(args: argparse.Namespace, root_dir: Path, model: dict[str, Any
         else:
             _print_explain_skill_text(payload)
         # Absence is a successful diagnosis for this read-only command.
+        return EXIT_OK
+
+    if skill_action in {"togglable", "toggleable"}:
+        payload = _build_skill_togglable_payload(model, cwd=args.cwd)
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            _print_skill_togglable_text(payload)
         return EXIT_OK
 
     dry_run = bool(args.dry_run or skill_action == "plan")
