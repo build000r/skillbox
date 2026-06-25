@@ -135,8 +135,8 @@ class ExpectedFile:
     repo-relative file whose text/declaration produced this entry — the doctor
     self-check verifies that source still PARSES (or, for CORE, is the file
     itself) so a derivation that silently stops emitting an entry is caught.
-    ``optional`` derivations never produce entries; only present-on-disk files
-    that are referenced become required (see the helper docstrings).
+    ``optional`` derivations never produce entries; required referenced files
+    become entries whether or not they currently exist.
     """
 
     path: str
@@ -153,6 +153,17 @@ def _read_text_if_present(path: Path) -> str | None:
         return None
 
 
+def _makefile_target_names(line: str) -> list[str] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or line.startswith(("\t", " ")):
+        return None
+    head, separator, tail = line.partition(":")
+    if not separator or tail.lstrip().startswith("="):
+        return None
+    targets = [item for item in head.split() if item and not item.startswith(".")]
+    return targets
+
+
 def _derive_makefile_script_files(root_dir: Path) -> list[ExpectedFile]:
     """Scripts referenced by Makefile targets (scripts/*.py|sh, .env-manager/*.py).
 
@@ -165,11 +176,19 @@ def _derive_makefile_script_files(root_dir: Path) -> list[ExpectedFile]:
     if text is None:
         return []
     entries: dict[str, ExpectedFile] = {}
-    for match in sorted(set(_SCRIPT_REF_PATTERN.findall(text))):
-        entries.setdefault(
-            match,
-            ExpectedFile(path=match, provenance="referenced by Makefile target", source="Makefile"),
-        )
+    current_targets: list[str] = []
+    for line in text.splitlines():
+        target_names = _makefile_target_names(line)
+        if target_names is not None:
+            current_targets = target_names
+        elif line.strip() and not line.startswith(("\t", "#")):
+            current_targets = []
+
+        provenance = "referenced by Makefile"
+        if current_targets:
+            provenance = f"referenced by Makefile target {', '.join(current_targets)}"
+        for match in _SCRIPT_REF_PATTERN.findall(line):
+            entries.setdefault(match, ExpectedFile(path=match, provenance=provenance, source="Makefile"))
     return list(entries.values())
 
 
@@ -245,8 +264,8 @@ def _derive_dockerfile_entrypoint(root_dir: Path) -> list[ExpectedFile]:
 
     The Dockerfile `COPY docker/sandbox-entrypoint.sh ...` is what backs the
     sandbox.yaml `entrypoints`. Derived from the literal COPY source so a
-    rename of the entrypoint script is caught. Only scripts/* paths the
-    Dockerfile names via COPY are emitted.
+    rename of the entrypoint script is caught. COPYed shell script sources are
+    emitted even when missing so doctor can report the broken image contract.
     """
     text = _read_text_if_present(root_dir / "Dockerfile")
     if text is None:
@@ -254,8 +273,8 @@ def _derive_dockerfile_entrypoint(root_dir: Path) -> list[ExpectedFile]:
     entries: dict[str, ExpectedFile] = {}
     copy_pattern = re.compile(r"^\s*COPY\s+(\S+)\s", re.MULTILINE)
     for raw in copy_pattern.findall(text):
-        candidate = raw.strip()
-        if candidate.endswith(".sh") and (root_dir / candidate).is_file():
+        candidate = raw.strip().removeprefix("./")
+        if candidate.endswith(".sh") and not candidate.startswith("--"):
             entries.setdefault(
                 candidate,
                 ExpectedFile(
