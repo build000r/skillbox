@@ -265,6 +265,55 @@ class SkillVisibilityTests(unittest.TestCase):
                 "present",
             )
 
+    def test_lifecycle_prune_plan_respects_override_firewall_decisions(self) -> None:
+        visibility = {
+            "visibility_decisions": [
+                {
+                    "name": "alpha",
+                    "availability": "override",
+                    "state": "pinned",
+                    "override_action": "pin_on",
+                    "layer": "repo-override-file",
+                    "winning_layer": "repo-override-file",
+                },
+                {
+                    "name": "beta",
+                    "availability": "override",
+                    "state": "disabled",
+                    "override_action": "pin_off",
+                    "layer": "repo-override-file",
+                    "winning_layer": "repo-override-file",
+                },
+            ],
+            "occurrences": [
+                {
+                    "name": "beta",
+                    "availability": "installed",
+                    "path": "/project/beta",
+                    "layer": "project:claude",
+                }
+            ],
+            "issues": {
+                "scope_violations": [
+                    {"name": "alpha", "path": "/project/alpha", "layer": "project:claude"},
+                    {"name": "alpha", "path": "/project/alpha", "layer": "project:claude"},
+                ],
+                "global_not_allowed": [],
+                "extra_global": [],
+                "broken_global": [],
+                "broken_project": [],
+            },
+        }
+        skipped: list[dict[str, object]] = []
+
+        actions = _plan_skill_prune_actions(visibility, None, from_scope="project", skipped=skipped)
+
+        self.assertEqual([action["skill"] for action in actions], ["beta"])
+        self.assertEqual(actions[0]["reason"], "pin_off")
+        self.assertEqual([item["name"] for item in skipped], ["alpha"])
+        self.assertEqual(skipped[0]["reason"], "pinned")
+        self.assertEqual(skipped[0]["winning_layer"], "repo-override-file")
+
     def test_scope_filters_removal_plans_and_compact_payload_helpers(self) -> None:
         self.assertTrue(_scope_filter_matches({"layer": "global:codex"}, "all"))
         self.assertTrue(_scope_filter_matches({"layer": "project:claude"}, "all"))
