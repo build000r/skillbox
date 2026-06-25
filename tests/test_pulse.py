@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -548,6 +549,7 @@ class PulseTests(unittest.TestCase):
                 mock.patch.object(PULSE_MODULE, "_model_config_hash", return_value="hash"),
                 mock.patch.object(PULSE_MODULE, "_snapshot_services", return_value={}),
                 mock.patch.object(PULSE_MODULE, "_snapshot_checks", return_value={}),
+                mock.patch.object(PULSE_MODULE, "_scan_rogue_listeners", return_value=[]),
             ):
                 PULSE_MODULE.reconcile_once(
                     root,
@@ -590,6 +592,7 @@ class PulseTests(unittest.TestCase):
                     return_value={"web": {"state": "starting", "pid": 123, "url": "http://127.0.0.1:3001"}},
                 ),
                 mock.patch.object(PULSE_MODULE, "_snapshot_checks", return_value={}),
+                mock.patch.object(PULSE_MODULE, "_scan_rogue_listeners", return_value=[]),
                 mock.patch.object(PULSE_MODULE, "service_supports_lifecycle", return_value=(True, "")),
                 mock.patch.object(PULSE_MODULE, "_restart_service", return_value=True) as restart_service,
                 mock.patch.object(PULSE_MODULE, "log_runtime_event"),
@@ -635,6 +638,7 @@ class PulseTests(unittest.TestCase):
                     return_value={"web": {"state": "down", "pid": None, "url": "http://127.0.0.1:3001"}},
                 ),
                 mock.patch.object(PULSE_MODULE, "_snapshot_checks", return_value={}),
+                mock.patch.object(PULSE_MODULE, "_scan_rogue_listeners", return_value=[]),
                 mock.patch.object(PULSE_MODULE, "service_supports_lifecycle", return_value=(True, "")),
                 mock.patch.object(PULSE_MODULE, "_restart_service", return_value=True) as restart_service,
                 mock.patch.object(PULSE_MODULE, "log_runtime_event"),
@@ -714,6 +718,179 @@ class PulseTests(unittest.TestCase):
         event.assert_called_once_with("pulse.check_recovered", "db", {"ok": True})
         log.assert_called_once_with("info", "check db: recovered")
         self.assertEqual(state.events_emitted, 2)
+
+    def _rogue_candidate(self, *, pid: int = 333, port: int = 5174, key: str = "333:5174:old") -> dict:
+        return {
+            "key": key,
+            "pid": pid,
+            "port": port,
+            "comm": "node",
+            "cmdline": "node vite --host 0.0.0.0",
+            "start_time": "old",
+            "signature": "vite",
+            "enforcement": "dev-server",
+            "reason": "dev_server_signature",
+            "declared_port": False,
+        }
+
+    def test_port_sentinel_classifies_managed_allowlisted_dev_and_report_only(self) -> None:
+        identities = {
+            1: {"pid": 1, "comm": "sshd", "cmdline": "sshd: listener", "start_time": "a"},
+            2: {"pid": 2, "comm": "node", "cmdline": "node vite --port 5173", "start_time": "b"},
+            3: {"pid": 3, "comm": "node", "cmdline": "node vite --port 5174", "start_time": "c"},
+            4: {"pid": 4, "comm": "python3", "cmdline": "python3 -m http.server 9000", "start_time": "d"},
+            5: {"pid": 5, "comm": "python3", "cmdline": "python3 -m http.server 80", "start_time": "e"},
+        }
+
+        with (
+            mock.patch.object(PULSE_MODULE, "_declared_port_set", return_value={5173}),  # noqa: SLF001
+            mock.patch.object(PULSE_MODULE, "_managed_service_pids", return_value={2}),  # noqa: SLF001
+            mock.patch.object(
+                PULSE_MODULE,
+                "all_process_listeners",
+                return_value=[
+                    {"pid": 1, "port": 22},
+                    {"pid": 2, "port": 5173},
+                    {"pid": 3, "port": 5174},
+                    {"pid": 4, "port": 9000},
+                    {"pid": 5, "port": 80},
+                ],
+            ),
+            mock.patch.object(PULSE_MODULE, "_process_identity", side_effect=lambda pid: identities.get(pid)),  # noqa: SLF001
+        ):
+            candidates = PULSE_MODULE._scan_rogue_listeners({"services": []})  # noqa: SLF001
+
+        self.assertEqual([candidate["pid"] for candidate in candidates], [5, 3, 4])
+        self.assertEqual(candidates[0]["signature"], "none")
+        self.assertEqual(candidates[0]["enforcement"], "report-only")
+        self.assertEqual(candidates[1]["signature"], "vite")
+        self.assertEqual(candidates[1]["enforcement"], "dev-server")
+        self.assertEqual(candidates[2]["signature"], "none")
+        self.assertEqual(candidates[2]["enforcement"], "report-only")
+
+    def test_port_sentinel_observe_reports_without_reaping(self) -> None:
+        state = PULSE_MODULE.PulseState()
+        candidate = self._rogue_candidate()
+
+        with (
+            mock.patch.object(PULSE_MODULE, "_port_sentinel_config", return_value=("observe", 15.0)),  # noqa: SLF001
+            mock.patch.object(PULSE_MODULE, "_scan_rogue_listeners", return_value=[candidate]),  # noqa: SLF001
+            mock.patch.object(PULSE_MODULE, "_terminate_rogue") as terminate,  # noqa: SLF001
+            mock.patch.object(PULSE_MODULE, "log_runtime_event") as event,
+            mock.patch.object(PULSE_MODULE, "log"),
+        ):
+            PULSE_MODULE._reconcile_port_sentinel({}, state, now=10.0)  # noqa: SLF001
+
+        terminate.assert_not_called()
+        self.assertEqual(state.port_sentinel_counters["rogues_seen"], 1)
+        self.assertEqual(state.port_sentinel_counters["rogues_reaped"], 0)
+        self.assertEqual(state.port_sentinel_counters["by_signature"], {"vite": 1})
+        self.assertEqual(state.port_sentinel_last_candidates[0]["pid"], 333)
+        self.assertEqual(event.call_args.args[0], "pulse.port_sentinel")
+        self.assertEqual(event.call_args.args[2]["action"], "observed")
+
+    def test_port_sentinel_enforce_reaps_dev_signature_after_grace(self) -> None:
+        state = PULSE_MODULE.PulseState()
+        candidate = self._rogue_candidate()
+        state.port_sentinel_first_seen[candidate["key"]] = 1.0
+
+        with (
+            mock.patch.object(PULSE_MODULE, "_port_sentinel_config", return_value=("enforce", 5.0)),  # noqa: SLF001
+            mock.patch.object(PULSE_MODULE, "_scan_rogue_listeners", return_value=[candidate]),  # noqa: SLF001
+            mock.patch.object(PULSE_MODULE, "_terminate_rogue", return_value="terminated") as terminate,  # noqa: SLF001
+            mock.patch.object(PULSE_MODULE, "log_runtime_event") as event,
+            mock.patch.object(PULSE_MODULE, "log"),
+        ):
+            PULSE_MODULE._reconcile_port_sentinel({}, state, now=10.0)  # noqa: SLF001
+
+        terminate.assert_called_once_with(candidate)
+        self.assertEqual(state.port_sentinel_counters["rogues_reaped"], 1)
+        self.assertNotIn(candidate["key"], state.port_sentinel_first_seen)
+        self.assertEqual(event.call_args.args[2]["action"], "terminated")
+
+    def test_port_sentinel_reverify_skips_pid_reuse_before_kill(self) -> None:
+        candidate = self._rogue_candidate()
+        with (
+            mock.patch.object(
+                PULSE_MODULE,
+                "_process_identity",  # noqa: SLF001
+                return_value={"pid": 333, "comm": "node", "cmdline": "node different", "start_time": "new"},
+            ),
+            mock.patch.object(PULSE_MODULE.os, "kill") as kill,
+        ):
+            action = PULSE_MODULE._terminate_rogue(candidate)  # noqa: SLF001
+
+        self.assertEqual(action, "skipped-pid-reused")
+        kill.assert_not_called()
+
+    def test_port_sentinel_status_rendering_includes_counters(self) -> None:
+        snapshot = {
+            "pid": 321,
+            "cycle_count": 1,
+            "heals": 0,
+            "events_emitted": 2,
+            "port_sentinel": {
+                "mode": "observe",
+                "rogues_seen": 3,
+                "rogues_reaped": 1,
+                "active_candidates": 1,
+                "last_candidates": [
+                    {"pid": 333, "port": 5174, "signature": "vite", "enforcement": "dev-server"}
+                ],
+            },
+        }
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            PULSE_MODULE._print_pulse_snapshot(snapshot, running_pid=321)  # noqa: SLF001
+
+        output = stdout.getvalue()
+        self.assertIn("port sentinel: observe, seen 3, reaped 1, active 1", output)
+        self.assertIn("pid 333 port 5174 vite dev-server", output)
+
+    def test_port_sentinel_real_socket_is_report_only_in_observe_mode(self) -> None:
+        code = (
+            "import socket, time\n"
+            "sock = socket.socket()\n"
+            "sock.bind(('127.0.0.1', 0))\n"
+            "sock.listen()\n"
+            "print(sock.getsockname()[1], flush=True)\n"
+            "time.sleep(30)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        try:
+            assert proc.stdout is not None
+            port = int(proc.stdout.readline().strip())
+            match = None
+            for _attempt in range(10):
+                candidates = PULSE_MODULE._scan_rogue_listeners({"services": []})  # noqa: SLF001
+                match = next(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if candidate.get("pid") == proc.pid and candidate.get("port") == port
+                    ),
+                    None,
+                )
+                if match is not None:
+                    break
+                PULSE_MODULE.time.sleep(0.1)
+            self.assertIsNotNone(match)
+            self.assertEqual(match["enforcement"], "report-only")
+            self.assertTrue(PULSE_MODULE.process_is_running(proc.pid))
+        finally:
+            if proc.stdout is not None:
+                proc.stdout.close()
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
 
     def test_print_pulse_services_and_checks_cover_marker_branches(self) -> None:
         stdout = io.StringIO()

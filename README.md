@@ -437,6 +437,8 @@ What it does each cycle:
 - reloads `runtime.yaml` and detects config hash changes
 - probes every declared service and detects state transitions
 - auto-restarts crashed managed services with exponential backoff
+- reports unmanaged listeners through the port sentinel and can reap
+  dev-server signatures when `SKILLBOX_PORT_SENTINEL=enforce`
 - runs declared checks and detects failures and recoveries
 - writes every state change to the plain-text runtime log at `logs/runtime/runtime.log`
 - persists a state snapshot at `logs/runtime/pulse.state.json` for the MCP tool to read

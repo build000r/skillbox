@@ -2576,6 +2576,26 @@ def _process_tree_pids(root_pid: int) -> set[int]:
     return pids
 
 
+def _all_proc_pids() -> set[int]:
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return set()
+    pids: set[int] = set()
+    for child in proc_root.iterdir():
+        if not child.name.isdigit():
+            continue
+        try:
+            pids.add(int(child.name))
+        except ValueError:
+            continue
+    return pids
+
+
+def process_tree_pids(root_pid: int) -> set[int]:
+    """Return the root process and descendants visible through /proc."""
+    return _process_tree_pids(root_pid)
+
+
 def _parse_listener_port(raw_local_address: str) -> int | None:
     value = str(raw_local_address or "").strip()
     if not value:
@@ -2702,6 +2722,25 @@ def _process_tree_listener_snapshot(pid: int) -> dict[str, Any]:
         "observed_ports": observed_ports,
         "source": source,
     }
+
+
+def process_tree_listener_snapshot(pid: int) -> dict[str, Any]:
+    """Return listening ports owned by a process tree."""
+    return _process_tree_listener_snapshot(pid)
+
+
+def all_process_listeners() -> list[dict[str, Any]]:
+    """Return visible listening sockets keyed by owning process pid."""
+    pids = _all_proc_pids()
+    if not pids:
+        return []
+    listeners = _proc_process_tree_listeners(pids)
+    if not listeners:
+        listeners = _ss_process_tree_listeners(pids)
+    return sorted(
+        listeners,
+        key=lambda item: (int(item.get("port") or 0), int(item.get("pid") or 0)),
+    )
 
 
 def _service_port_guard_disabled() -> bool:
