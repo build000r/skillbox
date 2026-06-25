@@ -247,6 +247,51 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
         self.assertEqual(policy["pin_off"], [])
         self.assertEqual(policy["defaults"], [])
 
+    def test_missing_override_file_is_visibility_noop_from_repo_and_subdir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            subdir = repo / "src" / "pkg"
+            subdir.mkdir(parents=True)
+            source_root = root / "sources"
+            source = _write_source_skill(source_root, "alpha")
+            _install_project_skill(repo, "alpha", source, surface="claude")
+            _install_project_skill(repo, "alpha", source, surface="codex")
+            model = _write_scope_policy(root, source_root, "alpha", repo)
+
+            for cwd in (repo, subdir):
+                with self.subTest(cwd=cwd):
+                    self.assertFalse((repo / ".skillbox" / "skill-overrides.yaml").exists())
+                    normal = collect_skill_visibility(
+                        model,
+                        cwd=str(cwd),
+                        include_global=False,
+                        include_project=True,
+                    )
+                    with mock.patch(
+                        "runtime_manager.skill_visibility._repo_override_visibility",
+                        return_value=([], []),
+                    ):
+                        baseline = collect_skill_visibility(
+                            model,
+                            cwd=str(cwd),
+                            include_global=False,
+                            include_project=True,
+                        )
+
+                    self.assertEqual(
+                        json.dumps(normal, sort_keys=True),
+                        json.dumps(baseline, sort_keys=True),
+                    )
+                    self.assertNotIn(
+                        "repo-override-file",
+                        [str(layer.get("id") or "") for layer in normal["layers"]],
+                    )
+                    self.assertEqual(
+                        [item["name"] for item in normal["effective"]],
+                        ["alpha"],
+                    )
+
     def test_override_writer_preserves_sequential_read_modify_writes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = _make_repo(Path(tmpdir))
