@@ -607,6 +607,9 @@ python3 .env-manager/manage.py search "mcp parity" --format json
 python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json
 ```
 
+For the complete generated command contract, see `docs/API_REFERENCE.md`;
+regenerate it with `python3 .env-manager/manage.py registry-docs --write`.
+
 `capabilities`, `next`, `graph`, `explain`, and `search` are read-only.
 `snap replay` and `snap diff` are read-only fixture operations. `snap create`
 prints a redacted snapshot by default and writes under `.skillbox-state/` only
