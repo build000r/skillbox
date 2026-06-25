@@ -154,7 +154,9 @@ Usage:
                               (INCO/FAIL/PASS); complements `make doctor`.
                               Exits nonzero on FAIL only.
   __WRAPPER__ registry doctor [args...] Check registry/repos.yaml against local Git repos
-  __WRAPPER__ cass status|search|rebuild|doctor  Remote worker-devbox Cass front door
+  __WRAPPER__ cass status|search|rebuild|doctor  Remote Cass front door.
+                              Use status/search for active tasks; treat rebuild as
+                              coordinated maintenance, not degraded-mode fallback.
   __WRAPPER__ evidence [--repo P|--skill N] --format json  Measure skill invocations per
                               repo from Cass (contamination-safe), joined to current policy
   __WRAPPER__ cron [status|apply]     Declared crontab + script links from skillbox-config
@@ -423,7 +425,12 @@ payload = {
         {"name": "candidates", "json": True, "safe_first_try": f"{wrapper} candidates --json"},
         {"name": "mcp", "json": True, "safe_first_try": f"{wrapper} mcp --json"},
         {"name": "registry", "json": True, "safe_first_try": f"{wrapper} registry doctor --json"},
-        {"name": "cass", "json": True, "safe_first_try": f"{wrapper} cass status --json"},
+        {
+            "name": "cass",
+            "json": True,
+            "safe_first_try": f"{wrapper} cass status --json",
+            "fallback": "If status is error/degraded/stale during active work, report degraded_cass evidence mode and use the local transcript scanner; do not rebuild Cass mid-task.",
+        },
         {"name": "evidence", "json": True, "safe_first_try": f"{wrapper} evidence --repo <path> --format json"},
         {"name": "cron", "json": True, "safe_first_try": f"{wrapper} cron status --json"},
         {"name": "send-later", "json": True, "safe_first_try": f"{wrapper} send-later list --json"},
