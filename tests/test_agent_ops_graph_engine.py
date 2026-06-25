@@ -52,6 +52,7 @@ class AgentGraphEngineTests(unittest.TestCase):
         self.assertEqual(payload["graph"]["warnings"][0]["code"], "ADAPTER_TIMEOUT")
         self.assertEqual(payload["algorithm"]["name"], "all")
         self.assertIn("critical_path", payload["algorithm"]["result"])
+        self.assertTrue(all(action.startswith("python3 .env-manager/manage.py ") for action in payload["next_actions"]))
         self.assertEqual(json.loads(json.dumps(payload)), payload)
 
     def test_cycles_algorithm_uses_shared_cycle_evidence(self) -> None:
@@ -98,6 +99,7 @@ class AgentGraphEngineTests(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "INVALID_ARGUMENT")
         self.assertIn("allowed", payload["error"]["details"])
+        self.assertTrue(all(action.startswith("python3 .env-manager/manage.py ") for action in payload["next_actions"]))
 
     def test_unknown_node_returns_structured_unknown_node(self) -> None:
         payload = ENGINE.graph_command_payload(

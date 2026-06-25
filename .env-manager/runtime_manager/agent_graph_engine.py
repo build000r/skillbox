@@ -5,6 +5,7 @@ import re
 from typing import Any, Iterable, Mapping
 
 from .agent_graph import AgentGraph
+from .agent_cli_hints import manage_py_command
 from .agent_graph_algorithms import (
     ALGORITHMS_SCHEMA_VERSION,
     analyze_graph,
@@ -91,14 +92,14 @@ def _require_node(graph_payload: Mapping[str, Any], node_id: str, role: str) -> 
         return _error_payload(
             "INVALID_ARGUMENT",
             f"{role} is required",
-            next_actions=["brain.graph --algorithm blast-radius --node <node-id>"],
+            next_actions=[manage_py_command("graph", "--algorithm", "blast-radius", "--node", "<node-id>", "--format", "json")],
         )
     node_ids = {str(node.get("id") or "") for node in graph_payload.get("nodes") or [] if isinstance(node, Mapping)}
     if node_id not in node_ids:
         return _error_payload(
             "UNKNOWN_NODE",
             f"unknown graph node: {node_id}",
-            next_actions=["brain.graph --format json"],
+            next_actions=[manage_py_command("graph", "--format", "json")],
             details={"node_id": node_id, "role": role},
         )
     return None
@@ -118,8 +119,8 @@ def _algorithm_payload(
             "INVALID_ARGUMENT",
             f"unknown graph algorithm: {algorithm}",
             next_actions=[
-                "brain.graph --algorithm all --format json",
-                "brain.graph --algorithm cycles --format json",
+                manage_py_command("graph", "--algorithm", "all", "--format", "json"),
+                manage_py_command("graph", "--algorithm", "cycles", "--format", "json"),
             ],
             details={"allowed": sorted(GRAPH_ALGORITHMS)},
         )
@@ -165,8 +166,8 @@ def graph_command_payload(
         "schema_version": GRAPH_ENGINE_SCHEMA_VERSION,
         "graph": graph_payload,
         "next_actions": [
-            "brain.graph --algorithm all --format json",
-            "brain.next --format json",
+            manage_py_command("graph", "--algorithm", "all", "--format", "json"),
+            manage_py_command("next", "--format", "json"),
         ],
     }
     if algorithm:

@@ -6,9 +6,18 @@ from typing import Any, Iterable, Mapping
 
 from .agent_graph import AgentGraph
 from .agent_graph_algorithms import blast_radius, normalize_graph, normalized_to_payload
+from .agent_cli_hints import manage_py_command
 from .command_registry import CommandSpec, default_registry
 
 DECISIONS_SCHEMA_VERSION = "2026-06-11+agent_ops_brain.decisions"
+BRAIN_COMMAND_TARGET_ALIASES = {
+    "capabilities": "runtime.capabilities",
+    "next": "brain.next",
+    "graph": "brain.graph",
+    "explain": "brain.explain",
+    "search": "brain.search",
+    "snap": "brain.snap",
+}
 
 
 def _error_payload(code: str, message: str, **details: Any) -> dict[str, Any]:
@@ -351,7 +360,7 @@ def next_action_payload(
                 "risk": "low",
                 "side_effect": "none",
                 "reasons": [f"graph has {len(graph_payload.get('warnings') or [])} warning(s)"],
-                "commands": ["brain.graph --format json"],
+                "commands": [manage_py_command("graph", "--format", "json")],
                 "validations": ["python3 .env-manager/manage.py doctor --format json"],
                 "evidence": [{"source": "graph", "path": "warnings"}],
             }
@@ -385,7 +394,10 @@ def next_action_payload(
             for warning in (adapter.get("warnings") or [])
             if isinstance(warning, Mapping)
         ],
-        "next_actions": limited[0]["commands"] if limited else ["br ready --json", "brain.graph --format json"],
+        "next_actions": limited[0]["commands"] if limited else [
+            "br ready --json",
+            manage_py_command("graph", "--format", "json"),
+        ],
     }
 
 
@@ -441,6 +453,7 @@ def _bead_evidence(target_id: str, adapters: Mapping[str, Any] | None) -> list[d
 
 def _target_node_id(target: str, graph_payload: Mapping[str, Any]) -> str:
     target = str(target or "").strip()
+    target = BRAIN_COMMAND_TARGET_ALIASES.get(target, target)
     if target in _node_lookup(graph_payload):
         return target
     registry = _registry_by_id()

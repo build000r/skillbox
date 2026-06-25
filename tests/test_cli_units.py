@@ -121,6 +121,8 @@ class CliUnitTests(unittest.TestCase):
         self.assertIn("sbh-report --format json", sbh_report["safe_first_try"])
         next_command = next(command for command in payload["commands"] if command["name"] == "next")
         self.assertIn("--no-adapters", next_command["safe_first_try"])
+        search_command = next(command for command in payload["commands"] if command["name"] == "search")
+        self.assertEqual(search_command["safe_first_try"], "manage.py search graph --format json --no-adapters")
 
     def test_capabilities_compact_registry_is_parser_backed(self) -> None:
         result = _run_manage("capabilities", "--compact", "--json")
@@ -176,6 +178,37 @@ class CliUnitTests(unittest.TestCase):
         self.assertEqual(payloads[2]["kind"], "command")
         self.assertTrue(payloads[3]["hits"])
         self.assertEqual(payloads[4]["snapshot_id"], "golden-fixture")
+
+    def test_explain_bare_brain_command_alias_resolves_to_command_node(self) -> None:
+        result = _run_manage("explain", "next", "--format", "json", "--no-adapters")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["target"], "command:brain.next")
+        self.assertEqual(payload["kind"], "command")
+
+    def test_snap_without_action_returns_structured_usage_payload(self) -> None:
+        result = _run_manage("snap", "--format", "json")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "")
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["code"], "SNAP_ACTION_REQUIRED")
+        self.assertEqual([action["name"] for action in payload["actions"]], ["create", "diff", "replay"])
+        self.assertIn("snap replay tests/goldens/agent_ops_snapshot.json", payload["next_actions"][0])
+
+    def test_graph_invalid_algorithm_returns_structured_json_error(self) -> None:
+        result = _run_manage("graph", "--algorithm", "pagerank", "--format", "json", "--no-adapters")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "")
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["code"], "INVALID_ARGUMENT")
+        self.assertIn("allowed", payload["error"]["details"])
+        self.assertTrue(all(action.startswith("python3 .env-manager/manage.py ") for action in payload["next_actions"]))
 
     def test_agent_ops_brain_text_renderers_cover_success_and_errors(self) -> None:
         stdout = StringIO()

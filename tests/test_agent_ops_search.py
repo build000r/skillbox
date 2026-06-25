@@ -81,6 +81,7 @@ class AgentSearchTests(unittest.TestCase):
             self.assertIn("score", hit)
             self.assertIn("snippet", hit)
             self.assertIn("next_action", hit)
+            self.assertNotIn("brain.", hit["next_action"])
         self.assertEqual(json.loads(json.dumps(payload)), payload)
 
     def test_search_covers_beads_and_evidence(self) -> None:
@@ -98,6 +99,7 @@ class AgentSearchTests(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "INVALID_ARGUMENT")
         self.assertTrue(payload["examples"])
+        self.assertTrue(all(example.startswith("python3 .env-manager/manage.py ") for example in payload["examples"]))
 
     def test_source_and_kind_filters_are_applied(self) -> None:
         payload = SEARCH.search_payload(

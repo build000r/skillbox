@@ -49,9 +49,10 @@ from .port_registry import port_registry_payload, port_registry_text_lines
 from .agent_adapters import collect_agent_adapter_evidence
 from .agent_graph import build_agent_graph, build_agent_graph_payload
 from .agent_graph_engine import GRAPH_ALGORITHMS, GRAPH_OUTPUT_FORMATS, graph_command_payload, render_graph_payload
-from .agent_decisions import explain_payload, next_action_payload
+from .agent_decisions import BRAIN_COMMAND_TARGET_ALIASES, explain_payload, next_action_payload
 from .agent_search import search_payload
 from .agent_snapshots import (
+    SNAPSHOT_SCHEMA_VERSION,
     create_snapshot_payload,
     diff_snapshots,
     load_snapshot,
@@ -1056,7 +1057,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Inspect the agent operations graph and optional graph algorithms.",
     )
     graph_parser.add_argument("--format", choices=tuple(sorted(GRAPH_OUTPUT_FORMATS)), default="json")
-    graph_parser.add_argument("--algorithm", choices=tuple(sorted(GRAPH_ALGORITHMS)), default=None)
+    graph_parser.add_argument("--algorithm", default=None)
     graph_parser.add_argument("--node", default=None, help="Node id for node-scoped graph algorithms.")
     graph_parser.add_argument("--source", default=None, help="Source node id for shortest-path.")
     graph_parser.add_argument("--target", default=None, help="Target node id for shortest-path.")
@@ -1139,7 +1140,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "snap",
         help="Create, diff, or replay redacted agent operations snapshots.",
     )
-    snap_subparsers = snap_parser.add_subparsers(dest="snap_action", required=True)
+    snap_parser.add_argument("--format", choices=("text", "json"), default="json")
+    snap_subparsers = snap_parser.add_subparsers(dest="snap_action")
     snap_create_parser = snap_subparsers.add_parser("create", help="Create a redacted runtime/evidence/graph snapshot.")
     snap_create_parser.add_argument("--format", choices=("text", "json"), default="json")
     snap_create_parser.add_argument("--name", "--label", dest="name", default=None)
@@ -3148,8 +3150,10 @@ def _safe_first_try_command(name: str) -> str:
         return f"manage.py {name} --json"
     if name == "robot-docs":
         return "manage.py robot-docs guide"
-    if name in {"next", "graph", "search"}:
+    if name in {"next", "graph"}:
         return f"manage.py {name} --format json --no-adapters"
+    if name == "search":
+        return "manage.py search graph --format json --no-adapters"
     if name == "explain":
         return "manage.py explain brain.next --format json --no-adapters"
     if name == "snap":
@@ -4122,6 +4126,8 @@ def _explain_target_is_brain(args: argparse.Namespace) -> bool:
     target = str(getattr(args, "target", "") or "").strip()
     if "." in target or ":" in target:
         return True
+    if target in BRAIN_COMMAND_TARGET_ALIASES:
+        return True
     try:
         from .command_registry import load_default_registry
 
@@ -4258,7 +4264,39 @@ def _snap_diff_paths(args: argparse.Namespace) -> tuple[Path, Path]:
 
 def _handle_snap(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
     del resolved_mode
-    if args.snap_action == "create":
+    if not getattr(args, "snap_action", None):
+        payload = {
+            "ok": False,
+            "schema_version": SNAPSHOT_SCHEMA_VERSION,
+            "error": {
+                "code": "SNAP_ACTION_REQUIRED",
+                "type": "invalid_argument",
+                "message": "snap requires an action: create, diff, or replay",
+                "recoverable": True,
+            },
+            "actions": [
+                {
+                    "name": "create",
+                    "side_effect": "none unless --write is passed",
+                    "safe_first_try": "python3 .env-manager/manage.py snap create --format json --no-adapters",
+                },
+                {
+                    "name": "diff",
+                    "side_effect": "none",
+                    "safe_first_try": "python3 .env-manager/manage.py snap diff --from before.json --to after.json --format json",
+                },
+                {
+                    "name": "replay",
+                    "side_effect": "none",
+                    "safe_first_try": "python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json",
+                },
+            ],
+            "next_actions": [
+                "python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json",
+                "python3 .env-manager/manage.py capabilities --json",
+            ],
+        }
+    elif args.snap_action == "create":
         adapters = _brain_adapters_for_args(root_dir, model, args)
         payload = create_snapshot_payload(
             status=runtime_status(model),

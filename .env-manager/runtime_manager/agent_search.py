@@ -7,6 +7,7 @@ from typing import Any, Iterable, Mapping
 
 from .agent_graph import AgentGraph
 from .agent_graph_algorithms import normalize_graph
+from .agent_cli_hints import manage_py_command
 from .command_registry import default_registry
 
 SEARCH_SCHEMA_VERSION = "2026-06-11+agent_ops_brain.search"
@@ -27,9 +28,9 @@ def _error_payload(code: str, message: str, **details: Any) -> dict[str, Any]:
             "recoverable": True,
         },
         "examples": [
-            "brain.search graph command",
-            "brain.search --kind bead mcp",
-            "brain.search --source docs runtime",
+            manage_py_command("search", "graph", "command", "--format", "json"),
+            manage_py_command("search", "--kind", "bead", "mcp", "--format", "json"),
+            manage_py_command("search", "--source", "docs", "runtime", "--format", "json"),
         ],
     }
     if details:
@@ -117,7 +118,7 @@ def _registry_hits(query_tokens: list[str]) -> list[dict[str, Any]]:
             source="registry",
             title=spec.summary,
             body=body,
-            next_action=spec.examples[0] if spec.examples else f"brain.explain {spec.id}",
+            next_action=spec.examples[0] if spec.examples else manage_py_command("explain", spec.id, "--format", "json"),
             query_tokens=query_tokens,
             base_score=120 if spec.tier == 1 else 80,
         )
@@ -142,7 +143,7 @@ def _graph_hits(graph: AgentGraph | Mapping[str, Any] | None, query_tokens: list
             source="graph",
             title=title,
             body=body,
-            next_action=f"brain.explain {node_id}",
+            next_action=manage_py_command("explain", node_id, "--format", "json"),
             query_tokens=query_tokens,
             base_score=90,
         )
@@ -221,7 +222,7 @@ def _evidence_hits(
             source="evidence",
             title=title,
             body=body,
-            next_action="brain.next --format json",
+            next_action=manage_py_command("next", "--format", "json"),
             query_tokens=query_tokens,
             base_score=85,
         )
@@ -272,7 +273,7 @@ def _doc_hits(
             source="docs",
             title=label,
             body=text,
-            next_action=f"brain.search --source docs {label}",
+            next_action=manage_py_command("search", "--source", "docs", label, "--format", "json"),
             query_tokens=query_tokens,
             base_score=70,
         )
@@ -341,7 +342,10 @@ def search_payload(
         "hits": limited,
         "groups": _group_hits(limited),
         "warnings": warnings,
-        "next_actions": [limited[0]["next_action"]] if limited else ["brain.search graph", "brain.next --format json"],
+        "next_actions": [limited[0]["next_action"]] if limited else [
+            manage_py_command("search", "graph", "--format", "json"),
+            manage_py_command("next", "--format", "json"),
+        ],
     }
 
 
