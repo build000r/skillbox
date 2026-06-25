@@ -6,13 +6,16 @@ import os
 import subprocess
 import sys
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from .errors import (
     OVERRIDE_REFUSED_FLOOR,
     OVERRIDE_REFUSED_GLOBAL_ESCALATION,
+    OVERRIDE_SKILL_UNKNOWN,
     PRUNE_SKIPPED_PINNED,
+    ValidationError,
 )
 from .shared import *
 from .validation import *
@@ -1371,6 +1374,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help_text="Installed scope to unlink after writing pin_off.",
     )
     skill_off_parser.set_defaults(to="project", from_scope="project")
+
+    skill_heal_parser = skill_subparsers.add_parser(
+        "heal",
+        help="Resolve a skill source, durably pin it on for this repo, link it, and return its activation packet.",
+    )
+    skill_heal_parser.add_argument("skill_name")
+    _add_skill_lifecycle_common(skill_heal_parser)
+    skill_heal_parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Re-resolve visibility after applying and report the linked packet hash.",
+    )
+    skill_heal_parser.set_defaults(to="project")
 
     remove_parser = skill_subparsers.add_parser("remove", help="Remove installed links/files for a skill.")
     remove_parser.add_argument("skill_name")
@@ -4328,6 +4344,53 @@ def _apply_skill_pin(
     }
 
 
+def _heal_pin_reason(skill_name: str) -> str:
+    timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return f"heal:{skill_name} {timestamp}"
+
+
+def _apply_skill_heal_pin(
+    cwd: str | None,
+    skill_name: str,
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    current = _repo_override_policy(cwd or os.getcwd())
+    policy_path = str(current.get("_policy_path") or "")
+    would_change = _skill_pin_would_change(current, skill_name, "on")
+    reason = _heal_pin_reason(skill_name)
+    if dry_run:
+        return {
+            "changed": False,
+            "would_change": would_change,
+            "policy_path": policy_path,
+            "pin": "pin_on",
+            "reason": reason if would_change else str(current.get("reason") or ""),
+        }
+    if not would_change:
+        return {
+            "changed": False,
+            "would_change": False,
+            "policy_path": policy_path,
+            "pin": "pin_on",
+            "reason": str(current.get("reason") or ""),
+        }
+
+    def mutator(policy: dict[str, Any]) -> dict[str, Any]:
+        updated = _mutate_skill_pin(policy, skill_name, "on")
+        updated["reason"] = reason
+        return updated
+
+    result = update_repo_override_policy(cwd or os.getcwd(), mutator)
+    return {
+        "changed": bool(result.get("changed")),
+        "would_change": would_change,
+        "policy_path": str(result.get("_policy_path") or policy_path),
+        "pin": "pin_on",
+        "reason": reason,
+    }
+
+
 def _drop_same_link_actions(plan: dict[str, Any]) -> dict[str, Any]:
     filtered = [
         action for action in plan.get("actions") or []
@@ -4409,6 +4472,8 @@ def _skill_toggle_verification(
     skill_name: str,
     cwd_path: Path,
     activation_packet: dict[str, Any] | None,
+    *,
+    expected_targets: list[str] | None = None,
 ) -> dict[str, Any]:
     visibility = collect_skill_visibility(
         model,
@@ -4439,12 +4504,207 @@ def _skill_toggle_verification(
     sha_matches = bool(packet_sha) and any(
         row.get("skill_md_sha256") == packet_sha for row in linked
     )
+    expected_link_rows: list[dict[str, Any]] = []
+    packet_source = str((activation_packet or {}).get("source") or "")
+    packet_source_real = os.path.realpath(packet_source) if packet_source else ""
+    for target in expected_targets or []:
+        path = Path(target)
+        exists = os.path.lexists(path)
+        resolved = os.path.realpath(path) if exists else None
+        target_sha = _skill_packet_sha256(Path(resolved)) if resolved else None
+        ok = (
+            bool(exists)
+            and path.is_symlink()
+            and bool(packet_source_real)
+            and resolved == packet_source_real
+            and target_sha == packet_sha
+        )
+        expected_link_rows.append({
+            "path": str(path),
+            "exists": exists,
+            "is_symlink": path.is_symlink(),
+            "resolved": resolved,
+            "skill_md_sha256": target_sha,
+            "ok": ok,
+        })
+    expected_links_ok = all(row.get("ok") for row in expected_link_rows) if expected_targets is not None else True
     return {
-        "verified": bool(effective_now) and sha_matches,
+        "verified": bool(effective_now) and sha_matches and expected_links_ok,
         "effective_now": effective_now,
         "symlink_resolved": linked,
+        "expected_targets": expected_link_rows,
         "skill_md_sha256": packet_sha or None,
     }
+
+
+def _activation_packet_targets(activation_packet: dict[str, Any] | None) -> list[str]:
+    targets: list[str] = []
+    for values in ((activation_packet or {}).get("surface_targets") or {}).values():
+        targets.extend(str(value) for value in values or [] if value)
+    return sorted(dict.fromkeys(targets))
+
+
+def _skill_name_suggestions(model: dict[str, Any], skill_name: str) -> list[str]:
+    names: set[str] = set()
+    try:
+        declared_occurrences, _layers = _declared_skill_occurrences(model)
+        for root in _skill_source_roots(model, declared_occurrences):
+            for candidate in _skill_source_candidates(root):
+                name = str(candidate.get("name") or "")
+                if name:
+                    names.add(name)
+    except Exception:
+        names = set()
+    return difflib.get_close_matches(skill_name, sorted(names), n=5, cutoff=0.45)
+
+
+def _selected_source_from_visible_skill(
+    visibility: dict[str, Any],
+    skill_name: str,
+) -> dict[str, Any] | None:
+    rows = [
+        *(visibility.get("effective") or []),
+        *(visibility.get("occurrences") or []),
+    ]
+    for row in rows:
+        if str(row.get("name") or "") != skill_name:
+            continue
+        if str(row.get("state") or "") in {"disabled", "broken"}:
+            continue
+        raw_source = str(row.get("source") or "")
+        raw_path = str(row.get("path") or "")
+        candidates = [raw_source, raw_path]
+        for candidate in candidates:
+            if not candidate:
+                continue
+            path = Path(candidate).expanduser()
+            try:
+                resolved = path.resolve()
+            except OSError:
+                resolved = path.absolute()
+            if (resolved / "SKILL.md").is_file():
+                return {
+                    "name": skill_name,
+                    "source": str(resolved),
+                    "source_bucket": row.get("source_bucket") or _source_bucket(str(resolved)),
+                    "root": str(resolved.parent),
+                    "explicit": False,
+                }
+    return None
+
+
+def _raise_heal_unknown(
+    model: dict[str, Any],
+    skill_name: str,
+    cwd_path: Path,
+    *,
+    payload: dict[str, Any] | None = None,
+    message: str | None = None,
+    extra_suggestions: list[str] | None = None,
+) -> None:
+    suggestions: list[str] = []
+    for suggestion in extra_suggestions or []:
+        if suggestion and suggestion != skill_name and suggestion not in suggestions:
+            suggestions.append(suggestion)
+    for suggestion in _skill_name_suggestions(model, skill_name):
+        if suggestion and suggestion not in suggestions:
+            suggestions.append(suggestion)
+    suffix = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+    raise ValidationError(
+        OVERRIDE_SKILL_UNKNOWN,
+        (message or f"Cannot heal skill {skill_name!r}: no source directory found.") + suffix,
+        context={
+            "skill": skill_name,
+            "cwd": str(cwd_path),
+            "suggestions": suggestions,
+            "source_options": (payload or {}).get("source_options") or [],
+        },
+        next_actions=[
+            f"sbp candidates --cwd {cwd_path} --json",
+            f"sbp skill why {skill_name} --cwd {cwd_path} --json",
+        ],
+    )
+
+
+def _validate_heal_source_identity_or_raise(
+    model: dict[str, Any],
+    skill_name: str,
+    cwd_path: Path,
+    selected_source: dict[str, Any],
+    payload: dict[str, Any],
+) -> None:
+    if not bool(selected_source.get("explicit")):
+        return
+    source_path = Path(str(selected_source.get("source") or "")).resolve()
+    source_name = source_path.name
+    if source_name == skill_name:
+        return
+    _raise_heal_unknown(
+        model,
+        skill_name,
+        cwd_path,
+        payload=payload,
+        message=(
+            f"Cannot heal skill {skill_name!r}: explicit source {source_path} "
+            f"appears to be skill {source_name!r}."
+        ),
+        extra_suggestions=[source_name],
+    )
+
+
+def _resolve_heal_source_or_raise(
+    model: dict[str, Any],
+    skill_name: str,
+    cwd_path: Path,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    selected_source = payload.get("selected_source")
+    if selected_source:
+        _validate_heal_source_identity_or_raise(model, skill_name, cwd_path, selected_source, payload)
+        return selected_source
+
+    visibility = collect_skill_visibility(
+        model,
+        cwd=str(cwd_path),
+        include_global=True,
+        include_project=True,
+        include_sources=False,
+    )
+    selected_source = _selected_source_from_visible_skill(visibility, skill_name)
+    if selected_source:
+        return selected_source
+
+    _raise_heal_unknown(model, skill_name, cwd_path, payload=payload)
+    raise AssertionError("unreachable")
+
+
+def _heal_lifecycle_plan_or_raise(
+    args: argparse.Namespace,
+    model: dict[str, Any],
+    skill_name: str,
+    cwd_path: Path,
+    requested_to: str,
+) -> dict[str, Any]:
+    try:
+        return skill_lifecycle_plan(
+            model,
+            "activate",
+            skill_name=skill_name,
+            cwd=str(cwd_path),
+            to=requested_to,
+            categories=getattr(args, "category", []) or [],
+            source=getattr(args, "source", None),
+            force=True,
+        )
+    except RuntimeError as exc:
+        if getattr(args, "source", None):
+            _raise_heal_unknown(
+                model,
+                skill_name,
+                cwd_path,
+                message=f"Cannot heal skill {skill_name!r}: explicit source could not be resolved: {exc}",
+            )
+        raise
 
 
 def _validate_skill_toggle_security(
@@ -4568,6 +4828,61 @@ def _handle_skill_toggle(
     return payload
 
 
+def _handle_skill_heal(
+    args: argparse.Namespace,
+    model: dict[str, Any],
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    skill_name = str(args.skill_name)
+    cwd_path = Path(args.cwd or os.getcwd()).resolve()
+    requested_to = str(getattr(args, "to", "project") or "project")
+    if requested_to != "project":
+        raise RuntimeError("skill heal currently supports repo-local project scope only; use --to project.")
+    _validate_skill_toggle_security(
+        model,
+        skill_name=skill_name,
+        skill_action="on",
+        requested_to=requested_to,
+        cwd_path=cwd_path,
+    )
+    payload = _heal_lifecycle_plan_or_raise(args, model, skill_name, cwd_path, requested_to)
+    selected_source = _resolve_heal_source_or_raise(model, skill_name, cwd_path, payload)
+    payload["selected_source"] = selected_source
+    if not payload.get("activation_packet"):
+        activation_packet, packet_warning = _activation_packet(
+            skill_name,
+            selected_source,
+            payload.get("actions") or [],
+        )
+        payload["activation_packet"] = activation_packet
+        if packet_warning:
+            payload.setdefault("warnings", []).append(packet_warning)
+    payload = _drop_same_link_actions(payload)
+    override = _apply_skill_heal_pin(args.cwd, skill_name, dry_run=dry_run)
+    payload["action"] = "heal"
+    payload["override"] = override
+    payload["changed"] = bool(override.get("changed"))
+    payload["noop"] = not bool(override.get("would_change")) and not bool(payload.get("actions"))
+    payload = apply_skill_lifecycle_plan(
+        payload,
+        dry_run=dry_run,
+        allow_directories=bool(getattr(args, "allow_directories", False)),
+        force=bool(getattr(args, "force", False)),
+    )
+    if bool(getattr(args, "verify", False)) and not dry_run:
+        payload["verification"] = _skill_toggle_verification(
+            model,
+            skill_name,
+            cwd_path,
+            payload.get("activation_packet"),
+            expected_targets=_activation_packet_targets(payload.get("activation_packet")),
+        )
+    else:
+        payload["verification"] = None
+    return payload
+
+
 def _handle_skill(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
     skill_action = str(args.skill_action)
     if skill_action == "lint":
@@ -4599,6 +4914,13 @@ def _handle_skill(args: argparse.Namespace, root_dir: Path, model: dict[str, Any
     dry_run = bool(args.dry_run or skill_action == "plan")
     if skill_action in {"on", "off"}:
         payload = _handle_skill_toggle(args, model, dry_run=dry_run)
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            print_skill_lifecycle_text(payload)
+        return EXIT_OK
+    if skill_action == "heal":
+        payload = _handle_skill_heal(args, model, dry_run=dry_run)
         if args.format == "json":
             emit_json(payload)
         else:

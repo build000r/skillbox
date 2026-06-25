@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import io
 import json
 import multiprocessing as mp
@@ -30,6 +31,7 @@ from runtime_manager.errors import (  # noqa: E402
     OVERRIDE_PARSE_ERROR,
     OVERRIDE_REFUSED_FLOOR,
     OVERRIDE_REFUSED_GLOBAL_ESCALATION,
+    OVERRIDE_SKILL_UNKNOWN,
     PRUNE_SKIPPED_PINNED,
     ValidationError,
 )
@@ -1160,6 +1162,201 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
             self.assertEqual(policy["pin_on"], ["alpha"])
             self.assertTrue(payload["changed"])
             self.assertEqual(payload["summary"]["link"], 2)
+
+    def test_skill_heal_pins_links_and_returns_same_packet_on_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            fake_home = root / "home"
+            source_root = root / "sources"
+            source = _write_source_skill(source_root, "alpha")
+            expected_sha = hashlib.sha256((source / "SKILL.md").read_bytes()).hexdigest()
+            model = _write_global_floor_policy(root, source_root, "alpha", repo)
+
+            with (
+                mock.patch("runtime_manager.skill_visibility.Path.home", return_value=fake_home),
+                mock.patch.object(RUNTIME_CLI, "_filtered_model_for_args", return_value=model),
+            ):
+                first_code, first_text = _run_runtime_cli([
+                    "skill",
+                    "heal",
+                    "alpha",
+                    "--cwd",
+                    str(repo),
+                    "--format",
+                    "json",
+                ])
+                second_code, second_text = _run_runtime_cli([
+                    "skill",
+                    "heal",
+                    "alpha",
+                    "--cwd",
+                    str(repo),
+                    "--format",
+                    "json",
+                ])
+
+            first = json.loads(first_text)
+            second = json.loads(second_text)
+            policy = _repo_override_policy(repo)
+            claude_linked = (repo / ".claude" / "skills" / "alpha").is_symlink()
+            codex_linked = (repo / ".codex" / "skills" / "alpha").is_symlink()
+
+        self.assertEqual(first_code, 0)
+        self.assertEqual(second_code, 0)
+        self.assertEqual(policy["pin_on"], ["alpha"])
+        self.assertTrue(policy["reason"].startswith("heal:alpha "))
+        self.assertTrue(claude_linked)
+        self.assertTrue(codex_linked)
+        self.assertEqual(first["action"], "heal")
+        self.assertTrue(first["changed"])
+        self.assertEqual(first["summary"]["link"], 2)
+        self.assertEqual(first["activation_packet"]["skill_md_sha256"], expected_sha)
+        self.assertEqual(second["action"], "heal")
+        self.assertFalse(second["changed"])
+        self.assertTrue(second["noop"])
+        self.assertEqual(second["actions"], [])
+        self.assertEqual(second["activation_packet"], first["activation_packet"])
+
+    def test_skill_heal_unknown_refuses_without_writing_dangling_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            fake_home = root / "home"
+            source_root = root / "sources"
+            _write_source_skill(source_root, "alpha")
+            model = _write_global_floor_policy(root, source_root, "alpha", repo)
+
+            with (
+                mock.patch("runtime_manager.skill_visibility.Path.home", return_value=fake_home),
+                mock.patch.object(RUNTIME_CLI, "_filtered_model_for_args", return_value=model),
+            ):
+                code, text = _run_runtime_cli([
+                    "skill",
+                    "heal",
+                    "alpah",
+                    "--cwd",
+                    str(repo),
+                    "--format",
+                    "json",
+                ])
+
+            payload = json.loads(text)
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(payload["error_code"], OVERRIDE_SKILL_UNKNOWN)
+        self.assertIn("alpha", payload["error"]["context"]["suggestions"])
+        self.assertFalse((repo / ".skillbox" / "skill-overrides.yaml").exists())
+
+    def test_skill_heal_explicit_source_mismatch_refuses_without_writing_dangling_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            fake_home = root / "home"
+            source_root = root / "sources"
+            source = _write_source_skill(source_root, "sbp")
+            model = _write_global_floor_policy(root, source_root, "alpha", repo)
+
+            with (
+                mock.patch("runtime_manager.skill_visibility.Path.home", return_value=fake_home),
+                mock.patch.object(RUNTIME_CLI, "_filtered_model_for_args", return_value=model),
+            ):
+                code, text = _run_runtime_cli([
+                    "skill",
+                    "heal",
+                    "madeup-skill-name",
+                    "--source",
+                    str(source),
+                    "--cwd",
+                    str(repo),
+                    "--format",
+                    "json",
+                ])
+
+            payload = json.loads(text)
+            override_exists = (repo / ".skillbox" / "skill-overrides.yaml").exists()
+            claude_link_exists = (repo / ".claude" / "skills" / "madeup-skill-name").exists()
+            codex_link_exists = (repo / ".codex" / "skills" / "madeup-skill-name").exists()
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(payload["error_code"], OVERRIDE_SKILL_UNKNOWN)
+        self.assertIn("sbp", payload["error"]["context"]["suggestions"])
+        self.assertFalse(override_exists)
+        self.assertFalse(claude_link_exists)
+        self.assertFalse(codex_link_exists)
+
+    def test_skill_heal_missing_explicit_source_reports_unknown_without_writing_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            fake_home = root / "home"
+            source_root = root / "sources"
+            _write_source_skill(source_root, "alpha")
+            model = _write_global_floor_policy(root, source_root, "alpha", repo)
+
+            with (
+                mock.patch("runtime_manager.skill_visibility.Path.home", return_value=fake_home),
+                mock.patch.object(RUNTIME_CLI, "_filtered_model_for_args", return_value=model),
+            ):
+                code, text = _run_runtime_cli([
+                    "skill",
+                    "heal",
+                    "alpha",
+                    "--source",
+                    str(root / "missing"),
+                    "--cwd",
+                    str(repo),
+                    "--format",
+                    "json",
+                ])
+
+            payload = json.loads(text)
+            override_exists = (repo / ".skillbox" / "skill-overrides.yaml").exists()
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(payload["error_code"], OVERRIDE_SKILL_UNKNOWN)
+        self.assertFalse(override_exists)
+
+    def test_skill_heal_verify_fails_when_any_surface_target_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            fake_home = root / "home"
+            source_root = root / "sources"
+            _write_source_skill(source_root, "alpha")
+            model = _write_global_floor_policy(root, source_root, "alpha", repo)
+            conflict = repo / ".claude" / "skills" / "alpha"
+            conflict.mkdir(parents=True)
+
+            with (
+                mock.patch("runtime_manager.skill_visibility.Path.home", return_value=fake_home),
+                mock.patch.object(RUNTIME_CLI, "_filtered_model_for_args", return_value=model),
+            ):
+                code, text = _run_runtime_cli([
+                    "skill",
+                    "heal",
+                    "alpha",
+                    "--cwd",
+                    str(repo),
+                    "--verify",
+                    "--format",
+                    "json",
+                ])
+
+            payload = json.loads(text)
+            policy = _repo_override_policy(repo)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(policy["pin_on"], ["alpha"])
+        self.assertFalse(payload["verification"]["verified"])
+        statuses = {action["destination"]: action["status"] for action in payload["actions"]}
+        self.assertEqual(statuses[str(conflict)], "conflict_directory")
+        expected_targets = {
+            row["path"]: row
+            for row in payload["verification"]["expected_targets"]
+        }
+        self.assertFalse(expected_targets[str(conflict)]["ok"])
+        self.assertFalse(expected_targets[str(conflict)]["is_symlink"])
 
     def test_skill_on_parser_accepts_global_alias(self) -> None:
         parser = RUNTIME_CLI._build_parser()
