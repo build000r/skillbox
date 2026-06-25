@@ -96,7 +96,7 @@ The wrapper discovery contract. Agents should start here to learn the stable com
     {
       "json": true,
       "name": "robot-docs",
-      "safe_first_try": "sbp robot-docs guide"
+      "safe_first_try": "sbp robot-docs guide --json"
     },
     {
       "json": true,
