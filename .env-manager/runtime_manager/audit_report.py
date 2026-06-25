@@ -169,8 +169,8 @@ def _skill_visibility_recommendations(issues: dict[str, list[dict[str, Any]]]) -
             "allowed_paths": item.get("allowed_paths") or [],
             **_recommendation_provenance(item, "missing_for_cwd"),
             "hint": (
-                "Add this skill to the active client's skill-repos.yaml, or activate it "
-                "for this cwd ephemerally with `sbp skill activate <skill> --cwd <repo>`. "
+                "Add this skill to the active client's skill-repos.yaml, or durably pin it "
+                "for this repo with `sbp skill on <skill> --cwd $PWD`. "
                 "Use `sbp overlay activate <name> --cwd <repo>` for a one-session/cwd "
                 "policy-evaluated flip, or `sbp overlay on <name>` to PERSIST the overlay "
                 "across sessions until `overlay off`."
@@ -305,7 +305,7 @@ def _issue_row_fix_command(issue_type: str, row: dict[str, Any]) -> str:
         # ``broken_link_class_counts`` / ``_classified_broken_rows``).
         return f"rm {shlex.quote(path)}  # prune dead link {name!r}" if path else ""
     if issue_type == "missing_for_cwd":
-        return f"sbp skill activate {name} --cwd <repo>"
+        return f"sbp skill on {name} --cwd $PWD"
     if issue_type == "scope_violations":
         return f"sbp skill remove {name} --from project --cwd {path or '<repo>'} --yes"
     if issue_type == "global_not_allowed":
@@ -379,7 +379,8 @@ def _enrich_issue_rows(
                 new_row["origin"] = row.get("origin") or "dangling"
             else:
                 new_row.setdefault("origin", None)
-            new_row["fix_command"] = row.get("fix_command") or _issue_row_fix_command(
+            existing_fix_command = None if issue_type == "missing_for_cwd" else row.get("fix_command")
+            new_row["fix_command"] = existing_fix_command or _issue_row_fix_command(
                 issue_type, new_row
             )
             enriched.append(new_row)

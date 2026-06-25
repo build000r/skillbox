@@ -183,8 +183,8 @@ def test_recommendations_mirror_row_provenance(fixture_fleet) -> None:
     assert saw_any, "fixture fleet produced no recommendations to assert on"
 
 
-def test_missing_for_cwd_hint_distinguishes_overlay_on_vs_activate() -> None:
-    """The missing-skill hint teaches activate (ephemeral) vs on (persist).
+def test_missing_for_cwd_hint_uses_durable_on_recovery() -> None:
+    """The missing-skill fix command uses the durable `on` recovery.
 
     Driven directly off a synthetic ``missing_for_cwd`` issue group so the
     overlay-semantics contract is asserted deterministically (no fixture repo in
@@ -212,7 +212,7 @@ def test_missing_for_cwd_hint_distinguishes_overlay_on_vs_activate() -> None:
     assert rec["issue_type"] == "missing_for_cwd"
     assert rec["rule_id"] == "wiki-local"
     assert rec["policy_path"] == "/p/skill-scope.yaml"
-    assert "skill activate wiki" in rec["fix_command"]
+    assert rec["fix_command"] == "sbp skill on wiki --cwd $PWD"
 
 
 # --- direct-unit coverage of the fix-command derivation ---------------------
@@ -221,7 +221,7 @@ def test_missing_for_cwd_hint_distinguishes_overlay_on_vs_activate() -> None:
 @pytest.mark.parametrize(
     "issue_type,row,expected_substr",
     [
-        ("missing_for_cwd", {"name": "wiki"}, "skill activate wiki"),
+        ("missing_for_cwd", {"name": "wiki"}, "skill on wiki --cwd $PWD"),
         ("scope_violations", {"name": "wiki", "path": "/r/.claude/skills/wiki"}, "remove wiki --from project"),
         ("global_not_allowed", {"name": "wiki"}, "remove wiki --from global"),
         ("extra_global", {"name": "wiki"}, "remove wiki --from global"),

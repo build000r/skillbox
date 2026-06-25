@@ -320,10 +320,10 @@ The wrapper discovery contract. Agents should start here to learn the stable com
       "when_to_use": "Use after dry-run to remove drift that policy does not allow."
     },
     "recalibrate": {
-      "do_NOT": "Do not treat recalibrate as a mutator; it recommends commands.",
+      "do_NOT": "Do not treat bare recalibrate as a mutator; --auto-fix previews and --auto-fix --yes applies heal.",
       "links_disk": false,
       "mutates": "none",
-      "purpose": "Read-only cwd/fleet skill visibility audit with exact next commands.",
+      "purpose": "Read-only cwd/fleet skill visibility audit with exact next commands; --auto-fix previews heal, --yes applies.",
       "returns_packet": false,
       "scope": "cwd or fleet",
       "survives_recalibrate": false,
@@ -448,7 +448,7 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
         "categories": [
           "frontend"
         ],
-        "fix_command": "sbp skill activate tiny-ui --cwd <repo>",
+        "fix_command": "sbp skill on tiny-ui --cwd $PWD",
         "name": "tiny-ui",
         "origin": null,
         "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
@@ -530,8 +530,8 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
       "allowed_paths": [
         "<FLEET>/repos_real/overlay-repo"
       ],
-      "fix_command": "sbp skill activate tiny-ui --cwd <repo>",
-      "hint": "Add this skill to the active client's skill-repos.yaml, or activate it for this cwd ephemerally with `sbp skill activate <skill> --cwd <repo>`. Use `sbp overlay activate <name> --cwd <repo>` for a one-session/cwd policy-evaluated flip, or `sbp overlay on <name>` to PERSIST the overlay across sessions until `overlay off`.",
+      "fix_command": "sbp skill on tiny-ui --cwd $PWD",
+      "hint": "Add this skill to the active client's skill-repos.yaml, or durably pin it for this repo with `sbp skill on <skill> --cwd $PWD`. Use `sbp overlay activate <name> --cwd <repo>` for a one-session/cwd policy-evaluated flip, or `sbp overlay on <name>` to PERSIST the overlay across sessions until `overlay off`.",
       "issue_type": "missing_for_cwd",
       "origin": null,
       "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
@@ -1224,7 +1224,7 @@ A COMPOSITE human surface that stitches together several dry-run sub-calls (`sbp
         "categories": [
           "frontend"
         ],
-        "fix_command": "sbp skill activate tiny-ui --cwd <repo>",
+        "fix_command": "sbp skill on tiny-ui --cwd $PWD",
         "name": "tiny-ui",
         "origin": null,
         "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
@@ -1281,8 +1281,8 @@ A COMPOSITE human surface that stitches together several dry-run sub-calls (`sbp
       "allowed_paths": [
         "<FLEET>/repos_real/overlay-repo"
       ],
-      "fix_command": "sbp skill activate tiny-ui --cwd <repo>",
-      "hint": "Add this skill to the active client's skill-repos.yaml, or activate it for this cwd ephemerally with `sbp skill activate <skill> --cwd <repo>`. Use `sbp overlay activate <name> --cwd <repo>` for a one-session/cwd policy-evaluated flip, or `sbp overlay on <name>` to PERSIST the overlay across sessions until `overlay off`.",
+      "fix_command": "sbp skill on tiny-ui --cwd $PWD",
+      "hint": "Add this skill to the active client's skill-repos.yaml, or durably pin it for this repo with `sbp skill on <skill> --cwd $PWD`. Use `sbp overlay activate <name> --cwd <repo>` for a one-session/cwd policy-evaluated flip, or `sbp overlay on <name>` to PERSIST the overlay across sessions until `overlay off`.",
       "issue_type": "missing_for_cwd",
       "origin": null,
       "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
