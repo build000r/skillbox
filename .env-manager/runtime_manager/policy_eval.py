@@ -41,6 +41,7 @@ __all__ = [
     'OVERLAY_STATE_ENV',
     'OVERLAY_STATE_DEFAULT',
     'OVERLAY_ENV_VAR',
+    'OVERLAY_CLI_ENV_VAR',
     'SKILL_SOURCE_ROOT_KEYS',
     'SKILL_INSTALL_SCAN_ROOT_KEYS',
     'WILDCARD_CHARS',
@@ -61,6 +62,7 @@ __all__ = [
     '_skillset_layer',
     '_target_states_for_skill',
     '_overlay_state_path',
+    'active_overlay_records',
     'active_overlays',
     'set_overlay',
     'toggle_overlay',
@@ -123,6 +125,7 @@ SKILL_OVERRIDES_REL = Path(".skillbox") / "skill-overrides.yaml"
 OVERLAY_STATE_ENV = "SKILLBOX_OVERLAY_STATE"
 OVERLAY_STATE_DEFAULT = "~/.skillbox-state/overlays"
 OVERLAY_ENV_VAR = "SKILLBOX_OVERLAYS"
+OVERLAY_CLI_ENV_VAR = "SKILLBOX_CLI_OVERLAYS"
 SKILL_SOURCE_ROOT_KEYS = ("skill_source_roots", "source_roots", "skill_roots")
 SKILL_INSTALL_SCAN_ROOT_KEYS = ("skill_install_scan_roots", "install_scan_roots")
 WILDCARD_CHARS = set("*?[")
@@ -466,29 +469,160 @@ def _overlay_state_path() -> Path:
     return Path(os.path.expandvars(os.path.expanduser(raw)))
 
 
-def active_overlays() -> set[str]:
-    """Return the set of overlay names currently enabled for this operator.
+def _overlay_record(
+    name: str,
+    *,
+    enabled: bool,
+    layer: str,
+    label: str,
+    rank: int,
+    source: str,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "enabled": enabled,
+        "layer": layer,
+        "layer_label": label,
+        "layer_rank": rank,
+        "source": source,
+    }
 
-    Reads from the file at $SKILLBOX_OVERLAY_STATE (default
-    ~/.skillbox-state/overlays), one overlay name per line. $SKILLBOX_OVERLAYS
-    env var (comma-separated) augments the file so agent sessions can opt in
-    ephemerally without flipping global state.
-    """
-    overlays: set[str] = set()
+
+def _state_overlay_records() -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
     state_path = _overlay_state_path()
     if state_path.is_file():
         try:
             for line in state_path.read_text(encoding="utf-8").splitlines():
                 name = line.strip()
                 if name and not name.startswith("#"):
-                    overlays.add(name)
+                    records.append(
+                        _overlay_record(
+                            name,
+                            enabled=True,
+                            layer="operator-state-dir",
+                            label="operator overlay state",
+                            rank=OPERATOR_STATE_LAYER_RANK,
+                            source=str(state_path),
+                        )
+                    )
         except OSError:
             pass
-    for item in (os.environ.get(OVERLAY_ENV_VAR) or "").split(","):
-        name = item.strip()
+    return records
+
+
+def _env_overlay_records(env_var: str, *, layer: str, label: str, rank: int) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for item in (os.environ.get(env_var) or "").split(","):
+        token = item.strip()
+        if not token:
+            continue
+        enabled = not token.startswith("!")
+        name = token[1:].strip() if token.startswith("!") else token
         if name:
-            overlays.add(name)
-    return overlays
+            records.append(
+                _overlay_record(
+                    name,
+                    enabled=enabled,
+                    layer=layer,
+                    label=label,
+                    rank=rank,
+                    source=env_var,
+                )
+            )
+    return records
+
+
+def _repo_override_overlay_records(cwd: str | os.PathLike[str] | Path | None) -> list[dict[str, Any]]:
+    if cwd is None:
+        return []
+    policy = _repo_override_policy(cwd)
+    if not policy.get("ok"):
+        return []
+    policy_path = str(policy.get("_policy_path") or "")
+    records: list[dict[str, Any]] = []
+    overlays = policy.get("overlays") or {}
+    for name in overlays.get("enable") or []:
+        records.append(
+            _overlay_record(
+                str(name),
+                enabled=True,
+                layer="repo-override-file",
+                label="repo override file",
+                rank=REPO_OVERRIDE_LAYER_RANK,
+                source=policy_path,
+            )
+        )
+    for name in overlays.get("disable") or []:
+        records.append(
+            _overlay_record(
+                str(name),
+                enabled=False,
+                layer="repo-override-file",
+                label="repo override file",
+                rank=REPO_OVERRIDE_LAYER_RANK,
+                source=policy_path,
+            )
+        )
+    return records
+
+
+def active_overlay_records(
+    cwd: str | os.PathLike[str] | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Winning overlay decisions in total precedence order.
+
+    Higher ranks win: CLI env (`SKILLBOX_CLI_OVERLAYS`) > session env
+    (`SKILLBOX_OVERLAYS`) > repo override file > operator state dir. Env vars
+    accept `!name` to force-disable a lower layer for the current invocation.
+    """
+    raw_records = [
+        *_state_overlay_records(),
+        *_repo_override_overlay_records(cwd),
+        *_env_overlay_records(
+            OVERLAY_ENV_VAR,
+            layer="env-overlays",
+            label="session env overlays",
+            rank=ENV_LAYER_RANK,
+        ),
+        *_env_overlay_records(
+            OVERLAY_CLI_ENV_VAR,
+            layer="cli-overlays",
+            label="this invocation overlays",
+            rank=CLI_LAYER_RANK,
+        ),
+    ]
+    winners: dict[str, dict[str, Any]] = {}
+    for order, record in enumerate(raw_records):
+        name = str(record.get("name") or "").strip()
+        if not name:
+            continue
+        candidate = dict(record)
+        candidate["_order"] = order
+        current = winners.get(name)
+        if current is None or (
+            int(candidate.get("layer_rank") or 0),
+            int(candidate.get("_order") or 0),
+        ) >= (
+            int(current.get("layer_rank") or 0),
+            int(current.get("_order") or 0),
+        ):
+            winners[name] = candidate
+    cleaned = []
+    for record in winners.values():
+        item = dict(record)
+        item.pop("_order", None)
+        cleaned.append(item)
+    return sorted(cleaned, key=lambda item: str(item.get("name") or ""))
+
+
+def active_overlays(cwd: str | os.PathLike[str] | Path | None = None) -> set[str]:
+    """Return overlay names enabled by the winning precedence layer."""
+    return {
+        str(record.get("name") or "")
+        for record in active_overlay_records(cwd)
+        if record.get("enabled") and str(record.get("name") or "")
+    }
 
 
 def set_overlay(name: str, enabled: bool) -> bool:
@@ -595,7 +729,10 @@ def rule_overlay_tags(model: dict[str, Any]) -> set[str]:
     return tags
 
 
-def undeclared_active_overlays(model: dict[str, Any]) -> list[str]:
+def undeclared_active_overlays(
+    model: dict[str, Any],
+    cwd: str | os.PathLike[str] | Path | None = None,
+) -> list[str]:
     """Active overlay-state entries that name an UNDECLARED overlay.
 
     An overlay-state-file entry (or ``SKILLBOX_OVERLAYS`` opt-in) for a name with
@@ -607,7 +744,7 @@ def undeclared_active_overlays(model: dict[str, Any]) -> list[str]:
     declared = declared_overlays(model)
     if not declared:
         return []
-    return sorted(name for name in active_overlays() if name not in declared)
+    return sorted(name for name in active_overlays(cwd) if name not in declared)
 
 
 def overlay_scoped_skill_names(model: dict[str, Any], overlay_name: str) -> set[str]:
@@ -1647,10 +1784,16 @@ def last_scope_rule_errors() -> list[dict[str, Any]]:
     return [dict(item) for item in _LAST_SCOPE_RULE_ERRORS]
 
 
-def _scope_rules(model: dict[str, Any]) -> list[dict[str, Any]]:
+def _scope_rules(
+    model: dict[str, Any],
+    *,
+    cwd: str | os.PathLike[str] | Path | None = None,
+    overlays_on: set[str] | None = None,
+) -> list[dict[str, Any]]:
     rules: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
-    overlays_on = active_overlays()
+    if overlays_on is None:
+        overlays_on = active_overlays(cwd)
     # Load the registry id->path taxonomy once per pass (not per rule) so
     # `repos:`/registry-`categories:` resolution stays cheap.
     registry_entries = _load_registry_entries()
@@ -1843,7 +1986,7 @@ def _skill_is_effective(effective: list[dict[str, Any]], skill_name: str) -> boo
 def _matched_scope_rules_for_cwd(model: dict[str, Any], cwd: Path) -> list[dict[str, Any]]:
     matched: list[dict[str, Any]] = []
     cwd = cwd.resolve()
-    for rule in _scope_rules(model):
+    for rule in _scope_rules(model, cwd=cwd):
         paths = list(rule.get("paths") or [])
         matched_paths = [path for path in paths if _path_prefix_matches(cwd, path)]
         if not matched_paths:

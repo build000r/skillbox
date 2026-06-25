@@ -18,11 +18,17 @@ if str(ENV_MANAGER_DIR) not in sys.path:
     sys.path.insert(0, str(ENV_MANAGER_DIR))
 
 from runtime_manager import policy_eval as POLICY_EVAL  # noqa: E402
+from runtime_manager import skill_visibility as SKILL_VISIBILITY  # noqa: E402
 from runtime_manager.errors import OVERRIDE_PARSE_ERROR  # noqa: E402
 from runtime_manager.policy_eval import (  # noqa: E402
     OverrideWriteLockTimeout,
     _repo_override_policy,
     update_repo_override_policy,
+)
+from runtime_manager.skill_visibility import (  # noqa: E402
+    active_overlays,
+    collect_skill_visibility,
+    explain_skill_visibility,
 )
 from tests.fixture_fleet import build_fixture_fleet  # noqa: E402
 
@@ -40,6 +46,17 @@ def _append_pin(policy: dict[str, object], name: str) -> dict[str, object]:
         pins.append(name)
     policy["pin_on"] = pins
     return policy
+
+
+def _write_override(repo: Path, text: str) -> None:
+    (repo / ".skillbox").mkdir(exist_ok=True)
+    (repo / ".skillbox" / "skill-overrides.yaml").write_text(text, encoding="utf-8")
+
+
+def _write_project_skill(repo: Path, name: str) -> None:
+    skill_dir = repo / ".codex" / "skills" / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(f"# {name}\n", encoding="utf-8")
 
 
 def _override_writer_worker(repo_path: str, name: str) -> None:
@@ -220,6 +237,170 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
                 os.close(lock_fd)
 
         self.assertEqual(ctx.exception.lock_path, lock_path)
+
+    def test_repo_override_pin_on_and_pin_off_are_effective_layers_shared_by_explain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = _make_repo(Path(tmpdir))
+            _write_project_skill(repo, "alpha")
+            _write_project_skill(repo, "beta")
+            _write_override(repo, "version: 1\npin_on: [alpha]\npin_off: [beta]\n")
+
+            payload = collect_skill_visibility(
+                {},
+                cwd=str(repo),
+                include_global=False,
+                include_project=True,
+            )
+            explanation = explain_skill_visibility(
+                {},
+                "alpha",
+                cwd=str(repo),
+                include_global=False,
+                include_project=True,
+            )
+            disabled_explanation = explain_skill_visibility(
+                {},
+                "beta",
+                cwd=str(repo),
+                include_global=False,
+                include_project=True,
+            )
+
+        effective = {item["name"]: item for item in payload["effective"]}
+        decisions = {item["name"]: item for item in payload["visibility_decisions"]}
+        self.assertEqual(effective["alpha"]["layer"], "repo-override-file")
+        self.assertEqual(effective["alpha"]["winning_layer"], "repo-override-file")
+        self.assertEqual(effective["alpha"]["state"], "pinned")
+        self.assertNotIn("beta", effective)
+        self.assertEqual(decisions["beta"]["layer"], "repo-override-file")
+        self.assertEqual(decisions["beta"]["winning_layer"], "repo-override-file")
+        self.assertEqual(decisions["beta"]["state"], "disabled")
+        self.assertEqual(explanation["layer"], "repo-override-file")
+        self.assertTrue(explanation["visible"])
+        self.assertEqual(disabled_explanation["layer"], "repo-override-file")
+        self.assertFalse(disabled_explanation["visible"])
+        self.assertEqual(disabled_explanation["winner"]["state"], "disabled")
+        self.assertIn("disabled by the OVERRIDE layer", disabled_explanation["reason"])
+
+    def test_repo_override_pin_off_cannot_disable_dispatcher_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = _make_repo(Path(tmpdir))
+            _write_project_skill(repo, "sbp")
+            _write_override(repo, "version: 1\npin_off: [sbp]\n")
+
+            payload = collect_skill_visibility(
+                {},
+                cwd=str(repo),
+                include_global=False,
+                include_project=True,
+            )
+
+        effective = {item["name"]: item for item in payload["effective"]}
+        self.assertNotEqual(effective["sbp"]["layer"], "repo-override-file")
+        self.assertEqual(effective["sbp"]["state"], "ok")
+        override_layer = [
+            layer for layer in payload["layers"]
+            if layer.get("id") == "repo-override-file"
+        ][0]
+        self.assertEqual(override_layer["vetoed_floor"], ["sbp"])
+
+    def test_repo_override_pin_on_without_source_is_not_effective(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = _make_repo(Path(tmpdir))
+            _write_override(repo, "version: 1\npin_on: [ghost]\n")
+
+            payload = collect_skill_visibility(
+                {},
+                cwd=str(repo),
+                include_global=False,
+                include_project=True,
+            )
+            explanation = explain_skill_visibility(
+                {},
+                "ghost",
+                cwd=str(repo),
+                include_global=False,
+                include_project=True,
+            )
+
+        effective = {item["name"]: item for item in payload["effective"]}
+        decisions = {item["name"]: item for item in payload["visibility_decisions"]}
+        self.assertNotIn("ghost", effective)
+        self.assertEqual(decisions["ghost"]["layer"], "repo-override-file")
+        self.assertEqual(decisions["ghost"]["winning_layer"], "repo-override-file")
+        self.assertEqual(decisions["ghost"]["state"], "broken")
+        self.assertEqual(decisions["ghost"]["broken_reason"], "override_source_missing")
+        self.assertEqual(explanation["layer"], "repo-override-file")
+        self.assertFalse(explanation["visible"])
+        self.assertEqual(explanation["winner"]["state"], "broken")
+        self.assertIn("no installed occurrence or source was found", explanation["reason"])
+
+    def test_overlay_precedence_cli_env_repo_operator_base_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            state_path = root / "overlays.txt"
+            state_path.write_text("marketing\n", encoding="utf-8")
+            _write_override(
+                repo,
+                "version: 1\n"
+                "overlays:\n"
+                "  disable: [marketing]\n",
+            )
+            model = {
+                "active_clients": ["personal"],
+                "clients": [
+                    {
+                        "id": "personal",
+                        "context": {
+                            "skill_scope": {
+                                "overlays": [{"name": "marketing"}],
+                                "rules": [
+                                    {
+                                        "id": "marketing-rule",
+                                        "skills": ["promo"],
+                                        "overlay": "marketing",
+                                        "paths": [str(repo)],
+                                    }
+                                ],
+                            }
+                        },
+                    }
+                ],
+                "skills": [],
+            }
+
+            base_env = {
+                "SKILLBOX_OVERLAY_STATE": str(state_path),
+                "SKILLBOX_OVERLAYS": "",
+                "SKILLBOX_CLI_OVERLAYS": "",
+            }
+            with mock.patch.dict(SKILL_VISIBILITY.os.environ, base_env, clear=False):
+                self.assertNotIn("marketing", active_overlays(repo))
+                disabled = collect_skill_visibility(
+                    model,
+                    cwd=str(repo),
+                    include_global=False,
+                    include_project=False,
+                )
+                self.assertEqual(disabled["matched_scope_rules"], [])
+
+            env_on = dict(base_env)
+            env_on["SKILLBOX_OVERLAYS"] = "marketing"
+            with mock.patch.dict(SKILL_VISIBILITY.os.environ, env_on, clear=False):
+                self.assertIn("marketing", active_overlays(repo))
+                enabled = collect_skill_visibility(
+                    model,
+                    cwd=str(repo),
+                    include_global=False,
+                    include_project=False,
+                )
+                self.assertEqual(enabled["matched_scope_rules"][0]["id"], "marketing-rule")
+
+            cli_off = dict(env_on)
+            cli_off["SKILLBOX_CLI_OVERLAYS"] = "!marketing"
+            with mock.patch.dict(SKILL_VISIBILITY.os.environ, cli_off, clear=False):
+                self.assertNotIn("marketing", active_overlays(repo))
 
 
 if __name__ == "__main__":

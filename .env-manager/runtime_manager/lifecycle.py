@@ -178,11 +178,11 @@ def activate_overlay_scoped_skills(
 ) -> list[dict[str, Any]]:
     """Policy-evaluate one overlay for THIS invocation, scoped to ``cwd``.
 
-    This is equivalent to ``SKILLBOX_OVERLAYS=<overlay_name> skill sync``
+    This is equivalent to ``SKILLBOX_CLI_OVERLAYS=<overlay_name> skill sync``
     narrowed to ``cwd`` — it runs the SAME policy evaluation as ``skill sync``
     rather than blindly linking every literal overlay-tagged skill. The named
     overlay is treated as active only for the duration of this call (the
-    ``SKILLBOX_OVERLAYS`` env var that ``active_overlays`` reads is patched and
+    ``SKILLBOX_CLI_OVERLAYS`` env var that ``active_overlays`` reads is patched and
     restored), so NO overlay state is persisted.
 
     The sync plan it builds is the contract: ``--dry-run`` previews exactly the
@@ -194,11 +194,11 @@ def activate_overlay_scoped_skills(
     if not target:
         return []
 
-    previous = os.environ.get(OVERLAY_ENV_VAR)
+    previous = os.environ.get(OVERLAY_CLI_ENV_VAR)
     forced = [item for item in (previous or "").split(",") if item.strip()]
     if target not in forced:
         forced.append(target)
-    os.environ[OVERLAY_ENV_VAR] = ",".join(forced)
+    os.environ[OVERLAY_CLI_ENV_VAR] = ",".join(forced)
     try:
         plan = skill_lifecycle_plan(
             model,
@@ -218,9 +218,9 @@ def activate_overlay_scoped_skills(
         )
     finally:
         if previous is None:
-            os.environ.pop(OVERLAY_ENV_VAR, None)
+            os.environ.pop(OVERLAY_CLI_ENV_VAR, None)
         else:
-            os.environ[OVERLAY_ENV_VAR] = previous
+            os.environ[OVERLAY_CLI_ENV_VAR] = previous
 
     return _activations_from_sync_plan(plan)
 
@@ -249,7 +249,7 @@ def _skill_destination_bases(
     if requested == "category":
         category_ids = categories
         if not category_ids:
-            rule = _matching_scope_rule(skill_name, _scope_rules(model), cwd=cwd)
+            rule = _matching_scope_rule(skill_name, _scope_rules(model, cwd=cwd), cwd=cwd)
             category_ids = list(rule.get("categories") or []) if rule else []
         if not category_ids:
             warnings.append("No project category was supplied or inferred; falling back to the current repo.")
@@ -269,7 +269,7 @@ def _skill_destination_bases(
                 })
         return requested, bases, warnings
 
-    rule = _matching_scope_rule(skill_name, _scope_rules(model), cwd=cwd)
+    rule = _matching_scope_rule(skill_name, _scope_rules(model, cwd=cwd), cwd=cwd)
     matched_paths: list[str] = []
     if rule:
         matched_paths = [
@@ -488,7 +488,7 @@ def _skill_blocked_reason(
     if resolved_to == "global" and not _global_install_allowed(model, skill_name) and not force:
         return "global install is not allowed by skill-scope policy"
     if resolved_to == "project" and not force:
-        rule = _matching_scope_rule(skill_name, _scope_rules(model), cwd=cwd)
+        rule = _matching_scope_rule(skill_name, _scope_rules(model, cwd=cwd), cwd=cwd)
         allowed_paths = list(rule.get("paths") or []) if rule else []
         if allowed_paths and not any(_path_prefix_matches(cwd, path) for path in allowed_paths):
             return "project install is outside allowed skill-scope paths"
