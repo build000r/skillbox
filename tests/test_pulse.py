@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from importlib.machinery import SourceFileLoader
@@ -789,6 +790,27 @@ class PulseTests(unittest.TestCase):
         self.assertEqual(event.call_args.args[0], "pulse.port_sentinel")
         self.assertEqual(event.call_args.args[2]["action"], "observed")
 
+    def test_port_sentinel_counts_active_candidate_once(self) -> None:
+        state = PULSE_MODULE.PulseState()
+        candidate = self._rogue_candidate()
+        candidate["cmdline"] = "node vite --host 0.0.0.0 --port 5174"
+
+        with (
+            mock.patch.object(PULSE_MODULE, "_port_sentinel_config", return_value=("observe", 15.0)),  # noqa: SLF001
+            mock.patch.object(PULSE_MODULE, "_scan_rogue_listeners", return_value=[candidate]),  # noqa: SLF001
+            mock.patch.object(PULSE_MODULE, "_terminate_rogue") as terminate,  # noqa: SLF001
+            mock.patch.object(PULSE_MODULE, "log_runtime_event") as event,
+            mock.patch.object(PULSE_MODULE, "log"),
+        ):
+            PULSE_MODULE._reconcile_port_sentinel({}, state, now=10.0)  # noqa: SLF001
+            PULSE_MODULE._reconcile_port_sentinel({}, state, now=11.0)  # noqa: SLF001
+
+        terminate.assert_not_called()
+        self.assertEqual(state.port_sentinel_counters["rogues_seen"], 1)
+        self.assertEqual(state.port_sentinel_counters["wildcard_criticals"], 1)
+        self.assertEqual(state.port_sentinel_counters["by_signature"], {"vite": 1})
+        self.assertEqual(event.call_count, 1)
+
     def test_port_sentinel_enforce_reaps_dev_signature_after_grace(self) -> None:
         state = PULSE_MODULE.PulseState()
         candidate = self._rogue_candidate()
@@ -831,8 +853,14 @@ class PulseTests(unittest.TestCase):
             "events_emitted": 2,
             "port_sentinel": {
                 "mode": "observe",
+                "hook_blocks": 2,
+                "shim_blocks": 1,
+                "post_bind_mismatches": 1,
                 "rogues_seen": 3,
                 "rogues_reaped": 1,
+                "wildcard_criticals": 1,
+                "first_seen_at": "2026-06-01T00:00:00Z",
+                "last_seen_at": "2026-06-02T00:00:00Z",
                 "active_candidates": 1,
                 "last_candidates": [
                     {"pid": 333, "port": 5174, "signature": "vite", "enforcement": "dev-server"}
@@ -845,7 +873,89 @@ class PulseTests(unittest.TestCase):
 
         output = stdout.getvalue()
         self.assertIn("port sentinel: observe, seen 3, reaped 1, active 1", output)
+        self.assertIn("port guard counters: hook 2, shim 1, post-bind 1, wildcard 1", output)
         self.assertIn("pid 333 port 5174 vite dev-server", output)
+
+    def test_port_guard_counters_hydrate_from_state_and_external_telemetry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state_path = PULSE_MODULE.pulse_state_path(root)
+            telemetry_path = PULSE_MODULE.port_guard_telemetry_path(root)
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "port_sentinel": {
+                            "rogues_seen": 2,
+                            "rogues_reaped": 1,
+                            "by_signature": {"vite": 2},
+                            "first_seen_at": "2026-06-01T00:00:00Z",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            telemetry_path.write_text(
+                json.dumps(
+                    {
+                        "counters": {
+                            "hook_blocks": 3,
+                            "shim_blocks": 1,
+                            "post_bind_mismatches": 2,
+                            "last_seen_at": "2026-06-02T00:00:00Z",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            state = PULSE_MODULE.load_pulse_state(root)
+
+        counters = state.port_sentinel_counters
+        self.assertEqual(counters["rogues_seen"], 2)
+        self.assertEqual(counters["rogues_reaped"], 1)
+        self.assertEqual(counters["hook_blocks"], 3)
+        self.assertEqual(counters["shim_blocks"], 1)
+        self.assertEqual(counters["post_bind_mismatches"], 2)
+        self.assertEqual(counters["by_signature"], {"vite": 2})
+        self.assertEqual(counters["first_seen_at"], "2026-06-01T00:00:00Z")
+        self.assertEqual(counters["last_seen_at"], "2026-06-02T00:00:00Z")
+
+    def test_read_state_merges_external_port_guard_telemetry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state_path = PULSE_MODULE.pulse_state_path(root)
+            telemetry_path = PULSE_MODULE.port_guard_telemetry_path(root)
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "updated_at": time.time(),
+                        "port_sentinel": {
+                            "rogues_seen": 2,
+                            "first_seen_at": "2026-06-01T00:00:00Z",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            telemetry_path.write_text(
+                json.dumps(
+                    {
+                        "counters": {
+                            "hook_blocks": 4,
+                            "last_seen_at": "2026-06-02T00:00:00Z",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            state = PULSE_MODULE.read_state(root)
+
+        self.assertEqual(state["port_sentinel"]["rogues_seen"], 2)
+        self.assertEqual(state["port_sentinel"]["hook_blocks"], 4)
+        self.assertEqual(state["port_sentinel"]["last_seen_at"], "2026-06-02T00:00:00Z")
 
     def test_port_sentinel_real_socket_is_report_only_in_observe_mode(self) -> None:
         code = (

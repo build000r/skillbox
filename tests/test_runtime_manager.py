@@ -1023,8 +1023,8 @@ class RuntimeManagerTests(unittest.TestCase):
 
             sync = self._run(repo, "sync", "--profile", "connectors-dev", "--format", "json")
             self.assertEqual(sync.returncode, 0, sync.stderr)
-            self.assertTrue((repo / "repos" / "flywheel_connectors").is_dir())
-            self.assertTrue((repo / "repos" / "destructive_command_guard").is_dir())
+            self.assertTrue((repo / "repos" / "flywheel-connectors").is_dir())
+            self.assertTrue((repo / "repos" / "destructive-command-guard").is_dir())
 
     def test_doctor_fails_when_client_connectors_exceed_box_superset(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5195,7 +5195,7 @@ class RuntimeManagerTests(unittest.TestCase):
             "  repos:\n"
             "    - id: flywheel-connectors\n"
             "      kind: repo\n"
-            "      path: ${SKILLBOX_REPOS_ROOT}/flywheel_connectors\n"
+            "      path: ${SKILLBOX_REPOS_ROOT}/flywheel-connectors\n"
             "      required: false\n"
             "      profiles:\n"
             "        - connectors-dev\n"
@@ -5205,7 +5205,7 @@ class RuntimeManagerTests(unittest.TestCase):
             "        mode: ensure-directory\n"
             "    - id: destructive-command-guard\n"
             "      kind: repo\n"
-            "      path: ${SKILLBOX_REPOS_ROOT}/destructive_command_guard\n"
+            "      path: ${SKILLBOX_REPOS_ROOT}/destructive-command-guard\n"
             "      required: false\n"
             "      profiles:\n"
             "        - connectors-dev\n"
@@ -6737,6 +6737,71 @@ class RuntimeManagerTests(unittest.TestCase):
         self.assertEqual([item["code"] for item in doctor["failures"]], ["skill-repo-lock"])
         self.assertEqual([item["code"] for item in doctor["warnings"]], ["pulse"])
 
+    def test_stewardship_pulse_evidence_includes_port_guard_counters(self) -> None:
+        from runtime_manager import workflows
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            runtime_dir = root / "logs" / "runtime"
+            runtime_dir.mkdir(parents=True)
+            (runtime_dir / "pulse.state.json").write_text(
+                json.dumps(
+                    {
+                        "pid": 123,
+                        "updated_at": time.time(),
+                        "cycle_count": 9,
+                        "port_sentinel": {
+                            "mode": "observe",
+                            "rogues_seen": 2,
+                            "rogues_reaped": 1,
+                            "first_seen_at": "2026-06-01T00:00:00Z",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (runtime_dir / "port-guard.telemetry.json").write_text(
+                json.dumps(
+                    {
+                        "counters": {
+                            "hook_blocks": 4,
+                            "shim_blocks": 1,
+                            "post_bind_mismatches": 2,
+                            "wildcard_criticals": 0,
+                            "last_seen_at": "2026-06-15T00:00:00Z",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            evidence = workflows._stewardship_pulse_evidence(  # noqa: SLF001
+                root,
+                {"logs": [{"id": "runtime", "host_path": str(runtime_dir)}]},
+                time.time(),
+            )
+
+        port_sentinel = evidence["port_sentinel"]
+        self.assertEqual(port_sentinel["hook_blocks"], 4)
+        self.assertEqual(port_sentinel["shim_blocks"], 1)
+        self.assertEqual(port_sentinel["post_bind_mismatches"], 2)
+        self.assertEqual(port_sentinel["rogues_seen"], 2)
+        self.assertIn(evidence["port_guard"]["status"], {"warming_up", "assessed"})
+
+    def test_stewardship_port_guard_assessment_blocks_wildcard_criticals(self) -> None:
+        from runtime_manager import workflows
+
+        first_seen = time.time() - (15 * 86400)
+        evidence = workflows._port_guard_assessment(  # noqa: SLF001
+            {
+                "first_seen_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(first_seen)),
+                "wildcard_criticals": 1,
+            },
+            time.time(),
+        )
+
+        self.assertEqual(evidence["status"], "blocked")
+        self.assertFalse(evidence["enforce_flip_ready"])
+
     def test_stewardship_helper_risks_include_doctor_first(self) -> None:
         from runtime_manager import workflows
 
@@ -6786,6 +6851,17 @@ class RuntimeManagerTests(unittest.TestCase):
                     "recent_errors": {"count": 1},
                 },
                 "evidence": {
+                    "pulse": {
+                        "port_sentinel": {
+                            "hook_blocks": 2,
+                            "shim_blocks": 1,
+                            "post_bind_mismatches": 1,
+                            "rogues_seen": 3,
+                            "rogues_reaped": 1,
+                            "wildcard_criticals": 0,
+                        },
+                        "port_guard": {"status": "warming_up"},
+                    },
                     "doctor": {
                         "status": "fail",
                         "counts": {"fail": 1},
@@ -6819,6 +6895,7 @@ class RuntimeManagerTests(unittest.TestCase):
         self.assertIn("# Stewardship Report: personal", markdown)
         self.assertIn("HIGH: Runtime doctor validation is failing (`doctor-validation`)", markdown)
         self.assertIn("- Doctor: fail (1 failing)", markdown)
+        self.assertIn("- Port guard: hook 2, shim 1, post-bind 1, rogues 3/1, wildcard 0 (warming_up)", markdown)
         self.assertIn("Failure `skill-repo-lock`: managed skill locks are stale", markdown)
         self.assertIn("personal: config_sha mismatch", markdown)
         self.assertIn("- backup-recovery: No restore drill.", markdown)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import calendar
+
 from .shared import *
 from .validation import *
 from .runtime_ops import *
@@ -2047,6 +2049,15 @@ STEWARDSHIP_PULSE_STATE_RELS = (
     Path("logs") / "runtime" / "pulse.state.json",
     Path(".skillbox-state") / "logs" / "runtime" / "pulse.state.json",
 )
+STEWARDSHIP_PORT_GUARD_TELEMETRY_NAME = "port-guard.telemetry.json"
+STEWARDSHIP_PORT_GUARD_COUNTER_KEYS = (
+    "hook_blocks",
+    "shim_blocks",
+    "post_bind_mismatches",
+    "rogues_seen",
+    "rogues_reaped",
+    "wildcard_criticals",
+)
 
 
 def _stewardship_utc_now() -> tuple[float, str, str]:
@@ -2123,6 +2134,83 @@ def _stewardship_pulse_candidates(root_dir: Path, model: dict[str, Any]) -> list
     return unique
 
 
+def _stewardship_port_guard_telemetry_candidates(root_dir: Path, model: dict[str, Any]) -> list[Path]:
+    candidates = [
+        path.with_name(STEWARDSHIP_PORT_GUARD_TELEMETRY_NAME)
+        for path in _stewardship_pulse_candidates(root_dir, model)
+    ]
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        marker = str(candidate)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique.append(candidate)
+    return unique
+
+
+def _merge_port_guard_telemetry(
+    root_dir: Path,
+    model: dict[str, Any],
+    port_sentinel: dict[str, Any],
+) -> dict[str, Any]:
+    merged = dict(port_sentinel)
+    telemetry_path = next(
+        (path for path in _stewardship_port_guard_telemetry_candidates(root_dir, model) if path.is_file()),
+        None,
+    )
+    if telemetry_path is None:
+        return merged
+    _status, payload, _error = _load_optional_json_object(telemetry_path)
+    counters = payload.get("counters") if isinstance(payload.get("counters"), dict) else payload
+    if not isinstance(counters, dict):
+        return merged
+    for key in STEWARDSHIP_PORT_GUARD_COUNTER_KEYS:
+        try:
+            merged[key] = max(int(merged.get(key) or 0), int(counters.get(key) or 0))
+        except (TypeError, ValueError):
+            continue
+    for key in ("first_seen_at", "last_seen_at", "last_reaped_at"):
+        values = [str(merged.get(key) or "").strip(), str(counters.get(key) or "").strip()]
+        values = [value for value in values if value]
+        if values:
+            merged[key] = min(values) if key == "first_seen_at" else max(values)
+    merged["telemetry_path"] = repo_rel(root_dir, telemetry_path)
+    return merged
+
+
+def _parse_utc_z(value: str) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return float(calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ")))
+    except ValueError:
+        return None
+
+
+def _port_guard_assessment(port_sentinel: dict[str, Any], now: float) -> dict[str, Any]:
+    first_seen = _parse_utc_z(str(port_sentinel.get("first_seen_at") or ""))
+    observation_days = 0.0 if first_seen is None else max(0.0, (now - first_seen) / 86400.0)
+    wildcard = int(port_sentinel.get("wildcard_criticals") or 0)
+    observed_long_enough = observation_days >= 14.0
+    if first_seen is None:
+        status = "not_assessed"
+    elif wildcard > 0:
+        status = "blocked"
+    elif observed_long_enough:
+        status = "assessed"
+    else:
+        status = "warming_up"
+    return {
+        "status": status,
+        "observation_days": round(observation_days, 2),
+        "enforce_flip_ready": bool(observed_long_enough and wildcard == 0),
+        "enforce_flip_rule": "14 consecutive days of port-guard counters with zero wildcard criticals and no false-positive reports",
+    }
+
+
 def _stewardship_pulse_evidence(root_dir: Path, model: dict[str, Any], now: float) -> dict[str, Any]:
     candidates = _stewardship_pulse_candidates(root_dir, model)
     existing = next((path for path in candidates if path.is_file()), None)
@@ -2139,6 +2227,9 @@ def _stewardship_pulse_evidence(root_dir: Path, model: dict[str, Any], now: floa
         age_seconds = _state_age_seconds(payload, "updated_at", now)
         active_clients = payload.get("active_clients") or []
         active_profiles = payload.get("active_profiles") or []
+        port_sentinel = payload.get("port_sentinel") if isinstance(payload.get("port_sentinel"), dict) else {}
+        port_sentinel = _merge_port_guard_telemetry(root_dir, model, port_sentinel)
+        port_guard = _port_guard_assessment(port_sentinel, now)
         evidence.update(
             {
                 "pid": payload.get("pid"),
@@ -2150,6 +2241,8 @@ def _stewardship_pulse_evidence(root_dir: Path, model: dict[str, Any], now: floa
                 "events_emitted": payload.get("events_emitted"),
                 "active_clients": active_clients,
                 "active_profiles": active_profiles,
+                "port_sentinel": port_sentinel,
+                "port_guard": port_guard,
             }
         )
     return evidence
@@ -2744,6 +2837,9 @@ def _stewardship_markdown_evidence(payload: dict[str, Any]) -> str:
     services = health.get("services") or {}
     recent_errors = health.get("recent_errors") or {}
     evidence = payload.get("evidence") or {}
+    pulse = evidence.get("pulse") or {}
+    port_sentinel = pulse.get("port_sentinel") or {}
+    port_guard = pulse.get("port_guard") or {}
     sessions = evidence.get("sessions") or {}
     parity = evidence.get("parity_ledger") or {}
     dev_prod_parity = evidence.get("dev_prod_parity") or {}
@@ -2764,6 +2860,13 @@ def _stewardship_markdown_evidence(payload: dict[str, Any]) -> str:
         f"- Doctor: {doctor.get('status', 'unknown')} ({doctor_counts.get('fail', 0)} failing)",
         f"- Pressure: {pressure_disk.get('pressure_level', 'unknown')} ({pressure_disk.get('free_gib')}GiB free); target={pressure_target.get('id')}; rch={pressure_rch.get('state')}; sbh={pressure_sbh.get('state')}",
         f"- Dev/prod parity: {dev_prod_parity.get('status', 'not_assessed')} ({dev_prod_parity.get('blocking_count', 0)} blocking)",
+        "- Port guard: "
+        f"hook {port_sentinel.get('hook_blocks', 0)}, "
+        f"shim {port_sentinel.get('shim_blocks', 0)}, "
+        f"post-bind {port_sentinel.get('post_bind_mismatches', 0)}, "
+        f"rogues {port_sentinel.get('rogues_seen', 0)}/{port_sentinel.get('rogues_reaped', 0)}, "
+        f"wildcard {port_sentinel.get('wildcard_criticals', 0)} "
+        f"({port_guard.get('status', 'not_assessed')})",
     ]
     lines.extend(_stewardship_markdown_doctor_findings(doctor))
     lines.extend(

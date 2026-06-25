@@ -1179,6 +1179,7 @@ PORT_CONTRACT_UNADOPTED = "PORT_CONTRACT_UNADOPTED"
 PORT_CONTRACT_GITIGNORE = "PORT_CONTRACT_GITIGNORE"
 PORT_CONTRACT_STALE = "PORT_CONTRACT_STALE"
 PORT_CONTRACT_FILE_NAME = ".skillbox-port.env"
+PORT_GUARD_TELEMETRY_NAME = "port-guard.telemetry.json"
 
 _PORT_CONTRACT_ADOPTION_SNIPPET = (
     "Load .skillbox-port.env before dev startup; for Vite use "
@@ -3099,6 +3100,31 @@ def _service_port_guard_disabled() -> bool:
     return str(os.environ.get("SKILLBOX_PORT_GUARD") or "").strip().lower() == "off"
 
 
+def _port_guard_telemetry_path(root_dir: Path) -> Path:
+    return Path(root_dir) / "logs" / "runtime" / PORT_GUARD_TELEMETRY_NAME
+
+
+def _record_port_guard_telemetry(root_dir: Path, counter: str) -> None:
+    if counter not in {"post_bind_mismatches"}:
+        return
+    path = _port_guard_telemetry_path(root_dir)
+
+    def mutate(current: Any) -> dict[str, Any]:
+        payload = current if isinstance(current, dict) else {}
+        counters = payload.get("counters") if isinstance(payload.get("counters"), dict) else {}
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        counters[counter] = int(counters.get(counter) or 0) + 1
+        counters.setdefault("first_seen_at", stamp)
+        counters["last_seen_at"] = stamp
+        payload["counters"] = counters
+        return payload
+
+    try:
+        locked_json_update(path, mutate)
+    except (StateLockTimeout, OSError):
+        pass
+
+
 def _verify_service_declared_ports(
     model: dict[str, Any],
     service: dict[str, Any],
@@ -3296,6 +3322,7 @@ def _service_port_mismatch_result(
         },
         root_dir=event_root,
     )
+    _record_port_guard_telemetry(event_root, "post_bind_mismatches")
     return detail
 
 
