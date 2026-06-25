@@ -1409,6 +1409,26 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_client_arg(skill_lint_parser)
     _add_cwd_arg(skill_lint_parser)
 
+    skill_why_parser = skill_subparsers.add_parser(
+        "why",
+        help="Explain one skill's visibility provenance for this cwd, including absence and fixes.",
+    )
+    skill_why_parser.add_argument("skill_name")
+    skill_why_parser.add_argument("--format", choices=("text", "json"), default="text")
+    skill_why_parser.add_argument(
+        "--no-global",
+        action="store_true",
+        help="Do not inspect ~/.claude/skills or ~/.codex/skills.",
+    )
+    skill_why_parser.add_argument(
+        "--no-project",
+        action="store_true",
+        help="Do not inspect project-local .claude/.codex skill dirs near --cwd.",
+    )
+    _add_profile_arg(skill_why_parser)
+    _add_client_arg(skill_why_parser)
+    _add_cwd_arg(skill_why_parser)
+
     overlay_parser = subparsers.add_parser(
         "overlay",
         help="List, enable, disable, toggle, or activate skill scope overlays (e.g. marketing).",
@@ -4560,6 +4580,21 @@ def _handle_skill(args: argparse.Namespace, root_dir: Path, model: dict[str, Any
             item.get("severity") == "error"
             for item in payload.get("findings") or []
         ) else EXIT_OK
+
+    if skill_action == "why":
+        payload = explain_skill_visibility(
+            model,
+            args.skill_name,
+            cwd=args.cwd,
+            include_global=not getattr(args, "no_global", False),
+            include_project=not getattr(args, "no_project", False),
+        )
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            _print_explain_skill_text(payload)
+        # Absence is a successful diagnosis for this read-only command.
+        return EXIT_OK
 
     dry_run = bool(args.dry_run or skill_action == "plan")
     if skill_action in {"on", "off"}:

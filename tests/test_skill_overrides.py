@@ -211,7 +211,7 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
         self.assertTrue(policy["ok"], policy["errors"])
         self.assertEqual(policy["pin_on"], ["needs-beads"])
         self.assertEqual(policy["pin_off"], ["tiny-marketing"])
-        self.assertEqual(policy["opt_out_global"], ["project-status-mmdx"])
+        self.assertEqual(policy["opt_out_global"], ["fixture-global-optout"])
         self.assertEqual(policy["overlays"]["enable"], ["marketing"])
         self.assertEqual(policy["overlays"]["disable"], ["swarm"])
         self.assertEqual(policy["defaults"], ["tiny-ui"])
@@ -507,10 +507,21 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
         self.assertEqual(decisions["beta"]["winning_layer"], "repo-override-file")
         self.assertEqual(decisions["beta"]["state"], "disabled")
         self.assertEqual(explanation["layer"], "repo-override-file")
+        self.assertEqual(explanation["winning_layer"], "repo-override-file")
         self.assertTrue(explanation["visible"])
+        self.assertEqual(
+            [layer["layer"] for layer in explanation["layers"] if layer.get("wins")],
+            ["repo-override-file"],
+        )
         self.assertEqual(disabled_explanation["layer"], "repo-override-file")
+        self.assertEqual(disabled_explanation["winning_layer"], "repo-override-file")
         self.assertFalse(disabled_explanation["visible"])
         self.assertEqual(disabled_explanation["winner"]["state"], "disabled")
+        self.assertEqual(disabled_explanation["winner"]["override_action"], "pin_off")
+        self.assertEqual(
+            [layer["layer"] for layer in disabled_explanation["layers"] if layer.get("wins")],
+            ["repo-override-file"],
+        )
         self.assertIn("disabled by the OVERRIDE layer", disabled_explanation["reason"])
 
     def test_repo_override_pin_off_cannot_disable_dispatcher_floor(self) -> None:
@@ -534,6 +545,34 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
             if layer.get("id") == "repo-override-file"
         ][0]
         self.assertEqual(override_layer["vetoed_floor"], ["sbp"])
+
+    def test_explain_floor_skill_pin_off_veto_has_non_winning_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = _make_repo(Path(tmpdir))
+            _write_project_skill(repo, "sbp")
+            _write_override(repo, "version: 1\npin_off: [sbp]\n")
+
+            explanation = explain_skill_visibility(
+                {},
+                "sbp",
+                cwd=str(repo),
+                include_global=False,
+                include_project=True,
+            )
+
+        self.assertTrue(explanation["visible"])
+        self.assertEqual(explanation["winning_layer"], explanation["winner"]["layer"])
+        winning_layers = [layer for layer in explanation["layers"] if layer.get("wins")]
+        self.assertEqual(len(winning_layers), 1)
+        self.assertEqual(winning_layers[0]["layer"], explanation["winning_layer"])
+        veto_layers = [
+            layer for layer in explanation["layers"]
+            if layer.get("state") == "vetoed_floor"
+        ]
+        self.assertEqual(len(veto_layers), 1)
+        self.assertEqual(veto_layers[0]["layer"], "repo-override-file")
+        self.assertFalse(veto_layers[0]["wins"])
+        self.assertIn("cannot be disabled", veto_layers[0]["lost_reason"])
 
     def test_repo_override_pin_on_without_source_is_not_effective(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -562,9 +601,38 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
         self.assertEqual(decisions["ghost"]["state"], "broken")
         self.assertEqual(decisions["ghost"]["broken_reason"], "override_source_missing")
         self.assertEqual(explanation["layer"], "repo-override-file")
+        self.assertEqual(explanation["winning_layer"], "repo-override-file")
         self.assertFalse(explanation["visible"])
         self.assertEqual(explanation["winner"]["state"], "broken")
         self.assertIn("no installed occurrence or source was found", explanation["reason"])
+
+    def test_skill_why_cli_explains_absence_without_brain_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fleet = build_fixture_fleet(tmpdir)
+            buf = io.StringIO()
+
+            with fleet._home_patched(), mock.patch.object(
+                RUNTIME_CLI,
+                "_filtered_model_for_args",
+                return_value=fleet.model(),
+            ), contextlib.redirect_stdout(buf):
+                code = RUNTIME_CLI.main([
+                    "skill",
+                    "why",
+                    "needs-beads",
+                    "--cwd",
+                    str(fleet.repo("overlay-repo")),
+                    "--format",
+                    "json",
+                ])
+
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["skill"], "needs-beads")
+        self.assertFalse(payload["visible"])
+        self.assertEqual(payload["remediation"][0]["kind"], "on")
+        self.assertEqual(payload["remediation"][0]["command"], "sbp skill on needs-beads --cwd $PWD")
+        self.assertEqual(payload["next_actions"][0], "sbp skill on needs-beads --cwd $PWD")
 
     def test_prune_firewall_skips_pinned_override_at_plan_construction(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

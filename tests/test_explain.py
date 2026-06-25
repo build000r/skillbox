@@ -11,7 +11,7 @@ operator estate.
 The five required cases:
 
 * ``visible``               -- linked and effective at the cwd,
-* ``invisible_activatable``  -- a source exists but is not linked here,
+* ``invisible_activatable``  -- a source exists and can be durably turned on,
 * ``invisible_no_source``    -- no occurrence and no source anywhere,
 * ``overlay_gated``          -- only "expected" when an overlay is active,
 * ``shadowed``               -- a lower-layer occurrence loses to a higher one.
@@ -52,6 +52,17 @@ def _remediation_kinds(payload: dict) -> list[str]:
     return [step["kind"] for step in payload.get("remediation") or []]
 
 
+def _assert_single_winning_layer(payload: dict) -> None:
+    winners = [layer for layer in payload.get("layers") or [] if layer.get("wins")]
+    if payload.get("winner") is None:
+        assert winners == []
+        assert payload.get("winning_layer") is None
+        return
+    assert len(winners) == 1
+    assert winners[0]["layer"] == payload["winning_layer"]
+    assert winners[0]["layer"] == payload["winner"]["layer"]
+
+
 # --------------------------------------------------------------------------
 # Case 1: visible
 # --------------------------------------------------------------------------
@@ -69,7 +80,44 @@ def test_visible_skill_reports_winning_layer(fixture_fleet):
     assert sum(1 for occ in payload["occurrences"] if occ.get("won")) == 1
     assert payload["winner"] is not None
     assert payload["winner"]["won"] is True
+    assert payload["winner"]["wins"] is True
+    _assert_single_winning_layer(payload)
     assert payload["next_actions"] == ["already visible; no action needed"]
+
+
+# --------------------------------------------------------------------------
+# Case 1b: repo-local pin_on override
+# --------------------------------------------------------------------------
+
+def test_pinned_on_local_skill_reports_override_winning_layer(fixture_fleet):
+    case = CASES["pinned_on_local"]
+    payload = _explain(fixture_fleet, case["skill"], case["repo"])
+
+    assert payload["visible"] is case["visible"]
+    assert payload["layer"] == case["layer"]
+    assert payload["winning_layer"] == case["layer"]
+    assert payload["layer_family"] == case["layer_family"]
+    assert payload["winner"]["state"] == case["winner_state"]
+    assert payload["winner"]["override_action"] == "pin_on"
+    _assert_single_winning_layer(payload)
+
+
+# --------------------------------------------------------------------------
+# Case 1c: repo-local opt_out_global override
+# --------------------------------------------------------------------------
+
+def test_opt_out_global_skill_reports_disabled_override_layer(fixture_fleet):
+    case = CASES["opt_out_global"]
+    payload = _explain(fixture_fleet, case["skill"], case["repo"])
+
+    assert payload["visible"] is case["visible"]
+    assert payload["layer"] == case["layer"]
+    assert payload["winning_layer"] == case["layer"]
+    assert payload["layer_family"] == case["layer_family"]
+    assert payload["winner"]["state"] == case["winner_state"]
+    assert payload["winner"]["override_action"] == "opt_out_global"
+    assert case["reason_contains"] in payload["reason"]
+    _assert_single_winning_layer(payload)
 
 
 # --------------------------------------------------------------------------
@@ -86,11 +134,13 @@ def test_invisible_activatable_skill_ranks_activate_first(fixture_fleet):
     assert payload["remediation"][0]["kind"] == case["top_remediation_kind"]
     assert case["reason_contains"] in payload["reason"]
     assert bool(payload["source_options"]) is case["has_source_options"]
-    # The activate command is exact and cwd-scoped, and is surfaced as the
-    # primary next action.
-    activate = payload["remediation"][0]
-    assert activate["command"] == f"sbp skill activate {case['skill']} --cwd {payload['cwd']}"
-    assert payload["next_actions"][0] == activate["command"]
+    # The durable command is exact and cwd-scoped by shell $PWD, while the
+    # resolved command records the absolute cwd for machine consumers.
+    turn_on = payload["remediation"][0]
+    assert turn_on["command"] == f"sbp skill on {case['skill']} --cwd $PWD"
+    assert turn_on["resolved_command"] == f"sbp skill on {case['skill']} --cwd {payload['cwd']}"
+    assert payload["next_actions"][0] == turn_on["command"]
+    _assert_single_winning_layer(payload)
 
 
 # --------------------------------------------------------------------------
@@ -109,6 +159,7 @@ def test_invisible_no_source_skill_recommends_source_restore(fixture_fleet):
     assert payload["occurrences"] == []
     # No activate path because there is nothing to link.
     assert "activate" not in _remediation_kinds(payload)
+    _assert_single_winning_layer(payload)
 
 
 # --------------------------------------------------------------------------
@@ -139,6 +190,7 @@ def test_overlay_gated_skill_surfaces_overlay_flip(fixture_fleet, monkeypatch):
     assert overlay_steps[0]["command"] == (
         f"sbp overlay activate {case['overlay_flip_overlay']} --cwd {payload['cwd']}"
     )
+    _assert_single_winning_layer(payload)
 
 
 def test_overlay_gated_rule_appears_in_scope_rules_when_overlay_active(
@@ -169,6 +221,7 @@ def test_shadowed_skill_reports_loser_and_reason(fixture_fleet):
     assert lost_families == case["lost_layer_families"]
     assert payload["lost"]
     assert case["lost_reason_contains"] in payload["lost"][0]["lost_reason"]
+    _assert_single_winning_layer(payload)
 
 
 # --------------------------------------------------------------------------
@@ -224,13 +277,34 @@ def test_cli_explain_skill_json_routes_to_provenance(fixture_fleet):
 
 def test_cli_explain_invisible_skill_text_lists_ranked_paths(fixture_fleet):
     code, out = _run_cli(
-        ["explain", "needs-beads", "--cwd", str(fixture_fleet.repo("healthy")), "--format", "text"],
+        ["explain", "needs-beads", "--cwd", str(fixture_fleet.repo("overlay-repo")), "--format", "text"],
         fixture_fleet,
     )
     assert code == 0
     assert "NOT VISIBLE" in out
     assert "paths to visibility (ranked)" in out
-    assert "skill activate needs-beads" in out
+    assert "skill on needs-beads --cwd $PWD" in out
+
+
+def test_cli_skill_why_json_routes_to_provenance_without_unknown_fallback(fixture_fleet):
+    code, out = _run_cli(
+        [
+            "skill",
+            "why",
+            "totally-unknown-skill",
+            "--cwd",
+            str(fixture_fleet.repo("healthy")),
+            "--format",
+            "json",
+        ],
+        fixture_fleet,
+    )
+    assert code == 0
+    payload = json.loads(out)
+    assert payload["schema_version"] == GOLDEN["schema_version"]
+    assert payload["skill"] == "totally-unknown-skill"
+    assert payload["visible"] is False
+    assert [step["kind"] for step in payload["remediation"]] == ["rule_edit", "source_restore"]
 
 
 def test_cli_explain_brain_target_still_routes_to_brain(fixture_fleet):

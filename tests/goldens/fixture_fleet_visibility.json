@@ -11,7 +11,7 @@
     "healthy": {
       "matched_scope_rules": ["cli-local"],
       "matched_project_categories": ["cli"],
-      "effective": ["tiny-cli", "tiny-ui"],
+      "effective": ["needs-beads", "tiny-cli", "tiny-ui"],
       "missing_for_cwd": [],
       "broken_project": []
     },

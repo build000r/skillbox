@@ -172,6 +172,7 @@ Skills:
   __WRAPPER__ skills audit            Scan downstream repos for skill policy drift
   __WRAPPER__ skill plan NAME         Preview where NAME would be linked
   __WRAPPER__ skill add NAME          Link NAME into global/project/category roots
+  __WRAPPER__ skill why NAME          Explain visibility layers and exact fixes
   __WRAPPER__ skill on NAME           Durably pin NAME on for this repo
   __WRAPPER__ skill off NAME          Durably pin NAME off for this repo
   __WRAPPER__ skill sync --dry-run    Link cwd-required missing skills
@@ -206,6 +207,7 @@ Examples:
   __WRAPPER__ recalibrate --fleet --limit 20
   __WRAPPER__ skill plan mcp-server-design
   __WRAPPER__ skill add ui --to category --category frontend
+  __WRAPPER__ skill why wiki --json
   __WRAPPER__ skill on wiki --verify
   __WRAPPER__ skill off wiki --dry-run
   __WRAPPER__ skill lint             Lint .skillbox/skill-overrides.yaml
@@ -246,6 +248,7 @@ payload = {
         {"name": "launch", "json": True, "safe_first_try": f"{wrapper} launch <dir> <dir> --request '<prompt>' --dry-run --json", "aliases": ["bulk"]},
         {"name": "bulk", "json": True, "safe_first_try": f"{wrapper} bulk <dir> <dir> --request '<prompt>' --dry-run --json", "alias_for": "launch"},
         {"name": "skills", "json": True, "safe_first_try": f"{wrapper} skills --issues-only --json"},
+        {"name": "skill-why", "json": True, "safe_first_try": f"{wrapper} skill why <skill> --json"},
         {"name": "candidates", "json": True, "safe_first_try": f"{wrapper} candidates --json"},
         {"name": "mcp", "json": True, "safe_first_try": f"{wrapper} mcp --json"},
         {"name": "registry", "json": True, "safe_first_try": f"{wrapper} registry doctor --json"},
