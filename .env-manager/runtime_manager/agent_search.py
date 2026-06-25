@@ -9,6 +9,7 @@ from .agent_decisions import MAX_FUZZY_SUGGESTIONS, fuzzy_suggestions
 from .agent_graph import AgentGraph
 from .agent_graph_algorithms import normalize_graph
 from .agent_cli_hints import manage_py_command
+from .agent_errors import brain_error_payload
 from .agent_timing import attach_elapsed, timer_start
 from .command_registry import default_registry
 
@@ -20,23 +21,17 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9_.:-]+")
 
 
 def _error_payload(code: str, message: str, **details: Any) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "ok": False,
-        "schema_version": SEARCH_SCHEMA_VERSION,
-        "error": {
-            "code": code,
-            "type": code.lower(),
-            "message": message,
-            "recoverable": True,
-        },
-        "examples": [
-            manage_py_command("search", "graph", "command", "--format", "json"),
-            manage_py_command("search", "--kind", "bead", "mcp", "--format", "json"),
-            manage_py_command("search", "--source", "docs", "runtime", "--format", "json"),
-        ],
-    }
-    if details:
-        payload["error"]["details"] = details
+    payload = brain_error_payload(
+        SEARCH_SCHEMA_VERSION,
+        code,
+        message,
+        context=details or None,
+    )
+    payload["examples"] = [
+        manage_py_command("search", "graph", "command", "--format", "json"),
+        manage_py_command("search", "--kind", "bead", "mcp", "--format", "json"),
+        manage_py_command("search", "--source", "docs", "runtime", "--format", "json"),
+    ]
     return payload
 
 

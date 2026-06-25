@@ -23,6 +23,16 @@ def _assert_elapsed_meta(testcase: unittest.TestCase, payload: dict[str, object]
     testcase.assertGreaterEqual(float(elapsed), 0.0)
 
 
+def _assert_error_envelope(testcase: unittest.TestCase, payload: dict[str, object], code: str) -> None:
+    testcase.assertIs(payload["ok"], False)
+    error = payload.get("error")
+    testcase.assertIsInstance(error, dict)
+    testcase.assertEqual(error["code"], code)
+    testcase.assertEqual(error["type"], code)
+    testcase.assertEqual(payload["error_code"], code)
+    testcase.assertIn("deprecation", payload)
+
+
 def _node(node_id: str, kind: str = "test", label: str | None = None) -> dict[str, object]:
     return {"id": node_id, "kind": kind, "label": label or node_id, "attrs": {}}
 
@@ -108,7 +118,9 @@ class AgentGraphEngineTests(unittest.TestCase):
 
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "INVALID_ARGUMENT")
+        _assert_error_envelope(self, payload, "INVALID_ARGUMENT")
         self.assertIn("allowed", payload["error"]["details"])
+        self.assertIn("allowed", payload["error"]["context"])
         self.assertTrue(all(action.startswith("python3 .env-manager/manage.py ") for action in payload["next_actions"]))
         _assert_elapsed_meta(self, payload)
 
@@ -121,13 +133,16 @@ class AgentGraphEngineTests(unittest.TestCase):
 
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "UNKNOWN_NODE")
+        _assert_error_envelope(self, payload, "UNKNOWN_NODE")
         self.assertEqual(payload["error"]["details"]["node_id"], "service:missing")
+        self.assertEqual(payload["error"]["context"]["node_id"], "service:missing")
 
     def test_invalid_algorithm_typo_suggests_critical_path(self) -> None:
         payload = ENGINE.graph_command_payload(_fixture_graph(), algorithm="critcal-path")
 
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "INVALID_ARGUMENT")
+        _assert_error_envelope(self, payload, "INVALID_ARGUMENT")
         self.assertIn("critical-path", payload["error"]["details"]["suggestions"])
         self.assertTrue(
             any("critical-path" in action for action in payload.get("next_actions") or [])

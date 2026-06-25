@@ -3,6 +3,7 @@ from __future__ import annotations
 import difflib
 import fnmatch
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -50,6 +51,7 @@ from .agent_adapters import collect_agent_adapter_evidence
 from .agent_graph import build_agent_graph, build_agent_graph_payload
 from .agent_graph_engine import GRAPH_ALGORITHMS, GRAPH_OUTPUT_FORMATS, graph_command_payload, render_graph_payload
 from .agent_decisions import BRAIN_COMMAND_TARGET_ALIASES, explain_payload, next_action_payload
+from .agent_errors import brain_error_payload
 from .agent_search import search_payload
 from .agent_timing import attach_elapsed, timer_start
 from .agent_snapshots import (
@@ -4306,13 +4308,14 @@ def _snap_usage_payload(*, unknown_action: str | None = None) -> dict[str, Any]:
         ],
     }
     if unknown_action is not None:
-        payload["ok"] = False
-        payload["error"] = {
-            "code": "SNAP_UNKNOWN_ACTION",
-            "type": "invalid_argument",
-            "message": f"unknown snap action: {unknown_action}",
-            "recoverable": True,
-        }
+        payload.update(
+            brain_error_payload(
+                SNAPSHOT_SCHEMA_VERSION,
+                "SNAP_UNKNOWN_ACTION",
+                f"unknown snap action: {unknown_action}",
+                context={"action": unknown_action},
+            )
+        )
     return payload
 
 
@@ -4329,6 +4332,72 @@ def _snap_action_required_text_payload() -> dict[str, Any]:
             "python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json",
         ],
     }
+
+
+def _snap_error_payload(
+    code: str,
+    message: str,
+    *,
+    context: dict[str, Any] | None = None,
+    next_actions: list[str] | None = None,
+) -> dict[str, Any]:
+    return brain_error_payload(
+        SNAPSHOT_SCHEMA_VERSION,
+        code,
+        message,
+        context=context,
+        next_actions=next_actions or [
+            "python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json",
+            "python3 .env-manager/manage.py snap --format json",
+        ],
+    )
+
+
+def _load_snapshot_for_brain(path: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    path_text = str(path)
+    try:
+        payload = load_snapshot(path)
+    except FileNotFoundError:
+        return None, _snap_error_payload(
+            "SNAPSHOT_NOT_FOUND",
+            f"snapshot not found: {path_text}",
+            context={"path": path_text},
+        )
+    except json.JSONDecodeError as exc:
+        return None, _snap_error_payload(
+            "SNAPSHOT_SCHEMA_MISMATCH",
+            f"snapshot is not valid JSON: {path_text}",
+            context={"path": path_text, "reason": str(exc)},
+        )
+    except OSError as exc:
+        return None, _snap_error_payload(
+            "SNAPSHOT_NOT_FOUND",
+            f"snapshot is unreadable: {path_text}",
+            context={"path": path_text, "reason": str(exc)},
+        )
+    if not isinstance(payload, dict):
+        return None, _snap_error_payload(
+            "SNAPSHOT_SCHEMA_MISMATCH",
+            f"snapshot root must be an object: {path_text}",
+            context={"path": path_text, "actual_type": type(payload).__name__},
+        )
+    inputs = payload.get("inputs")
+    if (
+        payload.get("schema_version") != SNAPSHOT_SCHEMA_VERSION
+        or not payload.get("snapshot_id")
+        or not isinstance(inputs, dict)
+    ):
+        return None, _snap_error_payload(
+            "SNAPSHOT_SCHEMA_MISMATCH",
+            f"snapshot does not match {SNAPSHOT_SCHEMA_VERSION}: {path_text}",
+            context={
+                "path": path_text,
+                "schema_version": payload.get("schema_version"),
+                "has_snapshot_id": bool(payload.get("snapshot_id")),
+                "has_inputs": isinstance(inputs, dict),
+            },
+        )
+    return payload, None
 
 
 def _handle_snap(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
@@ -4354,10 +4423,25 @@ def _handle_snap(args: argparse.Namespace, root_dir: Path, model: dict[str, Any]
         if getattr(args, "write", False):
             payload["artifact"] = str(save_snapshot(root_dir, payload))
     elif snap_action == "diff":
-        from_path, to_path = _snap_diff_paths(args)
-        payload = diff_snapshots(load_snapshot(from_path), load_snapshot(to_path))
+        try:
+            from_path, to_path = _snap_diff_paths(args)
+        except RuntimeError as exc:
+            payload = _snap_error_payload(
+                "INVALID_ARGUMENT",
+                str(exc),
+                context={"action": "diff"},
+                next_actions=["python3 .env-manager/manage.py snap diff --from before.json --to after.json --format json"],
+            )
+        else:
+            before, error = _load_snapshot_for_brain(from_path)
+            if error is not None:
+                payload = error
+            else:
+                after, error = _load_snapshot_for_brain(to_path)
+                payload = error if error is not None else diff_snapshots(before, after)
     elif snap_action == "replay":
-        payload = replay_snapshot(load_snapshot(Path(args.path)))
+        snapshot, error = _load_snapshot_for_brain(Path(args.path))
+        payload = error if error is not None else replay_snapshot(snapshot)
     else:
         payload = (
             _snap_usage_payload(unknown_action=snap_action)

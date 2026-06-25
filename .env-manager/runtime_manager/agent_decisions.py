@@ -8,6 +8,7 @@ from typing import Any, Iterable, Mapping
 from .agent_graph import AgentGraph
 from .agent_graph_algorithms import blast_radius, normalize_graph, normalized_to_payload
 from .agent_cli_hints import manage_py_command
+from .agent_errors import brain_error_payload
 from .agent_timing import attach_elapsed, timer_start
 from .command_registry import CommandSpec, default_registry
 
@@ -33,23 +34,14 @@ def _error_payload(
     next_actions: list[str] | None = None,
     **details: Any,
 ) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "ok": False,
-        "schema_version": DECISIONS_SCHEMA_VERSION,
-        "error": {
-            "code": code,
-            "type": code.lower(),
-            "message": message,
-            "recoverable": True,
-        },
-    }
-    if details:
-        payload["error"]["details"] = details
-    if suggestions:
-        payload["suggestions"] = suggestions[:MAX_FUZZY_SUGGESTIONS]
-    if next_actions:
-        payload["next_actions"] = next_actions
-    return payload
+    return brain_error_payload(
+        DECISIONS_SCHEMA_VERSION,
+        code,
+        message,
+        context=details or None,
+        suggestions=suggestions[:MAX_FUZZY_SUGGESTIONS] if suggestions else None,
+        next_actions=next_actions,
+    )
 
 
 def _kind_from_node_id(node_id: str) -> str:
