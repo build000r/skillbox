@@ -191,13 +191,39 @@ class CliUnitTests(unittest.TestCase):
     def test_snap_without_action_returns_structured_usage_payload(self) -> None:
         result = _run_manage("snap", "--format", "json")
 
-        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         payload = json.loads(result.stdout)
-        self.assertFalse(payload["ok"])
-        self.assertEqual(payload["error"]["code"], "SNAP_ACTION_REQUIRED")
-        self.assertEqual([action["name"] for action in payload["actions"]], ["create", "diff", "replay"])
-        self.assertIn("snap replay tests/goldens/agent_ops_snapshot.json", payload["next_actions"][0])
+        self.assertTrue(payload["ok"])
+        self.assertNotIn("error", payload)
+        self.assertTrue(payload["read_only_default"])
+        self.assertEqual([item["name"] for item in payload["subcommands"]], ["create", "diff", "replay"])
+        self.assertEqual(payload["actions"], payload["subcommands"])
+        self.assertEqual(payload["subcommands"][0]["writes_only_with"], "--write")
+        self.assertIn(
+            "snap --format json replay tests/goldens/agent_ops_snapshot.json",
+            payload["next_actions"][0],
+        )
+
+    def test_snap_without_action_text_mode_keeps_nonzero_usage_error(self) -> None:
+        result = _run_manage("snap", "--format", "text")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("snap requires an action", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_snap_flag_first_replay_json(self) -> None:
+        result = _run_manage(
+            "snap",
+            "--format",
+            "json",
+            "replay",
+            "tests/goldens/agent_ops_snapshot.json",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["snapshot_id"], "golden-fixture")
 
     def test_graph_invalid_algorithm_returns_structured_json_error(self) -> None:
         result = _run_manage("graph", "--algorithm", "pagerank", "--format", "json", "--no-adapters")
@@ -454,6 +480,21 @@ class CliUnitTests(unittest.TestCase):
             snap_args,
             ["snap", "replay", "--format", "json", "tests/goldens/agent_ops_snapshot.json"],
         )
+        bare_snap_args = mcp_server.build_args("snap", {})
+        self.assertEqual(bare_snap_args, ["snap", "--format", "json"])
+
+    def test_skillbox_snap_without_action_returns_usage_payload(self) -> None:
+        mcp_server = _load_mcp_server_module()
+
+        cli_usage = json.loads(_run_manage("snap", "--format", "json").stdout)
+        mcp_usage = mcp_server.dispatch_tool("skillbox_snap", {})
+        mcp_usage_payload = json.loads(mcp_usage["content"][0]["text"])
+
+        self.assertNotIn("isError", mcp_usage)
+        self.assertEqual(mcp_usage_payload["_exit_code"], 0)
+        self.assertEqual(mcp_usage_payload["ok"], cli_usage["ok"])
+        self.assertEqual(mcp_usage_payload["read_only_default"], cli_usage["read_only_default"])
+        self.assertEqual(mcp_usage_payload["subcommands"], cli_usage["subcommands"])
 
     def test_agent_ops_brain_mcp_dispatch_matches_cli_representatives(self) -> None:
         mcp_server = _load_mcp_server_module()

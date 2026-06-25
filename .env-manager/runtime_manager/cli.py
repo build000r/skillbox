@@ -4261,41 +4261,74 @@ def _snap_diff_paths(args: argparse.Namespace) -> tuple[Path, Path]:
     return from_path, to_path
 
 
+def _snap_subcommands() -> list[dict[str, str]]:
+    return [
+        {
+            "name": "create",
+            "side_effect": "none unless --write is passed",
+            "writes_only_with": "--write",
+            "safe_first_try": "python3 .env-manager/manage.py snap create --format json --no-adapters",
+        },
+        {
+            "name": "diff",
+            "side_effect": "none",
+            "safe_first_try": "python3 .env-manager/manage.py snap diff --from before.json --to after.json --format json",
+        },
+        {
+            "name": "replay",
+            "side_effect": "none",
+            "safe_first_try": "python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json",
+        },
+    ]
+
+
+def _snap_usage_payload(*, unknown_action: str | None = None) -> dict[str, Any]:
+    subcommands = _snap_subcommands()
+    payload: dict[str, Any] = {
+        "ok": True,
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "read_only_default": True,
+        "summary": "snap subcommands: create (dry-run unless --write), diff, replay",
+        "subcommands": subcommands,
+        "actions": subcommands,
+        "next_actions": [
+            "python3 .env-manager/manage.py snap --format json replay tests/goldens/agent_ops_snapshot.json",
+            "python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json",
+            "python3 .env-manager/manage.py capabilities --format json",
+        ],
+    }
+    if unknown_action is not None:
+        payload["ok"] = False
+        payload["error"] = {
+            "code": "SNAP_UNKNOWN_ACTION",
+            "type": "invalid_argument",
+            "message": f"unknown snap action: {unknown_action}",
+            "recoverable": True,
+        }
+    return payload
+
+
+def _snap_action_required_text_payload() -> dict[str, Any]:
+    return {
+        "error": {
+            "code": "SNAP_ACTION_REQUIRED",
+            "type": "invalid_argument",
+            "message": "snap requires an action: create, diff, or replay",
+            "recoverable": True,
+        },
+        "next_actions": [
+            "python3 .env-manager/manage.py snap create --format json --no-adapters",
+            "python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json",
+        ],
+    }
+
+
 def _handle_snap(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
     del resolved_mode
-    if not getattr(args, "snap_action", None):
-        payload = {
-            "ok": False,
-            "schema_version": SNAPSHOT_SCHEMA_VERSION,
-            "error": {
-                "code": "SNAP_ACTION_REQUIRED",
-                "type": "invalid_argument",
-                "message": "snap requires an action: create, diff, or replay",
-                "recoverable": True,
-            },
-            "actions": [
-                {
-                    "name": "create",
-                    "side_effect": "none unless --write is passed",
-                    "safe_first_try": "python3 .env-manager/manage.py snap create --format json --no-adapters",
-                },
-                {
-                    "name": "diff",
-                    "side_effect": "none",
-                    "safe_first_try": "python3 .env-manager/manage.py snap diff --from before.json --to after.json --format json",
-                },
-                {
-                    "name": "replay",
-                    "side_effect": "none",
-                    "safe_first_try": "python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json",
-                },
-            ],
-            "next_actions": [
-                "python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json",
-                "python3 .env-manager/manage.py capabilities --json",
-            ],
-        }
-    elif args.snap_action == "create":
+    snap_action = getattr(args, "snap_action", None)
+    if not snap_action:
+        payload = _snap_usage_payload() if args.format == "json" else _snap_action_required_text_payload()
+    elif snap_action == "create":
         adapters = _brain_adapters_for_args(root_dir, model, args)
         payload = create_snapshot_payload(
             status=runtime_status(model),
@@ -4312,18 +4345,24 @@ def _handle_snap(args: argparse.Namespace, root_dir: Path, model: dict[str, Any]
         )
         if getattr(args, "write", False):
             payload["artifact"] = str(save_snapshot(root_dir, payload))
-    elif args.snap_action == "diff":
+    elif snap_action == "diff":
         from_path, to_path = _snap_diff_paths(args)
         payload = diff_snapshots(load_snapshot(from_path), load_snapshot(to_path))
-    elif args.snap_action == "replay":
+    elif snap_action == "replay":
         payload = replay_snapshot(load_snapshot(Path(args.path)))
     else:
-        payload = {"error": {"message": f"unknown snap action: {args.snap_action}"}}
+        payload = (
+            _snap_usage_payload(unknown_action=snap_action)
+            if args.format == "json"
+            else {"error": {"message": f"unknown snap action: {snap_action}"}}
+        )
 
     if args.format == "json":
         emit_json(payload)
     else:
         _print_snap_text(payload)
+    if args.format == "json" and payload.get("ok") is True and "error" not in payload:
+        return EXIT_OK
     return EXIT_ERROR if "error" in payload else EXIT_OK
 
 

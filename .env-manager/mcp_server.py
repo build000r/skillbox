@@ -518,12 +518,11 @@ TOOLS: list[dict] = [
         ),
         "inputSchema": {
             "type": "object",
-            "required": ["action"],
             "properties": {
                 "action": {
                     "type": "string",
                     "enum": ["create", "diff", "replay"],
-                    "description": "Snapshot action.",
+                    "description": "Snapshot action. Omit to return read-only usage for create/diff/replay.",
                 },
                 "name": {"type": "string", "description": "Snapshot label for create."},
                 "created_at": {"type": "string", "description": "Timestamp override for deterministic fixtures."},
@@ -2081,7 +2080,18 @@ def _missing_positional_error(name: str, positional_key: str) -> dict:
     )
 
 
-def _positional_required(positional_key: str | None, positional: str | None, tool_params: dict) -> bool:
+_OPTIONAL_POSITIONAL_TOOLS = frozenset({"skillbox_snap"})
+
+
+def _positional_required(
+    positional_key: str | None,
+    positional: str | None,
+    tool_params: dict,
+    *,
+    tool_name: str | None = None,
+) -> bool:
+    if tool_name in _OPTIONAL_POSITIONAL_TOOLS:
+        return False
     return bool(positional_key and positional is None and not tool_params.get("list_blueprints"))
 
 
@@ -2182,7 +2192,7 @@ def _dispatch_manage_tool(
                 "recoverable": True,
             }
         })
-    if _positional_required(positional_key, positional, tool_params):
+    if _positional_required(positional_key, positional, tool_params, tool_name=name):
         return _missing_positional_error(name, str(positional_key))
 
     try:
