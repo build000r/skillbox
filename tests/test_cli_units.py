@@ -33,6 +33,16 @@ def _assert_elapsed_meta(testcase: unittest.TestCase, payload: dict[str, object]
     testcase.assertGreaterEqual(float(elapsed), 0.0)
 
 
+def _assert_error_envelope(testcase: unittest.TestCase, payload: dict[str, object], code: str) -> None:
+    testcase.assertIs(payload["ok"], False)
+    error = payload.get("error")
+    testcase.assertIsInstance(error, dict)
+    testcase.assertEqual(error["code"], code)
+    testcase.assertEqual(error["type"], code)
+    testcase.assertEqual(payload["error_code"], code)
+    testcase.assertIn("deprecation", payload)
+
+
 def _ns(**kwargs: object) -> argparse.Namespace:
     defaults = {
         "format": "json",
@@ -237,6 +247,43 @@ class CliUnitTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["snapshot_id"], "golden-fixture")
 
+    def test_snap_file_failures_use_brain_error_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing_path = str(Path(tmpdir) / "missing-snapshot.json")
+            missing = _run_manage("snap", "replay", missing_path, "--format", "json")
+
+        self.assertEqual(missing.returncode, 1)
+        missing_payload = json.loads(missing.stdout)
+        _assert_error_envelope(self, missing_payload, "SNAPSHOT_NOT_FOUND")
+        self.assertEqual(missing_payload["error"]["context"]["path"], missing_path)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bad_json = Path(tmpdir) / "bad.json"
+            bad_json.write_text("{bad json", encoding="utf-8")
+            bad_schema = Path(tmpdir) / "bad-schema.json"
+            bad_schema.write_text("{}", encoding="utf-8")
+
+            malformed = _run_manage("snap", "replay", str(bad_json), "--format", "json")
+            schema = _run_manage("snap", "replay", str(bad_schema), "--format", "json")
+
+        self.assertEqual(malformed.returncode, 1)
+        malformed_payload = json.loads(malformed.stdout)
+        _assert_error_envelope(self, malformed_payload, "SNAPSHOT_SCHEMA_MISMATCH")
+        self.assertIn("reason", malformed_payload["error"]["context"])
+
+        self.assertEqual(schema.returncode, 1)
+        schema_payload = json.loads(schema.stdout)
+        _assert_error_envelope(self, schema_payload, "SNAPSHOT_SCHEMA_MISMATCH")
+        self.assertFalse(schema_payload["error"]["context"]["has_snapshot_id"])
+
+    def test_snap_diff_missing_args_use_brain_error_envelope(self) -> None:
+        result = _run_manage("snap", "diff", "--format", "json")
+
+        self.assertEqual(result.returncode, 1)
+        payload = json.loads(result.stdout)
+        _assert_error_envelope(self, payload, "INVALID_ARGUMENT")
+        self.assertEqual(payload["error"]["context"]["action"], "diff")
+
     def test_graph_invalid_algorithm_returns_structured_json_error(self) -> None:
         result = _run_manage("graph", "--algorithm", "pagerank", "--format", "json", "--no-adapters")
 
@@ -245,7 +292,9 @@ class CliUnitTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "INVALID_ARGUMENT")
+        _assert_error_envelope(self, payload, "INVALID_ARGUMENT")
         self.assertIn("allowed", payload["error"]["details"])
+        self.assertIn("allowed", payload["error"]["context"])
         self.assertTrue(all(action.startswith("python3 .env-manager/manage.py ") for action in payload["next_actions"]))
 
     def test_agent_ops_brain_text_renderers_cover_success_and_errors(self) -> None:
@@ -481,6 +530,8 @@ class CliUnitTests(unittest.TestCase):
         self.assertEqual(mcp_server._DISPATCH["skillbox_next"], ("next", None))  # noqa: SLF001
         self.assertEqual(mcp_server._DISPATCH["skillbox_snap"], ("snap", "action"))  # noqa: SLF001
 
+        explain_args = mcp_server.build_args("explain", {"target": "brain.next", "no_adapters": True})
+        self.assertEqual(explain_args, ["explain", "--format", "json", "brain.next", "--no-adapters"])
         search_args = mcp_server.build_args("search", {"query": "graph", "no_adapters": True})
         self.assertEqual(search_args, ["search", "--format", "json", "graph", "--no-adapters"])
         snap_args = mcp_server.build_args(
@@ -538,6 +589,34 @@ class CliUnitTests(unittest.TestCase):
         self.assertEqual(mcp_search_payload["_exit_code"], 0)
         self.assertEqual(mcp_search_payload["hits"][0]["id"], cli_search["hits"][0]["id"])
         self.assertEqual(mcp_search_payload["hits"][0]["score"], cli_search["hits"][0]["score"])
+
+        cli_explain = json.loads(
+            _run_manage("explain", "service:missing", "--format", "json", "--no-adapters").stdout
+        )
+        mcp_explain = mcp_server.dispatch_tool(
+            "skillbox_explain",
+            {"target": "service:missing", "no_adapters": True},
+        )
+        mcp_explain_payload = json.loads(mcp_explain["content"][0]["text"])
+
+        self.assertIn("isError", mcp_explain)
+        self.assertEqual(mcp_explain_payload["_exit_code"], 1)
+        _assert_error_envelope(self, cli_explain, "UNKNOWN_NODE")
+        _assert_error_envelope(self, mcp_explain_payload, "UNKNOWN_NODE")
+        self.assertEqual(mcp_explain_payload["error"]["code"], cli_explain["error"]["code"])
+        self.assertEqual(mcp_explain_payload["error"]["context"], cli_explain["error"]["context"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing_path = str(Path(tmpdir) / "missing-snapshot.json")
+            mcp_snap_missing = mcp_server.dispatch_tool(
+                "skillbox_snap",
+                {"action": "replay", "path": missing_path},
+            )
+        mcp_snap_missing_payload = json.loads(mcp_snap_missing["content"][0]["text"])
+
+        self.assertIn("isError", mcp_snap_missing)
+        self.assertEqual(mcp_snap_missing_payload["_exit_code"], 1)
+        _assert_error_envelope(self, mcp_snap_missing_payload, "SNAPSHOT_NOT_FOUND")
 
     def test_swimmers_launch_cli_dry_run_resolves_against_invoke_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

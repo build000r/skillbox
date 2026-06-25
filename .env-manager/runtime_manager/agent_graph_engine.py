@@ -7,6 +7,7 @@ from typing import Any, Iterable, Mapping
 from .agent_decisions import MAX_FUZZY_SUGGESTIONS, fuzzy_suggestions, resolve_brain_target
 from .agent_graph import AgentGraph
 from .agent_cli_hints import manage_py_command
+from .agent_errors import brain_error_payload
 from .agent_timing import attach_elapsed, timer_start
 from .agent_graph_algorithms import (
     ALGORITHMS_SCHEMA_VERSION,
@@ -45,21 +46,13 @@ def _error_payload(
     next_actions: list[str] | None = None,
     details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "ok": False,
-        "schema_version": GRAPH_ENGINE_SCHEMA_VERSION,
-        "error": {
-            "code": code,
-            "type": code.lower(),
-            "message": message,
-            "recoverable": True,
-        },
-    }
-    if details:
-        payload["error"]["details"] = details
-    if next_actions:
-        payload["next_actions"] = next_actions
-    return payload
+    return brain_error_payload(
+        GRAPH_ENGINE_SCHEMA_VERSION,
+        code,
+        message,
+        context=details,
+        next_actions=next_actions,
+    )
 
 
 def _graph_payload(graph: AgentGraph | Mapping[str, Any]) -> dict[str, Any]:

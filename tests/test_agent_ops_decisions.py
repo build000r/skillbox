@@ -24,6 +24,16 @@ def _assert_elapsed_meta(testcase: unittest.TestCase, payload: dict[str, object]
     testcase.assertGreaterEqual(float(elapsed), 0.0)
 
 
+def _assert_error_envelope(testcase: unittest.TestCase, payload: dict[str, object], code: str) -> None:
+    testcase.assertIs(payload["ok"], False)
+    error = payload.get("error")
+    testcase.assertIsInstance(error, dict)
+    testcase.assertEqual(error["code"], code)
+    testcase.assertEqual(error["type"], code)
+    testcase.assertEqual(payload["error_code"], code)
+    testcase.assertIn("deprecation", payload)
+
+
 def _node(node_id: str, kind: str, label: str | None = None, **attrs: object) -> dict[str, object]:
     return {"id": node_id, "kind": kind, "label": label or node_id, "attrs": attrs}
 
@@ -184,6 +194,7 @@ class AgentDecisionTests(unittest.TestCase):
 
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "UNKNOWN_NODE")
+        _assert_error_envelope(self, payload, "UNKNOWN_NODE")
         _assert_elapsed_meta(self, payload)
 
     def test_explain_prefixed_command_falls_back_to_registry_without_graph_node(self) -> None:
@@ -211,8 +222,11 @@ class AgentDecisionTests(unittest.TestCase):
 
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "UNKNOWN_NODE")
+        _assert_error_envelope(self, payload, "UNKNOWN_NODE")
         suggestion_ids = [item["id"] for item in payload.get("suggestions") or []]
         self.assertIn("service:pulse", suggestion_ids)
+        context_suggestion_ids = [item["id"] for item in payload["error"]["context"]["suggestions"]]
+        self.assertIn("service:pulse", context_suggestion_ids)
 
     def test_explain_ambiguous_bare_word_lists_candidates_without_guessing(self) -> None:
         graph = _graph()
@@ -222,8 +236,11 @@ class AgentDecisionTests(unittest.TestCase):
 
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "AMBIGUOUS_NODE")
+        _assert_error_envelope(self, payload, "AMBIGUOUS_NODE")
         candidate_ids = [item["id"] for item in payload["error"]["details"]["candidates"]]
         self.assertEqual(sorted(candidate_ids), ["check:api", "service:api"])
+        context_ids = [item["id"] for item in payload["error"]["context"]["candidates"]]
+        self.assertEqual(sorted(context_ids), ["check:api", "service:api"])
 
     def test_explain_text_renderer_prints_copy_pasteable_suggestions(self) -> None:
         graph = _graph()

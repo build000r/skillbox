@@ -25,6 +25,16 @@ def _assert_elapsed_meta(testcase: unittest.TestCase, payload: dict[str, object]
     testcase.assertGreaterEqual(float(elapsed), 0.0)
 
 
+def _assert_error_envelope(testcase: unittest.TestCase, payload: dict[str, object], code: str) -> None:
+    testcase.assertIs(payload["ok"], False)
+    error = payload.get("error")
+    testcase.assertIsInstance(error, dict)
+    testcase.assertEqual(error["code"], code)
+    testcase.assertEqual(error["type"], code)
+    testcase.assertEqual(payload["error_code"], code)
+    testcase.assertIn("deprecation", payload)
+
+
 def _graph() -> dict[str, object]:
     return {
         "nodes": [
@@ -109,6 +119,7 @@ class AgentSearchTests(unittest.TestCase):
 
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "INVALID_ARGUMENT")
+        _assert_error_envelope(self, payload, "INVALID_ARGUMENT")
         self.assertTrue(payload["examples"])
         self.assertTrue(all(example.startswith("python3 .env-manager/manage.py ") for example in payload["examples"]))
         _assert_elapsed_meta(self, payload)

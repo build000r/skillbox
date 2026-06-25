@@ -1685,8 +1685,10 @@ def _validate_bool_params(params: dict) -> None:
             raise ValueError(f"{key} must be a boolean")
 
 
-def _append_scalar_args(args: list[str], params: dict) -> None:
+def _append_scalar_args(args: list[str], command: str, params: dict) -> None:
     for key, flag in _STRING_ARG_SPECS:
+        if command == "explain" and key == "target":
+            continue
         value = _string_param(params, key)
         if value:
             args += [flag, value]
@@ -1777,7 +1779,7 @@ def build_args(command: str, params: dict, positional: str | None = None) -> lis
 
     _append_repeat_args(args, params)
     _append_command_positionals(args, command, params)
-    _append_scalar_args(args, params)
+    _append_scalar_args(args, command, params)
     _append_bool_args(args, command, params)
 
     return args
