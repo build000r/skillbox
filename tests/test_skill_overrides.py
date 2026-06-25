@@ -8,6 +8,7 @@ import io
 import json
 import multiprocessing as mp
 import os
+import random
 import sys
 import tempfile
 import unittest
@@ -108,6 +109,28 @@ def _write_scope_policy(root: Path, source_root: Path, skill_name: str, allowed_
     }
 
 
+def _write_multi_scope_policy(root: Path, source_root: Path, skill_names: list[str], allowed_path: Path) -> dict[str, object]:
+    clients_root = root / "clients"
+    clients_root.mkdir(exist_ok=True)
+    skill_rows = "\n".join(f"      - {name}" for name in skill_names)
+    (root / "skill-scope.yaml").write_text(
+        "version: 1\n"
+        "skill_source_roots:\n"
+        f"  - {source_root}\n"
+        "rules:\n"
+        "  - id: generated-scope\n"
+        "    skills:\n"
+        f"{skill_rows}\n"
+        f"    paths: [{allowed_path}]\n",
+        encoding="utf-8",
+    )
+    return {
+        "env": {"SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root)},
+        "clients": [],
+        "skills": [],
+    }
+
+
 def _write_global_floor_policy(root: Path, source_root: Path, skill_name: str, allowed_path: Path) -> dict[str, object]:
     clients_root = root / "clients"
     clients_root.mkdir(exist_ok=True)
@@ -148,6 +171,30 @@ def _skill_toggle_args(repo: Path, action: str, name: str, **overrides: object) 
     }
     values.update(overrides)
     return Namespace(**values)
+
+
+def _write_seeded_override(repo: Path, *, pin_on: list[str], pin_off: list[str]) -> None:
+    lines = ["version: 1"]
+    if pin_on:
+        lines.append("pin_on:")
+        lines.extend(f"  - {name}" for name in pin_on)
+    if pin_off:
+        lines.append("pin_off:")
+        lines.extend(f"  - {name}" for name in pin_off)
+    if len(lines) > 1:
+        _write_override(repo, "\n".join(lines) + "\n")
+
+
+def _plan_action_signature(plan: dict[str, object]) -> list[tuple[str, str, str, str]]:
+    return sorted(
+        (
+            str(action.get("op") or ""),
+            str(action.get("skill") or ""),
+            str(action.get("destination") or ""),
+            str(action.get("reason") or ""),
+        )
+        for action in plan.get("actions") or []
+    )
 
 
 def _override_writer_worker(repo_path: str, name: str) -> None:
@@ -569,6 +616,96 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
             self.assertEqual(dry["actions"][0]["destination"], str(link))
             self.assertEqual(applied["actions"][0]["status"], "unlinked")
             self.assertFalse(link.exists())
+
+    def test_seeded_prune_firewall_property_over_generated_overrides(self) -> None:
+        skill_names = ["alpha", "beta", "gamma", "delta"]
+        for seed in range(16):
+            with self.subTest(seed=seed):
+                rng = random.Random(seed)
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    root = Path(tmpdir)
+                    repo = _make_repo(root)
+                    fake_home = root / "home"
+                    fixture_br = root / "bin" / "br"
+                    fixture_br.parent.mkdir()
+                    fixture_br.write_text("#!/bin/sh\n", encoding="utf-8")
+                    source_root = root / "sources"
+                    sources = {
+                        name: _write_source_skill(source_root, name)
+                        for name in skill_names
+                    }
+                    for name in skill_names:
+                        if rng.choice([True, False]):
+                            _install_project_skill(repo, name, sources[name], surface="claude")
+
+                    pin_on = sorted(name for name in skill_names if rng.random() < 0.35)
+                    remaining = [name for name in skill_names if name not in pin_on]
+                    pin_off = sorted(name for name in remaining if rng.random() < 0.35)
+                    _write_seeded_override(repo, pin_on=pin_on, pin_off=pin_off)
+                    model = _write_multi_scope_policy(root, source_root, skill_names, repo)
+
+                    with (
+                        mock.patch("runtime_manager.skill_visibility.Path.home", return_value=fake_home),
+                        mock.patch("runtime_manager.skill_visibility.shutil.which", return_value=str(fixture_br)),
+                    ):
+                        sync_first = apply_skill_lifecycle_plan(
+                            skill_lifecycle_plan(model, "sync", cwd=str(repo), to="project"),
+                            dry_run=False,
+                        )
+                        prune_dry_plan = skill_lifecycle_plan(
+                            model,
+                            "prune",
+                            cwd=str(repo),
+                            from_scope="project",
+                        )
+                        prune_dry = apply_skill_lifecycle_plan(prune_dry_plan, dry_run=True)
+                        prune_apply_plan = skill_lifecycle_plan(
+                            model,
+                            "prune",
+                            cwd=str(repo),
+                            from_scope="project",
+                        )
+                        prune_apply = apply_skill_lifecycle_plan(prune_apply_plan, dry_run=False)
+                        sync_fixed = apply_skill_lifecycle_plan(
+                            skill_lifecycle_plan(model, "sync", cwd=str(repo), to="project"),
+                            dry_run=True,
+                        )
+                        visibility = collect_skill_visibility(
+                            model,
+                            cwd=str(repo),
+                            include_global=False,
+                            include_project=True,
+                        )
+
+                self.assertEqual(_plan_action_signature(prune_dry), _plan_action_signature(prune_apply))
+                self.assertFalse(
+                    {
+                        str(action.get("skill") or "")
+                        for action in prune_dry["actions"]
+                        if action.get("op") == "unlink"
+                    } & set(pin_on)
+                )
+                self.assertFalse(
+                    {
+                        item["name"]
+                        for item in visibility["effective"]
+                    } & set(pin_off)
+                )
+                self.assertEqual(sync_fixed["actions"], [])
+                rendered = json.dumps(
+                    {
+                        "sync_first": sync_first,
+                        "prune_dry": prune_dry,
+                        "prune_apply": prune_apply,
+                        "sync_fixed": sync_fixed,
+                        "visibility": visibility,
+                    },
+                    sort_keys=True,
+                )
+                self.assertNotIn(str(Path.home().resolve()), rendered)
+                self.assertNotIn("/srv/skillbox", rendered)
+                for name in pin_on + pin_off:
+                    self.assertIn(name, skill_names)
 
     def test_skill_on_is_idempotent_and_returns_activation_packet(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
