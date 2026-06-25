@@ -2379,6 +2379,7 @@ def translated_runtime_command(model: dict[str, Any], item: dict[str, Any]) -> t
     if isinstance(item_env, dict):
         for key, value in item_env.items():
             env[str(key)] = translate_runtime_paths(str(value), runtime_env, translated_env)
+    env["SKILLBOX_MANAGED_RUN"] = "1"
     return command, env
 
 

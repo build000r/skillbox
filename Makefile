@@ -34,8 +34,10 @@ OUTPUT_DIR_ARGS := $(if $(strip $(OUTPUT_DIR)),--output-dir $(OUTPUT_DIR),)
 FORCE_ARGS := $(if $(strip $(FORCE)),--force,)
 RESUME_ARGS := $(if $(strip $(RESUME)),--resume,)
 WRAPPER_BIN_DIR ?= $(HOME)/.local/bin
+DEV_SHIM_BIN_DIR ?= $(HOME)/.local/skillbox-shims
+DEV_SHIM_BINS := npm pnpm yarn vite next astro
 
-.PHONY: help bootstrap-env render doctor acceptance runtime-render runtime-sync runtime-status runtime-skills runtime-skill-audit runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context dev-sanity python-cov-xml wrappers-install build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles box-register box-unregister
+.PHONY: help bootstrap-env render doctor acceptance runtime-render runtime-sync runtime-status runtime-skills runtime-skill-audit runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context dev-sanity python-cov-xml wrappers-install dev-shims-install build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles box-register box-unregister
 
 help:
 	@printf "  make bootstrap-env  Seed .skillbox-state/operator/.env from .env.example if missing\n"
@@ -60,6 +62,7 @@ help:
 	@printf "  make pulse-status   Show pulse daemon status, supervised services, and recent heals\n"
 	@printf "  make dev-sanity     Validate runtime graph, paths, and skill integrity (optional CLIENT=name PROFILE=name)\n"
 	@printf "  make wrappers-install Install sbp/sbo symlinks into WRAPPER_BIN_DIR (default ~/.local/bin)\n"
+	@printf "  make dev-shims-install Install dev-command guard shims into DEV_SHIM_BIN_DIR\n"
 	@printf "  make build          Build the workspace image\n"
 	@printf "  make up             Start the workspace container\n"
 	@printf "  make up-surfaces    Start optional api and web stubs\n"
@@ -151,6 +154,15 @@ wrappers-install:
 	@SKILLBOX_ROOT="$(CURDIR)" "$(WRAPPER_BIN_DIR)/sbp" --help >/dev/null
 	@SKILLBOX_ROOT="$(CURDIR)" "$(WRAPPER_BIN_DIR)/sbo" --help >/dev/null
 	@printf "installed wrappers: %s/sbp %s/sbo\n" "$(WRAPPER_BIN_DIR)" "$(WRAPPER_BIN_DIR)"
+	@$(MAKE) --no-print-directory dev-shims-install
+
+dev-shims-install:
+	@mkdir -p "$(DEV_SHIM_BIN_DIR)"
+	@chmod +x "$(CURDIR)/scripts/guard-dev-port.sh" "$(CURDIR)/scripts/skillbox-dev-shim.sh"
+	@for bin in $(DEV_SHIM_BINS); do \
+		ln -sf "$(CURDIR)/scripts/skillbox-dev-shim.sh" "$(DEV_SHIM_BIN_DIR)/$$bin"; \
+	done
+	@printf "installed dev shims: %s (%s)\n" "$(DEV_SHIM_BIN_DIR)" "$(DEV_SHIM_BINS)"
 
 pulse-start:
 	@python3 .env-manager/pulse.py run &

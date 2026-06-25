@@ -194,6 +194,227 @@ class TailnetAppSmokeTests(unittest.TestCase):
         self.assertEqual(payload["results"][0]["error"], "service is not tailnet-direct")
 
 
+class GuardDevPortScriptTests(unittest.TestCase):
+    SCRIPT = SCRIPTS_DIR / "guard-dev-port.sh"
+    SHIM = SCRIPTS_DIR / "skillbox-dev-shim.sh"
+
+    def _copy_scripts(self, root: Path) -> tuple[Path, Path]:
+        scripts_dir = root / "scripts"
+        scripts_dir.mkdir(parents=True)
+        guard = scripts_dir / "guard-dev-port.sh"
+        shim = scripts_dir / "skillbox-dev-shim.sh"
+        guard.write_text(self.SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+        shim.write_text(self.SHIM.read_text(encoding="utf-8"), encoding="utf-8")
+        guard.chmod(0o755)
+        shim.chmod(0o755)
+        return guard, shim
+
+    def _model(self, root: Path, app: Path) -> dict[str, object]:
+        return {
+            "root_dir": str(root),
+            "repos": [{"id": "app", "host_path": str(app)}],
+            "services": [
+                {
+                    "id": "app-web",
+                    "client": "acme",
+                    "profiles": ["local-all"],
+                    "repo_id": "app",
+                    "healthcheck": {"type": "http", "url": "http://127.0.0.1:5173/health"},
+                }
+            ],
+        }
+
+    def _run_guard(
+        self,
+        guard: Path,
+        *,
+        command: str,
+        cwd: Path,
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        root = guard.parent.parent
+        env = os.environ.copy()
+        env["SKILLBOX_ROOT"] = str(root)
+        env["SKILLBOX_PORT_GUARD_MODEL_JSON"] = json.dumps(self._model(root, cwd if cwd.name == "app" else root / "app"))
+        if extra_env:
+            env.update(extra_env)
+        payload = {"tool_name": "Bash", "tool_input": {"command": command, "cwd": str(cwd)}}
+        return subprocess.run(
+            ["bash", str(guard)],
+            cwd=root,
+            input=json.dumps(payload),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+
+    def test_guard_dev_port_blocks_direct_dev_in_covered_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            app = root / "app"
+            app.mkdir()
+            guard, _shim = self._copy_scripts(root)
+
+            result = self._run_guard(guard, command="npm run dev", cwd=app)
+            cd_result = self._run_guard(guard, command="cd app && npm run dev", cwd=root)
+
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(cd_result.returncode, 2)
+            self.assertLessEqual(len(result.stderr.strip().splitlines()), 10)
+            self.assertIn("service: app-web", result.stderr)
+            self.assertIn("declared port: 5173", result.stderr)
+            self.assertIn(
+                "python3 .env-manager/manage.py up --client acme --profile local-all --service app-web",
+                result.stderr,
+            )
+            runtime_log = root / "logs" / "runtime" / "runtime.log"
+            self.assertIn("port_guard block", runtime_log.read_text(encoding="utf-8"))
+
+    def test_guard_dev_port_allows_non_dev_uncovered_and_bypass_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            app = root / "app"
+            other = root / "other"
+            app.mkdir()
+            other.mkdir()
+            guard, _shim = self._copy_scripts(root)
+
+            install = self._run_guard(guard, command="npm install", cwd=app)
+            vite_build = self._run_guard(guard, command="vite build", cwd=app)
+            uncovered = self._run_guard(guard, command="npm run dev", cwd=other)
+            managed = self._run_guard(
+                guard,
+                command="pnpm dev",
+                cwd=app,
+                extra_env={"SKILLBOX_MANAGED_RUN": "1"},
+            )
+            bypass = self._run_guard(
+                guard,
+                command="next dev",
+                cwd=app,
+                extra_env={"SKILLBOX_PORT_GUARD": "off"},
+            )
+
+            self.assertEqual(install.returncode, 0, install.stderr)
+            self.assertEqual(vite_build.returncode, 0, vite_build.stderr)
+            self.assertEqual(uncovered.returncode, 0, uncovered.stderr)
+            self.assertEqual(managed.returncode, 0, managed.stderr)
+            self.assertEqual(bypass.returncode, 0, bypass.stderr)
+            runtime_log = root / "logs" / "runtime" / "runtime.log"
+            content = runtime_log.read_text(encoding="utf-8")
+            self.assertIn("port_guard bypass_uncovered", content)
+            self.assertIn("port_guard bypass_managed_run", content)
+            self.assertIn("port_guard bypass_operator", content)
+
+    def test_guard_dev_port_blocks_when_detected_dev_cannot_be_evaluated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            app = root / "app"
+            app.mkdir()
+            guard, _shim = self._copy_scripts(root)
+            env = os.environ.copy()
+            env["SKILLBOX_ROOT"] = str(root)
+            env["SKILLBOX_PORT_GUARD_MODEL_JSON"] = "{not-json"
+            payload = {"tool_name": "Bash", "tool_input": {"command": "npm run dev", "cwd": str(app)}}
+
+            result = subprocess.run(
+                ["bash", str(guard)],
+                cwd=root,
+                input=json.dumps(payload),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("could not evaluate", result.stderr)
+            self.assertIn("SKILLBOX_PORT_GUARD=off", result.stderr)
+
+    def test_dev_shim_blocks_before_exec_and_allows_managed_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            app = root / "app"
+            shims = root / "shims"
+            realbin = root / "realbin"
+            app.mkdir()
+            shims.mkdir()
+            realbin.mkdir()
+            _guard, shim = self._copy_scripts(root)
+            (shims / "npm").symlink_to(shim)
+            marker = root / "real-npm.txt"
+            real = realbin / "npm"
+            real.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf 'real npm %s\\n' \"$*\" > \"$REAL_NPM_MARKER\"\n",
+                encoding="utf-8",
+            )
+            real.chmod(0o755)
+            env = os.environ.copy()
+            env.update({
+                "PATH": f"{shims}:{realbin}:{env.get('PATH', '')}",
+                "SKILLBOX_ROOT": str(root),
+                "SKILLBOX_PORT_GUARD_MODEL_JSON": json.dumps(self._model(root, app)),
+                "REAL_NPM_MARKER": str(marker),
+            })
+
+            blocked = subprocess.run(
+                [str(shims / "npm"), "run", "dev"],
+                cwd=app,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(blocked.returncode, 2)
+            self.assertFalse(marker.exists())
+
+            allowed_env = dict(env)
+            allowed_env["SKILLBOX_MANAGED_RUN"] = "1"
+            allowed = subprocess.run(
+                [str(shims / "npm"), "run", "dev"],
+                cwd=app,
+                env=allowed_env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+
+            self.assertEqual(allowed.returncode, 0, allowed.stderr)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "real npm run dev\n")
+
+    def test_dev_shims_install_target_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shims = Path(tmpdir) / "shims"
+
+            first = subprocess.run(
+                ["make", "dev-shims-install", f"DEV_SHIM_BIN_DIR={shims}"],
+                cwd=ROOT_DIR,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            second = subprocess.run(
+                ["make", "dev-shims-install", f"DEV_SHIM_BIN_DIR={shims}"],
+                cwd=ROOT_DIR,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            for name in ("npm", "pnpm", "yarn", "vite", "next", "astro"):
+                self.assertTrue((shims / name).exists(), name)
+
+
 class GuardDestructiveOpScriptTests(unittest.TestCase):
     SCRIPT = SCRIPTS_DIR / "guard-destructive-op.sh"
 

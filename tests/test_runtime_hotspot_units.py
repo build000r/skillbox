@@ -74,6 +74,20 @@ class _FakeManageProcess:
 
 
 class RuntimeStatusHotspotTests(unittest.TestCase):
+    def test_translated_runtime_command_marks_managed_run(self) -> None:
+        model = {"root_dir": str(ROOT_DIR), "env": {}}
+
+        _command, env = runtime_ops_module.translated_runtime_command(
+            model,
+            {
+                "id": "web",
+                "command": "npm run dev",
+                "env": {"SKILLBOX_MANAGED_RUN": "0"},
+            },
+        )
+
+        self.assertEqual(env["SKILLBOX_MANAGED_RUN"], "1")
+
     def test_compact_runtime_status_preserves_agent_facing_summary(self) -> None:
         payload = {
             "clients": [{"id": "personal"}, {"id": ""}],
