@@ -481,9 +481,11 @@ def default_registry() -> tuple[CommandSpec, ...]:
             entrypoint="manage.py",
             mcp_tool="skillbox_snap",
             examples=(
+                "python3 .env-manager/manage.py snap --format json",
                 "python3 .env-manager/manage.py snap create --name before-agent-ops --format json",
+                "python3 .env-manager/manage.py snap create --write --name persisted --format json",
+                "python3 .env-manager/manage.py snap --format json replay tests/goldens/agent_ops_snapshot.json",
                 "python3 .env-manager/manage.py snap diff --from before.json --to after.json --format json",
-                "python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json",
             ),
             validations=(_REGISTRY_TEST,),
             graph_nodes=("snapshot", "diff", "evidence"),
