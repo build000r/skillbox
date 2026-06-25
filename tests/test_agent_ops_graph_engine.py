@@ -14,6 +14,15 @@ if str(ENV_MANAGER_DIR) not in sys.path:
 from runtime_manager import agent_graph_engine as ENGINE  # noqa: E402
 
 
+def _assert_elapsed_meta(testcase: unittest.TestCase, payload: dict[str, object]) -> None:
+    meta = payload.get("meta")
+    testcase.assertIsInstance(meta, dict)
+    elapsed = meta.get("elapsed_ms") if isinstance(meta, dict) else None
+    testcase.assertIsInstance(elapsed, (int, float))
+    testcase.assertNotIsInstance(elapsed, bool)
+    testcase.assertGreaterEqual(float(elapsed), 0.0)
+
+
 def _node(node_id: str, kind: str = "test", label: str | None = None) -> dict[str, object]:
     return {"id": node_id, "kind": kind, "label": label or node_id, "attrs": {}}
 
@@ -53,6 +62,7 @@ class AgentGraphEngineTests(unittest.TestCase):
         self.assertEqual(payload["algorithm"]["name"], "all")
         self.assertIn("critical_path", payload["algorithm"]["result"])
         self.assertTrue(all(action.startswith("python3 .env-manager/manage.py ") for action in payload["next_actions"]))
+        _assert_elapsed_meta(self, payload)
         self.assertEqual(json.loads(json.dumps(payload)), payload)
 
     def test_cycles_algorithm_uses_shared_cycle_evidence(self) -> None:
@@ -100,6 +110,7 @@ class AgentGraphEngineTests(unittest.TestCase):
         self.assertEqual(payload["error"]["code"], "INVALID_ARGUMENT")
         self.assertIn("allowed", payload["error"]["details"])
         self.assertTrue(all(action.startswith("python3 .env-manager/manage.py ") for action in payload["next_actions"]))
+        _assert_elapsed_meta(self, payload)
 
     def test_unknown_node_returns_structured_unknown_node(self) -> None:
         payload = ENGINE.graph_command_payload(
