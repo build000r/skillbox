@@ -120,6 +120,28 @@ class OutputSchemaDocDriftTests(unittest.TestCase):
         self.assertIn("GENERATED FILE", committed)
         self.assertIn("do not hand-edit", committed)
 
+    def test_recalibrate_example_includes_machine_actionable_fixes(self) -> None:
+        example = GEN.example_recalibrate()
+        self.assertIn("fixes", example)
+        self.assertTrue(example["fixes"])
+        fix = example["fixes"][0]
+        for key in (
+            "problem",
+            "skill",
+            "command",
+            "links",
+            "dry_run_preview",
+            "packet_on_apply",
+        ):
+            with self.subTest(field=key):
+                self.assertIn(key, fix)
+        self.assertEqual(fix["problem"], "missing_for_cwd")
+        self.assertEqual(fix["skill"], "tiny-ui")
+        self.assertEqual(fix["command"], "sbp skill on tiny-ui --cwd $PWD")
+        self.assertTrue(fix["links"])
+        self.assertIsInstance(fix["dry_run_preview"], dict)
+        self.assertIsInstance(fix["packet_on_apply"], dict)
+
 
 if __name__ == "__main__":
     unittest.main()

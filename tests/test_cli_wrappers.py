@@ -107,8 +107,11 @@ class CliWrapperTests(unittest.TestCase):
         self.assertLessEqual(dispatched_skill_verbs, set(verbs))
         launch = next(command for command in payload["commands"] if command["name"] == "launch")
         bulk = next(command for command in payload["commands"] if command["name"] == "bulk")
+        recalibrate = next(command for command in payload["commands"] if command["name"] == "recalibrate")
         self.assertEqual(launch["aliases"], ["bulk"])
         self.assertEqual(bulk["alias_for"], "launch")
+        self.assertTrue(recalibrate["json"])
+        self.assertEqual(recalibrate["safe_first_try"], "sbp recalibrate --json")
         self.assertIn("sbp down <profile> <service> --dry-run --json", payload["safety"]["dry_run_first"])
         self.assertIn("sbp launch <dir> <dir> --request '<prompt>' --dry-run --json", payload["safety"]["dry_run_first"])
         self.assertIn("sbp bulk <dir> <dir> --request '<prompt>' --dry-run --json", payload["safety"]["dry_run_first"])
@@ -736,6 +739,57 @@ class CliWrapperTests(unittest.TestCase):
                     str(target_cwd),
                 ],
             )
+
+    def test_sbp_recalibrate_json_emits_parseable_machine_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            downstream = root / "downstream"
+            downstream.mkdir()
+            generator = fake_root / "scripts" / "gen_output_schemas.py"
+            generator.parent.mkdir(parents=True)
+            generator.write_text(
+                textwrap.dedent(
+                    """\
+                    from __future__ import annotations
+
+                    import json
+                    import sys
+
+                    if "--recalibrate-json" not in sys.argv:
+                        raise SystemExit(2)
+                    cwd = sys.argv[sys.argv.index("--cwd") + 1]
+                    print(json.dumps({
+                        "cwd": cwd,
+                        "issues": {"missing_for_cwd": [{"name": "alpha"}]},
+                        "fixes": [{
+                            "problem": "missing_for_cwd",
+                            "skill": "alpha",
+                            "command": "sbp skill on alpha --cwd $PWD",
+                            "links": [],
+                            "dry_run_preview": {"dry_run": True},
+                            "packet_on_apply": None,
+                        }],
+                    }))
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            result = self._run_wrapper(
+                SBP,
+                "recalibrate",
+                "--json",
+                fake_root=fake_root,
+                invoke_cwd=downstream,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("policy issues for this repo:", result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["cwd"], str(downstream))
+            self.assertEqual(payload["fixes"][0]["skill"], "alpha")
+            self.assertEqual(payload["fixes"][0]["command"], "sbp skill on alpha --cwd $PWD")
 
     def test_sbp_recalibrate_auto_fix_previews_heal_for_missing_skills(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
