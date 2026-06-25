@@ -41,6 +41,7 @@ from runtime_manager.policy_eval import (  # noqa: E402
     _repo_override_policy,
     update_repo_override_policy,
 )
+from runtime_manager.validation import validate_global_skill_contract  # noqa: E402
 from runtime_manager.skill_visibility import (  # noqa: E402
     active_overlays,
     apply_skill_lifecycle_plan,
@@ -171,6 +172,31 @@ def _skill_toggle_args(repo: Path, action: str, name: str, **overrides: object) 
         "force": False,
         "allow_directories": False,
         "verify": False,
+    }
+    values.update(overrides)
+    return Namespace(**values)
+
+
+def _skill_default_args(
+    repo: Path,
+    action: str,
+    name: str,
+    *,
+    scope: str = "repo",
+    **overrides: object,
+) -> Namespace:
+    values = {
+        "skill_action": "default",
+        "default_action": action,
+        "skill_name": name,
+        "default_scope": scope,
+        "cwd": str(repo),
+        "dry_run": False,
+        "yes": False,
+        "policy_path": None,
+        "format": "json",
+        "client": None,
+        "profile": "local-all",
     }
     values.update(overrides)
     return Namespace(**values)
@@ -1162,6 +1188,299 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
             self.assertEqual(policy["pin_on"], ["alpha"])
             self.assertTrue(payload["changed"])
             self.assertEqual(payload["summary"]["link"], 2)
+
+    def test_skill_default_repo_dry_run_prints_diff_without_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            args = _skill_default_args(repo, "on", "alpha")
+
+            payload = RUNTIME_CLI._handle_skill_default(args, dry_run=True)
+
+            self.assertEqual(payload["scope"], "repo")
+            self.assertTrue(payload["would_change"])
+            self.assertFalse(payload["changed"])
+            self.assertIn("--- /dev/null", payload["diff"])
+            self.assertIn("+  - alpha", payload["diff"])
+            self.assertFalse((repo / ".skillbox" / "skill-overrides.yaml").exists())
+
+    def test_skill_default_repo_apply_makes_skill_effective(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            source_root = root / "sources"
+            _write_source_skill(source_root, "alpha")
+            model = _write_scope_policy(root, source_root, "alpha", repo)
+            args = _skill_default_args(repo, "on", "alpha")
+
+            payload = RUNTIME_CLI._handle_skill_default(args, dry_run=False)
+            policy = _repo_override_policy(repo)
+            visibility = collect_skill_visibility(
+                model,
+                cwd=str(repo),
+                include_global=False,
+                include_project=True,
+                include_sources=False,
+            )
+
+            self.assertTrue(payload["changed"])
+            self.assertEqual(policy["defaults"], ["alpha"])
+            self.assertEqual(policy["pin_on"], ["alpha"])
+            self.assertEqual(policy["pin_off"], [])
+            self.assertIn("alpha", [item["name"] for item in visibility["effective"]])
+
+    def test_skill_default_repo_off_removes_default_and_pins_off(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            _write_override(repo, "version: 1\ndefaults: [alpha]\npin_on: [alpha]\n")
+            args = _skill_default_args(repo, "off", "alpha")
+
+            payload = RUNTIME_CLI._handle_skill_default(args, dry_run=False)
+            policy = _repo_override_policy(repo)
+
+            self.assertTrue(payload["changed"])
+            self.assertEqual(policy["defaults"], [])
+            self.assertEqual(policy["pin_on"], [])
+            self.assertEqual(policy["pin_off"], ["alpha"])
+
+    def test_skill_default_repo_preserves_comments_and_unrelated_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            _write_override(
+                repo,
+                "# keep top comment\n"
+                "version: 1\n"
+                "reason: keep me\n"
+                "# pins below\n"
+                "pin_on:\n"
+                "  - beta\n",
+            )
+            args = _skill_default_args(repo, "on", "alpha")
+
+            payload = RUNTIME_CLI._handle_skill_default(args, dry_run=False)
+            text = (repo / ".skillbox" / "skill-overrides.yaml").read_text(encoding="utf-8")
+            policy = _repo_override_policy(repo)
+
+            self.assertTrue(payload["changed"])
+            self.assertIn("# keep top comment", text)
+            self.assertIn("# pins below", text)
+            self.assertLess(text.index("reason:"), text.index("pin_on:"))
+            self.assertEqual(policy["pin_on"], ["alpha", "beta"])
+            self.assertEqual(policy["defaults"], ["alpha"])
+
+    def test_skill_default_repo_off_refuses_dispatcher_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = _make_repo(Path(tmpdir))
+            _write_override(repo, "version: 1\nreason: keep me\n")
+            before = (repo / ".skillbox" / "skill-overrides.yaml").read_bytes()
+            args = _skill_default_args(repo, "off", "sbp")
+
+            with self.assertRaises(ValidationError) as caught:
+                RUNTIME_CLI._handle_skill_default(args, dry_run=False)
+
+            self.assertEqual(caught.exception.code, OVERRIDE_REFUSED_FLOOR)
+            self.assertEqual((repo / ".skillbox" / "skill-overrides.yaml").read_bytes(), before)
+
+    def test_skill_default_global_dry_run_preserves_file_and_shows_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            policy_path = root / "skill-scope.yaml"
+            policy_path.write_text(
+                "# operator policy\n"
+                "version: 1\n"
+                "global_allowlist:\n"
+                "  - smart\n"
+                "rules:\n"
+                "  # dispatcher stays first\n"
+                "  - id: dispatcher-global\n"
+                "    skills:\n"
+                "      - smart\n"
+                "    allow_global: true\n",
+                encoding="utf-8",
+            )
+            before = policy_path.read_text(encoding="utf-8")
+            args = _skill_default_args(
+                repo,
+                "on",
+                "alpha",
+                scope="global",
+                policy_path=str(policy_path),
+            )
+
+            payload = RUNTIME_CLI._handle_skill_default(args, dry_run=True)
+
+            self.assertTrue(payload["would_change"])
+            self.assertFalse(payload["changed"])
+            self.assertEqual(policy_path.read_text(encoding="utf-8"), before)
+            self.assertIn("skillbox-default-global-alpha", payload["diff"])
+            self.assertIn("+  - alpha", payload["diff"])
+
+    def test_skill_default_global_apply_and_off_keep_contract_green(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            policy_path = root / "skill-scope.yaml"
+            policy_path.write_text(
+                "# operator policy\n"
+                "version: 1\n"
+                "global_allowlist:\n"
+                "  - smart\n"
+                "rules:\n"
+                "  # dispatcher stays first\n"
+                "  - id: dispatcher-global\n"
+                "    skills:\n"
+                "      - smart\n"
+                "    allow_global: true\n",
+                encoding="utf-8",
+            )
+            on_args = _skill_default_args(
+                repo,
+                "on",
+                "alpha",
+                scope="global",
+                policy_path=str(policy_path),
+                yes=True,
+            )
+            off_args = _skill_default_args(
+                repo,
+                "off",
+                "alpha",
+                scope="global",
+                policy_path=str(policy_path),
+                yes=True,
+            )
+
+            on_payload = RUNTIME_CLI._handle_skill_default(on_args, dry_run=False)
+            on_text = policy_path.read_text(encoding="utf-8")
+            on_policy = RUNTIME_CLI._load_policy_from_text(on_text)
+            on_results = validate_global_skill_contract(on_policy, policy_path=str(policy_path))
+            off_payload = RUNTIME_CLI._handle_skill_default(off_args, dry_run=False)
+            off_text = policy_path.read_text(encoding="utf-8")
+            off_policy = RUNTIME_CLI._load_policy_from_text(off_text)
+            off_results = validate_global_skill_contract(off_policy, policy_path=str(policy_path))
+
+            self.assertTrue(on_payload["changed"])
+            self.assertIn("# operator policy", on_text)
+            self.assertIn("# dispatcher stays first", on_text)
+            self.assertIn("skillbox-default-global-alpha", on_text)
+            self.assertIn("alpha", on_policy["global_allowlist"])
+            self.assertEqual([result.status for result in on_results], ["pass"])
+            self.assertTrue(off_payload["changed"])
+            self.assertNotIn("skillbox-default-global-alpha", off_text)
+            self.assertNotIn("alpha", off_policy["global_allowlist"])
+            self.assertEqual([result.status for result in off_results], ["pass"])
+
+    def test_skill_default_global_apply_requires_yes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            policy_path = root / "skill-scope.yaml"
+            policy_path.write_text(
+                "version: 1\n"
+                "rules:\n"
+                "  - id: dispatcher-global\n"
+                "    skills: [smart]\n"
+                "    allow_global: true\n",
+                encoding="utf-8",
+            )
+            args = _skill_default_args(
+                repo,
+                "on",
+                "alpha",
+                scope="global",
+                policy_path=str(policy_path),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "writes outside this repo"):
+                RUNTIME_CLI._handle_skill_default(args, dry_run=False)
+
+    def test_skill_default_global_off_refuses_wildcard_hand_authored_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            policy_path = root / "skill-scope.yaml"
+            policy_path.write_text(
+                "version: 1\n"
+                "rules:\n"
+                "  - id: beads-globals\n"
+                "    skills: [beads-*]\n"
+                "    allow_global: true\n",
+                encoding="utf-8",
+            )
+            args = _skill_default_args(
+                repo,
+                "off",
+                "beads-br",
+                scope="global",
+                policy_path=str(policy_path),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "hand-authored rule"):
+                RUNTIME_CLI._handle_skill_default(args, dry_run=True)
+
+    def test_skill_default_global_off_refuses_mixed_generated_and_hand_authored_grants(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            policy_path = root / "skill-scope.yaml"
+            policy_path.write_text(
+                "version: 1\n"
+                "rules:\n"
+                "  - id: skillbox-default-global-alpha\n"
+                "    skills:\n"
+                "      - alpha\n"
+                "    allow_global: true\n"
+                "    default: on\n"
+                "  - id: shared-globals\n"
+                "    skills: [a*]\n"
+                "    allow_global: true\n",
+                encoding="utf-8",
+            )
+            before = policy_path.read_text(encoding="utf-8")
+            args = _skill_default_args(
+                repo,
+                "off",
+                "alpha",
+                scope="global",
+                policy_path=str(policy_path),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "hand-authored rule"):
+                RUNTIME_CLI._handle_skill_default(args, dry_run=True)
+            self.assertEqual(policy_path.read_text(encoding="utf-8"), before)
+
+    def test_skill_default_global_on_refuses_inline_nonempty_rules_without_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            policy_path = root / "skill-scope.yaml"
+            policy_path.write_text(
+                "version: 1\n"
+                "rules: [{id: dispatcher-global, skills: [smart], allow_global: true}]\n",
+                encoding="utf-8",
+            )
+            before = policy_path.read_text(encoding="utf-8")
+            args = _skill_default_args(
+                repo,
+                "on",
+                "alpha",
+                scope="global",
+                policy_path=str(policy_path),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "inline non-empty rules"):
+                RUNTIME_CLI._handle_skill_default(args, dry_run=True)
+            self.assertEqual(policy_path.read_text(encoding="utf-8"), before)
+
+    def test_skill_default_parser_requires_explicit_scope(self) -> None:
+        parser = RUNTIME_CLI._build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["skill", "default", "on", "alpha"])
+        args = parser.parse_args(["skill", "default", "on", "alpha", "--repo"])
+        self.assertEqual(args.default_scope, "repo")
 
     def test_skill_heal_pins_links_and_returns_same_packet_on_noop(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

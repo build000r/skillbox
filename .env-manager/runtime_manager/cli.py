@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import difflib
+import fnmatch
 import hashlib
 import os
+import re
 import subprocess
 import sys
 import traceback
@@ -10,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
+from . import validation as VALIDATION
 from .errors import (
     OVERRIDE_REFUSED_FLOOR,
     OVERRIDE_REFUSED_GLOBAL_ESCALATION,
@@ -1387,6 +1390,43 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Re-resolve visibility after applying and report the linked packet hash.",
     )
     skill_heal_parser.set_defaults(to="project")
+
+    skill_default_parser = skill_subparsers.add_parser(
+        "default",
+        help="Set repo or global skill defaults with a dry-run/apply diff.",
+    )
+    skill_default_parser.add_argument("default_action", choices=("on", "off"))
+    skill_default_parser.add_argument("skill_name")
+    default_scope = skill_default_parser.add_mutually_exclusive_group(required=True)
+    default_scope.add_argument(
+        "--repo",
+        dest="default_scope",
+        action="store_const",
+        const="repo",
+        help="Write the current repo's .skillbox/skill-overrides.yaml.",
+    )
+    default_scope.add_argument(
+        "--global",
+        dest="default_scope",
+        action="store_const",
+        const="global",
+        help="Write the operator skill-scope.yaml allow_global defaults.",
+    )
+    skill_default_parser.add_argument("--format", choices=("text", "json"), default="text")
+    skill_default_parser.add_argument("--cwd", default=None)
+    skill_default_parser.add_argument("--dry-run", action="store_true")
+    skill_default_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm --global apply; --global dry-runs never require this.",
+    )
+    skill_default_parser.add_argument(
+        "--policy-path",
+        default=None,
+        help="Global skill-scope.yaml path. Defaults to SKILLBOX_SKILL_SCOPE_FILE or the operator config path.",
+    )
+    _add_profile_arg(skill_default_parser)
+    _add_client_arg(skill_default_parser)
 
     remove_parser = skill_subparsers.add_parser("remove", help="Remove installed links/files for a skill.")
     remove_parser.add_argument("skill_name")
@@ -4391,6 +4431,423 @@ def _apply_skill_heal_pin(
     }
 
 
+def _mutate_skill_default(policy: dict[str, Any], skill_name: str, default_action: str) -> dict[str, Any]:
+    updated = dict(policy)
+    defaults = [item for item in _override_list(updated, "defaults") if item != skill_name]
+    pin_on = [item for item in _override_list(updated, "pin_on") if item != skill_name]
+    pin_off = [item for item in _override_list(updated, "pin_off") if item != skill_name]
+    if default_action == "on":
+        defaults.append(skill_name)
+        pin_on.append(skill_name)
+    else:
+        pin_off.append(skill_name)
+    updated["defaults"] = defaults
+    updated["pin_on"] = pin_on
+    updated["pin_off"] = pin_off
+    return updated
+
+
+def _unified_policy_diff(path: str, before: str, after: str) -> str:
+    if before == after:
+        return ""
+    before_label = path if before else "/dev/null"
+    return "".join(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile=before_label,
+            tofile=path,
+        )
+    )
+
+
+def _check_result_payload(result: CheckResult) -> dict[str, Any]:
+    return {
+        "status": result.status,
+        "code": result.code,
+        "message": result.message,
+        "details": result.details or {},
+    }
+
+
+def _handle_repo_skill_default(
+    args: argparse.Namespace,
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    skill_name = str(args.skill_name)
+    default_action = str(args.default_action)
+    cwd_path = Path(args.cwd or os.getcwd()).resolve()
+    if default_action == "off" and skill_name in set(DISPATCHER_CORE):
+        raise ValidationError(
+            OVERRIDE_REFUSED_FLOOR,
+            f"Refusing to default off dispatcher floor skill {skill_name!r}.",
+            context={
+                "skill": skill_name,
+                "action": "default off",
+                "floor": list(DISPATCHER_CORE),
+                "policy": "repo defaults cannot disable dispatcher floor skills",
+            },
+            next_actions=[
+                f"sbp skill default on {skill_name} --repo --cwd {cwd_path}",
+                f"sbp skill lint --cwd {cwd_path}",
+            ],
+        )
+
+    current = _repo_override_policy(str(cwd_path))
+    policy_path = str(current.get("_policy_path") or "")
+    path = Path(policy_path)
+    before = path.read_text(encoding="utf-8") if path.is_file() else ""
+    after = _repo_policy_text_for_default(before, skill_name, default_action)
+    diff_text = _unified_policy_diff(
+        policy_path,
+        before,
+        after,
+    )
+    would_change = before != after
+    result: dict[str, Any] = {
+        "action": "default",
+        "default_action": default_action,
+        "scope": "repo",
+        "skill": skill_name,
+        "cwd": str(cwd_path),
+        "dry_run": dry_run,
+        "changed": False,
+        "would_change": would_change,
+        "noop": not would_change,
+        "policy_path": policy_path,
+        "diff": diff_text,
+        "override": {
+            "pin": "pin_on" if default_action == "on" else "pin_off",
+            "defaults": default_action == "on",
+        },
+    }
+    if dry_run:
+        return result
+
+    if would_change:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(path, after)
+    result["changed"] = would_change
+    result["noop"] = not would_change
+    return result
+
+
+def _load_policy_from_text(text: str) -> dict[str, Any]:
+    yaml_mod = require_yaml("read skill-scope policy")
+    parsed = yaml_mod.safe_load(text) if text.strip() else {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _repo_policy_text_for_default(text: str, skill_name: str, default_action: str) -> str:
+    base_text = text if text.strip() else "version: 1\n"
+    policy = _load_policy_from_text(base_text)
+    updated = _mutate_skill_default(policy, skill_name, default_action)
+    rendered = _upsert_top_level_list(
+        base_text,
+        "pin_on",
+        _override_list(updated, "pin_on"),
+        after_keys=("version",),
+    )
+    rendered = _upsert_top_level_list(
+        rendered,
+        "pin_off",
+        _override_list(updated, "pin_off"),
+        after_keys=("pin_on", "version"),
+    )
+    rendered = _upsert_top_level_list(
+        rendered,
+        "defaults",
+        _override_list(updated, "defaults"),
+        after_keys=("overlays", "opt_out_global", "pin_off", "pin_on", "version"),
+    )
+    parsed = _load_policy_from_text(rendered)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("repo skill override policy would not parse as a mapping")
+    return rendered
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value]
+    return []
+
+
+def _allow_global_patterns(rule: dict[str, Any]) -> list[str]:
+    raw = rule.get("skills") or rule.get("patterns") or rule.get("names") or []
+    return [name for item in _string_list(raw) if (name := item.strip())]
+
+
+def _global_allow_rule_matches_skill(rule: dict[str, Any], skill_name: str) -> bool:
+    if not bool(rule.get("allow_global", False)):
+        return False
+    return any(fnmatch.fnmatchcase(skill_name, pattern) for pattern in _allow_global_patterns(rule))
+
+
+def _allow_global_union(policy: dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+    for rule in policy.get("rules") or []:
+        if not isinstance(rule, dict) or not bool(rule.get("allow_global", False)):
+            continue
+        names.update(_allow_global_patterns(rule))
+    return names
+
+
+def _global_policy_grants_skill(policy: dict[str, Any], skill_name: str) -> bool:
+    for rule in policy.get("rules") or []:
+        if isinstance(rule, dict) and _global_allow_rule_matches_skill(rule, skill_name):
+            return True
+    return False
+
+
+def _hand_authored_global_grants_skill(policy: dict[str, Any], skill_name: str) -> bool:
+    generated_id = _generated_global_rule_id(skill_name)
+    for rule in policy.get("rules") or []:
+        if not isinstance(rule, dict) or str(rule.get("id") or "") == generated_id:
+            continue
+        if _global_allow_rule_matches_skill(rule, skill_name):
+            return True
+    return False
+
+
+def _top_level_block_end(lines: list[str], start: int) -> int:
+    index = start + 1
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        if stripped and not line.startswith((" ", "\t")) and not stripped.startswith("#"):
+            break
+        index += 1
+    return index
+
+
+def _replace_top_level_list(text: str, key: str, values: list[str]) -> str:
+    lines = text.splitlines(keepends=True)
+    replacement = [f"{key}:\n"]
+    replacement.extend(f"  - {value}\n" for value in values)
+    if not values:
+        replacement = [f"{key}: []\n"]
+    for index, line in enumerate(lines):
+        if line.startswith(f"{key}:"):
+            end = _top_level_block_end(lines, index)
+            return "".join([*lines[:index], *replacement, *lines[end:]])
+    return text
+
+
+def _upsert_top_level_list(
+    text: str,
+    key: str,
+    values: list[str],
+    *,
+    after_keys: tuple[str, ...] = (),
+) -> str:
+    updated = _replace_top_level_list(text, key, values)
+    if updated != text:
+        return updated
+    lines = text.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    replacement = [f"{key}:\n"]
+    replacement.extend(f"  - {value}\n" for value in values)
+    if not values:
+        replacement = [f"{key}: []\n"]
+    insert_at = len(lines)
+    for after_key in after_keys:
+        found_anchor = False
+        for index, line in enumerate(lines):
+            if line.startswith(f"{after_key}:"):
+                insert_at = _top_level_block_end(lines, index)
+                found_anchor = True
+                break
+        if found_anchor:
+            break
+    return "".join([*lines[:insert_at], *replacement, *lines[insert_at:]])
+
+
+def _generated_global_rule_id(skill_name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", skill_name.lower()).strip("-") or "skill"
+    return f"skillbox-default-global-{slug}"
+
+
+def _generated_global_rule_lines(skill_name: str) -> list[str]:
+    return [
+        f"  - id: {_generated_global_rule_id(skill_name)}\n",
+        "    skills:\n",
+        f"      - {skill_name}\n",
+        "    allow_global: true\n",
+        "    default: on\n",
+    ]
+
+
+def _has_generated_global_rule(text: str, skill_name: str) -> bool:
+    needle = f"  - id: {_generated_global_rule_id(skill_name)}"
+    return any(line.strip() == needle.strip() for line in text.splitlines())
+
+
+def _append_generated_global_rule(text: str, skill_name: str) -> str:
+    if _has_generated_global_rule(text, skill_name):
+        return text
+    lines = text.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] = lines[-1] + "\n"
+    rule_lines = _generated_global_rule_lines(skill_name)
+    for index, line in enumerate(lines):
+        if not line.startswith("rules:"):
+            continue
+        if line.strip() != "rules:":
+            if line.strip() not in {"rules: []", "rules: null"}:
+                raise RuntimeError(
+                    "cannot preserve inline non-empty rules while adding a generated default; "
+                    "convert rules to block form first."
+                )
+            end = _top_level_block_end(lines, index)
+            return "".join([*lines[:index], "rules:\n", *rule_lines, *lines[end:]])
+        end = _top_level_block_end(lines, index)
+        return "".join([*lines[:end], *rule_lines, *lines[end:]])
+    prefix = "".join(lines)
+    if prefix and not prefix.endswith("\n"):
+        prefix += "\n"
+    return prefix + "rules:\n" + "".join(rule_lines)
+
+
+def _remove_generated_global_rule(text: str, skill_name: str) -> str:
+    rule_id = _generated_global_rule_id(skill_name)
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if line.strip() != f"- id: {rule_id}":
+            continue
+        end = index + 1
+        while end < len(lines):
+            stripped = lines[end].strip()
+            if stripped.startswith("- id: ") or (stripped and not lines[end].startswith((" ", "\t"))):
+                break
+            end += 1
+        return "".join([*lines[:index], *lines[end:]])
+    return text
+
+
+def _sync_global_allowlist_snapshot(text: str) -> str:
+    policy = _load_policy_from_text(text)
+    if "global_allowlist" not in policy:
+        return text
+    return _replace_top_level_list(
+        text,
+        "global_allowlist",
+        sorted(_allow_global_union(policy)),
+    )
+
+
+def _validate_global_policy_text_or_raise(text: str, policy_path: Path) -> list[CheckResult]:
+    policy = _load_policy_from_text(text)
+    results = validate_global_skill_contract(policy, policy_path=str(policy_path))
+    failures = [result for result in results if result.status == "fail"]
+    if failures:
+        messages = "; ".join(result.message for result in failures)
+        raise RuntimeError(f"skill-scope policy would fail global contract lint: {messages}")
+    return results
+
+
+def _global_policy_text_for_default(text: str, skill_name: str, default_action: str) -> str:
+    policy = _load_policy_from_text(text)
+    allowed_before = _global_policy_grants_skill(policy, skill_name)
+    if default_action == "on":
+        updated = text if allowed_before else _append_generated_global_rule(text, skill_name)
+    else:
+        if _hand_authored_global_grants_skill(policy, skill_name) or (
+            allowed_before and not _has_generated_global_rule(text, skill_name)
+        ):
+            raise RuntimeError(
+                "skill default off --global only removes allow_global rules created by "
+                "`skill default on --global`; edit the existing hand-authored rule deliberately."
+            )
+        updated = _remove_generated_global_rule(text, skill_name)
+    return _sync_global_allowlist_snapshot(updated)
+
+
+def _skill_scope_policy_path_arg(args: argparse.Namespace) -> Path:
+    raw = str(getattr(args, "policy_path", None) or "").strip()
+    if raw:
+        return Path(os.path.expandvars(os.path.expanduser(raw))).resolve()
+    return VALIDATION._skill_scope_policy_path().resolve()
+
+
+def _handle_global_skill_default(
+    args: argparse.Namespace,
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    if not dry_run and not bool(getattr(args, "yes", False)):
+        raise RuntimeError(
+            "skill default --global writes outside this repo; run with --dry-run first, "
+            "then pass --yes to apply."
+        )
+    skill_name = str(args.skill_name)
+    default_action = str(args.default_action)
+    policy_path = _skill_scope_policy_path_arg(args)
+    if not policy_path.is_file():
+        raise RuntimeError(f"skill-scope policy not found: {policy_path}")
+    before = policy_path.read_text(encoding="utf-8")
+    after = _global_policy_text_for_default(before, skill_name, default_action)
+    validation_results = _validate_global_policy_text_or_raise(after, policy_path)
+    diff_text = _unified_policy_diff(str(policy_path), before, after)
+    would_change = before != after
+    result: dict[str, Any] = {
+        "action": "default",
+        "default_action": default_action,
+        "scope": "global",
+        "skill": skill_name,
+        "cwd": str(Path(args.cwd or os.getcwd()).resolve()),
+        "dry_run": dry_run,
+        "changed": False,
+        "would_change": would_change,
+        "noop": not would_change,
+        "policy_path": str(policy_path),
+        "diff": diff_text,
+        "validation": [_check_result_payload(item) for item in validation_results],
+    }
+    if dry_run:
+        return result
+    if would_change:
+        atomic_write_text(policy_path, after)
+    result["changed"] = would_change
+    return result
+
+
+def _handle_skill_default(
+    args: argparse.Namespace,
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    scope = str(args.default_scope)
+    if scope == "repo":
+        return _handle_repo_skill_default(args, dry_run=dry_run)
+    if scope == "global":
+        return _handle_global_skill_default(args, dry_run=dry_run)
+    raise RuntimeError("skill default requires exactly one scope: --repo or --global")
+
+
+def _print_skill_default_text(payload: dict[str, Any]) -> None:
+    mode = "dry-run" if payload.get("dry_run") else "apply"
+    print(f"skill default {payload.get('default_action')}: {payload.get('skill')} ({mode})")
+    print(f"scope: {payload.get('scope')}")
+    print(f"path: {payload.get('policy_path')}")
+    print(f"changed: {str(bool(payload.get('changed'))).lower()}")
+    print(f"would_change: {str(bool(payload.get('would_change'))).lower()}")
+    if payload.get("validation"):
+        statuses = ", ".join(
+            f"{item.get('code')}={item.get('status')}" for item in payload.get("validation") or []
+        )
+        print(f"validation: {statuses}")
+    diff_text = str(payload.get("diff") or "")
+    if diff_text:
+        print("diff:")
+        print(diff_text, end="" if diff_text.endswith("\n") else "\n")
+    else:
+        print("diff: none")
+
+
 def _drop_same_link_actions(plan: dict[str, Any]) -> dict[str, Any]:
     filtered = [
         action for action in plan.get("actions") or []
@@ -4918,6 +5375,13 @@ def _handle_skill(args: argparse.Namespace, root_dir: Path, model: dict[str, Any
             emit_json(payload)
         else:
             print_skill_lifecycle_text(payload)
+        return EXIT_OK
+    if skill_action == "default":
+        payload = _handle_skill_default(args, dry_run=dry_run)
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            _print_skill_default_text(payload)
         return EXIT_OK
     if skill_action == "heal":
         payload = _handle_skill_heal(args, model, dry_run=dry_run)

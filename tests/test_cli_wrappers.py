@@ -86,7 +86,12 @@ class CliWrapperTests(unittest.TestCase):
         self.assertEqual(verbs["recalibrate"]["mutates"], "none")
         self.assertEqual(verbs["activate"]["mutates"], "cwd-ephemeral")
         self.assertIn("default", verbs)
+        self.assertEqual(verbs["default"]["mutates"], "repo_or_operator_policy")
         self.assertFalse(verbs["default"]["links_disk"])
+        self.assertIn(
+            "sbp skill default on <skill> --repo --dry-run --format json",
+            payload["safety"]["dry_run_first"],
+        )
         help_result = subprocess.run(
             ["python3", ".env-manager/manage.py", "skill", "--help"],
             cwd=ROOT_DIR,
@@ -112,6 +117,49 @@ class CliWrapperTests(unittest.TestCase):
         self.assertEqual(triage_payload["tool"], "skillbox-sbp")
         self.assertIn("sbp launch <dir> <dir> --request '<prompt>' --dry-run --json", triage_payload["quick_ref"])
         self.assertTrue(any(item["id"] == "preview-launch" for item in triage_payload["recommendations"]))
+
+    def test_sbp_skill_default_forwards_to_runtime_skill_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            downstream = root / "downstream"
+            downstream.mkdir()
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "skill",
+                "default",
+                "on",
+                "alpha",
+                "--repo",
+                "--dry-run",
+                "--format",
+                "json",
+                fake_root=fake_root,
+                invoke_cwd=downstream,
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                record["argv"],
+                [
+                    "skill",
+                    "default",
+                    "--profile",
+                    "local-all",
+                    "--cwd",
+                    str(downstream),
+                    "on",
+                    "alpha",
+                    "--repo",
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+            )
 
     def test_sbp_home_surfaces_batch_launcher_safe_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
