@@ -48,6 +48,13 @@ listeners and wildcard/dev-server signatures in `pulse.state.json`; in
 `enforce` mode it may terminate dev-server signatures after the configured
 grace window. Unknown non-dev listeners remain report-only.
 
+Runtime sync also writes generated repo-local port contracts for covered HTTP
+services. Each covered repo gets `.skillbox-port.env` with `PORT`, `HOST`, and
+`SKILLBOX_SERVICE_ID` from the port registry. Client repos should gitignore
+that file and load it before dev startup; Vite apps should set
+`server.strictPort: true` with `port: Number(process.env.PORT)` so a busy
+declared port fails loudly instead of auto-incrementing.
+
 ## Commands
 
 ### Verify posture from operator machine

@@ -27,7 +27,10 @@ variables:
     description: Runtime service id for the managed dev process.
   - name: SERVICE_COMMAND
     required: true
-    description: Command to start the dev service from the primary repo.
+    description: >
+      Command to start the dev service from the primary repo. Prefer loading
+      ./.skillbox-port.env and enabling strict port behavior so bypass launches
+      fail instead of hopping ports.
   - name: SERVICE_PORT
     default: "4010"
     description: Loopback port used by the HTTP healthcheck.
@@ -112,5 +115,11 @@ client:
         type: http
         url: ${SERVICE_HEALTHCHECK_URL}
         timeout_seconds: 0.5
-      notes: Managed HTTP service declared by the client blueprint.
+      port_contract:
+        default: true
+      notes: >
+        Managed HTTP service declared by the client blueprint. Port contract
+        adoption: load ./.skillbox-port.env before startup and configure Vite
+        with server: { host: process.env.HOST || "127.0.0.1", port:
+        Number(process.env.PORT), strictPort: true }.
   connectors: ${CONNECTORS}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import io
+import shlex
 import socket
 import tarfile
 
@@ -1174,6 +1175,31 @@ PORT_WILDCARD_BIND = "PORT_WILDCARD_BIND"
 PORT_UNDECLARED_RESERVED = "PORT_UNDECLARED_RESERVED"
 PORT_REGISTRY_WARNING = "PORT_REGISTRY_WARNING"
 PORT_CROSS_CLIENT_OVERLAP = "PORT_CROSS_CLIENT_OVERLAP"
+PORT_CONTRACT_UNADOPTED = "PORT_CONTRACT_UNADOPTED"
+PORT_CONTRACT_GITIGNORE = "PORT_CONTRACT_GITIGNORE"
+PORT_CONTRACT_STALE = "PORT_CONTRACT_STALE"
+PORT_CONTRACT_FILE_NAME = ".skillbox-port.env"
+
+_PORT_CONTRACT_ADOPTION_SNIPPET = (
+    "Load .skillbox-port.env before dev startup; for Vite use "
+    "server: { host: process.env.HOST || '127.0.0.1', "
+    "port: Number(process.env.PORT), strictPort: true }."
+)
+_PORT_CONTRACT_ADOPTION_FILES = (
+    "vite.config.ts",
+    "vite.config.js",
+    "vite.config.mts",
+    "vite.config.mjs",
+    "vite.config.cts",
+    "vite.config.cjs",
+    "next.config.js",
+    "next.config.mjs",
+    "next.config.ts",
+    "package.json",
+    "Makefile",
+    ".envrc",
+    "README.md",
+)
 
 # Box network postures under which a wildcard (0.0.0.0/::) bind is a violation.
 _WILDCARD_DENY_POSTURES = frozenset({"tailnet_only"})
@@ -1401,6 +1427,330 @@ def _reserved_results(entries: list[dict[str, Any]], model: dict[str, Any]) -> l
     ]
 
 
+def _repo_host_path(repo: dict[str, Any]) -> Path | None:
+    raw_path = str(repo.get("host_path") or repo.get("path") or "").strip()
+    if not raw_path:
+        return None
+    return Path(raw_path).expanduser()
+
+
+def _port_contract_env_key(service_id: str, suffix: str) -> str:
+    normalized = "".join(
+        char.upper() if char.isalnum() else "_"
+        for char in str(service_id or "").strip()
+    ).strip("_")
+    while "__" in normalized:
+        normalized = normalized.replace("__", "_")
+    if not normalized:
+        normalized = "SERVICE"
+    return f"SKILLBOX_{normalized}_{suffix}"
+
+
+def _normalize_port_contract_host(host: str) -> str:
+    normalized = str(host or "").strip()
+    if not normalized or normalized.lower() == "localhost":
+        return "127.0.0.1"
+    return normalized
+
+
+def _service_command_host(service: dict[str, Any]) -> str:
+    command = str(service.get("command") or "").strip()
+    if not command and isinstance(service.get("commands"), dict):
+        commands = service.get("commands") or {}
+        command = str(commands.get("reuse") or commands.get("start") or commands.get("run") or "").strip()
+    if not command:
+        return ""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    for index, token in enumerate(tokens):
+        for flag in ("--host", "--hostname"):
+            if token == flag and index + 1 < len(tokens):
+                return str(tokens[index + 1]).strip()
+            prefix = f"{flag}="
+            if token.startswith(prefix):
+                return token[len(prefix):].strip()
+    return ""
+
+
+def _service_health_host(service: dict[str, Any]) -> str:
+    healthcheck = service.get("healthcheck") if isinstance(service.get("healthcheck"), dict) else {}
+    if not healthcheck:
+        return ""
+    raw_host = str(healthcheck.get("host") or "").strip()
+    if raw_host:
+        return raw_host
+    raw_url = str(healthcheck.get("url") or "").strip()
+    if not raw_url:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(raw_url)
+    except ValueError:
+        return ""
+    return str(parsed.hostname or "").strip()
+
+
+def _port_contract_host_for_service(service: dict[str, Any], entry: dict[str, Any]) -> str:
+    command_host = _service_command_host(service)
+    if command_host:
+        return _normalize_port_contract_host(command_host)
+
+    declared = _service_declared_listen_port(service)
+    if declared is not None and int(declared[1]) == int(entry["port"]):
+        return _normalize_port_contract_host(declared[0])
+
+    health_host = _service_health_host(service)
+    if health_host:
+        return _normalize_port_contract_host(health_host)
+
+    if str(entry.get("bind_scope") or "") == "wildcard":
+        return "0.0.0.0"
+    return "127.0.0.1"
+
+
+def _port_contract_records(model: dict[str, Any]) -> list[dict[str, Any]]:
+    repos = runtime_repo_map(model)
+    services = {
+        str(service.get("id") or "").strip(): service
+        for service in model.get("services") or []
+        if str(service.get("id") or "").strip()
+    }
+    records: list[dict[str, Any]] = []
+    for entry in build_port_registry(model):
+        if entry.get("owner_kind") != "service" or entry.get("port") is None or entry.get("warning"):
+            continue
+        service_id = str(entry.get("owner_id") or "").strip()
+        service = services.get(service_id)
+        if service is None or ownership_state_for_service(model, service_id) != "covered":
+            continue
+        repo_id = str(service.get("repo") or service.get("repo_id") or "").strip()
+        if not repo_id:
+            continue
+        repo = repos.get(repo_id)
+        if repo is None:
+            continue
+        repo_path = _repo_host_path(repo)
+        if repo_path is None:
+            continue
+        records.append(
+            {
+                "service_id": service_id,
+                "repo_id": repo_id,
+                "repo_path": repo_path,
+                "port": int(entry["port"]),
+                "host": _port_contract_host_for_service(service, entry),
+                "source": dict(entry.get("source") or {}),
+                "protocol": str(entry.get("protocol") or ""),
+                "bind_scope": str(entry.get("bind_scope") or "unknown"),
+                "service": service,
+            }
+        )
+    return sorted(
+        records,
+        key=lambda item: (str(item["repo_path"]), str(item["service_id"]), int(item["port"])),
+    )
+
+
+def _port_contract_default_rank(record: dict[str, Any]) -> tuple[int, str]:
+    config = record["service"].get("port_contract")
+    is_default = isinstance(config, dict) and bool(config.get("default"))
+    return (0 if is_default else 1, str(record["service_id"]))
+
+
+def _render_port_contract_file(records: list[dict[str, Any]]) -> str:
+    first = sorted(records, key=_port_contract_default_rank)[0]
+    lines = [
+        "# Generated by Skillbox. Do not commit.",
+        "# Source of truth: python3 .env-manager/manage.py ports --format json",
+        f"PORT={first['port']}",
+        f"HOST={first['host']}",
+        f"SKILLBOX_SERVICE_ID={first['service_id']}",
+    ]
+    source = first.get("source") or {}
+    source_file = str(source.get("file") or "").strip()
+    source_key = str(source.get("key") or "").strip()
+    if source_file or source_key:
+        lines.append(f"SKILLBOX_PORT_SOURCE={source_file}:{source_key}".rstrip(":"))
+    if len(records) > 1:
+        lines.append("")
+        lines.append("# Additional declared services in this repo.")
+        for record in records:
+            if str(record["service_id"]) == str(first["service_id"]):
+                continue
+            prefix = _port_contract_env_key(str(record["service_id"]), "")
+            lines.extend(
+                [
+                    f"{prefix}PORT={record['port']}",
+                    f"{prefix}HOST={record['host']}",
+                ]
+            )
+    return "\n".join(lines) + "\n"
+
+
+def _port_contract_groups(model: dict[str, Any]) -> list[tuple[Path, list[dict[str, Any]]]]:
+    grouped: dict[Path, list[dict[str, Any]]] = {}
+    for record in _port_contract_records(model):
+        grouped.setdefault(record["repo_path"], []).append(record)
+    return [(path, grouped[path]) for path in sorted(grouped, key=lambda p: str(p))]
+
+
+def sync_port_contracts(model: dict[str, Any], dry_run: bool) -> list[str]:
+    actions: list[str] = []
+    for repo_path, records in _port_contract_groups(model):
+        target = repo_path / PORT_CONTRACT_FILE_NAME
+        service_count = len(records)
+        if not repo_path.is_dir():
+            actions.append(f"skip-port-contract: {target} (repo missing)")
+            continue
+        desired = _render_port_contract_file(records)
+        state = managed_text_artifact_state(target, desired)
+        ensure_directory(target.parent, dry_run)
+        if dry_run:
+            actions.append(f"render-port-contract: {target} ({service_count} service(s))")
+            continue
+        if state == "ok":
+            actions.append(f"port-contract-unchanged: {target}")
+            continue
+        atomic_write_text(target, desired)
+        actions.append(f"render-port-contract: {target} ({service_count} service(s))")
+    return actions
+
+
+def _port_contract_gitignored(repo_path: Path) -> bool:
+    gitignore = repo_path / ".gitignore"
+    try:
+        lines = gitignore.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    return any(line.strip().rstrip("/") == PORT_CONTRACT_FILE_NAME for line in lines)
+
+
+def _port_contract_adoption_files(repo_path: Path) -> list[Path]:
+    candidates = [repo_path / name for name in _PORT_CONTRACT_ADOPTION_FILES]
+    candidates.extend(sorted(repo_path.glob("*.config.*")))
+    seen: set[Path] = set()
+    existing: list[Path] = []
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        if path.is_file():
+            existing.append(path)
+    return existing
+
+
+def _repo_mentions_port_contract(repo_path: Path) -> bool:
+    for path in _port_contract_adoption_files(repo_path):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if PORT_CONTRACT_FILE_NAME in text or "SKILLBOX_SERVICE_ID" in text:
+            return True
+        if "strictPort" in text and ("process.env.PORT" in text or "$PORT" in text):
+            return True
+        if "--strictPort" in text and ("$PORT" in text or "PORT" in text):
+            return True
+    return False
+
+
+def _port_contract_advisory_suppressed(service: dict[str, Any]) -> bool:
+    config = service.get("port_contract")
+    if not isinstance(config, dict):
+        return False
+    if bool(config.get("adopted") or config.get("suppress_advisory") or config.get("suppress_unadopted")):
+        return True
+    adoption = str(config.get("adoption") or "").strip().lower()
+    return adoption in {"manual", "external", "suppressed"}
+
+
+def validate_port_contracts(model: dict[str, Any]) -> list[CheckResult]:
+    groups = _port_contract_groups(model)
+    if not groups:
+        return []
+
+    results: list[CheckResult] = []
+    checked_count = 0
+    for repo_path, grouped_records in groups:
+        if not repo_path.is_dir():
+            continue
+        checked_count += len(grouped_records)
+        target = repo_path / PORT_CONTRACT_FILE_NAME
+        service_ids = [str(record["service_id"]) for record in grouped_records]
+        desired = _render_port_contract_file(grouped_records)
+        group_details = {
+            "service_ids": service_ids,
+            "repo_id": grouped_records[0]["repo_id"],
+            "repo_path": str(repo_path),
+            "contract_path": str(target),
+            "adoption_snippet": _PORT_CONTRACT_ADOPTION_SNIPPET,
+        }
+        if target.is_file():
+            state = managed_text_artifact_state(target, desired)
+            if state != "ok":
+                results.append(
+                    CheckResult(
+                        status="warn",
+                        code=PORT_CONTRACT_STALE,
+                        message=(
+                            f"{PORT_CONTRACT_FILE_NAME} in repo {grouped_records[0]['repo_id']} "
+                            "does not match the current port registry"
+                        ),
+                        details={**group_details, "state": state},
+                    )
+                )
+        if target.is_file() and not _port_contract_gitignored(repo_path):
+            results.append(
+                CheckResult(
+                    status="warn",
+                    code=PORT_CONTRACT_GITIGNORE,
+                    message=(
+                        f"{PORT_CONTRACT_FILE_NAME} is generated under repo {grouped_records[0]['repo_id']} "
+                        "but is not covered by .gitignore"
+                    ),
+                    details={**group_details, "exact_line": PORT_CONTRACT_FILE_NAME},
+                )
+            )
+        repo_adopted = _repo_mentions_port_contract(repo_path)
+        for record in grouped_records:
+            service_id = str(record["service_id"])
+            if _port_contract_advisory_suppressed(record["service"]) or repo_adopted:
+                continue
+            base_details = {
+                "service_id": service_id,
+                "repo_id": record["repo_id"],
+                "repo_path": str(repo_path),
+                "contract_path": str(target),
+                "adoption_snippet": _PORT_CONTRACT_ADOPTION_SNIPPET,
+            }
+            results.append(
+                CheckResult(
+                    status="warn",
+                    code=PORT_CONTRACT_UNADOPTED,
+                    message=(
+                        f"service {service_id} has a generated port contract, but repo "
+                        f"{record['repo_id']} does not appear to load it with strict port settings"
+                    ),
+                    details={
+                        **base_details,
+                        "suppress_with": "services[].port_contract.suppress_advisory: true",
+                    },
+                )
+            )
+
+    if not results and checked_count:
+        results.append(
+            CheckResult(
+                status="pass",
+                code="port-contracts",
+                message=f"{checked_count} generated port contract(s) are adopted or suppressed",
+                details={"count": checked_count},
+            )
+        )
+    return results
+
+
 def validate_port_registry(model: dict[str, Any]) -> list[CheckResult]:
     """Port-guard doctor checks built on the scope-aware port registry view.
 
@@ -1485,6 +1835,7 @@ def doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
         + validate_ingress(model)
         + validate_service_exposure(model)
         + validate_port_registry(model)
+        + validate_port_contracts(model)
         + parity_results
     )
 
@@ -1940,6 +2291,7 @@ def sync_runtime(model: dict[str, Any], dry_run: bool) -> list[str]:
     for env_file in model["env_files"]:
         actions.extend(sync_env_file(env_file, dry_run=dry_run))
 
+    actions.extend(sync_port_contracts(model, dry_run=dry_run))
     actions.extend(_sync_log_dirs(model, dry_run))
     actions.extend(sync_skill_repo_sets(model, dry_run=dry_run))
     actions.extend(_sync_distributor_sources(model, dry_run=dry_run))
