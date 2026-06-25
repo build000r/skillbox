@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
+import io
+import json
 import multiprocessing as mp
 import os
 import sys
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
@@ -18,6 +22,7 @@ if str(ENV_MANAGER_DIR) not in sys.path:
     sys.path.insert(0, str(ENV_MANAGER_DIR))
 
 from runtime_manager import policy_eval as POLICY_EVAL  # noqa: E402
+from runtime_manager import cli as RUNTIME_CLI  # noqa: E402
 from runtime_manager import skill_visibility as SKILL_VISIBILITY  # noqa: E402
 from runtime_manager.errors import OVERRIDE_PARSE_ERROR  # noqa: E402
 from runtime_manager.policy_eval import (  # noqa: E402
@@ -94,6 +99,23 @@ def _write_scope_policy(root: Path, source_root: Path, skill_name: str, allowed_
         "clients": [],
         "skills": [],
     }
+
+
+def _skill_toggle_args(repo: Path, action: str, name: str, **overrides: object) -> Namespace:
+    values = {
+        "skill_action": action,
+        "skill_name": name,
+        "cwd": str(repo),
+        "to": "project",
+        "category": [],
+        "source": None,
+        "from_scope": "project",
+        "force": False,
+        "allow_directories": False,
+        "verify": False,
+    }
+    values.update(overrides)
+    return Namespace(**values)
 
 
 def _override_writer_worker(repo_path: str, name: str) -> None:
@@ -422,6 +444,138 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
             self.assertEqual(dry["actions"][0]["destination"], str(link))
             self.assertEqual(applied["actions"][0]["status"], "unlinked")
             self.assertFalse(link.exists())
+
+    def test_skill_on_is_idempotent_and_returns_activation_packet(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            fake_home = root / "home"
+            source_root = root / "sources"
+            _write_source_skill(source_root, "alpha")
+            model = _write_scope_policy(root, source_root, "alpha", repo)
+            args = _skill_toggle_args(repo, "on", "alpha", verify=True)
+
+            with mock.patch("runtime_manager.skill_visibility.Path.home", return_value=fake_home):
+                first = RUNTIME_CLI._handle_skill_toggle(args, model, dry_run=False)
+                second = RUNTIME_CLI._handle_skill_toggle(args, model, dry_run=False)
+                third = RUNTIME_CLI._handle_skill_toggle(args, model, dry_run=False)
+
+            policy = _repo_override_policy(repo)
+            self.assertEqual(policy["pin_on"], ["alpha"])
+            self.assertEqual(policy["pin_off"], [])
+            self.assertTrue(first["changed"])
+            self.assertFalse(first["noop"])
+            self.assertEqual(first["summary"]["link"], 2)
+            self.assertTrue(first["activation_packet"]["skill_md_sha256"])
+            self.assertTrue(first["verification"]["verified"])
+            self.assertIn("alpha", [item["name"] for item in first["verification"]["effective_now"]])
+            self.assertFalse(second["changed"])
+            self.assertTrue(second["noop"])
+            self.assertEqual(second["actions"], [])
+            self.assertEqual(
+                json.dumps(second, sort_keys=True),
+                json.dumps(third, sort_keys=True),
+            )
+
+    def test_skill_on_dry_run_does_not_write_or_link(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            fake_home = root / "home"
+            source_root = root / "sources"
+            _write_source_skill(source_root, "alpha")
+            model = _write_scope_policy(root, source_root, "alpha", repo)
+            args = _skill_toggle_args(repo, "on", "alpha")
+
+            with mock.patch("runtime_manager.skill_visibility.Path.home", return_value=fake_home):
+                dry = RUNTIME_CLI._handle_skill_toggle(args, model, dry_run=True)
+
+            self.assertTrue(dry["override"]["would_change"])
+            self.assertFalse(dry["changed"])
+            self.assertFalse((repo / ".skillbox" / "skill-overrides.yaml").exists())
+            self.assertFalse((repo / ".claude" / "skills" / "alpha").exists())
+            self.assertFalse((repo / ".codex" / "skills" / "alpha").exists())
+
+    def test_skill_on_text_prints_activation_packet_without_link_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            fake_home = root / "home"
+            source_root = root / "sources"
+            source = _write_source_skill(source_root, "alpha")
+            _install_project_skill(repo, "alpha", source, surface="claude")
+            _install_project_skill(repo, "alpha", source, surface="codex")
+            model = _write_scope_policy(root, source_root, "alpha", repo)
+            args = _skill_toggle_args(repo, "on", "alpha")
+
+            with mock.patch("runtime_manager.skill_visibility.Path.home", return_value=fake_home):
+                payload = RUNTIME_CLI._handle_skill_toggle(args, model, dry_run=False)
+
+            self.assertEqual(payload["actions"], [])
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                RUNTIME_CLI.print_skill_lifecycle_text(payload)
+            text = output.getvalue()
+            self.assertIn("actions: none", text)
+            self.assertIn("activation packet:", text)
+            self.assertIn("skill_md_sha256:", text)
+
+    def test_skill_on_verify_requires_activation_packet_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            fake_home = root / "home"
+            clients_root = root / "clients"
+            clients_root.mkdir()
+            source = _write_source_skill(root / "unlisted-sources", "alpha")
+            _install_project_skill(repo, "alpha", source, surface="claude")
+            _install_project_skill(repo, "alpha", source, surface="codex")
+            model = {
+                "env": {"SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root)},
+                "clients": [],
+                "skills": [],
+            }
+            args = _skill_toggle_args(repo, "on", "alpha", verify=True)
+
+            with mock.patch("runtime_manager.skill_visibility.Path.home", return_value=fake_home):
+                payload = RUNTIME_CLI._handle_skill_toggle(args, model, dry_run=False)
+
+            self.assertIsNone(payload["activation_packet"])
+            self.assertFalse(payload["verification"]["verified"])
+            self.assertIsNone(payload["verification"]["skill_md_sha256"])
+            self.assertIn("alpha", [item["name"] for item in payload["verification"]["effective_now"]])
+            self.assertTrue(payload["verification"]["symlink_resolved"])
+
+    def test_skill_off_writes_pin_off_and_unlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            fake_home = root / "home"
+            source_root = root / "sources"
+            source = _write_source_skill(source_root, "alpha")
+            claude_link = _install_project_skill(repo, "alpha", source, surface="claude")
+            codex_link = _install_project_skill(repo, "alpha", source, surface="codex")
+            _write_override(repo, "version: 1\npin_on: [alpha]\n")
+            model = _write_scope_policy(root, source_root, "alpha", repo)
+            args = _skill_toggle_args(repo, "off", "alpha")
+
+            with mock.patch("runtime_manager.skill_visibility.Path.home", return_value=fake_home):
+                dry = RUNTIME_CLI._handle_skill_toggle(args, model, dry_run=True)
+                applied = RUNTIME_CLI._handle_skill_toggle(args, model, dry_run=False)
+
+            policy = _repo_override_policy(repo)
+            self.assertEqual(policy["pin_on"], [])
+            self.assertEqual(policy["pin_off"], ["alpha"])
+            self.assertTrue(dry["override"]["would_change"])
+            self.assertEqual({action["status"] for action in dry["actions"]}, {"would_unlink"})
+            self.assertTrue(applied["changed"])
+            self.assertEqual(dry["requested_to"], "project")
+            self.assertEqual(dry["resolved_to"], "project")
+            self.assertEqual(applied["requested_to"], "project")
+            self.assertEqual(applied["resolved_to"], "project")
+            self.assertEqual({action["status"] for action in applied["actions"]}, {"unlinked"})
+            self.assertFalse(claude_link.exists())
+            self.assertFalse(codex_link.exists())
 
     def test_overlay_precedence_cli_env_repo_operator_base_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
