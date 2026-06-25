@@ -45,6 +45,8 @@ from manage import (  # noqa: E402
     DEFAULT_SERVICE_START_WAIT_SECONDS,
     DEFAULT_SERVICE_STOP_WAIT_SECONDS,
     StateLockTimeout,
+    all_process_listeners,
+    build_port_registry,
     log_runtime_event,
     ensure_directory,
     filter_model,
@@ -53,6 +55,8 @@ from manage import (  # noqa: E402
     normalize_active_profiles,
     process_is_running,
     probe_service,
+    process_tree_pids,
+    read_service_pid,
     remove_pid_file,
     resolve_runtime_command_cwd,
     runtime_pressure_advisory,
@@ -81,6 +85,27 @@ PID_NAME = "pulse.pid"
 STATE_NAME = "pulse.state.json"
 LOG_NAME = "pulse.log"
 DEFAULT_UNHEALTHY_GRACE_SECONDS = 60.0
+DEFAULT_PORT_SENTINEL_MODE = "observe"
+DEFAULT_PORT_SENTINEL_GRACE_SECONDS = 15.0
+PORT_SENTINEL_MODES = {"off", "observe", "enforce"}
+PORT_SENTINEL_REAP_WAIT_SECONDS = 1.0
+PORT_SENTINEL_SYSTEM_NAMES = {
+    "containerd",
+    "docker-proxy",
+    "dockerd",
+    "nginx",
+    "sshd",
+    "systemd-resolve",
+    "tailscaled",
+}
+PORT_SENTINEL_DEV_SIGNATURES = (
+    ("vite", ("vite",)),
+    ("next", ("next",)),
+    ("webpack-dev-server", ("webpack-dev-server",)),
+    ("webpack-serve", ("webpack", "serve")),
+    ("react-scripts", ("react-scripts", "start")),
+    ("turbopack", ("turbo", "dev")),
+)
 
 _runtime_dir_cache: dict[Path, Path] = {}
 
@@ -435,6 +460,275 @@ def _restart_with_backoff(
 
 
 # ---------------------------------------------------------------------------
+# Port sentinel: observe/reap rogue dev-server listeners
+# ---------------------------------------------------------------------------
+
+def copy_port_sentinel_counters(counters: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "rogues_seen": int(counters.get("rogues_seen") or 0),
+        "rogues_reaped": int(counters.get("rogues_reaped") or 0),
+        "by_signature": dict(counters.get("by_signature") or {}),
+    }
+
+
+def _env_value(model: dict[str, Any], key: str, default: str = "") -> str:
+    raw = os.environ.get(key)
+    if raw is None:
+        raw = (model.get("env") or {}).get(key)
+    if raw is None:
+        raw = default
+    return str(raw).strip()
+
+
+def _port_sentinel_config(model: dict[str, Any]) -> tuple[str, float]:
+    mode = _env_value(model, "SKILLBOX_PORT_SENTINEL", DEFAULT_PORT_SENTINEL_MODE).lower()
+    if mode not in PORT_SENTINEL_MODES:
+        mode = DEFAULT_PORT_SENTINEL_MODE
+    raw_grace = _env_value(
+        model,
+        "SKILLBOX_PORT_SENTINEL_GRACE_SECONDS",
+        str(DEFAULT_PORT_SENTINEL_GRACE_SECONDS),
+    )
+    try:
+        grace_seconds = max(0.0, float(raw_grace))
+    except ValueError:
+        grace_seconds = DEFAULT_PORT_SENTINEL_GRACE_SECONDS
+    return mode, grace_seconds
+
+
+def _process_identity(pid: int) -> dict[str, Any] | None:
+    proc_dir = Path("/proc") / str(pid)
+    try:
+        raw_cmdline = (proc_dir / "cmdline").read_bytes()
+        cmdline = raw_cmdline.replace(b"\0", b" ").decode("utf-8", errors="replace").strip()
+    except OSError:
+        cmdline = ""
+    try:
+        comm = (proc_dir / "comm").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        comm = ""
+    try:
+        raw_stat = (proc_dir / "stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    _before, _sep, after = raw_stat.rpartition(")")
+    fields = after.split()
+    start_time = fields[19] if len(fields) > 19 else ""
+    return {
+        "pid": pid,
+        "comm": comm,
+        "cmdline": cmdline or comm,
+        "start_time": start_time,
+    }
+
+
+def _dev_server_signature(identity: dict[str, Any]) -> str:
+    haystack = f"{identity.get('comm') or ''} {identity.get('cmdline') or ''}".lower()
+    for label, tokens in PORT_SENTINEL_DEV_SIGNATURES:
+        if all(token in haystack for token in tokens):
+            return label
+    return ""
+
+
+def _system_listener_allowed(identity: dict[str, Any], port: int, signature: str) -> bool:
+    comm = str(identity.get("comm") or "").strip().lower()
+    cmdline = str(identity.get("cmdline") or "").strip().lower()
+    if comm in PORT_SENTINEL_SYSTEM_NAMES:
+        return True
+    if any(name in cmdline for name in PORT_SENTINEL_SYSTEM_NAMES):
+        return True
+    return False
+
+
+def _declared_port_set(model: dict[str, Any]) -> set[int]:
+    ports: set[int] = set()
+    try:
+        entries = build_port_registry(model)
+    except Exception:
+        return ports
+    for entry in entries:
+        if entry.get("warning") or entry.get("port") is None:
+            continue
+        try:
+            ports.add(int(entry["port"]))
+        except (TypeError, ValueError):
+            continue
+    return ports
+
+
+def _managed_service_pids(model: dict[str, Any]) -> set[int]:
+    managed: set[int] = set()
+    for service in model.get("services") or []:
+        try:
+            pid = read_service_pid(service_paths(model, service)["pid_file"])
+        except Exception:
+            pid = None
+        if pid is None or not process_is_running(pid):
+            continue
+        try:
+            managed.update(process_tree_pids(pid))
+        except Exception:
+            managed.add(pid)
+    return managed
+
+
+def _candidate_key(pid: int, port: int, start_time: str) -> str:
+    return f"{pid}:{port}:{start_time}"
+
+
+def _scan_rogue_listeners(model: dict[str, Any]) -> list[dict[str, Any]]:
+    declared_ports = _declared_port_set(model)
+    managed_pids = _managed_service_pids(model)
+    candidates: list[dict[str, Any]] = []
+    identity_cache: dict[int, dict[str, Any] | None] = {}
+
+    for listener in all_process_listeners():
+        try:
+            pid = int(listener.get("pid"))
+            port = int(listener.get("port"))
+        except (TypeError, ValueError):
+            continue
+        if pid in managed_pids:
+            continue
+        identity = identity_cache.setdefault(pid, _process_identity(pid))
+        if identity is None:
+            continue
+        signature = _dev_server_signature(identity)
+        if _system_listener_allowed(identity, port, signature):
+            continue
+        enforcement = "dev-server" if signature else "report-only"
+        reason = "dev_server_signature" if signature else "unmanaged_listener"
+        if port in declared_ports and signature:
+            reason = "dev_server_on_declared_port"
+        candidate = {
+            "key": _candidate_key(pid, port, str(identity.get("start_time") or "")),
+            "pid": pid,
+            "port": port,
+            "comm": identity.get("comm") or "",
+            "cmdline": identity.get("cmdline") or "",
+            "start_time": identity.get("start_time") or "",
+            "signature": signature or "none",
+            "enforcement": enforcement,
+            "reason": reason,
+            "declared_port": port in declared_ports,
+        }
+        candidates.append(candidate)
+    return sorted(candidates, key=lambda item: (item["port"], item["pid"]))
+
+
+def _same_process(candidate: dict[str, Any], identity: dict[str, Any] | None) -> bool:
+    if identity is None:
+        return False
+    return (
+        str(identity.get("start_time") or "") == str(candidate.get("start_time") or "")
+        and str(identity.get("cmdline") or "") == str(candidate.get("cmdline") or "")
+    )
+
+
+def _terminate_rogue(candidate: dict[str, Any]) -> str:
+    pid = int(candidate["pid"])
+    identity = _process_identity(pid)
+    if not _same_process(candidate, identity):
+        return "skipped-pid-reused"
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "already-gone"
+    except PermissionError:
+        return "permission-denied"
+
+    deadline = time.monotonic() + PORT_SENTINEL_REAP_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        if not process_is_running(pid):
+            return "terminated"
+        time.sleep(0.05)
+
+    identity = _process_identity(pid)
+    if not _same_process(candidate, identity):
+        return "skipped-pid-reused"
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return "terminated"
+    except PermissionError:
+        return "permission-denied"
+    return "killed"
+
+
+def _record_port_sentinel_seen(state: "PulseState", candidate: dict[str, Any]) -> None:
+    counters = state.port_sentinel_counters
+    counters["rogues_seen"] = int(counters.get("rogues_seen") or 0) + 1
+    by_signature = counters.setdefault("by_signature", {})
+    signature = str(candidate.get("signature") or "none")
+    by_signature[signature] = int(by_signature.get(signature) or 0) + 1
+
+
+def _port_sentinel_event(action: str, candidate: dict[str, Any], state: "PulseState", **extra: Any) -> None:
+    detail = {
+        "kind": "port_sentinel",
+        "action": action,
+        "pid": candidate.get("pid"),
+        "port": candidate.get("port"),
+        "signature": candidate.get("signature"),
+        "reason": candidate.get("reason"),
+        "enforcement": candidate.get("enforcement"),
+        **extra,
+    }
+    log_runtime_event("pulse.port_sentinel", str(candidate.get("pid")), detail)
+    state.events_emitted += 1
+    log("warn", f"port sentinel {action}: pid {candidate.get('pid')} port {candidate.get('port')}")
+
+
+def _reconcile_port_sentinel(model: dict[str, Any], state: "PulseState", *, now: float) -> None:
+    mode, grace_seconds = _port_sentinel_config(model)
+    state.port_sentinel_mode = mode
+    state.port_sentinel_grace_seconds = grace_seconds
+    if mode == "off":
+        state.port_sentinel_last_candidates = []
+        state.port_sentinel_first_seen.clear()
+        return
+
+    candidates = _scan_rogue_listeners(model)
+    active_keys = {candidate["key"] for candidate in candidates}
+    for stale_key in list(state.port_sentinel_first_seen):
+        if stale_key not in active_keys:
+            state.port_sentinel_first_seen.pop(stale_key, None)
+
+    last_candidates: list[dict[str, Any]] = []
+    for candidate in candidates:
+        key = candidate["key"]
+        first_seen = state.port_sentinel_first_seen.setdefault(key, now)
+        age_seconds = max(0.0, now - first_seen)
+        candidate_view = {
+            "pid": candidate["pid"],
+            "port": candidate["port"],
+            "signature": candidate["signature"],
+            "enforcement": candidate["enforcement"],
+            "reason": candidate["reason"],
+            "age_seconds": round(age_seconds, 1),
+        }
+        last_candidates.append(candidate_view)
+        _record_port_sentinel_seen(state, candidate)
+
+        if first_seen == now:
+            _port_sentinel_event("observed", candidate, state, mode=mode)
+
+        if mode != "enforce" or candidate.get("enforcement") != "dev-server":
+            continue
+        if age_seconds < grace_seconds:
+            continue
+
+        action = _terminate_rogue(candidate)
+        if action in {"terminated", "killed", "already-gone"}:
+            counters = state.port_sentinel_counters
+            counters["rogues_reaped"] = int(counters.get("rogues_reaped") or 0) + 1
+            state.port_sentinel_first_seen.pop(key, None)
+        _port_sentinel_event(action, candidate, state, mode=mode, age_seconds=round(age_seconds, 1))
+
+    state.port_sentinel_last_candidates = last_candidates[-10:]
+
+
+# ---------------------------------------------------------------------------
 # Core reconciliation cycle
 # ---------------------------------------------------------------------------
 
@@ -450,6 +744,15 @@ class PulseState:
         self.unhealthy_since: dict[str, float] = {}  # service_id → monotonic timestamp
         self.pressure_warnings: list[str] = []
         self.pressure_advisory: dict[str, Any] = {}
+        self.port_sentinel_first_seen: dict[str, float] = {}
+        self.port_sentinel_mode: str = DEFAULT_PORT_SENTINEL_MODE
+        self.port_sentinel_grace_seconds: float = DEFAULT_PORT_SENTINEL_GRACE_SECONDS
+        self.port_sentinel_counters: dict[str, Any] = {
+            "rogues_seen": 0,
+            "rogues_reaped": 0,
+            "by_signature": {},
+        }
+        self.port_sentinel_last_candidates: list[dict[str, Any]] = []
         self.cycle_count: int = 0
         self.heals: int = 0
         self.events_emitted: int = 0
@@ -470,6 +773,13 @@ class PulseState:
             "check_states": dict(self.check_states),
             "pressure_warnings": list(self.pressure_warnings),
             "pressure_advisory": dict(self.pressure_advisory),
+            "port_sentinel": {
+                "mode": self.port_sentinel_mode,
+                "grace_seconds": self.port_sentinel_grace_seconds,
+                "active_candidates": len(self.port_sentinel_first_seen),
+                "last_candidates": list(self.port_sentinel_last_candidates),
+                **copy_port_sentinel_counters(self.port_sentinel_counters),
+            },
             "restart_attempts": dict(self.restart_attempts),
             "unhealthy_for_seconds": unhealthy_for,
         }
@@ -507,6 +817,7 @@ def reconcile_once(
         unhealthy_grace_seconds=unhealthy_grace_seconds,
         now=now,
     )
+    _reconcile_port_sentinel(model, state, now=now)
     _reconcile_pulse_checks(model, state)
     _reconcile_pressure_advisory(root_dir, state)
     _write_pulse_state(
@@ -1012,6 +1323,7 @@ def _print_pulse_snapshot(snapshot: dict[str, Any], running_pid: int | None) -> 
 
     _print_pulse_services(snapshot.get("service_states", {}))
     _print_pulse_checks(snapshot.get("check_states", {}))
+    _print_port_sentinel(snapshot.get("port_sentinel", {}))
     _print_pulse_pressure(snapshot.get("pressure_warnings", []))
 
 
@@ -1039,6 +1351,22 @@ def _print_pulse_pressure(pressure_warnings: list[Any]) -> None:
     print("  pressure/offload warnings:")
     for warning in warnings:
         print(f"    ! {warning}")
+
+
+def _print_port_sentinel(port_sentinel: dict[str, Any]) -> None:
+    if not port_sentinel:
+        return
+    mode = port_sentinel.get("mode", DEFAULT_PORT_SENTINEL_MODE)
+    seen = int(port_sentinel.get("rogues_seen") or 0)
+    reaped = int(port_sentinel.get("rogues_reaped") or 0)
+    active = int(port_sentinel.get("active_candidates") or 0)
+    print(f"  port sentinel: {mode}, seen {seen}, reaped {reaped}, active {active}")
+    for candidate in port_sentinel.get("last_candidates") or []:
+        print(
+            "    ! "
+            f"pid {candidate.get('pid')} port {candidate.get('port')} "
+            f"{candidate.get('signature')} {candidate.get('enforcement')}"
+        )
 
 
 def read_state(root_dir: Path) -> dict[str, Any]:

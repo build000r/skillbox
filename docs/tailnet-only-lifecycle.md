@@ -43,6 +43,11 @@ Services bind to one of four exposure patterns:
 | `ingress-routed` | via Tailscale Funnel/proxy | Yes |
 | `wildcard-direct` | `0.0.0.0:8080` | **No** — violation |
 
+Pulse also runs a port sentinel. In `observe` mode it reports unmanaged
+listeners and wildcard/dev-server signatures in `pulse.state.json`; in
+`enforce` mode it may terminate dev-server signatures after the configured
+grace window. Unknown non-dev listeners remain report-only.
+
 ## Commands
 
 ### Verify posture from operator machine
@@ -151,5 +156,8 @@ infrastructure cooperates.
   matches. Use `posture-proof` to check.
 - `wildcard-direct` binds (`0.0.0.0`) are violations under `tailnet_only`.
   Fix service configs to bind to Tailnet IP or loopback.
+- Keep `SKILLBOX_PORT_SENTINEL=observe` until the pulse telemetry is clean;
+  `enforce` is intended for dev-server signatures, not arbitrary operator
+  sockets.
 - The bootstrap aperture (public SSH) exists only during `create` through
   `enroll`. After lockdown, there is no public SSH path.
