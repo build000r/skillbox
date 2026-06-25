@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 import textwrap
@@ -55,6 +56,50 @@ class CliWrapperTests(unittest.TestCase):
         self.assertEqual(payload["tool"], "skillbox-sbp")
         self.assertIn("stdout_stderr_contract", payload)
         self.assertTrue(any(command["name"] == "candidates" for command in payload["commands"]))
+        verbs = payload["skill_verbs"]
+        expected_verb_fields = {
+            "purpose",
+            "mutates",
+            "links_disk",
+            "returns_packet",
+            "scope",
+            "survives_recalibrate",
+            "when_to_use",
+            "do_NOT",
+        }
+        required_decision_verbs = {
+            "recalibrate",
+            "activate",
+            "sync",
+            "prune",
+            "on",
+            "off",
+            "default",
+            "heal",
+            "why",
+        }
+        self.assertLessEqual(required_decision_verbs, set(verbs))
+        for name, row in verbs.items():
+            with self.subTest(skill_verb=name):
+                self.assertEqual(set(row), expected_verb_fields)
+        self.assertTrue(verbs["on"]["returns_packet"])
+        self.assertEqual(verbs["recalibrate"]["mutates"], "none")
+        self.assertEqual(verbs["activate"]["mutates"], "cwd-ephemeral")
+        self.assertIn("default", verbs)
+        self.assertFalse(verbs["default"]["links_disk"])
+        help_result = subprocess.run(
+            ["python3", ".env-manager/manage.py", "skill", "--help"],
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        match = re.search(r"\{([^}]+)\}", help_result.stdout)
+        self.assertIsNotNone(match, help_result.stdout)
+        dispatched_skill_verbs = set(match.group(1).split(",")) if match else set()
+        self.assertLessEqual(dispatched_skill_verbs, set(verbs))
         launch = next(command for command in payload["commands"] if command["name"] == "launch")
         bulk = next(command for command in payload["commands"] if command["name"] == "bulk")
         self.assertEqual(launch["aliases"], ["bulk"])
@@ -88,6 +133,9 @@ class CliWrapperTests(unittest.TestCase):
         self.assertIn("sbp bulk <dir> <dir> --request 'Audit auth drift' --dry-run --json", result.stdout)
         self.assertIn("bulk is an alias for launch", result.stdout)
         self.assertIn("Use single quotes when prompts contain $smart", result.stdout)
+        self.assertIn("Skill verb contract:", result.stdout)
+        self.assertIn("sbp capabilities --json | jq .skill_verbs", result.stdout)
+        self.assertIn("activate (mutates=cwd-ephemeral, returns_packet=true)", result.stdout)
 
     def test_sbp_launch_maps_to_swimmers_launch_without_profile_consuming_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

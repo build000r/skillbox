@@ -15,6 +15,7 @@ This page is **generated** from `scripts/gen_output_schemas.py`. The example pay
 
 ## Surfaces
 
+- [`sbp capabilities`](#sbp-capabilities)
 - [`sbp skills`](#sbp-skills)
 - [`sbp candidates`](#sbp-candidates)
 - [`sbp mcp`](#sbp-mcp)
@@ -25,9 +26,353 @@ This page is **generated** from `scripts/gen_output_schemas.py`. The example pay
 
 ---
 
+## `sbp capabilities`
+
+**Invocation:** `sbp capabilities --json`
+**Produced by:** `scripts/sbp print_capabilities`
+
+The wrapper discovery contract. Agents should start here to learn the stable command inventory, stdout/stderr rules, dry-run guidance, and the machine-readable `skill_verbs` decision map for choosing between recalibrate/activate/sync/prune/on/off/heal/why and maintenance verbs.
+
+### Fields
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `agent_surfaces` | CONTRACT | Canonical discovery commands for agents. |
+| `aliases` | CONTRACT | Sibling wrapper aliases for this entrypoint. |
+| `commands` | CONTRACT | Agent-facing command inventory with safe_first_try examples. |
+| `contract_version` | CONTRACT | Version tag for this wrapper capabilities contract. |
+| `cwd` | CONTRACT | Invocation cwd used by the wrapper. |
+| `entrypoint` | CONTRACT | Wrapper entrypoint path relative to the skillbox repo. |
+| `next_actions` | info | Common first follow-up commands. |
+| `ok` | CONTRACT | True when the wrapper emitted a complete capabilities payload. |
+| `safety` | CONTRACT | Dry-run and confirmation guidance for mutating commands. |
+| `skill_verbs` | CONTRACT | Machine-readable skill verb decision map; every dispatched skill subcommand has an entry. |
+| `stdout_stderr_contract` | CONTRACT | Where JSON and diagnostics are emitted. |
+| `tool` | CONTRACT | Tool identity, e.g. skillbox-sbp. |
+
+#### `skill_verbs.<verb>` (one skill verb row)
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `do_NOT` | info | Important anti-pattern for this verb. |
+| `links_disk` | CONTRACT | True when the verb may create/remove skill links on disk. |
+| `mutates` | CONTRACT | Stable mutation class: none, cwd-ephemeral, disk-links, or repo-state+disk-links. |
+| `purpose` | CONTRACT | One-line meaning of the verb. |
+| `returns_packet` | CONTRACT | True when success includes an activation_packet for immediate session use. |
+| `scope` | CONTRACT | Scope the verb operates on. |
+| `survives_recalibrate` | CONTRACT | True when the verb writes durable repo state that recalibrate/prune should preserve. |
+| `when_to_use` | info | Human/agent guidance for choosing this verb. |
+
+### Example payload
+
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>`.</sub>
+
+```json
+{
+  "agent_surfaces": {
+    "capabilities": "sbp capabilities --json",
+    "json_aliases": [
+      "--jason",
+      "--json",
+      "--jsno",
+      "--jsson"
+    ],
+    "robot_docs": "sbp robot-docs guide",
+    "robot_triage": "sbp --robot-triage"
+  },
+  "aliases": [
+    "sbo"
+  ],
+  "commands": [
+    {
+      "json": true,
+      "name": "capabilities",
+      "safe_first_try": "sbp capabilities --json"
+    },
+    {
+      "json": true,
+      "name": "robot-docs",
+      "safe_first_try": "sbp robot-docs guide"
+    },
+    {
+      "json": true,
+      "name": "robot-triage",
+      "safe_first_try": "sbp --robot-triage"
+    },
+    {
+      "json": true,
+      "name": "status",
+      "safe_first_try": "sbp status --json"
+    },
+    {
+      "json": true,
+      "name": "logs",
+      "safe_first_try": "sbp logs <profile> <service> --json"
+    },
+    {
+      "json": true,
+      "name": "up",
+      "safe_first_try": "sbp up <profile> <service> --dry-run --json"
+    },
+    {
+      "json": true,
+      "name": "down",
+      "safe_first_try": "sbp down <profile> <service> --dry-run --json"
+    },
+    {
+      "json": true,
+      "name": "restart",
+      "safe_first_try": "sbp restart <profile> <service> --dry-run --json"
+    },
+    {
+      "aliases": [
+        "bulk"
+      ],
+      "json": true,
+      "name": "launch",
+      "safe_first_try": "sbp launch <dir> <dir> --request '<prompt>' --dry-run --json"
+    },
+    {
+      "alias_for": "launch",
+      "json": true,
+      "name": "bulk",
+      "safe_first_try": "sbp bulk <dir> <dir> --request '<prompt>' --dry-run --json"
+    },
+    {
+      "json": true,
+      "name": "skills",
+      "safe_first_try": "sbp skills --issues-only --json"
+    },
+    {
+      "json": true,
+      "name": "skill-why",
+      "safe_first_try": "sbp skill why <skill> --json"
+    },
+    {
+      "json": true,
+      "name": "skill-heal",
+      "safe_first_try": "sbp skill heal <skill> --dry-run --format json"
+    },
+    {
+      "json": true,
+      "name": "candidates",
+      "safe_first_try": "sbp candidates --json"
+    },
+    {
+      "json": true,
+      "name": "mcp",
+      "safe_first_try": "sbp mcp --json"
+    },
+    {
+      "json": true,
+      "name": "registry",
+      "safe_first_try": "sbp registry doctor --json"
+    },
+    {
+      "json": true,
+      "name": "cass",
+      "safe_first_try": "sbp cass status --json"
+    },
+    {
+      "json": true,
+      "name": "evidence",
+      "safe_first_try": "sbp evidence --repo <path> --format json"
+    },
+    {
+      "json": true,
+      "name": "cron",
+      "safe_first_try": "sbp cron status --json"
+    },
+    {
+      "json": true,
+      "name": "send-later",
+      "safe_first_try": "sbp send-later list --json"
+    },
+    {
+      "json": false,
+      "name": "recalibrate",
+      "safe_first_try": "sbp recalibrate"
+    }
+  ],
+  "contract_version": "2026-05-11",
+  "cwd": "<RUNTIME_ROOT>",
+  "entrypoint": "scripts/sbp",
+  "next_actions": [
+    "sbp status --json",
+    "sbp skills --issues-only --json",
+    "sbp mcp --json",
+    "sbp launch <dir> <dir> --request '<prompt>' --dry-run --json",
+    "sbp up <profile> <service> --dry-run --json"
+  ],
+  "ok": true,
+  "safety": {
+    "confirm_with_user_before": [
+      "sbp down <profile> <service>"
+    ],
+    "dry_run_first": [
+      "sbp up <profile> <service> --dry-run --json",
+      "sbp down <profile> <service> --dry-run --json",
+      "sbp restart <profile> <service> --dry-run --json",
+      "sbp launch <dir> <dir> --request '<prompt>' --dry-run --json",
+      "sbp bulk <dir> <dir> --request '<prompt>' --dry-run --json",
+      "sbp skill prune --dry-run"
+    ]
+  },
+  "skill_verbs": {
+    "activate": {
+      "do_NOT": "Do not treat activate as durable repo state; use on or heal for that.",
+      "links_disk": true,
+      "mutates": "cwd-ephemeral",
+      "purpose": "Install/link a skill and print an activation packet for this session.",
+      "returns_packet": true,
+      "scope": "current cwd by default; global/category if explicitly requested",
+      "survives_recalibrate": false,
+      "when_to_use": "Use for an immediate one-session handoff when durability is not required."
+    },
+    "add": {
+      "do_NOT": "Do not use add when the repo needs a durable policy override; use on or heal.",
+      "links_disk": true,
+      "mutates": "disk-links",
+      "purpose": "Install/link a skill into a selected scope.",
+      "returns_packet": false,
+      "scope": "global, project, or category",
+      "survives_recalibrate": false,
+      "when_to_use": "Use for deliberate non-override link management."
+    },
+    "default": {
+      "do_NOT": "Do not call skill default; inspect with why and edit reviewed policy deliberately.",
+      "links_disk": false,
+      "mutates": "none",
+      "purpose": "Documented non-verb: there is no implemented skill default command.",
+      "returns_packet": false,
+      "scope": "n/a",
+      "survives_recalibrate": false,
+      "when_to_use": "Use the row to avoid reaching for an unimplemented default verb."
+    },
+    "heal": {
+      "do_NOT": "Do not use heal when no real source exists; unknown sources are refused.",
+      "links_disk": true,
+      "mutates": "repo-state+disk-links",
+      "purpose": "Resolve a real skill source, durably pin it on, link it, and return an activation packet.",
+      "returns_packet": true,
+      "scope": "repo-local project scope",
+      "survives_recalibrate": true,
+      "when_to_use": "Use when a source-backed skill is missing and should become visible now and later."
+    },
+    "lint": {
+      "do_NOT": "Do not expect lint to repair or rewrite the file.",
+      "links_disk": false,
+      "mutates": "none",
+      "purpose": "Validate the repo-local .skillbox/skill-overrides.yaml file.",
+      "returns_packet": false,
+      "scope": "current repo override file",
+      "survives_recalibrate": false,
+      "when_to_use": "Use after editing override state or when a pin behaves unexpectedly."
+    },
+    "move": {
+      "do_NOT": "Do not use move as a policy override; it only manages links.",
+      "links_disk": true,
+      "mutates": "disk-links",
+      "purpose": "Install/link a skill into a new scope and remove old installs for that skill.",
+      "returns_packet": false,
+      "scope": "global, project, or category",
+      "survives_recalibrate": false,
+      "when_to_use": "Use when intentionally relocating an existing install."
+    },
+    "off": {
+      "do_NOT": "Do not use off to disable dispatcher floor skills such as smart or sbp.",
+      "links_disk": true,
+      "mutates": "repo-state+disk-links",
+      "purpose": "Durably pin a skill off for this repo and unlink project installs.",
+      "returns_packet": false,
+      "scope": "repo-local project scope",
+      "survives_recalibrate": true,
+      "when_to_use": "Use when a repo should keep a skill disabled."
+    },
+    "on": {
+      "do_NOT": "Do not use on for global escalation; disallowed globals are refused.",
+      "links_disk": true,
+      "mutates": "repo-state+disk-links",
+      "purpose": "Durably pin a skill on for this repo, link it, and return an activation packet.",
+      "returns_packet": true,
+      "scope": "repo-local project scope",
+      "survives_recalibrate": true,
+      "when_to_use": "Use when the repo should keep seeing a known source-backed skill."
+    },
+    "plan": {
+      "do_NOT": "Do not expect plan to make a skill visible.",
+      "links_disk": false,
+      "mutates": "none",
+      "purpose": "Preview where a skill lifecycle operation would install or remove links.",
+      "returns_packet": false,
+      "scope": "global, project, or category preview",
+      "survives_recalibrate": false,
+      "when_to_use": "Use before a risky link or move when you only need the plan."
+    },
+    "prune": {
+      "do_NOT": "Do not skip dry-run; pinned overrides are protected by the prune firewall.",
+      "links_disk": true,
+      "mutates": "disk-links",
+      "purpose": "Remove installed skills that violate current skill-scope policy.",
+      "returns_packet": false,
+      "scope": "global, project, or all selected installs",
+      "survives_recalibrate": false,
+      "when_to_use": "Use after dry-run to remove drift that policy does not allow."
+    },
+    "recalibrate": {
+      "do_NOT": "Do not treat recalibrate as a mutator; it recommends commands.",
+      "links_disk": false,
+      "mutates": "none",
+      "purpose": "Read-only cwd/fleet skill visibility audit with exact next commands.",
+      "returns_packet": false,
+      "scope": "cwd or fleet",
+      "survives_recalibrate": false,
+      "when_to_use": "Use first when unsure what the repo or fleet needs."
+    },
+    "remove": {
+      "do_NOT": "Do not use remove when policy should keep the skill absent; use off.",
+      "links_disk": true,
+      "mutates": "disk-links",
+      "purpose": "Remove installed links/files for a skill.",
+      "returns_packet": false,
+      "scope": "global, project, or all selected installs",
+      "survives_recalibrate": false,
+      "when_to_use": "Use for direct cleanup of installed links."
+    },
+    "sync": {
+      "do_NOT": "Do not use sync to create a durable exception; use on or heal.",
+      "links_disk": true,
+      "mutates": "disk-links",
+      "purpose": "Install/link a named skill or all literal skills missing for the current cwd policy.",
+      "returns_packet": false,
+      "scope": "current cwd policy, project by default",
+      "survives_recalibrate": false,
+      "when_to_use": "Use when policy already requires a skill and only links are missing."
+    },
+    "why": {
+      "do_NOT": "Do not infer policy from memory when why can return the live layers.",
+      "links_disk": false,
+      "mutates": "none",
+      "purpose": "Explain one skill's visibility provenance, absence, and exact fixes.",
+      "returns_packet": false,
+      "scope": "current cwd",
+      "survives_recalibrate": false,
+      "when_to_use": "Use when choosing the narrowest correct fix for one skill."
+    }
+  },
+  "stdout_stderr_contract": {
+    "diagnostics_stderr": "JSON typo alias notices and parser errors go to stderr.",
+    "json_stdout": "When JSON is requested, stdout is parseable JSON from manage.py or this wrapper."
+  },
+  "tool": "skillbox-sbp"
+}
+```
+
+---
+
 ## `sbp skills`
 
-**Invocation:** `sbp skills [--full] [--no-global] [--show-sources] --format json`  
+**Invocation:** `sbp skills [--full] [--no-global] [--show-sources] --format json`
 **Produced by:** `collect_skill_visibility (compact via compact_skill_visibility_payload)`
 
 The conflict-aware skill availability view for the current cwd. `sbp skills` emits the COMPACT payload (below); `sbp skills --full` adds `global_surfaces`, `layers`, and `occurrences`. Branch on `summary` counters and `issues` groups; `effective` is the authoritative list of what is visible here.
@@ -262,7 +607,7 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
 
 ## `sbp candidates`
 
-**Invocation:** `sbp candidates --json` (== `sbp skills --show-sources --full --no-global --format json`)  
+**Invocation:** `sbp candidates --json` (== `sbp skills --show-sources --full --no-global --format json`)
 **Produced by:** `collect_skill_visibility (full, include_sources=True)`
 
 The exploratory source-inventory surface. Same payload as `sbp skills --full` with sources enabled; the load-bearing fields for bucketing candidates are `undefined_sources` + `source_roots` (the linkable universe) against `effective` (already present), `issues.missing_for_cwd` (definitely), and the matched policy.
@@ -689,7 +1034,7 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
 
 ## `sbp mcp`
 
-**Invocation:** `sbp mcp [--cwd <repo>] --format json` (bare `sbp mcp` runs the read-only audit)  
+**Invocation:** `sbp mcp [--cwd <repo>] --format json` (bare `sbp mcp` runs the read-only audit)
 **Produced by:** `collect_mcp_audit`
 
 Claude (`.mcp.json`) vs Codex (`.codex/config.toml`) MCP-server reconciliation. `expected_servers` is the per-scope baseline, `declared_servers` adds model-declared servers (any profile). Gate on `summary.unexplained_drift` and `summary.invalid_configs`; per-surface detail is in `surfaces.claude` / `surfaces.codex`.
@@ -815,7 +1160,7 @@ Claude (`.mcp.json`) vs Codex (`.codex/config.toml`) MCP-server reconciliation. 
 
 ## `sbp recalibrate`
 
-**Invocation:** `sbp recalibrate [--cwd <repo>]` (composite; machine core shown below)  
+**Invocation:** `sbp recalibrate [--cwd <repo>]` (composite; machine core shown below)
 **Produced by:** `collect_skill_visibility (issues-only view) + embedded beads block`
 
 A COMPOSITE human surface that stitches together several dry-run sub-calls (`sbp skills --issues-only`, `sbp skill sync --dry-run`, `sbp skill prune --dry-run`, the beads graph, and `sbp mcp`). Its single machine-readable core is the issues-focused `collect_skill_visibility` payload below — same shape as `sbp skills --issues-only --format json`, whose `beads` block the wrapper parses directly.
@@ -987,7 +1332,7 @@ A COMPOSITE human surface that stitches together several dry-run sub-calls (`sbp
 
 ## `sbp explain`
 
-**Invocation:** `sbp explain <skill> [--cwd <repo>] --format json`  
+**Invocation:** `sbp explain <skill> [--cwd <repo>] --format json`
 **Produced by:** `explain_skill_visibility`
 
 Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which occurrences lost and why, and — when invisible — the ranked, narrowest path to visibility with the EXACT command for each option. `machine` and `registry` are forward-compatible blocks: always present (possibly partial) so routing/registry consumers can grow without a schema break.
@@ -1136,7 +1481,7 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
 
 ## `sbp doctor`
 
-**Invocation:** `sbp doctor [--cwd <repo>] --format json` (a.k.a. structure-doctor)  
+**Invocation:** `sbp doctor [--cwd <repo>] --format json` (a.k.a. structure-doctor)
 **Produced by:** `run_structure_doctor`
 
 The structural verification front door. Runs every gate read-only and returns `{ok, gates, summary, exit_code}`. FAIL is the only status that flips `exit_code`; INCO (e.g. a dependency unreachable) and PASS both exit 0 — INCO is never a regression. The example below uses canned gate outcomes (one of each status) for determinism; `duration_s` is real wall-clock in production (normalized to 0.0 here).
@@ -1226,7 +1571,7 @@ The structural verification front door. Runs every gate read-only and returns `{
 
 ## `fleet converge`
 
-**Invocation:** `sbp fleet converge [--cwd <repo>] [--all] [--no-mcp] --format json`  
+**Invocation:** `sbp fleet converge [--cwd <repo>] [--all] [--no-mcp] --format json`
 **Produced by:** `build_fleet_converge_plan`
 
 ONE diffable, PLAN-ONLY heal plan across the deduped canonical fleet (the same candidate set `collect_skill_audit` reports). Each repo's drift is grouped into the five fixed triage classes (`relink`, `prune`, `sync`, `policy`, `mcp`); every action carries its exact single-repo command. `dry_run` is always true — converge never writes.

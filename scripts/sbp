@@ -230,6 +230,148 @@ import sys
 
 wrapper = sys.argv[1]
 cwd = sys.argv[2]
+skill_verbs = {
+    "recalibrate": {
+        "purpose": "Read-only cwd/fleet skill visibility audit with exact next commands.",
+        "mutates": "none",
+        "links_disk": False,
+        "returns_packet": False,
+        "scope": "cwd or fleet",
+        "survives_recalibrate": False,
+        "when_to_use": "Use first when unsure what the repo or fleet needs.",
+        "do_NOT": "Do not treat recalibrate as a mutator; it recommends commands.",
+    },
+    "plan": {
+        "purpose": "Preview where a skill lifecycle operation would install or remove links.",
+        "mutates": "none",
+        "links_disk": False,
+        "returns_packet": False,
+        "scope": "global, project, or category preview",
+        "survives_recalibrate": False,
+        "when_to_use": "Use before a risky link or move when you only need the plan.",
+        "do_NOT": "Do not expect plan to make a skill visible.",
+    },
+    "add": {
+        "purpose": "Install/link a skill into a selected scope.",
+        "mutates": "disk-links",
+        "links_disk": True,
+        "returns_packet": False,
+        "scope": "global, project, or category",
+        "survives_recalibrate": False,
+        "when_to_use": "Use for deliberate non-override link management.",
+        "do_NOT": "Do not use add when the repo needs a durable policy override; use on or heal.",
+    },
+    "activate": {
+        "purpose": "Install/link a skill and print an activation packet for this session.",
+        "mutates": "cwd-ephemeral",
+        "links_disk": True,
+        "returns_packet": True,
+        "scope": "current cwd by default; global/category if explicitly requested",
+        "survives_recalibrate": False,
+        "when_to_use": "Use for an immediate one-session handoff when durability is not required.",
+        "do_NOT": "Do not treat activate as durable repo state; use on or heal for that.",
+    },
+    "move": {
+        "purpose": "Install/link a skill into a new scope and remove old installs for that skill.",
+        "mutates": "disk-links",
+        "links_disk": True,
+        "returns_packet": False,
+        "scope": "global, project, or category",
+        "survives_recalibrate": False,
+        "when_to_use": "Use when intentionally relocating an existing install.",
+        "do_NOT": "Do not use move as a policy override; it only manages links.",
+    },
+    "on": {
+        "purpose": "Durably pin a skill on for this repo, link it, and return an activation packet.",
+        "mutates": "repo-state+disk-links",
+        "links_disk": True,
+        "returns_packet": True,
+        "scope": "repo-local project scope",
+        "survives_recalibrate": True,
+        "when_to_use": "Use when the repo should keep seeing a known source-backed skill.",
+        "do_NOT": "Do not use on for global escalation; disallowed globals are refused.",
+    },
+    "off": {
+        "purpose": "Durably pin a skill off for this repo and unlink project installs.",
+        "mutates": "repo-state+disk-links",
+        "links_disk": True,
+        "returns_packet": False,
+        "scope": "repo-local project scope",
+        "survives_recalibrate": True,
+        "when_to_use": "Use when a repo should keep a skill disabled.",
+        "do_NOT": "Do not use off to disable dispatcher floor skills such as smart or sbp.",
+    },
+    "heal": {
+        "purpose": "Resolve a real skill source, durably pin it on, link it, and return an activation packet.",
+        "mutates": "repo-state+disk-links",
+        "links_disk": True,
+        "returns_packet": True,
+        "scope": "repo-local project scope",
+        "survives_recalibrate": True,
+        "when_to_use": "Use when a source-backed skill is missing and should become visible now and later.",
+        "do_NOT": "Do not use heal when no real source exists; unknown sources are refused.",
+    },
+    "remove": {
+        "purpose": "Remove installed links/files for a skill.",
+        "mutates": "disk-links",
+        "links_disk": True,
+        "returns_packet": False,
+        "scope": "global, project, or all selected installs",
+        "survives_recalibrate": False,
+        "when_to_use": "Use for direct cleanup of installed links.",
+        "do_NOT": "Do not use remove when policy should keep the skill absent; use off.",
+    },
+    "prune": {
+        "purpose": "Remove installed skills that violate current skill-scope policy.",
+        "mutates": "disk-links",
+        "links_disk": True,
+        "returns_packet": False,
+        "scope": "global, project, or all selected installs",
+        "survives_recalibrate": False,
+        "when_to_use": "Use after dry-run to remove drift that policy does not allow.",
+        "do_NOT": "Do not skip dry-run; pinned overrides are protected by the prune firewall.",
+    },
+    "sync": {
+        "purpose": "Install/link a named skill or all literal skills missing for the current cwd policy.",
+        "mutates": "disk-links",
+        "links_disk": True,
+        "returns_packet": False,
+        "scope": "current cwd policy, project by default",
+        "survives_recalibrate": False,
+        "when_to_use": "Use when policy already requires a skill and only links are missing.",
+        "do_NOT": "Do not use sync to create a durable exception; use on or heal.",
+    },
+    "lint": {
+        "purpose": "Validate the repo-local .skillbox/skill-overrides.yaml file.",
+        "mutates": "none",
+        "links_disk": False,
+        "returns_packet": False,
+        "scope": "current repo override file",
+        "survives_recalibrate": False,
+        "when_to_use": "Use after editing override state or when a pin behaves unexpectedly.",
+        "do_NOT": "Do not expect lint to repair or rewrite the file.",
+    },
+    "why": {
+        "purpose": "Explain one skill's visibility provenance, absence, and exact fixes.",
+        "mutates": "none",
+        "links_disk": False,
+        "returns_packet": False,
+        "scope": "current cwd",
+        "survives_recalibrate": False,
+        "when_to_use": "Use when choosing the narrowest correct fix for one skill.",
+        "do_NOT": "Do not infer policy from memory when why can return the live layers.",
+    },
+    "default": {
+        "purpose": "Documented non-verb: there is no implemented skill default command.",
+        "mutates": "none",
+        "links_disk": False,
+        "returns_packet": False,
+        "scope": "n/a",
+        "survives_recalibrate": False,
+        "when_to_use": "Use the row to avoid reaching for an unimplemented default verb.",
+        "do_NOT": "Do not call skill default; inspect with why and edit reviewed policy deliberately.",
+    },
+}
 payload = {
     "ok": True,
     "tool": f"skillbox-{wrapper}",
@@ -266,6 +408,7 @@ payload = {
         "robot_triage": f"{wrapper} --robot-triage",
         "json_aliases": ["--jason", "--json", "--jsno", "--jsson"],
     },
+    "skill_verbs": skill_verbs,
     "stdout_stderr_contract": {
         "json_stdout": "When JSON is requested, stdout is parseable JSON from manage.py or this wrapper.",
         "diagnostics_stderr": "JSON typo alias notices and parser errors go to stderr.",
@@ -317,6 +460,13 @@ Safe mutation pattern:
   ${wrapper_name} down <profile> <service> --dry-run --json
   ${wrapper_name} restart <profile> <service> --dry-run --json
   ${wrapper_name} launch <dir> <dir> --request "..." --dry-run --json
+
+Skill verb contract:
+  Machine map: ${wrapper_name} capabilities --json | jq .skill_verbs
+  Read-only: recalibrate, plan, lint, why, default (default is a documented non-verb)
+  Session handoff: activate (mutates=cwd-ephemeral, returns_packet=true)
+  Durable repo pins: on, off, heal (survive recalibrate)
+  Link-only maintenance: add, move, remove, prune, sync
 
 Batch launcher:
   ${wrapper_name} launch <dir> <dir> --request 'Audit auth drift' --dry-run --json

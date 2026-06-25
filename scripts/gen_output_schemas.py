@@ -42,6 +42,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -86,6 +88,30 @@ CONTRACT = "CONTRACT"
 INFO = "info"
 
 FIELD_NOTES: dict[str, dict[str, tuple[str, str]]] = {
+    "capabilities": {
+        "ok": (CONTRACT, "True when the wrapper emitted a complete capabilities payload."),
+        "tool": (CONTRACT, "Tool identity, e.g. skillbox-sbp."),
+        "contract_version": (CONTRACT, "Version tag for this wrapper capabilities contract."),
+        "entrypoint": (CONTRACT, "Wrapper entrypoint path relative to the skillbox repo."),
+        "cwd": (CONTRACT, "Invocation cwd used by the wrapper."),
+        "aliases": (CONTRACT, "Sibling wrapper aliases for this entrypoint."),
+        "commands": (CONTRACT, "Agent-facing command inventory with safe_first_try examples."),
+        "agent_surfaces": (CONTRACT, "Canonical discovery commands for agents."),
+        "skill_verbs": (CONTRACT, "Machine-readable skill verb decision map; every dispatched skill subcommand has an entry."),
+        "stdout_stderr_contract": (CONTRACT, "Where JSON and diagnostics are emitted."),
+        "safety": (CONTRACT, "Dry-run and confirmation guidance for mutating commands."),
+        "next_actions": (INFO, "Common first follow-up commands."),
+    },
+    "capabilities.skill_verb": {
+        "purpose": (CONTRACT, "One-line meaning of the verb."),
+        "mutates": (CONTRACT, "Stable mutation class: none, cwd-ephemeral, disk-links, or repo-state+disk-links."),
+        "links_disk": (CONTRACT, "True when the verb may create/remove skill links on disk."),
+        "returns_packet": (CONTRACT, "True when success includes an activation_packet for immediate session use."),
+        "scope": (CONTRACT, "Scope the verb operates on."),
+        "survives_recalibrate": (CONTRACT, "True when the verb writes durable repo state that recalibrate/prune should preserve."),
+        "when_to_use": (INFO, "Human/agent guidance for choosing this verb."),
+        "do_NOT": (INFO, "Important anti-pattern for this verb."),
+    },
     "skills": {
         "cwd": (CONTRACT, "Absolute resolved cwd the visibility view was computed for."),
         "active_clients": (CONTRACT, "Client overlays active for this resolution."),
@@ -337,6 +363,23 @@ def example_skills() -> dict[str, Any]:
     return _fleet_example(run)
 
 
+def example_capabilities() -> dict[str, Any]:
+    """`sbp capabilities --json` from the real wrapper."""
+    env = os.environ.copy()
+    env.setdefault("TERM", "dumb")
+    env["SKILLBOX_ROOT"] = str(ROOT_DIR)
+    result = subprocess.run(
+        ["bash", str(ROOT_DIR / "scripts" / "sbp"), "capabilities", "--json"],
+        cwd=ROOT_DIR,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    return _norm(json.loads(result.stdout), [(str(ROOT_DIR), RUNTIME_ROOT_PLACEHOLDER)])
+
+
 def example_candidates() -> dict[str, Any]:
     """`sbp candidates` == `sbp skills --show-sources --full --no-global` at the cli repo."""
 
@@ -464,6 +507,20 @@ def example_fleet_converge() -> dict[str, Any]:
 
 # (key, command, title, intro, example fn, nested tables [(notes_key, label, picker)])
 SURFACES: list[dict[str, Any]] = [
+    {
+        "key": "capabilities",
+        "command": "sbp capabilities",
+        "long": "`sbp capabilities --json`",
+        "fn": "scripts/sbp print_capabilities",
+        "intro": (
+            "The wrapper discovery contract. Agents should start here to learn the stable "
+            "command inventory, stdout/stderr rules, dry-run guidance, and the machine-readable "
+            "`skill_verbs` decision map for choosing between recalibrate/activate/sync/prune/"
+            "on/off/heal/why and maintenance verbs."
+        ),
+        "example": example_capabilities,
+        "nested": [("capabilities.skill_verb", "`skill_verbs.<verb>` (one skill verb row)", None)],
+    },
     {
         "key": "skills",
         "command": "sbp skills",
@@ -593,6 +650,8 @@ def _first_nested(example: dict[str, Any], notes_key: str) -> dict[str, Any] | N
     if leaf == "repo":
         repos = example.get("repos") or []
         return repos[0] if repos else None
+    if leaf == "skill_verb":
+        return (example.get("skill_verbs") or {}).get("on") or None
     return None
 
 
@@ -665,7 +724,7 @@ def render_doc() -> str:
         lines.append("")
         lines.append(f"## `{surface['command']}`")
         lines.append("")
-        lines.append(f"**Invocation:** {surface['long']}  ")
+        lines.append(f"**Invocation:** {surface['long']}")
         lines.append(f"**Produced by:** `{surface['fn']}`")
         lines.append("")
         lines.append(surface["intro"])
