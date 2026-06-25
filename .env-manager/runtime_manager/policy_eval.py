@@ -117,6 +117,7 @@ __all__ = [
     '_category_by_id',
     '_scope_allows_global',
     '_global_install_allowed',
+    '_global_override_refusal_context',
 ]
 
 
@@ -2068,3 +2069,21 @@ def _global_install_allowed(model: dict[str, Any], skill_name: str) -> bool:
     if patterns is None:
         return True
     return any(fnmatch.fnmatchcase(skill_name, pattern) for pattern in patterns)
+
+
+def _global_override_refusal_context(model: dict[str, Any], skill_name: str) -> dict[str, Any] | None:
+    patterns = _global_allow_patterns(model)
+    if patterns is None or any(fnmatch.fnmatchcase(skill_name, pattern) for pattern in patterns):
+        return None
+
+    matching_rule = _matching_scope_rule(skill_name, _scope_rules(model))
+    context: dict[str, Any] = {
+        "skill": skill_name,
+        "allowed_global_patterns": list(patterns),
+    }
+    if matching_rule:
+        context["scope_rule"] = matching_rule.get("id")
+        context["scope_policy_path"] = matching_rule.get("policy_path")
+        context["scope_rule_allow_global"] = bool(matching_rule.get("allow_global"))
+        context["scope_rule_default"] = matching_rule.get("default")
+    return context

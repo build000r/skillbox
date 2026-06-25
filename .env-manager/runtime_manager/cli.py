@@ -9,7 +9,11 @@ import traceback
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
-from .errors import PRUNE_SKIPPED_PINNED
+from .errors import (
+    OVERRIDE_REFUSED_FLOOR,
+    OVERRIDE_REFUSED_GLOBAL_ESCALATION,
+    PRUNE_SKIPPED_PINNED,
+)
 from .shared import *
 from .validation import *
 from .publish import *
@@ -1346,6 +1350,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--verify",
         action="store_true",
         help="Re-resolve visibility after applying and report the linked packet hash.",
+    )
+    skill_on_parser.add_argument(
+        "--global",
+        dest="to",
+        action="store_const",
+        const="global",
+        help="Request a global pin; refused when the skill is not globally allowed.",
     )
     skill_on_parser.set_defaults(to="project")
 
@@ -4416,6 +4427,52 @@ def _skill_toggle_verification(
     }
 
 
+def _validate_skill_toggle_security(
+    model: dict[str, Any],
+    *,
+    skill_name: str,
+    skill_action: str,
+    requested_to: str,
+    cwd_path: Path,
+) -> None:
+    if skill_action == "off" and skill_name in set(DISPATCHER_CORE):
+        raise ValidationError(
+            OVERRIDE_REFUSED_FLOOR,
+            f"Refusing to pin off dispatcher floor skill {skill_name!r}.",
+            context={
+                "skill": skill_name,
+                "action": skill_action,
+                "floor": list(DISPATCHER_CORE),
+                "policy": "repo overrides cannot disable dispatcher floor skills",
+            },
+            next_actions=[
+                f"sbp skill on {skill_name} --cwd {cwd_path}",
+                f"sbp skill lint --cwd {cwd_path}",
+            ],
+        )
+    global_refusal = (
+        _global_override_refusal_context(model, skill_name)
+        if skill_action == "on" and requested_to == "global"
+        else None
+    )
+    if global_refusal is not None:
+        context = dict(global_refusal)
+        context.update({
+            "action": skill_action,
+            "requested_to": requested_to,
+            "policy": "repo overrides may widen visibility only inside the current repo",
+        })
+        raise ValidationError(
+            OVERRIDE_REFUSED_GLOBAL_ESCALATION,
+            f"Refusing global pin for skill {skill_name!r}: allow_global is false.",
+            context=context,
+            next_actions=[
+                f"sbp skill on {skill_name} --cwd {cwd_path}",
+                "Edit the operator skill-scope allow_global rule if this truly belongs in the global layer.",
+            ],
+        )
+
+
 def _handle_skill_toggle(
     args: argparse.Namespace,
     model: dict[str, Any],
@@ -4427,6 +4484,13 @@ def _handle_skill_toggle(
     cwd_path = Path(args.cwd or os.getcwd()).resolve()
     requested_to = str(getattr(args, "to", "project") or "project")
     from_scope = str(getattr(args, "from_scope", "project") or "project")
+    _validate_skill_toggle_security(
+        model,
+        skill_name=skill_name,
+        skill_action=skill_action,
+        requested_to=requested_to,
+        cwd_path=cwd_path,
+    )
     if requested_to != "project":
         raise RuntimeError("skill on/off currently supports repo-local project scope only; use --to project.")
     if skill_action == "off" and from_scope != "project":
