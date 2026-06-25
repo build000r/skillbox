@@ -65,7 +65,7 @@ The wrapper discovery contract. Agents should start here to learn the stable com
 
 ### Example payload
 
-<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>`.</sub>
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
 
 ```json
 {
@@ -189,9 +189,9 @@ The wrapper discovery contract. Agents should start here to learn the stable com
       "safe_first_try": "sbp send-later list --json"
     },
     {
-      "json": false,
+      "json": true,
       "name": "recalibrate",
-      "safe_first_try": "sbp recalibrate"
+      "safe_first_try": "sbp recalibrate --json"
     }
   ],
   "contract_version": "2026-05-11",
@@ -402,7 +402,7 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
 
 ### Example payload
 
-<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>`.</sub>
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
 
 ```json
 {
@@ -412,7 +412,7 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
   ],
   "beads": {
     "beads_dir": "<FLEET>/repos_real/overlay-repo/.beads",
-    "br": "/home/skillbox/.local/bin/br",
+    "br": "<BR_BIN>",
     "initialized": false,
     "issues": [],
     "next_actions": [],
@@ -641,7 +641,7 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
 
 ### Example payload
 
-<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>`.</sub>
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
 
 ```json
 {
@@ -651,7 +651,7 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
   ],
   "beads": {
     "beads_dir": "<FLEET>/repos_real/healthy/.beads",
-    "br": "/home/skillbox/.local/bin/br",
+    "br": "<BR_BIN>",
     "initialized": false,
     "issues": [
       {
@@ -1075,7 +1075,7 @@ Claude (`.mcp.json`) vs Codex (`.codex/config.toml`) MCP-server reconciliation. 
 
 ### Example payload
 
-<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>`.</sub>
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
 
 ```json
 {
@@ -1161,10 +1161,10 @@ Claude (`.mcp.json`) vs Codex (`.codex/config.toml`) MCP-server reconciliation. 
 
 ## `sbp recalibrate`
 
-**Invocation:** `sbp recalibrate [--cwd <repo>]` (composite; machine core shown below)
-**Produced by:** `collect_skill_visibility (issues-only view) + embedded beads block`
+**Invocation:** `sbp recalibrate [--cwd <repo>] --json`
+**Produced by:** `assemble_recalibrate_payload (issues-only view + fixes[] dry-run previews)`
 
-A COMPOSITE human surface that stitches together several dry-run sub-calls (`sbp skills --issues-only`, `sbp skill sync --dry-run`, `sbp skill prune --dry-run`, the beads graph, and `sbp mcp`). Its single machine-readable core is the issues-focused `collect_skill_visibility` payload below — same shape as `sbp skills --issues-only --format json`, whose `beads` block the wrapper parses directly.
+Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-focused `collect_skill_visibility` core (same fields as `sbp skills --issues-only --format json`) plus a `fixes[]` row per actionable issue. Each fix carries the literal `fix_command`, link dry-run rows, a trimmed `dry_run_preview`, and `packet_on_apply` when linking would return an activation packet. Bare `sbp recalibrate` (no `--json`) still prints the composite human surface (sync/prune dry-runs, beads graph, MCP audit).
 
 ### Fields
 
@@ -1176,6 +1176,7 @@ A COMPOSITE human surface that stitches together several dry-run sub-calls (`sbp
 | `issues` | CONTRACT | The drift to heal, grouped by kind (the issues-only view's payload). |
 | `beads` | CONTRACT | required / required_skills / repo_root / initialized / br / issues. |
 | `summary` | CONTRACT | Counters incl. beads_required_skills + beads_issues. |
+| `fixes` | CONTRACT | Machine-actionable remediation rows; one per actionable issue. |
 | `recommendations` | info | Ranked remediation suggestions. |
 | `next_actions` | info | Ordered next commands (dry-run heal moves). |
 
@@ -1193,15 +1194,26 @@ A COMPOSITE human surface that stitches together several dry-run sub-calls (`sbp
 | `issues` | CONTRACT | Per-issue {message, hint} for unmet beads requirements. |
 | `next_actions` | info | Beads-specific next commands. |
 
+#### `fixes[]` (one machine-actionable remediation row)
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `problem` | CONTRACT | Issue kind (e.g. missing_for_cwd, scope_violations). |
+| `skill` | CONTRACT | Skill name this fix targets. |
+| `command` | CONTRACT | Exact copy-pasteable command that resolves the issue. |
+| `links` | CONTRACT | Link actions the dry-run would apply (lifecycle link rows). |
+| `dry_run_preview` | CONTRACT | Trimmed skill lifecycle dry-run payload for the fix. |
+| `packet_on_apply` | info | activation_packet from the dry-run when the fix links a skill; null otherwise. |
+
 ### Example payload
 
-<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>`.</sub>
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
 
 ```json
 {
   "beads": {
     "beads_dir": "<FLEET>/repos_real/overlay-repo/.beads",
-    "br": "/home/skillbox/.local/bin/br",
+    "br": "<BR_BIN>",
     "initialized": false,
     "issues": [],
     "next_actions": [],
@@ -1211,6 +1223,117 @@ A COMPOSITE human surface that stitches together several dry-run sub-calls (`sbp
     "required_skills": []
   },
   "cwd": "<FLEET>/repos_real/overlay-repo",
+  "fixes": [
+    {
+      "command": "sbp skill on tiny-ui --cwd $PWD",
+      "dry_run_preview": {
+        "action": "activate",
+        "actions": [
+          {
+            "blocked_reason": "",
+            "category": null,
+            "destination": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui",
+            "existing": {
+              "state": "missing"
+            },
+            "op": "link",
+            "repo_path": "<FLEET>/repos_real/overlay-repo",
+            "root": "<FLEET>/repos_real/overlay-repo/.claude/skills",
+            "scope": "project",
+            "skill": "tiny-ui",
+            "source": "<FLEET>/skills/tiny-ui",
+            "source_bucket": "external",
+            "status": "would_link",
+            "surface": "claude"
+          },
+          {
+            "blocked_reason": "",
+            "category": null,
+            "destination": "<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui",
+            "existing": {
+              "state": "missing"
+            },
+            "op": "link",
+            "repo_path": "<FLEET>/repos_real/overlay-repo",
+            "root": "<FLEET>/repos_real/overlay-repo/.codex/skills",
+            "scope": "project",
+            "skill": "tiny-ui",
+            "source": "<FLEET>/skills/tiny-ui",
+            "source_bucket": "external",
+            "status": "would_link",
+            "surface": "codex"
+          }
+        ],
+        "activation_packet": {
+          "instructions": "Use this SKILL.md content immediately in the current agent session. The filesystem links make the skill visible to future Claude and Codex sessions.",
+          "name": "tiny-ui",
+          "skill_md": "---\nname: tiny-ui\ndescription: Tiny fixture skill tiny-ui.\n---\n\n# tiny-ui\n\nFixture skill body for tiny-ui.\n",
+          "skill_md_path": "<FLEET>/skills/tiny-ui/SKILL.md",
+          "skill_md_sha256": "953824e6b88a4753851d0309b740812747d507dd780b037e47fdcea540a41e04",
+          "source": "<FLEET>/skills/tiny-ui",
+          "source_bucket": "external",
+          "surface_targets": {
+            "claude": [
+              "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui"
+            ],
+            "codex": [
+              "<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui"
+            ]
+          }
+        },
+        "cwd": "<FLEET>/repos_real/overlay-repo",
+        "dry_run": true,
+        "skill": "tiny-ui",
+        "summary": {
+          "actions": 2,
+          "applied": 0,
+          "blocked": 0,
+          "link": 2,
+          "skipped": 0,
+          "unchanged": 0,
+          "unlink": 0
+        },
+        "warnings": []
+      },
+      "links": [
+        {
+          "destination": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui",
+          "scope": "project",
+          "skill": "tiny-ui",
+          "source": "<FLEET>/skills/tiny-ui",
+          "status": "would_link",
+          "surface": "claude"
+        },
+        {
+          "destination": "<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui",
+          "scope": "project",
+          "skill": "tiny-ui",
+          "source": "<FLEET>/skills/tiny-ui",
+          "status": "would_link",
+          "surface": "codex"
+        }
+      ],
+      "packet_on_apply": {
+        "instructions": "Use this SKILL.md content immediately in the current agent session. The filesystem links make the skill visible to future Claude and Codex sessions.",
+        "name": "tiny-ui",
+        "skill_md": "---\nname: tiny-ui\ndescription: Tiny fixture skill tiny-ui.\n---\n\n# tiny-ui\n\nFixture skill body for tiny-ui.\n",
+        "skill_md_path": "<FLEET>/skills/tiny-ui/SKILL.md",
+        "skill_md_sha256": "953824e6b88a4753851d0309b740812747d507dd780b037e47fdcea540a41e04",
+        "source": "<FLEET>/skills/tiny-ui",
+        "source_bucket": "external",
+        "surface_targets": {
+          "claude": [
+            "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui"
+          ],
+          "codex": [
+            "<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui"
+          ]
+        }
+      },
+      "problem": "missing_for_cwd",
+      "skill": "tiny-ui"
+    }
+  ],
   "issues": {
     "archive_sources": [],
     "broken_global": [],
@@ -1370,7 +1493,7 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
 
 ### Example payload
 
-<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>`.</sub>
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
 
 ```json
 {
@@ -1512,7 +1635,7 @@ The structural verification front door. Runs every gate read-only and returns `{
 
 ### Example payload
 
-<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>`.</sub>
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
 
 ```json
 {
@@ -1606,7 +1729,7 @@ ONE diffable, PLAN-ONLY heal plan across the deduped canonical fleet (the same c
 
 ### Example payload
 
-<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>`.</sub>
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
 
 ```json
 {
@@ -1685,7 +1808,7 @@ ONE diffable, PLAN-ONLY heal plan across the deduped canonical fleet (the same c
           {
             "class": "relink",
             "command": "ln -sfn <FLEET>/skills/tiny-ui <FLEET>/repos_real/other-machine/.claude/skills/tiny-ui",
-            "link_target": "<FLEET>/fake-mac-root/skills/tiny-ui",
+            "link_target": "<REMOTE_ROOT>/skills/tiny-ui",
             "origin": "moved",
             "path": "<FLEET>/repos_real/other-machine/.claude/skills/tiny-ui",
             "skill": "tiny-ui",

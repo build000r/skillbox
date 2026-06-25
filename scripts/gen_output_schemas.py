@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -58,10 +59,11 @@ for _path in (ENV_MANAGER_DIR, TESTS_DIR):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from fixture_fleet import build_fixture_fleet  # noqa: E402
 from runtime_manager import fleet_converge as fc  # noqa: E402
+from runtime_manager import lifecycle as lc  # noqa: E402
 from runtime_manager.machines import MachineProfile, MachinesConfig  # noqa: E402
 from runtime_manager import mcp_visibility as mv  # noqa: E402
+from runtime_manager.shared import build_runtime_model  # noqa: E402
 from runtime_manager import skill_visibility as sv  # noqa: E402
 from runtime_manager import structure_doctor as sd  # noqa: E402
 
@@ -72,6 +74,8 @@ REGEN_ENV = "REGEN_OUTPUT_SCHEMA_DOCS"
 # Stable placeholders for the volatile tokens in live payloads.
 FLEET_PLACEHOLDER = "<FLEET>"
 RUNTIME_ROOT_PLACEHOLDER = "<RUNTIME_ROOT>"
+BR_BIN_PLACEHOLDER = "<BR_BIN>"
+REMOTE_ROOT_PLACEHOLDER = "<REMOTE_ROOT>"
 
 
 # --------------------------------------------------------------------------- #
@@ -168,17 +172,25 @@ FIELD_NOTES: dict[str, dict[str, tuple[str, str]]] = {
         "error": (CONTRACT, "Parse error string, or null when valid."),
     },
     "recalibrate": {
-        # `sbp recalibrate` is a COMPOSITE human surface; its machine-readable
-        # core is the `sbp skills --issues-only --format json` view (same
-        # collect_skill_visibility payload) plus the embedded `beads` block.
+        # `sbp recalibrate --json` emits the issues-only visibility core plus
+        # machine-actionable ``fixes[]`` rows (one per actionable issue).
         "cwd": (CONTRACT, "Absolute resolved cwd being recalibrated."),
         "matched_scope_rules": (CONTRACT, "Rules in force for this cwd."),
         "matched_project_categories": (CONTRACT, "Project categories for this cwd."),
         "issues": (CONTRACT, "The drift to heal, grouped by kind (the issues-only view's payload)."),
         "beads": (CONTRACT, "required / required_skills / repo_root / initialized / br / issues."),
         "summary": (CONTRACT, "Counters incl. beads_required_skills + beads_issues."),
+        "fixes": (CONTRACT, "Machine-actionable remediation rows; one per actionable issue."),
         "recommendations": (INFO, "Ranked remediation suggestions."),
         "next_actions": (INFO, "Ordered next commands (dry-run heal moves)."),
+    },
+    "recalibrate.fix": {
+        "problem": (CONTRACT, "Issue kind (e.g. missing_for_cwd, scope_violations)."),
+        "skill": (CONTRACT, "Skill name this fix targets."),
+        "command": (CONTRACT, "Exact copy-pasteable command that resolves the issue."),
+        "links": (CONTRACT, "Link actions the dry-run would apply (lifecycle link rows)."),
+        "dry_run_preview": (CONTRACT, "Trimmed skill lifecycle dry-run payload for the fix."),
+        "packet_on_apply": (INFO, "activation_packet from the dry-run when the fix links a skill; null otherwise."),
     },
     "recalibrate.beads": {
         "required": (CONTRACT, "True when an effective skill declares requires_beads."),
@@ -293,6 +305,8 @@ def _norm(obj: Any, replacements: list[tuple[str, str]]) -> Any:
 
 def _fleet_example(fn: Callable[["FixtureFleetT", str], dict[str, Any]]) -> dict[str, Any]:
     """Build a fixture-fleet, run ``fn``, and normalize the temp root to <FLEET>."""
+    from fixture_fleet import build_fixture_fleet
+
     tmp = tempfile.mkdtemp()
     try:
         fleet = build_fixture_fleet(tmp)
@@ -338,11 +352,17 @@ def _fleet_example(fn: Callable[["FixtureFleetT", str], dict[str, Any]]) -> dict
             create=True,
         ):
             payload = fn(fleet, tmp)
-        return _norm(payload, [(tmp, FLEET_PLACEHOLDER)])
+        replacements = [
+            (str(Path(tmp) / "fake-mac-root"), REMOTE_ROOT_PLACEHOLDER),
+            ("/fake-mac-root", REMOTE_ROOT_PLACEHOLDER),
+            (tmp, FLEET_PLACEHOLDER),
+        ]
+        br_bin = shutil.which("br")
+        if br_bin:
+            replacements.append((br_bin, BR_BIN_PLACEHOLDER))
+        return _norm(payload, replacements)
     finally:
         # Best-effort cleanup; the temp tree carries no operator state.
-        import shutil
-
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -404,31 +424,199 @@ def example_mcp() -> dict[str, Any]:
     return _norm(payload, [(str(ROOT_DIR), RUNTIME_ROOT_PLACEHOLDER)])
 
 
-def example_recalibrate() -> dict[str, Any]:
-    """`sbp recalibrate` machine core: the `--issues-only` skill-visibility view at the overlay repo.
+_ACTIONABLE_RECALIBRATE_ISSUE_TYPES = (
+    "missing_for_cwd",
+    "scope_violations",
+    "global_not_allowed",
+    "extra_global",
+    "broken_global",
+    "broken_project",
+)
 
-    The wrapper composes several dry-run sub-calls; its single JSON payload is the
-    issues-focused ``collect_skill_visibility`` result (the same one the wrapper's
-    ``--issues-only --format json`` step parses for the beads block).
-    """
+_DRY_RUN_PREVIEW_KEYS = (
+    "action",
+    "skill",
+    "cwd",
+    "dry_run",
+    "summary",
+    "actions",
+    "activation_packet",
+    "warnings",
+    "noop",
+    "changed",
+)
+
+
+def _extract_fix_links(preview: dict[str, Any] | None) -> list[dict[str, Any]]:
+    links: list[dict[str, Any]] = []
+    for action in (preview or {}).get("actions") or []:
+        if action.get("op") != "link":
+            continue
+        links.append({
+            "skill": action.get("skill"),
+            "source": action.get("source"),
+            "destination": action.get("destination"),
+            "surface": action.get("surface"),
+            "scope": action.get("scope"),
+            "status": action.get("status"),
+        })
+    return links
+
+
+def _trim_dry_run_preview(preview: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not preview:
+        return None
+    return {key: preview[key] for key in _DRY_RUN_PREVIEW_KEYS if key in preview}
+
+
+def _preview_recalibrate_fix(
+    model: dict[str, Any],
+    issue_type: str,
+    row: dict[str, Any],
+    *,
+    cwd: str,
+) -> dict[str, Any] | None:
+    skill_name = str(row.get("name") or "")
+    if not skill_name:
+        return None
+    cwd_text = str(cwd)
+    if issue_type == "missing_for_cwd":
+        plan = lc.skill_lifecycle_plan(
+            model,
+            "activate",
+            skill_name=skill_name,
+            cwd=cwd_text,
+            to="project",
+            force=True,
+        )
+    elif issue_type == "scope_violations":
+        plan = lc.skill_lifecycle_plan(
+            model,
+            "prune",
+            skill_name=skill_name,
+            cwd=cwd_text,
+            from_scope="project",
+        )
+    elif issue_type in {"global_not_allowed", "extra_global"}:
+        plan = lc.skill_lifecycle_plan(
+            model,
+            "prune",
+            skill_name=skill_name,
+            cwd=cwd_text,
+            from_scope="global",
+        )
+    elif issue_type in {"broken_global", "broken_project"}:
+        from_scope = "global" if issue_type == "broken_global" else "project"
+        plan = lc.skill_lifecycle_plan(
+            model,
+            "prune",
+            skill_name=skill_name,
+            cwd=cwd_text,
+            from_scope=from_scope,
+        )
+    else:
+        return None
+    return lc.apply_skill_lifecycle_plan(plan, dry_run=True)
+
+
+def build_recalibrate_fixes(
+    model: dict[str, Any],
+    issues: dict[str, list[dict[str, Any]]],
+    *,
+    cwd: str,
+) -> list[dict[str, Any]]:
+    fixes: list[dict[str, Any]] = []
+    for issue_type in _ACTIONABLE_RECALIBRATE_ISSUE_TYPES:
+        for row in (issues or {}).get(issue_type) or []:
+            if not isinstance(row, dict):
+                continue
+            skill_name = str(row.get("name") or "")
+            command = str(row.get("fix_command") or "").strip()
+            if not skill_name or not command:
+                continue
+            preview = _preview_recalibrate_fix(model, issue_type, row, cwd=cwd)
+            trimmed = _trim_dry_run_preview(preview)
+            fixes.append({
+                "problem": issue_type,
+                "skill": skill_name,
+                "command": command,
+                "links": _extract_fix_links(trimmed),
+                "dry_run_preview": trimmed,
+                "packet_on_apply": (trimmed or {}).get("activation_packet"),
+            })
+    fixes.sort(key=lambda item: (item["problem"], item["skill"]))
+    return fixes
+
+
+def assemble_recalibrate_payload(
+    visibility_payload: dict[str, Any],
+    *,
+    model: dict[str, Any],
+) -> dict[str, Any]:
+    issues = sv._compact_skill_visibility_issues(visibility_payload)
+    cwd = str(visibility_payload.get("cwd") or "")
+    return {
+        "cwd": cwd,
+        "matched_scope_rules": visibility_payload.get("matched_scope_rules") or [],
+        "matched_project_categories": visibility_payload.get("matched_project_categories") or [],
+        "issues": issues,
+        "beads": visibility_payload.get("beads") or {},
+        "summary": visibility_payload.get("summary") or {},
+        "fixes": build_recalibrate_fixes(model, issues, cwd=cwd),
+        "recommendations": visibility_payload.get("recommendations") or [],
+        "next_actions": visibility_payload.get("next_actions") or [],
+    }
+
+
+def emit_recalibrate_json(
+    *,
+    cwd: str,
+    profile: str = "local-all",
+    client: str | None = None,
+    extra_argv: list[str] | None = None,
+    runtime_root: Path | None = None,
+) -> dict[str, Any]:
+    """Live ``sbp recalibrate --json`` payload against the operator runtime."""
+    root = runtime_root or ROOT_DIR
+    manage = root / ".env-manager" / "manage.py"
+    argv = ["python3", str(manage), "skills"]
+    if client:
+        argv.extend(["--client", client])
+    argv.extend([
+        "--profile", profile,
+        "--cwd", cwd,
+        "--issues-only",
+        "--no-global",
+        "--format", "json",
+    ])
+    argv.extend(extra_argv or [])
+    result = subprocess.run(
+        argv,
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"skills --issues-only --format json failed (exit {result.returncode}): "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    visibility_payload = json.loads(result.stdout)
+    model = build_runtime_model(root)
+    return assemble_recalibrate_payload(visibility_payload, model=model)
+
+
+def example_recalibrate() -> dict[str, Any]:
+    """`sbp recalibrate --json` at the overlay repo (missing_for_cwd fix row)."""
 
     def run(fleet: FixtureFleetT, _tmp: str) -> dict[str, Any]:
         payload = sv.collect_skill_visibility(
             fleet.model(), cwd=str(fleet.repo("overlay-repo")),
             include_global=False, include_project=True, include_sources=False,
         )
-        # Mirror the wrapper's issues-only machine view: the same payload, trimmed
-        # to the recalibration-relevant fields the wrapper's pipeline reads.
-        return {
-            "cwd": payload["cwd"],
-            "matched_scope_rules": payload["matched_scope_rules"],
-            "matched_project_categories": payload["matched_project_categories"],
-            "issues": sv._compact_skill_visibility_issues(payload),
-            "beads": payload["beads"],
-            "summary": payload["summary"],
-            "recommendations": payload["recommendations"],
-            "next_actions": payload["next_actions"],
-        }
+        return assemble_recalibrate_payload(payload, model=fleet.model())
 
     return _fleet_example(run)
 
@@ -566,17 +754,22 @@ SURFACES: list[dict[str, Any]] = [
     {
         "key": "recalibrate",
         "command": "sbp recalibrate",
-        "long": "`sbp recalibrate [--cwd <repo>]` (composite; machine core shown below)",
-        "fn": "collect_skill_visibility (issues-only view) + embedded beads block",
+        "long": "`sbp recalibrate [--cwd <repo>] --json`",
+        "fn": "assemble_recalibrate_payload (issues-only view + fixes[] dry-run previews)",
         "intro": (
-            "A COMPOSITE human surface that stitches together several dry-run sub-calls "
-            "(`sbp skills --issues-only`, `sbp skill sync --dry-run`, `sbp skill prune --dry-run`, "
-            "the beads graph, and `sbp mcp`). Its single machine-readable core is the issues-focused "
-            "`collect_skill_visibility` payload below — same shape as `sbp skills --issues-only "
-            "--format json`, whose `beads` block the wrapper parses directly."
+            "Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the "
+            "issues-focused `collect_skill_visibility` core (same fields as "
+            "`sbp skills --issues-only --format json`) plus a `fixes[]` row per actionable "
+            "issue. Each fix carries the literal `fix_command`, link dry-run rows, a trimmed "
+            "`dry_run_preview`, and `packet_on_apply` when linking would return an activation "
+            "packet. Bare `sbp recalibrate` (no `--json`) still prints the composite human "
+            "surface (sync/prune dry-runs, beads graph, MCP audit)."
         ),
         "example": example_recalibrate,
-        "nested": [("recalibrate.beads", "`beads` (beads requirement/readiness)", None)],
+        "nested": [
+            ("recalibrate.beads", "`beads` (beads requirement/readiness)", None),
+            ("recalibrate.fix", "`fixes[]` (one machine-actionable remediation row)", None),
+        ],
     },
     {
         "key": "explain",
@@ -647,6 +840,9 @@ def _first_nested(example: dict[str, Any], notes_key: str) -> dict[str, Any] | N
         return gates[0] if gates else None
     if leaf == "beads":
         return example.get("beads") or None
+    if leaf == "fix":
+        fixes = example.get("fixes") or []
+        return fixes[0] if fixes else None
     if leaf == "repo":
         repos = example.get("repos") or []
         return repos[0] if repos else None
@@ -745,7 +941,8 @@ def render_doc() -> str:
         lines.append("")
         lines.append(
             "<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to "
-            f"`{FLEET_PLACEHOLDER}` / `{RUNTIME_ROOT_PLACEHOLDER}`.</sub>")
+            f"`{FLEET_PLACEHOLDER}` / `{RUNTIME_ROOT_PLACEHOLDER}` / "
+            f"`{BR_BIN_PLACEHOLDER}` / `{REMOTE_ROOT_PLACEHOLDER}`.</sub>")
         lines.append("")
         lines.append("```json")
         lines.append(json.dumps(example, indent=2, sort_keys=True))
@@ -772,7 +969,32 @@ def _anchor(text: str) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--write", action="store_true", help="Write the doc to disk instead of printing it.")
+    parser.add_argument(
+        "--recalibrate-json",
+        action="store_true",
+        help="Emit live sbp recalibrate --json payload to stdout (used by scripts/sbp).",
+    )
+    parser.add_argument("--cwd", default=None, help="Cwd for --recalibrate-json.")
+    parser.add_argument("--profile", default="local-all", help="Profile for --recalibrate-json.")
+    parser.add_argument("--client", default=None, help="Optional client overlay for --recalibrate-json.")
+    parser.add_argument(
+        "extra",
+        nargs="*",
+        help="Extra argv tokens forwarded to skills --issues-only (after --recalibrate-json flags).",
+    )
     args = parser.parse_args(argv)
+    if args.recalibrate_json:
+        if not args.cwd:
+            print("gen_output_schemas: --recalibrate-json requires --cwd", file=sys.stderr)
+            return 2
+        payload = emit_recalibrate_json(
+            cwd=args.cwd,
+            profile=args.profile,
+            client=args.client,
+            extra_argv=list(args.extra),
+        )
+        sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        return 0
     doc = render_doc()
     if args.write:
         DOC_PATH.parent.mkdir(parents=True, exist_ok=True)

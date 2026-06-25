@@ -404,7 +404,7 @@ payload = {
         {"name": "evidence", "json": True, "safe_first_try": f"{wrapper} evidence --repo <path> --format json"},
         {"name": "cron", "json": True, "safe_first_try": f"{wrapper} cron status --json"},
         {"name": "send-later", "json": True, "safe_first_try": f"{wrapper} send-later list --json"},
-        {"name": "recalibrate", "json": False, "safe_first_try": f"{wrapper} recalibrate"},
+        {"name": "recalibrate", "json": True, "safe_first_try": f"{wrapper} recalibrate --json"},
     ],
     "agent_surfaces": {
         "capabilities": f"{wrapper} capabilities --json",
@@ -1054,6 +1054,7 @@ PY
     recalibrate_fleet="false"
     recalibrate_auto_fix="false"
     recalibrate_apply="false"
+    recalibrate_wants_json="false"
     recalibrate_cwd="${invoke_cwd}"
     recalibrate_args=()
     index=0
@@ -1068,6 +1069,18 @@ PY
           ;;
         --yes)
           recalibrate_apply="true"
+          ;;
+        --format)
+          index=$((index + 1))
+          if [[ ${index} -ge ${#passthrough_args[@]} ]]; then
+            echo "sbp recalibrate: --format requires a value" >&2
+            exit 2
+          fi
+          if [[ "${passthrough_args[$index]}" == "json" ]]; then
+            recalibrate_wants_json="true"
+          else
+            recalibrate_args+=("--format" "${passthrough_args[$index]}")
+          fi
           ;;
         --cwd)
           index=$((index + 1))
@@ -1086,6 +1099,30 @@ PY
       esac
       index=$((index + 1))
     done
+    if [[ "${recalibrate_wants_json}" == "true" ]]; then
+      if [[ "${recalibrate_auto_fix}" == "true" ]]; then
+        echo "sbp recalibrate: --auto-fix and --json are mutually exclusive (use fixes[].command)" >&2
+        exit 2
+      fi
+      if [[ "${recalibrate_fleet}" == "true" ]]; then
+        python3 .env-manager/manage.py skill-audit "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --format json "${recalibrate_args[@]}"
+        exit $?
+      fi
+      recalibrate_json_argv=(
+        python3 scripts/gen_output_schemas.py
+        --recalibrate-json
+        --cwd "${recalibrate_cwd}"
+        --profile "${profile}"
+      )
+      if [[ -n "${client}" ]]; then
+        recalibrate_json_argv+=(--client "${client}")
+      fi
+      if [[ ${#recalibrate_args[@]} -gt 0 ]]; then
+        recalibrate_json_argv+=("${recalibrate_args[@]}")
+      fi
+      "${recalibrate_json_argv[@]}"
+      exit $?
+    fi
     if [[ "${recalibrate_fleet}" == "true" ]]; then
       if [[ "${recalibrate_auto_fix}" == "true" ]]; then
         echo "sbp recalibrate: --auto-fix is cwd-only; omit --fleet or use fleet converge dry-runs" >&2
