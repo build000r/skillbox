@@ -38,6 +38,10 @@ __all__ = [
     'CLIENT_LAYER_RANK',
     'GLOBAL_LAYER_RANK',
     'PROJECT_LAYER_RANK',
+    'OPERATOR_STATE_LAYER_RANK',
+    'REPO_OVERRIDE_LAYER_RANK',
+    'ENV_LAYER_RANK',
+    'CLI_LAYER_RANK',
     '_as_list',
     '_expand_policy_path',
     '_path_under_or_equal',
@@ -59,6 +63,10 @@ DEFAULT_LAYER_RANK = 10
 CLIENT_LAYER_RANK = 20
 GLOBAL_LAYER_RANK = 30
 PROJECT_LAYER_RANK = 40
+OPERATOR_STATE_LAYER_RANK = 50
+REPO_OVERRIDE_LAYER_RANK = 60
+ENV_LAYER_RANK = 70
+CLI_LAYER_RANK = 80
 
 
 def _as_list(value: Any) -> list[Any]:

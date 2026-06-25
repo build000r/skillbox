@@ -1379,7 +1379,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "Manage skill-scope overlays. `activate` is policy-evaluated and ephemeral: "
             "it runs the SAME policy evaluation as `skill sync` with the named overlay "
             "treated as active for THIS invocation only (equivalent to "
-            "`SKILLBOX_OVERLAYS=<name> skill sync` scoped to --cwd), persists NO overlay "
+            "`SKILLBOX_CLI_OVERLAYS=<name> skill sync` scoped to --cwd), persists NO overlay "
             "state, and links only the policy-correct set for --cwd (often zero in a "
             "non-matching dir) — never every literal overlay-tagged skill. `--dry-run` "
             "previews exactly the plan `activate` would apply."

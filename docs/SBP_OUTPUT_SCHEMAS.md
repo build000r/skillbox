@@ -44,7 +44,8 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
 | `matched_scope_rules` | CONTRACT | skill-scope.yaml rules in force for this cwd (id + provenance). |
 | `summary` | CONTRACT | Roll-up counters; keys are stable, add-only. Branch on these first. |
 | `parity` | CONTRACT | Claude<->Codex GLOBAL skill-surface parity (empty when --no-global). |
-| `effective` | CONTRACT | The skills actually visible at this cwd after layer resolution. |
+| `visibility_decisions` | CONTRACT | One winning resolution row per skill name, including disabled/broken winners; use effective for visible skills. |
+| `effective` | CONTRACT | Visible skills at this cwd after layer resolution; excludes disabled/broken winners. |
 | `issues` | CONTRACT | Policy problems grouped by kind (broken_project, missing_for_cwd, scope_violations, ...). |
 | `beads` | CONTRACT | Beads requirement/readiness derived from effective skills' frontmatter. |
 | `recommendations` | info | Ranked human-facing remediation suggestions. |
@@ -84,7 +85,8 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
       "shadowed_count": 0,
       "source": "<FLEET>/private-skills/tiny-marketing",
       "source_bucket": "external",
-      "state": "ok"
+      "state": "ok",
+      "winning_layer": "project:claude:<FLEET>/repos_real/overlay-repo"
     }
   ],
   "issues": {
@@ -228,7 +230,20 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
     "undefined_source_skills": 0,
     "undefined_sources": 0
   },
-  "undefined_sources": []
+  "undefined_sources": [],
+  "visibility_decisions": [
+    {
+      "availability": "installed",
+      "layer": "project:claude:<FLEET>/repos_real/overlay-repo",
+      "name": "tiny-marketing",
+      "path": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-marketing",
+      "shadowed_count": 0,
+      "source": "<FLEET>/private-skills/tiny-marketing",
+      "source_bucket": "external",
+      "state": "ok",
+      "winning_layer": "project:claude:<FLEET>/repos_real/overlay-repo"
+    }
+  ]
 }
 ```
 
@@ -255,7 +270,8 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
 | `parity` | CONTRACT | Claude<->Codex GLOBAL skill-surface parity (empty when --no-global). |
 | `layers` | info | Every resolution layer considered, ranked (full payload only). |
 | `source_roots` | CONTRACT | Every skill source root discovered under the configured roots — the linkable universe. |
-| `effective` | CONTRACT | The skills actually visible at this cwd after layer resolution. |
+| `visibility_decisions` | CONTRACT | One winning resolution row per skill name, including disabled/broken winners; use effective for visible skills. |
+| `effective` | CONTRACT | Visible skills at this cwd after layer resolution; excludes disabled/broken winners. |
 | `occurrences` | CONTRACT | Every raw skill occurrence across all layers (full payload only). |
 | `undefined_sources` | CONTRACT | Linkable source skills with no policy occurrence — the candidate pool. |
 | `beads` | CONTRACT | Beads requirement/readiness derived from effective skills' frontmatter. |
@@ -280,15 +296,45 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
     "beads_dir": "<FLEET>/repos_real/healthy/.beads",
     "br": "/home/skillbox/.local/bin/br",
     "initialized": false,
-    "issues": [],
-    "next_actions": [],
-    "ok": true,
+    "issues": [
+      {
+        "code": "no_beads_dir",
+        "hint": "sbp beads init --cwd <FLEET>/repos_real/healthy",
+        "message": "BEADS DRIFT: 1 active skill(s) require .beads/ in this repo"
+      }
+    ],
+    "next_actions": [
+      "sbp beads init --cwd <FLEET>/repos_real/healthy"
+    ],
+    "ok": false,
     "repo_root": "<FLEET>/repos_real/healthy",
-    "required": false,
-    "required_skills": []
+    "required": true,
+    "required_skills": [
+      {
+        "layer": "repo-override-file",
+        "name": "needs-beads",
+        "source": "<FLEET>/private-skills/needs-beads"
+      }
+    ]
   },
   "cwd": "<FLEET>/repos_real/healthy",
   "effective": [
+    {
+      "availability": "override",
+      "layer": "repo-override-file",
+      "layer_label": "repo override file",
+      "layer_rank": 60,
+      "name": "needs-beads",
+      "override_action": "pin_on",
+      "path": "<FLEET>/repos_real/healthy",
+      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "scope": "repo",
+      "shadowed_count": 0,
+      "source": "<FLEET>/private-skills/needs-beads",
+      "source_bucket": "external",
+      "state": "pinned",
+      "winning_layer": "repo-override-file"
+    },
     {
       "availability": "installed",
       "has_skill_md": true,
@@ -303,7 +349,8 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "source": "<FLEET>/skills/tiny-cli",
       "source_bucket": "external",
       "source_kind": "directory",
-      "state": "ok"
+      "state": "ok",
+      "winning_layer": "project:claude:<FLEET>/repos_real/healthy"
     }
   ],
   "global_surfaces": [],
@@ -339,6 +386,17 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "present": true,
       "rank": 40,
       "skill_count": 0
+    },
+    {
+      "id": "repo-override-file",
+      "kind": "override",
+      "label": "repo override file",
+      "path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "present": true,
+      "rank": 60,
+      "scope": "repo",
+      "skill_count": 3,
+      "vetoed_floor": []
     }
   ],
   "matched_clients": [],
@@ -377,7 +435,8 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
     }
   ],
   "next_actions": [
-    "doctor --format json"
+    "doctor --format json",
+    "sbp beads init --cwd <FLEET>/repos_real/healthy"
   ],
   "occurrences": [
     {
@@ -394,10 +453,72 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "source_bucket": "external",
       "source_kind": "directory",
       "state": "ok"
+    },
+    {
+      "availability": "override",
+      "layer": "repo-override-file",
+      "layer_label": "repo override file",
+      "layer_rank": 60,
+      "name": "needs-beads",
+      "override_action": "pin_on",
+      "path": "<FLEET>/repos_real/healthy",
+      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "scope": "repo",
+      "source": "<FLEET>/private-skills/needs-beads",
+      "source_bucket": "external",
+      "state": "pinned"
+    },
+    {
+      "availability": "override",
+      "layer": "repo-override-file",
+      "layer_label": "repo override file",
+      "layer_rank": 60,
+      "name": "tiny-marketing",
+      "override_action": "pin_off",
+      "path": "<FLEET>/repos_real/healthy",
+      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "scope": "repo",
+      "source": "<FLEET>/private-skills/tiny-marketing",
+      "source_bucket": "external",
+      "state": "disabled"
+    },
+    {
+      "availability": "override",
+      "layer": "repo-override-file:global-opt-out",
+      "layer_label": "repo override global opt-out",
+      "layer_rank": 35,
+      "name": "project-status-mmdx",
+      "override_action": "opt_out_global",
+      "path": "<FLEET>/repos_real/healthy",
+      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "scope": "repo",
+      "source": null,
+      "source_bucket": null,
+      "state": "disabled"
     }
   ],
   "overlay_audit": {
-    "active": [],
+    "active": [
+      "marketing"
+    ],
+    "active_layers": [
+      {
+        "enabled": true,
+        "layer": "repo-override-file",
+        "layer_label": "repo override file",
+        "layer_rank": 60,
+        "name": "marketing",
+        "source": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml"
+      },
+      {
+        "enabled": false,
+        "layer": "repo-override-file",
+        "layer_label": "repo override file",
+        "layer_rank": 60,
+        "name": "swarm",
+        "source": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml"
+      }
+    ],
     "declared": [],
     "undeclared_active": [],
     "warnings": []
@@ -436,7 +557,7 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "present": true,
       "rank": 0,
       "skill_count": 2,
-      "undefined_count": 1
+      "undefined_count": 0
     },
     {
       "id": "source:<FLEET>/skills",
@@ -452,8 +573,8 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
   "summary": {
     "archive_source_skills": 0,
     "archive_sources": 0,
-    "beads_issues": 0,
-    "beads_required_skills": 0,
+    "beads_issues": 1,
+    "beads_required_skills": 1,
     "broken_by_class": {
       "dangling": 0,
       "moved": 0,
@@ -464,31 +585,90 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
     "broken_global_skills": 0,
     "broken_project": 0,
     "broken_project_skills": 0,
-    "effective": 1,
+    "effective": 2,
     "extra_global": 0,
     "extra_global_skills": 0,
     "global_not_allowed": 0,
     "global_not_allowed_skills": 0,
-    "layers": 2,
+    "layers": 3,
     "missing_for_cwd": 0,
     "missing_for_cwd_skills": 0,
-    "occurrences": 1,
+    "occurrences": 4,
     "parity_divergent": 0,
     "recommendations": 0,
     "scope_violation_skills": 0,
     "scope_violations": 0,
     "shadowed": 0,
     "undeclared_active_overlays": 0,
-    "undefined_source_skills": 1,
-    "undefined_sources": 1
+    "undefined_source_skills": 0,
+    "undefined_sources": 0
   },
-  "undefined_sources": [
+  "undefined_sources": [],
+  "visibility_decisions": [
     {
+      "availability": "override",
+      "layer": "repo-override-file",
+      "layer_label": "repo override file",
+      "layer_rank": 60,
       "name": "needs-beads",
-      "root": "<FLEET>/private-skills",
+      "override_action": "pin_on",
+      "path": "<FLEET>/repos_real/healthy",
+      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "scope": "repo",
+      "shadowed_count": 0,
       "source": "<FLEET>/private-skills/needs-beads",
       "source_bucket": "external",
-      "state": "undefined"
+      "state": "pinned",
+      "winning_layer": "repo-override-file"
+    },
+    {
+      "availability": "override",
+      "layer": "repo-override-file:global-opt-out",
+      "layer_label": "repo override global opt-out",
+      "layer_rank": 35,
+      "name": "project-status-mmdx",
+      "override_action": "opt_out_global",
+      "path": "<FLEET>/repos_real/healthy",
+      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "scope": "repo",
+      "shadowed_count": 0,
+      "source": null,
+      "source_bucket": null,
+      "state": "disabled",
+      "winning_layer": "repo-override-file:global-opt-out"
+    },
+    {
+      "availability": "installed",
+      "has_skill_md": true,
+      "layer": "project:claude:<FLEET>/repos_real/healthy",
+      "layer_label": "project claude",
+      "layer_rank": 40,
+      "link_target": "<FLEET>/skills/tiny-cli",
+      "name": "tiny-cli",
+      "path": "<FLEET>/repos_real/healthy/.claude/skills/tiny-cli",
+      "scope": "installed",
+      "shadowed_count": 0,
+      "source": "<FLEET>/skills/tiny-cli",
+      "source_bucket": "external",
+      "source_kind": "directory",
+      "state": "ok",
+      "winning_layer": "project:claude:<FLEET>/repos_real/healthy"
+    },
+    {
+      "availability": "override",
+      "layer": "repo-override-file",
+      "layer_label": "repo override file",
+      "layer_rank": 60,
+      "name": "tiny-marketing",
+      "override_action": "pin_off",
+      "path": "<FLEET>/repos_real/healthy",
+      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "scope": "repo",
+      "shadowed_count": 0,
+      "source": "<FLEET>/private-skills/tiny-marketing",
+      "source_bucket": "external",
+      "state": "disabled",
+      "winning_layer": "repo-override-file"
     }
   ]
 }
@@ -810,11 +990,11 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
 | `cwd` | CONTRACT | Absolute resolved cwd the provenance is for. |
 | `visible` | CONTRACT | True iff the skill resolves to a non-broken effective occurrence here. |
 | `reason` | info | Human sentence explaining the verdict. |
-| `layer` | CONTRACT | Winning layer id, or null when not visible. |
-| `layer_family` | CONTRACT | PROJECT|GLOBAL|CLIENT|DEFAULT of the winner, or null. |
-| `layer_label` | info | Human label for the winning layer, or null. |
-| `layer_rank` | CONTRACT | Numeric rank of the winning layer, or null. |
-| `winner` | CONTRACT | Trimmed view of the effective occurrence (won=true), or null. |
+| `layer` | CONTRACT | Resolution winner layer id, including disabled/broken winners, or null when none. |
+| `layer_family` | CONTRACT | PROJECT|GLOBAL|CLIENT|DEFAULT|OVERRIDE of the resolution winner, or null. |
+| `layer_label` | info | Human label for the resolution winner layer, or null. |
+| `layer_rank` | CONTRACT | Numeric rank of the resolution winner layer, or null. |
+| `winner` | CONTRACT | Trimmed view of the resolution winner (won=true), or null. |
 | `occurrences` | CONTRACT | Every occurrence of this skill across layers, each with a won verdict. |
 | `lost` | CONTRACT | Non-winning occurrences with a lost_reason. |
 | `scope_rules` | CONTRACT | skill-scope.yaml rules naming this skill at this cwd. |
@@ -836,13 +1016,15 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
 ```json
 {
   "active_clients": [],
-  "active_overlays": [],
+  "active_overlays": [
+    "marketing"
+  ],
   "cwd": "<FLEET>/repos_real/healthy",
   "inactive_overlay_rules": [],
-  "layer": null,
-  "layer_family": null,
-  "layer_label": null,
-  "layer_rank": null,
+  "layer": "repo-override-file",
+  "layer_family": "OVERRIDE",
+  "layer_label": "repo override file",
+  "layer_rank": 60,
   "lost": [],
   "machine": {
     "declared_machines": [
@@ -866,33 +1048,28 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
     }
   ],
   "next_actions": [
-    "sbp skill activate needs-beads --cwd <FLEET>/repos_real/healthy",
-    "edit skill-scope.yaml: add a rule with skills:[needs-beads] and a path/category covering <FLEET>/repos_real/healthy"
+    "already visible; no action needed"
   ],
-  "occurrences": [],
-  "reason": "'needs-beads' is NOT visible here, but a source exists and it can be activated",
+  "occurrences": [
+    {
+      "availability": "override",
+      "layer": "repo-override-file",
+      "layer_family": "OVERRIDE",
+      "layer_label": "repo override file",
+      "layer_rank": 60,
+      "path": "<FLEET>/repos_real/healthy",
+      "source": "<FLEET>/private-skills/needs-beads",
+      "source_bucket": "external",
+      "state": "pinned",
+      "won": true
+    }
+  ],
+  "reason": "'needs-beads' IS visible at cwd via the OVERRIDE layer (repo-override-file)",
   "registry": {
     "registry_ids": [],
     "skill_id": null
   },
-  "remediation": [
-    {
-      "command": "sbp skill activate needs-beads --cwd <FLEET>/repos_real/healthy",
-      "kind": "activate",
-      "manage_command": "python3 .env-manager/manage.py skill activate needs-beads --cwd <FLEET>/repos_real/healthy",
-      "rank": 1,
-      "why": "a source for 'needs-beads' exists (<FLEET>/private-skills/needs-beads); activating links it here and returns the SKILL.md packet immediately"
-    },
-    {
-      "command": "edit skill-scope.yaml: add a rule with skills:[needs-beads] and a path/category covering <FLEET>/repos_real/healthy",
-      "kind": "rule_edit",
-      "policy_files": [
-        "<FLEET>/skillbox-config/skill-scope.yaml"
-      ],
-      "rank": 3,
-      "why": "no skill-scope rule currently matches 'needs-beads' for this cwd, so the resolver does not consider it in-scope here"
-    }
-  ],
+  "remediation": [],
   "schema_version": "2026-06-13+skill_explain",
   "scope_rules": [],
   "skill": "needs-beads",
@@ -902,8 +1079,19 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
       "source_bucket": "external"
     }
   ],
-  "visible": false,
-  "winner": null
+  "visible": true,
+  "winner": {
+    "availability": "override",
+    "layer": "repo-override-file",
+    "layer_family": "OVERRIDE",
+    "layer_label": "repo override file",
+    "layer_rank": 60,
+    "path": "<FLEET>/repos_real/healthy",
+    "source": "<FLEET>/private-skills/needs-beads",
+    "source_bucket": "external",
+    "state": "pinned",
+    "won": true
+  }
 }
 ```
 
