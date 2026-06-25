@@ -16,6 +16,15 @@ from runtime_manager import agent_search as SEARCH  # noqa: E402
 from runtime_manager.text_renderers import search_brain_text_lines  # noqa: E402
 
 
+def _assert_elapsed_meta(testcase: unittest.TestCase, payload: dict[str, object]) -> None:
+    meta = payload.get("meta")
+    testcase.assertIsInstance(meta, dict)
+    elapsed = meta.get("elapsed_ms") if isinstance(meta, dict) else None
+    testcase.assertIsInstance(elapsed, (int, float))
+    testcase.assertNotIsInstance(elapsed, bool)
+    testcase.assertGreaterEqual(float(elapsed), 0.0)
+
+
 def _graph() -> dict[str, object]:
     return {
         "nodes": [
@@ -83,6 +92,7 @@ class AgentSearchTests(unittest.TestCase):
             self.assertIn("snippet", hit)
             self.assertIn("next_action", hit)
             self.assertNotIn("brain.", hit["next_action"])
+        _assert_elapsed_meta(self, payload)
         self.assertEqual(json.loads(json.dumps(payload)), payload)
 
     def test_search_covers_beads_and_evidence(self) -> None:
@@ -101,6 +111,7 @@ class AgentSearchTests(unittest.TestCase):
         self.assertEqual(payload["error"]["code"], "INVALID_ARGUMENT")
         self.assertTrue(payload["examples"])
         self.assertTrue(all(example.startswith("python3 .env-manager/manage.py ") for example in payload["examples"]))
+        _assert_elapsed_meta(self, payload)
 
     def test_source_and_kind_filters_are_applied(self) -> None:
         payload = SEARCH.search_payload(

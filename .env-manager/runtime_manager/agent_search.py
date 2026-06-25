@@ -9,6 +9,7 @@ from .agent_decisions import MAX_FUZZY_SUGGESTIONS, fuzzy_suggestions
 from .agent_graph import AgentGraph
 from .agent_graph_algorithms import normalize_graph
 from .agent_cli_hints import manage_py_command
+from .agent_timing import attach_elapsed, timer_start
 from .command_registry import default_registry
 
 SEARCH_SCHEMA_VERSION = "2026-06-11+agent_ops_brain.search"
@@ -349,9 +350,10 @@ def search_payload(
     limit: int = 10,
 ) -> dict[str, Any]:
     """Search command registry, graph nodes, docs, Beads, and evidence."""
+    start = timer_start()
     query_tokens = _tokens(query)
     if not query_tokens:
-        return _error_payload("INVALID_ARGUMENT", "search query must not be empty")
+        return attach_elapsed(_error_payload("INVALID_ARGUMENT", "search query must not be empty"), start)
 
     hits: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
@@ -399,7 +401,7 @@ def search_payload(
     }
     if suggestions:
         payload["suggestions"] = suggestions
-    return payload
+    return attach_elapsed(payload, start)
 
 
 __all__ = [

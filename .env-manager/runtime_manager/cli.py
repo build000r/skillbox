@@ -51,6 +51,7 @@ from .agent_graph import build_agent_graph, build_agent_graph_payload
 from .agent_graph_engine import GRAPH_ALGORITHMS, GRAPH_OUTPUT_FORMATS, graph_command_payload, render_graph_payload
 from .agent_decisions import BRAIN_COMMAND_TARGET_ALIASES, explain_payload, next_action_payload
 from .agent_search import search_payload
+from .agent_timing import attach_elapsed, timer_start
 from .agent_snapshots import (
     SNAPSHOT_SCHEMA_VERSION,
     create_snapshot_payload,
@@ -401,6 +402,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--compact",
         action="store_true",
         help="Emit compact registry entries while preserving the top-level capabilities contract.",
+    )
+    capabilities_parser.add_argument(
+        "--no-adapters",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
 
     robot_docs_parser = subparsers.add_parser(
@@ -3088,6 +3094,7 @@ def _compact_registry_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _capabilities_payload(root_dir: Path, *, compact: bool = False) -> dict[str, Any]:
+    start = timer_start()
     commands = [
         {
             "name": name,
@@ -3099,7 +3106,7 @@ def _capabilities_payload(root_dir: Path, *, compact: bool = False) -> dict[str,
     registry = registry_payload()
     if compact:
         registry = _compact_registry_payload(registry)
-    return {
+    payload = {
         "ok": True,
         "tool": "skillbox-manage",
         "contract_version": "2026-05-09",
@@ -3160,6 +3167,7 @@ def _capabilities_payload(root_dir: Path, *, compact: bool = False) -> dict[str,
             "python3 .env-manager/manage.py robot-docs guide",
         ],
     }
+    return attach_elapsed(payload, start)
 
 
 def _safe_first_try_command(name: str) -> str:

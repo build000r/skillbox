@@ -27,6 +27,7 @@ Main entry points:
 - Agent ops brain: `python3 .env-manager/manage.py capabilities --format json`, then `python3 .env-manager/manage.py next --format json`
 - Agent graph/search: `python3 .env-manager/manage.py graph --format json`, `python3 .env-manager/manage.py explain brain.next --format json`, `python3 .env-manager/manage.py search "<query>" --format json`
 - Agent snapshots: `python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json`; `snap create --write` writes redacted local state under `.skillbox-state/`
+- Agent brain latency proof: `python3 tests/perf/brain_proof.py --cycles 5` (standalone, outside default unittest discovery)
 - Run tests: `python3 -m unittest discover -s tests`
 - Coverage: `make python-cov-xml`
 - Build image: `make build`

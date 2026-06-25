@@ -15,6 +15,15 @@ from runtime_manager import agent_decisions as DECISIONS  # noqa: E402
 from runtime_manager.text_renderers import explain_brain_text_lines  # noqa: E402
 
 
+def _assert_elapsed_meta(testcase: unittest.TestCase, payload: dict[str, object]) -> None:
+    meta = payload.get("meta")
+    testcase.assertIsInstance(meta, dict)
+    elapsed = meta.get("elapsed_ms") if isinstance(meta, dict) else None
+    testcase.assertIsInstance(elapsed, (int, float))
+    testcase.assertNotIsInstance(elapsed, bool)
+    testcase.assertGreaterEqual(float(elapsed), 0.0)
+
+
 def _node(node_id: str, kind: str, label: str | None = None, **attrs: object) -> dict[str, object]:
     return {"id": node_id, "kind": kind, "label": label or node_id, "attrs": attrs}
 
@@ -78,6 +87,7 @@ class AgentDecisionTests(unittest.TestCase):
         self.assertIn("br show ready-1 --json", first["validations"])
         self.assertEqual(first["evidence"][0]["source"], "br_ready")
         self.assertEqual(payload["disagreements"], [])
+        _assert_elapsed_meta(self, payload)
         self.assertEqual(json.loads(json.dumps(payload)), payload)
 
     def test_next_handles_no_ready_and_blocked_work(self) -> None:
@@ -165,6 +175,7 @@ class AgentDecisionTests(unittest.TestCase):
                 self.assertTrue(payload["ok"])
                 self.assertTrue(payload["summary"])
                 self.assertIn("relationships", payload)
+                _assert_elapsed_meta(self, payload)
         bead = DECISIONS.explain_payload(_graph(), "bead:ready-1", adapters=adapters)
         self.assertTrue(any(item["source"] == "br_ready" for item in bead["evidence"]))
 
@@ -173,6 +184,7 @@ class AgentDecisionTests(unittest.TestCase):
 
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "UNKNOWN_NODE")
+        _assert_elapsed_meta(self, payload)
 
     def test_explain_prefixed_command_falls_back_to_registry_without_graph_node(self) -> None:
         payload = DECISIONS.explain_payload({"nodes": [], "edges": []}, "command:brain.next")

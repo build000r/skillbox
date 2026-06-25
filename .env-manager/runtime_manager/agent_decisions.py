@@ -8,6 +8,7 @@ from typing import Any, Iterable, Mapping
 from .agent_graph import AgentGraph
 from .agent_graph_algorithms import blast_radius, normalize_graph, normalized_to_payload
 from .agent_cli_hints import manage_py_command
+from .agent_timing import attach_elapsed, timer_start
 from .command_registry import CommandSpec, default_registry
 
 DECISIONS_SCHEMA_VERSION = "2026-06-11+agent_ops_brain.decisions"
@@ -480,6 +481,7 @@ def next_action_payload(
     limit: int = 5,
 ) -> dict[str, Any]:
     """Rank next actions from graph, evidence, Beads/BV, SBP, and load state."""
+    start = timer_start()
     graph_payload = _graph_payload(graph)
     evidence_payload = _evidence_payload(adapters, evidence)
     ready_ids = {_issue_id(item) for item in _adapter_items(adapters, "br_ready") if _issue_id(item)}
@@ -516,7 +518,7 @@ def next_action_payload(
     recommendations.sort(key=lambda item: (-int(item.get("score") or 0), str(item.get("id") or "")))
     limited = recommendations[: max(0, int(limit))]
     disagreements = _disagreements(adapters, ready_ids, bv_ids)
-    return {
+    return attach_elapsed({
         "ok": True,
         "schema_version": DECISIONS_SCHEMA_VERSION,
         "summary": {
@@ -539,7 +541,7 @@ def next_action_payload(
             "br ready --json",
             manage_py_command("graph", "--format", "json"),
         ],
-    }
+    }, start)
 
 
 def _registry_by_id() -> dict[str, CommandSpec]:
@@ -599,6 +601,11 @@ def explain_payload(
     adapters: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Explain a graph node or registered command."""
+    start = timer_start()
+
+    def _with_elapsed(payload: dict[str, Any]) -> dict[str, Any]:
+        return attach_elapsed(payload, start)
+
     graph_payload = _graph_payload(graph)
     nodes = _node_lookup(graph_payload)
     registry = _registry_by_id()
@@ -607,7 +614,7 @@ def explain_payload(
     if resolution["status"] == "ambiguous":
         candidates = resolution.get("candidates") or []
         candidate_ids = [str(item.get("id") or "") for item in candidates if str(item.get("id") or "")]
-        return _error_payload(
+        return _with_elapsed(_error_payload(
             "AMBIGUOUS_NODE",
             f"ambiguous explain target: {resolution.get('target') or target}",
             target=resolution.get("target") or target,
@@ -617,11 +624,11 @@ def explain_payload(
                 manage_py_command("explain", candidate_id, "--format", "json")
                 for candidate_id in candidate_ids[:3]
             ],
-        )
+        ))
 
     if resolution["status"] != "resolved":
         suggestions = resolution.get("suggestions") or []
-        return _error_payload(
+        return _with_elapsed(_error_payload(
             "UNKNOWN_NODE",
             f"unknown explain target: {target}",
             target=resolution.get("target") or target,
@@ -630,7 +637,7 @@ def explain_payload(
                 manage_py_command("explain", item["id"], "--format", "json")
                 for item in suggestions[:3]
             ],
-        )
+        ))
 
     target_id = str(resolution["id"])
     resolved_from = resolution.get("resolved_from")
@@ -653,9 +660,9 @@ def explain_payload(
             }
             if resolved_from:
                 payload["resolved_from"] = resolved_from
-            return payload
+            return _with_elapsed(payload)
         suggestions = fuzzy_suggestions(str(target), _brain_target_corpus(graph_payload, registry))
-        return _error_payload(
+        return _with_elapsed(_error_payload(
             "UNKNOWN_NODE",
             f"unknown explain target: {target}",
             target=target,
@@ -664,7 +671,7 @@ def explain_payload(
                 manage_py_command("explain", item["id"], "--format", "json")
                 for item in suggestions[:3]
             ],
-        )
+        ))
 
     node = nodes[target_id]
     kind = str(node.get("kind") or "unknown")
@@ -699,7 +706,7 @@ def explain_payload(
     }
     if resolved_from:
         payload["resolved_from"] = resolved_from
-    return payload
+    return _with_elapsed(payload)
 
 
 __all__ = [

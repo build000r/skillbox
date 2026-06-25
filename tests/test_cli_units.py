@@ -24,6 +24,15 @@ from runtime_manager.command_registry import default_registry  # noqa: E402
 from runtime_manager.errors import PRUNE_SKIPPED_PINNED  # noqa: E402
 
 
+def _assert_elapsed_meta(testcase: unittest.TestCase, payload: dict[str, object]) -> None:
+    meta = payload.get("meta")
+    testcase.assertIsInstance(meta, dict)
+    elapsed = meta.get("elapsed_ms") if isinstance(meta, dict) else None
+    testcase.assertIsInstance(elapsed, (int, float))
+    testcase.assertNotIsInstance(elapsed, bool)
+    testcase.assertGreaterEqual(float(elapsed), 0.0)
+
+
 def _ns(**kwargs: object) -> argparse.Namespace:
     defaults = {
         "format": "json",
@@ -73,12 +82,13 @@ class CliUnitTests(unittest.TestCase):
         self.assertIn("focus requires a client_id or --resume", payload["error"]["message"])
 
     def test_capabilities_json_contract_is_agent_readable(self) -> None:
-        result = _run_manage("capabilities", "--json")
+        result = _run_manage("capabilities", "--json", "--no-adapters")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["tool"], "skillbox-manage")
         self.assertEqual(payload["contract_version"], "2026-05-09")
+        _assert_elapsed_meta(self, payload)
         self.assertIn("capabilities", payload["agent_surfaces"])
         self.assertTrue(any(command["name"] == "next" for command in payload["commands"]))
         self.assertTrue(any(command["name"] == "graph" for command in payload["commands"]))
@@ -178,6 +188,8 @@ class CliUnitTests(unittest.TestCase):
         self.assertEqual(payloads[2]["kind"], "command")
         self.assertTrue(payloads[3]["hits"])
         self.assertEqual(payloads[4]["snapshot_id"], "golden-fixture")
+        for payload in payloads[:4]:
+            _assert_elapsed_meta(self, payload)
 
     def test_explain_bare_brain_command_alias_resolves_to_command_node(self) -> None:
         result = _run_manage("explain", "next", "--format", "json", "--no-adapters")

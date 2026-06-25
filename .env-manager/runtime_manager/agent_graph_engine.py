@@ -7,6 +7,7 @@ from typing import Any, Iterable, Mapping
 from .agent_decisions import MAX_FUZZY_SUGGESTIONS, fuzzy_suggestions, resolve_brain_target
 from .agent_graph import AgentGraph
 from .agent_cli_hints import manage_py_command
+from .agent_timing import attach_elapsed, timer_start
 from .agent_graph_algorithms import (
     ALGORITHMS_SCHEMA_VERSION,
     analyze_graph,
@@ -217,6 +218,7 @@ def graph_command_payload(
     blocked_nodes: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Build the graph command JSON payload, optionally with algorithms."""
+    start = timer_start()
     graph_payload = _graph_payload(graph)
     payload: dict[str, Any] = {
         "ok": bool(graph_payload.get("ok", True)),
@@ -237,14 +239,14 @@ def graph_command_payload(
             blocked_nodes=blocked_nodes,
         )
         if "error" in algorithm_payload:
-            return algorithm_payload
+            return attach_elapsed(algorithm_payload, start)
         payload["algorithm"] = {
             "name": algorithm,
             "schema_version": ALGORITHMS_SCHEMA_VERSION,
             "result": algorithm_payload,
         }
         payload["ok"] = payload["ok"] and bool(algorithm_payload.get("ok", True))
-    return payload
+    return attach_elapsed(payload, start)
 
 
 def _quote_dot(value: str) -> str:
