@@ -161,6 +161,128 @@ class CliWrapperTests(unittest.TestCase):
                 ],
             )
 
+    def test_sbp_recalibrate_auto_fix_yes_repairs_missing_skill_in_one_outer_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = root / "repo"
+            source_root = root / "sources"
+            clients_root = root / "clients"
+            repo.mkdir()
+            (repo / ".git").mkdir()
+            (source_root / "alpha").mkdir(parents=True)
+            clients_root.mkdir()
+            (source_root / "alpha" / "SKILL.md").write_text("# alpha\n", encoding="utf-8")
+            policy_path = root / "skill-scope.yaml"
+            policy_path.write_text(
+                "version: 1\n"
+                "skill_source_roots:\n"
+                f"  - {source_root}\n"
+                "rules:\n"
+                "  - id: alpha-local\n"
+                "    skills: [alpha]\n"
+                f"    paths: [{repo}]\n",
+                encoding="utf-8",
+            )
+            env = {
+                "SKILLBOX_SKILL_SCOPE_FILE": str(policy_path),
+                "SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root),
+            }
+
+            def embedded_json_objects(text: str) -> list[dict[str, object]]:
+                decoder = json.JSONDecoder()
+                objects: list[dict[str, object]] = []
+                for index, character in enumerate(text):
+                    if character != "{":
+                        continue
+                    try:
+                        item, _ = decoder.raw_decode(text[index:])
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(item, dict):
+                        objects.append(item)
+                return objects
+
+            before = self._run_wrapper(
+                SBP,
+                "skills",
+                "--issues-only",
+                "--no-global",
+                "--format",
+                "json",
+                invoke_cwd=repo,
+                extra_env=env,
+            )
+            recovery = self._run_wrapper(
+                SBP,
+                "recalibrate",
+                "--auto-fix",
+                "--yes",
+                invoke_cwd=repo,
+                extra_env=env,
+            )
+            after = self._run_wrapper(
+                SBP,
+                "skills",
+                "--issues-only",
+                "--no-global",
+                "--format",
+                "json",
+                invoke_cwd=repo,
+                extra_env=env,
+            )
+            self.assertEqual(before.returncode, 0, before.stderr)
+            self.assertEqual(recovery.returncode, 0, recovery.stderr)
+            self.assertEqual(after.returncode, 0, after.stderr)
+            before_payload = json.loads(before.stdout)
+            heal_payloads = [
+                item for item in embedded_json_objects(recovery.stdout)
+                if item.get("action") == "heal" and item.get("skill") == "alpha"
+            ]
+            after_payload = json.loads(after.stdout)
+            recovery_commands = ["sbp recalibrate --auto-fix --yes"]
+            ceremony_log = {
+                "steps": [
+                    {
+                        "name": "detect_missing",
+                        "command": "sbp skills --issues-only --no-global --format json",
+                        "missing_for_cwd": [
+                            item.get("name")
+                            for item in (before_payload.get("issues") or {}).get("missing_for_cwd") or []
+                        ],
+                    },
+                    {
+                        "name": "recover",
+                        "command": recovery_commands[0],
+                        "tool_call_count": len(recovery_commands),
+                        "returned_activation_packet": bool(
+                            heal_payloads and heal_payloads[0].get("activation_packet")
+                        ),
+                    },
+                    {
+                        "name": "verify_effective",
+                        "command": "sbp skills --issues-only --no-global --format json",
+                        "missing_for_cwd": [
+                            item.get("name")
+                            for item in (after_payload.get("issues") or {}).get("missing_for_cwd") or []
+                        ],
+                    },
+                ],
+            }
+
+            self.assertEqual(ceremony_log["steps"][0]["missing_for_cwd"], ["alpha"], ceremony_log)
+            self.assertEqual(recovery_commands, ["sbp recalibrate --auto-fix --yes"], ceremony_log)
+            self.assertEqual(ceremony_log["steps"][1]["tool_call_count"], 1, ceremony_log)
+            self.assertEqual(len(heal_payloads), 1, ceremony_log)
+            heal_payload = heal_payloads[0]
+            self.assertTrue(ceremony_log["steps"][1]["returned_activation_packet"], ceremony_log)
+            self.assertEqual(heal_payload["action"], "heal", ceremony_log)
+            self.assertEqual(heal_payload["activation_packet"]["name"], "alpha", ceremony_log)
+            self.assertIn("skill_md", heal_payload["activation_packet"], ceremony_log)
+            self.assertEqual(ceremony_log["steps"][2]["missing_for_cwd"], [], ceremony_log)
+            self.assertIn("alpha", [item.get("name") for item in after_payload.get("effective") or []], ceremony_log)
+            self.assertTrue((repo / ".claude" / "skills" / "alpha").is_symlink(), ceremony_log)
+            self.assertTrue((repo / ".codex" / "skills" / "alpha").is_symlink(), ceremony_log)
+
     def test_sbp_home_surfaces_batch_launcher_safe_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
