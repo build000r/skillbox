@@ -1439,7 +1439,7 @@ def compact_skill_visibility_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-EXPLAIN_SCHEMA_VERSION = "2026-06-13+skill_explain"
+EXPLAIN_SCHEMA_VERSION = "2026-06-25+skill_explain_layers"
 
 # Maps an occurrence ``layer`` id (e.g. ``default``, ``client:foo``,
 # ``global:claude``, ``project:codex:/repo``) to one of the four ranking
@@ -1472,9 +1472,44 @@ def _explain_occurrence_view(occurrence: dict[str, Any], *, won: bool) -> dict[s
         "source": occurrence.get("source"),
         "source_bucket": occurrence.get("source_bucket"),
         "path": occurrence.get("path"),
+        "override_action": occurrence.get("override_action"),
+        "policy_path": occurrence.get("policy_path"),
         "won": won,
+        "wins": won,
     }
-    return {key: value for key, value in view.items() if value not in (None, "")} | {"won": won}
+    return (
+        {key: value for key, value in view.items() if value not in (None, "")}
+        | {"won": won, "wins": won}
+    )
+
+
+def _explain_vetoed_floor_views(payload: dict[str, Any], skill_name: str) -> list[dict[str, Any]]:
+    """Repo override attempts vetoed by the dispatcher floor.
+
+    Floor vetoes intentionally do not become occurrences, because the canonical
+    resolver must ignore them. The explain trace still needs to show the
+    touched layer so agents can see why a local pin_off did not win.
+    """
+    rows: list[dict[str, Any]] = []
+    for layer in payload.get("layers") or []:
+        if str(layer.get("id") or "") != "repo-override-file":
+            continue
+        if skill_name not in {str(name) for name in layer.get("vetoed_floor") or []}:
+            continue
+        rows.append({
+            "layer": layer.get("id"),
+            "layer_label": layer.get("label"),
+            "layer_rank": layer.get("rank"),
+            "layer_family": "OVERRIDE",
+            "availability": "override",
+            "state": "vetoed_floor",
+            "path": layer.get("path"),
+            "override_action": "pin_off_or_opt_out_global",
+            "lost_reason": "dispatcher floor skills cannot be disabled by repo overrides",
+            "won": False,
+            "wins": False,
+        })
+    return rows
 
 
 def _explain_lost_reason(
@@ -1669,18 +1704,19 @@ def _explain_remediation(
     ]
 
     if source_options:
-        # A real source exists: the narrowest fix is a scoped activate, which
-        # both prints the SKILL.md packet now and links it for future sessions.
+        # A real source exists: the narrowest durable fix is a scoped `on`,
+        # which pins it for this repo, links it, and returns the SKILL.md packet.
         remediation.append({
             "rank": 1,
-            "kind": "activate",
-            "command": f"sbp skill activate {skill_name} --cwd {cwd}",
+            "kind": "on",
+            "command": f"sbp skill on {skill_name} --cwd $PWD",
+            "resolved_command": f"sbp skill on {skill_name} --cwd {cwd}",
             "manage_command": (
-                f"python3 .env-manager/manage.py skill activate {skill_name} --cwd {cwd}"
+                f"python3 .env-manager/manage.py skill on {skill_name} --cwd {cwd}"
             ),
             "why": (
                 f"a source for {skill_name!r} exists ({source_options[0].get('source')}); "
-                "activating links it here and returns the SKILL.md packet immediately"
+                "turning it on pins it for this repo, links it, and returns the SKILL.md packet"
             ),
         })
 
@@ -1828,6 +1864,10 @@ def explain_skill_visibility(
             view["lost_reason"] = _explain_lost_reason(winner, item)
             losers.append(view)
         occurrence_views.append(view)
+    layer_trace = [
+        *occurrence_views,
+        *_explain_vetoed_floor_views(payload, skill_name),
+    ]
 
     if visible:
         reason = (
@@ -1879,10 +1919,12 @@ def explain_skill_visibility(
         "visible": visible,
         "reason": reason,
         "layer": winner.get("layer") if winner else None,
+        "winning_layer": winner.get("winning_layer") if winner else None,
         "layer_family": _layer_family(winner) if winner else None,
         "layer_label": winner.get("layer_label") if winner else None,
         "layer_rank": winner.get("layer_rank") if winner else None,
         "winner": _explain_occurrence_view(winner, won=True) if winner else None,
+        "layers": layer_trace,
         "occurrences": occurrence_views,
         "lost": losers,
         "scope_rules": scope_rules,

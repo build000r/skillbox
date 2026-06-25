@@ -186,6 +186,12 @@ class FixtureFleet:
         """
         with mock.patch.object(
             skill_visibility.Path, "home", return_value=self.os_home
+        ), mock.patch.dict(
+            os.environ,
+            {
+                "SKILLBOX_MACHINES_FILE": str(self.machines_path),
+                "SKILLBOX_MACHINE": "devbox-like",
+            },
         ):
             yield
 
@@ -264,15 +270,14 @@ def _write_machines_yaml(path: Path, *, mac_root: Path, devbox_root: Path) -> No
     path.write_text(
         "version: 1\n"
         "machines:\n"
-        "  - id: mac-like\n"
-        "    role: laptop\n"
-        f"    repos_root: {mac_root}\n"
-        "    home_style: per-entry-symlink\n"
-        "  - id: devbox-like\n"
-        "    role: devbox\n"
-        f"    repos_root: {devbox_root}\n"
-        "    home_style: dir-symlink\n"
-        "    public_ip: true\n",
+        "  mac-like:\n"
+        "    hostnames: [mac-like]\n"
+        f"    home: {mac_root}\n"
+        f"    repo_roots: [{mac_root}]\n"
+        "  devbox-like:\n"
+        "    hostnames: [devbox-like]\n"
+        f"    home: {devbox_root}\n"
+        f"    repo_roots: [{devbox_root}]\n",
         encoding="utf-8",
     )
 
@@ -439,7 +444,7 @@ def build_fixture_fleet(tmp_root: str | os.PathLike[str]) -> FixtureFleet:
         "version: 1\n"
         "pin_on: [needs-beads]\n"
         "pin_off: [tiny-marketing]\n"
-        "opt_out_global: [project-status-mmdx]\n"
+        "opt_out_global: [fixture-global-optout]\n"
         "overlays:\n"
         "  enable: [marketing]\n"
         "  disable: [swarm]\n"

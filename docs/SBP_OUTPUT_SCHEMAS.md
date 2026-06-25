@@ -498,7 +498,7 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "layer": "repo-override-file:global-opt-out",
       "layer_label": "repo override global opt-out",
       "layer_rank": 35,
-      "name": "project-status-mmdx",
+      "name": "fixture-global-optout",
       "override_action": "opt_out_global",
       "path": "<FLEET>/repos_real/healthy",
       "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
@@ -618,6 +618,22 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
   "visibility_decisions": [
     {
       "availability": "override",
+      "layer": "repo-override-file:global-opt-out",
+      "layer_label": "repo override global opt-out",
+      "layer_rank": 35,
+      "name": "fixture-global-optout",
+      "override_action": "opt_out_global",
+      "path": "<FLEET>/repos_real/healthy",
+      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "scope": "repo",
+      "shadowed_count": 0,
+      "source": null,
+      "source_bucket": null,
+      "state": "disabled",
+      "winning_layer": "repo-override-file:global-opt-out"
+    },
+    {
+      "availability": "override",
       "layer": "repo-override-file",
       "layer_label": "repo override file",
       "layer_rank": 60,
@@ -631,22 +647,6 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "source_bucket": "external",
       "state": "pinned",
       "winning_layer": "repo-override-file"
-    },
-    {
-      "availability": "override",
-      "layer": "repo-override-file:global-opt-out",
-      "layer_label": "repo override global opt-out",
-      "layer_rank": 35,
-      "name": "project-status-mmdx",
-      "override_action": "opt_out_global",
-      "path": "<FLEET>/repos_real/healthy",
-      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
-      "scope": "repo",
-      "shadowed_count": 0,
-      "source": null,
-      "source_bucket": null,
-      "state": "disabled",
-      "winning_layer": "repo-override-file:global-opt-out"
     },
     {
       "availability": "installed",
@@ -1002,10 +1002,12 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
 | `visible` | CONTRACT | True iff the skill resolves to a non-broken effective occurrence here. |
 | `reason` | info | Human sentence explaining the verdict. |
 | `layer` | CONTRACT | Resolution winner layer id, including disabled/broken winners, or null when none. |
+| `winning_layer` | CONTRACT | Canonical winning_layer copied from the same visibility decision that drives the effective set. |
 | `layer_family` | CONTRACT | PROJECT|GLOBAL|CLIENT|DEFAULT|OVERRIDE of the resolution winner, or null. |
 | `layer_label` | info | Human label for the resolution winner layer, or null. |
 | `layer_rank` | CONTRACT | Numeric rank of the resolution winner layer, or null. |
 | `winner` | CONTRACT | Trimmed view of the resolution winner (won=true), or null. |
+| `layers` | CONTRACT | Ordered provenance trace for this skill; exactly one row has wins=true when a winning layer exists. |
 | `occurrences` | CONTRACT | Every occurrence of this skill across layers, each with a won verdict. |
 | `lost` | CONTRACT | Non-winning occurrences with a lost_reason. |
 | `scope_rules` | CONTRACT | skill-scope.yaml rules naming this skill at this cwd. |
@@ -1036,6 +1038,23 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
   "layer_family": "OVERRIDE",
   "layer_label": "repo override file",
   "layer_rank": 60,
+  "layers": [
+    {
+      "availability": "override",
+      "layer": "repo-override-file",
+      "layer_family": "OVERRIDE",
+      "layer_label": "repo override file",
+      "layer_rank": 60,
+      "override_action": "pin_on",
+      "path": "<FLEET>/repos_real/healthy",
+      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "source": "<FLEET>/private-skills/needs-beads",
+      "source_bucket": "external",
+      "state": "pinned",
+      "wins": true,
+      "won": true
+    }
+  ],
   "lost": [],
   "machine": {
     "declared_machines": [
@@ -1068,10 +1087,13 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
       "layer_family": "OVERRIDE",
       "layer_label": "repo override file",
       "layer_rank": 60,
+      "override_action": "pin_on",
       "path": "<FLEET>/repos_real/healthy",
+      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
       "source": "<FLEET>/private-skills/needs-beads",
       "source_bucket": "external",
       "state": "pinned",
+      "wins": true,
       "won": true
     }
   ],
@@ -1081,7 +1103,7 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
     "skill_id": null
   },
   "remediation": [],
-  "schema_version": "2026-06-13+skill_explain",
+  "schema_version": "2026-06-25+skill_explain_layers",
   "scope_rules": [],
   "skill": "needs-beads",
   "source_options": [
@@ -1097,12 +1119,16 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
     "layer_family": "OVERRIDE",
     "layer_label": "repo override file",
     "layer_rank": 60,
+    "override_action": "pin_on",
     "path": "<FLEET>/repos_real/healthy",
+    "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
     "source": "<FLEET>/private-skills/needs-beads",
     "source_bucket": "external",
     "state": "pinned",
+    "wins": true,
     "won": true
-  }
+  },
+  "winning_layer": "repo-override-file"
 }
 ```
 

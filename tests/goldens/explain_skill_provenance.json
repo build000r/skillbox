@@ -1,6 +1,6 @@
 {
   "_comment": "Golden invariants for `sbp explain <skill>` (explain_skill_visibility). Keyed by case. Paths are tmp-specific so we assert structure/verdicts, not absolute paths. Built on tests/fixture_fleet so every case is reproducible.",
-  "schema_version": "2026-06-13+skill_explain",
+  "schema_version": "2026-06-25+skill_explain_layers",
   "cases": {
     "visible": {
       "skill": "tiny-cli",
@@ -10,13 +10,30 @@
       "remediation_kinds": [],
       "reason_contains": "IS visible"
     },
-    "invisible_activatable": {
+    "pinned_on_local": {
       "skill": "needs-beads",
       "repo": "healthy",
+      "visible": true,
+      "layer": "repo-override-file",
+      "layer_family": "OVERRIDE",
+      "winner_state": "pinned"
+    },
+    "opt_out_global": {
+      "skill": "fixture-global-optout",
+      "repo": "healthy",
+      "visible": false,
+      "layer": "repo-override-file:global-opt-out",
+      "layer_family": "OVERRIDE",
+      "winner_state": "disabled",
+      "reason_contains": "disabled by the OVERRIDE layer"
+    },
+    "invisible_activatable": {
+      "skill": "needs-beads",
+      "repo": "overlay-repo",
       "visible": false,
       "layer_family": null,
-      "remediation_kinds": ["activate", "rule_edit"],
-      "top_remediation_kind": "activate",
+      "remediation_kinds": ["on", "rule_edit"],
+      "top_remediation_kind": "on",
       "reason_contains": "can be activated",
       "has_source_options": true
     },
@@ -35,7 +52,7 @@
       "unlink_first": true,
       "overlay_off": true,
       "visible": false,
-      "remediation_kinds": ["activate", "overlay_flip"],
+      "remediation_kinds": ["on", "overlay_flip"],
       "overlay_flip_overlay": "marketing",
       "inactive_overlay_rule_id": "marketing-overlay-local"
     },
