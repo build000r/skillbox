@@ -84,6 +84,7 @@ DEFAULT_INTERVAL = 30
 PID_NAME = "pulse.pid"
 STATE_NAME = "pulse.state.json"
 LOG_NAME = "pulse.log"
+PORT_GUARD_TELEMETRY_NAME = "port-guard.telemetry.json"
 DEFAULT_UNHEALTHY_GRACE_SECONDS = 60.0
 DEFAULT_PORT_SENTINEL_MODE = "observe"
 DEFAULT_PORT_SENTINEL_GRACE_SECONDS = 15.0
@@ -105,6 +106,14 @@ PORT_SENTINEL_DEV_SIGNATURES = (
     ("webpack-serve", ("webpack", "serve")),
     ("react-scripts", ("react-scripts", "start")),
     ("turbopack", ("turbo", "dev")),
+)
+PORT_GUARD_COUNTER_KEYS = (
+    "hook_blocks",
+    "shim_blocks",
+    "post_bind_mismatches",
+    "rogues_seen",
+    "rogues_reaped",
+    "wildcard_criticals",
 )
 
 _runtime_dir_cache: dict[Path, Path] = {}
@@ -186,6 +195,14 @@ def pulse_state_path(root_dir: Path) -> Path:
 
 def pulse_state_candidates(root_dir: Path) -> list[Path]:
     return [path / STATE_NAME for path in _runtime_dir_candidates(root_dir)]
+
+
+def port_guard_telemetry_path(root_dir: Path) -> Path:
+    return _runtime_dir(root_dir) / PORT_GUARD_TELEMETRY_NAME
+
+
+def port_guard_telemetry_candidates(root_dir: Path) -> list[Path]:
+    return [path / PORT_GUARD_TELEMETRY_NAME for path in _runtime_dir_candidates(root_dir)]
 
 
 def pulse_log_path(root_dir: Path) -> Path:
@@ -464,11 +481,132 @@ def _restart_with_backoff(
 # ---------------------------------------------------------------------------
 
 def copy_port_sentinel_counters(counters: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "rogues_seen": int(counters.get("rogues_seen") or 0),
-        "rogues_reaped": int(counters.get("rogues_reaped") or 0),
-        "by_signature": dict(counters.get("by_signature") or {}),
+    copied = {
+        key: int(counters.get(key) or 0)
+        for key in PORT_GUARD_COUNTER_KEYS
     }
+    copied["by_signature"] = dict(counters.get("by_signature") or {})
+    for key in ("first_seen_at", "last_seen_at", "last_reaped_at"):
+        value = str(counters.get(key) or "").strip()
+        if value:
+            copied[key] = value
+    return copied
+
+
+def _utc_timestamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _default_port_guard_counters() -> dict[str, Any]:
+    return {
+        **{key: 0 for key in PORT_GUARD_COUNTER_KEYS},
+        "by_signature": {},
+    }
+
+
+def _normalize_port_guard_counters(raw: dict[str, Any] | None) -> dict[str, Any]:
+    counters = _default_port_guard_counters()
+    if not isinstance(raw, dict):
+        return counters
+    for key in PORT_GUARD_COUNTER_KEYS:
+        try:
+            counters[key] = int(raw.get(key) or 0)
+        except (TypeError, ValueError):
+            counters[key] = 0
+    if isinstance(raw.get("by_signature"), dict):
+        counters["by_signature"] = {
+            str(key): int(value or 0)
+            for key, value in raw["by_signature"].items()
+            if str(key).strip()
+        }
+    for key in ("first_seen_at", "last_seen_at", "last_reaped_at"):
+        value = str(raw.get(key) or "").strip()
+        if value:
+            counters[key] = value
+    return counters
+
+
+def _touch_port_guard_counters(counters: dict[str, Any], *, timestamp: str | None = None) -> None:
+    stamp = timestamp or _utc_timestamp()
+    counters.setdefault("first_seen_at", stamp)
+    counters["last_seen_at"] = stamp
+
+
+def _increment_port_guard_counter(
+    counters: dict[str, Any],
+    key: str,
+    amount: int = 1,
+    *,
+    timestamp: str | None = None,
+) -> None:
+    if key not in PORT_GUARD_COUNTER_KEYS:
+        return
+    counters[key] = int(counters.get(key) or 0) + int(amount)
+    _touch_port_guard_counters(counters, timestamp=timestamp)
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _external_port_guard_counters(root_dir: Path) -> dict[str, Any]:
+    for candidate in port_guard_telemetry_candidates(root_dir):
+        if not candidate.is_file():
+            continue
+        payload = _read_json_object(candidate)
+        counters = payload.get("counters") if isinstance(payload.get("counters"), dict) else payload
+        if isinstance(counters, dict):
+            return _normalize_port_guard_counters(counters)
+    return _default_port_guard_counters()
+
+
+def _merge_port_guard_counters(state: "PulseState", external: dict[str, Any]) -> None:
+    external = _normalize_port_guard_counters(external)
+    counters = _normalize_port_guard_counters(state.port_sentinel_counters)
+    for key in PORT_GUARD_COUNTER_KEYS:
+        counters[key] = max(int(counters.get(key) or 0), int(external.get(key) or 0))
+    by_signature: dict[str, int] = {}
+    for source in (external.get("by_signature") or {}, counters.get("by_signature") or {}):
+        for key, value in dict(source).items():
+            marker = str(key)
+            by_signature[marker] = max(int(by_signature.get(marker) or 0), int(value or 0))
+    counters["by_signature"] = by_signature
+    for key in ("first_seen_at", "last_seen_at", "last_reaped_at"):
+        values = [str(counters.get(key) or "").strip(), str(external.get(key) or "").strip()]
+        values = [value for value in values if value]
+        if values:
+            counters[key] = min(values) if key == "first_seen_at" else max(values)
+    state.port_sentinel_counters = counters
+
+
+def _merge_port_guard_counters_into_snapshot(root_dir: Path, snapshot: dict[str, Any]) -> None:
+    port_sentinel = snapshot.get("port_sentinel")
+    if not isinstance(port_sentinel, dict):
+        port_sentinel = {}
+    state = PulseState()
+    state.port_sentinel_counters = _normalize_port_guard_counters(port_sentinel)
+    _merge_port_guard_counters(state, _external_port_guard_counters(root_dir))
+    snapshot["port_sentinel"] = {
+        **port_sentinel,
+        **copy_port_sentinel_counters(state.port_sentinel_counters),
+    }
+
+
+def load_pulse_state(root_dir: Path) -> "PulseState":
+    state = PulseState()
+    state_path = next(
+        (candidate for candidate in pulse_state_candidates(root_dir) if candidate.is_file()),
+        pulse_state_path(root_dir),
+    )
+    payload = _read_json_object(state_path)
+    port_sentinel = payload.get("port_sentinel") if isinstance(payload.get("port_sentinel"), dict) else {}
+    state.port_sentinel_counters = _normalize_port_guard_counters(port_sentinel)
+    _merge_port_guard_counters(state, _external_port_guard_counters(root_dir))
+    return state
 
 
 def _env_value(model: dict[str, Any], key: str, default: str = "") -> str:
@@ -657,10 +795,22 @@ def _terminate_rogue(candidate: dict[str, Any]) -> str:
 
 def _record_port_sentinel_seen(state: "PulseState", candidate: dict[str, Any]) -> None:
     counters = state.port_sentinel_counters
-    counters["rogues_seen"] = int(counters.get("rogues_seen") or 0) + 1
+    _increment_port_guard_counter(counters, "rogues_seen")
     by_signature = counters.setdefault("by_signature", {})
     signature = str(candidate.get("signature") or "none")
     by_signature[signature] = int(by_signature.get(signature) or 0) + 1
+    if _candidate_uses_wildcard(candidate) and candidate.get("enforcement") == "dev-server":
+        _increment_port_guard_counter(counters, "wildcard_criticals")
+
+
+def _candidate_uses_wildcard(candidate: dict[str, Any]) -> bool:
+    cmdline = str(candidate.get("cmdline") or "").lower()
+    return (
+        "0.0.0.0" in cmdline
+        or "::" in cmdline
+        or "--host=0" in cmdline
+        or "--host 0" in cmdline
+    )
 
 
 def _port_sentinel_event(action: str, candidate: dict[str, Any], state: "PulseState", **extra: Any) -> None:
@@ -697,6 +847,7 @@ def _reconcile_port_sentinel(model: dict[str, Any], state: "PulseState", *, now:
     last_candidates: list[dict[str, Any]] = []
     for candidate in candidates:
         key = candidate["key"]
+        first_observation = key not in state.port_sentinel_first_seen
         first_seen = state.port_sentinel_first_seen.setdefault(key, now)
         age_seconds = max(0.0, now - first_seen)
         candidate_view = {
@@ -708,9 +859,9 @@ def _reconcile_port_sentinel(model: dict[str, Any], state: "PulseState", *, now:
             "age_seconds": round(age_seconds, 1),
         }
         last_candidates.append(candidate_view)
-        _record_port_sentinel_seen(state, candidate)
 
-        if first_seen == now:
+        if first_observation:
+            _record_port_sentinel_seen(state, candidate)
             _port_sentinel_event("observed", candidate, state, mode=mode)
 
         if mode != "enforce" or candidate.get("enforcement") != "dev-server":
@@ -721,7 +872,8 @@ def _reconcile_port_sentinel(model: dict[str, Any], state: "PulseState", *, now:
         action = _terminate_rogue(candidate)
         if action in {"terminated", "killed", "already-gone"}:
             counters = state.port_sentinel_counters
-            counters["rogues_reaped"] = int(counters.get("rogues_reaped") or 0) + 1
+            _increment_port_guard_counter(counters, "rogues_reaped")
+            counters["last_reaped_at"] = str(counters.get("last_seen_at") or _utc_timestamp())
             state.port_sentinel_first_seen.pop(key, None)
         _port_sentinel_event(action, candidate, state, mode=mode, age_seconds=round(age_seconds, 1))
 
@@ -747,11 +899,7 @@ class PulseState:
         self.port_sentinel_first_seen: dict[str, float] = {}
         self.port_sentinel_mode: str = DEFAULT_PORT_SENTINEL_MODE
         self.port_sentinel_grace_seconds: float = DEFAULT_PORT_SENTINEL_GRACE_SECONDS
-        self.port_sentinel_counters: dict[str, Any] = {
-            "rogues_seen": 0,
-            "rogues_reaped": 0,
-            "by_signature": {},
-        }
+        self.port_sentinel_counters: dict[str, Any] = _default_port_guard_counters()
         self.port_sentinel_last_candidates: list[dict[str, Any]] = []
         self.cycle_count: int = 0
         self.heals: int = 0
@@ -1161,6 +1309,7 @@ def _write_pulse_state(
 ) -> None:
     state_path = pulse_state_path(root_dir)
     state_path.parent.mkdir(parents=True, exist_ok=True)
+    _merge_port_guard_counters(state, _external_port_guard_counters(root_dir))
     snapshot = {
         "pid": os.getpid(),
         "updated_at": time.time(),
@@ -1234,7 +1383,7 @@ def run_daemon(
     }, root_dir)
     log("info", "started", pid=os.getpid(), interval=interval)
 
-    state = PulseState()
+    state = load_pulse_state(root_dir)
 
     try:
         while not _shutdown:
@@ -1291,6 +1440,8 @@ def print_status(root_dir: Path) -> int:
     except (json.JSONDecodeError, OSError) as exc:
         print(f"pulse: error reading state: {exc}")
         return 1
+    if isinstance(snapshot, dict):
+        _merge_port_guard_counters_into_snapshot(root_dir, snapshot)
 
     _print_pulse_snapshot(snapshot, running_pid)
     return 0
@@ -1361,6 +1512,17 @@ def _print_port_sentinel(port_sentinel: dict[str, Any]) -> None:
     reaped = int(port_sentinel.get("rogues_reaped") or 0)
     active = int(port_sentinel.get("active_candidates") or 0)
     print(f"  port sentinel: {mode}, seen {seen}, reaped {reaped}, active {active}")
+    hook_blocks = int(port_sentinel.get("hook_blocks") or 0)
+    shim_blocks = int(port_sentinel.get("shim_blocks") or 0)
+    post_bind = int(port_sentinel.get("post_bind_mismatches") or 0)
+    wildcard = int(port_sentinel.get("wildcard_criticals") or 0)
+    first_seen = str(port_sentinel.get("first_seen_at") or "never")
+    last_seen = str(port_sentinel.get("last_seen_at") or "never")
+    print(
+        "  port guard counters: "
+        f"hook {hook_blocks}, shim {shim_blocks}, post-bind {post_bind}, "
+        f"wildcard {wildcard}, first {first_seen}, last {last_seen}"
+    )
     for candidate in port_sentinel.get("last_candidates") or []:
         print(
             "    ! "
@@ -1390,6 +1552,7 @@ def read_state(root_dir: Path) -> dict[str, Any]:
             result["pid"] = running_pid
             if snapshot.get("updated_at"):
                 result["seconds_since_tick"] = round(time.time() - snapshot["updated_at"], 1)
+            _merge_port_guard_counters_into_snapshot(root_dir, result)
         except (json.JSONDecodeError, OSError):
             result["state_error"] = "failed to read state file"
 

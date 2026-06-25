@@ -36,6 +36,7 @@ python3 - "$REPO_ROOT" <<'PY'
 from __future__ import annotations
 
 import datetime as _dt
+import fcntl
 import json
 import os
 import re
@@ -286,6 +287,45 @@ def _log(root: Path, verdict: str, detail: dict[str, Any]) -> None:
             )
     except OSError:
         pass
+    if verdict == "block":
+        mode = str(detail.get("mode") or "hook")
+        counter = "shim_blocks" if mode == "shim" else "hook_blocks"
+        _record_port_guard_telemetry(root, counter)
+
+
+def _record_port_guard_telemetry(root: Path, counter: str) -> None:
+    if counter not in {"hook_blocks", "shim_blocks"}:
+        return
+    path = root / "logs" / "runtime" / "port-guard.telemetry.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.with_name(f".{path.name}.lock").open("a", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            counters = payload.get("counters")
+            if not isinstance(counters, dict):
+                counters = {}
+            now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            counters[counter] = int(counters.get(counter) or 0) + 1
+            counters.setdefault("first_seen_at", now)
+            counters["last_seen_at"] = now
+            payload["counters"] = counters
+            tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            try:
+                tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                os.replace(tmp_path, path)
+            except OSError:
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+    except OSError:
+        pass
 
 
 def main() -> int:
@@ -298,7 +338,7 @@ def main() -> int:
         return 0
     cwd_text = effective_command_cwd(command, cwd_text)
 
-    detail = {"cwd": cwd_text, "command": command, "signature": signature}
+    detail = {"cwd": cwd_text, "command": command, "signature": signature, "mode": os.environ.get("SKILLBOX_DEV_GUARD_MODE", "hook")}
     if os.environ.get("SKILLBOX_MANAGED_RUN") == "1":
         _log(root, "bypass_managed_run", detail)
         return 0

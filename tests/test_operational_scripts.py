@@ -271,6 +271,9 @@ class GuardDevPortScriptTests(unittest.TestCase):
             )
             runtime_log = root / "logs" / "runtime" / "runtime.log"
             self.assertIn("port_guard block", runtime_log.read_text(encoding="utf-8"))
+            telemetry = json.loads((root / "logs" / "runtime" / "port-guard.telemetry.json").read_text(encoding="utf-8"))
+            self.assertEqual(telemetry["counters"]["hook_blocks"], 2)
+            self.assertIn("first_seen_at", telemetry["counters"])
 
     def test_guard_dev_port_allows_non_dev_uncovered_and_bypass_modes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -372,6 +375,8 @@ class GuardDevPortScriptTests(unittest.TestCase):
             )
             self.assertEqual(blocked.returncode, 2)
             self.assertFalse(marker.exists())
+            telemetry = json.loads((root / "logs" / "runtime" / "port-guard.telemetry.json").read_text(encoding="utf-8"))
+            self.assertEqual(telemetry["counters"]["shim_blocks"], 1)
 
             allowed_env = dict(env)
             allowed_env["SKILLBOX_MANAGED_RUN"] = "1"

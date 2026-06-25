@@ -55,6 +55,14 @@ that file and load it before dev startup; Vite apps should set
 `server.strictPort: true` with `port: Number(process.env.PORT)` so a busy
 declared port fails loudly instead of auto-incrementing.
 
+The sentinel default stays `observe` until the port-guard telemetry has at
+least 14 consecutive days of clean evidence: zero wildcard criticals and no
+operator-confirmed false-positive reports. The proof path is
+`scripts/port-guard-proof.sh`, which writes a dated report with the five
+criterion checks, current port registry, doctor output, and pulse counters.
+Only after that clean window should the default flip to `enforce`, and that
+flip should be recorded as a dated config change.
+
 ## Commands
 
 ### Verify posture from operator machine
