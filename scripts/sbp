@@ -14,6 +14,8 @@ mode="${SKILLBOX_MODE:-reuse}"
 action="home"
 services=()
 sync_paths=()
+sync_dry_run="false"
+sync_yes="false"
 passthrough_args=()
 runtime_args=()
 json_alias_diagnostics=()
@@ -409,7 +411,7 @@ payload = {
     "aliases": ["sbo"] if wrapper == "sbp" else ["sbp"],
     "commands": [
         {"name": "capabilities", "json": True, "safe_first_try": f"{wrapper} capabilities --json"},
-        {"name": "robot-docs", "json": True, "safe_first_try": f"{wrapper} robot-docs guide"},
+        {"name": "robot-docs", "json": True, "safe_first_try": f"{wrapper} robot-docs guide --json"},
         {"name": "robot-triage", "json": True, "safe_first_try": f"{wrapper} --robot-triage"},
         {"name": "status", "json": True, "safe_first_try": f"{wrapper} status --json"},
         {"name": "logs", "json": True, "safe_first_try": f"{wrapper} logs <profile> <service> --json"},
@@ -734,7 +736,17 @@ append_passthrough_token() {
   local token="$1"
   case "${action}" in
     sync)
-      sync_paths+=("${token}")
+      case "${token}" in
+        --dry-run)
+          sync_dry_run="true"
+          ;;
+        --yes)
+          sync_yes="true"
+          ;;
+        *)
+          sync_paths+=("${token}")
+          ;;
+      esac
       ;;
     skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|structure-doctor|repo-registry|cass|cass-evidence|cron|send-later|beads|mmdx|operator-booking|swimmers-launch|fleet)
       passthrough_args+=("${token}")
@@ -1131,7 +1143,29 @@ PY
     done
     if [[ "${recalibrate_wants_json}" == "true" ]]; then
       if [[ "${recalibrate_auto_fix}" == "true" ]]; then
-        echo "sbp recalibrate: --auto-fix and --json are mutually exclusive (use fixes[].command)" >&2
+        python3 - "${wrapper_name}" "${recalibrate_cwd}" <<'PY'
+from __future__ import annotations
+
+import json
+import sys
+
+wrapper = sys.argv[1]
+cwd = sys.argv[2]
+payload = {
+    "ok": False,
+    "error": {
+        "code": "UNSUPPORTED_JSON_AUTO_FIX",
+        "message": "sbp recalibrate --auto-fix cannot be combined with --json.",
+        "context": {"cwd": cwd},
+        "next_actions": [
+            f"{wrapper} recalibrate --json",
+            "Read fixes[].command from the JSON payload, then run the selected command explicitly.",
+            f"{wrapper} recalibrate --auto-fix",
+        ],
+    },
+}
+print(json.dumps(payload, indent=2, sort_keys=True))
+PY
         exit 2
       fi
       if [[ "${recalibrate_fleet}" == "true" ]]; then
@@ -1182,6 +1216,7 @@ PY
       echo "remove repo-local policy violations:"
       python3 .env-manager/manage.py skill prune "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --from project --dry-run || true
       if [[ "${recalibrate_auto_fix}" == "true" ]]; then
+        auto_fix_failed=0
         echo
         echo "auto-fix missing repo-local skills:"
         if [[ "${recalibrate_apply}" == "true" ]]; then
@@ -1193,6 +1228,7 @@ PY
         missing_names="$(mktemp)"
         if ! python3 .env-manager/manage.py skills "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --issues-only --no-global --format json > "${missing_json}"; then
           printf '{}\n' > "${missing_json}"
+          auto_fix_failed=1
         fi
         python3 - "${missing_json}" > "${missing_names}" <<'PY'
 from __future__ import annotations
@@ -1221,9 +1257,13 @@ PY
           while IFS= read -r missing_skill; do
             [[ -z "${missing_skill}" ]] && continue
             if [[ "${recalibrate_apply}" == "true" ]]; then
-              python3 .env-manager/manage.py skill heal "${missing_skill}" "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --format json || true
+              if ! python3 .env-manager/manage.py skill heal "${missing_skill}" "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --format json; then
+                auto_fix_failed=1
+              fi
             else
-              python3 .env-manager/manage.py skill heal "${missing_skill}" "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --dry-run --format json || true
+              if ! python3 .env-manager/manage.py skill heal "${missing_skill}" "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --dry-run --format json; then
+                auto_fix_failed=1
+              fi
             fi
           done < "${missing_names}"
         fi
@@ -1261,6 +1301,10 @@ else:
       echo "  sbp recalibrate --fleet --limit 20"
       echo "  sbp skill prune --from global --dry-run"
       echo "  sbp overlay activate marketing --cwd \"${recalibrate_cwd}\""
+      if [[ "${recalibrate_auto_fix:-false}" == "true" && "${auto_fix_failed:-0}" -ne 0 ]]; then
+        echo "sbp recalibrate --auto-fix: one or more heal commands failed" >&2
+        exit 1
+      fi
     fi
     ;;
   beads)
@@ -1382,6 +1426,15 @@ else:
       echo "sbp sync: pass at least one skill path, e.g. 'sbp sync /path/to/ga4'" >&2
       exit 2
     fi
+    if [[ "${sync_dry_run}" != "true" && "${sync_yes}" != "true" ]]; then
+      echo "sbp sync: legacy global sync requires --dry-run to preview or --yes to apply" >&2
+      echo "Prefer durable repo-local activation: ${wrapper_name} skill on <skill> --cwd \"${invoke_cwd}\" --dry-run" >&2
+      exit 2
+    fi
+    legacy_sync_args=()
+    if [[ "${sync_dry_run}" == "true" ]]; then
+      legacy_sync_args+=(--dry-run)
+    fi
     for sync_path in "${sync_paths[@]}"; do
       if [[ ! -d "${sync_path}" ]]; then
         echo "sbp sync: not a directory: ${sync_path}" >&2
@@ -1397,7 +1450,8 @@ else:
         --profile "${profile}" \
         --cwd "${invoke_cwd}" \
         --to global \
-        --source "${sync_path}"
+        --source "${sync_path}" \
+        "${legacy_sync_args[@]}"
     done
     ;;
 esac
