@@ -171,6 +171,17 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
         self.assertEqual(policy["reason"], "fixture override")
         self.assertTrue(policy["_policy_path"].endswith(".skillbox/skill-overrides.yaml"))
 
+    def test_fixture_overlay_repo_materializes_override_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fleet = build_fixture_fleet(tmpdir)
+
+            policy = _repo_override_policy(fleet.repo("overlay-repo"))
+
+        self.assertTrue(policy["ok"], policy["errors"])
+        self.assertEqual(policy["pin_off"], ["tiny-cli"])
+        self.assertEqual(policy["reason"], "fixture overlay override")
+        self.assertTrue(policy["_policy_path"].endswith(".skillbox/skill-overrides.yaml"))
+
     def test_subdir_invocation_resolves_to_git_root_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = _make_repo(Path(tmpdir))
@@ -291,6 +302,43 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
                         [item["name"] for item in normal["effective"]],
                         ["alpha"],
                     )
+
+    def test_override_visibility_is_portable_without_skillbox_config_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            fake_home = root / "home"
+            source_root = root / "sources"
+            source = _write_source_skill(source_root, "alpha")
+            _install_project_skill(repo, "alpha", source, surface="claude")
+            _write_override(repo, "version: 1\npin_on: [alpha]\n")
+            model = _write_scope_policy(root, source_root, "alpha", repo)
+            fixture_br = root / "bin" / "br"
+            fixture_br.parent.mkdir()
+            fixture_br.write_text("#!/bin/sh\n", encoding="utf-8")
+
+            self.assertFalse((root / "skillbox-config").exists())
+            with (
+                mock.patch("runtime_manager.skill_visibility.Path.home", return_value=fake_home),
+                mock.patch("runtime_manager.skill_visibility.shutil.which", return_value=str(fixture_br)),
+            ):
+                payload = collect_skill_visibility(
+                    model,
+                    cwd=str(repo),
+                    include_global=False,
+                    include_project=True,
+                )
+
+        rendered = json.dumps(payload, sort_keys=True)
+        external_config_roots = [
+            str((ROOT_DIR.parent / "skillbox-config").resolve()),
+            str((ROOT_DIR.parent.parent / "skillbox-config").resolve()),
+        ]
+        for forbidden in [str(Path.home().resolve()), *external_config_roots]:
+            self.assertNotIn(forbidden, rendered)
+        effective = {item["name"]: item for item in payload["effective"]}
+        self.assertEqual(effective["alpha"]["layer"], "repo-override-file")
+        self.assertTrue(effective["alpha"]["policy_path"].startswith(str(root)))
 
     def test_override_writer_preserves_sequential_read_modify_writes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

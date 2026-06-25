@@ -473,6 +473,14 @@ def build_fixture_fleet(tmp_root: str | os.PathLike[str]) -> FixtureFleet:
         overlay_repo / ".claude" / "skills" / "tiny-marketing",
         skills["tiny-marketing"],
     )
+    overlay_override_dir = overlay_repo / ".skillbox"
+    overlay_override_dir.mkdir()
+    (overlay_override_dir / "skill-overrides.yaml").write_text(
+        "version: 1\n"
+        "pin_off: [tiny-cli]\n"
+        "reason: fixture overlay override\n",
+        encoding="utf-8",
+    )
 
     # --- skill-scope.yaml policy fixture ----------------------------------
     skill_scope_path = config_root / "skill-scope.yaml"
