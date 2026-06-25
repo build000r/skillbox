@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import os
 import subprocess
 import sys
@@ -1334,6 +1335,31 @@ def _build_parser() -> argparse.ArgumentParser:
         action_parser = skill_subparsers.add_parser(action_name, help=help_text)
         action_parser.add_argument("skill_name")
         _add_skill_lifecycle_common(action_parser)
+
+    skill_on_parser = skill_subparsers.add_parser(
+        "on",
+        help="Durably pin a skill on for this repo and return its activation packet.",
+    )
+    skill_on_parser.add_argument("skill_name")
+    _add_skill_lifecycle_common(skill_on_parser)
+    skill_on_parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Re-resolve visibility after applying and report the linked packet hash.",
+    )
+    skill_on_parser.set_defaults(to="project")
+
+    skill_off_parser = skill_subparsers.add_parser(
+        "off",
+        help="Durably pin a skill off for this repo and unlink current installs.",
+    )
+    skill_off_parser.add_argument("skill_name")
+    _add_skill_lifecycle_common(skill_off_parser)
+    _add_skill_from_scope_arg(
+        skill_off_parser,
+        help_text="Installed scope to unlink after writing pin_off.",
+    )
+    skill_off_parser.set_defaults(to="project", from_scope="project")
 
     remove_parser = skill_subparsers.add_parser("remove", help="Remove installed links/files for a skill.")
     remove_parser.add_argument("skill_name")
@@ -4212,6 +4238,252 @@ def _print_skill_override_lint_text(payload: dict[str, Any]) -> None:
         print(f"    fix: {finding.get('suggested_fix')}")
 
 
+def _override_list(policy: dict[str, Any], key: str) -> list[str]:
+    return [
+        str(item)
+        for item in policy.get(key) or []
+        if str(item).strip()
+    ]
+
+
+def _mutate_skill_pin(policy: dict[str, Any], skill_name: str, skill_action: str) -> dict[str, Any]:
+    updated = dict(policy)
+    pin_on = [item for item in _override_list(updated, "pin_on") if item != skill_name]
+    pin_off = [item for item in _override_list(updated, "pin_off") if item != skill_name]
+    if skill_action == "on":
+        pin_on.append(skill_name)
+    else:
+        pin_off.append(skill_name)
+    updated["pin_on"] = pin_on
+    updated["pin_off"] = pin_off
+    return updated
+
+
+def _pin_state(policy: dict[str, Any]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    return tuple(_override_list(policy, "pin_on")), tuple(_override_list(policy, "pin_off"))
+
+
+def _skill_pin_would_change(policy: dict[str, Any], skill_name: str, skill_action: str) -> bool:
+    return _pin_state(policy) != _pin_state(_mutate_skill_pin(policy, skill_name, skill_action))
+
+
+def _apply_skill_pin(
+    cwd: str | None,
+    skill_name: str,
+    skill_action: str,
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    current = _repo_override_policy(cwd or os.getcwd())
+    policy_path = str(current.get("_policy_path") or "")
+    would_change = _skill_pin_would_change(current, skill_name, skill_action)
+    if dry_run:
+        return {
+            "changed": False,
+            "would_change": would_change,
+            "policy_path": policy_path,
+            "pin": "pin_on" if skill_action == "on" else "pin_off",
+        }
+
+    result = update_repo_override_policy(
+        cwd or os.getcwd(),
+        lambda policy: _mutate_skill_pin(policy, skill_name, skill_action),
+    )
+    return {
+        "changed": bool(result.get("changed")),
+        "would_change": would_change,
+        "policy_path": str(result.get("_policy_path") or policy_path),
+        "pin": "pin_on" if skill_action == "on" else "pin_off",
+    }
+
+
+def _drop_same_link_actions(plan: dict[str, Any]) -> dict[str, Any]:
+    filtered = [
+        action for action in plan.get("actions") or []
+        if not (
+            action.get("op") == "link"
+            and (action.get("existing") or {}).get("state") == "same_link"
+        )
+    ]
+    if len(filtered) == len(plan.get("actions") or []):
+        return plan
+    updated = dict(plan)
+    updated["actions"] = filtered
+    updated["summary"] = _lifecycle_plan_summary(filtered, skipped=updated.get("skipped") or [])
+    return updated
+
+
+def _simulated_skill_off_plan(
+    model: dict[str, Any],
+    args: argparse.Namespace,
+    cwd_path: Path,
+) -> dict[str, Any]:
+    visibility = collect_skill_visibility(
+        model,
+        cwd=str(cwd_path),
+        include_global=True,
+        include_project=True,
+        include_sources=False,
+    )
+    skill_name = str(args.skill_name)
+    decisions = [
+        item for item in visibility.get("visibility_decisions") or []
+        if str(item.get("name") or "") != skill_name
+    ]
+    decisions.append({
+        "name": skill_name,
+        "availability": "override",
+        "state": "disabled",
+        "override_action": "pin_off",
+        "layer": "repo-override-file",
+        "winning_layer": "repo-override-file",
+    })
+    simulated_visibility = dict(visibility)
+    simulated_visibility["visibility_decisions"] = decisions
+    skipped: list[dict[str, Any]] = []
+    actions = _plan_skill_prune_actions(
+        simulated_visibility,
+        skill_name,
+        from_scope=getattr(args, "from_scope", "project"),
+        skipped=skipped,
+    )
+    deduped = _dedupe_actions(actions)
+    return {
+        "action": "off",
+        "skill": skill_name,
+        "cwd": str(cwd_path),
+        "requested_to": getattr(args, "to", "project"),
+        "resolved_to": "project",
+        "categories": getattr(args, "category", []) or [],
+        "from_scope": getattr(args, "from_scope", "project"),
+        "source_options": [],
+        "selected_source": None,
+        "activation_packet": None,
+        "warnings": [],
+        "actions": deduped,
+        "skipped": skipped,
+        "summary": _lifecycle_plan_summary(deduped, skipped=skipped),
+    }
+
+
+def _skill_packet_sha256(path: Path) -> str | None:
+    try:
+        return hashlib.sha256((path / "SKILL.md").read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _skill_toggle_verification(
+    model: dict[str, Any],
+    skill_name: str,
+    cwd_path: Path,
+    activation_packet: dict[str, Any] | None,
+) -> dict[str, Any]:
+    visibility = collect_skill_visibility(
+        model,
+        cwd=str(cwd_path),
+        include_global=True,
+        include_project=True,
+        include_sources=False,
+    )
+    effective_now = [
+        item for item in visibility.get("effective") or []
+        if str(item.get("name") or "") == skill_name
+    ]
+    packet_sha = str((activation_packet or {}).get("skill_md_sha256") or "")
+    linked: list[dict[str, Any]] = []
+    for item in visibility.get("occurrences") or []:
+        if item.get("availability") != "installed":
+            continue
+        if str(item.get("name") or "") != skill_name:
+            continue
+        path = Path(str(item.get("path") or ""))
+        resolved = path.resolve() if path.exists() else None
+        linked.append({
+            "path": str(path),
+            "is_symlink": path.is_symlink(),
+            "resolved": str(resolved) if resolved else None,
+            "skill_md_sha256": _skill_packet_sha256(resolved) if resolved else None,
+        })
+    sha_matches = bool(packet_sha) and any(
+        row.get("skill_md_sha256") == packet_sha for row in linked
+    )
+    return {
+        "verified": bool(effective_now) and sha_matches,
+        "effective_now": effective_now,
+        "symlink_resolved": linked,
+        "skill_md_sha256": packet_sha or None,
+    }
+
+
+def _handle_skill_toggle(
+    args: argparse.Namespace,
+    model: dict[str, Any],
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    skill_action = str(args.skill_action)
+    skill_name = str(args.skill_name)
+    cwd_path = Path(args.cwd or os.getcwd()).resolve()
+    requested_to = str(getattr(args, "to", "project") or "project")
+    from_scope = str(getattr(args, "from_scope", "project") or "project")
+    if requested_to != "project":
+        raise RuntimeError("skill on/off currently supports repo-local project scope only; use --to project.")
+    if skill_action == "off" and from_scope != "project":
+        raise RuntimeError("skill off currently unlinks project installs only; use --from project.")
+
+    override: dict[str, Any] | None = None
+    if skill_action == "on":
+        payload = skill_lifecycle_plan(
+            model,
+            "activate",
+            skill_name=skill_name,
+            cwd=str(cwd_path),
+            to=requested_to,
+            categories=getattr(args, "category", []) or [],
+            source=getattr(args, "source", None),
+            force=True,
+        )
+        payload = _drop_same_link_actions(payload)
+    else:
+        if dry_run:
+            payload = _simulated_skill_off_plan(model, args, cwd_path)
+        else:
+            override = _apply_skill_pin(args.cwd, skill_name, skill_action, dry_run=False)
+            payload = skill_lifecycle_plan(
+                model,
+                "prune",
+                skill_name=skill_name,
+                cwd=str(cwd_path),
+                to=requested_to,
+                from_scope=from_scope,
+            )
+            payload["action"] = "off"
+
+    if override is None:
+        override = _apply_skill_pin(args.cwd, skill_name, skill_action, dry_run=dry_run)
+    payload["action"] = skill_action
+    payload["override"] = override
+    payload["changed"] = bool(override.get("changed"))
+    payload["noop"] = not bool(override.get("would_change")) and not bool(payload.get("actions"))
+    payload = apply_skill_lifecycle_plan(
+        payload,
+        dry_run=dry_run,
+        allow_directories=bool(getattr(args, "allow_directories", False)),
+        force=bool(getattr(args, "force", False)),
+    )
+    if skill_action == "on" and bool(getattr(args, "verify", False)) and not dry_run:
+        payload["verification"] = _skill_toggle_verification(
+            model,
+            skill_name,
+            cwd_path,
+            payload.get("activation_packet"),
+        )
+    else:
+        payload["verification"] = None
+    return payload
+
+
 def _handle_skill(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
     skill_action = str(args.skill_action)
     if skill_action == "lint":
@@ -4226,6 +4498,14 @@ def _handle_skill(args: argparse.Namespace, root_dir: Path, model: dict[str, Any
         ) else EXIT_OK
 
     dry_run = bool(args.dry_run or skill_action == "plan")
+    if skill_action in {"on", "off"}:
+        payload = _handle_skill_toggle(args, model, dry_run=dry_run)
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            print_skill_lifecycle_text(payload)
+        return EXIT_OK
+
     if (
         not dry_run
         and not bool(getattr(args, "yes", False))

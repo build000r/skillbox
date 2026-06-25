@@ -1102,17 +1102,17 @@ def print_skill_lifecycle_text(payload: dict[str, Any]) -> None:
             f"{item.get('name') or item.get('skill')} "
             f"({item.get('reason')})"
         )
+    packet = payload.get("activation_packet")
     if not payload.get("actions"):
         print("actions: none")
-        return
-    print("actions:")
-    for action in payload.get("actions") or []:
-        op = action.get("op")
-        status = action.get("status") or "planned"
-        dest = action.get("destination")
-        skill = action.get("skill")
-        print(f"  - {status}: {op} {skill} -> {dest}")
-    packet = payload.get("activation_packet")
+    else:
+        print("actions:")
+        for action in payload.get("actions") or []:
+            op = action.get("op")
+            status = action.get("status") or "planned"
+            dest = action.get("destination")
+            skill = action.get("skill")
+            print(f"  - {status}: {op} {skill} -> {dest}")
     if packet:
         print("activation packet:")
         print(f"name: {packet.get('name')}")
