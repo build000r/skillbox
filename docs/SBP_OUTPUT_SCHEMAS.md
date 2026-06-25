@@ -215,7 +215,8 @@ The wrapper discovery contract. Agents should start here to learn the stable com
       "sbp restart <profile> <service> --dry-run --json",
       "sbp launch <dir> <dir> --request '<prompt>' --dry-run --json",
       "sbp bulk <dir> <dir> --request '<prompt>' --dry-run --json",
-      "sbp skill prune --dry-run"
+      "sbp skill prune --dry-run",
+      "sbp skill default on <skill> --repo --dry-run --format json"
     ]
   },
   "skill_verbs": {
@@ -240,14 +241,14 @@ The wrapper discovery contract. Agents should start here to learn the stable com
       "when_to_use": "Use for deliberate non-override link management."
     },
     "default": {
-      "do_NOT": "Do not call skill default; inspect with why and edit reviewed policy deliberately.",
+      "do_NOT": "Do not apply --global without --dry-run review and --yes; it writes operator skill-scope policy.",
       "links_disk": false,
-      "mutates": "none",
-      "purpose": "Documented non-verb: there is no implemented skill default command.",
+      "mutates": "repo_or_operator_policy",
+      "purpose": "Set repo or operator-global skill defaults with a reviewable unified diff.",
       "returns_packet": false,
-      "scope": "n/a",
-      "survives_recalibrate": false,
-      "when_to_use": "Use the row to avoid reaching for an unimplemented default verb."
+      "scope": "repo or global",
+      "survives_recalibrate": true,
+      "when_to_use": "Use --repo for a committed repo default; use --global only after dry-run review."
     },
     "heal": {
       "do_NOT": "Do not use heal when no real source exists; unknown sources are refused.",
