@@ -13,6 +13,7 @@ if str(ENV_MANAGER_DIR) not in sys.path:
     sys.path.insert(0, str(ENV_MANAGER_DIR))
 
 from runtime_manager import agent_search as SEARCH  # noqa: E402
+from runtime_manager.text_renderers import search_brain_text_lines  # noqa: E402
 
 
 def _graph() -> dict[str, object]:
@@ -113,6 +114,21 @@ class AgentSearchTests(unittest.TestCase):
         self.assertTrue(payload["hits"])
         self.assertTrue(all(hit["source"] == "graph" for hit in payload["hits"]))
         self.assertTrue(all(hit["kind"] == "service" for hit in payload["hits"]))
+
+    def test_empty_search_returns_related_suggestions(self) -> None:
+        payload = SEARCH.search_payload(
+            "apu",
+            graph=_graph(),
+            docs={"README.md": "unrelated docs only"},
+        )
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["count"], 0)
+        suggestion_ids = [item["id"] for item in payload.get("suggestions") or []]
+        self.assertIn("service:api", suggestion_ids)
+        lines = search_brain_text_lines(payload)
+        self.assertTrue(any("service:api" in line for line in lines))
+        self.assertTrue(any("manage.py search service:api" in line for line in lines))
 
     def test_missing_doc_source_and_missing_filter_source_emit_warnings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

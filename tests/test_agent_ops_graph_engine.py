@@ -112,6 +112,16 @@ class AgentGraphEngineTests(unittest.TestCase):
         self.assertEqual(payload["error"]["code"], "UNKNOWN_NODE")
         self.assertEqual(payload["error"]["details"]["node_id"], "service:missing")
 
+    def test_invalid_algorithm_typo_suggests_critical_path(self) -> None:
+        payload = ENGINE.graph_command_payload(_fixture_graph(), algorithm="critcal-path")
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["code"], "INVALID_ARGUMENT")
+        self.assertIn("critical-path", payload["error"]["details"]["suggestions"])
+        self.assertTrue(
+            any("critical-path" in action for action in payload.get("next_actions") or [])
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4041,29 +4041,11 @@ def _print_next_text(payload: dict[str, Any]) -> None:
 
 
 def _print_explain_text(payload: dict[str, Any]) -> None:
-    if "error" in payload:
-        print(payload["error"]["message"], file=sys.stderr)
-        return
-    print(f"explain: {payload['target']} ({payload['kind']})")
-    print(f"summary: {payload['summary']}")
-    relationships = payload.get("relationships") or {}
-    print(f"incoming: {relationships.get('incoming_count', 0)}")
-    print(f"outgoing: {relationships.get('outgoing_count', 0)}")
-    for command in payload.get("commands") or []:
-        print(f"command: {command['id']} - {command['summary']}")
+    print_explain_brain_text(payload)
 
 
 def _print_search_text(payload: dict[str, Any]) -> None:
-    if "error" in payload:
-        print(payload["error"]["message"], file=sys.stderr)
-        return
-    print(f"search: {payload['count']}/{payload['total_count']} hits for {payload['query']!r}")
-    for hit in payload.get("hits") or []:
-        print(f"- {hit['source']}:{hit['kind']}:{hit['id']} score={hit['score']}")
-        print(f"  {hit['snippet']}")
-        print(f"  next: {hit['next_action']}")
-    for warning in payload.get("warnings") or []:
-        print(f"warning: {warning['code']}: {warning['message']}")
+    print_search_brain_text(payload)
 
 
 def _print_snap_text(payload: dict[str, Any]) -> None:
@@ -4120,7 +4102,7 @@ def _handle_graph(args: argparse.Namespace, root_dir: Path, model: dict[str, Any
     if args.format == "json":
         emit_json(payload)
     elif "error" in payload:
-        print(payload["error"]["message"], file=sys.stderr)
+        print_graph_error_text(payload)
         return EXIT_ERROR
     else:
         print(render_graph_payload(payload, args.format))

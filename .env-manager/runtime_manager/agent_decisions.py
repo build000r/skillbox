@@ -1,6 +1,7 @@
 """Recommendation and explain engines for the agent operations brain."""
 from __future__ import annotations
 
+import difflib
 import re
 from typing import Any, Iterable, Mapping
 
@@ -10,6 +11,9 @@ from .agent_cli_hints import manage_py_command
 from .command_registry import CommandSpec, default_registry
 
 DECISIONS_SCHEMA_VERSION = "2026-06-11+agent_ops_brain.decisions"
+MAX_FUZZY_SUGGESTIONS = 5
+FUZZY_CUTOFF = 0.6
+BRAIN_TARGET_PREFIXES = ("service", "check", "skill", "mcp_tool", "bead", "command")
 BRAIN_COMMAND_TARGET_ALIASES = {
     "capabilities": "runtime.capabilities",
     "next": "brain.next",
@@ -20,7 +24,14 @@ BRAIN_COMMAND_TARGET_ALIASES = {
 }
 
 
-def _error_payload(code: str, message: str, **details: Any) -> dict[str, Any]:
+def _error_payload(
+    code: str,
+    message: str,
+    *,
+    suggestions: list[dict[str, Any]] | None = None,
+    next_actions: list[str] | None = None,
+    **details: Any,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "ok": False,
         "schema_version": DECISIONS_SCHEMA_VERSION,
@@ -33,7 +44,137 @@ def _error_payload(code: str, message: str, **details: Any) -> dict[str, Any]:
     }
     if details:
         payload["error"]["details"] = details
+    if suggestions:
+        payload["suggestions"] = suggestions[:MAX_FUZZY_SUGGESTIONS]
+    if next_actions:
+        payload["next_actions"] = next_actions
     return payload
+
+
+def _kind_from_node_id(node_id: str) -> str:
+    return node_id.split(":", 1)[0] if ":" in node_id else "command"
+
+
+def _is_bare_brain_target(target: str) -> bool:
+    text = str(target or "").strip()
+    aliased = BRAIN_COMMAND_TARGET_ALIASES.get(text, text)
+    return ":" not in aliased and "." not in aliased
+
+
+def _brain_target_corpus(graph_payload: Mapping[str, Any], registry: Mapping[str, CommandSpec] | None = None) -> list[str]:
+    nodes = _node_lookup(graph_payload)
+    reg = registry if registry is not None else _registry_by_id()
+    return sorted(set(nodes.keys()) | {f"command:{spec_id}" for spec_id in reg})
+
+
+def _bare_word_candidates(
+    word: str,
+    graph_payload: Mapping[str, Any],
+    registry: Mapping[str, CommandSpec],
+) -> list[str]:
+    nodes = _node_lookup(graph_payload)
+    found: list[str] = []
+    if word in nodes:
+        found.append(word)
+    if word in registry:
+        found.append(f"command:{word}")
+    for prefix in BRAIN_TARGET_PREFIXES:
+        candidate = f"{prefix}:{word}"
+        if candidate in nodes:
+            found.append(candidate)
+    return _dedupe_strings(found)
+
+
+def fuzzy_suggestions(
+    query: str,
+    candidate_ids: Iterable[str],
+    *,
+    limit: int = MAX_FUZZY_SUGGESTIONS,
+    cutoff: float = FUZZY_CUTOFF,
+) -> list[dict[str, Any]]:
+    """Rank near-miss ids with difflib; never auto-resolve, only suggest."""
+    query_norm = str(query or "").strip().lower()
+    if not query_norm:
+        return []
+
+    unique = sorted({str(candidate).strip() for candidate in candidate_ids if str(candidate).strip()})
+    match_keys: list[str] = []
+    key_to_id: dict[str, str] = {}
+    for node_id in unique:
+        lowered = node_id.lower()
+        match_keys.append(lowered)
+        key_to_id[lowered] = node_id
+        if ":" in node_id:
+            slug = node_id.split(":", 1)[1].lower()
+            match_keys.append(slug)
+            key_to_id.setdefault(slug, node_id)
+
+    ordered_keys = sorted(set(match_keys))
+    matches = difflib.get_close_matches(query_norm, ordered_keys, n=limit, cutoff=cutoff)
+    suggestions: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for key in matches:
+        node_id = key_to_id.get(key, key)
+        if node_id in seen_ids:
+            continue
+        seen_ids.add(node_id)
+        score = difflib.SequenceMatcher(None, query_norm, key).ratio()
+        suggestions.append(
+            {
+                "id": node_id,
+                "kind": _kind_from_node_id(node_id),
+                "score": round(score, 3),
+            }
+        )
+    return suggestions[:limit]
+
+
+def resolve_brain_target(target: str, graph_payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve explain/graph targets: exact, unique bare word, ambiguous, or unknown."""
+    raw = str(target or "").strip()
+    if not raw:
+        return {"status": "unknown", "target": raw, "suggestions": []}
+
+    normalized = BRAIN_COMMAND_TARGET_ALIASES.get(raw, raw)
+    nodes = _node_lookup(graph_payload)
+    registry = _registry_by_id()
+    corpus = _brain_target_corpus(graph_payload, registry)
+
+    if _is_bare_brain_target(raw):
+        candidates = _bare_word_candidates(normalized, graph_payload, registry)
+        if len(candidates) == 1:
+            return {
+                "status": "resolved",
+                "id": candidates[0],
+                "resolved_from": normalized,
+            }
+        if len(candidates) > 1:
+            return {
+                "status": "ambiguous",
+                "target": normalized,
+                "candidates": [
+                    {"id": candidate, "kind": _kind_from_node_id(candidate)}
+                    for candidate in candidates
+                ],
+            }
+        return {
+            "status": "unknown",
+            "target": normalized,
+            "suggestions": fuzzy_suggestions(normalized, corpus),
+        }
+
+    if normalized in nodes:
+        return {"status": "resolved", "id": normalized, "resolved_from": None}
+    if normalized.startswith("command:") and normalized.split(":", 1)[1] in registry:
+        return {"status": "resolved", "id": normalized, "resolved_from": None}
+    if normalized in registry:
+        return {"status": "resolved", "id": f"command:{normalized}", "resolved_from": None}
+
+    return {
+        "status": "unknown",
+        "target": normalized,
+        "suggestions": fuzzy_suggestions(normalized, corpus),
+    }
 
 
 def _graph_payload(graph: AgentGraph | Mapping[str, Any]) -> dict[str, Any]:
@@ -451,21 +592,6 @@ def _bead_evidence(target_id: str, adapters: Mapping[str, Any] | None) -> list[d
     return evidence
 
 
-def _target_node_id(target: str, graph_payload: Mapping[str, Any]) -> str:
-    target = str(target or "").strip()
-    target = BRAIN_COMMAND_TARGET_ALIASES.get(target, target)
-    if target in _node_lookup(graph_payload):
-        return target
-    registry = _registry_by_id()
-    if target in registry:
-        return f"command:{target}"
-    for prefix in ("service", "check", "skill", "mcp_tool", "bead", "command"):
-        candidate = f"{prefix}:{target}"
-        if candidate in _node_lookup(graph_payload):
-            return candidate
-    return target
-
-
 def explain_payload(
     graph: AgentGraph | Mapping[str, Any],
     target: str,
@@ -475,14 +601,45 @@ def explain_payload(
     """Explain a graph node or registered command."""
     graph_payload = _graph_payload(graph)
     nodes = _node_lookup(graph_payload)
-    target_id = _target_node_id(target, graph_payload)
     registry = _registry_by_id()
+    resolution = resolve_brain_target(target, graph_payload)
+
+    if resolution["status"] == "ambiguous":
+        candidates = resolution.get("candidates") or []
+        candidate_ids = [str(item.get("id") or "") for item in candidates if str(item.get("id") or "")]
+        return _error_payload(
+            "AMBIGUOUS_NODE",
+            f"ambiguous explain target: {resolution.get('target') or target}",
+            target=resolution.get("target") or target,
+            candidates=candidates,
+            suggestions=[{"id": cid, "kind": _kind_from_node_id(cid), "score": 1.0} for cid in candidate_ids[:MAX_FUZZY_SUGGESTIONS]],
+            next_actions=[
+                manage_py_command("explain", candidate_id, "--format", "json")
+                for candidate_id in candidate_ids[:3]
+            ],
+        )
+
+    if resolution["status"] != "resolved":
+        suggestions = resolution.get("suggestions") or []
+        return _error_payload(
+            "UNKNOWN_NODE",
+            f"unknown explain target: {target}",
+            target=resolution.get("target") or target,
+            suggestions=suggestions,
+            next_actions=[
+                manage_py_command("explain", item["id"], "--format", "json")
+                for item in suggestions[:3]
+            ],
+        )
+
+    target_id = str(resolution["id"])
+    resolved_from = resolution.get("resolved_from")
 
     if target_id not in nodes:
-        command_id = target_id.split(":", 1)[1] if target_id.startswith("command:") else target
+        command_id = target_id.split(":", 1)[1] if target_id.startswith("command:") else target_id
         if command_id in registry:
             spec = registry[command_id]
-            return {
+            payload = {
                 "ok": True,
                 "schema_version": DECISIONS_SCHEMA_VERSION,
                 "target": command_id,
@@ -494,7 +651,20 @@ def explain_payload(
                 "evidence": [{"source": "command_registry", "path": f"capabilities[id={command_id}]"}],
                 "next_actions": list(spec.examples),
             }
-        return _error_payload("UNKNOWN_NODE", f"unknown explain target: {target}", target=target)
+            if resolved_from:
+                payload["resolved_from"] = resolved_from
+            return payload
+        suggestions = fuzzy_suggestions(str(target), _brain_target_corpus(graph_payload, registry))
+        return _error_payload(
+            "UNKNOWN_NODE",
+            f"unknown explain target: {target}",
+            target=target,
+            suggestions=suggestions,
+            next_actions=[
+                manage_py_command("explain", item["id"], "--format", "json")
+                for item in suggestions[:3]
+            ],
+        )
 
     node = nodes[target_id]
     kind = str(node.get("kind") or "unknown")
@@ -505,7 +675,7 @@ def explain_payload(
     if kind == "bead":
         evidence.extend(_bead_evidence(target_id, adapters))
     impact = blast_radius(graph_payload, target_id) if kind in {"service", "task", "bead"} else None
-    return {
+    payload = {
         "ok": True,
         "schema_version": DECISIONS_SCHEMA_VERSION,
         "target": target_id,
@@ -527,10 +697,17 @@ def explain_payload(
             for example in spec.examples[:1]
         ),
     }
+    if resolved_from:
+        payload["resolved_from"] = resolved_from
+    return payload
 
 
 __all__ = [
     "DECISIONS_SCHEMA_VERSION",
+    "MAX_FUZZY_SUGGESTIONS",
+    "FUZZY_CUTOFF",
+    "fuzzy_suggestions",
+    "resolve_brain_target",
     "next_action_payload",
     "explain_payload",
 ]
