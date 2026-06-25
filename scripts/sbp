@@ -175,6 +175,7 @@ Skills:
   __WRAPPER__ skill why NAME          Explain visibility layers and exact fixes
   __WRAPPER__ skill on NAME           Durably pin NAME on for this repo
   __WRAPPER__ skill off NAME          Durably pin NAME off for this repo
+  __WRAPPER__ skill heal NAME         Resolve source, pin on, link, and print activation packet
   __WRAPPER__ skill sync --dry-run    Link cwd-required missing skills
   __WRAPPER__ skill prune --dry-run   Preview policy-violation unlinks
   __WRAPPER__ sync /path/to/skill     Legacy shorthand for global skill add
@@ -249,6 +250,7 @@ payload = {
         {"name": "bulk", "json": True, "safe_first_try": f"{wrapper} bulk <dir> <dir> --request '<prompt>' --dry-run --json", "alias_for": "launch"},
         {"name": "skills", "json": True, "safe_first_try": f"{wrapper} skills --issues-only --json"},
         {"name": "skill-why", "json": True, "safe_first_try": f"{wrapper} skill why <skill> --json"},
+        {"name": "skill-heal", "json": True, "safe_first_try": f"{wrapper} skill heal <skill> --dry-run --format json"},
         {"name": "candidates", "json": True, "safe_first_try": f"{wrapper} candidates --json"},
         {"name": "mcp", "json": True, "safe_first_try": f"{wrapper} mcp --json"},
         {"name": "registry", "json": True, "safe_first_try": f"{wrapper} registry doctor --json"},
