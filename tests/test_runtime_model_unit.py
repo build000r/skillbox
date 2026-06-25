@@ -348,7 +348,7 @@ class LocalRuntimeCoreModelTests(unittest.TestCase):
 
     Covers the bullet list under "Model-level" in the WG-007 brief:
       * bootstrap_task XOR-owner validation (both/neither -> LOCAL_RUNTIME_COVERAGE_GAP)
-      * All seven stable error codes are exported constants
+      * Stable local-runtime error codes are exported constants
       * Canonical constants (LOCAL_RUNTIME_START_MODES, PARITY_LEDGER_ACTIONS,
         PARITY_OWNERSHIP_STATES, CANONICAL_RUNTIME_RECORDS) are exposed
       * Flattening rules for env_files, services, bootstrap_tasks:
@@ -359,12 +359,13 @@ class LocalRuntimeCoreModelTests(unittest.TestCase):
 
     # --- stable error codes (US-1..US-4) ---------------------------------
 
-    def test_all_seven_stable_error_codes_are_exported_constants(self) -> None:
+    def test_stable_error_codes_are_exported_constants(self) -> None:
         expected = {
             "LOCAL_RUNTIME_ENV_BRIDGE_FAILED",
             "LOCAL_RUNTIME_ENV_OUTPUT_MISSING",
             "LOCAL_RUNTIME_PROFILE_UNKNOWN",
             "LOCAL_RUNTIME_START_BLOCKED",
+            "LOCAL_RUNTIME_PORT_MISMATCH",
             "LOCAL_RUNTIME_SERVICE_DEFERRED",
             "LOCAL_RUNTIME_MODE_UNSUPPORTED",
             "LOCAL_RUNTIME_COVERAGE_GAP",

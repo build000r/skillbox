@@ -6079,6 +6079,10 @@ def _apply_start_failure_error(payload: dict[str, Any], service_results: list[di
     failed_ids = _start_failure_ids(service_results)
     if not failed_ids:
         return EXIT_OK
+    specific_error = first_service_error_payload(service_results)
+    if specific_error is not None:
+        payload.update(specific_error)
+        return EXIT_ERROR
     payload.update(local_runtime_error(
         LOCAL_RUNTIME_START_BLOCKED,
         f"Some services did not become healthy: {', '.join(failed_ids)}",

@@ -364,6 +364,29 @@ def build_port_registry(model: dict[str, Any]) -> list[dict[str, Any]]:
     return entries
 
 
+def declared_service_port_entries(model: dict[str, Any], service_id: str) -> list[dict[str, Any]]:
+    """Return declared registry entries for one service, excluding warnings."""
+    target = str(service_id or "").strip()
+    if not target:
+        return []
+    return [
+        entry
+        for entry in build_port_registry(model)
+        if entry.get("owner_kind") == OWNER_KIND_SERVICE
+        and entry.get("owner_id") == target
+        and entry.get("port") is not None
+    ]
+
+
+def declared_service_ports(model: dict[str, Any], service_id: str) -> list[int]:
+    """Return declared listen ports for one service in deterministic order."""
+    return sorted({
+        int(entry["port"])
+        for entry in declared_service_port_entries(model, service_id)
+        if entry.get("port") is not None
+    })
+
+
 def _registry_warnings(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {"owner_id": e["owner_id"], "source": e["source"], "warning": e["warning"]}
@@ -462,6 +485,8 @@ __all__ = [
     "OWNER_KIND_ENV",
     "PORT_ENV_KEYS",
     "build_port_registry",
+    "declared_service_port_entries",
+    "declared_service_ports",
     "port_registry_payload",
     "port_registry_text_lines",
 ]

@@ -7,7 +7,7 @@ import tarfile
 
 from .shared import *
 from .validation import *
-from .port_registry import build_port_registry
+from .port_registry import build_port_registry, declared_service_ports
 from .pressure_report import collect_pressure_report
 from .rch_report import collect_rch_report
 from .sbh_report import collect_sbh_report
@@ -2417,6 +2417,7 @@ LOCAL_RUNTIME_ERROR_CODES = {
     "LOCAL_RUNTIME_ENV_OUTPUT_MISSING",
     "LOCAL_RUNTIME_PROFILE_UNKNOWN",
     "LOCAL_RUNTIME_START_BLOCKED",
+    "LOCAL_RUNTIME_PORT_MISMATCH",
     "LOCAL_RUNTIME_SERVICE_DEFERRED",
     "LOCAL_RUNTIME_MODE_UNSUPPORTED",
     "LOCAL_RUNTIME_COVERAGE_GAP",
@@ -2523,6 +2524,388 @@ def _external_listener_owner(host: str, port: int) -> dict[str, Any] | None:
     except OSError:
         pass
     return owner
+
+
+def _declared_ports_for_service(model: dict[str, Any], service: dict[str, Any]) -> list[int]:
+    service_id = str(service.get("id") or "").strip()
+    if not service_id:
+        return []
+    try:
+        return declared_service_ports(model, service_id)
+    except Exception:
+        declared = _service_declared_listen_port(service)
+        return [declared[1]] if declared is not None else []
+
+
+def _parse_proc_stat_ppid(stat_text: str) -> int | None:
+    _before, _sep, after = stat_text.rpartition(")")
+    fields = after.split()
+    if len(fields) < 2:
+        return None
+    try:
+        return int(fields[1])
+    except ValueError:
+        return None
+
+
+def _process_tree_pids(root_pid: int) -> set[int]:
+    pids: set[int] = {int(root_pid)}
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return pids
+
+    changed = True
+    while changed:
+        changed = False
+        for child in proc_root.iterdir():
+            if not child.name.isdigit():
+                continue
+            try:
+                pid = int(child.name)
+            except ValueError:
+                continue
+            if pid in pids:
+                continue
+            try:
+                ppid = _parse_proc_stat_ppid((child / "stat").read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+            if ppid in pids:
+                pids.add(pid)
+                changed = True
+    return pids
+
+
+def _parse_listener_port(raw_local_address: str) -> int | None:
+    value = str(raw_local_address or "").strip()
+    if not value:
+        return None
+    if value.startswith("[") and "]:" in value:
+        port_text = value.rsplit("]:", 1)[1]
+    elif ":" in value:
+        port_text = value.rsplit(":", 1)[1]
+    else:
+        return None
+    port_text = port_text.strip()
+    if port_text == "*":
+        return None
+    try:
+        return int(port_text)
+    except ValueError:
+        return None
+
+
+def _parse_ss_listener_rows(stdout: str, target_pids: set[int]) -> list[dict[str, Any]]:
+    listeners: list[dict[str, Any]] = []
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 5)
+        if len(parts) < 4:
+            continue
+        if parts[0].upper() != "LISTEN":
+            continue
+        port = _parse_listener_port(parts[3])
+        if port is None:
+            continue
+        pids = {
+            int(match.group(1))
+            for match in re.finditer(r"pid=(\d+)", parts[5] if len(parts) > 5 else "")
+        }
+        for pid in sorted(pids & target_pids):
+            listeners.append({"pid": pid, "port": port, "source": "ss"})
+    return listeners
+
+
+def _ss_process_tree_listeners(target_pids: set[int]) -> list[dict[str, Any]]:
+    if shutil.which("ss") is None:
+        return []
+    result = run_command(["ss", "-H", "-tlnp"])
+    if result.returncode != 0:
+        return []
+    return _parse_ss_listener_rows(result.stdout, target_pids)
+
+
+def _proc_net_tcp_listen_inodes(path: Path) -> dict[str, int]:
+    inodes: dict[str, int] = {}
+    try:
+        rows = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return inodes
+    for raw_line in rows[1:]:
+        parts = raw_line.split()
+        if len(parts) < 10 or parts[3] != "0A":
+            continue
+        _host_hex, _sep, port_hex = parts[1].partition(":")
+        if not port_hex:
+            continue
+        try:
+            port = int(port_hex, 16)
+        except ValueError:
+            continue
+        inode = parts[9]
+        if inode:
+            inodes[inode] = port
+    return inodes
+
+
+def _proc_socket_inode(fd_path: Path) -> str | None:
+    try:
+        target = os.readlink(fd_path)
+    except OSError:
+        return None
+    match = re.fullmatch(r"socket:\[(\d+)\]", target)
+    return match.group(1) if match else None
+
+
+def _proc_process_tree_listeners(target_pids: set[int]) -> list[dict[str, Any]]:
+    inode_to_port: dict[str, int] = {}
+    inode_to_port.update(_proc_net_tcp_listen_inodes(Path("/proc/net/tcp")))
+    inode_to_port.update(_proc_net_tcp_listen_inodes(Path("/proc/net/tcp6")))
+    if not inode_to_port:
+        return []
+
+    listeners: list[dict[str, Any]] = []
+    seen: set[tuple[int, int]] = set()
+    for pid in sorted(target_pids):
+        fd_dir = Path("/proc") / str(pid) / "fd"
+        try:
+            fd_paths = list(fd_dir.iterdir())
+        except OSError:
+            continue
+        for fd_path in fd_paths:
+            inode = _proc_socket_inode(fd_path)
+            if inode is None or inode not in inode_to_port:
+                continue
+            port = inode_to_port[inode]
+            key = (pid, port)
+            if key in seen:
+                continue
+            seen.add(key)
+            listeners.append({"pid": pid, "port": port, "source": "proc"})
+    return listeners
+
+
+def _process_tree_listener_snapshot(pid: int) -> dict[str, Any]:
+    pids = _process_tree_pids(pid)
+    listeners = _ss_process_tree_listeners(pids)
+    source = "ss"
+    if not listeners:
+        listeners = _proc_process_tree_listeners(pids)
+        source = "proc"
+    observed_ports = sorted({int(listener["port"]) for listener in listeners if listener.get("port") is not None})
+    return {
+        "pid": pid,
+        "pids": sorted(pids),
+        "listeners": listeners,
+        "observed_ports": observed_ports,
+        "source": source,
+    }
+
+
+def _service_port_guard_disabled() -> bool:
+    return str(os.environ.get("SKILLBOX_PORT_GUARD") or "").strip().lower() == "off"
+
+
+def _verify_service_declared_ports(
+    model: dict[str, Any],
+    service: dict[str, Any],
+    pid: int | None,
+    *,
+    attempts: int = 3,
+    sleep_seconds: float = 1.0,
+) -> dict[str, Any]:
+    declared_ports = _declared_ports_for_service(model, service)
+    if not declared_ports:
+        return {"state": "not-declared", "declared_ports": []}
+    if _service_port_guard_disabled():
+        return {"state": "skipped", "reason": "SKILLBOX_PORT_GUARD=off", "declared_ports": declared_ports}
+    if pid is None:
+        return {
+            "state": "unknown",
+            "reason": "pid unavailable",
+            "declared_ports": declared_ports,
+            "observed_ports": [],
+        }
+
+    attempts = max(1, int(attempts))
+    declared = set(declared_ports)
+    snapshot: dict[str, Any] = {
+        "pid": pid,
+        "pids": [pid],
+        "listeners": [],
+        "observed_ports": [],
+        "source": "unknown",
+    }
+    for attempt in range(1, attempts + 1):
+        snapshot = _process_tree_listener_snapshot(pid)
+        observed_ports = sorted({int(port) for port in snapshot.get("observed_ports") or []})
+        matches = sorted(declared & set(observed_ports))
+        if matches:
+            return {
+                "state": "ok",
+                "declared_ports": declared_ports,
+                "observed_ports": observed_ports,
+                "verified_port": matches[0],
+                "verified_ports": matches,
+                "pid": pid,
+                "process_pids": snapshot.get("pids") or [pid],
+                "listeners": snapshot.get("listeners") or [],
+                "source": snapshot.get("source"),
+                "attempts": attempt,
+            }
+        if attempt < attempts:
+            time.sleep(sleep_seconds)
+
+    return {
+        "state": "mismatch",
+        "declared_ports": declared_ports,
+        "observed_ports": sorted({int(port) for port in snapshot.get("observed_ports") or []}),
+        "pid": pid,
+        "process_pids": snapshot.get("pids") or [pid],
+        "listeners": snapshot.get("listeners") or [],
+        "source": snapshot.get("source"),
+        "attempts": attempts,
+    }
+
+
+def _port_mismatch_next_actions(service: dict[str, Any]) -> list[str]:
+    sid = str(service.get("id") or "<service>")
+    return [
+        f"free the declared port and re-run `sbp up {sid}`",
+        "fix the service command/env so it binds the declared registry port",
+        "run `manage.py ports --resolve " + sid + " --format json` to inspect the contract",
+    ]
+
+
+def _port_mismatch_error(service: dict[str, Any], verification: dict[str, Any]) -> dict[str, Any]:
+    sid = str(service.get("id") or "<service>")
+    declared = verification.get("declared_ports") or []
+    observed = verification.get("observed_ports") or []
+    next_actions = _port_mismatch_next_actions(service)
+    err = local_runtime_error(
+        LOCAL_RUNTIME_PORT_MISMATCH,
+        (
+            f"Service {sid!r} did not listen on its declared port(s) "
+            f"{declared}; observed process-tree port(s): {observed or 'none'}."
+        ),
+        recoverable=True,
+        blocked_services=[sid],
+        next_action=next_actions[0],
+    )
+    err["error"].update({
+        "service": sid,
+        "declared_ports": declared,
+        "observed_ports": observed,
+        "process_pids": verification.get("process_pids") or [],
+        "listeners": verification.get("listeners") or [],
+        "next_actions": next_actions,
+    })
+    return err
+
+
+def _copy_port_verification_fields(detail: dict[str, Any], verification: dict[str, Any]) -> None:
+    if verification.get("state") in {"not-declared", "skipped"}:
+        return
+    detail["port_verification"] = {
+        key: verification[key]
+        for key in (
+            "state",
+            "declared_ports",
+            "observed_ports",
+            "verified_port",
+            "verified_ports",
+            "process_pids",
+            "source",
+            "attempts",
+            "reason",
+        )
+        if key in verification
+    }
+    if verification.get("verified_port") is not None:
+        detail["verified_port"] = verification["verified_port"]
+    if verification.get("verified_ports"):
+        detail["verified_ports"] = verification["verified_ports"]
+
+
+def _unverified_reuse_mismatch(
+    model: dict[str, Any],
+    service: dict[str, Any],
+    pid: int | None,
+    reason: str,
+) -> dict[str, Any] | None:
+    declared_ports = _declared_ports_for_service(model, service)
+    if not declared_ports or _service_port_guard_disabled():
+        return None
+    verification: dict[str, Any] = {
+        "state": "mismatch",
+        "reason": reason,
+        "declared_ports": declared_ports,
+        "observed_ports": [],
+        "process_pids": [pid] if pid is not None else [],
+        "listeners": [],
+        "source": "unverified-reuse",
+        "attempts": 0,
+    }
+    if pid is not None:
+        verification["pid"] = pid
+    return verification
+
+
+def first_service_error_payload(service_results: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for entry in service_results:
+        error_block = entry.get("error")
+        if not isinstance(error_block, dict):
+            continue
+        error_type = str(error_block.get("type") or "").strip()
+        if error_type.startswith("LOCAL_RUNTIME_"):
+            return {"error": copy.deepcopy(error_block)}
+    return None
+
+
+def _service_port_mismatch_result(
+    service: dict[str, Any],
+    result: dict[str, Any],
+    paths: dict[str, Path],
+    pid: int | None,
+    verification: dict[str, Any],
+    event_root: Path,
+    *,
+    remove_pid: bool,
+) -> dict[str, Any]:
+    stop_result: str | None = None
+    signal_used: int | None = None
+    if pid is not None:
+        stop_result, signal_used = stop_process(pid, DEFAULT_SERVICE_STOP_WAIT_SECONDS)
+    if remove_pid:
+        remove_pid_file(paths["pid_file"])
+
+    detail = result | {
+        "result": "failed",
+        "reason": "port_mismatch",
+        "tail": tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES),
+    }
+    if pid is not None:
+        detail["pid"] = pid
+    if stop_result is not None:
+        detail["stop_result"] = stop_result
+    if signal_used is not None:
+        detail["signal"] = signal_used
+    _copy_port_verification_fields(detail, verification)
+    detail.update(_port_mismatch_error(service, verification))
+    log_runtime_event(
+        "service.port_mismatch",
+        service["id"],
+        {
+            "declared": verification.get("declared_ports") or [],
+            "observed": verification.get("observed_ports") or [],
+            "action": "stopped" if pid is not None else "blocked",
+            "stop_result": stop_result,
+        },
+        root_dir=event_root,
+    )
+    return detail
 
 
 def _port_conflict_blocked_result(
@@ -3720,13 +4103,31 @@ def _service_start_base_result(service: dict[str, Any], paths: dict[str, Path]) 
 
 
 def _prelaunch_running_result(
+    model: dict[str, Any],
     service: dict[str, Any],
     result: dict[str, Any],
+    paths: dict[str, Path],
     event_root: Path,
 ) -> dict[str, Any] | None:
     prelaunch_health = service_healthcheck_state(service)
     if prelaunch_health.get("state") != "ok":
         return None
+    unverified = _unverified_reuse_mismatch(
+        model,
+        service,
+        None,
+        "healthcheck was already healthy before runtime launched the service",
+    )
+    if unverified is not None:
+        return _service_port_mismatch_result(
+            service,
+            result,
+            paths,
+            None,
+            unverified,
+            event_root,
+            remove_pid=False,
+        )
     reused_result = result | {"result": "already-running"}
     for key in ("url", "target", "port"):
         if key in prelaunch_health:
@@ -3741,6 +4142,7 @@ def _service_has_declared_healthcheck(service: dict[str, Any]) -> bool:
 
 
 def _running_pid_service_result(
+    model: dict[str, Any],
     service: dict[str, Any],
     result: dict[str, Any],
     paths: dict[str, Path],
@@ -3756,6 +4158,18 @@ def _running_pid_service_result(
     if health_state.get("state") == "ok":
         reused_result = result | {"result": "already-running", "pid": pid}
         _copy_health_fields(reused_result, health_state, ("url", "target", "port", "pattern"))
+        verification = _verify_service_declared_ports(model, service, pid)
+        if verification.get("state") == "mismatch":
+            return _service_port_mismatch_result(
+                service,
+                result,
+                paths,
+                pid,
+                verification,
+                event_root,
+                remove_pid=True,
+            )
+        _copy_port_verification_fields(reused_result, verification)
         log_runtime_event("service.reused", service["id"], root_dir=event_root)
         return reused_result
 
@@ -3905,6 +4319,7 @@ def _timeout_service_start_result(
 
 
 def _self_managed_reused_result(
+    model: dict[str, Any],
     service: dict[str, Any],
     result: dict[str, Any],
     paths: dict[str, Path],
@@ -3917,23 +4332,53 @@ def _self_managed_reused_result(
         _copy_health_fields(detail, health_state, ("exit_code", "target"))
         log_runtime_event("service.start_failed", service["id"], {"state": "failed"}, root_dir=event_root)
         return detail
+    verification = _verify_service_declared_ports(model, service, started_pid)
+    if verification.get("state") == "mismatch":
+        return _service_port_mismatch_result(
+            service,
+            result,
+            paths,
+            started_pid,
+            verification,
+            event_root,
+            remove_pid=True,
+        )
     started_detail = result | {"result": "started", "pid": started_pid}
     _copy_health_fields(started_detail, health_state, ("target",))
+    _copy_port_verification_fields(started_detail, verification)
     log_runtime_event("service.started", service["id"], {"pid": started_pid}, root_dir=event_root)
     return started_detail
 
 
 def _reused_existing_service_result(
+    model: dict[str, Any],
     service: dict[str, Any],
     result: dict[str, Any],
     paths: dict[str, Path],
+    process: subprocess.Popen[str],
     health_state: dict[str, Any],
     self_managed_pid_file: bool,
     event_root: Path,
 ) -> dict[str, Any]:
     if self_managed_pid_file:
-        return _self_managed_reused_result(service, result, paths, health_state, event_root)
+        return _self_managed_reused_result(model, service, result, paths, health_state, event_root)
     remove_pid_file(paths["pid_file"])
+    unverified = _unverified_reuse_mismatch(
+        model,
+        service,
+        process.pid,
+        "launcher exited before owning a declared listener",
+    )
+    if unverified is not None:
+        return _service_port_mismatch_result(
+            service,
+            result,
+            paths,
+            process.pid,
+            unverified,
+            event_root,
+            remove_pid=True,
+        )
     reused_result = result | {"result": "already-running"}
     _copy_health_fields(reused_result, health_state, ("url", "target"))
     log_runtime_event("service.reused", service["id"], root_dir=event_root)
@@ -3941,6 +4386,7 @@ def _reused_existing_service_result(
 
 
 def _healthy_service_start_result(
+    model: dict[str, Any],
     service: dict[str, Any],
     result: dict[str, Any],
     paths: dict[str, Path],
@@ -3952,6 +4398,18 @@ def _healthy_service_start_result(
     started_detail = result | {"result": "started"}
     if started_pid is not None:
         started_detail["pid"] = started_pid
+    verification = _verify_service_declared_ports(model, service, started_pid)
+    if verification.get("state") == "mismatch":
+        return _service_port_mismatch_result(
+            service,
+            result,
+            paths,
+            started_pid,
+            verification,
+            event_root,
+            remove_pid=not self_managed_pid_file,
+        )
+    _copy_port_verification_fields(started_detail, verification)
     log_runtime_event(
         "service.started",
         service["id"],
@@ -3963,6 +4421,7 @@ def _healthy_service_start_result(
 
 
 def _service_health_start_result(
+    model: dict[str, Any],
     service: dict[str, Any],
     result: dict[str, Any],
     paths: dict[str, Path],
@@ -3986,14 +4445,16 @@ def _service_health_start_result(
         return _timeout_service_start_result(service, result, paths, process, health_state, event_root)
     if health_state.get("reused_existing"):
         return _reused_existing_service_result(
+            model,
             service,
             result,
             paths,
+            process,
             health_state,
             self_managed_pid_file,
             event_root,
         )
-    return _healthy_service_start_result(service, result, paths, process, self_managed_pid_file, event_root)
+    return _healthy_service_start_result(model, service, result, paths, process, self_managed_pid_file, event_root)
 
 
 def _start_service(
@@ -4014,6 +4475,7 @@ def _start_service(
     pid = live_service_pid(paths["pid_file"])
     if pid is not None:
         running_result = _running_pid_service_result(
+            model,
             service,
             result,
             paths,
@@ -4024,7 +4486,7 @@ def _start_service(
         if running_result is not None:
             return running_result
 
-    prelaunch_result = _prelaunch_running_result(service, result, event_root)
+    prelaunch_result = _prelaunch_running_result(model, service, result, paths, event_root)
     if prelaunch_result is not None:
         return prelaunch_result
 
@@ -4047,6 +4509,7 @@ def _start_service(
     if not self_managed_pid_file:
         _write_managed_service_pid(process, paths["pid_file"])
     return _service_health_start_result(
+        model,
         service,
         result,
         paths,
@@ -4087,7 +4550,7 @@ def _already_running_short_circuit(
     base = _service_start_base_result(service, paths)
     pid = live_service_pid(paths["pid_file"])
     if pid is None:
-        prelaunch = _prelaunch_running_result(service, base, event_root)
+        prelaunch = _prelaunch_running_result(model, service, base, paths, event_root)
         return _annotate_degraded_deps(prelaunch, blocked_on)
     if not _service_has_declared_healthcheck(service):
         return _annotate_degraded_deps(base | {"result": "already-running", "pid": pid}, blocked_on)
@@ -4096,6 +4559,21 @@ def _already_running_short_circuit(
         return None
     reused_result = base | {"result": "already-running", "pid": pid}
     _copy_health_fields(reused_result, health_state, ("url", "target", "port", "pattern"))
+    verification = _verify_service_declared_ports(model, service, pid)
+    if verification.get("state") == "mismatch":
+        return _annotate_degraded_deps(
+            _service_port_mismatch_result(
+                service,
+                base,
+                paths,
+                pid,
+                verification,
+                event_root,
+                remove_pid=True,
+            ),
+            blocked_on,
+        )
+    _copy_port_verification_fields(reused_result, verification)
     log_runtime_event("service.reused", service["id"], root_dir=event_root)
     return _annotate_degraded_deps(reused_result, blocked_on)
 

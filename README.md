@@ -416,6 +416,7 @@ in `status` and `doctor`.
 |------|------|
 | `LOCAL_RUNTIME_PROFILE_UNKNOWN` | Requested profile has no declared services |
 | `LOCAL_RUNTIME_START_BLOCKED` | Dependency or readiness blocks launch |
+| `LOCAL_RUNTIME_PORT_MISMATCH` | Started or reused service process did not bind its declared runtime port |
 | `LOCAL_RUNTIME_SERVICE_DEFERRED` | Requested surface is in the parity ledger but not covered |
 | `LOCAL_RUNTIME_MODE_UNSUPPORTED` | Start mode not declared for a requested service |
 | `LOCAL_RUNTIME_COVERAGE_GAP` | Declared ledger and covered set have drifted |
