@@ -111,6 +111,14 @@ class GlobalContractLintTests(unittest.TestCase):
         self.assertEqual(len(expected), 14)
         self.assertTrue(set(DISPATCHER_CORE).issubset(expected))
 
+    def test_dispatcher_core_is_the_floor_not_all_operator_globals(self) -> None:
+        expected = _derived_global_skills(_consistent_policy())
+
+        self.assertEqual(set(DISPATCHER_CORE), {"smart", "sbp"})
+        self.assertTrue(set(DISPATCHER_CORE).issubset(expected))
+        self.assertTrue(set(OPERATOR_EXCEPTIONS).issubset(expected))
+        self.assertTrue(set(DISPATCHER_CORE).isdisjoint(OPERATOR_EXCEPTIONS))
+
     def test_lint_green_on_consistent_policy(self) -> None:
         results = validate_global_skill_contract(_consistent_policy())
         self.assertEqual(self._statuses(results), ["pass"], results[0].details)

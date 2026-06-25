@@ -24,9 +24,16 @@ if str(ENV_MANAGER_DIR) not in sys.path:
 from runtime_manager import policy_eval as POLICY_EVAL  # noqa: E402
 from runtime_manager import cli as RUNTIME_CLI  # noqa: E402
 from runtime_manager import skill_visibility as SKILL_VISIBILITY  # noqa: E402
-from runtime_manager.errors import OVERRIDE_PARSE_ERROR  # noqa: E402
+from runtime_manager._skill_common import DISPATCHER_CORE  # noqa: E402
+from runtime_manager.errors import (  # noqa: E402
+    OVERRIDE_PARSE_ERROR,
+    OVERRIDE_REFUSED_FLOOR,
+    OVERRIDE_REFUSED_GLOBAL_ESCALATION,
+    ValidationError,
+)
 from runtime_manager.policy_eval import (  # noqa: E402
     OverrideWriteLockTimeout,
+    _global_override_refusal_context,
     _repo_override_policy,
     update_repo_override_policy,
 )
@@ -91,6 +98,31 @@ def _write_scope_policy(root: Path, source_root: Path, skill_name: str, allowed_
         "rules:\n"
         "  - id: skill-scope\n"
         f"    skills: [{skill_name}]\n"
+        f"    paths: [{allowed_path}]\n",
+        encoding="utf-8",
+    )
+    return {
+        "env": {"SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root)},
+        "clients": [],
+        "skills": [],
+    }
+
+
+def _write_global_floor_policy(root: Path, source_root: Path, skill_name: str, allowed_path: Path) -> dict[str, object]:
+    clients_root = root / "clients"
+    clients_root.mkdir(exist_ok=True)
+    (root / "skill-scope.yaml").write_text(
+        "version: 1\n"
+        "skill_source_roots:\n"
+        f"  - {source_root}\n"
+        "global_allowlist: [smart, sbp]\n"
+        "rules:\n"
+        "  - id: dispatcher-global\n"
+        "    skills: [smart, sbp]\n"
+        "    allow_global: true\n"
+        "  - id: local-default-off\n"
+        f"    skills: [{skill_name}]\n"
+        "    default: off\n"
         f"    paths: [{allowed_path}]\n",
         encoding="utf-8",
     )
@@ -576,6 +608,79 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
             self.assertEqual({action["status"] for action in applied["actions"]}, {"unlinked"})
             self.assertFalse(claude_link.exists())
             self.assertFalse(codex_link.exists())
+
+    def test_skill_off_refuses_dispatcher_floor_before_write(self) -> None:
+        for floor_skill in DISPATCHER_CORE:
+            with self.subTest(floor_skill=floor_skill):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    repo = _make_repo(Path(tmpdir))
+                    _write_override(repo, "version: 1\npin_on: [alpha]\n")
+                    before = (repo / ".skillbox" / "skill-overrides.yaml").read_bytes()
+                    args = _skill_toggle_args(repo, "off", floor_skill)
+
+                    with self.assertRaises(ValidationError) as caught:
+                        RUNTIME_CLI._handle_skill_toggle(args, {}, dry_run=False)
+
+                    self.assertEqual(caught.exception.code, OVERRIDE_REFUSED_FLOOR)
+                    self.assertEqual(
+                        (repo / ".skillbox" / "skill-overrides.yaml").read_bytes(),
+                        before,
+                    )
+
+    def test_skill_on_global_refuses_non_global_skill_before_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            source_root = root / "sources"
+            _write_source_skill(source_root, "alpha")
+            model = _write_global_floor_policy(root, source_root, "alpha", repo)
+            args = _skill_toggle_args(repo, "on", "alpha", to="global")
+
+            with self.assertRaises(ValidationError) as caught:
+                RUNTIME_CLI._handle_skill_toggle(args, model, dry_run=False)
+
+            self.assertEqual(caught.exception.code, OVERRIDE_REFUSED_GLOBAL_ESCALATION)
+            self.assertEqual(caught.exception.context["scope_rule"], "local-default-off")
+            self.assertEqual(caught.exception.context["scope_rule_allow_global"], False)
+            self.assertEqual(caught.exception.context["allowed_global_patterns"], ["sbp", "smart"])
+            self.assertFalse((repo / ".skillbox" / "skill-overrides.yaml").exists())
+
+    def test_skill_on_local_default_off_skill_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            fake_home = root / "home"
+            source_root = root / "sources"
+            _write_source_skill(source_root, "alpha")
+            model = _write_global_floor_policy(root, source_root, "alpha", repo)
+            args = _skill_toggle_args(repo, "on", "alpha")
+
+            with mock.patch("runtime_manager.skill_visibility.Path.home", return_value=fake_home):
+                payload = RUNTIME_CLI._handle_skill_toggle(args, model, dry_run=False)
+
+            policy = _repo_override_policy(repo)
+            self.assertEqual(policy["pin_on"], ["alpha"])
+            self.assertTrue(payload["changed"])
+            self.assertEqual(payload["summary"]["link"], 2)
+
+    def test_skill_on_parser_accepts_global_alias(self) -> None:
+        parser = RUNTIME_CLI._build_parser()
+        args = parser.parse_args(["skill", "on", "alpha", "--global"])
+        self.assertEqual(args.to, "global")
+
+    def test_global_override_refusal_context_uses_allow_global_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = _make_repo(root)
+            source_root = root / "sources"
+            _write_source_skill(source_root, "alpha")
+            model = _write_global_floor_policy(root, source_root, "alpha", repo)
+
+            alpha_context = _global_override_refusal_context(model, "alpha")
+            self.assertEqual(alpha_context["scope_rule"], "local-default-off")
+            self.assertEqual(alpha_context["scope_policy_path"], str(root / "skill-scope.yaml"))
+            self.assertEqual(alpha_context["allowed_global_patterns"], ["sbp", "smart"])
+            self.assertIsNone(_global_override_refusal_context(model, "sbp"))
 
     def test_overlay_precedence_cli_env_repo_operator_base_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
