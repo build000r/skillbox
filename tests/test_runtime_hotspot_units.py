@@ -642,6 +642,10 @@ class RuntimePortVerificationTests(unittest.TestCase):
                     return_value=["env: ok"],
                 ),
                 mock.patch(
+                    "runtime_manager.runtime_ops.sync_port_contracts",
+                    return_value=["port-contracts: ok"],
+                ),
+                mock.patch(
                     "runtime_manager.runtime_ops.sync_skill_repo_sets",
                     return_value=["skill-repos: ok"],
                 ),
@@ -671,6 +675,7 @@ class RuntimePortVerificationTests(unittest.TestCase):
                 f"exists: {existing_repo}",
                 "artifact: ok",
                 "env: ok",
+                "port-contracts: ok",
                 f"ensure-directory: {log_dir}",
                 "skill-repos: ok",
                 "distributors: ok",
@@ -1173,6 +1178,7 @@ class RuntimeScanHotspotTests(unittest.TestCase):
             mock.patch("runtime_manager.runtime_ops.validate_bridges", return_value=[]),
             mock.patch("runtime_manager.runtime_ops.validate_ingress", return_value=[]),
             mock.patch("runtime_manager.runtime_ops.validate_port_registry", return_value=[]),
+            mock.patch("runtime_manager.runtime_ops.validate_port_contracts", return_value=[]),
         ):
             results = runtime_ops_module.doctor_results({}, Path("/repo"))
 

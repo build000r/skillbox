@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -308,6 +309,153 @@ class DoctorCheckTests(unittest.TestCase):
         )
         results = OPS.validate_port_registry(model)
         self.assertTrue(any(r.code == OPS.PORT_COLLISION and r.status == "fail" for r in results))
+
+
+class PortContractTests(unittest.TestCase):
+    def _contract_model(self, repo_path: Path, *, port: int = 5173) -> dict[str, object]:
+        return _model(
+            env={},
+            repos=[
+                {
+                    "id": "app",
+                    "host_path": str(repo_path),
+                    "source": {"kind": "directory"},
+                }
+            ],
+            services=[
+                {
+                    "id": "web",
+                    "kind": "http",
+                    "repo": "app",
+                    "profiles": ["core"],
+                    "command": f"npm run dev -- --host 127.0.0.1 --port {port}",
+                    "healthcheck": {"type": "http", "url": f"http://127.0.0.1:{port}/health"},
+                }
+            ],
+            parity_ledger=[],
+        )
+
+    def test_sync_port_contract_writes_updates_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_path = Path(tmpdir) / "app"
+            repo_path.mkdir()
+            target = repo_path / OPS.PORT_CONTRACT_FILE_NAME
+
+            model = self._contract_model(repo_path, port=5173)
+            actions = OPS.sync_port_contracts(model, dry_run=False)
+            self.assertEqual(actions, [f"render-port-contract: {target} (1 service(s))"])
+            text = target.read_text(encoding="utf-8")
+            self.assertIn("PORT=5173\n", text)
+            self.assertIn("HOST=127.0.0.1\n", text)
+            self.assertIn("SKILLBOX_SERVICE_ID=web\n", text)
+            self.assertIn("SKILLBOX_PORT_SOURCE=workspace/runtime.yaml:healthcheck.url\n", text)
+
+            self.assertEqual(
+                OPS.sync_port_contracts(model, dry_run=False),
+                [f"port-contract-unchanged: {target}"],
+            )
+
+            updated_model = self._contract_model(repo_path, port=5174)
+            OPS.sync_port_contracts(updated_model, dry_run=False)
+            self.assertIn("PORT=5174\n", target.read_text(encoding="utf-8"))
+
+    def test_sync_port_contract_skips_non_covered_service(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_path = Path(tmpdir) / "app"
+            repo_path.mkdir()
+            model = self._contract_model(repo_path)
+            model["parity_ledger"] = [
+                {
+                    "id": "web",
+                    "legacy_surface": "web",
+                    "surface_type": "service",
+                    "ownership_state": "external",
+                }
+            ]
+
+            self.assertEqual(OPS.sync_port_contracts(model, dry_run=False), [])
+            self.assertFalse((repo_path / OPS.PORT_CONTRACT_FILE_NAME).exists())
+
+    def test_validate_port_contracts_warns_for_unadopted_and_is_suppressible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_path = Path(tmpdir) / "app"
+            repo_path.mkdir()
+            model = self._contract_model(repo_path)
+            OPS.sync_port_contracts(model, dry_run=False)
+
+            results = OPS.validate_port_contracts(model)
+            codes = {result.code for result in results}
+            self.assertIn(OPS.PORT_CONTRACT_UNADOPTED, codes)
+            self.assertIn(OPS.PORT_CONTRACT_GITIGNORE, codes)
+            unadopted = next(result for result in results if result.code == OPS.PORT_CONTRACT_UNADOPTED)
+            self.assertIn("strictPort", unadopted.details["adoption_snippet"])
+            gitignore = next(result for result in results if result.code == OPS.PORT_CONTRACT_GITIGNORE)
+            self.assertEqual(gitignore.details["exact_line"], OPS.PORT_CONTRACT_FILE_NAME)
+
+            service = model["services"][0]
+            service["port_contract"] = {"suppress_advisory": True}
+            suppressed_codes = {result.code for result in OPS.validate_port_contracts(model)}
+            self.assertNotIn(OPS.PORT_CONTRACT_UNADOPTED, suppressed_codes)
+            self.assertIn(OPS.PORT_CONTRACT_GITIGNORE, suppressed_codes)
+
+            service["port_contract"] = {}
+            (repo_path / ".gitignore").write_text(f"{OPS.PORT_CONTRACT_FILE_NAME}\n", encoding="utf-8")
+            (repo_path / "vite.config.ts").write_text(
+                "import 'dotenv/config';\n"
+                "export default { server: { host: process.env.HOST, "
+                "port: Number(process.env.PORT), strictPort: true } };\n",
+                encoding="utf-8",
+            )
+            clean_results = OPS.validate_port_contracts(model)
+            self.assertEqual([result.code for result in clean_results], ["port-contracts"])
+
+            target = repo_path / OPS.PORT_CONTRACT_FILE_NAME
+            target.write_text("PORT=9999\n", encoding="utf-8")
+            stale_results = OPS.validate_port_contracts(model)
+            self.assertEqual([result.code for result in stale_results], [OPS.PORT_CONTRACT_STALE])
+            self.assertEqual(stale_results[0].details["state"], "stale")
+
+    def test_multi_service_contract_uses_marked_default_without_duplicate_extra_var(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_path = Path(tmpdir) / "app"
+            repo_path.mkdir()
+            model = self._contract_model(repo_path)
+            model["services"] = [
+                {
+                    "id": "auth",
+                    "kind": "http",
+                    "repo": "app",
+                    "profiles": ["core"],
+                    "healthcheck": {"type": "http", "url": "http://127.0.0.1:3301/health"},
+                    "port_contract": {"suppress_advisory": True},
+                },
+                {
+                    "id": "web",
+                    "kind": "http",
+                    "repo": "app",
+                    "profiles": ["core"],
+                    "healthcheck": {"type": "http", "url": "http://127.0.0.1:5173/health"},
+                    "port_contract": {"default": True},
+                },
+            ]
+
+            OPS.sync_port_contracts(model, dry_run=False)
+            text = (repo_path / OPS.PORT_CONTRACT_FILE_NAME).read_text(encoding="utf-8")
+            self.assertIn("PORT=5173\n", text)
+            self.assertIn("SKILLBOX_SERVICE_ID=web\n", text)
+            self.assertIn("SKILLBOX_AUTH_PORT=3301\n", text)
+            self.assertNotIn("SKILLBOX_WEB_PORT=5173\n", text)
+
+    def test_http_client_blueprints_include_strict_port_contract_hint(self) -> None:
+        blueprint_dir = ROOT_DIR / "workspace" / "client-blueprints"
+        for name in (
+            "git-repo-http-service.yaml",
+            "git-repo-http-service-bootstrap.yaml",
+            "git-repo-http-service-bootstrap-spaps-auth.yaml",
+        ):
+            text = (blueprint_dir / name).read_text(encoding="utf-8")
+            self.assertIn(OPS.PORT_CONTRACT_FILE_NAME, text, name)
+            self.assertIn("strictPort", text, name)
 
 
 class CapabilitiesTests(unittest.TestCase):
