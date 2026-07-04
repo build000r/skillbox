@@ -100,10 +100,13 @@ notification mechanism is available.
 
 ## Network Posture
 
-Managed boxes default to `tailnet_only`. Public SSH closes after Tailscale
-enrollment (lockdown stage). Use `posture-proof <box-id>` to verify, and
-`box status` to see violations. Do not bind services to `0.0.0.0` on
-tailnet-only boxes — use loopback or Tailnet IP. See
+Managed boxes default to `tailnet_only`: public SSH is a temporary bootstrap
+aperture through `enroll`; after Tailscale enrollment succeeds, `box.py` locks
+host SSH to Tailnet access and updates the DigitalOcean firewall so inbound
+public SSH is closed. `posture-proof` verifies the box-level result with
+`public_ssh_probe`, `tailnet_probe`, `cloud_firewall_rules`, and `violations`;
+service bind exposure is verified by the runtime exposure lint. Do not bind
+services to `0.0.0.0` on tailnet-only boxes — use loopback or Tailnet IP. See
 `docs/tailnet-only-lifecycle.md` for recovery and exposure rules.
 
 ## Coding Notes

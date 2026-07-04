@@ -56,7 +56,7 @@ right client context without standing up a full hosted workspace control plane.
 
 | Need | `skillbox` answer |
 |---|---|
-| Private access without public SSH exposure | Tailscale host access plus host hardening scripts |
+| Private access without public SSH exposure | Managed boxes default to `tailnet_only`: public SSH is temporary during bootstrap/enroll, then host SSH and the DigitalOcean firewall are locked to Tailnet access |
 | A workspace that feels like a narrowed local setup | One bind-mounted `/workspace`, plus durable state from `SKILLBOX_STATE_ROOT` mounted into `/workspace/logs`, `/workspace/workspace/clients`, `/home/sandbox`, and optional `/monoserver` |
 | A sane way to let the box grow over time | `workspace/runtime.yaml` plus `.env-manager/manage.py` manage the core machine plus client-specific repos, artifacts, installed skills, logs, and checks |
 | Service graphs that do not devolve into shell folklore | Declared `depends_on` edges let `up`, `down`, and `restart` expand and order service graphs automatically |
@@ -525,7 +525,7 @@ Safety model:
 
 - the swimmers port is `3210`
 - the compose overlay publishes only to `127.0.0.1` by default
-- remote access requires opting in with `SKILLBOX_SWIMMERS_PUBLISH_HOST=0.0.0.0` (the helper exports this as `SWIMMERS_BIND`)
+- wildcard remote access is an explicit exposure exception: it requires opting in with `SKILLBOX_SWIMMERS_PUBLISH_HOST=0.0.0.0` (the helper exports this as `SWIMMERS_BIND`) and should not be treated as clean `tailnet_only` posture
 - remote box helpers only promote loopback defaults to public bind when `SKILLBOX_SWIMMERS_EXPOSE=1` is set
 - non-loopback publishing is blocked unless `SKILLBOX_SWIMMERS_AUTH_MODE=token` and `SKILLBOX_SWIMMERS_AUTH_TOKEN` are set
 - remote box status prints the canonical phone/browser URL as `Open this on phone: http://<tailnet-ip>:3210/` and separately reports public SSH, Tailnet ping, MagicDNS resolution, and port reachability
@@ -535,6 +535,7 @@ Remote operator example:
 ```bash
 # on the client skillbox
 cat >> .env <<'EOF'
+# Explicit exposure exception; not a clean tailnet_only bind.
 SKILLBOX_SWIMMERS_EXPOSE=1
 SKILLBOX_SWIMMERS_PUBLISH_HOST=0.0.0.0
 SKILLBOX_SWIMMERS_AUTH_MODE=token
@@ -674,10 +675,14 @@ Available MCP tools:
 
 ### Network Posture
 
-Managed boxes default to `tailnet_only` posture: public SSH is a bootstrap
-aperture that closes after Tailscale enrollment. See
+Managed boxes default to `tailnet_only`: public SSH is a temporary bootstrap
+aperture through `enroll`; after Tailscale enrollment succeeds, `box.py` locks
+host SSH to Tailnet access and updates the DigitalOcean firewall so inbound
+public SSH is closed. `posture-proof` verifies the box-level result with
+`public_ssh_probe`, `tailnet_probe`, `cloud_firewall_rules`, and `violations`;
+service bind exposure is verified by the runtime exposure lint. See
 [docs/tailnet-only-lifecycle.md](docs/tailnet-only-lifecycle.md) for the full
-lifecycle, recovery paths, and posture verification commands.
+lifecycle, break-glass recovery paths, and proof-field mapping.
 
 ```bash
 python3 scripts/box.py posture-proof <box-id>          # verify lockdown
@@ -976,7 +981,7 @@ make runtime-sync
 | `make swimmers-runtime-status` | Shows the runtime-manager view of the swimmers overlay |
 | `make box-up` | Provision a new remote box (DO + Tailscale) with the SPAPS auth/RBAC blueprint by default, or resume a partial provision with `RESUME=1` |
 | `make box-down` | Tear down a remote box |
-| `make box-status` | Health-check a remote box, including the phone URL, public SSH, Tailnet ping, MagicDNS, and swimmers port reachability |
+| `make box-status` | Health-check a remote box, including the phone URL, public SSH probe, Tailnet ping, MagicDNS, swimmers port reachability, and posture violations |
 | `make box-list` | List all boxes from inventory |
 | `make box-ssh` | SSH into a remote box |
 | `make box-profiles` | List available box profiles |
@@ -986,7 +991,7 @@ make runtime-sync
 | Script | Purpose | Example |
 |---|---|---|
 | `scripts/01-bootstrap-do.sh` | Bootstrap a fresh Ubuntu or DigitalOcean host | `sudo ./scripts/01-bootstrap-do.sh` |
-| `scripts/02-install-tailscale.sh` | Join the tailnet and harden SSH | `sudo TAILSCALE_AUTHKEY="tskey-..." ./scripts/02-install-tailscale.sh` |
+| `scripts/02-install-tailscale.sh` | Join the tailnet and harden SSH. Standalone default keeps public SSH for recovery; managed `box up` passes `TAILNET_ONLY_SSH=true` for `tailnet_only` boxes. | `sudo TAILSCALE_AUTHKEY="tskey-..." TAILNET_ONLY_SSH=true ./scripts/02-install-tailscale.sh` |
 | `scripts/04-reconcile.py render` | Print the resolved sandbox model | `python3 scripts/04-reconcile.py render --with-compose` |
 | `scripts/04-reconcile.py doctor` | Run drift and readiness checks | `python3 scripts/04-reconcile.py doctor` |
 | `scripts/05-swimmers.sh` | Manage the workspace-local swimmers install and process lifecycle | `./scripts/05-swimmers.sh status` |
