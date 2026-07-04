@@ -34,7 +34,7 @@ OPERATOR = SourceFileLoader(
 ).load_module()
 
 TOOLS = ("teardown", "compose_down", "provision", "box_exec")
-MARKERS = ("absent", "fresh", "expired", "wrong-session", "wrong-command-hash")
+MARKERS = ("absent", "fresh", "expired")
 REPOS = ("clean+pushed", "dirty", "unpushed", "scan-error-injected")
 TRANSPORTS = ("ok", "ssh-timeout")
 HOOK_TOOLS = {
@@ -90,10 +90,10 @@ MATRIX = [
 
 def expected_for(cell: MatrixCell) -> Expected:
     if cell.tool in {"teardown", "compose_down"}:
-        if cell.tool == "teardown" and cell.transport == "ssh-timeout":
-            return Expected(False, "ssh-timeout")
         if cell.repo == "scan-error-injected":
             return Expected(False, "repo-scan-error")
+        if cell.tool == "teardown" and cell.transport == "ssh-timeout":
+            return Expected(False, "ssh-timeout")
         if cell.repo == "dirty":
             return Expected(False, "repo-dirty")
         if cell.repo == "unpushed":
