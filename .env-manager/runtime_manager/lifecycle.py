@@ -261,10 +261,7 @@ def _skill_destination_bases(
     rule = _matching_scope_rule(skill_name, _scope_rules(model, cwd=cwd), cwd=cwd)
     matched_paths: list[str] = []
     if rule:
-        matched_paths = [
-            path for path in rule.get("paths") or []
-            if _path_prefix_matches(cwd, path)
-        ]
+        matched_paths = _scope_rule_matched_paths(rule, cwd)
     if matched_paths:
         repo_root = _repo_root_for_skill_install(cwd)
         if _path_is_under(str(repo_root), matched_paths):
@@ -538,7 +535,7 @@ def _skill_blocked_reason(
     if resolved_to == "project" and not force:
         rule = _matching_scope_rule(skill_name, _scope_rules(model, cwd=cwd), cwd=cwd)
         allowed_paths = list(rule.get("paths") or []) if rule else []
-        if allowed_paths and not any(_path_prefix_matches(cwd, path) for path in allowed_paths):
+        if allowed_paths and rule and not _scope_rule_matched_paths(rule, cwd):
             return "project install is outside allowed skill-scope paths"
     return ""
 
