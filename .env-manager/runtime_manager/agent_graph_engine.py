@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, Mapping
 
-from .agent_decisions import MAX_FUZZY_SUGGESTIONS, fuzzy_suggestions, resolve_brain_target
+from .agent_decisions import MAX_FUZZY_SUGGESTIONS, resolve_brain_target
 from .agent_graph import AgentGraph
 from .agent_cli_hints import manage_py_command
 from .agent_errors import brain_error_payload

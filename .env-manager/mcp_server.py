@@ -43,7 +43,7 @@ if str(SCRIPT_DIR) not in sys.path:
 _SCRIPTS_DIR = SCRIPT_DIR.parent / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
-from lib.redaction import REDACTION_MARKER, redact_text as redact_diagnostic_text  # noqa: E402
+from lib.redaction import redact_text as redact_diagnostic_text  # noqa: E402
 
 LOG_LEVELS = (
     "debug",

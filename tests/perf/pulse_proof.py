@@ -29,10 +29,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
-from io import StringIO
 from pathlib import Path
 from unittest import mock
 

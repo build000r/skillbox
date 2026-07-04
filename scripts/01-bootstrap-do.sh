@@ -156,7 +156,7 @@ fi
 
 echo "[6/9] Preparing durable state root..."
 if [[ -n "${STATE_ROOT}" && -n "${STORAGE_FILESYSTEM}" && -n "${VOLUME_DEVICE}" ]]; then
-  for attempt in $(seq 1 30); do
+  for _attempt in $(seq 1 30); do
     if [[ -b "${VOLUME_DEVICE}" ]]; then
       break
     fi
