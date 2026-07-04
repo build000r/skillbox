@@ -51,6 +51,7 @@ GRAPH_NODE_KINDS = frozenset(
         "profile",
         "repo",
         "artifact",
+        "overlay",
         "skill",
         "mcp_tool",
         "service",

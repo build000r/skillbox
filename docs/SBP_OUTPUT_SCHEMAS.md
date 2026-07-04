@@ -159,6 +159,11 @@ The wrapper discovery contract. Agents should start here to learn the stable com
     },
     {
       "json": true,
+      "name": "skill-what-if",
+      "safe_first_try": "sbp skill what-if --repo <repo-id-or-path> --overlay <overlay> --json"
+    },
+    {
+      "json": true,
       "name": "skill-heal",
       "safe_first_try": "sbp skill heal <skill> --dry-run --format json"
     },
@@ -380,6 +385,16 @@ The wrapper discovery contract. Agents should start here to learn the stable com
       "survives_recalibrate": false,
       "when_to_use": "Use when you need a one-read switchboard of repo skill on/off affordances."
     },
+    "what-if": {
+      "do_NOT": "Do not treat what-if as applying anything; it writes zero files.",
+      "links_disk": false,
+      "mutates": "none",
+      "purpose": "Purely simulate effective skill visibility for a repo, overlay, pin, opt-out, and machine.",
+      "returns_packet": false,
+      "scope": "target repo from --repo",
+      "survives_recalibrate": false,
+      "when_to_use": "Use before overlay or pin changes to see added, removed, shadowed, and conflict results."
+    },
     "why": {
       "do_NOT": "Do not infer policy from memory when why can return the live layers.",
       "links_disk": false,
@@ -517,6 +532,7 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
       "match": "<FLEET>/repos_real/overlay-repo",
       "notes": "",
       "overlay": "",
+      "path_match": "prefix",
       "paths": [
         "<FLEET>/repos_real/overlay-repo"
       ],
@@ -810,6 +826,7 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "match": "<FLEET>/repos_real/healthy",
       "notes": "",
       "overlay": "",
+      "path_match": "prefix",
       "paths": [
         "<FLEET>/repos_real/healthy"
       ],
@@ -895,7 +912,8 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
         "layer_label": "repo override file",
         "layer_rank": 60,
         "name": "marketing",
-        "source": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml"
+        "source": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+        "why": "repo-file"
       },
       {
         "enabled": false,
@@ -903,7 +921,8 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
         "layer_label": "repo override file",
         "layer_rank": 60,
         "name": "swarm",
-        "source": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml"
+        "source": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+        "why": "repo-file"
       }
     ],
     "declared": [],
@@ -1415,6 +1434,7 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
       "match": "<FLEET>/repos_real/overlay-repo",
       "notes": "",
       "overlay": "",
+      "path_match": "prefix",
       "paths": [
         "<FLEET>/repos_real/overlay-repo"
       ],

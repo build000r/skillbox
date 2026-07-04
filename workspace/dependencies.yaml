@@ -175,7 +175,7 @@ runtime_services:
     notes: Optional browser surface for proving the stack shape.
 
   - id: fwc-mcp
-    kind: mcp
+    kind: mcp-bridge
     owner: local
     required: false
     notes: >
@@ -184,7 +184,7 @@ runtime_services:
       Activated by the connectors profile.
 
   - id: dcg-mcp
-    kind: mcp
+    kind: mcp-bridge
     owner: local
     required: false
     notes: >

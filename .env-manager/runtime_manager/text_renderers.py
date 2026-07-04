@@ -276,6 +276,17 @@ def _format_service_line(service: dict[str, Any]) -> str:
     bootstrap_task_ids = service.get("bootstrap_tasks") or []
     if bootstrap_task_ids:
         summary = f"{summary}, bootstrap {', '.join(bootstrap_task_ids)}"
+    healthcheck_type = str(service.get("healthcheck_type") or "").strip()
+    if healthcheck_type:
+        health_parts = [healthcheck_type]
+        health_transport = str(service.get("healthcheck_transport") or service.get("transport") or "").strip()
+        if health_transport:
+            health_parts.append(health_transport)
+        health_summary = "/".join(health_parts)
+        reason = str(service.get("reason") or "").strip()
+        if reason:
+            health_summary = f"{health_summary} ({reason})"
+        summary = f"{summary}, health {health_summary}"
     endpoint = service.get("endpoint") or {}
     endpoint_url = str(service.get("endpoint_url") or endpoint.get("access_url") or "").strip()
     exposure = str(endpoint.get("exposure") or service.get("exposure") or "").strip()

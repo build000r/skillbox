@@ -213,7 +213,7 @@ def _service_entry(service: dict[str, Any], source_file: str) -> dict[str, Any]:
 def _service_warning(service: dict[str, Any], target: str, source_key: str) -> str:
     health = service.get("healthcheck") if isinstance(service.get("healthcheck"), dict) else {}
     htype = str((health or {}).get("type") or service.get("health_type") or "").strip()
-    if htype in {"path_exists", "process_running"} or not target:
+    if htype in {"path_exists", "process_running"} or (htype == "mcp_ready" and target == "stdio") or not target:
         return (
             f"service {service.get('id')!r} health check ({htype or 'unknown type'}) "
             "declares no port; not registered"

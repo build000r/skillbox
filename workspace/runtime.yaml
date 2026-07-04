@@ -249,10 +249,12 @@ core:
       notes: Workspace-local swimmers API that shares the tmux namespace with the agents.
 
     - id: cm-mcp
-      kind: mcp
+      kind: mcp-bridge
       owner: local
       artifact: cm-bin
       required: false
+      transport: http
+      port: ${SKILLBOX_CM_MCP_PORT}
       profiles:
         - memory
       command: ${SKILLBOX_CM_BIN} serve --port ${SKILLBOX_CM_MCP_PORT}
@@ -260,9 +262,12 @@ core:
         CASS_MEMORY_LLM: none
         CASS_PATH: ${SKILLBOX_CASS_BIN}
       healthcheck:
-        type: http
-        url: http://127.0.0.1:${SKILLBOX_CM_MCP_PORT}/health
-        timeout_seconds: 0.5
+        # Probe choice: cm exposes MCP over local HTTP, so mcp_ready/http sends
+        # a JSON-RPC initialize request and fails wrong processes on the port.
+        type: mcp_ready
+        transport: http
+        url: http://127.0.0.1:${SKILLBOX_CM_MCP_PORT}
+        timeout_seconds: 0.2
       depends_on:
         - cass-bin
         - cm-bin
@@ -609,10 +614,11 @@ connectors:
 
   services:
     - id: fwc-mcp
-      kind: mcp
+      kind: mcp-bridge
       owner: local
       artifact: fwc-bin
       required: false
+      transport: stdio
       profiles:
         - connectors
       command: >
@@ -620,8 +626,15 @@ connectors:
         --zone ${SKILLBOX_FWC_ZONE}
         --connectors ${SKILLBOX_FWC_CONNECTORS}
       healthcheck:
-        type: process_running
-        pattern: fwc serve-mcp
+        # Probe choice: fwc serve-mcp is a stdio MCP bridge, so pulse starts a
+        # bounded initialize-only subprocess and closes it after the response.
+        type: mcp_ready
+        transport: stdio
+        probe_command: >
+          ${SKILLBOX_FWC_BIN} serve-mcp
+          --zone ${SKILLBOX_FWC_ZONE}
+          --connectors ${SKILLBOX_FWC_CONNECTORS}
+        timeout_seconds: 0.2
       depends_on: []
       log: connectors
       notes: >
@@ -631,16 +644,21 @@ connectors:
         through FCP's capability-gated security model.
 
     - id: dcg-mcp
-      kind: mcp
+      kind: mcp-bridge
       owner: local
       artifact: dcg-bin
       required: false
+      transport: stdio
       profiles:
         - connectors
       command: ${SKILLBOX_DCG_BIN} mcp
       healthcheck:
-        type: process_running
-        pattern: dcg mcp
+        # Probe choice: dcg mcp is a stdio MCP bridge, so mcp_ready/stdio
+        # verifies the initialize handshake instead of only matching a process.
+        type: mcp_ready
+        transport: stdio
+        probe_command: ${SKILLBOX_DCG_BIN} mcp
+        timeout_seconds: 0.2
       depends_on: []
       log: connectors
       notes: >

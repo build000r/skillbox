@@ -12,8 +12,11 @@ from .graph_cycle_evidence import cycle_evidence
 from lib.runtime_model import (  # noqa: E402
     LOCAL_RUNTIME_COVERAGE_GAP,
     LOCAL_RUNTIME_ERROR_CODES,
+    MCP_READY_HEALTHCHECK_TYPE,
     PROJECT_KIND_IOS,
+    VALID_MCP_HEALTHCHECK_TRANSPORTS,
     VALID_PROJECT_KINDS,
+    VALID_SERVICE_HEALTHCHECK_TYPES,
     IOS_COMMAND_LANES,
 )
 from lib.parity_schema import (  # noqa: E402
@@ -67,6 +70,26 @@ def normalize_active_profiles(raw_profiles: list[str] | None) -> set[str]:
 
 def _is_int_port(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_intish_port(value: Any) -> bool:
+    if _is_int_port(value):
+        return True
+    text = str(value or "").strip()
+    return text.isdigit() and 0 < int(text) <= 65535
+
+
+def _mcp_healthcheck_transport(service: dict[str, Any], healthcheck: dict[str, Any]) -> str:
+    explicit = str(healthcheck.get("transport") or service.get("transport") or "").strip().lower()
+    if explicit:
+        return explicit
+    if healthcheck.get("url"):
+        return "http"
+    if healthcheck.get("port") is not None or service.get("port") is not None:
+        return "tcp"
+    if healthcheck.get("probe_command") or service.get("probe_command") or service.get("command"):
+        return "stdio"
+    return ""
 
 
 def normalize_active_clients(model: dict[str, Any], raw_clients: list[str] | None) -> set[str]:
@@ -2854,7 +2877,7 @@ def _check_service_healthcheck(service: dict[str, Any]) -> list[str]:
     healthcheck_type = healthcheck.get("type")
     if not healthcheck_type:
         return issues
-    if healthcheck_type not in VALID_HEALTHCHECK_TYPES:
+    if healthcheck_type not in VALID_SERVICE_HEALTHCHECK_TYPES:
         issues.append(
             f"service {service.get('id')} has unsupported healthcheck.type {healthcheck_type!r}"
         )
@@ -2866,6 +2889,28 @@ def _check_service_healthcheck(service: dict[str, Any]) -> list[str]:
         issues.append(f"service {service.get('id')} process_running healthcheck is missing pattern")
     if healthcheck_type == "port" and not _is_int_port(healthcheck.get("port")):
         issues.append(f"service {service.get('id')} port healthcheck is missing integer port")
+    if healthcheck_type == MCP_READY_HEALTHCHECK_TYPE:
+        transport = _mcp_healthcheck_transport(service, healthcheck)
+        if transport not in VALID_MCP_HEALTHCHECK_TRANSPORTS:
+            issues.append(
+                f"service {service.get('id')} mcp_ready healthcheck has unsupported transport {transport!r}"
+            )
+        elif transport == "http" and not (
+            healthcheck.get("url") or _is_intish_port(healthcheck.get("port") or service.get("port"))
+        ):
+            issues.append(
+                f"service {service.get('id')} mcp_ready http healthcheck is missing url or port"
+            )
+        elif transport == "tcp" and not _is_intish_port(healthcheck.get("port") or service.get("port")):
+            issues.append(
+                f"service {service.get('id')} mcp_ready tcp healthcheck is missing integer port"
+            )
+        elif transport == "stdio" and not (
+            healthcheck.get("probe_command") or service.get("probe_command") or service.get("command")
+        ):
+            issues.append(
+                f"service {service.get('id')} mcp_ready stdio healthcheck is missing probe_command"
+            )
     return issues
 
 

@@ -2,18 +2,31 @@ from __future__ import annotations
 
 import http.client
 import io
+import json
+import os
+import selectors
 import shlex
+import signal
 import socket
+import subprocess
 import tarfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 from .shared import *
 from .validation import *
-from .errors import StateConflictError, ValidationError
+from .errors import AdapterError, NetworkError, RuntimeLifecycleError, StateConflictError, ValidationError
 from .port_registry import build_port_registry, declared_service_ports
 from .pressure_report import collect_pressure_report
 from .rch_report import collect_rch_report
 from .sbh_report import collect_sbh_report
 from lib.runtime_model import (
+    LOCAL_RUNTIME_PORT_MISMATCH,
+    LOCAL_RUNTIME_SERVICE_DEFERRED,
+    MCP_PROTOCOL_VERSION,
+    MCP_READY_HEALTHCHECK_TYPE,
     PERSISTENT_PATH_OFF_STATE_ROOT,
     STATE_ROOT_LOW_SPACE,
     STATE_ROOT_MISSING,
@@ -21,7 +34,7 @@ from lib.runtime_model import (
     STATE_ROOT_WRONG_OWNERSHIP,
     is_runtime_absolute_path,
 )
-from lib.paths import BoxPath, PathTranslator
+from lib.paths import BoxPath, PathTranslationError, PathTranslator
 
 
 _STARTED_SERVICE_PROCESSES: list[subprocess.Popen[str]] = []
@@ -1174,6 +1187,49 @@ def validate_service_exposure(model: dict[str, Any]) -> list[CheckResult]:
     ]
 
 
+def _mcp_healthcheck_target_summary(service: dict[str, Any], healthcheck: dict[str, Any]) -> str:
+    transport = _mcp_ready_transport(service, healthcheck)
+    if transport == "http":
+        url = str(healthcheck.get("url") or "").strip()
+        if url:
+            return url
+        port = _mcp_probe_port(service, healthcheck)
+        return f"http://{_mcp_probe_host(service, healthcheck)}:{port}" if port is not None else "http"
+    if transport == "tcp":
+        port = _mcp_probe_port(service, healthcheck)
+        return f"{_mcp_probe_host(service, healthcheck)}:{port}" if port is not None else "tcp"
+    if transport == "stdio":
+        return "stdio"
+    return transport or "unknown"
+
+
+def validate_mcp_healthchecks(model: dict[str, Any]) -> list[CheckResult]:
+    """Surface declared MCP protocol healthchecks in doctor output."""
+    declarations: list[dict[str, Any]] = []
+    for service in model.get("services") or []:
+        healthcheck = service.get("healthcheck") if isinstance(service.get("healthcheck"), dict) else {}
+        if (healthcheck or {}).get("type") != MCP_READY_HEALTHCHECK_TYPE:
+            continue
+        declarations.append({
+            "service_id": service.get("id"),
+            "kind": service.get("kind", "service"),
+            "healthcheck_type": MCP_READY_HEALTHCHECK_TYPE,
+            "transport": _mcp_ready_transport(service, healthcheck),
+            "target": _mcp_healthcheck_target_summary(service, healthcheck),
+            "timeout_seconds": _mcp_ready_timeout_seconds(healthcheck),
+        })
+    if not declarations:
+        return []
+    return [
+        CheckResult(
+            status="pass",
+            code="mcp-healthchecks",
+            message=f"{len(declarations)} MCP protocol healthcheck(s) declared",
+            details={"healthcheck_type": MCP_READY_HEALTHCHECK_TYPE, "services": declarations},
+        )
+    ]
+
+
 PORT_COLLISION = "PORT_COLLISION"
 PORT_WILDCARD_BIND = "PORT_WILDCARD_BIND"
 PORT_UNDECLARED_RESERVED = "PORT_UNDECLARED_RESERVED"
@@ -1839,6 +1895,7 @@ def doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
         + validate_bridges(model)
         + validate_ingress(model)
         + validate_service_exposure(model)
+        + validate_mcp_healthchecks(model)
         + validate_port_registry(model)
         + validate_port_contracts(model)
         + parity_results
@@ -2232,7 +2289,8 @@ def _sync_existing_git_repo(
         return f"exists: {path}"
     if dry_run:
         return f"clone-reconcile: {url} -> {path}"
-    _run_git_clone_atomic(url, branch, path)
+    clear_repo_git_residue(path)
+    _run_git_clone(url, branch, path)
     return f"clone-reconcile: {url} -> {path}"
 
 
@@ -2597,6 +2655,24 @@ def translated_runtime_env(root_dir: Path, runtime_env: dict[str, str]) -> dict[
             return False
         return not is_runtime_absolute_path(raw_text)
 
+    def _translate_via_host_root_override(raw_value: str) -> str | None:
+        root_bindings = (
+            ("/workspace", "SKILLBOX_WORKSPACE_ROOT"),
+            ("/home/sandbox", "SKILLBOX_HOME_ROOT"),
+            ("/monoserver", "SKILLBOX_MONOSERVER_ROOT"),
+        )
+        for runtime_prefix, env_key in root_bindings:
+            host_root = str(runtime_env.get(env_key) or "").strip()
+            if not host_root or not _already_host_path(host_root):
+                continue
+            if raw_value == runtime_prefix:
+                return str(Path(host_root).expanduser().resolve())
+            prefix = runtime_prefix + "/"
+            if raw_value.startswith(prefix):
+                relative = raw_value[len(prefix):]
+                return str((Path(host_root).expanduser() / relative).resolve())
+        return None
+
     translated: dict[str, str] = {}
     for key, value in runtime_env.items():
         if key in {"SKILLBOX_MONOSERVER_HOST_ROOT", "SKILLBOX_CLIENTS_HOST_ROOT"}:
@@ -2608,7 +2684,13 @@ def translated_runtime_env(root_dir: Path, runtime_env: dict[str, str]) -> dict[
             elif not Path(value).expanduser().is_absolute():
                 translated[key] = str(Path(value).expanduser())
             else:
-                translated[key] = str(translator.to_host(BoxPath(value)))
+                try:
+                    translated[key] = str(translator.to_host(BoxPath(value)))
+                except PathTranslationError:
+                    fallback = _translate_via_host_root_override(value)
+                    if fallback is None:
+                        raise
+                    translated[key] = fallback
             continue
         translated[key] = value
     translated["ROOT_DIR"] = str(root_dir)
@@ -2843,9 +2925,527 @@ def _port_listening_state(port: int, *, host: str = "127.0.0.1", timeout: float 
         return {"state": "down", "host": host, "port": port}
 
 
+MCP_READY_DEFAULT_TIMEOUT_SECONDS = 0.2
+MCP_READY_MAX_TIMEOUT_SECONDS = 5.0
+MCP_READY_REQUEST_ID = 1
+
+
+def _mcp_ready_timeout_seconds(healthcheck: dict[str, Any]) -> float:
+    raw_timeout = healthcheck.get("timeout_seconds", MCP_READY_DEFAULT_TIMEOUT_SECONDS)
+    try:
+        timeout = float(raw_timeout)
+    except (TypeError, ValueError):
+        timeout = MCP_READY_DEFAULT_TIMEOUT_SECONDS
+    if timeout <= 0:
+        timeout = MCP_READY_DEFAULT_TIMEOUT_SECONDS
+    return min(timeout, MCP_READY_MAX_TIMEOUT_SECONDS)
+
+
+def _mcp_ready_elapsed_ms(started_at: float) -> int:
+    return max(0, int(round((time.monotonic() - started_at) * 1000)))
+
+
+def _mcp_ready_transport(service: dict[str, Any], healthcheck: dict[str, Any]) -> str:
+    explicit = str(healthcheck.get("transport") or service.get("transport") or "").strip().lower()
+    if explicit:
+        return explicit
+    if healthcheck.get("url"):
+        return "http"
+    if healthcheck.get("port") is not None or service.get("port") is not None:
+        return "tcp"
+    if healthcheck.get("probe_command") or service.get("probe_command") or service.get("command"):
+        return "stdio"
+    return ""
+
+
+def _mcp_probe_host(service: dict[str, Any], healthcheck: dict[str, Any]) -> str:
+    host = str(healthcheck.get("host") or service.get("host") or "127.0.0.1").strip() or "127.0.0.1"
+    if host in {"0.0.0.0", "::"}:
+        return "127.0.0.1"
+    return host
+
+
+def _mcp_probe_port(service: dict[str, Any], healthcheck: dict[str, Any]) -> int | None:
+    raw_port = healthcheck.get("port", service.get("port"))
+    try:
+        port = int(str(raw_port).strip())
+    except (TypeError, ValueError):
+        return None
+    if 1 <= port <= 65535:
+        return port
+    return None
+
+
+def _mcp_initialize_payload() -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": MCP_READY_REQUEST_ID,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {
+                "name": "skillbox-runtime-manager",
+                "version": "mcp-ready-healthcheck",
+            },
+        },
+    }
+
+
+def _mcp_ready_base(
+    *,
+    transport: str,
+    timeout_seconds: float,
+    started_at: float,
+    state: str,
+) -> dict[str, Any]:
+    return {
+        "state": state,
+        "healthcheck_type": MCP_READY_HEALTHCHECK_TYPE,
+        "healthcheck_transport": transport,
+        "transport": transport,
+        "timeout_seconds": timeout_seconds,
+        "elapsed_ms": _mcp_ready_elapsed_ms(started_at),
+    }
+
+
+def _mcp_ready_down(
+    *,
+    transport: str,
+    timeout_seconds: float,
+    started_at: float,
+    reason: str,
+    **extra: Any,
+) -> dict[str, Any]:
+    return _mcp_ready_base(
+        transport=transport,
+        timeout_seconds=timeout_seconds,
+        started_at=started_at,
+        state="down",
+    ) | {"reason": reason} | extra
+
+
+def _mcp_ready_ok(
+    *,
+    transport: str,
+    timeout_seconds: float,
+    started_at: float,
+    **extra: Any,
+) -> dict[str, Any]:
+    return _mcp_ready_base(
+        transport=transport,
+        timeout_seconds=timeout_seconds,
+        started_at=started_at,
+        state="ok",
+    ) | extra
+
+
+def _mcp_raw_excerpt(raw: str, *, limit: int = 240) -> str:
+    compact = " ".join(raw.strip().split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
+
+
+def _mcp_validate_initialize_response(raw: str) -> tuple[bool, dict[str, Any]]:
+    if not raw.strip():
+        return False, {"reason": "no_response"}
+    try:
+        response = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return False, {
+            "reason": "bad_handshake",
+            "protocol_error": f"non-json response: {exc.msg}",
+            "raw_excerpt": _mcp_raw_excerpt(raw),
+        }
+    if not isinstance(response, dict):
+        return False, {
+            "reason": "bad_handshake",
+            "protocol_error": f"expected object response, got {type(response).__name__}",
+            "raw_excerpt": _mcp_raw_excerpt(raw),
+        }
+    if response.get("jsonrpc") != "2.0":
+        return False, {
+            "reason": "bad_handshake",
+            "protocol_error": "missing jsonrpc 2.0 marker",
+            "raw_excerpt": _mcp_raw_excerpt(raw),
+        }
+    if response.get("id") != MCP_READY_REQUEST_ID:
+        return False, {
+            "reason": "bad_handshake",
+            "protocol_error": "response id did not match initialize request",
+            "raw_excerpt": _mcp_raw_excerpt(raw),
+        }
+    if response.get("error") is not None:
+        return False, {
+            "reason": "bad_handshake",
+            "protocol_error": str(response.get("error")),
+            "raw_excerpt": _mcp_raw_excerpt(raw),
+        }
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return False, {
+            "reason": "bad_handshake",
+            "protocol_error": "initialize result missing",
+            "raw_excerpt": _mcp_raw_excerpt(raw),
+        }
+    protocol_version = str(result.get("protocolVersion") or "").strip()
+    if not protocol_version:
+        return False, {
+            "reason": "bad_handshake",
+            "protocol_error": "initialize result missing protocolVersion",
+            "raw_excerpt": _mcp_raw_excerpt(raw),
+        }
+    return True, {
+        "protocol_version": protocol_version,
+        "raw_excerpt": _mcp_raw_excerpt(raw),
+    }
+
+
+def _mcp_ready_tcp(service: dict[str, Any], healthcheck: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
+    started_at = time.monotonic()
+    transport = "tcp"
+    host = _mcp_probe_host(service, healthcheck)
+    port = _mcp_probe_port(service, healthcheck)
+    if port is None:
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="missing_port",
+            host=host,
+        )
+    request = json.dumps(_mcp_initialize_payload(), separators=(",", ":")) + "\n"
+    try:
+        with socket.create_connection((host, port), timeout=timeout_seconds) as sock:
+            sock.settimeout(timeout_seconds)
+            sock.sendall(request.encode("utf-8"))
+            with sock.makefile("r", encoding="utf-8", newline="\n") as reader:
+                raw = reader.readline()
+    except (ConnectionRefusedError, FileNotFoundError):
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="refused",
+            host=host,
+            port=port,
+            target=f"{host}:{port}",
+        )
+    except socket.timeout:
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="no_response",
+            host=host,
+            port=port,
+            target=f"{host}:{port}",
+        )
+    except OSError as exc:
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="connection_error",
+            error=str(exc),
+            host=host,
+            port=port,
+            target=f"{host}:{port}",
+        )
+    ok, detail = _mcp_validate_initialize_response(raw)
+    common = {"host": host, "port": port, "target": f"{host}:{port}"}
+    if ok:
+        return _mcp_ready_ok(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            **common,
+            **detail,
+        )
+    return _mcp_ready_down(
+        transport=transport,
+        timeout_seconds=timeout_seconds,
+        started_at=started_at,
+        **common,
+        **detail,
+    )
+
+
+def _mcp_ready_http(service: dict[str, Any], healthcheck: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
+    started_at = time.monotonic()
+    transport = "http"
+    url = str(healthcheck.get("url") or "").strip()
+    if not url:
+        port = _mcp_probe_port(service, healthcheck)
+        if port is not None:
+            url = f"http://{_mcp_probe_host(service, healthcheck)}:{port}"
+    if not url:
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="missing_url",
+        )
+    body = json.dumps(_mcp_initialize_payload(), separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(url, data=body, method="POST")
+    request.add_header("content-type", "application/json")
+    request.add_header("accept", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            status_code = response.getcode()
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="bad_handshake",
+            protocol_error=f"http {exc.code}: {exc.reason}",
+            raw_excerpt=_mcp_raw_excerpt(raw),
+            url=url,
+            status_code=exc.code,
+            target=url,
+        )
+    except urllib.error.URLError as exc:
+        reason = exc.reason
+        if isinstance(reason, ConnectionRefusedError):
+            failure_reason = "refused"
+        elif isinstance(reason, TimeoutError):
+            failure_reason = "no_response"
+        else:
+            failure_reason = "connection_error"
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason=failure_reason,
+            error=str(reason),
+            url=url,
+            target=url,
+        )
+    except (TimeoutError, socket.timeout):
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="no_response",
+            url=url,
+            target=url,
+        )
+    except OSError as exc:
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="connection_error",
+            error=str(exc),
+            url=url,
+            target=url,
+        )
+    ok, detail = _mcp_validate_initialize_response(raw)
+    common = {"url": url, "target": url, "status_code": status_code}
+    if ok:
+        return _mcp_ready_ok(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            **common,
+            **detail,
+        )
+    return _mcp_ready_down(
+        transport=transport,
+        timeout_seconds=timeout_seconds,
+        started_at=started_at,
+        **common,
+        **detail,
+    )
+
+
+def _terminate_mcp_probe_process(process: subprocess.Popen[str]) -> None:
+    for stream in (process.stdin, process.stdout, process.stderr):
+        try:
+            if stream is not None:
+                stream.close()
+        except OSError:
+            pass
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+    except OSError:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=0.2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except OSError:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _mcp_ready_stdio(service: dict[str, Any], healthcheck: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
+    started_at = time.monotonic()
+    transport = "stdio"
+    command = str(
+        healthcheck.get("probe_command")
+        or service.get("probe_command")
+        or service.get("command")
+        or ""
+    ).strip()
+    if not command:
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="missing_command",
+        )
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+            text=True,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="spawn_failed",
+            error=str(exc),
+            source_command=command,
+        )
+
+    try:
+        assert process.stdin is not None
+        process.stdin.write(json.dumps(_mcp_initialize_payload(), separators=(",", ":")) + "\n")
+        process.stdin.flush()
+        assert process.stdout is not None
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            events = selector.select(timeout_seconds)
+        finally:
+            selector.close()
+        if not events:
+            if process.poll() is not None:
+                stderr = ""
+                try:
+                    stderr = process.stderr.read() if process.stderr is not None else ""
+                except OSError:
+                    stderr = ""
+                return _mcp_ready_down(
+                    transport=transport,
+                    timeout_seconds=timeout_seconds,
+                    started_at=started_at,
+                    reason="nonzero_exit" if process.returncode else "no_response",
+                    exit_code=process.returncode,
+                    stderr_excerpt=_mcp_raw_excerpt(stderr),
+                    source_command=command,
+                )
+            return _mcp_ready_down(
+                transport=transport,
+                timeout_seconds=timeout_seconds,
+                started_at=started_at,
+                reason="no_response",
+                source_command=command,
+            )
+        raw_chunk = os.read(process.stdout.fileno(), 65536).decode("utf-8", errors="replace")
+        raw_lines = [line for line in raw_chunk.splitlines() if line.strip()]
+        raw = raw_lines[0] if raw_lines else raw_chunk
+    except (BrokenPipeError, OSError) as exc:
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="connection_error",
+            error=str(exc),
+            source_command=command,
+        )
+    finally:
+        _terminate_mcp_probe_process(process)
+
+    ok, detail = _mcp_validate_initialize_response(raw)
+    common = {"source_command": command}
+    if ok:
+        return _mcp_ready_ok(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            **common,
+            **detail,
+        )
+    return _mcp_ready_down(
+        transport=transport,
+        timeout_seconds=timeout_seconds,
+        started_at=started_at,
+        **common,
+        **detail,
+    )
+
+
+def mcp_ready_state(service: dict[str, Any], healthcheck: dict[str, Any]) -> dict[str, Any]:
+    timeout_seconds = _mcp_ready_timeout_seconds(healthcheck)
+    transport = _mcp_ready_transport(service, healthcheck)
+    if transport == "tcp":
+        return _mcp_ready_tcp(service, healthcheck, timeout_seconds)
+    if transport == "http":
+        return _mcp_ready_http(service, healthcheck, timeout_seconds)
+    if transport == "stdio":
+        return _mcp_ready_stdio(service, healthcheck, timeout_seconds)
+    started_at = time.monotonic()
+    return _mcp_ready_down(
+        transport=transport or "unknown",
+        timeout_seconds=timeout_seconds,
+        started_at=started_at,
+        reason="unsupported_transport",
+    )
+
+
 def _service_declared_listen_port(service: dict[str, Any]) -> tuple[str, int] | None:
     healthcheck = service.get("healthcheck") or {}
     hc_type = healthcheck.get("type")
+    if hc_type == MCP_READY_HEALTHCHECK_TYPE:
+        transport = _mcp_ready_transport(service, healthcheck)
+        if transport == "tcp":
+            port = _mcp_probe_port(service, healthcheck)
+            if port is None:
+                return None
+            return _mcp_probe_host(service, healthcheck), port
+        if transport == "http":
+            url = str(healthcheck.get("url") or "").strip()
+            if url:
+                try:
+                    parsed = urllib.parse.urlparse(url)
+                except ValueError:
+                    return None
+                host = parsed.hostname or "127.0.0.1"
+                if parsed.port is not None:
+                    return host, int(parsed.port)
+                if parsed.scheme == "https":
+                    return host, 443
+                if parsed.scheme == "http":
+                    return host, 80
+            port = _mcp_probe_port(service, healthcheck)
+            if port is not None:
+                return _mcp_probe_host(service, healthcheck), port
+            return None
+        return None
     if hc_type == "port":
         try:
             port = int(healthcheck["port"])
@@ -4134,6 +4734,9 @@ def service_healthcheck_state(service: dict[str, Any]) -> dict[str, Any]:
             return {"state": "unknown"}
         host = str(healthcheck.get("host") or "127.0.0.1")
         return _port_listening_state(port, host=host)
+
+    if healthcheck_type == MCP_READY_HEALTHCHECK_TYPE:
+        return mcp_ready_state(service, healthcheck)
 
     if healthcheck_type == "process_running":
         pattern = str(healthcheck["pattern"]).strip()
@@ -5438,7 +6041,6 @@ FOCUS_ERROR_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 MCP_CONFIG_REL = Path(".mcp.json")
-MCP_PROTOCOL_VERSION = "2024-11-05"
 MCP_SMOKE_TIMEOUT_SECONDS = 5.0
 
 
@@ -6001,6 +6603,7 @@ def _runtime_task_statuses(model: dict[str, Any]) -> list[dict[str, Any]]:
 def _runtime_service_statuses(model: dict[str, Any]) -> list[dict[str, Any]]:
     statuses: list[dict[str, Any]] = []
     for service in model["services"]:
+        healthcheck = service.get("healthcheck") if isinstance(service.get("healthcheck"), dict) else {}
         item = {
             "id": service["id"],
             "kind": service.get("kind", "service"),
@@ -6008,6 +6611,11 @@ def _runtime_service_statuses(model: dict[str, Any]) -> list[dict[str, Any]]:
             "depends_on": service_dependency_ids(service),
             "bootstrap_tasks": service_bootstrap_task_ids(service),
         }
+        if (healthcheck or {}).get("type"):
+            item["healthcheck_type"] = healthcheck["type"]
+            if healthcheck.get("type") == MCP_READY_HEALTHCHECK_TYPE:
+                item["healthcheck_transport"] = _mcp_ready_transport(service, healthcheck)
+                item["healthcheck_target"] = _mcp_healthcheck_target_summary(service, healthcheck)
         item.update(probe_service(model, service))
         # WG-006: annotate with the parity-ledger ownership_state so
         # observational surfaces (text renderers, json consumers, doctor)

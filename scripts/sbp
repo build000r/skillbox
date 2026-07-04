@@ -875,7 +875,7 @@ apply_repo_overlay_override() {
   if passthrough_wants_json; then
     format_json="true"
   fi
-  python3 - "${invoke_cwd}" "${overlay_action}" "${overlay}" "${dry_run}" "${format_json}" <<'PY'
+  python3 - "${invoke_cwd}" "${overlay_action}" "${overlay}" "${dry_run}" "${format_json}" "${script_dir}/../.env-manager" <<'PY'
 from __future__ import annotations
 
 import json
@@ -883,7 +883,9 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(".env-manager").resolve()))
+for candidate in (Path(".env-manager").resolve(), Path(sys.argv[6]).resolve()):
+    if str(candidate) not in sys.path:
+        sys.path.insert(0, str(candidate))
 
 from runtime_manager.skill_visibility import (  # noqa: E402
     active_overlay_records,
