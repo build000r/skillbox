@@ -8,6 +8,7 @@ import tarfile
 
 from .shared import *
 from .validation import *
+from .errors import StateConflictError, ValidationError
 from .port_registry import build_port_registry, declared_service_ports
 from .pressure_report import collect_pressure_report
 from .rch_report import collect_rch_report
@@ -2063,7 +2064,7 @@ def sync_dcg_config(model: dict[str, Any], root_dir: Path, dry_run: bool) -> lis
     env = model.get("env") or {}
     dcg_bin = env.get("SKILLBOX_DCG_BIN", "").strip()
     if not dcg_bin:
-        return [f"skip: .dcg.toml (dcg not configured)"]
+        return ["skip: .dcg.toml (dcg not configured)"]
 
     packs, allowlist = _dcg_packs_and_allowlist(model, env)
     content = _dcg_config_content(packs, allowlist)
@@ -2459,6 +2460,28 @@ def service_dependency_ids(service: dict[str, Any]) -> list[str]:
     return unique_string_field_values(service, "depends_on")
 
 
+def _service_dependency_graph_failure(model: dict[str, Any]) -> CheckResult | None:
+    for result in validate_runtime_model(model):
+        if result.status != "fail":
+            continue
+        if result.code in {LOCAL_RUNTIME_DEPENDENCY_CYCLE, LOCAL_RUNTIME_DEPENDENCY_UNKNOWN}:
+            return result
+    return None
+
+
+def ensure_service_dependency_graph_ready(model: dict[str, Any]) -> None:
+    failure = _service_dependency_graph_failure(model)
+    if failure is None:
+        return
+    raise ValidationError(
+        failure.code,
+        failure.message,
+        context=dict(failure.details or {}),
+        next_actions=["doctor --format json"],
+        recoverable=False,
+    )
+
+
 def service_id_map(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {
         str(service["id"]): service
@@ -2533,6 +2556,7 @@ def resolve_services_for_start(
     *,
     mode: str | None = None,
 ) -> list[dict[str, Any]]:
+    ensure_service_dependency_graph_ready(model)
     # `mode` is accepted so WG-005 callers can thread the effective mode
     # through the lifecycle pipeline; the dependency expansion + topo sort is
     # mode-agnostic, but keeping the parameter here documents the data-flow
@@ -2549,6 +2573,7 @@ def resolve_services_for_stop(
     model: dict[str, Any],
     requested_services: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    ensure_service_dependency_graph_ready(model)
     requested_ids = [str(service["id"]) for service in requested_services]
     expanded_ids = expand_graph_ids(reverse_service_dependency_graph(model), requested_ids)
     ordered_ids = list(reversed(order_service_ids(model, expanded_ids)))
@@ -3185,6 +3210,63 @@ def _verify_service_declared_ports(
         "source": snapshot.get("source"),
         "attempts": attempts,
     }
+
+
+def _external_declared_listener_verification(
+    model: dict[str, Any],
+    service: dict[str, Any],
+    reason: str,
+) -> dict[str, Any] | None:
+    declared_ports = _declared_ports_for_service(model, service)
+    if not declared_ports or _service_port_guard_disabled():
+        return None
+
+    declared_listener = _service_declared_listen_port(service)
+    host = declared_listener[0] if declared_listener is not None else "127.0.0.1"
+    observed_ports: list[int] = []
+    listeners: list[dict[str, Any]] = []
+    for port in declared_ports:
+        port_state = _port_listening_state(port, host=host)
+        if port_state.get("state") != "ok":
+            continue
+        observed_ports.append(int(port))
+        listener: dict[str, Any] = {
+            "host": host,
+            "port": int(port),
+            "source": "external-listener",
+        }
+        owner = _external_listener_owner(host, int(port))
+        if owner:
+            listener.update({
+                key: value
+                for key, value in owner.items()
+                if key in {"pid", "command", "age"}
+            })
+        listeners.append(listener)
+
+    if not observed_ports:
+        return None
+
+    matches = sorted(set(declared_ports) & set(observed_ports))
+    process_pids = sorted({
+        int(listener["pid"])
+        for listener in listeners
+        if isinstance(listener.get("pid"), int)
+    })
+    verification: dict[str, Any] = {
+        "state": "ok" if matches else "mismatch",
+        "reason": reason,
+        "declared_ports": declared_ports,
+        "observed_ports": sorted(set(observed_ports)),
+        "process_pids": process_pids,
+        "listeners": listeners,
+        "source": "external-listener",
+        "attempts": 1,
+    }
+    if matches:
+        verification["verified_port"] = matches[0]
+        verification["verified_ports"] = matches
+    return verification
 
 
 def _port_mismatch_next_actions(service: dict[str, Any]) -> list[str]:
@@ -4530,6 +4612,29 @@ def _prelaunch_running_result(
     prelaunch_health = service_healthcheck_state(service)
     if prelaunch_health.get("state") != "ok":
         return None
+    verification = _external_declared_listener_verification(
+        model,
+        service,
+        "healthcheck was already healthy before runtime launched the service",
+    )
+    if verification is not None:
+        if verification.get("state") == "mismatch":
+            return _service_port_mismatch_result(
+                service,
+                result,
+                paths,
+                None,
+                verification,
+                event_root,
+                remove_pid=False,
+            )
+        reused_result = result | {"result": "already-running"}
+        for key in ("url", "target", "port"):
+            if key in prelaunch_health:
+                reused_result[key] = prelaunch_health[key]
+        _copy_port_verification_fields(reused_result, verification)
+        log_runtime_event("service.reused", service["id"], root_dir=event_root)
+        return reused_result
     unverified = _unverified_reuse_mismatch(
         model,
         service,
@@ -4781,6 +4886,27 @@ def _reused_existing_service_result(
     if self_managed_pid_file:
         return _self_managed_reused_result(model, service, result, paths, health_state, event_root)
     remove_pid_file(paths["pid_file"])
+    verification = _external_declared_listener_verification(
+        model,
+        service,
+        "launcher exited before owning a declared listener",
+    )
+    if verification is not None:
+        if verification.get("state") == "mismatch":
+            return _service_port_mismatch_result(
+                service,
+                result,
+                paths,
+                process.pid,
+                verification,
+                event_root,
+                remove_pid=True,
+            )
+        reused_result = result | {"result": "already-running"}
+        _copy_health_fields(reused_result, health_state, ("url", "target"))
+        _copy_port_verification_fields(reused_result, verification)
+        log_runtime_event("service.reused", service["id"], root_dir=event_root)
+        return reused_result
     unverified = _unverified_reuse_mismatch(
         model,
         service,
@@ -5384,7 +5510,6 @@ def collect_live_state(
 
 def _collect_skill_repo_status(skillset: dict[str, Any]) -> dict[str, Any]:
     """Build status payload for a skill-repo-set skillset."""
-    config_path = Path(str(skillset.get("skill_repos_config_host_path", "")))
     lock_path = Path(str(skillset.get("lock_path_host_path", "")))
 
     lock_present = lock_path.is_file()
