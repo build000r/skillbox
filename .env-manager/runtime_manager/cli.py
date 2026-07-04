@@ -50,6 +50,7 @@ from .registry_docs import registry_docs_payload
 from .port_registry import port_registry_payload, port_registry_text_lines
 from .agent_adapters import collect_agent_adapter_evidence
 from .agent_graph import build_agent_graph, build_agent_graph_payload
+from .agent_graph_algorithms import ALGORITHMS
 from .agent_graph_engine import GRAPH_OUTPUT_FORMATS, graph_command_payload, render_graph_payload
 from .agent_decisions import BRAIN_COMMAND_TARGET_ALIASES, explain_payload, next_action_payload
 from .agent_errors import brain_error_payload
@@ -3100,12 +3101,28 @@ def _compact_registry_payload(payload: dict[str, Any]) -> dict[str, Any]:
             )
             if key in entry
         }
+        if "algorithms" in entry:
+            compact_entry["algorithms"] = entry["algorithms"]
         compact_entries.append(compact_entry)
     return {
         "abi_version": payload.get("abi_version"),
         "counts": payload.get("counts") or {},
         "capabilities": compact_entries,
     }
+
+
+def _enrich_graph_capabilities(registry: dict[str, Any]) -> dict[str, Any]:
+    algorithm_names = sorted(ALGORITHMS)
+    algorithm_entries = [ALGORITHMS[name].to_payload() for name in algorithm_names]
+    algorithm_enum = f"enum[{'|'.join(algorithm_names)}]?"
+    for entry in registry.get("capabilities") or []:
+        if not isinstance(entry, dict) or entry.get("id") != "brain.graph":
+            continue
+        inputs = dict(entry.get("inputs") or {})
+        inputs["algorithm"] = algorithm_enum
+        entry["inputs"] = inputs
+        entry["algorithms"] = algorithm_entries
+    return registry
 
 
 def _capabilities_payload(root_dir: Path, *, compact: bool = False) -> dict[str, Any]:
@@ -3118,7 +3135,7 @@ def _capabilities_payload(root_dir: Path, *, compact: bool = False) -> dict[str,
         }
         for name in sorted(MANAGE_COMMAND_NAMES)
     ]
-    registry = registry_payload()
+    registry = _enrich_graph_capabilities(registry_payload())
     if compact:
         registry = _compact_registry_payload(registry)
     payload = {
