@@ -507,7 +507,7 @@ class BoxTests(unittest.TestCase):
 
     def test_list_shows_active_boxes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            inv_path = Path(tmpdir) / "workspace" / "boxes.json"
+            inv_path = self._inventory_path_for_tmp(tmpdir)
             inv_path.parent.mkdir(parents=True)
             inv_path.write_text(json.dumps({
                 "boxes": [
@@ -674,7 +674,7 @@ class BoxTests(unittest.TestCase):
 
     def test_up_rejects_existing_active_box(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            inv_path = Path(tmpdir) / "workspace" / "boxes.json"
+            inv_path = self._inventory_path_for_tmp(tmpdir)
             inv_path.parent.mkdir(parents=True)
             inv_path.write_text(json.dumps({
                 "boxes": [
@@ -704,7 +704,7 @@ class BoxTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             env = self._env_with_inventory(tmpdir)
 
-            result = self._run("down", "ghost", "--format", "json", env=env)
+            result = self._run("down", "ghost", "--dry-run", "--format", "json", env=env)
 
             self.assertEqual(result.returncode, 1)
             payload = json.loads(result.stdout)
@@ -712,7 +712,7 @@ class BoxTests(unittest.TestCase):
 
     def test_down_dry_run_shows_planned_steps(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            inv_path = Path(tmpdir) / "workspace" / "boxes.json"
+            inv_path = self._inventory_path_for_tmp(tmpdir)
             inv_path.parent.mkdir(parents=True)
             inv_path.write_text(json.dumps({
                 "boxes": [
@@ -736,7 +736,7 @@ class BoxTests(unittest.TestCase):
     def test_upgrade_dry_run_shows_release_and_steps(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            inv_path = root / "workspace" / "boxes.json"
+            inv_path = self._inventory_path_for_tmp(tmpdir)
             inv_path.parent.mkdir(parents=True)
             inv_path.write_text(json.dumps({
                 "boxes": [
@@ -783,7 +783,7 @@ class BoxTests(unittest.TestCase):
     def test_upgrade_rejects_non_ready_box(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            inv_path = root / "workspace" / "boxes.json"
+            inv_path = self._inventory_path_for_tmp(tmpdir)
             inv_path.parent.mkdir(parents=True)
             inv_path.write_text(json.dumps({
                 "boxes": [
@@ -824,7 +824,7 @@ class BoxTests(unittest.TestCase):
     def test_upgrade_rejects_mismatched_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            inv_path = root / "workspace" / "boxes.json"
+            inv_path = self._inventory_path_for_tmp(tmpdir)
             inv_path.parent.mkdir(parents=True)
             inv_path.write_text(json.dumps({
                 "boxes": [
@@ -865,7 +865,7 @@ class BoxTests(unittest.TestCase):
     def test_inventory_round_trip(self) -> None:
         """Verify inventory serialization and deserialization."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            inv_path = Path(tmpdir) / "workspace" / "boxes.json"
+            inv_path = self._inventory_path_for_tmp(tmpdir)
             inv_path.parent.mkdir(parents=True)
 
             original = {
@@ -919,7 +919,7 @@ class BoxTests(unittest.TestCase):
 
     def test_unregister_hides_registered_box_from_list(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            inv_path = Path(tmpdir) / "workspace" / "boxes.json"
+            inv_path = self._inventory_path_for_tmp(tmpdir)
             inv_path.parent.mkdir(parents=True)
             inv_path.write_text(json.dumps({
                 "boxes": [
@@ -1022,19 +1022,25 @@ class BoxTests(unittest.TestCase):
             env=run_env,
         )
 
+    def _inventory_path_for_tmp(self, tmpdir: str) -> Path:
+        return Path(tmpdir) / ".skillbox-state" / "inventory" / "boxes.json"
+
     def _env_with_inventory(self, tmpdir: str) -> dict[str, str]:
         """Create an env dict that redirects inventory to a temp directory."""
         # We patch by setting the env var that box.py uses for REPO_ROOT
         # Since box.py derives INVENTORY_PATH from REPO_ROOT, we need a different approach.
         # The simplest: create the workspace dir structure in tmpdir and set it as working dir.
-        inv_dir = Path(tmpdir) / "workspace"
-        inv_dir.mkdir(parents=True, exist_ok=True)
+        state_root = Path(tmpdir) / ".skillbox-state"
+        state_root.mkdir(parents=True, exist_ok=True)
+        inv_path = self._inventory_path_for_tmp(tmpdir)
+        inv_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Create a wrapper that overrides INVENTORY_PATH
         return {
             "PATH": os.environ.get("PATH", ""),
             "HOME": os.environ.get("HOME", ""),
-            "SKILLBOX_BOX_INVENTORY": str(inv_dir / "boxes.json"),
+            "SKILLBOX_BOX_INVENTORY": str(inv_path),
+            "SKILLBOX_STATE_ROOT": str(state_root),
             "SKILLBOX_DO_TOKEN": "",
             "SKILLBOX_DO_SSH_KEY_ID": "",
             "SKILLBOX_TS_AUTHKEY": "",
@@ -1310,6 +1316,7 @@ class NetworkPostureContractTests(unittest.TestCase):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             pass
         try:
+            os.unlink(f.name)
             with mock.patch.object(BOX_MODULE, "inventory_path", return_value=Path(f.name)):
                 BOX_MODULE.save_inventory([box])
                 loaded = BOX_MODULE.load_inventory()
@@ -1317,7 +1324,10 @@ class NetworkPostureContractTests(unittest.TestCase):
             self.assertEqual(loaded[0].network_posture, "tailnet_only")
             self.assertEqual(loaded[0].cloud_firewall_id, "fw-abc")
         finally:
-            os.unlink(f.name)
+            try:
+                os.unlink(f.name)
+            except FileNotFoundError:
+                pass
 
     def test_box_health_includes_posture_and_violations(self):
         box = self._make_box(
