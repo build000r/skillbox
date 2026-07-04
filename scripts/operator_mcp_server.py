@@ -71,7 +71,6 @@ _HOST_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,253}[a-zA-Z0-9])?$")
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from lib.redaction import (  # noqa: E402
-    REDACTION_MARKER,
     redact_text as redact_diagnostic_text,
     redact_value as _redact_diagnostic_value,
 )

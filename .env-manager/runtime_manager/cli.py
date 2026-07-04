@@ -50,7 +50,7 @@ from .registry_docs import registry_docs_payload
 from .port_registry import port_registry_payload, port_registry_text_lines
 from .agent_adapters import collect_agent_adapter_evidence
 from .agent_graph import build_agent_graph, build_agent_graph_payload
-from .agent_graph_engine import GRAPH_ALGORITHMS, GRAPH_OUTPUT_FORMATS, graph_command_payload, render_graph_payload
+from .agent_graph_engine import GRAPH_OUTPUT_FORMATS, graph_command_payload, render_graph_payload
 from .agent_decisions import BRAIN_COMMAND_TARGET_ALIASES, explain_payload, next_action_payload
 from .agent_errors import brain_error_payload
 from .agent_search import search_payload

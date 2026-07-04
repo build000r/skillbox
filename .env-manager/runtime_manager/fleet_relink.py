@@ -68,7 +68,7 @@ from __future__ import annotations
 import os
 import shlex
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from . import machines as _machines
 from . import skill_visibility as _sv

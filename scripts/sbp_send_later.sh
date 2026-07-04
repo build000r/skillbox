@@ -892,8 +892,8 @@ list_jobs() {
     return 0
   fi
   printf '  %-26s %-9s %-10s %-20s %s\n' "ID" "STATUS" "MODE" "DUE (local)" "DEST"
-  local id mode recurring gate due_utc due_epoch status lfe lstat ovd fires maxf exp dest
-  while IFS=$'\x1f' read -r id mode recurring gate due_utc due_epoch status lfe lstat ovd fires maxf exp dest; do
+  local id mode recurring gate due_utc due_epoch status _lfe lstat ovd fires _maxf _exp dest
+  while IFS=$'\x1f' read -r id mode recurring gate due_utc due_epoch status _lfe lstat ovd fires _maxf _exp dest; do
     [[ -n "$id" ]] || continue
     printf '  %-26s %-9s %-10s %-20s %s\n' "$id" "$status" "$mode" "$(fmt_local "$due_epoch")" "$dest"
   done <<< "$records"
@@ -934,8 +934,8 @@ cmd_doctor() {
   local records; records="$(all_job_records)"
   local total=0 overdue=0 wedged=0 active=0
   local issues=()
-  local id mode recurring gate due_utc due_epoch status lfe lstat ovd fires maxf exp dest
-  while IFS=$'\x1f' read -r id mode recurring gate due_utc due_epoch status lfe lstat ovd fires maxf exp dest; do
+  local id mode recurring gate due_utc due_epoch status _lfe lstat ovd fires _maxf _exp dest
+  while IFS=$'\x1f' read -r id mode recurring gate due_utc due_epoch status _lfe lstat ovd fires _maxf _exp dest; do
     [[ -n "$id" ]] || continue
     total=$((total + 1))
     case "$status" in
@@ -1055,7 +1055,7 @@ cmd_gc() {
 # Remove all state files for a single job id.
 remove_job_files() {
   local id="$1" purge="$2" removed=0 f
-  local exts=(env done last sentfp lastsent lock fires)
+  local exts=(env "done" last sentfp lastsent lock fires)
   [[ "$purge" == "true" ]] && exts+=(log)
   for f in "${exts[@]}"; do
     if [[ -e "$STATE_DIR/$id.$f" ]]; then

@@ -12,10 +12,7 @@ sys.path.insert(0, os.path.abspath(ENV_MANAGER_DIR))
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from runtime_manager.distribution.manifest import (
-    SUPPORTED_SCHEMA_VERSION,
     ClientManifestArtifact,
-    ClientManifest,
-    ClientManifestSkill,
     ManifestSchemaError,
     filter_skills_for_target,
     parse_manifest,

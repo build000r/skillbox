@@ -11,7 +11,6 @@ from __future__ import annotations
 import fnmatch
 import fcntl
 import glob
-import hashlib
 import os
 import shutil
 import tempfile
@@ -25,8 +24,6 @@ except ModuleNotFoundError:
     yaml = None
 
 from .shared import (
-    GLOBAL_HOME_ROOT_ENV,
-    GLOBAL_HOME_SURFACES,
     atomic_write_text,
     directory_tree_sha256,
     load_json_file,

@@ -59,7 +59,6 @@ from .mcp_visibility import (
     CLAUDE_MCP_REL,
     CODEX_MCP_REL,
     _read_claude_mcp,
-    _read_codex_mcp,
     _target_config_root,
 )
 from .shared import repo_rel
