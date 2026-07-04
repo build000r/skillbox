@@ -832,7 +832,7 @@ prove readiness with `acceptance`, and open a client-ready surface under
 ### Option 1: One-command installer
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/build000r/skillbox/main/install.sh | bash -s -- --client personal
+curl -fsSL https://raw.githubusercontent.com/example/skillbox/main/install.sh | bash -s -- --client personal
 ```
 
 ### Option 2: Local checkout
@@ -1333,7 +1333,7 @@ What v1 does not do:
 version: 2
 
 skill_repos:
-  - repo: build000r/skills
+  - repo: example/skills
     ref: main
     pick: [ask-cascade, audit-plans, build-vs-clone, commit, crap, describe, divide-and-conquer, domain-planner, domain-reviewer, domain-scaffolder, mutate, oss-doc-audit, reproduce, skill-issue]
 
@@ -1481,6 +1481,16 @@ a skill is installed outside its declared availability. The policy can also
 define named `project_categories` so rules can say `categories: [frontend]`
 instead of repeating the same repo path list in every rule.
 
+Repos can also carry a durable local override file at
+`.skillbox/skill-overrides.yaml`. It is for repo-specific skill visibility
+decisions that should survive `sbp recalibrate`: `pin_on` keeps a source-backed
+skill visible in this repo, `pin_off` keeps it absent, `defaults` records repo
+defaults managed by `skill default`, and `opt_out_global` suppresses
+non-floor global defaults for this repo. Effective visibility is resolved in
+this order: dispatcher floor policy first, then the repo override file, then
+global defaults from `skill-scope.yaml`. The floor currently includes the
+dispatcher/control-plane skills, so repo overrides cannot disable floor skills.
+
 The same view is available to agents as the read-only `skillbox_skills` MCP
 tool. Run it before adding, moving, or globally installing skills so the agent
 can keep global utilities global and project/category skills local to the repos
@@ -1492,10 +1502,16 @@ Use the singular `skill` command when you want to apply that policy:
 python3 .env-manager/manage.py skill plan mcp-server-design --cwd ~/repos/opensource/skillbox
 python3 .env-manager/manage.py skill add mcp-server-design --cwd ~/repos/opensource/skillbox
 python3 .env-manager/manage.py skill activate mcp-server-design --cwd ~/repos/opensource/skillbox
+python3 .env-manager/manage.py skill why wiki --cwd "$PWD" --format json
+python3 .env-manager/manage.py skill on wiki --cwd "$PWD" --dry-run
+python3 .env-manager/manage.py skill off wiki --cwd "$PWD" --dry-run
+python3 .env-manager/manage.py skill heal wiki --cwd "$PWD" --dry-run
+python3 .env-manager/manage.py skill default on wiki --repo --cwd "$PWD" --dry-run
 python3 .env-manager/manage.py skill add ui --to category --category frontend
 python3 .env-manager/manage.py skill sync --cwd "$PWD" --dry-run
 python3 .env-manager/manage.py skill prune --cwd "$PWD" --from project --dry-run
 python3 .env-manager/manage.py skill prune --from global --dry-run
+python3 .env-manager/manage.py skill lint --cwd "$PWD"
 python3 .env-manager/manage.py skill-audit --cwd "$PWD"
 python3 .env-manager/manage.py overlay activate marketing --cwd "$PWD"
 ```
@@ -1508,15 +1524,35 @@ skills go under the matching repo/category as `.claude/skills` and
 prints an activation packet containing the source `SKILL.md`, so the current
 agent session can use the skill immediately while future Claude and Codex
 sessions discover the filesystem links normally. `overlay activate <name>` is
-the cwd-scoped hot path: it does not persist overlay state, links literal
-overlay-scoped skills into the current repo's `.claude/skills` and
-`.codex/skills`, and returns one activation packet per linked skill. Pass
-`--to global` only when you intentionally want operator-wide links in
-`~/.claude/skills` and `~/.codex/skills`; use `overlay on` for persistent
-overlay state. `overlay off <name>` unlinks cwd-local overlay symlinks by
-default; pass `--scope global` or `--scope all` for wider cleanup. `remove`,
-`move`, and `prune` require `--dry-run` first or `--yes` to apply unlinking
-actions.
+the cwd-scoped hot path: it evaluates policy with that overlay active for this
+invocation only, links only the policy-allowed set for the cwd, and does not
+persist overlay state. Pass `--to global` only when you intentionally want
+operator-wide links in `~/.claude/skills` and `~/.codex/skills`; use
+`overlay on` for persistent overlay state. `overlay off <name>` unlinks
+cwd-local overlay symlinks by default; pass `--scope global` or `--scope all`
+for wider cleanup. `remove`, `move`, and `prune` require `--dry-run` first or
+`--yes` to apply unlinking actions.
+
+The durable override verbs are the repo-local path for visibility decisions:
+
+- `sbp skill why <name>` explains the winning layer, absence reason, and exact
+  next command without mutating state.
+- `sbp skill on <name>` writes `pin_on`, links the source-backed skill into the
+  current repo, and returns an activation packet.
+- `sbp skill off <name>` writes `pin_off` and unlinks project installs.
+- `sbp skill heal <name>` resolves a real source, writes `pin_on`, links it,
+  and returns an activation packet.
+- `sbp skill default on|off <name> --repo` edits this repo's
+  `.skillbox/skill-overrides.yaml`; `--global` edits operator policy and must be
+  dry-run first, then applied with `--yes`.
+
+Security contract: repo overrides may widen visibility only inside the current
+repo. They cannot escalate a local-only skill into the global layer, cannot
+disable dispatcher floor skills such as `smart` and `sbp`, and cannot make a
+missing or typoed source effective. The prune firewall is local-widen-only:
+project prune skips `pin_on` skills, removes `pin_off` project links, never
+turns a repo pin into a global permission, and never prunes the dispatcher
+floor. Use `sbp skill lint --cwd "$PWD"` after hand-editing the override file.
 
 The repo-owned `scripts/sbp` and `scripts/sbo` wrappers delegate to the same
 lifecycle surface. Install them as `~/.local/bin/sbp` and `~/.local/bin/sbo`
@@ -1536,6 +1572,12 @@ sbp skills audit --limit 20
 sbp skill plan mcp-server-design
 sbp skill add mcp-server-design
 sbp skill activate mcp-server-design
+sbp skill why wiki --json
+sbp skill on wiki --dry-run
+sbp skill off wiki --dry-run
+sbp skill heal wiki --dry-run
+sbp skill default on wiki --repo --dry-run
+sbp skill lint
 sbp overlay activate marketing
 sbp skill add ui --to category --category frontend
 sbp skill sync --dry-run
