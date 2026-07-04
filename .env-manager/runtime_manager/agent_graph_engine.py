@@ -10,33 +10,19 @@ from .agent_cli_hints import manage_py_command
 from .agent_errors import brain_error_payload
 from .agent_timing import attach_elapsed, timer_start
 from .agent_graph_algorithms import (
+    ALGORITHMS,
     ALGORITHMS_SCHEMA_VERSION,
-    analyze_graph,
-    blast_radius,
-    critical_path,
-    cycle_evidence,
-    min_unblock_set,
     normalize_graph,
     normalized_to_payload,
-    shortest_path,
-    strongly_connected_components,
-    topological_layers,
 )
 
 GRAPH_ENGINE_SCHEMA_VERSION = "2026-06-11+agent_ops_brain.graph_engine"
 GRAPH_OUTPUT_FORMATS = frozenset({"json", "text", "dot", "mermaid"})
-GRAPH_ALGORITHMS = frozenset(
-    {
-        "all",
-        "blast-radius",
-        "critical-path",
-        "cycles",
-        "min-unblock",
-        "scc",
-        "shortest-path",
-        "topology",
-    }
-)
+GRAPH_ALGORITHMS = ALGORITHMS.keys()
+
+
+def _graph_algorithm_names() -> list[str]:
+    return sorted(ALGORITHMS)
 
 
 def _error_payload(
@@ -145,12 +131,13 @@ def _algorithm_payload(
     target: str | None = None,
     blocked_nodes: Iterable[str] | None = None,
 ) -> dict[str, Any]:
-    if algorithm not in GRAPH_ALGORITHMS:
+    algorithm = str(algorithm or "").strip()
+    if algorithm not in ALGORITHMS:
         import difflib
 
         algorithm_suggestions = difflib.get_close_matches(
-            str(algorithm or ""),
-            sorted(GRAPH_ALGORITHMS),
+            algorithm,
+            _graph_algorithm_names(),
             n=MAX_FUZZY_SUGGESTIONS,
             cutoff=0.5,
         )
@@ -168,37 +155,41 @@ def _algorithm_payload(
             f"unknown graph algorithm: {algorithm}",
             next_actions=next_actions,
             details={
-                "allowed": sorted(GRAPH_ALGORITHMS),
+                "allowed": _graph_algorithm_names(),
                 "algorithm": algorithm,
                 "suggestions": algorithm_suggestions,
             },
         )
-    if algorithm == "all":
-        return analyze_graph(graph_payload, blocked_nodes=blocked_nodes)
-    if algorithm == "topology":
-        return topological_layers(graph_payload)
-    if algorithm == "cycles":
-        return cycle_evidence(graph_payload)
-    if algorithm == "scc":
-        return strongly_connected_components(graph_payload)
-    if algorithm == "min-unblock":
-        return min_unblock_set(graph_payload, blocked_nodes=blocked_nodes)
-    if algorithm == "critical-path":
-        return critical_path(graph_payload)
-    if algorithm == "blast-radius":
-        error, resolved_node = _resolve_graph_node_id(graph_payload, str(node_id or ""), "node")
+    spec = ALGORITHMS[algorithm]
+    params: dict[str, Any] = {}
+    schema = spec.params_schema if isinstance(spec.params_schema, Mapping) else {}
+    properties = schema.get("properties") if isinstance(schema.get("properties"), Mapping) else {}
+    required = {str(item) for item in schema.get("required") or ()}
+    raw_node_params = {
+        "node_id": (node_id, "node"),
+        "source": (source, "source"),
+        "target": (target, "target"),
+    }
+    for param_name, (raw_value, role) in raw_node_params.items():
+        property_schema = properties.get(param_name)
+        has_value = bool(str(raw_value or "").strip())
+        should_resolve = (
+            param_name in required
+            or (
+                has_value
+                and isinstance(property_schema, Mapping)
+                and bool(property_schema.get("x-resolve-node"))
+            )
+        )
+        if not should_resolve:
+            continue
+        error, resolved_node = _resolve_graph_node_id(graph_payload, str(raw_value or ""), role)
         if error:
             return error
-        return blast_radius(graph_payload, str(resolved_node))
-    if algorithm == "shortest-path":
-        error, resolved_source = _resolve_graph_node_id(graph_payload, str(source or ""), "source")
-        if error:
-            return error
-        error, resolved_target = _resolve_graph_node_id(graph_payload, str(target or ""), "target")
-        if error:
-            return error
-        return shortest_path(graph_payload, str(resolved_source), str(resolved_target))
-    raise AssertionError(f"unhandled graph algorithm: {algorithm}")
+        params[param_name] = str(resolved_node)
+    if "blocked_nodes" in properties and blocked_nodes is not None:
+        params["blocked_nodes"] = blocked_nodes
+    return spec.run(graph_payload, **params)
 
 
 def graph_command_payload(
@@ -316,7 +307,7 @@ def graph_text_summary(payload: Mapping[str, Any]) -> str:
     if isinstance(algorithm, Mapping):
         result = algorithm.get("result") if isinstance(algorithm.get("result"), Mapping) else {}
         lines.append(f"algorithm: {algorithm.get('name')} ok={bool(result.get('ok', True))}")
-        reason = str(result.get("reason") or "")
+        reason = str(result.get("reason") or result.get("summary_line") or "")
         if reason:
             lines.append(f"reason: {reason}")
     return "\n".join(lines)

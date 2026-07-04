@@ -4,13 +4,70 @@ from __future__ import annotations
 import heapq
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from .agent_graph import GRAPH_SCHEMA_VERSION, AgentGraph
 from .graph_cycle_evidence import cycle_evidence as shared_cycle_evidence
 
 ALGORITHMS_SCHEMA_VERSION = "2026-06-11+agent_ops_brain.algorithms"
 DEFAULT_BLOCKER_EDGE_KINDS = ("depends_on", "blocked_by")
+AlgorithmResult = dict[str, Any]
+
+
+@dataclass(frozen=True)
+class AlgorithmSpec:
+    name: str
+    summary: str
+    run: Callable[..., AlgorithmResult]
+    params_schema: Mapping[str, Any]
+    text_renderer: Callable[[Mapping[str, Any]], str] | None = None
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "summary": self.summary,
+            "params_schema": dict(self.params_schema),
+        }
+
+
+ALGORITHMS: dict[str, AlgorithmSpec] = {}
+
+
+def register_algorithm(spec: AlgorithmSpec) -> AlgorithmSpec:
+    """Register one graph algorithm spec by stable CLI name."""
+    name = str(spec.name or "").strip()
+    if not name:
+        raise ValueError("algorithm name is required")
+    if name in ALGORITHMS:
+        raise ValueError(f"graph algorithm already registered: {name}")
+    if name != spec.name:
+        spec = AlgorithmSpec(
+            name=name,
+            summary=spec.summary,
+            run=spec.run,
+            params_schema=spec.params_schema,
+            text_renderer=spec.text_renderer,
+        )
+    ALGORITHMS[name] = spec
+    return spec
+
+
+def algorithm_result(
+    algorithm: str,
+    summary_line: str,
+    data: Mapping[str, Any],
+    warnings: Iterable[Mapping[str, Any] | str] | None = None,
+) -> AlgorithmResult:
+    """Return the registry result envelope while preserving legacy result keys."""
+    result: AlgorithmResult = {
+        "algorithm": algorithm,
+        "summary_line": summary_line,
+        "data": dict(data),
+        "warnings": list(warnings or ()),
+    }
+    for key, value in data.items():
+        result.setdefault(str(key), value)
+    return result
 
 
 @dataclass(frozen=True)
@@ -591,13 +648,227 @@ def analyze_graph(
     }
 
 
+def _summary_from(data: Mapping[str, Any], fallback: str) -> str:
+    reason = str(data.get("reason") or "").strip()
+    return reason or fallback
+
+
+def _warnings_from(data: Mapping[str, Any]) -> list[Mapping[str, Any] | str]:
+    warnings = data.get("warnings")
+    return list(warnings) if isinstance(warnings, list) else []
+
+
+def _edge_kinds_param(
+    params: Mapping[str, Any],
+    default: Iterable[str] | None,
+) -> Iterable[str] | None:
+    raw_value = params.get("edge_kinds", default)
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, str):
+        return (raw_value,)
+    return tuple(str(kind) for kind in raw_value if str(kind))
+
+
+def _run_analyze_graph(graph: AgentGraph | Mapping[str, Any], **params: Any) -> AlgorithmResult:
+    data = analyze_graph(graph, blocked_nodes=params.get("blocked_nodes"))
+    return algorithm_result(
+        "all",
+        f"analyzed {data.get('node_count', 0)} node(s) and {data.get('edge_count', 0)} edge(s)",
+        data,
+        _warnings_from(data),
+    )
+
+
+def _run_topological_layers(graph: AgentGraph | Mapping[str, Any], **params: Any) -> AlgorithmResult:
+    data = topological_layers(graph, edge_kinds=_edge_kinds_param(params, ("depends_on",)))
+    return algorithm_result("topology", _summary_from(data, "topology analyzed"), data, _warnings_from(data))
+
+
+def _run_cycle_evidence(graph: AgentGraph | Mapping[str, Any], **params: Any) -> AlgorithmResult:
+    data = cycle_evidence(graph, edge_kinds=_edge_kinds_param(params, ("depends_on",)))
+    return algorithm_result("cycles", _summary_from(data, "cycle evidence analyzed"), data, _warnings_from(data))
+
+
+def _run_strongly_connected_components(
+    graph: AgentGraph | Mapping[str, Any],
+    **params: Any,
+) -> AlgorithmResult:
+    data = strongly_connected_components(graph, edge_kinds=_edge_kinds_param(params, ("depends_on",)))
+    return algorithm_result("scc", _summary_from(data, "strongly connected components analyzed"), data, _warnings_from(data))
+
+
+def _run_critical_path(graph: AgentGraph | Mapping[str, Any], **params: Any) -> AlgorithmResult:
+    data = critical_path(graph, edge_kinds=_edge_kinds_param(params, ("depends_on",)))
+    return algorithm_result("critical-path", _summary_from(data, "critical path analyzed"), data, _warnings_from(data))
+
+
+def _run_min_unblock_set(graph: AgentGraph | Mapping[str, Any], **params: Any) -> AlgorithmResult:
+    data = min_unblock_set(
+        graph,
+        blocked_nodes=params.get("blocked_nodes"),
+        edge_kinds=_edge_kinds_param(params, DEFAULT_BLOCKER_EDGE_KINDS) or DEFAULT_BLOCKER_EDGE_KINDS,
+    )
+    return algorithm_result("min-unblock", _summary_from(data, "minimum unblock set analyzed"), data, _warnings_from(data))
+
+
+def _run_shortest_path(graph: AgentGraph | Mapping[str, Any], **params: Any) -> AlgorithmResult:
+    data = shortest_path(
+        graph,
+        str(params.get("source") or ""),
+        str(params.get("target") or ""),
+        edge_kinds=_edge_kinds_param(params, None),
+        reverse=bool(params.get("reverse", False)),
+    )
+    return algorithm_result("shortest-path", _summary_from(data, "shortest path analyzed"), data, _warnings_from(data))
+
+
+def _run_blast_radius(graph: AgentGraph | Mapping[str, Any], **params: Any) -> AlgorithmResult:
+    max_depth = params.get("max_depth")
+    data = blast_radius(
+        graph,
+        str(params.get("node_id") or ""),
+        edge_kinds=_edge_kinds_param(params, DEFAULT_BLOCKER_EDGE_KINDS) or DEFAULT_BLOCKER_EDGE_KINDS,
+        max_depth=int(max_depth) if max_depth is not None else None,
+    )
+    return algorithm_result("blast-radius", _summary_from(data, "blast radius analyzed"), data, _warnings_from(data))
+
+
+def _summary_text(result: Mapping[str, Any]) -> str:
+    return str(result.get("summary_line") or "")
+
+
+_NO_PARAMS_SCHEMA = {"type": "object", "properties": {}, "required": []}
+_EDGE_KINDS_PARAM = {"type": "array", "items": {"type": "string"}}
+_BLOCKED_NODES_PARAM = {"type": "array", "items": {"type": "string"}}
+
+register_algorithm(
+    AlgorithmSpec(
+        name="topology",
+        summary="Dependency-first topological layers and cycle blockers.",
+        run=_run_topological_layers,
+        params_schema={
+            "type": "object",
+            "properties": {"edge_kinds": _EDGE_KINDS_PARAM},
+            "required": [],
+        },
+        text_renderer=_summary_text,
+    )
+)
+register_algorithm(
+    AlgorithmSpec(
+        name="cycles",
+        summary="Compact dependency cycle evidence.",
+        run=_run_cycle_evidence,
+        params_schema={
+            "type": "object",
+            "properties": {"edge_kinds": _EDGE_KINDS_PARAM},
+            "required": [],
+        },
+        text_renderer=_summary_text,
+    )
+)
+register_algorithm(
+    AlgorithmSpec(
+        name="scc",
+        summary="Tarjan strongly connected components.",
+        run=_run_strongly_connected_components,
+        params_schema={
+            "type": "object",
+            "properties": {"edge_kinds": _EDGE_KINDS_PARAM},
+            "required": [],
+        },
+        text_renderer=_summary_text,
+    )
+)
+register_algorithm(
+    AlgorithmSpec(
+        name="critical-path",
+        summary="Longest dependency-first path in an acyclic graph.",
+        run=_run_critical_path,
+        params_schema={
+            "type": "object",
+            "properties": {"edge_kinds": _EDGE_KINDS_PARAM},
+            "required": [],
+        },
+        text_renderer=_summary_text,
+    )
+)
+register_algorithm(
+    AlgorithmSpec(
+        name="min-unblock",
+        summary="Greedy blocker set to clear blocked targets.",
+        run=_run_min_unblock_set,
+        params_schema={
+            "type": "object",
+            "properties": {"blocked_nodes": _BLOCKED_NODES_PARAM, "edge_kinds": _EDGE_KINDS_PARAM},
+            "required": [],
+        },
+        text_renderer=_summary_text,
+    )
+)
+register_algorithm(
+    AlgorithmSpec(
+        name="shortest-path",
+        summary="Deterministic weighted shortest path between two nodes.",
+        run=_run_shortest_path,
+        params_schema={
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "x-resolve-node": True},
+                "target": {"type": "string", "x-resolve-node": True},
+                "edge_kinds": _EDGE_KINDS_PARAM,
+                "reverse": {"type": "boolean"},
+            },
+            "required": ["source", "target"],
+        },
+        text_renderer=_summary_text,
+    )
+)
+register_algorithm(
+    AlgorithmSpec(
+        name="blast-radius",
+        summary="Downstream nodes affected by a dependency or blocker.",
+        run=_run_blast_radius,
+        params_schema={
+            "type": "object",
+            "properties": {
+                "node_id": {"type": "string", "x-resolve-node": True},
+                "edge_kinds": _EDGE_KINDS_PARAM,
+                "max_depth": {"type": "integer"},
+            },
+            "required": ["node_id"],
+        },
+        text_renderer=_summary_text,
+    )
+)
+register_algorithm(
+    AlgorithmSpec(
+        name="all",
+        summary="Default bundle: topology, SCCs, cycles, critical path, and unblock set.",
+        run=_run_analyze_graph,
+        params_schema={
+            "type": "object",
+            "properties": {"blocked_nodes": _BLOCKED_NODES_PARAM},
+            "required": [],
+        },
+        text_renderer=_summary_text,
+    )
+)
+
+
 __all__ = [
+    "ALGORITHMS",
     "ALGORITHMS_SCHEMA_VERSION",
+    "AlgorithmResult",
+    "AlgorithmSpec",
     "DEFAULT_BLOCKER_EDGE_KINDS",
     "NormalizedEdge",
     "NormalizedGraph",
+    "algorithm_result",
     "normalize_graph",
     "normalized_to_payload",
+    "register_algorithm",
     "topological_layers",
     "strongly_connected_components",
     "cycle_evidence",

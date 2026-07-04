@@ -11,6 +11,7 @@ ENV_MANAGER_DIR = ROOT_DIR / ".env-manager"
 if str(ENV_MANAGER_DIR) not in sys.path:
     sys.path.insert(0, str(ENV_MANAGER_DIR))
 
+from runtime_manager import agent_graph_algorithms as ALGO  # noqa: E402
 from runtime_manager import agent_graph_engine as ENGINE  # noqa: E402
 
 
@@ -147,6 +148,39 @@ class AgentGraphEngineTests(unittest.TestCase):
         self.assertTrue(
             any("critical-path" in action for action in payload.get("next_actions") or [])
         )
+
+    def test_registered_toy_algorithm_runs_without_engine_edit(self) -> None:
+        original_algorithms = dict(ALGO.ALGORITHMS)
+
+        def run_toy(graph: dict[str, object], **_params: object) -> dict[str, object]:
+            normalized = ALGO.normalize_graph(graph)
+            return ALGO.algorithm_result(
+                "toy-registry",
+                f"counted {len(normalized.nodes)} node(s)",
+                {"ok": True, "node_count": len(normalized.nodes)},
+            )
+
+        try:
+            ALGO.register_algorithm(
+                ALGO.AlgorithmSpec(
+                    name="toy-registry",
+                    summary="Toy algorithm used to prove registry-backed dispatch.",
+                    run=run_toy,
+                    params_schema={"type": "object", "properties": {}, "required": []},
+                )
+            )
+
+            payload = ENGINE.graph_command_payload(_fixture_graph(), algorithm="toy-registry")
+
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["algorithm"]["name"], "toy-registry")
+            self.assertEqual(payload["algorithm"]["result"]["algorithm"], "toy-registry")
+            self.assertEqual(payload["algorithm"]["result"]["summary_line"], "counted 5 node(s)")
+            self.assertEqual(payload["algorithm"]["result"]["data"]["node_count"], 5)
+            self.assertEqual(payload["algorithm"]["result"]["node_count"], 5)
+        finally:
+            ALGO.ALGORITHMS.clear()
+            ALGO.ALGORITHMS.update(original_algorithms)
 
 
 if __name__ == "__main__":
