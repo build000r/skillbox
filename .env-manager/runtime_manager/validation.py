@@ -12,11 +12,15 @@ from .graph_cycle_evidence import cycle_evidence
 from lib.runtime_model import (  # noqa: E402
     LOCAL_RUNTIME_COVERAGE_GAP,
     LOCAL_RUNTIME_ERROR_CODES,
-    PARITY_LEDGER_ACTIONS,
-    PARITY_OWNERSHIP_STATES,
     PROJECT_KIND_IOS,
     VALID_PROJECT_KINDS,
     IOS_COMMAND_LANES,
+)
+from lib.parity_schema import (  # noqa: E402
+    PARITY_LEDGER_INVALID,
+    ParityLedgerRow,
+    ParityLedgerSchemaError,
+    parse_ledger_row,
 )
 
 LOCAL_RUNTIME_DEPENDENCY_CYCLE = "LOCAL_RUNTIME_DEPENDENCY_CYCLE"
@@ -28,6 +32,7 @@ LOCAL_RUNTIME_ERROR_CODES = frozenset(
         LOCAL_RUNTIME_DEPENDENCY_UNKNOWN,
     }
 )
+_build_runtime_model_without_parity_schema = build_runtime_model
 
 VALID_INGRESS_ROUTE_LISTENERS = {"public", "private"}
 VALID_INGRESS_ROUTE_MATCHES = {"exact", "prefix"}
@@ -38,6 +43,12 @@ SKILL_FORGE_STALE = "SKILL_FORGE_STALE"
 SKILL_FORGE_PENDING = "SKILL_FORGE_PENDING"
 SKILL_FORGE_UNSCORED = "SKILL_FORGE_UNSCORED"
 SKILL_FORGE_UNSCORED_THRESHOLD = 3
+
+
+def build_runtime_model(root_dir: Path) -> dict[str, Any]:
+    model = _build_runtime_model_without_parity_schema(root_dir)
+    _parse_parity_ledger_rows(model)
+    return model
 
 
 def _looks_like_ingress_origin(raw_value: Any) -> bool:
@@ -3406,49 +3417,52 @@ def _parity_ledger_graph_ids(model: dict[str, Any]) -> tuple[set[str], set[str],
     )
 
 
-def _parity_ledger_item_values(item: dict[str, Any]) -> tuple[str, str, str, Any, str, str, bool]:
-    item_id = str(item.get("id", "")).strip() or "(missing id)"
-    action = str(item.get("action", "")).strip()
-    ownership_state = str(item.get("ownership_state", "")).strip()
-    bridge_dependency = item.get("bridge_dependency")
-    request_error_raw = item.get("request_error")
-    request_error = str(request_error_raw).strip() if request_error_raw is not None else ""
-    surface = str(item.get("legacy_surface", "")).strip() or item_id
-    surface_type = str(item.get("surface_type", "service")).strip() or "service"
-    return item_id, action, ownership_state, bridge_dependency, request_error, surface, surface_type == "service"
+def _parity_ledger_source(model: dict[str, Any], item: dict[str, Any]) -> str:
+    client_id = str(item.get("client") or "").strip()
+    if client_id:
+        for client in model.get("clients") or []:
+            if str(client.get("id") or "").strip() == client_id:
+                source = str(client.get("_overlay_path") or "").strip()
+                if source:
+                    return source
+    return str(model.get("manifest_file") or "runtime manifest")
 
 
-def _parity_enum_issues(
-    item_id: str,
-    *,
-    action: str,
-    ownership_state: str,
-    request_error: str,
-) -> list[str]:
-    issues: list[str] = []
-    if action and action not in PARITY_LEDGER_ACTIONS:
-        issues.append(f"parity_ledger {item_id}: unsupported action {action!r}")
-    if ownership_state and ownership_state not in PARITY_OWNERSHIP_STATES:
-        issues.append(f"parity_ledger {item_id}: unsupported ownership_state {ownership_state!r}")
-    if request_error and request_error not in LOCAL_RUNTIME_ERROR_CODES:
-        issues.append(
-            f"parity_ledger {item_id}: request_error {request_error!r} is not one of "
-            f"the stable error codes"
+def _parse_parity_ledger_rows(model: dict[str, Any]) -> list[ParityLedgerRow]:
+    rows: list[ParityLedgerRow] = []
+    for index, item in enumerate(model.get("parity_ledger") or []):
+        source = _parity_ledger_source(model, item) if isinstance(item, dict) else str(
+            model.get("manifest_file") or "runtime manifest"
         )
-    return issues
+        try:
+            rows.append(
+                parse_ledger_row(
+                    item,
+                    index=index,
+                    source=source,
+                    known_error_codes=LOCAL_RUNTIME_ERROR_CODES,
+                )
+            )
+        except ParityLedgerSchemaError as exc:
+            raise ValidationError(
+                PARITY_LEDGER_INVALID,
+                str(exc),
+                context=exc.context,
+            ) from exc
+    return rows
 
 
 def _parity_bridge_dependency_issues(
     item_id: str,
-    bridge_dependency: Any,
+    bridge_dependency: str | None,
     *,
     bridge_ids: set[str],
     task_ids: set[str],
 ) -> list[str]:
-    if bridge_dependency is None or not str(bridge_dependency).strip():
+    if not bridge_dependency:
         return []
 
-    dep_id = str(bridge_dependency).strip()
+    dep_id = bridge_dependency
     if dep_id in task_ids and dep_id not in bridge_ids:
         return [
             f"parity_ledger {item_id}: bridge_dependency {dep_id!r} refers to a "
@@ -3512,40 +3526,27 @@ def _parity_service_cross_reference(
 
 
 def _parity_ledger_item_result(
-    item: dict[str, Any],
+    item: ParityLedgerRow,
     *,
     bridge_ids: set[str],
     task_ids: set[str],
     service_ids: set[str],
 ) -> tuple[list[str], str | None, str | None]:
-    (
-        item_id,
-        action,
-        ownership_state,
-        bridge_dependency,
-        request_error,
-        surface,
-        is_service_row,
-    ) = _parity_ledger_item_values(item)
-    issues = _parity_enum_issues(
-        item_id,
-        action=action,
-        ownership_state=ownership_state,
-        request_error=request_error,
-    )
+    item_id = item.id or "(missing id)"
+    issues: list[str] = []
     issues.extend(
         _parity_bridge_dependency_issues(
             item_id,
-            bridge_dependency,
+            item.bridge_dependency,
             bridge_ids=bridge_ids,
             task_ids=task_ids,
         )
     )
     service_issues, covered_service, deferred_surface = _parity_service_cross_reference(
         item_id=item_id,
-        ownership_state=ownership_state,
-        surface=surface,
-        is_service_row=is_service_row,
+        ownership_state=item.ownership_state,
+        surface=item.surface_id,
+        is_service_row=item.is_service_row,
         service_ids=service_ids,
     )
     issues.extend(service_issues)
@@ -3586,12 +3587,20 @@ def validate_parity_ledger(model: dict[str, Any]) -> list[CheckResult]:
 
     bridge_ids, task_ids, service_ids = _parity_ledger_graph_ids(model)
     issues: list[str] = []
+    schema_warnings: list[dict[str, Any]] = []
     covered_services: list[str] = []
     deferred_surfaces: list[str] = []
 
-    for item in ledger:
+    for row in _parse_parity_ledger_rows(model):
+        for warning in row.warnings:
+            schema_warnings.append(
+                {
+                    **warning.to_dict(),
+                    "provenance": dict(row.provenance),
+                }
+            )
         item_issues, covered_service, deferred_surface = _parity_ledger_item_result(
-            item,
+            row,
             bridge_ids=bridge_ids,
             task_ids=task_ids,
             service_ids=service_ids,
@@ -3611,6 +3620,7 @@ def validate_parity_ledger(model: dict[str, Any]) -> list[CheckResult]:
                 details={
                     "error_code": LOCAL_RUNTIME_COVERAGE_GAP,
                     "issues": issues,
+                    "warnings": schema_warnings,
                     "covered_services": sorted(set(covered_services)),
                     "deferred_surfaces": sorted(set(deferred_surfaces)),
                 },
@@ -3625,6 +3635,7 @@ def validate_parity_ledger(model: dict[str, Any]) -> list[CheckResult]:
             details={
                 "covered_services": sorted(set(covered_services)),
                 "deferred_surfaces": sorted(set(deferred_surfaces)),
+                "warnings": schema_warnings,
             },
         )
     ]

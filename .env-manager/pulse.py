@@ -602,7 +602,16 @@ def load_pulse_state(root_dir: Path) -> "PulseState":
         (candidate for candidate in pulse_state_candidates(root_dir) if candidate.is_file()),
         pulse_state_path(root_dir),
     )
-    payload = _read_json_object(state_path)
+    payload: dict[str, Any] = {}
+    if state_path.is_file():
+        try:
+            raw_payload = json.loads(state_path.read_text(encoding="utf-8"))
+            if isinstance(raw_payload, dict):
+                payload = raw_payload
+            else:
+                log("warn", "pulse state was not an object; starting clean", path=str(state_path))
+        except (OSError, json.JSONDecodeError) as exc:
+            log("warn", "failed to read pulse state; starting clean", path=str(state_path), error=str(exc))
     port_sentinel = payload.get("port_sentinel") if isinstance(payload.get("port_sentinel"), dict) else {}
     state.port_sentinel_counters = _normalize_port_guard_counters(port_sentinel)
     _merge_port_guard_counters(state, _external_port_guard_counters(root_dir))
@@ -957,6 +966,7 @@ def reconcile_once(
         return
     model, profiles, clients = loaded
     _handle_pulse_config_change(root_dir, state, model, auto_sync=auto_sync)
+    _prune_pulse_state_to_model(state, model)
     now = time.monotonic()
     _reconcile_pulse_services(
         model,
@@ -1025,6 +1035,31 @@ def _handle_pulse_config_change(
     if auto_sync:
         _pulse_auto_sync(model, state)
     state.config_hash = new_hash
+
+
+def _prune_pulse_state_to_model(state: PulseState, model: dict[str, Any]) -> None:
+    service_ids = {
+        str(service.get("id") or "").strip()
+        for service in model.get("services", [])
+        if str(service.get("id") or "").strip()
+    }
+    check_ids = {
+        str(check.get("id") or "").strip()
+        for check in model.get("checks", [])
+        if str(check.get("id") or "").strip()
+    }
+    for mapping in (
+        state.service_states,
+        state.restart_backoff,
+        state.restart_attempts,
+        state.unhealthy_since,
+    ):
+        for service_id in list(mapping):
+            if service_id not in service_ids:
+                mapping.pop(service_id, None)
+    for check_id in list(state.check_states):
+        if check_id not in check_ids:
+            state.check_states.pop(check_id, None)
 
 
 def _pulse_auto_sync(model: dict[str, Any], state: PulseState) -> None:

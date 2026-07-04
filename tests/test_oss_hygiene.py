@@ -54,8 +54,8 @@ PRIVATE_PATTERNS = (
     re.compile(r"/Users/" + "b" + r"(?=/)"),
     re.compile(r"github\.com/" + re.escape(_PRIVATE_OWNER) + r"/"),
     re.compile(r"\b(" + "|".join(re.escape(name) for name in _PRIVATE_REPOS) + r")\b"),
-    re.compile(r"/srv/skillbox/repos/skills-private\b"),
-    re.compile(r"/home/skillbox/repos/(marketing" + "skills" + r"|skills-private)\b"),
+    re.compile(r"/srv/skillbox/repos/skills-" + "private" + r"\b"),
+    re.compile(r"/home/skillbox/repos/(marketing" + "skills" + r"|skills-" + "private" + r")\b"),
 )
 
 

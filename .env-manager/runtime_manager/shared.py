@@ -2660,10 +2660,67 @@ def validate_client_id(client_id: str) -> str:
     return normalized
 
 
-def atomic_write_text(path: Path, content: str) -> None:
-    # Crash-safe text write: stage to a sibling temp file, then os.replace().
-    # A mid-write crash leaves the previous content intact instead of a
-    # truncated half-write that downstream readers would treat as valid.
+_ATOMICITY_KILL_AT_ENV = "SKILLBOX_TEST_ATOMICITY_KILL_AT"
+_ATOMICITY_COUNTER_ENV = "SKILLBOX_TEST_ATOMICITY_COUNTER_FILE"
+_atomicity_checkpoint_count = 0
+
+
+def _atomicity_checkpoint(label: str) -> None:
+    """Test-only kill hook for sync atomicity harnesses.
+
+    Production runs do nothing: the hook is enabled only by an intentionally
+    obscure test env var. Keeping the hook in the shared write primitive lets
+    tests SIGKILL at deterministic publish boundaries without real sleeps.
+    """
+    raw_target = os.environ.get(_ATOMICITY_KILL_AT_ENV)
+    if not raw_target:
+        return
+    try:
+        target = int(raw_target)
+    except ValueError:
+        return
+
+    global _atomicity_checkpoint_count
+    _atomicity_checkpoint_count += 1
+    checkpoint = _atomicity_checkpoint_count
+
+    counter_path = os.environ.get(_ATOMICITY_COUNTER_ENV)
+    if counter_path:
+        try:
+            Path(counter_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(counter_path).write_text(
+                json.dumps({"checkpoint": checkpoint, "label": label}) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    if checkpoint == target:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def atomic_write_bytes(
+    path: Path,
+    payload: bytes,
+    *,
+    mode: int | None = None,
+    fsync: bool = True,
+) -> None:
+    # Crash-safe byte write: stage to a sibling temp file, then os.replace().
+    path = Path(path)
     tmp_fd, tmp_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
         suffix=".tmp",
@@ -2671,15 +2728,28 @@ def atomic_write_text(path: Path, content: str) -> None:
     )
     tmp_path = Path(tmp_name)
     try:
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
+        with os.fdopen(tmp_fd, "wb") as handle:
+            handle.write(payload)
+            if mode is not None:
+                os.fchmod(handle.fileno(), mode)
+            if fsync:
+                handle.flush()
+                os.fsync(handle.fileno())
+        _atomicity_checkpoint(f"file-before-replace:{path}")
         os.replace(tmp_path, path)
+        if fsync:
+            _fsync_directory(path.parent)
+        _atomicity_checkpoint(f"file-after-replace:{path}")
     except BaseException:
         try:
             tmp_path.unlink()
         except FileNotFoundError:
             pass
         raise
+
+
+def atomic_write_text(path: Path, content: str, *, fsync: bool = True) -> None:
+    atomic_write_bytes(path, content.encode("utf-8"), fsync=fsync)
 
 
 def write_text_file(path: Path, content: str, dry_run: bool) -> None:
@@ -2781,25 +2851,7 @@ def read_json_tolerant(path: Path, default: Any = None) -> Any:
 
 def _atomic_write_json_serialized(path: Path, serialized: str) -> None:
     """Temp-write + flush + fsync + atomic rename of pre-serialized JSON."""
-    path = Path(path)
-    tmp_fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=str(path.parent),
-    )
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
-            handle.write(serialized)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, path)
-    except BaseException:
-        try:
-            tmp_path.unlink()
-        except FileNotFoundError:
-            pass
-        raise
+    atomic_write_text(Path(path), serialized, fsync=True)
 
 
 def atomic_write_json(path: Path, data: Any, *, indent: int = 2) -> None:
@@ -3488,7 +3540,7 @@ def ensure_client_scaffold_skill_sources(
         if target_dir.exists():
             continue
         if not dry_run:
-            shutil.copytree(source_dir, target_dir)
+            copy_tree_atomic(source_dir, target_dir)
         actions.append(f"copy-skill-template: {repo_rel(root_dir, target_dir)}")
     return actions
 
@@ -3844,6 +3896,88 @@ def remove_path(path: Path) -> None:
         path.unlink()
 
 
+def _recover_interrupted_tree_swap(target_dir: Path, backup_dir: Path) -> None:
+    if backup_dir.exists() and not target_dir.exists():
+        backup_dir.replace(target_dir)
+        _fsync_directory(target_dir.parent)
+        return
+    if backup_dir.exists():
+        remove_path(backup_dir)
+
+
+def atomic_replace_tree(
+    target_dir: Path,
+    build_fn: Callable[[Path], None],
+    *,
+    root_mode: int | None = None,
+    fsync: bool = False,
+) -> None:
+    """Build a directory in a sibling stage and publish it with rename.
+
+    Directory replacement cannot portably exchange a populated existing tree in
+    one syscall, so an existing target is first renamed to a sibling backup and
+    restored on failure. A SIGKILL during that narrow publish window can leave
+    the target absent, but never half-populated; lockfile-last sync ordering
+    lets doctor report the item as unsynced and the next sync restores it.
+    """
+    target_dir = Path(target_dir)
+    parent = target_dir.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    backup_dir = parent / f".{target_dir.name}.old"
+    _recover_interrupted_tree_swap(target_dir, backup_dir)
+
+    stage_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f".{target_dir.name}.stage.",
+            dir=str(parent),
+        )
+    )
+    try:
+        build_fn(stage_dir)
+        if root_mode is not None:
+            stage_dir.chmod(root_mode)
+        if fsync:
+            for file_path in sorted(path for path in stage_dir.rglob("*") if path.is_file()):
+                if file_path.is_symlink():
+                    continue
+                try:
+                    with file_path.open("rb") as handle:
+                        os.fsync(handle.fileno())
+                except OSError:
+                    pass
+        _atomicity_checkpoint(f"tree-before-swap:{target_dir}")
+        if target_dir.exists() or target_dir.is_symlink():
+            if backup_dir.exists():
+                remove_path(backup_dir)
+            target_dir.replace(backup_dir)
+            _atomicity_checkpoint(f"tree-after-backup:{target_dir}")
+        stage_dir.replace(target_dir)
+        if fsync:
+            _fsync_directory(target_dir)
+        _fsync_directory(parent)
+        _atomicity_checkpoint(f"tree-after-publish:{target_dir}")
+        if backup_dir.exists():
+            remove_path(backup_dir)
+            _fsync_directory(parent)
+    except BaseException:
+        try:
+            if stage_dir.exists():
+                remove_path(stage_dir)
+            if backup_dir.exists() and not target_dir.exists():
+                backup_dir.replace(target_dir)
+                _fsync_directory(parent)
+        except OSError:
+            pass
+        raise
+
+
+def copy_tree_atomic(source_dir: Path, target_dir: Path) -> None:
+    def _build(stage_dir: Path) -> None:
+        shutil.copytree(source_dir, stage_dir, dirs_exist_ok=True)
+
+    atomic_replace_tree(target_dir, _build)
+
+
 def digest_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
@@ -4066,30 +4200,30 @@ def filtered_copy_skill(source_dir: Path, target_dir: Path) -> str:
 
     patterns = _load_skillignore(source_dir)
 
-    remove_path(target_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
+    def _build(stage_dir: Path) -> None:
+        for source_file in sorted(source_dir.rglob("*")):
+            rel = source_file.relative_to(source_dir).as_posix()
 
-    for source_file in sorted(source_dir.rglob("*")):
-        rel = source_file.relative_to(source_dir).as_posix()
+            if _matches_skillignore(rel, patterns):
+                continue
 
-        if _matches_skillignore(rel, patterns):
-            continue
+            if rel == ".skillignore":
+                continue
 
-        if rel == ".skillignore":
-            continue
+            if source_file.is_symlink():
+                raise RuntimeError(
+                    "Refusing to install skill with symlinked file: "
+                    f"{source_file.relative_to(source_dir)}"
+                )
 
-        if source_file.is_symlink():
-            raise RuntimeError(
-                "Refusing to install skill with symlinked file: "
-                f"{source_file.relative_to(source_dir)}"
-            )
+            if not source_file.is_file():
+                continue
 
-        if not source_file.is_file():
-            continue
+            dest = stage_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(source_file), str(dest))
 
-        dest = target_dir / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(source_file), str(dest))
+    atomic_replace_tree(target_dir, _build, root_mode=0o755)
 
     tree_sha = directory_tree_sha256(target_dir)
     if tree_sha is None:
@@ -5147,7 +5281,7 @@ def migrate_client_overlay_tree(root_dir: Path, source_root: Path, target_root: 
         if dest.exists():
             actions.append(f"skip-client-existing: {repo_rel(root_dir, dest)}")
             continue
-        shutil.copytree(child, dest)
+        copy_tree_atomic(child, dest)
         migrated_clients.append(child.name)
         actions.append(f"copy-client: {repo_rel(root_dir, dest)}")
     return actions, migrated_clients
@@ -5177,9 +5311,9 @@ def migrate_client_subtree(
                 actions.append(f"skip-client-{subdir_name}-entry-existing: {repo_rel(root_dir, entry_dest)}")
                 continue
             if entry.is_dir():
-                shutil.copytree(entry, entry_dest)
+                copy_tree_atomic(entry, entry_dest)
             else:
-                shutil.copy2(entry, entry_dest)
+                atomic_write_bytes(entry_dest, entry.read_bytes())
             copied_any = True
             actions.append(f"copy-client-{subdir_name}-entry: {repo_rel(root_dir, entry_dest)}")
         if not copied_any and not any(dest.iterdir()):
@@ -5387,7 +5521,7 @@ def init_private_repo(root_dir: Path, *, target_dir_arg: str | None = None) -> d
     shared_skills_root = current_clients_root / "_shared"
     target_shared_skills_root = target_clients_root / "_shared"
     if shared_skills_root.is_dir() and not target_shared_skills_root.exists():
-        shutil.copytree(shared_skills_root, target_shared_skills_root)
+        copy_tree_atomic(shared_skills_root, target_shared_skills_root)
         actions.append(f"copy-client-shared: {repo_rel(root_dir, target_shared_skills_root)}")
     for child in sorted(target_clients_root.iterdir()):
         if not child.is_dir():

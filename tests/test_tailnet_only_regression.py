@@ -5,10 +5,8 @@ policy, and supporting scripts remain correct. Future refactors that reopen
 public SSH or wildcard exposure must fail one of these tests.
 """
 
-import os
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock

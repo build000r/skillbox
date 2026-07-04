@@ -57,20 +57,18 @@ _DRY_RUN_PROP: dict = {
     "default": False,
 }
 
-# ---------------------------------------------------------------------------
-# Identifier validation (path traversal / flag injection guard)
-# ---------------------------------------------------------------------------
-
-_IDENTIFIER_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
-_SSH_USER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$")
-_HOST_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,253}[a-zA-Z0-9])?$")
-
-# Single source of truth for secret redaction (scripts/lib/redaction.py), same
-# leaf-import direction as lib.runtime_model. ``redact_diagnostic_text`` and
-# ``_redact_diagnostic_value`` are preserved as thin aliases because call sites
-# (including the box_exec audit path) and tests reference these exact names.
+# Shared operator-side validation, inventory containment, and subprocess
+# helpers live in lib.opslib. Redaction aliases are preserved because call
+# sites (including the box_exec audit path) and tests reference these names.
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+from lib.opslib import (  # noqa: E402
+    resolve_inventory_path,
+    run_checked,
+    validate_host,
+    validate_identifier,
+    validate_ssh_user,
+)
 from lib.redaction import (  # noqa: E402
     redact_text as redact_diagnostic_text,
     redact_value as _redact_diagnostic_value,
@@ -243,24 +241,17 @@ def _dcg_verdict(command: str) -> dict[str, Any] | None:
     dcg_bin = shutil.which("dcg")
     if not dcg_bin:
         return None
-    try:
-        proc = subprocess.run(
-            [dcg_bin, "check", "--stdin"],
-            input=command,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
+    result = run_checked([dcg_bin, "check", "--stdin"], timeout=10, input_text=command)
+    if result.get("error_code"):
         return None
-    verdict: dict[str, Any] = {"available": True, "exit_code": proc.returncode}
-    out = proc.stdout.strip()
+    verdict: dict[str, Any] = {"available": True, "exit_code": result["rc"]}
+    out = str(result.get("stdout") or "").strip()
     if out:
         try:
             verdict["report"] = json.loads(out)
         except json.JSONDecodeError:
             verdict["report"] = redact_diagnostic_text(out)
-    verdict["blocked"] = proc.returncode != 0
+    verdict["blocked"] = result["rc"] != 0
     return verdict
 
 
@@ -272,17 +263,7 @@ def _validate_identifier(value: str, kind: str) -> str:
 
     Returns the validated value on success; raises ValueError otherwise.
     """
-    if not value:
-        raise ValueError(f"Invalid {kind}: must not be empty")
-    if "/" in value or "\\" in value:
-        raise ValueError(f"Invalid {kind}: must not contain path separators")
-    if value.startswith("-"):
-        raise ValueError(f"Invalid {kind}: must not start with '-'")
-    if not _IDENTIFIER_RE.match(value):
-        raise ValueError(
-            f"Invalid {kind}: must be a slug matching [a-zA-Z0-9][a-zA-Z0-9._-]{{0,63}}"
-        )
-    return value
+    return validate_identifier(value, kind)
 
 
 def _validate_string_identifier(value: Any, kind: str, *, trim: bool = False) -> str:
@@ -317,15 +298,11 @@ def _validate_int(value: Any, kind: str) -> int:
 
 
 def _validate_ssh_user(value: str, kind: str = "ssh_user") -> str:
-    if not isinstance(value, str) or not _SSH_USER_RE.match(value):
-        raise ValueError(f"Invalid {kind}: {value!r}")
-    return value
+    return validate_ssh_user(value, kind=kind)
 
 
 def _validate_host(value: str, kind: str = "host") -> str:
-    if not isinstance(value, str) or not _HOST_RE.match(value):
-        raise ValueError(f"Invalid {kind}: {value!r}")
-    return value
+    return validate_host(value, kind=kind)
 
 
 def _tool_metadata(
@@ -735,11 +712,8 @@ def run_script(
         }
 
     cmd = [sys.executable, str(script)] + args
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, cwd=str(REPO_ROOT),
-        )
-    except subprocess.TimeoutExpired:
+    result = run_checked(cmd, timeout=timeout, cwd=REPO_ROOT)
+    if result.get("error_code") == "TIMEOUT":
         return False, -1, {
             "error": {
                 "type": "timeout",
@@ -747,19 +721,28 @@ def run_script(
                 "recoverable": True,
             }
         }
+    if result.get("error_code") == "COMMAND_NOT_FOUND":
+        return False, -1, {
+            "error": {
+                "type": "python_not_found",
+                "message": "python executable not found.",
+                "recoverable": False,
+            }
+        }
 
-    if proc.stderr.strip():
-        stderr_text = redact_diagnostic_text(proc.stderr.strip())
+    if str(result.get("stderr_redacted") or "").strip():
+        stderr_text = str(result.get("stderr_redacted") or "").strip()
         print(f"[operator-mcp] {script.name} stderr: {stderr_text}", file=sys.stderr, flush=True)
 
-    stdout = proc.stdout.strip()
+    stdout = str(result.get("stdout") or "").strip()
+    rc = int(result["rc"])
     if stdout:
         try:
-            return proc.returncode == 0, proc.returncode, _redact_diagnostic_value(json.loads(stdout))
+            return rc == 0, rc, _redact_diagnostic_value(json.loads(stdout))
         except json.JSONDecodeError:
-            return proc.returncode == 0, proc.returncode, {"text": redact_diagnostic_text(stdout)}
+            return rc == 0, rc, {"text": redact_diagnostic_text(stdout)}
 
-    return proc.returncode == 0, proc.returncode, {"exit_code": proc.returncode}
+    return rc == 0, rc, {"exit_code": rc}
 
 
 def _compose_monoserver_layer() -> list[str]:
@@ -781,11 +764,8 @@ def run_compose(args: list[str], *, timeout: int = 300) -> tuple[bool, int, Any]
     """Run docker compose and return structured output."""
     file_flags = ["-f", "docker-compose.yml"] + _compose_monoserver_layer()
     cmd = ["docker", "compose"] + file_flags + args
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, cwd=str(REPO_ROOT),
-        )
-    except FileNotFoundError:
+    result = run_checked(cmd, timeout=timeout, cwd=REPO_ROOT)
+    if result.get("error_code") == "COMMAND_NOT_FOUND":
         return False, -1, {
             "error": {
                 "type": "docker_not_found",
@@ -793,7 +773,7 @@ def run_compose(args: list[str], *, timeout: int = 300) -> tuple[bool, int, Any]
                 "recoverable": False,
             }
         }
-    except subprocess.TimeoutExpired:
+    if result.get("error_code") == "TIMEOUT":
         return False, -1, {
             "error": {
                 "type": "timeout",
@@ -802,19 +782,20 @@ def run_compose(args: list[str], *, timeout: int = 300) -> tuple[bool, int, Any]
             }
         }
 
-    stdout = proc.stdout.strip()
-    stderr = proc.stderr.strip()
-    ok = proc.returncode == 0
+    stdout = str(result.get("stdout") or "").strip()
+    stderr = str(result.get("stderr_redacted") or "").strip()
+    rc = int(result["rc"])
+    ok = rc == 0
 
     # Try JSON parse (docker compose ps --format json)
     if stdout:
         try:
-            return ok, proc.returncode, _redact_diagnostic_value(json.loads(stdout))
+            return ok, rc, _redact_diagnostic_value(json.loads(stdout))
         except json.JSONDecodeError:
             pass
 
-    return ok, proc.returncode, {
-        "exit_code": proc.returncode,
+    return ok, rc, {
+        "exit_code": rc,
         "stdout": redact_diagnostic_text(stdout),
         "stderr": redact_diagnostic_text(stderr),
     }
@@ -834,9 +815,8 @@ def run_ssh(
         "-o", "BatchMode=yes",
     ]
     cmd = ["ssh", *ssh_opts, "--", f"{user}@{host}", command]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except FileNotFoundError:
+    result = run_checked(cmd, timeout=timeout)
+    if result.get("error_code") == "COMMAND_NOT_FOUND":
         return False, -1, {
             "error": {
                 "type": "ssh_not_found",
@@ -844,7 +824,7 @@ def run_ssh(
                 "recoverable": False,
             }
         }
-    except subprocess.TimeoutExpired:
+    if result.get("error_code") == "TIMEOUT":
         return False, -1, {
             "error": {
                 "type": "timeout",
@@ -854,20 +834,21 @@ def run_ssh(
             }
         }
 
-    stdout = proc.stdout.strip()
-    ok = proc.returncode == 0
+    stdout = str(result.get("stdout") or "").strip()
+    rc = int(result["rc"])
+    ok = rc == 0
 
     # Try JSON parse
     if stdout:
         try:
-            return ok, proc.returncode, _redact_diagnostic_value(json.loads(stdout))
+            return ok, rc, _redact_diagnostic_value(json.loads(stdout))
         except json.JSONDecodeError:
             pass
 
-    return ok, proc.returncode, {
-        "exit_code": proc.returncode,
+    return ok, rc, {
+        "exit_code": rc,
         "stdout": redact_diagnostic_text(stdout),
-        "stderr": redact_diagnostic_text(proc.stderr.strip()),
+        "stderr": redact_diagnostic_text(str(result.get("stderr_redacted") or "").strip()),
     }
 
 
@@ -876,10 +857,7 @@ def run_ssh(
 # ---------------------------------------------------------------------------
 
 def load_inventory() -> list[dict]:
-    inv_path = REPO_ROOT / "workspace" / "boxes.json"
-    override = os.environ.get("SKILLBOX_BOX_INVENTORY", "").strip()
-    if override:
-        inv_path = Path(override)
+    inv_path = resolve_inventory_path(repo_root=REPO_ROOT)
     if not inv_path.is_file():
         return []
     data = json.loads(inv_path.read_text(encoding="utf-8"))

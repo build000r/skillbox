@@ -6,12 +6,13 @@
 
 version: 2
 
-# The default install set must stay within the skill-scope.yaml
-# `global_allowlist` (skillbox-config). Task skills are activated on demand
-# via `sbp skill activate <skill> --cwd <repo>`, not installed globally.
+# The default install set must stay portable. Private/operator-only skills
+# belong in a private overlay or external profile config, not in this public
+# source tree. Task skills are activated on demand via
+# `sbp skill activate <skill> --cwd <repo>`, not installed globally.
 skill_repos:
   # Public multi-skill repo — pick the policy-allowed default set
-  - repo: build000r/skills
+  - repo: example/skills
     ref: main
     pick:
       - divide-and-conquer
@@ -20,15 +21,3 @@ skill_repos:
       - project-status-mmdx
       - skill-issue
       - smart
-
-  # Operator-local skills (same convention as skill-repos-memory.yaml).
-  - path: ../../../skills-private
-    pick:
-      - beads-br
-      - beads-bv
-      - beads-workflow
-      - codebase-audit
-      - git-stash-janitor
-      - no-ragrets
-      - sbp
-      - ui-fresh-eyes

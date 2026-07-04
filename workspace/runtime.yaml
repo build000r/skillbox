@@ -662,7 +662,7 @@ connectors-dev:
   repos:
     - id: flywheel-connectors
       kind: repo
-      path: ${SKILLBOX_REPOS_ROOT}/flywheel_connectors
+      path: ${SKILLBOX_REPOS_ROOT}/flywheel-connectors
       required: false
       profiles:
         - connectors-dev
@@ -679,7 +679,7 @@ connectors-dev:
 
     - id: destructive-command-guard
       kind: repo
-      path: ${SKILLBOX_REPOS_ROOT}/destructive_command_guard
+      path: ${SKILLBOX_REPOS_ROOT}/destructive-command-guard
       required: false
       profiles:
         - connectors-dev

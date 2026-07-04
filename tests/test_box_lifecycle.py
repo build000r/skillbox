@@ -753,7 +753,7 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
         self.assertEqual(payload["error"]["type"], "destroy_pending")
         self.assertEqual(payload["steps"][-1]["step"], "confirm")
         self.assertEqual(payload["steps"][-1]["status"], "warn")
-        self.assertIn(f"box down teardown", payload["next_actions"])
+        self.assertIn("box down teardown", payload["next_actions"])
 
     def test_404_confirmed_absent_marks_destroyed(self) -> None:
         """Scenario 2: read-after-delete returns 404 (None) -> confirmed absent
@@ -809,7 +809,7 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
         do_delete_volume.assert_not_called()
         payload = payloads[-1]
         self.assertEqual(payload["error"]["type"], "volume_cleanup_failed")
-        self.assertIn(f"box down teardown", payload["next_actions"])
+        self.assertIn("box down teardown", payload["next_actions"])
 
     def test_tailscale_removal_failure_never_blocks_destroy_but_is_reported(self) -> None:
         """Scenario 4: tailnet removal fails -> reported in steps but never

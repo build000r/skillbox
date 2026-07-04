@@ -152,6 +152,7 @@ Usage:
   __WRAPPER__ recalibrate [args...]   Read cwd skill drift; --auto-fix previews heal, --yes applies
   __WRAPPER__ candidates [args...]    Explore linkable skill sources for this cwd
   __WRAPPER__ mcp [args...]           Read-only Claude JSON / Codex TOML MCP audit
+  __WRAPPER__ mcp sync [args...]     Render .mcp.json + .codex/config.toml from declaration (--dry-run default)
   __WRAPPER__ doctor [--format json]  One front door for all STRUCTURAL gates
                               (INCO/FAIL/PASS); complements `make doctor`.
                               Exits nonzero on FAIL only.
@@ -619,8 +620,13 @@ case "${1:-}" in
     shift
     ;;
   mcp|mcps)
-    action="mcp-audit"
     shift
+    if [[ "${1:-}" == "sync" ]]; then
+      action="mcp-sync"
+      shift
+    else
+      action="mcp-audit"
+    fi
     ;;
   fleet)
     action="fleet"
@@ -748,7 +754,7 @@ append_passthrough_token() {
           ;;
       esac
       ;;
-    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|structure-doctor|repo-registry|cass|cass-evidence|cron|send-later|beads|mmdx|operator-booking|swimmers-launch|fleet)
+    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|mcp-sync|structure-doctor|repo-registry|cass|cass-evidence|cron|send-later|beads|mmdx|operator-booking|swimmers-launch|fleet)
       passthrough_args+=("${token}")
       ;;
     *)
@@ -933,6 +939,7 @@ case "${action}" in
     echo "  ${wrapper_name} skills --issues-only full skill drift check"
     echo "  ${wrapper_name} candidates   source inventory for definitely/maybe/no review"
     echo "  ${wrapper_name} mcp           Claude/Codex MCP config parity"
+    echo "  ${wrapper_name} mcp sync      Render .mcp.json + .codex/config.toml from declaration"
     echo "  ${wrapper_name} launch <dir> <dir> --request '<prompt>' --dry-run --json"
     echo "                         preview Swimmers batch launch (bulk alias)"
     echo "  ${wrapper_name} skills --full full skill view"
@@ -1001,6 +1008,9 @@ PY
     ;;
   mcp-audit)
     python3 .env-manager/manage.py mcp-audit "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    ;;
+  mcp-sync)
+    python3 .env-manager/manage.py mcp sync "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
     ;;
   fleet)
     # `sbp fleet converge [...]` -> read-only per-repo heal PLAN (no apply).

@@ -1,8 +1,6 @@
 """Tests for repo-based skill sync, drift detection, and filtered copy."""
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 import shutil
 import subprocess
@@ -23,7 +21,6 @@ if str(ROOT_DIR / "scripts") not in sys.path:
 
 from runtime_manager.shared import (
     DEFAULT_SKILLIGNORE_PATTERNS,
-    SKILL_REPOS_CONFIG_VERSION,
     SKILL_REPOS_LOCKFILE_VERSION,
     _load_skillignore,
     _matches_skillignore,
@@ -32,8 +29,6 @@ from runtime_manager.shared import (
     _resolve_skill_repo_entry_source,
     _resolve_skill_dirs,
     clone_dir_name,
-    directory_tree_sha256,
-    file_sha256,
     filtered_copy_skill,
     load_json_file,
     load_skill_repos_config,
@@ -86,7 +81,7 @@ class TestSkillReposConfig(unittest.TestCase):
             config_path.write_text(
                 "version: 2\n"
                 "skill_repos:\n"
-                "  - repo: build000r/skills\n"
+                "  - repo: example/skills\n"
                 "    ref: main\n"
                 "    pick: [ask-cascade, describe]\n"
                 "  - path: ./skills\n"
@@ -96,7 +91,7 @@ class TestSkillReposConfig(unittest.TestCase):
             config = load_skill_repos_config(config_path)
             self.assertEqual(config["version"], 2)
             self.assertEqual(len(config["skill_repos"]), 2)
-            self.assertEqual(config["skill_repos"][0]["repo"], "build000r/skills")
+            self.assertEqual(config["skill_repos"][0]["repo"], "example/skills")
             self.assertEqual(config["skill_repos"][1]["path"], "./skills")
 
     def test_missing_config_raises(self) -> None:
@@ -144,7 +139,7 @@ class TestSkillReposConfig(unittest.TestCase):
 
 class TestCloneDirName(unittest.TestCase):
     def test_owner_repo(self) -> None:
-        self.assertEqual(clone_dir_name("build000r/skills"), "build000r-skills")
+        self.assertEqual(clone_dir_name("example/skills"), "example-skills")
 
     def test_nested_slashes(self) -> None:
         self.assertEqual(clone_dir_name("org/sub/repo"), "org-sub-repo")

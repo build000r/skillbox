@@ -101,12 +101,12 @@ runtime_artifacts:
 
 connector_source_repos:
   - id: flywheel-connectors
-    path: /workspace/repos/flywheel_connectors
+    path: /workspace/repos/flywheel-connectors
     required: false
     notes: Optional FCP source checkout for the `connectors-dev` profile.
 
   - id: destructive-command-guard
-    path: /workspace/repos/destructive_command_guard
+    path: /workspace/repos/destructive-command-guard
     required: false
     notes: Optional DCG source checkout for the `connectors-dev` profile.
 

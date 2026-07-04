@@ -27,17 +27,15 @@ if str(ROOT_DIR / "scripts") not in sys.path:
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from runtime_manager.distribution.bundle import pack_skill_bundle, _file_sha256
+from runtime_manager.distribution.bundle import pack_skill_bundle
 from runtime_manager.distribution.lockfile import (
     DistributorManifestLockEntry,
-    Lockfile,
     SkillLockEntry,
     emit_lockfile,
     parse_lockfile,
 )
 from runtime_manager.distribution.signing import (
     public_key_to_config_str,
-    sign_detached,
     sign_manifest,
 )
 from runtime_manager.distribution.sync import (
@@ -844,7 +842,7 @@ class TestSyncDistributorSources(unittest.TestCase):
             "skills": [{
                 "name": "audit-plans",
                 "source": "repo",
-                "repo": "build000r/skills",
+                "repo": "example/skills",
                 "declared_ref": "main",
                 "resolved_commit": "deadbeef",
                 "install_tree_sha": "treehash123",
@@ -899,7 +897,7 @@ class TestSyncDistributorSourcesCoverageEdges(TestSyncDistributorSources):
 
         no_dist_config = {
             "version": 2,
-            "skill_repos": [{"repo": "build000r/skills", "ref": "main"}],
+            "skill_repos": [{"repo": "example/skills", "ref": "main"}],
         }
         self.config_path.write_text(
             yaml.dump(no_dist_config, default_flow_style=False),
@@ -955,7 +953,7 @@ class TestSyncDistributorSourcesCoverageEdges(TestSyncDistributorSources):
                 SkillLockEntry(
                     name="audit-plans",
                     source="repo",
-                    repo="build000r/skills",
+                    repo="example/skills",
                     declared_ref="main",
                     resolved_commit="deadbeef",
                     install_tree_sha="tree-repo",

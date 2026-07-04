@@ -21,7 +21,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from fixture_fleet import build_fixture_fleet
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
