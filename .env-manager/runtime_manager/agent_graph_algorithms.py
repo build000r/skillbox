@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
 from .agent_graph import GRAPH_SCHEMA_VERSION, AgentGraph
+from .graph_cycle_evidence import cycle_evidence as shared_cycle_evidence
 
 ALGORITHMS_SCHEMA_VERSION = "2026-06-11+agent_ops_brain.algorithms"
 DEFAULT_BLOCKER_EDGE_KINDS = ("depends_on", "blocked_by")
@@ -253,33 +254,7 @@ def cycle_evidence(
     edge_kinds: Iterable[str] | None = ("depends_on",),
 ) -> dict[str, Any]:
     """Return compact cycle evidence derived from SCCs."""
-    normalized = normalize_graph(graph)
-    scc = strongly_connected_components(normalized_to_payload(normalized), edge_kinds=edge_kinds)
-    cyclic_components = scc["cyclic_components"]
-    edges_by_component: list[dict[str, Any]] = []
-    allowed = _edge_kinds(edge_kinds)
-    for component in cyclic_components:
-        members = set(component)
-        component_edges = [
-            edge.to_payload()
-            for edge in normalized.edges
-            if edge.source in members
-            and edge.target in members
-            and (allowed is None or edge.kind in allowed)
-        ]
-        edges_by_component.append(
-            {
-                "nodes": component,
-                "edges": component_edges,
-                "reason": f"{len(component)} node(s) mutually depend on each other",
-            }
-        )
-    return {
-        "ok": not cyclic_components,
-        "edge_kinds": sorted(_edge_kinds(edge_kinds) or []),
-        "cycles": edges_by_component,
-        "reason": scc["reason"],
-    }
+    return shared_cycle_evidence(graph, edge_kinds=edge_kinds)
 
 
 def shortest_path(

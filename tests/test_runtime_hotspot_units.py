@@ -339,7 +339,16 @@ class RuntimePortVerificationTests(unittest.TestCase):
             model, service = self._model_and_service(Path(tmpdir), port=5173)
 
             with (
-                mock.patch.object(runtime_ops_module, "service_healthcheck_state", return_value={"state": "ok", "port": 5173}),
+                mock.patch.object(
+                    runtime_ops_module,
+                    "service_healthcheck_state",
+                    return_value={"state": "ok", "port": 5173},
+                ),
+                mock.patch.object(
+                    runtime_ops_module,
+                    "_port_listening_state",
+                    return_value={"state": "down"},
+                ),
                 mock.patch.object(runtime_ops_module, "stop_process") as stop_process,
                 mock.patch.object(runtime_ops_module, "log_runtime_event"),
             ):
@@ -354,6 +363,42 @@ class RuntimePortVerificationTests(unittest.TestCase):
             self.assertEqual(result["reason"], "port_mismatch")
             self.assertEqual(result["error"]["type"], "LOCAL_RUNTIME_PORT_MISMATCH")
             self.assertEqual(result["port_verification"]["source"], "unverified-reuse")
+            stop_process.assert_not_called()
+
+    def test_prelaunch_declared_port_with_verified_external_listener_reuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model, service = self._model_and_service(Path(tmpdir), port=5173)
+
+            with (
+                mock.patch.object(
+                    runtime_ops_module,
+                    "service_healthcheck_state",
+                    return_value={"state": "ok", "port": 5173},
+                ),
+                mock.patch.object(
+                    runtime_ops_module,
+                    "_port_listening_state",
+                    return_value={"state": "ok", "port": 5173},
+                ),
+                mock.patch.object(
+                    runtime_ops_module,
+                    "_external_listener_owner",
+                    return_value={"pid": 5151, "command": "docker-proxy"},
+                ),
+                mock.patch.object(runtime_ops_module, "stop_process") as stop_process,
+                mock.patch.object(runtime_ops_module, "log_runtime_event"),
+            ):
+                result = runtime_ops_module.start_services(
+                    model,
+                    [service],
+                    dry_run=False,
+                    wait_seconds=0,
+                )[0]
+
+            self.assertEqual(result["result"], "already-running")
+            self.assertEqual(result["verified_port"], 5173)
+            self.assertEqual(result["port_verification"]["state"], "ok")
+            self.assertEqual(result["port_verification"]["source"], "external-listener")
             stop_process.assert_not_called()
 
     def test_exited_launcher_reuse_is_mismatch_for_declared_port_service(self) -> None:
@@ -5270,6 +5315,132 @@ class ManifestValidationHotspotTests(unittest.TestCase):
         self.assertEqual(hashes, {"alpha": {"codex": "tree-sha"}})
         self.assertEqual(actions, ["install-skill: /bundles/alpha.skill -> /target/alpha"])
         extract.assert_called_once()
+
+    def _runtime_dependency_model(
+        self,
+        services: list[dict[str, object]],
+        artifacts: list[dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "selection": {},
+            "active_profiles": ["local-core"],
+            "active_clients": [],
+            "clients": [],
+            "repos": [],
+            "artifacts": artifacts or [],
+            "env_files": [],
+            "skills": [],
+            "tasks": [],
+            "services": services,
+            "logs": [],
+            "checks": [],
+            "ingress_routes": [],
+        }
+
+    def test_validate_runtime_model_reports_active_service_dependency_cycle(self) -> None:
+        model = self._runtime_dependency_model([
+            {
+                "id": "svc-a",
+                "command": "run-a",
+                "profiles": ["local-core"],
+                "depends_on": ["svc-b"],
+            },
+            {
+                "id": "svc-b",
+                "command": "run-b",
+                "profiles": ["local-core"],
+                "depends_on": ["svc-a"],
+            },
+        ])
+
+        results = validation_module.validate_runtime_model(model)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].code, "LOCAL_RUNTIME_DEPENDENCY_CYCLE")
+        self.assertEqual(results[0].details["cycle"], "svc-a->svc-b->svc-a")
+
+    def test_validate_runtime_model_reports_dangling_active_service_dependency(self) -> None:
+        model = self._runtime_dependency_model([
+            {
+                "id": "svc-a",
+                "command": "run-a",
+                "profiles": ["local-core"],
+                "depends_on": ["missing-service"],
+            },
+            {
+                "id": "inactive",
+                "command": "run-inactive",
+                "profiles": ["other-profile"],
+                "depends_on": ["also-missing"],
+            },
+        ])
+
+        results = validation_module.validate_runtime_model(model)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].code, "LOCAL_RUNTIME_DEPENDENCY_UNKNOWN")
+        self.assertEqual(results[0].details["service_id"], "svc-a")
+        self.assertEqual(results[0].details["dependency_id"], "missing-service")
+
+    def test_clean_manifest_service_dependency_graph_is_unchanged(self) -> None:
+        model = self._runtime_dependency_model([
+            {
+                "id": "svc-a",
+                "command": "run-a",
+                "profiles": ["local-core"],
+                "depends_on": ["svc-b", "artifact-a"],
+            },
+            {
+                "id": "svc-b",
+                "command": "run-b",
+                "profiles": ["local-core"],
+                "depends_on": [],
+            },
+        ], artifacts=[{"id": "artifact-a", "path": "/tmp/artifact-a"}])
+
+        self.assertEqual(validation_module.validate_runtime_model(model), [])
+        results = validation_module.check_manifest(model)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, "pass")
+        self.assertEqual(results[0].code, "runtime-manifest")
+
+    def test_service_resolution_refuses_dependency_cycle_before_lifecycle(self) -> None:
+        model = self._runtime_dependency_model([
+            {
+                "id": "svc-a",
+                "command": "run-a",
+                "profiles": ["local-core"],
+                "depends_on": ["svc-b"],
+            },
+            {
+                "id": "svc-b",
+                "command": "run-b",
+                "profiles": ["local-core"],
+                "depends_on": ["svc-a"],
+            },
+        ])
+
+        with self.assertRaises(Exception) as raised:
+            runtime_ops_module.resolve_services_for_start(model, model["services"])
+
+        self.assertEqual(getattr(raised.exception, "code", None), "LOCAL_RUNTIME_DEPENDENCY_CYCLE")
+        self.assertEqual(raised.exception.context["cycle"], "svc-a->svc-b->svc-a")
+
+    def test_service_stop_resolution_refuses_dangling_dependency_before_lifecycle(self) -> None:
+        model = self._runtime_dependency_model([
+            {
+                "id": "svc-a",
+                "command": "run-a",
+                "profiles": ["local-core"],
+                "depends_on": ["missing-service"],
+            },
+        ])
+
+        with self.assertRaises(Exception) as raised:
+            runtime_ops_module.resolve_services_for_stop(model, model["services"])
+
+        self.assertEqual(getattr(raised.exception, "code", None), "LOCAL_RUNTIME_DEPENDENCY_UNKNOWN")
+        self.assertEqual(raised.exception.context["dependency_id"], "missing-service")
 
     def test_manifest_validation_helpers_cover_env_service_duplicate_and_lock_failures(self) -> None:
         duplicate_model = {

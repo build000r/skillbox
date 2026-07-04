@@ -3,38 +3,30 @@ from __future__ import annotations
 from datetime import datetime as DateTime, timezone
 
 from .shared import *
+from .errors import ValidationError
+from .graph_cycle_evidence import cycle_evidence
 # Stable error codes from the local_runtime_core_cutover shared contract
 # (shared.md:245-254). Re-exported here so consumers that already pull in
 # the validation module get the full set without also importing
 # scripts.lib.runtime_model.
 from lib.runtime_model import (  # noqa: E402
-    LOCAL_RUNTIME_ENV_BRIDGE_FAILED,
-    LOCAL_RUNTIME_ENV_OUTPUT_MISSING,
-    LOCAL_RUNTIME_PROFILE_UNKNOWN,
-    LOCAL_RUNTIME_START_BLOCKED,
-    LOCAL_RUNTIME_PORT_MISMATCH,
-    LOCAL_RUNTIME_SERVICE_DEFERRED,
-    LOCAL_RUNTIME_MODE_UNSUPPORTED,
     LOCAL_RUNTIME_COVERAGE_GAP,
     LOCAL_RUNTIME_ERROR_CODES,
-    LOCAL_RUNTIME_START_MODES,
     PARITY_LEDGER_ACTIONS,
     PARITY_OWNERSHIP_STATES,
-    CANONICAL_RUNTIME_RECORDS,
-    LocalRuntimeContractError,
     PROJECT_KIND_IOS,
     VALID_PROJECT_KINDS,
     IOS_COMMAND_LANES,
-    # Runtime-id slug grammar (security: path-join footgun). Re-exported here
-    # so consumers that already pull in the validation module get the stable
-    # RUNTIME_ID_INVALID code + validator without also importing
-    # scripts.lib.runtime_model directly. Enforcement runs inside
-    # build_runtime_model; this re-export is the shared seam.
-    RUNTIME_ID_INVALID,
-    RUNTIME_ID_PATTERN,
-    RUNTIME_ID_PATTERN_TEXT,
-    RuntimeIdValidationError,
-    validate_runtime_id,
+)
+
+LOCAL_RUNTIME_DEPENDENCY_CYCLE = "LOCAL_RUNTIME_DEPENDENCY_CYCLE"
+LOCAL_RUNTIME_DEPENDENCY_UNKNOWN = "LOCAL_RUNTIME_DEPENDENCY_UNKNOWN"
+LOCAL_RUNTIME_ERROR_CODES = frozenset(
+    set(LOCAL_RUNTIME_ERROR_CODES)
+    | {
+        LOCAL_RUNTIME_DEPENDENCY_CYCLE,
+        LOCAL_RUNTIME_DEPENDENCY_UNKNOWN,
+    }
 )
 
 VALID_INGRESS_ROUTE_LISTENERS = {"public", "private"}
@@ -169,6 +161,10 @@ def _model_item_id(item: dict[str, Any]) -> str:
 
 def raw_task_dependency_ids(task: dict[str, Any]) -> list[str]:
     return unique_string_field_values(task, "depends_on")
+
+
+def raw_service_dependency_ids(service: dict[str, Any]) -> list[str]:
+    return unique_string_field_values(service, "depends_on")
 
 
 def raw_service_bootstrap_task_ids(service: dict[str, Any]) -> list[str]:
@@ -1133,6 +1129,52 @@ def _validate_skill_install_targets(
     return install_failures
 
 
+def _shared_asset_source_for_entry(
+    skillset: dict[str, Any],
+    config_path: Path,
+    entry: dict[str, Any],
+) -> Path | None:
+    if entry.get("distributor"):
+        return None
+    if entry.get("repo"):
+        clone_root = Path(str(skillset.get("clone_root_host_path", "")))
+        source_root = clone_root / clone_dir_name(str(entry["repo"]))
+    else:
+        local_path = str(entry.get("path", ""))
+        if not local_path:
+            return None
+        source_root = (
+            Path(local_path) if Path(local_path).is_absolute()
+            else (config_path.parent / local_path).resolve()
+        )
+    shared_source = source_root / SHARED_SKILL_ASSET_DIR
+    return shared_source if shared_source.is_dir() else None
+
+
+def _validate_shared_skill_asset_installs(
+    skillset: dict[str, Any],
+    config_path: Path,
+    config: dict[str, Any],
+) -> list[str]:
+    expected_sources = [
+        source
+        for entry in config.get("skill_repos") or []
+        if (source := _shared_asset_source_for_entry(skillset, config_path, entry)) is not None
+    ]
+    if not expected_sources:
+        return []
+
+    sid = skillset["id"]
+    failures: list[str] = []
+    for target in skillset.get("install_targets") or []:
+        install_dir = Path(str(target["host_path"])) / SHARED_SKILL_ASSET_DIR
+        if not install_dir.is_dir():
+            failures.append(
+                f"{sid}: SHARED_ASSET_NOT_INSTALLED: {SHARED_SKILL_ASSET_DIR} missing in {target['id']}"
+            )
+    return failures
+
+
 def _collect_extra_installed_skills(
     skillset: dict[str, Any], all_declared: set[str],
 ) -> list[str]:
@@ -1218,6 +1260,7 @@ def _validate_skillset_locks_and_installs(
     install_failures.extend(_validate_skill_install_targets(
         skillset, declared_skill_names_for_set, lock_skills_by_name, effective_skill_owner,
     ))
+    install_failures.extend(_validate_shared_skill_asset_installs(skillset, config_path, config))
     install_warnings.extend(_collect_extra_installed_skills(skillset, all_declared))
     return config_failures, shared_source_failures, lock_failures, lock_warnings, install_failures, install_warnings
 
@@ -2891,6 +2934,185 @@ def _check_service_entries(
     return issues, service_dependency_map, services_by_id, service_ids
 
 
+def _active_dependency_scope(model: dict[str, Any]) -> tuple[set[str], set[str]]:
+    raw_profiles = model.get("active_profiles")
+    active_profiles = (
+        normalize_active_profiles([str(value) for value in raw_profiles or []])
+        if isinstance(raw_profiles, list)
+        else set()
+    )
+
+    raw_clients = model.get("active_clients")
+    if not isinstance(raw_clients, list):
+        return active_profiles, set()
+    requested_clients = [str(value) for value in raw_clients if str(value).strip()]
+    try:
+        active_clients = normalize_active_clients(model, requested_clients)
+    except ValidationError:
+        active_clients = {value.strip() for value in requested_clients if value.strip()}
+    return active_profiles, active_clients
+
+
+def _item_matches_active_dependency_scope(
+    item: dict[str, Any],
+    active_profiles: set[str],
+    active_clients: set[str],
+) -> bool:
+    if active_profiles and not item_matches_profiles(item, active_profiles):
+        return False
+    if active_clients and not item_matches_clients(item, active_clients):
+        return False
+    return True
+
+
+def _active_dependency_items(
+    model: dict[str, Any],
+    section: str,
+    active_profiles: set[str],
+    active_clients: set[str],
+) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in model.get(section) or []
+        if _item_matches_active_dependency_scope(item, active_profiles, active_clients)
+    ]
+
+
+def _service_dependency_graph_payload(
+    dependency_map: dict[str, list[str]],
+    service_ids: set[str],
+) -> dict[str, Any]:
+    return {
+        "nodes": [
+            {"id": service_id, "kind": "service", "attrs": {}}
+            for service_id in sorted(service_ids)
+        ],
+        "edges": [
+            {
+                "source": service_id,
+                "target": dependency_id,
+                "kind": "depends_on",
+                "attrs": {},
+            }
+            for service_id in sorted(dependency_map)
+            for dependency_id in dependency_map[service_id]
+            if dependency_id in service_ids
+        ],
+    }
+
+
+def _cycle_path_from_edges(nodes: list[str], edges: list[dict[str, Any]]) -> list[str]:
+    node_set = set(nodes)
+    adjacency: dict[str, list[str]] = {node_id: [] for node_id in node_set}
+    for edge in edges:
+        source = str(edge.get("source") or "").strip()
+        target = str(edge.get("target") or "").strip()
+        if source in node_set and target in node_set:
+            adjacency.setdefault(source, []).append(target)
+    for targets in adjacency.values():
+        targets.sort()
+
+    visiting: list[str] = []
+    visited: set[str] = set()
+
+    def visit(node_id: str) -> list[str] | None:
+        if node_id in visiting:
+            return visiting[visiting.index(node_id):] + [node_id]
+        if node_id in visited:
+            return None
+        visiting.append(node_id)
+        for target in adjacency.get(node_id, []):
+            path = visit(target)
+            if path:
+                return path
+        visiting.pop()
+        visited.add(node_id)
+        return None
+
+    for node_id in sorted(node_set):
+        path = visit(node_id)
+        if path:
+            return path
+    return sorted(node_set) + sorted(node_set)[:1]
+
+
+def _dependency_cycle_results(
+    dependency_map: dict[str, list[str]],
+    service_ids: set[str],
+    active_profiles: set[str],
+    active_clients: set[str],
+) -> list[CheckResult]:
+    graph = _service_dependency_graph_payload(dependency_map, service_ids)
+    evidence = cycle_evidence(graph, edge_kinds=("depends_on",))
+    results: list[CheckResult] = []
+    for cycle in evidence.get("cycles") or []:
+        nodes = [str(node_id) for node_id in cycle.get("nodes") or [] if str(node_id)]
+        edges = [edge for edge in cycle.get("edges") or [] if isinstance(edge, dict)]
+        path = _cycle_path_from_edges(nodes, edges)
+        rendered_path = "->".join(path)
+        results.append(CheckResult(
+            status="fail",
+            code=LOCAL_RUNTIME_DEPENDENCY_CYCLE,
+            message=f"service dependency cycle detected: {rendered_path}",
+            details={
+                "error_code": LOCAL_RUNTIME_DEPENDENCY_CYCLE,
+                "cycle": rendered_path,
+                "cycle_path": path,
+                "active_profiles": sorted(active_profiles),
+                "active_clients": sorted(active_clients),
+                "evidence": cycle,
+            },
+        ))
+    return results
+
+
+def validate_runtime_model(model: dict[str, Any]) -> list[CheckResult]:
+    """Validate active-scope service dependency references and cycles."""
+    active_profiles, active_clients = _active_dependency_scope(model)
+    active_services = _active_dependency_items(model, "services", active_profiles, active_clients)
+    active_artifacts = _active_dependency_items(model, "artifacts", active_profiles, active_clients)
+    service_ids = {
+        str(service.get("id", "")).strip()
+        for service in active_services
+        if str(service.get("id", "")).strip()
+    }
+    artifact_ids = {
+        str(artifact.get("id", "")).strip()
+        for artifact in active_artifacts
+        if str(artifact.get("id", "")).strip()
+    }
+    allowed_dependency_ids = service_ids | artifact_ids
+    dependency_map: dict[str, list[str]] = {}
+    results: list[CheckResult] = []
+
+    for service in active_services:
+        service_id = str(service.get("id", "")).strip()
+        if not service_id:
+            continue
+        dependency_ids = raw_service_dependency_ids(service)
+        dependency_map[service_id] = dependency_ids
+        for dependency_id in dependency_ids:
+            if dependency_id in allowed_dependency_ids:
+                continue
+            results.append(CheckResult(
+                status="fail",
+                code=LOCAL_RUNTIME_DEPENDENCY_UNKNOWN,
+                message=f"service {service_id} depends on unknown runtime dependency {dependency_id!r}",
+                details={
+                    "error_code": LOCAL_RUNTIME_DEPENDENCY_UNKNOWN,
+                    "service_id": service_id,
+                    "dependency_id": dependency_id,
+                    "active_profiles": sorted(active_profiles),
+                    "active_clients": sorted(active_clients),
+                    "declared_services": sorted(service_ids),
+                    "declared_artifacts": sorted(artifact_ids),
+                },
+            ))
+
+    results.extend(_dependency_cycle_results(dependency_map, service_ids, active_profiles, active_clients))
+    return results
+
+
 def _detect_dependency_cycles(
     dependency_map: dict[str, list[str]], owner_kind: str,
 ) -> list[str]:
@@ -3105,7 +3327,7 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
     issues.extend(_check_log_entries(model, declared_client_ids))
     issues.extend(_check_check_entries(model, declared_client_ids))
 
-    return _build_manifest_check_result(issues, model)
+    return _build_manifest_check_result(issues, model) + validate_runtime_model(model)
 
 
 def validate_connector_contract(model: dict[str, Any]) -> list[CheckResult]:
