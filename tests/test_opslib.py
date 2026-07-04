@@ -122,6 +122,74 @@ class OpslibValidatorTests(unittest.TestCase):
         self.assertNotIn("bearer-secret", result["stderr_redacted"])
         self.assertIsInstance(result["elapsed"], float)
 
+    def test_classify_ssh_failure_uses_transport_error_table(self) -> None:
+        retryable_cases = [
+            (255, "ssh: connect to host box port 22: Connection timed out"),
+            (255, "ssh: connect to host box port 22: Connection refused"),
+            (255, "client_loop: send disconnect: Connection reset"),
+            (255, "kex_exchange_identification: banner line contains invalid characters"),
+        ]
+        for rc, stderr in retryable_cases:
+            with self.subTest(stderr=stderr):
+                result = opslib.classify_ssh_failure({"rc": rc, "stderr_redacted": stderr})
+                self.assertEqual(result["failure_class"], "ssh_transport")
+                self.assertTrue(result["retryable"])
+
+        non_retryable_cases = [
+            (255, "Permission denied (publickey)."),
+            (1, "remote command failed"),
+            (127, "bash: missing-command: command not found"),
+        ]
+        for rc, stderr in non_retryable_cases:
+            with self.subTest(stderr=stderr):
+                result = opslib.classify_ssh_failure({"rc": rc, "stderr_redacted": stderr})
+                self.assertEqual(result["failure_class"], "remote_command")
+                self.assertFalse(result["retryable"])
+
+    def test_run_checked_retry_respects_total_deadline(self) -> None:
+        calls: list[float] = []
+        sleeps: list[float] = []
+        now = [0.0]
+
+        def fake_run(cmd, **kwargs):
+            calls.append(float(kwargs["timeout"]))
+            return subprocess.CompletedProcess(
+                cmd,
+                255,
+                stdout="",
+                stderr="kex_exchange_identification: Connection closed by remote host",
+            )
+
+        def monotonic() -> float:
+            return now[0]
+
+        def sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            now[0] += seconds
+
+        policy = opslib.RetryPolicy(
+            attempts=3,
+            backoff_seconds=(1.0, 2.0, 4.0),
+            jitter_seconds=0.0,
+            total_deadline=1.5,
+        )
+        with mock.patch.object(opslib.subprocess, "run", side_effect=fake_run):
+            result = opslib.run_checked(
+                ["ssh", "box"],
+                timeout=10,
+                retry_policy=policy,
+                retry_classifier=opslib.classify_ssh_failure,
+                sleep=sleep,
+                monotonic=monotonic,
+            )
+
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(sleeps, [1.0])
+        self.assertEqual(calls, [1.5, 0.5])
+        self.assertTrue(result["deadline_exhausted"])
+        self.assertTrue(result["retryable_hint"])
+        self.assertEqual(result["failure_class"], "ssh_transport")
+
 
 if __name__ == "__main__":
     unittest.main()

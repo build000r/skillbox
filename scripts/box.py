@@ -28,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -38,6 +38,9 @@ REPO_ROOT = SCRIPT_DIR.parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from lib.opslib import (  # noqa: E402
+    SSH_READ_RETRY_POLICY,
+    RetryPolicy,
+    classify_ssh_failure,
     locked_inventory_update,
     resolve_inventory_path,
     run_checked,
@@ -823,11 +826,61 @@ def load_operator_secret(name: str) -> None:
 # CLI runners
 # ---------------------------------------------------------------------------
 
-def run(args: list[str], *, check: bool = True, capture: bool = True, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+
+def _completed_process_from_checked(args: list[str], checked: dict[str, Any]) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.CompletedProcess(
+        args,
+        int(checked["rc"]),
+        stdout=str(checked.get("stdout") or ""),
+        stderr=str(checked.get("stderr_redacted") or ""),
+    )
+    completed.opslib_result = checked
+    completed.retry_attempts = int(checked.get("attempts") or 1)
+    completed.failure_class = checked.get("failure_class")
+    completed.retryable_hint = bool(checked.get("retryable_hint", False))
+    return completed
+
+
+def _process_probe_metadata(result: subprocess.CompletedProcess[str] | Any) -> dict[str, Any]:
+    attrs = getattr(result, "__dict__", {})
+    raw = attrs.get("opslib_result", {}) if isinstance(attrs, dict) else {}
+    raw = raw if isinstance(raw, dict) else {}
+    attempts = raw.get("attempts", attrs.get("retry_attempts", 1) if isinstance(attrs, dict) else 1)
+    try:
+        attempts_value = int(attempts)
+    except (TypeError, ValueError):
+        attempts_value = 1
+    payload: dict[str, Any] = {
+        "attempts": attempts_value,
+        "retryable_hint": bool(raw.get("retryable_hint", attrs.get("retryable_hint", False) if isinstance(attrs, dict) else False)),
+    }
+    failure_class = raw.get("failure_class", attrs.get("failure_class") if isinstance(attrs, dict) else None)
+    if failure_class:
+        payload["failure_class"] = failure_class
+    if raw.get("deadline_exhausted"):
+        payload["deadline_exhausted"] = True
+    return payload
+
+
+def run(
+    args: list[str],
+    *,
+    check: bool = True,
+    capture: bool = True,
+    timeout: int = 120,
+    retry_policy: RetryPolicy | None = None,
+    retry_classifier: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+) -> subprocess.CompletedProcess[str]:
     if not capture:
         completed = subprocess.run(args, capture_output=False, text=True, check=check, timeout=timeout)
         return completed
-    checked = run_checked(args, timeout=timeout, redact=True)
+    checked = run_checked(
+        args,
+        timeout=timeout,
+        redact=True,
+        retry_policy=retry_policy,
+        retry_classifier=retry_classifier,
+    )
     if checked.get("error_code") == "TIMEOUT":
         raise subprocess.TimeoutExpired(
             args,
@@ -837,12 +890,7 @@ def run(args: list[str], *, check: bool = True, capture: bool = True, timeout: i
         )
     if checked.get("error_code") == "COMMAND_NOT_FOUND":
         raise FileNotFoundError(str(checked.get("stderr_redacted") or args[0]))
-    completed = subprocess.CompletedProcess(
-        args,
-        int(checked["rc"]),
-        stdout=str(checked.get("stdout") or ""),
-        stderr=str(checked.get("stderr_redacted") or ""),
-    )
+    completed = _completed_process_from_checked(args, checked)
     if check and completed.returncode != 0:
         raise subprocess.CalledProcessError(
             completed.returncode,
@@ -857,13 +905,22 @@ def doctl(*args: str, timeout: int = 120) -> subprocess.CompletedProcess[str]:
     return run(["doctl", *args], timeout=timeout)
 
 
-def ssh_cmd(user: str, host: str, command: str, *, timeout: int = 300) -> subprocess.CompletedProcess[str]:
+def ssh_cmd(
+    user: str,
+    host: str,
+    command: str,
+    *,
+    timeout: int = 300,
+    retry_policy: RetryPolicy | None = None,
+) -> subprocess.CompletedProcess[str]:
     _validate_ssh_user(user)
     _validate_host(host)
     return run(
         ["ssh", *DEFAULT_SSH_OPTS, "--", f"{user}@{host}", command],
         check=False,
         timeout=timeout,
+        retry_policy=retry_policy,
+        retry_classifier=classify_ssh_failure,
     )
 
 
@@ -888,6 +945,7 @@ def ssh_script(
         timeout=timeout,
         redact=True,
         input_text=script_path.read_text(encoding="utf-8"),
+        retry_classifier=classify_ssh_failure,
     )
     if checked.get("error_code") == "TIMEOUT":
         raise subprocess.TimeoutExpired(
@@ -898,11 +956,9 @@ def ssh_script(
         )
     if checked.get("error_code") == "COMMAND_NOT_FOUND":
         raise FileNotFoundError(str(checked.get("stderr_redacted") or "ssh"))
-    return subprocess.CompletedProcess(
+    return _completed_process_from_checked(
         ["ssh", *DEFAULT_SSH_OPTS, "--", f"{user}@{host}", remote_cmd],
-        int(checked["rc"]),
-        stdout=str(checked.get("stdout") or ""),
-        stderr=str(checked.get("stderr_redacted") or ""),
+        checked,
     )
 
 
@@ -988,7 +1044,14 @@ def probe_registered_box(box: "Box", *, enabled: bool) -> dict[str, Any]:
 
     payload["ssh_target"] = ssh_target
     payload["ssh_reachable"] = True
-    result = ssh_cmd(box.ssh_user, ssh_target, REGISTER_PROBE_COMMAND, timeout=20)
+    result = ssh_cmd(
+        box.ssh_user,
+        ssh_target,
+        REGISTER_PROBE_COMMAND,
+        timeout=20,
+        retry_policy=SSH_READ_RETRY_POLICY,
+    )
+    payload["probe"] = _process_probe_metadata(result)
     if result.returncode != 0:
         return payload
 
@@ -1016,10 +1079,11 @@ def _check_public_ssh(box: "Box") -> dict[str, Any]:
     if not target:
         return payload
     try:
-        result = ssh_cmd(box.ssh_user, target, "echo ok", timeout=5)
+        result = ssh_cmd(box.ssh_user, target, "echo ok", timeout=5, retry_policy=SSH_READ_RETRY_POLICY)
     except (OSError, subprocess.TimeoutExpired) as exc:
         payload["error"] = str(exc)
         return payload
+    payload.update(_process_probe_metadata(result))
     payload["ok"] = result.returncode == 0 and "ok" in result.stdout
     if not payload["ok"] and result.stderr:
         payload["error"] = result.stderr[-200:]
@@ -1091,6 +1155,7 @@ def scp_file(local_path: Path, user: str, host: str, remote_path: str, *, timeou
         ["scp", *DEFAULT_SSH_OPTS, "--", str(local_path), f"{user}@{host}:{remote_path}"],
         check=False,
         timeout=timeout,
+        retry_classifier=classify_ssh_failure,
     )
 
 
@@ -3648,11 +3713,13 @@ def cmd_upgrade(
         ssh_target,
         "cd ~/skillbox && docker compose ps --format json 2>/dev/null | head -1",
         timeout=30,
+        retry_policy=SSH_READ_RETRY_POLICY,
     )
     verify_ok = verify_result.returncode == 0 and "workspace" in verify_result.stdout
     verify_detail = {
         "ssh_target": ssh_target,
         "container_running": verify_ok,
+        **_process_probe_metadata(verify_result),
     }
     _record_box_step(steps, is_json, "verify", "ok" if verify_ok else "fail", verify_detail)
     if not verify_ok:
@@ -4402,6 +4469,7 @@ def box_health(box: Box) -> dict[str, Any]:
         "browser_url": phone_url,
         "magicdns_url": None,
         "network_checks": {},
+        "remote_probes": {},
     }
 
     if box.state in ("destroyed", "creating"):
@@ -4434,7 +4502,12 @@ def box_health(box: Box) -> dict[str, Any]:
                 box.ssh_user, ssh_target,
                 "cd ~/skillbox && docker compose ps --format json 2>/dev/null | head -1",
                 timeout=15,
+                retry_policy=SSH_READ_RETRY_POLICY,
             )
+            status["remote_probes"]["container"] = {
+                "returncode": container_probe.returncode,
+                **_process_probe_metadata(container_probe),
+            }
             status["container_running"] = container_probe.returncode == 0 and "workspace" in container_probe.stdout
 
     network_checks = box_network_health(box)
