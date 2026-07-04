@@ -92,6 +92,8 @@ BOX_COMMAND_NAMES = {
 }
 BOX_JSON_COMMANDS = BOX_COMMAND_NAMES - {"robot-docs", "ssh"}
 BOX_JSON_FLAG_ALIASES = {"--json", "--jason", "--jsno", "--jsson"}
+BOX_SECRET_LOADING_COMMANDS = {"down", "posture-proof", "up", "upgrade"}
+_ARGPARSE_JSON_ERRORS = False
 
 STATES = [
     "creating",
@@ -383,6 +385,26 @@ def emit_json(payload: Any) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True, default=str))
 
 
+def emit_json_stderr(payload: Any) -> None:
+    print(json.dumps(payload, indent=2, sort_keys=True, default=str), file=sys.stderr)
+
+
+def structured_cli_error(
+    message: str,
+    *,
+    error_code: str,
+    next_actions: list[str] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "ok": False,
+        "error": message,
+        "error_code": error_code,
+    }
+    if next_actions is not None:
+        payload["next_actions"] = next_actions
+    return payload
+
+
 def structured_error(
     message: str,
     *,
@@ -446,7 +468,7 @@ def _box_agent_command(name: str) -> dict[str, Any]:
             "--dry-run --format json"
         ),
     }[name]
-    return {
+    command = {
         "name": name,
         "json": name in BOX_JSON_COMMANDS,
         "mutates": name in {"down", "import", "register", "unregister", "up", "upgrade"},
@@ -459,13 +481,25 @@ def _box_agent_command(name: str) -> dict[str, Any]:
             "unregister": "python3 scripts/box.py unregister <box-id> --format json",
         }.get(name),
     }
+    if name == "down":
+        command["confirmation"] = {
+            "required_for_real_teardown": True,
+            "accepted_flags": ["--yes", "--confirm <box-id>"],
+            "safe_alternative": "python3 scripts/box.py down <box-id> --dry-run --format json",
+        }
+    if name == "status":
+        command["read_side_effects"] = {
+            "default": "none",
+            "opt_in": "--write-cache updates last_ssh_target in workspace/boxes.json when a better SSH target is discovered",
+        }
+    return command
 
 
 def box_capabilities_payload() -> dict[str, Any]:
     return {
         "ok": True,
         "tool": "skillbox-box",
-        "contract_version": "2026-05-11",
+        "contract_version": "2026-07-04",
         "root_dir": str(REPO_ROOT),
         "entrypoint": "python3 scripts/box.py",
         "commands": [_box_agent_command(name) for name in sorted(BOX_COMMAND_NAMES)],
@@ -488,10 +522,15 @@ def box_capabilities_payload() -> dict[str, Any]:
                     "--dry-run --format json"
                 ),
             ],
-            "confirm_with_user_before": [
-                "python3 scripts/box.py down <box-id> --format json",
-            ],
+            "real_teardown_requires": "Pass --yes or --confirm <box-id>; --dry-run does not require confirmation.",
             "non_tty_alternative": "Use MCP operator_box_exec for remote commands instead of box.py ssh.",
+        },
+        "read_side_effects": {
+            "status": {
+                "default": "does not write workspace/boxes.json",
+                "opt_in": "python3 scripts/box.py status --write-cache --format json updates cached last_ssh_target values",
+            },
+            "list": "does not write workspace/boxes.json",
         },
         "mcp_equivalents": {
             "profiles": "operator_profiles",
@@ -538,7 +577,12 @@ Safe mutation pattern:
   python3 scripts/box.py up <box-id> --profile dev-small --dry-run --format json
   python3 scripts/box.py down <box-id> --dry-run --format json
   python3 scripts/box.py upgrade <box-id> --deploy-manifest <deploy.json> --dry-run --format json
-  Confirm with the user before real teardown because it destroys infrastructure.
+  Real teardown requires --yes or --confirm <box-id> because it destroys infrastructure.
+
+Read-side commands:
+  status and list do not write workspace/boxes.json by default.
+  Use status --write-cache only when you intentionally want to update cached
+  last_ssh_target values after a successful probe.
 
 Remote commands:
   box.py ssh is for interactive terminals. Agents should use MCP operator_box_exec
@@ -1100,7 +1144,7 @@ class BoxProfile:
     image: str = "ubuntu-24-04-x64"
     ssh_user: str = "skillbox"
     tailscale_hostname_prefix: str = "skillbox"
-    skillbox_repo: str = "https://github.com/build000r/skillbox.git"
+    skillbox_repo: str = "https://github.com/example/skillbox.git"
     skillbox_branch: str = "main"
     storage: "BoxProfileStorage | None" = None
 
@@ -1694,7 +1738,7 @@ def load_profile(name: str) -> BoxProfile:
         image=data.get("image", "ubuntu-24-04-x64"),
         ssh_user=data.get("ssh_user", "skillbox"),
         tailscale_hostname_prefix=data.get("tailscale_hostname_prefix", "skillbox"),
-        skillbox_repo=data.get("skillbox_repo", "https://github.com/build000r/skillbox.git"),
+        skillbox_repo=data.get("skillbox_repo", "https://github.com/example/skillbox.git"),
         skillbox_branch=data.get("skillbox_branch", "main"),
         storage=storage,
     )
@@ -1782,11 +1826,20 @@ def inventory_ssh_target_snapshot(boxes: list[Box]) -> dict[str, str | None]:
     return {box.id: box.last_ssh_target for box in boxes}
 
 
-def persist_inventory_if_ssh_targets_changed(boxes: list[Box], before: dict[str, str | None]) -> None:
+def persist_inventory_if_ssh_targets_changed(
+    boxes: list[Box],
+    before: dict[str, str | None],
+    *,
+    enabled: bool = True,
+) -> bool:
+    if not enabled:
+        return False
     if inventory_ssh_target_snapshot(boxes) == before:
-        return
+        return False
     if inventory_path().is_file():
         save_inventory(boxes)
+        return True
+    return False
 
 
 def volume_payload(box: Box) -> dict[str, Any] | None:
@@ -3686,8 +3739,18 @@ def _emit_box_down_success(boxes: list[Box], box: Box, box_id: str, steps: list[
     return EXIT_OK
 
 
-def cmd_down(box_id: str, *, dry_run: bool, fmt: str) -> int:
+def cmd_down(
+    box_id: str,
+    *,
+    dry_run: bool,
+    fmt: str,
+    confirmed: bool = True,
+    confirmation_mismatch: bool = False,
+) -> int:
     is_json = fmt == "json"
+    if not dry_run and not confirmed:
+        return _emit_down_confirmation_required(box_id, fmt=fmt, mismatch=confirmation_mismatch)
+
     steps: list[dict[str, Any]] = []
     boxes = load_inventory()
     box = find_box(boxes, box_id)
@@ -3980,7 +4043,7 @@ def cmd_register(
 # box status
 # ---------------------------------------------------------------------------
 
-def cmd_status(box_id: str | None, *, fmt: str) -> int:
+def cmd_status(box_id: str | None, *, fmt: str, write_cache: bool = True) -> int:
     is_json = fmt == "json"
     boxes = load_inventory()
     ssh_target_snapshot = inventory_ssh_target_snapshot(boxes)
@@ -3996,7 +4059,17 @@ def cmd_status(box_id: str | None, *, fmt: str) -> int:
             return EXIT_ERROR
 
         status = box_health(box)
-        persist_inventory_if_ssh_targets_changed(boxes, ssh_target_snapshot)
+        cache_written = persist_inventory_if_ssh_targets_changed(
+            boxes,
+            ssh_target_snapshot,
+            enabled=write_cache,
+        )
+        if is_json:
+            status["cache"] = {
+                "write_cache": write_cache,
+                "inventory_updated": cache_written,
+                "field": "last_ssh_target",
+            }
         if is_json:
             emit_json(status)
         else:
@@ -4014,7 +4087,17 @@ def cmd_status(box_id: str | None, *, fmt: str) -> int:
             "boxes": statuses,
             "next_actions": ["box up <id> --profile <name>", "box register <id> --host <tailscale-hostname>"] if not statuses else [],
         }
-        persist_inventory_if_ssh_targets_changed(boxes, ssh_target_snapshot)
+        cache_written = persist_inventory_if_ssh_targets_changed(
+            boxes,
+            ssh_target_snapshot,
+            enabled=write_cache,
+        )
+        if is_json:
+            payload["cache"] = {
+                "write_cache": write_cache,
+                "inventory_updated": cache_written,
+                "field": "last_ssh_target",
+            }
         if is_json:
             emit_json(payload)
         else:
@@ -4337,7 +4420,43 @@ class BoxArgumentParser(argparse.ArgumentParser):
                 f"{message}\nDid you mean: `{self.prog} {suggestion}`?\n"
                 f"Discover commands: `{self.prog} capabilities --json`."
             )
+        if _ARGPARSE_JSON_ERRORS:
+            next_actions = ["box.py capabilities --json"]
+            if suggestion:
+                next_actions.insert(0, f"box.py {suggestion} --format json")
+            emit_json_stderr(
+                structured_cli_error(
+                    message,
+                    error_code="argparse_error",
+                    next_actions=next_actions,
+                )
+            )
+            raise SystemExit(EXIT_DRIFT)
         super().error(message)
+
+
+def _argv_requests_json_diagnostics(argv: list[str]) -> bool:
+    for index, token in enumerate(argv):
+        if token in BOX_JSON_FLAG_ALIASES:
+            return True
+        if token == "--format" and index + 1 < len(argv) and argv[index + 1] == "json":
+            return True
+        if token == "--format=json":
+            return True
+    return False
+
+
+def _emit_argparse_warning(message: str, *, is_json: bool) -> None:
+    if is_json:
+        emit_json_stderr(
+            {
+                "ok": True,
+                "warning": message,
+                "warning_code": "argument_normalized",
+            }
+        )
+    else:
+        print(message, file=sys.stderr)
 
 
 def _normalize_agent_argv(argv: list[str]) -> tuple[list[str], list[str]]:
@@ -4431,6 +4550,8 @@ def build_parser() -> argparse.ArgumentParser:
     down_parser = subparsers.add_parser("down", help="Drain and destroy a box.")
     down_parser.add_argument("box_id", type=_validate_box_id, help="Box identifier.")
     down_parser.add_argument("--dry-run", action="store_true")
+    down_parser.add_argument("--yes", action="store_true", help="Confirm real teardown without an interactive prompt.")
+    down_parser.add_argument("--confirm", default="", metavar="BOX_ID", help="Confirm real teardown by repeating the box id.")
     down_parser.add_argument("--format", choices=("text", "json"), default="text")
 
     upgrade_parser = subparsers.add_parser("upgrade", help="Upgrade an existing ready box from a pinned deploy manifest.")
@@ -4441,6 +4562,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_parser = subparsers.add_parser("status", help="Check health of one or all boxes.")
     status_parser.add_argument("box_id", nargs="?", default=None, type=_validate_box_id, help="Box identifier (omit for all).")
+    status_parser.add_argument(
+        "--write-cache",
+        action="store_true",
+        help="Opt in to updating cached last_ssh_target values in workspace/boxes.json after probes.",
+    )
     status_parser.add_argument("--format", choices=("text", "json"), default="text")
 
     posture_proof_parser = subparsers.add_parser("posture-proof", help="Generate a network posture proof artifact for a box.")
@@ -4482,15 +4608,59 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    load_operator_secret(".env")
-    load_operator_secret(".env.box")
+def _emit_down_confirmation_required(box_id: str, *, fmt: str, mismatch: bool = False) -> int:
+    message = (
+        f"Refusing to destroy box {box_id!r}: pass --yes or --confirm {box_id} for real teardown. "
+        f"Use --dry-run to preview without destroying infrastructure."
+    )
+    if mismatch:
+        message = (
+            f"Refusing to destroy box {box_id!r}: --confirm must exactly match the box id. "
+            f"Use --confirm {box_id}, --yes, or --dry-run."
+        )
+    payload = structured_cli_error(
+        message,
+        error_code="confirmation_required",
+        next_actions=[
+            f"python3 scripts/box.py down {box_id} --dry-run --format json",
+            f"python3 scripts/box.py down {box_id} --confirm {box_id} --format json",
+        ],
+    )
+    if fmt == "json":
+        emit_json(payload)
+    else:
+        print(message, file=sys.stderr)
+    return EXIT_ERROR
 
+
+def main(argv: list[str] | None = None) -> int:
+    global _ARGPARSE_JSON_ERRORS
+    raw_argv = sys.argv[1:] if argv is None else argv
     parser = build_parser()
-    normalized_argv, diagnostics = _normalize_agent_argv(sys.argv[1:] if argv is None else argv)
-    args = parser.parse_args(normalized_argv)
+    normalized_argv, diagnostics = _normalize_agent_argv(raw_argv)
+    json_errors_requested = (
+        _argv_requests_json_diagnostics(raw_argv)
+        or _argv_requests_json_diagnostics(normalized_argv)
+    )
+    _ARGPARSE_JSON_ERRORS = json_errors_requested
+    try:
+        args = parser.parse_args(normalized_argv)
+    finally:
+        _ARGPARSE_JSON_ERRORS = False
+    json_diagnostics = json_errors_requested or getattr(args, "format", "text") == "json"
     for diagnostic in diagnostics:
-        print(diagnostic, file=sys.stderr)
+        _emit_argparse_warning(diagnostic, is_json=json_diagnostics)
+
+    if args.command == "down":
+        down_confirmed = bool(args.dry_run or args.yes or args.confirm == args.box_id)
+        confirmation_mismatch = bool(args.confirm and args.confirm != args.box_id and not args.yes)
+    else:
+        down_confirmed = False
+        confirmation_mismatch = False
+
+    if args.command in BOX_SECRET_LOADING_COMMANDS and (args.command != "down" or down_confirmed):
+        load_operator_secret(".env")
+        load_operator_secret(".env.box")
 
     try:
         if args.command == "capabilities":
@@ -4518,7 +4688,13 @@ def main(argv: list[str] | None = None) -> int:
                 fmt=args.format,
             )
         if args.command == "down":
-            return cmd_down(args.box_id, dry_run=args.dry_run, fmt=args.format)
+            return cmd_down(
+                args.box_id,
+                dry_run=args.dry_run,
+                fmt=args.format,
+                confirmed=down_confirmed,
+                confirmation_mismatch=confirmation_mismatch,
+            )
         if args.command == "upgrade":
             return cmd_upgrade(
                 args.box_id,
@@ -4527,7 +4703,7 @@ def main(argv: list[str] | None = None) -> int:
                 fmt=args.format,
             )
         if args.command == "status":
-            return cmd_status(args.box_id, fmt=args.format)
+            return cmd_status(args.box_id, fmt=args.format, write_cache=args.write_cache)
         if args.command == "posture-proof":
             return cmd_posture_proof(args.box_id, fmt=args.format)
         if args.command == "ssh":
