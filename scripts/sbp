@@ -190,14 +190,14 @@ Skills:
   __WRAPPER__ sync /path/to/skill     Legacy shorthand for global skill add
 
 Overlays:
-  __WRAPPER__ m                       Toggle the marketing overlay on/off.
-                              Off-flip unlinks overlay-scoped symlinks.
+  __WRAPPER__ m                       Toggle the marketing overlay on/off in
+                              this repo's .skillbox/skill-overrides.yaml.
                               Pass --keep to preserve them.
   __WRAPPER__ overlay                 List active overlays
-  __WRAPPER__ overlay on NAME         Enable overlay (e.g. marketing)
-  __WRAPPER__ overlay off NAME        Disable overlay + unlink overlay-scoped symlinks
-  __WRAPPER__ overlay off NAME --keep Disable overlay, keep symlinks in place
-  __WRAPPER__ overlay toggle NAME     Flip overlay state (off-flip unlinks unless --keep)
+  __WRAPPER__ overlay on NAME         Enable overlay for this repo
+  __WRAPPER__ overlay off NAME        Disable overlay for this repo
+  __WRAPPER__ overlay off NAME --keep Disable overlay for this repo
+  __WRAPPER__ overlay toggle NAME     Flip overlay state for this repo
 
 Profiles:
   all | local-all, core | local-core, minimal | mini | local-minimal,
@@ -834,6 +834,139 @@ passthrough_has_arg() {
   return 1
 }
 
+passthrough_wants_json() {
+  local index=0
+  while [[ ${index} -lt ${#passthrough_args[@]} ]]; do
+    if [[ "${passthrough_args[index]}" == "--json" ]]; then
+      return 0
+    fi
+    if [[ "${passthrough_args[index]}" == "--format" && "${passthrough_args[index+1]:-}" == "json" ]]; then
+      return 0
+    fi
+    index=$((index + 1))
+  done
+  return 1
+}
+
+repo_overlay_action() {
+  local overlay_action="${1:-}"
+  case "${overlay_action}" in
+    on|off|toggle)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+apply_repo_overlay_override() {
+  local overlay_action="$1"
+  local overlay="$2"
+  local dry_run="false"
+  local format_json="false"
+  if [[ -z "${overlay}" ]]; then
+    echo "${wrapper_name} overlay ${overlay_action}: pass an overlay name" >&2
+    exit 2
+  fi
+  if passthrough_has_arg "--dry-run"; then
+    dry_run="true"
+  fi
+  if passthrough_wants_json; then
+    format_json="true"
+  fi
+  python3 - "${invoke_cwd}" "${overlay_action}" "${overlay}" "${dry_run}" "${format_json}" <<'PY'
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(".env-manager").resolve()))
+
+from runtime_manager.skill_visibility import (  # noqa: E402
+    active_overlay_records,
+    active_overlays,
+    update_repo_override_policy,
+    _repo_override_policy,
+)
+
+
+def _overlay_lists(policy: dict) -> tuple[set[str], set[str]]:
+    overlays = policy.get("overlays") or {}
+    enable = {str(item).strip() for item in overlays.get("enable") or [] if str(item).strip()}
+    disable = {str(item).strip() for item in overlays.get("disable") or [] if str(item).strip()}
+    return enable, disable
+
+
+def _mutate_overlay(policy: dict, name: str, enabled: bool) -> dict:
+    updated = dict(policy)
+    enable, disable = _overlay_lists(updated)
+    if enabled:
+        enable.add(name)
+        disable.discard(name)
+    else:
+        disable.add(name)
+        enable.discard(name)
+    updated["overlays"] = {"enable": sorted(enable), "disable": sorted(disable)}
+    return updated
+
+
+cwd, action, name, dry_run_raw, json_raw = sys.argv[1:6]
+dry_run = dry_run_raw == "true"
+as_json = json_raw == "true"
+before_policy = _repo_override_policy(cwd)
+before_enable, before_disable = _overlay_lists(before_policy)
+before_active = set(active_overlays(cwd))
+target_enabled = name not in before_active if action == "toggle" else action == "on"
+after_preview = _mutate_overlay(before_policy, name, target_enabled)
+after_enable, after_disable = _overlay_lists(after_preview)
+would_change = (before_enable, before_disable) != (after_enable, after_disable)
+policy_path = str(before_policy.get("_policy_path") or "")
+
+if dry_run:
+    changed = False
+else:
+    result = update_repo_override_policy(cwd, lambda policy: _mutate_overlay(policy, name, target_enabled))
+    changed = bool(result.get("changed"))
+    policy_path = str(result.get("_policy_path") or policy_path)
+
+after_active = sorted(active_overlays(cwd))
+payload = {
+    "ok": True,
+    "action": action,
+    "name": name,
+    "enabled": target_enabled,
+    "cwd": str(Path(os.path.expandvars(os.path.expanduser(cwd))).resolve()),
+    "persistent": "repo-file",
+    "why": "repo-file",
+    "dry_run": dry_run,
+    "changed": changed,
+    "would_change": would_change,
+    "policy_path": policy_path,
+    "overlays": after_active,
+    "before": {
+        "active": sorted(before_active),
+        "enable": sorted(before_enable),
+        "disable": sorted(before_disable),
+    },
+    "after": {
+        "enable": sorted(after_enable),
+        "disable": sorted(after_disable),
+    },
+    "active_layers": active_overlay_records(cwd),
+}
+if as_json:
+    print(json.dumps(payload, indent=2, sort_keys=True))
+else:
+    verb = "would enable" if dry_run and target_enabled else "would disable" if dry_run else "enabled" if target_enabled else "disabled"
+    print(f"overlay {name}: {verb} via repo-file")
+    print(f"policy: {policy_path}")
+    print("active overlays: " + (", ".join(after_active) if after_active else "(none)"))
+PY
+}
+
 overlay_should_sync_policy() {
   local overlay_action="${passthrough_args[0]:-list}"
   case "${overlay_action}" in
@@ -1423,7 +1556,12 @@ else:
     python3 .env-manager/manage.py skill "${skill_action}" "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${skill_args[@]}"
     ;;
   overlay)
-    python3 .env-manager/manage.py overlay "${client_flags[@]}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    overlay_action="${passthrough_args[0]:-list}"
+    if repo_overlay_action "${overlay_action}"; then
+      apply_repo_overlay_override "${overlay_action}" "${passthrough_args[1]:-}"
+    else
+      python3 .env-manager/manage.py overlay "${client_flags[@]}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    fi
     if overlay_should_sync_policy; then
       echo
       echo "applying policy for this cwd..."
@@ -1435,7 +1573,7 @@ else:
     fi
     ;;
   overlay-toggle)
-    python3 .env-manager/manage.py overlay toggle "${overlay_name}" "${client_flags[@]}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    apply_repo_overlay_override "toggle" "${overlay_name}"
     echo
     echo "applying policy for this cwd..."
     overlay_sync_args=()

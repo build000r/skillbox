@@ -486,6 +486,13 @@ def _overlay_record(
     rank: int,
     source: str,
 ) -> dict[str, Any]:
+    why_layer = {
+        "operator-state-dir": "global",
+        "repo-override-file": "repo-file",
+        "env-overlays": "env",
+        "cli-overlays": "env",
+        "what-if-overlays": "what-if",
+    }.get(layer, layer)
     return {
         "name": name,
         "enabled": enabled,
@@ -493,6 +500,7 @@ def _overlay_record(
         "layer_label": label,
         "layer_rank": rank,
         "source": source,
+        "why": why_layer,
     }
 
 

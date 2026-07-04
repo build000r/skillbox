@@ -26,7 +26,10 @@ TESTS ONLY -- never imports or edits runtime code beyond the public API.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+import tempfile
+import unittest
 from pathlib import Path
 
 import pytest
@@ -246,6 +249,76 @@ def test_multiple_overlays_on_links_the_union_of_those_packs(
     # research + operator-maintenance stayed off.
     off = set(PACK_SKILLS["research"]) | set(PACK_SKILLS["operator-maintenance"])
     assert not (linked & off)
+
+
+class SbpRepoOverlayWrapperTests(unittest.TestCase):
+    def _make_repo(self, root: Path) -> Path:
+        repo = root / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        return repo
+
+    def _run_sbp(self, repo: Path, *args: str, state_path: Path) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(repo.parent / "home"),
+                "SKILLBOX_ROOT": str(ROOT_DIR),
+                "SKILLBOX_INVOKE_CWD": str(repo),
+                "SKILLBOX_OVERLAY_STATE": str(state_path),
+                "SKILLBOX_OVERLAYS": "",
+                "SKILLBOX_CLI_OVERLAYS": "",
+            }
+        )
+        Path(env["HOME"]).mkdir(exist_ok=True)
+        return subprocess.run(
+            [str(ROOT_DIR / "scripts" / "sbp"), *args],
+            cwd=str(repo),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_sbp_overlay_on_off_toggle_write_repo_override_not_global_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = self._make_repo(root)
+            state_path = root / "global-overlays"
+
+            result = self._run_sbp(repo, "overlay", "on", "hardening", state_path=state_path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            policy = sv._repo_override_policy(repo)
+            self.assertEqual(policy["overlays"]["enable"], ["hardening"])
+            self.assertEqual(policy["overlays"]["disable"], [])
+            self.assertFalse(state_path.exists())
+
+            result = self._run_sbp(repo, "overlay", "off", "hardening", state_path=state_path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            policy = sv._repo_override_policy(repo)
+            self.assertEqual(policy["overlays"]["enable"], [])
+            self.assertEqual(policy["overlays"]["disable"], ["hardening"])
+            self.assertFalse(state_path.exists())
+
+            result = self._run_sbp(repo, "overlay", "toggle", "hardening", state_path=state_path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            policy = sv._repo_override_policy(repo)
+            self.assertEqual(policy["overlays"]["enable"], ["hardening"])
+            self.assertEqual(policy["overlays"]["disable"], [])
+            self.assertFalse(state_path.exists())
+
+    def test_sbp_marketing_alias_uses_same_repo_override_layer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = self._make_repo(root)
+            state_path = root / "global-overlays"
+
+            result = self._run_sbp(repo, "m", state_path=state_path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            policy = sv._repo_override_policy(repo)
+            self.assertEqual(policy["overlays"]["enable"], ["marketing"])
+            self.assertEqual(policy["overlays"]["disable"], [])
+            self.assertFalse(state_path.exists())
 
 
 if __name__ == "__main__":
