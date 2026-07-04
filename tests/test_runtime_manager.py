@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import signal
 import shlex
 import shutil
 import subprocess
@@ -35,6 +36,88 @@ MANAGE_MODULE = SourceFileLoader(
 
 
 class RuntimeManagerTests(unittest.TestCase):
+    _FIXTURE_DAEMON_SCRIPTS = ("fixture_daemon.py", "fixture_guarded_daemon.py")
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.addCleanup(self._cleanup_fixture_daemons)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        try:
+            cls._cleanup_fixture_daemons()
+        finally:
+            super().tearDownClass()
+
+    @classmethod
+    def _fixture_daemon_pids(cls) -> list[int]:
+        proc_root = Path("/proc")
+        if not proc_root.is_dir():
+            return []
+
+        pids: list[int] = []
+        for entry in proc_root.iterdir():
+            if not entry.name.isdecimal():
+                continue
+            try:
+                cmdline = (entry / "cmdline").read_bytes().decode("utf-8", errors="replace")
+            except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+                continue
+            if any(script in cmdline for script in cls._FIXTURE_DAEMON_SCRIPTS):
+                pids.append(int(entry.name))
+        return sorted(pids)
+
+    @classmethod
+    def _signal_fixture_daemon_groups(cls, sig: int) -> None:
+        current_pgid = os.getpgrp()
+        signaled_pgids: set[int] = set()
+        for pid in cls._fixture_daemon_pids():
+            try:
+                pgid = os.getpgid(pid)
+            except ProcessLookupError:
+                continue
+            except OSError:
+                continue
+
+            if pgid == current_pgid:
+                try:
+                    os.kill(pid, sig)
+                except (ProcessLookupError, OSError):
+                    pass
+                continue
+
+            if pgid in signaled_pgids:
+                continue
+            signaled_pgids.add(pgid)
+            try:
+                os.killpg(pgid, sig)
+            except (ProcessLookupError, OSError):
+                pass
+
+    @classmethod
+    def _wait_for_fixture_daemon_exit(cls, timeout_seconds: float) -> list[int]:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            pids = cls._fixture_daemon_pids()
+            if not pids:
+                return []
+            time.sleep(0.05)
+        return cls._fixture_daemon_pids()
+
+    @classmethod
+    def _cleanup_fixture_daemons(cls) -> None:
+        if not cls._fixture_daemon_pids():
+            return
+
+        cls._signal_fixture_daemon_groups(signal.SIGTERM)
+        remaining = cls._wait_for_fixture_daemon_exit(2.0)
+        if remaining:
+            cls._signal_fixture_daemon_groups(signal.SIGKILL)
+            remaining = cls._wait_for_fixture_daemon_exit(1.0)
+
+        if remaining:
+            raise AssertionError(f"fixture daemon processes still running after cleanup: {remaining}")
+
     def test_normalize_file_mode_rejects_out_of_range_modes(self) -> None:
         from runtime_manager.runtime_ops import normalize_file_mode
 
@@ -4836,6 +4919,10 @@ class RuntimeManagerTests(unittest.TestCase):
             "    runtime_path: /workspace\n"
             "    storage_class: external\n"
             "    source_ref: root_dir\n"
+            "  - id: home-root\n"
+            "    runtime_path: /home/sandbox\n"
+            "    storage_class: persistent\n"
+            "    relative_path: home\n"
             "  - id: claude-home\n"
             "    runtime_path: /home/sandbox/.claude\n"
             "    storage_class: persistent\n"
