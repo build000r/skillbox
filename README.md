@@ -1939,6 +1939,8 @@ exist all the time.
 
 ## Architecture
 
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full architecture map.
+
 ```text
                 Tailscale SSH
                       │

@@ -44,6 +44,8 @@ Main entry points:
 
 - `workspace/runtime.yaml` declares repos, artifacts, skills, services, logs, checks, profiles, and client overlays.
 - `workspace/sandbox.yaml`, `workspace/dependencies.yaml`, and `workspace/persistence.yaml` feed outer validation.
+- `docs/ARCHITECTURE.md` is the maintainer-grade system map for layers,
+  manifests, runtime modules, data flow, state layout, and extension seams.
 - `.env.example` documents supported env vars. `.env` and `.env.box` are local
   and ignored.
 - `.env-manager/runtime_manager/` contains the Python runtime manager modules.
