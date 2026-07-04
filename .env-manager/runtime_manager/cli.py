@@ -1514,6 +1514,50 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_client_arg(skill_togglable_parser)
     _add_cwd_arg(skill_togglable_parser)
 
+    skill_what_if_parser = skill_subparsers.add_parser(
+        "what-if",
+        help="Purely simulate skill visibility for repo/overlay/pin inputs without writing files.",
+    )
+    skill_what_if_parser.add_argument(
+        "--repo",
+        required=True,
+        help="Target repo registry id/name or path.",
+    )
+    skill_what_if_parser.add_argument(
+        "--overlay",
+        action="append",
+        default=[],
+        help="Overlay to force active for this simulation. Can be repeated.",
+    )
+    skill_what_if_parser.add_argument(
+        "--pin",
+        action="append",
+        default=[],
+        help="Skill to simulate as repo pin_on. Can be repeated.",
+    )
+    skill_what_if_parser.add_argument(
+        "--opt-out",
+        dest="opt_out",
+        action="append",
+        default=[],
+        help="Skill to simulate as opt_out_global. Can be repeated.",
+    )
+    skill_what_if_parser.add_argument(
+        "--machine",
+        default=None,
+        help="Machine id from machines.yaml to use for registry re-rooting.",
+    )
+    skill_what_if_parser.add_argument("--format", choices=("text", "json"), default="text")
+    skill_what_if_parser.add_argument(
+        "--json",
+        dest="format",
+        action="store_const",
+        const="json",
+        help="Alias for --format json.",
+    )
+    _add_profile_arg(skill_what_if_parser)
+    _add_client_arg(skill_what_if_parser)
+
     overlay_parser = subparsers.add_parser(
         "overlay",
         help="List, enable, disable, toggle, or activate skill scope overlays (e.g. marketing).",
@@ -1607,6 +1651,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--mode",
         default=None,
         help="Local runtime startup behavior. One of: reuse (default), prod, fresh.",
+    )
+    up_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Roll back services started by this invocation if a later service fails.",
     )
     _add_profile_arg(up_parser)
     _add_client_arg(up_parser)
@@ -5133,6 +5182,29 @@ def _print_skill_togglable_text(payload: dict[str, Any]) -> None:
         print("  (none)")
 
 
+def _print_skill_what_if_text(payload: dict[str, Any]) -> None:
+    repo = payload.get("repo") or {}
+    summary = payload.get("summary") or {}
+    print(f"skill what-if: {repo.get('path')}")
+    print(
+        "summary: "
+        f"effective={summary.get('effective', 0)} "
+        f"added={summary.get('added', 0)} "
+        f"removed={summary.get('removed', 0)} "
+        f"shadowed={summary.get('shadowed', 0)} "
+        f"pin_conflicts={summary.get('pin_conflicts', 0)}"
+    )
+    for label in ("added", "removed"):
+        rows = payload.get(label) or []
+        if rows:
+            print(f"{label}: " + ", ".join(str(row.get("name")) for row in rows))
+    conflicts = payload.get("pin_conflicts") or []
+    if conflicts:
+        print("pin_conflicts:")
+        for item in conflicts:
+            print(f"  - {item.get('skill')}: {item.get('rule')} {item.get('message')}")
+
+
 def _drop_same_link_actions(plan: dict[str, Any]) -> dict[str, Any]:
     filtered = [
         action for action in plan.get("actions") or []
@@ -5661,6 +5733,21 @@ def _handle_skill(args: argparse.Namespace, root_dir: Path, model: dict[str, Any
             _print_skill_togglable_text(payload)
         return EXIT_OK
 
+    if skill_action == "what-if":
+        payload = build_skill_what_if_payload(
+            model,
+            repo=args.repo,
+            overlays=getattr(args, "overlay", []) or [],
+            pins=getattr(args, "pin", []) or [],
+            opt_outs=getattr(args, "opt_out", []) or [],
+            machine=getattr(args, "machine", None),
+        )
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            _print_skill_what_if_text(payload)
+        return EXIT_OK
+
     dry_run = bool(args.dry_run or skill_action == "plan")
     if skill_action in {"on", "off"}:
         payload = _handle_skill_toggle(args, model, dry_run=dry_run)
@@ -6065,6 +6152,8 @@ def _emit_up_payload(
     if args.format == "json":
         emit_json(payload)
     elif exit_code != EXIT_OK and "error" in payload:
+        print_service_actions_text(payload)
+        print()
         print_local_runtime_error_text(payload)
     else:
         print_service_actions_text(payload)
@@ -6180,6 +6269,138 @@ def _emit_missing_bridge_if_needed(args: argparse.Namespace, model: dict[str, An
     return None
 
 
+def _repeat_cli_args(flag: str, values: list[str] | None) -> list[str]:
+    parts: list[str] = []
+    for value in values or []:
+        text = str(value).strip()
+        if text:
+            parts.extend([flag, text])
+    return parts
+
+
+def _shell_command(parts: list[str]) -> str:
+    return " ".join(shlex.quote(str(part)) for part in parts)
+
+
+def _up_retry_service_ids(
+    requested_services: list[dict[str, Any]],
+    failed: dict[str, Any] | None,
+) -> list[str]:
+    requested_ids = [
+        str(service.get("id") or "").strip()
+        for service in requested_services
+        if str(service.get("id") or "").strip()
+    ]
+    if requested_ids:
+        return requested_ids
+    failed_id = str((failed or {}).get("id") or "").strip()
+    return [failed_id] if failed_id else []
+
+
+def _up_retry_command(
+    args: argparse.Namespace,
+    requested_services: list[dict[str, Any]],
+    resolved_mode: str,
+    failed: dict[str, Any] | None,
+) -> str:
+    parts = ["up"]
+    parts.extend(_repeat_cli_args("--client", getattr(args, "client", []) or []))
+    parts.extend(_repeat_cli_args("--profile", getattr(args, "profile", []) or []))
+    for service_id in _up_retry_service_ids(requested_services, failed):
+        parts.extend(["--service", service_id])
+    if resolved_mode:
+        parts.extend(["--mode", resolved_mode])
+    parts.extend(["--format", "json"])
+    return _shell_command(parts)
+
+
+def _rollback_command(args: argparse.Namespace, started_ids: list[str]) -> str:
+    parts = ["down"]
+    parts.extend(_repeat_cli_args("--client", getattr(args, "client", []) or []))
+    parts.extend(_repeat_cli_args("--profile", getattr(args, "profile", []) or []))
+    for service_id in started_ids:
+        parts.extend(["--service", service_id])
+    parts.extend(["--format", "json"])
+    return _shell_command(parts)
+
+
+def _rollback_started_services(
+    model: dict[str, Any],
+    service_results: list[dict[str, Any]],
+    *,
+    dry_run: bool,
+    wait_seconds: float,
+) -> list[dict[str, Any]]:
+    started_ids = {
+        str(entry.get("id") or "").strip()
+        for entry in service_results
+        if entry.get("result") == "started" and str(entry.get("id") or "").strip()
+    }
+    if not started_ids:
+        return []
+    services_by_id = service_id_map(model)
+    ordered_ids = list(reversed(order_service_ids(model, started_ids)))
+    rollback_services = [
+        services_by_id[service_id]
+        for service_id in ordered_ids
+        if service_id in services_by_id
+    ]
+    rollback_results = stop_services(
+        model,
+        rollback_services,
+        dry_run=dry_run,
+        wait_seconds=wait_seconds,
+    )
+    rolled_back_ids = {
+        str(entry.get("id") or "").strip()
+        for entry in rollback_results
+        if entry.get("result") in {"stopped", "killed", "dry-run", "not-running"}
+    }
+    for entry in service_results:
+        if str(entry.get("id") or "").strip() in rolled_back_ids:
+            entry["rolled_back"] = True
+    return rollback_results
+
+
+def _attach_partial_start_payload(
+    payload: dict[str, Any],
+    args: argparse.Namespace,
+    model: dict[str, Any],
+    requested_services: list[dict[str, Any]],
+    resolved_mode: str,
+) -> None:
+    service_results = payload.get("services") or []
+    summary = summarize_service_start_results(service_results)
+    payload.update(summary)
+    payload["strict"] = bool(getattr(args, "strict", False))
+    failed = payload.get("failed") if isinstance(payload.get("failed"), dict) else None
+    started_ids = [
+        str(entry.get("id") or "").strip()
+        for entry in payload.get("started") or []
+        if str(entry.get("id") or "").strip()
+    ]
+    if not failed:
+        return
+
+    resume_command = _up_retry_command(args, requested_services, resolved_mode, failed)
+    rollback_command = _rollback_command(args, started_ids) if started_ids else ""
+    next_actions = [resume_command]
+    if rollback_command:
+        next_actions.append(rollback_command)
+    payload["resume_command"] = resume_command
+    if rollback_command:
+        payload["rollback_command"] = rollback_command
+    payload["next_actions"] = next_actions
+
+    if payload["strict"] and not getattr(args, "dry_run", False):
+        payload["rollback_services"] = _rollback_started_services(
+            model,
+            service_results,
+            dry_run=False,
+            wait_seconds=max(0.0, float(args.wait_seconds)),
+        )
+
+
 def _legacy_up_payload(
     args: argparse.Namespace,
     model: dict[str, Any],
@@ -6201,7 +6422,7 @@ def _legacy_up_payload(
         wait_seconds=max(0.0, float(args.wait_seconds)),
         mode=resolved_mode,
     )
-    return {
+    payload = {
         "dry_run": args.dry_run,
         "requested_mode": resolved_mode,
         "effective_mode": resolved_mode,
@@ -6210,6 +6431,8 @@ def _legacy_up_payload(
         "services": service_results,
         "next_actions": next_actions_for_up(service_results),
     }
+    _attach_partial_start_payload(payload, args, model, requested_services, resolved_mode)
+    return payload
 
 
 def _start_failure_ids(service_results: list[dict[str, Any]]) -> list[str]:
@@ -6223,19 +6446,30 @@ def _start_failure_ids(service_results: list[dict[str, Any]]) -> list[str]:
 
 
 def _apply_start_failure_error(payload: dict[str, Any], service_results: list[dict[str, Any]]) -> int:
-    failed_ids = _start_failure_ids(service_results)
+    failed_block = payload.get("failed") if isinstance(payload.get("failed"), dict) else None
+    if failed_block is not None:
+        failed_ids = [
+            str(value)
+            for value in [failed_block.get("id"), *(payload.get("skipped_dependents") or [])]
+            if str(value or "").strip()
+        ]
+    else:
+        failed_ids = _start_failure_ids(service_results)
     if not failed_ids:
         return EXIT_OK
     specific_error = first_service_error_payload(service_results)
     if specific_error is not None:
         payload.update(specific_error)
+        if payload.get("resume_command") and isinstance(payload.get("error"), dict):
+            payload["error"].setdefault("next_action", payload["resume_command"])
         return EXIT_ERROR
+    next_action = str(payload.get("resume_command") or "manage.py status --format json")
     payload.update(local_runtime_error(
         LOCAL_RUNTIME_START_BLOCKED,
         f"Some services did not become healthy: {', '.join(failed_ids)}",
         recoverable=True,
         blocked_services=failed_ids,
-        next_action="manage.py status --format json",
+        next_action=next_action,
     ))
     return EXIT_ERROR
 

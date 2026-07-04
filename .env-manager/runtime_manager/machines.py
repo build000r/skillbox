@@ -552,6 +552,16 @@ def current_profile(
     return config.current_profile(hostname=hostname, env=env)
 
 
+def repo_roots_for_machine(config: MachinesConfig, machine_id: str) -> list[str]:
+    """Expanded repo roots for a declared machine profile, longest first."""
+    profile = config.require(machine_id)
+    return sorted(
+        _expand_roots_for_match(profile.repo_roots, profile),
+        key=len,
+        reverse=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Path helpers (pure; POSIX semantics — these are deployment paths, not the
 # host's local filesystem, so we must not resolve symlinks on the running box)

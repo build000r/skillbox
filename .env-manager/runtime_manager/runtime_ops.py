@@ -5170,6 +5170,105 @@ def start_services(
     return results
 
 
+def _service_start_summary_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "id": str(entry.get("id") or ""),
+        "state": str(entry.get("result") or "unknown"),
+    }
+    for key in ("pid", "verified_port", "verified_ports", "port", "target", "url"):
+        if entry.get(key) is not None:
+            summary[key] = copy.deepcopy(entry[key])
+    return summary
+
+
+def _service_start_error(entry: dict[str, Any]) -> str:
+    error = entry.get("error")
+    if isinstance(error, dict):
+        message = str(error.get("message") or error.get("detail") or "").strip()
+        if message:
+            return message
+    for key in ("reason", "actionable"):
+        message = str(entry.get(key) or "").strip()
+        if message:
+            return message
+    exit_code = entry.get("exit_code")
+    if exit_code is not None:
+        return f"service exited with code {exit_code}"
+    return f"service start result: {entry.get('result', 'unknown')}"
+
+
+def _blocking_chain(service_id: str, results_by_id: dict[str, dict[str, Any]]) -> list[str]:
+    chain: list[str] = []
+    seen = {service_id}
+    current_id = service_id
+    while True:
+        entry = results_by_id.get(current_id) or {}
+        blockers = [
+            str(blocker)
+            for blocker in (entry.get("blocked_on") or entry.get("dependency_unhealthy") or [])
+            if str(blocker).strip()
+        ]
+        if not blockers:
+            return chain
+        blocker = blockers[0]
+        chain.append(blocker)
+        if blocker in seen:
+            return chain
+        seen.add(blocker)
+        current_id = blocker
+
+
+def summarize_service_start_results(
+    service_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    results_by_id = {
+        str(entry.get("id") or ""): entry
+        for entry in service_results
+        if str(entry.get("id") or "").strip()
+    }
+    started = [
+        _service_start_summary_entry(entry)
+        for entry in service_results
+        if entry.get("result") == "started"
+    ]
+    already_running = [
+        _service_start_summary_entry(entry)
+        for entry in service_results
+        if entry.get("result") == "already-running"
+    ]
+
+    skipped: list[dict[str, Any]] = []
+    direct_failures: list[dict[str, Any]] = []
+    for entry in service_results:
+        result = entry.get("result")
+        service_id = str(entry.get("id") or "").strip()
+        if result == "blocked" and entry.get("blocked_on"):
+            skipped_entry = _service_start_summary_entry(entry)
+            skipped_entry["blocked_on"] = list(entry.get("blocked_on") or [])
+            skipped_entry["blocking_chain"] = _blocking_chain(service_id, results_by_id)
+            skipped.append(skipped_entry)
+            continue
+        if result in {"failed", "timeout"} or result == "blocked":
+            direct_failures.append(entry)
+
+    failed: dict[str, Any] | None = None
+    if direct_failures:
+        first = direct_failures[0]
+        failed = _service_start_summary_entry(first)
+        failed["error"] = _service_start_error(first)
+        if first.get("tail"):
+            failed["tail"] = list(first.get("tail") or [])
+
+    return {
+        "ok": failed is None and not skipped,
+        "started": started,
+        "failed": failed,
+        "skipped_dependents": [entry["id"] for entry in skipped],
+        "skipped": skipped,
+        "already_running": already_running,
+    }
+
+
 def stop_services(
     model: dict[str, Any],
     services: list[dict[str, Any]],

@@ -442,11 +442,37 @@ def print_service_actions_text(payload: dict[str, Any]) -> None:
                 summary = f"{summary} ({item['target']})"
             print(f"  - {item['id']}: {summary}")
 
+    if any(key in payload for key in ("started", "failed", "skipped_dependents", "already_running")):
+        print("service start:")
+        print("  service                 outcome          detail")
+        rows: list[tuple[str, str, str]] = []
+        for item in payload.get("started") or []:
+            detail = f"pid {item['pid']}" if item.get("pid") is not None else ""
+            if item.get("verified_port") is not None:
+                detail = (detail + " " if detail else "") + f"verified_port {item['verified_port']}"
+            rows.append((str(item.get("id") or ""), "started", detail))
+        for item in payload.get("already_running") or []:
+            detail = f"pid {item['pid']}" if item.get("pid") is not None else ""
+            rows.append((str(item.get("id") or ""), "already-running", detail))
+        failed = payload.get("failed") if isinstance(payload.get("failed"), dict) else None
+        if failed:
+            rows.append((str(failed.get("id") or ""), str(failed.get("state") or "failed"), str(failed.get("error") or "")))
+        for item in payload.get("skipped") or []:
+            chain = " -> ".join(str(value) for value in item.get("blocking_chain") or item.get("blocked_on") or [])
+            detail = f"blocked by {chain}" if chain else ""
+            rows.append((str(item.get("id") or ""), "skipped", detail))
+        for service_id, outcome, detail in rows:
+            print(f"  {service_id:<23} {outcome:<16} {detail}".rstrip())
+
     print("services:")
     for item in payload.get("services") or []:
         summary = item.get("result", "unknown")
         if item.get("pid") is not None:
             summary = f"{summary} (pid {item['pid']})"
+        if item.get("rolled_back"):
+            summary = f"{summary} (rolled back)"
+        if item.get("blocked_on"):
+            summary = f"{summary} (blocked by {', '.join(str(value) for value in item['blocked_on'])})"
         if item.get("reason"):
             summary = f"{summary} ({item['reason']})"
         endpoint = item.get("endpoint") or {}
