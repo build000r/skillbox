@@ -9,6 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 API_PORT = int(os.environ.get("SKILLBOX_API_PORT", "8000"))
+HOST = os.environ.get("SKILLBOX_WEB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("SKILLBOX_WEB_PORT", "3000"))
 REPOS_ROOT = Path(os.environ.get("SKILLBOX_REPOS_ROOT", ROOT / "repos"))
 SKILLS_ROOT = Path(os.environ.get("SKILLBOX_SKILLS_ROOT", ROOT / "skills"))
@@ -92,8 +93,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"skillbox web stub listening on :{PORT}")
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"skillbox web stub listening on {HOST}:{PORT}")
     server.serve_forever()
 
 

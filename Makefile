@@ -37,7 +37,9 @@ WRAPPER_BIN_DIR ?= $(HOME)/.local/bin
 DEV_SHIM_BIN_DIR ?= $(HOME)/.local/skillbox-shims
 DEV_SHIM_BINS := npm pnpm yarn vite next astro
 
-.PHONY: help bootstrap-env install-hooks render doctor acceptance runtime-render runtime-sync runtime-status runtime-skills runtime-skill-audit runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context dev-sanity python-cov-xml wrappers-install dev-shims-install build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles box-register box-unregister
+E2E_SMOKE_ARGS := $(if $(strip $(FORMAT)),--format $(FORMAT),) $(if $(filter 1 true yes,$(STRICT)),--strict,) $(ARGS)
+
+.PHONY: help bootstrap-env install-hooks render doctor acceptance runtime-render runtime-sync runtime-status runtime-skills runtime-skill-audit runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context dev-sanity e2e-smoke python-cov-xml wrappers-install dev-shims-install build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles box-register box-unregister
 
 help:
 	@printf "  make bootstrap-env  Seed .skillbox-state/operator/.env from .env.example if missing\n"
@@ -62,6 +64,7 @@ help:
 	@printf "  make pulse-stop     Stop the pulse daemon\n"
 	@printf "  make pulse-status   Show pulse daemon status, supervised services, and recent heals\n"
 	@printf "  make dev-sanity     Validate runtime graph, paths, and skill integrity (optional CLIENT=name PROFILE=name)\n"
+	@printf "  make e2e-smoke      Run opt-in read-only e2e smoke (FORMAT=json STRICT=1 supported)\n"
 	@printf "  make wrappers-install Install sbp/sbo symlinks into WRAPPER_BIN_DIR (default ~/.local/bin)\n"
 	@printf "  make dev-shims-install Install dev-command guard shims into DEV_SHIM_BIN_DIR\n"
 	@printf "  make build          Build the workspace image\n"
@@ -146,6 +149,9 @@ context:
 
 dev-sanity:
 	@python3 .env-manager/manage.py doctor $(CLIENT_ARGS) $(PROFILE_ARGS)
+
+e2e-smoke:
+	@./scripts/e2e-smoke.sh $(E2E_SMOKE_ARGS)
 
 python-cov-xml:
 	@python3 -m coverage erase
