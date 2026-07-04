@@ -44,7 +44,15 @@ redacted snapshots.
 ### 4. Private infrastructure by default
 
 Tailscale, host SSH, and operator-owned infrastructure are a feature. The
-default posture is private-by-construction, not public SaaS first.
+default posture is private-by-construction, not public SaaS first. Managed
+boxes default to `tailnet_only`: public SSH is a temporary bootstrap aperture
+through `enroll`; after Tailscale enrollment succeeds, `box.py` locks host SSH
+to Tailnet access and updates the DigitalOcean firewall so inbound public SSH
+is closed. `posture-proof` verifies the box-level result with
+`public_ssh_probe`, `tailnet_probe`, `cloud_firewall_rules`, and `violations`;
+service bind exposure is verified by the runtime exposure lint. See
+`docs/tailnet-only-lifecycle.md` for the recovery path and the field-by-field
+proof contract.
 
 ### 5. Low ceremony over platform sprawl
 
