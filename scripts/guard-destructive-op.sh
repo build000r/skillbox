@@ -615,35 +615,181 @@ if [ "$MARKER_TTL_SECONDS" -le 0 ]; then
     MARKER_TTL_SECONDS=600
 fi
 
-MARKER_AGE_OK=false
-MARKER_AGE=""
-if [ -f "$MARKER" ]; then
-    # The marker file exists, so reading its age MUST succeed for it to count.
-    # A read failure here is treated as "no valid marker" (block via the
-    # MARKER_AGE_OK=false path below), never as a free pass — a marker we
-    # cannot age-check is the same as having no marker.
-    if MARKER_AGE=$(python3 -c '
-import os, sys, time
-try:
-    print(int(time.time() - os.stat(sys.argv[1]).st_mtime))
-except Exception:
-    sys.exit(1)
-' "$MARKER" 2>/dev/null); then
-        if [ -n "$MARKER_AGE" ] && [ "$MARKER_AGE" -ge 0 ] && [ "$MARKER_AGE" -le "$MARKER_TTL_SECONDS" ]; then
-            MARKER_AGE_OK=true
-        fi
-    else
-        # Could not stat/age the marker — treat as no valid marker.
-        MARKER_AGE=""
-    fi
+if ! MARKER_STATUS=$(SKILLBOX_DRYRUN_PARENT_PID="${PPID}" python3 - "$MARKER" "$MARKER_TTL_SECONDS" "$FRIENDLY_NAME" "$BOX_ID" <<'PY'
+import datetime
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+
+def process_start_time(pid: int) -> str:
+    try:
+        text = Path("/proc", str(pid), "stat").read_text(encoding="utf-8")
+        tail = text.rsplit(")", 1)[1].strip().split()
+        if len(tail) > 19:
+            return tail[19]
+    except (OSError, IndexError):
+        pass
+    try:
+        return str(Path("/proc", str(pid)).stat().st_ctime_ns)
+    except OSError:
+        return "unknown"
+
+
+def current_session() -> str:
+    explicit = os.environ.get("CLAUDE_SESSION_ID", "").strip()
+    if explicit:
+        return explicit
+    raw_parent = os.environ.get("SKILLBOX_DRYRUN_PARENT_PID") or str(os.getppid())
+    try:
+        parent_pid = int(raw_parent)
+    except ValueError:
+        parent_pid = os.getppid()
+    return f"ppid:{parent_pid}:start:{process_start_time(parent_pid)}"
+
+
+def created_epoch(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        return datetime.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+marker = Path(sys.argv[1])
+ttl = int(sys.argv[2])
+expected_tool = sys.argv[3]
+expected_key = sys.argv[4]
+now = time.time()
+session = current_session()
+status = {
+    "valid": "false",
+    "reason": "absent",
+    "age": "",
+    "format": "absent",
+    "warning": "",
+    "marker_session": "",
+    "current_session": session,
+}
+
+if marker.is_file():
+    status["format"] = "legacy"
+    try:
+        raw = marker.read_text(encoding="utf-8").strip()
+        payload = json.loads(raw) if raw else None
+        if not isinstance(payload, dict):
+            payload = None
+    except (OSError, json.JSONDecodeError):
+        payload = None
+
+    if payload is None:
+        status["warning"] = (
+            "legacy dry-run marker consumed; accepting mtime-only marker for back-compat "
+            "and recommending a new dry_run=true preview"
+        )
+        try:
+            age = max(0, int(now - marker.stat().st_mtime))
+        except OSError:
+            age = None
+            status["reason"] = "unreadable"
+    else:
+        status["format"] = "json"
+        status["marker_session"] = str(payload.get("session") or "").strip()
+        created_at = created_epoch(payload.get("created_at"))
+        ages = []
+        if created_at is not None:
+            ages.append(max(0, int(now - created_at)))
+        try:
+            ages.append(max(0, int(now - marker.stat().st_mtime)))
+        except OSError:
+            pass
+        age = max(ages) if ages else None
+        if age is None:
+            status["reason"] = "unreadable"
+        marker_tool = str(payload.get("tool") or "")
+        marker_key = str(payload.get("key") or "")
+        if marker_tool and marker_tool != expected_tool or marker_key and marker_key != expected_key:
+            status["reason"] = "payload-mismatch"
+        elif status["marker_session"] and session and status["marker_session"] != session:
+            status["reason"] = "session-mismatch"
+
+    if age is not None:
+        status["age"] = str(age)
+        if age > ttl:
+            status["reason"] = "expired"
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+        elif status["reason"] == "absent":
+            status["valid"] = "true"
+            status["reason"] = "valid"
+
+fields = [
+    status["valid"],
+    status["reason"],
+    status["age"],
+    status["format"],
+    status["warning"].replace("\t", " ").replace("\n", " "),
+    status["marker_session"].replace("\t", " ").replace("\n", " "),
+    status["current_session"].replace("\t", " ").replace("\n", " "),
+]
+print("\x1f".join(fields))
+PY
+); then
+    block "marker-read-error" <<EOF
+BLOCKED: ${FRIENDLY_NAME} requires a fresh dry-run first.
+
+The guard could not read the dry-run marker status, so it failed closed.
+Run ${FRIENDLY_NAME} with dry_run=true first, confirm the output, then retry.
+EOF
 fi
 
-if [ "$MARKER_AGE_OK" != "true" ]; then
-    MARKER_AGE_DISPLAY="${MARKER_AGE:-unavailable}"
-    if [ -n "$MARKER_AGE" ]; then
-        MARKER_AGE_DISPLAY="${MARKER_AGE}s"
+IFS=$'\037' read -r MARKER_VALID MARKER_REASON MARKER_AGE MARKER_FORMAT MARKER_WARNING MARKER_SESSION CURRENT_SESSION <<< "$MARKER_STATUS"
+
+if [ "$MARKER_VALID" = "true" ]; then
+    if [ "$MARKER_FORMAT" = "legacy" ] && [ -n "$MARKER_WARNING" ]; then
+        printf 'WARNING: %s\n' "$MARKER_WARNING" >&2
     fi
-    block "marker-missing-or-expired" <<EOF
+    exit 0
+fi
+
+MARKER_AGE_DISPLAY="${MARKER_AGE:-unavailable}"
+if [ -n "$MARKER_AGE" ]; then
+    MARKER_AGE_DISPLAY="${MARKER_AGE}s"
+fi
+
+case "${MARKER_REASON:-absent}" in
+    expired)
+        MARKER_REASON_TEXT="the previous dry-run marker has expired"
+        ;;
+    session-mismatch)
+        MARKER_REASON_TEXT="the dry-run marker was created by a different session"
+        ;;
+    payload-mismatch)
+        MARKER_REASON_TEXT="the dry-run marker payload does not match this tool and box"
+        ;;
+    unreadable)
+        MARKER_REASON_TEXT="the dry-run marker exists but could not be read safely"
+        ;;
+    absent|*)
+        MARKER_REASON_TEXT="no dry-run marker exists for this tool and box"
+        ;;
+esac
+
+block "marker-${MARKER_REASON:-absent}" <<EOF
 BLOCKED: ${FRIENDLY_NAME} requires a fresh dry-run first.
 
 Before executing a destructive operation, you must:
@@ -652,13 +798,14 @@ Before executing a destructive operation, you must:
   3. Get explicit confirmation
   4. Then run ${FRIENDLY_NAME} for real
 
-This is either the first call for ${FRIENDLY_NAME} (box: ${BOX_ID}) or
-the previous dry-run marker has expired. Run with dry_run=true first.
+Rejection reason: ${MARKER_REASON:-absent} — ${MARKER_REASON_TEXT}.
 
 Configured marker TTL: ${MARKER_TTL_SECONDS}s
 Observed marker age: ${MARKER_AGE_DISPLAY}
+Marker format: ${MARKER_FORMAT:-unknown}
+Marker session: ${MARKER_SESSION:-unavailable}
+Current session: ${CURRENT_SESSION:-unavailable}
 EOF
-fi
 
 # All gates passed
 exit 0

@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -76,7 +77,7 @@ from lib.redaction import (  # noqa: E402
 )
 
 DRYRUN_MARKER_TTL_SECONDS = 600  # 10 minutes
-_DRYRUN_MARKER_STATUS_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+_DRYRUN_MARKER_STATUS_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -1203,12 +1204,7 @@ def handle_operator_box_exec(params: dict) -> dict:
             reason=f"no dry-run marker for command hash {cmd_hash}: {classification['reason']}",
         )
         marker_status = _dryrun_marker_rejection_status("operator_box_exec", marker_key)
-        ttl_seconds = marker_status.get("ttl_seconds")
-        age_seconds = marker_status.get("age_seconds")
-        if age_seconds is None:
-            marker_note = f"no marker for this command; configured marker ttl is {ttl_seconds}s"
-        else:
-            marker_note = f"observed marker age is {age_seconds}s; configured marker ttl is {ttl_seconds}s"
+        marker_note = _dryrun_marker_rejection_note(marker_status)
         return _error_content({
             "error": {
                 "type": "dry_run_required",
@@ -1221,12 +1217,7 @@ def handle_operator_box_exec(params: dict) -> dict:
                 "subject": box_id_param,
                 "classification": classification["verdict"],
                 "command_hash": cmd_hash,
-                "marker": {
-                    "exists": bool(marker_status.get("exists")),
-                    "expired": bool(marker_status.get("expired")),
-                    "age_seconds": age_seconds,
-                    "ttl_seconds": ttl_seconds,
-                },
+                "marker": _dryrun_marker_error_payload(marker_status),
                 "next_actions": [
                     {
                         "tool": "operator_box_exec",
@@ -1418,11 +1409,15 @@ def emit_box_exec_audit(
 # Dry-run marker (coordinates with PreToolUse hook)
 # ---------------------------------------------------------------------------
 
+def _dryrun_marker_dir() -> Path:
+    return REPO_ROOT / ".skillbox-state" / "dryrun-markers"
+
+
 def _dryrun_marker_path(tool_name: str, box_id: str) -> Path:
     """Return the marker path after validating identifiers."""
     _validate_identifier(tool_name, "tool_name")
     _validate_identifier(box_id, "box_id")
-    return REPO_ROOT / ".skillbox-state" / "dryrun-markers" / f".skillbox-dryrun-{tool_name}-{box_id}"
+    return _dryrun_marker_dir() / f".skillbox-dryrun-{tool_name}-{box_id}"
 
 
 def _box_exec_marker_key(box_id: str, command: str) -> str:
@@ -1454,57 +1449,237 @@ def _dryrun_marker_ttl_seconds() -> int:
     return DRYRUN_MARKER_TTL_SECONDS
 
 
-def _stamp_dryrun_marker(tool_name: str, box_id: str) -> None:
-    """Create a temp marker so the PreToolUse hook knows a dry-run was done."""
-    marker = _dryrun_marker_path(tool_name, box_id)
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(f"dry-run completed for {tool_name} box={box_id}\n")
+def _process_start_time(pid: int) -> str:
+    proc_stat = Path("/proc") / str(pid) / "stat"
+    try:
+        text = proc_stat.read_text(encoding="utf-8")
+        tail = text.rsplit(")", 1)[1].strip().split()
+        if len(tail) > 19:
+            return tail[19]
+    except (OSError, IndexError):
+        pass
+    try:
+        return str((Path("/proc") / str(pid)).stat().st_ctime_ns)
+    except OSError:
+        return "unknown"
 
 
-def _dryrun_marker_status(tool_name: str, box_id: str) -> dict[str, Any]:
-    marker = _dryrun_marker_path(tool_name, box_id)
-    ttl_seconds = _dryrun_marker_ttl_seconds()
+def _dryrun_session_id() -> str:
+    explicit = str(os.environ.get("CLAUDE_SESSION_ID") or "").strip()
+    if explicit:
+        return explicit
+    parent_pid = os.getppid()
+    return f"ppid:{parent_pid}:start:{_process_start_time(parent_pid)}"
+
+
+def _dryrun_marker_cache_key(tool_name: str, box_id: str) -> tuple[str, str, str]:
+    return (tool_name, box_id, _dryrun_session_id())
+
+
+def _utc_timestamp(now: float | None = None) -> str:
+    return datetime.fromtimestamp(time.time() if now is None else now, timezone.utc).isoformat(
+        timespec="seconds"
+    ).replace("+00:00", "Z")
+
+
+def _created_at_epoch(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _read_dryrun_marker_payload(marker: Path) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        raw = marker.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        return None, f"unreadable marker: {exc.__class__.__name__}"
+    if not raw:
+        return None, "empty legacy marker"
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, "legacy mtime-only marker"
+    if not isinstance(payload, dict):
+        return None, "marker JSON payload is not an object"
+    return payload, None
+
+
+def _marker_stat_age(marker: Path, now: float) -> int | None:
+    try:
+        return max(0, int(now - marker.stat().st_mtime))
+    except OSError:
+        return None
+
+
+def _dryrun_marker_status_from_path(
+    marker: Path,
+    *,
+    tool_name: str,
+    box_id: str,
+    ttl_seconds: int,
+    now: float,
+    check_session: bool,
+) -> dict[str, Any]:
+    current_session = _dryrun_session_id()
     status: dict[str, Any] = {
         "path": str(marker),
         "exists": False,
         "valid": False,
         "expired": False,
+        "session_mismatch": False,
+        "reason": "absent",
         "age_seconds": None,
         "ttl_seconds": ttl_seconds,
+        "format": "absent",
+        "tool": tool_name,
+        "key": box_id,
+        "marker_session": None,
+        "current_session": current_session,
+        "created_at": None,
+        "warning": None,
     }
     if not marker.is_file():
         return status
+
     status["exists"] = True
-    try:
-        age_seconds = max(0, int(time.time() - marker.stat().st_mtime))
-    except OSError:
-        return status
+    payload, warning = _read_dryrun_marker_payload(marker)
+    if payload is None:
+        status["format"] = "legacy"
+        status["warning"] = warning or "legacy mtime-only marker"
+        age_seconds = _marker_stat_age(marker, now)
+    else:
+        status["format"] = "json"
+        marker_tool = str(payload.get("tool") or "")
+        marker_key = str(payload.get("key") or "")
+        marker_session = str(payload.get("session") or "").strip()
+        created_at = payload.get("created_at")
+        status.update(
+            {
+                "marker_tool": marker_tool,
+                "marker_key": marker_key,
+                "marker_session": marker_session or None,
+                "created_at": created_at,
+            }
+        )
+        created_epoch = _created_at_epoch(created_at)
+        ages = [
+            age
+            for age in (
+                max(0, int(now - created_epoch)) if created_epoch is not None else None,
+                _marker_stat_age(marker, now),
+            )
+            if age is not None
+        ]
+        age_seconds = max(ages) if ages else None
+
     status["age_seconds"] = age_seconds
-    status["expired"] = age_seconds > ttl_seconds
-    status["valid"] = not status["expired"]
+    if age_seconds is None:
+        status["reason"] = "unreadable"
+        return status
+    if age_seconds > ttl_seconds:
+        status["expired"] = True
+        status["reason"] = "expired"
+        return status
+    if payload is not None and (
+        (tool_name and marker_tool and marker_tool != tool_name)
+        or (box_id and marker_key and marker_key != box_id)
+    ):
+        status["reason"] = "payload-mismatch"
+        return status
+    if payload is not None and check_session and marker_session and current_session and marker_session != current_session:
+        status["session_mismatch"] = True
+        status["reason"] = "session-mismatch"
+        return status
+    status["valid"] = True
+    status["reason"] = "valid"
+    return status
+
+
+def _gc_expired_dryrun_markers(*, skip_path: Path | None = None) -> None:
+    marker_dir = _dryrun_marker_dir()
+    if not marker_dir.is_dir():
+        return
+    ttl_seconds = _dryrun_marker_ttl_seconds()
+    now = time.time()
+    for marker in marker_dir.glob(".skillbox-dryrun-*"):
+        if skip_path is not None and marker == skip_path:
+            continue
+        status = _dryrun_marker_status_from_path(
+            marker,
+            tool_name="",
+            box_id="",
+            ttl_seconds=ttl_seconds,
+            now=now,
+            check_session=False,
+        )
+        if not status.get("expired"):
+            continue
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _stamp_dryrun_marker(tool_name: str, box_id: str) -> None:
+    """Create a temp marker so the PreToolUse hook knows a dry-run was done."""
+    _gc_expired_dryrun_markers()
+    marker = _dryrun_marker_path(tool_name, box_id)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "tool": tool_name,
+        "key": box_id,
+        "session": _dryrun_session_id(),
+        "created_at": _utc_timestamp(),
+        "note": f"dry-run completed for {tool_name} key={box_id}",
+    }
+    marker.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _dryrun_marker_status(tool_name: str, box_id: str) -> dict[str, Any]:
+    marker = _dryrun_marker_path(tool_name, box_id)
+    ttl_seconds = _dryrun_marker_ttl_seconds()
+    status = _dryrun_marker_status_from_path(
+        marker,
+        tool_name=tool_name,
+        box_id=box_id,
+        ttl_seconds=ttl_seconds,
+        now=time.time(),
+        check_session=True,
+    )
+    if status.get("expired"):
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+    _gc_expired_dryrun_markers(skip_path=marker)
     return status
 
 
 def _has_dryrun_marker(tool_name: str, box_id: str) -> bool:
     """Check if a valid, non-expired dry-run marker exists."""
     status = _dryrun_marker_status(tool_name, box_id)
-    cache_key = (tool_name, box_id)
+    cache_key = _dryrun_marker_cache_key(tool_name, box_id)
     if status["valid"]:
         _DRYRUN_MARKER_STATUS_CACHE.pop(cache_key, None)
     else:
         _DRYRUN_MARKER_STATUS_CACHE[cache_key] = status
-    if status["expired"]:
-        # Expired — clean up and report absent.
-        try:
-            Path(str(status["path"])).unlink(missing_ok=True)
-        except OSError:
-            pass
-        return False
     return bool(status["valid"])
 
 
 def _dryrun_marker_rejection_status(tool_name: str, box_id: str) -> dict[str, Any]:
-    return _DRYRUN_MARKER_STATUS_CACHE.pop((tool_name, box_id), None) or _dryrun_marker_status(tool_name, box_id)
+    return _DRYRUN_MARKER_STATUS_CACHE.pop(_dryrun_marker_cache_key(tool_name, box_id), None) or _dryrun_marker_status(tool_name, box_id)
 
 
 def _clear_dryrun_marker(tool_name: str, box_id: str) -> None:
@@ -1512,6 +1687,7 @@ def _clear_dryrun_marker(tool_name: str, box_id: str) -> None:
     try:
         marker = _dryrun_marker_path(tool_name, box_id)
         marker.unlink(missing_ok=True)
+        _DRYRUN_MARKER_STATUS_CACHE.pop(_dryrun_marker_cache_key(tool_name, box_id), None)
     except (OSError, ValueError):
         pass
 
@@ -1542,6 +1718,42 @@ def _missing_required_error(tool_name: str, message: str, next_actions: list[str
     })
 
 
+def _dryrun_marker_rejection_note(marker: dict[str, Any]) -> str:
+    ttl_seconds = marker.get("ttl_seconds")
+    age_seconds = marker.get("age_seconds")
+    reason = str(marker.get("reason") or "absent")
+    if reason == "expired":
+        return f"marker expired; observed marker age is {age_seconds}s; configured marker ttl is {ttl_seconds}s"
+    if reason == "session-mismatch":
+        return (
+            "marker was created by a different session "
+            f"(marker session={marker.get('marker_session')!r}, current session={marker.get('current_session')!r})"
+        )
+    if reason == "absent":
+        return f"no marker exists; configured marker ttl is {ttl_seconds}s"
+    if reason == "payload-mismatch":
+        return "marker payload does not match the requested tool/key"
+    if age_seconds is None:
+        return f"no marker age observed; configured marker ttl is {ttl_seconds}s"
+    return f"marker is not valid ({reason}); observed marker age is {age_seconds}s; configured marker ttl is {ttl_seconds}s"
+
+
+def _dryrun_marker_error_payload(marker: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "exists": bool(marker.get("exists")),
+        "expired": bool(marker.get("expired")),
+        "session_mismatch": bool(marker.get("session_mismatch")),
+        "reason": marker.get("reason") or "absent",
+        "age_seconds": marker.get("age_seconds"),
+        "ttl_seconds": marker.get("ttl_seconds"),
+        "format": marker.get("format"),
+        "marker_session": marker.get("marker_session"),
+        "current_session": marker.get("current_session"),
+        "created_at": marker.get("created_at"),
+        "warning": marker.get("warning"),
+    }
+
+
 def _dry_run_required_error(
     tool_name: str,
     subject: str,
@@ -1550,13 +1762,13 @@ def _dry_run_required_error(
     *,
     marker_status: dict[str, Any] | None = None,
 ) -> dict:
-    marker = marker_status or {"ttl_seconds": _dryrun_marker_ttl_seconds(), "age_seconds": None}
-    ttl_seconds = marker.get("ttl_seconds")
-    age_seconds = marker.get("age_seconds")
-    if age_seconds is None:
-        marker_note = f"no marker age observed; configured marker ttl is {ttl_seconds}s"
-    else:
-        marker_note = f"observed marker age is {age_seconds}s; configured marker ttl is {ttl_seconds}s"
+    marker = marker_status or {
+        "ttl_seconds": _dryrun_marker_ttl_seconds(),
+        "age_seconds": None,
+        "reason": "absent",
+        "current_session": _dryrun_session_id(),
+    }
+    marker_note = _dryrun_marker_rejection_note(marker)
     return _error_content({
         "error": {
             "type": "dry_run_required",
@@ -1566,12 +1778,7 @@ def _dry_run_required_error(
             ),
             "recoverable": True,
             "subject": subject,
-            "marker": {
-                "exists": bool(marker.get("exists")),
-                "expired": bool(marker.get("expired")),
-                "age_seconds": age_seconds,
-                "ttl_seconds": ttl_seconds,
-            },
+            "marker": _dryrun_marker_error_payload(marker),
             "next_actions": [safe_first_call, exact_cli],
         }
     })
