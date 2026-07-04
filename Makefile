@@ -37,10 +37,11 @@ WRAPPER_BIN_DIR ?= $(HOME)/.local/bin
 DEV_SHIM_BIN_DIR ?= $(HOME)/.local/skillbox-shims
 DEV_SHIM_BINS := npm pnpm yarn vite next astro
 
-.PHONY: help bootstrap-env render doctor acceptance runtime-render runtime-sync runtime-status runtime-skills runtime-skill-audit runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context dev-sanity python-cov-xml wrappers-install dev-shims-install build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles box-register box-unregister
+.PHONY: help bootstrap-env install-hooks render doctor acceptance runtime-render runtime-sync runtime-status runtime-skills runtime-skill-audit runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context dev-sanity python-cov-xml wrappers-install dev-shims-install build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles box-register box-unregister
 
 help:
 	@printf "  make bootstrap-env  Seed .skillbox-state/operator/.env from .env.example if missing\n"
+	@printf "  make install-hooks  Configure repo-local git hooks\n"
 	@printf "  make render         Print the resolved sandbox model\n"
 	@printf "  make doctor         Validate outer manifests, compose drift, and default skill-repo-set sync\n"
 	@printf "  make acceptance     Run first-box acceptance for CLIENT=id (optional PROFILE=name)\n"
@@ -85,9 +86,15 @@ help:
 	@printf "  make box-register   Register an existing shared box locally (BOX=id HOST=name SSH_USER=user)\n"
 	@printf "  make box-unregister Remove a registered shared box from local inventory (BOX=id)\n"
 
-bootstrap-env:
+bootstrap-env: install-hooks
 	@mkdir -p $(_STATE_ROOT)/operator
 	@test -f $(_STATE_ROOT)/operator/.env || test -f ./.env || cp .env.example $(_STATE_ROOT)/operator/.env
+
+install-hooks:
+	@if git rev-parse --git-dir >/dev/null 2>&1; then \
+		chmod +x .githooks/pre-commit; \
+		git config core.hooksPath .githooks; \
+	fi
 
 render:
 	@python3 scripts/04-reconcile.py render
