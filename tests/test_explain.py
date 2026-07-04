@@ -21,13 +21,11 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import sys
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-import pytest
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]

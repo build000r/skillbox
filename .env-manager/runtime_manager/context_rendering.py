@@ -4,6 +4,7 @@ from .shared import *
 from .runtime_ops import *
 from .port_registry import build_port_registry
 from .distribution.status import render_connected_distributors_section
+from lib.paths import BoxPath, PathTranslator
 
 
 def _context_clients_data(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -589,6 +590,10 @@ def generate_skill_context(
     actions: list[str] = []
     active_ids = set(model.get("active_clients") or [])
     runtime_env = model.get("env") or load_runtime_env(root_dir)
+    translator_model = dict(model)
+    translator_model["root_dir"] = str(root_dir)
+    translator_model["env"] = runtime_env
+    path_translator = PathTranslator.from_model(translator_model)
 
     for client in model.get("clients") or []:
         cid = client.get("id", "")
@@ -600,7 +605,7 @@ def generate_skill_context(
 
         client_runtime_dir = client_config_runtime_dir(runtime_env, cid)
         if output_dir is None:
-            client_dir = client_config_host_dir(root_dir, runtime_env, cid)
+            client_dir = Path(path_translator.to_host(BoxPath(client_runtime_dir)))
         else:
             client_dir = output_dir / runtime_path_to_projection_rel_path(runtime_env, str(client_runtime_dir))
         resolved = _resolve_context_paths(raw_context, client_dir)

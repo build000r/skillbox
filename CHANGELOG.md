@@ -4,7 +4,7 @@ This is a synthesized, agent-facing changelog for the full current history of
 `skillbox`.
 
 Scope window: project inception on 2026-03-30 through local `main` at
-[`9157d0e`](https://github.com/build000r/skillbox/commit/9157d0e) on
+[`9157d0e`](https://github.com/example/skillbox/commit/9157d0e) on
 2026-04-29.
 
 Method: rebuilt from local git history, tag metadata, GitHub release metadata,
@@ -25,12 +25,12 @@ release buckets.
 
 | Window | Head Ref | Summary |
 |--------|----------|---------|
-| 2026-03-30 to 2026-03-31 | [`2c709eb`](https://github.com/build000r/skillbox/commit/2c709eb) | Starter repo, runtime manager, client overlays, box lifecycle, MCP surfaces, focus, pulse, and initial documentation landed. |
-| 2026-04-01 to 2026-04-02 | [`1759f06`](https://github.com/build000r/skillbox/commit/1759f06) | Client bundle publishing, reconciliation tests, runtime-manager package split, skill scaffolding, first-class agent artifacts, and git-repo-native skill distribution replaced the packaged-skill pipeline. |
-| 2026-04-03 to 2026-04-06 | [`6c8cc84`](https://github.com/build000r/skillbox/commit/6c8cc84) | Shared-jam access, local runtime bridges, `--mode` lifecycle controls, parity-ledger enforcement, and local-core documentation stabilized the daily local runtime path. |
-| 2026-04-08 to 2026-04-09 | [`6a23797`](https://github.com/build000r/skillbox/commit/6a23797) | Upgrade-release, storage posture validation, MCP validation, ingress routing, default skill promotion, droplet bootstrap hardening, and explicit ingress origins landed. |
-| 2026-04-10 to 2026-04-17 | [`19b4f0f`](https://github.com/build000r/skillbox/commit/19b4f0f) | Local verify paths, resilient service starts, remote shared-box registration, shared skill-source validation, and correlated runtime events were added. |
-| 2026-04-22 to 2026-04-29 | [`9157d0e`](https://github.com/build000r/skillbox/commit/9157d0e) | Signed skill sync, pulse and runtime hardening, VPS-portable skill loading, remote first-box hardening, activation packets, CLI refactor, and local service-startup error handling landed. |
+| 2026-03-30 to 2026-03-31 | [`2c709eb`](https://github.com/example/skillbox/commit/2c709eb) | Starter repo, runtime manager, client overlays, box lifecycle, MCP surfaces, focus, pulse, and initial documentation landed. |
+| 2026-04-01 to 2026-04-02 | [`1759f06`](https://github.com/example/skillbox/commit/1759f06) | Client bundle publishing, reconciliation tests, runtime-manager package split, skill scaffolding, first-class agent artifacts, and git-repo-native skill distribution replaced the packaged-skill pipeline. |
+| 2026-04-03 to 2026-04-06 | [`6c8cc84`](https://github.com/example/skillbox/commit/6c8cc84) | Shared-jam access, local runtime bridges, `--mode` lifecycle controls, parity-ledger enforcement, and local-core documentation stabilized the daily local runtime path. |
+| 2026-04-08 to 2026-04-09 | [`6a23797`](https://github.com/example/skillbox/commit/6a23797) | Upgrade-release, storage posture validation, MCP validation, ingress routing, default skill promotion, droplet bootstrap hardening, and explicit ingress origins landed. |
+| 2026-04-10 to 2026-04-17 | [`19b4f0f`](https://github.com/example/skillbox/commit/19b4f0f) | Local verify paths, resilient service starts, remote shared-box registration, shared skill-source validation, and correlated runtime events were added. |
+| 2026-04-22 to 2026-04-29 | [`9157d0e`](https://github.com/example/skillbox/commit/9157d0e) | Signed skill sync, pulse and runtime hardening, VPS-portable skill loading, remote first-box hardening, activation packets, CLI refactor, and local service-startup error handling landed. |
 
 ## Capability Waves
 
@@ -57,10 +57,10 @@ private single-tenant shape.
 
 ### Representative commits
 
-- [`fbcc658`](https://github.com/build000r/skillbox/commit/fbcc658) initialized the starter repo.
-- [`c5ffcb4`](https://github.com/build000r/skillbox/commit/c5ffcb4) added the internal box manager.
-- [`5cfbef7`](https://github.com/build000r/skillbox/commit/5cfbef7) introduced client overlay support.
-- [`2ef309a`](https://github.com/build000r/skillbox/commit/2ef309a) added the workspace-local overlay.
+- [`fbcc658`](https://github.com/example/skillbox/commit/fbcc658) initialized the starter repo.
+- [`c5ffcb4`](https://github.com/example/skillbox/commit/c5ffcb4) added the internal box manager.
+- [`5cfbef7`](https://github.com/example/skillbox/commit/5cfbef7) introduced client overlay support.
+- [`2ef309a`](https://github.com/example/skillbox/commit/2ef309a) added the workspace-local overlay.
 
 ## 2. Operator And Agent Control Surfaces
 
@@ -84,11 +84,11 @@ operator lifecycle commands for DigitalOcean and Tailscale-managed boxes.
 
 ### Representative commits
 
-- [`2cb7a47`](https://github.com/build000r/skillbox/commit/2cb7a47) added structured errors, context generation, and onboarding.
-- [`4f5d897`](https://github.com/build000r/skillbox/commit/4f5d897) added the DO and Tailscale box lifecycle manager.
-- [`3decf32`](https://github.com/build000r/skillbox/commit/3decf32) exposed native agent tools through the skillbox MCP server.
-- [`7b0fa4b`](https://github.com/build000r/skillbox/commit/7b0fa4b) added focus, pulse, and event journaling.
-- [`9bc5bf7`](https://github.com/build000r/skillbox/commit/9bc5bf7) added the operator MCP server and destructive-op guard hook.
+- [`2cb7a47`](https://github.com/example/skillbox/commit/2cb7a47) added structured errors, context generation, and onboarding.
+- [`4f5d897`](https://github.com/example/skillbox/commit/4f5d897) added the DO and Tailscale box lifecycle manager.
+- [`3decf32`](https://github.com/example/skillbox/commit/3decf32) exposed native agent tools through the skillbox MCP server.
+- [`7b0fa4b`](https://github.com/example/skillbox/commit/7b0fa4b) added focus, pulse, and event journaling.
+- [`9bc5bf7`](https://github.com/example/skillbox/commit/9bc5bf7) added the operator MCP server and destructive-op guard hook.
 
 ## 3. Client Projection And Runtime Packaging
 
@@ -113,11 +113,11 @@ so command behavior could be tested and extended more safely.
 
 ### Representative commits
 
-- [`f8a604b`](https://github.com/build000r/skillbox/commit/f8a604b) added per-client isolated volume mounts.
-- [`4d4f073`](https://github.com/build000r/skillbox/commit/4d4f073) added client bundle publishing.
-- [`f1c26db`](https://github.com/build000r/skillbox/commit/f1c26db) added client diff and acceptance.
-- [`d162059`](https://github.com/build000r/skillbox/commit/d162059) added client reconciliation and runtime model tests.
-- [`fb94ed6`](https://github.com/build000r/skillbox/commit/fb94ed6) split the runtime manager into a package.
+- [`f8a604b`](https://github.com/example/skillbox/commit/f8a604b) added per-client isolated volume mounts.
+- [`4d4f073`](https://github.com/example/skillbox/commit/4d4f073) added client bundle publishing.
+- [`f1c26db`](https://github.com/example/skillbox/commit/f1c26db) added client diff and acceptance.
+- [`d162059`](https://github.com/example/skillbox/commit/d162059) added client reconciliation and runtime model tests.
+- [`fb94ed6`](https://github.com/example/skillbox/commit/fb94ed6) split the runtime manager into a package.
 
 ## 4. Skill Distribution And Agent Artifacts
 
@@ -143,13 +143,13 @@ model so the box could install, validate, and expose them consistently.
 
 ### Representative commits
 
-- [`b3450bd`](https://github.com/build000r/skillbox/commit/b3450bd) added skill builder scaffolds.
-- [`3f66303`](https://github.com/build000r/skillbox/commit/3f66303) added the cass-memory skill.
-- [`9d37baf`](https://github.com/build000r/skillbox/commit/9d37baf) made cass and cm first-class runtime artifacts.
-- [`1759f06`](https://github.com/build000r/skillbox/commit/1759f06) replaced the packaged-skill pipeline with a git-repo-native model.
-- [`e59c17a`](https://github.com/build000r/skillbox/commit/e59c17a) added signed skill sync.
-- [`78daf1c`](https://github.com/build000r/skillbox/commit/78daf1c) added effective skill visibility.
-- [`4e5bbc1`](https://github.com/build000r/skillbox/commit/4e5bbc1) returned activation packets.
+- [`b3450bd`](https://github.com/example/skillbox/commit/b3450bd) added skill builder scaffolds.
+- [`3f66303`](https://github.com/example/skillbox/commit/3f66303) added the cass-memory skill.
+- [`9d37baf`](https://github.com/example/skillbox/commit/9d37baf) made cass and cm first-class runtime artifacts.
+- [`1759f06`](https://github.com/example/skillbox/commit/1759f06) replaced the packaged-skill pipeline with a git-repo-native model.
+- [`e59c17a`](https://github.com/example/skillbox/commit/e59c17a) added signed skill sync.
+- [`78daf1c`](https://github.com/example/skillbox/commit/78daf1c) added effective skill visibility.
+- [`4e5bbc1`](https://github.com/example/skillbox/commit/4e5bbc1) returned activation packets.
 
 ## 5. Local Runtime Profiles And Parity Ledger
 
@@ -176,12 +176,12 @@ checks so local service graphs could replace shell folklore.
 
 ### Representative commits
 
-- [`d4cde09`](https://github.com/build000r/skillbox/commit/d4cde09) added local runtime bridge support.
-- [`e2c50bb`](https://github.com/build000r/skillbox/commit/e2c50bb) added mode commands, parity ledger, and XOR bootstrap enforcement.
-- [`b8e97fe`](https://github.com/build000r/skillbox/commit/b8e97fe) added the `--mode` selector to lifecycle surfaces.
-- [`4ea9948`](https://github.com/build000r/skillbox/commit/4ea9948) added mode-aware up orchestration and focus reconciliation wiring.
-- [`a78228b`](https://github.com/build000r/skillbox/commit/a78228b) enforced the parity ledger in `up`, `status`, `logs`, and `doctor`.
-- [`9157d0e`](https://github.com/build000r/skillbox/commit/9157d0e) hardened local service-startup error handling.
+- [`d4cde09`](https://github.com/example/skillbox/commit/d4cde09) added local runtime bridge support.
+- [`e2c50bb`](https://github.com/example/skillbox/commit/e2c50bb) added mode commands, parity ledger, and XOR bootstrap enforcement.
+- [`b8e97fe`](https://github.com/example/skillbox/commit/b8e97fe) added the `--mode` selector to lifecycle surfaces.
+- [`4ea9948`](https://github.com/example/skillbox/commit/4ea9948) added mode-aware up orchestration and focus reconciliation wiring.
+- [`a78228b`](https://github.com/example/skillbox/commit/a78228b) enforced the parity ledger in `up`, `status`, `logs`, and `doctor`.
+- [`9157d0e`](https://github.com/example/skillbox/commit/9157d0e) hardened local service-startup error handling.
 
 ## 6. Upgrade, Ingress, And First-Box Hardening
 
@@ -208,12 +208,12 @@ landed together.
 
 ### Representative commits
 
-- [`c41dd26`](https://github.com/build000r/skillbox/commit/c41dd26) added storage posture validation and upgrade-release workflow.
-- [`b6cf405`](https://github.com/build000r/skillbox/commit/b6cf405) added MCP surface validation and first-box workflow hardening.
-- [`720b09d`](https://github.com/build000r/skillbox/commit/720b09d) added the ingress routing subsystem.
-- [`f07f749`](https://github.com/build000r/skillbox/commit/f07f749) added the ingress proxy script.
-- [`b49f24d`](https://github.com/build000r/skillbox/commit/b49f24d) added swap support for small droplets.
-- [`682339e`](https://github.com/build000r/skillbox/commit/682339e) added SSH-ready state and resilient target resolution.
+- [`c41dd26`](https://github.com/example/skillbox/commit/c41dd26) added storage posture validation and upgrade-release workflow.
+- [`b6cf405`](https://github.com/example/skillbox/commit/b6cf405) added MCP surface validation and first-box workflow hardening.
+- [`720b09d`](https://github.com/example/skillbox/commit/720b09d) added the ingress routing subsystem.
+- [`f07f749`](https://github.com/example/skillbox/commit/f07f749) added the ingress proxy script.
+- [`b49f24d`](https://github.com/example/skillbox/commit/b49f24d) added swap support for small droplets.
+- [`682339e`](https://github.com/example/skillbox/commit/682339e) added SSH-ready state and resilient target resolution.
 
 ## 7. Shared Access, Documentation, And OSS Hygiene
 
@@ -239,12 +239,12 @@ and docs/shared-jam.md matter for future work.
 
 ### Representative commits
 
-- [`918b939`](https://github.com/build000r/skillbox/commit/918b939) added shared-jam collaborator access.
-- [`c1c242b`](https://github.com/build000r/skillbox/commit/c1c242b) documented shared-jam usage.
-- [`c9981b7`](https://github.com/build000r/skillbox/commit/c9981b7) added the dev-to-prod transition roadmap.
-- [`ce23562`](https://github.com/build000r/skillbox/commit/ce23562) ignored local agent files for OSS hygiene.
-- [`78738ae`](https://github.com/build000r/skillbox/commit/78738ae) removed private service names from docs.
-- [`1ee9d1f`](https://github.com/build000r/skillbox/commit/1ee9d1f) added AGENTS.md and updated ignores.
+- [`918b939`](https://github.com/example/skillbox/commit/918b939) added shared-jam collaborator access.
+- [`c1c242b`](https://github.com/example/skillbox/commit/c1c242b) documented shared-jam usage.
+- [`c9981b7`](https://github.com/example/skillbox/commit/c9981b7) added the dev-to-prod transition roadmap.
+- [`ce23562`](https://github.com/example/skillbox/commit/ce23562) ignored local agent files for OSS hygiene.
+- [`78738ae`](https://github.com/example/skillbox/commit/78738ae) removed private service names from docs.
+- [`1ee9d1f`](https://github.com/example/skillbox/commit/1ee9d1f) added AGENTS.md and updated ignores.
 
 ## 8. Reliability, Validation, And Runtime Recovery
 
@@ -272,14 +272,14 @@ to look when debugging lifecycle regressions.
 
 ### Representative commits
 
-- [`7a572b1`](https://github.com/build000r/skillbox/commit/7a572b1) bounded task and manage.py subprocess runtime.
-- [`cab3aee`](https://github.com/build000r/skillbox/commit/cab3aee) atomically persisted pulse PID and reconcile state.
-- [`23c8a35`](https://github.com/build000r/skillbox/commit/23c8a35) hardened subprocess and bundle handling.
-- [`9b481c7`](https://github.com/build000r/skillbox/commit/9b481c7) hardened sync transport and bundle unpacking.
-- [`cdb029b`](https://github.com/build000r/skillbox/commit/cdb029b) made the core skill pack VPS portable.
-- [`ca8f76c`](https://github.com/build000r/skillbox/commit/ca8f76c) resolved shipped skills from the workspace.
-- [`a7852cd`](https://github.com/build000r/skillbox/commit/a7852cd) preserved self-managed service PIDs.
-- [`09c78db`](https://github.com/build000r/skillbox/commit/09c78db) hoisted CLI subparser helpers to module level.
+- [`7a572b1`](https://github.com/example/skillbox/commit/7a572b1) bounded task and manage.py subprocess runtime.
+- [`cab3aee`](https://github.com/example/skillbox/commit/cab3aee) atomically persisted pulse PID and reconcile state.
+- [`23c8a35`](https://github.com/example/skillbox/commit/23c8a35) hardened subprocess and bundle handling.
+- [`9b481c7`](https://github.com/example/skillbox/commit/9b481c7) hardened sync transport and bundle unpacking.
+- [`cdb029b`](https://github.com/example/skillbox/commit/cdb029b) made the core skill pack VPS portable.
+- [`ca8f76c`](https://github.com/example/skillbox/commit/ca8f76c) resolved shipped skills from the workspace.
+- [`a7852cd`](https://github.com/example/skillbox/commit/a7852cd) preserved self-managed service PIDs.
+- [`09c78db`](https://github.com/example/skillbox/commit/09c78db) hoisted CLI subparser helpers to module level.
 
 ## Notes For Agents
 

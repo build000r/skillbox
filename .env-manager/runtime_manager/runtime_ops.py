@@ -21,6 +21,7 @@ from lib.runtime_model import (
     STATE_ROOT_WRONG_OWNERSHIP,
     is_runtime_absolute_path,
 )
+from lib.paths import BoxPath, PathTranslator
 
 
 _STARTED_SERVICE_PROCESSES: list[subprocess.Popen[str]] = []
@@ -926,20 +927,22 @@ def resolved_ingress_routes(
 
 
 def ingress_config_paths(model: dict[str, Any]) -> dict[str, Path]:
-    root_dir = Path(str(model["root_dir"]))
     env = model.get("env") or {}
-    storage = model.get("storage")
-    route_file = runtime_path_to_host_path(
-        root_dir,
-        env,
-        str(env.get("SKILLBOX_INGRESS_ROUTE_FILE") or "/workspace/logs/runtime/ingress-routes.json"),
-        storage=storage,
+    translator = PathTranslator.from_model(model)
+
+    def _to_host_path(raw_path: str) -> Path:
+        candidate = Path(raw_path).expanduser()
+        if candidate.is_absolute() and not is_runtime_absolute_path(raw_path):
+            return candidate
+        if not candidate.is_absolute():
+            return candidate
+        return Path(translator.to_host(BoxPath(raw_path)))
+
+    route_file = _to_host_path(
+        str(env.get("SKILLBOX_INGRESS_ROUTE_FILE") or "/workspace/logs/runtime/ingress-routes.json")
     )
-    nginx_config = runtime_path_to_host_path(
-        root_dir,
-        env,
-        str(env.get("SKILLBOX_INGRESS_NGINX_CONFIG") or "/workspace/logs/runtime/ingress-nginx.conf"),
-        storage=storage,
+    nginx_config = _to_host_path(
+        str(env.get("SKILLBOX_INGRESS_NGINX_CONFIG") or "/workspace/logs/runtime/ingress-nginx.conf")
     )
     return {
         "route_file": Path(str(route_file)),
@@ -1863,11 +1866,7 @@ def _artifact_action_name(state: dict[str, Any], stale_action: str, missing_acti
 
 
 def _replace_artifact_payload(path: Path, payload: bytes, executable: bool) -> None:
-    tmp_path = path.parent / f".{path.name}.tmp"
-    tmp_path.write_bytes(payload)
-    if executable:
-        tmp_path.chmod(0o755)
-    tmp_path.replace(path)
+    atomic_write_bytes(path, payload, mode=0o755 if executable else 0o644)
 
 
 def _sync_url_artifact(
@@ -1980,11 +1979,11 @@ def _copy_artifact_to_path(source: dict[str, Any], source_path: Path, path: Path
             f"artifact source file is missing: {source_path}",
             context={"source_path": str(source_path)},
         )
-    tmp_path = path.parent / f".{path.name}.tmp"
-    shutil.copyfile(source_path, tmp_path)
-    if source.get("executable", False):
-        tmp_path.chmod(0o755)
-    tmp_path.replace(path)
+    atomic_write_bytes(
+        path,
+        source_path.read_bytes(),
+        mode=0o755 if source.get("executable", False) else 0o644,
+    )
 
 
 def sync_env_file(env_file: dict[str, Any], dry_run: bool) -> list[str]:
@@ -2038,8 +2037,7 @@ def _write_env_payload_if_changed(
     current_mode = path.stat().st_mode & 0o777 if path.is_file() else None
     if current_payload == payload and current_mode == desired_mode:
         return [f"env-unchanged: {path}"]
-    path.write_bytes(payload)
-    path.chmod(desired_mode)
+    atomic_write_bytes(path, payload, mode=desired_mode)
     return [f"hydrate-env: {source_path} -> {path}"]
 
 
@@ -2213,6 +2211,13 @@ def _run_git_clone(url: str, branch: str, path: Path) -> None:
         )
 
 
+def _run_git_clone_atomic(url: str, branch: str, path: Path) -> None:
+    def _build(stage_dir: Path) -> None:
+        _run_git_clone(url, branch, stage_dir)
+
+    atomic_replace_tree(path, _build, root_mode=0o755)
+
+
 def _sync_existing_git_repo(
     model: dict[str, Any],
     repo: dict[str, Any],
@@ -2227,8 +2232,7 @@ def _sync_existing_git_repo(
         return f"exists: {path}"
     if dry_run:
         return f"clone-reconcile: {url} -> {path}"
-    clear_repo_git_residue(path)
-    _run_git_clone(url, branch, path)
+    _run_git_clone_atomic(url, branch, path)
     return f"clone-reconcile: {url} -> {path}"
 
 
@@ -2246,7 +2250,7 @@ def _sync_git_repo(
 
     ensure_directory(path.parent, dry_run)
     if not dry_run:
-        _run_git_clone(url, branch, path)
+        _run_git_clone_atomic(url, branch, path)
     return [f"clone-if-missing: {url} -> {path}"]
 
 
@@ -2582,10 +2586,7 @@ def resolve_services_for_stop(
 
 
 def translated_runtime_env(root_dir: Path, runtime_env: dict[str, str]) -> dict[str, str]:
-    try:
-        storage = compile_persistence_summary(root_dir, runtime_env)
-    except RuntimeError:
-        storage = None
+    translator = PathTranslator.from_model({"root_dir": str(root_dir), "env": runtime_env})
 
     def _already_host_path(raw_value: str) -> bool:
         raw_text = str(raw_value).strip()
@@ -2604,8 +2605,10 @@ def translated_runtime_env(root_dir: Path, runtime_env: dict[str, str]) -> dict[
         if key in PATH_LIKE_ENV_KEYS and value:
             if _already_host_path(value):
                 translated[key] = str(Path(value).expanduser())
+            elif not Path(value).expanduser().is_absolute():
+                translated[key] = str(Path(value).expanduser())
             else:
-                translated[key] = str(runtime_path_to_host_path(root_dir, runtime_env, value, storage=storage))
+                translated[key] = str(translator.to_host(BoxPath(value)))
             continue
         translated[key] = value
     translated["ROOT_DIR"] = str(root_dir)
@@ -4782,9 +4785,7 @@ def _spawn_service_process(command: list[str], cwd: Path, env: dict[str, str], l
 
 def _write_managed_service_pid(process: subprocess.Popen[str], pid_file: Path) -> None:
     try:
-        tmp_pid = pid_file.with_suffix(pid_file.suffix + ".tmp")
-        tmp_pid.write_text(f"{process.pid}\n", encoding="utf-8")
-        os.replace(tmp_pid, pid_file)
+        atomic_write_bytes(pid_file, f"{process.pid}\n".encode("utf-8"), mode=0o644)
     except OSError:
         try:
             os.killpg(os.getpgid(process.pid), signal.SIGTERM)

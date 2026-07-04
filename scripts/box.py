@@ -33,13 +33,18 @@ from typing import Any
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 
-# Single source of truth for secret redaction (scripts/lib/redaction.py), the
-# same leaf-import direction shared.py uses for lib.runtime_model. box.py shells
-# out to doctl/ssh; their stdout/stderr can echo a DigitalOcean token or a
-# Tailscale authkey, which must never reach operator JSON or transcripts.
+# Single source of truth for operator-side validation, inventory containment,
+# and checked subprocess output redaction.
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
-from lib.redaction import redact_text as redact_diagnostic_text  # noqa: E402
+from lib.opslib import (  # noqa: E402
+    resolve_inventory_path,
+    run_checked,
+    validate_box_id,
+    validate_host,
+    validate_profile_name,
+    validate_ssh_user,
+)
 
 PROFILES_DIR = REPO_ROOT / "workspace" / "box-profiles"
 BOOTSTRAP_SCRIPT = SCRIPT_DIR / "01-bootstrap-do.sh"
@@ -67,10 +72,7 @@ PROVISIONING_ENV_VARS = (
 
 
 def inventory_path() -> Path:
-    override = os.environ.get("SKILLBOX_BOX_INVENTORY", "").strip()
-    if override:
-        return Path(override)
-    return REPO_ROOT / "workspace" / "boxes.json"
+    return resolve_inventory_path(repo_root=REPO_ROOT)
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -137,6 +139,53 @@ VALID_TRANSITIONS = {
     "volume-cleanup-failed": ["volume-cleanup-failed", "destroyed"],
 }
 
+
+class BoxStateTransitionError(RuntimeError):
+    """Structured rejection for invalid box lifecycle state transitions."""
+
+    error_type = "invalid_state_transition"
+
+    def __init__(self, from_state: str, to_state: str) -> None:
+        valid_next = list(VALID_TRANSITIONS.get(from_state, []))
+        message = (
+            f"Invalid box state transition {from_state!r} -> {to_state!r}. "
+            f"Valid next states: {', '.join(valid_next) or '(none)'}."
+        )
+        super().__init__(message)
+        self.from_state = from_state
+        self.to_state = to_state
+        self.valid_next = valid_next
+        self.payload = {
+            "error": {
+                "type": self.error_type,
+                "message": message,
+                "recoverable": True,
+            },
+            "transition": {
+                "from": from_state,
+                "to": to_state,
+                "valid_next": valid_next,
+            },
+            "next_actions": ["box status <box-id>", "box list"],
+        }
+
+
+def validate_box_state_transition(from_state: str, to_state: str) -> None:
+    """Raise a structured error unless from_state -> to_state is declared."""
+    if from_state not in STATES or to_state not in STATES:
+        raise BoxStateTransitionError(from_state, to_state)
+    if to_state not in VALID_TRANSITIONS.get(from_state, []):
+        raise BoxStateTransitionError(from_state, to_state)
+
+
+def box_state_transition_allowed(from_state: str, to_state: str) -> bool:
+    try:
+        validate_box_state_transition(from_state, to_state)
+    except BoxStateTransitionError:
+        return False
+    return True
+
+
 # States from which `box down` (rerun / --resume) must idempotently converge to
 # `destroyed` when the underlying infra cooperates. The droplet is already gone
 # (volume-cleanup-failed) or may still be present (destroy-pending), so a rerun
@@ -151,45 +200,26 @@ DEFAULT_SSH_OPTS = [
 REMOTE_ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SHA256_HEX_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")
 IPV4_PATTERN = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
-_SSH_USER_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$')
-_HOST_RE = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,253}[a-zA-Z0-9])?$')
 # Box ids / box-profile names are an ALIGNED-but-separate surface from runtime
 # ids. The canonical slug grammar (and why these allow the slightly wider
 # `[a-zA-Z0-9._-]` class — historic `.` and uppercase box ids) is documented
 # once in docs/runtime-id-grammar.md, the same reference
 # scripts/lib/runtime_model.py points at. No runtime id uses `.`/uppercase, so
 # the runtime grammar there is the stricter `^[a-z0-9][a-z0-9_-]{0,63}$`.
-_BOX_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
-_PROFILE_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 
 
 def _validate_box_id(box_id: str) -> str:
-    if not box_id:
-        raise argparse.ArgumentTypeError("invalid box_id: must not be empty")
-    if "/" in box_id or "\\" in box_id:
-        raise argparse.ArgumentTypeError("invalid box_id: must not contain path separators")
-    if box_id.startswith("-"):
-        raise argparse.ArgumentTypeError("invalid box_id: must not start with '-'")
-    if not _BOX_ID_RE.match(box_id):
-        raise argparse.ArgumentTypeError(
-            "invalid box_id: must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,63}"
-        )
-    return box_id
+    try:
+        return validate_box_id(box_id)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _validate_profile_name(profile_name: str) -> str:
-    name = str(profile_name or "").strip()
-    if not name:
-        raise RuntimeError("Invalid box profile name: must not be empty")
-    if "/" in name or "\\" in name:
-        raise RuntimeError("Invalid box profile name: must not contain path separators")
-    if name.startswith("-"):
-        raise RuntimeError("Invalid box profile name: must not start with '-'")
-    if not _PROFILE_NAME_RE.match(name):
-        raise RuntimeError(
-            "Invalid box profile name: must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,63}"
-        )
-    return name
+    try:
+        return validate_profile_name(profile_name)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 def _validate_config_bool(value: Any, field: str) -> bool:
@@ -199,15 +229,11 @@ def _validate_config_bool(value: Any, field: str) -> bool:
 
 
 def _validate_ssh_user(user: str) -> str:
-    if not _SSH_USER_RE.match(user):
-        raise ValueError(f"Invalid ssh user: {user!r}")
-    return user
+    return validate_ssh_user(user, kind="ssh user")
 
 
 def _validate_host(host: str) -> str:
-    if not _HOST_RE.match(host):
-        raise ValueError(f"Invalid host: {host!r}")
-    return host
+    return validate_host(host, kind="host")
 
 
 REGISTER_PROBE_COMMAND = (
@@ -780,42 +806,34 @@ def load_operator_secret(name: str) -> None:
 # CLI runners
 # ---------------------------------------------------------------------------
 
-def _redact_completed_process(
-    result: subprocess.CompletedProcess[str],
-) -> subprocess.CompletedProcess[str]:
-    """Redact secrets out of a remote subprocess's captured stdout/stderr.
-
-    This is THE single boundary where remote (doctl/ssh) output enters
-    operator-visible payloads, status checks, error tails, and JSON parses.
-    Redaction is value-targeted (KEY=value, bearer tokens, URL userinfo,
-    tskey-/dop_v1_ tokens), so it never alters JSON structure of clean output
-    that callers re-parse with ``json.loads``.
-    """
-    if isinstance(result.stdout, str) and result.stdout:
-        result.stdout = redact_diagnostic_text(result.stdout)
-    if isinstance(result.stderr, str) and result.stderr:
-        result.stderr = redact_diagnostic_text(result.stderr)
-    return result
-
-
 def run(args: list[str], *, check: bool = True, capture: bool = True, timeout: int = 120) -> subprocess.CompletedProcess[str]:
-    try:
-        completed = subprocess.run(
+    if not capture:
+        completed = subprocess.run(args, capture_output=False, text=True, check=check, timeout=timeout)
+        return completed
+    checked = run_checked(args, timeout=timeout, redact=True)
+    if checked.get("error_code") == "TIMEOUT":
+        raise subprocess.TimeoutExpired(
             args,
-            capture_output=capture,
-            text=True,
-            check=check,
-            timeout=timeout,
+            timeout,
+            output=checked.get("stdout", ""),
+            stderr=checked.get("stderr_redacted", ""),
         )
-    except subprocess.CalledProcessError as exc:
-        # Redact secrets out of the raised error's captured output too, so a
-        # failing doctl/ssh command cannot leak a token via an exception tail.
-        if isinstance(exc.stdout, str):
-            exc.stdout = redact_diagnostic_text(exc.stdout)
-        if isinstance(exc.stderr, str):
-            exc.stderr = redact_diagnostic_text(exc.stderr)
-        raise
-    return _redact_completed_process(completed)
+    if checked.get("error_code") == "COMMAND_NOT_FOUND":
+        raise FileNotFoundError(str(checked.get("stderr_redacted") or args[0]))
+    completed = subprocess.CompletedProcess(
+        args,
+        int(checked["rc"]),
+        stdout=str(checked.get("stdout") or ""),
+        stderr=str(checked.get("stderr_redacted") or ""),
+    )
+    if check and completed.returncode != 0:
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            args,
+            output=completed.stdout,
+            stderr=completed.stderr,
+        )
+    return completed
 
 
 def doctl(*args: str, timeout: int = 120) -> subprocess.CompletedProcess[str]:
@@ -848,17 +866,27 @@ def ssh_script(
     if script_args:
         remote_argv.extend(["--", *script_args])
     remote_cmd = build_remote_env_command(remote_argv, env_vars)
-    with script_path.open("r") as f:
-        return _redact_completed_process(
-            subprocess.run(
-                ["ssh", *DEFAULT_SSH_OPTS, "--", f"{user}@{host}", remote_cmd],
-                stdin=f,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=timeout,
-            )
+    checked = run_checked(
+        ["ssh", *DEFAULT_SSH_OPTS, "--", f"{user}@{host}", remote_cmd],
+        timeout=timeout,
+        redact=True,
+        input_text=script_path.read_text(encoding="utf-8"),
+    )
+    if checked.get("error_code") == "TIMEOUT":
+        raise subprocess.TimeoutExpired(
+            ["ssh", *DEFAULT_SSH_OPTS, "--", f"{user}@{host}", remote_cmd],
+            timeout,
+            output=checked.get("stdout", ""),
+            stderr=checked.get("stderr_redacted", ""),
         )
+    if checked.get("error_code") == "COMMAND_NOT_FOUND":
+        raise FileNotFoundError(str(checked.get("stderr_redacted") or "ssh"))
+    return subprocess.CompletedProcess(
+        ["ssh", *DEFAULT_SSH_OPTS, "--", f"{user}@{host}", remote_cmd],
+        int(checked["rc"]),
+        stdout=str(checked.get("stdout") or ""),
+        stderr=str(checked.get("stderr_redacted") or ""),
+    )
 
 
 def extract_tailscale_ipv4(output: str) -> str | None:
@@ -1815,7 +1843,9 @@ def find_box(boxes: list[Box], box_id: str) -> Box | None:
     return None
 
 
-def update_box(box: Box, **kwargs: Any) -> None:
+def update_box(box: Box, *, validate_transition: bool = False, **kwargs: Any) -> None:
+    if validate_transition and "state" in kwargs:
+        validate_box_state_transition(box.state, str(kwargs["state"]))
     for k, v in kwargs.items():
         if hasattr(box, k):
             setattr(box, k, v)

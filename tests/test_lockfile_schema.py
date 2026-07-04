@@ -25,7 +25,7 @@ class TestLockfileSchema(unittest.TestCase):
             SkillLockEntry(
                 name="audit-plans",
                 source="repo",
-                repo="build000r/skills",
+                repo="example/skills",
                 declared_ref="main",
                 resolved_commit="abc123",
                 install_tree_sha="tree-audit",
@@ -84,7 +84,7 @@ class TestLockfileSchema(unittest.TestCase):
             "skills": [
                 {
                     "name": "deploy",
-                    "repo": "build000r/skills",
+                    "repo": "example/skills",
                     "declared_ref": "main",
                     "resolved_commit": "deadbeef",
                     "install_tree_sha": "legacy-tree",
@@ -101,7 +101,7 @@ class TestLockfileSchema(unittest.TestCase):
 
         emitted = parsed.to_dict()
         self.assertEqual(emitted["skills"][0]["source"], "repo")
-        self.assertEqual(emitted["skills"][0]["repo"], "build000r/skills")
+        self.assertEqual(emitted["skills"][0]["repo"], "example/skills")
 
     def test_parse_mixed_lockfile_payload(self) -> None:
         raw = {
@@ -118,7 +118,7 @@ class TestLockfileSchema(unittest.TestCase):
             "skills": [
                 {
                     "name": "audit-plans",
-                    "repo": "build000r/skills",
+                    "repo": "example/skills",
                     "declared_ref": "main",
                     "resolved_commit": "abc",
                     "install_tree_sha": "tree-audit",
@@ -150,7 +150,7 @@ class TestLockfileSchema(unittest.TestCase):
             "skills": [
                 {
                     "name": "deploy",
-                    "repo": "build000r/skills",
+                    "repo": "example/skills",
                     "declared_ref": "main",
                     "resolved_commit": "deadbeef",
                     "install_tree_sha": "legacy-tree",

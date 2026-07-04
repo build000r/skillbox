@@ -83,7 +83,7 @@ def _active_worker_model(repo_root: str = "/tmp/skills") -> dict[str, object]:
                 "context": {
                     "deploy": {
                         "repo_root": repo_root,
-                        "repo_slug": "build000r/skills",
+                        "repo_slug": "example/skills",
                     }
                 },
             }

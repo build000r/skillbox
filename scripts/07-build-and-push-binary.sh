@@ -18,7 +18,7 @@ set -euo pipefail
 #   SKILLBOX_BUILD_APT_DEPS="libdbus-1-dev pkg-config libssl-dev" \
 #   SKILLBOX_BUILD_EXTRA_MOUNTS="$HOME/repos/opensource/asupersync:/dp/asupersync:ro $HOME/repos/opensource/toon_rust:/dp/toon_rust:ro" \
 #   07-build-and-push-binary.sh \
-#     ~/repos/opensource/skillbox/repos/flywheel_connectors \
+#     ~/repos/opensource/skillbox/repos/flywheel-connectors \
 #     fwc skillbox-client_a-3
 #
 # Env vars:

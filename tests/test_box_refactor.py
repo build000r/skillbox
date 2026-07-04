@@ -793,7 +793,10 @@ class BoxRefactorTests(unittest.TestCase):
                 "port_reachability": {"ok": False},
             }
 
-            with mock.patch.dict(os.environ, {"SKILLBOX_BOX_INVENTORY": str(inventory)}), \
+            with mock.patch.dict(
+                os.environ,
+                {"SKILLBOX_BOX_INVENTORY": str(inventory), "SKILLBOX_STATE_ROOT": str(tmpdir)},
+            ), \
                 mock.patch.object(BOX, "wait_for_ssh", return_value=True), \
                 mock.patch.object(BOX, "ssh_cmd", return_value=_completed(returncode=1)), \
                 mock.patch.object(BOX, "box_network_health", return_value=network), \

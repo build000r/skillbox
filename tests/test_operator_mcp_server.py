@@ -164,7 +164,10 @@ class OperatorMcpServerTests(unittest.TestCase):
                 json.dumps({"boxes": [{"id": "alpha"}, {"id": "beta"}]}),
                 encoding="utf-8",
             )
-            with mock.patch.dict(os.environ, {"SKILLBOX_BOX_INVENTORY": str(inventory_path)}):
+            with mock.patch.dict(
+                os.environ,
+                {"SKILLBOX_BOX_INVENTORY": str(inventory_path), "SKILLBOX_STATE_ROOT": str(root)},
+            ):
                 self.assertEqual([box["id"] for box in MODULE.load_inventory()], ["alpha", "beta"])
                 self.assertEqual(MODULE.find_box("beta"), {"id": "beta"})
                 self.assertIsNone(MODULE.find_box("gamma"))
@@ -1102,7 +1105,7 @@ class OperatorBoxExecCommandPolicyTests(unittest.TestCase):
         # Bounded + slug-safe for any box_id length (passes identifier guard).
         long_key = MODULE._box_exec_marker_key("a" * 80, "rm -rf /a")
         self.assertLessEqual(len(long_key), 64)
-        self.assertTrue(MODULE._IDENTIFIER_RE.match(long_key))
+        self.assertEqual(MODULE._validate_identifier(long_key, "box_id"), long_key)
         # And the marker path builder accepts it.
         MODULE._dryrun_marker_path("operator_box_exec", long_key)
 

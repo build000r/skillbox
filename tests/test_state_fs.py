@@ -13,7 +13,6 @@ few seconds at most.
 from __future__ import annotations
 
 import io
-import json
 import multiprocessing as mp
 import os
 import sys

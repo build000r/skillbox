@@ -54,7 +54,7 @@ distributors:
       public_key: "ed25519:abc123..."   # distributor's signing key, pinned in config
 
 skill_repos:
-  - repo: build000r/skills            # existing kind — unchanged
+  - repo: example/skills            # existing kind — unchanged
     ref: main
     pick: [audit-plans]
 

@@ -124,7 +124,7 @@ inside_main() {
   }
 
   default_release_download_url() {
-    printf '%s\n' "https://github.com/build000r/swimmers/releases/latest/download/swimmers-linux-amd64"
+    printf '%s\n' "https://github.com/example/swimmers/releases/latest/download/swimmers-linux-amd64"
   }
 
   normalize_sha256() {

@@ -4,7 +4,6 @@ import io
 import json
 import sys
 import tempfile
-import textwrap
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from importlib.machinery import SourceFileLoader
@@ -411,14 +410,14 @@ class ReconcileTests(unittest.TestCase):
 
         process = mock.Mock(
             returncode=0,
-            stdout=json.dumps({"actions": ["skill-repo-fetched: build000r/skills"]}),
+            stdout=json.dumps({"actions": ["skill-repo-fetched: example/skills"]}),
             stderr="",
         )
         with mock.patch.object(RECONCILE, "run_command", return_value=process):
             dry_run = RECONCILE.check_skill_sync_dry_run({})
         self.assertEqual(dry_run.status, "pass")
         self.assertEqual(dry_run.code, "skill-repo-sync-dry-run")
-        self.assertEqual(dry_run.details["preview"], ["skill-repo-fetched: build000r/skills"])
+        self.assertEqual(dry_run.details["preview"], ["skill-repo-fetched: example/skills"])
 
         failed_process = mock.Mock(returncode=1, stdout="", stderr="sync failed")
         with mock.patch.object(RECONCILE, "run_command", return_value=failed_process):

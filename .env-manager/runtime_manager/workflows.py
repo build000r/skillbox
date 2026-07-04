@@ -8,7 +8,8 @@ from .runtime_ops import *
 from .context_rendering import *
 from .text_renderers import print_local_runtime_error_text
 from .parity_report import collect_dev_prod_parity_report, parity_report_evidence_summary
-from lib.runtime_model import resolve_placeholders
+from lib.paths import BoxPath, PathTranslator
+from lib.runtime_model import LOCAL_RUNTIME_START_MODES, is_runtime_absolute_path, resolve_placeholders
 
 
 def _workflow_step(
@@ -845,7 +846,7 @@ def generate_client_compose_override(
     mounts = _client_compose_pruned_mounts(root_dir, model)
     lines = _client_compose_override_lines(client_id, mounts)
     out_path = _client_compose_override_path(root_dir, client_id)
-    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    atomic_write_text(out_path, "\n".join(lines) + "\n")
     return out_path
 
 
@@ -864,12 +865,24 @@ def _client_compose_repo_mounts(model: dict[str, Any]) -> dict[str, str]:
     return mounts
 
 
+def _runtime_value_to_host_path(translator: PathTranslator, raw_path: str) -> Path:
+    candidate = Path(raw_path).expanduser()
+    if candidate.is_absolute() and not is_runtime_absolute_path(raw_path):
+        return candidate
+    if not candidate.is_absolute():
+        return candidate
+    return Path(translator.to_host(BoxPath(raw_path)))
+
+
 def _add_swimmers_compose_mount(root_dir: Path, model: dict[str, Any], mounts: dict[str, str]) -> None:
     env_values = model.get("env") or {}
     swimmers_repo = env_values.get("SKILLBOX_SWIMMERS_REPO", "")
     if swimmers_repo and swimmers_repo not in mounts:
-        from lib.runtime_model import runtime_path_to_host_path as _rp2hp
-        swimmers_host = str(_rp2hp(root_dir, env_values, swimmers_repo))
+        translator_model = dict(model)
+        translator_model["root_dir"] = str(root_dir)
+        translator_model["env"] = env_values
+        translator = PathTranslator.from_model(translator_model)
+        swimmers_host = str(_runtime_value_to_host_path(translator, swimmers_repo))
         if Path(swimmers_host).exists():
             mounts[swimmers_repo] = swimmers_host
 
@@ -1496,10 +1509,12 @@ def _probe_value_translator(
     runtime_env: dict[str, Any],
     translated_env: dict[str, str],
 ) -> Callable[[Any], str]:
+    translator = PathTranslator.from_model({"root_dir": str(root_dir), "env": runtime_env})
+
     def translate_probe_value(raw_value: Any) -> str:
         value = str(raw_value)
         if value.startswith("/"):
-            return str(runtime_path_to_host_path(root_dir, runtime_env, value))
+            return str(_runtime_value_to_host_path(translator, value))
         return translate_runtime_paths(value, runtime_env, translated_env)
 
     return translate_probe_value

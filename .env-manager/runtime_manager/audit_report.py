@@ -9,10 +9,7 @@ all text renderers. Depends on ._skill_common, .policy_eval, and .inventory.
 from __future__ import annotations
 
 import fnmatch
-import glob
-import hashlib
 import os
-import shutil
 from pathlib import Path
 from typing import Any, Callable
 
@@ -30,15 +27,6 @@ try:
 except ModuleNotFoundError:
     yaml = None
 
-from .shared import (
-    GLOBAL_HOME_ROOT_ENV,
-    GLOBAL_HOME_SURFACES,
-    atomic_write_text,
-    directory_tree_sha256,
-    load_json_file,
-    load_yaml,
-    load_skill_repos_config,
-)
 
 from ._skill_common import *
 from .policy_eval import *
@@ -314,7 +302,7 @@ def _issue_row_fix_command(issue_type: str, row: dict[str, Any]) -> str:
         return f"sbp skill remove {name} --from global --yes"
     if issue_type == "archive_sources":
         return (
-            f"copy {name!r} into skills-private, then repoint its source root "
+            f"copy {name!r} into private-skills, then repoint its source root "
             f"(stale archive copy at {row.get('source') or path})"
         )
     if issue_type == "shadowed":
@@ -1768,7 +1756,7 @@ def _explain_remediation(
             "kind": "source_restore",
             "command": (
                 f"restore or declare a source for {skill_name!r} (e.g. add it to the active "
-                "client's skill-repos.yaml or create skills-private/<name>/SKILL.md)"
+                "client's skill-repos.yaml or create private-skills/<name>/SKILL.md)"
             ),
             "why": (
                 f"no source directory for {skill_name!r} was found under any configured source "
@@ -1960,7 +1948,7 @@ def skill_visibility_next_actions(issues: dict[str, list[dict[str, Any]]]) -> li
     if issues.get("extra_global"):
         actions.append("declare extra global skills in skill-repos.yaml or unlink them")
     if issues.get("archive_sources"):
-        actions.append("copy useful archive-sourced skills into skills-private, then repoint")
+        actions.append("copy useful archive-sourced skills into private-skills, then repoint")
     if issues.get("scope_violations"):
         actions.append("unlink or move skills installed outside their declared scope")
     if issues.get("missing_for_cwd"):

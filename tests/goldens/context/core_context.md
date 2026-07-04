@@ -52,7 +52,7 @@ Single source of truth for declared ports. Run `python3 .env-manager/manage.py p
 
 ## Installed Skills
 
-- **default-skills**: beads-br, beads-bv, beads-workflow, codebase-audit, divide-and-conquer, git-stash-janitor, lube, mmdx, no-ragrets, project-status-mmdx, sbp, skill-issue, smart, ui-fresh-eyes
+- **default-skills**: (empty)
 
 ## Logs
 

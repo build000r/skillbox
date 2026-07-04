@@ -24,7 +24,7 @@ SBH_RELEASE_CAVEATS = [
         "status": "known_bad",
         "observed_at": "2026-05-14",
         "version": "v0.4.23",
-        "repository": "Dicklesworthstone/storage_ballast_helper",
+        "repository": "storage-ballast-helper",
         "affected_asset": "sbh-v0.4.23-x86_64-unknown-linux-gnu.tar.xz",
         "observed_file_type": "Mach-O 64-bit executable arm64",
         "expected_file_type": "ELF 64-bit LSB executable, x86-64",
