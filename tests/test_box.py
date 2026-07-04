@@ -1130,6 +1130,85 @@ class BoxArgvHardeningTests(unittest.TestCase):
         self.assertEqual(payload["env_updates"]["SKILLBOX_SWIMMERS_PUBLISH_HOST"], "0.0.0.0")
 
 
+class BoxSshRetryTests(unittest.TestCase):
+    def _write_fake_ssh(self, root: Path) -> tuple[Path, Path]:
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        counter = root / "ssh-count"
+        fake_ssh = bin_dir / "ssh"
+        fake_ssh.write_text(
+            """#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+
+counter = pathlib.Path(os.environ["FAKE_SSH_COUNTER"])
+try:
+    count = int(counter.read_text(encoding="utf-8"))
+except FileNotFoundError:
+    count = 0
+count += 1
+counter.write_text(str(count), encoding="utf-8")
+
+fail_count = int(os.environ.get("FAKE_SSH_FAILS", "0"))
+if count <= fail_count:
+    sys.stderr.write(os.environ.get("FAKE_SSH_ERROR", "Connection timed out\\n"))
+    sys.exit(int(os.environ.get("FAKE_SSH_FAIL_RC", "255")))
+
+sys.stdout.write(os.environ.get("FAKE_SSH_STDOUT", "workspace\\n"))
+sys.exit(int(os.environ.get("FAKE_SSH_SUCCESS_RC", "0")))
+""",
+            encoding="utf-8",
+        )
+        fake_ssh.chmod(0o755)
+        return bin_dir, counter
+
+    def _retry_test_env(self, bin_dir: Path, counter: Path, *, fails: int) -> dict[str, str]:
+        return {
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "FAKE_SSH_COUNTER": str(counter),
+            "FAKE_SSH_FAILS": str(fails),
+            "FAKE_SSH_ERROR": "Connection timed out\n",
+            "FAKE_SSH_STDOUT": "workspace\n",
+        }
+
+    def test_box_health_retries_transient_ssh_transport_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bin_dir, counter = self._write_fake_ssh(Path(tmpdir))
+            box = BOX_MODULE.Box(
+                id="retry-box",
+                profile="dev-small",
+                state="ready",
+                tailscale_ip="100.64.0.8",
+                tailscale_hostname="retry-box",
+            )
+            network_checks = {
+                "public_ssh": {"ok": False, "target": None},
+                "tailnet_ping": {"ok": True, "target": "100.64.0.8"},
+                "magicdns_resolution": {"ok": False, "hostname": "retry-box"},
+                "port_reachability": {"ok": False, "target": "100.64.0.8"},
+            }
+            with mock.patch.dict(os.environ, self._retry_test_env(bin_dir, counter, fails=1), clear=False), \
+                 mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="100.64.0.8"), \
+                 mock.patch.object(BOX_MODULE, "box_network_health", return_value=network_checks):
+                status = BOX_MODULE.box_health(box)
+
+            self.assertTrue(status["container_running"])
+            self.assertEqual(counter.read_text(encoding="utf-8"), "2")
+            self.assertEqual(status["remote_probes"]["container"]["attempts"], 2)
+
+    def test_ssh_cmd_default_does_not_retry_mutating_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bin_dir, counter = self._write_fake_ssh(Path(tmpdir))
+            with mock.patch.dict(os.environ, self._retry_test_env(bin_dir, counter, fails=99), clear=False):
+                result = BOX_MODULE.ssh_cmd("skillbox", "box.example.com", "deploy something", timeout=5)
+
+            self.assertEqual(result.returncode, 255)
+            self.assertEqual(counter.read_text(encoding="utf-8"), "1")
+            self.assertTrue(result.retryable_hint)
+            self.assertEqual(result.failure_class, "ssh_transport")
+
+
 def _swimmers_context_for_test():
     """Minimal stand-in for BoxUpContext that activates the 'swimmers' profile."""
     from types import SimpleNamespace

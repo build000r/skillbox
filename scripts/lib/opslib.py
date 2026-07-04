@@ -10,9 +10,11 @@ import os
 import re
 import json
 import fcntl
+import random
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -28,6 +30,23 @@ _SECRET_ASSIGNMENT_RE = re.compile(
 )
 _BEARER_RE = re.compile(r"(?i)(\bAuthorization:\s*Bearer\s+)([^\s]+)")
 _SECRET_TOKEN_RE = re.compile(r"(?i)\b(?:tskey|dop_v1|ghp|github_pat)_[A-Za-z0-9_.-]+")
+SSH_TRANSPORT_ERROR_PATTERNS = (
+    "connection timed out",
+    "connection refused",
+    "connection reset",
+    "kex_exchange",
+)
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    attempts: int
+    backoff_seconds: tuple[float, ...] = (1.0, 2.0, 4.0)
+    jitter_seconds: float = 0.25
+    total_deadline: float = 30.0
+
+
+SSH_READ_RETRY_POLICY = RetryPolicy(attempts=3)
 
 
 class InventoryPathError(ValueError):
@@ -228,15 +247,44 @@ def resolve_inventory_path(
     )
 
 
-def run_checked(
+def classify_ssh_failure(result: dict[str, Any]) -> dict[str, Any]:
+    """Classify an SSH subprocess result for retry and diagnostics.
+
+    OpenSSH reports transport setup failures as exit 255. We only treat the
+    table below as retryable transport failures; other nonzero exits are remote
+    command failures and must not be retried automatically.
+    """
+    rc = int(result.get("rc", -1))
+    if rc == 0:
+        return {"failure_class": "success", "retryable": False}
+
+    error_code = str(result.get("error_code") or "")
+    if error_code == "TIMEOUT":
+        return {"failure_class": "ssh_transport", "retryable": True, "matched_pattern": "timeout"}
+
+    stderr = str(result.get("stderr_redacted") or result.get("stderr") or "").lower()
+    if rc == 255:
+        for pattern in SSH_TRANSPORT_ERROR_PATTERNS:
+            if pattern in stderr:
+                return {
+                    "failure_class": "ssh_transport",
+                    "retryable": True,
+                    "matched_pattern": pattern,
+                }
+
+    return {"failure_class": "remote_command", "retryable": False}
+
+
+def _run_checked_once(
     cmd: Sequence[str],
     timeout: int,
-    redact: bool = True,
     *,
+    redact: bool,
     cwd: str | Path | None = None,
     input_text: str | None = None,
+    monotonic: Callable[[], float],
 ) -> dict[str, Any]:
-    start = time.monotonic()
+    start = monotonic()
     command = [str(part) for part in cmd]
     try:
         proc = subprocess.run(
@@ -253,14 +301,14 @@ def run_checked(
             "rc": proc.returncode,
             "stdout": stdout,
             "stderr_redacted": stderr,
-            "elapsed": time.monotonic() - start,
+            "elapsed": monotonic() - start,
         }
     except FileNotFoundError as exc:
         return {
             "rc": -1,
             "stdout": "",
             "stderr_redacted": _redact_text(str(exc)) if redact else str(exc),
-            "elapsed": time.monotonic() - start,
+            "elapsed": monotonic() - start,
             "error_code": "COMMAND_NOT_FOUND",
         }
     except subprocess.CalledProcessError as exc:
@@ -270,7 +318,7 @@ def run_checked(
             "rc": exc.returncode,
             "stdout": _redact_text(stdout) if redact else stdout,
             "stderr_redacted": _redact_text(stderr) if redact else stderr,
-            "elapsed": time.monotonic() - start,
+            "elapsed": monotonic() - start,
             "error_code": "CHECK_FAILED",
         }
     except subprocess.TimeoutExpired as exc:
@@ -280,9 +328,108 @@ def run_checked(
             "rc": -1,
             "stdout": _redact_text(stdout) if redact else stdout,
             "stderr_redacted": _redact_text(stderr) if redact else stderr,
-            "elapsed": time.monotonic() - start,
+            "elapsed": monotonic() - start,
             "error_code": "TIMEOUT",
         }
+
+
+def _retry_backoff_seconds(
+    policy: RetryPolicy,
+    attempt_index: int,
+    *,
+    jitter: Callable[[float], float] | None,
+) -> float:
+    base = policy.backoff_seconds[min(attempt_index, len(policy.backoff_seconds) - 1)] if policy.backoff_seconds else 0.0
+    jitter_limit = max(0.0, float(policy.jitter_seconds))
+    jitter_value = 0.0
+    if jitter_limit:
+        jitter_value = float(jitter(jitter_limit) if jitter is not None else random.uniform(0.0, jitter_limit))
+        jitter_value = max(0.0, jitter_value)
+    return max(0.0, float(base) + jitter_value)
+
+
+def run_checked(
+    cmd: Sequence[str],
+    timeout: int,
+    redact: bool = True,
+    *,
+    cwd: str | Path | None = None,
+    input_text: str | None = None,
+    retry_policy: RetryPolicy | None = None,
+    retry_classifier: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    jitter: Callable[[float], float] | None = None,
+) -> dict[str, Any]:
+    total_start = monotonic()
+    attempts_allowed = max(1, int(retry_policy.attempts)) if retry_policy is not None else 1
+    deadline_at = total_start + max(0.0, float(retry_policy.total_deadline)) if retry_policy is not None else None
+    attempt_details: list[dict[str, Any]] = []
+    final: dict[str, Any] | None = None
+
+    for attempt_number in range(1, attempts_allowed + 1):
+        attempt_timeout: float = float(timeout)
+        if deadline_at is not None:
+            remaining = deadline_at - monotonic()
+            if remaining <= 0 and attempt_number > 1:
+                if final is not None:
+                    final["deadline_exhausted"] = True
+                break
+            attempt_timeout = max(0.001, min(float(timeout), max(0.0, remaining)))
+
+        result = _run_checked_once(
+            cmd,
+            timeout=attempt_timeout,
+            redact=redact,
+            cwd=cwd,
+            input_text=input_text,
+            monotonic=monotonic,
+        )
+        classification = retry_classifier(result) if retry_classifier is not None else {}
+        failure_class = classification.get("failure_class")
+        retryable = bool(classification.get("retryable", False))
+        if failure_class:
+            result["failure_class"] = failure_class
+        result["retryable_hint"] = retryable
+        final = result
+
+        detail: dict[str, Any] = {
+            "attempt": attempt_number,
+            "rc": int(result.get("rc", -1)),
+            "elapsed": float(result.get("elapsed") or 0.0),
+            "retryable": retryable,
+        }
+        if failure_class:
+            detail["failure_class"] = failure_class
+        if classification.get("matched_pattern"):
+            detail["matched_pattern"] = classification["matched_pattern"]
+        attempt_details.append(detail)
+
+        if int(result.get("rc", -1)) == 0 or not retryable or attempt_number >= attempts_allowed:
+            break
+
+        backoff = _retry_backoff_seconds(retry_policy, attempt_number - 1, jitter=jitter)
+        if deadline_at is not None and monotonic() + backoff >= deadline_at:
+            result["deadline_exhausted"] = True
+            break
+        detail["sleep_before_next"] = backoff
+        sleep(backoff)
+
+    if final is None:
+        final = {
+            "rc": -1,
+            "stdout": "",
+            "stderr_redacted": "",
+            "elapsed": monotonic() - total_start,
+            "error_code": "TIMEOUT",
+            "deadline_exhausted": True,
+            "retryable_hint": bool(retry_classifier),
+        }
+
+    final["attempts"] = len(attempt_details)
+    final["attempt_details"] = attempt_details
+    final["elapsed"] = monotonic() - total_start
+    return final
 
 
 __all__ = [
@@ -290,7 +437,11 @@ __all__ = [
     "INVENTORY_PATH_INVALID",
     "InventoryLockTimeout",
     "InventoryPathError",
+    "RetryPolicy",
+    "SSH_READ_RETRY_POLICY",
+    "SSH_TRANSPORT_ERROR_PATTERNS",
     "atomic_write_json",
+    "classify_ssh_failure",
     "locked_inventory_update",
     "resolve_inventory_path",
     "run_checked",
