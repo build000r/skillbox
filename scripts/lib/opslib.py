@@ -8,12 +8,16 @@ from __future__ import annotations
 
 import os
 import re
+import json
+import fcntl
 import subprocess
+import tempfile
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 INVENTORY_PATH_INVALID = "INVENTORY_PATH_INVALID"
+INVENTORY_LOCK_TIMEOUT = "INVENTORY_LOCK_TIMEOUT"
 
 _IDENTIFIER_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 _SSH_USER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$")
@@ -30,6 +34,12 @@ class InventoryPathError(ValueError):
     """Raised when an inventory path escapes approved operator roots."""
 
     error_code = INVENTORY_PATH_INVALID
+
+
+class InventoryLockTimeout(TimeoutError):
+    """Raised when an inventory sidecar lock cannot be acquired."""
+
+    error_code = INVENTORY_LOCK_TIMEOUT
 
 
 def _repo_root() -> Path:
@@ -49,6 +59,98 @@ def _redact_text(value: Any) -> str:
     text = _BEARER_RE.sub(r"\1[REDACTED]", text)
     text = _SECRET_ASSIGNMENT_RE.sub(r"\1[REDACTED]", text)
     return _SECRET_TOKEN_RE.sub("[REDACTED]", text)
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_write_json(path: Path, data: Any) -> None:
+    """Write JSON by temp-file + fsync + atomic replace.
+
+    The temporary file lives in the target directory so ``os.replace`` does not
+    cross filesystems. A crash mid-write leaves either the previous complete
+    file or the new complete file.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(data, indent=2, sort_keys=True, default=str) + "\n"
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=str(target.parent),
+        text=True,
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, target)
+        _fsync_directory(target.parent)
+    except BaseException:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _read_json_if_present(path: Path, *, default: Any, tolerate_corrupt: bool) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default
+    except json.JSONDecodeError:
+        if tolerate_corrupt:
+            return default
+        raise
+
+
+def locked_inventory_update(
+    path: Path,
+    updater_fn: Callable[[Any], Any],
+    *,
+    default: Any = None,
+    timeout: float = 5.0,
+    tolerate_corrupt: bool = False,
+) -> Any:
+    """Run a locked, atomic JSON read-modify-write cycle.
+
+    A ``<path>.lock`` sidecar serializes concurrent writers. The updater sees
+    the current parsed JSON value or ``default`` when the inventory is absent
+    (and, only when requested for recovery, corrupt).
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = target.with_name(target.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + max(0.0, timeout)
+
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        while True:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise InventoryLockTimeout(f"Timed out acquiring inventory lock {lock_path}") from exc
+                time.sleep(0.02)
+        try:
+            current = _read_json_if_present(target, default=default, tolerate_corrupt=tolerate_corrupt)
+            updated = updater_fn(current)
+            atomic_write_json(target, updated)
+            return updated
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def validate_identifier(value: str, kind: str) -> str:
@@ -184,8 +286,12 @@ def run_checked(
 
 
 __all__ = [
+    "INVENTORY_LOCK_TIMEOUT",
     "INVENTORY_PATH_INVALID",
+    "InventoryLockTimeout",
     "InventoryPathError",
+    "atomic_write_json",
+    "locked_inventory_update",
     "resolve_inventory_path",
     "run_checked",
     "validate_box_id",

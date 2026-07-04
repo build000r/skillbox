@@ -38,6 +38,7 @@ REPO_ROOT = SCRIPT_DIR.parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from lib.opslib import (  # noqa: E402
+    locked_inventory_update,
     resolve_inventory_path,
     run_checked,
     validate_box_id,
@@ -74,6 +75,19 @@ PROVISIONING_ENV_VARS = (
 def inventory_path() -> Path:
     return resolve_inventory_path(repo_root=REPO_ROOT)
 
+
+def inventory_journal_path(inventory: Path | None = None) -> Path:
+    override = os.environ.get("SKILLBOX_BOX_JOURNAL", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+
+    path = (inventory or inventory_path()).resolve()
+    default_inventory = (REPO_ROOT / "workspace" / "boxes.json").resolve()
+    if path == default_inventory:
+        return REPO_ROOT / ".skillbox-state" / "boxes-journal.jsonl"
+    return path.parent / ".skillbox-state" / "boxes-journal.jsonl"
+
+
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_DRIFT = 2
@@ -81,6 +95,7 @@ BOX_COMMAND_NAMES = {
     "capabilities",
     "down",
     "import",
+    "inventory-rebuild",
     "list",
     "profiles",
     "register",
@@ -480,6 +495,7 @@ def _box_agent_command(name: str) -> dict[str, Any]:
         "capabilities": "python3 scripts/box.py capabilities --json",
         "down": "python3 scripts/box.py down <box-id> --dry-run --format json",
         "import": "python3 scripts/box.py profiles --format json",
+        "inventory-rebuild": "python3 scripts/box.py status <box-id> --history --format json",
         "list": "python3 scripts/box.py list --format json",
         "profiles": "python3 scripts/box.py profiles --format json",
         "register": "python3 scripts/box.py profiles --format json",
@@ -497,12 +513,13 @@ def _box_agent_command(name: str) -> dict[str, Any]:
     command = {
         "name": name,
         "json": name in BOX_JSON_COMMANDS,
-        "mutates": name in {"down", "import", "register", "unregister", "up", "upgrade"},
+        "mutates": name in {"down", "import", "inventory-rebuild", "register", "unregister", "up", "upgrade"},
         "destructive": name == "down",
         "dry_run": name in {"down", "up", "upgrade"},
         "safe_first_try": safe_first_try,
         "mutation_command": {
             "import": "python3 scripts/box.py import <box-id> --host <host> --no-probe --format json",
+            "inventory-rebuild": "python3 scripts/box.py inventory-rebuild --from-journal --format json",
             "register": "python3 scripts/box.py register <box-id> --host <host> --no-probe --format json",
             "unregister": "python3 scripts/box.py unregister <box-id> --format json",
         }.get(name),
@@ -1816,24 +1833,196 @@ class Box:
     cloud_firewall_id: str | None = None
 
 
+INVENTORY_CORRUPT = "INVENTORY_CORRUPT"
+
+
+class InventoryCorruptError(RuntimeError):
+    """Raised when boxes.json exists but is not safe to trust."""
+
+    def __init__(self, path: Path, detail: str) -> None:
+        self.path = Path(path)
+        self.detail = detail
+        message = f"{INVENTORY_CORRUPT}: {path}: {detail}"
+        super().__init__(message)
+        self.payload = structured_error(
+            message,
+            error_type=INVENTORY_CORRUPT,
+            recovery_hint=(
+                "The box inventory was not loaded. Inspect the file, then rebuild "
+                "from the append-only journal if appropriate."
+            ),
+            next_actions=[
+                "python3 scripts/box.py inventory-rebuild --from-journal --format json",
+                f"cp {path} {path}.corrupt",
+            ],
+        )
+
+
+def _inventory_box_from_item(item: Any, *, index: int, path: Path) -> Box:
+    if not isinstance(item, dict):
+        raise InventoryCorruptError(path, f"boxes[{index}] must be an object")
+    if not isinstance(item.get("id"), str) or not item["id"].strip():
+        raise InventoryCorruptError(path, f"boxes[{index}].id must be a non-empty string")
+    normalized = {k: v for k, v in item.items() if k in Box.__dataclass_fields__}
+    normalized.setdefault("profile", "")
+    normalized.setdefault("state", "creating")
+    if normalized["state"] not in STATES:
+        raise InventoryCorruptError(path, f"boxes[{index}].state {normalized['state']!r} is not valid")
+    return Box(**normalized)
+
+
+def _boxes_from_inventory_payload(data: Any, *, path: Path) -> list[Box]:
+    if data is None:
+        return []
+    if not isinstance(data, dict):
+        raise InventoryCorruptError(path, "top-level inventory must be an object")
+    raw_boxes = data.get("boxes", [])
+    if not isinstance(raw_boxes, list):
+        raise InventoryCorruptError(path, "top-level boxes field must be a list")
+    return [
+        _inventory_box_from_item(item, index=index, path=path)
+        for index, item in enumerate(raw_boxes)
+    ]
+
+
+def _inventory_payload(boxes: list[Box]) -> dict[str, Any]:
+    return {"boxes": [asdict(b) for b in boxes]}
+
+
 def load_inventory() -> list[Box]:
     path = inventory_path()
     if not path.is_file():
         return []
-    data = json.loads(path.read_text(encoding="utf-8"))
-    boxes = []
-    for item in data.get("boxes", []):
-        boxes.append(Box(**{k: v for k, v in item.items() if k in Box.__dataclass_fields__}))
-    return boxes
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise InventoryCorruptError(path, f"invalid JSON: {exc}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"Could not read inventory {path}: {exc}") from exc
+    return _boxes_from_inventory_payload(data, path=path)
 
 
-def save_inventory(boxes: list[Box]) -> None:
-    path = inventory_path()
+def _append_inventory_journal(entries: list[dict[str, Any]], *, inventory: Path) -> None:
+    if not entries:
+        return
+    path = inventory_journal_path(inventory)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"boxes": [asdict(b) for b in boxes]}
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        for entry in entries:
+            os.write(fd, (json.dumps(entry, sort_keys=True, default=str) + "\n").encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _inventory_transition_entries(
+    current_payload: Any,
+    next_payload: dict[str, Any],
+    *,
+    actor: str,
+    reason: str,
+    path: Path,
+) -> list[dict[str, Any]]:
+    current_by_id = {
+        box.id: box
+        for box in _boxes_from_inventory_payload(current_payload, path=path)
+    }
+    entries: list[dict[str, Any]] = []
+    ts = datetime.now(timezone.utc).isoformat()
+    for box in _boxes_from_inventory_payload(next_payload, path=path):
+        previous = current_by_id.get(box.id)
+        from_state = previous.state if previous is not None else None
+        if from_state == box.state:
+            continue
+        entries.append(
+            {
+                "ts": ts,
+                "box_id": box.id,
+                "from_state": from_state,
+                "to_state": box.state,
+                "actor": actor,
+                "reason": reason,
+                "box": asdict(box),
+            }
+        )
+    return entries
+
+
+def read_inventory_journal(box_id: str | None = None) -> list[dict[str, Any]]:
+    path = inventory_journal_path()
+    if not path.is_file():
+        return []
+    entries: list[dict[str, Any]] = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if box_id is not None and entry.get("box_id") != box_id:
+            continue
+        entries.append(entry)
+    return entries
+
+
+def rebuild_inventory_from_journal() -> list[Box]:
+    boxes_by_id: dict[str, Box] = {}
+    created_at_by_id: dict[str, str] = {}
+    for entry in read_inventory_journal():
+        box_id = str(entry.get("box_id") or "").strip()
+        to_state = str(entry.get("to_state") or "").strip()
+        if not box_id or to_state not in STATES:
+            continue
+        ts = str(entry.get("ts") or "").strip()
+        snapshot = entry.get("box") if isinstance(entry.get("box"), dict) else {}
+        item = {k: v for k, v in snapshot.items() if k in Box.__dataclass_fields__}
+        item["id"] = box_id
+        item.setdefault("profile", "")
+        item["state"] = to_state
+        if ts:
+            created_at_by_id.setdefault(box_id, ts)
+            item.setdefault("created_at", created_at_by_id[box_id])
+            item["updated_at"] = ts
+        boxes_by_id[box_id] = Box(**item)
+    return [boxes_by_id[box_id] for box_id in sorted(boxes_by_id)]
+
+
+def save_inventory(
+    boxes: list[Box],
+    *,
+    actor: str | None = None,
+    reason: str = "inventory update",
+    journal: bool = True,
+    tolerate_corrupt: bool = False,
+) -> None:
+    path = inventory_path()
+    payload = _inventory_payload(boxes)
+    effective_actor = actor or os.environ.get("SKILLBOX_BOX_ACTOR", "").strip() or "cli"
+
+    def _replace_inventory(current: Any) -> dict[str, Any]:
+        current_payload = {"boxes": []} if tolerate_corrupt else (current if current is not None else {"boxes": []})
+        transitions = _inventory_transition_entries(
+            current_payload,
+            payload,
+            actor=effective_actor,
+            reason=reason,
+            path=path,
+        )
+        if journal:
+            _append_inventory_journal(transitions, inventory=path)
+        return payload
+
+    locked_inventory_update(
+        path,
+        _replace_inventory,
+        default={"boxes": []},
+        tolerate_corrupt=tolerate_corrupt,
+    )
 
 
 def find_box(boxes: list[Box], box_id: str) -> Box | None:
@@ -4070,13 +4259,57 @@ def cmd_register(
 
 
 # ---------------------------------------------------------------------------
+# inventory rebuild
+# ---------------------------------------------------------------------------
+
+def cmd_inventory_rebuild(*, from_journal: bool, fmt: str) -> int:
+    is_json = fmt == "json"
+    if not from_journal:
+        msg = "inventory-rebuild requires --from-journal."
+        if is_json:
+            emit_json(structured_error(msg, error_type="invalid_request", next_actions=["box inventory-rebuild --from-journal"]))
+        else:
+            print(msg, file=sys.stderr)
+        return EXIT_ERROR
+
+    boxes = rebuild_inventory_from_journal()
+    save_inventory(
+        boxes,
+        reason="inventory rebuild from journal",
+        journal=False,
+        tolerate_corrupt=True,
+    )
+    payload = {
+        "ok": True,
+        "rebuilt": len(boxes),
+        "inventory_path": str(inventory_path()),
+        "journal_path": str(inventory_journal_path()),
+        "boxes": [asdict(box) for box in boxes],
+        "next_actions": ["box list", "box status <box-id> --history"],
+    }
+    if is_json:
+        emit_json(payload)
+    else:
+        print(f"Rebuilt {len(boxes)} box inventory entr{'y' if len(boxes) == 1 else 'ies'} from journal.")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
 # box status
 # ---------------------------------------------------------------------------
 
-def cmd_status(box_id: str | None, *, fmt: str, write_cache: bool = True) -> int:
+def cmd_status(box_id: str | None, *, fmt: str, write_cache: bool = True, history: bool = False) -> int:
     is_json = fmt == "json"
     boxes = load_inventory()
     ssh_target_snapshot = inventory_ssh_target_snapshot(boxes)
+
+    if history and not box_id:
+        msg = "--history requires a box id."
+        if is_json:
+            emit_json(structured_error(msg, error_type="invalid_request", next_actions=["box status <box-id> --history"]))
+        else:
+            print(msg, file=sys.stderr)
+        return EXIT_ERROR
 
     if box_id:
         box = find_box(boxes, box_id)
@@ -4089,6 +4322,8 @@ def cmd_status(box_id: str | None, *, fmt: str, write_cache: bool = True) -> int
             return EXIT_ERROR
 
         status = box_health(box)
+        if history:
+            status["history"] = read_inventory_journal(box.id)
         cache_written = persist_inventory_if_ssh_targets_changed(
             boxes,
             ssh_target_snapshot,
@@ -4273,6 +4508,16 @@ def print_box_status_text(status: dict[str, Any]) -> None:
         for v in violations:
             severity = v.get("severity", "warning")
             print(f"    - [{severity}] {v.get('message', v.get('type', 'unknown'))}")
+    history = status.get("history") or []
+    if history:
+        print("  history:")
+        for entry in history:
+            print(
+                "    - "
+                f"{entry.get('ts', 'unknown')} "
+                f"{entry.get('from_state')} -> {entry.get('to_state')} "
+                f"({entry.get('reason') or 'no reason'})"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -4597,7 +4842,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Opt in to updating cached last_ssh_target values in workspace/boxes.json after probes.",
     )
+    status_parser.add_argument("--history", action="store_true", help="Show append-only transition history for one box.")
     status_parser.add_argument("--format", choices=("text", "json"), default="text")
+
+    rebuild_parser = subparsers.add_parser("inventory-rebuild", help="Rebuild boxes.json from the append-only transition journal.")
+    rebuild_parser.add_argument("--from-journal", action="store_true", help="Recover from .skillbox-state/boxes-journal.jsonl.")
+    rebuild_parser.add_argument("--format", choices=("text", "json"), default="text")
 
     posture_proof_parser = subparsers.add_parser("posture-proof", help="Generate a network posture proof artifact for a box.")
     posture_proof_parser.add_argument("box_id", type=_validate_box_id, help="Box identifier.")
@@ -4733,7 +4983,9 @@ def main(argv: list[str] | None = None) -> int:
                 fmt=args.format,
             )
         if args.command == "status":
-            return cmd_status(args.box_id, fmt=args.format, write_cache=args.write_cache)
+            return cmd_status(args.box_id, fmt=args.format, write_cache=args.write_cache, history=args.history)
+        if args.command == "inventory-rebuild":
+            return cmd_inventory_rebuild(from_journal=args.from_journal, fmt=args.format)
         if args.command == "posture-proof":
             return cmd_posture_proof(args.box_id, fmt=args.format)
         if args.command == "ssh":
@@ -4754,6 +5006,9 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_list(fmt=args.format)
         if args.command == "profiles":
             return cmd_profiles(fmt=args.format)
+    except InventoryCorruptError as exc:
+        emit_json(exc.payload)
+        return EXIT_ERROR
     except RuntimeError as exc:
         emit_json(structured_error(str(exc)))
         return EXIT_ERROR
