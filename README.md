@@ -93,6 +93,7 @@ This is the shortest useful local run:
 cp .env.example .env
 make render
 make doctor
+make e2e-smoke
 make runtime-render
 make runtime-sync
 make dev-sanity
@@ -956,6 +957,7 @@ make runtime-sync
 | `make onboard` | Scaffold and activate a new client overlay with optional blueprint |
 | `make context` | Generates `CLAUDE.md` and `AGENTS.md` from the resolved runtime graph |
 | `make dev-sanity` | Validates the internal runtime graph, filesystem readiness, and managed skill integrity |
+| `make e2e-smoke` | Runs the opt-in read-only e2e smoke: render, doctor, runtime-render, sync dry-run, compose config, and loopback stub probes. Use `FORMAT=json` for machine output and `STRICT=1` to fail on doctor red checks. |
 | `make pulse-start` | Starts the pulse reconciliation daemon |
 | `make pulse-stop` | Sends SIGTERM to the running pulse daemon |
 | `make pulse-status` | Prints pulse daemon status: cycles, heals, service states |

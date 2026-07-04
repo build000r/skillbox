@@ -14,7 +14,9 @@ REPOS_ROOT = Path(os.environ.get("SKILLBOX_REPOS_ROOT", ROOT / "repos"))
 SKILLS_ROOT = Path(os.environ.get("SKILLBOX_SKILLS_ROOT", ROOT / "skills"))
 LOG_ROOT = Path(os.environ.get("SKILLBOX_LOG_ROOT", ROOT / "logs"))
 HOME_ROOT = Path(os.environ.get("SKILLBOX_HOME_ROOT", "/home/sandbox"))
+HOST = os.environ.get("SKILLBOX_API_HOST", "0.0.0.0")
 PORT = int(os.environ.get("SKILLBOX_API_PORT", "8000"))
+_RUNTIME_SUMMARY_CACHE: dict | None = None
 
 
 def list_directories(root: Path) -> list[dict[str, str]]:
@@ -29,8 +31,11 @@ def list_directories(root: Path) -> list[dict[str, str]]:
 
 
 def runtime_summary() -> dict:
+    global _RUNTIME_SUMMARY_CACHE
+    if _RUNTIME_SUMMARY_CACHE is not None:
+        return _RUNTIME_SUMMARY_CACHE
     model = build_runtime_model(ROOT)
-    return {
+    _RUNTIME_SUMMARY_CACHE = {
         "manifest": model["manifest_file"],
         "clients": model.get("clients") or [],
         "selection": model.get("selection") or {},
@@ -40,6 +45,7 @@ def runtime_summary() -> dict:
         "logs": model["logs"],
         "checks": model["checks"],
     }
+    return _RUNTIME_SUMMARY_CACHE
 
 
 def existing_paths(items: list[dict]) -> list[dict[str, str | bool]]:
@@ -128,8 +134,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"skillbox api stub listening on :{PORT}")
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"skillbox api stub listening on {HOST}:{PORT}")
     server.serve_forever()
 
 
