@@ -9,7 +9,15 @@ from .context_rendering import *
 from .text_renderers import print_local_runtime_error_text
 from .parity_report import collect_dev_prod_parity_report, parity_report_evidence_summary
 from lib.paths import BoxPath, PathTranslator
-from lib.runtime_model import LOCAL_RUNTIME_START_MODES, is_runtime_absolute_path, resolve_placeholders
+from lib.runtime_model import (
+    LOCAL_RUNTIME_ENV_OUTPUT_MISSING,
+    LOCAL_RUNTIME_MODE_UNSUPPORTED,
+    LOCAL_RUNTIME_PROFILE_UNKNOWN,
+    LOCAL_RUNTIME_START_BLOCKED,
+    LOCAL_RUNTIME_START_MODES,
+    is_runtime_absolute_path,
+    resolve_placeholders,
+)
 
 
 def _workflow_step(
@@ -878,11 +886,15 @@ def _add_swimmers_compose_mount(root_dir: Path, model: dict[str, Any], mounts: d
     env_values = model.get("env") or {}
     swimmers_repo = env_values.get("SKILLBOX_SWIMMERS_REPO", "")
     if swimmers_repo and swimmers_repo not in mounts:
-        translator_model = dict(model)
-        translator_model["root_dir"] = str(root_dir)
-        translator_model["env"] = env_values
-        translator = PathTranslator.from_model(translator_model)
-        swimmers_host = str(_runtime_value_to_host_path(translator, swimmers_repo))
+        try:
+            from lib.runtime_model import runtime_path_to_host_path
+            swimmers_host = str(runtime_path_to_host_path(root_dir, env_values, swimmers_repo))
+        except Exception:
+            translator_model = dict(model)
+            translator_model["root_dir"] = str(root_dir)
+            translator_model["env"] = env_values
+            translator = PathTranslator.from_model(translator_model)
+            swimmers_host = str(_runtime_value_to_host_path(translator, swimmers_repo))
         if Path(swimmers_host).exists():
             mounts[swimmers_repo] = swimmers_host
 
@@ -1101,7 +1113,7 @@ def requested_mcp_servers(model: dict[str, Any]) -> list[dict[str, Any]]:
     requested: list[dict[str, Any]] = [{"name": "skillbox", "service_id": None}]
     seen = {"skillbox"}
     for service in model.get("services") or []:
-        if str(service.get("kind") or "").strip() != "mcp":
+        if str(service.get("kind") or "").strip() not in {"mcp", "mcp-bridge"}:
             continue
         server_name = mcp_server_name_for_service(service)
         if not server_name or server_name in seen:

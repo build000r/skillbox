@@ -92,7 +92,7 @@ VALID_ENV_FILE_SOURCE_KINDS = {"file", "manual"}
 
 VALID_ENV_FILE_SYNC_MODES = {"write", "manual"}
 
-VALID_HEALTHCHECK_TYPES = {"http", "path_exists", "process_running", "port"}
+VALID_HEALTHCHECK_TYPES = {"http", "path_exists", "process_running", "port", "mcp_ready"}
 
 VALID_CHECK_TYPES = {"path_exists"}
 

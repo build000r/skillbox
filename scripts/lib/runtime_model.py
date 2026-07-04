@@ -130,6 +130,16 @@ RUNTIME_PATH_PREFIXES: tuple[PurePosixPath, ...] = (
 
 PROJECT_KIND_IOS = "ios"
 VALID_PROJECT_KINDS: frozenset[str] = frozenset({PROJECT_KIND_IOS})
+MCP_PROTOCOL_VERSION = "2024-11-05"
+MCP_READY_HEALTHCHECK_TYPE = "mcp_ready"
+VALID_MCP_HEALTHCHECK_TRANSPORTS: frozenset[str] = frozenset({"http", "stdio", "tcp"})
+VALID_SERVICE_HEALTHCHECK_TYPES: frozenset[str] = frozenset({
+    "http",
+    "path_exists",
+    "port",
+    "process_running",
+    MCP_READY_HEALTHCHECK_TYPE,
+})
 IOS_COMMAND_LANES: tuple[str, ...] = (
     "build",
     "test",
@@ -1325,6 +1335,8 @@ def _flatten_service_record(service: dict[str, Any]) -> list[dict[str, Any]]:
                 or healthcheck.get("port")
                 or healthcheck.get("path")
                 or healthcheck.get("pattern")
+                or healthcheck.get("transport")
+                or healthcheck.get("probe_command")
             )
             if target is not None:
                 service["health_target"] = target

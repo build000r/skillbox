@@ -7,7 +7,7 @@
 Generated from command registry ABI `2026-06-11+agent_ops_brain`.
 Do not edit by hand; run `python3 .env-manager/manage.py registry-docs --write`.
 
-Registry entries: 37.
+Registry entries: 38.
 
 ## Tier 1
 
@@ -1158,6 +1158,53 @@ python3 -m unittest tests.test_skill_overrides
 ```
 
 **Graph Nodes**: `skill`, `repo`, `command`
+
+#### runtime.skill_what_if
+
+Purely simulate effective skill visibility for repo, overlay, pin, opt-out, and machine inputs.
+
+- Surfaces: `cli`
+- Scopes: `cwd`
+- Side effect: `none`
+- Risk: `low`
+- Entrypoint: `manage.py`
+- Owner binary: `sbp`
+- MCP mirror: None
+
+**Inputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `format` | `enum[json\|text]?` | no |
+| `machine` | `string?` | no |
+| `opt_out` | `string[]?` | no |
+| `overlay` | `string[]?` | no |
+| `pin` | `string[]?` | no |
+| `repo` | `string` | yes |
+
+**Outputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `added` | `object[]` | yes |
+| `effective` | `object[]` | yes |
+| `pin_conflicts` | `object[]` | yes |
+| `removed` | `object[]` | yes |
+| `shadowed_by_layer` | `object[]` | yes |
+
+**Examples**
+
+```bash
+python3 .env-manager/manage.py skill what-if --repo "$PWD" --overlay marketing --format json
+```
+
+**Validation**
+
+```bash
+python3 -m unittest tests.test_skill_overrides
+```
+
+**Graph Nodes**: `skill`, `repo`, `overlay`, `command`
 
 #### runtime.skill_why
 

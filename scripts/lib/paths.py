@@ -131,20 +131,33 @@ class PathTranslator:
 
         storage = model.get("storage")
         if isinstance(storage, Mapping) and storage.get("bindings"):
-            return cls.from_storage(storage)
+            try:
+                return cls.from_storage(storage)
+            except ValueError:
+                pass
 
         try:
             return cls.from_persistence(root_dir, env_values)
-        except RuntimeError:
+        except (ImportError, RuntimeError):
             return cls._from_legacy_env(root_dir, env_values)
 
     @classmethod
     def _from_legacy_env(cls, root_dir: Path, env_values: Mapping[str, str]) -> PathTranslator:
-        from lib.runtime_model import (
-            client_configs_host_root,
-            client_configs_runtime_root,
-            host_path_to_absolute_path,
-        )
+        try:
+            from lib.runtime_model import (
+                client_configs_host_root,
+                client_configs_runtime_root,
+                host_path_to_absolute_path,
+            )
+        except ImportError:
+            def client_configs_runtime_root(values: Mapping[str, str]) -> str:
+                return values.get("SKILLBOX_CLIENTS_ROOT") or "/workspace/clients"
+
+            def client_configs_host_root(root: Path, _values: Mapping[str, str]) -> Path:
+                return root / "workspace" / "clients"
+
+            def host_path_to_absolute_path(root: Path, raw: str) -> Path:
+                return (root / raw).resolve()
 
         workspace_root = PurePosixPath(str(env_values.get("SKILLBOX_WORKSPACE_ROOT") or "/workspace"))
         home_root = PurePosixPath(str(env_values.get("SKILLBOX_HOME_ROOT") or "/home/sandbox"))
