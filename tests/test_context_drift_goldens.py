@@ -50,11 +50,12 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+from tests.helpers import PRESSURE_HEADING, PRESSURE_PLACEHOLDER, normalize_golden
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -78,36 +79,6 @@ from runtime_manager.validation import (  # noqa: E402
 
 GOLDENS_DIR = Path(__file__).resolve().parent / "goldens" / "context"
 REGEN_ENV = "REGEN_CONTEXT_GOLDENS"
-
-PRESSURE_HEADING = "## Pressure And Offload Policy"
-PRESSURE_PLACEHOLDER = "<PRESSURE-ADVISORY-NORMALIZED>"
-
-
-def _normalize_pressure_section(markdown: str) -> str:
-    """Collapse the host-dependent pressure-policy body to a placeholder.
-
-    The heading is preserved (its presence is part of the contract); every
-    body line up to the next ``## `` heading or end-of-string is replaced with
-    a single placeholder line so live disk / tailscale / warning state does not
-    leak into the golden.
-    """
-    lines = markdown.split("\n")
-    out: list[str] = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        out.append(line)
-        if line == PRESSURE_HEADING:
-            out.append("")
-            out.append(PRESSURE_PLACEHOLDER)
-            out.append("")
-            i += 1
-            # Skip the original body until the next top-level heading.
-            while i < len(lines) and not lines[i].startswith("## "):
-                i += 1
-            continue
-        i += 1
-    return "\n".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +197,7 @@ def _core_markdown() -> str:
     active_profiles = normalize_active_profiles([])
     active_clients = normalize_active_clients(model, [])
     filtered = filter_model(model, active_profiles, active_clients)
-    return _normalize_pressure_section(generate_context_markdown(filtered))
+    return normalize_golden(generate_context_markdown(filtered), ROOT_DIR)
 
 
 class _ClientFixture:
@@ -243,7 +214,7 @@ class _ClientFixture:
         self.model = filter_model(model, active_profiles, active_clients)
 
     def markdown(self) -> str:
-        return _normalize_pressure_section(generate_context_markdown(self.model))
+        return normalize_golden(generate_context_markdown(self.model), self.root)
 
     def skill_context(self) -> str:
         actions = generate_skill_context(self.model, self.root, dry_run=False)
@@ -251,8 +222,7 @@ class _ClientFixture:
         assert actions == ["write-skill-context: clients/personal/context.yaml"], actions
         ctx_path = self.root / "clients" / "personal" / "context.yaml"
         raw = ctx_path.read_text(encoding="utf-8")
-        # Normalize the per-run mkdtemp absolute root to a stable placeholder.
-        return raw.replace(str(self.root), "<ROOT>")
+        return normalize_golden(raw, self.root)
 
     def close(self) -> None:
         self._tmp.cleanup()

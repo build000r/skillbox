@@ -17,6 +17,7 @@ from .evidence import collect_runtime_evidence
 # Single source of truth for redaction. ``redact_diagnostic_text`` is kept as a
 # thin alias to the shared ``redact_text`` because agent_snapshots and the
 # adapter tests import this name from here.
+from .shared import REDACTION_MARKER as REDACTION_MARKER
 from .shared import redact_text as redact_diagnostic_text
 
 DEFAULT_TIMEOUTS = {

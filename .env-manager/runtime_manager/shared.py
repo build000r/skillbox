@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
+import argparse as argparse
 import copy
 import datetime
 import fcntl
@@ -9,9 +9,9 @@ import hashlib
 import json
 import os
 import re
-import selectors
+import selectors as selectors
 import shlex
-import signal
+import signal as signal
 import shutil
 import subprocess
 import sys
@@ -42,66 +42,48 @@ if str(SCRIPTS_DIR) not in sys.path:
 try:
     from .errors import (  # noqa: E402
         DEPRECATION_MARKER,
-        INTERNAL_ERROR_CODE,
-        AdapterError,
-        NetworkError,
-        RuntimeLifecycleError,
-        SkillboxError,
-        StateConflictError,
-        ValidationError,
-        internal_error_payload,
     )
 except ImportError:  # loaded standalone (SourceFileLoader) without a package
     if str(PACKAGE_DIR) not in sys.path:
         sys.path.insert(0, str(PACKAGE_DIR))
     from errors import (  # type: ignore[no-redef]  # noqa: E402
         DEPRECATION_MARKER,
-        INTERNAL_ERROR_CODE,
-        AdapterError,
-        NetworkError,
-        RuntimeLifecycleError,
-        SkillboxError,
-        StateConflictError,
-        ValidationError,
-        internal_error_payload,
     )
 
 from lib.runtime_model import (  # noqa: E402
-    LOOPBACK_BIND_HOSTS,
+    LOOPBACK_BIND_HOSTS as LOOPBACK_BIND_HOSTS,
     PERSISTENCE_ERROR_CODES,
     PersistenceContractError,
     RUNTIME_ID_INVALID,
     RUNTIME_ID_PATTERN,
     RUNTIME_ID_PATTERN_TEXT,
-    RuntimeIdValidationError,
-    WILDCARD_BIND_HOSTS,
+    RuntimeIdValidationError as RuntimeIdValidationError,
+    WILDCARD_BIND_HOSTS as WILDCARD_BIND_HOSTS,
     build_runtime_model,
-    classify_bind_scope,
+    classify_bind_scope as classify_bind_scope,
     client_config_host_dir,
     client_config_runtime_dir,
     client_configs_host_root,
     compile_persistence_summary,
-    extract_command_port,
-    extract_host_port,
+    extract_command_port as extract_command_port,
+    extract_host_port as extract_host_port,
     host_path_to_absolute_path,
     load_yaml,
     load_runtime_env,
     runtime_manifest_path,
-    runtime_path_to_host_path,
+    runtime_path_to_host_path as runtime_path_to_host_path,
     storage_binding_by_id,
-    validate_runtime_id,
+    validate_runtime_id as validate_runtime_id,
 )
+from lib.redaction import REDACTION_MARKER as REDACTION_MARKER  # noqa: E402
+from lib.redaction import SECRET_KEY_PATTERN as SECRET_KEY_PATTERN  # noqa: E402
+from lib.redaction import is_secret_key as is_secret_key  # noqa: E402
+from lib.redaction import redact_text as redact_text  # noqa: E402
+from lib.redaction import redact_value as redact_value  # noqa: E402
 
 # Single source of truth for secret redaction (see scripts/lib/redaction.py).
 # Re-exported here so internal callers can pull it from runtime_manager.shared
 # the same way they pull other lib helpers, without re-importing lib directly.
-from lib.redaction import (  # noqa: E402
-    REDACTION_MARKER,
-    SECRET_KEY_PATTERN,
-    is_secret_key,
-    redact_text,
-    redact_value,
-)
 
 
 VALID_REPO_SOURCE_KINDS = {"bind", "directory", "git", "manual"}
@@ -117,6 +99,7 @@ VALID_TASK_SUCCESS_TYPES = {"path_exists", "all_outputs_exist", "port_listening"
 LOCKFILE_VERSION = 1
 SKILL_REPOS_LOCKFILE_VERSION = 2
 SKILL_REPOS_CONFIG_VERSION = 2
+SHARED_SKILL_ASSET_DIR = "_shared"
 DEFAULT_SKILLIGNORE_PATTERNS = [
     ".git/",
     "__pycache__/",
@@ -207,20 +190,12 @@ def managed_home_install_targets() -> list[dict[str, str]]:
 
 
 HARDENED_SHARED_DEFAULT_SKILLS = [
-    "beads-br",
-    "beads-bv",
-    "beads-workflow",
-    "codebase-audit",
     "divide-and-conquer",
-    "git-stash-janitor",
     "lube",
     "mmdx",
-    "no-ragrets",
     "project-status-mmdx",
-    "sbp",
     "skill-issue",
     "smart",
-    "ui-fresh-eyes",
 ]
 HARDENED_CLIENT_PLANNING_SKILLS = [
     "domain-planner",
@@ -4302,6 +4277,48 @@ def _install_skill_to_targets(
     return install_tree_shas
 
 
+def _shared_skill_asset_source(source_root: Path) -> Path | None:
+    shared_source = source_root / SHARED_SKILL_ASSET_DIR
+    return shared_source if shared_source.is_dir() else None
+
+
+def _install_shared_skill_asset_to_targets(
+    skillset: dict[str, Any],
+    shared_source: Path,
+    dry_run: bool,
+    actions: list[str],
+    host_home_root: str | None = None,
+) -> None:
+    """Copy sibling shared skill assets next to installed skills.
+
+    The shared asset directory is not itself a skill, so it is intentionally
+    excluded from the skill lockfile. It must still live beside installed
+    skills so helper scripts referenced by skill SKILL.md files can resolve it.
+    """
+    for target in skillset.get("install_targets") or []:
+        target_root = Path(str(target["host_path"]))
+        install_dir = target_root / SHARED_SKILL_ASSET_DIR
+        if dry_run:
+            actions.append(f"install-shared-skill-asset: {SHARED_SKILL_ASSET_DIR} -> {install_dir}")
+            _mirror_installed_skill_to_host_home(
+                SHARED_SKILL_ASSET_DIR,
+                target_root,
+                dry_run,
+                actions,
+                host_home_root,
+            )
+            continue
+        filtered_copy_skill(shared_source, install_dir)
+        actions.append(f"install-shared-skill-asset: {SHARED_SKILL_ASSET_DIR} -> {install_dir}")
+        _mirror_installed_skill_to_host_home(
+            SHARED_SKILL_ASSET_DIR,
+            target_root,
+            dry_run,
+            actions,
+            host_home_root,
+        )
+
+
 def _host_skill_mirror_root(target_root: Path, host_home_root: str | None = None) -> Path | None:
     host_home = (host_home_root if host_home_root is not None else os.environ.get("SKILLBOX_HOST_HOME_ROOT", "")).strip()
     if not host_home:
@@ -4475,6 +4492,8 @@ def sync_skill_repo_sets(model: dict[str, Any], dry_run: bool) -> list[str]:
             ensure_directory(Path(str(target["host_path"])), dry_run)
 
         lock_skills: list[dict[str, Any]] = []
+        installed_shared_asset_tree_sha: str | None = None
+        installed_shared_asset_source: Path | None = None
         for entry in config.get("skill_repos") or []:
             if entry.get("distributor"):
                 continue
@@ -4484,7 +4503,35 @@ def sync_skill_repo_sets(model: dict[str, Any], dry_run: bool) -> list[str]:
             if resolved is None:
                 continue
             source_root, repo_name, repo, commit = resolved
-            for skill_name, skill_source in _resolve_skill_dirs(entry, source_root, repo_name):
+            skill_dirs = _resolve_skill_dirs(entry, source_root, repo_name)
+            shared_source = _shared_skill_asset_source(source_root)
+            if shared_source is not None:
+                shared_tree_sha = directory_tree_sha256(shared_source)
+                if shared_tree_sha is None:
+                    raise RuntimeError(f"SKILL_SHARED_ASSET_INVALID: failed to hash {shared_source}")
+                if installed_shared_asset_tree_sha is not None:
+                    if shared_tree_sha != installed_shared_asset_tree_sha:
+                        raise RuntimeError(
+                            "SKILL_SHARED_ASSET_CONFLICT: "
+                            f"{shared_source} differs from {installed_shared_asset_source}"
+                        )
+                else:
+                    installed_shared_asset_tree_sha = shared_tree_sha
+                    installed_shared_asset_source = shared_source
+                    for target in skillset.get("install_targets") or []:
+                        target_root = Path(str(target["host_path"]))
+                        if _host_skill_mirror_root(target_root, host_home_root) is not None:
+                            mirror_wanted_by_target_root.setdefault(target_root, set()).add(
+                                SHARED_SKILL_ASSET_DIR
+                            )
+                    _install_shared_skill_asset_to_targets(
+                        skillset,
+                        shared_source,
+                        dry_run,
+                        actions,
+                        host_home_root,
+                    )
+            for skill_name, skill_source in skill_dirs:
                 for target in skillset.get("install_targets") or []:
                     target_root = Path(str(target["host_path"]))
                     if _host_skill_mirror_root(target_root, host_home_root) is not None:

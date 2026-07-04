@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from tests.helpers import make_temp_workspace
+
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 MANAGER = ROOT_DIR / ".env-manager" / "manage.py"
@@ -51,9 +53,8 @@ class RuntimeManagerTests(unittest.TestCase):
     def test_tail_lines_zero_or_negative_is_empty_not_full_file(self) -> None:
         from runtime_manager.runtime_ops import tail_lines
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            log_path = Path(tmpdir) / "service.log"
-            log_path.write_text("one\ntwo\nthree\n", encoding="utf-8")
+        with make_temp_workspace({"service.log": "one\ntwo\nthree\n"}) as root:
+            log_path = root / "service.log"
 
             self.assertEqual(tail_lines(log_path, 0), [])
             self.assertEqual(tail_lines(log_path, -1), [])

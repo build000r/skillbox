@@ -5,6 +5,8 @@ import sys
 import unittest
 from pathlib import Path
 
+from tests.helpers import make_runtime_model
+
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 ENV_MANAGER_DIR = ROOT_DIR / ".env-manager"
@@ -43,12 +45,13 @@ def _edge(source: str, target: str, kind: str = "depends_on") -> dict[str, objec
 
 
 def _graph(warnings: list[dict[str, object]] | None = None) -> dict[str, object]:
+    model = make_runtime_model(checks=[{"id": "doctor", "type": "command", "repo": "app", "profiles": ["core"]}])
     return {
         "ok": not warnings,
         "nodes": [
-            _node("service:api", "service"),
-            _node("check:doctor", "check"),
-            _node("skill:domain-planner", "skill"),
+            _node(f"service:{model['services'][1]['id']}", "service"),
+            _node(f"check:{model['checks'][0]['id']}", "check"),
+            _node(f"skill:{model['skills'][0]['id']}", "skill"),
             _node("mcp_tool:skillbox_next", "mcp_tool"),
             _node("bead:ready-1", "bead", "Ready bead", status="open", priority=1),
             _node("command:brain.next", "command", "Recommend next actions"),
