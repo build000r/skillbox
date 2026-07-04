@@ -14,6 +14,7 @@ Discipline the server enforces: assess → scope → dry-run → act → verify.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -22,7 +23,8 @@ import subprocess
 import sys
 import time
 import traceback
-from pathlib import Path
+import urllib.parse
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -58,6 +60,10 @@ LOG_LEVELS = (
 LOG_LEVEL_ORDER = {level: index for index, level in enumerate(LOG_LEVELS)}
 CURRENT_LOG_LEVEL = "warning"
 MCP_EVENT_CONTEXT_ENV = "SKILLBOX_MCP_EVENT_CONTEXT"
+SKILL_RESOURCE_FLAG_ENV = "SKILLBOX_MCP_SKILL_RESOURCES"
+SKILL_RESOURCE_URI_SCHEME = "skillbox"
+SKILL_RESOURCE_URI_AUTHORITY = "skills"
+SKILL_RESOURCE_LOG_PATH = Path("mcp") / "skill-resource-reads.jsonl"
 _RUNTIME_MANAGER: Any = None
 
 
@@ -2247,16 +2253,290 @@ def _error_content(data: Any) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# MCP skill resources
+# ---------------------------------------------------------------------------
+
+def _skill_resources_enabled() -> bool:
+    return os.environ.get(SKILL_RESOURCE_FLAG_ENV) == "1"
+
+
+def _skill_visibility_module() -> Any:
+    _runtime_manager_module()
+    return importlib.import_module("runtime_manager.skill_visibility")
+
+
+def _load_skill_resource_model() -> dict[str, Any]:
+    runtime_manager = _runtime_manager_module()
+    root_dir = Path(getattr(runtime_manager, "DEFAULT_ROOT_DIR", SCRIPT_DIR.parent))
+    if hasattr(runtime_manager, "build_runtime_model"):
+        return runtime_manager.build_runtime_model(root_dir)
+    validation = importlib.import_module("runtime_manager.validation")
+    return validation.build_runtime_model(root_dir)
+
+
+def _collect_skill_visibility_payload(model: dict[str, Any], cwd: Path) -> dict[str, Any]:
+    skill_visibility = _skill_visibility_module()
+    return skill_visibility.collect_skill_visibility(
+        model,
+        cwd=str(cwd),
+        include_global=True,
+        include_project=True,
+        include_sources=False,
+    )
+
+
+def _skill_resource_cwd(params: dict[str, Any] | None = None) -> Path:
+    raw = ""
+    if isinstance(params, dict):
+        value = params.get("cwd")
+        if value is not None and not isinstance(value, str):
+            raise JsonRpcError(-32602, "Invalid cwd: expected a string.")
+        raw = str(value or "").strip()
+    return Path(os.path.expandvars(os.path.expanduser(raw or os.getcwd()))).resolve()
+
+
+def _skill_resource_uri(name: str, relpath: str | None = None) -> str:
+    encoded_name = urllib.parse.quote(name, safe="")
+    if not relpath:
+        return f"{SKILL_RESOURCE_URI_SCHEME}://{SKILL_RESOURCE_URI_AUTHORITY}/{encoded_name}"
+    encoded_relpath = "/".join(urllib.parse.quote(part, safe="") for part in relpath.split("/"))
+    return f"{SKILL_RESOURCE_URI_SCHEME}://{SKILL_RESOURCE_URI_AUTHORITY}/{encoded_name}/{encoded_relpath}"
+
+
+def _parse_skill_resource_uri(uri: Any) -> tuple[str, str | None]:
+    if not isinstance(uri, str) or not uri.strip():
+        raise JsonRpcError(-32602, "Invalid resource uri: expected a non-empty string.")
+
+    parsed = urllib.parse.urlsplit(uri.strip())
+    if (
+        parsed.scheme != SKILL_RESOURCE_URI_SCHEME
+        or parsed.netloc != SKILL_RESOURCE_URI_AUTHORITY
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise JsonRpcError(-32602, f"Unsupported resource uri: {uri!r}.")
+
+    raw_path = parsed.path.lstrip("/")
+    if not raw_path:
+        raise JsonRpcError(-32602, "Invalid skill resource uri: missing skill name.")
+
+    raw_parts = raw_path.split("/")
+    parts = [urllib.parse.unquote(part) for part in raw_parts]
+    try:
+        name = _validate_identifier(parts[0], "skill")
+    except ValueError as exc:
+        raise JsonRpcError(-32602, str(exc)) from exc
+
+    rel_parts = parts[1:]
+    if not rel_parts:
+        return name, None
+    if any(part in {"", ".", ".."} or "/" in part or "\\" in part for part in rel_parts):
+        raise JsonRpcError(-32602, "Invalid skill resource uri: path traversal is not allowed.")
+
+    relpath = PurePosixPath(*rel_parts)
+    if relpath.is_absolute() or any(part in {"", ".", ".."} for part in relpath.parts):
+        raise JsonRpcError(-32602, "Invalid skill resource uri: path traversal is not allowed.")
+    return name, str(relpath)
+
+
+def _skill_source_candidates_for_item(
+    skill_visibility: Any,
+    model: dict[str, Any],
+    item: dict[str, Any],
+) -> list[Path]:
+    name = str(item.get("name") or "").strip()
+    candidates: list[Path] = []
+    for key in ("source", "path"):
+        raw = str(item.get(key) or "").strip()
+        if raw and "://" not in raw:
+            candidates.append(Path(os.path.expandvars(os.path.expanduser(raw))))
+
+    source = str(item.get("source") or "").strip() or None
+    try:
+        options = skill_visibility._skill_source_options(model, name, explicit_source=source)
+    except Exception:  # noqa: BLE001 - a missing source fallback should not hide visible installed skills.
+        options = []
+    for option in options:
+        raw = str(option.get("source") or "").strip()
+        if raw and "://" not in raw:
+            candidates.append(Path(os.path.expandvars(os.path.expanduser(raw))))
+
+    return candidates
+
+
+def _visible_skill_resources(cwd: Path | None = None) -> dict[str, dict[str, Any]]:
+    model = _load_skill_resource_model()
+    skill_visibility = _skill_visibility_module()
+    payload = _collect_skill_visibility_payload(model, cwd or Path(os.getcwd()).resolve())
+    resources: dict[str, dict[str, Any]] = {}
+
+    for item in payload.get("effective") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        for candidate in _skill_source_candidates_for_item(skill_visibility, model, item):
+            root = candidate.resolve()
+            skill_md = root / "SKILL.md"
+            if not skill_md.is_file():
+                continue
+            resources[name] = {
+                "name": name,
+                "root": root,
+                "skill_md": skill_md,
+                "layer": item.get("layer"),
+                "source": str(root),
+                "source_bucket": item.get("source_bucket"),
+                "state": item.get("state"),
+            }
+            break
+
+    return resources
+
+
+def _bundled_skill_resource_refs(name: str, root: Path) -> list[dict[str, str]]:
+    refs: list[dict[str, str]] = []
+    skip_dirs = {".git", "__pycache__"}
+    for candidate in sorted(root.rglob("*")):
+        if not candidate.is_file() or candidate.name == "SKILL.md":
+            continue
+        try:
+            relpath = candidate.relative_to(root).as_posix()
+            candidate.resolve().relative_to(root)
+        except ValueError:
+            continue
+        if any(part in skip_dirs for part in PurePosixPath(relpath).parts):
+            continue
+        refs.append({
+            "uri": _skill_resource_uri(name, relpath),
+            "name": relpath,
+            "mimeType": _skill_resource_mime_type(candidate),
+        })
+    return refs
+
+
+def _skill_resource_mime_type(path: Path) -> str:
+    if path.suffix.lower() in {".md", ".markdown"}:
+        return "text/markdown"
+    if path.suffix.lower() in {".json", ".jsonl"}:
+        return "application/json"
+    return "text/plain"
+
+
+def _resolve_skill_resource_path(root: Path, relpath: str | None) -> Path:
+    target = root / "SKILL.md" if relpath is None else root / PurePosixPath(relpath)
+    resolved = target.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise JsonRpcError(-32602, "Invalid skill resource uri: path traversal is not allowed.") from exc
+    if not resolved.is_file():
+        raise JsonRpcError(-32602, f"Skill resource not found: {relpath or 'SKILL.md'}.")
+    return resolved
+
+
+def _skill_resource_state_root() -> Path:
+    raw = os.environ.get("SKILLBOX_STATE_ROOT")
+    if raw:
+        return Path(os.path.expandvars(os.path.expanduser(raw))).resolve()
+    return SCRIPT_DIR.parent / ".skillbox-state"
+
+
+def _skill_resource_session_id(request_id: Any = None) -> str:
+    for key in ("SKILLBOX_MCP_SESSION", "SKILLBOX_SESSION_ID", "MCP_SESSION_ID"):
+        value = str(os.environ.get(key) or "").strip()
+        if value:
+            return value
+    raw_context = os.environ.get(MCP_EVENT_CONTEXT_ENV)
+    if raw_context:
+        try:
+            context = json.loads(raw_context)
+        except json.JSONDecodeError:
+            context = {}
+        if isinstance(context, dict):
+            for key in ("session_id", "mcp_session_id", "mcp_request_id"):
+                value = str(context.get(key) or "").strip()
+                if value:
+                    return value
+    return "" if request_id is None else str(request_id)
+
+
+def _append_skill_resource_usage(skill: str, uri: str, request_id: Any = None) -> None:
+    log_path = _skill_resource_state_root() / SKILL_RESOURCE_LOG_PATH
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "skill": skill,
+        "uri": uri,
+        "session": _skill_resource_session_id(request_id),
+    }
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def handle_resources_list(params: dict | None = None, _request_id: Any = None) -> dict:
+    if not _skill_resources_enabled():
+        raise JsonRpcError(-32601, "Method not found: resources/list")
+
+    cwd = _skill_resource_cwd(params)
+    resources = []
+    for name, item in sorted(_visible_skill_resources(cwd).items()):
+        resources.append({
+            "uri": _skill_resource_uri(name),
+            "name": name,
+            "mimeType": "text/markdown",
+            "description": f"Visible Skillbox skill from {item.get('source')}",
+        })
+    return {"resources": resources}
+
+
+def handle_resources_read(params: dict | None = None, request_id: Any = None) -> dict:
+    if not _skill_resources_enabled():
+        raise JsonRpcError(-32601, "Method not found: resources/read")
+    if not isinstance(params, dict):
+        raise JsonRpcError(-32602, "Invalid resources/read params: expected an object.")
+
+    requested_uri = params.get("uri")
+    name, relpath = _parse_skill_resource_uri(requested_uri)
+    visible = _visible_skill_resources(_skill_resource_cwd(params))
+    item = visible.get(name)
+    if item is None:
+        raise JsonRpcError(-32602, f"Skill resource is not visible in this scope: {name}.")
+
+    root = item["root"]
+    target = _resolve_skill_resource_path(root, relpath)
+    text = target.read_text(encoding="utf-8", errors="replace")
+    response: dict[str, Any] = {
+        "contents": [
+            {
+                "uri": _skill_resource_uri(name, relpath),
+                "mimeType": _skill_resource_mime_type(target),
+                "text": text,
+            }
+        ]
+    }
+    if relpath is None:
+        response["refs"] = _bundled_skill_resource_refs(name, root)
+
+    _append_skill_resource_usage(name, str(requested_uri), request_id)
+    return response
+
+
+# ---------------------------------------------------------------------------
 # MCP protocol handlers
 # ---------------------------------------------------------------------------
 
 def handle_initialize(_params: dict, _request_id: Any = None) -> dict:
+    capabilities = {
+        "logging": {},
+        "tools": {"listChanged": False},
+    }
+    if _skill_resources_enabled():
+        capabilities["resources"] = {"listChanged": False}
     return {
         "protocolVersion": PROTOCOL_VERSION,
-        "capabilities": {
-            "logging": {},
-            "tools": {"listChanged": False},
-        },
+        "capabilities": capabilities,
         "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
         "instructions": (
             "skillbox runtime manager. "
@@ -2297,10 +2577,23 @@ _HANDLERS: dict[str, Any] = {
     "ping":        lambda _p, _request_id=None: {},
 }
 
+_RESOURCE_HANDLERS: dict[str, Any] = {
+    "resources/list": handle_resources_list,
+    "resources/read": handle_resources_read,
+}
+
 _NOTIFICATION_HANDLERS: dict[str, Any] = {
     "notifications/cancelled": lambda _p: None,
     "notifications/initialized": lambda _p: None,
 }
+
+
+def _active_handlers() -> dict[str, Any]:
+    if not _skill_resources_enabled():
+        return dict(_HANDLERS)
+    handlers = dict(_HANDLERS)
+    handlers.update(_RESOURCE_HANDLERS)
+    return handlers
 
 
 def send(msg: dict) -> None:
@@ -2341,7 +2634,7 @@ def main() -> None:
                     print(f"[skillbox-mcp] notification error in {method}: {exc}", file=sys.stderr, flush=True)
             continue
 
-        handler = _HANDLERS.get(method)
+        handler = _active_handlers().get(method)
         if handler is None:
             send_error(msg_id, -32601, f"Method not found: {method}")
             continue
