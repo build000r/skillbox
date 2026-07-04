@@ -1383,6 +1383,115 @@ class RuntimeManagerTests(unittest.TestCase):
             )
             self.assertTrue((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-worker.ready").is_file())
 
+    def test_up_partial_failure_keeps_started_and_skips_dependents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._install_fixture_partial_start_graph(repo)
+            self.addCleanup(self._run, repo, "down", "--service", "fixture-a", "--format", "json")
+
+            up = self._run(
+                repo,
+                "up",
+                "--service",
+                "fixture-c",
+                "--wait-seconds",
+                "0.5",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(up.returncode, 1, up.stderr)
+            payload = json.loads(up.stdout)
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["started"][0]["id"], "fixture-a")
+            self.assertEqual(payload["failed"]["id"], "fixture-b")
+            self.assertIn("exited with code 7", payload["failed"]["error"])
+            self.assertEqual(payload["skipped_dependents"], ["fixture-c"])
+            self.assertEqual(payload["skipped"][0]["blocking_chain"], ["fixture-b"])
+            self.assertEqual(payload["error"]["blocked_services"], ["fixture-b", "fixture-c"])
+            self.assertIn("up --service fixture-c", payload["next_actions"][0])
+            self.assertIn("down --service fixture-a", payload["next_actions"][1])
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-a.ready").is_file())
+            self.assertFalse((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-c.ready").exists())
+
+            text = self._run(repo, "up", "--service", "fixture-c", "--wait-seconds", "0.1")
+            self.assertEqual(text.returncode, 1, text.stderr)
+            self.assertIn("service start:", text.stdout)
+            self.assertIn("fixture-c", text.stdout)
+            self.assertIn("skipped", text.stdout)
+
+    def test_up_strict_rolls_back_started_services_from_this_invocation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._install_fixture_partial_start_graph(repo)
+
+            up = self._run(
+                repo,
+                "up",
+                "--strict",
+                "--service",
+                "fixture-c",
+                "--wait-seconds",
+                "0.5",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(up.returncode, 1, up.stderr)
+            payload = json.loads(up.stdout)
+            self.assertFalse(payload["ok"])
+            self.assertTrue(payload["strict"])
+            self.assertEqual([item["id"] for item in payload["rollback_services"]], ["fixture-a"])
+            self.assertIn(payload["rollback_services"][0]["result"], {"stopped", "killed"})
+            service_rows = {item["id"]: item for item in payload["services"]}
+            self.assertTrue(service_rows["fixture-a"]["rolled_back"])
+            self.assertFalse((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-a.pid").exists())
+            self.assertFalse((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-a.ready").exists())
+
+    def test_up_resume_command_completes_partial_graph_after_fix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._install_fixture_partial_start_graph(repo)
+            self.addCleanup(self._run, repo, "down", "--format", "json")
+
+            first = self._run(
+                repo,
+                "up",
+                "--service",
+                "fixture-c",
+                "--wait-seconds",
+                "0.5",
+                "--format",
+                "json",
+            )
+            self.assertEqual(first.returncode, 1, first.stderr)
+            first_payload = json.loads(first.stdout)
+            self.assertIn("up --service fixture-c", first_payload["resume_command"])
+
+            self._fix_fixture_partial_start_middle_service(repo)
+            resumed = self._run(
+                repo,
+                "up",
+                "--service",
+                "fixture-c",
+                "--wait-seconds",
+                "1",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            payload = json.loads(resumed.stdout)
+            results_by_id = {item["id"]: item for item in payload["services"]}
+            self.assertEqual(results_by_id["fixture-a"]["result"], "already-running")
+            self.assertEqual(results_by_id["fixture-b"]["result"], "started")
+            self.assertEqual(results_by_id["fixture-c"]["result"], "started")
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-b.ready").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-c.ready").is_file())
+
     def test_down_selected_dependency_stops_dependents_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -5745,6 +5854,101 @@ class RuntimeManagerTests(unittest.TestCase):
                 "        path: ${SKILLBOX_LOG_ROOT}/runtime/fixture-worker.ready\n"
                 "      log: runtime\n"
                 "  logs:\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+    def _install_fixture_partial_start_graph(self, repo: Path) -> None:
+        scripts_dir = repo / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / "fixture_daemon.py").write_text(
+            "from __future__ import annotations\n"
+            "\n"
+            "import signal\n"
+            "import sys\n"
+            "import time\n"
+            "from pathlib import Path\n"
+            "\n"
+            "ready_path = Path(sys.argv[1])\n"
+            "label = sys.argv[2] if len(sys.argv) > 2 else ready_path.stem\n"
+            "ready_path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "\n"
+            "def shutdown(*_args: object) -> None:\n"
+            "    try:\n"
+            "        ready_path.unlink()\n"
+            "    except FileNotFoundError:\n"
+            "        pass\n"
+            "    raise SystemExit(0)\n"
+            "\n"
+            "signal.signal(signal.SIGTERM, shutdown)\n"
+            "signal.signal(signal.SIGINT, shutdown)\n"
+            "ready_path.write_text('ok\\n', encoding='utf-8')\n"
+            "print(f'{label} ready', flush=True)\n"
+            "while True:\n"
+            "    time.sleep(0.2)\n",
+            encoding="utf-8",
+        )
+        (scripts_dir / "fixture_fail.py").write_text(
+            "import sys\n"
+            "print('fixture-b boom', flush=True)\n"
+            "sys.exit(7)\n",
+            encoding="utf-8",
+        )
+
+        runtime_path = repo / "workspace" / "runtime.yaml"
+        runtime_path.write_text(
+            runtime_path.read_text(encoding="utf-8").replace(
+                "  logs:\n",
+                "    - id: fixture-a\n"
+                "      kind: daemon\n"
+                "      repo: skillbox-self\n"
+                "      required: false\n"
+                "      profiles:\n"
+                "        - core\n"
+                "      command: python3 scripts/fixture_daemon.py ${SKILLBOX_LOG_ROOT}/runtime/fixture-a.ready fixture-a\n"
+                "      healthcheck:\n"
+                "        type: path_exists\n"
+                "        path: ${SKILLBOX_LOG_ROOT}/runtime/fixture-a.ready\n"
+                "      log: runtime\n"
+                "    - id: fixture-b\n"
+                "      kind: daemon\n"
+                "      repo: skillbox-self\n"
+                "      required: false\n"
+                "      profiles:\n"
+                "        - core\n"
+                "      depends_on:\n"
+                "        - fixture-a\n"
+                "      command: python3 scripts/fixture_fail.py\n"
+                "      healthcheck:\n"
+                "        type: path_exists\n"
+                "        path: ${SKILLBOX_LOG_ROOT}/runtime/fixture-b.ready\n"
+                "      log: runtime\n"
+                "    - id: fixture-c\n"
+                "      kind: daemon\n"
+                "      repo: skillbox-self\n"
+                "      required: false\n"
+                "      profiles:\n"
+                "        - core\n"
+                "      depends_on:\n"
+                "        - fixture-b\n"
+                "      command: python3 scripts/fixture_daemon.py ${SKILLBOX_LOG_ROOT}/runtime/fixture-c.ready fixture-c\n"
+                "      healthcheck:\n"
+                "        type: path_exists\n"
+                "        path: ${SKILLBOX_LOG_ROOT}/runtime/fixture-c.ready\n"
+                "      log: runtime\n"
+                "  logs:\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+    def _fix_fixture_partial_start_middle_service(self, repo: Path) -> None:
+        runtime_path = repo / "workspace" / "runtime.yaml"
+        runtime_path.write_text(
+            runtime_path.read_text(encoding="utf-8").replace(
+                "      command: python3 scripts/fixture_fail.py\n",
+                "      command: python3 scripts/fixture_daemon.py ${SKILLBOX_LOG_ROOT}/runtime/fixture-b.ready fixture-b\n",
                 1,
             ),
             encoding="utf-8",

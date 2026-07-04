@@ -55,6 +55,7 @@ __all__ = [
     'broken_link_class_counts',
     'attach_skill_evidence',
     'collect_skill_visibility',
+    'build_skill_what_if_payload',
     'SKILL_AUDIT_REPO_ISSUE_KEYS',
     'SKILL_AUDIT_GLOBAL_ISSUE_KEYS',
     '_skill_audit_candidate_from_path',
@@ -661,9 +662,9 @@ def _repo_override_visibility(
     occurrences: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Repo override occurrences folded into the canonical effective merge."""
-    policy = _repo_override_policy(cwd_path)
+    policy = _simulated_repo_override_policy(model) or _repo_override_policy(cwd_path)
     policy_path = str(policy.get("_policy_path") or "")
-    if not Path(policy_path).is_file():
+    if not policy.get("_simulated") and not Path(policy_path).is_file():
         return [], []
 
     layer = {
@@ -734,6 +735,31 @@ def _repo_override_visibility(
     return override_occurrences, [layer]
 
 
+def _simulated_installed_visibility(
+    model: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    simulation = _skill_visibility_simulation(model)
+    rows = [
+        dict(item)
+        for item in simulation.get("installed_occurrences") or []
+        if isinstance(item, dict) and str(item.get("name") or "")
+    ]
+    if not rows:
+        return [], []
+    layer = {
+        "id": "what-if:planned-project",
+        "label": "what-if planned project links",
+        "rank": PROJECT_LAYER_RANK,
+        "kind": "installed",
+        "path": str(simulation.get("repo_path") or ""),
+        "present": True,
+        "skill_count": len(rows),
+        "broken_count": sum(1 for row in rows if row.get("state") == "broken"),
+        "non_skill_count": 0,
+    }
+    return rows, [layer]
+
+
 def collect_skill_visibility(
     model: dict[str, Any],
     *,
@@ -758,14 +784,15 @@ def collect_skill_visibility(
         include_global=include_global,
         include_project=include_project,
     )
-    base_occurrences = [*declared_occurrences, *installed_occurrences]
+    simulated_occurrences, simulated_layers = _simulated_installed_visibility(model)
+    base_occurrences = [*declared_occurrences, *installed_occurrences, *simulated_occurrences]
     override_occurrences, override_layers = _repo_override_visibility(
         model,
         cwd_path,
         base_occurrences,
     )
     occurrences = [*base_occurrences, *override_occurrences]
-    layers = [*declared_layers, *installed_layers, *override_layers]
+    layers = [*declared_layers, *installed_layers, *simulated_layers, *override_layers]
     # Classify broken installed links up front so the taxonomy fields (origin,
     # suggested_action, fix_command) flow into both occurrences and the issue
     # groups that reference the same dicts.
@@ -822,11 +849,11 @@ def collect_skill_visibility(
     # declare the overlay. This is the skill-visibility analogue of the
     # overlay-declaration doctor lint (which guards rule `overlay:` tags).
     declared_overlay_names = sorted(declared_overlays(model))
-    active_overlay_rows = active_overlay_records(cwd_path)
+    active_overlay_rows = active_overlay_records(cwd_path, model=model)
     undeclared_state = undeclared_active_overlays(model, cwd_path)
     overlay_audit = {
         "declared": declared_overlay_names,
-        "active": sorted(active_overlays(cwd_path)),
+        "active": sorted(active_overlays(cwd_path, model=model)),
         "active_layers": active_overlay_rows,
         "undeclared_active": undeclared_state,
         "warnings": [
@@ -890,6 +917,374 @@ def collect_skill_visibility(
         attach_skill_evidence(payload, evidence_index)
 
     return payload
+
+
+def _what_if_validation_error(code: str, message: str, *, context: dict[str, Any]) -> Exception:
+    from .errors import ValidationError  # noqa: PLC0415
+
+    return ValidationError(
+        code,
+        message,
+        context=context,
+        next_actions=[
+            "Check skillbox-config/machines.yaml.",
+            "Run `sbp registry doctor --json` to inspect declared repo ids.",
+        ],
+    )
+
+
+def _validate_what_if_machine(machine: str | None) -> str | None:
+    machine_id = str(machine or "").strip()
+    if not machine_id:
+        return None
+    try:
+        from . import machines as _machines  # noqa: PLC0415
+
+        config = _machines.load_machines_config()
+        config.require(machine_id)
+    except Exception as exc:
+        raise _what_if_validation_error(
+            "SKILL_WHAT_IF_UNKNOWN_MACHINE",
+            f"Unknown machine id {machine_id!r}.",
+            context={"machine": machine_id, "reason": str(exc)},
+        ) from exc
+    return machine_id
+
+
+def _what_if_model(
+    model: dict[str, Any],
+    *,
+    machine: str | None = None,
+    repo_path: str | None = None,
+    overlays: list[str] | None = None,
+    repo_override_policy: dict[str, Any] | None = None,
+    installed_occurrences: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    simulated = dict(model)
+    simulation = {
+        "machine": machine,
+        "repo_path": repo_path,
+        "overlays": sorted({str(item).strip() for item in overlays or [] if str(item).strip()}),
+        "installed_occurrences": list(installed_occurrences or []),
+    }
+    if repo_override_policy is not None:
+        simulation["repo_override_policy"] = repo_override_policy
+    simulated[SKILL_VISIBILITY_SIMULATION_KEY] = simulation
+    return simulated
+
+
+def _path_under_roots(path: str, roots: list[str]) -> bool:
+    return _path_is_under(path, roots)
+
+
+def _select_machine_registry_path(
+    paths: list[str],
+    *,
+    machine: str | None,
+) -> str:
+    if not paths:
+        return ""
+    if not machine:
+        return paths[0]
+    try:
+        from . import machines as _machines  # noqa: PLC0415
+
+        config = _machines.load_machines_config()
+        roots = _machines.repo_roots_for_machine(config, machine)
+    except Exception:
+        roots = []
+    for path in paths:
+        if roots and _path_under_roots(path, roots):
+            return path
+    return paths[0]
+
+
+def _reroot_literal_repo_path(path: str, *, machine: str | None) -> str:
+    raw = str(path or "").strip()
+    if not raw:
+        return raw
+    if not machine:
+        return str(Path(os.path.expandvars(os.path.expanduser(raw))).resolve())
+    try:
+        from . import machines as _machines  # noqa: PLC0415
+
+        config = _machines.load_machines_config()
+        config.require(machine)
+        classified = config.classify_path(raw)
+        for src_machine in classified.get("machines") or []:
+            translated = config.translate_path(raw, str(src_machine), machine, category="repos")
+            if translated:
+                raw = translated
+                break
+    except Exception:
+        pass
+    return str(Path(os.path.expandvars(os.path.expanduser(raw))).resolve())
+
+
+def _resolve_what_if_repo(
+    model: dict[str, Any],
+    repo_ref: str,
+    *,
+    machine: str | None,
+) -> dict[str, Any]:
+    registry = _resolve_registry_repo_ref(repo_ref, model=model)
+    if registry is not None:
+        path = _select_machine_registry_path(list(registry.get("paths") or []), machine=machine)
+        return {
+            "input": repo_ref,
+            "path": path,
+            "machine": machine,
+            "registry": registry,
+        }
+    return {
+        "input": repo_ref,
+        "path": _reroot_literal_repo_path(repo_ref, machine=machine),
+        "machine": machine,
+        "registry": None,
+    }
+
+
+def _copy_override_policy_for_what_if(cwd_path: Path) -> dict[str, Any]:
+    current = _repo_override_policy(cwd_path)
+    repo_root = Path(str(current.get("_repo_root") or cwd_path))
+    policy_path = Path(str(current.get("_policy_path") or (repo_root / SKILL_OVERRIDES_REL)))
+    if not current.get("ok"):
+        current = _empty_repo_override_policy(repo_root, policy_path)
+    policy = {
+        "ok": True,
+        "version": current.get("version", OVERRIDE_POLICY_VERSION),
+        "pin_on": list(current.get("pin_on") or []),
+        "pin_off": list(current.get("pin_off") or []),
+        "opt_out_global": list(current.get("opt_out_global") or []),
+        "overlays": {
+            "enable": list((current.get("overlays") or {}).get("enable") or []),
+            "disable": list((current.get("overlays") or {}).get("disable") or []),
+        },
+        "defaults": list(current.get("defaults") or []),
+        "reason": str(current.get("reason") or "what-if"),
+        "errors": [],
+        "_repo_root": str(repo_root),
+        "_policy_path": str(policy_path),
+        "_simulated": True,
+    }
+    return policy
+
+
+def _dedup_names(names: list[str] | tuple[str, ...] | set[str] | None) -> list[str]:
+    return sorted({str(name).strip() for name in names or [] if str(name).strip()})
+
+
+def _simulated_repo_policy(
+    cwd_path: Path,
+    *,
+    pins: list[str],
+    opt_outs: list[str],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    before = _copy_override_policy_for_what_if(cwd_path)
+    policy = dict(before)
+    policy["overlays"] = dict(before.get("overlays") or {"enable": [], "disable": []})
+    pin_on = set(before.get("pin_on") or [])
+    pin_off = set(before.get("pin_off") or [])
+    opt_out_global = set(before.get("opt_out_global") or [])
+    conflicts: list[dict[str, Any]] = []
+
+    for skill_name in pins:
+        if skill_name in pin_off:
+            conflicts.append({
+                "skill": skill_name,
+                "rule": "existing_pin_off",
+                "message": f"{skill_name!r} is currently pin_off; what-if pin treats it as pin_on.",
+            })
+        pin_off.discard(skill_name)
+        pin_on.add(skill_name)
+
+    for skill_name in opt_outs:
+        if skill_name in DISPATCHER_CORE:
+            conflicts.append({
+                "skill": skill_name,
+                "rule": "floor_opt_out",
+                "message": f"{skill_name!r} is dispatcher floor policy and cannot be opted out.",
+            })
+        opt_out_global.add(skill_name)
+
+    for skill_name in sorted(pin_on & pin_off):
+        conflicts.append({
+            "skill": skill_name,
+            "rule": "contradiction",
+            "message": f"{skill_name!r} appears in both pin_on and pin_off.",
+        })
+
+    policy["pin_on"] = sorted(pin_on)
+    policy["pin_off"] = sorted(pin_off)
+    policy["opt_out_global"] = sorted(opt_out_global)
+    return policy, conflicts
+
+
+def _planned_install_occurrences(
+    model: dict[str, Any],
+    cwd_path: Path,
+    visibility: dict[str, Any],
+) -> list[dict[str, Any]]:
+    wanted = _dedup_names([
+        str(item.get("name") or "")
+        for item in (visibility.get("issues") or {}).get("missing_for_cwd") or []
+    ])
+    repo_root = _repo_root_for_skill_install(cwd_path)
+    rows: list[dict[str, Any]] = []
+    for skill_name in wanted:
+        try:
+            options = _skill_source_options(model, skill_name)
+        except RuntimeError:
+            options = []
+        if not options:
+            continue
+        source = options[0]
+        source_path = str(source.get("source") or "")
+        for surface in ("claude", "codex"):
+            root = repo_root / f".{surface}" / "skills"
+            rows.append({
+                "name": skill_name,
+                "availability": "installed",
+                "layer": f"what-if:project:{surface}",
+                "layer_label": "what-if planned project link",
+                "layer_rank": PROJECT_LAYER_RANK,
+                "scope": "installed",
+                "source_kind": "symlink",
+                "source": source_path,
+                "source_bucket": source.get("source_bucket"),
+                "path": str(root / skill_name),
+                "link_target": source_path,
+                "has_skill_md": True,
+                "state": "ok",
+            })
+    return rows
+
+
+def _effective_by_name(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(item.get("name")): item
+        for item in payload.get("effective") or []
+        if item.get("name")
+    }
+
+
+def _shadowed_by_layer(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in (payload.get("issues") or {}).get("shadowed") or []:
+        if not isinstance(item, dict):
+            continue
+        rows.append({
+            "name": item.get("name"),
+            "winner_layer": item.get("winner_layer"),
+            "shadowed_layers": list(item.get("shadowed_layers") or []),
+        })
+    return sorted(rows, key=lambda item: str(item.get("name") or ""))
+
+
+def build_skill_what_if_payload(
+    model: dict[str, Any],
+    *,
+    repo: str,
+    overlays: list[str] | None = None,
+    pins: list[str] | None = None,
+    opt_outs: list[str] | None = None,
+    machine: str | None = None,
+) -> dict[str, Any]:
+    """Pure skill-visibility simulation; reads state but writes nothing."""
+    machine_id = _validate_what_if_machine(machine)
+    overlay_names = _dedup_names(overlays)
+    pin_names = _dedup_names(pins)
+    opt_out_names = _dedup_names(opt_outs)
+
+    machine_model = _what_if_model(model, machine=machine_id)
+    repo_record = _resolve_what_if_repo(machine_model, repo, machine=machine_id)
+    cwd_path = Path(str(repo_record["path"])).resolve()
+
+    baseline_model = _what_if_model(model, machine=machine_id, repo_path=str(cwd_path))
+    baseline = collect_skill_visibility(
+        baseline_model,
+        cwd=str(cwd_path),
+        include_global=True,
+        include_project=True,
+        include_sources=False,
+    )
+
+    simulated_policy, pin_conflicts = _simulated_repo_policy(
+        cwd_path,
+        pins=pin_names,
+        opt_outs=opt_out_names,
+    )
+    prelink_model = _what_if_model(
+        model,
+        machine=machine_id,
+        repo_path=str(cwd_path),
+        overlays=overlay_names,
+        repo_override_policy=simulated_policy,
+    )
+    prelink = collect_skill_visibility(
+        prelink_model,
+        cwd=str(cwd_path),
+        include_global=True,
+        include_project=True,
+        include_sources=False,
+    )
+    planned_installs = (
+        _planned_install_occurrences(prelink_model, cwd_path, prelink)
+        if overlay_names
+        else []
+    )
+    simulated_model = _what_if_model(
+        model,
+        machine=machine_id,
+        repo_path=str(cwd_path),
+        overlays=overlay_names,
+        repo_override_policy=simulated_policy,
+        installed_occurrences=planned_installs,
+    )
+    simulated = collect_skill_visibility(
+        simulated_model,
+        cwd=str(cwd_path),
+        include_global=True,
+        include_project=True,
+        include_sources=True,
+    )
+
+    before = _effective_by_name(baseline)
+    after = _effective_by_name(simulated)
+    added_names = sorted(set(after) - set(before))
+    removed_names = sorted(set(before) - set(after))
+    effective = [
+        _compact_skill_visibility_skill(item)
+        for item in simulated.get("effective") or []
+    ]
+    return {
+        "ok": True,
+        "schema_version": "2026-07-04+skill_what_if",
+        "repo": repo_record,
+        "inputs": {
+            "overlays": overlay_names,
+            "pin": pin_names,
+            "opt_out": opt_out_names,
+            "machine": machine_id,
+        },
+        "effective": effective,
+        "added": [_compact_skill_visibility_skill(after[name]) for name in added_names],
+        "removed": [_compact_skill_visibility_skill(before[name]) for name in removed_names],
+        "shadowed_by_layer": _shadowed_by_layer(simulated),
+        "pin_conflicts": pin_conflicts,
+        "planned_installs": planned_installs,
+        "baseline": {
+            "effective": sorted(before),
+            "active_overlays": (baseline.get("overlay_audit") or {}).get("active") or [],
+        },
+        "summary": {
+            "effective": len(effective),
+            "added": len(added_names),
+            "removed": len(removed_names),
+            "shadowed": len(_shadowed_by_layer(simulated)),
+            "pin_conflicts": len(pin_conflicts),
+        },
+    }
 
 
 SKILL_AUDIT_REPO_ISSUE_KEYS = (
@@ -1541,7 +1936,7 @@ def _explain_inactive_overlay_rules(
     to flip. The active set is never mutated.
     """
     found: list[dict[str, Any]] = []
-    overlays_on = active_overlays(cwd_path)
+    overlays_on = active_overlays(cwd_path, model=model)
     for policy in _operator_scope_policies(model):
         categories = _policy_categories_by_id(policy)
         for index, raw_rule in enumerate(policy.get("rules") or []):
@@ -1919,7 +2314,7 @@ def explain_skill_visibility(
         "scope_rules": scope_rules,
         "inactive_overlay_rules": inactive_overlay_rules,
         "source_options": source_options,
-        "active_overlays": sorted(active_overlays(cwd_path)),
+        "active_overlays": sorted(active_overlays(cwd_path, model=model)),
         "active_clients": payload.get("active_clients") or [],
         "matched_clients": payload.get("matched_clients") or [],
         "matched_project_categories": payload.get("matched_project_categories") or [],

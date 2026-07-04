@@ -69,8 +69,15 @@ __all__ = [
     'rule_overlay_tags',
     'undeclared_active_overlays',
     'overlay_scoped_skill_names',
+    'SKILL_VISIBILITY_SIMULATION_KEY',
+    '_skill_visibility_simulation',
+    '_simulated_machine_id',
+    '_resolve_registry_repo_ref',
+    'SKILL_OVERRIDES_REL',
+    'OVERRIDE_POLICY_VERSION',
     '_load_scope_policy',
     '_operator_scope_policies',
+    '_empty_repo_override_policy',
     '_repo_override_policy',
     'lint_repo_override_policy',
     'update_repo_override_policy',
@@ -534,10 +541,19 @@ def _env_overlay_records(env_var: str, *, layer: str, label: str, rank: int) -> 
     return records
 
 
-def _repo_override_overlay_records(cwd: str | os.PathLike[str] | Path | None) -> list[dict[str, Any]]:
+def _simulated_repo_override_policy(model: dict[str, Any] | None) -> dict[str, Any] | None:
+    policy = _skill_visibility_simulation(model).get("repo_override_policy")
+    return policy if isinstance(policy, dict) else None
+
+
+def _repo_override_overlay_records(
+    cwd: str | os.PathLike[str] | Path | None,
+    *,
+    model: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     if cwd is None:
         return []
-    policy = _repo_override_policy(cwd)
+    policy = _simulated_repo_override_policy(model) or _repo_override_policy(cwd)
     if not policy.get("ok"):
         return []
     policy_path = str(policy.get("_policy_path") or "")
@@ -568,8 +584,30 @@ def _repo_override_overlay_records(cwd: str | os.PathLike[str] | Path | None) ->
     return records
 
 
+def _simulated_overlay_records(model: dict[str, Any] | None) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    simulation = _skill_visibility_simulation(model)
+    for name in simulation.get("overlays") or []:
+        text = str(name).strip()
+        if not text:
+            continue
+        records.append(
+            _overlay_record(
+                text,
+                enabled=True,
+                layer="what-if-overlays",
+                label="what-if overlays",
+                rank=CLI_LAYER_RANK + 1,
+                source="what-if",
+            )
+        )
+    return records
+
+
 def active_overlay_records(
     cwd: str | os.PathLike[str] | Path | None = None,
+    *,
+    model: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Winning overlay decisions in total precedence order.
 
@@ -579,7 +617,7 @@ def active_overlay_records(
     """
     raw_records = [
         *_state_overlay_records(),
-        *_repo_override_overlay_records(cwd),
+        *_repo_override_overlay_records(cwd, model=model),
         *_env_overlay_records(
             OVERLAY_ENV_VAR,
             layer="env-overlays",
@@ -592,6 +630,7 @@ def active_overlay_records(
             label="this invocation overlays",
             rank=CLI_LAYER_RANK,
         ),
+        *_simulated_overlay_records(model),
     ]
     winners: dict[str, dict[str, Any]] = {}
     for order, record in enumerate(raw_records):
@@ -617,11 +656,15 @@ def active_overlay_records(
     return sorted(cleaned, key=lambda item: str(item.get("name") or ""))
 
 
-def active_overlays(cwd: str | os.PathLike[str] | Path | None = None) -> set[str]:
+def active_overlays(
+    cwd: str | os.PathLike[str] | Path | None = None,
+    *,
+    model: dict[str, Any] | None = None,
+) -> set[str]:
     """Return overlay names enabled by the winning precedence layer."""
     return {
         str(record.get("name") or "")
-        for record in active_overlay_records(cwd)
+        for record in active_overlay_records(cwd, model=model)
         if record.get("enabled") and str(record.get("name") or "")
     }
 
@@ -745,7 +788,7 @@ def undeclared_active_overlays(
     declared = declared_overlays(model)
     if not declared:
         return []
-    return sorted(name for name in active_overlays(cwd) if name not in declared)
+    return sorted(name for name in active_overlays(cwd, model=model) if name not in declared)
 
 
 def overlay_scoped_skill_names(model: dict[str, Any], overlay_name: str) -> set[str]:
@@ -1394,6 +1437,7 @@ def _policy_categories_by_id(policy: dict[str, Any]) -> dict[str, dict[str, Any]
 REGISTRY_FILE_ENV_VAR = "SKILLBOX_REGISTRY_FILE"
 # repos.yaml lives in the private config repo beside skill-scope.yaml/machines.yaml.
 REGISTRY_FILE_REL = ("registry", "repos.yaml")
+SKILL_VISIBILITY_SIMULATION_KEY = "_skill_visibility_simulation"
 
 
 class RegistryResolutionError(ValueError):
@@ -1402,6 +1446,25 @@ class RegistryResolutionError(ValueError):
     The message embeds a fix hint: the nearest declared id (did-you-mean) and the
     full declared id list, so a typo is self-healing rather than a silent miss.
     """
+
+
+def _skill_visibility_simulation(model: dict[str, Any] | None) -> dict[str, Any]:
+    """In-memory resolver inputs for read-only what-if calls.
+
+    The key is deliberately private to the runtime model. Normal callers never
+    set it; simulation callers can inject overlays, repo overrides, planned
+    installs, or a target machine while still flowing through this resolver.
+    """
+    if not isinstance(model, dict):
+        return {}
+    raw = model.get(SKILL_VISIBILITY_SIMULATION_KEY)
+    return raw if isinstance(raw, dict) else {}
+
+
+def _simulated_machine_id(model: dict[str, Any] | None) -> str | None:
+    raw = _skill_visibility_simulation(model).get("machine")
+    text = str(raw or "").strip()
+    return text or None
 
 
 def _registry_doctor_module() -> Any | None:
@@ -1485,7 +1548,15 @@ def _did_you_mean(target: str, candidates: list[str]) -> str | None:
     return matches[0] if matches else None
 
 
-def _machine_detected() -> bool:
+def _machine_config_and_id(model: dict[str, Any] | None = None) -> tuple[Any, str | None]:
+    config, machine_id = _machines_classifier()
+    simulated = _simulated_machine_id(model)
+    if simulated:
+        machine_id = simulated
+    return config, machine_id
+
+
+def _machine_detected(model: dict[str, Any] | None = None) -> bool:
     """True when the current machine is positively identified.
 
     Distinguishes "machine detected (just no repo_roots declared)" from "machine
@@ -1495,11 +1566,16 @@ def _machine_detected() -> bool:
     renamed host, a worker container) to ``(None, None)``; an undetected machine
     must NOT silently re-root to the home-form-only set, so callers fail loud.
     """
-    config, machine_id = _machines_classifier()
+    config, machine_id = _machine_config_and_id(model)
+    if config is not None and machine_id:
+        try:
+            config.require(machine_id)
+        except Exception:
+            return False
     return config is not None and bool(machine_id)
 
 
-def _machine_repo_roots() -> list[str]:
+def _machine_repo_roots(model: dict[str, Any] | None = None) -> list[str]:
     """Current machine's declared repo roots (expanded), longest-first.
 
     Empty when machines.yaml is missing, the machine is undetected, OR the
@@ -1508,13 +1584,16 @@ def _machine_repo_roots() -> list[str]:
     an UNDETECTED machine means "cannot re-root" (a hard error), not "fall back to
     the home-relative form".
     """
-    config, machine_id = _machines_classifier()
+    config, machine_id = _machine_config_and_id(model)
     if config is None or not machine_id:
         return []
-    profile = config.get(machine_id)
-    if profile is None:
+    try:
+        from . import machines as _machines  # noqa: PLC0415
+
+        roots = _machines.repo_roots_for_machine(config, machine_id)
+    except Exception:
         return []
-    roots = [str(root) for root in profile.repo_roots if str(root).strip()]
+    roots = [str(root) for root in roots if str(root).strip()]
     return sorted(roots, key=len, reverse=True)
 
 
@@ -1537,7 +1616,11 @@ def _registry_path_remainder(declared_path: str) -> tuple[str, bool]:
     return expanded, False
 
 
-def _resolve_registry_path(declared_path: str) -> list[str]:
+def _resolve_registry_path(
+    declared_path: str,
+    *,
+    model: dict[str, Any] | None = None,
+) -> list[str]:
     """Map one registry repo path to every spelling on the CURRENT machine.
 
     Emits the repo's path under (a) the registry's home-relative form and (b)
@@ -1553,13 +1636,17 @@ def _resolve_registry_path(declared_path: str) -> list[str]:
     spellings.append(declared_path)
     if under_repos:
         # (b) re-root the remainder under each current-machine repo root.
-        for root in _machine_repo_roots():
+        for root in _machine_repo_roots(model):
             spellings.append(os.path.join(root, remainder) if remainder else root)
     resolved = sorted({_expand_policy_path(item) for item in spellings if str(item).strip()})
     return resolved
 
 
-def _resolve_registry_entry_path(entry: dict[str, Any]) -> list[str]:
+def _resolve_registry_entry_path(
+    entry: dict[str, Any],
+    *,
+    model: dict[str, Any] | None = None,
+) -> list[str]:
     """Resolve ONE registry entry's declared path to current-machine spellings.
 
     Fail-loud guards (match the project's posture — unknown-id already raises):
@@ -1583,14 +1670,49 @@ def _resolve_registry_entry_path(entry: dict[str, Any]) -> list[str]:
             "it to a current-machine path."
         )
     _remainder, under_repos = _registry_path_remainder(declared_path)
-    if under_repos and not _machine_detected():
+    if under_repos and not _machine_detected(model):
         raise RegistryResolutionError(
             "registry-id rule used but current machine undetected -- cannot "
             "re-root; check machines.yaml / SKILLBOX_MACHINE "
             f"(resolving registry id {str(entry.get('id') or '')!r} -> "
             f"{declared_path!r})."
         )
-    return _resolve_registry_path(declared_path)
+    return _resolve_registry_path(declared_path, model=model)
+
+
+def _resolve_registry_repo_ref(
+    repo_ref: str,
+    *,
+    model: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Resolve a registry repo id/name to machine-rooted paths.
+
+    Returns ``None`` when ``repo_ref`` is not a declared registry id/name so the
+    caller can treat it as a literal path.
+    """
+    target = str(repo_ref or "").strip()
+    if not target:
+        return None
+    entries = _load_registry_entries()
+    by_key: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        for key_name in ("id", "name"):
+            key = str(entry.get(key_name) or "").strip()
+            if key:
+                by_key.setdefault(key, entry)
+    entry = by_key.get(target)
+    if entry is None:
+        return None
+    paths = _resolve_registry_entry_path(entry, model=model)
+    return {
+        "input": target,
+        "matched": True,
+        "id": str(entry.get("id") or entry.get("name") or target),
+        "name": str(entry.get("name") or entry.get("id") or target),
+        "bucket": str(entry.get("bucket") or entry.get("class") or ""),
+        "declared_path": str(entry.get("path") or ""),
+        "paths": paths,
+    }
 
 
 def _scope_rule_repo_ids(raw_rule: dict[str, Any]) -> list[str]:
@@ -1605,6 +1727,8 @@ def _resolve_scope_rule_repos(
     repo_ids: list[str],
     category_ids: list[str],
     entries: list[dict[str, Any]],
+    *,
+    model: dict[str, Any] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Resolve registry ids + registry-category ids to current-machine paths.
 
@@ -1644,7 +1768,7 @@ def _resolve_scope_rule_repos(
                 f"id {repo_id!r} not in registry/repos.yaml{suggestion} "
                 f"declared ids: {', '.join(declared_ids)}"
             )
-        paths.extend(_resolve_registry_entry_path(entry))
+        paths.extend(_resolve_registry_entry_path(entry, model=model))
 
     matched_categories: list[str] = []
     for category_id in category_ids:
@@ -1656,7 +1780,7 @@ def _resolve_scope_rule_repos(
             continue
         matched_categories.append(category_id)
         for entry in members:
-            paths.extend(_resolve_registry_entry_path(entry))
+            paths.extend(_resolve_registry_entry_path(entry, model=model))
 
     return sorted(set(paths)), matched_categories
 
@@ -1693,6 +1817,7 @@ def _scope_rule_paths(
     categories: dict[str, dict[str, Any]],
     *,
     registry_entries: list[dict[str, Any]] | None = None,
+    model: dict[str, Any] | None = None,
 ) -> tuple[list[str], list[str], list[str], list[str]]:
     """Build a rule's effective path list (literal + category + registry).
 
@@ -1719,7 +1844,7 @@ def _scope_rule_paths(
     if registry_entries is None:
         registry_entries = _load_registry_entries()
     registry_paths, registry_categories = _resolve_scope_rule_repos(
-        repo_ids, category_ids, registry_entries
+        repo_ids, category_ids, registry_entries, model=model
     )
     paths.extend(registry_paths)
 
@@ -1740,6 +1865,7 @@ def _scope_rule_from_raw(
     categories: dict[str, dict[str, Any]],
     overlays_on: set[str],
     registry_entries: list[dict[str, Any]] | None = None,
+    model: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     overlay = str(raw_rule.get("overlay") or "").strip()
     if overlay and overlay not in overlays_on:
@@ -1748,7 +1874,7 @@ def _scope_rule_from_raw(
     if not patterns:
         return None
     paths, category_ids, unknown_categories, repo_ids = _scope_rule_paths(
-        raw_rule, categories, registry_entries=registry_entries
+        raw_rule, categories, registry_entries=registry_entries, model=model
     )
     return {
         "id": str(raw_rule.get("id") or f"rule-{index}"),
@@ -1823,7 +1949,7 @@ def _scope_rules(
     rules: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     if overlays_on is None:
-        overlays_on = active_overlays(cwd)
+        overlays_on = active_overlays(cwd, model=model)
     # Load the registry id->path taxonomy once per pass (not per rule) so
     # `repos:`/registry-`categories:` resolution stays cheap.
     registry_entries = _load_registry_entries()
@@ -1840,6 +1966,7 @@ def _scope_rules(
                     categories=categories,
                     overlays_on=overlays_on,
                     registry_entries=registry_entries,
+                    model=model,
                 )
             except RegistryResolutionError as exc:
                 # BUG C: one bad rule (typo'd repos: id / malformed registry
@@ -2017,7 +2144,6 @@ def _matched_scope_rules_for_cwd(model: dict[str, Any], cwd: Path) -> list[dict[
     matched: list[dict[str, Any]] = []
     cwd = cwd.resolve()
     for rule in _scope_rules(model, cwd=cwd):
-        paths = list(rule.get("paths") or [])
         matched_paths = _scope_rule_matched_paths(rule, cwd)
         if not matched_paths:
             continue

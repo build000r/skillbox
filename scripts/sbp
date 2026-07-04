@@ -179,6 +179,7 @@ Skills:
   __WRAPPER__ skill add NAME          Link NAME into global/project/category roots
   __WRAPPER__ skill why NAME          Explain visibility layers and exact fixes
   __WRAPPER__ skill togglable         List cwd-flippable skills and exact flip commands
+  __WRAPPER__ skill what-if --repo R  Simulate overlay/pin visibility with zero writes
   __WRAPPER__ skill on NAME           Durably pin NAME on for this repo
   __WRAPPER__ skill off NAME          Durably pin NAME off for this repo
   __WRAPPER__ skill default on NAME --repo --dry-run
@@ -219,6 +220,7 @@ Examples:
   __WRAPPER__ skill add ui --to category --category frontend
   __WRAPPER__ skill why wiki --json
   __WRAPPER__ skill togglable --json
+  __WRAPPER__ skill what-if --repo . --overlay marketing --json
   __WRAPPER__ skill on wiki --verify
   __WRAPPER__ skill off wiki --dry-run
   __WRAPPER__ skill default on wiki --repo --dry-run
@@ -372,6 +374,16 @@ skill_verbs = {
         "when_to_use": "Use when choosing the narrowest correct fix for one skill.",
         "do_NOT": "Do not infer policy from memory when why can return the live layers.",
     },
+    "what-if": {
+        "purpose": "Purely simulate effective skill visibility for a repo, overlay, pin, opt-out, and machine.",
+        "mutates": "none",
+        "links_disk": False,
+        "returns_packet": False,
+        "scope": "target repo from --repo",
+        "survives_recalibrate": False,
+        "when_to_use": "Use before overlay or pin changes to see added, removed, shadowed, and conflict results.",
+        "do_NOT": "Do not treat what-if as applying anything; it writes zero files.",
+    },
     "togglable": {
         "purpose": "List every skill flippable at this cwd and the exact command to flip it.",
         "mutates": "none",
@@ -424,6 +436,7 @@ payload = {
         {"name": "skills", "json": True, "safe_first_try": f"{wrapper} skills --issues-only --json"},
         {"name": "skill-why", "json": True, "safe_first_try": f"{wrapper} skill why <skill> --json"},
         {"name": "skill-togglable", "json": True, "safe_first_try": f"{wrapper} skill togglable --json"},
+        {"name": "skill-what-if", "json": True, "safe_first_try": f"{wrapper} skill what-if --repo <repo-id-or-path> --overlay <overlay> --json"},
         {"name": "skill-heal", "json": True, "safe_first_try": f"{wrapper} skill heal <skill> --dry-run --format json"},
         {"name": "candidates", "json": True, "safe_first_try": f"{wrapper} candidates --json"},
         {"name": "mcp", "json": True, "safe_first_try": f"{wrapper} mcp --json"},

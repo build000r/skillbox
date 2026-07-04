@@ -44,7 +44,9 @@ from runtime_manager.policy_eval import (  # noqa: E402
 from runtime_manager.validation import validate_global_skill_contract  # noqa: E402
 from runtime_manager.skill_visibility import (  # noqa: E402
     active_overlays,
+    activate_overlay_scoped_skills,
     apply_skill_lifecycle_plan,
+    build_skill_what_if_payload,
     collect_skill_visibility,
     explain_skill_visibility,
     skill_lifecycle_plan,
@@ -1807,6 +1809,150 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
             cli_off["SKILLBOX_CLI_OVERLAYS"] = "!marketing"
             with mock.patch.dict(SKILL_VISIBILITY.os.environ, cli_off, clear=False):
                 self.assertNotIn("marketing", active_overlays(repo))
+
+
+class SkillWhatIfTests(unittest.TestCase):
+    def _overlay_fixture(self, root: Path) -> tuple[Path, Path, dict[str, object]]:
+        repo = _make_repo(root)
+        fake_home = root / "home"
+        fake_home.mkdir()
+        clients_root = root / "clients"
+        clients_root.mkdir()
+        source_root = root / "sources"
+        _write_source_skill(source_root, "promo")
+        (root / "skill-scope.yaml").write_text(
+            "version: 1\n"
+            f"skill_source_roots: [{source_root}]\n"
+            "overlays:\n"
+            "  marketing:\n"
+            "    description: Marketing mode\n"
+            "rules:\n"
+            "  - id: marketing-local\n"
+            "    skills: [promo]\n"
+            "    overlay: marketing\n"
+            f"    paths: [{repo}]\n",
+            encoding="utf-8",
+        )
+        for surface in ("claude", "codex"):
+            (repo / f".{surface}" / "skills").mkdir(parents=True)
+        model = {"env": {"SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root)}, "clients": [], "skills": []}
+        return repo, fake_home, model
+
+    def test_what_if_overlay_matches_overlay_activate_dry_run_added_set(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo, fake_home, model = self._overlay_fixture(root)
+
+            with mock.patch.object(SKILL_VISIBILITY.Path, "home", return_value=fake_home):
+                what_if = build_skill_what_if_payload(
+                    model,
+                    repo=str(repo),
+                    overlays=["marketing"],
+                )
+                activations = activate_overlay_scoped_skills(
+                    model,
+                    "marketing",
+                    repo,
+                    dry_run=True,
+                )
+
+        self.assertEqual([item["name"] for item in what_if["added"]], ["promo"])
+        self.assertEqual(
+            [item["name"] for item in what_if["effective"]],
+            ["promo"],
+        )
+        self.assertEqual(
+            [item["skill"] for item in activations],
+            [item["name"] for item in what_if["added"]],
+        )
+
+    def test_what_if_writes_zero_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo, fake_home, model = self._overlay_fixture(root)
+            _write_override(repo, "version: 1\npin_off: [old-skill]\n")
+            watched = [
+                repo / ".skillbox" / "skill-overrides.yaml",
+                repo / ".claude" / "skills",
+                repo / ".codex" / "skills",
+            ]
+            before = {path: path.stat().st_mtime_ns for path in watched}
+
+            with mock.patch.object(SKILL_VISIBILITY.Path, "home", return_value=fake_home):
+                payload = build_skill_what_if_payload(
+                    model,
+                    repo=str(repo),
+                    overlays=["marketing"],
+                    pins=["old-skill"],
+                    opt_outs=["smart"],
+                )
+
+            after = {path: path.stat().st_mtime_ns for path in watched}
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(before, after)
+        self.assertEqual(
+            {(item["skill"], item["rule"]) for item in payload["pin_conflicts"]},
+            {("old-skill", "existing_pin_off"), ("smart", "floor_opt_out")},
+        )
+
+    def test_what_if_literal_repo_can_be_rerooted_to_target_machine(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            dev_root = root / "dev" / "repos"
+            mac_root = root / "mac" / "repos"
+            repo = dev_root / "app"
+            repo.mkdir(parents=True)
+            mac_root.mkdir(parents=True)
+            machines_file = root / "machines.yaml"
+            machines_file.write_text(
+                "version: 1\n"
+                "machines:\n"
+                "  devbox-like:\n"
+                "    hostnames: [devbox-like]\n"
+                f"    home: {root / 'dev'}\n"
+                f"    repo_roots: [{dev_root}]\n"
+                "  mac-like:\n"
+                "    hostnames: [mac-like]\n"
+                f"    home: {root / 'mac'}\n"
+                f"    repo_roots: [{mac_root}]\n",
+                encoding="utf-8",
+            )
+            model = {"env": {"SKILLBOX_CLIENTS_HOST_ROOT": str(root / "clients")}, "clients": [], "skills": []}
+
+            with mock.patch.dict(os.environ, {"SKILLBOX_MACHINES_FILE": str(machines_file)}, clear=False):
+                payload = build_skill_what_if_payload(
+                    model,
+                    repo=str(repo),
+                    machine="mac-like",
+                )
+
+        self.assertEqual(payload["repo"]["path"], str(mac_root / "app"))
+
+    def test_what_if_unknown_machine_returns_structured_json_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fleet = build_fixture_fleet(tmpdir)
+            env = {"SKILLBOX_MACHINES_FILE": str(fleet.machines_path)}
+            with (
+                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch.object(RUNTIME_CLI, "_filtered_model_for_args", return_value=fleet.model()),
+            ):
+                code, text = _run_runtime_cli([
+                    "skill",
+                    "what-if",
+                    "--repo",
+                    str(fleet.repo("overlay-repo")),
+                    "--machine",
+                    "missing-machine",
+                    "--format",
+                    "json",
+                ])
+
+        payload = json.loads(text)
+        self.assertEqual(code, 1)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error_code"], "SKILL_WHAT_IF_UNKNOWN_MACHINE")
+        self.assertEqual(payload["error"]["context"]["machine"], "missing-machine")
 
 
 if __name__ == "__main__":
