@@ -1577,7 +1577,7 @@ def _explain_inactive_overlay_rules(
             ):
                 continue
             paths = list(rule.get("paths") or [])
-            matched_paths = [path for path in paths if _path_prefix_matches(cwd_path, path)]
+            matched_paths = _scope_rule_matched_paths(rule, cwd_path)
             if not matched_paths and paths:
                 continue
             found.append({
@@ -1610,7 +1610,7 @@ def _explain_scope_rules(model: dict[str, Any], skill_name: str, cwd_path: Path)
         if matched_pattern is None:
             continue
         paths = list(rule.get("paths") or [])
-        matched_paths = [path for path in paths if _path_prefix_matches(cwd_path, path)]
+        matched_paths = _scope_rule_matched_paths(rule, cwd_path)
         rules.append({
             "id": rule.get("id"),
             "policy_path": rule.get("policy_path"),

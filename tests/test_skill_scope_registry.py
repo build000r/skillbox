@@ -207,6 +207,55 @@ class RegistryResolutionTests(unittest.TestCase):
         self.assertIn(sv._expand_policy_path("~/repos/some-unregistered-repo"), rule["paths"])
 
 
+class ScopeRulePathMatchTests(unittest.TestCase):
+    def _model(self, rules: list[dict]) -> dict:
+        return {
+            "env": {},
+            "active_clients": [],
+            "active_profiles": ["core"],
+            "clients": [
+                {
+                    "id": "c",
+                    "context": {
+                        "skill_scope": {"_policy_path": "inline:c", "rules": rules}
+                    },
+                }
+            ],
+            "skills": [],
+        }
+
+    def test_exact_rule_matches_root_but_not_child_repo(self) -> None:
+        root = Path("/tmp/skillbox-portfolio-repos")
+        child_repo = root / "cycle-chef"
+        model = self._model(
+            [
+                {
+                    "id": "portfolio-root-local",
+                    "skills": ["make-indispensable"],
+                    "paths": [str(root)],
+                    "match": "exact",
+                },
+                {
+                    "id": "prefix-local",
+                    "skills": ["prefix-skill"],
+                    "paths": [str(root)],
+                },
+            ]
+        )
+
+        parsed_rules = {rule["id"]: rule for rule in sv._scope_rules(model)}
+        self.assertEqual(parsed_rules["portfolio-root-local"]["path_match"], "exact")
+        self.assertEqual(parsed_rules["prefix-local"]["path_match"], "prefix")
+
+        root_ids = [rule["id"] for rule in sv._matched_scope_rules_for_cwd(model, root)]
+        child_ids = [rule["id"] for rule in sv._matched_scope_rules_for_cwd(model, child_repo)]
+
+        self.assertIn("portfolio-root-local", root_ids)
+        self.assertIn("prefix-local", root_ids)
+        self.assertNotIn("portfolio-root-local", child_ids)
+        self.assertIn("prefix-local", child_ids)
+
+
 class MigratedRuleEquivalenceTests(unittest.TestCase):
     """Prove the migrated app_core-local/ui-local rules resolve to the SAME effective
     paths as their prior literal lists, on this machine, with no behavior change.

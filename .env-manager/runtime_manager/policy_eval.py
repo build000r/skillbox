@@ -99,6 +99,9 @@ __all__ = [
     '_scope_rule_from_raw',
     '_scope_rules',
     'last_scope_rule_errors',
+    '_scope_rule_path_match_mode',
+    '_scope_rule_path_matches',
+    '_scope_rule_matched_paths',
     '_policy_skill_source_patterns',
     '_policy_skill_install_scan_patterns',
     '_expand_skill_source_patterns',
@@ -1754,6 +1757,10 @@ def _scope_rule_from_raw(
         "categories": category_ids,
         "repos": repo_ids,
         "unknown_categories": unknown_categories,
+        "path_match": (
+            str(raw_rule.get("match") or raw_rule.get("path_match") or "prefix").strip().lower()
+            or "prefix"
+        ),
         "allow_global": bool(raw_rule.get("allow_global", False)),
         "default": raw_rule.get("default", "on"),
         "activation": str(raw_rule.get("activation") or "").strip(),
@@ -1780,6 +1787,31 @@ def last_scope_rule_errors() -> list[dict[str, Any]]:
     Returns a copy so callers cannot mutate the collector.
     """
     return [dict(item) for item in _LAST_SCOPE_RULE_ERRORS]
+
+
+def _scope_rule_path_match_mode(rule: dict[str, Any]) -> str:
+    mode = str(rule.get("path_match") or "prefix").strip().lower()
+    if mode in {"exact", "equal", "equals"}:
+        return "exact"
+    return "prefix"
+
+
+def _scope_rule_path_matches(rule: dict[str, Any], cwd: Path, path: str) -> bool:
+    if _scope_rule_path_match_mode(rule) != "exact":
+        return _path_prefix_matches(cwd, path)
+    raw_path = str(path or "").strip()
+    if not raw_path:
+        return False
+    expanded = Path(os.path.expandvars(os.path.expanduser(raw_path))).resolve()
+    return cwd.resolve() == expanded
+
+
+def _scope_rule_matched_paths(rule: dict[str, Any], cwd: Path) -> list[str]:
+    return [
+        path
+        for path in rule.get("paths") or []
+        if _scope_rule_path_matches(rule, cwd, path)
+    ]
 
 
 def _scope_rules(
@@ -1911,7 +1943,7 @@ def _matching_scope_rule(
         cwd = Path(os.path.abspath(os.path.expandvars(os.path.expanduser(str(cwd)))))
         path_matches = [
             rule for rule in matches
-            if any(_path_prefix_matches(cwd, path) for path in rule.get("paths") or [])
+            if _scope_rule_matched_paths(rule, cwd)
         ]
         if path_matches:
             return max(
@@ -1919,7 +1951,7 @@ def _matching_scope_rule(
                 key=lambda rule: max(
                     len(str(path))
                     for path in rule.get("paths") or []
-                    if _path_prefix_matches(cwd, path)
+                    if _scope_rule_path_matches(rule, cwd, path)
                 ),
             )
     if matches:
@@ -1986,7 +2018,7 @@ def _matched_scope_rules_for_cwd(model: dict[str, Any], cwd: Path) -> list[dict[
     cwd = cwd.resolve()
     for rule in _scope_rules(model, cwd=cwd):
         paths = list(rule.get("paths") or [])
-        matched_paths = [path for path in paths if _path_prefix_matches(cwd, path)]
+        matched_paths = _scope_rule_matched_paths(rule, cwd)
         if not matched_paths:
             continue
         item = dict(rule)
