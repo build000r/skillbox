@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import traceback
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
@@ -19,9 +20,16 @@ from .errors import (
     OVERRIDE_REFUSED_GLOBAL_ESCALATION,
     OVERRIDE_SKILL_UNKNOWN,
     PRUNE_SKIPPED_PINNED,
+    SkillboxError,
     ValidationError,
+    internal_error_payload,
 )
 from .shared import *
+from lib.runtime_model import (  # noqa: E402
+    LOCAL_RUNTIME_MODE_UNSUPPORTED,
+    LOCAL_RUNTIME_START_BLOCKED,
+    LOCAL_RUNTIME_START_MODES,
+)
 from .validation import *
 from .publish import *
 from .runtime_ops import *
@@ -80,73 +88,54 @@ class DistributionRollbackError(RuntimeError):
     pass
 
 
-MANAGE_COMMAND_NAMES = {
-    "acceptance",
-    "bootstrap",
-    "capabilities",
-    "client-diff",
-    "client-init",
-    "client-open",
-    "client-project",
-    "client-publish",
-    "context",
-    "distribution-preview",
-    "distribution-publish",
-    "distribution-rollback",
-    "doctor",
-    "down",
-    "explain",
-    "first-box",
-    "focus",
-    "forge",
-    "graph",
-    "logs",
-    "mcp",
-    "mcp-audit",
-    "mmdx",
-    "next",
-    "onboard",
-    "operator-booking",
-    "overlay",
-    "parity-report",
-    "ports",
-    "private-init",
-    "pressure-report",
-    "rch-stage",
-    "rch-report",
-    "sbh-report",
-    "render",
-    "registry-docs",
-    "restart",
-    "robot-docs",
-    "robot-triage",
-    "search",
-    "session-end",
-    "session-event",
-    "session-resume",
-    "session-start",
-    "session-status",
-    "skill",
-    "skill-audit",
-    "skills",
-    "snap",
-    "status",
-    "stewardship-report",
-    "structure-doctor",
-    "swimmers-launch",
-    "sync",
-    "up",
-    "worker-artifacts",
-    "worker-promote-learning",
-    "worker-status",
-    "worker-submit",
-}
 JSON_FLAG_ALIASES = {
     "--json": "--format json",
     "--jason": "--format json",
     "--jsno": "--format json",
     "--jsson": "--format json",
 }
+EarlyCommandHandler = Callable[[argparse.Namespace, Path], int]
+ModelCommandHandler = Callable[[argparse.Namespace, Path, dict[str, Any], str], int]
+
+
+@dataclass(frozen=True)
+class ManageCommandSpec:
+    name: str
+    handler: EarlyCommandHandler | ModelCommandHandler
+    help: str
+    loads_model: bool
+
+
+_COMMAND_REGISTRY: dict[str, ManageCommandSpec] = {}
+COMMAND_REGISTRY = _COMMAND_REGISTRY
+MANAGE_COMMAND_NAMES: frozenset[str] = frozenset()
+
+
+def register_command(
+    name: str,
+    handler: EarlyCommandHandler | ModelCommandHandler,
+    help_text: str,
+    *,
+    loads_model: bool,
+) -> ManageCommandSpec:
+    global MANAGE_COMMAND_NAMES
+    if not name:
+        raise RuntimeError("command registry entry is missing a name")
+    if name in _COMMAND_REGISTRY:
+        raise RuntimeError(f"command {name!r} is already registered")
+    spec = ManageCommandSpec(name=name, handler=handler, help=help_text, loads_model=loads_model)
+    _COMMAND_REGISTRY[name] = spec
+    MANAGE_COMMAND_NAMES = frozenset(_COMMAND_REGISTRY)
+    if "_EARLY_DISPATCH" in globals() and "_MODEL_DISPATCH" in globals():
+        if loads_model:
+            _MODEL_DISPATCH[name] = handler
+        else:
+            _EARLY_DISPATCH[name] = handler
+    return spec
+
+
+def command_registry() -> dict[str, ManageCommandSpec]:
+    return dict(sorted(_COMMAND_REGISTRY.items()))
 
 
 class SkillboxArgumentParser(argparse.ArgumentParser):
@@ -168,8 +157,7 @@ def _command_suggestion_from_error(message: str) -> str:
         return ""
     remainder = message.split(marker, 1)[1]
     raw = remainder.split("(", 1)[0].strip().strip("'\"")
-    matches = difflib.get_close_matches(raw, sorted(MANAGE_COMMAND_NAMES), n=1, cutoff=0.68)
-    return matches[0] if matches else ""
+    return _suggest_command(raw)
 
 
 def _normalize_agent_argv(argv: list[str] | None) -> tuple[list[str], list[str]]:
@@ -3725,44 +3713,44 @@ def _handle_cass_evidence(args: argparse.Namespace, root_dir: Path) -> int:
     return int(proc.returncode)
 
 
-_EARLY_DISPATCH: dict[str, Callable[[argparse.Namespace, Path], int]] = {
-    "cass-evidence": _handle_cass_evidence,
-    "capabilities": _handle_capabilities,
-    "registry-docs": _handle_registry_docs,
-    "robot-docs": _handle_robot_docs,
-    "robot-triage": _handle_robot_triage,
-    "pressure-report": _handle_pressure_report,
-    "rch-report": _handle_rch_report,
-    "rch-stage": _handle_rch_stage,
-    "sbh-report": _handle_sbh_report,
-    "client-init": _handle_client_init,
-    "onboard": _handle_onboard,
-    "first-box": _handle_first_box,
-    "forge": _handle_forge,
-    "private-init": _handle_private_init,
-    "acceptance": _handle_acceptance,
-    "client-project": _handle_client_project,
-    "client-open": _handle_client_open,
-    "client-publish": _handle_client_publish,
-    "client-diff": _handle_client_diff,
-    "distribution-publish": _handle_distribution_publish,
-    "distribution-preview": _handle_distribution_preview,
-    "distribution-rollback": _handle_distribution_rollback,
-    "focus": _handle_focus,
-    "stewardship-report": _handle_stewardship_report,
-    "session-start": _handle_session_start,
-    "session-event": _handle_session_event,
-    "session-end": _handle_session_end,
-    "session-resume": _handle_session_resume,
-    "session-status": _handle_session_status,
-    "worker-submit": _handle_worker_submit,
-    "worker-status": _handle_worker_status,
-    "worker-artifacts": _handle_worker_artifacts,
-    "worker-promote-learning": _handle_worker_promote_learning,
-    "swimmers-launch": _handle_swimmers_launch,
-    "mmdx": _handle_mmdx,
-    "structure-doctor": _handle_structure_doctor,
-}
+_EARLY_COMMANDS: tuple[tuple[str, EarlyCommandHandler, str], ...] = (
+    ("cass-evidence", _handle_cass_evidence, "Measure skill invocations per repo from Cass."),
+    ("capabilities", _handle_capabilities, "Print the machine-readable Skillbox CLI contract."),
+    ("registry-docs", _handle_registry_docs, "Render docs/API_REFERENCE.md from the command registry."),
+    ("robot-docs", _handle_robot_docs, "Print agent-oriented in-tool documentation."),
+    ("robot-triage", _handle_robot_triage, "Emit a compact JSON triage packet for agents."),
+    ("pressure-report", _handle_pressure_report, "Report local disk pressure and guard posture."),
+    ("rch-report", _handle_rch_report, "Report RCH build-offload readiness without mutation."),
+    ("rch-stage", _handle_rch_stage, "Prepare or run a no-sudo RCH staging lane."),
+    ("sbh-report", _handle_sbh_report, "Report SBH storage guard readiness without mutation."),
+    ("client-init", _handle_client_init, "Create or inspect client overlay scaffolds."),
+    ("onboard", _handle_onboard, "Create an operator-owned client overlay and acceptance checklist."),
+    ("first-box", _handle_first_box, "Run first-box bootstrap for a client."),
+    ("forge", _handle_forge, "Run forge workspace helpers."),
+    ("private-init", _handle_private_init, "Create a private client config tree."),
+    ("acceptance", _handle_acceptance, "Run the first-box readiness gate."),
+    ("client-project", _handle_client_project, "Render a client project bundle."),
+    ("client-open", _handle_client_open, "Open a client surface from a bundle."),
+    ("client-publish", _handle_client_publish, "Publish a client bundle."),
+    ("client-diff", _handle_client_diff, "Diff a client bundle against a target."),
+    ("distribution-publish", _handle_distribution_publish, "Publish a signed skill distribution."),
+    ("distribution-preview", _handle_distribution_preview, "Preview a signed skill distribution manifest."),
+    ("distribution-rollback", _handle_distribution_rollback, "Rollback a distributed skill version."),
+    ("focus", _handle_focus, "Sync, bootstrap, start, and inspect one client."),
+    ("stewardship-report", _handle_stewardship_report, "Summarize stewardship coverage and risks."),
+    ("session-start", _handle_session_start, "Start a tracked client session."),
+    ("session-event", _handle_session_event, "Append an event to a tracked client session."),
+    ("session-end", _handle_session_end, "End a tracked client session."),
+    ("session-resume", _handle_session_resume, "Resume a tracked client session."),
+    ("session-status", _handle_session_status, "Inspect tracked client sessions."),
+    ("worker-submit", _handle_worker_submit, "Submit a broker-managed worker run."),
+    ("worker-status", _handle_worker_status, "Inspect a broker-managed worker run."),
+    ("worker-artifacts", _handle_worker_artifacts, "Read result artifacts for a worker run."),
+    ("worker-promote-learning", _handle_worker_promote_learning, "Promote a reviewed worker learning proposal."),
+    ("swimmers-launch", _handle_swimmers_launch, "Launch Swimmers agent sessions for directories."),
+    ("mmdx", _handle_mmdx, "Open or create MMDX diagrams."),
+    ("structure-doctor", _handle_structure_doctor, "Run structural gates without mutating runtime state."),
+)
 
 
 def _handle_render(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
@@ -6364,33 +6352,53 @@ def _handle_logs(args: argparse.Namespace, root_dir: Path, model: dict[str, Any]
     return EXIT_OK
 
 
-_MODEL_DISPATCH: dict[str, Callable[[argparse.Namespace, Path, dict[str, Any], str], int]] = {
-    "render": _handle_render,
-    "ports": _handle_ports,
-    "sync": _handle_sync,
-    "context": _handle_context,
-    "doctor": _handle_doctor,
-    "status": _handle_status,
-    "skills": _handle_skills,
-    "skill-audit": _handle_skill_audit,
-    "mcp-audit": _handle_mcp_audit,
-    "mcp": _handle_mcp,
-    "fleet": _handle_fleet,
-    "evidence": _handle_evidence,
-    "next": _handle_next,
-    "graph": _handle_graph,
-    "explain": _handle_explain,
-    "search": _handle_search,
-    "snap": _handle_snap,
-    "parity-report": _handle_parity_report,
-    "skill": _handle_skill,
-    "overlay": _handle_overlay,
-    "operator-booking": _handle_operator_booking,
-    "bootstrap": _handle_bootstrap,
-    "up": _handle_up,
-    "down": _handle_down,
-    "restart": _handle_restart,
-    "logs": _handle_logs,
+_MODEL_COMMANDS: tuple[tuple[str, ModelCommandHandler, str], ...] = (
+    ("render", _handle_render, "Print the resolved runtime graph."),
+    ("ports", _handle_ports, "List or resolve the active port registry."),
+    ("sync", _handle_sync, "Create managed runtime directories, repos, artifacts, and skill state."),
+    ("context", _handle_context, "Render managed agent context files."),
+    ("doctor", _handle_doctor, "Validate runtime graph, filesystem readiness, and skill integrity."),
+    ("status", _handle_status, "Summarize repo, artifact, skill, service, log, and check state."),
+    ("skills", _handle_skills, "Show effective skill availability."),
+    ("skill-audit", _handle_skill_audit, "Audit skill scope policy across repos."),
+    ("mcp-audit", _handle_mcp_audit, "Audit Claude and Codex MCP config parity."),
+    ("mcp", _handle_mcp, "Render single-source MCP config."),
+    ("fleet", _handle_fleet, "Plan fleet-wide skill and MCP convergence."),
+    ("evidence", _handle_evidence, "Emit a read-only runtime evidence packet."),
+    ("next", _handle_next, "Rank explainable next actions from evidence."),
+    ("graph", _handle_graph, "Inspect the agent operations graph."),
+    ("explain", _handle_explain, "Explain graph nodes, Beads, tools, and commands."),
+    ("search", _handle_search, "Search commands, graph nodes, docs, Beads, and evidence."),
+    ("snap", _handle_snap, "Create, diff, or replay redacted runtime snapshots."),
+    ("parity-report", _handle_parity_report, "Report dev/prod parity for a client."),
+    ("skill", _handle_skill, "Manage skill visibility and lifecycle overrides."),
+    ("overlay", _handle_overlay, "Inspect or migrate client overlays."),
+    ("operator-booking", _handle_operator_booking, "Inspect or create operator booking holds."),
+    ("bootstrap", _handle_bootstrap, "Run declared runtime bootstrap tasks."),
+    ("up", _handle_up, "Start declared runtime services."),
+    ("down", _handle_down, "Stop declared runtime services."),
+    ("restart", _handle_restart, "Restart declared runtime services."),
+    ("logs", _handle_logs, "Show declared runtime service logs."),
+)
+
+
+def _register_builtin_commands() -> None:
+    for name, handler, help_text in _EARLY_COMMANDS:
+        register_command(name, handler, help_text, loads_model=False)
+    for name, handler, help_text in _MODEL_COMMANDS:
+        register_command(name, handler, help_text, loads_model=True)
+
+
+_register_builtin_commands()
+_EARLY_DISPATCH: dict[str, EarlyCommandHandler] = {
+    name: spec.handler
+    for name, spec in _COMMAND_REGISTRY.items()
+    if not spec.loads_model
+}
+_MODEL_DISPATCH: dict[str, ModelCommandHandler] = {
+    name: spec.handler
+    for name, spec in _COMMAND_REGISTRY.items()
+    if spec.loads_model
 }
 
 
@@ -6842,6 +6850,31 @@ def _dispatch_model_command(
         return _emit_main_exception(args, exc)
 
 
+def _suggest_command(command: str) -> str:
+    matches = difflib.get_close_matches(command, sorted(MANAGE_COMMAND_NAMES), n=1, cutoff=0.68)
+    return matches[0] if matches else ""
+
+
+def _emit_unknown_registered_command(command: str) -> int:
+    suggestion = _suggest_command(command)
+    print(f"Unknown command: {command}", file=sys.stderr)
+    if suggestion:
+        print(f"Did you mean: `manage.py {suggestion}`?", file=sys.stderr)
+    print("Agent hint: run `manage.py capabilities --json` for the machine-readable command contract.", file=sys.stderr)
+    return EXIT_ERROR
+
+
+def _dispatch_registered_command(args: argparse.Namespace, root_dir: Path, resolved_mode: str) -> int:
+    spec = _COMMAND_REGISTRY.get(str(args.command))
+    if spec is None:
+        return _emit_unknown_registered_command(str(args.command))
+    if spec.loads_model:
+        handler = _MODEL_DISPATCH.get(spec.name, spec.handler)
+        return _dispatch_model_command(args, root_dir, resolved_mode, handler)
+    handler = _EARLY_DISPATCH.get(spec.name, spec.handler)
+    return handler(args, root_dir)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     normalized_argv, diagnostics = _normalize_agent_argv(argv)
@@ -6858,12 +6891,4 @@ def main(argv: list[str] | None = None) -> int:
     if mode_error is not None:
         return _emit_mode_error(args, mode_error)
 
-    early_handler = _EARLY_DISPATCH.get(args.command)
-    if early_handler is not None:
-        return early_handler(args, root_dir)
-
-    model_handler = _MODEL_DISPATCH.get(args.command)
-    if model_handler is None:
-        print(f"Unknown command: {args.command}", file=sys.stderr)
-        return EXIT_ERROR
-    return _dispatch_model_command(args, root_dir, resolved_mode, model_handler)
+    return _dispatch_registered_command(args, root_dir, resolved_mode)
