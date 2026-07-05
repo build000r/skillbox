@@ -72,6 +72,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from . import machines as _machines
 from . import skill_visibility as _sv
 from .mcp_visibility import collect_mcp_audit
 
@@ -167,6 +168,254 @@ _ORIGIN_TO_CLASS = {
     "dangling": "prune",
     "unreadable": "prune",
 }
+
+
+# --- registry/category repo cohort resolution -------------------------------
+
+
+def _selector_tokens(values: list[str] | tuple[str, ...] | None) -> list[str]:
+    tokens: list[str] = []
+    for value in values or []:
+        for item in str(value or "").split(","):
+            token = item.strip()
+            if token and token not in tokens:
+                tokens.append(token)
+    return tokens
+
+
+def _registry_entry_id(entry: dict[str, Any]) -> str:
+    return str(entry.get("id") or entry.get("name") or entry.get("path") or "").strip()
+
+
+def _registry_entry_name(entry: dict[str, Any]) -> str:
+    return str(entry.get("name") or entry.get("id") or entry.get("path") or "").strip()
+
+
+def _registry_entry_buckets(entry: dict[str, Any]) -> list[str]:
+    buckets: list[str] = []
+    for key in ("bucket", "class", "category"):
+        value = str(entry.get(key) or "").strip()
+        if value and value not in buckets:
+            buckets.append(value)
+    raw_categories = entry.get("categories") or []
+    if isinstance(raw_categories, str):
+        raw_categories = [raw_categories]
+    iterable = raw_categories if isinstance(raw_categories, (list, tuple, set)) else []
+    for item in iterable:
+        value = str(item or "").strip()
+        if value and value not in buckets:
+            buckets.append(value)
+    return buckets
+
+
+def _registry_entries_by_key(entries: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    by_key: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        for key in (_registry_entry_id(entry), _registry_entry_name(entry)):
+            if key:
+                by_key.setdefault(key, entry)
+    return by_key
+
+
+def _current_machine_context() -> tuple[Any, str | None, list[str]]:
+    try:
+        config = _machines.load_machines_config()
+    except Exception:
+        return None, None, []
+    try:
+        machine_id = config.detect_machine_id()
+    except Exception:
+        machine_id = None
+    roots: list[str] = []
+    if machine_id:
+        try:
+            roots = _machines.repo_roots_for_machine(config, machine_id)
+        except Exception:
+            roots = []
+    return config, machine_id, roots
+
+
+def _path_under_any_root(path: str, roots: list[str]) -> bool:
+    if not roots:
+        return False
+    candidate = os.path.abspath(os.path.expanduser(os.path.expandvars(path)))
+    for root in roots:
+        root_path = os.path.abspath(os.path.expanduser(os.path.expandvars(str(root))))
+        try:
+            if os.path.commonpath([candidate, root_path]) == root_path:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _select_current_machine_repo_path(paths: list[str], roots: list[str]) -> str:
+    candidates = [str(Path(path).resolve()) for path in paths if str(path).strip()]
+    if not candidates:
+        return ""
+    existing_under_root = [
+        path for path in candidates
+        if Path(path).is_dir() and _path_under_any_root(path, roots)
+    ]
+    if existing_under_root:
+        return sorted(existing_under_root)[0]
+    under_root = [path for path in candidates if _path_under_any_root(path, roots)]
+    if under_root:
+        return sorted(under_root)[0]
+    existing = [path for path in candidates if Path(path).is_dir()]
+    if existing:
+        return sorted(existing)[0]
+    return sorted(candidates)[0]
+
+
+def _target_from_registry_resolution(
+    resolution: dict[str, Any],
+    *,
+    selector: str,
+    selector_kind: str,
+    roots: list[str],
+) -> dict[str, Any]:
+    paths = [str(path) for path in (resolution.get("paths") or []) if str(path).strip()]
+    repo_path = _select_current_machine_repo_path(paths, roots)
+    repo_id = str(resolution.get("id") or resolution.get("name") or selector).strip()
+    return {
+        "selector": selector,
+        "selector_kind": selector_kind,
+        "repo_id": repo_id,
+        "repo_name": str(resolution.get("name") or repo_id),
+        "bucket": str(resolution.get("bucket") or ""),
+        "declared_path": str(resolution.get("declared_path") or ""),
+        "resolved_paths": paths,
+        "path": repo_path,
+    }
+
+
+def _target_from_literal_category_path(
+    category_id: str,
+    raw_path: str,
+    *,
+    roots: list[str],
+) -> dict[str, Any]:
+    repo_path = _select_current_machine_repo_path([raw_path], roots)
+    return {
+        "selector": category_id,
+        "selector_kind": "category",
+        "repo_id": Path(repo_path).name if repo_path else str(raw_path),
+        "repo_name": Path(repo_path).name if repo_path else str(raw_path),
+        "bucket": category_id,
+        "declared_path": str(raw_path),
+        "resolved_paths": [repo_path] if repo_path else [],
+        "path": repo_path,
+    }
+
+
+def resolve_skill_default_targets(
+    model: dict[str, Any],
+    *,
+    repo_selectors: list[str] | tuple[str, ...] | None = None,
+    category_selectors: list[str] | tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    """Resolve ``skill default --repos/--category`` selectors to repo paths.
+
+    This is the small write-oriented companion to ``fleet converge``: it reuses
+    the same registry and machines.yaml-aware resolver that scope rules use, then
+    picks the current-machine spelling for each target repo. ``--repos`` names
+    registry ids/names; ``--category`` names registry buckets/classes and also
+    accepts policy ``project_categories`` as a fallback so existing local policy
+    cohorts remain addressable.
+    """
+    repos = _selector_tokens(list(repo_selectors or []))
+    categories = _selector_tokens(list(category_selectors or []))
+    if not repos and not categories:
+        return []
+
+    entries = _sv._load_registry_entries()
+    by_key = _registry_entries_by_key(entries)
+    _config, _machine_id, roots = _current_machine_context()
+
+    targets: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    for repo_ref in repos:
+        resolution = _sv._resolve_registry_repo_ref(repo_ref, model=model)
+        if resolution is None:
+            entry = by_key.get(repo_ref)
+            if entry is not None:
+                resolution = _sv._resolve_registry_repo_ref(_registry_entry_id(entry), model=model)
+        if resolution is None:
+            errors.append(f"repo selector {repo_ref!r} is not declared in registry/repos.yaml")
+            continue
+        targets.append(
+            _target_from_registry_resolution(
+                resolution,
+                selector=repo_ref,
+                selector_kind="repos",
+                roots=roots,
+            )
+        )
+
+    policy_categories = {
+        str(category.get("id") or ""): category
+        for category in _sv._project_categories(model)
+        if str(category.get("id") or "")
+    }
+    for category_id in categories:
+        matched = [
+            entry for entry in entries
+            if category_id in _registry_entry_buckets(entry)
+        ]
+        for entry in sorted(matched, key=lambda item: (_registry_entry_id(item), _registry_entry_name(item))):
+            key = _registry_entry_id(entry) or _registry_entry_name(entry)
+            resolution = _sv._resolve_registry_repo_ref(key, model=model)
+            if resolution is None:
+                continue
+            targets.append(
+                _target_from_registry_resolution(
+                    resolution,
+                    selector=category_id,
+                    selector_kind="category",
+                    roots=roots,
+                )
+            )
+        category = policy_categories.get(category_id)
+        if category is not None:
+            for raw_path in category.get("paths") or []:
+                targets.append(
+                    _target_from_literal_category_path(
+                        category_id,
+                        str(raw_path),
+                        roots=roots,
+                    )
+                )
+        if not matched and category is None:
+            errors.append(
+                f"category selector {category_id!r} matched no registry bucket/class "
+                "or policy project_categories entry"
+            )
+
+    if errors:
+        raise RuntimeError("; ".join(errors))
+
+    deduped: dict[str, dict[str, Any]] = {}
+    for target in targets:
+        path = str(target.get("path") or "").strip()
+        if not path:
+            continue
+        existing = deduped.get(path)
+        if existing is None:
+            item = dict(target)
+            item["selectors"] = [str(target.get("selector") or "")]
+            item["selector_kinds"] = [str(target.get("selector_kind") or "")]
+            deduped[path] = item
+            continue
+        selector = str(target.get("selector") or "")
+        if selector and selector not in existing["selectors"]:
+            existing["selectors"].append(selector)
+        kind = str(target.get("selector_kind") or "")
+        if kind and kind not in existing["selector_kinds"]:
+            existing["selector_kinds"].append(kind)
+
+    return sorted(deduped.values(), key=lambda item: str(item.get("path") or ""))
 
 
 def _manage_py() -> str:

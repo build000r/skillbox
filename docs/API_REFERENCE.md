@@ -927,7 +927,7 @@ None
 
 #### runtime.skill_default
 
-Set repo or operator-global skill defaults with a dry-run/apply unified diff.
+Set repo, cross-repo, or operator-global skill defaults with a dry-run/apply unified diff.
 
 - Surfaces: `cli`
 - Scopes: `cwd`
@@ -941,12 +941,14 @@ Set repo or operator-global skill defaults with a dry-run/apply unified diff.
 
 | Name | Type | Required |
 |---|---|---|
+| `category` | `string?` | no |
 | `cwd` | `string?` | no |
 | `default_action` | `enum[on\|off]` | yes |
 | `dry_run` | `boolean?` | no |
 | `format` | `enum[json\|text]?` | no |
 | `policy_path` | `string?` | no |
-| `scope` | `enum[repo\|global]` | yes |
+| `repos` | `string?` | no |
+| `scope` | `enum[repo\|global\|repos\|category]` | yes |
 | `skill_name` | `string` | yes |
 | `yes` | `boolean?` | no |
 
@@ -958,6 +960,9 @@ Set repo or operator-global skill defaults with a dry-run/apply unified diff.
 | `diff` | `string` | yes |
 | `noop` | `boolean` | yes |
 | `policy_path` | `string` | yes |
+| `residue` | `object[]?` | no |
+| `review` | `object?` | no |
+| `targets` | `object[]?` | no |
 | `validation` | `object[]?` | no |
 | `would_change` | `boolean` | yes |
 

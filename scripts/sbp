@@ -183,7 +183,9 @@ Skills:
   __WRAPPER__ skill on NAME           Durably pin NAME on for this repo
   __WRAPPER__ skill off NAME          Durably pin NAME off for this repo
   __WRAPPER__ skill default on NAME --repo --dry-run
-                                      Preview repo/global default policy edits
+  __WRAPPER__ skill default on NAME --repos app,app-server --dry-run
+  __WRAPPER__ skill default on NAME --category frontend --dry-run
+                                      Preview repo/cross-repo/global default policy edits
   __WRAPPER__ skill heal NAME         Resolve source, pin on, link, and print activation packet
   __WRAPPER__ skill sync --dry-run    Link cwd-required missing skills
   __WRAPPER__ skill prune --dry-run   Preview policy-violation unlinks
@@ -224,6 +226,7 @@ Examples:
   __WRAPPER__ skill on wiki --verify
   __WRAPPER__ skill off wiki --dry-run
   __WRAPPER__ skill default on wiki --repo --dry-run
+  __WRAPPER__ skill default on wiki --category frontend --dry-run
   __WRAPPER__ skill lint             Lint .skillbox/skill-overrides.yaml
   __WRAPPER__ mmdx review
   __WRAPPER__ mmdx skill review --no-open
@@ -405,14 +408,14 @@ skill_verbs = {
         "do_NOT": "Do not use toggleable as proof a flip already happened; run the returned command to mutate state.",
     },
     "default": {
-        "purpose": "Set repo or operator-global skill defaults with a reviewable unified diff.",
+        "purpose": "Set repo, cross-repo, or operator-global skill defaults with a reviewable unified diff.",
         "mutates": "repo_or_operator_policy",
         "links_disk": False,
         "returns_packet": False,
-        "scope": "repo or global",
+        "scope": "repo, registry cohort, or global",
         "survives_recalibrate": True,
-        "when_to_use": "Use --repo for a committed repo default; use --global only after dry-run review.",
-        "do_NOT": "Do not apply --global without --dry-run review and --yes; it writes operator skill-scope policy.",
+        "when_to_use": "Use --repo for one repo, --repos/--category for reviewed registry cohorts, and --global only after dry-run review.",
+        "do_NOT": "Do not apply --global without --dry-run review and --yes; do not apply --repos/--category before the exact dry-run marker exists.",
     },
 }
 payload = {
@@ -472,6 +475,7 @@ payload = {
             f"{wrapper} bulk <dir> <dir> --request '<prompt>' --dry-run --json",
             f"{wrapper} skill prune --dry-run",
             f"{wrapper} skill default on <skill> --repo --dry-run --format json",
+            f"{wrapper} skill default on <skill> --category frontend --dry-run --format json",
         ],
         "confirm_with_user_before": [f"{wrapper} down <profile> <service>"],
     },
@@ -513,13 +517,14 @@ Safe mutation pattern:
   ${wrapper_name} launch <dir> <dir> --request "..." --dry-run --json
   ${wrapper_name} recalibrate --auto-fix
   ${wrapper_name} skill default on <skill> --repo --dry-run --format json
+  ${wrapper_name} skill default on <skill> --category frontend --dry-run --format json
 
 Skill verb contract:
   Machine map: ${wrapper_name} capabilities --json | jq .skill_verbs
   Read-only: recalibrate, plan, lint, why
   Session handoff: activate (mutates=cwd-ephemeral, returns_packet=true)
   Durable repo pins: on, off, heal (survive recalibrate)
-  Durable defaults: default on/off <skill> --repo|--global (diff first; --global needs --yes)
+  Durable defaults: default on/off <skill> --repo|--repos IDS|--category NAME|--global (diff first; --global needs --yes)
   Link-only maintenance: add, move, remove, prune, sync
   Missing-skill fold: ${wrapper_name} recalibrate --auto-fix previews heal; add --yes to apply
 
