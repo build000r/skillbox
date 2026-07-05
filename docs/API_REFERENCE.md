@@ -7,7 +7,7 @@
 Generated from command registry ABI `2026-06-11+agent_ops_brain`.
 Do not edit by hand; run `python3 .env-manager/manage.py registry-docs --write`.
 
-Registry entries: 38.
+Registry entries: 39.
 
 ## Tier 1
 
@@ -1295,6 +1295,60 @@ python3 -m unittest tests.test_skill_visibility
 ```
 
 **Graph Nodes**: `skill`, `client`, `profile`
+
+#### runtime.state_backup
+
+Create, list, and verify checksummed tar.gz backups of SKILLBOX_STATE_ROOT.
+
+- Surfaces: `cli`
+- Scopes: None
+- Side effect: `local_write`
+- Risk: `medium`
+- Entrypoint: `manage.py`
+- Owner binary: None
+- MCP mirror: None
+
+**Inputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `action` | `enum[create\|list\|verify]?` | no |
+| `backup_root` | `string?` | no |
+| `format` | `enum[json\|text]?` | no |
+| `state_root` | `string?` | no |
+| `target` | `string?` | no |
+
+**Outputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `backup` | `object?` | no |
+| `backups` | `object[]?` | no |
+| `checks` | `object[]?` | no |
+| `next_actions` | `string[]?` | no |
+| `ok` | `boolean` | yes |
+
+**Examples**
+
+```bash
+python3 .env-manager/manage.py state-backup list --format json
+```
+
+```bash
+python3 .env-manager/manage.py state-backup create --format json
+```
+
+```bash
+python3 .env-manager/manage.py state-backup verify <manifest.json> --format json
+```
+
+**Validation**
+
+```bash
+python3 -m unittest tests.test_state_backup
+```
+
+**Graph Nodes**: `command`
 
 #### runtime.status
 
