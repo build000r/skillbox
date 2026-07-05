@@ -11,7 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-BUNDLE_FILES = ("clipcopy", "clippaste", "tmux.conf")
+BUNDLE_FILES = ("clipcopy", "clippaste", "tmux.conf", "xterm-ghostty.tic")
+TERMINFO_BUNDLE_NAME = "xterm-ghostty.tic"
 BUNDLE_EXECUTABLES = ("clipcopy", "clippaste", "pbcopy", "clipimg-put")
 TMUX_MARKER = "clipboard.tmux.conf"
 CONFIG_SUBDIR = ".config/skillbox"
@@ -110,16 +111,35 @@ def default_shell_probe(command: str) -> bool:
         return False
 
 
+def static_conference_route(
+    hosts: dict[str, Any] | None = None,
+    root: Path | None = None,
+) -> ConferenceRoute:
+    """Deterministic conference target for plan/help/dry-run surfaces."""
+    data = hosts or load_hosts(root)
+    direct = data["conference_routing"]["direct_target"]
+    return ConferenceRoute(
+        transport="ssh",
+        ssh_target=direct,
+        clipboard_capable=True,
+        reason="static_direct_wsl_preferred",
+    )
+
+
 def select_conference_route(
     probe_reachable: Callable[[str], bool] | None = None,
     probe_mosh: Callable[[str], bool] | None = None,
     hosts: dict[str, Any] | None = None,
     root: Path | None = None,
+    *,
+    live_probe: bool = True,
 ) -> ConferenceRoute:
     data = hosts or load_hosts(root)
     routing = data["conference_routing"]
     direct = routing["direct_target"]
     fallback = routing["fallback_target"]
+    if not live_probe:
+        return static_conference_route(hosts=data, root=root)
     reachable = probe_reachable or default_shell_probe
     mosh_ok = probe_mosh or default_shell_probe
 
@@ -253,10 +273,12 @@ def plan_remote_bootstrap(
     dry_run: bool = False,
     root: Path | None = None,
     ssh_target_override: str | None = None,
+    live_probe: bool | None = None,
 ) -> InstallPlan:
     resolved = resolve_profile(profile, target=target, root=root)
+    probe = live_probe if live_probe is not None else not dry_run
     if profile == "conference1" and not target:
-        route = select_conference_route(root=root)
+        route = select_conference_route(root=root, live_probe=probe)
         if route.used_fallback:
             resolved = resolve_profile("conference1-fallback", root=root)
         ssh_target = route.ssh_target
@@ -276,8 +298,8 @@ def plan_remote_bootstrap(
             f"ssh {ssh_target}: install helpers to ~/.local/bin",
             f"ssh {ssh_target}: install tmux fragment to ~/.config/skillbox/clipboard.tmux.conf",
             f"ssh {ssh_target}: append idempotent source line to ~/.tmux.conf",
-            f"ssh {ssh_target}: install xterm-ghostty terminfo (infocmp -x xterm-ghostty | tic -x -)",
-            f"ssh {ssh_target}: verify infocmp -x xterm-ghostty",
+            f"ssh {ssh_target}: install xterm-ghostty terminfo from bundled {TERMINFO_BUNDLE_NAME}",
+            f"ssh {ssh_target}: verify infocmp -x xterm-ghostty (warn if unavailable)",
             f"ssh {ssh_target}: verify clipcopy executable and tmux fragment present",
         ]
     )
@@ -315,9 +337,20 @@ if ! grep -Fq "$marker" "$tmux_conf"; then
     printf '%s\\n' '{SOURCE_LINE}'
   }} >>"$tmux_conf"
 fi
-if command -v infocmp >/dev/null 2>&1 && command -v tic >/dev/null 2>&1; then
+terminfo_ok=0
+if command -v infocmp >/dev/null 2>&1 && infocmp -x xterm-ghostty >/dev/null 2>&1; then
+  terminfo_ok=1
+fi
+if [ "$terminfo_ok" = "0" ] && command -v tic >/dev/null 2>&1 && [ -f "$bundle_dir/{TERMINFO_BUNDLE_NAME}" ]; then
+  tic -x "$bundle_dir/{TERMINFO_BUNDLE_NAME}" 2>/dev/null || true
+  if command -v infocmp >/dev/null 2>&1 && infocmp -x xterm-ghostty >/dev/null 2>&1; then
+    terminfo_ok=1
+  fi
+fi
+if [ "$terminfo_ok" = "0" ] && command -v tic >/dev/null 2>&1 && command -v infocmp >/dev/null 2>&1; then
   if infocmp -x xterm-ghostty >/dev/null 2>&1; then
     infocmp -x xterm-ghostty | tic -x - 2>/dev/null || true
+    terminfo_ok=1
   fi
 fi
 if command -v tmux >/dev/null 2>&1; then
@@ -325,8 +358,8 @@ if command -v tmux >/dev/null 2>&1; then
 fi
 test -x "$bin_dir/clipcopy"
 test -f "$config_dir/clipboard.tmux.conf"
-if command -v infocmp >/dev/null 2>&1; then
-  infocmp -x xterm-ghostty >/dev/null
+if [ "$terminfo_ok" = "0" ]; then
+  echo "warning: xterm-ghostty terminfo unavailable after bundled install" >&2
 fi
 echo "skillbox clipboard bootstrap: ok on $(hostname)"
 """
@@ -345,9 +378,73 @@ def make_bundle_tar(root: Path | None = None) -> bytes:
             info = tarfile.TarInfo(name=path.name)
             data = path.read_bytes()
             info.size = len(data)
-            info.mode = 0o755 if path.name != "tmux.conf" else 0o644
+            if path.name in {"tmux.conf", TERMINFO_BUNDLE_NAME}:
+                info.mode = 0o644
+            else:
+                info.mode = 0o755
             archive.addfile(info, io.BytesIO(data))
     return buffer.getvalue()
+
+
+def run_remote_install(
+    home: Path,
+    *,
+    root: Path | None = None,
+    bundle: bytes | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Execute remote_install_script against a local HOME (fixture/e2e path)."""
+    import base64
+
+    resolved_root = root or repo_root()
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
+    run_env["HOME"] = str(home)
+    run_env["SKILLBOX_CLIPBOARD_BUNDLE_B64"] = base64.b64encode(
+        bundle if bundle is not None else make_bundle_tar(resolved_root)
+    ).decode()
+    home.mkdir(parents=True, exist_ok=True)
+    return subprocess.run(
+        ["bash", "-s"],
+        input=remote_install_script(),
+        env=run_env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+
+def apply_remote_via_ssh(
+    ssh_target: str,
+    *,
+    root: Path | None = None,
+    runner: Callable[..., subprocess.CompletedProcess[bytes]] | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run remote install over SSH; runner is injectable for tests."""
+    import base64
+
+    resolved_root = root or repo_root()
+    bundle_b64 = base64.b64encode(make_bundle_tar(resolved_root)).decode()
+    run = runner or subprocess.run
+    return run(
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=15",
+            ssh_target,
+            f"SKILLBOX_CLIPBOARD_BUNDLE_B64={bundle_b64}",
+            "bash",
+            "-s",
+        ],
+        input=remote_install_script().encode("utf-8"),
+        capture_output=True,
+        check=False,
+        timeout=120,
+    )
 
 
 def verify_local_install(home: Path) -> list[str]:
