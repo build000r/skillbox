@@ -12,7 +12,7 @@ version: 2
 # `sbp skill activate <skill> --cwd <repo>`, not installed globally.
 skill_repos:
   # Public multi-skill repo — pick the policy-allowed default set
-  - repo: example/skills
+  - repo: build000r/skills
     ref: main
     pick:
       - divide-and-conquer

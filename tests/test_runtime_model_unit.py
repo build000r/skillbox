@@ -143,6 +143,23 @@ class RuntimeModelUnitTests(unittest.TestCase):
             self.assertEqual(translated["SKILLBOX_CLIENTS_ROOT"], str((repo / "workspace" / "clients").resolve()))
             self.assertEqual(translated["SKILLBOX_MONOSERVER_ROOT"], str(repo.parent.resolve()))
 
+    def test_translated_runtime_env_maps_default_home_root_to_state_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            self._write_runtime_fixture(repo)
+            runtime_env = runtime_model_module.load_runtime_env(repo)
+
+            translated = MANAGE_MODULE.translated_runtime_env(repo, runtime_env)
+
+            self.assertEqual(
+                translated["SKILLBOX_HOME_ROOT"],
+                str((repo / ".skillbox-state" / "home").resolve()),
+            )
+            self.assertEqual(
+                translated["SKILLBOX_SWIMMERS_INSTALL_DIR"],
+                str((repo / ".skillbox-state" / "home" / ".local" / "bin").resolve()),
+            )
+
     def test_load_runtime_env_infers_monoserver_host_root_from_host_native_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir).resolve()
