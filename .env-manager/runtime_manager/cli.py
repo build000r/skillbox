@@ -49,6 +49,12 @@ from .pressure_report import *
 from .rch_report import *
 from .rch_adapter import *
 from .sbh_report import *
+from .state_backup import (
+    create_state_backup,
+    list_state_backups,
+    state_backup_text_lines,
+    verify_state_backup,
+)
 from .evidence import *
 from .forge import *
 from .swimmers_launch import launch_swimmers_batch, swimmers_launch_text_lines
@@ -481,6 +487,44 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_profile_arg(status_parser)
     _add_client_arg(status_parser)
     _add_cwd_arg(status_parser)
+
+    def _add_state_backup_common_args(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument("--format", choices=("text", "json"), default="text")
+        command_parser.add_argument(
+            "--state-root",
+            default=None,
+            help="Override SKILLBOX_STATE_ROOT. Defaults to the resolved persistence state root.",
+        )
+        command_parser.add_argument(
+            "--backup-root",
+            default=None,
+            help="Override SKILLBOX_BACKUP_ROOT. Must be outside the state root.",
+        )
+
+    state_backup_parser = subparsers.add_parser(
+        "state-backup",
+        help="Create, list, or verify tar.gz backups of SKILLBOX_STATE_ROOT.",
+    )
+    _add_state_backup_common_args(state_backup_parser)
+    state_backup_subparsers = state_backup_parser.add_subparsers(dest="state_backup_action")
+    state_backup_create_parser = state_backup_subparsers.add_parser(
+        "create",
+        help="Create a tar.gz state-root backup and manifest.",
+    )
+    _add_state_backup_common_args(state_backup_create_parser)
+    state_backup_list_parser = state_backup_subparsers.add_parser("list", help="List backups in SKILLBOX_BACKUP_ROOT.")
+    _add_state_backup_common_args(state_backup_list_parser)
+    state_backup_verify_parser = state_backup_subparsers.add_parser(
+        "verify",
+        help="Verify one backup manifest or archive.",
+    )
+    _add_state_backup_common_args(state_backup_verify_parser)
+    state_backup_verify_parser.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help="Manifest path or archive path. Defaults to the newest listed backup.",
+    )
 
     ports_parser = subparsers.add_parser(
         "ports",
@@ -3221,6 +3265,7 @@ def _capabilities_payload(root_dir: Path, *, compact: bool = False) -> dict[str,
         },
         "env": {
             "SKILLBOX_STATE_ROOT": "Persistent runtime state root.",
+            "SKILLBOX_BACKUP_ROOT": "Destination directory for state-backup archives.",
             "SKILLBOX_MONOSERVER_ROOT": "Host or container repo universe root.",
             "SKILLBOX_CLIENTS_ROOT": "Runtime client overlay root.",
             "SKILLBOX_RCH_BIN": "Optional RCH CLI path for build-offload checks.",
@@ -3270,6 +3315,8 @@ def _safe_first_try_command(name: str) -> str:
         return "manage.py distribution-preview --manifest-path <manifest.json> --public-key <public-key.pem> --format json"
     if name in {"distribution-rollback"}:
         return "manage.py distribution-rollback --list --skill <skill> --format json"
+    if name == "state-backup":
+        return "manage.py state-backup list --format json"
     if name in {"status", "render", "doctor", "skills", "skill-audit", "mcp-audit"}:
         return f"manage.py {name} --format json"
     if name == "pressure-report":
@@ -6586,6 +6633,45 @@ def _handle_logs(args: argparse.Namespace, root_dir: Path, model: dict[str, Any]
     return EXIT_OK
 
 
+def _handle_state_backup(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    action = str(getattr(args, "state_backup_action", None) or "list")
+    backup_root = getattr(args, "backup_root", None)
+    if action == "create":
+        payload = create_state_backup(
+            state_root=getattr(args, "state_root", None),
+            backup_root=backup_root,
+            model=model,
+        )
+    elif action == "verify":
+        target = getattr(args, "target", None)
+        if not target:
+            listed = list_state_backups(backup_root=backup_root)
+            backups = listed.get("backups") or []
+            target = str((backups[0] or {}).get("manifest") or "") if backups else ""
+        if target:
+            payload = verify_state_backup(target)
+        else:
+            payload = {
+                "ok": False,
+                "action": "verify",
+                "error": {
+                    "type": "state_backup_not_found",
+                    "message": "No backups found to verify.",
+                    "recoverable": True,
+                },
+                "next_actions": ["state-backup create --format json"],
+                "checks": [],
+            }
+    else:
+        payload = list_state_backups(backup_root=backup_root)
+
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print("\n".join(state_backup_text_lines(payload)))
+    return EXIT_OK if payload.get("ok") else EXIT_ERROR
+
+
 _MODEL_COMMANDS: tuple[tuple[str, ModelCommandHandler, str], ...] = (
     ("render", _handle_render, "Print the resolved runtime graph."),
     ("ports", _handle_ports, "List or resolve the active port registry."),
@@ -6593,6 +6679,7 @@ _MODEL_COMMANDS: tuple[tuple[str, ModelCommandHandler, str], ...] = (
     ("context", _handle_context, "Render managed agent context files."),
     ("doctor", _handle_doctor, "Validate runtime graph, filesystem readiness, and skill integrity."),
     ("status", _handle_status, "Summarize repo, artifact, skill, service, log, and check state."),
+    ("state-backup", _handle_state_backup, "Create, list, or verify state-root backups."),
     ("skills", _handle_skills, "Show effective skill availability."),
     ("skill-audit", _handle_skill_audit, "Audit skill scope policy across repos."),
     ("mcp-audit", _handle_mcp_audit, "Audit Claude and Codex MCP config parity."),
