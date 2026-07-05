@@ -107,6 +107,9 @@ curl -fsS http://127.0.0.1:8000/v1/runtime
 make shell
 ```
 
+For a captured zero-to-focused-client walkthrough with real expected output,
+see [examples/first-box-demo.md](examples/first-box-demo.md).
+
 What that gives you:
 
 - a validated box model
@@ -1340,7 +1343,7 @@ What v1 does not do:
 version: 2
 
 skill_repos:
-  - repo: example/skills
+  - repo: build000r/skills
     ref: main
     pick: [ask-cascade, audit-plans, build-vs-clone, commit, crap, describe, divide-and-conquer, domain-planner, domain-reviewer, domain-scaffolder, mutate, oss-doc-audit, reproduce, skill-issue]
 

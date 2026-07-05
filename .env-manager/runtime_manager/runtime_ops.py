@@ -2656,6 +2656,12 @@ def translated_runtime_env(root_dir: Path, runtime_env: dict[str, str]) -> dict[
         return not is_runtime_absolute_path(raw_text)
 
     def _translate_via_host_root_override(raw_value: str) -> str | None:
+        home_prefix = "/home/sandbox"
+        if raw_value == home_prefix or raw_value.startswith(home_prefix + "/"):
+            state_root = str(runtime_env.get("SKILLBOX_STATE_ROOT") or "./.skillbox-state").strip()
+            home_root = host_path_to_absolute_path(root_dir, state_root) / "home"
+            relative = raw_value[len(home_prefix):].lstrip("/")
+            return str((home_root / relative).resolve())
         root_bindings = (
             ("/workspace", "SKILLBOX_WORKSPACE_ROOT"),
             ("/home/sandbox", "SKILLBOX_HOME_ROOT"),
