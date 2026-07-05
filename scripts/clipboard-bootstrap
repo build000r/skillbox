@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Skillbox clipboard bootstrap: install helpers, tmux fragment, and terminfo.
+set -euo pipefail
+
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd -P)"
+ROOT_DIR="${SKILLBOX_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd -P)}"
+
+exec python3 "$SCRIPT_DIR/lib/clipboard_bootstrap_cli.py" --root "$ROOT_DIR" "$@"

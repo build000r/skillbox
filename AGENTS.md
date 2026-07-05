@@ -36,6 +36,7 @@ Main entry points:
 - Runtime services: `make runtime-up CLIENT=<id> PROFILE=<name>`, `make runtime-down CLIENT=<id> PROFILE=<name>`, `make runtime-status`
 - Box lifecycle: `make box-up BOX=<id>`, `make box-down BOX=<id>`, `make box-status`, `make box-list`, `make box-ssh BOX=<id>`
 - Release/upgrade scripts: `install.sh`, `scripts/06-upgrade-release.sh`, `scripts/07-build-and-push-binary.sh`; verify arguments before use.
+- Clipboard bootstrap: `scripts/clipboard-bootstrap --profile local|d3|sweet|jeremy|conference1 [--dry-run|--apply-remote]`; bundle in `scripts/clipboard/`; closeout `scripts/clipboard-closeout.sh`; design `docs/clipboard-bootstrap.md`.
 - CI: `.github/workflows/ci.yml` runs Ruff, ShellCheck, compose config validation, `python3 scripts/04-reconcile.py render`, and the Python unittest matrix on push/PR.
 - Python lint: `python3 -m ruff check .`
 - Shell lint: `shellcheck --severity=warning scripts/*.sh install.sh`
@@ -46,7 +47,7 @@ Main entry points:
 - `workspace/sandbox.yaml`, `workspace/dependencies.yaml`, and `workspace/persistence.yaml` feed outer validation.
 - `README.md` is the short front door. Moved long-form README content lives in
   `docs/runtime-graph.md`, `docs/clients.md`, `docs/skills.md`,
-  `docs/operations.md`, `docs/troubleshooting.md`, and `docs/faq.md`.
+  `docs/operations.md`, `docs/clipboard-bootstrap.md`, `docs/troubleshooting.md`, and `docs/faq.md`.
 - `docs/ARCHITECTURE.md` is the maintainer-grade system map for layers,
   manifests, runtime modules, data flow, state layout, and extension seams.
 - `.env.example` documents supported env vars. `.env` and `.env.box` are local

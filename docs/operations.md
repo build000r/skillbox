@@ -539,3 +539,42 @@ and `dcg` on top of that.
 
 `scripts/operator_mcp_server.py` runs on the operator machine and provides
 fleet lifecycle tools. See the [Fleet Management](operations.md#fleet-management) section.
+
+## Clipboard bootstrap
+
+Skillbox owns OSC52 clipboard integration for operator Mac + Ghostty, SSH/mosh
+remotes, nested tmux, and Conference1 direct WSL. Source bundle:
+`scripts/clipboard/`. Design contract: `docs/clipboard-bootstrap.md`.
+
+One-command bootstrap:
+
+```bash
+# Local operator Mac
+scripts/clipboard-bootstrap --profile local
+
+# Remote d3 portfolio devbox (plan)
+scripts/clipboard-bootstrap --profile d3 --dry-run
+
+# Apply on remote host
+scripts/clipboard-bootstrap --profile d3 --apply-remote
+
+# Generic target
+scripts/clipboard-bootstrap --profile generic --target user@host --dry-run
+```
+
+Usage after install:
+
+- Text copy: `printf 'hello\n' | clipcopy` or tmux copy-mode `y` / Enter / mouse drag
+- Linux `pbcopy` shim on remotes delegates to `clipcopy`
+- Image transfer (Darwin only): screenshot then `clipimg-put d|s|j|c` — pastes the
+  **remote file path**, not binary image data through the terminal
+- Conference1: prefer direct `worker@conference1-wsl`; `conference1-ssh` Windows
+  wrapper is OSC52-hostile fallback only
+
+Proof and regression:
+
+```bash
+scripts/clipboard-closeout.sh
+python3 -m unittest tests.test_clipboard_bootstrap -v
+scripts/clipboard-proof.sh --live   # operator Mac + Ghostty only
+```
