@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import calendar
+import os
 
 from .shared import *
 from .validation import *
 from .runtime_ops import *
 from .context_rendering import *
 from .text_renderers import print_local_runtime_error_text
+from .state_backup import DRILL_EVIDENCE_REL
 from .parity_report import collect_dev_prod_parity_report, parity_report_evidence_summary
 from lib.paths import BoxPath, PathTranslator
 from lib.runtime_model import (
@@ -2382,6 +2384,67 @@ def _stewardship_pressure_evidence(status_payload: dict[str, Any]) -> dict[str, 
     }
 
 
+def _stewardship_state_root(model: dict[str, Any]) -> Path | None:
+    raw = str((model.get("storage") or {}).get("state_root") or os.environ.get("SKILLBOX_STATE_ROOT") or "").strip()
+    if not raw:
+        return None
+    return Path(os.path.expandvars(os.path.expanduser(raw))).resolve()
+
+
+def _stewardship_backup_restore_evidence(model: dict[str, Any], now: float) -> dict[str, Any]:
+    state_root = _stewardship_state_root(model)
+    if state_root is None:
+        return {
+            "status": "not_assessed",
+            "ok": False,
+            "last_drill": None,
+            "age_days": None,
+            "reason": "No state root is available for backup drill evidence.",
+        }
+    evidence_path = state_root / DRILL_EVIDENCE_REL
+    status, payload, error = _load_optional_json_object(evidence_path)
+    base: dict[str, Any] = {
+        "status": "not_assessed",
+        "ok": False,
+        "path": str(evidence_path),
+        "last_drill": None,
+        "age_days": None,
+    }
+    if status == "missing":
+        base["reason"] = "No state-backup drill evidence has been written yet."
+        return base
+    if error:
+        base["reason"] = f"State-backup drill evidence is unreadable: {error}"
+        return base
+    if not payload:
+        base["reason"] = "State-backup drill evidence is empty."
+        return base
+
+    last_drill = str(payload.get("drilled_at") or "").strip()
+    drilled_at = _parse_utc_z(last_drill)
+    age_days = None if drilled_at is None else round(max(0.0, now - drilled_at) / 86400.0, 2)
+    ok = bool(payload.get("ok"))
+    assessed = age_days is not None and age_days <= 30.0
+    base.update(
+        {
+            "status": "ready" if ok and assessed else ("failed" if assessed else "not_assessed"),
+            "ok": ok,
+            "last_drill": last_drill or None,
+            "age_days": age_days,
+            "manifest": payload.get("manifest"),
+            "archive": payload.get("archive"),
+            "checks": payload.get("checks") or [],
+        }
+    )
+    if drilled_at is None:
+        base["reason"] = "State-backup drill evidence has no parseable drilled_at timestamp."
+    elif age_days is not None and age_days > 30.0:
+        base["reason"] = "Latest state-backup drill is older than 30 days."
+    elif not ok:
+        base["reason"] = "Latest state-backup drill failed."
+    return base
+
+
 def _stewardship_doctor_check_payload(result: CheckResult) -> dict[str, Any]:
     return {
         "status": result.status,
@@ -2410,21 +2473,26 @@ def _stewardship_doctor_evidence(model: dict[str, Any], root_dir: Path) -> dict[
     }
 
 
-def _stewardship_not_assessed() -> list[dict[str, str]]:
-    return [
-        {
-            "id": "backup-recovery",
-            "status": "not_assessed",
-            "reason": "No first-class backup or restore drill evidence is declared in the public runtime graph yet.",
-            "next_action": "Add a restore-drill check before claiming recovery readiness.",
-        },
+def _stewardship_not_assessed(backup_restore: dict[str, Any] | None = None) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    if (backup_restore or {}).get("status") == "not_assessed":
+        items.append(
+            {
+                "id": "backup-recovery",
+                "status": "not_assessed",
+                "reason": str((backup_restore or {}).get("reason") or "No state-backup drill evidence is available."),
+                "next_action": "Run state-backup drill --format json before claiming recovery readiness.",
+            }
+        )
+    items.extend([
         {
             "id": "cost-review",
             "status": "not_assessed",
             "reason": "No cost telemetry or budget review evidence is declared in the public runtime graph yet.",
             "next_action": "Add a cost snapshot source before claiming spend stewardship.",
         },
-    ]
+    ])
+    return items
 
 
 def _stewardship_risk(
@@ -2752,6 +2820,7 @@ def _build_stewardship_report(root_dir: Path, cid: str, profiles: list[str]) -> 
     sessions = _stewardship_session_evidence(live)
     parity = _stewardship_parity_evidence(status_payload)
     pressure = _stewardship_pressure_evidence(status_payload)
+    backup_restore = _stewardship_backup_restore_evidence(filtered_model, now)
     dev_prod_parity = _stewardship_dev_prod_parity_evidence(filtered_model, cid)
     doctor = _stewardship_doctor_evidence(filtered_model, root_dir)
     risks = _stewardship_risks(
@@ -2783,6 +2852,7 @@ def _build_stewardship_report(root_dir: Path, cid: str, profiles: list[str]) -> 
             "pulse": pulse,
             "doctor": doctor,
             "pressure_advisory": pressure,
+            "backup_restore": backup_restore,
             "sessions": sessions,
             "parity_ledger": parity,
             "dev_prod_parity": dev_prod_parity,
@@ -2799,7 +2869,7 @@ def _build_stewardship_report(root_dir: Path, cid: str, profiles: list[str]) -> 
             ],
         },
         "risks": risks,
-        "not_assessed": _stewardship_not_assessed(),
+        "not_assessed": _stewardship_not_assessed(backup_restore),
         "next_recommendation": next_recommendation,
         "next_actions": _stewardship_next_actions(
             cid,
@@ -2870,6 +2940,7 @@ def _stewardship_markdown_evidence(payload: dict[str, Any]) -> str:
     sessions = evidence.get("sessions") or {}
     parity = evidence.get("parity_ledger") or {}
     dev_prod_parity = evidence.get("dev_prod_parity") or {}
+    backup_restore = evidence.get("backup_restore") or {}
     doctor = evidence.get("doctor") or {}
     doctor_counts = doctor.get("counts") or {}
     pressure = evidence.get("pressure_advisory") or {}
@@ -2886,6 +2957,7 @@ def _stewardship_markdown_evidence(payload: dict[str, Any]) -> str:
         f"- Recent log errors: {recent_errors.get('count', 0)}",
         f"- Doctor: {doctor.get('status', 'unknown')} ({doctor_counts.get('fail', 0)} failing)",
         f"- Pressure: {pressure_disk.get('pressure_level', 'unknown')} ({pressure_disk.get('free_gib')}GiB free); target={pressure_target.get('id')}; rch={pressure_rch.get('state')}; sbh={pressure_sbh.get('state')}",
+        f"- Backup/restore: {backup_restore.get('status', 'not_assessed')} ok={bool(backup_restore.get('ok'))} last_drill={backup_restore.get('last_drill') or '-'} age_days={backup_restore.get('age_days')}",
         f"- Dev/prod parity: {dev_prod_parity.get('status', 'not_assessed')} ({dev_prod_parity.get('blocking_count', 0)} blocking)",
         "- Port guard: "
         f"hook {port_sentinel.get('hook_blocks', 0)}, "

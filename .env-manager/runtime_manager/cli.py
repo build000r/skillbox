@@ -51,7 +51,9 @@ from .rch_adapter import *
 from .sbh_report import *
 from .state_backup import (
     create_state_backup,
+    drill_state_backup,
     list_state_backups,
+    restore_state_backup,
     state_backup_text_lines,
     verify_state_backup,
 )
@@ -488,22 +490,24 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_client_arg(status_parser)
     _add_cwd_arg(status_parser)
 
-    def _add_state_backup_common_args(command_parser: argparse.ArgumentParser) -> None:
-        command_parser.add_argument("--format", choices=("text", "json"), default="text")
+    def _add_state_backup_common_args(command_parser: argparse.ArgumentParser, *, subcommand: bool = False) -> None:
+        default_format: str | argparse._SuppressClass = argparse.SUPPRESS if subcommand else "text"
+        default_path: None | argparse._SuppressClass = argparse.SUPPRESS if subcommand else None
+        command_parser.add_argument("--format", choices=("text", "json"), default=default_format)
         command_parser.add_argument(
             "--state-root",
-            default=None,
+            default=default_path,
             help="Override SKILLBOX_STATE_ROOT. Defaults to the resolved persistence state root.",
         )
         command_parser.add_argument(
             "--backup-root",
-            default=None,
+            default=default_path,
             help="Override SKILLBOX_BACKUP_ROOT. Must be outside the state root.",
         )
 
     state_backup_parser = subparsers.add_parser(
         "state-backup",
-        help="Create, list, or verify tar.gz backups of SKILLBOX_STATE_ROOT.",
+        help="Create, list, verify, drill, or restore tar.gz backups of SKILLBOX_STATE_ROOT.",
     )
     _add_state_backup_common_args(state_backup_parser)
     state_backup_subparsers = state_backup_parser.add_subparsers(dest="state_backup_action")
@@ -511,19 +515,46 @@ def _build_parser() -> argparse.ArgumentParser:
         "create",
         help="Create a tar.gz state-root backup and manifest.",
     )
-    _add_state_backup_common_args(state_backup_create_parser)
+    _add_state_backup_common_args(state_backup_create_parser, subcommand=True)
     state_backup_list_parser = state_backup_subparsers.add_parser("list", help="List backups in SKILLBOX_BACKUP_ROOT.")
-    _add_state_backup_common_args(state_backup_list_parser)
+    _add_state_backup_common_args(state_backup_list_parser, subcommand=True)
     state_backup_verify_parser = state_backup_subparsers.add_parser(
         "verify",
         help="Verify one backup manifest or archive.",
     )
-    _add_state_backup_common_args(state_backup_verify_parser)
+    _add_state_backup_common_args(state_backup_verify_parser, subcommand=True)
     state_backup_verify_parser.add_argument(
         "target",
         nargs="?",
         default=None,
         help="Manifest path or archive path. Defaults to the newest listed backup.",
+    )
+    state_backup_drill_parser = state_backup_subparsers.add_parser(
+        "drill",
+        help="Extract the newest backup into a temp dir and write drill evidence.",
+    )
+    _add_state_backup_common_args(state_backup_drill_parser, subcommand=True)
+    state_backup_drill_parser.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help="Manifest path or archive path. Defaults to the newest listed backup.",
+    )
+    state_backup_restore_parser = state_backup_subparsers.add_parser(
+        "restore",
+        help="Restore one backup after guardrails and an automatic safety backup.",
+    )
+    _add_state_backup_common_args(state_backup_restore_parser, subcommand=True)
+    state_backup_restore_parser.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help="Manifest path or archive path. Defaults to the newest listed backup.",
+    )
+    state_backup_restore_parser.add_argument(
+        "--i-understand-data-loss",
+        action="store_true",
+        help="Required acknowledgement for destructive restore.",
     )
 
     ports_parser = subparsers.add_parser(
@@ -6662,6 +6693,21 @@ def _handle_state_backup(args: argparse.Namespace, root_dir: Path, model: dict[s
                 "next_actions": ["state-backup create --format json"],
                 "checks": [],
             }
+    elif action == "drill":
+        payload = drill_state_backup(
+            getattr(args, "target", None),
+            state_root=getattr(args, "state_root", None),
+            backup_root=backup_root,
+            model=model,
+        )
+    elif action == "restore":
+        payload = restore_state_backup(
+            getattr(args, "target", None),
+            state_root=getattr(args, "state_root", None),
+            backup_root=backup_root,
+            model=model,
+            i_understand_data_loss=bool(getattr(args, "i_understand_data_loss", False)),
+        )
     else:
         payload = list_state_backups(backup_root=backup_root)
 
@@ -6679,7 +6725,7 @@ _MODEL_COMMANDS: tuple[tuple[str, ModelCommandHandler, str], ...] = (
     ("context", _handle_context, "Render managed agent context files."),
     ("doctor", _handle_doctor, "Validate runtime graph, filesystem readiness, and skill integrity."),
     ("status", _handle_status, "Summarize repo, artifact, skill, service, log, and check state."),
-    ("state-backup", _handle_state_backup, "Create, list, or verify state-root backups."),
+    ("state-backup", _handle_state_backup, "Create, list, verify, drill, or restore state-root backups."),
     ("skills", _handle_skills, "Show effective skill availability."),
     ("skill-audit", _handle_skill_audit, "Audit skill scope policy across repos."),
     ("mcp-audit", _handle_mcp_audit, "Audit Claude and Codex MCP config parity."),

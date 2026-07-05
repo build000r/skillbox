@@ -7,7 +7,7 @@
 Generated from command registry ABI `2026-06-11+agent_ops_brain`.
 Do not edit by hand; run `python3 .env-manager/manage.py registry-docs --write`.
 
-Registry entries: 39.
+Registry entries: 41.
 
 ## Tier 1
 
@@ -1312,9 +1312,10 @@ Create, list, and verify checksummed tar.gz backups of SKILLBOX_STATE_ROOT.
 
 | Name | Type | Required |
 |---|---|---|
-| `action` | `enum[create\|list\|verify]?` | no |
+| `action` | `enum[create\|list\|verify\|drill\|restore]?` | no |
 | `backup_root` | `string?` | no |
 | `format` | `enum[json\|text]?` | no |
+| `i_understand_data_loss` | `boolean?` | no |
 | `state_root` | `string?` | no |
 | `target` | `string?` | no |
 
@@ -1325,8 +1326,10 @@ Create, list, and verify checksummed tar.gz backups of SKILLBOX_STATE_ROOT.
 | `backup` | `object?` | no |
 | `backups` | `object[]?` | no |
 | `checks` | `object[]?` | no |
+| `evidence_path` | `string?` | no |
 | `next_actions` | `string[]?` | no |
 | `ok` | `boolean` | yes |
+| `safety_backup` | `object?` | no |
 
 **Examples**
 
@@ -1340,6 +1343,99 @@ python3 .env-manager/manage.py state-backup create --format json
 
 ```bash
 python3 .env-manager/manage.py state-backup verify <manifest.json> --format json
+```
+
+```bash
+python3 .env-manager/manage.py state-backup drill --format json
+```
+
+**Validation**
+
+```bash
+python3 -m unittest tests.test_state_backup
+```
+
+**Graph Nodes**: `command`
+
+#### runtime.state_backup_drill
+
+Extract the newest state backup into a temp dir and write restore-drill evidence.
+
+- Surfaces: `cli`
+- Scopes: None
+- Side effect: `local_write`
+- Risk: `low`
+- Entrypoint: `manage.py`
+- Owner binary: None
+- MCP mirror: None
+
+**Inputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `backup_root` | `string?` | no |
+| `format` | `enum[json\|text]?` | no |
+| `state_root` | `string?` | no |
+| `target` | `string?` | no |
+
+**Outputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `checks` | `object[]` | yes |
+| `evidence_path` | `string` | yes |
+| `manifest` | `string` | yes |
+| `ok` | `boolean` | yes |
+
+**Examples**
+
+```bash
+python3 .env-manager/manage.py state-backup drill --format json
+```
+
+**Validation**
+
+```bash
+python3 -m unittest tests.test_state_backup
+```
+
+**Graph Nodes**: `command`
+
+#### runtime.state_backup_restore
+
+Restore a verified state backup after pulse, checksum, confirmation, and safety-backup guardrails.
+
+- Surfaces: `cli`
+- Scopes: None
+- Side effect: `destructive`
+- Risk: `destructive`
+- Entrypoint: `manage.py`
+- Owner binary: None
+- MCP mirror: None
+
+**Inputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `backup_root` | `string?` | no |
+| `format` | `enum[json\|text]?` | no |
+| `i_understand_data_loss` | `boolean` | yes |
+| `state_root` | `string?` | no |
+| `target` | `string?` | no |
+
+**Outputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `checks` | `object[]` | yes |
+| `ok` | `boolean` | yes |
+| `safety_backup` | `object` | yes |
+| `state_root` | `string` | yes |
+
+**Examples**
+
+```bash
+python3 .env-manager/manage.py state-backup restore <manifest.json> --i-understand-data-loss --format json
 ```
 
 **Validation**
