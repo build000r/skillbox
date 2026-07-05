@@ -14,7 +14,16 @@ from .agent_timing import attach_elapsed, timer_start
 from .command_registry import default_registry
 
 SEARCH_SCHEMA_VERSION = "2026-06-11+agent_ops_brain.search"
-DEFAULT_DOC_PATHS = ("README.md", "AGENTS.md")
+DEFAULT_DOC_PATHS = (
+    "README.md",
+    "AGENTS.md",
+    "docs/runtime-graph.md",
+    "docs/clients.md",
+    "docs/skills.md",
+    "docs/operations.md",
+    "docs/troubleshooting.md",
+    "docs/faq.md",
+)
 MAX_DOC_BYTES = 200_000
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_.:-]+")
