@@ -56,16 +56,16 @@ if ! run_gate "unit_tests" python3 -m unittest tests.test_clipboard_bootstrap -v
 fi
 
 static_log="$SCRATCH/clipboard-static-checks.log"
-: >"$static_log"
-static_rc=0
-for helper in "$ROOT_DIR/scripts/clipboard"/{clipcopy,clippaste,pbcopy,clipimg-put} "$ROOT_DIR/scripts/clipboard-bootstrap" "$ROOT_DIR/scripts/clipboard-closeout.sh"; do
-  if ! bash -n "$helper" >>"$static_log" 2>&1; then
-    static_rc=1
-  fi
-done
-if ! (cd "$ROOT_DIR" && git diff --check >>"$static_log" 2>&1); then
-  static_rc=1
-fi
+{
+  echo "=== bash -n helpers ==="
+  for helper in "$ROOT_DIR/scripts/clipboard"/{clipcopy,clippaste,pbcopy,clipimg-put} "$ROOT_DIR/scripts/clipboard-bootstrap" "$ROOT_DIR/scripts/clipboard-closeout.sh" "$ROOT_DIR/scripts/clipboard-proof.sh"; do
+    echo "bash -n $helper"
+    bash -n "$helper"
+  done
+  echo "=== git diff --check ==="
+  (cd "$ROOT_DIR" && git diff --check)
+} >"$static_log" 2>&1
+static_rc=$?
 python3 - "$JSON_OUT" "static_checks" "$static_rc" "$static_log" <<'PY'
 import json
 import sys

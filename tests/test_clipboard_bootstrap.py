@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -55,12 +56,18 @@ class ClipboardBootstrapTests(unittest.TestCase):
             self.assertTrue(CB.default_shell_probe("ssh host true"))
             run.assert_called_once()
 
-    def test_conference_plan_uses_routed_target(self) -> None:
-        with (
-            mock.patch.object(CB, "default_shell_probe", side_effect=[True, True]),
-            mock.patch.object(CB, "select_conference_route", wraps=CB.select_conference_route) as route_fn,
-        ):
-            plan = CB.plan_remote_bootstrap("conference1", dry_run=True, root=ROOT_DIR)
+    def test_conference_plan_dry_run_uses_static_target(self) -> None:
+        plan = CB.plan_remote_bootstrap("conference1", dry_run=True, root=ROOT_DIR, live_probe=False)
+        self.assertEqual(plan.ssh_target, "worker@conference1-wsl")
+
+    def test_conference_plan_live_probe_uses_routed_target(self) -> None:
+        with mock.patch.object(CB, "default_shell_probe", side_effect=[True, True]):
+            plan = CB.plan_remote_bootstrap(
+                "conference1",
+                dry_run=False,
+                root=ROOT_DIR,
+                live_probe=True,
+            )
         self.assertEqual(plan.ssh_target, "worker@conference1-wsl")
 
     def test_conference_route_direct_wsl_first(self) -> None:
@@ -141,7 +148,9 @@ class ClipboardBootstrapTests(unittest.TestCase):
             timeout=30,
         )
         self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stderr, "")
         self.assertIn("d3", proc.stdout)
+        self.assertIn("worker@conference1-wsl", proc.stdout)
         self.assertIn("xterm-ghostty", proc.stdout)
 
     def test_bootstrap_cli_target_without_profile_uses_generic(self) -> None:
@@ -165,10 +174,44 @@ class ClipboardBootstrapTests(unittest.TestCase):
 
     def test_remote_install_script_terminfo_verification(self) -> None:
         script = CB.remote_install_script()
-        self.assertIn("infocmp -x xterm-ghostty >/dev/null", script)
+        self.assertIn(CB.TERMINFO_BUNDLE_NAME, script)
+        self.assertIn("tic -x", script)
         self.assertIn(CB.TMUX_MARKER, script)
         self.assertIn(CB.SOURCE_LINE, script)
         self.assertIn("SKILLBOX_CLIPBOARD_BUNDLE_B64", script)
+
+    def test_run_remote_install_provisions_helpers_and_terminfo(self) -> None:
+        if not shutil_which("tic"):
+            self.skipTest("tic not available")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            env = {"TERMINFO": str(home / ".terminfo")}
+            result = CB.run_remote_install(home, root=ROOT_DIR, env=env)
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertTrue((home / ".local" / "bin" / "clipcopy").is_file())
+            self.assertTrue((home / ".config" / "skillbox" / "clipboard.tmux.conf").is_file())
+            verify = subprocess.run(
+                ["infocmp", "-x", "xterm-ghostty"],
+                env={**os.environ, "HOME": str(home), "TERMINFO": str(home / ".terminfo")},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(verify.returncode, 0, msg=verify.stderr)
+
+    def test_apply_remote_via_ssh_invokes_ssh_runner(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_runner(argv, **kwargs):  # type: ignore[no-untyped-def]
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, stdout=b"skillbox clipboard bootstrap: ok\n", stderr=b"")
+
+        proc = CB.apply_remote_via_ssh("skillbox@example", root=ROOT_DIR, runner=fake_runner)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("ssh", calls[0])
+        self.assertIn("skillbox@example", calls[0])
+        self.assertTrue(any(arg.startswith("SKILLBOX_CLIPBOARD_BUNDLE_B64=") for arg in calls[0]))
 
     def test_bootstrap_cli_dry_run_d3(self) -> None:
         proc = subprocess.run(
@@ -203,7 +246,13 @@ class ClipboardBootstrapTests(unittest.TestCase):
         archive = CB.make_bundle_tar(ROOT_DIR)
         with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
             names = {member.name for member in tar.getmembers()}
-        self.assertTrue({"clipcopy", "clippaste", "pbcopy", "tmux.conf"}.issubset(names))
+        self.assertTrue({"clipcopy", "clippaste", "pbcopy", "tmux.conf", CB.TERMINFO_BUNDLE_NAME}.issubset(names))
+
+
+def shutil_which(cmd: str) -> str | None:
+    from shutil import which
+
+    return which(cmd)
 
 
 if __name__ == "__main__":

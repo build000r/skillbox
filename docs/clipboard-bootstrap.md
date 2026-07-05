@@ -31,7 +31,9 @@ The managed tmux fragment (`scripts/clipboard/tmux.conf`) sets `set-clipboard on
 terminal clipboard features for `xterm-ghostty` and nested `tmux*`, and binds
 copy-mode to `$HOME/.local/bin/clipcopy`.
 
-Remote hosts need `xterm-ghostty` terminfo (`infocmp -x xterm-ghostty | tic -x -`).
+Remote hosts need `xterm-ghostty` terminfo. Bootstrap installs from the bundled
+`scripts/clipboard/xterm-ghostty.tic` when the terminfo is absent; it falls back
+to `infocmp -x xterm-ghostty | tic -x -` when the host already has a source entry.
 
 ## Conference1 routing
 
