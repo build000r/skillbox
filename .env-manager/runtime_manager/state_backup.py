@@ -6,17 +6,28 @@ import json
 import os
 import shutil
 import tarfile
+import tempfile
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 from .errors import SkillboxError
+
+try:
+    import yaml  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - exercised only without PyYAML.
+    yaml = None  # type: ignore
 
 
 STATE_BACKUP_SCHEMA_VERSION = "2026-07-04+state-backup.v1"
 STATE_ROOT_ENV = "SKILLBOX_STATE_ROOT"
 BACKUP_ROOT_ENV = "SKILLBOX_BACKUP_ROOT"
 DEFAULT_EXCLUDES = ("monoserver/", "__pycache__", "pruned-skill-repo-extras-*")
+DRILL_EVIDENCE_REL = Path("state-backup") / "last-drill.json"
+PULSE_PID_RELS = (
+    Path("logs") / "runtime" / "pulse.pid",
+    Path("pulse.pid"),
+)
 
 
 class StateBackupError(SkillboxError):
@@ -213,6 +224,10 @@ def _write_json_0600(path: Path, payload: dict[str, Any]) -> None:
     os.chmod(path, 0o600)
 
 
+def _drill_evidence_path(state_root: Path) -> Path:
+    return state_root / DRILL_EVIDENCE_REL
+
+
 def create_state_backup(
     *,
     state_root: str | os.PathLike[str] | None = None,
@@ -334,6 +349,57 @@ def _archive_path_from_manifest(manifest_path: Path, manifest: dict[str, Any]) -
     )
 
 
+def _validate_tar_member_path(member: tarfile.TarInfo, destination: Path) -> None:
+    name = str(member.name or "")
+    parts = PurePosixPath(name).parts
+    if not name or name.startswith("/") or ".." in parts:
+        raise StateBackupError(
+            "STATE_BACKUP_TAR_PATH_ESCAPE",
+            f"Backup archive member escapes restore root: {name!r}",
+            context={"member": name},
+        )
+    target = (destination / PurePosixPath(name)).resolve()
+    if not _is_under_or_equal(target, destination):
+        raise StateBackupError(
+            "STATE_BACKUP_TAR_PATH_ESCAPE",
+            f"Backup archive member escapes restore root: {name!r}",
+            context={"member": name, "target": str(target), "destination": str(destination)},
+        )
+    if member.issym() or member.islnk():
+        link_name = str(member.linkname or "")
+        link_parts = PurePosixPath(link_name).parts
+        if not link_name or link_name.startswith("/") or ".." in link_parts:
+            raise StateBackupError(
+                "STATE_BACKUP_TAR_LINK_ESCAPE",
+                f"Backup archive link escapes restore root: {name!r} -> {link_name!r}",
+                context={"member": name, "linkname": link_name},
+            )
+
+
+def _safe_tar_filter(member: tarfile.TarInfo, destination: str) -> tarfile.TarInfo | None:
+    dest_path = Path(destination).resolve()
+    _validate_tar_member_path(member, dest_path)
+    data_filter = getattr(tarfile, "data_filter", None)
+    if data_filter is not None:
+        return data_filter(member, destination)
+    return member
+
+
+def _extract_archive_safe(archive_path: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    try:
+        with tarfile.open(archive_path, "r:gz") as archive:
+            archive.extractall(path=destination, filter=_safe_tar_filter)
+    except StateBackupError:
+        raise
+    except (tarfile.TarError, OSError) as exc:
+        raise StateBackupError(
+            "STATE_BACKUP_EXTRACT_FAILED",
+            f"Failed to extract backup archive safely: {exc}",
+            context={"archive": str(archive_path), "destination": str(destination)},
+        ) from exc
+
+
 def _archive_structure(path: Path) -> dict[str, Any]:
     file_count = 0
     total_bytes = 0
@@ -357,6 +423,171 @@ def _archive_structure(path: Path) -> dict[str, Any]:
         "top_level_entries": sorted(top_level_entries),
         "unsafe_entries": unsafe_entries,
     }
+
+
+def _top_level_entries_in_dir(path: Path) -> list[str]:
+    if not path.is_dir():
+        return []
+    return sorted(item.name for item in path.iterdir())
+
+
+def _yaml_parse_check(root: Path) -> dict[str, Any]:
+    yaml_paths = sorted(
+        path
+        for pattern in ("*.yaml", "*.yml")
+        for path in root.rglob(pattern)
+        if path.is_file() and not path.is_symlink()
+    )
+    failures: list[dict[str, str]] = []
+    if yaml is None and yaml_paths:
+        failures.append({
+            "path": "",
+            "error": "PyYAML is not available; cannot parse YAML files in backup drill.",
+        })
+    elif yaml is not None:
+        for path in yaml_paths:
+            try:
+                yaml.safe_load(path.read_text(encoding="utf-8"))
+            except Exception as exc:  # noqa: BLE001 - drill should report all parse failures.
+                failures.append({
+                    "path": path.relative_to(root).as_posix(),
+                    "error": str(exc),
+                })
+    return {
+        "name": "yaml_parse",
+        "ok": not failures,
+        "checked": len(yaml_paths),
+        "failures": failures,
+    }
+
+
+def latest_state_backup_manifest(*, backup_root: str | os.PathLike[str] | None = None) -> Path | None:
+    listed = list_state_backups(backup_root=backup_root)
+    backups = listed.get("backups") or []
+    if not backups:
+        return None
+    manifest = str((backups[0] or {}).get("manifest") or "").strip()
+    return Path(manifest) if manifest else None
+
+
+def _target_or_latest_manifest(
+    target: str | os.PathLike[str] | None,
+    *,
+    backup_root: str | os.PathLike[str] | None = None,
+) -> Path:
+    if target:
+        return _manifest_path_for(target)
+    latest = latest_state_backup_manifest(backup_root=backup_root)
+    if latest is None:
+        raise StateBackupError(
+            "STATE_BACKUP_NOT_FOUND",
+            "No state backups found.",
+            next_actions=["state-backup create --format json"],
+        )
+    return latest
+
+
+def _write_drill_evidence(state_root: Path, payload: dict[str, Any]) -> Path:
+    evidence_path = _drill_evidence_path(state_root)
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    payload["evidence_path"] = str(evidence_path)
+    _write_json_0600(evidence_path, payload)
+    return evidence_path
+
+
+def _read_pid(path: Path) -> int | None:
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _process_is_zombie(pid: int) -> bool:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    _before, _sep, after = raw.rpartition(")")
+    fields = after.split(None, 1)
+    return bool(fields) and fields[0] == "Z"
+
+
+def _process_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return not _process_is_zombie(pid)
+
+
+def _pulse_pid_candidates(state_root: Path, model: dict[str, Any] | None = None) -> list[Path]:
+    candidates = [state_root / rel for rel in PULSE_PID_RELS]
+    if isinstance(model, dict):
+        for log_item in model.get("logs") or []:
+            if str(log_item.get("id") or "").strip() == "runtime":
+                raw = str(log_item.get("host_path") or "").strip()
+                if raw:
+                    candidates.append(Path(raw) / "pulse.pid")
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        marker = str(path)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique.append(path)
+    return unique
+
+
+def _running_pulse_pid(state_root: Path, model: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    for path in _pulse_pid_candidates(state_root, model):
+        pid = _read_pid(path)
+        if pid is not None and _process_is_running(pid):
+            return {"pid": pid, "pid_file": str(path)}
+    return None
+
+
+def _raise_if_pulse_running(state_root: Path, model: dict[str, Any] | None = None) -> None:
+    running = _running_pulse_pid(state_root, model)
+    if running is None:
+        return
+    raise StateBackupError(
+        "STATE_BACKUP_PULSE_RUNNING",
+        "Refusing state restore while pulse is running.",
+        context=running,
+        next_actions=["pulse stop", "state-backup restore <manifest> --i-understand-data-loss --format json"],
+    )
+
+
+def _raise_if_verification_failed(verification: dict[str, Any]) -> None:
+    if verification.get("ok"):
+        return
+    checks = verification.get("checks") or []
+    sha = next((check for check in checks if check.get("name") == "sha256"), None)
+    if sha is not None and not sha.get("ok"):
+        raise StateBackupError(
+            "STATE_BACKUP_SHA256_MISMATCH",
+            "Refusing restore because the backup archive sha256 does not match its manifest.",
+            context={"manifest": verification.get("manifest"), "archive": verification.get("archive"), "sha256": sha},
+        )
+    raise StateBackupError(
+        "STATE_BACKUP_VERIFY_FAILED",
+        "Refusing restore because backup verification failed.",
+        context={"manifest": verification.get("manifest"), "archive": verification.get("archive"), "checks": checks},
+    )
+
+
+def _unique_swap_path(state_root: Path, stamp: str) -> Path:
+    for index in range(0, 1000):
+        suffix = "" if index == 0 else f"-{index}"
+        candidate = state_root.with_name(f".{state_root.name}.pre-restore-{stamp}{suffix}")
+        if not candidate.exists():
+            return candidate
+    raise StateBackupError("STATE_BACKUP_SWAP_NAME_EXHAUSTED", "Could not allocate a restore swap path.")
 
 
 def verify_state_backup(target: str | os.PathLike[str]) -> dict[str, Any]:
@@ -510,6 +741,142 @@ def list_state_backups(
     }
 
 
+def drill_state_backup(
+    target: str | os.PathLike[str] | None = None,
+    *,
+    state_root: str | os.PathLike[str] | None = None,
+    backup_root: str | os.PathLike[str] | None = None,
+    model: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    source_root = _resolve_state_root(state_root, model=model)
+    manifest_path = _target_or_latest_manifest(target, backup_root=backup_root)
+    manifest_path, manifest = _load_manifest(manifest_path)
+    archive_path = _archive_path_from_manifest(manifest_path, manifest)
+    drilled_at = _isoformat(_utc_now())
+    verification = verify_state_backup(manifest_path)
+    checks = list(verification.get("checks") or [])
+    sha_check = next((check for check in checks if check.get("name") == "sha256"), None)
+    sha_ok = bool(sha_check and sha_check.get("ok"))
+
+    if sha_ok:
+        with tempfile.TemporaryDirectory(prefix="skillbox-state-drill-") as tmpdir:
+            temp_root = Path(tmpdir).resolve()
+            try:
+                _extract_archive_safe(archive_path, temp_root)
+            except StateBackupError as exc:
+                checks.append({
+                    "name": "path_escape",
+                    "ok": False,
+                    "message": exc.message,
+                    "code": exc.code,
+                })
+            else:
+                checks.append({"name": "path_escape", "ok": True})
+                extracted_top = _top_level_entries_in_dir(temp_root)
+                expected_top = list(manifest.get("top_level_entries") or [])
+                checks.append({
+                    "name": "top_level_entries",
+                    "ok": extracted_top == expected_top,
+                    "expected": expected_top,
+                    "actual": extracted_top,
+                })
+                checks.append(_yaml_parse_check(temp_root))
+    else:
+        checks.append({
+            "name": "extract",
+            "ok": False,
+            "message": "Skipped extraction because backup sha256 verification failed.",
+        })
+
+    ok = all(bool(check.get("ok")) for check in checks)
+    payload = {
+        "ok": ok,
+        "action": "drill",
+        "drilled_at": drilled_at,
+        "manifest": str(manifest_path),
+        "archive": str(archive_path),
+        "created_at": manifest.get("created_at"),
+        "source_root": manifest.get("source_root"),
+        "state_root": str(source_root),
+        "checks": checks,
+        "next_actions": [
+            "state-backup list --format json",
+            "stewardship-report <client> --format json",
+        ],
+    }
+    evidence_path = _write_drill_evidence(source_root, payload)
+    payload["evidence_path"] = str(evidence_path)
+    return payload
+
+
+def restore_state_backup(
+    target: str | os.PathLike[str] | None = None,
+    *,
+    state_root: str | os.PathLike[str] | None = None,
+    backup_root: str | os.PathLike[str] | None = None,
+    model: dict[str, Any] | None = None,
+    i_understand_data_loss: bool = False,
+) -> dict[str, Any]:
+    if not i_understand_data_loss:
+        raise StateBackupError(
+            "STATE_BACKUP_RESTORE_CONFIRMATION_REQUIRED",
+            "state-backup restore requires --i-understand-data-loss.",
+            next_actions=["state-backup restore <manifest> --i-understand-data-loss --format json"],
+        )
+
+    source_root = _resolve_state_root(state_root, model=model)
+    destination_root = _resolve_backup_root(backup_root)
+    _validate_backup_root(source_root, destination_root)
+    manifest_path = _target_or_latest_manifest(target, backup_root=backup_root)
+    manifest_path, manifest = _load_manifest(manifest_path)
+    archive_path = _archive_path_from_manifest(manifest_path, manifest)
+
+    _raise_if_pulse_running(source_root, model)
+    verification = verify_state_backup(manifest_path)
+    _raise_if_verification_failed(verification)
+
+    safety = create_state_backup(
+        state_root=source_root,
+        backup_root=destination_root,
+        model=model,
+    )
+
+    stamp = _utc_now().strftime("%Y%m%dT%H%M%SZ")
+    staging = Path(tempfile.mkdtemp(prefix=f".{source_root.name}.restore-", dir=str(source_root.parent))).resolve()
+    previous = _unique_swap_path(source_root, stamp)
+    swapped = False
+    try:
+        _extract_archive_safe(archive_path, staging)
+        source_root.rename(previous)
+        swapped = True
+        staging.rename(source_root)
+        shutil.rmtree(previous)
+    except Exception:
+        if swapped and not source_root.exists() and previous.exists():
+            previous.rename(source_root)
+        try:
+            if staging.exists():
+                shutil.rmtree(staging)
+        except OSError:
+            pass
+        raise
+
+    return {
+        "ok": True,
+        "action": "restore",
+        "restored_at": _isoformat(_utc_now()),
+        "state_root": str(source_root),
+        "manifest": str(manifest_path),
+        "archive": str(archive_path),
+        "safety_backup": safety.get("backup") or {},
+        "checks": verification.get("checks") or [],
+        "next_actions": [
+            "doctor --format json",
+            "state-backup drill --format json",
+        ],
+    }
+
+
 def state_backup_text_lines(payload: dict[str, Any]) -> list[str]:
     action = str(payload.get("action") or "")
     if action == "create":
@@ -534,6 +901,28 @@ def state_backup_text_lines(payload: dict[str, Any]) -> list[str]:
             lines.append(f"  {mark}: {detail}")
         return lines
 
+    if action == "drill":
+        status = "ok" if payload.get("ok") else "failed"
+        lines = [
+            f"drill: {status}",
+            f"archive: {payload.get('archive')}",
+            f"evidence: {payload.get('evidence_path')}",
+        ]
+        for check in payload.get("checks") or []:
+            mark = "ok" if check.get("ok") else "fail"
+            lines.append(f"  {mark}: {check.get('name')}")
+        return lines
+
+    if action == "restore":
+        safety = payload.get("safety_backup") or {}
+        return [
+            "restore: ok",
+            f"state_root: {payload.get('state_root')}",
+            f"archive: {payload.get('archive')}",
+            f"safety_backup: {safety.get('archive')}",
+            "next: doctor --format json",
+        ]
+
     backups = payload.get("backups") or []
     lines = [f"backups: {len(backups)}  root: {payload.get('backup_root')}"]
     if not backups:
@@ -552,11 +941,15 @@ def state_backup_text_lines(payload: dict[str, Any]) -> list[str]:
 __all__ = [
     "BACKUP_ROOT_ENV",
     "DEFAULT_EXCLUDES",
+    "DRILL_EVIDENCE_REL",
     "STATE_BACKUP_SCHEMA_VERSION",
     "STATE_ROOT_ENV",
     "StateBackupError",
     "create_state_backup",
+    "drill_state_backup",
+    "latest_state_backup_manifest",
     "list_state_backups",
+    "restore_state_backup",
     "state_backup_text_lines",
     "verify_state_backup",
 ]
