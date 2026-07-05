@@ -309,6 +309,14 @@ def _target_from_literal_category_path(
     }
 
 
+def _raise_registry_resolution_errors(errors: list[dict[str, Any]]) -> None:
+    message = "; ".join(str(error.get("message") or "") for error in errors if error.get("message"))
+    exc = _sv.RegistryResolutionError(message or "registry selector resolution failed")
+    exc.errors = [dict(error) for error in errors]  # type: ignore[attr-defined]
+    exc.context = {"errors": [dict(error) for error in errors]}  # type: ignore[attr-defined]
+    raise exc
+
+
 def resolve_skill_default_targets(
     model: dict[str, Any],
     *,
@@ -334,7 +342,7 @@ def resolve_skill_default_targets(
     _config, _machine_id, roots = _current_machine_context()
 
     targets: list[dict[str, Any]] = []
-    errors: list[str] = []
+    errors: list[dict[str, Any]] = []
 
     for repo_ref in repos:
         resolution = _sv._resolve_registry_repo_ref(repo_ref, model=model)
@@ -343,7 +351,14 @@ def resolve_skill_default_targets(
             if entry is not None:
                 resolution = _sv._resolve_registry_repo_ref(_registry_entry_id(entry), model=model)
         if resolution is None:
-            errors.append(f"repo selector {repo_ref!r} is not declared in registry/repos.yaml")
+            errors.append(
+                {
+                    "type": "unknown_repo",
+                    "selector": repo_ref,
+                    "selector_kind": "repos",
+                    "message": f"repo selector {repo_ref!r} is not declared in registry/repos.yaml",
+                }
+            )
             continue
         targets.append(
             _target_from_registry_resolution(
@@ -389,12 +404,19 @@ def resolve_skill_default_targets(
                 )
         if not matched and category is None:
             errors.append(
-                f"category selector {category_id!r} matched no registry bucket/class "
-                "or policy project_categories entry"
+                {
+                    "type": "unknown_category",
+                    "selector": category_id,
+                    "selector_kind": "category",
+                    "message": (
+                        f"category selector {category_id!r} matched no registry bucket/class "
+                        "or policy project_categories entry"
+                    ),
+                }
             )
 
     if errors:
-        raise RuntimeError("; ".join(errors))
+        _raise_registry_resolution_errors(errors)
 
     deduped: dict[str, dict[str, Any]] = {}
     for target in targets:

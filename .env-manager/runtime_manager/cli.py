@@ -5009,11 +5009,50 @@ def _build_fleet_skill_default_payload(
     cwd_path = Path(args.cwd or os.getcwd()).resolve()
     repo_selectors = _csv_arg(getattr(args, "default_repos", None))
     category_selectors = _csv_arg(getattr(args, "default_category", None))
-    targets = resolve_skill_default_targets(
-        model or {},
-        repo_selectors=repo_selectors,
-        category_selectors=category_selectors,
-    )
+    selectors = {
+        "repos": repo_selectors,
+        "categories": category_selectors,
+    }
+    try:
+        targets = resolve_skill_default_targets(
+            model or {},
+            repo_selectors=repo_selectors,
+            category_selectors=category_selectors,
+        )
+    except RegistryResolutionError as exc:
+        return {
+            "ok": False,
+            "action": "default",
+            "default_action": default_action,
+            "scope": "repos",
+            "skill": skill_name,
+            "cwd": str(cwd_path),
+            "dry_run": dry_run,
+            "changed": False,
+            "would_change": False,
+            "noop": True,
+            "policy_path": None,
+            "diff": "",
+            "selectors": selectors,
+            "target_count": 0,
+            "would_change_count": 0,
+            "changed_count": 0,
+            "targets": [],
+            "preflight": {"ok": False, "missing": [], "dirty": []},
+            "residue": [],
+            "partial_apply": False,
+            "failed": None,
+            "error": {
+                "type": "RegistryResolutionError",
+                "message": str(exc),
+                "errors": [dict(item) for item in getattr(exc, "errors", [])],
+                "context": dict(getattr(exc, "context", {}) or {}),
+            },
+            "next_actions": [
+                "sbp registry doctor --json",
+                "sbp skills audit --format json --all",
+            ],
+        }
     planned_targets = [
         _fleet_skill_default_target_plan(
             target,
@@ -5041,10 +5080,7 @@ def _build_fleet_skill_default_payload(
         "noop": would_change_count == 0,
         "policy_path": None,
         "diff": "",
-        "selectors": {
-            "repos": repo_selectors,
-            "categories": category_selectors,
-        },
+        "selectors": selectors,
         "target_count": len(planned_targets),
         "would_change_count": would_change_count,
         "changed_count": 0,
@@ -5191,6 +5227,10 @@ def _handle_fleet_skill_default(
                 "repo_id": target.get("repo_id"),
                 "repo_path": target.get("repo_path"),
                 "policy_path": target.get("policy_path"),
+                "before_sha256": target.get("before_sha256"),
+                "after_sha256": target.get("after_sha256"),
+                "diff": target.get("diff"),
+                "rollback_hint": f"restore {target.get('policy_path')} from VCS or reverse the listed diff",
             }
         )
 
