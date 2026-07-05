@@ -44,11 +44,15 @@ Main entry points:
 
 - `workspace/runtime.yaml` declares repos, artifacts, skills, services, logs, checks, profiles, and client overlays.
 - `workspace/sandbox.yaml`, `workspace/dependencies.yaml`, and `workspace/persistence.yaml` feed outer validation.
+- `README.md` is the short front door. Moved long-form README content lives in
+  `docs/runtime-graph.md`, `docs/clients.md`, `docs/skills.md`,
+  `docs/operations.md`, `docs/troubleshooting.md`, and `docs/faq.md`.
 - `docs/ARCHITECTURE.md` is the maintainer-grade system map for layers,
   manifests, runtime modules, data flow, state layout, and extension seams.
 - `.env.example` documents supported env vars. `.env` and `.env.box` are local
   and ignored.
 - `.env-manager/runtime_manager/` contains the Python runtime manager modules.
+  `agent_search.py` indexes the README, AGENTS.md, and the focused docs pages.
 - `scripts/lib/runtime_model.py` builds the shared runtime model.
 - `tests/` contains `unittest` coverage, including `tests/distribution/`.
 - `.skillbox/skill-overrides.yaml` is the repo-local durable skill visibility

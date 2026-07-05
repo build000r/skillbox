@@ -165,6 +165,27 @@ class AgentSearchTests(unittest.TestCase):
         self.assertIn("MISSING_SOURCE", warning_codes)
         self.assertTrue(any(warning.get("source") == "not-present" for warning in payload["warnings"]))
 
+    def test_default_doc_index_includes_split_docs(self) -> None:
+        for path in (
+            "docs/runtime-graph.md",
+            "docs/clients.md",
+            "docs/skills.md",
+            "docs/operations.md",
+            "docs/troubleshooting.md",
+            "docs/faq.md",
+        ):
+            self.assertIn(path, SEARCH.DEFAULT_DOC_PATHS)
+
+        parity = SEARCH.search_payload("parity ledger", root_dir=ROOT_DIR, source_filter=["docs"])
+        operator_gate = SEARCH.search_payload(
+            "operator_box_exec command gate",
+            root_dir=ROOT_DIR,
+            source_filter=["docs"],
+        )
+
+        self.assertIn("doc:docs/runtime-graph.md", {hit["id"] for hit in parity["hits"]})
+        self.assertIn("doc:docs/operations.md", {hit["id"] for hit in operator_gate["hits"]})
+
 
 if __name__ == "__main__":
     unittest.main()
