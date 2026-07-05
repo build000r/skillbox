@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import traceback
@@ -80,7 +81,11 @@ from .agent_snapshots import (
     replay_snapshot,
     save_snapshot,
 )
-from .fleet_converge import build_fleet_converge_plan, fleet_converge_text_lines
+from .fleet_converge import (
+    build_fleet_converge_plan,
+    fleet_converge_text_lines,
+    resolve_skill_default_targets,
+)
 from .fleet_relink import (
     apply_relink_plan,
     build_relink_plan,
@@ -1499,6 +1504,19 @@ def _build_parser() -> argparse.ArgumentParser:
         const="global",
         help="Write the operator skill-scope.yaml allow_global defaults.",
     )
+    default_scope.add_argument(
+        "--repos",
+        dest="default_repos",
+        metavar="IDS",
+        help="Write defaults into registry repo ids/names (comma-separated).",
+    )
+    default_scope.add_argument(
+        "--category",
+        dest="default_category",
+        metavar="NAME",
+        help="Write defaults into every repo in a registry bucket/class or policy project category.",
+    )
+    skill_default_parser.set_defaults(default_repos=None, default_category=None)
     skill_default_parser.add_argument("--format", choices=("text", "json"), default="text")
     skill_default_parser.add_argument("--cwd", default=None)
     skill_default_parser.add_argument("--dry-run", action="store_true")
@@ -4862,6 +4880,327 @@ def _handle_repo_skill_default(
     return result
 
 
+def _csv_arg(value: Any) -> list[str]:
+    items: list[str] = []
+    if value is None:
+        return items
+    raw_values = value if isinstance(value, (list, tuple, set)) else [value]
+    for raw in raw_values:
+        for part in str(raw or "").split(","):
+            item = part.strip()
+            if item and item not in items:
+                items.append(item)
+    return items
+
+
+def _skill_default_review_dir() -> Path:
+    raw = str(os.environ.get("SKILLBOX_STATE_ROOT") or ".skillbox-state").strip()
+    root = Path(os.path.expandvars(os.path.expanduser(raw)))
+    if not root.is_absolute():
+        root = Path.cwd() / root
+    return root / "skill-default-previews"
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _fleet_skill_default_target_plan(
+    target: dict[str, Any],
+    *,
+    skill_name: str,
+    default_action: str,
+) -> dict[str, Any]:
+    repo_path = Path(str(target.get("path") or "")).resolve()
+    policy_path = repo_path / ".skillbox" / "skill-overrides.yaml"
+    exists = repo_path.is_dir()
+    before = policy_path.read_text(encoding="utf-8") if policy_path.is_file() else ""
+    after = _repo_policy_text_for_default(before, skill_name, default_action) if exists else before
+    diff_text = _unified_policy_diff(str(policy_path), before, after) if exists else ""
+    dirty_paths = git_dirty_paths(repo_path) if exists else []
+    result = dict(target)
+    result.update(
+        {
+            "repo_path": str(repo_path),
+            "policy_path": str(policy_path),
+            "exists": exists,
+            "clean": not dirty_paths,
+            "dirty_paths": dirty_paths[:20],
+            "dirty_count": len(dirty_paths),
+            "before_sha256": _sha256_text(before),
+            "after_sha256": _sha256_text(after),
+            "would_change": exists and before != after,
+            "changed": False,
+            "diff": diff_text,
+        }
+    )
+    return result
+
+
+def _fleet_skill_default_plan_signature(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": "skill-default-fleet-review-v1",
+        "skill": payload.get("skill"),
+        "default_action": payload.get("default_action"),
+        "scope": payload.get("scope"),
+        "selectors": payload.get("selectors") or {},
+        "targets": [
+            {
+                "repo_id": target.get("repo_id"),
+                "repo_path": target.get("repo_path"),
+                "policy_path": target.get("policy_path"),
+                "before_sha256": target.get("before_sha256"),
+                "after_sha256": target.get("after_sha256"),
+                "diff_sha256": _sha256_text(str(target.get("diff") or "")),
+                "would_change": bool(target.get("would_change")),
+            }
+            for target in payload.get("targets") or []
+        ],
+    }
+
+
+def _fleet_skill_default_plan_sha(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(_fleet_skill_default_plan_signature(payload), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _fleet_skill_default_marker_path(plan_sha: str) -> Path:
+    return _skill_default_review_dir() / f"{plan_sha}.json"
+
+
+def _record_fleet_skill_default_review(payload: dict[str, Any]) -> dict[str, Any]:
+    plan_sha = _fleet_skill_default_plan_sha(payload)
+    marker_path = _fleet_skill_default_marker_path(plan_sha)
+    record = {
+        "schema": "skill-default-fleet-review-v1",
+        "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "plan_sha256": plan_sha,
+        "signature": _fleet_skill_default_plan_signature(payload),
+    }
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(marker_path, json.dumps(record, sort_keys=True, indent=2) + "\n")
+    return {
+        "required_for_apply": True,
+        "plan_sha256": plan_sha,
+        "marker_path": str(marker_path),
+        "recorded": True,
+    }
+
+
+def _fleet_skill_default_review_status(payload: dict[str, Any]) -> dict[str, Any]:
+    plan_sha = _fleet_skill_default_plan_sha(payload)
+    marker_path = _fleet_skill_default_marker_path(plan_sha)
+    return {
+        "required_for_apply": True,
+        "plan_sha256": plan_sha,
+        "marker_path": str(marker_path),
+        "present": marker_path.is_file(),
+    }
+
+
+def _build_fleet_skill_default_payload(
+    args: argparse.Namespace,
+    model: dict[str, Any] | None,
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    skill_name = str(args.skill_name)
+    default_action = str(args.default_action)
+    cwd_path = Path(args.cwd or os.getcwd()).resolve()
+    repo_selectors = _csv_arg(getattr(args, "default_repos", None))
+    category_selectors = _csv_arg(getattr(args, "default_category", None))
+    targets = resolve_skill_default_targets(
+        model or {},
+        repo_selectors=repo_selectors,
+        category_selectors=category_selectors,
+    )
+    planned_targets = [
+        _fleet_skill_default_target_plan(
+            target,
+            skill_name=skill_name,
+            default_action=default_action,
+        )
+        for target in targets
+    ]
+    missing = [target for target in planned_targets if not target.get("exists")]
+    dirty = [
+        target for target in planned_targets
+        if target.get("would_change") and not target.get("clean")
+    ]
+    would_change_count = sum(1 for target in planned_targets if target.get("would_change"))
+    payload: dict[str, Any] = {
+        "ok": not missing and not dirty,
+        "action": "default",
+        "default_action": default_action,
+        "scope": "repos",
+        "skill": skill_name,
+        "cwd": str(cwd_path),
+        "dry_run": dry_run,
+        "changed": False,
+        "would_change": would_change_count > 0,
+        "noop": would_change_count == 0,
+        "policy_path": None,
+        "diff": "",
+        "selectors": {
+            "repos": repo_selectors,
+            "categories": category_selectors,
+        },
+        "target_count": len(planned_targets),
+        "would_change_count": would_change_count,
+        "changed_count": 0,
+        "targets": planned_targets,
+        "preflight": {
+            "ok": not missing and not dirty,
+            "missing": [
+                {
+                    "repo_id": target.get("repo_id"),
+                    "repo_path": target.get("repo_path"),
+                    "policy_path": target.get("policy_path"),
+                }
+                for target in missing
+            ],
+            "dirty": [
+                {
+                    "repo_id": target.get("repo_id"),
+                    "repo_path": target.get("repo_path"),
+                    "dirty_count": target.get("dirty_count"),
+                    "dirty_paths": target.get("dirty_paths") or [],
+                }
+                for target in dirty
+            ],
+        },
+        "residue": [],
+        "partial_apply": False,
+        "failed": None,
+        "next_actions": [],
+    }
+    if not planned_targets:
+        payload["ok"] = False
+        payload["preflight"]["ok"] = False
+        payload["preflight"]["missing"] = []
+        payload["error"] = "no repositories matched --repos/--category selectors"
+    if dry_run:
+        payload["review"] = _record_fleet_skill_default_review(payload)
+        payload["next_actions"] = [
+            _skill_default_apply_command(args, include_dry_run=False),
+        ]
+    else:
+        payload["review"] = _fleet_skill_default_review_status(payload)
+        payload["next_actions"] = [
+            _skill_default_apply_command(args, include_dry_run=True),
+        ]
+    return payload
+
+
+def _skill_default_apply_command(args: argparse.Namespace, *, include_dry_run: bool) -> str:
+    pieces = [
+        "sbp",
+        "skill",
+        "default",
+        shlex.quote(str(args.default_action)),
+        shlex.quote(str(args.skill_name)),
+    ]
+    if getattr(args, "default_repos", None):
+        pieces.extend(["--repos", shlex.quote(str(args.default_repos))])
+    if getattr(args, "default_category", None):
+        pieces.extend(["--category", shlex.quote(str(args.default_category))])
+    if getattr(args, "cwd", None):
+        pieces.extend(["--cwd", shlex.quote(str(args.cwd))])
+    if include_dry_run:
+        pieces.append("--dry-run")
+    return " ".join(pieces)
+
+
+def _handle_fleet_skill_default(
+    args: argparse.Namespace,
+    model: dict[str, Any] | None,
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    default_action = str(args.default_action)
+    skill_name = str(args.skill_name)
+    if default_action == "off" and skill_name in set(DISPATCHER_CORE):
+        raise ValidationError(
+            OVERRIDE_REFUSED_FLOOR,
+            f"Refusing to default off dispatcher floor skill {skill_name!r}.",
+            context={
+                "skill": skill_name,
+                "action": "default off",
+                "floor": list(DISPATCHER_CORE),
+                "policy": "repo defaults cannot disable dispatcher floor skills",
+            },
+            next_actions=[
+                f"sbp skill default on {skill_name} --repos <ids> --dry-run",
+                f"sbp skill default on {skill_name} --category <name> --dry-run",
+            ],
+        )
+    payload = _build_fleet_skill_default_payload(args, model, dry_run=dry_run)
+    if dry_run:
+        return payload
+    if not payload.get("ok"):
+        return payload
+    if payload.get("would_change") and not (payload.get("review") or {}).get("present"):
+        payload["ok"] = False
+        payload["preflight"]["ok"] = False
+        payload["error"] = (
+            "cross-repo skill default writes require an exact dry-run first; "
+            "run the dry-run command and re-run apply without changing the target set."
+        )
+        return payload
+    if not payload.get("would_change"):
+        payload["ok"] = True
+        payload["noop"] = True
+        return payload
+
+    applied: list[dict[str, Any]] = []
+    targets = payload.get("targets") or []
+    for index, target in enumerate(targets):
+        if not target.get("would_change"):
+            continue
+        policy_path = Path(str(target.get("policy_path") or ""))
+        try:
+            before = policy_path.read_text(encoding="utf-8") if policy_path.is_file() else ""
+            after = _repo_policy_text_for_default(before, skill_name, default_action)
+            policy_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(policy_path, after)
+        except Exception as exc:
+            payload["ok"] = False
+            payload["failed"] = {
+                "repo_id": target.get("repo_id"),
+                "repo_path": target.get("repo_path"),
+                "policy_path": target.get("policy_path"),
+                "error": str(exc),
+            }
+            payload["residue"] = applied
+            payload["partial_apply"] = bool(applied)
+            payload["changed"] = bool(applied)
+            payload["changed_count"] = len(applied)
+            payload["not_applied"] = [
+                {
+                    "repo_id": item.get("repo_id"),
+                    "repo_path": item.get("repo_path"),
+                    "policy_path": item.get("policy_path"),
+                }
+                for item in targets[index + 1 :]
+                if item.get("would_change")
+            ]
+            return payload
+        target["changed"] = True
+        applied.append(
+            {
+                "repo_id": target.get("repo_id"),
+                "repo_path": target.get("repo_path"),
+                "policy_path": target.get("policy_path"),
+            }
+        )
+
+    payload["ok"] = True
+    payload["changed"] = bool(applied)
+    payload["changed_count"] = len(applied)
+    payload["noop"] = not applied
+    return payload
+
+
 def _load_policy_from_text(text: str) -> dict[str, Any]:
     yaml_mod = require_yaml("read skill-scope policy")
     parsed = yaml_mod.safe_load(text) if text.strip() else {}
@@ -4973,7 +5312,7 @@ def _upsert_top_level_list(
     after_keys: tuple[str, ...] = (),
 ) -> str:
     updated = _replace_top_level_list(text, key, values)
-    if updated != text:
+    if updated != text or any(line.startswith(f"{key}:") for line in text.splitlines()):
         return updated
     lines = text.splitlines(keepends=True)
     if lines and not lines[-1].endswith("\n"):
@@ -5148,27 +5487,69 @@ def _handle_skill_default(
     args: argparse.Namespace,
     *,
     dry_run: bool,
+    model: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if getattr(args, "default_repos", None) or getattr(args, "default_category", None):
+        return _handle_fleet_skill_default(args, model, dry_run=dry_run)
     scope = str(args.default_scope)
     if scope == "repo":
         return _handle_repo_skill_default(args, dry_run=dry_run)
     if scope == "global":
         return _handle_global_skill_default(args, dry_run=dry_run)
-    raise RuntimeError("skill default requires exactly one scope: --repo or --global")
+    raise RuntimeError("skill default requires exactly one scope: --repo, --global, --repos, or --category")
 
 
 def _print_skill_default_text(payload: dict[str, Any]) -> None:
     mode = "dry-run" if payload.get("dry_run") else "apply"
     print(f"skill default {payload.get('default_action')}: {payload.get('skill')} ({mode})")
     print(f"scope: {payload.get('scope')}")
-    print(f"path: {payload.get('policy_path')}")
+    if payload.get("targets") is not None:
+        print(f"targets: {payload.get('target_count', 0)}")
+    else:
+        print(f"path: {payload.get('policy_path')}")
     print(f"changed: {str(bool(payload.get('changed'))).lower()}")
     print(f"would_change: {str(bool(payload.get('would_change'))).lower()}")
+    if payload.get("ok") is False:
+        print("ok: false")
+        if payload.get("error"):
+            print(f"error: {payload.get('error')}")
+    review = payload.get("review") or {}
+    if review:
+        status = "present" if review.get("present") else ("recorded" if review.get("recorded") else "missing")
+        print(f"review: {status} {review.get('plan_sha256')}")
+    preflight = payload.get("preflight") or {}
+    if preflight and not preflight.get("ok", True):
+        for item in preflight.get("missing") or []:
+            print(f"missing: {item.get('repo_id')} {item.get('repo_path')}")
+        for item in preflight.get("dirty") or []:
+            paths = ", ".join(item.get("dirty_paths") or [])
+            print(f"dirty: {item.get('repo_id')} {item.get('repo_path')} ({paths})")
+    if payload.get("failed"):
+        failed = payload["failed"]
+        print(f"failed: {failed.get('repo_id')} {failed.get('policy_path')} {failed.get('error')}")
+    residue = payload.get("residue") or []
+    if residue:
+        print("residue:")
+        for item in residue:
+            print(f"  - {item.get('repo_id')} {item.get('policy_path')}")
     if payload.get("validation"):
         statuses = ", ".join(
             f"{item.get('code')}={item.get('status')}" for item in payload.get("validation") or []
         )
         print(f"validation: {statuses}")
+    targets = payload.get("targets") or []
+    if targets:
+        for target in targets:
+            marker = "change" if target.get("would_change") else "noop"
+            clean = "clean" if target.get("clean") else "dirty"
+            print(f"path: {target.get('policy_path')} [{marker}, {clean}]")
+            diff_text = str(target.get("diff") or "")
+            if diff_text:
+                print("diff:")
+                print(diff_text, end="" if diff_text.endswith("\n") else "\n")
+        if not any(str(target.get("diff") or "") for target in targets):
+            print("diff: none")
+        return
     diff_text = str(payload.get("diff") or "")
     if diff_text:
         print("diff:")
@@ -5835,12 +6216,12 @@ def _handle_skill(args: argparse.Namespace, root_dir: Path, model: dict[str, Any
             print_skill_lifecycle_text(payload)
         return EXIT_OK
     if skill_action == "default":
-        payload = _handle_skill_default(args, dry_run=dry_run)
+        payload = _handle_skill_default(args, dry_run=dry_run, model=model)
         if args.format == "json":
             emit_json(payload)
         else:
             _print_skill_default_text(payload)
-        return EXIT_OK
+        return EXIT_ERROR if payload.get("ok") is False else EXIT_OK
     if skill_action == "heal":
         payload = _handle_skill_heal(args, model, dry_run=dry_run)
         if args.format == "json":

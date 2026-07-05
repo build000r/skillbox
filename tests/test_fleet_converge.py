@@ -24,7 +24,12 @@ Run just this surface with::
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+import unittest
+from argparse import Namespace
 from pathlib import Path
+from unittest import mock
 
 
 import sys
@@ -34,6 +39,9 @@ if str(ENV_MANAGER_DIR) not in sys.path:
     sys.path.insert(0, str(ENV_MANAGER_DIR))
 
 from runtime_manager import fleet_converge as fc  # noqa: E402
+from runtime_manager import cli as runtime_cli  # noqa: E402
+from runtime_manager.policy_eval import _repo_override_policy  # noqa: E402
+from tests.fixture_fleet import build_fixture_fleet  # noqa: E402
 
 
 def _build_plan(fleet, *, include_mcp=False, include_clean=True, root_dir=None,
@@ -56,6 +64,100 @@ def _repo(plan, name_suffix):
             return row
     raise AssertionError(f"repo {name_suffix!r} not in plan: "
                          f"{[Path(r['path']).name for r in plan['repos']]}")
+
+
+def _skill_default_args(fleet, *, repos=None, category=None, skill="alpha") -> Namespace:
+    return Namespace(
+        skill_action="default",
+        default_action="on",
+        skill_name=skill,
+        default_scope=None,
+        default_repos=repos,
+        default_category=category,
+        cwd=str(fleet.repo("healthy")),
+        dry_run=False,
+        yes=False,
+        policy_path=None,
+        format="json",
+        client=None,
+        profile="local-all",
+    )
+
+
+class SkillDefaultFleetTests(unittest.TestCase):
+    def test_skill_default_cohort_resolution_from_registry_ids_and_category(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fleet = build_fixture_fleet(tmpdir)
+            with fleet._home_patched():
+                targets = fc.resolve_skill_default_targets(
+                    fleet.model(),
+                    repo_selectors=["healthy,other-machine"],
+                    category_selectors=["frontend"],
+                )
+
+        self.assertEqual(
+            [target["repo_id"] for target in targets],
+            ["healthy", "other-machine", "overlay-repo"],
+        )
+        self.assertEqual(
+            {Path(target["path"]).name for target in targets},
+            {"healthy", "other-machine", "overlay-repo"},
+        )
+
+    def test_skill_default_cross_repo_apply_is_idempotent_after_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fleet = build_fixture_fleet(tmpdir)
+            state_root = fleet.root / "state"
+            args = _skill_default_args(fleet, category="frontend", skill="tiny-ui")
+
+            with fleet._home_patched(), mock.patch.dict(os.environ, {"SKILLBOX_STATE_ROOT": str(state_root)}):
+                dry = runtime_cli._handle_skill_default(args, dry_run=True, model=fleet.model())
+                applied = runtime_cli._handle_skill_default(args, dry_run=False, model=fleet.model())
+                second = runtime_cli._handle_skill_default(args, dry_run=False, model=fleet.model())
+
+            policy = _repo_override_policy(fleet.repo("overlay-repo"))
+
+        self.assertTrue(dry["review"]["recorded"])
+        self.assertEqual(
+            [target["policy_path"] for target in dry["targets"]],
+            [target["policy_path"] for target in applied["targets"]],
+        )
+        self.assertTrue(applied["ok"])
+        self.assertTrue(applied["changed"])
+        self.assertEqual(applied["changed_count"], 1)
+        self.assertTrue(second["ok"])
+        self.assertFalse(second["changed"])
+        self.assertTrue(second["noop"])
+        self.assertEqual(policy["defaults"], ["tiny-ui"])
+        self.assertEqual(policy["pin_on"], ["tiny-ui"])
+
+    def test_skill_default_cross_repo_reports_residue_from_forced_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fleet = build_fixture_fleet(tmpdir)
+            state_root = fleet.root / "state"
+            args = _skill_default_args(fleet, repos="healthy,overlay-repo", skill="alpha")
+            overlay_policy = fleet.repo("overlay-repo") / ".skillbox" / "skill-overrides.yaml"
+            original_write = runtime_cli.atomic_write_text
+
+            def flaky_write(path, content, **kwargs):
+                if Path(path) == overlay_policy:
+                    raise OSError("forced failure")
+                return original_write(path, content, **kwargs)
+
+            with fleet._home_patched(), mock.patch.dict(os.environ, {"SKILLBOX_STATE_ROOT": str(state_root)}):
+                runtime_cli._handle_skill_default(args, dry_run=True, model=fleet.model())
+                with mock.patch.object(runtime_cli, "atomic_write_text", side_effect=flaky_write):
+                    payload = runtime_cli._handle_skill_default(args, dry_run=False, model=fleet.model())
+
+            healthy_policy = _repo_override_policy(fleet.repo("healthy"))
+            overlay_policy_payload = _repo_override_policy(fleet.repo("overlay-repo"))
+
+        self.assertFalse(payload["ok"])
+        self.assertTrue(payload["partial_apply"])
+        self.assertEqual(payload["failed"]["repo_id"], "overlay-repo")
+        self.assertEqual([item["repo_id"] for item in payload["residue"]], ["healthy"])
+        self.assertIn("alpha", healthy_policy["defaults"])
+        self.assertNotIn("alpha", overlay_policy_payload["defaults"])
 
 
 # --- plan shape -------------------------------------------------------------

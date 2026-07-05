@@ -231,7 +231,8 @@ The wrapper discovery contract. Agents should start here to learn the stable com
       "sbp launch <dir> <dir> --request '<prompt>' --dry-run --json",
       "sbp bulk <dir> <dir> --request '<prompt>' --dry-run --json",
       "sbp skill prune --dry-run",
-      "sbp skill default on <skill> --repo --dry-run --format json"
+      "sbp skill default on <skill> --repo --dry-run --format json",
+      "sbp skill default on <skill> --category frontend --dry-run --format json"
     ]
   },
   "skill_verbs": {
@@ -256,14 +257,14 @@ The wrapper discovery contract. Agents should start here to learn the stable com
       "when_to_use": "Use for deliberate non-override link management."
     },
     "default": {
-      "do_NOT": "Do not apply --global without --dry-run review and --yes; it writes operator skill-scope policy.",
+      "do_NOT": "Do not apply --global without --dry-run review and --yes; do not apply --repos/--category before the exact dry-run marker exists.",
       "links_disk": false,
       "mutates": "repo_or_operator_policy",
-      "purpose": "Set repo or operator-global skill defaults with a reviewable unified diff.",
+      "purpose": "Set repo, cross-repo, or operator-global skill defaults with a reviewable unified diff.",
       "returns_packet": false,
-      "scope": "repo or global",
+      "scope": "repo, registry cohort, or global",
       "survives_recalibrate": true,
-      "when_to_use": "Use --repo for a committed repo default; use --global only after dry-run review."
+      "when_to_use": "Use --repo for one repo, --repos/--category for reviewed registry cohorts, and --global only after dry-run review."
     },
     "heal": {
       "do_NOT": "Do not use heal when no real source exists; unknown sources are refused.",

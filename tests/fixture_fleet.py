@@ -191,6 +191,7 @@ class FixtureFleet:
             {
                 "SKILLBOX_MACHINES_FILE": str(self.machines_path),
                 "SKILLBOX_MACHINE": "devbox-like",
+                "SKILLBOX_REGISTRY_FILE": str(self.registry_path),
             },
         ):
             yield
@@ -300,8 +301,10 @@ def _write_registry_repos_yaml(path: Path, *, scan_root: Path, repos: dict[str, 
         "overlay-repo": "frontend",
     }
     for name, repo_path in repos.items():
-        lines.append(f"  - path: {repo_path}")
+        lines.append(f"  - id: {name}")
+        lines.append(f"    path: {repo_path}")
         lines.append(f"    name: {name}")
+        lines.append(f"    bucket: {classes.get(name, 'backend')}")
         lines.append(f"    class: {classes.get(name, 'backend')}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
