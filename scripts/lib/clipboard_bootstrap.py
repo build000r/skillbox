@@ -331,11 +331,11 @@ tmux_conf="$HOME/.tmux.conf"
 touch "$tmux_conf"
 marker='{TMUX_MARKER}'
 if ! grep -Fq "$marker" "$tmux_conf"; then
-  {{
-    printf '\\n'
-    printf '# Skillbox clipboard integration: OSC52 across local tmux, SSH, mosh, and nested tmux.\\n'
-    printf '%s\\n' '{SOURCE_LINE}'
-  }} >>"$tmux_conf"
+  cat >>"$tmux_conf" <<'SKILLBOX_CLIPBOARD_TMUX'
+
+# Skillbox clipboard integration: OSC52 across local tmux, SSH, mosh, and nested tmux.
+if-shell '[ -r "$HOME/.config/skillbox/clipboard.tmux.conf" ]' 'source-file "$HOME/.config/skillbox/clipboard.tmux.conf"'
+SKILLBOX_CLIPBOARD_TMUX
 fi
 terminfo_ok=0
 if command -v infocmp >/dev/null 2>&1 && infocmp -x xterm-ghostty >/dev/null 2>&1; then
@@ -420,6 +420,8 @@ def apply_remote_via_ssh(
     ssh_target: str,
     *,
     root: Path | None = None,
+    transport: str = "ssh",
+    wsl_distro: str | None = None,
     runner: Callable[..., subprocess.CompletedProcess[bytes]] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run remote install over SSH; runner is injectable for tests."""
@@ -428,8 +430,23 @@ def apply_remote_via_ssh(
     resolved_root = root or repo_root()
     bundle_b64 = base64.b64encode(make_bundle_tar(resolved_root)).decode()
     run = runner or subprocess.run
-    return run(
-        [
+    distro = wsl_distro or os.environ.get("SKILLBOX_WSL_DISTRO", "Ubuntu")
+    if transport == "wsl":
+        remote_cmd = (
+            f"wsl -d {distro} --cd ~ --exec env "
+            f"SKILLBOX_CLIPBOARD_BUNDLE_B64={bundle_b64} bash -s"
+        )
+        argv = [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=15",
+            ssh_target,
+            remote_cmd,
+        ]
+    else:
+        argv = [
             "ssh",
             "-o",
             "BatchMode=yes",
@@ -439,7 +456,9 @@ def apply_remote_via_ssh(
             f"SKILLBOX_CLIPBOARD_BUNDLE_B64={bundle_b64}",
             "bash",
             "-s",
-        ],
+        ]
+    return run(
+        argv,
         input=remote_install_script().encode("utf-8"),
         capture_output=True,
         check=False,

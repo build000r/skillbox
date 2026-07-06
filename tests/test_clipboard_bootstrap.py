@@ -213,6 +213,33 @@ class ClipboardBootstrapTests(unittest.TestCase):
         self.assertIn("skillbox@example", calls[0])
         self.assertTrue(any(arg.startswith("SKILLBOX_CLIPBOARD_BUNDLE_B64=") for arg in calls[0]))
 
+    def test_apply_remote_via_ssh_wsl_transport(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_runner(argv, **kwargs):  # type: ignore[no-untyped-def]
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, stdout=b"ok\n", stderr=b"")
+
+        CB.apply_remote_via_ssh("conference1-ssh", root=ROOT_DIR, transport="wsl", runner=fake_runner)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(any("wsl -d" in arg for arg in calls[0]))
+        self.assertTrue(any("SKILLBOX_CLIPBOARD_BUNDLE_B64=" in arg for arg in calls[0]))
+
+    def test_run_remote_install_writes_valid_tmux_source_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            result = CB.run_remote_install(home, root=ROOT_DIR)
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            tmux_conf = home / ".tmux.conf"
+            content = tmux_conf.read_text(encoding="utf-8")
+            self.assertIn(CB.SOURCE_LINE, content)
+            source_lines = [
+                line
+                for line in content.splitlines()
+                if "if-shell" in line and "clipboard.tmux.conf" in line
+            ]
+            self.assertEqual(len(source_lines), 1)
+
     def test_bootstrap_cli_dry_run_d3(self) -> None:
         proc = subprocess.run(
             [

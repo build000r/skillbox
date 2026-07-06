@@ -105,7 +105,9 @@ def _apply_remote(root: Path, profile: str, target: str | None) -> int:
         print("clipboard-bootstrap: remote profile missing ssh_target", file=sys.stderr)
         return 2
 
-    proc = apply_remote_via_ssh(ssh_target, root=root)
+    resolved_apply = resolve_profile(_profile_key, target=target if _profile_key == "generic" else None, root=root)
+    transport = resolved_apply.get("transport", "ssh")
+    proc = apply_remote_via_ssh(ssh_target, root=root, transport=transport)
     if proc.returncode != 0:
         print(proc.stdout.decode("utf-8", errors="replace"), end="")
         print(proc.stderr.decode("utf-8", errors="replace"), end="", file=sys.stderr)
