@@ -322,6 +322,51 @@ class ClipboardBootstrapTests(unittest.TestCase):
         self.assertIn("skillbox-portfolio-devbox", proc.stdout)
         self.assertIn("xterm-ghostty", proc.stdout)
 
+    def test_bootstrap_cli_remote_default_is_plan_mode(self) -> None:
+        proc = subprocess.run(
+            [
+                "bash",
+                str(ROOT_DIR / "scripts" / "clipboard-bootstrap"),
+                "--profile",
+                "d3",
+            ],
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("(plan)", proc.stdout)
+        self.assertNotIn("(apply)", proc.stdout)
+
+    def test_install_local_repairs_stale_tmux_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            tmux_conf = home / ".tmux.conf"
+            clip_path = f"{home}/.config/skillbox/clipboard.tmux.conf"
+            tmux_conf.write_text(
+                "\n".join(
+                    [
+                        "set -g mouse on",
+                        CB.TMUX_COMMENT,
+                        "if-shell [",
+                        "-r",
+                        clip_path,
+                        "] source-file",
+                        clip_path,
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            CB.install_local(home, dry_run=False, root=ROOT_DIR)
+            content = tmux_conf.read_text(encoding="utf-8")
+            self.assertIn("set -g mouse on", content)
+            self.assertIn(CB.SOURCE_LINE, content)
+            self.assertNotIn("if-shell [", content)
+            self.assertEqual(CB.verify_local_install(home), [])
+
     def test_shell_syntax_clipboard_helpers(self) -> None:
         for name in ("clipcopy", "clippaste", "pbcopy", "clipimg-put"):
             path = CB.bundle_dir(ROOT_DIR) / name

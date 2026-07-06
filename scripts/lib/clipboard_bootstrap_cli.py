@@ -159,7 +159,12 @@ def main(argv: list[str] | None = None) -> int:
         ssh_target_override=routed_target if profile == "conference1" else None,
         live_probe=live_probe,
     )
-    mode = "dry-run" if args.dry_run else "apply"
+    if args.dry_run:
+        mode = "dry-run"
+    elif args.apply_remote:
+        mode = "apply"
+    else:
+        mode = "plan"
     print(f"clipboard-bootstrap: profile={resolved['profile']} target={remote_plan.ssh_target} ({mode})")
     for step in remote_plan.steps:
         print(f"  - {step}")

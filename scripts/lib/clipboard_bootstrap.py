@@ -175,10 +175,56 @@ def read_tmux_fragment(root: Path | None = None) -> str:
 def expected_tmux_fragment_markers() -> tuple[str, ...]:
     return (
         "set -g set-clipboard on",
+        "set -ag terminal-features",
         "xterm-ghostty:clipboard:RGB",
         'set -g copy-command "$HOME/.local/bin/clipcopy"',
         "copy-pipe-and-cancel",
     )
+
+
+def _is_malformed_skillbox_tmux_line(line: str) -> bool:
+    if line.startswith("# Skillbox clipboard integration: OSC52"):
+        return True
+    if line in {"if-shell [", "-r", "]", "'", "] source-file"}:
+        return True
+    if "'source-file" in line:
+        return True
+    return "clipboard.tmux.conf" in line and "source-file" not in line
+
+
+def repair_malformed_tmux_block(content: str) -> str:
+    """Remove a broken Skillbox clipboard block while preserving other settings."""
+    lines = content.splitlines()
+    out: list[str] = []
+    repair_skip = False
+    for line in lines:
+        if line.startswith("# Skillbox clipboard integration: OSC52"):
+            repair_skip = True
+            continue
+        if repair_skip:
+            if _is_malformed_skillbox_tmux_line(line):
+                continue
+            repair_skip = False
+            out.append(line)
+            continue
+        out.append(line)
+    repaired = "\n".join(out)
+    if content.endswith("\n"):
+        repaired += "\n"
+    return repaired
+
+
+def ensure_tmux_source_line(tmux_conf: Path) -> None:
+    content = tmux_conf.read_text(encoding="utf-8") if tmux_conf.exists() else ""
+    if SOURCE_LINE in content:
+        return
+    if TMUX_MARKER in content:
+        content = repair_malformed_tmux_block(content)
+    if SOURCE_LINE not in content:
+        if content and not content.endswith("\n"):
+            content += "\n"
+        content += f"\n{TMUX_COMMENT}\n{SOURCE_LINE}\n"
+    tmux_conf.write_text(content, encoding="utf-8")
 
 
 def clipcopy_client_tty_markers() -> tuple[str, ...]:
@@ -251,12 +297,7 @@ def install_local(home: Path | None = None, *, dry_run: bool = False, root: Path
         tmux_conf.parent.mkdir(parents=True, exist_ok=True)
         if not tmux_conf.exists():
             tmux_conf.write_text("", encoding="utf-8")
-        content = tmux_conf.read_text(encoding="utf-8")
-        if TMUX_MARKER not in content:
-            with tmux_conf.open("a", encoding="utf-8") as handle:
-                if content and not content.endswith("\n"):
-                    handle.write("\n")
-                handle.write(f"\n{TMUX_COMMENT}\n{SOURCE_LINE}\n")
+        ensure_tmux_source_line(tmux_conf)
         if shutil.which("tmux"):
             subprocess.run(
                 ["tmux", "source-file", str(tmux_conf)],
@@ -509,8 +550,8 @@ def verify_local_install(home: Path) -> list[str]:
             if marker not in content:
                 issues.append(f"tmux fragment missing marker: {marker}")
     tmux_conf = tmux_conf_path(home)
-    if tmux_conf.is_file() and TMUX_MARKER not in tmux_conf.read_text(encoding="utf-8"):
-        issues.append(f"{tmux_conf} missing source line for {TMUX_MARKER}")
+    if tmux_conf.is_file() and SOURCE_LINE not in tmux_conf.read_text(encoding="utf-8"):
+        issues.append(f"{tmux_conf} missing valid source line for {TMUX_MARKER}")
     return issues
 
 
@@ -534,4 +575,4 @@ def is_idempotent_reinstall(home: Path, *, root: Path | None = None) -> bool:
     tmux_conf = tmux_conf_path(home)
     if not tmux_conf.is_file():
         return False
-    return TMUX_MARKER in tmux_conf.read_text(encoding="utf-8")
+    return SOURCE_LINE in tmux_conf.read_text(encoding="utf-8")
