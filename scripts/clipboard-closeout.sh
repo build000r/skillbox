@@ -57,7 +57,7 @@ fi
 
 static_log="$SCRATCH/clipboard-static-checks.log"
 set +e
-{
+(
   echo "=== bash -n helpers ==="
   static_fail=0
   for helper in "$ROOT_DIR/scripts/clipboard"/{clipcopy,clippaste,pbcopy,clipimg-put} "$ROOT_DIR/scripts/clipboard-bootstrap" "$ROOT_DIR/scripts/clipboard-closeout.sh" "$ROOT_DIR/scripts/clipboard-proof.sh"; do
@@ -71,7 +71,7 @@ set +e
     static_fail=1
   fi
   exit "$static_fail"
-} >"$static_log" 2>&1
+) >"$static_log" 2>&1
 static_rc=$?
 set -e
 python3 - "$JSON_OUT" "static_checks" "$static_rc" "$static_log" <<'PY'
