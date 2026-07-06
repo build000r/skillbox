@@ -332,7 +332,29 @@ touch "$tmux_conf"
 valid_source='if-shell '"'"'[ -r "$HOME/.config/skillbox/clipboard.tmux.conf" ]'"'"' '"'"'source-file "$HOME/.config/skillbox/clipboard.tmux.conf"'"'"''
 if ! grep -Fq "$valid_source" "$tmux_conf"; then
   if grep -Fq '{TMUX_MARKER}' "$tmux_conf"; then
-    awk 'BEGIN{{skip=0}} /^# Skillbox clipboard integration: OSC52/ {{skip=1; next}} skip && NF==0 {{skip=0; next}} skip {{next}} {{print}}' "$tmux_conf" >"$tmux_conf.tmp" && mv "$tmux_conf.tmp" "$tmux_conf"
+    repair_skip=0
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        "# Skillbox clipboard integration: OSC52"*)
+          repair_skip=1
+          continue
+          ;;
+      esac
+      if [ "$repair_skip" = "1" ]; then
+        case "$line" in
+          "if-shell ["|"-r"|"]"|"'") continue ;;
+          *"'source-file"*) continue ;;
+          *clipboard.tmux.conf*) continue ;;
+          *)
+            repair_skip=0
+            printf '%s\\n' "$line"
+            continue
+            ;;
+        esac
+        continue
+      fi
+      printf '%s\\n' "$line"
+    done <"$tmux_conf" >"$tmux_conf.tmp" && mv "$tmux_conf.tmp" "$tmux_conf"
   fi
   cat >>"$tmux_conf" <<'SKILLBOX_CLIPBOARD_TMUX'
 
