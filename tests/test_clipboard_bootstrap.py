@@ -245,6 +245,7 @@ class ClipboardBootstrapTests(unittest.TestCase):
             home = Path(tmpdir) / "home"
             home.mkdir()
             tmux_conf = home / ".tmux.conf"
+            clip_path = f"{home}/.config/skillbox/clipboard.tmux.conf"
             tmux_conf.write_text(
                 "\n".join(
                     [
@@ -253,11 +254,9 @@ class ClipboardBootstrapTests(unittest.TestCase):
                         "# Skillbox clipboard integration: OSC52 across local tmux, SSH, mosh, and nested tmux.",
                         "if-shell [",
                         "-r",
-                        '"$HOME/.config/skillbox/clipboard.tmux.conf"',
-                        "]",
-                        "'source-file",
-                        '"$HOME/.config/skillbox/clipboard.tmux.conf"',
-                        "'",
+                        clip_path,
+                        "] source-file",
+                        clip_path,
                         "",
                     ]
                 ),
@@ -280,6 +279,7 @@ class ClipboardBootstrapTests(unittest.TestCase):
             home = Path(tmpdir) / "home"
             home.mkdir()
             tmux_conf = home / ".tmux.conf"
+            clip_path = f"{home}/.config/skillbox/clipboard.tmux.conf"
             tmux_conf.write_text(
                 "\n".join(
                     [
@@ -287,11 +287,9 @@ class ClipboardBootstrapTests(unittest.TestCase):
                         "# Skillbox clipboard integration: OSC52 across local tmux, SSH, mosh, and nested tmux.",
                         "if-shell [",
                         "-r",
-                        '"$HOME/.config/skillbox/clipboard.tmux.conf"',
-                        "]",
-                        "'source-file",
-                        '"$HOME/.config/skillbox/clipboard.tmux.conf"',
-                        "'",
+                        clip_path,
+                        "] source-file",
+                        clip_path,
                         "setw -g mode-keys vi",
                     ]
                 ),

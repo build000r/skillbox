@@ -343,6 +343,7 @@ if ! grep -Fq "$valid_source" "$tmux_conf"; then
       if [ "$repair_skip" = "1" ]; then
         case "$line" in
           "if-shell ["|"-r"|"]"|"'") continue ;;
+          *"] source-file"*) continue ;;
           *"'source-file"*) continue ;;
           *clipboard.tmux.conf*) continue ;;
           *)
