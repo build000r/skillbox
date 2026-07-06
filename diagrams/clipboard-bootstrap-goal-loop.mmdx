@@ -5,166 +5,49 @@
   "links": [
     {
       "from": "main",
-      "label": "Agent roles",
-      "to": "agents",
-      "title": "Who did what"
-    },
-    {
-      "from": "main",
-      "label": "Iteration counts",
-      "to": "iterations",
-      "title": "Review and commit iterations"
-    },
-    {
-      "from": "main",
-      "label": "Reusable contract",
-      "to": "contract",
-      "title": "Goal harness pattern"
-    },
-    {
-      "from": "main",
-      "label": "Verification gates",
-      "to": "gates",
-      "title": "Closeout gates detail"
-    },
-    {
-      "from": "agents",
-      "label": "Back to overview",
-      "to": "main",
-      "title": "Process loop overview"
-    },
-    {
-      "from": "iterations",
-      "label": "Back to overview",
-      "to": "main",
-      "title": "Process loop overview"
+      "label": "Models",
+      "to": "models",
+      "title": "Which model ran which role"
     }
   ]
 }
 -->
 
-## chart main Clipboard Bootstrap Goal Loop
+## chart main Recursive Goal Loop
 ```mermaid
 flowchart TD
-  subgraph HARNESS["Goal harness"]
-    PLAN["plan.md\nacceptance criteria + checklist + verification"]
-    SCRATCH["{SCRATCH}/ evidence dir"]
-  end
+  PLAN["Goal harness\nwrites plan.md + acceptance criteria"]
 
-  subgraph IMPL["Implementer — Grok goal agent"]
-    READ["Read plan → seed todos"]
-    AUDIT["Audit shipped code\nscripts/clipboard/, CLI, tests, docs"]
-    VERIFY["Run verification gates"]
-    CHECK["Flip checklist, close beads"]
-    COMMIT["/commit"]
-  end
+  IMPL["Implementer\nmodel: grok-composer-2.5-fast\nimplement → verify → /commit"]
 
-  subgraph GATES["Verification gates"]
-    U["unittest 30/30 PASS"]
-    C["clipboard-closeout.sh PASS"]
-    L["bootstrap --help + d3 --dry-run ×2"]
-  end
+  REV["Review subagent\nmodel: grok-composer-2.5-fast\nREVIEW-MODE → verdict.json"]
 
-  subgraph REVIEW["Review subagent\ngeneralPurpose REVIEW-MODE"]
-    R1["Read epic diff + evidence"]
-    R2["Re-run unit tests"]
-    R3["verdict.json approve"]
-  end
+  DONE["Done"]
 
-  subgraph PRIOR["Prior sessions"]
-    P1["a60bcc2 initial productize"]
-    P2["8 fix commits"]
-    P3["e0a6513 address review P2s"]
-  end
-
-  PLAN --> READ --> AUDIT --> VERIFY
-  VERIFY --> U & C & L --> SCRATCH --> CHECK --> COMMIT
-  COMMIT --> R1 --> R2 --> R3
-  R3 -->|reject| FIX["fix → /commit → re-review"]
-  FIX -.-> R1
-  R3 -->|approve| DONE["goal complete"]
-  P1 --> P2 --> P3 --> AUDIT
+  PLAN --> IMPL --> REV
+  REV -->|approve| DONE
+  REV -->|reject — blocking issues| IMPL
 
   style DONE fill:#2d6a4f,color:#fff
-  style R3 fill:#2d6a4f,color:#fff
-  style FIX fill:#e76f51,color:#fff,stroke-dasharray:5
+  style REV fill:#457b9d,color:#fff
+  style IMPL fill:#e9c46a,color:#000
 ```
 
-## chart agents Agent Roles
+## chart models Models by Role
 ```mermaid
 flowchart LR
-  subgraph IMP["Implementer — Grok goal agent"]
-    I1["Read plan + seed todos"]
-    I2["Verify gates + evidence"]
-    I3["Close beads + commit"]
+  subgraph LOOP["This goal session — 1 review pass, 0 fix loops"]
+    I["Implementer\ngrok-composer-2.5-fast"]
+    R["Reviewer subagent\ngrok-composer-2.5-fast"]
+    I --> R
   end
 
-  subgraph REV["Review subagent — generalPurpose"]
-    R1["Adversarial REVIEW-MODE"]
-    R2["1 iteration → approve"]
+  subgraph PRIOR["Prior pass — ~1 review→fix cycle, 9 commits"]
+    P_I["Implementer\ngrok-composer-2.5-fast"]
+    P_V["Verifier subagent\ngrok-build"]
+    P_R["Reviewer subagent\ngrok-composer-2.5-fast"]
+    P_I --> P_V --> P_R --> P_I
   end
 
-  subgraph PREV["Prior implementer sessions"]
-    P1["9 commits\na60bcc2 → e0a6513"]
-    P2["~1 prior review cycle\nP2 fixes"]
-  end
-
-  PREV --> IMP --> REV
-
-  classDef done fill:#2d6a4f,color:#fff
-  class R2 done
-```
-
-## chart iterations Iteration Accounting
-```mermaid
-flowchart TD
-  subgraph THIS["This goal session"]
-    T1["Review iterations: 1"]
-    T2["Fix loops: 0"]
-    T3["Unit test runs: 3"]
-    T4["Closeout runs: 1"]
-    T5["Commits: 1 beads closure"]
-  end
-
-  subgraph PRIOR["Prior sessions"]
-    P1["Implement commits: 9"]
-    P2["Review→fix cycles: ~1"]
-    P3["P2 items addressed in e0a6513"]
-  end
-
-  subgraph TOTAL["Epic total"]
-    X1["10 commits a60bcc2 → f640431"]
-    X2["30 unit tests, all PASS"]
-    X3["Final verdict: approve"]
-  end
-
-  THIS --> TOTAL
-  PRIOR --> TOTAL
-```
-
-## chart contract Reusable Goal Contract
-```mermaid
-flowchart LR
-  A["plan.md\nacceptance + checklist"] --> B["Implement / verify\nreal entry points"]
-  B --> C["Evidence → {SCRATCH}"]
-  C --> D["/commit"]
-  D --> E["NTM-style review subagent"]
-  E -->|reject| B
-  E -->|approve| F["verdict.json\nclose beads"]
-
-  style F fill:#2d6a4f,color:#fff
-```
-
-## chart gates Verification Gates Detail
-```mermaid
-flowchart TD
-  U["python3 -m unittest tests.test_clipboard_bootstrap -v\n30 tests OK"]
-  C["CLIPBOARD_SCRATCH={SCRATCH} scripts/clipboard-closeout.sh\nunit_tests + static_checks + bootstrap_launch PASS"]
-  L1["scripts/clipboard-bootstrap --help"]
-  L2["scripts/clipboard-bootstrap --profile d3 --dry-run\n×2 identical runs"]
-  V["clipboard-bootstrap-verdict.json\nverdict approve, 0 blocking"]
-
-  U --> C --> L1 --> L2 --> V
-
-  style V fill:#2d6a4f,color:#fff
+  PRIOR -.->|shipped code into| LOOP
 ```
