@@ -329,8 +329,11 @@ install -m 0755 "$bundle_dir/pbcopy" "$bin_dir/pbcopy"
 install -m 0644 "$bundle_dir/tmux.conf" "$config_dir/clipboard.tmux.conf"
 tmux_conf="$HOME/.tmux.conf"
 touch "$tmux_conf"
-marker='{TMUX_MARKER}'
-if ! grep -Fq "$marker" "$tmux_conf"; then
+valid_source='if-shell '"'"'[ -r "$HOME/.config/skillbox/clipboard.tmux.conf" ]'"'"' '"'"'source-file "$HOME/.config/skillbox/clipboard.tmux.conf"'"'"''
+if ! grep -Fq "$valid_source" "$tmux_conf"; then
+  if grep -Fq '{TMUX_MARKER}' "$tmux_conf"; then
+    awk 'BEGIN{{skip=0}} /^# Skillbox clipboard integration: OSC52/ {{skip=1; next}} skip && NF==0 {{skip=0; next}} skip {{next}} {{print}}' "$tmux_conf" >"$tmux_conf.tmp" && mv "$tmux_conf.tmp" "$tmux_conf"
+  fi
   cat >>"$tmux_conf" <<'SKILLBOX_CLIPBOARD_TMUX'
 
 # Skillbox clipboard integration: OSC52 across local tmux, SSH, mosh, and nested tmux.
