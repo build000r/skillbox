@@ -240,6 +240,41 @@ class ClipboardBootstrapTests(unittest.TestCase):
             ]
             self.assertEqual(len(source_lines), 1)
 
+    def test_run_remote_install_repairs_malformed_tmux_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            tmux_conf = home / ".tmux.conf"
+            tmux_conf.write_text(
+                "\n".join(
+                    [
+                        "set -g mouse on",
+                        "",
+                        "# Skillbox clipboard integration: OSC52 across local tmux, SSH, mosh, and nested tmux.",
+                        "if-shell [",
+                        "-r",
+                        '"$HOME/.config/skillbox/clipboard.tmux.conf"',
+                        "]",
+                        "'source-file",
+                        '"$HOME/.config/skillbox/clipboard.tmux.conf"',
+                        "'",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            result = CB.run_remote_install(home, root=ROOT_DIR)
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            content = tmux_conf.read_text(encoding="utf-8")
+            self.assertIn(CB.SOURCE_LINE, content)
+            source_lines = [
+                line
+                for line in content.splitlines()
+                if "if-shell" in line and "clipboard.tmux.conf" in line
+            ]
+            self.assertEqual(len(source_lines), 1)
+            self.assertNotIn("if-shell [", content)
+
     def test_bootstrap_cli_dry_run_d3(self) -> None:
         proc = subprocess.run(
             [
