@@ -1,0 +1,53 @@
+<!-- mmdx
+{
+  "entry": "main",
+  "shortLink": { "username": "buildooor", "slug": "clipboard-bootstrap-goal-loop" },
+  "links": [
+    {
+      "from": "main",
+      "label": "Models",
+      "to": "models",
+      "title": "Which model ran which role"
+    }
+  ]
+}
+-->
+
+## chart main Recursive Goal Loop
+```mermaid
+flowchart TD
+  PLAN["Goal harness\nwrites plan.md + acceptance criteria"]
+
+  IMPL["Implementer\nmodel: grok-composer-2.5-fast\nimplement → verify → /commit"]
+
+  REV["Review subagent\nmodel: grok-composer-2.5-fast\nREVIEW-MODE → verdict.json"]
+
+  DONE["Done"]
+
+  PLAN --> IMPL --> REV
+  REV -->|approve| DONE
+  REV -->|reject — blocking issues| IMPL
+
+  style DONE fill:#2d6a4f,color:#fff
+  style REV fill:#457b9d,color:#fff
+  style IMPL fill:#e9c46a,color:#000
+```
+
+## chart models Models by Role
+```mermaid
+flowchart LR
+  subgraph LOOP["This goal session — 1 review pass, 0 fix loops"]
+    I["Implementer\ngrok-composer-2.5-fast"]
+    R["Reviewer subagent\ngrok-composer-2.5-fast"]
+    I --> R
+  end
+
+  subgraph PRIOR["Prior pass — ~1 review→fix cycle, 9 commits"]
+    P_I["Implementer\ngrok-composer-2.5-fast"]
+    P_V["Verifier subagent\ngrok-build"]
+    P_R["Reviewer subagent\ngrok-composer-2.5-fast"]
+    P_I --> P_V --> P_R --> P_I
+  end
+
+  PRIOR -.->|shipped code into| LOOP
+```

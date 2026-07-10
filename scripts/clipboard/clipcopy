@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+tmp="$(mktemp "${TMPDIR:-/tmp}/clipcopy.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+
+cat >"$tmp"
+
+native_macos_clipboard() {
+    [ "$(uname -s)" = "Darwin" ] && [ -x /usr/bin/pbcopy ]
+}
+
+local_macos_session() {
+    [ -z "${SSH_CONNECTION:-}" ] && [ -z "${SSH_CLIENT:-}" ] && [ -z "${SSH_TTY:-}" ]
+}
+
+if native_macos_clipboard && local_macos_session; then
+    /usr/bin/pbcopy <"$tmp"
+    exit 0
+fi
+
+if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
+    tmux load-buffer "$tmp" 2>/dev/null || true
+
+    b64="$(base64 <"$tmp" | tr -d '\r\n')"
+    wrote=0
+    clients="$(tmux list-clients -F '#{client_name}' 2>/dev/null || tmux display-message -p '#{client_name}' 2>/dev/null || true)"
+    while IFS= read -r client; do
+        [ -n "$client" ] || continue
+        [ -w "$client" ] || continue
+        printf '\033]52;c;%s\a' "$b64" >"$client" && wrote=1
+    done <<EOF
+$clients
+EOF
+    if [ "$wrote" = "1" ]; then
+        exit 0
+    fi
+
+    if tmux load-buffer -w "$tmp" 2>/dev/null; then
+        exit 0
+    fi
+fi
+
+if native_macos_clipboard; then
+    /usr/bin/pbcopy <"$tmp"
+    exit 0
+fi
+
+if [ -w /dev/tty ]; then
+    b64="$(base64 <"$tmp" | tr -d '\r\n')"
+    printf '\033]52;c;%s\a' "$b64" >/dev/tty
+    exit 0
+fi
+
+if [ -t 1 ]; then
+    b64="$(base64 <"$tmp" | tr -d '\r\n')"
+    printf '\033]52;c;%s\a' "$b64"
+    exit 0
+fi
+
+echo "clipcopy: no macOS clipboard, tmux client, or tty available for OSC52" >&2
+exit 1

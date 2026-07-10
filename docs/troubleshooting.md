@@ -105,6 +105,41 @@ The destructive-op guard requires:
 2. A `dry_run=true` call before the real operation
 
 Run `/commit`, push, then re-run with `dry_run: true` first.
+
+### Clipboard copy does not reach the Mac
+
+Check in order:
+
+1. Ghostty launched with `--clipboard-write=allow` (live terminals only; captured PTYs may not pass OSC52).
+2. `~/.local/bin/clipcopy` exists and is executable on the host where copy runs.
+3. `~/.config/skillbox/clipboard.tmux.conf` is sourced from `~/.tmux.conf`.
+4. Remote host has `xterm-ghostty` terminfo: `infocmp -x xterm-ghostty >/dev/null`.
+5. Inside tmux, `clipcopy` writes OSC52 to attached client TTYs — not only `tmux load-buffer -w`.
+
+Re-bootstrap:
+
+```bash
+scripts/clipboard-bootstrap --profile local
+scripts/clipboard-bootstrap --profile d3 --apply-remote
+scripts/clipboard-closeout.sh
+```
+
+### Conference1 clipboard fails over SSH
+
+Use direct WSL (`worker@conference1-wsl`), not the `conference1-ssh` Windows wrapper.
+The wrapper path is documented as OSC52-hostile. Probe:
+
+```bash
+ssh conference1-wsl true
+ssh conference1-wsl 'command -v mosh-server'
+```
+
+### `clipimg-put` fails or pastes wrong content
+
+- Must run on macOS with an image on the clipboard (PNG or TIFF).
+- Uploads to `~/clipboard-images/` on the remote and puts the **remote path** on the Mac clipboard.
+- True binary paste through the terminal is not supported — paste the returned path into chat.
+
 ## Limitations
 
 - This is not a hosted control plane or a multi-user workspace platform.

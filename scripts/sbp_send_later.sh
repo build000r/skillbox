@@ -10,6 +10,25 @@ fi
 CRON_MARKER="sbp-send-later-wrapper"
 CRON_LINE="* * * * * ${SBP_BIN} send-later run-pending >> ${LOG_DIR}/ntm-send-later.cron.log 2>&1 # ${CRON_MARKER}"
 CRON_LOG="${LOG_DIR}/ntm-send-later.cron.log"
+
+# --- launch mode -------------------------------------------------------------
+# The `launch` MODE runs an operator-controlled *launcher* by name (e.g. a
+# self-scheduling burndown tick) instead of typing into a pane. It is NOT a
+# general command executor: a job may only name a launcher that (a) matches a
+# traversal-safe slug, (b) lives directly in LAUNCHER_DIR, (c) is a regular
+# executable file owned by this user, and it is always run with NO arguments.
+# This keeps `.env` jobs declarative and auditable while letting send-later own
+# the recurring scheduler, cron heartbeat, per-job flock, and list/doctor/gc.
+LAUNCHER_DIR="${SBP_SEND_LATER_LAUNCHER_DIR:-$HOME/.local/share/sbp/launchers}"
+
+run_launcher() {  # $1 = launcher slug; echoes nothing, returns launcher's rc
+  local name="$1" path
+  [[ "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "invalid launcher slug: $name" >&2; return 2; }
+  path="$LAUNCHER_DIR/$name"
+  [[ -f "$path" && -x "$path" ]] || { echo "launcher not found/executable: $path" >&2; return 2; }
+  [[ -O "$path" ]] || { echo "launcher not owned by current user: $path" >&2; return 2; }
+  "$path"
+}
 # Heartbeat written every tick so `doctor` can prove the per-minute run-pending
 # is firing even when the queue is empty (an idle run-pending writes nothing
 # else, so CRON_LOG mtime alone cannot distinguish "dead" from "idle").
@@ -328,6 +347,7 @@ schedule_job() {
   local minutes="" in_spec="" at_spec="" id="" session="" pane="" message="" target="" to="" key_delay="1"
   local recurring="false" when_waiting="false" cooldown_min="0" renudge_min="0"
   local idle_re="" busy_re="" force="false" dry_run="false" tz="" max_fires="0" until_spec=""
+  local launcher=""
   local keys=()
 
   while [[ $# -gt 0 ]]; do
@@ -344,6 +364,7 @@ schedule_job() {
       --to) require_value "$1" "$#"; to="$2"; shift 2 ;;
       --key) require_value "$1" "$#"; keys+=("$2"); shift 2 ;;
       --key-delay) require_value "$1" "$#"; key_delay="$2"; shift 2 ;;
+      --launcher) require_value "$1" "$#"; launcher="$2"; shift 2 ;;
       --recurring) recurring="true"; shift 1 ;;
       --when-waiting) when_waiting="true"; shift 1 ;;
       --max-fires) require_value "$1" "$#"; max_fires="$2"; shift 2 ;;
@@ -366,7 +387,15 @@ schedule_job() {
 
   # ---- resolve destination + mode -----------------------------------------
   local mode=""
-  if [[ -n "$to" ]]; then
+  if [[ -n "$launcher" ]]; then
+    [[ -z "$to$session$pane$target$message" && "${#keys[@]}" -eq 0 ]] \
+      || die "--launcher takes no pane destination (no --to/--session/--pane/--target/--message/--key)"
+    [[ "$launcher" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "--launcher must be a slug ^[a-z0-9][a-z0-9-]*$"
+    [[ -x "$LAUNCHER_DIR/$launcher" ]] \
+      || die "launcher '$launcher' not found or not executable in $LAUNCHER_DIR
+  register it first (chmod +x + place/symlink in $LAUNCHER_DIR), then re-run"
+    mode="launch"
+  elif [[ -n "$to" ]]; then
     [[ -z "$session" && -z "$pane" && -z "$target" ]] \
       || die "use --to OR --session/--pane OR --target, not several at once"
     target="$(resolve_target "$to")"
@@ -425,7 +454,8 @@ schedule_job() {
   # ---- auto-generate id when not supplied ----------------------------------
   if [[ -z "$id" ]]; then
     local base
-    if [[ "$mode" == "tmux_keys" ]]; then base="$target"; else base="${session}-${pane}"; fi
+    if [[ "$mode" == "launch" ]]; then base="launch-$launcher";
+    elif [[ "$mode" == "tmux_keys" ]]; then base="$target"; else base="${session}-${pane}"; fi
     base="$(printf 'sl-%s-%s' "$base" "$(date -u +%H%M%S)" | tr -c 'A-Za-z0-9_.-' '-')"
     id="$(sanitize_id "$base")"
   fi
@@ -436,14 +466,17 @@ schedule_job() {
   fi
 
   local dest
-  if [[ "$mode" == "tmux_keys" ]]; then dest="$target"; else dest="session $session pane $pane"; fi
+  if [[ "$mode" == "launch" ]]; then dest="launcher:$launcher";
+  elif [[ "$mode" == "tmux_keys" ]]; then dest="$target"; else dest="session $session pane $pane"; fi
 
   # ---- dry-run: show the fully-resolved job, write nothing -----------------
   if [[ "$dry_run" == "true" ]]; then
     echo "DRY RUN — nothing scheduled."
     echo "  id=$id  ->  $dest"
     echo "  when=$due_utc  ($(fmt_local "$due") local)  mode=$mode"
-    if [[ "$mode" == "tmux_keys" ]]; then
+    if [[ "$mode" == "launch" ]]; then
+      echo "  launcher: $LAUNCHER_DIR/$launcher"
+    elif [[ "$mode" == "tmux_keys" ]]; then
       echo "  keys: $(printf '%s' "$keys_joined" | tr '\n' '|' | sed 's/|$//')"
     else
       echo "  message: $message"
@@ -503,6 +536,7 @@ COOLDOWN_MIN='$cooldown_min'
 RENUDGE_MIN='$renudge_min'
 IDLE_RE_B64='$(b64 "$idle_re")'
 BUSY_RE_B64='$(b64 "$busy_re")'
+LAUNCHER_B64='$(b64 "$launcher")'
 EOF
 
   echo "scheduled: id=$id -> $dest"
@@ -721,6 +755,9 @@ run_job() {
       fi
       sleep "$KEY_DELAY"
     done <<< "$keys_text"
+  elif [[ "$MODE" == "launch" ]]; then
+    run_launcher "$(unb64 "${LAUNCHER_B64:-}")" >> "$log_file" 2>&1
+    status=$?
   else
     echo "unknown mode: $MODE" >> "$log_file"
     status=2

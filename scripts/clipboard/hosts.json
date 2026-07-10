@@ -1,0 +1,78 @@
+{
+  "bundle_version": 1,
+  "source_dir": "scripts/clipboard",
+  "profiles": {
+    "local": {
+      "label": "Operator Mac local install",
+      "scope": "local",
+      "clipboard_capable": true
+    },
+    "d3": {
+      "label": "d3 portfolio devbox",
+      "ssh_target": "skillbox@skillbox-portfolio-devbox",
+      "remote_home": "/home/skillbox",
+      "transport": "ssh",
+      "clipboard_capable": true
+    },
+    "sweet": {
+      "label": "Sweet Potato",
+      "ssh_target": "aiops@sweet-potato-prod",
+      "remote_home": "/home/aiops",
+      "transport": "ssh",
+      "clipboard_capable": true
+    },
+    "jeremy": {
+      "label": "Jeremy VPS",
+      "ssh_target": "skillbox@skillbox-jeremy-3",
+      "remote_home": "/home/skillbox",
+      "transport": "ssh",
+      "clipboard_capable": true
+    },
+    "conference1": {
+      "label": "Conference1 direct WSL",
+      "ssh_target": "worker@conference1-wsl",
+      "remote_home": "/home/worker",
+      "transport": "ssh",
+      "clipboard_capable": true,
+      "preferred": true
+    },
+    "conference1-fallback": {
+      "label": "Conference1 Windows SSH wrapper",
+      "ssh_target": "conference1-ssh",
+      "remote_home": "/home/worker",
+      "transport": "wsl",
+      "clipboard_capable": false,
+      "fallback_only": true,
+      "osc52_hostile": true
+    },
+    "generic": {
+      "label": "Generic user@host",
+      "scope": "remote",
+      "clipboard_capable": true
+    }
+  },
+  "conference_routing": {
+    "direct_alias": "conference1-wsl",
+    "direct_target": "worker@conference1-wsl",
+    "fallback_alias": "conference1-ssh",
+    "fallback_target": "conference1-ssh",
+    "probe_reachability": "ssh -o BatchMode=yes -o ConnectTimeout=5 conference1-wsl true",
+    "probe_mosh": "ssh -o BatchMode=yes -o ConnectTimeout=5 conference1-wsl 'command -v mosh-server'",
+    "route_order": ["direct_wsl", "mosh_if_available", "fallback_ssh_wrapper"]
+  },
+  "clipimg_aliases": {
+    "d": "d3",
+    "default": "d3",
+    "devbox": "d3",
+    "portfolio": "d3",
+    "s": "sweet",
+    "sp": "sweet",
+    "sweet": "sweet",
+    "j": "jeremy",
+    "jeremy": "jeremy",
+    "c": "conference1",
+    "conf": "conference1",
+    "conference": "conference1",
+    "conference1": "conference1"
+  }
+}
