@@ -96,9 +96,38 @@ This mode reads Claude/Codex JSONL logs directly, writes a lightweight last-seen
 
 Treat real user-triggered skill invocations as the experiment corpus. Do not fabricate synthetic reruns by default. Patch from live traces, ship once, then watch the next real invocation window.
 
+### Transcript Evidence Backend
+
+Prefer the configured evidence front door before hand-walking raw logs. In a
+Skillbox environment this is usually `sbp cass`, which searches a derived Cass
+index while keeping raw JSONL archive details out of the public skill contract.
+
+Probe health first:
+
+```bash
+if command -v sbp >/dev/null 2>&1; then
+  sbp cass status --json || true
+elif command -v cass >/dev/null 2>&1; then
+  echo "DEGRADED: no configured front door; bare cass searches only the local corpus" >&2
+  cass status --json || true
+fi
+```
+
+If the configured backend is stale, degraded, timed out, or unavailable during
+an active agent task, do **not** rebuild Cass as the fallback. Report
+`evidence_mode=degraded_cass`, then proceed with the local scanner in the review
+flow below. Cass is a derived index over raw JSONL archives; rebuilds are
+coordinated maintenance, not a one-task recovery path.
+
+Use bare `cass` only when no configured front door exists, and label those
+results `evidence_mode=local_corpus`. If `sbp cass` exists but fails, do not
+silently fall back to bare `cass`; use the local transcript scanner so the
+evidence mode is explicit and reproducible.
+
 ### Review Flow
 
-1. Scan transcript history for a target skill:
+1. Scan transcript history for a target skill, using this as the immediate
+fallback whenever CASS evidence is degraded:
 
 ```bash
 scripts/review_skill_usage.py --skill skill-issue --source both --limit 50 > /tmp/skill-issue-review.json

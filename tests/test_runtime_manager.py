@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import signal
 import shlex
 import shutil
 import subprocess
@@ -20,6 +21,8 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from tests.helpers import make_temp_workspace
+
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 MANAGER = ROOT_DIR / ".env-manager" / "manage.py"
@@ -33,6 +36,88 @@ MANAGE_MODULE = SourceFileLoader(
 
 
 class RuntimeManagerTests(unittest.TestCase):
+    _FIXTURE_DAEMON_SCRIPTS = ("fixture_daemon.py", "fixture_guarded_daemon.py")
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.addCleanup(self._cleanup_fixture_daemons)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        try:
+            cls._cleanup_fixture_daemons()
+        finally:
+            super().tearDownClass()
+
+    @classmethod
+    def _fixture_daemon_pids(cls) -> list[int]:
+        proc_root = Path("/proc")
+        if not proc_root.is_dir():
+            return []
+
+        pids: list[int] = []
+        for entry in proc_root.iterdir():
+            if not entry.name.isdecimal():
+                continue
+            try:
+                cmdline = (entry / "cmdline").read_bytes().decode("utf-8", errors="replace")
+            except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+                continue
+            if any(script in cmdline for script in cls._FIXTURE_DAEMON_SCRIPTS):
+                pids.append(int(entry.name))
+        return sorted(pids)
+
+    @classmethod
+    def _signal_fixture_daemon_groups(cls, sig: int) -> None:
+        current_pgid = os.getpgrp()
+        signaled_pgids: set[int] = set()
+        for pid in cls._fixture_daemon_pids():
+            try:
+                pgid = os.getpgid(pid)
+            except ProcessLookupError:
+                continue
+            except OSError:
+                continue
+
+            if pgid == current_pgid:
+                try:
+                    os.kill(pid, sig)
+                except (ProcessLookupError, OSError):
+                    pass
+                continue
+
+            if pgid in signaled_pgids:
+                continue
+            signaled_pgids.add(pgid)
+            try:
+                os.killpg(pgid, sig)
+            except (ProcessLookupError, OSError):
+                pass
+
+    @classmethod
+    def _wait_for_fixture_daemon_exit(cls, timeout_seconds: float) -> list[int]:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            pids = cls._fixture_daemon_pids()
+            if not pids:
+                return []
+            time.sleep(0.05)
+        return cls._fixture_daemon_pids()
+
+    @classmethod
+    def _cleanup_fixture_daemons(cls) -> None:
+        if not cls._fixture_daemon_pids():
+            return
+
+        cls._signal_fixture_daemon_groups(signal.SIGTERM)
+        remaining = cls._wait_for_fixture_daemon_exit(2.0)
+        if remaining:
+            cls._signal_fixture_daemon_groups(signal.SIGKILL)
+            remaining = cls._wait_for_fixture_daemon_exit(1.0)
+
+        if remaining:
+            raise AssertionError(f"fixture daemon processes still running after cleanup: {remaining}")
+
     def test_normalize_file_mode_rejects_out_of_range_modes(self) -> None:
         from runtime_manager.runtime_ops import normalize_file_mode
 
@@ -51,9 +136,8 @@ class RuntimeManagerTests(unittest.TestCase):
     def test_tail_lines_zero_or_negative_is_empty_not_full_file(self) -> None:
         from runtime_manager.runtime_ops import tail_lines
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            log_path = Path(tmpdir) / "service.log"
-            log_path.write_text("one\ntwo\nthree\n", encoding="utf-8")
+        with make_temp_workspace({"service.log": "one\ntwo\nthree\n"}) as root:
+            log_path = root / "service.log"
 
             self.assertEqual(tail_lines(log_path, 0), [])
             self.assertEqual(tail_lines(log_path, -1), [])
@@ -447,7 +531,7 @@ class RuntimeManagerTests(unittest.TestCase):
                     "listener": "public",
                     "path": "/v1",
                     "match": "prefix",
-                    "client": "jeremy",
+                    "client": "client_a",
                     "profiles": ["local-ecom"],
                 }
             )
@@ -722,26 +806,26 @@ class RuntimeManagerTests(unittest.TestCase):
             self._write_fixture(repo)
             self._write_client_overlay(
                 repo,
-                "buildooor",
+                "example-app",
                 label="Buildooor",
-                default_cwd="${SKILLBOX_MONOSERVER_ROOT}/buildooor",
-                root_path="${SKILLBOX_MONOSERVER_ROOT}/buildooor",
+                default_cwd="${SKILLBOX_MONOSERVER_ROOT}/example-app",
+                root_path="${SKILLBOX_MONOSERVER_ROOT}/example-app",
                 include_context=True,
             )
             clients_root = self._clients_host_root(repo)
-            (clients_root / "buildooor" / "skill-repos.yaml").write_text(
+            (clients_root / "example-app" / "skill-repos.yaml").write_text(
                 "version: 2\nskill_repos: []\n",
                 encoding="utf-8",
             )
-            client_cwd = repo / ".skillbox-state" / "monoserver" / "buildooor"
+            client_cwd = repo / ".skillbox-state" / "monoserver" / "example-app"
             client_cwd.mkdir(parents=True, exist_ok=True)
-            overlay_path = clients_root / "buildooor" / "overlay.yaml"
+            overlay_path = clients_root / "example-app" / "overlay.yaml"
             overlay_doc = MANAGE_MODULE.load_yaml(overlay_path)
             overlay_doc["client"].setdefault("services", []).append(
                 {
-                    "id": "buildooor-web",
+                    "id": "example-web",
                     "kind": "http",
-                    "repo_id": "buildooor-root",
+                    "repo_id": "example-root",
                     "command": "python3 -m http.server 3000",
                     "origin_url": "http://127.0.0.1:3000",
                     "healthcheck": {"type": "http", "url": "http://127.0.0.1:3000/health"},
@@ -759,10 +843,10 @@ class RuntimeManagerTests(unittest.TestCase):
             )
             self.assertEqual(status.returncode, 0, status.stderr)
             status_payload = json.loads(status.stdout)
-            self.assertEqual(status_payload["active_clients"], ["buildooor"])
-            service = next(item for item in status_payload["services"] if item["id"] == "buildooor-web")
+            self.assertEqual(status_payload["active_clients"], ["example-app"])
+            service = next(item for item in status_payload["services"] if item["id"] == "example-web")
             self.assertEqual(service["endpoint"]["exposure"], "loopback-only")
-            self.assertTrue(any("buildooor-web is loopback-only" in item for item in status_payload["warnings"]))
+            self.assertTrue(any("example-web is loopback-only" in item for item in status_payload["warnings"]))
 
             up = subprocess.run(
                 ["python3", str(MANAGER), "--root-dir", str(repo), "up", "--dry-run", "--format", "json"],
@@ -774,9 +858,9 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(up.returncode, 0, up.stderr)
             up_payload = json.loads(up.stdout)
             self.assertIn("box_access", up_payload)
-            up_service = next(item for item in up_payload["services"] if item["id"] == "buildooor-web")
+            up_service = next(item for item in up_payload["services"] if item["id"] == "example-web")
             self.assertEqual(up_service["endpoint"]["exposure"], "loopback-only")
-            self.assertTrue(any("buildooor-web is loopback-only" in item for item in up_payload["warnings"]))
+            self.assertTrue(any("example-web is loopback-only" in item for item in up_payload["warnings"]))
 
     def test_runtime_commands_infer_client_from_nested_operator_repo_with_mac_overlay_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -784,31 +868,31 @@ class RuntimeManagerTests(unittest.TestCase):
             self._write_fixture(repo)
             self._write_client_overlay(
                 repo,
-                "buildooor",
+                "example-app",
                 label="Buildooor",
-                default_cwd="/Users/b/repos/buildooor",
-                root_path="/Users/b/repos/buildooor",
+                default_cwd="/Users/operator/repos/example-app",
+                root_path="/Users/operator/repos/example-app",
                 include_context=True,
             )
             clients_root = self._clients_host_root(repo)
-            (clients_root / "buildooor" / "skill-repos.yaml").write_text(
+            (clients_root / "example-app" / "skill-repos.yaml").write_text(
                 "version: 2\nskill_repos: []\n",
                 encoding="utf-8",
             )
-            overlay_path = clients_root / "buildooor" / "overlay.yaml"
+            overlay_path = clients_root / "example-app" / "overlay.yaml"
             overlay_doc = MANAGE_MODULE.load_yaml(overlay_path)
             overlay_doc["client"].setdefault("services", []).append(
                 {
-                    "id": "buildooor-web",
+                    "id": "example-web",
                     "kind": "http",
-                    "repo_id": "buildooor-root",
+                    "repo_id": "example-root",
                     "command": "npm run dev -- --hostname 127.0.0.1 --port 3000",
                     "healthcheck": {"type": "http", "url": "http://127.0.0.1:3000/health"},
                     "profiles": ["core"],
                 }
             )
             overlay_path.write_text(MANAGE_MODULE.render_yaml_document(overlay_doc), encoding="utf-8")
-            nested_cwd = repo / ".skillbox-state" / "monoserver" / "buildooor" / "src" / "components"
+            nested_cwd = repo / ".skillbox-state" / "monoserver" / "example-app" / "src" / "components"
             nested_cwd.mkdir(parents=True, exist_ok=True)
 
             status = subprocess.run(
@@ -821,8 +905,8 @@ class RuntimeManagerTests(unittest.TestCase):
 
             self.assertEqual(status.returncode, 0, status.stderr)
             status_payload = json.loads(status.stdout)
-            self.assertEqual(status_payload["active_clients"], ["buildooor"])
-            service = next(item for item in status_payload["services"] if item["id"] == "buildooor-web")
+            self.assertEqual(status_payload["active_clients"], ["example-app"])
+            service = next(item for item in status_payload["services"] if item["id"] == "example-web")
             self.assertEqual(service["endpoint"]["exposure"], "loopback-only")
 
     def test_sync_reconciles_safe_git_repo_residue_into_a_real_clone(self) -> None:
@@ -1023,8 +1107,8 @@ class RuntimeManagerTests(unittest.TestCase):
 
             sync = self._run(repo, "sync", "--profile", "connectors-dev", "--format", "json")
             self.assertEqual(sync.returncode, 0, sync.stderr)
-            self.assertTrue((repo / "repos" / "flywheel_connectors").is_dir())
-            self.assertTrue((repo / "repos" / "destructive_command_guard").is_dir())
+            self.assertTrue((repo / "repos" / "flywheel-connectors").is_dir())
+            self.assertTrue((repo / "repos" / "destructive-command-guard").is_dir())
 
     def test_doctor_fails_when_client_connectors_exceed_box_superset(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1235,9 +1319,9 @@ class RuntimeManagerTests(unittest.TestCase):
 
             with mock.patch.dict(os.environ, {
                 "SKILLBOX_BOX_SELF": "true",
-                "SKILLBOX_BOX_ID": "portfolio-devbox",
+                "SKILLBOX_BOX_ID": "worker-devbox",
                 "SKILLBOX_BOX_TAILSCALE_IP": "100.86.253.9",
-                "SKILLBOX_BOX_TAILSCALE_HOSTNAME": "portfolio-devbox",
+                "SKILLBOX_BOX_TAILSCALE_HOSTNAME": "worker-devbox",
                 "SKILLBOX_SWIMMERS_PORT": "3210",
             }):
                 text_result = self._run(repo, "status")
@@ -1298,6 +1382,115 @@ class RuntimeManagerTests(unittest.TestCase):
                 ["started", "started"],
             )
             self.assertTrue((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-worker.ready").is_file())
+
+    def test_up_partial_failure_keeps_started_and_skips_dependents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._install_fixture_partial_start_graph(repo)
+            self.addCleanup(self._run, repo, "down", "--service", "fixture-a", "--format", "json")
+
+            up = self._run(
+                repo,
+                "up",
+                "--service",
+                "fixture-c",
+                "--wait-seconds",
+                "0.5",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(up.returncode, 1, up.stderr)
+            payload = json.loads(up.stdout)
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["started"][0]["id"], "fixture-a")
+            self.assertEqual(payload["failed"]["id"], "fixture-b")
+            self.assertIn("exited with code 7", payload["failed"]["error"])
+            self.assertEqual(payload["skipped_dependents"], ["fixture-c"])
+            self.assertEqual(payload["skipped"][0]["blocking_chain"], ["fixture-b"])
+            self.assertEqual(payload["error"]["blocked_services"], ["fixture-b", "fixture-c"])
+            self.assertIn("up --service fixture-c", payload["next_actions"][0])
+            self.assertIn("down --service fixture-a", payload["next_actions"][1])
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-a.ready").is_file())
+            self.assertFalse((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-c.ready").exists())
+
+            text = self._run(repo, "up", "--service", "fixture-c", "--wait-seconds", "0.1")
+            self.assertEqual(text.returncode, 1, text.stderr)
+            self.assertIn("service start:", text.stdout)
+            self.assertIn("fixture-c", text.stdout)
+            self.assertIn("skipped", text.stdout)
+
+    def test_up_strict_rolls_back_started_services_from_this_invocation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._install_fixture_partial_start_graph(repo)
+
+            up = self._run(
+                repo,
+                "up",
+                "--strict",
+                "--service",
+                "fixture-c",
+                "--wait-seconds",
+                "0.5",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(up.returncode, 1, up.stderr)
+            payload = json.loads(up.stdout)
+            self.assertFalse(payload["ok"])
+            self.assertTrue(payload["strict"])
+            self.assertEqual([item["id"] for item in payload["rollback_services"]], ["fixture-a"])
+            self.assertIn(payload["rollback_services"][0]["result"], {"stopped", "killed"})
+            service_rows = {item["id"]: item for item in payload["services"]}
+            self.assertTrue(service_rows["fixture-a"]["rolled_back"])
+            self.assertFalse((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-a.pid").exists())
+            self.assertFalse((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-a.ready").exists())
+
+    def test_up_resume_command_completes_partial_graph_after_fix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_fixture(repo)
+            self._install_fixture_partial_start_graph(repo)
+            self.addCleanup(self._run, repo, "down", "--format", "json")
+
+            first = self._run(
+                repo,
+                "up",
+                "--service",
+                "fixture-c",
+                "--wait-seconds",
+                "0.5",
+                "--format",
+                "json",
+            )
+            self.assertEqual(first.returncode, 1, first.stderr)
+            first_payload = json.loads(first.stdout)
+            self.assertIn("up --service fixture-c", first_payload["resume_command"])
+
+            self._fix_fixture_partial_start_middle_service(repo)
+            resumed = self._run(
+                repo,
+                "up",
+                "--service",
+                "fixture-c",
+                "--wait-seconds",
+                "1",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            payload = json.loads(resumed.stdout)
+            results_by_id = {item["id"]: item for item in payload["services"]}
+            self.assertEqual(results_by_id["fixture-a"]["result"], "already-running")
+            self.assertEqual(results_by_id["fixture-b"]["result"], "started")
+            self.assertEqual(results_by_id["fixture-c"]["result"], "started")
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-b.ready").is_file())
+            self.assertTrue((repo / ".skillbox-state" / "logs" / "runtime" / "fixture-c.ready").is_file())
 
     def test_down_selected_dependency_stops_dependents_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4835,6 +5028,10 @@ class RuntimeManagerTests(unittest.TestCase):
             "    runtime_path: /workspace\n"
             "    storage_class: external\n"
             "    source_ref: root_dir\n"
+            "  - id: home-root\n"
+            "    runtime_path: /home/sandbox\n"
+            "    storage_class: persistent\n"
+            "    relative_path: home\n"
             "  - id: claude-home\n"
             "    runtime_path: /home/sandbox/.claude\n"
             "    storage_class: persistent\n"
@@ -5049,9 +5246,11 @@ class RuntimeManagerTests(unittest.TestCase):
             "        path: ${SKILLBOX_LOG_ROOT}/swimmers/swimmers-server.pid\n"
             "      log: swimmers\n"
             "    - id: cm-mcp\n"
-            "      kind: mcp\n"
+            "      kind: mcp-bridge\n"
             "      artifact: cm-bin\n"
             "      required: false\n"
+            "      transport: http\n"
+            "      port: ${SKILLBOX_CM_MCP_PORT}\n"
             "      profiles:\n"
             "        - core\n"
             "      command: ${SKILLBOX_CM_BIN} serve --port ${SKILLBOX_CM_MCP_PORT}\n"
@@ -5059,9 +5258,10 @@ class RuntimeManagerTests(unittest.TestCase):
             "        CASS_MEMORY_LLM: none\n"
             "        CASS_PATH: ${SKILLBOX_CASS_BIN}\n"
             "      healthcheck:\n"
-            "        type: http\n"
-            "        url: http://127.0.0.1:${SKILLBOX_CM_MCP_PORT}/health\n"
-            "        timeout_seconds: 0.5\n"
+            "        type: mcp_ready\n"
+            "        transport: http\n"
+            "        url: http://127.0.0.1:${SKILLBOX_CM_MCP_PORT}\n"
+            "        timeout_seconds: 0.2\n"
             "      depends_on:\n"
             "        - cass-bin\n"
             "        - cm-bin\n"
@@ -5152,26 +5352,32 @@ class RuntimeManagerTests(unittest.TestCase):
             "        mode: copy-if-missing\n"
             "  services:\n"
             "    - id: fwc-mcp\n"
-            "      kind: mcp\n"
+            "      kind: mcp-bridge\n"
             "      artifact: fwc-bin\n"
             "      required: false\n"
+            "      transport: stdio\n"
             "      profiles:\n"
             "        - connectors\n"
             "      command: ${SKILLBOX_FWC_BIN} serve-mcp --zone ${SKILLBOX_FWC_ZONE} --connectors ${SKILLBOX_FWC_CONNECTORS}\n"
             "      healthcheck:\n"
-            "        type: process_running\n"
-            "        pattern: fwc serve-mcp\n"
+            "        type: mcp_ready\n"
+            "        transport: stdio\n"
+            "        probe_command: ${SKILLBOX_FWC_BIN} serve-mcp --zone ${SKILLBOX_FWC_ZONE} --connectors ${SKILLBOX_FWC_CONNECTORS}\n"
+            "        timeout_seconds: 0.2\n"
             "      log: connectors\n"
             "    - id: dcg-mcp\n"
-            "      kind: mcp\n"
+            "      kind: mcp-bridge\n"
             "      artifact: dcg-bin\n"
             "      required: false\n"
+            "      transport: stdio\n"
             "      profiles:\n"
             "        - connectors\n"
             "      command: ${SKILLBOX_DCG_BIN} mcp\n"
             "      healthcheck:\n"
-            "        type: process_running\n"
-            "        pattern: dcg mcp\n"
+            "        type: mcp_ready\n"
+            "        transport: stdio\n"
+            "        probe_command: ${SKILLBOX_DCG_BIN} mcp\n"
+            "        timeout_seconds: 0.2\n"
             "      log: connectors\n"
             "  logs:\n"
             "    - id: connectors\n"
@@ -5195,7 +5401,7 @@ class RuntimeManagerTests(unittest.TestCase):
             "  repos:\n"
             "    - id: flywheel-connectors\n"
             "      kind: repo\n"
-            "      path: ${SKILLBOX_REPOS_ROOT}/flywheel_connectors\n"
+            "      path: ${SKILLBOX_REPOS_ROOT}/flywheel-connectors\n"
             "      required: false\n"
             "      profiles:\n"
             "        - connectors-dev\n"
@@ -5205,7 +5411,7 @@ class RuntimeManagerTests(unittest.TestCase):
             "        mode: ensure-directory\n"
             "    - id: destructive-command-guard\n"
             "      kind: repo\n"
-            "      path: ${SKILLBOX_REPOS_ROOT}/destructive_command_guard\n"
+            "      path: ${SKILLBOX_REPOS_ROOT}/destructive-command-guard\n"
             "      required: false\n"
             "      profiles:\n"
             "        - connectors-dev\n"
@@ -5295,6 +5501,18 @@ class RuntimeManagerTests(unittest.TestCase):
         )
         (repo / ".env-manager" / "mcp_server.py").write_text(
             (ROOT_DIR / ".env-manager" / "mcp_server.py").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        # mcp_server.py imports the shared secret-redaction leaf (scripts/lib/
+        # redaction.py) the same way it runs in /workspace (full repo present).
+        # Stage it so the fixture faithfully mirrors the real launch environment.
+        (repo / "scripts" / "lib").mkdir(parents=True, exist_ok=True)
+        (repo / "scripts" / "lib" / "__init__.py").write_text(
+            (ROOT_DIR / "scripts" / "lib" / "__init__.py").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        (repo / "scripts" / "lib" / "redaction.py").write_text(
+            (ROOT_DIR / "scripts" / "lib" / "redaction.py").read_text(encoding="utf-8"),
             encoding="utf-8",
         )
         (repo / ".mcp.json").write_text(
@@ -5463,7 +5681,7 @@ class RuntimeManagerTests(unittest.TestCase):
                     "listener": "public",
                     "path": "/v1/report",
                     "match": "exact",
-                    "client": "jeremy",
+                    "client": "client_a",
                     "profiles": ["local-ecom"],
                 }
             ],
@@ -5474,7 +5692,7 @@ class RuntimeManagerTests(unittest.TestCase):
             "tasks": [],
             "checks": [],
             "clients": [],
-            "active_clients": ["jeremy"],
+            "active_clients": ["client_a"],
             "active_profiles": ["core", "local-ecom"],
         }
 
@@ -5645,6 +5863,101 @@ class RuntimeManagerTests(unittest.TestCase):
                 "        path: ${SKILLBOX_LOG_ROOT}/runtime/fixture-worker.ready\n"
                 "      log: runtime\n"
                 "  logs:\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+    def _install_fixture_partial_start_graph(self, repo: Path) -> None:
+        scripts_dir = repo / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / "fixture_daemon.py").write_text(
+            "from __future__ import annotations\n"
+            "\n"
+            "import signal\n"
+            "import sys\n"
+            "import time\n"
+            "from pathlib import Path\n"
+            "\n"
+            "ready_path = Path(sys.argv[1])\n"
+            "label = sys.argv[2] if len(sys.argv) > 2 else ready_path.stem\n"
+            "ready_path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "\n"
+            "def shutdown(*_args: object) -> None:\n"
+            "    try:\n"
+            "        ready_path.unlink()\n"
+            "    except FileNotFoundError:\n"
+            "        pass\n"
+            "    raise SystemExit(0)\n"
+            "\n"
+            "signal.signal(signal.SIGTERM, shutdown)\n"
+            "signal.signal(signal.SIGINT, shutdown)\n"
+            "ready_path.write_text('ok\\n', encoding='utf-8')\n"
+            "print(f'{label} ready', flush=True)\n"
+            "while True:\n"
+            "    time.sleep(0.2)\n",
+            encoding="utf-8",
+        )
+        (scripts_dir / "fixture_fail.py").write_text(
+            "import sys\n"
+            "print('fixture-b boom', flush=True)\n"
+            "sys.exit(7)\n",
+            encoding="utf-8",
+        )
+
+        runtime_path = repo / "workspace" / "runtime.yaml"
+        runtime_path.write_text(
+            runtime_path.read_text(encoding="utf-8").replace(
+                "  logs:\n",
+                "    - id: fixture-a\n"
+                "      kind: daemon\n"
+                "      repo: skillbox-self\n"
+                "      required: false\n"
+                "      profiles:\n"
+                "        - core\n"
+                "      command: python3 scripts/fixture_daemon.py ${SKILLBOX_LOG_ROOT}/runtime/fixture-a.ready fixture-a\n"
+                "      healthcheck:\n"
+                "        type: path_exists\n"
+                "        path: ${SKILLBOX_LOG_ROOT}/runtime/fixture-a.ready\n"
+                "      log: runtime\n"
+                "    - id: fixture-b\n"
+                "      kind: daemon\n"
+                "      repo: skillbox-self\n"
+                "      required: false\n"
+                "      profiles:\n"
+                "        - core\n"
+                "      depends_on:\n"
+                "        - fixture-a\n"
+                "      command: python3 scripts/fixture_fail.py\n"
+                "      healthcheck:\n"
+                "        type: path_exists\n"
+                "        path: ${SKILLBOX_LOG_ROOT}/runtime/fixture-b.ready\n"
+                "      log: runtime\n"
+                "    - id: fixture-c\n"
+                "      kind: daemon\n"
+                "      repo: skillbox-self\n"
+                "      required: false\n"
+                "      profiles:\n"
+                "        - core\n"
+                "      depends_on:\n"
+                "        - fixture-b\n"
+                "      command: python3 scripts/fixture_daemon.py ${SKILLBOX_LOG_ROOT}/runtime/fixture-c.ready fixture-c\n"
+                "      healthcheck:\n"
+                "        type: path_exists\n"
+                "        path: ${SKILLBOX_LOG_ROOT}/runtime/fixture-c.ready\n"
+                "      log: runtime\n"
+                "  logs:\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+    def _fix_fixture_partial_start_middle_service(self, repo: Path) -> None:
+        runtime_path = repo / "workspace" / "runtime.yaml"
+        runtime_path.write_text(
+            runtime_path.read_text(encoding="utf-8").replace(
+                "      command: python3 scripts/fixture_fail.py\n",
+                "      command: python3 scripts/fixture_daemon.py ${SKILLBOX_LOG_ROOT}/runtime/fixture-b.ready fixture-b\n",
                 1,
             ),
             encoding="utf-8",
@@ -6179,7 +6492,7 @@ class RuntimeManagerTests(unittest.TestCase):
             overlay_doc = MANAGE_MODULE.load_yaml(overlay_path)
             overlay_doc.setdefault("client", {})["context"] = {
                 "cwd_match": [
-                    "repos/sweet-potato",
+                    "repos/example-app",
                     "~/repos/opensource",
                     "/monoserver",
                 ],
@@ -6192,9 +6505,9 @@ class RuntimeManagerTests(unittest.TestCase):
                 },
                 "domains": {
                     "frontends": {
-                        "buildooor": {
+                        "example-app": {
                             "local": "http://localhost:3000",
-                            "repo_slug": "build000r/buildooor",
+                            "repo_slug": "example/example-app",
                         }
                     }
                 },
@@ -6214,7 +6527,7 @@ class RuntimeManagerTests(unittest.TestCase):
             context_doc = MANAGE_MODULE.load_yaml(client_dir / "context.yaml")
             self.assertEqual(
                 Path(str(context_doc["cwd_match"][0])).resolve(),
-                (client_dir / "repos/sweet-potato").resolve(),
+                (client_dir / "repos/example-app").resolve(),
             )
             self.assertEqual(context_doc["cwd_match"][1], "~/repos/opensource")
             self.assertEqual(context_doc["cwd_match"][2], "/monoserver")
@@ -6231,12 +6544,12 @@ class RuntimeManagerTests(unittest.TestCase):
                 (client_dir / "workflows/INDEX.md").resolve(),
             )
             self.assertEqual(
-                context_doc["domains"]["frontends"]["buildooor"]["local"],
+                context_doc["domains"]["frontends"]["example-app"]["local"],
                 "http://localhost:3000",
             )
             self.assertEqual(
-                context_doc["domains"]["frontends"]["buildooor"]["repo_slug"],
-                "build000r/buildooor",
+                context_doc["domains"]["frontends"]["example-app"]["repo_slug"],
+                "example/example-app",
             )
             self.assertEqual(
                 context_doc["deploy"]["legacy_ssh_key"],
@@ -6725,6 +7038,71 @@ class RuntimeManagerTests(unittest.TestCase):
         self.assertEqual([item["code"] for item in doctor["failures"]], ["skill-repo-lock"])
         self.assertEqual([item["code"] for item in doctor["warnings"]], ["pulse"])
 
+    def test_stewardship_pulse_evidence_includes_port_guard_counters(self) -> None:
+        from runtime_manager import workflows
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            runtime_dir = root / "logs" / "runtime"
+            runtime_dir.mkdir(parents=True)
+            (runtime_dir / "pulse.state.json").write_text(
+                json.dumps(
+                    {
+                        "pid": 123,
+                        "updated_at": time.time(),
+                        "cycle_count": 9,
+                        "port_sentinel": {
+                            "mode": "observe",
+                            "rogues_seen": 2,
+                            "rogues_reaped": 1,
+                            "first_seen_at": "2026-06-01T00:00:00Z",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (runtime_dir / "port-guard.telemetry.json").write_text(
+                json.dumps(
+                    {
+                        "counters": {
+                            "hook_blocks": 4,
+                            "shim_blocks": 1,
+                            "post_bind_mismatches": 2,
+                            "wildcard_criticals": 0,
+                            "last_seen_at": "2026-06-15T00:00:00Z",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            evidence = workflows._stewardship_pulse_evidence(  # noqa: SLF001
+                root,
+                {"logs": [{"id": "runtime", "host_path": str(runtime_dir)}]},
+                time.time(),
+            )
+
+        port_sentinel = evidence["port_sentinel"]
+        self.assertEqual(port_sentinel["hook_blocks"], 4)
+        self.assertEqual(port_sentinel["shim_blocks"], 1)
+        self.assertEqual(port_sentinel["post_bind_mismatches"], 2)
+        self.assertEqual(port_sentinel["rogues_seen"], 2)
+        self.assertIn(evidence["port_guard"]["status"], {"warming_up", "assessed"})
+
+    def test_stewardship_port_guard_assessment_blocks_wildcard_criticals(self) -> None:
+        from runtime_manager import workflows
+
+        first_seen = time.time() - (15 * 86400)
+        evidence = workflows._port_guard_assessment(  # noqa: SLF001
+            {
+                "first_seen_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(first_seen)),
+                "wildcard_criticals": 1,
+            },
+            time.time(),
+        )
+
+        self.assertEqual(evidence["status"], "blocked")
+        self.assertFalse(evidence["enforce_flip_ready"])
+
     def test_stewardship_helper_risks_include_doctor_first(self) -> None:
         from runtime_manager import workflows
 
@@ -6774,6 +7152,17 @@ class RuntimeManagerTests(unittest.TestCase):
                     "recent_errors": {"count": 1},
                 },
                 "evidence": {
+                    "pulse": {
+                        "port_sentinel": {
+                            "hook_blocks": 2,
+                            "shim_blocks": 1,
+                            "post_bind_mismatches": 1,
+                            "rogues_seen": 3,
+                            "rogues_reaped": 1,
+                            "wildcard_criticals": 0,
+                        },
+                        "port_guard": {"status": "warming_up"},
+                    },
                     "doctor": {
                         "status": "fail",
                         "counts": {"fail": 1},
@@ -6807,6 +7196,7 @@ class RuntimeManagerTests(unittest.TestCase):
         self.assertIn("# Stewardship Report: personal", markdown)
         self.assertIn("HIGH: Runtime doctor validation is failing (`doctor-validation`)", markdown)
         self.assertIn("- Doctor: fail (1 failing)", markdown)
+        self.assertIn("- Port guard: hook 2, shim 1, post-bind 1, rogues 3/1, wildcard 0 (warming_up)", markdown)
         self.assertIn("Failure `skill-repo-lock`: managed skill locks are stale", markdown)
         self.assertIn("personal: config_sha mismatch", markdown)
         self.assertIn("- backup-recovery: No restore drill.", markdown)

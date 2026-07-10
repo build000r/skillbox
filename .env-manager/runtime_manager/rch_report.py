@@ -158,7 +158,7 @@ def collect_rch_report(
     binary: str | None = None,
     run_probes: bool = True,
     timeout_seconds: float = 5.0,
-    target_box: str = "portfolio-devbox",
+    target_box: str = "worker-devbox",
 ) -> dict[str, Any]:
     configured_binary, source = _binary_from_arg_env_or_path(binary)
     binary_present = bool(configured_binary and source not in {"argument-missing", "env-missing"})
@@ -182,7 +182,7 @@ def collect_rch_report(
         },
         "approved_worker_scope": {
             "default_target": target_box,
-            "excluded_targets": ["jeremy", "ssh-info", "sweet-potato-prod"],
+            "excluded_targets": ["prod", "production", "primary-prod"],
             "remote_writes_allowed": False,
         },
         "global_hook_install": {

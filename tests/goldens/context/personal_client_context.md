@@ -27,6 +27,21 @@ You are inside a skillbox workspace container.
 | personal-root | `/monoserver` | repo-root | - | - |
 | recipe-ios | `/monoserver/recipe-ios` | repo | ios | build, test, sim, device-local, device-fixtures, device-prod, archive, upload, screenshots |
 
+## Ports
+
+Single source of truth for declared ports. Run `python3 .env-manager/manage.py ports --format json` for the live registry.
+
+| Port | Owner | Kind | Client | Profiles | Bind | Source |
+|------|-------|------|--------|----------|------|--------|
+| 3000 | SKILLBOX_WEB_PORT | env_surface | - | - | loopback | `.env:SKILLBOX_WEB_PORT` |
+| 3210 | SKILLBOX_SWIMMERS_PORT | env_surface | - | - | loopback | `.env:SKILLBOX_SWIMMERS_PORT` |
+| 3220 | SKILLBOX_DCG_MCP_PORT | env_surface | - | - | loopback | `.env:SKILLBOX_DCG_MCP_PORT` |
+| 3221 | SKILLBOX_FWC_MCP_PORT | env_surface | - | - | loopback | `.env:SKILLBOX_FWC_MCP_PORT` |
+| 3222 | SKILLBOX_CM_MCP_PORT | env_surface | - | - | loopback | `.env:SKILLBOX_CM_MCP_PORT` |
+| 8000 | SKILLBOX_API_PORT | env_surface | - | - | loopback | `.env:SKILLBOX_API_PORT` |
+| 8080 | SKILLBOX_INGRESS_PUBLIC_PORT | env_surface | - | - | loopback | `.env:SKILLBOX_INGRESS_PUBLIC_PORT` |
+| 9080 | SKILLBOX_INGRESS_PRIVATE_PORT | env_surface | - | - | loopback | `.env:SKILLBOX_INGRESS_PRIVATE_PORT` |
+
 ## Quick Reference
 
 ```bash

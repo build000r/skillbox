@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,46 @@ def _completed(stdout: str, *, returncode: int = 0, stderr: str = "") -> subproc
 
 
 class CommandAdapterTests(unittest.TestCase):
+    def test_tool_wrappers_all_use_adapter_specs(self) -> None:
+        seen: list[tuple[str, str, list[str]]] = []
+
+        def fake_run_adapter(
+            spec: ADAPT.AdapterSpec,
+            *,
+            context: object | None = None,
+            **_kwargs: object,
+        ) -> ADAPT.AdapterResult:
+            args = spec.args_builder(context if isinstance(context, dict) else {})
+            seen.append((spec.name, spec.binary, args))
+            return ADAPT.AdapterResult(
+                status="ok",
+                payload={},
+                raw_excerpt="",
+                elapsed_ms=1,
+                source_command=[spec.binary, *args],
+                timeout_seconds=spec.timeout_default,
+                timeout_source="default",
+                warnings=[],
+                source=spec.name,
+            )
+
+        root = Path("/repo")
+        with mock.patch.object(ADAPT, "run_adapter", side_effect=fake_run_adapter):
+            ADAPT.br_ready_adapter(root)
+            ADAPT.bv_triage_adapter(root)
+            ADAPT.sbp_skills_adapter(root)
+            ADAPT.ntm_activity_adapter("sess", root_dir=root)
+
+        self.assertEqual(
+            seen,
+            [
+                ("br", "br", ["ready", "--json"]),
+                ("bv", "bv", ["--robot-triage", "--format", "json"]),
+                ("sbp", "sbp", ["skills", "--issues-only", "--format", "json"]),
+                ("ntm", "ntm", ["activity", "sess", "--json"]),
+            ],
+        )
+
     def test_successful_json_command_is_parsed_with_timeout_and_cwd(self) -> None:
         calls: list[dict[str, object]] = []
 
@@ -42,6 +83,9 @@ class CommandAdapterTests(unittest.TestCase):
         self.assertEqual(result["payload"], {"items": [1]})
         self.assertEqual(calls[0]["timeout"], ADAPT.DEFAULT_TIMEOUTS["br"])
         self.assertEqual(calls[0]["command"], ["br", "ready", "--json"])
+        self.assertEqual(result["timeout_seconds"], ADAPT.DEFAULT_TIMEOUTS["br"])
+        self.assertEqual(result["source_command"], ["br", "ready", "--json"])
+        self.assertIn("elapsed_ms", result)
 
     def test_missing_command_degrades_without_raising(self) -> None:
         def fake_run(_command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -62,7 +106,7 @@ class CommandAdapterTests(unittest.TestCase):
         result = ADAPT.run_command_adapter("bv", ["bv", "--robot-triage"], subprocess_run=fake_run)
 
         self.assertFalse(result["ok"])
-        self.assertEqual(result["status"], "degraded")
+        self.assertEqual(result["status"], "nonzero_exit")
         self.assertEqual(result["exit_code"], 2)
         self.assertEqual(result["warnings"][0]["code"], "ADAPTER_NONZERO_EXIT")
         self.assertNotIn("token-secret", result["stderr"])
@@ -76,6 +120,7 @@ class CommandAdapterTests(unittest.TestCase):
 
         json_result = ADAPT.run_command_adapter("bv", ["bv"], subprocess_run=bad_json)
         self.assertFalse(json_result["ok"])
+        self.assertEqual(json_result["status"], "parse_error")
         self.assertEqual(json_result["warnings"][0]["code"], "MALFORMED_JSON")
         self.assertIn("{not json", json_result["stdout_preview"])
 
@@ -89,6 +134,7 @@ class CommandAdapterTests(unittest.TestCase):
             subprocess_run=toon,
         )
         self.assertFalse(toon_result["ok"])
+        self.assertEqual(toon_result["status"], "parse_error")
         self.assertEqual(toon_result["warnings"][0]["code"], "MALFORMED_TOON")
 
     def test_timeout_is_structured_and_redacted(self) -> None:
@@ -107,6 +153,116 @@ class CommandAdapterTests(unittest.TestCase):
         self.assertEqual(result["warnings"][0]["code"], "ADAPTER_TIMEOUT")
         self.assertEqual(result["stdout_preview"], "partial")
         self.assertNotIn("secret", result["stderr"])
+        self.assertEqual(result["timeout_seconds"], ADAPT.DEFAULT_TIMEOUTS["sbp"])
+
+    def test_env_tunable_timeout_extends_sleeping_fake_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bin_path = Path(tmpdir) / "bv"
+            bin_path.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json\n"
+                "import time\n"
+                "time.sleep(0.12)\n"
+                "print(json.dumps({'ok': True}))\n",
+                encoding="utf-8",
+            )
+            bin_path.chmod(0o755)
+            spec = ADAPT.AdapterSpec(
+                name="bv",
+                binary=str(bin_path),
+                args_builder=lambda _context: [],
+                timeout_default=0.05,
+                parse=lambda stdout: json.loads(stdout),
+            )
+
+            result = ADAPT.run_adapter(spec, env={"SKILLBOX_ADAPTER_TIMEOUT_BV": "0.3"}).to_payload()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["payload"], {"ok": True})
+        self.assertEqual(result["timeout_seconds"], 0.3)
+        self.assertEqual(result["timeout_source"], "SKILLBOX_ADAPTER_TIMEOUT_BV")
+
+    def test_global_timeout_multiplier_is_reported_and_capped(self) -> None:
+        calls: list[float] = []
+
+        def fake_run(_command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append(float(kwargs["timeout"]))
+            return _completed("{}")
+
+        spec = ADAPT.AdapterSpec(
+            name="br",
+            binary="br",
+            args_builder=lambda _context: ["ready", "--json"],
+            timeout_default=20.0,
+            parse=lambda stdout: json.loads(stdout),
+        )
+
+        result = ADAPT.run_adapter(
+            spec,
+            env={"SKILLBOX_ADAPTER_TIMEOUT": "3"},
+            subprocess_run=fake_run,
+        ).to_payload()
+
+        self.assertEqual(calls, [ADAPT.MAX_ADAPTER_TIMEOUT_SECONDS])
+        self.assertEqual(result["timeout_seconds"], ADAPT.MAX_ADAPTER_TIMEOUT_SECONDS)
+        self.assertEqual(result["timeout_source"], "SKILLBOX_ADAPTER_TIMEOUT")
+        self.assertEqual(result["warnings"][0]["code"], "ADAPTER_TIMEOUT_CAPPED")
+
+    def test_timeout_missing_binary_nonzero_and_parse_error_have_distinct_statuses(self) -> None:
+        def timeout_run(_command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(["br"], timeout=1.5)
+
+        timeout_result = ADAPT.run_command_adapter("br", ["br"], subprocess_run=timeout_run)
+        self.assertEqual(timeout_result["status"], "timeout")
+
+        def missing_run(_command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            raise FileNotFoundError("missing")
+
+        missing_result = ADAPT.run_command_adapter("br", ["br"], subprocess_run=missing_run)
+        self.assertEqual(missing_result["status"], "unavailable")
+
+        def nonzero_run(_command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            return _completed("{}", returncode=12)
+
+        nonzero_result = ADAPT.run_command_adapter("br", ["br"], subprocess_run=nonzero_run)
+        self.assertEqual(nonzero_result["status"], "nonzero_exit")
+
+        def bad_json(_command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            return _completed("{")
+
+        parse_result = ADAPT.run_command_adapter("br", ["br"], subprocess_run=bad_json)
+        self.assertEqual(parse_result["status"], "parse_error")
+
+    def test_runner_fault_injection_never_raises(self) -> None:
+        specs = [
+            ADAPT.AdapterSpec(
+                name="br",
+                binary="br",
+                args_builder=lambda _context: (_ for _ in ()).throw(RuntimeError("args broke")),
+                timeout_default=0.1,
+                parse=lambda stdout: json.loads(stdout),
+            ),
+            ADAPT.AdapterSpec(
+                name="bv",
+                binary="bv",
+                args_builder=lambda _context: [],
+                timeout_default=0.1,
+                parse=lambda _stdout: (_ for _ in ()).throw(RuntimeError("parse broke")),
+            ),
+        ]
+
+        args_result = ADAPT.run_adapter(specs[0], subprocess_run=lambda *_a, **_k: _completed("{}")).to_payload()
+        parse_result = ADAPT.run_adapter(specs[1], subprocess_run=lambda *_a, **_k: _completed("{}")).to_payload()
+
+        def boom(_command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            raise RuntimeError("subprocess broke")
+
+        subprocess_result = ADAPT.run_command_adapter("sbp", ["sbp"], subprocess_run=boom)
+
+        self.assertEqual(args_result["status"], "unavailable")
+        self.assertEqual(parse_result["status"], "parse_error")
+        self.assertEqual(subprocess_result["status"], "unavailable")
 
     def test_wrappers_use_expected_commands(self) -> None:
         commands: list[list[str]] = []
@@ -134,6 +290,27 @@ class CommandAdapterTests(unittest.TestCase):
                 ["ntm", "activity", "sess", "--json"],
             ],
         )
+
+    def test_collect_evidence_exposes_elapsed_and_applied_timeout(self) -> None:
+        def fake_run(_command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            return _completed("{}")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                **os.environ,
+                "SKILLBOX_ADAPTER_TIMEOUT_BR": "0.2",
+                "SKILLBOX_ADAPTER_TIMEOUT_BV": "0.2",
+                "SKILLBOX_ADAPTER_TIMEOUT_SBP": "0.2",
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                with mock.patch.object(ADAPT.subprocess, "run", side_effect=fake_run):
+                    payload = ADAPT.collect_agent_adapter_evidence(Path(tmpdir))
+
+        br_ready = payload["adapters"]["br_ready"]
+        self.assertEqual(br_ready["status"], "ok")
+        self.assertEqual(br_ready["source_command"], ["br", "ready", "--json"])
+        self.assertEqual(br_ready["timeout_seconds"], 0.2)
+        self.assertIn("elapsed_ms", br_ready)
 
 
 class FileAndInProcessAdapterTests(unittest.TestCase):

@@ -14,6 +14,8 @@ mode="${SKILLBOX_MODE:-reuse}"
 action="home"
 services=()
 sync_paths=()
+sync_dry_run="false"
+sync_yes="false"
 passthrough_args=()
 runtime_args=()
 json_alias_diagnostics=()
@@ -147,18 +149,21 @@ Usage:
   __WRAPPER__ logs [profile] service  Show service logs
   __WRAPPER__ launch DIR... --request "..."  Launch one Swimmers agent per dir
   __WRAPPER__ bulk DIR... --request "..."    Alias for launch
-  __WRAPPER__ recalibrate [args...]   Read-only cwd skill add/remove recalibration
+  __WRAPPER__ recalibrate [args...]   Read cwd skill drift; --auto-fix previews heal, --yes applies
   __WRAPPER__ candidates [args...]    Explore linkable skill sources for this cwd
   __WRAPPER__ mcp [args...]           Read-only Claude JSON / Codex TOML MCP audit
+  __WRAPPER__ mcp sync [args...]     Render .mcp.json + .codex/config.toml from declaration (--dry-run default)
   __WRAPPER__ doctor [--format json]  One front door for all STRUCTURAL gates
                               (INCO/FAIL/PASS); complements `make doctor`.
                               Exits nonzero on FAIL only.
   __WRAPPER__ registry doctor [args...] Check registry/repos.yaml against local Git repos
-  __WRAPPER__ cass status|search|rebuild|doctor  Remote portfolio-devbox Cass front door
+  __WRAPPER__ cass status|search|rebuild|doctor  Remote Cass front door.
+                              Use status/search for active tasks; treat rebuild as
+                              coordinated maintenance, not degraded-mode fallback.
   __WRAPPER__ evidence [--repo P|--skill N] --format json  Measure skill invocations per
                               repo from Cass (contamination-safe), joined to current policy
   __WRAPPER__ cron [status|apply]     Declared crontab + script links from skillbox-config
-  __WRAPPER__ send-later schedule --minutes N ...  One-shot delayed NTM/tmux send
+  __WRAPPER__ send-later [list|doctor|new|panes] Schedule/inspect delayed/recurring tmux/NTM sends (--json on list/doctor/panes)
   __WRAPPER__ beads [status|init|sync] Check or initialize repo-local beads state
   __WRAPPER__ mmdx QUERY              Fuzzy-find and open .mmdx/.mmd from this cwd
   __WRAPPER__ mmdx                    List recent .mmdx/.mmd files from this repo
@@ -172,19 +177,29 @@ Skills:
   __WRAPPER__ skills audit            Scan downstream repos for skill policy drift
   __WRAPPER__ skill plan NAME         Preview where NAME would be linked
   __WRAPPER__ skill add NAME          Link NAME into global/project/category roots
+  __WRAPPER__ skill why NAME          Explain visibility layers and exact fixes
+  __WRAPPER__ skill togglable         List cwd-flippable skills and exact flip commands
+  __WRAPPER__ skill what-if --repo R  Simulate overlay/pin visibility with zero writes
+  __WRAPPER__ skill on NAME           Durably pin NAME on for this repo
+  __WRAPPER__ skill off NAME          Durably pin NAME off for this repo
+  __WRAPPER__ skill default on NAME --repo --dry-run
+  __WRAPPER__ skill default on NAME --repos app,app-server --dry-run
+  __WRAPPER__ skill default on NAME --category frontend --dry-run
+                                      Preview repo/cross-repo/global default policy edits
+  __WRAPPER__ skill heal NAME         Resolve source, pin on, link, and print activation packet
   __WRAPPER__ skill sync --dry-run    Link cwd-required missing skills
   __WRAPPER__ skill prune --dry-run   Preview policy-violation unlinks
   __WRAPPER__ sync /path/to/skill     Legacy shorthand for global skill add
 
 Overlays:
-  __WRAPPER__ m                       Toggle the marketing overlay on/off.
-                              Off-flip unlinks overlay-scoped symlinks.
+  __WRAPPER__ m                       Toggle the marketing overlay on/off in
+                              this repo's .skillbox/skill-overrides.yaml.
                               Pass --keep to preserve them.
   __WRAPPER__ overlay                 List active overlays
-  __WRAPPER__ overlay on NAME         Enable overlay (e.g. marketing)
-  __WRAPPER__ overlay off NAME        Disable overlay + unlink overlay-scoped symlinks
-  __WRAPPER__ overlay off NAME --keep Disable overlay, keep symlinks in place
-  __WRAPPER__ overlay toggle NAME     Flip overlay state (off-flip unlinks unless --keep)
+  __WRAPPER__ overlay on NAME         Enable overlay for this repo
+  __WRAPPER__ overlay off NAME        Disable overlay for this repo
+  __WRAPPER__ overlay off NAME --keep Disable overlay for this repo
+  __WRAPPER__ overlay toggle NAME     Flip overlay state for this repo
 
 Profiles:
   all | local-all, core | local-core, minimal | mini | local-minimal,
@@ -198,12 +213,21 @@ Examples:
   __WRAPPER__ skills --issues-only
   __WRAPPER__ candidates --json
   __WRAPPER__ recalibrate
+  __WRAPPER__ recalibrate --auto-fix
   __WRAPPER__ mcp
   __WRAPPER__ beads status
   __WRAPPER__ beads init
   __WRAPPER__ recalibrate --fleet --limit 20
   __WRAPPER__ skill plan mcp-server-design
   __WRAPPER__ skill add ui --to category --category frontend
+  __WRAPPER__ skill why wiki --json
+  __WRAPPER__ skill togglable --json
+  __WRAPPER__ skill what-if --repo . --overlay marketing --json
+  __WRAPPER__ skill on wiki --verify
+  __WRAPPER__ skill off wiki --dry-run
+  __WRAPPER__ skill default on wiki --repo --dry-run
+  __WRAPPER__ skill default on wiki --category frontend --dry-run
+  __WRAPPER__ skill lint             Lint .skillbox/skill-overrides.yaml
   __WRAPPER__ mmdx review
   __WRAPPER__ mmdx skill review --no-open
   __WRAPPER__ launch ../api ../web --request 'Audit auth drift' --dry-run --json
@@ -222,6 +246,178 @@ import sys
 
 wrapper = sys.argv[1]
 cwd = sys.argv[2]
+skill_verbs = {
+    "recalibrate": {
+        "purpose": "Read-only cwd/fleet skill visibility audit with exact next commands; --auto-fix previews heal, --yes applies.",
+        "mutates": "none",
+        "links_disk": False,
+        "returns_packet": False,
+        "scope": "cwd or fleet",
+        "survives_recalibrate": False,
+        "when_to_use": "Use first when unsure what the repo or fleet needs.",
+        "do_NOT": "Do not treat bare recalibrate as a mutator; --auto-fix previews and --auto-fix --yes applies heal.",
+    },
+    "plan": {
+        "purpose": "Preview where a skill lifecycle operation would install or remove links.",
+        "mutates": "none",
+        "links_disk": False,
+        "returns_packet": False,
+        "scope": "global, project, or category preview",
+        "survives_recalibrate": False,
+        "when_to_use": "Use before a risky link or move when you only need the plan.",
+        "do_NOT": "Do not expect plan to make a skill visible.",
+    },
+    "add": {
+        "purpose": "Install/link a skill into a selected scope.",
+        "mutates": "disk-links",
+        "links_disk": True,
+        "returns_packet": False,
+        "scope": "global, project, or category",
+        "survives_recalibrate": False,
+        "when_to_use": "Use for deliberate non-override link management.",
+        "do_NOT": "Do not use add when the repo needs a durable policy override; use on or heal.",
+    },
+    "activate": {
+        "purpose": "Install/link a skill and print an activation packet for this session.",
+        "mutates": "cwd-ephemeral",
+        "links_disk": True,
+        "returns_packet": True,
+        "scope": "current cwd by default; global/category if explicitly requested",
+        "survives_recalibrate": False,
+        "when_to_use": "Use for an immediate one-session handoff when durability is not required.",
+        "do_NOT": "Do not treat activate as durable repo state; use on or heal for that.",
+    },
+    "move": {
+        "purpose": "Install/link a skill into a new scope and remove old installs for that skill.",
+        "mutates": "disk-links",
+        "links_disk": True,
+        "returns_packet": False,
+        "scope": "global, project, or category",
+        "survives_recalibrate": False,
+        "when_to_use": "Use when intentionally relocating an existing install.",
+        "do_NOT": "Do not use move as a policy override; it only manages links.",
+    },
+    "on": {
+        "purpose": "Durably pin a skill on for this repo, link it, and return an activation packet.",
+        "mutates": "repo-state+disk-links",
+        "links_disk": True,
+        "returns_packet": True,
+        "scope": "repo-local project scope",
+        "survives_recalibrate": True,
+        "when_to_use": "Use when the repo should keep seeing a known source-backed skill.",
+        "do_NOT": "Do not use on for global escalation; disallowed globals are refused.",
+    },
+    "off": {
+        "purpose": "Durably pin a skill off for this repo and unlink project installs.",
+        "mutates": "repo-state+disk-links",
+        "links_disk": True,
+        "returns_packet": False,
+        "scope": "repo-local project scope",
+        "survives_recalibrate": True,
+        "when_to_use": "Use when a repo should keep a skill disabled.",
+        "do_NOT": "Do not use off to disable dispatcher floor skills such as smart or sbp.",
+    },
+    "heal": {
+        "purpose": "Resolve a real skill source, durably pin it on, link it, and return an activation packet.",
+        "mutates": "repo-state+disk-links",
+        "links_disk": True,
+        "returns_packet": True,
+        "scope": "repo-local project scope",
+        "survives_recalibrate": True,
+        "when_to_use": "Use when a source-backed skill is missing and should become visible now and later.",
+        "do_NOT": "Do not use heal when no real source exists; unknown sources are refused.",
+    },
+    "remove": {
+        "purpose": "Remove installed links/files for a skill.",
+        "mutates": "disk-links",
+        "links_disk": True,
+        "returns_packet": False,
+        "scope": "global, project, or all selected installs",
+        "survives_recalibrate": False,
+        "when_to_use": "Use for direct cleanup of installed links.",
+        "do_NOT": "Do not use remove when policy should keep the skill absent; use off.",
+    },
+    "prune": {
+        "purpose": "Remove installed skills that violate current skill-scope policy.",
+        "mutates": "disk-links",
+        "links_disk": True,
+        "returns_packet": False,
+        "scope": "global, project, or all selected installs",
+        "survives_recalibrate": False,
+        "when_to_use": "Use after dry-run to remove drift that policy does not allow.",
+        "do_NOT": "Do not skip dry-run; pinned overrides are protected by the prune firewall.",
+    },
+    "sync": {
+        "purpose": "Install/link a named skill or all literal skills missing for the current cwd policy.",
+        "mutates": "disk-links",
+        "links_disk": True,
+        "returns_packet": False,
+        "scope": "current cwd policy, project by default",
+        "survives_recalibrate": False,
+        "when_to_use": "Use when policy already requires a skill and only links are missing.",
+        "do_NOT": "Do not use sync to create a durable exception; use on or heal.",
+    },
+    "lint": {
+        "purpose": "Validate the repo-local .skillbox/skill-overrides.yaml file.",
+        "mutates": "none",
+        "links_disk": False,
+        "returns_packet": False,
+        "scope": "current repo override file",
+        "survives_recalibrate": False,
+        "when_to_use": "Use after editing override state or when a pin behaves unexpectedly.",
+        "do_NOT": "Do not expect lint to repair or rewrite the file.",
+    },
+    "why": {
+        "purpose": "Explain one skill's visibility provenance, absence, and exact fixes.",
+        "mutates": "none",
+        "links_disk": False,
+        "returns_packet": False,
+        "scope": "current cwd",
+        "survives_recalibrate": False,
+        "when_to_use": "Use when choosing the narrowest correct fix for one skill.",
+        "do_NOT": "Do not infer policy from memory when why can return the live layers.",
+    },
+    "what-if": {
+        "purpose": "Purely simulate effective skill visibility for a repo, overlay, pin, opt-out, and machine.",
+        "mutates": "none",
+        "links_disk": False,
+        "returns_packet": False,
+        "scope": "target repo from --repo",
+        "survives_recalibrate": False,
+        "when_to_use": "Use before overlay or pin changes to see added, removed, shadowed, and conflict results.",
+        "do_NOT": "Do not treat what-if as applying anything; it writes zero files.",
+    },
+    "togglable": {
+        "purpose": "List every skill flippable at this cwd and the exact command to flip it.",
+        "mutates": "none",
+        "links_disk": False,
+        "returns_packet": False,
+        "scope": "current cwd",
+        "survives_recalibrate": False,
+        "when_to_use": "Use when you need a one-read switchboard of repo skill on/off affordances.",
+        "do_NOT": "Do not use togglable as proof a flip already happened; run the returned command to mutate state.",
+    },
+    "toggleable": {
+        "purpose": "Alias for togglable; lists every skill flippable at this cwd and the exact command to flip it.",
+        "mutates": "none",
+        "links_disk": False,
+        "returns_packet": False,
+        "scope": "current cwd",
+        "survives_recalibrate": False,
+        "when_to_use": "Use when you need a one-read switchboard of repo skill on/off affordances.",
+        "do_NOT": "Do not use toggleable as proof a flip already happened; run the returned command to mutate state.",
+    },
+    "default": {
+        "purpose": "Set repo, cross-repo, or operator-global skill defaults with a reviewable unified diff.",
+        "mutates": "repo_or_operator_policy",
+        "links_disk": False,
+        "returns_packet": False,
+        "scope": "repo, registry cohort, or global",
+        "survives_recalibrate": True,
+        "when_to_use": "Use --repo for one repo, --repos/--category for reviewed registry cohorts, and --global only after dry-run review.",
+        "do_NOT": "Do not apply --global without --dry-run review and --yes; do not apply --repos/--category before the exact dry-run marker exists.",
+    },
+}
 payload = {
     "ok": True,
     "tool": f"skillbox-{wrapper}",
@@ -231,7 +427,7 @@ payload = {
     "aliases": ["sbo"] if wrapper == "sbp" else ["sbp"],
     "commands": [
         {"name": "capabilities", "json": True, "safe_first_try": f"{wrapper} capabilities --json"},
-        {"name": "robot-docs", "json": True, "safe_first_try": f"{wrapper} robot-docs guide"},
+        {"name": "robot-docs", "json": True, "safe_first_try": f"{wrapper} robot-docs guide --json"},
         {"name": "robot-triage", "json": True, "safe_first_try": f"{wrapper} --robot-triage"},
         {"name": "status", "json": True, "safe_first_try": f"{wrapper} status --json"},
         {"name": "logs", "json": True, "safe_first_try": f"{wrapper} logs <profile> <service> --json"},
@@ -241,14 +437,23 @@ payload = {
         {"name": "launch", "json": True, "safe_first_try": f"{wrapper} launch <dir> <dir> --request '<prompt>' --dry-run --json", "aliases": ["bulk"]},
         {"name": "bulk", "json": True, "safe_first_try": f"{wrapper} bulk <dir> <dir> --request '<prompt>' --dry-run --json", "alias_for": "launch"},
         {"name": "skills", "json": True, "safe_first_try": f"{wrapper} skills --issues-only --json"},
+        {"name": "skill-why", "json": True, "safe_first_try": f"{wrapper} skill why <skill> --json"},
+        {"name": "skill-togglable", "json": True, "safe_first_try": f"{wrapper} skill togglable --json"},
+        {"name": "skill-what-if", "json": True, "safe_first_try": f"{wrapper} skill what-if --repo <repo-id-or-path> --overlay <overlay> --json"},
+        {"name": "skill-heal", "json": True, "safe_first_try": f"{wrapper} skill heal <skill> --dry-run --format json"},
         {"name": "candidates", "json": True, "safe_first_try": f"{wrapper} candidates --json"},
         {"name": "mcp", "json": True, "safe_first_try": f"{wrapper} mcp --json"},
         {"name": "registry", "json": True, "safe_first_try": f"{wrapper} registry doctor --json"},
-        {"name": "cass", "json": True, "safe_first_try": f"{wrapper} cass status --json"},
+        {
+            "name": "cass",
+            "json": True,
+            "safe_first_try": f"{wrapper} cass status --json",
+            "fallback": "If status is error/degraded/stale during active work, report degraded_cass evidence mode and use the local transcript scanner; do not rebuild Cass mid-task.",
+        },
         {"name": "evidence", "json": True, "safe_first_try": f"{wrapper} evidence --repo <path> --format json"},
         {"name": "cron", "json": True, "safe_first_try": f"{wrapper} cron status --json"},
-        {"name": "send-later", "json": False, "safe_first_try": f"{wrapper} send-later list"},
-        {"name": "recalibrate", "json": False, "safe_first_try": f"{wrapper} recalibrate"},
+        {"name": "send-later", "json": True, "safe_first_try": f"{wrapper} send-later list --json"},
+        {"name": "recalibrate", "json": True, "safe_first_try": f"{wrapper} recalibrate --json"},
     ],
     "agent_surfaces": {
         "capabilities": f"{wrapper} capabilities --json",
@@ -256,6 +461,7 @@ payload = {
         "robot_triage": f"{wrapper} --robot-triage",
         "json_aliases": ["--jason", "--json", "--jsno", "--jsson"],
     },
+    "skill_verbs": skill_verbs,
     "stdout_stderr_contract": {
         "json_stdout": "When JSON is requested, stdout is parseable JSON from manage.py or this wrapper.",
         "diagnostics_stderr": "JSON typo alias notices and parser errors go to stderr.",
@@ -268,6 +474,8 @@ payload = {
             f"{wrapper} launch <dir> <dir> --request '<prompt>' --dry-run --json",
             f"{wrapper} bulk <dir> <dir> --request '<prompt>' --dry-run --json",
             f"{wrapper} skill prune --dry-run",
+            f"{wrapper} skill default on <skill> --repo --dry-run --format json",
+            f"{wrapper} skill default on <skill> --category frontend --dry-run --format json",
         ],
         "confirm_with_user_before": [f"{wrapper} down <profile> <service>"],
     },
@@ -307,6 +515,18 @@ Safe mutation pattern:
   ${wrapper_name} down <profile> <service> --dry-run --json
   ${wrapper_name} restart <profile> <service> --dry-run --json
   ${wrapper_name} launch <dir> <dir> --request "..." --dry-run --json
+  ${wrapper_name} recalibrate --auto-fix
+  ${wrapper_name} skill default on <skill> --repo --dry-run --format json
+  ${wrapper_name} skill default on <skill> --category frontend --dry-run --format json
+
+Skill verb contract:
+  Machine map: ${wrapper_name} capabilities --json | jq .skill_verbs
+  Read-only: recalibrate, plan, lint, why
+  Session handoff: activate (mutates=cwd-ephemeral, returns_packet=true)
+  Durable repo pins: on, off, heal (survive recalibrate)
+  Durable defaults: default on/off <skill> --repo|--repos IDS|--category NAME|--global (diff first; --global needs --yes)
+  Link-only maintenance: add, move, remove, prune, sync
+  Missing-skill fold: ${wrapper_name} recalibrate --auto-fix previews heal; add --yes to apply
 
 Batch launcher:
   ${wrapper_name} launch <dir> <dir> --request 'Audit auth drift' --dry-run --json
@@ -418,8 +638,13 @@ case "${1:-}" in
     shift
     ;;
   mcp|mcps)
-    action="mcp-audit"
     shift
+    if [[ "${1:-}" == "sync" ]]; then
+      action="mcp-sync"
+      shift
+    else
+      action="mcp-audit"
+    fi
     ;;
   fleet)
     action="fleet"
@@ -535,9 +760,19 @@ append_passthrough_token() {
   local token="$1"
   case "${action}" in
     sync)
-      sync_paths+=("${token}")
+      case "${token}" in
+        --dry-run)
+          sync_dry_run="true"
+          ;;
+        --yes)
+          sync_yes="true"
+          ;;
+        *)
+          sync_paths+=("${token}")
+          ;;
+      esac
       ;;
-    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|structure-doctor|repo-registry|cass|cass-evidence|cron|send-later|beads|mmdx|operator-booking|swimmers-launch|fleet)
+    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|mcp-sync|structure-doctor|repo-registry|cass|cass-evidence|cron|send-later|beads|mmdx|operator-booking|swimmers-launch|fleet)
       passthrough_args+=("${token}")
       ;;
     *)
@@ -604,6 +839,141 @@ passthrough_has_arg() {
   return 1
 }
 
+passthrough_wants_json() {
+  local index=0
+  while [[ ${index} -lt ${#passthrough_args[@]} ]]; do
+    if [[ "${passthrough_args[index]}" == "--json" ]]; then
+      return 0
+    fi
+    if [[ "${passthrough_args[index]}" == "--format" && "${passthrough_args[index+1]:-}" == "json" ]]; then
+      return 0
+    fi
+    index=$((index + 1))
+  done
+  return 1
+}
+
+repo_overlay_action() {
+  local overlay_action="${1:-}"
+  case "${overlay_action}" in
+    on|off|toggle)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+apply_repo_overlay_override() {
+  local overlay_action="$1"
+  local overlay="$2"
+  local dry_run="false"
+  local format_json="false"
+  if [[ -z "${overlay}" ]]; then
+    echo "${wrapper_name} overlay ${overlay_action}: pass an overlay name" >&2
+    exit 2
+  fi
+  if passthrough_has_arg "--dry-run"; then
+    dry_run="true"
+  fi
+  if passthrough_wants_json; then
+    format_json="true"
+  fi
+  python3 - "${invoke_cwd}" "${overlay_action}" "${overlay}" "${dry_run}" "${format_json}" "${script_dir}/../.env-manager" <<'PY'
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+for candidate in (Path(".env-manager").resolve(), Path(sys.argv[6]).resolve()):
+    if str(candidate) not in sys.path:
+        sys.path.insert(0, str(candidate))
+
+from runtime_manager.skill_visibility import (  # noqa: E402
+    active_overlay_records,
+    active_overlays,
+    update_repo_override_policy,
+    _repo_override_policy,
+)
+
+
+def _overlay_lists(policy: dict) -> tuple[set[str], set[str]]:
+    overlays = policy.get("overlays") or {}
+    enable = {str(item).strip() for item in overlays.get("enable") or [] if str(item).strip()}
+    disable = {str(item).strip() for item in overlays.get("disable") or [] if str(item).strip()}
+    return enable, disable
+
+
+def _mutate_overlay(policy: dict, name: str, enabled: bool) -> dict:
+    updated = dict(policy)
+    enable, disable = _overlay_lists(updated)
+    if enabled:
+        enable.add(name)
+        disable.discard(name)
+    else:
+        disable.add(name)
+        enable.discard(name)
+    updated["overlays"] = {"enable": sorted(enable), "disable": sorted(disable)}
+    return updated
+
+
+cwd, action, name, dry_run_raw, json_raw = sys.argv[1:6]
+dry_run = dry_run_raw == "true"
+as_json = json_raw == "true"
+before_policy = _repo_override_policy(cwd)
+before_enable, before_disable = _overlay_lists(before_policy)
+before_active = set(active_overlays(cwd))
+target_enabled = name not in before_active if action == "toggle" else action == "on"
+after_preview = _mutate_overlay(before_policy, name, target_enabled)
+after_enable, after_disable = _overlay_lists(after_preview)
+would_change = (before_enable, before_disable) != (after_enable, after_disable)
+policy_path = str(before_policy.get("_policy_path") or "")
+
+if dry_run:
+    changed = False
+else:
+    result = update_repo_override_policy(cwd, lambda policy: _mutate_overlay(policy, name, target_enabled))
+    changed = bool(result.get("changed"))
+    policy_path = str(result.get("_policy_path") or policy_path)
+
+after_active = sorted(active_overlays(cwd))
+payload = {
+    "ok": True,
+    "action": action,
+    "name": name,
+    "enabled": target_enabled,
+    "cwd": str(Path(os.path.expandvars(os.path.expanduser(cwd))).resolve()),
+    "persistent": "repo-file",
+    "why": "repo-file",
+    "dry_run": dry_run,
+    "changed": changed,
+    "would_change": would_change,
+    "policy_path": policy_path,
+    "overlays": after_active,
+    "before": {
+        "active": sorted(before_active),
+        "enable": sorted(before_enable),
+        "disable": sorted(before_disable),
+    },
+    "after": {
+        "enable": sorted(after_enable),
+        "disable": sorted(after_disable),
+    },
+    "active_layers": active_overlay_records(cwd),
+}
+if as_json:
+    print(json.dumps(payload, indent=2, sort_keys=True))
+else:
+    verb = "would enable" if dry_run and target_enabled else "would disable" if dry_run else "enabled" if target_enabled else "disabled"
+    print(f"overlay {name}: {verb} via repo-file")
+    print(f"policy: {policy_path}")
+    print("active overlays: " + (", ".join(after_active) if after_active else "(none)"))
+PY
+}
+
 overlay_should_sync_policy() {
   local overlay_action="${passthrough_args[0]:-list}"
   case "${overlay_action}" in
@@ -649,7 +1019,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-if [[ ! -t 0 && "${action}" != "home" && "${action}" != "help" ]]; then
+if [[ ! -t 0 && "${action}" != "home" && "${action}" != "help" && "${action}" != "send-later" ]]; then
   while IFS= read -r line; do
     line="${line//,/ }"
     # Intentional shell-word splitting for simple pipe-friendly wrapper input.
@@ -722,6 +1092,7 @@ case "${action}" in
     echo "  ${wrapper_name} skills --issues-only full skill drift check"
     echo "  ${wrapper_name} candidates   source inventory for definitely/maybe/no review"
     echo "  ${wrapper_name} mcp           Claude/Codex MCP config parity"
+    echo "  ${wrapper_name} mcp sync      Render .mcp.json + .codex/config.toml from declaration"
     echo "  ${wrapper_name} launch <dir> <dir> --request '<prompt>' --dry-run --json"
     echo "                         preview Swimmers batch launch (bulk alias)"
     echo "  ${wrapper_name} skills --full full skill view"
@@ -790,6 +1161,9 @@ PY
     ;;
   mcp-audit)
     python3 .env-manager/manage.py mcp-audit "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    ;;
+  mcp-sync)
+    python3 .env-manager/manage.py mcp sync "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
     ;;
   fleet)
     # `sbp fleet converge [...]` -> read-only per-repo heal PLAN (no apply).
@@ -883,6 +1257,9 @@ PY
     ;;
   recalibrate)
     recalibrate_fleet="false"
+    recalibrate_auto_fix="false"
+    recalibrate_apply="false"
+    recalibrate_wants_json="false"
     recalibrate_cwd="${invoke_cwd}"
     recalibrate_args=()
     index=0
@@ -891,6 +1268,24 @@ PY
       case "${token}" in
         --fleet|fleet|--all-repos)
           recalibrate_fleet="true"
+          ;;
+        --auto-fix)
+          recalibrate_auto_fix="true"
+          ;;
+        --yes)
+          recalibrate_apply="true"
+          ;;
+        --format)
+          index=$((index + 1))
+          if [[ ${index} -ge ${#passthrough_args[@]} ]]; then
+            echo "sbp recalibrate: --format requires a value" >&2
+            exit 2
+          fi
+          if [[ "${passthrough_args[$index]}" == "json" ]]; then
+            recalibrate_wants_json="true"
+          else
+            recalibrate_args+=("--format" "${passthrough_args[$index]}")
+          fi
           ;;
         --cwd)
           index=$((index + 1))
@@ -909,7 +1304,57 @@ PY
       esac
       index=$((index + 1))
     done
+    if [[ "${recalibrate_wants_json}" == "true" ]]; then
+      if [[ "${recalibrate_auto_fix}" == "true" ]]; then
+        python3 - "${wrapper_name}" "${recalibrate_cwd}" <<'PY'
+from __future__ import annotations
+
+import json
+import sys
+
+wrapper = sys.argv[1]
+cwd = sys.argv[2]
+payload = {
+    "ok": False,
+    "error": {
+        "code": "UNSUPPORTED_JSON_AUTO_FIX",
+        "message": "sbp recalibrate --auto-fix cannot be combined with --json.",
+        "context": {"cwd": cwd},
+        "next_actions": [
+            f"{wrapper} recalibrate --json",
+            "Read fixes[].command from the JSON payload, then run the selected command explicitly.",
+            f"{wrapper} recalibrate --auto-fix",
+        ],
+    },
+}
+print(json.dumps(payload, indent=2, sort_keys=True))
+PY
+        exit 2
+      fi
+      if [[ "${recalibrate_fleet}" == "true" ]]; then
+        python3 .env-manager/manage.py skill-audit "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --format json "${recalibrate_args[@]}"
+        exit $?
+      fi
+      recalibrate_json_argv=(
+        python3 scripts/gen_output_schemas.py
+        --recalibrate-json
+        --cwd "${recalibrate_cwd}"
+        --profile "${profile}"
+      )
+      if [[ -n "${client}" ]]; then
+        recalibrate_json_argv+=(--client "${client}")
+      fi
+      if [[ ${#recalibrate_args[@]} -gt 0 ]]; then
+        recalibrate_json_argv+=("${recalibrate_args[@]}")
+      fi
+      "${recalibrate_json_argv[@]}"
+      exit $?
+    fi
     if [[ "${recalibrate_fleet}" == "true" ]]; then
+      if [[ "${recalibrate_auto_fix}" == "true" ]]; then
+        echo "sbp recalibrate: --auto-fix is cwd-only; omit --fleet or use fleet converge dry-runs" >&2
+        exit 2
+      fi
       python3 .env-manager/manage.py skill-audit "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" "${recalibrate_args[@]}"
       echo
       echo "review dry-runs before applying:"
@@ -925,11 +1370,68 @@ PY
       echo "policy issues for this repo:"
       python3 .env-manager/manage.py skills "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --issues-only --no-global "${recalibrate_args[@]}" || true
       echo
+      echo "repo skill override lint:"
+      python3 .env-manager/manage.py skill lint "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" || true
+      echo
       echo "add missing repo-local skills:"
       python3 .env-manager/manage.py skill sync "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --dry-run || true
       echo
       echo "remove repo-local policy violations:"
       python3 .env-manager/manage.py skill prune "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --from project --dry-run || true
+      if [[ "${recalibrate_auto_fix}" == "true" ]]; then
+        auto_fix_failed=0
+        echo
+        echo "auto-fix missing repo-local skills:"
+        if [[ "${recalibrate_apply}" == "true" ]]; then
+          echo "mode: apply (--yes)"
+        else
+          echo "mode: dry-run (pass --yes to apply)"
+        fi
+        missing_json="$(mktemp)"
+        missing_names="$(mktemp)"
+        if ! python3 .env-manager/manage.py skills "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --issues-only --no-global --format json > "${missing_json}"; then
+          printf '{}\n' > "${missing_json}"
+          auto_fix_failed=1
+        fi
+        python3 - "${missing_json}" > "${missing_names}" <<'PY'
+from __future__ import annotations
+
+import json
+import sys
+
+try:
+    payload = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    payload = {}
+names: list[str] = []
+seen: set[str] = set()
+for item in ((payload.get("issues") or {}).get("missing_for_cwd") or []):
+    name = str(item.get("name") or item.get("skill") or "").strip()
+    if not name or name in seen:
+        continue
+    seen.add(name)
+    names.append(name)
+for name in names:
+    print(name)
+PY
+        if [[ ! -s "${missing_names}" ]]; then
+          echo "  none"
+        else
+          while IFS= read -r missing_skill; do
+            [[ -z "${missing_skill}" ]] && continue
+            if [[ "${recalibrate_apply}" == "true" ]]; then
+              if ! python3 .env-manager/manage.py skill heal "${missing_skill}" "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --format json; then
+                auto_fix_failed=1
+              fi
+            else
+              if ! python3 .env-manager/manage.py skill heal "${missing_skill}" "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --dry-run --format json; then
+                auto_fix_failed=1
+              fi
+            fi
+          done < "${missing_names}"
+        fi
+        rm -f "${missing_json}" "${missing_names}"
+      fi
       echo
       echo "beads graph:"
       python3 .env-manager/manage.py skills "${client_flags[@]}" --profile "${profile}" --cwd "${recalibrate_cwd}" --issues-only --format json \
@@ -962,6 +1464,10 @@ else:
       echo "  sbp recalibrate --fleet --limit 20"
       echo "  sbp skill prune --from global --dry-run"
       echo "  sbp overlay activate marketing --cwd \"${recalibrate_cwd}\""
+      if [[ "${recalibrate_auto_fix:-false}" == "true" && "${auto_fix_failed:-0}" -ne 0 ]]; then
+        echo "sbp recalibrate --auto-fix: one or more heal commands failed" >&2
+        exit 1
+      fi
     fi
     ;;
   beads)
@@ -1049,7 +1555,7 @@ else:
     ;;
   skill)
     if [[ ${#passthrough_args[@]} -eq 0 ]]; then
-      echo "sbp skill: pass an action, e.g. 'sbp skill add ui --to project'" >&2
+      echo "sbp skill: pass an action, e.g. 'sbp skill on wiki --verify' or 'sbp skill add ui --to project'" >&2
       exit 2
     fi
     skill_action="${passthrough_args[0]}"
@@ -1057,7 +1563,12 @@ else:
     python3 .env-manager/manage.py skill "${skill_action}" "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${skill_args[@]}"
     ;;
   overlay)
-    python3 .env-manager/manage.py overlay "${client_flags[@]}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    overlay_action="${passthrough_args[0]:-list}"
+    if repo_overlay_action "${overlay_action}"; then
+      apply_repo_overlay_override "${overlay_action}" "${passthrough_args[1]:-}"
+    else
+      python3 .env-manager/manage.py overlay "${client_flags[@]}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    fi
     if overlay_should_sync_policy; then
       echo
       echo "applying policy for this cwd..."
@@ -1069,7 +1580,7 @@ else:
     fi
     ;;
   overlay-toggle)
-    python3 .env-manager/manage.py overlay toggle "${overlay_name}" "${client_flags[@]}" --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    apply_repo_overlay_override "toggle" "${overlay_name}"
     echo
     echo "applying policy for this cwd..."
     overlay_sync_args=()
@@ -1082,6 +1593,15 @@ else:
     if [[ ${#sync_paths[@]} -eq 0 ]]; then
       echo "sbp sync: pass at least one skill path, e.g. 'sbp sync /path/to/ga4'" >&2
       exit 2
+    fi
+    if [[ "${sync_dry_run}" != "true" && "${sync_yes}" != "true" ]]; then
+      echo "sbp sync: legacy global sync requires --dry-run to preview or --yes to apply" >&2
+      echo "Prefer durable repo-local activation: ${wrapper_name} skill on <skill> --cwd \"${invoke_cwd}\" --dry-run" >&2
+      exit 2
+    fi
+    legacy_sync_args=()
+    if [[ "${sync_dry_run}" == "true" ]]; then
+      legacy_sync_args+=(--dry-run)
     fi
     for sync_path in "${sync_paths[@]}"; do
       if [[ ! -d "${sync_path}" ]]; then
@@ -1098,7 +1618,8 @@ else:
         --profile "${profile}" \
         --cwd "${invoke_cwd}" \
         --to global \
-        --source "${sync_path}"
+        --source "${sync_path}" \
+        "${legacy_sync_args[@]}"
     done
     ;;
 esac

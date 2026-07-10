@@ -39,7 +39,7 @@ class RchReportTests(unittest.TestCase):
             {
                 "id": "status",
                 "ok": True,
-                "json": {"data": {"workers": [{"id": "portfolio-devbox", "healthy": True}]}},
+                "json": {"data": {"workers": [{"id": "worker-devbox", "healthy": True}]}},
                 "stdout": "",
                 "stderr": "",
             },
@@ -67,7 +67,7 @@ class RchReportTests(unittest.TestCase):
             {
                 "id": "status",
                 "ok": True,
-                "json": {"workers": [{"id": "portfolio-devbox", "healthy": True}]},
+                "json": {"workers": [{"id": "worker-devbox", "healthy": True}]},
                 "stdout": "",
                 "stderr": "",
             },
@@ -100,7 +100,7 @@ class RchReportTests(unittest.TestCase):
                 return subprocess.CompletedProcess(
                     args,
                     0,
-                    stdout=json.dumps({"workers": [{"id": "portfolio-devbox", "state": "ready"}]}),
+                    stdout=json.dumps({"workers": [{"id": "worker-devbox", "state": "ready"}]}),
                     stderr="",
                 )
             if args[1] == "hook":

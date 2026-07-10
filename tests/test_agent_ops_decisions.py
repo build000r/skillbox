@@ -5,6 +5,8 @@ import sys
 import unittest
 from pathlib import Path
 
+from tests.helpers import make_runtime_model
+
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 ENV_MANAGER_DIR = ROOT_DIR / ".env-manager"
@@ -12,6 +14,26 @@ if str(ENV_MANAGER_DIR) not in sys.path:
     sys.path.insert(0, str(ENV_MANAGER_DIR))
 
 from runtime_manager import agent_decisions as DECISIONS  # noqa: E402
+from runtime_manager.text_renderers import explain_brain_text_lines  # noqa: E402
+
+
+def _assert_elapsed_meta(testcase: unittest.TestCase, payload: dict[str, object]) -> None:
+    meta = payload.get("meta")
+    testcase.assertIsInstance(meta, dict)
+    elapsed = meta.get("elapsed_ms") if isinstance(meta, dict) else None
+    testcase.assertIsInstance(elapsed, (int, float))
+    testcase.assertNotIsInstance(elapsed, bool)
+    testcase.assertGreaterEqual(float(elapsed), 0.0)
+
+
+def _assert_error_envelope(testcase: unittest.TestCase, payload: dict[str, object], code: str) -> None:
+    testcase.assertIs(payload["ok"], False)
+    error = payload.get("error")
+    testcase.assertIsInstance(error, dict)
+    testcase.assertEqual(error["code"], code)
+    testcase.assertEqual(error["type"], code)
+    testcase.assertEqual(payload["error_code"], code)
+    testcase.assertIn("deprecation", payload)
 
 
 def _node(node_id: str, kind: str, label: str | None = None, **attrs: object) -> dict[str, object]:
@@ -23,12 +45,13 @@ def _edge(source: str, target: str, kind: str = "depends_on") -> dict[str, objec
 
 
 def _graph(warnings: list[dict[str, object]] | None = None) -> dict[str, object]:
+    model = make_runtime_model(checks=[{"id": "doctor", "type": "command", "repo": "app", "profiles": ["core"]}])
     return {
         "ok": not warnings,
         "nodes": [
-            _node("service:api", "service"),
-            _node("check:doctor", "check"),
-            _node("skill:domain-planner", "skill"),
+            _node(f"service:{model['services'][1]['id']}", "service"),
+            _node(f"check:{model['checks'][0]['id']}", "check"),
+            _node(f"skill:{model['skills'][0]['id']}", "skill"),
             _node("mcp_tool:skillbox_next", "mcp_tool"),
             _node("bead:ready-1", "bead", "Ready bead", status="open", priority=1),
             _node("command:brain.next", "command", "Recommend next actions"),
@@ -77,6 +100,7 @@ class AgentDecisionTests(unittest.TestCase):
         self.assertIn("br show ready-1 --json", first["validations"])
         self.assertEqual(first["evidence"][0]["source"], "br_ready")
         self.assertEqual(payload["disagreements"], [])
+        _assert_elapsed_meta(self, payload)
         self.assertEqual(json.loads(json.dumps(payload)), payload)
 
     def test_next_handles_no_ready_and_blocked_work(self) -> None:
@@ -156,12 +180,15 @@ class AgentDecisionTests(unittest.TestCase):
             "bead:ready-1",
             "command:brain.next",
             "brain.next",
+            "next",
+            "snap",
         ):
             with self.subTest(target=target):
                 payload = DECISIONS.explain_payload(_graph(), target, adapters=adapters)
                 self.assertTrue(payload["ok"])
                 self.assertTrue(payload["summary"])
                 self.assertIn("relationships", payload)
+                _assert_elapsed_meta(self, payload)
         bead = DECISIONS.explain_payload(_graph(), "bead:ready-1", adapters=adapters)
         self.assertTrue(any(item["source"] == "br_ready" for item in bead["evidence"]))
 
@@ -170,6 +197,62 @@ class AgentDecisionTests(unittest.TestCase):
 
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "UNKNOWN_NODE")
+        _assert_error_envelope(self, payload, "UNKNOWN_NODE")
+        _assert_elapsed_meta(self, payload)
+
+    def test_explain_prefixed_command_falls_back_to_registry_without_graph_node(self) -> None:
+        payload = DECISIONS.explain_payload({"nodes": [], "edges": []}, "command:brain.next")
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["target"], "brain.next")
+        self.assertEqual(payload["kind"], "command")
+
+    def test_explain_bare_pulse_resolves_with_resolved_from(self) -> None:
+        graph = _graph()
+        graph["nodes"].append(_node("service:pulse", "service", "Pulse daemon"))
+
+        payload = DECISIONS.explain_payload(graph, "pulse")
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["target"], "service:pulse")
+        self.assertEqual(payload["resolved_from"], "pulse")
+
+    def test_explain_typo_pluse_returns_unknown_with_pulse_suggestion(self) -> None:
+        graph = _graph()
+        graph["nodes"].append(_node("service:pulse", "service", "Pulse daemon"))
+
+        payload = DECISIONS.explain_payload(graph, "pluse")
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["code"], "UNKNOWN_NODE")
+        _assert_error_envelope(self, payload, "UNKNOWN_NODE")
+        suggestion_ids = [item["id"] for item in payload.get("suggestions") or []]
+        self.assertIn("service:pulse", suggestion_ids)
+        context_suggestion_ids = [item["id"] for item in payload["error"]["context"]["suggestions"]]
+        self.assertIn("service:pulse", context_suggestion_ids)
+
+    def test_explain_ambiguous_bare_word_lists_candidates_without_guessing(self) -> None:
+        graph = _graph()
+        graph["nodes"].append(_node("check:api", "check", "API check"))
+
+        payload = DECISIONS.explain_payload(graph, "api")
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["code"], "AMBIGUOUS_NODE")
+        _assert_error_envelope(self, payload, "AMBIGUOUS_NODE")
+        candidate_ids = [item["id"] for item in payload["error"]["details"]["candidates"]]
+        self.assertEqual(sorted(candidate_ids), ["check:api", "service:api"])
+        context_ids = [item["id"] for item in payload["error"]["context"]["candidates"]]
+        self.assertEqual(sorted(context_ids), ["check:api", "service:api"])
+
+    def test_explain_text_renderer_prints_copy_pasteable_suggestions(self) -> None:
+        graph = _graph()
+        graph["nodes"].append(_node("service:pulse", "service", "Pulse daemon"))
+        payload = DECISIONS.explain_payload(graph, "pluse")
+        lines = explain_brain_text_lines(payload)
+
+        self.assertTrue(any("service:pulse" in line for line in lines))
+        self.assertTrue(any("manage.py explain service:pulse" in line for line in lines))
 
 
 if __name__ == "__main__":

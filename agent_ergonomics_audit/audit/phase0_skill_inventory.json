@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-05-09T11:04:28Z",
-  "jsm_present": true,
+  "checked_at": "2026-06-25T06:22:31Z",
+  "jsm_present": false,
   "skills": {
     "operationalizing-expertise": {"present": false},
     "codebase-archaeology": {"present": true},
@@ -10,10 +10,10 @@
     "ubs": {"present": false},
     "dcg": {"present": true},
     "agent-mail": {"present": false},
-    "beads-br": {"present": false},
-    "beads-bv": {"present": false},
+    "beads-br": {"present": true},
+    "beads-bv": {"present": true},
     "cass": {"present": true},
-    "idea-wizard": {"present": false},
+    "idea-wizard": {"present": true},
     "gh-cli": {"present": false},
     "cc-hooks": {"present": false}
   }

@@ -5,6 +5,8 @@ import sys
 import unittest
 from pathlib import Path
 
+from tests.helpers import make_runtime_model
+
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 ENV_MANAGER_DIR = ROOT_DIR / ".env-manager"
@@ -13,36 +15,6 @@ if str(ENV_MANAGER_DIR) not in sys.path:
 
 from runtime_manager import agent_graph as GRAPH  # noqa: E402
 from runtime_manager.runtime_ops import order_service_ids  # noqa: E402
-
-
-def _minimal_model() -> dict[str, object]:
-    return {
-        "active_profiles": ["core"],
-        "active_clients": ["personal"],
-        "clients": [{"id": "personal", "label": "Personal"}],
-        "profiles": [{"id": "core", "label": "Core"}],
-        "repos": [{"id": "app", "host_path": "/repo/app", "profiles": ["core"]}],
-        "artifacts": [{"id": "bundle", "path": "/tmp/bundle.tgz"}],
-        "services": [
-            {"id": "db", "kind": "service", "profiles": ["core"]},
-            {
-                "id": "api",
-                "kind": "service",
-                "depends_on": ["db"],
-                "bootstrap_tasks": ["build-api"],
-                "repo": "app",
-                "artifact": "bundle",
-                "profiles": ["core"],
-            },
-            {"id": "memory-mcp", "kind": "mcp", "mcp_server": "memory", "profiles": ["core"]},
-        ],
-        "tasks": [
-            {"id": "prepare", "repo": "app", "profiles": ["core"]},
-            {"id": "build-api", "depends_on": ["prepare"], "repo": "app", "profiles": ["core"]},
-        ],
-        "checks": [{"id": "runtime-doctor", "type": "command", "repo": "app", "profiles": ["core"]}],
-        "skill_repos": [{"id": "skills", "path": "/repo/skills", "profiles": ["core"]}],
-    }
 
 
 def _adapter_payload() -> dict[str, object]:
@@ -73,7 +45,7 @@ def _adapter_payload() -> dict[str, object]:
 
 class AgentGraphTests(unittest.TestCase):
     def test_graph_builder_includes_phase_a_nodes_edges_and_adapter_evidence(self) -> None:
-        payload = GRAPH.build_agent_graph_payload(_minimal_model(), adapters=_adapter_payload())
+        payload = GRAPH.build_agent_graph_payload(make_runtime_model(), adapters=_adapter_payload())
         node_ids = {node["id"] for node in payload["nodes"]}
         edge_keys = {(edge["source"], edge["kind"], edge["target"]) for edge in payload["edges"]}
 
@@ -130,7 +102,7 @@ class AgentGraphTests(unittest.TestCase):
 
     def test_adapter_failure_becomes_warning_not_crash(self) -> None:
         payload = GRAPH.build_agent_graph_payload(
-            _minimal_model(),
+            make_runtime_model(),
             adapters={
                 "bv_triage": {
                     "source": "bv",

@@ -4,35 +4,25 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, Mapping
 
+from .agent_decisions import MAX_FUZZY_SUGGESTIONS, resolve_brain_target
 from .agent_graph import AgentGraph
+from .agent_cli_hints import manage_py_command
+from .agent_errors import brain_error_payload
+from .agent_timing import attach_elapsed, timer_start
 from .agent_graph_algorithms import (
+    ALGORITHMS,
     ALGORITHMS_SCHEMA_VERSION,
-    analyze_graph,
-    blast_radius,
-    critical_path,
-    cycle_evidence,
-    min_unblock_set,
     normalize_graph,
     normalized_to_payload,
-    shortest_path,
-    strongly_connected_components,
-    topological_layers,
 )
 
 GRAPH_ENGINE_SCHEMA_VERSION = "2026-06-11+agent_ops_brain.graph_engine"
 GRAPH_OUTPUT_FORMATS = frozenset({"json", "text", "dot", "mermaid"})
-GRAPH_ALGORITHMS = frozenset(
-    {
-        "all",
-        "blast-radius",
-        "critical-path",
-        "cycles",
-        "min-unblock",
-        "scc",
-        "shortest-path",
-        "topology",
-    }
-)
+GRAPH_ALGORITHMS = ALGORITHMS.keys()
+
+
+def _graph_algorithm_names() -> list[str]:
+    return sorted(ALGORITHMS)
 
 
 def _error_payload(
@@ -42,21 +32,13 @@ def _error_payload(
     next_actions: list[str] | None = None,
     details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "ok": False,
-        "schema_version": GRAPH_ENGINE_SCHEMA_VERSION,
-        "error": {
-            "code": code,
-            "type": code.lower(),
-            "message": message,
-            "recoverable": True,
-        },
-    }
-    if details:
-        payload["error"]["details"] = details
-    if next_actions:
-        payload["next_actions"] = next_actions
-    return payload
+    return brain_error_payload(
+        GRAPH_ENGINE_SCHEMA_VERSION,
+        code,
+        message,
+        context=details,
+        next_actions=next_actions,
+    )
 
 
 def _graph_payload(graph: AgentGraph | Mapping[str, Any]) -> dict[str, Any]:
@@ -85,23 +67,59 @@ def _graph_payload(graph: AgentGraph | Mapping[str, Any]) -> dict[str, Any]:
     return normalized_payload
 
 
-def _require_node(graph_payload: Mapping[str, Any], node_id: str, role: str) -> dict[str, Any] | None:
+def _resolve_graph_node_id(
+    graph_payload: Mapping[str, Any],
+    node_id: str,
+    role: str,
+) -> tuple[dict[str, Any] | None, str | None]:
     node_id = str(node_id or "").strip()
     if not node_id:
-        return _error_payload(
-            "INVALID_ARGUMENT",
-            f"{role} is required",
-            next_actions=["brain.graph --algorithm blast-radius --node <node-id>"],
+        return (
+            _error_payload(
+                "INVALID_ARGUMENT",
+                f"{role} is required",
+                next_actions=[
+                    manage_py_command("graph", "--algorithm", "blast-radius", "--node", "<node-id>", "--format", "json")
+                ],
+            ),
+            None,
         )
-    node_ids = {str(node.get("id") or "") for node in graph_payload.get("nodes") or [] if isinstance(node, Mapping)}
-    if node_id not in node_ids:
-        return _error_payload(
-            "UNKNOWN_NODE",
-            f"unknown graph node: {node_id}",
-            next_actions=["brain.graph --format json"],
-            details={"node_id": node_id, "role": role},
+    resolution = resolve_brain_target(node_id, graph_payload)
+    if resolution["status"] == "ambiguous":
+        candidates = resolution.get("candidates") or []
+        candidate_ids = [str(item.get("id") or "") for item in candidates if str(item.get("id") or "")]
+        return (
+            _error_payload(
+                "AMBIGUOUS_NODE",
+                f"ambiguous graph {role}: {resolution.get('target') or node_id}",
+                next_actions=[
+                    manage_py_command("graph", "--algorithm", "blast-radius", "--node", candidate_id, "--format", "json")
+                    for candidate_id in candidate_ids[:3]
+                ],
+                details={
+                    "node_id": node_id,
+                    "role": role,
+                    "target": resolution.get("target") or node_id,
+                    "candidates": candidates,
+                },
+            ),
+            None,
         )
-    return None
+    if resolution["status"] != "resolved":
+        suggestions = resolution.get("suggestions") or []
+        return (
+            _error_payload(
+                "UNKNOWN_NODE",
+                f"unknown graph node: {node_id}",
+                next_actions=[
+                    manage_py_command("graph", "--algorithm", "blast-radius", "--node", item["id"], "--format", "json")
+                    for item in suggestions[:3]
+                ],
+                details={"node_id": node_id, "role": role, "suggestions": suggestions},
+            ),
+            None,
+        )
+    return None, str(resolution["id"])
 
 
 def _algorithm_payload(
@@ -113,40 +131,65 @@ def _algorithm_payload(
     target: str | None = None,
     blocked_nodes: Iterable[str] | None = None,
 ) -> dict[str, Any]:
-    if algorithm not in GRAPH_ALGORITHMS:
+    algorithm = str(algorithm or "").strip()
+    if algorithm not in ALGORITHMS:
+        import difflib
+
+        algorithm_suggestions = difflib.get_close_matches(
+            algorithm,
+            _graph_algorithm_names(),
+            n=MAX_FUZZY_SUGGESTIONS,
+            cutoff=0.5,
+        )
+        next_actions = [
+            manage_py_command("graph", "--algorithm", suggestion, "--format", "json")
+            for suggestion in algorithm_suggestions[:3]
+        ]
+        if not next_actions:
+            next_actions = [
+                manage_py_command("graph", "--algorithm", "all", "--format", "json"),
+                manage_py_command("graph", "--algorithm", "cycles", "--format", "json"),
+            ]
         return _error_payload(
             "INVALID_ARGUMENT",
             f"unknown graph algorithm: {algorithm}",
-            next_actions=[
-                "brain.graph --algorithm all --format json",
-                "brain.graph --algorithm cycles --format json",
-            ],
-            details={"allowed": sorted(GRAPH_ALGORITHMS)},
+            next_actions=next_actions,
+            details={
+                "allowed": _graph_algorithm_names(),
+                "algorithm": algorithm,
+                "suggestions": algorithm_suggestions,
+            },
         )
-    if algorithm == "all":
-        return analyze_graph(graph_payload, blocked_nodes=blocked_nodes)
-    if algorithm == "topology":
-        return topological_layers(graph_payload)
-    if algorithm == "cycles":
-        return cycle_evidence(graph_payload)
-    if algorithm == "scc":
-        return strongly_connected_components(graph_payload)
-    if algorithm == "min-unblock":
-        return min_unblock_set(graph_payload, blocked_nodes=blocked_nodes)
-    if algorithm == "critical-path":
-        return critical_path(graph_payload)
-    if algorithm == "blast-radius":
-        error = _require_node(graph_payload, str(node_id or ""), "node")
+    spec = ALGORITHMS[algorithm]
+    params: dict[str, Any] = {}
+    schema = spec.params_schema if isinstance(spec.params_schema, Mapping) else {}
+    properties = schema.get("properties") if isinstance(schema.get("properties"), Mapping) else {}
+    required = {str(item) for item in schema.get("required") or ()}
+    raw_node_params = {
+        "node_id": (node_id, "node"),
+        "source": (source, "source"),
+        "target": (target, "target"),
+    }
+    for param_name, (raw_value, role) in raw_node_params.items():
+        property_schema = properties.get(param_name)
+        has_value = bool(str(raw_value or "").strip())
+        should_resolve = (
+            param_name in required
+            or (
+                has_value
+                and isinstance(property_schema, Mapping)
+                and bool(property_schema.get("x-resolve-node"))
+            )
+        )
+        if not should_resolve:
+            continue
+        error, resolved_node = _resolve_graph_node_id(graph_payload, str(raw_value or ""), role)
         if error:
             return error
-        return blast_radius(graph_payload, str(node_id))
-    if algorithm == "shortest-path":
-        for role, value in (("source", source), ("target", target)):
-            error = _require_node(graph_payload, str(value or ""), role)
-            if error:
-                return error
-        return shortest_path(graph_payload, str(source), str(target))
-    raise AssertionError(f"unhandled graph algorithm: {algorithm}")
+        params[param_name] = str(resolved_node)
+    if "blocked_nodes" in properties and blocked_nodes is not None:
+        params["blocked_nodes"] = blocked_nodes
+    return spec.run(graph_payload, **params)
 
 
 def graph_command_payload(
@@ -159,14 +202,15 @@ def graph_command_payload(
     blocked_nodes: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Build the graph command JSON payload, optionally with algorithms."""
+    start = timer_start()
     graph_payload = _graph_payload(graph)
     payload: dict[str, Any] = {
         "ok": bool(graph_payload.get("ok", True)),
         "schema_version": GRAPH_ENGINE_SCHEMA_VERSION,
         "graph": graph_payload,
         "next_actions": [
-            "brain.graph --algorithm all --format json",
-            "brain.next --format json",
+            manage_py_command("graph", "--algorithm", "all", "--format", "json"),
+            manage_py_command("next", "--format", "json"),
         ],
     }
     if algorithm:
@@ -179,14 +223,14 @@ def graph_command_payload(
             blocked_nodes=blocked_nodes,
         )
         if "error" in algorithm_payload:
-            return algorithm_payload
+            return attach_elapsed(algorithm_payload, start)
         payload["algorithm"] = {
             "name": algorithm,
             "schema_version": ALGORITHMS_SCHEMA_VERSION,
             "result": algorithm_payload,
         }
         payload["ok"] = payload["ok"] and bool(algorithm_payload.get("ok", True))
-    return payload
+    return attach_elapsed(payload, start)
 
 
 def _quote_dot(value: str) -> str:
@@ -263,7 +307,7 @@ def graph_text_summary(payload: Mapping[str, Any]) -> str:
     if isinstance(algorithm, Mapping):
         result = algorithm.get("result") if isinstance(algorithm.get("result"), Mapping) else {}
         lines.append(f"algorithm: {algorithm.get('name')} ok={bool(result.get('ok', True))}")
-        reason = str(result.get("reason") or "")
+        reason = str(result.get("reason") or result.get("summary_line") or "")
         if reason:
             lines.append(f"reason: {reason}")
     return "\n".join(lines)

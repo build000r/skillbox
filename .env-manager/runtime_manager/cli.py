@@ -1,13 +1,36 @@
 from __future__ import annotations
 
 import difflib
+import fnmatch
+import hashlib
+import json
 import os
+import re
+import shlex
 import subprocess
 import sys
+import traceback
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
+from . import validation as VALIDATION
+from .errors import (
+    OVERRIDE_REFUSED_FLOOR,
+    OVERRIDE_REFUSED_GLOBAL_ESCALATION,
+    OVERRIDE_SKILL_UNKNOWN,
+    PRUNE_SKIPPED_PINNED,
+    SkillboxError,
+    ValidationError,
+    internal_error_payload,
+)
 from .shared import *
+from lib.runtime_model import (  # noqa: E402
+    LOCAL_RUNTIME_MODE_UNSUPPORTED,
+    LOCAL_RUNTIME_START_BLOCKED,
+    LOCAL_RUNTIME_START_MODES,
+)
 from .validation import *
 from .publish import *
 from .runtime_ops import *
@@ -27,24 +50,42 @@ from .pressure_report import *
 from .rch_report import *
 from .rch_adapter import *
 from .sbh_report import *
+from .state_backup import (
+    create_state_backup,
+    drill_state_backup,
+    list_state_backups,
+    restore_state_backup,
+    state_backup_text_lines,
+    verify_state_backup,
+)
 from .evidence import *
 from .forge import *
 from .swimmers_launch import launch_swimmers_batch, swimmers_launch_text_lines
 from .structure_doctor import run_structure_doctor, structure_doctor_text_lines
 from .command_registry import registry_payload
+from .registry_docs import registry_docs_payload
+from .port_registry import port_registry_payload, port_registry_text_lines
 from .agent_adapters import collect_agent_adapter_evidence
 from .agent_graph import build_agent_graph, build_agent_graph_payload
-from .agent_graph_engine import GRAPH_ALGORITHMS, GRAPH_OUTPUT_FORMATS, graph_command_payload, render_graph_payload
-from .agent_decisions import explain_payload, next_action_payload
+from .agent_graph_algorithms import ALGORITHMS
+from .agent_graph_engine import GRAPH_OUTPUT_FORMATS, graph_command_payload, render_graph_payload
+from .agent_decisions import BRAIN_COMMAND_TARGET_ALIASES, explain_payload, next_action_payload
+from .agent_errors import brain_error_payload
 from .agent_search import search_payload
+from .agent_timing import attach_elapsed, timer_start
 from .agent_snapshots import (
+    SNAPSHOT_SCHEMA_VERSION,
     create_snapshot_payload,
     diff_snapshots,
     load_snapshot,
     replay_snapshot,
     save_snapshot,
 )
-from .fleet_converge import build_fleet_converge_plan, fleet_converge_text_lines
+from .fleet_converge import (
+    build_fleet_converge_plan,
+    fleet_converge_text_lines,
+    resolve_skill_default_targets,
+)
 from .fleet_relink import (
     apply_relink_plan,
     build_relink_plan,
@@ -60,71 +101,54 @@ class DistributionRollbackError(RuntimeError):
     pass
 
 
-MANAGE_COMMAND_NAMES = {
-    "acceptance",
-    "bootstrap",
-    "capabilities",
-    "client-diff",
-    "client-init",
-    "client-open",
-    "client-project",
-    "client-publish",
-    "context",
-    "distribution-preview",
-    "distribution-publish",
-    "distribution-rollback",
-    "doctor",
-    "down",
-    "explain",
-    "first-box",
-    "focus",
-    "forge",
-    "graph",
-    "logs",
-    "mcp",
-    "mcp-audit",
-    "mmdx",
-    "next",
-    "onboard",
-    "operator-booking",
-    "overlay",
-    "parity-report",
-    "private-init",
-    "pressure-report",
-    "rch-stage",
-    "rch-report",
-    "sbh-report",
-    "render",
-    "restart",
-    "robot-docs",
-    "robot-triage",
-    "search",
-    "session-end",
-    "session-event",
-    "session-resume",
-    "session-start",
-    "session-status",
-    "skill",
-    "skill-audit",
-    "skills",
-    "snap",
-    "status",
-    "stewardship-report",
-    "structure-doctor",
-    "swimmers-launch",
-    "sync",
-    "up",
-    "worker-artifacts",
-    "worker-promote-learning",
-    "worker-status",
-    "worker-submit",
-}
 JSON_FLAG_ALIASES = {
     "--json": "--format json",
     "--jason": "--format json",
     "--jsno": "--format json",
     "--jsson": "--format json",
 }
+EarlyCommandHandler = Callable[[argparse.Namespace, Path], int]
+ModelCommandHandler = Callable[[argparse.Namespace, Path, dict[str, Any], str], int]
+
+
+@dataclass(frozen=True)
+class ManageCommandSpec:
+    name: str
+    handler: EarlyCommandHandler | ModelCommandHandler
+    help: str
+    loads_model: bool
+
+
+_COMMAND_REGISTRY: dict[str, ManageCommandSpec] = {}
+COMMAND_REGISTRY = _COMMAND_REGISTRY
+MANAGE_COMMAND_NAMES: frozenset[str] = frozenset()
+
+
+def register_command(
+    name: str,
+    handler: EarlyCommandHandler | ModelCommandHandler,
+    help_text: str,
+    *,
+    loads_model: bool,
+) -> ManageCommandSpec:
+    global MANAGE_COMMAND_NAMES
+    if not name:
+        raise RuntimeError("command registry entry is missing a name")
+    if name in _COMMAND_REGISTRY:
+        raise RuntimeError(f"command {name!r} is already registered")
+    spec = ManageCommandSpec(name=name, handler=handler, help=help_text, loads_model=loads_model)
+    _COMMAND_REGISTRY[name] = spec
+    MANAGE_COMMAND_NAMES = frozenset(_COMMAND_REGISTRY)
+    if "_EARLY_DISPATCH" in globals() and "_MODEL_DISPATCH" in globals():
+        if loads_model:
+            _MODEL_DISPATCH[name] = handler
+        else:
+            _EARLY_DISPATCH[name] = handler
+    return spec
+
+
+def command_registry() -> dict[str, ManageCommandSpec]:
+    return dict(sorted(_COMMAND_REGISTRY.items()))
 
 
 class SkillboxArgumentParser(argparse.ArgumentParser):
@@ -146,8 +170,7 @@ def _command_suggestion_from_error(message: str) -> str:
         return ""
     remainder = message.split(marker, 1)[1]
     raw = remainder.split("(", 1)[0].strip().strip("'\"")
-    matches = difflib.get_close_matches(raw, sorted(MANAGE_COMMAND_NAMES), n=1, cutoff=0.68)
-    return matches[0] if matches else ""
+    return _suggest_command(raw)
 
 
 def _normalize_agent_argv(argv: list[str] | None) -> tuple[list[str], list[str]]:
@@ -365,6 +388,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override the repo root for testing or embedding.",
     )
     parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Include the traceback for unexpected (INTERNAL) errors. Off by default so tracebacks never leak.",
+    )
+    parser.add_argument(
         "--robot-triage",
         action="store_true",
         help="Emit a compact JSON triage packet for agents and exit.",
@@ -380,6 +408,22 @@ def _build_parser() -> argparse.ArgumentParser:
         "--compact",
         action="store_true",
         help="Emit compact registry entries while preserving the top-level capabilities contract.",
+    )
+    capabilities_parser.add_argument(
+        "--no-adapters",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+
+    registry_docs_parser = subparsers.add_parser(
+        "registry-docs",
+        help="Render docs/API_REFERENCE.md from the command registry.",
+    )
+    registry_docs_parser.add_argument("--format", choices=("md", "json"), default="md")
+    registry_docs_parser.add_argument(
+        "--write",
+        action="store_true",
+        help="Write docs/API_REFERENCE.md instead of only printing the generated reference.",
     )
 
     robot_docs_parser = subparsers.add_parser(
@@ -450,6 +494,93 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_profile_arg(status_parser)
     _add_client_arg(status_parser)
     _add_cwd_arg(status_parser)
+
+    def _add_state_backup_common_args(command_parser: argparse.ArgumentParser, *, subcommand: bool = False) -> None:
+        default_format: str | argparse._SuppressClass = argparse.SUPPRESS if subcommand else "text"
+        default_path: None | argparse._SuppressClass = argparse.SUPPRESS if subcommand else None
+        command_parser.add_argument("--format", choices=("text", "json"), default=default_format)
+        command_parser.add_argument(
+            "--state-root",
+            default=default_path,
+            help="Override SKILLBOX_STATE_ROOT. Defaults to the resolved persistence state root.",
+        )
+        command_parser.add_argument(
+            "--backup-root",
+            default=default_path,
+            help="Override SKILLBOX_BACKUP_ROOT. Must be outside the state root.",
+        )
+
+    state_backup_parser = subparsers.add_parser(
+        "state-backup",
+        help="Create, list, verify, drill, or restore tar.gz backups of SKILLBOX_STATE_ROOT.",
+    )
+    _add_state_backup_common_args(state_backup_parser)
+    state_backup_subparsers = state_backup_parser.add_subparsers(dest="state_backup_action")
+    state_backup_create_parser = state_backup_subparsers.add_parser(
+        "create",
+        help="Create a tar.gz state-root backup and manifest.",
+    )
+    _add_state_backup_common_args(state_backup_create_parser, subcommand=True)
+    state_backup_list_parser = state_backup_subparsers.add_parser("list", help="List backups in SKILLBOX_BACKUP_ROOT.")
+    _add_state_backup_common_args(state_backup_list_parser, subcommand=True)
+    state_backup_verify_parser = state_backup_subparsers.add_parser(
+        "verify",
+        help="Verify one backup manifest or archive.",
+    )
+    _add_state_backup_common_args(state_backup_verify_parser, subcommand=True)
+    state_backup_verify_parser.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help="Manifest path or archive path. Defaults to the newest listed backup.",
+    )
+    state_backup_drill_parser = state_backup_subparsers.add_parser(
+        "drill",
+        help="Extract the newest backup into a temp dir and write drill evidence.",
+    )
+    _add_state_backup_common_args(state_backup_drill_parser, subcommand=True)
+    state_backup_drill_parser.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help="Manifest path or archive path. Defaults to the newest listed backup.",
+    )
+    state_backup_restore_parser = state_backup_subparsers.add_parser(
+        "restore",
+        help="Restore one backup after guardrails and an automatic safety backup.",
+    )
+    _add_state_backup_common_args(state_backup_restore_parser, subcommand=True)
+    state_backup_restore_parser.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help="Manifest path or archive path. Defaults to the newest listed backup.",
+    )
+    state_backup_restore_parser.add_argument(
+        "--i-understand-data-loss",
+        action="store_true",
+        help="Required acknowledgement for destructive restore.",
+    )
+
+    ports_parser = subparsers.add_parser(
+        "ports",
+        help=(
+            "List the machine-readable port registry for the active scope: every "
+            "declared port mapped to its owning service/ingress/env_surface, with "
+            "source (file+key), profiles, client, and bind scope. Health targets "
+            "with no parseable port emit a warning entry and are never guessed. "
+            "Read-only. Use --resolve <service-id> to resolve one owner's port(s)."
+        ),
+    )
+    ports_parser.add_argument("--format", choices=("text", "json"), default="json")
+    ports_parser.add_argument(
+        "--resolve",
+        default=None,
+        help="Resolve the declared port(s) for a single service/owner id.",
+    )
+    _add_profile_arg(ports_parser)
+    _add_client_arg(ports_parser)
+    _add_cwd_arg(ports_parser)
 
     pressure_report_parser = subparsers.add_parser(
         "pressure-report",
@@ -734,7 +865,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "from the one declaration that `mcp-audit` audits against, so audit and "
             "render agree. Output paths and the Codex `cwd` resolve through machine "
             "profiles (skillbox-config/machines.yaml) so a devbox TOML never gets a "
-            "foreign /Users/b path. Entries marked operator_managed in the "
+            "foreign /Users/operator path. Entries marked operator_managed in the "
             "declaration, and any entry present on a surface but not declared, are "
             "PRESERVED (review-before-remove). The user-global ~/.codex/config.toml "
             "is operator-managed and is NEVER rewritten by this command. --dry-run "
@@ -872,7 +1003,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--from-root",
         dest="from_root",
         default=None,
-        help="Source root to rewrite FROM (e.g. /Users/b/repos). Defaults to every other machine's repo roots from machines.yaml.",
+        help="Source root to rewrite FROM (e.g. /Users/operator/repos). Defaults to every other machine's repo roots from machines.yaml.",
     )
     fleet_relink_parser.add_argument(
         "--to-root",
@@ -1016,7 +1147,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Inspect the agent operations graph and optional graph algorithms.",
     )
     graph_parser.add_argument("--format", choices=tuple(sorted(GRAPH_OUTPUT_FORMATS)), default="json")
-    graph_parser.add_argument("--algorithm", choices=tuple(sorted(GRAPH_ALGORITHMS)), default=None)
+    graph_parser.add_argument("--algorithm", default=None)
     graph_parser.add_argument("--node", default=None, help="Node id for node-scoped graph algorithms.")
     graph_parser.add_argument("--source", default=None, help="Source node id for shortest-path.")
     graph_parser.add_argument("--target", default=None, help="Target node id for shortest-path.")
@@ -1099,7 +1230,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "snap",
         help="Create, diff, or replay redacted agent operations snapshots.",
     )
-    snap_subparsers = snap_parser.add_subparsers(dest="snap_action", required=True)
+    snap_parser.add_argument("--format", choices=("text", "json"), default="json")
+    snap_subparsers = snap_parser.add_subparsers(dest="snap_action")
     snap_create_parser = snap_subparsers.add_parser("create", help="Create a redacted runtime/evidence/graph snapshot.")
     snap_create_parser.add_argument("--format", choices=("text", "json"), default="json")
     snap_create_parser.add_argument("--name", "--label", dest="name", default=None)
@@ -1306,6 +1438,101 @@ def _build_parser() -> argparse.ArgumentParser:
         action_parser.add_argument("skill_name")
         _add_skill_lifecycle_common(action_parser)
 
+    skill_on_parser = skill_subparsers.add_parser(
+        "on",
+        help="Durably pin a skill on for this repo and return its activation packet.",
+    )
+    skill_on_parser.add_argument("skill_name")
+    _add_skill_lifecycle_common(skill_on_parser)
+    skill_on_parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Re-resolve visibility after applying and report the linked packet hash.",
+    )
+    skill_on_parser.add_argument(
+        "--global",
+        dest="to",
+        action="store_const",
+        const="global",
+        help="Request a global pin; refused when the skill is not globally allowed.",
+    )
+    skill_on_parser.set_defaults(to="project")
+
+    skill_off_parser = skill_subparsers.add_parser(
+        "off",
+        help="Durably pin a skill off for this repo and unlink current installs.",
+    )
+    skill_off_parser.add_argument("skill_name")
+    _add_skill_lifecycle_common(skill_off_parser)
+    _add_skill_from_scope_arg(
+        skill_off_parser,
+        help_text="Installed scope to unlink after writing pin_off.",
+    )
+    skill_off_parser.set_defaults(to="project", from_scope="project")
+
+    skill_heal_parser = skill_subparsers.add_parser(
+        "heal",
+        help="Resolve a skill source, durably pin it on for this repo, link it, and return its activation packet.",
+    )
+    skill_heal_parser.add_argument("skill_name")
+    _add_skill_lifecycle_common(skill_heal_parser)
+    skill_heal_parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Re-resolve visibility after applying and report the linked packet hash.",
+    )
+    skill_heal_parser.set_defaults(to="project")
+
+    skill_default_parser = skill_subparsers.add_parser(
+        "default",
+        help="Set repo or global skill defaults with a dry-run/apply diff.",
+    )
+    skill_default_parser.add_argument("default_action", choices=("on", "off"))
+    skill_default_parser.add_argument("skill_name")
+    default_scope = skill_default_parser.add_mutually_exclusive_group(required=True)
+    default_scope.add_argument(
+        "--repo",
+        dest="default_scope",
+        action="store_const",
+        const="repo",
+        help="Write the current repo's .skillbox/skill-overrides.yaml.",
+    )
+    default_scope.add_argument(
+        "--global",
+        dest="default_scope",
+        action="store_const",
+        const="global",
+        help="Write the operator skill-scope.yaml allow_global defaults.",
+    )
+    default_scope.add_argument(
+        "--repos",
+        dest="default_repos",
+        metavar="IDS",
+        help="Write defaults into registry repo ids/names (comma-separated).",
+    )
+    default_scope.add_argument(
+        "--category",
+        dest="default_category",
+        metavar="NAME",
+        help="Write defaults into every repo in a registry bucket/class or policy project category.",
+    )
+    skill_default_parser.set_defaults(default_repos=None, default_category=None)
+    skill_default_parser.add_argument("--format", choices=("text", "json"), default="text")
+    skill_default_parser.add_argument("--cwd", default=None)
+    skill_default_parser.add_argument("--dry-run", action="store_true")
+    skill_default_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm --global apply; --global dry-runs never require this.",
+    )
+    skill_default_parser.add_argument(
+        "--policy-path",
+        default=None,
+        help="Global skill-scope.yaml path. Defaults to SKILLBOX_SKILL_SCOPE_FILE or the operator config path.",
+    )
+    _add_profile_arg(skill_default_parser)
+    _add_client_arg(skill_default_parser)
+
     remove_parser = skill_subparsers.add_parser("remove", help="Remove installed links/files for a skill.")
     remove_parser.add_argument("skill_name")
     _add_skill_lifecycle_common(remove_parser)
@@ -1334,6 +1561,96 @@ def _build_parser() -> argparse.ArgumentParser:
         help_text="Installed scope to prune when --prune is set.",
     )
 
+    skill_lint_parser = skill_subparsers.add_parser(
+        "lint",
+        help="Lint the repo-local .skillbox/skill-overrides.yaml file.",
+    )
+    skill_lint_parser.add_argument("--format", choices=("text", "json"), default="text")
+    _add_profile_arg(skill_lint_parser)
+    _add_client_arg(skill_lint_parser)
+    _add_cwd_arg(skill_lint_parser)
+
+    skill_why_parser = skill_subparsers.add_parser(
+        "why",
+        help="Explain one skill's visibility provenance for this cwd, including absence and fixes.",
+    )
+    skill_why_parser.add_argument("skill_name")
+    skill_why_parser.add_argument("--format", choices=("text", "json"), default="text")
+    skill_why_parser.add_argument(
+        "--no-global",
+        action="store_true",
+        help="Do not inspect ~/.claude/skills or ~/.codex/skills.",
+    )
+    skill_why_parser.add_argument(
+        "--no-project",
+        action="store_true",
+        help="Do not inspect project-local .claude/.codex skill dirs near --cwd.",
+    )
+    _add_profile_arg(skill_why_parser)
+    _add_client_arg(skill_why_parser)
+    _add_cwd_arg(skill_why_parser)
+
+    skill_togglable_parser = skill_subparsers.add_parser(
+        "togglable",
+        aliases=["toggleable"],
+        help="List every skill flippable at this cwd and the command to flip it.",
+    )
+    skill_togglable_parser.add_argument("--format", choices=("text", "json"), default="text")
+    skill_togglable_parser.add_argument(
+        "--json",
+        dest="format",
+        action="store_const",
+        const="json",
+        help="Alias for --format json.",
+    )
+    _add_profile_arg(skill_togglable_parser)
+    _add_client_arg(skill_togglable_parser)
+    _add_cwd_arg(skill_togglable_parser)
+
+    skill_what_if_parser = skill_subparsers.add_parser(
+        "what-if",
+        help="Purely simulate skill visibility for repo/overlay/pin inputs without writing files.",
+    )
+    skill_what_if_parser.add_argument(
+        "--repo",
+        required=True,
+        help="Target repo registry id/name or path.",
+    )
+    skill_what_if_parser.add_argument(
+        "--overlay",
+        action="append",
+        default=[],
+        help="Overlay to force active for this simulation. Can be repeated.",
+    )
+    skill_what_if_parser.add_argument(
+        "--pin",
+        action="append",
+        default=[],
+        help="Skill to simulate as repo pin_on. Can be repeated.",
+    )
+    skill_what_if_parser.add_argument(
+        "--opt-out",
+        dest="opt_out",
+        action="append",
+        default=[],
+        help="Skill to simulate as opt_out_global. Can be repeated.",
+    )
+    skill_what_if_parser.add_argument(
+        "--machine",
+        default=None,
+        help="Machine id from machines.yaml to use for registry re-rooting.",
+    )
+    skill_what_if_parser.add_argument("--format", choices=("text", "json"), default="text")
+    skill_what_if_parser.add_argument(
+        "--json",
+        dest="format",
+        action="store_const",
+        const="json",
+        help="Alias for --format json.",
+    )
+    _add_profile_arg(skill_what_if_parser)
+    _add_client_arg(skill_what_if_parser)
+
     overlay_parser = subparsers.add_parser(
         "overlay",
         help="List, enable, disable, toggle, or activate skill scope overlays (e.g. marketing).",
@@ -1341,7 +1658,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "Manage skill-scope overlays. `activate` is policy-evaluated and ephemeral: "
             "it runs the SAME policy evaluation as `skill sync` with the named overlay "
             "treated as active for THIS invocation only (equivalent to "
-            "`SKILLBOX_OVERLAYS=<name> skill sync` scoped to --cwd), persists NO overlay "
+            "`SKILLBOX_CLI_OVERLAYS=<name> skill sync` scoped to --cwd), persists NO overlay "
             "state, and links only the policy-correct set for --cwd (often zero in a "
             "non-matching dir) — never every literal overlay-tagged skill. `--dry-run` "
             "previews exactly the plan `activate` would apply."
@@ -1427,6 +1744,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--mode",
         default=None,
         help="Local runtime startup behavior. One of: reuse (default), prod, fresh.",
+    )
+    up_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Roll back services started by this invocation if a later service fails.",
     )
     _add_profile_arg(up_parser)
     _add_client_arg(up_parser)
@@ -2909,6 +3231,8 @@ def _compact_registry_payload(payload: dict[str, Any]) -> dict[str, Any]:
             )
             if key in entry
         }
+        if "algorithms" in entry:
+            compact_entry["algorithms"] = entry["algorithms"]
         compact_entries.append(compact_entry)
     return {
         "abi_version": payload.get("abi_version"),
@@ -2917,7 +3241,22 @@ def _compact_registry_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _enrich_graph_capabilities(registry: dict[str, Any]) -> dict[str, Any]:
+    algorithm_names = sorted(ALGORITHMS)
+    algorithm_entries = [ALGORITHMS[name].to_payload() for name in algorithm_names]
+    algorithm_enum = f"enum[{'|'.join(algorithm_names)}]?"
+    for entry in registry.get("capabilities") or []:
+        if not isinstance(entry, dict) or entry.get("id") != "brain.graph":
+            continue
+        inputs = dict(entry.get("inputs") or {})
+        inputs["algorithm"] = algorithm_enum
+        entry["inputs"] = inputs
+        entry["algorithms"] = algorithm_entries
+    return registry
+
+
 def _capabilities_payload(root_dir: Path, *, compact: bool = False) -> dict[str, Any]:
+    start = timer_start()
     commands = [
         {
             "name": name,
@@ -2926,10 +3265,10 @@ def _capabilities_payload(root_dir: Path, *, compact: bool = False) -> dict[str,
         }
         for name in sorted(MANAGE_COMMAND_NAMES)
     ]
-    registry = registry_payload()
+    registry = _enrich_graph_capabilities(registry_payload())
     if compact:
         registry = _compact_registry_payload(registry)
-    return {
+    payload = {
         "ok": True,
         "tool": "skillbox-manage",
         "contract_version": "2026-05-09",
@@ -2975,6 +3314,7 @@ def _capabilities_payload(root_dir: Path, *, compact: bool = False) -> dict[str,
         },
         "env": {
             "SKILLBOX_STATE_ROOT": "Persistent runtime state root.",
+            "SKILLBOX_BACKUP_ROOT": "Destination directory for state-backup archives.",
             "SKILLBOX_MONOSERVER_ROOT": "Host or container repo universe root.",
             "SKILLBOX_CLIENTS_ROOT": "Runtime client overlay root.",
             "SKILLBOX_RCH_BIN": "Optional RCH CLI path for build-offload checks.",
@@ -2990,6 +3330,7 @@ def _capabilities_payload(root_dir: Path, *, compact: bool = False) -> dict[str,
             "python3 .env-manager/manage.py robot-docs guide",
         ],
     }
+    return attach_elapsed(payload, start)
 
 
 def _safe_first_try_command(name: str) -> str:
@@ -2997,12 +3338,16 @@ def _safe_first_try_command(name: str) -> str:
         return f"manage.py {name} --json"
     if name == "robot-docs":
         return "manage.py robot-docs guide"
-    if name in {"next", "graph", "search"}:
+    if name in {"next", "graph"}:
         return f"manage.py {name} --format json --no-adapters"
+    if name == "search":
+        return "manage.py search graph --format json --no-adapters"
     if name == "explain":
         return "manage.py explain brain.next --format json --no-adapters"
     if name == "snap":
         return "manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json"
+    if name == "registry-docs":
+        return "manage.py registry-docs --format md"
     if name in {"client-init"}:
         return "manage.py client-init --list-blueprints --format json"
     if name in {"client-project"}:
@@ -3019,6 +3364,8 @@ def _safe_first_try_command(name: str) -> str:
         return "manage.py distribution-preview --manifest-path <manifest.json> --public-key <public-key.pem> --format json"
     if name in {"distribution-rollback"}:
         return "manage.py distribution-rollback --list --skill <skill> --format json"
+    if name == "state-backup":
+        return "manage.py state-backup list --format json"
     if name in {"status", "render", "doctor", "skills", "skill-audit", "mcp-audit"}:
         return f"manage.py {name} --format json"
     if name == "pressure-report":
@@ -3081,8 +3428,8 @@ Useful command families:
   focus <client> --format json  Sync, bootstrap, start, collect live state, context.
 
 Pressure/offload rule:
-  The approved non-production worker target is portfolio-devbox.
-  Excluded targets are jeremy, ssh-info, and sweet-potato-prod.
+  The approved non-production worker target is worker-devbox.
+  Excluded targets are prod, production, and primary-prod.
   Protected paths like ~/.codex, ~/.claude, and ~/.ssh are hard no-touch.
   Use pressure-report, rch-report, and sbh-report before expensive builds or cleanup.
   Use rch-stage --dry-run before any staged remote build; it strips remote delete flags by default.
@@ -3092,6 +3439,19 @@ Pressure/offload rule:
 
 def _handle_capabilities(args: argparse.Namespace, root_dir: Path) -> int:
     emit_json(_capabilities_payload(root_dir, compact=bool(getattr(args, "compact", False))))
+    return EXIT_OK
+
+
+def _handle_registry_docs(args: argparse.Namespace, root_dir: Path) -> int:
+    payload = registry_docs_payload(
+        root_dir,
+        write=bool(getattr(args, "write", False)),
+        include_content=args.format == "md",
+    )
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print(payload["content"], end="")
     return EXIT_OK
 
 
@@ -3498,43 +3858,44 @@ def _handle_cass_evidence(args: argparse.Namespace, root_dir: Path) -> int:
     return int(proc.returncode)
 
 
-_EARLY_DISPATCH: dict[str, Callable[[argparse.Namespace, Path], int]] = {
-    "cass-evidence": _handle_cass_evidence,
-    "capabilities": _handle_capabilities,
-    "robot-docs": _handle_robot_docs,
-    "robot-triage": _handle_robot_triage,
-    "pressure-report": _handle_pressure_report,
-    "rch-report": _handle_rch_report,
-    "rch-stage": _handle_rch_stage,
-    "sbh-report": _handle_sbh_report,
-    "client-init": _handle_client_init,
-    "onboard": _handle_onboard,
-    "first-box": _handle_first_box,
-    "forge": _handle_forge,
-    "private-init": _handle_private_init,
-    "acceptance": _handle_acceptance,
-    "client-project": _handle_client_project,
-    "client-open": _handle_client_open,
-    "client-publish": _handle_client_publish,
-    "client-diff": _handle_client_diff,
-    "distribution-publish": _handle_distribution_publish,
-    "distribution-preview": _handle_distribution_preview,
-    "distribution-rollback": _handle_distribution_rollback,
-    "focus": _handle_focus,
-    "stewardship-report": _handle_stewardship_report,
-    "session-start": _handle_session_start,
-    "session-event": _handle_session_event,
-    "session-end": _handle_session_end,
-    "session-resume": _handle_session_resume,
-    "session-status": _handle_session_status,
-    "worker-submit": _handle_worker_submit,
-    "worker-status": _handle_worker_status,
-    "worker-artifacts": _handle_worker_artifacts,
-    "worker-promote-learning": _handle_worker_promote_learning,
-    "swimmers-launch": _handle_swimmers_launch,
-    "mmdx": _handle_mmdx,
-    "structure-doctor": _handle_structure_doctor,
-}
+_EARLY_COMMANDS: tuple[tuple[str, EarlyCommandHandler, str], ...] = (
+    ("cass-evidence", _handle_cass_evidence, "Measure skill invocations per repo from Cass."),
+    ("capabilities", _handle_capabilities, "Print the machine-readable Skillbox CLI contract."),
+    ("registry-docs", _handle_registry_docs, "Render docs/API_REFERENCE.md from the command registry."),
+    ("robot-docs", _handle_robot_docs, "Print agent-oriented in-tool documentation."),
+    ("robot-triage", _handle_robot_triage, "Emit a compact JSON triage packet for agents."),
+    ("pressure-report", _handle_pressure_report, "Report local disk pressure and guard posture."),
+    ("rch-report", _handle_rch_report, "Report RCH build-offload readiness without mutation."),
+    ("rch-stage", _handle_rch_stage, "Prepare or run a no-sudo RCH staging lane."),
+    ("sbh-report", _handle_sbh_report, "Report SBH storage guard readiness without mutation."),
+    ("client-init", _handle_client_init, "Create or inspect client overlay scaffolds."),
+    ("onboard", _handle_onboard, "Create an operator-owned client overlay and acceptance checklist."),
+    ("first-box", _handle_first_box, "Run first-box bootstrap for a client."),
+    ("forge", _handle_forge, "Run forge workspace helpers."),
+    ("private-init", _handle_private_init, "Create a private client config tree."),
+    ("acceptance", _handle_acceptance, "Run the first-box readiness gate."),
+    ("client-project", _handle_client_project, "Render a client project bundle."),
+    ("client-open", _handle_client_open, "Open a client surface from a bundle."),
+    ("client-publish", _handle_client_publish, "Publish a client bundle."),
+    ("client-diff", _handle_client_diff, "Diff a client bundle against a target."),
+    ("distribution-publish", _handle_distribution_publish, "Publish a signed skill distribution."),
+    ("distribution-preview", _handle_distribution_preview, "Preview a signed skill distribution manifest."),
+    ("distribution-rollback", _handle_distribution_rollback, "Rollback a distributed skill version."),
+    ("focus", _handle_focus, "Sync, bootstrap, start, and inspect one client."),
+    ("stewardship-report", _handle_stewardship_report, "Summarize stewardship coverage and risks."),
+    ("session-start", _handle_session_start, "Start a tracked client session."),
+    ("session-event", _handle_session_event, "Append an event to a tracked client session."),
+    ("session-end", _handle_session_end, "End a tracked client session."),
+    ("session-resume", _handle_session_resume, "Resume a tracked client session."),
+    ("session-status", _handle_session_status, "Inspect tracked client sessions."),
+    ("worker-submit", _handle_worker_submit, "Submit a broker-managed worker run."),
+    ("worker-status", _handle_worker_status, "Inspect a broker-managed worker run."),
+    ("worker-artifacts", _handle_worker_artifacts, "Read result artifacts for a worker run."),
+    ("worker-promote-learning", _handle_worker_promote_learning, "Promote a reviewed worker learning proposal."),
+    ("swimmers-launch", _handle_swimmers_launch, "Launch Swimmers agent sessions for directories."),
+    ("mmdx", _handle_mmdx, "Open or create MMDX diagrams."),
+    ("structure-doctor", _handle_structure_doctor, "Run structural gates without mutating runtime state."),
+)
 
 
 def _handle_render(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
@@ -3573,6 +3934,17 @@ def _handle_context(args: argparse.Namespace, root_dir: Path, model: dict[str, A
         emit_json({"actions": actions, "dry_run": args.dry_run, "next_actions": next_actions_for_context()})
     else:
         print("\n".join(actions))
+    return EXIT_OK
+
+
+def _handle_ports(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    model.setdefault("active_profiles", normalize_active_profiles(getattr(args, "profile", [])))
+    model.setdefault("active_clients", _active_clients_for_args(args, model))
+    payload = port_registry_payload(model, resolve=getattr(args, "resolve", None))
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print("\n".join(port_registry_text_lines(payload)))
     return EXIT_OK
 
 
@@ -3858,29 +4230,11 @@ def _print_next_text(payload: dict[str, Any]) -> None:
 
 
 def _print_explain_text(payload: dict[str, Any]) -> None:
-    if "error" in payload:
-        print(payload["error"]["message"], file=sys.stderr)
-        return
-    print(f"explain: {payload['target']} ({payload['kind']})")
-    print(f"summary: {payload['summary']}")
-    relationships = payload.get("relationships") or {}
-    print(f"incoming: {relationships.get('incoming_count', 0)}")
-    print(f"outgoing: {relationships.get('outgoing_count', 0)}")
-    for command in payload.get("commands") or []:
-        print(f"command: {command['id']} - {command['summary']}")
+    print_explain_brain_text(payload)
 
 
 def _print_search_text(payload: dict[str, Any]) -> None:
-    if "error" in payload:
-        print(payload["error"]["message"], file=sys.stderr)
-        return
-    print(f"search: {payload['count']}/{payload['total_count']} hits for {payload['query']!r}")
-    for hit in payload.get("hits") or []:
-        print(f"- {hit['source']}:{hit['kind']}:{hit['id']} score={hit['score']}")
-        print(f"  {hit['snippet']}")
-        print(f"  next: {hit['next_action']}")
-    for warning in payload.get("warnings") or []:
-        print(f"warning: {warning['code']}: {warning['message']}")
+    print_search_brain_text(payload)
 
 
 def _print_snap_text(payload: dict[str, Any]) -> None:
@@ -3937,7 +4291,7 @@ def _handle_graph(args: argparse.Namespace, root_dir: Path, model: dict[str, Any
     if args.format == "json":
         emit_json(payload)
     elif "error" in payload:
-        print(payload["error"]["message"], file=sys.stderr)
+        print_graph_error_text(payload)
         return EXIT_ERROR
     else:
         print(render_graph_payload(payload, args.format))
@@ -3959,6 +4313,8 @@ def _explain_target_is_brain(args: argparse.Namespace) -> bool:
         return True
     target = str(getattr(args, "target", "") or "").strip()
     if "." in target or ":" in target:
+        return True
+    if target in BRAIN_COMMAND_TARGET_ALIASES:
         return True
     try:
         from .command_registry import load_default_registry
@@ -4094,9 +4450,141 @@ def _snap_diff_paths(args: argparse.Namespace) -> tuple[Path, Path]:
     return from_path, to_path
 
 
+def _snap_subcommands() -> list[dict[str, str]]:
+    return [
+        {
+            "name": "create",
+            "side_effect": "none unless --write is passed",
+            "writes_only_with": "--write",
+            "safe_first_try": "python3 .env-manager/manage.py snap create --format json --no-adapters",
+        },
+        {
+            "name": "diff",
+            "side_effect": "none",
+            "safe_first_try": "python3 .env-manager/manage.py snap diff --from before.json --to after.json --format json",
+        },
+        {
+            "name": "replay",
+            "side_effect": "none",
+            "safe_first_try": "python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json",
+        },
+    ]
+
+
+def _snap_usage_payload(*, unknown_action: str | None = None) -> dict[str, Any]:
+    subcommands = _snap_subcommands()
+    payload: dict[str, Any] = {
+        "ok": True,
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "read_only_default": True,
+        "summary": "snap subcommands: create (dry-run unless --write), diff, replay",
+        "subcommands": subcommands,
+        "actions": subcommands,
+        "next_actions": [
+            "python3 .env-manager/manage.py snap --format json replay tests/goldens/agent_ops_snapshot.json",
+            "python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json",
+            "python3 .env-manager/manage.py capabilities --format json",
+        ],
+    }
+    if unknown_action is not None:
+        payload.update(
+            brain_error_payload(
+                SNAPSHOT_SCHEMA_VERSION,
+                "SNAP_UNKNOWN_ACTION",
+                f"unknown snap action: {unknown_action}",
+                context={"action": unknown_action},
+            )
+        )
+    return payload
+
+
+def _snap_action_required_text_payload() -> dict[str, Any]:
+    return {
+        "error": {
+            "code": "SNAP_ACTION_REQUIRED",
+            "type": "invalid_argument",
+            "message": "snap requires an action: create, diff, or replay",
+            "recoverable": True,
+        },
+        "next_actions": [
+            "python3 .env-manager/manage.py snap create --format json --no-adapters",
+            "python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json",
+        ],
+    }
+
+
+def _snap_error_payload(
+    code: str,
+    message: str,
+    *,
+    context: dict[str, Any] | None = None,
+    next_actions: list[str] | None = None,
+) -> dict[str, Any]:
+    return brain_error_payload(
+        SNAPSHOT_SCHEMA_VERSION,
+        code,
+        message,
+        context=context,
+        next_actions=next_actions or [
+            "python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json",
+            "python3 .env-manager/manage.py snap --format json",
+        ],
+    )
+
+
+def _load_snapshot_for_brain(path: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    path_text = str(path)
+    try:
+        payload = load_snapshot(path)
+    except FileNotFoundError:
+        return None, _snap_error_payload(
+            "SNAPSHOT_NOT_FOUND",
+            f"snapshot not found: {path_text}",
+            context={"path": path_text},
+        )
+    except json.JSONDecodeError as exc:
+        return None, _snap_error_payload(
+            "SNAPSHOT_SCHEMA_MISMATCH",
+            f"snapshot is not valid JSON: {path_text}",
+            context={"path": path_text, "reason": str(exc)},
+        )
+    except OSError as exc:
+        return None, _snap_error_payload(
+            "SNAPSHOT_NOT_FOUND",
+            f"snapshot is unreadable: {path_text}",
+            context={"path": path_text, "reason": str(exc)},
+        )
+    if not isinstance(payload, dict):
+        return None, _snap_error_payload(
+            "SNAPSHOT_SCHEMA_MISMATCH",
+            f"snapshot root must be an object: {path_text}",
+            context={"path": path_text, "actual_type": type(payload).__name__},
+        )
+    inputs = payload.get("inputs")
+    if (
+        payload.get("schema_version") != SNAPSHOT_SCHEMA_VERSION
+        or not payload.get("snapshot_id")
+        or not isinstance(inputs, dict)
+    ):
+        return None, _snap_error_payload(
+            "SNAPSHOT_SCHEMA_MISMATCH",
+            f"snapshot does not match {SNAPSHOT_SCHEMA_VERSION}: {path_text}",
+            context={
+                "path": path_text,
+                "schema_version": payload.get("schema_version"),
+                "has_snapshot_id": bool(payload.get("snapshot_id")),
+                "has_inputs": isinstance(inputs, dict),
+            },
+        )
+    return payload, None
+
+
 def _handle_snap(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
     del resolved_mode
-    if args.snap_action == "create":
+    snap_action = getattr(args, "snap_action", None)
+    if not snap_action:
+        payload = _snap_usage_payload() if args.format == "json" else _snap_action_required_text_payload()
+    elif snap_action == "create":
         adapters = _brain_adapters_for_args(root_dir, model, args)
         payload = create_snapshot_payload(
             status=runtime_status(model),
@@ -4113,18 +4601,39 @@ def _handle_snap(args: argparse.Namespace, root_dir: Path, model: dict[str, Any]
         )
         if getattr(args, "write", False):
             payload["artifact"] = str(save_snapshot(root_dir, payload))
-    elif args.snap_action == "diff":
-        from_path, to_path = _snap_diff_paths(args)
-        payload = diff_snapshots(load_snapshot(from_path), load_snapshot(to_path))
-    elif args.snap_action == "replay":
-        payload = replay_snapshot(load_snapshot(Path(args.path)))
+    elif snap_action == "diff":
+        try:
+            from_path, to_path = _snap_diff_paths(args)
+        except RuntimeError as exc:
+            payload = _snap_error_payload(
+                "INVALID_ARGUMENT",
+                str(exc),
+                context={"action": "diff"},
+                next_actions=["python3 .env-manager/manage.py snap diff --from before.json --to after.json --format json"],
+            )
+        else:
+            before, error = _load_snapshot_for_brain(from_path)
+            if error is not None:
+                payload = error
+            else:
+                after, error = _load_snapshot_for_brain(to_path)
+                payload = error if error is not None else diff_snapshots(before, after)
+    elif snap_action == "replay":
+        snapshot, error = _load_snapshot_for_brain(Path(args.path))
+        payload = error if error is not None else replay_snapshot(snapshot)
     else:
-        payload = {"error": {"message": f"unknown snap action: {args.snap_action}"}}
+        payload = (
+            _snap_usage_payload(unknown_action=snap_action)
+            if args.format == "json"
+            else {"error": {"message": f"unknown snap action: {snap_action}"}}
+        )
 
     if args.format == "json":
         emit_json(payload)
     else:
         _print_snap_text(payload)
+    if args.format == "json" and payload.get("ok") is True and "error" not in payload:
+        return EXIT_OK
     return EXIT_ERROR if "error" in payload else EXIT_OK
 
 
@@ -4135,9 +4644,1632 @@ def _handle_parity_report(args: argparse.Namespace, root_dir: Path, model: dict[
     return emit_dev_prod_parity_report(payload, fmt=args.format)
 
 
+def _print_skill_override_lint_text(payload: dict[str, Any]) -> None:
+    print("skill override lint")
+    print(f"path: {payload.get('policy_path')}")
+    if not payload.get("exists"):
+        print("findings: none (no override file)")
+        return
+    findings = payload.get("findings") or []
+    if not findings:
+        print("findings: none")
+        return
+    print("findings:")
+    for finding in findings:
+        severity = str(finding.get("severity") or "warn").upper()
+        rule = finding.get("rule")
+        skill = finding.get("skill") or "(file)"
+        location = ""
+        if finding.get("line") is not None:
+            location = f":{finding.get('line')}"
+        elif finding.get("lines"):
+            rendered = ", ".join(
+                f"{key}:{value}" for key, value in (finding.get("lines") or {}).items()
+            )
+            location = f" ({rendered})"
+        print(f"  - {severity} {rule} {skill}{location}")
+        print(f"    {finding.get('explanation')}")
+        print(f"    fix: {finding.get('suggested_fix')}")
+
+
+def _override_list(policy: dict[str, Any], key: str) -> list[str]:
+    return [
+        str(item)
+        for item in policy.get(key) or []
+        if str(item).strip()
+    ]
+
+
+def _mutate_skill_pin(policy: dict[str, Any], skill_name: str, skill_action: str) -> dict[str, Any]:
+    updated = dict(policy)
+    pin_on = [item for item in _override_list(updated, "pin_on") if item != skill_name]
+    pin_off = [item for item in _override_list(updated, "pin_off") if item != skill_name]
+    if skill_action == "on":
+        pin_on.append(skill_name)
+    else:
+        pin_off.append(skill_name)
+    updated["pin_on"] = pin_on
+    updated["pin_off"] = pin_off
+    return updated
+
+
+def _pin_state(policy: dict[str, Any]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    return tuple(_override_list(policy, "pin_on")), tuple(_override_list(policy, "pin_off"))
+
+
+def _skill_pin_would_change(policy: dict[str, Any], skill_name: str, skill_action: str) -> bool:
+    return _pin_state(policy) != _pin_state(_mutate_skill_pin(policy, skill_name, skill_action))
+
+
+def _apply_skill_pin(
+    cwd: str | None,
+    skill_name: str,
+    skill_action: str,
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    current = _repo_override_policy(cwd or os.getcwd())
+    policy_path = str(current.get("_policy_path") or "")
+    would_change = _skill_pin_would_change(current, skill_name, skill_action)
+    if dry_run:
+        return {
+            "changed": False,
+            "would_change": would_change,
+            "policy_path": policy_path,
+            "pin": "pin_on" if skill_action == "on" else "pin_off",
+        }
+
+    result = update_repo_override_policy(
+        cwd or os.getcwd(),
+        lambda policy: _mutate_skill_pin(policy, skill_name, skill_action),
+    )
+    return {
+        "changed": bool(result.get("changed")),
+        "would_change": would_change,
+        "policy_path": str(result.get("_policy_path") or policy_path),
+        "pin": "pin_on" if skill_action == "on" else "pin_off",
+    }
+
+
+def _heal_pin_reason(skill_name: str) -> str:
+    timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return f"heal:{skill_name} {timestamp}"
+
+
+def _apply_skill_heal_pin(
+    cwd: str | None,
+    skill_name: str,
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    current = _repo_override_policy(cwd or os.getcwd())
+    policy_path = str(current.get("_policy_path") or "")
+    would_change = _skill_pin_would_change(current, skill_name, "on")
+    reason = _heal_pin_reason(skill_name)
+    if dry_run:
+        return {
+            "changed": False,
+            "would_change": would_change,
+            "policy_path": policy_path,
+            "pin": "pin_on",
+            "reason": reason if would_change else str(current.get("reason") or ""),
+        }
+    if not would_change:
+        return {
+            "changed": False,
+            "would_change": False,
+            "policy_path": policy_path,
+            "pin": "pin_on",
+            "reason": str(current.get("reason") or ""),
+        }
+
+    def mutator(policy: dict[str, Any]) -> dict[str, Any]:
+        updated = _mutate_skill_pin(policy, skill_name, "on")
+        updated["reason"] = reason
+        return updated
+
+    result = update_repo_override_policy(cwd or os.getcwd(), mutator)
+    return {
+        "changed": bool(result.get("changed")),
+        "would_change": would_change,
+        "policy_path": str(result.get("_policy_path") or policy_path),
+        "pin": "pin_on",
+        "reason": reason,
+    }
+
+
+def _mutate_skill_default(policy: dict[str, Any], skill_name: str, default_action: str) -> dict[str, Any]:
+    updated = dict(policy)
+    defaults = [item for item in _override_list(updated, "defaults") if item != skill_name]
+    pin_on = [item for item in _override_list(updated, "pin_on") if item != skill_name]
+    pin_off = [item for item in _override_list(updated, "pin_off") if item != skill_name]
+    if default_action == "on":
+        defaults.append(skill_name)
+        pin_on.append(skill_name)
+    else:
+        pin_off.append(skill_name)
+    updated["defaults"] = defaults
+    updated["pin_on"] = pin_on
+    updated["pin_off"] = pin_off
+    return updated
+
+
+def _unified_policy_diff(path: str, before: str, after: str) -> str:
+    if before == after:
+        return ""
+    before_label = path if before else "/dev/null"
+    return "".join(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile=before_label,
+            tofile=path,
+        )
+    )
+
+
+def _check_result_payload(result: CheckResult) -> dict[str, Any]:
+    return {
+        "status": result.status,
+        "code": result.code,
+        "message": result.message,
+        "details": result.details or {},
+    }
+
+
+def _handle_repo_skill_default(
+    args: argparse.Namespace,
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    skill_name = str(args.skill_name)
+    default_action = str(args.default_action)
+    cwd_path = Path(args.cwd or os.getcwd()).resolve()
+    if default_action == "off" and skill_name in set(DISPATCHER_CORE):
+        raise ValidationError(
+            OVERRIDE_REFUSED_FLOOR,
+            f"Refusing to default off dispatcher floor skill {skill_name!r}.",
+            context={
+                "skill": skill_name,
+                "action": "default off",
+                "floor": list(DISPATCHER_CORE),
+                "policy": "repo defaults cannot disable dispatcher floor skills",
+            },
+            next_actions=[
+                f"sbp skill default on {skill_name} --repo --cwd {cwd_path}",
+                f"sbp skill lint --cwd {cwd_path}",
+            ],
+        )
+
+    current = _repo_override_policy(str(cwd_path))
+    policy_path = str(current.get("_policy_path") or "")
+    path = Path(policy_path)
+    before = path.read_text(encoding="utf-8") if path.is_file() else ""
+    after = _repo_policy_text_for_default(before, skill_name, default_action)
+    diff_text = _unified_policy_diff(
+        policy_path,
+        before,
+        after,
+    )
+    would_change = before != after
+    result: dict[str, Any] = {
+        "action": "default",
+        "default_action": default_action,
+        "scope": "repo",
+        "skill": skill_name,
+        "cwd": str(cwd_path),
+        "dry_run": dry_run,
+        "changed": False,
+        "would_change": would_change,
+        "noop": not would_change,
+        "policy_path": policy_path,
+        "diff": diff_text,
+        "override": {
+            "pin": "pin_on" if default_action == "on" else "pin_off",
+            "defaults": default_action == "on",
+        },
+    }
+    if dry_run:
+        return result
+
+    if would_change:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(path, after)
+    result["changed"] = would_change
+    result["noop"] = not would_change
+    return result
+
+
+def _csv_arg(value: Any) -> list[str]:
+    items: list[str] = []
+    if value is None:
+        return items
+    raw_values = value if isinstance(value, (list, tuple, set)) else [value]
+    for raw in raw_values:
+        for part in str(raw or "").split(","):
+            item = part.strip()
+            if item and item not in items:
+                items.append(item)
+    return items
+
+
+def _skill_default_review_dir() -> Path:
+    raw = str(os.environ.get("SKILLBOX_STATE_ROOT") or ".skillbox-state").strip()
+    root = Path(os.path.expandvars(os.path.expanduser(raw)))
+    if not root.is_absolute():
+        root = Path.cwd() / root
+    return root / "skill-default-previews"
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _fleet_skill_default_target_plan(
+    target: dict[str, Any],
+    *,
+    skill_name: str,
+    default_action: str,
+) -> dict[str, Any]:
+    repo_path = Path(str(target.get("path") or "")).resolve()
+    policy_path = repo_path / ".skillbox" / "skill-overrides.yaml"
+    exists = repo_path.is_dir()
+    before = policy_path.read_text(encoding="utf-8") if policy_path.is_file() else ""
+    after = _repo_policy_text_for_default(before, skill_name, default_action) if exists else before
+    diff_text = _unified_policy_diff(str(policy_path), before, after) if exists else ""
+    dirty_paths = git_dirty_paths(repo_path) if exists else []
+    result = dict(target)
+    result.update(
+        {
+            "repo_path": str(repo_path),
+            "policy_path": str(policy_path),
+            "exists": exists,
+            "clean": not dirty_paths,
+            "dirty_paths": dirty_paths[:20],
+            "dirty_count": len(dirty_paths),
+            "before_sha256": _sha256_text(before),
+            "after_sha256": _sha256_text(after),
+            "would_change": exists and before != after,
+            "changed": False,
+            "diff": diff_text,
+        }
+    )
+    return result
+
+
+def _fleet_skill_default_plan_signature(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": "skill-default-fleet-review-v1",
+        "skill": payload.get("skill"),
+        "default_action": payload.get("default_action"),
+        "scope": payload.get("scope"),
+        "selectors": payload.get("selectors") or {},
+        "targets": [
+            {
+                "repo_id": target.get("repo_id"),
+                "repo_path": target.get("repo_path"),
+                "policy_path": target.get("policy_path"),
+                "before_sha256": target.get("before_sha256"),
+                "after_sha256": target.get("after_sha256"),
+                "diff_sha256": _sha256_text(str(target.get("diff") or "")),
+                "would_change": bool(target.get("would_change")),
+            }
+            for target in payload.get("targets") or []
+        ],
+    }
+
+
+def _fleet_skill_default_plan_sha(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(_fleet_skill_default_plan_signature(payload), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _fleet_skill_default_marker_path(plan_sha: str) -> Path:
+    return _skill_default_review_dir() / f"{plan_sha}.json"
+
+
+def _record_fleet_skill_default_review(payload: dict[str, Any]) -> dict[str, Any]:
+    plan_sha = _fleet_skill_default_plan_sha(payload)
+    marker_path = _fleet_skill_default_marker_path(plan_sha)
+    record = {
+        "schema": "skill-default-fleet-review-v1",
+        "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "plan_sha256": plan_sha,
+        "signature": _fleet_skill_default_plan_signature(payload),
+    }
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(marker_path, json.dumps(record, sort_keys=True, indent=2) + "\n")
+    return {
+        "required_for_apply": True,
+        "plan_sha256": plan_sha,
+        "marker_path": str(marker_path),
+        "recorded": True,
+    }
+
+
+def _fleet_skill_default_review_status(payload: dict[str, Any]) -> dict[str, Any]:
+    plan_sha = _fleet_skill_default_plan_sha(payload)
+    marker_path = _fleet_skill_default_marker_path(plan_sha)
+    return {
+        "required_for_apply": True,
+        "plan_sha256": plan_sha,
+        "marker_path": str(marker_path),
+        "present": marker_path.is_file(),
+    }
+
+
+def _build_fleet_skill_default_payload(
+    args: argparse.Namespace,
+    model: dict[str, Any] | None,
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    skill_name = str(args.skill_name)
+    default_action = str(args.default_action)
+    cwd_path = Path(args.cwd or os.getcwd()).resolve()
+    repo_selectors = _csv_arg(getattr(args, "default_repos", None))
+    category_selectors = _csv_arg(getattr(args, "default_category", None))
+    selectors = {
+        "repos": repo_selectors,
+        "categories": category_selectors,
+    }
+    try:
+        targets = resolve_skill_default_targets(
+            model or {},
+            repo_selectors=repo_selectors,
+            category_selectors=category_selectors,
+        )
+    except RegistryResolutionError as exc:
+        return {
+            "ok": False,
+            "action": "default",
+            "default_action": default_action,
+            "scope": "repos",
+            "skill": skill_name,
+            "cwd": str(cwd_path),
+            "dry_run": dry_run,
+            "changed": False,
+            "would_change": False,
+            "noop": True,
+            "policy_path": None,
+            "diff": "",
+            "selectors": selectors,
+            "target_count": 0,
+            "would_change_count": 0,
+            "changed_count": 0,
+            "targets": [],
+            "preflight": {"ok": False, "missing": [], "dirty": []},
+            "residue": [],
+            "partial_apply": False,
+            "failed": None,
+            "error": {
+                "type": "RegistryResolutionError",
+                "message": str(exc),
+                "errors": [dict(item) for item in getattr(exc, "errors", [])],
+                "context": dict(getattr(exc, "context", {}) or {}),
+            },
+            "next_actions": [
+                "sbp registry doctor --json",
+                "sbp skills audit --format json --all",
+            ],
+        }
+    planned_targets = [
+        _fleet_skill_default_target_plan(
+            target,
+            skill_name=skill_name,
+            default_action=default_action,
+        )
+        for target in targets
+    ]
+    missing = [target for target in planned_targets if not target.get("exists")]
+    dirty = [
+        target for target in planned_targets
+        if target.get("would_change") and not target.get("clean")
+    ]
+    would_change_count = sum(1 for target in planned_targets if target.get("would_change"))
+    payload: dict[str, Any] = {
+        "ok": not missing and not dirty,
+        "action": "default",
+        "default_action": default_action,
+        "scope": "repos",
+        "skill": skill_name,
+        "cwd": str(cwd_path),
+        "dry_run": dry_run,
+        "changed": False,
+        "would_change": would_change_count > 0,
+        "noop": would_change_count == 0,
+        "policy_path": None,
+        "diff": "",
+        "selectors": selectors,
+        "target_count": len(planned_targets),
+        "would_change_count": would_change_count,
+        "changed_count": 0,
+        "targets": planned_targets,
+        "preflight": {
+            "ok": not missing and not dirty,
+            "missing": [
+                {
+                    "repo_id": target.get("repo_id"),
+                    "repo_path": target.get("repo_path"),
+                    "policy_path": target.get("policy_path"),
+                }
+                for target in missing
+            ],
+            "dirty": [
+                {
+                    "repo_id": target.get("repo_id"),
+                    "repo_path": target.get("repo_path"),
+                    "dirty_count": target.get("dirty_count"),
+                    "dirty_paths": target.get("dirty_paths") or [],
+                }
+                for target in dirty
+            ],
+        },
+        "residue": [],
+        "partial_apply": False,
+        "failed": None,
+        "next_actions": [],
+    }
+    if not planned_targets:
+        payload["ok"] = False
+        payload["preflight"]["ok"] = False
+        payload["preflight"]["missing"] = []
+        payload["error"] = "no repositories matched --repos/--category selectors"
+    if dry_run:
+        payload["review"] = _record_fleet_skill_default_review(payload)
+        payload["next_actions"] = [
+            _skill_default_apply_command(args, include_dry_run=False),
+        ]
+    else:
+        payload["review"] = _fleet_skill_default_review_status(payload)
+        payload["next_actions"] = [
+            _skill_default_apply_command(args, include_dry_run=True),
+        ]
+    return payload
+
+
+def _skill_default_apply_command(args: argparse.Namespace, *, include_dry_run: bool) -> str:
+    pieces = [
+        "sbp",
+        "skill",
+        "default",
+        shlex.quote(str(args.default_action)),
+        shlex.quote(str(args.skill_name)),
+    ]
+    if getattr(args, "default_repos", None):
+        pieces.extend(["--repos", shlex.quote(str(args.default_repos))])
+    if getattr(args, "default_category", None):
+        pieces.extend(["--category", shlex.quote(str(args.default_category))])
+    if getattr(args, "cwd", None):
+        pieces.extend(["--cwd", shlex.quote(str(args.cwd))])
+    if include_dry_run:
+        pieces.append("--dry-run")
+    return " ".join(pieces)
+
+
+def _handle_fleet_skill_default(
+    args: argparse.Namespace,
+    model: dict[str, Any] | None,
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    default_action = str(args.default_action)
+    skill_name = str(args.skill_name)
+    if default_action == "off" and skill_name in set(DISPATCHER_CORE):
+        raise ValidationError(
+            OVERRIDE_REFUSED_FLOOR,
+            f"Refusing to default off dispatcher floor skill {skill_name!r}.",
+            context={
+                "skill": skill_name,
+                "action": "default off",
+                "floor": list(DISPATCHER_CORE),
+                "policy": "repo defaults cannot disable dispatcher floor skills",
+            },
+            next_actions=[
+                f"sbp skill default on {skill_name} --repos <ids> --dry-run",
+                f"sbp skill default on {skill_name} --category <name> --dry-run",
+            ],
+        )
+    payload = _build_fleet_skill_default_payload(args, model, dry_run=dry_run)
+    if dry_run:
+        return payload
+    if not payload.get("ok"):
+        return payload
+    if payload.get("would_change") and not (payload.get("review") or {}).get("present"):
+        payload["ok"] = False
+        payload["preflight"]["ok"] = False
+        payload["error"] = (
+            "cross-repo skill default writes require an exact dry-run first; "
+            "run the dry-run command and re-run apply without changing the target set."
+        )
+        return payload
+    if not payload.get("would_change"):
+        payload["ok"] = True
+        payload["noop"] = True
+        return payload
+
+    applied: list[dict[str, Any]] = []
+    targets = payload.get("targets") or []
+    for index, target in enumerate(targets):
+        if not target.get("would_change"):
+            continue
+        policy_path = Path(str(target.get("policy_path") or ""))
+        try:
+            before = policy_path.read_text(encoding="utf-8") if policy_path.is_file() else ""
+            after = _repo_policy_text_for_default(before, skill_name, default_action)
+            policy_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(policy_path, after)
+        except Exception as exc:
+            payload["ok"] = False
+            payload["failed"] = {
+                "repo_id": target.get("repo_id"),
+                "repo_path": target.get("repo_path"),
+                "policy_path": target.get("policy_path"),
+                "error": str(exc),
+            }
+            payload["residue"] = applied
+            payload["partial_apply"] = bool(applied)
+            payload["changed"] = bool(applied)
+            payload["changed_count"] = len(applied)
+            payload["not_applied"] = [
+                {
+                    "repo_id": item.get("repo_id"),
+                    "repo_path": item.get("repo_path"),
+                    "policy_path": item.get("policy_path"),
+                }
+                for item in targets[index + 1 :]
+                if item.get("would_change")
+            ]
+            return payload
+        target["changed"] = True
+        applied.append(
+            {
+                "repo_id": target.get("repo_id"),
+                "repo_path": target.get("repo_path"),
+                "policy_path": target.get("policy_path"),
+                "before_sha256": target.get("before_sha256"),
+                "after_sha256": target.get("after_sha256"),
+                "diff": target.get("diff"),
+                "rollback_hint": f"restore {target.get('policy_path')} from VCS or reverse the listed diff",
+            }
+        )
+
+    payload["ok"] = True
+    payload["changed"] = bool(applied)
+    payload["changed_count"] = len(applied)
+    payload["noop"] = not applied
+    return payload
+
+
+def _load_policy_from_text(text: str) -> dict[str, Any]:
+    yaml_mod = require_yaml("read skill-scope policy")
+    parsed = yaml_mod.safe_load(text) if text.strip() else {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _repo_policy_text_for_default(text: str, skill_name: str, default_action: str) -> str:
+    base_text = text if text.strip() else "version: 1\n"
+    policy = _load_policy_from_text(base_text)
+    updated = _mutate_skill_default(policy, skill_name, default_action)
+    rendered = _upsert_top_level_list(
+        base_text,
+        "pin_on",
+        _override_list(updated, "pin_on"),
+        after_keys=("version",),
+    )
+    rendered = _upsert_top_level_list(
+        rendered,
+        "pin_off",
+        _override_list(updated, "pin_off"),
+        after_keys=("pin_on", "version"),
+    )
+    rendered = _upsert_top_level_list(
+        rendered,
+        "defaults",
+        _override_list(updated, "defaults"),
+        after_keys=("overlays", "opt_out_global", "pin_off", "pin_on", "version"),
+    )
+    parsed = _load_policy_from_text(rendered)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("repo skill override policy would not parse as a mapping")
+    return rendered
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value]
+    return []
+
+
+def _allow_global_patterns(rule: dict[str, Any]) -> list[str]:
+    raw = rule.get("skills") or rule.get("patterns") or rule.get("names") or []
+    return [name for item in _string_list(raw) if (name := item.strip())]
+
+
+def _global_allow_rule_matches_skill(rule: dict[str, Any], skill_name: str) -> bool:
+    if not bool(rule.get("allow_global", False)):
+        return False
+    return any(fnmatch.fnmatchcase(skill_name, pattern) for pattern in _allow_global_patterns(rule))
+
+
+def _allow_global_union(policy: dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+    for rule in policy.get("rules") or []:
+        if not isinstance(rule, dict) or not bool(rule.get("allow_global", False)):
+            continue
+        names.update(_allow_global_patterns(rule))
+    return names
+
+
+def _global_policy_grants_skill(policy: dict[str, Any], skill_name: str) -> bool:
+    for rule in policy.get("rules") or []:
+        if isinstance(rule, dict) and _global_allow_rule_matches_skill(rule, skill_name):
+            return True
+    return False
+
+
+def _hand_authored_global_grants_skill(policy: dict[str, Any], skill_name: str) -> bool:
+    generated_id = _generated_global_rule_id(skill_name)
+    for rule in policy.get("rules") or []:
+        if not isinstance(rule, dict) or str(rule.get("id") or "") == generated_id:
+            continue
+        if _global_allow_rule_matches_skill(rule, skill_name):
+            return True
+    return False
+
+
+def _top_level_block_end(lines: list[str], start: int) -> int:
+    index = start + 1
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        if stripped and not line.startswith((" ", "\t")) and not stripped.startswith("#"):
+            break
+        index += 1
+    return index
+
+
+def _replace_top_level_list(text: str, key: str, values: list[str]) -> str:
+    lines = text.splitlines(keepends=True)
+    replacement = [f"{key}:\n"]
+    replacement.extend(f"  - {value}\n" for value in values)
+    if not values:
+        replacement = [f"{key}: []\n"]
+    for index, line in enumerate(lines):
+        if line.startswith(f"{key}:"):
+            end = _top_level_block_end(lines, index)
+            return "".join([*lines[:index], *replacement, *lines[end:]])
+    return text
+
+
+def _upsert_top_level_list(
+    text: str,
+    key: str,
+    values: list[str],
+    *,
+    after_keys: tuple[str, ...] = (),
+) -> str:
+    updated = _replace_top_level_list(text, key, values)
+    if updated != text or any(line.startswith(f"{key}:") for line in text.splitlines()):
+        return updated
+    lines = text.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    replacement = [f"{key}:\n"]
+    replacement.extend(f"  - {value}\n" for value in values)
+    if not values:
+        replacement = [f"{key}: []\n"]
+    insert_at = len(lines)
+    for after_key in after_keys:
+        found_anchor = False
+        for index, line in enumerate(lines):
+            if line.startswith(f"{after_key}:"):
+                insert_at = _top_level_block_end(lines, index)
+                found_anchor = True
+                break
+        if found_anchor:
+            break
+    return "".join([*lines[:insert_at], *replacement, *lines[insert_at:]])
+
+
+def _generated_global_rule_id(skill_name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", skill_name.lower()).strip("-") or "skill"
+    return f"skillbox-default-global-{slug}"
+
+
+def _generated_global_rule_lines(skill_name: str) -> list[str]:
+    return [
+        f"  - id: {_generated_global_rule_id(skill_name)}\n",
+        "    skills:\n",
+        f"      - {skill_name}\n",
+        "    allow_global: true\n",
+        "    default: on\n",
+    ]
+
+
+def _has_generated_global_rule(text: str, skill_name: str) -> bool:
+    needle = f"  - id: {_generated_global_rule_id(skill_name)}"
+    return any(line.strip() == needle.strip() for line in text.splitlines())
+
+
+def _append_generated_global_rule(text: str, skill_name: str) -> str:
+    if _has_generated_global_rule(text, skill_name):
+        return text
+    lines = text.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] = lines[-1] + "\n"
+    rule_lines = _generated_global_rule_lines(skill_name)
+    for index, line in enumerate(lines):
+        if not line.startswith("rules:"):
+            continue
+        if line.strip() != "rules:":
+            if line.strip() not in {"rules: []", "rules: null"}:
+                raise RuntimeError(
+                    "cannot preserve inline non-empty rules while adding a generated default; "
+                    "convert rules to block form first."
+                )
+            end = _top_level_block_end(lines, index)
+            return "".join([*lines[:index], "rules:\n", *rule_lines, *lines[end:]])
+        end = _top_level_block_end(lines, index)
+        return "".join([*lines[:end], *rule_lines, *lines[end:]])
+    prefix = "".join(lines)
+    if prefix and not prefix.endswith("\n"):
+        prefix += "\n"
+    return prefix + "rules:\n" + "".join(rule_lines)
+
+
+def _remove_generated_global_rule(text: str, skill_name: str) -> str:
+    rule_id = _generated_global_rule_id(skill_name)
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if line.strip() != f"- id: {rule_id}":
+            continue
+        end = index + 1
+        while end < len(lines):
+            stripped = lines[end].strip()
+            if stripped.startswith("- id: ") or (stripped and not lines[end].startswith((" ", "\t"))):
+                break
+            end += 1
+        return "".join([*lines[:index], *lines[end:]])
+    return text
+
+
+def _sync_global_allowlist_snapshot(text: str) -> str:
+    policy = _load_policy_from_text(text)
+    if "global_allowlist" not in policy:
+        return text
+    return _replace_top_level_list(
+        text,
+        "global_allowlist",
+        sorted(_allow_global_union(policy)),
+    )
+
+
+def _validate_global_policy_text_or_raise(text: str, policy_path: Path) -> list[CheckResult]:
+    policy = _load_policy_from_text(text)
+    results = validate_global_skill_contract(policy, policy_path=str(policy_path))
+    failures = [result for result in results if result.status == "fail"]
+    if failures:
+        messages = "; ".join(result.message for result in failures)
+        raise RuntimeError(f"skill-scope policy would fail global contract lint: {messages}")
+    return results
+
+
+def _global_policy_text_for_default(text: str, skill_name: str, default_action: str) -> str:
+    policy = _load_policy_from_text(text)
+    allowed_before = _global_policy_grants_skill(policy, skill_name)
+    if default_action == "on":
+        updated = text if allowed_before else _append_generated_global_rule(text, skill_name)
+    else:
+        if _hand_authored_global_grants_skill(policy, skill_name) or (
+            allowed_before and not _has_generated_global_rule(text, skill_name)
+        ):
+            raise RuntimeError(
+                "skill default off --global only removes allow_global rules created by "
+                "`skill default on --global`; edit the existing hand-authored rule deliberately."
+            )
+        updated = _remove_generated_global_rule(text, skill_name)
+    return _sync_global_allowlist_snapshot(updated)
+
+
+def _skill_scope_policy_path_arg(args: argparse.Namespace) -> Path:
+    raw = str(getattr(args, "policy_path", None) or "").strip()
+    if raw:
+        return Path(os.path.expandvars(os.path.expanduser(raw))).resolve()
+    return VALIDATION._skill_scope_policy_path().resolve()
+
+
+def _handle_global_skill_default(
+    args: argparse.Namespace,
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    if not dry_run and not bool(getattr(args, "yes", False)):
+        raise RuntimeError(
+            "skill default --global writes outside this repo; run with --dry-run first, "
+            "then pass --yes to apply."
+        )
+    skill_name = str(args.skill_name)
+    default_action = str(args.default_action)
+    policy_path = _skill_scope_policy_path_arg(args)
+    if not policy_path.is_file():
+        raise RuntimeError(f"skill-scope policy not found: {policy_path}")
+    before = policy_path.read_text(encoding="utf-8")
+    after = _global_policy_text_for_default(before, skill_name, default_action)
+    validation_results = _validate_global_policy_text_or_raise(after, policy_path)
+    diff_text = _unified_policy_diff(str(policy_path), before, after)
+    would_change = before != after
+    result: dict[str, Any] = {
+        "action": "default",
+        "default_action": default_action,
+        "scope": "global",
+        "skill": skill_name,
+        "cwd": str(Path(args.cwd or os.getcwd()).resolve()),
+        "dry_run": dry_run,
+        "changed": False,
+        "would_change": would_change,
+        "noop": not would_change,
+        "policy_path": str(policy_path),
+        "diff": diff_text,
+        "validation": [_check_result_payload(item) for item in validation_results],
+    }
+    if dry_run:
+        return result
+    if would_change:
+        atomic_write_text(policy_path, after)
+    result["changed"] = would_change
+    return result
+
+
+def _handle_skill_default(
+    args: argparse.Namespace,
+    *,
+    dry_run: bool,
+    model: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if getattr(args, "default_repos", None) or getattr(args, "default_category", None):
+        return _handle_fleet_skill_default(args, model, dry_run=dry_run)
+    scope = str(args.default_scope)
+    if scope == "repo":
+        return _handle_repo_skill_default(args, dry_run=dry_run)
+    if scope == "global":
+        return _handle_global_skill_default(args, dry_run=dry_run)
+    raise RuntimeError("skill default requires exactly one scope: --repo, --global, --repos, or --category")
+
+
+def _print_skill_default_text(payload: dict[str, Any]) -> None:
+    mode = "dry-run" if payload.get("dry_run") else "apply"
+    print(f"skill default {payload.get('default_action')}: {payload.get('skill')} ({mode})")
+    print(f"scope: {payload.get('scope')}")
+    if payload.get("targets") is not None:
+        print(f"targets: {payload.get('target_count', 0)}")
+    else:
+        print(f"path: {payload.get('policy_path')}")
+    print(f"changed: {str(bool(payload.get('changed'))).lower()}")
+    print(f"would_change: {str(bool(payload.get('would_change'))).lower()}")
+    if payload.get("ok") is False:
+        print("ok: false")
+        if payload.get("error"):
+            print(f"error: {payload.get('error')}")
+    review = payload.get("review") or {}
+    if review:
+        status = "present" if review.get("present") else ("recorded" if review.get("recorded") else "missing")
+        print(f"review: {status} {review.get('plan_sha256')}")
+    preflight = payload.get("preflight") or {}
+    if preflight and not preflight.get("ok", True):
+        for item in preflight.get("missing") or []:
+            print(f"missing: {item.get('repo_id')} {item.get('repo_path')}")
+        for item in preflight.get("dirty") or []:
+            paths = ", ".join(item.get("dirty_paths") or [])
+            print(f"dirty: {item.get('repo_id')} {item.get('repo_path')} ({paths})")
+    if payload.get("failed"):
+        failed = payload["failed"]
+        print(f"failed: {failed.get('repo_id')} {failed.get('policy_path')} {failed.get('error')}")
+    residue = payload.get("residue") or []
+    if residue:
+        print("residue:")
+        for item in residue:
+            print(f"  - {item.get('repo_id')} {item.get('policy_path')}")
+    if payload.get("validation"):
+        statuses = ", ".join(
+            f"{item.get('code')}={item.get('status')}" for item in payload.get("validation") or []
+        )
+        print(f"validation: {statuses}")
+    targets = payload.get("targets") or []
+    if targets:
+        for target in targets:
+            marker = "change" if target.get("would_change") else "noop"
+            clean = "clean" if target.get("clean") else "dirty"
+            print(f"path: {target.get('policy_path')} [{marker}, {clean}]")
+            diff_text = str(target.get("diff") or "")
+            if diff_text:
+                print("diff:")
+                print(diff_text, end="" if diff_text.endswith("\n") else "\n")
+        if not any(str(target.get("diff") or "") for target in targets):
+            print("diff: none")
+        return
+    diff_text = str(payload.get("diff") or "")
+    if diff_text:
+        print("diff:")
+        print(diff_text, end="" if diff_text.endswith("\n") else "\n")
+    else:
+        print("diff: none")
+
+
+def _build_skill_togglable_payload(
+    model: dict[str, Any],
+    *,
+    cwd: str | Path | None = None,
+) -> dict[str, Any]:
+    cwd_path = Path(cwd or os.getcwd()).resolve()
+    visibility = collect_skill_visibility(
+        model,
+        cwd=str(cwd_path),
+        include_global=False,
+        include_project=True,
+        include_sources=True,
+    )
+    override = _repo_override_policy(str(cwd_path))
+    pin_on = {str(name) for name in _override_list(override, "pin_on")}
+    pin_off = {str(name) for name in _override_list(override, "pin_off")}
+    effective = {
+        str(item.get("name")): item
+        for item in visibility.get("effective") or []
+        if item.get("name")
+    }
+    missing = {
+        str(item.get("name")): item
+        for item in (visibility.get("issues") or {}).get("missing_for_cwd") or []
+        if item.get("name")
+    }
+    names: set[str] = set()
+    for rule in visibility.get("matched_scope_rules") or []:
+        for skill_name in rule.get("skills") or []:
+            text = str(skill_name).strip()
+            if text:
+                names.add(text)
+    names.update(pin_on)
+    names.update(pin_off)
+    names.update(effective)
+    names.update(missing)
+
+    items: list[dict[str, Any]] = []
+    for skill_name in sorted(names):
+        source: str | None = None
+        if skill_name in effective:
+            winner = effective[skill_name]
+            source = str(winner.get("path") or winner.get("source") or "") or None
+
+        if skill_name in pin_on:
+            state = "pinned_on"
+            pinned_by = "override"
+        elif skill_name in pin_off:
+            state = "pinned_off"
+            pinned_by = "override"
+        elif skill_name in missing:
+            state = "missing_for_cwd"
+            pinned_by = "policy"
+        elif skill_name in effective:
+            state = "on"
+            pinned_by = "policy"
+        else:
+            state = "off"
+            pinned_by = "policy"
+
+        next_action = "on" if state in {"missing_for_cwd", "off", "pinned_off"} else "off"
+        items.append({
+            "skill": skill_name,
+            "state": state,
+            "source": source,
+            "pinned_by": pinned_by,
+            "command_to_flip": f"sbp skill {next_action} {skill_name} --cwd {cwd_path}",
+        })
+
+    return {"cwd": str(cwd_path), "items": items}
+
+
+def _print_skill_togglable_text(payload: dict[str, Any]) -> None:
+    print(f"skill togglable: {payload.get('cwd')}")
+    for item in payload.get("items") or []:
+        print(
+            f"  - {item.get('skill')}: {item.get('state')} "
+            f"({item.get('pinned_by')}) -> {item.get('command_to_flip')}"
+        )
+    if not payload.get("items"):
+        print("  (none)")
+
+
+def _print_skill_what_if_text(payload: dict[str, Any]) -> None:
+    repo = payload.get("repo") or {}
+    summary = payload.get("summary") or {}
+    print(f"skill what-if: {repo.get('path')}")
+    print(
+        "summary: "
+        f"effective={summary.get('effective', 0)} "
+        f"added={summary.get('added', 0)} "
+        f"removed={summary.get('removed', 0)} "
+        f"shadowed={summary.get('shadowed', 0)} "
+        f"pin_conflicts={summary.get('pin_conflicts', 0)}"
+    )
+    for label in ("added", "removed"):
+        rows = payload.get(label) or []
+        if rows:
+            print(f"{label}: " + ", ".join(str(row.get("name")) for row in rows))
+    conflicts = payload.get("pin_conflicts") or []
+    if conflicts:
+        print("pin_conflicts:")
+        for item in conflicts:
+            print(f"  - {item.get('skill')}: {item.get('rule')} {item.get('message')}")
+
+
+def _drop_same_link_actions(plan: dict[str, Any]) -> dict[str, Any]:
+    filtered = [
+        action for action in plan.get("actions") or []
+        if not (
+            action.get("op") == "link"
+            and (action.get("existing") or {}).get("state") == "same_link"
+        )
+    ]
+    if len(filtered) == len(plan.get("actions") or []):
+        return plan
+    updated = dict(plan)
+    updated["actions"] = filtered
+    updated["summary"] = _lifecycle_plan_summary(filtered, skipped=updated.get("skipped") or [])
+    return updated
+
+
+def _simulated_skill_off_plan(
+    model: dict[str, Any],
+    args: argparse.Namespace,
+    cwd_path: Path,
+) -> dict[str, Any]:
+    visibility = collect_skill_visibility(
+        model,
+        cwd=str(cwd_path),
+        include_global=True,
+        include_project=True,
+        include_sources=False,
+    )
+    skill_name = str(args.skill_name)
+    decisions = [
+        item for item in visibility.get("visibility_decisions") or []
+        if str(item.get("name") or "") != skill_name
+    ]
+    decisions.append({
+        "name": skill_name,
+        "availability": "override",
+        "state": "disabled",
+        "override_action": "pin_off",
+        "layer": "repo-override-file",
+        "winning_layer": "repo-override-file",
+    })
+    simulated_visibility = dict(visibility)
+    simulated_visibility["visibility_decisions"] = decisions
+    skipped: list[dict[str, Any]] = []
+    actions = _plan_skill_prune_actions(
+        simulated_visibility,
+        skill_name,
+        from_scope=getattr(args, "from_scope", "project"),
+        skipped=skipped,
+    )
+    deduped = _dedupe_actions(actions)
+    return {
+        "action": "off",
+        "skill": skill_name,
+        "cwd": str(cwd_path),
+        "requested_to": getattr(args, "to", "project"),
+        "resolved_to": "project",
+        "categories": getattr(args, "category", []) or [],
+        "from_scope": getattr(args, "from_scope", "project"),
+        "source_options": [],
+        "selected_source": None,
+        "activation_packet": None,
+        "warnings": [],
+        "actions": deduped,
+        "skipped": skipped,
+        "summary": _lifecycle_plan_summary(deduped, skipped=skipped),
+    }
+
+
+def _skill_packet_sha256(path: Path) -> str | None:
+    try:
+        return hashlib.sha256((path / "SKILL.md").read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _skill_toggle_verification(
+    model: dict[str, Any],
+    skill_name: str,
+    cwd_path: Path,
+    activation_packet: dict[str, Any] | None,
+    *,
+    expected_targets: list[str] | None = None,
+) -> dict[str, Any]:
+    visibility = collect_skill_visibility(
+        model,
+        cwd=str(cwd_path),
+        include_global=True,
+        include_project=True,
+        include_sources=False,
+    )
+    effective_now = [
+        item for item in visibility.get("effective") or []
+        if str(item.get("name") or "") == skill_name
+    ]
+    packet_sha = str((activation_packet or {}).get("skill_md_sha256") or "")
+    linked: list[dict[str, Any]] = []
+    for item in visibility.get("occurrences") or []:
+        if item.get("availability") != "installed":
+            continue
+        if str(item.get("name") or "") != skill_name:
+            continue
+        path = Path(str(item.get("path") or ""))
+        resolved = path.resolve() if path.exists() else None
+        linked.append({
+            "path": str(path),
+            "is_symlink": path.is_symlink(),
+            "resolved": str(resolved) if resolved else None,
+            "skill_md_sha256": _skill_packet_sha256(resolved) if resolved else None,
+        })
+    sha_matches = bool(packet_sha) and any(
+        row.get("skill_md_sha256") == packet_sha for row in linked
+    )
+    expected_link_rows: list[dict[str, Any]] = []
+    packet_source = str((activation_packet or {}).get("source") or "")
+    packet_source_real = os.path.realpath(packet_source) if packet_source else ""
+    for target in expected_targets or []:
+        path = Path(target)
+        exists = os.path.lexists(path)
+        resolved = os.path.realpath(path) if exists else None
+        target_sha = _skill_packet_sha256(Path(resolved)) if resolved else None
+        ok = (
+            bool(exists)
+            and path.is_symlink()
+            and bool(packet_source_real)
+            and resolved == packet_source_real
+            and target_sha == packet_sha
+        )
+        expected_link_rows.append({
+            "path": str(path),
+            "exists": exists,
+            "is_symlink": path.is_symlink(),
+            "resolved": resolved,
+            "skill_md_sha256": target_sha,
+            "ok": ok,
+        })
+    expected_links_ok = all(row.get("ok") for row in expected_link_rows) if expected_targets is not None else True
+    return {
+        "verified": bool(effective_now) and sha_matches and expected_links_ok,
+        "effective_now": effective_now,
+        "symlink_resolved": linked,
+        "expected_targets": expected_link_rows,
+        "skill_md_sha256": packet_sha or None,
+    }
+
+
+def _activation_packet_targets(activation_packet: dict[str, Any] | None) -> list[str]:
+    targets: list[str] = []
+    for values in ((activation_packet or {}).get("surface_targets") or {}).values():
+        targets.extend(str(value) for value in values or [] if value)
+    return sorted(dict.fromkeys(targets))
+
+
+def _skill_name_suggestions(model: dict[str, Any], skill_name: str) -> list[str]:
+    names: set[str] = set()
+    try:
+        declared_occurrences, _layers = _declared_skill_occurrences(model)
+        for root in _skill_source_roots(model, declared_occurrences):
+            for candidate in _skill_source_candidates(root):
+                name = str(candidate.get("name") or "")
+                if name:
+                    names.add(name)
+    except Exception:
+        names = set()
+    return difflib.get_close_matches(skill_name, sorted(names), n=5, cutoff=0.45)
+
+
+def _selected_source_from_visible_skill(
+    visibility: dict[str, Any],
+    skill_name: str,
+) -> dict[str, Any] | None:
+    rows = [
+        *(visibility.get("effective") or []),
+        *(visibility.get("occurrences") or []),
+    ]
+    for row in rows:
+        if str(row.get("name") or "") != skill_name:
+            continue
+        if str(row.get("state") or "") in {"disabled", "broken"}:
+            continue
+        raw_source = str(row.get("source") or "")
+        raw_path = str(row.get("path") or "")
+        candidates = [raw_source, raw_path]
+        for candidate in candidates:
+            if not candidate:
+                continue
+            path = Path(candidate).expanduser()
+            try:
+                resolved = path.resolve()
+            except OSError:
+                resolved = path.absolute()
+            if (resolved / "SKILL.md").is_file():
+                return {
+                    "name": skill_name,
+                    "source": str(resolved),
+                    "source_bucket": row.get("source_bucket") or _source_bucket(str(resolved)),
+                    "root": str(resolved.parent),
+                    "explicit": False,
+                }
+    return None
+
+
+def _raise_heal_unknown(
+    model: dict[str, Any],
+    skill_name: str,
+    cwd_path: Path,
+    *,
+    payload: dict[str, Any] | None = None,
+    message: str | None = None,
+    extra_suggestions: list[str] | None = None,
+) -> None:
+    suggestions: list[str] = []
+    for suggestion in extra_suggestions or []:
+        if suggestion and suggestion != skill_name and suggestion not in suggestions:
+            suggestions.append(suggestion)
+    for suggestion in _skill_name_suggestions(model, skill_name):
+        if suggestion and suggestion not in suggestions:
+            suggestions.append(suggestion)
+    suffix = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+    raise ValidationError(
+        OVERRIDE_SKILL_UNKNOWN,
+        (message or f"Cannot heal skill {skill_name!r}: no source directory found.") + suffix,
+        context={
+            "skill": skill_name,
+            "cwd": str(cwd_path),
+            "suggestions": suggestions,
+            "source_options": (payload or {}).get("source_options") or [],
+        },
+        next_actions=[
+            f"sbp candidates --cwd {cwd_path} --json",
+            f"sbp skill why {skill_name} --cwd {cwd_path} --json",
+        ],
+    )
+
+
+def _validate_heal_source_identity_or_raise(
+    model: dict[str, Any],
+    skill_name: str,
+    cwd_path: Path,
+    selected_source: dict[str, Any],
+    payload: dict[str, Any],
+) -> None:
+    if not bool(selected_source.get("explicit")):
+        return
+    source_path = Path(str(selected_source.get("source") or "")).resolve()
+    source_name = source_path.name
+    if source_name == skill_name:
+        return
+    _raise_heal_unknown(
+        model,
+        skill_name,
+        cwd_path,
+        payload=payload,
+        message=(
+            f"Cannot heal skill {skill_name!r}: explicit source {source_path} "
+            f"appears to be skill {source_name!r}."
+        ),
+        extra_suggestions=[source_name],
+    )
+
+
+def _resolve_heal_source_or_raise(
+    model: dict[str, Any],
+    skill_name: str,
+    cwd_path: Path,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    selected_source = payload.get("selected_source")
+    if selected_source:
+        _validate_heal_source_identity_or_raise(model, skill_name, cwd_path, selected_source, payload)
+        return selected_source
+
+    visibility = collect_skill_visibility(
+        model,
+        cwd=str(cwd_path),
+        include_global=True,
+        include_project=True,
+        include_sources=False,
+    )
+    selected_source = _selected_source_from_visible_skill(visibility, skill_name)
+    if selected_source:
+        return selected_source
+
+    _raise_heal_unknown(model, skill_name, cwd_path, payload=payload)
+    raise AssertionError("unreachable")
+
+
+def _heal_lifecycle_plan_or_raise(
+    args: argparse.Namespace,
+    model: dict[str, Any],
+    skill_name: str,
+    cwd_path: Path,
+    requested_to: str,
+) -> dict[str, Any]:
+    try:
+        return skill_lifecycle_plan(
+            model,
+            "activate",
+            skill_name=skill_name,
+            cwd=str(cwd_path),
+            to=requested_to,
+            categories=getattr(args, "category", []) or [],
+            source=getattr(args, "source", None),
+            force=True,
+        )
+    except RuntimeError as exc:
+        if getattr(args, "source", None):
+            _raise_heal_unknown(
+                model,
+                skill_name,
+                cwd_path,
+                message=f"Cannot heal skill {skill_name!r}: explicit source could not be resolved: {exc}",
+            )
+        raise
+
+
+def _validate_skill_toggle_security(
+    model: dict[str, Any],
+    *,
+    skill_name: str,
+    skill_action: str,
+    requested_to: str,
+    cwd_path: Path,
+) -> None:
+    if skill_action == "off" and skill_name in set(DISPATCHER_CORE):
+        raise ValidationError(
+            OVERRIDE_REFUSED_FLOOR,
+            f"Refusing to pin off dispatcher floor skill {skill_name!r}.",
+            context={
+                "skill": skill_name,
+                "action": skill_action,
+                "floor": list(DISPATCHER_CORE),
+                "policy": "repo overrides cannot disable dispatcher floor skills",
+            },
+            next_actions=[
+                f"sbp skill on {skill_name} --cwd {cwd_path}",
+                f"sbp skill lint --cwd {cwd_path}",
+            ],
+        )
+    global_refusal = (
+        _global_override_refusal_context(model, skill_name)
+        if skill_action == "on" and requested_to == "global"
+        else None
+    )
+    if global_refusal is not None:
+        context = dict(global_refusal)
+        context.update({
+            "action": skill_action,
+            "requested_to": requested_to,
+            "policy": "repo overrides may widen visibility only inside the current repo",
+        })
+        raise ValidationError(
+            OVERRIDE_REFUSED_GLOBAL_ESCALATION,
+            f"Refusing global pin for skill {skill_name!r}: allow_global is false.",
+            context=context,
+            next_actions=[
+                f"sbp skill on {skill_name} --cwd {cwd_path}",
+                "Edit the operator skill-scope allow_global rule if this truly belongs in the global layer.",
+            ],
+        )
+
+
+def _handle_skill_toggle(
+    args: argparse.Namespace,
+    model: dict[str, Any],
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    skill_action = str(args.skill_action)
+    skill_name = str(args.skill_name)
+    cwd_path = Path(args.cwd or os.getcwd()).resolve()
+    requested_to = str(getattr(args, "to", "project") or "project")
+    from_scope = str(getattr(args, "from_scope", "project") or "project")
+    _validate_skill_toggle_security(
+        model,
+        skill_name=skill_name,
+        skill_action=skill_action,
+        requested_to=requested_to,
+        cwd_path=cwd_path,
+    )
+    if requested_to != "project":
+        raise RuntimeError("skill on/off currently supports repo-local project scope only; use --to project.")
+    if skill_action == "off" and from_scope != "project":
+        raise RuntimeError("skill off currently unlinks project installs only; use --from project.")
+
+    override: dict[str, Any] | None = None
+    if skill_action == "on":
+        payload = skill_lifecycle_plan(
+            model,
+            "activate",
+            skill_name=skill_name,
+            cwd=str(cwd_path),
+            to=requested_to,
+            categories=getattr(args, "category", []) or [],
+            source=getattr(args, "source", None),
+            force=True,
+        )
+        payload = _drop_same_link_actions(payload)
+    else:
+        if dry_run:
+            payload = _simulated_skill_off_plan(model, args, cwd_path)
+        else:
+            override = _apply_skill_pin(args.cwd, skill_name, skill_action, dry_run=False)
+            payload = skill_lifecycle_plan(
+                model,
+                "prune",
+                skill_name=skill_name,
+                cwd=str(cwd_path),
+                to=requested_to,
+                from_scope=from_scope,
+            )
+            payload["action"] = "off"
+
+    if override is None:
+        override = _apply_skill_pin(args.cwd, skill_name, skill_action, dry_run=dry_run)
+    payload["action"] = skill_action
+    payload["override"] = override
+    payload["changed"] = bool(override.get("changed"))
+    payload["noop"] = not bool(override.get("would_change")) and not bool(payload.get("actions"))
+    payload = apply_skill_lifecycle_plan(
+        payload,
+        dry_run=dry_run,
+        allow_directories=bool(getattr(args, "allow_directories", False)),
+        force=bool(getattr(args, "force", False)),
+    )
+    if skill_action == "on" and bool(getattr(args, "verify", False)) and not dry_run:
+        payload["verification"] = _skill_toggle_verification(
+            model,
+            skill_name,
+            cwd_path,
+            payload.get("activation_packet"),
+        )
+    else:
+        payload["verification"] = None
+    return payload
+
+
+def _handle_skill_heal(
+    args: argparse.Namespace,
+    model: dict[str, Any],
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    skill_name = str(args.skill_name)
+    cwd_path = Path(args.cwd or os.getcwd()).resolve()
+    requested_to = str(getattr(args, "to", "project") or "project")
+    if requested_to != "project":
+        raise RuntimeError("skill heal currently supports repo-local project scope only; use --to project.")
+    _validate_skill_toggle_security(
+        model,
+        skill_name=skill_name,
+        skill_action="on",
+        requested_to=requested_to,
+        cwd_path=cwd_path,
+    )
+    payload = _heal_lifecycle_plan_or_raise(args, model, skill_name, cwd_path, requested_to)
+    selected_source = _resolve_heal_source_or_raise(model, skill_name, cwd_path, payload)
+    payload["selected_source"] = selected_source
+    if not payload.get("activation_packet"):
+        activation_packet, packet_warning = _activation_packet(
+            skill_name,
+            selected_source,
+            payload.get("actions") or [],
+        )
+        payload["activation_packet"] = activation_packet
+        if packet_warning:
+            payload.setdefault("warnings", []).append(packet_warning)
+    payload = _drop_same_link_actions(payload)
+    override = _apply_skill_heal_pin(args.cwd, skill_name, dry_run=dry_run)
+    payload["action"] = "heal"
+    payload["override"] = override
+    payload["changed"] = bool(override.get("changed"))
+    payload["noop"] = not bool(override.get("would_change")) and not bool(payload.get("actions"))
+    payload = apply_skill_lifecycle_plan(
+        payload,
+        dry_run=dry_run,
+        allow_directories=bool(getattr(args, "allow_directories", False)),
+        force=bool(getattr(args, "force", False)),
+    )
+    if bool(getattr(args, "verify", False)) and not dry_run:
+        payload["verification"] = _skill_toggle_verification(
+            model,
+            skill_name,
+            cwd_path,
+            payload.get("activation_packet"),
+            expected_targets=_activation_packet_targets(payload.get("activation_packet")),
+        )
+    else:
+        payload["verification"] = None
+    return payload
+
+
 def _handle_skill(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
     skill_action = str(args.skill_action)
+    if skill_action == "lint":
+        payload = repo_skill_override_lint_payload(model, cwd=args.cwd)
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            _print_skill_override_lint_text(payload)
+        return EXIT_ERROR if any(
+            item.get("severity") == "error"
+            for item in payload.get("findings") or []
+        ) else EXIT_OK
+
+    if skill_action == "why":
+        payload = explain_skill_visibility(
+            model,
+            args.skill_name,
+            cwd=args.cwd,
+            include_global=not getattr(args, "no_global", False),
+            include_project=not getattr(args, "no_project", False),
+        )
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            _print_explain_skill_text(payload)
+        # Absence is a successful diagnosis for this read-only command.
+        return EXIT_OK
+
+    if skill_action in {"togglable", "toggleable"}:
+        payload = _build_skill_togglable_payload(model, cwd=args.cwd)
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            _print_skill_togglable_text(payload)
+        return EXIT_OK
+
+    if skill_action == "what-if":
+        payload = build_skill_what_if_payload(
+            model,
+            repo=args.repo,
+            overlays=getattr(args, "overlay", []) or [],
+            pins=getattr(args, "pin", []) or [],
+            opt_outs=getattr(args, "opt_out", []) or [],
+            machine=getattr(args, "machine", None),
+        )
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            _print_skill_what_if_text(payload)
+        return EXIT_OK
+
     dry_run = bool(args.dry_run or skill_action == "plan")
+    if skill_action in {"on", "off"}:
+        payload = _handle_skill_toggle(args, model, dry_run=dry_run)
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            print_skill_lifecycle_text(payload)
+        return EXIT_OK
+    if skill_action == "default":
+        payload = _handle_skill_default(args, dry_run=dry_run, model=model)
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            _print_skill_default_text(payload)
+        return EXIT_ERROR if payload.get("ok") is False else EXIT_OK
+    if skill_action == "heal":
+        payload = _handle_skill_heal(args, model, dry_run=dry_run)
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            print_skill_lifecycle_text(payload)
+        return EXIT_OK
+
     if (
         not dry_run
         and not bool(getattr(args, "yes", False))
@@ -4176,6 +6308,7 @@ def _handle_skill(args: argparse.Namespace, root_dir: Path, model: dict[str, Any
         problematic = [
             item for item in payload.get("actions") or []
             if str(item.get("status") or "").startswith(("blocked", "conflict", "skipped"))
+            and str(item.get("code") or "") != PRUNE_SKIPPED_PINNED
         ]
         if problematic:
             return EXIT_DRIFT
@@ -4518,6 +6651,8 @@ def _emit_up_payload(
     if args.format == "json":
         emit_json(payload)
     elif exit_code != EXIT_OK and "error" in payload:
+        print_service_actions_text(payload)
+        print()
         print_local_runtime_error_text(payload)
     else:
         print_service_actions_text(payload)
@@ -4633,6 +6768,138 @@ def _emit_missing_bridge_if_needed(args: argparse.Namespace, model: dict[str, An
     return None
 
 
+def _repeat_cli_args(flag: str, values: list[str] | None) -> list[str]:
+    parts: list[str] = []
+    for value in values or []:
+        text = str(value).strip()
+        if text:
+            parts.extend([flag, text])
+    return parts
+
+
+def _shell_command(parts: list[str]) -> str:
+    return " ".join(shlex.quote(str(part)) for part in parts)
+
+
+def _up_retry_service_ids(
+    requested_services: list[dict[str, Any]],
+    failed: dict[str, Any] | None,
+) -> list[str]:
+    requested_ids = [
+        str(service.get("id") or "").strip()
+        for service in requested_services
+        if str(service.get("id") or "").strip()
+    ]
+    if requested_ids:
+        return requested_ids
+    failed_id = str((failed or {}).get("id") or "").strip()
+    return [failed_id] if failed_id else []
+
+
+def _up_retry_command(
+    args: argparse.Namespace,
+    requested_services: list[dict[str, Any]],
+    resolved_mode: str,
+    failed: dict[str, Any] | None,
+) -> str:
+    parts = ["up"]
+    parts.extend(_repeat_cli_args("--client", getattr(args, "client", []) or []))
+    parts.extend(_repeat_cli_args("--profile", getattr(args, "profile", []) or []))
+    for service_id in _up_retry_service_ids(requested_services, failed):
+        parts.extend(["--service", service_id])
+    if resolved_mode:
+        parts.extend(["--mode", resolved_mode])
+    parts.extend(["--format", "json"])
+    return _shell_command(parts)
+
+
+def _rollback_command(args: argparse.Namespace, started_ids: list[str]) -> str:
+    parts = ["down"]
+    parts.extend(_repeat_cli_args("--client", getattr(args, "client", []) or []))
+    parts.extend(_repeat_cli_args("--profile", getattr(args, "profile", []) or []))
+    for service_id in started_ids:
+        parts.extend(["--service", service_id])
+    parts.extend(["--format", "json"])
+    return _shell_command(parts)
+
+
+def _rollback_started_services(
+    model: dict[str, Any],
+    service_results: list[dict[str, Any]],
+    *,
+    dry_run: bool,
+    wait_seconds: float,
+) -> list[dict[str, Any]]:
+    started_ids = {
+        str(entry.get("id") or "").strip()
+        for entry in service_results
+        if entry.get("result") == "started" and str(entry.get("id") or "").strip()
+    }
+    if not started_ids:
+        return []
+    services_by_id = service_id_map(model)
+    ordered_ids = list(reversed(order_service_ids(model, started_ids)))
+    rollback_services = [
+        services_by_id[service_id]
+        for service_id in ordered_ids
+        if service_id in services_by_id
+    ]
+    rollback_results = stop_services(
+        model,
+        rollback_services,
+        dry_run=dry_run,
+        wait_seconds=wait_seconds,
+    )
+    rolled_back_ids = {
+        str(entry.get("id") or "").strip()
+        for entry in rollback_results
+        if entry.get("result") in {"stopped", "killed", "dry-run", "not-running"}
+    }
+    for entry in service_results:
+        if str(entry.get("id") or "").strip() in rolled_back_ids:
+            entry["rolled_back"] = True
+    return rollback_results
+
+
+def _attach_partial_start_payload(
+    payload: dict[str, Any],
+    args: argparse.Namespace,
+    model: dict[str, Any],
+    requested_services: list[dict[str, Any]],
+    resolved_mode: str,
+) -> None:
+    service_results = payload.get("services") or []
+    summary = summarize_service_start_results(service_results)
+    payload.update(summary)
+    payload["strict"] = bool(getattr(args, "strict", False))
+    failed = payload.get("failed") if isinstance(payload.get("failed"), dict) else None
+    started_ids = [
+        str(entry.get("id") or "").strip()
+        for entry in payload.get("started") or []
+        if str(entry.get("id") or "").strip()
+    ]
+    if not failed:
+        return
+
+    resume_command = _up_retry_command(args, requested_services, resolved_mode, failed)
+    rollback_command = _rollback_command(args, started_ids) if started_ids else ""
+    next_actions = [resume_command]
+    if rollback_command:
+        next_actions.append(rollback_command)
+    payload["resume_command"] = resume_command
+    if rollback_command:
+        payload["rollback_command"] = rollback_command
+    payload["next_actions"] = next_actions
+
+    if payload["strict"] and not getattr(args, "dry_run", False):
+        payload["rollback_services"] = _rollback_started_services(
+            model,
+            service_results,
+            dry_run=False,
+            wait_seconds=max(0.0, float(args.wait_seconds)),
+        )
+
+
 def _legacy_up_payload(
     args: argparse.Namespace,
     model: dict[str, Any],
@@ -4654,7 +6921,7 @@ def _legacy_up_payload(
         wait_seconds=max(0.0, float(args.wait_seconds)),
         mode=resolved_mode,
     )
-    return {
+    payload = {
         "dry_run": args.dry_run,
         "requested_mode": resolved_mode,
         "effective_mode": resolved_mode,
@@ -4663,6 +6930,8 @@ def _legacy_up_payload(
         "services": service_results,
         "next_actions": next_actions_for_up(service_results),
     }
+    _attach_partial_start_payload(payload, args, model, requested_services, resolved_mode)
+    return payload
 
 
 def _start_failure_ids(service_results: list[dict[str, Any]]) -> list[str]:
@@ -4676,15 +6945,30 @@ def _start_failure_ids(service_results: list[dict[str, Any]]) -> list[str]:
 
 
 def _apply_start_failure_error(payload: dict[str, Any], service_results: list[dict[str, Any]]) -> int:
-    failed_ids = _start_failure_ids(service_results)
+    failed_block = payload.get("failed") if isinstance(payload.get("failed"), dict) else None
+    if failed_block is not None:
+        failed_ids = [
+            str(value)
+            for value in [failed_block.get("id"), *(payload.get("skipped_dependents") or [])]
+            if str(value or "").strip()
+        ]
+    else:
+        failed_ids = _start_failure_ids(service_results)
     if not failed_ids:
         return EXIT_OK
+    specific_error = first_service_error_payload(service_results)
+    if specific_error is not None:
+        payload.update(specific_error)
+        if payload.get("resume_command") and isinstance(payload.get("error"), dict):
+            payload["error"].setdefault("next_action", payload["resume_command"])
+        return EXIT_ERROR
+    next_action = str(payload.get("resume_command") or "manage.py status --format json")
     payload.update(local_runtime_error(
         LOCAL_RUNTIME_START_BLOCKED,
         f"Some services did not become healthy: {', '.join(failed_ids)}",
         recoverable=True,
         blocked_services=failed_ids,
-        next_action="manage.py status --format json",
+        next_action=next_action,
     ))
     return EXIT_ERROR
 
@@ -4801,32 +7085,108 @@ def _handle_logs(args: argparse.Namespace, root_dir: Path, model: dict[str, Any]
     return EXIT_OK
 
 
-_MODEL_DISPATCH: dict[str, Callable[[argparse.Namespace, Path, dict[str, Any], str], int]] = {
-    "render": _handle_render,
-    "sync": _handle_sync,
-    "context": _handle_context,
-    "doctor": _handle_doctor,
-    "status": _handle_status,
-    "skills": _handle_skills,
-    "skill-audit": _handle_skill_audit,
-    "mcp-audit": _handle_mcp_audit,
-    "mcp": _handle_mcp,
-    "fleet": _handle_fleet,
-    "evidence": _handle_evidence,
-    "next": _handle_next,
-    "graph": _handle_graph,
-    "explain": _handle_explain,
-    "search": _handle_search,
-    "snap": _handle_snap,
-    "parity-report": _handle_parity_report,
-    "skill": _handle_skill,
-    "overlay": _handle_overlay,
-    "operator-booking": _handle_operator_booking,
-    "bootstrap": _handle_bootstrap,
-    "up": _handle_up,
-    "down": _handle_down,
-    "restart": _handle_restart,
-    "logs": _handle_logs,
+def _handle_state_backup(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    action = str(getattr(args, "state_backup_action", None) or "list")
+    backup_root = getattr(args, "backup_root", None)
+    if action == "create":
+        payload = create_state_backup(
+            state_root=getattr(args, "state_root", None),
+            backup_root=backup_root,
+            model=model,
+        )
+    elif action == "verify":
+        target = getattr(args, "target", None)
+        if not target:
+            listed = list_state_backups(backup_root=backup_root)
+            backups = listed.get("backups") or []
+            target = str((backups[0] or {}).get("manifest") or "") if backups else ""
+        if target:
+            payload = verify_state_backup(target)
+        else:
+            payload = {
+                "ok": False,
+                "action": "verify",
+                "error": {
+                    "type": "state_backup_not_found",
+                    "message": "No backups found to verify.",
+                    "recoverable": True,
+                },
+                "next_actions": ["state-backup create --format json"],
+                "checks": [],
+            }
+    elif action == "drill":
+        payload = drill_state_backup(
+            getattr(args, "target", None),
+            state_root=getattr(args, "state_root", None),
+            backup_root=backup_root,
+            model=model,
+        )
+    elif action == "restore":
+        payload = restore_state_backup(
+            getattr(args, "target", None),
+            state_root=getattr(args, "state_root", None),
+            backup_root=backup_root,
+            model=model,
+            i_understand_data_loss=bool(getattr(args, "i_understand_data_loss", False)),
+        )
+    else:
+        payload = list_state_backups(backup_root=backup_root)
+
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print("\n".join(state_backup_text_lines(payload)))
+    return EXIT_OK if payload.get("ok") else EXIT_ERROR
+
+
+_MODEL_COMMANDS: tuple[tuple[str, ModelCommandHandler, str], ...] = (
+    ("render", _handle_render, "Print the resolved runtime graph."),
+    ("ports", _handle_ports, "List or resolve the active port registry."),
+    ("sync", _handle_sync, "Create managed runtime directories, repos, artifacts, and skill state."),
+    ("context", _handle_context, "Render managed agent context files."),
+    ("doctor", _handle_doctor, "Validate runtime graph, filesystem readiness, and skill integrity."),
+    ("status", _handle_status, "Summarize repo, artifact, skill, service, log, and check state."),
+    ("state-backup", _handle_state_backup, "Create, list, verify, drill, or restore state-root backups."),
+    ("skills", _handle_skills, "Show effective skill availability."),
+    ("skill-audit", _handle_skill_audit, "Audit skill scope policy across repos."),
+    ("mcp-audit", _handle_mcp_audit, "Audit Claude and Codex MCP config parity."),
+    ("mcp", _handle_mcp, "Render single-source MCP config."),
+    ("fleet", _handle_fleet, "Plan fleet-wide skill and MCP convergence."),
+    ("evidence", _handle_evidence, "Emit a read-only runtime evidence packet."),
+    ("next", _handle_next, "Rank explainable next actions from evidence."),
+    ("graph", _handle_graph, "Inspect the agent operations graph."),
+    ("explain", _handle_explain, "Explain graph nodes, Beads, tools, and commands."),
+    ("search", _handle_search, "Search commands, graph nodes, docs, Beads, and evidence."),
+    ("snap", _handle_snap, "Create, diff, or replay redacted runtime snapshots."),
+    ("parity-report", _handle_parity_report, "Report dev/prod parity for a client."),
+    ("skill", _handle_skill, "Manage skill visibility and lifecycle overrides."),
+    ("overlay", _handle_overlay, "Inspect or migrate client overlays."),
+    ("operator-booking", _handle_operator_booking, "Inspect or create operator booking holds."),
+    ("bootstrap", _handle_bootstrap, "Run declared runtime bootstrap tasks."),
+    ("up", _handle_up, "Start declared runtime services."),
+    ("down", _handle_down, "Stop declared runtime services."),
+    ("restart", _handle_restart, "Restart declared runtime services."),
+    ("logs", _handle_logs, "Show declared runtime service logs."),
+)
+
+
+def _register_builtin_commands() -> None:
+    for name, handler, help_text in _EARLY_COMMANDS:
+        register_command(name, handler, help_text, loads_model=False)
+    for name, handler, help_text in _MODEL_COMMANDS:
+        register_command(name, handler, help_text, loads_model=True)
+
+
+_register_builtin_commands()
+_EARLY_DISPATCH: dict[str, EarlyCommandHandler] = {
+    name: spec.handler
+    for name, spec in _COMMAND_REGISTRY.items()
+    if not spec.loads_model
+}
+_MODEL_DISPATCH: dict[str, ModelCommandHandler] = {
+    name: spec.handler
+    for name, spec in _COMMAND_REGISTRY.items()
+    if spec.loads_model
 }
 
 
@@ -4838,18 +7198,82 @@ def _emit_mode_error(args: argparse.Namespace, mode_error: dict[str, Any]) -> in
     return EXIT_ERROR
 
 
+def _typed_error_payload(exc: SkillboxError, command: str) -> dict[str, Any]:
+    """Render a SkillboxError into the back-compat envelope.
+
+    Runs the message-pattern classifier (preserving recovery_hint/next_actions
+    for known messages), then makes the typed code authoritative and layers in
+    the structured context + the error's own next_actions. Code stays unchanged:
+    the typed code is the same value classify_error derives for this message.
+    """
+    payload = classify_error(exc, command)
+    error_obj = payload.setdefault("error", {})
+    error_obj["code"] = exc.code
+    error_obj["type"] = exc.code
+    payload["error_code"] = exc.code
+    if exc.context:
+        error_obj["context"] = dict(exc.context)
+    if exc.next_actions:
+        error_obj["next_actions"] = list(exc.next_actions)
+        payload["next_actions"] = list(exc.next_actions)
+    return payload
+
+
 def _emit_main_exception(args: argparse.Namespace, exc: Exception) -> int:
+    is_json = getattr(args, "format", "text") == "json"
+    verbose = bool(getattr(args, "verbose", False))
+
+    # Runtime-id grammar violations are raised by the leaf runtime_model layer
+    # as a plain RuntimeIdValidationError (it must not import the typed-error
+    # hierarchy — runtime_manager imports runtime_model, not the reverse). Here,
+    # at the runtime_manager boundary, we PROMOTE it to a typed ValidationError
+    # so the surfaced envelope carries code RUNTIME_ID_INVALID + the structured
+    # provenance (id/kind/source_file) + the rename playbook.
+    if isinstance(exc, RuntimeIdValidationError):
+        exc = ValidationError(
+            exc.code,
+            str(exc),
+            context=exc.context,
+            next_actions=exc.next_actions,
+            recoverable=True,
+        )
+
+    # Typed errors carry their stable code + structured context. We still run
+    # the message-pattern table (classify_error) so the recovery_hint and
+    # next_actions affordances are preserved, then let the typed code/context be
+    # authoritative. The typed code MUST equal what classify_error would derive
+    # for the same message (codes are unchanged), so this only enriches.
+    if isinstance(exc, SkillboxError):
+        if is_json:
+            emit_json(_typed_error_payload(exc, args.command))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    # Legacy RuntimeError raisers still classify through the message table; the
+    # enriched ``structured_error`` carrier gives them the new envelope keys.
     if isinstance(exc, RuntimeError):
-        payload_error = exc
-    else:
-        payload_error = RuntimeError(f"Unexpected error: {exc}")
-    if args.format == "json":
-        emit_json(classify_error(payload_error, args.command))
-    elif isinstance(exc, RuntimeError):
-        print(str(exc), file=sys.stderr)
-    else:
-        import traceback
+        if is_json:
+            emit_json(classify_error(exc, args.command))
+        else:
+            print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    # Truly unexpected exception: generic INTERNAL envelope. Never leak the
+    # traceback by default — only when --verbose is set.
+    if is_json:
+        context = {"traceback": traceback.format_exc()} if verbose else None
+        emit_json(
+            internal_error_payload(
+                f"Unexpected error: {exc}",
+                context=context,
+                next_actions=["doctor --format json"],
+            )
+        )
+    elif verbose:
         traceback.print_exc()
+    else:
+        print(f"Unexpected error: {exc}", file=sys.stderr)
     return EXIT_ERROR
 
 
@@ -5170,6 +7594,7 @@ def _active_clients_for_args(args: argparse.Namespace, model: dict[str, Any]) ->
         "search",
         "snap",
         "parity-report",
+        "ports",
         "bootstrap",
         "up",
         "down",
@@ -5213,6 +7638,31 @@ def _dispatch_model_command(
         return _emit_main_exception(args, exc)
 
 
+def _suggest_command(command: str) -> str:
+    matches = difflib.get_close_matches(command, sorted(MANAGE_COMMAND_NAMES), n=1, cutoff=0.68)
+    return matches[0] if matches else ""
+
+
+def _emit_unknown_registered_command(command: str) -> int:
+    suggestion = _suggest_command(command)
+    print(f"Unknown command: {command}", file=sys.stderr)
+    if suggestion:
+        print(f"Did you mean: `manage.py {suggestion}`?", file=sys.stderr)
+    print("Agent hint: run `manage.py capabilities --json` for the machine-readable command contract.", file=sys.stderr)
+    return EXIT_ERROR
+
+
+def _dispatch_registered_command(args: argparse.Namespace, root_dir: Path, resolved_mode: str) -> int:
+    spec = _COMMAND_REGISTRY.get(str(args.command))
+    if spec is None:
+        return _emit_unknown_registered_command(str(args.command))
+    if spec.loads_model:
+        handler = _MODEL_DISPATCH.get(spec.name, spec.handler)
+        return _dispatch_model_command(args, root_dir, resolved_mode, handler)
+    handler = _EARLY_DISPATCH.get(spec.name, spec.handler)
+    return handler(args, root_dir)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     normalized_argv, diagnostics = _normalize_agent_argv(argv)
@@ -5229,12 +7679,4 @@ def main(argv: list[str] | None = None) -> int:
     if mode_error is not None:
         return _emit_mode_error(args, mode_error)
 
-    early_handler = _EARLY_DISPATCH.get(args.command)
-    if early_handler is not None:
-        return early_handler(args, root_dir)
-
-    model_handler = _MODEL_DISPATCH.get(args.command)
-    if model_handler is None:
-        print(f"Unknown command: {args.command}", file=sys.stderr)
-        return EXIT_ERROR
-    return _dispatch_model_command(args, root_dir, resolved_mode, model_handler)
+    return _dispatch_registered_command(args, root_dir, resolved_mode)

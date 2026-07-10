@@ -9,10 +9,7 @@ all text renderers. Depends on ._skill_common, .policy_eval, and .inventory.
 from __future__ import annotations
 
 import fnmatch
-import glob
-import hashlib
 import os
-import shutil
 from pathlib import Path
 from typing import Any, Callable
 
@@ -30,15 +27,6 @@ try:
 except ModuleNotFoundError:
     yaml = None
 
-from .shared import (
-    GLOBAL_HOME_ROOT_ENV,
-    GLOBAL_HOME_SURFACES,
-    atomic_write_text,
-    directory_tree_sha256,
-    load_json_file,
-    load_yaml,
-    load_skill_repos_config,
-)
 
 from ._skill_common import *
 from .policy_eval import *
@@ -67,6 +55,7 @@ __all__ = [
     'broken_link_class_counts',
     'attach_skill_evidence',
     'collect_skill_visibility',
+    'build_skill_what_if_payload',
     'SKILL_AUDIT_REPO_ISSUE_KEYS',
     'SKILL_AUDIT_GLOBAL_ISSUE_KEYS',
     '_skill_audit_candidate_from_path',
@@ -169,8 +158,8 @@ def _skill_visibility_recommendations(issues: dict[str, list[dict[str, Any]]]) -
             "allowed_paths": item.get("allowed_paths") or [],
             **_recommendation_provenance(item, "missing_for_cwd"),
             "hint": (
-                "Add this skill to the active client's skill-repos.yaml, or activate it "
-                "for this cwd ephemerally with `sbp skill activate <skill> --cwd <repo>`. "
+                "Add this skill to the active client's skill-repos.yaml, or durably pin it "
+                "for this repo with `sbp skill on <skill> --cwd $PWD`. "
                 "Use `sbp overlay activate <name> --cwd <repo>` for a one-session/cwd "
                 "policy-evaluated flip, or `sbp overlay on <name>` to PERSIST the overlay "
                 "across sessions until `overlay off`."
@@ -305,7 +294,7 @@ def _issue_row_fix_command(issue_type: str, row: dict[str, Any]) -> str:
         # ``broken_link_class_counts`` / ``_classified_broken_rows``).
         return f"rm {shlex.quote(path)}  # prune dead link {name!r}" if path else ""
     if issue_type == "missing_for_cwd":
-        return f"sbp skill activate {name} --cwd <repo>"
+        return f"sbp skill on {name} --cwd $PWD"
     if issue_type == "scope_violations":
         return f"sbp skill remove {name} --from project --cwd {path or '<repo>'} --yes"
     if issue_type == "global_not_allowed":
@@ -314,7 +303,7 @@ def _issue_row_fix_command(issue_type: str, row: dict[str, Any]) -> str:
         return f"sbp skill remove {name} --from global --yes"
     if issue_type == "archive_sources":
         return (
-            f"copy {name!r} into skills-private, then repoint its source root "
+            f"copy {name!r} into private-skills, then repoint its source root "
             f"(stale archive copy at {row.get('source') or path})"
         )
     if issue_type == "shadowed":
@@ -379,7 +368,8 @@ def _enrich_issue_rows(
                 new_row["origin"] = row.get("origin") or "dangling"
             else:
                 new_row.setdefault("origin", None)
-            new_row["fix_command"] = row.get("fix_command") or _issue_row_fix_command(
+            existing_fix_command = None if issue_type == "missing_for_cwd" else row.get("fix_command")
+            new_row["fix_command"] = existing_fix_command or _issue_row_fix_command(
                 issue_type, new_row
             )
             enriched.append(new_row)
@@ -440,7 +430,7 @@ def _skill_visibility_summary(
 # detected:
 #
 #   other-machine  the link target lives under a root that machines.yaml maps to
-#                  a DIFFERENT machine profile (e.g. /Users/b/repos/... seen from
+#                  a DIFFERENT machine profile (e.g. /Users/operator/repos/... seen from
 #                  the devbox). Detected via runtime_manager.machines:
 #                  ``is_foreign_path(target, current_machine)``. Action: migrate.
 #   moved          a skill with the SAME name still exists under some current
@@ -513,7 +503,7 @@ def _classify_broken_link(
     Precedence is deliberate:
       1. unreadable  — if we could not even read the link, classify nothing else.
       2. other-machine — a foreign target is a migration, never a mystery (this
-         is the mhb case: 47 links all under /Users/b are ONE decision).
+         is the migration case: 47 links all under /Users/operator are ONE decision).
       3. moved        — a same-named live source means a one-symlink relink.
       4. dangling     — otherwise the link is dead and should be pruned.
     """
@@ -642,6 +632,134 @@ def attach_skill_evidence(
     return payload
 
 
+def _override_source_record(
+    model: dict[str, Any],
+    skill_name: str,
+    occurrences: list[dict[str, Any]],
+) -> dict[str, Any]:
+    for occurrence in occurrences:
+        if str(occurrence.get("name") or "") != skill_name:
+            continue
+        source = str(occurrence.get("source") or "").strip()
+        if source:
+            return {
+                "source": source,
+                "source_bucket": occurrence.get("source_bucket"),
+                "path": occurrence.get("path"),
+            }
+    try:
+        options = _skill_source_options(model, skill_name)
+    except RuntimeError:
+        options = []
+    if options:
+        return dict(options[0])
+    return {}
+
+
+def _repo_override_visibility(
+    model: dict[str, Any],
+    cwd_path: Path,
+    occurrences: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Repo override occurrences folded into the canonical effective merge."""
+    policy = _simulated_repo_override_policy(model) or _repo_override_policy(cwd_path)
+    policy_path = str(policy.get("_policy_path") or "")
+    if not policy.get("_simulated") and not Path(policy_path).is_file():
+        return [], []
+
+    layer = {
+        "id": "repo-override-file",
+        "label": "repo override file",
+        "rank": REPO_OVERRIDE_LAYER_RANK,
+        "scope": "repo",
+        "kind": "override",
+        "path": policy_path,
+        "present": True,
+        "skill_count": 0,
+        "vetoed_floor": [],
+    }
+    if not policy.get("ok"):
+        layer["config_error"] = "; ".join(
+            str(error.get("message") or error) for error in policy.get("errors") or []
+        )
+        return [], [layer]
+
+    override_occurrences: list[dict[str, Any]] = []
+
+    def _base_row(skill_name: str, action: str, state: str, rank: int) -> dict[str, Any]:
+        source_record = _override_source_record(model, skill_name, occurrences)
+        return {
+            "name": skill_name,
+            "availability": "override",
+            "state": state,
+            "layer": "repo-override-file",
+            "layer_label": "repo override file",
+            "layer_rank": rank,
+            "scope": "repo",
+            "source": source_record.get("source"),
+            "source_bucket": source_record.get("source_bucket"),
+            "path": source_record.get("path") or str(cwd_path),
+            "override_action": action,
+            "policy_path": policy_path,
+        }
+
+    for skill_name in policy.get("pin_on") or []:
+        row = _base_row(str(skill_name), "pin_on", "pinned", REPO_OVERRIDE_LAYER_RANK)
+        if not str(row.get("source") or "").strip():
+            row["state"] = "broken"
+            row["broken_reason"] = "override_source_missing"
+        override_occurrences.append(row)
+
+    vetoed_floor: list[str] = []
+    for skill_name in policy.get("pin_off") or []:
+        name = str(skill_name)
+        if name in DISPATCHER_CORE:
+            vetoed_floor.append(name)
+            continue
+        override_occurrences.append(
+            _base_row(name, "pin_off", "disabled", REPO_OVERRIDE_LAYER_RANK)
+        )
+
+    for skill_name in policy.get("opt_out_global") or []:
+        name = str(skill_name)
+        if name in DISPATCHER_CORE:
+            vetoed_floor.append(name)
+            continue
+        row = _base_row(name, "opt_out_global", "disabled", GLOBAL_LAYER_RANK + 5)
+        row["layer"] = "repo-override-file:global-opt-out"
+        row["layer_label"] = "repo override global opt-out"
+        override_occurrences.append(row)
+
+    layer["skill_count"] = len(override_occurrences)
+    layer["vetoed_floor"] = sorted(set(vetoed_floor))
+    return override_occurrences, [layer]
+
+
+def _simulated_installed_visibility(
+    model: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    simulation = _skill_visibility_simulation(model)
+    rows = [
+        dict(item)
+        for item in simulation.get("installed_occurrences") or []
+        if isinstance(item, dict) and str(item.get("name") or "")
+    ]
+    if not rows:
+        return [], []
+    layer = {
+        "id": "what-if:planned-project",
+        "label": "what-if planned project links",
+        "rank": PROJECT_LAYER_RANK,
+        "kind": "installed",
+        "path": str(simulation.get("repo_path") or ""),
+        "present": True,
+        "skill_count": len(rows),
+        "broken_count": sum(1 for row in rows if row.get("state") == "broken"),
+        "non_skill_count": 0,
+    }
+    return rows, [layer]
+
+
 def collect_skill_visibility(
     model: dict[str, Any],
     *,
@@ -666,20 +784,33 @@ def collect_skill_visibility(
         include_global=include_global,
         include_project=include_project,
     )
-    occurrences = [*declared_occurrences, *installed_occurrences]
-    layers = [*declared_layers, *installed_layers]
+    simulated_occurrences, simulated_layers = _simulated_installed_visibility(model)
+    base_occurrences = [*declared_occurrences, *installed_occurrences, *simulated_occurrences]
+    override_occurrences, override_layers = _repo_override_visibility(
+        model,
+        cwd_path,
+        base_occurrences,
+    )
+    occurrences = [*base_occurrences, *override_occurrences]
+    layers = [*declared_layers, *installed_layers, *simulated_layers, *override_layers]
     # Classify broken installed links up front so the taxonomy fields (origin,
     # suggested_action, fix_command) flow into both occurrences and the issue
     # groups that reference the same dicts.
     _enrich_broken_links(model, occurrences)
 
-    effective, shadowed = _effective_occurrences(occurrences)
+    visibility_decisions, shadowed = _effective_occurrences(occurrences)
+    for decision in visibility_decisions:
+        decision["winning_layer"] = decision.get("layer")
+    effective = [
+        decision for decision in visibility_decisions
+        if decision.get("state") not in {"broken", "disabled"}
+    ]
     issues = _visibility_issue_groups(
         model,
         cwd_path,
         occurrences,
         declared_occurrences,
-        effective,
+        visibility_decisions,
         shadowed,
     )
     # Surface rule provenance + origin + an exact fix_command on EVERY issue row
@@ -718,10 +849,12 @@ def collect_skill_visibility(
     # declare the overlay. This is the skill-visibility analogue of the
     # overlay-declaration doctor lint (which guards rule `overlay:` tags).
     declared_overlay_names = sorted(declared_overlays(model))
-    undeclared_state = undeclared_active_overlays(model)
+    active_overlay_rows = active_overlay_records(cwd_path, model=model)
+    undeclared_state = undeclared_active_overlays(model, cwd_path)
     overlay_audit = {
         "declared": declared_overlay_names,
-        "active": sorted(active_overlays()),
+        "active": sorted(active_overlays(cwd_path, model=model)),
+        "active_layers": active_overlay_rows,
         "undeclared_active": undeclared_state,
         "warnings": [
             (
@@ -757,6 +890,7 @@ def collect_skill_visibility(
         "parity": parity,
         "layers": sorted(layers, key=lambda item: int(item.get("rank", 0))),
         "source_roots": sorted(source_roots, key=lambda item: str(item.get("path") or "")),
+        "visibility_decisions": visibility_decisions,
         "effective": effective,
         "occurrences": occurrences,
         "undefined_sources": undefined_sources,
@@ -783,6 +917,374 @@ def collect_skill_visibility(
         attach_skill_evidence(payload, evidence_index)
 
     return payload
+
+
+def _what_if_validation_error(code: str, message: str, *, context: dict[str, Any]) -> Exception:
+    from .errors import ValidationError  # noqa: PLC0415
+
+    return ValidationError(
+        code,
+        message,
+        context=context,
+        next_actions=[
+            "Check skillbox-config/machines.yaml.",
+            "Run `sbp registry doctor --json` to inspect declared repo ids.",
+        ],
+    )
+
+
+def _validate_what_if_machine(machine: str | None) -> str | None:
+    machine_id = str(machine or "").strip()
+    if not machine_id:
+        return None
+    try:
+        from . import machines as _machines  # noqa: PLC0415
+
+        config = _machines.load_machines_config()
+        config.require(machine_id)
+    except Exception as exc:
+        raise _what_if_validation_error(
+            "SKILL_WHAT_IF_UNKNOWN_MACHINE",
+            f"Unknown machine id {machine_id!r}.",
+            context={"machine": machine_id, "reason": str(exc)},
+        ) from exc
+    return machine_id
+
+
+def _what_if_model(
+    model: dict[str, Any],
+    *,
+    machine: str | None = None,
+    repo_path: str | None = None,
+    overlays: list[str] | None = None,
+    repo_override_policy: dict[str, Any] | None = None,
+    installed_occurrences: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    simulated = dict(model)
+    simulation = {
+        "machine": machine,
+        "repo_path": repo_path,
+        "overlays": sorted({str(item).strip() for item in overlays or [] if str(item).strip()}),
+        "installed_occurrences": list(installed_occurrences or []),
+    }
+    if repo_override_policy is not None:
+        simulation["repo_override_policy"] = repo_override_policy
+    simulated[SKILL_VISIBILITY_SIMULATION_KEY] = simulation
+    return simulated
+
+
+def _path_under_roots(path: str, roots: list[str]) -> bool:
+    return _path_is_under(path, roots)
+
+
+def _select_machine_registry_path(
+    paths: list[str],
+    *,
+    machine: str | None,
+) -> str:
+    if not paths:
+        return ""
+    if not machine:
+        return paths[0]
+    try:
+        from . import machines as _machines  # noqa: PLC0415
+
+        config = _machines.load_machines_config()
+        roots = _machines.repo_roots_for_machine(config, machine)
+    except Exception:
+        roots = []
+    for path in paths:
+        if roots and _path_under_roots(path, roots):
+            return path
+    return paths[0]
+
+
+def _reroot_literal_repo_path(path: str, *, machine: str | None) -> str:
+    raw = str(path or "").strip()
+    if not raw:
+        return raw
+    if not machine:
+        return str(Path(os.path.expandvars(os.path.expanduser(raw))).resolve())
+    try:
+        from . import machines as _machines  # noqa: PLC0415
+
+        config = _machines.load_machines_config()
+        config.require(machine)
+        classified = config.classify_path(raw)
+        for src_machine in classified.get("machines") or []:
+            translated = config.translate_path(raw, str(src_machine), machine, category="repos")
+            if translated:
+                raw = translated
+                break
+    except Exception:
+        pass
+    return str(Path(os.path.expandvars(os.path.expanduser(raw))).resolve())
+
+
+def _resolve_what_if_repo(
+    model: dict[str, Any],
+    repo_ref: str,
+    *,
+    machine: str | None,
+) -> dict[str, Any]:
+    registry = _resolve_registry_repo_ref(repo_ref, model=model)
+    if registry is not None:
+        path = _select_machine_registry_path(list(registry.get("paths") or []), machine=machine)
+        return {
+            "input": repo_ref,
+            "path": path,
+            "machine": machine,
+            "registry": registry,
+        }
+    return {
+        "input": repo_ref,
+        "path": _reroot_literal_repo_path(repo_ref, machine=machine),
+        "machine": machine,
+        "registry": None,
+    }
+
+
+def _copy_override_policy_for_what_if(cwd_path: Path) -> dict[str, Any]:
+    current = _repo_override_policy(cwd_path)
+    repo_root = Path(str(current.get("_repo_root") or cwd_path))
+    policy_path = Path(str(current.get("_policy_path") or (repo_root / SKILL_OVERRIDES_REL)))
+    if not current.get("ok"):
+        current = _empty_repo_override_policy(repo_root, policy_path)
+    policy = {
+        "ok": True,
+        "version": current.get("version", OVERRIDE_POLICY_VERSION),
+        "pin_on": list(current.get("pin_on") or []),
+        "pin_off": list(current.get("pin_off") or []),
+        "opt_out_global": list(current.get("opt_out_global") or []),
+        "overlays": {
+            "enable": list((current.get("overlays") or {}).get("enable") or []),
+            "disable": list((current.get("overlays") or {}).get("disable") or []),
+        },
+        "defaults": list(current.get("defaults") or []),
+        "reason": str(current.get("reason") or "what-if"),
+        "errors": [],
+        "_repo_root": str(repo_root),
+        "_policy_path": str(policy_path),
+        "_simulated": True,
+    }
+    return policy
+
+
+def _dedup_names(names: list[str] | tuple[str, ...] | set[str] | None) -> list[str]:
+    return sorted({str(name).strip() for name in names or [] if str(name).strip()})
+
+
+def _simulated_repo_policy(
+    cwd_path: Path,
+    *,
+    pins: list[str],
+    opt_outs: list[str],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    before = _copy_override_policy_for_what_if(cwd_path)
+    policy = dict(before)
+    policy["overlays"] = dict(before.get("overlays") or {"enable": [], "disable": []})
+    pin_on = set(before.get("pin_on") or [])
+    pin_off = set(before.get("pin_off") or [])
+    opt_out_global = set(before.get("opt_out_global") or [])
+    conflicts: list[dict[str, Any]] = []
+
+    for skill_name in pins:
+        if skill_name in pin_off:
+            conflicts.append({
+                "skill": skill_name,
+                "rule": "existing_pin_off",
+                "message": f"{skill_name!r} is currently pin_off; what-if pin treats it as pin_on.",
+            })
+        pin_off.discard(skill_name)
+        pin_on.add(skill_name)
+
+    for skill_name in opt_outs:
+        if skill_name in DISPATCHER_CORE:
+            conflicts.append({
+                "skill": skill_name,
+                "rule": "floor_opt_out",
+                "message": f"{skill_name!r} is dispatcher floor policy and cannot be opted out.",
+            })
+        opt_out_global.add(skill_name)
+
+    for skill_name in sorted(pin_on & pin_off):
+        conflicts.append({
+            "skill": skill_name,
+            "rule": "contradiction",
+            "message": f"{skill_name!r} appears in both pin_on and pin_off.",
+        })
+
+    policy["pin_on"] = sorted(pin_on)
+    policy["pin_off"] = sorted(pin_off)
+    policy["opt_out_global"] = sorted(opt_out_global)
+    return policy, conflicts
+
+
+def _planned_install_occurrences(
+    model: dict[str, Any],
+    cwd_path: Path,
+    visibility: dict[str, Any],
+) -> list[dict[str, Any]]:
+    wanted = _dedup_names([
+        str(item.get("name") or "")
+        for item in (visibility.get("issues") or {}).get("missing_for_cwd") or []
+    ])
+    repo_root = _repo_root_for_skill_install(cwd_path)
+    rows: list[dict[str, Any]] = []
+    for skill_name in wanted:
+        try:
+            options = _skill_source_options(model, skill_name)
+        except RuntimeError:
+            options = []
+        if not options:
+            continue
+        source = options[0]
+        source_path = str(source.get("source") or "")
+        for surface in ("claude", "codex"):
+            root = repo_root / f".{surface}" / "skills"
+            rows.append({
+                "name": skill_name,
+                "availability": "installed",
+                "layer": f"what-if:project:{surface}",
+                "layer_label": "what-if planned project link",
+                "layer_rank": PROJECT_LAYER_RANK,
+                "scope": "installed",
+                "source_kind": "symlink",
+                "source": source_path,
+                "source_bucket": source.get("source_bucket"),
+                "path": str(root / skill_name),
+                "link_target": source_path,
+                "has_skill_md": True,
+                "state": "ok",
+            })
+    return rows
+
+
+def _effective_by_name(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(item.get("name")): item
+        for item in payload.get("effective") or []
+        if item.get("name")
+    }
+
+
+def _shadowed_by_layer(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in (payload.get("issues") or {}).get("shadowed") or []:
+        if not isinstance(item, dict):
+            continue
+        rows.append({
+            "name": item.get("name"),
+            "winner_layer": item.get("winner_layer"),
+            "shadowed_layers": list(item.get("shadowed_layers") or []),
+        })
+    return sorted(rows, key=lambda item: str(item.get("name") or ""))
+
+
+def build_skill_what_if_payload(
+    model: dict[str, Any],
+    *,
+    repo: str,
+    overlays: list[str] | None = None,
+    pins: list[str] | None = None,
+    opt_outs: list[str] | None = None,
+    machine: str | None = None,
+) -> dict[str, Any]:
+    """Pure skill-visibility simulation; reads state but writes nothing."""
+    machine_id = _validate_what_if_machine(machine)
+    overlay_names = _dedup_names(overlays)
+    pin_names = _dedup_names(pins)
+    opt_out_names = _dedup_names(opt_outs)
+
+    machine_model = _what_if_model(model, machine=machine_id)
+    repo_record = _resolve_what_if_repo(machine_model, repo, machine=machine_id)
+    cwd_path = Path(str(repo_record["path"])).resolve()
+
+    baseline_model = _what_if_model(model, machine=machine_id, repo_path=str(cwd_path))
+    baseline = collect_skill_visibility(
+        baseline_model,
+        cwd=str(cwd_path),
+        include_global=True,
+        include_project=True,
+        include_sources=False,
+    )
+
+    simulated_policy, pin_conflicts = _simulated_repo_policy(
+        cwd_path,
+        pins=pin_names,
+        opt_outs=opt_out_names,
+    )
+    prelink_model = _what_if_model(
+        model,
+        machine=machine_id,
+        repo_path=str(cwd_path),
+        overlays=overlay_names,
+        repo_override_policy=simulated_policy,
+    )
+    prelink = collect_skill_visibility(
+        prelink_model,
+        cwd=str(cwd_path),
+        include_global=True,
+        include_project=True,
+        include_sources=False,
+    )
+    planned_installs = (
+        _planned_install_occurrences(prelink_model, cwd_path, prelink)
+        if overlay_names
+        else []
+    )
+    simulated_model = _what_if_model(
+        model,
+        machine=machine_id,
+        repo_path=str(cwd_path),
+        overlays=overlay_names,
+        repo_override_policy=simulated_policy,
+        installed_occurrences=planned_installs,
+    )
+    simulated = collect_skill_visibility(
+        simulated_model,
+        cwd=str(cwd_path),
+        include_global=True,
+        include_project=True,
+        include_sources=True,
+    )
+
+    before = _effective_by_name(baseline)
+    after = _effective_by_name(simulated)
+    added_names = sorted(set(after) - set(before))
+    removed_names = sorted(set(before) - set(after))
+    effective = [
+        _compact_skill_visibility_skill(item)
+        for item in simulated.get("effective") or []
+    ]
+    return {
+        "ok": True,
+        "schema_version": "2026-07-04+skill_what_if",
+        "repo": repo_record,
+        "inputs": {
+            "overlays": overlay_names,
+            "pin": pin_names,
+            "opt_out": opt_out_names,
+            "machine": machine_id,
+        },
+        "effective": effective,
+        "added": [_compact_skill_visibility_skill(after[name]) for name in added_names],
+        "removed": [_compact_skill_visibility_skill(before[name]) for name in removed_names],
+        "shadowed_by_layer": _shadowed_by_layer(simulated),
+        "pin_conflicts": pin_conflicts,
+        "planned_installs": planned_installs,
+        "baseline": {
+            "effective": sorted(before),
+            "active_overlays": (baseline.get("overlay_audit") or {}).get("active") or [],
+        },
+        "summary": {
+            "effective": len(effective),
+            "added": len(added_names),
+            "removed": len(removed_names),
+            "shadowed": len(_shadowed_by_layer(simulated)),
+            "pin_conflicts": len(pin_conflicts),
+        },
+    }
 
 
 SKILL_AUDIT_REPO_ISSUE_KEYS = (
@@ -1270,6 +1772,7 @@ def _compact_skill_visibility_skill(item: dict[str, Any]) -> dict[str, Any]:
         "name": item.get("name"),
         "availability": item.get("availability"),
         "layer": item.get("layer"),
+        "winning_layer": item.get("winning_layer"),
         "state": item.get("state"),
         "source_bucket": item.get("source_bucket"),
         "source": item.get("source"),
@@ -1305,6 +1808,10 @@ def compact_skill_visibility_payload(payload: dict[str, Any]) -> dict[str, Any]:
         # compact payload too, so `sbp skills --format json | jq '.parity'`
         # surfaces drift without needing --full.
         "parity": payload.get("parity") or {},
+        "visibility_decisions": [
+            _compact_skill_visibility_skill(item)
+            for item in payload.get("visibility_decisions") or []
+        ],
         "effective": [_compact_skill_visibility_skill(item) for item in payload.get("effective") or []],
         "issues": _compact_skill_visibility_issues(payload),
         "beads": payload.get("beads") or {},
@@ -1316,7 +1823,7 @@ def compact_skill_visibility_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-EXPLAIN_SCHEMA_VERSION = "2026-06-13+skill_explain"
+EXPLAIN_SCHEMA_VERSION = "2026-06-25+skill_explain_layers"
 
 # Maps an occurrence ``layer`` id (e.g. ``default``, ``client:foo``,
 # ``global:claude``, ``project:codex:/repo``) to one of the four ranking
@@ -1326,6 +1833,8 @@ EXPLAIN_SCHEMA_VERSION = "2026-06-13+skill_explain"
 def _layer_family(occurrence: dict[str, Any]) -> str:
     layer = str(occurrence.get("layer") or "")
     rank = int(occurrence.get("layer_rank") or 0)
+    if layer.startswith("repo-override-file") or rank == REPO_OVERRIDE_LAYER_RANK:
+        return "OVERRIDE"
     if layer.startswith("project:") or rank >= PROJECT_LAYER_RANK:
         return "PROJECT"
     if layer.startswith("global:") or rank == GLOBAL_LAYER_RANK:
@@ -1347,9 +1856,44 @@ def _explain_occurrence_view(occurrence: dict[str, Any], *, won: bool) -> dict[s
         "source": occurrence.get("source"),
         "source_bucket": occurrence.get("source_bucket"),
         "path": occurrence.get("path"),
+        "override_action": occurrence.get("override_action"),
+        "policy_path": occurrence.get("policy_path"),
         "won": won,
+        "wins": won,
     }
-    return {key: value for key, value in view.items() if value not in (None, "")} | {"won": won}
+    return (
+        {key: value for key, value in view.items() if value not in (None, "")}
+        | {"won": won, "wins": won}
+    )
+
+
+def _explain_vetoed_floor_views(payload: dict[str, Any], skill_name: str) -> list[dict[str, Any]]:
+    """Repo override attempts vetoed by the dispatcher floor.
+
+    Floor vetoes intentionally do not become occurrences, because the canonical
+    resolver must ignore them. The explain trace still needs to show the
+    touched layer so agents can see why a local pin_off did not win.
+    """
+    rows: list[dict[str, Any]] = []
+    for layer in payload.get("layers") or []:
+        if str(layer.get("id") or "") != "repo-override-file":
+            continue
+        if skill_name not in {str(name) for name in layer.get("vetoed_floor") or []}:
+            continue
+        rows.append({
+            "layer": layer.get("id"),
+            "layer_label": layer.get("label"),
+            "layer_rank": layer.get("rank"),
+            "layer_family": "OVERRIDE",
+            "availability": "override",
+            "state": "vetoed_floor",
+            "path": layer.get("path"),
+            "override_action": "pin_off_or_opt_out_global",
+            "lost_reason": "dispatcher floor skills cannot be disabled by repo overrides",
+            "won": False,
+            "wins": False,
+        })
+    return rows
 
 
 def _explain_lost_reason(
@@ -1361,6 +1905,8 @@ def _explain_lost_reason(
         return "broken link (source target does not resolve here)"
     if winner is None:
         return "no effective occurrence for this skill"
+    if winner.get("state") == "disabled":
+        return f"disabled by higher-precedence override layer ({winner.get('layer')})"
     winner_rank = int(winner.get("layer_rank") or 0)
     loser_rank = int(loser.get("layer_rank") or 0)
     if _same_source(winner, loser):
@@ -1390,7 +1936,7 @@ def _explain_inactive_overlay_rules(
     to flip. The active set is never mutated.
     """
     found: list[dict[str, Any]] = []
-    overlays_on = active_overlays()
+    overlays_on = active_overlays(cwd_path, model=model)
     for policy in _operator_scope_policies(model):
         categories = _policy_categories_by_id(policy)
         for index, raw_rule in enumerate(policy.get("rules") or []):
@@ -1414,7 +1960,7 @@ def _explain_inactive_overlay_rules(
             ):
                 continue
             paths = list(rule.get("paths") or [])
-            matched_paths = [path for path in paths if _path_prefix_matches(cwd_path, path)]
+            matched_paths = _scope_rule_matched_paths(rule, cwd_path)
             if not matched_paths and paths:
                 continue
             found.append({
@@ -1435,7 +1981,7 @@ def _explain_scope_rules(model: dict[str, Any], skill_name: str, cwd_path: Path)
     is overlay-gated, and whether the rule actually matches ``cwd``.
     """
     rules: list[dict[str, Any]] = []
-    for rule in _scope_rules(model):
+    for rule in _scope_rules(model, cwd=cwd_path):
         matched_pattern = next(
             (
                 pattern
@@ -1447,7 +1993,7 @@ def _explain_scope_rules(model: dict[str, Any], skill_name: str, cwd_path: Path)
         if matched_pattern is None:
             continue
         paths = list(rule.get("paths") or [])
-        matched_paths = [path for path in paths if _path_prefix_matches(cwd_path, path)]
+        matched_paths = _scope_rule_matched_paths(rule, cwd_path)
         rules.append({
             "id": rule.get("id"),
             "policy_path": rule.get("policy_path"),
@@ -1468,7 +2014,7 @@ def _explain_machine_profile() -> dict[str, Any]:
     """Forward-compatible machine-profile resolution for the explanation.
 
     Resolution flows through ``runtime_manager.machines`` (the same profile API
-    used elsewhere) so a path like ``/srv/repos/...`` vs ``/Users/b/repos/...``
+    used elsewhere) so a path like ``/srv/repos/...`` vs ``/Users/operator/repos/...``
     can be reasoned about. Best-effort: a missing/unparseable machines.yaml
     yields a ``resolved: false`` stub rather than raising, because skill
     provenance must answer even on boxes that have not declared a profile.
@@ -1542,18 +2088,19 @@ def _explain_remediation(
     ]
 
     if source_options:
-        # A real source exists: the narrowest fix is a scoped activate, which
-        # both prints the SKILL.md packet now and links it for future sessions.
+        # A real source exists: the narrowest durable fix is a scoped `on`,
+        # which pins it for this repo, links it, and returns the SKILL.md packet.
         remediation.append({
             "rank": 1,
-            "kind": "activate",
-            "command": f"sbp skill activate {skill_name} --cwd {cwd}",
+            "kind": "on",
+            "command": f"sbp skill on {skill_name} --cwd $PWD",
+            "resolved_command": f"sbp skill on {skill_name} --cwd {cwd}",
             "manage_command": (
-                f"python3 .env-manager/manage.py skill activate {skill_name} --cwd {cwd}"
+                f"python3 .env-manager/manage.py skill on {skill_name} --cwd {cwd}"
             ),
             "why": (
                 f"a source for {skill_name!r} exists ({source_options[0].get('source')}); "
-                "activating links it here and returns the SKILL.md packet immediately"
+                "turning it on pins it for this repo, links it, and returns the SKILL.md packet"
             ),
         })
 
@@ -1604,7 +2151,7 @@ def _explain_remediation(
             "kind": "source_restore",
             "command": (
                 f"restore or declare a source for {skill_name!r} (e.g. add it to the active "
-                "client's skill-repos.yaml or create skills-private/<name>/SKILL.md)"
+                "client's skill-repos.yaml or create private-skills/<name>/SKILL.md)"
             ),
             "why": (
                 f"no source directory for {skill_name!r} was found under any configured source "
@@ -1670,10 +2217,13 @@ def explain_skill_visibility(
         if str(item.get("name") or "") == skill_name
     ]
     winner = next(
-        (item for item in payload.get("effective") or [] if str(item.get("name") or "") == skill_name),
+        (
+            item for item in payload.get("visibility_decisions") or []
+            if str(item.get("name") or "") == skill_name
+        ),
         None,
     )
-    visible = bool(winner) and winner.get("state") != "broken"
+    visible = bool(winner) and winner.get("state") not in {"broken", "disabled"}
 
     scope_rules = _explain_scope_rules(model, skill_name, cwd_path)
     inactive_overlay_rules = _explain_inactive_overlay_rules(model, skill_name, cwd_path)
@@ -1698,6 +2248,10 @@ def explain_skill_visibility(
             view["lost_reason"] = _explain_lost_reason(winner, item)
             losers.append(view)
         occurrence_views.append(view)
+    layer_trace = [
+        *occurrence_views,
+        *_explain_vetoed_floor_views(payload, skill_name),
+    ]
 
     if visible:
         reason = (
@@ -1711,10 +2265,20 @@ def explain_skill_visibility(
                 f"{skill_name!r} is NOT visible: no occurrence and no source found under any "
                 "configured root (unknown skill or removed source)"
             )
+        elif winner and winner.get("broken_reason") == "override_source_missing":
+            reason = (
+                f"{skill_name!r} is NOT visible: repo override pins it on, "
+                "but no installed occurrence or source was found"
+            )
         elif winner and winner.get("state") == "broken":
             reason = (
                 f"{skill_name!r} is NOT visible: the only occurrence is a broken link "
                 f"({winner.get('path')})"
+            )
+        elif winner and winner.get("state") == "disabled":
+            reason = (
+                f"{skill_name!r} is NOT visible: disabled by the "
+                f"{_layer_family(winner)} layer ({winner.get('layer')})"
             )
         elif source_options:
             reason = (
@@ -1739,16 +2303,18 @@ def explain_skill_visibility(
         "visible": visible,
         "reason": reason,
         "layer": winner.get("layer") if winner else None,
+        "winning_layer": winner.get("winning_layer") if winner else None,
         "layer_family": _layer_family(winner) if winner else None,
         "layer_label": winner.get("layer_label") if winner else None,
         "layer_rank": winner.get("layer_rank") if winner else None,
         "winner": _explain_occurrence_view(winner, won=True) if winner else None,
+        "layers": layer_trace,
         "occurrences": occurrence_views,
         "lost": losers,
         "scope_rules": scope_rules,
         "inactive_overlay_rules": inactive_overlay_rules,
         "source_options": source_options,
-        "active_overlays": sorted(active_overlays()),
+        "active_overlays": sorted(active_overlays(cwd_path, model=model)),
         "active_clients": payload.get("active_clients") or [],
         "matched_clients": payload.get("matched_clients") or [],
         "matched_project_categories": payload.get("matched_project_categories") or [],
@@ -1777,7 +2343,7 @@ def skill_visibility_next_actions(issues: dict[str, list[dict[str, Any]]]) -> li
     if issues.get("extra_global"):
         actions.append("declare extra global skills in skill-repos.yaml or unlink them")
     if issues.get("archive_sources"):
-        actions.append("copy useful archive-sourced skills into skills-private, then repoint")
+        actions.append("copy useful archive-sourced skills into private-skills, then repoint")
     if issues.get("scope_violations"):
         actions.append("unlink or move skills installed outside their declared scope")
     if issues.get("missing_for_cwd"):

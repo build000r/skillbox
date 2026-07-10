@@ -10,13 +10,16 @@ Protocol: JSON-RPC 2.0 over stdio (MCP 2024-11-05).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +27,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 BOX_PY = SCRIPT_DIR / "box.py"
 RECONCILE_PY = SCRIPT_DIR / "04-reconcile.py"
+# DEPRECATED repo-root secret locations (inside the workspace bind mount).
+# Retained for reference/back-compat; main() loads via load_operator_secret(),
+# which prefers operator_secret_dir() and only falls back here with a warning.
 ENV_FILE = REPO_ROOT / ".env"
 ENV_BOX_FILE = REPO_ROOT / ".env.box"
 
@@ -51,60 +57,202 @@ _DRY_RUN_PROP: dict = {
     "default": False,
 }
 
-# ---------------------------------------------------------------------------
-# Identifier validation (path traversal / flag injection guard)
-# ---------------------------------------------------------------------------
-
-_IDENTIFIER_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
-_SSH_USER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$")
-_HOST_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,253}[a-zA-Z0-9])?$")
-REDACTION_MARKER = "[REDACTED]"
-_SECRET_KEY_PATTERN = (
-    r"TOKEN|SECRET|PASSWORD|PASSWD|API[_-]?KEY|AUTH[_-]?KEY|PRIVATE[_-]?KEY|ACCESS[_-]?KEY"
+# Shared operator-side validation, inventory containment, and subprocess
+# helpers live in lib.opslib. Redaction aliases are preserved because call
+# sites (including the box_exec audit path) and tests reference these names.
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+from lib.opslib import (  # noqa: E402
+    resolve_inventory_path,
+    run_checked,
+    validate_host,
+    validate_identifier,
+    validate_ssh_user,
 )
-_SECRET_KEY_RE = re.compile(rf"(?:{_SECRET_KEY_PATTERN})", re.IGNORECASE)
-_SECRET_ASSIGNMENT_RE = re.compile(
-    r"("
-    r"(?:\b|[\"'])"
-    rf"[A-Z0-9_.-]*(?:{_SECRET_KEY_PATTERN})[A-Z0-9_.-]*"
-    r"(?:\b|[\"'])"
-    r"\s*[:=]\s*"
-    r"[\"']?"
-    r")"
-    r"([^\"'\s,;]+)"
-    r"([\"']?)",
-    re.IGNORECASE,
-)
-_BEARER_TOKEN_RE = re.compile(
-    r"(\b(?:authorization|proxy-authorization)\s*:\s*bearer\s+)([^\s,;]+)",
-    re.IGNORECASE,
+from lib.redaction import (  # noqa: E402
+    redact_text as redact_diagnostic_text,
+    redact_value as _redact_diagnostic_value,
 )
 
 DRYRUN_MARKER_TTL_SECONDS = 600  # 10 minutes
-_DRYRUN_MARKER_STATUS_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+_DRYRUN_MARKER_STATUS_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
 
 
-def redact_diagnostic_text(text: str) -> str:
-    redacted = _BEARER_TOKEN_RE.sub(lambda match: f"{match.group(1)}{REDACTION_MARKER}", text)
-    return _SECRET_ASSIGNMENT_RE.sub(
-        lambda match: f"{match.group(1)}{REDACTION_MARKER}{match.group(3)}",
-        redacted,
-    )
+# ---------------------------------------------------------------------------
+# operator_box_exec command policy (server-side gate)
+#
+# operator_box_exec runs ARBITRARY shell over Tailscale SSH on any inventory
+# box. Unlike teardown/compose_down (single fixed effect), the command itself
+# is the payload, so the gate lives here on the server (works for every MCP
+# client, like the provision dry-run gate) rather than only in the hook.
+#
+# Policy, in two tiers:
+#   1. READ-ONLY ALLOWLIST — a SHORT, BORING set of inspection commands that
+#      cannot mutate state. These pass unconditionally (no dry-run friction).
+#      We match on the LEADING command token(s) and refuse the command if it
+#      contains shell metacharacters that could chain a second command
+#      (`;`, `|`, `&`, `>`, backticks, `$(`, `&&`, `||`, newlines used as
+#      separators, etc.) — an allowlisted prefix must NOT be a smuggling
+#      vector for an arbitrary tail.
+#   2. EVERYTHING ELSE — mutating verbs, unknown commands, or anything with
+#      chaining metacharacters — requires a fresh dry_run=true preview that
+#      stamps a marker keyed by box_id + a hash of the NORMALIZED command, so
+#      a marker minted for command A cannot authorize command B.
+# ---------------------------------------------------------------------------
+
+# Shell metacharacters that can chain/redirect a second command. Their presence
+# disqualifies the read-only fast path: even `cat foo` becomes mutating-capable
+# as `cat foo > /etc/passwd` or `cat foo; rm -rf /`. A command with any of these
+# must go through the dry-run marker path regardless of its leading token.
+_SHELL_CHAIN_RE = re.compile(r"[;&|><`\n\r]|\$\(|\$\{|\\\n")
+
+# Read-only allowlist. Keyed by the leading token; the value is either:
+#   - None: any args allowed (e.g. `df`, `uptime`).
+#   - a set of allowed SECOND tokens (e.g. `docker` -> {"ps", "logs", ...},
+#     `git` -> {"status", "log", ...}, `systemctl` -> {"status", ...}).
+# Conservative on purpose: subcommands like `docker exec`, `git push`,
+# `systemctl restart` are NOT here and fall through to the dry-run gate.
+_READONLY_ALLOWLIST: dict[str, set[str] | None] = {
+    # Plain inspection commands (any args).
+    "cat": None,
+    "df": None,
+    "du": None,
+    "free": None,
+    "head": None,
+    "hostname": None,
+    "id": None,
+    "journalctl": None,
+    "ls": None,
+    "nproc": None,
+    "ps": None,
+    "pwd": None,
+    "stat": None,
+    "tail": None,
+    "uname": None,
+    "uptime": None,
+    "wc": None,
+    "whoami": None,
+    # Subcommand-scoped: only the read-only verbs below are allowlisted.
+    "docker": {"ps", "logs", "images", "inspect", "stats", "version", "top"},
+    "git": {"status", "log", "diff", "show", "branch", "remote", "rev-parse"},
+    "systemctl": {"status", "is-active", "is-enabled", "list-units", "show"},
+}
+
+# Paths whose `cat`/`head`/`tail` would leak secrets. If the read-only command
+# touches one of these, it does NOT get the fast path — it must dry-run first so
+# the preview (and audit) records exactly what would be read.
+_SECRET_PATH_RE = re.compile(
+    r"(?:^|[\s=])"
+    r"(?:[^\s]*/)?"
+    r"(?:\.env(?:\.[\w.-]+)?|\.netrc|id_rsa|id_ed25519|"
+    r"[^\s]*secret[^\s]*|[^\s]*credential[^\s]*|authkey|\.ssh/[^\s]*)",
+    re.IGNORECASE,
+)
 
 
-def _redact_diagnostic_value(value: Any) -> Any:
-    if isinstance(value, str):
-        return redact_diagnostic_text(value)
-    if isinstance(value, list):
-        return [_redact_diagnostic_value(item) for item in value]
-    if isinstance(value, dict):
+def normalize_command(command: str) -> str:
+    """Collapse insignificant whitespace so trivially-different spellings of
+    the SAME command hash to the same marker key.
+
+    Collapses runs of any whitespace (spaces, tabs, newlines) to a single
+    space and strips leading/trailing whitespace. This makes
+    ``"ls   -la"`` == ``"ls -la"`` and tolerates a trailing newline, but does
+    NOT alter token order, quoting, or operators, so two semantically distinct
+    commands never collide.
+    """
+    return re.sub(r"\s+", " ", command).strip()
+
+
+def command_hash(command: str) -> str:
+    """Stable short hash of the normalized command, used in the marker key.
+
+    Binds a dry-run marker to the EXACT command previewed: a marker for
+    command A cannot authorize command B because their hashes differ.
+    """
+    return hashlib.sha256(normalize_command(command).encode("utf-8")).hexdigest()[:16]
+
+
+def _leading_tokens(command: str) -> list[str]:
+    """Best-effort split of the normalized command into its leading tokens.
+
+    We only need the first two tokens to consult the allowlist. ``shlex`` would
+    raise on unbalanced quotes; for classification a simple whitespace split of
+    the normalized command is sufficient and never raises.
+    """
+    return normalize_command(command).split(" ")
+
+
+def classify_box_exec_command(command: str) -> dict[str, Any]:
+    """Classify *command* as 'read-only' (allowlisted) or 'mutating'.
+
+    Returns a dict: {"verdict": "read-only"|"mutating", "reason": str}.
+    'read-only' means it passes unconditionally; 'mutating' means a matching
+    dry-run marker is required. The classifier is conservative: anything it is
+    not SURE is read-only is treated as mutating.
+    """
+    normalized = normalize_command(command)
+    if not normalized:
+        return {"verdict": "mutating", "reason": "empty command"}
+
+    if _SHELL_CHAIN_RE.search(command):
         return {
-            key: REDACTION_MARKER
-            if isinstance(key, str) and _SECRET_KEY_RE.search(key)
-            else _redact_diagnostic_value(child)
-            for key, child in value.items()
+            "verdict": "mutating",
+            "reason": "contains shell chaining/redirection metacharacters",
         }
-    return value
+
+    tokens = _leading_tokens(command)
+    head = tokens[0]
+
+    # Reject an env-var prefix (FOO=bar cmd ...) or absolute/relative path
+    # invocation on the fast path — we only allowlist bare, known tokens.
+    if "=" in head or "/" in head:
+        return {"verdict": "mutating", "reason": f"non-allowlisted invocation: {head!r}"}
+
+    if head not in _READONLY_ALLOWLIST:
+        return {"verdict": "mutating", "reason": f"command {head!r} not in read-only allowlist"}
+
+    allowed_sub = _READONLY_ALLOWLIST[head]
+    if allowed_sub is not None:
+        sub = tokens[1] if len(tokens) > 1 else ""
+        if sub not in allowed_sub:
+            return {
+                "verdict": "mutating",
+                "reason": f"{head} subcommand {sub or '<none>'!r} not in read-only allowlist",
+            }
+
+    # `cat`/`head`/`tail`/`stat`/`ls` of a secret-looking path is NOT free:
+    # it could exfiltrate secrets, so route it through the dry-run preview.
+    if head in {"cat", "head", "tail", "stat", "ls", "wc"} and _SECRET_PATH_RE.search(command):
+        return {
+            "verdict": "mutating",
+            "reason": "reads a secret-looking path; preview required",
+        }
+
+    return {"verdict": "read-only", "reason": f"allowlisted: {head}"}
+
+
+def _dcg_verdict(command: str) -> dict[str, Any] | None:
+    """Optionally pipe *command* through `dcg check` and surface its verdict.
+
+    Best-effort and never a hard dependency: returns None if dcg is not
+    installed or errors. Output is advisory only — the server-side classifier
+    is the real gate.
+    """
+    dcg_bin = shutil.which("dcg")
+    if not dcg_bin:
+        return None
+    result = run_checked([dcg_bin, "check", "--stdin"], timeout=10, input_text=command)
+    if result.get("error_code"):
+        return None
+    verdict: dict[str, Any] = {"available": True, "exit_code": result["rc"]}
+    out = str(result.get("stdout") or "").strip()
+    if out:
+        try:
+            verdict["report"] = json.loads(out)
+        except json.JSONDecodeError:
+            verdict["report"] = redact_diagnostic_text(out)
+    verdict["blocked"] = result["rc"] != 0
+    return verdict
 
 
 def _validate_identifier(value: str, kind: str) -> str:
@@ -115,17 +263,7 @@ def _validate_identifier(value: str, kind: str) -> str:
 
     Returns the validated value on success; raises ValueError otherwise.
     """
-    if not value:
-        raise ValueError(f"Invalid {kind}: must not be empty")
-    if "/" in value or "\\" in value:
-        raise ValueError(f"Invalid {kind}: must not contain path separators")
-    if value.startswith("-"):
-        raise ValueError(f"Invalid {kind}: must not start with '-'")
-    if not _IDENTIFIER_RE.match(value):
-        raise ValueError(
-            f"Invalid {kind}: must be a slug matching [a-zA-Z0-9][a-zA-Z0-9._-]{{0,63}}"
-        )
-    return value
+    return validate_identifier(value, kind)
 
 
 def _validate_string_identifier(value: Any, kind: str, *, trim: bool = False) -> str:
@@ -160,15 +298,11 @@ def _validate_int(value: Any, kind: str) -> int:
 
 
 def _validate_ssh_user(value: str, kind: str = "ssh_user") -> str:
-    if not isinstance(value, str) or not _SSH_USER_RE.match(value):
-        raise ValueError(f"Invalid {kind}: {value!r}")
-    return value
+    return validate_ssh_user(value, kind=kind)
 
 
 def _validate_host(value: str, kind: str = "host") -> str:
-    if not isinstance(value, str) or not _HOST_RE.match(value):
-        raise ValueError(f"Invalid {kind}: {value!r}")
-    return value
+    return validate_host(value, kind=kind)
 
 
 def _tool_metadata(
@@ -266,8 +400,9 @@ TOOLS: list[dict] = [
             "This is the primary macro — one call replaces 7 manual steps. "
             "ALWAYS use dry_run=true first. "
             "Dry-run returns credential_status; if missing is non-empty, stop and ask the operator "
-            "to populate .env.box with SKILLBOX_DO_TOKEN, SKILLBOX_DO_SSH_KEY_ID, and "
-            "SKILLBOX_TS_AUTHKEY before running real provisioning."
+            "to populate the operator secret file (${SKILLBOX_STATE_ROOT}/operator/.env.box, "
+            "default ./.skillbox-state/operator/.env.box) with SKILLBOX_DO_TOKEN, "
+            "SKILLBOX_DO_SSH_KEY_ID, and SKILLBOX_TS_AUTHKEY before running real provisioning."
         ),
         **_tool_metadata(
             read_only=False,
@@ -355,7 +490,12 @@ TOOLS: list[dict] = [
             "Run a command on a box over Tailscale SSH. "
             "Use for ad-hoc operations: checking logs, running manage.py commands, inspecting state. "
             "The command runs as the box's SSH user (typically 'skillbox'). "
-            "For interactive SSH, use 'make box-ssh BOX=<id>' instead."
+            "For interactive SSH, use 'make box-ssh BOX=<id>' instead. "
+            "GATED: read-only inspection commands (status/logs/df/cat/ls/etc.) run "
+            "immediately. Any MUTATING or unrecognized command must first be "
+            "previewed with dry_run=true (which returns exactly what would run and "
+            "stamps a marker bound to box_id + the command hash); only then will the "
+            "identical command execute for real."
         ),
         **_tool_metadata(
             read_only=False,
@@ -383,6 +523,15 @@ TOOLS: list[dict] = [
                     "type": "integer",
                     "description": "Command timeout in seconds (default: 120).",
                     "default": 120,
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": (
+                        "Preview a mutating/unknown command without running it. Returns the exact "
+                        "command that would execute and stamps a marker bound to box_id + command hash, "
+                        "authorizing one real run of THIS command. Read-only commands do not need this."
+                    ),
+                    "default": False,
                 },
             },
         },
@@ -504,6 +653,47 @@ def load_dotenv(path: Path) -> None:
             os.environ[key] = value
 
 
+# Operator secret files (DigitalOcean token, Tailscale authkey, *_TOKEN/*_KEY/*_SECRET).
+# These are consumed host-side only; they must live OUTSIDE the `.:/workspace` bind
+# mount so in-container agents cannot read them. Canonical home is
+# ${SKILLBOX_STATE_ROOT}/operator/ (the state root is mounted only at specific
+# subpaths, never wholesale). The legacy repo-root ENV_FILE/ENV_BOX_FILE locations
+# are deprecated and warn.
+OPERATOR_SECRET_FILENAMES = (".env", ".env.box")
+
+
+def operator_secret_dir() -> Path:
+    """Resolve the canonical operator-secret directory under the state root."""
+    state_root = os.environ.get("SKILLBOX_STATE_ROOT", "").strip() or "./.skillbox-state"
+    base = Path(state_root)
+    if not base.is_absolute():
+        base = REPO_ROOT / base
+    return (base / "operator").resolve()
+
+
+def load_operator_secret(name: str) -> None:
+    """Load an operator secret file, preferring the relocated state-root copy.
+
+    Falls back to the deprecated repo-root location (inside the workspace mount)
+    with a loud stderr warning; no-op when neither file exists.
+    """
+    new_path = operator_secret_dir() / name
+    legacy_path = REPO_ROOT / name
+    if new_path.is_file():
+        load_dotenv(new_path)
+        return
+    if legacy_path.is_file():
+        sys.stderr.write(
+            f"[skillbox] DEPRECATED secret location: {legacy_path} is inside the workspace "
+            f"bind mount and readable by in-container agents.\n"
+            f"[skillbox] Move it out of the mount with:\n"
+            f"    mkdir -p {operator_secret_dir()} && mv {legacy_path} {new_path}\n"
+        )
+        load_dotenv(legacy_path)
+        return
+    # neither present: leave os.environ untouched; existing missing-credential UX handles it.
+
+
 def run_script(
     script: Path,
     args: list[str],
@@ -522,11 +712,8 @@ def run_script(
         }
 
     cmd = [sys.executable, str(script)] + args
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, cwd=str(REPO_ROOT),
-        )
-    except subprocess.TimeoutExpired:
+    result = run_checked(cmd, timeout=timeout, cwd=REPO_ROOT)
+    if result.get("error_code") == "TIMEOUT":
         return False, -1, {
             "error": {
                 "type": "timeout",
@@ -534,19 +721,28 @@ def run_script(
                 "recoverable": True,
             }
         }
+    if result.get("error_code") == "COMMAND_NOT_FOUND":
+        return False, -1, {
+            "error": {
+                "type": "python_not_found",
+                "message": "python executable not found.",
+                "recoverable": False,
+            }
+        }
 
-    if proc.stderr.strip():
-        stderr_text = redact_diagnostic_text(proc.stderr.strip())
+    if str(result.get("stderr_redacted") or "").strip():
+        stderr_text = str(result.get("stderr_redacted") or "").strip()
         print(f"[operator-mcp] {script.name} stderr: {stderr_text}", file=sys.stderr, flush=True)
 
-    stdout = proc.stdout.strip()
+    stdout = str(result.get("stdout") or "").strip()
+    rc = int(result["rc"])
     if stdout:
         try:
-            return proc.returncode == 0, proc.returncode, _redact_diagnostic_value(json.loads(stdout))
+            return rc == 0, rc, _redact_diagnostic_value(json.loads(stdout))
         except json.JSONDecodeError:
-            return proc.returncode == 0, proc.returncode, {"text": redact_diagnostic_text(stdout)}
+            return rc == 0, rc, {"text": redact_diagnostic_text(stdout)}
 
-    return proc.returncode == 0, proc.returncode, {"exit_code": proc.returncode}
+    return rc == 0, rc, {"exit_code": rc}
 
 
 def _compose_monoserver_layer() -> list[str]:
@@ -568,11 +764,8 @@ def run_compose(args: list[str], *, timeout: int = 300) -> tuple[bool, int, Any]
     """Run docker compose and return structured output."""
     file_flags = ["-f", "docker-compose.yml"] + _compose_monoserver_layer()
     cmd = ["docker", "compose"] + file_flags + args
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, cwd=str(REPO_ROOT),
-        )
-    except FileNotFoundError:
+    result = run_checked(cmd, timeout=timeout, cwd=REPO_ROOT)
+    if result.get("error_code") == "COMMAND_NOT_FOUND":
         return False, -1, {
             "error": {
                 "type": "docker_not_found",
@@ -580,7 +773,7 @@ def run_compose(args: list[str], *, timeout: int = 300) -> tuple[bool, int, Any]
                 "recoverable": False,
             }
         }
-    except subprocess.TimeoutExpired:
+    if result.get("error_code") == "TIMEOUT":
         return False, -1, {
             "error": {
                 "type": "timeout",
@@ -589,19 +782,20 @@ def run_compose(args: list[str], *, timeout: int = 300) -> tuple[bool, int, Any]
             }
         }
 
-    stdout = proc.stdout.strip()
-    stderr = proc.stderr.strip()
-    ok = proc.returncode == 0
+    stdout = str(result.get("stdout") or "").strip()
+    stderr = str(result.get("stderr_redacted") or "").strip()
+    rc = int(result["rc"])
+    ok = rc == 0
 
     # Try JSON parse (docker compose ps --format json)
     if stdout:
         try:
-            return ok, proc.returncode, _redact_diagnostic_value(json.loads(stdout))
+            return ok, rc, _redact_diagnostic_value(json.loads(stdout))
         except json.JSONDecodeError:
             pass
 
-    return ok, proc.returncode, {
-        "exit_code": proc.returncode,
+    return ok, rc, {
+        "exit_code": rc,
         "stdout": redact_diagnostic_text(stdout),
         "stderr": redact_diagnostic_text(stderr),
     }
@@ -621,9 +815,8 @@ def run_ssh(
         "-o", "BatchMode=yes",
     ]
     cmd = ["ssh", *ssh_opts, "--", f"{user}@{host}", command]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except FileNotFoundError:
+    result = run_checked(cmd, timeout=timeout)
+    if result.get("error_code") == "COMMAND_NOT_FOUND":
         return False, -1, {
             "error": {
                 "type": "ssh_not_found",
@@ -631,7 +824,7 @@ def run_ssh(
                 "recoverable": False,
             }
         }
-    except subprocess.TimeoutExpired:
+    if result.get("error_code") == "TIMEOUT":
         return False, -1, {
             "error": {
                 "type": "timeout",
@@ -641,20 +834,21 @@ def run_ssh(
             }
         }
 
-    stdout = proc.stdout.strip()
-    ok = proc.returncode == 0
+    stdout = str(result.get("stdout") or "").strip()
+    rc = int(result["rc"])
+    ok = rc == 0
 
     # Try JSON parse
     if stdout:
         try:
-            return ok, proc.returncode, _redact_diagnostic_value(json.loads(stdout))
+            return ok, rc, _redact_diagnostic_value(json.loads(stdout))
         except json.JSONDecodeError:
             pass
 
-    return ok, proc.returncode, {
-        "exit_code": proc.returncode,
+    return ok, rc, {
+        "exit_code": rc,
         "stdout": redact_diagnostic_text(stdout),
-        "stderr": redact_diagnostic_text(proc.stderr.strip()),
+        "stderr": redact_diagnostic_text(str(result.get("stderr_redacted") or "").strip()),
     }
 
 
@@ -663,10 +857,7 @@ def run_ssh(
 # ---------------------------------------------------------------------------
 
 def load_inventory() -> list[dict]:
-    inv_path = REPO_ROOT / "workspace" / "boxes.json"
-    override = os.environ.get("SKILLBOX_BOX_INVENTORY", "").strip()
-    if override:
-        inv_path = Path(override)
+    inv_path = resolve_inventory_path(repo_root=REPO_ROOT)
     if not inv_path.is_file():
         return []
     data = json.loads(inv_path.read_text(encoding="utf-8"))
@@ -927,7 +1118,107 @@ def handle_operator_box_exec(params: dict) -> dict:
                 "recoverable": True,
             }
         })
+
+    try:
+        dry_run_param = _validate_optional_bool(params, "dry_run")
+    except ValueError as exc:
+        return _error_content({"error": {"type": "invalid_parameter", "message": str(exc), "recoverable": True}})
+
+    # --- Command policy gate (server-side, every-client) -------------------
+    classification = classify_box_exec_command(command_param)
+    marker_key = _box_exec_marker_key(box_id_param, command_param)
+    cmd_hash = command_hash(command_param)
+
+    # Read-only allowlisted commands run unconditionally — no dry-run friction.
+    if classification["verdict"] == "read-only" and not dry_run_param:
+        emit_box_exec_audit(
+            box_id_param,
+            command_param,
+            verdict="allow-readonly",
+            reason=classification["reason"],
+        )
+        ok, _code, data = run_ssh(validated_user, validated_host, command_param, timeout=timeout)
+        return _ok_content(data) if ok else _error_content(data)
+
+    # Mutating/unknown (or an explicit dry_run). In dry_run mode we preview the
+    # EXACT command and stamp a marker bound to box_id + command hash.
+    if dry_run_param:
+        _stamp_dryrun_marker("operator_box_exec", marker_key)
+        emit_box_exec_audit(
+            box_id_param,
+            command_param,
+            verdict="preview",
+            reason=classification["reason"],
+            dry_run=True,
+        )
+        payload: dict[str, Any] = {
+            "dry_run": True,
+            "box_id": box_id_param,
+            "classification": classification["verdict"],
+            "reason": classification["reason"],
+            "would_run": {
+                "ssh_user": validated_user,
+                "host": validated_host,
+                "command": command_param,
+                "command_hash": cmd_hash,
+                "timeout": timeout,
+            },
+            "next_actions": [
+                "Confirm the command above with the user, then re-issue the IDENTICAL "
+                "operator_box_exec call WITHOUT dry_run to execute it.",
+            ],
+        }
+        dcg = _dcg_verdict(command_param)
+        if dcg is not None:
+            payload["dcg"] = dcg
+        return _ok_content(payload)
+
+    # Mutating, non-dry-run: require a fresh marker bound to THIS command.
+    if not _has_dryrun_marker("operator_box_exec", marker_key):
+        emit_box_exec_audit(
+            box_id_param,
+            command_param,
+            verdict="reject",
+            reason=f"no dry-run marker for command hash {cmd_hash}: {classification['reason']}",
+        )
+        marker_status = _dryrun_marker_rejection_status("operator_box_exec", marker_key)
+        marker_note = _dryrun_marker_rejection_note(marker_status)
+        return _error_content({
+            "error": {
+                "type": "dry_run_required",
+                "message": (
+                    f"operator_box_exec classified this command as '{classification['verdict']}' "
+                    f"({classification['reason']}). A mutating/unknown command requires a successful "
+                    f"dry_run=true preview of the IDENTICAL command first ({marker_note})."
+                ),
+                "recoverable": True,
+                "subject": box_id_param,
+                "classification": classification["verdict"],
+                "command_hash": cmd_hash,
+                "marker": _dryrun_marker_error_payload(marker_status),
+                "next_actions": [
+                    {
+                        "tool": "operator_box_exec",
+                        "arguments": {
+                            "box_id": box_id_param,
+                            "command": command_param,
+                            "dry_run": True,
+                        },
+                    },
+                ],
+            }
+        })
+
+    # Marker present and valid — authorize a single real run, then consume it.
+    emit_box_exec_audit(
+        box_id_param,
+        command_param,
+        verdict="allow-marker",
+        reason=f"matching dry-run marker for command hash {cmd_hash}",
+    )
     ok, _code, data = run_ssh(validated_user, validated_host, command_param, timeout=timeout)
+    if ok:
+        _clear_dryrun_marker("operator_box_exec", marker_key)
     return _ok_content(data) if ok else _error_content(data)
 
 
@@ -1063,15 +1354,64 @@ def emit_event(event_type: str, subject: str, detail: dict | None = None) -> Non
         pass
 
 
+def emit_box_exec_audit(
+    box_id: str,
+    command: str,
+    *,
+    verdict: str,
+    reason: str,
+    dry_run: bool = False,
+) -> None:
+    """Record an audit event for EVERY operator_box_exec invocation.
+
+    Logs box_id, the command HASH (never raw secrets), a REDACTED command
+    preview, the gate verdict (allow-readonly / allow-marker / reject /
+    preview), and a human reason. The raw command is redacted (KEY=value and
+    bearer-token shaped substrings) before it ever touches the journal so a
+    command carrying a secret cannot leak it into the audit trail.
+    """
+    emit_event(
+        "operator.box_exec",
+        box_id,
+        {
+            "verdict": verdict,
+            "reason": reason,
+            "dry_run": dry_run,
+            "command_hash": command_hash(command),
+            "command_redacted": redact_diagnostic_text(normalize_command(command)),
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Dry-run marker (coordinates with PreToolUse hook)
 # ---------------------------------------------------------------------------
+
+def _dryrun_marker_dir() -> Path:
+    return REPO_ROOT / ".skillbox-state" / "dryrun-markers"
+
 
 def _dryrun_marker_path(tool_name: str, box_id: str) -> Path:
     """Return the marker path after validating identifiers."""
     _validate_identifier(tool_name, "tool_name")
     _validate_identifier(box_id, "box_id")
-    return REPO_ROOT / ".skillbox-state" / "dryrun-markers" / f".skillbox-dryrun-{tool_name}-{box_id}"
+    return _dryrun_marker_dir() / f".skillbox-dryrun-{tool_name}-{box_id}"
+
+
+def _box_exec_marker_key(box_id: str, command: str) -> str:
+    """Marker subject for operator_box_exec, binding box_id + command hash.
+
+    The marker store keys on a single slug; we combine the (already validated)
+    box_id with the normalized-command hash so a marker minted for command A on
+    box X cannot authorize command B (different hash) or command A on box Y
+    (different box_id). To stay within the 64-char identifier limit for any
+    box_id length, the box_id is folded into a short hash and joined with the
+    command hash: ``{box_hash}.{command_hash}`` (only ``[a-z0-9.]``). Distinct
+    box_ids and distinct (normalized) commands therefore land on distinct
+    markers; identical ones collide intentionally.
+    """
+    box_hash = hashlib.sha256(box_id.encode("utf-8")).hexdigest()[:16]
+    return f"{box_hash}.{command_hash(command)}"
 
 
 def _dryrun_marker_ttl_seconds() -> int:
@@ -1087,57 +1427,237 @@ def _dryrun_marker_ttl_seconds() -> int:
     return DRYRUN_MARKER_TTL_SECONDS
 
 
-def _stamp_dryrun_marker(tool_name: str, box_id: str) -> None:
-    """Create a temp marker so the PreToolUse hook knows a dry-run was done."""
-    marker = _dryrun_marker_path(tool_name, box_id)
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(f"dry-run completed for {tool_name} box={box_id}\n")
+def _process_start_time(pid: int) -> str:
+    proc_stat = Path("/proc") / str(pid) / "stat"
+    try:
+        text = proc_stat.read_text(encoding="utf-8")
+        tail = text.rsplit(")", 1)[1].strip().split()
+        if len(tail) > 19:
+            return tail[19]
+    except (OSError, IndexError):
+        pass
+    try:
+        return str((Path("/proc") / str(pid)).stat().st_ctime_ns)
+    except OSError:
+        return "unknown"
 
 
-def _dryrun_marker_status(tool_name: str, box_id: str) -> dict[str, Any]:
-    marker = _dryrun_marker_path(tool_name, box_id)
-    ttl_seconds = _dryrun_marker_ttl_seconds()
+def _dryrun_session_id() -> str:
+    explicit = str(os.environ.get("CLAUDE_SESSION_ID") or "").strip()
+    if explicit:
+        return explicit
+    parent_pid = os.getppid()
+    return f"ppid:{parent_pid}:start:{_process_start_time(parent_pid)}"
+
+
+def _dryrun_marker_cache_key(tool_name: str, box_id: str) -> tuple[str, str, str]:
+    return (tool_name, box_id, _dryrun_session_id())
+
+
+def _utc_timestamp(now: float | None = None) -> str:
+    return datetime.fromtimestamp(time.time() if now is None else now, timezone.utc).isoformat(
+        timespec="seconds"
+    ).replace("+00:00", "Z")
+
+
+def _created_at_epoch(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _read_dryrun_marker_payload(marker: Path) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        raw = marker.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        return None, f"unreadable marker: {exc.__class__.__name__}"
+    if not raw:
+        return None, "empty legacy marker"
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, "legacy mtime-only marker"
+    if not isinstance(payload, dict):
+        return None, "marker JSON payload is not an object"
+    return payload, None
+
+
+def _marker_stat_age(marker: Path, now: float) -> int | None:
+    try:
+        return max(0, int(now - marker.stat().st_mtime))
+    except OSError:
+        return None
+
+
+def _dryrun_marker_status_from_path(
+    marker: Path,
+    *,
+    tool_name: str,
+    box_id: str,
+    ttl_seconds: int,
+    now: float,
+    check_session: bool,
+) -> dict[str, Any]:
+    current_session = _dryrun_session_id()
     status: dict[str, Any] = {
         "path": str(marker),
         "exists": False,
         "valid": False,
         "expired": False,
+        "session_mismatch": False,
+        "reason": "absent",
         "age_seconds": None,
         "ttl_seconds": ttl_seconds,
+        "format": "absent",
+        "tool": tool_name,
+        "key": box_id,
+        "marker_session": None,
+        "current_session": current_session,
+        "created_at": None,
+        "warning": None,
     }
     if not marker.is_file():
         return status
+
     status["exists"] = True
-    try:
-        age_seconds = max(0, int(time.time() - marker.stat().st_mtime))
-    except OSError:
-        return status
+    payload, warning = _read_dryrun_marker_payload(marker)
+    if payload is None:
+        status["format"] = "legacy"
+        status["warning"] = warning or "legacy mtime-only marker"
+        age_seconds = _marker_stat_age(marker, now)
+    else:
+        status["format"] = "json"
+        marker_tool = str(payload.get("tool") or "")
+        marker_key = str(payload.get("key") or "")
+        marker_session = str(payload.get("session") or "").strip()
+        created_at = payload.get("created_at")
+        status.update(
+            {
+                "marker_tool": marker_tool,
+                "marker_key": marker_key,
+                "marker_session": marker_session or None,
+                "created_at": created_at,
+            }
+        )
+        created_epoch = _created_at_epoch(created_at)
+        ages = [
+            age
+            for age in (
+                max(0, int(now - created_epoch)) if created_epoch is not None else None,
+                _marker_stat_age(marker, now),
+            )
+            if age is not None
+        ]
+        age_seconds = max(ages) if ages else None
+
     status["age_seconds"] = age_seconds
-    status["expired"] = age_seconds > ttl_seconds
-    status["valid"] = not status["expired"]
+    if age_seconds is None:
+        status["reason"] = "unreadable"
+        return status
+    if age_seconds > ttl_seconds:
+        status["expired"] = True
+        status["reason"] = "expired"
+        return status
+    if payload is not None and (
+        (tool_name and marker_tool and marker_tool != tool_name)
+        or (box_id and marker_key and marker_key != box_id)
+    ):
+        status["reason"] = "payload-mismatch"
+        return status
+    if payload is not None and check_session and marker_session and current_session and marker_session != current_session:
+        status["session_mismatch"] = True
+        status["reason"] = "session-mismatch"
+        return status
+    status["valid"] = True
+    status["reason"] = "valid"
+    return status
+
+
+def _gc_expired_dryrun_markers(*, skip_path: Path | None = None) -> None:
+    marker_dir = _dryrun_marker_dir()
+    if not marker_dir.is_dir():
+        return
+    ttl_seconds = _dryrun_marker_ttl_seconds()
+    now = time.time()
+    for marker in marker_dir.glob(".skillbox-dryrun-*"):
+        if skip_path is not None and marker == skip_path:
+            continue
+        status = _dryrun_marker_status_from_path(
+            marker,
+            tool_name="",
+            box_id="",
+            ttl_seconds=ttl_seconds,
+            now=now,
+            check_session=False,
+        )
+        if not status.get("expired"):
+            continue
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _stamp_dryrun_marker(tool_name: str, box_id: str) -> None:
+    """Create a temp marker so the PreToolUse hook knows a dry-run was done."""
+    _gc_expired_dryrun_markers()
+    marker = _dryrun_marker_path(tool_name, box_id)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "tool": tool_name,
+        "key": box_id,
+        "session": _dryrun_session_id(),
+        "created_at": _utc_timestamp(),
+        "note": f"dry-run completed for {tool_name} key={box_id}",
+    }
+    marker.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _dryrun_marker_status(tool_name: str, box_id: str) -> dict[str, Any]:
+    marker = _dryrun_marker_path(tool_name, box_id)
+    ttl_seconds = _dryrun_marker_ttl_seconds()
+    status = _dryrun_marker_status_from_path(
+        marker,
+        tool_name=tool_name,
+        box_id=box_id,
+        ttl_seconds=ttl_seconds,
+        now=time.time(),
+        check_session=True,
+    )
+    if status.get("expired"):
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+    _gc_expired_dryrun_markers(skip_path=marker)
     return status
 
 
 def _has_dryrun_marker(tool_name: str, box_id: str) -> bool:
     """Check if a valid, non-expired dry-run marker exists."""
     status = _dryrun_marker_status(tool_name, box_id)
-    cache_key = (tool_name, box_id)
+    cache_key = _dryrun_marker_cache_key(tool_name, box_id)
     if status["valid"]:
         _DRYRUN_MARKER_STATUS_CACHE.pop(cache_key, None)
     else:
         _DRYRUN_MARKER_STATUS_CACHE[cache_key] = status
-    if status["expired"]:
-        # Expired — clean up and report absent.
-        try:
-            Path(str(status["path"])).unlink(missing_ok=True)
-        except OSError:
-            pass
-        return False
     return bool(status["valid"])
 
 
 def _dryrun_marker_rejection_status(tool_name: str, box_id: str) -> dict[str, Any]:
-    return _DRYRUN_MARKER_STATUS_CACHE.pop((tool_name, box_id), None) or _dryrun_marker_status(tool_name, box_id)
+    return _DRYRUN_MARKER_STATUS_CACHE.pop(_dryrun_marker_cache_key(tool_name, box_id), None) or _dryrun_marker_status(tool_name, box_id)
 
 
 def _clear_dryrun_marker(tool_name: str, box_id: str) -> None:
@@ -1145,6 +1665,7 @@ def _clear_dryrun_marker(tool_name: str, box_id: str) -> None:
     try:
         marker = _dryrun_marker_path(tool_name, box_id)
         marker.unlink(missing_ok=True)
+        _DRYRUN_MARKER_STATUS_CACHE.pop(_dryrun_marker_cache_key(tool_name, box_id), None)
     except (OSError, ValueError):
         pass
 
@@ -1175,6 +1696,42 @@ def _missing_required_error(tool_name: str, message: str, next_actions: list[str
     })
 
 
+def _dryrun_marker_rejection_note(marker: dict[str, Any]) -> str:
+    ttl_seconds = marker.get("ttl_seconds")
+    age_seconds = marker.get("age_seconds")
+    reason = str(marker.get("reason") or "absent")
+    if reason == "expired":
+        return f"marker expired; observed marker age is {age_seconds}s; configured marker ttl is {ttl_seconds}s"
+    if reason == "session-mismatch":
+        return (
+            "marker was created by a different session "
+            f"(marker session={marker.get('marker_session')!r}, current session={marker.get('current_session')!r})"
+        )
+    if reason == "absent":
+        return f"no marker exists; configured marker ttl is {ttl_seconds}s"
+    if reason == "payload-mismatch":
+        return "marker payload does not match the requested tool/key"
+    if age_seconds is None:
+        return f"no marker age observed; configured marker ttl is {ttl_seconds}s"
+    return f"marker is not valid ({reason}); observed marker age is {age_seconds}s; configured marker ttl is {ttl_seconds}s"
+
+
+def _dryrun_marker_error_payload(marker: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "exists": bool(marker.get("exists")),
+        "expired": bool(marker.get("expired")),
+        "session_mismatch": bool(marker.get("session_mismatch")),
+        "reason": marker.get("reason") or "absent",
+        "age_seconds": marker.get("age_seconds"),
+        "ttl_seconds": marker.get("ttl_seconds"),
+        "format": marker.get("format"),
+        "marker_session": marker.get("marker_session"),
+        "current_session": marker.get("current_session"),
+        "created_at": marker.get("created_at"),
+        "warning": marker.get("warning"),
+    }
+
+
 def _dry_run_required_error(
     tool_name: str,
     subject: str,
@@ -1183,13 +1740,13 @@ def _dry_run_required_error(
     *,
     marker_status: dict[str, Any] | None = None,
 ) -> dict:
-    marker = marker_status or {"ttl_seconds": _dryrun_marker_ttl_seconds(), "age_seconds": None}
-    ttl_seconds = marker.get("ttl_seconds")
-    age_seconds = marker.get("age_seconds")
-    if age_seconds is None:
-        marker_note = f"no marker age observed; configured marker ttl is {ttl_seconds}s"
-    else:
-        marker_note = f"observed marker age is {age_seconds}s; configured marker ttl is {ttl_seconds}s"
+    marker = marker_status or {
+        "ttl_seconds": _dryrun_marker_ttl_seconds(),
+        "age_seconds": None,
+        "reason": "absent",
+        "current_session": _dryrun_session_id(),
+    }
+    marker_note = _dryrun_marker_rejection_note(marker)
     return _error_content({
         "error": {
             "type": "dry_run_required",
@@ -1199,12 +1756,7 @@ def _dry_run_required_error(
             ),
             "recoverable": True,
             "subject": subject,
-            "marker": {
-                "exists": bool(marker.get("exists")),
-                "expired": bool(marker.get("expired")),
-                "age_seconds": age_seconds,
-                "ttl_seconds": ttl_seconds,
-            },
+            "marker": _dryrun_marker_error_payload(marker),
             "next_actions": [safe_first_call, exact_cli],
         }
     })
@@ -1257,13 +1809,19 @@ def handle_initialize(_params: dict) -> dict:
             "1. Run operator_boxes to see the current fleet. "
             "2. Run operator_profiles to see available box sizes. "
             "3. Use operator_provision with dry_run=true before creating infrastructure and inspect "
-            "credential_status; missing credentials must be added to .env.box by the operator. "
+            "credential_status; missing credentials must be added by the operator to the operator "
+            "secret file (${SKILLBOX_STATE_ROOT}/operator/.env.box, default "
+            "./.skillbox-state/operator/.env.box) — NOT to the repo root, which is readable by "
+            "in-container agents. "
             "4. CONFIRM WITH USER before operator_teardown — it destroys infrastructure. "
-            "5. Use operator_box_exec to run commands on remote boxes. "
+            "5. Use operator_box_exec to run commands on remote boxes. Read-only inspection "
+            "commands run immediately; a MUTATING or unknown command is rejected until you "
+            "preview the IDENTICAL command with dry_run=true (which stamps a per-command marker). "
             "6. Use operator_doctor to validate the local repo state. "
-            "SAFETY: Destructive tools (teardown, compose_down) are gated by a PreToolUse hook. "
-            "The hook BLOCKS execution if: (a) there are uncommitted changes (run /commit first), "
-            "or (b) no dry_run=true was run first. Always dry-run, then confirm with user, then execute."
+            "SAFETY: Destructive tools (teardown, compose_down) AND mutating operator_box_exec "
+            "commands are gated server-side and by a PreToolUse hook. The gate BLOCKS execution if: "
+            "(a) there are uncommitted changes (run /commit first), or (b) no matching dry_run=true "
+            "was run first. Always dry-run, then confirm with user, then execute."
         ),
     }
 
@@ -1298,8 +1856,8 @@ def send_error(msg_id: Any, code: int, message: str) -> None:
 
 
 def main() -> None:
-    load_dotenv(ENV_FILE)
-    load_dotenv(ENV_BOX_FILE)
+    load_operator_secret(".env")
+    load_operator_secret(".env.box")
     print(f"[operator-mcp] starting — repo: {REPO_ROOT}", file=sys.stderr, flush=True)
 
     for raw in sys.stdin:

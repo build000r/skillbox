@@ -9,28 +9,18 @@ current visibility snapshot).
 
 from __future__ import annotations
 
-import fnmatch
-import glob
 import hashlib
 import os
 import shutil
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 try:
     import yaml
 except ModuleNotFoundError:
     yaml = None
 
-from .shared import (
-    GLOBAL_HOME_ROOT_ENV,
-    GLOBAL_HOME_SURFACES,
-    atomic_write_text,
-    directory_tree_sha256,
-    load_json_file,
-    load_yaml,
-    load_skill_repos_config,
-)
+from .errors import PRUNE_SKIPPED_PINNED
 
 from ._skill_common import *
 from .policy_eval import *
@@ -177,11 +167,11 @@ def activate_overlay_scoped_skills(
 ) -> list[dict[str, Any]]:
     """Policy-evaluate one overlay for THIS invocation, scoped to ``cwd``.
 
-    This is equivalent to ``SKILLBOX_OVERLAYS=<overlay_name> skill sync``
+    This is equivalent to ``SKILLBOX_CLI_OVERLAYS=<overlay_name> skill sync``
     narrowed to ``cwd`` — it runs the SAME policy evaluation as ``skill sync``
     rather than blindly linking every literal overlay-tagged skill. The named
     overlay is treated as active only for the duration of this call (the
-    ``SKILLBOX_OVERLAYS`` env var that ``active_overlays`` reads is patched and
+    ``SKILLBOX_CLI_OVERLAYS`` env var that ``active_overlays`` reads is patched and
     restored), so NO overlay state is persisted.
 
     The sync plan it builds is the contract: ``--dry-run`` previews exactly the
@@ -193,11 +183,11 @@ def activate_overlay_scoped_skills(
     if not target:
         return []
 
-    previous = os.environ.get(OVERLAY_ENV_VAR)
+    previous = os.environ.get(OVERLAY_CLI_ENV_VAR)
     forced = [item for item in (previous or "").split(",") if item.strip()]
     if target not in forced:
         forced.append(target)
-    os.environ[OVERLAY_ENV_VAR] = ",".join(forced)
+    os.environ[OVERLAY_CLI_ENV_VAR] = ",".join(forced)
     try:
         plan = skill_lifecycle_plan(
             model,
@@ -217,9 +207,9 @@ def activate_overlay_scoped_skills(
         )
     finally:
         if previous is None:
-            os.environ.pop(OVERLAY_ENV_VAR, None)
+            os.environ.pop(OVERLAY_CLI_ENV_VAR, None)
         else:
-            os.environ[OVERLAY_ENV_VAR] = previous
+            os.environ[OVERLAY_CLI_ENV_VAR] = previous
 
     return _activations_from_sync_plan(plan)
 
@@ -248,7 +238,7 @@ def _skill_destination_bases(
     if requested == "category":
         category_ids = categories
         if not category_ids:
-            rule = _matching_scope_rule(skill_name, _scope_rules(model), cwd=cwd)
+            rule = _matching_scope_rule(skill_name, _scope_rules(model, cwd=cwd), cwd=cwd)
             category_ids = list(rule.get("categories") or []) if rule else []
         if not category_ids:
             warnings.append("No project category was supplied or inferred; falling back to the current repo.")
@@ -268,13 +258,10 @@ def _skill_destination_bases(
                 })
         return requested, bases, warnings
 
-    rule = _matching_scope_rule(skill_name, _scope_rules(model), cwd=cwd)
+    rule = _matching_scope_rule(skill_name, _scope_rules(model, cwd=cwd), cwd=cwd)
     matched_paths: list[str] = []
     if rule:
-        matched_paths = [
-            path for path in rule.get("paths") or []
-            if _path_prefix_matches(cwd, path)
-        ]
+        matched_paths = _scope_rule_matched_paths(rule, cwd)
     if matched_paths:
         repo_root = _repo_root_for_skill_install(cwd)
         if _path_is_under(str(repo_root), matched_paths):
@@ -419,6 +406,65 @@ def _unlink_skill_action(occurrence: dict[str, Any], *, reason: str) -> dict[str
     }
 
 
+def _prune_decision_by_skill(visibility: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    decisions: dict[str, dict[str, Any]] = {}
+    for item in visibility.get("visibility_decisions") or []:
+        name = str(item.get("name") or "")
+        if name:
+            decisions[name] = item
+    return decisions
+
+
+def _prune_decision_protects(decision: dict[str, Any] | None) -> bool:
+    if not decision:
+        return False
+    return (
+        decision.get("availability") == "override"
+        and decision.get("override_action") == "pin_on"
+        and decision.get("state") == "pinned"
+    )
+
+
+def _prune_decision_disables(decision: dict[str, Any]) -> bool:
+    return (
+        decision.get("availability") == "override"
+        and decision.get("state") == "disabled"
+        and decision.get("override_action") in {"pin_off", "opt_out_global"}
+    )
+
+
+def _prune_skip_row(
+    occurrence: dict[str, Any],
+    decision: dict[str, Any],
+    *,
+    issue_key: str,
+) -> dict[str, Any]:
+    name = str(occurrence.get("name") or decision.get("name") or "")
+    return {
+        "name": name,
+        "skill": name,
+        "reason": "pinned",
+        "code": PRUNE_SKIPPED_PINNED,
+        "issue": issue_key,
+        "destination": occurrence.get("path"),
+        "layer": occurrence.get("layer"),
+        "winning_layer": decision.get("winning_layer") or decision.get("layer"),
+        "override_action": decision.get("override_action"),
+    }
+
+
+def _override_disabled_scope_matches(
+    decision: dict[str, Any],
+    occurrence: dict[str, Any],
+    from_scope: str,
+) -> bool:
+    if not _scope_filter_matches(occurrence, from_scope):
+        return False
+    if decision.get("override_action") == "opt_out_global":
+        return str(occurrence.get("layer") or "").startswith("global:")
+    return True
+
+
 def _dedupe_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     deduped: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -487,9 +533,9 @@ def _skill_blocked_reason(
     if resolved_to == "global" and not _global_install_allowed(model, skill_name) and not force:
         return "global install is not allowed by skill-scope policy"
     if resolved_to == "project" and not force:
-        rule = _matching_scope_rule(skill_name, _scope_rules(model), cwd=cwd)
+        rule = _matching_scope_rule(skill_name, _scope_rules(model, cwd=cwd), cwd=cwd)
         allowed_paths = list(rule.get("paths") or []) if rule else []
-        if allowed_paths and not any(_path_prefix_matches(cwd, path) for path in allowed_paths):
+        if allowed_paths and rule and not _scope_rule_matched_paths(rule, cwd):
             return "project install is outside allowed skill-scope paths"
     return ""
 
@@ -591,8 +637,20 @@ def _plan_skill_prune_actions(
     skill_name: str | None,
     *,
     from_scope: str = "all",
+    skipped: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     actions: list[dict[str, Any]] = []
+    seen_destinations: set[str] = set()
+    seen_skips: set[tuple[str, str]] = set()
+    decisions = _prune_decision_by_skill(visibility)
+
+    def _append_unlink(item: dict[str, Any], reason: str) -> None:
+        path = str(item.get("path") or "")
+        if not path or path in seen_destinations:
+            return
+        seen_destinations.add(path)
+        actions.append(_unlink_skill_action(item, reason=reason))
+
     issue_keys = ("scope_violations", "global_not_allowed", "extra_global", "broken_global", "broken_project")
     for issue_key in issue_keys:
         for item in (visibility.get("issues") or {}).get(issue_key) or []:
@@ -600,8 +658,33 @@ def _plan_skill_prune_actions(
                 continue
             if not _scope_filter_matches(item, from_scope):
                 continue
-            if item.get("path"):
-                actions.append(_unlink_skill_action(item, reason=issue_key))
+            decision = decisions.get(str(item.get("name") or ""))
+            if _prune_decision_protects(decision):
+                if skipped is not None:
+                    skip_key = (
+                        str(item.get("name") or ""),
+                        str(item.get("path") or ""),
+                    )
+                    if skip_key not in seen_skips:
+                        seen_skips.add(skip_key)
+                        skipped.append(_prune_skip_row(item, decision or {}, issue_key=issue_key))
+                continue
+            _append_unlink(item, issue_key)
+
+    for decision in decisions.values():
+        name = str(decision.get("name") or "")
+        if skill_name and name != skill_name:
+            continue
+        if not _prune_decision_disables(decision):
+            continue
+        for occurrence in visibility.get("occurrences") or []:
+            if occurrence.get("availability") != "installed":
+                continue
+            if str(occurrence.get("name") or "") != name:
+                continue
+            if not _override_disabled_scope_matches(decision, occurrence, from_scope):
+                continue
+            _append_unlink(occurrence, str(decision.get("override_action") or "override_disabled"))
     return actions
 
 
@@ -678,6 +761,7 @@ def _lifecycle_needs_visibility(action: str, prune: bool) -> bool:
 
 def _append_lifecycle_prune_actions(
     actions: list[dict[str, Any]],
+    skipped: list[dict[str, Any]],
     visibility: dict[str, Any],
     *,
     action: str,
@@ -686,7 +770,14 @@ def _append_lifecycle_prune_actions(
     prune: bool,
 ) -> None:
     if action == "prune" or (action == "sync" and prune):
-        actions.extend(_plan_skill_prune_actions(visibility, skill_name, from_scope=from_scope))
+        actions.extend(
+            _plan_skill_prune_actions(
+                visibility,
+                skill_name,
+                from_scope=from_scope,
+                skipped=skipped,
+            )
+        )
 
 
 def _append_lifecycle_sync_actions(
@@ -733,12 +824,17 @@ def _lifecycle_activation_packet_if_needed(
     return None, None
 
 
-def _lifecycle_plan_summary(actions: list[dict[str, Any]]) -> dict[str, int]:
+def _lifecycle_plan_summary(
+    actions: list[dict[str, Any]],
+    *,
+    skipped: list[dict[str, Any]] | None = None,
+) -> dict[str, int]:
     return {
         "actions": len(actions),
         "link": sum(1 for item in actions if item.get("op") == "link"),
         "unlink": sum(1 for item in actions if item.get("op") == "unlink"),
         "blocked": sum(1 for item in actions if item.get("blocked_reason")),
+        "skipped": len(skipped or []),
     }
 
 
@@ -768,6 +864,7 @@ def skill_lifecycle_plan(
         force,
     )
     actions.extend(_plan_skill_removals(model, action, skill_name, cwd_path, from_scope, actions))
+    skipped: list[dict[str, Any]] = []
 
     needs_prune_visibility = action == "prune" or (action == "sync" and prune)
     needs_sync_visibility = action == "sync"
@@ -779,6 +876,7 @@ def skill_lifecycle_plan(
     )
     _append_lifecycle_prune_actions(
         actions,
+        skipped,
         visibility,
         action=action,
         skill_name=skill_name,
@@ -822,7 +920,8 @@ def skill_lifecycle_plan(
         "activation_packet": activation_packet,
         "warnings": warnings,
         "actions": actions,
-        "summary": _lifecycle_plan_summary(actions),
+        "skipped": skipped,
+        "summary": _lifecycle_plan_summary(actions, skipped=skipped),
     }
 
 
@@ -887,6 +986,10 @@ def _apply_lifecycle_unlink(
     dry_run: bool,
     allow_directories: bool,
 ) -> None:
+    if action.get("pinned"):
+        action["status"] = "skipped_pinned"
+        action["code"] = PRUNE_SKIPPED_PINNED
+        return
     if dry_run:
         action["status"] = "would_unlink" if os.path.lexists(destination) else "missing"
         return
@@ -934,6 +1037,7 @@ def _apply_lifecycle_action(
 
 def _summarize_applied_lifecycle_plan(plan: dict[str, Any], dry_run: bool) -> None:
     actions = plan.get("actions") or []
+    planned_skipped = len(plan.get("skipped") or [])
 
     plan["dry_run"] = dry_run
     plan["summary"]["applied"] = 0 if dry_run else sum(
@@ -947,7 +1051,7 @@ def _summarize_applied_lifecycle_plan(plan: dict[str, Any], dry_run: bool) -> No
     plan["summary"]["skipped"] = sum(
         1 for item in actions
         if str(item.get("status") or "").startswith(("skipped", "conflict", "blocked"))
-    )
+    ) + planned_skipped
 
 
 def apply_skill_lifecycle_plan(
@@ -978,17 +1082,23 @@ def print_skill_lifecycle_text(payload: dict[str, Any]) -> None:
         print(f"source: {payload['selected_source'].get('source')}")
     for warning in payload.get("warnings") or []:
         print(f"warning: {warning}")
+    for item in payload.get("skipped") or []:
+        print(
+            "skipped: "
+            f"{item.get('name') or item.get('skill')} "
+            f"({item.get('reason')})"
+        )
+    packet = payload.get("activation_packet")
     if not payload.get("actions"):
         print("actions: none")
-        return
-    print("actions:")
-    for action in payload.get("actions") or []:
-        op = action.get("op")
-        status = action.get("status") or "planned"
-        dest = action.get("destination")
-        skill = action.get("skill")
-        print(f"  - {status}: {op} {skill} -> {dest}")
-    packet = payload.get("activation_packet")
+    else:
+        print("actions:")
+        for action in payload.get("actions") or []:
+            op = action.get("op")
+            status = action.get("status") or "planned"
+            dest = action.get("destination")
+            skill = action.get("skill")
+            print(f"  - {status}: {op} {skill} -> {dest}")
     if packet:
         print("activation packet:")
         print(f"name: {packet.get('name')}")

@@ -10,7 +10,7 @@ overlay that never matched and failed closed. This slice adds:
 * ``skill_visibility`` helpers that read the registry and flag overlay-state
   entries naming an UNDECLARED overlay as an AUDIT WARNING (they filter nothing).
 
-This suite covers the lint (green on the live policy, red on a ghost tag, the
+This suite covers the lint (green on a public fixture, red on a ghost tag, the
 empty/unused/parse edges) and the visibility-layer helpers + audit warning.
 
 TESTS ONLY -- never imports or edits runtime code beyond the public API.
@@ -36,17 +36,6 @@ from runtime_manager.validation import (  # noqa: E402
 from runtime_manager import skill_visibility as sv  # noqa: E402
 
 
-def _real_skill_scope_path() -> Path:
-    candidates = [
-        ROOT_DIR.parent / "skillbox-config" / "skill-scope.yaml",
-        ROOT_DIR.parent.parent / "skillbox-config" / "skill-scope.yaml",
-    ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    return candidates[0]
-
-
 def _policy(overlays, rules) -> dict:
     return {"overlays": overlays, "rules": rules}
 
@@ -55,20 +44,38 @@ class OverlayDeclarationLintTests(unittest.TestCase):
     def _statuses(self, results) -> list[str]:
         return [r.status for r in results]
 
-    def test_lint_green_on_real_skill_scope_yaml(self) -> None:
-        """The live policy must already declare every overlay tag its rules use."""
-        path = _real_skill_scope_path()
-        self.assertTrue(path.is_file(), f"expected skill-scope.yaml at {path}")
-        results = validate_overlay_declarations_file(path)
+    def test_lint_green_on_public_overlay_fixture(self) -> None:
+        """The public fixture declares every overlay tag its rules use."""
+        policy = _policy(
+            overlays=[
+                {"name": "marketing", "default": "off"},
+                {"name": "swarm", "default": "off"},
+                {"name": "research", "default": "off"},
+                {"name": "hardening", "default": "off"},
+                {"name": "operator-maintenance", "default": "off"},
+            ],
+            rules=[
+                {"id": "marketing-overlay", "overlay": "marketing", "skills": ["seo"]},
+                {"id": "swarm-overlay", "overlay": "swarm", "skills": ["ntm"]},
+                {"id": "research-overlay", "overlay": "research", "skills": ["cass"]},
+                {"id": "hardening-overlay", "overlay": "hardening", "skills": ["profiling"]},
+                {
+                    "id": "operator-maintenance-overlay",
+                    "overlay": "operator-maintenance",
+                    "skills": ["cleanup"],
+                },
+            ],
+        )
+        results = validate_overlay_declarations(policy)
         self.assertEqual(len(results), 1, results)
         self.assertEqual(results[0].code, OVERLAY_DECLARATION_CODE)
         self.assertEqual(
             results[0].status,
             "pass",
-            f"live skill-scope.yaml has an undeclared overlay tag: "
+            f"public overlay fixture has an undeclared overlay tag: "
             f"{results[0].message} :: {results[0].details}",
         )
-        # The live registry declares marketing plus the four mode packs
+        # The public registry declares marketing plus the four mode packs
         # (repos-sbp-policy-estate-oh1.2), and every declared overlay is used by
         # a rule (no declared-but-unused entries).
         self.assertEqual(

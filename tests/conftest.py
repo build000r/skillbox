@@ -12,7 +12,7 @@ Usage::
 
 ``fixture_fleet`` builds a miniature skill estate (two machine profiles +
 ``machines.yaml``, OS + managed homes with both symlink-home variants, mini
-``skills/`` + ``skills-private/`` source roots with a ``requires_beads`` skill,
+``skills/`` + ``private-skills/`` source roots with a ``requires_beads`` skill,
 the ``_shared`` chain, a ``skill-scope.yaml`` + ``registry/repos.yaml``, and 4
 fake repos showing healthy / other-machine / dangling / overlay-gated links).
 Its three helpers -- ``run_resolution(cwd)``, ``run_audit()``,

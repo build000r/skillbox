@@ -2,20 +2,20 @@
 
 The global skill contract has a strict precedence: an always-global skill -- one
 granted by an ``allow_global: true`` rule (the dispatcher core +
-``operator-global-exceptions``, e.g. ``divide-and-conquer``) or listed in
-``global_allowlist`` -- is linked into every repo unconditionally. Flipping a
-mode-pack overlay can neither add nor remove it. **Global wins**, so an overlay
-rule may only meaningfully add NON-global skills.
+``operator-global-exceptions``, e.g. ``divide-and-conquer``) -- is linked into
+every repo unconditionally. ``global_allowlist`` is only a derived snapshot.
+Flipping a mode-pack overlay can neither add nor remove a global skill.
+**Global wins**, so an overlay rule may only meaningfully add NON-global skills.
 
 ``validate_global_overlay_precedence`` makes a double-declaration (a skill that
 is both always-global AND overlay-gated) a hard, named FAIL. These tests:
 
-* prove the lint is GREEN against the current real ``skill-scope.yaml`` (the
+* prove the lint is GREEN against a committed public fixture (the
   four mode packs were deliberately authored to exclude always-global
   ``divide-and-conquer`` from the swarm pack),
 * prove the lint is GREEN on an in-memory disjoint policy,
 * prove the lint is RED when a skill is BOTH always-global and overlay-gated,
-  via an ``allow_global`` rule and via ``global_allowlist``,
+  via an ``allow_global`` rule,
 * prove the failure names the offending skill, the gating overlay rule, and the
   fix, and
 * cover the empty/parse/missing-file edges.
@@ -42,17 +42,6 @@ from runtime_manager.validation import (  # noqa: E402
     validate_global_overlay_precedence,
     validate_global_overlay_precedence_file,
 )
-
-
-def _real_skill_scope_path() -> Path:
-    candidates = [
-        ROOT_DIR.parent / "skillbox-config" / "skill-scope.yaml",
-        ROOT_DIR.parent.parent / "skillbox-config" / "skill-scope.yaml",
-    ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    return candidates[0]
 
 
 def _disjoint_policy() -> dict:
@@ -86,21 +75,19 @@ class GlobalOverlayPrecedenceLintTests(unittest.TestCase):
     def _statuses(self, results) -> list[str]:
         return [r.status for r in results]
 
-    def test_lint_green_on_real_skill_scope_yaml(self) -> None:
-        """The live policy keeps always-global and overlay-gated skills disjoint.
+    def test_lint_green_on_public_policy_fixture(self) -> None:
+        """The public policy fixture keeps always-global and overlay-gated skills disjoint.
 
         Concretely: divide-and-conquer is always-global and must NOT appear in
         the swarm overlay (the precedence the four mode packs were authored to
         respect)."""
-        path = _real_skill_scope_path()
-        self.assertTrue(path.is_file(), f"expected skill-scope.yaml at {path}")
-        results = validate_global_overlay_precedence_file(path)
+        results = validate_global_overlay_precedence(_disjoint_policy())
         self.assertEqual(len(results), 1, results)
         self.assertEqual(results[0].code, GLOBAL_OVERLAY_PRECEDENCE_CODE)
         self.assertEqual(
             results[0].status,
             "pass",
-            f"live skill-scope.yaml has a global/overlay precedence conflict: "
+            f"public policy fixture has a global/overlay precedence conflict: "
             f"{results[0].message} :: {results[0].details}",
         )
         # Sanity: divide-and-conquer is always-global, and is NOT overlay-gated.
@@ -137,8 +124,8 @@ class GlobalOverlayPrecedenceLintTests(unittest.TestCase):
             ["swarm-overlay (overlay: swarm)"],
         )
 
-    def test_lint_red_when_global_skill_is_allowlisted_and_overlay_gated(self) -> None:
-        """global_allowlist membership also counts as always-global for precedence."""
+    def test_snapshot_only_skill_is_not_always_global_for_precedence(self) -> None:
+        """global_allowlist is a snapshot, not an always-global grant."""
         policy = {
             "global_allowlist": ["lonely-global"],
             "overlays": [{"name": "swarm"}],
@@ -151,10 +138,10 @@ class GlobalOverlayPrecedenceLintTests(unittest.TestCase):
             ],
         }
         results = validate_global_overlay_precedence(policy)
-        self.assertEqual(self._statuses(results), ["fail"], results)
-        self.assertEqual(results[0].details["conflicts"], ["lonely-global"])
-        # The disjoint swarm skill ntm is NOT flagged.
-        self.assertNotIn("ntm", results[0].details["conflicts"])
+        self.assertEqual(self._statuses(results), ["pass"], results)
+        self.assertNotIn("lonely-global", results[0].details["always_global"])
+        # The global-skill-contract lint owns the stale snapshot failure.
+        self.assertIn("ntm", results[0].details["overlay_gated"])
 
     def test_failure_groups_multiple_overlay_rules_under_one_skill(self) -> None:
         policy = {

@@ -21,6 +21,26 @@ if str(ENV_MANAGER_DIR) not in sys.path:
 
 from runtime_manager import cli as CLI  # noqa: E402
 from runtime_manager.command_registry import default_registry  # noqa: E402
+from runtime_manager.errors import PRUNE_SKIPPED_PINNED  # noqa: E402
+
+
+def _assert_elapsed_meta(testcase: unittest.TestCase, payload: dict[str, object]) -> None:
+    meta = payload.get("meta")
+    testcase.assertIsInstance(meta, dict)
+    elapsed = meta.get("elapsed_ms") if isinstance(meta, dict) else None
+    testcase.assertIsInstance(elapsed, (int, float))
+    testcase.assertNotIsInstance(elapsed, bool)
+    testcase.assertGreaterEqual(float(elapsed), 0.0)
+
+
+def _assert_error_envelope(testcase: unittest.TestCase, payload: dict[str, object], code: str) -> None:
+    testcase.assertIs(payload["ok"], False)
+    error = payload.get("error")
+    testcase.assertIsInstance(error, dict)
+    testcase.assertEqual(error["code"], code)
+    testcase.assertEqual(error["type"], code)
+    testcase.assertEqual(payload["error_code"], code)
+    testcase.assertIn("deprecation", payload)
 
 
 def _ns(**kwargs: object) -> argparse.Namespace:
@@ -72,12 +92,13 @@ class CliUnitTests(unittest.TestCase):
         self.assertIn("focus requires a client_id or --resume", payload["error"]["message"])
 
     def test_capabilities_json_contract_is_agent_readable(self) -> None:
-        result = _run_manage("capabilities", "--json")
+        result = _run_manage("capabilities", "--json", "--no-adapters")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["tool"], "skillbox-manage")
         self.assertEqual(payload["contract_version"], "2026-05-09")
+        _assert_elapsed_meta(self, payload)
         self.assertIn("capabilities", payload["agent_surfaces"])
         self.assertTrue(any(command["name"] == "next" for command in payload["commands"]))
         self.assertTrue(any(command["name"] == "graph" for command in payload["commands"]))
@@ -120,6 +141,8 @@ class CliUnitTests(unittest.TestCase):
         self.assertIn("sbh-report --format json", sbh_report["safe_first_try"])
         next_command = next(command for command in payload["commands"] if command["name"] == "next")
         self.assertIn("--no-adapters", next_command["safe_first_try"])
+        search_command = next(command for command in payload["commands"] if command["name"] == "search")
+        self.assertEqual(search_command["safe_first_try"], "manage.py search graph --format json --no-adapters")
 
     def test_capabilities_compact_registry_is_parser_backed(self) -> None:
         result = _run_manage("capabilities", "--compact", "--json")
@@ -148,8 +171,8 @@ class CliUnitTests(unittest.TestCase):
         self.assertIn("rch-report --format json", result.stdout)
         self.assertIn("rch-stage --dry-run", result.stdout)
         self.assertIn("sbh-report --format json", result.stdout)
-        self.assertIn("portfolio-devbox", result.stdout)
-        self.assertIn("sweet-potato-prod", result.stdout)
+        self.assertIn("worker-devbox", result.stdout)
+        self.assertIn("primary-prod", result.stdout)
         self.assertIn("Protected paths", result.stdout)
         self.assertIn("swimmers-launch <dirs...>", result.stdout)
         self.assertIn("next --format json", result.stdout)
@@ -175,6 +198,104 @@ class CliUnitTests(unittest.TestCase):
         self.assertEqual(payloads[2]["kind"], "command")
         self.assertTrue(payloads[3]["hits"])
         self.assertEqual(payloads[4]["snapshot_id"], "golden-fixture")
+        for payload in payloads[:4]:
+            _assert_elapsed_meta(self, payload)
+
+    def test_explain_bare_brain_command_alias_resolves_to_command_node(self) -> None:
+        result = _run_manage("explain", "next", "--format", "json", "--no-adapters")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["target"], "command:brain.next")
+        self.assertEqual(payload["kind"], "command")
+
+    def test_snap_without_action_returns_structured_usage_payload(self) -> None:
+        result = _run_manage("snap", "--format", "json")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertNotIn("error", payload)
+        self.assertTrue(payload["read_only_default"])
+        self.assertEqual([item["name"] for item in payload["subcommands"]], ["create", "diff", "replay"])
+        self.assertEqual(payload["actions"], payload["subcommands"])
+        self.assertEqual(payload["subcommands"][0]["writes_only_with"], "--write")
+        self.assertIn(
+            "snap --format json replay tests/goldens/agent_ops_snapshot.json",
+            payload["next_actions"][0],
+        )
+
+    def test_snap_without_action_text_mode_keeps_nonzero_usage_error(self) -> None:
+        result = _run_manage("snap", "--format", "text")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("snap requires an action", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_snap_flag_first_replay_json(self) -> None:
+        result = _run_manage(
+            "snap",
+            "--format",
+            "json",
+            "replay",
+            "tests/goldens/agent_ops_snapshot.json",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["snapshot_id"], "golden-fixture")
+
+    def test_snap_file_failures_use_brain_error_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing_path = str(Path(tmpdir) / "missing-snapshot.json")
+            missing = _run_manage("snap", "replay", missing_path, "--format", "json")
+
+        self.assertEqual(missing.returncode, 1)
+        missing_payload = json.loads(missing.stdout)
+        _assert_error_envelope(self, missing_payload, "SNAPSHOT_NOT_FOUND")
+        self.assertEqual(missing_payload["error"]["context"]["path"], missing_path)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bad_json = Path(tmpdir) / "bad.json"
+            bad_json.write_text("{bad json", encoding="utf-8")
+            bad_schema = Path(tmpdir) / "bad-schema.json"
+            bad_schema.write_text("{}", encoding="utf-8")
+
+            malformed = _run_manage("snap", "replay", str(bad_json), "--format", "json")
+            schema = _run_manage("snap", "replay", str(bad_schema), "--format", "json")
+
+        self.assertEqual(malformed.returncode, 1)
+        malformed_payload = json.loads(malformed.stdout)
+        _assert_error_envelope(self, malformed_payload, "SNAPSHOT_SCHEMA_MISMATCH")
+        self.assertIn("reason", malformed_payload["error"]["context"])
+
+        self.assertEqual(schema.returncode, 1)
+        schema_payload = json.loads(schema.stdout)
+        _assert_error_envelope(self, schema_payload, "SNAPSHOT_SCHEMA_MISMATCH")
+        self.assertFalse(schema_payload["error"]["context"]["has_snapshot_id"])
+
+    def test_snap_diff_missing_args_use_brain_error_envelope(self) -> None:
+        result = _run_manage("snap", "diff", "--format", "json")
+
+        self.assertEqual(result.returncode, 1)
+        payload = json.loads(result.stdout)
+        _assert_error_envelope(self, payload, "INVALID_ARGUMENT")
+        self.assertEqual(payload["error"]["context"]["action"], "diff")
+
+    def test_graph_invalid_algorithm_returns_structured_json_error(self) -> None:
+        result = _run_manage("graph", "--algorithm", "pagerank", "--format", "json", "--no-adapters")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "")
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["code"], "INVALID_ARGUMENT")
+        _assert_error_envelope(self, payload, "INVALID_ARGUMENT")
+        self.assertIn("allowed", payload["error"]["details"])
+        self.assertIn("allowed", payload["error"]["context"])
+        self.assertTrue(all(action.startswith("python3 .env-manager/manage.py ") for action in payload["next_actions"]))
 
     def test_agent_ops_brain_text_renderers_cover_success_and_errors(self) -> None:
         stdout = StringIO()
@@ -409,6 +530,8 @@ class CliUnitTests(unittest.TestCase):
         self.assertEqual(mcp_server._DISPATCH["skillbox_next"], ("next", None))  # noqa: SLF001
         self.assertEqual(mcp_server._DISPATCH["skillbox_snap"], ("snap", "action"))  # noqa: SLF001
 
+        explain_args = mcp_server.build_args("explain", {"target": "brain.next", "no_adapters": True})
+        self.assertEqual(explain_args, ["explain", "--format", "json", "brain.next", "--no-adapters"])
         search_args = mcp_server.build_args("search", {"query": "graph", "no_adapters": True})
         self.assertEqual(search_args, ["search", "--format", "json", "graph", "--no-adapters"])
         snap_args = mcp_server.build_args(
@@ -420,6 +543,21 @@ class CliUnitTests(unittest.TestCase):
             snap_args,
             ["snap", "replay", "--format", "json", "tests/goldens/agent_ops_snapshot.json"],
         )
+        bare_snap_args = mcp_server.build_args("snap", {})
+        self.assertEqual(bare_snap_args, ["snap", "--format", "json"])
+
+    def test_skillbox_snap_without_action_returns_usage_payload(self) -> None:
+        mcp_server = _load_mcp_server_module()
+
+        cli_usage = json.loads(_run_manage("snap", "--format", "json").stdout)
+        mcp_usage = mcp_server.dispatch_tool("skillbox_snap", {})
+        mcp_usage_payload = json.loads(mcp_usage["content"][0]["text"])
+
+        self.assertNotIn("isError", mcp_usage)
+        self.assertEqual(mcp_usage_payload["_exit_code"], 0)
+        self.assertEqual(mcp_usage_payload["ok"], cli_usage["ok"])
+        self.assertEqual(mcp_usage_payload["read_only_default"], cli_usage["read_only_default"])
+        self.assertEqual(mcp_usage_payload["subcommands"], cli_usage["subcommands"])
 
     def test_agent_ops_brain_mcp_dispatch_matches_cli_representatives(self) -> None:
         mcp_server = _load_mcp_server_module()
@@ -451,6 +589,34 @@ class CliUnitTests(unittest.TestCase):
         self.assertEqual(mcp_search_payload["_exit_code"], 0)
         self.assertEqual(mcp_search_payload["hits"][0]["id"], cli_search["hits"][0]["id"])
         self.assertEqual(mcp_search_payload["hits"][0]["score"], cli_search["hits"][0]["score"])
+
+        cli_explain = json.loads(
+            _run_manage("explain", "service:missing", "--format", "json", "--no-adapters").stdout
+        )
+        mcp_explain = mcp_server.dispatch_tool(
+            "skillbox_explain",
+            {"target": "service:missing", "no_adapters": True},
+        )
+        mcp_explain_payload = json.loads(mcp_explain["content"][0]["text"])
+
+        self.assertIn("isError", mcp_explain)
+        self.assertEqual(mcp_explain_payload["_exit_code"], 1)
+        _assert_error_envelope(self, cli_explain, "UNKNOWN_NODE")
+        _assert_error_envelope(self, mcp_explain_payload, "UNKNOWN_NODE")
+        self.assertEqual(mcp_explain_payload["error"]["code"], cli_explain["error"]["code"])
+        self.assertEqual(mcp_explain_payload["error"]["context"], cli_explain["error"]["context"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing_path = str(Path(tmpdir) / "missing-snapshot.json")
+            mcp_snap_missing = mcp_server.dispatch_tool(
+                "skillbox_snap",
+                {"action": "replay", "path": missing_path},
+            )
+        mcp_snap_missing_payload = json.loads(mcp_snap_missing["content"][0]["text"])
+
+        self.assertIn("isError", mcp_snap_missing)
+        self.assertEqual(mcp_snap_missing_payload["_exit_code"], 1)
+        _assert_error_envelope(self, mcp_snap_missing_payload, "SNAPSHOT_NOT_FOUND")
 
     def test_swimmers_launch_cli_dry_run_resolves_against_invoke_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1425,11 +1591,101 @@ except RuntimeError as exc:
         ):
             self.assertEqual(run_main(["--root-dir", tmpdir, "status", "--format", "json"]), CLI.EXIT_ERROR)
         self.assertEqual(emitted[-1]["error"]["message"], "broken")
+        # Carrier change: even a bare RuntimeError raiser now gets the new
+        # envelope keys (ok/error.code/error_code/deprecation) alongside legacy.
+        self.assertIs(emitted[-1]["ok"], False)
+        self.assertEqual(emitted[-1]["error"]["code"], "runtime_error")
+        self.assertEqual(emitted[-1]["error_code"], "runtime_error")
+        self.assertIn("deprecation", emitted[-1])
+
+    def _run_dispatch_with_handler(self, handler, *, argv, emitted):
+        def run_main(args: list[str]) -> int:
+            with mock.patch.object(sys, "argv", ["manage.py", *args]):
+                return CLI.main()
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch.dict(CLI._MODEL_DISPATCH, {"doctor": handler}),
+            mock.patch.object(CLI, "build_runtime_model", return_value={}),
+            mock.patch.object(CLI, "normalize_active_profiles", return_value=[]),
+            mock.patch.object(CLI, "normalize_active_clients", return_value=[]),
+            mock.patch.object(CLI, "filter_model", return_value={}),
+            mock.patch.object(CLI, "_check_logs_deferred_surfaces", return_value=None),
+            mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
+        ):
+            return run_main(["--root-dir", tmpdir, *argv])
+
+    def test_typed_error_envelope_has_new_and_legacy_keys_coexisting(self) -> None:
+        # ACCEPTANCE (1)+(2): a typed raise on a doctor/sync/up/down path emits
+        # the envelope in JSON mode, and legacy keys (error, error_code,
+        # error.type, error.recoverable) COEXIST with the deprecation marker.
+        from runtime_manager.errors import ValidationError
+
+        def typed_handler(args, root_dir, model, mode):
+            raise ValidationError(
+                "unknown_client",
+                "Unknown runtime client(s): ghost.",
+                context={"unknown": ["ghost"]},
+            )
+
+        emitted: list[dict[str, object]] = []
+        exit_code = self._run_dispatch_with_handler(
+            typed_handler, argv=["doctor", "--format", "json"], emitted=emitted
+        )
+        self.assertEqual(exit_code, CLI.EXIT_ERROR)
+        payload = emitted[-1]
+        # New canonical keys.
+        self.assertIs(payload["ok"], False)
+        self.assertEqual(payload["error"]["code"], "unknown_client")
+        self.assertEqual(payload["error"]["context"], {"unknown": ["ghost"]})
+        # Legacy mirrors COEXIST.
+        self.assertEqual(payload["error"]["type"], "unknown_client")
+        self.assertTrue(payload["error"]["recoverable"])
+        self.assertEqual(payload["error_code"], "unknown_client")
+        # Deprecation marker present.
+        self.assertEqual(payload["deprecation"]["use_instead"][0], "error.code")
+        # The known message pattern still enriched recovery_hint/next_actions.
+        self.assertIn("recovery_hint", payload["error"])
+        self.assertIn("next_actions", payload)
+
+    def test_unexpected_exception_emits_internal_envelope_without_traceback(self) -> None:
+        # ACCEPTANCE (3): unknown exceptions -> generic INTERNAL envelope; the
+        # traceback is NOT leaked unless --verbose is set.
+        def boom_handler(args, root_dir, model, mode):
+            raise ValueError("kaboom")
+
+        emitted: list[dict[str, object]] = []
+        exit_code = self._run_dispatch_with_handler(
+            boom_handler, argv=["doctor", "--format", "json"], emitted=emitted
+        )
+        self.assertEqual(exit_code, CLI.EXIT_ERROR)
+        payload = emitted[-1]
+        self.assertIs(payload["ok"], False)
+        self.assertEqual(payload["error"]["code"], "INTERNAL")
+        self.assertEqual(payload["error_code"], "INTERNAL")
+        self.assertFalse(payload["error"]["recoverable"])
+        self.assertIn("kaboom", payload["error"]["message"])
+        # No traceback leaked by default.
+        self.assertNotIn("context", payload["error"])
+
+    def test_unexpected_exception_includes_traceback_when_verbose(self) -> None:
+        def boom_handler(args, root_dir, model, mode):
+            raise ValueError("kaboom")
+
+        emitted: list[dict[str, object]] = []
+        exit_code = self._run_dispatch_with_handler(
+            boom_handler, argv=["--verbose", "doctor", "--format", "json"], emitted=emitted
+        )
+        self.assertEqual(exit_code, CLI.EXIT_ERROR)
+        payload = emitted[-1]
+        self.assertEqual(payload["error"]["code"], "INTERNAL")
+        self.assertIn("traceback", payload["error"]["context"])
+        self.assertIn("ValueError", payload["error"]["context"]["traceback"])
 
     def test_runtime_cwd_inference_prefers_client_with_local_runtime_service_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            shared_dep = root / "ingredient_server"
+            shared_dep = root / "shared_service"
             shared_dep.mkdir()
             model = {
                 "selection": {},
@@ -1443,21 +1699,21 @@ except RuntimeError as exc:
                     {
                         "id": "cca",
                         "label": "CCA",
-                        "default_cwd": str(root / "cca-website"),
+                        "default_cwd": str(root / "example-website"),
                         "context": {"cwd_match": [str(shared_dep)]},
                     },
                     {
-                        "id": "htma",
-                        "label": "HTMA",
-                        "default_cwd": str(root / "htma"),
+                        "id": "app_core",
+                        "label": "App Core",
+                        "default_cwd": str(root / "app_core"),
                         "context": {"cwd_match": [str(shared_dep)]},
                     },
                 ],
                 "repos": [
                     {
-                        "id": "ingredient_server",
+                        "id": "shared_service",
                         "host_path": str(shared_dep),
-                        "client": "htma",
+                        "client": "app_core",
                     },
                     {
                         "id": "personal-ingredient",
@@ -1474,9 +1730,9 @@ except RuntimeError as exc:
                         "commands": {"reuse": "make personal-local-up"},
                     },
                     {
-                        "id": "ingredient_server",
-                        "client": "htma",
-                        "repo": "ingredient_server",
+                        "id": "shared_service",
+                        "client": "app_core",
+                        "repo": "shared_service",
                         "profiles": ["local-all"],
                         "commands": {"reuse": "make local-up"},
                     },
@@ -1495,12 +1751,12 @@ except RuntimeError as exc:
 
             args = _ns(command="up", cwd=str(shared_dep), profile=["local-all"])
 
-            self.assertEqual(CLI._active_clients_for_args(args, model), {"htma"})
+            self.assertEqual(CLI._active_clients_for_args(args, model), {"app_core"})
 
     def test_skill_cwd_inference_keeps_visibility_match_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            shared_dep = root / "ingredient_server"
+            shared_dep = root / "shared_service"
             shared_dep.mkdir()
             model = {
                 "selection": {},
@@ -1514,21 +1770,21 @@ except RuntimeError as exc:
                     {
                         "id": "cca",
                         "label": "CCA",
-                        "default_cwd": str(root / "cca-website"),
+                        "default_cwd": str(root / "example-website"),
                         "context": {"cwd_match": [str(shared_dep)]},
                     },
                     {
-                        "id": "htma",
-                        "label": "HTMA",
-                        "default_cwd": str(root / "htma"),
+                        "id": "service_app",
+                        "label": "Service App",
+                        "default_cwd": str(root / "service_app"),
                         "context": {"cwd_match": [str(shared_dep)]},
                     },
                 ],
                 "repos": [
                     {
-                        "id": "ingredient_server",
+                        "id": "shared_service",
                         "host_path": str(shared_dep),
-                        "client": "htma",
+                        "client": "service_app",
                     },
                     {
                         "id": "personal-ingredient",
@@ -1545,9 +1801,9 @@ except RuntimeError as exc:
                         "commands": {"reuse": "make personal-local-up"},
                     },
                     {
-                        "id": "ingredient_server",
-                        "client": "htma",
-                        "repo": "ingredient_server",
+                        "id": "shared_service",
+                        "client": "service_app",
+                        "repo": "shared_service",
                         "profiles": ["local-all"],
                         "commands": {"reuse": "make local-up"},
                     },
@@ -1571,21 +1827,21 @@ except RuntimeError as exc:
     def test_runtime_cwd_inference_uses_existing_match_order_before_graph_size(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            app_root = root / "sweet-potato"
+            app_root = root / "example-app"
             app_root.mkdir()
             model = {
                 "selection": {},
                 "clients": [
                     {
-                        "id": "sweet-potato",
+                        "id": "example-app",
                         "label": "Sweet Potato",
                         "default_cwd": str(app_root),
                         "context": {"cwd_match": [str(app_root)]},
                     },
                     {
-                        "id": "htma",
-                        "label": "HTMA",
-                        "default_cwd": str(root / "htma"),
+                        "id": "app_core",
+                        "label": "App Core",
+                        "default_cwd": str(root / "app_core"),
                         "context": {"cwd_match": [str(app_root)]},
                     },
                 ],
@@ -1593,38 +1849,38 @@ except RuntimeError as exc:
                     {
                         "id": "spaps-local",
                         "host_path": str(app_root),
-                        "client": "sweet-potato",
+                        "client": "example-app",
                     },
                     {
-                        "id": "spaps-htma",
+                        "id": "spaps-app_core",
                         "host_path": str(app_root),
-                        "client": "htma",
+                        "client": "app_core",
                     },
                     {
-                        "id": "htma-api",
-                        "host_path": str(root / "htma_server"),
-                        "client": "htma",
+                        "id": "app_core-api",
+                        "host_path": str(root / "api_server"),
+                        "client": "app_core",
                     },
                 ],
                 "services": [
                     {
                         "id": "spaps-local",
-                        "client": "sweet-potato",
+                        "client": "example-app",
                         "repo": "spaps-local",
                         "profiles": ["local-all"],
                         "commands": {"reuse": "make local-up"},
                     },
                     {
-                        "id": "spaps-htma",
-                        "client": "htma",
-                        "repo": "spaps-htma",
+                        "id": "spaps-app_core",
+                        "client": "app_core",
+                        "repo": "spaps-app_core",
                         "profiles": ["local-all"],
                         "commands": {"reuse": "make local-up"},
                     },
                     {
-                        "id": "htma-api",
-                        "client": "htma",
-                        "repo": "htma-api",
+                        "id": "app_core-api",
+                        "client": "app_core",
+                        "repo": "app_core-api",
                         "profiles": ["local-all"],
                         "commands": {"reuse": "make local-up"},
                     },
@@ -1643,7 +1899,7 @@ except RuntimeError as exc:
 
             args = _ns(command="up", cwd=str(app_root), profile=["local-all"])
 
-            self.assertEqual(CLI._active_clients_for_args(args, model), {"sweet-potato"})
+            self.assertEqual(CLI._active_clients_for_args(args, model), {"example-app"})
 
     def test_high_risk_handlers_emit_structured_payloads(self) -> None:
         emitted: list[dict[str, object]] = []
@@ -1682,6 +1938,19 @@ except RuntimeError as exc:
             mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
         ):
             self.assertEqual(CLI._handle_skill(skill_args, root, {}, "reuse"), CLI.EXIT_DRIFT)
+
+        with (
+            mock.patch.object(CLI, "skill_lifecycle_plan", return_value={"actions": []}),
+            mock.patch.object(
+                CLI,
+                "apply_skill_lifecycle_plan",
+                return_value={
+                    "actions": [{"status": "skipped_pinned", "code": PRUNE_SKIPPED_PINNED}]
+                },
+            ),
+            mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
+        ):
+            self.assertEqual(CLI._handle_skill(skill_args, root, {}, "reuse"), CLI.EXIT_OK)
 
         client_args = _ns(
             list_blueprints=True,

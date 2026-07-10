@@ -2,15 +2,31 @@ from __future__ import annotations
 
 import http.client
 import io
+import json
+import os
+import selectors
+import shlex
+import signal
 import socket
+import subprocess
 import tarfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 from .shared import *
 from .validation import *
+from .errors import AdapterError, NetworkError, RuntimeLifecycleError, StateConflictError, ValidationError
+from .port_registry import build_port_registry, declared_service_ports
 from .pressure_report import collect_pressure_report
 from .rch_report import collect_rch_report
 from .sbh_report import collect_sbh_report
 from lib.runtime_model import (
+    LOCAL_RUNTIME_PORT_MISMATCH,
+    LOCAL_RUNTIME_SERVICE_DEFERRED,
+    MCP_PROTOCOL_VERSION,
+    MCP_READY_HEALTHCHECK_TYPE,
     PERSISTENT_PATH_OFF_STATE_ROOT,
     STATE_ROOT_LOW_SPACE,
     STATE_ROOT_MISSING,
@@ -18,6 +34,7 @@ from lib.runtime_model import (
     STATE_ROOT_WRONG_OWNERSHIP,
     is_runtime_absolute_path,
 )
+from lib.paths import BoxPath, PathTranslationError, PathTranslator
 
 
 _STARTED_SERVICE_PROCESSES: list[subprocess.Popen[str]] = []
@@ -288,7 +305,11 @@ def normalize_file_mode(raw_mode: Any, default: int = 0o600) -> int:
     if raw_mode is None:
         return default
     if isinstance(raw_mode, bool):
-        raise RuntimeError(f"Invalid file mode {raw_mode!r}. Use an octal string such as '0600'.")
+        raise ValidationError(
+            "runtime_error",
+            f"Invalid file mode {raw_mode!r}. Use an octal string such as '0600'.",
+            context={"mode": raw_mode},
+        )
     if isinstance(raw_mode, int):
         mode = raw_mode
     else:
@@ -298,11 +319,17 @@ def normalize_file_mode(raw_mode: Any, default: int = 0o600) -> int:
         try:
             mode = int(text, 8)
         except ValueError as exc:
-            raise RuntimeError(f"Invalid file mode {raw_mode!r}. Use an octal string such as '0600'.") from exc
+            raise ValidationError(
+                "runtime_error",
+                f"Invalid file mode {raw_mode!r}. Use an octal string such as '0600'.",
+                context={"mode": raw_mode},
+            ) from exc
 
     if mode < 0 or mode > 0o777:
-        raise RuntimeError(
-            f"Invalid file mode {raw_mode!r}. Use an octal value between '0000' and '0777'."
+        raise ValidationError(
+            "runtime_error",
+            f"Invalid file mode {raw_mode!r}. Use an octal value between '0000' and '0777'.",
+            context={"mode": raw_mode},
         )
     return mode
 
@@ -913,20 +940,22 @@ def resolved_ingress_routes(
 
 
 def ingress_config_paths(model: dict[str, Any]) -> dict[str, Path]:
-    root_dir = Path(str(model["root_dir"]))
     env = model.get("env") or {}
-    storage = model.get("storage")
-    route_file = runtime_path_to_host_path(
-        root_dir,
-        env,
-        str(env.get("SKILLBOX_INGRESS_ROUTE_FILE") or "/workspace/logs/runtime/ingress-routes.json"),
-        storage=storage,
+    translator = PathTranslator.from_model(model)
+
+    def _to_host_path(raw_path: str) -> Path:
+        candidate = Path(raw_path).expanduser()
+        if candidate.is_absolute() and not is_runtime_absolute_path(raw_path):
+            return candidate
+        if not candidate.is_absolute():
+            return candidate
+        return Path(translator.to_host(BoxPath(raw_path)))
+
+    route_file = _to_host_path(
+        str(env.get("SKILLBOX_INGRESS_ROUTE_FILE") or "/workspace/logs/runtime/ingress-routes.json")
     )
-    nginx_config = runtime_path_to_host_path(
-        root_dir,
-        env,
-        str(env.get("SKILLBOX_INGRESS_NGINX_CONFIG") or "/workspace/logs/runtime/ingress-nginx.conf"),
-        storage=storage,
+    nginx_config = _to_host_path(
+        str(env.get("SKILLBOX_INGRESS_NGINX_CONFIG") or "/workspace/logs/runtime/ingress-nginx.conf")
     )
     return {
         "route_file": Path(str(route_file)),
@@ -1158,6 +1187,672 @@ def validate_service_exposure(model: dict[str, Any]) -> list[CheckResult]:
     ]
 
 
+def _mcp_healthcheck_target_summary(service: dict[str, Any], healthcheck: dict[str, Any]) -> str:
+    transport = _mcp_ready_transport(service, healthcheck)
+    if transport == "http":
+        url = str(healthcheck.get("url") or "").strip()
+        if url:
+            return url
+        port = _mcp_probe_port(service, healthcheck)
+        return f"http://{_mcp_probe_host(service, healthcheck)}:{port}" if port is not None else "http"
+    if transport == "tcp":
+        port = _mcp_probe_port(service, healthcheck)
+        return f"{_mcp_probe_host(service, healthcheck)}:{port}" if port is not None else "tcp"
+    if transport == "stdio":
+        return "stdio"
+    return transport or "unknown"
+
+
+def validate_mcp_healthchecks(model: dict[str, Any]) -> list[CheckResult]:
+    """Surface declared MCP protocol healthchecks in doctor output."""
+    declarations: list[dict[str, Any]] = []
+    for service in model.get("services") or []:
+        healthcheck = service.get("healthcheck") if isinstance(service.get("healthcheck"), dict) else {}
+        if (healthcheck or {}).get("type") != MCP_READY_HEALTHCHECK_TYPE:
+            continue
+        declarations.append({
+            "service_id": service.get("id"),
+            "kind": service.get("kind", "service"),
+            "healthcheck_type": MCP_READY_HEALTHCHECK_TYPE,
+            "transport": _mcp_ready_transport(service, healthcheck),
+            "target": _mcp_healthcheck_target_summary(service, healthcheck),
+            "timeout_seconds": _mcp_ready_timeout_seconds(healthcheck),
+        })
+    if not declarations:
+        return []
+    return [
+        CheckResult(
+            status="pass",
+            code="mcp-healthchecks",
+            message=f"{len(declarations)} MCP protocol healthcheck(s) declared",
+            details={"healthcheck_type": MCP_READY_HEALTHCHECK_TYPE, "services": declarations},
+        )
+    ]
+
+
+PORT_COLLISION = "PORT_COLLISION"
+PORT_WILDCARD_BIND = "PORT_WILDCARD_BIND"
+PORT_UNDECLARED_RESERVED = "PORT_UNDECLARED_RESERVED"
+PORT_REGISTRY_WARNING = "PORT_REGISTRY_WARNING"
+PORT_CROSS_CLIENT_OVERLAP = "PORT_CROSS_CLIENT_OVERLAP"
+PORT_CONTRACT_UNADOPTED = "PORT_CONTRACT_UNADOPTED"
+PORT_CONTRACT_GITIGNORE = "PORT_CONTRACT_GITIGNORE"
+PORT_CONTRACT_STALE = "PORT_CONTRACT_STALE"
+PORT_CONTRACT_FILE_NAME = ".skillbox-port.env"
+PORT_GUARD_TELEMETRY_NAME = "port-guard.telemetry.json"
+
+_PORT_CONTRACT_ADOPTION_SNIPPET = (
+    "Load .skillbox-port.env before dev startup; for Vite use "
+    "server: { host: process.env.HOST || '127.0.0.1', "
+    "port: Number(process.env.PORT), strictPort: true }."
+)
+_PORT_CONTRACT_ADOPTION_FILES = (
+    "vite.config.ts",
+    "vite.config.js",
+    "vite.config.mts",
+    "vite.config.mjs",
+    "vite.config.cts",
+    "vite.config.cjs",
+    "next.config.js",
+    "next.config.mjs",
+    "next.config.ts",
+    "package.json",
+    "Makefile",
+    ".envrc",
+    "README.md",
+)
+
+# Box network postures under which a wildcard (0.0.0.0/::) bind is a violation.
+_WILDCARD_DENY_POSTURES = frozenset({"tailnet_only"})
+
+
+def _resolved_network_posture(model: dict[str, Any]) -> str:
+    """Resolve the box network posture from env, falling back to the process env.
+
+    Managed boxes default to ``tailnet_only`` (see AGENTS.md Network Posture),
+    but we only treat the posture as wildcard-denying when it is explicitly
+    declared so local dev (no posture set) stays permissive.
+    """
+    env = model.get("env") or {}
+    posture = str(env.get("SKILLBOX_NETWORK_POSTURE") or "").strip()
+    if not posture:
+        posture = str(os.environ.get("SKILLBOX_NETWORK_POSTURE") or "").strip()
+    return posture.lower()
+
+
+def _reserved_port_ranges(model: dict[str, Any]) -> list[tuple[int, int, str]]:
+    """Parse declared reserved port ranges into ``(low, high, label)`` tuples.
+
+    Sources, in order: a model-level ``port_reserved_ranges`` list (each item
+    ``{low,high,label?}`` or ``[low,high]``) and the
+    ``SKILLBOX_RESERVED_PORT_RANGES`` env key (``"9000-9100:agents,4000"``).
+    Unparseable ranges are skipped silently so a typo never crashes doctor.
+    """
+    ranges: list[tuple[int, int, str]] = []
+
+    for raw in model.get("port_reserved_ranges") or []:
+        try:
+            if isinstance(raw, dict):
+                low = int(raw["low"])
+                high = int(raw.get("high", raw["low"]))
+                label = str(raw.get("label") or "")
+            elif isinstance(raw, (list, tuple)) and raw:
+                low = int(raw[0])
+                high = int(raw[1]) if len(raw) > 1 else low
+                label = str(raw[2]) if len(raw) > 2 else ""
+            else:
+                continue
+        except (KeyError, ValueError, TypeError):
+            continue
+        if low <= high:
+            ranges.append((low, high, label))
+
+    env = model.get("env") or {}
+    raw_env = str(env.get("SKILLBOX_RESERVED_PORT_RANGES") or "").strip()
+    for chunk in raw_env.split(","):
+        token = chunk.strip()
+        if not token:
+            continue
+        label = ""
+        if ":" in token:
+            token, label = token.split(":", 1)
+            token, label = token.strip(), label.strip()
+        try:
+            if "-" in token:
+                low_s, high_s = token.split("-", 1)
+                low, high = int(low_s), int(high_s)
+            else:
+                low = high = int(token)
+        except ValueError:
+            continue
+        if low <= high:
+            ranges.append((low, high, label))
+    return ranges
+
+
+def _active_scope_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Entries that actively bind a port, declared ports only.
+
+    Only ``service`` entries are real listeners for collision purposes:
+
+    - ``env_surface`` entries document the declared env value, not a live
+      listener, so flagging an env key against the service that consumes it
+      would be a false positive.
+    - ``ingress`` listener entries are synthesized from env and are realized by
+      the ingress-router SERVICE (already a service entry on the same port), so
+      counting both would double-claim the listener port.
+    """
+    return [
+        entry
+        for entry in entries
+        if entry.get("port") is not None and entry.get("owner_kind") == "service"
+    ]
+
+
+def _collision_results(entries: list[dict[str, Any]]) -> list[CheckResult]:
+    """PORT_COLLISION within the active scope, plus a cross-client ADVISORY.
+
+    Two active-scope owners on the same port collide. Collisions where the
+    owners belong to DIFFERENT clients are downgraded to a non-fatal advisory
+    (warn) because client overlays load only when that client is active; same
+    or core scope collisions are hard failures.
+    """
+    by_port: dict[int, list[dict[str, Any]]] = {}
+    for entry in _active_scope_entries(entries):
+        by_port.setdefault(int(entry["port"]), []).append(entry)
+
+    results: list[CheckResult] = []
+    for port in sorted(by_port):
+        owners = by_port[port]
+        if len(owners) < 2:
+            continue
+        clients = {str(o.get("client") or "") for o in owners}
+        named = [
+            {
+                "owner_id": o["owner_id"],
+                "owner_kind": o["owner_kind"],
+                "client": o.get("client") or "",
+                "source": o.get("source"),
+            }
+            for o in owners
+        ]
+        owner_phrase = " and ".join(
+            f"{o['owner_id']} ({o['source'].get('file')}:{o['source'].get('key')})"
+            for o in named
+        )
+        cross_client_only = len(clients) > 1 and not _same_scope_collision(owners)
+        if cross_client_only:
+            results.append(
+                CheckResult(
+                    status="warn",
+                    code=PORT_CROSS_CLIENT_OVERLAP,
+                    message=(
+                        f"port {port} is claimed across clients by {owner_phrase}; "
+                        "advisory only — these overlays do not load simultaneously"
+                    ),
+                    details={"port": port, "owners": named, "advisory": True},
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    status="fail",
+                    code=PORT_COLLISION,
+                    message=f"port {port} is claimed by {owner_phrase}",
+                    details={"port": port, "owners": named},
+                )
+            )
+    return results
+
+
+def _same_scope_collision(owners: list[dict[str, Any]]) -> bool:
+    """True when at least two colliding owners share the active (core/same) scope.
+
+    A core-scope owner (client == "") collides with everything in the active
+    scope; two owners under the SAME client also collide hard.
+    """
+    core_owners = [o for o in owners if not str(o.get("client") or "")]
+    if len(core_owners) >= 2:
+        return True
+    if core_owners and len(owners) > len(core_owners):
+        return True
+    seen_clients: set[str] = set()
+    for owner in owners:
+        client = str(owner.get("client") or "")
+        if client and client in seen_clients:
+            return True
+        if client:
+            seen_clients.add(client)
+    return False
+
+
+def _wildcard_results(entries: list[dict[str, Any]], posture: str) -> list[CheckResult]:
+    if posture not in _WILDCARD_DENY_POSTURES:
+        return []
+    offenders = [
+        {
+            "port": entry["port"],
+            "owner_id": entry["owner_id"],
+            "owner_kind": entry["owner_kind"],
+            "client": entry.get("client") or "",
+            "source": entry.get("source"),
+        }
+        for entry in entries
+        if entry.get("bind_scope") == "wildcard" and entry.get("port") is not None
+    ]
+    if not offenders:
+        return []
+    return [
+        CheckResult(
+            status="fail",
+            code=PORT_WILDCARD_BIND,
+            message=(
+                f"{len(offenders)} port(s) bind 0.0.0.0/:: while box posture is "
+                f"{posture}: " + ", ".join(f"{o['owner_id']}:{o['port']}" for o in offenders)
+            ),
+            details={"posture": posture, "offenders": offenders},
+        )
+    ]
+
+
+def _reserved_results(entries: list[dict[str, Any]], model: dict[str, Any]) -> list[CheckResult]:
+    ranges = _reserved_port_ranges(model)
+    if not ranges:
+        return []
+    owned_ports = {int(e["port"]) for e in entries if e.get("port") is not None}
+    undeclared: list[dict[str, Any]] = []
+    for low, high, label in ranges:
+        for port in range(low, high + 1):
+            if port not in owned_ports:
+                undeclared.append({"port": port, "range": [low, high], "label": label})
+    if not undeclared:
+        return [
+            CheckResult(
+                status="pass",
+                code="port-reserved-ranges",
+                message=f"all {len(ranges)} reserved port range(s) are fully owned",
+                details={"ranges": [{"low": r[0], "high": r[1], "label": r[2]} for r in ranges]},
+            )
+        ]
+    return [
+        CheckResult(
+            status="fail",
+            code=PORT_UNDECLARED_RESERVED,
+            message=(
+                f"{len(undeclared)} reserved port(s) have no declared owner: "
+                + ", ".join(str(item["port"]) for item in undeclared[:8])
+                + ("..." if len(undeclared) > 8 else "")
+            ),
+            details={"undeclared": undeclared},
+        )
+    ]
+
+
+def _repo_host_path(repo: dict[str, Any]) -> Path | None:
+    raw_path = str(repo.get("host_path") or repo.get("path") or "").strip()
+    if not raw_path:
+        return None
+    return Path(raw_path).expanduser()
+
+
+def _port_contract_env_key(service_id: str, suffix: str) -> str:
+    normalized = "".join(
+        char.upper() if char.isalnum() else "_"
+        for char in str(service_id or "").strip()
+    ).strip("_")
+    while "__" in normalized:
+        normalized = normalized.replace("__", "_")
+    if not normalized:
+        normalized = "SERVICE"
+    return f"SKILLBOX_{normalized}_{suffix}"
+
+
+def _normalize_port_contract_host(host: str) -> str:
+    normalized = str(host or "").strip()
+    if not normalized or normalized.lower() == "localhost":
+        return "127.0.0.1"
+    return normalized
+
+
+def _service_command_host(service: dict[str, Any]) -> str:
+    command = str(service.get("command") or "").strip()
+    if not command and isinstance(service.get("commands"), dict):
+        commands = service.get("commands") or {}
+        command = str(commands.get("reuse") or commands.get("start") or commands.get("run") or "").strip()
+    if not command:
+        return ""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    for index, token in enumerate(tokens):
+        for flag in ("--host", "--hostname"):
+            if token == flag and index + 1 < len(tokens):
+                return str(tokens[index + 1]).strip()
+            prefix = f"{flag}="
+            if token.startswith(prefix):
+                return token[len(prefix):].strip()
+    return ""
+
+
+def _service_health_host(service: dict[str, Any]) -> str:
+    healthcheck = service.get("healthcheck") if isinstance(service.get("healthcheck"), dict) else {}
+    if not healthcheck:
+        return ""
+    raw_host = str(healthcheck.get("host") or "").strip()
+    if raw_host:
+        return raw_host
+    raw_url = str(healthcheck.get("url") or "").strip()
+    if not raw_url:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(raw_url)
+    except ValueError:
+        return ""
+    return str(parsed.hostname or "").strip()
+
+
+def _port_contract_host_for_service(service: dict[str, Any], entry: dict[str, Any]) -> str:
+    command_host = _service_command_host(service)
+    if command_host:
+        return _normalize_port_contract_host(command_host)
+
+    declared = _service_declared_listen_port(service)
+    if declared is not None and int(declared[1]) == int(entry["port"]):
+        return _normalize_port_contract_host(declared[0])
+
+    health_host = _service_health_host(service)
+    if health_host:
+        return _normalize_port_contract_host(health_host)
+
+    if str(entry.get("bind_scope") or "") == "wildcard":
+        return "0.0.0.0"
+    return "127.0.0.1"
+
+
+def _port_contract_records(model: dict[str, Any]) -> list[dict[str, Any]]:
+    repos = runtime_repo_map(model)
+    services = {
+        str(service.get("id") or "").strip(): service
+        for service in model.get("services") or []
+        if str(service.get("id") or "").strip()
+    }
+    records: list[dict[str, Any]] = []
+    for entry in build_port_registry(model):
+        if entry.get("owner_kind") != "service" or entry.get("port") is None or entry.get("warning"):
+            continue
+        service_id = str(entry.get("owner_id") or "").strip()
+        service = services.get(service_id)
+        if service is None or ownership_state_for_service(model, service_id) != "covered":
+            continue
+        repo_id = str(service.get("repo") or service.get("repo_id") or "").strip()
+        if not repo_id:
+            continue
+        repo = repos.get(repo_id)
+        if repo is None:
+            continue
+        repo_path = _repo_host_path(repo)
+        if repo_path is None:
+            continue
+        records.append(
+            {
+                "service_id": service_id,
+                "repo_id": repo_id,
+                "repo_path": repo_path,
+                "port": int(entry["port"]),
+                "host": _port_contract_host_for_service(service, entry),
+                "source": dict(entry.get("source") or {}),
+                "protocol": str(entry.get("protocol") or ""),
+                "bind_scope": str(entry.get("bind_scope") or "unknown"),
+                "service": service,
+            }
+        )
+    return sorted(
+        records,
+        key=lambda item: (str(item["repo_path"]), str(item["service_id"]), int(item["port"])),
+    )
+
+
+def _port_contract_default_rank(record: dict[str, Any]) -> tuple[int, str]:
+    config = record["service"].get("port_contract")
+    is_default = isinstance(config, dict) and bool(config.get("default"))
+    return (0 if is_default else 1, str(record["service_id"]))
+
+
+def _render_port_contract_file(records: list[dict[str, Any]]) -> str:
+    first = sorted(records, key=_port_contract_default_rank)[0]
+    lines = [
+        "# Generated by Skillbox. Do not commit.",
+        "# Source of truth: python3 .env-manager/manage.py ports --format json",
+        f"PORT={first['port']}",
+        f"HOST={first['host']}",
+        f"SKILLBOX_SERVICE_ID={first['service_id']}",
+    ]
+    source = first.get("source") or {}
+    source_file = str(source.get("file") or "").strip()
+    source_key = str(source.get("key") or "").strip()
+    if source_file or source_key:
+        lines.append(f"SKILLBOX_PORT_SOURCE={source_file}:{source_key}".rstrip(":"))
+    if len(records) > 1:
+        lines.append("")
+        lines.append("# Additional declared services in this repo.")
+        for record in records:
+            if str(record["service_id"]) == str(first["service_id"]):
+                continue
+            prefix = _port_contract_env_key(str(record["service_id"]), "")
+            lines.extend(
+                [
+                    f"{prefix}PORT={record['port']}",
+                    f"{prefix}HOST={record['host']}",
+                ]
+            )
+    return "\n".join(lines) + "\n"
+
+
+def _port_contract_groups(model: dict[str, Any]) -> list[tuple[Path, list[dict[str, Any]]]]:
+    grouped: dict[Path, list[dict[str, Any]]] = {}
+    for record in _port_contract_records(model):
+        grouped.setdefault(record["repo_path"], []).append(record)
+    return [(path, grouped[path]) for path in sorted(grouped, key=lambda p: str(p))]
+
+
+def sync_port_contracts(model: dict[str, Any], dry_run: bool) -> list[str]:
+    actions: list[str] = []
+    for repo_path, records in _port_contract_groups(model):
+        target = repo_path / PORT_CONTRACT_FILE_NAME
+        service_count = len(records)
+        if not repo_path.is_dir():
+            actions.append(f"skip-port-contract: {target} (repo missing)")
+            continue
+        desired = _render_port_contract_file(records)
+        state = managed_text_artifact_state(target, desired)
+        ensure_directory(target.parent, dry_run)
+        if dry_run:
+            actions.append(f"render-port-contract: {target} ({service_count} service(s))")
+            continue
+        if state == "ok":
+            actions.append(f"port-contract-unchanged: {target}")
+            continue
+        atomic_write_text(target, desired)
+        actions.append(f"render-port-contract: {target} ({service_count} service(s))")
+    return actions
+
+
+def _port_contract_gitignored(repo_path: Path) -> bool:
+    gitignore = repo_path / ".gitignore"
+    try:
+        lines = gitignore.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    return any(line.strip().rstrip("/") == PORT_CONTRACT_FILE_NAME for line in lines)
+
+
+def _port_contract_adoption_files(repo_path: Path) -> list[Path]:
+    candidates = [repo_path / name for name in _PORT_CONTRACT_ADOPTION_FILES]
+    candidates.extend(sorted(repo_path.glob("*.config.*")))
+    seen: set[Path] = set()
+    existing: list[Path] = []
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        if path.is_file():
+            existing.append(path)
+    return existing
+
+
+def _repo_mentions_port_contract(repo_path: Path) -> bool:
+    for path in _port_contract_adoption_files(repo_path):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if PORT_CONTRACT_FILE_NAME in text or "SKILLBOX_SERVICE_ID" in text:
+            return True
+        if "strictPort" in text and ("process.env.PORT" in text or "$PORT" in text):
+            return True
+        if "--strictPort" in text and ("$PORT" in text or "PORT" in text):
+            return True
+    return False
+
+
+def _port_contract_advisory_suppressed(service: dict[str, Any]) -> bool:
+    config = service.get("port_contract")
+    if not isinstance(config, dict):
+        return False
+    if bool(config.get("adopted") or config.get("suppress_advisory") or config.get("suppress_unadopted")):
+        return True
+    adoption = str(config.get("adoption") or "").strip().lower()
+    return adoption in {"manual", "external", "suppressed"}
+
+
+def validate_port_contracts(model: dict[str, Any]) -> list[CheckResult]:
+    groups = _port_contract_groups(model)
+    if not groups:
+        return []
+
+    results: list[CheckResult] = []
+    checked_count = 0
+    for repo_path, grouped_records in groups:
+        if not repo_path.is_dir():
+            continue
+        checked_count += len(grouped_records)
+        target = repo_path / PORT_CONTRACT_FILE_NAME
+        service_ids = [str(record["service_id"]) for record in grouped_records]
+        desired = _render_port_contract_file(grouped_records)
+        group_details = {
+            "service_ids": service_ids,
+            "repo_id": grouped_records[0]["repo_id"],
+            "repo_path": str(repo_path),
+            "contract_path": str(target),
+            "adoption_snippet": _PORT_CONTRACT_ADOPTION_SNIPPET,
+        }
+        if target.is_file():
+            state = managed_text_artifact_state(target, desired)
+            if state != "ok":
+                results.append(
+                    CheckResult(
+                        status="warn",
+                        code=PORT_CONTRACT_STALE,
+                        message=(
+                            f"{PORT_CONTRACT_FILE_NAME} in repo {grouped_records[0]['repo_id']} "
+                            "does not match the current port registry"
+                        ),
+                        details={**group_details, "state": state},
+                    )
+                )
+        if target.is_file() and not _port_contract_gitignored(repo_path):
+            results.append(
+                CheckResult(
+                    status="warn",
+                    code=PORT_CONTRACT_GITIGNORE,
+                    message=(
+                        f"{PORT_CONTRACT_FILE_NAME} is generated under repo {grouped_records[0]['repo_id']} "
+                        "but is not covered by .gitignore"
+                    ),
+                    details={**group_details, "exact_line": PORT_CONTRACT_FILE_NAME},
+                )
+            )
+        repo_adopted = _repo_mentions_port_contract(repo_path)
+        for record in grouped_records:
+            service_id = str(record["service_id"])
+            if _port_contract_advisory_suppressed(record["service"]) or repo_adopted:
+                continue
+            base_details = {
+                "service_id": service_id,
+                "repo_id": record["repo_id"],
+                "repo_path": str(repo_path),
+                "contract_path": str(target),
+                "adoption_snippet": _PORT_CONTRACT_ADOPTION_SNIPPET,
+            }
+            results.append(
+                CheckResult(
+                    status="warn",
+                    code=PORT_CONTRACT_UNADOPTED,
+                    message=(
+                        f"service {service_id} has a generated port contract, but repo "
+                        f"{record['repo_id']} does not appear to load it with strict port settings"
+                    ),
+                    details={
+                        **base_details,
+                        "suppress_with": "services[].port_contract.suppress_advisory: true",
+                    },
+                )
+            )
+
+    if not results and checked_count:
+        results.append(
+            CheckResult(
+                status="pass",
+                code="port-contracts",
+                message=f"{checked_count} generated port contract(s) are adopted or suppressed",
+                details={"count": checked_count},
+            )
+        )
+    return results
+
+
+def validate_port_registry(model: dict[str, Any]) -> list[CheckResult]:
+    """Port-guard doctor checks built on the scope-aware port registry view.
+
+    Emits ``PORT_COLLISION`` (hard, names both declarations),
+    ``PORT_WILDCARD_BIND`` (hard under tailnet_only), and
+    ``PORT_UNDECLARED_RESERVED`` (hard, only when reserved ranges are
+    declared). Cross-client overlaps are downgraded to a non-fatal advisory
+    (``PORT_CROSS_CLIENT_OVERLAP``) because client overlays are mutually
+    exclusive at load time. A clean active scope yields a single PASS plus any
+    extraction warnings surfaced as warn entries.
+    """
+    entries = build_port_registry(model)
+    results: list[CheckResult] = []
+    results.extend(_collision_results(entries))
+    results.extend(_wildcard_results(entries, _resolved_network_posture(model)))
+    results.extend(_reserved_results(entries, model))
+
+    for entry in entries:
+        if entry.get("warning"):
+            results.append(
+                CheckResult(
+                    status="warn",
+                    code=PORT_REGISTRY_WARNING,
+                    message=entry["warning"],
+                    details={"owner_id": entry["owner_id"], "source": entry.get("source")},
+                )
+            )
+
+    if not any(r.status in {"fail", "warn"} for r in results):
+        declared = sum(1 for e in entries if e.get("port") is not None)
+        results.append(
+            CheckResult(
+                status="pass",
+                code="port-registry",
+                message=f"{declared} declared port(s) in active scope have no collisions",
+                details={"count": declared},
+            )
+        )
+    return results
+
+
 def doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
     results = check_manifest(model)
     if any(result.status == "fail" for result in results):
@@ -1200,6 +1895,9 @@ def doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
         + validate_bridges(model)
         + validate_ingress(model)
         + validate_service_exposure(model)
+        + validate_mcp_healthchecks(model)
+        + validate_port_registry(model)
+        + validate_port_contracts(model)
         + parity_results
     )
 
@@ -1225,11 +1923,7 @@ def _artifact_action_name(state: dict[str, Any], stale_action: str, missing_acti
 
 
 def _replace_artifact_payload(path: Path, payload: bytes, executable: bool) -> None:
-    tmp_path = path.parent / f".{path.name}.tmp"
-    tmp_path.write_bytes(payload)
-    if executable:
-        tmp_path.chmod(0o755)
-    tmp_path.replace(path)
+    atomic_write_bytes(path, payload, mode=0o755 if executable else 0o644)
 
 
 def _sync_url_artifact(
@@ -1261,9 +1955,16 @@ def _download_artifact_to_path(
         payload = response.read()
     actual_sha256 = hashlib.sha256(payload).hexdigest()
     if actual_sha256 != expected_sha256:
-        raise RuntimeError(
+        raise NetworkError(
+            "runtime_error",
             f"artifact {artifact['id']} digest mismatch for {url}: "
-            f"expected {expected_sha256}, got {actual_sha256}"
+            f"expected {expected_sha256}, got {actual_sha256}",
+            context={
+                "artifact": artifact["id"],
+                "url": url,
+                "expected_sha256": expected_sha256,
+                "actual_sha256": actual_sha256,
+            },
         )
     payload = _downloaded_artifact_payload(artifact, source, payload)
     _replace_artifact_payload(path, payload, bool(source.get("executable", False)))
@@ -1278,21 +1979,35 @@ def _downloaded_artifact_payload(
     if not archive_kind:
         return payload
     if archive_kind not in {"tar.gz", "tgz"}:
-        raise RuntimeError(f"artifact {artifact['id']} has unsupported source.archive {archive_kind!r}")
+        raise AdapterError(
+            "runtime_error",
+            f"artifact {artifact['id']} has unsupported source.archive {archive_kind!r}",
+            context={"artifact": artifact["id"], "archive": archive_kind},
+        )
 
     with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
         members = [member for member in archive.getmembers() if member.isfile()]
         if len(members) != 1:
-            raise RuntimeError(
-                f"artifact {artifact['id']} archive must contain exactly one regular file; found {len(members)}"
+            raise AdapterError(
+                "runtime_error",
+                f"artifact {artifact['id']} archive must contain exactly one regular file; found {len(members)}",
+                context={"artifact": artifact["id"], "member_count": len(members)},
             )
         member = members[0]
         member_path = PurePosixPath(member.name)
         if member_path.is_absolute() or ".." in member_path.parts:
-            raise RuntimeError(f"artifact {artifact['id']} archive member has unsafe path {member.name!r}")
+            raise AdapterError(
+                "runtime_error",
+                f"artifact {artifact['id']} archive member has unsafe path {member.name!r}",
+                context={"artifact": artifact["id"], "member": member.name},
+            )
         extracted = archive.extractfile(member)
         if extracted is None:
-            raise RuntimeError(f"artifact {artifact['id']} archive member {member.name!r} could not be read")
+            raise AdapterError(
+                "runtime_error",
+                f"artifact {artifact['id']} archive member {member.name!r} could not be read",
+                context={"artifact": artifact["id"], "member": member.name},
+            )
         return extracted.read()
 
 
@@ -1316,12 +2031,16 @@ def _sync_file_artifact(
 
 def _copy_artifact_to_path(source: dict[str, Any], source_path: Path, path: Path) -> None:
     if not source_path.is_file():
-        raise RuntimeError(f"artifact source file is missing: {source_path}")
-    tmp_path = path.parent / f".{path.name}.tmp"
-    shutil.copyfile(source_path, tmp_path)
-    if source.get("executable", False):
-        tmp_path.chmod(0o755)
-    tmp_path.replace(path)
+        raise AdapterError(
+            "runtime_error",
+            f"artifact source file is missing: {source_path}",
+            context={"source_path": str(source_path)},
+        )
+    atomic_write_bytes(
+        path,
+        source_path.read_bytes(),
+        mode=0o755 if source.get("executable", False) else 0o644,
+    )
 
 
 def sync_env_file(env_file: dict[str, Any], dry_run: bool) -> list[str]:
@@ -1356,8 +2075,10 @@ def _missing_env_source_action(
     path: Path,
 ) -> list[str]:
     if env_file.get("required"):
-        raise RuntimeError(
-            f"Required env file {env_file['id']} is missing source {state['source_path'] or state['source_host_path'] or path}."
+        raise ValidationError(
+            "missing_env_file",
+            f"Required env file {env_file['id']} is missing source {state['source_path'] or state['source_host_path'] or path}.",
+            context={"env_file": env_file["id"]},
         )
     return [f"skip: {path} (env source path missing)"]
 
@@ -1373,8 +2094,7 @@ def _write_env_payload_if_changed(
     current_mode = path.stat().st_mode & 0o777 if path.is_file() else None
     if current_payload == payload and current_mode == desired_mode:
         return [f"env-unchanged: {path}"]
-    path.write_bytes(payload)
-    path.chmod(desired_mode)
+    atomic_write_bytes(path, payload, mode=desired_mode)
     return [f"hydrate-env: {source_path} -> {path}"]
 
 
@@ -1386,7 +2106,11 @@ def _sync_existing_or_manual_env_file(
     if path.exists():
         return [f"exists: {path}"]
     if env_file.get("required"):
-        raise RuntimeError(f"Required env file {env_file['id']} is missing at {path}.")
+        raise ValidationError(
+            "missing_env_file",
+            f"Required env file {env_file['id']} is missing at {path}.",
+            context={"env_file": env_file["id"], "path": str(path)},
+        )
     return [f"skip: {path} (sync mode {state['sync_mode']})"]
 
 
@@ -1395,7 +2119,7 @@ def sync_dcg_config(model: dict[str, Any], root_dir: Path, dry_run: bool) -> lis
     env = model.get("env") or {}
     dcg_bin = env.get("SKILLBOX_DCG_BIN", "").strip()
     if not dcg_bin:
-        return [f"skip: .dcg.toml (dcg not configured)"]
+        return ["skip: .dcg.toml (dcg not configured)"]
 
     packs, allowlist = _dcg_packs_and_allowlist(model, env)
     content = _dcg_config_content(packs, allowlist)
@@ -1537,7 +2261,18 @@ def _git_clone_args(url: str, branch: str, path: Path) -> list[str]:
 def _run_git_clone(url: str, branch: str, path: Path) -> None:
     result = run_command(_git_clone_args(url, branch, path))
     if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"git clone failed for {url}")
+        raise AdapterError(
+            "runtime_error",
+            result.stderr.strip() or result.stdout.strip() or f"git clone failed for {url}",
+            context={"url": url, "returncode": result.returncode},
+        )
+
+
+def _run_git_clone_atomic(url: str, branch: str, path: Path) -> None:
+    def _build(stage_dir: Path) -> None:
+        _run_git_clone(url, branch, stage_dir)
+
+    atomic_replace_tree(path, _build, root_mode=0o755)
 
 
 def _sync_existing_git_repo(
@@ -1573,7 +2308,7 @@ def _sync_git_repo(
 
     ensure_directory(path.parent, dry_run)
     if not dry_run:
-        _run_git_clone(url, branch, path)
+        _run_git_clone_atomic(url, branch, path)
     return [f"clone-if-missing: {url} -> {path}"]
 
 
@@ -1620,6 +2355,7 @@ def sync_runtime(model: dict[str, Any], dry_run: bool) -> list[str]:
     for env_file in model["env_files"]:
         actions.extend(sync_env_file(env_file, dry_run=dry_run))
 
+    actions.extend(sync_port_contracts(model, dry_run=dry_run))
     actions.extend(_sync_log_dirs(model, dry_run))
     actions.extend(sync_skill_repo_sets(model, dry_run=dry_run))
     actions.extend(_sync_distributor_sources(model, dry_run=dry_run))
@@ -1696,9 +2432,17 @@ def order_task_ids(model: dict[str, Any], selected_ids: set[str]) -> list[str]:
         if task_id in visited:
             return
         if task_id in visiting:
-            raise RuntimeError(f"Task dependency cycle detected at {task_id}.")
+            raise StateConflictError(
+                "runtime_error",
+                f"Task dependency cycle detected at {task_id}.",
+                context={"task_id": task_id},
+            )
         if task_id not in tasks_by_id:
-            raise RuntimeError(f"Task dependency references unknown task {task_id!r}.")
+            raise ValidationError(
+                "runtime_error",
+                f"Task dependency references unknown task {task_id!r}.",
+                context={"task_id": task_id},
+            )
 
         visiting.add(task_id)
         for dependency_id in dependency_graph.get(task_id, []):
@@ -1778,6 +2522,28 @@ def service_dependency_ids(service: dict[str, Any]) -> list[str]:
     return unique_string_field_values(service, "depends_on")
 
 
+def _service_dependency_graph_failure(model: dict[str, Any]) -> CheckResult | None:
+    for result in validate_runtime_model(model):
+        if result.status != "fail":
+            continue
+        if result.code in {LOCAL_RUNTIME_DEPENDENCY_CYCLE, LOCAL_RUNTIME_DEPENDENCY_UNKNOWN}:
+            return result
+    return None
+
+
+def ensure_service_dependency_graph_ready(model: dict[str, Any]) -> None:
+    failure = _service_dependency_graph_failure(model)
+    if failure is None:
+        return
+    raise ValidationError(
+        failure.code,
+        failure.message,
+        context=dict(failure.details or {}),
+        next_actions=["doctor --format json"],
+        recoverable=False,
+    )
+
+
 def service_id_map(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {
         str(service["id"]): service
@@ -1816,11 +2582,19 @@ def order_service_ids(model: dict[str, Any], selected_ids: set[str]) -> list[str
         if service_id in visited:
             return
         if service_id in visiting:
-            raise RuntimeError(f"Service dependency cycle detected at {service_id}.")
+            raise StateConflictError(
+                "runtime_error",
+                f"Service dependency cycle detected at {service_id}.",
+                context={"service_id": service_id},
+            )
         if service_id not in services_by_id:
             if service_id in artifact_ids:
                 return
-            raise RuntimeError(f"Service dependency references unknown service {service_id!r}.")
+            raise ValidationError(
+                "runtime_error",
+                f"Service dependency references unknown service {service_id!r}.",
+                context={"service_id": service_id},
+            )
 
         visiting.add(service_id)
         for dependency_id in dependency_graph.get(service_id, []):
@@ -1844,6 +2618,7 @@ def resolve_services_for_start(
     *,
     mode: str | None = None,
 ) -> list[dict[str, Any]]:
+    ensure_service_dependency_graph_ready(model)
     # `mode` is accepted so WG-005 callers can thread the effective mode
     # through the lifecycle pipeline; the dependency expansion + topo sort is
     # mode-agnostic, but keeping the parameter here documents the data-flow
@@ -1860,6 +2635,7 @@ def resolve_services_for_stop(
     model: dict[str, Any],
     requested_services: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    ensure_service_dependency_graph_ready(model)
     requested_ids = [str(service["id"]) for service in requested_services]
     expanded_ids = expand_graph_ids(reverse_service_dependency_graph(model), requested_ids)
     ordered_ids = list(reversed(order_service_ids(model, expanded_ids)))
@@ -1868,10 +2644,7 @@ def resolve_services_for_stop(
 
 
 def translated_runtime_env(root_dir: Path, runtime_env: dict[str, str]) -> dict[str, str]:
-    try:
-        storage = compile_persistence_summary(root_dir, runtime_env)
-    except RuntimeError:
-        storage = None
+    translator = PathTranslator.from_model({"root_dir": str(root_dir), "env": runtime_env})
 
     def _already_host_path(raw_value: str) -> bool:
         raw_text = str(raw_value).strip()
@@ -1882,6 +2655,30 @@ def translated_runtime_env(root_dir: Path, runtime_env: dict[str, str]) -> dict[
             return False
         return not is_runtime_absolute_path(raw_text)
 
+    def _translate_via_host_root_override(raw_value: str) -> str | None:
+        home_prefix = "/home/sandbox"
+        if raw_value == home_prefix or raw_value.startswith(home_prefix + "/"):
+            state_root = str(runtime_env.get("SKILLBOX_STATE_ROOT") or "./.skillbox-state").strip()
+            home_root = host_path_to_absolute_path(root_dir, state_root) / "home"
+            relative = raw_value[len(home_prefix):].lstrip("/")
+            return str((home_root / relative).resolve())
+        root_bindings = (
+            ("/workspace", "SKILLBOX_WORKSPACE_ROOT"),
+            ("/home/sandbox", "SKILLBOX_HOME_ROOT"),
+            ("/monoserver", "SKILLBOX_MONOSERVER_ROOT"),
+        )
+        for runtime_prefix, env_key in root_bindings:
+            host_root = str(runtime_env.get(env_key) or "").strip()
+            if not host_root or not _already_host_path(host_root):
+                continue
+            if raw_value == runtime_prefix:
+                return str(Path(host_root).expanduser().resolve())
+            prefix = runtime_prefix + "/"
+            if raw_value.startswith(prefix):
+                relative = raw_value[len(prefix):]
+                return str((Path(host_root).expanduser() / relative).resolve())
+        return None
+
     translated: dict[str, str] = {}
     for key, value in runtime_env.items():
         if key in {"SKILLBOX_MONOSERVER_HOST_ROOT", "SKILLBOX_CLIENTS_HOST_ROOT"}:
@@ -1890,8 +2687,16 @@ def translated_runtime_env(root_dir: Path, runtime_env: dict[str, str]) -> dict[
         if key in PATH_LIKE_ENV_KEYS and value:
             if _already_host_path(value):
                 translated[key] = str(Path(value).expanduser())
+            elif not Path(value).expanduser().is_absolute():
+                translated[key] = str(Path(value).expanduser())
             else:
-                translated[key] = str(runtime_path_to_host_path(root_dir, runtime_env, value, storage=storage))
+                try:
+                    translated[key] = str(translator.to_host(BoxPath(value)))
+                except PathTranslationError:
+                    fallback = _translate_via_host_root_override(value)
+                    if fallback is None:
+                        raise
+                    translated[key] = fallback
             continue
         translated[key] = value
     translated["ROOT_DIR"] = str(root_dir)
@@ -2043,6 +2848,7 @@ def translated_runtime_command(model: dict[str, Any], item: dict[str, Any]) -> t
     if isinstance(item_env, dict):
         for key, value in item_env.items():
             env[str(key)] = translate_runtime_paths(str(value), runtime_env, translated_env)
+    env["SKILLBOX_MANAGED_RUN"] = "1"
     return command, env
 
 
@@ -2080,6 +2886,7 @@ LOCAL_RUNTIME_ERROR_CODES = {
     "LOCAL_RUNTIME_ENV_OUTPUT_MISSING",
     "LOCAL_RUNTIME_PROFILE_UNKNOWN",
     "LOCAL_RUNTIME_START_BLOCKED",
+    "LOCAL_RUNTIME_PORT_MISMATCH",
     "LOCAL_RUNTIME_SERVICE_DEFERRED",
     "LOCAL_RUNTIME_MODE_UNSUPPORTED",
     "LOCAL_RUNTIME_COVERAGE_GAP",
@@ -2124,9 +2931,527 @@ def _port_listening_state(port: int, *, host: str = "127.0.0.1", timeout: float 
         return {"state": "down", "host": host, "port": port}
 
 
+MCP_READY_DEFAULT_TIMEOUT_SECONDS = 0.2
+MCP_READY_MAX_TIMEOUT_SECONDS = 5.0
+MCP_READY_REQUEST_ID = 1
+
+
+def _mcp_ready_timeout_seconds(healthcheck: dict[str, Any]) -> float:
+    raw_timeout = healthcheck.get("timeout_seconds", MCP_READY_DEFAULT_TIMEOUT_SECONDS)
+    try:
+        timeout = float(raw_timeout)
+    except (TypeError, ValueError):
+        timeout = MCP_READY_DEFAULT_TIMEOUT_SECONDS
+    if timeout <= 0:
+        timeout = MCP_READY_DEFAULT_TIMEOUT_SECONDS
+    return min(timeout, MCP_READY_MAX_TIMEOUT_SECONDS)
+
+
+def _mcp_ready_elapsed_ms(started_at: float) -> int:
+    return max(0, int(round((time.monotonic() - started_at) * 1000)))
+
+
+def _mcp_ready_transport(service: dict[str, Any], healthcheck: dict[str, Any]) -> str:
+    explicit = str(healthcheck.get("transport") or service.get("transport") or "").strip().lower()
+    if explicit:
+        return explicit
+    if healthcheck.get("url"):
+        return "http"
+    if healthcheck.get("port") is not None or service.get("port") is not None:
+        return "tcp"
+    if healthcheck.get("probe_command") or service.get("probe_command") or service.get("command"):
+        return "stdio"
+    return ""
+
+
+def _mcp_probe_host(service: dict[str, Any], healthcheck: dict[str, Any]) -> str:
+    host = str(healthcheck.get("host") or service.get("host") or "127.0.0.1").strip() or "127.0.0.1"
+    if host in {"0.0.0.0", "::"}:
+        return "127.0.0.1"
+    return host
+
+
+def _mcp_probe_port(service: dict[str, Any], healthcheck: dict[str, Any]) -> int | None:
+    raw_port = healthcheck.get("port", service.get("port"))
+    try:
+        port = int(str(raw_port).strip())
+    except (TypeError, ValueError):
+        return None
+    if 1 <= port <= 65535:
+        return port
+    return None
+
+
+def _mcp_initialize_payload() -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": MCP_READY_REQUEST_ID,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {
+                "name": "skillbox-runtime-manager",
+                "version": "mcp-ready-healthcheck",
+            },
+        },
+    }
+
+
+def _mcp_ready_base(
+    *,
+    transport: str,
+    timeout_seconds: float,
+    started_at: float,
+    state: str,
+) -> dict[str, Any]:
+    return {
+        "state": state,
+        "healthcheck_type": MCP_READY_HEALTHCHECK_TYPE,
+        "healthcheck_transport": transport,
+        "transport": transport,
+        "timeout_seconds": timeout_seconds,
+        "elapsed_ms": _mcp_ready_elapsed_ms(started_at),
+    }
+
+
+def _mcp_ready_down(
+    *,
+    transport: str,
+    timeout_seconds: float,
+    started_at: float,
+    reason: str,
+    **extra: Any,
+) -> dict[str, Any]:
+    return _mcp_ready_base(
+        transport=transport,
+        timeout_seconds=timeout_seconds,
+        started_at=started_at,
+        state="down",
+    ) | {"reason": reason} | extra
+
+
+def _mcp_ready_ok(
+    *,
+    transport: str,
+    timeout_seconds: float,
+    started_at: float,
+    **extra: Any,
+) -> dict[str, Any]:
+    return _mcp_ready_base(
+        transport=transport,
+        timeout_seconds=timeout_seconds,
+        started_at=started_at,
+        state="ok",
+    ) | extra
+
+
+def _mcp_raw_excerpt(raw: str, *, limit: int = 240) -> str:
+    compact = " ".join(raw.strip().split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
+
+
+def _mcp_validate_initialize_response(raw: str) -> tuple[bool, dict[str, Any]]:
+    if not raw.strip():
+        return False, {"reason": "no_response"}
+    try:
+        response = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return False, {
+            "reason": "bad_handshake",
+            "protocol_error": f"non-json response: {exc.msg}",
+            "raw_excerpt": _mcp_raw_excerpt(raw),
+        }
+    if not isinstance(response, dict):
+        return False, {
+            "reason": "bad_handshake",
+            "protocol_error": f"expected object response, got {type(response).__name__}",
+            "raw_excerpt": _mcp_raw_excerpt(raw),
+        }
+    if response.get("jsonrpc") != "2.0":
+        return False, {
+            "reason": "bad_handshake",
+            "protocol_error": "missing jsonrpc 2.0 marker",
+            "raw_excerpt": _mcp_raw_excerpt(raw),
+        }
+    if response.get("id") != MCP_READY_REQUEST_ID:
+        return False, {
+            "reason": "bad_handshake",
+            "protocol_error": "response id did not match initialize request",
+            "raw_excerpt": _mcp_raw_excerpt(raw),
+        }
+    if response.get("error") is not None:
+        return False, {
+            "reason": "bad_handshake",
+            "protocol_error": str(response.get("error")),
+            "raw_excerpt": _mcp_raw_excerpt(raw),
+        }
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return False, {
+            "reason": "bad_handshake",
+            "protocol_error": "initialize result missing",
+            "raw_excerpt": _mcp_raw_excerpt(raw),
+        }
+    protocol_version = str(result.get("protocolVersion") or "").strip()
+    if not protocol_version:
+        return False, {
+            "reason": "bad_handshake",
+            "protocol_error": "initialize result missing protocolVersion",
+            "raw_excerpt": _mcp_raw_excerpt(raw),
+        }
+    return True, {
+        "protocol_version": protocol_version,
+        "raw_excerpt": _mcp_raw_excerpt(raw),
+    }
+
+
+def _mcp_ready_tcp(service: dict[str, Any], healthcheck: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
+    started_at = time.monotonic()
+    transport = "tcp"
+    host = _mcp_probe_host(service, healthcheck)
+    port = _mcp_probe_port(service, healthcheck)
+    if port is None:
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="missing_port",
+            host=host,
+        )
+    request = json.dumps(_mcp_initialize_payload(), separators=(",", ":")) + "\n"
+    try:
+        with socket.create_connection((host, port), timeout=timeout_seconds) as sock:
+            sock.settimeout(timeout_seconds)
+            sock.sendall(request.encode("utf-8"))
+            with sock.makefile("r", encoding="utf-8", newline="\n") as reader:
+                raw = reader.readline()
+    except (ConnectionRefusedError, FileNotFoundError):
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="refused",
+            host=host,
+            port=port,
+            target=f"{host}:{port}",
+        )
+    except socket.timeout:
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="no_response",
+            host=host,
+            port=port,
+            target=f"{host}:{port}",
+        )
+    except OSError as exc:
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="connection_error",
+            error=str(exc),
+            host=host,
+            port=port,
+            target=f"{host}:{port}",
+        )
+    ok, detail = _mcp_validate_initialize_response(raw)
+    common = {"host": host, "port": port, "target": f"{host}:{port}"}
+    if ok:
+        return _mcp_ready_ok(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            **common,
+            **detail,
+        )
+    return _mcp_ready_down(
+        transport=transport,
+        timeout_seconds=timeout_seconds,
+        started_at=started_at,
+        **common,
+        **detail,
+    )
+
+
+def _mcp_ready_http(service: dict[str, Any], healthcheck: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
+    started_at = time.monotonic()
+    transport = "http"
+    url = str(healthcheck.get("url") or "").strip()
+    if not url:
+        port = _mcp_probe_port(service, healthcheck)
+        if port is not None:
+            url = f"http://{_mcp_probe_host(service, healthcheck)}:{port}"
+    if not url:
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="missing_url",
+        )
+    body = json.dumps(_mcp_initialize_payload(), separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(url, data=body, method="POST")
+    request.add_header("content-type", "application/json")
+    request.add_header("accept", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            status_code = response.getcode()
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="bad_handshake",
+            protocol_error=f"http {exc.code}: {exc.reason}",
+            raw_excerpt=_mcp_raw_excerpt(raw),
+            url=url,
+            status_code=exc.code,
+            target=url,
+        )
+    except urllib.error.URLError as exc:
+        reason = exc.reason
+        if isinstance(reason, ConnectionRefusedError):
+            failure_reason = "refused"
+        elif isinstance(reason, TimeoutError):
+            failure_reason = "no_response"
+        else:
+            failure_reason = "connection_error"
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason=failure_reason,
+            error=str(reason),
+            url=url,
+            target=url,
+        )
+    except (TimeoutError, socket.timeout):
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="no_response",
+            url=url,
+            target=url,
+        )
+    except OSError as exc:
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="connection_error",
+            error=str(exc),
+            url=url,
+            target=url,
+        )
+    ok, detail = _mcp_validate_initialize_response(raw)
+    common = {"url": url, "target": url, "status_code": status_code}
+    if ok:
+        return _mcp_ready_ok(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            **common,
+            **detail,
+        )
+    return _mcp_ready_down(
+        transport=transport,
+        timeout_seconds=timeout_seconds,
+        started_at=started_at,
+        **common,
+        **detail,
+    )
+
+
+def _terminate_mcp_probe_process(process: subprocess.Popen[str]) -> None:
+    for stream in (process.stdin, process.stdout, process.stderr):
+        try:
+            if stream is not None:
+                stream.close()
+        except OSError:
+            pass
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+    except OSError:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=0.2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except OSError:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _mcp_ready_stdio(service: dict[str, Any], healthcheck: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
+    started_at = time.monotonic()
+    transport = "stdio"
+    command = str(
+        healthcheck.get("probe_command")
+        or service.get("probe_command")
+        or service.get("command")
+        or ""
+    ).strip()
+    if not command:
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="missing_command",
+        )
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+            text=True,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="spawn_failed",
+            error=str(exc),
+            source_command=command,
+        )
+
+    try:
+        assert process.stdin is not None
+        process.stdin.write(json.dumps(_mcp_initialize_payload(), separators=(",", ":")) + "\n")
+        process.stdin.flush()
+        assert process.stdout is not None
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            events = selector.select(timeout_seconds)
+        finally:
+            selector.close()
+        if not events:
+            if process.poll() is not None:
+                stderr = ""
+                try:
+                    stderr = process.stderr.read() if process.stderr is not None else ""
+                except OSError:
+                    stderr = ""
+                return _mcp_ready_down(
+                    transport=transport,
+                    timeout_seconds=timeout_seconds,
+                    started_at=started_at,
+                    reason="nonzero_exit" if process.returncode else "no_response",
+                    exit_code=process.returncode,
+                    stderr_excerpt=_mcp_raw_excerpt(stderr),
+                    source_command=command,
+                )
+            return _mcp_ready_down(
+                transport=transport,
+                timeout_seconds=timeout_seconds,
+                started_at=started_at,
+                reason="no_response",
+                source_command=command,
+            )
+        raw_chunk = os.read(process.stdout.fileno(), 65536).decode("utf-8", errors="replace")
+        raw_lines = [line for line in raw_chunk.splitlines() if line.strip()]
+        raw = raw_lines[0] if raw_lines else raw_chunk
+    except (BrokenPipeError, OSError) as exc:
+        return _mcp_ready_down(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            reason="connection_error",
+            error=str(exc),
+            source_command=command,
+        )
+    finally:
+        _terminate_mcp_probe_process(process)
+
+    ok, detail = _mcp_validate_initialize_response(raw)
+    common = {"source_command": command}
+    if ok:
+        return _mcp_ready_ok(
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            **common,
+            **detail,
+        )
+    return _mcp_ready_down(
+        transport=transport,
+        timeout_seconds=timeout_seconds,
+        started_at=started_at,
+        **common,
+        **detail,
+    )
+
+
+def mcp_ready_state(service: dict[str, Any], healthcheck: dict[str, Any]) -> dict[str, Any]:
+    timeout_seconds = _mcp_ready_timeout_seconds(healthcheck)
+    transport = _mcp_ready_transport(service, healthcheck)
+    if transport == "tcp":
+        return _mcp_ready_tcp(service, healthcheck, timeout_seconds)
+    if transport == "http":
+        return _mcp_ready_http(service, healthcheck, timeout_seconds)
+    if transport == "stdio":
+        return _mcp_ready_stdio(service, healthcheck, timeout_seconds)
+    started_at = time.monotonic()
+    return _mcp_ready_down(
+        transport=transport or "unknown",
+        timeout_seconds=timeout_seconds,
+        started_at=started_at,
+        reason="unsupported_transport",
+    )
+
+
 def _service_declared_listen_port(service: dict[str, Any]) -> tuple[str, int] | None:
     healthcheck = service.get("healthcheck") or {}
     hc_type = healthcheck.get("type")
+    if hc_type == MCP_READY_HEALTHCHECK_TYPE:
+        transport = _mcp_ready_transport(service, healthcheck)
+        if transport == "tcp":
+            port = _mcp_probe_port(service, healthcheck)
+            if port is None:
+                return None
+            return _mcp_probe_host(service, healthcheck), port
+        if transport == "http":
+            url = str(healthcheck.get("url") or "").strip()
+            if url:
+                try:
+                    parsed = urllib.parse.urlparse(url)
+                except ValueError:
+                    return None
+                host = parsed.hostname or "127.0.0.1"
+                if parsed.port is not None:
+                    return host, int(parsed.port)
+                if parsed.scheme == "https":
+                    return host, 443
+                if parsed.scheme == "http":
+                    return host, 80
+            port = _mcp_probe_port(service, healthcheck)
+            if port is not None:
+                return _mcp_probe_host(service, healthcheck), port
+            return None
+        return None
     if hc_type == "port":
         try:
             port = int(healthcheck["port"])
@@ -2186,6 +3511,510 @@ def _external_listener_owner(host: str, port: int) -> dict[str, Any] | None:
     except OSError:
         pass
     return owner
+
+
+def _declared_ports_for_service(model: dict[str, Any], service: dict[str, Any]) -> list[int]:
+    service_id = str(service.get("id") or "").strip()
+    if not service_id:
+        return []
+    try:
+        return declared_service_ports(model, service_id)
+    except Exception:
+        declared = _service_declared_listen_port(service)
+        return [declared[1]] if declared is not None else []
+
+
+def _parse_proc_stat_ppid(stat_text: str) -> int | None:
+    _before, _sep, after = stat_text.rpartition(")")
+    fields = after.split()
+    if len(fields) < 2:
+        return None
+    try:
+        return int(fields[1])
+    except ValueError:
+        return None
+
+
+def _process_tree_pids(root_pid: int) -> set[int]:
+    pids: set[int] = {int(root_pid)}
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return pids
+
+    changed = True
+    while changed:
+        changed = False
+        for child in proc_root.iterdir():
+            if not child.name.isdigit():
+                continue
+            try:
+                pid = int(child.name)
+            except ValueError:
+                continue
+            if pid in pids:
+                continue
+            try:
+                ppid = _parse_proc_stat_ppid((child / "stat").read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+            if ppid in pids:
+                pids.add(pid)
+                changed = True
+    return pids
+
+
+def _all_proc_pids() -> set[int]:
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return set()
+    pids: set[int] = set()
+    for child in proc_root.iterdir():
+        if not child.name.isdigit():
+            continue
+        try:
+            pids.add(int(child.name))
+        except ValueError:
+            continue
+    return pids
+
+
+def process_tree_pids(root_pid: int) -> set[int]:
+    """Return the root process and descendants visible through /proc."""
+    return _process_tree_pids(root_pid)
+
+
+def _parse_listener_port(raw_local_address: str) -> int | None:
+    value = str(raw_local_address or "").strip()
+    if not value:
+        return None
+    if value.startswith("[") and "]:" in value:
+        port_text = value.rsplit("]:", 1)[1]
+    elif ":" in value:
+        port_text = value.rsplit(":", 1)[1]
+    else:
+        return None
+    port_text = port_text.strip()
+    if port_text == "*":
+        return None
+    try:
+        return int(port_text)
+    except ValueError:
+        return None
+
+
+def _parse_ss_listener_rows(stdout: str, target_pids: set[int]) -> list[dict[str, Any]]:
+    listeners: list[dict[str, Any]] = []
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 5)
+        if len(parts) < 4:
+            continue
+        if parts[0].upper() != "LISTEN":
+            continue
+        port = _parse_listener_port(parts[3])
+        if port is None:
+            continue
+        pids = {
+            int(match.group(1))
+            for match in re.finditer(r"pid=(\d+)", parts[5] if len(parts) > 5 else "")
+        }
+        for pid in sorted(pids & target_pids):
+            listeners.append({"pid": pid, "port": port, "source": "ss"})
+    return listeners
+
+
+def _ss_process_tree_listeners(target_pids: set[int]) -> list[dict[str, Any]]:
+    if shutil.which("ss") is None:
+        return []
+    result = run_command(["ss", "-H", "-tlnp"])
+    if result.returncode != 0:
+        return []
+    return _parse_ss_listener_rows(result.stdout, target_pids)
+
+
+def _proc_net_tcp_listen_inodes(path: Path) -> dict[str, int]:
+    inodes: dict[str, int] = {}
+    try:
+        rows = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return inodes
+    for raw_line in rows[1:]:
+        parts = raw_line.split()
+        if len(parts) < 10 or parts[3] != "0A":
+            continue
+        _host_hex, _sep, port_hex = parts[1].partition(":")
+        if not port_hex:
+            continue
+        try:
+            port = int(port_hex, 16)
+        except ValueError:
+            continue
+        inode = parts[9]
+        if inode:
+            inodes[inode] = port
+    return inodes
+
+
+def _proc_socket_inode(fd_path: Path) -> str | None:
+    try:
+        target = os.readlink(fd_path)
+    except OSError:
+        return None
+    match = re.fullmatch(r"socket:\[(\d+)\]", target)
+    return match.group(1) if match else None
+
+
+def _proc_process_tree_listeners(target_pids: set[int]) -> list[dict[str, Any]]:
+    inode_to_port: dict[str, int] = {}
+    inode_to_port.update(_proc_net_tcp_listen_inodes(Path("/proc/net/tcp")))
+    inode_to_port.update(_proc_net_tcp_listen_inodes(Path("/proc/net/tcp6")))
+    if not inode_to_port:
+        return []
+
+    listeners: list[dict[str, Any]] = []
+    seen: set[tuple[int, int]] = set()
+    for pid in sorted(target_pids):
+        fd_dir = Path("/proc") / str(pid) / "fd"
+        try:
+            fd_paths = list(fd_dir.iterdir())
+        except OSError:
+            continue
+        for fd_path in fd_paths:
+            inode = _proc_socket_inode(fd_path)
+            if inode is None or inode not in inode_to_port:
+                continue
+            port = inode_to_port[inode]
+            key = (pid, port)
+            if key in seen:
+                continue
+            seen.add(key)
+            listeners.append({"pid": pid, "port": port, "source": "proc"})
+    return listeners
+
+
+def _process_tree_listener_snapshot(pid: int) -> dict[str, Any]:
+    pids = _process_tree_pids(pid)
+    listeners = _ss_process_tree_listeners(pids)
+    source = "ss"
+    if not listeners:
+        listeners = _proc_process_tree_listeners(pids)
+        source = "proc"
+    observed_ports = sorted({int(listener["port"]) for listener in listeners if listener.get("port") is not None})
+    return {
+        "pid": pid,
+        "pids": sorted(pids),
+        "listeners": listeners,
+        "observed_ports": observed_ports,
+        "source": source,
+    }
+
+
+def process_tree_listener_snapshot(pid: int) -> dict[str, Any]:
+    """Return listening ports owned by a process tree."""
+    return _process_tree_listener_snapshot(pid)
+
+
+def all_process_listeners() -> list[dict[str, Any]]:
+    """Return visible listening sockets keyed by owning process pid."""
+    pids = _all_proc_pids()
+    if not pids:
+        return []
+    listeners = _proc_process_tree_listeners(pids)
+    if not listeners:
+        listeners = _ss_process_tree_listeners(pids)
+    return sorted(
+        listeners,
+        key=lambda item: (int(item.get("port") or 0), int(item.get("pid") or 0)),
+    )
+
+
+def _service_port_guard_disabled() -> bool:
+    return str(os.environ.get("SKILLBOX_PORT_GUARD") or "").strip().lower() == "off"
+
+
+def _port_guard_telemetry_path(root_dir: Path) -> Path:
+    return Path(root_dir) / "logs" / "runtime" / PORT_GUARD_TELEMETRY_NAME
+
+
+def _record_port_guard_telemetry(root_dir: Path, counter: str) -> None:
+    if counter not in {"post_bind_mismatches"}:
+        return
+    path = _port_guard_telemetry_path(root_dir)
+
+    def mutate(current: Any) -> dict[str, Any]:
+        payload = current if isinstance(current, dict) else {}
+        counters = payload.get("counters") if isinstance(payload.get("counters"), dict) else {}
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        counters[counter] = int(counters.get(counter) or 0) + 1
+        counters.setdefault("first_seen_at", stamp)
+        counters["last_seen_at"] = stamp
+        payload["counters"] = counters
+        return payload
+
+    try:
+        locked_json_update(path, mutate)
+    except (StateLockTimeout, OSError):
+        pass
+
+
+def _verify_service_declared_ports(
+    model: dict[str, Any],
+    service: dict[str, Any],
+    pid: int | None,
+    *,
+    attempts: int = 3,
+    sleep_seconds: float = 1.0,
+) -> dict[str, Any]:
+    declared_ports = _declared_ports_for_service(model, service)
+    if not declared_ports:
+        return {"state": "not-declared", "declared_ports": []}
+    if _service_port_guard_disabled():
+        return {"state": "skipped", "reason": "SKILLBOX_PORT_GUARD=off", "declared_ports": declared_ports}
+    if pid is None:
+        return {
+            "state": "unknown",
+            "reason": "pid unavailable",
+            "declared_ports": declared_ports,
+            "observed_ports": [],
+        }
+
+    attempts = max(1, int(attempts))
+    declared = set(declared_ports)
+    snapshot: dict[str, Any] = {
+        "pid": pid,
+        "pids": [pid],
+        "listeners": [],
+        "observed_ports": [],
+        "source": "unknown",
+    }
+    for attempt in range(1, attempts + 1):
+        snapshot = _process_tree_listener_snapshot(pid)
+        observed_ports = sorted({int(port) for port in snapshot.get("observed_ports") or []})
+        matches = sorted(declared & set(observed_ports))
+        if matches:
+            return {
+                "state": "ok",
+                "declared_ports": declared_ports,
+                "observed_ports": observed_ports,
+                "verified_port": matches[0],
+                "verified_ports": matches,
+                "pid": pid,
+                "process_pids": snapshot.get("pids") or [pid],
+                "listeners": snapshot.get("listeners") or [],
+                "source": snapshot.get("source"),
+                "attempts": attempt,
+            }
+        if attempt < attempts:
+            time.sleep(sleep_seconds)
+
+    return {
+        "state": "mismatch",
+        "declared_ports": declared_ports,
+        "observed_ports": sorted({int(port) for port in snapshot.get("observed_ports") or []}),
+        "pid": pid,
+        "process_pids": snapshot.get("pids") or [pid],
+        "listeners": snapshot.get("listeners") or [],
+        "source": snapshot.get("source"),
+        "attempts": attempts,
+    }
+
+
+def _external_declared_listener_verification(
+    model: dict[str, Any],
+    service: dict[str, Any],
+    reason: str,
+) -> dict[str, Any] | None:
+    declared_ports = _declared_ports_for_service(model, service)
+    if not declared_ports or _service_port_guard_disabled():
+        return None
+
+    declared_listener = _service_declared_listen_port(service)
+    host = declared_listener[0] if declared_listener is not None else "127.0.0.1"
+    observed_ports: list[int] = []
+    listeners: list[dict[str, Any]] = []
+    for port in declared_ports:
+        port_state = _port_listening_state(port, host=host)
+        if port_state.get("state") != "ok":
+            continue
+        observed_ports.append(int(port))
+        listener: dict[str, Any] = {
+            "host": host,
+            "port": int(port),
+            "source": "external-listener",
+        }
+        owner = _external_listener_owner(host, int(port))
+        if owner:
+            listener.update({
+                key: value
+                for key, value in owner.items()
+                if key in {"pid", "command", "age"}
+            })
+        listeners.append(listener)
+
+    if not observed_ports:
+        return None
+
+    matches = sorted(set(declared_ports) & set(observed_ports))
+    process_pids = sorted({
+        int(listener["pid"])
+        for listener in listeners
+        if isinstance(listener.get("pid"), int)
+    })
+    verification: dict[str, Any] = {
+        "state": "ok" if matches else "mismatch",
+        "reason": reason,
+        "declared_ports": declared_ports,
+        "observed_ports": sorted(set(observed_ports)),
+        "process_pids": process_pids,
+        "listeners": listeners,
+        "source": "external-listener",
+        "attempts": 1,
+    }
+    if matches:
+        verification["verified_port"] = matches[0]
+        verification["verified_ports"] = matches
+    return verification
+
+
+def _port_mismatch_next_actions(service: dict[str, Any]) -> list[str]:
+    sid = str(service.get("id") or "<service>")
+    return [
+        f"free the declared port and re-run `sbp up {sid}`",
+        "fix the service command/env so it binds the declared registry port",
+        "run `manage.py ports --resolve " + sid + " --format json` to inspect the contract",
+    ]
+
+
+def _port_mismatch_error(service: dict[str, Any], verification: dict[str, Any]) -> dict[str, Any]:
+    sid = str(service.get("id") or "<service>")
+    declared = verification.get("declared_ports") or []
+    observed = verification.get("observed_ports") or []
+    next_actions = _port_mismatch_next_actions(service)
+    err = local_runtime_error(
+        LOCAL_RUNTIME_PORT_MISMATCH,
+        (
+            f"Service {sid!r} did not listen on its declared port(s) "
+            f"{declared}; observed process-tree port(s): {observed or 'none'}."
+        ),
+        recoverable=True,
+        blocked_services=[sid],
+        next_action=next_actions[0],
+    )
+    err["error"].update({
+        "service": sid,
+        "declared_ports": declared,
+        "observed_ports": observed,
+        "process_pids": verification.get("process_pids") or [],
+        "listeners": verification.get("listeners") or [],
+        "next_actions": next_actions,
+    })
+    return err
+
+
+def _copy_port_verification_fields(detail: dict[str, Any], verification: dict[str, Any]) -> None:
+    if verification.get("state") in {"not-declared", "skipped"}:
+        return
+    detail["port_verification"] = {
+        key: verification[key]
+        for key in (
+            "state",
+            "declared_ports",
+            "observed_ports",
+            "verified_port",
+            "verified_ports",
+            "process_pids",
+            "source",
+            "attempts",
+            "reason",
+        )
+        if key in verification
+    }
+    if verification.get("verified_port") is not None:
+        detail["verified_port"] = verification["verified_port"]
+    if verification.get("verified_ports"):
+        detail["verified_ports"] = verification["verified_ports"]
+
+
+def _unverified_reuse_mismatch(
+    model: dict[str, Any],
+    service: dict[str, Any],
+    pid: int | None,
+    reason: str,
+) -> dict[str, Any] | None:
+    declared_ports = _declared_ports_for_service(model, service)
+    if not declared_ports or _service_port_guard_disabled():
+        return None
+    verification: dict[str, Any] = {
+        "state": "mismatch",
+        "reason": reason,
+        "declared_ports": declared_ports,
+        "observed_ports": [],
+        "process_pids": [pid] if pid is not None else [],
+        "listeners": [],
+        "source": "unverified-reuse",
+        "attempts": 0,
+    }
+    if pid is not None:
+        verification["pid"] = pid
+    return verification
+
+
+def first_service_error_payload(service_results: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for entry in service_results:
+        error_block = entry.get("error")
+        if not isinstance(error_block, dict):
+            continue
+        error_type = str(error_block.get("type") or "").strip()
+        if error_type.startswith("LOCAL_RUNTIME_"):
+            return {"error": copy.deepcopy(error_block)}
+    return None
+
+
+def _service_port_mismatch_result(
+    service: dict[str, Any],
+    result: dict[str, Any],
+    paths: dict[str, Path],
+    pid: int | None,
+    verification: dict[str, Any],
+    event_root: Path,
+    *,
+    remove_pid: bool,
+) -> dict[str, Any]:
+    stop_result: str | None = None
+    signal_used: int | None = None
+    if pid is not None:
+        stop_result, signal_used = stop_process(pid, DEFAULT_SERVICE_STOP_WAIT_SECONDS)
+    if remove_pid:
+        remove_pid_file(paths["pid_file"])
+
+    detail = result | {
+        "result": "failed",
+        "reason": "port_mismatch",
+        "tail": tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES),
+    }
+    if pid is not None:
+        detail["pid"] = pid
+    if stop_result is not None:
+        detail["stop_result"] = stop_result
+    if signal_used is not None:
+        detail["signal"] = signal_used
+    _copy_port_verification_fields(detail, verification)
+    detail.update(_port_mismatch_error(service, verification))
+    log_runtime_event(
+        "service.port_mismatch",
+        service["id"],
+        {
+            "declared": verification.get("declared_ports") or [],
+            "observed": verification.get("observed_ports") or [],
+            "action": "stopped" if pid is not None else "blocked",
+            "stop_result": stop_result,
+        },
+        root_dir=event_root,
+    )
+    _record_port_guard_telemetry(event_root, "post_bind_mismatches")
+    return detail
 
 
 def _port_conflict_blocked_result(
@@ -2912,6 +4741,9 @@ def service_healthcheck_state(service: dict[str, Any]) -> dict[str, Any]:
         host = str(healthcheck.get("host") or "127.0.0.1")
         return _port_listening_state(port, host=host)
 
+    if healthcheck_type == MCP_READY_HEALTHCHECK_TYPE:
+        return mcp_ready_state(service, healthcheck)
+
     if healthcheck_type == "process_running":
         pattern = str(healthcheck["pattern"]).strip()
         if not pattern:
@@ -3043,11 +4875,13 @@ def select_tasks(model: dict[str, Any], task_ids: list[str] | None) -> list[dict
     }
     unknown = sorted(task_id for task_id in requested_ids if task_id not in available)
     if unknown:
-        raise RuntimeError(
+        raise ValidationError(
+            "runtime_error",
             "Unknown task id(s): "
             + ", ".join(unknown)
             + ". Available tasks: "
-            + (", ".join(sorted(available)) or "(none)")
+            + (", ".join(sorted(available)) or "(none)"),
+            context={"unknown": unknown, "available": sorted(available)},
         )
     if not requested_ids:
         return list(model["tasks"])
@@ -3095,11 +4929,13 @@ def select_services(model: dict[str, Any], service_ids: list[str] | None) -> lis
     }
     unknown = sorted(service_id for service_id in requested_ids if service_id not in available)
     if unknown:
-        raise RuntimeError(
+        raise ValidationError(
+            "runtime_error",
             "Unknown service id(s): "
             + ", ".join(unknown)
             + ". Available services: "
-            + (", ".join(sorted(available)) or "(none)")
+            + (", ".join(sorted(available)) or "(none)"),
+            context={"unknown": unknown, "available": sorted(available)},
         )
     if not requested_ids:
         return list(model["services"])
@@ -3156,7 +4992,11 @@ def ensure_required_env_files_ready(env_files: list[dict[str, Any]]) -> None:
         unresolved.append(f"{env_file['id']} ({detail})")
 
     if unresolved:
-        raise RuntimeError(f"Required env files are not ready: {', '.join(unresolved)}")
+        raise ValidationError(
+            "missing_env_file",
+            f"Required env files are not ready: {', '.join(unresolved)}",
+            context={"unresolved": unresolved},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3280,8 +5120,10 @@ def run_tasks(
                 for dependency_id, dependency_state in task_state.get("dependency_states", {}).items()
                 if dependency_state != "ok"
             ]
-            raise RuntimeError(
-                f"Task {task['id']} is blocked by incomplete dependencies: {', '.join(blocked_on)}"
+            raise StateConflictError(
+                "runtime_error",
+                f"Task {task['id']} is blocked by incomplete dependencies: {', '.join(blocked_on)}",
+                context={"task": task["id"], "blocked_on": blocked_on},
             )
 
         command, env = translated_runtime_command(model, task)
@@ -3324,17 +5166,21 @@ def run_tasks(
                 except subprocess.TimeoutExpired:
                     pass
                 log_runtime_event("task.failed", task["id"], {"reason": "timeout"}, root_dir=event_root)
-                raise RuntimeError(
+                raise RuntimeLifecycleError(
+                    "runtime_error",
                     f"Task {task['id']} timed out after {task_timeout:.0f}s. "
-                    "Increase 'timeout_seconds' on the task to allow more time."
+                    "Increase 'timeout_seconds' on the task to allow more time.",
+                    context={"task": task["id"], "timeout_seconds": task_timeout},
                 )
 
         if returncode != 0:
             tail = tail_lines(paths["log_file"], DEFAULT_LOG_TAIL_LINES)
             log_runtime_event("task.failed", task["id"], {"exit_code": returncode}, root_dir=event_root)
-            raise RuntimeError(
+            raise RuntimeLifecycleError(
+                "runtime_error",
                 f"Task {task['id']} failed with exit code {returncode}."
-                + (f" Recent logs: {' | '.join(tail)}" if tail else "")
+                + (f" Recent logs: {' | '.join(tail)}" if tail else ""),
+                context={"task": task["id"], "exit_code": returncode},
             )
 
         post_state = probe_task(model, task)
@@ -3346,10 +5192,12 @@ def run_tasks(
                 {"reason": "success_check_unsatisfied"},
                 root_dir=event_root,
             )
-            raise RuntimeError(
+            raise RuntimeLifecycleError(
+                "runtime_error",
                 f"Task {task['id']} completed but did not satisfy its success check."
                 + (f" Success target: {post_state['target']}." if post_state.get("target") else "")
-                + (f" Recent logs: {' | '.join(tail)}" if tail else "")
+                + (f" Recent logs: {' | '.join(tail)}" if tail else ""),
+                context={"task": task["id"], "target": post_state.get("target")},
             )
 
         results.append(result | {"result": "completed", "target": post_state.get("target")})
@@ -3367,13 +5215,54 @@ def _service_start_base_result(service: dict[str, Any], paths: dict[str, Path]) 
 
 
 def _prelaunch_running_result(
+    model: dict[str, Any],
     service: dict[str, Any],
     result: dict[str, Any],
+    paths: dict[str, Path],
     event_root: Path,
 ) -> dict[str, Any] | None:
     prelaunch_health = service_healthcheck_state(service)
     if prelaunch_health.get("state") != "ok":
         return None
+    verification = _external_declared_listener_verification(
+        model,
+        service,
+        "healthcheck was already healthy before runtime launched the service",
+    )
+    if verification is not None:
+        if verification.get("state") == "mismatch":
+            return _service_port_mismatch_result(
+                service,
+                result,
+                paths,
+                None,
+                verification,
+                event_root,
+                remove_pid=False,
+            )
+        reused_result = result | {"result": "already-running"}
+        for key in ("url", "target", "port"):
+            if key in prelaunch_health:
+                reused_result[key] = prelaunch_health[key]
+        _copy_port_verification_fields(reused_result, verification)
+        log_runtime_event("service.reused", service["id"], root_dir=event_root)
+        return reused_result
+    unverified = _unverified_reuse_mismatch(
+        model,
+        service,
+        None,
+        "healthcheck was already healthy before runtime launched the service",
+    )
+    if unverified is not None:
+        return _service_port_mismatch_result(
+            service,
+            result,
+            paths,
+            None,
+            unverified,
+            event_root,
+            remove_pid=False,
+        )
     reused_result = result | {"result": "already-running"}
     for key in ("url", "target", "port"):
         if key in prelaunch_health:
@@ -3388,6 +5277,7 @@ def _service_has_declared_healthcheck(service: dict[str, Any]) -> bool:
 
 
 def _running_pid_service_result(
+    model: dict[str, Any],
     service: dict[str, Any],
     result: dict[str, Any],
     paths: dict[str, Path],
@@ -3403,6 +5293,18 @@ def _running_pid_service_result(
     if health_state.get("state") == "ok":
         reused_result = result | {"result": "already-running", "pid": pid}
         _copy_health_fields(reused_result, health_state, ("url", "target", "port", "pattern"))
+        verification = _verify_service_declared_ports(model, service, pid)
+        if verification.get("state") == "mismatch":
+            return _service_port_mismatch_result(
+                service,
+                result,
+                paths,
+                pid,
+                verification,
+                event_root,
+                remove_pid=True,
+            )
+        _copy_port_verification_fields(reused_result, verification)
         log_runtime_event("service.reused", service["id"], root_dir=event_root)
         return reused_result
 
@@ -3492,9 +5394,7 @@ def _spawn_service_process(command: list[str], cwd: Path, env: dict[str, str], l
 
 def _write_managed_service_pid(process: subprocess.Popen[str], pid_file: Path) -> None:
     try:
-        tmp_pid = pid_file.with_suffix(pid_file.suffix + ".tmp")
-        tmp_pid.write_text(f"{process.pid}\n", encoding="utf-8")
-        os.replace(tmp_pid, pid_file)
+        atomic_write_bytes(pid_file, f"{process.pid}\n".encode("utf-8"), mode=0o644)
     except OSError:
         try:
             os.killpg(os.getpgid(process.pid), signal.SIGTERM)
@@ -3552,6 +5452,7 @@ def _timeout_service_start_result(
 
 
 def _self_managed_reused_result(
+    model: dict[str, Any],
     service: dict[str, Any],
     result: dict[str, Any],
     paths: dict[str, Path],
@@ -3564,23 +5465,74 @@ def _self_managed_reused_result(
         _copy_health_fields(detail, health_state, ("exit_code", "target"))
         log_runtime_event("service.start_failed", service["id"], {"state": "failed"}, root_dir=event_root)
         return detail
+    verification = _verify_service_declared_ports(model, service, started_pid)
+    if verification.get("state") == "mismatch":
+        return _service_port_mismatch_result(
+            service,
+            result,
+            paths,
+            started_pid,
+            verification,
+            event_root,
+            remove_pid=True,
+        )
     started_detail = result | {"result": "started", "pid": started_pid}
     _copy_health_fields(started_detail, health_state, ("target",))
+    _copy_port_verification_fields(started_detail, verification)
     log_runtime_event("service.started", service["id"], {"pid": started_pid}, root_dir=event_root)
     return started_detail
 
 
 def _reused_existing_service_result(
+    model: dict[str, Any],
     service: dict[str, Any],
     result: dict[str, Any],
     paths: dict[str, Path],
+    process: subprocess.Popen[str],
     health_state: dict[str, Any],
     self_managed_pid_file: bool,
     event_root: Path,
 ) -> dict[str, Any]:
     if self_managed_pid_file:
-        return _self_managed_reused_result(service, result, paths, health_state, event_root)
+        return _self_managed_reused_result(model, service, result, paths, health_state, event_root)
     remove_pid_file(paths["pid_file"])
+    verification = _external_declared_listener_verification(
+        model,
+        service,
+        "launcher exited before owning a declared listener",
+    )
+    if verification is not None:
+        if verification.get("state") == "mismatch":
+            return _service_port_mismatch_result(
+                service,
+                result,
+                paths,
+                process.pid,
+                verification,
+                event_root,
+                remove_pid=True,
+            )
+        reused_result = result | {"result": "already-running"}
+        _copy_health_fields(reused_result, health_state, ("url", "target"))
+        _copy_port_verification_fields(reused_result, verification)
+        log_runtime_event("service.reused", service["id"], root_dir=event_root)
+        return reused_result
+    unverified = _unverified_reuse_mismatch(
+        model,
+        service,
+        process.pid,
+        "launcher exited before owning a declared listener",
+    )
+    if unverified is not None:
+        return _service_port_mismatch_result(
+            service,
+            result,
+            paths,
+            process.pid,
+            unverified,
+            event_root,
+            remove_pid=True,
+        )
     reused_result = result | {"result": "already-running"}
     _copy_health_fields(reused_result, health_state, ("url", "target"))
     log_runtime_event("service.reused", service["id"], root_dir=event_root)
@@ -3588,6 +5540,7 @@ def _reused_existing_service_result(
 
 
 def _healthy_service_start_result(
+    model: dict[str, Any],
     service: dict[str, Any],
     result: dict[str, Any],
     paths: dict[str, Path],
@@ -3599,6 +5552,18 @@ def _healthy_service_start_result(
     started_detail = result | {"result": "started"}
     if started_pid is not None:
         started_detail["pid"] = started_pid
+    verification = _verify_service_declared_ports(model, service, started_pid)
+    if verification.get("state") == "mismatch":
+        return _service_port_mismatch_result(
+            service,
+            result,
+            paths,
+            started_pid,
+            verification,
+            event_root,
+            remove_pid=not self_managed_pid_file,
+        )
+    _copy_port_verification_fields(started_detail, verification)
     log_runtime_event(
         "service.started",
         service["id"],
@@ -3610,6 +5575,7 @@ def _healthy_service_start_result(
 
 
 def _service_health_start_result(
+    model: dict[str, Any],
     service: dict[str, Any],
     result: dict[str, Any],
     paths: dict[str, Path],
@@ -3633,14 +5599,16 @@ def _service_health_start_result(
         return _timeout_service_start_result(service, result, paths, process, health_state, event_root)
     if health_state.get("reused_existing"):
         return _reused_existing_service_result(
+            model,
             service,
             result,
             paths,
+            process,
             health_state,
             self_managed_pid_file,
             event_root,
         )
-    return _healthy_service_start_result(service, result, paths, process, self_managed_pid_file, event_root)
+    return _healthy_service_start_result(model, service, result, paths, process, self_managed_pid_file, event_root)
 
 
 def _start_service(
@@ -3661,6 +5629,7 @@ def _start_service(
     pid = live_service_pid(paths["pid_file"])
     if pid is not None:
         running_result = _running_pid_service_result(
+            model,
             service,
             result,
             paths,
@@ -3671,7 +5640,7 @@ def _start_service(
         if running_result is not None:
             return running_result
 
-    prelaunch_result = _prelaunch_running_result(service, result, event_root)
+    prelaunch_result = _prelaunch_running_result(model, service, result, paths, event_root)
     if prelaunch_result is not None:
         return prelaunch_result
 
@@ -3694,6 +5663,7 @@ def _start_service(
     if not self_managed_pid_file:
         _write_managed_service_pid(process, paths["pid_file"])
     return _service_health_start_result(
+        model,
         service,
         result,
         paths,
@@ -3734,7 +5704,7 @@ def _already_running_short_circuit(
     base = _service_start_base_result(service, paths)
     pid = live_service_pid(paths["pid_file"])
     if pid is None:
-        prelaunch = _prelaunch_running_result(service, base, event_root)
+        prelaunch = _prelaunch_running_result(model, service, base, paths, event_root)
         return _annotate_degraded_deps(prelaunch, blocked_on)
     if not _service_has_declared_healthcheck(service):
         return _annotate_degraded_deps(base | {"result": "already-running", "pid": pid}, blocked_on)
@@ -3743,6 +5713,21 @@ def _already_running_short_circuit(
         return None
     reused_result = base | {"result": "already-running", "pid": pid}
     _copy_health_fields(reused_result, health_state, ("url", "target", "port", "pattern"))
+    verification = _verify_service_declared_ports(model, service, pid)
+    if verification.get("state") == "mismatch":
+        return _annotate_degraded_deps(
+            _service_port_mismatch_result(
+                service,
+                base,
+                paths,
+                pid,
+                verification,
+                event_root,
+                remove_pid=True,
+            ),
+            blocked_on,
+        )
+    _copy_port_verification_fields(reused_result, verification)
     log_runtime_event("service.reused", service["id"], root_dir=event_root)
     return _annotate_degraded_deps(reused_result, blocked_on)
 
@@ -3792,6 +5777,105 @@ def start_services(
         if service_id:
             results_by_id[service_id] = result
     return results
+
+
+def _service_start_summary_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "id": str(entry.get("id") or ""),
+        "state": str(entry.get("result") or "unknown"),
+    }
+    for key in ("pid", "verified_port", "verified_ports", "port", "target", "url"):
+        if entry.get(key) is not None:
+            summary[key] = copy.deepcopy(entry[key])
+    return summary
+
+
+def _service_start_error(entry: dict[str, Any]) -> str:
+    error = entry.get("error")
+    if isinstance(error, dict):
+        message = str(error.get("message") or error.get("detail") or "").strip()
+        if message:
+            return message
+    for key in ("reason", "actionable"):
+        message = str(entry.get(key) or "").strip()
+        if message:
+            return message
+    exit_code = entry.get("exit_code")
+    if exit_code is not None:
+        return f"service exited with code {exit_code}"
+    return f"service start result: {entry.get('result', 'unknown')}"
+
+
+def _blocking_chain(service_id: str, results_by_id: dict[str, dict[str, Any]]) -> list[str]:
+    chain: list[str] = []
+    seen = {service_id}
+    current_id = service_id
+    while True:
+        entry = results_by_id.get(current_id) or {}
+        blockers = [
+            str(blocker)
+            for blocker in (entry.get("blocked_on") or entry.get("dependency_unhealthy") or [])
+            if str(blocker).strip()
+        ]
+        if not blockers:
+            return chain
+        blocker = blockers[0]
+        chain.append(blocker)
+        if blocker in seen:
+            return chain
+        seen.add(blocker)
+        current_id = blocker
+
+
+def summarize_service_start_results(
+    service_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    results_by_id = {
+        str(entry.get("id") or ""): entry
+        for entry in service_results
+        if str(entry.get("id") or "").strip()
+    }
+    started = [
+        _service_start_summary_entry(entry)
+        for entry in service_results
+        if entry.get("result") == "started"
+    ]
+    already_running = [
+        _service_start_summary_entry(entry)
+        for entry in service_results
+        if entry.get("result") == "already-running"
+    ]
+
+    skipped: list[dict[str, Any]] = []
+    direct_failures: list[dict[str, Any]] = []
+    for entry in service_results:
+        result = entry.get("result")
+        service_id = str(entry.get("id") or "").strip()
+        if result == "blocked" and entry.get("blocked_on"):
+            skipped_entry = _service_start_summary_entry(entry)
+            skipped_entry["blocked_on"] = list(entry.get("blocked_on") or [])
+            skipped_entry["blocking_chain"] = _blocking_chain(service_id, results_by_id)
+            skipped.append(skipped_entry)
+            continue
+        if result in {"failed", "timeout"} or result == "blocked":
+            direct_failures.append(entry)
+
+    failed: dict[str, Any] | None = None
+    if direct_failures:
+        first = direct_failures[0]
+        failed = _service_start_summary_entry(first)
+        failed["error"] = _service_start_error(first)
+        if first.get("tail"):
+            failed["tail"] = list(first.get("tail") or [])
+
+    return {
+        "ok": failed is None and not skipped,
+        "started": started,
+        "failed": failed,
+        "skipped_dependents": [entry["id"] for entry in skipped],
+        "skipped": skipped,
+        "already_running": already_running,
+    }
 
 
 def stop_services(
@@ -3963,7 +6047,6 @@ FOCUS_ERROR_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 MCP_CONFIG_REL = Path(".mcp.json")
-MCP_PROTOCOL_VERSION = "2024-11-05"
 MCP_SMOKE_TIMEOUT_SECONDS = 5.0
 
 
@@ -4135,7 +6218,6 @@ def collect_live_state(
 
 def _collect_skill_repo_status(skillset: dict[str, Any]) -> dict[str, Any]:
     """Build status payload for a skill-repo-set skillset."""
-    config_path = Path(str(skillset.get("skill_repos_config_host_path", "")))
     lock_path = Path(str(skillset.get("lock_path_host_path", "")))
 
     lock_present = lock_path.is_file()
@@ -4527,6 +6609,7 @@ def _runtime_task_statuses(model: dict[str, Any]) -> list[dict[str, Any]]:
 def _runtime_service_statuses(model: dict[str, Any]) -> list[dict[str, Any]]:
     statuses: list[dict[str, Any]] = []
     for service in model["services"]:
+        healthcheck = service.get("healthcheck") if isinstance(service.get("healthcheck"), dict) else {}
         item = {
             "id": service["id"],
             "kind": service.get("kind", "service"),
@@ -4534,6 +6617,11 @@ def _runtime_service_statuses(model: dict[str, Any]) -> list[dict[str, Any]]:
             "depends_on": service_dependency_ids(service),
             "bootstrap_tasks": service_bootstrap_task_ids(service),
         }
+        if (healthcheck or {}).get("type"):
+            item["healthcheck_type"] = healthcheck["type"]
+            if healthcheck.get("type") == MCP_READY_HEALTHCHECK_TYPE:
+                item["healthcheck_transport"] = _mcp_ready_transport(service, healthcheck)
+                item["healthcheck_target"] = _mcp_healthcheck_target_summary(service, healthcheck)
         item.update(probe_service(model, service))
         # WG-006: annotate with the parity-ledger ownership_state so
         # observational surfaces (text renderers, json consumers, doctor)

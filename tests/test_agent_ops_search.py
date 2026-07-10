@@ -13,6 +13,26 @@ if str(ENV_MANAGER_DIR) not in sys.path:
     sys.path.insert(0, str(ENV_MANAGER_DIR))
 
 from runtime_manager import agent_search as SEARCH  # noqa: E402
+from runtime_manager.text_renderers import search_brain_text_lines  # noqa: E402
+
+
+def _assert_elapsed_meta(testcase: unittest.TestCase, payload: dict[str, object]) -> None:
+    meta = payload.get("meta")
+    testcase.assertIsInstance(meta, dict)
+    elapsed = meta.get("elapsed_ms") if isinstance(meta, dict) else None
+    testcase.assertIsInstance(elapsed, (int, float))
+    testcase.assertNotIsInstance(elapsed, bool)
+    testcase.assertGreaterEqual(float(elapsed), 0.0)
+
+
+def _assert_error_envelope(testcase: unittest.TestCase, payload: dict[str, object], code: str) -> None:
+    testcase.assertIs(payload["ok"], False)
+    error = payload.get("error")
+    testcase.assertIsInstance(error, dict)
+    testcase.assertEqual(error["code"], code)
+    testcase.assertEqual(error["type"], code)
+    testcase.assertEqual(payload["error_code"], code)
+    testcase.assertIn("deprecation", payload)
 
 
 def _graph() -> dict[str, object]:
@@ -81,6 +101,8 @@ class AgentSearchTests(unittest.TestCase):
             self.assertIn("score", hit)
             self.assertIn("snippet", hit)
             self.assertIn("next_action", hit)
+            self.assertNotIn("brain.", hit["next_action"])
+        _assert_elapsed_meta(self, payload)
         self.assertEqual(json.loads(json.dumps(payload)), payload)
 
     def test_search_covers_beads_and_evidence(self) -> None:
@@ -97,7 +119,10 @@ class AgentSearchTests(unittest.TestCase):
 
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "INVALID_ARGUMENT")
+        _assert_error_envelope(self, payload, "INVALID_ARGUMENT")
         self.assertTrue(payload["examples"])
+        self.assertTrue(all(example.startswith("python3 .env-manager/manage.py ") for example in payload["examples"]))
+        _assert_elapsed_meta(self, payload)
 
     def test_source_and_kind_filters_are_applied(self) -> None:
         payload = SEARCH.search_payload(
@@ -112,6 +137,21 @@ class AgentSearchTests(unittest.TestCase):
         self.assertTrue(all(hit["source"] == "graph" for hit in payload["hits"]))
         self.assertTrue(all(hit["kind"] == "service" for hit in payload["hits"]))
 
+    def test_empty_search_returns_related_suggestions(self) -> None:
+        payload = SEARCH.search_payload(
+            "apu",
+            graph=_graph(),
+            docs={"README.md": "unrelated docs only"},
+        )
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["count"], 0)
+        suggestion_ids = [item["id"] for item in payload.get("suggestions") or []]
+        self.assertIn("service:api", suggestion_ids)
+        lines = search_brain_text_lines(payload)
+        self.assertTrue(any("service:api" in line for line in lines))
+        self.assertTrue(any("manage.py search service:api" in line for line in lines))
+
     def test_missing_doc_source_and_missing_filter_source_emit_warnings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             payload = SEARCH.search_payload(
@@ -124,6 +164,27 @@ class AgentSearchTests(unittest.TestCase):
         warning_codes = [warning["code"] for warning in payload["warnings"]]
         self.assertIn("MISSING_SOURCE", warning_codes)
         self.assertTrue(any(warning.get("source") == "not-present" for warning in payload["warnings"]))
+
+    def test_default_doc_index_includes_split_docs(self) -> None:
+        for path in (
+            "docs/runtime-graph.md",
+            "docs/clients.md",
+            "docs/skills.md",
+            "docs/operations.md",
+            "docs/troubleshooting.md",
+            "docs/faq.md",
+        ):
+            self.assertIn(path, SEARCH.DEFAULT_DOC_PATHS)
+
+        parity = SEARCH.search_payload("parity ledger", root_dir=ROOT_DIR, source_filter=["docs"])
+        operator_gate = SEARCH.search_payload(
+            "operator_box_exec command gate",
+            root_dir=ROOT_DIR,
+            source_filter=["docs"],
+        )
+
+        self.assertIn("doc:docs/runtime-graph.md", {hit["id"] for hit in parity["hits"]})
+        self.assertIn("doc:docs/operations.md", {hit["id"] for hit in operator_gate["hits"]})
 
 
 if __name__ == "__main__":

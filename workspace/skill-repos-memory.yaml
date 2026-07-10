@@ -6,7 +6,3 @@ skill_repos:
   - path: ../skills
     pick:
       - cass-memory
-
-  - path: ../../../skills-private
-    pick:
-      - cass

@@ -79,7 +79,7 @@ class InstallScriptTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertTrue((repo_dir / ".env").is_file())
+            self.assertTrue((repo_dir / ".skillbox-state" / "operator" / ".env").is_file())
             self.assertTrue((private_dir / ".git").exists())
             self.assertTrue((private_dir / "clients" / "personal" / "overlay.yaml").is_file())
             self.assertTrue((repo_dir / "sand" / "personal" / "CLAUDE.md").is_file())
@@ -205,7 +205,7 @@ class InstallScriptTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertTrue((repo_dir / ".env").is_file())
+            self.assertTrue((repo_dir / ".skillbox-state" / "operator" / ".env").is_file())
             self.assertFalse(old_file.exists())
 
     def test_verify_runs_post_install_checks(self) -> None:
@@ -263,7 +263,7 @@ class InstallScriptTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertTrue((repo_dir / ".env").is_file())
+            self.assertTrue((repo_dir / ".skillbox-state" / "operator" / ".env").is_file())
             self.assertFalse(private_dir.exists())
             self.assertFalse((repo_dir / "sand" / "personal").exists())
             self.assertIn("first_box: skipped", result.stdout)

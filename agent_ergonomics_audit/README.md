@@ -1,7 +1,7 @@
 # Agent Ergonomics Audit Workspace
 
 For tool: `skillbox`
-Target: `/Users/b/repos/opensource/skillbox`
+Target: `/srv/skillbox/repos/opensource/skillbox`
 
 This is a measurement workspace produced by the
 `agent-ergonomics-and-intuitiveness-maximization-for-cli-tools` skill.
@@ -25,9 +25,9 @@ This is a measurement workspace produced by the
 
 ## How to resume
 
-This workspace lives **inside the target repo** at `/Users/b/repos/opensource/skillbox/agent_ergonomics_audit/` and is committed alongside the code on the target's current branch (typically `main`). The phase-loop scripts live in the **skill repo**, not in this workspace. From the skill repo's root (or with absolute paths), run:
+This workspace lives **inside the target repo** at `/srv/skillbox/repos/opensource/skillbox/agent_ergonomics_audit/` and is committed alongside the code on the target's current branch (typically `main`). The phase-loop scripts live in the **skill repo**, not in this workspace. From the skill repo's root (or with absolute paths), run:
 
-1. `<SKILL>/scripts/discover-cli.sh /Users/b/repos/opensource/skillbox` to confirm the binary still exists.
-2. `<SKILL>/scripts/validate_pass.sh /Users/b/repos/opensource/skillbox/agent_ergonomics_audit` to check artifact integrity.
+1. `<SKILL>/scripts/discover-cli.sh /srv/skillbox/repos/opensource/skillbox` to confirm the binary still exists.
+2. `<SKILL>/scripts/validate_pass.sh /srv/skillbox/repos/opensource/skillbox/agent_ergonomics_audit` to check artifact integrity.
 3. Read `audit/HANDOFF.md` here in the workspace.
 4. Pick a mode and send the resumed-pass kickoff prompt.

@@ -32,10 +32,10 @@ What the factory builds
       symlink to a source skill dir), and
     - ``managed_home``: a dir-symlink home (``~/.claude/skills`` itself is a
       symlink to a managed skills directory).
-* **Skill source roots**: a mini ``skills/`` and ``skills-private/`` carrying
+* **Skill source roots**: a mini ``skills/`` and ``private-skills/`` carrying
   4 tiny skills, one of which (``needs-beads``) declares
   ``requires_beads: true`` frontmatter.
-* **The ``_shared`` symlink chain**: ``skills-private/_shared`` -> the shared
+* **The ``_shared`` symlink chain**: ``private-skills/_shared`` -> the shared
   payload under ``skills/_shared_payload`` (mirrors the real cross-root
   ``_shared`` link skills depend on).
 * **A ``registry/repos.yaml`` and a ``skill-scope.yaml``** policy fixture
@@ -186,6 +186,13 @@ class FixtureFleet:
         """
         with mock.patch.object(
             skill_visibility.Path, "home", return_value=self.os_home
+        ), mock.patch.dict(
+            os.environ,
+            {
+                "SKILLBOX_MACHINES_FILE": str(self.machines_path),
+                "SKILLBOX_MACHINE": "devbox-like",
+                "SKILLBOX_REGISTRY_FILE": str(self.registry_path),
+            },
         ):
             yield
 
@@ -264,15 +271,14 @@ def _write_machines_yaml(path: Path, *, mac_root: Path, devbox_root: Path) -> No
     path.write_text(
         "version: 1\n"
         "machines:\n"
-        "  - id: mac-like\n"
-        "    role: laptop\n"
-        f"    repos_root: {mac_root}\n"
-        "    home_style: per-entry-symlink\n"
-        "  - id: devbox-like\n"
-        "    role: devbox\n"
-        f"    repos_root: {devbox_root}\n"
-        "    home_style: dir-symlink\n"
-        "    public_ip: true\n",
+        "  mac-like:\n"
+        "    hostnames: [mac-like]\n"
+        f"    home: {mac_root}\n"
+        f"    repo_roots: [{mac_root}]\n"
+        "  devbox-like:\n"
+        "    hostnames: [devbox-like]\n"
+        f"    home: {devbox_root}\n"
+        f"    repo_roots: [{devbox_root}]\n",
         encoding="utf-8",
     )
 
@@ -295,8 +301,10 @@ def _write_registry_repos_yaml(path: Path, *, scan_root: Path, repos: dict[str, 
         "overlay-repo": "frontend",
     }
     for name, repo_path in repos.items():
-        lines.append(f"  - path: {repo_path}")
+        lines.append(f"  - id: {name}")
+        lines.append(f"    path: {repo_path}")
         lines.append(f"    name: {name}")
+        lines.append(f"    bucket: {classes.get(name, 'backend')}")
         lines.append(f"    class: {classes.get(name, 'backend')}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -356,9 +364,9 @@ def build_fixture_fleet(tmp_root: str | os.PathLike[str]) -> FixtureFleet:
     registry_dir = config_root / "registry"
     registry_dir.mkdir(parents=True)
 
-    # --- skill source roots: mini skills/ + skills-private/ ---------------
+    # --- skill source roots: mini skills/ + private-skills/ ---------------
     skills_root = root / "skills"
-    skills_private_root = root / "skills-private"
+    skills_private_root = root / "private-skills"
     skills_root.mkdir(parents=True)
     skills_private_root.mkdir(parents=True)
 
@@ -376,7 +384,7 @@ def build_fixture_fleet(tmp_root: str | os.PathLike[str]) -> FixtureFleet:
 
     # --- _shared symlink chain --------------------------------------------
     # Real estate: skills depend on a cross-root `_shared` payload reached via
-    # a symlink. Model it as skills-private/_shared -> skills/_shared_payload.
+    # a symlink. Model it as private-skills/_shared -> skills/_shared_payload.
     shared_payload = skills_root / "_shared_payload"
     shared_payload.mkdir(parents=True)
     (shared_payload / "README.md").write_text("# shared payload\n", encoding="utf-8")
@@ -433,6 +441,20 @@ def build_fixture_fleet(tmp_root: str | os.PathLike[str]) -> FixtureFleet:
     # 1) healthy: per-entry link that resolves on-box.
     healthy = _make_repo("healthy")
     _relink(healthy / ".claude" / "skills" / "tiny-cli", skills["tiny-cli"])
+    override_dir = healthy / ".skillbox"
+    override_dir.mkdir()
+    (override_dir / "skill-overrides.yaml").write_text(
+        "version: 1\n"
+        "pin_on: [needs-beads]\n"
+        "pin_off: [tiny-marketing]\n"
+        "opt_out_global: [fixture-global-optout]\n"
+        "overlays:\n"
+        "  enable: [marketing]\n"
+        "  disable: [swarm]\n"
+        "defaults: [tiny-ui]\n"
+        "reason: fixture override\n",
+        encoding="utf-8",
+    )
 
     # 2) other-machine: link target lives under /fake-mac-root (valid on the
     #    mac, dangling here -> simulates a cross-machine link).
@@ -458,6 +480,14 @@ def build_fixture_fleet(tmp_root: str | os.PathLike[str]) -> FixtureFleet:
     _relink(
         overlay_repo / ".claude" / "skills" / "tiny-marketing",
         skills["tiny-marketing"],
+    )
+    overlay_override_dir = overlay_repo / ".skillbox"
+    overlay_override_dir.mkdir()
+    (overlay_override_dir / "skill-overrides.yaml").write_text(
+        "version: 1\n"
+        "pin_off: [tiny-cli]\n"
+        "reason: fixture overlay override\n",
+        encoding="utf-8",
     )
 
     # --- skill-scope.yaml policy fixture ----------------------------------

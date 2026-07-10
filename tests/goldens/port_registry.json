@@ -1,0 +1,75 @@
+{
+  "count": 4,
+  "entries": [
+    {
+      "bind_scope": "loopback",
+      "owner_id": "SKILLBOX_WEB_PORT",
+      "owner_kind": "env_surface",
+      "port": 3000,
+      "protocol": "tcp",
+      "source": {
+        "file": ".env",
+        "key": "SKILLBOX_WEB_PORT"
+      },
+      "warning": null
+    },
+    {
+      "bind_scope": "loopback",
+      "owner_id": "SKILLBOX_API_PORT",
+      "owner_kind": "env_surface",
+      "port": 8000,
+      "protocol": "tcp",
+      "source": {
+        "file": ".env",
+        "key": "SKILLBOX_API_PORT"
+      },
+      "warning": null
+    },
+    {
+      "bind_scope": "loopback",
+      "owner_id": "api-stub",
+      "owner_kind": "service",
+      "port": 8000,
+      "protocol": "http",
+      "source": {
+        "file": "workspace/runtime.yaml",
+        "key": "healthcheck.url"
+      },
+      "warning": null
+    },
+    {
+      "bind_scope": "loopback",
+      "owner_id": "SKILLBOX_INGRESS_PUBLIC_PORT",
+      "owner_kind": "env_surface",
+      "port": 8080,
+      "protocol": "tcp",
+      "source": {
+        "file": ".env",
+        "key": "SKILLBOX_INGRESS_PUBLIC_PORT"
+      },
+      "warning": null
+    },
+    {
+      "bind_scope": "unknown",
+      "owner_id": "pulse",
+      "owner_kind": "service",
+      "port": null,
+      "protocol": "",
+      "source": {
+        "file": "workspace/runtime.yaml",
+        "key": "healthcheck.path"
+      },
+      "warning": "service 'pulse' health check (path_exists) declares no port; not registered"
+    }
+  ],
+  "warnings": [
+    {
+      "owner_id": "pulse",
+      "source": {
+        "file": "workspace/runtime.yaml",
+        "key": "healthcheck.path"
+      },
+      "warning": "service 'pulse' health check (path_exists) declares no port; not registered"
+    }
+  ]
+}

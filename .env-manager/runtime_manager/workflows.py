@@ -1,12 +1,25 @@
 from __future__ import annotations
 
+import calendar
+import os
+
 from .shared import *
 from .validation import *
 from .runtime_ops import *
 from .context_rendering import *
 from .text_renderers import print_local_runtime_error_text
+from .state_backup import DRILL_EVIDENCE_REL
 from .parity_report import collect_dev_prod_parity_report, parity_report_evidence_summary
-from lib.runtime_model import resolve_placeholders
+from lib.paths import BoxPath, PathTranslator
+from lib.runtime_model import (
+    LOCAL_RUNTIME_ENV_OUTPUT_MISSING,
+    LOCAL_RUNTIME_MODE_UNSUPPORTED,
+    LOCAL_RUNTIME_PROFILE_UNKNOWN,
+    LOCAL_RUNTIME_START_BLOCKED,
+    LOCAL_RUNTIME_START_MODES,
+    is_runtime_absolute_path,
+    resolve_placeholders,
+)
 
 
 def _workflow_step(
@@ -843,7 +856,7 @@ def generate_client_compose_override(
     mounts = _client_compose_pruned_mounts(root_dir, model)
     lines = _client_compose_override_lines(client_id, mounts)
     out_path = _client_compose_override_path(root_dir, client_id)
-    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    atomic_write_text(out_path, "\n".join(lines) + "\n")
     return out_path
 
 
@@ -862,12 +875,28 @@ def _client_compose_repo_mounts(model: dict[str, Any]) -> dict[str, str]:
     return mounts
 
 
+def _runtime_value_to_host_path(translator: PathTranslator, raw_path: str) -> Path:
+    candidate = Path(raw_path).expanduser()
+    if candidate.is_absolute() and not is_runtime_absolute_path(raw_path):
+        return candidate
+    if not candidate.is_absolute():
+        return candidate
+    return Path(translator.to_host(BoxPath(raw_path)))
+
+
 def _add_swimmers_compose_mount(root_dir: Path, model: dict[str, Any], mounts: dict[str, str]) -> None:
     env_values = model.get("env") or {}
     swimmers_repo = env_values.get("SKILLBOX_SWIMMERS_REPO", "")
     if swimmers_repo and swimmers_repo not in mounts:
-        from lib.runtime_model import runtime_path_to_host_path as _rp2hp
-        swimmers_host = str(_rp2hp(root_dir, env_values, swimmers_repo))
+        try:
+            from lib.runtime_model import runtime_path_to_host_path
+            swimmers_host = str(runtime_path_to_host_path(root_dir, env_values, swimmers_repo))
+        except Exception:
+            translator_model = dict(model)
+            translator_model["root_dir"] = str(root_dir)
+            translator_model["env"] = env_values
+            translator = PathTranslator.from_model(translator_model)
+            swimmers_host = str(_runtime_value_to_host_path(translator, swimmers_repo))
         if Path(swimmers_host).exists():
             mounts[swimmers_repo] = swimmers_host
 
@@ -1086,7 +1115,7 @@ def requested_mcp_servers(model: dict[str, Any]) -> list[dict[str, Any]]:
     requested: list[dict[str, Any]] = [{"name": "skillbox", "service_id": None}]
     seen = {"skillbox"}
     for service in model.get("services") or []:
-        if str(service.get("kind") or "").strip() != "mcp":
+        if str(service.get("kind") or "").strip() not in {"mcp", "mcp-bridge"}:
             continue
         server_name = mcp_server_name_for_service(service)
         if not server_name or server_name in seen:
@@ -1494,10 +1523,12 @@ def _probe_value_translator(
     runtime_env: dict[str, Any],
     translated_env: dict[str, str],
 ) -> Callable[[Any], str]:
+    translator = PathTranslator.from_model({"root_dir": str(root_dir), "env": runtime_env})
+
     def translate_probe_value(raw_value: Any) -> str:
         value = str(raw_value)
         if value.startswith("/"):
-            return str(runtime_path_to_host_path(root_dir, runtime_env, value))
+            return str(_runtime_value_to_host_path(translator, value))
         return translate_runtime_paths(value, runtime_env, translated_env)
 
     return translate_probe_value
@@ -2047,6 +2078,15 @@ STEWARDSHIP_PULSE_STATE_RELS = (
     Path("logs") / "runtime" / "pulse.state.json",
     Path(".skillbox-state") / "logs" / "runtime" / "pulse.state.json",
 )
+STEWARDSHIP_PORT_GUARD_TELEMETRY_NAME = "port-guard.telemetry.json"
+STEWARDSHIP_PORT_GUARD_COUNTER_KEYS = (
+    "hook_blocks",
+    "shim_blocks",
+    "post_bind_mismatches",
+    "rogues_seen",
+    "rogues_reaped",
+    "wildcard_criticals",
+)
 
 
 def _stewardship_utc_now() -> tuple[float, str, str]:
@@ -2123,6 +2163,83 @@ def _stewardship_pulse_candidates(root_dir: Path, model: dict[str, Any]) -> list
     return unique
 
 
+def _stewardship_port_guard_telemetry_candidates(root_dir: Path, model: dict[str, Any]) -> list[Path]:
+    candidates = [
+        path.with_name(STEWARDSHIP_PORT_GUARD_TELEMETRY_NAME)
+        for path in _stewardship_pulse_candidates(root_dir, model)
+    ]
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        marker = str(candidate)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique.append(candidate)
+    return unique
+
+
+def _merge_port_guard_telemetry(
+    root_dir: Path,
+    model: dict[str, Any],
+    port_sentinel: dict[str, Any],
+) -> dict[str, Any]:
+    merged = dict(port_sentinel)
+    telemetry_path = next(
+        (path for path in _stewardship_port_guard_telemetry_candidates(root_dir, model) if path.is_file()),
+        None,
+    )
+    if telemetry_path is None:
+        return merged
+    _status, payload, _error = _load_optional_json_object(telemetry_path)
+    counters = payload.get("counters") if isinstance(payload.get("counters"), dict) else payload
+    if not isinstance(counters, dict):
+        return merged
+    for key in STEWARDSHIP_PORT_GUARD_COUNTER_KEYS:
+        try:
+            merged[key] = max(int(merged.get(key) or 0), int(counters.get(key) or 0))
+        except (TypeError, ValueError):
+            continue
+    for key in ("first_seen_at", "last_seen_at", "last_reaped_at"):
+        values = [str(merged.get(key) or "").strip(), str(counters.get(key) or "").strip()]
+        values = [value for value in values if value]
+        if values:
+            merged[key] = min(values) if key == "first_seen_at" else max(values)
+    merged["telemetry_path"] = repo_rel(root_dir, telemetry_path)
+    return merged
+
+
+def _parse_utc_z(value: str) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return float(calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ")))
+    except ValueError:
+        return None
+
+
+def _port_guard_assessment(port_sentinel: dict[str, Any], now: float) -> dict[str, Any]:
+    first_seen = _parse_utc_z(str(port_sentinel.get("first_seen_at") or ""))
+    observation_days = 0.0 if first_seen is None else max(0.0, (now - first_seen) / 86400.0)
+    wildcard = int(port_sentinel.get("wildcard_criticals") or 0)
+    observed_long_enough = observation_days >= 14.0
+    if first_seen is None:
+        status = "not_assessed"
+    elif wildcard > 0:
+        status = "blocked"
+    elif observed_long_enough:
+        status = "assessed"
+    else:
+        status = "warming_up"
+    return {
+        "status": status,
+        "observation_days": round(observation_days, 2),
+        "enforce_flip_ready": bool(observed_long_enough and wildcard == 0),
+        "enforce_flip_rule": "14 consecutive days of port-guard counters with zero wildcard criticals and no false-positive reports",
+    }
+
+
 def _stewardship_pulse_evidence(root_dir: Path, model: dict[str, Any], now: float) -> dict[str, Any]:
     candidates = _stewardship_pulse_candidates(root_dir, model)
     existing = next((path for path in candidates if path.is_file()), None)
@@ -2139,6 +2256,9 @@ def _stewardship_pulse_evidence(root_dir: Path, model: dict[str, Any], now: floa
         age_seconds = _state_age_seconds(payload, "updated_at", now)
         active_clients = payload.get("active_clients") or []
         active_profiles = payload.get("active_profiles") or []
+        port_sentinel = payload.get("port_sentinel") if isinstance(payload.get("port_sentinel"), dict) else {}
+        port_sentinel = _merge_port_guard_telemetry(root_dir, model, port_sentinel)
+        port_guard = _port_guard_assessment(port_sentinel, now)
         evidence.update(
             {
                 "pid": payload.get("pid"),
@@ -2150,6 +2270,8 @@ def _stewardship_pulse_evidence(root_dir: Path, model: dict[str, Any], now: floa
                 "events_emitted": payload.get("events_emitted"),
                 "active_clients": active_clients,
                 "active_profiles": active_profiles,
+                "port_sentinel": port_sentinel,
+                "port_guard": port_guard,
             }
         )
     return evidence
@@ -2262,6 +2384,67 @@ def _stewardship_pressure_evidence(status_payload: dict[str, Any]) -> dict[str, 
     }
 
 
+def _stewardship_state_root(model: dict[str, Any]) -> Path | None:
+    raw = str((model.get("storage") or {}).get("state_root") or os.environ.get("SKILLBOX_STATE_ROOT") or "").strip()
+    if not raw:
+        return None
+    return Path(os.path.expandvars(os.path.expanduser(raw))).resolve()
+
+
+def _stewardship_backup_restore_evidence(model: dict[str, Any], now: float) -> dict[str, Any]:
+    state_root = _stewardship_state_root(model)
+    if state_root is None:
+        return {
+            "status": "not_assessed",
+            "ok": False,
+            "last_drill": None,
+            "age_days": None,
+            "reason": "No state root is available for backup drill evidence.",
+        }
+    evidence_path = state_root / DRILL_EVIDENCE_REL
+    status, payload, error = _load_optional_json_object(evidence_path)
+    base: dict[str, Any] = {
+        "status": "not_assessed",
+        "ok": False,
+        "path": str(evidence_path),
+        "last_drill": None,
+        "age_days": None,
+    }
+    if status == "missing":
+        base["reason"] = "No state-backup drill evidence has been written yet."
+        return base
+    if error:
+        base["reason"] = f"State-backup drill evidence is unreadable: {error}"
+        return base
+    if not payload:
+        base["reason"] = "State-backup drill evidence is empty."
+        return base
+
+    last_drill = str(payload.get("drilled_at") or "").strip()
+    drilled_at = _parse_utc_z(last_drill)
+    age_days = None if drilled_at is None else round(max(0.0, now - drilled_at) / 86400.0, 2)
+    ok = bool(payload.get("ok"))
+    assessed = age_days is not None and age_days <= 30.0
+    base.update(
+        {
+            "status": "ready" if ok and assessed else ("failed" if assessed else "not_assessed"),
+            "ok": ok,
+            "last_drill": last_drill or None,
+            "age_days": age_days,
+            "manifest": payload.get("manifest"),
+            "archive": payload.get("archive"),
+            "checks": payload.get("checks") or [],
+        }
+    )
+    if drilled_at is None:
+        base["reason"] = "State-backup drill evidence has no parseable drilled_at timestamp."
+    elif age_days is not None and age_days > 30.0:
+        base["reason"] = "Latest state-backup drill is older than 30 days."
+    elif not ok:
+        base["reason"] = "Latest state-backup drill failed."
+    return base
+
+
 def _stewardship_doctor_check_payload(result: CheckResult) -> dict[str, Any]:
     return {
         "status": result.status,
@@ -2290,21 +2473,26 @@ def _stewardship_doctor_evidence(model: dict[str, Any], root_dir: Path) -> dict[
     }
 
 
-def _stewardship_not_assessed() -> list[dict[str, str]]:
-    return [
-        {
-            "id": "backup-recovery",
-            "status": "not_assessed",
-            "reason": "No first-class backup or restore drill evidence is declared in the public runtime graph yet.",
-            "next_action": "Add a restore-drill check before claiming recovery readiness.",
-        },
+def _stewardship_not_assessed(backup_restore: dict[str, Any] | None = None) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    if (backup_restore or {}).get("status") == "not_assessed":
+        items.append(
+            {
+                "id": "backup-recovery",
+                "status": "not_assessed",
+                "reason": str((backup_restore or {}).get("reason") or "No state-backup drill evidence is available."),
+                "next_action": "Run state-backup drill --format json before claiming recovery readiness.",
+            }
+        )
+    items.extend([
         {
             "id": "cost-review",
             "status": "not_assessed",
             "reason": "No cost telemetry or budget review evidence is declared in the public runtime graph yet.",
             "next_action": "Add a cost snapshot source before claiming spend stewardship.",
         },
-    ]
+    ])
+    return items
 
 
 def _stewardship_risk(
@@ -2632,6 +2820,7 @@ def _build_stewardship_report(root_dir: Path, cid: str, profiles: list[str]) -> 
     sessions = _stewardship_session_evidence(live)
     parity = _stewardship_parity_evidence(status_payload)
     pressure = _stewardship_pressure_evidence(status_payload)
+    backup_restore = _stewardship_backup_restore_evidence(filtered_model, now)
     dev_prod_parity = _stewardship_dev_prod_parity_evidence(filtered_model, cid)
     doctor = _stewardship_doctor_evidence(filtered_model, root_dir)
     risks = _stewardship_risks(
@@ -2663,6 +2852,7 @@ def _build_stewardship_report(root_dir: Path, cid: str, profiles: list[str]) -> 
             "pulse": pulse,
             "doctor": doctor,
             "pressure_advisory": pressure,
+            "backup_restore": backup_restore,
             "sessions": sessions,
             "parity_ledger": parity,
             "dev_prod_parity": dev_prod_parity,
@@ -2679,7 +2869,7 @@ def _build_stewardship_report(root_dir: Path, cid: str, profiles: list[str]) -> 
             ],
         },
         "risks": risks,
-        "not_assessed": _stewardship_not_assessed(),
+        "not_assessed": _stewardship_not_assessed(backup_restore),
         "next_recommendation": next_recommendation,
         "next_actions": _stewardship_next_actions(
             cid,
@@ -2744,9 +2934,13 @@ def _stewardship_markdown_evidence(payload: dict[str, Any]) -> str:
     services = health.get("services") or {}
     recent_errors = health.get("recent_errors") or {}
     evidence = payload.get("evidence") or {}
+    pulse = evidence.get("pulse") or {}
+    port_sentinel = pulse.get("port_sentinel") or {}
+    port_guard = pulse.get("port_guard") or {}
     sessions = evidence.get("sessions") or {}
     parity = evidence.get("parity_ledger") or {}
     dev_prod_parity = evidence.get("dev_prod_parity") or {}
+    backup_restore = evidence.get("backup_restore") or {}
     doctor = evidence.get("doctor") or {}
     doctor_counts = doctor.get("counts") or {}
     pressure = evidence.get("pressure_advisory") or {}
@@ -2763,7 +2957,15 @@ def _stewardship_markdown_evidence(payload: dict[str, Any]) -> str:
         f"- Recent log errors: {recent_errors.get('count', 0)}",
         f"- Doctor: {doctor.get('status', 'unknown')} ({doctor_counts.get('fail', 0)} failing)",
         f"- Pressure: {pressure_disk.get('pressure_level', 'unknown')} ({pressure_disk.get('free_gib')}GiB free); target={pressure_target.get('id')}; rch={pressure_rch.get('state')}; sbh={pressure_sbh.get('state')}",
+        f"- Backup/restore: {backup_restore.get('status', 'not_assessed')} ok={bool(backup_restore.get('ok'))} last_drill={backup_restore.get('last_drill') or '-'} age_days={backup_restore.get('age_days')}",
         f"- Dev/prod parity: {dev_prod_parity.get('status', 'not_assessed')} ({dev_prod_parity.get('blocking_count', 0)} blocking)",
+        "- Port guard: "
+        f"hook {port_sentinel.get('hook_blocks', 0)}, "
+        f"shim {port_sentinel.get('shim_blocks', 0)}, "
+        f"post-bind {port_sentinel.get('post_bind_mismatches', 0)}, "
+        f"rogues {port_sentinel.get('rogues_seen', 0)}/{port_sentinel.get('rogues_reaped', 0)}, "
+        f"wildcard {port_sentinel.get('wildcard_criticals', 0)} "
+        f"({port_guard.get('status', 'not_assessed')})",
     ]
     lines.extend(_stewardship_markdown_doctor_findings(doctor))
     lines.extend(
@@ -3303,8 +3505,13 @@ def _focus_persist_step(
     if ctx_yaml_path.is_file():
         focus_data["skill_context_path"] = str(ctx_runtime_path)
     try:
-        atomic_write_text(focus_path, json.dumps(focus_data, indent=2) + "\n")
+        # Serialize focus writes against each other and against the pulse-write
+        # window via the shared lock + atomic-rename helper. focus is a full
+        # snapshot (not read-modify-write), so the mutate fn ignores current.
+        locked_json_update(focus_path, lambda _current: focus_data)
         _focus_step(steps, is_json, "persist", "ok")
+    except StateLockTimeout as exc:
+        _focus_step(steps, is_json, "persist", "fail", {"error": str(exc)})
     except OSError as exc:
         _focus_step(steps, is_json, "persist", "fail", {"error": str(exc)})
 
@@ -3972,6 +4179,11 @@ def _up_start_result(
     payload["ingress_actions"] = ingress_actions
     if not has_failure:
         return EXIT_OK, payload
+    specific_error = first_service_error_payload(started)
+    if specific_error is not None:
+        payload.update(specific_error)
+        payload["error"]["requested_mode"] = requested_mode
+        return EXIT_ERROR, payload
     failed_ids = _up_failed_service_ids(started)
     payload.update(local_runtime_error(
         LOCAL_RUNTIME_START_BLOCKED,

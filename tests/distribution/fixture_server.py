@@ -13,7 +13,6 @@ from __future__ import annotations
 import hashlib
 import http.server
 import json
-import os
 import sys
 import threading
 from dataclasses import dataclass

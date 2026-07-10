@@ -1,29 +1,33 @@
 # Agent Ergonomics Handoff
 
-Pass 2 extended the Pass 1 `manage.py` agent surfaces across the full operator/runtime loop:
+Date: 2026-06-25
+Active bead: `skillbox-agent-ergonomics-epic-086q.7`
 
-- `scripts/04-reconcile.py`: `capabilities --json`, `robot-docs guide`, `--robot-triage`, JSON typo aliases, exact suggestions, concise runtime errors, and `skill-repo-sync-dry-run` skip-code parity.
-- `scripts/box.py`: deterministic capabilities/robot docs/triage, JSON typo aliases, exact suggestions, dry-run-first safety metadata, and MCP equivalents.
-- `scripts/sbp` / `scripts/sbo`: wrapper capabilities/robot docs/triage, identity-aware `sbo --help`, JSON alias forwarding, runtime dry-run flag routing, and exact unknown/logs errors.
-- `scripts/operator_mcp_server.py`: `annotations` and `x_skillbox_contract` metadata, deterministic JSON content, exact next actions for unknown/missing inputs, provision dry-run marker stamping, and dry-run-required guards for real mutation calls.
-- `.env-manager/manage.py capabilities --json`: robot-docs JSON correction plus parser-valid, non-mutating client/distribution lifecycle preview commands.
+## Applied In This Pass
 
-Focused verification run:
+- Added copy-pasteable brain command hints via `agent_cli_hints.py`.
+- Fixed `capabilities` search safe-first command.
+- Added exact bare command aliases for `explain next` and related brain commands.
+- Moved invalid graph algorithm JSON calls into the graph engine's structured `INVALID_ARGUMENT` payload.
+- Added structured `snap --format json` usage when no action is supplied.
+- Added focused regression coverage in `tests/test_agent_ops_*` and `tests/test_cli_units.py`.
 
-- `python3 -m unittest tests.test_reconcile`
-- `python3 -m unittest tests.test_box`
-- `python3 -m unittest tests.test_cli_wrappers`
-- `python3 -m unittest tests.test_operator_mcp_server tests.test_cli_units`
-- `bash agent_ergonomics_audit/audit/regression_tests/R-002__full_surface_agent_contracts.test.sh`
+## Deferred Beads
 
-Important local constraints:
+- `skillbox-agent-ergonomics-epic-086q.1`: full fuzzy suggestions, ambiguity handling, and broader explain/graph/search recovery.
+- `skillbox-agent-ergonomics-epic-086q.2`: full snap flag-position tolerance, text-mode usage policy, registry example refresh, and MCP parity.
+- `skillbox-agent-ergonomics-epic-086q.5`: generated API reference and registry/docs freshness.
+- `skillbox-agent-ergonomics-epic-086q.6`: unified error envelope across brain surfaces and MCP mirrors; also covers output schema drift.
+- `skillbox-agent-ergonomics-epic-086q.8`: SBP wrapper JSON/mutation contract hardening.
+- `skillbox-agent-ergonomics-epic-086q.9`: direct `box.py` safety, status write semantics, and JSON argparse errors.
 
-- The repo was dirty before this pass with `.beads/issues.jsonl` and untracked `.buildooor/`; preserve that unrelated local state unless explicitly scoped.
-- macOS preflight still lacked Linux `flock` and `timeout`, so direct focused verification remains the reliable local proof path.
-- No branch or sibling audit workspace was created. Audit workspace remains in-tree.
+## Verification To Run Before Closing
 
-Next pass:
+- `python3 .env-manager/manage.py capabilities --format json`
+- `python3 .env-manager/manage.py next --format json`
+- `python3 .env-manager/manage.py graph --format json`
+- `python3 .env-manager/manage.py explain brain.next --format json`
+- `python3 .env-manager/manage.py search "doctor" --format json`
+- `python3 -m unittest tests.test_agent_ops_adapters tests.test_agent_ops_command_registry tests.test_agent_ops_graph tests.test_agent_ops_graph_algorithms tests.test_agent_ops_graph_engine tests.test_agent_ops_decisions tests.test_agent_ops_search tests.test_agent_ops_snapshots tests.test_agent_ops_golden_outputs tests.test_cli_units`
 
-1. Generate command metadata from argparse/schema definitions if static capabilities inventory starts to drift.
-2. Consider `box.py ssh --command ... --format json` only if agents need a direct CLI alternative to MCP `operator_box_exec`.
-3. Split exit code `2` semantics across the published contracts if callers need programmatic usage-error versus drift separation.
+Run full `python3 -m unittest discover -s tests` only if time permits. The repo has unrelated dirty local/generated state; commit with a temporary index and include only intended files.

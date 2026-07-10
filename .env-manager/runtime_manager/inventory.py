@@ -8,13 +8,9 @@ Depends on ._skill_common and .policy_eval.
 
 from __future__ import annotations
 
-import fnmatch
-import glob
-import hashlib
 import os
-import shutil
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 try:
     import yaml
@@ -24,11 +20,6 @@ except ModuleNotFoundError:
 from .shared import (
     GLOBAL_HOME_ROOT_ENV,
     GLOBAL_HOME_SURFACES,
-    atomic_write_text,
-    directory_tree_sha256,
-    load_json_file,
-    load_yaml,
-    load_skill_repos_config,
 )
 
 from ._skill_common import *
@@ -85,9 +76,7 @@ SKILL_INSTALL_SCAN_MAX_DEPTH = 4
 DEFAULT_SKILL_SOURCE_ROOT_PATTERNS = (
     "~/repos/opensource/skills",
     "~/repos/opensource/skillbox/skills",
-    "~/repos/skills-private",
     "~/repos/skills/skills",
-    "~/repos/marketingskills/skills",
     "~/projects/jsm-skill-archive-*",
 )
 DEFAULT_SKILL_INSTALL_SCAN_ROOT_PATTERNS: tuple[str, ...] = ()
@@ -109,9 +98,6 @@ SKILL_SOURCE_SCAN_SKIP_DIRS = {
 }
 SOURCE_BUCKET_ORDER = {
     "opensource/skills": 0,
-    "skills-private": 1,
-    "marketingskills": 2,
-    "sweet-potato": 3,
     "local": 4,
     "archive": 9,
     "external": 10,
@@ -546,7 +532,7 @@ def global_home_surfaces_report() -> list[dict[str, Any]]:
 # audit the same way.
 #
 # ``_shared`` is the cross-root payload link skills depend on (see fixture_fleet
-# and the live skills-private/_shared chain); it is not a real skill, so it is
+# and the live private-skills/_shared chain); it is not a real skill, so it is
 # excluded from the parity diff by default and surfaced separately under
 # ``ignored`` for transparency.
 

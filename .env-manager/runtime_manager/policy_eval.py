@@ -9,10 +9,12 @@ cwd*. Depends only on ._skill_common.
 from __future__ import annotations
 
 import fnmatch
+import fcntl
 import glob
-import hashlib
 import os
 import shutil
+import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -22,22 +24,21 @@ except ModuleNotFoundError:
     yaml = None
 
 from .shared import (
-    GLOBAL_HOME_ROOT_ENV,
-    GLOBAL_HOME_SURFACES,
     atomic_write_text,
     directory_tree_sha256,
     load_json_file,
     load_yaml,
     load_skill_repos_config,
+    require_yaml,
 )
 
 from ._skill_common import *
-
 __all__ = [
     'SKILL_SCOPE_POLICY_FILES',
     'OVERLAY_STATE_ENV',
     'OVERLAY_STATE_DEFAULT',
     'OVERLAY_ENV_VAR',
+    'OVERLAY_CLI_ENV_VAR',
     'SKILL_SOURCE_ROOT_KEYS',
     'SKILL_INSTALL_SCAN_ROOT_KEYS',
     'WILDCARD_CHARS',
@@ -58,6 +59,7 @@ __all__ = [
     '_skillset_layer',
     '_target_states_for_skill',
     '_overlay_state_path',
+    'active_overlay_records',
     'active_overlays',
     'set_overlay',
     'toggle_overlay',
@@ -67,8 +69,20 @@ __all__ = [
     'rule_overlay_tags',
     'undeclared_active_overlays',
     'overlay_scoped_skill_names',
+    'SKILL_VISIBILITY_SIMULATION_KEY',
+    '_skill_visibility_simulation',
+    '_simulated_machine_id',
+    '_resolve_registry_repo_ref',
+    'SKILL_OVERRIDES_REL',
+    'OVERRIDE_POLICY_VERSION',
     '_load_scope_policy',
     '_operator_scope_policies',
+    '_empty_repo_override_policy',
+    '_repo_override_policy',
+    'lint_repo_override_policy',
+    'update_repo_override_policy',
+    'OVERRIDE_WRITE_LOCK_TIMEOUT_SECONDS',
+    'OverrideWriteLockTimeout',
     '_project_categories_for_policy',
     '_project_categories',
     '_matched_project_categories',
@@ -92,6 +106,9 @@ __all__ = [
     '_scope_rule_from_raw',
     '_scope_rules',
     'last_scope_rule_errors',
+    '_scope_rule_path_match_mode',
+    '_scope_rule_path_matches',
+    '_scope_rule_matched_paths',
     '_policy_skill_source_patterns',
     '_policy_skill_install_scan_patterns',
     '_expand_skill_source_patterns',
@@ -107,16 +124,43 @@ __all__ = [
     '_category_by_id',
     '_scope_allows_global',
     '_global_install_allowed',
+    '_global_override_refusal_context',
 ]
 
 
 SKILL_SCOPE_POLICY_FILES = ("skill-scope.yaml", "skills-scope.yaml")
+SKILL_OVERRIDES_REL = Path(".skillbox") / "skill-overrides.yaml"
 OVERLAY_STATE_ENV = "SKILLBOX_OVERLAY_STATE"
 OVERLAY_STATE_DEFAULT = "~/.skillbox-state/overlays"
 OVERLAY_ENV_VAR = "SKILLBOX_OVERLAYS"
+OVERLAY_CLI_ENV_VAR = "SKILLBOX_CLI_OVERLAYS"
 SKILL_SOURCE_ROOT_KEYS = ("skill_source_roots", "source_roots", "skill_roots")
 SKILL_INSTALL_SCAN_ROOT_KEYS = ("skill_install_scan_roots", "install_scan_roots")
 WILDCARD_CHARS = set("*?[")
+OVERRIDE_POLICY_VERSION = 1
+OVERRIDE_LIST_KEYS = ("pin_on", "pin_off", "opt_out_global", "defaults")
+OVERRIDE_OVERLAY_KEYS = ("enable", "disable")
+OVERRIDE_WRITE_LOCK_TIMEOUT_SECONDS = 5.0
+_OVERRIDE_WRITE_POLL_INTERVAL_SECONDS = 0.02
+OVERRIDE_ALLOWED_KEYS = {
+    "version",
+    "pin_on",
+    "pin_off",
+    "opt_out_global",
+    "overlays",
+    "defaults",
+    "reason",
+}
+OVERRIDE_LINT_SEVERITY_ERROR = "error"
+OVERRIDE_LINT_SEVERITY_WARN = "warn"
+
+
+class OverrideWriteLockTimeout(RuntimeError):
+    """Raised when the repo override writer cannot acquire its sidecar lock."""
+
+    def __init__(self, lock_path: Path) -> None:
+        self.lock_path = Path(lock_path)
+        super().__init__(f"Timed out acquiring skill override lock {self.lock_path}.")
 
 
 def _frontmatter_truthy(value: Any) -> bool:
@@ -433,29 +477,204 @@ def _overlay_state_path() -> Path:
     return Path(os.path.expandvars(os.path.expanduser(raw)))
 
 
-def active_overlays() -> set[str]:
-    """Return the set of overlay names currently enabled for this operator.
+def _overlay_record(
+    name: str,
+    *,
+    enabled: bool,
+    layer: str,
+    label: str,
+    rank: int,
+    source: str,
+) -> dict[str, Any]:
+    why_layer = {
+        "operator-state-dir": "global",
+        "repo-override-file": "repo-file",
+        "env-overlays": "env",
+        "cli-overlays": "env",
+        "what-if-overlays": "what-if",
+    }.get(layer, layer)
+    return {
+        "name": name,
+        "enabled": enabled,
+        "layer": layer,
+        "layer_label": label,
+        "layer_rank": rank,
+        "source": source,
+        "why": why_layer,
+    }
 
-    Reads from the file at $SKILLBOX_OVERLAY_STATE (default
-    ~/.skillbox-state/overlays), one overlay name per line. $SKILLBOX_OVERLAYS
-    env var (comma-separated) augments the file so agent sessions can opt in
-    ephemerally without flipping global state.
-    """
-    overlays: set[str] = set()
+
+def _state_overlay_records() -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
     state_path = _overlay_state_path()
     if state_path.is_file():
         try:
             for line in state_path.read_text(encoding="utf-8").splitlines():
                 name = line.strip()
                 if name and not name.startswith("#"):
-                    overlays.add(name)
+                    records.append(
+                        _overlay_record(
+                            name,
+                            enabled=True,
+                            layer="operator-state-dir",
+                            label="operator overlay state",
+                            rank=OPERATOR_STATE_LAYER_RANK,
+                            source=str(state_path),
+                        )
+                    )
         except OSError:
             pass
-    for item in (os.environ.get(OVERLAY_ENV_VAR) or "").split(","):
-        name = item.strip()
+    return records
+
+
+def _env_overlay_records(env_var: str, *, layer: str, label: str, rank: int) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for item in (os.environ.get(env_var) or "").split(","):
+        token = item.strip()
+        if not token:
+            continue
+        enabled = not token.startswith("!")
+        name = token[1:].strip() if token.startswith("!") else token
         if name:
-            overlays.add(name)
-    return overlays
+            records.append(
+                _overlay_record(
+                    name,
+                    enabled=enabled,
+                    layer=layer,
+                    label=label,
+                    rank=rank,
+                    source=env_var,
+                )
+            )
+    return records
+
+
+def _simulated_repo_override_policy(model: dict[str, Any] | None) -> dict[str, Any] | None:
+    policy = _skill_visibility_simulation(model).get("repo_override_policy")
+    return policy if isinstance(policy, dict) else None
+
+
+def _repo_override_overlay_records(
+    cwd: str | os.PathLike[str] | Path | None,
+    *,
+    model: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if cwd is None:
+        return []
+    policy = _simulated_repo_override_policy(model) or _repo_override_policy(cwd)
+    if not policy.get("ok"):
+        return []
+    policy_path = str(policy.get("_policy_path") or "")
+    records: list[dict[str, Any]] = []
+    overlays = policy.get("overlays") or {}
+    for name in overlays.get("enable") or []:
+        records.append(
+            _overlay_record(
+                str(name),
+                enabled=True,
+                layer="repo-override-file",
+                label="repo override file",
+                rank=REPO_OVERRIDE_LAYER_RANK,
+                source=policy_path,
+            )
+        )
+    for name in overlays.get("disable") or []:
+        records.append(
+            _overlay_record(
+                str(name),
+                enabled=False,
+                layer="repo-override-file",
+                label="repo override file",
+                rank=REPO_OVERRIDE_LAYER_RANK,
+                source=policy_path,
+            )
+        )
+    return records
+
+
+def _simulated_overlay_records(model: dict[str, Any] | None) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    simulation = _skill_visibility_simulation(model)
+    for name in simulation.get("overlays") or []:
+        text = str(name).strip()
+        if not text:
+            continue
+        records.append(
+            _overlay_record(
+                text,
+                enabled=True,
+                layer="what-if-overlays",
+                label="what-if overlays",
+                rank=CLI_LAYER_RANK + 1,
+                source="what-if",
+            )
+        )
+    return records
+
+
+def active_overlay_records(
+    cwd: str | os.PathLike[str] | Path | None = None,
+    *,
+    model: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Winning overlay decisions in total precedence order.
+
+    Higher ranks win: CLI env (`SKILLBOX_CLI_OVERLAYS`) > session env
+    (`SKILLBOX_OVERLAYS`) > repo override file > operator state dir. Env vars
+    accept `!name` to force-disable a lower layer for the current invocation.
+    """
+    raw_records = [
+        *_state_overlay_records(),
+        *_repo_override_overlay_records(cwd, model=model),
+        *_env_overlay_records(
+            OVERLAY_ENV_VAR,
+            layer="env-overlays",
+            label="session env overlays",
+            rank=ENV_LAYER_RANK,
+        ),
+        *_env_overlay_records(
+            OVERLAY_CLI_ENV_VAR,
+            layer="cli-overlays",
+            label="this invocation overlays",
+            rank=CLI_LAYER_RANK,
+        ),
+        *_simulated_overlay_records(model),
+    ]
+    winners: dict[str, dict[str, Any]] = {}
+    for order, record in enumerate(raw_records):
+        name = str(record.get("name") or "").strip()
+        if not name:
+            continue
+        candidate = dict(record)
+        candidate["_order"] = order
+        current = winners.get(name)
+        if current is None or (
+            int(candidate.get("layer_rank") or 0),
+            int(candidate.get("_order") or 0),
+        ) >= (
+            int(current.get("layer_rank") or 0),
+            int(current.get("_order") or 0),
+        ):
+            winners[name] = candidate
+    cleaned = []
+    for record in winners.values():
+        item = dict(record)
+        item.pop("_order", None)
+        cleaned.append(item)
+    return sorted(cleaned, key=lambda item: str(item.get("name") or ""))
+
+
+def active_overlays(
+    cwd: str | os.PathLike[str] | Path | None = None,
+    *,
+    model: dict[str, Any] | None = None,
+) -> set[str]:
+    """Return overlay names enabled by the winning precedence layer."""
+    return {
+        str(record.get("name") or "")
+        for record in active_overlay_records(cwd, model=model)
+        if record.get("enabled") and str(record.get("name") or "")
+    }
 
 
 def set_overlay(name: str, enabled: bool) -> bool:
@@ -562,7 +781,10 @@ def rule_overlay_tags(model: dict[str, Any]) -> set[str]:
     return tags
 
 
-def undeclared_active_overlays(model: dict[str, Any]) -> list[str]:
+def undeclared_active_overlays(
+    model: dict[str, Any],
+    cwd: str | os.PathLike[str] | Path | None = None,
+) -> list[str]:
     """Active overlay-state entries that name an UNDECLARED overlay.
 
     An overlay-state-file entry (or ``SKILLBOX_OVERLAYS`` opt-in) for a name with
@@ -574,7 +796,7 @@ def undeclared_active_overlays(model: dict[str, Any]) -> list[str]:
     declared = declared_overlays(model)
     if not declared:
         return []
-    return sorted(name for name in active_overlays() if name not in declared)
+    return sorted(name for name in active_overlays(cwd, model=model) if name not in declared)
 
 
 def overlay_scoped_skill_names(model: dict[str, Any], overlay_name: str) -> set[str]:
@@ -613,6 +835,487 @@ def _load_scope_policy(path: Path) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
     return raw
+
+
+def _empty_repo_override_policy(
+    repo_root: Path,
+    policy_path: Path,
+    *,
+    errors: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    error_list = list(errors or [])
+    return {
+        "ok": not error_list,
+        "version": OVERRIDE_POLICY_VERSION,
+        "pin_on": [],
+        "pin_off": [],
+        "opt_out_global": [],
+        "overlays": {"enable": [], "disable": []},
+        "defaults": [],
+        "reason": "",
+        "errors": error_list,
+        "_repo_root": str(repo_root),
+        "_policy_path": str(policy_path),
+    }
+
+
+def _override_error(
+    policy_path: Path,
+    message: str,
+    *,
+    key: str | None = None,
+) -> dict[str, Any]:
+    from .errors import OVERRIDE_PARSE_ERROR  # noqa: PLC0415
+
+    error: dict[str, Any] = {
+        "code": OVERRIDE_PARSE_ERROR,
+        "message": message,
+        "path": str(policy_path),
+    }
+    if key is not None:
+        error["key"] = key
+    return error
+
+
+def _override_name_list(value: Any) -> list[str]:
+    return sorted(
+        {
+            str(item).strip()
+            for item in _as_list(value)
+            if str(item).strip()
+        }
+    )
+
+
+def _repo_override_policy(cwd: str | os.PathLike[str] | Path) -> dict[str, Any]:
+    """Read the repo-local skill override policy anchored at the git root.
+
+    Missing files resolve to an empty policy. Malformed YAML or schema
+    violations are reported in ``errors`` while the effective override payload
+    fails safe to empty lists.
+    """
+    cwd_path = Path(os.path.expandvars(os.path.expanduser(str(cwd))))
+    repo_root = _repo_root_for_skill_install(cwd_path)
+    policy_path = repo_root / SKILL_OVERRIDES_REL
+    empty_policy = _empty_repo_override_policy(repo_root, policy_path)
+
+    if not policy_path.is_file():
+        return empty_policy
+
+    try:
+        raw = load_yaml(policy_path)
+    except RuntimeError as exc:
+        return _empty_repo_override_policy(
+            repo_root,
+            policy_path,
+            errors=[_override_error(policy_path, str(exc))],
+        )
+    if not isinstance(raw, dict):
+        return _empty_repo_override_policy(
+            repo_root,
+            policy_path,
+            errors=[_override_error(policy_path, "skill override policy must be a mapping")],
+        )
+
+    errors: list[dict[str, Any]] = []
+    unknown_keys = sorted(str(key) for key in set(raw) - OVERRIDE_ALLOWED_KEYS)
+    for key in unknown_keys:
+        errors.append(
+            _override_error(policy_path, f"unknown skill override key: {key}", key=key)
+        )
+
+    if raw.get("version") != OVERRIDE_POLICY_VERSION:
+        errors.append(
+            _override_error(
+                policy_path,
+                f"skill override version must be {OVERRIDE_POLICY_VERSION}",
+                key="version",
+            )
+        )
+
+    overlays_value = raw.get("overlays")
+    overlays_raw = overlays_value or {}
+    if overlays_value is not None and not isinstance(overlays_value, dict):
+        errors.append(
+            _override_error(policy_path, "overlays must be a mapping", key="overlays")
+        )
+        overlays_raw = {}
+    for key in sorted(set(overlays_raw) - set(OVERRIDE_OVERLAY_KEYS)):
+        errors.append(
+            _override_error(
+                policy_path,
+                f"unknown overlays key: {key}",
+                key=f"overlays.{key}",
+            )
+        )
+
+    policy = _empty_repo_override_policy(repo_root, policy_path, errors=errors)
+    if errors:
+        return policy
+
+    for key in OVERRIDE_LIST_KEYS:
+        policy[key] = _override_name_list(raw.get(key))
+    policy["overlays"] = {
+        key: _override_name_list(overlays_raw.get(key))
+        for key in OVERRIDE_OVERLAY_KEYS
+    }
+    policy["reason"] = str(raw.get("reason") or "").strip()
+    return policy
+
+
+def _override_entry_locations(policy_path: Path) -> dict[str, dict[str, list[int]]]:
+    """Best-effort map of override list entries to 1-based YAML line numbers."""
+    locations: dict[str, dict[str, list[int]]] = {}
+    if yaml is None or not policy_path.is_file():
+        return locations
+    try:
+        document = yaml.compose(policy_path.read_text(encoding="utf-8"))
+    except Exception:
+        return locations
+    if document is None:
+        return locations
+
+    def _line(node: Any) -> int:
+        mark = getattr(node, "start_mark", None)
+        return int(getattr(mark, "line", 0)) + 1
+
+    def _record(section: str, raw_name: Any, line: int) -> None:
+        name = str(raw_name).strip()
+        if not name:
+            return
+        locations.setdefault(section, {}).setdefault(name, []).append(line)
+
+    def _scalar_entries(value_node: Any) -> list[tuple[str, int]]:
+        node_id = str(getattr(value_node, "id", ""))
+        if node_id == "scalar":
+            return [(str(getattr(value_node, "value", "")).strip(), _line(value_node))]
+        if node_id != "sequence":
+            return []
+        entries: list[tuple[str, int]] = []
+        for item_node in getattr(value_node, "value", []) or []:
+            if str(getattr(item_node, "id", "")) != "scalar":
+                continue
+            entries.append((str(getattr(item_node, "value", "")).strip(), _line(item_node)))
+        return entries
+
+    if str(getattr(document, "id", "")) != "mapping":
+        return locations
+
+    for key_node, value_node in getattr(document, "value", []) or []:
+        key = str(getattr(key_node, "value", "")).strip()
+        if key in OVERRIDE_LIST_KEYS:
+            for name, line in _scalar_entries(value_node):
+                _record(key, name, line)
+        elif key == "overlays" and str(getattr(value_node, "id", "")) == "mapping":
+            for overlay_key_node, overlay_value_node in getattr(value_node, "value", []) or []:
+                overlay_key = str(getattr(overlay_key_node, "value", "")).strip()
+                if overlay_key not in OVERRIDE_OVERLAY_KEYS:
+                    continue
+                section = f"overlays.{overlay_key}"
+                for name, line in _scalar_entries(overlay_value_node):
+                    _record(section, name, line)
+    return locations
+
+
+def _first_location(
+    locations: dict[str, dict[str, list[int]]],
+    section: str,
+    name: str,
+) -> int | None:
+    lines = locations.get(section, {}).get(name) or []
+    return lines[0] if lines else None
+
+
+def _override_lint_finding(
+    *,
+    rule: str,
+    severity: str,
+    skill: str | None,
+    explanation: str,
+    suggested_fix: str,
+    policy_path: str,
+    line: int | None = None,
+    lines: dict[str, int | None] | None = None,
+    code: str | None = None,
+    did_you_mean: str | None = None,
+) -> dict[str, Any]:
+    finding: dict[str, Any] = {
+        "rule": rule,
+        "severity": severity,
+        "explanation": explanation,
+        "suggested_fix": suggested_fix,
+        "policy_path": policy_path,
+    }
+    if code:
+        finding["code"] = code
+    if skill:
+        finding["skill"] = skill
+    if line is not None:
+        finding["line"] = line
+    if lines:
+        finding["lines"] = lines
+    if did_you_mean:
+        finding["did_you_mean"] = did_you_mean
+    return finding
+
+
+def _override_parse_findings(policy: dict[str, Any]) -> list[dict[str, Any]]:
+    policy_path = str(policy.get("_policy_path") or "")
+    findings: list[dict[str, Any]] = []
+    for error in policy.get("errors") or []:
+        message = str(error.get("message") or "could not parse skill override policy")
+        findings.append(
+            _override_lint_finding(
+                rule="parse_error",
+                severity=OVERRIDE_LINT_SEVERITY_ERROR,
+                skill=None,
+                explanation=message,
+                suggested_fix="Fix the override YAML/schema issue, then rerun `sbp skill lint`.",
+                policy_path=policy_path,
+                code=str(error.get("code") or "OVERRIDE_PARSE_ERROR"),
+            )
+        )
+    return findings
+
+
+def lint_repo_override_policy(
+    cwd: str | os.PathLike[str] | Path,
+    *,
+    known_skill_names: list[str] | set[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Static lint for ``.skillbox/skill-overrides.yaml``.
+
+    The reader already fails safe on malformed files. This layer converts those
+    non-fatal reader errors plus semantic contradictions into structured
+    findings so doctor/recalibrate can report every issue they can still see.
+    """
+    policy = _repo_override_policy(cwd)
+    policy_path = str(policy.get("_policy_path") or "")
+    locations = _override_entry_locations(Path(policy_path))
+    findings = _override_parse_findings(policy)
+    known = {
+        str(name).strip()
+        for name in (known_skill_names or [])
+        if str(name).strip()
+    }
+
+    if policy.get("ok"):
+        for skill_name in sorted(set(policy.get("pin_on") or []) & set(policy.get("pin_off") or [])):
+            pin_on_line = _first_location(locations, "pin_on", skill_name)
+            pin_off_line = _first_location(locations, "pin_off", skill_name)
+            findings.append(
+                _override_lint_finding(
+                    rule="contradiction",
+                    severity=OVERRIDE_LINT_SEVERITY_ERROR,
+                    skill=skill_name,
+                    explanation=(
+                        f"{skill_name!r} appears in both pin_on and pin_off, "
+                        "so the override asks for mutually exclusive outcomes."
+                    ),
+                    suggested_fix=(
+                        "Keep exactly one of `pin_on` or `pin_off` for this skill, "
+                        "or remove both entries."
+                    ),
+                    policy_path=policy_path,
+                    lines={"pin_on": pin_on_line, "pin_off": pin_off_line},
+                )
+            )
+
+        for skill_name in sorted(set(policy.get("opt_out_global") or []) & set(DISPATCHER_CORE)):
+            findings.append(
+                _override_lint_finding(
+                    rule="floor_opt_out",
+                    severity=OVERRIDE_LINT_SEVERITY_ERROR,
+                    skill=skill_name,
+                    explanation=(
+                        f"{skill_name!r} is dispatcher-core floor policy and cannot "
+                        "be opted out by repo-local overrides."
+                    ),
+                    suggested_fix=(
+                        f"Remove {skill_name!r} from `opt_out_global`; dispatcher "
+                        "floor skills must remain available."
+                    ),
+                    policy_path=policy_path,
+                    line=_first_location(locations, "opt_out_global", skill_name),
+                    code="OVERRIDE_REFUSED_FLOOR",
+                )
+            )
+
+        if known:
+            referenced_sections = ("pin_on", "pin_off", "opt_out_global", "defaults")
+            for section in referenced_sections:
+                for skill_name in sorted(set(policy.get(section) or [])):
+                    if skill_name in known:
+                        continue
+                    suggestion = _did_you_mean(skill_name, sorted(known))
+                    suggested_fix = "Remove the stale override entry or restore the skill source."
+                    if suggestion:
+                        suggested_fix = f"Did you mean {suggestion!r}? Otherwise {suggested_fix[0].lower()}{suggested_fix[1:]}"
+                    findings.append(
+                        _override_lint_finding(
+                            rule="dangling",
+                            severity=OVERRIDE_LINT_SEVERITY_ERROR,
+                            skill=skill_name,
+                            explanation=(
+                                f"{section} references {skill_name!r}, but no declared "
+                                "or discoverable skill source by that name was found."
+                            ),
+                            suggested_fix=suggested_fix,
+                            policy_path=policy_path,
+                            line=_first_location(locations, section, skill_name),
+                            did_you_mean=suggestion,
+                        )
+                    )
+
+    errors = [
+        finding for finding in findings
+        if finding.get("severity") == OVERRIDE_LINT_SEVERITY_ERROR
+    ]
+    warnings = [
+        finding for finding in findings
+        if finding.get("severity") == OVERRIDE_LINT_SEVERITY_WARN
+    ]
+    return {
+        "ok": not errors,
+        "policy_path": policy_path,
+        "repo_root": str(policy.get("_repo_root") or ""),
+        "exists": Path(policy_path).is_file() if policy_path else False,
+        "findings": findings,
+        "summary": {
+            "total": len(findings),
+            "error": len(errors),
+            "warn": len(warnings),
+        },
+    }
+
+
+def _repo_override_paths(cwd: str | os.PathLike[str] | Path) -> tuple[Path, Path]:
+    cwd_path = Path(os.path.expandvars(os.path.expanduser(str(cwd))))
+    repo_root = _repo_root_for_skill_install(cwd_path)
+    return repo_root, repo_root / SKILL_OVERRIDES_REL
+
+
+def _override_policy_for_write(policy_path: Path) -> dict[str, Any]:
+    if not policy_path.is_file():
+        return {
+            "version": OVERRIDE_POLICY_VERSION,
+            "pin_on": [],
+            "pin_off": [],
+            "opt_out_global": [],
+            "overlays": {"enable": [], "disable": []},
+            "defaults": [],
+            "reason": "",
+        }
+    raw = load_yaml(policy_path)
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"skill override policy must be a mapping: {policy_path}")
+    return dict(raw)
+
+
+def _serialize_override_policy(policy: dict[str, Any]) -> str:
+    yaml_mod = require_yaml("write skill override policy")
+    payload = dict(policy)
+    payload.setdefault("version", OVERRIDE_POLICY_VERSION)
+    payload.setdefault("pin_on", [])
+    payload.setdefault("pin_off", [])
+    payload.setdefault("opt_out_global", [])
+    payload.setdefault("overlays", {"enable": [], "disable": []})
+    payload.setdefault("defaults", [])
+    payload.setdefault("reason", "")
+    return yaml_mod.safe_dump(payload, sort_keys=False).rstrip() + "\n"
+
+
+def _fsync_parent_dir(path: Path) -> None:
+    parent_fd = os.open(str(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _atomic_write_override_text(path: Path, content: str, *, fsync: bool) -> None:
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            if fsync:
+                os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        if fsync:
+            _fsync_parent_dir(path)
+    except BaseException:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _wait_for_override_text(path: Path, expected: str) -> None:
+    deadline = time.monotonic() + 0.5
+    while True:
+        try:
+            if path.read_text(encoding="utf-8") == expected:
+                return
+        except OSError:
+            pass
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.01)
+
+
+def update_repo_override_policy(
+    cwd: str | os.PathLike[str] | Path,
+    mutate_fn: Callable[[dict[str, Any]], dict[str, Any] | None],
+    *,
+    fsync: bool = True,
+    timeout: float = OVERRIDE_WRITE_LOCK_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Locked, crash-safe read-modify-write for .skillbox/skill-overrides.yaml."""
+    _repo_root, policy_path = _repo_override_paths(cwd)
+    policy_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = policy_path.with_name(policy_path.name + ".lock")
+
+    def _commit() -> dict[str, Any]:
+        current = _override_policy_for_write(policy_path)
+        updated = mutate_fn(dict(current))
+        if updated is None:
+            updated = current
+        serialized = _serialize_override_policy(updated)
+        previous = policy_path.read_text(encoding="utf-8") if policy_path.is_file() else ""
+        changed = previous != serialized
+        if changed:
+            _atomic_write_override_text(policy_path, serialized, fsync=fsync)
+            _wait_for_override_text(policy_path, serialized)
+        policy = _repo_override_policy(policy_path.parent)
+        policy["changed"] = changed
+        policy["lock_path"] = str(lock_path)
+        return policy
+
+    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise OverrideWriteLockTimeout(lock_path)
+                time.sleep(_OVERRIDE_WRITE_POLL_INTERVAL_SECONDS)
+        return _commit()
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(lock_fd)
 
 
 def _operator_scope_policies(model: dict[str, Any]) -> list[dict[str, Any]]:
@@ -723,7 +1426,7 @@ def _policy_categories_by_id(policy: dict[str, Any]) -> dict[str, dict[str, Any]
 # --------------------------------------------------------------------------- #
 # Registry id/category -> path resolution (skill-scope `repos:` / `categories:`)
 #
-# A scope rule may name repos by their registry id (``repos: [htma, htma-server]``)
+# A scope rule may name repos by their registry id (``repos: [app_core, app_core-server]``)
 # and/or by a registry classification (``categories: [backend]`` matching a
 # repo's ``bucket``) instead of hand-listing literal ``paths:``. The id->path
 # taxonomy is the canonical operator registry at
@@ -742,6 +1445,7 @@ def _policy_categories_by_id(policy: dict[str, Any]) -> dict[str, dict[str, Any]
 REGISTRY_FILE_ENV_VAR = "SKILLBOX_REGISTRY_FILE"
 # repos.yaml lives in the private config repo beside skill-scope.yaml/machines.yaml.
 REGISTRY_FILE_REL = ("registry", "repos.yaml")
+SKILL_VISIBILITY_SIMULATION_KEY = "_skill_visibility_simulation"
 
 
 class RegistryResolutionError(ValueError):
@@ -750,6 +1454,25 @@ class RegistryResolutionError(ValueError):
     The message embeds a fix hint: the nearest declared id (did-you-mean) and the
     full declared id list, so a typo is self-healing rather than a silent miss.
     """
+
+
+def _skill_visibility_simulation(model: dict[str, Any] | None) -> dict[str, Any]:
+    """In-memory resolver inputs for read-only what-if calls.
+
+    The key is deliberately private to the runtime model. Normal callers never
+    set it; simulation callers can inject overlays, repo overrides, planned
+    installs, or a target machine while still flowing through this resolver.
+    """
+    if not isinstance(model, dict):
+        return {}
+    raw = model.get(SKILL_VISIBILITY_SIMULATION_KEY)
+    return raw if isinstance(raw, dict) else {}
+
+
+def _simulated_machine_id(model: dict[str, Any] | None) -> str | None:
+    raw = _skill_visibility_simulation(model).get("machine")
+    text = str(raw or "").strip()
+    return text or None
 
 
 def _registry_doctor_module() -> Any | None:
@@ -833,7 +1556,15 @@ def _did_you_mean(target: str, candidates: list[str]) -> str | None:
     return matches[0] if matches else None
 
 
-def _machine_detected() -> bool:
+def _machine_config_and_id(model: dict[str, Any] | None = None) -> tuple[Any, str | None]:
+    config, machine_id = _machines_classifier()
+    simulated = _simulated_machine_id(model)
+    if simulated:
+        machine_id = simulated
+    return config, machine_id
+
+
+def _machine_detected(model: dict[str, Any] | None = None) -> bool:
     """True when the current machine is positively identified.
 
     Distinguishes "machine detected (just no repo_roots declared)" from "machine
@@ -843,11 +1574,16 @@ def _machine_detected() -> bool:
     renamed host, a worker container) to ``(None, None)``; an undetected machine
     must NOT silently re-root to the home-form-only set, so callers fail loud.
     """
-    config, machine_id = _machines_classifier()
+    config, machine_id = _machine_config_and_id(model)
+    if config is not None and machine_id:
+        try:
+            config.require(machine_id)
+        except Exception:
+            return False
     return config is not None and bool(machine_id)
 
 
-def _machine_repo_roots() -> list[str]:
+def _machine_repo_roots(model: dict[str, Any] | None = None) -> list[str]:
     """Current machine's declared repo roots (expanded), longest-first.
 
     Empty when machines.yaml is missing, the machine is undetected, OR the
@@ -856,22 +1592,25 @@ def _machine_repo_roots() -> list[str]:
     an UNDETECTED machine means "cannot re-root" (a hard error), not "fall back to
     the home-relative form".
     """
-    config, machine_id = _machines_classifier()
+    config, machine_id = _machine_config_and_id(model)
     if config is None or not machine_id:
         return []
-    profile = config.get(machine_id)
-    if profile is None:
+    try:
+        from . import machines as _machines  # noqa: PLC0415
+
+        roots = _machines.repo_roots_for_machine(config, machine_id)
+    except Exception:
         return []
-    roots = [str(root) for root in profile.repo_roots if str(root).strip()]
+    roots = [str(root) for root in roots if str(root).strip()]
     return sorted(roots, key=len, reverse=True)
 
 
 def _registry_path_remainder(declared_path: str) -> tuple[str, bool]:
     """Split a registry path into (remainder, was_under_repos_root).
 
-    The registry authors paths home-relative (``~/repos/htma``, ``~/hard/x``).
+    The registry authors paths home-relative (``~/repos/app_core``, ``~/hard/x``).
     Paths under the ``~/repos`` family get re-rooted under the CURRENT machine's
-    repo roots (so ``htma`` -> ``/srv/skillbox/repos/htma`` on the devbox); paths
+    repo roots (so ``app_core`` -> ``/srv/skillbox/repos/app_core`` on the devbox); paths
     under other roots (``~/hard/...``) carry no machine mapping and are expanded
     home-relative as-is. Returns ``("", False)`` when there is no remainder.
     """
@@ -885,7 +1624,11 @@ def _registry_path_remainder(declared_path: str) -> tuple[str, bool]:
     return expanded, False
 
 
-def _resolve_registry_path(declared_path: str) -> list[str]:
+def _resolve_registry_path(
+    declared_path: str,
+    *,
+    model: dict[str, Any] | None = None,
+) -> list[str]:
     """Map one registry repo path to every spelling on the CURRENT machine.
 
     Emits the repo's path under (a) the registry's home-relative form and (b)
@@ -901,13 +1644,17 @@ def _resolve_registry_path(declared_path: str) -> list[str]:
     spellings.append(declared_path)
     if under_repos:
         # (b) re-root the remainder under each current-machine repo root.
-        for root in _machine_repo_roots():
+        for root in _machine_repo_roots(model):
             spellings.append(os.path.join(root, remainder) if remainder else root)
     resolved = sorted({_expand_policy_path(item) for item in spellings if str(item).strip()})
     return resolved
 
 
-def _resolve_registry_entry_path(entry: dict[str, Any]) -> list[str]:
+def _resolve_registry_entry_path(
+    entry: dict[str, Any],
+    *,
+    model: dict[str, Any] | None = None,
+) -> list[str]:
     """Resolve ONE registry entry's declared path to current-machine spellings.
 
     Fail-loud guards (match the project's posture — unknown-id already raises):
@@ -931,14 +1678,49 @@ def _resolve_registry_entry_path(entry: dict[str, Any]) -> list[str]:
             "it to a current-machine path."
         )
     _remainder, under_repos = _registry_path_remainder(declared_path)
-    if under_repos and not _machine_detected():
+    if under_repos and not _machine_detected(model):
         raise RegistryResolutionError(
             "registry-id rule used but current machine undetected -- cannot "
             "re-root; check machines.yaml / SKILLBOX_MACHINE "
             f"(resolving registry id {str(entry.get('id') or '')!r} -> "
             f"{declared_path!r})."
         )
-    return _resolve_registry_path(declared_path)
+    return _resolve_registry_path(declared_path, model=model)
+
+
+def _resolve_registry_repo_ref(
+    repo_ref: str,
+    *,
+    model: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Resolve a registry repo id/name to machine-rooted paths.
+
+    Returns ``None`` when ``repo_ref`` is not a declared registry id/name so the
+    caller can treat it as a literal path.
+    """
+    target = str(repo_ref or "").strip()
+    if not target:
+        return None
+    entries = _load_registry_entries()
+    by_key: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        for key_name in ("id", "name"):
+            key = str(entry.get(key_name) or "").strip()
+            if key:
+                by_key.setdefault(key, entry)
+    entry = by_key.get(target)
+    if entry is None:
+        return None
+    paths = _resolve_registry_entry_path(entry, model=model)
+    return {
+        "input": target,
+        "matched": True,
+        "id": str(entry.get("id") or entry.get("name") or target),
+        "name": str(entry.get("name") or entry.get("id") or target),
+        "bucket": str(entry.get("bucket") or entry.get("class") or ""),
+        "declared_path": str(entry.get("path") or ""),
+        "paths": paths,
+    }
 
 
 def _scope_rule_repo_ids(raw_rule: dict[str, Any]) -> list[str]:
@@ -953,6 +1735,8 @@ def _resolve_scope_rule_repos(
     repo_ids: list[str],
     category_ids: list[str],
     entries: list[dict[str, Any]],
+    *,
+    model: dict[str, Any] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Resolve registry ids + registry-category ids to current-machine paths.
 
@@ -992,7 +1776,7 @@ def _resolve_scope_rule_repos(
                 f"id {repo_id!r} not in registry/repos.yaml{suggestion} "
                 f"declared ids: {', '.join(declared_ids)}"
             )
-        paths.extend(_resolve_registry_entry_path(entry))
+        paths.extend(_resolve_registry_entry_path(entry, model=model))
 
     matched_categories: list[str] = []
     for category_id in category_ids:
@@ -1004,7 +1788,7 @@ def _resolve_scope_rule_repos(
             continue
         matched_categories.append(category_id)
         for entry in members:
-            paths.extend(_resolve_registry_entry_path(entry))
+            paths.extend(_resolve_registry_entry_path(entry, model=model))
 
     return sorted(set(paths)), matched_categories
 
@@ -1041,6 +1825,7 @@ def _scope_rule_paths(
     categories: dict[str, dict[str, Any]],
     *,
     registry_entries: list[dict[str, Any]] | None = None,
+    model: dict[str, Any] | None = None,
 ) -> tuple[list[str], list[str], list[str], list[str]]:
     """Build a rule's effective path list (literal + category + registry).
 
@@ -1067,7 +1852,7 @@ def _scope_rule_paths(
     if registry_entries is None:
         registry_entries = _load_registry_entries()
     registry_paths, registry_categories = _resolve_scope_rule_repos(
-        repo_ids, category_ids, registry_entries
+        repo_ids, category_ids, registry_entries, model=model
     )
     paths.extend(registry_paths)
 
@@ -1088,6 +1873,7 @@ def _scope_rule_from_raw(
     categories: dict[str, dict[str, Any]],
     overlays_on: set[str],
     registry_entries: list[dict[str, Any]] | None = None,
+    model: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     overlay = str(raw_rule.get("overlay") or "").strip()
     if overlay and overlay not in overlays_on:
@@ -1096,7 +1882,7 @@ def _scope_rule_from_raw(
     if not patterns:
         return None
     paths, category_ids, unknown_categories, repo_ids = _scope_rule_paths(
-        raw_rule, categories, registry_entries=registry_entries
+        raw_rule, categories, registry_entries=registry_entries, model=model
     )
     return {
         "id": str(raw_rule.get("id") or f"rule-{index}"),
@@ -1105,6 +1891,10 @@ def _scope_rule_from_raw(
         "categories": category_ids,
         "repos": repo_ids,
         "unknown_categories": unknown_categories,
+        "path_match": (
+            str(raw_rule.get("match") or raw_rule.get("path_match") or "prefix").strip().lower()
+            or "prefix"
+        ),
         "allow_global": bool(raw_rule.get("allow_global", False)),
         "default": raw_rule.get("default", "on"),
         "activation": str(raw_rule.get("activation") or "").strip(),
@@ -1133,10 +1923,41 @@ def last_scope_rule_errors() -> list[dict[str, Any]]:
     return [dict(item) for item in _LAST_SCOPE_RULE_ERRORS]
 
 
-def _scope_rules(model: dict[str, Any]) -> list[dict[str, Any]]:
+def _scope_rule_path_match_mode(rule: dict[str, Any]) -> str:
+    mode = str(rule.get("path_match") or "prefix").strip().lower()
+    if mode in {"exact", "equal", "equals"}:
+        return "exact"
+    return "prefix"
+
+
+def _scope_rule_path_matches(rule: dict[str, Any], cwd: Path, path: str) -> bool:
+    if _scope_rule_path_match_mode(rule) != "exact":
+        return _path_prefix_matches(cwd, path)
+    raw_path = str(path or "").strip()
+    if not raw_path:
+        return False
+    expanded = Path(os.path.expandvars(os.path.expanduser(raw_path))).resolve()
+    return cwd.resolve() == expanded
+
+
+def _scope_rule_matched_paths(rule: dict[str, Any], cwd: Path) -> list[str]:
+    return [
+        path
+        for path in rule.get("paths") or []
+        if _scope_rule_path_matches(rule, cwd, path)
+    ]
+
+
+def _scope_rules(
+    model: dict[str, Any],
+    *,
+    cwd: str | os.PathLike[str] | Path | None = None,
+    overlays_on: set[str] | None = None,
+) -> list[dict[str, Any]]:
     rules: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
-    overlays_on = active_overlays()
+    if overlays_on is None:
+        overlays_on = active_overlays(cwd, model=model)
     # Load the registry id->path taxonomy once per pass (not per rule) so
     # `repos:`/registry-`categories:` resolution stays cheap.
     registry_entries = _load_registry_entries()
@@ -1153,6 +1974,7 @@ def _scope_rules(model: dict[str, Any]) -> list[dict[str, Any]]:
                     categories=categories,
                     overlays_on=overlays_on,
                     registry_entries=registry_entries,
+                    model=model,
                 )
             except RegistryResolutionError as exc:
                 # BUG C: one bad rule (typo'd repos: id / malformed registry
@@ -1227,13 +2049,12 @@ def _global_allow_patterns(model: dict[str, Any]) -> list[str] | None:
     patterns: list[str] = []
     has_explicit_policy = False
     for policy in _operator_scope_policies(model):
-        raw_allowlist = policy.get("global_allowlist")
-        if raw_allowlist is not None:
+        if policy.get("global_allowlist") is not None:
             has_explicit_policy = True
-            patterns.extend(str(item).strip() for item in raw_allowlist or [] if str(item).strip())
         for rule in policy.get("rules") or []:
             if not isinstance(rule, dict) or not bool(rule.get("allow_global", False)):
                 continue
+            has_explicit_policy = True
             raw_patterns = rule.get("skills") or rule.get("patterns") or rule.get("names") or []
             patterns.extend(str(item).strip() for item in raw_patterns if str(item).strip())
     if not has_explicit_policy:
@@ -1257,7 +2078,7 @@ def _matching_scope_rule(
         cwd = Path(os.path.abspath(os.path.expandvars(os.path.expanduser(str(cwd)))))
         path_matches = [
             rule for rule in matches
-            if any(_path_prefix_matches(cwd, path) for path in rule.get("paths") or [])
+            if _scope_rule_matched_paths(rule, cwd)
         ]
         if path_matches:
             return max(
@@ -1265,7 +2086,7 @@ def _matching_scope_rule(
                 key=lambda rule: max(
                     len(str(path))
                     for path in rule.get("paths") or []
-                    if _path_prefix_matches(cwd, path)
+                    if _scope_rule_path_matches(rule, cwd, path)
                 ),
             )
     if matches:
@@ -1330,9 +2151,8 @@ def _skill_is_effective(effective: list[dict[str, Any]], skill_name: str) -> boo
 def _matched_scope_rules_for_cwd(model: dict[str, Any], cwd: Path) -> list[dict[str, Any]]:
     matched: list[dict[str, Any]] = []
     cwd = cwd.resolve()
-    for rule in _scope_rules(model):
-        paths = list(rule.get("paths") or [])
-        matched_paths = [path for path in paths if _path_prefix_matches(cwd, path)]
+    for rule in _scope_rules(model, cwd=cwd):
+        matched_paths = _scope_rule_matched_paths(rule, cwd)
         if not matched_paths:
             continue
         item = dict(rule)
@@ -1412,3 +2232,21 @@ def _global_install_allowed(model: dict[str, Any], skill_name: str) -> bool:
     if patterns is None:
         return True
     return any(fnmatch.fnmatchcase(skill_name, pattern) for pattern in patterns)
+
+
+def _global_override_refusal_context(model: dict[str, Any], skill_name: str) -> dict[str, Any] | None:
+    patterns = _global_allow_patterns(model)
+    if patterns is None or any(fnmatch.fnmatchcase(skill_name, pattern) for pattern in patterns):
+        return None
+
+    matching_rule = _matching_scope_rule(skill_name, _scope_rules(model))
+    context: dict[str, Any] = {
+        "skill": skill_name,
+        "allowed_global_patterns": list(patterns),
+    }
+    if matching_rule:
+        context["scope_rule"] = matching_rule.get("id")
+        context["scope_policy_path"] = matching_rule.get("policy_path")
+        context["scope_rule_allow_global"] = bool(matching_rule.get("allow_global"))
+        context["scope_rule_default"] = matching_rule.get("default")
+    return context

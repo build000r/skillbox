@@ -15,19 +15,411 @@ This page is **generated** from `scripts/gen_output_schemas.py`. The example pay
 
 ## Surfaces
 
+- [`sbp capabilities`](#sbp-capabilities)
 - [`sbp skills`](#sbp-skills)
 - [`sbp candidates`](#sbp-candidates)
 - [`sbp mcp`](#sbp-mcp)
 - [`sbp recalibrate`](#sbp-recalibrate)
+- [`sbp skill why`](#sbp-skill-why)
+- [`sbp skill on`](#sbp-skill-on)
+- [`sbp skill off`](#sbp-skill-off)
+- [`sbp skill togglable`](#sbp-skill-togglable)
 - [`sbp explain`](#sbp-explain)
 - [`sbp doctor`](#sbp-doctor)
 - [`fleet converge`](#fleet-converge)
 
 ---
 
+## `sbp capabilities`
+
+**Invocation:** `sbp capabilities --json`
+**Produced by:** `scripts/sbp print_capabilities`
+
+The wrapper discovery contract. Agents should start here to learn the stable command inventory, stdout/stderr rules, dry-run guidance, and the machine-readable `skill_verbs` decision map for choosing between recalibrate/activate/sync/prune/on/off/heal/why/togglable and maintenance verbs.
+
+### Fields
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `agent_surfaces` | CONTRACT | Canonical discovery commands for agents. |
+| `aliases` | CONTRACT | Sibling wrapper aliases for this entrypoint. |
+| `commands` | CONTRACT | Agent-facing command inventory with safe_first_try examples. |
+| `contract_version` | CONTRACT | Version tag for this wrapper capabilities contract. |
+| `cwd` | CONTRACT | Invocation cwd used by the wrapper. |
+| `entrypoint` | CONTRACT | Wrapper entrypoint path relative to the skillbox repo. |
+| `next_actions` | info | Common first follow-up commands. |
+| `ok` | CONTRACT | True when the wrapper emitted a complete capabilities payload. |
+| `safety` | CONTRACT | Dry-run and confirmation guidance for mutating commands. |
+| `skill_verbs` | CONTRACT | Machine-readable skill verb decision map; every dispatched skill subcommand has an entry. |
+| `stdout_stderr_contract` | CONTRACT | Where JSON and diagnostics are emitted. |
+| `tool` | CONTRACT | Tool identity, e.g. skillbox-sbp. |
+
+#### `skill_verbs.<verb>` (one skill verb row)
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `do_NOT` | info | Important anti-pattern for this verb. |
+| `links_disk` | CONTRACT | True when the verb may create/remove skill links on disk. |
+| `mutates` | CONTRACT | Stable mutation class: none, cwd-ephemeral, disk-links, or repo-state+disk-links. |
+| `purpose` | CONTRACT | One-line meaning of the verb. |
+| `returns_packet` | CONTRACT | True when success includes an activation_packet for immediate session use. |
+| `scope` | CONTRACT | Scope the verb operates on. |
+| `survives_recalibrate` | CONTRACT | True when the verb writes durable repo state that recalibrate/prune should preserve. |
+| `when_to_use` | info | Human/agent guidance for choosing this verb. |
+
+### Example payload
+
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
+
+```json
+{
+  "agent_surfaces": {
+    "capabilities": "sbp capabilities --json",
+    "json_aliases": [
+      "--jason",
+      "--json",
+      "--jsno",
+      "--jsson"
+    ],
+    "robot_docs": "sbp robot-docs guide",
+    "robot_triage": "sbp --robot-triage"
+  },
+  "aliases": [
+    "sbo"
+  ],
+  "commands": [
+    {
+      "json": true,
+      "name": "capabilities",
+      "safe_first_try": "sbp capabilities --json"
+    },
+    {
+      "json": true,
+      "name": "robot-docs",
+      "safe_first_try": "sbp robot-docs guide --json"
+    },
+    {
+      "json": true,
+      "name": "robot-triage",
+      "safe_first_try": "sbp --robot-triage"
+    },
+    {
+      "json": true,
+      "name": "status",
+      "safe_first_try": "sbp status --json"
+    },
+    {
+      "json": true,
+      "name": "logs",
+      "safe_first_try": "sbp logs <profile> <service> --json"
+    },
+    {
+      "json": true,
+      "name": "up",
+      "safe_first_try": "sbp up <profile> <service> --dry-run --json"
+    },
+    {
+      "json": true,
+      "name": "down",
+      "safe_first_try": "sbp down <profile> <service> --dry-run --json"
+    },
+    {
+      "json": true,
+      "name": "restart",
+      "safe_first_try": "sbp restart <profile> <service> --dry-run --json"
+    },
+    {
+      "aliases": [
+        "bulk"
+      ],
+      "json": true,
+      "name": "launch",
+      "safe_first_try": "sbp launch <dir> <dir> --request '<prompt>' --dry-run --json"
+    },
+    {
+      "alias_for": "launch",
+      "json": true,
+      "name": "bulk",
+      "safe_first_try": "sbp bulk <dir> <dir> --request '<prompt>' --dry-run --json"
+    },
+    {
+      "json": true,
+      "name": "skills",
+      "safe_first_try": "sbp skills --issues-only --json"
+    },
+    {
+      "json": true,
+      "name": "skill-why",
+      "safe_first_try": "sbp skill why <skill> --json"
+    },
+    {
+      "json": true,
+      "name": "skill-togglable",
+      "safe_first_try": "sbp skill togglable --json"
+    },
+    {
+      "json": true,
+      "name": "skill-what-if",
+      "safe_first_try": "sbp skill what-if --repo <repo-id-or-path> --overlay <overlay> --json"
+    },
+    {
+      "json": true,
+      "name": "skill-heal",
+      "safe_first_try": "sbp skill heal <skill> --dry-run --format json"
+    },
+    {
+      "json": true,
+      "name": "candidates",
+      "safe_first_try": "sbp candidates --json"
+    },
+    {
+      "json": true,
+      "name": "mcp",
+      "safe_first_try": "sbp mcp --json"
+    },
+    {
+      "json": true,
+      "name": "registry",
+      "safe_first_try": "sbp registry doctor --json"
+    },
+    {
+      "fallback": "If status is error/degraded/stale during active work, report degraded_cass evidence mode and use the local transcript scanner; do not rebuild Cass mid-task.",
+      "json": true,
+      "name": "cass",
+      "safe_first_try": "sbp cass status --json"
+    },
+    {
+      "json": true,
+      "name": "evidence",
+      "safe_first_try": "sbp evidence --repo <path> --format json"
+    },
+    {
+      "json": true,
+      "name": "cron",
+      "safe_first_try": "sbp cron status --json"
+    },
+    {
+      "json": true,
+      "name": "send-later",
+      "safe_first_try": "sbp send-later list --json"
+    },
+    {
+      "json": true,
+      "name": "recalibrate",
+      "safe_first_try": "sbp recalibrate --json"
+    }
+  ],
+  "contract_version": "2026-05-11",
+  "cwd": "<RUNTIME_ROOT>",
+  "entrypoint": "scripts/sbp",
+  "next_actions": [
+    "sbp status --json",
+    "sbp skills --issues-only --json",
+    "sbp mcp --json",
+    "sbp launch <dir> <dir> --request '<prompt>' --dry-run --json",
+    "sbp up <profile> <service> --dry-run --json"
+  ],
+  "ok": true,
+  "safety": {
+    "confirm_with_user_before": [
+      "sbp down <profile> <service>"
+    ],
+    "dry_run_first": [
+      "sbp up <profile> <service> --dry-run --json",
+      "sbp down <profile> <service> --dry-run --json",
+      "sbp restart <profile> <service> --dry-run --json",
+      "sbp launch <dir> <dir> --request '<prompt>' --dry-run --json",
+      "sbp bulk <dir> <dir> --request '<prompt>' --dry-run --json",
+      "sbp skill prune --dry-run",
+      "sbp skill default on <skill> --repo --dry-run --format json",
+      "sbp skill default on <skill> --category frontend --dry-run --format json"
+    ]
+  },
+  "skill_verbs": {
+    "activate": {
+      "do_NOT": "Do not treat activate as durable repo state; use on or heal for that.",
+      "links_disk": true,
+      "mutates": "cwd-ephemeral",
+      "purpose": "Install/link a skill and print an activation packet for this session.",
+      "returns_packet": true,
+      "scope": "current cwd by default; global/category if explicitly requested",
+      "survives_recalibrate": false,
+      "when_to_use": "Use for an immediate one-session handoff when durability is not required."
+    },
+    "add": {
+      "do_NOT": "Do not use add when the repo needs a durable policy override; use on or heal.",
+      "links_disk": true,
+      "mutates": "disk-links",
+      "purpose": "Install/link a skill into a selected scope.",
+      "returns_packet": false,
+      "scope": "global, project, or category",
+      "survives_recalibrate": false,
+      "when_to_use": "Use for deliberate non-override link management."
+    },
+    "default": {
+      "do_NOT": "Do not apply --global without --dry-run review and --yes; do not apply --repos/--category before the exact dry-run marker exists.",
+      "links_disk": false,
+      "mutates": "repo_or_operator_policy",
+      "purpose": "Set repo, cross-repo, or operator-global skill defaults with a reviewable unified diff.",
+      "returns_packet": false,
+      "scope": "repo, registry cohort, or global",
+      "survives_recalibrate": true,
+      "when_to_use": "Use --repo for one repo, --repos/--category for reviewed registry cohorts, and --global only after dry-run review."
+    },
+    "heal": {
+      "do_NOT": "Do not use heal when no real source exists; unknown sources are refused.",
+      "links_disk": true,
+      "mutates": "repo-state+disk-links",
+      "purpose": "Resolve a real skill source, durably pin it on, link it, and return an activation packet.",
+      "returns_packet": true,
+      "scope": "repo-local project scope",
+      "survives_recalibrate": true,
+      "when_to_use": "Use when a source-backed skill is missing and should become visible now and later."
+    },
+    "lint": {
+      "do_NOT": "Do not expect lint to repair or rewrite the file.",
+      "links_disk": false,
+      "mutates": "none",
+      "purpose": "Validate the repo-local .skillbox/skill-overrides.yaml file.",
+      "returns_packet": false,
+      "scope": "current repo override file",
+      "survives_recalibrate": false,
+      "when_to_use": "Use after editing override state or when a pin behaves unexpectedly."
+    },
+    "move": {
+      "do_NOT": "Do not use move as a policy override; it only manages links.",
+      "links_disk": true,
+      "mutates": "disk-links",
+      "purpose": "Install/link a skill into a new scope and remove old installs for that skill.",
+      "returns_packet": false,
+      "scope": "global, project, or category",
+      "survives_recalibrate": false,
+      "when_to_use": "Use when intentionally relocating an existing install."
+    },
+    "off": {
+      "do_NOT": "Do not use off to disable dispatcher floor skills such as smart or sbp.",
+      "links_disk": true,
+      "mutates": "repo-state+disk-links",
+      "purpose": "Durably pin a skill off for this repo and unlink project installs.",
+      "returns_packet": false,
+      "scope": "repo-local project scope",
+      "survives_recalibrate": true,
+      "when_to_use": "Use when a repo should keep a skill disabled."
+    },
+    "on": {
+      "do_NOT": "Do not use on for global escalation; disallowed globals are refused.",
+      "links_disk": true,
+      "mutates": "repo-state+disk-links",
+      "purpose": "Durably pin a skill on for this repo, link it, and return an activation packet.",
+      "returns_packet": true,
+      "scope": "repo-local project scope",
+      "survives_recalibrate": true,
+      "when_to_use": "Use when the repo should keep seeing a known source-backed skill."
+    },
+    "plan": {
+      "do_NOT": "Do not expect plan to make a skill visible.",
+      "links_disk": false,
+      "mutates": "none",
+      "purpose": "Preview where a skill lifecycle operation would install or remove links.",
+      "returns_packet": false,
+      "scope": "global, project, or category preview",
+      "survives_recalibrate": false,
+      "when_to_use": "Use before a risky link or move when you only need the plan."
+    },
+    "prune": {
+      "do_NOT": "Do not skip dry-run; pinned overrides are protected by the prune firewall.",
+      "links_disk": true,
+      "mutates": "disk-links",
+      "purpose": "Remove installed skills that violate current skill-scope policy.",
+      "returns_packet": false,
+      "scope": "global, project, or all selected installs",
+      "survives_recalibrate": false,
+      "when_to_use": "Use after dry-run to remove drift that policy does not allow."
+    },
+    "recalibrate": {
+      "do_NOT": "Do not treat bare recalibrate as a mutator; --auto-fix previews and --auto-fix --yes applies heal.",
+      "links_disk": false,
+      "mutates": "none",
+      "purpose": "Read-only cwd/fleet skill visibility audit with exact next commands; --auto-fix previews heal, --yes applies.",
+      "returns_packet": false,
+      "scope": "cwd or fleet",
+      "survives_recalibrate": false,
+      "when_to_use": "Use first when unsure what the repo or fleet needs."
+    },
+    "remove": {
+      "do_NOT": "Do not use remove when policy should keep the skill absent; use off.",
+      "links_disk": true,
+      "mutates": "disk-links",
+      "purpose": "Remove installed links/files for a skill.",
+      "returns_packet": false,
+      "scope": "global, project, or all selected installs",
+      "survives_recalibrate": false,
+      "when_to_use": "Use for direct cleanup of installed links."
+    },
+    "sync": {
+      "do_NOT": "Do not use sync to create a durable exception; use on or heal.",
+      "links_disk": true,
+      "mutates": "disk-links",
+      "purpose": "Install/link a named skill or all literal skills missing for the current cwd policy.",
+      "returns_packet": false,
+      "scope": "current cwd policy, project by default",
+      "survives_recalibrate": false,
+      "when_to_use": "Use when policy already requires a skill and only links are missing."
+    },
+    "togglable": {
+      "do_NOT": "Do not use togglable as proof a flip already happened; run the returned command to mutate state.",
+      "links_disk": false,
+      "mutates": "none",
+      "purpose": "List every skill flippable at this cwd and the exact command to flip it.",
+      "returns_packet": false,
+      "scope": "current cwd",
+      "survives_recalibrate": false,
+      "when_to_use": "Use when you need a one-read switchboard of repo skill on/off affordances."
+    },
+    "toggleable": {
+      "do_NOT": "Do not use toggleable as proof a flip already happened; run the returned command to mutate state.",
+      "links_disk": false,
+      "mutates": "none",
+      "purpose": "Alias for togglable; lists every skill flippable at this cwd and the exact command to flip it.",
+      "returns_packet": false,
+      "scope": "current cwd",
+      "survives_recalibrate": false,
+      "when_to_use": "Use when you need a one-read switchboard of repo skill on/off affordances."
+    },
+    "what-if": {
+      "do_NOT": "Do not treat what-if as applying anything; it writes zero files.",
+      "links_disk": false,
+      "mutates": "none",
+      "purpose": "Purely simulate effective skill visibility for a repo, overlay, pin, opt-out, and machine.",
+      "returns_packet": false,
+      "scope": "target repo from --repo",
+      "survives_recalibrate": false,
+      "when_to_use": "Use before overlay or pin changes to see added, removed, shadowed, and conflict results."
+    },
+    "why": {
+      "do_NOT": "Do not infer policy from memory when why can return the live layers.",
+      "links_disk": false,
+      "mutates": "none",
+      "purpose": "Explain one skill's visibility provenance, absence, and exact fixes.",
+      "returns_packet": false,
+      "scope": "current cwd",
+      "survives_recalibrate": false,
+      "when_to_use": "Use when choosing the narrowest correct fix for one skill."
+    }
+  },
+  "stdout_stderr_contract": {
+    "diagnostics_stderr": "JSON typo alias notices and parser errors go to stderr.",
+    "json_stdout": "When JSON is requested, stdout is parseable JSON from manage.py or this wrapper."
+  },
+  "tool": "skillbox-sbp"
+}
+```
+
+---
+
 ## `sbp skills`
 
-**Invocation:** `sbp skills [--full] [--no-global] [--show-sources] --format json`  
+**Invocation:** `sbp skills [--full] [--no-global] [--show-sources] --format json`
 **Produced by:** `collect_skill_visibility (compact via compact_skill_visibility_payload)`
 
 The conflict-aware skill availability view for the current cwd. `sbp skills` emits the COMPACT payload (below); `sbp skills --full` adds `global_surfaces`, `layers`, and `occurrences`. Branch on `summary` counters and `issues` groups; `effective` is the authoritative list of what is visible here.
@@ -44,7 +436,8 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
 | `matched_scope_rules` | CONTRACT | skill-scope.yaml rules in force for this cwd (id + provenance). |
 | `summary` | CONTRACT | Roll-up counters; keys are stable, add-only. Branch on these first. |
 | `parity` | CONTRACT | Claude<->Codex GLOBAL skill-surface parity (empty when --no-global). |
-| `effective` | CONTRACT | The skills actually visible at this cwd after layer resolution. |
+| `visibility_decisions` | CONTRACT | One winning resolution row per skill name, including disabled/broken winners; use effective for visible skills. |
+| `effective` | CONTRACT | Visible skills at this cwd after layer resolution; excludes disabled/broken winners. |
 | `issues` | CONTRACT | Policy problems grouped by kind (broken_project, missing_for_cwd, scope_violations, ...). |
 | `beads` | CONTRACT | Beads requirement/readiness derived from effective skills' frontmatter. |
 | `recommendations` | info | Ranked human-facing remediation suggestions. |
@@ -55,7 +448,7 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
 
 ### Example payload
 
-<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>`.</sub>
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
 
 ```json
 {
@@ -65,7 +458,7 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
   ],
   "beads": {
     "beads_dir": "<FLEET>/repos_real/overlay-repo/.beads",
-    "br": "/home/skillbox/.local/bin/br",
+    "br": "<BR_BIN>",
     "initialized": false,
     "issues": [],
     "next_actions": [],
@@ -82,9 +475,10 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
       "name": "tiny-marketing",
       "path": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-marketing",
       "shadowed_count": 0,
-      "source": "<FLEET>/skills-private/tiny-marketing",
+      "source": "<FLEET>/private-skills/tiny-marketing",
       "source_bucket": "external",
-      "state": "ok"
+      "state": "ok",
+      "winning_layer": "project:claude:<FLEET>/repos_real/overlay-repo"
     }
   ],
   "issues": {
@@ -101,7 +495,7 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
         "categories": [
           "frontend"
         ],
-        "fix_command": "sbp skill activate tiny-ui --cwd <repo>",
+        "fix_command": "sbp skill on tiny-ui --cwd $PWD",
         "name": "tiny-ui",
         "origin": null,
         "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
@@ -139,6 +533,7 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
       "match": "<FLEET>/repos_real/overlay-repo",
       "notes": "",
       "overlay": "",
+      "path_match": "prefix",
       "paths": [
         "<FLEET>/repos_real/overlay-repo"
       ],
@@ -183,8 +578,8 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
       "allowed_paths": [
         "<FLEET>/repos_real/overlay-repo"
       ],
-      "fix_command": "sbp skill activate tiny-ui --cwd <repo>",
-      "hint": "Add this skill to the active client's skill-repos.yaml, or activate it for this cwd ephemerally with `sbp skill activate <skill> --cwd <repo>`. Use `sbp overlay activate <name> --cwd <repo>` for a one-session/cwd policy-evaluated flip, or `sbp overlay on <name>` to PERSIST the overlay across sessions until `overlay off`.",
+      "fix_command": "sbp skill on tiny-ui --cwd $PWD",
+      "hint": "Add this skill to the active client's skill-repos.yaml, or durably pin it for this repo with `sbp skill on <skill> --cwd $PWD`. Use `sbp overlay activate <name> --cwd <repo>` for a one-session/cwd policy-evaluated flip, or `sbp overlay on <name>` to PERSIST the overlay across sessions until `overlay off`.",
       "issue_type": "missing_for_cwd",
       "origin": null,
       "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
@@ -215,10 +610,10 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
     "extra_global_skills": 0,
     "global_not_allowed": 0,
     "global_not_allowed_skills": 0,
-    "layers": 2,
+    "layers": 3,
     "missing_for_cwd": 1,
     "missing_for_cwd_skills": 1,
-    "occurrences": 1,
+    "occurrences": 2,
     "parity_divergent": 0,
     "recommendations": 1,
     "scope_violation_skills": 0,
@@ -228,7 +623,31 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
     "undefined_source_skills": 0,
     "undefined_sources": 0
   },
-  "undefined_sources": []
+  "undefined_sources": [],
+  "visibility_decisions": [
+    {
+      "availability": "override",
+      "layer": "repo-override-file",
+      "name": "tiny-cli",
+      "path": "<FLEET>/repos_real/overlay-repo",
+      "shadowed_count": 0,
+      "source": "<FLEET>/skills/tiny-cli",
+      "source_bucket": "external",
+      "state": "disabled",
+      "winning_layer": "repo-override-file"
+    },
+    {
+      "availability": "installed",
+      "layer": "project:claude:<FLEET>/repos_real/overlay-repo",
+      "name": "tiny-marketing",
+      "path": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-marketing",
+      "shadowed_count": 0,
+      "source": "<FLEET>/private-skills/tiny-marketing",
+      "source_bucket": "external",
+      "state": "ok",
+      "winning_layer": "project:claude:<FLEET>/repos_real/overlay-repo"
+    }
+  ]
 }
 ```
 
@@ -236,7 +655,7 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
 
 ## `sbp candidates`
 
-**Invocation:** `sbp candidates --json` (== `sbp skills --show-sources --full --no-global --format json`)  
+**Invocation:** `sbp candidates --json` (== `sbp skills --show-sources --full --no-global --format json`)
 **Produced by:** `collect_skill_visibility (full, include_sources=True)`
 
 The exploratory source-inventory surface. Same payload as `sbp skills --full` with sources enabled; the load-bearing fields for bucketing candidates are `undefined_sources` + `source_roots` (the linkable universe) against `effective` (already present), `issues.missing_for_cwd` (definitely), and the matched policy.
@@ -255,7 +674,8 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
 | `parity` | CONTRACT | Claude<->Codex GLOBAL skill-surface parity (empty when --no-global). |
 | `layers` | info | Every resolution layer considered, ranked (full payload only). |
 | `source_roots` | CONTRACT | Every skill source root discovered under the configured roots — the linkable universe. |
-| `effective` | CONTRACT | The skills actually visible at this cwd after layer resolution. |
+| `visibility_decisions` | CONTRACT | One winning resolution row per skill name, including disabled/broken winners; use effective for visible skills. |
+| `effective` | CONTRACT | Visible skills at this cwd after layer resolution; excludes disabled/broken winners. |
 | `occurrences` | CONTRACT | Every raw skill occurrence across all layers (full payload only). |
 | `undefined_sources` | CONTRACT | Linkable source skills with no policy occurrence — the candidate pool. |
 | `beads` | CONTRACT | Beads requirement/readiness derived from effective skills' frontmatter. |
@@ -268,7 +688,7 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
 
 ### Example payload
 
-<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>`.</sub>
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
 
 ```json
 {
@@ -278,17 +698,47 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
   ],
   "beads": {
     "beads_dir": "<FLEET>/repos_real/healthy/.beads",
-    "br": "/home/skillbox/.local/bin/br",
+    "br": "<BR_BIN>",
     "initialized": false,
-    "issues": [],
-    "next_actions": [],
-    "ok": true,
+    "issues": [
+      {
+        "code": "no_beads_dir",
+        "hint": "sbp beads init --cwd <FLEET>/repos_real/healthy",
+        "message": "BEADS DRIFT: 1 active skill(s) require .beads/ in this repo"
+      }
+    ],
+    "next_actions": [
+      "sbp beads init --cwd <FLEET>/repos_real/healthy"
+    ],
+    "ok": false,
     "repo_root": "<FLEET>/repos_real/healthy",
-    "required": false,
-    "required_skills": []
+    "required": true,
+    "required_skills": [
+      {
+        "layer": "repo-override-file",
+        "name": "needs-beads",
+        "source": "<FLEET>/private-skills/needs-beads"
+      }
+    ]
   },
   "cwd": "<FLEET>/repos_real/healthy",
   "effective": [
+    {
+      "availability": "override",
+      "layer": "repo-override-file",
+      "layer_label": "repo override file",
+      "layer_rank": 60,
+      "name": "needs-beads",
+      "override_action": "pin_on",
+      "path": "<FLEET>/repos_real/healthy",
+      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "scope": "repo",
+      "shadowed_count": 0,
+      "source": "<FLEET>/private-skills/needs-beads",
+      "source_bucket": "external",
+      "state": "pinned",
+      "winning_layer": "repo-override-file"
+    },
     {
       "availability": "installed",
       "has_skill_md": true,
@@ -303,7 +753,8 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "source": "<FLEET>/skills/tiny-cli",
       "source_bucket": "external",
       "source_kind": "directory",
-      "state": "ok"
+      "state": "ok",
+      "winning_layer": "project:claude:<FLEET>/repos_real/healthy"
     }
   ],
   "global_surfaces": [],
@@ -339,6 +790,17 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "present": true,
       "rank": 40,
       "skill_count": 0
+    },
+    {
+      "id": "repo-override-file",
+      "kind": "override",
+      "label": "repo override file",
+      "path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "present": true,
+      "rank": 60,
+      "scope": "repo",
+      "skill_count": 3,
+      "vetoed_floor": []
     }
   ],
   "matched_clients": [],
@@ -365,15 +827,8 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "match": "<FLEET>/repos_real/healthy",
       "notes": "",
       "overlay": "",
+      "path_match": "prefix",
       "paths": [
-        "/home/skillbox/repos/meaning",
-        "/home/skillbox/repos/notes-grep",
-        "/home/skillbox/repos/opensource/clawgs",
-        "/home/skillbox/repos/opensource/swimmers",
-        "/srv/skillbox/repos/meaning",
-        "/srv/skillbox/repos/notes-grep",
-        "/srv/skillbox/repos/opensource/clawgs",
-        "/srv/skillbox/repos/opensource/swimmers",
         "<FLEET>/repos_real/healthy"
       ],
       "patterns": [
@@ -385,7 +840,8 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
     }
   ],
   "next_actions": [
-    "doctor --format json"
+    "doctor --format json",
+    "sbp beads init --cwd <FLEET>/repos_real/healthy"
   ],
   "occurrences": [
     {
@@ -402,10 +858,74 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "source_bucket": "external",
       "source_kind": "directory",
       "state": "ok"
+    },
+    {
+      "availability": "override",
+      "layer": "repo-override-file",
+      "layer_label": "repo override file",
+      "layer_rank": 60,
+      "name": "needs-beads",
+      "override_action": "pin_on",
+      "path": "<FLEET>/repos_real/healthy",
+      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "scope": "repo",
+      "source": "<FLEET>/private-skills/needs-beads",
+      "source_bucket": "external",
+      "state": "pinned"
+    },
+    {
+      "availability": "override",
+      "layer": "repo-override-file",
+      "layer_label": "repo override file",
+      "layer_rank": 60,
+      "name": "tiny-marketing",
+      "override_action": "pin_off",
+      "path": "<FLEET>/repos_real/healthy",
+      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "scope": "repo",
+      "source": "<FLEET>/private-skills/tiny-marketing",
+      "source_bucket": "external",
+      "state": "disabled"
+    },
+    {
+      "availability": "override",
+      "layer": "repo-override-file:global-opt-out",
+      "layer_label": "repo override global opt-out",
+      "layer_rank": 35,
+      "name": "fixture-global-optout",
+      "override_action": "opt_out_global",
+      "path": "<FLEET>/repos_real/healthy",
+      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "scope": "repo",
+      "source": null,
+      "source_bucket": null,
+      "state": "disabled"
     }
   ],
   "overlay_audit": {
-    "active": [],
+    "active": [
+      "marketing"
+    ],
+    "active_layers": [
+      {
+        "enabled": true,
+        "layer": "repo-override-file",
+        "layer_label": "repo override file",
+        "layer_rank": 60,
+        "name": "marketing",
+        "source": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+        "why": "repo-file"
+      },
+      {
+        "enabled": false,
+        "layer": "repo-override-file",
+        "layer_label": "repo override file",
+        "layer_rank": 60,
+        "name": "swarm",
+        "source": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+        "why": "repo-file"
+      }
+    ],
     "declared": [],
     "undeclared_active": [],
     "warnings": []
@@ -437,64 +957,14 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
   "recommendations": [],
   "source_roots": [
     {
-      "id": "source:/home/skillbox/projects/jsm-skill-archive-*",
+      "id": "source:<FLEET>/private-skills",
       "kind": "source",
-      "label": "/home/skillbox/projects/jsm-skill-archive-*",
-      "path": "/home/skillbox/projects/jsm-skill-archive-*",
-      "present": false,
-      "rank": 0,
-      "skill_count": 0,
-      "undefined_count": 0
-    },
-    {
-      "id": "source:/home/skillbox/repos/marketingskills/skills",
-      "kind": "source",
-      "label": "/home/skillbox/repos/marketingskills/skills",
-      "path": "/home/skillbox/repos/marketingskills/skills",
+      "label": "<FLEET>/private-skills",
+      "path": "<FLEET>/private-skills",
       "present": true,
       "rank": 0,
-      "skill_count": 43,
-      "undefined_count": 43
-    },
-    {
-      "id": "source:/home/skillbox/repos/opensource/skillbox/skills",
-      "kind": "source",
-      "label": "/home/skillbox/repos/opensource/skillbox/skills",
-      "path": "/home/skillbox/repos/opensource/skillbox/skills",
-      "present": false,
-      "rank": 0,
-      "skill_count": 0,
+      "skill_count": 2,
       "undefined_count": 0
-    },
-    {
-      "id": "source:/home/skillbox/repos/skills/skills",
-      "kind": "source",
-      "label": "/home/skillbox/repos/skills/skills",
-      "path": "/home/skillbox/repos/skills/skills",
-      "present": false,
-      "rank": 0,
-      "skill_count": 0,
-      "undefined_count": 0
-    },
-    {
-      "id": "source:/srv/skillbox/repos/skills",
-      "kind": "source",
-      "label": "/srv/skillbox/repos/skills",
-      "path": "/srv/skillbox/repos/skills",
-      "present": true,
-      "rank": 0,
-      "skill_count": 45,
-      "undefined_count": 45
-    },
-    {
-      "id": "source:/srv/skillbox/repos/skills-private",
-      "kind": "source",
-      "label": "/srv/skillbox/repos/skills-private",
-      "path": "/srv/skillbox/repos/skills-private",
-      "present": true,
-      "rank": 0,
-      "skill_count": 129,
-      "undefined_count": 129
     },
     {
       "id": "source:<FLEET>/skills",
@@ -505,23 +975,13 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "rank": 0,
       "skill_count": 2,
       "undefined_count": 0
-    },
-    {
-      "id": "source:<FLEET>/skills-private",
-      "kind": "source",
-      "label": "<FLEET>/skills-private",
-      "path": "<FLEET>/skills-private",
-      "present": true,
-      "rank": 0,
-      "skill_count": 2,
-      "undefined_count": 1
     }
   ],
   "summary": {
     "archive_source_skills": 0,
     "archive_sources": 0,
-    "beads_issues": 0,
-    "beads_required_skills": 0,
+    "beads_issues": 1,
+    "beads_required_skills": 1,
     "broken_by_class": {
       "dangling": 0,
       "moved": 0,
@@ -532,1550 +992,90 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
     "broken_global_skills": 0,
     "broken_project": 0,
     "broken_project_skills": 0,
-    "effective": 1,
+    "effective": 2,
     "extra_global": 0,
     "extra_global_skills": 0,
     "global_not_allowed": 0,
     "global_not_allowed_skills": 0,
-    "layers": 2,
+    "layers": 3,
     "missing_for_cwd": 0,
     "missing_for_cwd_skills": 0,
-    "occurrences": 1,
+    "occurrences": 4,
     "parity_divergent": 0,
     "recommendations": 0,
     "scope_violation_skills": 0,
     "scope_violations": 0,
     "shadowed": 0,
     "undeclared_active_overlays": 0,
-    "undefined_source_skills": 216,
-    "undefined_sources": 218
+    "undefined_source_skills": 0,
+    "undefined_sources": 0
   },
-  "undefined_sources": [
-    {
-      "name": "ab-testing",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/ab-testing",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "ad-creative",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/ad-creative",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "add-recipe",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/add-recipe",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "admin-via-cli-maker",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/admin-via-cli-maker",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "ads",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/ads",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "agent-ergonomics-and-intuitiveness-maximization-for-cli-tools",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/agent-ergonomics-and-intuitiveness-maximization-for-cli-tools",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "ai-seo",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/ai-seo",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "analytics",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/analytics",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "analytics-standardize",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/analytics-standardize",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "ascii-art",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/ascii-art",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "ask-cascade",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/ask-cascade",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "aso",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/aso",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "asupersync-mega-skill",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/asupersync-mega-skill",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "audit-plans",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/audit-plans",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "automating-your-automations",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/automating-your-automations",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "bayview-payment-reconciliation",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/bayview-payment-reconciliation",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "beads-br",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/beads-br",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "beads-bv",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/beads-bv",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "beads-compliance-and-completion-verification",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/beads-compliance-and-completion-verification",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "beads-usage-audit",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/beads-usage-audit",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "beads-workflow",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/beads-workflow",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "bookme",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/bookme",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "build-vs-clone",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/build-vs-clone",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "cass",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/cass",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "cass-memory",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/cass-memory",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "catalog-integrity-warden",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/catalog-integrity-warden",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "caveman",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/caveman",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "cca-5yr",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/cca-5yr",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "cca-meeting-pack",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/cca-meeting-pack",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "changelog-md-workmanship",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/changelog-md-workmanship",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "chart-crimes",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/chart-crimes",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "churn-prevention",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/churn-prevention",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "claude-clone",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/claude-clone",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "cli-ergonomics",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/cli-ergonomics",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "cli-ergonomics",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/cli-ergonomics",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "co-marketing",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/co-marketing",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "codebase-archaeology",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/codebase-archaeology",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "codebase-audit",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/codebase-audit",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "codebase-pattern-extraction",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/codebase-pattern-extraction",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "codex-tmux",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/codex-tmux",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "cold-email",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/cold-email",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "colosseum-copilot",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/colosseum-copilot",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "commit",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/commit",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "community-marketing",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/community-marketing",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "competitor-profiling",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/competitor-profiling",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "competitors",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/competitors",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "content-strategy",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/content-strategy",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "copy-editing",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/copy-editing",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "copywriting",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/copywriting",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "crap",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/crap",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "cro",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/cro",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "customer-research",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/customer-research",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "daystar-dropbox-ocr",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/daystar-dropbox-ocr",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "dcg",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/dcg",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "de-slopify",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/de-slopify",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "deep-research-prompt",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/deep-research-prompt",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "deploy",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/deploy",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "describe",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/describe",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "dev-sanity",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/dev-sanity",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "diagnose",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/diagnose",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "directory-submissions",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/directory-submissions",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "disk-space-triage",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/disk-space-triage",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "divide-and-conquer",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/divide-and-conquer",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "documentation-website-for-software-project",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/documentation-website-for-software-project",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "domain-planner",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/domain-planner",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "domain-reviewer",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/domain-reviewer",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "domain-scaffolder",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/domain-scaffolder",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "drift-detector",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/drift-detector",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "dueling-idea-wizards",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/dueling-idea-wizards",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "eli-hailey",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/eli-hailey",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "eli-me",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/eli-me",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "eli-me-maker",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/eli-me-maker",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "emails",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/emails",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "escalate",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/escalate",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "extreme-software-optimization",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/extreme-software-optimization",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "facets-fireco-batch",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/facets-fireco-batch",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "frankensearch-integration-for-rust-projects",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/frankensearch-integration-for-rust-projects",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "free-tools",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/free-tools",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "ga4",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/ga4",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "gh-actions",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/gh-actions",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "ghostty",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/ghostty",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "git-guardrails-claude-code",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/git-guardrails-claude-code",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "git-stash-janitor",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/git-stash-janitor",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "github-profile-readme",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/github-profile-readme",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "grill-me",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/grill-me",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "grill-with-docs",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/grill-with-docs",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "handoff",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/handoff",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "hire-human-operator",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/hire-human-operator",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "hoa-enrich",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/hoa-enrich",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "htma-e2e-testing",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/htma-e2e-testing",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "htma-marketing",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/htma-marketing",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "htma-patterns",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/htma-patterns",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "htma-product-creator",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/htma-product-creator",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "idea-wizard",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/idea-wizard",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "image",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/image",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "improve-codebase-architecture",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/improve-codebase-architecture",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "installer-workmanship",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/installer-workmanship",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "intake-baseline",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/intake-baseline",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "ios-app-store",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/ios-app-store",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "ios-builds",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/ios-builds",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "ios-surface-hardening",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/ios-surface-hardening",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "jsm",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/jsm",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "karpathy-idea-gist",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/karpathy-idea-gist",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "launch",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/launch",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "lead-magnets",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/lead-magnets",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "leadgen",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/leadgen",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "lube",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/lube",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "macos-app-store",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/macos-app-store",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "mailgun-gmail-sendas",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/mailgun-gmail-sendas",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "make-indispensable",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/make-indispensable",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "marketing-ideas",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/marketing-ideas",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "marketing-plan",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/marketing-plan",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "marketing-psychology",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/marketing-psychology",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "mcp-server-design",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/mcp-server-design",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "me-reader",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/me-reader",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "migrate-to-shoehorn",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/migrate-to-shoehorn",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "mmdx",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/mmdx",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "mmdx-registry-usage-audit",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/mmdx-registry-usage-audit",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "mobile-onboarding-cro",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/mobile-onboarding-cro",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "modes-of-reasoning-project-analysis",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/modes-of-reasoning-project-analysis",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "multi-pass-bug-hunting",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/multi-pass-bug-hunting",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "mutate",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/mutate",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
+  "undefined_sources": [],
+  "visibility_decisions": [
+    {
+      "availability": "override",
+      "layer": "repo-override-file:global-opt-out",
+      "layer_label": "repo override global opt-out",
+      "layer_rank": 35,
+      "name": "fixture-global-optout",
+      "override_action": "opt_out_global",
+      "path": "<FLEET>/repos_real/healthy",
+      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "scope": "repo",
+      "shadowed_count": 0,
+      "source": null,
+      "source_bucket": null,
+      "state": "disabled",
+      "winning_layer": "repo-override-file:global-opt-out"
+    },
+    {
+      "availability": "override",
+      "layer": "repo-override-file",
+      "layer_label": "repo override file",
+      "layer_rank": 60,
       "name": "needs-beads",
-      "root": "<FLEET>/skills-private",
-      "source": "<FLEET>/skills-private/needs-beads",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "no-ragrets",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/no-ragrets",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "ntm",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/ntm",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "onboarding",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/onboarding",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "openclaw-client-bootstrap",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/openclaw-client-bootstrap",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "openclaw-docs-audit",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/openclaw-docs-audit",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "orchestrate-all-beads",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/orchestrate-all-beads",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "oss-doc-audit",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/oss-doc-audit",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "page-cro",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/page-cro",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "paywalls",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/paywalls",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "pcb-from-idea",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/pcb-from-idea",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "pop-culture-reference",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/videos/pop-culture-reference",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "popups",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/popups",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "portco",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/portco",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "power-map",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/power-map",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "pricing",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/pricing",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "product-marketing",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/product-marketing",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "profiling-software-performance",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/profiling-software-performance",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "programmatic-seo",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/programmatic-seo",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "project-status-mmdx",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/project-status-mmdx",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "prompt-reviewer",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/prompt-reviewer",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "prospecting",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/prospecting",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "prototype",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/prototype",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "quay-plan-update",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/quay-plan-update",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "readme-writing",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/readme-writing",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "reality-check-for-project",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/reality-check-for-project",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "recipe-ios-ui-catalog",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/recipe-ios-ui-catalog",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "referrals",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/referrals",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "remotion",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/remotion",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "repo-landing-cro",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/repo-landing-cro",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "reproduce",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/reproduce",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "research-paper",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/research-paper",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "revops",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/revops",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "rust-cli-with-sqlite",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/rust-cli-with-sqlite",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "rust-crates-publishing",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/rust-crates-publishing",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "saas-billing-patterns-for-stripe-and-paypal",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/saas-billing-patterns-for-stripe-and-paypal",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "saas-cli-auth-flow",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/saas-cli-auth-flow",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "saas-customer-analytics",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/saas-customer-analytics",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "sales-enablement",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/sales-enablement",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "sbp",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/sbp",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "scaffold-exercises",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/scaffold-exercises",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "schema",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/schema",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "security-audit-for-saas",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/security-audit-for-saas",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "seo-audit",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/seo-audit",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "seo-for-saas-businesses",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/seo-for-saas-businesses",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "session-to-tweet",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/session-to-tweet",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "setup-matt-pocock-skills",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/setup-matt-pocock-skills",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "setup-pre-commit",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/setup-pre-commit",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "shadcn-data-table",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/shadcn-data-table",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "signup",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/signup",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "simplify-and-refactor-code-isomorphically",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/simplify-and-refactor-code-isomorphically",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "site-architecture",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/site-architecture",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "skill-issue",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/skill-issue",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "skill-registry-usage-audit",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/skill-registry-usage-audit",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "skillbox-quickstart",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/skillbox-quickstart",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "skillbox-upstream-audit",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/skillbox-upstream-audit",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "smart",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/smart",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "smart",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/smart",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "sms",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/sms",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "soc2-fedramp-auditor",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/soc2-fedramp-auditor",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "social",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/social",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "spaps-feedback",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/spaps-feedback",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "split-testing",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/split-testing",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "ssh-info",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/ssh-info",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "stripe-checkout",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/stripe-checkout",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "sweet-potato-upstream-audit",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/sweet-potato-upstream-audit",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "sweet-potato-usage-audit",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/sweet-potato-usage-audit",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "system-performance-remediation",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/system-performance-remediation",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "tax-return-preparation-and-advice-generic",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/tax-return-preparation-and-advice-generic",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "tdd",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/tdd",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "teach",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/teach",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "testing-conformance-harnesses",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/testing-conformance-harnesses",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "testing-fuzzing",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/testing-fuzzing",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "testing-golden-artifacts",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/testing-golden-artifacts",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "testing-metamorphic",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/testing-metamorphic",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "thesis-gtm",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/thesis-gtm",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "to-issues",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/to-issues",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "to-prd",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/to-prd",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "trend-to-content",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/trend-to-content",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "triage",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/triage",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "ui",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/ui",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "ui-fresh-eyes",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/ui-fresh-eyes",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "unified-brand-system",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/unified-brand-system",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "usage-auditor-maker",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/usage-auditor-maker",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "vibing-with-ntm",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/vibing-with-ntm",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "video",
-      "root": "/home/skillbox/repos/marketingskills/skills",
-      "source": "/home/skillbox/repos/marketingskills/skills/video",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "viral-product-score",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/viral-product-score",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "visual-inspiration-demo",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/visual-inspiration-demo",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "wiki",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/wiki",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "wiki-dry",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/wiki-dry",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "wiki-duel",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/wiki-duel",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "wiki-forge",
-      "root": "/srv/skillbox/repos/skills",
-      "source": "/srv/skillbox/repos/skills/wiki-forge",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "wrangler",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/wrangler",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "write-a-skill",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/write-a-skill",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "write-mineral-page",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/write-mineral-page",
-      "source_bucket": "external",
-      "state": "undefined"
-    },
-    {
-      "name": "zoom-out",
-      "root": "/srv/skillbox/repos/skills-private",
-      "source": "/srv/skillbox/repos/skills-private/zoom-out",
-      "source_bucket": "external",
-      "state": "undefined"
+      "override_action": "pin_on",
+      "path": "<FLEET>/repos_real/healthy",
+      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "scope": "repo",
+      "shadowed_count": 0,
+      "source": "<FLEET>/private-skills/needs-beads",
+      "source_bucket": "external",
+      "state": "pinned",
+      "winning_layer": "repo-override-file"
+    },
+    {
+      "availability": "installed",
+      "has_skill_md": true,
+      "layer": "project:claude:<FLEET>/repos_real/healthy",
+      "layer_label": "project claude",
+      "layer_rank": 40,
+      "link_target": "<FLEET>/skills/tiny-cli",
+      "name": "tiny-cli",
+      "path": "<FLEET>/repos_real/healthy/.claude/skills/tiny-cli",
+      "scope": "installed",
+      "shadowed_count": 0,
+      "source": "<FLEET>/skills/tiny-cli",
+      "source_bucket": "external",
+      "source_kind": "directory",
+      "state": "ok",
+      "winning_layer": "project:claude:<FLEET>/repos_real/healthy"
+    },
+    {
+      "availability": "override",
+      "layer": "repo-override-file",
+      "layer_label": "repo override file",
+      "layer_rank": 60,
+      "name": "tiny-marketing",
+      "override_action": "pin_off",
+      "path": "<FLEET>/repos_real/healthy",
+      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "scope": "repo",
+      "shadowed_count": 0,
+      "source": "<FLEET>/private-skills/tiny-marketing",
+      "source_bucket": "external",
+      "state": "disabled",
+      "winning_layer": "repo-override-file"
     }
   ]
 }
@@ -2085,7 +1085,7 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
 
 ## `sbp mcp`
 
-**Invocation:** `sbp mcp [--cwd <repo>] --format json` (bare `sbp mcp` runs the read-only audit)  
+**Invocation:** `sbp mcp [--cwd <repo>] --format json` (bare `sbp mcp` runs the read-only audit)
 **Produced by:** `collect_mcp_audit`
 
 Claude (`.mcp.json`) vs Codex (`.codex/config.toml`) MCP-server reconciliation. `expected_servers` is the per-scope baseline, `declared_servers` adds model-declared servers (any profile). Gate on `summary.unexplained_drift` and `summary.invalid_configs`; per-surface detail is in `surfaces.claude` / `surfaces.codex`.
@@ -2125,7 +1125,7 @@ Claude (`.mcp.json`) vs Codex (`.codex/config.toml`) MCP-server reconciliation. 
 
 ### Example payload
 
-<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>`.</sub>
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
 
 ```json
 {
@@ -2211,10 +1211,10 @@ Claude (`.mcp.json`) vs Codex (`.codex/config.toml`) MCP-server reconciliation. 
 
 ## `sbp recalibrate`
 
-**Invocation:** `sbp recalibrate [--cwd <repo>]` (composite; machine core shown below)  
-**Produced by:** `collect_skill_visibility (issues-only view) + embedded beads block`
+**Invocation:** `sbp recalibrate [--cwd <repo>] --json`
+**Produced by:** `assemble_recalibrate_payload (issues-only view + fixes[] dry-run previews)`
 
-A COMPOSITE human surface that stitches together several dry-run sub-calls (`sbp skills --issues-only`, `sbp skill sync --dry-run`, `sbp skill prune --dry-run`, the beads graph, and `sbp mcp`). Its single machine-readable core is the issues-focused `collect_skill_visibility` payload below — same shape as `sbp skills --issues-only --format json`, whose `beads` block the wrapper parses directly.
+Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-focused `collect_skill_visibility` core (same fields as `sbp skills --issues-only --format json`) plus a `fixes[]` row per actionable issue. Each fix carries the literal `fix_command`, link dry-run rows, a trimmed `dry_run_preview`, and `packet_on_apply` when linking would return an activation packet. Bare `sbp recalibrate` (no `--json`) still prints the composite human surface (sync/prune dry-runs, beads graph, MCP audit).
 
 ### Fields
 
@@ -2226,6 +1226,7 @@ A COMPOSITE human surface that stitches together several dry-run sub-calls (`sbp
 | `issues` | CONTRACT | The drift to heal, grouped by kind (the issues-only view's payload). |
 | `beads` | CONTRACT | required / required_skills / repo_root / initialized / br / issues. |
 | `summary` | CONTRACT | Counters incl. beads_required_skills + beads_issues. |
+| `fixes` | CONTRACT | Machine-actionable remediation rows; one per actionable issue. |
 | `recommendations` | info | Ranked remediation suggestions. |
 | `next_actions` | info | Ordered next commands (dry-run heal moves). |
 
@@ -2243,15 +1244,26 @@ A COMPOSITE human surface that stitches together several dry-run sub-calls (`sbp
 | `issues` | CONTRACT | Per-issue {message, hint} for unmet beads requirements. |
 | `next_actions` | info | Beads-specific next commands. |
 
+#### `fixes[]` (one machine-actionable remediation row)
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `problem` | CONTRACT | Issue kind (e.g. missing_for_cwd, scope_violations). |
+| `skill` | CONTRACT | Skill name this fix targets. |
+| `command` | CONTRACT | Exact copy-pasteable command that resolves the issue. |
+| `links` | CONTRACT | Link actions the dry-run would apply (lifecycle link rows). |
+| `dry_run_preview` | CONTRACT | Trimmed skill lifecycle dry-run payload for the fix. |
+| `packet_on_apply` | info | activation_packet from the dry-run when the fix links a skill; null otherwise. |
+
 ### Example payload
 
-<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>`.</sub>
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
 
 ```json
 {
   "beads": {
     "beads_dir": "<FLEET>/repos_real/overlay-repo/.beads",
-    "br": "/home/skillbox/.local/bin/br",
+    "br": "<BR_BIN>",
     "initialized": false,
     "issues": [],
     "next_actions": [],
@@ -2261,6 +1273,117 @@ A COMPOSITE human surface that stitches together several dry-run sub-calls (`sbp
     "required_skills": []
   },
   "cwd": "<FLEET>/repos_real/overlay-repo",
+  "fixes": [
+    {
+      "command": "sbp skill on tiny-ui --cwd $PWD",
+      "dry_run_preview": {
+        "action": "activate",
+        "actions": [
+          {
+            "blocked_reason": "",
+            "category": null,
+            "destination": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui",
+            "existing": {
+              "state": "missing"
+            },
+            "op": "link",
+            "repo_path": "<FLEET>/repos_real/overlay-repo",
+            "root": "<FLEET>/repos_real/overlay-repo/.claude/skills",
+            "scope": "project",
+            "skill": "tiny-ui",
+            "source": "<FLEET>/skills/tiny-ui",
+            "source_bucket": "external",
+            "status": "would_link",
+            "surface": "claude"
+          },
+          {
+            "blocked_reason": "",
+            "category": null,
+            "destination": "<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui",
+            "existing": {
+              "state": "missing"
+            },
+            "op": "link",
+            "repo_path": "<FLEET>/repos_real/overlay-repo",
+            "root": "<FLEET>/repos_real/overlay-repo/.codex/skills",
+            "scope": "project",
+            "skill": "tiny-ui",
+            "source": "<FLEET>/skills/tiny-ui",
+            "source_bucket": "external",
+            "status": "would_link",
+            "surface": "codex"
+          }
+        ],
+        "activation_packet": {
+          "instructions": "Use this SKILL.md content immediately in the current agent session. The filesystem links make the skill visible to future Claude and Codex sessions.",
+          "name": "tiny-ui",
+          "skill_md": "---\nname: tiny-ui\ndescription: Tiny fixture skill tiny-ui.\n---\n\n# tiny-ui\n\nFixture skill body for tiny-ui.\n",
+          "skill_md_path": "<FLEET>/skills/tiny-ui/SKILL.md",
+          "skill_md_sha256": "953824e6b88a4753851d0309b740812747d507dd780b037e47fdcea540a41e04",
+          "source": "<FLEET>/skills/tiny-ui",
+          "source_bucket": "external",
+          "surface_targets": {
+            "claude": [
+              "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui"
+            ],
+            "codex": [
+              "<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui"
+            ]
+          }
+        },
+        "cwd": "<FLEET>/repos_real/overlay-repo",
+        "dry_run": true,
+        "skill": "tiny-ui",
+        "summary": {
+          "actions": 2,
+          "applied": 0,
+          "blocked": 0,
+          "link": 2,
+          "skipped": 0,
+          "unchanged": 0,
+          "unlink": 0
+        },
+        "warnings": []
+      },
+      "links": [
+        {
+          "destination": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui",
+          "scope": "project",
+          "skill": "tiny-ui",
+          "source": "<FLEET>/skills/tiny-ui",
+          "status": "would_link",
+          "surface": "claude"
+        },
+        {
+          "destination": "<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui",
+          "scope": "project",
+          "skill": "tiny-ui",
+          "source": "<FLEET>/skills/tiny-ui",
+          "status": "would_link",
+          "surface": "codex"
+        }
+      ],
+      "packet_on_apply": {
+        "instructions": "Use this SKILL.md content immediately in the current agent session. The filesystem links make the skill visible to future Claude and Codex sessions.",
+        "name": "tiny-ui",
+        "skill_md": "---\nname: tiny-ui\ndescription: Tiny fixture skill tiny-ui.\n---\n\n# tiny-ui\n\nFixture skill body for tiny-ui.\n",
+        "skill_md_path": "<FLEET>/skills/tiny-ui/SKILL.md",
+        "skill_md_sha256": "953824e6b88a4753851d0309b740812747d507dd780b037e47fdcea540a41e04",
+        "source": "<FLEET>/skills/tiny-ui",
+        "source_bucket": "external",
+        "surface_targets": {
+          "claude": [
+            "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui"
+          ],
+          "codex": [
+            "<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui"
+          ]
+        }
+      },
+      "problem": "missing_for_cwd",
+      "skill": "tiny-ui"
+    }
+  ],
   "issues": {
     "archive_sources": [],
     "broken_global": [],
@@ -2275,7 +1398,7 @@ A COMPOSITE human surface that stitches together several dry-run sub-calls (`sbp
         "categories": [
           "frontend"
         ],
-        "fix_command": "sbp skill activate tiny-ui --cwd <repo>",
+        "fix_command": "sbp skill on tiny-ui --cwd $PWD",
         "name": "tiny-ui",
         "origin": null,
         "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
@@ -2312,6 +1435,7 @@ A COMPOSITE human surface that stitches together several dry-run sub-calls (`sbp
       "match": "<FLEET>/repos_real/overlay-repo",
       "notes": "",
       "overlay": "",
+      "path_match": "prefix",
       "paths": [
         "<FLEET>/repos_real/overlay-repo"
       ],
@@ -2332,8 +1456,8 @@ A COMPOSITE human surface that stitches together several dry-run sub-calls (`sbp
       "allowed_paths": [
         "<FLEET>/repos_real/overlay-repo"
       ],
-      "fix_command": "sbp skill activate tiny-ui --cwd <repo>",
-      "hint": "Add this skill to the active client's skill-repos.yaml, or activate it for this cwd ephemerally with `sbp skill activate <skill> --cwd <repo>`. Use `sbp overlay activate <name> --cwd <repo>` for a one-session/cwd policy-evaluated flip, or `sbp overlay on <name>` to PERSIST the overlay across sessions until `overlay off`.",
+      "fix_command": "sbp skill on tiny-ui --cwd $PWD",
+      "hint": "Add this skill to the active client's skill-repos.yaml, or durably pin it for this repo with `sbp skill on <skill> --cwd $PWD`. Use `sbp overlay activate <name> --cwd <repo>` for a one-session/cwd policy-evaluated flip, or `sbp overlay on <name>` to PERSIST the overlay across sessions until `overlay off`.",
       "issue_type": "missing_for_cwd",
       "origin": null,
       "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
@@ -2363,10 +1487,10 @@ A COMPOSITE human surface that stitches together several dry-run sub-calls (`sbp
     "extra_global_skills": 0,
     "global_not_allowed": 0,
     "global_not_allowed_skills": 0,
-    "layers": 2,
+    "layers": 3,
     "missing_for_cwd": 1,
     "missing_for_cwd_skills": 1,
-    "occurrences": 1,
+    "occurrences": 2,
     "parity_divergent": 0,
     "recommendations": 1,
     "scope_violation_skills": 0,
@@ -2381,12 +1505,12 @@ A COMPOSITE human surface that stitches together several dry-run sub-calls (`sbp
 
 ---
 
-## `sbp explain`
+## `sbp skill why`
 
-**Invocation:** `sbp explain <skill> [--cwd <repo>] --format json`  
+**Invocation:** `sbp skill why <skill> [--cwd <repo>] --format json`
 **Produced by:** `explain_skill_visibility`
 
-Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which occurrences lost and why, and — when invisible — the ranked, narrowest path to visibility with the EXACT command for each option. `machine` and `registry` are forward-compatible blocks: always present (possibly partial) so routing/registry consumers can grow without a schema break.
+Read-only provenance for ONE skill at ONE cwd, including absence. Same payload shape as `sbp explain` but routed through the `skill why` verb. Walks the precedence spine, names the winning layer (if any), and — when invisible — emits ranked remediation rows with literal `command` strings agents can run without re-deriving policy.
 
 ### Fields
 
@@ -2397,11 +1521,13 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
 | `cwd` | CONTRACT | Absolute resolved cwd the provenance is for. |
 | `visible` | CONTRACT | True iff the skill resolves to a non-broken effective occurrence here. |
 | `reason` | info | Human sentence explaining the verdict. |
-| `layer` | CONTRACT | Winning layer id, or null when not visible. |
-| `layer_family` | CONTRACT | PROJECT|GLOBAL|CLIENT|DEFAULT of the winner, or null. |
-| `layer_label` | info | Human label for the winning layer, or null. |
-| `layer_rank` | CONTRACT | Numeric rank of the winning layer, or null. |
-| `winner` | CONTRACT | Trimmed view of the effective occurrence (won=true), or null. |
+| `layer` | CONTRACT | Resolution winner layer id, including disabled/broken winners, or null when none. |
+| `winning_layer` | CONTRACT | Canonical winning_layer copied from the same visibility decision that drives the effective set. |
+| `layer_family` | CONTRACT | PROJECT|GLOBAL|CLIENT|DEFAULT|OVERRIDE of the resolution winner, or null. |
+| `layer_label` | info | Human label for the resolution winner layer, or null. |
+| `layer_rank` | CONTRACT | Numeric rank of the resolution winner layer, or null. |
+| `winner` | CONTRACT | Trimmed view of the resolution winner (won=true), or null. |
+| `layers` | CONTRACT | Ordered provenance trace for this skill; exactly one row has wins=true when a winning layer exists. |
 | `occurrences` | CONTRACT | Every occurrence of this skill across layers, each with a won verdict. |
 | `lost` | CONTRACT | Non-winning occurrences with a lost_reason. |
 | `scope_rules` | CONTRACT | skill-scope.yaml rules naming this skill at this cwd. |
@@ -2418,27 +1544,543 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
 
 ### Example payload
 
-<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>`.</sub>
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
 
 ```json
 {
   "active_clients": [],
   "active_overlays": [],
-  "cwd": "<FLEET>/repos_real/healthy",
+  "cwd": "<FLEET>/repos_real/overlay-repo",
   "inactive_overlay_rules": [],
   "layer": null,
   "layer_family": null,
   "layer_label": null,
   "layer_rank": null,
+  "layers": [],
   "lost": [],
   "machine": {
     "declared_machines": [
-      "mac-laptop",
-      "portfolio-devbox"
+      "devbox-like",
+      "mac-like"
     ],
-    "machine_id": "portfolio-devbox",
+    "machine_id": "devbox-like",
     "resolved": true,
-    "source_path": "/srv/skillbox/repos/skillbox-config/machines.yaml"
+    "source_path": "<FLEET>/skillbox-config/machines.yaml"
+  },
+  "matched_clients": [],
+  "matched_project_categories": [
+    {
+      "id": "frontend",
+      "match": "<FLEET>/repos_real/overlay-repo",
+      "notes": "",
+      "paths": [
+        "<FLEET>/repos_real/overlay-repo"
+      ],
+      "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml"
+    }
+  ],
+  "next_actions": [
+    "sbp skill on needs-beads --cwd $PWD",
+    "edit skill-scope.yaml: add a rule with skills:[needs-beads] and a path/category covering <FLEET>/repos_real/overlay-repo"
+  ],
+  "occurrences": [],
+  "reason": "'needs-beads' is NOT visible here, but a source exists and it can be activated",
+  "registry": {
+    "registry_ids": [],
+    "skill_id": null
+  },
+  "remediation": [
+    {
+      "command": "sbp skill on needs-beads --cwd $PWD",
+      "kind": "on",
+      "manage_command": "python3 .env-manager/manage.py skill on needs-beads --cwd <FLEET>/repos_real/overlay-repo",
+      "rank": 1,
+      "resolved_command": "sbp skill on needs-beads --cwd <FLEET>/repos_real/overlay-repo",
+      "why": "a source for 'needs-beads' exists (<FLEET>/private-skills/needs-beads); turning it on pins it for this repo, links it, and returns the SKILL.md packet"
+    },
+    {
+      "command": "edit skill-scope.yaml: add a rule with skills:[needs-beads] and a path/category covering <FLEET>/repos_real/overlay-repo",
+      "kind": "rule_edit",
+      "policy_files": [
+        "<FLEET>/skillbox-config/skill-scope.yaml"
+      ],
+      "rank": 3,
+      "why": "no skill-scope rule currently matches 'needs-beads' for this cwd, so the resolver does not consider it in-scope here"
+    }
+  ],
+  "schema_version": "2026-06-25+skill_explain_layers",
+  "scope_rules": [],
+  "skill": "needs-beads",
+  "source_options": [
+    {
+      "source": "<FLEET>/private-skills/needs-beads",
+      "source_bucket": "external"
+    }
+  ],
+  "visible": false,
+  "winner": null,
+  "winning_layer": null
+}
+```
+
+---
+
+## `sbp skill on`
+
+**Invocation:** `sbp skill on <skill> [--cwd <repo>] [--dry-run] --format json`
+**Produced by:** `_handle_skill_toggle (on / activate plan + override pin_on)`
+
+Durable repo-local pin ON plus disk links. Writes `pin_on` to `.skillbox/skill-overrides.yaml` (survives recalibrate) and links project skills when needed. Returns an `activation_packet` for immediate session use. `--dry-run` previews override + link actions without writing; a repeat apply is a clean no-op (`noop: true`).
+
+### Fields
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `action` | CONTRACT | Verb executed: 'on' or 'off'. |
+| `skill` | CONTRACT | Skill name toggled. |
+| `cwd` | CONTRACT | Absolute resolved repo cwd the toggle ran against. |
+| `requested_to` | CONTRACT | Scope the caller requested (project-only today). |
+| `resolved_to` | CONTRACT | Scope the plan resolved to. |
+| `categories` | CONTRACT | Project categories targeted when --to category (often empty). |
+| `from_scope` | CONTRACT | Installed scope considered for off/unlink (project for skill off). |
+| `source_options` | CONTRACT | Resolvable source directories for on/activate. |
+| `selected_source` | CONTRACT | Chosen source for on/activate, or null for off. |
+| `activation_packet` | CONTRACT | Immediate-use SKILL.md packet on on; null on off. |
+| `warnings` | info | Non-fatal plan warnings. |
+| `actions` | CONTRACT | Link/unlink rows the toggle would apply; see the action field table. |
+| `skipped` | CONTRACT | Skills skipped by the plan (e.g. prune firewall pinned rows). |
+| `summary` | CONTRACT | Roll-up counters for planned/applied link+unlink actions. |
+| `override` | CONTRACT | Repo override-file mutation preview/result; see the override field table. |
+| `changed` | CONTRACT | True when disk and/or override state changed (apply mode). |
+| `noop` | CONTRACT | True when neither override nor link actions would change state. |
+| `dry_run` | CONTRACT | True when the payload previews without writing. |
+| `verification` | info | Optional post-on verify block when --verify is set; null otherwise. |
+
+#### `override` (repo override-file mutation)
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `changed` | CONTRACT | True when the override file was written (apply mode). |
+| `would_change` | CONTRACT | True when a dry-run would mutate the override file. |
+| `policy_path` | CONTRACT | Absolute path of .skillbox/skill-overrides.yaml. |
+| `pin` | CONTRACT | Override list touched: pin_on or pin_off. |
+
+#### `activation_packet` (immediate SKILL.md packet)
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `name` | CONTRACT | Skill name in the activation packet. |
+| `source` | CONTRACT | Resolved source directory backing the skill. |
+| `source_bucket` | CONTRACT | Source bucket id (external/private/etc.). |
+| `skill_md_path` | CONTRACT | Absolute path to SKILL.md used for the packet. |
+| `skill_md_sha256` | CONTRACT | SHA-256 of SKILL.md for verify consumers. |
+| `skill_md` | CONTRACT | Full SKILL.md body for immediate session use. |
+| `surface_targets` | CONTRACT | Per-surface link destinations the packet covers. |
+| `instructions` | info | Human guidance for using the packet in-session. |
+
+#### `actions[]` (one lifecycle link/unlink row)
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `op` | CONTRACT | Lifecycle op: link or unlink. |
+| `skill` | CONTRACT | Skill name for this action row. |
+| `source` | CONTRACT | Source path for link rows; prior target for unlink rows. |
+| `source_bucket` | info | Source bucket for link rows. |
+| `destination` | CONTRACT | Installed symlink path affected. |
+| `root` | CONTRACT | Skills root directory under the repo for link rows. |
+| `scope` | CONTRACT | project or global scope of the action. |
+| `surface` | CONTRACT | claude or codex surface. |
+| `category` | info | Project category when scoped by category. |
+| `repo_path` | CONTRACT | Repo root owning the destination. |
+| `existing` | CONTRACT | Prior install state at the destination. |
+| `blocked_reason` | CONTRACT | Empty when allowed; otherwise why the row is blocked. |
+| `status` | CONTRACT | Dry-run/applied status (would_link, would_unlink, linked, ...). |
+
+#### `summary` (action counters)
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `actions` | CONTRACT | Total planned/applied action rows. |
+| `link` | CONTRACT | Link action count. |
+| `unlink` | CONTRACT | Unlink action count. |
+| `blocked` | CONTRACT | Blocked action count. |
+| `skipped` | CONTRACT | Skipped action count. |
+| `applied` | CONTRACT | Applied action count (apply mode). |
+| `unchanged` | CONTRACT | Actions that left destination unchanged. |
+
+### Example payload
+
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
+
+```json
+{
+  "action": "on",
+  "actions": [
+    {
+      "blocked_reason": "",
+      "category": null,
+      "destination": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui",
+      "existing": {
+        "state": "missing"
+      },
+      "op": "link",
+      "repo_path": "<FLEET>/repos_real/overlay-repo",
+      "root": "<FLEET>/repos_real/overlay-repo/.claude/skills",
+      "scope": "project",
+      "skill": "tiny-ui",
+      "source": "<FLEET>/skills/tiny-ui",
+      "source_bucket": "external",
+      "status": "would_link",
+      "surface": "claude"
+    },
+    {
+      "blocked_reason": "",
+      "category": null,
+      "destination": "<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui",
+      "existing": {
+        "state": "missing"
+      },
+      "op": "link",
+      "repo_path": "<FLEET>/repos_real/overlay-repo",
+      "root": "<FLEET>/repos_real/overlay-repo/.codex/skills",
+      "scope": "project",
+      "skill": "tiny-ui",
+      "source": "<FLEET>/skills/tiny-ui",
+      "source_bucket": "external",
+      "status": "would_link",
+      "surface": "codex"
+    }
+  ],
+  "activation_packet": {
+    "instructions": "Use this SKILL.md content immediately in the current agent session. The filesystem links make the skill visible to future Claude and Codex sessions.",
+    "name": "tiny-ui",
+    "skill_md": "---\nname: tiny-ui\ndescription: Tiny fixture skill tiny-ui.\n---\n\n# tiny-ui\n\nFixture skill body for tiny-ui.\n",
+    "skill_md_path": "<FLEET>/skills/tiny-ui/SKILL.md",
+    "skill_md_sha256": "953824e6b88a4753851d0309b740812747d507dd780b037e47fdcea540a41e04",
+    "source": "<FLEET>/skills/tiny-ui",
+    "source_bucket": "external",
+    "surface_targets": {
+      "claude": [
+        "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui"
+      ],
+      "codex": [
+        "<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui"
+      ]
+    }
+  },
+  "categories": [],
+  "changed": false,
+  "cwd": "<FLEET>/repos_real/overlay-repo",
+  "dry_run": true,
+  "from_scope": "all",
+  "noop": false,
+  "override": {
+    "changed": false,
+    "pin": "pin_on",
+    "policy_path": "<FLEET>/repos_real/overlay-repo/.skillbox/skill-overrides.yaml",
+    "would_change": true
+  },
+  "requested_to": "project",
+  "resolved_to": "project",
+  "selected_source": {
+    "explicit": false,
+    "name": "tiny-ui",
+    "root": "<FLEET>/skills",
+    "source": "<FLEET>/skills/tiny-ui",
+    "source_bucket": "external"
+  },
+  "skill": "tiny-ui",
+  "skipped": [],
+  "source_options": [
+    {
+      "explicit": false,
+      "name": "tiny-ui",
+      "root": "<FLEET>/skills",
+      "source": "<FLEET>/skills/tiny-ui",
+      "source_bucket": "external"
+    }
+  ],
+  "summary": {
+    "actions": 2,
+    "applied": 0,
+    "blocked": 0,
+    "link": 2,
+    "skipped": 0,
+    "unchanged": 0,
+    "unlink": 0
+  },
+  "verification": null,
+  "warnings": []
+}
+```
+
+---
+
+## `sbp skill off`
+
+**Invocation:** `sbp skill off <skill> [--cwd <repo>] [--dry-run] --format json`
+**Produced by:** `_handle_skill_toggle (off / prune plan + override pin_off)`
+
+Durable repo-local pin OFF plus project unlink. Writes `pin_off` to `.skillbox/skill-overrides.yaml` and unlinks project installs. Refuses floor skills (smart/sbp). `--dry-run` previews override + unlink rows; `activation_packet` is always null.
+
+### Fields
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `action` | CONTRACT | Verb executed: 'on' or 'off'. |
+| `skill` | CONTRACT | Skill name toggled. |
+| `cwd` | CONTRACT | Absolute resolved repo cwd the toggle ran against. |
+| `requested_to` | CONTRACT | Scope the caller requested (project-only today). |
+| `resolved_to` | CONTRACT | Scope the plan resolved to. |
+| `categories` | CONTRACT | Project categories targeted when --to category (often empty). |
+| `from_scope` | CONTRACT | Installed scope considered for off/unlink (project for skill off). |
+| `source_options` | CONTRACT | Resolvable source directories for on/activate. |
+| `selected_source` | CONTRACT | Chosen source for on/activate, or null for off. |
+| `activation_packet` | CONTRACT | Immediate-use SKILL.md packet on on; null on off. |
+| `warnings` | info | Non-fatal plan warnings. |
+| `actions` | CONTRACT | Link/unlink rows the toggle would apply; see the action field table. |
+| `skipped` | CONTRACT | Skills skipped by the plan (e.g. prune firewall pinned rows). |
+| `summary` | CONTRACT | Roll-up counters for planned/applied link+unlink actions. |
+| `override` | CONTRACT | Repo override-file mutation preview/result; see the override field table. |
+| `changed` | CONTRACT | True when disk and/or override state changed (apply mode). |
+| `noop` | CONTRACT | True when neither override nor link actions would change state. |
+| `dry_run` | CONTRACT | True when the payload previews without writing. |
+| `verification` | info | Optional post-on verify block when --verify is set; null otherwise. |
+
+#### `override` (repo override-file mutation)
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `changed` | CONTRACT | True when the override file was written (apply mode). |
+| `would_change` | CONTRACT | True when a dry-run would mutate the override file. |
+| `policy_path` | CONTRACT | Absolute path of .skillbox/skill-overrides.yaml. |
+| `pin` | CONTRACT | Override list touched: pin_on or pin_off. |
+
+#### `actions[]` (one lifecycle unlink row)
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `op` | CONTRACT | Lifecycle op: link or unlink. |
+| `skill` | CONTRACT | Skill name for this action row. |
+| `destination` | CONTRACT | Installed symlink path affected. |
+| `scope` | CONTRACT | project or global scope of the action. |
+| `surface` | CONTRACT | claude or codex surface. |
+| `source` | CONTRACT | Source path for link rows; prior target for unlink rows. |
+| `layer` | info | Layer id for unlink rows derived from visibility. |
+| `reason` | info | Human reason for unlink (e.g. pin_off, prune). |
+| `existing` | CONTRACT | Prior install state at the destination. |
+| `status` | CONTRACT | Dry-run/applied status (would_link, would_unlink, linked, ...). |
+
+#### `summary` (action counters)
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `actions` | CONTRACT | Total planned/applied action rows. |
+| `link` | CONTRACT | Link action count. |
+| `unlink` | CONTRACT | Unlink action count. |
+| `blocked` | CONTRACT | Blocked action count. |
+| `skipped` | CONTRACT | Skipped action count. |
+| `applied` | CONTRACT | Applied action count (apply mode). |
+| `unchanged` | CONTRACT | Actions that left destination unchanged. |
+
+### Example payload
+
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
+
+```json
+{
+  "action": "off",
+  "actions": [
+    {
+      "destination": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-marketing",
+      "existing": {
+        "link_target": "<FLEET>/private-skills/tiny-marketing",
+        "resolved": "<FLEET>/private-skills/tiny-marketing",
+        "state": "different_link"
+      },
+      "layer": "project:claude:<FLEET>/repos_real/overlay-repo",
+      "op": "unlink",
+      "reason": "pin_off",
+      "scope": "project",
+      "skill": "tiny-marketing",
+      "source": "<FLEET>/private-skills/tiny-marketing",
+      "status": "would_unlink",
+      "surface": "claude"
+    }
+  ],
+  "activation_packet": null,
+  "categories": [],
+  "changed": false,
+  "cwd": "<FLEET>/repos_real/overlay-repo",
+  "dry_run": true,
+  "from_scope": "project",
+  "noop": false,
+  "override": {
+    "changed": false,
+    "pin": "pin_off",
+    "policy_path": "<FLEET>/repos_real/overlay-repo/.skillbox/skill-overrides.yaml",
+    "would_change": true
+  },
+  "requested_to": "project",
+  "resolved_to": "project",
+  "selected_source": null,
+  "skill": "tiny-marketing",
+  "skipped": [],
+  "source_options": [],
+  "summary": {
+    "actions": 1,
+    "applied": 0,
+    "blocked": 0,
+    "link": 0,
+    "skipped": 0,
+    "unchanged": 0,
+    "unlink": 1
+  },
+  "verification": null,
+  "warnings": []
+}
+```
+
+---
+
+## `sbp skill togglable`
+
+**Invocation:** `sbp skill togglable [--cwd <repo>] --format json`
+**Produced by:** `build_skill_togglable_payload`
+
+Write-affordance switchboard for one cwd: every skill the policy marks as flippable here, its current state (`on`, `off`, `missing_for_cwd`, `pinned_on`, `pinned_off`), who pinned it (`override` vs `policy`), and the literal `command_to_flip` to transition state. Distinct from `sbp skills` (visibility/read).
+
+### Fields
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `cwd` | CONTRACT | Absolute resolved cwd the switchboard was computed for. |
+| `items` | CONTRACT | Every flippable skill at this cwd; see the item field table. |
+
+#### `items[]` (one flippable skill row)
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `skill` | CONTRACT | Skill name. |
+| `state` | CONTRACT | on | off | missing_for_cwd | pinned_on | pinned_off. |
+| `source` | CONTRACT | Installed path when on; null when absent. |
+| `pinned_by` | CONTRACT | override when repo override lists drive state; else policy. |
+| `command_to_flip` | CONTRACT | Literal sbp skill on/off command to transition state. |
+
+### Example payload
+
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
+
+```json
+{
+  "cwd": "<FLEET>/repos_real/overlay-repo",
+  "items": [
+    {
+      "command_to_flip": "sbp skill on tiny-cli --cwd <FLEET>/repos_real/overlay-repo",
+      "pinned_by": "override",
+      "skill": "tiny-cli",
+      "source": null,
+      "state": "pinned_off"
+    },
+    {
+      "command_to_flip": "sbp skill off tiny-marketing --cwd <FLEET>/repos_real/overlay-repo",
+      "pinned_by": "policy",
+      "skill": "tiny-marketing",
+      "source": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-marketing",
+      "state": "on"
+    },
+    {
+      "command_to_flip": "sbp skill on tiny-ui --cwd <FLEET>/repos_real/overlay-repo",
+      "pinned_by": "policy",
+      "skill": "tiny-ui",
+      "source": null,
+      "state": "missing_for_cwd"
+    }
+  ]
+}
+```
+
+---
+
+## `sbp explain`
+
+**Invocation:** `sbp explain <skill> [--cwd <repo>] --format json`
+**Produced by:** `explain_skill_visibility`
+
+Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which occurrences lost and why, and — when invisible — the ranked, narrowest path to visibility with the EXACT command for each option. `machine` and `registry` are forward-compatible blocks: always present (possibly partial) so routing/registry consumers can grow without a schema break.
+
+### Fields
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `schema_version` | CONTRACT | Versioned tag for the explain payload shape. |
+| `skill` | CONTRACT | The skill name explained. |
+| `cwd` | CONTRACT | Absolute resolved cwd the provenance is for. |
+| `visible` | CONTRACT | True iff the skill resolves to a non-broken effective occurrence here. |
+| `reason` | info | Human sentence explaining the verdict. |
+| `layer` | CONTRACT | Resolution winner layer id, including disabled/broken winners, or null when none. |
+| `winning_layer` | CONTRACT | Canonical winning_layer copied from the same visibility decision that drives the effective set. |
+| `layer_family` | CONTRACT | PROJECT|GLOBAL|CLIENT|DEFAULT|OVERRIDE of the resolution winner, or null. |
+| `layer_label` | info | Human label for the resolution winner layer, or null. |
+| `layer_rank` | CONTRACT | Numeric rank of the resolution winner layer, or null. |
+| `winner` | CONTRACT | Trimmed view of the resolution winner (won=true), or null. |
+| `layers` | CONTRACT | Ordered provenance trace for this skill; exactly one row has wins=true when a winning layer exists. |
+| `occurrences` | CONTRACT | Every occurrence of this skill across layers, each with a won verdict. |
+| `lost` | CONTRACT | Non-winning occurrences with a lost_reason. |
+| `scope_rules` | CONTRACT | skill-scope.yaml rules naming this skill at this cwd. |
+| `inactive_overlay_rules` | CONTRACT | Overlay-gated rules that would apply if the overlay were active. |
+| `source_options` | CONTRACT | Discoverable source dirs that could be linked to make it visible. |
+| `active_overlays` | CONTRACT | Overlays currently active. |
+| `active_clients` | CONTRACT | Active client overlays. |
+| `matched_clients` | CONTRACT | Client overlays matching this cwd. |
+| `matched_project_categories` | CONTRACT | Project categories for this cwd. |
+| `remediation` | CONTRACT | Ranked, narrowest-first paths to visibility, each with kind + exact command. |
+| `machine` | CONTRACT | Forward-compatible machine-routing block (always present, may be partial). |
+| `registry` | CONTRACT | Forward-compatible {skill_id, registry_ids} block (always present). |
+| `next_actions` | info | Commands from remediation, or the already-visible sentinel. |
+
+### Example payload
+
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
+
+```json
+{
+  "active_clients": [],
+  "active_overlays": [
+    "marketing"
+  ],
+  "cwd": "<FLEET>/repos_real/healthy",
+  "inactive_overlay_rules": [],
+  "layer": "repo-override-file",
+  "layer_family": "OVERRIDE",
+  "layer_label": "repo override file",
+  "layer_rank": 60,
+  "layers": [
+    {
+      "availability": "override",
+      "layer": "repo-override-file",
+      "layer_family": "OVERRIDE",
+      "layer_label": "repo override file",
+      "layer_rank": 60,
+      "override_action": "pin_on",
+      "path": "<FLEET>/repos_real/healthy",
+      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "source": "<FLEET>/private-skills/needs-beads",
+      "source_bucket": "external",
+      "state": "pinned",
+      "wins": true,
+      "won": true
+    }
+  ],
+  "lost": [],
+  "machine": {
+    "declared_machines": [
+      "devbox-like",
+      "mac-like"
+    ],
+    "machine_id": "devbox-like",
+    "resolved": true,
+    "source_path": "<FLEET>/skillbox-config/machines.yaml"
   },
   "matched_clients": [],
   "matched_project_categories": [
@@ -2453,44 +2095,57 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
     }
   ],
   "next_actions": [
-    "sbp skill activate needs-beads --cwd <FLEET>/repos_real/healthy",
-    "edit skill-scope.yaml: add a rule with skills:[needs-beads] and a path/category covering <FLEET>/repos_real/healthy"
+    "already visible; no action needed"
   ],
-  "occurrences": [],
-  "reason": "'needs-beads' is NOT visible here, but a source exists and it can be activated",
+  "occurrences": [
+    {
+      "availability": "override",
+      "layer": "repo-override-file",
+      "layer_family": "OVERRIDE",
+      "layer_label": "repo override file",
+      "layer_rank": 60,
+      "override_action": "pin_on",
+      "path": "<FLEET>/repos_real/healthy",
+      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "source": "<FLEET>/private-skills/needs-beads",
+      "source_bucket": "external",
+      "state": "pinned",
+      "wins": true,
+      "won": true
+    }
+  ],
+  "reason": "'needs-beads' IS visible at cwd via the OVERRIDE layer (repo-override-file)",
   "registry": {
     "registry_ids": [],
     "skill_id": null
   },
-  "remediation": [
-    {
-      "command": "sbp skill activate needs-beads --cwd <FLEET>/repos_real/healthy",
-      "kind": "activate",
-      "manage_command": "python3 .env-manager/manage.py skill activate needs-beads --cwd <FLEET>/repos_real/healthy",
-      "rank": 1,
-      "why": "a source for 'needs-beads' exists (<FLEET>/skills-private/needs-beads); activating links it here and returns the SKILL.md packet immediately"
-    },
-    {
-      "command": "edit skill-scope.yaml: add a rule with skills:[needs-beads] and a path/category covering <FLEET>/repos_real/healthy",
-      "kind": "rule_edit",
-      "policy_files": [
-        "<FLEET>/skillbox-config/skill-scope.yaml"
-      ],
-      "rank": 3,
-      "why": "no skill-scope rule currently matches 'needs-beads' for this cwd, so the resolver does not consider it in-scope here"
-    }
-  ],
-  "schema_version": "2026-06-13+skill_explain",
+  "remediation": [],
+  "schema_version": "2026-06-25+skill_explain_layers",
   "scope_rules": [],
   "skill": "needs-beads",
   "source_options": [
     {
-      "source": "<FLEET>/skills-private/needs-beads",
+      "source": "<FLEET>/private-skills/needs-beads",
       "source_bucket": "external"
     }
   ],
-  "visible": false,
-  "winner": null
+  "visible": true,
+  "winner": {
+    "availability": "override",
+    "layer": "repo-override-file",
+    "layer_family": "OVERRIDE",
+    "layer_label": "repo override file",
+    "layer_rank": 60,
+    "override_action": "pin_on",
+    "path": "<FLEET>/repos_real/healthy",
+    "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+    "source": "<FLEET>/private-skills/needs-beads",
+    "source_bucket": "external",
+    "state": "pinned",
+    "wins": true,
+    "won": true
+  },
+  "winning_layer": "repo-override-file"
 }
 ```
 
@@ -2498,7 +2153,7 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
 
 ## `sbp doctor`
 
-**Invocation:** `sbp doctor [--cwd <repo>] --format json` (a.k.a. structure-doctor)  
+**Invocation:** `sbp doctor [--cwd <repo>] --format json` (a.k.a. structure-doctor)
 **Produced by:** `run_structure_doctor`
 
 The structural verification front door. Runs every gate read-only and returns `{ok, gates, summary, exit_code}`. FAIL is the only status that flips `exit_code`; INCO (e.g. a dependency unreachable) and PASS both exit 0 — INCO is never a regression. The example below uses canned gate outcomes (one of each status) for determinism; `duration_s` is real wall-clock in production (normalized to 0.0 here).
@@ -2528,7 +2183,7 @@ The structural verification front door. Runs every gate read-only and returns `{
 
 ### Example payload
 
-<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>`.</sub>
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
 
 ```json
 {
@@ -2588,7 +2243,7 @@ The structural verification front door. Runs every gate read-only and returns `{
 
 ## `fleet converge`
 
-**Invocation:** `sbp fleet converge [--cwd <repo>] [--all] [--no-mcp] --format json`  
+**Invocation:** `sbp fleet converge [--cwd <repo>] [--all] [--no-mcp] --format json`
 **Produced by:** `build_fleet_converge_plan`
 
 ONE diffable, PLAN-ONLY heal plan across the deduped canonical fleet (the same candidate set `collect_skill_audit` reports). Each repo's drift is grouped into the five fixed triage classes (`relink`, `prune`, `sync`, `policy`, `mcp`); every action carries its exact single-repo command. `dry_run` is always true — converge never writes.
@@ -2622,7 +2277,7 @@ ONE diffable, PLAN-ONLY heal plan across the deduped canonical fleet (the same c
 
 ### Example payload
 
-<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>`.</sub>
+<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to `<FLEET>` / `<RUNTIME_ROOT>` / `<BR_BIN>` / `<REMOTE_ROOT>`.</sub>
 
 ```json
 {
@@ -2701,7 +2356,7 @@ ONE diffable, PLAN-ONLY heal plan across the deduped canonical fleet (the same c
           {
             "class": "relink",
             "command": "ln -sfn <FLEET>/skills/tiny-ui <FLEET>/repos_real/other-machine/.claude/skills/tiny-ui",
-            "link_target": "<FLEET>/fake-mac-root/skills/tiny-ui",
+            "link_target": "<REMOTE_ROOT>/skills/tiny-ui",
             "origin": "moved",
             "path": "<FLEET>/repos_real/other-machine/.claude/skills/tiny-ui",
             "skill": "tiny-ui",

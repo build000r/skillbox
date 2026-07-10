@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 import textwrap
@@ -55,10 +56,62 @@ class CliWrapperTests(unittest.TestCase):
         self.assertEqual(payload["tool"], "skillbox-sbp")
         self.assertIn("stdout_stderr_contract", payload)
         self.assertTrue(any(command["name"] == "candidates" for command in payload["commands"]))
+        verbs = payload["skill_verbs"]
+        expected_verb_fields = {
+            "purpose",
+            "mutates",
+            "links_disk",
+            "returns_packet",
+            "scope",
+            "survives_recalibrate",
+            "when_to_use",
+            "do_NOT",
+        }
+        required_decision_verbs = {
+            "recalibrate",
+            "activate",
+            "sync",
+            "prune",
+            "on",
+            "off",
+            "default",
+            "heal",
+            "why",
+        }
+        self.assertLessEqual(required_decision_verbs, set(verbs))
+        for name, row in verbs.items():
+            with self.subTest(skill_verb=name):
+                self.assertEqual(set(row), expected_verb_fields)
+        self.assertTrue(verbs["on"]["returns_packet"])
+        self.assertEqual(verbs["recalibrate"]["mutates"], "none")
+        self.assertEqual(verbs["activate"]["mutates"], "cwd-ephemeral")
+        self.assertIn("default", verbs)
+        self.assertEqual(verbs["default"]["mutates"], "repo_or_operator_policy")
+        self.assertFalse(verbs["default"]["links_disk"])
+        self.assertIn(
+            "sbp skill default on <skill> --repo --dry-run --format json",
+            payload["safety"]["dry_run_first"],
+        )
+        help_result = subprocess.run(
+            ["python3", ".env-manager/manage.py", "skill", "--help"],
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        match = re.search(r"\{([^}]+)\}", help_result.stdout)
+        self.assertIsNotNone(match, help_result.stdout)
+        dispatched_skill_verbs = set(match.group(1).split(",")) if match else set()
+        self.assertLessEqual(dispatched_skill_verbs, set(verbs))
         launch = next(command for command in payload["commands"] if command["name"] == "launch")
         bulk = next(command for command in payload["commands"] if command["name"] == "bulk")
+        recalibrate = next(command for command in payload["commands"] if command["name"] == "recalibrate")
         self.assertEqual(launch["aliases"], ["bulk"])
         self.assertEqual(bulk["alias_for"], "launch")
+        self.assertTrue(recalibrate["json"])
+        self.assertEqual(recalibrate["safe_first_try"], "sbp recalibrate --json")
         self.assertIn("sbp down <profile> <service> --dry-run --json", payload["safety"]["dry_run_first"])
         self.assertIn("sbp launch <dir> <dir> --request '<prompt>' --dry-run --json", payload["safety"]["dry_run_first"])
         self.assertIn("sbp bulk <dir> <dir> --request '<prompt>' --dry-run --json", payload["safety"]["dry_run_first"])
@@ -67,6 +120,171 @@ class CliWrapperTests(unittest.TestCase):
         self.assertEqual(triage_payload["tool"], "skillbox-sbp")
         self.assertIn("sbp launch <dir> <dir> --request '<prompt>' --dry-run --json", triage_payload["quick_ref"])
         self.assertTrue(any(item["id"] == "preview-launch" for item in triage_payload["recommendations"]))
+
+    def test_sbp_skill_default_forwards_to_runtime_skill_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            downstream = root / "downstream"
+            downstream.mkdir()
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "skill",
+                "default",
+                "on",
+                "alpha",
+                "--repo",
+                "--dry-run",
+                "--format",
+                "json",
+                fake_root=fake_root,
+                invoke_cwd=downstream,
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                record["argv"],
+                [
+                    "skill",
+                    "default",
+                    "--profile",
+                    "local-all",
+                    "--cwd",
+                    str(downstream),
+                    "on",
+                    "alpha",
+                    "--repo",
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+            )
+
+    def test_sbp_recalibrate_auto_fix_yes_repairs_missing_skill_in_one_outer_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = root / "repo"
+            source_root = root / "sources"
+            clients_root = root / "clients"
+            repo.mkdir()
+            (repo / ".git").mkdir()
+            (source_root / "alpha").mkdir(parents=True)
+            clients_root.mkdir()
+            (source_root / "alpha" / "SKILL.md").write_text("# alpha\n", encoding="utf-8")
+            policy_path = root / "skill-scope.yaml"
+            policy_path.write_text(
+                "version: 1\n"
+                "skill_source_roots:\n"
+                f"  - {source_root}\n"
+                "rules:\n"
+                "  - id: alpha-local\n"
+                "    skills: [alpha]\n"
+                f"    paths: [{repo}]\n",
+                encoding="utf-8",
+            )
+            env = {
+                "SKILLBOX_SKILL_SCOPE_FILE": str(policy_path),
+                "SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root),
+            }
+
+            def embedded_json_objects(text: str) -> list[dict[str, object]]:
+                decoder = json.JSONDecoder()
+                objects: list[dict[str, object]] = []
+                for index, character in enumerate(text):
+                    if character != "{":
+                        continue
+                    try:
+                        item, _ = decoder.raw_decode(text[index:])
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(item, dict):
+                        objects.append(item)
+                return objects
+
+            before = self._run_wrapper(
+                SBP,
+                "skills",
+                "--issues-only",
+                "--no-global",
+                "--format",
+                "json",
+                invoke_cwd=repo,
+                extra_env=env,
+            )
+            recovery = self._run_wrapper(
+                SBP,
+                "recalibrate",
+                "--auto-fix",
+                "--yes",
+                invoke_cwd=repo,
+                extra_env=env,
+            )
+            after = self._run_wrapper(
+                SBP,
+                "skills",
+                "--issues-only",
+                "--no-global",
+                "--format",
+                "json",
+                invoke_cwd=repo,
+                extra_env=env,
+            )
+            self.assertEqual(before.returncode, 0, before.stderr)
+            self.assertEqual(recovery.returncode, 0, recovery.stderr)
+            self.assertEqual(after.returncode, 0, after.stderr)
+            before_payload = json.loads(before.stdout)
+            heal_payloads = [
+                item for item in embedded_json_objects(recovery.stdout)
+                if item.get("action") == "heal" and item.get("skill") == "alpha"
+            ]
+            after_payload = json.loads(after.stdout)
+            recovery_commands = ["sbp recalibrate --auto-fix --yes"]
+            ceremony_log = {
+                "steps": [
+                    {
+                        "name": "detect_missing",
+                        "command": "sbp skills --issues-only --no-global --format json",
+                        "missing_for_cwd": [
+                            item.get("name")
+                            for item in (before_payload.get("issues") or {}).get("missing_for_cwd") or []
+                        ],
+                    },
+                    {
+                        "name": "recover",
+                        "command": recovery_commands[0],
+                        "tool_call_count": len(recovery_commands),
+                        "returned_activation_packet": bool(
+                            heal_payloads and heal_payloads[0].get("activation_packet")
+                        ),
+                    },
+                    {
+                        "name": "verify_effective",
+                        "command": "sbp skills --issues-only --no-global --format json",
+                        "missing_for_cwd": [
+                            item.get("name")
+                            for item in (after_payload.get("issues") or {}).get("missing_for_cwd") or []
+                        ],
+                    },
+                ],
+            }
+
+            self.assertEqual(ceremony_log["steps"][0]["missing_for_cwd"], ["alpha"], ceremony_log)
+            self.assertEqual(recovery_commands, ["sbp recalibrate --auto-fix --yes"], ceremony_log)
+            self.assertEqual(ceremony_log["steps"][1]["tool_call_count"], 1, ceremony_log)
+            self.assertEqual(len(heal_payloads), 1, ceremony_log)
+            heal_payload = heal_payloads[0]
+            self.assertTrue(ceremony_log["steps"][1]["returned_activation_packet"], ceremony_log)
+            self.assertEqual(heal_payload["action"], "heal", ceremony_log)
+            self.assertEqual(heal_payload["activation_packet"]["name"], "alpha", ceremony_log)
+            self.assertIn("skill_md", heal_payload["activation_packet"], ceremony_log)
+            self.assertEqual(ceremony_log["steps"][2]["missing_for_cwd"], [], ceremony_log)
+            self.assertIn("alpha", [item.get("name") for item in after_payload.get("effective") or []], ceremony_log)
+            self.assertTrue((repo / ".claude" / "skills" / "alpha").is_symlink(), ceremony_log)
+            self.assertTrue((repo / ".codex" / "skills" / "alpha").is_symlink(), ceremony_log)
 
     def test_sbp_home_surfaces_batch_launcher_safe_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -88,6 +306,9 @@ class CliWrapperTests(unittest.TestCase):
         self.assertIn("sbp bulk <dir> <dir> --request 'Audit auth drift' --dry-run --json", result.stdout)
         self.assertIn("bulk is an alias for launch", result.stdout)
         self.assertIn("Use single quotes when prompts contain $smart", result.stdout)
+        self.assertIn("Skill verb contract:", result.stdout)
+        self.assertIn("sbp capabilities --json | jq .skill_verbs", result.stdout)
+        self.assertIn("activate (mutates=cwd-ephemeral, returns_packet=true)", result.stdout)
 
     def test_sbp_launch_maps_to_swimmers_launch_without_profile_consuming_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -519,6 +740,161 @@ class CliWrapperTests(unittest.TestCase):
                 ],
             )
 
+    def test_sbp_recalibrate_json_emits_parseable_machine_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            downstream = root / "downstream"
+            downstream.mkdir()
+            generator = fake_root / "scripts" / "gen_output_schemas.py"
+            generator.parent.mkdir(parents=True)
+            generator.write_text(
+                textwrap.dedent(
+                    """\
+                    from __future__ import annotations
+
+                    import json
+                    import sys
+
+                    if "--recalibrate-json" not in sys.argv:
+                        raise SystemExit(2)
+                    cwd = sys.argv[sys.argv.index("--cwd") + 1]
+                    print(json.dumps({
+                        "cwd": cwd,
+                        "issues": {"missing_for_cwd": [{"name": "alpha"}]},
+                        "fixes": [{
+                            "problem": "missing_for_cwd",
+                            "skill": "alpha",
+                            "command": "sbp skill on alpha --cwd $PWD",
+                            "links": [],
+                            "dry_run_preview": {"dry_run": True},
+                            "packet_on_apply": None,
+                        }],
+                    }))
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            result = self._run_wrapper(
+                SBP,
+                "recalibrate",
+                "--json",
+                fake_root=fake_root,
+                invoke_cwd=downstream,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("policy issues for this repo:", result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["cwd"], str(downstream))
+            self.assertEqual(payload["fixes"][0]["skill"], "alpha")
+            self.assertEqual(payload["fixes"][0]["command"], "sbp skill on alpha --cwd $PWD")
+
+    def test_sbp_recalibrate_auto_fix_previews_heal_for_missing_skills(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox_with_missing_skills(root / "skillbox")
+            downstream = root / "downstream"
+            downstream.mkdir()
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "recalibrate",
+                "--auto-fix",
+                fake_root=fake_root,
+                invoke_cwd=downstream,
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("auto-fix missing repo-local skills:", result.stdout)
+            self.assertIn("mode: dry-run (pass --yes to apply)", result.stdout)
+            calls = json.loads(record_path.read_text(encoding="utf-8"))
+            heal_calls = [
+                item["argv"] for item in calls
+                if item["argv"][:2] == ["skill", "heal"]
+            ]
+            self.assertEqual(
+                heal_calls,
+                [
+                    [
+                        "skill",
+                        "heal",
+                        "alpha",
+                        "--profile",
+                        "local-all",
+                        "--cwd",
+                        str(downstream),
+                        "--dry-run",
+                        "--format",
+                        "json",
+                    ],
+                    [
+                        "skill",
+                        "heal",
+                        "beta",
+                        "--profile",
+                        "local-all",
+                        "--cwd",
+                        str(downstream),
+                        "--dry-run",
+                        "--format",
+                        "json",
+                    ],
+                ],
+            )
+
+    def test_sbp_recalibrate_auto_fix_yes_applies_heal_for_missing_skills(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox_with_missing_skills(root / "skillbox")
+            downstream = root / "downstream"
+            downstream.mkdir()
+            record_path = root / "record.json"
+
+            result = self._run_wrapper(
+                SBP,
+                "recalibrate",
+                "--auto-fix",
+                "--yes",
+                fake_root=fake_root,
+                invoke_cwd=downstream,
+                record_path=record_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("mode: apply (--yes)", result.stdout)
+            self.assertIn('"activation_packet"', result.stdout)
+            calls = json.loads(record_path.read_text(encoding="utf-8"))
+            heal_calls = [
+                item["argv"] for item in calls
+                if item["argv"][:2] == ["skill", "heal"]
+            ]
+            self.assertEqual(len(heal_calls), 2)
+            self.assertTrue(all("--dry-run" not in call for call in heal_calls))
+            self.assertEqual([call[2] for call in heal_calls], ["alpha", "beta"])
+
+    def test_sbp_recalibrate_auto_fix_rejects_fleet_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            downstream = root / "downstream"
+            downstream.mkdir()
+
+            result = self._run_wrapper(
+                SBP,
+                "recalibrate",
+                "--fleet",
+                "--auto-fix",
+                fake_root=fake_root,
+                invoke_cwd=downstream,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("--auto-fix is cwd-only", result.stderr)
+
     def test_sbp_mcp_maps_to_mcp_audit_for_downstream_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -858,6 +1234,56 @@ class CliWrapperTests(unittest.TestCase):
                 with open(os.environ["SKILLBOX_RECORD"], "w", encoding="utf-8") as handle:
                     json.dump(payload, handle)
                 print(json.dumps(payload))
+                """
+            ),
+            encoding="utf-8",
+        )
+        return root
+
+    def _make_fake_skillbox_with_missing_skills(self, root: Path) -> Path:
+        env_dir = root / ".env-manager"
+        env_dir.mkdir(parents=True)
+        (env_dir / "manage.py").write_text(
+            textwrap.dedent(
+                """\
+                from __future__ import annotations
+
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                record_path = Path(os.environ["SKILLBOX_RECORD"])
+                if record_path.exists() and record_path.read_text(encoding="utf-8"):
+                    rows = json.loads(record_path.read_text(encoding="utf-8"))
+                else:
+                    rows = []
+                rows.append({"argv": sys.argv[1:], "cwd": os.getcwd()})
+                record_path.write_text(json.dumps(rows), encoding="utf-8")
+
+                argv = sys.argv[1:]
+                payload = {
+                    "issues": {
+                        "missing_for_cwd": [
+                            {"name": "alpha"},
+                            {"name": "beta"},
+                            {"name": "alpha"},
+                        ]
+                    },
+                    "beads": {"required": False},
+                    "summary": {},
+                }
+                if argv[:1] == ["skills"] and "--format" in argv and "json" in argv:
+                    print(json.dumps(payload))
+                elif argv[:2] == ["skill", "heal"]:
+                    skill = argv[2]
+                    print(json.dumps({
+                        "action": "heal",
+                        "skill": skill,
+                        "activation_packet": {"name": skill, "skill_md_sha256": "sha"},
+                    }))
+                else:
+                    print("ok")
                 """
             ),
             encoding="utf-8",

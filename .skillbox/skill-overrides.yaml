@@ -1,0 +1,9 @@
+version: 1
+pin_on: []
+pin_off: []
+opt_out_global: []
+overlays:
+  enable: []
+  disable: []
+defaults: []
+reason: "Repo-local skill visibility overrides."

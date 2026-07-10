@@ -1,19 +1,15 @@
 # Ambition Bar Check
 
-- Substantive surface changes: 5
-- Dimensions touched: agent_intuitiveness, agent_ergonomics, output_parseability, error_pedagogy, intent_inference, self_documentation, composability, regression_resistance
-- Mega-command: yes, `--robot-triage`
-- Capabilities or robot-docs: yes, both
-- JSON or robot read-side output: yes, `capabilities --json`, `--robot-triage`, and JSON aliases
-- Error rewrite: yes, unknown command suggestions
-- Intent inference: yes, JSON typo aliases
+Question: Did this pass materially improve the cold-agent path through Skillbox's CLI surfaces, or merely document existing behavior?
 
-Self-prompt:
+Answer: It improved the path. The pass did not stop at a scorecard. It shipped narrowly scoped fixes on the documented brain surfaces that a cold agent is expected to run first:
 
-> That's it?? I was hoping you would get a lot more practical value out of this skill.
-> Where are the dramatic improvements? Re-read the playbook, look at the surfaces still
-> scoring below 500 on output_parseability / error_pedagogy / intent_inference /
-> self_documentation, and ship a substantially larger batch of high-leverage changes.
-> You're allowed to be ambitious. Default to acting, not deliberating.
+- `capabilities` now advertises an executable `search` safe-first command.
+- Brain `next_actions` now use real `python3 .env-manager/manage.py ...` commands instead of internal `brain.*` labels.
+- `explain next` resolves to `command:brain.next`.
+- `graph --algorithm pagerank --format json` returns structured JSON instead of argparse text.
+- `snap --format json` returns an agent-readable action list instead of parser usage.
 
-Result: the second-round scope is deferred to avoid trampling a dirty worktree already carrying unrelated runtime-manager changes. The next highest-leverage batch is extending the same contract to `scripts/04-reconcile.py`, `scripts/box.py`, and wrapper shortcuts.
+The pass also refused to hide larger safety issues as "done": SBP JSON/mutation hardening and direct box CLI safety were filed as follow-up beads with acceptance criteria.
+
+Ambition bar result: met for a bounded full pass on bead `.7`; remaining systemic work is tracked in `.1`, `.2`, `.5`, `.6`, `.8`, and `.9`.

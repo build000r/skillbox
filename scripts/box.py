@@ -28,10 +28,28 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
+
+# Single source of truth for operator-side validation, inventory containment,
+# and checked subprocess output redaction.
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+from lib.opslib import (  # noqa: E402
+    SSH_READ_RETRY_POLICY,
+    RetryPolicy,
+    classify_ssh_failure,
+    locked_inventory_update,
+    resolve_inventory_path,
+    run_checked,
+    validate_box_id,
+    validate_host,
+    validate_profile_name,
+    validate_ssh_user,
+)
+
 PROFILES_DIR = REPO_ROOT / "workspace" / "box-profiles"
 BOOTSTRAP_SCRIPT = SCRIPT_DIR / "01-bootstrap-do.sh"
 TAILSCALE_SCRIPT = SCRIPT_DIR / "02-install-tailscale.sh"
@@ -58,10 +76,20 @@ PROVISIONING_ENV_VARS = (
 
 
 def inventory_path() -> Path:
-    override = os.environ.get("SKILLBOX_BOX_INVENTORY", "").strip()
+    return resolve_inventory_path(repo_root=REPO_ROOT)
+
+
+def inventory_journal_path(inventory: Path | None = None) -> Path:
+    override = os.environ.get("SKILLBOX_BOX_JOURNAL", "").strip()
     if override:
-        return Path(override)
-    return REPO_ROOT / "workspace" / "boxes.json"
+        return Path(override).expanduser().resolve()
+
+    path = (inventory or inventory_path()).resolve()
+    default_inventory = (REPO_ROOT / "workspace" / "boxes.json").resolve()
+    if path == default_inventory:
+        return REPO_ROOT / ".skillbox-state" / "boxes-journal.jsonl"
+    return path.parent / ".skillbox-state" / "boxes-journal.jsonl"
+
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -70,6 +98,7 @@ BOX_COMMAND_NAMES = {
     "capabilities",
     "down",
     "import",
+    "inventory-rebuild",
     "list",
     "profiles",
     "register",
@@ -83,6 +112,8 @@ BOX_COMMAND_NAMES = {
 }
 BOX_JSON_COMMANDS = BOX_COMMAND_NAMES - {"robot-docs", "ssh"}
 BOX_JSON_FLAG_ALIASES = {"--json", "--jason", "--jsno", "--jsson"}
+BOX_SECRET_LOADING_COMMANDS = {"down", "posture-proof", "up", "upgrade"}
+_ARGPARSE_JSON_ERRORS = False
 
 STATES = [
     "creating",
@@ -95,6 +126,13 @@ STATES = [
     "onboarding",
     "ready",
     "draining",
+    # Teardown truth states: a droplet that was asked to delete but is still
+    # API-listed lands in `destroy-pending` (NOT destroyed — it may still bill).
+    # A droplet confirmed-absent whose volume cleanup did not finish lands in
+    # `volume-cleanup-failed` (no billing lie; resumable). Both are reported by
+    # box-status / box-list with the exact retry command.
+    "destroy-pending",
+    "volume-cleanup-failed",
     "destroyed",
 ]
 
@@ -108,8 +146,69 @@ VALID_TRANSITIONS = {
     "acceptance": ["ready", "destroyed"],
     "onboarding": ["ready", "destroyed"],
     "ready": ["draining", "destroyed"],
-    "draining": ["destroyed"],
+    # draining can converge to destroyed, or fall into a truthful pending state
+    # when the droplet is still listed (destroy-pending) or the volume cleanup
+    # did not finish after the droplet was confirmed gone (volume-cleanup-failed).
+    "draining": ["destroy-pending", "volume-cleanup-failed", "destroyed"],
+    # destroy-pending re-runs the read-after-delete confirmation; it stays
+    # pending, advances to volume-cleanup-failed, or converges to destroyed.
+    "destroy-pending": ["destroy-pending", "volume-cleanup-failed", "destroyed"],
+    # volume-cleanup-failed re-runs volume cleanup only (droplet already gone).
+    "volume-cleanup-failed": ["volume-cleanup-failed", "destroyed"],
 }
+
+
+class BoxStateTransitionError(RuntimeError):
+    """Structured rejection for invalid box lifecycle state transitions."""
+
+    error_type = "invalid_state_transition"
+
+    def __init__(self, from_state: str, to_state: str) -> None:
+        valid_next = list(VALID_TRANSITIONS.get(from_state, []))
+        message = (
+            f"Invalid box state transition {from_state!r} -> {to_state!r}. "
+            f"Valid next states: {', '.join(valid_next) or '(none)'}."
+        )
+        super().__init__(message)
+        self.from_state = from_state
+        self.to_state = to_state
+        self.valid_next = valid_next
+        self.payload = {
+            "error": {
+                "type": self.error_type,
+                "message": message,
+                "recoverable": True,
+            },
+            "transition": {
+                "from": from_state,
+                "to": to_state,
+                "valid_next": valid_next,
+            },
+            "next_actions": ["box status <box-id>", "box list"],
+        }
+
+
+def validate_box_state_transition(from_state: str, to_state: str) -> None:
+    """Raise a structured error unless from_state -> to_state is declared."""
+    if from_state not in STATES or to_state not in STATES:
+        raise BoxStateTransitionError(from_state, to_state)
+    if to_state not in VALID_TRANSITIONS.get(from_state, []):
+        raise BoxStateTransitionError(from_state, to_state)
+
+
+def box_state_transition_allowed(from_state: str, to_state: str) -> bool:
+    try:
+        validate_box_state_transition(from_state, to_state)
+    except BoxStateTransitionError:
+        return False
+    return True
+
+
+# States from which `box down` (rerun / --resume) must idempotently converge to
+# `destroyed` when the underlying infra cooperates. The droplet is already gone
+# (volume-cleanup-failed) or may still be present (destroy-pending), so a rerun
+# re-confirms truth rather than blindly trusting a prior delete call.
+RESUMABLE_DOWN_STATES = {"destroy-pending", "volume-cleanup-failed"}
 
 DEFAULT_SSH_OPTS = [
     "-o", "StrictHostKeyChecking=accept-new",
@@ -119,39 +218,26 @@ DEFAULT_SSH_OPTS = [
 REMOTE_ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SHA256_HEX_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")
 IPV4_PATTERN = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
-_SSH_USER_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$')
-_HOST_RE = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,253}[a-zA-Z0-9])?$')
-_BOX_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
-_PROFILE_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+# Box ids / box-profile names are an ALIGNED-but-separate surface from runtime
+# ids. The canonical slug grammar (and why these allow the slightly wider
+# `[a-zA-Z0-9._-]` class — historic `.` and uppercase box ids) is documented
+# once in docs/runtime-id-grammar.md, the same reference
+# scripts/lib/runtime_model.py points at. No runtime id uses `.`/uppercase, so
+# the runtime grammar there is the stricter `^[a-z0-9][a-z0-9_-]{0,63}$`.
 
 
 def _validate_box_id(box_id: str) -> str:
-    if not box_id:
-        raise argparse.ArgumentTypeError("invalid box_id: must not be empty")
-    if "/" in box_id or "\\" in box_id:
-        raise argparse.ArgumentTypeError("invalid box_id: must not contain path separators")
-    if box_id.startswith("-"):
-        raise argparse.ArgumentTypeError("invalid box_id: must not start with '-'")
-    if not _BOX_ID_RE.match(box_id):
-        raise argparse.ArgumentTypeError(
-            "invalid box_id: must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,63}"
-        )
-    return box_id
+    try:
+        return validate_box_id(box_id)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _validate_profile_name(profile_name: str) -> str:
-    name = str(profile_name or "").strip()
-    if not name:
-        raise RuntimeError("Invalid box profile name: must not be empty")
-    if "/" in name or "\\" in name:
-        raise RuntimeError("Invalid box profile name: must not contain path separators")
-    if name.startswith("-"):
-        raise RuntimeError("Invalid box profile name: must not start with '-'")
-    if not _PROFILE_NAME_RE.match(name):
-        raise RuntimeError(
-            "Invalid box profile name: must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,63}"
-        )
-    return name
+    try:
+        return validate_profile_name(profile_name)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 def _validate_config_bool(value: Any, field: str) -> bool:
@@ -161,15 +247,11 @@ def _validate_config_bool(value: Any, field: str) -> bool:
 
 
 def _validate_ssh_user(user: str) -> str:
-    if not _SSH_USER_RE.match(user):
-        raise ValueError(f"Invalid ssh user: {user!r}")
-    return user
+    return validate_ssh_user(user, kind="ssh user")
 
 
 def _validate_host(host: str) -> str:
-    if not _HOST_RE.match(host):
-        raise ValueError(f"Invalid host: {host!r}")
-    return host
+    return validate_host(host, kind="host")
 
 
 REGISTER_PROBE_COMMAND = (
@@ -347,6 +429,26 @@ def emit_json(payload: Any) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True, default=str))
 
 
+def emit_json_stderr(payload: Any) -> None:
+    print(json.dumps(payload, indent=2, sort_keys=True, default=str), file=sys.stderr)
+
+
+def structured_cli_error(
+    message: str,
+    *,
+    error_code: str,
+    next_actions: list[str] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "ok": False,
+        "error": message,
+        "error_code": error_code,
+    }
+    if next_actions is not None:
+        payload["next_actions"] = next_actions
+    return payload
+
+
 def structured_error(
     message: str,
     *,
@@ -396,6 +498,7 @@ def _box_agent_command(name: str) -> dict[str, Any]:
         "capabilities": "python3 scripts/box.py capabilities --json",
         "down": "python3 scripts/box.py down <box-id> --dry-run --format json",
         "import": "python3 scripts/box.py profiles --format json",
+        "inventory-rebuild": "python3 scripts/box.py status <box-id> --history --format json",
         "list": "python3 scripts/box.py list --format json",
         "profiles": "python3 scripts/box.py profiles --format json",
         "register": "python3 scripts/box.py profiles --format json",
@@ -410,26 +513,39 @@ def _box_agent_command(name: str) -> dict[str, Any]:
             "--dry-run --format json"
         ),
     }[name]
-    return {
+    command = {
         "name": name,
         "json": name in BOX_JSON_COMMANDS,
-        "mutates": name in {"down", "import", "register", "unregister", "up", "upgrade"},
+        "mutates": name in {"down", "import", "inventory-rebuild", "register", "unregister", "up", "upgrade"},
         "destructive": name == "down",
         "dry_run": name in {"down", "up", "upgrade"},
         "safe_first_try": safe_first_try,
         "mutation_command": {
             "import": "python3 scripts/box.py import <box-id> --host <host> --no-probe --format json",
+            "inventory-rebuild": "python3 scripts/box.py inventory-rebuild --from-journal --format json",
             "register": "python3 scripts/box.py register <box-id> --host <host> --no-probe --format json",
             "unregister": "python3 scripts/box.py unregister <box-id> --format json",
         }.get(name),
     }
+    if name == "down":
+        command["confirmation"] = {
+            "required_for_real_teardown": True,
+            "accepted_flags": ["--yes", "--confirm <box-id>"],
+            "safe_alternative": "python3 scripts/box.py down <box-id> --dry-run --format json",
+        }
+    if name == "status":
+        command["read_side_effects"] = {
+            "default": "none",
+            "opt_in": "--write-cache updates last_ssh_target in workspace/boxes.json when a better SSH target is discovered",
+        }
+    return command
 
 
 def box_capabilities_payload() -> dict[str, Any]:
     return {
         "ok": True,
         "tool": "skillbox-box",
-        "contract_version": "2026-05-11",
+        "contract_version": "2026-07-04",
         "root_dir": str(REPO_ROOT),
         "entrypoint": "python3 scripts/box.py",
         "commands": [_box_agent_command(name) for name in sorted(BOX_COMMAND_NAMES)],
@@ -452,10 +568,15 @@ def box_capabilities_payload() -> dict[str, Any]:
                     "--dry-run --format json"
                 ),
             ],
-            "confirm_with_user_before": [
-                "python3 scripts/box.py down <box-id> --format json",
-            ],
+            "real_teardown_requires": "Pass --yes or --confirm <box-id>; --dry-run does not require confirmation.",
             "non_tty_alternative": "Use MCP operator_box_exec for remote commands instead of box.py ssh.",
+        },
+        "read_side_effects": {
+            "status": {
+                "default": "does not write workspace/boxes.json",
+                "opt_in": "python3 scripts/box.py status --write-cache --format json updates cached last_ssh_target values",
+            },
+            "list": "does not write workspace/boxes.json",
         },
         "mcp_equivalents": {
             "profiles": "operator_profiles",
@@ -502,7 +623,12 @@ Safe mutation pattern:
   python3 scripts/box.py up <box-id> --profile dev-small --dry-run --format json
   python3 scripts/box.py down <box-id> --dry-run --format json
   python3 scripts/box.py upgrade <box-id> --deploy-manifest <deploy.json> --dry-run --format json
-  Confirm with the user before real teardown because it destroys infrastructure.
+  Real teardown requires --yes or --confirm <box-id> because it destroys infrastructure.
+
+Read-side commands:
+  status and list do not write workspace/boxes.json by default.
+  Use status --write-cache only when you intentionally want to update cached
+  last_ssh_target values after a successful probe.
 
 Remote commands:
   box.py ssh is for interactive terminals. Agents should use MCP operator_box_exec
@@ -549,7 +675,7 @@ def require_env(name: str) -> str:
     if not val:
         raise RuntimeError(
             f"Required environment variable {name} is not set. "
-            f"Add it to .env or export it before running box commands."
+            f"Add it to {operator_secret_dir() / '.env'} or export it before running box commands."
         )
     return val
 
@@ -568,7 +694,8 @@ def provisioning_credentials_next_actions(
         return [f"box up {box_id} --profile {profile_name} --deploy-manifest <path>"]
     return [
         "Ask the operator for the missing DigitalOcean/Tailscale provisioning values.",
-        "Create or update .env.box on the operator machine with the missing KEY=value lines.",
+        f"Create or update {operator_secret_dir() / '.env.box'} on the operator machine "
+        "with the missing KEY=value lines.",
         f"Missing: {', '.join(missing)}",
         f"Re-run: python3 scripts/box.py up {box_id} --profile {profile_name} --dry-run --format json",
     ]
@@ -582,7 +709,10 @@ def provisioning_credentials_status() -> dict[str, Any]:
         "required": list(PROVISIONING_ENV_VARS),
         "configured": configured,
         "missing": missing,
-        "env_files": [".env", ".env.box"],
+        "env_files": [
+            str(operator_secret_dir() / ".env"),
+            str(operator_secret_dir() / ".env.box"),
+        ],
         "message": (
             "Provisioning credentials are ready."
             if not missing
@@ -599,7 +729,8 @@ def emit_provisioning_credentials_error(*, box_id: str, profile_name: str, is_js
     message = (
         "Required provisioning credentials are unset: "
         + ", ".join(missing)
-        + ". Add them to .env.box or export them before running box provisioning."
+        + f". Add them to {operator_secret_dir() / '.env.box'} or export them "
+        "before running box provisioning."
     )
     next_actions = provisioning_credentials_next_actions(
         missing,
@@ -612,8 +743,9 @@ def emit_provisioning_credentials_error(*, box_id: str, profile_name: str, is_js
             error_type="provisioning_credentials_missing",
             recovery_hint=(
                 "These are operator-machine credentials, not values to invent inside the box. "
-                "Ask the operator to populate .env.box with SKILLBOX_DO_TOKEN, "
-                "SKILLBOX_DO_SSH_KEY_ID, and SKILLBOX_TS_AUTHKEY, then rerun the dry-run."
+                f"Ask the operator to populate {operator_secret_dir() / '.env.box'} with "
+                "SKILLBOX_DO_TOKEN, SKILLBOX_DO_SSH_KEY_ID, and SKILLBOX_TS_AUTHKEY, "
+                "then rerun the dry-run."
             ),
             next_actions=next_actions,
         )
@@ -648,31 +780,147 @@ def load_dotenv(path: Path) -> None:
             os.environ[key] = value
 
 
+# Operator secret files (DigitalOcean token, Tailscale authkey, *_TOKEN/*_KEY/*_SECRET).
+# These are consumed host-side only; they must live OUTSIDE the `.:/workspace` bind
+# mount so in-container agents cannot read them. Canonical home is
+# ${SKILLBOX_STATE_ROOT}/operator/ (the state root is mounted only at specific
+# subpaths, never wholesale). Repo-root copies are deprecated and warn.
+# NOTE: workspace/boxes.json is NOT a credential (droplet IDs/IPs/topology only),
+# so it intentionally stays in the workspace mount.
+OPERATOR_SECRET_FILENAMES = (".env", ".env.box")
+
+
+def operator_secret_dir() -> Path:
+    """Resolve the canonical operator-secret directory under the state root."""
+    state_root = os.environ.get("SKILLBOX_STATE_ROOT", "").strip() or "./.skillbox-state"
+    base = Path(state_root)
+    if not base.is_absolute():
+        base = REPO_ROOT / base
+    return (base / "operator").resolve()
+
+
+def load_operator_secret(name: str) -> None:
+    """Load an operator secret file, preferring the relocated state-root copy.
+
+    Falls back to the deprecated repo-root location (inside the workspace mount)
+    with a loud stderr warning; no-op when neither file exists.
+    """
+    new_path = operator_secret_dir() / name
+    legacy_path = REPO_ROOT / name
+    if new_path.is_file():
+        load_dotenv(new_path)
+        return
+    if legacy_path.is_file():
+        sys.stderr.write(
+            f"[skillbox] DEPRECATED secret location: {legacy_path} is inside the workspace "
+            f"bind mount and readable by in-container agents.\n"
+            f"[skillbox] Move it out of the mount with:\n"
+            f"    mkdir -p {operator_secret_dir()} && mv {legacy_path} {new_path}\n"
+        )
+        load_dotenv(legacy_path)
+        return
+    # neither present: leave os.environ untouched; existing missing-credential UX handles it.
+
+
 # ---------------------------------------------------------------------------
 # CLI runners
 # ---------------------------------------------------------------------------
 
-def run(args: list[str], *, check: bool = True, capture: bool = True, timeout: int = 120) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+
+def _completed_process_from_checked(args: list[str], checked: dict[str, Any]) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.CompletedProcess(
         args,
-        capture_output=capture,
-        text=True,
-        check=check,
-        timeout=timeout,
+        int(checked["rc"]),
+        stdout=str(checked.get("stdout") or ""),
+        stderr=str(checked.get("stderr_redacted") or ""),
     )
+    completed.opslib_result = checked
+    completed.retry_attempts = int(checked.get("attempts") or 1)
+    completed.failure_class = checked.get("failure_class")
+    completed.retryable_hint = bool(checked.get("retryable_hint", False))
+    return completed
+
+
+def _process_probe_metadata(result: subprocess.CompletedProcess[str] | Any) -> dict[str, Any]:
+    attrs = getattr(result, "__dict__", {})
+    raw = attrs.get("opslib_result", {}) if isinstance(attrs, dict) else {}
+    raw = raw if isinstance(raw, dict) else {}
+    attempts = raw.get("attempts", attrs.get("retry_attempts", 1) if isinstance(attrs, dict) else 1)
+    try:
+        attempts_value = int(attempts)
+    except (TypeError, ValueError):
+        attempts_value = 1
+    payload: dict[str, Any] = {
+        "attempts": attempts_value,
+        "retryable_hint": bool(raw.get("retryable_hint", attrs.get("retryable_hint", False) if isinstance(attrs, dict) else False)),
+    }
+    failure_class = raw.get("failure_class", attrs.get("failure_class") if isinstance(attrs, dict) else None)
+    if failure_class:
+        payload["failure_class"] = failure_class
+    if raw.get("deadline_exhausted"):
+        payload["deadline_exhausted"] = True
+    return payload
+
+
+def run(
+    args: list[str],
+    *,
+    check: bool = True,
+    capture: bool = True,
+    timeout: int = 120,
+    retry_policy: RetryPolicy | None = None,
+    retry_classifier: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    if not capture:
+        completed = subprocess.run(args, capture_output=False, text=True, check=check, timeout=timeout)
+        return completed
+    checked = run_checked(
+        args,
+        timeout=timeout,
+        redact=True,
+        retry_policy=retry_policy,
+        retry_classifier=retry_classifier,
+    )
+    if checked.get("error_code") == "TIMEOUT":
+        raise subprocess.TimeoutExpired(
+            args,
+            timeout,
+            output=checked.get("stdout", ""),
+            stderr=checked.get("stderr_redacted", ""),
+        )
+    if checked.get("error_code") == "COMMAND_NOT_FOUND":
+        raise FileNotFoundError(str(checked.get("stderr_redacted") or args[0]))
+    completed = _completed_process_from_checked(args, checked)
+    if check and completed.returncode != 0:
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            args,
+            output=completed.stdout,
+            stderr=completed.stderr,
+        )
+    return completed
 
 
 def doctl(*args: str, timeout: int = 120) -> subprocess.CompletedProcess[str]:
     return run(["doctl", *args], timeout=timeout)
 
 
-def ssh_cmd(user: str, host: str, command: str, *, timeout: int = 300) -> subprocess.CompletedProcess[str]:
+def ssh_cmd(
+    user: str,
+    host: str,
+    command: str,
+    *,
+    timeout: int = 300,
+    retry_policy: RetryPolicy | None = None,
+) -> subprocess.CompletedProcess[str]:
     _validate_ssh_user(user)
     _validate_host(host)
     return run(
         ["ssh", *DEFAULT_SSH_OPTS, "--", f"{user}@{host}", command],
         check=False,
         timeout=timeout,
+        retry_policy=retry_policy,
+        retry_classifier=classify_ssh_failure,
     )
 
 
@@ -692,15 +940,26 @@ def ssh_script(
     if script_args:
         remote_argv.extend(["--", *script_args])
     remote_cmd = build_remote_env_command(remote_argv, env_vars)
-    with script_path.open("r") as f:
-        return subprocess.run(
+    checked = run_checked(
+        ["ssh", *DEFAULT_SSH_OPTS, "--", f"{user}@{host}", remote_cmd],
+        timeout=timeout,
+        redact=True,
+        input_text=script_path.read_text(encoding="utf-8"),
+        retry_classifier=classify_ssh_failure,
+    )
+    if checked.get("error_code") == "TIMEOUT":
+        raise subprocess.TimeoutExpired(
             ["ssh", *DEFAULT_SSH_OPTS, "--", f"{user}@{host}", remote_cmd],
-            stdin=f,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout,
+            timeout,
+            output=checked.get("stdout", ""),
+            stderr=checked.get("stderr_redacted", ""),
         )
+    if checked.get("error_code") == "COMMAND_NOT_FOUND":
+        raise FileNotFoundError(str(checked.get("stderr_redacted") or "ssh"))
+    return _completed_process_from_checked(
+        ["ssh", *DEFAULT_SSH_OPTS, "--", f"{user}@{host}", remote_cmd],
+        checked,
+    )
 
 
 def extract_tailscale_ipv4(output: str) -> str | None:
@@ -785,7 +1044,14 @@ def probe_registered_box(box: "Box", *, enabled: bool) -> dict[str, Any]:
 
     payload["ssh_target"] = ssh_target
     payload["ssh_reachable"] = True
-    result = ssh_cmd(box.ssh_user, ssh_target, REGISTER_PROBE_COMMAND, timeout=20)
+    result = ssh_cmd(
+        box.ssh_user,
+        ssh_target,
+        REGISTER_PROBE_COMMAND,
+        timeout=20,
+        retry_policy=SSH_READ_RETRY_POLICY,
+    )
+    payload["probe"] = _process_probe_metadata(result)
     if result.returncode != 0:
         return payload
 
@@ -813,10 +1079,11 @@ def _check_public_ssh(box: "Box") -> dict[str, Any]:
     if not target:
         return payload
     try:
-        result = ssh_cmd(box.ssh_user, target, "echo ok", timeout=5)
+        result = ssh_cmd(box.ssh_user, target, "echo ok", timeout=5, retry_policy=SSH_READ_RETRY_POLICY)
     except (OSError, subprocess.TimeoutExpired) as exc:
         payload["error"] = str(exc)
         return payload
+    payload.update(_process_probe_metadata(result))
     payload["ok"] = result.returncode == 0 and "ok" in result.stdout
     if not payload["ok"] and result.stderr:
         payload["error"] = result.stderr[-200:]
@@ -888,6 +1155,7 @@ def scp_file(local_path: Path, user: str, host: str, remote_path: str, *, timeou
         ["scp", *DEFAULT_SSH_OPTS, "--", str(local_path), f"{user}@{host}:{remote_path}"],
         check=False,
         timeout=timeout,
+        retry_classifier=classify_ssh_failure,
     )
 
 
@@ -986,7 +1254,7 @@ class BoxProfile:
     image: str = "ubuntu-24-04-x64"
     ssh_user: str = "skillbox"
     tailscale_hostname_prefix: str = "skillbox"
-    skillbox_repo: str = "https://github.com/build000r/skillbox.git"
+    skillbox_repo: str = "https://github.com/example/skillbox.git"
     skillbox_branch: str = "main"
     storage: "BoxProfileStorage | None" = None
 
@@ -1580,7 +1848,7 @@ def load_profile(name: str) -> BoxProfile:
         image=data.get("image", "ubuntu-24-04-x64"),
         ssh_user=data.get("ssh_user", "skillbox"),
         tailscale_hostname_prefix=data.get("tailscale_hostname_prefix", "skillbox"),
-        skillbox_repo=data.get("skillbox_repo", "https://github.com/build000r/skillbox.git"),
+        skillbox_repo=data.get("skillbox_repo", "https://github.com/example/skillbox.git"),
         skillbox_branch=data.get("skillbox_branch", "main"),
         storage=storage,
     )
@@ -1630,24 +1898,196 @@ class Box:
     cloud_firewall_id: str | None = None
 
 
+INVENTORY_CORRUPT = "INVENTORY_CORRUPT"
+
+
+class InventoryCorruptError(RuntimeError):
+    """Raised when boxes.json exists but is not safe to trust."""
+
+    def __init__(self, path: Path, detail: str) -> None:
+        self.path = Path(path)
+        self.detail = detail
+        message = f"{INVENTORY_CORRUPT}: {path}: {detail}"
+        super().__init__(message)
+        self.payload = structured_error(
+            message,
+            error_type=INVENTORY_CORRUPT,
+            recovery_hint=(
+                "The box inventory was not loaded. Inspect the file, then rebuild "
+                "from the append-only journal if appropriate."
+            ),
+            next_actions=[
+                "python3 scripts/box.py inventory-rebuild --from-journal --format json",
+                f"cp {path} {path}.corrupt",
+            ],
+        )
+
+
+def _inventory_box_from_item(item: Any, *, index: int, path: Path) -> Box:
+    if not isinstance(item, dict):
+        raise InventoryCorruptError(path, f"boxes[{index}] must be an object")
+    if not isinstance(item.get("id"), str) or not item["id"].strip():
+        raise InventoryCorruptError(path, f"boxes[{index}].id must be a non-empty string")
+    normalized = {k: v for k, v in item.items() if k in Box.__dataclass_fields__}
+    normalized.setdefault("profile", "")
+    normalized.setdefault("state", "creating")
+    if normalized["state"] not in STATES:
+        raise InventoryCorruptError(path, f"boxes[{index}].state {normalized['state']!r} is not valid")
+    return Box(**normalized)
+
+
+def _boxes_from_inventory_payload(data: Any, *, path: Path) -> list[Box]:
+    if data is None:
+        return []
+    if not isinstance(data, dict):
+        raise InventoryCorruptError(path, "top-level inventory must be an object")
+    raw_boxes = data.get("boxes", [])
+    if not isinstance(raw_boxes, list):
+        raise InventoryCorruptError(path, "top-level boxes field must be a list")
+    return [
+        _inventory_box_from_item(item, index=index, path=path)
+        for index, item in enumerate(raw_boxes)
+    ]
+
+
+def _inventory_payload(boxes: list[Box]) -> dict[str, Any]:
+    return {"boxes": [asdict(b) for b in boxes]}
+
+
 def load_inventory() -> list[Box]:
     path = inventory_path()
     if not path.is_file():
         return []
-    data = json.loads(path.read_text(encoding="utf-8"))
-    boxes = []
-    for item in data.get("boxes", []):
-        boxes.append(Box(**{k: v for k, v in item.items() if k in Box.__dataclass_fields__}))
-    return boxes
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise InventoryCorruptError(path, f"invalid JSON: {exc}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"Could not read inventory {path}: {exc}") from exc
+    return _boxes_from_inventory_payload(data, path=path)
 
 
-def save_inventory(boxes: list[Box]) -> None:
-    path = inventory_path()
+def _append_inventory_journal(entries: list[dict[str, Any]], *, inventory: Path) -> None:
+    if not entries:
+        return
+    path = inventory_journal_path(inventory)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"boxes": [asdict(b) for b in boxes]}
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        for entry in entries:
+            os.write(fd, (json.dumps(entry, sort_keys=True, default=str) + "\n").encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _inventory_transition_entries(
+    current_payload: Any,
+    next_payload: dict[str, Any],
+    *,
+    actor: str,
+    reason: str,
+    path: Path,
+) -> list[dict[str, Any]]:
+    current_by_id = {
+        box.id: box
+        for box in _boxes_from_inventory_payload(current_payload, path=path)
+    }
+    entries: list[dict[str, Any]] = []
+    ts = datetime.now(timezone.utc).isoformat()
+    for box in _boxes_from_inventory_payload(next_payload, path=path):
+        previous = current_by_id.get(box.id)
+        from_state = previous.state if previous is not None else None
+        if from_state == box.state:
+            continue
+        entries.append(
+            {
+                "ts": ts,
+                "box_id": box.id,
+                "from_state": from_state,
+                "to_state": box.state,
+                "actor": actor,
+                "reason": reason,
+                "box": asdict(box),
+            }
+        )
+    return entries
+
+
+def read_inventory_journal(box_id: str | None = None) -> list[dict[str, Any]]:
+    path = inventory_journal_path()
+    if not path.is_file():
+        return []
+    entries: list[dict[str, Any]] = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if box_id is not None and entry.get("box_id") != box_id:
+            continue
+        entries.append(entry)
+    return entries
+
+
+def rebuild_inventory_from_journal() -> list[Box]:
+    boxes_by_id: dict[str, Box] = {}
+    created_at_by_id: dict[str, str] = {}
+    for entry in read_inventory_journal():
+        box_id = str(entry.get("box_id") or "").strip()
+        to_state = str(entry.get("to_state") or "").strip()
+        if not box_id or to_state not in STATES:
+            continue
+        ts = str(entry.get("ts") or "").strip()
+        snapshot = entry.get("box") if isinstance(entry.get("box"), dict) else {}
+        item = {k: v for k, v in snapshot.items() if k in Box.__dataclass_fields__}
+        item["id"] = box_id
+        item.setdefault("profile", "")
+        item["state"] = to_state
+        if ts:
+            created_at_by_id.setdefault(box_id, ts)
+            item.setdefault("created_at", created_at_by_id[box_id])
+            item["updated_at"] = ts
+        boxes_by_id[box_id] = Box(**item)
+    return [boxes_by_id[box_id] for box_id in sorted(boxes_by_id)]
+
+
+def save_inventory(
+    boxes: list[Box],
+    *,
+    actor: str | None = None,
+    reason: str = "inventory update",
+    journal: bool = True,
+    tolerate_corrupt: bool = False,
+) -> None:
+    path = inventory_path()
+    payload = _inventory_payload(boxes)
+    effective_actor = actor or os.environ.get("SKILLBOX_BOX_ACTOR", "").strip() or "cli"
+
+    def _replace_inventory(current: Any) -> dict[str, Any]:
+        current_payload = {"boxes": []} if tolerate_corrupt else (current if current is not None else {"boxes": []})
+        transitions = _inventory_transition_entries(
+            current_payload,
+            payload,
+            actor=effective_actor,
+            reason=reason,
+            path=path,
+        )
+        if journal:
+            _append_inventory_journal(transitions, inventory=path)
+        return payload
+
+    locked_inventory_update(
+        path,
+        _replace_inventory,
+        default={"boxes": []},
+        tolerate_corrupt=tolerate_corrupt,
+    )
 
 
 def find_box(boxes: list[Box], box_id: str) -> Box | None:
@@ -1657,7 +2097,9 @@ def find_box(boxes: list[Box], box_id: str) -> Box | None:
     return None
 
 
-def update_box(box: Box, **kwargs: Any) -> None:
+def update_box(box: Box, *, validate_transition: bool = False, **kwargs: Any) -> None:
+    if validate_transition and "state" in kwargs:
+        validate_box_state_transition(box.state, str(kwargs["state"]))
     for k, v in kwargs.items():
         if hasattr(box, k):
             setattr(box, k, v)
@@ -1668,11 +2110,20 @@ def inventory_ssh_target_snapshot(boxes: list[Box]) -> dict[str, str | None]:
     return {box.id: box.last_ssh_target for box in boxes}
 
 
-def persist_inventory_if_ssh_targets_changed(boxes: list[Box], before: dict[str, str | None]) -> None:
+def persist_inventory_if_ssh_targets_changed(
+    boxes: list[Box],
+    before: dict[str, str | None],
+    *,
+    enabled: bool = True,
+) -> bool:
+    if not enabled:
+        return False
     if inventory_ssh_target_snapshot(boxes) == before:
-        return
+        return False
     if inventory_path().is_file():
         save_inventory(boxes)
+        return True
+    return False
 
 
 def volume_payload(box: Box) -> dict[str, Any] | None:
@@ -1763,6 +2214,45 @@ def do_delete_droplet(droplet_id: str) -> bool:
         check=False,
     )
     return result.returncode == 0
+
+
+# Bounded read-after-delete confirmation for DigitalOcean eventual consistency.
+# We never spin: a single delete call followed by CONFIRM_DROPLET_ABSENT_ATTEMPTS
+# bounded reads (with backoff), then a truthful pending state if still listed.
+CONFIRM_DROPLET_ABSENT_ATTEMPTS = 3
+CONFIRM_DROPLET_ABSENT_BACKOFF_SECONDS = 2.0
+
+
+def confirm_droplet_absent(
+    droplet_id: str,
+    *,
+    attempts: int = CONFIRM_DROPLET_ABSENT_ATTEMPTS,
+    backoff_seconds: float = CONFIRM_DROPLET_ABSENT_BACKOFF_SECONDS,
+    sleep: Any = time.sleep,
+) -> bool:
+    """Read-after-delete confirmation that a droplet is truly gone.
+
+    Returns True only after `doctl compute droplet get` reports the droplet is
+    absent (404 / empty result -> do_get_droplet returns None). If the droplet is
+    still listed after a bounded number of attempts, returns False so the caller
+    keeps the inventory in a truthful pending state instead of lying `destroyed`.
+    A read error (doctl failure that is not a clean not-found) is treated as
+    *not confirmed* — we never assume absence we did not observe.
+    """
+    if not str(droplet_id or "").strip():
+        # Nothing to confirm; absence is vacuously true.
+        return True
+    last_attempt = max(1, attempts)
+    for attempt in range(1, last_attempt + 1):
+        try:
+            droplet = do_get_droplet(droplet_id)
+        except Exception:
+            droplet = {"_confirm_read_error": True}
+        if droplet is None:
+            return True
+        if attempt < last_attempt:
+            sleep(backoff_seconds * attempt)
+    return False
 
 
 def do_droplet_public_ip(droplet: dict[str, Any]) -> str | None:
@@ -3223,11 +3713,13 @@ def cmd_upgrade(
         ssh_target,
         "cd ~/skillbox && docker compose ps --format json 2>/dev/null | head -1",
         timeout=30,
+        retry_policy=SSH_READ_RETRY_POLICY,
     )
     verify_ok = verify_result.returncode == 0 and "workspace" in verify_result.stdout
     verify_detail = {
         "ssh_target": ssh_target,
         "container_running": verify_ok,
+        **_process_probe_metadata(verify_result),
     }
     _record_box_step(steps, is_json, "verify", "ok" if verify_ok else "fail", verify_detail)
     if not verify_ok:
@@ -3322,21 +3814,64 @@ def _cleanup_box_firewall(box: Box, steps: list[dict[str, Any]], *, is_json: boo
     return False
 
 
-def _destroy_box_droplet(box: Box, steps: list[dict[str, Any]], *, is_json: bool) -> bool:
-    if box.droplet_id:
-        try:
-            if not is_json:
-                print(f"[...] destroy  Deleting droplet {box.droplet_id}...")
-            if do_delete_droplet(box.droplet_id):
-                _box_down_step(steps, is_json, "destroy", "ok", f"droplet {box.droplet_id} deleted")
-                return True
-            _box_down_step(steps, is_json, "destroy", "fail", "doctl delete returned non-zero")
-        except Exception as exc:
-            _box_down_step(steps, is_json, "destroy", "fail", str(exc))
-        return False
+DESTROY_CONFIRMED_ABSENT = "confirmed-absent"
+DESTROY_PENDING = "destroy-pending"
+DESTROY_FAILED = "delete-failed"
 
-    _box_down_step(steps, is_json, "destroy", "skip", "no droplet id")
-    return True
+
+def _destroy_box_droplet(box: Box, steps: list[dict[str, Any]], *, is_json: bool) -> str:
+    """Delete the droplet, then CONFIRM absence via read-after-delete.
+
+    Returns one of:
+      - DESTROY_CONFIRMED_ABSENT: doctl delete succeeded AND a follow-up
+        `doctl compute droplet get` reported the droplet gone (404/empty). Only
+        this result lets the caller write the `destroyed` state.
+      - DESTROY_PENDING: delete succeeded but the droplet is still API-listed
+        after a bounded confirm-retry; inventory must stay truthful (the droplet
+        may still bill). Caller parks the box in `destroy-pending`.
+      - DESTROY_FAILED: the delete call itself failed (non-zero / exception);
+        inventory state is preserved for a clean retry.
+
+    The skip-without-droplet branch returns CONFIRMED_ABSENT: there is no droplet
+    to bill, so absence is vacuously confirmed.
+    """
+    if not box.droplet_id:
+        _box_down_step(steps, is_json, "destroy", "skip", "no droplet id")
+        return DESTROY_CONFIRMED_ABSENT
+
+    try:
+        if not is_json:
+            print(f"[...] destroy  Deleting droplet {box.droplet_id}...")
+        deleted = do_delete_droplet(box.droplet_id)
+    except Exception as exc:
+        _box_down_step(steps, is_json, "destroy", "fail", str(exc))
+        return DESTROY_FAILED
+
+    if not deleted:
+        _box_down_step(steps, is_json, "destroy", "fail", "doctl delete returned non-zero")
+        return DESTROY_FAILED
+
+    _box_down_step(steps, is_json, "destroy", "ok", f"droplet {box.droplet_id} delete requested")
+
+    # Read-after-delete: never trust the delete exit code alone. A delete that
+    # succeeds but leaves the droplet listed would otherwise become the most
+    # expensive lie — an inventory that says `destroyed` while DO still bills.
+    if not is_json:
+        print(f"[...] confirm  Verifying droplet {box.droplet_id} is gone...")
+    if confirm_droplet_absent(box.droplet_id):
+        _box_down_step(
+            steps, is_json, "confirm", "ok", f"droplet {box.droplet_id} confirmed absent via API read"
+        )
+        return DESTROY_CONFIRMED_ABSENT
+
+    _box_down_step(
+        steps,
+        is_json,
+        "confirm",
+        "warn",
+        f"droplet {box.droplet_id} delete requested but still API-listed; not marking destroyed",
+    )
+    return DESTROY_PENDING
 
 
 def _cleanup_box_volume(box: Box, steps: list[dict[str, Any]], *, is_json: bool) -> bool:
@@ -3418,6 +3953,39 @@ def _emit_box_down_destroy_failure(box: Box, box_id: str, steps: list[dict[str, 
     return EXIT_ERROR
 
 
+def _emit_box_down_destroy_pending(boxes: list[Box], box: Box, box_id: str, steps: list[dict[str, Any]], *, is_json: bool) -> int:
+    update_box(box, state="destroy-pending")
+    save_inventory(boxes)
+    message = (
+        f"Droplet delete was requested for box {box_id!r}, but DigitalOcean still lists the "
+        f"droplet (read-after-delete not yet confirmed). Inventory stays {box.state!r} so it does "
+        "not falsely report destroyed while the droplet may still bill."
+    )
+    next_actions = [f"box status {box_id}", f"box down {box_id}", "box list"]
+    payload = {
+        "box_id": box_id,
+        "dry_run": False,
+        "steps": steps,
+        "next_actions": next_actions,
+    }
+    payload.update(
+        structured_error(
+            message,
+            error_type="destroy_pending",
+            recovery_hint=(
+                "DigitalOcean delete is eventually consistent. Re-run box down to re-confirm "
+                "absence; if it persists, verify the droplet in the DO console."
+            ),
+            next_actions=next_actions,
+        )
+    )
+    if is_json:
+        emit_json(payload)
+    else:
+        print(message, file=sys.stderr)
+    return EXIT_ERROR
+
+
 def _emit_box_down_volume_failure(boxes: list[Box], box: Box, box_id: str, steps: list[dict[str, Any]], *, is_json: bool) -> int:
     update_box(box, state="volume-cleanup-failed")
     save_inventory(boxes)
@@ -3457,8 +4025,18 @@ def _emit_box_down_success(boxes: list[Box], box: Box, box_id: str, steps: list[
     return EXIT_OK
 
 
-def cmd_down(box_id: str, *, dry_run: bool, fmt: str) -> int:
+def cmd_down(
+    box_id: str,
+    *,
+    dry_run: bool,
+    fmt: str,
+    confirmed: bool = True,
+    confirmation_mismatch: bool = False,
+) -> int:
     is_json = fmt == "json"
+    if not dry_run and not confirmed:
+        return _emit_down_confirmation_required(box_id, fmt=fmt, mismatch=confirmation_mismatch)
+
     steps: list[dict[str, Any]] = []
     boxes = load_inventory()
     box = find_box(boxes, box_id)
@@ -3484,6 +4062,9 @@ def cmd_down(box_id: str, *, dry_run: bool, fmt: str) -> int:
         return _emit_box_down_dry_run(box, box_id, steps, is_json=is_json)
 
     if box.state == "volume-cleanup-failed":
+        # Droplet already confirmed gone on a prior run; only volume cleanup is
+        # outstanding. Rerun is idempotent: re-attempt volume cleanup and
+        # converge to destroyed when the volume can be released.
         _box_down_step(
             steps,
             is_json,
@@ -3491,18 +4072,79 @@ def cmd_down(box_id: str, *, dry_run: bool, fmt: str) -> int:
             "skip",
             "droplet was already destroyed; retrying volume cleanup",
         )
-        if not _cleanup_box_volume(box, steps, is_json=is_json):
-            return _emit_box_down_volume_failure(boxes, box, box_id, steps, is_json=is_json)
-        return _emit_box_down_success(boxes, box, box_id, steps, is_json=is_json)
+        return _finish_box_down_after_droplet_gone(boxes, box, box_id, steps, is_json=is_json)
+
+    if box.state == "destroy-pending":
+        # A prior run requested droplet delete but could not confirm absence.
+        # Skip drain/tailnet/firewall (already attempted) and re-run the
+        # read-after-delete confirmation only. Idempotent: converges once DO
+        # finishes the delete; stays pending while the droplet is still listed.
+        _box_down_step(steps, is_json, "drain", "skip", "droplet delete already requested")
+        _box_down_step(steps, is_json, "remove", "skip", "droplet delete already requested")
+        _box_down_step(steps, is_json, "firewall", "skip", "droplet delete already requested")
+        return _resume_box_down_confirm_destroy(boxes, box, box_id, steps, is_json=is_json)
 
     ssh_target = _drain_box_for_down(box, steps, is_json=is_json)
     update_box(box, state="draining")
     save_inventory(boxes)
     _remove_box_from_tailnet(box, ssh_target, steps, is_json=is_json)
     _cleanup_box_firewall(box, steps, is_json=is_json)
-    if not _destroy_box_droplet(box, steps, is_json=is_json):
+    return _finish_box_down_destroy_phase(boxes, box, box_id, steps, is_json=is_json)
+
+
+def _finish_box_down_destroy_phase(
+    boxes: list[Box], box: Box, box_id: str, steps: list[dict[str, Any]], *, is_json: bool
+) -> int:
+    """Run droplet destroy + read-after-delete confirm, then volume cleanup.
+
+    `destroyed` is only ever written after a confirmed-absent observation:
+      - DESTROY_FAILED: preserve state, structured destroy_failed error.
+      - DESTROY_PENDING: park in destroy-pending (truthful; droplet may bill).
+      - DESTROY_CONFIRMED_ABSENT: safe to proceed to volume cleanup.
+    """
+    destroy_status = _destroy_box_droplet(box, steps, is_json=is_json)
+    if destroy_status == DESTROY_FAILED:
         save_inventory(boxes)
         return _emit_box_down_destroy_failure(box, box_id, steps, is_json=is_json)
+    if destroy_status == DESTROY_PENDING:
+        return _emit_box_down_destroy_pending(boxes, box, box_id, steps, is_json=is_json)
+    return _finish_box_down_after_droplet_gone(boxes, box, box_id, steps, is_json=is_json)
+
+
+def _resume_box_down_confirm_destroy(
+    boxes: list[Box], box: Box, box_id: str, steps: list[dict[str, Any]], *, is_json: bool
+) -> int:
+    """Resume path for destroy-pending: re-confirm absence without re-deleting.
+
+    The droplet delete was already requested; we only need the read-after-delete
+    confirmation to converge. If the droplet is gone we proceed to volume
+    cleanup; otherwise the box stays in destroy-pending.
+    """
+    if not box.droplet_id or confirm_droplet_absent(box.droplet_id):
+        detail = (
+            "no droplet id" if not box.droplet_id
+            else f"droplet {box.droplet_id} confirmed absent via API read"
+        )
+        _box_down_step(steps, is_json, "confirm", "ok", detail)
+        return _finish_box_down_after_droplet_gone(boxes, box, box_id, steps, is_json=is_json)
+    _box_down_step(
+        steps,
+        is_json,
+        "confirm",
+        "warn",
+        f"droplet {box.droplet_id} still API-listed; staying in destroy-pending",
+    )
+    return _emit_box_down_destroy_pending(boxes, box, box_id, steps, is_json=is_json)
+
+
+def _finish_box_down_after_droplet_gone(
+    boxes: list[Box], box: Box, box_id: str, steps: list[dict[str, Any]], *, is_json: bool
+) -> int:
+    """Droplet is confirmed gone — run volume cleanup and finalize.
+
+    Volume cleanup failing here is not a billing lie (the droplet is gone), so we
+    park in volume-cleanup-failed (queryable + resumable) rather than destroyed.
+    """
     if not _cleanup_box_volume(box, steps, is_json=is_json):
         return _emit_box_down_volume_failure(boxes, box, box_id, steps, is_json=is_json)
     return _emit_box_down_success(boxes, box, box_id, steps, is_json=is_json)
@@ -3684,13 +4326,57 @@ def cmd_register(
 
 
 # ---------------------------------------------------------------------------
+# inventory rebuild
+# ---------------------------------------------------------------------------
+
+def cmd_inventory_rebuild(*, from_journal: bool, fmt: str) -> int:
+    is_json = fmt == "json"
+    if not from_journal:
+        msg = "inventory-rebuild requires --from-journal."
+        if is_json:
+            emit_json(structured_error(msg, error_type="invalid_request", next_actions=["box inventory-rebuild --from-journal"]))
+        else:
+            print(msg, file=sys.stderr)
+        return EXIT_ERROR
+
+    boxes = rebuild_inventory_from_journal()
+    save_inventory(
+        boxes,
+        reason="inventory rebuild from journal",
+        journal=False,
+        tolerate_corrupt=True,
+    )
+    payload = {
+        "ok": True,
+        "rebuilt": len(boxes),
+        "inventory_path": str(inventory_path()),
+        "journal_path": str(inventory_journal_path()),
+        "boxes": [asdict(box) for box in boxes],
+        "next_actions": ["box list", "box status <box-id> --history"],
+    }
+    if is_json:
+        emit_json(payload)
+    else:
+        print(f"Rebuilt {len(boxes)} box inventory entr{'y' if len(boxes) == 1 else 'ies'} from journal.")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
 # box status
 # ---------------------------------------------------------------------------
 
-def cmd_status(box_id: str | None, *, fmt: str) -> int:
+def cmd_status(box_id: str | None, *, fmt: str, write_cache: bool = True, history: bool = False) -> int:
     is_json = fmt == "json"
     boxes = load_inventory()
     ssh_target_snapshot = inventory_ssh_target_snapshot(boxes)
+
+    if history and not box_id:
+        msg = "--history requires a box id."
+        if is_json:
+            emit_json(structured_error(msg, error_type="invalid_request", next_actions=["box status <box-id> --history"]))
+        else:
+            print(msg, file=sys.stderr)
+        return EXIT_ERROR
 
     if box_id:
         box = find_box(boxes, box_id)
@@ -3703,7 +4389,19 @@ def cmd_status(box_id: str | None, *, fmt: str) -> int:
             return EXIT_ERROR
 
         status = box_health(box)
-        persist_inventory_if_ssh_targets_changed(boxes, ssh_target_snapshot)
+        if history:
+            status["history"] = read_inventory_journal(box.id)
+        cache_written = persist_inventory_if_ssh_targets_changed(
+            boxes,
+            ssh_target_snapshot,
+            enabled=write_cache,
+        )
+        if is_json:
+            status["cache"] = {
+                "write_cache": write_cache,
+                "inventory_updated": cache_written,
+                "field": "last_ssh_target",
+            }
         if is_json:
             emit_json(status)
         else:
@@ -3721,7 +4419,17 @@ def cmd_status(box_id: str | None, *, fmt: str) -> int:
             "boxes": statuses,
             "next_actions": ["box up <id> --profile <name>", "box register <id> --host <tailscale-hostname>"] if not statuses else [],
         }
-        persist_inventory_if_ssh_targets_changed(boxes, ssh_target_snapshot)
+        cache_written = persist_inventory_if_ssh_targets_changed(
+            boxes,
+            ssh_target_snapshot,
+            enabled=write_cache,
+        )
+        if is_json:
+            payload["cache"] = {
+                "write_cache": write_cache,
+                "inventory_updated": cache_written,
+                "field": "last_ssh_target",
+            }
         if is_json:
             emit_json(payload)
         else:
@@ -3761,9 +4469,27 @@ def box_health(box: Box) -> dict[str, Any]:
         "browser_url": phone_url,
         "magicdns_url": None,
         "network_checks": {},
+        "remote_probes": {},
     }
 
     if box.state in ("destroyed", "creating"):
+        return status
+
+    # Teardown-pending states are surfaced truthfully without probing SSH: the
+    # droplet is being torn down (or already gone) so there is nothing to reach.
+    # box-status and box-list both expose the exact retry command.
+    if box.state in ("destroy-pending", "volume-cleanup-failed"):
+        if box.state == "destroy-pending":
+            status["teardown_pending"] = {
+                "reason": "droplet delete requested but not yet confirmed absent via API read",
+                "billing_risk": True,
+            }
+        else:
+            status["teardown_pending"] = {
+                "reason": "droplet confirmed gone but volume cleanup did not complete",
+                "billing_risk": False,
+            }
+        status["next_actions"] = [f"box down {box.id}", f"box status {box.id}", "box list"]
         return status
 
     ssh_target = resolve_box_ssh_target(box, max_wait=5, interval=1, prefer_public=box.state == "ssh-ready")
@@ -3776,7 +4502,12 @@ def box_health(box: Box) -> dict[str, Any]:
                 box.ssh_user, ssh_target,
                 "cd ~/skillbox && docker compose ps --format json 2>/dev/null | head -1",
                 timeout=15,
+                retry_policy=SSH_READ_RETRY_POLICY,
             )
+            status["remote_probes"]["container"] = {
+                "returncode": container_probe.returncode,
+                **_process_probe_metadata(container_probe),
+            }
             status["container_running"] = container_probe.returncode == 0 and "workspace" in container_probe.stdout
 
     network_checks = box_network_health(box)
@@ -3850,6 +4581,16 @@ def print_box_status_text(status: dict[str, Any]) -> None:
         for v in violations:
             severity = v.get("severity", "warning")
             print(f"    - [{severity}] {v.get('message', v.get('type', 'unknown'))}")
+    history = status.get("history") or []
+    if history:
+        print("  history:")
+        for entry in history:
+            print(
+                "    - "
+                f"{entry.get('ts', 'unknown')} "
+                f"{entry.get('from_state')} -> {entry.get('to_state')} "
+                f"({entry.get('reason') or 'no reason'})"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -3937,15 +4678,40 @@ def cmd_ssh(box_id: str) -> int:
 # box list
 # ---------------------------------------------------------------------------
 
+def _teardown_pending_hint(box: Box) -> dict[str, Any] | None:
+    """Per-box retry hint for teardown-pending boxes, surfaced from box-list."""
+    if box.state == "destroy-pending":
+        return {
+            "box_id": box.id,
+            "state": box.state,
+            "reason": "droplet delete requested but not yet confirmed absent via API read",
+            "billing_risk": True,
+            "next_action": f"box down {box.id}",
+        }
+    if box.state == "volume-cleanup-failed":
+        return {
+            "box_id": box.id,
+            "state": box.state,
+            "reason": "droplet confirmed gone but volume cleanup did not complete",
+            "billing_risk": False,
+            "next_action": f"box down {box.id}",
+        }
+    return None
+
+
 def cmd_list(*, fmt: str) -> int:
     boxes = load_inventory()
     active = [b for b in boxes if b.state != "destroyed"]
+    pending = [hint for hint in (_teardown_pending_hint(b) for b in active) if hint]
 
     if fmt == "json":
-        emit_json({
+        payload: dict[str, Any] = {
             "boxes": [asdict(b) for b in active],
             "next_actions": ["box up <id> --profile <name>", "box register <id> --host <tailscale-hostname>"] if not active else [],
-        })
+        }
+        if pending:
+            payload["teardown_pending"] = pending
+        emit_json(payload)
     else:
         if not active:
             print("No active boxes.")
@@ -3958,6 +4724,8 @@ def cmd_list(*, fmt: str) -> int:
                     f"  {b.id}  state={b.state}  ts={ts}  ip={b.droplet_ip}  "
                     f"profile={b.profile}  mode={b.management_mode}  state_root={root}  volume={volume}"
                 )
+            for hint in pending:
+                print(f"    ! {hint['box_id']} teardown pending ({hint['state']}); retry: {hint['next_action']}")
     return EXIT_OK
 
 
@@ -4000,7 +4768,43 @@ class BoxArgumentParser(argparse.ArgumentParser):
                 f"{message}\nDid you mean: `{self.prog} {suggestion}`?\n"
                 f"Discover commands: `{self.prog} capabilities --json`."
             )
+        if _ARGPARSE_JSON_ERRORS:
+            next_actions = ["box.py capabilities --json"]
+            if suggestion:
+                next_actions.insert(0, f"box.py {suggestion} --format json")
+            emit_json_stderr(
+                structured_cli_error(
+                    message,
+                    error_code="argparse_error",
+                    next_actions=next_actions,
+                )
+            )
+            raise SystemExit(EXIT_DRIFT)
         super().error(message)
+
+
+def _argv_requests_json_diagnostics(argv: list[str]) -> bool:
+    for index, token in enumerate(argv):
+        if token in BOX_JSON_FLAG_ALIASES:
+            return True
+        if token == "--format" and index + 1 < len(argv) and argv[index + 1] == "json":
+            return True
+        if token == "--format=json":
+            return True
+    return False
+
+
+def _emit_argparse_warning(message: str, *, is_json: bool) -> None:
+    if is_json:
+        emit_json_stderr(
+            {
+                "ok": True,
+                "warning": message,
+                "warning_code": "argument_normalized",
+            }
+        )
+    else:
+        print(message, file=sys.stderr)
 
 
 def _normalize_agent_argv(argv: list[str]) -> tuple[list[str], list[str]]:
@@ -4094,6 +4898,8 @@ def build_parser() -> argparse.ArgumentParser:
     down_parser = subparsers.add_parser("down", help="Drain and destroy a box.")
     down_parser.add_argument("box_id", type=_validate_box_id, help="Box identifier.")
     down_parser.add_argument("--dry-run", action="store_true")
+    down_parser.add_argument("--yes", action="store_true", help="Confirm real teardown without an interactive prompt.")
+    down_parser.add_argument("--confirm", default="", metavar="BOX_ID", help="Confirm real teardown by repeating the box id.")
     down_parser.add_argument("--format", choices=("text", "json"), default="text")
 
     upgrade_parser = subparsers.add_parser("upgrade", help="Upgrade an existing ready box from a pinned deploy manifest.")
@@ -4104,7 +4910,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_parser = subparsers.add_parser("status", help="Check health of one or all boxes.")
     status_parser.add_argument("box_id", nargs="?", default=None, type=_validate_box_id, help="Box identifier (omit for all).")
+    status_parser.add_argument(
+        "--write-cache",
+        action="store_true",
+        help="Opt in to updating cached last_ssh_target values in workspace/boxes.json after probes.",
+    )
+    status_parser.add_argument("--history", action="store_true", help="Show append-only transition history for one box.")
     status_parser.add_argument("--format", choices=("text", "json"), default="text")
+
+    rebuild_parser = subparsers.add_parser("inventory-rebuild", help="Rebuild boxes.json from the append-only transition journal.")
+    rebuild_parser.add_argument("--from-journal", action="store_true", help="Recover from .skillbox-state/boxes-journal.jsonl.")
+    rebuild_parser.add_argument("--format", choices=("text", "json"), default="text")
 
     posture_proof_parser = subparsers.add_parser("posture-proof", help="Generate a network posture proof artifact for a box.")
     posture_proof_parser.add_argument("box_id", type=_validate_box_id, help="Box identifier.")
@@ -4145,15 +4961,59 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    load_dotenv(REPO_ROOT / ".env")
-    load_dotenv(REPO_ROOT / ".env.box")
+def _emit_down_confirmation_required(box_id: str, *, fmt: str, mismatch: bool = False) -> int:
+    message = (
+        f"Refusing to destroy box {box_id!r}: pass --yes or --confirm {box_id} for real teardown. "
+        f"Use --dry-run to preview without destroying infrastructure."
+    )
+    if mismatch:
+        message = (
+            f"Refusing to destroy box {box_id!r}: --confirm must exactly match the box id. "
+            f"Use --confirm {box_id}, --yes, or --dry-run."
+        )
+    payload = structured_cli_error(
+        message,
+        error_code="confirmation_required",
+        next_actions=[
+            f"python3 scripts/box.py down {box_id} --dry-run --format json",
+            f"python3 scripts/box.py down {box_id} --confirm {box_id} --format json",
+        ],
+    )
+    if fmt == "json":
+        emit_json(payload)
+    else:
+        print(message, file=sys.stderr)
+    return EXIT_ERROR
 
+
+def main(argv: list[str] | None = None) -> int:
+    global _ARGPARSE_JSON_ERRORS
+    raw_argv = sys.argv[1:] if argv is None else argv
     parser = build_parser()
-    normalized_argv, diagnostics = _normalize_agent_argv(sys.argv[1:] if argv is None else argv)
-    args = parser.parse_args(normalized_argv)
+    normalized_argv, diagnostics = _normalize_agent_argv(raw_argv)
+    json_errors_requested = (
+        _argv_requests_json_diagnostics(raw_argv)
+        or _argv_requests_json_diagnostics(normalized_argv)
+    )
+    _ARGPARSE_JSON_ERRORS = json_errors_requested
+    try:
+        args = parser.parse_args(normalized_argv)
+    finally:
+        _ARGPARSE_JSON_ERRORS = False
+    json_diagnostics = json_errors_requested or getattr(args, "format", "text") == "json"
     for diagnostic in diagnostics:
-        print(diagnostic, file=sys.stderr)
+        _emit_argparse_warning(diagnostic, is_json=json_diagnostics)
+
+    if args.command == "down":
+        down_confirmed = bool(args.dry_run or args.yes or args.confirm == args.box_id)
+        confirmation_mismatch = bool(args.confirm and args.confirm != args.box_id and not args.yes)
+    else:
+        down_confirmed = False
+        confirmation_mismatch = False
+
+    if args.command in BOX_SECRET_LOADING_COMMANDS and (args.command != "down" or down_confirmed):
+        load_operator_secret(".env")
+        load_operator_secret(".env.box")
 
     try:
         if args.command == "capabilities":
@@ -4181,7 +5041,13 @@ def main(argv: list[str] | None = None) -> int:
                 fmt=args.format,
             )
         if args.command == "down":
-            return cmd_down(args.box_id, dry_run=args.dry_run, fmt=args.format)
+            return cmd_down(
+                args.box_id,
+                dry_run=args.dry_run,
+                fmt=args.format,
+                confirmed=down_confirmed,
+                confirmation_mismatch=confirmation_mismatch,
+            )
         if args.command == "upgrade":
             return cmd_upgrade(
                 args.box_id,
@@ -4190,7 +5056,9 @@ def main(argv: list[str] | None = None) -> int:
                 fmt=args.format,
             )
         if args.command == "status":
-            return cmd_status(args.box_id, fmt=args.format)
+            return cmd_status(args.box_id, fmt=args.format, write_cache=args.write_cache, history=args.history)
+        if args.command == "inventory-rebuild":
+            return cmd_inventory_rebuild(from_journal=args.from_journal, fmt=args.format)
         if args.command == "posture-proof":
             return cmd_posture_proof(args.box_id, fmt=args.format)
         if args.command == "ssh":
@@ -4211,6 +5079,9 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_list(fmt=args.format)
         if args.command == "profiles":
             return cmd_profiles(fmt=args.format)
+    except InventoryCorruptError as exc:
+        emit_json(exc.payload)
+        return EXIT_ERROR
     except RuntimeError as exc:
         emit_json(structured_error(str(exc)))
         return EXIT_ERROR

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install with:
-#   curl -fsSL https://raw.githubusercontent.com/build000r/skillbox/main/install.sh | bash -s -- --client personal
+#   curl -fsSL https://raw.githubusercontent.com/example/skillbox/main/install.sh | bash -s -- --client personal
 set -euo pipefail
 shopt -s lastpipe 2>/dev/null || true
 umask 022
@@ -8,7 +8,8 @@ umask 022
 PROJECT_NAME="skillbox"
 PROJECT_LABEL="skillbox installer"
 PROJECT_DESCRIPTION="Source-distributed bootstrap for first-box"
-DEFAULT_REPO_URL="https://github.com/build000r/skillbox.git"
+DEFAULT_GITHUB_REPO="${SKILLBOX_INSTALL_GITHUB_REPO:-example/skillbox}"
+DEFAULT_REPO_URL="${SKILLBOX_INSTALL_REPO_URL:-https://github.com/${DEFAULT_GITHUB_REPO}.git}"
 DEFAULT_REF_FALLBACK="main"
 MIN_DISK_KB=102400
 
@@ -458,7 +459,7 @@ resolve_default_ref() {
   fi
   if have_cmd curl; then
     local resolved=""
-    resolved="$(curl -fsSL "${PROXY_ARGS[@]}" "https://api.github.com/repos/build000r/skillbox/releases/latest" 2>/dev/null | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1 || true)"
+    resolved="$(curl -fsSL "${PROXY_ARGS[@]}" "https://api.github.com/repos/${DEFAULT_GITHUB_REPO}/releases/latest" 2>/dev/null | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1 || true)"
     if [[ -n "${resolved}" ]]; then
       REF="${resolved}"
       return 0
@@ -475,9 +476,9 @@ download_source_tarball() {
   if [[ "${REF}" == "${DEFAULT_REF_FALLBACK}" ]]; then
     ref_kind="heads"
   fi
-  url="https://github.com/build000r/skillbox/archive/refs/${ref_kind}/${REF}.tar.gz"
+  url="https://github.com/${DEFAULT_GITHUB_REPO}/archive/refs/${ref_kind}/${REF}.tar.gz"
   if ! curl -fsSL "${PROXY_ARGS[@]}" "${url}" -o "${dest}"; then
-    url="https://github.com/build000r/skillbox/archive/refs/heads/${DEFAULT_REF_FALLBACK}.tar.gz"
+    url="https://github.com/${DEFAULT_GITHUB_REPO}/archive/refs/heads/${DEFAULT_REF_FALLBACK}.tar.gz"
     curl -fsSL "${PROXY_ARGS[@]}" "${url}" -o "${dest}"
   fi
 }
@@ -486,7 +487,6 @@ copy_checkout() {
   local src="$1"
   local dest="$2"
   local rel=""
-  local always_copy=""
 
   if [[ "${src}" == "${dest}" ]]; then
     STATUS_SOURCE="reused"
@@ -501,12 +501,11 @@ copy_checkout() {
       mkdir -p "${dest}/$(dirname "${rel}")"
       cp -pR "${src}/${rel}" "${dest}/${rel}"
     done < <(git -C "${src}" ls-files -z --cached --modified --others --exclude-standard)
-    for always_copy in ".mcp.json"; do
-      if [[ -f "${src}/${always_copy}" ]]; then
-        mkdir -p "${dest}/$(dirname "${always_copy}")"
-        cp -p "${src}/${always_copy}" "${dest}/${always_copy}"
-      fi
-    done
+    local always_copy=".mcp.json"
+    if [[ -f "${src}/${always_copy}" ]]; then
+      mkdir -p "${dest}/$(dirname "${always_copy}")"
+      cp -p "${src}/${always_copy}" "${dest}/${always_copy}"
+    fi
   else
     rsync -a \
       --exclude '.git/' \
@@ -710,7 +709,16 @@ preflight_checks() {
 
 hydrate_env() {
   local target_repo="$1"
-  local env_file="${target_repo}/.env"
+  # Secrets live OUTSIDE the workspace bind mount so in-container agents can't read
+  # them. Default to ${target_repo}/.skillbox-state/operator, honoring an exported
+  # SKILLBOX_STATE_ROOT (relative paths resolve against target_repo).
+  local state_root="${SKILLBOX_STATE_ROOT:-./.skillbox-state}"
+  local operator_dir
+  case "${state_root}" in
+    /*) operator_dir="${state_root}/operator" ;;
+    *)  operator_dir="${target_repo}/${state_root#./}/operator" ;;
+  esac
+  local env_file="${operator_dir}/.env"
   local env_example="${target_repo}/.env.example"
   local cass_path=""
   local cm_path=""
@@ -724,6 +732,8 @@ hydrate_env() {
     err "Missing ${env_example}"
     exit 1
   fi
+  mkdir -p "${operator_dir}"
+  chmod 700 "${operator_dir}" 2>/dev/null || true
   if [[ -f "${env_file}" ]]; then
     STATUS_ENV="kept"
     return 0
@@ -821,7 +831,14 @@ PY
 
 ensure_local_state_layout() {
   local target_repo="$1"
-  local env_file="${target_repo}/.env"
+  # The operator .env now lives under the state-root operator dir (out of the mount).
+  local state_root="${SKILLBOX_STATE_ROOT:-./.skillbox-state}"
+  local operator_dir
+  case "${state_root}" in
+    /*) operator_dir="${state_root}/operator" ;;
+    *)  operator_dir="${target_repo}/${state_root#./}/operator" ;;
+  esac
+  local env_file="${operator_dir}/.env"
   local dir_path=""
 
   if [[ "${DRY_RUN}" -eq 1 ]]; then
@@ -867,6 +884,7 @@ monoserver_root = resolve_host_path(monoserver_raw)
 
 dirs = [
     state_root,
+    state_root / "operator",
     state_root / "home" / ".claude",
     state_root / "home" / ".codex",
     state_root / "home" / ".local",
@@ -1100,6 +1118,8 @@ print_summary() {
   lines+=("up: ${STATUS_UP}")
   lines+=("verify: ${STATUS_VERIFY}")
   lines+=("private source of truth lives under ${FIRST_BOX_PRIVATE_REPO:-${PRIVATE_PATH}}")
+  lines+=("operator secrets live under ${REPO_DIR}/.skillbox-state/operator/ (out of the workspace mount)")
+  lines+=("place box-provisioning secrets in ${REPO_DIR}/.skillbox-state/operator/.env.box")
   lines+=("sand/${CLIENT_ID} is generated and can be rebuilt")
   lines+=("uninstall: rm -rf ${REPO_DIR} ${FIRST_BOX_PRIVATE_REPO:-${PRIVATE_PATH}}")
   draw_box '\033[0;32m' "${lines[@]}"

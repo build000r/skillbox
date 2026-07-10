@@ -3,7 +3,7 @@
 ## Scope
 
 - Requested window: full repository history.
-- Repo: `build000r/skillbox`.
+- Repo: `example/skillbox`.
 - Local head researched: `9157d0e` on 2026-04-29.
 - Commit count at local head: 123 non-merge-inclusive commits.
 

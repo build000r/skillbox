@@ -2,7 +2,7 @@
 
 Standalone loader for ``skillbox-config/machines.yaml``. It lets policy readers
 stop branching on ``socket.gethostname()`` and stop hard-coding root paths like
-``/srv/skillbox/repos`` vs ``/Users/b/repos`` all over the place.
+``/srv/skillbox/repos`` vs ``/Users/operator/repos`` all over the place.
 
 This module is intentionally **standalone**: it is NOT wired into policy
 evaluation or any existing code path yet. Consumers land in sibling beads.
@@ -550,6 +550,16 @@ def current_profile(
     """Resolve the current machine profile, loading config if not supplied."""
     config = config if config is not None else load_machines_config(env=env)
     return config.current_profile(hostname=hostname, env=env)
+
+
+def repo_roots_for_machine(config: MachinesConfig, machine_id: str) -> list[str]:
+    """Expanded repo roots for a declared machine profile, longest first."""
+    profile = config.require(machine_id)
+    return sorted(
+        _expand_roots_for_match(profile.repo_roots, profile),
+        key=len,
+        reverse=True,
+    )
 
 
 # ---------------------------------------------------------------------------

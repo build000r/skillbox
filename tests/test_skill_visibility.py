@@ -47,6 +47,7 @@ from runtime_manager.skill_visibility import (  # noqa: E402
     toggle_overlay,
     unlink_overlay_scoped_skills,
 )
+from runtime_manager.errors import PRUNE_SKIPPED_PINNED  # noqa: E402
 from runtime_manager.shared import directory_tree_sha256  # noqa: E402
 
 
@@ -191,6 +192,14 @@ class SkillVisibilityTests(unittest.TestCase):
             self.assertEqual(action["status"], "removed_directory")
             self.assertFalse(directory_path.exists())
 
+            pinned_path = root / "pinned-skill"
+            pinned_path.mkdir()
+            action = {"pinned": True}
+            _apply_lifecycle_unlink(action, pinned_path, dry_run=False, allow_directories=True)
+            self.assertEqual(action["status"], "skipped_pinned")
+            self.assertEqual(action["code"], PRUNE_SKIPPED_PINNED)
+            self.assertTrue(pinned_path.exists())
+
     def test_lifecycle_prune_sync_and_target_state_helpers_classify_visibility(self) -> None:
         visibility = {
             "issues": {
@@ -255,6 +264,55 @@ class SkillVisibilityTests(unittest.TestCase):
                 _target_states_for_skill(skillset, "present-skill", {})[0]["state"],
                 "present",
             )
+
+    def test_lifecycle_prune_plan_respects_override_firewall_decisions(self) -> None:
+        visibility = {
+            "visibility_decisions": [
+                {
+                    "name": "alpha",
+                    "availability": "override",
+                    "state": "pinned",
+                    "override_action": "pin_on",
+                    "layer": "repo-override-file",
+                    "winning_layer": "repo-override-file",
+                },
+                {
+                    "name": "beta",
+                    "availability": "override",
+                    "state": "disabled",
+                    "override_action": "pin_off",
+                    "layer": "repo-override-file",
+                    "winning_layer": "repo-override-file",
+                },
+            ],
+            "occurrences": [
+                {
+                    "name": "beta",
+                    "availability": "installed",
+                    "path": "/project/beta",
+                    "layer": "project:claude",
+                }
+            ],
+            "issues": {
+                "scope_violations": [
+                    {"name": "alpha", "path": "/project/alpha", "layer": "project:claude"},
+                    {"name": "alpha", "path": "/project/alpha", "layer": "project:claude"},
+                ],
+                "global_not_allowed": [],
+                "extra_global": [],
+                "broken_global": [],
+                "broken_project": [],
+            },
+        }
+        skipped: list[dict[str, object]] = []
+
+        actions = _plan_skill_prune_actions(visibility, None, from_scope="project", skipped=skipped)
+
+        self.assertEqual([action["skill"] for action in actions], ["beta"])
+        self.assertEqual(actions[0]["reason"], "pin_off")
+        self.assertEqual([item["name"] for item in skipped], ["alpha"])
+        self.assertEqual(skipped[0]["reason"], "pinned")
+        self.assertEqual(skipped[0]["winning_layer"], "repo-override-file")
 
     def test_scope_filters_removal_plans_and_compact_payload_helpers(self) -> None:
         self.assertTrue(_scope_filter_matches({"layer": "global:codex"}, "all"))
@@ -1520,27 +1578,27 @@ class SkillVisibilityTests(unittest.TestCase):
             self.assertEqual(violations[0]["scope_rule"], "restricted-local")
 
     def test_matched_clients_prefers_repo_specific_overlay_on_equal_prefix(self) -> None:
-        cwd = Path("/tmp/repos/htma_server")
+        cwd = Path("/tmp/repos/api_server")
         model = {
             "clients": [
                 {
                     "id": "cca",
                     "label": "CCA",
-                    "default_cwd": "/tmp/repos/cca-website",
-                    "context": {"cwd_match": ["/tmp/repos/htma_server"]},
+                    "default_cwd": "/tmp/repos/example-website",
+                    "context": {"cwd_match": ["/tmp/repos/api_server"]},
                 },
                 {
-                    "id": "htma",
-                    "label": "HTMA",
-                    "default_cwd": "/tmp/repos/htma",
-                    "context": {"cwd_match": ["/tmp/repos/htma_server"]},
+                    "id": "api",
+                    "label": "API",
+                    "default_cwd": "/tmp/repos/api",
+                    "context": {"cwd_match": ["/tmp/repos/api_server"]},
                 },
             ]
         }
 
         matches = matched_skill_clients(model, cwd)
 
-        self.assertEqual(matches[0]["id"], "htma")
+        self.assertEqual(matches[0]["id"], "api")
 
     def test_collects_broken_project_links_as_issues(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1609,14 +1667,18 @@ class SkillVisibilityTests(unittest.TestCase):
                 self.assertTrue(initialized_payload["beads"]["ok"])
                 self.assertEqual(initialized_payload["beads"]["issues"], [])
 
-    def test_global_allowlist_flags_unapproved_global_installs(self) -> None:
+    def test_allow_global_rules_flag_unapproved_global_installs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             clients_root = root / "clients"
             clients_root.mkdir()
             (root / "skill-scope.yaml").write_text(
                 "version: 1\n"
-                "global_allowlist: [always-global]\n",
+                "global_allowlist: [always-global]\n"
+                "rules:\n"
+                "  - id: global\n"
+                "    skills: [always-global]\n"
+                "    allow_global: true\n",
                 encoding="utf-8",
             )
 
@@ -1631,7 +1693,27 @@ class SkillVisibilityTests(unittest.TestCase):
             self.assertTrue(_global_install_allowed(model, "always-global"))
             self.assertFalse(_global_install_allowed(model, "too-broad"))
 
-    def test_global_allowlist_prevents_extra_global_noise(self) -> None:
+    def test_global_allowlist_snapshot_does_not_grant_global_install(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            clients_root = root / "clients"
+            clients_root.mkdir()
+            (root / "skill-scope.yaml").write_text(
+                "version: 1\n"
+                "global_allowlist: [snapshot-only]\n",
+                encoding="utf-8",
+            )
+            model = {
+                "env": {"SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root)},
+                "clients": [],
+                "skills": [],
+            }
+
+            from runtime_manager.skill_visibility import _global_install_allowed  # noqa: PLC0415
+
+            self.assertFalse(_global_install_allowed(model, "snapshot-only"))
+
+    def test_allow_global_rules_prevent_extra_global_noise(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             clients_root = root / "clients"
@@ -1647,7 +1729,11 @@ class SkillVisibilityTests(unittest.TestCase):
             (global_root / "too-broad").symlink_to(extra_source, target_is_directory=True)
             (root / "skill-scope.yaml").write_text(
                 "version: 1\n"
-                "global_allowlist: [always-global]\n",
+                "global_allowlist: [always-global]\n"
+                "rules:\n"
+                "  - id: global\n"
+                "    skills: [always-global]\n"
+                "    allow_global: true\n",
                 encoding="utf-8",
             )
             model = {

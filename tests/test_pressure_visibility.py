@@ -40,10 +40,10 @@ def _advisory_fixture() -> dict[str, object]:
             "pressure_level": "high",
         },
         "target_worker": {
-            "id": "portfolio-devbox",
+            "id": "worker-devbox",
             "state": "ready",
-            "tailscale_hostname": "skillbox-portfolio-devbox",
-            "excluded_box_ids": ["jeremy", "ssh-info", "sweet-potato-prod"],
+            "tailscale_hostname": "skillbox-worker-devbox",
+            "excluded_box_ids": ["client_a", "ssh-gateway", "example-prod"],
         },
         "rch": {
             "state": "not-configured",
@@ -89,7 +89,7 @@ class PressureVisibilityTests(unittest.TestCase):
             content = CONTEXT.generate_context_markdown(model)
 
         self.assertIn("Pressure And Offload Policy", content)
-        self.assertIn("portfolio-devbox", content)
+        self.assertIn("worker-devbox", content)
         self.assertIn("hook-install-allowed=False", content)
         self.assertIn("auto-delete=False", content)
         self.assertIn("sbh-report --format json", content)
@@ -123,7 +123,7 @@ class PressureVisibilityTests(unittest.TestCase):
         compact = OPS.compact_runtime_status(payload)
 
         self.assertIn("pressure-report --format json", actions)
-        self.assertEqual(compact["pressure_advisory"]["target_worker"]["id"], "portfolio-devbox")
+        self.assertEqual(compact["pressure_advisory"]["target_worker"]["id"], "worker-devbox")
         stdout = io.StringIO()
         with redirect_stdout(stdout):
             print_status_text(payload)
@@ -159,7 +159,7 @@ class PressureVisibilityTests(unittest.TestCase):
         )
 
         self.assertIn("Pressure: high", report)
-        self.assertIn("target=portfolio-devbox", report)
+        self.assertIn("target=worker-devbox", report)
         self.assertIn("rch=not-configured", report)
         self.assertIn("sbh=not-configured", report)
 

@@ -4,6 +4,7 @@ from collections import Counter
 from typing import Any
 
 from .shared import EXIT_DRIFT, EXIT_OK, emit_json
+from lib.parity_schema import parse_ledger_row
 
 
 DEV_PROD_PARITY_REPORT_VERSION = 1
@@ -687,9 +688,10 @@ def _runtime_parity_ledger_domain(model: dict[str, Any], client: dict[str, Any])
             ),
         )
     findings: list[dict[str, Any]] = []
-    for item in items:
-        state = _clean(item.get("ownership_state") or "deferred")
-        surface_id = _id(item, "surface", "service_id", "legacy_surface") or "surface"
+    for index, item in enumerate(items):
+        row = parse_ledger_row(item, index=index, source=source)
+        state = row.ownership_state
+        surface_id = row.id or row.legacy_surface or "surface"
         if state in {"covered", "external"}:
             status = "ready"
             message = "Runtime parity-ledger row is covered or intentionally external."
@@ -697,20 +699,20 @@ def _runtime_parity_ledger_domain(model: dict[str, Any], client: dict[str, Any])
         else:
             status = "deferred"
             message = "Runtime parity-ledger row is not covered by a native Skillbox runtime surface."
-            next_action = _clean(item.get("request_error")) or "promote or remove the deferred parity-ledger row"
+            next_action = row.request_error or "promote or remove the deferred parity-ledger row"
         findings.append(
             _finding(
                 domain="runtime_parity_ledger",
                 finding_id=surface_id,
                 status=status,
                 message=message,
-                source_declaration=_runtime_source("runtime.parity_ledger", item, surface_id),
+                source_declaration=f"runtime.parity_ledger.{surface_id}",
                 expected_contract={"ownership_state": "covered|external"},
                 actual_runtime={
                     "ownership_state": state,
-                    "surface_type": _clean(item.get("surface_type")),
-                    "legacy_surface": _clean(item.get("legacy_surface")),
-                    "profiles": item.get("intended_profiles") or item.get("profiles") or [],
+                    "surface_type": row.surface_type,
+                    "legacy_surface": row.legacy_surface,
+                    "profiles": list(row.intended_profiles or row.profiles),
                 },
                 next_action=next_action,
             )

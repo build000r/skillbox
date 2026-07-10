@@ -77,7 +77,7 @@ def build_rch_stage_plan(
     stage_root: Path | None = None,
     stage_id: str | None = None,
     command_parts: list[str] | None = None,
-    target_box: str = "portfolio-devbox",
+    target_box: str = "worker-devbox",
     remote_root: str = DEFAULT_ADAPTER_REMOTE_ROOT,
     rch_binary: str | None = None,
     real_ssh: str | None = None,
@@ -186,7 +186,7 @@ def build_rch_stage_plan(
             "remote_delete_flags_stripped": True,
             "zstd_choice_stripped": True,
             "approved_target": target_box,
-            "excluded_targets": ["jeremy", "ssh-info", "sweet-potato-prod"],
+            "excluded_targets": ["prod", "production", "primary-prod"],
             "protected_local_paths": ["~/.ssh", "~/.codex", "~/.claude"],
         },
     }

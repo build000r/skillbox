@@ -42,9 +42,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 from unittest import mock
 
@@ -55,9 +59,14 @@ for _path in (ENV_MANAGER_DIR, TESTS_DIR):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from fixture_fleet import build_fixture_fleet  # noqa: E402
+from argparse import Namespace
+
+from runtime_manager import cli as runtime_cli  # noqa: E402
 from runtime_manager import fleet_converge as fc  # noqa: E402
+from runtime_manager import lifecycle as lc  # noqa: E402
+from runtime_manager.machines import MachineProfile, MachinesConfig  # noqa: E402
 from runtime_manager import mcp_visibility as mv  # noqa: E402
+from runtime_manager.shared import build_runtime_model  # noqa: E402
 from runtime_manager import skill_visibility as sv  # noqa: E402
 from runtime_manager import structure_doctor as sd  # noqa: E402
 
@@ -68,6 +77,8 @@ REGEN_ENV = "REGEN_OUTPUT_SCHEMA_DOCS"
 # Stable placeholders for the volatile tokens in live payloads.
 FLEET_PLACEHOLDER = "<FLEET>"
 RUNTIME_ROOT_PLACEHOLDER = "<RUNTIME_ROOT>"
+BR_BIN_PLACEHOLDER = "<BR_BIN>"
+REMOTE_ROOT_PLACEHOLDER = "<REMOTE_ROOT>"
 
 
 # --------------------------------------------------------------------------- #
@@ -84,6 +95,30 @@ CONTRACT = "CONTRACT"
 INFO = "info"
 
 FIELD_NOTES: dict[str, dict[str, tuple[str, str]]] = {
+    "capabilities": {
+        "ok": (CONTRACT, "True when the wrapper emitted a complete capabilities payload."),
+        "tool": (CONTRACT, "Tool identity, e.g. skillbox-sbp."),
+        "contract_version": (CONTRACT, "Version tag for this wrapper capabilities contract."),
+        "entrypoint": (CONTRACT, "Wrapper entrypoint path relative to the skillbox repo."),
+        "cwd": (CONTRACT, "Invocation cwd used by the wrapper."),
+        "aliases": (CONTRACT, "Sibling wrapper aliases for this entrypoint."),
+        "commands": (CONTRACT, "Agent-facing command inventory with safe_first_try examples."),
+        "agent_surfaces": (CONTRACT, "Canonical discovery commands for agents."),
+        "skill_verbs": (CONTRACT, "Machine-readable skill verb decision map; every dispatched skill subcommand has an entry."),
+        "stdout_stderr_contract": (CONTRACT, "Where JSON and diagnostics are emitted."),
+        "safety": (CONTRACT, "Dry-run and confirmation guidance for mutating commands."),
+        "next_actions": (INFO, "Common first follow-up commands."),
+    },
+    "capabilities.skill_verb": {
+        "purpose": (CONTRACT, "One-line meaning of the verb."),
+        "mutates": (CONTRACT, "Stable mutation class: none, cwd-ephemeral, disk-links, or repo-state+disk-links."),
+        "links_disk": (CONTRACT, "True when the verb may create/remove skill links on disk."),
+        "returns_packet": (CONTRACT, "True when success includes an activation_packet for immediate session use."),
+        "scope": (CONTRACT, "Scope the verb operates on."),
+        "survives_recalibrate": (CONTRACT, "True when the verb writes durable repo state that recalibrate/prune should preserve."),
+        "when_to_use": (INFO, "Human/agent guidance for choosing this verb."),
+        "do_NOT": (INFO, "Important anti-pattern for this verb."),
+    },
     "skills": {
         "cwd": (CONTRACT, "Absolute resolved cwd the visibility view was computed for."),
         "active_clients": (CONTRACT, "Client overlays active for this resolution."),
@@ -94,7 +129,8 @@ FIELD_NOTES: dict[str, dict[str, tuple[str, str]]] = {
         "summary": (CONTRACT, "Roll-up counters; keys are stable, add-only. Branch on these first."),
         "parity": (CONTRACT, "Claude<->Codex GLOBAL skill-surface parity (empty when --no-global)."),
         "overlay_audit": (INFO, "Declared-overlay registry audit: declared + active overlays and warnings for active overlays not in the registry (advisory, never a hard fail; only when an overlays: block is declared)."),
-        "effective": (CONTRACT, "The skills actually visible at this cwd after layer resolution."),
+        "visibility_decisions": (CONTRACT, "One winning resolution row per skill name, including disabled/broken winners; use effective for visible skills."),
+        "effective": (CONTRACT, "Visible skills at this cwd after layer resolution; excludes disabled/broken winners."),
         "issues": (CONTRACT, "Policy problems grouped by kind (broken_project, missing_for_cwd, scope_violations, ...)."),
         "beads": (CONTRACT, "Beads requirement/readiness derived from effective skills' frontmatter."),
         "recommendations": (INFO, "Ranked human-facing remediation suggestions."),
@@ -139,17 +175,25 @@ FIELD_NOTES: dict[str, dict[str, tuple[str, str]]] = {
         "error": (CONTRACT, "Parse error string, or null when valid."),
     },
     "recalibrate": {
-        # `sbp recalibrate` is a COMPOSITE human surface; its machine-readable
-        # core is the `sbp skills --issues-only --format json` view (same
-        # collect_skill_visibility payload) plus the embedded `beads` block.
+        # `sbp recalibrate --json` emits the issues-only visibility core plus
+        # machine-actionable ``fixes[]`` rows (one per actionable issue).
         "cwd": (CONTRACT, "Absolute resolved cwd being recalibrated."),
         "matched_scope_rules": (CONTRACT, "Rules in force for this cwd."),
         "matched_project_categories": (CONTRACT, "Project categories for this cwd."),
         "issues": (CONTRACT, "The drift to heal, grouped by kind (the issues-only view's payload)."),
         "beads": (CONTRACT, "required / required_skills / repo_root / initialized / br / issues."),
         "summary": (CONTRACT, "Counters incl. beads_required_skills + beads_issues."),
+        "fixes": (CONTRACT, "Machine-actionable remediation rows; one per actionable issue."),
         "recommendations": (INFO, "Ranked remediation suggestions."),
         "next_actions": (INFO, "Ordered next commands (dry-run heal moves)."),
+    },
+    "recalibrate.fix": {
+        "problem": (CONTRACT, "Issue kind (e.g. missing_for_cwd, scope_violations)."),
+        "skill": (CONTRACT, "Skill name this fix targets."),
+        "command": (CONTRACT, "Exact copy-pasteable command that resolves the issue."),
+        "links": (CONTRACT, "Link actions the dry-run would apply (lifecycle link rows)."),
+        "dry_run_preview": (CONTRACT, "Trimmed skill lifecycle dry-run payload for the fix."),
+        "packet_on_apply": (INFO, "activation_packet from the dry-run when the fix links a skill; null otherwise."),
     },
     "recalibrate.beads": {
         "required": (CONTRACT, "True when an effective skill declares requires_beads."),
@@ -170,11 +214,13 @@ FIELD_NOTES: dict[str, dict[str, tuple[str, str]]] = {
         "cwd": (CONTRACT, "Absolute resolved cwd the provenance is for."),
         "visible": (CONTRACT, "True iff the skill resolves to a non-broken effective occurrence here."),
         "reason": (INFO, "Human sentence explaining the verdict."),
-        "layer": (CONTRACT, "Winning layer id, or null when not visible."),
-        "layer_family": (CONTRACT, "PROJECT|GLOBAL|CLIENT|DEFAULT of the winner, or null."),
-        "layer_label": (INFO, "Human label for the winning layer, or null."),
-        "layer_rank": (CONTRACT, "Numeric rank of the winning layer, or null."),
-        "winner": (CONTRACT, "Trimmed view of the effective occurrence (won=true), or null."),
+        "layer": (CONTRACT, "Resolution winner layer id, including disabled/broken winners, or null when none."),
+        "winning_layer": (CONTRACT, "Canonical winning_layer copied from the same visibility decision that drives the effective set."),
+        "layer_family": (CONTRACT, "PROJECT|GLOBAL|CLIENT|DEFAULT|OVERRIDE of the resolution winner, or null."),
+        "layer_label": (INFO, "Human label for the resolution winner layer, or null."),
+        "layer_rank": (CONTRACT, "Numeric rank of the resolution winner layer, or null."),
+        "winner": (CONTRACT, "Trimmed view of the resolution winner (won=true), or null."),
+        "layers": (CONTRACT, "Ordered provenance trace for this skill; exactly one row has wins=true when a winning layer exists."),
         "occurrences": (CONTRACT, "Every occurrence of this skill across layers, each with a won verdict."),
         "lost": (CONTRACT, "Non-winning occurrences with a lost_reason."),
         "scope_rules": (CONTRACT, "skill-scope.yaml rules naming this skill at this cwd."),
@@ -238,6 +284,96 @@ FIELD_NOTES["candidates"] = dict(FIELD_NOTES["skills"]) | {
     "undefined_sources": (CONTRACT, "Linkable source skills with no policy occurrence — the candidate pool."),
 }
 
+# `sbp skill why` routes to the same explain payload as `sbp explain`.
+FIELD_NOTES["skill_why"] = dict(FIELD_NOTES["explain"])
+
+_SKILL_TOGGLE_NOTES: dict[str, tuple[str, str]] = {
+    "action": (CONTRACT, "Verb executed: 'on' or 'off'."),
+    "skill": (CONTRACT, "Skill name toggled."),
+    "cwd": (CONTRACT, "Absolute resolved repo cwd the toggle ran against."),
+    "requested_to": (CONTRACT, "Scope the caller requested (project-only today)."),
+    "resolved_to": (CONTRACT, "Scope the plan resolved to."),
+    "categories": (CONTRACT, "Project categories targeted when --to category (often empty)."),
+    "from_scope": (CONTRACT, "Installed scope considered for off/unlink (project for skill off)."),
+    "source_options": (CONTRACT, "Resolvable source directories for on/activate."),
+    "selected_source": (CONTRACT, "Chosen source for on/activate, or null for off."),
+    "activation_packet": (CONTRACT, "Immediate-use SKILL.md packet on on; null on off."),
+    "warnings": (INFO, "Non-fatal plan warnings."),
+    "actions": (CONTRACT, "Link/unlink rows the toggle would apply; see the action field table."),
+    "skipped": (CONTRACT, "Skills skipped by the plan (e.g. prune firewall pinned rows)."),
+    "summary": (CONTRACT, "Roll-up counters for planned/applied link+unlink actions."),
+    "dry_run": (CONTRACT, "True when the payload previews without writing."),
+    "override": (CONTRACT, "Repo override-file mutation preview/result; see the override field table."),
+    "changed": (CONTRACT, "True when disk and/or override state changed (apply mode)."),
+    "noop": (CONTRACT, "True when neither override nor link actions would change state."),
+    "verification": (INFO, "Optional post-on verify block when --verify is set; null otherwise."),
+}
+FIELD_NOTES["skill_on"] = dict(_SKILL_TOGGLE_NOTES)
+FIELD_NOTES["skill_off"] = dict(_SKILL_TOGGLE_NOTES)
+
+FIELD_NOTES["skill_on.override"] = {
+    "changed": (CONTRACT, "True when the override file was written (apply mode)."),
+    "pin": (CONTRACT, "Override list touched: pin_on or pin_off."),
+    "policy_path": (CONTRACT, "Absolute path of .skillbox/skill-overrides.yaml."),
+    "would_change": (CONTRACT, "True when a dry-run would mutate the override file."),
+}
+FIELD_NOTES["skill_off.override"] = dict(FIELD_NOTES["skill_on.override"])
+
+_FIELD_NOTES_SKILL_ACTIVATION_PACKET = {
+    "name": (CONTRACT, "Skill name in the activation packet."),
+    "source": (CONTRACT, "Resolved source directory backing the skill."),
+    "source_bucket": (CONTRACT, "Source bucket id (external/private/etc.)."),
+    "skill_md_path": (CONTRACT, "Absolute path to SKILL.md used for the packet."),
+    "skill_md_sha256": (CONTRACT, "SHA-256 of SKILL.md for verify consumers."),
+    "skill_md": (CONTRACT, "Full SKILL.md body for immediate session use."),
+    "surface_targets": (CONTRACT, "Per-surface link destinations the packet covers."),
+    "instructions": (INFO, "Human guidance for using the packet in-session."),
+}
+FIELD_NOTES["skill_on.activation_packet"] = dict(_FIELD_NOTES_SKILL_ACTIVATION_PACKET)
+
+_FIELD_NOTES_SKILL_LIFECYCLE_ACTION = {
+    "op": (CONTRACT, "Lifecycle op: link or unlink."),
+    "skill": (CONTRACT, "Skill name for this action row."),
+    "source": (CONTRACT, "Source path for link rows; prior target for unlink rows."),
+    "destination": (CONTRACT, "Installed symlink path affected."),
+    "scope": (CONTRACT, "project or global scope of the action."),
+    "surface": (CONTRACT, "claude or codex surface."),
+    "status": (CONTRACT, "Dry-run/applied status (would_link, would_unlink, linked, ...)."),
+    "blocked_reason": (CONTRACT, "Empty when allowed; otherwise why the row is blocked."),
+    "reason": (INFO, "Human reason for unlink (e.g. pin_off, prune)."),
+    "repo_path": (CONTRACT, "Repo root owning the destination."),
+    "root": (CONTRACT, "Skills root directory under the repo for link rows."),
+    "existing": (CONTRACT, "Prior install state at the destination."),
+    "category": (INFO, "Project category when scoped by category."),
+    "source_bucket": (INFO, "Source bucket for link rows."),
+    "layer": (INFO, "Layer id for unlink rows derived from visibility."),
+}
+FIELD_NOTES["skill_on.action"] = dict(_FIELD_NOTES_SKILL_LIFECYCLE_ACTION)
+FIELD_NOTES["skill_off.action"] = dict(_FIELD_NOTES_SKILL_LIFECYCLE_ACTION)
+
+FIELD_NOTES["skill_on.summary"] = {
+    "actions": (CONTRACT, "Total planned/applied action rows."),
+    "link": (CONTRACT, "Link action count."),
+    "unlink": (CONTRACT, "Unlink action count."),
+    "blocked": (CONTRACT, "Blocked action count."),
+    "skipped": (CONTRACT, "Skipped action count."),
+    "applied": (CONTRACT, "Applied action count (apply mode)."),
+    "unchanged": (CONTRACT, "Actions that left destination unchanged."),
+}
+FIELD_NOTES["skill_off.summary"] = dict(FIELD_NOTES["skill_on.summary"])
+
+FIELD_NOTES["skill_togglable"] = {
+    "cwd": (CONTRACT, "Absolute resolved cwd the switchboard was computed for."),
+    "items": (CONTRACT, "Every flippable skill at this cwd; see the item field table."),
+}
+FIELD_NOTES["skill_togglable.item"] = {
+    "skill": (CONTRACT, "Skill name."),
+    "state": (CONTRACT, "on | off | missing_for_cwd | pinned_on | pinned_off."),
+    "source": (CONTRACT, "Installed path when on; null when absent."),
+    "pinned_by": (CONTRACT, "override when repo override lists drive state; else policy."),
+    "command_to_flip": (CONTRACT, "Literal sbp skill on/off command to transition state."),
+}
+
 
 # --------------------------------------------------------------------------- #
 # Surface definitions: title, intro, the source of the example, and which
@@ -262,16 +398,64 @@ def _norm(obj: Any, replacements: list[tuple[str, str]]) -> Any:
 
 def _fleet_example(fn: Callable[["FixtureFleetT", str], dict[str, Any]]) -> dict[str, Any]:
     """Build a fixture-fleet, run ``fn``, and normalize the temp root to <FLEET>."""
+    from fixture_fleet import build_fixture_fleet
+
     tmp = tempfile.mkdtemp()
     try:
         fleet = build_fixture_fleet(tmp)
-        with fleet._home_patched():
+        source_roots = (str(fleet.skills_root), str(fleet.skills_private_root))
+        machines_config = MachinesConfig(
+            machines={
+                "devbox-like": MachineProfile(
+                    machine_id="devbox-like",
+                    repo_roots=(str(fleet.aliased_root),),
+                ),
+                "mac-like": MachineProfile(
+                    machine_id="mac-like",
+                    repo_roots=("/fake-mac-root/repos",),
+                ),
+            },
+            source_path=str(fleet.machines_path),
+        )
+        registry_doctor = SimpleNamespace(
+            DEFAULT_REGISTRY=str(fleet.registry_path),
+            load_registry=lambda _path: {"repos": []},
+        )
+        with fleet._home_patched(), mock.patch.object(
+            sv, "DEFAULT_SKILL_SOURCE_ROOT_PATTERNS", source_roots
+        ), mock.patch.object(
+            sv,
+            "_machines_classifier_override",
+            lambda: (machines_config, "devbox-like"),
+            create=True,
+        ), mock.patch.object(
+            sv,
+            "_registry_doctor_module_override",
+            lambda: registry_doctor,
+            create=True,
+        ), mock.patch.object(
+            sv,
+            "_explain_machine_profile",
+            lambda: {
+                "resolved": True,
+                "machine_id": "devbox-like",
+                "source_path": str(fleet.machines_path),
+                "declared_machines": sorted(machines_config.machines),
+            },
+            create=True,
+        ):
             payload = fn(fleet, tmp)
-        return _norm(payload, [(tmp, FLEET_PLACEHOLDER)])
+        replacements = [
+            (str(Path(tmp) / "fake-mac-root"), REMOTE_ROOT_PLACEHOLDER),
+            ("/fake-mac-root", REMOTE_ROOT_PLACEHOLDER),
+            (tmp, FLEET_PLACEHOLDER),
+        ]
+        br_bin = shutil.which("br")
+        if br_bin:
+            replacements.append((br_bin, BR_BIN_PLACEHOLDER))
+        return _norm(payload, replacements)
     finally:
         # Best-effort cleanup; the temp tree carries no operator state.
-        import shutil
-
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -290,6 +474,23 @@ def example_skills() -> dict[str, Any]:
         return sv.compact_skill_visibility_payload(payload)
 
     return _fleet_example(run)
+
+
+def example_capabilities() -> dict[str, Any]:
+    """`sbp capabilities --json` from the real wrapper."""
+    env = os.environ.copy()
+    env.setdefault("TERM", "dumb")
+    env["SKILLBOX_ROOT"] = str(ROOT_DIR)
+    result = subprocess.run(
+        ["bash", str(ROOT_DIR / "scripts" / "sbp"), "capabilities", "--json"],
+        cwd=ROOT_DIR,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    return _norm(json.loads(result.stdout), [(str(ROOT_DIR), RUNTIME_ROOT_PLACEHOLDER)])
 
 
 def example_candidates() -> dict[str, Any]:
@@ -316,31 +517,297 @@ def example_mcp() -> dict[str, Any]:
     return _norm(payload, [(str(ROOT_DIR), RUNTIME_ROOT_PLACEHOLDER)])
 
 
-def example_recalibrate() -> dict[str, Any]:
-    """`sbp recalibrate` machine core: the `--issues-only` skill-visibility view at the overlay repo.
+_ACTIONABLE_RECALIBRATE_ISSUE_TYPES = (
+    "missing_for_cwd",
+    "scope_violations",
+    "global_not_allowed",
+    "extra_global",
+    "broken_global",
+    "broken_project",
+)
 
-    The wrapper composes several dry-run sub-calls; its single JSON payload is the
-    issues-focused ``collect_skill_visibility`` result (the same one the wrapper's
-    ``--issues-only --format json`` step parses for the beads block).
-    """
+_DRY_RUN_PREVIEW_KEYS = (
+    "action",
+    "skill",
+    "cwd",
+    "dry_run",
+    "summary",
+    "actions",
+    "activation_packet",
+    "warnings",
+    "noop",
+    "changed",
+)
+
+
+def _extract_fix_links(preview: dict[str, Any] | None) -> list[dict[str, Any]]:
+    links: list[dict[str, Any]] = []
+    for action in (preview or {}).get("actions") or []:
+        if action.get("op") != "link":
+            continue
+        links.append({
+            "skill": action.get("skill"),
+            "source": action.get("source"),
+            "destination": action.get("destination"),
+            "surface": action.get("surface"),
+            "scope": action.get("scope"),
+            "status": action.get("status"),
+        })
+    return links
+
+
+def _trim_dry_run_preview(preview: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not preview:
+        return None
+    return {key: preview[key] for key in _DRY_RUN_PREVIEW_KEYS if key in preview}
+
+
+def _preview_recalibrate_fix(
+    model: dict[str, Any],
+    issue_type: str,
+    row: dict[str, Any],
+    *,
+    cwd: str,
+) -> dict[str, Any] | None:
+    skill_name = str(row.get("name") or "")
+    if not skill_name:
+        return None
+    cwd_text = str(cwd)
+    if issue_type == "missing_for_cwd":
+        plan = lc.skill_lifecycle_plan(
+            model,
+            "activate",
+            skill_name=skill_name,
+            cwd=cwd_text,
+            to="project",
+            force=True,
+        )
+    elif issue_type == "scope_violations":
+        plan = lc.skill_lifecycle_plan(
+            model,
+            "prune",
+            skill_name=skill_name,
+            cwd=cwd_text,
+            from_scope="project",
+        )
+    elif issue_type in {"global_not_allowed", "extra_global"}:
+        plan = lc.skill_lifecycle_plan(
+            model,
+            "prune",
+            skill_name=skill_name,
+            cwd=cwd_text,
+            from_scope="global",
+        )
+    elif issue_type in {"broken_global", "broken_project"}:
+        from_scope = "global" if issue_type == "broken_global" else "project"
+        plan = lc.skill_lifecycle_plan(
+            model,
+            "prune",
+            skill_name=skill_name,
+            cwd=cwd_text,
+            from_scope=from_scope,
+        )
+    else:
+        return None
+    return lc.apply_skill_lifecycle_plan(plan, dry_run=True)
+
+
+def build_recalibrate_fixes(
+    model: dict[str, Any],
+    issues: dict[str, list[dict[str, Any]]],
+    *,
+    cwd: str,
+) -> list[dict[str, Any]]:
+    fixes: list[dict[str, Any]] = []
+    for issue_type in _ACTIONABLE_RECALIBRATE_ISSUE_TYPES:
+        for row in (issues or {}).get(issue_type) or []:
+            if not isinstance(row, dict):
+                continue
+            skill_name = str(row.get("name") or "")
+            command = str(row.get("fix_command") or "").strip()
+            if not skill_name or not command:
+                continue
+            preview = _preview_recalibrate_fix(model, issue_type, row, cwd=cwd)
+            trimmed = _trim_dry_run_preview(preview)
+            fixes.append({
+                "problem": issue_type,
+                "skill": skill_name,
+                "command": command,
+                "links": _extract_fix_links(trimmed),
+                "dry_run_preview": trimmed,
+                "packet_on_apply": (trimmed or {}).get("activation_packet"),
+            })
+    fixes.sort(key=lambda item: (item["problem"], item["skill"]))
+    return fixes
+
+
+def assemble_recalibrate_payload(
+    visibility_payload: dict[str, Any],
+    *,
+    model: dict[str, Any],
+) -> dict[str, Any]:
+    issues = sv._compact_skill_visibility_issues(visibility_payload)
+    cwd = str(visibility_payload.get("cwd") or "")
+    return {
+        "cwd": cwd,
+        "matched_scope_rules": visibility_payload.get("matched_scope_rules") or [],
+        "matched_project_categories": visibility_payload.get("matched_project_categories") or [],
+        "issues": issues,
+        "beads": visibility_payload.get("beads") or {},
+        "summary": visibility_payload.get("summary") or {},
+        "fixes": build_recalibrate_fixes(model, issues, cwd=cwd),
+        "recommendations": visibility_payload.get("recommendations") or [],
+        "next_actions": visibility_payload.get("next_actions") or [],
+    }
+
+
+def emit_recalibrate_json(
+    *,
+    cwd: str,
+    profile: str = "local-all",
+    client: str | None = None,
+    extra_argv: list[str] | None = None,
+    runtime_root: Path | None = None,
+) -> dict[str, Any]:
+    """Live ``sbp recalibrate --json`` payload against the operator runtime."""
+    root = runtime_root or ROOT_DIR
+    manage = root / ".env-manager" / "manage.py"
+    argv = ["python3", str(manage), "skills"]
+    if client:
+        argv.extend(["--client", client])
+    argv.extend([
+        "--profile", profile,
+        "--cwd", cwd,
+        "--issues-only",
+        "--no-global",
+        "--format", "json",
+    ])
+    argv.extend(extra_argv or [])
+    result = subprocess.run(
+        argv,
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"skills --issues-only --format json failed (exit {result.returncode}): "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    visibility_payload = json.loads(result.stdout)
+    model = build_runtime_model(root)
+    return assemble_recalibrate_payload(visibility_payload, model=model)
+
+
+def example_recalibrate() -> dict[str, Any]:
+    """`sbp recalibrate --json` at the overlay repo (missing_for_cwd fix row)."""
 
     def run(fleet: FixtureFleetT, _tmp: str) -> dict[str, Any]:
         payload = sv.collect_skill_visibility(
             fleet.model(), cwd=str(fleet.repo("overlay-repo")),
             include_global=False, include_project=True, include_sources=False,
         )
-        # Mirror the wrapper's issues-only machine view: the same payload, trimmed
-        # to the recalibration-relevant fields the wrapper's pipeline reads.
-        return {
-            "cwd": payload["cwd"],
-            "matched_scope_rules": payload["matched_scope_rules"],
-            "matched_project_categories": payload["matched_project_categories"],
-            "issues": sv._compact_skill_visibility_issues(payload),
-            "beads": payload["beads"],
-            "summary": payload["summary"],
-            "recommendations": payload["recommendations"],
-            "next_actions": payload["next_actions"],
-        }
+        return assemble_recalibrate_payload(payload, model=fleet.model())
+
+    return _fleet_example(run)
+
+
+def _skill_toggle_args(
+    fleet: FixtureFleetT,
+    *,
+    repo: str,
+    action: str,
+    skill_name: str,
+    dry_run: bool = True,
+) -> Namespace:
+    return Namespace(
+        skill_action=action,
+        skill_name=skill_name,
+        cwd=str(fleet.repo(repo)),
+        to="project",
+        from_scope="project",
+        category=[],
+        source=None,
+        dry_run=dry_run,
+        verify=False,
+        allow_directories=False,
+        force=False,
+    )
+
+
+def _skill_toggle_payload(
+    fleet: FixtureFleetT,
+    *,
+    repo: str,
+    action: str,
+    skill_name: str,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    args = _skill_toggle_args(
+        fleet, repo=repo, action=action, skill_name=skill_name, dry_run=dry_run,
+    )
+    return runtime_cli._handle_skill_toggle(args, fleet.model(), dry_run=dry_run)
+
+
+def build_skill_togglable_payload(
+    model: dict[str, Any],
+    *,
+    cwd: str | Path,
+) -> dict[str, Any]:
+    """Write-affordance switchboard: every skill flippable at one cwd."""
+    return runtime_cli._build_skill_togglable_payload(model, cwd=cwd)
+
+
+def example_skill_why() -> dict[str, Any]:
+    """`sbp skill why <skill>` — absence diagnosis with exact fix command."""
+
+    def run(fleet: FixtureFleetT, _tmp: str) -> dict[str, Any]:
+        return sv.explain_skill_visibility(
+            fleet.model(),
+            "needs-beads",
+            cwd=str(fleet.repo("overlay-repo")),
+            include_global=False,
+            include_project=True,
+        )
+
+    return _fleet_example(run)
+
+
+def example_skill_on() -> dict[str, Any]:
+    """`sbp skill on <skill> --dry-run --format json` — missing_for_cwd link preview."""
+
+    def run(fleet: FixtureFleetT, _tmp: str) -> dict[str, Any]:
+        return _skill_toggle_payload(
+            fleet, repo="overlay-repo", action="on", skill_name="tiny-ui", dry_run=True,
+        )
+
+    return _fleet_example(run)
+
+
+def example_skill_off() -> dict[str, Any]:
+    """`sbp skill off <skill> --dry-run --format json` — unlink preview for an installed skill."""
+
+    def run(fleet: FixtureFleetT, _tmp: str) -> dict[str, Any]:
+        return _skill_toggle_payload(
+            fleet,
+            repo="overlay-repo",
+            action="off",
+            skill_name="tiny-marketing",
+            dry_run=True,
+        )
+
+    return _fleet_example(run)
+
+
+def example_skill_togglable() -> dict[str, Any]:
+    """`sbp skill togglable --json` — write-affordance switchboard at the overlay repo."""
+
+    def run(fleet: FixtureFleetT, _tmp: str) -> dict[str, Any]:
+        return build_skill_togglable_payload(
+            fleet.model(), cwd=fleet.repo("overlay-repo"),
+        )
 
     return _fleet_example(run)
 
@@ -420,6 +887,20 @@ def example_fleet_converge() -> dict[str, Any]:
 # (key, command, title, intro, example fn, nested tables [(notes_key, label, picker)])
 SURFACES: list[dict[str, Any]] = [
     {
+        "key": "capabilities",
+        "command": "sbp capabilities",
+        "long": "`sbp capabilities --json`",
+        "fn": "scripts/sbp print_capabilities",
+        "intro": (
+            "The wrapper discovery contract. Agents should start here to learn the stable "
+            "command inventory, stdout/stderr rules, dry-run guidance, and the machine-readable "
+            "`skill_verbs` decision map for choosing between recalibrate/activate/sync/prune/"
+            "on/off/heal/why/togglable and maintenance verbs."
+        ),
+        "example": example_capabilities,
+        "nested": [("capabilities.skill_verb", "`skill_verbs.<verb>` (one skill verb row)", None)],
+    },
+    {
         "key": "skills",
         "command": "sbp skills",
         "long": "`sbp skills [--full] [--no-global] [--show-sources] --format json`",
@@ -464,17 +945,89 @@ SURFACES: list[dict[str, Any]] = [
     {
         "key": "recalibrate",
         "command": "sbp recalibrate",
-        "long": "`sbp recalibrate [--cwd <repo>]` (composite; machine core shown below)",
-        "fn": "collect_skill_visibility (issues-only view) + embedded beads block",
+        "long": "`sbp recalibrate [--cwd <repo>] --json`",
+        "fn": "assemble_recalibrate_payload (issues-only view + fixes[] dry-run previews)",
         "intro": (
-            "A COMPOSITE human surface that stitches together several dry-run sub-calls "
-            "(`sbp skills --issues-only`, `sbp skill sync --dry-run`, `sbp skill prune --dry-run`, "
-            "the beads graph, and `sbp mcp`). Its single machine-readable core is the issues-focused "
-            "`collect_skill_visibility` payload below — same shape as `sbp skills --issues-only "
-            "--format json`, whose `beads` block the wrapper parses directly."
+            "Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the "
+            "issues-focused `collect_skill_visibility` core (same fields as "
+            "`sbp skills --issues-only --format json`) plus a `fixes[]` row per actionable "
+            "issue. Each fix carries the literal `fix_command`, link dry-run rows, a trimmed "
+            "`dry_run_preview`, and `packet_on_apply` when linking would return an activation "
+            "packet. Bare `sbp recalibrate` (no `--json`) still prints the composite human "
+            "surface (sync/prune dry-runs, beads graph, MCP audit)."
         ),
         "example": example_recalibrate,
-        "nested": [("recalibrate.beads", "`beads` (beads requirement/readiness)", None)],
+        "nested": [
+            ("recalibrate.beads", "`beads` (beads requirement/readiness)", None),
+            ("recalibrate.fix", "`fixes[]` (one machine-actionable remediation row)", None),
+        ],
+    },
+    {
+        "key": "skill_why",
+        "command": "sbp skill why",
+        "long": "`sbp skill why <skill> [--cwd <repo>] --format json`",
+        "fn": "explain_skill_visibility",
+        "intro": (
+            "Read-only provenance for ONE skill at ONE cwd, including absence. Same payload "
+            "shape as `sbp explain` but routed through the `skill why` verb. Walks the "
+            "precedence spine, names the winning layer (if any), and — when invisible — emits "
+            "ranked remediation rows with literal `command` strings agents can run without "
+            "re-deriving policy."
+        ),
+        "example": example_skill_why,
+        "nested": [],
+    },
+    {
+        "key": "skill_on",
+        "command": "sbp skill on",
+        "long": "`sbp skill on <skill> [--cwd <repo>] [--dry-run] --format json`",
+        "fn": "_handle_skill_toggle (on / activate plan + override pin_on)",
+        "intro": (
+            "Durable repo-local pin ON plus disk links. Writes `pin_on` to "
+            "`.skillbox/skill-overrides.yaml` (survives recalibrate) and links project "
+            "skills when needed. Returns an `activation_packet` for immediate session use. "
+            "`--dry-run` previews override + link actions without writing; a repeat apply "
+            "is a clean no-op (`noop: true`)."
+        ),
+        "example": example_skill_on,
+        "nested": [
+            ("skill_on.override", "`override` (repo override-file mutation)", None),
+            ("skill_on.activation_packet", "`activation_packet` (immediate SKILL.md packet)", None),
+            ("skill_on.action", "`actions[]` (one lifecycle link/unlink row)", None),
+            ("skill_on.summary", "`summary` (action counters)", None),
+        ],
+    },
+    {
+        "key": "skill_off",
+        "command": "sbp skill off",
+        "long": "`sbp skill off <skill> [--cwd <repo>] [--dry-run] --format json`",
+        "fn": "_handle_skill_toggle (off / prune plan + override pin_off)",
+        "intro": (
+            "Durable repo-local pin OFF plus project unlink. Writes `pin_off` to "
+            "`.skillbox/skill-overrides.yaml` and unlinks project installs. Refuses floor "
+            "skills (smart/sbp). `--dry-run` previews override + unlink rows; `activation_packet` "
+            "is always null."
+        ),
+        "example": example_skill_off,
+        "nested": [
+            ("skill_off.override", "`override` (repo override-file mutation)", None),
+            ("skill_off.action", "`actions[]` (one lifecycle unlink row)", None),
+            ("skill_off.summary", "`summary` (action counters)", None),
+        ],
+    },
+    {
+        "key": "skill_togglable",
+        "command": "sbp skill togglable",
+        "long": "`sbp skill togglable [--cwd <repo>] --format json`",
+        "fn": "build_skill_togglable_payload",
+        "intro": (
+            "Write-affordance switchboard for one cwd: every skill the policy marks as "
+            "flippable here, its current state (`on`, `off`, `missing_for_cwd`, `pinned_on`, "
+            "`pinned_off`), who pinned it (`override` vs `policy`), and the literal "
+            "`command_to_flip` to transition state. Distinct from `sbp skills` (visibility/read)."
+        ),
+        "example": example_skill_togglable,
+        "nested": [("skill_togglable.item", "`items[]` (one flippable skill row)", None)],
     },
     {
         "key": "explain",
@@ -545,9 +1098,26 @@ def _first_nested(example: dict[str, Any], notes_key: str) -> dict[str, Any] | N
         return gates[0] if gates else None
     if leaf == "beads":
         return example.get("beads") or None
+    if leaf == "fix":
+        fixes = example.get("fixes") or []
+        return fixes[0] if fixes else None
+    if leaf == "override":
+        return example.get("override") or None
+    if leaf == "activation_packet":
+        return example.get("activation_packet") or None
+    if leaf == "action":
+        actions = example.get("actions") or []
+        return actions[0] if actions else None
+    if leaf == "summary" and isinstance(example.get("summary"), dict):
+        return example.get("summary") or None
+    if leaf == "item":
+        items = example.get("items") or []
+        return items[0] if items else None
     if leaf == "repo":
         repos = example.get("repos") or []
         return repos[0] if repos else None
+    if leaf == "skill_verb":
+        return (example.get("skill_verbs") or {}).get("on") or None
     return None
 
 
@@ -620,7 +1190,7 @@ def render_doc() -> str:
         lines.append("")
         lines.append(f"## `{surface['command']}`")
         lines.append("")
-        lines.append(f"**Invocation:** {surface['long']}  ")
+        lines.append(f"**Invocation:** {surface['long']}")
         lines.append(f"**Produced by:** `{surface['fn']}`")
         lines.append("")
         lines.append(surface["intro"])
@@ -641,7 +1211,8 @@ def render_doc() -> str:
         lines.append("")
         lines.append(
             "<sub>From the `tests/fixture_fleet.py` estate; absolute paths normalized to "
-            f"`{FLEET_PLACEHOLDER}` / `{RUNTIME_ROOT_PLACEHOLDER}`.</sub>")
+            f"`{FLEET_PLACEHOLDER}` / `{RUNTIME_ROOT_PLACEHOLDER}` / "
+            f"`{BR_BIN_PLACEHOLDER}` / `{REMOTE_ROOT_PLACEHOLDER}`.</sub>")
         lines.append("")
         lines.append("```json")
         lines.append(json.dumps(example, indent=2, sort_keys=True))
@@ -668,7 +1239,32 @@ def _anchor(text: str) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--write", action="store_true", help="Write the doc to disk instead of printing it.")
+    parser.add_argument(
+        "--recalibrate-json",
+        action="store_true",
+        help="Emit live sbp recalibrate --json payload to stdout (used by scripts/sbp).",
+    )
+    parser.add_argument("--cwd", default=None, help="Cwd for --recalibrate-json.")
+    parser.add_argument("--profile", default="local-all", help="Profile for --recalibrate-json.")
+    parser.add_argument("--client", default=None, help="Optional client overlay for --recalibrate-json.")
+    parser.add_argument(
+        "extra",
+        nargs="*",
+        help="Extra argv tokens forwarded to skills --issues-only (after --recalibrate-json flags).",
+    )
     args = parser.parse_args(argv)
+    if args.recalibrate_json:
+        if not args.cwd:
+            print("gen_output_schemas: --recalibrate-json requires --cwd", file=sys.stderr)
+            return 2
+        payload = emit_recalibrate_json(
+            cwd=args.cwd,
+            profile=args.profile,
+            client=args.client,
+            extra_argv=list(args.extra),
+        )
+        sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        return 0
     doc = render_doc()
     if args.write:
         DOC_PATH.parent.mkdir(parents=True, exist_ok=True)

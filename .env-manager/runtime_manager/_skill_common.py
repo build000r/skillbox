@@ -9,34 +9,26 @@ import layering and breaks would-be cycles.
 
 from __future__ import annotations
 
-import fnmatch
-import glob
-import hashlib
 import os
-import shutil
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 try:
     import yaml
 except ModuleNotFoundError:
     yaml = None
 
-from .shared import (
-    GLOBAL_HOME_ROOT_ENV,
-    GLOBAL_HOME_SURFACES,
-    atomic_write_text,
-    directory_tree_sha256,
-    load_json_file,
-    load_yaml,
-    load_skill_repos_config,
-)
 
 __all__ = [
+    'DISPATCHER_CORE',
     'DEFAULT_LAYER_RANK',
     'CLIENT_LAYER_RANK',
     'GLOBAL_LAYER_RANK',
     'PROJECT_LAYER_RANK',
+    'OPERATOR_STATE_LAYER_RANK',
+    'REPO_OVERRIDE_LAYER_RANK',
+    'ENV_LAYER_RANK',
+    'CLI_LAYER_RANK',
     '_as_list',
     '_expand_policy_path',
     '_path_under_or_equal',
@@ -53,10 +45,15 @@ __all__ = [
 ]
 
 
+DISPATCHER_CORE = ("smart", "sbp")
 DEFAULT_LAYER_RANK = 10
 CLIENT_LAYER_RANK = 20
 GLOBAL_LAYER_RANK = 30
 PROJECT_LAYER_RANK = 40
+OPERATOR_STATE_LAYER_RANK = 50
+REPO_OVERRIDE_LAYER_RANK = 60
+ENV_LAYER_RANK = 70
+CLI_LAYER_RANK = 80
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -95,9 +92,6 @@ def _source_bucket(path: str) -> str:
     home = str(Path.home())
     buckets = [
         (f"{home}/repos/opensource/skills", "opensource/skills"),
-        (f"{home}/repos/skills-private", "skills-private"),
-        (f"{home}/repos/marketingskills", "marketingskills"),
-        (f"{home}/repos/sweet-potato", "sweet-potato"),
         (f"{home}/projects/jsm-skill-archive", "archive"),
         (f"{home}/projects/jsm-skill-archive-", "archive"),
     ]

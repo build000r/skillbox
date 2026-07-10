@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -74,6 +75,20 @@ class _FakeManageProcess:
 
 
 class RuntimeStatusHotspotTests(unittest.TestCase):
+    def test_translated_runtime_command_marks_managed_run(self) -> None:
+        model = {"root_dir": str(ROOT_DIR), "env": {}}
+
+        _command, env = runtime_ops_module.translated_runtime_command(
+            model,
+            {
+                "id": "web",
+                "command": "npm run dev",
+                "env": {"SKILLBOX_MANAGED_RUN": "0"},
+            },
+        )
+
+        self.assertEqual(env["SKILLBOX_MANAGED_RUN"], "1")
+
     def test_compact_runtime_status_preserves_agent_facing_summary(self) -> None:
         payload = {
             "clients": [{"id": "personal"}, {"id": ""}],
@@ -169,6 +184,359 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
         self.assertEqual(compact["parity_ledger"]["covered_count"], 1)
         self.assertEqual(compact["next_actions"], ["inspect worker"])
         self.assertNotIn("secret", compact["storage"])
+
+
+class RuntimePortVerificationTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        runtime_ops_module._STARTED_SERVICE_PROCESSES.clear()  # noqa: SLF001
+
+    def _model_and_service(self, root: Path, *, port: int = 5173, healthcheck: dict | None = None) -> tuple[dict, dict]:
+        log_dir = root / "logs" / "runtime"
+        service = {
+            "id": "web",
+            "kind": "service",
+            "command": "python3 -m http.server",
+            "healthcheck": healthcheck if healthcheck is not None else {"type": "port", "port": port},
+        }
+        model = {
+            "root_dir": str(root),
+            "env": {},
+            "logs": [{"id": "runtime", "host_path": str(log_dir)}],
+            "repos": [],
+            "tasks": [],
+            "services": [service],
+            "ingress_routes": [],
+        }
+        return model, service
+
+    def _fake_process(self, pid: int = 4242) -> object:
+        class _Process:
+            returncode = None
+
+            def __init__(self, process_pid: int) -> None:
+                self.pid = process_pid
+
+            def poll(self) -> None:
+                return None
+
+        return _Process(pid)
+
+    def test_start_success_includes_verified_port(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model, service = self._model_and_service(Path(tmpdir), port=5173)
+            process = self._fake_process()
+
+            with (
+                mock.patch.object(runtime_ops_module.subprocess, "Popen", return_value=process),
+                mock.patch.object(runtime_ops_module, "service_healthcheck_state", return_value={"state": "down"}),
+                mock.patch.object(runtime_ops_module, "_port_listening_state", return_value={"state": "down"}),
+                mock.patch.object(runtime_ops_module, "wait_for_service_health", return_value={"state": "ok", "port": 5173}),
+                mock.patch.object(
+                    runtime_ops_module,
+                    "_process_tree_listener_snapshot",
+                    return_value={
+                        "pid": 4242,
+                        "pids": [4242],
+                        "listeners": [{"pid": 4242, "port": 5173, "source": "test"}],
+                        "observed_ports": [5173],
+                        "source": "test",
+                    },
+                ),
+                mock.patch.object(runtime_ops_module, "log_runtime_event"),
+            ):
+                result = runtime_ops_module.start_services(
+                    model,
+                    [service],
+                    dry_run=False,
+                    wait_seconds=0,
+                )[0]
+
+            self.assertEqual(result["result"], "started")
+            self.assertEqual(result["verified_port"], 5173)
+            self.assertEqual(result["port_verification"]["state"], "ok")
+
+    def test_start_wrong_port_stops_service_and_returns_mismatch_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            model, service = self._model_and_service(root, port=5173)
+            process = self._fake_process()
+
+            with (
+                mock.patch.object(runtime_ops_module.subprocess, "Popen", return_value=process),
+                mock.patch.object(runtime_ops_module, "service_healthcheck_state", return_value={"state": "down"}),
+                mock.patch.object(runtime_ops_module, "_port_listening_state", return_value={"state": "down"}),
+                mock.patch.object(runtime_ops_module, "wait_for_service_health", return_value={"state": "ok", "port": 5173}),
+                mock.patch.object(
+                    runtime_ops_module,
+                    "_process_tree_listener_snapshot",
+                    return_value={
+                        "pid": 4242,
+                        "pids": [4242, 4243],
+                        "listeners": [{"pid": 4243, "port": 5174, "source": "test"}],
+                        "observed_ports": [5174],
+                        "source": "test",
+                    },
+                ),
+                mock.patch.object(runtime_ops_module.time, "sleep"),
+                mock.patch.object(runtime_ops_module, "stop_process", return_value=("stopped", 15)) as stop_process,
+                mock.patch.object(runtime_ops_module, "log_runtime_event"),
+            ):
+                result = runtime_ops_module.start_services(
+                    model,
+                    [service],
+                    dry_run=False,
+                    wait_seconds=0,
+                )[0]
+
+            self.assertEqual(result["result"], "failed")
+            self.assertEqual(result["reason"], "port_mismatch")
+            self.assertEqual(result["error"]["type"], "LOCAL_RUNTIME_PORT_MISMATCH")
+            self.assertEqual(result["error"]["declared_ports"], [5173])
+            self.assertEqual(result["error"]["observed_ports"], [5174])
+            stop_process.assert_called_once_with(4242, runtime_ops_module.DEFAULT_SERVICE_STOP_WAIT_SECONDS)
+            self.assertFalse((root / "logs" / "runtime" / "web.pid").exists())
+
+    def test_reuse_wrong_port_process_returns_mismatch_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            model, service = self._model_and_service(root, port=5173)
+            paths = runtime_ops_module.service_paths(model, service)
+            paths["log_dir"].mkdir(parents=True)
+            paths["pid_file"].write_text("4242\n", encoding="utf-8")
+
+            with (
+                mock.patch.object(runtime_ops_module, "process_is_running", return_value=True),
+                mock.patch.object(runtime_ops_module, "service_healthcheck_state", return_value={"state": "ok", "port": 5173}),
+                mock.patch.object(
+                    runtime_ops_module,
+                    "_process_tree_listener_snapshot",
+                    return_value={
+                        "pid": 4242,
+                        "pids": [4242],
+                        "listeners": [{"pid": 4242, "port": 5174, "source": "test"}],
+                        "observed_ports": [5174],
+                        "source": "test",
+                    },
+                ),
+                mock.patch.object(runtime_ops_module.time, "sleep"),
+                mock.patch.object(runtime_ops_module, "stop_process", return_value=("stopped", 15)) as stop_process,
+                mock.patch.object(runtime_ops_module, "log_runtime_event"),
+            ):
+                result = runtime_ops_module.start_services(
+                    model,
+                    [service],
+                    dry_run=False,
+                    wait_seconds=0,
+                )[0]
+
+            self.assertEqual(result["result"], "failed")
+            self.assertEqual(result["error"]["type"], "LOCAL_RUNTIME_PORT_MISMATCH")
+            stop_process.assert_called_once_with(4242, runtime_ops_module.DEFAULT_SERVICE_STOP_WAIT_SECONDS)
+            self.assertFalse(paths["pid_file"].exists())
+
+    def test_prelaunch_declared_port_without_pid_is_mismatch_not_silent_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model, service = self._model_and_service(Path(tmpdir), port=5173)
+
+            with (
+                mock.patch.object(
+                    runtime_ops_module,
+                    "service_healthcheck_state",
+                    return_value={"state": "ok", "port": 5173},
+                ),
+                mock.patch.object(
+                    runtime_ops_module,
+                    "_port_listening_state",
+                    return_value={"state": "down"},
+                ),
+                mock.patch.object(runtime_ops_module, "stop_process") as stop_process,
+                mock.patch.object(runtime_ops_module, "log_runtime_event"),
+            ):
+                result = runtime_ops_module.start_services(
+                    model,
+                    [service],
+                    dry_run=False,
+                    wait_seconds=0,
+                )[0]
+
+            self.assertEqual(result["result"], "failed")
+            self.assertEqual(result["reason"], "port_mismatch")
+            self.assertEqual(result["error"]["type"], "LOCAL_RUNTIME_PORT_MISMATCH")
+            self.assertEqual(result["port_verification"]["source"], "unverified-reuse")
+            stop_process.assert_not_called()
+
+    def test_prelaunch_declared_port_with_verified_external_listener_reuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model, service = self._model_and_service(Path(tmpdir), port=5173)
+
+            with (
+                mock.patch.object(
+                    runtime_ops_module,
+                    "service_healthcheck_state",
+                    return_value={"state": "ok", "port": 5173},
+                ),
+                mock.patch.object(
+                    runtime_ops_module,
+                    "_port_listening_state",
+                    return_value={"state": "ok", "port": 5173},
+                ),
+                mock.patch.object(
+                    runtime_ops_module,
+                    "_external_listener_owner",
+                    return_value={"pid": 5151, "command": "docker-proxy"},
+                ),
+                mock.patch.object(runtime_ops_module, "stop_process") as stop_process,
+                mock.patch.object(runtime_ops_module, "log_runtime_event"),
+            ):
+                result = runtime_ops_module.start_services(
+                    model,
+                    [service],
+                    dry_run=False,
+                    wait_seconds=0,
+                )[0]
+
+            self.assertEqual(result["result"], "already-running")
+            self.assertEqual(result["verified_port"], 5173)
+            self.assertEqual(result["port_verification"]["state"], "ok")
+            self.assertEqual(result["port_verification"]["source"], "external-listener")
+            stop_process.assert_not_called()
+
+    def test_exited_launcher_reuse_is_mismatch_for_declared_port_service(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model, service = self._model_and_service(Path(tmpdir), port=5173)
+            process = self._fake_process()
+
+            with (
+                mock.patch.object(runtime_ops_module.subprocess, "Popen", return_value=process),
+                mock.patch.object(runtime_ops_module, "service_healthcheck_state", return_value={"state": "down"}),
+                mock.patch.object(runtime_ops_module, "_port_listening_state", return_value={"state": "down"}),
+                mock.patch.object(
+                    runtime_ops_module,
+                    "wait_for_service_health",
+                    return_value={"state": "ok", "port": 5173, "reused_existing": True},
+                ),
+                mock.patch.object(runtime_ops_module, "stop_process", return_value=("not-running", None)) as stop_process,
+                mock.patch.object(runtime_ops_module, "log_runtime_event"),
+            ):
+                result = runtime_ops_module.start_services(
+                    model,
+                    [service],
+                    dry_run=False,
+                    wait_seconds=0,
+                )[0]
+
+            self.assertEqual(result["result"], "failed")
+            self.assertEqual(result["error"]["type"], "LOCAL_RUNTIME_PORT_MISMATCH")
+            self.assertEqual(result["port_verification"]["source"], "unverified-reuse")
+            stop_process.assert_called_once_with(4242, runtime_ops_module.DEFAULT_SERVICE_STOP_WAIT_SECONDS)
+
+    def test_slow_bind_retry_can_succeed_before_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model, service = self._model_and_service(Path(tmpdir), port=5173)
+
+            with (
+                mock.patch.object(
+                    runtime_ops_module,
+                    "_process_tree_listener_snapshot",
+                    side_effect=[
+                        {
+                            "pid": 4242,
+                            "pids": [4242],
+                            "listeners": [],
+                            "observed_ports": [],
+                            "source": "test",
+                        },
+                        {
+                            "pid": 4242,
+                            "pids": [4242],
+                            "listeners": [{"pid": 4242, "port": 5173, "source": "test"}],
+                            "observed_ports": [5173],
+                            "source": "test",
+                        },
+                    ],
+                ) as snapshot,
+                mock.patch.object(runtime_ops_module.time, "sleep") as sleep,
+            ):
+                verification = runtime_ops_module._verify_service_declared_ports(  # noqa: SLF001
+                    model,
+                    service,
+                    4242,
+                    attempts=3,
+                    sleep_seconds=1.0,
+                )
+
+            self.assertEqual(verification["state"], "ok")
+            self.assertEqual(verification["attempts"], 2)
+            self.assertEqual(verification["verified_port"], 5173)
+            self.assertEqual(snapshot.call_count, 2)
+            sleep.assert_called_once_with(1.0)
+
+    def test_non_port_services_do_not_run_port_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model, service = self._model_and_service(Path(tmpdir), healthcheck={})
+            process = self._fake_process()
+
+            with (
+                mock.patch.object(runtime_ops_module.subprocess, "Popen", return_value=process),
+                mock.patch.object(runtime_ops_module, "service_healthcheck_state", return_value={"state": "declared"}),
+                mock.patch.object(runtime_ops_module, "_process_tree_listener_snapshot") as snapshot,
+                mock.patch.object(runtime_ops_module, "log_runtime_event"),
+            ):
+                result = runtime_ops_module.start_services(
+                    model,
+                    [service],
+                    dry_run=False,
+                    wait_seconds=0,
+                )[0]
+
+            self.assertEqual(result["result"], "started")
+            snapshot.assert_not_called()
+
+    def test_first_service_error_payload_preserves_local_runtime_mismatch(self) -> None:
+        service_results = [
+            {
+                "id": "web",
+                "result": "failed",
+                "error": {
+                    "type": "LOCAL_RUNTIME_PORT_MISMATCH",
+                    "detail": "wrong port",
+                },
+            }
+        ]
+
+        payload = runtime_ops_module.first_service_error_payload(service_results)
+
+        self.assertEqual(payload["error"]["type"], "LOCAL_RUNTIME_PORT_MISMATCH")
+
+    def test_process_tree_listener_snapshot_detects_real_python_socket(self) -> None:
+        code = (
+            "import socket, sys, time\n"
+            "sock = socket.socket()\n"
+            "sock.bind(('127.0.0.1', 0))\n"
+            "sock.listen()\n"
+            "print(sock.getsockname()[1], flush=True)\n"
+            "time.sleep(30)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        try:
+            assert proc.stdout is not None
+            port = int(proc.stdout.readline().strip())
+            snapshot = runtime_ops_module._process_tree_listener_snapshot(proc.pid)  # noqa: SLF001
+            self.assertIn(port, snapshot["observed_ports"])
+        finally:
+            if proc.stdout is not None:
+                proc.stdout.close()
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
 
     def test_validate_storage_posture_reports_off_root_and_pass_states(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -319,6 +687,10 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
                     return_value=["env: ok"],
                 ),
                 mock.patch(
+                    "runtime_manager.runtime_ops.sync_port_contracts",
+                    return_value=["port-contracts: ok"],
+                ),
+                mock.patch(
                     "runtime_manager.runtime_ops.sync_skill_repo_sets",
                     return_value=["skill-repos: ok"],
                 ),
@@ -348,6 +720,7 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
                 f"exists: {existing_repo}",
                 "artifact: ok",
                 "env: ok",
+                "port-contracts: ok",
                 f"ensure-directory: {log_dir}",
                 "skill-repos: ok",
                 "distributors: ok",
@@ -647,7 +1020,7 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
             },
             "services": [
                 {
-                    "id": "buildooor-web",
+                    "id": "example-web",
                     "kind": "http",
                     "healthcheck": {"type": "http", "url": "http://127.0.0.1:3000/health"},
                 },
@@ -706,7 +1079,7 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
             ],
         }
         rows = [
-            {"id": "buildooor-web"},
+            {"id": "example-web"},
             {"id": "api"},
             {"id": "lan-api"},
             {"id": "wide-web"},
@@ -721,8 +1094,8 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
         )
 
         by_id = {row["id"]: row for row in rows}
-        self.assertEqual(by_id["buildooor-web"]["endpoint"]["exposure"], "loopback-only")
-        self.assertFalse(by_id["buildooor-web"]["viewable_from_tailnet"])
+        self.assertEqual(by_id["example-web"]["endpoint"]["exposure"], "loopback-only")
+        self.assertFalse(by_id["example-web"]["viewable_from_tailnet"])
         self.assertEqual(by_id["api"]["endpoint"]["exposure"], "wildcard-direct")
         self.assertEqual(by_id["api"]["endpoint_url"], "http://100.64.0.10:9100")
         self.assertTrue(by_id["api"]["endpoint"]["all_interfaces"])
@@ -743,7 +1116,7 @@ class RuntimeStatusHotspotTests(unittest.TestCase):
         self.assertEqual(by_id["local-routed-web"]["endpoint"]["exposure"], "loopback-only")
         self.assertFalse(by_id["local-routed-web"]["viewable_from_tailnet"])
         self.assertEqual(len(warnings), 4)
-        self.assertIn("buildooor-web is loopback-only", warnings[0])
+        self.assertIn("example-web is loopback-only", warnings[0])
         self.assertTrue(any("api uses wildcard host 0.0.0.0:9100" in warning for warning in warnings))
         self.assertTrue(any("wide-web uses wildcard host 0.0.0.0:5175" in warning for warning in warnings))
         self.assertTrue(any("local-routed-web has only loopback-only ingress" in warning for warning in warnings))
@@ -849,6 +1222,8 @@ class RuntimeScanHotspotTests(unittest.TestCase):
             mock.patch("runtime_manager.runtime_ops.validate_storage_posture", return_value=[]),
             mock.patch("runtime_manager.runtime_ops.validate_bridges", return_value=[]),
             mock.patch("runtime_manager.runtime_ops.validate_ingress", return_value=[]),
+            mock.patch("runtime_manager.runtime_ops.validate_port_registry", return_value=[]),
+            mock.patch("runtime_manager.runtime_ops.validate_port_contracts", return_value=[]),
         ):
             results = runtime_ops_module.doctor_results({}, Path("/repo"))
 
@@ -4940,6 +5315,132 @@ class ManifestValidationHotspotTests(unittest.TestCase):
         self.assertEqual(hashes, {"alpha": {"codex": "tree-sha"}})
         self.assertEqual(actions, ["install-skill: /bundles/alpha.skill -> /target/alpha"])
         extract.assert_called_once()
+
+    def _runtime_dependency_model(
+        self,
+        services: list[dict[str, object]],
+        artifacts: list[dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "selection": {},
+            "active_profiles": ["local-core"],
+            "active_clients": [],
+            "clients": [],
+            "repos": [],
+            "artifacts": artifacts or [],
+            "env_files": [],
+            "skills": [],
+            "tasks": [],
+            "services": services,
+            "logs": [],
+            "checks": [],
+            "ingress_routes": [],
+        }
+
+    def test_validate_runtime_model_reports_active_service_dependency_cycle(self) -> None:
+        model = self._runtime_dependency_model([
+            {
+                "id": "svc-a",
+                "command": "run-a",
+                "profiles": ["local-core"],
+                "depends_on": ["svc-b"],
+            },
+            {
+                "id": "svc-b",
+                "command": "run-b",
+                "profiles": ["local-core"],
+                "depends_on": ["svc-a"],
+            },
+        ])
+
+        results = validation_module.validate_runtime_model(model)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].code, "LOCAL_RUNTIME_DEPENDENCY_CYCLE")
+        self.assertEqual(results[0].details["cycle"], "svc-a->svc-b->svc-a")
+
+    def test_validate_runtime_model_reports_dangling_active_service_dependency(self) -> None:
+        model = self._runtime_dependency_model([
+            {
+                "id": "svc-a",
+                "command": "run-a",
+                "profiles": ["local-core"],
+                "depends_on": ["missing-service"],
+            },
+            {
+                "id": "inactive",
+                "command": "run-inactive",
+                "profiles": ["other-profile"],
+                "depends_on": ["also-missing"],
+            },
+        ])
+
+        results = validation_module.validate_runtime_model(model)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].code, "LOCAL_RUNTIME_DEPENDENCY_UNKNOWN")
+        self.assertEqual(results[0].details["service_id"], "svc-a")
+        self.assertEqual(results[0].details["dependency_id"], "missing-service")
+
+    def test_clean_manifest_service_dependency_graph_is_unchanged(self) -> None:
+        model = self._runtime_dependency_model([
+            {
+                "id": "svc-a",
+                "command": "run-a",
+                "profiles": ["local-core"],
+                "depends_on": ["svc-b", "artifact-a"],
+            },
+            {
+                "id": "svc-b",
+                "command": "run-b",
+                "profiles": ["local-core"],
+                "depends_on": [],
+            },
+        ], artifacts=[{"id": "artifact-a", "path": "/tmp/artifact-a"}])
+
+        self.assertEqual(validation_module.validate_runtime_model(model), [])
+        results = validation_module.check_manifest(model)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, "pass")
+        self.assertEqual(results[0].code, "runtime-manifest")
+
+    def test_service_resolution_refuses_dependency_cycle_before_lifecycle(self) -> None:
+        model = self._runtime_dependency_model([
+            {
+                "id": "svc-a",
+                "command": "run-a",
+                "profiles": ["local-core"],
+                "depends_on": ["svc-b"],
+            },
+            {
+                "id": "svc-b",
+                "command": "run-b",
+                "profiles": ["local-core"],
+                "depends_on": ["svc-a"],
+            },
+        ])
+
+        with self.assertRaises(Exception) as raised:
+            runtime_ops_module.resolve_services_for_start(model, model["services"])
+
+        self.assertEqual(getattr(raised.exception, "code", None), "LOCAL_RUNTIME_DEPENDENCY_CYCLE")
+        self.assertEqual(raised.exception.context["cycle"], "svc-a->svc-b->svc-a")
+
+    def test_service_stop_resolution_refuses_dangling_dependency_before_lifecycle(self) -> None:
+        model = self._runtime_dependency_model([
+            {
+                "id": "svc-a",
+                "command": "run-a",
+                "profiles": ["local-core"],
+                "depends_on": ["missing-service"],
+            },
+        ])
+
+        with self.assertRaises(Exception) as raised:
+            runtime_ops_module.resolve_services_for_stop(model, model["services"])
+
+        self.assertEqual(getattr(raised.exception, "code", None), "LOCAL_RUNTIME_DEPENDENCY_UNKNOWN")
+        self.assertEqual(raised.exception.context["dependency_id"], "missing-service")
 
     def test_manifest_validation_helpers_cover_env_service_duplicate_and_lock_failures(self) -> None:
         duplicate_model = {

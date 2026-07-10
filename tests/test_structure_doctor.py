@@ -38,7 +38,6 @@ from runtime_manager.structure_doctor import (  # noqa: E402
     STATUS_INCO,
     STATUS_PASS,
     DoctorContext,
-    GateResult,
     run_structure_doctor,
     structure_doctor_text_lines,
 )

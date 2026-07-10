@@ -127,7 +127,7 @@ class MmdxOpenTests(unittest.TestCase):
 
             completed = mock.Mock()
             completed.returncode = 0
-            completed.stdout = "https://buildooor.com/diagrams#pako:abc\n"
+            completed.stdout = "https://example.com/diagrams#pako:abc\n"
             completed.stderr = ""
             with mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run:
                 payload, exit_code = MODULE.mmdx_open_payload(
@@ -140,7 +140,7 @@ class MmdxOpenTests(unittest.TestCase):
 
         self.assertEqual(exit_code, MODULE.EXIT_OK)
         self.assertEqual(payload["action"], "opened")
-        self.assertEqual(payload["viewer"]["url"], "https://buildooor.com/diagrams#pako:abc")
+        self.assertEqual(payload["viewer"]["url"], "https://example.com/diagrams#pako:abc")
         args = run.call_args.args[0]
         self.assertIn(str(script), args)
         self.assertIn(str(target.resolve()), args)

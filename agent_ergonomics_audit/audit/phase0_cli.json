@@ -1,6 +1,6 @@
 {
-  "target_path": "/Users/b/repos/opensource/skillbox",
-  "discovered_at": "2026-05-09T11:04:28Z",
+  "target_path": "/srv/skillbox/repos/opensource/skillbox",
+  "discovered_at": "2026-06-25T06:22:24Z",
   "languages": [],
   "binaries": [],
   "env_var_prefix": "",

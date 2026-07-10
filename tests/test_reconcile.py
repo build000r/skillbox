@@ -4,7 +4,6 @@ import io
 import json
 import sys
 import tempfile
-import textwrap
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from importlib.machinery import SourceFileLoader
@@ -164,6 +163,82 @@ class ReconcileTests(unittest.TestCase):
                 {},
             )
 
+    def test_check_secrets_visible_passes_on_migrated_layout(self) -> None:
+        # Binds whose host dirs contain no secret files -> pass.
+        with tempfile.TemporaryDirectory() as tmp:
+            host_dir = Path(tmp)
+            config = {
+                "services": {
+                    "workspace": {
+                        "volumes": [
+                            {"type": "bind", "source": str(host_dir), "target": "/workspace"},
+                            {"type": "volume", "source": "named", "target": "/data"},
+                        ]
+                    }
+                }
+            }
+            with mock.patch.object(RECONCILE, "compose_config", return_value=config):
+                result = RECONCILE.check_secrets_visible_in_workspace()
+            self.assertEqual(result.status, "pass")
+            self.assertEqual(result.code, "secrets-visible-in-workspace")
+            self.assertEqual(result.details, {"exposed": []})
+
+    def test_check_secrets_visible_fails_with_planted_env_box(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            host_dir = Path(tmp)
+            (host_dir / ".env.box").write_text("SKILLBOX_DO_TOKEN=secret\n", encoding="utf-8")
+            config = {
+                "services": {
+                    "workspace": {
+                        "volumes": [
+                            {"type": "bind", "source": str(host_dir), "target": "/workspace"},
+                        ]
+                    }
+                }
+            }
+            with mock.patch.object(RECONCILE, "compose_config", return_value=config):
+                result = RECONCILE.check_secrets_visible_in_workspace()
+            self.assertEqual(result.status, "fail")
+            self.assertEqual(result.code, "secrets-visible-in-workspace")
+            self.assertIn(".env.box", result.details["exposed"])
+            self.assertIsNotNone(result.fix_command)
+            self.assertIn("mv ./.env.box ./.skillbox-state/operator/.env.box", result.fix_command)
+            self.assertIn("mkdir -p ./.skillbox-state/operator", result.fix_command)
+            # Only the present file should appear in the migration command.
+            self.assertNotIn("mv ./.env ", result.fix_command)
+
+    def test_check_secrets_visible_handles_compose_config_failure(self) -> None:
+        with mock.patch.object(
+            RECONCILE, "compose_config", side_effect=RuntimeError("docker missing")
+        ):
+            result = RECONCILE.check_secrets_visible_in_workspace()
+        self.assertEqual(result.status, "fail")
+        self.assertEqual(result.code, "secrets-visible-in-workspace")
+        self.assertIn("docker missing", result.details["error"])
+        self.assertEqual(result.fix_command, "docker compose config")
+
+    def test_compose_yaml_does_not_bind_mount_secret_files(self) -> None:
+        # Parse compose YAML directly (no docker dependency) and assert no volume
+        # `source` is literally a secret file. Mirrors the compose helper test approach.
+        if RECONCILE.yaml is None:
+            self.skipTest("PyYAML not available")
+        for compose_name in ("docker-compose.yml", "docker-compose.monoserver.yml"):
+            compose = RECONCILE.yaml.safe_load(
+                (ROOT_DIR / compose_name).read_text(encoding="utf-8")
+            )
+            for service in (compose.get("services") or {}).values():
+                for entry in service.get("volumes") or []:
+                    if isinstance(entry, str):
+                        source = entry.split(":", 1)[0]
+                    else:
+                        source = entry.get("source", "")
+                    base = source.rstrip("/").rsplit("/", 1)[-1]
+                    self.assertNotIn(
+                        base,
+                        RECONCILE.OPERATOR_SECRET_FILENAMES,
+                        f"{compose_name} bind-mounts secret file {source}",
+                    )
+
     def test_check_compose_model_reports_workspace_surface_and_swimmers_drift(self) -> None:
         model = {
             "expected_env": {
@@ -301,7 +376,10 @@ class ReconcileTests(unittest.TestCase):
 
         self.assertEqual(drift.status, "fail")
         self.assertEqual(drift.details["hits"], ["docs/note.txt:1"])
-        self.assertEqual(drift.fix_command, 'rg "00-skill-sync.sh" .')
+        # Build the expected fix_command without a literal sentinel so this
+        # test file does not itself trip check_reference_drift (mirrors the
+        # split-string convention used for `legacy_script` above).
+        self.assertEqual(drift.fix_command, f'rg "{legacy_script}" .')
 
         process = mock.Mock(returncode=0, stdout=json.dumps({"checks": [{"status": "warn", "code": "skill-repo-lock-state"}]}), stderr="")
         with mock.patch.object(RECONCILE, "run_command", return_value=process):
@@ -332,14 +410,14 @@ class ReconcileTests(unittest.TestCase):
 
         process = mock.Mock(
             returncode=0,
-            stdout=json.dumps({"actions": ["skill-repo-fetched: build000r/skills"]}),
+            stdout=json.dumps({"actions": ["skill-repo-fetched: example/skills"]}),
             stderr="",
         )
         with mock.patch.object(RECONCILE, "run_command", return_value=process):
             dry_run = RECONCILE.check_skill_sync_dry_run({})
         self.assertEqual(dry_run.status, "pass")
         self.assertEqual(dry_run.code, "skill-repo-sync-dry-run")
-        self.assertEqual(dry_run.details["preview"], ["skill-repo-fetched: build000r/skills"])
+        self.assertEqual(dry_run.details["preview"], ["skill-repo-fetched: example/skills"])
 
         failed_process = mock.Mock(returncode=1, stdout="", stderr="sync failed")
         with mock.patch.object(RECONCILE, "run_command", return_value=failed_process):
@@ -657,6 +735,149 @@ class ReconcileTests(unittest.TestCase):
 
     def _patch_roots(self, repo: Path):
         return mock.patch.multiple(RECONCILE, ROOT_DIR=repo, WORKSPACE_DIR=repo / "workspace")
+
+
+import subprocess  # noqa: E402
+
+MANAGER = ROOT_DIR / ".env-manager" / "manage.py"
+
+_PERSISTENCE_YAML = (
+    "version: 1\n"
+    "state_root_env: SKILLBOX_STATE_ROOT\n"
+    "targets:\n"
+    "  local:\n"
+    "    provider: local\n"
+    "    default_state_root: ./.skillbox-state\n"
+    "  digitalocean:\n"
+    "    provider: digitalocean\n"
+    "    default_state_root: /srv/skillbox\n"
+    "bindings:\n"
+    "  - id: workspace-root\n"
+    "    runtime_path: /workspace\n"
+    "    storage_class: external\n"
+    "    source_ref: root_dir\n"
+    "  - id: clients-root\n"
+    "    runtime_path: /workspace/workspace/clients\n"
+    "    storage_class: persistent\n"
+    "    relative_path: clients\n"
+)
+
+_ENV_EXAMPLE = (
+    "SKILLBOX_NAME=skillbox\n"
+    "SKILLBOX_WORKSPACE_ROOT=/workspace\n"
+    "SKILLBOX_REPOS_ROOT=/workspace/repos\n"
+    "SKILLBOX_SKILLS_ROOT=/workspace/skills\n"
+    "SKILLBOX_LOG_ROOT=/workspace/logs\n"
+    "SKILLBOX_HOME_ROOT=/home/sandbox\n"
+    "SKILLBOX_MONOSERVER_ROOT=/monoserver\n"
+    "SKILLBOX_CLIENTS_ROOT=/workspace/workspace/clients\n"
+    "SKILLBOX_CLIENTS_HOST_ROOT=./workspace/clients\n"
+    "SKILLBOX_MONOSERVER_HOST_ROOT=./monoserver-host\n"
+)
+
+
+class RuntimeIdRejectionCliTests(unittest.TestCase):
+    """skillbox-typed-contracts-epic-ugcx.4: render/doctor must reject an id
+    that violates the canonical slug grammar with code RUNTIME_ID_INVALID and
+    provenance (kind + source file), and client-init must refuse a bad slug.
+    """
+
+    def _run(self, repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["python3", str(MANAGER), "--root-dir", str(repo), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def _write_minimal_repo(self, repo: Path, *, service_id: str) -> None:
+        (repo / "workspace").mkdir(parents=True, exist_ok=True)
+        (repo / "workspace" / "persistence.yaml").write_text(
+            _PERSISTENCE_YAML, encoding="utf-8"
+        )
+        (repo / ".env.example").write_text(_ENV_EXAMPLE, encoding="utf-8")
+        (repo / "workspace" / "runtime.yaml").write_text(
+            "version: 2\n"
+            "selection:\n"
+            "  profiles:\n"
+            "    - core\n"
+            "core:\n"
+            "  services:\n"
+            f"    - id: {service_id}\n"
+            "      path: ${SKILLBOX_WORKSPACE_ROOT}/.env-manager/manage.py\n",
+            encoding="utf-8",
+        )
+
+    def test_render_rejects_bad_service_id_with_code_and_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_minimal_repo(repo, service_id="env/manager")
+
+            result = self._run(repo, "render", "--format", "json")
+
+            self.assertEqual(result.returncode, 1, result.stderr or result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertFalse(payload.get("ok", True))
+            error = payload["error"]
+            self.assertEqual(error["code"], "RUNTIME_ID_INVALID")
+            self.assertEqual(error["type"], "RUNTIME_ID_INVALID")
+            self.assertEqual(payload["error_code"], "RUNTIME_ID_INVALID")
+            context = error["context"]
+            self.assertEqual(context["id"], "env/manager")
+            self.assertEqual(context["kind"], "service")
+            self.assertEqual(Path(context["source_file"]).name, "runtime.yaml")
+            self.assertTrue(error["next_actions"])
+
+    def test_doctor_rejects_bad_service_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_minimal_repo(repo, service_id="../escape")
+
+            result = self._run(repo, "doctor", "--format", "json")
+
+            self.assertEqual(result.returncode, 1, result.stderr or result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["error"]["code"], "RUNTIME_ID_INVALID")
+            self.assertEqual(payload["error"]["context"]["id"], "../escape")
+            self.assertEqual(payload["error"]["context"]["kind"], "service")
+
+    def test_clean_minimal_repo_renders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_minimal_repo(repo, service_id="env-manager")
+
+            result = self._run(repo, "render", "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertNotIn("RUNTIME_ID_INVALID", result.stdout)
+            self.assertTrue(
+                any(s["id"] == "env-manager" for s in payload.get("services", []))
+            )
+
+    def test_client_init_refuses_bad_slug(self) -> None:
+        # client-init must reject a bad slug at creation time with the same
+        # grammar (here: a path-separator slug), before any directory is made.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_minimal_repo(repo, service_id="env-manager")
+
+            result = self._run(repo, "client-init", "bad/slug", "--format", "json")
+
+            self.assertEqual(result.returncode, 1, result.stderr or result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertIn("Invalid client id", payload["error"]["message"])
+
+    def test_client_init_refuses_uppercase_slug(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            self._write_minimal_repo(repo, service_id="env-manager")
+
+            result = self._run(repo, "client-init", "Acme", "--format", "json")
+
+            self.assertEqual(result.returncode, 1, result.stderr or result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertIn("Invalid client id", payload["error"]["message"])
 
 
 if __name__ == "__main__":

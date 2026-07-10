@@ -11,8 +11,8 @@ from .shared import is_elevated_pressure_level
 
 
 GIB = 1024 ** 3
-DEFAULT_TARGET_BOX = "portfolio-devbox"
-EXCLUDED_BOX_IDS = ("jeremy", "ssh-info", "sweet-potato-prod")
+DEFAULT_TARGET_BOX = "worker-devbox"
+EXCLUDED_BOX_IDS = ("prod", "production", "primary-prod")
 
 PROTECTED_BUCKETS = (
     {

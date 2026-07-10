@@ -307,8 +307,8 @@ class BoxTests(unittest.TestCase):
 
     def test_volume_filesystem_label_drops_state_prefix_for_ext4(self) -> None:
         self.assertEqual(
-            BOX_MODULE.volume_filesystem_label("skillbox-state-jeremy", "ext4"),
-            "skillbox-jeremy",
+            BOX_MODULE.volume_filesystem_label("skillbox-state-clienta", "ext4"),
+            "skillbox-clienta",
         )
 
     def test_volume_filesystem_label_respects_xfs_length_limit(self) -> None:
@@ -507,7 +507,7 @@ class BoxTests(unittest.TestCase):
 
     def test_list_shows_active_boxes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            inv_path = Path(tmpdir) / "workspace" / "boxes.json"
+            inv_path = self._inventory_path_for_tmp(tmpdir)
             inv_path.parent.mkdir(parents=True)
             inv_path.write_text(json.dumps({
                 "boxes": [
@@ -667,11 +667,14 @@ class BoxTests(unittest.TestCase):
                 payload["credential_status"]["missing"],
                 ["SKILLBOX_DO_TOKEN", "SKILLBOX_DO_SSH_KEY_ID", "SKILLBOX_TS_AUTHKEY"],
             )
-            self.assertIn("Create or update .env.box", " ".join(payload["next_actions"]))
+            next_actions_text = " ".join(payload["next_actions"])
+            self.assertIn("Create or update ", next_actions_text)
+            # Secrets now live under the state-root operator dir, out of the workspace mount.
+            self.assertIn("operator/.env.box", next_actions_text)
 
     def test_up_rejects_existing_active_box(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            inv_path = Path(tmpdir) / "workspace" / "boxes.json"
+            inv_path = self._inventory_path_for_tmp(tmpdir)
             inv_path.parent.mkdir(parents=True)
             inv_path.write_text(json.dumps({
                 "boxes": [
@@ -701,7 +704,7 @@ class BoxTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             env = self._env_with_inventory(tmpdir)
 
-            result = self._run("down", "ghost", "--format", "json", env=env)
+            result = self._run("down", "ghost", "--dry-run", "--format", "json", env=env)
 
             self.assertEqual(result.returncode, 1)
             payload = json.loads(result.stdout)
@@ -709,7 +712,7 @@ class BoxTests(unittest.TestCase):
 
     def test_down_dry_run_shows_planned_steps(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            inv_path = Path(tmpdir) / "workspace" / "boxes.json"
+            inv_path = self._inventory_path_for_tmp(tmpdir)
             inv_path.parent.mkdir(parents=True)
             inv_path.write_text(json.dumps({
                 "boxes": [
@@ -733,13 +736,13 @@ class BoxTests(unittest.TestCase):
     def test_upgrade_dry_run_shows_release_and_steps(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            inv_path = root / "workspace" / "boxes.json"
+            inv_path = self._inventory_path_for_tmp(tmpdir)
             inv_path.parent.mkdir(parents=True)
             inv_path.write_text(json.dumps({
                 "boxes": [
-                    {"id": "jeremy", "profile": "dev-small", "state": "ready",
+                    {"id": "client_a", "profile": "dev-small", "state": "ready",
                      "droplet_id": "321", "droplet_ip": "1.2.3.4",
-                     "tailscale_hostname": "skillbox-jeremy", "tailscale_ip": "100.64.1.9",
+                     "tailscale_hostname": "skillbox-client_a", "tailscale_ip": "100.64.1.9",
                      "ssh_user": "skillbox", "created_at": "", "updated_at": "",
                      "region": "nyc3", "size": "s-2vcpu-4gb"},
                 ],
@@ -749,7 +752,7 @@ class BoxTests(unittest.TestCase):
             archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
             manifest_path = root / "deploy.json"
             manifest_path.write_text(json.dumps({
-                "client_id": "jeremy",
+                "client_id": "client_a",
                 "source_commit": "abc123def456",
                 "payload_tree_sha256": "1" * 64,
                 "active_profiles": ["connectors", "core"],
@@ -760,7 +763,7 @@ class BoxTests(unittest.TestCase):
             env = self._env_with_inventory(tmpdir)
             result = self._run(
                 "upgrade",
-                "jeremy",
+                "client_a",
                 "--deploy-manifest",
                 str(manifest_path),
                 "--dry-run",
@@ -780,13 +783,13 @@ class BoxTests(unittest.TestCase):
     def test_upgrade_rejects_non_ready_box(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            inv_path = root / "workspace" / "boxes.json"
+            inv_path = self._inventory_path_for_tmp(tmpdir)
             inv_path.parent.mkdir(parents=True)
             inv_path.write_text(json.dumps({
                 "boxes": [
-                    {"id": "jeremy", "profile": "dev-small", "state": "deploying",
+                    {"id": "client_a", "profile": "dev-small", "state": "deploying",
                      "droplet_id": "321", "droplet_ip": "1.2.3.4",
-                     "tailscale_hostname": "skillbox-jeremy", "tailscale_ip": "100.64.1.9",
+                     "tailscale_hostname": "skillbox-client_a", "tailscale_ip": "100.64.1.9",
                      "ssh_user": "skillbox", "created_at": "", "updated_at": "",
                      "region": "nyc3", "size": "s-2vcpu-4gb"},
                 ],
@@ -796,7 +799,7 @@ class BoxTests(unittest.TestCase):
             archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
             manifest_path = root / "deploy.json"
             manifest_path.write_text(json.dumps({
-                "client_id": "jeremy",
+                "client_id": "client_a",
                 "source_commit": "abc123def456",
                 "payload_tree_sha256": "1" * 64,
                 "archive": "skillbox.tar.gz",
@@ -806,7 +809,7 @@ class BoxTests(unittest.TestCase):
             env = self._env_with_inventory(tmpdir)
             result = self._run(
                 "upgrade",
-                "jeremy",
+                "client_a",
                 "--deploy-manifest",
                 str(manifest_path),
                 "--format",
@@ -821,13 +824,13 @@ class BoxTests(unittest.TestCase):
     def test_upgrade_rejects_mismatched_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            inv_path = root / "workspace" / "boxes.json"
+            inv_path = self._inventory_path_for_tmp(tmpdir)
             inv_path.parent.mkdir(parents=True)
             inv_path.write_text(json.dumps({
                 "boxes": [
-                    {"id": "jeremy", "profile": "dev-small", "state": "ready",
+                    {"id": "client_a", "profile": "dev-small", "state": "ready",
                      "droplet_id": "321", "droplet_ip": "1.2.3.4",
-                     "tailscale_hostname": "skillbox-jeremy", "tailscale_ip": "100.64.1.9",
+                     "tailscale_hostname": "skillbox-client_a", "tailscale_ip": "100.64.1.9",
                      "ssh_user": "skillbox", "created_at": "", "updated_at": "",
                      "region": "nyc3", "size": "s-2vcpu-4gb"},
                 ],
@@ -847,7 +850,7 @@ class BoxTests(unittest.TestCase):
             env = self._env_with_inventory(tmpdir)
             result = self._run(
                 "upgrade",
-                "jeremy",
+                "client_a",
                 "--deploy-manifest",
                 str(manifest_path),
                 "--format",
@@ -862,7 +865,7 @@ class BoxTests(unittest.TestCase):
     def test_inventory_round_trip(self) -> None:
         """Verify inventory serialization and deserialization."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            inv_path = Path(tmpdir) / "workspace" / "boxes.json"
+            inv_path = self._inventory_path_for_tmp(tmpdir)
             inv_path.parent.mkdir(parents=True)
 
             original = {
@@ -916,7 +919,7 @@ class BoxTests(unittest.TestCase):
 
     def test_unregister_hides_registered_box_from_list(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            inv_path = Path(tmpdir) / "workspace" / "boxes.json"
+            inv_path = self._inventory_path_for_tmp(tmpdir)
             inv_path.parent.mkdir(parents=True)
             inv_path.write_text(json.dumps({
                 "boxes": [
@@ -1019,19 +1022,25 @@ class BoxTests(unittest.TestCase):
             env=run_env,
         )
 
+    def _inventory_path_for_tmp(self, tmpdir: str) -> Path:
+        return Path(tmpdir) / ".skillbox-state" / "inventory" / "boxes.json"
+
     def _env_with_inventory(self, tmpdir: str) -> dict[str, str]:
         """Create an env dict that redirects inventory to a temp directory."""
         # We patch by setting the env var that box.py uses for REPO_ROOT
         # Since box.py derives INVENTORY_PATH from REPO_ROOT, we need a different approach.
         # The simplest: create the workspace dir structure in tmpdir and set it as working dir.
-        inv_dir = Path(tmpdir) / "workspace"
-        inv_dir.mkdir(parents=True, exist_ok=True)
+        state_root = Path(tmpdir) / ".skillbox-state"
+        state_root.mkdir(parents=True, exist_ok=True)
+        inv_path = self._inventory_path_for_tmp(tmpdir)
+        inv_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Create a wrapper that overrides INVENTORY_PATH
         return {
             "PATH": os.environ.get("PATH", ""),
             "HOME": os.environ.get("HOME", ""),
-            "SKILLBOX_BOX_INVENTORY": str(inv_dir / "boxes.json"),
+            "SKILLBOX_BOX_INVENTORY": str(inv_path),
+            "SKILLBOX_STATE_ROOT": str(state_root),
             "SKILLBOX_DO_TOKEN": "",
             "SKILLBOX_DO_SSH_KEY_ID": "",
             "SKILLBOX_TS_AUTHKEY": "",
@@ -1119,6 +1128,85 @@ class BoxArgvHardeningTests(unittest.TestCase):
              mock.patch.object(BOX_MODULE, "local_swimmers_auth_token", return_value=("tok-abc", "local")):
             payload = BOX_MODULE.remote_box_contract_payload(context)
         self.assertEqual(payload["env_updates"]["SKILLBOX_SWIMMERS_PUBLISH_HOST"], "0.0.0.0")
+
+
+class BoxSshRetryTests(unittest.TestCase):
+    def _write_fake_ssh(self, root: Path) -> tuple[Path, Path]:
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        counter = root / "ssh-count"
+        fake_ssh = bin_dir / "ssh"
+        fake_ssh.write_text(
+            """#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+
+counter = pathlib.Path(os.environ["FAKE_SSH_COUNTER"])
+try:
+    count = int(counter.read_text(encoding="utf-8"))
+except FileNotFoundError:
+    count = 0
+count += 1
+counter.write_text(str(count), encoding="utf-8")
+
+fail_count = int(os.environ.get("FAKE_SSH_FAILS", "0"))
+if count <= fail_count:
+    sys.stderr.write(os.environ.get("FAKE_SSH_ERROR", "Connection timed out\\n"))
+    sys.exit(int(os.environ.get("FAKE_SSH_FAIL_RC", "255")))
+
+sys.stdout.write(os.environ.get("FAKE_SSH_STDOUT", "workspace\\n"))
+sys.exit(int(os.environ.get("FAKE_SSH_SUCCESS_RC", "0")))
+""",
+            encoding="utf-8",
+        )
+        fake_ssh.chmod(0o755)
+        return bin_dir, counter
+
+    def _retry_test_env(self, bin_dir: Path, counter: Path, *, fails: int) -> dict[str, str]:
+        return {
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "FAKE_SSH_COUNTER": str(counter),
+            "FAKE_SSH_FAILS": str(fails),
+            "FAKE_SSH_ERROR": "Connection timed out\n",
+            "FAKE_SSH_STDOUT": "workspace\n",
+        }
+
+    def test_box_health_retries_transient_ssh_transport_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bin_dir, counter = self._write_fake_ssh(Path(tmpdir))
+            box = BOX_MODULE.Box(
+                id="retry-box",
+                profile="dev-small",
+                state="ready",
+                tailscale_ip="100.64.0.8",
+                tailscale_hostname="retry-box",
+            )
+            network_checks = {
+                "public_ssh": {"ok": False, "target": None},
+                "tailnet_ping": {"ok": True, "target": "100.64.0.8"},
+                "magicdns_resolution": {"ok": False, "hostname": "retry-box"},
+                "port_reachability": {"ok": False, "target": "100.64.0.8"},
+            }
+            with mock.patch.dict(os.environ, self._retry_test_env(bin_dir, counter, fails=1), clear=False), \
+                 mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="100.64.0.8"), \
+                 mock.patch.object(BOX_MODULE, "box_network_health", return_value=network_checks):
+                status = BOX_MODULE.box_health(box)
+
+            self.assertTrue(status["container_running"])
+            self.assertEqual(counter.read_text(encoding="utf-8"), "2")
+            self.assertEqual(status["remote_probes"]["container"]["attempts"], 2)
+
+    def test_ssh_cmd_default_does_not_retry_mutating_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bin_dir, counter = self._write_fake_ssh(Path(tmpdir))
+            with mock.patch.dict(os.environ, self._retry_test_env(bin_dir, counter, fails=99), clear=False):
+                result = BOX_MODULE.ssh_cmd("skillbox", "box.example.com", "deploy something", timeout=5)
+
+            self.assertEqual(result.returncode, 255)
+            self.assertEqual(counter.read_text(encoding="utf-8"), "1")
+            self.assertTrue(result.retryable_hint)
+            self.assertEqual(result.failure_class, "ssh_transport")
 
 
 def _swimmers_context_for_test():
@@ -1307,6 +1395,7 @@ class NetworkPostureContractTests(unittest.TestCase):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             pass
         try:
+            os.unlink(f.name)
             with mock.patch.object(BOX_MODULE, "inventory_path", return_value=Path(f.name)):
                 BOX_MODULE.save_inventory([box])
                 loaded = BOX_MODULE.load_inventory()
@@ -1314,7 +1403,10 @@ class NetworkPostureContractTests(unittest.TestCase):
             self.assertEqual(loaded[0].network_posture, "tailnet_only")
             self.assertEqual(loaded[0].cloud_firewall_id, "fw-abc")
         finally:
-            os.unlink(f.name)
+            try:
+                os.unlink(f.name)
+            except FileNotFoundError:
+                pass
 
     def test_box_health_includes_posture_and_violations(self):
         box = self._make_box(

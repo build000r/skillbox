@@ -7,7 +7,6 @@
 # Triggered via ForceCommand in sshd_config for the sandbox user.
 set -euo pipefail
 
-SHARED_HISTORY_LOG="/var/log/skillbox/shared-history.log"
 WHOIS_TIMEOUT=3
 
 # --- Dependency checks ---

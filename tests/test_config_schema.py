@@ -81,7 +81,7 @@ class ConfigSchemaTests(unittest.TestCase):
                 "    verification:\n"
                 "      public_key: \"ed25519:abc123\"\n"
                 "skill_repos:\n"
-                "  - repo: build000r/skills\n"
+                "  - repo: example/skills\n"
                 "    ref: main\n"
                 "    pick: [ask-cascade]\n"
                 "  - path: ./workspace/skills\n"
@@ -94,7 +94,7 @@ class ConfigSchemaTests(unittest.TestCase):
                 distributors, distributor_sources = parse_distribution_config(config, config_path)
 
             self.assertEqual(len(config["skill_repos"]), 3)
-            self.assertEqual(config["skill_repos"][0]["repo"], "build000r/skills")
+            self.assertEqual(config["skill_repos"][0]["repo"], "example/skills")
             self.assertEqual(config["skill_repos"][1]["path"], "./workspace/skills")
             self.assertEqual(config["skill_repos"][2]["distributor"], "acme-skills")
             self.assertEqual(len(distributors), 1)

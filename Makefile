@@ -1,10 +1,25 @@
 COMPOSE := docker compose
 
+# Resolve operator env file for non-secret overrides. Secrets moved out of the
+# workspace bind mount to $(SKILLBOX_STATE_ROOT)/operator/.env, so compose can no
+# longer auto-load .env from the project dir. Prefer the relocated file, fall back
+# to a legacy repo-root .env, else omit --env-file (compose ${VAR:-default}s hold).
+_STATE_ROOT := $(if $(strip $(SKILLBOX_STATE_ROOT)),$(SKILLBOX_STATE_ROOT),./.skillbox-state)
+_OPERATOR_ENV := $(firstword $(wildcard $(_STATE_ROOT)/operator/.env) $(wildcard ./.env))
+_ENV_FILE_ARG := $(if $(_OPERATOR_ENV),--env-file $(_OPERATOR_ENV),)
+
 # Resolve monoserver layer: per-client override when focused, fat default otherwise.
-_FOCUS_CLIENT := $(shell python3 -c "import json; print(json.load(open('workspace/.focus.json')).get('client_id',''))" 2>/dev/null)
+# Read the focused client id. A momentarily-invalid .focus.json silently falls
+# back to empty here, which flips _MONOSERVER_LAYER to the fat default — i.e. it
+# changes WHICH FILESYSTEM gets mounted. Keep the empty fallback (so a clean
+# absent-file case stays quiet) but warn on stderr when the file EXISTS yet
+# fails to parse, so that silent mis-steer becomes visible.
+_FOCUS_CLIENT := $(shell python3 -c "import json,os;p='workspace/.focus.json';\
+print(json.load(open(p)).get('client_id','')) if os.path.exists(p) else print('')" 2>/dev/null \
+|| (echo >&2 'make: warning: workspace/.focus.json exists but failed to parse; falling back to monoserver default mount'; echo ''))
 _CLIENT_OVERRIDE := workspace/.compose-overrides/docker-compose.client-$(_FOCUS_CLIENT).yml
 _MONOSERVER_LAYER := $(if $(and $(_FOCUS_CLIENT),$(wildcard $(_CLIENT_OVERRIDE))),$(_CLIENT_OVERRIDE),docker-compose.monoserver.yml)
-COMPOSEF := $(COMPOSE) -f docker-compose.yml -f $(_MONOSERVER_LAYER)
+COMPOSEF := $(COMPOSE) $(_ENV_FILE_ARG) -f docker-compose.yml -f $(_MONOSERVER_LAYER)
 
 PROFILE_ARGS := $(if $(strip $(PROFILE)),--profile $(PROFILE),)
 CLIENT_ARGS := $(if $(strip $(CLIENT)),--client $(CLIENT),)
@@ -19,11 +34,16 @@ OUTPUT_DIR_ARGS := $(if $(strip $(OUTPUT_DIR)),--output-dir $(OUTPUT_DIR),)
 FORCE_ARGS := $(if $(strip $(FORCE)),--force,)
 RESUME_ARGS := $(if $(strip $(RESUME)),--resume,)
 WRAPPER_BIN_DIR ?= $(HOME)/.local/bin
+DEV_SHIM_BIN_DIR ?= $(HOME)/.local/skillbox-shims
+DEV_SHIM_BINS := npm pnpm yarn vite next astro
 
-.PHONY: help bootstrap-env render doctor acceptance runtime-render runtime-sync runtime-status runtime-skills runtime-skill-audit runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context dev-sanity python-cov-xml wrappers-install build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles box-register box-unregister
+E2E_SMOKE_ARGS := $(if $(strip $(FORMAT)),--format $(FORMAT),) $(if $(filter 1 true yes,$(STRICT)),--strict,) $(ARGS)
+
+.PHONY: help bootstrap-env install-hooks render doctor acceptance runtime-render runtime-sync runtime-status runtime-skills runtime-skill-audit runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context dev-sanity e2e-smoke python-cov-xml wrappers-install dev-shims-install build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles box-register box-unregister
 
 help:
-	@printf "  make bootstrap-env  Copy .env.example to .env if missing\n"
+	@printf "  make bootstrap-env  Seed .skillbox-state/operator/.env from .env.example if missing\n"
+	@printf "  make install-hooks  Configure repo-local git hooks\n"
 	@printf "  make render         Print the resolved sandbox model\n"
 	@printf "  make doctor         Validate outer manifests, compose drift, and default skill-repo-set sync\n"
 	@printf "  make acceptance     Run first-box acceptance for CLIENT=id (optional PROFILE=name)\n"
@@ -44,7 +64,9 @@ help:
 	@printf "  make pulse-stop     Stop the pulse daemon\n"
 	@printf "  make pulse-status   Show pulse daemon status, supervised services, and recent heals\n"
 	@printf "  make dev-sanity     Validate runtime graph, paths, and skill integrity (optional CLIENT=name PROFILE=name)\n"
+	@printf "  make e2e-smoke      Run opt-in read-only e2e smoke (FORMAT=json STRICT=1 supported)\n"
 	@printf "  make wrappers-install Install sbp/sbo symlinks into WRAPPER_BIN_DIR (default ~/.local/bin)\n"
+	@printf "  make dev-shims-install Install dev-command guard shims into DEV_SHIM_BIN_DIR\n"
 	@printf "  make build          Build the workspace image\n"
 	@printf "  make up             Start the workspace container\n"
 	@printf "  make up-surfaces    Start optional api and web stubs\n"
@@ -67,8 +89,15 @@ help:
 	@printf "  make box-register   Register an existing shared box locally (BOX=id HOST=name SSH_USER=user)\n"
 	@printf "  make box-unregister Remove a registered shared box from local inventory (BOX=id)\n"
 
-bootstrap-env:
-	@test -f .env || cp .env.example .env
+bootstrap-env: install-hooks
+	@mkdir -p $(_STATE_ROOT)/operator
+	@test -f $(_STATE_ROOT)/operator/.env || test -f ./.env || cp .env.example $(_STATE_ROOT)/operator/.env
+
+install-hooks:
+	@if git rev-parse --git-dir >/dev/null 2>&1; then \
+		chmod +x .githooks/pre-commit; \
+		git config core.hooksPath .githooks; \
+	fi
 
 render:
 	@python3 scripts/04-reconcile.py render
@@ -121,6 +150,9 @@ context:
 dev-sanity:
 	@python3 .env-manager/manage.py doctor $(CLIENT_ARGS) $(PROFILE_ARGS)
 
+e2e-smoke:
+	@./scripts/e2e-smoke.sh $(E2E_SMOKE_ARGS)
+
 python-cov-xml:
 	@python3 -m coverage erase
 	@python3 -m coverage run --source=scripts,.env-manager -m unittest discover -s tests
@@ -135,6 +167,15 @@ wrappers-install:
 	@SKILLBOX_ROOT="$(CURDIR)" "$(WRAPPER_BIN_DIR)/sbp" --help >/dev/null
 	@SKILLBOX_ROOT="$(CURDIR)" "$(WRAPPER_BIN_DIR)/sbo" --help >/dev/null
 	@printf "installed wrappers: %s/sbp %s/sbo\n" "$(WRAPPER_BIN_DIR)" "$(WRAPPER_BIN_DIR)"
+	@$(MAKE) --no-print-directory dev-shims-install
+
+dev-shims-install:
+	@mkdir -p "$(DEV_SHIM_BIN_DIR)"
+	@chmod +x "$(CURDIR)/scripts/guard-dev-port.sh" "$(CURDIR)/scripts/skillbox-dev-shim.sh"
+	@for bin in $(DEV_SHIM_BINS); do \
+		ln -sf "$(CURDIR)/scripts/skillbox-dev-shim.sh" "$(DEV_SHIM_BIN_DIR)/$$bin"; \
+	done
+	@printf "installed dev shims: %s (%s)\n" "$(DEV_SHIM_BIN_DIR)" "$(DEV_SHIM_BINS)"
 
 pulse-start:
 	@python3 .env-manager/pulse.py run &

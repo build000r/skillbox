@@ -5,35 +5,42 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from .agent_decisions import MAX_FUZZY_SUGGESTIONS, fuzzy_suggestions
 from .agent_graph import AgentGraph
 from .agent_graph_algorithms import normalize_graph
+from .agent_cli_hints import manage_py_command
+from .agent_errors import brain_error_payload
+from .agent_timing import attach_elapsed, timer_start
 from .command_registry import default_registry
 
 SEARCH_SCHEMA_VERSION = "2026-06-11+agent_ops_brain.search"
-DEFAULT_DOC_PATHS = ("README.md", "AGENTS.md")
+DEFAULT_DOC_PATHS = (
+    "README.md",
+    "AGENTS.md",
+    "docs/runtime-graph.md",
+    "docs/clients.md",
+    "docs/skills.md",
+    "docs/operations.md",
+    "docs/troubleshooting.md",
+    "docs/faq.md",
+)
 MAX_DOC_BYTES = 200_000
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_.:-]+")
 
 
 def _error_payload(code: str, message: str, **details: Any) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "ok": False,
-        "schema_version": SEARCH_SCHEMA_VERSION,
-        "error": {
-            "code": code,
-            "type": code.lower(),
-            "message": message,
-            "recoverable": True,
-        },
-        "examples": [
-            "brain.search graph command",
-            "brain.search --kind bead mcp",
-            "brain.search --source docs runtime",
-        ],
-    }
-    if details:
-        payload["error"]["details"] = details
+    payload = brain_error_payload(
+        SEARCH_SCHEMA_VERSION,
+        code,
+        message,
+        context=details or None,
+    )
+    payload["examples"] = [
+        manage_py_command("search", "graph", "command", "--format", "json"),
+        manage_py_command("search", "--kind", "bead", "mcp", "--format", "json"),
+        manage_py_command("search", "--source", "docs", "runtime", "--format", "json"),
+    ]
     return payload
 
 
@@ -117,7 +124,7 @@ def _registry_hits(query_tokens: list[str]) -> list[dict[str, Any]]:
             source="registry",
             title=spec.summary,
             body=body,
-            next_action=spec.examples[0] if spec.examples else f"brain.explain {spec.id}",
+            next_action=spec.examples[0] if spec.examples else manage_py_command("explain", spec.id, "--format", "json"),
             query_tokens=query_tokens,
             base_score=120 if spec.tier == 1 else 80,
         )
@@ -142,7 +149,7 @@ def _graph_hits(graph: AgentGraph | Mapping[str, Any] | None, query_tokens: list
             source="graph",
             title=title,
             body=body,
-            next_action=f"brain.explain {node_id}",
+            next_action=manage_py_command("explain", node_id, "--format", "json"),
             query_tokens=query_tokens,
             base_score=90,
         )
@@ -221,7 +228,7 @@ def _evidence_hits(
             source="evidence",
             title=title,
             body=body,
-            next_action="brain.next --format json",
+            next_action=manage_py_command("next", "--format", "json"),
             query_tokens=query_tokens,
             base_score=85,
         )
@@ -272,13 +279,55 @@ def _doc_hits(
             source="docs",
             title=label,
             body=text,
-            next_action=f"brain.search --source docs {label}",
+            next_action=manage_py_command("search", "--source", "docs", label, "--format", "json"),
             query_tokens=query_tokens,
             base_score=70,
         )
         if hit:
             hits.append(hit)
     return hits, warnings
+
+
+def _search_corpus_ids(
+    graph: AgentGraph | Mapping[str, Any] | None,
+) -> list[str]:
+    ids: set[str] = set()
+    for spec in default_registry():
+        ids.add(spec.id)
+    if graph is not None:
+        normalized = normalize_graph(graph.to_payload() if isinstance(graph, AgentGraph) else graph)
+        ids.update(normalized.nodes.keys())
+    return sorted(ids)
+
+
+def _empty_search_suggestions(
+    query_tokens: list[str],
+    *,
+    graph: AgentGraph | Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    corpus = _search_corpus_ids(graph)
+    query = " ".join(query_tokens)
+    suggestions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for node_id in corpus:
+        lowered = node_id.lower()
+        if not any(token in lowered for token in query_tokens):
+            continue
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        kind = node_id.split(":", 1)[0] if ":" in node_id else "command"
+        suggestions.append({"id": node_id, "kind": kind, "score": 0.75})
+
+    for item in fuzzy_suggestions(query, corpus, cutoff=0.45):
+        if item["id"] in seen:
+            continue
+        seen.add(item["id"])
+        suggestions.append(item)
+
+    suggestions.sort(key=lambda item: (-float(item.get("score") or 0), str(item.get("id"))))
+    return suggestions[:MAX_FUZZY_SUGGESTIONS]
 
 
 def _group_hits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -305,9 +354,10 @@ def search_payload(
     limit: int = 10,
 ) -> dict[str, Any]:
     """Search command registry, graph nodes, docs, Beads, and evidence."""
+    start = timer_start()
     query_tokens = _tokens(query)
     if not query_tokens:
-        return _error_payload("INVALID_ARGUMENT", "search query must not be empty")
+        return attach_elapsed(_error_payload("INVALID_ARGUMENT", "search query must not be empty"), start)
 
     hits: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
@@ -331,7 +381,17 @@ def search_payload(
 
     hits.sort(key=lambda hit: (-int(hit["score"]), str(hit["source"]), str(hit["id"])))
     limited = hits[: max(0, int(limit))]
-    return {
+    suggestions = _empty_search_suggestions(query_tokens, graph=graph) if not limited else []
+    next_actions = [limited[0]["next_action"]] if limited else [
+        manage_py_command("search", suggestion["id"], "--format", "json")
+        for suggestion in suggestions[:3]
+    ]
+    if not next_actions:
+        next_actions = [
+            manage_py_command("search", "graph", "--format", "json"),
+            manage_py_command("next", "--format", "json"),
+        ]
+    payload: dict[str, Any] = {
         "ok": True,
         "schema_version": SEARCH_SCHEMA_VERSION,
         "query": query,
@@ -341,8 +401,11 @@ def search_payload(
         "hits": limited,
         "groups": _group_hits(limited),
         "warnings": warnings,
-        "next_actions": [limited[0]["next_action"]] if limited else ["brain.search graph", "brain.next --format json"],
+        "next_actions": next_actions,
     }
+    if suggestions:
+        payload["suggestions"] = suggestions
+    return attach_elapsed(payload, start)
 
 
 __all__ = [

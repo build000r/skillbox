@@ -27,6 +27,7 @@ Main entry points:
 - Agent ops brain: `python3 .env-manager/manage.py capabilities --format json`, then `python3 .env-manager/manage.py next --format json`
 - Agent graph/search: `python3 .env-manager/manage.py graph --format json`, `python3 .env-manager/manage.py explain brain.next --format json`, `python3 .env-manager/manage.py search "<query>" --format json`
 - Agent snapshots: `python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json`; `snap create --write` writes redacted local state under `.skillbox-state/`
+- Agent brain latency proof: `python3 tests/perf/brain_proof.py --cycles 5` (standalone, outside default unittest discovery)
 - Run tests: `python3 -m unittest discover -s tests`
 - Coverage: `make python-cov-xml`
 - Build image: `make build`
@@ -35,18 +36,27 @@ Main entry points:
 - Runtime services: `make runtime-up CLIENT=<id> PROFILE=<name>`, `make runtime-down CLIENT=<id> PROFILE=<name>`, `make runtime-status`
 - Box lifecycle: `make box-up BOX=<id>`, `make box-down BOX=<id>`, `make box-status`, `make box-list`, `make box-ssh BOX=<id>`
 - Release/upgrade scripts: `install.sh`, `scripts/06-upgrade-release.sh`, `scripts/07-build-and-push-binary.sh`; verify arguments before use.
-- CI: `.github/workflows/ci.yml` runs `python3 scripts/04-reconcile.py render` and `python3 -m unittest discover -s tests` on push/PR.
-- Unknown / verify first: no repo-level lint command was found.
+- CI: `.github/workflows/ci.yml` runs Ruff, ShellCheck, compose config validation, `python3 scripts/04-reconcile.py render`, and the Python unittest matrix on push/PR.
+- Python lint: `python3 -m ruff check .`
+- Shell lint: `shellcheck --severity=warning scripts/*.sh install.sh`
 
 ## Important Paths
 
 - `workspace/runtime.yaml` declares repos, artifacts, skills, services, logs, checks, profiles, and client overlays.
 - `workspace/sandbox.yaml`, `workspace/dependencies.yaml`, and `workspace/persistence.yaml` feed outer validation.
+- `README.md` is the short front door. Moved long-form README content lives in
+  `docs/runtime-graph.md`, `docs/clients.md`, `docs/skills.md`,
+  `docs/operations.md`, `docs/troubleshooting.md`, and `docs/faq.md`.
+- `docs/ARCHITECTURE.md` is the maintainer-grade system map for layers,
+  manifests, runtime modules, data flow, state layout, and extension seams.
 - `.env.example` documents supported env vars. `.env` and `.env.box` are local
   and ignored.
 - `.env-manager/runtime_manager/` contains the Python runtime manager modules.
+  `agent_search.py` indexes the README, AGENTS.md, and the focused docs pages.
 - `scripts/lib/runtime_model.py` builds the shared runtime model.
 - `tests/` contains `unittest` coverage, including `tests/distribution/`.
+- `.skillbox/skill-overrides.yaml` is the repo-local durable skill visibility
+  override file used by `sbp skill on/off/heal/default --repo`.
 - Runtime/log/generated state: `.skillbox-state/`, `logs/`, `invocations/`, `workspace/clients/`, `workspace/skill-repos/`, `workspace/.focus.json`, `workspace/boxes.json`, `sand/`, `builds/`.
 - Generated agent context: `home/.claude/CLAUDE.md`, `home/.codex/AGENTS.md`.
 
@@ -64,6 +74,24 @@ containers, clone/download artifacts, start services, or touch infrastructure.
 `snap diff` are read-only; `snap create --write` is the only brain command that
 writes local generated state.
 
+## Skill Overrides
+
+- Check live skill visibility with `sbp skills --issues-only --json`,
+  `sbp candidates --json`, and `sbp skill why <name> --json` before changing
+  links or policy.
+- Effective skill precedence is: dispatcher floor policy > repo override
+  `.skillbox/skill-overrides.yaml` > global defaults from `skill-scope.yaml`.
+- Durable repo verbs are `sbp skill on <name>`, `sbp skill off <name>`,
+  `sbp skill heal <name>`, and `sbp skill default on|off <name> --repo`.
+  Use `--dry-run` first when available; use `sbp skill lint` after hand-editing
+  `.skillbox/skill-overrides.yaml`.
+- `sbp skill why` and `sbp skill lint` are read-only. `activate`, `add`,
+  `move`, `remove`, `sync`, and `prune` manage links but are not durable repo
+  override decisions unless paired with an override verb.
+- The prune firewall is local-widen-only: project prune skips `pin_on` skills,
+  removes `pin_off` project links, never grants global visibility, and never
+  disables dispatcher floor skills such as `smart` or `sbp`.
+
 ## Background Task Polling
 
 Do not hand-roll `while/for` loops with `sleep` and `grep` to poll for
@@ -76,10 +104,13 @@ notification mechanism is available.
 
 ## Network Posture
 
-Managed boxes default to `tailnet_only`. Public SSH closes after Tailscale
-enrollment (lockdown stage). Use `posture-proof <box-id>` to verify, and
-`box status` to see violations. Do not bind services to `0.0.0.0` on
-tailnet-only boxes — use loopback or Tailnet IP. See
+Managed boxes default to `tailnet_only`: public SSH is a temporary bootstrap
+aperture through `enroll`; after Tailscale enrollment succeeds, `box.py` locks
+host SSH to Tailnet access and updates the DigitalOcean firewall so inbound
+public SSH is closed. `posture-proof` verifies the box-level result with
+`public_ssh_probe`, `tailnet_probe`, `cloud_firewall_rules`, and `violations`;
+service bind exposure is verified by the runtime exposure lint. Do not bind
+services to `0.0.0.0` on tailnet-only boxes — use loopback or Tailnet IP. See
 `docs/tailnet-only-lifecycle.md` for recovery and exposure rules.
 
 ## Coding Notes
@@ -101,7 +132,21 @@ tailnet-only boxes — use loopback or Tailnet IP. See
 
 - Do not commit secrets from `.env`, `.env.box`, `workspace/secrets/`, or local
   client overlays.
+- Skill overrides cannot be used for global escalation. Durable `on`/`off`/`heal`
+  pins are repo-local; global defaults must go through
+  `sbp skill default on|off <name> --global --dry-run` and apply with `--yes`.
+  `off`/`default off` cannot disable dispatcher floor skills.
 - Treat `make box-down`, `scripts/box.py down`, droplet destroy paths, Tailscale removal, and upgrade rollback paths as destructive; use dry-run or confirmation where supported.
+- The `operator_box_exec` MCP tool is gated server-side
+  (`scripts/operator_mcp_server.py`): a short read-only allowlist
+  (status/journalctl/df/`docker ps`/`docker logs`/`git status`/`cat` of
+  non-secret paths/etc.) runs unconditionally, but any mutating or unknown
+  command — or anything with shell chaining/redirection — is rejected until you
+  re-issue the IDENTICAL command with `dry_run=true` first. The preview stamps a
+  marker bound to `box_id + sha256(normalized command)`, so a marker for one
+  command never authorizes another. Every invocation is audited
+  (`operator.box_exec`) with the command redacted. `posture-proof`/`box status`
+  do NOT route through `operator_box_exec`, so the gate adds no friction there.
 - Do not run commands that download, clone, provision, or destroy unless the
   task requires that side effect.
 - Avoid editing generated/runtime state unless the bug is specifically in that
@@ -113,7 +158,7 @@ tailnet-only boxes — use loopback or Tailnet IP. See
 
 ## Beads Workflow Integration
 
-This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
+This project uses [beads_rust](https://github.com/example/beads_rust) (`br`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
 
 ### Essential Commands
 
@@ -180,7 +225,7 @@ git push                # Push to remote
 
 ## Beads Workflow Integration
 
-This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`) for issue tracking and [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) (`bv`) for graph-aware triage. Issues are stored in `.beads/` and tracked in git.
+This project uses [beads_rust](https://github.com/example/beads_rust) (`br`) for issue tracking and [beads_viewer](https://github.com/example/beads_viewer) (`bv`) for graph-aware triage. Issues are stored in `.beads/` and tracked in git.
 
 ### Using bv as an AI sidecar
 

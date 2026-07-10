@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -21,29 +23,67 @@ from lib.runtime_model import build_runtime_model
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 WORKSPACE_DIR = ROOT_DIR / "workspace"
-EXPECTED_FILES = [
-    ".env.example",
-    "Dockerfile",
-    "docker-compose.yml",
-    "docker-compose.monoserver.yml",
-    "docker-compose.swimmers.yml",
-    ".env-manager/README.md",
-    ".env-manager/manage.py",
-    "docker/sandbox-entrypoint.sh",
-    "scripts/01-bootstrap-do.sh",
-    "scripts/02-install-tailscale.sh",
-    "scripts/05-swimmers.sh",
-    "scripts/quick_validate.py",
-    "scripts/lib/__init__.py",
-    "scripts/lib/runtime_model.py",
+
+# ---------------------------------------------------------------------------
+# Expected files: hand-curated CORE + manifest/Makefile-DERIVED (provenance)
+# ---------------------------------------------------------------------------
+#
+# K2 root fix (skillbox-safety-trust-boundary-epic-lzz1.5): the must-exist file
+# list is the credibility surface `make doctor` sells in the README. A static
+# list silently ROTS whenever someone renames/removes a listed file (or forgets
+# to add a newly-required one). So we DERIVE the bulk of the list from the real
+# sources that already reference each file — every derived entry carries
+# PROVENANCE ("expected because <source>:<reference>") — and keep only a small
+# CORE set of genuinely hand-curated files that NO source references. Killing
+# the failure CLASS, not patching instances.
+#
+# CORE is the residual: files that no Makefile target / compose composition /
+# workspace manifest / installer / Dockerfile references, so they cannot be
+# derived. Each MUST carry an inline justification. Keep this list <= 10.
+CORE_EXPECTED_FILES: list[tuple[str, str]] = [
+    # The credibility/handshake docs the README + AGENTS.md sell to operators and
+    # agents; pure prose, referenced by no build/compose/manifest source.
+    ("README.md", "operator-facing project README; not referenced by any build source"),
+    ("AGENTS.md", "coding-agent guide; not referenced by any build source"),
+    (".env-manager/README.md", "runtime-manager subtree README; documentation only, no source references it"),
+    # The curl|bash installer is the entry point a fresh host runs BEFORE any
+    # Makefile/compose exists; nothing upstream references it, so it cannot be
+    # derived — yet it must ship.
+    ("install.sh", "curl|bash bootstrap installer; the root entry point, referenced by nothing upstream"),
+    # `.env.example` is the manifest-validated env template. It is consumed by
+    # load_env_defaults()/check_env_defaults (a value check, not a path
+    # reference) and `make bootstrap-env`; treated as core so its existence is
+    # asserted even when those value checks are skipped.
+    (".env.example", "manifest-validated env template seeded by bootstrap-env; existence is load-bearing for env-defaults check"),
+    # The Dockerfile is the image contract. The Makefile builds it via
+    # `$(COMPOSEF) build` (compose resolves `build.dockerfile`), not by naming
+    # the path, so it is not statically derivable from the Makefile text.
+    ("Dockerfile", "workspace image contract; built via compose `build`, never named as a path in any source"),
+]
+CORE_EXPECTED_FILE_NAMES: list[str] = [path for path, _ in CORE_EXPECTED_FILES]
+
+# Compose files that participate in the Makefile `$(COMPOSEF)` BASE composition
+# (docker-compose.yml -f $(_MONOSERVER_LAYER)). The per-client override
+# (_CLIENT_OVERRIDE) and the swimmers overlay are intentionally NOT here: the
+# override is optional/generated and the swimmers overlay is derived from
+# scripts/05-swimmers.sh instead (see _derive_compose_overlay_files).
+MAKEFILE_BASE_COMPOSE_FILES = ("docker-compose.yml", "docker-compose.monoserver.yml")
+
+# Workspace manifests loaded by build_model() — the declared outer model inputs.
+WORKSPACE_MANIFEST_FILES = (
     "workspace/sandbox.yaml",
     "workspace/dependencies.yaml",
     "workspace/persistence.yaml",
     "workspace/runtime.yaml",
     "workspace/skill-repos.yaml",
-    "workspace/client-blueprints/git-repo.yaml",
-    "workspace/client-blueprints/git-repo-http-service.yaml",
-]
+)
+
+# Regexes used to harvest file references out of Makefile / installer text.
+_SCRIPT_REF_PATTERN = re.compile(
+    r"(?:scripts/[A-Za-z0-9_./-]+\.(?:py|sh)|\.env-manager/[A-Za-z0-9_./-]+\.py)"
+)
+_COMPOSE_REF_PATTERN = re.compile(r"docker-compose[A-Za-z0-9_.-]*\.yml")
+
 EXPECTED_DIRECTORIES = [
     ".env-manager",
     "docker",
@@ -73,6 +113,270 @@ BEADS_SYNC_STATUS_COMMAND = "br sync --status --json"
 SKILL_SYNC_FIX_COMMAND = "make runtime-sync"
 SKILL_SYNC_DRY_RUN_COMMAND = "python3 .env-manager/manage.py sync --dry-run --format json"
 RUNTIME_DOCTOR_COMMAND = "python3 .env-manager/manage.py doctor --format json"
+
+# Operator secret files that must never sit directly under a bind-mounted host dir
+# (e.g. the `.:/workspace` mount), where in-container agents could read them. The
+# canonical home is ${SKILLBOX_STATE_ROOT}/operator/. Kept in sync with the helpers
+# in scripts/box.py and scripts/operator_mcp_server.py.
+OPERATOR_SECRET_FILENAMES = (".env", ".env.box")
+
+
+# ---------------------------------------------------------------------------
+# Expected-files derivation (K2 root fix)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ExpectedFile:
+    """A must-exist repo file with the SOURCE that makes it expected.
+
+    ``path`` is repo-relative. ``provenance`` is the human-readable reason
+    (surfaced in render + in any missing-file finding). ``source`` is the
+    repo-relative file whose text/declaration produced this entry — the doctor
+    self-check verifies that source still PARSES (or, for CORE, is the file
+    itself) so a derivation that silently stops emitting an entry is caught.
+    ``optional`` derivations never produce entries; required referenced files
+    become entries whether or not they currently exist.
+    """
+
+    path: str
+    provenance: str
+    source: str
+
+
+def _read_text_if_present(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except UnicodeDecodeError:  # pragma: no cover - defensive
+        return None
+
+
+def _makefile_target_names(line: str) -> list[str] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or line.startswith(("\t", " ")):
+        return None
+    head, separator, tail = line.partition(":")
+    if not separator or tail.lstrip().startswith("="):
+        return None
+    targets = [item for item in head.split() if item and not item.startswith(".")]
+    return targets
+
+
+def _derive_makefile_script_files(root_dir: Path) -> list[ExpectedFile]:
+    """Scripts referenced by Makefile targets (scripts/*.py|sh, .env-manager/*.py).
+
+    A file is required because a make target invokes it; if the script is
+    renamed/removed the target breaks, so doctor should fail until the rename
+    is reflected everywhere. Optionality is implicit: a script the Makefile
+    never names simply never appears here.
+    """
+    text = _read_text_if_present(root_dir / "Makefile")
+    if text is None:
+        return []
+    entries: dict[str, ExpectedFile] = {}
+    current_targets: list[str] = []
+    for line in text.splitlines():
+        target_names = _makefile_target_names(line)
+        if target_names is not None:
+            current_targets = target_names
+        elif line.strip() and not line.startswith(("\t", "#")):
+            current_targets = []
+
+        provenance = "referenced by Makefile"
+        if current_targets:
+            provenance = f"referenced by Makefile target {', '.join(current_targets)}"
+        for match in _SCRIPT_REF_PATTERN.findall(line):
+            entries.setdefault(match, ExpectedFile(path=match, provenance=provenance, source="Makefile"))
+    return list(entries.values())
+
+
+def _derive_makefile_compose_files(root_dir: Path) -> list[ExpectedFile]:
+    """Compose files in the Makefile `$(COMPOSEF)` BASE composition.
+
+    Only the always-on base files (docker-compose.yml + the fat-default
+    monoserver layer) are required. The per-client override is OPTIONAL
+    (generated, may be absent) and the swimmers overlay is derived from
+    scripts/05-swimmers.sh instead — neither is forced here.
+    """
+    text = _read_text_if_present(root_dir / "Makefile")
+    if text is None:
+        return []
+    present = set(_COMPOSE_REF_PATTERN.findall(text))
+    return [
+        ExpectedFile(
+            path=name,
+            provenance="Makefile $(COMPOSEF) base compose composition",
+            source="Makefile",
+        )
+        for name in MAKEFILE_BASE_COMPOSE_FILES
+        if name in present
+    ]
+
+
+def _derive_swimmers_compose_overlay(root_dir: Path) -> list[ExpectedFile]:
+    """The swimmers compose overlay, derived from scripts/05-swimmers.sh.
+
+    05-swimmers.sh hard-references docker-compose.swimmers.yml in its
+    COMPOSE_FILES array (unconditionally), so the overlay is required whenever
+    that script ships. We only emit a compose file the script actually names;
+    the per-client override it may also pick up is optional and not emitted.
+    """
+    text = _read_text_if_present(root_dir / "scripts" / "05-swimmers.sh")
+    if text is None:
+        return []
+    refs = set(_COMPOSE_REF_PATTERN.findall(text))
+    name = "docker-compose.swimmers.yml"
+    if name not in refs:
+        return []
+    return [
+        ExpectedFile(
+            path=name,
+            provenance="referenced by scripts/05-swimmers.sh COMPOSE_FILES overlay",
+            source="scripts/05-swimmers.sh",
+        )
+    ]
+
+
+def _derive_installer_script_files(root_dir: Path) -> list[ExpectedFile]:
+    """Scripts referenced by the curl|bash installer (install.sh).
+
+    install.sh runs the DO bootstrap + Tailscale install scripts by path; if
+    they are renamed the installer silently breaks. Derived (not CORE) so a
+    rename forces a coordinated update. Only files install.sh actually names
+    are emitted.
+    """
+    text = _read_text_if_present(root_dir / "install.sh")
+    if text is None:
+        return []
+    entries: dict[str, ExpectedFile] = {}
+    for match in sorted(set(_SCRIPT_REF_PATTERN.findall(text))):
+        entries.setdefault(
+            match,
+            ExpectedFile(path=match, provenance="referenced by install.sh", source="install.sh"),
+        )
+    return list(entries.values())
+
+
+def _derive_dockerfile_entrypoint(root_dir: Path) -> list[ExpectedFile]:
+    """The container entrypoint script COPYed by the Dockerfile.
+
+    The Dockerfile `COPY docker/sandbox-entrypoint.sh ...` is what backs the
+    sandbox.yaml `entrypoints`. Derived from the literal COPY source so a
+    rename of the entrypoint script is caught. COPYed shell script sources are
+    emitted even when missing so doctor can report the broken image contract.
+    """
+    text = _read_text_if_present(root_dir / "Dockerfile")
+    if text is None:
+        return []
+    entries: dict[str, ExpectedFile] = {}
+    copy_pattern = re.compile(r"^\s*COPY\s+(\S+)\s", re.MULTILINE)
+    for raw in copy_pattern.findall(text):
+        candidate = raw.strip().removeprefix("./")
+        if candidate.endswith(".sh") and not candidate.startswith("--"):
+            entries.setdefault(
+                candidate,
+                ExpectedFile(
+                    path=candidate,
+                    provenance="COPYed into the image by Dockerfile",
+                    source="Dockerfile",
+                ),
+            )
+    return list(entries.values())
+
+
+def _derive_workspace_manifest_files(root_dir: Path) -> list[ExpectedFile]:
+    """Workspace manifests build_model() loads as the outer model inputs."""
+    return [
+        ExpectedFile(
+            path=name,
+            provenance="declared workspace manifest loaded by build_model()",
+            source=name,
+        )
+        for name in WORKSPACE_MANIFEST_FILES
+    ]
+
+
+def _derive_reconcile_lib_files(root_dir: Path) -> list[ExpectedFile]:
+    """The lib package this script imports (`from lib.runtime_model import ...`).
+
+    scripts/04-reconcile.py imports scripts/lib/runtime_model.py, which makes
+    the module + its package __init__ load-bearing for the reconcile tool
+    itself. Both are required whenever the import statement is present.
+    """
+    text = _read_text_if_present(root_dir / "scripts" / "04-reconcile.py")
+    if text is None or "from lib.runtime_model import" not in text:
+        return []
+    return [
+        ExpectedFile(
+            path="scripts/lib/__init__.py",
+            provenance="lib package init imported by scripts/04-reconcile.py",
+            source="scripts/04-reconcile.py",
+        ),
+        ExpectedFile(
+            path="scripts/lib/runtime_model.py",
+            provenance="imported by scripts/04-reconcile.py (`from lib.runtime_model import ...`)",
+            source="scripts/04-reconcile.py",
+        ),
+    ]
+
+
+_DERIVATION_SOURCES = (
+    _derive_makefile_script_files,
+    _derive_makefile_compose_files,
+    _derive_swimmers_compose_overlay,
+    _derive_installer_script_files,
+    _derive_dockerfile_entrypoint,
+    _derive_workspace_manifest_files,
+    _derive_reconcile_lib_files,
+)
+
+
+def derive_expected_files(root_dir: Path) -> list[ExpectedFile]:
+    """Compute the DERIVED expected-file list from the real sources.
+
+    Deduplicates by path (first provenance wins, deterministic source order).
+    CORE files are intentionally not included here — they are merged by
+    ``resolved_expected_files``.
+    """
+    by_path: dict[str, ExpectedFile] = {}
+    for derive in _DERIVATION_SOURCES:
+        for entry in derive(root_dir):
+            by_path.setdefault(entry.path, entry)
+    return [by_path[path] for path in sorted(by_path)]
+
+
+def resolved_expected_files(root_dir: Path) -> list[ExpectedFile]:
+    """CORE (hand-curated) + DERIVED, deduplicated, sorted by path.
+
+    The single source of truth for both the required-files check and the
+    inspectable render surface. CORE wins ties (a hand-curated justification is
+    more specific than a derivation).
+    """
+    by_path: dict[str, ExpectedFile] = {}
+    for name, reason in CORE_EXPECTED_FILES:
+        by_path[name] = ExpectedFile(path=name, provenance=f"core: {reason}", source=name)
+    for entry in derive_expected_files(root_dir):
+        by_path.setdefault(entry.path, entry)
+    return [by_path[path] for path in sorted(by_path)]
+
+
+def _operator_state_root() -> Path:
+    state_root = os.environ.get("SKILLBOX_STATE_ROOT", "").strip() or "./.skillbox-state"
+    base = Path(state_root)
+    if not base.is_absolute():
+        base = ROOT_DIR / base
+    return base
+
+
+def _operator_env_path() -> Path:
+    """Resolve the operator `.env` (non-secret overrides), preferring the relocated
+    state-root copy and falling back to the deprecated repo-root location."""
+    relocated = (_operator_state_root() / "operator" / ".env").resolve()
+    if relocated.is_file():
+        return relocated
+    return ROOT_DIR / ".env"
 
 
 def repo_rel(path: Path) -> str:
@@ -253,38 +557,18 @@ def build_model() -> dict[str, Any]:
         "SKILLBOX_SBH_DOWNLOAD_URL": "",
         "SKILLBOX_SBH_DOWNLOAD_SHA256": "",
         "SKILLBOX_CASS_BIN": f"{home_root}/.local/bin/cass",
-        "SKILLBOX_CASS_DOWNLOAD_URL": (
-            "https://github.com/Dicklesworthstone/coding_agent_session_search/"
-            "releases/download/v0.6.9/cass-linux-amd64-baseline.tar.gz"
-        ),
-        "SKILLBOX_CASS_DOWNLOAD_SHA256": (
-            "cfcf7b7b4a25e5627344bf02a5c437d79e8253fb6dc9a93e9a317df48f2c37f8"
-        ),
+        "SKILLBOX_CASS_DOWNLOAD_URL": "",
+        "SKILLBOX_CASS_DOWNLOAD_SHA256": "",
         "SKILLBOX_CM_BIN": f"{home_root}/.local/bin/cm",
-        "SKILLBOX_CM_DOWNLOAD_URL": (
-            "https://github.com/Dicklesworthstone/cass_memory_system/releases/"
-            "download/v0.2.3/cass-memory-linux-x64"
-        ),
-        "SKILLBOX_CM_DOWNLOAD_SHA256": (
-            "c1cf33be88ca819f8c457f4519334fa99727da42e29832c71e99fd423f1a29f4"
-        ),
+        "SKILLBOX_CM_DOWNLOAD_URL": "",
+        "SKILLBOX_CM_DOWNLOAD_SHA256": "",
         "SKILLBOX_CM_MCP_PORT": "3222",
         "SKILLBOX_UBS_BIN": f"{home_root}/.local/bin/ubs",
-        "SKILLBOX_UBS_DOWNLOAD_URL": (
-            "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/"
-            "v5.3.2/ubs"
-        ),
-        "SKILLBOX_UBS_DOWNLOAD_SHA256": (
-            "5a1765f05029e571e9d7da71ebb972b777e3ecbdafe540cdd17bd54eaf543132"
-        ),
+        "SKILLBOX_UBS_DOWNLOAD_URL": "",
+        "SKILLBOX_UBS_DOWNLOAD_SHA256": "",
         "SKILLBOX_APR_BIN": f"{home_root}/.local/bin/apr",
-        "SKILLBOX_APR_DOWNLOAD_URL": (
-            "https://github.com/Dicklesworthstone/automated_plan_reviser_pro/"
-            "releases/download/v1.2.2/apr"
-        ),
-        "SKILLBOX_APR_DOWNLOAD_SHA256": (
-            "3d9c0fa7077a1e11cc0ca4a54b6078507c6c077fc5af55081941cb8192372dfc"
-        ),
+        "SKILLBOX_APR_DOWNLOAD_URL": "",
+        "SKILLBOX_APR_DOWNLOAD_SHA256": "",
         "SKILLBOX_DCG_MCP_PORT": "3220",
         "SKILLBOX_FWC_BIN": f"{home_root}/.local/bin/fwc",
         "SKILLBOX_FWC_DOWNLOAD_URL": "",
@@ -306,7 +590,11 @@ def build_model() -> dict[str, Any]:
     # into the rendered config, so reflect the same overrides here so doctor's compose checks
     # verify structural alignment rather than rejecting legitimate local overrides. The
     # `env-defaults` check still validates that `.env.example` itself matches the manifest.
-    runtime_env.update(load_runtime_env_overrides(ROOT_DIR / ".env", runtime_env.keys()))
+    # The operator `.env` now lives under ${SKILLBOX_STATE_ROOT}/operator/ (out of the
+    # workspace bind mount); prefer it, falling back to a legacy repo-root copy. This
+    # mirrors the --env-file compose passes in the Makefile and the load_operator_secret
+    # resolution order in box.py / operator_mcp_server.py.
+    runtime_env.update(load_runtime_env_overrides(_operator_env_path(), runtime_env.keys()))
     # CLIENTS_HOST_ROOT has dual semantics: on the host it's the source path used by
     # client-init scaffolding, but inside the container docker-compose.yml maps it to
     # CLIENTS_ROOT so in-container callers see the same path under either name. The
@@ -460,15 +748,86 @@ def expected_runtime_paths(model: dict[str, Any]) -> dict[str, str]:
 
 
 def check_required_files() -> CheckResult:
-    missing = [path for path in EXPECTED_FILES if not (ROOT_DIR / path).is_file()]
+    """Assert every resolved expected file (CORE + DERIVED) exists, naming the
+    PROVENANCE of any missing one so the operator knows WHY it was expected.
+
+    A missing DERIVED file means a real reference (Makefile/install.sh/compose/
+    Dockerfile/manifest) still points at a file that is gone — fix the rename at
+    its source, not by patching this list.
+    """
+    expected = resolved_expected_files(ROOT_DIR)
+    missing = [entry for entry in expected if not (ROOT_DIR / entry.path).is_file()]
     if missing:
         return CheckResult(
             status="fail",
             code="required-files",
             message="required files are missing",
-            details={"missing": missing},
+            details={
+                "missing": [entry.path for entry in missing],
+                "missing_with_provenance": [
+                    f"{entry.path} ({entry.provenance})" for entry in missing
+                ],
+            },
         )
-    return CheckResult(status="pass", code="required-files", message="required files are present")
+    return CheckResult(
+        status="pass",
+        code="required-files",
+        message="required files are present",
+        details={"checked": len(expected)},
+    )
+
+
+def check_expected_files_sources() -> CheckResult:
+    """Doctor self-check for the expected-files derivation itself.
+
+    Two failure classes:
+
+    1. A static CORE entry is missing on disk — report the exact CORE tuple to
+       delete (the stale instance) so the rot is fixable without spelunking.
+    2. A DERIVED entry's source no longer PARSES as expected (the source file
+       vanished while the derivation still names it) — surfaced as a warning so
+       a half-applied rename is visible before it silently drops coverage.
+    """
+    issues: list[str] = []
+    warnings: list[str] = []
+
+    for path, _reason in CORE_EXPECTED_FILES:
+        if not (ROOT_DIR / path).is_file():
+            issues.append(
+                f"{path}: stale CORE entry — file is gone; delete its tuple from "
+                "CORE_EXPECTED_FILES in scripts/04-reconcile.py"
+            )
+
+    derived = derive_expected_files(ROOT_DIR)
+    for entry in derived:
+        if not (ROOT_DIR / entry.source).is_file():
+            warnings.append(
+                f"{entry.path}: derivation source {entry.source} is missing "
+                f"({entry.provenance})"
+            )
+
+    if issues:
+        return CheckResult(
+            status="fail",
+            code="expected-files-sources",
+            message="the expected-files CORE list has stale entries",
+            details={"stale_core": issues, "stale_sources": warnings},
+            fix_command="python3 scripts/04-reconcile.py render --format json",
+        )
+    if warnings:
+        return CheckResult(
+            status="warn",
+            code="expected-files-sources",
+            message="an expected-files derivation source could not be resolved",
+            details={"stale_sources": warnings},
+            fix_command="python3 scripts/04-reconcile.py render --format json",
+        )
+    return CheckResult(
+        status="pass",
+        code="expected-files-sources",
+        message="expected-files CORE list and derivation sources resolve cleanly",
+        details={"core": len(CORE_EXPECTED_FILES), "derived": len(derived)},
+    )
 
 
 def check_expected_directories() -> CheckResult:
@@ -688,6 +1047,75 @@ def check_compose_model(model: dict[str, Any]) -> list[CheckResult]:
             _swimmers_compose_issues(swimmers_config, model),
         ),
     ]
+
+
+def _secret_migration_fix_command(exposed: list[str]) -> str:
+    """Build the exact (manual) migration command for the exposed secret files."""
+    parts = ["mkdir -p ./.skillbox-state/operator"]
+    for name in OPERATOR_SECRET_FILENAMES:
+        if name in exposed:
+            parts.append(f"mv ./{name} ./.skillbox-state/operator/{name}")
+    return " && ".join(parts)
+
+
+def check_secrets_visible_in_workspace() -> CheckResult:
+    """Fail if any operator secret file sits directly under a bind-mounted host dir.
+
+    Parses `docker compose config` and inspects every bind-mount host source path.
+    For the `.:/workspace` mount the host source is ROOT_DIR, so this catches
+    ROOT_DIR/.env and ROOT_DIR/.env.box. NEVER moves files automatically — on a
+    failure it only emits the manual migration command.
+    """
+    try:
+        config = compose_config(include_surfaces=False)
+    except RuntimeError as exc:
+        return CheckResult(
+            status="fail",
+            code="secrets-visible-in-workspace",
+            message="docker compose config could not be resolved to check secret exposure",
+            details={"error": str(exc)},
+            fix_command="docker compose config",
+        )
+
+    host_sources: set[Path] = set()
+    for service in (config.get("services") or {}).values():
+        for volume in service.get("volumes") or []:
+            if volume.get("type") != "bind":
+                continue
+            source = volume.get("source")
+            if not source:
+                continue
+            try:
+                host_sources.add(Path(source).resolve())
+            except (OSError, ValueError):
+                continue
+
+    exposed: list[str] = []
+    for host_dir in host_sources:
+        if not host_dir.is_dir():
+            continue
+        for name in OPERATOR_SECRET_FILENAMES:
+            if (host_dir / name).is_file() and name not in exposed:
+                exposed.append(name)
+
+    if exposed:
+        return CheckResult(
+            status="fail",
+            code="secrets-visible-in-workspace",
+            message=(
+                "operator secret files are readable by in-container agents — they sit "
+                "inside a bind-mounted host directory"
+            ),
+            details={"exposed": exposed},
+            fix_command=_secret_migration_fix_command(exposed),
+        )
+
+    return CheckResult(
+        status="pass",
+        code="secrets-visible-in-workspace",
+        message="no operator secret files are exposed inside workspace bind mounts",
+        details={"exposed": []},
+    )
 
 
 def check_skill_sync_dry_run(model: dict[str, Any]) -> CheckResult:
@@ -1007,11 +1435,24 @@ def compose_summary(model: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def expected_files_payload() -> list[dict[str, str]]:
+    """The resolved expected-files list with provenance, for the render surface.
+
+    Inspectable so an operator can see exactly which files doctor will require
+    and WHY each one is expected (core justification or derivation source).
+    """
+    return [
+        {"path": entry.path, "provenance": entry.provenance, "source": entry.source}
+        for entry in resolved_expected_files(ROOT_DIR)
+    ]
+
+
 def build_render_payload(with_compose: bool) -> dict[str, Any]:
     model = build_model()
     payload = {
         "sandbox": model["sandbox"],
         "expected_env": model["expected_env"],
+        "expected_files": expected_files_payload(),
         "expected_mounts": model["expected_mounts"],
         "dependencies": model["dependencies"],
         "storage": model["storage"],
@@ -1034,6 +1475,11 @@ def print_render_text(payload: dict[str, Any]) -> None:
     print("env defaults:")
     for key, value in payload["expected_env"].items():
         print(f"  {key}={value}")
+    if payload.get("expected_files"):
+        print()
+        print("expected files:")
+        for entry in payload["expected_files"]:
+            print(f"  {entry['path']}  <- {entry['provenance']}")
     print()
     print("expected mounts:")
     for mount in payload["expected_mounts"]:
@@ -1125,6 +1571,7 @@ def doctor_results(skip_compose: bool, skip_skill_sync: bool) -> list[CheckResul
     model = build_model()
     results = [
         check_required_files(),
+        check_expected_files_sources(),
         check_expected_directories(),
         check_manifest_alignment(model),
         check_env_defaults(model),
@@ -1144,8 +1591,17 @@ def doctor_results(skip_compose: bool, skip_skill_sync: bool) -> list[CheckResul
                 fix_command="python3 scripts/04-reconcile.py doctor --format json",
             )
         )
+        results.append(
+            CheckResult(
+                status="warn",
+                code="secrets-visible-in-workspace",
+                message="workspace secret-exposure check skipped (needs docker compose config)",
+                fix_command="python3 scripts/04-reconcile.py doctor --format json",
+            )
+        )
     else:
         results.extend(check_compose_model(model))
+        results.append(check_secrets_visible_in_workspace())
 
     if skip_skill_sync:
         results.append(

@@ -40,15 +40,15 @@ FIXTURE_YAML = textwrap.dedent(
     machines:
       mac-laptop:
         hostnames: [bs-macbook-air, macbook-pro]
-        home: /Users/b
+        home: /Users/operator
         repo_roots:
-          - /Users/b/repos
+          - /Users/operator/repos
           - ~/repos
         projects_roots:
-          - /Users/b/projects
+          - /Users/operator/projects
 
-      portfolio-devbox:
-        hostnames: [skillbox-portfolio-devbox, portfolio-devbox]
+      worker-devbox:
+        hostnames: [skillbox-worker-devbox, worker-devbox]
         home: /home/skillbox
         managed_home: /srv/skillbox/home
         repo_roots:
@@ -83,9 +83,9 @@ class MachinesLoaderTests(unittest.TestCase):
 
     def test_load_parses_machines_and_aliases(self) -> None:
         self.assertEqual(
-            sorted(self.config.machines), ["mac-laptop", "portfolio-devbox"]
+            sorted(self.config.machines), ["mac-laptop", "worker-devbox"]
         )
-        devbox = self.config.require("portfolio-devbox")
+        devbox = self.config.require("worker-devbox")
         self.assertEqual(devbox.home, "/home/skillbox")
         self.assertEqual(devbox.managed_home, "/srv/skillbox/home")
         self.assertEqual(devbox.canonical_repo_root, "/srv/skillbox/repos")
@@ -108,16 +108,16 @@ class MachinesLoaderTests(unittest.TestCase):
 
     def test_detect_by_hostname_devbox(self) -> None:
         machine_id = self.config.detect_machine_id(
-            hostname="skillbox-portfolio-devbox", env={}
+            hostname="skillbox-worker-devbox", env={}
         )
-        self.assertEqual(machine_id, "portfolio-devbox")
+        self.assertEqual(machine_id, "worker-devbox")
 
     def test_detect_by_short_hostname_strips_domain(self) -> None:
         # A FQDN should match on its short form (the part before the first ".").
         machine_id = self.config.detect_machine_id(
-            hostname="skillbox-portfolio-devbox.tail-scale.ts.net", env={}
+            hostname="skillbox-worker-devbox.tail-scale.ts.net", env={}
         )
-        self.assertEqual(machine_id, "portfolio-devbox")
+        self.assertEqual(machine_id, "worker-devbox")
 
     def test_detect_by_hostname_is_case_insensitive(self) -> None:
         machine_id = self.config.detect_machine_id(
@@ -133,18 +133,18 @@ class MachinesLoaderTests(unittest.TestCase):
 
     def test_current_profile_resolves_from_hostname(self) -> None:
         profile = self.config.current_profile(
-            hostname="portfolio-devbox", env={}
+            hostname="worker-devbox", env={}
         )
         self.assertIsNotNone(profile)
         assert profile is not None
-        self.assertEqual(profile.machine_id, "portfolio-devbox")
+        self.assertEqual(profile.machine_id, "worker-devbox")
 
     # -- SKILLBOX_MACHINE env override ----------------------------------
 
     def test_env_override_wins_over_hostname(self) -> None:
         # Hostname says devbox, but the override forces mac-laptop.
         machine_id = self.config.detect_machine_id(
-            hostname="skillbox-portfolio-devbox",
+            hostname="skillbox-worker-devbox",
             env={m.MACHINE_ENV_VAR: "mac-laptop"},
         )
         self.assertEqual(machine_id, "mac-laptop")
@@ -152,23 +152,23 @@ class MachinesLoaderTests(unittest.TestCase):
     def test_env_override_selects_machine_with_no_hostname_match(self) -> None:
         machine_id = self.config.detect_machine_id(
             hostname="totally-unknown-host",
-            env={m.MACHINE_ENV_VAR: "portfolio-devbox"},
+            env={m.MACHINE_ENV_VAR: "worker-devbox"},
         )
-        self.assertEqual(machine_id, "portfolio-devbox")
+        self.assertEqual(machine_id, "worker-devbox")
 
     def test_env_override_unknown_machine_raises(self) -> None:
         with self.assertRaises(m.MachinesConfigError):
             self.config.detect_machine_id(
-                hostname="skillbox-portfolio-devbox",
+                hostname="skillbox-worker-devbox",
                 env={m.MACHINE_ENV_VAR: "ghost-box"},
             )
 
     def test_blank_env_override_falls_back_to_hostname(self) -> None:
         machine_id = self.config.detect_machine_id(
-            hostname="skillbox-portfolio-devbox",
+            hostname="skillbox-worker-devbox",
             env={m.MACHINE_ENV_VAR: "   "},
         )
-        self.assertEqual(machine_id, "portfolio-devbox")
+        self.assertEqual(machine_id, "worker-devbox")
 
     # -- alias canonicalization -----------------------------------------
 
@@ -186,8 +186,8 @@ class MachinesLoaderTests(unittest.TestCase):
 
     def test_alias_canonicalization_noop_for_non_alias_path(self) -> None:
         self.assertEqual(
-            self.config.canonicalize_alias("/Users/b/repos/foo"),
-            "/Users/b/repos/foo",
+            self.config.canonicalize_alias("/Users/operator/repos/foo"),
+            "/Users/operator/repos/foo",
         )
 
     def test_alias_not_applied_to_lookalike_sibling(self) -> None:
@@ -202,16 +202,16 @@ class MachinesLoaderTests(unittest.TestCase):
     def test_translate_devbox_to_mac(self) -> None:
         out = self.config.translate_path(
             "/srv/skillbox/repos/skillbox-config/machines.yaml",
-            "portfolio-devbox",
+            "worker-devbox",
             "mac-laptop",
         )
-        self.assertEqual(out, "/Users/b/repos/skillbox-config/machines.yaml")
+        self.assertEqual(out, "/Users/operator/repos/skillbox-config/machines.yaml")
 
     def test_translate_mac_to_devbox(self) -> None:
         out = self.config.translate_path(
-            "/Users/b/repos/skillbox-config/machines.yaml",
+            "/Users/operator/repos/skillbox-config/machines.yaml",
             "mac-laptop",
-            "portfolio-devbox",
+            "worker-devbox",
         )
         self.assertEqual(
             out, "/srv/skillbox/repos/skillbox-config/machines.yaml"
@@ -220,10 +220,10 @@ class MachinesLoaderTests(unittest.TestCase):
     def test_translate_round_trips(self) -> None:
         start = "/srv/skillbox/repos/opensource/skillbox/AGENTS.md"
         to_mac = self.config.translate_path(
-            start, "portfolio-devbox", "mac-laptop"
+            start, "worker-devbox", "mac-laptop"
         )
         back = self.config.translate_path(
-            to_mac, "mac-laptop", "portfolio-devbox"
+            to_mac, "mac-laptop", "worker-devbox"
         )
         self.assertEqual(back, start)
 
@@ -231,57 +231,57 @@ class MachinesLoaderTests(unittest.TestCase):
         # An alias-form devbox path should translate as if canonical.
         out = self.config.translate_path(
             "/srv/repos/skillbox-config/machines.yaml",
-            "portfolio-devbox",
+            "worker-devbox",
             "mac-laptop",
         )
-        self.assertEqual(out, "/Users/b/repos/skillbox-config/machines.yaml")
+        self.assertEqual(out, "/Users/operator/repos/skillbox-config/machines.yaml")
 
     def test_translate_projects_root(self) -> None:
         out = self.config.translate_path(
             "/srv/skillbox/projects/foo/bar",
-            "portfolio-devbox",
+            "worker-devbox",
             "mac-laptop",
         )
-        self.assertEqual(out, "/Users/b/projects/foo/bar")
+        self.assertEqual(out, "/Users/operator/projects/foo/bar")
 
     def test_translate_returns_none_for_path_outside_src_roots(self) -> None:
         out = self.config.translate_path(
-            "/etc/hosts", "portfolio-devbox", "mac-laptop"
+            "/etc/hosts", "worker-devbox", "mac-laptop"
         )
         self.assertIsNone(out)
 
     def test_translate_root_itself_maps_to_dst_root(self) -> None:
         out = self.config.translate_path(
-            "/srv/skillbox/repos", "portfolio-devbox", "mac-laptop"
+            "/srv/skillbox/repos", "worker-devbox", "mac-laptop"
         )
-        self.assertEqual(out, "/Users/b/repos")
+        self.assertEqual(out, "/Users/operator/repos")
 
     # -- foreign-path classification ------------------------------------
 
     def test_foreign_path_from_other_machine_is_foreign(self) -> None:
         self.assertTrue(
             self.config.is_foreign_path(
-                "/Users/b/repos/foo", "portfolio-devbox"
+                "/Users/operator/repos/foo", "worker-devbox"
             )
         )
 
     def test_own_path_is_not_foreign(self) -> None:
         self.assertFalse(
             self.config.is_foreign_path(
-                "/srv/skillbox/repos/foo", "portfolio-devbox"
+                "/srv/skillbox/repos/foo", "worker-devbox"
             )
         )
 
     def test_alias_path_is_not_foreign_for_owning_machine(self) -> None:
         # /srv/repos is the devbox's own tree via alias; not foreign to devbox.
         self.assertFalse(
-            self.config.is_foreign_path("/srv/repos/foo", "portfolio-devbox")
+            self.config.is_foreign_path("/srv/repos/foo", "worker-devbox")
         )
 
     def test_unrooted_path_is_not_foreign(self) -> None:
         # A path under no declared root makes no claim; it is not "foreign".
         self.assertFalse(
-            self.config.is_foreign_path("/var/log/syslog", "portfolio-devbox")
+            self.config.is_foreign_path("/var/log/syslog", "worker-devbox")
         )
 
     def test_is_foreign_unknown_machine_raises(self) -> None:
@@ -290,11 +290,11 @@ class MachinesLoaderTests(unittest.TestCase):
 
     def test_classify_path_reports_machine_and_remainder(self) -> None:
         result = self.config.classify_path("/srv/repos/opensource/skillbox")
-        self.assertEqual(result["machines"], ["portfolio-devbox"])
+        self.assertEqual(result["machines"], ["worker-devbox"])
         self.assertEqual(result["canonical"], "/srv/skillbox/repos/opensource/skillbox")
         self.assertEqual(len(result["matches"]), 1)
         match = result["matches"][0]
-        self.assertEqual(match["machine"], "portfolio-devbox")
+        self.assertEqual(match["machine"], "worker-devbox")
         self.assertEqual(match["category"], "repos")
         self.assertEqual(match["root"], "/srv/skillbox/repos")
         self.assertEqual(match["remainder"], "opensource/skillbox")
@@ -368,8 +368,8 @@ class MachinesLocationTests(unittest.TestCase):
         path = _write_fixture(self.tmpdir)
         config = m.load_machines_config(path)
         self.assertEqual(
-            m.detect_machine_id(config, hostname="portfolio-devbox", env={}),
-            "portfolio-devbox",
+            m.detect_machine_id(config, hostname="worker-devbox", env={}),
+            "worker-devbox",
         )
         profile = m.current_profile(config, hostname="bs-macbook-air", env={})
         self.assertIsNotNone(profile)
@@ -391,7 +391,7 @@ class ForeignHomeExpansionTests(unittest.TestCase):
     ``~`` roots to THAT profile's declared ``home``/``managed_home`` instead.
     """
 
-    # mac declares ~/repos with home /Users/b; devbox declares an absolute repo
+    # mac declares ~/repos with home /Users/operator; devbox declares an absolute repo
     # root plus a managed_home at /srv/skillbox/home. We set $HOME = the devbox
     # managed_home to reproduce the exact mis-expansion the bug describes.
     FIXTURE = textwrap.dedent(
@@ -400,13 +400,13 @@ class ForeignHomeExpansionTests(unittest.TestCase):
         machines:
           mac-laptop:
             hostnames: [bs-macbook-air]
-            home: /Users/b
+            home: /Users/operator
             repo_roots:
               - ~/repos
             projects_roots:
               - ~/projects
-          portfolio-devbox:
-            hostnames: [portfolio-devbox]
+          worker-devbox:
+            hostnames: [worker-devbox]
             home: /home/skillbox
             managed_home: /srv/skillbox/home
             repo_roots:
@@ -445,30 +445,30 @@ class ForeignHomeExpansionTests(unittest.TestCase):
     def test_managed_home_path_not_foreign_to_devbox(self) -> None:
         self.assertFalse(
             self.config.is_foreign_path(
-                "/srv/skillbox/home/repos/something", "portfolio-devbox"
+                "/srv/skillbox/home/repos/something", "worker-devbox"
             )
         )
 
     def test_current_machine_tilde_root_still_expands_to_declared_home(self) -> None:
-        # The mac's ~/repos is anchored to ITS declared home (/Users/b), not the
-        # local $HOME — so a /Users/b path classifies as the mac.
-        result = self.config.classify_path("/Users/b/repos/foo")
+        # The mac's ~/repos is anchored to ITS declared home (/Users/operator), not the
+        # local $HOME — so a /Users/operator path classifies as the mac.
+        result = self.config.classify_path("/Users/operator/repos/foo")
         self.assertEqual(result["machines"], ["mac-laptop"])
         match = result["matches"][0]
         self.assertEqual(match["category"], "repos")
         self.assertEqual(match["remainder"], "foo")
         # And the reported root is the home-anchored form, not the raw "~/repos".
-        self.assertEqual(match["root"], "/Users/b/repos")
+        self.assertEqual(match["root"], "/Users/operator/repos")
 
     def test_devbox_absolute_root_unaffected(self) -> None:
-        result = self.config.classify_path("/srv/skillbox/repos/htma")
-        self.assertEqual(result["machines"], ["portfolio-devbox"])
+        result = self.config.classify_path("/srv/skillbox/repos/app_core")
+        self.assertEqual(result["machines"], ["worker-devbox"])
 
     def test_translate_mac_tilde_root_to_devbox_uses_declared_home(self) -> None:
         # A mac ~/repos path translates to the devbox root via the mac's declared
         # home, NOT the local $HOME.
         out = self.config.translate_path(
-            "/Users/b/repos/pkg/x", "mac-laptop", "portfolio-devbox"
+            "/Users/operator/repos/pkg/x", "mac-laptop", "worker-devbox"
         )
         self.assertEqual(out, "/srv/skillbox/repos/pkg/x")
 

@@ -3,29 +3,39 @@ from __future__ import annotations
 from datetime import datetime as DateTime, timezone
 
 from .shared import *
-
+from .errors import ValidationError
+from .graph_cycle_evidence import cycle_evidence
 # Stable error codes from the local_runtime_core_cutover shared contract
 # (shared.md:245-254). Re-exported here so consumers that already pull in
 # the validation module get the full set without also importing
 # scripts.lib.runtime_model.
 from lib.runtime_model import (  # noqa: E402
-    LOCAL_RUNTIME_ENV_BRIDGE_FAILED,
-    LOCAL_RUNTIME_ENV_OUTPUT_MISSING,
-    LOCAL_RUNTIME_PROFILE_UNKNOWN,
-    LOCAL_RUNTIME_START_BLOCKED,
-    LOCAL_RUNTIME_SERVICE_DEFERRED,
-    LOCAL_RUNTIME_MODE_UNSUPPORTED,
     LOCAL_RUNTIME_COVERAGE_GAP,
     LOCAL_RUNTIME_ERROR_CODES,
-    LOCAL_RUNTIME_START_MODES,
-    PARITY_LEDGER_ACTIONS,
-    PARITY_OWNERSHIP_STATES,
-    CANONICAL_RUNTIME_RECORDS,
-    LocalRuntimeContractError,
+    MCP_READY_HEALTHCHECK_TYPE,
     PROJECT_KIND_IOS,
+    VALID_MCP_HEALTHCHECK_TRANSPORTS,
     VALID_PROJECT_KINDS,
+    VALID_SERVICE_HEALTHCHECK_TYPES,
     IOS_COMMAND_LANES,
 )
+from lib.parity_schema import (  # noqa: E402
+    PARITY_LEDGER_INVALID,
+    ParityLedgerRow,
+    ParityLedgerSchemaError,
+    parse_ledger_row,
+)
+
+LOCAL_RUNTIME_DEPENDENCY_CYCLE = "LOCAL_RUNTIME_DEPENDENCY_CYCLE"
+LOCAL_RUNTIME_DEPENDENCY_UNKNOWN = "LOCAL_RUNTIME_DEPENDENCY_UNKNOWN"
+LOCAL_RUNTIME_ERROR_CODES = frozenset(
+    set(LOCAL_RUNTIME_ERROR_CODES)
+    | {
+        LOCAL_RUNTIME_DEPENDENCY_CYCLE,
+        LOCAL_RUNTIME_DEPENDENCY_UNKNOWN,
+    }
+)
+_build_runtime_model_without_parity_schema = build_runtime_model
 
 VALID_INGRESS_ROUTE_LISTENERS = {"public", "private"}
 VALID_INGRESS_ROUTE_MATCHES = {"exact", "prefix"}
@@ -36,6 +46,12 @@ SKILL_FORGE_STALE = "SKILL_FORGE_STALE"
 SKILL_FORGE_PENDING = "SKILL_FORGE_PENDING"
 SKILL_FORGE_UNSCORED = "SKILL_FORGE_UNSCORED"
 SKILL_FORGE_UNSCORED_THRESHOLD = 3
+
+
+def build_runtime_model(root_dir: Path) -> dict[str, Any]:
+    model = _build_runtime_model_without_parity_schema(root_dir)
+    _parse_parity_ledger_rows(model)
+    return model
 
 
 def _looks_like_ingress_origin(raw_value: Any) -> bool:
@@ -56,6 +72,26 @@ def _is_int_port(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _is_intish_port(value: Any) -> bool:
+    if _is_int_port(value):
+        return True
+    text = str(value or "").strip()
+    return text.isdigit() and 0 < int(text) <= 65535
+
+
+def _mcp_healthcheck_transport(service: dict[str, Any], healthcheck: dict[str, Any]) -> str:
+    explicit = str(healthcheck.get("transport") or service.get("transport") or "").strip().lower()
+    if explicit:
+        return explicit
+    if healthcheck.get("url"):
+        return "http"
+    if healthcheck.get("port") is not None or service.get("port") is not None:
+        return "tcp"
+    if healthcheck.get("probe_command") or service.get("probe_command") or service.get("command"):
+        return "stdio"
+    return ""
+
+
 def normalize_active_clients(model: dict[str, Any], raw_clients: list[str] | None) -> set[str]:
     requested_clients = {value.strip() for value in raw_clients or [] if value and value.strip()}
     available_clients = {
@@ -69,11 +105,16 @@ def normalize_active_clients(model: dict[str, Any], raw_clients: list[str] | Non
 
     unknown_clients = sorted(requested_clients - available_clients)
     if unknown_clients:
-        raise RuntimeError(
+        raise ValidationError(
+            "unknown_client",
             "Unknown runtime client(s): "
             + ", ".join(unknown_clients)
             + ". Available clients: "
-            + (", ".join(sorted(available_clients)) or "(none)")
+            + (", ".join(sorted(available_clients)) or "(none)"),
+            context={
+                "unknown": unknown_clients,
+                "available": sorted(available_clients),
+            },
         )
 
     return requested_clients
@@ -154,6 +195,10 @@ def _model_item_id(item: dict[str, Any]) -> str:
 
 def raw_task_dependency_ids(task: dict[str, Any]) -> list[str]:
     return unique_string_field_values(task, "depends_on")
+
+
+def raw_service_dependency_ids(service: dict[str, Any]) -> list[str]:
+    return unique_string_field_values(service, "depends_on")
 
 
 def raw_service_bootstrap_task_ids(service: dict[str, Any]) -> list[str]:
@@ -342,36 +387,56 @@ def filter_model(model: dict[str, Any], active_profiles: set[str], active_client
 def _lockfile_skill_entries(lock_payload: dict[str, Any]) -> list[dict[str, Any]]:
     skills = lock_payload.get("skills") or []
     if not isinstance(skills, list):
-        raise RuntimeError("Lockfile field 'skills' must be a list")
+        raise ValidationError("runtime_error", "Lockfile field 'skills' must be a list")
     for item in skills:
         if not isinstance(item, dict):
-            raise RuntimeError("Lockfile skill entries must be objects")
+            raise ValidationError("runtime_error", "Lockfile skill entries must be objects")
     return skills
 
 
 def _lockfile_skill_name(item: dict[str, Any], mapping: dict[str, dict[str, Any]]) -> str:
     name = str(item.get("name", "")).strip()
     if not name:
-        raise RuntimeError("Lockfile skill entries must include a non-empty name")
+        raise ValidationError("runtime_error", "Lockfile skill entries must include a non-empty name")
     if name in mapping:
-        raise RuntimeError(f"Lockfile contains duplicate skill entry {name!r}")
+        raise ValidationError(
+            "runtime_error",
+            f"Lockfile contains duplicate skill entry {name!r}",
+            context={"skill": name},
+        )
     return name
 
 
 def _lockfile_targets_by_id(name: str, item: dict[str, Any]) -> dict[str, dict[str, Any]]:
     targets = item.get("targets") or []
     if not isinstance(targets, list):
-        raise RuntimeError(f"Lockfile skill {name!r} has a non-list targets field")
+        raise ValidationError(
+            "runtime_error",
+            f"Lockfile skill {name!r} has a non-list targets field",
+            context={"skill": name},
+        )
 
     targets_by_id: dict[str, dict[str, Any]] = {}
     for target in targets:
         if not isinstance(target, dict):
-            raise RuntimeError(f"Lockfile skill {name!r} contains a non-object target entry")
+            raise ValidationError(
+                "runtime_error",
+                f"Lockfile skill {name!r} contains a non-object target entry",
+                context={"skill": name},
+            )
         target_id = str(target.get("id", "")).strip()
         if not target_id:
-            raise RuntimeError(f"Lockfile skill {name!r} contains a target without an id")
+            raise ValidationError(
+                "runtime_error",
+                f"Lockfile skill {name!r} contains a target without an id",
+                context={"skill": name},
+            )
         if target_id in targets_by_id:
-            raise RuntimeError(f"Lockfile skill {name!r} contains duplicate target {target_id!r}")
+            raise ValidationError(
+                "runtime_error",
+                f"Lockfile skill {name!r} contains duplicate target {target_id!r}",
+                context={"skill": name, "target": target_id},
+            )
         targets_by_id[target_id] = target
     return targets_by_id
 
@@ -658,12 +723,16 @@ def _ensure_skillset_sync_inputs(skillset: dict[str, Any], inventory: dict[str, 
         if not present
     ]
     if missing_inputs:
-        raise RuntimeError(
-            f"Skill set {skillset['id']} is missing required files: {', '.join(missing_inputs)}"
+        raise ValidationError(
+            "runtime_error",
+            f"Skill set {skillset['id']} is missing required files: {', '.join(missing_inputs)}",
+            context={"skillset": skillset["id"], "missing": missing_inputs},
         )
     if inventory["missing_bundles"]:
-        raise RuntimeError(
-            f"Skill set {skillset['id']} is missing bundles for: {', '.join(inventory['missing_bundles'])}"
+        raise ValidationError(
+            "runtime_error",
+            f"Skill set {skillset['id']} is missing bundles for: {', '.join(inventory['missing_bundles'])}",
+            context={"skillset": skillset["id"], "missing_bundles": inventory["missing_bundles"]},
         )
 
 
@@ -1094,6 +1163,52 @@ def _validate_skill_install_targets(
     return install_failures
 
 
+def _shared_asset_source_for_entry(
+    skillset: dict[str, Any],
+    config_path: Path,
+    entry: dict[str, Any],
+) -> Path | None:
+    if entry.get("distributor"):
+        return None
+    if entry.get("repo"):
+        clone_root = Path(str(skillset.get("clone_root_host_path", "")))
+        source_root = clone_root / clone_dir_name(str(entry["repo"]))
+    else:
+        local_path = str(entry.get("path", ""))
+        if not local_path:
+            return None
+        source_root = (
+            Path(local_path) if Path(local_path).is_absolute()
+            else (config_path.parent / local_path).resolve()
+        )
+    shared_source = source_root / SHARED_SKILL_ASSET_DIR
+    return shared_source if shared_source.is_dir() else None
+
+
+def _validate_shared_skill_asset_installs(
+    skillset: dict[str, Any],
+    config_path: Path,
+    config: dict[str, Any],
+) -> list[str]:
+    expected_sources = [
+        source
+        for entry in config.get("skill_repos") or []
+        if (source := _shared_asset_source_for_entry(skillset, config_path, entry)) is not None
+    ]
+    if not expected_sources:
+        return []
+
+    sid = skillset["id"]
+    failures: list[str] = []
+    for target in skillset.get("install_targets") or []:
+        install_dir = Path(str(target["host_path"])) / SHARED_SKILL_ASSET_DIR
+        if not install_dir.is_dir():
+            failures.append(
+                f"{sid}: SHARED_ASSET_NOT_INSTALLED: {SHARED_SKILL_ASSET_DIR} missing in {target['id']}"
+            )
+    return failures
+
+
 def _collect_extra_installed_skills(
     skillset: dict[str, Any], all_declared: set[str],
 ) -> list[str]:
@@ -1179,6 +1294,7 @@ def _validate_skillset_locks_and_installs(
     install_failures.extend(_validate_skill_install_targets(
         skillset, declared_skill_names_for_set, lock_skills_by_name, effective_skill_owner,
     ))
+    install_failures.extend(_validate_shared_skill_asset_installs(skillset, config_path, config))
     install_warnings.extend(_collect_extra_installed_skills(skillset, all_declared))
     return config_failures, shared_source_failures, lock_failures, lock_warnings, install_failures, install_warnings
 
@@ -1360,24 +1476,22 @@ def validate_global_skill_contract(
     """Assert the global skill contract is internally consistent.
 
     The operator's ``skill-scope.yaml`` declares the always-global surface in
-    two hand-synced places: the ``global_allowlist`` list (gates install-path
-    patterns) and every rule carrying ``allow_global: true`` (carries the
-    per-rule scope rationale). These are intentionally kept as separate lists --
-    one is a flat allowlist consumed by the install planner, the other is the
-    structured, commented rule set -- but they describe the *same* canonical
-    global set and can silently drift apart.
+    rules carrying ``allow_global: true``. That structured rule set is the source
+    of truth because it carries the per-rule scope rationale that ``sbp`` reads.
+    The flat ``global_allowlist`` key is now only an optional snapshot for human
+    readability and backward-compatible policy files; it must be derived from
+    the rules and never grants a skill by itself.
 
-    DECISION: rather than collapse to one list (which would lose the per-rule
-    rationale the rules carry and that ``sbp`` reads), this lint keeps both lists
-    and makes drift impossible by asserting they are EQUAL:
+    DECISION: allow_global rules are canonical. If ``global_allowlist`` is
+    present, this lint asserts that the snapshot equals the derived projection:
 
         global_allowlist  ==  union(skills of rules where allow_global: true)
 
     On drift it names exactly which skills are in one list but not the other and
-    states the fix (edit the relevant ``allow_global`` rule and
-    ``global_allowlist`` together). Mirrors the three sources reconciled in the
-    sbp dispatcher contract: dispatcher core + named operator exceptions +
-    mode-pack overlays, where the always-global set is exactly this union.
+    states the fix: edit the relevant ``allow_global`` rule, then regenerate or
+    remove the derived snapshot. Mirrors the sbp dispatcher contract: dispatcher
+    core + named operator exceptions + mode-pack overlays, where the
+    always-global set is exactly this union.
     """
     if not isinstance(policy, dict):
         return [
@@ -1388,17 +1502,35 @@ def validate_global_skill_contract(
             )
         ]
 
+    has_allowlist_snapshot = policy.get("global_allowlist") is not None
     allowlist = _scope_global_allowlist(policy)
     allow_global_union = _scope_allow_global_union(policy)
 
-    # An empty policy (no allowlist and no allow_global rules) is not drift; it
-    # just means this policy does not declare a global surface.
-    if not allowlist and not allow_global_union:
+    # An empty policy (no allowlist snapshot and no allow_global rules) is not
+    # drift; it just means this policy does not declare a global surface.
+    if not has_allowlist_snapshot and not allow_global_union:
         return [
             CheckResult(
                 status="pass",
                 code=GLOBAL_SKILL_CONTRACT_CODE,
                 message="skill-scope policy declares no global skill surface",
+            )
+        ]
+
+    if not has_allowlist_snapshot:
+        return [
+            CheckResult(
+                status="pass",
+                code=GLOBAL_SKILL_CONTRACT_CODE,
+                message=(
+                    "global_allowlist is derived from allow_global rules "
+                    f"({len(allow_global_union)} operator skills)"
+                ),
+                details={
+                    "global_skills": sorted(allow_global_union),
+                    "derived_global_allowlist": sorted(allow_global_union),
+                    "global_allowlist_present": False,
+                },
             )
         ]
 
@@ -1423,14 +1555,15 @@ def validate_global_skill_contract(
                 status="fail",
                 code=GLOBAL_SKILL_CONTRACT_CODE,
                 message=(
-                    f"global skill contract drift{location}: global_allowlist must equal "
-                    "the union of skills from all rules with allow_global: true. "
-                    "Fix: edit the relevant allow_global rule and global_allowlist together "
-                    "so they list the same skills."
+                    f"global skill contract drift{location}: global_allowlist is a "
+                    "derived snapshot and must equal the union of skills from all "
+                    "rules with allow_global: true. This list is derived; edit rules "
+                    "instead, then regenerate or remove global_allowlist."
                 ),
                 details={
                     "issues": issues,
                     "global_allowlist": sorted(allowlist),
+                    "derived_global_allowlist": sorted(allow_global_union),
                     "allow_global_union": sorted(allow_global_union),
                     "in_allowlist_only": in_allowlist_only,
                     "in_rules_only": in_rules_only,
@@ -1443,10 +1576,14 @@ def validate_global_skill_contract(
             status="pass",
             code=GLOBAL_SKILL_CONTRACT_CODE,
             message=(
-                "global_allowlist equals the union of allow_global rules "
+                "global_allowlist snapshot equals the union of allow_global rules "
                 f"({len(allowlist)} operator skills)"
             ),
-            details={"global_skills": sorted(allowlist)},
+            details={
+                "global_skills": sorted(allow_global_union),
+                "derived_global_allowlist": sorted(allow_global_union),
+                "global_allowlist_present": True,
+            },
         )
     ]
 
@@ -1489,6 +1626,94 @@ def validate_global_skill_contract_file(
             )
         ]
     return validate_global_skill_contract(policy, policy_path=str(resolved))
+
+
+REPO_SKILL_OVERRIDE_LINT_CODE = "repo-skill-override-lint"
+
+
+def _known_skill_names_for_override_lint(model: dict[str, Any]) -> list[str]:
+    """Declared/discoverable skill names used to detect stale override entries."""
+    names: set[str] = set()
+    try:
+        from .skill_visibility import (  # noqa: PLC0415
+            _declared_skill_occurrences,
+            _skill_source_roots,
+            _skill_source_candidates,
+        )
+
+        declared_occurrences, _ = _declared_skill_occurrences(model)
+        names.update(
+            str(item.get("name") or "").strip()
+            for item in declared_occurrences
+            if str(item.get("name") or "").strip()
+        )
+        for root in _skill_source_roots(model, declared_occurrences):
+            for candidate in _skill_source_candidates(root):
+                name = str(candidate.get("name") or "").strip()
+                if name:
+                    names.add(name)
+    except Exception:
+        return sorted(names)
+    return sorted(names)
+
+
+def repo_skill_override_lint_payload(
+    model: dict[str, Any],
+    *,
+    cwd: str | os.PathLike[str] | Path | None = None,
+) -> dict[str, Any]:
+    """Machine payload for `sbp skill lint`."""
+    from .skill_visibility import lint_repo_override_policy  # noqa: PLC0415
+
+    lint_cwd = Path(cwd or os.environ.get("PWD") or os.getcwd())
+    return lint_repo_override_policy(
+        lint_cwd,
+        known_skill_names=_known_skill_names_for_override_lint(model),
+    )
+
+
+def validate_repo_skill_override_policy(
+    model: dict[str, Any],
+    *,
+    cwd: str | os.PathLike[str] | Path | None = None,
+) -> list[CheckResult]:
+    """Fold repo-local skill override lint into doctor-style CheckResults."""
+    payload = repo_skill_override_lint_payload(model, cwd=cwd)
+    findings = list(payload.get("findings") or [])
+    errors = [item for item in findings if item.get("severity") == "error"]
+    warnings = [item for item in findings if item.get("severity") == "warn"]
+    details = {
+        "policy_path": payload.get("policy_path"),
+        "repo_root": payload.get("repo_root"),
+        "exists": payload.get("exists"),
+        "findings": findings,
+    }
+    if errors:
+        return [
+            CheckResult(
+                status="fail",
+                code=REPO_SKILL_OVERRIDE_LINT_CODE,
+                message=f"{len(errors)} repo skill override error(s)",
+                details=details,
+            )
+        ]
+    if warnings:
+        return [
+            CheckResult(
+                status="warn",
+                code=REPO_SKILL_OVERRIDE_LINT_CODE,
+                message=f"{len(warnings)} repo skill override warning(s)",
+                details=details,
+            )
+        ]
+    return [
+        CheckResult(
+            status="pass",
+            code=REPO_SKILL_OVERRIDE_LINT_CODE,
+            message="repo skill override policy is clean",
+            details=details,
+        )
+    ]
 
 
 OVERLAY_DECLARATION_CODE = "overlay-declaration"
@@ -1676,15 +1901,14 @@ GLOBAL_OVERLAY_PRECEDENCE_CODE = "global-overlay-precedence"
 
 
 def _policy_always_global_skills(policy: dict[str, Any]) -> set[str]:
-    """The always-global skill set: ``global_allowlist`` ∪ allow_global rules.
+    """The always-global skill set derived from ``allow_global`` rules.
 
     These are linked into every repo unconditionally (layer 1+2 of the global
-    skill contract). Both sources are unioned so the precedence lint stays
-    correct even mid-edit, before ``validate_global_skill_contract`` has been
-    re-reconciled (that lint owns the *equality* of the two; this one only needs
-    membership).
+    skill contract). ``global_allowlist`` is only an optional derived snapshot;
+    it never grants a skill by itself, and
+    ``validate_global_skill_contract`` owns snapshot drift.
     """
-    return _scope_global_allowlist(policy) | _scope_allow_global_union(policy)
+    return _scope_allow_global_union(policy)
 
 
 def _policy_overlay_gated_skills(policy: dict[str, Any]) -> dict[str, list[str]]:
@@ -1748,9 +1972,8 @@ def validate_global_overlay_precedence(
     The global skill contract has a strict precedence (repos-sbp-policy-estate-
     oh1.2): an always-global skill -- one granted by an ``allow_global: true``
     rule (the dispatcher core + ``operator-global-exceptions``, e.g.
-    ``divide-and-conquer``) or listed in ``global_allowlist`` -- is linked into
-    EVERY repo unconditionally. Flipping a mode-pack overlay can neither add nor
-    remove it. **Global wins.**
+    ``divide-and-conquer``) -- is linked into EVERY repo unconditionally.
+    Flipping a mode-pack overlay can neither add nor remove it. **Global wins.**
 
     Therefore an overlay rule only meaningfully adds NON-global skills. Naming an
     already-global skill in an overlay rule is ambiguous noise: it implies the
@@ -1807,8 +2030,8 @@ def validate_global_overlay_precedence(
                 code=GLOBAL_OVERLAY_PRECEDENCE_CODE,
                 message=(
                     f"global-vs-overlay precedence conflict{location}: {offender_text}. "
-                    "A skill that is always-global (granted by an allow_global rule or "
-                    "global_allowlist) is linked into every repo unconditionally; an "
+                    "A skill that is always-global (granted by an allow_global rule) "
+                    "is linked into every repo unconditionally; an "
                     "overlay cannot add or remove it (global wins). Naming it in an "
                     "overlay rule is ambiguous. "
                     "Fix: drop the skill from the overlay rule (the global layer already "
@@ -1891,9 +2114,9 @@ def _registry_id_resolved_paths() -> dict[str, set[str]]:
     This is the equality basis for the duplication lint (bug y8w-fix). A literal
     ``paths:`` entry is only a no-op-replaceable duplicate of ``repos: [<id>]``
     when the rule's literals enumerate the WHOLE resolved set of that id; a single
-    home-form spelling like ``~/repos/buildooor`` is a strict SUBSET of the id's
+    home-form spelling like ``~/repos/example-app`` is a strict SUBSET of the id's
     resolved set (which on a machine with ``~/repos`` repo roots also includes the
-    ``/srv/.../buildooor`` re-rooting), so swapping it for ``repos:`` would WIDEN
+    ``/srv/.../example-app`` re-rooting), so swapping it for ``repos:`` would WIDEN
     the match set — a real behavior change the lint must NOT recommend.
 
     Reuses ``skill_visibility``'s registry loader + the SAME machine-aware
@@ -1945,10 +2168,10 @@ def validate_registry_path_duplication(
 
     The subtlety (the y8w fix): a registry id resolves to a SET of spellings on
     the current machine — its home-relative form PLUS every re-rooting under the
-    machine's repo roots (e.g. ``buildooor`` -> ``~/repos/buildooor`` AND
-    ``/srv/.../buildooor`` on a ``~/repos``-rooted box). A literal path like
-    ``~/repos/buildooor`` matches only ONE of those spellings. Replacing that one
-    literal with ``repos: [buildooor]`` would WIDEN the rule's match set to the
+    machine's repo roots (e.g. ``example-app`` -> ``~/repos/example-app`` AND
+    ``/srv/.../example-app`` on a ``~/repos``-rooted box). A literal path like
+    ``~/repos/example-app`` matches only ONE of those spellings. Replacing that one
+    literal with ``repos: [example-app]`` would WIDEN the rule's match set to the
     whole superset — a real behavior change. So a literal that is a strict SUBSET
     of an id's resolved set is INTENTIONALLY narrower and must NOT be flagged.
 
@@ -2654,7 +2877,7 @@ def _check_service_healthcheck(service: dict[str, Any]) -> list[str]:
     healthcheck_type = healthcheck.get("type")
     if not healthcheck_type:
         return issues
-    if healthcheck_type not in VALID_HEALTHCHECK_TYPES:
+    if healthcheck_type not in VALID_SERVICE_HEALTHCHECK_TYPES:
         issues.append(
             f"service {service.get('id')} has unsupported healthcheck.type {healthcheck_type!r}"
         )
@@ -2666,6 +2889,28 @@ def _check_service_healthcheck(service: dict[str, Any]) -> list[str]:
         issues.append(f"service {service.get('id')} process_running healthcheck is missing pattern")
     if healthcheck_type == "port" and not _is_int_port(healthcheck.get("port")):
         issues.append(f"service {service.get('id')} port healthcheck is missing integer port")
+    if healthcheck_type == MCP_READY_HEALTHCHECK_TYPE:
+        transport = _mcp_healthcheck_transport(service, healthcheck)
+        if transport not in VALID_MCP_HEALTHCHECK_TRANSPORTS:
+            issues.append(
+                f"service {service.get('id')} mcp_ready healthcheck has unsupported transport {transport!r}"
+            )
+        elif transport == "http" and not (
+            healthcheck.get("url") or _is_intish_port(healthcheck.get("port") or service.get("port"))
+        ):
+            issues.append(
+                f"service {service.get('id')} mcp_ready http healthcheck is missing url or port"
+            )
+        elif transport == "tcp" and not _is_intish_port(healthcheck.get("port") or service.get("port")):
+            issues.append(
+                f"service {service.get('id')} mcp_ready tcp healthcheck is missing integer port"
+            )
+        elif transport == "stdio" and not (
+            healthcheck.get("probe_command") or service.get("probe_command") or service.get("command")
+        ):
+            issues.append(
+                f"service {service.get('id')} mcp_ready stdio healthcheck is missing probe_command"
+            )
     return issues
 
 
@@ -2743,6 +2988,185 @@ def _check_service_entries(
         issues.extend(_check_service_healthcheck(service))
 
     return issues, service_dependency_map, services_by_id, service_ids
+
+
+def _active_dependency_scope(model: dict[str, Any]) -> tuple[set[str], set[str]]:
+    raw_profiles = model.get("active_profiles")
+    active_profiles = (
+        normalize_active_profiles([str(value) for value in raw_profiles or []])
+        if isinstance(raw_profiles, list)
+        else set()
+    )
+
+    raw_clients = model.get("active_clients")
+    if not isinstance(raw_clients, list):
+        return active_profiles, set()
+    requested_clients = [str(value) for value in raw_clients if str(value).strip()]
+    try:
+        active_clients = normalize_active_clients(model, requested_clients)
+    except ValidationError:
+        active_clients = {value.strip() for value in requested_clients if value.strip()}
+    return active_profiles, active_clients
+
+
+def _item_matches_active_dependency_scope(
+    item: dict[str, Any],
+    active_profiles: set[str],
+    active_clients: set[str],
+) -> bool:
+    if active_profiles and not item_matches_profiles(item, active_profiles):
+        return False
+    if active_clients and not item_matches_clients(item, active_clients):
+        return False
+    return True
+
+
+def _active_dependency_items(
+    model: dict[str, Any],
+    section: str,
+    active_profiles: set[str],
+    active_clients: set[str],
+) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in model.get(section) or []
+        if _item_matches_active_dependency_scope(item, active_profiles, active_clients)
+    ]
+
+
+def _service_dependency_graph_payload(
+    dependency_map: dict[str, list[str]],
+    service_ids: set[str],
+) -> dict[str, Any]:
+    return {
+        "nodes": [
+            {"id": service_id, "kind": "service", "attrs": {}}
+            for service_id in sorted(service_ids)
+        ],
+        "edges": [
+            {
+                "source": service_id,
+                "target": dependency_id,
+                "kind": "depends_on",
+                "attrs": {},
+            }
+            for service_id in sorted(dependency_map)
+            for dependency_id in dependency_map[service_id]
+            if dependency_id in service_ids
+        ],
+    }
+
+
+def _cycle_path_from_edges(nodes: list[str], edges: list[dict[str, Any]]) -> list[str]:
+    node_set = set(nodes)
+    adjacency: dict[str, list[str]] = {node_id: [] for node_id in node_set}
+    for edge in edges:
+        source = str(edge.get("source") or "").strip()
+        target = str(edge.get("target") or "").strip()
+        if source in node_set and target in node_set:
+            adjacency.setdefault(source, []).append(target)
+    for targets in adjacency.values():
+        targets.sort()
+
+    visiting: list[str] = []
+    visited: set[str] = set()
+
+    def visit(node_id: str) -> list[str] | None:
+        if node_id in visiting:
+            return visiting[visiting.index(node_id):] + [node_id]
+        if node_id in visited:
+            return None
+        visiting.append(node_id)
+        for target in adjacency.get(node_id, []):
+            path = visit(target)
+            if path:
+                return path
+        visiting.pop()
+        visited.add(node_id)
+        return None
+
+    for node_id in sorted(node_set):
+        path = visit(node_id)
+        if path:
+            return path
+    return sorted(node_set) + sorted(node_set)[:1]
+
+
+def _dependency_cycle_results(
+    dependency_map: dict[str, list[str]],
+    service_ids: set[str],
+    active_profiles: set[str],
+    active_clients: set[str],
+) -> list[CheckResult]:
+    graph = _service_dependency_graph_payload(dependency_map, service_ids)
+    evidence = cycle_evidence(graph, edge_kinds=("depends_on",))
+    results: list[CheckResult] = []
+    for cycle in evidence.get("cycles") or []:
+        nodes = [str(node_id) for node_id in cycle.get("nodes") or [] if str(node_id)]
+        edges = [edge for edge in cycle.get("edges") or [] if isinstance(edge, dict)]
+        path = _cycle_path_from_edges(nodes, edges)
+        rendered_path = "->".join(path)
+        results.append(CheckResult(
+            status="fail",
+            code=LOCAL_RUNTIME_DEPENDENCY_CYCLE,
+            message=f"service dependency cycle detected: {rendered_path}",
+            details={
+                "error_code": LOCAL_RUNTIME_DEPENDENCY_CYCLE,
+                "cycle": rendered_path,
+                "cycle_path": path,
+                "active_profiles": sorted(active_profiles),
+                "active_clients": sorted(active_clients),
+                "evidence": cycle,
+            },
+        ))
+    return results
+
+
+def validate_runtime_model(model: dict[str, Any]) -> list[CheckResult]:
+    """Validate active-scope service dependency references and cycles."""
+    active_profiles, active_clients = _active_dependency_scope(model)
+    active_services = _active_dependency_items(model, "services", active_profiles, active_clients)
+    active_artifacts = _active_dependency_items(model, "artifacts", active_profiles, active_clients)
+    service_ids = {
+        str(service.get("id", "")).strip()
+        for service in active_services
+        if str(service.get("id", "")).strip()
+    }
+    artifact_ids = {
+        str(artifact.get("id", "")).strip()
+        for artifact in active_artifacts
+        if str(artifact.get("id", "")).strip()
+    }
+    allowed_dependency_ids = service_ids | artifact_ids
+    dependency_map: dict[str, list[str]] = {}
+    results: list[CheckResult] = []
+
+    for service in active_services:
+        service_id = str(service.get("id", "")).strip()
+        if not service_id:
+            continue
+        dependency_ids = raw_service_dependency_ids(service)
+        dependency_map[service_id] = dependency_ids
+        for dependency_id in dependency_ids:
+            if dependency_id in allowed_dependency_ids:
+                continue
+            results.append(CheckResult(
+                status="fail",
+                code=LOCAL_RUNTIME_DEPENDENCY_UNKNOWN,
+                message=f"service {service_id} depends on unknown runtime dependency {dependency_id!r}",
+                details={
+                    "error_code": LOCAL_RUNTIME_DEPENDENCY_UNKNOWN,
+                    "service_id": service_id,
+                    "dependency_id": dependency_id,
+                    "active_profiles": sorted(active_profiles),
+                    "active_clients": sorted(active_clients),
+                    "declared_services": sorted(service_ids),
+                    "declared_artifacts": sorted(artifact_ids),
+                },
+            ))
+
+    results.extend(_dependency_cycle_results(dependency_map, service_ids, active_profiles, active_clients))
+    return results
 
 
 def _detect_dependency_cycles(
@@ -2959,7 +3383,7 @@ def check_manifest(model: dict[str, Any]) -> list[CheckResult]:
     issues.extend(_check_log_entries(model, declared_client_ids))
     issues.extend(_check_check_entries(model, declared_client_ids))
 
-    return _build_manifest_check_result(issues, model)
+    return _build_manifest_check_result(issues, model) + validate_runtime_model(model)
 
 
 def validate_connector_contract(model: dict[str, Any]) -> list[CheckResult]:
@@ -3038,49 +3462,52 @@ def _parity_ledger_graph_ids(model: dict[str, Any]) -> tuple[set[str], set[str],
     )
 
 
-def _parity_ledger_item_values(item: dict[str, Any]) -> tuple[str, str, str, Any, str, str, bool]:
-    item_id = str(item.get("id", "")).strip() or "(missing id)"
-    action = str(item.get("action", "")).strip()
-    ownership_state = str(item.get("ownership_state", "")).strip()
-    bridge_dependency = item.get("bridge_dependency")
-    request_error_raw = item.get("request_error")
-    request_error = str(request_error_raw).strip() if request_error_raw is not None else ""
-    surface = str(item.get("legacy_surface", "")).strip() or item_id
-    surface_type = str(item.get("surface_type", "service")).strip() or "service"
-    return item_id, action, ownership_state, bridge_dependency, request_error, surface, surface_type == "service"
+def _parity_ledger_source(model: dict[str, Any], item: dict[str, Any]) -> str:
+    client_id = str(item.get("client") or "").strip()
+    if client_id:
+        for client in model.get("clients") or []:
+            if str(client.get("id") or "").strip() == client_id:
+                source = str(client.get("_overlay_path") or "").strip()
+                if source:
+                    return source
+    return str(model.get("manifest_file") or "runtime manifest")
 
 
-def _parity_enum_issues(
-    item_id: str,
-    *,
-    action: str,
-    ownership_state: str,
-    request_error: str,
-) -> list[str]:
-    issues: list[str] = []
-    if action and action not in PARITY_LEDGER_ACTIONS:
-        issues.append(f"parity_ledger {item_id}: unsupported action {action!r}")
-    if ownership_state and ownership_state not in PARITY_OWNERSHIP_STATES:
-        issues.append(f"parity_ledger {item_id}: unsupported ownership_state {ownership_state!r}")
-    if request_error and request_error not in LOCAL_RUNTIME_ERROR_CODES:
-        issues.append(
-            f"parity_ledger {item_id}: request_error {request_error!r} is not one of "
-            f"the stable error codes"
+def _parse_parity_ledger_rows(model: dict[str, Any]) -> list[ParityLedgerRow]:
+    rows: list[ParityLedgerRow] = []
+    for index, item in enumerate(model.get("parity_ledger") or []):
+        source = _parity_ledger_source(model, item) if isinstance(item, dict) else str(
+            model.get("manifest_file") or "runtime manifest"
         )
-    return issues
+        try:
+            rows.append(
+                parse_ledger_row(
+                    item,
+                    index=index,
+                    source=source,
+                    known_error_codes=LOCAL_RUNTIME_ERROR_CODES,
+                )
+            )
+        except ParityLedgerSchemaError as exc:
+            raise ValidationError(
+                PARITY_LEDGER_INVALID,
+                str(exc),
+                context=exc.context,
+            ) from exc
+    return rows
 
 
 def _parity_bridge_dependency_issues(
     item_id: str,
-    bridge_dependency: Any,
+    bridge_dependency: str | None,
     *,
     bridge_ids: set[str],
     task_ids: set[str],
 ) -> list[str]:
-    if bridge_dependency is None or not str(bridge_dependency).strip():
+    if not bridge_dependency:
         return []
 
-    dep_id = str(bridge_dependency).strip()
+    dep_id = bridge_dependency
     if dep_id in task_ids and dep_id not in bridge_ids:
         return [
             f"parity_ledger {item_id}: bridge_dependency {dep_id!r} refers to a "
@@ -3144,40 +3571,27 @@ def _parity_service_cross_reference(
 
 
 def _parity_ledger_item_result(
-    item: dict[str, Any],
+    item: ParityLedgerRow,
     *,
     bridge_ids: set[str],
     task_ids: set[str],
     service_ids: set[str],
 ) -> tuple[list[str], str | None, str | None]:
-    (
-        item_id,
-        action,
-        ownership_state,
-        bridge_dependency,
-        request_error,
-        surface,
-        is_service_row,
-    ) = _parity_ledger_item_values(item)
-    issues = _parity_enum_issues(
-        item_id,
-        action=action,
-        ownership_state=ownership_state,
-        request_error=request_error,
-    )
+    item_id = item.id or "(missing id)"
+    issues: list[str] = []
     issues.extend(
         _parity_bridge_dependency_issues(
             item_id,
-            bridge_dependency,
+            item.bridge_dependency,
             bridge_ids=bridge_ids,
             task_ids=task_ids,
         )
     )
     service_issues, covered_service, deferred_surface = _parity_service_cross_reference(
         item_id=item_id,
-        ownership_state=ownership_state,
-        surface=surface,
-        is_service_row=is_service_row,
+        ownership_state=item.ownership_state,
+        surface=item.surface_id,
+        is_service_row=item.is_service_row,
         service_ids=service_ids,
     )
     issues.extend(service_issues)
@@ -3218,12 +3632,20 @@ def validate_parity_ledger(model: dict[str, Any]) -> list[CheckResult]:
 
     bridge_ids, task_ids, service_ids = _parity_ledger_graph_ids(model)
     issues: list[str] = []
+    schema_warnings: list[dict[str, Any]] = []
     covered_services: list[str] = []
     deferred_surfaces: list[str] = []
 
-    for item in ledger:
+    for row in _parse_parity_ledger_rows(model):
+        for warning in row.warnings:
+            schema_warnings.append(
+                {
+                    **warning.to_dict(),
+                    "provenance": dict(row.provenance),
+                }
+            )
         item_issues, covered_service, deferred_surface = _parity_ledger_item_result(
-            item,
+            row,
             bridge_ids=bridge_ids,
             task_ids=task_ids,
             service_ids=service_ids,
@@ -3243,6 +3665,7 @@ def validate_parity_ledger(model: dict[str, Any]) -> list[CheckResult]:
                 details={
                     "error_code": LOCAL_RUNTIME_COVERAGE_GAP,
                     "issues": issues,
+                    "warnings": schema_warnings,
                     "covered_services": sorted(set(covered_services)),
                     "deferred_surfaces": sorted(set(deferred_surfaces)),
                 },
@@ -3257,6 +3680,7 @@ def validate_parity_ledger(model: dict[str, Any]) -> list[CheckResult]:
             details={
                 "covered_services": sorted(set(covered_services)),
                 "deferred_surfaces": sorted(set(deferred_surfaces)),
+                "warnings": schema_warnings,
             },
         )
     ]
