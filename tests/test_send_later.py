@@ -82,6 +82,8 @@ class SendLaterTests(unittest.TestCase):
         self.sendlog = root / "sendlog.txt"
         self.capture = root / "capture.txt"
         self.cronstore = root / "crontab.store"
+        self.launchers = root / "launchers"
+        self.launchers.mkdir()
 
         self._write_exec(self.bin / "tmux", FAKE_TMUX)
         self._write_exec(self.bin / "crontab", FAKE_CRONTAB)
@@ -106,6 +108,7 @@ class SendLaterTests(unittest.TestCase):
         env["FAKE_TMUX_DEAD"] = dead
         env["FAKE_TMUX_SENDLOG"] = str(self.sendlog)
         env["FAKE_CRONTAB_STORE"] = str(self.cronstore)
+        env["SBP_SEND_LATER_LAUNCHER_DIR"] = str(self.launchers)
         if capture is not None:
             self.capture.write_text(capture)
             env["FAKE_TMUX_CAPTURE"] = str(self.capture)
@@ -310,6 +313,53 @@ class SendLaterTests(unittest.TestCase):
         self.assertFalse(data["cron_installed"])
         self.assertFalse(data["ok"])
         self.assertTrue(any("cron tick NOT installed" in i for i in data["issues"]))
+
+    # -- launch mode (whitelisted launcher dispatch) ----------------------
+    def _write_launcher(self, name: str, body: str) -> Path:
+        p = self.launchers / name
+        self._write_exec(p, body)
+        return p
+
+    def test_launch_mode_dispatches_whitelisted_launcher(self) -> None:
+        marker = Path(self.tmp.name) / "launcher-ran.txt"
+        self._write_launcher(
+            "do-work-son",
+            f'#!/usr/bin/env bash\necho fired > "{marker}"\nexit 0\n',
+        )
+        s = self._run("schedule", "--launcher", "do-work-son",
+                      "--id", "dws", "--recurring", "--force")
+        self.assertEqual(s.returncode, 0, s.stderr)
+        job = self._job_env("dws").read_text()
+        self.assertIn("MODE='launch'", job)
+        r = self._run("fire", "dws")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(marker.exists(), "launcher was not executed")
+        # recurring launch job must NOT be marked done after one successful fire
+        self.assertFalse((self.state / "dws.done").exists())
+
+    def test_launch_rejects_unregistered_launcher(self) -> None:
+        r = self._run("schedule", "--launcher", "not-installed", "--force")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not found or not executable", r.stderr)
+
+    def test_launch_rejects_path_traversal_slug(self) -> None:
+        r = self._run("schedule", "--launcher", "../evil", "--force")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("slug", r.stderr)
+
+    def test_launch_rejects_pane_args(self) -> None:
+        self._write_launcher("do-work-son", "#!/usr/bin/env bash\nexit 0\n")
+        r = self._run("schedule", "--launcher", "do-work-son",
+                      "--to", "0", "--message", "hi")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("no pane destination", r.stderr)
+
+    def test_launch_runner_rejects_non_executable(self) -> None:
+        # A registered-but-non-executable file must be refused at schedule time.
+        (self.launchers / "do-work-son").write_text("#!/usr/bin/env bash\nexit 0\n")
+        r = self._run("schedule", "--launcher", "do-work-son", "--force")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not found or not executable", r.stderr)
 
 
 if __name__ == "__main__":

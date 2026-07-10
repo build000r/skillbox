@@ -1,13 +1,43 @@
 <!-- mmdx
 {
   "entry": "main",
-  "shortLink": { "username": "skillbox", "slug": "" },
+  "shortLink": { "username": "buildooor", "slug": "skillbox-project-status" },
   "links": [
+    {
+      "from": "main",
+      "label": "Open epic status",
+      "to": "epic-gantt",
+      "title": "Open epic status"
+    },
+    {
+      "from": "main",
+      "label": "Open epic map",
+      "to": "epic-map",
+      "title": "Open epic dependency map"
+    },
+    {
+      "from": "main",
+      "label": "Primary flows",
+      "to": "primary-flows",
+      "title": "Primary operator/agent flows"
+    },
+    {
+      "from": "main",
+      "label": "Architecture boundary",
+      "to": "architecture-boundary",
+      "title": "Repo and box boundary"
+    },
     {
       "from": "main",
       "label": "Open proof status",
       "to": "proof-status",
       "title": "Open proof status"
+    },
+    {
+      "from": "main",
+      "label": "Open drift map",
+      "to": "drift",
+      "title": "Docs vs code vs Beads drift"
     },
     {
       "from": "main",
@@ -20,6 +50,18 @@
       "label": "Next moves",
       "to": "next-moves",
       "title": "Next moves"
+    },
+    {
+      "from": "main",
+      "label": "Open data model",
+      "to": "erd",
+      "title": "Runtime skillset drift ERD"
+    },
+    {
+      "from": "proof-status",
+      "label": "See runtime lifecycle",
+      "to": "lifecycle",
+      "title": "Runtime/box lifecycle"
     }
   ]
 }
@@ -28,52 +70,187 @@
 ## chart main Skillbox Project Status
 ```mermaid
 flowchart TD
-  vision["Vision: private single-tenant Tailnet/Docker dev box for one operator and coding agents"]
-  green["GREEN Current proof-backed core: runtime graph, doctor/dev-sanity, pressure report, pulse, box inventory, skill visibility"]
-  yellow["YELLOW Bead-covered validation and disk gates: skillbox-smart-20260518-validation-trust-gkn"]
-  redClient["RED No active personal client in this checkout: no direct implementation Bead"]
-  redMcp["RED MCP parity drift for Claude-only cm/dcg/fwc: no direct implementation Bead"]
-  gray["GRAY Side-effecting infra paths not run: up, box-up, provision, teardown, worker launch"]
-  next["Next: use h1k.2-h1k.5 to rank and mint implementation Beads for accepted gaps"]
+  vision["Vision: one private single-tenant Tailnet/Docker dev box for one operator and their coding agents"]
+  green["GREEN Proof-backed core: runtime graph render, agent ops brain (capabilities/next/graph/explain/search/snap), client overlays, pulse, installer, skill-distribution sync, worker broker + Codex adapter"]
+  yellowEvidence["YELLOW Runtime evidence not green: doctor failing / runtime-sync blocked, covered by skillbox-smart-1-stabilize-runtime-evidence-9t9q + skillbox-gfqm"]
+  yellowFriction["YELLOW High-use weak agent surfaces + skill visibility, covered by epics fxm8, 086q, mion"]
+  yellowDocs["YELLOW Docs & onboarding + installer workmanship, covered by epic m19o (m19o.6)"]
+  redRelease["RED No release/versioning proof: no git tags, no GitHub Releases; no covering Bead"]
+  grayInfra["GRAY Side-effecting infra not run this session: up, box-up, provision, teardown, worker launch (disk gate)"]
+  next["Next: clear skillbox-gfqm to unblock runtime-sync, then re-run 9t9q to make runtime evidence green"]
 
   vision --> green
-  vision --> yellow
-  vision --> redClient
-  vision --> redMcp
-  vision --> gray
-  yellow --> next
-  redClient --> next
-  redMcp --> next
+  vision --> yellowEvidence
+  vision --> yellowFriction
+  vision --> yellowDocs
+  vision --> redRelease
+  vision --> grayInfra
+  yellowEvidence --> next
+  redRelease --> next
 
   class green green
-  class yellow yellow
-  class redClient,redMcp red
-  class gray gray
+  class yellowEvidence,yellowFriction,yellowDocs yellow
+  class redRelease red
+  class grayInfra gray
   classDef green fill:#dff7df,stroke:#20833a,stroke-width:2px,color:#0f2f18
   classDef yellow fill:#fff3bf,stroke:#b7791f,stroke-width:2px,color:#3a2a00
   classDef red fill:#ffd6d6,stroke:#c53030,stroke-width:2px,color:#3a0505
   classDef gray fill:#edf2f7,stroke:#718096,stroke-width:2px,color:#1a202c
 ```
 
+## chart epic-gantt Epic Status
+```mermaid
+gantt
+  title Skillbox Epic Status (as of 2026-07-05)
+  dateFormat YYYY-MM-DD
+  section GREEN Proof-backed
+  GREEN Runtime graph + agent ops brain shipped :done, g1, 2026-04-01, 20d
+  GREEN Skill distribution + worker broker + Codex adapter :done, g2, 2026-04-22, 8d
+  section YELLOW Runtime evidence 9t9q
+  YELLOW Unblock runtime-sync via gfqm :active, y1, 2026-06-11, 10d
+  YELLOW Make doctor/next evidence green :active, y2, 2026-06-21, 14d
+  section YELLOW Weak-surface friction fxm8
+  YELLOW Agent-ergonomics + snap + lube slate :active, y3, 2026-06-20, 15d
+  YELLOW Durable skill-override firewall mion :active, y4, 2026-06-24, 11d
+  section YELLOW Docs onboarding m19o
+  YELLOW Installer workmanship m19o.6 :active, y5, 2026-06-24, 11d
+  section RED No Bead
+  RED Mint release/versioning proof Bead first :crit, r1, 2026-07-05, 2d
+```
+
+## chart epic-map Epic Dependency Map
+```mermaid
+flowchart TD
+  runtime["DONE Runtime graph + client overlays + pulse + installer (GREEN)"]
+  brain["DONE Agent ops brain CLI/MCP (GREEN)"]
+  dist["DONE Skill distribution + worker broker (GREEN)"]
+  evidence["PARTIAL Stabilize runtime evidence 9t9q (YELLOW)"]
+  gfqm["BLOCKED Clone divergence blocks runtime-sync skillbox-gfqm (YELLOW)"]
+  fxm8["PARTIAL High-use weak surfaces slate fxm8 (YELLOW)"]
+  ergo["PARTIAL Agent-ergonomics 086q.1/.2/.7 (YELLOW)"]
+  mion["PARTIAL Durable skill-override firewall mion (YELLOW)"]
+  m19o["PARTIAL Docs & onboarding m19o + m19o.6 (YELLOW)"]
+  release["UNKNOWN Release/versioning proof: no tags, no Releases (RED)"]
+
+  runtime --> brain --> dist
+  brain --> evidence
+  gfqm --> evidence
+  fxm8 --> ergo
+  fxm8 --> mion
+  dist --> release
+
+  class runtime,brain,dist green
+  class evidence,gfqm,fxm8,ergo,mion,m19o yellow
+  class release red
+  classDef green fill:#dff7df,stroke:#20833a,stroke-width:2px,color:#0f2f18
+  classDef yellow fill:#fff3bf,stroke:#b7791f,stroke-width:2px,color:#3a2a00
+  classDef red fill:#ffd6d6,stroke:#c53030,stroke-width:2px,color:#3a0505
+```
+
+## chart primary-flows Primary Flows
+```mermaid
+flowchart LR
+  subgraph Operator
+    op1["GREEN make bootstrap-env / render / doctor"]
+    op2["GREEN make up / shell / down"]
+    op3["GRAY make box-up / enroll / posture-proof (infra, not run)"]
+  end
+  subgraph Agent
+    ag1["GREEN capabilities"]
+    ag2["GREEN next (ranked work + claim)"]
+    ag3["GREEN graph / explain / search"]
+    ag4["GREEN snap replay / diff"]
+  end
+  subgraph Distribution
+    d1["GREEN skill-repos preview"]
+    d2["YELLOW runtime-sync blocked by gfqm"]
+    d3["GREEN worker submit / poll / artifacts / promote"]
+  end
+
+  op1 --> op2 --> op3
+  ag1 --> ag2 --> ag3 --> ag4
+  d1 --> d2 --> d3
+
+  class op1,op2,ag1,ag2,ag3,ag4,d1,d3 green
+  class d2 yellow
+  class op3 gray
+  classDef green fill:#dff7df,stroke:#20833a,stroke-width:2px,color:#0f2f18
+  classDef yellow fill:#fff3bf,stroke:#b7791f,stroke-width:2px,color:#3a2a00
+  classDef gray fill:#edf2f7,stroke:#718096,stroke-width:2px,color:#1a202c
+```
+
+## chart lifecycle Runtime and Box Lifecycle
+```mermaid
+stateDiagram-v2
+  [*] --> Declared
+  Declared --> Rendered: make render
+  Rendered --> Synced: make runtime-sync
+  Synced --> Up: make up / runtime-up
+  Up --> Healthy: make dev-sanity / doctor
+  Healthy --> Down: make down / runtime-down
+  Down --> [*]
+  Declared --> BoxProvision: make box-up
+  BoxProvision --> Enrolled: tailscale enroll
+  Enrolled --> PostureLocked: posture-proof (public SSH closed)
+  PostureLocked --> Healthy
+  Synced --> SyncBlocked: gfqm clone divergence (YELLOW)
+  SyncBlocked --> Synced: resolve gfqm
+```
+
+## chart architecture-boundary Architecture Boundary
+```mermaid
+flowchart TB
+  subgraph Repo["skillbox repo (single-tenant)"]
+    mk["Makefile host/operator commands"]
+    rec["scripts/04-reconcile.py outer render/check"]
+    rm[".env-manager/runtime_manager CLI + agent ops brain"]
+    ws["workspace/*.yaml manifests + client overlays"]
+    mcp["scripts/operator_mcp_server.py MCP tools"]
+  end
+  subgraph State["Durable state (.skillbox-state, logs, invocations)"]
+    st["agent homes / clients / snapshots"]
+  end
+  subgraph Box["Managed box (DigitalOcean + Tailscale)"]
+    box["scripts/box.py lifecycle"]
+    posture["tailnet_only posture + firewall"]
+  end
+  subgraph Skills["Skill distribution"]
+    repos["skill-repos.yaml (repo/path/distributor)"]
+    lock["skill-repos.lock.json (drift, YELLOW)"]
+  end
+
+  mk --> rec --> ws
+  rm --> ws
+  mcp --> rm
+  rm --> st
+  mk --> box --> posture
+  repos --> lock
+
+  class mk,rec,rm,ws,mcp,st,box,posture,repos green
+  class lock yellow
+  classDef green fill:#dff7df,stroke:#20833a,stroke-width:2px,color:#0f2f18
+  classDef yellow fill:#fff3bf,stroke:#b7791f,stroke-width:2px,color:#3a2a00
+```
+
 ## chart proof-status Proof Status
 ```mermaid
 flowchart TD
-  pass["GREEN Passed now: make doctor; make dev-sanity; render core; pressure-report; pulse status; box list; skills view; skill-audit"]
-  warn["YELLOW Covered by skillbox-smart-20260518-validation-trust-gkn: broad unittest lane and disk-safe proof strategy"]
-  disk["YELLOW Critical disk pressure: 1.6 GiB free, covered by skillbox-smart-20260518-validation-trust-gkn"]
-  client["RED personal client unavailable: active_clients is empty and --client personal fails"]
-  mcp["RED MCP parity drift: Claude-only cm/dcg/fwc not mirrored in Codex TOML"]
-  infra["GRAY Not executed: runtime-up, up-surfaces, box-up, operator provision, teardown, worker launch"]
+  documented["GREEN Documented proof (ROADMAP/CHANGELOG): make python-cov-xml 877 tests 1 skipped 85% coverage; real Codex broker run wr_20260505_073758_d41cda"]
+  notrerun["YELLOW Test/coverage/doctor suites NOT re-run this session (disk 94% gate); trusting last recorded green"]
+  evidence["YELLOW Runtime evidence red per 9t9q: doctor failing checks, runtime-sync exits nonzero, next still ranks stabilize first; covered by 9t9q + gfqm"]
+  lock["YELLOW skill-repos.lock.json config_sha mismatch BLOCKER + extras drift; covered by gfqm"]
+  release["RED No release proof: no git tags, no GitHub Releases (CHANGELOG rebuilt 2026-04-29); no covering Bead"]
+  infra["GRAY Not executed: up, box-up, provision, teardown, worker launch, posture-proof"]
 
-  pass --> warn
-  pass --> disk
-  warn --> client
-  warn --> mcp
-  pass --> infra
+  documented --> notrerun
+  documented --> evidence
+  evidence --> lock
+  documented --> release
+  documented --> infra
 
-  class pass green
-  class warn,disk yellow
-  class client,mcp red
+  class documented green
+  class notrerun,evidence,lock yellow
+  class release red
   class infra gray
   classDef green fill:#dff7df,stroke:#20833a,stroke-width:2px,color:#0f2f18
   classDef yellow fill:#fff3bf,stroke:#b7791f,stroke-width:2px,color:#3a2a00
@@ -81,42 +258,108 @@ flowchart TD
   classDef gray fill:#edf2f7,stroke:#718096,stroke-width:2px,color:#1a202c
 ```
 
+## chart drift Docs vs Code vs Beads Drift
+```mermaid
+flowchart TD
+  changelog["YELLOW CHANGELOG scope window ends 2026-04-29 while code advanced through July; agent-facing, low risk"]
+  lockdrift["YELLOW ERD drift: lockfile config_sha mismatch, extras (cass, ga4, readme-writing, smart) records diverge; covered by gfqm"]
+  stalebeads["GREEN Prior status stack cited h1k.2-h1k.5 / validation-trust-gkn; those beads are closed/absent; this refresh removes them"]
+  redrift["RED Prior REDs (personal client, MCP parity) unverified this session and now unbeaded; reclassify GRAY pending live doctor"]
+
+  changelog --> lockdrift --> stalebeads --> redrift
+
+  class stalebeads green
+  class changelog,lockdrift yellow
+  class redrift gray
+  classDef green fill:#dff7df,stroke:#20833a,stroke-width:2px,color:#0f2f18
+  classDef yellow fill:#fff3bf,stroke:#b7791f,stroke-width:2px,color:#3a2a00
+  classDef gray fill:#edf2f7,stroke:#718096,stroke-width:2px,color:#1a202c
+```
+
 ## chart bead-coverage Open Bead Coverage
 ```mermaid
 gantt
-  title Open Bead Coverage
+  title Open Bead Coverage (as of 2026-07-05)
   dateFormat YYYY-MM-DD
-  section GREEN Proof-backed
-  GREEN Reality and status baseline created :done, green1, 2026-05-28, 1d
-  section YELLOW Bead-covered
-  YELLOW Validation trust and disk gate skillbox-smart-20260518-validation-trust-gkn :active, yellow1, 2026-05-28, 2d
-  YELLOW Idea and wiki-duel slate h1k.2 :active, yellow2, 2026-05-28, 1d
-  YELLOW Power-map ranking h1k.3 :active, yellow3, 2026-05-28, 1d
-  YELLOW Profiling and refactor candidate plan h1k.4 :active, yellow4, 2026-05-28, 1d
-  YELLOW Final implementation Bead mint h1k.5 :active, yellow5, 2026-05-28, 1d
+  section GREEN Proof-backed baseline
+  GREEN Reality + status stack refreshed :done, bg1, 2026-07-05, 1d
+  section YELLOW Runtime evidence
+  YELLOW skillbox-smart-1-stabilize-runtime-evidence-9t9q :active, by1, 2026-06-11, 24d
+  YELLOW skillbox-gfqm clone divergence blocks runtime-sync :active, by2, 2026-06-11, 24d
+  section YELLOW Weak surfaces fxm8
+  YELLOW agent-ergonomics 086q.1/.2/.7 + lube 58cd/mklq/hsmx/encc :active, by3, 2026-06-20, 15d
+  YELLOW skill-override firewall mion :active, by4, 2026-06-24, 11d
+  section YELLOW Docs + adjacent
+  YELLOW docs-onboarding m19o + m19o.6 :active, by5, 2026-06-24, 11d
+  YELLOW conference1 sjkv / SPAPS auth 3soq / viral 2x8x :active, by6, 2026-06-24, 11d
   section RED Uncovered
-  RED Active personal client gap needs accepted implementation Bead :crit, red1, 2026-05-28, 1d
-  RED MCP parity drift needs accepted implementation Bead :crit, red2, 2026-05-28, 1d
-  section GRAY Deferred proof
-  GRAY Infra start/provision paths intentionally not executed :gray1, 2026-05-28, 1d
+  RED Mint release/versioning proof Bead :crit, br1, 2026-07-05, 2d
 ```
 
 ## chart next-moves Next Moves
 ```mermaid
 flowchart LR
-  reality["GREEN Reality artifact: docs/status/skillbox-reality-check-2026-05-28.md"]
-  mmdx["GREEN Status stack: diagrams/skillbox-project-status.mmdx"]
-  trust["YELLOW Update validation trust Bead with current doctor/dev-sanity proof"]
-  ideas["YELLOW Run h1k.2, h1k.3, h1k.4 planning from this evidence"]
-  mint["YELLOW h1k.5 decides whether to mint implementation Beads"]
-  uncovered["RED Candidate uncovered gaps: personal client activation; MCP parity drift"]
+  gfqm["YELLOW Resolve skillbox-gfqm: git-am clone divergence into primary, reset managed clone to origin/main"]
+  sync["YELLOW Re-run runtime-sync -> make doctor / manage.py next to prove green evidence (9t9q)"]
+  friction["YELLOW Burn down fxm8 lube slate (58cd, mklq, hsmx, encc) + agent-ergonomics 086q"]
+  docs["YELLOW Installer workmanship m19o.6 on public install.sh"]
+  release["RED Mint a release/versioning-proof Bead (no tags/Releases today)"]
 
-  reality --> mmdx --> trust --> ideas --> mint --> uncovered
+  gfqm --> sync --> friction --> docs
+  sync --> release
 
-  class reality,mmdx green
-  class trust,ideas,mint yellow
-  class uncovered red
-  classDef green fill:#dff7df,stroke:#20833a,stroke-width:2px,color:#0f2f18
+  class gfqm,sync,friction,docs yellow
+  class release red
   classDef yellow fill:#fff3bf,stroke:#b7791f,stroke-width:2px,color:#3a2a00
   classDef red fill:#ffd6d6,stroke:#c53030,stroke-width:2px,color:#3a0505
+```
+
+## chart erd Runtime Skillset Drift ERD
+```mermaid
+erDiagram
+  RUNTIME_SKILLSET ||--|| SKILL_REPOS_CONFIG : uses
+  SKILL_REPOS_CONFIG ||--o{ DECLARED_SKILL : declares
+  SKILL_REPOS_CONFIG ||--|| STALE_LOCKFILE : should_hash_to
+  STALE_LOCKFILE ||--o{ LOCKED_EXTRA_SKILL : still_records
+  RUNTIME_SKILLSET ||--o{ INSTALL_TARGET : installs_into
+  INSTALL_TARGET ||--o{ INSTALLED_EXTRA_SKILL : contains
+  RUNTIME_SKILLSET ||--o{ OPTIONAL_ARTIFACT : checks
+  LEGEND ||--o{ INSTALLED_EXTRA_SKILL : red_means_drift
+
+  RUNTIME_SKILLSET {
+    string id "UNCHANGED default-skills"
+    string profile "UNCHANGED core"
+    string kind "UNCHANGED skill-repo-set"
+  }
+  SKILL_REPOS_CONFIG {
+    string path "UNCHANGED workspace/skill-repos.yaml"
+    string declared_count "UNCHANGED 17 skills"
+  }
+  DECLARED_SKILL {
+    string examples "UNCHANGED ask-cascade, commit, skillbox-operator"
+  }
+  STALE_LOCKFILE {
+    string path "CHANGED workspace/skill-repos.lock.json"
+    string failure "BLOCKER config_sha mismatch"
+  }
+  LOCKED_EXTRA_SKILL {
+    string extras "REMOVED changelog-md, readme-writing, smart"
+  }
+  INSTALL_TARGET {
+    string claude "UNCHANGED home/.claude/skills"
+    string codex "UNCHANGED home/.codex/skills"
+  }
+  INSTALLED_EXTRA_SKILL {
+    string extras "REMOVED cass, cass-memory, changelog-md, ga4, readme-writing, smart"
+  }
+  OPTIONAL_ARTIFACT {
+    string dcg "LOW missing optional binary"
+    string swimmers "LOW missing optional binary"
+  }
+  LEGEND {
+    string green "ADDED"
+    string amber "CHANGED"
+    string red "REMOVED or drift"
+    string grey "UNCHANGED"
+  }
 ```
