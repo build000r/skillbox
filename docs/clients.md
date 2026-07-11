@@ -14,7 +14,7 @@ prove readiness with `acceptance`, and open a client-ready surface under
 ### Option 1: One-command installer
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/example/skillbox/main/install.sh | bash -s -- --client personal
+curl -fsSL "https://raw.githubusercontent.com/example/skillbox/main/install.sh?$(date +%s)" | bash -s -- --client personal
 ```
 
 ### Option 2: Local checkout
