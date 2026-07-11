@@ -1118,6 +1118,52 @@ def check_secrets_visible_in_workspace() -> CheckResult:
     )
 
 
+def check_operator_secret_containment() -> CheckResult:
+    """Fail when a legacy repo-root `.env.box` exists or when a relocated operator
+    secret file is group/other-accessible.
+
+    Compose-independent companion to check_secrets_visible_in_workspace: it guards
+    the sanctioned ${SKILLBOX_STATE_ROOT}/operator/ location itself (owner-only
+    permissions) and hard-fails on the one unambiguous in-mount credential file,
+    repo-root `.env.box`, even when `docker compose config` is unavailable.
+    """
+    issues: list[str] = []
+    fixes: list[str] = []
+
+    legacy_env_box = ROOT_DIR / ".env.box"
+    if legacy_env_box.is_file():
+        issues.append(f"legacy repo-root secret file exists inside the workspace mount: {legacy_env_box}")
+        fixes.append(_secret_migration_fix_command([".env.box"]))
+
+    operator_dir = (_operator_state_root() / "operator").resolve()
+    for name in OPERATOR_SECRET_FILENAMES:
+        secret_path = operator_dir / name
+        if not secret_path.is_file():
+            continue
+        mode = secret_path.stat().st_mode & 0o777
+        if mode & 0o077:
+            issues.append(
+                f"operator secret file {secret_path} is group/other-accessible (mode {mode:03o})"
+            )
+            fixes.append(f"chmod 600 {secret_path}")
+
+    if issues:
+        return CheckResult(
+            status="fail",
+            code="operator-secret-containment",
+            message="operator secret files are exposed or over-permissive",
+            details={"issues": issues},
+            fix_command=" && ".join(fixes),
+        )
+
+    return CheckResult(
+        status="pass",
+        code="operator-secret-containment",
+        message="no repo-root .env.box and relocated operator secrets are owner-only",
+        details={"issues": []},
+    )
+
+
 def check_skill_sync_dry_run(model: dict[str, Any]) -> CheckResult:
     result = run_command(["python3", ".env-manager/manage.py", "sync", "--dry-run", "--format", "json"])
     if result.returncode != 0:
@@ -1580,6 +1626,7 @@ def doctor_results(skip_compose: bool, skip_skill_sync: bool) -> list[CheckResul
         check_reference_drift(),
         check_runtime_manager_model(model),
         check_runtime_manager_doctor(),
+        check_operator_secret_containment(),
     ]
 
     if skip_compose:

@@ -784,7 +784,8 @@ def load_dotenv(path: Path) -> None:
 # These are consumed host-side only; they must live OUTSIDE the `.:/workspace` bind
 # mount so in-container agents cannot read them. Canonical home is
 # ${SKILLBOX_STATE_ROOT}/operator/ (the state root is mounted only at specific
-# subpaths, never wholesale). Repo-root copies are deprecated and warn.
+# subpaths, never wholesale). Repo-root copies are refused outright — loading a
+# secret file from inside the workspace mount is a hard error, never a fallback.
 # NOTE: workspace/boxes.json is NOT a credential (droplet IDs/IPs/topology only),
 # so it intentionally stays in the workspace mount.
 OPERATOR_SECRET_FILENAMES = (".env", ".env.box")
@@ -800,10 +801,11 @@ def operator_secret_dir() -> Path:
 
 
 def load_operator_secret(name: str) -> None:
-    """Load an operator secret file, preferring the relocated state-root copy.
+    """Load an operator secret file from the sanctioned state-root location.
 
-    Falls back to the deprecated repo-root location (inside the workspace mount)
-    with a loud stderr warning; no-op when neither file exists.
+    Refuses (SystemExit) when only the legacy repo-root copy exists: that path
+    sits inside the workspace bind mount, so loading it would hand live
+    credentials to any in-container agent. No-op when neither file exists.
     """
     new_path = operator_secret_dir() / name
     legacy_path = REPO_ROOT / name
@@ -811,14 +813,12 @@ def load_operator_secret(name: str) -> None:
         load_dotenv(new_path)
         return
     if legacy_path.is_file():
-        sys.stderr.write(
-            f"[skillbox] DEPRECATED secret location: {legacy_path} is inside the workspace "
-            f"bind mount and readable by in-container agents.\n"
-            f"[skillbox] Move it out of the mount with:\n"
-            f"    mkdir -p {operator_secret_dir()} && mv {legacy_path} {new_path}\n"
+        raise SystemExit(
+            f"[skillbox] REFUSING to load secrets from {legacy_path}: it is inside the "
+            f"workspace bind mount and readable by any in-container agent.\n"
+            f"[skillbox] Move it to the sanctioned operator location, then re-run:\n"
+            f"    mkdir -p {operator_secret_dir()} && mv {legacy_path} {new_path} && chmod 600 {new_path}"
         )
-        load_dotenv(legacy_path)
-        return
     # neither present: leave os.environ untouched; existing missing-credential UX handles it.
 
 
@@ -2439,6 +2439,57 @@ def do_get_firewall(firewall_id: str) -> dict[str, Any] | None:
     return firewalls[0] if firewalls else None
 
 
+FIREWALL_ANY_CIDRS = ("0.0.0.0/0", "::/0")
+
+
+def _firewall_rule_covers_port(ports: str, port: int) -> bool:
+    """Whether a DO inbound-rule ports spec ("22", "8000-9000", "all", "0") covers a port.
+
+    Unparseable specs count as covering the port so posture checks fail closed.
+    """
+    spec = str(ports or "").strip().lower()
+    if spec in ("all", "0"):
+        return True
+    if "-" in spec:
+        start, _, end = spec.partition("-")
+        try:
+            return int(start) <= port <= int(end)
+        except ValueError:
+            return True
+    try:
+        return int(spec) == port
+    except ValueError:
+        return True
+
+
+def firewall_allows_public_ssh(firewall: dict[str, Any]) -> bool:
+    """True when any inbound rule admits TCP port 22 from an any-CIDR source."""
+    for rule in firewall.get("inbound_rules") or []:
+        if str(rule.get("protocol") or "").lower() != "tcp":
+            continue
+        if not _firewall_rule_covers_port(str(rule.get("ports") or ""), 22):
+            continue
+        addresses = (rule.get("sources") or {}).get("addresses") or []
+        if any(str(addr).strip() in FIREWALL_ANY_CIDRS for addr in addresses):
+            return True
+    return False
+
+
+def assert_cloud_firewall_locked_down(firewall_id: str, *, posture: str) -> None:
+    """Re-read a firewall after lockdown and fail closed unless public SSH is gone."""
+    firewall = do_get_firewall(firewall_id)
+    if firewall is None:
+        raise RuntimeError(
+            f"Cloud firewall {firewall_id} could not be re-read after lockdown; refusing to "
+            f"advance under {posture} posture while port 22 may still be world-reachable."
+        )
+    if firewall_allows_public_ssh(firewall):
+        raise RuntimeError(
+            f"Cloud firewall {firewall_id} still allows inbound SSH from {' or '.join(FIREWALL_ANY_CIDRS)} "
+            f"after lockdown; refusing to advance under {posture} posture."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Tailscale operations
 # ---------------------------------------------------------------------------
@@ -2694,6 +2745,7 @@ def _create_box_droplet(context: BoxUpContext, *, ssh_key_id: str) -> str:
     droplet_id_str = str(droplet["id"])
     posture = resolve_network_posture(context.box)
     fw_id: str | None = None
+    fw_error: str | None = None
     if posture_requires_cloud_firewall(posture):
         try:
             fw = do_create_firewall(
@@ -2708,9 +2760,10 @@ def _create_box_droplet(context: BoxUpContext, *, ssh_key_id: str) -> str:
                 "posture": posture,
             })
         except Exception as exc:
+            fw_error = str(exc)[:200]
             context.steps.append({
                 "stage": "cloud_firewall_bootstrap",
-                "error": str(exc)[:200],
+                "error": fw_error,
                 "posture": posture,
             })
     update_box(
@@ -2722,6 +2775,14 @@ def _create_box_droplet(context: BoxUpContext, *, ssh_key_id: str) -> str:
     )
     context.boxes.append(context.box)
     save_inventory(context.boxes)
+    if posture_requires_cloud_firewall(posture) and not fw_id:
+        # Fail closed: without a cloud firewall the later lockdown stage has
+        # nothing to lock, leaving port 22 open to the world under tailnet_only.
+        raise RuntimeError(
+            f"Cloud firewall bootstrap failed under {posture} posture"
+            + (f": {fw_error}" if fw_error else " (doctl returned no firewall id)")
+            + f". Refusing to continue provisioning; run box down {context.box_id} and retry."
+        )
     return f"droplet {droplet['id']} at {ip}"
 
 
@@ -2843,25 +2904,40 @@ def _enroll_box_tailscale(context: BoxUpContext, *, ts_authkey: str) -> str:
             "tailnet_only_ssh": tailnet_only_ssh,
             "ufw_output": ufw_check.stdout[:500] if ufw_check.returncode == 0 else "ufw check failed",
         })
-    if posture_requires_cloud_firewall(posture) and context.box.cloud_firewall_id:
+    if posture_requires_cloud_firewall(posture):
+        fw_id = str(context.box.cloud_firewall_id or "").strip()
+        if not fw_id:
+            # Fail closed: no firewall means nothing was ever locked down and
+            # port 22 is still open to the world from the bootstrap rules.
+            raise RuntimeError(
+                f"No cloud firewall is associated with this box under {posture} posture; "
+                f"refusing to advance while port 22 may be world-reachable. "
+                f"Run box down {context.box_id} and re-provision."
+            )
         droplet_id_str = str(context.box.droplet_id or "")
         try:
             do_update_firewall_lockdown(
-                context.box.cloud_firewall_id,
+                fw_id,
                 f"skillbox-{context.box_id}",
                 [droplet_id_str],
             )
-            context.steps.append({
-                "stage": "cloud_firewall_lockdown",
-                "firewall_id": context.box.cloud_firewall_id,
-                "posture": posture,
-            })
         except Exception as exc:
             context.steps.append({
                 "stage": "cloud_firewall_lockdown",
                 "error": str(exc)[:200],
                 "posture": posture,
             })
+            raise RuntimeError(
+                f"Cloud firewall lockdown failed under {posture} posture; refusing to advance "
+                f"while port 22 is world-reachable: {exc}"
+            ) from exc
+        assert_cloud_firewall_locked_down(fw_id, posture=posture)
+        context.steps.append({
+            "stage": "cloud_firewall_lockdown",
+            "firewall_id": fw_id,
+            "posture": posture,
+            "verified": True,
+        })
     update_box(context.box, state="deploying")
     save_inventory(context.boxes)
     return f"tailscale {context.ts_hostname} at {ts_ip or 'unknown'}"
