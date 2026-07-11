@@ -187,4 +187,4 @@ Moved to [docs/faq.md#faq](docs/faq.md#faq).
 
 ## License
 
-No license file is included yet.
+All rights reserved. No license file is included and no OSI license is granted yet (operator decision, 2026-06-21): the source is published for reading and reference, but you may not redistribute or reuse it without permission.
