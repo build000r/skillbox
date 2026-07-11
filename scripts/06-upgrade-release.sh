@@ -7,6 +7,7 @@ REPO_DIR=""
 CLIENT_ID=""
 ROLLBACK_DIR=""
 TEMP_DIR=""
+LOCK_DIR=""
 PRESERVE_ROOT=""
 SWAPPED=0
 SUCCESS=0
@@ -164,6 +165,43 @@ bring_repo_up() {
   return 0
 }
 
+# Shares install.sh's lock path so an upgrade cannot race a concurrent
+# install (or another upgrade) mutating the same host.
+acquire_lock() {
+  local base="${TMPDIR:-/tmp}"
+  local candidate="${base}/skillbox-install.lock"
+  local holder_pid=""
+
+  # Only assign LOCK_DIR once we own the lock; release_lock must never remove
+  # a lock directory held by another running install/upgrade.
+  if mkdir "${candidate}" 2>/dev/null; then
+    LOCK_DIR="${candidate}"
+    printf '%s\n' "$$" >"${LOCK_DIR}/pid"
+    return 0
+  fi
+
+  holder_pid="$(cat "${candidate}/pid" 2>/dev/null || true)"
+  if [[ -n "${holder_pid}" ]] && ! kill -0 "${holder_pid}" 2>/dev/null; then
+    warn "Reclaiming stale install lock left by exited process ${holder_pid}."
+    rm -rf "${candidate}"
+    if mkdir "${candidate}" 2>/dev/null; then
+      LOCK_DIR="${candidate}"
+      printf '%s\n' "$$" >"${LOCK_DIR}/pid"
+      return 0
+    fi
+  fi
+
+  err "Another skillbox install/upgrade appears to be running (${candidate}${holder_pid:+, pid ${holder_pid}})."
+  err "If no other install is running, remove the lock with: rm -rf ${candidate}"
+  exit 1
+}
+
+release_lock() {
+  if [[ -n "${LOCK_DIR}" && -d "${LOCK_DIR}" ]]; then
+    rm -rf "${LOCK_DIR}" >/dev/null 2>&1 || true
+  fi
+}
+
 rollback() {
   local status="$1"
 
@@ -171,6 +209,7 @@ rollback() {
     if [[ -n "${TEMP_DIR}" && -d "${TEMP_DIR}" ]]; then
       rm -rf "${TEMP_DIR}"
     fi
+    release_lock
     return
   fi
 
@@ -196,6 +235,7 @@ rollback() {
     rm -rf "${TEMP_DIR}"
   fi
 
+  release_lock
   exit "${status}"
 }
 
@@ -265,6 +305,8 @@ fi
 if [[ -z "${ROLLBACK_DIR}" ]]; then
   ROLLBACK_DIR="${REPO_DIR}.rollback"
 fi
+
+acquire_lock
 
 TEMP_DIR="$(mktemp -d)"
 PRESERVE_ROOT="${TEMP_DIR}/preserve"
