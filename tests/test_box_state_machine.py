@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import subprocess
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -244,6 +245,165 @@ class BoxUpStageFailureStateTests(unittest.TestCase):
                 else:
                     self.assertEqual(context.box.state, stage.failure_state)
                     save_inventory.assert_called_once_with(context.boxes)
+
+
+class CloudFirewallFailClosedTests(unittest.TestCase):
+    """tailnet_only lockdown must fail closed: a doctl/API failure, a missing
+    cloud_firewall_id, or an unverified lockdown may never advance the box past
+    the enroll stage while port 22 could still be world-reachable."""
+
+    LOCKED_DOWN_FIREWALL = {
+        "id": "fw-1",
+        "inbound_rules": [
+            {"protocol": "udp", "ports": "41641", "sources": {"addresses": ["0.0.0.0/0", "::/0"]}},
+        ],
+    }
+    SSH_OPEN_FIREWALL = {
+        "id": "fw-1",
+        "inbound_rules": [
+            {"protocol": "tcp", "ports": "22", "sources": {"addresses": ["0.0.0.0/0", "::/0"]}},
+            {"protocol": "udp", "ports": "41641", "sources": {"addresses": ["0.0.0.0/0", "::/0"]}},
+        ],
+    }
+
+    def _enroll_context(self, *, cloud_firewall_id: str | None) -> object:
+        context = _resume_context("ssh-ready")
+        context.box.cloud_firewall_id = cloud_firewall_id
+        return context
+
+    def _run_enroll_stage(self, context: object) -> bool:
+        with mock.patch.object(BOX, "_emit_box_up_failure", return_value=BOX.EXIT_ERROR):
+            return BOX._run_box_up_stage(
+                context,
+                stage_name="enroll",
+                error_type="tailscale_failed",
+                action=lambda: BOX._enroll_box_tailscale(context, ts_authkey="ts-auth"),
+                failure_state="ssh-ready",
+                next_actions=["box ssh box-1"],
+            )
+
+    @contextlib.contextmanager
+    def _enroll_mocks(self):
+        with (
+            mock.patch.object(BOX, "ssh_script", return_value=_completed(0, stdout="100.64.0.9")),
+            mock.patch.object(BOX, "ssh_cmd", return_value=_completed(0, stdout="Status: active")),
+            mock.patch.object(BOX, "extract_tailscale_ipv4", return_value="100.64.0.9"),
+            mock.patch.object(BOX, "save_inventory"),
+        ):
+            yield
+
+    def test_lockdown_doctl_failure_fails_stage_and_state_does_not_advance(self) -> None:
+        context = self._enroll_context(cloud_firewall_id="fw-1")
+        with (
+            self._enroll_mocks(),
+            mock.patch.object(BOX, "do_update_firewall_lockdown", side_effect=RuntimeError("doctl 500")),
+            mock.patch.object(BOX, "do_get_firewall") as get_firewall,
+        ):
+            ok = self._run_enroll_stage(context)
+
+        self.assertFalse(ok)
+        get_firewall.assert_not_called()
+        self.assertEqual(context.box.state, "ssh-ready")
+        failure = context.steps[-1]
+        self.assertEqual(failure["step"], "enroll")
+        self.assertEqual(failure["status"], "fail")
+        self.assertIn("refusing to advance", failure["detail"])
+        lockdown_steps = [step for step in context.steps if step.get("stage") == "cloud_firewall_lockdown"]
+        self.assertEqual(lockdown_steps, [{"stage": "cloud_firewall_lockdown", "error": "doctl 500", "posture": "tailnet_only"}])
+
+    def test_missing_cloud_firewall_id_is_fatal_under_tailnet_only(self) -> None:
+        context = self._enroll_context(cloud_firewall_id=None)
+        with (
+            self._enroll_mocks(),
+            mock.patch.object(BOX, "do_update_firewall_lockdown") as update_lockdown,
+        ):
+            ok = self._run_enroll_stage(context)
+
+        self.assertFalse(ok)
+        update_lockdown.assert_not_called()
+        self.assertEqual(context.box.state, "ssh-ready")
+        self.assertIn("No cloud firewall", context.steps[-1]["detail"])
+
+    def test_lockdown_reread_still_open_ssh_fails_stage(self) -> None:
+        context = self._enroll_context(cloud_firewall_id="fw-1")
+        with (
+            self._enroll_mocks(),
+            mock.patch.object(BOX, "do_update_firewall_lockdown", return_value=self.LOCKED_DOWN_FIREWALL),
+            mock.patch.object(BOX, "do_get_firewall", return_value=self.SSH_OPEN_FIREWALL),
+        ):
+            ok = self._run_enroll_stage(context)
+
+        self.assertFalse(ok)
+        self.assertEqual(context.box.state, "ssh-ready")
+        self.assertIn("still allows inbound SSH", context.steps[-1]["detail"])
+
+    def test_lockdown_reread_failure_fails_stage(self) -> None:
+        context = self._enroll_context(cloud_firewall_id="fw-1")
+        with (
+            self._enroll_mocks(),
+            mock.patch.object(BOX, "do_update_firewall_lockdown", return_value=self.LOCKED_DOWN_FIREWALL),
+            mock.patch.object(BOX, "do_get_firewall", return_value=None),
+        ):
+            ok = self._run_enroll_stage(context)
+
+        self.assertFalse(ok)
+        self.assertEqual(context.box.state, "ssh-ready")
+        self.assertIn("could not be re-read", context.steps[-1]["detail"])
+
+    def test_lockdown_success_verifies_reread_and_advances(self) -> None:
+        context = self._enroll_context(cloud_firewall_id="fw-1")
+        with (
+            self._enroll_mocks(),
+            mock.patch.object(BOX, "do_update_firewall_lockdown", return_value=self.LOCKED_DOWN_FIREWALL),
+            mock.patch.object(BOX, "do_get_firewall", return_value=self.LOCKED_DOWN_FIREWALL) as get_firewall,
+        ):
+            ok = self._run_enroll_stage(context)
+
+        self.assertTrue(ok)
+        get_firewall.assert_called_once_with("fw-1")
+        self.assertEqual(context.box.state, "deploying")
+        lockdown_steps = [step for step in context.steps if step.get("stage") == "cloud_firewall_lockdown"]
+        self.assertEqual(
+            lockdown_steps,
+            [{"stage": "cloud_firewall_lockdown", "firewall_id": "fw-1", "posture": "tailnet_only", "verified": True}],
+        )
+
+    def test_create_droplet_fails_closed_when_firewall_create_fails(self) -> None:
+        context = self._enroll_context(cloud_firewall_id=None)
+        context.boxes = []
+        saved: list[object] = []
+        with (
+            mock.patch.object(BOX, "do_create_droplet", return_value={"id": 123}),
+            mock.patch.object(BOX, "do_droplet_public_ip", return_value="1.2.3.4"),
+            mock.patch.object(BOX, "do_create_firewall", side_effect=RuntimeError("doctl timeout")),
+            mock.patch.object(BOX, "save_inventory", side_effect=saved.append),
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                BOX._create_box_droplet(context, ssh_key_id="ssh-key")
+
+        self.assertIn("Cloud firewall bootstrap failed", str(raised.exception))
+        self.assertIn("doctl timeout", str(raised.exception))
+        # The droplet is still recorded in inventory so teardown can find it.
+        self.assertEqual(saved, [[context.box]])
+        self.assertEqual(context.box.droplet_id, "123")
+        self.assertIsNone(context.box.cloud_firewall_id)
+
+    def test_firewall_allows_public_ssh_covers_port_ranges_and_all(self) -> None:
+        any_sources = {"addresses": ["0.0.0.0/0"]}
+        cases = [
+            ({"inbound_rules": [{"protocol": "tcp", "ports": "22", "sources": any_sources}]}, True),
+            ({"inbound_rules": [{"protocol": "tcp", "ports": "all", "sources": any_sources}]}, True),
+            ({"inbound_rules": [{"protocol": "tcp", "ports": "0", "sources": any_sources}]}, True),
+            ({"inbound_rules": [{"protocol": "tcp", "ports": "20-25", "sources": any_sources}]}, True),
+            ({"inbound_rules": [{"protocol": "tcp", "ports": "garbage", "sources": any_sources}]}, True),
+            ({"inbound_rules": [{"protocol": "tcp", "ports": "80", "sources": any_sources}]}, False),
+            ({"inbound_rules": [{"protocol": "udp", "ports": "41641", "sources": any_sources}]}, False),
+            ({"inbound_rules": [{"protocol": "tcp", "ports": "22", "sources": {"addresses": ["100.64.0.0/10"]}}]}, False),
+            ({"inbound_rules": []}, False),
+        ]
+        for firewall, expected in cases:
+            with self.subTest(firewall=firewall):
+                self.assertEqual(BOX.firewall_allows_public_ssh(firewall), expected)
 
 
 class BoxDownIntermediateStateTests(unittest.TestCase):
