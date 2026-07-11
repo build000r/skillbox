@@ -62,6 +62,7 @@ FIRST_BOX_OUTPUT_DIR=""
 FIRST_BOX_PRIVATE_REPO=""
 LOCK_DIR=""
 TEMP_DIR=""
+FIRST_BOX_JSON=""
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-${0:-}}"
 SCRIPT_PATH=""
 SCRIPT_DIR=""
@@ -210,7 +211,7 @@ warn() {
 
 err() {
   if [[ "${HAS_GUM}" -eq 1 && "${NO_GUM}" -eq 0 ]]; then
-    gum style --foreground 196 "ERR $*"
+    gum style --foreground 196 "ERR $*" >&2
   else
     printf '\033[0;31mERR\033[0m %s\n' "$*" >&2
   fi
@@ -422,19 +423,41 @@ cleanup() {
   if [[ -n "${TEMP_DIR}" && -d "${TEMP_DIR}" ]]; then
     rm -rf "${TEMP_DIR}"
   fi
+  if [[ -n "${FIRST_BOX_JSON}" && -f "${FIRST_BOX_JSON}" ]]; then
+    rm -f "${FIRST_BOX_JSON}"
+  fi
   if [[ -n "${LOCK_DIR}" && -d "${LOCK_DIR}" ]]; then
-    rmdir "${LOCK_DIR}" >/dev/null 2>&1 || true
+    rm -rf "${LOCK_DIR}" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
 acquire_lock() {
   local base="${TMPDIR:-/tmp}"
-  LOCK_DIR="${base}/skillbox-install.lock"
-  if mkdir "${LOCK_DIR}" 2>/dev/null; then
+  local candidate="${base}/skillbox-install.lock"
+  local holder_pid=""
+
+  # Only assign LOCK_DIR once we own the lock; the cleanup trap must never
+  # remove a lock directory held by another running install.
+  if mkdir "${candidate}" 2>/dev/null; then
+    LOCK_DIR="${candidate}"
+    printf '%s\n' "$$" >"${LOCK_DIR}/pid"
     return 0
   fi
-  err "Another skillbox install appears to be running (${LOCK_DIR})."
+
+  holder_pid="$(cat "${candidate}/pid" 2>/dev/null || true)"
+  if [[ -n "${holder_pid}" ]] && ! kill -0 "${holder_pid}" 2>/dev/null; then
+    warn "Reclaiming stale install lock left by exited process ${holder_pid}."
+    rm -rf "${candidate}"
+    if mkdir "${candidate}" 2>/dev/null; then
+      LOCK_DIR="${candidate}"
+      printf '%s\n' "$$" >"${LOCK_DIR}/pid"
+      return 0
+    fi
+  fi
+
+  err "Another skillbox install appears to be running (${candidate}${holder_pid:+, pid ${holder_pid}})."
+  err "If no other install is running, remove the lock with: rm -rf ${candidate}"
   exit 1
 }
 
@@ -620,7 +643,11 @@ extract_tarball_checkout() {
   local extract_root=""
 
   ensure_checkout_target_ready "${dest}"
-  TEMP_DIR="$(mktemp -d)"
+  # Reuse an existing temp dir (download path) so the cleanup trap removes
+  # everything; only allocate one when none exists yet (offline path).
+  if [[ -z "${TEMP_DIR}" ]]; then
+    TEMP_DIR="$(mktemp -d)"
+  fi
   mkdir -p "${TEMP_DIR}/extract"
   tar -xzf "${tarball}" -C "${TEMP_DIR}/extract"
   extract_root="$(find "${TEMP_DIR}/extract" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
@@ -1086,6 +1113,7 @@ run_verify() {
 }
 
 print_header() {
+  [[ "${QUIET}" -eq 1 ]] && return 0
   if [[ "${HAS_GUM}" -eq 1 && "${NO_GUM}" -eq 0 ]]; then
     gum style \
       --border normal \
@@ -1100,6 +1128,7 @@ print_header() {
 }
 
 print_summary() {
+  [[ "${QUIET}" -eq 1 ]] && return 0
   local lines=()
   lines+=("repo_dir: ${REPO_DIR}")
   lines+=("private_repo: ${FIRST_BOX_PRIVATE_REPO:-${PRIVATE_PATH}}")
@@ -1300,7 +1329,6 @@ ensure_local_state_layout "${REPO_DIR}"
 run_host_bootstrap "${REPO_DIR}"
 run_tailscale_setup "${REPO_DIR}"
 
-FIRST_BOX_JSON=""
 if [[ "${DRY_RUN}" -eq 0 ]]; then
   FIRST_BOX_JSON="$(mktemp)"
 fi
