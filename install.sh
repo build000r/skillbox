@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install with:
-#   curl -fsSL https://raw.githubusercontent.com/example/skillbox/main/install.sh | bash -s -- --client personal
+#   curl -fsSL "https://raw.githubusercontent.com/example/skillbox/main/install.sh?$(date +%s)" | bash -s -- --client personal
 set -euo pipefail
 shopt -s lastpipe 2>/dev/null || true
 umask 022
