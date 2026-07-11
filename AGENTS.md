@@ -36,7 +36,7 @@ Main entry points:
 - Runtime services: `make runtime-up CLIENT=<id> PROFILE=<name>`, `make runtime-down CLIENT=<id> PROFILE=<name>`, `make runtime-status`
 - Box lifecycle: `make box-up BOX=<id>`, `make box-down BOX=<id>`, `make box-status`, `make box-list`, `make box-ssh BOX=<id>`
 - Release/upgrade scripts: `install.sh`, `scripts/06-upgrade-release.sh`, `scripts/07-build-and-push-binary.sh`; verify arguments before use.
-- Clipboard bootstrap: `scripts/clipboard-bootstrap --profile local|d3|sweet|jeremy|conference1 [--dry-run|--apply-remote]`; bundle in `scripts/clipboard/`; closeout `scripts/clipboard-closeout.sh`; design `docs/clipboard-bootstrap.md`.
+- Clipboard bootstrap (explicit manual step; not run by `install.sh`/`box.py`): `scripts/clipboard-bootstrap --profile local|d3|sweet|jeremy|conference1 [--dry-run|--apply-remote]` — remote profiles print a plan by default and only write with `--apply-remote`. Canonical flow: "New-host clipboard adoption" in `docs/operations.md`; bundle in `scripts/clipboard/`; closeout `scripts/clipboard-closeout.sh`; design `docs/clipboard-bootstrap.md`.
 - CI: `.github/workflows/ci.yml` runs Ruff, ShellCheck, compose config validation, `python3 scripts/04-reconcile.py render`, and the Python unittest matrix on push/PR.
 - Python lint: `python3 -m ruff check .`
 - Shell lint: `shellcheck --severity=warning scripts/*.sh install.sh`
@@ -102,6 +102,14 @@ background process (each stdout line becomes a notification), or use `Bash` with
 Monitor with an until-loop: `until <check>; do sleep 2; done` — you get a
 notification when the loop exits. Only use `sleep` in a poll loop when no
 notification mechanism is available.
+
+## Deferred Tools
+
+Common tools (TaskCreate, TaskUpdate, WebSearch, WebFetch, Monitor) are
+deferred and unusable until their schemas are fetched. If you expect to need
+any of them, batch-load them with a single ToolSearch call in your first turn
+(e.g. `select:TaskCreate,TaskUpdate,WebSearch,WebFetch,Monitor`) instead of
+paying one ToolSearch round-trip per tool later.
 
 ## Network Posture
 
@@ -247,12 +255,16 @@ bv is a graph-aware triage engine for Beads projects (.beads/beads.jsonl). Inste
 - `commands`: copy-paste shell commands for next steps
 
 ```bash
-bv --robot-triage        # THE MEGA-COMMAND: start here
-bv --robot-next          # Minimal: just the single top pick + claim command
-
-# Token-optimized output (TOON) for lower LLM context usage:
-bv --robot-triage --format toon
+bv --robot-triage --format toon   # THE MEGA-COMMAND: start here
+bv --robot-next --format toon     # Minimal: just the single top pick + claim command
 ```
+
+Always pass `--format toon` (or `export BV_OUTPUT_FORMAT=toon`) in agent
+contexts: TOON is the token-lean structured format for LLM consumption, and
+bare `--robot-*` JSON on large graphs can flood your context window. TOON
+rendering needs the renderer from the `tru` crate (`cargo install tru`, which
+installs the `toon` binary); without it bv prints a stderr warning and silently
+falls back to JSON.
 
 Before claiming, verify current state with `br show <id> --json` or `br ready --json`. `recommendations` can include graph-important blocked or assigned work; only `quick_ref.top_picks` and non-empty `claim_command` fields represent claimable work.
 
@@ -271,10 +283,10 @@ Before claiming, verify current state with `br show <id> --json` or `br ready --
 #### Scoping & Filtering
 
 ```bash
-bv --robot-plan --label backend              # Scope to label's subgraph
-bv --robot-insights --as-of HEAD~30          # Historical point-in-time
-bv --recipe actionable --robot-plan          # Pre-filter: ready to work (no blockers)
-bv --recipe high-impact --robot-triage       # Pre-filter: top PageRank scores
+bv --robot-plan --label backend --format toon         # Scope to label's subgraph
+bv --robot-insights --as-of HEAD~30 --format toon     # Historical point-in-time
+bv --recipe actionable --robot-plan --format toon     # Pre-filter: ready to work (no blockers)
+bv --recipe high-impact --robot-triage --format toon  # Pre-filter: top PageRank scores
 ```
 
 ### br Commands for Issue Management
@@ -292,7 +304,7 @@ br sync --flush-only  # Export DB to JSONL
 
 ### Workflow Pattern
 
-1. **Triage**: Run `bv --robot-triage` to find the highest-impact actionable work
+1. **Triage**: Run `bv --robot-triage --format toon` to find the highest-impact actionable work
 2. **Claim**: Use `br update <id> --status=in_progress`
 3. **Work**: Implement the task
 4. **Complete**: Use `br close <id>`

@@ -64,15 +64,19 @@ Windows wrapper.
 
 ## Adoption checklist
 
+Canonical new-host flow: see "New-host clipboard adoption" in
+`docs/operations.md`. Remote profiles are plan-only by default; remote writes
+happen only with `--apply-remote`.
+
 ```bash
-# From Skillbox repo root — local operator Mac
+# From Skillbox repo root — local operator Mac (applies locally)
 scripts/clipboard-bootstrap --profile local
 
-# Remote host (d3 default)
+# Remote host (d3): prints the plan, performs no remote writes
 scripts/clipboard-bootstrap --profile d3
 
-# Plan without writes
-scripts/clipboard-bootstrap --profile d3 --dry-run
+# Apply on the remote host (the only form that writes remotely)
+scripts/clipboard-bootstrap --profile d3 --apply-remote
 
 # Generic target (implies --profile generic)
 scripts/clipboard-bootstrap --target skillbox@my-host --dry-run
