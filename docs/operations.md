@@ -578,3 +578,33 @@ scripts/clipboard-closeout.sh
 python3 -m unittest tests.test_clipboard_bootstrap -v
 scripts/clipboard-proof.sh --live   # operator Mac + Ghostty only
 ```
+
+### New-host clipboard adoption
+
+Clipboard bootstrap is an **explicit manual/agent-run step**. It is not wired
+into `install.sh`, `scripts/box.py`, or the env-manager lifecycle, and that is
+deliberate: host adoption surfaces are security-sensitive, clipboard
+integration is operator-optional, and remote writes should stay behind a
+conscious `--apply-remote` invocation rather than ride along with enrollment.
+
+Adopt a new host dry-run-first:
+
+```bash
+# 1. Plan (default for remote profiles; performs no remote writes)
+scripts/clipboard-bootstrap --profile d3
+
+# 2. Apply once the plan looks right (the only form that writes remotely)
+scripts/clipboard-bootstrap --profile d3 --apply-remote
+
+# Hosts without a named profile
+scripts/clipboard-bootstrap --profile generic --target user@host                 # plan
+scripts/clipboard-bootstrap --profile generic --target user@host --apply-remote  # apply
+```
+
+Validation from a fresh checkout (no SSH access or remote writes needed):
+
+```bash
+scripts/clipboard-bootstrap --profile d3
+# expected: the per-step plan plus "note: remote writes require --apply-remote", exit 0
+python3 -m unittest tests.test_clipboard_bootstrap -v
+```
