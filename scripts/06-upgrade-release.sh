@@ -338,8 +338,14 @@ SWAPPED=1
 info "Restoring runtime-owned state into the new checkout"
 restore_preserved_paths "${PRESERVE_ROOT}" "${REPO_DIR}"
 
-if [[ ! -f "${REPO_DIR}/.env" && -f "${REPO_DIR}/.env.example" ]]; then
-  cp "${REPO_DIR}/.env.example" "${REPO_DIR}/.env"
+# Seed the operator env into the sanctioned out-of-mount location; a repo-root
+# .env would trip the secrets-visible-in-workspace / operator-secret-containment
+# doctor checks on fresh upgrades (skillbox-4c9s).
+OPERATOR_ENV_DIR="${REPO_DIR}/.skillbox-state/operator"
+if [[ ! -f "${OPERATOR_ENV_DIR}/.env" && ! -f "${REPO_DIR}/.env" && -f "${REPO_DIR}/.env.example" ]]; then
+  mkdir -p "${OPERATOR_ENV_DIR}"
+  cp "${REPO_DIR}/.env.example" "${OPERATOR_ENV_DIR}/.env"
+  chmod 600 "${OPERATOR_ENV_DIR}/.env"
 fi
 
 info "Building upgraded workspace image"
