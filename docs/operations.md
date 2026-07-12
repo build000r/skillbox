@@ -571,13 +571,24 @@ Usage after install:
 - Conference1: prefer direct `worker@conference1-wsl`; `conference1-ssh` Windows
   wrapper is OSC52-hostile fallback only
 
-Proof and regression:
+Proof and regression (two documented modes; see
+[clipboard-bootstrap.md](clipboard-bootstrap.md#closeout-gates-and-proof-commands)):
 
 ```bash
+# CI / source smoke — any Linux checkout; live paths recorded as SKIP with reasons
 scripts/clipboard-closeout.sh
-python3 -m unittest tests.test_clipboard_bootstrap -v
-scripts/clipboard-proof.sh --live   # operator Mac + Ghostty only
+python3 -m unittest tests.test_clipboard_bootstrap tests.test_clipboard_closeout -v
+
+# Operator / live rollout proof — exercises real SSH/tmux/nested-tmux/image
+# paths; skipped core paths (d3, current-host migration, Ghostty, mosh) FAIL
+# the run. Full PASS requires the operator Mac.
+scripts/clipboard-closeout.sh --live
 ```
+
+Durable per-run artifacts (JSON verdict + raw per-gate logs) land in
+`~/.local/state/skillbox/clipboard-closeout/<stamp>-<mode>/`. Remote profiles
+require the `~/.ssh/config` Host blocks documented in
+[clipboard-bootstrap.md](clipboard-bootstrap.md#prerequisites).
 
 ### New-host clipboard adoption
 
