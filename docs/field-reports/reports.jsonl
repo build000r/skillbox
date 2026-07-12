@@ -1,0 +1,4 @@
+// SCHEMA (this comment line is not valid JSON and is ignored by parsers — skip lines starting with //):
+// {"date":"YYYY-MM-DD","source":"github-issue|script|email|dm","handle":"@who","link":"https://...","context":"...","quote":"exact verbatim words","permission_to_quote":true,"answers":{"replaced":"...","survived_rebuild":"...","felt_real":"...","still_hurt":"..."}}
+// Eligible for a marketing surface only when: permission_to_quote=true AND handle non-empty AND link non-empty.
+// One JSON object per line below. No real reports captured yet.

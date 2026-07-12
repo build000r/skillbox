@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  skillbox OG social-preview card — 1200x630
+  Palette (restrained, ~3 colors):
+    #242424  near-black background (Tailscale dark accent)
+    #e6edf3  off-white foreground text
+    #2ea44f  green accent (matches the doctor badge / $ prompt)
+  Regenerate the PNG with: scripts/make-og-card.sh
+  Headline is verbatim from the shipped hero: "Give your coding agents a real computer."
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" font-family="DejaVu Sans Mono, Menlo, Consolas, monospace">
+  <!-- background -->
+  <rect x="0" y="0" width="1200" height="630" fill="#242424"/>
+
+  <!-- terminal window frame -->
+  <rect x="80" y="70" width="1040" height="490" rx="18" ry="18" fill="#1b1b1b" stroke="#2ea44f" stroke-opacity="0.35" stroke-width="2"/>
+  <!-- title bar -->
+  <rect x="80" y="70" width="1040" height="56" rx="18" ry="18" fill="#303030"/>
+  <rect x="80" y="104" width="1040" height="22" fill="#303030"/>
+  <!-- traffic-light dots (kept within palette: greyscale + accent) -->
+  <circle cx="116" cy="98" r="8" fill="#5a5a5a"/>
+  <circle cx="144" cy="98" r="8" fill="#7a7a7a"/>
+  <circle cx="172" cy="98" r="8" fill="#2ea44f"/>
+  <!-- window title -->
+  <text x="600" y="104" fill="#e6edf3" fill-opacity="0.55" font-size="20" text-anchor="middle">skillbox — agent workstation</text>
+
+  <!-- headline (the shipped hero) -->
+  <text x="120" y="215" fill="#e6edf3" font-size="52" font-weight="bold">Give your coding agents</text>
+  <text x="120" y="283" fill="#e6edf3" font-size="52" font-weight="bold">a real <tspan fill="#2ea44f">computer</tspan>.</text>
+
+  <!-- runnable-looking install line (real one-liner, protocol elided to fit) -->
+  <text x="120" y="368" font-size="20" xml:space="preserve"><tspan fill="#2ea44f">$ </tspan><tspan fill="#e6edf3">curl -fsSL raw.githubusercontent.com/build000r/skillbox/main/install.sh | bash</tspan></text>
+
+  <!-- blinking-cursor block (static) -->
+  <rect x="120" y="388" width="14" height="26" fill="#2ea44f" fill-opacity="0.85"/>
+
+  <!-- project name + tagline (bottom-left) -->
+  <text x="120" y="500" fill="#e6edf3" font-size="34" font-weight="bold">skillbox</text>
+  <text x="120" y="530" fill="#e6edf3" fill-opacity="0.6" font-size="20">private · durable · agent-first</text>
+
+  <!-- dated capture stamp (bottom-right) -->
+  <text x="1080" y="530" fill="#2ea44f" fill-opacity="0.9" font-size="18" text-anchor="end">first-box demo captured 2026-07-05</text>
+</svg>
