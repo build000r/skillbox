@@ -2,23 +2,45 @@
 
 # skillbox
 
-**A private, single-tenant Tailnet box for you and your coding agents.**
+**Give your coding agents a real computer.**
 
-Thin, self-hosted, Docker-based, with durable runtime state under `.skillbox-state/` and client-scoped overlays.
+One private Linux box with persistent Claude/Codex homes, repo state, client overlays, logs, and checks.
+Not a platform. Not a sandbox that forgets you. A machine.
+
+Built and dogfooded daily by one operator and his agents — see [Proof](#proof).
 
 ![runtime](https://img.shields.io/badge/runtime-Docker-2496ED?style=flat-square&logo=docker&logoColor=white)
 ![access](https://img.shields.io/badge/access-Tailscale-242424?style=flat-square&logo=tailscale&logoColor=white)
 ![shape](https://img.shields.io/badge/shape-thin%20starter-6E7781?style=flat-square)
 ![doctor](https://img.shields.io/badge/doctor-manifest%20checks-2ea44f?style=flat-square)
 
+<!-- Hero demo placeholder: an asciinema->gif is being produced separately as
+assets/demo.gif. Once that file lands, add the image here as:
+image tag -> skillbox demo, source assets/demo.gif. Left as text until the
+asset exists so the README never renders a broken image. -->  
+
 </div>
+
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/build000r/skillbox/main/install.sh | bash
+```
+
+One command. It clones the repo, hydrates your `.env`, initializes durable state under `.skillbox-state/`, builds the workspace container, starts it, and leaves you a client-ready surface at `sand/personal/`.
+
+Cautious? Append `--dry-run` to see the full plan before anything runs.
 
 ## TL;DR
 
-Most remote dev setups overshoot the need. You want one private box that feels
-like a real computer: one primary workspace container, your own Claude or Codex
-home directories, a broader repo universe, and a way to activate the right
-client context without standing up a full hosted workspace control plane.
+Remote dev platforms hand you a control plane you did not ask for. You want one
+private box that feels like a real computer: one primary workspace container,
+your own Claude or Codex home directories, a broader repo universe, and a way to
+activate the right client context — without standing up a full hosted workspace
+control plane.
+
+That is the whole product: a durable, private, agent-first machine — not a
+platform, not an ephemeral sandbox.
 
 `skillbox` gives you a cloneable starter for a Tailnet-first dev box with a
 Docker workspace, durable state under `.skillbox-state/`, client overlays,
@@ -26,19 +48,31 @@ explicit runtime graphs, and compact operator commands.
 
 ### Why Use `skillbox`?
 
-| Need | `skillbox` answer |
-|---|---|
-| Private access without public SSH exposure | Managed boxes default to `tailnet_only`: public SSH is temporary during bootstrap/enroll, then host SSH and the DigitalOcean firewall are locked to Tailnet access |
-| A workspace that feels like a narrowed local setup | One bind-mounted `/workspace`, plus durable state from `SKILLBOX_STATE_ROOT` mounted into `/workspace/logs`, `/workspace/workspace/clients`, `/home/sandbox`, and optional `/monoserver` |
-| A sane way to let the box grow over time | `workspace/runtime.yaml` plus `.env-manager/manage.py` manage the core machine plus client-specific repos, artifacts, installed skills, logs, and checks |
-| Service graphs that do not devolve into shell folklore | Declared `depends_on` edges let `up`, `down`, and `restart` expand and order service graphs automatically |
-| Live drift detection and auto-healing | The pulse daemon monitors services on a fixed interval, auto-restarts crashes, and appends human-readable events to `logs/runtime/runtime.log` |
-| Runtime history plus durable work notes | `focus` surfaces recent runtime activity, while `skillbox_session_*` tools and `cm` carry longer-lived work context |
-| One-command client activation | `focus` syncs, bootstraps, starts services, collects live state, and writes enriched agent context in a single pass |
-| Fleet management from the operator machine | The operator MCP server provisions DO droplets, enrolls Tailscale, and runs commands on remote boxes as native agent tools |
-| Reproducible default skills | `skill-repos.yaml` declares GitHub repos and local paths; `sync` clones and filtered-installs skills |
-| Confidence that docs/config/runtime still match | `04-reconcile.py` powers `make render` and the outer `make doctor` path, while `make dev-sanity` validates the live runtime internals |
-| Minimal surface area | No multi-tenant control plane, no hosted dependency, no hidden sibling repo requirement for packaging |
+**Durable.**
+- Runtime state lives under `.skillbox-state/`, mounted back into the box so agent homes, logs, and client overlays survive rebuilds.
+- `workspace/runtime.yaml` plus `make doctor` keep docs, config, and the live runtime in agreement.
+
+**Private.**
+- Managed boxes default to `tailnet_only`: public SSH is temporary during bootstrap/enroll, then host SSH and the DigitalOcean firewall lock to Tailnet access.
+- Operator secrets stay outside the workspace mount; in-box agents never see them.
+
+**Agent-first.**
+- Persistent Claude/Codex homes, declared service graphs, and one-command client `focus` that syncs, starts services, and writes enriched agent context in a single pass.
+- In-box and operator MCP tools expose the machine to your agents as native, structured tools.
+
+Full needs-to-answers table → [docs/faq.md#why-use-skillbox](docs/faq.md#why-use-skillbox).
+
+## Proof
+
+Measured in [examples/first-box-demo.md](examples/first-box-demo.md) (captured 2026-07-05):
+
+- `make render` resolved 4 repos, 11 services, 7 logs, and 18 checks before the box started.
+- A demo client reached focus with 2 services running.
+- The demo app served HTTP on `127.0.0.1`; status marked it `loopback-only`.
+- Final doctor after cleanup: 15 passed, 1 warning, 0 failed.
+- Operator secrets stayed outside the workspace mount.
+
+Reproduce the proof: follow [examples/first-box-demo.md](examples/first-box-demo.md) from a clean clone.
 
 ## Why `skillbox` Exists
 
@@ -48,7 +82,9 @@ explicit runtime state, and low operational ceremony.
 
 For the deeper thesis, see [docs/VISION.md](docs/VISION.md).
 
-## Quick Start
+## From A Local Checkout
+
+Prefer to drive it by hand? Clone and run the make sequence instead of the one-liner:
 
 ```bash
 git clone https://github.com/build000r/skillbox.git
@@ -181,10 +217,12 @@ Moved to [docs/troubleshooting.md#limitations](docs/troubleshooting.md#limitatio
 
 Moved to [docs/faq.md#faq](docs/faq.md#faq).
 
+## License
+
+Source-available; no OSI license granted yet (operator decision, 2026-06-21) — read before reuse. The source is published for reading and reference; you may not redistribute or reuse it without permission.
+
 ## About Contributions
 
 > *About Contributions:* Please don't take this the wrong way, but I do not accept outside contributions for any of my projects. I simply don't have the mental bandwidth to review anything, and it's my name on the thing, so I'm responsible for any problems it causes; thus, the risk-reward is highly asymmetric from my perspective. I'd also have to worry about other "stakeholders," which seems unwise for tools I mostly make for myself for free. Feel free to submit issues, and even PRs if you want to illustrate a proposed fix, but know I won't merge them directly. Instead, I'll have Claude or Codex review submissions via `gh` and independently decide whether and how to address them. Bug reports in particular are welcome. Sorry if this offends, but I want to avoid wasted time and hurt feelings. I understand this isn't in sync with the prevailing open-source ethos that seeks community contributions, but it's the only way I can move at this velocity and keep my sanity.
 
-## License
-
-All rights reserved. No license file is included and no OSI license is granted yet (operator decision, 2026-06-21): the source is published for reading and reference, but you may not redistribute or reuse it without permission.
+> — build000r ([@build000r](https://github.com/build000r)), who runs his agents on this exact box, every day.

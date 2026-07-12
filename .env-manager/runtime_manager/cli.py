@@ -151,9 +151,48 @@ def command_registry() -> dict[str, ManageCommandSpec]:
     return dict(sorted(_COMMAND_REGISTRY.items()))
 
 
+def _argv_requests_json(argv: list[str] | None = None) -> bool:
+    """True when the raw argv asks for JSON output (via --format json or a json alias).
+
+    Used to decide whether an argparse usage error should be rendered as a parseable
+    JSON error envelope on stdout instead of a plain-text usage block on stderr.
+    """
+    raw = list(sys.argv[1:] if argv is None else argv)
+    for index, token in enumerate(raw):
+        if token in JSON_FLAG_ALIASES:
+            return True
+        if token == "--format" and index + 1 < len(raw) and raw[index + 1] == "json":
+            return True
+        if token == "--format=json":
+            return True
+    return False
+
+
+# argparse usage errors are exit code 2 per the documented exit_code dictionary.
+_EXIT_USAGE = 2
+
+
 class SkillboxArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         command_hint = _command_suggestion_from_error(message)
+        if _argv_requests_json():
+            # Agents that pass --format json get a parseable recovery envelope on
+            # stdout instead of a plain-text usage block they'd have to scrape.
+            next_actions = ["manage.py capabilities --format json"]
+            suggestions: list[dict[str, Any]] | None = None
+            if command_hint:
+                next_actions.insert(0, f"manage.py {command_hint} --format json")
+                suggestions = [{"command": command_hint, "invoke": f"manage.py {command_hint}"}]
+            payload = brain_error_payload(
+                "2026-05-09",
+                "USAGE_ERROR",
+                message,
+                context={"prog": self.prog, "usage": self.format_usage().strip()},
+                next_actions=next_actions,
+                suggestions=suggestions,
+            )
+            emit_json(payload)
+            self.exit(_EXIT_USAGE)
         hint_lines = [
             "",
             "Agent hint: run `manage.py capabilities --json` for the machine-readable command contract.",
@@ -1228,9 +1267,24 @@ def _build_parser() -> argparse.ArgumentParser:
 
     snap_parser = subparsers.add_parser(
         "snap",
-        help="Create, diff, or replay redacted agent operations snapshots.",
+        help=(
+            "Redacted agent operations snapshot. Bare `snap --format json` creates a "
+            "read-only snapshot (like status/render); subcommands: create, diff, replay, actions."
+        ),
     )
     snap_parser.add_argument("--format", choices=("text", "json"), default="json")
+    # Sibling-consistency: allow the canonical create flags directly on bare `snap`
+    # so `snap --format json`, `snap --no-adapters`, `snap --write` all "just work"
+    # without an explicit `create` verb (skillbox-ej24). The `create` subcommand
+    # remains fully supported for backward compatibility.
+    snap_parser.add_argument("--name", "--label", dest="name", default=None)
+    snap_parser.add_argument("--created-at", default=None, help="Override timestamp for deterministic fixtures.")
+    snap_parser.add_argument("--write", action="store_true", help="Write the snapshot under .skillbox-state.")
+    snap_parser.add_argument("--cwd", default=None, help="Working directory used for evidence scoping.")
+    snap_parser.add_argument("--ntm-session", default=None, help="Optional NTM session id for load-state evidence.")
+    snap_parser.add_argument("--no-adapters", action="store_true", help="Skip optional br/bv/sbp/ntm adapters.")
+    _add_profile_arg(snap_parser)
+    _add_client_arg(snap_parser)
     snap_subparsers = snap_parser.add_subparsers(dest="snap_action")
     snap_create_parser = snap_subparsers.add_parser("create", help="Create a redacted runtime/evidence/graph snapshot.")
     snap_create_parser.add_argument("--format", choices=("text", "json"), default="json")
@@ -1254,6 +1308,12 @@ def _build_parser() -> argparse.ArgumentParser:
     snap_replay_parser.add_argument("--format", choices=("text", "json"), default="json")
     _add_profile_arg(snap_replay_parser)
     _add_client_arg(snap_replay_parser)
+    snap_actions_parser = snap_subparsers.add_parser(
+        "actions", help="List snap subcommands and safe first-try invocations (discovery)."
+    )
+    snap_actions_parser.add_argument("--format", choices=("text", "json"), default="json")
+    _add_profile_arg(snap_actions_parser)
+    _add_client_arg(snap_actions_parser)
 
     mmdx_parser = subparsers.add_parser(
         "mmdx",
@@ -3345,7 +3405,7 @@ def _safe_first_try_command(name: str) -> str:
     if name == "explain":
         return "manage.py explain brain.next --format json --no-adapters"
     if name == "snap":
-        return "manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json"
+        return "manage.py snap --format json --no-adapters"
     if name == "registry-docs":
         return "manage.py registry-docs --format md"
     if name in {"client-init"}:
@@ -3413,6 +3473,7 @@ Useful command families:
   graph --format json           Inspect the agent operations graph.
   explain <node> --format json  Explain graph nodes, Beads, tools, and commands.
   search <query> --format json  Search commands, graph nodes, docs, Beads, evidence.
+  snap --format json            Create a read-only agent-ops snapshot (like status/render).
   snap replay <file>            Replay redacted snapshot fixtures without live services.
   status --format json          Compact runtime state.
   doctor --format json          Runtime validation checks.
@@ -4477,11 +4538,15 @@ def _snap_usage_payload(*, unknown_action: str | None = None) -> dict[str, Any]:
         "ok": True,
         "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "read_only_default": True,
-        "summary": "snap subcommands: create (dry-run unless --write), diff, replay",
+        "summary": (
+            "snap: bare `snap --format json` creates a read-only snapshot (like status/render). "
+            "Subcommands: create (dry-run unless --write), diff, replay, actions."
+        ),
+        "default_action": "create",
         "subcommands": subcommands,
         "actions": subcommands,
         "next_actions": [
-            "python3 .env-manager/manage.py snap --format json replay tests/goldens/agent_ops_snapshot.json",
+            "python3 .env-manager/manage.py snap --format json",
             "python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json",
             "python3 .env-manager/manage.py capabilities --format json",
         ],
@@ -4582,7 +4647,12 @@ def _load_snapshot_for_brain(path: Path) -> tuple[dict[str, Any] | None, dict[st
 def _handle_snap(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
     del resolved_mode
     snap_action = getattr(args, "snap_action", None)
+    # skillbox-ej24: bare `snap --format json` (no verb) now produces a read-only
+    # snapshot directly, matching sibling read-side surfaces (status/render/doctor).
+    # The `create` verb stays supported; `snap actions` surfaces the discovery menu.
     if not snap_action:
+        snap_action = "create"
+    if snap_action == "actions":
         payload = _snap_usage_payload() if args.format == "json" else _snap_action_required_text_payload()
     elif snap_action == "create":
         adapters = _brain_adapters_for_args(root_dir, model, args)

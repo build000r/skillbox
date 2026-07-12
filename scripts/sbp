@@ -711,25 +711,36 @@ case "${1:-}" in
     ;;
   *)
     if [[ -n "${1:-}" ]]; then
+      suggestion=""
       case "${1}" in
-        statu|stats|state)
+        statu|stats|state|statuss)
           suggestion="status"
           ;;
-        log|logz)
+        log|logz|logss)
           suggestion="logs"
           ;;
-        skillz)
+        skillz|skill-audit|skils)
           suggestion="skills"
           ;;
-        mc)
+        mc|mcpp|mcps)
           suggestion="mcp"
           ;;
-        *)
-          suggestion="status"
+        recalibrat|recal|recalibarte)
+          suggestion="recalibrate"
+          ;;
+        doc|doctorr|docter)
+          suggestion="doctor"
+          ;;
+        cand|candidate)
+          suggestion="candidates"
           ;;
       esac
       echo "${wrapper_name}: unknown command '${1}'." >&2
-      echo "Did you mean: ${wrapper_name} ${suggestion} --json" >&2
+      # Only emit a "Did you mean" line when we have a plausible match; a canned
+      # suggestion for a genuinely-unknown command misleads agents (gkso).
+      if [[ -n "${suggestion}" ]]; then
+        echo "Did you mean: ${wrapper_name} ${suggestion} --json" >&2
+      fi
       echo "Discover commands: ${wrapper_name} capabilities --json" >&2
       exit 2
     fi

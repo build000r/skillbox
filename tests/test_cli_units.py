@@ -210,8 +210,26 @@ class CliUnitTests(unittest.TestCase):
         self.assertEqual(payload["target"], "command:brain.next")
         self.assertEqual(payload["kind"], "command")
 
-    def test_snap_without_action_returns_structured_usage_payload(self) -> None:
-        result = _run_manage("snap", "--format", "json")
+    def test_snap_bare_json_creates_snapshot_like_siblings(self) -> None:
+        # skillbox-ej24: bare `snap --format json` (no verb) creates a read-only
+        # snapshot directly, matching sibling read-side surfaces (status/render).
+        result = _run_manage("snap", "--format", "json", "--no-adapters")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertIn("snapshot_id", payload)
+        self.assertIn("inputs", payload)
+        self.assertNotIn("error", payload)
+
+    def test_snap_bare_text_creates_snapshot(self) -> None:
+        # Bare `snap` in text mode also creates a snapshot (consistent default action).
+        result = _run_manage("snap", "--format", "text", "--no-adapters")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("snapshot:", result.stdout)
+
+    def test_snap_actions_returns_structured_usage_payload(self) -> None:
+        result = _run_manage("snap", "actions", "--format", "json")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
@@ -219,20 +237,14 @@ class CliUnitTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertNotIn("error", payload)
         self.assertTrue(payload["read_only_default"])
+        self.assertEqual(payload["default_action"], "create")
         self.assertEqual([item["name"] for item in payload["subcommands"]], ["create", "diff", "replay"])
         self.assertEqual(payload["actions"], payload["subcommands"])
         self.assertEqual(payload["subcommands"][0]["writes_only_with"], "--write")
         self.assertIn(
-            "snap --format json replay tests/goldens/agent_ops_snapshot.json",
+            "snap --format json",
             payload["next_actions"][0],
         )
-
-    def test_snap_without_action_text_mode_keeps_nonzero_usage_error(self) -> None:
-        result = _run_manage("snap", "--format", "text")
-
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("snap requires an action", result.stderr)
-        self.assertEqual(result.stdout, "")
 
     def test_snap_flag_first_replay_json(self) -> None:
         result = _run_manage(
@@ -546,11 +558,28 @@ class CliUnitTests(unittest.TestCase):
         bare_snap_args = mcp_server.build_args("snap", {})
         self.assertEqual(bare_snap_args, ["snap", "--format", "json"])
 
-    def test_skillbox_snap_without_action_returns_usage_payload(self) -> None:
+    def test_skillbox_snap_without_action_creates_snapshot_matching_cli(self) -> None:
+        # skillbox-ej24: bare `snap` (CLI) and omitted-action `skillbox_snap` (MCP)
+        # both now create a read-only snapshot. Parity between the two surfaces holds;
+        # discovery moved to `snap actions`.
         mcp_server = _load_mcp_server_module()
 
-        cli_usage = json.loads(_run_manage("snap", "--format", "json").stdout)
-        mcp_usage = mcp_server.dispatch_tool("skillbox_snap", {})
+        cli_bare = json.loads(_run_manage("snap", "--format", "json", "--no-adapters").stdout)
+        mcp_bare = mcp_server.dispatch_tool("skillbox_snap", {"no_adapters": True})
+        mcp_bare_payload = json.loads(mcp_bare["content"][0]["text"])
+
+        self.assertNotIn("isError", mcp_bare)
+        self.assertEqual(mcp_bare_payload["_exit_code"], 0)
+        self.assertIn("snapshot_id", cli_bare)
+        self.assertIn("snapshot_id", mcp_bare_payload)
+        self.assertIn("inputs", cli_bare)
+        self.assertIn("inputs", mcp_bare_payload)
+
+    def test_skillbox_snap_actions_returns_usage_payload(self) -> None:
+        mcp_server = _load_mcp_server_module()
+
+        cli_usage = json.loads(_run_manage("snap", "actions", "--format", "json").stdout)
+        mcp_usage = mcp_server.dispatch_tool("skillbox_snap", {"action": "actions"})
         mcp_usage_payload = json.loads(mcp_usage["content"][0]["text"])
 
         self.assertNotIn("isError", mcp_usage)
@@ -671,9 +700,9 @@ class CliUnitTests(unittest.TestCase):
         self.assertIn("active_profiles", payload)
         self.assertIn("Interpreting --jsno as --format json", result.stderr)
 
-    def test_unknown_command_error_suggests_correct_command_and_capabilities(self) -> None:
+    def test_unknown_command_error_text_mode_suggests_correct_command(self) -> None:
         result = subprocess.run(
-            [sys.executable, ".env-manager/manage.py", "statu", "--json"],
+            [sys.executable, ".env-manager/manage.py", "statu"],
             cwd=ROOT_DIR,
             capture_output=True,
             text=True,
@@ -685,6 +714,27 @@ class CliUnitTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertIn("Did you mean: `manage.py status`?", result.stderr)
         self.assertIn("manage.py capabilities --json", result.stderr)
+
+    def test_unknown_command_error_json_mode_returns_parseable_envelope(self) -> None:
+        # gkso: --format json usage errors return a parseable JSON error envelope on
+        # stdout (exit 2, clean stderr) instead of a plain-text usage block agents
+        # would have to scrape.
+        result = subprocess.run(
+            [sys.executable, ".env-manager/manage.py", "statu", "--json"],
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "PYTHONPATH": str(ENV_MANAGER_DIR)},
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip(), "")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["code"], "USAGE_ERROR")
+        self.assertEqual(payload["suggestions"][0]["command"], "status")
+        self.assertIn("manage.py status --format json", payload["next_actions"])
+        self.assertIn("manage.py capabilities --format json", payload["next_actions"])
 
     def test_cli_import_does_not_require_distribution_crypto_modules(self) -> None:
         code = r"""

@@ -469,6 +469,30 @@ class CliWrapperTests(unittest.TestCase):
         self.assertIn("Exact command: sbp logs <profile> <service> --json", logs.stderr)
         self.assertIn("List services first: sbp status --json", logs.stderr)
 
+    def test_sbp_genuinely_unknown_command_omits_misleading_suggestion(self) -> None:
+        # gkso: a canned "Did you mean: status" for a command with no plausible
+        # match misleads agents. Genuinely-unknown commands point only at capabilities.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+
+            unknown = self._run_wrapper(SBP, "totally-bogus-xyz", fake_root=fake_root)
+
+        self.assertEqual(unknown.returncode, 2)
+        self.assertEqual(unknown.stdout, "")
+        self.assertNotIn("Did you mean:", unknown.stderr)
+        self.assertIn("Discover commands: sbp capabilities --json", unknown.stderr)
+
+    def test_sbp_close_typo_still_suggests_exact_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+
+            recal = self._run_wrapper(SBP, "recalibrat", fake_root=fake_root)
+
+        self.assertEqual(recal.returncode, 2)
+        self.assertIn("Did you mean: sbp recalibrate --json", recal.stderr)
+
     def test_sbp_skills_infers_client_from_downstream_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
