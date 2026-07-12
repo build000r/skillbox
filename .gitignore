@@ -61,3 +61,8 @@ refactor/
 
 # local private config (symlinks to host-private paths)
 .buildoo[o]r/
+
+# Runtime lock/port artifacts (generated; never commit)
+.skillbox-port.env
+workspace/.focus.json.lock
+.skillbox/skill-overrides.yaml.lock

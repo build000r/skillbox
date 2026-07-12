@@ -1,10 +1,11 @@
 version: 1
 pin_on:
 - vibing-with-ntm
+- viral-product-score
 pin_off: []
 opt_out_global: []
 overlays:
   enable: []
   disable: []
 defaults: []
-reason: Repo-local skill visibility overrides.
+reason: heal:viral-product-score 2026-07-11T22:47:24Z
