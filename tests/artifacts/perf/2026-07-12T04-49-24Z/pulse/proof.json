@@ -1,0 +1,97 @@
+{
+  "kind": "pulse-regression-proof",
+  "generated_at_utc": "2026-07-12T04:49:24+00:00",
+  "python": "3.12.3",
+  "behavioral": {
+    "service_transitions": {
+      "scenario": "service crash then auto-heal",
+      "cycles": 3,
+      "final_service_states": {
+        "web": "running"
+      },
+      "events_emitted": 1,
+      "heals": 1
+    },
+    "check_transitions": {
+      "scenario": "check fail then recover",
+      "cycles": 3,
+      "final_check_states": {
+        "disk": true
+      },
+      "events_emitted": 2
+    },
+    "pressure_advisory": {
+      "scenario": "pressure advisory raise then clear (read-only)",
+      "cycles": 3,
+      "final_pressure_warnings": [],
+      "events_emitted": 2,
+      "advisory_mutates": false
+    },
+    "state_file_shape": {
+      "state_path_rel": "logs/runtime/pulse.state.json",
+      "top_level_keys": [
+        "active_clients",
+        "active_profiles",
+        "auto_restart",
+        "auto_sync",
+        "check_states",
+        "config_hash",
+        "cycle_count",
+        "events_emitted",
+        "heals",
+        "interval",
+        "pid",
+        "port_sentinel",
+        "pressure_advisory",
+        "pressure_warnings",
+        "restart_attempts",
+        "service_states",
+        "unhealthy_for_seconds",
+        "unhealthy_grace_seconds",
+        "updated_at"
+      ],
+      "sample": {
+        "service_states": {
+          "web": "running"
+        },
+        "check_states": {
+          "disk": true
+        },
+        "interval": 30,
+        "auto_restart": true
+      }
+    },
+    "status_rendering": {
+      "command": "pulse.py --root-dir <tmp> status",
+      "exit_code": 0,
+      "stdout_normalized": [
+        "pulse: stopped (pid 4242)",
+        "  interval:  30s",
+        "  cycles:    3",
+        "  heals:     1",
+        "  events:    4",
+        "  last tick: <age>",
+        "  services:",
+        "    - api: down",
+        "    + web: running",
+        "  failed checks: tls",
+        "  port sentinel: observe, seen 0, reaped 0, active 0",
+        "  port guard counters: hook 0, shim 0, post-bind 0, wildcard 0, first never, last never",
+        "  pressure/offload warnings:",
+        "    ! disk free below 10 GiB"
+      ]
+    }
+  },
+  "behavioral_fingerprint_sha256": "fa79c867c1baca0967ff7f33d6ce66fe056ad6466ec8f17acb06ce327f3216da",
+  "timing": {
+    "cycles": 5,
+    "total_ms": 30.938,
+    "avg_ms": 6.1877,
+    "p50_ms": 6.0172,
+    "p95_ms": 7.0648,
+    "max_ms": 7.0648
+  },
+  "blocked_conditions": [
+    "none \u2014 proof runs without infrastructure or live services"
+  ]
+}
