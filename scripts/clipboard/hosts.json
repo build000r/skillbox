@@ -51,6 +51,40 @@
       "clipboard_capable": true
     }
   },
+  "conference1_tailnet": {
+    "host": "conference1",
+    "role": "heavy-build and dev-surface target",
+    "os": "windows-with-wsl-ubuntu",
+    "magicdns": "conference1.tail4c481e.ts.net",
+    "tailscale_ip": "100.123.217.11",
+    "windows_ssh_target": "conference1-ssh",
+    "wsl_ssh_target": "worker@conference1-wsl",
+    "wsl_tailscale_ip": "100.96.206.87",
+    "serve_helper": "C:\\Users\\worker\\bin\\tailnet-serve.ps1",
+    "serve_helper_actions": ["list", "expose", "remove"],
+    "serve_backend_host": "127.0.0.1",
+    "serve_ports": [3000, 3001, 3170, 3210, 8050],
+    "portproxy_fallback": {
+      "listen_address": "100.123.217.11",
+      "list_command": "netsh interface portproxy show v4tov4",
+      "note": "Raw Tailscale-IP portproxy; fallback only when MagicDNS Serve is unavailable."
+    },
+    "swimmers_remote_rust": {
+      "host_env": "SWIMMERS_REMOTE_RUST_HOST",
+      "host_values": ["conference1-ssh", "worker@100.123.217.11"],
+      "build_side": "wsl-ubuntu",
+      "wsl_ssh_target": "worker@conference1-wsl",
+      "cargo_cache": "/var/tmp/swimmers-remote-rust-cache"
+    },
+    "security": {
+      "posture": "tailnet-only",
+      "rules": [
+        "Reach services through Tailscale Serve / MagicDNS URLs on the tailnet.",
+        "No 0.0.0.0 public binds; apps bind 127.0.0.1 and Serve proxies to them.",
+        "No Tailscale Funnel unless the operator explicitly requests it."
+      ]
+    }
+  },
   "conference_routing": {
     "direct_alias": "conference1-wsl",
     "direct_target": "worker@conference1-wsl",

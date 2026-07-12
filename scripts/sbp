@@ -164,6 +164,10 @@ Usage:
                               repo from Cass (contamination-safe), joined to current policy
   __WRAPPER__ cron [status|apply]     Declared crontab + script links from skillbox-config
   __WRAPPER__ send-later [list|doctor|new|panes] Schedule/inspect delayed/recurring tmux/NTM sends (--json on list/doctor/panes)
+  __WRAPPER__ conference1 [urls|status|helper] Conference1 tailnet Serve endpoints, live
+                              read-only Serve/portproxy status over SSH, and the
+                              Swimmers heavy-build lane (aliases: conf1, tailnet;
+                              expose/remove require --yes; Funnel refused)
   __WRAPPER__ beads [status|init|sync] Check or initialize repo-local beads state
   __WRAPPER__ mmdx QUERY              Fuzzy-find and open .mmdx/.mmd from this cwd
   __WRAPPER__ mmdx                    List recent .mmdx/.mmd files from this repo
@@ -453,6 +457,7 @@ payload = {
         {"name": "evidence", "json": True, "safe_first_try": f"{wrapper} evidence --repo <path> --format json"},
         {"name": "cron", "json": True, "safe_first_try": f"{wrapper} cron status --json"},
         {"name": "send-later", "json": True, "safe_first_try": f"{wrapper} send-later list --json"},
+        {"name": "conference1", "json": True, "safe_first_try": f"{wrapper} conference1 status --json", "aliases": ["conf1", "tailnet"], "notes": "urls/status/helper are read-only; expose/remove require --yes; Funnel refused."},
         {"name": "recalibrate", "json": True, "safe_first_try": f"{wrapper} recalibrate --json"},
     ],
     "agent_surfaces": {
@@ -674,6 +679,10 @@ case "${1:-}" in
     action="send-later"
     shift
     ;;
+  conference1|conf1|tailnet)
+    action="conference1"
+    shift
+    ;;
   beads|br)
     action="beads"
     shift
@@ -772,7 +781,7 @@ append_passthrough_token() {
           ;;
       esac
       ;;
-    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|mcp-sync|structure-doctor|repo-registry|cass|cass-evidence|cron|send-later|beads|mmdx|operator-booking|swimmers-launch|fleet)
+    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|mcp-sync|structure-doctor|repo-registry|cass|cass-evidence|cron|send-later|conference1|beads|mmdx|operator-booking|swimmers-launch|fleet)
       passthrough_args+=("${token}")
       ;;
     *)
@@ -1019,7 +1028,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-if [[ ! -t 0 && "${action}" != "home" && "${action}" != "help" && "${action}" != "send-later" ]]; then
+if [[ ! -t 0 && "${action}" != "home" && "${action}" != "help" && "${action}" != "send-later" && "${action}" != "conference1" ]]; then
   while IFS= read -r line; do
     line="${line//,/ }"
     # Intentional shell-word splitting for simple pipe-friendly wrapper input.
@@ -1220,6 +1229,14 @@ PY
       exit 1
     fi
     bash "${cron_wrapper}" "${passthrough_args[@]}"
+    ;;
+  conference1)
+    conference1_helper="${script_dir}/lib/conference1_tailnet.py"
+    if [[ ! -f "${conference1_helper}" ]]; then
+      echo "${wrapper_name} conference1: missing helper at ${conference1_helper}" >&2
+      exit 1
+    fi
+    python3 "${conference1_helper}" "${passthrough_args[@]}"
     ;;
   send-later)
     send_later_wrapper="${script_dir}/sbp_send_later.sh"
