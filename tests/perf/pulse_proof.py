@@ -85,6 +85,9 @@ def _run_reconcile_sequence(
     auto_restart: bool = True,
 ) -> PULSE.PulseState:
     """Run one reconcile cycle per supplied snapshot, with all I/O seams mocked."""
+    # Every scenario mocks _model_config_hash to the same constant; drop the
+    # hash-keyed model cache so each scenario's mocked model is rebuilt.
+    PULSE._pulse_model_cache.clear()
     state = PULSE.PulseState()
     cycles = max(len(service_snapshots), len(check_snapshots), len(advisories))
     with (

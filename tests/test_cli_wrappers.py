@@ -1209,6 +1209,56 @@ class CliWrapperTests(unittest.TestCase):
             self.assertEqual((bin_dir / "sbo").resolve(), SBO)
             self.assertIn("installed wrappers:", result.stdout)
 
+    def _run_pulse(self, *args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["python3", str(ROOT_DIR / ".env-manager" / "pulse.py"), *args],
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+
+    def test_pulse_bare_invocation_defaults_to_read_only_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self._run_pulse("--root-dir", tmpdir)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("pulse: not running", result.stdout)
+            # Read-only: the bare default must not daemonize or write a pidfile.
+            self.assertEqual(
+                [str(p) for p in Path(tmpdir).rglob("pulse.pid")], [],
+            )
+
+    def test_pulse_start_verifies_pidfile_and_stop_tears_down(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                result = self._run_pulse("--root-dir", tmpdir, "start", "--interval", "30")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("[pulse] started (pid ", result.stdout)
+                self.assertIn("pulse.log", result.stdout)
+                pid_files = list(Path(tmpdir).rglob("pulse.pid"))
+                self.assertEqual(len(pid_files), 1, pid_files)
+
+                again = self._run_pulse("--root-dir", tmpdir, "start")
+                self.assertEqual(again.returncode, 0, again.stderr)
+                self.assertIn("already running", again.stdout)
+            finally:
+                stop = self._run_pulse("--root-dir", tmpdir, "stop")
+            self.assertEqual(stop.returncode, 0, stop.stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores directory write bits")
+    def test_pulse_start_returns_nonzero_when_state_dir_unwritable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "ro-root"
+            root.mkdir()
+            root.chmod(0o555)
+            try:
+                result = self._run_pulse("--root-dir", str(root), "start")
+            finally:
+                root.chmod(0o755)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("[pulse]", result.stderr)
+
     def _make_fake_skillbox(self, root: Path) -> Path:
         env_dir = root / ".env-manager"
         env_dir.mkdir(parents=True)

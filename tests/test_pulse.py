@@ -1021,5 +1021,166 @@ class PulseTests(unittest.TestCase):
         self.assertIn("checks: all passing (2)", output)
 
 
+class PulseStartAndTickCostTests(unittest.TestCase):
+    def test_main_bare_invocation_defaults_to_read_only_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with (
+                mock.patch.object(PULSE_MODULE.sys, "argv", ["pulse.py", "--root-dir", str(root)]),
+                mock.patch.object(PULSE_MODULE, "print_status", return_value=0) as print_status,
+                mock.patch.object(PULSE_MODULE, "run_daemon") as run_daemon,
+            ):
+                self.assertEqual(PULSE_MODULE.main(), 0)
+            print_status.assert_called_once_with(root.resolve())
+            run_daemon.assert_not_called()
+
+    def test_main_start_routes_to_start_daemon_with_shared_options(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            argv = [
+                "pulse.py",
+                "--root-dir",
+                str(root),
+                "start",
+                "--interval",
+                "7",
+                "--no-restart",
+                "--client",
+                "personal",
+            ]
+            with (
+                mock.patch.object(PULSE_MODULE.sys, "argv", argv),
+                mock.patch.object(PULSE_MODULE, "start_daemon", return_value=0) as start_daemon,
+                mock.patch.object(PULSE_MODULE, "run_daemon") as run_daemon,
+            ):
+                self.assertEqual(PULSE_MODULE.main(), 0)
+            run_daemon.assert_not_called()
+            start_daemon.assert_called_once_with(
+                root.resolve(),
+                interval=7,
+                auto_restart=False,
+                auto_sync=False,
+                active_clients=["personal"],
+                active_profiles=None,
+                unhealthy_grace_seconds=PULSE_MODULE.DEFAULT_UNHEALTHY_GRACE_SECONDS,
+            )
+
+    def test_start_daemon_is_idempotent_when_already_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(PULSE_MODULE, "existing_pid", return_value=42),
+                mock.patch.object(PULSE_MODULE.subprocess, "Popen") as popen,
+                redirect_stdout(stdout),
+            ):
+                self.assertEqual(PULSE_MODULE.start_daemon(root), 0)
+            popen.assert_not_called()
+            self.assertIn("already running (pid 42)", stdout.getvalue())
+
+    def test_start_daemon_verifies_pidfile_and_reports_pid_and_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            child = mock.Mock()
+            child.pid = 999
+            child.poll.return_value = None
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(PULSE_MODULE, "existing_pid", side_effect=[None, 999]),
+                mock.patch.object(PULSE_MODULE.subprocess, "Popen", return_value=child) as popen,
+                redirect_stdout(stdout),
+            ):
+                self.assertEqual(PULSE_MODULE.start_daemon(root, interval=5), 0)
+            command = popen.call_args.args[0]
+            self.assertIn("run", command)
+            self.assertIn("--interval", command)
+            self.assertIn("5", command)
+            self.assertIn("started (pid 999)", stdout.getvalue())
+            self.assertIn("pulse.log", stdout.getvalue())
+
+    def test_start_daemon_surfaces_child_crash_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            child = mock.Mock()
+            child.pid = 999
+            child.poll.return_value = 3
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(PULSE_MODULE, "existing_pid", return_value=None),
+                mock.patch.object(PULSE_MODULE.subprocess, "Popen", return_value=child),
+                mock.patch.object(PULSE_MODULE.sys, "stderr", stderr),
+            ):
+                self.assertEqual(PULSE_MODULE.start_daemon(root), 3)
+            self.assertIn("exited during startup (exit 3)", stderr.getvalue())
+
+    def test_start_daemon_times_out_when_pidfile_never_appears(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            child = mock.Mock()
+            child.pid = 999
+            child.poll.return_value = None
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(PULSE_MODULE, "existing_pid", return_value=None),
+                mock.patch.object(PULSE_MODULE.subprocess, "Popen", return_value=child),
+                mock.patch.object(PULSE_MODULE.sys, "stderr", stderr),
+            ):
+                self.assertEqual(PULSE_MODULE.start_daemon(root, wait_seconds=0.5), 1)
+            self.assertIn("did not write", stderr.getvalue())
+
+    def test_load_pulse_model_reuses_cached_model_until_hash_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            model = {"services": [], "checks": [], "clients": []}
+            PULSE_MODULE._pulse_model_cache.clear()  # noqa: SLF001
+            try:
+                with (
+                    mock.patch.object(PULSE_MODULE, "build_runtime_model", return_value=model) as build,
+                    mock.patch.object(PULSE_MODULE, "filter_model", side_effect=lambda m, _p, _c: m),
+                    mock.patch.object(PULSE_MODULE, "normalize_active_clients", return_value=set()),
+                ):
+                    for _ in range(3):
+                        loaded = PULSE_MODULE._load_pulse_model(root, None, None, config_hash="aaaa")  # noqa: SLF001
+                        self.assertIsNotNone(loaded)
+                    self.assertEqual(build.call_count, 1)
+
+                    PULSE_MODULE._load_pulse_model(root, None, None, config_hash="bbbb")  # noqa: SLF001
+                    self.assertEqual(build.call_count, 2)
+
+                    # No hash (degraded environments): never served from cache.
+                    PULSE_MODULE._load_pulse_model(root, None, None)  # noqa: SLF001
+                    self.assertEqual(build.call_count, 3)
+            finally:
+                PULSE_MODULE._pulse_model_cache.clear()  # noqa: SLF001
+
+    def test_managed_service_pids_walks_proc_once_for_all_services(self) -> None:
+        model = {
+            "services": [
+                {"id": "api"},
+                {"id": "web"},
+                {"id": "down-service"},
+            ]
+        }
+        pids = {"api": 100, "web": 200, "down-service": None}
+        with (
+            mock.patch.object(PULSE_MODULE, "service_paths", side_effect=lambda _m, s: {"pid_file": s["id"]}),
+            mock.patch.object(PULSE_MODULE, "read_service_pid", side_effect=lambda sid: pids[sid]),
+            mock.patch.object(PULSE_MODULE, "process_is_running", return_value=True),
+            mock.patch.object(PULSE_MODULE, "process_forest_pids", return_value={100, 101, 200}) as forest,
+        ):
+            managed = PULSE_MODULE._managed_service_pids(model)  # noqa: SLF001
+        self.assertEqual(managed, {100, 101, 200})
+        forest.assert_called_once_with({100, 200})
+
+    def test_scan_rogue_listeners_passes_persistent_cache(self) -> None:
+        with (
+            mock.patch.object(PULSE_MODULE, "_declared_port_set", return_value=set()),
+            mock.patch.object(PULSE_MODULE, "_managed_service_pids", return_value=set()),
+            mock.patch.object(PULSE_MODULE, "all_process_listeners", return_value=[]) as listeners,
+        ):
+            PULSE_MODULE._scan_rogue_listeners({"services": []})  # noqa: SLF001
+        listeners.assert_called_once_with(cache=PULSE_MODULE._listener_scan_cache)  # noqa: SLF001
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -79,7 +79,41 @@ from lib.redaction import redact_value as redact_value  # noqa: E402
 
 RUNTIME_LOG_REL = Path("logs") / "runtime" / "runtime.log"
 
+# Size-based rotation for append-only logs: rotate at ~10MB, keep N archives
+# (<name>.1 is the most recent). Enforced on every append so unbounded growth
+# (runtime.log, pulse.log, crash-looping service stdout) is impossible.
+RUNTIME_LOG_MAX_BYTES = 10 * 1024 * 1024
+RUNTIME_LOG_KEEP_ROTATIONS = 3
+
 MCP_EVENT_CONTEXT_ENV = "SKILLBOX_MCP_EVENT_CONTEXT"
+
+def rotate_log_file(
+    log_path: Path,
+    *,
+    max_bytes: int = RUNTIME_LOG_MAX_BYTES,
+    keep: int = RUNTIME_LOG_KEEP_ROTATIONS,
+) -> bool:
+    """Rotate ``log_path`` to ``.1``..``.<keep>`` once it reaches ``max_bytes``.
+
+    Best-effort: callers invoke it before appending, and any OSError leaves the
+    current file in place. Returns True when a rotation happened.
+    """
+    if max_bytes <= 0 or keep < 1:
+        return False
+    try:
+        if log_path.stat().st_size < max_bytes:
+            return False
+    except OSError:
+        return False
+    try:
+        for index in range(keep - 1, 0, -1):
+            source = log_path.with_name(f"{log_path.name}.{index}")
+            if source.exists():
+                os.replace(source, log_path.with_name(f"{log_path.name}.{index + 1}"))
+        os.replace(log_path, log_path.with_name(f"{log_path.name}.1"))
+    except OSError:
+        return False
+    return True
 
 def current_mcp_event_context() -> dict[str, Any]:
     raw = str(os.environ.get(MCP_EVENT_CONTEXT_ENV) or "").strip()
@@ -107,6 +141,7 @@ def log_runtime_event(
     """Append a human-readable line to the runtime log. Best-effort."""
     log_path = root_dir / RUNTIME_LOG_REL
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    rotate_log_file(log_path, max_bytes=RUNTIME_LOG_MAX_BYTES, keep=RUNTIME_LOG_KEEP_ROTATIONS)
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     detail = merge_runtime_event_detail(detail)
     detail_str = f" {json.dumps(detail, separators=(',', ':'), default=str)}" if detail else ""
