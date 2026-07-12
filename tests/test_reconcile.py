@@ -181,7 +181,30 @@ class ReconcileTests(unittest.TestCase):
                 result = RECONCILE.check_secrets_visible_in_workspace()
             self.assertEqual(result.status, "pass")
             self.assertEqual(result.code, "secrets-visible-in-workspace")
-            self.assertEqual(result.details, {"exposed": []})
+            self.assertEqual(result.details, {"exposed": [], "foreign_app_env": []})
+
+    def test_check_secrets_visible_warns_on_foreign_app_env(self) -> None:
+        # A plain `.env` at another repo's mount root is app-owned runtime config
+        # (policy skillbox-i704): warn, don't fail, and don't demand relocation.
+        with tempfile.TemporaryDirectory() as tmp:
+            host_dir = Path(tmp)
+            (host_dir / ".env").write_text("APP_SETTING=1\n", encoding="utf-8")
+            config = {
+                "services": {
+                    "client-app": {
+                        "volumes": [
+                            {"type": "bind", "source": str(host_dir), "target": "/app"},
+                        ]
+                    }
+                }
+            }
+            with mock.patch.object(RECONCILE, "compose_config", return_value=config):
+                result = RECONCILE.check_secrets_visible_in_workspace()
+            self.assertEqual(result.status, "warn")
+            self.assertEqual(result.code, "secrets-visible-in-workspace")
+            self.assertEqual(result.details["exposed"], [])
+            self.assertEqual(result.details["foreign_app_env"], [str(host_dir / ".env")])
+            self.assertIn("skillbox-i704", result.message)
 
     def test_check_secrets_visible_fails_with_planted_env_box(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
