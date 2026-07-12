@@ -21,6 +21,15 @@ class UpgradeReleaseScriptTests(unittest.TestCase):
         self.assertIn("repo_lifecycle_target", script)
         self.assertIn('repo_dir="$(cd "${repo_dir}" && pwd -P)"', script)
 
+    def test_upgrade_release_seeds_env_into_operator_state_not_repo_root(self) -> None:
+        # skillbox-4c9s: a repo-root .env seed trips the secrets containment
+        # doctor checks on fresh upgrades; the seed must target the operator dir.
+        script = UPGRADE_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('cp "${REPO_DIR}/.env.example" "${OPERATOR_ENV_DIR}/.env"', script)
+        self.assertIn('chmod 600 "${OPERATOR_ENV_DIR}/.env"', script)
+        self.assertNotIn('cp "${REPO_DIR}/.env.example" "${REPO_DIR}/.env"', script)
+
     def test_upgrade_release_preserves_runtime_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
