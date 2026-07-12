@@ -121,6 +121,8 @@ public SSH is closed. `posture-proof` verifies the box-level result with
 service bind exposure is verified by the runtime exposure lint. Do not bind
 services to `0.0.0.0` on tailnet-only boxes — use loopback or Tailnet IP. See
 `docs/tailnet-only-lifecycle.md` for recovery and exposure rules.
+For the Conference1 heavy-build box (tailnet Serve URLs, read-only status,
+Swimmers remote Rust lane), use `sbp conference1` — see `docs/conference1.md`.
 
 ## Coding Notes
 
