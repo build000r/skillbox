@@ -13,6 +13,7 @@ Discipline the server enforces: assess → scope → dry-run → act → verify.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib
 import json
@@ -21,6 +22,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import urllib.parse
@@ -1416,11 +1418,116 @@ def build_tool_event_context(name: str, command: str, params: dict, request_id: 
     return context
 
 
+# manage.py subcommands that are read-only (no runtime mutation) and safe to
+# execute in-process. Dispatching these via runtime_manager.main() in the
+# server process skips the per-call interpreter start plus the eager
+# runtime_manager package import (~300-700ms fixed overhead per call).
+# Mutating lifecycle commands (sync/up/down/restart/bootstrap/onboard/...)
+# deliberately stay on the subprocess path for isolation and timeouts.
+_INPROCESS_MANAGE_COMMANDS = frozenset(
+    {
+        "capabilities",
+        "doctor",
+        "explain",
+        "graph",
+        "logs",
+        "mcp-audit",
+        "next",
+        "parity-report",
+        "ports",
+        "render",
+        "search",
+        "session-status",
+        "skill-audit",
+        "skills",
+        "status",
+    }
+)
+
+
+@contextlib.contextmanager
+def _captured_process_output(stdout_file: Any, stderr_file: Any):
+    """Redirect fd 1/2 to temp files so in-process command output (including
+    output from any child processes the command spawns) never leaks into the
+    JSON-RPC stdout stream — the same containment subprocess capture gave us."""
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved_stdout_fd = os.dup(1)
+    saved_stderr_fd = os.dup(2)
+    try:
+        os.dup2(stdout_file.fileno(), 1)
+        os.dup2(stderr_file.fileno(), 2)
+        yield
+    finally:
+        try:
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            pass
+        try:
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
+        os.dup2(saved_stdout_fd, 1)
+        os.dup2(saved_stderr_fd, 2)
+        os.close(saved_stdout_fd)
+        os.close(saved_stderr_fd)
+
+
+def _coerce_exit_code(raw: Any) -> int:
+    if raw is None:
+        return 0
+    if isinstance(raw, int):
+        return raw
+    return 1
+
+
+def _run_manage_in_process(
+    args: list[str],
+    *,
+    event_context: dict[str, Any] | None = None,
+) -> tuple[int, str, str] | None:
+    """Run manage.py's command dispatch in-process. Returns
+    (exit_code, stdout, stderr) mirroring a captured subprocess, or None when
+    the in-process path is unavailable (caller falls back to subprocess)."""
+    try:
+        runtime_manager = _runtime_manager_module()
+    except Exception:  # noqa: BLE001 - any bootstrap failure falls back to subprocess.
+        return None
+
+    saved_environ = dict(os.environ)
+    if event_context:
+        os.environ[MCP_EVENT_CONTEXT_ENV] = json.dumps(
+            event_context,
+            separators=(",", ":"),
+            default=str,
+        )
+    try:
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdout_file, tempfile.TemporaryFile(
+            mode="w+", encoding="utf-8"
+        ) as stderr_file:
+            with _captured_process_output(stdout_file, stderr_file):
+                try:
+                    exit_code = _coerce_exit_code(runtime_manager.main(list(args)))
+                except SystemExit as exc:
+                    exit_code = _coerce_exit_code(exc.code)
+                except Exception:  # noqa: BLE001 - mirror a crashing subprocess: traceback + exit 1.
+                    traceback.print_exc()
+                    exit_code = 1
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            return exit_code, stdout_file.read(), stderr_file.read()
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_environ)
+
+
 def run_manage(args: list[str], *, event_context: dict[str, Any] | None = None) -> tuple[bool, int, Any]:
     """
     Invoke manage.py with given args. Returns (ok, exit_code, parsed_output).
     ok=True for exit 0 (success) or exit 2 (drift — still parseable and useful).
     ok=False for exit 1 (error) or failures.
+    Read-only commands run in-process (interpreter + import paid once per
+    server); everything else is dispatched as a manage.py subprocess.
     """
     log_context = _compact_log_context(event_context, manage_args=args)
     if not MANAGE_PY.exists():
@@ -1438,6 +1545,12 @@ def run_manage(args: list[str], *, event_context: dict[str, Any] | None = None) 
         }
         emit_log_message("error", _compact_log_context(log_context, error=payload["error"]), logger="skillbox.manage")
         return False, -1, payload
+
+    if args and args[0] in _INPROCESS_MANAGE_COMMANDS:
+        in_process = _run_manage_in_process(args, event_context=event_context)
+        if in_process is not None:
+            exit_code, stdout_text, stderr_text = in_process
+            return _finalize_manage_result(exit_code, stdout_text, stderr_text, log_context)
 
     # Scale timeout with --wait-seconds when present.  Services are started
     # sequentially so total time can be wait_seconds * service_count.  Use a
@@ -1486,47 +1599,58 @@ def run_manage(args: list[str], *, event_context: dict[str, Any] | None = None) 
         )
         return False, -1, payload
 
-    if proc.stderr.strip():
-        stderr_text = redact_diagnostic_text(proc.stderr.strip())
+    return _finalize_manage_result(proc.returncode, proc.stdout, proc.stderr, log_context)
+
+
+def _finalize_manage_result(
+    returncode: int,
+    raw_stdout: str,
+    raw_stderr: str,
+    log_context: dict[str, Any],
+) -> tuple[bool, int, Any]:
+    """Shared stdout/stderr → (ok, exit_code, payload) contract for both the
+    in-process and subprocess manage.py dispatch paths."""
+    if raw_stderr.strip():
+        stderr_text = redact_diagnostic_text(raw_stderr.strip())
         emit_log_message(
-            "warning" if proc.returncode in (0, 2) else "error",
-            _compact_log_context(log_context, exit_code=proc.returncode, stderr=stderr_text),
+            "warning" if returncode in (0, 2) else "error",
+            _compact_log_context(log_context, exit_code=returncode, stderr=stderr_text),
             logger="skillbox.manage.stderr",
         )
         print(f"[skillbox-mcp] stderr: {stderr_text}", file=sys.stderr, flush=True)
 
-    stdout = proc.stdout.strip()
+    stdout = raw_stdout.strip()
     if stdout:
         try:
             data = json.loads(stdout)
-            ok = proc.returncode in (0, 2)
+            ok = returncode in (0, 2)
             if not ok:
                 emit_log_message(
                     "error",
-                    _compact_log_context(log_context, exit_code=proc.returncode, result=data),
+                    _compact_log_context(log_context, exit_code=returncode, result=data),
                     logger="skillbox.manage",
                 )
-            return ok, proc.returncode, data
+            return ok, returncode, data
         except json.JSONDecodeError:
             data = {"text": redact_diagnostic_text(stdout)}
-            ok = proc.returncode == 0
+            ok = returncode == 0
             if not ok:
                 emit_log_message(
                     "error",
-                    _compact_log_context(log_context, exit_code=proc.returncode, result=data),
+                    _compact_log_context(log_context, exit_code=returncode, result=data),
                     logger="skillbox.manage",
                 )
-            return ok, proc.returncode, data
+            return ok, returncode, data
 
-    ok = proc.returncode == 0
-    data = {"exit_code": proc.returncode}
+    ok = returncode == 0
+    data = {"exit_code": returncode}
     if not ok:
         emit_log_message(
             "error",
-            _compact_log_context(log_context, exit_code=proc.returncode),
+            _compact_log_context(log_context, exit_code=returncode),
             logger="skillbox.manage",
         )
-    return ok, proc.returncode, data
+    return ok, returncode, data
 
 
 _REPEAT_ARG_SPECS: tuple[tuple[str, str], ...] = (

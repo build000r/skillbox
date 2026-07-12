@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -63,11 +64,12 @@ class SkillboxMcpServerTests(unittest.TestCase):
             "run",
             return_value=completed,
         ) as run, mock.patch.object(sys, "stderr", stderr_capture):
+            # "sync" stays on the subprocess path (read-only commands run in-process).
             ok, exit_code, payload = MODULE.run_manage(
-                ["status", "--format", "json"],
+                ["sync", "--format", "json"],
                 event_context={
                     "mcp_request_id": "req-7",
-                    "mcp_tool_name": "skillbox_status",
+                    "mcp_tool_name": "skillbox_sync",
                 },
             )
 
@@ -79,7 +81,7 @@ class SkillboxMcpServerTests(unittest.TestCase):
             json.loads(env[MODULE.MCP_EVENT_CONTEXT_ENV]),
             {
                 "mcp_request_id": "req-7",
-                "mcp_tool_name": "skillbox_status",
+                "mcp_tool_name": "skillbox_sync",
             },
         )
         self.assertEqual(sent[0]["method"], "notifications/message")
@@ -96,7 +98,7 @@ class SkillboxMcpServerTests(unittest.TestCase):
             self.assertNotIn("token-secret", exposed)
             self.assertNotIn("secret123", exposed)
             self.assertNotIn("api-secret", exposed)
-        self.assertEqual(sent[0]["params"]["data"]["mcp_tool_name"], "skillbox_status")
+        self.assertEqual(sent[0]["params"]["data"]["mcp_tool_name"], "skillbox_sync")
 
     def test_run_manage_handles_timeout_plain_text_and_empty_failure(self) -> None:
         sent: list[dict] = []
@@ -121,7 +123,7 @@ class SkillboxMcpServerTests(unittest.TestCase):
             "run",
             return_value=plain,
         ):
-            ok, exit_code, payload = MODULE.run_manage(["status"])
+            ok, exit_code, payload = MODULE.run_manage(["sync"])
         self.assertFalse(ok)
         self.assertEqual(exit_code, 1)
         self.assertIn("not json", payload["text"])
@@ -135,7 +137,7 @@ class SkillboxMcpServerTests(unittest.TestCase):
             "run",
             return_value=empty,
         ):
-            ok, exit_code, payload = MODULE.run_manage(["status"])
+            ok, exit_code, payload = MODULE.run_manage(["sync"])
         self.assertFalse(ok)
         self.assertEqual(exit_code, 1)
         self.assertEqual(payload["exit_code"], 1)
@@ -190,15 +192,99 @@ class SkillboxMcpServerTests(unittest.TestCase):
             side_effect=subprocess.TimeoutExpired(["python3"], timeout=120),
         ):
             ok, exit_code, payload = MODULE.run_manage(
-                ["status", "--format", "json"],
-                event_context={"mcp_tool_name": "skillbox_status"},
+                ["sync", "--format", "json"],
+                event_context={"mcp_tool_name": "skillbox_sync"},
             )
 
         self.assertFalse(ok)
         self.assertEqual(exit_code, -1)
         self.assertEqual(payload["error"]["type"], "timeout")
         self.assertEqual(sent[0]["params"]["level"], "error")
-        self.assertEqual(sent[0]["params"]["data"]["mcp_tool_name"], "skillbox_status")
+        self.assertEqual(sent[0]["params"]["data"]["mcp_tool_name"], "skillbox_sync")
+
+    def test_run_manage_dispatches_read_only_commands_in_process(self) -> None:
+        seen_env: dict[str, str | None] = {}
+        outer_context = os.environ.get(MODULE.MCP_EVENT_CONTEXT_ENV)
+
+        class FakeRuntimeManager:
+            @staticmethod
+            def main(argv: list[str]) -> int:
+                seen_env["context"] = os.environ.get(MODULE.MCP_EVENT_CONTEXT_ENV)
+                print(json.dumps({"ok": True, "argv": list(argv)}))
+                return 0
+
+        with mock.patch.object(MODULE, "send"), mock.patch.object(
+            MODULE, "_RUNTIME_MANAGER", FakeRuntimeManager
+        ), mock.patch.object(
+            MODULE.subprocess,
+            "run",
+            side_effect=AssertionError("read-only command must not spawn a subprocess"),
+        ):
+            ok, exit_code, payload = MODULE.run_manage(
+                ["status", "--format", "json", "--compact"],
+                event_context={"mcp_tool_name": "skillbox_status"},
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload, {"ok": True, "argv": ["status", "--format", "json", "--compact"]})
+        self.assertEqual(
+            json.loads(seen_env["context"] or "{}"),
+            {"mcp_tool_name": "skillbox_status"},
+        )
+        # The event-context env var is scoped to the in-process call.
+        self.assertEqual(os.environ.get(MODULE.MCP_EVENT_CONTEXT_ENV), outer_context)
+
+    def test_run_manage_in_process_drift_exit_keeps_ok_contract(self) -> None:
+        class FakeRuntimeManager:
+            @staticmethod
+            def main(argv: list[str]) -> int:
+                print(json.dumps({"checks": []}))
+                raise SystemExit(2)
+
+        with mock.patch.object(MODULE, "send"), mock.patch.object(
+            MODULE, "_RUNTIME_MANAGER", FakeRuntimeManager
+        ):
+            ok, exit_code, payload = MODULE.run_manage(["doctor", "--format", "json"])
+
+        self.assertTrue(ok)
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(payload, {"checks": []})
+
+    def test_run_manage_in_process_crash_mirrors_subprocess_failure(self) -> None:
+        class FakeRuntimeManager:
+            @staticmethod
+            def main(argv: list[str]) -> int:
+                raise ValueError("boom")
+
+        stderr_capture = io.StringIO()
+        with mock.patch.object(MODULE, "send"), mock.patch.object(
+            MODULE, "_RUNTIME_MANAGER", FakeRuntimeManager
+        ), mock.patch.object(sys, "stderr", stderr_capture):
+            ok, exit_code, payload = MODULE.run_manage(["skills", "--format", "json"])
+
+        self.assertFalse(ok)
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload, {"exit_code": 1})
+
+    def test_run_manage_falls_back_to_subprocess_when_import_fails(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["python3"],
+            0,
+            stdout='{"ok": true}',
+            stderr="",
+        )
+        with mock.patch.object(MODULE, "send"), mock.patch.object(
+            MODULE,
+            "_runtime_manager_module",
+            side_effect=ModuleNotFoundError("runtime_manager"),
+        ), mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run:
+            ok, exit_code, payload = MODULE.run_manage(["status", "--format", "json"])
+
+        self.assertTrue(ok)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload, {"ok": True})
+        run.assert_called_once()
 
     def test_handle_tools_call_builds_request_scoped_event_context(self) -> None:
         with mock.patch.object(

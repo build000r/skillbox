@@ -286,6 +286,71 @@ class OperatorMcpServerTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(payload["error"]["type"], "bad_args")
 
+    def test_run_script_dispatches_read_only_box_commands_in_process(self) -> None:
+        class FakeBox:
+            @staticmethod
+            def main(argv: list[str]) -> int:
+                print(json.dumps({"ok": True, "argv": list(argv)}))
+                return 0
+
+        with mock.patch.object(MODULE, "_BOX_MODULE", FakeBox), mock.patch.object(
+            MODULE.subprocess,
+            "run",
+            side_effect=AssertionError("read-only box.py command must not spawn a subprocess"),
+        ):
+            ok, code, payload = MODULE.run_script(MODULE.BOX_PY, ["list", "--format", "json"])
+
+        self.assertTrue(ok)
+        self.assertEqual(code, 0)
+        self.assertEqual(payload, {"ok": True, "argv": ["list", "--format", "json"]})
+
+    def test_run_script_in_process_crash_mirrors_subprocess_failure(self) -> None:
+        class FakeBox:
+            @staticmethod
+            def main(argv: list[str]) -> int:
+                raise ValueError("boom")
+
+        stderr_capture = io.StringIO()
+        with mock.patch.object(MODULE, "_BOX_MODULE", FakeBox), mock.patch.object(
+            sys, "stderr", stderr_capture
+        ):
+            ok, code, payload = MODULE.run_script(MODULE.BOX_PY, ["profiles", "--format", "json"])
+
+        self.assertFalse(ok)
+        self.assertEqual(code, 1)
+        self.assertEqual(payload, {"exit_code": 1})
+
+    def test_run_script_falls_back_to_subprocess_when_box_import_fails(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["python3"],
+            0,
+            stdout='{"ok": true}',
+            stderr="",
+        )
+        with mock.patch.object(
+            MODULE, "_box_module", side_effect=ModuleNotFoundError("box")
+        ), mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run:
+            ok, code, payload = MODULE.run_script(MODULE.BOX_PY, ["list", "--format", "json"])
+
+        self.assertTrue(ok)
+        self.assertEqual(code, 0)
+        self.assertEqual(payload, {"ok": True})
+        run.assert_called_once()
+
+    def test_run_script_mutating_box_commands_stay_on_subprocess(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["python3"],
+            0,
+            stdout='{"ok": true}',
+            stderr="",
+        )
+        with mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run:
+            ok, _code, payload = MODULE.run_script(MODULE.BOX_PY, ["up", "alpha", "--format", "json"])
+
+        self.assertTrue(ok)
+        self.assertEqual(payload, {"ok": True})
+        run.assert_called_once()
+
     def test_read_only_tool_handlers_and_event_journal_use_structured_outputs(self) -> None:
         with mock.patch.object(
             MODULE,

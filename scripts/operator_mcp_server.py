@@ -10,6 +10,7 @@ Protocol: JSON-RPC 2.0 over stdio (MCP 2024-11-05).
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from datetime import datetime, timezone
@@ -658,7 +660,8 @@ def load_dotenv(path: Path) -> None:
 # mount so in-container agents cannot read them. Canonical home is
 # ${SKILLBOX_STATE_ROOT}/operator/ (the state root is mounted only at specific
 # subpaths, never wholesale). The legacy repo-root ENV_FILE/ENV_BOX_FILE locations
-# are deprecated and warn.
+# are refused outright — loading a secret file from inside the workspace mount is
+# a hard error, never a fallback.
 OPERATOR_SECRET_FILENAMES = (".env", ".env.box")
 
 
@@ -672,10 +675,11 @@ def operator_secret_dir() -> Path:
 
 
 def load_operator_secret(name: str) -> None:
-    """Load an operator secret file, preferring the relocated state-root copy.
+    """Load an operator secret file from the sanctioned state-root location.
 
-    Falls back to the deprecated repo-root location (inside the workspace mount)
-    with a loud stderr warning; no-op when neither file exists.
+    Refuses (SystemExit) when only the legacy repo-root copy exists: that path
+    sits inside the workspace bind mount, so loading it would hand live
+    credentials to any in-container agent. No-op when neither file exists.
     """
     new_path = operator_secret_dir() / name
     legacy_path = REPO_ROOT / name
@@ -683,15 +687,120 @@ def load_operator_secret(name: str) -> None:
         load_dotenv(new_path)
         return
     if legacy_path.is_file():
-        sys.stderr.write(
-            f"[skillbox] DEPRECATED secret location: {legacy_path} is inside the workspace "
-            f"bind mount and readable by in-container agents.\n"
-            f"[skillbox] Move it out of the mount with:\n"
-            f"    mkdir -p {operator_secret_dir()} && mv {legacy_path} {new_path}\n"
+        raise SystemExit(
+            f"[skillbox] REFUSING to load secrets from {legacy_path}: it is inside the "
+            f"workspace bind mount and readable by any in-container agent.\n"
+            f"[skillbox] Move it to the sanctioned operator location, then re-run:\n"
+            f"    mkdir -p {operator_secret_dir()} && mv {legacy_path} {new_path} && chmod 600 {new_path}"
         )
-        load_dotenv(legacy_path)
-        return
     # neither present: leave os.environ untouched; existing missing-credential UX handles it.
+
+
+# box.py subcommands that are read-only and safe to run in-process. Importing
+# box once and calling box.main() directly skips the per-request interpreter
+# start + module import overhead. Mutating lifecycle commands (up/down/
+# upgrade/register/unregister/...) stay on the subprocess path for isolation.
+_INPROCESS_BOX_COMMANDS = frozenset({"list", "profiles", "status"})
+_BOX_MODULE: Any = None
+
+
+def _box_module() -> Any:
+    global _BOX_MODULE
+    if _BOX_MODULE is None:
+        import box as box_module  # SCRIPT_DIR is already on sys.path
+
+        _BOX_MODULE = box_module
+    return _BOX_MODULE
+
+
+@contextlib.contextmanager
+def _captured_process_output(stdout_file: Any, stderr_file: Any):
+    """Redirect fd 1/2 to temp files so in-process command output (including
+    output from any child processes it spawns) never leaks into the JSON-RPC
+    stdout stream — the same containment subprocess capture gave us."""
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved_stdout_fd = os.dup(1)
+    saved_stderr_fd = os.dup(2)
+    try:
+        os.dup2(stdout_file.fileno(), 1)
+        os.dup2(stderr_file.fileno(), 2)
+        yield
+    finally:
+        try:
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            pass
+        try:
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
+        os.dup2(saved_stdout_fd, 1)
+        os.dup2(saved_stderr_fd, 2)
+        os.close(saved_stdout_fd)
+        os.close(saved_stderr_fd)
+
+
+def _coerce_exit_code(raw: Any) -> int:
+    if raw is None:
+        return 0
+    if isinstance(raw, int):
+        return raw
+    return 1
+
+
+def _run_box_in_process(args: list[str]) -> tuple[int, str, str] | None:
+    """Run box.py's command dispatch in-process. Returns (rc, stdout, stderr)
+    mirroring a captured subprocess, or None when the in-process path is
+    unavailable (caller falls back to subprocess)."""
+    try:
+        box = _box_module()
+    except Exception:  # noqa: BLE001 - any bootstrap failure falls back to subprocess.
+        return None
+
+    saved_environ = dict(os.environ)
+    saved_cwd = os.getcwd()
+    try:
+        os.chdir(REPO_ROOT)
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdout_file, tempfile.TemporaryFile(
+            mode="w+", encoding="utf-8"
+        ) as stderr_file:
+            with _captured_process_output(stdout_file, stderr_file):
+                try:
+                    rc = _coerce_exit_code(box.main(list(args)))
+                except SystemExit as exc:
+                    rc = _coerce_exit_code(exc.code)
+                except Exception:  # noqa: BLE001 - mirror a crashing subprocess: traceback + exit 1.
+                    traceback.print_exc()
+                    rc = 1
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            return rc, stdout_file.read(), stderr_file.read()
+    finally:
+        os.chdir(saved_cwd)
+        os.environ.clear()
+        os.environ.update(saved_environ)
+
+
+def _finalize_script_result(
+    script: Path,
+    rc: int,
+    stdout: str,
+    stderr_redacted: str,
+) -> tuple[bool, int, Any]:
+    """Shared stdout/stderr → (ok, rc, payload) contract for both the
+    in-process and subprocess script dispatch paths."""
+    if stderr_redacted.strip():
+        print(f"[operator-mcp] {script.name} stderr: {stderr_redacted.strip()}", file=sys.stderr, flush=True)
+
+    stdout = stdout.strip()
+    if stdout:
+        try:
+            return rc == 0, rc, _redact_diagnostic_value(json.loads(stdout))
+        except json.JSONDecodeError:
+            return rc == 0, rc, {"text": redact_diagnostic_text(stdout)}
+
+    return rc == 0, rc, {"exit_code": rc}
 
 
 def run_script(
@@ -700,7 +809,9 @@ def run_script(
     *,
     timeout: int = 300,
 ) -> tuple[bool, int, Any]:
-    """Run a Python script as subprocess and parse JSON output."""
+    """Run a Python script and parse JSON output. Read-only box.py commands
+    run in-process (interpreter + import paid once per server); everything
+    else runs as a subprocess."""
     if not script.exists():
         return False, -1, {
             "error": {
@@ -710,6 +821,12 @@ def run_script(
                 "recovery_hint": "Are you running from the skillbox repo root?",
             }
         }
+
+    if script == BOX_PY and args and args[0] in _INPROCESS_BOX_COMMANDS:
+        in_process = _run_box_in_process(args)
+        if in_process is not None:
+            rc, stdout_text, stderr_text = in_process
+            return _finalize_script_result(script, rc, stdout_text, redact_diagnostic_text(stderr_text))
 
     cmd = [sys.executable, str(script)] + args
     result = run_checked(cmd, timeout=timeout, cwd=REPO_ROOT)
@@ -730,19 +847,12 @@ def run_script(
             }
         }
 
-    if str(result.get("stderr_redacted") or "").strip():
-        stderr_text = str(result.get("stderr_redacted") or "").strip()
-        print(f"[operator-mcp] {script.name} stderr: {stderr_text}", file=sys.stderr, flush=True)
-
-    stdout = str(result.get("stdout") or "").strip()
-    rc = int(result["rc"])
-    if stdout:
-        try:
-            return rc == 0, rc, _redact_diagnostic_value(json.loads(stdout))
-        except json.JSONDecodeError:
-            return rc == 0, rc, {"text": redact_diagnostic_text(stdout)}
-
-    return rc == 0, rc, {"exit_code": rc}
+    return _finalize_script_result(
+        script,
+        int(result["rc"]),
+        str(result.get("stdout") or ""),
+        str(result.get("stderr_redacted") or ""),
+    )
 
 
 def _compose_monoserver_layer() -> list[str]:
