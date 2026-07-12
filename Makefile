@@ -178,7 +178,7 @@ dev-shims-install:
 	@printf "installed dev shims: %s (%s)\n" "$(DEV_SHIM_BIN_DIR)" "$(DEV_SHIM_BINS)"
 
 pulse-start:
-	@python3 .env-manager/pulse.py run &
+	@python3 .env-manager/pulse.py start
 
 pulse-stop:
 	@python3 .env-manager/pulse.py stop

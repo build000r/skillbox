@@ -3535,32 +3535,45 @@ def _parse_proc_stat_ppid(stat_text: str) -> int | None:
         return None
 
 
-def _process_tree_pids(root_pid: int) -> set[int]:
-    pids: set[int] = {int(root_pid)}
+def _proc_pid_ppid_map() -> dict[int, int]:
+    """Snapshot /proc once as a pid -> ppid map."""
+    pid_map: dict[int, int] = {}
     proc_root = Path("/proc")
     if not proc_root.is_dir():
-        return pids
+        return pid_map
+    for child in proc_root.iterdir():
+        if not child.name.isdigit():
+            continue
+        try:
+            pid = int(child.name)
+        except ValueError:
+            continue
+        try:
+            ppid = _parse_proc_stat_ppid((child / "stat").read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        if ppid is not None:
+            pid_map[pid] = ppid
+    return pid_map
 
-    changed = True
-    while changed:
-        changed = False
-        for child in proc_root.iterdir():
-            if not child.name.isdigit():
-                continue
-            try:
-                pid = int(child.name)
-            except ValueError:
-                continue
-            if pid in pids:
-                continue
-            try:
-                ppid = _parse_proc_stat_ppid((child / "stat").read_text(encoding="utf-8", errors="replace"))
-            except OSError:
-                continue
-            if ppid in pids:
-                pids.add(pid)
-                changed = True
+
+def _forest_pids_from_map(root_pids: set[int], pid_map: dict[int, int]) -> set[int]:
+    pids = set(root_pids)
+    children: dict[int, list[int]] = {}
+    for pid, ppid in pid_map.items():
+        children.setdefault(ppid, []).append(pid)
+    frontier = list(pids)
+    while frontier:
+        parent = frontier.pop()
+        for child_pid in children.get(parent, ()):  # descendants only
+            if child_pid not in pids:
+                pids.add(child_pid)
+                frontier.append(child_pid)
     return pids
+
+
+def _process_tree_pids(root_pid: int) -> set[int]:
+    return process_forest_pids([int(root_pid)])
 
 
 def _all_proc_pids() -> set[int]:
@@ -3581,6 +3594,19 @@ def _all_proc_pids() -> set[int]:
 def process_tree_pids(root_pid: int) -> set[int]:
     """Return the root process and descendants visible through /proc."""
     return _process_tree_pids(root_pid)
+
+
+def process_forest_pids(root_pids: list[int] | set[int]) -> set[int]:
+    """Return the given processes plus all descendants from one /proc pass.
+
+    Callers with several root pids (e.g. the pulse tick walking every managed
+    service) should prefer this over per-root ``process_tree_pids`` calls so
+    /proc is only walked once.
+    """
+    roots = {int(pid) for pid in root_pids}
+    if not roots:
+        return set()
+    return _forest_pids_from_map(roots, _proc_pid_ppid_map())
 
 
 def _parse_listener_port(raw_local_address: str) -> int | None:
@@ -3666,10 +3692,20 @@ def _proc_socket_inode(fd_path: Path) -> str | None:
     return match.group(1) if match else None
 
 
-def _proc_process_tree_listeners(target_pids: set[int]) -> list[dict[str, Any]]:
+def listen_socket_inode_ports() -> dict[str, int]:
+    """Read the kernel's listening TCP socket inode -> port map (cheap)."""
     inode_to_port: dict[str, int] = {}
     inode_to_port.update(_proc_net_tcp_listen_inodes(Path("/proc/net/tcp")))
     inode_to_port.update(_proc_net_tcp_listen_inodes(Path("/proc/net/tcp6")))
+    return inode_to_port
+
+
+def _proc_process_tree_listeners(
+    target_pids: set[int],
+    inode_to_port: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    if inode_to_port is None:
+        inode_to_port = listen_socket_inode_ports()
     if not inode_to_port:
         return []
 
@@ -3716,18 +3752,32 @@ def process_tree_listener_snapshot(pid: int) -> dict[str, Any]:
     return _process_tree_listener_snapshot(pid)
 
 
-def all_process_listeners() -> list[dict[str, Any]]:
-    """Return visible listening sockets keyed by owning process pid."""
+def all_process_listeners(*, cache: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Return visible listening sockets keyed by owning process pid.
+
+    ``cache`` is a caller-owned dict that memoizes the previous scan: the
+    listen-socket inode map is read first (two small /proc/net files) and the
+    expensive per-process fd readlink walk is skipped whenever that map is
+    unchanged since the cached scan.
+    """
+    inode_to_port = listen_socket_inode_ports()
+    inode_key = frozenset(inode_to_port.items())
+    if cache is not None and inode_to_port and cache.get("inode_key") == inode_key:
+        return [dict(item) for item in cache.get("listeners") or []]
     pids = _all_proc_pids()
     if not pids:
         return []
-    listeners = _proc_process_tree_listeners(pids)
+    listeners = _proc_process_tree_listeners(pids, inode_to_port)
     if not listeners:
         listeners = _ss_process_tree_listeners(pids)
-    return sorted(
+    listeners = sorted(
         listeners,
         key=lambda item: (int(item.get("port") or 0), int(item.get("pid") or 0)),
     )
+    if cache is not None and inode_to_port:
+        cache["inode_key"] = inode_key
+        cache["listeners"] = [dict(item) for item in listeners]
+    return listeners
 
 
 def _service_port_guard_disabled() -> bool:

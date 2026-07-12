@@ -5643,5 +5643,98 @@ class OnboardWorkflowHotspotTests(unittest.TestCase):
         self.assertEqual(emitted[0]["error"]["message"], "bad client")
 
 
+class ProcScanHotspotTests(unittest.TestCase):
+    def test_process_forest_pids_finds_descendants_in_one_proc_pass(self) -> None:
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            with mock.patch.object(
+                runtime_ops_module,
+                "_proc_pid_ppid_map",
+                wraps=runtime_ops_module._proc_pid_ppid_map,
+            ) as pid_map:
+                forest = runtime_ops_module.process_forest_pids([os.getpid()])
+            self.assertEqual(pid_map.call_count, 1)
+            self.assertIn(os.getpid(), forest)
+            self.assertIn(child.pid, forest)
+        finally:
+            child.terminate()
+            child.wait(timeout=5)
+
+    def test_process_forest_pids_empty_input_returns_empty_set(self) -> None:
+        self.assertEqual(runtime_ops_module.process_forest_pids([]), set())
+
+    def test_process_tree_pids_matches_forest_for_single_root(self) -> None:
+        self.assertEqual(
+            runtime_ops_module.process_tree_pids(os.getpid()),
+            runtime_ops_module.process_forest_pids([os.getpid()]),
+        )
+
+    def test_all_process_listeners_skips_fd_walk_when_listen_inodes_unchanged(self) -> None:
+        cache: dict = {}
+        rows = [{"pid": 10, "port": 8000, "source": "proc"}]
+        with (
+            mock.patch.object(runtime_ops_module, "listen_socket_inode_ports", return_value={"111": 8000}),
+            mock.patch.object(runtime_ops_module, "_all_proc_pids", return_value={10}),
+            mock.patch.object(runtime_ops_module, "_proc_process_tree_listeners", return_value=list(rows)) as walk,
+        ):
+            first = runtime_ops_module.all_process_listeners(cache=cache)
+            second = runtime_ops_module.all_process_listeners(cache=cache)
+        self.assertEqual(walk.call_count, 1)
+        self.assertEqual(first, rows)
+        self.assertEqual(second, rows)
+
+        # Cached rows are defensive copies, not shared references.
+        second[0]["port"] = 1
+        with (
+            mock.patch.object(runtime_ops_module, "listen_socket_inode_ports", return_value={"111": 8000}),
+            mock.patch.object(runtime_ops_module, "_proc_process_tree_listeners") as walk_again,
+        ):
+            third = runtime_ops_module.all_process_listeners(cache=cache)
+        walk_again.assert_not_called()
+        self.assertEqual(third[0]["port"], 8000)
+
+    def test_all_process_listeners_rescans_when_listen_inodes_change(self) -> None:
+        cache: dict = {}
+        with (
+            mock.patch.object(runtime_ops_module, "listen_socket_inode_ports", return_value={"111": 8000}),
+            mock.patch.object(runtime_ops_module, "_all_proc_pids", return_value={10}),
+            mock.patch.object(
+                runtime_ops_module,
+                "_proc_process_tree_listeners",
+                return_value=[{"pid": 10, "port": 8000, "source": "proc"}],
+            ),
+        ):
+            runtime_ops_module.all_process_listeners(cache=cache)
+        with (
+            mock.patch.object(runtime_ops_module, "listen_socket_inode_ports", return_value={"222": 9000}),
+            mock.patch.object(runtime_ops_module, "_all_proc_pids", return_value={10}),
+            mock.patch.object(
+                runtime_ops_module,
+                "_proc_process_tree_listeners",
+                return_value=[{"pid": 10, "port": 9000, "source": "proc"}],
+            ) as walk,
+        ):
+            rescanned = runtime_ops_module.all_process_listeners(cache=cache)
+        self.assertEqual(walk.call_count, 1)
+        self.assertEqual(rescanned, [{"pid": 10, "port": 9000, "source": "proc"}])
+
+    def test_all_process_listeners_without_listen_inodes_never_caches(self) -> None:
+        cache: dict = {}
+        with (
+            mock.patch.object(runtime_ops_module, "listen_socket_inode_ports", return_value={}),
+            mock.patch.object(runtime_ops_module, "_all_proc_pids", return_value={10}),
+            mock.patch.object(runtime_ops_module, "_proc_process_tree_listeners", return_value=[]),
+            mock.patch.object(
+                runtime_ops_module,
+                "_ss_process_tree_listeners",
+                return_value=[{"pid": 10, "port": 7000, "source": "ss"}],
+            ) as ss_scan,
+        ):
+            runtime_ops_module.all_process_listeners(cache=cache)
+            runtime_ops_module.all_process_listeners(cache=cache)
+        self.assertEqual(ss_scan.call_count, 2)
+        self.assertEqual(cache, {})
+
+
 if __name__ == "__main__":
     unittest.main()

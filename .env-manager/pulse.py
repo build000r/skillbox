@@ -10,8 +10,11 @@ Every state change is logged to logs/runtime/runtime.log
 and queryable via the skillbox_pulse MCP tool.
 
 Designed to run as a managed service declared in runtime.yaml.
-Start: python3 .env-manager/pulse.py [--interval 30] [--root-dir /workspace]
-Stop:  kill $(cat logs/runtime/pulse.pid)  — or use `make pulse-stop`
+Start:  python3 .env-manager/pulse.py start [--interval 30] [--root-dir /workspace]
+        (daemonizes, verifies the pidfile, exits nonzero on failure — used by
+        `make pulse-start`; `run` stays in the foreground)
+Stop:   python3 .env-manager/pulse.py stop  — or use `make pulse-stop`
+Status: python3 .env-manager/pulse.py [status]  (bare invocation is read-only)
 """
 from __future__ import annotations
 
@@ -55,7 +58,7 @@ from manage import (  # noqa: E402
     normalize_active_profiles,
     process_is_running,
     probe_service,
-    process_tree_pids,
+    process_forest_pids,
     read_service_pid,
     remove_pid_file,
     resolve_runtime_command_cwd,
@@ -66,6 +69,10 @@ from manage import (  # noqa: E402
     sync_runtime,
     translated_runtime_command,
     wait_for_service_health,
+)
+from runtime_manager._shared.events import (  # noqa: E402
+    RUNTIME_LOG_MAX_BYTES,
+    rotate_log_file,
 )
 
 # ---------------------------------------------------------------------------
@@ -213,13 +220,31 @@ def pulse_log_path(root_dir: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 _log_handle = None
+_log_path: Path | None = None
 
 
 def _open_log(root_dir: Path) -> None:
-    global _log_handle
+    global _log_handle, _log_path
     log_path = pulse_log_path(root_dir)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    rotate_log_file(log_path)
     _log_handle = log_path.open("a", encoding="utf-8")
+    _log_path = log_path
+
+
+def _rotate_open_log() -> None:
+    """Rotate the live pulse log handle once it grows past the size cap."""
+    global _log_handle
+    if _log_handle is None or _log_path is None:
+        return
+    try:
+        if _log_handle.tell() < RUNTIME_LOG_MAX_BYTES:
+            return
+        _log_handle.close()
+        rotate_log_file(_log_path)
+        _log_handle = _log_path.open("a", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def log(level: str, message: str, **extra: Any) -> None:
@@ -231,6 +256,7 @@ def log(level: str, message: str, **extra: Any) -> None:
     }
     line = json.dumps(entry, separators=(",", ":"), default=str)
     if _log_handle:
+        _rotate_open_log()
         _log_handle.write(line + "\n")
         _log_handle.flush()
     print(f"[pulse] {level}: {message}", file=sys.stderr, flush=True)
@@ -346,6 +372,8 @@ def _restart_service(
     )
 
     try:
+        # Crash-looping services can flood their stdout log; cap it.
+        rotate_log_file(paths["log_file"])
         with paths["log_file"].open("a", encoding="utf-8") as log_handle:
             process = subprocess.Popen(
                 command,
@@ -704,7 +732,7 @@ def _declared_port_set(model: dict[str, Any]) -> set[int]:
 
 
 def _managed_service_pids(model: dict[str, Any]) -> set[int]:
-    managed: set[int] = set()
+    roots: set[int] = set()
     for service in model.get("services") or []:
         try:
             pid = read_service_pid(service_paths(model, service)["pid_file"])
@@ -712,15 +740,23 @@ def _managed_service_pids(model: dict[str, Any]) -> set[int]:
             pid = None
         if pid is None or not process_is_running(pid):
             continue
-        try:
-            managed.update(process_tree_pids(pid))
-        except Exception:
-            managed.add(pid)
-    return managed
+        roots.add(pid)
+    if not roots:
+        return roots
+    try:
+        # One /proc pass for every managed root instead of a walk per service.
+        return process_forest_pids(roots)
+    except Exception:
+        return roots
 
 
 def _candidate_key(pid: int, port: int, start_time: str) -> str:
     return f"{pid}:{port}:{start_time}"
+
+
+# Caller-owned memo for all_process_listeners: the per-process fd walk is
+# skipped whenever the kernel's listen-socket inode map is unchanged.
+_listener_scan_cache: dict[str, Any] = {}
 
 
 def _scan_rogue_listeners(model: dict[str, Any]) -> list[dict[str, Any]]:
@@ -729,7 +765,7 @@ def _scan_rogue_listeners(model: dict[str, Any]) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     identity_cache: dict[int, dict[str, Any] | None] = {}
 
-    for listener in all_process_listeners():
+    for listener in all_process_listeners(cache=_listener_scan_cache):
         try:
             pid = int(listener.get("pid"))
             port = int(listener.get("port"))
@@ -910,6 +946,7 @@ class PulseState:
         self.port_sentinel_grace_seconds: float = DEFAULT_PORT_SENTINEL_GRACE_SECONDS
         self.port_sentinel_counters: dict[str, Any] = _default_port_guard_counters()
         self.port_sentinel_last_candidates: list[dict[str, Any]] = []
+        self.last_retention_prune: float = 0.0  # monotonic timestamp
         self.cycle_count: int = 0
         self.heals: int = 0
         self.events_emitted: int = 0
@@ -961,11 +998,17 @@ def reconcile_once(
     """Run one reconciliation cycle."""
     state.cycle_count += 1
 
-    loaded = _load_pulse_model(root_dir, active_clients, active_profiles)
+    # Hash the config files first so an unchanged config reuses the cached
+    # model instead of re-parsing runtime.yaml + overlays every tick.
+    try:
+        config_hash = _model_config_hash(root_dir)
+    except Exception:
+        config_hash = ""
+    loaded = _load_pulse_model(root_dir, active_clients, active_profiles, config_hash=config_hash)
     if loaded is None:
         return
     model, profiles, clients = loaded
-    _handle_pulse_config_change(root_dir, state, model, auto_sync=auto_sync)
+    _handle_pulse_config_change(root_dir, state, model, auto_sync=auto_sync, new_hash=config_hash)
     _prune_pulse_state_to_model(state, model)
     now = time.monotonic()
     _reconcile_pulse_services(
@@ -978,6 +1021,7 @@ def reconcile_once(
     _reconcile_port_sentinel(model, state, now=now)
     _reconcile_pulse_checks(model, state)
     _reconcile_pressure_advisory(root_dir, state)
+    _reconcile_log_retention(model, state, now=now)
     _write_pulse_state(
         root_dir,
         state,
@@ -990,16 +1034,29 @@ def reconcile_once(
     )
 
 
+# Cache of the last built (unfiltered) runtime model keyed by config hash so
+# unchanged configs skip the full parse+validate cycle every tick.
+_pulse_model_cache: dict[str, Any] = {}
+
+
 def _load_pulse_model(
     root_dir: Path,
     active_clients: list[str] | None,
     active_profiles: list[str] | None,
+    *,
+    config_hash: str = "",
 ) -> tuple[dict[str, Any], set[str], set[str]] | None:
-    try:
-        model = build_runtime_model(root_dir)
-    except Exception as exc:
-        log("error", f"failed to load runtime model: {exc}")
-        return None
+    cache_key = (str(root_dir), config_hash) if config_hash else None
+    model = _pulse_model_cache.get("model") if cache_key and _pulse_model_cache.get("key") == cache_key else None
+    if model is None:
+        try:
+            model = build_runtime_model(root_dir)
+        except Exception as exc:
+            log("error", f"failed to load runtime model: {exc}")
+            return None
+        if cache_key:
+            _pulse_model_cache["key"] = cache_key
+            _pulse_model_cache["model"] = model
 
     profiles = normalize_active_profiles(active_profiles)
     try:
@@ -1020,8 +1077,10 @@ def _handle_pulse_config_change(
     model: dict[str, Any],
     *,
     auto_sync: bool,
+    new_hash: str = "",
 ) -> None:
-    new_hash = _model_config_hash(root_dir)
+    if not new_hash:
+        new_hash = _model_config_hash(root_dir)
     if not state.config_hash or new_hash == state.config_hash:
         state.config_hash = new_hash
         return
@@ -1331,6 +1390,81 @@ def _reconcile_pressure_advisory(root_dir: Path, state: PulseState) -> None:
     state.pressure_advisory = advisory
 
 
+# Retention pruning runs on the first cycle and then at most every 6 hours;
+# retention_days granularity is daily so per-tick checks would be waste.
+RETENTION_PRUNE_INTERVAL_SECONDS = 6 * 3600.0
+# Log dirs also hold pid files, generated configs, and state snapshots; only
+# reap files that are unambiguously logs.
+RETENTION_PRUNE_SUFFIXES = (".log", ".jsonl", ".out", ".err")
+
+
+def _is_prunable_log_file(candidate: Path) -> bool:
+    name = candidate.name
+    if name.endswith(RETENTION_PRUNE_SUFFIXES):
+        return True
+    # Rotated archives: <name>.log.1, <name>.jsonl.2, ...
+    stem, _sep, suffix = name.rpartition(".")
+    return bool(suffix.isdigit() and stem.endswith(RETENTION_PRUNE_SUFFIXES))
+
+
+def prune_expired_log_files(model: dict[str, Any], *, now: float | None = None) -> list[dict[str, str]]:
+    """Delete log files older than each declared log dir's ``retention_days``.
+
+    Only regular log-suffixed files are removed (never directories, symlinks,
+    pid files, or generated configs), and only inside log dirs the runtime
+    model declares with a positive retention. Returns one record per removed
+    file.
+    """
+    wall_now = time.time() if now is None else now
+    removed: list[dict[str, str]] = []
+    for log_item in model.get("logs") or []:
+        try:
+            retention_days = float(log_item.get("retention_days") or 0)
+        except (TypeError, ValueError):
+            continue
+        if retention_days <= 0:
+            continue
+        host_path = str(log_item.get("host_path") or "").strip()
+        if not host_path:
+            continue
+        log_dir = Path(host_path)
+        if not log_dir.is_dir():
+            continue
+        cutoff = wall_now - retention_days * 86400.0
+        for candidate in sorted(log_dir.rglob("*")):
+            if not _is_prunable_log_file(candidate):
+                continue
+            if candidate.is_symlink() or not candidate.is_file():
+                continue
+            try:
+                if candidate.stat().st_mtime >= cutoff:
+                    continue
+                candidate.unlink()
+            except OSError:
+                continue
+            removed.append({"path": str(candidate), "log_id": str(log_item.get("id") or "")})
+    return removed
+
+
+def _reconcile_log_retention(model: dict[str, Any], state: "PulseState", *, now: float) -> None:
+    if state.last_retention_prune and now - state.last_retention_prune < RETENTION_PRUNE_INTERVAL_SECONDS:
+        return
+    state.last_retention_prune = now
+    try:
+        removed = prune_expired_log_files(model)
+    except Exception as exc:
+        log("warn", f"log retention prune failed: {exc}")
+        return
+    if not removed:
+        return
+    log_runtime_event("pulse.logs_pruned", "logs", {
+        "removed_count": len(removed),
+        "paths": [entry["path"] for entry in removed[:20]],
+    })
+    state.events_emitted += 1
+    log("info", f"pruned {len(removed)} expired log file(s)")
+
+
 def _write_pulse_state(
     root_dir: Path,
     state: PulseState,
@@ -1452,6 +1586,94 @@ def run_daemon(
             _log_handle.close()
 
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Daemonized start (for `make pulse-start`): spawn `run`, verify, real exit code
+# ---------------------------------------------------------------------------
+
+DAEMON_START_WAIT_SECONDS = 3.0
+
+
+def start_daemon(
+    root_dir: Path,
+    *,
+    interval: int = DEFAULT_INTERVAL,
+    auto_restart: bool = True,
+    auto_sync: bool = False,
+    active_clients: list[str] | None = None,
+    active_profiles: list[str] | None = None,
+    unhealthy_grace_seconds: float = DEFAULT_UNHEALTHY_GRACE_SECONDS,
+    wait_seconds: float = DAEMON_START_WAIT_SECONDS,
+) -> int:
+    """Daemonize ``run`` and verify it came up.
+
+    Unlike backgrounding ``run`` with a shell ampersand, this reports a real
+    exit code: 0 only when the daemon's pidfile shows a live process, the
+    child's own exit code when it dies during startup (e.g. unwritable state
+    dir), and 1 when the pidfile never appears within ``wait_seconds``.
+    """
+    running_pid = existing_pid(root_dir)
+    if running_pid is not None:
+        print(f"[pulse] already running (pid {running_pid}), log {pulse_log_path(root_dir)}")
+        return 0
+
+    log_path = pulse_log_path(root_dir)
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--root-dir",
+        str(root_dir),
+        "run",
+        "--interval",
+        str(interval),
+        "--unhealthy-grace-seconds",
+        str(unhealthy_grace_seconds),
+    ]
+    if not auto_restart:
+        command.append("--no-restart")
+    if auto_sync:
+        command.append("--auto-sync")
+    for client in active_clients or []:
+        command.extend(["--client", client])
+    for profile in active_profiles or []:
+        command.extend(["--profile", profile])
+
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as log_handle:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    except OSError as exc:
+        print(f"[pulse] failed to start daemon: {exc}", file=sys.stderr)
+        return 1
+
+    deadline = time.monotonic() + max(0.5, wait_seconds)
+    while time.monotonic() < deadline:
+        exit_code = process.poll()
+        if exit_code is not None:
+            print(
+                f"[pulse] daemon exited during startup (exit {exit_code}); see {log_path}",
+                file=sys.stderr,
+            )
+            return exit_code or 1
+        pid = existing_pid(root_dir)
+        if pid is not None:
+            print(f"[pulse] started (pid {pid}), log {log_path}")
+            return 0
+        time.sleep(0.1)
+
+    print(
+        f"[pulse] daemon (pid {process.pid}) did not write {pulse_pid_path(root_dir)} "
+        f"within {wait_seconds:g}s; see {log_path}",
+        file=sys.stderr,
+    )
+    return 1
 
 
 # ---------------------------------------------------------------------------
@@ -1653,41 +1875,50 @@ def main() -> int:
     )
     sub = parser.add_subparsers(dest="command")
 
+    def _add_daemon_options(daemon_parser: argparse.ArgumentParser) -> None:
+        daemon_parser.add_argument(
+            "--interval",
+            type=int,
+            default=None,
+            help=f"Seconds between reconciliation cycles (default: {DEFAULT_INTERVAL}).",
+        )
+        daemon_parser.add_argument(
+            "--no-restart",
+            action="store_true",
+            help="Disable auto-restart of crashed services.",
+        )
+        daemon_parser.add_argument(
+            "--auto-sync",
+            action="store_true",
+            help="Auto-run sync when config changes are detected.",
+        )
+        daemon_parser.add_argument(
+            "--client",
+            action="append",
+            default=None,
+            help="Client overlay to supervise. Can be repeated. Defaults to SKILLBOX_PULSE_CLIENTS or the runtime default client.",
+        )
+        daemon_parser.add_argument(
+            "--profile",
+            action="append",
+            default=None,
+            help="Runtime profile to supervise. Can be repeated. Defaults to SKILLBOX_PULSE_PROFILES or core.",
+        )
+        daemon_parser.add_argument(
+            "--unhealthy-grace-seconds",
+            type=float,
+            default=None,
+            help=f"Seconds a live service may fail healthchecks before restart (default: {DEFAULT_UNHEALTHY_GRACE_SECONDS:g}).",
+        )
+
     run_parser = sub.add_parser("run", help="Start the pulse daemon (foreground).")
-    run_parser.add_argument(
-        "--interval",
-        type=int,
-        default=None,
-        help=f"Seconds between reconciliation cycles (default: {DEFAULT_INTERVAL}).",
+    _add_daemon_options(run_parser)
+
+    start_parser = sub.add_parser(
+        "start",
+        help="Daemonize the pulse daemon, verify its pidfile, and exit with a real status code.",
     )
-    run_parser.add_argument(
-        "--no-restart",
-        action="store_true",
-        help="Disable auto-restart of crashed services.",
-    )
-    run_parser.add_argument(
-        "--auto-sync",
-        action="store_true",
-        help="Auto-run sync when config changes are detected.",
-    )
-    run_parser.add_argument(
-        "--client",
-        action="append",
-        default=None,
-        help="Client overlay to supervise. Can be repeated. Defaults to SKILLBOX_PULSE_CLIENTS or the runtime default client.",
-    )
-    run_parser.add_argument(
-        "--profile",
-        action="append",
-        default=None,
-        help="Runtime profile to supervise. Can be repeated. Defaults to SKILLBOX_PULSE_PROFILES or core.",
-    )
-    run_parser.add_argument(
-        "--unhealthy-grace-seconds",
-        type=float,
-        default=None,
-        help=f"Seconds a live service may fail healthchecks before restart (default: {DEFAULT_UNHEALTHY_GRACE_SECONDS:g}).",
-    )
+    _add_daemon_options(start_parser)
 
     sub.add_parser("status", help="Print current pulse daemon status.")
     sub.add_parser("stop", help="Send SIGTERM to the running pulse daemon.")
@@ -1695,7 +1926,9 @@ def main() -> int:
     args = parser.parse_args()
     root_dir = Path(args.root_dir).resolve() if args.root_dir else DEFAULT_ROOT_DIR
 
-    command = args.command or "run"
+    # Bare invocation is read-only, mirroring `manage.py` defaulting to status;
+    # running the daemon (the most dangerous action) must be explicit.
+    command = args.command or "status"
 
     if command == "status":
         return print_status(root_dir)
@@ -1709,7 +1942,7 @@ def main() -> int:
         print(f"[pulse] sent SIGTERM to {pid}")
         return 0
 
-    # Default: run the daemon.
+    # run/start share option resolution.
     env_values = load_runtime_env(root_dir)
     interval = args.interval if hasattr(args, "interval") and args.interval else None
     if interval is None:
@@ -1734,7 +1967,8 @@ def main() -> int:
         env_values,
     )
 
-    return run_daemon(
+    daemon_fn = start_daemon if command == "start" else run_daemon
+    return daemon_fn(
         root_dir,
         interval=interval,
         auto_restart=not getattr(args, "no_restart", False),
