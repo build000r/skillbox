@@ -1254,7 +1254,7 @@ class BoxProfile:
     image: str = "ubuntu-24-04-x64"
     ssh_user: str = "skillbox"
     tailscale_hostname_prefix: str = "skillbox"
-    skillbox_repo: str = "https://github.com/example/skillbox.git"
+    skillbox_repo: str = "https://github.com/build000r/skillbox.git"
     skillbox_branch: str = "main"
     storage: "BoxProfileStorage | None" = None
 
@@ -1848,7 +1848,7 @@ def load_profile(name: str) -> BoxProfile:
         image=data.get("image", "ubuntu-24-04-x64"),
         ssh_user=data.get("ssh_user", "skillbox"),
         tailscale_hostname_prefix=data.get("tailscale_hostname_prefix", "skillbox"),
-        skillbox_repo=data.get("skillbox_repo", "https://github.com/example/skillbox.git"),
+        skillbox_repo=data.get("skillbox_repo", "https://github.com/build000r/skillbox.git"),
         skillbox_branch=data.get("skillbox_branch", "main"),
         storage=storage,
     )

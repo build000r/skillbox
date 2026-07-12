@@ -41,7 +41,7 @@ RUN npm install -g \
     @anthropic-ai/claude-code@2.1.160 \
     @openai/codex@0.136.0 \
     gh-axi@0.1.11 \
-    spaps@0.7.7
+    spaps@0.9.3
 
 RUN useradd --create-home --shell /bin/zsh sandbox \
  && ln -s /home/sandbox /home/skillbox \

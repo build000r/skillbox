@@ -55,8 +55,13 @@ The mental model is:
   checks to that scaffold so `render`, `sync`, and `up` immediately work on a
   concrete client shape; `git-repo-http-service-bootstrap` is the generic path,
   and `git-repo-http-service-bootstrap-spaps-auth` adds managed SPAPS local auth
-  plus repo-local fixture bootstrap through the mandatory `spaps@0.7.7` CLI
-  installed in the workspace image; for tailnet-visible boxes, set
+  plus repo-local fixture bootstrap through the mandatory `spaps@0.9.3` CLI
+  installed in the workspace image. With `0.9.3` the headless
+  `spaps token --refresh` path exists, so the `spaps-keepwarm` shim (the
+  buildooor-proxy prototype used when older CLIs could not refresh headlessly)
+  is retained only until production `api.sweetpotato.dev` public-client refresh
+  (`client_id` + `refresh_token`, no app API key) is verified on a live box,
+  after which it is retired; for tailnet-visible boxes, set
   `SPAPS_AUTH_BASE_URL`, `SPAPS_FIXTURE_BASE_URL`, `SPAPS_BROWSER_API_URL`, and
   `SPAPS_CORS_ALLOW_ORIGINS` to browser-visible URLs instead of loopback URLs
 - `first-box <client>` is the canonical first-run path: it runs `private-init`,

@@ -6,10 +6,11 @@ This page contains content moved from `README.md` during the README front-door s
 
 ### The Problem
 
-Most remote dev setups overshoot the need. You want one private box that feels
-like a real computer: one primary workspace container, your own Claude or
-Codex home directories, a broader repo universe, and a way to activate the
-right client context without standing up a full hosted workspace control plane.
+Remote dev platforms hand you a control plane you did not ask for. You want one
+private box that feels like a real computer: one primary workspace container,
+your own Claude or Codex home directories, a broader repo universe, and a way to
+activate the right client context — without standing up a full hosted workspace
+control plane.
 
 ### The Solution
 
