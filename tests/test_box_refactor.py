@@ -32,6 +32,14 @@ def _completed(returncode: int = 0, stdout: str = "", stderr: str = "") -> subpr
     return subprocess.CompletedProcess(["mock"], returncode, stdout=stdout, stderr=stderr)
 
 
+def _droplet_absent(droplet_id: str = "77") -> object:
+    return BOX.ProviderObservation(
+        outcome=BOX.ProviderOutcome.CONFIRMED_NOT_FOUND,
+        operation="digitalocean.droplet.get",
+        resource_id=droplet_id,
+    )
+
+
 def _storage() -> object:
     return BOX.BoxProfileStorage(
         provider="digitalocean",
@@ -416,7 +424,7 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(BOX, "resolve_box_ssh_target", return_value="1.2.3.4"), \
             mock.patch.object(BOX, "ssh_cmd", side_effect=[_completed(returncode=1), _completed()]), \
             mock.patch.object(BOX, "do_delete_droplet", return_value=True), \
-            mock.patch.object(BOX, "do_get_droplet", return_value=None), \
+            mock.patch.object(BOX, "do_get_droplet", return_value=_droplet_absent()), \
             mock.patch.object(BOX, "save_inventory"), \
             mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
             result = BOX.cmd_down("teardown", dry_run=False, fmt="json")
@@ -493,7 +501,7 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(BOX, "resolve_box_ssh_target", return_value="1.2.3.4"), \
             mock.patch.object(BOX, "ssh_cmd", side_effect=[_completed(), _completed()]), \
             mock.patch.object(BOX, "do_delete_droplet", side_effect=delete_droplet), \
-            mock.patch.object(BOX, "do_get_droplet", return_value=None), \
+            mock.patch.object(BOX, "do_get_droplet", return_value=_droplet_absent()), \
             mock.patch.object(BOX, "do_get_volume", side_effect=get_volume), \
             mock.patch.object(BOX, "do_detach_volume", side_effect=detach_volume), \
             mock.patch.object(BOX, "do_delete_volume", side_effect=delete_volume), \
@@ -528,7 +536,7 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(BOX, "resolve_box_ssh_target", return_value="1.2.3.4"), \
             mock.patch.object(BOX, "ssh_cmd", side_effect=[_completed(), _completed()]), \
             mock.patch.object(BOX, "do_delete_droplet", return_value=True), \
-            mock.patch.object(BOX, "do_get_droplet", return_value=None), \
+            mock.patch.object(BOX, "do_get_droplet", return_value=_droplet_absent()), \
             mock.patch.object(BOX, "do_get_volume", return_value={"id": "vol-1", "droplet_ids": ["999"]}), \
             mock.patch.object(BOX, "do_detach_volume") as detach_volume, \
             mock.patch.object(BOX, "do_delete_volume") as delete_volume, \
