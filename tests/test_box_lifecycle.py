@@ -24,6 +24,32 @@ FAKE_PROVISIONING_ENV = {
 }
 
 
+def _provider_observation(
+    outcome: object,
+    droplet_id: str = "77",
+    *,
+    resource: dict[str, object] | None = None,
+) -> object:
+    return BOX_MODULE.ProviderObservation(
+        outcome=BOX_MODULE.ProviderOutcome(outcome),
+        operation="digitalocean.droplet.get",
+        resource_id=droplet_id,
+        resource=resource,
+    )
+
+
+def _droplet_found(droplet_id: str = "77") -> object:
+    return _provider_observation(
+        BOX_MODULE.ProviderOutcome.FOUND,
+        droplet_id,
+        resource={"id": droplet_id},
+    )
+
+
+def _droplet_absent(droplet_id: str = "77") -> object:
+    return _provider_observation(BOX_MODULE.ProviderOutcome.CONFIRMED_NOT_FOUND, droplet_id)
+
+
 class BoxLifecycleTests(unittest.TestCase):
     def test_cmd_up_requires_deploy_manifest_for_non_dry_run(self) -> None:
         profile = BOX_MODULE.BoxProfile(id="dev-small")
@@ -591,8 +617,12 @@ class BoxLifecycleTests(unittest.TestCase):
             mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="1.2.3.4"),
             mock.patch.object(BOX_MODULE, "ssh_cmd", return_value=subprocess.CompletedProcess([], 0, "", "")),
             mock.patch.object(BOX_MODULE, "do_delete_droplet", return_value=True),
-            # Read-after-delete confirmation: droplet is gone (404 -> None).
-            mock.patch.object(BOX_MODULE, "do_get_droplet", return_value=None) as do_get_droplet,
+            # Read-after-delete confirmation: provider explicitly returned 404.
+            mock.patch.object(
+                BOX_MODULE,
+                "do_get_droplet",
+                return_value=_droplet_absent("123"),
+            ) as do_get_droplet,
             mock.patch.object(BOX_MODULE, "save_inventory"),
             mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
         ):
@@ -734,7 +764,7 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
             mock.patch.object(BOX_MODULE, "ssh_cmd", return_value=_completed()),
             mock.patch.object(BOX_MODULE, "do_delete_droplet", return_value=True),
             # Read-after-delete keeps returning the droplet -> still listed.
-            mock.patch.object(BOX_MODULE, "do_get_droplet", return_value={"id": "77"}),
+            mock.patch.object(BOX_MODULE, "do_get_droplet", return_value=_droplet_found()),
             mock.patch.object(BOX_MODULE, "time") as fake_time,
             mock.patch.object(BOX_MODULE, "do_get_volume") as do_get_volume,
             mock.patch.object(BOX_MODULE, "do_delete_volume") as do_delete_volume,
@@ -753,11 +783,13 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
         self.assertEqual(payload["error"]["type"], "destroy_pending")
         self.assertEqual(payload["steps"][-1]["step"], "confirm")
         self.assertEqual(payload["steps"][-1]["status"], "warn")
-        self.assertIn("box down teardown", payload["next_actions"])
+        self.assertIn(
+            "python3 scripts/box.py down teardown --confirm teardown --format json",
+            payload["next_actions"],
+        )
 
     def test_404_confirmed_absent_marks_destroyed(self) -> None:
-        """Scenario 2: read-after-delete returns 404 (None) -> confirmed absent
-        -> safe to mark destroyed."""
+        """Scenario 2: explicit provider 404 evidence permits destroyed."""
         box = _ready_box()
         box.volume_id = None  # isolate the destroy/confirm path
         box.volume_name = None
@@ -768,7 +800,11 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
             mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="1.2.3.4"),
             mock.patch.object(BOX_MODULE, "ssh_cmd", return_value=_completed()),
             mock.patch.object(BOX_MODULE, "do_delete_droplet", return_value=True),
-            mock.patch.object(BOX_MODULE, "do_get_droplet", return_value=None) as do_get_droplet,
+            mock.patch.object(
+                BOX_MODULE,
+                "do_get_droplet",
+                return_value=_droplet_absent(),
+            ) as do_get_droplet,
             mock.patch.object(BOX_MODULE, "save_inventory"),
             mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
         ):
@@ -793,7 +829,7 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
             mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="1.2.3.4"),
             mock.patch.object(BOX_MODULE, "ssh_cmd", return_value=_completed()),
             mock.patch.object(BOX_MODULE, "do_delete_droplet", return_value=True),
-            mock.patch.object(BOX_MODULE, "do_get_droplet", return_value=None),
+            mock.patch.object(BOX_MODULE, "do_get_droplet", return_value=_droplet_absent()),
             # Volume still attached to a foreign droplet -> cleanup refuses.
             mock.patch.object(BOX_MODULE, "do_get_volume", return_value={"id": "vol-1", "droplet_ids": ["999"]}),
             mock.patch.object(BOX_MODULE, "do_detach_volume") as do_detach_volume,
@@ -829,7 +865,7 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
                 side_effect=[_completed(), RuntimeError("tailscale logout failed")],
             ),
             mock.patch.object(BOX_MODULE, "do_delete_droplet", return_value=True),
-            mock.patch.object(BOX_MODULE, "do_get_droplet", return_value=None),
+            mock.patch.object(BOX_MODULE, "do_get_droplet", return_value=_droplet_absent()),
             mock.patch.object(BOX_MODULE, "save_inventory"),
             mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
         ):
@@ -862,7 +898,7 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
             mock.patch.object(BOX_MODULE, "resolve_box_ssh_target") as resolve_ssh,
             mock.patch.object(BOX_MODULE, "ssh_cmd") as ssh_cmd,
             mock.patch.object(BOX_MODULE, "do_delete_droplet") as do_delete_droplet,
-            mock.patch.object(BOX_MODULE, "do_get_droplet", return_value=None),
+            mock.patch.object(BOX_MODULE, "do_get_droplet", return_value=_droplet_absent()),
             mock.patch.object(BOX_MODULE, "save_inventory"),
             mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
         ):
@@ -891,7 +927,7 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
             mock.patch.object(BOX_MODULE, "load_inventory", return_value=[box]),
             mock.patch.object(BOX_MODULE, "optional_env", return_value=""),
             mock.patch.object(BOX_MODULE, "do_delete_droplet") as do_delete_droplet,
-            mock.patch.object(BOX_MODULE, "do_get_droplet", return_value={"id": "77"}),
+            mock.patch.object(BOX_MODULE, "do_get_droplet", return_value=_droplet_found()),
             mock.patch.object(BOX_MODULE, "time") as fake_time,
             mock.patch.object(BOX_MODULE, "save_inventory"),
             mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
@@ -948,7 +984,7 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
 
         def record_get(_droplet_id: str):
             order.append("confirm_read")
-            return None  # confirmed absent
+            return _droplet_absent()  # explicit confirmed-absent evidence
 
         original_update_box = BOX_MODULE.update_box
 
@@ -986,7 +1022,7 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
 
         def get(_droplet_id: str):
             get_calls.append(_droplet_id)
-            return {"id": "77"}  # never goes away
+            return _droplet_found()  # never goes away
 
         with mock.patch.object(BOX_MODULE, "do_get_droplet", side_effect=get):
             result = BOX_MODULE.confirm_droplet_absent(
@@ -996,7 +1032,7 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
                 sleep=sleeps.append,
             )
 
-        self.assertFalse(result)
+        self.assertEqual(result.outcome, BOX_MODULE.ProviderOutcome.FOUND)
         # Exactly `attempts` reads, and one fewer sleep than reads (bounded).
         self.assertEqual(len(get_calls), 3)
         self.assertEqual(sleeps, [1.0, 2.0])  # linear backoff, then stop
@@ -1005,7 +1041,138 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
         """A doctl read error must NOT be mistaken for confirmed absence."""
         with mock.patch.object(BOX_MODULE, "do_get_droplet", side_effect=RuntimeError("doctl boom")):
             result = BOX_MODULE.confirm_droplet_absent("77", attempts=2, backoff_seconds=0.0, sleep=lambda _s: None)
-        self.assertFalse(result)
+        self.assertEqual(result.outcome, BOX_MODULE.ProviderOutcome.RETRYABLE_FAILURE)
+
+    def test_confirm_droplet_absent_requires_a_resource_id(self) -> None:
+        with mock.patch.object(BOX_MODULE, "do_get_droplet") as do_get_droplet:
+            result = BOX_MODULE.confirm_droplet_absent("")
+
+        do_get_droplet.assert_not_called()
+        self.assertEqual(result.outcome, BOX_MODULE.ProviderOutcome.MALFORMED_RESPONSE)
+
+    def test_do_get_droplet_classifies_provider_results_without_ambiguity(self) -> None:
+        cases = [
+            (
+                "found",
+                _completed(stdout='[{"id": 77, "name": "teardown"}]'),
+                BOX_MODULE.ProviderOutcome.FOUND,
+            ),
+            (
+                "confirmed-not-found",
+                _completed(returncode=1, stderr="Error: GET /v2/droplets/77: 404 not found"),
+                BOX_MODULE.ProviderOutcome.CONFIRMED_NOT_FOUND,
+            ),
+            (
+                "auth",
+                _completed(returncode=1, stderr="Error: GET /v2/droplets/77: 401 unauthorized"),
+                BOX_MODULE.ProviderOutcome.PERMANENT_FAILURE,
+            ),
+            (
+                "network",
+                _completed(returncode=1, stderr="dial tcp: network is unreachable"),
+                BOX_MODULE.ProviderOutcome.RETRYABLE_FAILURE,
+            ),
+            (
+                "rate-limit",
+                _completed(returncode=1, stderr="Error: GET /v2/droplets/77: 429 too many requests"),
+                BOX_MODULE.ProviderOutcome.RETRYABLE_FAILURE,
+            ),
+            (
+                "server-error",
+                _completed(returncode=1, stderr="Error: GET /v2/droplets/77: 503 unavailable"),
+                BOX_MODULE.ProviderOutcome.RETRYABLE_FAILURE,
+            ),
+            (
+                "invalid-json",
+                _completed(stdout="not-json"),
+                BOX_MODULE.ProviderOutcome.MALFORMED_RESPONSE,
+            ),
+            (
+                "empty-success",
+                _completed(stdout="[]"),
+                BOX_MODULE.ProviderOutcome.MALFORMED_RESPONSE,
+            ),
+            (
+                "wrong-resource",
+                _completed(stdout='[{"id": 88}]'),
+                BOX_MODULE.ProviderOutcome.MALFORMED_RESPONSE,
+            ),
+        ]
+
+        for label, provider_result, expected in cases:
+            with self.subTest(label=label), mock.patch.object(
+                BOX_MODULE,
+                "run",
+                return_value=provider_result,
+            ):
+                observation = BOX_MODULE.do_get_droplet("77")
+            self.assertEqual(observation.outcome, expected)
+            self.assertEqual(observation.resource_id, "77")
+
+    def test_non_absence_provider_results_never_unlock_destroyed_or_volume_cleanup(self) -> None:
+        cases = [
+            (
+                "auth",
+                _completed(returncode=1, stderr="Error: GET /v2/droplets/77: 401 unauthorized"),
+                "permanent-failure",
+                1,
+            ),
+            (
+                "network",
+                _completed(returncode=1, stderr="dial tcp: network is unreachable"),
+                "retryable-failure",
+                3,
+            ),
+            (
+                "rate-limit",
+                _completed(returncode=1, stderr="Error: GET /v2/droplets/77: 429 too many requests"),
+                "retryable-failure",
+                3,
+            ),
+            (
+                "server-error",
+                _completed(returncode=1, stderr="Error: GET /v2/droplets/77: 503 unavailable"),
+                "retryable-failure",
+                3,
+            ),
+            (
+                "malformed",
+                _completed(stdout="not-json"),
+                "malformed-response",
+                1,
+            ),
+        ]
+
+        for label, provider_result, expected_outcome, expected_attempts in cases:
+            box = _ready_box()
+            payloads: list[dict[str, object]] = []
+            with (
+                self.subTest(label=label),
+                mock.patch.object(BOX_MODULE, "load_inventory", return_value=[box]),
+                mock.patch.object(BOX_MODULE, "optional_env", return_value=""),
+                mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="1.2.3.4"),
+                mock.patch.object(BOX_MODULE, "ssh_cmd", return_value=_completed()),
+                mock.patch.object(BOX_MODULE, "do_delete_droplet", return_value=True),
+                mock.patch.object(BOX_MODULE, "run", return_value=provider_result),
+                mock.patch.object(BOX_MODULE.time, "sleep"),
+                mock.patch.object(BOX_MODULE, "do_get_volume") as do_get_volume,
+                mock.patch.object(BOX_MODULE, "do_delete_volume") as do_delete_volume,
+                mock.patch.object(BOX_MODULE, "save_inventory"),
+                mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
+            ):
+                result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json")
+
+            self.assertEqual(result, BOX_MODULE.EXIT_ERROR)
+            self.assertEqual(box.state, "destroy-pending")
+            do_get_volume.assert_not_called()
+            do_delete_volume.assert_not_called()
+            payload = payloads[-1]
+            self.assertEqual(payload["provider_observation"]["outcome"], expected_outcome)
+            self.assertEqual(payload["provider_observation"]["attempts"], expected_attempts)
+            self.assertEqual(
+                payload["next_actions"][1],
+                "python3 scripts/box.py down teardown --confirm teardown --format json",
+            )
 
 
 class BoxTeardownPendingVisibilityTests(unittest.TestCase):

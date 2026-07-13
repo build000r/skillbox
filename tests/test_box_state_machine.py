@@ -20,6 +20,15 @@ def _completed(returncode: int = 0, stdout: str = "", stderr: str = "") -> subpr
     return subprocess.CompletedProcess(["mock"], returncode, stdout=stdout, stderr=stderr)
 
 
+def _provider_observation(outcome: object, droplet_id: str = "123") -> object:
+    return BOX.ProviderObservation(
+        outcome=BOX.ProviderOutcome(outcome),
+        operation="digitalocean.droplet.get",
+        resource_id=droplet_id,
+        resource={"id": droplet_id} if outcome == BOX.ProviderOutcome.FOUND else None,
+    )
+
+
 def _storage() -> object:
     return BOX.BoxProfileStorage(
         provider="digitalocean",
@@ -416,7 +425,11 @@ class BoxDownIntermediateStateTests(unittest.TestCase):
         payloads: list[dict[str, object]] = []
         with (
             mock.patch.object(BOX, "load_inventory", return_value=[box]),
-            mock.patch.object(BOX, "confirm_droplet_absent", return_value=True) as confirm_absent,
+            mock.patch.object(
+                BOX,
+                "confirm_droplet_absent",
+                return_value=_provider_observation(BOX.ProviderOutcome.CONFIRMED_NOT_FOUND),
+            ) as confirm_absent,
             mock.patch.object(BOX, "_destroy_box_droplet") as destroy_droplet,
             mock.patch.object(BOX, "save_inventory"),
             mock.patch.object(BOX, "emit_json", side_effect=payloads.append),
@@ -438,7 +451,11 @@ class BoxDownIntermediateStateTests(unittest.TestCase):
         payloads: list[dict[str, object]] = []
         with (
             mock.patch.object(BOX, "load_inventory", return_value=[box]),
-            mock.patch.object(BOX, "confirm_droplet_absent", return_value=False),
+            mock.patch.object(
+                BOX,
+                "confirm_droplet_absent",
+                return_value=_provider_observation(BOX.ProviderOutcome.FOUND),
+            ),
             mock.patch.object(BOX, "_destroy_box_droplet") as destroy_droplet,
             mock.patch.object(BOX, "save_inventory"),
             mock.patch.object(BOX, "emit_json", side_effect=payloads.append),
