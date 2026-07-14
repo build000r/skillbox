@@ -68,6 +68,8 @@ unrelated application or global macOS paste binding.
 
 Image/file reads are gesture-triggered. Text may continue through the terminal's
 native paste implementation without being copied into Skillbox diagnostics.
+Finder paths and basenames remain private gesture data; public snapshots and
+receipts expose only the item count, aggregate size, and digest.
 
 ## Surface acceptance matrix
 

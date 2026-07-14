@@ -66,7 +66,9 @@ class ClipboardSnapshot:
         payload = asdict(self)
         payload.pop("_source_paths", None)
         payload["source_types"] = list(self.source_types)
-        payload["file_names"] = list(self.file_names)
+        # Finder basenames can themselves contain customer, project, or secret
+        # metadata. Keep them available only to the in-gesture object.
+        payload["file_names"] = []
         return payload
 
 

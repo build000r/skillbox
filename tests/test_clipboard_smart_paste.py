@@ -509,6 +509,9 @@ class ClipboardSmartPasteTests(unittest.TestCase):
         self.assertEqual(receipt["outcome"], "native_files")
         self.assertFalse(self.tmux.injections)
         self.assertIsNone(receipt["transfer"])
+        serialized = json.dumps(receipt)
+        self.assertNotIn("first.png", serialized)
+        self.assertNotIn("second.pdf", serialized)
 
     def test_pdf_is_transferred_and_injected_as_document_reference(self) -> None:
         document = self.root / "fixture.pdf"

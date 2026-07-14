@@ -104,6 +104,8 @@ class ClipboardSnapshotTests(unittest.TestCase):
         self.assertEqual(snap.file_count, 2)
         self.assertEqual(snap.file_names, ("Secret Plan.png", "other.pdf"))
         self.assertNotIn("/Users/b", json.dumps(public))
+        self.assertNotIn("Secret Plan.png", json.dumps(public))
+        self.assertEqual(public["file_names"], [])
 
     def test_empty_and_unsupported_are_distinct(self) -> None:
         empty = cs.snapshot_from_payload({"change_count": 1, "types": [], "items": []})
