@@ -417,6 +417,21 @@ class ClipboardBootstrapTests(unittest.TestCase):
             tmux_conf.write_bytes(b"set -g mouse on\n")
             installed = CB.run_remote_install(home, root=ROOT_DIR)
             self.assertEqual(installed.returncode, 0, msg=installed.stderr)
+            state = home / CB.STATE_SUBDIR
+            baseline = state / "baseline"
+            self.assertEqual(state.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(
+                (baseline / "records.tsv").stat().st_mode & 0o777,
+                0o600,
+            )
+            self.assertEqual(
+                (baseline / "files" / "clipcopy").stat().st_mode & 0o777,
+                0o600,
+            )
+            self.assertEqual(
+                (baseline / "files" / "tmux_conf").stat().st_mode & 0o777,
+                0o600,
+            )
 
             restored = subprocess.run(
                 ["bash", "-s"],
