@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from scripts.lib import clipboard_bootstrap
+from scripts.lib import clipboard_session
 from scripts.lib import clipboard_status as status
 
 
@@ -115,7 +116,7 @@ python 12 user 8u IPv4 0 0t0 TCP *:9999 (LISTEN)
             self.assertEqual(private["status"], "fail")
             self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o644)
 
-    def test_installed_fixture_has_ready_redacted_status_schema(self) -> None:
+    def test_installed_fixture_without_exact_route_is_ambiguous(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             home = Path(raw) / "home"
             home.mkdir()
@@ -130,10 +131,56 @@ python 12 user 8u IPv4 0 0t0 TCP *:9999 (LISTEN)
                 ),
             )
             self.assertEqual(report["schema_version"], 1)
-            self.assertEqual(report["state"], "ready")
+            self.assertEqual(report["state"], "ambiguous")
             self.assertTrue(report["install"]["ready"])
             self.assertIn("clipboard bytes", report["redaction"])
             self.assertNotIn("clipboard_text", status.dump(report))
+
+    def test_current_tmux_pane_auto_resolves_exact_route_to_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            home.mkdir()
+            clipboard_bootstrap.install_local(home, root=ROOT_DIR)
+            record, route_path = clipboard_session.register(
+                profile="d3",
+                transport="ssh",
+                tmux_pane="%42",
+                tmux_client="/dev/ttys042",
+                tmux_server="/tmp/tmux-fixture",
+                root=home / ".local" / "state" / "skillbox" / "paste-routes",
+                hosts_path=ROOT_DIR / "scripts" / "clipboard" / "hosts.json",
+                now=900.0,
+                ttl_seconds=1_000,
+                stamp_tmux=False,
+            )
+
+            def tmux_runner(
+                command: list[str], **_kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                fmt = command[-1]
+                values = {
+                    "#{client_name}": "/dev/ttys042",
+                    clipboard_session.TMUX_ROUTE_OPTION: str(route_path),
+                    clipboard_session.TMUX_GENERATION_OPTION: str(
+                        record["generation"]
+                    ),
+                }
+                return subprocess.CompletedProcess(command, 0, values[fmt] + "\n", "")
+
+            report = status.inspect_status(
+                home=home,
+                root=ROOT_DIR,
+                profile="d3",
+                now=1000.0,
+                environment={"TMUX": "/tmp/tmux-fixture,1,0", "TMUX_PANE": "%42"},
+                tmux_runner=tmux_runner,
+                listener_runner=lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                    [], 1, "", ""
+                ),
+            )
+            self.assertEqual(report["state"], "ready")
+            self.assertTrue(report["route"]["ready"])
+            self.assertEqual(report["route"]["route_id"], record["route_id"])
 
     def test_unsupported_profile_is_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

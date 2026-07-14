@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import subprocess
 import time
@@ -284,6 +285,31 @@ def _codex_version() -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def _current_tmux_client(
+    pane: str,
+    *,
+    runner: Any = subprocess.run,
+) -> str:
+    result = runner(
+        ["tmux", "display-message", "-p", "-t", pane, "#{client_name}"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    client = result.stdout.strip() if result.returncode == 0 else ""
+    if not client:
+        raise clipboard_session.SessionError(
+            result.stderr.strip() or "focused tmux client is unavailable"
+        )
+    return client
+
+
+def _missing_route_error(message: str) -> bool:
+    lowered = message.lower()
+    return "no registered paste route" in lowered or "invalid option" in lowered
+
+
 def inspect_status(
     *,
     home: Path | None = None,
@@ -292,6 +318,8 @@ def inspect_status(
     route_path: Path | None = None,
     now: float | None = None,
     listener_runner: Any = subprocess.run,
+    tmux_runner: Any = subprocess.run,
+    environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     home = home or Path.home()
     resolved_root = root
@@ -301,14 +329,30 @@ def inspect_status(
         except FileNotFoundError:
             resolved_root = None
     now = time.time() if now is None else now
+    environment = os.environ if environment is None else environment
     install_issues = bootstrap.verify_local_install(home)
     route_record: dict[str, Any] | None = None
     route_error: str | None = None
+    route_stale = False
     if route_path is not None:
         try:
             route_record = clipboard_session.load_record(route_path, now=now)
         except (OSError, clipboard_session.SessionError) as exc:
             route_error = str(exc)
+            route_stale = True
+    elif environment.get("TMUX") and environment.get("TMUX_PANE"):
+        pane = str(environment["TMUX_PANE"])
+        try:
+            client = _current_tmux_client(pane, runner=tmux_runner)
+            route_record, route_path = clipboard_session.resolve_tmux(
+                pane=pane,
+                client=client,
+                now=now,
+                runner=tmux_runner,
+            )
+        except (OSError, clipboard_session.SessionError) as exc:
+            route_error = str(exc)
+            route_stale = not _missing_route_error(route_error)
     host_data = (
         bootstrap.load_hosts(resolved_root)
         if resolved_root is not None
@@ -321,7 +365,7 @@ def inspect_status(
             "generation_matches": route_record is not None,
             "pane_matches": route_record is not None,
             "client_matches": route_record is not None,
-            "stale": route_error is not None,
+            "stale": route_stale,
         }
     )
     listener_probe_error: str | None = None
@@ -334,7 +378,7 @@ def inspect_status(
         "listeners": listeners,
         "listener_probe_error": listener_probe_error,
         "private_paths": _private_file_facts(home),
-        "route_stale": route_error is not None,
+        "route_stale": route_stale,
         "duplicate_tmux_features": _tmux_duplicate_count(home),
         "legacy_bridge": {},
     }
@@ -343,7 +387,8 @@ def inspect_status(
     unsupported = not profile_record["capabilities"]["inbound"]["smart_path_paste"]
     state = classify_state(
         unsupported=unsupported,
-        stale=route_error is not None,
+        ambiguous=route_record is None and not route_stale,
+        stale=route_stale,
         installed=(bootstrap.lifecycle_state_dir(home) / "manifest.json").is_file(),
         install_issues=bool(install_issues),
         failed_checks=bool(failing),
