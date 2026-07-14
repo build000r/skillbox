@@ -16,6 +16,7 @@ from lib.clipboard_bootstrap import (
     apply_remote_restore_via_ssh,
     install_local,
     load_hosts,
+    operator_platform_supported,
     plan_local_install,
     plan_remote_bootstrap,
     repo_root,
@@ -23,6 +24,7 @@ from lib.clipboard_bootstrap import (
     rollback_local,
     select_conference_route,
     static_conference_route,
+    unsupported_operator_message,
     uninstall_local,
     verify_local_install,
 )
@@ -161,6 +163,12 @@ def main(argv: list[str] | None = None) -> int:
     target = (args.target or "").strip() or None
     profile = _effective_profile(profile, target)
     live_probe = not args.dry_run and args.apply_remote
+    writes_install = args.action == "install" and (
+        profile == "local" or args.apply_remote
+    )
+    if writes_install and not args.dry_run and not operator_platform_supported():
+        print(f"clipboard-bootstrap: {unsupported_operator_message()}", file=sys.stderr)
+        return 2
 
     if args.action == "uninstall":
         if profile != "local":

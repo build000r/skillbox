@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import subprocess
 import sys
@@ -143,6 +145,36 @@ class ClipboardBootstrapTests(unittest.TestCase):
                 if CB.TMUX_MARKER in line
             ]
             self.assertEqual(len(lines), 1)
+
+    def test_unsupported_operator_install_is_no_write_but_dry_run_explains(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            with mock.patch.object(CB.platform, "system", return_value="Windows"):
+                plan = CB.install_local(home, dry_run=True, root=ROOT_DIR)
+                self.assertEqual(len(plan.steps), 1)
+                self.assertIn("no local or remote changes", plan.steps[0])
+                with self.assertRaises(CB.UnsupportedOperatorPlatform):
+                    CB.install_local(home, root=ROOT_DIR)
+            self.assertEqual(list(home.iterdir()), [])
+
+    def test_cli_rejects_unsupported_apply_before_remote_resolution(self) -> None:
+        from lib import clipboard_bootstrap_cli as CLI
+
+        with (
+            mock.patch.object(CLI, "operator_platform_supported", return_value=False),
+            mock.patch.object(
+                CLI,
+                "unsupported_operator_message",
+                return_value="unsupported fixture; no local or remote changes were made",
+            ),
+            mock.patch.object(CLI, "_resolve_remote_target") as resolve_remote,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            code = CLI.main(["--profile", "d3", "--apply-remote"])
+        self.assertEqual(code, 2)
+        self.assertIn("no local or remote changes", stderr.getvalue())
+        resolve_remote.assert_not_called()
 
     def test_install_uninstall_restores_owned_files_byte_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

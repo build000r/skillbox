@@ -70,6 +70,23 @@ GHOSTTY_COMMENT = (
     "# Skillbox seamless paste: scoped Ghostty Cmd+V probe plus native paste."
 )
 STATE_SUBDIR = ".local/state/skillbox/clipboard-bootstrap"
+SUPPORTED_OPERATOR_PLATFORMS = {"Darwin", "Linux"}
+
+
+class UnsupportedOperatorPlatform(RuntimeError):
+    """The local installer has no focus-safe contract for this platform."""
+
+
+def operator_platform_supported(system: str | None = None) -> bool:
+    return (system or platform.system()) in SUPPORTED_OPERATOR_PLATFORMS
+
+
+def unsupported_operator_message(system: str | None = None) -> str:
+    name = system or platform.system()
+    return (
+        f"operator platform {name!r} is substrate-only or unsupported; "
+        "no local or remote changes were made"
+    )
 
 
 def repo_root(start: Path | None = None) -> Path:
@@ -636,6 +653,9 @@ def plan_local_install(
 ) -> InstallPlan:
     home_dir = home or Path.home()
     plan = InstallPlan(profile="local", scope="local", dry_run=dry_run)
+    if not operator_platform_supported():
+        plan.steps.append(unsupported_operator_message())
+        return plan
     bin_dir = home_dir / ".local" / "bin"
     fragment = tmux_fragment_path(home_dir)
     tmux_conf = tmux_conf_path(home_dir)
@@ -670,6 +690,10 @@ def install_local(
     resolved_root = root or repo_root()
     home_dir = home or Path.home()
     plan = plan_local_install(home_dir, dry_run=dry_run, root=resolved_root)
+    if not operator_platform_supported():
+        if dry_run:
+            return plan
+        raise UnsupportedOperatorPlatform(unsupported_operator_message())
     if not dry_run:
         already_managed = (lifecycle_state_dir(home_dir) / "manifest.json").is_file()
         _ensure_baseline(resolved_root, home_dir)
