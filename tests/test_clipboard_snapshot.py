@@ -16,9 +16,28 @@ from scripts.lib import clipboard_snapshot as cs
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 CLI = ROOT_DIR / "scripts" / "clipboard-snapshot"
-PNG = b"\x89PNG\r\n\x1a\n" + b"fixture-png"
-JPEG = b"\xff\xd8\xff" + b"fixture-jpeg"
-TIFF = b"II*\x00" + b"fixture-tiff"
+PNG = (
+    b"\x89PNG\r\n\x1a\n"
+    + b"\x00\x00\x00\x0dIHDR"
+    + (11).to_bytes(4, "big")
+    + (7).to_bytes(4, "big")
+    + b"\x08\x06\x00\x00\x00"
+)
+JPEG = (
+    b"\xff\xd8\xff\xc0\x00\x0b\x08"
+    + (5).to_bytes(2, "big")
+    + (9).to_bytes(2, "big")
+    + b"\x01\x01\x11\x00"
+)
+TIFF = (
+    b"II*\x00\x08\x00\x00\x00"
+    + b"\x02\x00"
+    + b"\x00\x01\x04\x00\x01\x00\x00\x00"
+    + (9).to_bytes(4, "little")
+    + b"\x01\x01\x04\x00\x01\x00\x00\x00"
+    + (5).to_bytes(4, "little")
+    + b"\x00\x00\x00\x00"
+)
 HEIC = b"\x00\x00\x00\x18ftypheic" + b"fixture-heic"
 PDF = b"%PDF-1.7\nfixture-pdf"
 
@@ -169,6 +188,27 @@ class ClipboardSnapshotTests(unittest.TestCase):
                 with self.assertRaises(cs.SnapshotError) as caught:
                     cs.snapshot_from_payload(fixture)
                 self.assertEqual(caught.exception.code, "corrupt_media")
+
+    def test_encoded_header_dimension_bomb_is_rejected_even_when_decoded_size_is_small(
+        self,
+    ) -> None:
+        bomb = (
+            b"\x89PNG\r\n\x1a\n"
+            + b"\x00\x00\x00\x0dIHDR"
+            + (cs.DEFAULT_MAX_DIMENSION + 1).to_bytes(4, "big")
+            + (1).to_bytes(4, "big")
+            + b"\x08\x06\x00\x00\x00"
+        )
+        with self.assertRaises(cs.SnapshotError) as caught:
+            cs.snapshot_from_payload(
+                payload(
+                    "public.png",
+                    data_base64=base64.b64encode(bomb).decode(),
+                    width=1,
+                    height=1,
+                )
+            )
+        self.assertEqual(caught.exception.code, "corrupt_media")
 
     def test_cli_emits_stable_json_and_private_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
