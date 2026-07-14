@@ -26,6 +26,7 @@ SCHEMA_VERSION = 1
 NOTICE_MS = 2500
 PROGRESS_DELAY_SECONDS = 0.5
 TRANSFER_TIMEOUT_SECONDS = 3.0
+REPAIR_MESSAGE = "press Cmd+V to retry or run clipboard-paste doctor"
 
 
 class SmartPasteError(RuntimeError):
@@ -242,6 +243,11 @@ def error_code(exc: BaseException) -> str:
     if "paste failed" in message or "injection" in message:
         return "injection_failed"
     return "paste_rejected"
+
+
+def public_error_message(code: str) -> str:
+    """Return a bounded operator message without echoing sensitive paths or stderr."""
+    return f"Paste stopped [{code}]. {REPAIR_MESSAGE}"
 
 
 def _smart_paste_impl(
@@ -509,11 +515,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         clipboard_transfer.TransferError,
     ) as exc:
         code = error_code(exc)
-        notify(
-            f"Paste stopped [{code}]: {exc}; press Cmd+V to retry or run clipboard-paste doctor",
-            pane=args.pane,
-        )
-        runtime_root = _private_runtime(args.runtime_root)
+        public_message = public_error_message(code)
+        notify(public_message, pane=args.pane)
         failure = {
             "schema_version": SCHEMA_VERSION,
             "ok": False,
@@ -522,20 +525,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             "pane": args.pane,
             "client": args.client,
             "error": {"code": code, "message": str(exc)[:240]},
-            "repair": "press Cmd+V to retry or run clipboard-paste doctor",
+            "repair": REPAIR_MESSAGE,
             "finished_at": time.time(),
         }
-        receipt_path = write_receipt(runtime_root, failure)
+        receipt_path: Path | None = None
+        with contextlib.suppress(OSError, SmartPasteError):
+            runtime_root = _private_runtime(args.runtime_root)
+            receipt_path = write_receipt(runtime_root, failure)
+        public_failure = {
+            **failure,
+            "error": {"code": code, "message": public_message},
+            "receipt_path": str(receipt_path) if receipt_path is not None else None,
+        }
         if args.json:
             json.dump(
-                {**failure, "receipt_path": str(receipt_path)},
+                public_failure,
                 sys.stdout,
                 sort_keys=True,
                 separators=(",", ":"),
             )
             sys.stdout.write("\n")
         else:
-            print(f"clipboard-smart-paste: {exc}", file=sys.stderr)
+            print(f"clipboard-smart-paste: {public_message}", file=sys.stderr)
         return 1
     if args.json:
         json.dump(receipt, sys.stdout, sort_keys=True, separators=(",", ":"))
