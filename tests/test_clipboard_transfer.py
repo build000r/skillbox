@@ -229,9 +229,8 @@ class ClipboardTransferClientTests(unittest.TestCase):
         def runner(
             command: object, **kwargs: object
         ) -> subprocess.CompletedProcess[bytes]:
-            stream = kwargs["stdin"]
-            assert hasattr(stream, "read")
-            data = stream.read()
+            data = kwargs["input"]
+            assert isinstance(data, bytes)
             digest = hashlib.sha256(data).hexdigest()
             observed["command"] = command
             observed["data"] = data
@@ -259,6 +258,39 @@ class ClipboardTransferClientTests(unittest.TestCase):
         self.assertEqual(observed["data"], self.path.read_bytes())
         self.assertEqual(observed["command"][0:2], ("ssh", "-o"))
         self.assertEqual(receipt["mode"], "0600")
+
+    def test_path_replacement_after_capture_cannot_change_sent_bytes(self) -> None:
+        original = self.path.read_bytes()
+        replacement = b"different-private-file"
+
+        def runner(
+            command: object, **kwargs: object
+        ) -> subprocess.CompletedProcess[bytes]:
+            self.path.unlink()
+            self.path.write_bytes(replacement)
+            sent = kwargs["input"]
+            self.assertEqual(sent, original)
+            digest = hashlib.sha256(original).hexdigest()
+            receipt = {
+                "schema_version": 1,
+                "ok": True,
+                "path": f"/home/u/.cache/skillbox/paste-artifacts/{digest}.png",
+                "sha256": digest,
+                "byte_size": len(original),
+                "mode": "0600",
+                "reused": False,
+                "cleanup": {
+                    "removed_files": 0,
+                    "removed_bytes": 0,
+                    "remaining_bytes": len(original),
+                },
+            }
+            return subprocess.CompletedProcess(
+                command, 0, json.dumps(receipt).encode(), b""
+            )
+
+        ct.transfer_artifact(self.path, ssh_target="skillbox@devbox", runner=runner)
+        self.assertEqual(self.path.read_bytes(), replacement)
 
     def test_timeout_is_reported_without_retrying(self) -> None:
         def runner(
