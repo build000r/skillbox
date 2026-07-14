@@ -460,11 +460,14 @@ def transfer_artifact(
     if not isinstance(receipt, dict) or set(receipt) != expected_keys:
         raise TransferError("remote receiver returned an unknown receipt schema")
     if (
-        receipt["schema_version"] != SCHEMA_VERSION
+        type(receipt["schema_version"]) is not int
+        or receipt["schema_version"] != SCHEMA_VERSION
         or receipt["ok"] is not True
         or receipt["sha256"] != digest
+        or type(receipt["byte_size"]) is not int
         or receipt["byte_size"] != size
         or receipt["mode"] != "0600"
+        or type(receipt["reused"]) is not bool
         or not isinstance(receipt["path"], str)
         or not receipt["path"].startswith("/")
         or any(ord(char) < 32 for char in receipt["path"])
@@ -483,7 +486,7 @@ def transfer_artifact(
         not isinstance(cleanup, dict)
         or set(cleanup)
         != {"removed_files", "removed_bytes", "remaining_bytes"}
-        or any(not isinstance(value, int) or value < 0 for value in cleanup.values())
+        or any(type(value) is not int or value < 0 for value in cleanup.values())
     ):
         raise TransferError("remote receipt cleanup metadata is invalid")
     return receipt
@@ -540,6 +543,7 @@ def delete_remote_artifact(
     if (
         not isinstance(receipt, dict)
         or set(receipt) != {"schema_version", "ok", "sha256", "removed"}
+        or type(receipt["schema_version"]) is not int
         or receipt["schema_version"] != SCHEMA_VERSION
         or receipt["ok"] is not True
         or receipt["sha256"] != digest
