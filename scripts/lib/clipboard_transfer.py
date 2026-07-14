@@ -107,6 +107,31 @@ def _regular_owned_file(path: Path) -> os.stat_result:
     return info
 
 
+def _open_private_lock(root: Path) -> int:
+    """Open the store lock without accepting a redirected or shared inode."""
+    lock_path = root / ".lock"
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise TransferError("artifact store lock could not be opened safely") from exc
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+        ):
+            raise TransferError(
+                "artifact store lock is not a private single-link regular file"
+            )
+        os.fchmod(fd, 0o600)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def _read_regular_owned_file(
     path: Path, *, max_bytes: int = DEFAULT_MAX_BYTES
 ) -> bytes:
@@ -227,10 +252,8 @@ def delete_artifact(
     path = root / f"{digest}.{extension}"
     if path.parent != root or ARTIFACT_NAME.fullmatch(path.name) is None:
         raise TransferError("artifact path escaped the store")
-    lock_path = root / ".lock"
-    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    lock_fd = _open_private_lock(root)
     try:
-        os.fchmod(lock_fd, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         if not path.exists() and not path.is_symlink():
             removed = False
@@ -273,11 +296,9 @@ def receive_artifact(
     if final.parent != root or ARTIFACT_NAME.fullmatch(final.name) is None:
         raise TransferError("artifact path escaped the store")
 
-    lock_path = root / ".lock"
-    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    lock_fd = _open_private_lock(root)
     tmp_path: Path | None = None
     try:
-        os.fchmod(lock_fd, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         if final.exists() or final.is_symlink():
             _regular_owned_file(final)

@@ -113,6 +113,38 @@ class ClipboardTransferReceiverTests(unittest.TestCase):
         with self.assertRaisesRegex(ct.TransferError, "not a regular file"):
             self.receive(data)
 
+    def test_receiver_refuses_symlink_fifo_and_hardlinked_store_locks(self) -> None:
+        for kind in ("symlink", "fifo", "hardlink"):
+            with self.subTest(kind=kind):
+                root = Path(self.tmp.name) / f"store-{kind}"
+                root.mkdir(mode=0o700)
+                lock = root / ".lock"
+                outside = Path(self.tmp.name) / f"outside-{kind}"
+                if kind == "symlink":
+                    outside.write_bytes(b"outside")
+                    lock.symlink_to(outside)
+                elif kind == "fifo":
+                    os.mkfifo(lock, mode=0o600)
+                else:
+                    outside.write_bytes(b"outside")
+                    os.link(outside, lock)
+
+                with self.assertRaisesRegex(
+                    ct.TransferError,
+                    "lock (could not be opened safely|is not a private)",
+                ):
+                    ct.receive_artifact(
+                        io.BytesIO(b"image"),
+                        expected_sha256=self.digest(b"image"),
+                        expected_size=5,
+                        extension="png",
+                        root=root,
+                    )
+                if outside.exists():
+                    self.assertEqual(outside.read_bytes(), b"outside")
+                self.assertFalse(list(root.glob(".incoming-*")))
+                self.assertFalse(list(root.glob("*.png")))
+
     def test_traversal_and_unsafe_target_are_refused(self) -> None:
         for extension in ("../png", "/tmp/x", "png;id", ""):
             with self.subTest(extension=extension):
