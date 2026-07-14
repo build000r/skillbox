@@ -451,6 +451,15 @@ def inspect_status(
     install_issues = bootstrap.verify_local_install(home)
     installed_manifest = bootstrap.lifecycle_state_dir(home) / "manifest.json"
     installed_version, manifest_error = _read_installed_version(installed_manifest)
+    if installed_manifest.exists() or installed_manifest.is_symlink():
+        try:
+            bootstrap.validate_local_lifecycle(
+                home,
+                root=resolved_root or Path("/"),
+                action="install",
+            )
+        except bootstrap.LifecycleError:
+            manifest_error = "reversible install manifest is invalid or unsafe"
     if manifest_error:
         install_issues.append(manifest_error)
     route_record: dict[str, Any] | None = None

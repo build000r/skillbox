@@ -278,6 +278,62 @@ python 12 user 8u IPv4 0 0t0 TCP *:9999 (LISTEN)
             self.assertEqual(manifest_check["status"], "fail")
             json.loads(status.dump(report))
 
+    def test_tampered_manifest_restore_path_is_a_failing_doctor_check(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            home.mkdir()
+            clipboard_bootstrap.install_local(home, root=ROOT_DIR)
+            manifest = clipboard_bootstrap.lifecycle_state_dir(home) / "manifest.json"
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["baseline"][0]["path"] = str(Path(raw) / "outside")
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            manifest.chmod(0o600)
+
+            report = status.inspect_status(
+                home=home,
+                root=ROOT_DIR,
+                profile="d3",
+                now=1000.0,
+                environment={},
+                listener_runner=lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                    [], 1, "", ""
+                ),
+            )
+            self.assertEqual(report["state"], "configured")
+            self.assertFalse(report["install"]["ready"])
+            manifest_check = next(
+                item for item in report["checks"] if item["id"] == "lifecycle.manifest"
+            )
+            self.assertEqual(manifest_check["status"], "fail")
+
+    def test_symlinked_managed_helper_is_a_failing_doctor_check(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            home.mkdir()
+            clipboard_bootstrap.install_local(home, root=ROOT_DIR)
+            helper = home / ".local" / "bin" / "clipcopy"
+            helper.unlink()
+            outside = Path(raw) / "outside"
+            outside.write_text("outside", encoding="utf-8")
+            helper.symlink_to(outside)
+
+            report = status.inspect_status(
+                home=home,
+                root=ROOT_DIR,
+                profile="d3",
+                now=1000.0,
+                environment={},
+                listener_runner=lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                    [], 1, "", ""
+                ),
+            )
+            self.assertEqual(report["state"], "configured")
+            manifest_check = next(
+                item for item in report["checks"] if item["id"] == "lifecycle.manifest"
+            )
+            self.assertEqual(manifest_check["status"], "fail")
+            self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
+
     def test_current_tmux_pane_auto_resolves_exact_route_to_ready(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             home = Path(raw) / "home"
