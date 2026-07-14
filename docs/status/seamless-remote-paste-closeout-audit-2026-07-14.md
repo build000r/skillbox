@@ -3,7 +3,7 @@
 Verdict: **not eligible for epic closure yet**. The owned core implementation
 is present and the permitted `devbox-1` semantic proof passed, but required
 physical-key, direct d3/mosh, full text-matrix, sample-size, source/install
-parity, fresh committed-clone, cross-platform, and independent-review evidence
+parity, origin-clone, cross-platform, and independent-review evidence
 is incomplete. No open Bead below is silently counted as complete.
 
 Operator boundary: after the explicit restriction, no other remote tmux
@@ -22,11 +22,11 @@ neighboring sessions.
 | Route identity | Tracked d2/d3 launchers, generation-stamped records, exact pane/client checks | Proven by source/tests and `devbox-1` route record |
 | Secure artifact transport | Atomic content-addressed receiver, hash/size/path/mode checks, quota/TTL/dedupe, exact canceled-artifact deletion, private single-link lock validation | Proven by adversarial tests; latest receiver revisions not remote-deployed |
 | Agent adapter | Codex remote readable path decision plus Claude/generic fallback | Proven; live `devbox-1` showed `[Image #1]` and semantic confirmation |
-| Feedback | 500 ms delayed notice, stable errors, retry/doctor, cancel, private receipts | Proven by deterministic tests |
-| Lifecycle | Exact commit `23216b7` was cloned with `--no-local --no-hardlinks` into an empty fixture; install was ready, route state was correctly `ambiguous` without focus, current redaction loaded, no target probe ran, and uninstall left zero files/symlinks | Proven from a fresh local clone; origin/push remains a release gate |
+| Feedback | 500 ms delayed notice, stable path-free public errors, retry/doctor, cancel, private `0600` diagnostic receipts | Proven by deterministic hostile tests |
+| Lifecycle | Exact implementation commit `a6981014e8b505ed519942db73c4989bd92dce14` was cloned with `--no-local --no-hardlinks` into an empty fixture; install was ready, the second install was byte-identical, route state was correctly `ambiguous` without focus, no target probe ran, and uninstall left zero files/symlinks | Proven from a fresh local clone; origin/push remains a release gate |
 | Diagnostics | Live local listener discovery, private modes, route freshness, duplicates, redacted target/session/HOME/receipt output, fail-closed manifest parsing | Proven locally |
 | Partial failure | Remote apply/reversal errors suppress hostile output, state which side may be partial, and print one exact idempotent resume command | Proven with fully stubbed SSH |
-| Focused regression | 176 passed, one opt-in live clipboard observer skipped; Ruff/Bash/diff clean | Proven |
+| Focused regression | 203 passed, one opt-in live clipboard observer skipped; Ruff/Bash/diff clean | Proven |
 | Offline closeout | `20260714T210526Z-smoke`: unit/static/bootstrap PASS; all live rows explicit SKIP | Proven as smoke only |
 | Beads lint | All currently open/deferred plan issues lint with zero warnings | Proven |
 
@@ -41,13 +41,13 @@ neighboring sessions.
 | `.4.4` feedback | Implementation and tests complete | Tracker waits on `.4.3`; close afterward without bypass |
 | `.5.1` owned Codex bridge | BUILD path and live nested Codex attachment | Required SSH/mosh/reconnect/reattach rows and latest receiver deployment |
 | `.5.5` safe degradation | Native text fallback, adapter fallback, typed errors, doctor checks | Tracker waits on `.5.1`; live missing-receiver/reconnect behavior remains to record |
-| `.6.1` one-command bootstrap | Local install and earlier remote receiver install | Latest source receiver must be installed through an explicitly authorized route; repeated current-version remote proof |
-| `.6.2`, `.6.3`, `.6.4` lifecycle/status/docs | Implementation and local evidence complete | Dependency-ordered behind `.6.1`; do not force-close |
-| `.7.2` adversarial proof | Comprehensive deterministic source coverage, including lock inode, manifest, route, receipt, path-race, and failure-log hostility | Dependency-ordered behind `.4.3` and `.5.1`; independent hostile case remains part of final review |
+| `.6.1` one-command bootstrap | Fresh committed clone reaches local ready state; byte-idempotent repeat install | Latest source receiver must be installed through an explicitly authorized route; repeated current-version remote proof |
+| `.6.2`, `.6.3`, `.6.4` lifecycle/status/docs | Fail-closed fixed-path rollback, byte-idempotent reinstall, redacted status/error envelopes, and local evidence complete | Dependency-ordered behind `.6.1`; do not force-close |
+| `.7.2` adversarial proof | Comprehensive deterministic source coverage, including lock inode, lifecycle manifests/backups/destinations, route/receipt schemas, path races, and public-error redaction | Dependency-ordered behind `.4.3` and `.5.1`; independent hostile case remains part of final review |
 | `.7.3` real d3 + devbox-1 | `devbox-1` semantic/hash/clipboard proof | Direct d3 is required and unclaimed |
 | `.7.4` full text matrix | Offline and smoke evidence | Real Ghostty SSH/mosh/nested/direct matrix, without disturbing unrelated sessions |
 | `.7.5` stability/latency | Reconnect generation, concurrency, dedupe, lifecycle tests; two receipt samples | Rollout-size authorized sample and live reconnect/reattach evidence |
-| `.7.6` fresh clone | Exact local clone of `23216b7` reported install-ready/route-ambiguous without focus, loaded current redaction, and uninstalled with zero managed residue | Push, prove origin contains the commits, then clone from origin; remote/fallback rows remain dependency-gated |
+| `.7.6` fresh clone | Exact local clone of `a6981014e8b505ed519942db73c4989bd92dce14` reported install-ready/route-ambiguous without focus, performed a byte-identical second install, made no target probe, and uninstalled with zero files or symlinks | Push, prove origin contains the commits, then clone from origin; remote/fallback rows remain dependency-gated |
 | `.7.7` independent review | This self-audit prepares the packet | A genuinely independent reviewer must verify artifacts after all live rows pass |
 
 ## Expansion Beads
