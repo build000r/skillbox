@@ -109,6 +109,18 @@ class ClipboardBootstrapTests(unittest.TestCase):
         for marker in CB.expected_tmux_fragment_markers():
             self.assertIn(marker, content, msg=marker)
 
+    def test_unregistered_tmux_pane_never_reads_image_clipboard(self) -> None:
+        content = CB.read_tmux_fragment(ROOT_DIR)
+        user199 = next(
+            line for line in content.splitlines() if line.startswith("bind-key -n User199")
+        )
+        user198 = next(
+            line for line in content.splitlines() if line.startswith("bind-key -n User198")
+        )
+        self.assertNotIn("else clipboard-smart-paste", user199)
+        self.assertNotIn("else clipboard-smart-paste", user198)
+        self.assertIn('else tmux send-keys -t "#{pane_id}" -H 16', user198)
+
     def test_clipcopy_client_tty_markers(self) -> None:
         content = (CB.bundle_dir(ROOT_DIR) / "clipcopy").read_text(encoding="utf-8")
         for marker in CB.clipcopy_client_tty_markers():
