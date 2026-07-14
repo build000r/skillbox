@@ -27,6 +27,17 @@ class ClipboardAdapterTests(unittest.TestCase):
         self.assertEqual(result.state, "degraded")
         self.assertEqual(result.strategy, "text_reference")
 
+    def test_unproven_old_codex_version_never_claims_visible_attachment(self) -> None:
+        result = adapter.choose_adapter(
+            agent="codex",
+            agent_version="codex-cli 0.143.9",
+            input_kind="remote_image_path",
+            route_ready=True,
+        )
+        self.assertEqual(result.state, "degraded")
+        self.assertEqual(result.strategy, "text_reference")
+        self.assertFalse(result.visible_attachment)
+
     def test_native_local_and_generic_fallback_contracts(self) -> None:
         native = adapter.choose_adapter(
             agent="codex",

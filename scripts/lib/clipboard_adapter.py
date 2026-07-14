@@ -8,6 +8,7 @@ from typing import Any
 
 
 SCHEMA_VERSION = 1
+MIN_CODEX_PATH_ATTACHMENT_VERSION = (0, 144, 4)
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,17 @@ def choose_adapter(
                 False,
                 input_kind,
                 "Codex version is unknown; use an explicit path reference",
+            )
+        if version < MIN_CODEX_PATH_ATTACHMENT_VERSION:
+            return AdapterDecision(
+                SCHEMA_VERSION,
+                key,
+                agent_version,
+                "degraded",
+                "text_reference",
+                False,
+                input_kind,
+                "Codex is older than the proven remote-path attachment version",
             )
         if native_clipboard and input_kind == "local_image_path":
             return AdapterDecision(
