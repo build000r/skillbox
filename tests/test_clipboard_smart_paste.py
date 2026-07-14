@@ -7,6 +7,8 @@ import json
 import stat
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -315,6 +317,115 @@ class ClipboardSmartPasteTests(unittest.TestCase):
                 },
             )
         self.assertFalse(self.tmux.injections)
+
+    def test_concurrent_panes_cannot_cross_deliver_remote_paths(self) -> None:
+        second_pane = "%2"
+        second_record, second_route = cs.register(
+            profile="d3",
+            transport="mosh",
+            tmux_pane=second_pane,
+            tmux_client=self.client,
+            tmux_server="default",
+            root=self.routes,
+            hosts_path=HOSTS,
+            now=1_000.0,
+            ttl_seconds=10_000_000_000,
+            stamp_tmux=False,
+        )
+        second_generation = str(second_record["generation"])
+        self.tmux.options[(second_pane, cs.TMUX_ROUTE_OPTION)] = str(second_route)
+        self.tmux.options[(second_pane, cs.TMUX_GENERATION_OPTION)] = (
+            second_generation
+        )
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def capture_for(name: str) -> object:
+            path = self.root / f"{name}.png"
+            path.write_bytes(b"\x89PNG\r\n\x1a\n" + name.encode())
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+
+            def capture_fn(**_kwargs: object) -> tuple[ClipboardSnapshot, None]:
+                return (
+                    ClipboardSnapshot(
+                        ok=True,
+                        kind="image",
+                        change_count=7,
+                        byte_size=path.stat().st_size,
+                        mime="image/png",
+                        sha256=digest,
+                        artifact=str(path),
+                    ),
+                    None,
+                )
+
+            return capture_fn
+
+        def transfer(path: Path, **_kwargs: object) -> dict[str, object]:
+            barrier.wait(timeout=2)
+            name = path.stem
+            return {
+                "path": f"/home/skillbox/.cache/skillbox/paste-artifacts/{name}.png",
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "reused": False,
+            }
+
+        def run(
+            pane: str,
+            route_path: Path,
+            generation: str,
+            capture_fn: object,
+        ) -> None:
+            try:
+                sp.smart_paste(
+                    pane=pane,
+                    client=self.client,
+                    route_path=route_path,
+                    generation=generation,
+                    runtime_root=self.runtime,
+                    now=time.time,
+                    capture_fn=capture_fn,  # type: ignore[arg-type]
+                    change_count_fn=lambda: 7,
+                    transfer_fn=transfer,
+                    runner=self.tmux,
+                )
+            except BaseException as exc:  # test captures worker failures
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(
+                target=run,
+                args=(self.pane, self.route_path, self.generation, capture_for("first")),
+            ),
+            threading.Thread(
+                target=run,
+                args=(second_pane, second_route, second_generation, capture_for("second")),
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertFalse(errors)
+        self.assertEqual(
+            set(self.tmux.injections),
+            {
+                (
+                    self.pane,
+                    b"/home/skillbox/.cache/skillbox/paste-artifacts/first.png",
+                    True,
+                ),
+                (
+                    second_pane,
+                    b"/home/skillbox/.cache/skillbox/paste-artifacts/second.png",
+                    True,
+                ),
+            },
+        )
+        self.assertFalse((self.root / "first.png").exists())
+        self.assertFalse((self.root / "second.png").exists())
 
     def test_transfer_failure_prevents_injection(self) -> None:
         def transfer(*_args: object, **_kwargs: object) -> dict[str, object]:
