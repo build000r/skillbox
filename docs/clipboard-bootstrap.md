@@ -188,7 +188,11 @@ route was revalidated; an installed bundle with no exact current route reports
 Target reachability is never implicit: `--probe-target` runs exactly one
 non-interactive `ssh ... true` check, never lists or attaches sessions, and
 reports only `attempted`, `reachable`, and a redacted stable error class under
-`target_probe`.
+`target_probe`. Public status/doctor JSON also replaces the SSH target and
+remote-session label with state labels, shortens the latest receipt to its
+filename, and rewrites absolute operator-HOME prefixes as `~`. A malformed or
+unsafe lifecycle manifest becomes a failing `lifecycle.manifest` check instead
+of a traceback.
 The `agent.adapter` object is also evidence-backed: Codex path attachment is
 reported ready only for the proven minimum `0.144.4` or newer. Older or unknown
 versions degrade to a visible text-reference strategy with an update repair.

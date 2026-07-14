@@ -21,6 +21,7 @@ from . import clipboard_transfer
 
 SCHEMA_VERSION = 1
 LEGACY_CLIPBOARD_PORTS = {6000, 18339}
+MAX_MANIFEST_BYTES = 256 * 1024
 
 
 class ListenerProbeError(RuntimeError):
@@ -108,6 +109,19 @@ def diagnose_facts(facts: Mapping[str, Any]) -> list[dict[str, Any]]:
             else None,
         )
     )
+    manifest_error = bool(facts.get("manifest_error"))
+    checks.append(
+        _check(
+            "lifecycle.manifest",
+            "fail" if manifest_error else "pass",
+            "reversible install manifest is invalid or unsafe"
+            if manifest_error
+            else "reversible install manifest is readable",
+            "restore the private lifecycle manifest from a trusted backup before install, rollback, or uninstall"
+            if manifest_error
+            else None,
+        )
+    )
     bridge = facts.get("legacy_bridge", {})
     for key, message, repair in (
         (
@@ -156,17 +170,64 @@ def classify_state(
 ) -> str:
     if unsupported:
         return "unsupported"
+    if install_issues:
+        return "configured" if installed else "degraded"
     if ambiguous:
         return "ambiguous"
     if stale:
         return "stale"
     if offline:
         return "offline"
-    if install_issues:
-        return "configured" if installed else "degraded"
     if failed_checks:
         return "degraded"
     return "ready"
+
+
+def _read_installed_version(path: Path) -> tuple[str | None, str | None]:
+    """Read the private lifecycle manifest without following or racing its path."""
+    if not path.exists() and not path.is_symlink():
+        return None, None
+    try:
+        before = path.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_size > MAX_MANIFEST_BYTES
+        ):
+            raise ValueError("unsafe manifest inode")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            after = os.fstat(fd)
+            if (
+                not stat.S_ISREG(after.st_mode)
+                or after.st_uid != os.getuid()
+                or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            ):
+                raise ValueError("manifest changed during open")
+            chunks: list[bytes] = []
+            total = 0
+            while chunk := os.read(fd, min(64 * 1024, MAX_MANIFEST_BYTES + 1 - total)):
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > MAX_MANIFEST_BYTES:
+                    raise ValueError("manifest is oversized")
+        finally:
+            os.close(fd)
+        payload = json.loads(b"".join(chunks).decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("manifest root is not an object")
+        version = payload.get("installed_version")
+        if version is not None and not isinstance(version, str):
+            raise ValueError("manifest version has the wrong type")
+        return version, None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None, "reversible install manifest is invalid or unsafe"
+
+
+def _redact_home(value: str | None, home: Path) -> str | None:
+    if value is None:
+        return None
+    return value.replace(str(home), "~")
 
 
 def collect_clipboard_listeners(
@@ -388,6 +449,10 @@ def inspect_status(
     now = time.time() if now is None else now
     environment = os.environ if environment is None else environment
     install_issues = bootstrap.verify_local_install(home)
+    installed_manifest = bootstrap.lifecycle_state_dir(home) / "manifest.json"
+    installed_version, manifest_error = _read_installed_version(installed_manifest)
+    if manifest_error:
+        install_issues.append(manifest_error)
     route_record: dict[str, Any] | None = None
     route_error: str | None = None
     route_stale = False
@@ -442,6 +507,7 @@ def inspect_status(
         "private_paths": _private_file_facts(home),
         "route_stale": route_stale,
         "duplicate_tmux_features": _tmux_duplicate_count(home),
+        "manifest_error": manifest_error,
         "legacy_bridge": {},
     }
     checks = diagnose_facts(facts)
@@ -481,12 +547,6 @@ def inspect_status(
         if receipts.is_dir()
         else None
     )
-    installed_manifest = bootstrap.lifecycle_state_dir(home) / "manifest.json"
-    installed_version = None
-    if installed_manifest.is_file():
-        installed_version = json.loads(
-            installed_manifest.read_text(encoding="utf-8")
-        ).get("installed_version")
     version = (
         bootstrap.bundle_revision(resolved_root, home)
         if resolved_root is not None
@@ -497,17 +557,20 @@ def inspect_status(
         "state": state,
         "version": version,
         "profile": profile_record["profile"],
-        "target": profile_record.get("ssh_target"),
+        "target": "configured" if profile_record.get("ssh_target") else None,
         "target_probe": target_probe,
-        "install": {"ready": not install_issues, "issues": install_issues},
+        "install": {
+            "ready": not install_issues,
+            "issues": [_redact_home(issue, home) for issue in install_issues],
+        },
         "route": {
             "ready": route_record is not None,
             "route_id": route_record.get("route_id") if route_record else None,
             "generation": route_record.get("generation") if route_record else None,
-            "remote_session": route_record.get("remote_session")
-            if route_record
+            "remote_session": "registered"
+            if route_record and route_record.get("remote_session")
             else None,
-            "error": route_error,
+            "error": _redact_home(route_error, home),
         },
         "capabilities": profile_record["capabilities"],
         "fallback": fallback,
@@ -516,9 +579,9 @@ def inspect_status(
             "adapter": adapter.public_dict(),
         },
         "checks": checks,
-        "last_receipt": str(latest) if latest else None,
+        "last_receipt": latest.name if latest else None,
         "generated_at": now,
-        "redaction": "clipboard bytes, text, tokens, and credentials omitted",
+        "redaction": "clipboard bytes, text, tokens, credentials, absolute home paths, targets, and session labels omitted",
     }
 
 
