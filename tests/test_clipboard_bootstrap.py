@@ -176,6 +176,64 @@ class ClipboardBootstrapTests(unittest.TestCase):
         self.assertIn("no local or remote changes", stderr.getvalue())
         resolve_remote.assert_not_called()
 
+    def test_remote_apply_failure_is_redacted_and_has_exact_resume(self) -> None:
+        from lib import clipboard_bootstrap_cli as CLI
+
+        secret = "/home/remote/private/bootstrap-token"
+        failed = subprocess.CompletedProcess(
+            [], 255, stdout=b"hostile stdout secret", stderr=f"Permission denied {secret}".encode()
+        )
+        with (
+            mock.patch.object(
+                CLI,
+                "_resolve_remote_target",
+                return_value=("d3", "skillbox@fixture"),
+            ),
+            mock.patch.object(
+                CLI,
+                "resolve_profile",
+                return_value={"profile": "d3", "transport": "ssh"},
+            ),
+            mock.patch.object(CLI, "apply_remote_via_ssh", return_value=failed),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            code = CLI._apply_remote(ROOT_DIR, "d3", None)  # noqa: SLF001
+        self.assertEqual(code, 255)
+        self.assertEqual(stdout.getvalue(), "")
+        report = stderr.getvalue()
+        self.assertIn("class=authentication_failed", report)
+        self.assertIn(
+            "resume: scripts/clipboard-bootstrap --profile d3 --apply-remote",
+            report,
+        )
+        self.assertIn("remote state may be partial", report)
+        self.assertNotIn(secret, report)
+        self.assertNotIn("hostile stdout", report)
+
+    def test_remote_reversal_failure_does_not_start_local_reversal(self) -> None:
+        from lib import clipboard_bootstrap_cli as CLI
+
+        failed = subprocess.CompletedProcess(
+            [], 23, stdout=b"", stderr=b"connection refused at private target"
+        )
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            code = CLI._report_remote_failure(  # noqa: SLF001
+                failed,
+                action="rollback",
+                profile="generic",
+                target="user@example",
+            )
+        self.assertEqual(code, 23)
+        report = stderr.getvalue()
+        self.assertIn("class=target_unreachable", report)
+        self.assertIn("local reversal was not started", report)
+        self.assertIn(
+            "resume: scripts/clipboard-bootstrap rollback --profile generic --target user@example --apply-remote",
+            report,
+        )
+        self.assertNotIn("private target", report)
+
     def test_install_uninstall_restores_owned_files_byte_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir) / "home"

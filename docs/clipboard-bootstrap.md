@@ -166,6 +166,13 @@ scripts/clipboard-bootstrap --target skillbox@my-host --dry-run
 scripts/clipboard-closeout.sh
 ```
 
+If a remote apply, rollback, or uninstall exits nonzero, the CLI suppresses raw
+remote output, prints a stable failure class, states which side was not
+reversed, and prints the exact command to resume. Re-running the command is the
+supported recovery path: both local and remote owned-file operations are
+idempotent, and a failed remote apply may have completed only part of its
+remote file sequence.
+
 Status and lifecycle:
 
 ```bash

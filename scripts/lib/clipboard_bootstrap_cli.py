@@ -119,6 +119,64 @@ def _resolve_remote_target(
     return key, resolved.get("ssh_target") or target or ""
 
 
+def _remote_failure_class(stderr: bytes) -> str:
+    message = stderr.decode("utf-8", errors="replace").lower()
+    if "permission denied" in message or "authentication" in message:
+        return "authentication_failed"
+    if "timed out" in message or "timeout" in message:
+        return "timeout"
+    if "could not resolve" in message or "name or service not known" in message:
+        return "target_unresolved"
+    if "connection refused" in message or "no route to host" in message:
+        return "target_unreachable"
+    return "remote_command_failed"
+
+
+def _resume_command(action: str, profile: str, target: str | None) -> str:
+    parts = ["scripts/clipboard-bootstrap"]
+    if action != "install":
+        parts.append(action)
+    parts.extend(("--profile", profile))
+    if target:
+        parts.extend(("--target", target))
+    parts.append("--apply-remote")
+    return " ".join(parts)
+
+
+def _report_remote_failure(
+    proc: object,
+    *,
+    action: str,
+    profile: str,
+    target: str | None,
+) -> int:
+    returncode = int(getattr(proc, "returncode"))
+    stderr = bytes(getattr(proc, "stderr", b""))
+    print(
+        "clipboard-bootstrap: "
+        f"remote {action} failed class={_remote_failure_class(stderr)} "
+        f"exit={returncode}",
+        file=sys.stderr,
+    )
+    if action == "install":
+        print(
+            "clipboard-bootstrap: local prerequisite remains installed; "
+            "remote state may be partial",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "clipboard-bootstrap: local reversal was not started; "
+            "remote state may be partial",
+            file=sys.stderr,
+        )
+    print(
+        "clipboard-bootstrap: resume: " + _resume_command(action, profile, target),
+        file=sys.stderr,
+    )
+    return returncode
+
+
 def _apply_remote(root: Path, profile: str, target: str | None) -> int:
     _profile_key, ssh_target = _resolve_remote_target(
         profile, target, root, live_probe=True
@@ -138,9 +196,9 @@ def _apply_remote(root: Path, profile: str, target: str | None) -> int:
     transport = resolved_apply.get("transport", "ssh")
     proc = apply_remote_via_ssh(ssh_target, root=root, transport=transport)
     if proc.returncode != 0:
-        print(proc.stdout.decode("utf-8", errors="replace"), end="")
-        print(proc.stderr.decode("utf-8", errors="replace"), end="", file=sys.stderr)
-        return proc.returncode
+        return _report_remote_failure(
+            proc, action="install", profile=profile, target=target
+        )
     print(proc.stdout.decode("utf-8", errors="replace"), end="")
     return 0
 
@@ -190,12 +248,9 @@ def main(argv: list[str] | None = None) -> int:
                 ssh_target, transport=resolved.get("transport", "ssh")
             )
             if proc.returncode != 0:
-                print(
-                    proc.stderr.decode("utf-8", errors="replace"),
-                    end="",
-                    file=sys.stderr,
+                return _report_remote_failure(
+                    proc, action="uninstall", profile=profile, target=target
                 )
-                return proc.returncode
             print(proc.stdout.decode("utf-8", errors="replace"), end="")
         result = uninstall_local(Path.home())
         print(
@@ -222,12 +277,9 @@ def main(argv: list[str] | None = None) -> int:
                 ssh_target, rollback=True, transport=resolved.get("transport", "ssh")
             )
             if proc.returncode != 0:
-                print(
-                    proc.stderr.decode("utf-8", errors="replace"),
-                    end="",
-                    file=sys.stderr,
+                return _report_remote_failure(
+                    proc, action="rollback", profile=profile, target=target
                 )
-                return proc.returncode
             print(proc.stdout.decode("utf-8", errors="replace"), end="")
         try:
             result = rollback_local(Path.home())
