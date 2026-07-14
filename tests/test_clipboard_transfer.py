@@ -389,6 +389,48 @@ class ClipboardTransferClientTests(unittest.TestCase):
                 ),
             )
 
+    def test_receipt_rejects_bool_as_integer_and_non_bool_reuse(self) -> None:
+        digest = hashlib.sha256(self.path.read_bytes()).hexdigest()
+        base = {
+            "schema_version": 1,
+            "ok": True,
+            "path": f"/home/u/.cache/skillbox/paste-artifacts/{digest}.png",
+            "sha256": digest,
+            "byte_size": self.path.stat().st_size,
+            "mode": "0600",
+            "reused": False,
+            "cleanup": {
+                "removed_files": 0,
+                "removed_bytes": 0,
+                "remaining_bytes": self.path.stat().st_size,
+            },
+        }
+
+        for field, value in (
+            ("schema_version", True),
+            ("byte_size", True),
+            ("reused", 0),
+            ("cleanup.removed_files", False),
+        ):
+            with self.subTest(field=field):
+                payload = json.loads(json.dumps(base))
+                if field.startswith("cleanup."):
+                    payload["cleanup"][field.split(".", 1)[1]] = value
+                else:
+                    payload[field] = value
+
+                def runner(
+                    command: object, **_kwargs: object
+                ) -> subprocess.CompletedProcess[bytes]:
+                    return subprocess.CompletedProcess(
+                        command, 0, json.dumps(payload).encode(), b""
+                    )
+
+                with self.assertRaises(ct.TransferError):
+                    ct.transfer_artifact(
+                        self.path, ssh_target="devbox", runner=runner
+                    )
+
     def test_receiver_cli_cleans_partial_stream_after_cancellation(self) -> None:
         digest = hashlib.sha256(b"complete").hexdigest()
         code = ct.main(
