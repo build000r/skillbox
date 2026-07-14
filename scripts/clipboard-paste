@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Status, doctor, and explain surface for Skillbox seamless paste."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+INSTALLED_LIB = Path.home() / ".local" / "share" / "skillbox" / "python"
+for candidate in (INSTALLED_LIB, SCRIPT_DIR):
+    try:
+        sys.path.remove(str(candidate))
+    except ValueError:
+        pass
+    sys.path.insert(0, str(candidate))
+
+from lib import clipboard_status
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("status", "doctor", "explain"), nargs="?", default="status")
+    parser.add_argument("--profile", default="d3")
+    parser.add_argument("--route-path", type=Path)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+    try:
+        report = clipboard_status.inspect_status(profile=args.profile, route_path=args.route_path)
+    except (OSError, ValueError) as exc:
+        print(f"clipboard-paste: {exc}", file=sys.stderr)
+        return 1
+    if args.command == "explain":
+        output = report["fallback"]
+        print(clipboard_status.dump(output) if args.json else "\n".join(output["evidence"] + output["risks"]))
+    else:
+        print(clipboard_status.dump(report) if args.json else clipboard_status.render_text(report))
+    if args.command == "doctor":
+        return 1 if any(item["status"] == "fail" for item in report["checks"]) else 0
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

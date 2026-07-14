@@ -52,12 +52,16 @@ class ClipboardBootstrapTests(unittest.TestCase):
         self.assertEqual(resolved["ssh_target"], "worker@conference1-wsl")
 
     def test_default_shell_probe_uses_subprocess(self) -> None:
-        with mock.patch.object(subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
+        with mock.patch.object(
+            subprocess, "run", return_value=mock.Mock(returncode=0)
+        ) as run:
             self.assertTrue(CB.default_shell_probe("ssh host true"))
             run.assert_called_once()
 
     def test_conference_plan_dry_run_uses_static_target(self) -> None:
-        plan = CB.plan_remote_bootstrap("conference1", dry_run=True, root=ROOT_DIR, live_probe=False)
+        plan = CB.plan_remote_bootstrap(
+            "conference1", dry_run=True, root=ROOT_DIR, live_probe=False
+        )
         self.assertEqual(plan.ssh_target, "worker@conference1-wsl")
 
     def test_conference_plan_live_probe_uses_routed_target(self) -> None:
@@ -121,8 +125,105 @@ class ClipboardBootstrapTests(unittest.TestCase):
             CB.install_local(home, dry_run=False, root=ROOT_DIR)
             self.assertTrue(CB.is_idempotent_reinstall(home, root=ROOT_DIR))
             tmux_conf = home / ".tmux.conf"
-            lines = [line for line in tmux_conf.read_text(encoding="utf-8").splitlines() if CB.TMUX_MARKER in line]
+            lines = [
+                line
+                for line in tmux_conf.read_text(encoding="utf-8").splitlines()
+                if CB.TMUX_MARKER in line
+            ]
             self.assertEqual(len(lines), 1)
+
+    def test_install_uninstall_restores_owned_files_byte_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            original_tmux = b"set -g mouse on\n"
+            original_ghostty = b"font-size = 13\n"
+            original_d2 = b"#!/bin/sh\necho legacy-d2\n"
+            (home / ".tmux.conf").write_bytes(original_tmux)
+            ghostty = CB.ghostty_conf_path(home)
+            ghostty.parent.mkdir(parents=True)
+            ghostty.write_bytes(original_ghostty)
+            d2 = home / ".local" / "bin" / "d2"
+            d2.parent.mkdir(parents=True)
+            d2.write_bytes(original_d2)
+            d2.chmod(0o755)
+
+            CB.install_local(home, root=ROOT_DIR)
+            cache = CB.installed_python_dir(home) / "__pycache__"
+            cache.mkdir()
+            (cache / "clipboard_route.cpython-312.pyc").write_bytes(b"owned")
+            (cache / "unrelated.cpython-312.pyc").write_bytes(b"preserve")
+            result = CB.uninstall_local(home)
+
+            self.assertTrue(result["changed"])
+            self.assertEqual((home / ".tmux.conf").read_bytes(), original_tmux)
+            self.assertEqual(ghostty.read_bytes(), original_ghostty)
+            self.assertEqual(d2.read_bytes(), original_d2)
+            self.assertFalse((cache / "clipboard_route.cpython-312.pyc").exists())
+            self.assertEqual(
+                (cache / "unrelated.cpython-312.pyc").read_bytes(), b"preserve"
+            )
+            self.assertFalse(CB.lifecycle_state_dir(home).exists())
+
+    def test_uninstall_removes_empty_owned_python_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            CB.install_local(home, root=ROOT_DIR)
+            cache = CB.installed_python_dir(home) / "__pycache__"
+            cache.mkdir()
+            for name in CB.LOCAL_PYTHON_MODULES:
+                (cache / f"{Path(name).stem}.cpython-312.pyc").write_bytes(b"owned")
+            CB.uninstall_local(home)
+            self.assertFalse(cache.exists())
+
+    def test_uninstall_preserves_user_config_added_after_install(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            CB.install_local(home, root=ROOT_DIR)
+            tmux_conf = home / ".tmux.conf"
+            ghostty = CB.ghostty_conf_path(home)
+            tmux_conf.write_text(tmux_conf.read_text() + "set -g status off\n")
+            ghostty.write_text(ghostty.read_text() + "font-size = 14\n")
+
+            CB.uninstall_local(home)
+
+            self.assertEqual(tmux_conf.read_text(), "set -g status off\n")
+            self.assertEqual(ghostty.read_text(), "font-size = 14\n")
+
+    def test_install_migrates_legacy_ghostty_include_without_duplication(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            legacy = CB.legacy_ghostty_conf_path(home)
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text(
+                f"font-size = 12\n\n{CB.GHOSTTY_COMMENT}\n{CB.ghostty_source_line(home)}\n"
+            )
+
+            CB.install_local(home, root=ROOT_DIR)
+
+            self.assertEqual(legacy.read_text(), "font-size = 12\n")
+            current = CB.ghostty_conf_path(home)
+            self.assertEqual(current.read_text().count(CB.ghostty_source_line(home)), 1)
+            CB.uninstall_local(home)
+            self.assertIn(CB.GHOSTTY_COMMENT, legacy.read_text())
+
+    def test_upgrade_creates_one_step_rollback_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            CB.install_local(home, root=ROOT_DIR)
+            helper = home / ".local" / "bin" / "clipboard-route"
+            prior = helper.read_bytes()
+            helper.write_bytes(b"prior pinned helper\n")
+
+            CB.install_local(home, root=ROOT_DIR)
+            self.assertEqual(helper.read_bytes(), prior)
+            rollback = CB.rollback_local(home)
+            self.assertTrue(rollback["ok"])
+            self.assertEqual(helper.read_bytes(), b"prior pinned helper\n")
 
     def test_plan_remote_bootstrap_steps(self) -> None:
         plan = CB.plan_remote_bootstrap("d3", dry_run=True, root=ROOT_DIR)
@@ -134,9 +235,14 @@ class ClipboardBootstrapTests(unittest.TestCase):
 
     def test_clipimg_put_conference_target_is_direct_wsl(self) -> None:
         content = (CB.bundle_dir(ROOT_DIR) / "clipimg-put").read_text(encoding="utf-8")
-        self.assertIn("worker@conference1-wsl", content)
-        self.assertIn("OSC52-capable", content)
-        self.assertNotIn("conference1-ssh WSL Ubuntu", content)
+        hosts = CB.load_hosts(ROOT_DIR)
+        route = CB.resolve_profile(
+            CB.resolve_clipimg_alias("c", hosts=hosts), hosts=hosts
+        )
+        self.assertEqual(route["ssh_target"], "worker@conference1-wsl")
+        self.assertIn("clipboard-route", content)
+        self.assertIn("direct WSL is preferred", content)
+        self.assertNotIn('case "$target_arg"', content)
 
     def test_bootstrap_cli_help_exits_zero(self) -> None:
         proc = subprocess.run(
@@ -189,29 +295,112 @@ class ClipboardBootstrapTests(unittest.TestCase):
             result = CB.run_remote_install(home, root=ROOT_DIR, env=env)
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             self.assertTrue((home / ".local" / "bin" / "clipcopy").is_file())
-            self.assertTrue((home / ".config" / "skillbox" / "clipboard.tmux.conf").is_file())
+            self.assertTrue(
+                (home / ".local" / "bin" / "clipboard-artifact-receive").is_file()
+            )
+            self.assertTrue(
+                (
+                    home
+                    / ".local"
+                    / "share"
+                    / "skillbox"
+                    / "python"
+                    / "lib"
+                    / "clipboard_transfer.py"
+                ).is_file()
+            )
+            self.assertTrue(
+                (home / ".config" / "skillbox" / "clipboard.tmux.conf").is_file()
+            )
             verify = subprocess.run(
                 ["infocmp", "-x", "xterm-ghostty"],
-                env={**os.environ, "HOME": str(home), "TERMINFO": str(home / ".terminfo")},
+                env={
+                    **os.environ,
+                    "HOME": str(home),
+                    "TERMINFO": str(home / ".terminfo"),
+                },
                 capture_output=True,
                 text=True,
                 check=False,
             )
             self.assertEqual(verify.returncode, 0, msg=verify.stderr)
 
+    def test_remote_receiver_is_runnable_from_fresh_fixture_home(self) -> None:
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            result = CB.run_remote_install(home, root=ROOT_DIR)
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            payload = b"\x89PNG\r\n\x1a\nremote-fixture"
+            digest = hashlib.sha256(payload).hexdigest()
+            receiver = home / ".local" / "bin" / "clipboard-artifact-receive"
+            receive = subprocess.run(
+                [
+                    str(receiver),
+                    "put",
+                    "--sha256",
+                    digest,
+                    "--size",
+                    str(len(payload)),
+                    "--extension",
+                    "png",
+                ],
+                input=payload,
+                env={**os.environ, "HOME": str(home)},
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(receive.returncode, 0, msg=receive.stderr.decode())
+            self.assertIn(digest.encode(), receive.stdout)
+
+    def test_remote_install_uninstall_restores_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            helper = home / ".local" / "bin" / "clipcopy"
+            helper.parent.mkdir(parents=True)
+            helper.write_bytes(b"legacy remote helper\n")
+            helper.chmod(0o755)
+            tmux_conf = home / ".tmux.conf"
+            tmux_conf.write_bytes(b"set -g mouse on\n")
+            installed = CB.run_remote_install(home, root=ROOT_DIR)
+            self.assertEqual(installed.returncode, 0, msg=installed.stderr)
+
+            restored = subprocess.run(
+                ["bash", "-s"],
+                input=CB.remote_restore_script(),
+                env={**os.environ, "HOME": str(home)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(restored.returncode, 0, msg=restored.stderr)
+            self.assertEqual(helper.read_bytes(), b"legacy remote helper\n")
+            self.assertEqual(tmux_conf.read_bytes(), b"set -g mouse on\n")
+            self.assertFalse(
+                (home / ".local" / "bin" / "clipboard-artifact-receive").exists()
+            )
+            self.assertFalse(home.joinpath(CB.STATE_SUBDIR).exists())
+
     def test_apply_remote_via_ssh_invokes_ssh_runner(self) -> None:
         calls: list[list[str]] = []
 
         def fake_runner(argv, **kwargs):  # type: ignore[no-untyped-def]
             calls.append(list(argv))
-            return subprocess.CompletedProcess(argv, 0, stdout=b"skillbox clipboard bootstrap: ok\n", stderr=b"")
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=b"skillbox clipboard bootstrap: ok\n", stderr=b""
+            )
 
-        proc = CB.apply_remote_via_ssh("skillbox@example", root=ROOT_DIR, runner=fake_runner)
+        proc = CB.apply_remote_via_ssh(
+            "skillbox@example", root=ROOT_DIR, runner=fake_runner
+        )
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(len(calls), 1)
         self.assertIn("ssh", calls[0])
         self.assertIn("skillbox@example", calls[0])
-        self.assertTrue(any(arg.startswith("SKILLBOX_CLIPBOARD_BUNDLE_B64=") for arg in calls[0]))
+        self.assertTrue(
+            any(arg.startswith("SKILLBOX_CLIPBOARD_BUNDLE_B64=") for arg in calls[0])
+        )
 
     def test_apply_remote_via_ssh_wsl_transport(self) -> None:
         calls: list[list[str]] = []
@@ -220,10 +409,26 @@ class ClipboardBootstrapTests(unittest.TestCase):
             calls.append(list(argv))
             return subprocess.CompletedProcess(argv, 0, stdout=b"ok\n", stderr=b"")
 
-        CB.apply_remote_via_ssh("conference1-ssh", root=ROOT_DIR, transport="wsl", runner=fake_runner)
+        CB.apply_remote_via_ssh(
+            "conference1-ssh", root=ROOT_DIR, transport="wsl", runner=fake_runner
+        )
         self.assertEqual(len(calls), 1)
         self.assertTrue(any("wsl -d" in arg for arg in calls[0]))
-        self.assertTrue(any("SKILLBOX_CLIPBOARD_BUNDLE_B64=" in arg for arg in calls[0]))
+        self.assertTrue(
+            any("SKILLBOX_CLIPBOARD_BUNDLE_B64=" in arg for arg in calls[0])
+        )
+
+    def test_apply_remote_restore_via_ssh_uses_owned_restore_script(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_runner(argv, **kwargs):  # type: ignore[no-untyped-def]
+            calls.append(list(argv))
+            self.assertIn(b"baseline", kwargs["input"])
+            return subprocess.CompletedProcess(argv, 0, stdout=b"ok\n", stderr=b"")
+
+        result = CB.apply_remote_restore_via_ssh("skillbox@example", runner=fake_runner)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("skillbox@example", calls[0])
 
     def test_run_remote_install_writes_valid_tmux_source_line(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -274,7 +479,9 @@ class ClipboardBootstrapTests(unittest.TestCase):
             self.assertEqual(len(source_lines), 1)
             self.assertNotIn("if-shell [", content)
 
-    def test_run_remote_install_repairs_malformed_block_preserves_following_config(self) -> None:
+    def test_run_remote_install_repairs_malformed_block_preserves_following_config(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir) / "home"
             home.mkdir()
@@ -370,7 +577,9 @@ class ClipboardBootstrapTests(unittest.TestCase):
     def test_shell_syntax_clipboard_helpers(self) -> None:
         for name in ("clipcopy", "clippaste", "pbcopy", "clipimg-put"):
             path = CB.bundle_dir(ROOT_DIR) / name
-            proc = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True, check=False)
+            proc = subprocess.run(
+                ["bash", "-n", str(path)], capture_output=True, text=True, check=False
+            )
             self.assertEqual(proc.returncode, 0, msg=f"{name}: {proc.stderr}")
 
     def test_make_bundle_tar_contains_helpers(self) -> None:
@@ -380,7 +589,19 @@ class ClipboardBootstrapTests(unittest.TestCase):
         archive = CB.make_bundle_tar(ROOT_DIR)
         with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
             names = {member.name for member in tar.getmembers()}
-        self.assertTrue({"clipcopy", "clippaste", "pbcopy", "tmux.conf", CB.TERMINFO_BUNDLE_NAME}.issubset(names))
+        self.assertTrue(
+            {
+                "clipcopy",
+                "clippaste",
+                "pbcopy",
+                "tmux.conf",
+                CB.TERMINFO_BUNDLE_NAME,
+                "clipboard-artifact-receive",
+                "lib/__init__.py",
+                "lib/clipboard_transfer.py",
+                "VERSION",
+            }.issubset(names)
+        )
 
 
 def shutil_which(cmd: str) -> str | None:

@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""Paste text or a remote image attachment path into one captured tmux pane."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+INSTALLED_LIB = Path.home() / ".local" / "share" / "skillbox" / "python"
+for candidate in (INSTALLED_LIB, SCRIPT_DIR):
+    try:
+        sys.path.remove(str(candidate))
+    except ValueError:
+        pass
+    sys.path.insert(0, str(candidate))
+
+from lib.clipboard_smart_paste import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
