@@ -67,6 +67,24 @@ class ClipboardRouteTests(unittest.TestCase):
         self.assertEqual(route["ssh_target"], "me@example.test")
         self.assertFalse(cr.capability(route, "smart_path_paste"))
 
+    def test_unsafe_tracked_and_dynamic_ssh_targets_fail_before_spawn(self) -> None:
+        for target in (
+            "-oProxyCommand=id",
+            "host;id",
+            "host name",
+            "user@host/path",
+            "user@@host",
+        ):
+            with self.subTest(target=target), self.assertRaisesRegex(
+                cr.HostConfigError, "unsafe ssh_target"
+            ):
+                cr.resolve_profile("generic", data=self.data, target=target)
+
+        tracked = copy.deepcopy(self.data)
+        tracked["profiles"]["d3"]["ssh_target"] = "host;id"
+        with self.assertRaisesRegex(cr.HostConfigError, "unsafe ssh_target"):
+            cr.validate_host_config(tracked)
+
     def test_unknown_alias_and_contradictory_config_fail(self) -> None:
         with self.assertRaises(cr.HostConfigError):
             cr.resolve_profile("not-a-real-profile", data=self.data)

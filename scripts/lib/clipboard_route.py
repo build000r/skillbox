@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -15,10 +16,17 @@ CAPABILITY_KEYS = (
 BROKER_STRATEGIES = {"local", "negotiated", "none"}
 DISPLAY_STRATEGIES = {"native", "xvfb", "none"}
 TRUST_LEVELS = {"local", "allowlisted", "explicit", "unsupported"}
+SAFE_SSH_TARGET = re.compile(r"^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9._-]+$")
 
 
 class HostConfigError(ValueError):
     """Raised when tracked host routing is ambiguous or contradictory."""
+
+
+def validate_ssh_target(target: str) -> str:
+    if target.startswith("-") or SAFE_SSH_TARGET.fullmatch(target) is None:
+        raise HostConfigError("unsafe ssh_target")
+    return target
 
 
 def load_host_config(path: Path) -> dict[str, Any]:
@@ -66,8 +74,14 @@ def validate_host_config(data: dict[str, Any]) -> None:
             )
         target = raw.get("ssh_target")
         if target:
-            if not isinstance(target, str) or any(char in target for char in "\r\n\t|"):
+            if not isinstance(target, str):
                 raise HostConfigError(f"profile {name!r} has unsafe ssh_target")
+            try:
+                validate_ssh_target(target)
+            except HostConfigError as exc:
+                raise HostConfigError(
+                    f"profile {name!r} has unsafe ssh_target"
+                ) from exc
             previous = ssh_targets.get(target)
             if previous and not raw.get("shares_target_with") == previous:
                 raise HostConfigError(
@@ -117,7 +131,7 @@ def resolve_profile(
     }
     entry["profile"] = key
     if target:
-        entry["ssh_target"] = target
+        entry["ssh_target"] = validate_ssh_target(target)
     if entry.get("dynamic_target") and not entry.get("ssh_target"):
         raise HostConfigError(f"profile {key!r} requires an explicit target")
     if key == "generic" and not entry.get("ssh_target"):
