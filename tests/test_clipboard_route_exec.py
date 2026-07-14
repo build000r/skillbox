@@ -72,6 +72,46 @@ class ClipboardRouteExecTests(unittest.TestCase):
             },
         )
 
+    def test_tmux_identity_waits_for_new_client_without_guessing(self) -> None:
+        with (
+            mock.patch.object(
+                route_exec,
+                "_tmux_value",
+                side_effect=[
+                    route_exec.RouteExecError("tmux did not report #{client_name}"),
+                    "/dev/ttys888",
+                    "/private/tmp/tmux-test/default",
+                ],
+            ) as tmux_value,
+            mock.patch.object(route_exec.time, "sleep") as sleep,
+        ):
+            identity = route_exec.identity_from_environment(
+                {"TMUX": "/private/tmp/tmux-test/default,1,0", "TMUX_PANE": "%43"}
+            )
+        self.assertEqual(identity["tmux_client"], "/dev/ttys888")
+        self.assertEqual(tmux_value.call_args_list[0].args, ("%43", "#{client_name}"))
+        self.assertEqual(tmux_value.call_args_list[1].args, ("%43", "#{client_name}"))
+        sleep.assert_called_once_with(0.05)
+
+    def test_tmux_identity_fails_closed_after_bounded_client_wait(self) -> None:
+        with (
+            mock.patch.object(
+                route_exec,
+                "_tmux_value",
+                side_effect=route_exec.RouteExecError("client unavailable"),
+            ) as tmux_value,
+            mock.patch.object(route_exec.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(route_exec.RouteExecError, "client unavailable"):
+                route_exec.identity_from_environment(
+                    {
+                        "TMUX": "/private/tmp/tmux-test/default,1,0",
+                        "TMUX_PANE": "%44",
+                    }
+                )
+        self.assertEqual(tmux_value.call_count, 20)
+        self.assertEqual(sleep.call_count, 19)
+
     def test_identity_without_tmux_or_terminal_fails_closed(self) -> None:
         with self.assertRaisesRegex(route_exec.RouteExecError, "no stable"):
             route_exec.identity_from_environment({})
