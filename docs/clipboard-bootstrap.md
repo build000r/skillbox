@@ -177,6 +177,11 @@ scripts/clipboard-bootstrap uninstall
 scripts/clipboard-bootstrap uninstall --profile d3 --apply-remote
 ```
 
+Inside tmux, the status command resolves the current pane, attached client,
+route path, and generation automatically. `ready` therefore means an exact
+route was revalidated; an installed bundle with no exact current route reports
+`ambiguous` and recommends relaunching through `d2` or `d3`.
+
 `clipboard-metrics` requires 20 successful samples before it calls a latency
 distribution rollout-grade. A smaller set remains diagnostic evidence only.
 
