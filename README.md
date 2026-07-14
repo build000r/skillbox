@@ -33,18 +33,40 @@ Cautious? Append `--dry-run` to see the full plan before anything runs.
 
 ### Seamless image paste
 
-To paste a copied Mac image into an existing remote Codex session with the same
-`Cmd+V` or `Ctrl+V` you already use, install the reversible local + d3 bundle
-once:
+On the operator Mac, install the reversible local + d3 bundle once from this
+checkout:
 
 ```bash
+# Preview only; no remote writes.
+scripts/clipboard-bootstrap --profile d3 --dry-run
+
+# Install the local router and remote receiver.
 scripts/clipboard-bootstrap --profile d3 --apply-remote
 ```
 
-Then copy an image, focus the `d2`/`d3` pane, and paste. There is no helper
-command, host selection, second paste, or Enter. See
-[clipboard bootstrap](docs/clipboard-bootstrap.md) for status, security,
-fallback, rollback, and uninstall.
+Then copy an image, focus the existing Codex pane launched through `d2` or
+`d3`, and press `Cmd+V` (or `Ctrl+V`) once. The router uploads the image and
+injects its readable remote path into that exact pane; Codex renders it as an
+attachment. It does not choose a host, switch sessions, or press Enter.
+
+If paste does not attach, inspect the exact current route without contacting a
+host, then request one explicit reachability probe only if needed:
+
+```bash
+clipboard-paste status --profile d3
+clipboard-paste doctor --profile d3
+clipboard-paste doctor --profile d3 --probe-target
+```
+
+`clipimg-put d` is recovery only: it uploads the image and replaces the Mac
+clipboard with the remote path for a manual paste. Reverse the managed changes
+with `scripts/clipboard-bootstrap rollback`, or remove both sides with
+`scripts/clipboard-bootstrap uninstall --profile d3 --apply-remote`.
+
+The macOS + Ghostty + tracked tmux lane has real `devbox-1` image evidence;
+the remaining transport/support-matrix rows are still rollout gates. See
+[clipboard bootstrap](docs/clipboard-bootstrap.md) for the proof boundary,
+privacy model, diagnosis, fallback, and lifecycle details.
 
 ## TL;DR
 
