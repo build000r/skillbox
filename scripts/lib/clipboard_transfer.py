@@ -107,19 +107,51 @@ def _regular_owned_file(path: Path) -> os.stat_result:
     return info
 
 
-def sha256_file(path: Path, *, max_bytes: int = DEFAULT_MAX_BYTES) -> tuple[str, int]:
-    info = _regular_owned_file(path)
-    if info.st_size > max_bytes:
-        raise TransferError(f"artifact exceeds {max_bytes} byte limit")
-    digest = hashlib.sha256()
-    total = 0
-    with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
+def _read_regular_owned_file(
+    path: Path, *, max_bytes: int = DEFAULT_MAX_BYTES
+) -> bytes:
+    """Read one bounded file without following or racing a path replacement."""
+    before = _regular_owned_file(path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise TransferError(f"artifact path could not be opened safely: {path}") from exc
+    try:
+        after = os.fstat(fd)
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or after.st_uid != os.getuid()
+            or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+        ):
+            raise TransferError(f"artifact path changed before it could be read: {path}")
+        if after.st_size > max_bytes:
+            raise TransferError(f"artifact exceeds {max_bytes} byte limit")
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := os.read(fd, min(1024 * 1024, max_bytes + 1 - total)):
+            chunks.append(chunk)
             total += len(chunk)
             if total > max_bytes:
                 raise TransferError(f"artifact exceeds {max_bytes} byte limit")
-            digest.update(chunk)
-    return digest.hexdigest(), total
+        data = b"".join(chunks)
+        if len(data) != after.st_size:
+            raise TransferError(f"artifact changed while it was being read: {path}")
+        return data
+    finally:
+        os.close(fd)
+
+
+def sha256_file(path: Path, *, max_bytes: int = DEFAULT_MAX_BYTES) -> tuple[str, int]:
+    data = _read_regular_owned_file(path, max_bytes=max_bytes)
+    return hashlib.sha256(data).hexdigest(), len(data)
+
+
+def _artifact_payload(
+    path: Path, *, max_bytes: int = DEFAULT_MAX_BYTES
+) -> tuple[bytes, str]:
+    data = _read_regular_owned_file(path, max_bytes=max_bytes)
+    return data, hashlib.sha256(data).hexdigest()
 
 
 def _artifact_files(root: Path) -> list[tuple[Path, os.stat_result]]:
@@ -372,7 +404,8 @@ def transfer_artifact(
     """Send one local file to a registered SSH route."""
     target = validate_target(ssh_target)
     local_path = local_path.expanduser()
-    digest, size = sha256_file(local_path, max_bytes=max_bytes)
+    payload, digest = _artifact_payload(local_path, max_bytes=max_bytes)
+    size = len(payload)
     extension = validate_extension(extension or local_path.suffix)
     command: Sequence[str] = (
         "ssh",
@@ -393,15 +426,14 @@ def transfer_artifact(
         str(max_bytes),
     )
     try:
-        with local_path.open("rb") as stream:
-            completed = runner(
-                command,
-                stdin=stream,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=timeout_seconds,
-                check=False,
-            )
+        completed = runner(
+            command,
+            input=payload,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_seconds,
+            check=False,
+        )
     except subprocess.TimeoutExpired as exc:
         raise TransferError(
             f"artifact transfer timed out after {timeout_seconds:g}s"
