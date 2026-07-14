@@ -7,7 +7,7 @@
 Generated from command registry ABI `2026-06-11+agent_ops_brain`.
 Do not edit by hand; run `python3 .env-manager/manage.py registry-docs --write`.
 
-Registry entries: 41.
+Registry entries: 42.
 
 ## Tier 1
 
@@ -1860,3 +1860,69 @@ make dev-sanity
 None
 
 **Graph Nodes**: `check`
+
+### clipboard
+
+#### clipboard.paste
+
+Report, diagnose, or explain exact-route seamless-paste readiness with redacted evidence.
+
+- Surfaces: `cli`
+- Scopes: `profile`
+- Side effect: `network`
+- Risk: `low`
+- Entrypoint: `clipboard-paste`
+- Owner binary: None
+- MCP mirror: None
+
+**Inputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `command` | `enum[status\|doctor\|explain]?` | no |
+| `json` | `boolean?` | no |
+| `probe_target` | `boolean?` | no |
+| `profile` | `string?` | no |
+| `route_path` | `string?` | no |
+
+**Outputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `agent` | `object` | yes |
+| `capabilities` | `object` | yes |
+| `checks` | `object[]` | yes |
+| `fallback` | `object` | yes |
+| `generated_at` | `number` | yes |
+| `install` | `object` | yes |
+| `last_receipt` | `string?` | no |
+| `profile` | `string` | yes |
+| `redaction` | `string` | yes |
+| `route` | `object` | yes |
+| `schema_version` | `integer` | yes |
+| `state` | `enum[ready\|configured\|degraded\|stale\|unsupported\|ambiguous\|offline]` | yes |
+| `target` | `string?` | no |
+| `target_probe` | `object` | yes |
+| `version` | `string?` | no |
+
+**Examples**
+
+```bash
+clipboard-paste status --profile d3 --json
+```
+
+```bash
+clipboard-paste doctor --profile d3 --probe-target --json
+```
+
+```bash
+clipboard-paste explain --profile d3 --json
+```
+
+**Validation**
+
+```bash
+python3 -m unittest tests.test_clipboard_status tests.test_agent_ops_command_registry
+```
+
+**Graph Nodes**: `command`, `check`, `evidence`
