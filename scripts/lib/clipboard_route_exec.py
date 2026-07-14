@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -32,6 +33,24 @@ def _tmux_value(pane: str, fmt: str) -> str:
     return completed.stdout.strip()
 
 
+def _tmux_client_value(
+    pane: str,
+    *,
+    attempts: int = 20,
+    delay_seconds: float = 0.05,
+) -> str:
+    """Wait briefly for a just-created tmux client to attach to its first pane."""
+    last_error: RouteExecError | None = None
+    for attempt in range(attempts):
+        try:
+            return _tmux_value(pane, "#{client_name}")
+        except RouteExecError as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(delay_seconds)
+    raise last_error or RouteExecError("tmux did not report #{client_name}")
+
+
 def identity_from_environment(
     env: dict[str, str] | None = None,
 ) -> dict[str, str | None]:
@@ -40,7 +59,7 @@ def identity_from_environment(
     if pane and env.get("TMUX"):
         return {
             "tmux_pane": pane,
-            "tmux_client": _tmux_value(pane, "#{client_name}"),
+            "tmux_client": _tmux_client_value(pane),
             "tmux_server": _tmux_value(pane, "#{socket_path}"),
             "terminal_id": None,
         }
