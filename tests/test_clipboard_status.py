@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import stat
 import tempfile
@@ -209,6 +210,73 @@ python 12 user 8u IPv4 0 0t0 TCP *:9999 (LISTEN)
             self.assertTrue(report["install"]["ready"])
             self.assertIn("clipboard bytes", report["redaction"])
             self.assertNotIn("clipboard_text", status.dump(report))
+
+    def test_status_redacts_paths_target_session_and_receipt_location(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "private-operator-home"
+            home.mkdir()
+            clipboard_bootstrap.install_local(home, root=ROOT_DIR)
+            record, route_path = clipboard_session.register(
+                profile="d3",
+                transport="ssh",
+                terminal_id="ghostty-redaction-fixture",
+                remote_session="private-session-name",
+                root=home / ".local" / "state" / "skillbox" / "paste-routes",
+                hosts_path=ROOT_DIR / "scripts" / "clipboard" / "hosts.json",
+                now=900.0,
+                ttl_seconds=1_000,
+                stamp_tmux=False,
+            )
+            receipts = home / ".cache" / "skillbox" / "smart-paste" / "receipts"
+            receipts.mkdir(parents=True)
+            (receipts / "gesture-safe-id.json").write_text("{}", encoding="utf-8")
+
+            report = status.inspect_status(
+                home=home,
+                root=ROOT_DIR,
+                profile="d3",
+                route_path=route_path,
+                now=1000.0,
+                environment={},
+                codex_version_fn=lambda: "codex-cli 0.144.4",
+                listener_runner=lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                    [], 1, "", ""
+                ),
+            )
+            public = status.dump(report)
+            self.assertEqual(report["target"], "configured")
+            self.assertEqual(report["route"]["remote_session"], "registered")
+            self.assertEqual(report["last_receipt"], "gesture-safe-id.json")
+            self.assertEqual(report["route"]["route_id"], record["route_id"])
+            self.assertNotIn(str(home), public)
+            self.assertNotIn("skillbox-portfolio-devbox", public)
+            self.assertNotIn("private-session-name", public)
+
+    def test_malformed_manifest_is_a_typed_degraded_check_not_a_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            home.mkdir()
+            clipboard_bootstrap.install_local(home, root=ROOT_DIR)
+            manifest = clipboard_bootstrap.lifecycle_state_dir(home) / "manifest.json"
+            manifest.write_text("{not-json", encoding="utf-8")
+
+            report = status.inspect_status(
+                home=home,
+                root=ROOT_DIR,
+                profile="d3",
+                now=1000.0,
+                environment={},
+                listener_runner=lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                    [], 1, "", ""
+                ),
+            )
+            self.assertEqual(report["state"], "configured")
+            self.assertFalse(report["install"]["ready"])
+            manifest_check = next(
+                item for item in report["checks"] if item["id"] == "lifecycle.manifest"
+            )
+            self.assertEqual(manifest_check["status"], "fail")
+            json.loads(status.dump(report))
 
     def test_current_tmux_pane_auto_resolves_exact_route_to_ready(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
