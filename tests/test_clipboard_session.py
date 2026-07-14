@@ -220,6 +220,59 @@ class ClipboardSessionTests(unittest.TestCase):
         with self.assertRaisesRegex(cs.SessionError, "unsafe remote session"):
             self.register(remote_session="devbox-1;id")
 
+    def test_loaded_route_rejects_tampered_authorization_fields(self) -> None:
+        mutations = (
+            ("remote_home", lambda item: item.__setitem__("remote_home", "/home/u;id")),
+            (
+                "ssh_target",
+                lambda item: item.__setitem__("ssh_target", "-oProxyCommand=id"),
+            ),
+            ("generation", lambda item: item.__setitem__("generation", "not-a-uuid")),
+            (
+                "local_identity",
+                lambda item: item["local"].__setitem__("tmux_pane", "%999"),
+            ),
+            (
+                "capability_type",
+                lambda item: item["capabilities"]["inbound"].__setitem__(
+                    "smart_path_paste", 1
+                ),
+            ),
+            (
+                "timestamps",
+                lambda item: item.__setitem__(
+                    "expires_at", item["updated_at"]
+                ),
+            ),
+        )
+        for index, (name, mutate) in enumerate(mutations, start=30):
+            with self.subTest(name=name):
+                _, path = self.register(tmux_pane=f"%{index}")
+                payload = json.loads(path.read_text())
+                mutate(payload)
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                path.chmod(0o600)
+                with self.assertRaises(cs.SessionError):
+                    cs.load_record(path, now=1_010.0)
+
+    def test_route_record_is_bound_to_private_parent_filename_and_size(self) -> None:
+        _, path = self.register(tmux_pane="%50")
+        renamed = path.with_name(f"{'0' * 32}.json")
+        path.rename(renamed)
+        with self.assertRaisesRegex(cs.SessionError, "path does not match"):
+            cs.load_record(renamed, now=1_010.0)
+
+        renamed.write_bytes(b" " * (cs.MAX_RECORD_BYTES + 1))
+        renamed.chmod(0o600)
+        with self.assertRaisesRegex(cs.SessionError, "size limit"):
+            cs.load_record(renamed, now=1_010.0)
+
+        renamed.write_text("{}", encoding="utf-8")
+        renamed.chmod(0o600)
+        self.state.chmod(0o755)
+        with self.assertRaisesRegex(cs.SessionError, "parent has unsafe"):
+            cs.load_record(renamed, now=1_010.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,7 @@ from . import clipboard_route
 
 SCHEMA_VERSION = 1
 DEFAULT_TTL_SECONDS = 24 * 60 * 60
+MAX_RECORD_BYTES = 64 * 1024
 SAFE_TOKEN = re.compile(r"^[A-Za-z0-9._%:/@+-]{1,256}$")
 SAFE_TRANSPORTS = {"local", "ssh", "mosh", "wsl"}
 TMUX_ROUTE_OPTION = "@skillbox_paste_route"
@@ -81,7 +82,9 @@ def _identity(
 
 
 def _write_record(root: Path, record: Mapping[str, Any]) -> Path:
-    route_id = str(record["route_id"])
+    if not isinstance(record["route_id"], str):
+        raise SessionError("route ID is malformed")
+    route_id = record["route_id"]
     if re.fullmatch(r"[0-9a-f]{32}", route_id) is None:
         raise SessionError("invalid route ID")
     final = root / f"{route_id}.json"
@@ -262,13 +265,36 @@ def load_record(
     expected_pane: str | None = None,
     expected_client: str | None = None,
 ) -> dict[str, Any]:
+    parent = path.parent.lstat()
+    if (
+        stat.S_ISLNK(parent.st_mode)
+        or not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.getuid()
+        or stat.S_IMODE(parent.st_mode) & 0o077
+    ):
+        raise SessionError("route record parent has unsafe ownership or mode")
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise SessionError("route record must be a regular file")
     if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
         raise SessionError("route record has unsafe ownership or mode")
     try:
-        record = json.loads(path.read_text(encoding="utf-8"))
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened = os.fstat(fd)
+            if (
+                (info.st_dev, info.st_ino) != (opened.st_dev, opened.st_ino)
+                or not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.getuid()
+                or stat.S_IMODE(opened.st_mode) & 0o077
+            ):
+                raise SessionError("route record changed before it could be read")
+            raw = os.read(fd, MAX_RECORD_BYTES + 1)
+        finally:
+            os.close(fd)
+        if len(raw) > MAX_RECORD_BYTES:
+            raise SessionError("route record exceeds the size limit")
+        record = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise SessionError("route record is malformed") from exc
     required = {
@@ -291,9 +317,64 @@ def load_record(
     }
     if not isinstance(record, dict) or set(record) != required:
         raise SessionError("route record has an unknown schema")
-    if record["schema_version"] != SCHEMA_VERSION or record["owner_uid"] != os.getuid():
+    if (
+        type(record["schema_version"]) is not int
+        or record["schema_version"] != SCHEMA_VERSION
+        or type(record["owner_uid"]) is not int
+        or record["owner_uid"] != os.getuid()
+    ):
         raise SessionError("route record version or owner does not match")
+    route_id = str(record["route_id"])
+    if (
+        re.fullmatch(r"[0-9a-f]{32}", route_id) is None
+        or path.name != f"{route_id}.json"
+    ):
+        raise SessionError("route record path does not match its route ID")
+    if not isinstance(record["generation"], str):
+        raise SessionError("route generation is not a UUID")
+    try:
+        uuid.UUID(record["generation"])
+    except ValueError as exc:
+        raise SessionError("route generation is not a UUID") from exc
+    transport = record["transport"]
+    if transport not in SAFE_TRANSPORTS:
+        raise SessionError("route transport is unsupported")
+    if not isinstance(record["profile"], str):
+        raise SessionError("route profile is malformed")
+    _safe(record["profile"], "profile", required=True)
+    target = record["ssh_target"]
+    if target is not None:
+        if not isinstance(target, str):
+            raise SessionError("route SSH target is malformed")
+        try:
+            clipboard_route.validate_ssh_target(target)
+        except clipboard_route.HostConfigError as exc:
+            raise SessionError("route SSH target is unsafe") from exc
+    if transport != "local" and target is None:
+        raise SessionError("remote route is missing its SSH target")
+    if record["remote_home"] is not None and not isinstance(
+        record["remote_home"], str
+    ):
+        raise SessionError("route remote home is malformed")
+    remote_home = _safe(record["remote_home"], "remote home")
+    if remote_home is not None:
+        parts = Path(remote_home).parts
+        if not remote_home.startswith("/") or ".." in parts:
+            raise SessionError("route remote home is unsafe")
+    if record["remote_session"] is not None and not isinstance(
+        record["remote_session"], str
+    ):
+        raise SessionError("route remote session is malformed")
+    _safe(record["remote_session"], "remote session")
     now = time.time() if now is None else now
+    for field in ("created_at", "updated_at", "expires_at"):
+        value = record[field]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise SessionError("route timestamps are malformed")
+    if not (
+        record["created_at"] <= record["updated_at"] < record["expires_at"]
+    ):
+        raise SessionError("route timestamps are contradictory")
     if (
         not isinstance(record["expires_at"], (int, float))
         or record["expires_at"] <= now
@@ -302,8 +383,54 @@ def load_record(
     if expected_generation and record["generation"] != expected_generation:
         raise SessionError("route generation changed before paste")
     local = record["local"]
-    if not isinstance(local, dict):
+    if not isinstance(local, dict) or set(local) != {
+        "tmux_server",
+        "tmux_pane",
+        "tmux_client",
+        "terminal_id",
+    }:
         raise SessionError("route local identity is malformed")
+    for field, label in (
+        ("tmux_server", "tmux server"),
+        ("tmux_pane", "tmux pane"),
+        ("tmux_client", "tmux client"),
+        ("terminal_id", "terminal ID"),
+    ):
+        value = local[field]
+        if value is not None and not isinstance(value, str):
+            raise SessionError("route local identity is malformed")
+        _safe(value, label)
+    expected_route_id = _identity(
+        tmux_server=local["tmux_server"],
+        tmux_pane=local["tmux_pane"],
+        tmux_client=local["tmux_client"],
+        terminal_id=local["terminal_id"],
+    )
+    if expected_route_id != route_id:
+        raise SessionError("route ID does not match its local identity")
+    capabilities = record["capabilities"]
+    if not isinstance(capabilities, dict) or set(capabilities) != {
+        "outbound",
+        "inbound",
+    }:
+        raise SessionError("route capabilities are malformed")
+    flattened: dict[str, Any] = {}
+    for direction in ("outbound", "inbound"):
+        values = capabilities[direction]
+        if not isinstance(values, dict) or any(
+            not isinstance(value, bool) for value in values.values()
+        ):
+            raise SessionError("route capabilities are malformed")
+        flattened.update(values)
+    if any(key not in flattened for key in clipboard_route.CAPABILITY_KEYS):
+        raise SessionError("route capabilities are incomplete")
+    if (
+        not isinstance(record["trust"], str)
+        or record["trust"] not in clipboard_route.TRUST_LEVELS
+    ):
+        raise SessionError("route trust level is malformed")
+    if record["cleanup_owner"] != "launching-process":
+        raise SessionError("route cleanup owner is malformed")
     if expected_pane and local.get("tmux_pane") != expected_pane:
         raise SessionError("route pane does not match the focused pane")
     if expected_client and local.get("tmux_client") != expected_client:
