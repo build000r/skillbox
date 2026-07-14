@@ -123,6 +123,10 @@ def _validated_dimensions(item: dict[str, Any]) -> tuple[int, int]:
         raise SnapshotError(
             "corrupt_media", "decoded image dimensions are unavailable"
         ) from exc
+    return _bounded_dimensions(width, height)
+
+
+def _bounded_dimensions(width: int, height: int) -> tuple[int, int]:
     if (
         width < 1
         or height < 1
@@ -231,7 +235,8 @@ def snapshot_from_payload(
         width: int | None = None
         height: int | None = None
         if kind == "image":
-            width, height = _validated_dimensions(item)
+            _validated_dimensions(item)
+            width, height = _bounded_dimensions(*_image_dimensions(mime, data))
         artifact = _materialize(data, suffix, output_dir) if output_dir else None
         return ClipboardSnapshot(
             ok=True,
