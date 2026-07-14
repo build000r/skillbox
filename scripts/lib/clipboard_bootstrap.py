@@ -756,6 +756,7 @@ def plan_remote_bootstrap(
             f"ssh {ssh_target}: install xterm-ghostty terminfo from bundled {TERMINFO_BUNDLE_NAME}",
             f"ssh {ssh_target}: verify infocmp -x xterm-ghostty (warn if unavailable)",
             f"ssh {ssh_target}: verify clipcopy executable and tmux fragment present",
+            f"ssh {ssh_target}: leave every running tmux server untouched",
         ]
     )
     if not cr.capability(resolved, "osc52_copy"):
@@ -873,9 +874,6 @@ if [ "$terminfo_ok" = "0" ] && command -v tic >/dev/null 2>&1 && command -v info
     infocmp -x xterm-ghostty | tic -x - 2>/dev/null || true
     terminfo_ok=1
   fi
-fi
-if command -v tmux >/dev/null 2>&1; then
-  tmux source-file "$tmux_conf" >/dev/null 2>&1 || true
 fi
 test -x "$bin_dir/clipcopy"
 test -x "$bin_dir/clipboard-artifact-receive"

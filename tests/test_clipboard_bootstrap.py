@@ -329,6 +329,14 @@ class ClipboardBootstrapTests(unittest.TestCase):
         self.assertIn(CB.TMUX_MARKER, script)
         self.assertIn(CB.SOURCE_LINE, script)
         self.assertIn("SKILLBOX_CLIPBOARD_BUNDLE_B64", script)
+        self.assertNotIn('tmux source-file "$tmux_conf"', script)
+
+    def test_remote_plan_promises_no_running_tmux_reload(self) -> None:
+        plan = CB.plan_remote_bootstrap("d3", dry_run=True, root=ROOT_DIR)
+        self.assertIn(
+            "ssh skillbox@skillbox-portfolio-devbox: leave every running tmux server untouched",
+            plan.steps,
+        )
 
     def test_run_remote_install_provisions_helpers_and_terminfo(self) -> None:
         if not shutil_which("tic"):
