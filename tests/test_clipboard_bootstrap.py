@@ -146,6 +146,46 @@ class ClipboardBootstrapTests(unittest.TestCase):
             ]
             self.assertEqual(len(lines), 1)
 
+    def test_local_install_never_reloads_a_running_tmux_server_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            with mock.patch.object(CB.shutil, "which", return_value="/usr/bin/tmux"):
+                runner = mock.Mock()
+                plan = CB.install_local(
+                    home,
+                    root=ROOT_DIR,
+                    tmux_runner=runner,
+                )
+            runner.assert_not_called()
+            self.assertIn(
+                "leave every running local tmux server untouched",
+                plan.steps,
+            )
+
+    def test_local_tmux_reload_requires_explicit_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            with mock.patch.object(CB.shutil, "which", return_value="/usr/bin/tmux"):
+                runner = mock.Mock(
+                    return_value=subprocess.CompletedProcess([], 0, b"", b"")
+                )
+                plan = CB.install_local(
+                    home,
+                    root=ROOT_DIR,
+                    reload_current_tmux=True,
+                    tmux_runner=runner,
+                )
+            runner.assert_called_once_with(
+                ["tmux", "source-file", str(home / ".tmux.conf")],
+                capture_output=True,
+                check=False,
+            )
+            self.assertTrue(
+                any("affects all sessions" in step for step in plan.steps)
+            )
+
     def test_unsupported_operator_install_is_no_write_but_dry_run_explains(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir) / "home"

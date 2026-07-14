@@ -58,6 +58,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Perform remote SSH install (default is plan)",
     )
+    parser.add_argument(
+        "--reload-current-tmux",
+        action="store_true",
+        help="source the managed config into the current local tmux server; affects every session on that server",
+    )
     return parser
 
 
@@ -290,7 +295,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if profile == "local":
-        plan = install_local(dry_run=args.dry_run, root=root)
+        plan = install_local(
+            dry_run=args.dry_run,
+            root=root,
+            reload_current_tmux=args.reload_current_tmux,
+        )
         mode = "dry-run" if args.dry_run else "apply"
         print(f"clipboard-bootstrap: local profile ({mode})")
         for step in plan.steps:
@@ -344,7 +353,11 @@ def main(argv: list[str] | None = None) -> int:
             print("note: remote writes require --apply-remote")
         return 0
 
-    local_plan = install_local(dry_run=False, root=root)
+    local_plan = install_local(
+        dry_run=False,
+        root=root,
+        reload_current_tmux=args.reload_current_tmux,
+    )
     print("clipboard-bootstrap: local prerequisite installed")
     for step in local_plan.steps:
         print(f"  - {step}")

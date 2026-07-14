@@ -649,7 +649,11 @@ class InstallPlan:
 
 
 def plan_local_install(
-    home: Path | None = None, *, dry_run: bool = False, root: Path | None = None
+    home: Path | None = None,
+    *,
+    dry_run: bool = False,
+    root: Path | None = None,
+    reload_current_tmux: bool = False,
 ) -> InstallPlan:
     home_dir = home or Path.home()
     plan = InstallPlan(profile="local", scope="local", dry_run=dry_run)
@@ -670,11 +674,9 @@ def plan_local_install(
             f"append source line to {tmux_conf} if missing",
             f"append scoped source line to {ghostty_conf_path(home_dir)} if missing",
             f"record reversible ownership under {lifecycle_state_dir(home_dir)}",
-            (
-                "leave running tmux servers untouched (SKILLBOX_SKIP_TMUX_RELOAD=1)"
-                if os.environ.get("SKILLBOX_SKIP_TMUX_RELOAD") == "1"
-                else "reload tmux config when tmux is available"
-            ),
+            "reload the current tmux server explicitly; this affects all sessions on that server"
+            if reload_current_tmux
+            else "leave every running local tmux server untouched",
         ]
     )
     if platform.system() != "Darwin":
@@ -685,11 +687,21 @@ def plan_local_install(
 
 
 def install_local(
-    home: Path | None = None, *, dry_run: bool = False, root: Path | None = None
+    home: Path | None = None,
+    *,
+    dry_run: bool = False,
+    root: Path | None = None,
+    reload_current_tmux: bool = False,
+    tmux_runner: Callable[..., subprocess.CompletedProcess[Any]] = subprocess.run,
 ) -> InstallPlan:
     resolved_root = root or repo_root()
     home_dir = home or Path.home()
-    plan = plan_local_install(home_dir, dry_run=dry_run, root=resolved_root)
+    plan = plan_local_install(
+        home_dir,
+        dry_run=dry_run,
+        root=resolved_root,
+        reload_current_tmux=reload_current_tmux,
+    )
     if not operator_platform_supported():
         if dry_run:
             return plan
@@ -712,8 +724,8 @@ def install_local(
         ensure_ghostty_source_line(ghostty_conf_path(home_dir), home_dir)
         _remove_legacy_ghostty_block(home_dir)
         _record_installed_state(resolved_root, home_dir)
-        if shutil.which("tmux") and os.environ.get("SKILLBOX_SKIP_TMUX_RELOAD") != "1":
-            subprocess.run(
+        if reload_current_tmux and shutil.which("tmux"):
+            tmux_runner(
                 ["tmux", "source-file", str(tmux_conf)],
                 capture_output=True,
                 check=False,

@@ -564,6 +564,9 @@ scripts/clipboard-bootstrap --profile generic --target user@host --dry-run
 
 Usage after install:
 
+- Existing tmux servers are never reloaded; relaunch the intended `d2`/`d3`
+  surface once, or deliberately pass `--reload-current-tmux` only when every
+  session on the current local server may change
 - Text/image paste: copy, focus the existing `d2`/`d3` pane, press `Cmd+V` or
   `Ctrl+V`; the router never chooses a host or sends Enter
 - Text copy: `printf 'hello\n' | clipcopy` or tmux copy-mode `y` / Enter / mouse drag
