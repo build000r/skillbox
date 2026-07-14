@@ -88,6 +88,13 @@ sources configuration into an already-running tmux server. Existing remote
 sessions stay live and untouched; new tmux servers pick up the tracked source
 line normally.
 
+Local bootstrap follows the same rule: it writes the managed source line but
+does not source it into any running tmux server. Relaunch through `d2`/`d3` or
+start a new tmux server to activate the new fragment. The explicit
+`--reload-current-tmux` escape hatch sources the config into the current local
+server and therefore affects every session on that server; use it only after
+confirming those sessions may change.
+
 ## OSC52 and tmux behavior
 
 `clipcopy` reads stdin, then:

@@ -44,8 +44,10 @@ scripts/clipboard-bootstrap --profile d3 --dry-run
 scripts/clipboard-bootstrap --profile d3 --apply-remote
 ```
 
-Then copy an image, focus the existing Codex pane launched through `d2` or
-`d3`, and press `Cmd+V` (or `Ctrl+V`) once. The router uploads the image and
+Bootstrap never reloads a running tmux server. If `d2`/`d3` was already open,
+relaunch that one surface once so it picks up the managed fragment. Then copy
+an image, focus the Codex pane launched through `d2` or `d3`, and press `Cmd+V`
+(or `Ctrl+V`) once. The router uploads the image and
 injects its readable remote path into that exact pane; Codex renders it as an
 attachment. It does not choose a host, switch sessions, or press Enter.
 
