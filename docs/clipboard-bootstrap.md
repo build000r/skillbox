@@ -1,8 +1,21 @@
 # Clipboard bootstrap
 
-Skillbox owns OSC52 clipboard integration for operator Mac + Ghostty, local tmux,
-SSH/mosh remotes, nested tmux, and Conference1 WSL. Source bundle:
+Skillbox owns one-gesture text/image paste and OSC52 copy for operator Mac +
+Ghostty, local tmux, SSH/mosh remotes, nested tmux, and Conference1 WSL. Source bundle:
 `scripts/clipboard/`. Bootstrap entry: `scripts/clipboard-bootstrap`.
+
+## Daily path: copy, focus, paste
+
+After bootstrap, copy a screenshot or image, focus the existing `d2`/`d3`
+terminal, and press `Cmd+V` (or terminal-first `Ctrl+V`). There is no host
+argument, helper command, second paste, or Enter. Text stays on Ghostty's
+native bracketed-paste path for `Cmd+V`; `Ctrl+V` uses the same exact-pane
+router. A readable remote image path becomes a visible Codex attachment.
+
+The launcher registers the exact local pane/client, canonical host, transport,
+and `devbox-N` generation. Image transfer refuses unknown or stale routes.
+`d2`/`d3` started outside tmux create a disposable local tmux boundary so the
+operator does not need to manage one.
 
 ## Prerequisites
 
@@ -50,6 +63,23 @@ is acceptable for your threat model.
 | Conference1 Windows wrapper (`conference1-ssh`) | WSL via Windows | Known-bad | OSC52-hostile; recovery/auth fallback only |
 | Generic `user@host` | SSH | Best-effort | Profile `generic` or raw target arg |
 
+### Operator-platform matrix
+
+| Operator client | Capture | Gesture/install | Support level | Proof boundary |
+|---|---|---|---|---|
+| macOS + Ghostty + local tmux | AppKit pasteboard with monotonic change count | Managed `Cmd+V`/`Ctrl+V`; `clipboard-bootstrap` install/uninstall | Core | Real Mac + `devbox-1` image proof recorded; remaining transport rows still gate rollout |
+| Linux Wayland | `wl-paste`, typed MIME capture, content-digest generation | Same Ghostty/tmux fragment; `clipboard-bootstrap --profile local` and `uninstall` | Experimental | Offline command fixtures only; no real image or native-text regression proof yet |
+| Linux X11 | `xclip`, typed target capture, content-digest generation | Same as Wayland | Experimental | Offline command fixtures only |
+| Native Windows | STA PowerShell image/file/text capture contract | No safe terminal-focus installer is shipped | Substrate only, unsupported for rollout | Offline payload fixture only; no real image or paste proof |
+| WSL via Windows terminal | Not inferred from native Windows state | Existing Conference fallback remains explicit and OSC52-hostile | Unsupported | Never counted as a passing Linux or Windows client |
+
+Linux and Windows do not expose AppKit's monotonic pasteboard change count. The
+experimental capture substrate derives a generation from the typed content and
+re-reads it inside the same explicit gesture immediately before injection. It
+does not poll or retain history. Neither platform is promoted to supported
+until its separate installer/uninstaller, native-text regression, focus-race,
+and real-image proof all pass. The macOS default is unchanged.
+
 ## OSC52 and tmux behavior
 
 `clipcopy` reads stdin, then:
@@ -79,19 +109,29 @@ Probe order (encoded in `scripts/clipboard/hosts.json`):
 **Do not** use `conference1-ssh` for clipboard-sensitive work when direct WSL is up.
 The wrapper path is documented and tested as OSC52-hostile.
 
-## Image transfer (`clipimg-put`)
+## Explicit recovery (`clipimg-put`)
 
 Darwin-only. Extracts PNG/TIFF from macOS clipboard, uploads to
 `~/clipboard-images/clipboard-<timestamp>.png` on the remote, puts the **remote file
-path** on the Mac clipboard. True binary paste through the terminal is not supported.
+path** on the Mac clipboard. Use it only when `clipboard-paste doctor` says the
+one-key route is unavailable.
+
+This is the explicit recovery path, not the target daily UX. The normative
+one-gesture behavior, latency budget, route rules, and threat controls live in
+[`docs/seamless-remote-paste.md`](seamless-remote-paste.md).
 
 Conference target `c` resolves to direct WSL (`worker@conference1-wsl`), not the
 Windows wrapper.
 
 ## Security boundaries
 
+- Reads media bytes only after an explicit paste gesture; it never polls the clipboard.
 - Installs only under the target user's home: `~/.local/bin`, `~/.config/skillbox/`,
-  `~/.tmux.conf` source line (append-only, idempotent).
+  scoped Ghostty/tmux includes, and a private lifecycle manifest.
+- Remote artifacts are content-addressed, mode `0600`, bounded to 20 MiB, and
+  pruned by a 7-day/200-MiB policy. Transient Mac snapshots are destroyed after
+  remote success or failure. A newly-created remote artifact is deleted when a
+  post-transfer focus, route, clipboard, or pane-injection check cancels paste.
 - No secrets, no system-wide terminfo, no public `0.0.0.0` binding changes.
 - Remote bootstrap uses SSH; dry-run/plan modes never write.
 
@@ -108,7 +148,7 @@ scripts/clipboard-bootstrap --profile local
 # Remote host (d3): prints the plan, performs no remote writes
 scripts/clipboard-bootstrap --profile d3
 
-# Apply on the remote host (the only form that writes remotely)
+# One command applies the reversible local bundle and remote receiver
 scripts/clipboard-bootstrap --profile d3 --apply-remote
 
 # Generic target (implies --profile generic)
@@ -117,6 +157,36 @@ scripts/clipboard-bootstrap --target skillbox@my-host --dry-run
 # Closeout / regression (CI smoke)
 scripts/clipboard-closeout.sh
 ```
+
+Status and lifecycle:
+
+```bash
+clipboard-paste status --profile d3
+clipboard-paste doctor --profile d3
+clipboard-paste explain --profile d3 --json
+clipboard-metrics                 # local receipts only; no host contact
+
+scripts/clipboard-bootstrap rollback
+scripts/clipboard-bootstrap uninstall
+# Restore remote + local baselines explicitly:
+scripts/clipboard-bootstrap uninstall --profile d3 --apply-remote
+```
+
+`clipboard-metrics` requires 20 successful samples before it calls a latency
+distribution rollout-grade. A smaller set remains diagnostic evidence only.
+
+Routine tests never inspect the live clipboard. The one macOS capture observer
+is opt-in and should be run only with a deliberate proof image already copied:
+
+```bash
+SKILLBOX_LIVE_CLIPBOARD_TEST=1 \
+  pytest -q tests/test_clipboard_snapshot.py::ClipboardSnapshotTests::test_live_capture_does_not_change_pasteboard_generation
+```
+
+Install baselines and one-step rollback snapshots live under
+`~/.local/state/skillbox/clipboard-bootstrap/`. Uninstall restores overwritten
+helpers and removes only Skillbox-owned Ghostty/tmux blocks while preserving
+later user edits.
 
 ## Closeout gates and proof commands
 

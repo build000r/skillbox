@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# d2 — spawn/attach a fresh numbered devbox-N tmux session on the remote.
+# Split-aware if already inside a local tmux client (matches previous `dev` behavior).
+# Use DEVL_TARGET / DEVL_ROOT to override.
+
+target="${DEVL_TARGET:-skillbox@skillbox-portfolio-devbox}"
+root="${DEVL_ROOT:-/srv/repos}"
+transport="${DEVL_TRANSPORT:-mosh}"
+wsl_distro="${DEVL_WSL_DISTRO:-Ubuntu}"
+clipboard_profile="devbox"
+
+case "${1:-}" in
+    s|sp|sweet|sweet-potato|sweet-potato-prod)
+        target="aiops@sweet-potato-prod"
+        if [ -z "${DEVL_ROOT+x}" ]; then
+            root="/home/aiops/ingredient_server"
+        fi
+        # mosh-server not installed on prod yet; keep ssh unless explicitly overridden
+        transport="${DEVL_TRANSPORT:-ssh}"
+        clipboard_profile="sweet"
+        shift
+        ;;
+	    c|conf|conference1|conference1-ssh)
+	        if [ -z "${DEVL_ROOT+x}" ]; then
+	            root="/srv/repos"
+	        fi
+	        conference_wsl_target="${DEVL_CONFERENCE_WSL_TARGET:-conference1-wsl}"
+	        if [ -n "${DEVL_CONFERENCE_TARGET+x}" ]; then
+	            target="$DEVL_CONFERENCE_TARGET"
+	            transport="${DEVL_CONFERENCE_TRANSPORT:-wsl}"
+	            clipboard_profile="conference1"
+	        elif ssh -o BatchMode=yes -o ConnectTimeout="${DEVL_CONFERENCE_WSL_PROBE_TIMEOUT:-8}" "$conference_wsl_target" 'true' >/dev/null 2>&1; then
+	            target="$conference_wsl_target"
+	            if ssh -o BatchMode=yes -o ConnectTimeout="${DEVL_CONFERENCE_WSL_PROBE_TIMEOUT:-8}" "$conference_wsl_target" 'command -v mosh-server >/dev/null 2>&1' >/dev/null 2>&1; then
+	                transport="${DEVL_CONFERENCE_TRANSPORT:-mosh}"
+	            else
+	                transport="${DEVL_CONFERENCE_TRANSPORT:-ssh}"
+	            fi
+	            clipboard_profile="conference1"
+	        else
+	            target="conference1-ssh"
+	            transport="${DEVL_CONFERENCE_TRANSPORT:-wsl}"
+	            clipboard_profile="conference1-fallback"
+	        fi
+	        shift
+	        ;;
+    j|jeremy|jeremy-vps|skillbox-jeremy|skillbox-jeremy-3)
+        target="${DEVL_JEREMY_TARGET:-skillbox@skillbox-jeremy-3}"
+        if [ -z "${DEVL_ROOT+x}" ]; then
+            root="/home/skillbox/ecom-reporting-host"
+        fi
+        transport="${DEVL_TRANSPORT:-ssh}"
+        clipboard_profile="jeremy"
+        shift
+        ;;
+esac
+
+clipboard_profile="${DEVL_CLIPBOARD_PROFILE:-$clipboard_profile}"
+
+# mosh is the default transport; fall back to ssh if mosh isn't installed locally
+if [ "$transport" = "mosh" ] && ! command -v mosh >/dev/null 2>&1; then
+    echo "d2: mosh not found locally (brew install mosh); falling back to ssh" >&2
+    transport="ssh"
+fi
+
+if ! command -v clipboard-route-exec >/dev/null 2>&1; then
+    echo "d2: clipboard-route-exec is missing; run 'clipboard-bootstrap install'" >&2
+    exit 1
+fi
+if ! command -v tmux >/dev/null 2>&1; then
+    echo "d2: tmux is required for exact one-key paste routing" >&2
+    exit 1
+fi
+
+# Compute the next free devbox-N name on the remote. Bounded by a remote `timeout`
+# so a wedged/unresponsive tmux server makes us fail fast with a clear message
+# instead of hanging forever on `tmux has-session`.
+name=""
+name_rc=0
+if [ "$transport" = "wsl" ]; then
+    name=$(
+        ssh -o BatchMode=yes -o ConnectTimeout=10 "$target" "wsl -d $wsl_distro --cd ~ --exec timeout 10 bash -s" <<'REMOTE'
+n=1
+while tmux has-session -t "devbox-${n}" 2>/dev/null; do
+    n=$((n + 1))
+done
+printf "devbox-%s\n" "$n"
+REMOTE
+    ) || name_rc=$?
+else
+    name=$(
+        ssh -o BatchMode=yes -o ConnectTimeout=10 "$target" 'timeout 10 bash -s' <<'REMOTE'
+n=1
+while tmux has-session -t "devbox-${n}" 2>/dev/null; do
+    n=$((n + 1))
+done
+printf "devbox-%s\n" "$n"
+REMOTE
+    ) || name_rc=$?
+fi
+
+if [ -z "$name" ]; then
+    echo "d2: remote tmux on $target isn't responding (rc=$name_rc; server likely wedged) — aborting instead of hanging." >&2
+    echo "    Recover: ssh $target 'tmux kill-server'  (kills ALL its sessions), then retry; or 'd3' for a plain shell." >&2
+    exit 1
+fi
+printf -v root_q '%q' "$root"
+printf -v name_q '%q' "$name"
+devbox_cmd="export TERM=xterm-256color; export PATH=\"\$HOME/.local/bin:\$HOME/bin:\$HOME/.grok/bin:\$PATH\"; cd $root_q && exec tmux new-session -A -s $name_q -c $root_q"
+
+route_prefix=(
+    clipboard-route-exec
+    --profile "$clipboard_profile"
+    --transport "$transport"
+    --target "$target"
+    --remote-session "$name"
+    --
+)
+
+shell_join() {
+    local joined="" arg quoted
+    for arg in "$@"; do
+        printf -v quoted '%q' "$arg"
+        joined+="${joined:+ }$quoted"
+    done
+    printf '%s' "$joined"
+}
+
+# Open remote-nested-tmux in a local split without disabling mouse for the whole
+# server. Mark the pane @devl_nested=1 so ~/.tmux.conf focus hooks turn mouse
+# off only while this pane is focused (wheel reaches remote tmux). Local panes
+# keep scroll. Escape hatch: prefix+m toggles mouse.
+devl_tmux_split_nested() {
+    local title="$1"
+    local cmd="$2"
+    tmux split-window -h "$cmd"
+    local pane
+    pane="$(tmux display-message -p '#{pane_id}')"
+    tmux set-option -p -t "$pane" @devl_nested 1
+    tmux select-pane -T "$title" -t "$pane"
+    # New pane is focused: drop outer mouse so nested remote tmux gets the wheel.
+    tmux set -g mouse off
+}
+
+if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
+    if [ "$transport" = "wsl" ]; then
+        # -T is select-pane only (tmux 3.x); split-window has no title flag
+        wrapped=("${route_prefix[@]}" ssh -t "$target" "wsl -d $wsl_distro --cd $root_q --exec bash -lc ${devbox_cmd@Q}")
+        devl_tmux_split_nested "$name" "$(shell_join "${wrapped[@]}")"
+        exit 0
+    fi
+    if [ "$transport" = "mosh" ]; then
+        wrapped=("${route_prefix[@]}" mosh "$target" -- bash -lc "$devbox_cmd")
+        devl_tmux_split_nested "$name" "$(shell_join "${wrapped[@]}")"
+    else
+        wrapped=("${route_prefix[@]}" ssh -t "$target" "bash -lc ${devbox_cmd@Q}")
+        devl_tmux_split_nested "$name" "$(shell_join "${wrapped[@]}")"
+    fi
+    exit 0
+fi
+
+# Ghostty has no key action that can invoke a local helper.  When d2 starts
+# outside tmux, create a disposable local tmux boundary so the same private
+# Cmd+V key reaches the scoped User0 binding.  The session disappears when the
+# remote command exits; no tmux is added to the remote path beyond d2's normal
+# named devbox session.
+managed_session="skillbox-d2-$$"
+if [ "$transport" = "wsl" ]; then
+    wrapped=("${route_prefix[@]}" ssh -t "$target" "wsl -d $wsl_distro --cd $root_q --exec tmux new-session -A -s $name_q -c $root_q")
+    exec tmux new-session -s "$managed_session" "$(shell_join "${wrapped[@]}")"
+fi
+if [ "$transport" = "mosh" ]; then
+    wrapped=("${route_prefix[@]}" mosh "$target" -- bash -lc "$devbox_cmd")
+    exec tmux new-session -s "$managed_session" "$(shell_join "${wrapped[@]}")"
+fi
+wrapped=("${route_prefix[@]}" ssh -t "$target" "$devbox_cmd")
+exec tmux new-session -s "$managed_session" "$(shell_join "${wrapped[@]}")"

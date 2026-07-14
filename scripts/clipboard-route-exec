@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""Run a canonical launcher command with exact smart-paste route ownership."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+INSTALLED_LIB = Path.home() / ".local" / "share" / "skillbox" / "python"
+for candidate in (INSTALLED_LIB, SCRIPT_DIR):
+    try:
+        sys.path.remove(str(candidate))
+    except ValueError:
+        pass
+    sys.path.insert(0, str(candidate))
+
+from lib.clipboard_route_exec import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

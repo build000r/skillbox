@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# d3 — direct login shell, zero tmux on the remote side.
+# Lands you in a plain login shell on the remote (cd to root).
+# If you're already inside local tmux, it splits a pane for convenience (no remote tmux is forced).
+# Use DEVL_TARGET / DEVL_ROOT to override.
+
+target="${DEVL_TARGET:-skillbox@skillbox-portfolio-devbox}"
+root="${DEVL_ROOT:-/srv/repos}"
+transport="${DEVL_TRANSPORT:-mosh}"
+wsl_distro="${DEVL_WSL_DISTRO:-Ubuntu}"
+clipboard_profile="d3"
+
+case "${1:-}" in
+    s|sp|sweet|sweet-potato|sweet-potato-prod)
+        target="aiops@sweet-potato-prod"
+        if [ -z "${DEVL_ROOT+x}" ]; then
+            root="/home/aiops/ingredient_server"
+        fi
+        # mosh-server not installed on prod yet; keep ssh unless explicitly overridden
+        transport="${DEVL_TRANSPORT:-ssh}"
+        clipboard_profile="sweet"
+        shift
+        ;;
+	    c|conf|conference1|conference1-ssh)
+	        if [ -z "${DEVL_ROOT+x}" ]; then
+	            root="/srv/repos"
+	        fi
+	        conference_wsl_target="${DEVL_CONFERENCE_WSL_TARGET:-conference1-wsl}"
+	        if [ -n "${DEVL_CONFERENCE_TARGET+x}" ]; then
+	            target="$DEVL_CONFERENCE_TARGET"
+	            transport="${DEVL_CONFERENCE_TRANSPORT:-wsl}"
+	            clipboard_profile="conference1"
+	        elif ssh -o BatchMode=yes -o ConnectTimeout="${DEVL_CONFERENCE_WSL_PROBE_TIMEOUT:-8}" "$conference_wsl_target" 'true' >/dev/null 2>&1; then
+	            target="$conference_wsl_target"
+	            if ssh -o BatchMode=yes -o ConnectTimeout="${DEVL_CONFERENCE_WSL_PROBE_TIMEOUT:-8}" "$conference_wsl_target" 'command -v mosh-server >/dev/null 2>&1' >/dev/null 2>&1; then
+	                transport="${DEVL_CONFERENCE_TRANSPORT:-mosh}"
+	            else
+	                transport="${DEVL_CONFERENCE_TRANSPORT:-ssh}"
+	            fi
+	            clipboard_profile="conference1"
+	        else
+	            target="conference1-ssh"
+	            transport="${DEVL_CONFERENCE_TRANSPORT:-wsl}"
+	            clipboard_profile="conference1-fallback"
+	        fi
+	        shift
+	        ;;
+    j|jeremy|jeremy-vps|skillbox-jeremy|skillbox-jeremy-3)
+        target="${DEVL_JEREMY_TARGET:-skillbox@skillbox-jeremy-3}"
+        if [ -z "${DEVL_ROOT+x}" ]; then
+            root="/home/skillbox/ecom-reporting-host"
+        fi
+        transport="${DEVL_TRANSPORT:-ssh}"
+        clipboard_profile="jeremy"
+        shift
+        ;;
+esac
+
+clipboard_profile="${DEVL_CLIPBOARD_PROFILE:-$clipboard_profile}"
+
+# mosh is the default transport; fall back to ssh if mosh isn't installed locally
+if [ "$transport" = "mosh" ] && ! command -v mosh >/dev/null 2>&1; then
+    echo "d3: mosh not found locally (brew install mosh); falling back to ssh" >&2
+    transport="ssh"
+fi
+
+if ! command -v clipboard-route-exec >/dev/null 2>&1; then
+    echo "d3: clipboard-route-exec is missing; run 'clipboard-bootstrap install'" >&2
+    exit 1
+fi
+if ! command -v tmux >/dev/null 2>&1; then
+    echo "d3: tmux is required for exact one-key paste routing" >&2
+    exit 1
+fi
+
+ssh_connect_timeout="${DEVL_SSH_CONNECT_TIMEOUT:-10}"
+ssh_server_alive_interval="${DEVL_SSH_SERVER_ALIVE_INTERVAL:-15}"
+ssh_server_alive_count_max="${DEVL_SSH_SERVER_ALIVE_COUNT_MAX:-2}"
+ssh_opts=(
+    -o "ConnectTimeout=$ssh_connect_timeout"
+    -o "ServerAliveInterval=$ssh_server_alive_interval"
+    -o "ServerAliveCountMax=$ssh_server_alive_count_max"
+)
+# Plain shell, deliberately no tmux new-session / attach.
+printf -v root_q '%q' "$root"
+printf -v wsl_distro_q '%q' "$wsl_distro"
+remote_cmd="export TERM=xterm-256color; export PATH=\"\$HOME/.local/bin:\$HOME/bin:\$HOME/.grok/bin:\$PATH\"; cd $root_q && exec \${SHELL:-/bin/bash} -l"
+
+route_prefix=(
+    clipboard-route-exec
+    --profile "$clipboard_profile"
+    --transport "$transport"
+    --target "$target"
+    --
+)
+
+shell_join() {
+    local joined="" arg quoted
+    for arg in "$@"; do
+        printf -v quoted '%q' "$arg"
+        joined+="${joined:+ }$quoted"
+    done
+    printf '%s' "$joined"
+}
+
+# When already inside local tmux: open a split for the remote plain shell.
+# Do NOT toggle global mouse — d3 has no remote tmux, so outer mouse scroll
+# is what you want for history. (d2 marks @devl_nested for nested remote tmux.)
+if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
+    if [ "$transport" = "wsl" ]; then
+        # -T is select-pane only (tmux 3.x); split-window has no title flag
+        wrapped=("${route_prefix[@]}" ssh "${ssh_opts[@]}" -t "$target" "wsl -d $wsl_distro_q --cd $root_q --exec bash -l")
+        tmux split-window -h "$(shell_join "${wrapped[@]}")"
+        tmux select-pane -T "conference1"
+        exit 0
+    fi
+    if [ "$transport" = "mosh" ]; then
+        wrapped=("${route_prefix[@]}" mosh "$target" -- bash -lc "$remote_cmd")
+        tmux split-window -h "$(shell_join "${wrapped[@]}")"
+        tmux select-pane -T "direct"
+    else
+        wrapped=("${route_prefix[@]}" ssh "${ssh_opts[@]}" -t "$target" "$remote_cmd")
+        tmux split-window -h "$(shell_join "${wrapped[@]}")"
+        tmux select-pane -T "direct"
+    fi
+    exit 0
+fi
+
+# A direct Ghostty surface cannot invoke the transfer helper from a key action,
+# so d3 supplies a transparent, disposable local tmux boundary.  This keeps the
+# remote login a plain shell while giving Cmd+V the same exact-pane User0
+# interception used by an already-running local tmux client.
+managed_session="skillbox-d3-$$"
+if [ "$transport" = "wsl" ]; then
+    wrapped=("${route_prefix[@]}" ssh "${ssh_opts[@]}" -t "$target" "wsl -d $wsl_distro_q --cd $root_q --exec bash -l")
+    exec tmux new-session -s "$managed_session" "$(shell_join "${wrapped[@]}")"
+fi
+if [ "$transport" = "mosh" ]; then
+    wrapped=("${route_prefix[@]}" mosh "$target" -- bash -lc "$remote_cmd")
+    exec tmux new-session -s "$managed_session" "$(shell_join "${wrapped[@]}")"
+fi
+wrapped=("${route_prefix[@]}" ssh "${ssh_opts[@]}" -t "$target" "$remote_cmd")
+exec tmux new-session -s "$managed_session" "$(shell_join "${wrapped[@]}")"

@@ -8,16 +8,13 @@ usage: clipimg-put [target|d|s|c|j] [remote-dir]
 Copies the current macOS clipboard image to a reachable Skillbox host and puts the
 remote image path back on the local clipboard.
 
-Targets:
-  d, default   skillbox@skillbox-portfolio-devbox
-  s           aiops@sweet-potato-prod
-  c           worker@conference1-wsl (direct WSL; OSC52-capable)
-  j           skillbox@skillbox-jeremy-3
+Targets are resolved by the tracked Skillbox clipboard host registry. Common
+aliases are d, s, c, and j; an explicit user@host uses the generic profile.
 
 Default remote dir: ~/clipboard-images
 
-Conference: direct WSL is preferred. Set SKILLBOX_CONFERENCE_FALLBACK=conference1-ssh
-only when conference1-wsl is unreachable (OSC52-hostile fallback).
+Conference: direct WSL is preferred. Use the explicit conference1-ssh alias only
+as the OSC52-hostile recovery path.
 EOF
 }
 
@@ -31,44 +28,30 @@ if [ "$(uname -s)" != "Darwin" ]; then
     exit 1
 fi
 
-if ! command -v osascript >/dev/null 2>&1; then
-    echo "clipimg-put: osascript is required" >&2
+target_arg="${1:-d}"
+remote_dir="${2:-~/clipboard-images}"
+wsl_distro="${SKILLBOX_WSL_DISTRO:-Ubuntu}"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd -P)"
+if command -v clipboard-route >/dev/null 2>&1; then
+    route_bin="$(command -v clipboard-route)"
+elif [ -x "$script_dir/../clipboard-route" ]; then
+    route_bin="$script_dir/../clipboard-route"
+else
+    echo "clipimg-put: clipboard-route is required; rerun scripts/clipboard-bootstrap --profile local" >&2
     exit 1
 fi
 
-target_arg="${1:-d}"
-remote_dir="${2:-~/clipboard-images}"
-target=""
-transport="ssh"
-remote_home=""
-wsl_distro="${SKILLBOX_WSL_DISTRO:-Ubuntu}"
-
-case "$target_arg" in
-    d|default|devbox|portfolio|skillbox-portfolio-devbox)
-        target="${SKILLBOX_TARGET:-skillbox@skillbox-portfolio-devbox}"
-        remote_home="/home/skillbox"
-        ;;
-    s|sp|sweet|sweet-potato|sweet-potato-prod)
-        target="aiops@sweet-potato-prod"
-        remote_home="/home/aiops"
-        ;;
-    c|conf|conference|conference1|conference1-wsl)
-        target="${SKILLBOX_CONFERENCE_TARGET:-worker@conference1-wsl}"
-        remote_home="/home/worker"
-        ;;
-    conference1-ssh)
-        target="${SKILLBOX_CONFERENCE_FALLBACK:-conference1-ssh}"
-        transport="wsl"
-        remote_home="/home/worker"
-        ;;
-    j|jeremy|jeremy-vps|skillbox-jeremy|skillbox-jeremy-3)
-        target="${SKILLBOX_JEREMY_TARGET:-skillbox@skillbox-jeremy-3}"
-        remote_home="/home/skillbox"
-        ;;
-    *)
-        target="$target_arg"
-        ;;
-esac
+route_args=("$route_bin" "$target_arg" --format tsv)
+if [ -f "$script_dir/hosts.json" ]; then
+    route_args+=(--hosts "$script_dir/hosts.json")
+fi
+if ! route_tsv="$("${route_args[@]}")"; then
+    echo "clipimg-put: target is not present in the canonical clipboard route registry" >&2
+    exit 1
+fi
+IFS=$'\t' read -r target transport remote_home _profile <<<"$route_tsv"
+[ "$remote_home" = "-" ] && remote_home=""
+[ "$transport" = "-" ] && transport="ssh"
 
 if [ -z "$remote_home" ] && [ "$transport" != "wsl" ]; then
     remote_home="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$target" 'printf %s "$HOME"')"
@@ -85,52 +68,35 @@ esac
 
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/clipimg-put.XXXXXX")"
 trap 'rm -rf "$workdir"' EXIT
-local_png="$workdir/clipboard.png"
+if command -v clipboard-snapshot >/dev/null 2>&1; then
+    snapshot_bin="$(command -v clipboard-snapshot)"
+elif [ -x "$script_dir/../clipboard-snapshot" ]; then
+    snapshot_bin="$script_dir/../clipboard-snapshot"
+else
+    echo "clipimg-put: clipboard-snapshot is required; rerun scripts/clipboard-bootstrap --profile local" >&2
+    exit 1
+fi
 
-jxa="$workdir/read-clipboard-image.js"
-cat >"$jxa" <<'JXA'
-ObjC.import('AppKit')
-ObjC.import('Foundation')
-
-function run(argv) {
-  const out = argv[0]
-  const pb = $.NSPasteboard.generalPasteboard
-  let data = pb.dataForType($.NSPasteboardTypePNG)
-
-  if (!data) {
-    const tiff = pb.dataForType($.NSPasteboardTypeTIFF)
-    if (tiff) {
-      const image = $.NSImage.alloc.initWithData(tiff)
-      const rep = $.NSBitmapImageRep.imageRepWithData(image.TIFFRepresentation)
-      if (rep) {
-        data = rep.representationUsingTypeProperties(4, $())
-      }
-    }
-  }
-
-  if (!data) {
-    throw new Error('clipboard does not contain PNG or TIFF image data')
-  }
-
-  const ok = data.writeToFileAtomically($(out).stringByStandardizingPath, true)
-  if (!ok) {
-    throw new Error('could not write clipboard image to ' + out)
-  }
-}
-JXA
-
-if ! osascript -l JavaScript "$jxa" "$local_png" >/dev/null; then
-    echo "clipimg-put: clipboard does not currently contain an image" >&2
+if ! snapshot_json="$($snapshot_bin --materialize-dir "$workdir")"; then
+    printf '%s\n' "$snapshot_json" >&2
+    echo "clipimg-put: clipboard does not currently contain a supported image" >&2
+    exit 1
+fi
+local_image="$(printf '%s' "$snapshot_json" | python3 -c 'import json,sys; p=json.load(sys.stdin); print(p.get("artifact") or "")')"
+kind="$(printf '%s' "$snapshot_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("kind", ""))')"
+if [ "$kind" != "image" ] || [ ! -f "$local_image" ]; then
+    echo "clipimg-put: clipboard snapshot is '$kind', not an image" >&2
     exit 1
 fi
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-remote_file="${remote_dir%/}/clipboard-${timestamp}.png"
+extension=".${local_image##*.}"
+remote_file="${remote_dir%/}/clipboard-${timestamp}${extension}"
 printf -v remote_dir_q '%q' "$remote_dir"
 printf -v remote_file_q '%q' "$remote_file"
 
 if [ "$transport" = "wsl" ]; then
-    encoded="$(base64 <"$local_png" | tr -d '\r\n')"
+    encoded="$(base64 <"$local_image" | tr -d '\r\n')"
     ssh -o BatchMode=yes -o ConnectTimeout=10 "$target" "wsl -d $wsl_distro --cd ~ --exec bash -s" <<REMOTE
 set -euo pipefail
 mkdir -p $remote_dir_q
@@ -140,7 +106,7 @@ B64
 REMOTE
 else
     ssh -o BatchMode=yes -o ConnectTimeout=10 "$target" "mkdir -p $remote_dir_q"
-    scp -q "$local_png" "$target:$remote_file"
+    scp -q "$local_image" "$target:$remote_file"
 fi
 
 printf '%s' "$remote_file" | /usr/bin/pbcopy

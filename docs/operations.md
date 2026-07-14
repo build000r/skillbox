@@ -542,8 +542,8 @@ fleet lifecycle tools. See the [Fleet Management](operations.md#fleet-management
 
 ## Clipboard bootstrap
 
-Skillbox owns OSC52 clipboard integration for operator Mac + Ghostty, SSH/mosh
-remotes, nested tmux, and Conference1 direct WSL. Source bundle:
+Skillbox owns seamless paste plus OSC52 copy for operator Mac + Ghostty,
+SSH/mosh remotes, nested tmux, and Conference1 direct WSL. Source bundle:
 `scripts/clipboard/`. Design contract: `docs/clipboard-bootstrap.md`.
 
 One-command bootstrap:
@@ -564,10 +564,14 @@ scripts/clipboard-bootstrap --profile generic --target user@host --dry-run
 
 Usage after install:
 
+- Text/image paste: copy, focus the existing `d2`/`d3` pane, press `Cmd+V` or
+  `Ctrl+V`; the router never chooses a host or sends Enter
 - Text copy: `printf 'hello\n' | clipcopy` or tmux copy-mode `y` / Enter / mouse drag
 - Linux `pbcopy` shim on remotes delegates to `clipcopy`
-- Image transfer (Darwin only): screenshot then `clipimg-put d|s|j|c` — pastes the
-  **remote file path**, not binary image data through the terminal
+- Recovery only: `clipimg-put d|s|j|c` explicitly uploads and replaces the Mac
+  clipboard with a remote path
+- Truth surface: `clipboard-paste status|doctor|explain --profile d3`
+- Reversal: `scripts/clipboard-bootstrap uninstall` or `rollback`
 - Conference1: prefer direct `worker@conference1-wsl`; `conference1-ssh` Windows
   wrapper is OSC52-hostile fallback only
 

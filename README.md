@@ -31,6 +31,21 @@ One command. It clones the repo, hydrates your `.env`, initializes durable state
 
 Cautious? Append `--dry-run` to see the full plan before anything runs.
 
+### Seamless image paste
+
+To paste a copied Mac image into an existing remote Codex session with the same
+`Cmd+V` or `Ctrl+V` you already use, install the reversible local + d3 bundle
+once:
+
+```bash
+scripts/clipboard-bootstrap --profile d3 --apply-remote
+```
+
+Then copy an image, focus the `d2`/`d3` pane, and paste. There is no helper
+command, host selection, second paste, or Enter. See
+[clipboard bootstrap](docs/clipboard-bootstrap.md) for status, security,
+fallback, rollback, and uninstall.
+
 ## TL;DR
 
 Remote dev platforms hand you a control plane you did not ask for. You want one
