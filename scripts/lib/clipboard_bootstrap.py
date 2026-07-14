@@ -770,6 +770,7 @@ def remote_install_script() -> str:
     """Shell script run on remote host via stdin (or SKILLBOX_CLIPBOARD_BUNDLE_B64)."""
     return f"""#!/usr/bin/env bash
 set -euo pipefail
+umask 077
 bundle_dir="${{TMPDIR:-/tmp}}/skillbox-clipboard.$$"
 trap 'rm -rf "$bundle_dir"' EXIT
 mkdir -p "$bundle_dir"
@@ -783,6 +784,7 @@ config_dir="$HOME/.config/skillbox"
 python_dir="$HOME/.local/share/skillbox/python/lib"
 state_dir="$HOME/.local/state/skillbox/clipboard-bootstrap"
 mkdir -p "$bin_dir" "$config_dir" "$python_dir" "$state_dir"
+chmod 0700 "$state_dir"
 snapshot_set() {{
   snapshot_dir="$1"
   rm -rf "$snapshot_dir"
@@ -793,6 +795,7 @@ snapshot_set() {{
     snapshot_path="$2"
     if [ -f "$snapshot_path" ]; then
       cp -p "$snapshot_path" "$snapshot_dir/files/$snapshot_id"
+      chmod 0600 "$snapshot_dir/files/$snapshot_id"
       snapshot_mode=$(stat -c '%a' "$snapshot_path" 2>/dev/null || stat -f '%Lp' "$snapshot_path")
       printf '%s\t1\t%s\t%s\n' "$snapshot_id" "$snapshot_mode" "$snapshot_path" >>"$snapshot_dir/records.tsv"
     else
