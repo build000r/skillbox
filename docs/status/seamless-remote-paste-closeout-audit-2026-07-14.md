@@ -23,7 +23,7 @@ neighboring sessions.
 | Secure artifact transport | Atomic content-addressed receiver, hash/size/path/mode checks, quota/TTL/dedupe, exact canceled-artifact deletion | Proven by adversarial tests; latest delete revision not remote-deployed |
 | Agent adapter | Codex remote readable path decision plus Claude/generic fallback | Proven; live `devbox-1` showed `[Image #1]` and semantic confirmation |
 | Feedback | 500 ms delayed notice, stable errors, retry/doctor, cancel, private receipts | Proven by deterministic tests |
-| Lifecycle | Empty-HOME install reached `ready`; uninstall restored tmux/Ghostty byte-exactly and left no managed files or bytecode | Proven locally |
+| Lifecycle | Exact commit `4b79a71` was cloned with `--no-local` into an empty fixture; install reached `ready`, uninstall restored tmux/Ghostty byte-exactly, and managed residue was zero | Proven from a fresh local clone |
 | Diagnostics | Live local listener discovery, private modes, route freshness, duplicates, redacted status/metrics | Proven locally |
 | Focused regression | 157 passed, one opt-in live clipboard observer skipped; Ruff/compile/Bash/diff clean | Proven |
 | Offline closeout | `20260714T210526Z-smoke`: unit/static/bootstrap PASS; all live rows explicit SKIP | Proven as smoke only |
@@ -46,7 +46,7 @@ neighboring sessions.
 | `.7.3` real d3 + devbox-1 | `devbox-1` semantic/hash/clipboard proof | Direct d3 is required and unclaimed |
 | `.7.4` full text matrix | Offline and smoke evidence | Real Ghostty SSH/mosh/nested/direct matrix, without disturbing unrelated sessions |
 | `.7.5` stability/latency | Reconnect generation, concurrency, dedupe, lifecycle tests; two receipt samples | Rollout-size authorized sample and live reconnect/reattach evidence |
-| `.7.6` fresh clone | Empty-HOME source fixture | Commit/push, clone that exact commit, repeat install/update/uninstall/fallback from clone |
+| `.7.6` fresh clone | Exact local clone of `4b79a71` reached `ready` and uninstalled with zero managed residue | Push, prove origin contains the commits, then clone from origin; remote/fallback rows remain dependency-gated |
 | `.7.7` independent review | This self-audit prepares the packet | A genuinely independent reviewer must verify artifacts after all live rows pass |
 
 ## Expansion Beads
