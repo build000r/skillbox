@@ -583,9 +583,12 @@ class ClipboardSmartPasteTests(unittest.TestCase):
     def test_cli_failure_writes_private_bounded_receipt_and_one_repair(self) -> None:
         output = io.StringIO()
         notices: list[str] = []
+        secret_path = "/Users/operator/Secret Project/private-image.png"
         with (
             mock.patch.object(
-                sp, "smart_paste", side_effect=TransferError("authentication failed")
+                sp,
+                "smart_paste",
+                side_effect=TransferError(f"authentication failed for {secret_path}"),
             ),
             mock.patch.object(
                 sp,
@@ -608,14 +611,88 @@ class ClipboardSmartPasteTests(unittest.TestCase):
         self.assertEqual(code, 1)
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["error"]["code"], "auth_failed")
+        self.assertNotIn(secret_path, output.getvalue())
+        self.assertNotIn(secret_path, notices[0])
         self.assertEqual(
             payload["repair"],
             "press Cmd+V to retry or run clipboard-paste doctor",
         )
         receipt = Path(payload["receipt_path"])
         self.assertEqual(stat.S_IMODE(receipt.stat().st_mode), 0o600)
+        self.assertIn(secret_path, receipt.read_text())
         self.assertEqual(len(notices), 1)
         self.assertLessEqual(len(notices[0]), 400)
+
+    def test_cli_failure_with_unsafe_runtime_still_returns_redacted_json(self) -> None:
+        unsafe_runtime = self.root / "unsafe-runtime"
+        unsafe_runtime.symlink_to(self.root / "redirected-runtime")
+        output = io.StringIO()
+        notices: list[str] = []
+        secret_path = "/Users/operator/private-image.png"
+        with (
+            mock.patch.object(
+                sp,
+                "smart_paste",
+                side_effect=sp.SmartPasteError(
+                    f"smart-paste runtime root must not be a symlink: {secret_path}"
+                ),
+            ),
+            mock.patch.object(
+                sp,
+                "notify",
+                side_effect=lambda message, **_kwargs: notices.append(message),
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            code = sp.main(
+                [
+                    "--pane",
+                    self.pane,
+                    "--client",
+                    self.client,
+                    "--runtime-root",
+                    str(unsafe_runtime),
+                    "--json",
+                ]
+            )
+        self.assertEqual(code, 1)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["error"]["code"], "paste_rejected")
+        self.assertIsNone(payload["receipt_path"])
+        self.assertNotIn(secret_path, output.getvalue())
+        self.assertNotIn(secret_path, notices[0])
+
+    def test_non_json_cli_failure_does_not_echo_private_error(self) -> None:
+        stderr = io.StringIO()
+        notices: list[str] = []
+        secret_path = "/Users/operator/private-image.png"
+        with (
+            mock.patch.object(
+                sp,
+                "smart_paste",
+                side_effect=TransferError(f"authentication failed for {secret_path}"),
+            ),
+            mock.patch.object(
+                sp,
+                "notify",
+                side_effect=lambda message, **_kwargs: notices.append(message),
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = sp.main(
+                [
+                    "--pane",
+                    self.pane,
+                    "--client",
+                    self.client,
+                    "--runtime-root",
+                    str(self.runtime),
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("auth_failed", stderr.getvalue())
+        self.assertNotIn(secret_path, stderr.getvalue())
+        self.assertNotIn(secret_path, notices[0])
 
     def test_cli_cancel_supersedes_inflight_gesture_without_injection(self) -> None:
         notices: list[str] = []
