@@ -78,9 +78,10 @@ an operator tmux server.
 
 After checkpointing, a `git clone --no-local` of exact commit `4b79a71` repeated
 that original empty-HOME proof. A later `git clone --no-local --no-hardlinks` of
-exact commit `13ff2d0` refreshed the current status contract: local install was
-ready, route state was correctly `ambiguous` without a focused pane, no target
-probe ran, and uninstall left zero files or symlinks. These prove local
+exact commit `23216b7` refreshed the current status contract: local install was
+ready, route state was correctly `ambiguous` without a focused pane, current
+redaction loaded, no target probe ran, and uninstall left zero files or
+symlinks. These prove local
 committed-clone reproducibility at the named commits; they do not claim
 origin/push, the later local receiver/status/bootstrap hardening, or remote-host
 parity.

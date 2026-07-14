@@ -23,7 +23,7 @@ neighboring sessions.
 | Secure artifact transport | Atomic content-addressed receiver, hash/size/path/mode checks, quota/TTL/dedupe, exact canceled-artifact deletion, private single-link lock validation | Proven by adversarial tests; latest receiver revisions not remote-deployed |
 | Agent adapter | Codex remote readable path decision plus Claude/generic fallback | Proven; live `devbox-1` showed `[Image #1]` and semantic confirmation |
 | Feedback | 500 ms delayed notice, stable errors, retry/doctor, cancel, private receipts | Proven by deterministic tests |
-| Lifecycle | Exact commit `13ff2d0` was cloned with `--no-local --no-hardlinks` into an empty fixture; install was ready, route state was correctly `ambiguous` without focus, no target probe ran, and uninstall left zero files/symlinks | Proven from a fresh local clone; later local hardening still needs the release clone/push gate |
+| Lifecycle | Exact commit `23216b7` was cloned with `--no-local --no-hardlinks` into an empty fixture; install was ready, route state was correctly `ambiguous` without focus, current redaction loaded, no target probe ran, and uninstall left zero files/symlinks | Proven from a fresh local clone; origin/push remains a release gate |
 | Diagnostics | Live local listener discovery, private modes, route freshness, duplicates, redacted target/session/HOME/receipt output, fail-closed manifest parsing | Proven locally |
 | Partial failure | Remote apply/reversal errors suppress hostile output, state which side may be partial, and print one exact idempotent resume command | Proven with fully stubbed SSH |
 | Focused regression | 176 passed, one opt-in live clipboard observer skipped; Ruff/Bash/diff clean | Proven |
@@ -47,7 +47,7 @@ neighboring sessions.
 | `.7.3` real d3 + devbox-1 | `devbox-1` semantic/hash/clipboard proof | Direct d3 is required and unclaimed |
 | `.7.4` full text matrix | Offline and smoke evidence | Real Ghostty SSH/mosh/nested/direct matrix, without disturbing unrelated sessions |
 | `.7.5` stability/latency | Reconnect generation, concurrency, dedupe, lifecycle tests; two receipt samples | Rollout-size authorized sample and live reconnect/reattach evidence |
-| `.7.6` fresh clone | Exact local clone of `13ff2d0` reported install-ready/route-ambiguous without focus and uninstalled with zero managed residue | Push, prove origin contains the commits, then clone from origin; remote/fallback rows remain dependency-gated |
+| `.7.6` fresh clone | Exact local clone of `23216b7` reported install-ready/route-ambiguous without focus, loaded current redaction, and uninstalled with zero managed residue | Push, prove origin contains the commits, then clone from origin; remote/fallback rows remain dependency-gated |
 | `.7.7` independent review | This self-audit prepares the packet | A genuinely independent reviewer must verify artifacts after all live rows pass |
 
 ## Expansion Beads
