@@ -871,13 +871,21 @@ def _record_installed_state(root: Path, home: Path) -> None:
     state = lifecycle_state_dir(home)
     manifest_path = state / "manifest.json"
     manifest = _load_manifest(root, home, require_all=True)
-    manifest["installed_version"] = bundle_revision(root, home)
-    manifest["installed_at"] = time.time()
-    manifest["installed_hashes"] = {
+    installed_version = bundle_revision(root, home)
+    installed_hashes = {
         str(path): _sha256(path)
         for path in _managed_paths(root, home)
         if path.is_file()
     }
+    if (
+        manifest.get("installed_version") == installed_version
+        and manifest.get("installed_hashes") == installed_hashes
+        and manifest.get("installed_at") is not None
+    ):
+        return
+    manifest["installed_version"] = installed_version
+    manifest["installed_at"] = time.time()
+    manifest["installed_hashes"] = installed_hashes
     _write_json_private(manifest_path, manifest)
 
 

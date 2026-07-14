@@ -134,11 +134,15 @@ class ClipboardBootstrapTests(unittest.TestCase):
             home = Path(tmpdir) / "home"
             home.mkdir()
             CB.install_local(home, dry_run=False, root=ROOT_DIR)
+            manifest = CB.lifecycle_state_dir(home) / "manifest.json"
+            manifest_before = manifest.read_bytes()
             issues_first = CB.verify_local_install(home)
             self.assertEqual(issues_first, [])
             self.assertTrue(CB.is_idempotent_reinstall(home, root=ROOT_DIR))
-            CB.install_local(home, dry_run=False, root=ROOT_DIR)
+            with mock.patch.object(CB.time, "time", return_value=9_999_999_999.0):
+                CB.install_local(home, dry_run=False, root=ROOT_DIR)
             self.assertTrue(CB.is_idempotent_reinstall(home, root=ROOT_DIR))
+            self.assertEqual(manifest.read_bytes(), manifest_before)
             tmux_conf = home / ".tmux.conf"
             lines = [
                 line
