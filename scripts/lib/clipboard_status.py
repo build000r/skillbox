@@ -20,6 +20,10 @@ SCHEMA_VERSION = 1
 LEGACY_CLIPBOARD_PORTS = {6000, 18339}
 
 
+class ListenerProbeError(RuntimeError):
+    """Clipboard listener containment could not be observed safely."""
+
+
 def _check(
     check_id: str, status: str, message: str, repair: str | None = None
 ) -> dict[str, Any]:
@@ -34,31 +38,45 @@ def diagnose_facts(facts: Mapping[str, Any]) -> list[dict[str, Any]]:
         for item in listeners
         if item.get("address") not in {"127.0.0.1", "::1", "unix"}
     ]
-    checks.append(
-        _check(
-            "network.containment",
-            "fail" if exposed else "pass",
-            "clipboard-related listener is exposed beyond loopback"
-            if exposed
-            else "no non-loopback clipboard listener",
-            "stop the exposed process; seamless paste requires no listener"
-            if exposed
-            else None,
+    listener_probe_error = bool(facts.get("listener_probe_error"))
+    if listener_probe_error:
+        checks.append(
+            _check(
+                "network.containment",
+                "fail",
+                "clipboard listener containment could not be observed",
+                "install or repair lsof, then rerun clipboard-paste doctor",
+            )
         )
-    )
+    else:
+        checks.append(
+            _check(
+                "network.containment",
+                "fail" if exposed else "pass",
+                "clipboard-related listener is exposed beyond loopback"
+                if exposed
+                else "no non-loopback clipboard listener",
+                "stop the exposed process; seamless paste requires no listener"
+                if exposed
+                else None,
+            )
+        )
     unsafe_modes = [
         item
-        for item in facts.get("private_files", [])
-        if int(item.get("mode", 0)) & 0o077
+        for item in facts.get("private_paths", facts.get("private_files", []))
+        if (
+            item.get("kind", "file") not in {"file", "directory"}
+            or int(item.get("mode", 0)) & 0o077
+        )
     ]
     checks.append(
         _check(
             "files.private_modes",
             "fail" if unsafe_modes else "pass",
-            "private state has group or world permissions"
+            "private state has an unsafe mode, type, or symlink"
             if unsafe_modes
             else "private state modes are restricted",
-            "chmod 600 the named files and rerun clipboard-paste doctor"
+            "remove state symlinks; chmod directories 700 and files 600; rerun clipboard-paste doctor"
             if unsafe_modes
             else None,
         )
@@ -161,10 +179,10 @@ def collect_clipboard_listeners(
             check=False,
             timeout=3,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ListenerProbeError("clipboard listener probe unavailable") from exc
     if result.returncode not in {0, 1}:
-        return []
+        raise ListenerProbeError("clipboard listener probe failed")
     listeners: list[dict[str, Any]] = []
     for line in result.stdout.splitlines()[1:]:
         fields = line.split()
@@ -209,13 +227,34 @@ def _private_file_facts(home: Path) -> list[dict[str, Any]]:
         bootstrap.lifecycle_state_dir(home),
         home / ".cache" / "skillbox" / "smart-paste" / "receipts",
     ):
-        if not root.exists():
+        if not root.exists() and not root.is_symlink():
             continue
-        for path in root.rglob("*"):
-            if path.is_file() and not path.is_symlink():
-                facts.append(
-                    {"path": str(path), "mode": stat.S_IMODE(path.stat().st_mode)}
-                )
+        pending = [root]
+        while pending:
+            path = pending.pop()
+            try:
+                info = path.lstat()
+            except OSError:
+                facts.append({"path": str(path), "mode": 0o777, "kind": "unreadable"})
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                kind = "symlink"
+            elif stat.S_ISDIR(info.st_mode):
+                kind = "directory"
+            elif stat.S_ISREG(info.st_mode):
+                kind = "file"
+            else:
+                kind = "other"
+            facts.append(
+                {"path": str(path), "mode": stat.S_IMODE(info.st_mode), "kind": kind}
+            )
+            if kind == "directory":
+                try:
+                    pending.extend(path.iterdir())
+                except OSError:
+                    facts.append(
+                        {"path": str(path), "mode": 0o777, "kind": "unreadable"}
+                    )
     return facts
 
 
@@ -252,6 +291,7 @@ def inspect_status(
     profile: str = "d3",
     route_path: Path | None = None,
     now: float | None = None,
+    listener_runner: Any = subprocess.run,
 ) -> dict[str, Any]:
     home = home or Path.home()
     resolved_root = root
@@ -284,9 +324,16 @@ def inspect_status(
             "stale": route_error is not None,
         }
     )
+    listener_probe_error: str | None = None
+    try:
+        listeners = collect_clipboard_listeners(runner=listener_runner)
+    except ListenerProbeError as exc:
+        listeners = []
+        listener_probe_error = str(exc)
     facts = {
-        "listeners": collect_clipboard_listeners(),
-        "private_files": _private_file_facts(home),
+        "listeners": listeners,
+        "listener_probe_error": listener_probe_error,
+        "private_paths": _private_file_facts(home),
         "route_stale": route_error is not None,
         "duplicate_tmux_features": _tmux_duplicate_count(home),
         "legacy_bridge": {},
