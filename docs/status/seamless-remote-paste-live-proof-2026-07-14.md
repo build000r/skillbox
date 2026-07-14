@@ -61,8 +61,8 @@ intent.
 
 ## Local-only follow-up gates
 
-After the live run, the latest local bundle was installed with tmux reload
-disabled. `clipboard-paste status --profile d3 --json` reported `ready`, no
+After the live run, the then-current local bundle was installed with tmux
+reload disabled. `clipboard-paste status --profile d3 --json` reported `ready`, no
 install issues, private modes, no duplicate features, Codex `0.144.4`, and no
 non-loopback clipboard listener. The offline closeout run at
 `20260714T210526Z-smoke` passed unit tests, static checks, and bootstrap launch;
@@ -77,14 +77,18 @@ The fixture used `SKILLBOX_SKIP_TMUX_RELOAD=1`; it neither inspected nor changed
 an operator tmux server.
 
 After checkpointing, a `git clone --no-local` of exact commit `4b79a71` repeated
-that empty-HOME proof: installed status was `ready` at bundle revision
-`2.0.0+8e3b5141bd32`, byte-exact config comparison passed, and managed residue
-after uninstall was zero. This proves local committed-clone reproducibility;
-it does not claim origin/push or remote-host parity.
+that original empty-HOME proof. A later `git clone --no-local --no-hardlinks` of
+exact commit `13ff2d0` refreshed the current status contract: local install was
+ready, route state was correctly `ambiguous` without a focused pane, no target
+probe ran, and uninstall left zero files or symlinks. These prove local
+committed-clone reproducibility at the named commits; they do not claim
+origin/push, the later local receiver/status/bootstrap hardening, or remote-host
+parity.
 
-The final focused source gate reported 157 passed and one explicit opt-in live
-clipboard observer skipped. Ruff, Python compilation, Bash syntax, and
-`git diff --check` also passed. The repository-wide unittest discovery is not a
+The latest focused source gate reported 176 passed and one explicit opt-in live
+clipboard observer skipped. Ruff, Bash syntax, generated registry/docs tests,
+documentation links/hygiene, and `git diff --check` also passed. The
+repository-wide unittest discovery is not a
 release signal for this change: it hit the unrelated current-suite failure
 `test_agent_ops_adapters.CommandAdapterTests.test_env_tunable_timeout_extends_sleeping_fake_binary`
 and later hung in `test_runtime_manager...test_first_box_runs_connectors_acceptance_and_open_surface`;
