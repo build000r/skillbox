@@ -10,7 +10,10 @@ After bootstrap, copy a screenshot or image, focus the existing `d2`/`d3`
 terminal, and press `Cmd+V` (or terminal-first `Ctrl+V`). There is no host
 argument, helper command, second paste, or Enter. Text stays on Ghostty's
 native bracketed-paste path for `Cmd+V`; `Ctrl+V` uses the same exact-pane
-router. A readable remote image path becomes a visible Codex attachment.
+router. For an image, the router uploads bounded media bytes and injects a
+readable remote path into the exact pane; the proven Codex adapter renders that
+reference as a visible attachment. This is reference injection, not raw image
+bytes traveling through the terminal paste protocol.
 
 The launcher registers the exact local pane/client, canonical host, transport,
 and `devbox-N` generation. Image transfer refuses unknown or stale routes.
@@ -282,3 +285,21 @@ scripts/clipboard-proof.sh --live   # SKIP on non-Darwin or without Ghostty
 ```
 
 See `docs/troubleshooting.md` for failure modes.
+
+## Field report: what still hurt?
+
+After a real attempt, preserve the operator's own words and attach the redacted
+truth surfaces. Do not include clipboard contents, remote paths, hostnames, pane
+text, or session listings.
+
+```text
+Gesture and surface: [Cmd+V or Ctrl+V] in [d2 or d3], [SSH or mosh]
+Expected:
+Observed:
+What was surprising or required a second action:
+Recovery used, if any:
+clipboard-paste status --profile d3 --json: [attach redacted output]
+clipboard-paste doctor --profile d3 --json: [attach redacted output]
+Receipt/error class and elapsed_ms: [no paths or clipboard data]
+Would this feel local if the issue disappeared? [yes/no, why]
+```
