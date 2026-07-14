@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from . import clipboard_adapter
 from . import clipboard_bootstrap as bootstrap
 from . import clipboard_fallback
 from . import clipboard_route
@@ -375,6 +376,7 @@ def inspect_status(
     environment: Mapping[str, str] | None = None,
     probe_target_live: bool = False,
     target_runner: Any = subprocess.run,
+    codex_version_fn: Any = _codex_version,
 ) -> dict[str, Any]:
     home = home or Path.home()
     resolved_root = root
@@ -443,6 +445,23 @@ def inspect_status(
         "legacy_bridge": {},
     }
     checks = diagnose_facts(facts)
+    codex_version = codex_version_fn()
+    adapter = clipboard_adapter.choose_adapter(
+        agent="codex",
+        agent_version=codex_version,
+        input_kind="remote_image_path",
+        route_ready=route_record is not None,
+    )
+    checks.append(
+        _check(
+            "agent.codex_attachment",
+            "pass" if adapter.state == "ready" else "fail",
+            adapter.reason,
+            None
+            if adapter.state == "ready"
+            else "update Codex to the proven version, then rerun clipboard-paste doctor",
+        )
+    )
     failing = [check for check in checks if check["status"] == "fail"]
     unsupported = not profile_record["capabilities"]["inbound"]["smart_path_paste"]
     state = classify_state(
@@ -493,8 +512,8 @@ def inspect_status(
         "capabilities": profile_record["capabilities"],
         "fallback": fallback,
         "agent": {
-            "codex_version": _codex_version(),
-            "adapter": "remote_path_attachment",
+            "codex_version": codex_version,
+            "adapter": adapter.public_dict(),
         },
         "checks": checks,
         "last_receipt": str(latest) if latest else None,

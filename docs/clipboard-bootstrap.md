@@ -186,6 +186,9 @@ Target reachability is never implicit: `--probe-target` runs exactly one
 non-interactive `ssh ... true` check, never lists or attaches sessions, and
 reports only `attempted`, `reachable`, and a redacted stable error class under
 `target_probe`.
+The `agent.adapter` object is also evidence-backed: Codex path attachment is
+reported ready only for the proven minimum `0.144.4` or newer. Older or unknown
+versions degrade to a visible text-reference strategy with an update repair.
 
 `clipboard-metrics` requires 20 successful samples before it calls a latency
 distribution rollout-grade. A smaller set remains diagnostic evidence only.

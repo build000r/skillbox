@@ -122,6 +122,7 @@ python 12 user 8u IPv4 0 0t0 TCP *:9999 (LISTEN)
                 now=1000.0,
                 environment={},
                 probe_target_live=True,
+                codex_version_fn=lambda: "codex-cli 0.144.4",
                 target_runner=lambda command, **_kwargs: subprocess.CompletedProcess(
                     command, 255, "", "connection timed out"
                 ),
@@ -247,6 +248,7 @@ python 12 user 8u IPv4 0 0t0 TCP *:9999 (LISTEN)
                 now=1000.0,
                 environment={"TMUX": "/tmp/tmux-fixture,1,0", "TMUX_PANE": "%42"},
                 tmux_runner=tmux_runner,
+                codex_version_fn=lambda: "codex-cli 0.144.4",
                 listener_runner=lambda *_args, **_kwargs: subprocess.CompletedProcess(
                     [], 1, "", ""
                 ),
@@ -254,6 +256,43 @@ python 12 user 8u IPv4 0 0t0 TCP *:9999 (LISTEN)
             self.assertEqual(report["state"], "ready")
             self.assertTrue(report["route"]["ready"])
             self.assertEqual(report["route"]["route_id"], record["route_id"])
+
+    def test_exact_route_with_old_codex_is_degraded_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            home.mkdir()
+            clipboard_bootstrap.install_local(home, root=ROOT_DIR)
+            _, route_path = clipboard_session.register(
+                profile="d3",
+                transport="ssh",
+                terminal_id="ghostty-old-codex",
+                root=home / ".local" / "state" / "skillbox" / "paste-routes",
+                hosts_path=ROOT_DIR / "scripts" / "clipboard" / "hosts.json",
+                now=900.0,
+                ttl_seconds=1_000,
+                stamp_tmux=False,
+            )
+            report = status.inspect_status(
+                home=home,
+                root=ROOT_DIR,
+                profile="d3",
+                route_path=route_path,
+                now=1000.0,
+                environment={},
+                codex_version_fn=lambda: "codex-cli 0.143.9",
+                listener_runner=lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                    [], 1, "", ""
+                ),
+            )
+            self.assertEqual(report["state"], "degraded")
+            adapter_report = report["agent"]["adapter"]
+            self.assertEqual(adapter_report["strategy"], "text_reference")
+            check = next(
+                item
+                for item in report["checks"]
+                if item["id"] == "agent.codex_attachment"
+            )
+            self.assertEqual(check["status"], "fail")
 
     def test_unsupported_profile_is_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
