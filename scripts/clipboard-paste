@@ -24,10 +24,19 @@ def main() -> int:
     parser.add_argument("command", choices=("status", "doctor", "explain"), nargs="?", default="status")
     parser.add_argument("--profile", default="d3")
     parser.add_argument("--route-path", type=Path)
+    parser.add_argument(
+        "--probe-target",
+        action="store_true",
+        help="run one explicit non-interactive SSH true reachability probe",
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     try:
-        report = clipboard_status.inspect_status(profile=args.profile, route_path=args.route_path)
+        report = clipboard_status.inspect_status(
+            profile=args.profile,
+            route_path=args.route_path,
+            probe_target_live=args.probe_target,
+        )
     except (OSError, ValueError) as exc:
         print(f"clipboard-paste: {exc}", file=sys.stderr)
         return 1

@@ -59,6 +59,79 @@ python 12 user 8u IPv4 0 0t0 TCP *:9999 (LISTEN)
         self.assertEqual(status.classify_state(ambiguous=True), "ambiguous")
         self.assertEqual(status.classify_state(offline=True), "offline")
 
+    def test_explicit_target_probe_is_minimal_redacted_and_reports_offline(self) -> None:
+        observed: list[str] = []
+        secret = "/home/user/private/session"
+
+        def runner(
+            command: list[str], **_kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            observed.extend(command)
+            return subprocess.CompletedProcess(
+                command, 255, "", f"connection failed near {secret}"
+            )
+
+        result = status.probe_ssh_target("skillbox@example", runner=runner)
+        self.assertEqual(
+            observed,
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=3",
+                "skillbox@example",
+                "true",
+            ],
+        )
+        self.assertEqual(result["reachable"], False)
+        self.assertEqual(result["error"], "offline_or_unreachable")
+        self.assertNotIn(secret, status.dump(result))
+
+    def test_target_probe_rejects_option_injection_without_spawning_ssh(self) -> None:
+        called = False
+
+        def runner(*_args: object, **_kwargs: object) -> None:
+            nonlocal called
+            called = True
+
+        result = status.probe_ssh_target("-oProxyCommand=id", runner=runner)
+        self.assertEqual(result["error"], "invalid_target")
+        self.assertFalse(called)
+
+    def test_ready_route_with_failed_explicit_probe_reports_offline(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            home.mkdir()
+            clipboard_bootstrap.install_local(home, root=ROOT_DIR)
+            _, route_path = clipboard_session.register(
+                profile="d3",
+                transport="ssh",
+                terminal_id="ghostty-offline-fixture",
+                root=home / ".local" / "state" / "skillbox" / "paste-routes",
+                hosts_path=ROOT_DIR / "scripts" / "clipboard" / "hosts.json",
+                now=900.0,
+                ttl_seconds=1_000,
+                stamp_tmux=False,
+            )
+            report = status.inspect_status(
+                home=home,
+                root=ROOT_DIR,
+                profile="d3",
+                route_path=route_path,
+                now=1000.0,
+                environment={},
+                probe_target_live=True,
+                target_runner=lambda command, **_kwargs: subprocess.CompletedProcess(
+                    command, 255, "", "connection timed out"
+                ),
+                listener_runner=lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                    [], 1, "", ""
+                ),
+            )
+            self.assertEqual(report["state"], "offline")
+            self.assertEqual(report["target_probe"]["reachable"], False)
+
     def test_doctor_detects_containment_modes_stale_route_and_duplicate_tmux(
         self,
     ) -> None:

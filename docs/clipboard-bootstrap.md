@@ -168,6 +168,7 @@ Status and lifecycle:
 ```bash
 clipboard-paste status --profile d3
 clipboard-paste doctor --profile d3
+clipboard-paste doctor --profile d3 --probe-target  # explicit `ssh ... true`
 clipboard-paste explain --profile d3 --json
 clipboard-metrics                 # local receipts only; no host contact
 
@@ -181,6 +182,10 @@ Inside tmux, the status command resolves the current pane, attached client,
 route path, and generation automatically. `ready` therefore means an exact
 route was revalidated; an installed bundle with no exact current route reports
 `ambiguous` and recommends relaunching through `d2` or `d3`.
+Target reachability is never implicit: `--probe-target` runs exactly one
+non-interactive `ssh ... true` check, never lists or attaches sessions, and
+reports only `attempted`, `reachable`, and a redacted stable error class under
+`target_probe`.
 
 `clipboard-metrics` requires 20 successful samples before it calls a latency
 distribution rollout-grade. A smaller set remains diagnostic evidence only.
