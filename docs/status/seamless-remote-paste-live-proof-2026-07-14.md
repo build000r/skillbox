@@ -27,6 +27,16 @@ signaled, reloaded, or written during this proof.
   expected SHA-256. Remote SHA-256 and byte size matched; the route record was
   removed when the disposable local attachment exited.
 
+## Operator physical-key attestation
+
+After the source-only hardening and safety handoff, the operator copied an
+image, focused the existing `devbox-1` Codex composer, pressed `Cmd+V` once,
+and reported that the one-key path worked. The agent did not automate the key,
+inspect the pane, press Enter, enumerate tmux servers, or contact any SSH host
+during this attestation. This closes the physical-key question for the nested
+`devbox-1` route; it does not prove direct d3, current-source remote deployment,
+or any other host/session.
+
 ## Rejected attempt and fix
 
 An earlier direct harness invocation found that the clipboard had changed from
@@ -46,9 +56,8 @@ intent.
 
 ## Not claimed in this artifact
 
-- Automated AppleScript key injection is not counted as physical-key proof.
-  macOS would focus the requested surface but the synthetic key did not reach
-  even an isolated plain tmux `C-v` binding reliably.
+- Automated AppleScript key injection is not counted as proof. The physical
+  nested-route proof is the later operator-attested `Cmd+V`, not automation.
 - Other live SSH/mosh hosts and other remote tmux sessions were deliberately
   not touched after the operator restricted scope to `devbox-1`.
 - Direct non-tmux `d3` and the full Sweet/Jeremy/Conference text matrix remain

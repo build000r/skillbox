@@ -1,8 +1,8 @@
 # Seamless remote paste closeout audit — 2026-07-14
 
 Verdict: **not eligible for epic closure yet**. The owned core implementation
-is present and the permitted `devbox-1` semantic proof passed, but required
-physical-key, direct d3/mosh, full text-matrix, sample-size, source/install
+is present and the permitted `devbox-1` semantic plus physical-key proof passed,
+but required direct d3/mosh, full text-matrix, sample-size, source/install
 parity, origin-clone, cross-platform, and independent-review evidence
 is incomplete. No open Bead below is silently counted as complete.
 
@@ -20,6 +20,7 @@ neighboring sessions.
 | Architecture/adopt gate | `docs/seamless-remote-paste-architecture.md`; cc-clip X11 exposure rejected and removed | Proven |
 | Typed capture | macOS AppKit plus experimental Linux/Windows substrates; byte/type/dimension/race tests | Proven for macOS source; other platforms experimental |
 | Route identity | Tracked d2/d3 launchers, generation-stamped records, exact pane/client checks | Proven by source/tests and `devbox-1` route record |
+| One-key router | Scoped Ghostty `Cmd+V` to local-tmux dispatch; operator physically confirmed the existing nested `devbox-1` path works; no automation or pane observation was used | Proven for nested `devbox-1`; direct d3 remains separate |
 | Secure artifact transport | Atomic content-addressed receiver, hash/size/path/mode checks, quota/TTL/dedupe, exact canceled-artifact deletion, private single-link lock validation | Proven by adversarial tests; latest receiver revisions not remote-deployed |
 | Agent adapter | Codex remote readable path decision plus Claude/generic fallback | Proven; live `devbox-1` showed `[Image #1]` and semantic confirmation |
 | Feedback | 500 ms delayed notice, stable path-free public errors, retry/doctor, cancel, private `0600` diagnostic receipts | Proven by deterministic hostile tests |
@@ -35,7 +36,7 @@ neighboring sessions.
 | Bead | Implemented evidence | Missing evidence / release action |
 |---|---|---|
 | `.2.4` latency optimization | Two redacted image receipts: p50 881.395 ms, p95 1007.121 ms | At least 20 authorized warm samples; only then decide whether SSH connection reuse is justified |
-| `.4.1` one-key router | Installed Ghostty key list/config, tmux User198/User199 seam, idempotent lifecycle | One real human `Cmd+V`/`Ctrl+V` on the permitted route; synthetic AppleScript is explicitly rejected |
+| `.4.1` one-key router | Installed Ghostty key list/config, tmux User198/User199 seam, byte-idempotent lifecycle, and operator-attested physical `Cmd+V` on nested `devbox-1` | Acceptance complete; tracker may close without claiming direct d3 or current-source remote rollout |
 | `.4.2` text semantics | Native Cmd+V chain, exact bracketed Ctrl+V, multiline/metacharacter fixtures | Real Ghostty checks across every required transport; other sessions/hosts currently out of bounds |
 | `.4.3` exact-pane injection | Deterministic focus/clipboard/route races and live nested `devbox-1` attachment | Required direct d3 proof and latest receiver parity |
 | `.4.4` feedback | Implementation and tests complete | Tracker waits on `.4.3`; close afterward without bypass |
@@ -61,10 +62,9 @@ neighboring sessions.
 
 ## Required next authorization
 
-The smallest safe live step is one manual paste into the already-existing
-`devbox-1` Codex surface. The operator copies the known proof image, focuses
-that exact surface, presses `Cmd+V` once, does not press Enter, and reports
-whether `[Image #1]` appeared. No automation will observe even that pane until
-the operator explicitly authorizes it; server enumeration remains forbidden.
-Any direct d3, mosh, remote-helper update, or other-host matrix needs separate
-permission because it falls outside the current session boundary.
+The nested physical-key step is complete. The next live step is current-source
+deployment parity, but the remote helper is shared by the remote account and
+could affect neighboring sessions. It therefore requires explicit authorization
+for the exact `devbox-1` route before any SSH contact or helper update. Direct
+d3, mosh, and other-host matrix rows require separate permission; server
+enumeration remains forbidden.
