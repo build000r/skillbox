@@ -15,6 +15,7 @@ from . import clipboard_bootstrap as bootstrap
 from . import clipboard_fallback
 from . import clipboard_route
 from . import clipboard_session
+from . import clipboard_transfer
 
 
 SCHEMA_VERSION = 1
@@ -221,6 +222,58 @@ def collect_clipboard_listeners(
     return listeners
 
 
+def probe_ssh_target(
+    target: str | None,
+    *,
+    runner: Any = subprocess.run,
+) -> dict[str, Any]:
+    """Run one explicit, non-interactive reachability probe with redacted output."""
+    if not target:
+        return {
+            "attempted": True,
+            "reachable": None,
+            "error": "profile_has_no_ssh_target",
+        }
+    try:
+        target = clipboard_transfer.validate_target(target)
+    except clipboard_transfer.TransferError:
+        return {"attempted": True, "reachable": False, "error": "invalid_target"}
+    command = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=3",
+        target,
+        "true",
+    ]
+    try:
+        result = runner(
+            command,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=4,
+        )
+    except subprocess.TimeoutExpired:
+        return {"attempted": True, "reachable": False, "error": "timeout"}
+    except OSError:
+        return {
+            "attempted": True,
+            "reachable": False,
+            "error": "ssh_unavailable",
+        }
+    if result.returncode == 0:
+        return {"attempted": True, "reachable": True, "error": None}
+    stderr = result.stderr.lower()
+    error = (
+        "authentication_failed"
+        if "permission denied" in stderr or "authentication" in stderr
+        else "offline_or_unreachable"
+    )
+    return {"attempted": True, "reachable": False, "error": error}
+
+
 def _private_file_facts(home: Path) -> list[dict[str, Any]]:
     facts: list[dict[str, Any]] = []
     for root in (
@@ -320,6 +373,8 @@ def inspect_status(
     listener_runner: Any = subprocess.run,
     tmux_runner: Any = subprocess.run,
     environment: Mapping[str, str] | None = None,
+    probe_target_live: bool = False,
+    target_runner: Any = subprocess.run,
 ) -> dict[str, Any]:
     home = home or Path.home()
     resolved_root = root
@@ -359,6 +414,11 @@ def inspect_status(
         else clipboard_route.load_host_config(bootstrap.installed_hosts_path(home))
     )
     profile_record = clipboard_route.resolve_profile(profile, data=host_data)
+    target_probe = (
+        probe_ssh_target(profile_record.get("ssh_target"), runner=target_runner)
+        if probe_target_live
+        else {"attempted": False, "reachable": None, "error": None}
+    )
     fallback = clipboard_fallback.explain_fallback(
         {
             "registered": route_record is not None,
@@ -389,6 +449,7 @@ def inspect_status(
         unsupported=unsupported,
         ambiguous=route_record is None and not route_stale,
         stale=route_stale,
+        offline=target_probe["attempted"] and target_probe["reachable"] is False,
         installed=(bootstrap.lifecycle_state_dir(home) / "manifest.json").is_file(),
         install_issues=bool(install_issues),
         failed_checks=bool(failing),
@@ -418,6 +479,7 @@ def inspect_status(
         "version": version,
         "profile": profile_record["profile"],
         "target": profile_record.get("ssh_target"),
+        "target_probe": target_probe,
         "install": {"ready": not install_issues, "issues": install_issues},
         "route": {
             "ready": route_record is not None,
