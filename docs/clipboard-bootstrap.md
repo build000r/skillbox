@@ -80,6 +80,11 @@ does not poll or retain history. Neither platform is promoted to supported
 until its separate installer/uninstaller, native-text regression, focus-race,
 and real-image proof all pass. The macOS default is unchanged.
 
+Remote bootstrap writes the owned helper and configuration files but never
+sources configuration into an already-running tmux server. Existing remote
+sessions stay live and untouched; new tmux servers pick up the tracked source
+line normally.
+
 ## OSC52 and tmux behavior
 
 `clipcopy` reads stdin, then:
