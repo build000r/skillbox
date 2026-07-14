@@ -42,6 +42,7 @@ KNOWN_ENTRYPOINTS = frozenset(
         "mcp_server.py",
         "pulse.py",
         "Makefile",
+        "clipboard-paste",
     }
 )
 # Minimum node kinds from the agent_ops_brain backend spec graph contract.
@@ -302,6 +303,7 @@ REQUIRED_TIER2_IDS = frozenset(
         "box.status",
         "box.up",
         "box.down",
+        "clipboard.paste",
     }
 )
 REQUIRED_COMMAND_IDS = REQUIRED_TIER1_IDS | REQUIRED_TIER2_IDS
@@ -537,6 +539,49 @@ def default_registry() -> tuple[CommandSpec, ...]:
             examples=("python3 .env-manager/manage.py status --format json",),
             validations=("python3 -m unittest tests.test_cli_units",),
             graph_nodes=("service", "task", "repo", "check"),
+        ),
+        CommandSpec(
+            id="clipboard.paste",
+            tier=2,
+            surface=("cli",),
+            summary="Report, diagnose, or explain exact-route seamless-paste readiness with redacted evidence.",
+            inputs={
+                "command": "enum[status|doctor|explain]?",
+                "profile": "string?",
+                "route_path": "string?",
+                "probe_target": "boolean?",
+                "json": "boolean?",
+            },
+            outputs={
+                "schema_version": "integer",
+                "state": "enum[ready|configured|degraded|stale|unsupported|ambiguous|offline]",
+                "version": "string?",
+                "profile": "string",
+                "target": "string?",
+                "target_probe": "object",
+                "install": "object",
+                "route": "object",
+                "capabilities": "object",
+                "fallback": "object",
+                "agent": "object",
+                "checks": "object[]",
+                "last_receipt": "string?",
+                "generated_at": "number",
+                "redaction": "string",
+            },
+            side_effect="network",
+            risk="low",
+            entrypoint="clipboard-paste",
+            scopes=("profile",),
+            examples=(
+                "clipboard-paste status --profile d3 --json",
+                "clipboard-paste doctor --profile d3 --probe-target --json",
+                "clipboard-paste explain --profile d3 --json",
+            ),
+            validations=(
+                "python3 -m unittest tests.test_clipboard_status tests.test_agent_ops_command_registry",
+            ),
+            graph_nodes=("command", "check", "evidence"),
         ),
         CommandSpec(
             id="runtime.state_backup",
