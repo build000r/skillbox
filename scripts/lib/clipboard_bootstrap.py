@@ -7,8 +7,11 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
+import stat
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,10 +74,17 @@ GHOSTTY_COMMENT = (
 )
 STATE_SUBDIR = ".local/state/skillbox/clipboard-bootstrap"
 SUPPORTED_OPERATOR_PLATFORMS = {"Darwin", "Linux"}
+MAX_LIFECYCLE_JSON_BYTES = 1024 * 1024
+MAX_LIFECYCLE_BACKUP_BYTES = 20 * 1024 * 1024
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class UnsupportedOperatorPlatform(RuntimeError):
     """The local installer has no focus-safe contract for this platform."""
+
+
+class LifecycleError(RuntimeError):
+    """Lifecycle state is unsafe, corrupt, or outside the owned contract."""
 
 
 def operator_platform_supported(system: str | None = None) -> bool:
@@ -248,8 +258,7 @@ def ensure_ghostty_source_line(config: Path, home: Path) -> None:
     if content and not content.endswith("\n"):
         content += "\n"
     content += f"\n{GHOSTTY_COMMENT}\n{line}\n"
-    config.parent.mkdir(parents=True, exist_ok=True)
-    config.write_text(content, encoding="utf-8")
+    _write_text_atomic(config, content)
 
 
 def read_tmux_fragment(root: Path | None = None) -> str:
@@ -308,7 +317,7 @@ def ensure_tmux_source_line(tmux_conf: Path) -> None:
         if content and not content.endswith("\n"):
             content += "\n"
         content += f"\n{TMUX_COMMENT}\n{SOURCE_LINE}\n"
-    tmux_conf.write_text(content, encoding="utf-8")
+    _write_text_atomic(tmux_conf, content)
 
 
 def clipcopy_client_tty_markers() -> tuple[str, ...]:
@@ -322,9 +331,51 @@ def clipcopy_client_tty_markers() -> tuple[str, ...]:
 def _install_file(src: Path, dest: Path, mode: int, *, dry_run: bool) -> None:
     if dry_run:
         return
+    _copy_file_atomic(src, dest, mode=mode)
+
+
+def _copy_file_atomic(src: Path, dest: Path, *, mode: int) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dest)
-    dest.chmod(mode)
+    fd, raw = tempfile.mkstemp(prefix=f".{dest.name}.", dir=dest.parent)
+    tmp = Path(raw)
+    try:
+        with src.open("rb") as source, os.fdopen(fd, "wb", closefd=True) as output:
+            shutil.copyfileobj(source, output)
+            output.flush()
+            os.fsync(output.fileno())
+        tmp.chmod(mode)
+        os.replace(tmp, dest)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+
+
+def _write_text_atomic(path: Path, content: str) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        mode = 0o600
+    else:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+        ):
+            raise LifecycleError("managed text destination is unsafe")
+        mode = stat.S_IMODE(info.st_mode)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    tmp = Path(raw)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=True) as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        tmp.chmod(mode)
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
 
 
 def lifecycle_state_dir(home: Path) -> Path:
@@ -376,12 +427,297 @@ def bundle_revision(root: Path, home: Path) -> str:
 def _write_json_private(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     os.chmod(path.parent, 0o700)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(
-        json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    tmp = Path(raw)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=True) as output:
+            output.write(json.dumps(payload, sort_keys=True, indent=2) + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        tmp.chmod(0o600)
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+
+
+def _validate_private_directories(root: Path, parent: Path) -> None:
+    try:
+        relative = parent.relative_to(root)
+    except ValueError as exc:
+        raise LifecycleError("lifecycle state escaped its owned directory") from exc
+    current = root
+    for part in (Path(), *map(Path, relative.parts)):
+        if part != Path():
+            current = current / part
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise LifecycleError("lifecycle state directory is unreadable") from exc
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o077
+        ):
+            raise LifecycleError("lifecycle state directory is not private and real")
+
+
+def _validate_state_root(home: Path, state: Path) -> None:
+    try:
+        relative = state.relative_to(home)
+    except ValueError as exc:
+        raise LifecycleError("lifecycle state escaped the operator home") from exc
+    current = home
+    for part in (Path(), *map(Path, relative.parts)):
+        if part != Path():
+            current = current / part
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise LifecycleError("lifecycle state path is unreadable") from exc
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise LifecycleError("lifecycle state path contains a link or unowned entry")
+    if state.lstat().st_mode & 0o077:
+        raise LifecycleError("lifecycle state root is not private")
+
+
+def _read_private_json(path: Path, *, root: Path) -> dict[str, Any]:
+    """Read one bounded private JSON object without following or racing links."""
+    try:
+        _validate_private_directories(root, path.parent)
+        before = path.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or before.st_mode & 0o077
+            or before.st_size > MAX_LIFECYCLE_JSON_BYTES
+        ):
+            raise LifecycleError("lifecycle JSON inode is not private and regular")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            after = os.fstat(fd)
+            if (
+                not stat.S_ISREG(after.st_mode)
+                or after.st_uid != os.getuid()
+                or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            ):
+                raise LifecycleError("lifecycle JSON changed during open")
+            chunks: list[bytes] = []
+            total = 0
+            while chunk := os.read(
+                fd, min(64 * 1024, MAX_LIFECYCLE_JSON_BYTES + 1 - total)
+            ):
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > MAX_LIFECYCLE_JSON_BYTES:
+                    raise LifecycleError("lifecycle JSON exceeds the size limit")
+        finally:
+            os.close(fd)
+        payload = json.loads(b"".join(chunks).decode("utf-8"))
+    except LifecycleError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LifecycleError("lifecycle JSON is unreadable or malformed") from exc
+    if not isinstance(payload, dict):
+        raise LifecycleError("lifecycle JSON root must be an object")
+    return payload
+
+
+def _validate_backup(path: Path, *, root: Path, expected_sha256: str) -> None:
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise LifecycleError("lifecycle backup escaped its owned directory") from exc
+    try:
+        _validate_private_directories(root, path.parent)
+        before = path.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or before.st_mode & 0o077
+            or before.st_size > MAX_LIFECYCLE_BACKUP_BYTES
+        ):
+            raise LifecycleError("lifecycle backup inode is unsafe")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            after = os.fstat(fd)
+            if (
+                not stat.S_ISREG(after.st_mode)
+                or after.st_uid != os.getuid()
+                or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            ):
+                raise LifecycleError("lifecycle backup changed during open")
+            digest = hashlib.sha256()
+            total = 0
+            while chunk := os.read(
+                fd, min(1024 * 1024, MAX_LIFECYCLE_BACKUP_BYTES + 1 - total)
+            ):
+                digest.update(chunk)
+                total += len(chunk)
+                if total > MAX_LIFECYCLE_BACKUP_BYTES:
+                    raise LifecycleError("lifecycle backup exceeds the size limit")
+        finally:
+            os.close(fd)
+    except LifecycleError:
+        raise
+    except OSError as exc:
+        raise LifecycleError("lifecycle backup is missing or unreadable") from exc
+    if digest.hexdigest() != expected_sha256:
+        raise LifecycleError("lifecycle backup digest does not match its record")
+
+
+def _validate_records(
+    records: Any,
+    *,
+    allowed_paths: set[str],
+    backup_root: Path,
+    require_all: bool,
+) -> list[dict[str, Any]]:
+    if not isinstance(records, list):
+        raise LifecycleError("lifecycle records must be a list")
+    validated: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            raise LifecycleError("lifecycle record must be an object")
+        path = record.get("path")
+        existed = record.get("existed")
+        if not isinstance(path, str) or path not in allowed_paths or path in seen:
+            raise LifecycleError("lifecycle record path is unknown or duplicated")
+        if type(existed) is not bool:
+            raise LifecycleError("lifecycle record existed flag must be boolean")
+        expected_keys = {"path", "existed"}
+        if existed:
+            expected_keys.update({"backup", "mode", "sha256"})
+        if set(record) != expected_keys:
+            raise LifecycleError("lifecycle record schema is invalid")
+        if existed:
+            backup = record.get("backup")
+            mode = record.get("mode")
+            digest = record.get("sha256")
+            if (
+                not isinstance(backup, str)
+                or type(mode) is not int
+                or mode < 0
+                or mode > 0o777
+                or not isinstance(digest, str)
+                or SHA256_PATTERN.fullmatch(digest) is None
+            ):
+                raise LifecycleError("lifecycle backup metadata is invalid")
+            _validate_backup(Path(backup), root=backup_root, expected_sha256=digest)
+        seen.add(path)
+        validated.append(record)
+    if require_all and seen != allowed_paths:
+        raise LifecycleError("lifecycle records do not cover the managed path set")
+    return validated
+
+
+def _load_manifest(
+    root: Path, home: Path, *, require_all: bool = False
+) -> dict[str, Any]:
+    state = lifecycle_state_dir(home)
+    _validate_state_root(home, state)
+    payload = _read_private_json(state / "manifest.json", root=state)
+    if set(payload) != {
+        "schema_version",
+        "owner",
+        "installed_version",
+        "installed_at",
+        "baseline",
+        "installed_hashes",
+    }:
+        raise LifecycleError("lifecycle manifest schema is invalid")
+    version = payload.get("installed_version")
+    installed_at = payload.get("installed_at")
+    if (
+        type(payload.get("schema_version")) is not int
+        or payload["schema_version"] != 1
+        or payload.get("owner") != "skillbox-seamless-paste"
+        or (version is not None and not isinstance(version, str))
+        or (
+            installed_at is not None
+            and (
+                isinstance(installed_at, bool)
+                or not isinstance(installed_at, (int, float))
+            )
+        )
+    ):
+        raise LifecycleError("lifecycle manifest identity or types are invalid")
+    allowed = {str(path) for path in _managed_paths(root, home)}
+    payload["baseline"] = _validate_records(
+        payload.get("baseline"),
+        allowed_paths=allowed,
+        backup_root=state / "baseline",
+        require_all=require_all,
     )
-    tmp.chmod(0o600)
-    os.replace(tmp, path)
+    hashes = payload.get("installed_hashes")
+    if not isinstance(hashes, dict) or any(
+        not isinstance(path, str)
+        or path not in allowed
+        or not isinstance(digest, str)
+        or SHA256_PATTERN.fullmatch(digest) is None
+        for path, digest in hashes.items()
+    ):
+        raise LifecycleError("installed lifecycle hashes are invalid")
+    return payload
+
+
+def _load_rollback(root: Path, home: Path) -> dict[str, Any]:
+    state = lifecycle_state_dir(home)
+    _validate_state_root(home, state)
+    payload = _read_private_json(
+        state / "rollback" / "snapshot.json", root=state
+    )
+    if set(payload) != {
+        "schema_version",
+        "version",
+        "captured_at",
+        "records",
+    }:
+        raise LifecycleError("rollback snapshot schema is invalid")
+    if (
+        type(payload.get("schema_version")) is not int
+        or payload["schema_version"] != 1
+        or (
+            payload.get("version") is not None
+            and not isinstance(payload["version"], str)
+        )
+        or isinstance(payload.get("captured_at"), bool)
+        or not isinstance(payload.get("captured_at"), (int, float))
+    ):
+        raise LifecycleError("rollback snapshot identity or types are invalid")
+    allowed = {str(path) for path in _managed_paths(root, home)}
+    payload["records"] = _validate_records(
+        payload.get("records"),
+        allowed_paths=allowed,
+        backup_root=state / "rollback" / "files",
+        require_all=True,
+    )
+    return payload
+
+
+def validate_local_lifecycle(
+    home: Path, *, root: Path, action: str
+) -> None:
+    """Fail before a lifecycle action if its trusted state is not restorable."""
+    state = lifecycle_state_dir(home)
+    if action in {"install", "uninstall"}:
+        manifest = state / "manifest.json"
+        if manifest.exists() or manifest.is_symlink():
+            _load_manifest(root, home, require_all=action == "uninstall")
+        _validate_managed_destinations(home, _managed_paths(root, home))
+    elif action == "rollback":
+        snapshot = state / "rollback" / "snapshot.json"
+        if not snapshot.is_file():
+            raise FileNotFoundError(
+                "no prior seamless-paste version is available for rollback"
+            )
+        _load_rollback(root, home)
+        _validate_managed_destinations(home, _managed_paths(root, home))
+    else:
+        raise ValueError(f"unknown lifecycle action: {action}")
 
 
 def _snapshot_paths(paths: list[Path], destination: Path) -> list[dict[str, Any]]:
@@ -389,9 +725,20 @@ def _snapshot_paths(paths: list[Path], destination: Path) -> list[dict[str, Any]
     os.chmod(destination, 0o700)
     records: list[dict[str, Any]] = []
     for index, path in enumerate(paths):
-        record: dict[str, Any] = {"path": str(path), "existed": path.is_file()}
-        if path.is_file():
-            info = path.stat()
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            info = None
+        existed = info is not None
+        record: dict[str, Any] = {"path": str(path), "existed": existed}
+        if existed:
+            if (
+                info is None
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_nlink != 1
+            ):
+                raise LifecycleError("managed baseline source is unsafe")
             backup = destination / f"{index:04d}.bin"
             shutil.copy2(path, backup)
             backup.chmod(0o600)
@@ -416,11 +763,52 @@ def _managed_paths(root: Path, home: Path) -> list[Path]:
     return paths
 
 
+def _validate_managed_destinations(home: Path, paths: list[Path]) -> None:
+    try:
+        home_info = home.lstat()
+    except OSError as exc:
+        raise LifecycleError("operator home is unreadable") from exc
+    if not stat.S_ISDIR(home_info.st_mode) or home_info.st_uid != os.getuid():
+        raise LifecycleError("operator home must be a real owned directory")
+    for path in paths:
+        try:
+            relative = path.relative_to(home)
+        except ValueError as exc:
+            raise LifecycleError("managed destination escaped the operator home") from exc
+        current = home
+        for part in relative.parts[:-1]:
+            current = current / part
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                break
+            except OSError as exc:
+                raise LifecycleError("managed destination parent is unreadable") from exc
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+                raise LifecycleError(
+                    "managed destination parent contains a link or unowned entry"
+                )
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise LifecycleError("managed destination is unreadable") from exc
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+        ):
+            raise LifecycleError(
+                "managed destination is not a private single-link regular file"
+            )
+
+
 def _ensure_baseline(root: Path, home: Path) -> dict[str, Any]:
     state = lifecycle_state_dir(home)
     manifest_path = state / "manifest.json"
     if manifest_path.is_file():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = _load_manifest(root, home)
         known = {record["path"] for record in manifest["baseline"]}
         missing = [
             path for path in _managed_paths(root, home) if str(path) not in known
@@ -463,11 +851,11 @@ def _installation_differs(root: Path, home: Path) -> bool:
 
 def _capture_rollback(root: Path, home: Path) -> None:
     state = lifecycle_state_dir(home)
+    manifest = _load_manifest(root, home, require_all=True)
     rollback = state / "rollback"
     if rollback.exists():
         shutil.rmtree(rollback)
     records = _snapshot_paths(_managed_paths(root, home), rollback / "files")
-    manifest = json.loads((state / "manifest.json").read_text(encoding="utf-8"))
     _write_json_private(
         rollback / "snapshot.json",
         {
@@ -482,7 +870,7 @@ def _capture_rollback(root: Path, home: Path) -> None:
 def _record_installed_state(root: Path, home: Path) -> None:
     state = lifecycle_state_dir(home)
     manifest_path = state / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = _load_manifest(root, home, require_all=True)
     manifest["installed_version"] = bundle_revision(root, home)
     manifest["installed_at"] = time.time()
     manifest["installed_hashes"] = {
@@ -498,9 +886,7 @@ def _restore_records(records: list[dict[str, Any]]) -> None:
         path = Path(record["path"])
         if record["existed"]:
             backup = Path(record["backup"])
-            path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(backup, path)
-            path.chmod(int(record["mode"]))
+            _copy_file_atomic(backup, path, mode=int(record["mode"]))
         else:
             path.unlink(missing_ok=True)
 
@@ -530,8 +916,9 @@ def _restore_config_record(
     path = Path(record["path"])
     if path.is_file() and installed_hash and _sha256(path) == installed_hash:
         if record["existed"]:
-            shutil.copy2(Path(record["backup"]), path)
-            path.chmod(int(record["mode"]))
+            _copy_file_atomic(
+                Path(record["backup"]), path, mode=int(record["mode"])
+            )
         else:
             path.unlink()
         return
@@ -541,11 +928,9 @@ def _restore_config_record(
         Path(record["backup"]).read_text(encoding="utf-8") if record["existed"] else ""
     )
     if stripped == baseline and record["existed"]:
-        shutil.copy2(Path(record["backup"]), path)
-        path.chmod(int(record["mode"]))
+        _copy_file_atomic(Path(record["backup"]), path, mode=int(record["mode"]))
     elif stripped:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(stripped, encoding="utf-8")
+        _write_text_atomic(path, stripped)
     else:
         path.unlink(missing_ok=True)
 
@@ -560,7 +945,7 @@ def _remove_legacy_ghostty_block(home: Path) -> None:
     )
     if migrated != content:
         if migrated:
-            legacy.write_text(migrated, encoding="utf-8")
+            _write_text_atomic(legacy, migrated)
         else:
             legacy.unlink()
 
@@ -581,25 +966,37 @@ def _remove_owned_python_cache(home: Path) -> None:
         cache.rmdir()
 
 
-def rollback_local(home: Path | None = None) -> dict[str, Any]:
+def rollback_local(
+    home: Path | None = None, *, root: Path | None = None
+) -> dict[str, Any]:
     home_dir = home or Path.home()
+    resolved_root = root or repo_root()
     snapshot = lifecycle_state_dir(home_dir) / "rollback" / "snapshot.json"
     if not snapshot.is_file():
         raise FileNotFoundError(
             "no prior seamless-paste version is available for rollback"
         )
-    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    payload = _load_rollback(resolved_root, home_dir)
+    _validate_managed_destinations(
+        home_dir, _managed_paths(resolved_root, home_dir)
+    )
     _restore_records(payload["records"])
     return {"ok": True, "restored_version": payload.get("version")}
 
 
-def uninstall_local(home: Path | None = None) -> dict[str, Any]:
+def uninstall_local(
+    home: Path | None = None, *, root: Path | None = None
+) -> dict[str, Any]:
     home_dir = home or Path.home()
+    resolved_root = root or repo_root()
     state = lifecycle_state_dir(home_dir)
     manifest_path = state / "manifest.json"
     if not manifest_path.is_file():
         return {"ok": True, "changed": False, "message": "not installed"}
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = _load_manifest(resolved_root, home_dir, require_all=True)
+    _validate_managed_destinations(
+        home_dir, _managed_paths(resolved_root, home_dir)
+    )
     config_records: dict[str, dict[str, Any]] = {
         record["path"]: record for record in manifest["baseline"]
     }
@@ -707,6 +1104,9 @@ def install_local(
             return plan
         raise UnsupportedOperatorPlatform(unsupported_operator_message())
     if not dry_run:
+        _validate_managed_destinations(
+            home_dir, _managed_paths(resolved_root, home_dir)
+        )
         already_managed = (lifecycle_state_dir(home_dir) / "manifest.json").is_file()
         _ensure_baseline(resolved_root, home_dir)
         if already_managed and _installation_differs(resolved_root, home_dir):
@@ -719,7 +1119,7 @@ def install_local(
     if not dry_run:
         tmux_conf.parent.mkdir(parents=True, exist_ok=True)
         if not tmux_conf.exists():
-            tmux_conf.write_text("", encoding="utf-8")
+            _write_text_atomic(tmux_conf, "")
         ensure_tmux_source_line(tmux_conf)
         ensure_ghostty_source_line(ghostty_conf_path(home_dir), home_dir)
         _remove_legacy_ghostty_block(home_dir)
@@ -778,6 +1178,156 @@ def plan_remote_bootstrap(
     return plan
 
 
+def _remote_snapshot_guard() -> str:
+    """Shell helpers that validate fixed remote lifecycle records before use."""
+    return r'''
+hash_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+expected_id() {
+  case "$1" in
+    1) printf '%s' clipcopy ;;
+    2) printf '%s' clippaste ;;
+    3) printf '%s' pbcopy ;;
+    4) printf '%s' receiver ;;
+    5) printf '%s' pyinit ;;
+    6) printf '%s' transfer ;;
+    7) printf '%s' tmux_fragment ;;
+    8) printf '%s' tmux_conf ;;
+    *) return 1 ;;
+  esac
+}
+expected_path() {
+  case "$1" in
+    clipcopy) printf '%s' "$bin_dir/clipcopy" ;;
+    clippaste) printf '%s' "$bin_dir/clippaste" ;;
+    pbcopy) printf '%s' "$bin_dir/pbcopy" ;;
+    receiver) printf '%s' "$bin_dir/clipboard-artifact-receive" ;;
+    pyinit) printf '%s' "$python_dir/__init__.py" ;;
+    transfer) printf '%s' "$python_dir/clipboard_transfer.py" ;;
+    tmux_fragment) printf '%s' "$config_dir/clipboard.tmux.conf" ;;
+    tmux_conf) printf '%s' "$HOME/.tmux.conf" ;;
+    *) return 1 ;;
+  esac
+}
+require_real_owned_dir() {
+  candidate="$1"
+  if [ ! -d "$candidate" ] || [ -L "$candidate" ] || [ ! -O "$candidate" ]; then
+    echo "skillbox clipboard bootstrap: unsafe lifecycle or managed directory" >&2
+    return 1
+  fi
+}
+validate_managed_parents() {
+  require_real_owned_dir "$HOME"
+  require_real_owned_dir "$HOME/.local"
+  require_real_owned_dir "$bin_dir"
+  require_real_owned_dir "$HOME/.local/share"
+  require_real_owned_dir "$HOME/.local/share/skillbox"
+  require_real_owned_dir "$HOME/.local/share/skillbox/python"
+  require_real_owned_dir "$python_dir"
+  require_real_owned_dir "$HOME/.config"
+  require_real_owned_dir "$config_dir"
+}
+validate_managed_destinations() {
+  index=1
+  while [ "$index" -le 8 ]; do
+    snapshot_id=$(expected_id "$index") || return 1
+    candidate=$(expected_path "$snapshot_id") || return 1
+    if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+      if [ ! -f "$candidate" ] || [ -L "$candidate" ] || [ ! -O "$candidate" ]; then
+        echo "skillbox clipboard bootstrap: unsafe managed destination" >&2
+        return 1
+      fi
+      candidate_links=$(stat -c '%h' "$candidate" 2>/dev/null || stat -f '%l' "$candidate")
+      [ "$candidate_links" = "1" ] || return 1
+    fi
+    index=$((index + 1))
+  done
+}
+validate_state_file() {
+  candidate="$1"
+  if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+    if [ ! -f "$candidate" ] || [ -L "$candidate" ] || [ ! -O "$candidate" ]; then
+      echo "skillbox clipboard bootstrap: unsafe lifecycle version file" >&2
+      return 1
+    fi
+    candidate_mode=$(stat -c '%a' "$candidate" 2>/dev/null || stat -f '%Lp' "$candidate")
+    candidate_links=$(stat -c '%h' "$candidate" 2>/dev/null || stat -f '%l' "$candidate")
+    [ "$candidate_mode" = "600" ] || return 1
+    [ "$candidate_links" = "1" ] || return 1
+  fi
+}
+validate_version_file() {
+  validate_state_file "$state_dir/version"
+}
+normalize_snapshot() {
+  snapshot_dir="$1"
+  records="$snapshot_dir/records.tsv"
+  if [ ! -f "$records" ] || [ -L "$records" ] || [ ! -O "$records" ]; then
+    echo "skillbox clipboard bootstrap: unsafe lifecycle records" >&2
+    return 1
+  fi
+  records_mode=$(stat -c '%a' "$records" 2>/dev/null || stat -f '%Lp' "$records")
+  records_links=$(stat -c '%h' "$records" 2>/dev/null || stat -f '%l' "$records")
+  if [ "$records_mode" != "600" ] || [ "$records_links" != "1" ]; then
+    echo "skillbox clipboard bootstrap: lifecycle records are not private" >&2
+    return 1
+  fi
+  normalized=$(mktemp "$snapshot_dir/.records.normalized.XXXXXX") || return 1
+  chmod 0600 "$normalized"
+  line_number=0
+  while IFS=$'\t' read -r snapshot_id existed mode path digest extra; do
+    line_number=$((line_number + 1))
+    wanted_id=$(expected_id "$line_number") || return 1
+    wanted_path=$(expected_path "$wanted_id") || return 1
+    if [ "$snapshot_id" != "$wanted_id" ] || [ "$path" != "$wanted_path" ] || [ -n "$extra" ]; then
+      echo "skillbox clipboard bootstrap: lifecycle record identity mismatch" >&2
+      return 1
+    fi
+    case "$existed" in
+      0)
+        if [ "$mode" != "-" ] || { [ -n "$digest" ] && [ "$digest" != "-" ]; }; then
+          echo "skillbox clipboard bootstrap: invalid absent lifecycle record" >&2
+          return 1
+        fi
+        digest="-"
+        ;;
+      1)
+        case "$mode" in ''|*[!0-7]*) return 1 ;; esac
+        backup="$snapshot_dir/files/$snapshot_id"
+        if [ ! -f "$backup" ] || [ -L "$backup" ] || [ ! -O "$backup" ]; then
+          echo "skillbox clipboard bootstrap: unsafe lifecycle backup" >&2
+          return 1
+        fi
+        backup_mode=$(stat -c '%a' "$backup" 2>/dev/null || stat -f '%Lp' "$backup")
+        backup_links=$(stat -c '%h' "$backup" 2>/dev/null || stat -f '%l' "$backup")
+        [ "$backup_mode" = "600" ] || return 1
+        [ "$backup_links" = "1" ] || return 1
+        observed=$(hash_file "$backup")
+        if [ -n "$digest" ] && [ "$digest" != "-" ] && [ "$digest" != "$observed" ]; then
+          echo "skillbox clipboard bootstrap: lifecycle backup digest mismatch" >&2
+          return 1
+        fi
+        digest="$observed"
+        ;;
+      *) return 1 ;;
+    esac
+    printf '%s\t%s\t%s\t%s\t%s\n' "$snapshot_id" "$existed" "$mode" "$wanted_path" "$digest" >>"$normalized"
+  done <"$records"
+  if [ "$line_number" -ne 8 ]; then
+    echo "skillbox clipboard bootstrap: incomplete lifecycle record set" >&2
+    return 1
+  fi
+  mv "$normalized" "$records"
+  chmod 0600 "$records"
+}
+'''
+
+
 def remote_install_script() -> str:
     """Shell script run on remote host via stdin (or SKILLBOX_CLIPBOARD_BUNDLE_B64)."""
     return f"""#!/usr/bin/env bash
@@ -795,8 +1345,21 @@ bin_dir="$HOME/.local/bin"
 config_dir="$HOME/.config/skillbox"
 python_dir="$HOME/.local/share/skillbox/python/lib"
 state_dir="$HOME/.local/state/skillbox/clipboard-bootstrap"
-mkdir -p "$bin_dir" "$config_dir" "$python_dir" "$state_dir"
+for candidate in "$HOME/.local" "$bin_dir" "$HOME/.local/share" "$HOME/.local/share/skillbox" "$HOME/.local/share/skillbox/python" "$python_dir" "$HOME/.local/state" "$HOME/.local/state/skillbox" "$state_dir" "$HOME/.config" "$config_dir"; do
+  if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+    if [ ! -d "$candidate" ] || [ -L "$candidate" ] || [ ! -O "$candidate" ]; then
+      echo "skillbox clipboard bootstrap: unsafe managed directory" >&2
+      exit 1
+    fi
+  else
+    mkdir "$candidate"
+  fi
+done
 chmod 0700 "$state_dir"
+{_remote_snapshot_guard()}
+validate_managed_parents
+validate_managed_destinations
+validate_version_file
 snapshot_set() {{
   snapshot_dir="$1"
   rm -rf "$snapshot_dir"
@@ -809,9 +1372,10 @@ snapshot_set() {{
       cp -p "$snapshot_path" "$snapshot_dir/files/$snapshot_id"
       chmod 0600 "$snapshot_dir/files/$snapshot_id"
       snapshot_mode=$(stat -c '%a' "$snapshot_path" 2>/dev/null || stat -f '%Lp' "$snapshot_path")
-      printf '%s\t1\t%s\t%s\n' "$snapshot_id" "$snapshot_mode" "$snapshot_path" >>"$snapshot_dir/records.tsv"
+      snapshot_sha=$(hash_file "$snapshot_dir/files/$snapshot_id")
+      printf '%s\t1\t%s\t%s\t%s\n' "$snapshot_id" "$snapshot_mode" "$snapshot_path" "$snapshot_sha" >>"$snapshot_dir/records.tsv"
     else
-      printf '%s\t0\t-\t%s\n' "$snapshot_id" "$snapshot_path" >>"$snapshot_dir/records.tsv"
+      printf '%s\t0\t-\t%s\t-\n' "$snapshot_id" "$snapshot_path" >>"$snapshot_dir/records.tsv"
     fi
   }}
   snapshot_one clipcopy "$bin_dir/clipcopy"
@@ -827,9 +1391,14 @@ incoming_version=$(cat "$bundle_dir/VERSION")
 if [ ! -f "$state_dir/baseline/records.tsv" ]; then
   snapshot_set "$state_dir/baseline"
 fi
+normalize_snapshot "$state_dir/baseline"
 if [ -f "$state_dir/version" ] && [ "$(cat "$state_dir/version")" != "$incoming_version" ]; then
   snapshot_set "$state_dir/rollback"
-  cp "$state_dir/version" "$state_dir/rollback-version"
+  normalize_snapshot "$state_dir/rollback"
+  rollback_version_tmp=$(mktemp "$state_dir/.rollback-version.XXXXXX")
+  cp "$state_dir/version" "$rollback_version_tmp"
+  chmod 0600 "$rollback_version_tmp"
+  mv "$rollback_version_tmp" "$state_dir/rollback-version"
 fi
 install -m 0755 "$bundle_dir/clipcopy" "$bin_dir/clipcopy"
 install -m 0755 "$bundle_dir/clippaste" "$bin_dir/clippaste"
@@ -844,6 +1413,7 @@ valid_source='if-shell '"'"'[ -r "$HOME/.config/skillbox/clipboard.tmux.conf" ]'
 if ! grep -Fq "$valid_source" "$tmux_conf"; then
   if grep -Fq '{TMUX_MARKER}' "$tmux_conf"; then
     repair_skip=0
+    repair_tmp=$(mktemp "$HOME/.tmux.conf.skillbox.XXXXXX")
     while IFS= read -r line || [ -n "$line" ]; do
       case "$line" in
         "# Skillbox clipboard integration: OSC52"*)
@@ -866,7 +1436,7 @@ if ! grep -Fq "$valid_source" "$tmux_conf"; then
         continue
       fi
       printf '%s\\n' "$line"
-    done <"$tmux_conf" >"$tmux_conf.tmp" && mv "$tmux_conf.tmp" "$tmux_conf"
+    done <"$tmux_conf" >"$repair_tmp" && mv "$repair_tmp" "$tmux_conf"
   fi
   cat >>"$tmux_conf" <<'SKILLBOX_CLIPBOARD_TMUX'
 
@@ -893,8 +1463,10 @@ fi
 test -x "$bin_dir/clipcopy"
 test -x "$bin_dir/clipboard-artifact-receive"
 test -f "$config_dir/clipboard.tmux.conf"
-printf '%s\n' "$incoming_version" >"$state_dir/version"
-chmod 0600 "$state_dir/version"
+version_tmp=$(mktemp "$state_dir/.version.XXXXXX")
+printf '%s\n' "$incoming_version" >"$version_tmp"
+chmod 0600 "$version_tmp"
+mv "$version_tmp" "$state_dir/version"
 if [ "$terminfo_ok" = "0" ]; then
   echo "warning: xterm-ghostty terminfo unavailable after bundled install" >&2
 fi
@@ -906,25 +1478,48 @@ def remote_restore_script(*, rollback: bool = False) -> str:
     """Restore the remote baseline or the previous installed version."""
     snapshot = "rollback" if rollback else "baseline"
     final_cleanup = "" if rollback else 'rm -rf "$state_dir"'
+    version_preflight = (
+        """[ -f "$state_dir/rollback-version" ]
+[ ! -L "$state_dir/rollback-version" ]
+validate_state_file "$state_dir/rollback-version""" if rollback else ""
+    )
     version_restore = (
-        'if [ -f "$state_dir/rollback-version" ]; then cp "$state_dir/rollback-version" "$state_dir/version"; fi'
-        if rollback
-        else ""
+        """version_tmp=$(mktemp "$state_dir/.version.XXXXXX")
+cp "$state_dir/rollback-version" "$version_tmp"
+chmod 0600 "$version_tmp"
+mv "$version_tmp" "$state_dir/version""" if rollback else ""
     )
     return f"""#!/usr/bin/env bash
 set -euo pipefail
+umask 077
 state_dir="$HOME/.local/state/skillbox/clipboard-bootstrap"
 snapshot_dir="$state_dir/{snapshot}"
 records="$snapshot_dir/records.tsv"
+bin_dir="$HOME/.local/bin"
+config_dir="$HOME/.config/skillbox"
+python_dir="$HOME/.local/share/skillbox/python/lib"
 if [ ! -f "$records" ]; then
   echo "skillbox clipboard bootstrap: no remote {snapshot} snapshot" >&2
   exit 1
 fi
-while IFS=$'\t' read -r snapshot_id existed mode path; do
+{_remote_snapshot_guard()}
+require_real_owned_dir "$state_dir"
+require_real_owned_dir "$snapshot_dir"
+state_mode=$(stat -c '%a' "$state_dir" 2>/dev/null || stat -f '%Lp' "$state_dir")
+snapshot_mode=$(stat -c '%a' "$snapshot_dir" 2>/dev/null || stat -f '%Lp' "$snapshot_dir")
+[ "$state_mode" = "700" ] || exit 1
+[ "$snapshot_mode" = "700" ] || exit 1
+validate_managed_parents
+validate_managed_destinations
+{version_preflight}
+normalize_snapshot "$snapshot_dir"
+while IFS=$'\t' read -r snapshot_id existed mode _recorded_path digest; do
+  path=$(expected_path "$snapshot_id")
   if [ "$existed" = "1" ]; then
-    mkdir -p "$(dirname "$path")"
-    cp -p "$snapshot_dir/files/$snapshot_id" "$path"
-    chmod "$mode" "$path"
+    backup="$snapshot_dir/files/$snapshot_id"
+    [ "$(hash_file "$backup")" = "$digest" ] || exit 1
+    rm -f "$path"
+    install -m "$mode" "$backup" "$path"
   else
     rm -f "$path"
   fi

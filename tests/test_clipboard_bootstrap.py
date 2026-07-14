@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -185,6 +186,262 @@ class ClipboardBootstrapTests(unittest.TestCase):
             self.assertTrue(
                 any("affects all sessions" in step for step in plan.steps)
             )
+
+    def test_install_refuses_malformed_manifest_before_overwriting_helpers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            CB.install_local(home, root=ROOT_DIR)
+            helper = home / ".local" / "bin" / "clipcopy"
+            helper.write_bytes(b"operator replacement\n")
+            manifest = CB.lifecycle_state_dir(home) / "manifest.json"
+            manifest.write_text("{not-json", encoding="utf-8")
+            manifest.chmod(0o600)
+
+            with self.assertRaisesRegex(CB.LifecycleError, "malformed"):
+                CB.install_local(home, root=ROOT_DIR)
+            self.assertEqual(helper.read_bytes(), b"operator replacement\n")
+
+    def test_install_refuses_symlinked_destination_before_lifecycle_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            bin_dir = home / ".local" / "bin"
+            bin_dir.mkdir(parents=True)
+            outside = Path(tmpdir) / "outside"
+            outside.write_bytes(b"outside\n")
+            (bin_dir / "clipcopy").symlink_to(outside)
+
+            with self.assertRaisesRegex(CB.LifecycleError, "single-link regular"):
+                CB.install_local(home, root=ROOT_DIR)
+            self.assertEqual(outside.read_bytes(), b"outside\n")
+            self.assertFalse(CB.lifecycle_state_dir(home).exists())
+
+    def test_install_refuses_symlinked_destination_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            config = home / ".config"
+            config.mkdir(parents=True)
+            outside = Path(tmpdir) / "outside-config"
+            outside.mkdir()
+            (config / "skillbox").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(CB.LifecycleError, "parent contains a link"):
+                CB.install_local(home, root=ROOT_DIR)
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertFalse(CB.lifecycle_state_dir(home).exists())
+
+    def test_uninstall_refuses_unknown_manifest_path_before_restoring(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            CB.install_local(home, root=ROOT_DIR)
+            helper = home / ".local" / "bin" / "clipcopy"
+            installed = helper.read_bytes()
+            outside = Path(tmpdir) / "outside"
+            outside.write_bytes(b"keep me\n")
+            manifest = CB.lifecycle_state_dir(home) / "manifest.json"
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["baseline"][0]["path"] = str(outside)
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            manifest.chmod(0o600)
+
+            with self.assertRaisesRegex(CB.LifecycleError, "unknown or duplicated"):
+                CB.uninstall_local(home, root=ROOT_DIR)
+            self.assertEqual(outside.read_bytes(), b"keep me\n")
+            self.assertEqual(helper.read_bytes(), installed)
+            self.assertTrue(CB.lifecycle_state_dir(home).exists())
+
+    def test_uninstall_refuses_incomplete_manifest_before_partial_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            CB.install_local(home, root=ROOT_DIR)
+            helper = home / ".local" / "bin" / "clipcopy"
+            installed = helper.read_bytes()
+            manifest = CB.lifecycle_state_dir(home) / "manifest.json"
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["baseline"].pop()
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            manifest.chmod(0o600)
+
+            with self.assertRaisesRegex(CB.LifecycleError, "do not cover"):
+                CB.uninstall_local(home, root=ROOT_DIR)
+            self.assertEqual(helper.read_bytes(), installed)
+            self.assertTrue(CB.lifecycle_state_dir(home).exists())
+
+    def test_uninstall_refuses_symlinked_current_helper_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            CB.install_local(home, root=ROOT_DIR)
+            helper = home / ".local" / "bin" / "clipcopy"
+            helper.unlink()
+            outside = Path(tmpdir) / "outside"
+            outside.write_bytes(b"outside\n")
+            helper.symlink_to(outside)
+
+            with self.assertRaisesRegex(CB.LifecycleError, "single-link regular"):
+                CB.uninstall_local(home, root=ROOT_DIR)
+            self.assertEqual(outside.read_bytes(), b"outside\n")
+            self.assertTrue(helper.is_symlink())
+            self.assertTrue(CB.lifecycle_state_dir(home).exists())
+
+    def test_uninstall_refuses_hardlinked_current_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            CB.install_local(home, root=ROOT_DIR)
+            helper = home / ".local" / "bin" / "clipcopy"
+            outside = Path(tmpdir) / "outside"
+            outside.write_bytes(helper.read_bytes())
+            helper.unlink()
+            os.link(outside, helper)
+
+            with self.assertRaisesRegex(CB.LifecycleError, "single-link regular"):
+                CB.uninstall_local(home, root=ROOT_DIR)
+            self.assertEqual(outside.read_bytes(), helper.read_bytes())
+            self.assertEqual(outside.stat().st_nlink, 2)
+
+    def test_uninstall_refuses_symlinked_baseline_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            tmux_conf = home / ".tmux.conf"
+            tmux_conf.write_bytes(b"set -g mouse on\n")
+            CB.install_local(home, root=ROOT_DIR)
+            manifest = CB.lifecycle_state_dir(home) / "manifest.json"
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            record = next(
+                item for item in payload["baseline"] if item["path"] == str(tmux_conf)
+            )
+            backup = Path(record["backup"])
+            outside = Path(tmpdir) / "outside"
+            outside.write_bytes(b"outside\n")
+            backup.unlink()
+            backup.symlink_to(outside)
+
+            with self.assertRaisesRegex(CB.LifecycleError, "backup inode is unsafe"):
+                CB.uninstall_local(home, root=ROOT_DIR)
+            self.assertEqual(outside.read_bytes(), b"outside\n")
+            self.assertIn(CB.SOURCE_LINE.encode(), tmux_conf.read_bytes())
+
+    def test_uninstall_refuses_symlinked_lifecycle_state_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            CB.install_local(home, root=ROOT_DIR)
+            helper = home / ".local" / "bin" / "clipcopy"
+            installed = helper.read_bytes()
+            state = CB.lifecycle_state_dir(home)
+            outside = Path(tmpdir) / "outside-state"
+            state.rename(outside)
+            state.symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(
+                CB.LifecycleError, "contains a link"
+            ):
+                CB.uninstall_local(home, root=ROOT_DIR)
+            self.assertEqual(helper.read_bytes(), installed)
+            self.assertTrue((outside / "manifest.json").is_file())
+
+    def test_uninstall_refuses_symlinked_lifecycle_parent_component(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            CB.install_local(home, root=ROOT_DIR)
+            helper = home / ".local" / "bin" / "clipcopy"
+            installed = helper.read_bytes()
+            parent = home / ".local" / "state" / "skillbox"
+            outside = Path(tmpdir) / "outside-parent"
+            parent.rename(outside)
+            parent.symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(CB.LifecycleError, "contains a link"):
+                CB.uninstall_local(home, root=ROOT_DIR)
+            self.assertEqual(helper.read_bytes(), installed)
+            self.assertTrue(
+                (outside / "clipboard-bootstrap" / "manifest.json").is_file()
+            )
+
+    def test_rollback_refuses_unknown_record_before_restoring(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            CB.install_local(home, root=ROOT_DIR)
+            helper = home / ".local" / "bin" / "clipcopy"
+            helper.write_bytes(b"candidate version\n")
+            CB._capture_rollback(ROOT_DIR, home)  # noqa: SLF001
+            snapshot = CB.lifecycle_state_dir(home) / "rollback" / "snapshot.json"
+            payload = json.loads(snapshot.read_text(encoding="utf-8"))
+            outside = Path(tmpdir) / "outside"
+            outside.write_bytes(b"outside\n")
+            payload["records"][0]["path"] = str(outside)
+            snapshot.write_text(json.dumps(payload), encoding="utf-8")
+            snapshot.chmod(0o600)
+
+            with self.assertRaisesRegex(CB.LifecycleError, "unknown or duplicated"):
+                CB.rollback_local(home, root=ROOT_DIR)
+            self.assertEqual(helper.read_bytes(), b"candidate version\n")
+            self.assertEqual(outside.read_bytes(), b"outside\n")
+
+    def test_cli_reports_invalid_lifecycle_without_traceback_or_mutation(self) -> None:
+        from lib import clipboard_bootstrap_cli as CLI
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            CB.install_local(home, root=ROOT_DIR)
+            helper = home / ".local" / "bin" / "clipcopy"
+            installed = helper.read_bytes()
+            manifest = CB.lifecycle_state_dir(home) / "manifest.json"
+            manifest.write_text("[]", encoding="utf-8")
+            manifest.chmod(0o600)
+            with (
+                mock.patch.dict(os.environ, {"HOME": str(home)}),
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+            ):
+                code = CLI.main(
+                    ["uninstall", "--root", str(ROOT_DIR), "--profile", "local"]
+                )
+            self.assertEqual(code, 1)
+            report = stderr.getvalue()
+            self.assertIn("class=invalid_lifecycle_state", report)
+            self.assertNotIn("Traceback", report)
+            self.assertEqual(helper.read_bytes(), installed)
+
+    def test_remote_reversal_preflight_refuses_unsafe_local_destination(self) -> None:
+        from lib import clipboard_bootstrap_cli as CLI
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            CB.install_local(home, root=ROOT_DIR)
+            helper = home / ".local" / "bin" / "clipcopy"
+            helper.unlink()
+            outside = Path(tmpdir) / "outside"
+            outside.write_bytes(b"outside\n")
+            helper.symlink_to(outside)
+            with (
+                mock.patch.dict(os.environ, {"HOME": str(home)}),
+                mock.patch.object(CLI, "_resolve_remote_target") as resolve_remote,
+                mock.patch.object(CLI, "apply_remote_restore_via_ssh") as restore,
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+            ):
+                code = CLI.main(
+                    [
+                        "uninstall",
+                        "--root",
+                        str(ROOT_DIR),
+                        "--profile",
+                        "d3",
+                        "--apply-remote",
+                    ]
+                )
+            self.assertEqual(code, 1)
+            self.assertIn("invalid_lifecycle_state", stderr.getvalue())
+            resolve_remote.assert_not_called()
+            restore.assert_not_called()
+            self.assertEqual(outside.read_bytes(), b"outside\n")
 
     def test_unsupported_operator_install_is_no_write_but_dry_run_explains(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -546,6 +803,217 @@ class ClipboardBootstrapTests(unittest.TestCase):
                 (home / ".local" / "bin" / "clipboard-artifact-receive").exists()
             )
             self.assertFalse(home.joinpath(CB.STATE_SUBDIR).exists())
+
+    def test_remote_lifecycle_records_are_fixed_order_and_digest_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            helper = home / ".local" / "bin" / "clipcopy"
+            helper.parent.mkdir(parents=True)
+            helper.write_bytes(b"legacy helper\n")
+            result = CB.run_remote_install(home, root=ROOT_DIR)
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            records = (
+                home
+                / CB.STATE_SUBDIR
+                / "baseline"
+                / "records.tsv"
+            ).read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(records), 8)
+            fields = [line.split("\t") for line in records]
+            self.assertTrue(all(len(item) == 5 for item in fields))
+            self.assertEqual(
+                [item[0] for item in fields],
+                [
+                    "clipcopy",
+                    "clippaste",
+                    "pbcopy",
+                    "receiver",
+                    "pyinit",
+                    "transfer",
+                    "tmux_fragment",
+                    "tmux_conf",
+                ],
+            )
+            clipcopy = fields[0]
+            self.assertEqual(clipcopy[1], "1")
+            self.assertEqual(clipcopy[3], str(helper))
+            self.assertEqual(clipcopy[4], CB._sha256(home / CB.STATE_SUBDIR / "baseline" / "files" / "clipcopy"))  # noqa: SLF001
+
+    def test_remote_restore_refuses_tampered_record_before_any_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            helper = home / ".local" / "bin" / "clipcopy"
+            helper.parent.mkdir(parents=True)
+            helper.write_bytes(b"legacy helper\n")
+            result = CB.run_remote_install(home, root=ROOT_DIR)
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            installed = helper.read_bytes()
+            outside = Path(tmpdir) / "outside"
+            outside.write_bytes(b"outside\n")
+            records = home / CB.STATE_SUBDIR / "baseline" / "records.tsv"
+            lines = records.read_text(encoding="utf-8").splitlines()
+            first = lines[0].split("\t")
+            first[3] = str(outside)
+            lines[0] = "\t".join(first)
+            records.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            records.chmod(0o600)
+
+            restored = subprocess.run(
+                ["bash", "-s"],
+                input=CB.remote_restore_script(),
+                env={**os.environ, "HOME": str(home)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(restored.returncode, 0)
+            self.assertIn("identity mismatch", restored.stderr)
+            self.assertEqual(helper.read_bytes(), installed)
+            self.assertEqual(outside.read_bytes(), b"outside\n")
+
+    def test_remote_restore_refuses_changed_backup_before_any_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            helper = home / ".local" / "bin" / "clipcopy"
+            helper.parent.mkdir(parents=True)
+            helper.write_bytes(b"legacy helper\n")
+            result = CB.run_remote_install(home, root=ROOT_DIR)
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            installed = helper.read_bytes()
+            backup = home / CB.STATE_SUBDIR / "baseline" / "files" / "clipcopy"
+            backup.write_bytes(b"tampered backup\n")
+            backup.chmod(0o600)
+
+            restored = subprocess.run(
+                ["bash", "-s"],
+                input=CB.remote_restore_script(),
+                env={**os.environ, "HOME": str(home)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(restored.returncode, 0)
+            self.assertIn("digest mismatch", restored.stderr)
+            self.assertEqual(helper.read_bytes(), installed)
+
+    def test_remote_restore_refuses_hardlinked_backup_before_any_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            helper = home / ".local" / "bin" / "clipcopy"
+            helper.parent.mkdir(parents=True)
+            helper.write_bytes(b"legacy helper\n")
+            result = CB.run_remote_install(home, root=ROOT_DIR)
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            installed = helper.read_bytes()
+            backup = home / CB.STATE_SUBDIR / "baseline" / "files" / "clipcopy"
+            outside = Path(tmpdir) / "outside-backup"
+            outside.write_bytes(backup.read_bytes())
+            outside.chmod(0o600)
+            backup.unlink()
+            os.link(outside, backup)
+
+            restored = subprocess.run(
+                ["bash", "-s"],
+                input=CB.remote_restore_script(),
+                env={**os.environ, "HOME": str(home)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(restored.returncode, 0)
+            self.assertEqual(helper.read_bytes(), installed)
+            self.assertEqual(outside.read_bytes(), b"legacy helper\n")
+
+    def test_remote_rollback_validates_version_state_before_restoring(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            first = CB.run_remote_install(home, root=ROOT_DIR)
+            self.assertEqual(first.returncode, 0, msg=first.stderr)
+            helper = home / ".local" / "bin" / "clipcopy"
+            installed = helper.read_bytes()
+            version = home / CB.STATE_SUBDIR / "version"
+            version.write_text("prior-version\n", encoding="utf-8")
+            version.chmod(0o600)
+            second = CB.run_remote_install(home, root=ROOT_DIR)
+            self.assertEqual(second.returncode, 0, msg=second.stderr)
+            rollback_version = home / CB.STATE_SUBDIR / "rollback-version"
+            self.assertTrue(rollback_version.is_file())
+            rollback_version.unlink()
+            helper.write_bytes(b"candidate helper\n")
+
+            restored = subprocess.run(
+                ["bash", "-s"],
+                input=CB.remote_restore_script(rollback=True),
+                env={**os.environ, "HOME": str(home)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(restored.returncode, 0)
+            self.assertEqual(helper.read_bytes(), b"candidate helper\n")
+            self.assertNotEqual(helper.read_bytes(), installed)
+
+    def test_remote_install_migrates_valid_legacy_four_field_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            helper = home / ".local" / "bin" / "clipcopy"
+            helper.parent.mkdir(parents=True)
+            helper.write_bytes(b"legacy helper\n")
+            result = CB.run_remote_install(home, root=ROOT_DIR)
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            records = home / CB.STATE_SUBDIR / "baseline" / "records.tsv"
+            legacy = [
+                "\t".join(line.split("\t")[:4])
+                for line in records.read_text(encoding="utf-8").splitlines()
+            ]
+            records.write_text("\n".join(legacy) + "\n", encoding="utf-8")
+            records.chmod(0o600)
+
+            migrated = CB.run_remote_install(home, root=ROOT_DIR)
+            self.assertEqual(migrated.returncode, 0, msg=migrated.stderr)
+            normalized = records.read_text(encoding="utf-8").splitlines()
+            self.assertTrue(all(len(line.split("\t")) == 5 for line in normalized))
+
+            restored = subprocess.run(
+                ["bash", "-s"],
+                input=CB.remote_restore_script(),
+                env={**os.environ, "HOME": str(home)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(restored.returncode, 0, msg=restored.stderr)
+            self.assertEqual(helper.read_bytes(), b"legacy helper\n")
+
+    def test_remote_install_refuses_symlinked_lifecycle_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            state_parent = home / ".local" / "state"
+            state_parent.parent.mkdir(parents=True)
+            outside = Path(tmpdir) / "outside-state"
+            outside.mkdir()
+            state_parent.symlink_to(outside, target_is_directory=True)
+
+            result = CB.run_remote_install(home, root=ROOT_DIR)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unsafe managed directory", result.stderr)
+            self.assertFalse((home / ".local" / "bin" / "clipcopy").exists())
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_remote_install_refuses_symlinked_managed_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            bin_dir = home / ".local" / "bin"
+            bin_dir.mkdir(parents=True)
+            outside = Path(tmpdir) / "outside-helper"
+            outside.write_bytes(b"outside\n")
+            (bin_dir / "clipcopy").symlink_to(outside)
+
+            result = CB.run_remote_install(home, root=ROOT_DIR)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unsafe managed destination", result.stderr)
+            self.assertEqual(outside.read_bytes(), b"outside\n")
+            self.assertTrue((bin_dir / "clipcopy").is_symlink())
 
     def test_apply_remote_via_ssh_invokes_ssh_runner(self) -> None:
         calls: list[list[str]] = []

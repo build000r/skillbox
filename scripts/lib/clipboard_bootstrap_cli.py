@@ -12,6 +12,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from lib.clipboard_bootstrap import (
+    LifecycleError,
     apply_remote_via_ssh,
     apply_remote_restore_via_ssh,
     install_local,
@@ -26,6 +27,7 @@ from lib.clipboard_bootstrap import (
     static_conference_route,
     unsupported_operator_message,
     uninstall_local,
+    validate_local_lifecycle,
     verify_local_install,
 )
 
@@ -182,6 +184,20 @@ def _report_remote_failure(
     return returncode
 
 
+def _report_lifecycle_failure(action: str, exc: LifecycleError) -> int:
+    print(
+        "clipboard-bootstrap: "
+        f"local {action} refused class=invalid_lifecycle_state: {exc}",
+        file=sys.stderr,
+    )
+    print(
+        "clipboard-bootstrap: local managed files were not changed; "
+        "restore lifecycle state from a trusted private backup before retrying",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def _apply_remote(root: Path, profile: str, target: str | None) -> int:
     _profile_key, ssh_target = _resolve_remote_target(
         profile, target, root, live_probe=True
@@ -234,6 +250,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.action == "uninstall":
+        try:
+            validate_local_lifecycle(Path.home(), root=root, action="uninstall")
+        except LifecycleError as exc:
+            return _report_lifecycle_failure("uninstall", exc)
         if profile != "local":
             if not args.apply_remote:
                 print(
@@ -257,12 +277,22 @@ def main(argv: list[str] | None = None) -> int:
                     proc, action="uninstall", profile=profile, target=target
                 )
             print(proc.stdout.decode("utf-8", errors="replace"), end="")
-        result = uninstall_local(Path.home())
+        try:
+            result = uninstall_local(Path.home(), root=root)
+        except LifecycleError as exc:
+            return _report_lifecycle_failure("uninstall", exc)
         print(
             f"clipboard-bootstrap: uninstall ok changed={str(result['changed']).lower()}"
         )
         return 0
     if args.action == "rollback":
+        try:
+            validate_local_lifecycle(Path.home(), root=root, action="rollback")
+        except FileNotFoundError as exc:
+            print(f"clipboard-bootstrap: {exc}", file=sys.stderr)
+            return 1
+        except LifecycleError as exc:
+            return _report_lifecycle_failure("rollback", exc)
         if profile != "local":
             if not args.apply_remote:
                 print(
@@ -287,7 +317,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             print(proc.stdout.decode("utf-8", errors="replace"), end="")
         try:
-            result = rollback_local(Path.home())
+            result = rollback_local(Path.home(), root=root)
         except FileNotFoundError as exc:
             print(f"clipboard-bootstrap: {exc}", file=sys.stderr)
             return 1
@@ -295,11 +325,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if profile == "local":
-        plan = install_local(
-            dry_run=args.dry_run,
-            root=root,
-            reload_current_tmux=args.reload_current_tmux,
-        )
+        try:
+            plan = install_local(
+                dry_run=args.dry_run,
+                root=root,
+                reload_current_tmux=args.reload_current_tmux,
+            )
+        except LifecycleError as exc:
+            return _report_lifecycle_failure("install", exc)
         mode = "dry-run" if args.dry_run else "apply"
         print(f"clipboard-bootstrap: local profile ({mode})")
         for step in plan.steps:
@@ -353,11 +386,14 @@ def main(argv: list[str] | None = None) -> int:
             print("note: remote writes require --apply-remote")
         return 0
 
-    local_plan = install_local(
-        dry_run=False,
-        root=root,
-        reload_current_tmux=args.reload_current_tmux,
-    )
+    try:
+        local_plan = install_local(
+            dry_run=False,
+            root=root,
+            reload_current_tmux=args.reload_current_tmux,
+        )
+    except LifecycleError as exc:
+        return _report_lifecycle_failure("install", exc)
     print("clipboard-bootstrap: local prerequisite installed")
     for step in local_plan.steps:
         print(f"  - {step}")

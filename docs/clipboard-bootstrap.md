@@ -227,6 +227,18 @@ Install baselines and one-step rollback snapshots live under
 helpers and removes only Skillbox-owned Ghostty/tmux blocks while preserving
 later user edits.
 
+Install, rollback, and uninstall fail before mutation when lifecycle state is
+malformed or unsafe. The validator accepts only the exact managed path set,
+private owned regular JSON/backup files, contained single-link backups, exact
+record types, and matching backup digests. Doctor reports the same condition as
+`lifecycle.manifest`; restore that private state from a trusted backup before
+retrying rather than deleting it and guessing at the original baseline.
+Local and remote lifecycle actions also reject symlinked/unowned parents,
+symlinked or hardlinked managed destinations, and path-bearing metadata that
+does not exactly match the fixed destination table. Local file replacement is
+atomic; remote restore validates the complete record set before restoring any
+managed file and rechecks each backup digest immediately before use.
+
 ## Closeout gates and proof commands
 
 `scripts/clipboard-closeout.sh` is the closeout/regression gate. It has two
