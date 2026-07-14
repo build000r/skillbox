@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,11 +32,20 @@ python 12 user 8u IPv4 0 0t0 TCP *:9999 (LISTEN)
             ],
         )
 
-    def test_listener_collection_failure_is_a_safe_empty_observation(self) -> None:
+    def test_listener_collection_failure_cannot_claim_safe_observation(self) -> None:
         def runner(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
             raise FileNotFoundError("lsof")
 
-        self.assertEqual(status.collect_clipboard_listeners(runner=runner), [])
+        with self.assertRaises(status.ListenerProbeError):
+            status.collect_clipboard_listeners(runner=runner)
+        checks = status.diagnose_facts(
+            {"listeners": [], "listener_probe_error": "unavailable"}
+        )
+        containment = next(
+            check for check in checks if check["id"] == "network.containment"
+        )
+        self.assertEqual(containment["status"], "fail")
+        self.assertIn("lsof", containment["repair"])
 
     def test_state_vocabulary_is_deterministic(self) -> None:
         self.assertEqual(status.classify_state(), "ready")
@@ -82,13 +92,42 @@ python 12 user 8u IPv4 0 0t0 TCP *:9999 (LISTEN)
             all(item["repair"] for item in checks if item["status"] == "fail")
         )
 
+    def test_private_state_walk_rejects_symlinks_and_unsafe_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            receipts = home / ".cache" / "skillbox" / "smart-paste" / "receipts"
+            receipts.mkdir(parents=True)
+            receipts.chmod(0o755)
+            outside = Path(raw) / "outside.json"
+            outside.write_text("secret", encoding="utf-8")
+            (receipts / "linked.json").symlink_to(outside)
+
+            facts = status._private_file_facts(home)  # noqa: SLF001
+            by_kind = {item["kind"] for item in facts}
+            self.assertIn("directory", by_kind)
+            self.assertIn("symlink", by_kind)
+            receipt_fact = next(item for item in facts if item["path"] == str(receipts))
+            self.assertEqual(receipt_fact["mode"], 0o755)
+            checks = status.diagnose_facts({"private_paths": facts})
+            private = next(
+                check for check in checks if check["id"] == "files.private_modes"
+            )
+            self.assertEqual(private["status"], "fail")
+            self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o644)
+
     def test_installed_fixture_has_ready_redacted_status_schema(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             home = Path(raw) / "home"
             home.mkdir()
             clipboard_bootstrap.install_local(home, root=ROOT_DIR)
             report = status.inspect_status(
-                home=home, root=ROOT_DIR, profile="d3", now=1000.0
+                home=home,
+                root=ROOT_DIR,
+                profile="d3",
+                now=1000.0,
+                listener_runner=lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                    [], 1, "", ""
+                ),
             )
             self.assertEqual(report["schema_version"], 1)
             self.assertEqual(report["state"], "ready")
@@ -102,7 +141,13 @@ python 12 user 8u IPv4 0 0t0 TCP *:9999 (LISTEN)
             home.mkdir()
             clipboard_bootstrap.install_local(home, root=ROOT_DIR)
             report = status.inspect_status(
-                home=home, root=ROOT_DIR, profile="conference1-fallback", now=1000.0
+                home=home,
+                root=ROOT_DIR,
+                profile="conference1-fallback",
+                now=1000.0,
+                listener_runner=lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                    [], 1, "", ""
+                ),
             )
             self.assertEqual(report["state"], "unsupported")
 

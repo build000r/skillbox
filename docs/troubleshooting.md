@@ -134,6 +134,11 @@ clipboard-paste doctor --profile d3
 clipboard-paste explain --profile d3 --json
 ```
 
+`network.containment` fails closed when `lsof` is unavailable or errors; it
+never treats a missing observation as proof that no listener exists. Likewise,
+`files.private_modes` rejects group/world-readable state directories or files,
+symlinks, and non-regular entries without following them.
+
 Then check that `ghostty +list-keybinds` shows the Skillbox `super+v` and
 `ctrl+v` private sequences, tmux shows `User198`/`User199`, and the focused
 pane was launched through tracked `d2`/`d3`. A stale or unknown route will keep
