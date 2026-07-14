@@ -7,7 +7,7 @@
 Generated from command registry ABI `2026-06-11+agent_ops_brain`.
 Do not edit by hand; run `python3 .env-manager/manage.py registry-docs --write`.
 
-Registry entries: 42.
+Registry entries: 44.
 
 ## Tier 1
 
@@ -1863,9 +1863,9 @@ None
 
 ### clipboard
 
-#### clipboard.paste
+#### clipboard.doctor
 
-Report, diagnose, or explain exact-route seamless-paste readiness with redacted evidence.
+Diagnose seamless-paste installation, containment, and exact-route readiness.
 
 - Surfaces: `cli`
 - Scopes: `profile`
@@ -1879,7 +1879,109 @@ Report, diagnose, or explain exact-route seamless-paste readiness with redacted 
 
 | Name | Type | Required |
 |---|---|---|
-| `command` | `enum[status\|doctor\|explain]?` | no |
+| `json` | `boolean?` | no |
+| `probe_target` | `boolean?` | no |
+| `profile` | `string?` | no |
+| `route_path` | `string?` | no |
+
+**Outputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `agent` | `object` | yes |
+| `capabilities` | `object` | yes |
+| `checks` | `object[]` | yes |
+| `fallback` | `object` | yes |
+| `generated_at` | `number` | yes |
+| `install` | `object` | yes |
+| `last_receipt` | `string?` | no |
+| `profile` | `string` | yes |
+| `redaction` | `string` | yes |
+| `route` | `object` | yes |
+| `schema_version` | `integer` | yes |
+| `state` | `enum[ready\|configured\|degraded\|stale\|unsupported\|ambiguous\|offline]` | yes |
+| `target` | `string?` | no |
+| `target_probe` | `object` | yes |
+| `version` | `string?` | no |
+
+**Examples**
+
+```bash
+clipboard-paste doctor --profile d3 --probe-target --json
+```
+
+**Validation**
+
+```bash
+python3 -m unittest tests.test_clipboard_status tests.test_agent_ops_command_registry
+```
+
+**Graph Nodes**: `command`, `check`, `evidence`
+
+#### clipboard.explain
+
+Explain the exact evidence, risks, and fallback for seamless paste.
+
+- Surfaces: `cli`
+- Scopes: `profile`
+- Side effect: `network`
+- Risk: `low`
+- Entrypoint: `clipboard-paste`
+- Owner binary: None
+- MCP mirror: None
+
+**Inputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `json` | `boolean?` | no |
+| `probe_target` | `boolean?` | no |
+| `profile` | `string?` | no |
+| `route_path` | `string?` | no |
+
+**Outputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `confidence` | `number` | yes |
+| `evidence` | `string[]` | yes |
+| `image_action` | `enum[registered_route\|refuse_upload]` | yes |
+| `repair` | `string?` | no |
+| `risks` | `string[]` | yes |
+| `schema_version` | `integer` | yes |
+| `state` | `enum[ready\|ambiguous\|unsupported]` | yes |
+| `text_action` | `enum[native_paste]` | yes |
+
+**Examples**
+
+```bash
+clipboard-paste explain --profile d3 --json
+```
+
+**Validation**
+
+```bash
+python3 -m unittest tests.test_clipboard_status tests.test_agent_ops_command_registry
+```
+
+**Graph Nodes**: `command`, `check`, `evidence`
+
+#### clipboard.status
+
+Report exact-route seamless-paste readiness with redacted evidence.
+
+- Surfaces: `cli`
+- Scopes: `profile`
+- Side effect: `network`
+- Risk: `low`
+- Entrypoint: `clipboard-paste`
+- Owner binary: None
+- MCP mirror: None
+
+**Inputs**
+
+| Name | Type | Required |
+|---|---|---|
 | `json` | `boolean?` | no |
 | `probe_target` | `boolean?` | no |
 | `profile` | `string?` | no |
@@ -1909,14 +2011,6 @@ Report, diagnose, or explain exact-route seamless-paste readiness with redacted 
 
 ```bash
 clipboard-paste status --profile d3 --json
-```
-
-```bash
-clipboard-paste doctor --profile d3 --probe-target --json
-```
-
-```bash
-clipboard-paste explain --profile d3 --json
 ```
 
 **Validation**
