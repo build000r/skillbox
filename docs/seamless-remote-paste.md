@@ -45,6 +45,9 @@ native text semantics and dispatches non-text snapshots only for a registered
 route. Managed Ghostty also maps terminal-first `Ctrl+V` to the same exact-pane
 router; on that chord the router performs one bracketed text paste itself.
 Both chords obey the same snapshot, route, race, privacy, and fallback rules.
+A pane without a complete route/generation never invokes the clipboard helper:
+`Cmd+V` stays on Ghostty's native action and `Ctrl+V` sends its original literal
+`^V` byte to the pane.
 A profile must advertise which chord it owns; the installer must not shadow an
 unrelated application or global macOS paste binding.
 

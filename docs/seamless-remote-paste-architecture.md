@@ -35,6 +35,10 @@ Because Ghostty does not chain native paste on that chord, the router injects
 text exactly once as bracketed paste. `Cmd+V` remains the macOS-native default
 and uses `User199` plus Ghostty's chained `paste_from_clipboard` action.
 
+Without both a registered route path and generation, `User199` performs no
+helper read and `User198` restores the original literal `^V` byte. Thus an
+unregistered pane cannot cause an image snapshot, upload, or path injection.
+
 When `d2` or `d3` starts outside local tmux, the tracked launcher creates a
 transparent disposable local tmux session and runs the registered route inside
 it. This supplies the same exact interception point without changing the
