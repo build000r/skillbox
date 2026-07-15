@@ -204,6 +204,26 @@ The wrapper discovery contract. Agents should start here to learn the stable com
       "safe_first_try": "sbp send-later list --json"
     },
     {
+      "aliases": [
+        "load-guard",
+        "swarm-safe"
+      ],
+      "json": true,
+      "name": "safe",
+      "notes": "One-shot load gate; pass SECONDS to watch (sbp safe 10). Exit 0=GO, 1=NO-GO.",
+      "safe_first_try": "sbp safe --json"
+    },
+    {
+      "aliases": [
+        "conf1",
+        "tailnet"
+      ],
+      "json": true,
+      "name": "conference1",
+      "notes": "urls/status/helper are read-only; expose/remove require --yes; Funnel refused.",
+      "safe_first_try": "sbp conference1 status --json"
+    },
+    {
       "json": true,
       "name": "recalibrate",
       "safe_first_try": "sbp recalibrate --json"
