@@ -68,7 +68,8 @@ with `scripts/clipboard-bootstrap rollback`, or remove both sides with
 The macOS + Ghostty + tracked tmux lane has real `devbox-1` image evidence;
 the remaining transport/support-matrix rows are still rollout gates. See
 [clipboard bootstrap](docs/clipboard-bootstrap.md) for the proof boundary,
-privacy model, diagnosis, fallback, and lifecycle details.
+privacy model, diagnosis, fallback, lifecycle details, and the
+[future-host configuration recipe](docs/clipboard-bootstrap.md#future-host-no-new-clipboard-code).
 
 ## TL;DR
 

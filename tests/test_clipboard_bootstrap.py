@@ -512,6 +512,23 @@ class ClipboardBootstrapTests(unittest.TestCase):
         self.assertNotIn(secret, report)
         self.assertNotIn("hostile stdout", report)
 
+    def test_remote_apply_keeps_dynamic_profile_target(self) -> None:
+        from lib import clipboard_bootstrap_cli as CLI
+
+        success = subprocess.CompletedProcess([], 0, stdout=b"remote-installed\n", stderr=b"")
+        with (
+            mock.patch.object(CLI, "apply_remote_via_ssh", return_value=success) as apply,
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            code = CLI._apply_remote(  # noqa: SLF001
+                ROOT_DIR, "devbox", "skillbox@example-host"
+            )
+        self.assertEqual(code, 0)
+        apply.assert_called_once_with(
+            "skillbox@example-host", root=ROOT_DIR, transport="ssh"
+        )
+        self.assertEqual(stdout.getvalue(), "remote-installed\n")
+
     def test_remote_reversal_failure_does_not_start_local_reversal(self) -> None:
         from lib import clipboard_bootstrap_cli as CLI
 
@@ -680,6 +697,49 @@ class ClipboardBootstrapTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertIn("user@example.com", proc.stdout)
         self.assertIn("generic", proc.stdout)
+
+    def test_bootstrap_cli_dynamic_devbox_profile_keeps_explicit_target(self) -> None:
+        proc = subprocess.run(
+            [
+                "bash",
+                str(ROOT_DIR / "scripts" / "clipboard-bootstrap"),
+                "--profile",
+                "devbox",
+                "--target",
+                "skillbox@example-host",
+                "--dry-run",
+            ],
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        self.assertIn("profile=devbox", proc.stdout)
+        self.assertIn("target=skillbox@example-host", proc.stdout)
+
+    def test_bootstrap_cli_conference_profile_honors_explicit_target(self) -> None:
+        proc = subprocess.run(
+            [
+                "bash",
+                str(ROOT_DIR / "scripts" / "clipboard-bootstrap"),
+                "--profile",
+                "conference1",
+                "--target",
+                "worker@conference-fixture",
+                "--dry-run",
+            ],
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        self.assertIn("target=worker@conference-fixture", proc.stdout)
+        self.assertNotIn("conference route:", proc.stdout)
 
     def test_remote_install_script_terminfo_verification(self) -> None:
         script = CB.remote_install_script()

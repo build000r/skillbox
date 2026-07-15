@@ -101,6 +101,21 @@ class SeamlessRemotePasteContractTests(unittest.TestCase):
             "[`docs/seamless-remote-paste.md`](seamless-remote-paste.md)", bootstrap
         )
 
+    def test_clipboard_bootstrap_documents_future_host_configuration(self) -> None:
+        bootstrap = (ROOT_DIR / "docs" / "clipboard-bootstrap.md").read_text(
+            encoding="utf-8"
+        )
+        normalized = " ".join(bootstrap.split())
+        for marker in (
+            "## Configuration model",
+            "`scripts/clipboard/hosts.json`",
+            "`~/.config/skillbox/clipboard-hosts.json`",
+            "--profile devbox --target \"$target\" --dry-run",
+            "DEVL_CLIPBOARD_PROFILE=devbox",
+            "Capability flags are explicit security claims",
+        ):
+            self.assertIn(marker, normalized)
+
 
 if __name__ == "__main__":
     unittest.main()
