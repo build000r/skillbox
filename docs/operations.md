@@ -617,7 +617,19 @@ scripts/clipboard-bootstrap --profile d3 --apply-remote
 # Hosts without a named profile
 scripts/clipboard-bootstrap --profile generic --target user@host                 # plan
 scripts/clipboard-bootstrap --profile generic --target user@host --apply-remote  # apply
+
+# New full-capability single-user devbox (no registry edit required)
+scripts/clipboard-bootstrap --profile devbox --target skillbox@new-devbox --dry-run
+scripts/clipboard-bootstrap --profile devbox --target skillbox@new-devbox --apply-remote
+
+# Use that target through the normal one-gesture d2/d3 launcher path
+DEVL_TARGET=skillbox@new-devbox DEVL_CLIPBOARD_PROFILE=devbox \
+  DEVL_TRANSPORT=ssh DEVL_ROOT=/srv/repos d3
 ```
+
+The complete configuration map, installed paths, durable named-profile recipe,
+and capability/trust rules are in
+[clipboard-bootstrap.md](clipboard-bootstrap.md#configuration-model).
 
 Validation from a fresh checkout (no SSH access or remote writes needed):
 

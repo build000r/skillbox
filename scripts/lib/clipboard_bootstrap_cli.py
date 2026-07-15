@@ -103,7 +103,7 @@ def _resolve_remote_target(
 ) -> tuple[str, str]:
     """Return (profile_key, ssh_target) after conference routing."""
     key = profile
-    if profile == "conference1":
+    if profile == "conference1" and not target:
         route = (
             select_conference_route(root=root, live_probe=live_probe)
             if live_probe
@@ -211,9 +211,7 @@ def _apply_remote(root: Path, profile: str, target: str | None) -> int:
         print("clipboard-bootstrap: remote profile missing ssh_target", file=sys.stderr)
         return 2
 
-    resolved_apply = resolve_profile(
-        _profile_key, target=target if _profile_key == "generic" else None, root=root
-    )
+    resolved_apply = resolve_profile(_profile_key, target=target, root=root)
     transport = resolved_apply.get("transport", "ssh")
     proc = apply_remote_via_ssh(ssh_target, root=root, transport=transport)
     if proc.returncode != 0:
@@ -264,11 +262,7 @@ def main(argv: list[str] | None = None) -> int:
             profile_key, ssh_target = _resolve_remote_target(
                 profile, target, root, live_probe=True
             )
-            resolved = resolve_profile(
-                profile_key,
-                target=target if profile_key == "generic" else None,
-                root=root,
-            )
+            resolved = resolve_profile(profile_key, target=target, root=root)
             proc = apply_remote_restore_via_ssh(
                 ssh_target, transport=resolved.get("transport", "ssh")
             )
@@ -303,11 +297,7 @@ def main(argv: list[str] | None = None) -> int:
             profile_key, ssh_target = _resolve_remote_target(
                 profile, target, root, live_probe=True
             )
-            resolved = resolve_profile(
-                profile_key,
-                target=target if profile_key == "generic" else None,
-                root=root,
-            )
+            resolved = resolve_profile(profile_key, target=target, root=root)
             proc = apply_remote_restore_via_ssh(
                 ssh_target, rollback=True, transport=resolved.get("transport", "ssh")
             )
@@ -348,9 +338,7 @@ def main(argv: list[str] | None = None) -> int:
     profile_key, routed_target = _resolve_remote_target(
         profile, target, root, live_probe=live_probe
     )
-    resolved = resolve_profile(
-        profile_key, target=target if profile_key == "generic" else None, root=root
-    )
+    resolved = resolve_profile(profile_key, target=target, root=root)
     remote_plan = plan_remote_bootstrap(
         profile,
         target=target,
@@ -371,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
     for step in remote_plan.steps:
         print(f"  - {step}")
 
-    if profile == "conference1":
+    if profile == "conference1" and not target:
         route = (
             static_conference_route(root=root)
             if not live_probe

@@ -53,6 +53,57 @@ each host key once before first use — either run a manual
 `StrictHostKeyChecking accept-new` in the Host block if trust-on-first-use
 is acceptable for your threat model.
 
+## Configuration model
+
+Clipboard behavior is config-driven and split into four explicit layers:
+
+| Concern | Tracked source of truth | Installed/runtime location |
+|---|---|---|
+| Host names, aliases, trust, transports, and paste capabilities | `scripts/clipboard/hosts.json` | `~/.config/skillbox/clipboard-hosts.json` (private mode `0600`) |
+| `Cmd+V` / `Ctrl+V` ownership | `scripts/clipboard/ghostty.conf` | `~/.config/skillbox/clipboard.ghostty.conf` |
+| tmux OSC52 and smart-paste bindings | `scripts/clipboard/tmux.conf` | `~/.config/skillbox/clipboard.tmux.conf` |
+| Exact focused-pane route | `scripts/launchers/d2`, `scripts/launchers/d3`, and `clipboard-route-exec` | Short-lived records under `~/.local/state/skillbox/paste-routes/` |
+
+Bootstrap copies the tracked configuration and adds scoped include lines; it
+does not replace the operator's whole Ghostty or tmux configuration. The host
+registry is validated before it is used. Runtime route commands accept
+`SKILLBOX_CLIPBOARD_HOSTS=/path/to/hosts.json` for an explicit alternate
+registry, while the checked-in registry remains the reproducible default. Do
+not hand-edit the installed registry: a later bootstrap intentionally
+republishes the tracked source of truth over it.
+
+### Future host: no new clipboard code
+
+For a new single-user devbox, use the dynamic, full-capability `devbox` profile.
+The target is explicit, so no source edit or new alias is required:
+
+```bash
+target=skillbox@new-devbox
+
+# Safe preview: local only, no SSH and no writes.
+scripts/clipboard-bootstrap --profile devbox --target "$target" --dry-run
+
+# Reversible local install plus remote receiver install.
+scripts/clipboard-bootstrap --profile devbox --target "$target" --apply-remote
+
+# Launch a direct shell with exact one-gesture paste routing.
+DEVL_TARGET="$target" \
+DEVL_CLIPBOARD_PROFILE=devbox \
+DEVL_TRANSPORT=ssh \
+DEVL_ROOT=/srv/repos \
+d3
+```
+
+Use the same environment variables with `d2` for a numbered remote tmux
+session. Put the target behind a `~/.ssh/config` Host alias to make the command
+stable when an IP changes. If the setup is permanent and deserves a short
+operator alias, add one profile plus its aliases to
+`scripts/clipboard/hosts.json`, run
+`clipboard-route <alias> --hosts scripts/clipboard/hosts.json --validate`, and
+rerun the local bootstrap to publish the updated private registry. Capability
+flags are explicit security claims: do not enable native image paste for a
+multi-user or untrusted host.
+
 ## Supported surfaces
 
 | Surface | Transport | Clipboard | Notes |
