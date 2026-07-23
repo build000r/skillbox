@@ -1,0 +1,23 @@
+skillbox-orb-setup: start: 2026-07-19T16:44:37Z
+skillbox-orb-setup: disk before: /dev/vda1       154G  127G   28G  82% /
+skillbox-orb-setup: python: Python 3.12.3
+skillbox-orb-setup: compileall: .env-manager + scripts + tests
+skillbox-orb-setup: unittest: tests.test_agent_ops_adapters
+----------------------------------------------------------------------
+Ran 14 tests in 0.186s
+
+OK
+skillbox-orb-setup: disk after: /dev/vda1       154G  127G   28G  82% /
+skillbox-orb-setup: setup ok
+AGENT_SETUP_RESULT_JSON {"schema_version":1,"repo":"build000r/skillbox","script":"setup","status":"ok","failure_class":"none","reason":"setup ok","exit_code":0,"duration_seconds":0,"disk":{"filesystem":"/dev/vda1","size_kb":161421296,"used_kb":132335400,"available_kb":29069512,"capacity":"82%","mount":"/"},"log_file":"/srv/skillbox/repos/opensource/skillbox/.agents/logs/setup.log","timestamp":"2026-07-19T16:44:38Z"}skillbox-orb-setup: start: 2026-07-19T16:46:57Z
+skillbox-orb-setup: disk before: /dev/vda1       154G  127G   28G  83% /
+skillbox-orb-setup: python: Python 3.12.3
+skillbox-orb-setup: compileall: .env-manager + scripts + tests
+skillbox-orb-setup: unittest: tests.test_agent_ops_adapters
+----------------------------------------------------------------------
+Ran 14 tests in 0.182s
+
+OK
+skillbox-orb-setup: disk after: /dev/vda1       154G  127G   28G  83% /
+skillbox-orb-setup: setup ok
+AGENT_SETUP_RESULT_JSON {"schema_version":1,"repo":"build000r/skillbox","script":"setup","status":"ok","failure_class":"none","reason":"setup ok","exit_code":0,"duration_seconds":2,"disk":{"filesystem":"/dev/vda1","size_kb":161421296,"used_kb":132909908,"available_kb":28495004,"capacity":"83%","mount":"/"},"log_file":"/srv/skillbox/repos/opensource/skillbox/.agents/logs/setup.log","timestamp":"2026-07-19T16:46:59Z"}

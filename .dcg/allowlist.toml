@@ -1,0 +1,5 @@
+[[allow]]
+rule = "strict_git:push-main"
+reason = "Repository permits direct pushes to main"
+added_by = "skillbox"
+added_at = "2026-07-23T14:48:57Z"

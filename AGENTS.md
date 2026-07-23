@@ -330,3 +330,26 @@ git push                # Push to remote
 ```
 
 <!-- end-bv-agent-instructions -->
+
+## Orb bootstrap (AO-005)
+
+Hardened Amp Orb lane for shell/Python validation (substitute for skillbox-config,
+which is Orb-denied).
+
+- **Setup:** run `.agents/setup`. It is idempotent, checks fixed Orb disk
+  headroom before work, compiles `.env-manager`/`scripts`/`tests`, then runs
+  `python3 -m unittest tests.test_agent_ops_adapters -q`.
+- **Resume:** run `.agents/resume` on wake. It performs only fast checks
+  (Python/git/toolchain presence and disk headroom) and backgrounds optional
+  repair so it stays inside Amp's 10s non-blocking wake budget.
+- **Status/logs:** setup writes `.agents/state/setup-status.json` and
+  `.agents/logs/setup.log`; resume writes `.agents/state/resume-status.json` and
+  `.agents/logs/resume.log`. Final stderr lines are prefixed
+  `AGENT_SETUP_RESULT_JSON` or `AGENT_RESUME_RESULT_JSON`.
+- **Typed failures:** `setup=10`, `dependency=20`, `capacity=30`, `auth=40`,
+  `validation=50`. Capacity failures mean the fixed 40GB Orb disk does not have
+  enough free space for safe setup/resume.
+- **Broader tests (optional):** `python3 -m unittest discover -s tests` is
+  heavier and not required for bootstrap smoke.
+- **Do not:** start Docker monoserver, load operator `.env` secrets, or touch
+  production box lifecycle on the Orb.
