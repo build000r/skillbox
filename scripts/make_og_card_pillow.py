@@ -52,8 +52,11 @@ def render(out: str, w: int = 1200, h: int = 630) -> None:
     img = Image.new("RGB", (w, h), BG)
     d = ImageDraw.Draw(img)
 
-    reg = lambda s: _font(FONT_CANDIDATES, s)
-    bold = lambda s: _font(FONT_BOLD_CANDIDATES, s)
+    def reg(s):
+        return _font(FONT_CANDIDATES, s)
+
+    def bold(s):
+        return _font(FONT_BOLD_CANDIDATES, s)
 
     # terminal window frame
     d.rounded_rectangle([80, 70, 1120, 560], radius=18, fill=PANEL,
