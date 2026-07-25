@@ -1251,7 +1251,13 @@ def check_skill_sync_dry_run(model: dict[str, Any]) -> CheckResult:
         status="pass",
         code="skill-repo-sync-dry-run",
         message="manage.py sync --dry-run can resolve the configured default skill-repo-set",
-        details={"preview": actions[:4]},
+        # sync --format json now emits action OBJECTS (skillbox-sync-actions-schema-fe3h).
+        # detail_lines() str()-joins this preview, so keep the human-readable text.
+        details={
+            "preview": [
+                a.get("text", a) if isinstance(a, dict) else a for a in actions[:4]
+            ]
+        },
     )
 
 
