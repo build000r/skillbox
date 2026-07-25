@@ -65,9 +65,26 @@ runtime_artifacts:
   - id: dcg-bin
     path: /home/sandbox/.local/bin/dcg
     required: false
+    version: v0.6.7
+    provenance:
+      release: https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.7
+      minisign_key: RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB
+      minisign_key_id: d0a0a51bd147b836
+      cache_key: dcg/v0.6.7/<asset>/<sha256>
+      resolver: .env-manager/runtime_manager/dcg_distribution.py
+      supported_assets:
+        - dcg-aarch64-apple-darwin.tar.xz
+        - dcg-x86_64-apple-darwin.tar.xz
+        - dcg-aarch64-unknown-linux-gnu.tar.xz
+        - dcg-x86_64-unknown-linux-musl.tar.xz
     notes: >
-      Destructive command guard binary. PreToolUse hook AND MCP server
-      for proactive command safety checking.
+      Destructive command guard binary, pinned to v0.6.7. PreToolUse hook AND
+      MCP server (`dcg mcp-server`) for proactive command safety checking.
+      Installed only through the verified resolver: OS/arch maps to one of the
+      four supported assets above, and the download must match the committed
+      sha256 AND the upstream minisign signature. WSL uses the Linux mapping;
+      native Windows is unsupported. Unsupported or unverifiable states fail
+      with a remediation command instead of skipping the install.
 
   - id: rch-bin
     path: /home/sandbox/.local/bin/rch
@@ -187,8 +204,11 @@ runtime_services:
     kind: mcp-bridge
     owner: local
     required: false
+    command: dcg mcp-server
     notes: >
-      DCG MCP server. Agents can proactively check command safety
+      DCG MCP server, started as `dcg mcp-server` (v0.6.7 removed the older
+      `dcg mcp` spelling, which now exits with "unrecognized subcommand").
+      Agents can proactively check command safety
       via check_command, scan files for destructive patterns, and
       get explanations for why a pattern was flagged.
 

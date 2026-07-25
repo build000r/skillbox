@@ -57,8 +57,25 @@ core:
         sha256: ${SKILLBOX_DCG_DOWNLOAD_SHA256}
         executable: true
       sync:
-        mode: download-if-missing
-      notes: Destructive command guard binary. Protects agent sessions from irreversible shell commands.
+        # NOT download-if-missing: the pinned DCG assets are .tar.xz bundles
+        # that also require a minisign signature check, which the generic
+        # URL downloader (tar.gz + sha256 only) cannot do. Installation is
+        # owned by the verified resolver in
+        # .env-manager/runtime_manager/dcg_distribution.py, which pins
+        # v0.6.7, maps OS/arch to exactly four supported assets, checks the
+        # committed sha256 AND the upstream minisign signature, caches under
+        # dcg/v0.6.7/<asset>/<sha256> on the persistent ${SKILLBOX_HOME_ROOT}/.local
+        # mount, and fails closed (never optional-skip) on any unsupported or
+        # unverifiable state.
+        mode: manual
+      notes: >
+        Destructive command guard binary, pinned to v0.6.7 from the upstream
+        destructive_command_guard release (exact release URL, per-asset sha256
+        table, and OS/arch mapping live in the resolver) and authenticated with
+        minisign key RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB
+        (key id d0a0a51bd147b836). Protects agent sessions from irreversible
+        shell commands. SKILLBOX_DCG_DOWNLOAD_URL/SHA256 are assertions, not
+        opt-outs: a value that disagrees with the repo pin is rejected.
 
     - id: cass-bin
       kind: binary
@@ -391,7 +408,11 @@ core:
       required: false
       profiles:
         - core
-      notes: Destructive command guard should be installed for agent safety.
+      notes: >
+        Destructive command guard should be installed for agent safety. Presence
+        alone is not health: the installed binary must report the pinned v0.6.7
+        (see .env-manager/runtime_manager/dcg_distribution.py provenance_record)
+        and must serve `dcg mcp-server`.
 
     - id: apr-binary
       type: path_exists
@@ -651,18 +672,21 @@ connectors:
       transport: stdio
       profiles:
         - connectors
-      command: ${SKILLBOX_DCG_BIN} mcp
+      command: ${SKILLBOX_DCG_BIN} mcp-server
       healthcheck:
-        # Probe choice: dcg mcp is a stdio MCP bridge, so mcp_ready/stdio
+        # Probe choice: dcg mcp-server is a stdio MCP bridge, so mcp_ready/stdio
         # verifies the initialize handshake instead of only matching a process.
+        # The subcommand is `mcp-server`, NOT the pre-0.6.7 `mcp`: `dcg mcp`
+        # exits with "unrecognized subcommand" on the pinned v0.6.7 build.
         type: mcp_ready
         transport: stdio
-        probe_command: ${SKILLBOX_DCG_BIN} mcp
+        probe_command: ${SKILLBOX_DCG_BIN} mcp-server
         timeout_seconds: 0.2
       depends_on: []
       log: connectors
       notes: >
-        DCG MCP server. Exposes check_command, scan_file, and
+        DCG MCP server (dcg mcp-server on v0.6.7; the old `dcg mcp` spelling
+        was removed). Exposes check_command, scan_file, and
         explain_pattern as agent tools. Agents can proactively verify
         whether a command is safe before attempting it, rather than
         being passively blocked by the PreToolUse hook.
