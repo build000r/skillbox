@@ -1,0 +1,12 @@
+[
+  {
+    "id": "acme",
+    "packs": ["core.git", "containers.docker", "containers.docker"],
+    "allowlist": ["docker compose down --volumes acme-dev", "docker compose down --volumes acme-dev"]
+  },
+  {
+    "id": "globex",
+    "packs": ["containers.docker", "core.filesystem", "database.postgresql"],
+    "allowlist": ["docker compose down --volumes acme-dev"]
+  }
+]

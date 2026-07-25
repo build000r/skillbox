@@ -1,0 +1,12 @@
+[
+  {
+    "id": "acme",
+    "packs": ["containers.docker", "database.postgresql"],
+    "allowlist": ["docker compose down --volumes acme-dev"]
+  },
+  {
+    "id": "globex",
+    "packs": ["kubernetes.kubectl", "containers.compose"],
+    "allowlist": ["kubectl delete namespace globex-ephemeral"]
+  }
+]
