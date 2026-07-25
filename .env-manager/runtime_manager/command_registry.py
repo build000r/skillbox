@@ -406,6 +406,7 @@ def default_registry() -> tuple[CommandSpec, ...]:
             outputs={
                 "ok": "boolean",
                 "context": "object",
+                "cautions": "object[]",
                 "recommendations": "object[]",
                 "blockers": "object[]",
             },

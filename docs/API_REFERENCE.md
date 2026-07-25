@@ -131,6 +131,7 @@ Rank the highest-leverage next actions with reasons, claim commands, and validat
 | Name | Type | Required |
 |---|---|---|
 | `blockers` | `object[]` | yes |
+| `cautions` | `object[]` | yes |
 | `context` | `object` | yes |
 | `ok` | `boolean` | yes |
 | `recommendations` | `object[]` | yes |
