@@ -1,0 +1,33 @@
+# Synthetic registry/repos.yaml for the environment-inventory contract tests.
+#
+# `gadget` carries a remote with an embedded credential ON PURPOSE: the contract
+# must never emit a git remote URL, only host + transport kind, and the redaction
+# tests assert the literal credential never appears anywhere in the output.
+schema_version: 1
+
+metadata:
+  updated: "2026-07-25"
+  owner: fixture
+
+repos:
+  - id: widget
+    path: ~/repos/widget
+    ownership: owned
+    remote: "git@github.test:example/widget.git"
+    bucket: app
+    runtime_class: runnable
+    sbp_owner: acme
+
+  - id: gadget
+    path: ~/repos/gadget
+    ownership: owned
+    remote: "https://deploy:s3cr3t-token-value@github.test/example/gadget.git"
+    bucket: backend
+    runtime_class: dependency
+    sbp_owner: acme
+
+  - id: orphan
+    path: /synthetic/elsewhere/orphan
+    ownership: external
+    bucket: reference
+    runtime_class: needs-decision

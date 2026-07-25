@@ -1,0 +1,301 @@
+{
+  "clients": [
+    {
+      "client_id": "acme",
+      "declared": {
+        "client_id": "acme",
+        "cwd_match": [
+          "~/repos/widget",
+          "/synthetic/beta/repos"
+        ],
+        "label": "Acme Co",
+        "plan_draft": "plans/draft",
+        "plan_root": "plans/released",
+        "repo_ids": [
+          "sha256:0c4642c194bd8991",
+          "sha256:2ade7e957d73d3eb",
+          "sha256:78057b1e20b7e0c3"
+        ],
+        "scan_roots": [
+          "~/repos",
+          "/synthetic/beta/repos"
+        ]
+      },
+      "observed": null
+    },
+    {
+      "client_id": "bravo",
+      "declared": {
+        "client_id": "bravo",
+        "cwd_match": [
+          "/synthetic/beta/repos/bravo-app"
+        ],
+        "label": "Bravo AUTH_TOKEN=[REDACTED]",
+        "plan_draft": null,
+        "plan_root": "plans/bravo",
+        "repo_ids": [
+          "sha256:15ce6f7d481555ce"
+        ],
+        "scan_roots": [
+          "/synthetic/beta/repos"
+        ]
+      },
+      "observed": null
+    }
+  ],
+  "contract": "skillbox.environment_inventory",
+  "freshness": {
+    "expires_at": 1700000300.0,
+    "generated_at": 1700000000.0,
+    "observed": false,
+    "source_count": 4,
+    "ttl_s": 300.0
+  },
+  "generated_at": 1700000000.0,
+  "machine": {
+    "declared": {
+      "aliases": [
+        {
+          "alias": "/synthetic/beta/repos-alias",
+          "canonical": "/synthetic/beta/repos"
+        }
+      ],
+      "declared_machine_ids": [
+        "alpha-laptop",
+        "beta-devbox"
+      ],
+      "home": "/synthetic/beta-home",
+      "hostnames": [
+        "beta-host"
+      ],
+      "machine_id": "beta-devbox",
+      "managed_home": "/synthetic/beta-managed",
+      "projects_roots": [
+        "/synthetic/beta/projects"
+      ],
+      "repo_roots": [
+        "/synthetic/beta/repos",
+        "/synthetic/beta/repos-alias"
+      ]
+    },
+    "detection_source": "explicit",
+    "observed": null
+  },
+  "readiness": {
+    "declared_client_count": 2,
+    "declared_repo_count": 5,
+    "observed_missing_count": null,
+    "observed_present_count": null,
+    "reasons": [],
+    "recovery_count": 0,
+    "status": "ready"
+  },
+  "recovery": [],
+  "redaction": {
+    "applied": true,
+    "marker": "[REDACTED]",
+    "policy": "field-allowlist projection, then shared lib.redaction.redact_value"
+  },
+  "repos": [
+    {
+      "declared": {
+        "bucket": null,
+        "clients": [
+          "acme"
+        ],
+        "declared_by": [
+          "client:acme.repos"
+        ],
+        "kind": "repo",
+        "ownership": null,
+        "path_declared": "/synthetic/beta/repos-alias/sprocket",
+        "path_relative": "sprocket",
+        "registry_id": "sprocket",
+        "remote_host": null,
+        "remote_kind": null,
+        "root_category": "repos",
+        "runtime_class": null,
+        "sbp_owner": null,
+        "unresolved_vars": []
+      },
+      "observed": null,
+      "repo_id": "sha256:0c4642c194bd8991"
+    },
+    {
+      "declared": {
+        "bucket": "reference",
+        "clients": [],
+        "declared_by": [
+          "registry"
+        ],
+        "kind": null,
+        "ownership": "external",
+        "path_declared": "/synthetic/elsewhere/orphan",
+        "path_relative": null,
+        "registry_id": "orphan",
+        "remote_host": null,
+        "remote_kind": null,
+        "root_category": null,
+        "runtime_class": "needs-decision",
+        "sbp_owner": null,
+        "unresolved_vars": []
+      },
+      "observed": null,
+      "repo_id": "sha256:11096e5cd4ce6fa4"
+    },
+    {
+      "declared": {
+        "bucket": null,
+        "clients": [
+          "bravo"
+        ],
+        "declared_by": [
+          "client:bravo.repo_landscape",
+          "client:bravo.repos"
+        ],
+        "kind": "repo",
+        "ownership": null,
+        "path_declared": "/synthetic/beta/repos/bravo-app",
+        "path_relative": "bravo-app",
+        "registry_id": "bravo-app",
+        "remote_host": null,
+        "remote_kind": null,
+        "root_category": "repos",
+        "runtime_class": null,
+        "sbp_owner": null,
+        "unresolved_vars": []
+      },
+      "observed": null,
+      "repo_id": "sha256:15ce6f7d481555ce"
+    },
+    {
+      "declared": {
+        "bucket": "backend",
+        "clients": [
+          "acme"
+        ],
+        "declared_by": [
+          "client:acme.repo_landscape",
+          "registry"
+        ],
+        "kind": null,
+        "ownership": "owned",
+        "path_declared": "~/repos/gadget",
+        "path_relative": "gadget",
+        "registry_id": "gadget",
+        "remote_host": "github.test",
+        "remote_kind": "https",
+        "root_category": "repos",
+        "runtime_class": "dependency",
+        "sbp_owner": "acme",
+        "unresolved_vars": []
+      },
+      "observed": null,
+      "repo_id": "sha256:2ade7e957d73d3eb"
+    },
+    {
+      "declared": {
+        "bucket": "app",
+        "clients": [
+          "acme"
+        ],
+        "declared_by": [
+          "client:acme.repos",
+          "registry"
+        ],
+        "kind": "repo",
+        "ownership": "owned",
+        "path_declared": "~/repos/widget",
+        "path_relative": "widget",
+        "registry_id": "widget",
+        "remote_host": "github.test",
+        "remote_kind": "ssh",
+        "root_category": "repos",
+        "runtime_class": "runnable",
+        "sbp_owner": "acme",
+        "unresolved_vars": []
+      },
+      "observed": null,
+      "repo_id": "sha256:78057b1e20b7e0c3"
+    }
+  ],
+  "schema_version": "2026-07-25+environment_inventory.v1",
+  "sources": [
+    {
+      "client_id": null,
+      "kind": "machines",
+      "present": true
+    },
+    {
+      "client_id": null,
+      "kind": "registry",
+      "present": true
+    },
+    {
+      "client_id": "acme",
+      "kind": "client_overlay",
+      "present": true
+    },
+    {
+      "client_id": "bravo",
+      "kind": "client_overlay",
+      "present": true
+    }
+  ],
+  "supersedes": {
+    "consumer": "swimmers",
+    "fields": {
+      "<derived> repo exists on this box": [
+        "repos[].observed.present",
+        "repos[].observed.kind"
+      ],
+      "<derived> repo root translation": [
+        "machine.declared.repo_roots",
+        "repos[].observed.path"
+      ],
+      "<derived> which machine am I": [
+        "machine.declared.machine_id",
+        "machine.detection_source"
+      ],
+      "<discovery> clients/*/overlay.yaml glob": [
+        "clients[]",
+        "sources[]"
+      ],
+      "client.id": [
+        "clients[].declared.client_id"
+      ],
+      "client.label": [
+        "clients[].declared.label"
+      ],
+      "client.repos[].id": [
+        "repos[].declared.registry_id",
+        "repos[].repo_id"
+      ],
+      "client.repos[].kind": [
+        "repos[].declared.kind"
+      ],
+      "client.repos[].repo_path": [
+        "repos[].declared.path_declared",
+        "repos[].declared.path_relative",
+        "repos[].observed.path"
+      ],
+      "context.cwd_match": [
+        "clients[].declared.cwd_match"
+      ],
+      "context.plans.plan_draft": [
+        "clients[].declared.plan_draft"
+      ],
+      "context.plans.plan_root": [
+        "clients[].declared.plan_root"
+      ],
+      "context.repo_landscape.repos[].path": [
+        "repos[].declared.path_declared",
+        "repos[].observed.path"
+      ],
+      "context.repo_landscape.scan_roots": [
+        "clients[].declared.scan_roots"
+      ]
+    },
+    "note": "Read these contract fields instead of parsing skillbox-config privately. Every key below is a field Swimmers parses today in src/session/overlay.rs; the values are the contract paths that now own that fact. Guaranteed for the life of this schema_version."
+  }
+}

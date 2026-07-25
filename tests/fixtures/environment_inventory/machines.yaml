@@ -1,0 +1,34 @@
+# Synthetic machines.yaml for the environment-inventory contract tests.
+#
+# Every path here is deliberately fake (/synthetic/...) so nothing in this
+# fixture or in the golden built from it can ever bake in a real machine's
+# absolute paths. Two profiles with DIFFERENT root shapes are declared on
+# purpose: the contract's stable repo ids must come out identical whichever
+# profile is current.
+version: 1
+
+machines:
+  alpha-laptop:
+    hostnames: [alpha-host, alpha-host-alt]
+    home: /synthetic/alpha-home
+    repo_roots:
+      - /synthetic/alpha-home/repos
+      - ~/repos
+    projects_roots:
+      - ~/projects
+
+  beta-devbox:
+    hostnames: [beta-host]
+    home: /synthetic/beta-home
+    managed_home: /synthetic/beta-managed
+    repo_roots:
+      - /synthetic/beta/repos
+      - /synthetic/beta/repos-alias
+    projects_roots:
+      - /synthetic/beta/projects
+
+# repos-alias is the "same tree, two names" case: a path written through the
+# alias must canonicalize before identity is computed.
+aliases:
+  - alias: /synthetic/beta/repos-alias
+    canonical: /synthetic/beta/repos
