@@ -26,6 +26,14 @@ x-runtime-env: &runtime_env
   SKILLBOX_SWIMMERS_AUTH_MODE: ${SKILLBOX_SWIMMERS_AUTH_MODE:-}
   SKILLBOX_SWIMMERS_AUTH_TOKEN: ${SKILLBOX_SWIMMERS_AUTH_TOKEN:-}
   SKILLBOX_SWIMMERS_OBSERVER_TOKEN: ${SKILLBOX_SWIMMERS_OBSERVER_TOKEN:-}
+  # DCG is pinned to v0.6.7 by .env-manager/runtime_manager/dcg_distribution.py
+  # (four supported OS/arch assets, committed sha256s, minisign key id
+  # d0a0a51bd147b836). The two DOWNLOAD_* knobs stay empty so the resolver picks
+  # the asset for the box's architecture; a non-empty value that disagrees with
+  # the pin is rejected rather than honored. The verified asset cache lives at
+  # $SKILLBOX_HOME_ROOT/.local/share/skillbox/dcg, under the persistent
+  # home/.local bind mount below, so a replaced container keeps both the
+  # installed binary and its provenance.
   SKILLBOX_DCG_BIN: ${SKILLBOX_DCG_BIN:-/home/sandbox/.local/bin/dcg}
   SKILLBOX_DCG_DOWNLOAD_URL: ${SKILLBOX_DCG_DOWNLOAD_URL:-}
   SKILLBOX_DCG_DOWNLOAD_SHA256: ${SKILLBOX_DCG_DOWNLOAD_SHA256:-}
