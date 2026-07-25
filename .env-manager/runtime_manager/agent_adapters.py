@@ -10,10 +10,13 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from .agent_timing import PHASE_ADAPTER_COLLECTION, record_detail, record_phase
 from .evidence import collect_runtime_evidence
@@ -42,8 +45,25 @@ ADAPTER_TIMEOUT_ENV = "SKILLBOX_ADAPTER_TIMEOUT"
 MAX_ADAPTER_TIMEOUT_SECONDS = 30.0
 DEFAULT_PULSE_MAX_AGE_SECONDS = 120.0
 PREVIEW_LIMIT = 500
+
+# Bounded concurrency for adapter collection.
+#
+# Serial collection made a brain invocation cost the *sum* of every external
+# tool budget: a measured ``next`` run spent 7856ms of its 8930ms end-to-end in
+# adapter collection, with bv and sbp each burning their full 2.5s timeout back
+# to back. The adapters are independent read-only probes, so they can overlap --
+# but this box is shared with live agent sessions, so the fan-out is capped
+# rather than unbounded. Four covers the expensive probes (br x2, bv, sbp,
+# evidence) in effectively one wave while leaving headroom on a loaded host.
+DEFAULT_ADAPTER_MAX_WORKERS = 4
+ADAPTER_MAX_WORKERS_ENV = "SKILLBOX_ADAPTER_MAX_WORKERS"
+MAX_ADAPTER_WORKERS = 8
+ADAPTER_THREAD_NAME_PREFIX = "sbx-adapter"
+
 AdapterArgsBuilder = Callable[[Mapping[str, Any]], list[str]]
 AdapterParser = Callable[[str], Any]
+AdapterCallable = Callable[[], Any]
+AdapterTask = tuple[str, AdapterCallable]
 
 
 @dataclass(frozen=True)
@@ -655,17 +675,222 @@ def pulse_state_adapter(
     }
 
 
+def _resolve_adapter_max_workers(
+    *,
+    max_workers: int | None = None,
+    env: Mapping[str, str] | None = None,
+) -> tuple[int, str, list[dict[str, Any]]]:
+    """Resolve the concurrency cap from an argument, the environment, or the default."""
+    warnings: list[dict[str, Any]] = []
+    if max_workers is not None:
+        raw: Any = max_workers
+        source = "argument"
+    else:
+        merged_env = {**os.environ, **dict(env or {})}
+        raw = str(merged_env.get(ADAPTER_MAX_WORKERS_ENV) or "").strip()
+        if not raw:
+            return DEFAULT_ADAPTER_MAX_WORKERS, "default", warnings
+        source = ADAPTER_MAX_WORKERS_ENV
+
+    try:
+        value = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        warnings.append(
+            _warning(
+                "ADAPTER_WORKERS_CONFIG_INVALID",
+                f"{source} must be an integer worker count",
+                requested_max_workers=str(raw),
+                max_workers_source=source,
+            )
+        )
+        return DEFAULT_ADAPTER_MAX_WORKERS, "default", warnings
+
+    if value < 1:
+        warnings.append(
+            _warning(
+                "ADAPTER_WORKERS_CONFIG_INVALID",
+                f"{source} must be at least 1",
+                requested_max_workers=value,
+                max_workers_source=source,
+            )
+        )
+        return 1, source, warnings
+    if value > MAX_ADAPTER_WORKERS:
+        warnings.append(
+            _warning(
+                "ADAPTER_WORKERS_CAPPED",
+                f"adapter concurrency capped at {MAX_ADAPTER_WORKERS}",
+                requested_max_workers=value,
+                cap=MAX_ADAPTER_WORKERS,
+                max_workers_source=source,
+            )
+        )
+        return MAX_ADAPTER_WORKERS, source, warnings
+    return value, source, warnings
+
+
+class _ConcurrencyGauge:
+    """Records the peak number of adapters in flight at once.
+
+    This is the observable that makes "bounded" a fact rather than a claim: the
+    proof and the tests read ``peak`` instead of trusting the executor.
+    """
+
+    __slots__ = ("_lock", "_active", "peak")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active = 0
+        self.peak = 0
+
+    @contextmanager
+    def track(self) -> Iterator[None]:
+        with self._lock:
+            self._active += 1
+            if self._active > self.peak:
+                self.peak = self._active
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._active -= 1
+
+
+def _degraded_adapter_payload(
+    name: str,
+    *,
+    code: str,
+    message: str,
+    started_at: float,
+) -> dict[str, Any]:
+    return {
+        "source": str(name),
+        "kind": "in_process",
+        "ok": False,
+        "status": "unavailable",
+        "duration_ms": _duration_ms(started_at),
+        "warnings": [_warning(code, message)],
+    }
+
+
+def _call_adapter(name: str, fn: AdapterCallable, gauge: _ConcurrencyGauge) -> dict[str, Any]:
+    """Run one adapter callable so no failure can escape into its siblings.
+
+    Per-adapter timeouts are enforced inside ``run_adapter`` by the subprocess
+    itself, so a timeout consumes only its own worker: the other adapters keep
+    running and the collection still ends at the slowest one.
+    """
+    started_at = time.monotonic()
+    with gauge.track():
+        try:
+            payload = fn()
+        except Exception as exc:  # noqa: BLE001 - one adapter must never fail the set
+            return _degraded_adapter_payload(
+                name,
+                code="ADAPTER_CALL_FAILED",
+                message=str(exc),
+                started_at=started_at,
+            )
+    if not isinstance(payload, dict):
+        return _degraded_adapter_payload(
+            name,
+            code="ADAPTER_RESULT_INVALID",
+            message=f"{name} adapter returned {type(payload).__name__}, expected a mapping",
+            started_at=started_at,
+        )
+    return payload
+
+
+def _future_payload(name: str, future: "Future[dict[str, Any]]", started_at: float) -> dict[str, Any]:
+    try:
+        return future.result()
+    except Exception as exc:  # noqa: BLE001 - dispatch failures degrade like any other adapter
+        return _degraded_adapter_payload(
+            name,
+            code="ADAPTER_DISPATCH_FAILED",
+            message=str(exc),
+            started_at=started_at,
+        )
+
+
+def collect_adapters_bounded(
+    tasks: Sequence[AdapterTask] | Iterable[AdapterTask],
+    *,
+    max_workers: int | None = None,
+    env: Mapping[str, str] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run independent adapter callables under a bounded thread pool.
+
+    Contract:
+
+    * **Bounded.** At most ``max_workers`` adapters are ever in flight; the
+      observed peak is reported back so callers can verify it.
+    * **Deterministic.** Results are keyed in *declared* order, never completion
+      order, so payload and golden stability survive parallelism.
+    * **Isolated.** An exception, a timeout, or a nonsense return value degrades
+      exactly one adapter entry and never the collection.
+    * **Unchanged when trivial.** Zero or one adapter runs inline on the calling
+      thread with no pool at all.
+    """
+    ordered: list[AdapterTask] = [(str(name), fn) for name, fn in tasks]
+    workers, workers_source, warnings = _resolve_adapter_max_workers(
+        max_workers=max_workers,
+        env=env,
+    )
+    effective = max(1, min(workers, len(ordered))) if ordered else 1
+    gauge = _ConcurrencyGauge()
+    started_at = time.monotonic()
+    results: dict[str, Any] = {}
+
+    if len(ordered) <= 1 or effective <= 1:
+        mode = "serial"
+        for name, fn in ordered:
+            results[name] = _call_adapter(name, fn, gauge)
+    else:
+        mode = "parallel"
+        futures: dict[str, Future[dict[str, Any]]] = {}
+        with ThreadPoolExecutor(
+            max_workers=effective,
+            thread_name_prefix=ADAPTER_THREAD_NAME_PREFIX,
+        ) as pool:
+            for name, fn in ordered:
+                futures[name] = pool.submit(_call_adapter, name, fn, gauge)
+        # Exiting the pool joined every worker, so nothing is still running and
+        # nothing was abandoned. Rebuild by declared name, not completion order.
+        for name, _fn in ordered:
+            results[name] = _future_payload(name, futures[name], started_at)
+
+    concurrency = {
+        "mode": mode,
+        "adapter_count": len(ordered),
+        "max_workers": effective,
+        "requested_max_workers": workers,
+        "max_workers_source": workers_source,
+        "peak_in_flight": gauge.peak,
+        "warnings": warnings,
+    }
+    return results, concurrency
+
+
 def adapter_timing_summary(
     adapters: Mapping[str, Any],
     *,
     collection_ms: float | None = None,
+    concurrency: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Summarize per-adapter durations and degraded statuses.
 
     Per-adapter ``duration_ms`` stays untouched on each adapter payload; this is
     a roll-up so a caller can see *which* adapter ate the wall clock without
-    walking every packet. ``collection_ms`` is the real collection wall time and
-    is normally larger than ``sum_adapter_ms`` by the dispatch overhead.
+    walking every packet. ``collection_ms`` is the real collection wall time.
+    Under bounded parallel collection it tracks the *slowest* adapter rather
+    than ``sum_adapter_ms``.
+
+    ``concurrency`` is optional and only appears when supplied, so the key set
+    of a bare summary stays pinned by the golden contract. When it is supplied
+    it gains ``parallel_speedup`` -- ``sum_adapter_ms / collection_ms`` -- the
+    single field that makes a silent regression back to serial collection
+    visible.
     """
     durations: dict[str, float] = {}
     statuses: dict[str, str] = {}
@@ -689,16 +914,23 @@ def adapter_timing_summary(
         slowest_name = max(durations, key=lambda key: durations[key])
         slowest = {"name": slowest_name, "duration_ms": durations[slowest_name]}
 
+    sum_adapter_ms = round(sum(durations.values()), 3)
     summary: dict[str, Any] = {
         "adapter_count": len(statuses),
         "collection_ms": round(float(collection_ms), 3) if collection_ms is not None else None,
-        "sum_adapter_ms": round(sum(durations.values()), 3),
+        "sum_adapter_ms": sum_adapter_ms,
         "durations_ms": durations,
         "statuses": statuses,
         "slowest": slowest,
         "timeouts": sorted(timeouts),
         "unavailable": sorted(unavailable),
     }
+    if concurrency is not None:
+        block = dict(concurrency)
+        wall = summary["collection_ms"]
+        if isinstance(wall, (int, float)) and wall > 0:
+            block["parallel_speedup"] = round(sum_adapter_ms / float(wall), 3)
+        summary["concurrency"] = block
     return summary
 
 
@@ -708,27 +940,42 @@ def collect_agent_adapter_evidence(
     model: dict[str, Any] | None = None,
     cwd: str | None = None,
     ntm_session: str | None = None,
+    max_workers: int | None = None,
 ) -> dict[str, Any]:
-    """Collect bounded adapter evidence for graph/next consumers."""
+    """Collect bounded adapter evidence for graph/next consumers.
+
+    Every adapter below is an independent read-only probe: ``br``/``bv``/``sbp``
+    each shell out to their own binary, ``pulse`` reads a state file, and
+    ``evidence`` composes read-only in-process surfaces. None consumes another's
+    result and none mutates shared state, so they are collected concurrently
+    under a bounded pool. The declared order here is also the emitted order.
+    """
     started_at = time.monotonic()
-    adapters: dict[str, Any] = {
-        "br_ready": br_ready_adapter(root_dir),
-        "br_open": br_list_adapter(root_dir, status="open"),
-        "bv_triage": bv_triage_adapter(root_dir),
-        "sbp_skills": sbp_skills_adapter(root_dir),
-        "pulse": pulse_state_adapter(root_dir),
-    }
+    tasks: list[AdapterTask] = [
+        ("br_ready", lambda: br_ready_adapter(root_dir)),
+        ("br_open", lambda: br_list_adapter(root_dir, status="open")),
+        ("bv_triage", lambda: bv_triage_adapter(root_dir)),
+        ("sbp_skills", lambda: sbp_skills_adapter(root_dir)),
+        ("pulse", lambda: pulse_state_adapter(root_dir)),
+    ]
     if ntm_session:
-        adapters["ntm_activity"] = ntm_activity_adapter(ntm_session, root_dir=root_dir)
+        tasks.append(("ntm_activity", lambda: ntm_activity_adapter(ntm_session, root_dir=root_dir)))
     if model is not None:
-        adapters["evidence"] = runtime_evidence_adapter(root_dir, model, cwd=cwd)
+        tasks.append(("evidence", lambda: runtime_evidence_adapter(root_dir, model, cwd=cwd)))
+
+    adapters, concurrency = collect_adapters_bounded(tasks, max_workers=max_workers)
     warnings = [
         warning
         for adapter in adapters.values()
         for warning in (adapter.get("warnings") or [])
     ]
+    warnings.extend(concurrency.get("warnings") or [])
     collection_ms = float(_duration_ms(started_at))
-    timing = adapter_timing_summary(adapters, collection_ms=collection_ms)
+    timing = adapter_timing_summary(
+        adapters,
+        collection_ms=collection_ms,
+        concurrency=concurrency,
+    )
     # Feed the invocation recorder so brain payloads can report adapter wall
     # time next to compute time instead of hiding it.
     record_phase(PHASE_ADAPTER_COLLECTION, collection_ms)
@@ -746,9 +993,13 @@ __all__ = [
     "AdapterSpec",
     "DEFAULT_TIMEOUTS",
     "ADAPTER_TIMEOUT_ENV",
+    "ADAPTER_MAX_WORKERS_ENV",
+    "DEFAULT_ADAPTER_MAX_WORKERS",
     "MAX_ADAPTER_TIMEOUT_SECONDS",
+    "MAX_ADAPTER_WORKERS",
     "DEFAULT_PULSE_MAX_AGE_SECONDS",
     "adapter_timing_summary",
+    "collect_adapters_bounded",
     "redact_diagnostic_text",
     "run_adapter",
     "run_command_adapter",

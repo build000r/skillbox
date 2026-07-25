@@ -63,6 +63,12 @@ BUDGETS_MS = {
     "explain_service": 100.0,
     "search_graph": 100.0,
     "adapter_collection_stub": 1500.0,
+    # Six fixture adapters that each block for ADAPTER_FIXTURE_HOLD_SECONDS.
+    # Serial collection costs 6 x 200ms = 1200ms; bounded parallel collection at
+    # the default cap of 4 costs two waves, ~400ms. The budget sits between the
+    # two, so a silent regression to serial collection fails this row while an
+    # ordinarily loaded host still passes with ~600ms of slack.
+    "adapter_parallel_fixture": 1000.0,
     "model_build": 5000.0,
     # Subprocess wall on a shared box. Measured 1.1-1.9s at load average 34, so
     # this is an order-of-magnitude regression detector, not a precision gate:
@@ -77,6 +83,10 @@ REQUIRED_COMPONENT_META = ("compute_ms", "elapsed_ms", "end_to_end_ms")
 
 LIVE_DEFAULT_COMMAND = ("next", "--format", "json", "--limit", "1")
 LIVE_DEFAULT_TIMEOUT_SECONDS = 180.0
+
+# Blocking fixture adapters for the bounded-concurrency row.
+ADAPTER_FIXTURE_COUNT = 6
+ADAPTER_FIXTURE_HOLD_SECONDS = 0.2
 
 
 def _node(node_id: str, kind: str, label: str, **attrs: object) -> dict[str, object]:
@@ -228,8 +238,51 @@ def _component_detail(name: str, value: Any) -> dict[str, Any]:
             "statuses": timing.get("statuses"),
             "timeouts": timing.get("timeouts"),
             "unavailable": timing.get("unavailable"),
+            "concurrency": timing.get("concurrency"),
+            "order": list((value.get("adapters") or {}).keys()),
         }
+    if name == "adapter_parallel_fixture" and isinstance(value, dict):
+        return value
     return {}
+
+
+def _parallel_adapter_fixture() -> dict[str, Any]:
+    """Prove bounded collection costs the slowest adapter, not the sum.
+
+    Deterministic and tool-free: every fixture adapter blocks for the same
+    interval, so the serial cost is known exactly and the observed wall time
+    either follows it or does not.
+    """
+
+    def blocking(index: int) -> Callable[[], dict[str, Any]]:
+        def run() -> dict[str, Any]:
+            time.sleep(ADAPTER_FIXTURE_HOLD_SECONDS)
+            return {
+                "source": f"fixture-{index}",
+                "kind": "fixture",
+                "ok": True,
+                "status": "ok",
+                "warnings": [],
+            }
+
+        return run
+
+    tasks = [(f"fixture-{index}", blocking(index)) for index in range(ADAPTER_FIXTURE_COUNT)]
+    started = time.perf_counter()
+    results, concurrency = ADAPTERS.collect_adapters_bounded(tasks)
+    wall_ms = (time.perf_counter() - started) * 1000.0
+    serial_equivalent_ms = ADAPTER_FIXTURE_COUNT * ADAPTER_FIXTURE_HOLD_SECONDS * 1000.0
+    return {
+        "order": list(results),
+        "declared_order_preserved": list(results) == [name for name, _fn in tasks],
+        "mode": concurrency["mode"],
+        "max_workers": concurrency["max_workers"],
+        "peak_in_flight": concurrency["peak_in_flight"],
+        "bounded": concurrency["peak_in_flight"] <= concurrency["max_workers"],
+        "serial_equivalent_ms": round(serial_equivalent_ms, 3),
+        "observed_wall_ms": round(wall_ms, 3),
+        "speedup_vs_serial": round(serial_equivalent_ms / wall_ms, 3) if wall_ms > 0 else None,
+    }
 
 
 def _stubbed_adapter_collection(tmp_root: Path) -> dict[str, Any]:
@@ -355,6 +408,11 @@ def _live_meta_breakdown(meta: dict[str, Any]) -> dict[str, Any]:
         "adapter_timeouts": adapters.get("timeouts") or [],
         "adapter_unavailable": adapters.get("unavailable") or [],
         "slowest_adapter": adapters.get("slowest"),
+        # sum vs collection is the whole parallelism story in two numbers:
+        # serial collection makes them equal, bounded parallel collection drives
+        # collection down toward the slowest single adapter.
+        "sum_adapter_ms": adapters.get("sum_adapter_ms"),
+        "adapter_concurrency": adapters.get("concurrency"),
     }
 
 
@@ -452,6 +510,20 @@ def build_proof(
                 lambda: _stubbed_adapter_collection(tmp_root),
             )
         )
+    # Bounded-concurrency row. Wall time alone is a machine-dependent number, so
+    # the structural facts -- never over the cap, always declared order -- gate
+    # alongside it.
+    parallel_row = _measure_component(
+        "adapter_parallel_fixture",
+        max(1, min(cycles, 3)),
+        _parallel_adapter_fixture,
+    )
+    detail = parallel_row["detail"]
+    parallel_row["ok"] = bool(
+        parallel_row["ok"] and detail.get("bounded") and detail.get("declared_order_preserved")
+    )
+    rows.append(parallel_row)
+
     rows.append(_measure_component("model_build", max(1, min(cycles, 3)), lambda: build_runtime_model(ROOT_DIR)))
     rows.append(_capabilities_cli_import_smoke())
 
@@ -503,8 +575,21 @@ def _render_live(live: dict[str, Any]) -> str:
     for key in ("end_to_end_ms", "startup_ms", "model_ms", "adapter_collection_ms", "compute_ms"):
         if breakdown.get(key) is not None:
             lines.append(f"  {key}: {breakdown[key]}")
+    if breakdown.get("sum_adapter_ms") is not None:
+        lines.append(f"  sum_adapter_ms: {breakdown['sum_adapter_ms']}")
+    concurrency = breakdown.get("adapter_concurrency") or {}
+    if concurrency:
+        lines.append(
+            "  adapter_concurrency: "
+            f"mode={concurrency.get('mode')} "
+            f"max_workers={concurrency.get('max_workers')} "
+            f"peak_in_flight={concurrency.get('peak_in_flight')} "
+            f"speedup={concurrency.get('parallel_speedup')}"
+        )
     if breakdown.get("adapter_durations_ms"):
         lines.append(f"  adapters_ms: {json.dumps(breakdown['adapter_durations_ms'], sort_keys=True)}")
+    if breakdown.get("slowest_adapter"):
+        lines.append(f"  slowest_adapter: {json.dumps(breakdown['slowest_adapter'], sort_keys=True)}")
     if breakdown.get("adapter_timeouts"):
         lines.append(f"  adapter_timeouts: {', '.join(breakdown['adapter_timeouts'])}")
     if breakdown.get("adapter_unavailable"):

@@ -5,6 +5,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -373,6 +375,192 @@ class AdapterComponentTimingTests(unittest.TestCase):
         )
         self.assertEqual(recorder.details()["adapters"], timing)
         TIMING.reset_invocation()
+
+
+class BoundedAdapterConcurrencyTests(unittest.TestCase):
+    """Adapters are independent read-only probes, so they overlap -- under a cap.
+
+    The regression these tests exist to prevent is the measured one: serial
+    collection charged a brain invocation the *sum* of every external tool
+    budget (7856ms of an 8930ms ``next``), because two adapters each burned
+    their full 2.5s timeout back to back.
+    """
+
+    @staticmethod
+    def _blocking_task(barrier: threading.Barrier, hold_seconds: float):
+        def run() -> dict[str, object]:
+            # Rendezvous proves genuine simultaneity: if the collector were
+            # serial, or the pool narrower than the barrier, this raises
+            # BrokenBarrierError and the adapter degrades visibly.
+            barrier.wait(timeout=10.0)
+            time.sleep(hold_seconds)
+            return {"source": "fixture", "ok": True, "status": "ok", "duration_ms": 0, "warnings": []}
+
+        return run
+
+    def test_wall_time_follows_the_slowest_adapter_not_the_sum(self) -> None:
+        cap = 3
+        hold = 0.1
+        barrier = threading.Barrier(cap)
+        tasks = [(f"fixture-{index}", self._blocking_task(barrier, hold)) for index in range(9)]
+
+        started = time.monotonic()
+        results, concurrency = ADAPT.collect_adapters_bounded(tasks, max_workers=cap)
+        elapsed = time.monotonic() - started
+
+        serial_equivalent = hold * len(tasks)
+        self.assertEqual([row["status"] for row in results.values()], ["ok"] * len(tasks))
+        self.assertEqual(concurrency["mode"], "parallel")
+        self.assertEqual(concurrency["max_workers"], cap)
+        # Bounded: never more than the cap in flight...
+        self.assertLessEqual(concurrency["peak_in_flight"], cap)
+        # ...and genuinely concurrent: the barrier could not have released
+        # otherwise, so the peak is exactly the cap.
+        self.assertEqual(concurrency["peak_in_flight"], cap)
+        # 9 tasks / 3 workers is 3 waves, not 9: comfortably under the serial sum.
+        self.assertLess(elapsed, serial_equivalent * 0.6)
+
+    def test_declared_order_survives_scrambled_completion_order(self) -> None:
+        """Completion order is nondeterministic; emitted order must not be."""
+        delays = {"alpha": 0.06, "bravo": 0.0, "charlie": 0.03, "delta": 0.045, "echo": 0.015}
+        completion: list[str] = []
+        lock = threading.Lock()
+
+        def make(name: str, delay: float):
+            def run() -> dict[str, object]:
+                time.sleep(delay)
+                with lock:
+                    completion.append(name)
+                return {"source": name, "ok": True, "status": "ok", "warnings": []}
+
+            return run
+
+        tasks = [(name, make(name, delay)) for name, delay in delays.items()]
+        orders: list[list[str]] = []
+        for _ in range(3):
+            completion.clear()
+            results, _concurrency = ADAPT.collect_adapters_bounded(tasks, max_workers=5)
+            orders.append(list(results))
+
+        self.assertEqual(orders, [list(delays)] * 3)
+        # Completion really did finish out of declared order, so the assertion
+        # above is testing something.
+        self.assertNotEqual(completion, list(delays))
+
+    def test_one_adapter_timing_out_or_raising_never_stalls_the_others(self) -> None:
+        def timing_out() -> dict[str, object]:
+            raise subprocess.TimeoutExpired(["bv"], timeout=0.01)
+
+        def exploding() -> dict[str, object]:
+            raise RuntimeError("adapter blew up")
+
+        def nonsense() -> object:
+            return "not-a-mapping"
+
+        def healthy() -> dict[str, object]:
+            return {"source": "healthy", "ok": True, "status": "ok", "warnings": []}
+
+        results, concurrency = ADAPT.collect_adapters_bounded(
+            [
+                ("timing_out", timing_out),
+                ("exploding", exploding),
+                ("nonsense", nonsense),
+                ("healthy", healthy),
+            ],
+            max_workers=4,
+        )
+
+        self.assertEqual(list(results), ["timing_out", "exploding", "nonsense", "healthy"])
+        self.assertEqual(results["healthy"]["status"], "ok")
+        for name in ("timing_out", "exploding", "nonsense"):
+            with self.subTest(adapter=name):
+                self.assertFalse(results[name]["ok"])
+                self.assertEqual(results[name]["status"], "unavailable")
+                self.assertIn("duration_ms", results[name])
+        self.assertEqual(results["exploding"]["warnings"][0]["code"], "ADAPTER_CALL_FAILED")
+        self.assertEqual(results["nonsense"]["warnings"][0]["code"], "ADAPTER_RESULT_INVALID")
+        self.assertEqual(concurrency["warnings"], [])
+
+    def test_zero_and_one_adapter_stay_serial_with_no_pool(self) -> None:
+        def healthy() -> dict[str, object]:
+            return {"source": "solo", "ok": True, "status": "ok", "warnings": []}
+
+        empty, empty_concurrency = ADAPT.collect_adapters_bounded([])
+        solo, solo_concurrency = ADAPT.collect_adapters_bounded([("solo", healthy)])
+
+        self.assertEqual(empty, {})
+        self.assertEqual(empty_concurrency["mode"], "serial")
+        self.assertEqual(empty_concurrency["adapter_count"], 0)
+        self.assertEqual(list(solo), ["solo"])
+        self.assertEqual(solo_concurrency["mode"], "serial")
+        self.assertEqual(solo_concurrency["peak_in_flight"], 1)
+
+    def test_worker_cap_is_configurable_clamped_and_reported(self) -> None:
+        def healthy() -> dict[str, object]:
+            return {"source": "x", "ok": True, "status": "ok", "warnings": []}
+
+        tasks = [(f"task-{index}", healthy) for index in range(12)]
+
+        with mock.patch.dict(os.environ, {ADAPT.ADAPTER_MAX_WORKERS_ENV: "2"}, clear=False):
+            _results, tuned = ADAPT.collect_adapters_bounded(tasks)
+        with mock.patch.dict(os.environ, {ADAPT.ADAPTER_MAX_WORKERS_ENV: "99"}, clear=False):
+            _results, capped = ADAPT.collect_adapters_bounded(tasks)
+        with mock.patch.dict(os.environ, {ADAPT.ADAPTER_MAX_WORKERS_ENV: "banana"}, clear=False):
+            _results, invalid = ADAPT.collect_adapters_bounded(tasks)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ADAPT.ADAPTER_MAX_WORKERS_ENV, None)
+            _results, default = ADAPT.collect_adapters_bounded(tasks)
+
+        self.assertEqual(tuned["max_workers"], 2)
+        self.assertEqual(tuned["max_workers_source"], ADAPT.ADAPTER_MAX_WORKERS_ENV)
+        self.assertEqual(capped["max_workers"], ADAPT.MAX_ADAPTER_WORKERS)
+        self.assertEqual(capped["warnings"][0]["code"], "ADAPTER_WORKERS_CAPPED")
+        self.assertEqual(invalid["max_workers"], ADAPT.DEFAULT_ADAPTER_MAX_WORKERS)
+        self.assertEqual(invalid["warnings"][0]["code"], "ADAPTER_WORKERS_CONFIG_INVALID")
+        self.assertEqual(default["max_workers"], ADAPT.DEFAULT_ADAPTER_MAX_WORKERS)
+        self.assertEqual(default["max_workers_source"], "default")
+        self.assertLessEqual(default["peak_in_flight"], ADAPT.DEFAULT_ADAPTER_MAX_WORKERS)
+
+    def test_collect_evidence_overlaps_real_adapters_and_pins_emitted_order(self) -> None:
+        hold = 0.25
+
+        def slow_run(_command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            time.sleep(hold)
+            return _completed("{}")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch.object(ADAPT.subprocess, "run", side_effect=slow_run):
+                started = time.monotonic()
+                payload = ADAPT.collect_agent_adapter_evidence(Path(tmpdir))
+                elapsed_ms = (time.monotonic() - started) * 1000.0
+
+        timing = payload["timing"]
+        concurrency = timing["concurrency"]
+
+        self.assertEqual(
+            list(payload["adapters"]),
+            ["br_ready", "br_open", "bv_triage", "sbp_skills", "pulse"],
+        )
+        self.assertEqual(concurrency["mode"], "parallel")
+        self.assertEqual(concurrency["max_workers"], ADAPT.DEFAULT_ADAPTER_MAX_WORKERS)
+        self.assertLessEqual(concurrency["peak_in_flight"], ADAPT.DEFAULT_ADAPTER_MAX_WORKERS)
+        # The proof this bead exists for: collection tracks the slowest adapter,
+        # not the sum of four blocking subprocess calls.
+        self.assertGreater(timing["sum_adapter_ms"], timing["collection_ms"] * 2)
+        self.assertGreater(concurrency["parallel_speedup"], 2.0)
+        self.assertLess(elapsed_ms, hold * 1000.0 * 3)
+
+    def test_summary_omits_concurrency_unless_supplied(self) -> None:
+        bare = ADAPT.adapter_timing_summary({}, collection_ms=0.0)
+        annotated = ADAPT.adapter_timing_summary(
+            {"bv_triage": {"status": "timeout", "ok": False, "duration_ms": 2500}},
+            collection_ms=2510.0,
+            concurrency={"mode": "parallel", "max_workers": 4, "peak_in_flight": 4},
+        )
+
+        self.assertNotIn("concurrency", bare)
+        self.assertEqual(annotated["concurrency"]["mode"], "parallel")
+        self.assertEqual(annotated["concurrency"]["parallel_speedup"], round(2500 / 2510.0, 3))
 
 
 class InvocationTimingTests(unittest.TestCase):

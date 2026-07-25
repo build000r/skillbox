@@ -6,15 +6,25 @@ carry a safety verdict is rejected, a corpus that leaks secrets or
 machine-specific values is rejected, and the evaluator keeps false-safe and
 false-abstain failures in separate columns instead of averaging them into a
 single "accuracy" number.
+
+``EvidenceUnderConcurrencyTests`` adds the comparison lane: the orientation
+corpus grades decisions made *from adapter evidence*, so any change to how that
+evidence is collected has to be proven decision-neutral. Bounded parallel
+collection is compared against serial collection packet for packet, and the
+resulting recommendations are compared payload for payload.
 """
 from __future__ import annotations
 
 import contextlib
 import io
 import json
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
+from unittest import mock
 
 from tests.quality import brain_orientation_proof as PROOF
 
@@ -24,7 +34,17 @@ ENV_MANAGER_DIR = ROOT_DIR / ".env-manager"
 if str(ENV_MANAGER_DIR) not in sys.path:
     sys.path.insert(0, str(ENV_MANAGER_DIR))
 
+from runtime_manager import agent_adapters as ADAPT  # noqa: E402
+from runtime_manager.agent_decisions import next_action_payload  # noqa: E402
+
 CORPUS_PATH = ROOT_DIR / "tests" / "goldens" / "agent_ops_orientation_scenarios.json"
+
+# Fields whose whole purpose is to differ between two runs. Everything else in
+# an adapter packet is evidence, and evidence must be identical.
+VOLATILE_ADAPTER_KEYS = frozenset({"duration_ms", "elapsed_ms"})
+VOLATILE_TIMING_KEYS = frozenset(
+    {"collection_ms", "durations_ms", "sum_adapter_ms", "slowest", "concurrency"}
+)
 
 
 def _valid_scenario() -> dict[str, object]:
@@ -365,6 +385,114 @@ class OrientationBaselineTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertIn("BASELINE SCORECARD", buffer.getvalue())
+
+
+def _stub_tool_output(command: list[str]) -> str:
+    """Deterministic stand-ins for the real br/bv/sbp payloads."""
+    binary = command[0]
+    if binary == "br" and "ready" in command:
+        return json.dumps(
+            [
+                {"id": "probe-1", "title": "Ready probe one", "priority": 0, "status": "open"},
+                {"id": "probe-2", "title": "Ready probe two", "priority": 2, "status": "open"},
+            ]
+        )
+    if binary == "br":
+        return json.dumps([{"id": "probe-3", "title": "Open probe", "priority": 1, "status": "open"}])
+    if binary == "bv":
+        return json.dumps(
+            {
+                "recommendations": [
+                    {"id": "probe-1", "claim_command": "br update probe-1 --status=in_progress"}
+                ]
+            }
+        )
+    if binary == "sbp":
+        return json.dumps({"issues": [], "summary": {"effective": 3}})
+    return "{}"
+
+
+def _stable_graph() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "nodes": [
+            {"id": "service:db", "kind": "service", "label": "db", "attrs": {}},
+            {"id": "service:api", "kind": "service", "label": "api", "attrs": {}},
+            {"id": "command:brain.next", "kind": "command", "label": "next", "attrs": {}},
+        ],
+        "edges": [
+            {"source": "service:api", "target": "service:db", "kind": "depends_on", "attrs": {}},
+        ],
+        "warnings": [],
+    }
+
+
+def _strip_volatile(payload: dict[str, Any]) -> dict[str, Any]:
+    adapters = {
+        name: {key: value for key, value in packet.items() if key not in VOLATILE_ADAPTER_KEYS}
+        for name, packet in payload["adapters"].items()
+    }
+    timing = {
+        key: value for key, value in payload["timing"].items() if key not in VOLATILE_TIMING_KEYS
+    }
+    return {
+        "ok": payload["ok"],
+        "order": list(payload["adapters"]),
+        "adapters": adapters,
+        "timing": timing,
+        "warnings": payload["warnings"],
+    }
+
+
+class EvidenceUnderConcurrencyTests(unittest.TestCase):
+    """Bounded parallel collection must be decision-neutral, not just faster."""
+
+    def _collect(self, tmpdir: str, *, max_workers: int) -> dict[str, Any]:
+        def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(command, 0, stdout=_stub_tool_output(command), stderr="")
+
+        with mock.patch.object(ADAPT.subprocess, "run", side_effect=fake_run):
+            return ADAPT.collect_agent_adapter_evidence(Path(tmpdir), max_workers=max_workers)
+
+    def test_serial_and_parallel_collection_yield_identical_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            serial = self._collect(tmpdir, max_workers=1)
+            parallel = self._collect(tmpdir, max_workers=ADAPT.DEFAULT_ADAPTER_MAX_WORKERS)
+
+        self.assertEqual(serial["timing"]["concurrency"]["mode"], "serial")
+        self.assertEqual(parallel["timing"]["concurrency"]["mode"], "parallel")
+        self.assertEqual(_strip_volatile(serial), _strip_volatile(parallel))
+
+    def test_recommendations_are_unchanged_by_the_collection_strategy(self) -> None:
+        """The Quality Lab grades this payload; concurrency must not touch it."""
+        graph = _stable_graph()
+        evidence = {"overall": "green", "blocked_conditions": []}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            serial = self._collect(tmpdir, max_workers=1)["adapters"]
+            parallel = self._collect(tmpdir, max_workers=ADAPT.DEFAULT_ADAPTER_MAX_WORKERS)["adapters"]
+
+        serial_payload = next_action_payload(graph, adapters=serial, evidence=evidence)
+        parallel_payload = next_action_payload(graph, adapters=parallel, evidence=evidence)
+
+        for payload in (serial_payload, parallel_payload):
+            payload.pop("meta", None)
+
+        self.assertEqual(serial_payload, parallel_payload)
+        self.assertEqual(
+            [item["id"] for item in parallel_payload.get("recommendations") or []],
+            [item["id"] for item in serial_payload.get("recommendations") or []],
+        )
+
+    def test_parallel_collection_is_stable_across_repeated_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runs = [
+                _strip_volatile(self._collect(tmpdir, max_workers=ADAPT.DEFAULT_ADAPTER_MAX_WORKERS))
+                for _ in range(4)
+            ]
+
+        for index, run in enumerate(runs[1:], start=1):
+            with self.subTest(run=index):
+                self.assertEqual(run, runs[0])
 
 
 if __name__ == "__main__":
