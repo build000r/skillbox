@@ -1,0 +1,64 @@
+# Synthetic client overlay for the environment-inventory contract tests.
+#
+# Shape mirrors a real skillbox-config/clients/<id>/overlay.yaml, including the
+# sections Swimmers parses today (client.id, client.label, client.repos[],
+# context.cwd_match, context.plans.*, context.repo_landscape.*) AND several
+# sections it ignores. The ignored sections carry secret-looking values on
+# purpose: the contract projects an explicit allowlist, so none of them may
+# appear in the payload.
+version: 1
+
+client:
+  id: acme
+  label: Acme Co
+
+  # --- fields the contract must NOT project ------------------------------- #
+  default_cwd: /synthetic/beta/repos
+  human_operator:
+    booking_url: https://example.test/book
+    access_token_env: ACME_ACCESS_TOKEN
+    api_password: hunter2-must-never-appear
+  skills:
+    - id: acme-skills
+      lock_path: /synthetic/private/skill-repos.lock.json
+      deploy_secret: acme-deploy-secret-value
+  logs:
+    - id: acme
+      path: /synthetic/private/logs/acme
+
+  # --- fields the contract DOES project ----------------------------------- #
+  repos:
+    # Same repo as registry `widget`, written through a ${VAR} root token.
+    - id: widget
+      kind: repo
+      repo_path: ${CLIENT_ROOT}/widget
+      notes: overlay spelling of the registry `widget` entry
+    # Written through the declared symlink alias root.
+    - id: sprocket
+      kind: repo
+      repo_path: /synthetic/beta/repos-alias/sprocket
+
+  context:
+    cwd_match:
+      - ~/repos/widget
+      - /synthetic/beta/repos
+    plans:
+      plan_root: plans/released
+      plan_draft: plans/draft
+      plan_index: plans/index.md
+    repo_landscape:
+      scan_roots:
+        - ~/repos
+        - /synthetic/beta/repos
+      repos:
+        # Same repo as registry `gadget`, written in the registry spelling.
+        - id: gadget
+          path: ~/repos/gadget
+          owns:
+            - billing
+          does_not_own:
+            - auth
+
+checks:
+  - id: acme-token-check
+    notes: "AUTH_TOKEN=acme-check-secret-value"
