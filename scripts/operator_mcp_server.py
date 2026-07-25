@@ -16,6 +16,13 @@ import json
 import os
 import re
 import shutil
+
+# Not referenced directly in this module, but it IS part of the module's
+# patchable surface: tests/test_operator_mcp_server.py patches
+# mock.patch.object(MODULE.subprocess, "run", ...) to drive the run_ssh and
+# run_script failure paths. Removing it breaks 8 tests with
+# "module has no attribute 'subprocess'".
+import subprocess  # noqa: F401
 import sys
 import tempfile
 import time
