@@ -248,14 +248,14 @@ gate_current_host_migration() {
 }
 
 gate_local_tmux() {
-  local sock="$1" marker="$2" sc buf="" i
+  local sock="$1" marker="$2" sc buf=""
   command -v tmux >/dev/null 2>&1 || { echo "tmux unavailable"; return 1; }
   tmux -L "$sock" -f scripts/clipboard/tmux.conf new-session -d -s closeout
   sc="$(tmux -L "$sock" show-option -gv set-clipboard 2>/dev/null || true)"
   echo "set-clipboard=$sc"
   tmux -L "$sock" send-keys -t closeout \
     "printf '%s' '$marker' | '$ROOT_DIR/scripts/clipboard/clipcopy'" Enter
-  for i in $(seq 1 20); do
+  for _ in $(seq 1 20); do
     buf="$(tmux -L "$sock" show-buffer 2>/dev/null || true)"
     [ "$buf" = "$marker" ] && break
     sleep 0.5
@@ -350,7 +350,7 @@ EOS
 }
 
 gate_nested_tmux() { # <ssh_target> <local_sock> <remote_sock> <marker>
-  local target="$1" lsock="$2" rsock="$3" marker="$4" buf="" i
+  local target="$1" lsock="$2" rsock="$3" marker="$4" buf=""
   command -v tmux >/dev/null 2>&1 || { echo "tmux unavailable"; return 1; }
   local inner="$ART/nested-inner.sh"
   cat >"$inner" <<EOF
@@ -362,7 +362,7 @@ EOF
   echo "inner helper: $inner"
   tmux -L "$lsock" -f scripts/clipboard/tmux.conf new-session -d -s nested -x 200 -y 50
   tmux -L "$lsock" send-keys -t nested "bash '$inner'" Enter
-  for i in $(seq 1 30); do
+  for _ in $(seq 1 30); do
     buf="$(tmux -L "$lsock" show-buffer 2>/dev/null || true)"
     [ "$buf" = "$marker" ] && break
     sleep 1
