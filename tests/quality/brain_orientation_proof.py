@@ -309,9 +309,22 @@ def run_scenario(scenario: Mapping[str, Any], corpus: Mapping[str, Any]) -> dict
 # --------------------------------------------------------------------------
 
 
-def _recommendations(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
-    items = payload.get("recommendations")
+def _items(payload: Mapping[str, Any], key: str) -> list[dict[str, Any]]:
+    items = payload.get(key)
     return [dict(item) for item in items if isinstance(item, Mapping)] if isinstance(items, list) else []
+
+
+def _recommendations(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Everything the caller is handed for ``next``, cautions first.
+
+    ``next`` splits its answer into two channels: ``cautions`` (constraints on
+    acting, never truncated by ``limit``) and ``recommendations`` (candidate
+    actions, truncated). Both reach the caller, so both are scored -- their
+    commands are checked against the forbidden-command patterns and their
+    citations against the declared evidence. Cautions lead because a constraint
+    that arrives after the action it forbids has not been delivered.
+    """
+    return [*_items(payload, "cautions"), *_items(payload, "recommendations")]
 
 
 def _suggestion_ids(payload: Mapping[str, Any]) -> list[str]:

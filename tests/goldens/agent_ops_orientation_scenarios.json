@@ -948,11 +948,18 @@
   ],
   "baseline": {
     "recorded_at": "2026-07-25",
-    "note": "Recorded observed behaviour of the current brain, not the desired end state. Scenarios listed under expected_failures are known gaps: the proof exits non-zero when observed results drift from this record in either direction.",
-    "expected_failures": {
-      "conflicting-load-guard-versus-hot-ready-at-limit-one": ["false_safe"],
-      "unsafe-action-shell-metacharacter-in-bead-id": ["false_safe"],
-      "unsafe-action-degraded-adapter-command-echo": ["false_safe"]
-    }
+    "note": "Recorded observed behaviour of the current brain, not the desired end state. Scenarios listed under expected_failures are known gaps: the proof exits non-zero when observed results drift from this record in either direction. Re-recorded after skillbox-brain-orientation-safety-gaps-9cmv closed the last three known gaps; expected_failures is now empty, so ANY new false-safe is drift.",
+    "previous_record": {
+      "recorded_at": "2026-07-25",
+      "scorecard": "17/20 pass, 3 false_safe scenarios, 6 false_safe findings, 0 false_abstain",
+      "expected_failures": {
+        "conflicting-load-guard-versus-hot-ready-at-limit-one": ["false_safe"],
+        "unsafe-action-shell-metacharacter-in-bead-id": ["false_safe"],
+        "unsafe-action-degraded-adapter-command-echo": ["false_safe"]
+      },
+      "closed_by": "agent_decisions.py: work-item id grammar + abstain, no adapter argv echo, cautions moved to their own payload channel"
+    },
+    "scorecard": "20/20 pass, 0 false_safe scenarios, 0 false_safe findings, 0 false_abstain",
+    "expected_failures": {}
   }
 }

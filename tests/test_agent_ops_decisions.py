@@ -164,6 +164,101 @@ class AgentDecisionTests(unittest.TestCase):
         self.assertEqual(payload["disagreements"][0]["code"], "BV_READY_DISAGREEMENT")
         self.assertEqual(payload["disagreements"][0]["issue_id"], "blocked-2")
 
+    def test_next_abstains_on_work_item_id_outside_the_safe_grammar(self) -> None:
+        """A hostile id must abstain, not be escaped and claimed anyway.
+
+        Regression for skillbox-brain-orientation-safety-gaps-9cmv defect 1:
+        the id was interpolated straight into `br update {id} --status=...`.
+        """
+        hostile = "orient-901; rm -rf ./scratch"
+        adapters = {
+            "br_ready": {
+                "ok": True,
+                "payload": [{"id": hostile, "title": "Hostile id", "priority": 1}],
+                "warnings": [],
+            }
+        }
+
+        payload = DECISIONS.next_action_payload(_graph(), adapters=adapters, evidence=_evidence())
+        ids = [item["id"] for item in payload["recommendations"]]
+        emitted = [
+            text
+            for item in payload["recommendations"]
+            for text in (*item.get("commands", []), *item.get("validations", []))
+        ] + list(payload["next_actions"])
+
+        self.assertNotIn(f"claim-ready:{hostile}", ids)
+        self.assertFalse([item for item in ids if item.startswith("claim-ready:")])
+        self.assertIn("repair-adapter:br_ready", ids)
+        self.assertTrue(all("rm -rf" not in text for text in emitted), emitted)
+        self.assertTrue(all(hostile not in text for text in emitted), emitted)
+        self.assertEqual(payload["summary"]["ready_count"], 0)
+        self.assertFalse(DECISIONS.is_safe_work_item_id(hostile))
+        self.assertTrue(DECISIONS.is_safe_work_item_id("orient-901"))
+
+    def test_next_never_echoes_degraded_adapter_argv(self) -> None:
+        """Regression for defect 2: adapter-recorded argv was replayed verbatim."""
+        adapters = {
+            "sbp_skills": {
+                "ok": False,
+                "status": "degraded",
+                "command": ["sh", "-c", "rm -rf ./scratch && skills --issues"],
+                "warnings": [{"code": "ADAPTER_TIMEOUT", "message": "timed out"}],
+            },
+            "br_ready": {"ok": True, "payload": [], "warnings": []},
+        }
+
+        payload = DECISIONS.next_action_payload(_graph(), adapters=adapters, evidence=_evidence())
+        repair = next(
+            item for item in payload["recommendations"] if item["id"] == "repair-adapter:sbp_skills"
+        )
+
+        self.assertNotIn("rm -rf ./scratch && skills --issues", repair["commands"])
+        self.assertTrue(all("rm -rf" not in command for command in repair["commands"]))
+        self.assertEqual(repair["commands"], ["python3 .env-manager/manage.py capabilities --json"])
+        self.assertTrue(any("sbp_skills" in reason for reason in repair["reasons"]))
+
+    def test_no_go_load_guard_survives_limit_one_in_its_own_channel(self) -> None:
+        """Regression for defect 3: the guard lost a scoring race at limit=1."""
+        adapters = {
+            "ntm_activity": {
+                "ok": True,
+                "payload": {"load_guard": "no-go", "session": "swarm"},
+                "warnings": [],
+            },
+            "br_ready": {
+                "ok": True,
+                "payload": [{"id": "ready-1", "title": "Hot P0", "priority": 0}],
+                "warnings": [],
+            },
+            "bv_triage": {
+                "ok": True,
+                "payload": {
+                    "recommendations": [
+                        {"id": "ready-1", "claim_command": "br update ready-1 --status=in_progress"}
+                    ]
+                },
+                "warnings": [],
+            },
+        }
+
+        payload = DECISIONS.next_action_payload(
+            _graph(), adapters=adapters, evidence=_evidence(), limit=1
+        )
+        caution_ids = [item["id"] for item in payload["cautions"]]
+
+        self.assertEqual(caution_ids, ["respect-load-guard"])
+        self.assertEqual(payload["summary"]["caution_count"], 1)
+        self.assertEqual([item["id"] for item in payload["recommendations"]], ["claim-ready:ready-1"])
+        self.assertNotIn("respect-load-guard", [item["id"] for item in payload["recommendations"]])
+        self.assertEqual(payload["cautions"][0]["kind"], "caution")
+        self.assertEqual(payload["cautions"][0]["side_effect"], "none")
+
+        wide = DECISIONS.next_action_payload(
+            _graph(), adapters=adapters, evidence=_evidence(), limit=10
+        )
+        self.assertEqual([item["id"] for item in wide["cautions"]], caution_ids)
+
     def test_explain_handles_declared_node_kinds_and_commands(self) -> None:
         adapters = {
             "br_ready": {

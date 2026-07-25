@@ -213,8 +213,18 @@ def _adapter_items(adapters: Mapping[str, Any] | None, name: str) -> list[dict[s
 
 _BR_CLAIM_RE = re.compile(r"\bbr\s+update\s+([A-Za-z0-9_.-]+)\s+--status[ =]in_progress\b")
 
+# The only shape a work-item identifier may take before it is allowed anywhere
+# near an emitted command. This is a whitelist, not an escaper: an id outside
+# this grammar is evidence that the feed is wrong, not input to be sanitised.
+WORK_ITEM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
-def _issue_id(item: Mapping[str, Any]) -> str:
+
+def is_safe_work_item_id(value: Any) -> bool:
+    """True when ``value`` can be interpolated into a command hint verbatim."""
+    return bool(WORK_ITEM_ID_RE.fullmatch(str(value or "")))
+
+
+def _raw_issue_id(item: Mapping[str, Any]) -> str:
     for key in ("id", "issue_id", "bead_id"):
         value = str(item.get(key) or "").strip()
         if value:
@@ -222,6 +232,17 @@ def _issue_id(item: Mapping[str, Any]) -> str:
     command = str(item.get("claim_command") or item.get("command") or "")
     match = _BR_CLAIM_RE.search(command)
     return match.group(1) if match else ""
+
+
+def _issue_id(item: Mapping[str, Any]) -> str:
+    """Return the work-item id only when it matches the safe id grammar.
+
+    Every downstream caller builds command hints out of this value, so an id
+    that fails the grammar is dropped here rather than escaped downstream. The
+    dropped item is reported separately by ``_malformed_feed_recommendations``.
+    """
+    raw = _raw_issue_id(item)
+    return raw if is_safe_work_item_id(raw) else ""
 
 
 def _priority_value(value: Any) -> int:
@@ -324,10 +345,69 @@ def _adapter_warning_recommendations(adapters: Mapping[str, Any] | None) -> list
                 "score": 610,
                 "risk": "low",
                 "side_effect": "none",
-                "reasons": [f"{adapter_name} adapter is {adapter.get('status', 'degraded')}", code],
-                "commands": [str(" ".join(adapter.get("command") or []))] if adapter.get("command") else [],
+                "reasons": [
+                    f"{adapter_name} adapter is {adapter.get('status', 'degraded')}",
+                    code,
+                    # Never replay adapter-recorded argv: a degraded adapter's
+                    # recorded command is untrusted input, not a suggestion.
+                    f"recorded argv for {adapter_name} is withheld; read it from the capabilities payload",
+                ],
+                "commands": [manage_py_command("capabilities", "--json")],
                 "validations": ["python3 .env-manager/manage.py capabilities --json"],
                 "evidence": [{"source": adapter_name, "path": "warnings"}],
+            }
+        )
+    return recommendations
+
+
+_WORK_FEED_ADAPTERS = ("br_ready", "br_open")
+
+
+def _malformed_feed_ids(adapters: Mapping[str, Any] | None, name: str) -> list[str]:
+    """Ids from ``name`` that fail the work-item grammar, plus their blockers."""
+    rejected: list[str] = []
+    for item in _adapter_items(adapters, name):
+        raw = _raw_issue_id(item)
+        if raw and not is_safe_work_item_id(raw):
+            rejected.append(raw)
+        for dep in item.get("dependencies") or []:
+            if not isinstance(dep, Mapping):
+                continue
+            dep_id = str(dep.get("id") or "").strip()
+            if dep_id and not is_safe_work_item_id(dep_id):
+                rejected.append(dep_id)
+    return rejected
+
+
+def _malformed_feed_recommendations(adapters: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    """Report a work feed that emitted unnameable identifiers, and abstain.
+
+    An id that cannot be written into a command is not a claimable work item.
+    The rejected ids are deliberately *not* echoed: the count and the adapter
+    name are enough for a caller to go look, and quoting a hostile identifier
+    back at an agent is how it ends up pasted into a shell.
+    """
+    recommendations: list[dict[str, Any]] = []
+    for adapter_name in _WORK_FEED_ADAPTERS:
+        rejected = _malformed_feed_ids(adapters, adapter_name)
+        if not rejected:
+            continue
+        recommendations.append(
+            {
+                "id": f"repair-adapter:{adapter_name}",
+                "title": f"Repair or account for degraded {adapter_name} evidence",
+                "score": 900,
+                "risk": "low",
+                "side_effect": "none",
+                "reasons": [
+                    f"{adapter_name} adapter is degraded",
+                    "MALFORMED_WORK_ITEM_ID",
+                    f"{len(rejected)} identifier(s) from {adapter_name} fail the work-item id grammar",
+                    "no claim command can name these items safely, so none was emitted",
+                ],
+                "commands": [manage_py_command("capabilities", "--json")],
+                "validations": ["br ready --json"],
+                "evidence": [{"source": adapter_name, "path": "payload[].id"}],
             }
         )
     return recommendations
@@ -380,7 +460,15 @@ def _blocked_work_recommendations(adapters: Mapping[str, Any] | None) -> list[di
         ]
         if not dependencies:
             continue
-        blocker_ids = _dedupe_strings(dep.get("id") for dep in dependencies)
+        blocker_ids = [
+            blocker_id
+            for blocker_id in _dedupe_strings(dep.get("id") for dep in dependencies)
+            if is_safe_work_item_id(blocker_id)
+        ]
+        if not blocker_ids:
+            # Every blocker id was unnameable; _malformed_feed_recommendations
+            # reports the broken feed instead of guessing at a command.
+            continue
         recommendations.append(
             {
                 "id": f"clear-blockers:{issue_id}",
@@ -401,12 +489,18 @@ def _blocked_work_recommendations(adapters: Mapping[str, Any] | None) -> list[di
 
 
 def _no_ready_recommendation(adapters: Mapping[str, Any] | None) -> dict[str, Any] | None:
-    if _adapter_items(adapters, "br_ready"):
+    items = _adapter_items(adapters, "br_ready")
+    if any(_issue_id(item) for item in items):
         return None
     br_adapter = _adapter(adapters, "br_ready")
     if br_adapter and not bool(br_adapter.get("ok", True)):
         return None
-    reason = "BR returned no ready work" if br_adapter else "BR ready adapter was not collected"
+    if items:
+        reason = "BR returned no ready work that can be named safely"
+    elif br_adapter:
+        reason = "BR returned no ready work"
+    else:
+        reason = "BR ready adapter was not collected"
     return {
         "id": "inspect-work-queue",
         "title": "Inspect the work queue before choosing a new task",
@@ -430,6 +524,7 @@ def _load_guard_recommendation(adapters: Mapping[str, Any] | None) -> dict[str, 
     return {
         "id": "respect-load-guard",
         "title": "Do not spawn additional workers while load guard is no-go",
+        "kind": "caution",
         "score": 920,
         "risk": "low",
         "side_effect": "none",
@@ -479,10 +574,14 @@ def next_action_payload(
     ready_ids = {_issue_id(item) for item in _adapter_items(adapters, "br_ready") if _issue_id(item)}
     bv_ids = _bv_recommendation_ids(adapters)
     recommendations: list[dict[str, Any]] = []
+    # Cautions are constraints on acting, not candidate actions. They travel in
+    # their own channel so `limit` can never truncate a no-go guard out of the
+    # answer -- at limit=1 the old scoring race silently dropped it.
+    cautions: list[dict[str, Any]] = []
 
     load_guard = _load_guard_recommendation(adapters)
     if load_guard:
-        recommendations.append(load_guard)
+        cautions.append(load_guard)
     runtime_blocker = _runtime_blocker_recommendation(evidence_payload)
     if runtime_blocker:
         recommendations.append(runtime_blocker)
@@ -502,12 +601,15 @@ def next_action_payload(
         )
     recommendations.extend(_ready_work_recommendations(adapters, bv_ids=bv_ids))
     recommendations.extend(_blocked_work_recommendations(adapters))
+    recommendations.extend(_malformed_feed_recommendations(adapters))
     recommendations.extend(_adapter_warning_recommendations(adapters))
     no_ready = _no_ready_recommendation(adapters)
     if no_ready:
         recommendations.append(no_ready)
 
+    recommendations = _dedupe_recommendations(recommendations)
     recommendations.sort(key=lambda item: (-int(item.get("score") or 0), str(item.get("id") or "")))
+    cautions.sort(key=lambda item: (-int(item.get("score") or 0), str(item.get("id") or "")))
     limited = recommendations[: max(0, int(limit))]
     disagreements = _disagreements(adapters, ready_ids, bv_ids)
     return attach_elapsed({
@@ -517,9 +619,11 @@ def next_action_payload(
             "ready_count": len(ready_ids),
             "recommendation_count": len(recommendations),
             "returned": len(limited),
+            "caution_count": len(cautions),
             "blocked_condition_count": len(evidence_payload.get("blocked_conditions") or []),
             "graph_warning_count": len(graph_payload.get("warnings") or []),
         },
+        "cautions": cautions,
         "recommendations": limited,
         "disagreements": disagreements,
         "warnings": [
@@ -529,11 +633,22 @@ def next_action_payload(
             for warning in (adapter.get("warnings") or [])
             if isinstance(warning, Mapping)
         ],
-        "next_actions": limited[0]["commands"] if limited else [
+        "next_actions": (limited or cautions)[0]["commands"] if (limited or cautions) else [
             "br ready --json",
             manage_py_command("graph", "--format", "json"),
         ],
     }, start)
+
+
+def _dedupe_recommendations(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse duplicate recommendation ids, keeping the highest-scoring one."""
+    best: dict[str, dict[str, Any]] = {}
+    for item in items:
+        key = str(item.get("id") or "")
+        current = best.get(key)
+        if current is None or int(item.get("score") or 0) > int(current.get("score") or 0):
+            best[key] = item
+    return list(best.values())
 
 
 def _registry_by_id() -> dict[str, CommandSpec]:
@@ -705,6 +820,8 @@ __all__ = [
     "DECISIONS_SCHEMA_VERSION",
     "MAX_FUZZY_SUGGESTIONS",
     "FUZZY_CUTOFF",
+    "WORK_ITEM_ID_RE",
+    "is_safe_work_item_id",
     "fuzzy_suggestions",
     "resolve_brain_target",
     "next_action_payload",

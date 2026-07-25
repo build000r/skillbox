@@ -420,7 +420,9 @@ TOOLS: list[dict] = [
         "description": (
             "Rank explainable next actions from runtime evidence, graph facts, Beads/BV, SBP, "
             "and optional NTM load state. Read-only; recommendations include score, reasons, "
-            "commands, validations, evidence, and explicit BR/BV disagreements."
+            "commands, validations, evidence, and explicit BR/BV disagreements. Safety "
+            "constraints (for example a no-go NTM load guard) are returned in a separate "
+            "`cautions` array that `limit` never truncates -- read it before acting."
         ),
         "inputSchema": {
             "type": "object",
@@ -428,7 +430,11 @@ TOOLS: list[dict] = [
                 "client": _CLIENT_PROP,
                 "profile": _PROFILE_PROP,
                 "cwd": {"type": "string", "description": "Working directory used for evidence scoping."},
-                "limit": {"type": "integer", "description": "Maximum recommendations to return.", "default": 5},
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum recommendations to return. Cautions are exempt and always returned in full.",
+                    "default": 5,
+                },
                 "ntm_session": {"type": "string", "description": "Optional NTM session id for load evidence."},
                 "no_adapters": {
                     "type": "boolean",
