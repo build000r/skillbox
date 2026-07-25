@@ -1,0 +1,16 @@
+{
+  "description": "unrelated grok hook owned by someone else",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/opt/audit/log-command"
+          }
+        ]
+      }
+    ]
+  }
+}
