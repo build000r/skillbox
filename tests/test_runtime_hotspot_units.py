@@ -730,6 +730,106 @@ class RuntimePortVerificationTests(unittest.TestCase):
             ],
         )
 
+    def test_action_record_parses_human_readable_sync_actions(self) -> None:
+        # `sync --format json` emits `.actions` as OBJECTS. This pins the record
+        # schema every machine consumer asserts against.
+        record = runtime_ops_module.action_record(
+            "skip: /opt/bin/dcg (sync mode manual)",
+            kind="artifact",
+        )
+        self.assertEqual(
+            record,
+            {
+                "id": "dcg",
+                "action": "skip",
+                "kind": "artifact",
+                "text": "skip: /opt/bin/dcg (sync mode manual)",
+                "source": "",
+                "target": "/opt/bin/dcg",
+                "detail": "sync mode manual",
+            },
+        )
+
+        # An explicit model-entity id always wins over the id derived from text.
+        self.assertEqual(
+            runtime_ops_module.action_record(
+                "skip: /opt/bin/dcg (sync mode manual)",
+                action_id="dcg-bin",
+                kind="artifact",
+            )["id"],
+            "dcg-bin",
+        )
+
+        # Nested parens in the detail suffix stay balanced.
+        contract = runtime_ops_module.action_record("render-port-contract: /repo/.ports.env (2 service(s))")
+        self.assertEqual(contract["action"], "render-port-contract")
+        self.assertEqual(contract["detail"], "2 service(s)")
+
+        # `source -> target` forms take their id from the left-hand subject.
+        installed = runtime_ops_module.action_record("install-skill: lube -> /home/.claude/skills/lube")
+        self.assertEqual((installed["id"], installed["source"], installed["target"]), (
+            "lube",
+            "lube",
+            "/home/.claude/skills/lube",
+        ))
+
+        # Relative subjects are slugified whole so distinct subjects stay distinct.
+        self.assertEqual(runtime_ops_module.action_record("skill-repo-fetched: acme/skills")["id"], "acme-skills")
+
+        # A mapping producer (e.g. dcg_distribution.sync_action) passes through with
+        # its provenance fields intact.
+        passthrough = runtime_ops_module.normalize_action_record(
+            {"id": "dcg-bin", "action": "install", "version": "v0.6.7", "verified": True, "path": "/opt/bin/dcg"},
+            kind="dcg",
+        )
+        self.assertEqual(passthrough["id"], "dcg-bin")
+        self.assertEqual(passthrough["version"], "v0.6.7")
+        self.assertTrue(passthrough["verified"])
+        self.assertEqual(passthrough["text"], "install: /opt/bin/dcg")
+
+        # Every record carries a non-empty id, and text round-trips verbatim.
+        texts = ["exists: /srv/box", "install-skill: lube -> /home/.claude/skills/lube", "bare-verb"]
+        records = runtime_ops_module.action_records(texts, kind="repo")
+        self.assertTrue(all(record["id"] for record in records), records)
+        self.assertEqual(runtime_ops_module.action_texts(records), texts)
+
+    def test_sync_runtime_records_carry_model_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            log_dir = root / "logs"
+            model = {
+                "root_dir": str(root),
+                "repos": [],
+                "artifacts": [{"id": "dcg-bin"}],
+                "env_files": [],
+                "logs": [{"id": "runtime", "host_path": str(log_dir)}],
+            }
+            with (
+                mock.patch(
+                    "runtime_manager.runtime_ops.sync_artifact",
+                    return_value=["skip: /opt/bin/dcg (sync mode manual)"],
+                ),
+                mock.patch("runtime_manager.runtime_ops.sync_port_contracts", return_value=[]),
+                mock.patch("runtime_manager.runtime_ops.sync_skill_repo_sets", return_value=[]),
+                mock.patch("runtime_manager.runtime_ops._sync_distributor_sources", return_value=[]),
+                mock.patch("runtime_manager.runtime_ops.sync_skill_sets", return_value=[]),
+                mock.patch(
+                    "runtime_manager.runtime_ops.sync_dcg_config",
+                    return_value=["render-dcg-config: /repo/.dcg.toml (packs: core.git)"],
+                ),
+                mock.patch("runtime_manager.runtime_ops.sync_ingress_artifacts", return_value=[]),
+            ):
+                records = runtime_ops_module.sync_runtime_records(model, dry_run=True)
+
+        self.assertEqual(
+            [(record["id"], record["kind"]) for record in records],
+            [
+                ("dcg-bin", "artifact"),
+                ("runtime", "log"),
+                ("dcg-config", "dcg"),
+            ],
+        )
+
     def test_validate_task_state_reports_pending_blocked_and_pass_states(self) -> None:
         model = {
             "tasks": [

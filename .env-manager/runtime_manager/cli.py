@@ -3979,19 +3979,25 @@ def _handle_render(args: argparse.Namespace, root_dir: Path, model: dict[str, An
 
 
 def _handle_sync(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
-    actions = sync_runtime(model, dry_run=args.dry_run)
-    actions.extend(
-        sync_context(
-            model,
-            root_dir,
-            dry_run=args.dry_run,
-            context_dir=resolve_context_dir(root_dir, getattr(args, "context_dir", None)),
+    # `.actions` is a list of OBJECTS (id/action/kind/text/...), never strings:
+    # machine consumers assert on `.id`, display consumers read `.text`.
+    # `runtime_ops.action_texts()` reproduces the previous text output verbatim.
+    records = sync_runtime_records(model, dry_run=args.dry_run)
+    records.extend(
+        action_records(
+            sync_context(
+                model,
+                root_dir,
+                dry_run=args.dry_run,
+                context_dir=resolve_context_dir(root_dir, getattr(args, "context_dir", None)),
+            ),
+            kind="context",
         )
     )
     if args.format == "json":
-        emit_json({"actions": actions, "dry_run": args.dry_run, "next_actions": next_actions_for_sync()})
+        emit_json({"actions": records, "dry_run": args.dry_run, "next_actions": next_actions_for_sync()})
     else:
-        print("\n".join(actions))
+        print("\n".join(action_texts(records)))
     return EXIT_OK
 
 
@@ -4288,10 +4294,20 @@ def _brain_graph_payload(model: dict[str, Any], adapters: dict[str, Any]) -> dic
 
 
 def _print_next_text(payload: dict[str, Any]) -> None:
+    cautions = payload.get("cautions") or []
     print(
         f"next: {payload['summary']['returned']}/{payload['summary']['recommendation_count']} "
         f"recommendations"
+        + (f" ({len(cautions)} caution(s))" if cautions else "")
     )
+    if cautions:
+        print("cautions:")
+        for item in cautions:
+            print(f"- {item['id']}: {item['title']}")
+            for reason in item.get("reasons") or []:
+                print(f"  reason: {reason}")
+            for command in item.get("commands") or []:
+                print(f"  command: {command}")
     for item in payload.get("recommendations") or []:
         print(f"- {item['id']} score={item['score']} risk={item['risk']} side_effect={item['side_effect']}")
         for reason in item.get("reasons") or []:

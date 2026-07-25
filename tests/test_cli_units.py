@@ -1540,14 +1540,43 @@ except RuntimeError as exc:
         root = Path("/tmp/skillbox")
         model = {"services": [{"id": "api"}], "tasks": [{"id": "bootstrap"}]}
 
+        # `_handle_sync` emits `.actions` as OBJECTS. `sync_runtime_records` is the
+        # structured producer; context actions are normalized into the same schema.
         with (
-            mock.patch.object(CLI, "sync_runtime", return_value=["sync"]),
-            mock.patch.object(CLI, "sync_context", return_value=["context"]),
+            mock.patch.object(
+                CLI,
+                "sync_runtime_records",
+                return_value=[CLI.action_record("exists: /srv/box", action_id="box", kind="repo")],
+            ),
+            mock.patch.object(CLI, "sync_context", return_value=["write-context: home/.claude/CLAUDE.md"]),
             mock.patch.object(CLI, "resolve_context_dir", return_value=None),
             mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
         ):
             self.assertEqual(CLI._handle_sync(_ns(context_dir=None, format="json"), root, model, "reuse"), CLI.EXIT_OK)
-        self.assertEqual(emitted[-1]["actions"], ["sync", "context"])
+        self.assertEqual(
+            [(action["id"], action["kind"], action["text"]) for action in emitted[-1]["actions"]],
+            [
+                ("box", "repo", "exists: /srv/box"),
+                ("home-claude-claude-md", "context", "write-context: home/.claude/CLAUDE.md"),
+            ],
+        )
+
+        with (
+            mock.patch.object(
+                CLI,
+                "sync_runtime_records",
+                return_value=[CLI.action_record("exists: /srv/box", action_id="box", kind="repo")],
+            ),
+            mock.patch.object(CLI, "sync_context", return_value=["write-context: home/.claude/CLAUDE.md"]),
+            mock.patch.object(CLI, "resolve_context_dir", return_value=None),
+            redirect_stdout(StringIO()) as sync_stdout,
+        ):
+            self.assertEqual(CLI._handle_sync(_ns(context_dir=None, format="text"), root, model, "reuse"), CLI.EXIT_OK)
+        # Text output stays the verbatim human-readable lines, not record reprs.
+        self.assertEqual(
+            sync_stdout.getvalue(),
+            "exists: /srv/box\nwrite-context: home/.claude/CLAUDE.md\n",
+        )
 
         with (
             mock.patch.object(CLI, "sync_context", return_value=["context"]),

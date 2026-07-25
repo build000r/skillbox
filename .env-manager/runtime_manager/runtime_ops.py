@@ -4,6 +4,7 @@ import http.client
 import io
 import json
 import os
+import re
 import selectors
 import shlex
 import signal
@@ -14,6 +15,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from collections.abc import Iterable
 
 from .shared import *
 from .validation import *
@@ -2334,37 +2337,211 @@ def _sync_repos(model: dict[str, Any], dry_run: bool) -> list[str]:
     return actions
 
 
+def _sync_log_dir(log_item: dict[str, Any], dry_run: bool) -> list[str]:
+    path = Path(str(log_item["host_path"]))
+    if path.exists():
+        return [f"exists: {path}"]
+    ensure_directory(path, dry_run)
+    return [f"ensure-directory: {path}"]
+
+
 def _sync_log_dirs(model: dict[str, Any], dry_run: bool) -> list[str]:
     actions: list[str] = []
     for log_item in model["logs"]:
-        path = Path(str(log_item["host_path"]))
-        if path.exists():
-            actions.append(f"exists: {path}")
-            continue
-        ensure_directory(path, dry_run)
-        actions.append(f"ensure-directory: {path}")
+        actions.extend(_sync_log_dir(log_item, dry_run))
     return actions
+
+
+# ---------------------------------------------------------------------------
+# Sync action records
+#
+# ``sync --format json`` emits ``.actions`` as a list of OBJECTS, never bare
+# strings. Every record carries a stable ``id`` plus the verbatim
+# human-readable ``text`` the text renderer prints, so display consumers
+# migrate by reading ``.text`` while machine consumers assert on
+# ``.id`` / ``.action`` / ``.kind``.
+#
+# The canonical record shape is the one already returned by
+# ``dcg_distribution.sync_action()`` (``id``/``action``/``state``/``version``/
+# ``verified``/...). Producers that hand back a mapping pass through untouched
+# apart from the defaulted ``id``/``kind``/``text`` keys, so a converge record
+# keeps its provenance fields verbatim.
+# ---------------------------------------------------------------------------
+
+_ACTION_VERB_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+
+
+def _split_action_detail(body: str) -> tuple[str, str]:
+    """Split a trailing ``(detail)`` suffix off an action string.
+
+    Detail text may itself contain balanced parens (``2 service(s)``), so the
+    opening paren is found by scanning backwards with a depth counter.
+    """
+    if not body.endswith(")"):
+        return body, ""
+    depth = 0
+    for index in range(len(body) - 1, -1, -1):
+        char = body[index]
+        if char == ")":
+            depth += 1
+        elif char == "(":
+            depth -= 1
+            if depth == 0:
+                head = body[:index].rstrip()
+                if not head:
+                    return body, ""
+                return head, body[index + 1 : -1]
+    return body, ""
+
+
+def _action_subject_id(source: str, target: str) -> str:
+    """Derive a stable id from an action's subject.
+
+    Absolute paths collapse to their basename (``/opt/bin/dcg`` -> ``dcg``);
+    anything else is slugified whole so distinct subjects stay distinct
+    (``build000r/skills`` -> ``build000r-skills``).
+    """
+    subject = (source or target).strip()
+    if not subject:
+        return ""
+    if subject.startswith(("/", "~")):
+        subject = subject.rstrip("/").rsplit("/", 1)[-1] or subject
+    slug = re.sub(r"[^a-z0-9]+", "-", subject.lower()).strip("-")
+    return slug
+
+
+def action_record(text: str, *, action_id: str = "", kind: str = "") -> dict[str, Any]:
+    """Parse one human-readable sync action string into a record.
+
+    ``text`` is preserved verbatim; the parsed fields are best-effort and an
+    explicit ``action_id`` from the caller (a model entity id) always wins over
+    the id derived from the string.
+    """
+    text = str(text)
+    verb = ""
+    rest = text
+    head, separator, tail = text.partition(": ")
+    if separator and _ACTION_VERB_RE.match(head):
+        verb = head
+        rest = tail
+    elif not separator and _ACTION_VERB_RE.match(text.strip()):
+        verb = text.strip()
+        rest = ""
+
+    body, detail = _split_action_detail(rest.strip())
+    source, arrow, target = body.partition(" -> ")
+    if not arrow:
+        source, target = "", body
+
+    return {
+        "id": action_id or _action_subject_id(source, target) or verb or "action",
+        "action": verb,
+        "kind": kind,
+        "text": text,
+        "source": source,
+        "target": target,
+        "detail": detail,
+    }
+
+
+def normalize_action_record(
+    value: Any,
+    *,
+    action_id: str = "",
+    kind: str = "",
+) -> dict[str, Any]:
+    """Coerce a producer's action (string or mapping) into a record."""
+    if isinstance(value, dict):
+        record = dict(value)
+        if not str(record.get("id") or "").strip():
+            record["id"] = action_id or "action"
+        record.setdefault("kind", kind)
+        if not str(record.get("text") or "").strip():
+            target = str(record.get("path") or record.get("target") or "").strip()
+            verb = str(record.get("action") or "").strip()
+            record["text"] = f"{verb}: {target}".strip(": ") or str(record["id"])
+        return record
+    return action_record(str(value), action_id=action_id, kind=kind)
+
+
+def action_records(
+    actions: Iterable[Any],
+    *,
+    action_id: str = "",
+    kind: str = "",
+) -> list[dict[str, Any]]:
+    return [normalize_action_record(action, action_id=action_id, kind=kind) for action in actions]
+
+
+def action_texts(records: Iterable[Any]) -> list[str]:
+    """Human-readable lines for a record list; strings pass through unchanged."""
+    return [
+        str(record.get("text", "")) if isinstance(record, dict) else str(record)
+        for record in records
+    ]
+
+
+def sync_runtime_records(model: dict[str, Any], dry_run: bool) -> list[dict[str, Any]]:
+    """Converge the runtime and return structured action records.
+
+    Order is identical to :func:`sync_runtime`, which is the string façade over
+    this function kept for the in-process callers (``pulse``, ``workflows``,
+    ``cli`` up/bootstrap/restart) that only render text.
+    """
+    records: list[dict[str, Any]] = []
+    for repo in model["repos"]:
+        records.extend(
+            action_records(
+                _sync_repo(model, repo, dry_run),
+                action_id=str(repo.get("id") or ""),
+                kind="repo",
+            )
+        )
+    for artifact in model["artifacts"]:
+        records.extend(
+            action_records(
+                sync_artifact(artifact, dry_run=dry_run),
+                action_id=str(artifact.get("id") or ""),
+                kind="artifact",
+            )
+        )
+
+    for env_file in model["env_files"]:
+        records.extend(
+            action_records(
+                sync_env_file(env_file, dry_run=dry_run),
+                action_id=str(env_file.get("id") or ""),
+                kind="env-file",
+            )
+        )
+
+    records.extend(action_records(sync_port_contracts(model, dry_run=dry_run), kind="port-contract"))
+    for log_item in model["logs"]:
+        records.extend(
+            action_records(
+                _sync_log_dir(log_item, dry_run),
+                action_id=str(log_item.get("id") or ""),
+                kind="log",
+            )
+        )
+    records.extend(action_records(sync_skill_repo_sets(model, dry_run=dry_run), kind="skill-repo"))
+    records.extend(action_records(_sync_distributor_sources(model, dry_run=dry_run), kind="distributor"))
+    records.extend(action_records(sync_skill_sets(model, dry_run=dry_run), kind="skill"))
+    records.extend(
+        action_records(
+            sync_dcg_config(model, Path(str(model["root_dir"])), dry_run=dry_run),
+            action_id="dcg-config",
+            kind="dcg",
+        )
+    )
+    records.extend(action_records(sync_ingress_artifacts(model, dry_run=dry_run), kind="ingress"))
+    if not dry_run:
+        _log_model_runtime_event(model, "sync.completed", "runtime", {"action_count": len(records)})
+    return records
 
 
 def sync_runtime(model: dict[str, Any], dry_run: bool) -> list[str]:
-    actions: list[str] = []
-    actions.extend(_sync_repos(model, dry_run))
-    for artifact in model["artifacts"]:
-        actions.extend(sync_artifact(artifact, dry_run=dry_run))
-
-    for env_file in model["env_files"]:
-        actions.extend(sync_env_file(env_file, dry_run=dry_run))
-
-    actions.extend(sync_port_contracts(model, dry_run=dry_run))
-    actions.extend(_sync_log_dirs(model, dry_run))
-    actions.extend(sync_skill_repo_sets(model, dry_run=dry_run))
-    actions.extend(_sync_distributor_sources(model, dry_run=dry_run))
-    actions.extend(sync_skill_sets(model, dry_run=dry_run))
-    actions.extend(sync_dcg_config(model, Path(str(model["root_dir"])), dry_run=dry_run))
-    actions.extend(sync_ingress_artifacts(model, dry_run=dry_run))
-    if not dry_run:
-        _log_model_runtime_event(model, "sync.completed", "runtime", {"action_count": len(actions)})
-    return actions
+    return action_texts(sync_runtime_records(model, dry_run))
 
 
 def runtime_log_map(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
