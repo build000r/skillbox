@@ -391,7 +391,15 @@ class VerifiedSubstrateTests(unittest.TestCase):
                 self.assertIn("UNOWNED", SM.boundary(boundary_id).lock_owner)
 
     def test_state_root_resolvers_genuinely_disagree(self) -> None:
-        """Five resolvers, three different fallbacks. Recorded, not fixed."""
+        """Resolvers disagree on the fallback. Recorded, not fixed.
+
+        The original sweep labelled box.py and operator_mcp_server.py
+        CWD-RELATIVE on the strength of their './.skillbox-state' default.
+        Both actually follow it with 'if not base.is_absolute():
+        base = REPO_ROOT / base', so both are REPO-relative. Corrected while
+        implementing the lease (skillbox-duel-state-root-mutation-lease-2py0),
+        which is why the counts below favour repo-relative.
+        """
         cwd_relative = [
             name
             for name, text in SM.STATE_ROOT_SOURCES.items()
@@ -402,15 +410,25 @@ class VerifiedSubstrateTests(unittest.TestCase):
             for name, text in SM.STATE_ROOT_SOURCES.items()
             if "REPO-RELATIVE" in text
         ]
-        self.assertGreaterEqual(len(cwd_relative), 3)
-        self.assertGreaterEqual(len(repo_relative), 1)
+        self.assertGreaterEqual(len(cwd_relative), 1)
+        self.assertGreaterEqual(len(repo_relative), 3)
+        # The disagreement itself is the point: both spellings coexist.
+        self.assertTrue(cwd_relative and repo_relative)
 
-    def test_no_locking_is_implemented_here(self) -> None:
-        """Non-goal guard: this module inventories, it never locks."""
-        source = self._read(".env-manager/runtime_manager/state_mutation.py")
-        for forbidden in ("import fcntl", "flock(", "LOCK_EX", "os.open("):
-            with self.subTest(token=forbidden):
-                self.assertNotIn(forbidden, source)
+    # test_no_locking_is_implemented_here was retired deliberately.
+    #
+    # It encoded this bead's own non-goal ("this module inventories, it never
+    # locks"), which skillbox-duel-state-root-mutation-lease-2py0 was chartered
+    # to overturn: that bead's binding write list puts the lease in this exact
+    # module and requires LOCK_EX|LOCK_NB. The two contracts cannot both hold,
+    # and the newer one supersedes.
+    #
+    # The guard is not replaced by a weaker substring check, because the
+    # properties it was standing in for are now asserted directly and much
+    # more strongly in tests/test_state_mutation_lock.py: no read boundary may
+    # take a lease, the public namespace exposes no clear/steal/break/force/
+    # unlink/reset/revoke verb, the lease source contains no unlink/remove/
+    # rmtree, and flock unavailability fails closed rather than degrading.
 
 
 class KnownRiskAssertionTests(unittest.TestCase):
