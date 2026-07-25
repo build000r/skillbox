@@ -36,6 +36,7 @@ from lib.runtime_model import (
     STATE_ROOT_WRONG_FILESYSTEM,
     STATE_ROOT_WRONG_OWNERSHIP,
     is_runtime_absolute_path,
+    load_env_file,
 )
 from lib.paths import BoxPath, PathTranslationError, PathTranslator
 
@@ -2117,6 +2118,94 @@ def _sync_existing_or_manual_env_file(
     return [f"skip: {path} (sync mode {state['sync_mode']})"]
 
 
+# ---------------------------------------------------------------------------
+# .dcg.toml state-root scoping
+#
+# ``.dcg.toml`` stays at the REPO ROOT because that is the only place dcg looks.
+# Verified against dcg 0.6.7 on this box: ``dcg config --format json`` reports
+# its project config source as ``<git-repo-root>/.dcg.toml``. Discovery walks up
+# from the process cwd to the nearest ancestor holding a ``.git`` marker and
+# reads ``.dcg.toml`` THERE. Probe: a ``.dcg.toml`` in a plain directory is NOT
+# picked up (only the user config at ~/.config/dcg/config.toml is listed); after
+# ``mkdir .git`` in that same directory it appears as the ``project`` source.
+# There is no state-root, ``--config``, or ``DCG_CONFIG`` affordance.
+#
+# So the file cannot be relocated under ``SKILLBOX_STATE_ROOT`` without silently
+# disarming the guard. State-root scoping is therefore a REFUSAL, not a
+# relocation: a sync whose effective state root is not the one this repo
+# declares for itself is running against foreign state and must not touch the
+# repo's live guard config. Nothing is written anywhere, so an isolated
+# ``SKILLBOX_STATE_ROOT`` can no longer produce a write outside its own root.
+#
+# The effective state root is read the way the ``manage.sync`` boundary in
+# ``state_mutation.MANIFEST`` declares it (``state_root_source=
+# "runtime_model.root_dir"``): the compiled ``model["storage"]["state_root"]``,
+# already resolved against ``root_dir``. The declared state root is recomputed
+# from the repo's own ``.env``/``.env.example`` so a process-environment
+# override is visible as a divergence instead of being merged away by
+# ``load_runtime_env``.
+# ---------------------------------------------------------------------------
+
+
+def _dcg_resolved_state_root(root_dir: Path, raw: str) -> Path | None:
+    raw = str(raw or "").strip()
+    if not raw:
+        return None
+    try:
+        return host_path_to_absolute_path(root_dir, raw)
+    except (OSError, ValueError):
+        return None
+
+
+def _dcg_effective_state_root(model: dict[str, Any], root_dir: Path) -> Path | None:
+    """State root this sync run is actually operating against."""
+    storage = model.get("storage")
+    if isinstance(storage, dict):
+        resolved = _dcg_resolved_state_root(root_dir, str(storage.get("state_root") or ""))
+        if resolved is not None:
+            return resolved
+    env = model.get("env") or {}
+    resolved = _dcg_resolved_state_root(root_dir, str(env.get("SKILLBOX_STATE_ROOT") or ""))
+    if resolved is not None:
+        return resolved
+    return _dcg_resolved_state_root(root_dir, str(os.environ.get("SKILLBOX_STATE_ROOT") or ""))
+
+
+def _dcg_declared_state_root(model: dict[str, Any], root_dir: Path) -> Path | None:
+    """State root this repo checkout declares on disk, ignoring the process env."""
+    try:
+        declared = load_env_file(root_dir / ".env.example") | load_env_file(root_dir / ".env")
+    except (OSError, RuntimeError):
+        declared = {}
+    resolved = _dcg_resolved_state_root(root_dir, str(declared.get("SKILLBOX_STATE_ROOT") or ""))
+    if resolved is not None:
+        return resolved
+    storage = model.get("storage")
+    if isinstance(storage, dict):
+        return _dcg_resolved_state_root(root_dir, str(storage.get("default_state_root") or ""))
+    return None
+
+
+def _dcg_foreign_state_root_skip(
+    model: dict[str, Any],
+    root_dir: Path,
+    dcg_config_path: Path,
+) -> str:
+    """Refusal line when the run's state root is not this repo's own, else ``""``.
+
+    Only a *known* divergence refuses. If either side is unresolvable there is
+    no override to detect and the legacy behaviour is preserved.
+    """
+    effective = _dcg_effective_state_root(model, root_dir)
+    declared = _dcg_declared_state_root(model, root_dir)
+    if effective is None or declared is None or effective == declared:
+        return ""
+    return (
+        f"skip: {dcg_config_path} (state root {effective} is not this repo's "
+        f"declared state root {declared}; refusing to write outside it)"
+    )
+
+
 def sync_dcg_config(model: dict[str, Any], root_dir: Path, dry_run: bool) -> list[str]:
     """Render .dcg.toml from env and client overlay dcg settings."""
     env = model.get("env") or {}
@@ -2124,9 +2213,13 @@ def sync_dcg_config(model: dict[str, Any], root_dir: Path, dry_run: bool) -> lis
     if not dcg_bin:
         return ["skip: .dcg.toml (dcg not configured)"]
 
+    dcg_config_path = root_dir / ".dcg.toml"
+    refusal = _dcg_foreign_state_root_skip(model, root_dir, dcg_config_path)
+    if refusal:
+        return [refusal]
+
     packs, allowlist = _dcg_packs_and_allowlist(model, env)
     content = _dcg_config_content(packs, allowlist)
-    dcg_config_path = root_dir / ".dcg.toml"
     if _dcg_config_current(dcg_config_path, content):
         return [f"exists: {dcg_config_path}"]
 

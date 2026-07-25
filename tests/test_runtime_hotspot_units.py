@@ -5836,5 +5836,126 @@ class ProcScanHotspotTests(unittest.TestCase):
         self.assertEqual(cache, {})
 
 
+class DcgConfigStateRootScopeTests(unittest.TestCase):
+    """`.dcg.toml` must never be written by a run whose state root is foreign.
+
+    dcg 0.6.7 only ever reads `<git-repo-root>/.dcg.toml` (verified via
+    `dcg config --format json`: the `project` config source appears only when
+    the directory holding `.dcg.toml` also holds a `.git` marker). The file
+    therefore cannot be relocated under SKILLBOX_STATE_ROOT, so scoping is a
+    refusal: an isolated state root writes nothing at all.
+    """
+
+    def _repo(self, tmpdir: str, state_root: str) -> Path:
+        root = Path(tmpdir) / "repo"
+        (root / ".git").mkdir(parents=True)
+        (root / ".env").write_text(
+            f"SKILLBOX_STATE_ROOT={state_root}\nSKILLBOX_DCG_BIN=/usr/bin/dcg\n",
+            encoding="utf-8",
+        )
+        (root / ".dcg.toml").write_text(
+            "# live policy render\n[general]\nfail_closed = true\n",
+            encoding="utf-8",
+        )
+        return root
+
+    def _model(self, root: Path, state_root: Path) -> dict:
+        return {
+            "root_dir": str(root),
+            "env": {"SKILLBOX_DCG_BIN": "/usr/bin/dcg", "SKILLBOX_STATE_ROOT": str(state_root)},
+            "clients": [],
+            "storage": {
+                "state_root": str(state_root),
+                "default_state_root": "./.skillbox-state",
+            },
+        }
+
+    def test_isolated_state_root_refuses_and_leaves_repo_root_config_byte_identical(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = self._repo(tmpdir, "./.skillbox-state")
+            isolated = Path(tmpdir) / "isolated-state"
+            isolated.mkdir()
+            config = root / ".dcg.toml"
+            before = config.read_bytes()
+
+            actions = runtime_ops_module.sync_dcg_config(
+                self._model(root, isolated),
+                root,
+                dry_run=False,
+            )
+
+            self.assertEqual(len(actions), 1)
+            self.assertTrue(actions[0].startswith(f"skip: {config} (state root {isolated} "))
+            self.assertIn("refusing to write outside it", actions[0])
+            # The repo-root guard config is untouched...
+            self.assertEqual(config.read_bytes(), before)
+            # ...and nothing escaped INTO the isolated root either.
+            self.assertEqual(sorted(isolated.rglob("*")), [])
+
+    def test_isolated_state_root_refuses_in_dry_run_too(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = self._repo(tmpdir, "./.skillbox-state")
+            isolated = Path(tmpdir) / "isolated-state"
+            isolated.mkdir()
+            actions = runtime_ops_module.sync_dcg_config(
+                self._model(root, isolated),
+                root,
+                dry_run=True,
+            )
+        self.assertEqual(len(actions), 1)
+        self.assertIn("refusing to write outside it", actions[0])
+
+    def test_repo_own_state_root_still_renders_to_the_repo_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = self._repo(tmpdir, "./.skillbox-state")
+            own = root / ".skillbox-state"
+            own.mkdir()
+            config = root / ".dcg.toml"
+
+            actions = runtime_ops_module.sync_dcg_config(
+                self._model(root, own),
+                root,
+                dry_run=False,
+            )
+
+            self.assertEqual(
+                actions,
+                [f"render-dcg-config: {config} (packs: core.git, core.filesystem)"],
+            )
+            self.assertIn("[packs]", config.read_text(encoding="utf-8"))
+
+    def test_absolute_env_state_root_matching_the_repo_declaration_is_not_foreign(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "repo"
+            (root / ".git").mkdir(parents=True)
+            declared = root / "state"
+            (root / ".env").write_text(
+                f"SKILLBOX_STATE_ROOT={declared}\nSKILLBOX_DCG_BIN=/usr/bin/dcg\n",
+                encoding="utf-8",
+            )
+            declared.mkdir()
+
+            actions = runtime_ops_module.sync_dcg_config(
+                self._model(root, declared),
+                root,
+                dry_run=True,
+            )
+
+        self.assertEqual(
+            actions,
+            [f"render-dcg-config: {root / '.dcg.toml'} (packs: core.git, core.filesystem)"],
+        )
+
+    def test_unresolvable_state_root_pair_preserves_legacy_behaviour(self) -> None:
+        # No .env on disk and no storage summary: there is no override to
+        # detect, so the historical repo-root render is preserved.
+        model = {"env": {"SKILLBOX_DCG_BIN": "dcg"}, "clients": []}
+        with mock.patch("runtime_manager.runtime_ops._dcg_config_current", return_value=False):
+            self.assertEqual(
+                runtime_ops_module.sync_dcg_config(model, Path("/repo"), dry_run=True),
+                ["render-dcg-config: /repo/.dcg.toml (packs: core.git, core.filesystem)"],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
