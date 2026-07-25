@@ -12,7 +12,16 @@ ENV_MANAGER_DIR = ROOT_DIR / ".env-manager"
 if str(ENV_MANAGER_DIR) not in sys.path:
     sys.path.insert(0, str(ENV_MANAGER_DIR))
 
+from runtime_manager.agent_adapters import adapter_timing_summary  # noqa: E402
 from runtime_manager.agent_decisions import explain_payload, next_action_payload  # noqa: E402
+from runtime_manager.agent_timing import (  # noqa: E402
+    COMPONENT_META_KEYS,
+    PHASE_ADAPTER_COLLECTION,
+    PHASE_MODEL,
+    PHASE_STARTUP,
+    InvocationTiming,
+    attach_component_timing,
+)
 from runtime_manager.agent_graph_engine import graph_command_payload  # noqa: E402
 from runtime_manager.agent_snapshots import load_snapshot, replay_snapshot  # noqa: E402
 from runtime_manager.command_registry import registry_payload  # noqa: E402
@@ -89,6 +98,46 @@ class AgentOpsGoldenOutputTests(unittest.TestCase):
         self.assertEqual(replay["summary"]["overall"], golden["snap_replay"]["overall"])
         self.assertEqual(replay["summary"]["graph_nodes"], golden["snap_replay"]["graph_nodes"])
         self.assertEqual(replay["summary"]["graph_edges"], golden["snap_replay"]["graph_edges"])
+
+    def test_component_timing_contract_matches_golden(self) -> None:
+        """Pin the timing *contract*, never timing *values*.
+
+        Every assertion below is over key names and synthetic inputs, so the
+        golden stays byte-identical across runs and across machines.
+        """
+        golden = json.loads((ROOT_DIR / "tests" / "goldens" / "agent_ops_brain_surfaces.json").read_text())
+        timing_golden = golden["timing"]
+
+        self.assertEqual(list(COMPONENT_META_KEYS), timing_golden["component_meta_keys"])
+        self.assertEqual(
+            sorted({PHASE_ADAPTER_COLLECTION, PHASE_MODEL, PHASE_STARTUP}),
+            timing_golden["phase_names"],
+        )
+        self.assertEqual(
+            sorted(adapter_timing_summary({}, collection_ms=0.0)),
+            timing_golden["adapter_summary_keys"],
+        )
+
+        recorder = InvocationTiming()
+        recorder.record(PHASE_STARTUP, 900.0)
+        recorder.record(PHASE_MODEL, 250.0)
+        recorder.record(PHASE_ADAPTER_COLLECTION, 7500.0)
+        payload = attach_component_timing(
+            {"ok": True, "meta": {"elapsed_ms": 1.7}},
+            invocation=recorder,
+            end_to_end_ms=8700.0,
+        )
+        meta = payload["meta"]
+
+        self.assertEqual(sorted(meta), timing_golden["required_meta_keys"])
+        self.assertEqual(sorted(meta["timing"]), timing_golden["timing_block_keys"])
+        # The regression this contract exists to prevent: a payload that reports
+        # 1.7ms while the invocation actually took 8.7 seconds.
+        self.assertEqual(meta["compute_ms"], 1.7)
+        self.assertEqual(meta["end_to_end_ms"], 8700.0)
+        self.assertEqual(meta["adapter_collection_ms"], 7500.0)
+        self.assertEqual(meta["model_ms"], 250.0)
+        self.assertEqual(meta["startup_ms"], 900.0)
 
     def test_fixture_scale_surfaces_are_fast(self) -> None:
         started = time.monotonic()

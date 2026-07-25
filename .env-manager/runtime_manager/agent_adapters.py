@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from .agent_timing import PHASE_ADAPTER_COLLECTION, record_detail, record_phase
 from .evidence import collect_runtime_evidence
 
 try:
@@ -654,6 +655,53 @@ def pulse_state_adapter(
     }
 
 
+def adapter_timing_summary(
+    adapters: Mapping[str, Any],
+    *,
+    collection_ms: float | None = None,
+) -> dict[str, Any]:
+    """Summarize per-adapter durations and degraded statuses.
+
+    Per-adapter ``duration_ms`` stays untouched on each adapter payload; this is
+    a roll-up so a caller can see *which* adapter ate the wall clock without
+    walking every packet. ``collection_ms`` is the real collection wall time and
+    is normally larger than ``sum_adapter_ms`` by the dispatch overhead.
+    """
+    durations: dict[str, float] = {}
+    statuses: dict[str, str] = {}
+    unavailable: list[str] = []
+    timeouts: list[str] = []
+    for name, adapter in (adapters or {}).items():
+        if not isinstance(adapter, dict):
+            continue
+        raw_duration = adapter.get("duration_ms", adapter.get("elapsed_ms"))
+        if isinstance(raw_duration, (int, float)) and not isinstance(raw_duration, bool):
+            durations[str(name)] = round(float(raw_duration), 3)
+        status = str(adapter.get("status") or ("ok" if adapter.get("ok") else "unknown"))
+        statuses[str(name)] = status
+        if status == "timeout":
+            timeouts.append(str(name))
+        elif status == "unavailable":
+            unavailable.append(str(name))
+
+    slowest: dict[str, Any] | None = None
+    if durations:
+        slowest_name = max(durations, key=lambda key: durations[key])
+        slowest = {"name": slowest_name, "duration_ms": durations[slowest_name]}
+
+    summary: dict[str, Any] = {
+        "adapter_count": len(statuses),
+        "collection_ms": round(float(collection_ms), 3) if collection_ms is not None else None,
+        "sum_adapter_ms": round(sum(durations.values()), 3),
+        "durations_ms": durations,
+        "statuses": statuses,
+        "slowest": slowest,
+        "timeouts": sorted(timeouts),
+        "unavailable": sorted(unavailable),
+    }
+    return summary
+
+
 def collect_agent_adapter_evidence(
     root_dir: Path,
     *,
@@ -662,6 +710,7 @@ def collect_agent_adapter_evidence(
     ntm_session: str | None = None,
 ) -> dict[str, Any]:
     """Collect bounded adapter evidence for graph/next consumers."""
+    started_at = time.monotonic()
     adapters: dict[str, Any] = {
         "br_ready": br_ready_adapter(root_dir),
         "br_open": br_list_adapter(root_dir, status="open"),
@@ -678,10 +727,17 @@ def collect_agent_adapter_evidence(
         for adapter in adapters.values()
         for warning in (adapter.get("warnings") or [])
     ]
+    collection_ms = float(_duration_ms(started_at))
+    timing = adapter_timing_summary(adapters, collection_ms=collection_ms)
+    # Feed the invocation recorder so brain payloads can report adapter wall
+    # time next to compute time instead of hiding it.
+    record_phase(PHASE_ADAPTER_COLLECTION, collection_ms)
+    record_detail("adapters", timing)
     return {
         "ok": all(bool(adapter.get("ok")) for adapter in adapters.values()),
         "adapters": adapters,
         "warnings": warnings,
+        "timing": timing,
     }
 
 
@@ -692,6 +748,7 @@ __all__ = [
     "ADAPTER_TIMEOUT_ENV",
     "MAX_ADAPTER_TIMEOUT_SECONDS",
     "DEFAULT_PULSE_MAX_AGE_SECONDS",
+    "adapter_timing_summary",
     "redact_diagnostic_text",
     "run_adapter",
     "run_command_adapter",

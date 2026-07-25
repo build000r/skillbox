@@ -16,6 +16,7 @@ if str(ENV_MANAGER_DIR) not in sys.path:
     sys.path.insert(0, str(ENV_MANAGER_DIR))
 
 from runtime_manager import agent_adapters as ADAPT  # noqa: E402
+from runtime_manager import agent_timing as TIMING  # noqa: E402
 
 
 def _completed(stdout: str, *, returncode: int = 0, stderr: str = "") -> subprocess.CompletedProcess[str]:
@@ -311,6 +312,116 @@ class CommandAdapterTests(unittest.TestCase):
         self.assertEqual(br_ready["source_command"], ["br", "ready", "--json"])
         self.assertEqual(br_ready["timeout_seconds"], 0.2)
         self.assertIn("elapsed_ms", br_ready)
+
+
+class AdapterComponentTimingTests(unittest.TestCase):
+    """Adapter wall time must be attributable per adapter, not just in total."""
+
+    def test_summary_classifies_timeouts_unavailable_and_slowest(self) -> None:
+        summary = ADAPT.adapter_timing_summary(
+            {
+                "br_ready": {"status": "ok", "ok": True, "duration_ms": 12},
+                "bv_triage": {"status": "timeout", "ok": False, "duration_ms": 2503},
+                "sbp_skills": {"status": "timeout", "ok": False, "duration_ms": 2501},
+                "ntm_activity": {"status": "unavailable", "ok": False, "duration_ms": 3},
+                "pulse": {"status": "ok", "ok": True, "duration_ms": 0},
+                "junk": "not-a-dict",
+            },
+            collection_ms=5030.5,
+        )
+
+        self.assertEqual(summary["adapter_count"], 5)
+        self.assertEqual(summary["collection_ms"], 5030.5)
+        self.assertEqual(summary["sum_adapter_ms"], 5019.0)
+        self.assertEqual(summary["slowest"], {"name": "bv_triage", "duration_ms": 2503.0})
+        self.assertEqual(summary["timeouts"], ["bv_triage", "sbp_skills"])
+        self.assertEqual(summary["unavailable"], ["ntm_activity"])
+        self.assertEqual(summary["durations_ms"]["br_ready"], 12.0)
+        self.assertEqual(summary["statuses"]["pulse"], "ok")
+
+    def test_summary_without_durations_reports_no_slowest(self) -> None:
+        summary = ADAPT.adapter_timing_summary({"pulse": {"status": "ok", "ok": True}})
+
+        self.assertIsNone(summary["slowest"])
+        self.assertIsNone(summary["collection_ms"])
+        self.assertEqual(summary["sum_adapter_ms"], 0.0)
+        self.assertEqual(summary["statuses"], {"pulse": "ok"})
+
+    def test_collect_evidence_emits_timing_rollup_and_records_phase(self) -> None:
+        def fake_run(_command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            return _completed("{}")
+
+        recorder = TIMING.reset_invocation()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch.object(ADAPT.subprocess, "run", side_effect=fake_run):
+                payload = ADAPT.collect_agent_adapter_evidence(Path(tmpdir))
+
+        timing = payload["timing"]
+        self.assertEqual(sorted(timing["statuses"]), ["br_open", "br_ready", "bv_triage", "pulse", "sbp_skills"])
+        self.assertEqual(timing["adapter_count"], 5)
+        self.assertGreaterEqual(float(timing["collection_ms"]), 0.0)
+        # pulse state is absent in a fresh temp root: recorded, never fatal.
+        self.assertEqual(timing["unavailable"], ["pulse"])
+        self.assertEqual(timing["timeouts"], [])
+        # Per-adapter duration_ms stays on each adapter packet.
+        for name in timing["statuses"]:
+            self.assertIn("duration_ms", payload["adapters"][name])
+
+        self.assertEqual(
+            recorder.get(TIMING.PHASE_ADAPTER_COLLECTION),
+            round(float(timing["collection_ms"]), 3),
+        )
+        self.assertEqual(recorder.details()["adapters"], timing)
+        TIMING.reset_invocation()
+
+
+class InvocationTimingTests(unittest.TestCase):
+    def test_phases_accumulate_and_attach_without_rebuilding_work(self) -> None:
+        calls: list[str] = []
+        recorder = TIMING.InvocationTiming()
+        with recorder.phase("model_ms"):
+            calls.append("build")
+        recorder.record("model_ms", 10.0)
+        recorder.record("adapter_collection_ms", 7500.0)
+        recorder.record("adapter_collection_ms", "not-a-number")
+        recorder.record("startup_ms", -5.0)
+
+        self.assertEqual(calls, ["build"], "phase() must not re-run the timed block")
+        self.assertGreaterEqual(recorder.get("model_ms"), 10.0)
+        self.assertEqual(recorder.get("adapter_collection_ms"), 7500.0)
+        self.assertEqual(recorder.get("startup_ms"), 0.0)
+
+        payload = TIMING.attach_component_timing(
+            {"ok": True, "meta": {"elapsed_ms": 1.7}},
+            invocation=recorder,
+            end_to_end_ms=8700.0,
+        )
+        meta = payload["meta"]
+        self.assertEqual(meta["compute_ms"], 1.7)
+        self.assertEqual(meta["elapsed_ms"], 1.7)
+        self.assertEqual(meta["end_to_end_ms"], 8700.0)
+        self.assertEqual(meta["adapter_collection_ms"], 7500.0)
+        self.assertEqual(meta["timing"]["phases"]["adapter_collection_ms"], 7500.0)
+
+    def test_unrecorded_phases_are_omitted_not_zeroed(self) -> None:
+        payload = TIMING.attach_component_timing(
+            {"ok": True, "meta": {"elapsed_ms": 2.0}},
+            invocation=TIMING.InvocationTiming(),
+        )
+        meta = payload["meta"]
+
+        self.assertNotIn("adapter_collection_ms", meta)
+        self.assertNotIn("model_ms", meta)
+        self.assertIn("end_to_end_ms", meta)
+        self.assertEqual(meta["compute_ms"], 2.0)
+
+    def test_process_elapsed_is_monotonic_and_sourced(self) -> None:
+        first = TIMING.process_elapsed_ms()
+        second = TIMING.process_elapsed_ms()
+
+        self.assertGreaterEqual(second, first)
+        self.assertGreater(first, 0.0)
+        self.assertIn(TIMING.PROCESS_START_SOURCE, {"proc_self_stat", "module_import"})
 
 
 class FileAndInProcessAdapterTests(unittest.TestCase):

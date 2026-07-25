@@ -72,7 +72,17 @@ from .agent_graph_engine import GRAPH_OUTPUT_FORMATS, graph_command_payload, ren
 from .agent_decisions import BRAIN_COMMAND_TARGET_ALIASES, explain_payload, next_action_payload
 from .agent_errors import brain_error_payload
 from .agent_search import search_payload
-from .agent_timing import attach_elapsed, timer_start
+from .agent_timing import (
+    PHASE_MODEL,
+    PHASE_STARTUP,
+    attach_component_timing,
+    attach_elapsed,
+    current_invocation,
+    invocation_startup_ms,
+    record_phase,
+    reset_invocation,
+    timer_start,
+)
 from .agent_snapshots import (
     SNAPSHOT_SCHEMA_VERSION,
     create_snapshot_payload,
@@ -3390,7 +3400,8 @@ def _capabilities_payload(root_dir: Path, *, compact: bool = False) -> dict[str,
             "python3 .env-manager/manage.py robot-docs guide",
         ],
     }
-    return attach_elapsed(payload, start)
+    attach_elapsed(payload, start)
+    return attach_component_timing(payload)
 
 
 def _safe_first_try_command(name: str) -> str:
@@ -4260,6 +4271,9 @@ def _write_runtime_evidence_artifact(root_dir: Path, payload: dict[str, Any], ru
 def _brain_adapters_for_args(root_dir: Path, model: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     if bool(getattr(args, "no_adapters", False)):
         return {}
+    # collect_agent_adapter_evidence records adapter_collection_ms and the
+    # per-adapter roll-up on the invocation recorder itself, so nothing is timed
+    # twice here.
     payload = collect_agent_adapter_evidence(
         root_dir,
         model=model,
@@ -4330,6 +4344,7 @@ def _handle_next(args: argparse.Namespace, root_dir: Path, model: dict[str, Any]
         adapters=adapters,
         limit=max(0, int(getattr(args, "limit", 5))),
     )
+    attach_component_timing(payload)
     if args.format == "json":
         emit_json(payload)
     else:
@@ -4349,6 +4364,7 @@ def _handle_graph(args: argparse.Namespace, root_dir: Path, model: dict[str, Any
         target=getattr(args, "target", None),
         blocked_nodes=getattr(args, "blocked_node", None),
     )
+    attach_component_timing(payload)
     if args.format == "json":
         emit_json(payload)
     elif "error" in payload:
@@ -4422,6 +4438,7 @@ def _handle_explain_brain(args: argparse.Namespace, root_dir: Path, model: dict[
     adapters = _brain_adapters_for_args(root_dir, model, args)
     graph_payload = _brain_graph_payload(model, adapters)
     payload = explain_payload(graph_payload, args.target, adapters=adapters)
+    attach_component_timing(payload)
     if args.format == "json":
         emit_json(payload)
     else:
@@ -4495,6 +4512,7 @@ def _handle_search(args: argparse.Namespace, root_dir: Path, model: dict[str, An
         kind_filter=getattr(args, "kind_filter", []) or [],
         limit=max(0, int(getattr(args, "limit", 10))),
     )
+    attach_component_timing(payload)
     if args.format == "json":
         emit_json(payload)
     else:
@@ -7686,9 +7704,12 @@ def _active_clients_for_args(args: argparse.Namespace, model: dict[str, Any]) ->
 
 
 def _filtered_model_for_args(args: argparse.Namespace, root_dir: Path) -> dict[str, Any]:
-    model = build_runtime_model(root_dir)
-    active_profiles = normalize_active_profiles(getattr(args, "profile", []))
-    return filter_model(model, active_profiles, _active_clients_for_args(args, model))
+    # The model is built exactly once per invocation; timing it in place keeps
+    # model_ms truthful without a second build.
+    with current_invocation().phase(PHASE_MODEL):
+        model = build_runtime_model(root_dir)
+        active_profiles = normalize_active_profiles(getattr(args, "profile", []))
+        return filter_model(model, active_profiles, _active_clients_for_args(args, model))
 
 
 def _dispatch_model_command(
@@ -7734,6 +7755,12 @@ def _dispatch_registered_command(args: argparse.Namespace, root_dir: Path, resol
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Re-baseline the invocation clock, then bank everything spent before this
+    # line (interpreter boot + module imports) as startup -- the slice
+    # meta.elapsed_ms could never see. A warm in-process re-entry (the MCP
+    # server calls main() repeatedly) correctly pays zero startup.
+    reset_invocation()
+    record_phase(PHASE_STARTUP, invocation_startup_ms())
     parser = _build_parser()
     normalized_argv, diagnostics = _normalize_agent_argv(argv)
     args = parser.parse_args(normalized_argv)
