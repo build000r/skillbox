@@ -519,6 +519,57 @@ What this does:
 - `make runtime-status CLIENT=acme-studio` reports each task as `ready`, `pending`, or `blocked`
 - `make dev-sanity CLIENT=acme-studio` warns when declared bootstrap outputs are still missing
 - `make runtime-up CLIENT=acme-studio SERVICE=app-dev` automatically runs `app-bootstrap` before starting the service
+### Orientation quality gate
+
+The graph above is what the agent operations brain reasons over. Schema tests
+prove the brain answers in the right shape and the latency proof
+(`tests/perf/brain_proof.py`) proves it answers quickly, but neither says
+anything about whether `next`, `explain`, and `search` orient an agent
+*safely*. A confidently wrong recommendation passes every shape and timing gate
+ever written for it, so making the brain faster or broader without a safety
+signal only amplifies it.
+
+`tests/quality/brain_orientation_proof.py` replays a redacted scenario corpus
+(`tests/goldens/agent_ops_orientation_scenarios.json`) through the real
+in-process payload functions and scores each answer against rules the scenario
+declares up front:
+
+- **acceptable actions** — every action that is safe in that scenario. Where
+  several actions are safe they are all listed, so there is no exact-action
+  oracle to overfit to.
+- **forbidden actions** — ids or globs that must never appear.
+- **grounding** — which evidence sources may be cited, which must be cited,
+  which cautions must stay in the returned set, and which conflicts must be
+  reported.
+- **abstention** — whether refusing to act is the correct answer.
+
+Failures land in two columns that are never averaged together. `false_safe`
+means the brain moved when it should not have: it acted where abstention was
+correct, surfaced a forbidden action, emitted an unsafe command, or lost the
+grounding that would justify its answer. `false_abstain` means the brain
+stalled while a vetted safe action was available, or refused without offering a
+route forward. A single "accuracy" number would let one hide behind the other.
+
+Everything is deterministic — fixed fixtures, rule-based matching, no
+LLM-as-judge — and the proof runs with no network, no Docker, and no
+subprocess:
+
+```bash
+python3 tests/quality/brain_orientation_proof.py
+python3 tests/quality/brain_orientation_proof.py --strict    # fail on any false_safe
+python3 tests/quality/brain_orientation_proof.py --emit-baseline
+```
+
+The corpus holds 20 scenarios across healthy, degraded, conflicting,
+missing-evidence, unsafe-action, and abstention cases. Every value in it is a
+stable placeholder: the schema test rejects any scenario carrying a secret-like
+value, an absolute path, a hostname, an IP, or an email, because a corpus that
+pins one machine stops being a regression signal on any other.
+
+The corpus records a baseline of observed behaviour rather than aspirational
+behaviour, and the proof exits non-zero on drift in either direction: a new
+false-safe is a regression, and a fixed one has to be recorded deliberately.
+`tests/test_agent_ops_quality.py` runs the same baseline in the unit suite.
 ## Architecture
 
 See [docs/ARCHITECTURE.md](ARCHITECTURE.md) for the full architecture map.
