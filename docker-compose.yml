@@ -95,6 +95,12 @@ services:
       - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.claude:/home/sandbox/.claude
       - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.codex:/home/sandbox/.codex
       - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.config/claude-code:/home/sandbox/.config/claude-code
+      # DCG convergence state (user policy render + reconcile ledger + rollback
+      # backups) written by .env-manager/runtime_manager/dcg_reconcile.py. Mounted
+      # so a replaced container keeps its converged hooks AND the ledger that
+      # binds Codex's persisted hook-trust hash to those exact bytes; without it a
+      # recreate would silently look like a fresh, untrusted home.
+      - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.config/dcg:/home/sandbox/.config/dcg
       - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.config/git:/home/sandbox/.config/git
       - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.config/gh:/home/sandbox/.config/gh
       - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.config/ntm:/home/sandbox/.config/ntm
@@ -122,6 +128,12 @@ services:
       - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.claude:/home/sandbox/.claude
       - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.codex:/home/sandbox/.codex
       - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.config/claude-code:/home/sandbox/.config/claude-code
+      # DCG convergence state (user policy render + reconcile ledger + rollback
+      # backups) written by .env-manager/runtime_manager/dcg_reconcile.py. Mounted
+      # so a replaced container keeps its converged hooks AND the ledger that
+      # binds Codex's persisted hook-trust hash to those exact bytes; without it a
+      # recreate would silently look like a fresh, untrusted home.
+      - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.config/dcg:/home/sandbox/.config/dcg
       - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.config/git:/home/sandbox/.config/git
       - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.config/gh:/home/sandbox/.config/gh
       - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.config/ntm:/home/sandbox/.config/ntm
@@ -156,6 +168,12 @@ services:
       - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.claude:/home/sandbox/.claude
       - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.codex:/home/sandbox/.codex
       - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.config/claude-code:/home/sandbox/.config/claude-code
+      # DCG convergence state (user policy render + reconcile ledger + rollback
+      # backups) written by .env-manager/runtime_manager/dcg_reconcile.py. Mounted
+      # so a replaced container keeps its converged hooks AND the ledger that
+      # binds Codex's persisted hook-trust hash to those exact bytes; without it a
+      # recreate would silently look like a fresh, untrusted home.
+      - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.config/dcg:/home/sandbox/.config/dcg
       - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.config/git:/home/sandbox/.config/git
       - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.config/gh:/home/sandbox/.config/gh
       - ${SKILLBOX_STATE_ROOT:-./.skillbox-state}/home/.config/ntm:/home/sandbox/.config/ntm

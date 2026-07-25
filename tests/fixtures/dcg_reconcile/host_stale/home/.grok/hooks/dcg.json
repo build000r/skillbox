@@ -1,0 +1,17 @@
+{
+  "description": "stale description written by an older installer",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/old/prefix/bin/dcg",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
