@@ -1,0 +1,16 @@
+[
+  {
+    "id": "acme",
+    "packs": ["containers.docker"]
+  },
+  {
+    "id": "legacy-hook-shim",
+    "fail_closed": false,
+    "fail_closed_exception": {
+      "ticket": "SEC-4417",
+      "approved_by": "skillbox-security-lead",
+      "expires": "2099-01-01",
+      "reason": "legacy hook shim emits non-JSON on this box; tracked to removal"
+    }
+  }
+]
