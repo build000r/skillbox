@@ -184,6 +184,84 @@ class OwnedGapTests(unittest.TestCase):
         )
         self.assertEqual(payload["inventory_complete"], SM.inventory_complete())
 
+    def test_no_owned_gap_remains(self) -> None:
+        """Ratchet. Both original gaps were resolved by STATIC READ of the
+        delegate sources (skillbox-mutation-gap-delegates-cukm). Reintroducing a
+        gap is allowed, but it is a deliberate act that must edit this test too —
+        it must never happen by accident."""
+        self.assertEqual([entry.boundary_id for entry in SM.owned_gaps()], [])
+        self.assertTrue(SM.inventory_complete())
+
+
+class ResolvedDelegateBoundaryTests(unittest.TestCase):
+    """Pin the two delegated boundaries that were once OWNED GAPS.
+
+    Both were classified by reading the delegate source, never by running it.
+    These tests assert on the manifest record (always in-repo) and only
+    cross-check the delegate source when that delegate happens to be installed,
+    so a clean checkout on another host still passes.
+    """
+
+    MMDX_DELEGATE = (
+        ROOT_DIR / "workspace" / "skill-repos" / "build000r-skills" / "mmdx" / "scripts" / "mmd.py"
+    )
+
+    def test_cass_evidence_is_a_read_not_a_pessimistic_mutation(self) -> None:
+        entry = SM.boundary("manage.cass-evidence")
+        self.assertEqual(entry.classification, SM.READ)
+        self.assertFalse(entry.is_gap)
+        # A read may not claim a lease, a lock, or any write.
+        self.assertEqual(entry.lease_span, "n/a")
+        self.assertEqual(entry.lock_owner, "n/a")
+        self.assertEqual(entry.writes, ())
+        # The classification rests on the delegate being read-only, not on the
+        # delegate being absent. Both facts have to stay cited.
+        blob = " ".join(entry.evidence)
+        self.assertIn("sbp_evidence.py:812-813", blob)
+        self.assertIn("read_only=True", blob)
+        self.assertIn("READ_ONLY_CASS_VERBS", blob)
+        self.assertIn("NOT by execution", blob)
+        # It is still a two-hop delegation; that must not decay to "leaf".
+        self.assertIn("delegates_external", entry.nested_call_policy)
+
+    def test_mmdx_post_exit_write_window_is_bounded_not_unbounded(self) -> None:
+        entry = SM.boundary("manage.mmdx")
+        self.assertEqual(entry.classification, SM.CONDITIONAL_MUTATION)
+        self.assertFalse(entry.is_gap)
+        self.assertNotIn("UNBOUNDED", entry.lease_span)
+        # The bound itself: the handoff TTL, and the flag that gates the window.
+        self.assertIn("600s", entry.lease_span)
+        self.assertIn("mmd.py:54", entry.lease_span)
+        self.assertIn("--tmux", entry.dry_run_predicate)
+        self.assertIn("mmd.py:3015", entry.dry_run_predicate)
+        # The single write-back call site must stay named.
+        self.assertIn("mmd.py:923", " ".join(entry.writes))
+        # And the parser-flag escape found while resolving the gap.
+        self.assertIn("PARSER-FLAG ESCAPE", " ".join(entry.evidence))
+
+    def test_mmdx_delegate_source_still_matches_the_record(self) -> None:
+        """Cross-check the cited delegate facts against the real file when the
+        mmdx skill is installed. Skipped, never failed, when it is not."""
+        if not self.MMDX_DELEGATE.is_file():
+            self.skipTest(f"mmdx delegate not installed at {self.MMDX_DELEGATE}")
+        source = self.MMDX_DELEGATE.read_text(encoding="utf-8")
+        # The 600s bound.
+        self.assertIn("DEFAULT_HANDOFF_TTL_SECONDS = 10 * 60", source)
+        # The one gate that decides whether a local bridge exists at all.
+        self.assertIn("if args.tmux_handoff:", source)
+        # The one write-back call reachable from `manage mmdx`...
+        self.assertEqual(source.count('source_path.write_text(code, encoding="utf-8")'), 1)
+        # ...and the only other write in the delegate, which is not: it belongs
+        # to the `publish-link` subcommand `manage mmdx` never passes.
+        self.assertEqual(source.count("source_path.write_text("), 2)
+        self.assertIn("if args.write_short_link_metadata:", source)
+        # The detached grandchild that creates the post-exit window.
+        self.assertIn("start_new_session=True", source)
+        # Nothing on this path takes a lock.
+        for token in ("flock", "fcntl", "lockf"):
+            with self.subTest(token=token):
+                self.assertNotIn(token, source)
+
 
 class DeterminismTests(unittest.TestCase):
     """Rendering the manifest twice must be byte-identical."""

@@ -312,13 +312,16 @@ What the inventory established, and what a future single-writer lease has to fix
 - **The only real cross-process lease in the tree today is `scripts/self-test.sh`,**
   which flocks `${SKILLBOX_STATE_ROOT}/self-test/toolchain/.lock` (`self-test.sh:186`).
 
-**Open OWNED GAPS (blocking; the inventory is deliberately not marked complete).**
-`state_mutation.inventory_complete()` returns `False` while either remains:
+**Resolved OWNED GAPS.** Both delegated boundaries were originally recorded as
+blocking gaps, classified pessimistically because bounding them appeared to
+require executing the delegate. Both were later resolved by *static reading* of
+the delegate sources, so `state_mutation.inventory_complete()` now returns
+`True` and `owned_gaps()` is empty.
 
-| Boundary | Why it cannot be classified |
+| Boundary | Resolution |
 |---|---|
-| `manage.cass-evidence` | The `--proposals` write path lives in `$SKILLBOX_CONFIG_ROOT/scripts/sbp_evidence.py`, outside this repo and not installed here (`cli.py:3906`, `cli.py:3928`). Classifying it needs the delegate executed. Recorded pessimistically as `conditional_mutation`. |
-| `manage.mmdx` | Delegates to an external skill-repo script that launches a browser viewer able to rewrite the diagram source *after* this command exits, and `--allow-parser-install` runs `npm install` (`mmdx_open.py:440-458`). The post-return write window cannot be bounded without executing the viewer. Recorded pessimistically as `conditional_mutation`. |
+| `manage.cass-evidence` | **`read`.** `--proposals` is a print-only mode (`sbp_evidence.py:812-813`); `proposals()` computes, prints JSON and returns (`:747-787`). An AST sweep of the delegate found exactly one `open()`, in read mode (`:724`), and zero write primitives and zero `subprocess`. Its only child process is a fixed `cass search … --json` over ssh, and `search` is on the read-only verb allowlist. |
+| `manage.mmdx` | **`conditional_mutation`,** with a bounded window. The default invocation writes nothing: the detached bridge is spawned only under `--tmux` (`mmd.py:3015`), and without it the browser opens a remote URL with no local endpoint. Under `--tmux`, a detached grandchild serves `POST /source/write` (`mmd.py:923`) for at most `DEFAULT_HANDOFF_TTL_SECONDS` = 600s (`mmd.py:54`, enforced at `:1081` and `:931-933`), admitted by exact `Origin` plus a `secrets.token_urlsafe(24)` match, bound to one resolved path, capped at 512 KiB. |
 
 ## 7. Extension Recipes
 
