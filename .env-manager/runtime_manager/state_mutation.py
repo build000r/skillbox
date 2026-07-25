@@ -7,12 +7,23 @@ the operator MCP server, and the ``Makefile`` — namely:
     when an operator or agent runs this, what persistent state can change,
     under which predicate, and who owns the final write?
 
-It is an **inventory and a ratchet, not a lock**. Nothing here acquires,
-releases, or brokers a lock; :mod:`runtime_manager.state_mutation` is
-standard-library only and imports nothing from the rest of ``runtime_manager``
-at module scope, exactly like :mod:`runtime_manager.command_registry`. The
-authoritative reentrant state-root mutation lease is a *separate*, later piece
-of work that consumes the boundary IDs declared here.
+The module has exactly **two halves**, and they are strictly layered:
+
+1. The **inventory and ratchet** (:data:`MANIFEST` and everything above the
+   lease banner). It classifies surfaces. It acquires nothing, opens nothing,
+   and touches no filesystem outside the read-only source enumeration used by
+   :func:`coverage_report`.
+2. The **authoritative reentrant state-root mutation lease** (everything below
+   the lease banner). It is the one kernel-``flock`` writer lease for a
+   resolved state root, and it *consumes* the boundary IDs the inventory
+   declares — :func:`state_mutation_lease` refuses any ``boundary_id`` that is
+   not a classified mutation in :data:`MANIFEST`.
+
+The inventory half never calls into the lease half. The lease half reads only
+:func:`boundary` from the inventory half. :mod:`runtime_manager.state_mutation`
+remains standard-library only and imports nothing from the rest of
+``runtime_manager`` at module scope, exactly like
+:mod:`runtime_manager.command_registry`.
 
 Why this exists (verified substrate, re-confirmed against the tree)
 ------------------------------------------------------------------
@@ -43,8 +54,12 @@ Why this exists (verified substrate, re-confirmed against the tree)
 Non-goals
 ---------
 
-* **No locking is implemented here.** ``lock_owner`` records who owns the final
-  write *today*; ``UNOWNED`` is the honest and common answer.
+* **The inventory half still locks nothing.** ``lock_owner`` records who owns
+  the final write *today*, before any boundary is gated; ``UNOWNED`` is the
+  honest and common answer and stays that way until a gating bead actually
+  wraps that boundary in :func:`state_mutation_lease`.
+* **The lease half is local, not distributed.** No stealing, no heartbeat, no
+  read lock, no cross-host coordination. See the lease banner.
 * **Not every atomic helper is a public boundary.** ``atomic_write_json``,
   ``write_json_file``, ``write_text_file``, ``_append_jsonl`` and friends are
   write *primitives*. A boundary is a surface an operator or agent can invoke
@@ -67,11 +82,24 @@ terminal state for an honest inventory — it is not a failure to paper over.
 from __future__ import annotations
 
 import ast
+import contextlib
+import errno
 import json
+import os
+import platform
 import re
+import sys
+import threading
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Iterator, Mapping
+
+try:  # POSIX only. Absence is a fail-closed condition, never a degrade path.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX host
+    fcntl = None  # type: ignore[assignment]
 
 MANIFEST_SCHEMA_VERSION = "2026-07-25+state-mutation-boundaries.v1"
 
@@ -144,11 +172,14 @@ STATE_ROOT_SOURCES: Mapping[str, str] = {
         "SKILLBOX_BOX_INVENTORY overrides it (opslib.py:239)"
     ),
     "box.state_root": (
-        "scripts/box.py:797 -> env SKILLBOX_STATE_ROOT else './.skillbox-state' (CWD-RELATIVE)"
+        "scripts/box.py:797 operator_secret_dir -> env SKILLBOX_STATE_ROOT else "
+        "'./.skillbox-state', then 'if not base.is_absolute(): base = REPO_ROOT / base' "
+        "(REPO-RELATIVE, despite the './' spelling)"
     ),
     "opmcp.state_root": (
-        "scripts/operator_mcp_server.py:670 -> env SKILLBOX_STATE_ROOT else './.skillbox-state' "
-        "(CWD-RELATIVE); also roots the dry-run marker dir (operator_mcp_server.py:1500)"
+        "scripts/operator_mcp_server.py:980 operator_secret_dir -> env SKILLBOX_STATE_ROOT "
+        "else './.skillbox-state', then 'if not base.is_absolute(): base = REPO_ROOT / base' "
+        "(REPO-RELATIVE, despite the './' spelling); also roots the dry-run marker dir"
     ),
     "selftest.state_root": (
         "scripts/self-test.sh:178 ${SKILLBOX_STATE_ROOT:-${REPO_ROOT}/.skillbox-state} "
@@ -1862,6 +1893,1025 @@ def render_manifest_text() -> str:
     return "\n".join(lines) + "\n"
 
 
+# ==========================================================================
+# THE AUTHORITATIVE REENTRANT STATE-ROOT MUTATION LEASE
+# ==========================================================================
+#
+# Everything below this banner is the lease. Everything above it is the
+# inventory. The lease reads ``boundary()`` from the inventory and nothing else.
+#
+# What the lease is
+# -----------------
+# One ``LOCK_EX | LOCK_NB`` kernel flock per *canonical* state root, taken on a
+# stable **sibling** path next to the root — NEVER on anything inside the root,
+# because ``state_backup.restore`` renames the whole root out from under itself
+# (``state_backup.py:850`` ``source_root.rename(previous)``) and then
+# ``shutil.rmtree``s it. A lock file inside the root would be renamed away mid
+# hold and the next acquirer would create a *different* inode and see no
+# contention at all. The sibling survives the rename.
+#
+# What the lease is NOT (non-goals, enforced by omission)
+# -------------------------------------------------------
+# * Not distributed. One host, one kernel, ``flock(2)`` semantics only.
+# * No stealing. There is no API that takes a lock away from a live holder.
+# * No heartbeat. A holder that stops heartbeating is not a concept here.
+# * No read lock. Reads never take the lease; :func:`read_lease_metadata` is
+#   deliberately lock-free.
+# * No ``clear``. There is no public operation that erases or resets lease
+#   metadata, and the lock file is NEVER unlinked. Unlinking is how flock users
+#   silently lose mutual exclusion: two processes each holding a flock on two
+#   different inodes that happen to share a path.
+#
+# Why the metadata cannot authorize anything
+# ------------------------------------------
+# The JSON stored *inside* the lock file is advisory and descriptive. Ownership
+# is the kernel flock and only the kernel flock. Metadata is written strictly
+# AFTER the flock is held, replaced only while the flock is held, and is
+# tolerated as missing, empty, truncated, or stale at every read site. A crashed
+# holder leaves metadata claiming ``"held"`` forever; the next acquirer wins the
+# flock regardless and overwrites it. Any code that reads this metadata to
+# decide whether it may write is broken by construction — hence
+# :func:`read_lease_metadata` always cross-checks ``/proc/locks`` and reports
+# ``metadata_matches_kernel``.
+
+LEASE_SCHEMA_VERSION = "2026-07-25+state-mutation-lease.v1"
+
+#: Appended to the canonical root's *name*, inside the root's parent directory.
+LEASE_LOCK_SUFFIX = ".mutation-lease.lock"
+
+DEFAULT_LEASE_TIMEOUT_SECONDS = 30.0
+
+LEASE_AUTHORITY_NOTE = (
+    "ADVISORY ONLY. Ownership of this state root is the kernel flock held on "
+    "this file, never this JSON. Do not read this to decide whether you may "
+    "write; take the lease."
+)
+
+#: The one global lock-ordering rule. See :func:`state_mutation_lease`.
+LEASE_LOCK_ORDER_RULE = (
+    "cross-root nesting is deterministically ordered: a thread may only acquire "
+    "a canonical state root that sorts strictly AFTER every root it already "
+    "holds (plain lexicographic order on the canonical absolute path)"
+)
+
+_LEASE_POLL_MIN_SECONDS = 0.005
+_LEASE_POLL_MAX_SECONDS = 0.25
+_LEASE_METADATA_MAX_BYTES = 8192
+_LEASE_COMMAND_MAX_ITEMS = 16
+_LEASE_COMMAND_MAX_CHARS = 160
+_LEASE_LOCK_FILE_MODE = 0o644
+
+REDACTED = "***REDACTED***"
+
+_SECRET_KEY_RE = re.compile(
+    r"(?i)(pass(word|wd)?|secret|token|api[-_]?key|apikey|_key$|^key$|auth|bearer"
+    r"|credential|cred|cookie|session[-_]?id|private|signature|salt|dsn)"
+)
+_SECRET_VALUE_PREFIX_RE = re.compile(
+    r"(?i)^(sk-|sk_live_|sk_test_|pk_live_|rk_live_|ghp_|gho_|ghu_|ghs_|ghr_"
+    r"|github_pat_|glpat-|dop_v1_|doo_v1_|tskey-|xox[abprs]-|AKIA|ASIA|ya29\.|eyJ)"
+)
+_OPAQUE_BLOB_RE = re.compile(r"^[A-Za-z0-9_\-]{32,}$")
+
+
+# --------------------------------------------------------------------------
+# Lease errors — deliberately local
+# --------------------------------------------------------------------------
+#
+# These stay in this module rather than in ``_shared/errors.py`` on purpose.
+# ``_shared/errors.py`` is a mechanically generated split of ``shared.py`` that
+# imports ``yaml``, ``lib.runtime_model`` and ``lib.redaction`` at module scope
+# (``_shared/errors.py:1-77``). Importing it here would destroy this module's
+# standard-library-only property and create an import cycle for every gating
+# boundary. The plumbing genuinely can stay local, so it does.
+
+
+class StateMutationLeaseError(RuntimeError):
+    """Base class for every lease failure. Always carries a structured payload."""
+
+    code = "STATE_LEASE_ERROR"
+
+    def __init__(self, message: str, **context: Any) -> None:
+        super().__init__(message)
+        self.message = message
+        self.context: dict[str, Any] = dict(context)
+
+    def payload(self) -> dict[str, Any]:
+        return {"code": self.code, "error": self.message, **self.context}
+
+
+class StateMutationRootInvalid(StateMutationLeaseError):
+    """The supplied state root cannot be canonicalized at all."""
+
+    code = "STATE_LEASE_ROOT_INVALID"
+
+
+class StateMutationRootAmbiguous(StateMutationLeaseError):
+    """A relative state root has more than one live interpretation. STOP.
+
+    This is the ``ambiguous canonical root`` stop condition, implemented as
+    behaviour instead of prose: the tree contains resolvers that anchor a
+    relative ``SKILLBOX_STATE_ROOT`` to the *cwd* and resolvers that anchor it
+    to the *repo root*. Guessing here would hand two processes two different
+    lock files for what the operator believes is one state root — i.e. silent
+    loss of mutual exclusion. So the lease refuses and names both readings.
+    """
+
+    code = "STATE_LEASE_ROOT_AMBIGUOUS"
+
+
+class StateMutationLeaseUnsupported(StateMutationLeaseError):
+    """flock is unavailable or refused. Fail closed; never degrade to no lock."""
+
+    code = "STATE_LEASE_FLOCK_UNSUPPORTED"
+
+
+class StateMutationLeaseTimeout(StateMutationLeaseError):
+    """The bounded wait elapsed. Carries the full contention forensics."""
+
+    code = "STATE_LEASE_TIMEOUT"
+
+
+class StateMutationLeaseNesting(StateMutationLeaseError):
+    """A nested owner did not present the explicit lease it must present."""
+
+    code = "STATE_LEASE_NESTING"
+
+
+class StateMutationLeaseOrder(StateMutationLeaseError):
+    """Cross-root nesting violated the deterministic global lock order."""
+
+    code = "STATE_LEASE_LOCK_ORDER"
+
+
+class StateMutationBoundaryError(StateMutationLeaseError):
+    """The boundary ID is unknown to the inventory, or is not a mutation."""
+
+    code = "STATE_LEASE_BOUNDARY"
+
+
+# --------------------------------------------------------------------------
+# Canonical root — the deliberate resolution of the five-resolver ambiguity
+# --------------------------------------------------------------------------
+
+#: How the lease resolves what :data:`STATE_ROOT_SOURCES` records as a genuine
+#: disagreement. The lease does NOT pick a winner among the five resolvers and
+#: does NOT read ``SKILLBOX_STATE_ROOT`` itself — adding a sixth resolver with a
+#: sixth fallback is the failure mode, not the fix. Instead:
+#:
+#: * The caller passes the state root it already resolved. The lease adds no
+#:   fallback of its own and has no ``os.environ`` read anywhere.
+#: * An ABSOLUTE root is unambiguous. ``Path.resolve()`` then collapses
+#:   symlinks, ``..``, and duplicate separators, so every resolver that names
+#:   the same directory by any spelling lands on the same lock file. That is the
+#:   convergence guarantee, and it is the only one that is actually true.
+#: * A RELATIVE root is where the five resolvers genuinely fork — cwd-relative
+#:   (``cli.py:4985``, ``workflows.py:2388``) versus repo-relative
+#:   (``box.py:797``, ``operator_mcp_server.py:980``, ``opslib.py:235``,
+#:   ``self-test.sh:178``). The lease REFUSES it and raises
+#:   :class:`StateMutationRootAmbiguous` naming both readings, unless the caller
+#:   states the base explicitly via ``base=``.
+CANONICAL_ROOT_CONTRACT = (
+    "absolute + Path.resolve() (symlinks collapsed) is canonical; a relative "
+    "state root is refused unless the caller passes an explicit base=, because "
+    "cwd-relative and repo-relative resolvers disagree whenever cwd is not the "
+    "repo root"
+)
+
+CWD_RELATIVE_RESOLVERS = (
+    "runtime_manager/cli.py:4985 _skill_default_review_dir -> Path.cwd() / raw",
+    "runtime_manager/workflows.py:2388 _stewardship_state_root -> Path(raw).resolve()",
+    "runtime_manager/state_backup.py:60 _expand_path -> Path(raw).resolve()",
+)
+REPO_RELATIVE_RESOLVERS = (
+    "scripts/box.py:797 operator_secret_dir -> REPO_ROOT / raw",
+    "scripts/operator_mcp_server.py:980 operator_secret_dir -> REPO_ROOT / raw",
+    "scripts/lib/opslib.py:235 resolve_inventory_path -> <repo>/.skillbox-state fallback",
+    "scripts/self-test.sh:178 ${SKILLBOX_STATE_ROOT:-${REPO_ROOT}/.skillbox-state}",
+)
+
+
+def canonical_state_root(state_root: Path | str, *, base: Path | str | None = None) -> Path:
+    """Return the one canonical, symlink-collapsed absolute state root.
+
+    Raises :class:`StateMutationRootAmbiguous` for a relative root with no
+    explicit ``base`` — see :data:`CANONICAL_ROOT_CONTRACT`.
+
+    The root itself need not exist: ``restore`` renames it away and recreates
+    it, and the lease must be holdable across exactly that window.
+    """
+    raw = "" if state_root is None else str(state_root).strip()
+    if not raw:
+        raise StateMutationRootInvalid(
+            "a state root is required; the lease never reads SKILLBOX_STATE_ROOT itself",
+            state_root=raw,
+            contract=CANONICAL_ROOT_CONTRACT,
+        )
+    expanded = Path(os.path.expandvars(os.path.expanduser(raw)))
+    if not expanded.is_absolute():
+        if base is None:
+            raise StateMutationRootAmbiguous(
+                f"relative state root {raw!r} has two live interpretations in this tree; "
+                "pass an absolute root, or state the base explicitly with base=",
+                state_root=raw,
+                contract=CANONICAL_ROOT_CONTRACT,
+                cwd_interpretation=str((Path.cwd() / expanded).resolve()),
+                repo_interpretation=str((_repo_root() / expanded).resolve()),
+                cwd_relative_resolvers=list(CWD_RELATIVE_RESOLVERS),
+                repo_relative_resolvers=list(REPO_RELATIVE_RESOLVERS),
+            )
+        base_path = Path(os.path.expandvars(os.path.expanduser(str(base))))
+        if not base_path.is_absolute():
+            raise StateMutationRootInvalid(
+                f"base={str(base)!r} is itself relative; a base must be absolute",
+                state_root=raw,
+                base=str(base),
+            )
+        expanded = base_path / expanded
+    resolved = expanded.resolve()
+    if resolved.parent == resolved:
+        raise StateMutationRootInvalid(
+            f"{resolved} is a filesystem root and has no sibling to lock on",
+            state_root=str(resolved),
+        )
+    return resolved
+
+
+def lease_lock_path(state_root: Path | str, *, base: Path | str | None = None) -> Path:
+    """The stable sibling lock path for ``state_root``.
+
+    ``<parent>/<name>.mutation-lease.lock``. Outside the root by construction,
+    so ``state_backup.restore``'s ``rename`` + ``rmtree`` of the root cannot
+    move, replace, or delete the inode a holder is flocked to. It also cannot
+    collide with restore's own sibling scratch paths, which are
+    ``.<name>.pre-restore-<stamp>`` (``state_backup.py:587``) and
+    ``.<name>.restore-<random>`` (``state_backup.py:845``).
+    """
+    root = canonical_state_root(state_root, base=base)
+    return root.with_name(root.name + LEASE_LOCK_SUFFIX)
+
+
+# --------------------------------------------------------------------------
+# Redaction — local, conservative, applied before anything reaches the disk
+# --------------------------------------------------------------------------
+
+
+def _redact_token(text: str) -> str:
+    trimmed = text[:_LEASE_COMMAND_MAX_CHARS]
+    if "=" in trimmed:
+        key, _, value = trimmed.partition("=")
+        if value and (_SECRET_KEY_RE.search(key) or _SECRET_VALUE_PREFIX_RE.match(value)):
+            return f"{key}={REDACTED}"
+    if _SECRET_VALUE_PREFIX_RE.match(trimmed):
+        return REDACTED
+    if _OPAQUE_BLOB_RE.match(trimmed):
+        return REDACTED
+    return trimmed
+
+
+def _redact_command(argv: Iterable[str]) -> tuple[str, ...]:
+    """Redact an argv before it is written as advisory metadata.
+
+    Conservative on both axes: a secret-looking *flag* also swallows the value
+    that follows it, and anything that merely *looks* like an opaque credential
+    is masked even when the flag is innocuous.
+    """
+    out: list[str] = []
+    swallow_next = False
+    for item in list(argv)[:_LEASE_COMMAND_MAX_ITEMS]:
+        text = str(item)
+        if swallow_next:
+            swallow_next = False
+            out.append(REDACTED)
+            continue
+        if text.startswith("-") and "=" not in text and _SECRET_KEY_RE.search(text):
+            swallow_next = True
+            out.append(text[:_LEASE_COMMAND_MAX_CHARS])
+            continue
+        out.append(_redact_token(text))
+    return tuple(out)
+
+
+def _redact_annotations(annotations: Mapping[str, Any] | None) -> dict[str, str]:
+    if not annotations:
+        return {}
+    clean: dict[str, str] = {}
+    for key, value in list(annotations.items())[:_LEASE_COMMAND_MAX_ITEMS]:
+        name = str(key)[:_LEASE_COMMAND_MAX_CHARS]
+        if _SECRET_KEY_RE.search(name):
+            clean[name] = REDACTED
+            continue
+        clean[name] = _redact_token(str(value))
+    return clean
+
+
+# --------------------------------------------------------------------------
+# Best-effort holder forensics
+# --------------------------------------------------------------------------
+
+
+def _clock_ticks() -> int:
+    try:
+        return int(os.sysconf("SC_CLK_TCK")) or 100
+    except (OSError, ValueError, AttributeError):  # pragma: no cover - exotic host
+        return 100
+
+
+def _boot_id() -> str | None:
+    """Identifies the current boot, so a recorded pid cannot be trusted across reboots."""
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def _process_start_ticks(pid: int) -> int | None:
+    """Field 22 of ``/proc/<pid>/stat``. Distinguishes a live pid from a reused one."""
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    # comm (field 2) is parenthesized and may itself contain spaces and ')'.
+    tail = stat_text.rsplit(")", 1)[-1].split()
+    if len(tail) < 20:
+        return None
+    try:
+        return int(tail[19])
+    except ValueError:
+        return None
+
+
+def _process_command(pid: int) -> tuple[str, ...] | None:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    parts = [chunk.decode("utf-8", "replace") for chunk in raw.split(b"\0") if chunk]
+    if not parts:
+        return None
+    return _redact_command(parts)
+
+
+def _proc_lock_holders(lock_path: Path) -> tuple[dict[str, Any], ...]:
+    """Kernel truth: who actually holds/awaits a FLOCK on this inode.
+
+    Best effort — ``/proc/locks`` is Linux-only and the inode match ignores the
+    device column because its encoding varies across filesystems. Used for
+    diagnostics and to contradict lying metadata; never used to grant anything.
+    """
+    try:
+        target_inode = os.stat(lock_path).st_ino
+    except OSError:
+        return ()
+    try:
+        text = Path("/proc/locks").read_text(encoding="utf-8")
+    except OSError:  # pragma: no cover - non-Linux
+        return ()
+    found: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        tokens = line.split()
+        waiting = "->" in tokens
+        tokens = [token for token in tokens if token != "->"]
+        if len(tokens) < 6 or tokens[1] != "FLOCK":
+            continue
+        ident = tokens[5].rsplit(":", 1)
+        if len(ident) != 2:
+            continue
+        try:
+            inode = int(ident[1])
+            pid = int(tokens[4])
+        except ValueError:
+            continue
+        if inode != target_inode:
+            continue
+        found.append({"pid": pid, "mode": tokens[3], "waiting": waiting})
+    return tuple(found)
+
+
+def describe_lease_holder(lock_path: Path) -> dict[str, Any]:
+    """Best-effort, never-authoritative description of the current holder."""
+    holder: dict[str, Any] = {
+        "lock_path": str(lock_path),
+        "source": "unavailable",
+        "verified": False,
+        "pid": None,
+        "start_ticks": None,
+        "command": None,
+        "alive": False,
+        "advisory": None,
+        "advisory_matches_kernel": None,
+        "note": "best effort; absence of a holder here never means the lock is free",
+    }
+    advisory = _read_lock_file_metadata(lock_path)
+    if isinstance(advisory, dict):
+        holder["advisory"] = {
+            key: advisory.get(key)
+            for key in ("state", "pid", "boundary_id", "operation_id", "acquired_at", "owners", "host")
+        }
+    kernel = [entry for entry in _proc_lock_holders(lock_path) if not entry["waiting"]]
+    pid: int | None = None
+    if kernel:
+        pid = kernel[0]["pid"]
+        holder["source"] = "proc_locks"
+        holder["verified"] = True
+        holder["kernel_holders"] = [entry["pid"] for entry in kernel]
+    elif isinstance(advisory, dict) and isinstance(advisory.get("pid"), int):
+        pid = advisory["pid"]
+        holder["source"] = "advisory_metadata"
+    if pid is None:
+        return holder
+    holder["pid"] = pid
+    holder["start_ticks"] = _process_start_ticks(pid)
+    holder["command"] = list(_process_command(pid) or ())
+    holder["alive"] = holder["start_ticks"] is not None
+    if holder["start_ticks"] is not None:
+        holder["start_seconds_since_boot"] = round(holder["start_ticks"] / _clock_ticks(), 2)
+    if isinstance(advisory, dict):
+        holder["advisory_matches_kernel"] = bool(
+            advisory.get("pid") == pid
+            and advisory.get("start_ticks") == holder["start_ticks"]
+            and advisory.get("boot_id") == _boot_id()
+        )
+    return holder
+
+
+# --------------------------------------------------------------------------
+# Advisory metadata — lock-free reads, locked writes, never a ``clear``
+# --------------------------------------------------------------------------
+
+
+def _read_lock_file_metadata(lock_path: Path) -> dict[str, Any] | str:
+    try:
+        raw = lock_path.read_bytes()
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unreadable"
+    if not raw.strip():
+        return "empty"
+    try:
+        parsed = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        # A torn read of a concurrent replacement. Expected and harmless.
+        return "unreadable"
+    if not isinstance(parsed, dict):
+        return "unreadable"
+    return parsed
+
+
+def read_lease_metadata(state_root: Path | str, *, base: Path | str | None = None) -> dict[str, Any]:
+    """Read the advisory metadata WITHOUT taking the lease.
+
+    Deliberately lock-free: a reader must never be able to block a writer, and
+    "no read lock" is a stated non-goal. The result always reports both the
+    claim and the kernel's contradiction of it.
+    """
+    lock_path = lease_lock_path(state_root, base=base)
+    result: dict[str, Any] = {
+        "advisory": True,
+        "authority": LEASE_AUTHORITY_NOTE,
+        "schema": LEASE_SCHEMA_VERSION,
+        "lock_path": str(lock_path),
+        "state": "absent",
+        "metadata": None,
+        "kernel_holders": [],
+        "metadata_matches_kernel": None,
+    }
+    parsed = _read_lock_file_metadata(lock_path)
+    if isinstance(parsed, str):
+        result["state"] = parsed
+    else:
+        result["metadata"] = parsed
+        result["state"] = str(parsed.get("state") or "unknown")
+    kernel = [entry for entry in _proc_lock_holders(lock_path) if not entry["waiting"]]
+    result["kernel_holders"] = [entry["pid"] for entry in kernel]
+    if isinstance(parsed, dict):
+        claims_held = result["state"] == "held"
+        result["metadata_matches_kernel"] = bool(kernel) == claims_held and (
+            not kernel or kernel[0]["pid"] == parsed.get("pid")
+        )
+        if claims_held and not kernel:
+            result["stale"] = True
+    return result
+
+
+def _write_lock_file_metadata(fd: int, payload: Mapping[str, Any]) -> bool:
+    """Replace the lock file's contents. ONLY ever called while holding the flock."""
+    data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+    if len(data) > _LEASE_METADATA_MAX_BYTES:
+        trimmed = dict(payload)
+        trimmed["command"] = [REDACTED]
+        trimmed["owners"] = list(trimmed.get("owners") or ())[-2:]
+        trimmed["annotations"] = {}
+        trimmed["truncated"] = True
+        data = json.dumps(trimmed, ensure_ascii=False, default=str).encode("utf-8")[
+            :_LEASE_METADATA_MAX_BYTES
+        ]
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, data)
+    except OSError:
+        # Metadata is advisory. Losing it must never fail a mutation that
+        # legitimately holds the kernel lock.
+        return False
+    return True
+
+
+# --------------------------------------------------------------------------
+# The lease handle
+# --------------------------------------------------------------------------
+
+
+class StateMutationLease:
+    """A held, reentrant, single-writer lease on one canonical state root.
+
+    Instances are created only by :func:`state_mutation_lease`. There is no
+    public ``acquire``, ``release``, ``steal``, ``clear``, or ``refresh``: the
+    context manager owns the whole lifetime, so a crash, a ``SIGKILL``, or an
+    unhandled exception all release through the kernel rather than through
+    application code.
+    """
+
+    __slots__ = (
+        "_state_root",
+        "_lock_path",
+        "_owners",
+        "_pid",
+        "_thread_ident",
+        "_fd",
+        "_depth",
+        "_acquired_at",
+        "_acquired_monotonic",
+        "_start_ticks",
+        "_boot_id",
+        "_command",
+        "_annotations",
+        "_metadata_writable",
+        "_state",
+    )
+
+    def __init__(self, state_root: Path, lock_path: Path, boundary_id: str, operation_id: str) -> None:
+        self._state_root = state_root
+        self._lock_path = lock_path
+        self._owners: list[dict[str, str]] = [{"boundary_id": boundary_id, "operation_id": operation_id}]
+        self._pid = os.getpid()
+        self._thread_ident = threading.get_ident()
+        self._fd: int | None = None
+        self._depth = 0
+        self._acquired_at: str | None = None
+        self._acquired_monotonic: float | None = None
+        self._start_ticks: int | None = None
+        self._boot_id: str | None = None
+        self._command: tuple[str, ...] = ()
+        self._annotations: dict[str, str] = {}
+        self._metadata_writable = False
+        self._state = "acquiring"
+
+    # -- read-only surface -------------------------------------------------
+    @property
+    def state_root(self) -> Path:
+        return self._state_root
+
+    @property
+    def lock_path(self) -> Path:
+        return self._lock_path
+
+    @property
+    def boundary_id(self) -> str:
+        return self._owners[-1]["boundary_id"]
+
+    @property
+    def operation_id(self) -> str:
+        return self._owners[-1]["operation_id"]
+
+    @property
+    def root_operation_id(self) -> str:
+        return self._owners[0]["operation_id"]
+
+    @property
+    def owners(self) -> tuple[dict[str, str], ...]:
+        return tuple(dict(owner) for owner in self._owners)
+
+    @property
+    def depth(self) -> int:
+        return self._depth
+
+    @property
+    def pid(self) -> int:
+        return self._pid
+
+    @property
+    def acquired_at(self) -> str | None:
+        return self._acquired_at
+
+    @property
+    def held(self) -> bool:
+        return self._state == "held"
+
+    @property
+    def metadata_writable(self) -> bool:
+        """``False`` when the lock file could only be opened read-only.
+
+        Mutual exclusion is unaffected — ``flock`` needs no write permission.
+        Only the advisory metadata is lost.
+        """
+        return self._metadata_writable
+
+    def held_seconds(self) -> float:
+        if self._acquired_monotonic is None:
+            return 0.0
+        return time.monotonic() - self._acquired_monotonic
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "schema": LEASE_SCHEMA_VERSION,
+            "state": self._state,
+            "state_root": str(self._state_root),
+            "lock_path": str(self._lock_path),
+            "pid": self._pid,
+            "depth": self._depth,
+            "owners": [dict(owner) for owner in self._owners],
+            "acquired_at": self._acquired_at,
+            "held_seconds": round(self.held_seconds(), 3),
+            "metadata_writable": self._metadata_writable,
+        }
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return (
+            f"<StateMutationLease {self._state} root={self._state_root} "
+            f"depth={self._depth} owner={self.boundary_id}>"
+        )
+
+    # -- internal ----------------------------------------------------------
+    def _metadata(self, *, state: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "schema": LEASE_SCHEMA_VERSION,
+            "advisory": True,
+            "authority": LEASE_AUTHORITY_NOTE,
+            "state": state,
+            "state_root": str(self._state_root),
+            "lock_path": str(self._lock_path),
+            "pid": self._pid,
+            "boot_id": self._boot_id,
+            "start_ticks": self._start_ticks,
+            "host": platform.node(),
+            "boundary_id": self.boundary_id,
+            "operation_id": self.operation_id,
+            "owners": [dict(owner) for owner in self._owners],
+            "depth": self._depth,
+            "acquired_at": self._acquired_at,
+            "command": list(self._command),
+            "annotations": dict(self._annotations),
+        }
+        if state == "released":
+            payload["released_at"] = _utc_now()
+            payload["held_seconds"] = round(self.held_seconds(), 3)
+        return payload
+
+    def _publish(self, *, state: str) -> None:
+        if self._fd is None or not self._metadata_writable:
+            return
+        _write_lock_file_metadata(self._fd, self._metadata(state=state))
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+# --------------------------------------------------------------------------
+# Acquisition
+# --------------------------------------------------------------------------
+
+_LEASE_REGISTRY: dict[str, StateMutationLease] = {}
+_LEASE_REGISTRY_GUARD = threading.Lock()
+_LEASE_SEQUENCE = 0
+
+
+def held_lease_roots() -> tuple[str, ...]:
+    """Canonical roots this *process* currently holds or is acquiring."""
+    with _LEASE_REGISTRY_GUARD:
+        return tuple(sorted(_LEASE_REGISTRY))
+
+
+def _next_operation_id(boundary_id: str) -> str:
+    global _LEASE_SEQUENCE
+    with _LEASE_REGISTRY_GUARD:
+        _LEASE_SEQUENCE += 1
+        sequence = _LEASE_SEQUENCE
+    return f"{boundary_id}@{os.getpid()}.{sequence}"
+
+
+def _flock_supported() -> bool:
+    return fcntl is not None and hasattr(fcntl, "flock") and hasattr(fcntl, "LOCK_EX")
+
+
+def _flock_exclusive_nonblocking(fd: int) -> None:
+    """The single kernel call. Isolated so the unsupported path can be exercised."""
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _flock_unlock(fd: int) -> None:
+    fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def _open_lock_descriptor(lock_path: Path) -> tuple[int, bool]:
+    """Open the lock file with a NON-INHERITABLE descriptor.
+
+    Returns ``(fd, writable)``. ``O_CLOEXEC`` plus an explicit
+    ``os.set_inheritable(fd, False)`` means no ``exec``'d child — a container,
+    a ``docker compose`` shell-out, a ``box ssh`` — can silently keep the lease
+    alive after the holder exits, or release it early.
+    """
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    writable = True
+    try:
+        fd = os.open(lock_path, flags, _LEASE_LOCK_FILE_MODE)
+    except PermissionError:
+        # Another uid owns the lock file. Mutual exclusion must NOT degrade, and
+        # flock(2) works fine on a read-only descriptor; only metadata is lost.
+        try:
+            fd = os.open(lock_path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        except OSError as exc:
+            raise StateMutationLeaseUnsupported(
+                f"cannot open the lease lock file {lock_path}: {exc}",
+                lock_path=str(lock_path),
+                errno=getattr(exc, "errno", None),
+            ) from exc
+        writable = False
+    except OSError as exc:
+        raise StateMutationLeaseUnsupported(
+            f"cannot open the lease lock file {lock_path}: {exc}",
+            lock_path=str(lock_path),
+            errno=getattr(exc, "errno", None),
+        ) from exc
+    os.set_inheritable(fd, False)
+    return fd, writable
+
+
+def _acquire_kernel_lock(
+    lease: StateMutationLease,
+    *,
+    timeout: float,
+) -> None:
+    if not _flock_supported():
+        raise StateMutationLeaseUnsupported(
+            "fcntl.flock is unavailable on this interpreter/platform; refusing to "
+            "mutate a state root without kernel-enforced mutual exclusion",
+            state_root=str(lease.state_root),
+            lock_path=str(lease.lock_path),
+            boundary_id=lease.boundary_id,
+            operation_id=lease.operation_id,
+        )
+    try:
+        lease.lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise StateMutationLeaseUnsupported(
+            f"cannot create the parent directory for {lease.lock_path}: {exc}",
+            lock_path=str(lease.lock_path),
+        ) from exc
+
+    fd, writable = _open_lock_descriptor(lease.lock_path)
+    bounded = max(0.0, float(timeout))
+    started = time.monotonic()
+    deadline = started + bounded
+    delay = _LEASE_POLL_MIN_SECONDS
+    while True:
+        try:
+            _flock_exclusive_nonblocking(fd)
+            break
+        except OSError as exc:
+            if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                os.close(fd)
+                raise StateMutationLeaseUnsupported(
+                    f"flock is not supported on {lease.lock_path} ({exc}); refusing to "
+                    "mutate a state root without kernel-enforced mutual exclusion",
+                    state_root=str(lease.state_root),
+                    lock_path=str(lease.lock_path),
+                    boundary_id=lease.boundary_id,
+                    operation_id=lease.operation_id,
+                    errno=getattr(exc, "errno", None),
+                ) from exc
+        now = time.monotonic()
+        if now >= deadline:
+            waited = now - started
+            holder = describe_lease_holder(lease.lock_path)
+            os.close(fd)
+            raise StateMutationLeaseTimeout(
+                f"timed out after {waited:.3f}s waiting for the state-root mutation lease on "
+                f"{lease.state_root} (boundary {lease.boundary_id}, operation "
+                f"{lease.operation_id}, lock {lease.lock_path})",
+                state_root=str(lease.state_root),
+                boundary_id=lease.boundary_id,
+                operation_id=lease.operation_id,
+                waited_seconds=round(waited, 3),
+                timeout_seconds=bounded,
+                lock_path=str(lease.lock_path),
+                holder=holder,
+            )
+        time.sleep(max(0.0, min(delay, deadline - now)))
+        delay = min(delay * 2, _LEASE_POLL_MAX_SECONDS)
+
+    # --- held from here down. Metadata is written only now, never before. ---
+    lease._fd = fd
+    lease._metadata_writable = writable
+    lease._depth = 1
+    lease._state = "held"
+    lease._acquired_at = _utc_now()
+    lease._acquired_monotonic = time.monotonic()
+    lease._start_ticks = _process_start_ticks(lease.pid)
+    lease._boot_id = _boot_id()
+    lease._command = _redact_command(sys.argv)
+    # Whatever a dead holder left behind is replaced here, AFTER acquisition,
+    # while the kernel lock is held. Stale metadata never blocks anyone.
+    lease._publish(state="held")
+
+
+def _release_kernel_lock(lease: StateMutationLease) -> None:
+    fd = lease._fd
+    lease._state = "released"
+    lease._depth = 0
+    if fd is None:
+        return
+    try:
+        # Replace, never unlink, and only while still holding the kernel lock.
+        lease._publish(state="released")
+    finally:
+        lease._fd = None
+        try:
+            if _flock_supported():
+                _flock_unlock(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+
+def _resolve_boundary(boundary_id: str) -> Boundary:
+    try:
+        entry = boundary(boundary_id)
+    except KeyError:
+        raise StateMutationBoundaryError(
+            f"unknown boundary id {boundary_id!r}; the lease only accepts IDs classified in "
+            "runtime_manager.state_mutation.MANIFEST",
+            boundary_id=boundary_id,
+        ) from None
+    if not entry.is_mutation:
+        raise StateMutationBoundaryError(
+            f"boundary {boundary_id!r} is classified {entry.classification!r}; a read never "
+            "takes the write lease (no read lock is an explicit non-goal)",
+            boundary_id=boundary_id,
+            classification=entry.classification,
+        )
+    return entry
+
+
+@contextlib.contextmanager
+def state_mutation_lease(
+    state_root: Path | str,
+    boundary_id: str,
+    *,
+    lease: StateMutationLease | None = None,
+    operation_id: str | None = None,
+    base: Path | str | None = None,
+    timeout: float = DEFAULT_LEASE_TIMEOUT_SECONDS,
+    annotations: Mapping[str, Any] | None = None,
+) -> Iterator[StateMutationLease]:
+    """Hold the single-writer lease on ``state_root`` for ``boundary_id``.
+
+    ``boundary_id`` MUST name a mutating boundary in :data:`MANIFEST`; that is
+    how the inventory and the lease stay welded together.
+
+    Nesting rules, all fail-closed:
+
+    * **Same root, nested owner** — the inner owner MUST pass the outer lease
+      explicitly as ``lease=``. It then *reuses* the same kernel lock and
+      simply increments the depth; no second flock is taken and nothing is
+      released until the outermost owner exits. Calling without ``lease=``
+      while this thread already holds that root raises
+      :class:`StateMutationLeaseNesting` rather than silently piggybacking on
+      an ownership the caller never proved it had.
+    * **Same root, other thread** — rejected. ``flock`` is per open file
+      description, not per thread; sharing one across threads would mean two
+      concurrent mutators believing they are the single writer.
+    * **Cross-root nesting** — permitted but deterministically ordered, see
+      :data:`LEASE_LOCK_ORDER_RULE`. Out-of-order acquisition raises
+      :class:`StateMutationLeaseOrder` instead of risking an ABBA deadlock that
+      would only ever surface as two mutual timeouts in production.
+
+    Raises :class:`StateMutationLeaseTimeout` when the bounded wait elapses,
+    :class:`StateMutationLeaseUnsupported` when flock cannot be relied on, and
+    :class:`StateMutationRootAmbiguous` when the root cannot be canonicalized
+    without guessing.
+    """
+    _resolve_boundary(boundary_id)
+    root = canonical_state_root(state_root, base=base)
+    key = str(root)
+    operation = operation_id or _next_operation_id(boundary_id)
+    thread_ident = threading.get_ident()
+
+    reuse: StateMutationLease | None = None
+    fresh: StateMutationLease | None = None
+
+    with _LEASE_REGISTRY_GUARD:
+        registered = _LEASE_REGISTRY.get(key)
+        if lease is not None:
+            if str(lease.state_root) == key:
+                if registered is not lease or not lease.held:
+                    raise StateMutationLeaseNesting(
+                        "the lease passed for this root is not the live registered holder; "
+                        "it was already released or belongs to another root",
+                        state_root=key,
+                        boundary_id=boundary_id,
+                        operation_id=operation,
+                    )
+                if lease._thread_ident != thread_ident:
+                    raise StateMutationLeaseNesting(
+                        "a lease cannot be reused from a different thread; flock is per open "
+                        "file description, so two threads sharing it would both believe they "
+                        "are the single writer",
+                        state_root=key,
+                        boundary_id=boundary_id,
+                        operation_id=operation,
+                        owner_thread=lease._thread_ident,
+                        calling_thread=thread_ident,
+                    )
+                reuse = lease
+        if reuse is None:
+            if registered is not None:
+                if registered._thread_ident == thread_ident:
+                    raise StateMutationLeaseNesting(
+                        f"this thread already holds {key}; a nested owner MUST pass the held "
+                        "lease explicitly as lease=<StateMutationLease>. Implicit ambient "
+                        "reuse is refused so that ownership is always proved, never assumed.",
+                        state_root=key,
+                        boundary_id=boundary_id,
+                        operation_id=operation,
+                        held_by=registered.boundary_id,
+                        held_operation_id=registered.operation_id,
+                    )
+                raise StateMutationLeaseNesting(
+                    f"another thread in this process holds {key}; the lease is not shared "
+                    "across threads",
+                    state_root=key,
+                    boundary_id=boundary_id,
+                    operation_id=operation,
+                    owner_thread=registered._thread_ident,
+                    calling_thread=thread_ident,
+                )
+            blocking = sorted(
+                held
+                for held, entry in _LEASE_REGISTRY.items()
+                if entry._thread_ident == thread_ident and held >= key
+            )
+            if blocking:
+                raise StateMutationLeaseOrder(
+                    f"cross-root nesting out of order: this thread already holds {blocking} "
+                    f"and {key} does not sort after all of them",
+                    state_root=key,
+                    boundary_id=boundary_id,
+                    operation_id=operation,
+                    already_held=blocking,
+                    rule=LEASE_LOCK_ORDER_RULE,
+                )
+            fresh = StateMutationLease(root, root.with_name(root.name + LEASE_LOCK_SUFFIX), boundary_id, operation)
+            # Reserve the slot before releasing the guard so a second thread
+            # fails fast instead of racing us into a pointless flock timeout.
+            _LEASE_REGISTRY[key] = fresh
+
+    if reuse is not None:
+        reuse._owners.append({"boundary_id": boundary_id, "operation_id": operation})
+        reuse._depth += 1
+        reuse._publish(state="held")
+        try:
+            yield reuse
+        finally:
+            reuse._depth -= 1
+            reuse._owners.pop()
+            if reuse.held:
+                reuse._publish(state="held")
+        return
+
+    assert fresh is not None  # noqa: S101 - registry invariant, not user input
+    fresh._annotations = _redact_annotations(annotations)
+    try:
+        _acquire_kernel_lock(fresh, timeout=timeout)
+    except BaseException:
+        with _LEASE_REGISTRY_GUARD:
+            if _LEASE_REGISTRY.get(key) is fresh:
+                del _LEASE_REGISTRY[key]
+        raise
+    try:
+        yield fresh
+    finally:
+        try:
+            _release_kernel_lock(fresh)
+        finally:
+            with _LEASE_REGISTRY_GUARD:
+                if _LEASE_REGISTRY.get(key) is fresh:
+                    del _LEASE_REGISTRY[key]
+
+
 __all__ = [
     "MANIFEST",
     "MANIFEST_SCHEMA_VERSION",
@@ -1894,4 +2944,27 @@ __all__ = [
     "owned_gaps",
     "render_manifest",
     "render_manifest_text",
+    # -- lease ------------------------------------------------------------
+    # There is deliberately no clear/steal/break/force/unlink entry point.
+    "CANONICAL_ROOT_CONTRACT",
+    "DEFAULT_LEASE_TIMEOUT_SECONDS",
+    "LEASE_AUTHORITY_NOTE",
+    "LEASE_LOCK_ORDER_RULE",
+    "LEASE_LOCK_SUFFIX",
+    "LEASE_SCHEMA_VERSION",
+    "StateMutationBoundaryError",
+    "StateMutationLease",
+    "StateMutationLeaseError",
+    "StateMutationLeaseNesting",
+    "StateMutationLeaseOrder",
+    "StateMutationLeaseTimeout",
+    "StateMutationLeaseUnsupported",
+    "StateMutationRootAmbiguous",
+    "StateMutationRootInvalid",
+    "canonical_state_root",
+    "describe_lease_holder",
+    "held_lease_roots",
+    "lease_lock_path",
+    "read_lease_metadata",
+    "state_mutation_lease",
 ]
