@@ -33,6 +33,41 @@ def _assert_elapsed_meta(testcase: unittest.TestCase, payload: dict[str, object]
     testcase.assertGreaterEqual(float(elapsed), 0.0)
 
 
+def _assert_component_meta(
+    testcase: unittest.TestCase,
+    payload: dict[str, object],
+    *,
+    expect_adapters: bool,
+) -> dict[str, object]:
+    """Assert meta separates end-to-end wall time from in-process compute.
+
+    ``meta.elapsed_ms`` alone hid ~10s of adapter/startup wall behind a ~2ms
+    number; these keys are what makes that visible.
+    """
+    meta = payload.get("meta")
+    testcase.assertIsInstance(meta, dict)
+    assert isinstance(meta, dict)
+    for key in ("compute_ms", "end_to_end_ms", "elapsed_ms"):
+        testcase.assertIn(key, meta)
+        testcase.assertIsInstance(meta[key], (int, float))
+        testcase.assertNotIsInstance(meta[key], bool)
+    testcase.assertEqual(meta["compute_ms"], meta["elapsed_ms"])
+    testcase.assertGreaterEqual(float(meta["end_to_end_ms"]), float(meta["compute_ms"]))
+    timing = meta.get("timing")
+    testcase.assertIsInstance(timing, dict)
+    assert isinstance(timing, dict)
+    testcase.assertIsInstance(timing.get("phases"), dict)
+    testcase.assertIn(timing.get("process_start_source"), {"proc_self_stat", "module_import"})
+    testcase.assertGreaterEqual(int(timing.get("invocation_index", 0)), 1)
+    if expect_adapters:
+        testcase.assertIn("adapter_collection_ms", meta)
+    else:
+        # An omitted phase is honest: --no-adapters really has no adapter cost,
+        # and a fabricated 0.0 would read as "adapters are free".
+        testcase.assertNotIn("adapter_collection_ms", meta)
+    return meta
+
+
 def _assert_error_envelope(testcase: unittest.TestCase, payload: dict[str, object], code: str) -> None:
     testcase.assertIs(payload["ok"], False)
     error = payload.get("error")
@@ -200,6 +235,80 @@ class CliUnitTests(unittest.TestCase):
         self.assertEqual(payloads[4]["snapshot_id"], "golden-fixture")
         for payload in payloads[:4]:
             _assert_elapsed_meta(self, payload)
+            meta = _assert_component_meta(self, payload, expect_adapters=False)
+            # Startup and model build are the wall time elapsed_ms never saw.
+            # These are one-shot processes, so both are strictly positive.
+            self.assertEqual(meta["timing"]["invocation_index"], 1)
+            self.assertGreater(float(meta["startup_ms"]), 0.0)
+            self.assertGreater(float(meta["model_ms"]), 0.0)
+            self.assertGreater(float(meta["end_to_end_ms"]), float(meta["startup_ms"]))
+
+    def test_next_reports_component_breakdown_without_building_the_model_twice(self) -> None:
+        real_build = CLI.build_runtime_model
+        builds: list[object] = []
+
+        def counting_build(root_dir: Path) -> dict[str, object]:
+            builds.append(root_dir)
+            return real_build(root_dir)
+
+        stdout = StringIO()
+        with mock.patch.object(CLI, "build_runtime_model", side_effect=counting_build):
+            with redirect_stdout(stdout):
+                code = CLI.main(["next", "--format", "json", "--no-adapters", "--limit", "1"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(builds), 1, "model_ms must not cost a second runtime model build")
+        payload = json.loads(stdout.getvalue())
+        meta = _assert_component_meta(self, payload, expect_adapters=False)
+        self.assertGreater(float(meta["model_ms"]), 0.0)
+        self.assertEqual(meta["timing"]["phases"]["model_ms"], meta["model_ms"])
+        # main() re-entered in-process: startup was already paid by an earlier
+        # invocation, so charging it again would inflate the number.
+        self.assertGreaterEqual(float(meta["startup_ms"]), 0.0)
+        if meta["timing"]["invocation_index"] > 1:
+            self.assertEqual(float(meta["startup_ms"]), 0.0)
+
+    def test_warm_in_process_reentry_does_not_recharge_startup(self) -> None:
+        # The MCP server calls cli.main() repeatedly in one long-lived process.
+        # Charging call N with the server's whole process age would report an
+        # end_to_end_ms orders of magnitude larger than the actual work.
+        metas = []
+        for _ in range(2):
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                self.assertEqual(CLI.main(["capabilities", "--format", "json", "--no-adapters"]), 0)
+            metas.append(json.loads(stdout.getvalue())["meta"])
+
+        first, second = metas
+        self.assertEqual(
+            second["timing"]["invocation_index"],
+            first["timing"]["invocation_index"] + 1,
+        )
+        self.assertEqual(float(second["startup_ms"]), 0.0)
+        # A warm capabilities call is sub-second work, not process age.
+        self.assertLess(float(second["end_to_end_ms"]), 30_000.0)
+
+    def test_next_with_adapters_attributes_adapter_wall_time(self) -> None:
+        from runtime_manager import agent_adapters as ADAPT
+
+        def fake_run(_command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(["stub"], 0, stdout="{}", stderr="")
+
+        stdout = StringIO()
+        with mock.patch.object(ADAPT.subprocess, "run", side_effect=fake_run):
+            with redirect_stdout(stdout):
+                code = CLI.main(["next", "--format", "json", "--limit", "1"])
+
+        self.assertEqual(code, 0)
+        payload = json.loads(stdout.getvalue())
+        meta = _assert_component_meta(self, payload, expect_adapters=True)
+        adapters = meta["timing"]["adapters"]
+        self.assertGreaterEqual(adapters["adapter_count"], 5)
+        self.assertIn("br_ready", adapters["statuses"])
+        self.assertIn("durations_ms", adapters)
+        self.assertIn("timeouts", adapters)
+        self.assertIn("unavailable", adapters)
+        self.assertEqual(meta["adapter_collection_ms"], adapters["collection_ms"])
 
     def test_explain_bare_brain_command_alias_resolves_to_command_node(self) -> None:
         result = _run_manage("explain", "next", "--format", "json", "--no-adapters")
