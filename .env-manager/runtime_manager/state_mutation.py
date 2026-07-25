@@ -381,26 +381,50 @@ _MANAGE_BOUNDARIES: tuple[Boundary, ...] = tuple(
         evidence=("cli.py:6674", "runtime_ops.py:2349 sync_runtime", "runtime_ops.py:5142 run_tasks", "runtime_ops.py:5198 subprocess.Popen(shell=True)"),
     ),
     _b(
-        SURFACE_MANAGE, "cass-evidence", CONDITIONAL_MUTATION,
-        state_root_source="external",
-        dry_run_predicate="UNKNOWN — lives in the out-of-repo helper",
-        nested_call_policy="delegates_external: $SKILLBOX_CONFIG_ROOT/scripts/sbp_evidence.py",
-        lease_span="unknown",
-        lock_owner="unknown (external process)",
-        writes=("unknown — the --proposals path is implemented outside this repo",),
+        SURFACE_MANAGE, "cass-evidence", READ,
+        # READ, so the manifest contract pins lease_span / lock_owner / writes to
+        # the "n/a" defaults (tests/test_state_mutation_inventory.py:137
+        # test_reads_do_not_claim_a_lease_or_a_lock). The nested-call policy is
+        # recorded anyway because the delegate chain is the whole reason this row
+        # was an OWNED GAP: it is a read *through two hops*, not a leaf read.
+        nested_call_policy=(
+            "delegates_external (READ-ONLY, verified by static read): "
+            "$SKILLBOX_CONFIG_ROOT/scripts/sbp_evidence.py -> sbp_cass.bash_remote ssh "
+            "`cass search` on the index host"
+        ),
         evidence=(
             "cli.py:3894 _handle_cass_evidence",
             "cli.py:3906 helper = config_root / 'scripts' / 'sbp_evidence.py'",
-            "cli.py:3919-3921 `if getattr(args, \"proposals\", False): cmd += [\"--proposals\"]`",
-            "cli.py:3928 `proc = subprocess.run(cmd, check=False)`",
-            "helper absent on this host: ~/repos/skillbox-config/scripts/sbp_evidence.py missing, SKILLBOX_CONFIG_ROOT unset -> cli.py:3907 returns evidence_helper_missing",
-        ),
-        gap=(
-            "BLOCKING: the write behaviour of `--proposals` is implemented in "
-            "skillbox-config/scripts/sbp_evidence.py, which is not in this repo and is not "
-            "installed on this host. Classifying it would require either executing the "
-            "delegate or guessing. Recorded as conditional_mutation on the pessimistic "
-            "assumption that --proposals writes."
+            "cli.py:3919-3920 `if getattr(args, \"proposals\", False): cmd += [\"--proposals\"]`",
+            "cli.py:3929 `proc = subprocess.run(cmd, check=False)` (was cited as :3928; the call is on 3929 today)",
+            "helper still absent at the resolved default on this host: ~/repos/skillbox-config "
+            "does not exist and SKILLBOX_CONFIG_ROOT is unset, so cli.py:3907-3917 emits "
+            "evidence_helper_missing and returns EXIT_ERROR without spawning anything",
+            "GAP RESOLVED BY STATIC READ of the canonical source, NOT by execution: "
+            "skillbox-config/scripts/sbp_evidence.py (920 lines, commit 34c27ac)",
+            "sbp_evidence.py:812-813 `if getattr(args, \"proposals\", False): return proposals(args)` "
+            "— --proposals is a distinct print mode on the same command",
+            "sbp_evidence.py:747-787 proposals(): resolves the policy path, computes, "
+            "`print(json.dumps(...))` / _print_proposals_text, `return 0`. No write call.",
+            "sbp_evidence.py:449-455 module contract: 'it never writes skill-scope.yaml and "
+            "never links/unlinks anything'; the payload itself carries applied=False and "
+            "read_only=True (sbp_evidence.py:563-564)",
+            "AST sweep of sbp_evidence.py for write primitives: exactly ONE open() — "
+            "sbp_evidence.py:724 `open(policy_path, encoding=\"utf-8\")`, read mode, feeding "
+            "yaml.safe_load. Zero write_text/write_bytes/mkdir/makedirs/json.dump-to-file/"
+            "shutil.*/os.replace/rename/unlink/rmtree/touch/chmod, and zero subprocess.",
+            "AST sweep of the sibling detector it imports (skill_invocation_detector.py): "
+            "zero write primitives and zero subprocess",
+            "the ONLY child process on the whole path is sbp_evidence.py:190 "
+            "sbp_cass.bash_remote -> sbp_cass.py:207-208 -> run_ssh_host (sbp_cass.py:174-187), "
+            "running the FIXED remote string built at sbp_evidence.py:184-188: "
+            "`cass search <query> --json --limit N --fields all --data-dir <DATA_DIR>`. "
+            "`search` is in READ_ONLY_CASS_VERBS (sbp_cass.py:78); the queries are the "
+            "hardcoded locators ('Using', 'Skill') at sbp_evidence.py:54; --repo/--skill are "
+            "local join filters and never reach the remote argv.",
+            "importing sbp_cass has no module-level side effect that writes: its only "
+            "module-level calls are Path(...)/frozenset(...)/socket.gethostname()/os.path.isdir "
+            "(sbp_cass.py:21, 78, 103, 123, 125, 164-167)",
         ),
     ),
     _b(
@@ -588,22 +612,86 @@ _MANAGE_BOUNDARIES: tuple[Boundary, ...] = tuple(
     _b(
         SURFACE_MANAGE, "mmdx", CONDITIONAL_MUTATION,
         state_root_source="external",
-        dry_run_predicate="`if not open_file:` mmdx_open.py:590 returns before spawning; `--no-parser-install` appended unless --allow-parser-install (mmdx_open.py:449-450)",
-        nested_call_policy="delegates_external: workspace/skill-repos/build000r-skills/mmdx/scripts/mmd.py",
-        lease_span="UNBOUNDED — the spawned viewer outlives the command",
-        lock_owner="unknown (external viewer process)",
-        writes=("mmdx node_modules when --allow-parser-install", "the diagram source, rewritten by the browser viewer AFTER this command returns"),
-        evidence=(
-            "cli.py:3259 -> mmdx_open.py:649 mmdx_open_payload -> :429 _open_selected_mmdx",
-            "mmdx_open.py:440-458 subprocess.run([sys.executable, str(script), path, '--open', ...], timeout=45)",
-            "delegate present: workspace/skill-repos/build000r-skills/mmdx/scripts/mmd.py",
+        dry_run_predicate=(
+            "THREE nested predicates, all now read out of the delegate source. "
+            "(1) `if not open_file:` mmdx_open.py:590 returns 'resolved' before the delegate "
+            "is spawned at all — `--no-open` writes nothing anywhere. "
+            "(2) parser install: mmd.py:1211 `if parser_dependencies_ready(): return` short-"
+            "circuits when node_modules/mermaid already exists (mmd.py:48), and mmd.py:1213-1217 "
+            "`if not auto_install: raise RuntimeError` refuses instead of installing; "
+            "mmdx_open.py:449-450 appends `--no-parser-install` unless --allow-parser-install. "
+            "(3) diagram write-back: mmd.py:3015 `if args.tmux_handoff:` is the ONLY call site "
+            "of start_handoff_channel, so WITHOUT `--tmux` no local bridge is ever spawned, the "
+            "encoded state carries neither buildooorHandoff nor buildooorSource "
+            "(mmd.py:3011-3012, 3040-3041), and the viewer opened by xdg-open is the REMOTE app "
+            "at https://buildooor.com/diagrams (mmd.py:30, 708-714) with no local endpoint and "
+            "no local path to write through. Default `manage mmdx <file>` therefore writes NOTHING."
         ),
-        gap=(
-            "BLOCKING: the delegate is an external skill-repo script that launches a browser "
-            "viewer whose write-back handler can rewrite the diagram source after this "
-            "command has already exited, and --allow-parser-install runs `npm install`. "
-            "The post-return write window cannot be bounded without executing the viewer. "
-            "Recorded pessimistically as conditional_mutation."
+        nested_call_policy=(
+            "delegates_external: workspace/skill-repos/build000r-skills/mmdx/scripts/mmd.py via "
+            "subprocess.run(..., timeout=45) which WAITS for the delegate to exit "
+            "(mmdx_open.py:452-458); under `--tmux` the delegate additionally spawns a DETACHED "
+            "grandchild `mmd.py --handoff-server` with start_new_session=True "
+            "(mmd.py:1161-1186) that outlives both processes"
+        ),
+        lease_span=(
+            "whole_command (hard 45s cap, mmdx_open.py:457) — and with `--tmux` a BOUNDED "
+            "detached tail of DEFAULT_HANDOFF_TTL_SECONDS = 10*60 = 600s (mmd.py:54), which "
+            "`manage mmdx` never overrides (mmdx_open.py:439-450 passes no --handoff-ttl). "
+            "The tail is enforced twice: the server loop `while time.time() <= server.expires_at` "
+            "(mmd.py:1081) and a per-request 410 'handoff expired' (mmd.py:931-933). Worst case "
+            "is 600s + one in-flight request (preflight capped at PARSER_PARSE_TIMEOUT_S=45s, "
+            "mmd.py:52). Without `--tmux` the span ends when the command returns — the earlier "
+            "'cannot be bounded without executing the viewer' reading was wrong."
+        ),
+        lock_owner=(
+            UNOWNED + " — mmd.py contains no flock/fcntl/lockf anywhere. With `--tmux` the final "
+            "writer is the detached `mmd.py --handoff-server` process, admitted only by an exact "
+            "Origin match (mmd.py:978-986) plus an exact secrets.token_urlsafe(24) token match "
+            "(mmd.py:939, minted mmd.py:1147 and carried only inside the pako fragment handed to "
+            "the browser), bound to the ONE resolved diagram path (mmd.py:972-976), with a "
+            "512 KiB body cap (mmd.py:55, 958)"
+        ),
+        writes=(
+            "<mmdx skill>/scripts/node_modules — `npm install --silent --no-audit --no-fund` with "
+            "cwd=SCRIPT_DIR (mmd.py:1223-1228, 180s cap), reachable only when the mermaid parser "
+            "is missing AND install is allowed",
+            "the single .mmd/.mmdx source file named on the command line, rewritten in place by "
+            "`source_path.write_text(code, encoding=\"utf-8\")` (mmd.py:923) from POST "
+            "/source/write — only under `--tmux`, only inside the 600s TTL",
+            "NOTHING under any skillbox state root: node_modules lands beside the skill script "
+            "and the write-back targets the operator's own diagram file, which is why "
+            "state_root_source is 'external'",
+        ),
+        evidence=(
+            "cli.py:3259-3271 _handle_mmdx -> mmdx_open.py:649 mmdx_open_payload -> :429 _open_selected_mmdx",
+            "mmdx_open.py:439-450 argv build; :452-458 subprocess.run(capture_output=True, timeout=45) is SYNCHRONOUS",
+            "cli.py:1353-1367 exposes --tmux / --tmux-submit / --allow-parser-install; cli.py:1351-1352 makes --open the default",
+            "GAP RESOLVED BY STATIC READ of the delegate, NOT by execution: "
+            "workspace/skill-repos/build000r-skills/mmdx/scripts/mmd.py (3073 lines)",
+            "mmd.py:1564-1570 `--tmux`/`--tmux-handoff` share dest='tmux_handoff'; mmd.py:3015-3030 is its only consumer",
+            "mmd.py:1135-1201 start_handoff_channel: Popen(--handoff-server, start_new_session=True) at :1161-1186, then wait_for_handoff_server",
+            "mmd.py:1059-1083 run_handoff_server is the detached child's whole life: bind, then loop until expires_at",
+            "mmd.py:771-786 do_POST routes /send, /source/read, /source/preflight, /source/write; "
+            "only /source/write writes, at mmd.py:923",
+            "mmd.py has exactly TWO source_path.write_text call sites; the second, mmd.py:543 "
+            "write_mmdx_short_link_metadata, is UNREACHABLE from this boundary — it is called "
+            "only from publish_link (mmd.py:2307-2459) under `if args.write_short_link_metadata:` "
+            "(mmd.py:2422-2423), a flag on the `publish-link` SUBCOMMAND parser (mmd.py:1311). "
+            "mmdx_open.py:439-450 builds argv with no subcommand, so mmd.py:2913 never routes there.",
+            "mmd.py:1145 resolve_tmux_target raises 'no tmux target found' (mmd.py:1108) outside "
+            "tmux, so `--tmux` cannot start a bridge there — the delegate exits non-zero and "
+            "mmdx_open.py:461-469 raises mmdx_open_failed",
+            "mmd.py:3047-3048 `if args.open: open_generated_url(output)` -> mmd.py:708-714 "
+            "xdg-open on the remote URL; _run_open_command (mmd.py:694-700) writes nothing",
+            "PARSER-FLAG ESCAPE (found while resolving this gap, recorded not fixed): "
+            "start_handoff_channel does NOT forward --no-parser-install to the detached child "
+            "(mmd.py:1161-1181), and both _handle_source_preflight and _handle_source_write call "
+            "preflight_source_code(code, source_path) with the default auto_install=True "
+            "(mmd.py:400-406, 896, 917). So `manage mmdx --tmux` WITHOUT --allow-parser-install "
+            "can still reach `npm install` — in the detached child, up to 600s after the command "
+            "returned. The install branch is live, not dead: node_modules/mermaid is absent here.",
+            "mmd.py has zero flock/fcntl/lockf hits",
         ),
     ),
     _b(
