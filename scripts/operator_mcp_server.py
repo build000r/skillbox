@@ -76,6 +76,29 @@ from lib.redaction import (  # noqa: E402
     redact_value as _redact_diagnostic_value,
 )
 
+# The DCG version pin lives in ONE place: .env-manager/runtime_manager/
+# dcg_distribution.py. This server consumes it instead of re-declaring a
+# version string. The import is guarded so a missing/broken runtime_manager
+# cannot take the whole MCP server down at import time — but it is NOT a
+# fallback: with no pin we cannot prove the binary is compatible, so the DCG
+# adapter treats a failed import as "incompatible" and FAILS CLOSED.
+_ENV_MANAGER_DIR = REPO_ROOT / ".env-manager"
+if _ENV_MANAGER_DIR.is_dir() and str(_ENV_MANAGER_DIR) not in sys.path:
+    sys.path.insert(0, str(_ENV_MANAGER_DIR))
+try:  # pragma: no cover - exercised via DcgAdapterTests monkeypatching
+    from runtime_manager.dcg_distribution import (  # noqa: E402
+        DCG_VERSION as DCG_PINNED_VERSION,
+        normalize_version as _dcg_normalize_version,
+    )
+
+    DCG_PIN_IMPORT_ERROR = ""
+except Exception as _dcg_pin_exc:  # noqa: BLE001 - any import failure fails closed
+    DCG_PINNED_VERSION = ""
+    DCG_PIN_IMPORT_ERROR = f"{type(_dcg_pin_exc).__name__}: {_dcg_pin_exc}"
+
+    def _dcg_normalize_version(text: str) -> str:  # type: ignore[misc]
+        raise RuntimeError(DCG_PIN_IMPORT_ERROR)
+
 DRYRUN_MARKER_TTL_SECONDS = 600  # 10 minutes
 _DRYRUN_MARKER_STATUS_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
 
@@ -233,28 +256,315 @@ def classify_box_exec_command(command: str) -> dict[str, Any]:
     return {"verdict": "read-only", "reason": f"allowlisted: {head}"}
 
 
-def _dcg_verdict(command: str) -> dict[str, Any] | None:
-    """Optionally pipe *command* through `dcg check` and surface its verdict.
+# ---------------------------------------------------------------------------
+# DCG (destructive command guard) adapter — FAIL CLOSED
+#
+# Interface: the supported DCG 0.6.7 robot surface,
+#   dcg test --robot --format json --no-color -- <command>
+# which STATICALLY evaluates <command> against the enabled packs and prints a
+# single JSON object. Exit 0 = allow, 1 = deny, 3/4/5 = config/parse/IO error.
+#
+# SAFETY INVARIANT (this module's whole reason to exist): the command under
+# inspection is passed as ONE argv element to `dcg test`. It is never handed to
+# a shell, never `input`-piped into an interpreter, and `dcg test` itself does
+# not execute it. Nothing on this path can run the payload.
+#
+# Authoritative vs advisory:
+#   * AUTHORITATIVE — every site that is about to actually execute the command
+#     (both `run_ssh` branches in handle_operator_box_exec). A missing binary,
+#     a timeout, malformed JSON, an incompatible version, or an unrecognized
+#     response all resolve to DENY. There is no "no verdict" outcome.
+#   * NON-AUTHORITATIVE — `handle_operator_box_exec` dry_run preview
+#     (DCG_ADVISORY_SITES below). A preview executes nothing, so the verdict is
+#     reported for the operator's benefit and an unavailable guard degrades to
+#     an annotated advisory instead of blocking the preview. The real run that
+#     the preview authorizes is still gated authoritatively.
+# ---------------------------------------------------------------------------
 
-    Best-effort and never a hard dependency: returns None if dcg is not
-    installed or errors. Output is advisory only — the server-side classifier
-    is the real gate.
+DCG_BINARY_NAME = "dcg"
+DCG_BINARY_ENV = "SKILLBOX_DCG_BIN"
+DCG_EVAL_TIMEOUT_SECONDS = 10
+DCG_ROBOT_SCHEMA_VERSION = 1
+DCG_INTERFACE = "dcg test --robot --format json"
+
+# The ONLY call sites permitted to treat a DCG failure as non-blocking. Each is
+# named here and covered by a dedicated non-authoritative test.
+DCG_ADVISORY_SITES = ("operator_box_exec:dry_run_preview",)
+
+# Decision strings understood by this adapter. Anything else is an
+# "unsupported_response" and fails closed.
+_DCG_ALLOW_DECISIONS = frozenset({"allow", "warn"})
+_DCG_DENY_DECISIONS = frozenset({"deny", "block"})
+
+
+def _dcg_binary_path() -> str:
+    """Resolve the pinned DCG binary, or "" when it cannot be found.
+
+    Order: explicit ``SKILLBOX_DCG_BIN`` override, then ``PATH``, then the
+    default install target ``~/.local/bin/dcg`` used by the distribution
+    contract. Returning "" is a fail-closed signal, never a skip.
     """
-    dcg_bin = shutil.which("dcg")
+    override = str(os.environ.get(DCG_BINARY_ENV) or "").strip()
+    if override:
+        return override if Path(override).is_file() else ""
+    found = shutil.which(DCG_BINARY_NAME)
+    if found:
+        return found
+    default_target = Path.home() / ".local" / "bin" / DCG_BINARY_NAME
+    return str(default_target) if default_target.is_file() else ""
+
+
+def _dcg_result(
+    verdict: str,
+    reason_code: str,
+    reason: str,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Build the adapter's stable verdict record.
+
+    ``verdict`` is one of ``allow`` / ``deny`` / ``unavailable``. Callers must
+    never infer "no opinion" from this: :func:`dcg_blocks_execution` maps
+    anything that is not ``allow`` to a block.
+    """
+    record: dict[str, Any] = {
+        "verdict": verdict,
+        "reason_code": reason_code,
+        "reason": reason,
+        "available": verdict in {"allow", "deny"},
+        "fail_closed": verdict == "unavailable",
+        "interface": DCG_INTERFACE,
+        "expected_version": DCG_PINNED_VERSION or "<pin unavailable>",
+    }
+    record.update(extra)
+    return record
+
+
+def dcg_blocks_execution(verdict: dict[str, Any] | None) -> bool:
+    """True unless DCG explicitly allowed the command.
+
+    ``None``, ``unavailable``, and ``deny`` all block. This is the single
+    predicate every authoritative call site uses, so "silently no verdict"
+    is not expressible.
+    """
+    if not isinstance(verdict, dict):
+        return True
+    return verdict.get("verdict") != "allow"
+
+
+def evaluate_command_with_dcg(
+    command: str,
+    *,
+    timeout: int = DCG_EVAL_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Statically evaluate *command* with the pinned DCG binary.
+
+    NEVER executes *command*: it is passed as a single argv element to
+    ``dcg test``, which only pattern-matches it against the enabled packs.
+
+    Always returns a verdict record. Every failure mode — no pin, no binary,
+    spawn failure, timeout, non-JSON output, wrong schema, wrong version,
+    unrecognized decision — returns ``verdict="unavailable"``, which
+    :func:`dcg_blocks_execution` treats as a block.
+    """
+    if not DCG_PINNED_VERSION:
+        return _dcg_result(
+            "unavailable",
+            "pin_unavailable",
+            (
+                "the DCG version pin (.env-manager/runtime_manager/"
+                f"dcg_distribution.py) could not be loaded: {DCG_PIN_IMPORT_ERROR}"
+            ),
+        )
+
+    dcg_bin = _dcg_binary_path()
     if not dcg_bin:
-        return None
-    result = run_checked([dcg_bin, "check", "--stdin"], timeout=10, input_text=command)
-    if result.get("error_code"):
-        return None
-    verdict: dict[str, Any] = {"available": True, "exit_code": result["rc"]}
-    out = str(result.get("stdout") or "").strip()
-    if out:
-        try:
-            verdict["report"] = json.loads(out)
-        except json.JSONDecodeError:
-            verdict["report"] = redact_diagnostic_text(out)
-    verdict["blocked"] = result["rc"] != 0
+        return _dcg_result(
+            "unavailable",
+            "binary_missing",
+            (
+                f"the pinned DCG {DCG_PINNED_VERSION} binary is not installed "
+                f"(looked at ${DCG_BINARY_ENV}, PATH, and ~/.local/bin/dcg)"
+            ),
+        )
+
+    argv = [
+        dcg_bin,
+        "test",
+        "--robot",
+        "--format",
+        "json",
+        "--no-color",
+        "--",
+        command,
+    ]
+    # redact=False so redaction cannot corrupt the JSON we are about to parse;
+    # every string we surface below is redacted explicitly instead.
+    result = run_checked(argv, timeout=timeout, redact=False)
+    error_code = str(result.get("error_code") or "")
+    if error_code == "TIMEOUT":
+        return _dcg_result(
+            "unavailable",
+            "timeout",
+            f"DCG did not answer within {timeout}s",
+            binary=dcg_bin,
+        )
+    if error_code:
+        return _dcg_result(
+            "unavailable",
+            "invocation_failed",
+            (
+                f"could not run the pinned DCG binary ({error_code}): "
+                + redact_diagnostic_text(str(result.get("stderr_redacted") or ""))[:200]
+            ),
+            binary=dcg_bin,
+        )
+
+    raw_stdout = str(result.get("stdout") or "").strip()
+    try:
+        report = json.loads(raw_stdout)
+    except (json.JSONDecodeError, ValueError):
+        return _dcg_result(
+            "unavailable",
+            "malformed_output",
+            (
+                "DCG did not return parseable JSON: "
+                + (redact_diagnostic_text(raw_stdout)[:200] or "<empty stdout>")
+            ),
+            binary=dcg_bin,
+            exit_code=result.get("rc"),
+        )
+    if not isinstance(report, dict):
+        return _dcg_result(
+            "unavailable",
+            "malformed_output",
+            f"DCG returned a JSON {type(report).__name__}, expected an object",
+            binary=dcg_bin,
+            exit_code=result.get("rc"),
+        )
+
+    schema_version = report.get("schema_version")
+    if schema_version != DCG_ROBOT_SCHEMA_VERSION:
+        return _dcg_result(
+            "unavailable",
+            "incompatible_version",
+            (
+                f"DCG robot schema_version {schema_version!r} is not the "
+                f"supported {DCG_ROBOT_SCHEMA_VERSION}"
+            ),
+            binary=dcg_bin,
+            exit_code=result.get("rc"),
+        )
+
+    reported_raw = str(report.get("dcg_version") or "")
+    try:
+        reported_version = _dcg_normalize_version(reported_raw)
+    except Exception as exc:  # noqa: BLE001 - unparseable version fails closed
+        return _dcg_result(
+            "unavailable",
+            "incompatible_version",
+            f"could not read a version out of DCG's response: {exc}",
+            binary=dcg_bin,
+            dcg_version=reported_raw,
+        )
+    if reported_version != DCG_PINNED_VERSION:
+        return _dcg_result(
+            "unavailable",
+            "incompatible_version",
+            (
+                f"DCG reports {reported_version}, but the repo pin is "
+                f"{DCG_PINNED_VERSION}"
+            ),
+            binary=dcg_bin,
+            dcg_version=reported_version,
+        )
+
+    decision = str(report.get("decision") or "").strip().lower()
+    common: dict[str, Any] = {
+        "binary": dcg_bin,
+        "dcg_version": reported_version,
+        "decision": decision,
+        "exit_code": result.get("rc"),
+    }
+    if decision in _DCG_DENY_DECISIONS:
+        return _dcg_result(
+            "deny",
+            "guard_denied",
+            redact_diagnostic_text(str(report.get("reason") or "DCG denied this command")),
+            rule_id=report.get("rule_id") or "",
+            pack_id=report.get("pack_id") or "",
+            severity=report.get("severity") or "",
+            **common,
+        )
+    if decision in _DCG_ALLOW_DECISIONS:
+        return _dcg_result(
+            "allow",
+            "guard_allowed",
+            f"DCG {reported_version} decision={decision}",
+            warned=decision == "warn",
+            **common,
+        )
+    return _dcg_result(
+        "unavailable",
+        "unsupported_response",
+        f"DCG returned an unrecognized decision {decision or '<missing>'!r}",
+        **common,
+    )
+
+
+def dcg_advisory(command: str, *, site: str) -> dict[str, Any]:
+    """Verdict for an explicitly NON-AUTHORITATIVE call site.
+
+    *site* must be one of :data:`DCG_ADVISORY_SITES`. The returned record is
+    identical to the authoritative one plus ``authoritative: False`` and the
+    site name, so an operator reading a preview can see that an unavailable
+    guard did not block *this* step — and will block the real run.
+    """
+    if site not in DCG_ADVISORY_SITES:
+        raise ValueError(f"{site!r} is not a declared non-authoritative DCG site")
+    verdict = evaluate_command_with_dcg(command)
+    verdict["authoritative"] = False
+    verdict["site"] = site
+    verdict["blocks_execution_here"] = False
+    verdict["blocks_real_run"] = dcg_blocks_execution(verdict)
     return verdict
+
+
+def _dcg_denied_error(box_id: str, command: str, verdict: dict[str, Any]) -> dict[str, Any]:
+    """Structured MCP error for an authoritative DCG block. Nothing ran."""
+    fail_closed = bool(verdict.get("fail_closed"))
+    if fail_closed:
+        message = (
+            "operator_box_exec refused to run this command because the "
+            f"destructive command guard could not render a verdict: {verdict['reason']}. "
+            "The guard is authoritative on the execution path, so an unavailable "
+            "guard denies rather than allows."
+        )
+        next_actions = [
+            "python3 .env-manager/manage.py sync --profile core",
+            "python3 -m runtime_manager.dcg_distribution --binary ~/.local/bin/dcg",
+        ]
+    else:
+        message = (
+            "operator_box_exec refused to run this command: the destructive "
+            f"command guard denied it ({verdict.get('rule_id') or 'unknown rule'}). "
+            f"{verdict['reason']}"
+        )
+        next_actions = [
+            "Ask the user to run this command manually if it is genuinely required.",
+            "Re-issue operator_box_exec with a narrower, non-destructive command.",
+        ]
+    return {
+        "error": {
+            "type": "dcg_unavailable" if fail_closed else "dcg_denied",
+            "message": message,
+            "recoverable": fail_closed,
+            "subject": box_id,
+            "command_hash": command_hash(command),
+            "executed": False,
+            "dcg": verdict,
+            "next_actions": next_actions,
+        }
+    }
 
 
 def _validate_identifier(value: str, kind: str) -> str:
@@ -1239,8 +1549,29 @@ def handle_operator_box_exec(params: dict) -> dict:
     marker_key = _box_exec_marker_key(box_id_param, command_param)
     cmd_hash = command_hash(command_param)
 
+    def _dcg_gate(audit_verdict: str) -> dict | None:
+        """AUTHORITATIVE DCG gate. Returns an error payload, or None to proceed.
+
+        Runs immediately before an actual ``run_ssh``. A deny AND every
+        unavailable/malformed/timeout/incompatible outcome block execution;
+        there is no path where a missing verdict lets the command through.
+        """
+        verdict = evaluate_command_with_dcg(command_param)
+        if not dcg_blocks_execution(verdict):
+            return None
+        emit_box_exec_audit(
+            box_id_param,
+            command_param,
+            verdict=audit_verdict,
+            reason=f"dcg {verdict['reason_code']}: {verdict['reason']}",
+        )
+        return _error_content(_dcg_denied_error(box_id_param, command_param, verdict))
+
     # Read-only allowlisted commands run unconditionally — no dry-run friction.
     if classification["verdict"] == "read-only" and not dry_run_param:
+        blocked = _dcg_gate("deny-dcg-readonly")
+        if blocked is not None:
+            return blocked
         emit_box_exec_audit(
             box_id_param,
             command_param,
@@ -1278,9 +1609,10 @@ def handle_operator_box_exec(params: dict) -> dict:
                 "operator_box_exec call WITHOUT dry_run to execute it.",
             ],
         }
-        dcg = _dcg_verdict(command_param)
-        if dcg is not None:
-            payload["dcg"] = dcg
+        # NON-AUTHORITATIVE site (DCG_ADVISORY_SITES[0]): a preview executes
+        # nothing, so an unavailable guard is annotated, not fatal. The real run
+        # this preview authorizes still passes the authoritative gate below.
+        payload["dcg"] = dcg_advisory(command_param, site="operator_box_exec:dry_run_preview")
         return _ok_content(payload)
 
     # Mutating, non-dry-run: require a fresh marker bound to THIS command.
@@ -1318,6 +1650,12 @@ def handle_operator_box_exec(params: dict) -> dict:
                 ],
             }
         })
+
+    # Marker present and valid — but the marker only proves the operator
+    # previewed this exact command. The guard still has to allow it.
+    blocked = _dcg_gate("deny-dcg-marker")
+    if blocked is not None:
+        return blocked
 
     # Marker present and valid — authorize a single real run, then consume it.
     emit_box_exec_audit(
