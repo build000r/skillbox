@@ -1229,6 +1229,15 @@ require_real_owned_dir() {
     return 1
   fi
 }
+require_not_shared_writable() {
+  candidate="$1"
+  candidate_mode=$(stat -c '%a' "$candidate" 2>/dev/null || stat -f '%Lp' "$candidate")
+  case "$candidate_mode" in ''|*[!0-7]*) return 1 ;; esac
+  if [ $((8#$candidate_mode & 0022)) -ne 0 ]; then
+    echo "skillbox clipboard bootstrap: shared-writable lifecycle entry" >&2
+    return 1
+  fi
+}
 validate_managed_parents() {
   require_real_owned_dir "$HOME"
   require_real_owned_dir "$HOME/.local"
@@ -1274,19 +1283,24 @@ validate_version_file() {
 }
 normalize_snapshot() {
   snapshot_dir="$1"
+  files_dir="$snapshot_dir/files"
+  require_real_owned_dir "$snapshot_dir"
+  require_real_owned_dir "$files_dir"
+  require_not_shared_writable "$snapshot_dir"
+  require_not_shared_writable "$files_dir"
   records="$snapshot_dir/records.tsv"
   if [ ! -f "$records" ] || [ -L "$records" ] || [ ! -O "$records" ]; then
     echo "skillbox clipboard bootstrap: unsafe lifecycle records" >&2
     return 1
   fi
-  records_mode=$(stat -c '%a' "$records" 2>/dev/null || stat -f '%Lp' "$records")
   records_links=$(stat -c '%h' "$records" 2>/dev/null || stat -f '%l' "$records")
-  if [ "$records_mode" != "600" ] || [ "$records_links" != "1" ]; then
+  if [ "$records_links" != "1" ]; then
     echo "skillbox clipboard bootstrap: lifecycle records are not private" >&2
     return 1
   fi
-  normalized=$(mktemp "$snapshot_dir/.records.normalized.XXXXXX") || return 1
-  chmod 0600 "$normalized"
+  require_not_shared_writable "$records"
+  normalized_lines=()
+  expected_backup_ids=""
   line_number=0
   while IFS=$'\t' read -r snapshot_id existed mode path digest extra; do
     line_number=$((line_number + 1))
@@ -1313,25 +1327,65 @@ normalize_snapshot() {
         fi
         backup_mode=$(stat -c '%a' "$backup" 2>/dev/null || stat -f '%Lp' "$backup")
         backup_links=$(stat -c '%h' "$backup" 2>/dev/null || stat -f '%l' "$backup")
-        [ "$backup_mode" = "600" ] || return 1
         [ "$backup_links" = "1" ] || return 1
+        require_not_shared_writable "$backup"
         observed=$(hash_file "$backup")
         if [ -n "$digest" ] && [ "$digest" != "-" ] && [ "$digest" != "$observed" ]; then
           echo "skillbox clipboard bootstrap: lifecycle backup digest mismatch" >&2
           return 1
         fi
         digest="$observed"
+        expected_backup_ids="$expected_backup_ids $snapshot_id"
         ;;
       *) return 1 ;;
     esac
-    printf '%s\t%s\t%s\t%s\t%s\n' "$snapshot_id" "$existed" "$mode" "$wanted_path" "$digest" >>"$normalized"
+    normalized_lines[${#normalized_lines[@]}]=$(printf '%s\t%s\t%s\t%s\t%s' \
+      "$snapshot_id" "$existed" "$mode" "$wanted_path" "$digest")
   done <"$records"
   if [ "$line_number" -ne 8 ]; then
     echo "skillbox clipboard bootstrap: incomplete lifecycle record set" >&2
     return 1
   fi
+  shopt -s nullglob dotglob
+  backups=("$files_dir"/*)
+  shopt -u nullglob dotglob
+  for backup in "${backups[@]}"; do
+    backup_id=${backup##*/}
+    case "$backup_id" in
+      clipcopy|clippaste|pbcopy|receiver|pyinit|transfer|tmux_fragment|tmux_conf) ;;
+      *)
+        echo "skillbox clipboard bootstrap: unknown lifecycle backup" >&2
+        return 1
+        ;;
+    esac
+    if [ ! -f "$backup" ] || [ -L "$backup" ] || [ ! -O "$backup" ]; then
+      echo "skillbox clipboard bootstrap: unsafe lifecycle backup" >&2
+      return 1
+    fi
+    backup_links=$(stat -c '%h' "$backup" 2>/dev/null || stat -f '%l' "$backup")
+    if [ "$backup_links" != "1" ]; then
+      echo "skillbox clipboard bootstrap: lifecycle backup is not private" >&2
+      return 1
+    fi
+    case " $expected_backup_ids " in
+      *" $backup_id "*) ;;
+      *)
+        echo "skillbox clipboard bootstrap: unexpected lifecycle backup" >&2
+        return 1
+        ;;
+    esac
+  done
+  normalized=$(mktemp "$snapshot_dir/.records.normalized.XXXXXX") || return 1
+  trap 'rm -f "$normalized"' RETURN
+  chmod 0600 "$normalized"
+  printf '%s\n' "${normalized_lines[@]}" >"$normalized"
+  chmod 0700 "$snapshot_dir" "$files_dir"
+  for backup in "${backups[@]}"; do
+    chmod 0600 "$backup"
+  done
   mv "$normalized" "$records"
   chmod 0600 "$records"
+  trap - RETURN
 }
 '''
 
