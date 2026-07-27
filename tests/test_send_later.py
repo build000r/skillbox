@@ -213,6 +213,50 @@ class SendLaterTests(unittest.TestCase):
         self._run("fire", "gate2", live="b:0.0", capture=busy)
         self.assertFalse(self.sendlog.exists() and "x" in self.sendlog.read_text())
 
+    def test_when_waiting_gate_recognizes_stable_codex_composer(self) -> None:
+        idle = (
+            "completed response\n\n"
+            "› Improve documentation in @filename\n\n"
+            "  gpt-5.6-sol medium · /srv/repo\n"
+        )
+        self._run("schedule", "--target", "codex:0.0", "--key", "follow-up",
+                 "--id", "codex-idle", "--when-waiting", "--recurring", "--force")
+        self._run("fire", "codex-idle", live="codex:0.0", capture=idle)
+        self.assertFalse(self.sendlog.exists())
+        self._run("fire", "codex-idle", live="codex:0.0", capture=idle)
+        self.assertIn("follow-up", self.sendlog.read_text())
+
+    def test_when_waiting_gate_blocks_busy_codex_with_idle_composer_visible(self) -> None:
+        busy = (
+            "• Working (13s • esc to interrupt) · 3 background terminals running\n\n"
+            "› Improve documentation in @filename\n\n"
+            "  gpt-5.6-sol medium · /srv/repo\n"
+        )
+        self._run("schedule", "--target", "codex:0.0", "--key", "must-not-send",
+                 "--id", "codex-busy", "--when-waiting", "--recurring", "--force")
+        self._run("fire", "codex-busy", live="codex:0.0", capture=busy)
+        self._run("fire", "codex-busy", live="codex:0.0", capture=busy)
+        self.assertFalse(
+            self.sendlog.exists() and "must-not-send" in self.sendlog.read_text()
+        )
+
+    def test_when_waiting_gate_ignores_historical_markers_outside_footer(self) -> None:
+        idle_with_history = "\n".join(
+            [
+                "› an old prompt retained in scrollback",
+                "old output said esc to interrupt",
+                *[f"settled output line {index}" for index in range(14)],
+                "› Improve documentation in @filename",
+                "",
+                "  gpt-5.6-sol medium · /srv/repo",
+            ]
+        )
+        self._run("schedule", "--target", "codex:0.0", "--key", "footer-only",
+                 "--id", "codex-history", "--when-waiting", "--recurring", "--force")
+        self._run("fire", "codex-history", live="codex:0.0", capture=idle_with_history)
+        self._run("fire", "codex-history", live="codex:0.0", capture=idle_with_history)
+        self.assertIn("footer-only", self.sendlog.read_text())
+
     def test_max_fires_stops_recurring_job(self) -> None:
         self._run("schedule", "--target", "m:0.0", "--key", "nudge",
                  "--id", "mx", "--recurring", "--max-fires", "2", "--force")
