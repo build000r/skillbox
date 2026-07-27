@@ -44,8 +44,10 @@ TICK_STALE_S="${SBP_SEND_LATER_TICK_STALE_S:-180}"
 # captured tail is STABLE across ticks (not streaming), matches an idle footer,
 # and does NOT match a busy/working indicator. Tunable per-job via --idle-regex
 # / --busy-regex, or globally via the env vars below.
-DEFAULT_IDLE_RE="${SBP_SEND_LATER_IDLE_RE:-Shift\\+Tab:mode|Ctrl\\+\\.:shortcuts|Grok Composer|\\? for shortcuts}"
+DEFAULT_IDLE_RE="${SBP_SEND_LATER_IDLE_RE:-Shift\\+Tab:mode|Ctrl\\+\\.:shortcuts|Grok Composer|\\? for shortcuts|^[[:space:]]*›([[:space:]]|$)}"
 DEFAULT_BUSY_RE="${SBP_SEND_LATER_BUSY_RE:-esc to interrupt|Esc to interrupt|esc to cancel|ctrl-c to interrupt|Ctrl\\+c:cancel|Ctrl\\+Enter:interject|Waiting…|Thinking…|Generating…|tokens/s|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏}"
+GATE_FOOTER_LINES="${SBP_SEND_LATER_GATE_FOOTER_LINES:-12}"
+[[ "$GATE_FOOTER_LINES" =~ ^[1-9][0-9]*$ ]] || GATE_FOOTER_LINES=12
 CAPTURE_LINES="${SBP_SEND_LATER_CAPTURE_LINES:-40}"
 
 usage() {
@@ -631,13 +633,18 @@ capture_norm() {
 #   unknown  -> stable but no recognizable footer (do not send)
 state_of_capture() {
   local cur="$1" prev="$2" idle_re="$3" busy_re="$4"
-  if printf '%s\n' "$cur" | grep -Eq -- "$busy_re" 2>/dev/null; then
+  local footer
+  # Interactive UIs retain old prompts and spinner text in their scrollback.
+  # Classify only the current footer so transcript history cannot make an idle
+  # pane look busy (or make an unknown pane look idle).
+  footer="$(printf '%s\n' "$cur" | tail -n "$GATE_FOOTER_LINES")"
+  if printf '%s\n' "$footer" | grep -Eq -- "$busy_re" 2>/dev/null; then
     printf 'running'; return 0
   fi
   if [[ "$cur" != "$prev" ]]; then
     printf 'running'; return 0
   fi
-  if printf '%s\n' "$cur" | grep -Eq -- "$idle_re" 2>/dev/null; then
+  if printf '%s\n' "$footer" | grep -Eq -- "$idle_re" 2>/dev/null; then
     printf 'waiting'; return 0
   fi
   printf 'unknown'
