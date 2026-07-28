@@ -7,7 +7,7 @@
 Generated from command registry ABI `2026-06-11+agent_ops_brain`.
 Do not edit by hand; run `python3 .env-manager/manage.py registry-docs --write`.
 
-Registry entries: 44.
+Registry entries: 46.
 
 ## Tier 1
 
@@ -1161,6 +1161,100 @@ python3 .env-manager/manage.py skill on wiki --cwd "$PWD" --verify --format json
 
 ```bash
 python3 -m unittest tests.test_skill_overrides
+```
+
+**Graph Nodes**: `skill`, `repo`, `command`
+
+#### runtime.skill_pull
+
+Read one admitted host skill as a verified current-session packet without mutation.
+
+- Surfaces: `cli`
+- Scopes: `cwd`
+- Side effect: `none`
+- Risk: `low`
+- Entrypoint: `manage.py`
+- Owner binary: `sbp`
+- MCP mirror: None
+
+**Inputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `cwd` | `string?` | no |
+| `format` | `enum[json]?` | no |
+| `skill_name` | `string` | yes |
+
+**Outputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `entry_sha256` | `string` | yes |
+| `entry_text` | `string` | yes |
+| `instructions` | `string` | yes |
+| `lifecycle` | `string` | yes |
+| `name` | `string` | yes |
+| `ok` | `boolean` | yes |
+| `receipt_sha256` | `string` | yes |
+| `schema_version` | `string` | yes |
+| `source_classification` | `string` | yes |
+| `tree_sha256` | `string` | yes |
+
+**Examples**
+
+```bash
+python3 .env-manager/manage.py skill pull sbp --cwd "$PWD" --format json
+```
+
+**Validation**
+
+```bash
+python3 -m unittest tests.test_skill_pull
+```
+
+**Graph Nodes**: `skill`, `repo`, `command`
+
+#### runtime.skill_resolve
+
+Resolve the admitted host skill catalog with canonical policy and content identities.
+
+- Surfaces: `cli`
+- Scopes: `cwd`
+- Side effect: `none`
+- Risk: `low`
+- Entrypoint: `manage.py`
+- Owner binary: `sbp`
+- MCP mirror: None
+
+**Inputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `cwd` | `string?` | no |
+| `format` | `enum[json]?` | no |
+
+**Outputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `policy` | `object` | yes |
+| `receipt_sha256` | `string` | yes |
+| `repository` | `object` | yes |
+| `schema_version` | `string` | yes |
+| `selected_names` | `string[]` | yes |
+| `skills` | `object[]` | yes |
+| `totals` | `object` | yes |
+
+**Examples**
+
+```bash
+python3 .env-manager/manage.py skill resolve --cwd "$PWD" --format json
+```
+
+**Validation**
+
+```bash
+python3 -m unittest tests.test_skill_pull
 ```
 
 **Graph Nodes**: `skill`, `repo`, `command`
