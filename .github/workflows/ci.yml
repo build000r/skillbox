@@ -1,10 +1,17 @@
 name: CI
 
+# Trust boundary (skillbox-6r53):
+#   * pull_request      - untrusted contributions still get the full hosted matrix
+#   * workflow_dispatch - manual recovery when the local gate is unavailable
+#   * push              - deliberately absent. Trusted-main commits are gated by
+#                         the canonical local gate (scripts/self-test.sh), which
+#                         runs these same lanes against an isolated exact-SHA
+#                         checkout and is enforced by .githooks/pre-push.
+# The pinned versions below are the single hosted copy of the tool matrix and
+# are contract-tested for equality with scripts/self-test.sh.
 on:
-  push:
-    branches:
-      - main
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -57,7 +64,9 @@ jobs:
         run: python -m pip install --disable-pip-version-check "shellcheck-py==${SHELLCHECK_PY_VERSION}"
 
       - name: Run ShellCheck
-        run: shellcheck --severity=warning scripts/*.sh install.sh
+        # .githooks/* is included because the pre-push hook is now a gate, not a
+        # convenience: it must be linted wherever the shell lint runs.
+        run: shellcheck --severity=warning scripts/*.sh install.sh .githooks/pre-commit .githooks/pre-push
 
   render:
     runs-on: ubuntu-latest
