@@ -182,6 +182,9 @@ Skills:
   __WRAPPER__ skills audit            Scan downstream repos for skill policy drift
   __WRAPPER__ skill plan NAME         Preview where NAME would be linked
   __WRAPPER__ skill add NAME          Link NAME into global/project/category roots
+  __WRAPPER__ skill resolve           Resolve admitted host skills without mutation
+  __WRAPPER__ skill pull NAME         Read one admitted skill now without linking or activation
+  __WRAPPER__ skill activate NAME     Link NAME and return a session packet (mutates links)
   __WRAPPER__ skill why NAME          Explain visibility layers and exact fixes
   __WRAPPER__ skill togglable         List cwd-flippable skills and exact flip commands
   __WRAPPER__ skill what-if --repo R  Simulate overlay/pin visibility with zero writes
@@ -291,6 +294,16 @@ skill_verbs = {
         "survives_recalibrate": False,
         "when_to_use": "Use for an immediate one-session handoff when durability is not required.",
         "do_NOT": "Do not treat activate as durable repo state; use on or heal for that.",
+    },
+    "pull": {
+        "purpose": "Read one admitted skill as a verified current-session packet.",
+        "mutates": "none",
+        "links_disk": False,
+        "returns_packet": True,
+        "scope": "current cwd host policy",
+        "survives_recalibrate": False,
+        "when_to_use": "Use when the skill is needed now but durable visibility is not wanted.",
+        "do_NOT": "Do not treat pull as activation, linking, or a durable policy decision.",
     },
     "move": {
         "purpose": "Install/link a skill into a new scope and remove old installs for that skill.",
@@ -425,6 +438,7 @@ skill_verbs = {
 }
 payload = {
     "ok": True,
+    "mode": "host",
     "tool": f"skillbox-{wrapper}",
     "contract_version": "2026-05-11",
     "entrypoint": f"scripts/{wrapper}",
@@ -443,6 +457,7 @@ payload = {
         {"name": "bulk", "json": True, "safe_first_try": f"{wrapper} bulk <dir> <dir> --request '<prompt>' --dry-run --json", "alias_for": "launch"},
         {"name": "skills", "json": True, "safe_first_try": f"{wrapper} skills --issues-only --json"},
         {"name": "skill-why", "json": True, "safe_first_try": f"{wrapper} skill why <skill> --json"},
+        {"name": "skill-pull", "json": True, "safe_first_try": f"{wrapper} skill pull <skill> --format json"},
         {"name": "skill-togglable", "json": True, "safe_first_try": f"{wrapper} skill togglable --json"},
         {"name": "skill-what-if", "json": True, "safe_first_try": f"{wrapper} skill what-if --repo <repo-id-or-path> --overlay <overlay> --json"},
         {"name": "skill-heal", "json": True, "safe_first_try": f"{wrapper} skill heal <skill> --dry-run --format json"},
@@ -528,7 +543,8 @@ Safe mutation pattern:
 
 Skill verb contract:
   Machine map: ${wrapper_name} capabilities --json | jq .skill_verbs
-  Read-only: recalibrate, plan, lint, why
+  Read-only: recalibrate, plan, lint, why, resolve, pull
+  Current-session read: pull (mutates=none, links_disk=false, returns_packet=true)
   Session handoff: activate (mutates=cwd-ephemeral, returns_packet=true)
   Durable repo pins: on, off, heal (survive recalibrate)
   Durable defaults: default on/off <skill> --repo|--repos IDS|--category NAME|--global (diff first; --global needs --yes)
@@ -1602,7 +1618,34 @@ else:
     fi
     skill_action="${passthrough_args[0]}"
     skill_args=("${passthrough_args[@]:1}")
-    python3 .env-manager/manage.py skill "${skill_action}" "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${skill_args[@]}"
+    if [[ "${skill_action}" == "resolve" || "${skill_action}" == "pull" ]]; then
+      skill_route_cwd="${invoke_cwd}"
+      normalized_skill_args=()
+      index=0
+      while [[ ${index} -lt ${#skill_args[@]} ]]; do
+        token="${skill_args[$index]}"
+        case "${token}" in
+          --cwd)
+            index=$((index + 1))
+            if [[ ${index} -ge ${#skill_args[@]} ]]; then
+              echo "${wrapper_name} skill ${skill_action}: --cwd requires a path" >&2
+              exit 2
+            fi
+            skill_route_cwd="${skill_args[$index]}"
+            ;;
+          --cwd=*)
+            skill_route_cwd="${token#--cwd=}"
+            ;;
+          *)
+            normalized_skill_args+=("${token}")
+            ;;
+        esac
+        index=$((index + 1))
+      done
+      python3 .env-manager/manage.py skill "${skill_action}" --cwd "${skill_route_cwd}" "${normalized_skill_args[@]}"
+    else
+      python3 .env-manager/manage.py skill "${skill_action}" "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${skill_args[@]}"
+    fi
     ;;
   overlay)
     overlay_action="${passthrough_args[0]:-list}"
