@@ -62,6 +62,7 @@ from .evidence import *
 from .forge import *
 from .swimmers_launch import launch_swimmers_batch, swimmers_launch_text_lines
 from .structure_doctor import run_structure_doctor, structure_doctor_text_lines
+from .skill_pull import SkillPullError, pull_host_skill, resolve_host_skills
 from .command_registry import registry_payload
 from .registry_docs import registry_docs_payload
 from .port_registry import port_registry_payload, port_registry_text_lines
@@ -1659,6 +1660,21 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_profile_arg(skill_why_parser)
     _add_client_arg(skill_why_parser)
     _add_cwd_arg(skill_why_parser)
+
+    skill_resolve_parser = skill_subparsers.add_parser(
+        "resolve",
+        help="Resolve the current host skill catalog without changing visibility or links.",
+    )
+    skill_resolve_parser.add_argument("--format", choices=("json",), default="json")
+    _add_cwd_arg(skill_resolve_parser)
+
+    skill_pull_parser = skill_subparsers.add_parser(
+        "pull",
+        help="Read one admitted skill as a verified current-session packet without mutation.",
+    )
+    skill_pull_parser.add_argument("skill_name")
+    skill_pull_parser.add_argument("--format", choices=("json",), default="json")
+    _add_cwd_arg(skill_pull_parser)
 
     skill_togglable_parser = skill_subparsers.add_parser(
         "togglable",
@@ -6302,6 +6318,25 @@ def _handle_skill_heal(
 
 def _handle_skill(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
     skill_action = str(args.skill_action)
+    if skill_action in {"resolve", "pull"}:
+        try:
+            if skill_action == "resolve":
+                payload = resolve_host_skills(
+                    model,
+                    cwd=getattr(args, "cwd", None) or os.getcwd(),
+                )
+            else:
+                payload = pull_host_skill(
+                    model,
+                    str(args.skill_name),
+                    cwd=getattr(args, "cwd", None) or os.getcwd(),
+                )
+        except SkillPullError as exc:
+            emit_json(exc.envelope())
+            return EXIT_ERROR
+        emit_json(payload)
+        return EXIT_OK
+
     if skill_action == "lint":
         payload = repo_skill_override_lint_payload(model, cwd=args.cwd)
         if args.format == "json":
@@ -7724,6 +7759,11 @@ def _filtered_model_for_args(args: argparse.Namespace, root_dir: Path) -> dict[s
     # model_ms truthful without a second build.
     with current_invocation().phase(PHASE_MODEL):
         model = build_runtime_model(root_dir)
+        # Catalog resolution must retain every declared candidate so inactive or
+        # broken source rows can be represented as omitted SkillDecisions.
+        # Explicit pull remains profile/client filtered below.
+        if args.command == "skill" and getattr(args, "skill_action", None) == "resolve":
+            return model
         active_profiles = normalize_active_profiles(getattr(args, "profile", []))
         return filter_model(model, active_profiles, _active_clients_for_args(args, model))
 
