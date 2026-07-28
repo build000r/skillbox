@@ -1049,6 +1049,145 @@ class ClipboardBootstrapTests(unittest.TestCase):
             self.assertEqual(restored.returncode, 0, msg=restored.stderr)
             self.assertEqual(helper.read_bytes(), b"legacy helper\n")
 
+    def test_remote_install_migrates_owned_legacy_lifecycle_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            helper = home / ".local" / "bin" / "clipcopy"
+            helper.parent.mkdir(parents=True)
+            helper.write_bytes(b"legacy helper\n")
+            helper.chmod(0o755)
+            first = CB.run_remote_install(home, root=ROOT_DIR)
+            self.assertEqual(first.returncode, 0, msg=first.stderr)
+            baseline = home / CB.STATE_SUBDIR / "baseline"
+            files = baseline / "files"
+            self.assertTrue(any(files.iterdir()))
+            baseline.chmod(0o755)
+            files.chmod(0o755)
+            for index, path in enumerate(
+                (baseline / "records.tsv", *files.iterdir())
+            ):
+                path.chmod(0o755 if index % 2 else 0o644)
+
+            migrated = CB.run_remote_install(home, root=ROOT_DIR)
+
+            self.assertEqual(migrated.returncode, 0, msg=migrated.stderr)
+            self.assertEqual(baseline.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(files.stat().st_mode & 0o777, 0o700)
+            for path in (baseline / "records.tsv", *files.iterdir()):
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_remote_install_refuses_hardlinked_legacy_lifecycle_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            first = CB.run_remote_install(home, root=ROOT_DIR)
+            self.assertEqual(first.returncode, 0, msg=first.stderr)
+            records = home / CB.STATE_SUBDIR / "baseline" / "records.tsv"
+            records.chmod(0o644)
+            outside = Path(tmpdir) / "shared-records"
+            os.link(records, outside)
+            helper = home / ".local" / "bin" / "clipcopy"
+            installed = helper.read_bytes()
+
+            refused = CB.run_remote_install(home, root=ROOT_DIR)
+
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("records are not private", refused.stderr)
+            self.assertEqual(records.stat().st_mode & 0o777, 0o644)
+            self.assertEqual(outside.stat().st_mode & 0o777, 0o644)
+            self.assertEqual(helper.read_bytes(), installed)
+
+    def test_remote_install_validates_all_entries_before_mode_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            first = CB.run_remote_install(home, root=ROOT_DIR)
+            self.assertEqual(first.returncode, 0, msg=first.stderr)
+            baseline = home / CB.STATE_SUBDIR / "baseline"
+            files = baseline / "files"
+            records = baseline / "records.tsv"
+            baseline.chmod(0o755)
+            files.chmod(0o755)
+            records.chmod(0o644)
+            hidden = files / ".unexpected"
+            hidden.write_bytes(b"outside schema\n")
+            hidden.chmod(0o644)
+            tree_before = sorted(
+                str(path.relative_to(baseline)) for path in baseline.rglob("*")
+            )
+
+            refused = CB.run_remote_install(home, root=ROOT_DIR)
+
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("unknown lifecycle backup", refused.stderr)
+            self.assertEqual(
+                sorted(
+                    str(path.relative_to(baseline))
+                    for path in baseline.rglob("*")
+                ),
+                tree_before,
+            )
+            self.assertEqual(baseline.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(files.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(records.stat().st_mode & 0o777, 0o644)
+            self.assertEqual(hidden.stat().st_mode & 0o777, 0o644)
+
+    def test_remote_install_refuses_backup_for_absent_lifecycle_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            first = CB.run_remote_install(home, root=ROOT_DIR)
+            self.assertEqual(first.returncode, 0, msg=first.stderr)
+            baseline = home / CB.STATE_SUBDIR / "baseline"
+            files = baseline / "files"
+            stale = files / "clipcopy"
+            stale.write_bytes(b"stale backup\n")
+            stale.chmod(0o644)
+
+            refused = CB.run_remote_install(home, root=ROOT_DIR)
+
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("unexpected lifecycle backup", refused.stderr)
+            self.assertEqual(stale.stat().st_mode & 0o777, 0o644)
+
+    def test_remote_install_refuses_shared_writable_lifecycle_entries(self) -> None:
+        for target_name in ("baseline", "files", "records", "backup"):
+            with self.subTest(target_name=target_name), tempfile.TemporaryDirectory() as tmpdir:
+                home = Path(tmpdir) / "home"
+                helper = home / ".local" / "bin" / "clipcopy"
+                helper.parent.mkdir(parents=True)
+                helper.write_bytes(b"legacy helper\n")
+                first = CB.run_remote_install(home, root=ROOT_DIR)
+                self.assertEqual(first.returncode, 0, msg=first.stderr)
+                baseline = home / CB.STATE_SUBDIR / "baseline"
+                files = baseline / "files"
+                records = baseline / "records.tsv"
+                backup = files / "clipcopy"
+                targets = {
+                    "baseline": (baseline, 0o777),
+                    "files": (files, 0o777),
+                    "records": (records, 0o666),
+                    "backup": (backup, 0o666),
+                }
+                target, unsafe_mode = targets[target_name]
+                target.chmod(unsafe_mode)
+                installed = helper.read_bytes()
+                tree_before = sorted(
+                    str(path.relative_to(baseline))
+                    for path in baseline.rglob("*")
+                )
+
+                refused = CB.run_remote_install(home, root=ROOT_DIR)
+
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertIn("shared-writable lifecycle entry", refused.stderr)
+                self.assertEqual(target.stat().st_mode & 0o777, unsafe_mode)
+                self.assertEqual(helper.read_bytes(), installed)
+                self.assertEqual(
+                    sorted(
+                        str(path.relative_to(baseline))
+                        for path in baseline.rglob("*")
+                    ),
+                    tree_before,
+                )
+
     def test_remote_install_refuses_symlinked_lifecycle_parent(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir) / "home"
