@@ -37,7 +37,8 @@ Main entry points:
 - Box lifecycle: `make box-up BOX=<id>`, `make box-down BOX=<id>`, `make box-status`, `make box-list`, `make box-ssh BOX=<id>`
 - Release/upgrade scripts: `install.sh`, `scripts/06-upgrade-release.sh`, `scripts/07-build-and-push-binary.sh`; verify arguments before use.
 - Clipboard bootstrap (explicit manual step; not run by `install.sh`/`box.py`): `scripts/clipboard-bootstrap --profile local|d3|sweet|jeremy|conference1 [--dry-run|--apply-remote]` — remote profiles print a plan by default and only write with `--apply-remote`. Canonical flow: "New-host clipboard adoption" in `docs/operations.md`; bundle in `scripts/clipboard/`; closeout `scripts/clipboard-closeout.sh`; design `docs/clipboard-bootstrap.md`.
-- CI: `.github/workflows/ci.yml` runs Ruff, ShellCheck, compose config validation, `python3 scripts/04-reconcile.py render`, and the Python unittest matrix on push/PR.
+- Canonical local CI gate: `make self-test` (or `./scripts/self-test.sh --rev <rev>`) runs Ruff, ShellCheck, compose config validation, `scripts/04-reconcile.py render`, and the pinned 3.11/3.12/3.13 unittest matrix with 3.12 coverage against an isolated checkout of an exact SHA, then writes a receipt under `.skillbox-state/self-test/receipts/`. `.githooks/pre-push` runs it and blocks the push on failure (`make install-hooks`).
+- CI: `.github/workflows/ci.yml` runs the same lanes for `pull_request` and `workflow_dispatch` only — trusted-main pushes are gated locally, not on Actions. `.github/workflows/release.yml` is unchanged (`v*` tags + manual, OIDC keyless signing). See "Local CI gate" in `docs/operations.md`.
 - Python lint: `python3 -m ruff check .`
 - Shell lint: `shellcheck --severity=warning scripts/*.sh install.sh`
 
