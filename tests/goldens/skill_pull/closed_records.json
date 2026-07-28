@@ -1,0 +1,256 @@
+{
+  "error_envelopes": [
+    {
+      "error_code": "SBP_ENVIRONMENT_UNSUPPORTED",
+      "message": "fixture",
+      "ok": false,
+      "retryable": false,
+      "schema_version": "skill-error/v1"
+    },
+    {
+      "error_code": "SKILL_REQUEST_INVALID",
+      "message": "fixture",
+      "ok": false,
+      "retryable": false,
+      "schema_version": "skill-error/v1"
+    },
+    {
+      "error_code": "SKILL_NOT_ADMITTED",
+      "message": "fixture",
+      "ok": false,
+      "retryable": false,
+      "schema_version": "skill-error/v1"
+    },
+    {
+      "error_code": "SKILL_SOURCE_MISSING",
+      "message": "fixture",
+      "ok": false,
+      "retryable": false,
+      "schema_version": "skill-error/v1"
+    },
+    {
+      "error_code": "SKILL_ENTRY_INVALID_UTF8",
+      "message": "fixture",
+      "ok": false,
+      "retryable": false,
+      "schema_version": "skill-error/v1"
+    },
+    {
+      "error_code": "SKILL_TREE_DRIFT",
+      "message": "fixture",
+      "ok": false,
+      "retryable": true,
+      "schema_version": "skill-error/v1"
+    },
+    {
+      "error_code": "SKILL_LIFECYCLE_RETIRED",
+      "message": "fixture",
+      "ok": false,
+      "retryable": false,
+      "schema_version": "skill-error/v1"
+    },
+    {
+      "error_code": "SKILL_RUNTIME_REQUIREMENT_MISSING",
+      "message": "fixture",
+      "ok": false,
+      "retryable": false,
+      "schema_version": "skill-error/v1"
+    },
+    {
+      "error_code": "SKILL_COMPOSITION_CONFLICT",
+      "message": "fixture",
+      "ok": false,
+      "retryable": false,
+      "schema_version": "skill-error/v1"
+    },
+    {
+      "error_code": "SKILL_CONTEXT_BUDGET_EXCEEDED",
+      "message": "fixture",
+      "ok": false,
+      "retryable": false,
+      "schema_version": "skill-error/v1"
+    },
+    {
+      "error_code": "PERFORMANCE_FIXTURE_INVALID",
+      "message": "fixture",
+      "ok": false,
+      "retryable": false,
+      "schema_version": "skill-error/v1"
+    }
+  ],
+  "nested_records": {
+    "admitted_skill_decision": {
+      "admission": "admitted",
+      "entry_bytes": 24,
+      "entry_sha256": "7c9ea2522491027ddb386c1bab212f4fab4e1e66fadf81ef3b599c25722e9262",
+      "estimated_entry_tokens": 6,
+      "lifecycle": "active",
+      "logical_source_id": "host-fixture",
+      "name": "sbp",
+      "reason_code": "DISPATCHER_FLOOR",
+      "source_repo_sha": null,
+      "tree_sha256": "e91454b6c535b0552015121fea58c74b57da1e7c9efd27c8057fc80b5f80904a"
+    },
+    "omitted_skill_decision": {
+      "admission": "omitted",
+      "entry_bytes": null,
+      "entry_sha256": null,
+      "estimated_entry_tokens": null,
+      "lifecycle": "active",
+      "logical_source_id": null,
+      "name": "omitted-skill",
+      "reason_code": "DEFAULT_OFF",
+      "source_repo_sha": null,
+      "tree_sha256": null
+    },
+    "policy_identity": {
+      "dirty": false,
+      "dispatcher_floor": [
+        "sbp",
+        "smart"
+      ],
+      "policy_epoch": 7,
+      "policy_sha256": "<policy-sha256>",
+      "repo_override_sha256": null,
+      "sources": [
+        {
+          "logical_source_id": "dispatcher-floor",
+          "present": true,
+          "sha256": "<dispatcher-floor-sha256>"
+        },
+        {
+          "logical_source_id": "global-scope",
+          "present": true,
+          "sha256": "<global-scope-sha256>"
+        },
+        {
+          "logical_source_id": "repo-override",
+          "present": false,
+          "sha256": null
+        }
+      ]
+    },
+    "policy_source_digests": [
+      {
+        "logical_source_id": "dispatcher-floor",
+        "present": true,
+        "sha256": "<dispatcher-floor-sha256>"
+      },
+      {
+        "logical_source_id": "global-scope",
+        "present": true,
+        "sha256": "<global-scope-sha256>"
+      },
+      {
+        "logical_source_id": "repo-override",
+        "present": false,
+        "sha256": null
+      }
+    ],
+    "repository_identity": {
+      "base_sha": "1111111111111111111111111111111111111111",
+      "cwd_relative": ".",
+      "repository_id": "fixture-host"
+    },
+    "resolution_totals": {
+      "admitted_count": 1,
+      "admitted_entry_bytes": 24,
+      "candidate_count": 1,
+      "estimated_entry_tokens": 6,
+      "omitted_count": 0
+    }
+  },
+  "pull": {
+    "entry_sha256": "7c9ea2522491027ddb386c1bab212f4fab4e1e66fadf81ef3b599c25722e9262",
+    "entry_text": "# sbp\n\nUse live policy.\n",
+    "instructions": "use this content immediately in the current session",
+    "lifecycle": "active",
+    "name": "sbp",
+    "ok": true,
+    "receipt_sha256": "<receipt-sha256>",
+    "schema_version": "skill-pull-result/v1",
+    "source_classification": "host-canonical",
+    "tree_sha256": "e91454b6c535b0552015121fea58c74b57da1e7c9efd27c8057fc80b5f80904a"
+  },
+  "receipt": {
+    "created_at": "2026-07-28T00:00:00.000000Z",
+    "mode": "host",
+    "policy": {
+      "dirty": false,
+      "dispatcher_floor": [
+        "sbp",
+        "smart"
+      ],
+      "policy_epoch": 7,
+      "policy_sha256": "<policy-sha256>",
+      "repo_override_sha256": null,
+      "sources": [
+        {
+          "logical_source_id": "dispatcher-floor",
+          "present": true,
+          "sha256": "<dispatcher-floor-sha256>"
+        },
+        {
+          "logical_source_id": "global-scope",
+          "present": true,
+          "sha256": "<global-scope-sha256>"
+        },
+        {
+          "logical_source_id": "repo-override",
+          "present": false,
+          "sha256": null
+        }
+      ]
+    },
+    "receipt_sha256": "<receipt-sha256>",
+    "repository": {
+      "base_sha": "1111111111111111111111111111111111111111",
+      "cwd_relative": ".",
+      "repository_id": "fixture-host"
+    },
+    "request_id": "00000000-0000-0000-0000-000000000001",
+    "resolution_id": "00000000-0000-0000-0000-000000000001",
+    "schema_version": "skill-resolution-receipt/v1",
+    "selected_names": [
+      "sbp"
+    ],
+    "skills": [
+      {
+        "admission": "admitted",
+        "entry_bytes": 24,
+        "entry_sha256": "7c9ea2522491027ddb386c1bab212f4fab4e1e66fadf81ef3b599c25722e9262",
+        "estimated_entry_tokens": 6,
+        "lifecycle": "active",
+        "logical_source_id": "host-fixture",
+        "name": "sbp",
+        "reason_code": "DISPATCHER_FLOOR",
+        "source_repo_sha": null,
+        "tree_sha256": "e91454b6c535b0552015121fea58c74b57da1e7c9efd27c8057fc80b5f80904a"
+      }
+    ],
+    "surface": "host-cli",
+    "totals": {
+      "admitted_count": 1,
+      "admitted_entry_bytes": 24,
+      "candidate_count": 1,
+      "estimated_entry_tokens": 6,
+      "omitted_count": 0
+    }
+  },
+  "request": {
+    "explicit_skills": [
+      "sbp"
+    ],
+    "max_entry_bytes": 1000000,
+    "mode": "host",
+    "repository": {
+      "base_sha": "1111111111111111111111111111111111111111",
+      "cwd_relative": ".",
+      "repository_id": "fixture-host"
+    },
+    "request_id": "golden-request",
+    "schema_version": "skill-resolution-request/v1",
+    "surface": "host-cli"
+  },
+  "schema_version": "skill-pull-closed-record-goldens/v1"
+}
