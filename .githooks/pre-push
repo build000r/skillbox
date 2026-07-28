@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Blocking pre-push gate (skillbox-6r53).
+#
+# Trusted-main pushes no longer start a hosted CI run, so the canonical local
+# gate runs here instead. This hook is a thin delegation: it resolves the exact
+# SHA(s) git is about to publish and hands each one to scripts/self-test.sh,
+# which owns the pinned tool matrix, the isolated checkout, and the receipt.
+#
+# Emergency bypass is git's own `git push --no-verify`; this hook deliberately
+# has no env-var escape hatch of its own.
+
+set -euo pipefail
+
+ZERO_SHA="0000000000000000000000000000000000000000"
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -z "${repo_root}" ]]; then
+  exit 0
+fi
+
+gate="${repo_root}/scripts/self-test.sh"
+if [[ ! -x "${gate}" ]]; then
+  echo "pre-push: ${gate} is missing or not executable; refusing to push ungated" >&2
+  exit 1
+fi
+
+# stdin lines are: <local ref> <local sha> <remote ref> <remote sha>
+seen=""
+shas=()
+while read -r -a fields; do
+  local_sha="${fields[1]:-}"
+  # Branch/tag deletions publish no new source; nothing to gate.
+  if [[ -z "${local_sha}" || "${local_sha}" == "${ZERO_SHA}" ]]; then
+    continue
+  fi
+  if [[ "${seen}" == *" ${local_sha} "* ]]; then
+    continue
+  fi
+  seen="${seen} ${local_sha} "
+  shas+=("${local_sha}")
+done
+
+if [[ ${#shas[@]} -eq 0 ]]; then
+  exit 0
+fi
+
+for sha in "${shas[@]}"; do
+  echo "pre-push: running canonical local gate for ${sha}" >&2
+  if ! "${gate}" --rev "${sha}" --trigger pre-push; then
+    echo "pre-push: canonical gate failed for ${sha}; push blocked" >&2
+    exit 1
+  fi
+done

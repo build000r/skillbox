@@ -39,11 +39,14 @@ DEV_SHIM_BINS := npm pnpm yarn vite next astro
 
 E2E_SMOKE_ARGS := $(if $(strip $(FORMAT)),--format $(FORMAT),) $(if $(filter 1 true yes,$(STRICT)),--strict,) $(ARGS)
 
-.PHONY: help bootstrap-env install-hooks render doctor acceptance runtime-render runtime-sync runtime-status runtime-skills runtime-skill-audit runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context dev-sanity e2e-smoke python-cov-xml wrappers-install dev-shims-install build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles box-register box-unregister
+.PHONY: help bootstrap-env install-hooks self-test self-test-worktree self-test-refresh render doctor acceptance runtime-render runtime-sync runtime-status runtime-skills runtime-skill-audit runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context dev-sanity e2e-smoke python-cov-xml wrappers-install dev-shims-install build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles box-register box-unregister
 
 help:
 	@printf "  make bootstrap-env  Seed .skillbox-state/operator/.env from .env.example if missing\n"
-	@printf "  make install-hooks  Configure repo-local git hooks\n"
+	@printf "  make install-hooks  Configure repo-local git hooks (pre-commit + blocking pre-push gate)\n"
+	@printf "  make self-test      Run the canonical local CI gate on an exact SHA (REV=<rev>) and write a receipt\n"
+	@printf "  make self-test-worktree Run the canonical gate with uncommitted changes overlaid (non-canonical receipt)\n"
+	@printf "  make self-test-refresh  Re-provision the pinned self-test toolchain, then run the gate\n"
 	@printf "  make render         Print the resolved sandbox model\n"
 	@printf "  make doctor         Validate outer manifests, compose drift, and default skill-repo-set sync\n"
 	@printf "  make acceptance     Run first-box acceptance for CLIENT=id (optional PROFILE=name)\n"
@@ -95,9 +98,23 @@ bootstrap-env: install-hooks
 
 install-hooks:
 	@if git rev-parse --git-dir >/dev/null 2>&1; then \
-		chmod +x .githooks/pre-commit; \
+		chmod +x .githooks/pre-commit .githooks/pre-push scripts/self-test.sh; \
 		git config core.hooksPath .githooks; \
 	fi
+
+# Canonical local CI gate (skillbox-6r53). Same lanes as .github/workflows/ci.yml,
+# run against an isolated checkout of an exact SHA with the pinned tool matrix.
+REV_ARGS := $(if $(strip $(REV)),--rev $(REV),)
+SELF_TEST_ARGS := $(REV_ARGS) $(if $(strip $(LANE)),--lane $(LANE),) $(if $(filter 1 true yes,$(JSON)),--json,) $(ARGS)
+
+self-test:
+	@./scripts/self-test.sh --trigger make $(SELF_TEST_ARGS)
+
+self-test-worktree:
+	@./scripts/self-test.sh --trigger make --worktree $(SELF_TEST_ARGS)
+
+self-test-refresh:
+	@./scripts/self-test.sh --trigger make --refresh $(SELF_TEST_ARGS)
 
 render:
 	@python3 scripts/04-reconcile.py render
