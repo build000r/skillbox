@@ -160,6 +160,10 @@ Usage:
   __WRAPPER__ cass status|search|rebuild|doctor  Remote Cass front door.
                               Use status/search for active tasks; treat rebuild as
                               coordinated maintenance, not degraded-mode fallback.
+  __WRAPPER__ oracle "question" [args...]  Ask GPT-5 Pro; answer on stdout.
+                              Hidden browser, no paste. --model instant while
+                              iterating so Pro usage is not spent on tests;
+                              --project files the thread in a ChatGPT Project.
   __WRAPPER__ evidence [--repo P|--skill N] --format json  Measure skill invocations per
                               repo from Cass (contamination-safe), joined to current policy
   __WRAPPER__ cron [status|apply]     Declared crontab + script links from skillbox-config
@@ -669,6 +673,10 @@ case "${1:-}" in
     action="cass"
     shift
     ;;
+  oracle|ask)
+    action="oracle"
+    shift
+    ;;
   evidence)
     action="cass-evidence"
     shift
@@ -798,7 +806,7 @@ append_passthrough_token() {
           ;;
       esac
       ;;
-    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|mcp-sync|structure-doctor|repo-registry|cass|cass-evidence|cron|send-later|safe|conference1|beads|mmdx|operator-booking|swimmers-launch|fleet)
+    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|mcp-sync|structure-doctor|repo-registry|cass|cass-evidence|oracle|cron|send-later|safe|conference1|beads|mmdx|operator-booking|swimmers-launch|fleet)
       passthrough_args+=("${token}")
       ;;
     *)
@@ -818,7 +826,7 @@ append_json_flag() {
       ;;
     capabilities|robot-triage)
       ;;
-    repo-registry|cass|cron|safe|send-later)
+    repo-registry|cass|oracle|cron|safe|send-later)
       passthrough_args+=(--json)
       ;;
     *)
@@ -1228,6 +1236,56 @@ PY
       exit 1
     fi
     python3 "${cass_wrapper}" "${passthrough_args[@]}"
+    ;;
+  oracle)
+    # Ask GPT-5 Pro one question through the hidden browser lane. Prefer the
+    # repo copy so a checkout is self-contained; fall back to the activated
+    # skill in the operator home.
+    oracle_ask=""
+    for candidate in \
+      "${script_dir}/../../skills/deep-research-prompt/assets/scripts/oracle-ask.mjs" \
+      "${HOME}/.claude/skills/deep-research-prompt/assets/scripts/oracle-ask.mjs"; do
+      if [[ -f "${candidate}" ]]; then
+        oracle_ask="${candidate}"
+        break
+      fi
+    done
+    if [[ -z "${oracle_ask}" ]]; then
+      echo "${wrapper_name} oracle: deep-research-prompt is not available; activate the skill or check out opensource/skills" >&2
+      exit 1
+    fi
+    if [[ "${#passthrough_args[@]}" -eq 0 ]]; then
+      echo "${wrapper_name} oracle: needs a question, e.g. ${wrapper_name} oracle \"why is my p99 bimodal?\"" >&2
+      exit 2
+    fi
+    # Default the ChatGPT Project so answers stay trackable without --project.
+    # The overlay is cwd-matched, so fall back to the skills client root when
+    # invoked from elsewhere. Capture and test before eval: `eval "$(cmd)"`
+    # returns 0 even when cmd dies, which silently drops the whole config.
+    if [[ -z "${ORACLE_CHATGPT_PROJECT_URL:-}" ]]; then
+      overlay_resolver=""
+      for candidate in \
+        "${HOME}/.claude/skills/skill-issue/scripts/resolve_overlay_config.py" \
+        "${script_dir}/../../skills/skill-issue/scripts/resolve_overlay_config.py"; do
+        if [[ -f "${candidate}" ]]; then
+          overlay_resolver="${candidate}"
+          break
+        fi
+      done
+      if [[ -n "${overlay_resolver}" ]]; then
+        for match_cwd in "${invoke_cwd}" "${script_dir}/../../skills"; do
+          [[ -d "${match_cwd}" ]] || continue
+          overlay_env="$(python3 "${overlay_resolver}" --section oracle --cwd "${match_cwd}" --format env 2>/dev/null || true)"
+          if [[ -n "${overlay_env}" ]]; then
+            eval "${overlay_env}"
+            [[ -n "${ORACLE_CHATGPT_PROJECT_URL:-}" ]] && break
+          fi
+        done
+      fi
+    fi
+    # So the follow-up hint is copy-pasteable exactly as invoked here.
+    ORACLE_ASK_INVOKED_AS="${wrapper_name} oracle" \
+      node "${oracle_ask}" "${passthrough_args[@]}"
     ;;
   cass-evidence)
     config_root="${SKILLBOX_CONFIG_ROOT:-${HOME}/repos/skillbox-config}"
