@@ -2094,6 +2094,19 @@ def _matching_scope_rule(
     return None
 
 
+def _skill_matching_rules(
+    skill_name: str,
+    rules: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    for rule in rules:
+        for pattern in rule.get("patterns") or []:
+            if fnmatch.fnmatchcase(skill_name, str(pattern)):
+                matches.append(rule)
+                break
+    return matches
+
+
 def _skill_scope_violations(
     model: dict[str, Any],
     occurrences: list[dict[str, Any]],
@@ -2108,6 +2121,34 @@ def _skill_scope_violations(
             continue
         name = str(occurrence.get("name") or "")
         install_path = str(occurrence.get("path") or "")
+        layer = str(occurrence.get("layer") or "")
+
+        if layer.startswith("global:"):
+            # A global occurrence is only a violation if NO matching rule
+            # grants allow_global. Do not pick a single "matching" rule via
+            # _matching_scope_rule here: that helper breaks ties by path
+            # proximity to `cwd`, but the only `cwd` available for a global
+            # occurrence is the install path itself (~/.claude/skills/<name>),
+            # which never matches any path-scoped rule's `paths:`. That made
+            # the tie-break fall back to declaration order, so a skill listed
+            # in both a path-scoped rule (e.g. portfolio-root-local) and an
+            # `allow_global: true` rule (e.g. operator-global-exceptions)
+            # could get gated by whichever rule happened to sort first in
+            # skill-scope.yaml, regardless of the allow_global grant.
+            matching_rules = _skill_matching_rules(name, rules)
+            if not matching_rules:
+                continue
+            if any(rule.get("allow_global") for rule in matching_rules):
+                continue
+            rule = matching_rules[0]
+            violation = dict(occurrence)
+            violation["scope_rule"] = rule["id"]
+            violation["scope_policy_path"] = rule.get("policy_path")
+            violation["allowed_paths"] = list(rule.get("paths") or [])
+            violation["reason"] = "global install is not allowed by this skill scope rule"
+            violations.append(violation)
+            continue
+
         rule = _matching_scope_rule(
             name,
             rules,
@@ -2116,22 +2157,13 @@ def _skill_scope_violations(
         if not rule:
             continue
 
-        layer = str(occurrence.get("layer") or "")
-        allowed = False
-        reason = ""
-        if layer.startswith("global:"):
-            allowed = bool(rule.get("allow_global"))
-            reason = "global install is not allowed by this skill scope rule"
-        else:
-            allowed = _path_is_under(install_path, list(rule.get("paths") or []))
-            reason = "installed outside allowed repo path"
-
+        allowed = _path_is_under(install_path, list(rule.get("paths") or []))
         if not allowed:
             violation = dict(occurrence)
             violation["scope_rule"] = rule["id"]
             violation["scope_policy_path"] = rule.get("policy_path")
             violation["allowed_paths"] = list(rule.get("paths") or [])
-            violation["reason"] = reason
+            violation["reason"] = "installed outside allowed repo path"
             violations.append(violation)
 
     return violations
