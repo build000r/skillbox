@@ -149,6 +149,9 @@ def _machines_classifier() -> tuple[Any, str | None]:
     override = globals().get("_machines_classifier_override")
     if override is not None:
         return override()
+    global _machines_classifier_cache
+    if _machines_classifier_cache is not None:
+        return _machines_classifier_cache
     try:
         from . import machines as _machines  # noqa: PLC0415
     except Exception:  # pragma: no cover - import guard
@@ -156,12 +159,28 @@ def _machines_classifier() -> tuple[Any, str | None]:
     try:
         config = _machines.load_machines_config()
     except Exception:
+        # not cached: a missing/broken machines.yaml may appear later in a
+        # long-lived process, and the failure path is already cheap
         return None, None
     try:
         machine_id = config.detect_machine_id()
     except Exception:
         machine_id = None
-    return config, machine_id
+    _machines_classifier_cache = (config, machine_id)
+    return _machines_classifier_cache
+
+
+# Successful (config, machine_id) memo. Skill visibility resolves machines.yaml
+# once per rule *path* — 2,310 times for one `skills --format json` run — and
+# unmemoized that is ~70s of redundant YAML parsing per invocation (measured
+# 2026-07-28: 76s -> ~1s). One CLI run never needs a mid-process reload;
+# long-lived callers can reset via _machines_classifier_cache_clear().
+_machines_classifier_cache: tuple[Any, str | None] | None = None
+
+
+def _machines_classifier_cache_clear() -> None:
+    global _machines_classifier_cache
+    _machines_classifier_cache = None
 
 
 def _canonicalize_repo_path(path: str) -> str:

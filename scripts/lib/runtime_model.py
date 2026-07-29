@@ -475,14 +475,33 @@ def client_overlay_paths(root_dir: Path, env_values: dict[str, str] | None = Non
     return sorted(path for path in overlays_root.glob("*/overlay.yaml") if path.is_file())
 
 
+# Parsed-YAML memo keyed by (mtime_ns, size). Skill visibility re-reads the
+# same policy/registry files hundreds of times per run (skill-scope.yaml alone
+# was parsed 328x = ~26s); the cache returns a deepcopy so callers that mutate
+# the result (e.g. _operator_scope_policies setdefault) never alias each other.
+_load_yaml_cache: dict[str, tuple[tuple[int, int], Any]] = {}
+
+
 def load_yaml(path: Path) -> dict[str, Any]:
     if yaml is None:
         raise RuntimeError(
             "Missing PyYAML. Install `python3-yaml` or `pip install pyyaml` to use runtime commands."
         )
 
+    cache_key = str(path)
+    signature = None
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        stat = path.stat()
+        signature = (stat.st_mtime_ns, stat.st_size)
+        hit = _load_yaml_cache.get(cache_key)
+        if hit is not None and hit[0] == signature:
+            return copy.deepcopy(hit[1])
+    except OSError:
+        pass  # fall through to the read path and its existing error contract
+
+    loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+    try:
+        raw = yaml.load(path.read_text(encoding="utf-8"), Loader=loader)
     except FileNotFoundError as exc:
         raise RuntimeError(f"Required file missing: {path}") from exc
     except Exception as exc:  # pragma: no cover - defensive parse path
@@ -504,6 +523,9 @@ def load_yaml(path: Path) -> dict[str, Any]:
         return {}
     if not isinstance(raw, dict):
         raise RuntimeError(f"Expected a YAML object in {path}")
+    if signature is not None:
+        _load_yaml_cache[cache_key] = (signature, raw)
+        return copy.deepcopy(raw)
     return raw
 
 
