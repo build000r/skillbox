@@ -4,17 +4,25 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import ipaddress
+import io
 import json
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
+import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib import request as urllib_request
 from urllib.parse import parse_qs, unquote, urlsplit
+
+import jwt
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -36,6 +44,34 @@ SBP_CASS_SCRIPT = Path(
 )
 TAILSCALE_V4 = ipaddress.ip_network("100.64.0.0/10")
 TAILSCALE_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+AMP_JWKS_URL = "https://ampcode.com/api/workload-identity/jwks.json"
+AMP_ISSUER = "https://ampcode.com/api/workload-identity"
+SBPD_AUDIENCE = "sbpd"
+JWKS_CACHE_TTL_SECONDS = 300
+JWKS_TIMEOUT_SECONDS = 10
+JWKS_KID_REFRESH_COOLDOWN_SECONDS = 30
+PROTECTED_PATH_PREFIXES = ("/v1/cass/", "/v1/skill/")
+ORB_KIT_FILES = (
+    ("lib/sbp_client.py", Path("scripts/lib/sbp_client.py"), 0o644),
+    ("runtime_manager/__init__.py", Path(".env-manager/runtime_manager/__init__.py"), 0o644),
+    (
+        "runtime_manager/distribution/__init__.py",
+        Path(".env-manager/runtime_manager/distribution/__init__.py"),
+        0o644,
+    ),
+    (
+        "runtime_manager/distribution/bundle.py",
+        Path(".env-manager/runtime_manager/distribution/bundle.py"),
+        0o644,
+    ),
+    ("orb/join-tailnet.sh", Path("scripts/orb/join-tailnet.sh"), 0o755),
+)
+ORB_KIT_README = (
+    "Run orb/join-tailnet.sh to join the Skillbox tailnet.\n"
+    'Export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" and '
+    'SBP_REMOTE="http://<skillbox-tailnet-ip>:8443".\n'
+    "Run python3 lib/sbp_client.py cass status --json.\n"
+).encode("utf-8")
 
 
 class ServiceError(RuntimeError):
@@ -45,6 +81,139 @@ class ServiceError(RuntimeError):
         super().__init__(str(payload.get("message") or payload.get("error") or "service error"))
         self.status = status
         self.payload = payload
+
+
+class AuthenticationError(RuntimeError):
+    """A bearer token cannot be authenticated without exposing internals."""
+
+
+def _require_https_jwks_url(value: str) -> None:
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise AuthenticationError("workload-identity JWKS URL must use HTTPS")
+
+
+class JWKSVerifier:
+    """Verify Amp workload-identity tokens against a bounded JWKS cache."""
+
+    def __init__(
+        self,
+        *,
+        jwks_url: str = AMP_JWKS_URL,
+        audience: str = SBPD_AUDIENCE,
+        issuer: str = AMP_ISSUER,
+        cache_ttl_seconds: int = JWKS_CACHE_TTL_SECONDS,
+        timeout_seconds: int = JWKS_TIMEOUT_SECONDS,
+        kid_refresh_cooldown_seconds: int = JWKS_KID_REFRESH_COOLDOWN_SECONDS,
+        opener: Any = urllib_request.urlopen,
+        clock: Any = time.monotonic,
+    ) -> None:
+        _require_https_jwks_url(jwks_url)
+        self.jwks_url = jwks_url
+        self.audience = audience
+        self.issuer = issuer
+        self.cache_ttl_seconds = cache_ttl_seconds
+        self.timeout_seconds = timeout_seconds
+        self.kid_refresh_cooldown_seconds = kid_refresh_cooldown_seconds
+        self.opener = opener
+        self.clock = clock
+        self._keys: dict[str, dict[str, Any]] = {}
+        self._expires_at = 0.0
+        self._next_kid_refresh_at = 0.0
+        self._lock = threading.Lock()
+
+    def _fetch_keys(self) -> dict[str, dict[str, Any]]:
+        request = urllib_request.Request(
+            self.jwks_url,
+            headers={"Accept": "application/json"},
+        )
+        try:
+            with self.opener(request, timeout=self.timeout_seconds) as response:
+                response_url = (
+                    response.geturl()
+                    if callable(getattr(response, "geturl", None))
+                    else self.jwks_url
+                )
+                if not isinstance(response_url, str):
+                    raise AuthenticationError(
+                        "workload-identity JWKS response URL is invalid"
+                    )
+                _require_https_jwks_url(response_url)
+                payload = json.load(response)
+        except Exception as exc:
+            raise AuthenticationError("unable to load workload-identity keys") from exc
+
+        raw_keys = payload.get("keys") if isinstance(payload, dict) else None
+        if not isinstance(raw_keys, list):
+            raise AuthenticationError("workload-identity JWKS has no keys list")
+        keys = {
+            key["kid"]: key
+            for key in raw_keys
+            if isinstance(key, dict)
+            and isinstance(key.get("kid"), str)
+            and key.get("kid")
+            and key.get("kty") == "RSA"
+            and key.get("alg") == "RS256"
+            and key.get("use") in {None, "sig"}
+        }
+        if not keys:
+            raise AuthenticationError("workload-identity JWKS has no RS256 signing keys")
+        return keys
+
+    def _cached_keys(self, *, force_refresh: bool = False) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            now = self.clock()
+            if force_refresh:
+                if now < self._next_kid_refresh_at:
+                    return dict(self._keys)
+                self._next_kid_refresh_at = (
+                    now + self.kid_refresh_cooldown_seconds
+                )
+            if force_refresh or not self._keys or now >= self._expires_at:
+                self._keys = self._fetch_keys()
+                self._expires_at = now + self.cache_ttl_seconds
+            return dict(self._keys)
+
+    def _jwk_for_kid(self, kid: str) -> dict[str, Any]:
+        key = self._cached_keys().get(kid)
+        if key is None:
+            key = self._cached_keys(force_refresh=True).get(kid)
+        if key is None:
+            raise AuthenticationError("token kid is not present in workload-identity JWKS")
+        return key
+
+    def verify(self, token: str) -> dict[str, Any]:
+        """Return verified claims for one RS256 Amp workload-identity JWT."""
+        try:
+            header = jwt.get_unverified_header(token)
+            if header.get("alg") != "RS256":
+                raise AuthenticationError("token algorithm must be RS256")
+            kid = header.get("kid")
+            if not isinstance(kid, str) or not kid:
+                raise AuthenticationError("token has no kid")
+            public_key = jwt.algorithms.RSAAlgorithm.from_jwk(
+                json.dumps(self._jwk_for_kid(kid))
+            )
+            claims = jwt.decode(
+                token,
+                public_key,
+                algorithms=["RS256"],
+                audience=self.audience,
+                issuer=self.issuer,
+                options={"require": ["aud", "exp"]},
+            )
+        except AuthenticationError:
+            raise
+        except Exception as exc:
+            raise AuthenticationError("invalid workload-identity token") from exc
+        if not isinstance(claims, dict):
+            raise AuthenticationError("invalid workload-identity claims")
+        return claims
 
 
 def bind_address(value: str) -> str:
@@ -59,6 +228,47 @@ def bind_address(value: str) -> str:
             "--bind must be loopback or a Tailnet IP; wildcard/public binds are forbidden"
         )
     return str(address)
+
+
+def build_orb_kit(root_dir: Path = ROOT_DIR) -> bytes:
+    """Build the deterministic bootstrap kit from current repo files."""
+    members: list[tuple[str, bytes, int]] = []
+    for archive_name, relative_path, mode in ORB_KIT_FILES:
+        source = root_dir / relative_path
+        try:
+            body = source.read_bytes()
+        except OSError as exc:
+            raise ServiceError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {
+                    "ok": False,
+                    "error": "orb_kit_unavailable",
+                    "message": f"Orb kit source is unavailable: {relative_path.as_posix()}",
+                },
+            ) from exc
+        members.append((archive_name, body, mode))
+    members.append(("README.txt", ORB_KIT_README, 0o644))
+
+    output = io.BytesIO()
+    with gzip.GzipFile(
+        filename="",
+        mode="wb",
+        fileobj=output,
+        compresslevel=9,
+        mtime=0,
+    ) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.GNU_FORMAT) as archive:
+            for archive_name, body, mode in members:
+                info = tarfile.TarInfo(archive_name)
+                info.size = len(body)
+                info.mode = mode
+                info.mtime = 0
+                info.uid = 0
+                info.gid = 0
+                info.uname = ""
+                info.gname = ""
+                archive.addfile(info, io.BytesIO(body))
+    return output.getvalue()
 
 
 def _json_from_process(stdout: str) -> Any:
@@ -209,7 +419,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_json(self, status: int, payload: Any) -> None:
+    def _send_json(
+        self,
+        status: int,
+        payload: Any,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         body = json.dumps(
             payload,
             ensure_ascii=False,
@@ -217,15 +433,66 @@ class Handler(BaseHTTPRequestHandler):
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-        self._send_bytes(status, body, "application/json; charset=utf-8")
+        self._send_bytes(
+            status,
+            body,
+            "application/json; charset=utf-8",
+            headers=headers,
+        )
+
+    def _authenticate(self, path: str) -> bool:
+        self.auth_sub = None
+        require_auth = bool(getattr(self.server, "require_auth", False))
+        if not require_auth or not path.startswith(PROTECTED_PATH_PREFIXES):
+            return True
+
+        authorization = self.headers.get_all("Authorization", [])
+        if len(authorization) == 1:
+            scheme, separator, token = authorization[0].partition(" ")
+            if scheme.lower() == "bearer" and separator and token.strip():
+                verifier = getattr(self.server, "authenticator", None)
+                try:
+                    if verifier is None:
+                        raise AuthenticationError("authentication is not configured")
+                    claims = verifier.verify(token.strip())
+                    subject = claims.get("sub")
+                    self.auth_sub = subject if isinstance(subject, str) else None
+                    return True
+                except AuthenticationError:
+                    pass
+
+        self._send_json(
+            HTTPStatus.UNAUTHORIZED,
+            {
+                "ok": False,
+                "error": "unauthorized",
+                "message": "Authentication required",
+            },
+            headers={"WWW-Authenticate": 'Bearer realm="sbpd"'},
+        )
+        return False
 
     def do_GET(self) -> None:  # noqa: N802
         request = urlsplit(self.path)
         try:
+            if not self._authenticate(request.path):
+                return
+
             if request.path == "/healthz":
                 self._send_json(
                     HTTPStatus.OK,
                     {"ok": True, "service": "sbpd", "version": "v1"},
+                )
+                return
+
+            if request.path == "/v1/orb-kit":
+                self._send_bytes(
+                    HTTPStatus.OK,
+                    build_orb_kit(),
+                    "application/gzip",
+                    headers={
+                        "Content-Disposition": 'attachment; filename="orb-kit.tar.gz"',
+                    },
                 )
                 return
 
@@ -286,6 +553,9 @@ class Handler(BaseHTTPRequestHandler):
             )
 
     def _method_not_allowed(self) -> None:
+        request = urlsplit(self.path)
+        if not self._authenticate(request.path):
+            return
         self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
         self.send_header("Allow", "GET")
         body = b'{"error":"method_not_allowed","ok":false}'
@@ -300,7 +570,12 @@ class Handler(BaseHTTPRequestHandler):
     do_PUT = _method_not_allowed
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        sys.stderr.write("sbpd: %s - %s\n" % (self.client_address[0], fmt % args))
+        subject = getattr(self, "auth_sub", None) or "-"
+        subject = json.dumps(subject, ensure_ascii=True)[1:-1]
+        sys.stderr.write(
+            "sbpd: %s sub=%s - %s\n"
+            % (self.client_address[0], subject, fmt % args)
+        )
 
 
 class ThreadingHTTPServerV6(ThreadingHTTPServer):
@@ -316,6 +591,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Loopback or literal Tailnet IP (default: 127.0.0.1)",
     )
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument(
+        "--require-auth",
+        action="store_true",
+        help="Require Amp workload-identity bearer JWTs for data endpoints",
+    )
     return parser
 
 
@@ -327,6 +607,8 @@ def main(argv: list[str] | None = None) -> int:
         else ThreadingHTTPServer
     )
     server = server_class((args.bind, args.port), Handler)
+    server.require_auth = args.require_auth
+    server.authenticator = JWKSVerifier() if args.require_auth else None
     print(f"sbpd serving http://{args.bind}:{args.port}", flush=True)
     try:
         server.serve_forever()

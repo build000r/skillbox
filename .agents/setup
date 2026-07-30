@@ -90,6 +90,12 @@ fi
 need_cmd python3
 need_cmd git
 
+if [[ -n "${TAILSCALE_AUTHKEY:-}" && -x scripts/orb/join-tailnet.sh ]]; then
+  log "tailnet: joining"
+  scripts/orb/join-tailnet.sh \
+    || fail auth "tailnet join failed" 40
+fi
+
 log "python: $(python3 --version 2>&1)"
 
 PY_VERSION="$(python3 - <<'PY'

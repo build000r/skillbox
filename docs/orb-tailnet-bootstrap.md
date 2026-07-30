@@ -205,89 +205,279 @@ one into an Amp thread, NTM message, Bead, issue comment, result artifact,
 setup log, or shell command literal. Automatic redaction is defense in depth,
 not a delivery mechanism.
 
-## Mac-lane API v2 rotation
+## Operator device access + key lifecycle
 
-Target auth-key ID: `REDACTEDOLDKEYIDCNTRL`.
+Run every API step in this section only from the trusted Mac lane. The examples
+expect `TAILSCALE_API_KEY` to be loaded from the Mac's credential store before
+the subshell starts. Never paste its value into this file, a command literal,
+an Amp thread, or a result artifact.
 
-Run this only from the trusted Mac lane. It expects a short-lived Tailscale API
-access token already stored in macOS Keychain under service
-`skillbox-tailscale-api-v2`. The token needs permission to read and delete auth
-keys. The script passes the bearer header to `curl` through standard input, so
-the token is absent from argv and shell history.
+### Operator device access to d3:8443
+
+Append this object to the existing top-level `grants` array. It mirrors the
+existing `tag:orb` grant shape while granting only tailnet-member devices
+access to `sbpd` at `100.100.1.3` over TCP port 8443:
+
+```json
+{
+  "src": ["autogroup:member"],
+  "dst": ["100.100.1.3"],
+  "ip": ["tcp:8443"]
+}
+```
+
+`autogroup:member` is appropriate for this single-operator tailnet. On a shared
+tailnet, replace it with only the operator devices' stable Tailscale IPs or
+host aliases. Do not add those named devices alongside `autogroup:member`;
+grant source arrays are unions, so that would not narrow access.
+
+Fetch the complete current policy, append the object, validate the candidate
+without mutation, then apply it with the `ETag` returned by that same fetch.
+The `If-Match` guard makes a concurrent policy edit fail with HTTP 412 instead
+of overwriting it:
 
 ```bash
 (
   set -euo pipefail
   set +x
+  : "${TAILSCALE_API_KEY:?load TAILSCALE_API_KEY from the Mac credential store}"
 
-  target_key_id='REDACTEDOLDKEYIDCNTRL'
-  key_url="https://api.tailscale.com/api/v2/tailnet/-/keys/${target_key_id}"
-  TAILSCALE_API_TOKEN="$(
-    security find-generic-password \
-      -s skillbox-tailscale-api-v2 \
-      -w
-  )"
-  trap 'unset TAILSCALE_API_TOKEN' EXIT
+  acl_url='https://api.tailscale.com/api/v2/tailnet/-/acl'
+  tailnet_policy_tmp="$(mktemp -d)"
+  headers_file="${tailnet_policy_tmp}/headers"
+  policy_file="${tailnet_policy_tmp}/policy.hujson"
+  validate_file="${tailnet_policy_tmp}/validate.json"
+  updated_file="${tailnet_policy_tmp}/updated.hujson"
 
-  api_status() {
-    method="$1"
-    url="$2"
-    printf 'header = "Authorization: Bearer %s"\n' "$TAILSCALE_API_TOKEN" |
+  cleanup() {
+    rm -f -- \
+      "$headers_file" \
+      "$policy_file" \
+      "$validate_file" \
+      "$updated_file"
+    rmdir -- "$tailnet_policy_tmp"
+    unset TAILSCALE_API_KEY
+  }
+  trap cleanup EXIT
+
+  tailscale_api() {
+    printf 'header = "Authorization: Bearer %s"\n' "$TAILSCALE_API_KEY" |
       curl --config - \
         --silent \
         --show-error \
-        --output /dev/null \
+        --fail-with-body \
+        "$@"
+  }
+
+  tailscale_api \
+    --header 'Accept: application/hujson' \
+    --dump-header "$headers_file" \
+    --output "$policy_file" \
+    "$acl_url"
+
+  etag="$(
+    python3 - "$headers_file" <<'PY'
+import pathlib
+import sys
+
+for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
+    if line.lower().startswith("etag:"):
+        print(line.split(":", 1)[1].strip())
+        break
+else:
+    raise SystemExit("policy GET returned no ETag")
+PY
+  )"
+
+  vi "$policy_file"
+
+  tailscale_api \
+    --request POST \
+    --header 'Content-Type: application/hujson' \
+    --data-binary "@${policy_file}" \
+    --output "$validate_file" \
+    "${acl_url}/validate"
+
+  python3 - "$validate_file" <<'PY'
+import json
+import pathlib
+import sys
+
+result = json.loads(pathlib.Path(sys.argv[1]).read_text() or "{}")
+if result:
+    raise SystemExit(
+        "policy validation did not pass cleanly: "
+        + json.dumps(result, separators=(",", ":"))
+    )
+PY
+
+  tailscale_api \
+    --request POST \
+    --header 'Accept: application/hujson' \
+    --header 'Content-Type: application/hujson' \
+    --header "If-Match: ${etag}" \
+    --data-binary "@${policy_file}" \
+    --output "$updated_file" \
+    "$acl_url"
+
+  printf 'policy validated and applied with If-Match %s\n' "$etag"
+)
+```
+
+After applying, prove an operator device can reach
+`http://100.100.1.3:8443/healthz` and that an ungranted port remains blocked.
+Do not treat a clean `/acl/validate` response as live connectivity proof.
+
+### Rotate the Orb bootstrap auth key
+
+Target old auth-key ID: `REDACTEDOLDKEYIDCNTRL`. This checklist creates a 90-day
+reusable, ephemeral, preauthorized `tag:orb` replacement, writes the returned
+key directly into the Amp user-level secret `TAILSCALE_AUTHKEY`, then revokes
+the old credential. Mint-before-revoke avoids losing bootstrap access when key
+creation or secret delivery fails. The response file is mode 0600 and is
+removed by the exit trap; never print or retain its `key` field.
+
+```bash
+(
+  set -euo pipefail
+  set +x
+  umask 077
+  : "${TAILSCALE_API_KEY:?load TAILSCALE_API_KEY from the Mac credential store}"
+
+  old_key_id='REDACTEDOLDKEYIDCNTRL'
+  keys_url='https://api.tailscale.com/api/v2/tailnet/-/keys'
+  old_key_url="${keys_url}/${old_key_id}"
+  key_rotation_tmp="$(mktemp -d)"
+  request_file="${key_rotation_tmp}/request.json"
+  response_file="${key_rotation_tmp}/response.json"
+
+  cleanup() {
+    rm -f -- "$request_file" "$response_file"
+    rmdir -- "$key_rotation_tmp"
+    unset TAILSCALE_API_KEY
+  }
+  trap cleanup EXIT
+
+  tailscale_api_status() {
+    method="$1"
+    url="$2"
+    output_file="${3:-/dev/null}"
+    if [ "$#" -ge 3 ]; then
+      shift 3
+    else
+      shift 2
+    fi
+
+    printf 'header = "Authorization: Bearer %s"\n' "$TAILSCALE_API_KEY" |
+      curl --config - \
+        --silent \
+        --show-error \
+        --output "$output_file" \
         --write-out '%{http_code}' \
         --request "$method" \
+        "$@" \
         "$url"
   }
 
-  before="$(api_status GET "$key_url")"
-  case "$before" in
-    200) ;;
-    404)
-      printf 'auth key already absent: %s\n' "$target_key_id"
-      exit 0
-      ;;
-    *)
-      printf 'pre-delete GET failed: HTTP %s\n' "$before" >&2
-      exit 1
-      ;;
-  esac
+  cat >"$request_file" <<'JSON'
+{
+  "keyType": "auth",
+  "description": "Amp Orb bootstrap",
+  "expirySeconds": 7776000,
+  "capabilities": {
+    "devices": {
+      "create": {
+        "reusable": true,
+        "ephemeral": true,
+        "preauthorized": true,
+        "tags": ["tag:orb"]
+      }
+    }
+  }
+}
+JSON
 
-  deleted="$(api_status DELETE "$key_url")"
+  created="$(
+    tailscale_api_status \
+      POST \
+      "$keys_url" \
+      "$response_file" \
+      --header 'Content-Type: application/json' \
+      --data-binary "@${request_file}"
+  )"
+  test "$created" = 200 || {
+    printf 'replacement-key POST failed: HTTP %s\n' "$created" >&2
+    exit 1
+  }
+
+  python3 - "$response_file" <<'PY' |
+import json
+import pathlib
+import sys
+
+payload = json.loads(pathlib.Path(sys.argv[1]).read_text())
+key = payload.get("key")
+if not isinstance(key, str) or not key:
+    raise SystemExit("replacement response has no key")
+sys.stdout.write(key)
+PY
+    amp secrets set TAILSCALE_AUTHKEY \
+      --user \
+      --secret \
+      --data-file -
+
+  deleted="$(tailscale_api_status DELETE "$old_key_url")"
   case "$deleted" in
     200|204) ;;
     *)
-      printf 'DELETE failed: HTTP %s\n' "$deleted" >&2
+      printf 'old-key DELETE failed: HTTP %s\n' "$deleted" >&2
       exit 1
       ;;
   esac
 
-  after="$(api_status GET "$key_url")"
+  after="$(tailscale_api_status GET "$old_key_url")"
   test "$after" = 404 || {
     printf 'post-delete GET expected HTTP 404, got %s\n' "$after" >&2
     exit 1
   }
 
-  printf 'revoked auth-key ID %s; post-delete GET=404\n' "$target_key_id"
+  new_key_id="$(
+    python3 - "$response_file" <<'PY'
+import json
+import pathlib
+import sys
+
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())["id"])
+PY
+  )"
+  printf 'revoked %s; minted %s; refreshed Amp user secret\n' \
+    "$old_key_id" \
+    "$new_key_id"
 )
 ```
 
-Afterward:
+The `tailscale_api_status` helper intentionally accepts extra `curl` arguments
+after its output-file parameter. Confirm the Tailscale configuration audit log
+records the deletion and creation, then run
+`amp secrets list --user --json` and verify only that `TAILSCALE_AUTHKEY`
+exists; secret-list output must not contain its value.
 
-1. Confirm the Tailscale configuration audit log records the deletion.
-2. Remove the compromised key from Amp project secrets if it was stored there:
-   `amp secrets delete TAILSCALE_AUTHKEY --project '<amp-project-id-or-name>'`.
-3. Start a fresh Orb through the OIDC path and repeat the `100.x` plus ACL
-   proof. Existing ephemeral Orb nodes do not need the revoked bootstrap key
-   to keep their current node session.
+Deleting an auth key prevents future registrations but does not disconnect an
+Orb that is still online. Amp pauses can remove an inactive ephemeral node
+(~1 hour observed); that Orb then resumes in `NeedsLogin` and must run the full
+join again. The re-join consumes the refreshed Amp user secret automatically.
+Prove a fresh or resumed Orb gets a `100.x` address, reaches d3:8443, and remains
+blocked from an ungranted port.
 
-The API path is
-`DELETE /api/v2/tailnet/:tailnet/keys/:keyID`; `-` selects the token's own
-tailnet. Prefer a Tailscale trust credential scoped to `auth_keys` over a
-full-permission API access token. Sources:
-[Tailscale API authentication](https://tailscale.com/docs/reference/tailscale-api) and
+The policy endpoints are `GET|POST /api/v2/tailnet/:tailnet/acl` and
+`POST /api/v2/tailnet/:tailnet/acl/validate`; the key endpoints are
+`POST /api/v2/tailnet/:tailnet/keys` and
+`DELETE /api/v2/tailnet/:tailnet/keys/:keyID`. `-` selects the API credential's
+own tailnet. Prefer trust credentials scoped to `policy_file` and `auth_keys`
+over a full-permission API access token. Sources:
+[Tailscale grants syntax](https://tailscale.com/docs/reference/syntax/grants),
+[Tailscale API authentication](https://tailscale.com/docs/reference/tailscale-api),
+and
 [Tailscale trust-credential scopes](https://tailscale.com/docs/reference/trust-credentials).
 
 ## `sbpd` and `SBP_REMOTE` bootstrap
