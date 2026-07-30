@@ -111,6 +111,11 @@ def bundle_dir(root: Path | None = None) -> Path:
 
 
 def hosts_path(root: Path | None = None) -> Path:
+    # The tracked hosts.json ships sanitized .example targets; operators point
+    # SKILLBOX_CLIPBOARD_HOSTS at their real fleet registry (skillbox-config).
+    env_hosts = os.environ.get("SKILLBOX_CLIPBOARD_HOSTS")
+    if env_hosts:
+        return Path(env_hosts)
     return bundle_dir(root) / "hosts.json"
 
 

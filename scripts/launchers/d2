@@ -12,8 +12,8 @@ wsl_distro="${DEVL_WSL_DISTRO:-Ubuntu}"
 clipboard_profile="devbox"
 
 case "${1:-}" in
-    s|sp|sweet|sweet-potato|sweet-potato.example)
-        target="aiops@sweet-potato.example"
+    s|sp|sweet|sweet-potato)
+        target="${DEVL_SWEET_TARGET:-aiops@sweet-potato.example}"
         if [ -z "${DEVL_ROOT+x}" ]; then
             root="/home/aiops/ingredient_server"
         fi
@@ -46,7 +46,7 @@ case "${1:-}" in
 	        fi
 	        shift
 	        ;;
-    j|jeremy|jeremy-vps|jeremy-vps.example|jeremy-vps.example)
+    j|jeremy|jeremy-vps)
         target="${DEVL_JEREMY_TARGET:-skillbox@jeremy-vps.example}"
         if [ -z "${DEVL_ROOT+x}" ]; then
             root="/home/skillbox/ecom-reporting-host"

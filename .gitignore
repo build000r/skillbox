@@ -70,3 +70,4 @@ refactor/
 .skillbox-port.env
 workspace/.focus.json.lock
 .skillbox/skill-overrides.yaml.lock
+docs/field-reports/reports.jsonl

@@ -1,5 +1,6 @@
 {
   "bundle_version": 2,
+  "note": "Sanitized example registry: every *.example target is a placeholder. Operators keep a real registry outside this repo and point SKILLBOX_CLIPBOARD_HOSTS at it.",
   "source_dir": "scripts/clipboard",
   "profiles": {
     "local": {
