@@ -310,3 +310,22 @@ sbp cass search 'tailnet'
 `SBP_REMOTE` is an endpoint, not a credential. Access still depends on the
 Orb's `tag:orb` identity and tailnet grants. Do not change `sbpd` to
 `0.0.0.0`; bind it to loopback and/or the box's Tailscale address.
+
+## Operational findings (2026-07-30 live E2E, thread T-019fb489)
+
+- **Ephemeral node removal on pause.** Amp orbs pause between `-ox` rounds. A
+  long pause (~1h observed) lets the control plane remove the ephemeral node:
+  `tailscale status` shows `Logged out.` / `state: NeedsLogin`. Restarting
+  tailscaled is NOT enough — resume requires the full re-join:
+  dummy-addr step, `systemctl restart tailscaled`, then
+  `tailscale up --authkey=...`. Wake preamble should be:
+  `curl -s --max-time 8 http://<box>:8443/healthz || <full re-join>`.
+- **Standalone client needs the bundle verifier.** `scripts/lib/sbp_client.py`
+  cass verbs are stdlib-only, but `skill pull` lazily imports
+  `runtime_manager.distribution.bundle` (pure-stdlib module, ~10KB) for
+  verified unpack. Off-repo hosts must ship that module and set
+  `PYTHONPATH` (package scaffold: `runtime_manager/__init__.py`,
+  `runtime_manager/distribution/__init__.py`, `bundle.py`), or install the
+  skillbox repo. Verified determinism cross-transport: box-local and orb pulls
+  of the `sbp` skill both yield tree
+  `ae33c56e8a204f52998363a339af4f1f835ebcb25b0a453d630eef00d5e94629`.

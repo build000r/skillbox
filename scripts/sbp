@@ -1133,6 +1133,11 @@ if [[ -n "${SBP_REMOTE:-}" && "${action}" == "cass" ]]; then
     --remote "${SBP_REMOTE}" cass "${passthrough_args[@]}"
   exit $?
 fi
+if [[ -n "${SBP_REMOTE:-}" && "${action}" == "skill" && "${passthrough_args[0]:-}" == "pull" ]]; then
+  python3 "${script_dir}/lib/sbp_client.py" \
+    --remote "${SBP_REMOTE}" skill "${passthrough_args[@]}"
+  exit $?
+fi
 
 cd "${skillbox_root}"
 
