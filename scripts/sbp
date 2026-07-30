@@ -1128,6 +1128,12 @@ else
   runtime_client_flags=(--cwd "${invoke_cwd}")
 fi
 
+if [[ -n "${SBP_REMOTE:-}" && "${action}" == "cass" ]]; then
+  python3 "${script_dir}/lib/sbp_client.py" \
+    --remote "${SBP_REMOTE}" cass "${passthrough_args[@]}"
+  exit $?
+fi
+
 cd "${skillbox_root}"
 
 case "${action}" in
