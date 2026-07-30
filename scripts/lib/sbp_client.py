@@ -62,6 +62,15 @@ def _cass_url(remote: str, args: Sequence[str]) -> str:
     raise ValueError(f"remote cass v1 does not support {verb!r}")
 
 
+def _request_headers(accept: str) -> dict[str, str]:
+    """Base headers plus optional bearer auth from SBP_TOKEN (never logged)."""
+    headers = {"Accept": accept}
+    token = os.environ.get("SBP_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
 def run_remote_cass(
     remote: str,
     args: Sequence[str],
@@ -77,7 +86,7 @@ def run_remote_cass(
     try:
         url = _cass_url(remote, args)
         response = opener(
-            urllib.request.Request(url, headers={"Accept": "application/json"}),
+            urllib.request.Request(url, headers=_request_headers("application/json")),
             timeout=timeout,
         )
         output.write(response.read())
@@ -158,7 +167,7 @@ def run_remote_skill_pull(
         quoted_name = urllib.parse.quote(name, safe="")
         url = f"{remote.rstrip('/')}/v1/skill/pull/{quoted_name}"
         response = opener(
-            urllib.request.Request(url, headers={"Accept": "application/gzip"}),
+            urllib.request.Request(url, headers=_request_headers("application/gzip")),
             timeout=timeout,
         )
         bundle_bytes = response.read()
