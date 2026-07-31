@@ -691,7 +691,7 @@ class GuardDestructiveOpScriptTests(unittest.TestCase):
             (root / "workspace").mkdir(parents=True, exist_ok=True)
             (root / "workspace" / "boxes.json").write_text(
                 json.dumps(
-                    {"boxes": [{"id": "box-remote", "tailscale_ip": "100.64.0.9", "ssh_user": "skillbox"}]}
+                    {"boxes": [{"id": "box-remote", "tailscale_ip": "100.100.0.9", "ssh_user": "skillbox"}]}
                 ),
                 encoding="utf-8",
             )

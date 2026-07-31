@@ -95,7 +95,7 @@ class BoxLifecycleTests(unittest.TestCase):
             profile="dev-small",
             state="ready",
             droplet_ip="1.2.3.4",
-            tailscale_ip="100.64.0.8",
+            tailscale_ip="100.100.0.8",
             ssh_user="skillbox",
             storage_provider="digitalocean",
             state_root="/skillbox-state",
@@ -136,7 +136,7 @@ class BoxLifecycleTests(unittest.TestCase):
             mock.patch.object(BOX_MODULE, "load_inventory", return_value=[box]),
             mock.patch.object(BOX_MODULE, "load_deploy_manifest", return_value=release),
             mock.patch.object(BOX_MODULE, "load_profile", return_value=profile),
-            mock.patch.object(BOX_MODULE, "_resolve_existing_box_target", return_value="100.64.0.8"),
+            mock.patch.object(BOX_MODULE, "_resolve_existing_box_target", return_value="100.100.0.8"),
             mock.patch.object(
                 BOX_MODULE,
                 "scp_file",
@@ -224,7 +224,7 @@ class BoxLifecycleTests(unittest.TestCase):
             inventory = overrides.get("load_inventory", [box])
             load_deploy_manifest = overrides.get("load_deploy_manifest", release)
             load_profile = overrides.get("load_profile", profile)
-            resolve_target = overrides.get("resolve_target", "100.64.0.8")
+            resolve_target = overrides.get("resolve_target", "100.100.0.8")
             scp_result = overrides.get("scp_file", subprocess.CompletedProcess(["scp"], 0, stdout="", stderr=""))
             patch_contract = overrides.get("patch_contract", {"env_updates": ["A"]})
             ssh_script_result = overrides.get("ssh_script", subprocess.CompletedProcess(["ssh"], 0, stdout="ok", stderr=""))
@@ -296,8 +296,8 @@ class BoxLifecycleTests(unittest.TestCase):
 
         def fake_enroll_box_tailscale(context: BOX_MODULE.BoxUpContext, *, ts_authkey: str) -> str:
             del ts_authkey
-            BOX_MODULE.update_box(context.box, tailscale_ip="100.64.0.8", state="deploying")
-            return "tailscale skillbox-box-1 at 100.64.0.8"
+            BOX_MODULE.update_box(context.box, tailscale_ip="100.100.0.8", state="deploying")
+            return "tailscale skillbox-box-1 at 100.100.0.8"
 
         def fake_mark_box_ssh_ready(context: BOX_MODULE.BoxUpContext) -> str:
             context.ssh_target = "1.2.3.4"
@@ -353,7 +353,7 @@ class BoxLifecycleTests(unittest.TestCase):
         )
         self.assertTrue(all(step["status"] == "ok" for step in payload["steps"]))
         self.assertEqual(payload["droplet_ip"], "1.2.3.4")
-        self.assertEqual(payload["tailscale_ip"], "100.64.0.8")
+        self.assertEqual(payload["tailscale_ip"], "100.100.0.8")
         run_first_box.assert_called_once_with(
             mock.ANY,
             blueprint=BOX_MODULE.DEFAULT_FIRST_BOX_BLUEPRINT,
@@ -430,7 +430,7 @@ class BoxLifecycleTests(unittest.TestCase):
             droplet_id="123",
             droplet_ip="1.2.3.4",
             tailscale_hostname="skillbox-box-1",
-            tailscale_ip="100.64.0.8",
+            tailscale_ip="100.100.0.8",
             ssh_user="skillbox",
             state_root="/srv/skillbox",
             storage_provider="digitalocean",
@@ -450,8 +450,8 @@ class BoxLifecycleTests(unittest.TestCase):
         payloads: list[dict[str, object]] = []
 
         def fake_resolve(context: BOX_MODULE.BoxUpContext) -> str:
-            context.ssh_target = "100.64.0.8"
-            return "100.64.0.8"
+            context.ssh_target = "100.100.0.8"
+            return "100.100.0.8"
 
         with (
             mock.patch.object(BOX_MODULE, "load_profile", return_value=profile),
@@ -664,7 +664,7 @@ class BoxLifecycleTests(unittest.TestCase):
         ), mock.patch.object(
             BOX_MODULE, "run", return_value=subprocess.CompletedProcess([], 0, "pong\n", ""),
         ), mock.patch.object(
-            BOX_MODULE.socket, "gethostbyname", return_value="100.64.0.8",
+            BOX_MODULE.socket, "gethostbyname", return_value="100.100.0.8",
         ), mock.patch.object(
             BOX_MODULE.socket, "create_connection",
         ) as create_connection:
@@ -687,14 +687,14 @@ class BoxLifecycleTests(unittest.TestCase):
             "droplet_id": "123",
             "droplet_ip": "1.2.3.4",
             "tailscale_hostname": "skillbox-box-1",
-            "tailscale_ip": "100.64.0.8",
+            "tailscale_ip": "100.100.0.8",
             "ssh_user": "skillbox",
             "state_root": "",
             "volume_name": "",
             "ssh_reachable": True,
             "container_running": True,
-            "ssh_target": "100.64.0.8",
-            "phone_url": "http://100.64.0.8:3210/",
+            "ssh_target": "100.100.0.8",
+            "phone_url": "http://100.100.0.8:3210/",
             "magicdns_url": "http://skillbox-box-1:3210/",
             "network_checks": {},
         }
@@ -703,7 +703,7 @@ class BoxLifecycleTests(unittest.TestCase):
         with redirect_stdout(stdout):
             BOX_MODULE.print_box_status_text(status)
 
-        self.assertIn("\nOpen this on phone: http://100.64.0.8:3210/\n", stdout.getvalue())
+        self.assertIn("\nOpen this on phone: http://100.100.0.8:3210/\n", stdout.getvalue())
 
 
 def _completed(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:

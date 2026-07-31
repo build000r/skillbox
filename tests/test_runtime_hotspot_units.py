@@ -1090,12 +1090,12 @@ class RuntimePortVerificationTests(unittest.TestCase):
     def test_runtime_box_access_falls_back_to_tailscale_status(self) -> None:
         tailscale_status = {
             "BackendState": "Running",
-            "TailscaleIPs": ["100.64.0.10", "fd7a:115c:a1e0::1"],
+            "TailscaleIPs": ["100.100.0.10", "fd7a:115c:a1e0::1"],
             "CurrentTailnet": {"Name": "example.github"},
             "Self": {
                 "HostName": "skillbox-dev",
                 "DNSName": "skillbox-dev.tailnet.test.",
-                "TailscaleIPs": ["100.64.0.10"],
+                "TailscaleIPs": ["100.100.0.10"],
             },
         }
         result = mock.Mock(returncode=0, stdout=json.dumps(tailscale_status), stderr="")
@@ -1106,9 +1106,9 @@ class RuntimePortVerificationTests(unittest.TestCase):
         ):
             access = runtime_ops_module.runtime_box_access_from_env({"SKILLBOX_SWIMMERS_PORT": "4444"})
 
-        self.assertEqual(access["tailscale_ip"], "100.64.0.10")
+        self.assertEqual(access["tailscale_ip"], "100.100.0.10")
         self.assertEqual(access["tailscale_hostname"], "skillbox-dev.tailnet.test")
-        self.assertEqual(access["phone_url"], "http://100.64.0.10:4444/")
+        self.assertEqual(access["phone_url"], "http://100.100.0.10:4444/")
         self.assertEqual(access["magicdns_url"], "http://skillbox-dev.tailnet.test:4444/")
         self.assertEqual(access["source"], "tailscale")
 
@@ -1190,29 +1190,29 @@ class RuntimePortVerificationTests(unittest.TestCase):
         warnings = endpoints_module.annotate_service_rows(
             model,
             rows,
-            box_access={"tailscale_ip": "100.64.0.10"},
+            box_access={"tailscale_ip": "100.100.0.10"},
         )
 
         by_id = {row["id"]: row for row in rows}
         self.assertEqual(by_id["example-web"]["endpoint"]["exposure"], "loopback-only")
         self.assertFalse(by_id["example-web"]["viewable_from_tailnet"])
         self.assertEqual(by_id["api"]["endpoint"]["exposure"], "wildcard-direct")
-        self.assertEqual(by_id["api"]["endpoint_url"], "http://100.64.0.10:9100")
+        self.assertEqual(by_id["api"]["endpoint_url"], "http://100.100.0.10:9100")
         self.assertTrue(by_id["api"]["endpoint"]["all_interfaces"])
         self.assertEqual(by_id["lan-api"]["endpoint"]["exposure"], "loopback-only")
         self.assertFalse(by_id["lan-api"]["viewable_from_tailnet"])
         self.assertEqual(by_id["wide-web"]["endpoint"]["exposure"], "wildcard-direct")
-        self.assertEqual(by_id["wide-web"]["endpoint_url"], "http://100.64.0.10:5175")
+        self.assertEqual(by_id["wide-web"]["endpoint_url"], "http://100.100.0.10:5175")
         self.assertTrue(by_id["wide-web"]["endpoint"]["all_interfaces"])
         self.assertEqual(
             by_id["wide-web"]["endpoint"]["ingress_routes"][0]["tailnet_url"],
-            "http://100.64.0.10:9080/",
+            "http://100.100.0.10:9080/",
         )
         self.assertTrue(by_id["wide-web"]["viewable_from_tailnet"])
         self.assertEqual(by_id["routed"]["endpoint"]["exposure"], "ingress-routed")
         self.assertEqual(by_id["routed"]["endpoint"]["ingress_routes"][0]["request_url"], "http://127.0.0.1:9080/routed")
-        self.assertEqual(by_id["routed"]["endpoint"]["ingress_routes"][0]["tailnet_url"], "http://100.64.0.10:9080/routed")
-        self.assertEqual(by_id["routed"]["endpoint_url"], "http://100.64.0.10:9080/routed")
+        self.assertEqual(by_id["routed"]["endpoint"]["ingress_routes"][0]["tailnet_url"], "http://100.100.0.10:9080/routed")
+        self.assertEqual(by_id["routed"]["endpoint_url"], "http://100.100.0.10:9080/routed")
         self.assertEqual(by_id["local-routed-web"]["endpoint"]["exposure"], "loopback-only")
         self.assertFalse(by_id["local-routed-web"]["viewable_from_tailnet"])
         self.assertEqual(len(warnings), 4)
@@ -1239,18 +1239,18 @@ class RuntimePortVerificationTests(unittest.TestCase):
             model,
             {"cycle-chef-web"},
             probe=False,
-            box_access={"tailscale_ip": "100.64.0.10"},
+            box_access={"tailscale_ip": "100.100.0.10"},
         )
 
         self.assertEqual(summary["apps"][0]["url"], "http://0.0.0.0:5175")
-        self.assertEqual(summary["apps"][0]["access_url"], "http://100.64.0.10:5175")
+        self.assertEqual(summary["apps"][0]["access_url"], "http://100.100.0.10:5175")
         self.assertEqual(summary["apps"][0]["exposure"], "wildcard-direct")
         self.assertTrue(summary["apps"][0]["endpoint"]["all_interfaces"])
         buffer = io.StringIO()
         with redirect_stdout(buffer):
             text_renderers_module.print_endpoint_summary(summary)
         output = buffer.getvalue()
-        self.assertIn("http://100.64.0.10:5175", output)
+        self.assertIn("http://100.100.0.10:5175", output)
         self.assertIn("wildcard-direct", output)
         self.assertNotIn("http://127.0.0.1:5175", output)
 
@@ -3615,7 +3615,7 @@ class RuntimeTextRendererHotspotTests(unittest.TestCase):
                     "pid": 123,
                     "depends_on": ["db"],
                     "bootstrap_tasks": ["sync"],
-                    "endpoint_url": "http://100.64.0.10:9100",
+                    "endpoint_url": "http://100.100.0.10:9100",
                     "exposure": "tailnet-direct",
                     "ownership_state": "covered",
                 },
@@ -3657,7 +3657,7 @@ class RuntimeTextRendererHotspotTests(unittest.TestCase):
         self.assertIn("  - sync: pending, depends on prepare", output)
         self.assertIn(
             "  - api [covered]: running (pid 123), depends on db, bootstrap sync -> "
-            "http://100.64.0.10:9100 [tailnet-direct]",
+            "http://100.100.0.10:9100 [tailnet-direct]",
             output,
         )
         self.assertIn("  - worker: declared (external process)", output)
@@ -3679,7 +3679,7 @@ class RuntimeTextRendererHotspotTests(unittest.TestCase):
                     "id": "api",
                     "result": "started",
                     "pid": 123,
-                    "endpoint": {"access_url": "http://100.64.0.10:9100", "exposure": "tailnet-direct"},
+                    "endpoint": {"access_url": "http://100.100.0.10:9100", "exposure": "tailnet-direct"},
                 },
                 {"id": "worker", "result": "skipped", "reason": "external"},
                 {"id": "cron"},
@@ -3694,7 +3694,7 @@ class RuntimeTextRendererHotspotTests(unittest.TestCase):
         self.assertIn("sync:\n  - clone repo\n  - write env", output)
         self.assertIn("tasks:\n  - prepare: done (/tmp/ready)\n  - sync: unknown", output)
         self.assertIn("services:", output)
-        self.assertIn("  - api: started (pid 123) -> http://100.64.0.10:9100 [tailnet-direct]", output)
+        self.assertIn("  - api: started (pid 123) -> http://100.100.0.10:9100 [tailnet-direct]", output)
         self.assertIn("  - worker: skipped (external)", output)
         self.assertIn("  - cron: unknown", output)
 

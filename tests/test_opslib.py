@@ -26,7 +26,7 @@ class OpslibValidatorTests(unittest.TestCase):
             (opslib.validate_ssh_user, "skillbox_1", "skillbox_1"),
             (opslib.validate_ssh_user, "_svc", "_svc"),
             (opslib.validate_host, "skillbox-alpha.tailnet", "skillbox-alpha.tailnet"),
-            (opslib.validate_host, "100.64.0.1", "100.64.0.1"),
+            (opslib.validate_host, "100.100.0.1", "100.100.0.1"),
         ]
         for validator, raw_value, expected in cases:
             with self.subTest(raw_value=raw_value):

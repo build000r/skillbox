@@ -89,7 +89,7 @@ class ExtractionHelperTests(unittest.TestCase):
         self.assertEqual(RM.classify_bind_scope("::"), "wildcard")
         self.assertEqual(RM.classify_bind_scope("127.0.0.1"), "loopback")
         self.assertEqual(RM.classify_bind_scope("localhost"), "loopback")
-        self.assertEqual(RM.classify_bind_scope("100.64.0.5"), "tailnet")
+        self.assertEqual(RM.classify_bind_scope("100.100.0.5"), "tailnet")
         self.assertEqual(RM.classify_bind_scope(""), "loopback")
 
 

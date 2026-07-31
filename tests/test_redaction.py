@@ -236,7 +236,7 @@ class BoxRemoteOutputRedactionTests(unittest.TestCase):
         return subprocess.CompletedProcess(["ssh"], code, stdout=stdout, stderr=stderr)
 
     def test_ssh_cmd_redacts_tailscale_authkey_in_remote_output(self) -> None:
-        planted_out = "TAILSCALE_IPV4=100.64.0.1 SKILLBOX_TS_AUTHKEY=tskey-PLANTED123"
+        planted_out = "TAILSCALE_IPV4=100.100.0.1 SKILLBOX_TS_AUTHKEY=tskey-PLANTED123"
         planted_err = "warn: doctl token dop_v1_PLANTEDdeadbeef rejected"
         with mock.patch.object(
             self.box.subprocess,
@@ -249,7 +249,7 @@ class BoxRemoteOutputRedactionTests(unittest.TestCase):
         self.assertIn(REDACTION_MARKER, result.stdout)
         self.assertIn(REDACTION_MARKER, result.stderr)
         # Benign context (the tailnet IP) survives.
-        self.assertIn("TAILSCALE_IPV4=100.64.0.1", result.stdout)
+        self.assertIn("TAILSCALE_IPV4=100.100.0.1", result.stdout)
 
     def test_doctl_redacts_token_in_output(self) -> None:
         planted = '{"error":"unauthorized","detail":"SKILLBOX_DO_TOKEN=dop_v1_LEAKED9999"}'

@@ -55,7 +55,7 @@ def _release() -> object:
     )
 
 
-def _box(state: str, *, tailscale_ip: str | None = "100.64.0.8") -> object:
+def _box(state: str, *, tailscale_ip: str | None = "100.100.0.8") -> object:
     return BOX.Box(
         id="box-1",
         profile="dev-small",
@@ -144,12 +144,12 @@ class BoxUpResumeStateTests(unittest.TestCase):
         expected_prior_stages = ["create", "storage", "bootstrap"]
         for state in sorted(BOX.RESUMABLE_UP_STATES):
             with self.subTest(state=state):
-                box = _box(state, tailscale_ip="100.64.0.8")
+                box = _box(state, tailscale_ip="100.100.0.8")
                 payloads: list[dict[str, object]] = []
 
                 def fake_resolve(context: object) -> str:
-                    context.ssh_target = "100.64.0.8"
-                    return "100.64.0.8"
+                    context.ssh_target = "100.100.0.8"
+                    return "100.100.0.8"
 
                 with (
                     mock.patch.object(BOX, "load_profile", return_value=_profile()),
@@ -294,9 +294,9 @@ class CloudFirewallFailClosedTests(unittest.TestCase):
     @contextlib.contextmanager
     def _enroll_mocks(self):
         with (
-            mock.patch.object(BOX, "ssh_script", return_value=_completed(0, stdout="100.64.0.9")),
+            mock.patch.object(BOX, "ssh_script", return_value=_completed(0, stdout="100.100.0.9")),
             mock.patch.object(BOX, "ssh_cmd", return_value=_completed(0, stdout="Status: active")),
-            mock.patch.object(BOX, "extract_tailscale_ipv4", return_value="100.64.0.9"),
+            mock.patch.object(BOX, "extract_tailscale_ipv4", return_value="100.100.0.9"),
             mock.patch.object(BOX, "save_inventory"),
         ):
             yield

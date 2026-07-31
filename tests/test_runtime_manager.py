@@ -1330,7 +1330,7 @@ class RuntimeManagerTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {
                 "SKILLBOX_BOX_SELF": "true",
                 "SKILLBOX_BOX_ID": "worker-devbox",
-                "SKILLBOX_BOX_TAILSCALE_IP": "100.86.253.9",
+                "SKILLBOX_BOX_TAILSCALE_IP": "100.100.253.9",
                 "SKILLBOX_BOX_TAILSCALE_HOSTNAME": "worker-devbox",
                 "SKILLBOX_SWIMMERS_PORT": "3210",
             }):
@@ -1338,10 +1338,10 @@ class RuntimeManagerTests(unittest.TestCase):
                 json_result = self._run(repo, "status", "--format", "json", "--compact")
 
             self.assertEqual(text_result.returncode, 0, text_result.stderr)
-            self.assertIn("Open this on phone: http://100.86.253.9:3210/", text_result.stdout)
+            self.assertIn("Open this on phone: http://100.100.253.9:3210/", text_result.stdout)
             payload = json.loads(json_result.stdout)
             self.assertTrue(payload["box_access"]["self"])
-            self.assertEqual(payload["box_access"]["phone_url"], "http://100.86.253.9:3210/")
+            self.assertEqual(payload["box_access"]["phone_url"], "http://100.100.253.9:3210/")
 
     def test_up_skips_status_only_services_and_logs_show_recent_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
