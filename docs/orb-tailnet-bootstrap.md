@@ -214,9 +214,15 @@ an Amp thread, or a result artifact.
 
 ### Operator device access to d3:8443
 
-Append this object to the existing top-level `grants` array. It mirrors the
-existing `tag:orb` grant shape while granting only tailnet-member devices
-access to `sbpd` at `100.100.1.3` over TCP port 8443:
+**Usually unnecessary — check before adding anything.** On this tailnet the
+existing grant `build000r@github -> autogroup:self -> ip:["*"]` already gives
+every operator-owned device full access to d3, verified 2026-07-31: a Mac
+`curl http://100.100.1.3:8443/healthz` returned HTTP 200 with no new grant.
+The tailnet has exactly one member (other identities are shared-in, not
+members), so `autogroup:member` adds nothing here either.
+
+Only if operator devices ever lose that blanket self-grant, append this object
+to the top-level `grants` array (d3's tailnet IP is `100.100.1.3`):
 
 ```json
 {
@@ -226,10 +232,10 @@ access to `sbpd` at `100.100.1.3` over TCP port 8443:
 }
 ```
 
-`autogroup:member` is appropriate for this single-operator tailnet. On a shared
-tailnet, replace it with only the operator devices' stable Tailscale IPs or
-host aliases. Do not add those named devices alongside `autogroup:member`;
-grant source arrays are unions, so that would not narrow access.
+On a shared tailnet, replace `autogroup:member` with only the operator
+devices' stable Tailscale IPs or host aliases. Do not add named devices
+alongside `autogroup:member`; grant source arrays are unions, so that would
+not narrow access.
 
 Fetch the complete current policy, append the object, validate the candidate
 without mutation, then apply it with the `ETag` returned by that same fetch.
@@ -435,9 +441,13 @@ PY
       ;;
   esac
 
-  after="$(tailscale_api_status GET "$old_key_url")"
-  test "$after" = 404 || {
-    printf 'post-delete GET expected HTTP 404, got %s\n' "$after" >&2
+  # Tailscale keeps deleted keys as audit tombstones: post-delete GET returns
+  # HTTP 200 with invalid:true + revoked:<ts>, NOT 404 (asserting 404 fails
+  # every successful rotation — observed live 2026-07-31 on REDACTEDOLDKEYIDCNTRL).
+  after_invalid="$(curl -fsS -H "Authorization: Bearer ${TAILSCALE_API_KEY}" \
+    "$old_key_url" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("invalid"))')"
+  test "$after_invalid" = "True" || {
+    printf 'post-delete GET expected invalid:true tombstone, got invalid=%s\n' "$after_invalid" >&2
     exit 1
   }
 
