@@ -217,17 +217,17 @@ an Amp thread, or a result artifact.
 **Usually unnecessary — check before adding anything.** On this tailnet the
 existing grant `build000r@github -> autogroup:self -> ip:["*"]` already gives
 every operator-owned device full access to d3, verified 2026-07-31: a Mac
-`curl http://100.79.193.34:8443/healthz` returned HTTP 200 with no new grant.
+`curl http://100.100.1.3:8443/healthz` returned HTTP 200 with no new grant.
 The tailnet has exactly one member (other identities are shared-in, not
 members), so `autogroup:member` adds nothing here either.
 
 Only if operator devices ever lose that blanket self-grant, append this object
-to the top-level `grants` array (d3's tailnet IP is `100.79.193.34`):
+to the top-level `grants` array (d3's tailnet IP is `100.100.1.3`):
 
 ```json
 {
   "src": ["autogroup:member"],
-  "dst": ["100.79.193.34"],
+  "dst": ["100.100.1.3"],
   "ip": ["tcp:8443"]
 }
 ```
@@ -331,7 +331,7 @@ PY
 ```
 
 After applying, prove an operator device can reach
-`http://100.79.193.34:8443/healthz` and that an ungranted port remains blocked.
+`http://100.100.1.3:8443/healthz` and that an ungranted port remains blocked.
 Do not treat a clean `/acl/validate` response as live connectivity proof.
 
 ### Rotate the Orb bootstrap auth key
