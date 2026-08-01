@@ -4,6 +4,12 @@
 .vscode/
 .cache/
 .claude/
+# The unanchored `.claude/` above also swallowed committed test fixtures
+# (tests/fixtures/**/home/.claude/...), so `git archive` extracts — which is
+# what the self-test gate runs against — silently lacked them and the
+# dcg_reconcile suite failed only under the gate. Re-include fixture trees.
+!tests/fixtures/**/.claude/
+!tests/fixtures/**/.claude/**
 .mcp.json
 __pycache__/
 *.pyc

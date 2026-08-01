@@ -307,18 +307,22 @@ class RepoIdentityE2ETests(unittest.TestCase):
                 model, cwd="/srv/skillbox/repos/app_core/src",
                 include_global=False, include_project=False,
             )
+            # Machine-level canonicalization folds the alias prefix regardless
+            # of a real on-disk symlink (the declared alias does it by string
+            # prefix), so the alias and canonical spelling of the same repo
+            # collapse to ONE canonical path and never split the match into a
+            # distinct /srv/repos/app_core entry. Asserted INSIDE the harness:
+            # _canonicalize_repo_path consults the injected classifier; outside
+            # the block it would silently fall back to the live host
+            # machines.yaml, which made this test pass only on boxes that
+            # happen to declare the alias.
+            self.assertEqual(
+                sv._canonicalize_repo_path("/srv/repos/app_core"),
+                "/srv/skillbox/repos/app_core",
+            )
         matched = payload["matched_scope_rules"]
         self.assertEqual([item["id"] for item in matched], ["app-local"])
         self.assertIn("/srv/skillbox/repos/app_core", matched[0]["paths"])
-        # Machine-level canonicalization folds the alias prefix regardless of a
-        # real on-disk symlink (the declared alias does it by string prefix), so
-        # the alias and canonical spelling of the same repo collapse to ONE
-        # canonical path and never split the match into a distinct
-        # /srv/repos/app_core entry.
-        self.assertEqual(
-            sv._canonicalize_repo_path("/srv/repos/app_core"),
-            "/srv/skillbox/repos/app_core",
-        )
         # Where the alias symlink is real on this host, _expand_policy_path's
         # resolve() folds it too (defense-in-depth alongside the declared alias).
         if Path("/srv/repos").is_symlink():

@@ -176,6 +176,23 @@ class FixtureFleet:
     def skill(self, name: str) -> Path:
         return self.skills[name]
 
+    class _RegistryDoctorShim:
+        """Hermetic stand-in for skillbox-config's ``registry_doctor`` loader.
+
+        The real module is discovered as a sibling of the runtime root, which
+        exists on operator boxes but not in a ``git archive`` extract — the
+        world the self-test gate runs in. Without this shim, registry ids
+        written by this fixture silently resolve to [] there and cohort tests
+        fail only under the gate. ``_load_registry_entries`` exercises exactly
+        ``load_registry``.
+        """
+
+        @staticmethod
+        def load_registry(path: Any) -> dict[str, Any]:
+            import yaml
+
+            return yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+
     @contextmanager
     def _home_patched(self) -> Iterator[None]:
         """Resolve ``Path.home()`` to the fixture OS home for the duration.
@@ -184,17 +201,23 @@ class FixtureFleet:
         and ``collect_skill_audit`` (global drift row) read ``Path.home()``;
         patch it so they never touch the operator's real home.
         """
-        with mock.patch.object(
-            skill_visibility.Path, "home", return_value=self.os_home
-        ), mock.patch.dict(
-            os.environ,
-            {
-                "SKILLBOX_MACHINES_FILE": str(self.machines_path),
-                "SKILLBOX_MACHINE": "devbox-like",
-                "SKILLBOX_REGISTRY_FILE": str(self.registry_path),
-            },
-        ):
-            yield
+        skill_visibility._registry_doctor_module_override = (  # type: ignore[attr-defined]
+            lambda: self._RegistryDoctorShim
+        )
+        try:
+            with mock.patch.object(
+                skill_visibility.Path, "home", return_value=self.os_home
+            ), mock.patch.dict(
+                os.environ,
+                {
+                    "SKILLBOX_MACHINES_FILE": str(self.machines_path),
+                    "SKILLBOX_MACHINE": "devbox-like",
+                    "SKILLBOX_REGISTRY_FILE": str(self.registry_path),
+                },
+            ):
+                yield
+        finally:
+            skill_visibility.__dict__.pop("_registry_doctor_module_override", None)
 
     # -- helpers (return parsed payloads) ----------------------------------
     def run_resolution(
