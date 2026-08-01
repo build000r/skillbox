@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -25,8 +26,24 @@ class BoxTests(unittest.TestCase):
     """Test box.py core logic: profiles, inventory, structured output, dry-run."""
 
     def test_workspace_image_installs_mandatory_spaps_cli(self) -> None:
+        # The Dockerfile is the authoritative pin (upgraded deliberately, e.g.
+        # 0.7.7 -> 0.9.3 in b64bde1); assert the invariant (an exact-version
+        # mandatory pin exists) and that documented references track it,
+        # instead of hardcoding a version this test can silently outdate.
         dockerfile = (ROOT_DIR / "Dockerfile").read_text(encoding="utf-8")
-        self.assertIn("spaps@0.7.7", dockerfile)
+        match = re.search(r"spaps@(\d+\.\d+\.\d+)", dockerfile)
+        self.assertIsNotNone(
+            match, "Dockerfile must pin the mandatory spaps CLI as spaps@X.Y.Z"
+        )
+        pin = match.group(0)
+        env_manager_readme = (ROOT_DIR / ".env-manager" / "README.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(pin, env_manager_readme)
+        runtime_graph = (ROOT_DIR / "docs" / "runtime-graph.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(pin, runtime_graph)
 
     def test_build_remote_env_command_preserves_literal_env_values(self) -> None:
         command = BOX_MODULE.build_remote_env_command(

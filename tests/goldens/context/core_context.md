@@ -52,7 +52,7 @@ Single source of truth for declared ports. Run `python3 .env-manager/manage.py p
 
 ## Installed Skills
 
-- **default-skills**: (empty)
+- **default-skills**: divide-and-conquer, lube, mmdx, project-status-mmdx, skill-issue, smart
 
 ## Logs
 
