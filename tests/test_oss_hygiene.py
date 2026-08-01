@@ -83,14 +83,37 @@ _FLEET_HOSTNAMES = (
 
 
 def _tracked_files() -> list[str]:
+    """Files that ship with the repo.
+
+    The canonical gate (scripts/self-test.sh) runs against a `git archive`
+    extract, which is NOT a git repo — so `git ls-files` raised CalledProcessError
+    and this test could never pass under the very gate that is supposed to
+    enforce it. It went unnoticed because it passes fine in a working checkout.
+
+    In an archive extract every present file is by definition a tracked file, so
+    walking the tree there checks exactly the same invariant.
+    """
     proc = subprocess.run(
         ["git", "ls-files"],
         cwd=ROOT_DIR,
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
     )
-    return proc.stdout.splitlines()
+    if proc.returncode == 0:
+        return proc.stdout.splitlines()
+
+    walked: list[str] = []
+    for path in ROOT_DIR.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(ROOT_DIR)
+        # Never present in an archive; skip defensively so a stray local run
+        # does not scan build output or vendored trees.
+        if any(part in {".git", "node_modules", "__pycache__", ".skillbox-state"} for part in rel.parts):
+            continue
+        walked.append(str(rel))
+    return walked
 
 
 class OssHygieneTests(unittest.TestCase):
