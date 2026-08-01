@@ -123,7 +123,9 @@ service bind exposure is verified by the runtime exposure lint. Do not bind
 services to `0.0.0.0` on tailnet-only boxes — use loopback or Tailnet IP. See
 `docs/tailnet-only-lifecycle.md` for recovery and exposure rules.
 For the Conference1 heavy-build box (tailnet Serve URLs, read-only status,
-Swimmers remote Rust lane), use `sbp conference1` — see `docs/conference1.md`.
+Swimmers remote Rust lane), use `sbp conference1`. Real host metadata lives in
+the operator's private hosts registry (`SKILLBOX_CLIPBOARD_HOSTS`); the tracked
+`scripts/clipboard/hosts.json` ships sanitized `.example` values.
 
 ## Coding Notes
 
@@ -164,19 +166,42 @@ Swimmers remote Rust lane), use `sbp conference1` — see `docs/conference1.md`.
 - Avoid editing generated/runtime state unless the bug is specifically in that
   state contract.
 
+## Orb bootstrap (AO-005)
+
+Hardened Amp Orb lane for shell/Python validation (substitute for skillbox-config,
+which is Orb-denied).
+
+- **Setup:** run `.agents/setup`. It is idempotent, checks fixed Orb disk
+  headroom before work, compiles `.env-manager`/`scripts`/`tests`, then runs
+  `python3 -m unittest tests.test_agent_ops_adapters -q`.
+- **Resume:** run `.agents/resume` on wake. It performs only fast checks
+  (Python/git/toolchain presence and disk headroom) and backgrounds optional
+  repair so it stays inside Amp's 10s non-blocking wake budget.
+- **Status/logs:** setup writes `.agents/state/setup-status.json` and
+  `.agents/logs/setup.log`; resume writes `.agents/state/resume-status.json` and
+  `.agents/logs/resume.log`. Final stderr lines are prefixed
+  `AGENT_SETUP_RESULT_JSON` or `AGENT_RESUME_RESULT_JSON`.
+- **Typed failures:** `setup=10`, `dependency=20`, `capacity=30`, `auth=40`,
+  `validation=50`. Capacity failures mean the fixed 40GB Orb disk does not have
+  enough free space for safe setup/resume.
+- **Broader tests (optional):** `python3 -m unittest discover -s tests` is
+  heavier and not required for bootstrap smoke.
+- **Do not:** start Docker monoserver, load operator `.env` secrets, or touch
+  production box lifecycle on the Orb.
+
 <!-- br-agent-instructions-v1 -->
 
 ---
 
 ## Beads Workflow Integration
 
-This project uses [beads_rust](https://github.com/example/beads_rust) (`br`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
+This project uses beads_rust (`br`/`bd`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
 
 ### Essential Commands
 
 ```bash
 # View ready issues (open, unblocked, not deferred)
-br ready
+br ready              # or: bd ready
 
 # List and search
 br list --status=open # All open issues
@@ -230,127 +255,3 @@ git push                # Push to remote
 - Always sync before ending session
 
 <!-- end-br-agent-instructions -->
-
-<!-- bv-agent-instructions-v2 -->
-
----
-
-## Beads Workflow Integration
-
-This project uses [beads_rust](https://github.com/example/beads_rust) (`br`) for issue tracking and [beads_viewer](https://github.com/example/beads_viewer) (`bv`) for graph-aware triage. Issues are stored in `.beads/` and tracked in git.
-
-### Using bv as an AI sidecar
-
-bv is a graph-aware triage engine for Beads projects (.beads/beads.jsonl). Instead of parsing JSONL or hallucinating graph traversal, use robot flags for deterministic, dependency-aware outputs with precomputed metrics (PageRank, betweenness, critical path, cycles, HITS, eigenvector, k-core).
-
-**Scope boundary:** bv handles *what to work on* (triage, priority, planning). `br` handles creating, modifying, and closing beads.
-
-**CRITICAL: Use ONLY --robot-* flags. Bare bv launches an interactive TUI that blocks your session.**
-
-#### The Workflow: Start With Triage
-
-**`bv --robot-triage` is your single entry point.** It returns everything you need in one call:
-- `quick_ref`: at-a-glance counts + top 3 picks
-- `recommendations`: ranked actionable items with scores, reasons, unblock info
-- `quick_wins`: low-effort high-impact items
-- `blockers_to_clear`: items that unblock the most downstream work
-- `project_health`: status/type/priority distributions, graph metrics
-- `commands`: copy-paste shell commands for next steps
-
-```bash
-bv --robot-triage --format toon   # THE MEGA-COMMAND: start here
-bv --robot-next --format toon     # Minimal: just the single top pick + claim command
-```
-
-Always pass `--format toon` (or `export BV_OUTPUT_FORMAT=toon`) in agent
-contexts: TOON is the token-lean structured format for LLM consumption, and
-bare `--robot-*` JSON on large graphs can flood your context window. TOON
-rendering needs the renderer from the `tru` crate (`cargo install tru`, which
-installs the `toon` binary); without it bv prints a stderr warning and silently
-falls back to JSON.
-
-Before claiming, verify current state with `br show <id> --json` or `br ready --json`. `recommendations` can include graph-important blocked or assigned work; only `quick_ref.top_picks` and non-empty `claim_command` fields represent claimable work.
-
-#### Other bv Commands
-
-| Command | Returns |
-|---------|---------|
-| `--robot-plan` | Parallel execution tracks with unblocks lists |
-| `--robot-priority` | Priority misalignment detection with confidence |
-| `--robot-insights` | Full metrics: PageRank, betweenness, HITS, eigenvector, critical path, cycles, k-core |
-| `--robot-alerts` | Stale issues, blocking cascades, priority mismatches |
-| `--robot-suggest` | Hygiene: duplicates, missing deps, label suggestions, cycle breaks |
-| `--robot-diff --diff-since <ref>` | Changes since ref: new/closed/modified issues |
-| `--robot-graph [--graph-format=json\|dot\|mermaid]` | Dependency graph export |
-
-#### Scoping & Filtering
-
-```bash
-bv --robot-plan --label backend --format toon         # Scope to label's subgraph
-bv --robot-insights --as-of HEAD~30 --format toon     # Historical point-in-time
-bv --recipe actionable --robot-plan --format toon     # Pre-filter: ready to work (no blockers)
-bv --recipe high-impact --robot-triage --format toon  # Pre-filter: top PageRank scores
-```
-
-### br Commands for Issue Management
-
-```bash
-br ready              # Show issues ready to work (no blockers)
-br list --status=open # All open issues
-br show <id>          # Full issue details with dependencies
-br create --title="..." --type=task --priority=2
-br update <id> --status=in_progress
-br close <id> --reason="Completed"
-br close <id1> <id2>  # Close multiple issues at once
-br sync --flush-only  # Export DB to JSONL
-```
-
-### Workflow Pattern
-
-1. **Triage**: Run `bv --robot-triage --format toon` to find the highest-impact actionable work
-2. **Claim**: Use `br update <id> --status=in_progress`
-3. **Work**: Implement the task
-4. **Complete**: Use `br close <id>`
-5. **Sync**: Always run `br sync --flush-only` at session end
-
-### Key Concepts
-
-- **Dependencies**: Issues can block other issues. `br ready` shows only unblocked work.
-- **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog (use numbers 0-4, not words)
-- **Types**: task, bug, feature, epic, chore, docs, question
-- **Blocking**: `br dep add <issue> <depends-on>` to add dependencies
-
-### Session Protocol
-
-```bash
-git status              # Check what changed
-git add <files>         # Stage code changes
-br sync --flush-only    # Export beads changes to JSONL
-git commit -m "..."     # Commit everything
-git push                # Push to remote
-```
-
-<!-- end-bv-agent-instructions -->
-
-## Orb bootstrap (AO-005)
-
-Hardened Amp Orb lane for shell/Python validation (substitute for skillbox-config,
-which is Orb-denied).
-
-- **Setup:** run `.agents/setup`. It is idempotent, checks fixed Orb disk
-  headroom before work, compiles `.env-manager`/`scripts`/`tests`, then runs
-  `python3 -m unittest tests.test_agent_ops_adapters -q`.
-- **Resume:** run `.agents/resume` on wake. It performs only fast checks
-  (Python/git/toolchain presence and disk headroom) and backgrounds optional
-  repair so it stays inside Amp's 10s non-blocking wake budget.
-- **Status/logs:** setup writes `.agents/state/setup-status.json` and
-  `.agents/logs/setup.log`; resume writes `.agents/state/resume-status.json` and
-  `.agents/logs/resume.log`. Final stderr lines are prefixed
-  `AGENT_SETUP_RESULT_JSON` or `AGENT_RESUME_RESULT_JSON`.
-- **Typed failures:** `setup=10`, `dependency=20`, `capacity=30`, `auth=40`,
-  `validation=50`. Capacity failures mean the fixed 40GB Orb disk does not have
-  enough free space for safe setup/resume.
-- **Broader tests (optional):** `python3 -m unittest discover -s tests` is
-  heavier and not required for bootstrap smoke.
-- **Do not:** start Docker monoserver, load operator `.env` secrets, or touch
-  production box lifecycle on the Orb.
