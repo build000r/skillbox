@@ -364,6 +364,12 @@ run_lane() {
     printf 'self-test: FAIL %-20s %4ss (exit %s)\n' "${id}" "${elapsed}" "${code}" >&2
     log "----- ${id} (last 40 lines) -----"
     tail -n 40 "${log_file}" >&2 || true
+    log "----- ${id} failing tests -----"
+    # The 40-line tail regularly ends inside a test's stdout (JSON noise) and
+    # loses the unittest summary; always surface the failure NAMES too, or a
+    # red lane is undiagnosable from the receipt (skillbox-5gth).
+    grep -E '^(FAIL|ERROR): ' "${log_file}" | tail -n 30 >&2 || true
+    grep -E '^(FAILED|OK)( |$)' "${log_file}" | tail -n 2 >&2 || true
     log "----- end ${id} -----"
   fi
 
