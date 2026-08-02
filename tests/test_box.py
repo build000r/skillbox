@@ -635,7 +635,15 @@ class BoxTests(unittest.TestCase):
         finally:
             BOX_MODULE.wait_for_ssh = original_wait_for_ssh
 
-        self.assertEqual(calls[:3], ["100.100.0.10", "skillbox-test-box", "1.2.3.4"])
+        # The three candidates are probed by a ThreadPoolExecutor
+        # (resolve_box_ssh_target), so APPEND order is thread-scheduling
+        # dependent — asserting an exact sequence made this flake under load
+        # (it reddened two otherwise-green gate runs). The contract is that all
+        # three candidates are probed and the public IP wins as fallback.
+        self.assertEqual(
+            sorted(calls),
+            sorted(["100.100.0.10", "skillbox-test-box", "1.2.3.4"]),
+        )
 
     def test_up_fails_without_do_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
