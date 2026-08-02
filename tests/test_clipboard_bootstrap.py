@@ -12,6 +12,14 @@ from pathlib import Path
 from unittest import mock
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
+
+# These suites assert the tracked, sanitized scripts/clipboard/hosts.json.
+# Operator shells export SKILLBOX_CLIPBOARD_HOSTS to point at a private fleet
+# registry; that override leaking in makes every assertion here depend on
+# operator-local data (and broke the self-test gate, which inherits the
+# pusher's environment). Scrub it at module import.
+os.environ.pop("SKILLBOX_CLIPBOARD_HOSTS", None)
+
 SCRIPTS_DIR = ROOT_DIR / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))

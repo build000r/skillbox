@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import stat
 import tempfile
@@ -13,6 +14,14 @@ from scripts.lib import clipboard_status as status
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
+
+# These suites assert the tracked, sanitized scripts/clipboard/hosts.json.
+# Operator shells export SKILLBOX_CLIPBOARD_HOSTS to point at a private fleet
+# registry; that override leaking in makes every assertion here depend on
+# operator-local data (and broke the self-test gate, which inherits the
+# pusher's environment). Scrub it at module import.
+os.environ.pop("SKILLBOX_CLIPBOARD_HOSTS", None)
+
 
 
 class ClipboardStatusTests(unittest.TestCase):

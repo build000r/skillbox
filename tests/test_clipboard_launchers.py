@@ -9,6 +9,14 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 
+# These suites assert the tracked, sanitized scripts/clipboard/hosts.json.
+# Operator shells export SKILLBOX_CLIPBOARD_HOSTS to point at a private fleet
+# registry; that override leaking in makes every assertion here depend on
+# operator-local data (and broke the self-test gate, which inherits the
+# pusher's environment). Scrub it at module import.
+os.environ.pop("SKILLBOX_CLIPBOARD_HOSTS", None)
+
+
 
 class ClipboardLauncherTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -27,8 +35,15 @@ class ClipboardLauncherTests(unittest.TestCase):
             # ~/.local/bin must not make the missing-helper test pass.
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "TEST_LOG": str(self.log),
-            "DEVL_TRANSPORT": "ssh",
         }
+        # Operator shells export DEVL_* overrides (DEVL_TARGET,
+        # DEVL_JEREMY_TARGET, ...) pointing launchers at the real fleet; these
+        # assertions are against the tracked sanitized defaults, so ambient
+        # overrides must not leak in (they broke the self-test gate, which
+        # inherits the pusher's environment).
+        for key in [k for k in self.env if k.startswith("DEVL_")]:
+            del self.env[key]
+        self.env["DEVL_TRANSPORT"] = "ssh"
         self.env.pop("TMUX", None)
         self.env.pop("TMUX_PANE", None)
 
