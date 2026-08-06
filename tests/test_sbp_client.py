@@ -173,7 +173,7 @@ class SbpClientUnitTests(unittest.TestCase):
     def test_authenticated_response_cannot_change_origin(self) -> None:
         token, _claims = self._token()
         errors = io.StringIO()
-        with mock.patch.dict(os.environ, {"SBP_TOKEN": token}, clear=True):
+        with mock.patch.dict(os.environ, {}, clear=True):
             result = SBP_CLIENT.run_remote_cass(
                 TAILNET_REMOTE,
                 ["status"],
@@ -185,6 +185,7 @@ class SbpClientUnitTests(unittest.TestCase):
                 ),
                 stdout=io.BytesIO(),
                 stderr=errors,
+                token_minter=lambda _audience, _ttl: token,
             )
         self.assertEqual(result, 1)
         self.assertIn("changed transport origin", errors.getvalue())
@@ -390,7 +391,7 @@ class SbpClientUnitTests(unittest.TestCase):
             f"Bearer {refreshed_token}",
         )
 
-    def test_token_mint_timeout_and_static_secret_shape_fail_closed(self) -> None:
+    def test_token_mint_timeout_nonzero_and_malformed_output_fail_closed(self) -> None:
         with (
             mock.patch.dict(os.environ, {}, clear=True),
             mock.patch.object(
@@ -416,12 +417,6 @@ class SbpClientUnitTests(unittest.TestCase):
             ):
                 SBP_CLIENT._auth(TAILNET_REMOTE)
 
-        with (
-            mock.patch.dict(os.environ, {"SBP_TOKEN": "shared-static-secret"}, clear=True),
-            self.assertRaisesRegex(ValueError, "parseable JWT"),
-        ):
-            SBP_CLIENT._auth(TAILNET_REMOTE)
-
     def test_client_rejects_non_rs256_future_and_overlong_tokens(self) -> None:
         now = int(time.time())
         invalid = {
@@ -434,12 +429,15 @@ class SbpClientUnitTests(unittest.TestCase):
         invalid["wrong-algorithm"] = f"{header}.{parts[1]}.{parts[2]}"
         self.assertEqual(claims["token_use"], "exchanged")
         for name, token in invalid.items():
-            with self.subTest(name=name), mock.patch.dict(
-                os.environ,
-                {"SBP_TOKEN": token},
-                clear=True,
-            ), self.assertRaisesRegex(ValueError, "identity contract"):
-                SBP_CLIENT._auth(TAILNET_REMOTE)
+            with (
+                self.subTest(name=name),
+                mock.patch.dict(os.environ, {}, clear=True),
+                self.assertRaisesRegex(ValueError, "identity contract"),
+            ):
+                SBP_CLIENT._auth(
+                    TAILNET_REMOTE,
+                    token_minter=lambda _audience, _ttl, value=token: value,
+                )
 
     def test_authenticated_pull_caches_exact_capsule_for_verified_offline_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -454,7 +452,6 @@ class SbpClientUnitTests(unittest.TestCase):
                 "SBP_PROJECT_ID": "project-test",
                 "SBP_RESUME_ID": "resume-test",
                 "SBP_THREAD_ID": "T-test",
-                "SBP_TOKEN": token,
                 "SBP_USER_ID": "user-test",
             }
             online_output = io.BytesIO()
@@ -466,6 +463,7 @@ class SbpClientUnitTests(unittest.TestCase):
                         return_value=Response(bundle, self._identity_headers(tree_sha))
                     ),
                     stdout=online_output,
+                    token_minter=lambda _audience, _ttl: token,
                 )
             self.assertEqual(result, 0, online_output.getvalue())
             online = json.loads(online_output.getvalue())
@@ -559,7 +557,6 @@ class SbpClientUnitTests(unittest.TestCase):
                 "SBP_PROJECT_ID": "project-test",
                 "SBP_RESUME_ID": "resume-test",
                 "SBP_THREAD_ID": "T-test",
-                "SBP_TOKEN": token,
                 "SBP_USER_ID": "user-test",
                 "SBP_WORKSPACE_ID": workspace,
             }
@@ -572,6 +569,7 @@ class SbpClientUnitTests(unittest.TestCase):
                         return_value=Response(bundle, self._identity_headers(tree_sha))
                     ),
                     stdout=online_output,
+                    token_minter=lambda _audience, _ttl: token,
                 )
             self.assertEqual(result, 0, online_output.getvalue())
             cache_dir = next((root / "cache").iterdir())
@@ -708,7 +706,6 @@ class SbpClientUnitTests(unittest.TestCase):
                     "SBP_PROJECT_ID": "project-test",
                     "SBP_RESUME_ID": "resume-test",
                     "SBP_THREAD_ID": "T-test",
-                    "SBP_TOKEN": token,
                     "SBP_USER_ID": "user-test",
                 },
                 clear=True,
@@ -718,6 +715,7 @@ class SbpClientUnitTests(unittest.TestCase):
                     ["pull", "sample"],
                     opener=mock.Mock(return_value=Response(bundle, headers)),
                     stdout=output,
+                    token_minter=lambda _audience, _ttl: token,
                 )
         self.assertEqual(result, 1)
         self.assertEqual(json.loads(output.getvalue())["error_code"], "SKILL_CACHE_IDENTITY_INVALID")

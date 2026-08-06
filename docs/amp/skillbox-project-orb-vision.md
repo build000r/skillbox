@@ -124,11 +124,11 @@ token and relying-party contract prove it. This observation proves the Amp
 mint and claim shape only; it does not prove that Sweet Potato/SPAPS accepts
 the identity.
 
-For non-loopback reads, `scripts/lib/sbp_client.py` mints a short-lived token
-using `amp orb id-token` by default, keeps it only in process memory, and
-retries once with a newly minted token after HTTP 401. `SBP_TOKEN` may carry an
-already minted short-lived Amp workload JWT, but the client rejects static
-strings and tokens with the wrong issuer, claims, subject, token-use,
+For every non-loopback read, `scripts/lib/sbp_client.py` mints a fresh,
+short-lived token using `amp orb id-token`, keeps it only in process memory,
+and retries once with another newly minted token after HTTP 401. There is no
+environment-token, token-command, or static-secret shortcut. The client
+rejects minted tokens with the wrong issuer, claims, subject, token-use,
 algorithm, audience, lifetime, or optional workspace binding. `sbpd` always
 performs RS256 signature and immutable allowlist verification; there is no
 shared-secret authentication path.
