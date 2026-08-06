@@ -1,7 +1,7 @@
 # Seamless remote paste live proof — 2026-07-14
 
 Scope: operator Mac and the explicitly permitted `devbox-1` session on
-`skillbox-portfolio-devbox`. No other remote tmux session was attached,
+`portfolio-devbox.example`. No other remote tmux session was attached,
 signaled, reloaded, or written during this proof.
 
 ## Proven
@@ -11,7 +11,7 @@ signaled, reloaded, or written during this proof.
 - Remote receiver: executable from the remote user's home; artifacts are
   content-addressed and mode `0600`; no ports `6000` or `18339` are listening.
 - Route identity: local pane `%16`, redacted local client TTY, canonical
-  profile `devbox`, SSH target `skillbox@skillbox-portfolio-devbox`, remote
+  profile `devbox`, SSH target `skillbox@portfolio-devbox.example`, remote
   session `devbox-1`, generation-stamped registry record.
 - Proof fixture: `assets/og-card.png`, 41,145 bytes, 1200×630 PNG,
   SHA-256 `a925a28d680b52150f7d34e8600f6c9c9a94fca3dce3ed88675b83dca375aa04`.
