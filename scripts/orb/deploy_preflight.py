@@ -7,8 +7,9 @@ import importlib.util
 import json
 import os
 import re
+import secrets
+import stat
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -116,8 +117,9 @@ def collect(
         if previous_deploy_manifest is not None
         else None
     )
+    credential_env = os.environ if env is None else env
     credentials = [
-        {"name": name, "configured": bool((env or os.environ).get(name, "").strip())}
+        {"name": name, "configured": bool(credential_env.get(name, "").strip())}
         for name in overlay["credential_preflight"]["environment_names"]
     ]
     current_artifact = _artifact(current)
@@ -159,26 +161,96 @@ def collect(
     }
 
 
-def write_receipt(path: Path, payload: dict[str, Any]) -> None:
-    if path.is_symlink() or (path.exists() and not path.is_file()):
-        raise ValueError("deploy receipt destination must be a regular file")
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.parent.is_symlink() or not path.parent.is_dir():
-        raise ValueError("deploy receipt parent must be a real directory")
-    os.chmod(path.parent, 0o700)
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+def _open_private_directory(path: Path) -> int:
+    absolute = path.absolute()
+    if ".." in absolute.parts:
+        raise ValueError("deploy receipt path cannot contain parent traversal")
+    directory_fd = os.open(absolute.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        for index, part in enumerate(absolute.parts[1:]):
+            created = False
+            try:
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                os.mkdir(part, mode=0o700, dir_fd=directory_fd)
+                created = True
+                os.chmod(part, 0o700, dir_fd=directory_fd)
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory_fd,
+                )
+            os.close(directory_fd)
+            directory_fd = next_fd
+            details = os.fstat(directory_fd)
+            mode = stat.S_IMODE(details.st_mode)
+            is_final = index == len(absolute.parts[1:]) - 1
+            if details.st_uid not in {0, os.geteuid()}:
+                raise ValueError("deploy receipt ancestors must have trusted ownership")
+            if mode & 0o022 and not (
+                details.st_uid == 0 and details.st_mode & stat.S_ISVTX
+            ):
+                raise ValueError("deploy receipt ancestors cannot be group/world writable")
+            if is_final:
+                if details.st_uid != os.geteuid():
+                    raise ValueError("deploy receipt parent must be owned by this user")
+                if created:
+                    os.fchmod(directory_fd, 0o700)
+                if stat.S_IMODE(os.fstat(directory_fd).st_mode) != 0o700:
+                    raise ValueError("deploy receipt parent must have mode 0700")
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def write_receipt(path: Path, payload: dict[str, Any]) -> None:
+    if not path.name or path.name in {".", ".."}:
+        raise ValueError("deploy receipt destination must name a file")
+    directory_fd = _open_private_directory(path.parent)
+    temporary = f".{path.name}.{secrets.token_hex(8)}"
+    file_fd: int | None = None
+    try:
+        try:
+            existing = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and not stat.S_ISREG(existing.st_mode):
+            raise ValueError("deploy receipt destination must be a regular file")
+        file_fd = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        os.fchmod(file_fd, 0o600)
+        with os.fdopen(file_fd, "w", encoding="utf-8") as stream:
+            file_fd = None
             json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        os.chmod(path, 0o600)
+        os.replace(
+            temporary,
+            path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
     finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+        try:
+            if file_fd is not None:
+                os.close(file_fd)
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        finally:
+            os.close(directory_fd)
 
 
 def receipt_destination(
@@ -187,17 +259,19 @@ def receipt_destination(
     requested: Path | None,
 ) -> Path:
     store_relative = Path(overlay["receipt_store"]["root"])
-    raw_root = ROOT / store_relative
+    if ".." in store_relative.parts or (requested is not None and ".." in requested.parts):
+        raise ValueError("deploy receipt path cannot contain parent traversal")
+    raw_root = (ROOT / store_relative).absolute()
     cursor = ROOT
     for part in store_relative.parts:
         cursor /= part
         if cursor.is_symlink():
             raise ValueError("deploy receipt store cannot contain symlinks")
-    store = raw_root.resolve(strict=False)
+    store = raw_root
     if requested is None:
         return store / f"preflight-{payload['artifact']['archive_sha256']}.json"
     candidate = requested if requested.is_absolute() else ROOT / requested
-    destination = candidate.resolve(strict=False)
+    destination = candidate.absolute()
     if destination.parent != store and store not in destination.parents:
         raise ValueError("deploy receipt output must remain in the declared receipt store")
     return destination

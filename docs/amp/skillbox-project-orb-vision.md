@@ -126,12 +126,14 @@ the identity.
 
 For non-loopback reads, `scripts/lib/sbp_client.py` mints a short-lived token
 using `amp orb id-token` by default, keeps it only in process memory, and
-retries once with a newly minted token after HTTP 401. `SBP_TOKEN` may carry an
-already minted short-lived Amp workload JWT, but the client rejects static
-strings and tokens with the wrong issuer, claims, subject, token-use,
-algorithm, audience, lifetime, or optional workspace binding. `sbpd` always
-performs RS256 signature and immutable allowlist verification; there is no
-shared-secret authentication path.
+retries once with a newly minted token after HTTP 401. Runtime authentication
+has no environment-token, file-token, or static-secret shortcut: every online
+authenticated request must mint Amp OIDC. Tests may inject an in-memory minter
+callable, but production dispatch does not expose that injection surface.
+The client rejects minted tokens with the wrong issuer, claims, subject,
+token-use, algorithm, audience, lifetime, or optional workspace binding.
+`sbpd` always performs RS256 signature and immutable allowlist verification;
+there is no shared-secret authentication path.
 
 ## Authenticated skill source and cold resume
 

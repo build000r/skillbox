@@ -82,6 +82,10 @@ class SbpClientUnitTests(unittest.TestCase):
         return f"{encoded({'alg': 'RS256', 'typ': 'JWT'})}.{encoded(claims)}.signature", claims
 
     @staticmethod
+    def _minter(token: str):
+        return lambda _audience, _ttl: token
+
+    @staticmethod
     def _identity_headers(tree_sha: str) -> dict[str, str]:
         return {
             "X-Skill-Tree-Sha256": tree_sha,
@@ -173,7 +177,7 @@ class SbpClientUnitTests(unittest.TestCase):
     def test_authenticated_response_cannot_change_origin(self) -> None:
         token, _claims = self._token()
         errors = io.StringIO()
-        with mock.patch.dict(os.environ, {"SBP_TOKEN": token}, clear=True):
+        with mock.patch.dict(os.environ, {}, clear=True):
             result = SBP_CLIENT.run_remote_cass(
                 TAILNET_REMOTE,
                 ["status"],
@@ -183,6 +187,7 @@ class SbpClientUnitTests(unittest.TestCase):
                         "http://100.100.0.11:8443/v1/cass/status",
                     )
                 ),
+                token_minter=self._minter(token),
                 stdout=io.BytesIO(),
                 stderr=errors,
             )
@@ -361,25 +366,21 @@ class SbpClientUnitTests(unittest.TestCase):
             io.BytesIO(b'{"ok":false}'),
         )
         opener = mock.Mock(side_effect=(unauthorized, Response(b'{"ok":true}')))
-        minted = (
-            subprocess.CompletedProcess([], 0, first_token + "\n", ""),
-            subprocess.CompletedProcess([], 0, refreshed_token + "\n", ""),
-        )
-        with (
-            mock.patch.dict(os.environ, {}, clear=True),
-            mock.patch.object(SBP_CLIENT.subprocess, "run", side_effect=minted) as run,
-        ):
+        minter = mock.Mock(side_effect=(first_token, refreshed_token))
+        with mock.patch.dict(os.environ, {}, clear=True):
             output = io.BytesIO()
             result = SBP_CLIENT.run_remote_cass(
                 TAILNET_REMOTE,
                 ["status"],
                 opener=opener,
+                token_minter=minter,
                 stdout=output,
             )
 
         self.assertEqual(result, 0)
         self.assertEqual(output.getvalue(), b'{"ok":true}')
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(minter.call_count, 2)
+        self.assertEqual(minter.call_args_list, [mock.call("sbpd", "600")] * 2)
         self.assertEqual(opener.call_count, 2)
         self.assertEqual(
             opener.call_args_list[0].args[0].headers["Authorization"],
@@ -390,7 +391,39 @@ class SbpClientUnitTests(unittest.TestCase):
             f"Bearer {refreshed_token}",
         )
 
-    def test_token_mint_timeout_and_static_secret_shape_fail_closed(self) -> None:
+    def test_loopback_unauthorized_response_mints_once_for_retry(self) -> None:
+        token, _claims = self._token()
+        remote = "http://127.0.0.1:8443"
+        unauthorized = urllib.error.HTTPError(
+            f"{remote}/v1/cass/status",
+            401,
+            "Unauthorized",
+            {},
+            io.BytesIO(b'{"ok":false}'),
+        )
+        opener = mock.Mock(side_effect=(unauthorized, Response(b'{"ok":true}')))
+        minter = mock.Mock(return_value=token)
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            output = io.BytesIO()
+            result = SBP_CLIENT.run_remote_cass(
+                remote,
+                ["status"],
+                opener=opener,
+                token_minter=minter,
+                stdout=output,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue(), b'{"ok":true}')
+        minter.assert_called_once_with("sbpd", "600")
+        self.assertNotIn("Authorization", opener.call_args_list[0].args[0].headers)
+        self.assertEqual(
+            opener.call_args_list[1].args[0].headers["Authorization"],
+            f"Bearer {token}",
+        )
+
+    def test_token_mint_timeout_malformed_output_and_env_shortcut_fail_closed(self) -> None:
         with (
             mock.patch.dict(os.environ, {}, clear=True),
             mock.patch.object(
@@ -416,9 +449,15 @@ class SbpClientUnitTests(unittest.TestCase):
             ):
                 SBP_CLIENT._auth(TAILNET_REMOTE)
 
+        injected, _claims = self._token()
         with (
-            mock.patch.dict(os.environ, {"SBP_TOKEN": "shared-static-secret"}, clear=True),
-            self.assertRaisesRegex(ValueError, "parseable JWT"),
+            mock.patch.dict(os.environ, {"SBP_TOKEN": injected}, clear=True),
+            mock.patch.object(
+                SBP_CLIENT.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(["amp"], 10),
+            ),
+            self.assertRaisesRegex(ValueError, "unable to mint"),
         ):
             SBP_CLIENT._auth(TAILNET_REMOTE)
 
@@ -434,12 +473,15 @@ class SbpClientUnitTests(unittest.TestCase):
         invalid["wrong-algorithm"] = f"{header}.{parts[1]}.{parts[2]}"
         self.assertEqual(claims["token_use"], "exchanged")
         for name, token in invalid.items():
-            with self.subTest(name=name), mock.patch.dict(
-                os.environ,
-                {"SBP_TOKEN": token},
-                clear=True,
-            ), self.assertRaisesRegex(ValueError, "identity contract"):
-                SBP_CLIENT._auth(TAILNET_REMOTE)
+            with (
+                self.subTest(name=name),
+                mock.patch.dict(os.environ, {}, clear=True),
+                self.assertRaisesRegex(ValueError, "identity contract"),
+            ):
+                SBP_CLIENT._auth(
+                    TAILNET_REMOTE,
+                    token_minter=self._minter(token),
+                )
 
     def test_authenticated_pull_caches_exact_capsule_for_verified_offline_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -454,7 +496,6 @@ class SbpClientUnitTests(unittest.TestCase):
                 "SBP_PROJECT_ID": "project-test",
                 "SBP_RESUME_ID": "resume-test",
                 "SBP_THREAD_ID": "T-test",
-                "SBP_TOKEN": token,
                 "SBP_USER_ID": "user-test",
             }
             online_output = io.BytesIO()
@@ -465,6 +506,7 @@ class SbpClientUnitTests(unittest.TestCase):
                     opener=mock.Mock(
                         return_value=Response(bundle, self._identity_headers(tree_sha))
                     ),
+                    token_minter=self._minter(token),
                     stdout=online_output,
                 )
             self.assertEqual(result, 0, online_output.getvalue())
@@ -559,7 +601,6 @@ class SbpClientUnitTests(unittest.TestCase):
                 "SBP_PROJECT_ID": "project-test",
                 "SBP_RESUME_ID": "resume-test",
                 "SBP_THREAD_ID": "T-test",
-                "SBP_TOKEN": token,
                 "SBP_USER_ID": "user-test",
                 "SBP_WORKSPACE_ID": workspace,
             }
@@ -571,6 +612,7 @@ class SbpClientUnitTests(unittest.TestCase):
                     opener=mock.Mock(
                         return_value=Response(bundle, self._identity_headers(tree_sha))
                     ),
+                    token_minter=self._minter(token),
                     stdout=online_output,
                 )
             self.assertEqual(result, 0, online_output.getvalue())
@@ -708,7 +750,6 @@ class SbpClientUnitTests(unittest.TestCase):
                     "SBP_PROJECT_ID": "project-test",
                     "SBP_RESUME_ID": "resume-test",
                     "SBP_THREAD_ID": "T-test",
-                    "SBP_TOKEN": token,
                     "SBP_USER_ID": "user-test",
                 },
                 clear=True,
@@ -717,6 +758,7 @@ class SbpClientUnitTests(unittest.TestCase):
                     TAILNET_REMOTE,
                     ["pull", "sample"],
                     opener=mock.Mock(return_value=Response(bundle, headers)),
+                    token_minter=self._minter(token),
                     stdout=output,
                 )
         self.assertEqual(result, 1)

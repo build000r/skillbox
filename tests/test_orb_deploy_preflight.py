@@ -3,10 +3,14 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "scripts/orb/deploy_preflight.py"
@@ -96,6 +100,33 @@ class OrbDeployPreflightTests(unittest.TestCase):
         self.assertEqual(missing_rollback["reason_code"], "ROLLBACK_UNPROVEN")
         self.assertEqual(missing_credential["reason_code"], "CREDENTIAL_UNAVAILABLE")
 
+    def test_explicit_empty_env_does_not_fall_back_to_process_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            current = self._manifest(root, "current", "a" * 40)
+            previous = self._manifest(root, "previous", "b" * 40)
+            prior = os.environ.get("SSH_AUTH_SOCK")
+            os.environ["SSH_AUTH_SOCK"] = "/configured/in-parent-process"
+            try:
+                explicit_empty = DEPLOY.collect(
+                    DEPLOY.DEFAULT_OVERLAY,
+                    current,
+                    box_id="project-orb-test",
+                    previous_deploy_manifest=previous,
+                    env={},
+                )
+            finally:
+                if prior is None:
+                    os.environ.pop("SSH_AUTH_SOCK", None)
+                else:
+                    os.environ["SSH_AUTH_SOCK"] = prior
+
+        self.assertEqual(explicit_empty["reason_code"], "CREDENTIAL_UNAVAILABLE")
+        self.assertEqual(
+            explicit_empty["credential_preflight"],
+            [{"name": "SSH_AUTH_SOCK", "configured": False}],
+        )
+
     def test_rejects_short_commit_and_overlay_authority_widening(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -145,6 +176,9 @@ class OrbDeployPreflightTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "declared receipt store"):
             DEPLOY.receipt_destination(overlay, payload, Path("/tmp/escape.json"))
+        traversal = expected_root / "nested" / ".." / ".." / "outside" / "receipt.json"
+        with self.assertRaisesRegex(ValueError, "parent traversal"):
+            DEPLOY.receipt_destination(overlay, payload, traversal)
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -155,6 +189,79 @@ class OrbDeployPreflightTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "regular file"):
                 DEPLOY.write_receipt(symlink, payload)
             self.assertEqual(target.read_text(encoding="utf-8"), "operator owned\n")
+
+    def test_receipt_writer_rejects_symlinked_ancestor_and_broad_parent(self) -> None:
+        payload = {"state": "configured"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outside = root / "outside"
+            outside.mkdir(mode=0o700)
+            linked = root / "linked"
+            linked.symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(OSError):
+                DEPLOY.write_receipt(linked / "receipt.json", payload)
+            self.assertFalse((outside / "receipt.json").exists())
+
+            broad = root / "broad"
+            broad.mkdir(mode=0o755)
+            with self.assertRaisesRegex(ValueError, "mode 0700"):
+                DEPLOY.write_receipt(broad / "receipt.json", payload)
+            self.assertFalse((broad / "receipt.json").exists())
+
+            private = root / "private"
+            private.mkdir(mode=0o700)
+            with self.assertRaisesRegex(ValueError, "parent traversal"):
+                DEPLOY.write_receipt(private / "nested" / ".." / "receipt.json", payload)
+            self.assertFalse((private / "receipt.json").exists())
+
+    def test_receipt_mode_is_exact_under_restrictive_umask(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            receipt = Path(directory) / "receipts" / "receipt.json"
+            program = (
+                "import importlib.util,json,os,stat,sys;"
+                "spec=importlib.util.spec_from_file_location('deploy_preflight',sys.argv[1]);"
+                "module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);"
+                "os.umask(0o777);module.write_receipt(module.Path(sys.argv[2]),{'state':'ready'});"
+                "print(oct(stat.S_IMODE(os.stat(sys.argv[2]).st_mode)))"
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", program, str(MODULE_PATH), str(receipt)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.stdout.strip(), "0o600")
+
+    def test_receipt_writer_keeps_open_directory_when_path_is_swapped(self) -> None:
+        payload = {"state": "configured"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent = root / "receipts"
+            moved = root / "receipts-opened"
+            outside = root / "outside"
+            parent.mkdir(mode=0o700)
+            outside.mkdir(mode=0o700)
+            real_replace = os.replace
+
+            def swap_then_replace(source, destination, *, src_dir_fd, dst_dir_fd):
+                parent.rename(moved)
+                parent.symlink_to(outside, target_is_directory=True)
+                return real_replace(
+                    source,
+                    destination,
+                    src_dir_fd=src_dir_fd,
+                    dst_dir_fd=dst_dir_fd,
+                )
+
+            with mock.patch.object(DEPLOY.os, "replace", side_effect=swap_then_replace):
+                DEPLOY.write_receipt(parent / "receipt.json", payload)
+
+            self.assertEqual(
+                json.loads((moved / "receipt.json").read_text(encoding="utf-8")),
+                payload,
+            )
+            self.assertFalse((outside / "receipt.json").exists())
 
 
 if __name__ == "__main__":
