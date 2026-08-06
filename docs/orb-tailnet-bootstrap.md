@@ -514,7 +514,7 @@ sbp cass search 'tailnet'
 Orb's `tag:orb` identity and tailnet grants. When `sbpd --require-auth` is in
 use, the client additionally mints an in-memory, audience-`sbpd` Amp workload
 token and the server verifies its RS256 signature, issuer, expiry, subject,
-`token_use=exchanged`, and immutable project allowlist. The server must be
+`token_use=exchanged`, and exactly one immutable project ID. The server must be
 started with both `--allowed-project-id <immutable-id>` and
 `--project-alias build000r/skillbox`; there is no static-secret fallback.
 `workspace_id` is optional unless the real token/verifier contract proves it.

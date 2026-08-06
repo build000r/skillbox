@@ -168,7 +168,7 @@ def _jwt_claims(token: str, audience: str) -> dict[str, object]:
         payload = parts[1] + "=" * (-len(parts[1]) % 4)
         claims = json.loads(base64.urlsafe_b64decode(payload))
     except Exception as exc:
-        raise ValueError("SBP_TOKEN is not a parseable JWT") from exc
+        raise ValueError("minted Amp OIDC token is not a parseable JWT") from exc
     now = time.time()
     required = ("email", "project_id", "thread_id", "user_id", "jti", "sub")
     if (
@@ -189,24 +189,24 @@ def _jwt_claims(token: str, audience: str) -> dict[str, object]:
         or claims["exp"] <= claims["iat"]
         or claims["exp"] - claims["iat"] > 3600
     ):
-        raise ValueError("SBP_TOKEN does not satisfy the Amp identity contract")
+        raise ValueError("minted Amp OIDC token does not satisfy the Amp identity contract")
     workspace = claims.get("workspace_id")
     if workspace is not None and (not isinstance(workspace, str) or not workspace.strip()):
-        raise ValueError("SBP_TOKEN does not satisfy the Amp identity contract")
+        raise ValueError("minted Amp OIDC token does not satisfy the Amp identity contract")
     prefix = f"workspace:{workspace}:" if workspace is not None else ""
     expected_sub = (
         f"{prefix}project:{claims['project_id']}:user:{claims['user_id']}:"
         f"thread:{claims['thread_id']}"
     )
     if claims["sub"] != expected_sub:
-        raise ValueError("SBP_TOKEN subject does not match identity claims")
+        raise ValueError("minted Amp OIDC token subject does not match identity claims")
     expected_claims = {
         "project_id": os.environ.get("SBP_PROJECT_ID"),
         "thread_id": os.environ.get("SBP_THREAD_ID"),
         "workspace_id": os.environ.get("SBP_WORKSPACE_ID"),
     }
     if any(expected and claims.get(key) != expected for key, expected in expected_claims.items()):
-        raise ValueError("SBP_TOKEN does not match expected identity")
+        raise ValueError("minted Amp OIDC token does not match expected identity")
     return claims
 
 
@@ -220,27 +220,35 @@ def _is_loopback(remote: str) -> bool:
         return False
 
 
-def _auth(remote: str, *, force_mint: bool = False) -> tuple[str | None, dict[str, object] | None]:
+def _mint_amp_oidc_token(audience: str, ttl: str) -> str:
+    try:
+        completed = subprocess.run(
+            ["amp", "orb", "id-token", "--audience", audience, "--ttl-seconds", ttl],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=TOKEN_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("unable to mint Amp workload identity") from exc
+    return completed.stdout.strip()
+
+
+def _auth(
+    remote: str,
+    *,
+    token_minter: Callable[[str, str], str] | None = None,
+) -> tuple[str | None, dict[str, object] | None]:
     audience = os.environ.get("SBP_AUDIENCE", "sbpd")
-    explicit = os.environ.get("SBP_TOKEN", "").strip()
-    if explicit and not force_mint:
-        return explicit, _jwt_claims(explicit, audience)
-    if not force_mint and _is_loopback(remote) and os.environ.get("SBP_REQUIRE_AUTH") != "1":
+    if _is_loopback(remote) and os.environ.get("SBP_REQUIRE_AUTH") != "1":
         return None, None
-    ttl = os.environ.get("SBP_TOKEN_TTL_SECONDS", "600")
+    ttl = os.environ.get("SBP_OIDC_TTL_SECONDS", "600")
     try:
         if not 60 <= int(ttl) <= 3600:
             raise ValueError
     except ValueError as exc:
         raise ValueError("SBP token TTL must be between 60 and 3600 seconds") from exc
-    try:
-        completed = subprocess.run(
-            ["amp", "orb", "id-token", "--audience", audience, "--ttl-seconds", ttl],
-            check=True, capture_output=True, text=True, timeout=TOKEN_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise ValueError("unable to mint Amp workload identity") from exc
-    token = completed.stdout.strip()
+    token = (token_minter or _mint_amp_oidc_token)(audience, ttl)
     return token, _jwt_claims(token, audience)
 
 
@@ -251,8 +259,9 @@ def _open_authenticated(
     *,
     timeout: float,
     opener: Callable[..., object],
+    token_minter: Callable[[str, str], str] | None = None,
 ) -> tuple[object, dict[str, object] | None]:
-    token, claims = _auth(remote)
+    token, claims = _auth(remote, token_minter=token_minter)
     try:
         response = opener(
             urllib.request.Request(url, headers=_request_headers(accept, token)),
@@ -262,7 +271,7 @@ def _open_authenticated(
     except urllib.error.HTTPError as exc:
         if exc.code != 401:
             raise
-        token, claims = _auth(remote, force_mint=True)
+        token, claims = _auth(remote, token_minter=token_minter)
         response = opener(
             urllib.request.Request(url, headers=_request_headers(accept, token)),
             timeout=timeout,
@@ -286,6 +295,7 @@ def run_remote_cass(
     opener: Callable[..., object] = _NO_REDIRECT_OPEN,
     stdout: BinaryIO | None = None,
     stderr: object | None = None,
+    token_minter: Callable[[str, str], str] | None = None,
 ) -> int:
     """Run one remote cass read and copy the server envelope byte-for-byte."""
     output = stdout if stdout is not None else sys.stdout.buffer
@@ -303,6 +313,7 @@ def run_remote_cass(
             "application/json",
             timeout=timeout,
             opener=opener,
+            token_minter=token_minter,
         )
         output.write(_read_bounded(response, MAX_CASS_RESPONSE_BYTES, "Cass response"))
         return 0
@@ -373,6 +384,7 @@ def run_remote_skill_pull(
     opener: Callable[..., object] = _NO_REDIRECT_OPEN,
     stdout: BinaryIO | None = None,
     stderr: object | None = None,
+    token_minter: Callable[[str, str], str] | None = None,
 ) -> int:
     """Fetch, verify, and print one remote current-session skill packet."""
     output = stdout if stdout is not None else sys.stdout.buffer
@@ -402,6 +414,7 @@ def run_remote_skill_pull(
             "application/gzip",
             timeout=timeout,
             opener=opener,
+            token_minter=token_minter,
         )
         bundle_bytes = _read_bounded(response, MAX_SKILL_BUNDLE_BYTES, "skill bundle")
         expected_tree = response.headers.get("X-Skill-Tree-Sha256", "")

@@ -433,7 +433,7 @@ class OracleAttachmentTests(unittest.TestCase):
             chunk = original_read(descriptor, amount)
             if chunk and not changed:
                 changed = True
-                source.write_bytes(b"B" * 128)
+                source.write_bytes(b"B" * 129)
             return chunk
 
         with mock.patch.object(attachments.os, "read", side_effect=racing_read):

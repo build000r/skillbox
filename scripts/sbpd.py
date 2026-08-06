@@ -152,6 +152,8 @@ class JWKSVerifier:
         allowed_workspace_ids: tuple[str, ...] = (),
     ) -> None:
         _require_https_jwks_url(jwks_url)
+        if len(allowed_project_ids) != 1:
+            raise ValueError("exactly one allowed project identity is required")
         for label, values in (
             ("project", allowed_project_ids),
             ("user", allowed_user_ids),
@@ -167,7 +169,7 @@ class JWKSVerifier:
         self.kid_refresh_cooldown_seconds = kid_refresh_cooldown_seconds
         self.opener = opener
         self.clock = clock
-        self.allowed_project_ids = tuple(allowed_project_ids)
+        self.allowed_project_id = allowed_project_ids[0]
         self.allowed_user_ids = tuple(allowed_user_ids)
         self.allowed_workspace_ids = tuple(allowed_workspace_ids)
         self._keys: dict[str, dict[str, Any]] = {}
@@ -287,7 +289,7 @@ class JWKSVerifier:
         workspace = claims.get("workspace_id")
         if workspace is not None and (not isinstance(workspace, str) or not workspace.strip()):
             raise AuthenticationError("invalid workspace identity")
-        if self.allowed_project_ids and claims["project_id"] not in self.allowed_project_ids:
+        if claims["project_id"] != self.allowed_project_id:
             raise AuthenticationError("project is not allowed")
         if self.allowed_user_ids and claims["user_id"] not in self.allowed_user_ids:
             raise AuthenticationError("user is not allowed")
@@ -794,8 +796,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not ipaddress.ip_address(args.bind).is_loopback and not args.require_auth:
         parser.error("Tailnet binds require --require-auth")
-    if args.require_auth and (not args.allowed_project_id or not args.project_alias):
-        parser.error("--require-auth requires --allowed-project-id and --project-alias")
+    if args.require_auth and (len(args.allowed_project_id) != 1 or not args.project_alias):
+        parser.error("--require-auth requires exactly one --allowed-project-id and --project-alias")
     if args.project_alias and PROJECT_ALIAS_RE.fullmatch(args.project_alias) is None:
         parser.error("--project-alias has invalid characters")
     server_class = (

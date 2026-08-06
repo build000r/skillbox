@@ -380,15 +380,19 @@ class RepoIdentityE2ETests(unittest.TestCase):
     def test_lint_fires_when_literals_enumerate_the_full_resolved_set(self) -> None:
         """The lint WARNS only when the rule's literals enumerate the id's FULL
         resolved set (a no-op ``repos:`` swap). On the devbox-like profile the
-        ``api-server`` id resolves to BOTH the home form and the /srv re-rooting, so
-        the rule must list both spellings to be a genuine duplicate (the y8w fix:
-        equality, not membership)."""
+        ``api-server`` id resolves to the home form and both declared /srv
+        re-rootings, so the rule must list all spellings to be a genuine duplicate
+        (the y8w fix: equality, not membership)."""
         policy = {
             "rules": [
                 {
                     "id": "api-old",
                     "skills": ["x"],
-                    "paths": ["~/repos/api_server", "/srv/skillbox/repos/api_server"],
+                    "paths": [
+                        "~/repos/api_server",
+                        "/srv/skillbox/repos/api_server",
+                        "/srv/repos/api_server",
+                    ],
                 },
             ]
         }

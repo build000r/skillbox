@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "scripts/orb/deploy_preflight.py"
@@ -85,13 +87,14 @@ class OrbDeployPreflightTests(unittest.TestCase):
                 box_id="project-orb-test",
                 env={"SSH_AUTH_SOCK": "configured"},
             )
-            missing_credential = DEPLOY.collect(
-                DEPLOY.DEFAULT_OVERLAY,
-                current,
-                box_id="project-orb-test",
-                previous_deploy_manifest=previous,
-                env={},
-            )
+            with mock.patch.dict(os.environ, {"SSH_AUTH_SOCK": "ambient-value"}, clear=True):
+                missing_credential = DEPLOY.collect(
+                    DEPLOY.DEFAULT_OVERLAY,
+                    current,
+                    box_id="project-orb-test",
+                    previous_deploy_manifest=previous,
+                    env={},
+                )
 
         self.assertEqual(missing_rollback["reason_code"], "ROLLBACK_UNPROVEN")
         self.assertEqual(missing_credential["reason_code"], "CREDENTIAL_UNAVAILABLE")
@@ -155,6 +158,73 @@ class OrbDeployPreflightTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "regular file"):
                 DEPLOY.write_receipt(symlink, payload)
             self.assertEqual(target.read_text(encoding="utf-8"), "operator owned\n")
+
+    def test_receipt_store_rejects_symlinked_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outside = root / "outside"
+            outside.mkdir()
+            linked_store = root / "receipt-store"
+            linked_store.symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "ancestors must be real directories"):
+                DEPLOY.write_receipt(
+                    linked_store / "preflight.json",
+                    {"ok": True},
+                    store_root=linked_store,
+                )
+            self.assertFalse((outside / "preflight.json").exists())
+
+    def test_receipt_serialization_failure_opens_no_store_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = Path(directory) / "receipt-store"
+            with (
+                mock.patch.object(DEPLOY, "_open_receipt_parent") as open_parent,
+                self.assertRaises(TypeError),
+            ):
+                DEPLOY.write_receipt(
+                    store / "preflight.json",
+                    {"not_json": object()},
+                    store_root=store,
+                )
+            open_parent.assert_not_called()
+
+    def test_receipt_write_remains_confined_when_store_path_is_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = root / "receipt-store"
+            store.mkdir(mode=0o700)
+            moved_store = root / "receipt-store-opened"
+            outside = root / "outside"
+            outside.mkdir()
+            destination = store / "preflight.json"
+            real_replace = os.replace
+
+            def replace_after_swap(
+                source: str,
+                target: str,
+                *,
+                src_dir_fd: int,
+                dst_dir_fd: int,
+            ) -> None:
+                store.rename(moved_store)
+                store.symlink_to(outside, target_is_directory=True)
+                real_replace(
+                    source,
+                    target,
+                    src_dir_fd=src_dir_fd,
+                    dst_dir_fd=dst_dir_fd,
+                )
+
+            with mock.patch.object(DEPLOY.os, "replace", side_effect=replace_after_swap):
+                DEPLOY.write_receipt(destination, {"ok": True}, store_root=store)
+
+            self.assertFalse((outside / destination.name).exists())
+            self.assertEqual(
+                json.loads((moved_store / destination.name).read_text(encoding="utf-8")),
+                {"ok": True},
+            )
+            self.assertEqual(stat.S_IMODE((moved_store / destination.name).stat().st_mode), 0o600)
 
 
 if __name__ == "__main__":
