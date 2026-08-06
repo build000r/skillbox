@@ -75,6 +75,49 @@ class ClipboardLauncherTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("--profile sweet", self.log.read_text())
 
+    def test_conference_c_defaults_to_ssh_even_when_mosh_server_exists(self) -> None:
+        # Fake ssh succeeds for every probe (including a mosh-server check if
+        # one were still present). Conference1 must still choose ssh because
+        # the ProxyCommand path cannot carry mosh UDP.
+        for launcher in ("d3", "d2"):
+            self.log.write_text("", encoding="utf-8")
+            completed = self._run(launcher, "c")
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            call = self.log.read_text()
+            self.assertIn("--profile conference1", call, msg=launcher)
+            self.assertIn("--transport ssh", call, msg=launcher)
+            self.assertIn("--target conference1-wsl", call, msg=launcher)
+            self.assertNotIn(" mosh ", f" {call} ", msg=launcher)
+
+    def test_conference_c_honors_explicit_mosh_override(self) -> None:
+        self.env["DEVL_CONFERENCE_TRANSPORT"] = "mosh"
+        completed = self._run("d3", "c")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        call = self.log.read_text()
+        self.assertIn("--profile conference1", call)
+        self.assertIn("--transport mosh", call)
+        self.assertIn("mosh conference1-wsl", call)
+
+    def test_conference_c_falls_back_to_windows_wrapper_when_wsl_unreachable(self) -> None:
+        # Fail only the reachability probe (`... true`); other ssh uses succeed.
+        self._fake(
+            "ssh",
+            """
+args="$*"
+case "$args" in
+  *' true'|*' true '*) exit 1 ;;
+esac
+cat >/dev/null
+printf 'devbox-1\\n'
+""",
+        )
+        completed = self._run("d3", "c")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        call = self.log.read_text()
+        self.assertIn("--profile conference1-fallback", call)
+        self.assertIn("--transport wsl", call)
+        self.assertIn("--target conference1-ssh", call)
+
     def test_launcher_refuses_unregistered_route_ownership(self) -> None:
         (self.bin / "clipboard-route-exec").unlink()
         completed = self._run("d3")

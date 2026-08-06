@@ -20,6 +20,32 @@ is surfaced through `sbp conference1` (aliases: `conf1`, `tailnet`), backed by
 Both SSH host aliases and the dedicated key (`~/.ssh/id_ed25519_conference1`)
 are defined in `~/.ssh/config` on this box.
 
+## d3 → conference1 (skillbox portfolio-devbox)
+
+The skillbox d3 host (`skillbox-portfolio-devbox`, Tailscale
+`100.79.193.34`) already sits on the same tailnet and is allowed to SSH into
+Conference1 with the same operator reachability as the Mac:
+
+| From d3 | Target | How |
+| --- | --- | --- |
+| `ssh conference1-wsl` / `ssh conf1` | WSL `worker@100.96.206.87` | Preferred direct Tailscale path |
+| `ssh conference1-ssh` | Windows `worker@100.123.217.11` | Windows OpenSSH |
+| `ssh conference1-wsl-via-windows` | WSL via Windows `ProxyCommand` | Fallback when direct WSL TS is down |
+| `c1` | interactive WSL login shell in `/srv/repos` | `~/.local/bin/c1` helper on d3 |
+
+Auth is a dedicated ed25519 key on d3:
+
+- Private: `skillbox@skillbox-portfolio-devbox:~/.ssh/id_ed25519_conference1`
+- Pub comment: `skillbox-portfolio-devbox-to-conference1-20260621`
+- Authorized on Conference1 Windows (`administrators_authorized_keys` /
+  worker) **and** WSL `~worker/.ssh/authorized_keys`
+
+No Tailscale ACL change is required for this path: both nodes are already on
+the operator tailnet (`build000r@` / tagged skillbox devices) and `tailscale
+ping` succeeds d3 → conference1 / conference1-wsl. If SSH ever fails after a
+key rotation, re-append the d3 public key to both Windows and WSL authorized
+key files; do not open public SSH.
+
 ## Commands
 
 ```sh

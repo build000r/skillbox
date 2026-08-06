@@ -153,8 +153,13 @@ The wrapper path is documented as OSC52-hostile. Probe:
 
 ```bash
 ssh conference1-wsl true
-ssh conference1-wsl 'command -v mosh-server'
 ```
+
+`d3 c` / `d2 c` default to SSH on that path. Do not treat `mosh-server` presence
+as proof the session should use mosh: `conference1-wsl` goes through a Windows
+SSH `ProxyCommand`, which cannot carry mosh UDP. Manual mosh is only for an
+operator who has already proven a non-proxy route
+(`DEVL_CONFERENCE_TRANSPORT=mosh d3 c`).
 
 ### `clipimg-put` fails or pastes wrong content
 

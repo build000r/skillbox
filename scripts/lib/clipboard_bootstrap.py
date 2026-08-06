@@ -184,12 +184,19 @@ def static_conference_route(
 
 def select_conference_route(
     probe_reachable: Callable[[str], bool] | None = None,
-    probe_mosh: Callable[[str], bool] | None = None,
     hosts: dict[str, Any] | None = None,
     root: Path | None = None,
     *,
     live_probe: bool = True,
 ) -> ConferenceRoute:
+    """Pick Conference1 transport from hosts.json; never auto-select mosh.
+
+    Conference1 WSL SSH goes through a Windows ProxyCommand. mosh cannot
+    bootstrap on that path, so the declared profile transport (ssh) is the
+    live default when direct WSL is reachable. Operators may still force mosh
+    via DEVL_CONFERENCE_TRANSPORT on the d2/d3 launchers after proving a
+    non-proxy path.
+    """
     data = hosts or load_hosts(root)
     routing = data["conference_routing"]
     direct = routing["direct_target"]
@@ -197,12 +204,13 @@ def select_conference_route(
     if not live_probe:
         return static_conference_route(hosts=data, root=root)
     reachable = probe_reachable or default_shell_probe
-    mosh_ok = probe_mosh or default_shell_probe
+    profiles = data.get("profiles") or {}
+    conference_profile = profiles.get("conference1") or {}
+    direct_transport = str(conference_profile.get("transport") or "ssh")
 
     if reachable(routing["probe_reachability"]):
-        transport = "mosh" if mosh_ok(routing["probe_mosh"]) else "ssh"
         return ConferenceRoute(
-            transport=transport,
+            transport=direct_transport,
             ssh_target=direct,
             clipboard_capable=True,
             reason="direct_wsl_reachable",

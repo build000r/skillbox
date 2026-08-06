@@ -23,30 +23,30 @@ case "${1:-}" in
         clipboard_profile="sweet"
         shift
         ;;
-	    c|conf|conference1|conference1-ssh)
-	        if [ -z "${DEVL_ROOT+x}" ]; then
-	            root="/srv/repos"
-	        fi
-	        conference_wsl_target="${DEVL_CONFERENCE_WSL_TARGET:-conference1-wsl}"
-	        if [ -n "${DEVL_CONFERENCE_TARGET+x}" ]; then
-	            target="$DEVL_CONFERENCE_TARGET"
-	            transport="${DEVL_CONFERENCE_TRANSPORT:-wsl}"
-	            clipboard_profile="conference1"
-	        elif ssh -o BatchMode=yes -o ConnectTimeout="${DEVL_CONFERENCE_WSL_PROBE_TIMEOUT:-8}" "$conference_wsl_target" 'true' >/dev/null 2>&1; then
-	            target="$conference_wsl_target"
-	            if ssh -o BatchMode=yes -o ConnectTimeout="${DEVL_CONFERENCE_WSL_PROBE_TIMEOUT:-8}" "$conference_wsl_target" 'command -v mosh-server >/dev/null 2>&1' >/dev/null 2>&1; then
-	                transport="${DEVL_CONFERENCE_TRANSPORT:-mosh}"
-	            else
-	                transport="${DEVL_CONFERENCE_TRANSPORT:-ssh}"
-	            fi
-	            clipboard_profile="conference1"
-	        else
-	            target="conference1-ssh"
-	            transport="${DEVL_CONFERENCE_TRANSPORT:-wsl}"
-	            clipboard_profile="conference1-fallback"
-	        fi
-	        shift
-	        ;;
+    c|conf|conference1|conference1-ssh)
+        # Conference1 WSL is reached through an SSH ProxyCommand (Windows →
+        # WSL nc). mosh cannot bootstrap or keep a UDP session on that path, so
+        # direct WSL defaults to ssh. Override with DEVL_CONFERENCE_TRANSPORT=mosh
+        # only after proving direct SSH + UDP reachability without the proxy.
+        if [ -z "${DEVL_ROOT+x}" ]; then
+            root="/srv/repos"
+        fi
+        conference_wsl_target="${DEVL_CONFERENCE_WSL_TARGET:-conference1-wsl}"
+        if [ -n "${DEVL_CONFERENCE_TARGET+x}" ]; then
+            target="$DEVL_CONFERENCE_TARGET"
+            transport="${DEVL_CONFERENCE_TRANSPORT:-wsl}"
+            clipboard_profile="conference1"
+        elif ssh -o BatchMode=yes -o ConnectTimeout="${DEVL_CONFERENCE_WSL_PROBE_TIMEOUT:-8}" "$conference_wsl_target" 'true' >/dev/null 2>&1; then
+            target="$conference_wsl_target"
+            transport="${DEVL_CONFERENCE_TRANSPORT:-ssh}"
+            clipboard_profile="conference1"
+        else
+            target="conference1-ssh"
+            transport="${DEVL_CONFERENCE_TRANSPORT:-wsl}"
+            clipboard_profile="conference1-fallback"
+        fi
+        shift
+        ;;
     j|jeremy|jeremy-vps|skillbox-jeremy|skillbox-jeremy-3)
         target="${DEVL_JEREMY_TARGET:-skillbox@skillbox-jeremy-3}"
         if [ -z "${DEVL_ROOT+x}" ]; then

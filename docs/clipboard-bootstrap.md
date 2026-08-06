@@ -113,7 +113,7 @@ multi-user or untrusted host.
 | Remote tmux inside d3 | nested | Required | Managed tmux fragment + `clipcopy` |
 | Sweet Potato (`aiops@sweet-potato-prod`) | SSH | Required | |
 | Jeremy (`skillbox@skillbox-jeremy-3`) | SSH | Required | |
-| Conference1 direct WSL (`worker@conference1-wsl`) | SSH or mosh | Required | **Preferred** Conference path |
+| Conference1 direct WSL (`worker@conference1-wsl`) | SSH (default) | Required | **Preferred** Conference path; mosh is explicit override only |
 | Conference1 Windows wrapper (`conference1-ssh`) | WSL via Windows | Known-bad | OSC52-hostile; recovery/auth fallback only |
 | Generic `user@host` | SSH | Best-effort | Profile `generic` or raw target arg |
 
@@ -166,11 +166,19 @@ to `infocmp -x xterm-ghostty | tic -x -` when the host already has a source entr
 
 ## Conference1 routing
 
-Probe order (encoded in `scripts/clipboard/hosts.json`):
+Probe order (encoded in `scripts/clipboard/hosts.json` and the `d2`/`d3`
+launchers):
 
-1. `ssh conference1-wsl true` — direct WSL reachable → use `worker@conference1-wsl`.
-2. `ssh conference1-wsl 'command -v mosh-server'` — if mosh-server exists, prefer mosh.
-3. Only when direct WSL is unreachable: fall back to `conference1-ssh` (Windows wrapper).
+1. `ssh conference1-wsl true` — direct WSL reachable → use `worker@conference1-wsl`
+   with **SSH** (`profiles.conference1.transport`).
+2. Only when direct WSL is unreachable: fall back to `conference1-ssh` (Windows
+   wrapper, OSC52-hostile).
+
+Conference1 WSL SSH goes through a Windows `ProxyCommand`
+(`ssh conference1-ssh wsl -d Ubuntu --exec nc 127.0.0.1 22`). mosh cannot
+bootstrap or keep a UDP session on that path, so launchers **do not** auto-select
+mosh when `mosh-server` is installed. Force mosh only after proving a non-proxy
+path: `DEVL_CONFERENCE_TRANSPORT=mosh d3 c`.
 
 **Do not** use `conference1-ssh` for clipboard-sensitive work when direct WSL is up.
 The wrapper path is documented and tested as OSC52-hostile.
