@@ -824,7 +824,7 @@ def _build_parser() -> argparse.ArgumentParser:
     skills_parser.add_argument(
         "--no-project",
         action="store_true",
-        help="Do not inspect project-local .claude/.codex skill directories near --cwd.",
+        help="Do not inspect project-local .claude/.codex/.agents skill directories near --cwd.",
     )
     _add_profile_arg(skills_parser)
     _add_client_arg(skills_parser)
@@ -1254,7 +1254,7 @@ def _build_parser() -> argparse.ArgumentParser:
     explain_parser.add_argument(
         "--no-project",
         action="store_true",
-        help="Skill mode: do not inspect project-local .claude/.codex skill dirs near --cwd.",
+        help="Skill mode: do not inspect project-local .claude/.codex/.agents skill dirs near --cwd.",
     )
     explain_parser.add_argument("--ntm-session", default=None, help="Optional NTM session id for load-state evidence.")
     explain_parser.add_argument("--no-adapters", action="store_true", help="Skip optional br/bv/sbp/ntm adapters.")
@@ -1655,7 +1655,7 @@ def _build_parser() -> argparse.ArgumentParser:
     skill_why_parser.add_argument(
         "--no-project",
         action="store_true",
-        help="Do not inspect project-local .claude/.codex skill dirs near --cwd.",
+        help="Do not inspect project-local .claude/.codex/.agents skill dirs near --cwd.",
     )
     _add_profile_arg(skill_why_parser)
     _add_client_arg(skill_why_parser)

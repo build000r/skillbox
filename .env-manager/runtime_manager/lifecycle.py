@@ -9,6 +9,7 @@ current visibility snapshot).
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import os
 import shutil
@@ -78,7 +79,7 @@ def unlink_overlay_scoped_skills(
 
     Never touches real directories — only symlinks — so an accidental call
     cannot delete skill sources. scope controls the blast radius:
-    project = cwd-local .claude/.codex, global = operator homes, all = both.
+    project = cwd-local .claude/.codex/.agents, global = operator homes, all = both.
     """
     skill_names = overlay_scoped_skill_names(model, overlay_name)
     if not skill_names:
@@ -90,6 +91,7 @@ def unlink_overlay_scoped_skills(
         targets.extend([
             Path(cwd) / ".claude" / "skills",
             Path(cwd) / ".codex" / "skills",
+            Path(cwd) / ".agents" / "skills",
         ])
     if scope in {"global", "all"}:
         # Route through the canonical global-home resolution so the managed
@@ -98,6 +100,9 @@ def unlink_overlay_scoped_skills(
         targets.extend(root for _surface, root in _default_global_roots())
     removed: list[str] = []
     for target_dir in targets:
+        if scope in {"project", "all"} and target_dir.is_relative_to(Path(cwd)):
+            if not _project_destination_is_confined(Path(cwd), target_dir / "placeholder"):
+                continue
         if not target_dir.is_dir():
             continue
         for name in skill_names:
@@ -109,6 +114,24 @@ def unlink_overlay_scoped_skills(
                 except OSError:
                     pass
     return sorted(removed)
+
+
+def _project_destination_is_confined(repo_path: Path, destination: Path) -> bool:
+    repo_path = repo_path.resolve()
+    try:
+        relative = destination.absolute().relative_to(repo_path)
+    except ValueError:
+        return False
+    cursor = repo_path
+    for part in relative.parts[:-1]:
+        cursor /= part
+        if cursor.is_symlink():
+            return False
+    try:
+        destination.parent.resolve(strict=False).relative_to(repo_path)
+    except ValueError:
+        return False
+    return True
 
 
 def _activations_from_sync_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
@@ -298,7 +321,7 @@ def _skill_destinations_for_bases(
             continue
 
         repo_path = Path(str(base.get("path") or "")).resolve()
-        for surface in ("claude", "codex"):
+        for surface in ("claude", "codex", "agents"):
             root = repo_path / f".{surface}" / "skills"
             destination = root / skill_name
             key = str(destination)
@@ -393,12 +416,24 @@ def _scope_filter_matches(occurrence: dict[str, Any], from_scope: str) -> bool:
 
 def _unlink_skill_action(occurrence: dict[str, Any], *, reason: str) -> dict[str, Any]:
     path = str(occurrence.get("path") or "")
+    layer = str(occurrence.get("layer") or "")
+    layer_parts = layer.split(":", 2)
+    repo_path = (
+        layer_parts[2]
+        if len(layer_parts) == 3 and layer_parts[0] == "project"
+        else None
+    )
+    surface = next(
+        (candidate for candidate in ("claude", "codex", "agents") if f":{candidate}" in layer),
+        "",
+    )
     return {
         "op": "unlink",
         "skill": occurrence.get("name"),
         "destination": path,
-        "scope": "global" if str(occurrence.get("layer") or "").startswith("global:") else "project",
-        "surface": "claude" if ":claude" in str(occurrence.get("layer") or "") else "codex",
+        "repo_path": repo_path,
+        "scope": "global" if layer.startswith("global:") else "project",
+        "surface": surface,
         "source": occurrence.get("source"),
         "layer": occurrence.get("layer"),
         "reason": reason,
@@ -512,7 +547,7 @@ def _activation_packet(
         },
         "instructions": (
             "Use this SKILL.md content immediately in the current agent session. "
-            "The filesystem links make the skill visible to future Claude and Codex sessions."
+            "The filesystem links make the skill visible to future compatible agent sessions."
         ),
     }, None
 
@@ -691,11 +726,32 @@ def _plan_skill_prune_actions(
 def _sync_wanted_skill_names(visibility: dict[str, Any], skill_name: str | None) -> list[str]:
     if skill_name:
         return [skill_name]
-    return [
+    missing = [
         str(item.get("name") or "")
         for item in (visibility.get("issues") or {}).get("missing_for_cwd") or []
         if str(item.get("name") or "")
     ]
+    installed_project = {
+        str(item.get("name") or "")
+        for item in visibility.get("occurrences") or []
+        if str(item.get("layer") or "").startswith("project:")
+        and item.get("availability") == "installed"
+        and str(item.get("name") or "")
+    }
+    expected_installed = {
+        name
+        for name in installed_project
+        if any(
+            _scope_rule_is_expected_by_default(rule)
+            and any(
+                fnmatch.fnmatchcase(name, str(pattern))
+                for pattern in rule.get("patterns") or []
+            )
+            for rule in visibility.get("matched_scope_rules") or []
+            if isinstance(rule, dict)
+        )
+    }
+    return _dedup_names([*missing, *sorted(expected_installed)])
 
 
 def _plan_one_skill_sync(
@@ -749,6 +805,12 @@ def _plan_skill_sync_actions(
             categories,
             force,
         )
+        if skill_name is None:
+            link_actions = [
+                action
+                for action in link_actions
+                if (action.get("existing") or {}).get("state") != "same_link"
+            ]
         actions.extend(link_actions)
         warnings.extend(link_warnings)
         resolved_to = sync_to if resolved_to == to else resolved_to
@@ -937,6 +999,9 @@ def _apply_lifecycle_link(
     if repo_path and not Path(str(repo_path)).is_dir():
         action["status"] = "would_skip_missing_repo" if dry_run else "skipped_missing_repo"
         return
+    if repo_path and not _project_destination_is_confined(Path(str(repo_path)), destination):
+        action["status"] = "conflict_project_root_escape"
+        return
     source = Path(str(action.get("source") or "")).resolve()
     if dry_run:
         action["status"] = "ok" if action.get("existing", {}).get("state") == "same_link" else "would_link"
@@ -989,6 +1054,10 @@ def _apply_lifecycle_unlink(
     if action.get("pinned"):
         action["status"] = "skipped_pinned"
         action["code"] = PRUNE_SKIPPED_PINNED
+        return
+    repo_path = action.get("repo_path")
+    if repo_path and not _project_destination_is_confined(Path(str(repo_path)), destination):
+        action["status"] = "conflict_project_root_escape"
         return
     if dry_run:
         action["status"] = "would_unlink" if os.path.lexists(destination) else "missing"

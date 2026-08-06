@@ -849,9 +849,13 @@ def _project_skill_roots(cwd: Path) -> list[tuple[str, Path]]:
     for parent in [cwd, *cwd.parents]:
         if parent == home:
             break
-        for surface in ("claude", "codex"):
+        for surface in ("claude", "codex", "agents"):
             root = parent / f".{surface}" / "skills"
-            if root.is_dir():
+            if (
+                root.is_dir()
+                and not (parent / f".{surface}").is_symlink()
+                and not root.is_symlink()
+            ):
                 roots.append((surface, root))
         if (parent / ".git").exists():
             break

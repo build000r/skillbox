@@ -1,0 +1,89 @@
+{
+  "schema_version": "skillbox.application-deploy-overlay/1",
+  "application": {
+    "id": "skillbox",
+    "owner": "build000r/skillbox",
+    "repo_slug": "build000r/skillbox"
+  },
+  "artifact": {
+    "manifest_schema_version": 1,
+    "ref_policy": "origin/main",
+    "identity_fields": [
+      "client_id",
+      "source_commit",
+      "payload_tree_sha256",
+      "archive_sha256"
+    ]
+  },
+  "credential_preflight": {
+    "environment_names": [
+      "SSH_AUTH_SOCK"
+    ],
+    "receipt_policy": "names_and_configured_booleans_only"
+  },
+  "dry_run": {
+    "mutates": false,
+    "command_template": [
+      "python3",
+      "scripts/box.py",
+      "upgrade",
+      "${BOX_ID}",
+      "--deploy-manifest",
+      "${DEPLOY_MANIFEST}",
+      "--dry-run",
+      "--format",
+      "json"
+    ]
+  },
+  "receipt_store": {
+    "root": ".skillbox-state/project-orb/deploy-receipts",
+    "file_mode": "0600"
+  },
+  "health_check": {
+    "command_template": [
+      "python3",
+      "scripts/box.py",
+      "status",
+      "${BOX_ID}",
+      "--format",
+      "json"
+    ],
+    "requires_artifact_identity": true
+  },
+  "rollback": {
+    "requires_previous_exact_manifest": true,
+    "requires_operator_gate": true,
+    "command_template": [
+      "python3",
+      "scripts/box.py",
+      "upgrade",
+      "${BOX_ID}",
+      "--deploy-manifest",
+      "${PREVIOUS_DEPLOY_MANIFEST}",
+      "--dry-run",
+      "--format",
+      "json"
+    ]
+  },
+  "least_privilege": {
+    "ordinary_project_orb_allowed": [
+      "deploy.preflight",
+      "deploy.dry_run",
+      "deploy.health_read",
+      "deploy.rollback_plan"
+    ],
+    "denied": [
+      "deploy.production_apply",
+      "infrastructure.admin",
+      "box.provision",
+      "box.destroy",
+      "dns.admin",
+      "tailnet.admin",
+      "credential.rotate"
+    ]
+  },
+  "authority": {
+    "ordinary_project_orb": "forbidden",
+    "production_apply": "operator_only"
+  }
+}

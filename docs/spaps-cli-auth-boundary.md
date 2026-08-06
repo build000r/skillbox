@@ -25,6 +25,30 @@ endpoint calls.
    (`NEXT_PUBLIC_SPAPS_PUBLISHABLE_KEY` as `X-API-Key`,
    `SPAPS_AUTH_ACCESS_TOKEN` as bearer).
 
+## Amp project-Orb remote-read gate
+
+The ordinary `build000r/skillbox` project Orb does not run the local dev auth
+runtime and does not infer hosted SPAPS authority from an installed CLI or an
+environment variable. `.agents/orb-capabilities.json` checks only whether the
+name `SPAPS_REMOTE_READ_URL` is configured; offline readiness neither contacts
+the URL nor exposes its value.
+
+A hosted SPAPS route is accepted only after Sweet Potato supplies a reviewed
+relying-party contract and a live sanitized receipt that binds the exact Amp
+project identity, audience, destination, and GET-only service/API read scope.
+The same receipt must prove mutation and infrastructure/admin operations are
+denied. The observed Amp workload token uses RS256, issuer
+`https://ampcode.com/api/workload-identity`, and claims `aud`, `email`,
+`email_verified`, `exp`, `iat`, `iss`, `jti`, `project_id`, `sub`, `thread_id`,
+`token_use`, and `user_id`; it omitted `workspace_id`. This is design evidence,
+not a SPAPS acceptance receipt, so no audience or workspace requirement may be
+guessed from it.
+
+Until that external gate exists, Skillbox's accepted Orb route remains the
+fixed authenticated GET-only `sbpd` surface documented in
+[`orb-tailnet-bootstrap.md`](orb-tailnet-bootstrap.md). It cannot delegate an
+arbitrary SPAPS command, and a local fixture is never external proof.
+
 ## Ownership boundary table
 
 | Auth-flow item | Owner | Status / notes |

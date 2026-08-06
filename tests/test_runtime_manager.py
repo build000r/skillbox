@@ -1844,8 +1844,8 @@ class RuntimeManagerTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads(result.stdout)
-            self.assertEqual(payload["summary"]["link"], 2)
-            for surface in ("claude", "codex"):
+            self.assertEqual(payload["summary"]["link"], 3)
+            for surface in ("claude", "codex", "agents"):
                 link = project / f".{surface}" / "skills" / "project-skill"
                 self.assertTrue(link.is_symlink())
                 self.assertEqual(link.resolve(), source.resolve())

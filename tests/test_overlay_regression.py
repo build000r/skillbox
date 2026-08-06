@@ -342,7 +342,7 @@ def test_broad_only_cwd_links_exactly_the_broad_subset(
     _assert_plans_identical("broad_only", activate, sync)
     assert set(activate) == {BROAD_SKILL}
     # Each policy-correct skill links one destination per agent surface.
-    assert len(activate[BROAD_SKILL]) == 2
+    assert len(activate[BROAD_SKILL]) == 3
     # Categorically NOT the full literal overlay set.
     assert set(activate) != set(ALL_OVERLAY_SKILLS)
 
@@ -383,7 +383,7 @@ def test_dry_run_plan_equals_apply_plan(scenario: MarketingScenario) -> None:
     )
     created_marketing = {name for name in created if name in set(ALL_OVERLAY_SKILLS)}
     assert created_marketing == {BROAD_SKILL}
-    for surface in ("claude", "codex"):
+    for surface in ("claude", "codex", "agents"):
         link = scenario.broad_only / f".{surface}" / "skills" / BROAD_SKILL
         assert link.is_symlink()
         assert link.resolve() == (scenario.src_root / BROAD_SKILL).resolve()
@@ -427,10 +427,12 @@ def test_overlay_round_trip_on_sync_off_restores_pre_state(
     state_path = tmp_path / "overlay-state"
     claude_link = scenario.broad_only / ".claude" / "skills" / BROAD_SKILL
     codex_link = scenario.broad_only / ".codex" / "skills" / BROAD_SKILL
+    agents_link = scenario.broad_only / ".agents" / "skills" / BROAD_SKILL
 
     # Pre-state: no marketing links.
     assert not claude_link.exists()
     assert not codex_link.exists()
+    assert not agents_link.exists()
 
     from unittest import mock
 
@@ -448,6 +450,7 @@ def test_overlay_round_trip_on_sync_off_restores_pre_state(
         )
         assert claude_link.is_symlink()
         assert codex_link.is_symlink()
+        assert agents_link.is_symlink()
 
         # OFF (default = unlink overlay-scoped links, then clear state).
         removed = sv.unlink_overlay_scoped_skills(
@@ -455,12 +458,13 @@ def test_overlay_round_trip_on_sync_off_restores_pre_state(
         )
         sv.set_overlay("marketing", False)
 
-        assert sorted(Path(r).name for r in removed) == [BROAD_SKILL, BROAD_SKILL]
+        assert sorted(Path(r).name for r in removed) == [BROAD_SKILL] * 3
         assert "marketing" not in sv.active_overlays()
 
     # Pre-state restored: links gone.
     assert not claude_link.exists()
     assert not codex_link.exists()
+    assert not agents_link.exists()
 
 
 def test_overlay_off_keep_preserves_the_links(
@@ -474,6 +478,7 @@ def test_overlay_off_keep_preserves_the_links(
     state_path = tmp_path / "overlay-state"
     claude_link = scenario.broad_only / ".claude" / "skills" / BROAD_SKILL
     codex_link = scenario.broad_only / ".codex" / "skills" / BROAD_SKILL
+    agents_link = scenario.broad_only / ".agents" / "skills" / BROAD_SKILL
 
     from unittest import mock
 
@@ -487,6 +492,7 @@ def test_overlay_off_keep_preserves_the_links(
         )
         assert claude_link.is_symlink()
         assert codex_link.is_symlink()
+        assert agents_link.is_symlink()
 
         # off --keep: turn the overlay off but DO NOT unlink.
         sv.set_overlay("marketing", False)
@@ -495,6 +501,7 @@ def test_overlay_off_keep_preserves_the_links(
     # Links survive the toggle-off because --keep skips the unlink.
     assert claude_link.is_symlink()
     assert codex_link.is_symlink()
+    assert agents_link.is_symlink()
 
 
 def test_activation_packet_shape_matches_golden(scenario: MarketingScenario) -> None:
@@ -532,7 +539,7 @@ def test_activation_packet_shape_matches_golden(scenario: MarketingScenario) -> 
         golden["skill_md"].encode("utf-8")
     ).hexdigest()
 
-    # Both agent surfaces, one link each (paths themselves are tmp-tree-relative).
+    # All project agent surfaces, one link each (paths themselves are tmp-tree-relative).
     assert sorted(packet["surface_targets"]) == golden["surfaces"]
     for surface in golden["surfaces"]:
         targets = packet["surface_targets"][surface]

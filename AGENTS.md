@@ -51,6 +51,9 @@ Main entry points:
   `docs/operations.md`, `docs/clipboard-bootstrap.md`, `docs/troubleshooting.md`, and `docs/faq.md`.
 - `docs/ARCHITECTURE.md` is the maintainer-grade system map for layers,
   manifests, runtime modules, data flow, state layout, and extension seams.
+- `docs/amp/skillbox-project-orb-vision.md` is the accepted contract for the
+  disposable Amp project Orb, its readiness and skill adapter, and its remote
+  auth/deploy authority stops.
 - `.env.example` documents supported env vars. `.env` and `.env.box` are local
   and ignored.
 - `.env-manager/runtime_manager/` contains the Python runtime manager modules.
@@ -166,28 +169,45 @@ the operator's private hosts registry (`SKILLBOX_CLIPBOARD_HOSTS`); the tracked
 - Avoid editing generated/runtime state unless the bug is specifically in that
   state contract.
 
-## Orb bootstrap (AO-005)
+## Amp project-Orb contract (AO-005)
 
-Hardened Amp Orb lane for shell/Python validation (substitute for skillbox-config,
-which is Orb-denied).
+Hardened project-backed Orb lane for local repository work. The durable
+Skillbox box remains a separate system; see
+`docs/amp/skillbox-project-orb-vision.md`.
 
-- **Setup:** run `.agents/setup`. It is idempotent, checks fixed Orb disk
-  headroom before work, compiles `.env-manager`/`scripts`/`tests`, then runs
-  `python3 -m unittest tests.test_agent_ops_adapters -q`.
-- **Resume:** run `.agents/resume` on wake. It performs only fast checks
-  (Python/git/toolchain presence and disk headroom) and backgrounds optional
-  repair so it stays inside Amp's 10s non-blocking wake budget.
-- **Status/logs:** setup writes `.agents/state/setup-status.json` and
-  `.agents/logs/setup.log`; resume writes `.agents/state/resume-status.json` and
-  `.agents/logs/resume.log`. Final stderr lines are prefixed
-  `AGENT_SETUP_RESULT_JSON` or `AGENT_RESUME_RESULT_JSON`.
+- **Setup:** run `.agents/setup`. It is bounded, offline, and idempotent. It
+  checks fixed Orb disk headroom, compiles `.env-manager`/`scripts`/`tests`,
+  runs `python3 -m unittest tests.test_agent_ops_adapters -q`, creates a
+  private stable resume identity, and evaluates `.agents/orb-capabilities.json`.
+- **Resume:** run `.agents/resume` on wake. It performs only bounded local
+  command/disk, identity, and readiness checks. It does not repair, install,
+  join networks, start services, or background work.
+- **Readiness:** run `python3 scripts/orb/orb_readiness.py collect --context
+  manual`. Optional `--output
+  .skillbox-state/project-orb/hook-state/orb-readiness.json` writes a sanitized
+  mode-0600 receipt. Capability states are `ready`, `configured`, `degraded`,
+  `blocked`, and `forbidden`; this evaluator never uses network.
+- **Status/logs:** setup and resume write private status, identity, readiness,
+  and log files under `.skillbox-state/project-orb/hook-state` and
+  `.skillbox-state/project-orb/hook-logs`. Override
+  `AGENT_STATE_DIR`/`AGENT_LOG_DIR` in tests. Legacy tracked `.agents/state` and
+  `.agents/logs` evidence is not runtime state. Receipts include only
+  enumerated status fields and reason codes.
 - **Typed failures:** `setup=10`, `dependency=20`, `capacity=30`, `auth=40`,
-  `validation=50`. Capacity failures mean the fixed 40GB Orb disk does not have
-  enough free space for safe setup/resume.
-- **Broader tests (optional):** `python3 -m unittest discover -s tests` is
-  heavier and not required for bootstrap smoke.
-- **Do not:** start Docker monoserver, load operator `.env` secrets, or touch
-  production box lifecycle on the Orb.
+  `validation=50`. Every hook subprocess has a hard elapsed timeout.
+- **Skills:** the existing SBP lifecycle projects one selected source to
+  `.claude/skills`, `.codex/skills`, and project-local `.agents/skills`. There
+  is no global Amp target or second source/policy/lock lifecycle.
+- **Remote auth:** authenticated `sbpd` requires a project allowlist and exact
+  project alias. `workspace_id` is optional unless a real token and verifier
+  contract require it. The client mints short-lived Amp tokens in memory; no
+  static-secret fallback is allowed.
+- **External authority:** hosted SPAPS acceptance and production deploy/apply
+  require real relying-party/operator receipts. Local fixtures, configured env
+  names, and dry-run receipts do not satisfy those gates.
+- **Do not:** start Docker/SPAPS/monoserver, load operator `.env` secrets,
+  expose public listeners, or touch production box/infrastructure lifecycle
+  from ordinary Orb setup/readiness.
 
 <!-- br-agent-instructions-v1 -->
 

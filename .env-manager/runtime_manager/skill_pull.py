@@ -851,13 +851,13 @@ def resolve_host_skills(
     return receipt
 
 
-def pull_host_skill(
+def _pull_host_skill_with_context(
     model: dict[str, Any],
     name: str,
     *,
     cwd: str | os.PathLike[str] | Path,
     after_resolve: Callable[[dict[str, Any]], None] | None = None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Resolve, recheck, and return exact current-session instructions."""
     _request, receipt, sources = _resolve_internal(model, cwd=cwd, explicit_skills=[name])
     if after_resolve is not None:
@@ -881,7 +881,7 @@ def pull_host_skill(
         raise SkillPullError("SKILL_ENTRY_INVALID_UTF8", "Skill entry is not valid UTF-8.") from exc
     if _sha256(entry_payload) != observed_entry:
         raise SkillPullError("SKILL_TREE_DRIFT", "Skill entry changed before output.")
-    return {
+    result = {
         "ok": True,
         "schema_version": PULL_SCHEMA,
         "name": name,
@@ -893,6 +893,28 @@ def pull_host_skill(
         "source_classification": "host-canonical",
         "instructions": "use this content immediately in the current session",
     }
+    return result, {
+        "source": source,
+        "source_repo_sha": decision["source_repo_sha"],
+        "resolution_receipt": receipt,
+    }
+
+
+def pull_host_skill(
+    model: dict[str, Any],
+    name: str,
+    *,
+    cwd: str | os.PathLike[str] | Path,
+    after_resolve: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Resolve, recheck, and return exact current-session instructions."""
+    result, _context = _pull_host_skill_with_context(
+        model,
+        name,
+        cwd=cwd,
+        after_resolve=after_resolve,
+    )
+    return result
 
 
 __all__ = [

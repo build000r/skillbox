@@ -1,13 +1,15 @@
-#!/usr/bin/env python3
 """Read-only HTTP bridge for host Cass search and skill pull."""
 
 from __future__ import annotations
 
 import argparse
 import gzip
-import ipaddress
 import io
+import ipaddress
 import json
+import os
+import re
+import selectors
 import socket
 import subprocess
 import sys
@@ -24,16 +26,19 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import jwt
 
-
 ROOT_DIR = Path(__file__).resolve().parent.parent
 ENV_MANAGER_DIR = ROOT_DIR / ".env-manager"
 if str(ENV_MANAGER_DIR) not in sys.path:
     sys.path.insert(0, str(ENV_MANAGER_DIR))
 
-from runtime_manager import skill_pull as SKILL_PULL  # noqa: E402
-from runtime_manager.distribution.bundle import pack_skill_bundle  # noqa: E402
-from lib.runtime_model import build_runtime_model  # noqa: E402
-
+from runtime_manager import skill_pull as SKILL_PULL  # noqa: I001
+from runtime_manager.distribution.bundle import (
+    BundleError,
+    pack_skill_bundle,
+    unpack_skill_bundle,
+    verify_bundle_contents,
+)
+from lib.runtime_model import build_runtime_model
 
 DEFAULT_BIND = "127.0.0.1"
 DEFAULT_PORT = 8443
@@ -47,10 +52,17 @@ TAILSCALE_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
 AMP_JWKS_URL = "https://ampcode.com/api/workload-identity/jwks.json"
 AMP_ISSUER = "https://ampcode.com/api/workload-identity"
 SBPD_AUDIENCE = "sbpd"
+PROJECT_ALIAS_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}/[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
+)
 JWKS_CACHE_TTL_SECONDS = 300
 JWKS_TIMEOUT_SECONDS = 10
 JWKS_KID_REFRESH_COOLDOWN_SECONDS = 30
-PROTECTED_PATH_PREFIXES = ("/v1/cass/", "/v1/skill/")
+MAX_TOKEN_TTL_SECONDS = 3600
+MAX_JWKS_BYTES = 1024 * 1024
+MAX_CASS_STDOUT_BYTES = 4 * 1024 * 1024
+MAX_CASS_STDERR_BYTES = 64 * 1024
+PROTECTED_PATH_PREFIXES = ("/v1/orb-kit", "/v1/cass/", "/v1/skill/")
 ORB_KIT_FILES = (
     ("lib/sbp_client.py", Path("scripts/lib/sbp_client.py"), 0o644),
     ("runtime_manager/__init__.py", Path(".env-manager/runtime_manager/__init__.py"), 0o644),
@@ -67,11 +79,11 @@ ORB_KIT_FILES = (
     ("orb/join-tailnet.sh", Path("scripts/orb/join-tailnet.sh"), 0o755),
 )
 ORB_KIT_README = (
-    "Run orb/join-tailnet.sh to join the Skillbox tailnet.\n"
-    'Export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" and '
-    'SBP_REMOTE="http://<skillbox-tailnet-ip>:8443".\n'
-    "Run python3 lib/sbp_client.py cass status --json.\n"
-).encode("utf-8")
+    b"Run orb/join-tailnet.sh to join the Skillbox tailnet.\n"
+    b'Export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" and '
+    b'SBP_REMOTE="http://<skillbox-tailnet-ip>:8443".\n'
+    b"Run python3 lib/sbp_client.py cass status --json.\n"
+)
 
 
 class ServiceError(RuntimeError):
@@ -85,6 +97,29 @@ class ServiceError(RuntimeError):
 
 class AuthenticationError(RuntimeError):
     """A bearer token cannot be authenticated without exposing internals."""
+
+
+class ProcessOutputLimitExceeded(RuntimeError):
+    """A bounded subprocess exceeded its allowed output size."""
+
+    def __init__(self, stream: str) -> None:
+        super().__init__(f"subprocess {stream} exceeded its size limit")
+        self.stream = stream
+
+
+def _read_bounded(response: Any, maximum: int, label: str) -> bytes:
+    chunks: list[bytes] = []
+    observed = 0
+    while True:
+        chunk = response.read(min(64 * 1024, maximum + 1 - observed))
+        if not chunk:
+            return b"".join(chunks)
+        if not isinstance(chunk, bytes):
+            raise TypeError(f"{label} returned non-byte content")
+        chunks.append(chunk)
+        observed += len(chunk)
+        if observed > maximum:
+            raise ValueError(f"{label} exceeded its size limit")
 
 
 def _require_https_jwks_url(value: str) -> None:
@@ -112,8 +147,18 @@ class JWKSVerifier:
         kid_refresh_cooldown_seconds: int = JWKS_KID_REFRESH_COOLDOWN_SECONDS,
         opener: Any = urllib_request.urlopen,
         clock: Any = time.monotonic,
+        allowed_project_ids: tuple[str, ...] = (),
+        allowed_user_ids: tuple[str, ...] = (),
+        allowed_workspace_ids: tuple[str, ...] = (),
     ) -> None:
         _require_https_jwks_url(jwks_url)
+        for label, values in (
+            ("project", allowed_project_ids),
+            ("user", allowed_user_ids),
+            ("workspace", allowed_workspace_ids),
+        ):
+            if any(not isinstance(value, str) or not value.strip() for value in values):
+                raise ValueError(f"allowed {label} identities must be nonempty")
         self.jwks_url = jwks_url
         self.audience = audience
         self.issuer = issuer
@@ -122,6 +167,9 @@ class JWKSVerifier:
         self.kid_refresh_cooldown_seconds = kid_refresh_cooldown_seconds
         self.opener = opener
         self.clock = clock
+        self.allowed_project_ids = tuple(allowed_project_ids)
+        self.allowed_user_ids = tuple(allowed_user_ids)
+        self.allowed_workspace_ids = tuple(allowed_workspace_ids)
         self._keys: dict[str, dict[str, Any]] = {}
         self._expires_at = 0.0
         self._next_kid_refresh_at = 0.0
@@ -144,7 +192,13 @@ class JWKSVerifier:
                         "workload-identity JWKS response URL is invalid"
                     )
                 _require_https_jwks_url(response_url)
-                payload = json.load(response)
+                if response_url != self.jwks_url:
+                    raise AuthenticationError(
+                        "workload-identity JWKS redirects are forbidden"
+                    )
+                payload = json.loads(
+                    _read_bounded(response, MAX_JWKS_BYTES, "workload-identity JWKS")
+                )
         except Exception as exc:
             raise AuthenticationError("unable to load workload-identity keys") from exc
 
@@ -205,7 +259,10 @@ class JWKSVerifier:
                 algorithms=["RS256"],
                 audience=self.audience,
                 issuer=self.issuer,
-                options={"require": ["aud", "exp"]},
+                options={
+                    "require": ["aud", "exp", "iat", "iss", "sub"],
+                    "strict_aud": True,
+                },
             )
         except AuthenticationError:
             raise
@@ -213,7 +270,36 @@ class JWKSVerifier:
             raise AuthenticationError("invalid workload-identity token") from exc
         if not isinstance(claims, dict):
             raise AuthenticationError("invalid workload-identity claims")
+        self._validate_claims(claims)
         return claims
+
+    def _validate_claims(self, claims: dict[str, Any]) -> None:
+        strings = ("email", "jti", "project_id", "sub", "thread_id", "token_use", "user_id")
+        if any(not isinstance(claims.get(key), str) or not claims[key].strip() for key in strings):
+            raise AuthenticationError("invalid workload-identity claim")
+        if claims.get("email_verified") is not True or claims["token_use"] != "exchanged":
+            raise AuthenticationError("invalid workload-identity claim")
+        iat, exp = claims.get("iat"), claims.get("exp")
+        if isinstance(iat, bool) or isinstance(exp, bool) or not isinstance(iat, (int, float)) or not isinstance(exp, (int, float)):
+            raise AuthenticationError("invalid workload-identity timestamps")
+        if exp <= iat or exp - iat > MAX_TOKEN_TTL_SECONDS:
+            raise AuthenticationError("invalid workload-identity token lifetime")
+        workspace = claims.get("workspace_id")
+        if workspace is not None and (not isinstance(workspace, str) or not workspace.strip()):
+            raise AuthenticationError("invalid workspace identity")
+        if self.allowed_project_ids and claims["project_id"] not in self.allowed_project_ids:
+            raise AuthenticationError("project is not allowed")
+        if self.allowed_user_ids and claims["user_id"] not in self.allowed_user_ids:
+            raise AuthenticationError("user is not allowed")
+        if self.allowed_workspace_ids and workspace not in self.allowed_workspace_ids:
+            raise AuthenticationError("workspace is not allowed")
+        prefix = f"workspace:{workspace}:" if workspace is not None else ""
+        expected_sub = (
+            f"{prefix}project:{claims['project_id']}:user:{claims['user_id']}:"
+            f"thread:{claims['thread_id']}"
+        )
+        if claims["sub"] != expected_sub:
+            raise AuthenticationError("subject identity does not match claims")
 
 
 def bind_address(value: str) -> str:
@@ -250,7 +336,7 @@ def build_orb_kit(root_dir: Path = ROOT_DIR) -> bytes:
     members.append(("README.txt", ORB_KIT_README, 0o644))
 
     output = io.BytesIO()
-    with gzip.GzipFile(
+    with gzip.GzipFile(  # noqa: SIM117 -- archive depends on the gzip context value
         filename="",
         mode="wb",
         fileobj=output,
@@ -285,6 +371,61 @@ def _json_from_process(stdout: str) -> Any:
         ) from exc
 
 
+def _run_bounded_process(
+    argv: list[str],
+    *,
+    timeout: float,
+    stdout_limit: int = MAX_CASS_STDOUT_BYTES,
+    stderr_limit: int = MAX_CASS_STDERR_BYTES,
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None and process.stderr is not None
+    streams = {process.stdout: ("stdout", stdout_limit), process.stderr: ("stderr", stderr_limit)}
+    chunks: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
+    observed = {"stdout": 0, "stderr": 0}
+    selector = selectors.DefaultSelector()
+    for stream in streams:
+        selector.register(stream, selectors.EVENT_READ)
+    deadline = time.monotonic() + timeout
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            for key, _mask in selector.select(remaining):
+                stream = key.fileobj
+                label, maximum = streams[stream]
+                chunk = os.read(stream.fileno(), min(64 * 1024, maximum + 1 - observed[label]))
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                chunks[label].append(chunk)
+                observed[label] += len(chunk)
+                if observed[label] > maximum:
+                    raise ProcessOutputLimitExceeded(label)
+        return_code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        raise
+    finally:
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+    return subprocess.CompletedProcess(
+        argv,
+        return_code,
+        b"".join(chunks["stdout"]).decode("utf-8", errors="replace"),
+        b"".join(chunks["stderr"]).decode("utf-8", errors="replace"),
+    )
+
+
 def run_cass(command: str, *, query: str | None = None) -> Any:
     """Run one fixed read-only Cass command through the canonical front door."""
     if command == "status":
@@ -310,11 +451,8 @@ def run_cass(command: str, *, query: str | None = None) -> Any:
         raise ValueError(f"unsupported Cass command: {command}")
 
     try:
-        completed = subprocess.run(
+        completed = _run_bounded_process(
             argv,
-            check=False,
-            capture_output=True,
-            text=True,
             timeout=CASS_PROCESS_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as exc:
@@ -324,6 +462,15 @@ def run_cass(command: str, *, query: str | None = None) -> Any:
                 "ok": False,
                 "error": "cass_timeout",
                 "message": f"Cass request exceeded {CASS_TIMEOUT_SECONDS}s",
+            },
+        ) from exc
+    except ProcessOutputLimitExceeded as exc:
+        raise ServiceError(
+            HTTPStatus.BAD_GATEWAY,
+            {
+                "ok": False,
+                "error": "cass_response_too_large",
+                "message": f"Cass {exc.stream} exceeded its size limit",
             },
         ) from exc
     except OSError as exc:
@@ -365,19 +512,29 @@ def pull_skill_bundle(name: str) -> tuple[bytes, dict[str, Any]]:
 
     model = build_runtime_model(ROOT_DIR)
     try:
-        _request, _receipt, sources = SKILL_PULL._resolve_internal(
+        result, context = SKILL_PULL._pull_host_skill_with_context(
             model,
+            name,
             cwd=ROOT_DIR,
-            explicit_skills=[name],
         )
-        result = SKILL_PULL.pull_host_skill(model, name, cwd=ROOT_DIR)
-        source = sources[name]
+        source = context["source"]
         observed_tree, _entry_sha, _entry_bytes = SKILL_PULL._safe_tree_identity(source)
         if observed_tree != result["tree_sha256"]:
             raise SKILL_PULL.SkillPullError(
                 "SKILL_TREE_DRIFT",
                 "Skill source changed before bundle creation.",
             )
+        remote_sha = context["source_repo_sha"]
+        if not isinstance(remote_sha, str) or re.fullmatch(r"[0-9a-f]{40}", remote_sha) is None:
+            raise ServiceError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {
+                    "ok": False,
+                    "error": "remote_identity_unavailable",
+                    "message": "Selected skill source commit is unavailable",
+                },
+            )
+        result["remote_pinned_sha"] = remote_sha
         with tempfile.TemporaryDirectory(prefix="sbpd-skill-") as temporary:
             bundle_path = pack_skill_bundle(
                 source,
@@ -385,7 +542,23 @@ def pull_skill_bundle(name: str) -> tuple[bytes, dict[str, Any]]:
                 name=name,
                 output_dir=Path(temporary),
             )
-            return bundle_path.read_bytes(), result
+            bundle = bundle_path.read_bytes()
+            verified = Path(temporary) / "verified"
+            verified.mkdir()
+            try:
+                manifest = unpack_skill_bundle(io.BytesIO(bundle), verified)
+                verify_bundle_contents(manifest, verified)
+            except BundleError as exc:
+                raise SKILL_PULL.SkillPullError(
+                    "SKILL_TREE_DRIFT",
+                    "Skill source changed while its exact bundle was created.",
+                ) from exc
+            if manifest.name != name or manifest.tree_sha256 != result["tree_sha256"]:
+                raise SKILL_PULL.SkillPullError(
+                    "SKILL_TREE_DRIFT",
+                    "Skill bundle does not match the resolved source identity.",
+                )
+            return bundle, result
     except SKILL_PULL.SkillPullError as exc:
         status = (
             HTTPStatus.NOT_FOUND
@@ -442,6 +615,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _authenticate(self, path: str) -> bool:
         self.auth_sub = None
+        self.auth_claims = None
         require_auth = bool(getattr(self.server, "require_auth", False))
         if not require_auth or not path.startswith(PROTECTED_PATH_PREFIXES):
             return True
@@ -455,8 +629,7 @@ class Handler(BaseHTTPRequestHandler):
                     if verifier is None:
                         raise AuthenticationError("authentication is not configured")
                     claims = verifier.verify(token.strip())
-                    subject = claims.get("sub")
-                    self.auth_sub = subject if isinstance(subject, str) else None
+                    self.auth_claims = claims
                     return True
                 except AuthenticationError:
                     pass
@@ -472,7 +645,7 @@ class Handler(BaseHTTPRequestHandler):
         )
         return False
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         request = urlsplit(self.path)
         try:
             if not self._authenticate(request.path):
@@ -523,6 +696,23 @@ class Handler(BaseHTTPRequestHandler):
             if request.path.startswith(prefix):
                 name = unquote(request.path[len(prefix) :])
                 bundle, result = pull_skill_bundle(name)
+                identity_headers = {}
+                claims = getattr(self, "auth_claims", None)
+                if claims is not None:
+                    source_sha = result.get("remote_pinned_sha")
+                    receipt = result.get("receipt_sha256")
+                    if not isinstance(source_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", source_sha) or not isinstance(receipt, str) or not re.fullmatch(r"[0-9a-f]{64}", receipt):
+                        raise ServiceError(HTTPStatus.CONFLICT, {"ok": False, "error": "skill_identity_unbound", "message": "Authenticated skill identity could not be bound"})
+                    identity_headers = {
+                        "X-SBP-Project-Id": claims["project_id"],
+                        "X-SBP-Project-Alias": self.server.project_alias,
+                        "X-SBP-Remote-Sha": source_sha,
+                        "X-SBP-Resolution-Receipt": receipt,
+                        "X-SBP-Lease-Id": claims["jti"],
+                        "X-SBP-Thread-Id": claims["thread_id"],
+                        "X-SBP-User-Id": claims["user_id"],
+                        "X-SBP-Visibility": "private",
+                    }
                 self._send_bytes(
                     HTTPStatus.OK,
                     bundle,
@@ -532,6 +722,7 @@ class Handler(BaseHTTPRequestHandler):
                             f'attachment; filename="{name}-v1.skillbundle.tar.gz"'
                         ),
                         "X-Skill-Tree-Sha256": str(result["tree_sha256"]),
+                        **identity_headers,
                     },
                 )
                 return
@@ -542,7 +733,7 @@ class Handler(BaseHTTPRequestHandler):
             )
         except ServiceError as exc:
             self._send_json(exc.status, exc.payload)
-        except Exception:
+        except Exception:  # noqa: BLE001 -- HTTP boundary must not leak internals
             self._send_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 {
@@ -570,12 +761,7 @@ class Handler(BaseHTTPRequestHandler):
     do_PUT = _method_not_allowed
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        subject = getattr(self, "auth_sub", None) or "-"
-        subject = json.dumps(subject, ensure_ascii=True)[1:-1]
-        sys.stderr.write(
-            "sbpd: %s sub=%s - %s\n"
-            % (self.client_address[0], subject, fmt % args)
-        )
+        sys.stderr.write(f"sbpd: {self.client_address[0]} - {fmt % args}\n")
 
 
 class ThreadingHTTPServerV6(ThreadingHTTPServer):
@@ -596,11 +782,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Require Amp workload-identity bearer JWTs for data endpoints",
     )
+    parser.add_argument("--allowed-project-id", action="append", default=[])
+    parser.add_argument("--allowed-user-id", action="append", default=[])
+    parser.add_argument("--allowed-workspace-id", action="append", default=[])
+    parser.add_argument("--project-alias")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not ipaddress.ip_address(args.bind).is_loopback and not args.require_auth:
+        parser.error("Tailnet binds require --require-auth")
+    if args.require_auth and (not args.allowed_project_id or not args.project_alias):
+        parser.error("--require-auth requires --allowed-project-id and --project-alias")
+    if args.project_alias and PROJECT_ALIAS_RE.fullmatch(args.project_alias) is None:
+        parser.error("--project-alias has invalid characters")
     server_class = (
         ThreadingHTTPServerV6
         if ipaddress.ip_address(args.bind).version == 6
@@ -608,7 +805,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     server = server_class((args.bind, args.port), Handler)
     server.require_auth = args.require_auth
-    server.authenticator = JWKSVerifier() if args.require_auth else None
+    server.project_alias = args.project_alias
+    server.authenticator = JWKSVerifier(
+        allowed_project_ids=tuple(args.allowed_project_id),
+        allowed_user_ids=tuple(args.allowed_user_id),
+        allowed_workspace_ids=tuple(args.allowed_workspace_id),
+    ) if args.require_auth else None
     print(f"sbpd serving http://{args.bind}:{args.port}", flush=True)
     try:
         server.serve_forever()

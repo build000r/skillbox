@@ -18,7 +18,6 @@ from unittest.mock import patch
 import jwt
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-
 ROOT_DIR = Path(__file__).resolve().parent.parent
 MODULE_PATH = ROOT_DIR / "scripts" / "sbpd.py"
 SPEC = importlib.util.spec_from_file_location("sbpd", MODULE_PATH)
@@ -32,6 +31,7 @@ class ServerFixture:
         self.server = SBPD.ThreadingHTTPServer(("127.0.0.1", 0), SBPD.Handler)
         self.server.require_auth = require_auth
         self.server.authenticator = authenticator
+        self.server.project_alias = "test/project"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
@@ -214,7 +214,7 @@ class SbpdDelegateTests(unittest.TestCase):
             stdout='{"status":"ok"}',
             stderr="",
         )
-        with patch.object(SBPD.subprocess, "run", return_value=completed) as run:
+        with patch.object(SBPD, "_run_bounded_process", return_value=completed) as run:
             payload = SBPD.run_cass("search", query="alpha; rm -rf nope")
         self.assertEqual(payload, {"status": "ok"})
         argv = run.call_args.args[0]
@@ -226,12 +226,11 @@ class SbpdDelegateTests(unittest.TestCase):
 
     def test_run_cass_maps_timeout_and_nonzero_to_typed_http_errors(self) -> None:
         with patch.object(
-            SBPD.subprocess,
-            "run",
+            SBPD,
+            "_run_bounded_process",
             side_effect=subprocess.TimeoutExpired(["cass"], 95),
-        ):
-            with self.assertRaises(SBPD.ServiceError) as timeout:
-                SBPD.run_cass("status")
+        ), self.assertRaises(SBPD.ServiceError) as timeout:
+            SBPD.run_cass("status")
         self.assertEqual(timeout.exception.status, 504)
         self.assertEqual(timeout.exception.payload["error"], "cass_timeout")
 
@@ -241,11 +240,21 @@ class SbpdDelegateTests(unittest.TestCase):
             stdout='{"status":"error"}',
             stderr="failed",
         )
-        with patch.object(SBPD.subprocess, "run", return_value=completed):
+        with patch.object(SBPD, "_run_bounded_process", return_value=completed):  # noqa: SIM117
             with self.assertRaises(SBPD.ServiceError) as failed:
                 SBPD.run_cass("status")
         self.assertEqual(failed.exception.status, 502)
         self.assertEqual(failed.exception.payload["exit_code"], 7)
+
+    def test_bounded_process_terminates_oversized_child_output(self) -> None:
+        with self.assertRaises(SBPD.ProcessOutputLimitExceeded) as oversized:
+            SBPD._run_bounded_process(
+                [SBPD.sys.executable, "-c", "import sys; sys.stdout.write('x' * 4096)"],
+                timeout=3,
+                stdout_limit=128,
+                stderr_limit=128,
+            )
+        self.assertEqual(oversized.exception.stream, "stdout")
 
     def test_pull_skill_bundle_delegates_pull_and_packs_selected_source(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -255,23 +264,21 @@ class SbpdDelegateTests(unittest.TestCase):
             (source / "guide.md").write_text("guide\n", encoding="utf-8")
             tree_sha, _entry_sha, _entry_bytes = SBPD.SKILL_PULL._safe_tree_identity(source)
             model = {"model": "fixture"}
+            result = {"tree_sha256": tree_sha}
+            context = {"source": source, "source_repo_sha": "a" * 40}
             with (
                 patch.object(SBPD, "build_runtime_model", return_value=model),
                 patch.object(
                     SBPD.SKILL_PULL,
-                    "_resolve_internal",
-                    return_value=({}, {}, {"sbp": source}),
-                ),
-                patch.object(
-                    SBPD.SKILL_PULL,
-                    "pull_host_skill",
-                    return_value={"tree_sha256": tree_sha},
+                    "_pull_host_skill_with_context",
+                    return_value=(result, context),
                 ) as pull,
             ):
                 bundle, result = SBPD.pull_skill_bundle("sbp")
 
         pull.assert_called_once_with(model, "sbp", cwd=SBPD.ROOT_DIR)
         self.assertEqual(result["tree_sha256"], tree_sha)
+        self.assertEqual(result["remote_pinned_sha"], "a" * 40)
         with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as archive:
             self.assertIn("SKILL.md", archive.getnames())
             self.assertIn("guide.md", archive.getnames())
@@ -287,17 +294,58 @@ class SbpdDelegateTests(unittest.TestCase):
                 patch.object(SBPD, "build_runtime_model", return_value=model),
                 patch.object(
                     SBPD.SKILL_PULL,
-                    "_resolve_internal",
-                    return_value=({}, {}, {"sbp": source}),
+                    "_pull_host_skill_with_context",
+                    return_value=(
+                        {"tree_sha256": "0" * 64},
+                        {"source": source, "source_repo_sha": "a" * 40},
+                    ),
                 ),
+                self.assertRaises(SBPD.ServiceError) as drift,
+            ):
+                SBPD.pull_skill_bundle("sbp")
+        self.assertEqual(drift.exception.status, 409)
+        self.assertEqual(drift.exception.payload["error_code"], "SKILL_TREE_DRIFT")
+
+    def test_pull_skill_bundle_fails_closed_when_source_changes_during_pack(self) -> None:
+        from runtime_manager.distribution import bundle as bundle_module
+
+        model = {"model": "fixture"}
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "sbp"
+            source.mkdir()
+            entry = source / "SKILL.md"
+            entry.write_text("# sbp\n", encoding="utf-8")
+            tree_sha, _entry_sha, _entry_bytes = SBPD.SKILL_PULL._safe_tree_identity(source)
+            original_collect = bundle_module._collect_content_files
+            calls = 0
+
+            def collect_then_mutate(root: Path) -> list[tuple[str, str]]:
+                nonlocal calls
+                entries = original_collect(root)
+                calls += 1
+                if calls == 1:
+                    entry.write_text("# changed during pack\n", encoding="utf-8")
+                return entries
+
+            with (
+                patch.object(SBPD, "build_runtime_model", return_value=model),
                 patch.object(
                     SBPD.SKILL_PULL,
-                    "pull_host_skill",
-                    return_value={"tree_sha256": "0" * 64},
+                    "_pull_host_skill_with_context",
+                    return_value=(
+                        {"tree_sha256": tree_sha},
+                        {"source": source, "source_repo_sha": "a" * 40},
+                    ),
                 ),
+                patch.object(
+                    bundle_module,
+                    "_collect_content_files",
+                    side_effect=collect_then_mutate,
+                ),
+                self.assertRaises(SBPD.ServiceError) as drift,
             ):
-                with self.assertRaises(SBPD.ServiceError) as drift:
-                    SBPD.pull_skill_bundle("sbp")
+                SBPD.pull_skill_bundle("sbp")
+
         self.assertEqual(drift.exception.status, 409)
         self.assertEqual(drift.exception.payload["error_code"], "SKILL_TREE_DRIFT")
 
@@ -309,7 +357,7 @@ class SbpdCliTests(unittest.TestCase):
         self.assertEqual(args.port, 8443)
         self.assertFalse(args.require_auth)
         self.assertTrue(SBPD.build_parser().parse_args(["--require-auth"]).require_auth)
-        self.assertEqual(SBPD.bind_address("100.100.1.3"), "100.100.1.3")
+        self.assertEqual(SBPD.bind_address("100.64.0.10"), "100.64.0.10")
         self.assertEqual(
             SBPD.bind_address("fd7a:115c:a1e0::1"),
             "fd7a:115c:a1e0::1",
@@ -317,9 +365,15 @@ class SbpdCliTests(unittest.TestCase):
 
     def test_bind_rejects_wildcard_and_public_addresses(self) -> None:
         for address in ("0.0.0.0", "::", "8.8.8.8", "localhost"):
-            with self.subTest(address=address):
+            with self.subTest(address=address):  # noqa: SIM117
                 with self.assertRaises(argparse.ArgumentTypeError):
                     SBPD.bind_address(address)
+
+    def test_tailnet_bind_requires_authenticated_project_allowlist(self) -> None:
+        with self.assertRaises(SystemExit):
+            SBPD.main(["--bind", "100.64.0.10", "--port", "0"])
+        with self.assertRaises(SystemExit):
+            SBPD.main(["--bind", "100.64.0.10", "--port", "0", "--require-auth"])
 
     def test_ipv6_server_class_uses_ipv6_socket_family(self) -> None:
         self.assertEqual(SBPD.ThreadingHTTPServerV6.address_family, SBPD.socket.AF_INET6)
@@ -394,17 +448,30 @@ class SbpdAuthTests(unittest.TestCase):
         kid: str = "primary",
         audience: str = SBPD.SBPD_AUDIENCE,
         expires_at: int | None = None,
-        subject: str = "project:user:thread",
+        subject: str = "project:project:user:user:thread:T-test",
+        overrides: dict[str, object] | None = None,
+        drop: tuple[str, ...] = (),
     ) -> str:
         now = int(time.time())
+        claims: dict[str, object] = {
+            "aud": audience,
+            "exp": expires_at if expires_at is not None else now + 60,
+            "iat": now,
+            "iss": SBPD.AMP_ISSUER,
+            "sub": subject,
+            "thread_id": "T-test",
+            "project_id": "project",
+            "user_id": "user",
+            "jti": "lease-1",
+            "email": "private@example.invalid",
+            "email_verified": True,
+            "token_use": "exchanged",
+        }
+        claims.update(overrides or {})
+        for key in drop:
+            claims.pop(key, None)
         return jwt.encode(
-            {
-                "aud": audience,
-                "exp": expires_at if expires_at is not None else now + 60,
-                "iss": SBPD.AMP_ISSUER,
-                "sub": subject,
-                "thread_id": "T-test",
-            },
+            claims,
             private_key or self.private_key,
             algorithm="RS256",
             headers={"kid": kid},
@@ -433,7 +500,94 @@ class SbpdAuthTests(unittest.TestCase):
             fixture.close()
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body), {"ok": True})
-        self.assertIn("sub=project:user:thread", log.getvalue())
+        self.assertNotIn("private@example.invalid", log.getvalue())
+        self.assertNotIn("sub=", log.getvalue())
+
+    def test_project_allowlist_and_amp_claim_schema_fail_closed(self) -> None:
+        allowed = self.verifier(allowed_project_ids=("project",))
+        claims = allowed.verify(self.token())
+        self.assertNotIn("workspace_id", claims)
+
+        cases = {
+            "wrong-project": self.token(
+                subject="project:wrong:user:user:thread:T-test",
+                overrides={"project_id": "wrong"},
+            ),
+            "wrong-token-use": self.token(overrides={"token_use": "access"}),
+            "subject-mismatch": self.token(subject="project:project:user:other:thread:T-test"),
+            "unverified-email": self.token(overrides={"email_verified": False}),
+            "thread-type": self.token(overrides={"thread_id": 7}),
+            "user-empty": self.token(overrides={"user_id": ""}),
+            "jti-type": self.token(overrides={"jti": ["lease-1"]}),
+            "iat-bool": self.token(overrides={"iat": True}),
+            **{
+                f"missing-{claim}": self.token(drop=(claim,))
+                for claim in (
+                    "email",
+                    "email_verified",
+                    "iat",
+                    "jti",
+                    "project_id",
+                    "sub",
+                    "thread_id",
+                    "token_use",
+                    "user_id",
+                )
+            },
+        }
+        for name, token in cases.items():
+            with self.subTest(name=name), self.assertRaises(SBPD.AuthenticationError):
+                allowed.verify(token)
+
+    def test_workspace_is_optional_unless_explicitly_allowlisted(self) -> None:
+        self.verifier(allowed_project_ids=("project",)).verify(self.token())
+        with self.assertRaises(SBPD.AuthenticationError):
+            self.verifier(
+                allowed_project_ids=("project",),
+                allowed_workspace_ids=("workspace-1",),
+            ).verify(self.token())
+
+        workspace_token = self.token(
+            subject="workspace:workspace-1:project:project:user:user:thread:T-test",
+            overrides={"workspace_id": "workspace-1"},
+        )
+        verified = self.verifier(
+            allowed_project_ids=("project",),
+            allowed_workspace_ids=("workspace-1",),
+        ).verify(workspace_token)
+        self.assertEqual(verified["workspace_id"], "workspace-1")
+
+    def test_authenticated_skill_response_binds_private_transport_identity(self) -> None:
+        fixture = ServerFixture(require_auth=True, authenticator=self.verifier())
+        try:
+            with patch.object(
+                SBPD,
+                "pull_skill_bundle",
+                return_value=(
+                    b"bundle",
+                    {
+                        "tree_sha256": "c" * 64,
+                        "remote_pinned_sha": "a" * 40,
+                        "receipt_sha256": "b" * 64,
+                    },
+                ),
+            ):
+                status, headers, body = fixture.request(
+                    "GET",
+                    "/v1/skill/pull/sbp",
+                    headers={"Authorization": f"Bearer {self.token()}"},
+                )
+        finally:
+            fixture.close()
+        self.assertEqual(status, 200, body)
+        self.assertEqual(headers["X-SBP-Project-Id"], "project")
+        self.assertEqual(headers["X-SBP-Project-Alias"], "test/project")
+        self.assertEqual(headers["X-SBP-Remote-Sha"], "a" * 40)
+        self.assertEqual(headers["X-SBP-Resolution-Receipt"], "b" * 64)
+        self.assertEqual(headers["X-SBP-Lease-Id"], "lease-1")
+        self.assertEqual(headers["X-SBP-Thread-Id"], "T-test")
+        self.assertEqual(headers["X-SBP-User-Id"], "user")
+        self.assertEqual(headers["X-SBP-Visibility"], "private")
 
     def test_missing_expired_wrong_audience_and_unknown_kid_return_json_401(self) -> None:
         fixture = ServerFixture(require_auth=True, authenticator=self.verifier())
@@ -484,6 +638,9 @@ class SbpdAuthTests(unittest.TestCase):
             "missing-exp": missing_expiry,
             "expired": self.token(expires_at=int(time.time()) - 60),
             "wrong-aud": self.token(audience="some-other-service"),
+            "aud-list-not-exact": self.token(
+                overrides={"aud": [SBPD.SBPD_AUDIENCE, "some-other-service"]}
+            ),
             "unknown-kid": self.token(kid="unknown"),
         }
         try:
@@ -514,13 +671,19 @@ class SbpdAuthTests(unittest.TestCase):
         finally:
             fixture.close()
 
-    def test_health_and_orb_kit_are_exempt_when_auth_is_required(self) -> None:
+    def test_health_is_public_but_orb_kit_requires_auth(self) -> None:
         fixture = ServerFixture(require_auth=True, authenticator=self.verifier())
         try:
             status, _headers, _body = fixture.request("GET", "/healthz")
             self.assertEqual(status, 200)
             with patch.object(SBPD, "build_orb_kit", return_value=b"kit"):
                 status, _headers, body = fixture.request("GET", "/v1/orb-kit")
+                self.assertEqual(status, 401)
+                status, _headers, body = fixture.request(
+                    "GET",
+                    "/v1/orb-kit",
+                    headers={"Authorization": f"Bearer {self.token()}"},
+                )
             self.assertEqual(status, 200)
             self.assertEqual(body, b"kit")
         finally:
@@ -588,6 +751,14 @@ class SbpdAuthTests(unittest.TestCase):
         )
         with self.assertRaises(SBPD.AuthenticationError):
             redirected.verify(self.token())
+        https_redirected = self.verifier(
+            opener=SequenceJWKSOpener(
+                {"keys": [self.jwk]},
+                response_url="https://attacker.invalid/jwks.json",
+            )
+        )
+        with self.assertRaisesRegex(SBPD.AuthenticationError, "unable to load"):
+            https_redirected.verify(self.token())
 
         poisoning_opener = SequenceJWKSOpener(
             {"keys": [self.jwk]},
@@ -611,6 +782,15 @@ class SbpdAuthTests(unittest.TestCase):
             poisoning_verifier.verify(self.token(kid="poison"))
         poisoning_verifier.verify(self.token())
         self.assertEqual(len(poisoning_opener.calls), 2)
+
+    def test_jwks_response_size_is_bounded(self) -> None:
+        verifier = self.verifier(
+            opener=SequenceJWKSOpener(
+                {"keys": [self.jwk], "padding": "x" * SBPD.MAX_JWKS_BYTES}
+            )
+        )
+        with self.assertRaisesRegex(SBPD.AuthenticationError, "unable to load"):
+            verifier.verify(self.token())
 
 
 if __name__ == "__main__":

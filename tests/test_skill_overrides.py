@@ -969,7 +969,7 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
             self.assertEqual(policy["pin_off"], [])
             self.assertTrue(first["changed"])
             self.assertFalse(first["noop"])
-            self.assertEqual(first["summary"]["link"], 2)
+            self.assertEqual(first["summary"]["link"], 3)
             self.assertTrue(first["activation_packet"]["skill_md_sha256"])
             self.assertTrue(first["verification"]["verified"])
             self.assertIn("alpha", [item["name"] for item in first["verification"]["effective_now"]])
@@ -1082,6 +1082,7 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
             self.assertFalse((repo / ".skillbox" / "skill-overrides.yaml").exists())
             self.assertFalse((repo / ".claude" / "skills" / "alpha").exists())
             self.assertFalse((repo / ".codex" / "skills" / "alpha").exists())
+            self.assertFalse((repo / ".agents" / "skills" / "alpha").exists())
 
     def test_skill_on_text_prints_activation_packet_without_link_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1092,6 +1093,7 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
             source = _write_source_skill(source_root, "alpha")
             _install_project_skill(repo, "alpha", source, surface="claude")
             _install_project_skill(repo, "alpha", source, surface="codex")
+            _install_project_skill(repo, "alpha", source, surface="agents")
             model = _write_scope_policy(root, source_root, "alpha", repo)
             args = _skill_toggle_args(repo, "on", "alpha")
 
@@ -1117,6 +1119,7 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
             source = _write_source_skill(root / "unlisted-sources", "alpha")
             _install_project_skill(repo, "alpha", source, surface="claude")
             _install_project_skill(repo, "alpha", source, surface="codex")
+            _install_project_skill(repo, "alpha", source, surface="agents")
             model = {
                 "env": {"SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root)},
                 "clients": [],
@@ -1142,6 +1145,7 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
             source = _write_source_skill(source_root, "alpha")
             claude_link = _install_project_skill(repo, "alpha", source, surface="claude")
             codex_link = _install_project_skill(repo, "alpha", source, surface="codex")
+            agents_link = _install_project_skill(repo, "alpha", source, surface="agents")
             _write_override(repo, "version: 1\npin_on: [alpha]\n")
             model = _write_scope_policy(root, source_root, "alpha", repo)
             args = _skill_toggle_args(repo, "off", "alpha")
@@ -1163,6 +1167,7 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
             self.assertEqual({action["status"] for action in applied["actions"]}, {"unlinked"})
             self.assertFalse(claude_link.exists())
             self.assertFalse(codex_link.exists())
+            self.assertFalse(agents_link.exists())
 
     def test_skill_off_refuses_dispatcher_floor_before_write(self) -> None:
         for floor_skill in DISPATCHER_CORE:
@@ -1241,7 +1246,7 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
             policy = _repo_override_policy(repo)
             self.assertEqual(policy["pin_on"], ["alpha"])
             self.assertTrue(payload["changed"])
-            self.assertEqual(payload["summary"]["link"], 2)
+            self.assertEqual(payload["summary"]["link"], 3)
 
     def test_skill_default_repo_dry_run_prints_diff_without_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1574,6 +1579,7 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
             policy = _repo_override_policy(repo)
             claude_linked = (repo / ".claude" / "skills" / "alpha").is_symlink()
             codex_linked = (repo / ".codex" / "skills" / "alpha").is_symlink()
+            agents_linked = (repo / ".agents" / "skills" / "alpha").is_symlink()
 
         self.assertEqual(first_code, 0)
         self.assertEqual(second_code, 0)
@@ -1581,9 +1587,10 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
         self.assertTrue(policy["reason"].startswith("heal:alpha "))
         self.assertTrue(claude_linked)
         self.assertTrue(codex_linked)
+        self.assertTrue(agents_linked)
         self.assertEqual(first["action"], "heal")
         self.assertTrue(first["changed"])
-        self.assertEqual(first["summary"]["link"], 2)
+        self.assertEqual(first["summary"]["link"], 3)
         self.assertEqual(first["activation_packet"]["skill_md_sha256"], expected_sha)
         self.assertEqual(second["action"], "heal")
         self.assertFalse(second["changed"])
@@ -1650,6 +1657,7 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
             override_exists = (repo / ".skillbox" / "skill-overrides.yaml").exists()
             claude_link_exists = (repo / ".claude" / "skills" / "madeup-skill-name").exists()
             codex_link_exists = (repo / ".codex" / "skills" / "madeup-skill-name").exists()
+            agents_link_exists = (repo / ".agents" / "skills" / "madeup-skill-name").exists()
 
         self.assertNotEqual(code, 0)
         self.assertEqual(payload["error_code"], OVERRIDE_SKILL_UNKNOWN)
@@ -1657,6 +1665,7 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
         self.assertFalse(override_exists)
         self.assertFalse(claude_link_exists)
         self.assertFalse(codex_link_exists)
+        self.assertFalse(agents_link_exists)
 
     def test_skill_heal_missing_explicit_source_reports_unknown_without_writing_pin(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1840,7 +1849,7 @@ class SkillWhatIfTests(unittest.TestCase):
             f"    paths: [{repo}]\n",
             encoding="utf-8",
         )
-        for surface in ("claude", "codex"):
+        for surface in ("claude", "codex", "agents"):
             (repo / f".{surface}" / "skills").mkdir(parents=True)
         model = {"env": {"SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root)}, "clients": [], "skills": []}
         return repo, fake_home, model
@@ -1882,6 +1891,7 @@ class SkillWhatIfTests(unittest.TestCase):
                 repo / ".skillbox" / "skill-overrides.yaml",
                 repo / ".claude" / "skills",
                 repo / ".codex" / "skills",
+                repo / ".agents" / "skills",
             ]
             before = {path: path.stat().st_mtime_ns for path in watched}
 

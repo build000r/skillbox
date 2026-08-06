@@ -1,136 +1,97 @@
 #!/usr/bin/env bash
-# AO-005 hardened Amp Orb setup for build000r/skillbox.
-# Idempotent: safe to re-run in the same Orb or a <=24h post-setup snapshot.
+# Bounded, idempotent AO-005 project-Orb setup. This hook is deliberately offline.
 set -Eeuo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "${BASH_SOURCE[0]%/*}/.." && pwd)"
 cd "$ROOT"
+STATE_DIR="${AGENT_STATE_DIR:-$ROOT/.skillbox-state/project-orb/hook-state}"
+LOG_DIR="${AGENT_LOG_DIR:-$ROOT/.skillbox-state/project-orb/hook-logs}"
+STATUS_FILE="$STATE_DIR/setup-status.json"
+LOG_FILE="$LOG_DIR/setup.log"
+printf -v START '%(%s)T' -1
+FAILURE_CLASS=setup
+REASON_CODE=setup_unexpected
+DETAIL='setup did not complete'
+umask 077
 
-AGENT_STATE_DIR="${AGENT_STATE_DIR:-$ROOT/.agents/state}"
-AGENT_LOG_DIR="${AGENT_LOG_DIR:-$ROOT/.agents/logs}"
-STATUS_FILE="$AGENT_STATE_DIR/setup-status.json"
-LOG_FILE="$AGENT_LOG_DIR/setup.log"
-MIN_FREE_GB="${SKILLBOX_ORB_MIN_FREE_GB:-8}"
-START_EPOCH="$(date +%s)"
-FAILURE_CLASS="setup"
-FAILURE_REASON="unexpected setup failure"
-
-mkdir -p "$AGENT_STATE_DIR" "$AGENT_LOG_DIR"
-touch "$LOG_FILE"
-exec > >(tee -a "$LOG_FILE") 2> >(tee -a "$LOG_FILE" >&2)
-
-log() { printf 'skillbox-orb-setup: %s\n' "$*"; }
-
-json_quote() {
-  python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1" 2>/dev/null \
-    || printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+fallback_status() {
+  local status="$1" failure="$2" reason="$3" code="$4"
+  printf 'AGENT_SETUP_RESULT_JSON {"schema_version":"skillbox.amp-project-orb.hook-status/1","kind":"skillbox.agent_hook_status","script":"setup","status":"%s","failure_class":"%s","reason_code":"%s","exit_code":%s,"duration_seconds":0}\n' \
+    "$status" "$failure" "$reason" "$code" >&2
 }
-
-disk_json() {
-  df -Pk / | awk 'NR==2 {printf "{\"filesystem\":\"%s\",\"size_kb\":%s,\"used_kb\":%s,\"available_kb\":%s,\"capacity\":\"%s\",\"mount\":\"%s\"}", $1, $2, $3, $4, $5, $6}'
+command -v timeout >/dev/null 2>&1 || {
+  printf 'skillbox-orb-setup: required local command timeout is missing\n' >&2
+  fallback_status error dependency timeout_command_missing 20
+  exit 20
 }
-
-disk_available_gb() {
-  df -Pk / | awk 'NR==2 {printf "%d", $4 / 1024 / 1024}'
+command -v python3 >/dev/null 2>&1 || {
+  printf 'skillbox-orb-setup: required local command python3 is missing\n' >&2
+  fallback_status error dependency python_missing 20
+  exit 20
 }
+timeout --signal=TERM --kill-after=1 "${SKILLBOX_ORB_FS_TIMEOUT_SECONDS:-3}s" \
+  "$ROOT/scripts/orb/orb_readiness.py" prepare-hook \
+  --state-dir "$STATE_DIR" --log-dir "$LOG_DIR" --script setup || {
+    printf 'skillbox-orb-setup: could not prepare private hook state\n' >&2
+    fallback_status error setup hook_state_invalid 10
+    exit 10
+  }
 
 emit_status() {
-  local exit_code="$1"
-  local end_epoch duration status
-  end_epoch="$(date +%s)"
-  duration="$((end_epoch - START_EPOCH))"
-  status="ok"
-  if [[ "$exit_code" -ne 0 ]]; then
-    status="error"
+  local rc="$1" status=error
+  [[ "$rc" -eq 0 ]] && status=ok
+  if STATUS_FILE="$STATUS_FILE" SCRIPT=setup STATUS="$status" FAILURE_CLASS="$FAILURE_CLASS" \
+    REASON_CODE="$REASON_CODE" EXIT_CODE="$rc" START="$START" \
+    timeout --signal=TERM --kill-after=1 "${SKILLBOX_ORB_STATUS_TIMEOUT_SECONDS:-2}s" \
+    "$ROOT/scripts/orb/orb_readiness.py" write-status >/dev/null 2>&1; then
+    [[ -f "$STATUS_FILE" && ! -L "$STATUS_FILE" ]] \
+      && printf 'AGENT_SETUP_RESULT_JSON %s\n' "$(<"$STATUS_FILE")" >&2
+  else
+    local fallback_code="$rc"
+    [[ "$fallback_code" -eq 0 ]] && fallback_code=50
+    fallback_status error validation status_write_failed "$fallback_code"
+    if [[ "$rc" -eq 0 ]]; then
+      trap - EXIT
+      exit 50
+    fi
   fi
-  local payload
-  payload="$(printf '{"schema_version":1,"repo":"build000r/skillbox","script":"setup","status":%s,"failure_class":%s,"reason":%s,"exit_code":%s,"duration_seconds":%s,"disk":%s,"log_file":%s,"timestamp":%s}\n' \
-    "$(json_quote "$status")" \
-    "$(json_quote "$FAILURE_CLASS")" \
-    "$(json_quote "$FAILURE_REASON")" \
-    "$exit_code" \
-    "$duration" \
-    "$(disk_json)" \
-    "$(json_quote "$LOG_FILE")" \
-    "$(json_quote "$(date -u +%Y-%m-%dT%H:%M:%SZ)")")"
-  printf '%s' "$payload" > "$STATUS_FILE"
-  printf 'AGENT_SETUP_RESULT_JSON %s' "$payload" >&2
+}
+trap 'rc=$?; emit_status "$rc"' EXIT
+
+fail() { FAILURE_CLASS="$1"; REASON_CODE="$2"; DETAIL="$3"; printf 'skillbox-orb-setup: %s\n' "$DETAIL" >&2; exit "$4"; }
+run_bounded() {
+  local seconds="$1" reason="$2" klass="$3" code="$4"; shift 4
+  timeout --signal=TERM --kill-after=1 "${seconds}s" "$@" >>"$LOG_FILE" 2>&1 || {
+    local rc=$?
+    [[ "$rc" -eq 124 || "$rc" -eq 137 ]] && fail "$klass" "$reason" "$reason" "$code"
+    fail "$klass" "${reason%_timeout}_failed" "${reason%_timeout} failed" "$code"
+  }
 }
 
-on_exit() {
-  local exit_code="$1"
-  if [[ "$exit_code" -eq 0 ]]; then
-    FAILURE_CLASS="none"
-    FAILURE_REASON="setup ok"
-  fi
-  emit_status "$exit_code"
+command -v git >/dev/null 2>&1 || fail dependency git_missing 'required local command git is missing' 20
+
+free_kb="$(
+  timeout --signal=TERM --kill-after=1 "${SKILLBOX_ORB_DISK_TIMEOUT_SECONDS:-3}s" \
+    python3 -c 'import shutil; print(shutil.disk_usage("/").free // 1024)'
+)" || {
+  rc=$?
+  [[ "$rc" -eq 124 || "$rc" -eq 137 ]] && fail capacity disk_probe_timeout 'local disk capacity probe timed out' 30
+  fail capacity disk_probe_failed 'local disk capacity probe failed' 30
 }
-trap 'on_exit $?' EXIT
+[[ "$free_kb" =~ ^[0-9]+$ ]] || fail capacity disk_probe_failed 'local disk capacity probe was invalid' 30
+min_gb="${SKILLBOX_ORB_MIN_FREE_GB:-8}"
+(( free_kb >= min_gb * 1024 * 1024 )) || fail capacity disk_capacity_low 'insufficient fixed Orb disk capacity' 30
 
-fail() {
-  FAILURE_CLASS="$1"
-  FAILURE_REASON="$2"
-  local code="$3"
-  log "FAIL[$FAILURE_CLASS]: $FAILURE_REASON"
-  exit "$code"
-}
+run_bounded "${SKILLBOX_ORB_COMPILE_TIMEOUT_SECONDS:-45}" compileall_timeout validation 50 \
+  python3 -m compileall -q -x '(/\.git/|/builds/|/data/|/node_modules/|/__pycache__/)' .env-manager scripts tests
+run_bounded "${SKILLBOX_ORB_UNITTEST_TIMEOUT_SECONDS:-45}" unittest_timeout validation 50 \
+  python3 -m unittest tests.test_agent_ops_adapters -q
+run_bounded "${SKILLBOX_ORB_IDENTITY_TIMEOUT_SECONDS:-3}" identity_timeout validation 50 \
+  "$ROOT/scripts/orb/orb_readiness.py" ensure-identity --output "$STATE_DIR/orb-resume-id"
+run_bounded "${SKILLBOX_ORB_READINESS_TIMEOUT_SECONDS:-5}" readiness_timeout validation 50 \
+  "$ROOT/scripts/orb/orb_readiness.py" collect --context setup --output "$STATE_DIR/orb-readiness.json"
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || fail dependency "missing required command: $1" 20
-}
-
-log "start: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-log "disk before: $(df -h / | tail -1)"
-
-FREE_GB="$(disk_available_gb)"
-if [[ "$FREE_GB" -lt "$MIN_FREE_GB" ]]; then
-  fail capacity "need at least ${MIN_FREE_GB}GB free on fixed Orb disk before setup; found ${FREE_GB}GB" 30
-fi
-
-need_cmd python3
-need_cmd git
-
-if [[ -n "${TAILSCALE_AUTHKEY:-}" && -x scripts/orb/join-tailnet.sh ]]; then
-  log "tailnet: joining"
-  scripts/orb/join-tailnet.sh \
-    || fail auth "tailnet join failed" 40
-fi
-
-log "python: $(python3 --version 2>&1)"
-
-PY_VERSION="$(python3 - <<'PY'
-import sys
-print(f"{sys.version_info.major}.{sys.version_info.minor}")
-PY
-)"
-PY_MAJOR="${PY_VERSION%%.*}"
-PY_MINOR="${PY_VERSION#*.}"
-if [[ "$PY_MAJOR" -lt 3 || "$PY_MINOR" -lt 11 ]]; then
-  fail dependency "need Python >= 3.11; got ${PY_VERSION}" 20
-fi
-
-if ! command -v ruff >/dev/null 2>&1; then
-  log "ruff not on PATH; attempting user install (best-effort)"
-  python3 -m pip install --user -q 'ruff>=0.4,<1' || log "ruff install skipped"
-fi
-
-log "compileall: .env-manager + scripts + tests"
-if ! python3 -m compileall -q \
-  -x '(/\.git/|/builds/|/data/|/node_modules/|/__pycache__/)' \
-  .env-manager scripts tests 2>/dev/null; then
-  python3 -m compileall -q .env-manager scripts tests \
-    || fail validation "compileall failed for .env-manager/scripts/tests" 50
-fi
-
-if [[ -f tests/test_agent_ops_adapters.py ]]; then
-  log "unittest: tests.test_agent_ops_adapters"
-  python3 -m unittest tests.test_agent_ops_adapters -q \
-    || fail validation "tests.test_agent_ops_adapters failed" 50
-else
-  log "adapter tests missing; falling back to discover -p test_agent_ops_adapters.py"
-  python3 -m unittest discover -s tests -p 'test_agent_ops_adapters.py' -q \
-    || fail validation "adapter unittest discovery failed" 50
-fi
-
-log "disk after: $(df -h / | tail -1)"
-log "setup ok"
+FAILURE_CLASS=none
+REASON_CODE=setup_ready
+DETAIL='setup complete'
+exit 0

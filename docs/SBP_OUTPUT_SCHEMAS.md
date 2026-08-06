@@ -495,7 +495,7 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
   ],
   "beads": {
     "beads_dir": "<FLEET>/repos_real/overlay-repo/.beads",
-    "br": "<BR_BIN>",
+    "br": null,
     "initialized": false,
     "issues": [],
     "next_actions": [],
@@ -735,9 +735,14 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
   ],
   "beads": {
     "beads_dir": "<FLEET>/repos_real/healthy/.beads",
-    "br": "<BR_BIN>",
+    "br": null,
     "initialized": false,
     "issues": [
+      {
+        "code": "missing_br",
+        "hint": "install beads_rust, then rerun sbp recalibrate",
+        "message": "BEADS DRIFT: beads-aware skills are active, but `br` is not on PATH"
+      },
       {
         "code": "no_beads_dir",
         "hint": "sbp beads init --cwd <FLEET>/repos_real/healthy",
@@ -745,6 +750,7 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       }
     ],
     "next_actions": [
+      "install beads_rust, then rerun sbp recalibrate",
       "sbp beads init --cwd <FLEET>/repos_real/healthy"
     ],
     "ok": false,
@@ -878,6 +884,7 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
   ],
   "next_actions": [
     "doctor --format json",
+    "install beads_rust, then rerun sbp recalibrate",
     "sbp beads init --cwd <FLEET>/repos_real/healthy"
   ],
   "occurrences": [
@@ -1017,7 +1024,7 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
   "summary": {
     "archive_source_skills": 0,
     "archive_sources": 0,
-    "beads_issues": 1,
+    "beads_issues": 2,
     "beads_required_skills": 1,
     "broken_by_class": {
       "dangling": 0,
@@ -1300,7 +1307,7 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
 {
   "beads": {
     "beads_dir": "<FLEET>/repos_real/overlay-repo/.beads",
-    "br": "<BR_BIN>",
+    "br": null,
     "initialized": false,
     "issues": [],
     "next_actions": [],
@@ -1349,10 +1356,27 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
             "source_bucket": "external",
             "status": "would_link",
             "surface": "codex"
+          },
+          {
+            "blocked_reason": "",
+            "category": null,
+            "destination": "<FLEET>/repos_real/overlay-repo/.agents/skills/tiny-ui",
+            "existing": {
+              "state": "missing"
+            },
+            "op": "link",
+            "repo_path": "<FLEET>/repos_real/overlay-repo",
+            "root": "<FLEET>/repos_real/overlay-repo/.agents/skills",
+            "scope": "project",
+            "skill": "tiny-ui",
+            "source": "<FLEET>/skills/tiny-ui",
+            "source_bucket": "external",
+            "status": "would_link",
+            "surface": "agents"
           }
         ],
         "activation_packet": {
-          "instructions": "Use this SKILL.md content immediately in the current agent session. The filesystem links make the skill visible to future Claude and Codex sessions.",
+          "instructions": "Use this SKILL.md content immediately in the current agent session. The filesystem links make the skill visible to future compatible agent sessions.",
           "name": "tiny-ui",
           "skill_md": "---\nname: tiny-ui\ndescription: Tiny fixture skill tiny-ui.\n---\n\n# tiny-ui\n\nFixture skill body for tiny-ui.\n",
           "skill_md_path": "<FLEET>/skills/tiny-ui/SKILL.md",
@@ -1360,6 +1384,9 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
           "source": "<FLEET>/skills/tiny-ui",
           "source_bucket": "external",
           "surface_targets": {
+            "agents": [
+              "<FLEET>/repos_real/overlay-repo/.agents/skills/tiny-ui"
+            ],
             "claude": [
               "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui"
             ],
@@ -1372,10 +1399,10 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
         "dry_run": true,
         "skill": "tiny-ui",
         "summary": {
-          "actions": 2,
+          "actions": 3,
           "applied": 0,
           "blocked": 0,
-          "link": 2,
+          "link": 3,
           "skipped": 0,
           "unchanged": 0,
           "unlink": 0
@@ -1398,10 +1425,18 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
           "source": "<FLEET>/skills/tiny-ui",
           "status": "would_link",
           "surface": "codex"
+        },
+        {
+          "destination": "<FLEET>/repos_real/overlay-repo/.agents/skills/tiny-ui",
+          "scope": "project",
+          "skill": "tiny-ui",
+          "source": "<FLEET>/skills/tiny-ui",
+          "status": "would_link",
+          "surface": "agents"
         }
       ],
       "packet_on_apply": {
-        "instructions": "Use this SKILL.md content immediately in the current agent session. The filesystem links make the skill visible to future Claude and Codex sessions.",
+        "instructions": "Use this SKILL.md content immediately in the current agent session. The filesystem links make the skill visible to future compatible agent sessions.",
         "name": "tiny-ui",
         "skill_md": "---\nname: tiny-ui\ndescription: Tiny fixture skill tiny-ui.\n---\n\n# tiny-ui\n\nFixture skill body for tiny-ui.\n",
         "skill_md_path": "<FLEET>/skills/tiny-ui/SKILL.md",
@@ -1409,6 +1444,9 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
         "source": "<FLEET>/skills/tiny-ui",
         "source_bucket": "external",
         "surface_targets": {
+          "agents": [
+            "<FLEET>/repos_real/overlay-repo/.agents/skills/tiny-ui"
+          ],
           "claude": [
             "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui"
           ],
@@ -1786,10 +1824,27 @@ Durable repo-local pin ON plus disk links. Writes `pin_on` to `.skillbox/skill-o
       "source_bucket": "external",
       "status": "would_link",
       "surface": "codex"
+    },
+    {
+      "blocked_reason": "",
+      "category": null,
+      "destination": "<FLEET>/repos_real/overlay-repo/.agents/skills/tiny-ui",
+      "existing": {
+        "state": "missing"
+      },
+      "op": "link",
+      "repo_path": "<FLEET>/repos_real/overlay-repo",
+      "root": "<FLEET>/repos_real/overlay-repo/.agents/skills",
+      "scope": "project",
+      "skill": "tiny-ui",
+      "source": "<FLEET>/skills/tiny-ui",
+      "source_bucket": "external",
+      "status": "would_link",
+      "surface": "agents"
     }
   ],
   "activation_packet": {
-    "instructions": "Use this SKILL.md content immediately in the current agent session. The filesystem links make the skill visible to future Claude and Codex sessions.",
+    "instructions": "Use this SKILL.md content immediately in the current agent session. The filesystem links make the skill visible to future compatible agent sessions.",
     "name": "tiny-ui",
     "skill_md": "---\nname: tiny-ui\ndescription: Tiny fixture skill tiny-ui.\n---\n\n# tiny-ui\n\nFixture skill body for tiny-ui.\n",
     "skill_md_path": "<FLEET>/skills/tiny-ui/SKILL.md",
@@ -1797,6 +1852,9 @@ Durable repo-local pin ON plus disk links. Writes `pin_on` to `.skillbox/skill-o
     "source": "<FLEET>/skills/tiny-ui",
     "source_bucket": "external",
     "surface_targets": {
+      "agents": [
+        "<FLEET>/repos_real/overlay-repo/.agents/skills/tiny-ui"
+      ],
       "claude": [
         "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui"
       ],
@@ -1838,10 +1896,10 @@ Durable repo-local pin ON plus disk links. Writes `pin_on` to `.skillbox/skill-o
     }
   ],
   "summary": {
-    "actions": 2,
+    "actions": 3,
     "applied": 0,
     "blocked": 0,
-    "link": 2,
+    "link": 3,
     "skipped": 0,
     "unchanged": 0,
     "unlink": 0
@@ -1900,6 +1958,7 @@ Durable repo-local pin OFF plus project unlink. Writes `pin_off` to `.skillbox/s
 | `op` | CONTRACT | Lifecycle op: link or unlink. |
 | `skill` | CONTRACT | Skill name for this action row. |
 | `destination` | CONTRACT | Installed symlink path affected. |
+| `repo_path` | CONTRACT | Repo root owning the destination. |
 | `scope` | CONTRACT | project or global scope of the action. |
 | `surface` | CONTRACT | claude or codex surface. |
 | `source` | CONTRACT | Source path for link rows; prior target for unlink rows. |
@@ -1938,6 +1997,7 @@ Durable repo-local pin OFF plus project unlink. Writes `pin_off` to `.skillbox/s
       "layer": "project:claude:<FLEET>/repos_real/overlay-repo",
       "op": "unlink",
       "reason": "pin_off",
+      "repo_path": "<FLEET>/repos_real/overlay-repo",
       "scope": "project",
       "skill": "tiny-marketing",
       "source": "<FLEET>/private-skills/tiny-marketing",

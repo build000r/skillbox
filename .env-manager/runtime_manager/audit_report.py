@@ -1140,7 +1140,7 @@ def _planned_install_occurrences(
             continue
         source = options[0]
         source_path = str(source.get("source") or "")
-        for surface in ("claude", "codex"):
+        for surface in ("claude", "codex", "agents"):
             root = repo_root / f".{surface}" / "skills"
             rows.append({
                 "name": skill_name,
@@ -1917,7 +1917,7 @@ def _explain_lost_reason(
             f"loses to {_layer_family(winner)} (rank {winner_rank})"
         )
     if loser_rank == winner_rank:
-        return "same layer rank; lost the surface tie-break (claude/codex ordering)"
+        return "same layer rank; lost the surface tie-break (claude/codex/agents ordering)"
     return "lower precedence than the effective occurrence"
 
 

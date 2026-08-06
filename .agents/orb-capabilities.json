@@ -1,0 +1,66 @@
+{
+  "schema_version": "skillbox.amp-project-orb.capabilities/1",
+  "project_alias": "build000r/skillbox",
+  "capabilities": [
+    {
+      "id": "orb.bootstrap",
+      "class": "required_local",
+      "probes": [
+        {"kind": "command", "name": "python3"},
+        {"kind": "command", "name": "git"},
+        {"kind": "command", "name": "timeout"},
+        {"kind": "path", "path": ".git"},
+        {"kind": "path", "path": ".agents/setup"}
+      ]
+    },
+    {
+      "id": "sbp.project_skill_lifecycle",
+      "class": "required_local",
+      "probes": [
+        {"kind": "path", "path": ".env-manager/manage.py"},
+        {"kind": "path", "path": ".env-manager/runtime_manager/lifecycle.py"},
+        {"kind": "path", "path": "workspace/skill-repos.yaml"}
+      ]
+    },
+    {
+      "id": "amp.project_skills",
+      "class": "required_local",
+      "probes": [
+        {"kind": "path", "path": ".agents"},
+        {"kind": "path", "path": ".env-manager/runtime_manager/inventory.py"}
+      ]
+    },
+    {
+      "id": "amp.workload_identity",
+      "class": "optional_presence",
+      "probes": [
+        {"kind": "command", "name": "amp"}
+      ]
+    },
+    {
+      "id": "sbpd.remote_read",
+      "class": "optional_presence",
+      "probes": [
+        {"kind": "path", "path": "scripts/lib/sbp_client.py"},
+        {"kind": "environment_set", "names": ["SBP_REMOTE", "SBP_PROJECT_ALIAS"]}
+      ]
+    },
+    {
+      "id": "sweet_potato.spaps_read",
+      "class": "optional_presence",
+      "probes": [
+        {"kind": "environment_set", "names": ["SPAPS_REMOTE_READ_URL"]}
+      ]
+    },
+    {
+      "id": "application.production_apply",
+      "class": "forbidden_authority",
+      "probes": []
+    },
+    {
+      "id": "infrastructure.admin",
+      "class": "forbidden_authority",
+      "probes": []
+    }
+  ]
+}
