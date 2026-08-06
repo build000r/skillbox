@@ -357,7 +357,7 @@ class SbpdCliTests(unittest.TestCase):
         self.assertEqual(args.port, 8443)
         self.assertFalse(args.require_auth)
         self.assertTrue(SBPD.build_parser().parse_args(["--require-auth"]).require_auth)
-        self.assertEqual(SBPD.bind_address("100.64.0.10"), "100.64.0.10")
+        self.assertEqual(SBPD.bind_address("100.100.0.10"), "100.100.0.10")
         self.assertEqual(
             SBPD.bind_address("fd7a:115c:a1e0::1"),
             "fd7a:115c:a1e0::1",
@@ -371,9 +371,9 @@ class SbpdCliTests(unittest.TestCase):
 
     def test_tailnet_bind_requires_authenticated_project_allowlist(self) -> None:
         with self.assertRaises(SystemExit):
-            SBPD.main(["--bind", "100.64.0.10", "--port", "0"])
+            SBPD.main(["--bind", "100.100.0.10", "--port", "0"])
         with self.assertRaises(SystemExit):
-            SBPD.main(["--bind", "100.64.0.10", "--port", "0", "--require-auth"])
+            SBPD.main(["--bind", "100.100.0.10", "--port", "0", "--require-auth"])
 
     def test_ipv6_server_class_uses_ipv6_socket_family(self) -> None:
         self.assertEqual(SBPD.ThreadingHTTPServerV6.address_family, SBPD.socket.AF_INET6)

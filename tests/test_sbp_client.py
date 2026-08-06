@@ -20,7 +20,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 CLIENT_PATH = ROOT / "scripts" / "lib" / "sbp_client.py"
 SBP_PATH = ROOT / "scripts" / "sbp"
-TAILNET_REMOTE = "http://100.64.0.10:8443"
+TAILNET_REMOTE = "http://100.100.0.10:8443"
 
 SPEC = importlib.util.spec_from_file_location("sbp_client", CLIENT_PATH)
 assert SPEC is not None and SPEC.loader is not None
@@ -150,11 +150,11 @@ class SbpClientUnitTests(unittest.TestCase):
 
     def test_remote_origin_rejects_unpinned_or_ambiguous_transports(self) -> None:
         invalid = (
-            "ftp://100.64.0.10:8443",
+            "ftp://100.100.0.10:8443",
             "http://8.8.8.8:8443",
             "http://user@example.invalid:8443",
-            "http://100.64.0.10:8443/base",
-            "http://100.64.0.10:8443?query=yes",
+            "http://100.100.0.10:8443/base",
+            "http://100.100.0.10:8443?query=yes",
             "https://service.example.invalid",
         )
         for remote in invalid:
@@ -180,7 +180,7 @@ class SbpClientUnitTests(unittest.TestCase):
                 opener=mock.Mock(
                     return_value=RedirectedResponse(
                         b"{}",
-                        "http://100.64.0.11:8443/v1/cass/status",
+                        "http://100.100.0.11:8443/v1/cass/status",
                     )
                 ),
                 stdout=io.BytesIO(),
