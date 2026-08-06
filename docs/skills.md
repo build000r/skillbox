@@ -179,7 +179,7 @@ python3 .env-manager/manage.py skills --client personal --profile local-all --cw
 ```
 
 It layers declared default skills, matched client skills, project-local
-`.claude/skills` or `.codex/skills`, and the operator's global
+`.claude/skills`, `.codex/skills`, or `.agents/skills`, and the operator's global
 `~/.claude/skills` plus `~/.codex/skills`. The output shows one effective
 winner per skill, counts lower-precedence shadowed sources, and flags broken
 global symlinks, broken project-local links, undeclared global extras, skills
@@ -258,12 +258,14 @@ python3 .env-manager/manage.py overlay activate marketing --cwd "$PWD"
 ```
 
 `skill add` links the source skill into the selected global or repo-local
-Claude/Codex skill roots. `--to auto` follows `skill-scope.yaml`: global
+skill roots. `--to auto` follows `skill-scope.yaml`: global
 allowlist skills go into `~/.claude/skills` and `~/.codex/skills`; scoped
-skills go under the matching repo/category as `.claude/skills` and
-`.codex/skills`. `skill activate` performs the same link operation and also
+skills go under the matching repo/category as `.claude/skills`,
+`.codex/skills`, and `.agents/skills`. The Amp projection is project-local;
+there is no global `.agents/skills` lifecycle target. `skill activate` performs
+the same link operation and also
 prints an activation packet containing the source `SKILL.md`, so the current
-agent session can use the skill immediately while future Claude and Codex
+agent session can use the skill immediately while future compatible agent
 sessions discover the filesystem links normally. `overlay activate <name>` is
 the cwd-scoped hot path: it evaluates policy with that overlay active for this
 invocation only, links only the policy-allowed set for the cwd, and does not

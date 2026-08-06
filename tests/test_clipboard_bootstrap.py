@@ -76,7 +76,7 @@ class ClipboardBootstrapTests(unittest.TestCase):
         self.assertEqual(plan.ssh_target, "worker@conference1-wsl")
 
     def test_conference_plan_live_probe_uses_routed_target(self) -> None:
-        with mock.patch.object(CB, "default_shell_probe", side_effect=[True, True]):
+        with mock.patch.object(CB, "default_shell_probe", return_value=True):
             plan = CB.plan_remote_bootstrap(
                 "conference1",
                 dry_run=False,
@@ -88,27 +88,17 @@ class ClipboardBootstrapTests(unittest.TestCase):
     def test_conference_route_direct_wsl_first(self) -> None:
         route = CB.select_conference_route(
             probe_reachable=lambda _cmd: True,
-            probe_mosh=lambda _cmd: True,
             root=ROOT_DIR,
         )
         self.assertEqual(route.ssh_target, "worker@conference1-wsl")
         self.assertTrue(route.clipboard_capable)
         self.assertFalse(route.used_fallback)
-        self.assertEqual(route.transport, "mosh")
-
-    def test_conference_route_ssh_when_no_mosh(self) -> None:
-        route = CB.select_conference_route(
-            probe_reachable=lambda _cmd: True,
-            probe_mosh=lambda _cmd: False,
-            root=ROOT_DIR,
-        )
+        # hosts.json profiles.conference1.transport is ssh; mosh is never auto-picked
         self.assertEqual(route.transport, "ssh")
-        self.assertEqual(route.ssh_target, "worker@conference1-wsl")
 
     def test_conference_route_fallback_when_unreachable(self) -> None:
         route = CB.select_conference_route(
             probe_reachable=lambda _cmd: False,
-            probe_mosh=lambda _cmd: False,
             root=ROOT_DIR,
         )
         self.assertTrue(route.used_fallback)

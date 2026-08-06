@@ -723,7 +723,7 @@ _MANAGE_BOUNDARIES: tuple[Boundary, ...] = tuple(
         nested_call_policy="reenters_inprocess: apply_skill_lifecycle_plan",
         lease_span="whole_command",
         lock_owner=UNOWNED,
-        writes=("skill symlinks under <cwd>/.claude/skills and <cwd>/.codex/skills",),
+        writes=("skill symlinks under <cwd>/.claude/skills, <cwd>/.codex/skills, and <cwd>/.agents/skills",),
         evidence=("cli.py:6644 -> lifecycle.py:156 activate_overlay_scoped_skills",),
     ),
     _b(
@@ -843,7 +843,7 @@ _MANAGE_BOUNDARIES: tuple[Boundary, ...] = tuple(
         nested_call_policy="reenters_inprocess: apply_skill_lifecycle_plan",
         lease_span="whole_command",
         lock_owner=UNOWNED,
-        writes=("skill symlinks under <cwd>/.claude/skills, <cwd>/.codex/skills, category/global roots",),
+        writes=("skill symlinks under <cwd>/.claude/skills, <cwd>/.codex/skills, <cwd>/.agents/skills, category/global roots",),
         evidence=("cli.py:6371 -> lifecycle.py:1057 apply_skill_lifecycle_plan",),
     ),
     _b(

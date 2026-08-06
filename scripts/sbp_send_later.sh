@@ -445,6 +445,9 @@ schedule_job() {
   elif [[ -n "$message" ]]; then
     [[ -n "$session" ]] || die "--session is required with --message"
     [[ -n "$pane" ]] || die "--pane is required with --message"
+    # A window.pane value here creates a job whose when-waiting gate resolves an
+    # invalid target (e.g. =sess:1.1.1) and skips forever without erroring.
+    [[ "$pane" != *.* ]] || die "--pane must be a bare pane index (e.g. 1); for SESSION:WIN.PANE targeting use --to"
     [[ "${#keys[@]}" -eq 0 ]] || die "use either --message/--session/--pane or --target/--key, not both"
     [[ -z "$target" ]] || die "use either --message/--session/--pane or --target/--key, not both"
     mode="ntm_send"

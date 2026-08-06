@@ -1147,14 +1147,14 @@ class SkillVisibilityTests(unittest.TestCase):
             )
             result = apply_skill_lifecycle_plan(plan, dry_run=False)
 
-            self.assertEqual(result["summary"]["link"], 4)
+            self.assertEqual(result["summary"]["link"], 6)
             for project in (project_a, project_b):
-                for surface in ("claude", "codex"):
+                for surface in ("claude", "codex", "agents"):
                     link = project / f".{surface}" / "skills" / "ui"
                     self.assertTrue(link.is_symlink())
                     self.assertEqual(link.resolve(), skill_dir.resolve())
 
-    def test_skill_lifecycle_activate_links_both_surfaces_and_returns_packet(self) -> None:
+    def test_skill_lifecycle_activate_links_all_project_surfaces_and_returns_packet(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             clients_root = root / "clients"
@@ -1183,7 +1183,7 @@ class SkillVisibilityTests(unittest.TestCase):
             )
             result = apply_skill_lifecycle_plan(plan, dry_run=False)
 
-            self.assertEqual(result["summary"]["link"], 2)
+            self.assertEqual(result["summary"]["link"], 3)
             packet = result["activation_packet"]
             self.assertEqual(packet["name"], "hot-skill")
             self.assertEqual(packet["skill_md"], skill_md)
@@ -1191,12 +1191,145 @@ class SkillVisibilityTests(unittest.TestCase):
                 packet["skill_md_sha256"],
                 hashlib.sha256(skill_md.encode("utf-8")).hexdigest(),
             )
-            self.assertEqual(set(packet["surface_targets"]), {"claude", "codex"})
-            for surface in ("claude", "codex"):
+            self.assertEqual(set(packet["surface_targets"]), {"claude", "codex", "agents"})
+            for surface in ("claude", "codex", "agents"):
                 link = project / f".{surface}" / "skills" / "hot-skill"
                 self.assertTrue(link.is_symlink())
                 self.assertEqual(link.resolve(), skill_dir.resolve())
                 self.assertIn(str(link.parent.resolve() / link.name), packet["surface_targets"][surface])
+
+    def test_amp_project_link_dry_run_rerun_remove_and_real_directory_protection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            project = root / "repo"
+            source = root / "skills" / "safe-skill"
+            project.mkdir()
+            source.mkdir(parents=True)
+            (source / "SKILL.md").write_text("# Safe Skill\n", encoding="utf-8")
+            model = {"clients": [], "skills": []}
+
+            def plan(command: str) -> dict:
+                return skill_lifecycle_plan(
+                    model,
+                    command,
+                    skill_name="safe-skill",
+                    cwd=str(project),
+                    to="project",
+                    source=str(source),
+                )
+
+            dry = apply_skill_lifecycle_plan(plan("add"), dry_run=True)
+            self.assertEqual({action["status"] for action in dry["actions"]}, {"would_link"})
+            self.assertFalse((project / ".agents").exists())
+
+            conflict = project / ".agents" / "skills" / "safe-skill"
+            conflict.mkdir(parents=True)
+            marker = conflict / "keep.txt"
+            marker.write_text("operator-owned\n", encoding="utf-8")
+            applied = apply_skill_lifecycle_plan(plan("add"), dry_run=False)
+            by_surface = {action["surface"]: action for action in applied["actions"]}
+            self.assertEqual(by_surface["agents"]["status"], "conflict_directory")
+            self.assertEqual(marker.read_text(encoding="utf-8"), "operator-owned\n")
+
+            marker.unlink()
+            conflict.rmdir()
+            rerun = apply_skill_lifecycle_plan(plan("add"), dry_run=False)
+            self.assertEqual({action["surface"] for action in rerun["actions"]}, {"claude", "codex", "agents"})
+            self.assertTrue((project / ".agents" / "skills" / "safe-skill").is_symlink())
+
+            remove = apply_skill_lifecycle_plan(
+                skill_lifecycle_plan(
+                    model,
+                    "remove",
+                    skill_name="safe-skill",
+                    cwd=str(project),
+                    from_scope="project",
+                ),
+                dry_run=False,
+            )
+            self.assertEqual({action["surface"] for action in remove["actions"]}, {"claude", "codex", "agents"})
+            self.assertEqual({action["status"] for action in remove["actions"]}, {"unlinked"})
+
+    def test_project_projection_does_not_follow_skill_root_outside_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            project = root / "repo"
+            outside = root / "outside"
+            source = root / "skills" / "safe-skill"
+            project.mkdir()
+            outside.mkdir()
+            source.mkdir(parents=True)
+            (source / "SKILL.md").write_text("# Safe Skill\n", encoding="utf-8")
+            (project / ".agents").mkdir()
+            (project / ".agents" / "skills").symlink_to(
+                outside,
+                target_is_directory=True,
+            )
+            model = {"clients": [], "skills": []}
+
+            def plan() -> dict:
+                return skill_lifecycle_plan(
+                    model,
+                    "add",
+                    skill_name="safe-skill",
+                    cwd=str(project),
+                    to="project",
+                    source=str(source),
+                )
+
+            dry = apply_skill_lifecycle_plan(plan(), dry_run=True)
+            dry_by_surface = {action["surface"]: action for action in dry["actions"]}
+            self.assertEqual(
+                dry_by_surface["agents"]["status"],
+                "conflict_project_root_escape",
+            )
+            applied = apply_skill_lifecycle_plan(plan(), dry_run=False)
+            applied_by_surface = {action["surface"]: action for action in applied["actions"]}
+            self.assertEqual(
+                applied_by_surface["agents"]["status"],
+                "conflict_project_root_escape",
+            )
+            self.assertFalse((outside / "safe-skill").exists())
+            self.assertNotIn("agents", dict(_project_skill_roots(project)))
+
+    def test_project_unlink_rechecks_root_confinement_at_apply_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            project = root / "repo"
+            outside = root / "outside"
+            source = root / "skills" / "safe-skill"
+            project.mkdir()
+            (project / ".git").mkdir()
+            outside.mkdir()
+            source.mkdir(parents=True)
+            (source / "SKILL.md").write_text("# Safe Skill\n", encoding="utf-8")
+            skill_root = project / ".agents" / "skills"
+            skill_root.mkdir(parents=True)
+            installed = skill_root / "safe-skill"
+            installed.symlink_to(source, target_is_directory=True)
+            model = {"clients": [], "skills": []}
+
+            plan = skill_lifecycle_plan(
+                model,
+                "remove",
+                skill_name="safe-skill",
+                cwd=str(project),
+                from_scope="project",
+            )
+            self.assertEqual(plan["actions"][0]["repo_path"], str(project))
+
+            installed.unlink()
+            skill_root.rmdir()
+            planted = outside / "safe-skill"
+            planted.symlink_to(source, target_is_directory=True)
+            skill_root.symlink_to(outside, target_is_directory=True)
+
+            result = apply_skill_lifecycle_plan(plan, dry_run=False)
+            self.assertEqual(
+                result["actions"][0]["status"],
+                "conflict_project_root_escape",
+            )
+            self.assertTrue(planted.is_symlink())
 
     def test_overlay_activation_defaults_to_project_scope_and_tracks_cwd_metamorphically(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1233,13 +1366,13 @@ class SkillVisibilityTests(unittest.TestCase):
 
             self.assertEqual(len(first), 1)
             self.assertEqual(len(second), 1)
-            self.assertEqual(first[0]["summary"]["link"], 2)
-            self.assertEqual(second[0]["summary"]["link"], 2)
+            self.assertEqual(first[0]["summary"]["link"], 3)
+            self.assertEqual(second[0]["summary"]["link"], 3)
             self.assertEqual(
                 first[0]["activation_packet"]["skill_md_sha256"],
                 second[0]["activation_packet"]["skill_md_sha256"],
             )
-            for surface in ("claude", "codex"):
+            for surface in ("claude", "codex", "agents"):
                 first_target = first[0]["activation_packet"]["surface_targets"][surface][0]
                 second_target = second[0]["activation_packet"]["surface_targets"][surface][0]
                 self.assertEqual(second_target, first_target.replace(str(project_a.resolve()), str(project_b.resolve())))
@@ -1310,6 +1443,7 @@ class SkillVisibilityTests(unittest.TestCase):
             for base in (
                 project / ".claude" / "skills",
                 project / ".codex" / "skills",
+                project / ".agents" / "skills",
                 fake_home / ".claude" / "skills",
                 fake_home / ".codex" / "skills",
             ):
@@ -1327,9 +1461,11 @@ class SkillVisibilityTests(unittest.TestCase):
             self.assertEqual(set(removed), {
                 str(project / ".claude" / "skills" / "hot-skill"),
                 str(project / ".codex" / "skills" / "hot-skill"),
+                str(project / ".agents" / "skills" / "hot-skill"),
             })
             self.assertFalse((project / ".claude" / "skills" / "hot-skill").exists())
             self.assertFalse((project / ".codex" / "skills" / "hot-skill").exists())
+            self.assertFalse((project / ".agents" / "skills" / "hot-skill").exists())
             self.assertTrue((fake_home / ".claude" / "skills" / "hot-skill").is_symlink())
             self.assertTrue((fake_home / ".codex" / "skills" / "hot-skill").is_symlink())
 
@@ -1473,12 +1609,58 @@ class SkillVisibilityTests(unittest.TestCase):
             with mock.patch("runtime_manager.skill_visibility.Path.home", return_value=fake_home):
                 plan = skill_lifecycle_plan(model, "sync", cwd=str(project), to="auto")
 
-            self.assertEqual(plan["summary"]["link"], 2)
+            self.assertEqual(plan["summary"]["link"], 3)
             self.assertEqual({item["scope"] for item in plan["actions"]}, {"project"})
             self.assertEqual(
                 {Path(str(item["destination"])).parent.parent.name for item in plan["actions"]},
-                {".claude", ".codex"},
+                {".claude", ".codex", ".agents"},
             )
+
+    def test_skill_sync_repairs_missing_amp_projection_for_existing_project_skill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            clients_root = root / "clients"
+            source_root = root / "source-skills"
+            project = root / "repo"
+            skill_dir = source_root / "project-tool"
+            clients_root.mkdir()
+            skill_dir.mkdir(parents=True)
+            project.mkdir()
+            (project / ".git").mkdir()
+            (skill_dir / "SKILL.md").write_text("# Project Tool\n", encoding="utf-8")
+            for surface in ("claude", "codex"):
+                target = project / f".{surface}" / "skills" / "project-tool"
+                target.parent.mkdir(parents=True)
+                target.symlink_to(skill_dir, target_is_directory=True)
+            (root / "skill-scope.yaml").write_text(
+                "version: 1\n"
+                "global_allowlist: []\n"
+                f"skill_source_roots: [{source_root}]\n"
+                "rules:\n"
+                "  - id: project-tool-local\n"
+                "    skills: [project-*]\n"
+                f"    paths: [{project}]\n",
+                encoding="utf-8",
+            )
+            model = {
+                "env": {"SKILLBOX_CLIENTS_HOST_ROOT": str(clients_root)},
+                "clients": [],
+                "skills": [],
+            }
+
+            plan = skill_lifecycle_plan(model, "sync", cwd=str(project), to="auto")
+            self.assertEqual(plan["summary"]["link"], 1)
+            self.assertEqual(plan["actions"][0]["surface"], "agents")
+            self.assertEqual(plan["actions"][0]["existing"]["state"], "missing")
+
+            result = apply_skill_lifecycle_plan(plan, dry_run=False)
+            self.assertEqual(result["actions"][0]["status"], "linked")
+            self.assertEqual(
+                (project / ".agents" / "skills" / "project-tool").resolve(),
+                skill_dir.resolve(),
+            )
+            rerun = skill_lifecycle_plan(model, "sync", cwd=str(project), to="auto")
+            self.assertEqual(rerun["actions"], [])
 
     def test_on_demand_rule_routes_explicit_activation_to_current_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1528,7 +1710,11 @@ class SkillVisibilityTests(unittest.TestCase):
             self.assertEqual({item["scope"] for item in plan["actions"]}, {"project"})
             self.assertEqual(
                 {Path(str(item["destination"])).parent.parent for item in plan["actions"]},
-                {(project / ".claude").resolve(), (project / ".codex").resolve()},
+                {
+                    (project / ".claude").resolve(),
+                    (project / ".codex").resolve(),
+                    (project / ".agents").resolve(),
+                },
             )
             self.assertIsNotNone(plan["activation_packet"])
 
@@ -1760,12 +1946,14 @@ class SkillVisibilityTests(unittest.TestCase):
             (parent / ".claude" / "skills").mkdir(parents=True)
             (repo / ".git").mkdir(parents=True)
             (repo / ".claude" / "skills").mkdir(parents=True)
+            (repo / ".agents" / "skills").mkdir(parents=True)
             subdir.mkdir()
 
-            roots = [path for _, path in _project_skill_roots(subdir)]
+            roots = dict(_project_skill_roots(subdir))
 
-            self.assertIn((repo / ".claude" / "skills").resolve(), roots)
-            self.assertNotIn((parent / ".claude" / "skills").resolve(), roots)
+            self.assertEqual(roots["claude"], (repo / ".claude" / "skills").resolve())
+            self.assertEqual(roots["agents"], (repo / ".agents" / "skills").resolve())
+            self.assertNotIn((parent / ".claude" / "skills").resolve(), roots.values())
 
 
 class SkillEvidenceAnnotationTests(unittest.TestCase):

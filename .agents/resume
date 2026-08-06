@@ -1,117 +1,78 @@
 #!/usr/bin/env bash
-# AO-005 hardened Amp Orb resume hook for build000r/skillbox.
-# Must fit Amp's 10s non-blocking wake budget; slow repair is backgrounded.
+# Fast, offline AO-005 wake hook. No repair, networking, or background work.
 set -Eeuo pipefail
-
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "${BASH_SOURCE[0]%/*}/.." && pwd)"
 cd "$ROOT"
-
-AGENT_STATE_DIR="${AGENT_STATE_DIR:-$ROOT/.agents/state}"
-AGENT_LOG_DIR="${AGENT_LOG_DIR:-$ROOT/.agents/logs}"
-STATUS_FILE="$AGENT_STATE_DIR/resume-status.json"
-LOG_FILE="$AGENT_LOG_DIR/resume.log"
-MIN_FREE_GB="${SKILLBOX_ORB_RESUME_MIN_FREE_GB:-6}"
-START_EPOCH="$(date +%s)"
-FAILURE_CLASS="setup"
-FAILURE_REASON="unexpected resume failure"
-REPAIR_STARTED=false
-
-mkdir -p "$AGENT_STATE_DIR" "$AGENT_LOG_DIR"
-touch "$LOG_FILE"
-exec > >(tee -a "$LOG_FILE") 2> >(tee -a "$LOG_FILE" >&2)
-
-log() { printf 'skillbox-orb-resume: %s\n' "$*"; }
-
-json_quote() {
-  python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1" 2>/dev/null \
-    || printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+STATE_DIR="${AGENT_STATE_DIR:-$ROOT/.skillbox-state/project-orb/hook-state}"
+LOG_DIR="${AGENT_LOG_DIR:-$ROOT/.skillbox-state/project-orb/hook-logs}"
+STATUS_FILE="$STATE_DIR/resume-status.json"
+LOG_FILE="$LOG_DIR/resume.log"
+printf -v START '%(%s)T' -1
+FAILURE_CLASS=setup
+REASON_CODE=resume_unexpected
+umask 077
+fallback_status() {
+  local status="$1" failure="$2" reason="$3" code="$4"
+  printf 'AGENT_RESUME_RESULT_JSON {"schema_version":"skillbox.amp-project-orb.hook-status/1","kind":"skillbox.agent_hook_status","script":"resume","status":"%s","failure_class":"%s","reason_code":"%s","exit_code":%s,"duration_seconds":0}\n' \
+    "$status" "$failure" "$reason" "$code" >&2
 }
-
-disk_json() {
-  df -Pk / | awk 'NR==2 {printf "{\"filesystem\":\"%s\",\"size_kb\":%s,\"used_kb\":%s,\"available_kb\":%s,\"capacity\":\"%s\",\"mount\":\"%s\"}", $1, $2, $3, $4, $5, $6}'
+command -v timeout >/dev/null 2>&1 || {
+  printf 'skillbox-orb-resume: required local command timeout is missing\n' >&2
+  fallback_status error dependency timeout_command_missing 20
+  exit 20
 }
-
-disk_available_gb() {
-  df -Pk / | awk 'NR==2 {printf "%d", $4 / 1024 / 1024}'
+command -v python3 >/dev/null 2>&1 || {
+  printf 'skillbox-orb-resume: required local command python3 is missing\n' >&2
+  fallback_status error dependency python_missing 20
+  exit 20
 }
-
+timeout --signal=TERM --kill-after=1 "${SKILLBOX_ORB_FS_TIMEOUT_SECONDS:-3}s" \
+  "$ROOT/scripts/orb/orb_readiness.py" prepare-hook \
+  --state-dir "$STATE_DIR" --log-dir "$LOG_DIR" --script resume || {
+    printf 'skillbox-orb-resume: could not prepare private hook state\n' >&2
+    fallback_status error setup hook_state_invalid 10
+    exit 10
+  }
 emit_status() {
-  local exit_code="$1"
-  local end_epoch duration status
-  end_epoch="$(date +%s)"
-  duration="$((end_epoch - START_EPOCH))"
-  status="ok"
-  if [[ "$exit_code" -ne 0 ]]; then
-    status="error"
+  local rc="$1" status=error; [[ "$rc" -eq 0 ]] && status=ok
+  if STATUS_FILE="$STATUS_FILE" SCRIPT=resume STATUS="$status" FAILURE_CLASS="$FAILURE_CLASS" \
+    REASON_CODE="$REASON_CODE" EXIT_CODE="$rc" START="$START" \
+    timeout --signal=TERM --kill-after=1 "${SKILLBOX_ORB_STATUS_TIMEOUT_SECONDS:-2}s" \
+    "$ROOT/scripts/orb/orb_readiness.py" write-status >/dev/null 2>&1; then
+    [[ -f "$STATUS_FILE" && ! -L "$STATUS_FILE" ]] \
+      && printf 'AGENT_RESUME_RESULT_JSON %s\n' "$(<"$STATUS_FILE")" >&2
+  else
+    local fallback_code="$rc"
+    [[ "$fallback_code" -eq 0 ]] && fallback_code=50
+    fallback_status error validation status_write_failed "$fallback_code"
+    if [[ "$rc" -eq 0 ]]; then
+      trap - EXIT
+      exit 50
+    fi
   fi
-  local payload
-  payload="$(printf '{"schema_version":1,"repo":"build000r/skillbox","script":"resume","status":%s,"failure_class":%s,"reason":%s,"exit_code":%s,"duration_seconds":%s,"disk":%s,"repair_started":%s,"log_file":%s,"timestamp":%s}\n' \
-    "$(json_quote "$status")" \
-    "$(json_quote "$FAILURE_CLASS")" \
-    "$(json_quote "$FAILURE_REASON")" \
-    "$exit_code" \
-    "$duration" \
-    "$(disk_json)" \
-    "$REPAIR_STARTED" \
-    "$(json_quote "$LOG_FILE")" \
-    "$(json_quote "$(date -u +%Y-%m-%dT%H:%M:%SZ)")")"
-  printf '%s' "$payload" > "$STATUS_FILE"
-  printf 'AGENT_RESUME_RESULT_JSON %s' "$payload" >&2
 }
-
-on_exit() {
-  local exit_code="$1"
-  if [[ "$exit_code" -eq 0 ]]; then
-    FAILURE_CLASS="none"
-    FAILURE_REASON="resume ok"
-  fi
-  emit_status "$exit_code"
+trap 'rc=$?; emit_status "$rc"' EXIT
+fail() { FAILURE_CLASS="$1"; REASON_CODE="$2"; printf 'skillbox-orb-resume: %s\n' "$2" >&2; exit "$3"; }
+command -v git >/dev/null 2>&1 || fail dependency git_missing 20
+free_kb="$(
+  timeout --signal=TERM --kill-after=1 "${SKILLBOX_ORB_DISK_TIMEOUT_SECONDS:-3}s" \
+    python3 -c 'import shutil; print(shutil.disk_usage("/").free // 1024)'
+)" || {
+  rc=$?
+  [[ "$rc" -eq 124 || "$rc" -eq 137 ]] && fail capacity disk_probe_timeout 30
+  fail capacity disk_probe_failed 30
 }
-trap 'on_exit $?' EXIT
-
-fail() {
-  FAILURE_CLASS="$1"
-  FAILURE_REASON="$2"
-  local code="$3"
-  log "FAIL[$FAILURE_CLASS]: $FAILURE_REASON"
-  exit "$code"
-}
-
-log "start: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-FREE_GB="$(disk_available_gb)"
-if [[ "$FREE_GB" -lt "$MIN_FREE_GB" ]]; then
-  fail capacity "need at least ${MIN_FREE_GB}GB free on fixed Orb disk during resume; found ${FREE_GB}GB" 30
-fi
-
-command -v python3 >/dev/null 2>&1 || fail dependency "missing required command: python3" 20
-command -v git >/dev/null 2>&1 || fail dependency "missing required command: git" 20
-
-PY_VERSION="$(python3 - <<'PY'
-import sys
-print(f"{sys.version_info.major}.{sys.version_info.minor}")
-PY
-)"
-PY_MAJOR="${PY_VERSION%%.*}"
-PY_MINOR="${PY_VERSION#*.}"
-if [[ "$PY_MAJOR" -lt 3 || "$PY_MINOR" -lt 11 ]]; then
-  fail dependency "need Python >= 3.11; got ${PY_VERSION}" 20
-fi
-
-if [[ -n "${TAILSCALE_AUTHKEY:-}" && -x scripts/orb/join-tailnet.sh ]]; then
-  REPAIR_STARTED=true
-  log "tailnet: starting non-blocking health check/rejoin"
-  (
-    scripts/orb/join-tailnet.sh --resume >>"$AGENT_LOG_DIR/resume-repair.log" 2>&1 || true
-  ) >/dev/null 2>&1 &
-fi
-
-if ! command -v ruff >/dev/null 2>&1; then
-  REPAIR_STARTED=true
-  log "ruff missing; starting non-blocking best-effort repair"
-  (
-    python3 -m pip install --user -q 'ruff>=0.4,<1' >>"$AGENT_LOG_DIR/resume-repair.log" 2>&1 || true
-  ) >/dev/null 2>&1 &
-fi
-
-log "resume fast checks ok"
+[[ "$free_kb" =~ ^[0-9]+$ ]] || fail capacity disk_probe_failed 30
+min_gb="${SKILLBOX_ORB_RESUME_MIN_FREE_GB:-6}"
+(( free_kb >= min_gb * 1024 * 1024 )) || fail capacity disk_capacity_low 30
+timeout --signal=TERM --kill-after=1 "${SKILLBOX_ORB_RESUME_IDENTITY_TIMEOUT_SECONDS:-2}s" \
+  "$ROOT/scripts/orb/orb_readiness.py" ensure-identity --output "$STATE_DIR/orb-resume-id" >>"$LOG_FILE" 2>&1 || {
+    rc=$?; [[ "$rc" -eq 124 || "$rc" -eq 137 ]] && fail validation identity_timeout 50
+    fail validation identity_failed 50
+  }
+timeout --signal=TERM --kill-after=1 "${SKILLBOX_ORB_RESUME_READINESS_TIMEOUT_SECONDS:-4}s" \
+  "$ROOT/scripts/orb/orb_readiness.py" collect --context resume --output "$STATE_DIR/orb-readiness.json" >>"$LOG_FILE" 2>&1 || {
+    rc=$?; [[ "$rc" -eq 124 || "$rc" -eq 137 ]] && fail validation readiness_timeout 50
+    fail validation readiness_failed 50
+  }
+FAILURE_CLASS=none; REASON_CODE=resume_ready

@@ -89,9 +89,10 @@ Configure this once from trusted admin surfaces:
 
 1. In Tailscale Trust credentials, create an OpenID Connect credential.
 2. Set issuer to `https://ampcode.com/api/workload-identity`.
-3. Restrict the subject to the intended immutable Amp workspace and project
-   IDs. Also require exact `workspace_id`, `project_id`, and
-   `token_use=exchanged` claims.
+3. Restrict the subject to the intended immutable Amp project ID and require
+   exact `project_id` and `token_use=exchanged` claims. Require
+   `workspace_id` only if a live token for this project contains it and the
+   relying-party contract defines it; the observed project token omitted it.
 4. Grant only `auth_keys` and allow only `tag:orb`.
 5. Store the generated client ID and audience as non-secret Amp project
    environment variables `TAILSCALE_CLIENT_ID` and `TAILSCALE_AUDIENCE`.
@@ -132,9 +133,10 @@ workspace, project, and `token_use` claims. See
 If operator policy must be centralized in Skillbox instead, a later `sbpd`
 endpoint can verify the same Amp JWT and mint a single-use, very short-lived,
 ephemeral `tag:orb` join credential. That endpoint must never log the JWT or
-returned credential and must bind issuance to immutable workspace/project
-claims. Current `sbpd` v1 is intentionally read-only; this broker endpoint is
-not part of the current cass/search client work.
+returned credential and must bind issuance to the immutable project claim; a
+workspace claim may be required only when the live token and relying-party
+contract provide it. Current `sbpd` v1 is intentionally read-only; this broker
+endpoint is not part of the current cass/search client work.
 
 ## Transitional auth-key delivery
 
@@ -503,13 +505,28 @@ ln -sfn "$PWD/scripts/sbp" "$HOME/.local/bin/sbp"
 export PATH="$HOME/.local/bin:$PATH"
 
 export SBP_REMOTE='http://<d3-tailnet-ip>:8443'
+export SBP_PROJECT_ALIAS='build000r/skillbox'
 sbp cass status
 sbp cass search 'tailnet'
 ```
 
 `SBP_REMOTE` is an endpoint, not a credential. Access still depends on the
-Orb's `tag:orb` identity and tailnet grants. Do not change `sbpd` to
-`0.0.0.0`; bind it to loopback and/or the box's Tailscale address.
+Orb's `tag:orb` identity and tailnet grants. When `sbpd --require-auth` is in
+use, the client additionally mints an in-memory, audience-`sbpd` Amp workload
+token and the server verifies its RS256 signature, issuer, expiry, subject,
+`token_use=exchanged`, and immutable project allowlist. The server must be
+started with both `--allowed-project-id <immutable-id>` and
+`--project-alias build000r/skillbox`; there is no static-secret fallback.
+`workspace_id` is optional unless the real token/verifier contract proves it.
+Do not change `sbpd` to `0.0.0.0`; bind it to loopback and/or the box's literal
+Tailscale address.
+
+Only fixed GET service/API reads are exposed: health, Cass status/search, and
+validated skill pull. Mutating verbs and arbitrary path/command delegation are
+denied. This route is not proof that the distinct hosted Sweet Potato/SPAPS
+relying party accepts Amp identity; that requires its own live verifier
+contract and sanitized allow/deny receipt. Never start `spaps local` as a
+substitute.
 
 ## Operational findings (2026-07-30 live E2E, thread T-019fb489)
 

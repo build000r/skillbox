@@ -178,7 +178,7 @@
     "fallback_alias": "conference1-ssh",
     "fallback_target": "conference1-ssh",
     "probe_reachability": "ssh -o BatchMode=yes -o ConnectTimeout=5 conference1-wsl true",
-    "probe_mosh": "ssh -o BatchMode=yes -o ConnectTimeout=5 conference1-wsl 'command -v mosh-server'",
-    "route_order": ["direct_wsl", "mosh_if_available", "fallback_ssh_wrapper"]
+    "route_order": ["direct_wsl", "fallback_ssh_wrapper"],
+    "notes": "Direct WSL uses profiles.conference1.transport (ssh). mosh is not auto-selected: conference1-wsl SSH goes through a Windows ProxyCommand that cannot carry mosh UDP."
   }
 }

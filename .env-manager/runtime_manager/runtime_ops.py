@@ -5401,9 +5401,15 @@ def validate_services_support_mode(
     Used pre-mutation by run_up (backend.md:33-35): if any requested service
     lacks a command for the effective mode the entire request is rejected
     with LOCAL_RUNTIME_MODE_UNSUPPORTED and no state is mutated.
+
+    Declaration-only surfaces (for example ``kind: mcp`` entries with no
+    lifecycle command) are skipped here because ``start_services`` already
+    treats them as non-manageable and does not mutate them.
     """
     unsupported: list[str] = []
     for service in services:
+        if not _service_has_lifecycle_command(service):
+            continue
         if not service_supports_mode(service, mode):
             unsupported.append(str(service.get("id", "")).strip() or "(missing id)")
     return unsupported

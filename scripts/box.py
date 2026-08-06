@@ -217,6 +217,7 @@ DEFAULT_SSH_OPTS = [
     "-o", "BatchMode=yes",
 ]
 REMOTE_ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+GIT_COMMIT_HEX_PATTERN = re.compile(r"^[a-fA-F0-9]{40}$")
 SHA256_HEX_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")
 IPV4_PATTERN = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 # Box ids / box-profile names are an ALIGNED-but-separate surface from runtime
@@ -1311,7 +1312,15 @@ def _deploy_manifest_sha256(payload: dict[str, Any], key: str, label: str, resol
 
 def _deploy_manifest_archive_path(payload: dict[str, Any], resolved_manifest: Path) -> Path:
     archive_rel = _deploy_manifest_text(payload, "archive", "archive path", resolved_manifest)
-    archive_path = (resolved_manifest.parent / archive_rel).resolve()
+    relative_path = Path(archive_rel)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise RuntimeError(f"Deploy manifest archive must stay beside its manifest: {resolved_manifest}")
+    archive_candidate = resolved_manifest.parent / relative_path
+    if archive_candidate.is_symlink():
+        raise RuntimeError(f"Deploy archive cannot be a symlink: {archive_candidate}")
+    archive_path = archive_candidate.resolve()
+    if resolved_manifest.parent not in archive_path.parents:
+        raise RuntimeError(f"Deploy manifest archive escapes its release directory: {resolved_manifest}")
     if not archive_path.is_file():
         raise RuntimeError(f"Deploy archive not found: {archive_path}")
     return archive_path
@@ -1343,6 +1352,8 @@ def load_deploy_manifest(manifest_path: Path, *, expected_client_id: str | None 
         payload = json.loads(resolved_manifest.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Deploy manifest is not valid JSON: {resolved_manifest}") from exc
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise RuntimeError(f"Deploy manifest has unsupported schema version: {resolved_manifest}")
 
     client_id = _deploy_manifest_text(payload, "client_id", "client_id", resolved_manifest)
     if expected_client_id is not None and client_id != expected_client_id:
@@ -1350,7 +1361,9 @@ def load_deploy_manifest(manifest_path: Path, *, expected_client_id: str | None 
             f"Deploy manifest {resolved_manifest} is for client {client_id!r}, not {expected_client_id!r}"
         )
 
-    source_commit = _deploy_manifest_text(payload, "source_commit", "source_commit", resolved_manifest)
+    source_commit = _deploy_manifest_text(payload, "source_commit", "source_commit", resolved_manifest).lower()
+    if not GIT_COMMIT_HEX_PATTERN.fullmatch(source_commit):
+        raise RuntimeError(f"Deploy manifest has invalid full source_commit: {resolved_manifest}")
     payload_tree_sha256 = _deploy_manifest_sha256(payload, "payload_tree_sha256", "payload_tree_sha256", resolved_manifest)
     archive_path = _deploy_manifest_archive_path(payload, resolved_manifest)
     archive_sha256 = _deploy_manifest_sha256(payload, "archive_sha256", "archive_sha256", resolved_manifest)

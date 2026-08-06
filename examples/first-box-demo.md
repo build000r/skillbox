@@ -142,7 +142,7 @@ WARN skill-repo-lock-state: workspace skill repo lockfile is missing
 WARN beads-state: Beads database is missing
      expected_path: .beads/beads.db
      fix: sbp beads init --cwd .
-PASS reference-drift: no stale 00-skill-sync.sh references were found
+PASS reference-drift: no stale make runtime-sync references were found
 PASS runtime-manager-model: internal runtime manager manifest resolved successfully
 [... omitted ...]
 PASS secrets-visible-in-workspace: no operator secret files are exposed inside workspace bind mounts
@@ -489,7 +489,7 @@ PASS skill-repo-lock-state: workspace skill repo lockfile matches the declared p
 WARN beads-state: Beads database is missing
      expected_path: .beads/beads.db
      fix: sbp beads init --cwd .
-PASS reference-drift: no stale 00-skill-sync.sh references were found
+PASS reference-drift: no stale make runtime-sync references were found
 PASS runtime-manager-model: internal runtime manager manifest resolved successfully
      manifest: workspace/runtime.yaml
      persistence_manifest: workspace/persistence.yaml

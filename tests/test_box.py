@@ -132,8 +132,9 @@ class BoxTests(unittest.TestCase):
             archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
             manifest_path = root / "deploy.json"
             manifest_path.write_text(json.dumps({
+                "version": 1,
                 "client_id": "personal",
-                "source_commit": "abc123def456",
+                "source_commit": "a" * 40,
                 "payload_tree_sha256": "1" * 64,
                 "archive": "skillbox.tar.gz",
                 "archive_sha256": archive_sha256,
@@ -188,8 +189,9 @@ class BoxTests(unittest.TestCase):
             archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
             manifest_path = root / "deploy.json"
             manifest_path.write_text(json.dumps({
+                "version": 1,
                 "client_id": "personal",
-                "source_commit": "abc123def456",
+                "source_commit": "a" * 40,
                 "payload_tree_sha256": "1" * 64,
                 "active_profiles": ["connectors", "core"],
                 "archive": "skillbox.tar.gz",
@@ -653,8 +655,9 @@ class BoxTests(unittest.TestCase):
             archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
             manifest_path = root / "deploy.json"
             manifest_path.write_text(json.dumps({
+                "version": 1,
                 "client_id": "no-token",
-                "source_commit": "abc123def456",
+                "source_commit": "a" * 40,
                 "payload_tree_sha256": "1" * 64,
                 "archive": "skillbox.tar.gz",
                 "archive_sha256": archive_sha256,
@@ -777,8 +780,9 @@ class BoxTests(unittest.TestCase):
             archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
             manifest_path = root / "deploy.json"
             manifest_path.write_text(json.dumps({
+                "version": 1,
                 "client_id": "client_a",
-                "source_commit": "abc123def456",
+                "source_commit": "a" * 40,
                 "payload_tree_sha256": "1" * 64,
                 "active_profiles": ["connectors", "core"],
                 "archive": "skillbox.tar.gz",
@@ -802,7 +806,7 @@ class BoxTests(unittest.TestCase):
             self.assertTrue(payload["dry_run"])
             self.assertEqual([step["step"] for step in payload["steps"]], ["upload", "contract", "upgrade", "verify"])
             self.assertTrue(all(step["status"] == "skip" for step in payload["steps"]))
-            self.assertEqual(payload["deploy_release"]["source_commit"], "abc123def456")
+            self.assertEqual(payload["deploy_release"]["source_commit"], "a" * 40)
             self.assertEqual(payload["deploy_release"]["active_profiles"], ["connectors", "core"])
 
     def test_upgrade_rejects_non_ready_box(self) -> None:
@@ -824,8 +828,9 @@ class BoxTests(unittest.TestCase):
             archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
             manifest_path = root / "deploy.json"
             manifest_path.write_text(json.dumps({
+                "version": 1,
                 "client_id": "client_a",
-                "source_commit": "abc123def456",
+                "source_commit": "a" * 40,
                 "payload_tree_sha256": "1" * 64,
                 "archive": "skillbox.tar.gz",
                 "archive_sha256": archive_sha256,
@@ -865,8 +870,9 @@ class BoxTests(unittest.TestCase):
             archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
             manifest_path = root / "deploy.json"
             manifest_path.write_text(json.dumps({
+                "version": 1,
                 "client_id": "someone-else",
-                "source_commit": "abc123def456",
+                "source_commit": "a" * 40,
                 "payload_tree_sha256": "1" * 64,
                 "archive": "skillbox.tar.gz",
                 "archive_sha256": archive_sha256,
