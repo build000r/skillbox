@@ -8113,6 +8113,28 @@ class LocalCoreModeAwareUpUS2Tests(unittest.TestCase):
             # No services were started, not even the five that do support prod
             self.assertEqual(payload["services"], [])
 
+    def test_up_skips_declaration_only_mcp_for_mode_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = self._fresh_model(tmpdir)
+            model["services"].append(
+                {
+                    "id": "chief-financial-officer",
+                    "kind": "mcp",
+                    "profiles": ["local-core"],
+                    "operator_managed": True,
+                }
+            )
+            exit_code, payload = MANAGE_MODULE.run_up(
+                model=model,
+                client_id="personal",
+                profile="local-core",
+                requested_mode="reuse",
+                dry_run=True,
+            )
+            self.assertEqual(exit_code, 0, payload)
+            service_ids = [entry["id"] for entry in payload["services"]]
+            self.assertIn("chief-financial-officer", service_ids)
+
     def test_up_topological_order_is_six_service_graph(self) -> None:
         # Confirms svc-web's dual dependency (svc-auth+svc-api) is enforced,
         # and the five siblings depend only on svc-auth.  The planned order
