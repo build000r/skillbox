@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -25,8 +26,24 @@ class BoxTests(unittest.TestCase):
     """Test box.py core logic: profiles, inventory, structured output, dry-run."""
 
     def test_workspace_image_installs_mandatory_spaps_cli(self) -> None:
+        # The Dockerfile is the authoritative pin (upgraded deliberately, e.g.
+        # 0.7.7 -> 0.9.3 in b64bde1); assert the invariant (an exact-version
+        # mandatory pin exists) and that documented references track it,
+        # instead of hardcoding a version this test can silently outdate.
         dockerfile = (ROOT_DIR / "Dockerfile").read_text(encoding="utf-8")
-        self.assertIn("spaps@0.7.7", dockerfile)
+        match = re.search(r"spaps@(\d+\.\d+\.\d+)", dockerfile)
+        self.assertIsNotNone(
+            match, "Dockerfile must pin the mandatory spaps CLI as spaps@X.Y.Z"
+        )
+        pin = match.group(0)
+        env_manager_readme = (ROOT_DIR / ".env-manager" / "README.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(pin, env_manager_readme)
+        runtime_graph = (ROOT_DIR / "docs" / "runtime-graph.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(pin, runtime_graph)
 
     def test_build_remote_env_command_preserves_literal_env_values(self) -> None:
         command = BOX_MODULE.build_remote_env_command(
@@ -72,14 +89,14 @@ class BoxTests(unittest.TestCase):
         result = BOX_MODULE.augment_spaps_tailnet_set_args(
             ["PRIMARY_REPO_URL=https://example.com/app.git"],
             blueprint=BOX_MODULE.DEFAULT_FIRST_BOX_BLUEPRINT,
-            tailscale_ip="100.76.6.41",
+            tailscale_ip="100.100.6.41",
         )
 
-        self.assertIn("SPAPS_AUTH_BASE_URL=http://100.76.6.41:5173", result)
-        self.assertIn("SPAPS_FIXTURE_BASE_URL=http://100.76.6.41:5173", result)
-        self.assertIn("SPAPS_BROWSER_API_URL=http://100.76.6.41:3301", result)
+        self.assertIn("SPAPS_AUTH_BASE_URL=http://100.100.6.41:5173", result)
+        self.assertIn("SPAPS_FIXTURE_BASE_URL=http://100.100.6.41:5173", result)
+        self.assertIn("SPAPS_BROWSER_API_URL=http://100.100.6.41:3301", result)
         self.assertIn(
-            "SPAPS_CORS_ALLOW_ORIGINS=http://100.76.6.41:5173,http://localhost:5173,http://127.0.0.1:5173",
+            "SPAPS_CORS_ALLOW_ORIGINS=http://100.100.6.41:5173,http://localhost:5173,http://127.0.0.1:5173",
             result,
         )
 
@@ -91,18 +108,18 @@ class BoxTests(unittest.TestCase):
                 "SPAPS_BROWSER_API_URL=http://custom:4401",
             ],
             blueprint=BOX_MODULE.DEFAULT_FIRST_BOX_BLUEPRINT,
-            tailscale_ip="100.76.6.41",
+            tailscale_ip="100.100.6.41",
         )
 
         self.assertIn("SPAPS_BROWSER_API_URL=http://custom:4401", result)
-        self.assertNotIn("SPAPS_BROWSER_API_URL=http://100.76.6.41:4401", result)
-        self.assertIn("SPAPS_AUTH_BASE_URL=http://100.76.6.41:3000", result)
+        self.assertNotIn("SPAPS_BROWSER_API_URL=http://100.100.6.41:4401", result)
+        self.assertIn("SPAPS_AUTH_BASE_URL=http://100.100.6.41:3000", result)
 
     def test_augment_spaps_tailnet_set_args_skips_plain_blueprint(self) -> None:
         result = BOX_MODULE.augment_spaps_tailnet_set_args(
             ["PRIMARY_REPO_URL=https://example.com/app.git"],
             blueprint="git-repo-http-service-bootstrap",
-            tailscale_ip="100.76.6.41",
+            tailscale_ip="100.100.6.41",
         )
 
         self.assertEqual(result, ["PRIMARY_REPO_URL=https://example.com/app.git"])
@@ -321,13 +338,13 @@ class BoxTests(unittest.TestCase):
     def test_extract_tailscale_ipv4_reads_marker_line(self) -> None:
         output = "\n".join([
             "some log line",
-            "TAILSCALE_IPV4=100.101.102.103",
+            "TAILSCALE_IPV4=100.100.102.103",
             "more log output",
         ])
 
         self.assertEqual(
             BOX_MODULE.extract_tailscale_ipv4(output),
-            "100.101.102.103",
+            "100.100.102.103",
         )
 
     def test_extract_tailscale_ipv4_returns_none_without_marker(self) -> None:
@@ -350,11 +367,11 @@ class BoxTests(unittest.TestCase):
 
         self.assertTrue(BOX_MODULE.is_ipv4_address("1.2.3.4"))
         self.assertFalse(BOX_MODULE.is_ipv4_address("999.1.1.1"))
-        self.assertTrue(BOX_MODULE.is_tailscale_ipv4("100.64.0.1"))
+        self.assertTrue(BOX_MODULE.is_tailscale_ipv4("100.100.0.1"))
         self.assertFalse(BOX_MODULE.is_tailscale_ipv4("8.8.8.8"))
         self.assertEqual(BOX_MODULE.derive_box_id_from_host("skillbox-Team.Example.com"), "team")
         self.assertEqual(BOX_MODULE.derive_box_id_from_host(""), "shared-box")
-        self.assertEqual(BOX_MODULE.seed_registered_box_fields("100.64.0.8"), {"tailscale_ip": "100.64.0.8"})
+        self.assertEqual(BOX_MODULE.seed_registered_box_fields("100.100.0.8"), {"tailscale_ip": "100.100.0.8"})
         self.assertEqual(BOX_MODULE.seed_registered_box_fields("8.8.8.8"), {"droplet_ip": "8.8.8.8"})
         self.assertEqual(
             BOX_MODULE.seed_registered_box_fields("skillbox-team"),
@@ -363,10 +380,10 @@ class BoxTests(unittest.TestCase):
         self.assertEqual(BOX_MODULE.seed_registered_box_fields(""), {})
         self.assertEqual(
             BOX_MODULE.parse_register_probe(
-                "SKILLBOX_PROBE_TAILSCALE_IPV4=100.64.0.9\n"
+                "SKILLBOX_PROBE_TAILSCALE_IPV4=100.100.0.9\n"
                 "SKILLBOX_PROBE_CONTAINER_RUNNING=yes\n"
             ),
-            {"tailscale_ip": "100.64.0.9", "container_running": True},
+            {"tailscale_ip": "100.100.0.9", "container_running": True},
         )
 
         external_box = BOX_MODULE.Box(
@@ -380,7 +397,7 @@ class BoxTests(unittest.TestCase):
         with mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value=None):
             self.assertFalse(BOX_MODULE.probe_registered_box(external_box, enabled=True)["ssh_reachable"])
         with (
-            mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="100.64.0.8"),
+            mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="100.100.0.8"),
             mock.patch.object(
                 BOX_MODULE,
                 "ssh_cmd",
@@ -391,7 +408,7 @@ class BoxTests(unittest.TestCase):
         self.assertTrue(probe["ssh_reachable"])
         self.assertFalse(probe["container_running"])
         with (
-            mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="100.64.0.8"),
+            mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="100.100.0.8"),
             mock.patch.object(
                 BOX_MODULE,
                 "ssh_cmd",
@@ -399,7 +416,7 @@ class BoxTests(unittest.TestCase):
                     ["ssh"],
                     0,
                     stdout=(
-                        "SKILLBOX_PROBE_TAILSCALE_IPV4=100.64.0.10\n"
+                        "SKILLBOX_PROBE_TAILSCALE_IPV4=100.100.0.10\n"
                         "SKILLBOX_PROBE_CONTAINER_RUNNING=yes\n"
                     ),
                     stderr="",
@@ -407,7 +424,7 @@ class BoxTests(unittest.TestCase):
             ),
         ):
             probe = BOX_MODULE.probe_registered_box(external_box, enabled=True)
-        self.assertEqual(probe["tailscale_ip"], "100.64.0.10")
+        self.assertEqual(probe["tailscale_ip"], "100.100.0.10")
         self.assertTrue(probe["container_running"])
 
         emitted: list[dict[str, object]] = []
@@ -444,10 +461,10 @@ class BoxTests(unittest.TestCase):
             "droplet_id": "123",
             "droplet_ip": "1.2.3.4",
             "tailscale_hostname": "skillbox-external",
-            "tailscale_ip": "100.64.0.8",
+            "tailscale_ip": "100.100.0.8",
             "ssh_user": "skillbox",
             "ssh_reachable": True,
-            "ssh_target": "100.64.0.8",
+            "ssh_target": "100.100.0.8",
             "container_running": True,
             "state_root": "/state",
             "storage_filesystem": "ext4",
@@ -457,7 +474,7 @@ class BoxTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as stdout:
             BOX_MODULE.print_box_status_text(status)
         self.assertIn("mode=external", stdout.getvalue())
-        self.assertIn("connect: ssh skillbox@100.64.0.8", stdout.getvalue())
+        self.assertIn("connect: ssh skillbox@100.100.0.8", stdout.getvalue())
 
         with (
             mock.patch.object(BOX_MODULE, "load_inventory", return_value=[]),
@@ -513,7 +530,7 @@ class BoxTests(unittest.TestCase):
                 "boxes": [
                     {"id": "test-box", "profile": "dev-small", "state": "ready",
                      "droplet_id": "123", "droplet_ip": "1.2.3.4",
-                     "tailscale_hostname": "skillbox-test-box", "tailscale_ip": "100.64.1.1",
+                     "tailscale_hostname": "skillbox-test-box", "tailscale_ip": "100.100.11.1",
                      "ssh_user": "skillbox", "created_at": "2026-01-01T00:00:00Z",
                      "updated_at": "2026-01-01T00:00:00Z", "region": "nyc3", "size": "s-2vcpu-4gb"},
                     {"id": "old-box", "profile": "dev-small", "state": "destroyed",
@@ -576,7 +593,7 @@ class BoxTests(unittest.TestCase):
             profile="dev-small",
             state="ssh-ready",
             droplet_ip="1.2.3.4",
-            tailscale_ip="100.64.0.10",
+            tailscale_ip="100.100.0.10",
             tailscale_hostname="skillbox-test-box",
             ssh_user="skillbox",
         )
@@ -601,7 +618,7 @@ class BoxTests(unittest.TestCase):
             profile="dev-small",
             state="ready",
             droplet_ip="1.2.3.4",
-            tailscale_ip="100.64.0.10",
+            tailscale_ip="100.100.0.10",
             tailscale_hostname="skillbox-test-box",
             ssh_user="skillbox",
         )
@@ -618,7 +635,15 @@ class BoxTests(unittest.TestCase):
         finally:
             BOX_MODULE.wait_for_ssh = original_wait_for_ssh
 
-        self.assertEqual(calls[:3], ["100.64.0.10", "skillbox-test-box", "1.2.3.4"])
+        # The three candidates are probed by a ThreadPoolExecutor
+        # (resolve_box_ssh_target), so APPEND order is thread-scheduling
+        # dependent — asserting an exact sequence made this flake under load
+        # (it reddened two otherwise-green gate runs). The contract is that all
+        # three candidates are probed and the public IP wins as fallback.
+        self.assertEqual(
+            sorted(calls),
+            sorted(["100.100.0.10", "skillbox-test-box", "1.2.3.4"]),
+        )
 
     def test_up_fails_without_do_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -742,7 +767,7 @@ class BoxTests(unittest.TestCase):
                 "boxes": [
                     {"id": "client_a", "profile": "dev-small", "state": "ready",
                      "droplet_id": "321", "droplet_ip": "1.2.3.4",
-                     "tailscale_hostname": "skillbox-client_a", "tailscale_ip": "100.64.1.9",
+                     "tailscale_hostname": "skillbox-client_a", "tailscale_ip": "100.100.11.9",
                      "ssh_user": "skillbox", "created_at": "", "updated_at": "",
                      "region": "nyc3", "size": "s-2vcpu-4gb"},
                 ],
@@ -789,7 +814,7 @@ class BoxTests(unittest.TestCase):
                 "boxes": [
                     {"id": "client_a", "profile": "dev-small", "state": "deploying",
                      "droplet_id": "321", "droplet_ip": "1.2.3.4",
-                     "tailscale_hostname": "skillbox-client_a", "tailscale_ip": "100.64.1.9",
+                     "tailscale_hostname": "skillbox-client_a", "tailscale_ip": "100.100.11.9",
                      "ssh_user": "skillbox", "created_at": "", "updated_at": "",
                      "region": "nyc3", "size": "s-2vcpu-4gb"},
                 ],
@@ -830,7 +855,7 @@ class BoxTests(unittest.TestCase):
                 "boxes": [
                     {"id": "client_a", "profile": "dev-small", "state": "ready",
                      "droplet_id": "321", "droplet_ip": "1.2.3.4",
-                     "tailscale_hostname": "skillbox-client_a", "tailscale_ip": "100.64.1.9",
+                     "tailscale_hostname": "skillbox-client_a", "tailscale_ip": "100.100.11.9",
                      "ssh_user": "skillbox", "created_at": "", "updated_at": "",
                      "region": "nyc3", "size": "s-2vcpu-4gb"},
                 ],
@@ -872,7 +897,7 @@ class BoxTests(unittest.TestCase):
                 "boxes": [
                     {"id": "roundtrip", "profile": "dev-small", "state": "ready",
                      "droplet_id": "555", "droplet_ip": "10.0.0.1",
-                     "tailscale_hostname": "skillbox-roundtrip", "tailscale_ip": "100.64.2.2",
+                     "tailscale_hostname": "skillbox-roundtrip", "tailscale_ip": "100.100.12.2",
                      "ssh_user": "skillbox", "created_at": "2026-03-31T00:00:00Z",
                      "updated_at": "2026-03-31T00:00:00Z", "region": "sfo3", "size": "s-4vcpu-8gb"},
                 ],
@@ -887,7 +912,7 @@ class BoxTests(unittest.TestCase):
             box = payload["boxes"][0]
             self.assertEqual(box["id"], "roundtrip")
             self.assertEqual(box["region"], "sfo3")
-            self.assertEqual(box["tailscale_ip"], "100.64.2.2")
+            self.assertEqual(box["tailscale_ip"], "100.100.12.2")
 
     def test_register_no_probe_creates_external_inventory_entry(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -896,7 +921,7 @@ class BoxTests(unittest.TestCase):
                 "register",
                 "shared-pal",
                 "--host",
-                "100.64.1.9",
+                "100.100.11.9",
                 "--ssh-user",
                 "sandbox",
                 "--no-probe",
@@ -909,7 +934,7 @@ class BoxTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertTrue(payload["registered"])
             self.assertEqual(payload["management_mode"], "external")
-            self.assertEqual(payload["tailscale_ip"], "100.64.1.9")
+            self.assertEqual(payload["tailscale_ip"], "100.100.11.9")
 
             listed = self._run("list", "--format", "json", env=env)
             self.assertEqual(listed.returncode, 0, listed.stderr)
@@ -1179,17 +1204,17 @@ sys.exit(int(os.environ.get("FAKE_SSH_SUCCESS_RC", "0")))
                 id="retry-box",
                 profile="dev-small",
                 state="ready",
-                tailscale_ip="100.64.0.8",
+                tailscale_ip="100.100.0.8",
                 tailscale_hostname="retry-box",
             )
             network_checks = {
                 "public_ssh": {"ok": False, "target": None},
-                "tailnet_ping": {"ok": True, "target": "100.64.0.8"},
+                "tailnet_ping": {"ok": True, "target": "100.100.0.8"},
                 "magicdns_resolution": {"ok": False, "hostname": "retry-box"},
-                "port_reachability": {"ok": False, "target": "100.64.0.8"},
+                "port_reachability": {"ok": False, "target": "100.100.0.8"},
             }
             with mock.patch.dict(os.environ, self._retry_test_env(bin_dir, counter, fails=1), clear=False), \
-                 mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="100.64.0.8"), \
+                 mock.patch.object(BOX_MODULE, "resolve_box_ssh_target", return_value="100.100.0.8"), \
                  mock.patch.object(BOX_MODULE, "box_network_health", return_value=network_checks):
                 status = BOX_MODULE.box_health(box)
 

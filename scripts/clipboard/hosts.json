@@ -1,5 +1,6 @@
 {
   "bundle_version": 2,
+  "note": "Sanitized example registry: every *.example target is a placeholder. Operators keep a real registry outside this repo and point SKILLBOX_CLIPBOARD_HOSTS at it.",
   "source_dir": "scripts/clipboard",
   "profiles": {
     "local": {
@@ -16,7 +17,7 @@
     },
     "d3": {
       "label": "d3 portfolio devbox",
-      "ssh_target": "skillbox@skillbox-portfolio-devbox",
+      "ssh_target": "skillbox@portfolio-devbox.example",
       "remote_home": "/home/skillbox",
       "transport": "ssh",
       "broker_strategy": "negotiated",
@@ -46,7 +47,7 @@
     },
     "sweet": {
       "label": "Sweet Potato",
-      "ssh_target": "aiops@sweet-potato-prod",
+      "ssh_target": "aiops@sweet-potato.example",
       "remote_home": "/home/aiops",
       "transport": "ssh",
       "broker_strategy": "negotiated",
@@ -60,7 +61,7 @@
     },
     "jeremy": {
       "label": "Jeremy VPS",
-      "ssh_target": "skillbox@skillbox-jeremy-3",
+      "ssh_target": "skillbox@jeremy-vps.example",
       "remote_home": "/home/skillbox",
       "transport": "ssh",
       "broker_strategy": "negotiated",
@@ -122,15 +123,15 @@
     "d": "d3",
     "default": "d3",
     "portfolio": "d3",
-    "skillbox-portfolio-devbox": "d3",
+    "portfolio-devbox.example": "d3",
     "s": "sweet",
     "sp": "sweet",
     "sweet-potato": "sweet",
-    "sweet-potato-prod": "sweet",
+    "sweet-potato.example": "sweet",
     "j": "jeremy",
     "jeremy-vps": "jeremy",
-    "skillbox-jeremy": "jeremy",
-    "skillbox-jeremy-3": "jeremy",
+    "jeremy-vps.example": "jeremy",
+    "jeremy-vps.example": "jeremy",
     "c": "conference1",
     "conf": "conference1",
     "conference": "conference1",
@@ -141,23 +142,23 @@
     "host": "conference1",
     "role": "heavy-build and dev-surface target",
     "os": "windows-with-wsl-ubuntu",
-    "magicdns": "conference1.tail4c481e.ts.net",
-    "tailscale_ip": "100.123.217.11",
+    "magicdns": "conference1.tailexample.ts.net",
+    "tailscale_ip": "100.100.1.1",
     "windows_ssh_target": "conference1-ssh",
     "wsl_ssh_target": "worker@conference1-wsl",
-    "wsl_tailscale_ip": "100.96.206.87",
+    "wsl_tailscale_ip": "100.100.1.2",
     "serve_helper": "C:\\Users\\worker\\bin\\tailnet-serve.ps1",
     "serve_helper_actions": ["list", "expose", "remove"],
     "serve_backend_host": "127.0.0.1",
     "serve_ports": [3000, 3001, 3170, 3210, 8050],
     "portproxy_fallback": {
-      "listen_address": "100.123.217.11",
+      "listen_address": "100.100.1.1",
       "list_command": "netsh interface portproxy show v4tov4",
       "note": "Raw Tailscale-IP portproxy; fallback only when MagicDNS Serve is unavailable."
     },
     "swimmers_remote_rust": {
       "host_env": "SWIMMERS_REMOTE_RUST_HOST",
-      "host_values": ["conference1-ssh", "worker@100.123.217.11"],
+      "host_values": ["conference1-ssh", "worker@100.100.1.1"],
       "build_side": "wsl-ubuntu",
       "wsl_ssh_target": "worker@conference1-wsl",
       "cargo_cache": "/var/tmp/swimmers-remote-rust-cache"

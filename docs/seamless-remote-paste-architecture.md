@@ -102,7 +102,7 @@ artifacts, atomic token replacement, a 20 MiB image cap, random temporary
 names, defensive timeouts, and race-enabled CI.
 
 The pinned binary was installed to a versioned Skillbox-owned path and
-`setup skillbox-portfolio-devbox --codex` completed against live `d3`. The
+`setup portfolio-devbox.example --codex` completed against live `d3`. The
 HTTP daemon bound only to `127.0.0.1:18339`, the SSH tunnel worked, notification
 health passed, and the remote bridge claimed the X clipboard. The decisive
 runtime socket inspection then found:
@@ -135,7 +135,7 @@ The current official remote-connections contract says the desktop app starts a
 remote Codex app server through SSH, using the remote login shell, and operates
 remote project files and commands. The current image-input contract supports
 pasting or attaching images in the app composer. Live prerequisites passed for
-`skillbox-portfolio-devbox`: the concrete SSH alias resolves, batch SSH works,
+`portfolio-devbox.example`: the concrete SSH alias resolves, batch SSH works,
 the login shell exposes Codex 0.144.4, and the intended remote repository is
 readable.
 

@@ -98,6 +98,14 @@ if [[ "$PY_MAJOR" -lt 3 || "$PY_MINOR" -lt 11 ]]; then
   fail dependency "need Python >= 3.11; got ${PY_VERSION}" 20
 fi
 
+if [[ -n "${TAILSCALE_AUTHKEY:-}" && -x scripts/orb/join-tailnet.sh ]]; then
+  REPAIR_STARTED=true
+  log "tailnet: starting non-blocking health check/rejoin"
+  (
+    scripts/orb/join-tailnet.sh --resume >>"$AGENT_LOG_DIR/resume-repair.log" 2>&1 || true
+  ) >/dev/null 2>&1 &
+fi
+
 if ! command -v ruff >/dev/null 2>&1; then
   REPAIR_STARTED=true
   log "ruff missing; starting non-blocking best-effort repair"

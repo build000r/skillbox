@@ -629,7 +629,7 @@ class OperatorMcpServerTests(unittest.TestCase):
             return_value={
                 "id": "alpha",
                 "state": "ready",
-                "tailscale_ip": "100.64.0.8",
+                "tailscale_ip": "100.100.0.8",
                 "tailscale_hostname": "skillbox-alpha",
                 "ssh_user": "skillbox",
             },
@@ -644,7 +644,7 @@ class OperatorMcpServerTests(unittest.TestCase):
 
         payload = _content_payload(result)
         self.assertEqual(payload["stdout"], "ok")
-        run_ssh.assert_called_once_with("skillbox", "100.64.0.8", "pwd", timeout=15)
+        run_ssh.assert_called_once_with("skillbox", "100.100.0.8", "pwd", timeout=15)
 
     def test_handle_operator_compose_up_covers_success_and_build_failure(self) -> None:
         with mock.patch.object(
@@ -1014,12 +1014,12 @@ class OperatorMcpSshHardeningTests(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         with mock.patch.object(MODULE.subprocess, "run", side_effect=fake_run):
-            MODULE.run_ssh("skillbox", "100.64.0.1", "echo ok")
+            MODULE.run_ssh("skillbox", "100.100.0.1", "echo ok")
 
         cmd = captured["cmd"]
         self.assertEqual(cmd[0], "ssh")
         self.assertIn("--", cmd)
-        self.assertLess(cmd.index("--"), cmd.index("skillbox@100.64.0.1"))
+        self.assertLess(cmd.index("--"), cmd.index("skillbox@100.100.0.1"))
 
     def test_box_exec_rejects_flag_injection_host(self) -> None:
         poisoned = {
@@ -1042,7 +1042,7 @@ class OperatorMcpSshHardeningTests(unittest.TestCase):
         poisoned = {
             "id": "alpha",
             "state": "ready",
-            "tailscale_ip": "100.64.0.8",
+            "tailscale_ip": "100.100.0.8",
             "ssh_user": "root; id;",
         }
         with mock.patch.object(MODULE, "find_box", return_value=poisoned), mock.patch.object(
@@ -1059,7 +1059,7 @@ class OperatorMcpSshHardeningTests(unittest.TestCase):
         clean = {
             "id": "alpha",
             "state": "ready",
-            "tailscale_ip": "100.64.0.8",
+            "tailscale_ip": "100.100.0.8",
             "ssh_user": "skillbox",
         }
         with mock.patch.object(MODULE, "find_box", return_value=clean), mock.patch.object(
@@ -1070,7 +1070,7 @@ class OperatorMcpSshHardeningTests(unittest.TestCase):
             )
 
         self.assertEqual(_content_payload(result)["stdout"], "ok")
-        run_ssh.assert_called_once_with("skillbox", "100.64.0.8", "pwd", timeout=15)
+        run_ssh.assert_called_once_with("skillbox", "100.100.0.8", "pwd", timeout=15)
 
 
 class OperatorBoxExecCommandPolicyTests(unittest.TestCase):
@@ -1207,7 +1207,7 @@ class OperatorBoxExecGateTests(unittest.TestCase):
     READY_BOX = {
         "id": "alpha",
         "state": "ready",
-        "tailscale_ip": "100.64.0.8",
+        "tailscale_ip": "100.100.0.8",
         "ssh_user": "skillbox",
     }
 
@@ -1240,7 +1240,7 @@ class OperatorBoxExecGateTests(unittest.TestCase):
             result = MODULE.handle_operator_box_exec({"box_id": "alpha", "command": "docker ps"})
 
         self.assertEqual(_content_payload(result)["stdout"], "ok")
-        run_ssh.assert_called_once_with("skillbox", "100.64.0.8", "docker ps", timeout=120)
+        run_ssh.assert_called_once_with("skillbox", "100.100.0.8", "docker ps", timeout=120)
         # Acceptance (4): an audit event is recorded.
         events = self._journal_events()
         self.assertEqual(len(events), 1)
@@ -1423,7 +1423,7 @@ class DcgAdapterTests(unittest.TestCase):
     READY_BOX = {
         "id": "alpha",
         "state": "ready",
-        "tailscale_ip": "100.64.0.8",
+        "tailscale_ip": "100.100.0.8",
         "ssh_user": "skillbox",
     }
 

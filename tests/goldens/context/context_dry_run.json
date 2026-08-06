@@ -1,7 +1,7 @@
 {
   "actions": [
-    "write-context: home/.claude/CLAUDE.md",
-    "exists: home/.codex/AGENTS.md -> ../.claude/CLAUDE.md"
+    "<SYNC-VERB-NORMALIZED>: home/.claude/CLAUDE.md",
+    "<SYNC-VERB-NORMALIZED>: home/.codex/AGENTS.md -> ../.claude/CLAUDE.md"
   ],
   "dry_run": true,
   "next_actions": [

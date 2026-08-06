@@ -111,6 +111,11 @@ def bundle_dir(root: Path | None = None) -> Path:
 
 
 def hosts_path(root: Path | None = None) -> Path:
+    # The tracked hosts.json ships sanitized .example targets; operators point
+    # SKILLBOX_CLIPBOARD_HOSTS at their real fleet registry (skillbox-config).
+    env_hosts = os.environ.get("SKILLBOX_CLIPBOARD_HOSTS")
+    if env_hosts:
+        return Path(env_hosts)
     return bundle_dir(root) / "hosts.json"
 
 
@@ -426,7 +431,15 @@ def bundle_revision(root: Path, home: Path) -> str:
     for source, destination, mode in sorted(
         local_managed_specs(root, home), key=lambda item: str(item[1])
     ):
-        digest.update(str(source.relative_to(root)).encode())
+        try:
+            source_key = str(source.relative_to(root))
+        except ValueError:
+            # SKILLBOX_CLIPBOARD_HOSTS may point outside the repo (documented
+            # operator overlay). Bind the digest to a stable external label
+            # rather than a host-specific absolute path, so revisions stay
+            # comparable across machines while still tracking content.
+            source_key = f"external:{destination.name}"
+        digest.update(source_key.encode())
         digest.update(str(mode).encode())
         digest.update(source.read_bytes())
     return f"{SEAMLESS_PASTE_VERSION}+{digest.hexdigest()[:12]}"

@@ -475,8 +475,11 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
             str((ROOT_DIR.parent / "skillbox-config").resolve()),
             str((ROOT_DIR.parent.parent / "skillbox-config").resolve()),
         ]
+        # Same sandbox masking as the prune-firewall property test: TMPDIR may
+        # itself live under /srv/skillbox on the operator box.
+        scrubbed = rendered.replace(str(root.resolve()), "<SANDBOX>").replace(str(root), "<SANDBOX>")
         for forbidden in [str(Path.home().resolve()), *external_config_roots, "/srv/skillbox"]:
-            self.assertNotIn(forbidden, rendered)
+            self.assertNotIn(forbidden, scrubbed)
         self.assertIn(str(root), rendered)
 
     def test_override_writer_preserves_sequential_read_modify_writes(self) -> None:
@@ -937,8 +940,12 @@ class RepoSkillOverridePolicyTests(unittest.TestCase):
                     },
                     sort_keys=True,
                 )
-                self.assertNotIn(str(Path.home().resolve()), rendered)
-                self.assertNotIn("/srv/skillbox", rendered)
+                # Mask the test sandbox first: on boxes where TMPDIR itself lives
+                # under /srv/skillbox, every legitimate sandbox path would trip the
+                # estate firewall. Anything OUTSIDE the sandbox still fails.
+                scrubbed = rendered.replace(str(root.resolve()), "<SANDBOX>").replace(str(root), "<SANDBOX>")
+                self.assertNotIn(str(Path.home().resolve()), scrubbed)
+                self.assertNotIn("/srv/skillbox", scrubbed)
                 for name in pin_on + pin_off:
                     self.assertIn(name, skill_names)
 

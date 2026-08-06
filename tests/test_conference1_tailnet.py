@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import sys
 import unittest
 from contextlib import redirect_stdout
@@ -8,6 +9,14 @@ from pathlib import Path
 from unittest import mock
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
+
+# These suites assert the tracked, sanitized scripts/clipboard/hosts.json.
+# Operator shells export SKILLBOX_CLIPBOARD_HOSTS to point at a private fleet
+# registry; that override leaking in makes every assertion here depend on
+# operator-local data (and broke the self-test gate, which inherits the
+# pusher's environment). Scrub it at module import.
+os.environ.pop("SKILLBOX_CLIPBOARD_HOSTS", None)
+
 SCRIPTS_DIR = ROOT_DIR / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
@@ -27,8 +36,8 @@ class Conference1MetadataTests(unittest.TestCase):
         self.meta = CT.load_conference1_tailnet(ROOT_DIR)
 
     def test_metadata_core_facts(self) -> None:
-        self.assertEqual(self.meta["magicdns"], "conference1.tail4c481e.ts.net")
-        self.assertEqual(self.meta["tailscale_ip"], "100.123.217.11")
+        self.assertEqual(self.meta["magicdns"], "conference1.tailexample.ts.net")
+        self.assertEqual(self.meta["tailscale_ip"], "100.100.1.1")
         self.assertEqual(self.meta["windows_ssh_target"], "conference1-ssh")
         self.assertEqual(self.meta["wsl_ssh_target"], "worker@conference1-wsl")
         self.assertEqual(sorted(self.meta["serve_ports"]), [3000, 3001, 3170, 3210, 8050])
@@ -50,8 +59,8 @@ class Conference1MetadataTests(unittest.TestCase):
     def test_urls_distinguish_magicdns_from_portproxy(self) -> None:
         magic = CT.magicdns_serve_urls(self.meta)
         proxy = CT.portproxy_fallback_urls(self.meta)
-        self.assertIn("http://conference1.tail4c481e.ts.net:3000", magic)
-        self.assertIn("http://100.123.217.11:3000", proxy)
+        self.assertIn("http://conference1.tailexample.ts.net:3000", magic)
+        self.assertIn("http://100.100.1.1:3000", proxy)
         self.assertFalse(set(magic) & set(proxy))
         text = CT.render_urls_text(self.meta)
         self.assertIn("MagicDNS Serve URLs (primary", text)

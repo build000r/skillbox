@@ -32,7 +32,7 @@ class PressureReportTests(unittest.TestCase):
                             "state": "ready",
                             "profile": "dev-small",
                             "tailscale_hostname": "skillbox-worker-devbox",
-                            "tailscale_ip": "100.86.253.9",
+                            "tailscale_ip": "100.100.253.9",
                             "state_root": "/srv/skillbox",
                             "storage_filesystem": "ext4",
                             "storage_min_free_gb": 10.0,

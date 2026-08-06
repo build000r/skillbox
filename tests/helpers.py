@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 import tempfile
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -19,6 +20,8 @@ from typing import Any
 PRESSURE_HEADING = "## Pressure And Offload Policy"
 PRESSURE_PLACEHOLDER = "<PRESSURE-ADVISORY-NORMALIZED>"
 ROOT_PLACEHOLDER = "<ROOT>"
+INSTALLED_SKILLS_PLACEHOLDER = "<INSTALLED-SKILLS-NORMALIZED>"
+SYNC_VERB_PLACEHOLDER = "<SYNC-VERB-NORMALIZED>:"
 
 
 def _deep_merge(base: dict[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
@@ -138,12 +141,30 @@ def _normalize_pressure_section(markdown: str) -> str:
     return "\n".join(out)
 
 
+# The resolved skill set depends on which skill source repos are checked out and
+# synced on the machine, and the sync verb depends on whether a link already
+# exists. Both differ between a working checkout and the `git archive` extract
+# the canonical gate runs in — so a golden that pins them can only ever pass in
+# one of the two, which is what kept scripts/self-test.sh red. Normalized for the
+# same reason (and in the same way) as the pressure advisory: the structure and
+# the presence of the line stay locked, only the volatile token is masked.
+_SKILLS_LINE_RE = re.compile(r"^(\s*-\s+\*\*[a-z0-9-]*skills\*\*:\s*).+$", re.M)
+_SYNC_VERB_RE = re.compile(r"\b(?:exists|symlink-context|write-context|install-skill):(?=\s)")
+
+
+def normalize_sync_verbs(text: str) -> str:
+    """Mask the sync verb, which reflects pre-existing local state, not contract."""
+    return _SYNC_VERB_RE.sub(SYNC_VERB_PLACEHOLDER, text)
+
+
 def normalize_golden(text: str, root: str | os.PathLike[str]) -> str:
     """Normalize volatile golden text such as host pressure and temp roots."""
     normalized = _normalize_pressure_section(text)
     root_text = str(root)
     if root_text:
         normalized = normalized.replace(root_text, ROOT_PLACEHOLDER)
+    normalized = _SKILLS_LINE_RE.sub(rf"\1{INSTALLED_SKILLS_PLACEHOLDER}", normalized)
+    normalized = _SYNC_VERB_RE.sub(SYNC_VERB_PLACEHOLDER, normalized)
     return normalized
 
 

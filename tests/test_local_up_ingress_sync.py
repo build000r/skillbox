@@ -16,7 +16,7 @@ class LocalUpIngressSyncTests(unittest.TestCase):
             "env": {
                 "SKILLBOX_WORKSPACE_ROOT": "/workspace",
                 "SKILLBOX_HOME_ROOT": "/home/sandbox",
-                "SKILLBOX_INGRESS_PRIVATE_BASE_URL": "http://100.64.0.1:9080",
+                "SKILLBOX_INGRESS_PRIVATE_BASE_URL": "http://100.100.0.1:9080",
             },
             "active_profiles": ["core", "local-app"],
             "active_clients": ["example"],

@@ -418,7 +418,7 @@ python3 .env-manager/manage.py client-init acme-studio \
   --set SERVICE_COMMAND='pnpm dev'
 ```
 
-Every skillbox image installs `spaps@0.7.7` as a mandatory workspace CLI. The
+Every skillbox image installs `spaps@0.9.3` as a mandatory workspace CLI. The
 SPAPS blueprint uses that installed `spaps` command by default; override
 `SPAPS_CLI_COMMAND` only when you intentionally want a different command, such
 as `npx --yes spaps@x.y.z`.

@@ -12,6 +12,14 @@ from pathlib import Path
 from unittest import mock
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
+
+# These suites assert the tracked, sanitized scripts/clipboard/hosts.json.
+# Operator shells export SKILLBOX_CLIPBOARD_HOSTS to point at a private fleet
+# registry; that override leaking in makes every assertion here depend on
+# operator-local data (and broke the self-test gate, which inherits the
+# pusher's environment). Scrub it at module import.
+os.environ.pop("SKILLBOX_CLIPBOARD_HOSTS", None)
+
 SCRIPTS_DIR = ROOT_DIR / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
@@ -39,7 +47,7 @@ class ClipboardBootstrapTests(unittest.TestCase):
 
     def test_resolve_profile_d3(self) -> None:
         resolved = CB.resolve_profile("d3", root=ROOT_DIR)
-        self.assertEqual(resolved["ssh_target"], "skillbox@skillbox-portfolio-devbox")
+        self.assertEqual(resolved["ssh_target"], "skillbox@portfolio-devbox.example")
         self.assertEqual(resolved["remote_home"], "/home/skillbox")
 
     def test_resolve_profile_generic_requires_target(self) -> None:
@@ -637,7 +645,7 @@ class ClipboardBootstrapTests(unittest.TestCase):
 
     def test_plan_remote_bootstrap_steps(self) -> None:
         plan = CB.plan_remote_bootstrap("d3", dry_run=True, root=ROOT_DIR)
-        self.assertEqual(plan.ssh_target, "skillbox@skillbox-portfolio-devbox")
+        self.assertEqual(plan.ssh_target, "skillbox@portfolio-devbox.example")
         joined = "\n".join(plan.steps)
         self.assertIn("xterm-ghostty", joined)
         self.assertIn("~/.local/bin", joined)
@@ -743,7 +751,7 @@ class ClipboardBootstrapTests(unittest.TestCase):
     def test_remote_plan_promises_no_running_tmux_reload(self) -> None:
         plan = CB.plan_remote_bootstrap("d3", dry_run=True, root=ROOT_DIR)
         self.assertIn(
-            "ssh skillbox@skillbox-portfolio-devbox: leave every running tmux server untouched",
+            "ssh skillbox@portfolio-devbox.example: leave every running tmux server untouched",
             plan.steps,
         )
 
@@ -1352,7 +1360,7 @@ class ClipboardBootstrapTests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(proc.stderr, "")
-        self.assertIn("skillbox-portfolio-devbox", proc.stdout)
+        self.assertIn("portfolio-devbox.example", proc.stdout)
         self.assertIn("xterm-ghostty", proc.stdout)
 
     def test_bootstrap_cli_remote_default_is_plan_mode(self) -> None:

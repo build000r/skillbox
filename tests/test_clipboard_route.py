@@ -40,9 +40,9 @@ class ClipboardRouteTests(unittest.TestCase):
 
     def test_supported_profile_and_alias_matrix(self) -> None:
         cases = {
-            "d": ("d3", "skillbox@skillbox-portfolio-devbox", True),
-            "sweet-potato-prod": ("sweet", "aiops@sweet-potato-prod", True),
-            "skillbox-jeremy-3": ("jeremy", "skillbox@skillbox-jeremy-3", True),
+            "d": ("d3", "skillbox@portfolio-devbox.example", True),
+            "sweet-potato.example": ("sweet", "aiops@sweet-potato.example", True),
+            "jeremy-vps.example": ("jeremy", "skillbox@jeremy-vps.example", True),
             "conference1-wsl": ("conference1", "worker@conference1-wsl", True),
             "conference1-ssh": ("conference1-fallback", "conference1-ssh", False),
         }
@@ -107,7 +107,7 @@ class ClipboardRouteTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, msg=proc.stderr)
         self.assertEqual(
             proc.stdout.strip().split("\t"),
-            ["skillbox@skillbox-portfolio-devbox", "ssh", "/home/skillbox", "d3"],
+            ["skillbox@portfolio-devbox.example", "ssh", "/home/skillbox", "d3"],
         )
         clipimg = (ROOT_DIR / "scripts" / "clipboard" / "clipimg-put").read_text(
             encoding="utf-8"

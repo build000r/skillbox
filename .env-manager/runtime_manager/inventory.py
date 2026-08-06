@@ -8,6 +8,7 @@ Depends on ._skill_common and .policy_eval.
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 from typing import Any
@@ -326,8 +327,22 @@ def _scan_installed_root(root: Path, *, layer: str, label: str, rank: int) -> tu
             broken += 1
             kind = "symlink"
             has_skill_md = False
-            # The link reads fine but its target does not exist on this box.
-            broken_reason = "missing-target"
+            # Python 3.13's non-strict resolve() no longer raises on symlink
+            # loops (older versions did), so a loop would otherwise fall through
+            # here and masquerade as a missing target. os.stat still raises
+            # ELOOP on every supported version; probe it to keep loops in the
+            # unreadable class.
+            try:
+                os.stat(entry)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    broken_reason = "unreadable"
+                    resolve_error = str(exc)
+                else:
+                    # The link reads fine but its target does not exist on this box.
+                    broken_reason = "missing-target"
+            else:
+                broken_reason = "missing-target"
         elif entry.is_dir():
             kind = "directory"
             has_skill_md = (entry / "SKILL.md").is_file()

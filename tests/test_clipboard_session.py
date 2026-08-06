@@ -75,7 +75,7 @@ class ClipboardSessionTests(unittest.TestCase):
     def test_d3_direct_ssh_registers_exact_pane_and_canonical_route(self) -> None:
         record, path = self.register()
         self.assertEqual(record["profile"], "d3")
-        self.assertEqual(record["ssh_target"], "skillbox@skillbox-portfolio-devbox")
+        self.assertEqual(record["ssh_target"], "skillbox@portfolio-devbox.example")
         self.assertEqual(record["remote_home"], "/home/skillbox")
         self.assertEqual(record["transport"], "ssh")
         self.assertEqual(record["local"]["tmux_pane"], "%1")
@@ -86,7 +86,7 @@ class ClipboardSessionTests(unittest.TestCase):
     def test_d2_numbered_devbox_records_remote_session_and_parent_target(self) -> None:
         record, _ = self.register(
             profile="devbox",
-            target="skillbox@skillbox-portfolio-devbox",
+            target="skillbox@portfolio-devbox.example",
             transport="mosh",
             remote_session="devbox-1",
         )

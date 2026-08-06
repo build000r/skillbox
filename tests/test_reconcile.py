@@ -681,7 +681,11 @@ class ReconcileTests(unittest.TestCase):
             "targets": {
                 "local": {
                     "provider": "local",
-                    "default_state_root": "./.skillbox-state",
+                    # Absolute + aligned with runtime_model.storage.state_root: since
+                    # 5dbae6e the operator-env channel (SKILLBOX_STATE_ROOT) is the
+                    # mount authority, so a CWD-relative default here would make these
+                    # tests depend on the process working directory.
+                    "default_state_root": "/state-root",
                 }
             },
         }

@@ -90,7 +90,8 @@ def refuse_funnel(tokens: list[str]) -> None:
         if "funnel" in str(token).lower():
             raise FunnelRefusedError(
                 "Tailscale Funnel is not allowed from this surface; "
-                "tailnet-only Serve is the policy (see docs/conference1.md)"
+                "tailnet-only Serve is the policy (see the conference1_tailnet "
+                "block in the hosts registry)"
             )
 
 

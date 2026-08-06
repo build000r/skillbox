@@ -171,7 +171,7 @@ class BoxRefactorTests(unittest.TestCase):
                 BOX,
                 "ssh_cmd",
                 side_effect=[
-                    _completed(stdout="100.64.0.1\n"),
+                    _completed(stdout="100.100.0.1\n"),
                     _completed(stdout='{"env_updates":["SKILLBOX_STATE_ROOT"],"mcp_config":"created"}\n'),
                     _completed(stdout="launch ok\n"),
                     _completed(stdout='{"client_id":"alpha","active_profiles":["core","ops"],"created_client":true}\n'),
@@ -194,7 +194,7 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertEqual(result, BOX.EXIT_OK)
         payload = payloads[-1]
         self.assertEqual(payload["box_id"], "alpha")
-        self.assertEqual(payload["tailscale_ip"], "100.64.0.1")
+        self.assertEqual(payload["tailscale_ip"], "100.100.0.1")
         self.assertEqual(payload["storage"]["mount_path"], "/srv/skillbox")
         self.assertEqual(payload["volume"]["name"], "skillbox-state-alpha")
         self.assertEqual([step["status"] for step in payload["steps"]], ["ok", "ok", "ok", "ok", "ok", "ok", "ok", "ok", "ok", "ok"])
@@ -222,7 +222,7 @@ class BoxRefactorTests(unittest.TestCase):
                 side_effect=[_completed(), _completed(), _completed(returncode=1, stderr="deploy failed")],
             ), \
             mock.patch.object(BOX, "scp_file", return_value=_completed()), \
-            mock.patch.object(BOX, "ssh_cmd", side_effect=[_completed(stdout="100.64.0.1\n")]), \
+            mock.patch.object(BOX, "ssh_cmd", side_effect=[_completed(stdout="100.100.0.1\n")]), \
             mock.patch.object(BOX, "save_inventory"), \
             mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
             result = BOX.cmd_up(
@@ -352,7 +352,7 @@ class BoxRefactorTests(unittest.TestCase):
                 BOX,
                 "ssh_cmd",
                 side_effect=[
-                    _completed(stdout="100.64.0.1\n"),
+                    _completed(stdout="100.100.0.1\n"),
                     _completed(stdout='{"env_updates":["SKILLBOX_STATE_ROOT"],"mcp_config":"created"}\n'),
                     _completed(stdout="launch ok\n"),
                     _completed(returncode=1, stderr="first-box failed"),
@@ -727,7 +727,7 @@ class BoxRefactorTests(unittest.TestCase):
             id="warm",
             profile="dev-small",
             state="ready",
-            tailscale_ip="100.64.0.8",
+            tailscale_ip="100.100.0.8",
             tailscale_hostname="skillbox-warm",
             droplet_ip="1.2.3.4",
             last_ssh_target="cached-host",
@@ -750,7 +750,7 @@ class BoxRefactorTests(unittest.TestCase):
             id="cold",
             profile="dev-small",
             state="ready",
-            tailscale_ip="100.64.0.8",
+            tailscale_ip="100.100.0.8",
             tailscale_hostname="skillbox-cold",
             droplet_ip="1.2.3.4",
         )
@@ -772,7 +772,7 @@ class BoxRefactorTests(unittest.TestCase):
 
         self.assertEqual(target, "skillbox-cold")
         self.assertEqual(box.last_ssh_target, "skillbox-cold")
-        self.assertCountEqual(started, ["100.64.0.8", "skillbox-cold", "1.2.3.4"])
+        self.assertCountEqual(started, ["100.100.0.8", "skillbox-cold", "1.2.3.4"])
 
     def test_cmd_status_persists_last_ssh_target_when_inventory_file_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -785,7 +785,7 @@ class BoxRefactorTests(unittest.TestCase):
                                 "id": "cached",
                                 "profile": "dev-small",
                                 "state": "ready",
-                                "tailscale_ip": "100.64.0.8",
+                                "tailscale_ip": "100.100.0.8",
                                 "ssh_user": "skillbox",
                             }
                         ]
@@ -814,8 +814,8 @@ class BoxRefactorTests(unittest.TestCase):
             saved = json.loads(inventory.read_text(encoding="utf-8"))
 
         self.assertEqual(result, BOX.EXIT_OK)
-        self.assertEqual(payloads[-1]["boxes"][0]["ssh_target"], "100.64.0.8")
-        self.assertEqual(saved["boxes"][0]["last_ssh_target"], "100.64.0.8")
+        self.assertEqual(payloads[-1]["boxes"][0]["ssh_target"], "100.100.0.8")
+        self.assertEqual(saved["boxes"][0]["last_ssh_target"], "100.100.0.8")
 
     def test_cmd_status_unknown_box_returns_error_payload(self) -> None:
         payloads: list[dict[str, object]] = []
@@ -893,10 +893,10 @@ class BoxRefactorTests(unittest.TestCase):
                 "probe_registered_box",
                 return_value={
                     "probe_enabled": True,
-                    "ssh_target": "100.64.0.8",
+                    "ssh_target": "100.100.0.8",
                     "ssh_reachable": True,
                     "container_running": True,
-                    "tailscale_ip": "100.64.0.8",
+                    "tailscale_ip": "100.100.0.8",
                 },
             ), \
             mock.patch.object(BOX, "save_inventory", side_effect=capture_inventory), \
@@ -915,8 +915,8 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertEqual(len(persisted), 1)
         self.assertEqual(persisted[0].management_mode, "external")
         self.assertEqual(persisted[0].state, "ready")
-        self.assertEqual(persisted[0].tailscale_ip, "100.64.0.8")
-        self.assertEqual(payloads[-1]["ssh_target"], "100.64.0.8")
+        self.assertEqual(persisted[0].tailscale_ip, "100.100.0.8")
+        self.assertEqual(payloads[-1]["ssh_target"], "100.100.0.8")
         self.assertEqual(payloads[-1]["next_actions"], ["box status shared-pal", "box ssh shared-pal"])
 
     def test_cmd_unregister_marks_external_box_destroyed(self) -> None:

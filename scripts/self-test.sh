@@ -31,6 +31,11 @@ SHELLCHECK_PY_VERSION="0.11.0.1"
 COVERAGE_VERSION="7.15.0"
 PYYAML_VERSION="6.0.3"
 CRYPTOGRAPHY_VERSION="49.0.0"
+# Test-only imports used by the suite itself (test_sbpd imports jwt; several
+# modules import pytest for fixtures/parametrize). Absent from the lane venvs
+# these become module-level ImportErrors that read as lane failures.
+PYTEST_VERSION="8.4.2"
+PYJWT_VERSION="2.13.0"
 PYTHON_VERSIONS=("3.11" "3.12" "3.13")
 COVERAGE_PYTHON="3.12"
 COVERAGE_FAIL_UNDER="80"
@@ -115,9 +120,9 @@ PINS
 }
 
 fingerprint_material() {
-  printf 'ruff=%s;shellcheck_py=%s;coverage=%s;pyyaml=%s;cryptography=%s;pythons=%s\n' \
+  printf 'ruff=%s;shellcheck_py=%s;coverage=%s;pyyaml=%s;cryptography=%s;pytest=%s;pyjwt=%s;pythons=%s\n' \
     "${RUFF_VERSION}" "${SHELLCHECK_PY_VERSION}" "${COVERAGE_VERSION}" \
-    "${PYYAML_VERSION}" "${CRYPTOGRAPHY_VERSION}" "${PYTHON_VERSIONS[*]}"
+    "${PYYAML_VERSION}" "${CRYPTOGRAPHY_VERSION}" "${PYTEST_VERSION}" "${PYJWT_VERSION}" "${PYTHON_VERSIONS[*]}"
 }
 
 toolchain_fingerprint() {
@@ -280,7 +285,9 @@ provision_toolchain() {
     uv pip install --quiet --python "${PY_ROOT}/${version}/bin/python" \
       "PyYAML==${PYYAML_VERSION}" \
       "cryptography==${CRYPTOGRAPHY_VERSION}" \
-      "coverage==${COVERAGE_VERSION}" >&2
+      "coverage==${COVERAGE_VERSION}" \
+      "pytest==${PYTEST_VERSION}" \
+      "PyJWT==${PYJWT_VERSION}" >&2
     [[ -x "${PY_ROOT}/${version}/bin/python" ]] \
       || die "provisioning produced no interpreter for ${version} at ${PY_ROOT}/${version}/bin/python"
     local actual
@@ -357,6 +364,12 @@ run_lane() {
     printf 'self-test: FAIL %-20s %4ss (exit %s)\n' "${id}" "${elapsed}" "${code}" >&2
     log "----- ${id} (last 40 lines) -----"
     tail -n 40 "${log_file}" >&2 || true
+    log "----- ${id} failing tests -----"
+    # The 40-line tail regularly ends inside a test's stdout (JSON noise) and
+    # loses the unittest summary; always surface the failure NAMES too, or a
+    # red lane is undiagnosable from the receipt (skillbox-5gth).
+    grep -E '^(FAIL|ERROR): ' "${log_file}" | tail -n 30 >&2 || true
+    grep -E '^(FAILED|OK)( |$)' "${log_file}" | tail -n 2 >&2 || true
     log "----- end ${id} -----"
   fi
 

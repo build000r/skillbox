@@ -207,7 +207,7 @@ def _write_inventory(root: Path) -> None:
                     {
                         "id": BOX_ID,
                         "state": "ready",
-                        "tailscale_ip": "100.64.0.9",
+                        "tailscale_ip": "100.100.0.9",
                         "ssh_user": "skillbox",
                     }
                 ]

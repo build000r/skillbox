@@ -197,7 +197,7 @@ gate_bootstrap_launch() {
   local out
   out="$(scripts/clipboard-bootstrap --profile d3 --dry-run)"
   printf '%s\n' "$out"
-  grep -q "skillbox-portfolio-devbox" <<<"$out"
+  grep -q "portfolio-devbox.example" <<<"$out"
   grep -q "xterm-ghostty" <<<"$out"
 }
 

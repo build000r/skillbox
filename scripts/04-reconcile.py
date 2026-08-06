@@ -681,14 +681,33 @@ def build_model() -> dict[str, Any]:
     }
 
 
-def run_command(args: list[str]) -> subprocess.CompletedProcess[str]:
+def run_command(
+    args: list[str], env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         args,
         cwd=ROOT_DIR,
         capture_output=True,
         text=True,
         check=False,
+        env=env,
     )
+
+
+# The sbp wrapper exports these with their HOST-view meaning (repo universe on
+# the box), but the compose files interpolate the same names as CONTAINER-view
+# paths (mount point, default /monoserver). If the caller's shell values leak
+# into `docker compose config`, the drift verdict depends on who invoked the
+# doctor. Compose parity must be judged against tracked defaults + the operator
+# --env-file only, so scrub exactly this collision pair from the shell env.
+_COMPOSE_CALLER_ENV_SCRUB = ("SKILLBOX_MONOSERVER_ROOT", "SKILLBOX_MONOSERVER_HOST_ROOT")
+
+
+def _compose_env() -> dict[str, str]:
+    env = dict(os.environ)
+    for name in _COMPOSE_CALLER_ENV_SCRUB:
+        env.pop(name, None)
+    return env
 
 
 def _resolve_monoserver_layer() -> str:
@@ -723,7 +742,7 @@ def compose_config(include_surfaces: bool, include_swimmers: bool = False) -> di
         args.extend(["--profile", "surfaces"])
     args.extend(["config", "--format", "json"])
 
-    result = run_command(args)
+    result = run_command(args, env=_compose_env())
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "docker compose config failed")
 

@@ -33,7 +33,8 @@ entry.
    chooser offers it) and answer the four prompts below.
 2. **Helper script** — run [`scripts/field-report.sh`](../../scripts/field-report.sh),
    which walks you through the fields and appends a JSONL row to
-   [`reports.jsonl`](reports.jsonl).
+   `reports.jsonl` (local intake data, deliberately untracked — see
+   `.gitignore`).
 3. **Copy the template** — duplicate [`TEMPLATE.md`](TEMPLATE.md), fill it in, and
    attach it to an issue or PR.
 

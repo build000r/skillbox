@@ -38,7 +38,7 @@ class ClipboardRouteExecTests(unittest.TestCase):
                 [os.environ.get("PYTHON", "python3"), "-c", script],
                 profile="d3",
                 transport="ssh",
-                target="skillbox@skillbox-portfolio-devbox",
+                target="skillbox@portfolio-devbox.example",
                 remote_session=None,
                 remote_home=None,
                 hosts_path=HOSTS,

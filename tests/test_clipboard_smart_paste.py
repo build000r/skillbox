@@ -188,7 +188,7 @@ class ClipboardSmartPasteTests(unittest.TestCase):
             }
 
         receipt = self.smart(capture_fn=self.image_capture(), transfer_fn=transfer)
-        self.assertEqual(transfers[0][1], "skillbox@skillbox-portfolio-devbox")
+        self.assertEqual(transfers[0][1], "skillbox@portfolio-devbox.example")
         self.assertEqual(
             self.tmux.injections,
             [
