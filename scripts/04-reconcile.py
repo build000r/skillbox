@@ -601,7 +601,12 @@ def build_model() -> dict[str, Any]:
     # compose-* checks compare against the container view, so force this alignment after
     # the operator overlay.
     runtime_env["SKILLBOX_CLIENTS_HOST_ROOT"] = expected_env["SKILLBOX_CLIENTS_ROOT"]
-    state_root = str(storage.get("state_root") or "").strip()
+    # The operator `.env` may relocate the state root (SKILLBOX_STATE_ROOT); the
+    # live compose resolves mounts against that value (via --env-file), so the
+    # expected mounts must use the same root or every state-backed mount drifts.
+    state_root = str(
+        runtime_env.get("SKILLBOX_STATE_ROOT") or storage.get("state_root") or ""
+    ).strip()
 
     def compose_mount_source(binding: dict[str, Any]) -> str:
         resolved_host_path = str(binding.get("resolved_host_path") or "").strip()
@@ -676,14 +681,33 @@ def build_model() -> dict[str, Any]:
     }
 
 
-def run_command(args: list[str]) -> subprocess.CompletedProcess[str]:
+def run_command(
+    args: list[str], env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         args,
         cwd=ROOT_DIR,
         capture_output=True,
         text=True,
         check=False,
+        env=env,
     )
+
+
+# The sbp wrapper exports these with their HOST-view meaning (repo universe on
+# the box), but the compose files interpolate the same names as CONTAINER-view
+# paths (mount point, default /monoserver). If the caller's shell values leak
+# into `docker compose config`, the drift verdict depends on who invoked the
+# doctor. Compose parity must be judged against tracked defaults + the operator
+# --env-file only, so scrub exactly this collision pair from the shell env.
+_COMPOSE_CALLER_ENV_SCRUB = ("SKILLBOX_MONOSERVER_ROOT", "SKILLBOX_MONOSERVER_HOST_ROOT")
+
+
+def _compose_env() -> dict[str, str]:
+    env = dict(os.environ)
+    for name in _COMPOSE_CALLER_ENV_SCRUB:
+        env.pop(name, None)
+    return env
 
 
 def _resolve_monoserver_layer() -> str:
@@ -707,13 +731,18 @@ def compose_config(include_surfaces: bool, include_swimmers: bool = False) -> di
 
     monoserver_layer = _resolve_monoserver_layer()
     args = ["docker", "compose", "-f", "docker-compose.yml", "-f", monoserver_layer]
+    # Mirror the Makefile's _ENV_FILE_ARG: the operator `.env` lives outside the
+    # workspace bind mount, so compose only sees its overrides when told where it is.
+    operator_env = _operator_env_path()
+    if operator_env.is_file():
+        args.extend(["--env-file", str(operator_env)])
     if include_swimmers:
         args.extend(["-f", "docker-compose.swimmers.yml"])
     if include_surfaces:
         args.extend(["--profile", "surfaces"])
     args.extend(["config", "--format", "json"])
 
-    result = run_command(args)
+    result = run_command(args, env=_compose_env())
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "docker compose config failed")
 
@@ -953,9 +982,22 @@ def _workspace_compose_issues(base_config: dict[str, Any], model: dict[str, Any]
     for expected_mount in model["expected_mounts"]:
         target = expected_mount["target"]
         source = expected_mount["source"]
-        if mounts.get(target) != source:
+        actual = mounts.get(target)
+        if actual != source and not _same_host_dir(actual, source):
             issues.append(f"workspace bind mount {source} -> {target} is missing or different")
     return issues
+
+
+def _same_host_dir(actual: str | None, expected: str) -> bool:
+    """True when two host paths name the same directory even through bind-mount or
+    state-root aliases (e.g. /srv/skillbox/... vs /srv/repos/...), where string and
+    symlink comparison both fail but device+inode agree."""
+    if not actual:
+        return False
+    try:
+        return os.path.samefile(actual, expected)
+    except OSError:
+        return False
 
 
 def _surface_compose_issues(surfaces_config: dict[str, Any], model: dict[str, Any]) -> list[str]:
@@ -1091,12 +1133,25 @@ def check_secrets_visible_in_workspace() -> CheckResult:
                 continue
 
     exposed: list[str] = []
+    foreign_app_env: list[str] = []
+    root_resolved = ROOT_DIR.resolve()
     for host_dir in host_sources:
         if not host_dir.is_dir():
             continue
         for name in OPERATOR_SECRET_FILENAMES:
-            if (host_dir / name).is_file() and name not in exposed:
-                exposed.append(name)
+            if not (host_dir / name).is_file():
+                continue
+            # Policy (skillbox-i704): operator secrets are `.env.box` anywhere and
+            # any secret filename at the skillbox root — those fail. A plain `.env`
+            # at another repo's mount root is that app's own runtime config, owned
+            # by that repo (relocating it would break the app), so it only warns.
+            if host_dir == root_resolved or name == ".env.box":
+                if name not in exposed:
+                    exposed.append(name)
+            else:
+                rel = str(host_dir / name)
+                if rel not in foreign_app_env:
+                    foreign_app_env.append(rel)
 
     if exposed:
         return CheckResult(
@@ -1106,15 +1161,73 @@ def check_secrets_visible_in_workspace() -> CheckResult:
                 "operator secret files are readable by in-container agents — they sit "
                 "inside a bind-mounted host directory"
             ),
-            details={"exposed": exposed},
+            details={"exposed": exposed, "foreign_app_env": foreign_app_env},
             fix_command=_secret_migration_fix_command(exposed),
+        )
+
+    if foreign_app_env:
+        return CheckResult(
+            status="warn",
+            code="secrets-visible-in-workspace",
+            message=(
+                "app-owned .env files sit at bind-mounted client repo roots; they are "
+                "those apps' runtime config (not skillbox operator secrets) and are "
+                "left in place by policy (skillbox-i704)"
+            ),
+            details={"exposed": [], "foreign_app_env": foreign_app_env},
         )
 
     return CheckResult(
         status="pass",
         code="secrets-visible-in-workspace",
         message="no operator secret files are exposed inside workspace bind mounts",
-        details={"exposed": []},
+        details={"exposed": [], "foreign_app_env": []},
+    )
+
+
+def check_operator_secret_containment() -> CheckResult:
+    """Fail when a legacy repo-root `.env.box` exists or when a relocated operator
+    secret file is group/other-accessible.
+
+    Compose-independent companion to check_secrets_visible_in_workspace: it guards
+    the sanctioned ${SKILLBOX_STATE_ROOT}/operator/ location itself (owner-only
+    permissions) and hard-fails on the one unambiguous in-mount credential file,
+    repo-root `.env.box`, even when `docker compose config` is unavailable.
+    """
+    issues: list[str] = []
+    fixes: list[str] = []
+
+    legacy_env_box = ROOT_DIR / ".env.box"
+    if legacy_env_box.is_file():
+        issues.append(f"legacy repo-root secret file exists inside the workspace mount: {legacy_env_box}")
+        fixes.append(_secret_migration_fix_command([".env.box"]))
+
+    operator_dir = (_operator_state_root() / "operator").resolve()
+    for name in OPERATOR_SECRET_FILENAMES:
+        secret_path = operator_dir / name
+        if not secret_path.is_file():
+            continue
+        mode = secret_path.stat().st_mode & 0o777
+        if mode & 0o077:
+            issues.append(
+                f"operator secret file {secret_path} is group/other-accessible (mode {mode:03o})"
+            )
+            fixes.append(f"chmod 600 {secret_path}")
+
+    if issues:
+        return CheckResult(
+            status="fail",
+            code="operator-secret-containment",
+            message="operator secret files are exposed or over-permissive",
+            details={"issues": issues},
+            fix_command=" && ".join(fixes),
+        )
+
+    return CheckResult(
+        status="pass",
+        code="operator-secret-containment",
+        message="no repo-root .env.box and relocated operator secrets are owner-only",
+        details={"issues": []},
     )
 
 
@@ -1157,7 +1270,13 @@ def check_skill_sync_dry_run(model: dict[str, Any]) -> CheckResult:
         status="pass",
         code="skill-repo-sync-dry-run",
         message="manage.py sync --dry-run can resolve the configured default skill-repo-set",
-        details={"preview": actions[:4]},
+        # sync --format json now emits action OBJECTS (skillbox-sync-actions-schema-fe3h).
+        # detail_lines() str()-joins this preview, so keep the human-readable text.
+        details={
+            "preview": [
+                a.get("text", a) if isinstance(a, dict) else a for a in actions[:4]
+            ]
+        },
     )
 
 
@@ -1305,6 +1424,9 @@ def check_reference_drift() -> CheckResult:
     }
     ignored_files = {
         "scripts/04-reconcile.py",
+        # Captured demo transcript legitimately contains this check's own
+        # PASS/FAIL message strings, not a stale script reference.
+        "examples/first-box-demo.md",
     }
 
     for path in ROOT_DIR.rglob("*"):
@@ -1580,6 +1702,7 @@ def doctor_results(skip_compose: bool, skip_skill_sync: bool) -> list[CheckResul
         check_reference_drift(),
         check_runtime_manager_model(model),
         check_runtime_manager_doctor(),
+        check_operator_secret_containment(),
     ]
 
     if skip_compose:

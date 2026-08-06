@@ -124,6 +124,28 @@ scripts/clipboard-bootstrap --profile d3 --apply-remote
 scripts/clipboard-closeout.sh
 ```
 
+### Cmd+V or Ctrl+V does not create an image attachment
+
+Run the truth surface first; it never prints clipboard bytes:
+
+```bash
+clipboard-paste status --profile d3
+clipboard-paste doctor --profile d3
+clipboard-paste explain --profile d3 --json
+```
+
+`network.containment` fails closed when `lsof` is unavailable or errors; it
+never treats a missing observation as proof that no listener exists. Likewise,
+`files.private_modes` rejects group/world-readable state directories or files,
+symlinks, and non-regular entries without following them.
+
+Then check that `ghostty +list-keybinds` shows the Skillbox `super+v` and
+`ctrl+v` private sequences, tmux shows `User198`/`User199`, and the focused
+pane was launched through tracked `d2`/`d3`. A stale or unknown route will keep
+native text paste but refuse image upload. Press the chord again to retry after
+repair; cancel an in-flight pane explicitly with
+`clipboard-smart-paste --cancel --pane %N --client /dev/ttysN`.
+
 ### Conference1 clipboard fails over SSH
 
 Use direct WSL (`worker@conference1-wsl`), not the `conference1-ssh` Windows wrapper.
@@ -131,14 +153,21 @@ The wrapper path is documented as OSC52-hostile. Probe:
 
 ```bash
 ssh conference1-wsl true
-ssh conference1-wsl 'command -v mosh-server'
 ```
+
+`d3 c` / `d2 c` default to SSH on that path. Do not treat `mosh-server` presence
+as proof the session should use mosh: `conference1-wsl` goes through a Windows
+SSH `ProxyCommand`, which cannot carry mosh UDP. Manual mosh is only for an
+operator who has already proven a non-proxy route
+(`DEVL_CONFERENCE_TRANSPORT=mosh d3 c`).
 
 ### `clipimg-put` fails or pastes wrong content
 
-- Must run on macOS with an image on the clipboard (PNG or TIFF).
+- This is the explicit recovery command, not the daily path.
+- It must run on macOS with an image on the clipboard (PNG or TIFF).
 - Uploads to `~/clipboard-images/` on the remote and puts the **remote path** on the Mac clipboard.
-- True binary paste through the terminal is not supported — paste the returned path into chat.
+- Paste the returned path into chat, or repair the one-key path with
+  `clipboard-paste doctor`.
 
 ## Limitations
 

@@ -42,5 +42,44 @@
     "graph_nodes": 2,
     "overall": "green",
     "snapshot_id": "golden-fixture"
+  },
+  "timing": {
+    "adapter_summary_keys": [
+      "adapter_count",
+      "collection_ms",
+      "durations_ms",
+      "slowest",
+      "statuses",
+      "sum_adapter_ms",
+      "timeouts",
+      "unavailable"
+    ],
+    "component_meta_keys": [
+      "elapsed_ms",
+      "compute_ms",
+      "end_to_end_ms",
+      "startup_ms",
+      "model_ms",
+      "adapter_collection_ms"
+    ],
+    "phase_names": [
+      "adapter_collection_ms",
+      "model_ms",
+      "startup_ms"
+    ],
+    "required_meta_keys": [
+      "adapter_collection_ms",
+      "compute_ms",
+      "elapsed_ms",
+      "end_to_end_ms",
+      "model_ms",
+      "startup_ms",
+      "timing"
+    ],
+    "timing_block_keys": [
+      "invocation_index",
+      "phases",
+      "process_start_source"
+    ]
   }
 }

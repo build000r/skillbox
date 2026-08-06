@@ -62,6 +62,7 @@ from .evidence import *
 from .forge import *
 from .swimmers_launch import launch_swimmers_batch, swimmers_launch_text_lines
 from .structure_doctor import run_structure_doctor, structure_doctor_text_lines
+from .skill_pull import SkillPullError, pull_host_skill, resolve_host_skills
 from .command_registry import registry_payload
 from .registry_docs import registry_docs_payload
 from .port_registry import port_registry_payload, port_registry_text_lines
@@ -72,7 +73,17 @@ from .agent_graph_engine import GRAPH_OUTPUT_FORMATS, graph_command_payload, ren
 from .agent_decisions import BRAIN_COMMAND_TARGET_ALIASES, explain_payload, next_action_payload
 from .agent_errors import brain_error_payload
 from .agent_search import search_payload
-from .agent_timing import attach_elapsed, timer_start
+from .agent_timing import (
+    PHASE_MODEL,
+    PHASE_STARTUP,
+    attach_component_timing,
+    attach_elapsed,
+    current_invocation,
+    invocation_startup_ms,
+    record_phase,
+    reset_invocation,
+    timer_start,
+)
 from .agent_snapshots import (
     SNAPSHOT_SCHEMA_VERSION,
     create_snapshot_payload,
@@ -151,9 +162,48 @@ def command_registry() -> dict[str, ManageCommandSpec]:
     return dict(sorted(_COMMAND_REGISTRY.items()))
 
 
+def _argv_requests_json(argv: list[str] | None = None) -> bool:
+    """True when the raw argv asks for JSON output (via --format json or a json alias).
+
+    Used to decide whether an argparse usage error should be rendered as a parseable
+    JSON error envelope on stdout instead of a plain-text usage block on stderr.
+    """
+    raw = list(sys.argv[1:] if argv is None else argv)
+    for index, token in enumerate(raw):
+        if token in JSON_FLAG_ALIASES:
+            return True
+        if token == "--format" and index + 1 < len(raw) and raw[index + 1] == "json":
+            return True
+        if token == "--format=json":
+            return True
+    return False
+
+
+# argparse usage errors are exit code 2 per the documented exit_code dictionary.
+_EXIT_USAGE = 2
+
+
 class SkillboxArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         command_hint = _command_suggestion_from_error(message)
+        if _argv_requests_json():
+            # Agents that pass --format json get a parseable recovery envelope on
+            # stdout instead of a plain-text usage block they'd have to scrape.
+            next_actions = ["manage.py capabilities --format json"]
+            suggestions: list[dict[str, Any]] | None = None
+            if command_hint:
+                next_actions.insert(0, f"manage.py {command_hint} --format json")
+                suggestions = [{"command": command_hint, "invoke": f"manage.py {command_hint}"}]
+            payload = brain_error_payload(
+                "2026-05-09",
+                "USAGE_ERROR",
+                message,
+                context={"prog": self.prog, "usage": self.format_usage().strip()},
+                next_actions=next_actions,
+                suggestions=suggestions,
+            )
+            emit_json(payload)
+            self.exit(_EXIT_USAGE)
         hint_lines = [
             "",
             "Agent hint: run `manage.py capabilities --json` for the machine-readable command contract.",
@@ -1228,9 +1278,24 @@ def _build_parser() -> argparse.ArgumentParser:
 
     snap_parser = subparsers.add_parser(
         "snap",
-        help="Create, diff, or replay redacted agent operations snapshots.",
+        help=(
+            "Redacted agent operations snapshot. Bare `snap --format json` creates a "
+            "read-only snapshot (like status/render); subcommands: create, diff, replay, actions."
+        ),
     )
     snap_parser.add_argument("--format", choices=("text", "json"), default="json")
+    # Sibling-consistency: allow the canonical create flags directly on bare `snap`
+    # so `snap --format json`, `snap --no-adapters`, `snap --write` all "just work"
+    # without an explicit `create` verb (skillbox-ej24). The `create` subcommand
+    # remains fully supported for backward compatibility.
+    snap_parser.add_argument("--name", "--label", dest="name", default=None)
+    snap_parser.add_argument("--created-at", default=None, help="Override timestamp for deterministic fixtures.")
+    snap_parser.add_argument("--write", action="store_true", help="Write the snapshot under .skillbox-state.")
+    snap_parser.add_argument("--cwd", default=None, help="Working directory used for evidence scoping.")
+    snap_parser.add_argument("--ntm-session", default=None, help="Optional NTM session id for load-state evidence.")
+    snap_parser.add_argument("--no-adapters", action="store_true", help="Skip optional br/bv/sbp/ntm adapters.")
+    _add_profile_arg(snap_parser)
+    _add_client_arg(snap_parser)
     snap_subparsers = snap_parser.add_subparsers(dest="snap_action")
     snap_create_parser = snap_subparsers.add_parser("create", help="Create a redacted runtime/evidence/graph snapshot.")
     snap_create_parser.add_argument("--format", choices=("text", "json"), default="json")
@@ -1254,6 +1319,12 @@ def _build_parser() -> argparse.ArgumentParser:
     snap_replay_parser.add_argument("--format", choices=("text", "json"), default="json")
     _add_profile_arg(snap_replay_parser)
     _add_client_arg(snap_replay_parser)
+    snap_actions_parser = snap_subparsers.add_parser(
+        "actions", help="List snap subcommands and safe first-try invocations (discovery)."
+    )
+    snap_actions_parser.add_argument("--format", choices=("text", "json"), default="json")
+    _add_profile_arg(snap_actions_parser)
+    _add_client_arg(snap_actions_parser)
 
     mmdx_parser = subparsers.add_parser(
         "mmdx",
@@ -1589,6 +1660,21 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_profile_arg(skill_why_parser)
     _add_client_arg(skill_why_parser)
     _add_cwd_arg(skill_why_parser)
+
+    skill_resolve_parser = skill_subparsers.add_parser(
+        "resolve",
+        help="Resolve the current host skill catalog without changing visibility or links.",
+    )
+    skill_resolve_parser.add_argument("--format", choices=("json",), default="json")
+    _add_cwd_arg(skill_resolve_parser)
+
+    skill_pull_parser = skill_subparsers.add_parser(
+        "pull",
+        help="Read one admitted skill as a verified current-session packet without mutation.",
+    )
+    skill_pull_parser.add_argument("skill_name")
+    skill_pull_parser.add_argument("--format", choices=("json",), default="json")
+    _add_cwd_arg(skill_pull_parser)
 
     skill_togglable_parser = skill_subparsers.add_parser(
         "togglable",
@@ -3330,7 +3416,8 @@ def _capabilities_payload(root_dir: Path, *, compact: bool = False) -> dict[str,
             "python3 .env-manager/manage.py robot-docs guide",
         ],
     }
-    return attach_elapsed(payload, start)
+    attach_elapsed(payload, start)
+    return attach_component_timing(payload)
 
 
 def _safe_first_try_command(name: str) -> str:
@@ -3345,7 +3432,7 @@ def _safe_first_try_command(name: str) -> str:
     if name == "explain":
         return "manage.py explain brain.next --format json --no-adapters"
     if name == "snap":
-        return "manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json"
+        return "manage.py snap --format json --no-adapters"
     if name == "registry-docs":
         return "manage.py registry-docs --format md"
     if name in {"client-init"}:
@@ -3413,6 +3500,7 @@ Useful command families:
   graph --format json           Inspect the agent operations graph.
   explain <node> --format json  Explain graph nodes, Beads, tools, and commands.
   search <query> --format json  Search commands, graph nodes, docs, Beads, evidence.
+  snap --format json            Create a read-only agent-ops snapshot (like status/render).
   snap replay <file>            Replay redacted snapshot fixtures without live services.
   status --format json          Compact runtime state.
   doctor --format json          Runtime validation checks.
@@ -3907,19 +3995,25 @@ def _handle_render(args: argparse.Namespace, root_dir: Path, model: dict[str, An
 
 
 def _handle_sync(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
-    actions = sync_runtime(model, dry_run=args.dry_run)
-    actions.extend(
-        sync_context(
-            model,
-            root_dir,
-            dry_run=args.dry_run,
-            context_dir=resolve_context_dir(root_dir, getattr(args, "context_dir", None)),
+    # `.actions` is a list of OBJECTS (id/action/kind/text/...), never strings:
+    # machine consumers assert on `.id`, display consumers read `.text`.
+    # `runtime_ops.action_texts()` reproduces the previous text output verbatim.
+    records = sync_runtime_records(model, dry_run=args.dry_run)
+    records.extend(
+        action_records(
+            sync_context(
+                model,
+                root_dir,
+                dry_run=args.dry_run,
+                context_dir=resolve_context_dir(root_dir, getattr(args, "context_dir", None)),
+            ),
+            kind="context",
         )
     )
     if args.format == "json":
-        emit_json({"actions": actions, "dry_run": args.dry_run, "next_actions": next_actions_for_sync()})
+        emit_json({"actions": records, "dry_run": args.dry_run, "next_actions": next_actions_for_sync()})
     else:
-        print("\n".join(actions))
+        print("\n".join(action_texts(records)))
     return EXIT_OK
 
 
@@ -4199,6 +4293,9 @@ def _write_runtime_evidence_artifact(root_dir: Path, payload: dict[str, Any], ru
 def _brain_adapters_for_args(root_dir: Path, model: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     if bool(getattr(args, "no_adapters", False)):
         return {}
+    # collect_agent_adapter_evidence records adapter_collection_ms and the
+    # per-adapter roll-up on the invocation recorder itself, so nothing is timed
+    # twice here.
     payload = collect_agent_adapter_evidence(
         root_dir,
         model=model,
@@ -4213,10 +4310,20 @@ def _brain_graph_payload(model: dict[str, Any], adapters: dict[str, Any]) -> dic
 
 
 def _print_next_text(payload: dict[str, Any]) -> None:
+    cautions = payload.get("cautions") or []
     print(
         f"next: {payload['summary']['returned']}/{payload['summary']['recommendation_count']} "
         f"recommendations"
+        + (f" ({len(cautions)} caution(s))" if cautions else "")
     )
+    if cautions:
+        print("cautions:")
+        for item in cautions:
+            print(f"- {item['id']}: {item['title']}")
+            for reason in item.get("reasons") or []:
+                print(f"  reason: {reason}")
+            for command in item.get("commands") or []:
+                print(f"  command: {command}")
     for item in payload.get("recommendations") or []:
         print(f"- {item['id']} score={item['score']} risk={item['risk']} side_effect={item['side_effect']}")
         for reason in item.get("reasons") or []:
@@ -4269,6 +4376,7 @@ def _handle_next(args: argparse.Namespace, root_dir: Path, model: dict[str, Any]
         adapters=adapters,
         limit=max(0, int(getattr(args, "limit", 5))),
     )
+    attach_component_timing(payload)
     if args.format == "json":
         emit_json(payload)
     else:
@@ -4288,6 +4396,7 @@ def _handle_graph(args: argparse.Namespace, root_dir: Path, model: dict[str, Any
         target=getattr(args, "target", None),
         blocked_nodes=getattr(args, "blocked_node", None),
     )
+    attach_component_timing(payload)
     if args.format == "json":
         emit_json(payload)
     elif "error" in payload:
@@ -4361,6 +4470,7 @@ def _handle_explain_brain(args: argparse.Namespace, root_dir: Path, model: dict[
     adapters = _brain_adapters_for_args(root_dir, model, args)
     graph_payload = _brain_graph_payload(model, adapters)
     payload = explain_payload(graph_payload, args.target, adapters=adapters)
+    attach_component_timing(payload)
     if args.format == "json":
         emit_json(payload)
     else:
@@ -4434,6 +4544,7 @@ def _handle_search(args: argparse.Namespace, root_dir: Path, model: dict[str, An
         kind_filter=getattr(args, "kind_filter", []) or [],
         limit=max(0, int(getattr(args, "limit", 10))),
     )
+    attach_component_timing(payload)
     if args.format == "json":
         emit_json(payload)
     else:
@@ -4477,11 +4588,15 @@ def _snap_usage_payload(*, unknown_action: str | None = None) -> dict[str, Any]:
         "ok": True,
         "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "read_only_default": True,
-        "summary": "snap subcommands: create (dry-run unless --write), diff, replay",
+        "summary": (
+            "snap: bare `snap --format json` creates a read-only snapshot (like status/render). "
+            "Subcommands: create (dry-run unless --write), diff, replay, actions."
+        ),
+        "default_action": "create",
         "subcommands": subcommands,
         "actions": subcommands,
         "next_actions": [
-            "python3 .env-manager/manage.py snap --format json replay tests/goldens/agent_ops_snapshot.json",
+            "python3 .env-manager/manage.py snap --format json",
             "python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json",
             "python3 .env-manager/manage.py capabilities --format json",
         ],
@@ -4582,7 +4697,12 @@ def _load_snapshot_for_brain(path: Path) -> tuple[dict[str, Any] | None, dict[st
 def _handle_snap(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
     del resolved_mode
     snap_action = getattr(args, "snap_action", None)
+    # skillbox-ej24: bare `snap --format json` (no verb) now produces a read-only
+    # snapshot directly, matching sibling read-side surfaces (status/render/doctor).
+    # The `create` verb stays supported; `snap actions` surfaces the discovery menu.
     if not snap_action:
+        snap_action = "create"
+    if snap_action == "actions":
         payload = _snap_usage_payload() if args.format == "json" else _snap_action_required_text_payload()
     elif snap_action == "create":
         adapters = _brain_adapters_for_args(root_dir, model, args)
@@ -6198,6 +6318,25 @@ def _handle_skill_heal(
 
 def _handle_skill(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
     skill_action = str(args.skill_action)
+    if skill_action in {"resolve", "pull"}:
+        try:
+            if skill_action == "resolve":
+                payload = resolve_host_skills(
+                    model,
+                    cwd=getattr(args, "cwd", None) or os.getcwd(),
+                )
+            else:
+                payload = pull_host_skill(
+                    model,
+                    str(args.skill_name),
+                    cwd=getattr(args, "cwd", None) or os.getcwd(),
+                )
+        except SkillPullError as exc:
+            emit_json(exc.envelope())
+            return EXIT_ERROR
+        emit_json(payload)
+        return EXIT_OK
+
     if skill_action == "lint":
         payload = repo_skill_override_lint_payload(model, cwd=args.cwd)
         if args.format == "json":
@@ -7616,9 +7755,17 @@ def _active_clients_for_args(args: argparse.Namespace, model: dict[str, Any]) ->
 
 
 def _filtered_model_for_args(args: argparse.Namespace, root_dir: Path) -> dict[str, Any]:
-    model = build_runtime_model(root_dir)
-    active_profiles = normalize_active_profiles(getattr(args, "profile", []))
-    return filter_model(model, active_profiles, _active_clients_for_args(args, model))
+    # The model is built exactly once per invocation; timing it in place keeps
+    # model_ms truthful without a second build.
+    with current_invocation().phase(PHASE_MODEL):
+        model = build_runtime_model(root_dir)
+        # Catalog resolution must retain every declared candidate so inactive or
+        # broken source rows can be represented as omitted SkillDecisions.
+        # Explicit pull remains profile/client filtered below.
+        if args.command == "skill" and getattr(args, "skill_action", None) == "resolve":
+            return model
+        active_profiles = normalize_active_profiles(getattr(args, "profile", []))
+        return filter_model(model, active_profiles, _active_clients_for_args(args, model))
 
 
 def _dispatch_model_command(
@@ -7664,6 +7811,12 @@ def _dispatch_registered_command(args: argparse.Namespace, root_dir: Path, resol
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Re-baseline the invocation clock, then bank everything spent before this
+    # line (interpreter boot + module imports) as startup -- the slice
+    # meta.elapsed_ms could never see. A warm in-process re-entry (the MCP
+    # server calls main() repeatedly) correctly pays zero startup.
+    reset_invocation()
+    record_phase(PHASE_STARTUP, invocation_startup_ms())
     parser = _build_parser()
     normalized_argv, diagnostics = _normalize_agent_argv(argv)
     args = parser.parse_args(normalized_argv)

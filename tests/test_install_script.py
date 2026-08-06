@@ -302,6 +302,131 @@ class InstallScriptTests(unittest.TestCase):
             self.assertEqual((bin_dir / "sbo").resolve(), (repo_dir / "scripts" / "sbo").resolve())
             self.assertIn("wrappers: ok", result.stdout)
 
+    def test_quiet_install_emits_no_output_on_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            self._write_fake_source(source_dir)
+
+            result = self._run(
+                "--source-dir",
+                str(source_dir),
+                "--repo-dir",
+                str(root / "skillbox"),
+                "--private-path",
+                str(root / "skillbox-config"),
+                "--client",
+                "personal",
+                "--skip-build",
+                "--skip-up",
+                "--quiet",
+                "--no-gum",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(result.stderr, "")
+
+    def test_lock_held_by_live_process_blocks_install(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            self._write_fake_source(source_dir)
+            lock_tmp = root / "tmp"
+            lock_tmp.mkdir()
+            lock_dir = lock_tmp / "skillbox-install.lock"
+            lock_dir.mkdir()
+            (lock_dir / "pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+            result = self._run(
+                "--source-dir",
+                str(source_dir),
+                "--repo-dir",
+                str(root / "skillbox"),
+                "--private-path",
+                str(root / "skillbox-config"),
+                "--client",
+                "personal",
+                "--skip-build",
+                "--skip-up",
+                "--dry-run",
+                "--no-gum",
+                tmpdir=str(lock_tmp),
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("appears to be running", result.stderr)
+            self.assertIn(f"rm -rf {lock_dir}", result.stderr)
+            # Losing the lock race must not remove the other install's lock.
+            self.assertTrue(lock_dir.is_dir())
+            self.assertEqual(
+                (lock_dir / "pid").read_text(encoding="utf-8").strip(),
+                str(os.getpid()),
+            )
+
+    def test_stale_lock_from_dead_process_is_reclaimed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            self._write_fake_source(source_dir)
+            lock_tmp = root / "tmp"
+            lock_tmp.mkdir()
+            lock_dir = lock_tmp / "skillbox-install.lock"
+            lock_dir.mkdir()
+            probe = subprocess.Popen(["sleep", "0"])
+            probe.wait()
+            (lock_dir / "pid").write_text(f"{probe.pid}\n", encoding="utf-8")
+
+            result = self._run(
+                "--source-dir",
+                str(source_dir),
+                "--repo-dir",
+                str(root / "skillbox"),
+                "--private-path",
+                str(root / "skillbox-config"),
+                "--client",
+                "personal",
+                "--skip-build",
+                "--skip-up",
+                "--dry-run",
+                "--no-gum",
+                tmpdir=str(lock_tmp),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Reclaiming stale install lock", result.stdout + result.stderr)
+            self.assertIn("source: planned", result.stdout)
+            # Cleanup trap must release the reclaimed lock on exit.
+            self.assertFalse(lock_dir.exists())
+
+    def test_successful_install_leaves_no_temp_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            self._write_fake_source(source_dir)
+            lock_tmp = root / "tmp"
+            lock_tmp.mkdir()
+
+            result = self._run(
+                "--source-dir",
+                str(source_dir),
+                "--repo-dir",
+                str(root / "skillbox"),
+                "--private-path",
+                str(root / "skillbox-config"),
+                "--client",
+                "personal",
+                "--skip-build",
+                "--skip-up",
+                "--no-gum",
+                tmpdir=str(lock_tmp),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # Lock dir, mktemp dirs, and the first-box JSON capture file must
+            # all be cleaned up by the EXIT trap.
+            self.assertEqual(os.listdir(lock_tmp), [])
+
     def _write_fake_source(self, source_dir: Path) -> None:
         (source_dir / ".env-manager").mkdir(parents=True, exist_ok=True)
         (source_dir / "scripts").mkdir(parents=True, exist_ok=True)
@@ -377,22 +502,34 @@ raise SystemExit(2)
             encoding="utf-8",
         )
 
-    def _run(self, *args: str, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    def _run(
+        self,
+        *args: str,
+        extra_env: dict[str, str] | None = None,
+        tmpdir: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.setdefault("TERM", "dumb")
         if extra_env:
             env.update(extra_env)
-        with tempfile.TemporaryDirectory() as lock_tmp:
-            env["TMPDIR"] = lock_tmp
-            return subprocess.run(
-                ["bash", str(INSTALL_SCRIPT), *args],
-                cwd=ROOT_DIR,
-                env=env,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=300,
-            )
+        if tmpdir is None:
+            with tempfile.TemporaryDirectory() as lock_tmp:
+                env["TMPDIR"] = lock_tmp
+                return self._invoke(args, env)
+        env["TMPDIR"] = tmpdir
+        return self._invoke(args, env)
+
+    @staticmethod
+    def _invoke(args: tuple[str, ...], env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), *args],
+            cwd=ROOT_DIR,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=300,
+        )
 
 
 class InstallScriptChecksumGateTests(unittest.TestCase):

@@ -160,10 +160,19 @@ Usage:
   __WRAPPER__ cass status|search|rebuild|doctor  Remote Cass front door.
                               Use status/search for active tasks; treat rebuild as
                               coordinated maintenance, not degraded-mode fallback.
+  __WRAPPER__ oracle "question" [args...]  Ask GPT-5 Pro; answer on stdout.
+                              Hidden browser, no paste. --model instant while
+                              iterating so Pro usage is not spent on tests;
+                              --project files the thread in a ChatGPT Project.
   __WRAPPER__ evidence [--repo P|--skill N] --format json  Measure skill invocations per
                               repo from Cass (contamination-safe), joined to current policy
   __WRAPPER__ cron [status|apply]     Declared crontab + script links from skillbox-config
   __WRAPPER__ send-later [list|doctor|new|panes] Schedule/inspect delayed/recurring tmux/NTM sends (--json on list/doctor/panes)
+  __WRAPPER__ safe [SECONDS]          Swarm load GO/NO-GO tick (wraps swarm-load-guard; e.g. safe 10)
+  __WRAPPER__ conference1 [urls|status|helper] Conference1 tailnet Serve endpoints, live
+                              read-only Serve/portproxy status over SSH, and the
+                              Swimmers heavy-build lane (aliases: conf1, tailnet;
+                              expose/remove require --yes; Funnel refused)
   __WRAPPER__ beads [status|init|sync] Check or initialize repo-local beads state
   __WRAPPER__ mmdx QUERY              Fuzzy-find and open .mmdx/.mmd from this cwd
   __WRAPPER__ mmdx                    List recent .mmdx/.mmd files from this repo
@@ -177,6 +186,9 @@ Skills:
   __WRAPPER__ skills audit            Scan downstream repos for skill policy drift
   __WRAPPER__ skill plan NAME         Preview where NAME would be linked
   __WRAPPER__ skill add NAME          Link NAME into global/project/category roots
+  __WRAPPER__ skill resolve           Resolve admitted host skills without mutation
+  __WRAPPER__ skill pull NAME         Read one admitted skill now without linking or activation
+  __WRAPPER__ skill activate NAME     Link NAME and return a session packet (mutates links)
   __WRAPPER__ skill why NAME          Explain visibility layers and exact fixes
   __WRAPPER__ skill togglable         List cwd-flippable skills and exact flip commands
   __WRAPPER__ skill what-if --repo R  Simulate overlay/pin visibility with zero writes
@@ -286,6 +298,16 @@ skill_verbs = {
         "survives_recalibrate": False,
         "when_to_use": "Use for an immediate one-session handoff when durability is not required.",
         "do_NOT": "Do not treat activate as durable repo state; use on or heal for that.",
+    },
+    "pull": {
+        "purpose": "Read one admitted skill as a verified current-session packet.",
+        "mutates": "none",
+        "links_disk": False,
+        "returns_packet": True,
+        "scope": "current cwd host policy",
+        "survives_recalibrate": False,
+        "when_to_use": "Use when the skill is needed now but durable visibility is not wanted.",
+        "do_NOT": "Do not treat pull as activation, linking, or a durable policy decision.",
     },
     "move": {
         "purpose": "Install/link a skill into a new scope and remove old installs for that skill.",
@@ -420,6 +442,7 @@ skill_verbs = {
 }
 payload = {
     "ok": True,
+    "mode": "host",
     "tool": f"skillbox-{wrapper}",
     "contract_version": "2026-05-11",
     "entrypoint": f"scripts/{wrapper}",
@@ -438,6 +461,7 @@ payload = {
         {"name": "bulk", "json": True, "safe_first_try": f"{wrapper} bulk <dir> <dir> --request '<prompt>' --dry-run --json", "alias_for": "launch"},
         {"name": "skills", "json": True, "safe_first_try": f"{wrapper} skills --issues-only --json"},
         {"name": "skill-why", "json": True, "safe_first_try": f"{wrapper} skill why <skill> --json"},
+        {"name": "skill-pull", "json": True, "safe_first_try": f"{wrapper} skill pull <skill> --format json"},
         {"name": "skill-togglable", "json": True, "safe_first_try": f"{wrapper} skill togglable --json"},
         {"name": "skill-what-if", "json": True, "safe_first_try": f"{wrapper} skill what-if --repo <repo-id-or-path> --overlay <overlay> --json"},
         {"name": "skill-heal", "json": True, "safe_first_try": f"{wrapper} skill heal <skill> --dry-run --format json"},
@@ -453,6 +477,8 @@ payload = {
         {"name": "evidence", "json": True, "safe_first_try": f"{wrapper} evidence --repo <path> --format json"},
         {"name": "cron", "json": True, "safe_first_try": f"{wrapper} cron status --json"},
         {"name": "send-later", "json": True, "safe_first_try": f"{wrapper} send-later list --json"},
+        {"name": "safe", "json": True, "safe_first_try": f"{wrapper} safe --json", "aliases": ["load-guard", "swarm-safe"], "notes": "One-shot load gate; pass SECONDS to watch (sbp safe 10). Exit 0=GO, 1=NO-GO."},
+        {"name": "conference1", "json": True, "safe_first_try": f"{wrapper} conference1 status --json", "aliases": ["conf1", "tailnet"], "notes": "urls/status/helper are read-only; expose/remove require --yes; Funnel refused."},
         {"name": "recalibrate", "json": True, "safe_first_try": f"{wrapper} recalibrate --json"},
     ],
     "agent_surfaces": {
@@ -521,7 +547,8 @@ Safe mutation pattern:
 
 Skill verb contract:
   Machine map: ${wrapper_name} capabilities --json | jq .skill_verbs
-  Read-only: recalibrate, plan, lint, why
+  Read-only: recalibrate, plan, lint, why, resolve, pull
+  Current-session read: pull (mutates=none, links_disk=false, returns_packet=true)
   Session handoff: activate (mutates=cwd-ephemeral, returns_packet=true)
   Durable repo pins: on, off, heal (survive recalibrate)
   Durable defaults: default on/off <skill> --repo|--repos IDS|--category NAME|--global (diff first; --global needs --yes)
@@ -662,6 +689,10 @@ case "${1:-}" in
     action="cass"
     shift
     ;;
+  oracle|ask)
+    action="oracle"
+    shift
+    ;;
   evidence)
     action="cass-evidence"
     shift
@@ -672,6 +703,14 @@ case "${1:-}" in
     ;;
   send-later|later|ntm-send-later)
     action="send-later"
+    shift
+    ;;
+  safe|load-guard|swarm-safe)
+    action="safe"
+    shift
+    ;;
+  conference1|conf1|tailnet)
+    action="conference1"
     shift
     ;;
   beads|br)
@@ -702,25 +741,36 @@ case "${1:-}" in
     ;;
   *)
     if [[ -n "${1:-}" ]]; then
+      suggestion=""
       case "${1}" in
-        statu|stats|state)
+        statu|stats|state|statuss)
           suggestion="status"
           ;;
-        log|logz)
+        log|logz|logss)
           suggestion="logs"
           ;;
-        skillz)
+        skillz|skill-audit|skils)
           suggestion="skills"
           ;;
-        mc)
+        mc|mcpp|mcps)
           suggestion="mcp"
           ;;
-        *)
-          suggestion="status"
+        recalibrat|recal|recalibarte)
+          suggestion="recalibrate"
+          ;;
+        doc|doctorr|docter)
+          suggestion="doctor"
+          ;;
+        cand|candidate)
+          suggestion="candidates"
           ;;
       esac
       echo "${wrapper_name}: unknown command '${1}'." >&2
-      echo "Did you mean: ${wrapper_name} ${suggestion} --json" >&2
+      # Only emit a "Did you mean" line when we have a plausible match; a canned
+      # suggestion for a genuinely-unknown command misleads agents (gkso).
+      if [[ -n "${suggestion}" ]]; then
+        echo "Did you mean: ${wrapper_name} ${suggestion} --json" >&2
+      fi
       echo "Discover commands: ${wrapper_name} capabilities --json" >&2
       exit 2
     fi
@@ -772,7 +822,7 @@ append_passthrough_token() {
           ;;
       esac
       ;;
-    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|mcp-sync|structure-doctor|repo-registry|cass|cass-evidence|cron|send-later|beads|mmdx|operator-booking|swimmers-launch|fleet)
+    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|mcp-sync|structure-doctor|repo-registry|cass|cass-evidence|oracle|cron|send-later|safe|conference1|beads|mmdx|operator-booking|swimmers-launch|fleet)
       passthrough_args+=("${token}")
       ;;
     *)
@@ -792,7 +842,7 @@ append_json_flag() {
       ;;
     capabilities|robot-triage)
       ;;
-    repo-registry|cass|cron)
+    repo-registry|cass|oracle|cron|safe|send-later)
       passthrough_args+=(--json)
       ;;
     *)
@@ -1019,7 +1069,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-if [[ ! -t 0 && "${action}" != "home" && "${action}" != "help" && "${action}" != "send-later" ]]; then
+if [[ ! -t 0 && "${action}" != "home" && "${action}" != "help" && "${action}" != "send-later" && "${action}" != "safe" && "${action}" != "conference1" ]]; then
   while IFS= read -r line; do
     line="${line//,/ }"
     # Intentional shell-word splitting for simple pipe-friendly wrapper input.
@@ -1076,6 +1126,17 @@ if [[ -n "${client}" ]]; then
   runtime_client_flags=(--client "${client}")
 else
   runtime_client_flags=(--cwd "${invoke_cwd}")
+fi
+
+if [[ -n "${SBP_REMOTE:-}" && "${action}" == "cass" ]]; then
+  python3 "${script_dir}/lib/sbp_client.py" \
+    --remote "${SBP_REMOTE}" cass "${passthrough_args[@]}"
+  exit $?
+fi
+if [[ -n "${SBP_REMOTE:-}" && "${action}" == "skill" && "${passthrough_args[0]:-}" == "pull" ]]; then
+  python3 "${script_dir}/lib/sbp_client.py" \
+    --remote "${SBP_REMOTE}" skill "${passthrough_args[@]}"
+  exit $?
 fi
 
 cd "${skillbox_root}"
@@ -1203,6 +1264,56 @@ PY
     fi
     python3 "${cass_wrapper}" "${passthrough_args[@]}"
     ;;
+  oracle)
+    # Ask GPT-5 Pro one question through the hidden browser lane. Prefer the
+    # repo copy so a checkout is self-contained; fall back to the activated
+    # skill in the operator home.
+    oracle_ask=""
+    for candidate in \
+      "${script_dir}/../../skills/deep-research-prompt/assets/scripts/oracle-ask.mjs" \
+      "${HOME}/.claude/skills/deep-research-prompt/assets/scripts/oracle-ask.mjs"; do
+      if [[ -f "${candidate}" ]]; then
+        oracle_ask="${candidate}"
+        break
+      fi
+    done
+    if [[ -z "${oracle_ask}" ]]; then
+      echo "${wrapper_name} oracle: deep-research-prompt is not available; activate the skill or check out opensource/skills" >&2
+      exit 1
+    fi
+    if [[ "${#passthrough_args[@]}" -eq 0 ]]; then
+      echo "${wrapper_name} oracle: needs a question, e.g. ${wrapper_name} oracle \"why is my p99 bimodal?\"" >&2
+      exit 2
+    fi
+    # Default the ChatGPT Project so answers stay trackable without --project.
+    # The overlay is cwd-matched, so fall back to the skills client root when
+    # invoked from elsewhere. Capture and test before eval: `eval "$(cmd)"`
+    # returns 0 even when cmd dies, which silently drops the whole config.
+    if [[ -z "${ORACLE_CHATGPT_PROJECT_URL:-}" ]]; then
+      overlay_resolver=""
+      for candidate in \
+        "${HOME}/.claude/skills/skill-issue/scripts/resolve_overlay_config.py" \
+        "${script_dir}/../../skills/skill-issue/scripts/resolve_overlay_config.py"; do
+        if [[ -f "${candidate}" ]]; then
+          overlay_resolver="${candidate}"
+          break
+        fi
+      done
+      if [[ -n "${overlay_resolver}" ]]; then
+        for match_cwd in "${invoke_cwd}" "${script_dir}/../../skills"; do
+          [[ -d "${match_cwd}" ]] || continue
+          overlay_env="$(python3 "${overlay_resolver}" --section oracle --cwd "${match_cwd}" --format env 2>/dev/null || true)"
+          if [[ -n "${overlay_env}" ]]; then
+            eval "${overlay_env}"
+            [[ -n "${ORACLE_CHATGPT_PROJECT_URL:-}" ]] && break
+          fi
+        done
+      fi
+    fi
+    # So the follow-up hint is copy-pasteable exactly as invoked here.
+    ORACLE_ASK_INVOKED_AS="${wrapper_name} oracle" \
+      node "${oracle_ask}" "${passthrough_args[@]}"
+    ;;
   cass-evidence)
     config_root="${SKILLBOX_CONFIG_ROOT:-${HOME}/repos/skillbox-config}"
     evidence_wrapper="${config_root}/scripts/sbp_evidence.py"
@@ -1221,6 +1332,14 @@ PY
     fi
     bash "${cron_wrapper}" "${passthrough_args[@]}"
     ;;
+  conference1)
+    conference1_helper="${script_dir}/lib/conference1_tailnet.py"
+    if [[ ! -f "${conference1_helper}" ]]; then
+      echo "${wrapper_name} conference1: missing helper at ${conference1_helper}" >&2
+      exit 1
+    fi
+    python3 "${conference1_helper}" "${passthrough_args[@]}"
+    ;;
   send-later)
     send_later_wrapper="${script_dir}/sbp_send_later.sh"
     if [[ ! -f "${send_later_wrapper}" ]]; then
@@ -1228,6 +1347,14 @@ PY
       exit 1
     fi
     bash "${send_later_wrapper}" "${passthrough_args[@]}"
+    ;;
+  safe)
+    safe_wrapper="${script_dir}/sbp_safe.sh"
+    if [[ ! -f "${safe_wrapper}" ]]; then
+      echo "${wrapper_name} safe: missing helper at ${safe_wrapper}" >&2
+      exit 1
+    fi
+    bash "${safe_wrapper}" "${passthrough_args[@]}"
     ;;
   repo-registry)
     config_root="${SKILLBOX_CONFIG_ROOT:-${HOME}/repos/skillbox-config}"
@@ -1560,7 +1687,34 @@ else:
     fi
     skill_action="${passthrough_args[0]}"
     skill_args=("${passthrough_args[@]:1}")
-    python3 .env-manager/manage.py skill "${skill_action}" "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${skill_args[@]}"
+    if [[ "${skill_action}" == "resolve" || "${skill_action}" == "pull" ]]; then
+      skill_route_cwd="${invoke_cwd}"
+      normalized_skill_args=()
+      index=0
+      while [[ ${index} -lt ${#skill_args[@]} ]]; do
+        token="${skill_args[$index]}"
+        case "${token}" in
+          --cwd)
+            index=$((index + 1))
+            if [[ ${index} -ge ${#skill_args[@]} ]]; then
+              echo "${wrapper_name} skill ${skill_action}: --cwd requires a path" >&2
+              exit 2
+            fi
+            skill_route_cwd="${skill_args[$index]}"
+            ;;
+          --cwd=*)
+            skill_route_cwd="${token#--cwd=}"
+            ;;
+          *)
+            normalized_skill_args+=("${token}")
+            ;;
+        esac
+        index=$((index + 1))
+      done
+      python3 .env-manager/manage.py skill "${skill_action}" --cwd "${skill_route_cwd}" "${normalized_skill_args[@]}"
+    else
+      python3 .env-manager/manage.py skill "${skill_action}" "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" "${skill_args[@]}"
+    fi
     ;;
   overlay)
     overlay_action="${passthrough_args[0]:-list}"

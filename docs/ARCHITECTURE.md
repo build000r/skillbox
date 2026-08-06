@@ -237,6 +237,92 @@ persistent binding even when absent on a given checkout.
 | `.skillbox-state/rch-adapter/` and `.skillbox-state/rch-canary/` | RCH staging/canary state for remote compilation helper workflows; written by `rch_adapter.py` and related tests/proofs. |
 | `.skillbox-state/pruned-skill-repo-extras-*` | Archive locations created by skill cleanup/prune workflows to preserve removed extras for review. |
 
+### 6.1 Mutation Boundary Inventory
+
+The table above says *where* state lives. `runtime_manager/state_mutation.py`
+says *who is allowed to change it, under which predicate, and who owns the final
+write*. It classifies all **178** public surfaces — 98 `manage` leaf commands, 4
+`pulse` subcommands, 15 `box` subcommands, 10 operator-MCP tools, 51 Make targets
+— into exactly four buckets:
+
+| Classification | Count | Meaning |
+|---|---|---|
+| `read` | 68 | Never writes persistent state. |
+| `true_dry_run` | 38 | Has a dry-run affordance and writes **nothing** when it is set. |
+| `unconditional_mutation` | 46 | Always writes on success; no preview mode exists. |
+| `conditional_mutation` | 26 | Writes only under a predicate — a flag, a confirmation, or *observed state*. Includes surfaces whose "dry run" is not write-free. |
+
+Every mutating row carries a stable `boundary_id`, its entry points, its
+canonical state-root source, the literal dry-run predicate (with `file:line`),
+its nested-call policy, its intended lease span, and its **final lock owner**.
+Other command contracts reference these IDs instead of maintaining a second
+mutation list.
+
+`tests/test_state_mutation_inventory.py` is the ratchet. It re-enumerates every
+surface from the live argparse trees, the `TOOLS` AST literal, and the Makefile
+text, and fails on any surface without a manifest row — so a new command cannot
+land unclassified. Synthetic "new command" and "wrapper bypass" fixtures assert
+the detectors still fire. Rendering the manifest twice is byte-identical
+(`render_manifest() == render_manifest()`); nothing in it carries a timestamp,
+a hostname, or an absolute host path.
+
+**This is an inventory, not a lease.** No locking is implemented in
+`state_mutation.py`; `lock_owner` records what is true today, and `UNOWNED` is
+the common and honest answer. Write *primitives* (`atomic_write_json`,
+`write_json_file`, `write_text_file`, `_append_jsonl`) are not boundaries — a
+boundary is something an operator or agent can invoke by name.
+
+What the inventory established, and what a future single-writer lease has to fix:
+
+- **The two "locked" helpers are per-file, not per-state-root.**
+  `_shared/fs.locked_json_update` (`_shared/fs.py:329`) flocks a sidecar
+  `<path>.lock`; `lib/opslib.locked_inventory_update` (`scripts/lib/opslib.py:137`)
+  flocks `<inventory>.lock`. Neither excludes a writer touching a different file
+  under the same state root.
+- **Focus and pulse do not serialize against each other**, despite comments in
+  both claiming they do. Focus locks `workspace/.focus.json.lock`
+  (`workflows.py:3511`); pulse locks `logs/runtime/pulse.state.json.lock`
+  (`pulse.py:1498`). Different sidecars, zero mutual exclusion.
+- **Sessions, workers, the backup drill, and restore write outside both helpers.**
+  `_shared/session.py`, `_shared/worker.py`, and `state_backup.py` contain no
+  reference to either helper. `state-backup restore` renames the entire state
+  root aside and `shutil.rmtree`s the previous one (`state_backup.py:853`) with
+  every other writer live — the single highest-risk unowned write in the tree.
+- **Five different expressions resolve `SKILLBOX_STATE_ROOT`, with three
+  different fallbacks.** `scripts/box.py:797`, `scripts/operator_mcp_server.py:670`,
+  and `cli.py:4984` fall back to a **cwd-relative** `.skillbox-state`;
+  `scripts/self-test.sh:178` falls back to a **repo-relative** one;
+  `workflows.py:2386` has no fallback at all. They agree only when the process
+  cwd is the repo root.
+- **Several nominal reads write.** `pulse status` unlinks a stale pid file
+  (`pulse.py:303`) even though `pulse.py:1928` calls the bare invocation
+  read-only; `state-backup list` creates the backup root (`state_backup.py:690`);
+  `worker-status` / `worker-artifacts` reconcile a dead run to terminal and
+  persist it (`worker.py:711-712`); `box status --write-cache` defaults to *off*
+  at the CLI but *on* in the function signature (`box.py:4710`).
+- **Not every `--dry-run` is inert.** `skill default --repos/--category --dry-run`
+  writes a review marker (`cli.py:5068-5069`) that a later apply requires — by
+  design, but it is a write.
+- **Make and the MCP dry-run gate are not the same control surface.**
+  `make box-down BOX=id` reaches `scripts/box.py down` directly and never
+  consults the operator-MCP marker. Make gates nothing.
+- **`operator_compose_up` is the one mutating operator-MCP tool with no
+  `dry_run` parameter and no marker requirement**, asymmetric with
+  `operator_compose_down`.
+- **The only real cross-process lease in the tree today is `scripts/self-test.sh`,**
+  which flocks `${SKILLBOX_STATE_ROOT}/self-test/toolchain/.lock` (`self-test.sh:186`).
+
+**Resolved OWNED GAPS.** Both delegated boundaries were originally recorded as
+blocking gaps, classified pessimistically because bounding them appeared to
+require executing the delegate. Both were later resolved by *static reading* of
+the delegate sources, so `state_mutation.inventory_complete()` now returns
+`True` and `owned_gaps()` is empty.
+
+| Boundary | Resolution |
+|---|---|
+| `manage.cass-evidence` | **`read`.** `--proposals` is a print-only mode (`sbp_evidence.py:812-813`); `proposals()` computes, prints JSON and returns (`:747-787`). An AST sweep of the delegate found exactly one `open()`, in read mode (`:724`), and zero write primitives and zero `subprocess`. Its only child process is a fixed `cass search … --json` over ssh, and `search` is on the read-only verb allowlist. |
+| `manage.mmdx` | **`conditional_mutation`,** with a bounded window. The default invocation writes nothing: the detached bridge is spawned only under `--tmux` (`mmd.py:3015`), and without it the browser opens a remote URL with no local endpoint. Under `--tmux`, a detached grandchild serves `POST /source/write` (`mmd.py:923`) for at most `DEFAULT_HANDOFF_TTL_SECONDS` = 600s (`mmd.py:54`, enforced at `:1081` and `:931-933`), admitted by exact `Origin` plus a `secrets.token_urlsafe(24)` match, bound to one resolved path, capped at 512 KiB. |
+
 ## 7. Extension Recipes
 
 ### Add a Command

@@ -368,6 +368,56 @@ the server gate is authoritative.
 > Note: `posture-proof` and `box status` probes shell out through `box.py`'s
 > own SSH helpers, **not** through `operator_box_exec`, so this gate adds no
 > friction to fleet posture/health automation.
+## Local CI gate
+
+`scripts/self-test.sh` is the canonical authority for trusted-main checks. It
+runs the same lanes GitHub Actions runs — Ruff, ShellCheck, `04-reconcile.py
+render`, the 3.11/3.12/3.13 unit matrix with 3.12 coverage at `--fail-under=80`,
+and `docker compose config` — against an **isolated checkout of an exact commit
+SHA**, using a pinned tool matrix that is provisioned once and cached.
+
+```bash
+make self-test                 # gate HEAD, write a receipt
+make self-test REV=<rev>       # gate an explicit commit-ish
+make self-test-worktree        # overlay uncommitted changes (non-canonical)
+make self-test-refresh         # rebuild the pinned toolchain, then gate
+./scripts/self-test.sh --lane lint    # re-run one lane (recovery/debug)
+```
+
+Trigger topology after the cutover (bead `skillbox-6r53`):
+
+| Path | Where it runs | Why |
+|---|---|---|
+| Trusted-main commits | `scripts/self-test.sh` via `.githooks/pre-push` | No hosted minutes for code we already trust to run locally |
+| Pull requests | `.github/workflows/ci.yml` (`pull_request`) | Untrusted contributions still need the hosted trust boundary |
+| Manual recovery | `.github/workflows/ci.yml` (`workflow_dispatch`) | Escape hatch when the local toolchain is unavailable |
+| Releases | `.github/workflows/release.yml` (`v*` tags, `workflow_dispatch`) | Unchanged: OIDC keyless signing needs GitHub's identity |
+
+Details that matter:
+
+* **Pinned matrix.** Ruff, `shellcheck-py`, `coverage`, PyYAML, and
+  `cryptography` versions and the Python list live in `scripts/self-test.sh` and
+  are contract-tested for equality with `.github/workflows/ci.yml`
+  (`tests/test_self_test_gate.py`). The local gate can never become a smaller
+  matrix than the hosted one. Provisioning needs [`uv`](https://docs.astral.sh/uv/).
+* **Build once.** The toolchain is cached under
+  `.skillbox-state/self-test/toolchain` and keyed by a fingerprint of the pins;
+  a pin change or `--refresh` re-provisions it, and a stale cache is never
+  silently reused.
+* **Receipts.** Every run writes
+  `.skillbox-state/self-test/receipts/<sha>-<timestamp>.json` plus
+  `latest.json`, recording the commit, tree, source mode, trigger, toolchain
+  fingerprint, and per-lane exit codes. `$HOME` is redacted; the newest 50
+  receipts are kept. A run is `canonical` only when it gated a committed SHA
+  with the full lane set.
+* **Blocking pre-push.** `.githooks/pre-push` gates each non-deleting SHA git is
+  about to publish and blocks the push on failure. Install it with
+  `make install-hooks`. There is no env-var bypass; the emergency path is git's
+  own `git push --no-verify`.
+* **Recovery.** `--lane <id>` re-runs a single lane, `--refresh` rebuilds the
+  toolchain, and `workflow_dispatch` on the hosted CI workflow reproduces the
+  full matrix on GitHub if the local host cannot.
+
 ## Command Reference
 
 ### Make targets
@@ -375,6 +425,9 @@ the server gate is authoritative.
 | Command | What it does |
 |---|---|
 | `make bootstrap-env` | Copies `.env.example` to `.env` if needed |
+| `make self-test` | Runs the canonical local CI gate on an exact SHA (`REV=<rev>`) and writes a receipt |
+| `make self-test-worktree` | Runs the gate with uncommitted changes overlaid (non-canonical receipt) |
+| `make self-test-refresh` | Re-provisions the pinned self-test toolchain, then runs the gate |
 | `make render` | Prints the resolved sandbox model |
 | `make doctor` | Validates the outer repo shell: manifests, Compose wiring, and the default `skill-repo-set` sync path |
 | `make runtime-render` | Prints the resolved internal runtime graph |
@@ -542,8 +595,8 @@ fleet lifecycle tools. See the [Fleet Management](operations.md#fleet-management
 
 ## Clipboard bootstrap
 
-Skillbox owns OSC52 clipboard integration for operator Mac + Ghostty, SSH/mosh
-remotes, nested tmux, and Conference1 direct WSL. Source bundle:
+Skillbox owns seamless paste plus OSC52 copy for operator Mac + Ghostty,
+SSH/mosh remotes, nested tmux, and Conference1 direct WSL. Source bundle:
 `scripts/clipboard/`. Design contract: `docs/clipboard-bootstrap.md`.
 
 One-command bootstrap:
@@ -564,17 +617,77 @@ scripts/clipboard-bootstrap --profile generic --target user@host --dry-run
 
 Usage after install:
 
+- Existing tmux servers are never reloaded; relaunch the intended `d2`/`d3`
+  surface once, or deliberately pass `--reload-current-tmux` only when every
+  session on the current local server may change
+- Text/image paste: copy, focus the existing `d2`/`d3` pane, press `Cmd+V` or
+  `Ctrl+V`; the router never chooses a host or sends Enter
 - Text copy: `printf 'hello\n' | clipcopy` or tmux copy-mode `y` / Enter / mouse drag
 - Linux `pbcopy` shim on remotes delegates to `clipcopy`
-- Image transfer (Darwin only): screenshot then `clipimg-put d|s|j|c` — pastes the
-  **remote file path**, not binary image data through the terminal
+- Recovery only: `clipimg-put d|s|j|c` explicitly uploads and replaces the Mac
+  clipboard with a remote path
+- Truth surface: `clipboard-paste status|doctor|explain --profile d3`
+- Reversal: `scripts/clipboard-bootstrap uninstall` or `rollback`
 - Conference1: prefer direct `worker@conference1-wsl`; `conference1-ssh` Windows
   wrapper is OSC52-hostile fallback only
 
-Proof and regression:
+Proof and regression (two documented modes; see
+[clipboard-bootstrap.md](clipboard-bootstrap.md#closeout-gates-and-proof-commands)):
 
 ```bash
+# CI / source smoke — any Linux checkout; live paths recorded as SKIP with reasons
 scripts/clipboard-closeout.sh
+python3 -m unittest tests.test_clipboard_bootstrap tests.test_clipboard_closeout -v
+
+# Operator / live rollout proof — exercises real SSH/tmux/nested-tmux/image
+# paths; skipped core paths (d3, current-host migration, Ghostty, mosh) FAIL
+# the run. Full PASS requires the operator Mac.
+scripts/clipboard-closeout.sh --live
+```
+
+Durable per-run artifacts (JSON verdict + raw per-gate logs) land in
+`~/.local/state/skillbox/clipboard-closeout/<stamp>-<mode>/`. Remote profiles
+require the `~/.ssh/config` Host blocks documented in
+[clipboard-bootstrap.md](clipboard-bootstrap.md#prerequisites).
+
+### New-host clipboard adoption
+
+Clipboard bootstrap is an **explicit manual/agent-run step**. It is not wired
+into `install.sh`, `scripts/box.py`, or the env-manager lifecycle, and that is
+deliberate: host adoption surfaces are security-sensitive, clipboard
+integration is operator-optional, and remote writes should stay behind a
+conscious `--apply-remote` invocation rather than ride along with enrollment.
+
+Adopt a new host dry-run-first:
+
+```bash
+# 1. Plan (default for remote profiles; performs no remote writes)
+scripts/clipboard-bootstrap --profile d3
+
+# 2. Apply once the plan looks right (the only form that writes remotely)
+scripts/clipboard-bootstrap --profile d3 --apply-remote
+
+# Hosts without a named profile
+scripts/clipboard-bootstrap --profile generic --target user@host                 # plan
+scripts/clipboard-bootstrap --profile generic --target user@host --apply-remote  # apply
+
+# New full-capability single-user devbox (no registry edit required)
+scripts/clipboard-bootstrap --profile devbox --target skillbox@new-devbox --dry-run
+scripts/clipboard-bootstrap --profile devbox --target skillbox@new-devbox --apply-remote
+
+# Use that target through the normal one-gesture d2/d3 launcher path
+DEVL_TARGET=skillbox@new-devbox DEVL_CLIPBOARD_PROFILE=devbox \
+  DEVL_TRANSPORT=ssh DEVL_ROOT=/srv/repos d3
+```
+
+The complete configuration map, installed paths, durable named-profile recipe,
+and capability/trust rules are in
+[clipboard-bootstrap.md](clipboard-bootstrap.md#configuration-model).
+
+Validation from a fresh checkout (no SSH access or remote writes needed):
+
+```bash
+scripts/clipboard-bootstrap --profile d3
+# expected: the per-step plan plus "note: remote writes require --apply-remote", exit 0
 python3 -m unittest tests.test_clipboard_bootstrap -v
-scripts/clipboard-proof.sh --live   # operator Mac + Ghostty only
 ```

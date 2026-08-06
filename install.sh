@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install with:
-#   curl -fsSL https://raw.githubusercontent.com/example/skillbox/main/install.sh | bash -s -- --client personal
+#   curl -fsSL "https://raw.githubusercontent.com/build000r/skillbox/main/install.sh?$(date +%s)" | bash -s -- --client personal
 set -euo pipefail
 shopt -s lastpipe 2>/dev/null || true
 umask 022
@@ -8,10 +8,22 @@ umask 022
 PROJECT_NAME="skillbox"
 PROJECT_LABEL="skillbox installer"
 PROJECT_DESCRIPTION="Source-distributed bootstrap for first-box"
-DEFAULT_GITHUB_REPO="${SKILLBOX_INSTALL_GITHUB_REPO:-example/skillbox}"
+DEFAULT_GITHUB_REPO="${SKILLBOX_INSTALL_GITHUB_REPO:-build000r/skillbox}"
 DEFAULT_REPO_URL="${SKILLBOX_INSTALL_REPO_URL:-https://github.com/${DEFAULT_GITHUB_REPO}.git}"
 DEFAULT_REF_FALLBACK="main"
 MIN_DISK_KB=102400
+
+# Sigstore / cosign identity policy pinned to the GitHub Actions release
+# workflow's OIDC identity. A `.sigstore.json` bundle published beside a release
+# tarball must have been signed by this workflow running on the release repo, or
+# verification fails. Overridable for forks via SKILLBOX_INSTALL_SIGSTORE_* env.
+SIGSTORE_CERT_OIDC_ISSUER="${SKILLBOX_INSTALL_SIGSTORE_ISSUER:-https://token.actions.githubusercontent.com}"
+SIGSTORE_CERT_IDENTITY_REGEXP="${SKILLBOX_INSTALL_SIGSTORE_IDENTITY_REGEXP:-^https://github.com/${DEFAULT_GITHUB_REPO}/\\.github/workflows/release\\.yml@refs/tags/}"
+
+# Set to 1 by the release-asset download path when a checksum was verified
+# against a published SHA256SUMS file (so the generic verify_checksum gate can
+# be satisfied without a user-supplied --sha256).
+RELEASE_ASSET_VERIFIED=0
 
 QUIET=0
 NO_GUM=0
@@ -62,6 +74,7 @@ FIRST_BOX_OUTPUT_DIR=""
 FIRST_BOX_PRIVATE_REPO=""
 LOCK_DIR=""
 TEMP_DIR=""
+FIRST_BOX_JSON=""
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-${0:-}}"
 SCRIPT_PATH=""
 SCRIPT_DIR=""
@@ -210,7 +223,7 @@ warn() {
 
 err() {
   if [[ "${HAS_GUM}" -eq 1 && "${NO_GUM}" -eq 0 ]]; then
-    gum style --foreground 196 "ERR $*"
+    gum style --foreground 196 "ERR $*" >&2
   else
     printf '\033[0;31mERR\033[0m %s\n' "$*" >&2
   fi
@@ -284,6 +297,11 @@ verify_checksum() {
   local expected="$2"
   local actual=""
   if [[ -z "${expected}" ]]; then
+    if [[ "${RELEASE_ASSET_VERIFIED:-0}" -eq 1 ]]; then
+      # The release-asset download path already verified this file against a
+      # published SHA256SUMS entry; no user-provided digest is required.
+      return 0
+    fi
     if [[ "${ALLOW_UNVERIFIED}" -eq 1 ]]; then
       warn "No SHA256 provided for ${path}; skipping checksum verification (--allow-unverified)."
       return 0
@@ -316,7 +334,27 @@ maybe_verify_sigstore_bundle() {
     err "Install cosign or pass --allow-unverified to bypass."
     exit 1
   fi
-  warn "Sigstore bundle found for ${path}, but identity policy is not configured for source installs yet."
+  # Verify the blob signature against the pinned certificate identity/issuer for
+  # the release workflow's OIDC identity. A tampered artifact or a bundle signed
+  # by any other identity makes cosign exit non-zero, which fails the install.
+  if cosign verify-blob \
+    --bundle "${bundle_path}" \
+    --certificate-identity-regexp "${SIGSTORE_CERT_IDENTITY_REGEXP}" \
+    --certificate-oidc-issuer "${SIGSTORE_CERT_OIDC_ISSUER}" \
+    "${path}" >/dev/null 2>&1; then
+    ok "Verified sigstore signature for ${path} against pinned identity."
+    return 0
+  fi
+  if [[ "${ALLOW_UNVERIFIED}" -eq 1 ]]; then
+    warn "Sigstore verification failed for ${path}; continuing anyway (--allow-unverified)."
+    return 0
+  fi
+  err "Sigstore signature verification failed for ${path}."
+  err "Expected identity matching ${SIGSTORE_CERT_IDENTITY_REGEXP}"
+  err "with issuer ${SIGSTORE_CERT_OIDC_ISSUER}."
+  err "The artifact may be tampered with, or signed by an untrusted identity."
+  err "Pass --allow-unverified to bypass signature verification."
+  exit 1
 }
 
 check_disk_space() {
@@ -422,19 +460,41 @@ cleanup() {
   if [[ -n "${TEMP_DIR}" && -d "${TEMP_DIR}" ]]; then
     rm -rf "${TEMP_DIR}"
   fi
+  if [[ -n "${FIRST_BOX_JSON}" && -f "${FIRST_BOX_JSON}" ]]; then
+    rm -f "${FIRST_BOX_JSON}"
+  fi
   if [[ -n "${LOCK_DIR}" && -d "${LOCK_DIR}" ]]; then
-    rmdir "${LOCK_DIR}" >/dev/null 2>&1 || true
+    rm -rf "${LOCK_DIR}" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
 acquire_lock() {
   local base="${TMPDIR:-/tmp}"
-  LOCK_DIR="${base}/skillbox-install.lock"
-  if mkdir "${LOCK_DIR}" 2>/dev/null; then
+  local candidate="${base}/skillbox-install.lock"
+  local holder_pid=""
+
+  # Only assign LOCK_DIR once we own the lock; the cleanup trap must never
+  # remove a lock directory held by another running install.
+  if mkdir "${candidate}" 2>/dev/null; then
+    LOCK_DIR="${candidate}"
+    printf '%s\n' "$$" >"${LOCK_DIR}/pid"
     return 0
   fi
-  err "Another skillbox install appears to be running (${LOCK_DIR})."
+
+  holder_pid="$(cat "${candidate}/pid" 2>/dev/null || true)"
+  if [[ -n "${holder_pid}" ]] && ! kill -0 "${holder_pid}" 2>/dev/null; then
+    warn "Reclaiming stale install lock left by exited process ${holder_pid}."
+    rm -rf "${candidate}"
+    if mkdir "${candidate}" 2>/dev/null; then
+      LOCK_DIR="${candidate}"
+      printf '%s\n' "$$" >"${LOCK_DIR}/pid"
+      return 0
+    fi
+  fi
+
+  err "Another skillbox install appears to be running (${candidate}${holder_pid:+, pid ${holder_pid}})."
+  err "If no other install is running, remove the lock with: rm -rf ${candidate}"
   exit 1
 }
 
@@ -468,11 +528,72 @@ resolve_default_ref() {
   REF="${DEFAULT_REF_FALLBACK}"
 }
 
+# Fetch the published release tarball + SHA256SUMS (+ optional sigstore bundle)
+# for a tagged ref and verify the checksum by default (no user-supplied digest).
+# Returns 0 only when the release assets exist and the checksum verifies; any
+# missing asset or checksum mismatch returns non-zero so the caller can fall
+# back to the GitHub auto-generated archive. Downloaded files land alongside
+# ${dest} (which lives under the cleanup-tracked TEMP_DIR).
+download_release_assets() {
+  local dest="$1"
+  local tag="$2"
+  local base="https://github.com/${DEFAULT_GITHUB_REPO}/releases/download/${tag}"
+  local tarball_name="skillbox-${tag}.tar.gz"
+  local sums_path="${dest%/*}/SHA256SUMS"
+  local expected=""
+
+  # Published release tarball. Absence => no release asset for this tag.
+  if ! curl -fsSL "${PROXY_ARGS[@]}" "${base}/${tarball_name}" -o "${dest}"; then
+    return 1
+  fi
+  # Published checksums. If missing we cannot verify by default, so fall back.
+  if ! curl -fsSL "${PROXY_ARGS[@]}" "${base}/SHA256SUMS" -o "${sums_path}"; then
+    return 1
+  fi
+
+  expected="$(awk -v name="${tarball_name}" '
+    { fname = $2; sub(/^\*/, "", fname) }
+    fname == name { print $1; exit }
+  ' "${sums_path}")"
+  if [[ -z "${expected}" ]]; then
+    err "SHA256SUMS from release ${tag} has no entry for ${tarball_name}."
+    return 1
+  fi
+
+  # Verify against the published digest. Set the release-verified flag so the
+  # generic verify_checksum() gate is satisfied without a --sha256 argument.
+  if [[ "$(sha256_file "${dest}")" != "${expected}" ]]; then
+    err "Checksum mismatch for published release asset ${tarball_name}."
+    return 1
+  fi
+  RELEASE_ASSET_VERIFIED=1
+
+  # Best-effort fetch of the sigstore bundle so maybe_verify_sigstore_bundle can
+  # pin-verify the signature. A missing bundle is fine; a present one is enforced.
+  curl -fsSL "${PROXY_ARGS[@]}" "${base}/${tarball_name}.sigstore.json" \
+    -o "${dest}.sigstore.json" 2>/dev/null || true
+
+  ok "Fetched checksum-verified release asset ${tarball_name} (${tag})."
+  return 0
+}
+
 download_source_tarball() {
   local dest="$1"
   local url=""
   local ref_kind="tags"
   resolve_default_ref
+
+  # Prefer a published, checksummed release asset when a tagged release is
+  # targeted. This verifies by default with no user-provided digest. Only fall
+  # back to the GitHub auto-generated archive (which has no published SHA256)
+  # when no release asset exists for the resolved tag.
+  if [[ "${REF}" != "${DEFAULT_REF_FALLBACK}" ]] && have_cmd awk; then
+    if download_release_assets "${dest}" "${REF}"; then
+      return 0
+    fi
+    warn "No verified release asset for ${REF}; falling back to source archive."
+  fi
+
   if [[ "${REF}" == "${DEFAULT_REF_FALLBACK}" ]]; then
     ref_kind="heads"
   fi
@@ -620,7 +741,11 @@ extract_tarball_checkout() {
   local extract_root=""
 
   ensure_checkout_target_ready "${dest}"
-  TEMP_DIR="$(mktemp -d)"
+  # Reuse an existing temp dir (download path) so the cleanup trap removes
+  # everything; only allocate one when none exists yet (offline path).
+  if [[ -z "${TEMP_DIR}" ]]; then
+    TEMP_DIR="$(mktemp -d)"
+  fi
   mkdir -p "${TEMP_DIR}/extract"
   tar -xzf "${tarball}" -C "${TEMP_DIR}/extract"
   extract_root="$(find "${TEMP_DIR}/extract" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
@@ -1086,6 +1211,7 @@ run_verify() {
 }
 
 print_header() {
+  [[ "${QUIET}" -eq 1 ]] && return 0
   if [[ "${HAS_GUM}" -eq 1 && "${NO_GUM}" -eq 0 ]]; then
     gum style \
       --border normal \
@@ -1100,6 +1226,7 @@ print_header() {
 }
 
 print_summary() {
+  [[ "${QUIET}" -eq 1 ]] && return 0
   local lines=()
   lines+=("repo_dir: ${REPO_DIR}")
   lines+=("private_repo: ${FIRST_BOX_PRIVATE_REPO:-${PRIVATE_PATH}}")
@@ -1300,7 +1427,6 @@ ensure_local_state_layout "${REPO_DIR}"
 run_host_bootstrap "${REPO_DIR}"
 run_tailscale_setup "${REPO_DIR}"
 
-FIRST_BOX_JSON=""
 if [[ "${DRY_RUN}" -eq 0 ]]; then
   FIRST_BOX_JSON="$(mktemp)"
 fi

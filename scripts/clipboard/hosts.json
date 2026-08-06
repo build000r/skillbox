@@ -1,54 +1,175 @@
 {
-  "bundle_version": 1,
+  "bundle_version": 2,
+  "note": "Sanitized example registry: every *.example target is a placeholder. Operators keep a real registry outside this repo and point SKILLBOX_CLIPBOARD_HOSTS at it.",
   "source_dir": "scripts/clipboard",
   "profiles": {
     "local": {
       "label": "Operator Mac local install",
       "scope": "local",
-      "clipboard_capable": true
+      "transport": "local",
+      "broker_strategy": "local",
+      "display_strategy": "native",
+      "trust": "local",
+      "capabilities": {
+        "outbound": {"osc52_copy": true},
+        "inbound": {"smart_path_paste": true, "native_image_paste": true}
+      }
     },
     "d3": {
       "label": "d3 portfolio devbox",
-      "ssh_target": "skillbox@skillbox-portfolio-devbox",
+      "ssh_target": "skillbox@portfolio-devbox.example",
       "remote_home": "/home/skillbox",
       "transport": "ssh",
-      "clipboard_capable": true
+      "broker_strategy": "negotiated",
+      "display_strategy": "xvfb",
+      "requires_ssh_tunnel": true,
+      "trust": "allowlisted",
+      "capabilities": {
+        "outbound": {"osc52_copy": true},
+        "inbound": {"smart_path_paste": true, "native_image_paste": true}
+      }
+    },
+    "devbox": {
+      "label": "Named devbox reached through d2",
+      "scope": "nested",
+      "parent_profile": "d3",
+      "dynamic_target": true,
+      "remote_home": "/home/skillbox",
+      "transport": "ssh",
+      "broker_strategy": "negotiated",
+      "display_strategy": "xvfb",
+      "requires_ssh_tunnel": true,
+      "trust": "explicit",
+      "capabilities": {
+        "outbound": {"osc52_copy": true},
+        "inbound": {"smart_path_paste": true, "native_image_paste": true}
+      }
     },
     "sweet": {
       "label": "Sweet Potato",
-      "ssh_target": "aiops@sweet-potato-prod",
+      "ssh_target": "aiops@sweet-potato.example",
       "remote_home": "/home/aiops",
       "transport": "ssh",
-      "clipboard_capable": true
+      "broker_strategy": "negotiated",
+      "display_strategy": "xvfb",
+      "requires_ssh_tunnel": true,
+      "trust": "allowlisted",
+      "capabilities": {
+        "outbound": {"osc52_copy": true},
+        "inbound": {"smart_path_paste": true, "native_image_paste": true}
+      }
     },
     "jeremy": {
       "label": "Jeremy VPS",
-      "ssh_target": "skillbox@skillbox-jeremy-3",
+      "ssh_target": "skillbox@jeremy-vps.example",
       "remote_home": "/home/skillbox",
       "transport": "ssh",
-      "clipboard_capable": true
+      "broker_strategy": "negotiated",
+      "display_strategy": "xvfb",
+      "requires_ssh_tunnel": true,
+      "trust": "allowlisted",
+      "capabilities": {
+        "outbound": {"osc52_copy": true},
+        "inbound": {"smart_path_paste": true, "native_image_paste": true}
+      }
     },
     "conference1": {
       "label": "Conference1 direct WSL",
       "ssh_target": "worker@conference1-wsl",
       "remote_home": "/home/worker",
       "transport": "ssh",
-      "clipboard_capable": true,
-      "preferred": true
+      "preferred": true,
+      "broker_strategy": "negotiated",
+      "display_strategy": "xvfb",
+      "requires_ssh_tunnel": true,
+      "trust": "allowlisted",
+      "capabilities": {
+        "outbound": {"osc52_copy": true},
+        "inbound": {"smart_path_paste": true, "native_image_paste": true}
+      }
     },
     "conference1-fallback": {
       "label": "Conference1 Windows SSH wrapper",
       "ssh_target": "conference1-ssh",
       "remote_home": "/home/worker",
       "transport": "wsl",
-      "clipboard_capable": false,
       "fallback_only": true,
-      "osc52_hostile": true
+      "osc52_hostile": true,
+      "broker_strategy": "none",
+      "display_strategy": "none",
+      "trust": "unsupported",
+      "unsupported_reason": "Windows wrapper is OSC52-hostile and cannot own an exact WSL pane route",
+      "capabilities": {
+        "outbound": {"osc52_copy": false},
+        "inbound": {"smart_path_paste": false, "native_image_paste": false}
+      }
     },
     "generic": {
       "label": "Generic user@host",
       "scope": "remote",
-      "clipboard_capable": true
+      "dynamic_target": true,
+      "transport": "ssh",
+      "broker_strategy": "negotiated",
+      "display_strategy": "none",
+      "requires_ssh_tunnel": false,
+      "trust": "explicit",
+      "capabilities": {
+        "outbound": {"osc52_copy": true},
+        "inbound": {"smart_path_paste": false, "native_image_paste": false}
+      }
+    }
+  },
+  "aliases": {
+    "d": "d3",
+    "default": "d3",
+    "portfolio": "d3",
+    "portfolio-devbox.example": "d3",
+    "s": "sweet",
+    "sp": "sweet",
+    "sweet-potato": "sweet",
+    "sweet-potato.example": "sweet",
+    "j": "jeremy",
+    "jeremy-vps": "jeremy",
+    "jeremy-vps.example": "jeremy",
+    "jeremy-vps.example": "jeremy",
+    "c": "conference1",
+    "conf": "conference1",
+    "conference": "conference1",
+    "conference1-wsl": "conference1",
+    "conference1-ssh": "conference1-fallback"
+  },
+  "conference1_tailnet": {
+    "host": "conference1",
+    "role": "heavy-build and dev-surface target",
+    "os": "windows-with-wsl-ubuntu",
+    "magicdns": "conference1.tailexample.ts.net",
+    "tailscale_ip": "100.100.1.1",
+    "windows_ssh_target": "conference1-ssh",
+    "wsl_ssh_target": "worker@conference1-wsl",
+    "wsl_tailscale_ip": "100.100.1.2",
+    "serve_helper": "C:\\Users\\worker\\bin\\tailnet-serve.ps1",
+    "serve_helper_actions": ["list", "expose", "remove"],
+    "serve_backend_host": "127.0.0.1",
+    "serve_ports": [3000, 3001, 3170, 3210, 8050],
+    "portproxy_fallback": {
+      "listen_address": "100.100.1.1",
+      "list_command": "netsh interface portproxy show v4tov4",
+      "note": "Raw Tailscale-IP portproxy; fallback only when MagicDNS Serve is unavailable."
+    },
+    "swimmers_remote_rust": {
+      "host_env": "SWIMMERS_REMOTE_RUST_HOST",
+      "host_values": ["conference1-ssh", "worker@100.100.1.1"],
+      "build_side": "wsl-ubuntu",
+      "wsl_ssh_target": "worker@conference1-wsl",
+      "cargo_cache": "/var/tmp/swimmers-remote-rust-cache"
+    },
+    "security": {
+      "posture": "tailnet-only",
+      "rules": [
+        "Reach services through Tailscale Serve / MagicDNS URLs on the tailnet.",
+        "No 0.0.0.0 public binds; apps bind 127.0.0.1 and Serve proxies to them.",
+        "No Tailscale Funnel unless the operator explicitly requests it."
+      ]
     }
   },
   "conference_routing": {
@@ -57,22 +178,7 @@
     "fallback_alias": "conference1-ssh",
     "fallback_target": "conference1-ssh",
     "probe_reachability": "ssh -o BatchMode=yes -o ConnectTimeout=5 conference1-wsl true",
-    "probe_mosh": "ssh -o BatchMode=yes -o ConnectTimeout=5 conference1-wsl 'command -v mosh-server'",
-    "route_order": ["direct_wsl", "mosh_if_available", "fallback_ssh_wrapper"]
-  },
-  "clipimg_aliases": {
-    "d": "d3",
-    "default": "d3",
-    "devbox": "d3",
-    "portfolio": "d3",
-    "s": "sweet",
-    "sp": "sweet",
-    "sweet": "sweet",
-    "j": "jeremy",
-    "jeremy": "jeremy",
-    "c": "conference1",
-    "conf": "conference1",
-    "conference": "conference1",
-    "conference1": "conference1"
+    "route_order": ["direct_wsl", "fallback_ssh_wrapper"],
+    "notes": "Direct WSL uses profiles.conference1.transport (ssh). mosh is not auto-selected: conference1-wsl SSH goes through a Windows ProxyCommand that cannot carry mosh UDP."
   }
 }

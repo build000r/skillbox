@@ -1,0 +1,83 @@
+name: Release
+
+# Publishes checksummed, keyless-signed source tarballs as release assets so the
+# installer's git-less curl fallback (install.sh) can verify by default:
+#   * skillbox-<tag>.tar.gz                 deterministic source tree at the tag
+#   * SHA256SUMS                            sha256 manifest for the tarball
+#   * skillbox-<tag>.tar.gz.sigstore.json   cosign keyless signature bundle
+#
+# The sigstore bundle is signed with this workflow's GitHub Actions OIDC
+# identity. install.sh pins that identity via --certificate-identity-regexp /
+# --certificate-oidc-issuer:
+#   issuer:   https://token.actions.githubusercontent.com
+#   identity: ^https://github.com/build000r/skillbox/.github/workflows/release.yml@refs/tags/
+# Keep this workflow's path (.github/workflows/release.yml) and repo
+# (build000r/skillbox) in sync with SIGSTORE_CERT_IDENTITY_REGEXP in install.sh.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build release assets for"
+        required: true
+
+permissions:
+  contents: write   # create the release and upload assets
+  id-token: write   # request the OIDC token cosign uses for keyless signing
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "ref=${{ github.event.inputs.tag }}" >>"$GITHUB_OUTPUT"
+          else
+            echo "ref=${GITHUB_REF#refs/tags/}" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Build checksummed source tarball
+        run: bash scripts/make-release-tarball.sh "${{ steps.tag.outputs.ref }}" dist
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign tarball (keyless, OIDC) and produce sigstore bundle
+        env:
+          COSIGN_YES: "true"
+        run: |
+          cosign sign-blob \
+            --yes \
+            --bundle "dist/skillbox-${{ steps.tag.outputs.ref }}.tar.gz.sigstore.json" \
+            "dist/skillbox-${{ steps.tag.outputs.ref }}.tar.gz"
+
+      - name: Verify the bundle against the pinned identity (self-check)
+        run: |
+          cosign verify-blob \
+            --bundle "dist/skillbox-${{ steps.tag.outputs.ref }}.tar.gz.sigstore.json" \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yml@refs/tags/" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "dist/skillbox-${{ steps.tag.outputs.ref }}.tar.gz"
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.ref }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/skillbox-${{ steps.tag.outputs.ref }}.tar.gz
+            dist/SHA256SUMS
+            dist/skillbox-${{ steps.tag.outputs.ref }}.tar.gz.sigstore.json

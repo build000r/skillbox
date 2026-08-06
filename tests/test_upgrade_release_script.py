@@ -21,6 +21,15 @@ class UpgradeReleaseScriptTests(unittest.TestCase):
         self.assertIn("repo_lifecycle_target", script)
         self.assertIn('repo_dir="$(cd "${repo_dir}" && pwd -P)"', script)
 
+    def test_upgrade_release_seeds_env_into_operator_state_not_repo_root(self) -> None:
+        # skillbox-4c9s: a repo-root .env seed trips the secrets containment
+        # doctor checks on fresh upgrades; the seed must target the operator dir.
+        script = UPGRADE_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('cp "${REPO_DIR}/.env.example" "${OPERATOR_ENV_DIR}/.env"', script)
+        self.assertIn('chmod 600 "${OPERATOR_ENV_DIR}/.env"', script)
+        self.assertNotIn('cp "${REPO_DIR}/.env.example" "${REPO_DIR}/.env"', script)
+
     def test_upgrade_release_preserves_runtime_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -33,6 +42,7 @@ class UpgradeReleaseScriptTests(unittest.TestCase):
 
             env = dict(os.environ)
             env["SKILLBOX_TEST_EXPECT_PROFILE"] = "connectors"
+            env["TMPDIR"] = tmpdir
 
             result = subprocess.run(
                 [
@@ -100,6 +110,7 @@ class UpgradeReleaseScriptTests(unittest.TestCase):
 
             env = dict(os.environ)
             env["SKILLBOX_TEST_ACCEPTANCE_FAIL"] = "1"
+            env["TMPDIR"] = tmpdir
 
             result = subprocess.run(
                 [
@@ -151,6 +162,53 @@ class UpgradeReleaseScriptTests(unittest.TestCase):
             self.assertEqual((repo_dir / ".up-version").read_text(encoding="utf-8"), "old\n")
             self.assertFalse((repo_dir / ".build-version").exists())
             self.assertFalse((root / "skillbox.rollback").exists())
+
+    def test_upgrade_blocks_when_install_lock_held_by_live_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_dir = root / "skillbox"
+            self._write_repo(repo_dir, version="old")
+
+            archive_path = self._build_release_archive(root, version="new")
+            archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+
+            lock_tmp = root / "tmp"
+            lock_tmp.mkdir()
+            lock_dir = lock_tmp / "skillbox-install.lock"
+            lock_dir.mkdir()
+            (lock_dir / "pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+            env = dict(os.environ)
+            env["TMPDIR"] = str(lock_tmp)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(UPGRADE_SCRIPT),
+                    "--archive",
+                    str(archive_path),
+                    "--sha256",
+                    archive_sha256,
+                    "--repo-dir",
+                    str(repo_dir),
+                    "--client",
+                    "personal",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("appears to be running", result.stderr)
+            # The existing checkout must be untouched and the foreign lock kept.
+            self.assertEqual((repo_dir / "VERSION.txt").read_text(encoding="utf-8"), "old\n")
+            self.assertTrue(lock_dir.is_dir())
+            self.assertEqual(
+                (lock_dir / "pid").read_text(encoding="utf-8").strip(),
+                str(os.getpid()),
+            )
 
     def _build_release_archive(self, root: Path, *, version: str) -> Path:
         source_root = root / "archive-src" / "skillbox"

@@ -730,6 +730,106 @@ class RuntimePortVerificationTests(unittest.TestCase):
             ],
         )
 
+    def test_action_record_parses_human_readable_sync_actions(self) -> None:
+        # `sync --format json` emits `.actions` as OBJECTS. This pins the record
+        # schema every machine consumer asserts against.
+        record = runtime_ops_module.action_record(
+            "skip: /opt/bin/dcg (sync mode manual)",
+            kind="artifact",
+        )
+        self.assertEqual(
+            record,
+            {
+                "id": "dcg",
+                "action": "skip",
+                "kind": "artifact",
+                "text": "skip: /opt/bin/dcg (sync mode manual)",
+                "source": "",
+                "target": "/opt/bin/dcg",
+                "detail": "sync mode manual",
+            },
+        )
+
+        # An explicit model-entity id always wins over the id derived from text.
+        self.assertEqual(
+            runtime_ops_module.action_record(
+                "skip: /opt/bin/dcg (sync mode manual)",
+                action_id="dcg-bin",
+                kind="artifact",
+            )["id"],
+            "dcg-bin",
+        )
+
+        # Nested parens in the detail suffix stay balanced.
+        contract = runtime_ops_module.action_record("render-port-contract: /repo/.ports.env (2 service(s))")
+        self.assertEqual(contract["action"], "render-port-contract")
+        self.assertEqual(contract["detail"], "2 service(s)")
+
+        # `source -> target` forms take their id from the left-hand subject.
+        installed = runtime_ops_module.action_record("install-skill: lube -> /home/.claude/skills/lube")
+        self.assertEqual((installed["id"], installed["source"], installed["target"]), (
+            "lube",
+            "lube",
+            "/home/.claude/skills/lube",
+        ))
+
+        # Relative subjects are slugified whole so distinct subjects stay distinct.
+        self.assertEqual(runtime_ops_module.action_record("skill-repo-fetched: acme/skills")["id"], "acme-skills")
+
+        # A mapping producer (e.g. dcg_distribution.sync_action) passes through with
+        # its provenance fields intact.
+        passthrough = runtime_ops_module.normalize_action_record(
+            {"id": "dcg-bin", "action": "install", "version": "v0.6.7", "verified": True, "path": "/opt/bin/dcg"},
+            kind="dcg",
+        )
+        self.assertEqual(passthrough["id"], "dcg-bin")
+        self.assertEqual(passthrough["version"], "v0.6.7")
+        self.assertTrue(passthrough["verified"])
+        self.assertEqual(passthrough["text"], "install: /opt/bin/dcg")
+
+        # Every record carries a non-empty id, and text round-trips verbatim.
+        texts = ["exists: /srv/box", "install-skill: lube -> /home/.claude/skills/lube", "bare-verb"]
+        records = runtime_ops_module.action_records(texts, kind="repo")
+        self.assertTrue(all(record["id"] for record in records), records)
+        self.assertEqual(runtime_ops_module.action_texts(records), texts)
+
+    def test_sync_runtime_records_carry_model_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            log_dir = root / "logs"
+            model = {
+                "root_dir": str(root),
+                "repos": [],
+                "artifacts": [{"id": "dcg-bin"}],
+                "env_files": [],
+                "logs": [{"id": "runtime", "host_path": str(log_dir)}],
+            }
+            with (
+                mock.patch(
+                    "runtime_manager.runtime_ops.sync_artifact",
+                    return_value=["skip: /opt/bin/dcg (sync mode manual)"],
+                ),
+                mock.patch("runtime_manager.runtime_ops.sync_port_contracts", return_value=[]),
+                mock.patch("runtime_manager.runtime_ops.sync_skill_repo_sets", return_value=[]),
+                mock.patch("runtime_manager.runtime_ops._sync_distributor_sources", return_value=[]),
+                mock.patch("runtime_manager.runtime_ops.sync_skill_sets", return_value=[]),
+                mock.patch(
+                    "runtime_manager.runtime_ops.sync_dcg_config",
+                    return_value=["render-dcg-config: /repo/.dcg.toml (packs: core.git)"],
+                ),
+                mock.patch("runtime_manager.runtime_ops.sync_ingress_artifacts", return_value=[]),
+            ):
+                records = runtime_ops_module.sync_runtime_records(model, dry_run=True)
+
+        self.assertEqual(
+            [(record["id"], record["kind"]) for record in records],
+            [
+                ("dcg-bin", "artifact"),
+                ("runtime", "log"),
+                ("dcg-config", "dcg"),
+            ],
+        )
+
     def test_validate_task_state_reports_pending_blocked_and_pass_states(self) -> None:
         model = {
             "tasks": [
@@ -990,12 +1090,12 @@ class RuntimePortVerificationTests(unittest.TestCase):
     def test_runtime_box_access_falls_back_to_tailscale_status(self) -> None:
         tailscale_status = {
             "BackendState": "Running",
-            "TailscaleIPs": ["100.64.0.10", "fd7a:115c:a1e0::1"],
+            "TailscaleIPs": ["100.100.0.10", "fd7a:115c:a1e0::1"],
             "CurrentTailnet": {"Name": "example.github"},
             "Self": {
                 "HostName": "skillbox-dev",
                 "DNSName": "skillbox-dev.tailnet.test.",
-                "TailscaleIPs": ["100.64.0.10"],
+                "TailscaleIPs": ["100.100.0.10"],
             },
         }
         result = mock.Mock(returncode=0, stdout=json.dumps(tailscale_status), stderr="")
@@ -1006,9 +1106,9 @@ class RuntimePortVerificationTests(unittest.TestCase):
         ):
             access = runtime_ops_module.runtime_box_access_from_env({"SKILLBOX_SWIMMERS_PORT": "4444"})
 
-        self.assertEqual(access["tailscale_ip"], "100.64.0.10")
+        self.assertEqual(access["tailscale_ip"], "100.100.0.10")
         self.assertEqual(access["tailscale_hostname"], "skillbox-dev.tailnet.test")
-        self.assertEqual(access["phone_url"], "http://100.64.0.10:4444/")
+        self.assertEqual(access["phone_url"], "http://100.100.0.10:4444/")
         self.assertEqual(access["magicdns_url"], "http://skillbox-dev.tailnet.test:4444/")
         self.assertEqual(access["source"], "tailscale")
 
@@ -1090,29 +1190,29 @@ class RuntimePortVerificationTests(unittest.TestCase):
         warnings = endpoints_module.annotate_service_rows(
             model,
             rows,
-            box_access={"tailscale_ip": "100.64.0.10"},
+            box_access={"tailscale_ip": "100.100.0.10"},
         )
 
         by_id = {row["id"]: row for row in rows}
         self.assertEqual(by_id["example-web"]["endpoint"]["exposure"], "loopback-only")
         self.assertFalse(by_id["example-web"]["viewable_from_tailnet"])
         self.assertEqual(by_id["api"]["endpoint"]["exposure"], "wildcard-direct")
-        self.assertEqual(by_id["api"]["endpoint_url"], "http://100.64.0.10:9100")
+        self.assertEqual(by_id["api"]["endpoint_url"], "http://100.100.0.10:9100")
         self.assertTrue(by_id["api"]["endpoint"]["all_interfaces"])
         self.assertEqual(by_id["lan-api"]["endpoint"]["exposure"], "loopback-only")
         self.assertFalse(by_id["lan-api"]["viewable_from_tailnet"])
         self.assertEqual(by_id["wide-web"]["endpoint"]["exposure"], "wildcard-direct")
-        self.assertEqual(by_id["wide-web"]["endpoint_url"], "http://100.64.0.10:5175")
+        self.assertEqual(by_id["wide-web"]["endpoint_url"], "http://100.100.0.10:5175")
         self.assertTrue(by_id["wide-web"]["endpoint"]["all_interfaces"])
         self.assertEqual(
             by_id["wide-web"]["endpoint"]["ingress_routes"][0]["tailnet_url"],
-            "http://100.64.0.10:9080/",
+            "http://100.100.0.10:9080/",
         )
         self.assertTrue(by_id["wide-web"]["viewable_from_tailnet"])
         self.assertEqual(by_id["routed"]["endpoint"]["exposure"], "ingress-routed")
         self.assertEqual(by_id["routed"]["endpoint"]["ingress_routes"][0]["request_url"], "http://127.0.0.1:9080/routed")
-        self.assertEqual(by_id["routed"]["endpoint"]["ingress_routes"][0]["tailnet_url"], "http://100.64.0.10:9080/routed")
-        self.assertEqual(by_id["routed"]["endpoint_url"], "http://100.64.0.10:9080/routed")
+        self.assertEqual(by_id["routed"]["endpoint"]["ingress_routes"][0]["tailnet_url"], "http://100.100.0.10:9080/routed")
+        self.assertEqual(by_id["routed"]["endpoint_url"], "http://100.100.0.10:9080/routed")
         self.assertEqual(by_id["local-routed-web"]["endpoint"]["exposure"], "loopback-only")
         self.assertFalse(by_id["local-routed-web"]["viewable_from_tailnet"])
         self.assertEqual(len(warnings), 4)
@@ -1139,18 +1239,18 @@ class RuntimePortVerificationTests(unittest.TestCase):
             model,
             {"cycle-chef-web"},
             probe=False,
-            box_access={"tailscale_ip": "100.64.0.10"},
+            box_access={"tailscale_ip": "100.100.0.10"},
         )
 
         self.assertEqual(summary["apps"][0]["url"], "http://0.0.0.0:5175")
-        self.assertEqual(summary["apps"][0]["access_url"], "http://100.64.0.10:5175")
+        self.assertEqual(summary["apps"][0]["access_url"], "http://100.100.0.10:5175")
         self.assertEqual(summary["apps"][0]["exposure"], "wildcard-direct")
         self.assertTrue(summary["apps"][0]["endpoint"]["all_interfaces"])
         buffer = io.StringIO()
         with redirect_stdout(buffer):
             text_renderers_module.print_endpoint_summary(summary)
         output = buffer.getvalue()
-        self.assertIn("http://100.64.0.10:5175", output)
+        self.assertIn("http://100.100.0.10:5175", output)
         self.assertIn("wildcard-direct", output)
         self.assertNotIn("http://127.0.0.1:5175", output)
 
@@ -3515,7 +3615,7 @@ class RuntimeTextRendererHotspotTests(unittest.TestCase):
                     "pid": 123,
                     "depends_on": ["db"],
                     "bootstrap_tasks": ["sync"],
-                    "endpoint_url": "http://100.64.0.10:9100",
+                    "endpoint_url": "http://100.100.0.10:9100",
                     "exposure": "tailnet-direct",
                     "ownership_state": "covered",
                 },
@@ -3557,7 +3657,7 @@ class RuntimeTextRendererHotspotTests(unittest.TestCase):
         self.assertIn("  - sync: pending, depends on prepare", output)
         self.assertIn(
             "  - api [covered]: running (pid 123), depends on db, bootstrap sync -> "
-            "http://100.64.0.10:9100 [tailnet-direct]",
+            "http://100.100.0.10:9100 [tailnet-direct]",
             output,
         )
         self.assertIn("  - worker: declared (external process)", output)
@@ -3579,7 +3679,7 @@ class RuntimeTextRendererHotspotTests(unittest.TestCase):
                     "id": "api",
                     "result": "started",
                     "pid": 123,
-                    "endpoint": {"access_url": "http://100.64.0.10:9100", "exposure": "tailnet-direct"},
+                    "endpoint": {"access_url": "http://100.100.0.10:9100", "exposure": "tailnet-direct"},
                 },
                 {"id": "worker", "result": "skipped", "reason": "external"},
                 {"id": "cron"},
@@ -3594,7 +3694,7 @@ class RuntimeTextRendererHotspotTests(unittest.TestCase):
         self.assertIn("sync:\n  - clone repo\n  - write env", output)
         self.assertIn("tasks:\n  - prepare: done (/tmp/ready)\n  - sync: unknown", output)
         self.assertIn("services:", output)
-        self.assertIn("  - api: started (pid 123) -> http://100.64.0.10:9100 [tailnet-direct]", output)
+        self.assertIn("  - api: started (pid 123) -> http://100.100.0.10:9100 [tailnet-direct]", output)
         self.assertIn("  - worker: skipped (external)", output)
         self.assertIn("  - cron: unknown", output)
 
@@ -5641,6 +5741,220 @@ class OnboardWorkflowHotspotTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(emitted[0]["steps"], [{"step": "scaffold", "status": "fail", "detail": {"error": "bad client"}}])
         self.assertEqual(emitted[0]["error"]["message"], "bad client")
+
+
+class ProcScanHotspotTests(unittest.TestCase):
+    def test_process_forest_pids_finds_descendants_in_one_proc_pass(self) -> None:
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            with mock.patch.object(
+                runtime_ops_module,
+                "_proc_pid_ppid_map",
+                wraps=runtime_ops_module._proc_pid_ppid_map,
+            ) as pid_map:
+                forest = runtime_ops_module.process_forest_pids([os.getpid()])
+            self.assertEqual(pid_map.call_count, 1)
+            self.assertIn(os.getpid(), forest)
+            self.assertIn(child.pid, forest)
+        finally:
+            child.terminate()
+            child.wait(timeout=5)
+
+    def test_process_forest_pids_empty_input_returns_empty_set(self) -> None:
+        self.assertEqual(runtime_ops_module.process_forest_pids([]), set())
+
+    def test_process_tree_pids_matches_forest_for_single_root(self) -> None:
+        self.assertEqual(
+            runtime_ops_module.process_tree_pids(os.getpid()),
+            runtime_ops_module.process_forest_pids([os.getpid()]),
+        )
+
+    def test_all_process_listeners_skips_fd_walk_when_listen_inodes_unchanged(self) -> None:
+        cache: dict = {}
+        rows = [{"pid": 10, "port": 8000, "source": "proc"}]
+        with (
+            mock.patch.object(runtime_ops_module, "listen_socket_inode_ports", return_value={"111": 8000}),
+            mock.patch.object(runtime_ops_module, "_all_proc_pids", return_value={10}),
+            mock.patch.object(runtime_ops_module, "_proc_process_tree_listeners", return_value=list(rows)) as walk,
+        ):
+            first = runtime_ops_module.all_process_listeners(cache=cache)
+            second = runtime_ops_module.all_process_listeners(cache=cache)
+        self.assertEqual(walk.call_count, 1)
+        self.assertEqual(first, rows)
+        self.assertEqual(second, rows)
+
+        # Cached rows are defensive copies, not shared references.
+        second[0]["port"] = 1
+        with (
+            mock.patch.object(runtime_ops_module, "listen_socket_inode_ports", return_value={"111": 8000}),
+            mock.patch.object(runtime_ops_module, "_proc_process_tree_listeners") as walk_again,
+        ):
+            third = runtime_ops_module.all_process_listeners(cache=cache)
+        walk_again.assert_not_called()
+        self.assertEqual(third[0]["port"], 8000)
+
+    def test_all_process_listeners_rescans_when_listen_inodes_change(self) -> None:
+        cache: dict = {}
+        with (
+            mock.patch.object(runtime_ops_module, "listen_socket_inode_ports", return_value={"111": 8000}),
+            mock.patch.object(runtime_ops_module, "_all_proc_pids", return_value={10}),
+            mock.patch.object(
+                runtime_ops_module,
+                "_proc_process_tree_listeners",
+                return_value=[{"pid": 10, "port": 8000, "source": "proc"}],
+            ),
+        ):
+            runtime_ops_module.all_process_listeners(cache=cache)
+        with (
+            mock.patch.object(runtime_ops_module, "listen_socket_inode_ports", return_value={"222": 9000}),
+            mock.patch.object(runtime_ops_module, "_all_proc_pids", return_value={10}),
+            mock.patch.object(
+                runtime_ops_module,
+                "_proc_process_tree_listeners",
+                return_value=[{"pid": 10, "port": 9000, "source": "proc"}],
+            ) as walk,
+        ):
+            rescanned = runtime_ops_module.all_process_listeners(cache=cache)
+        self.assertEqual(walk.call_count, 1)
+        self.assertEqual(rescanned, [{"pid": 10, "port": 9000, "source": "proc"}])
+
+    def test_all_process_listeners_without_listen_inodes_never_caches(self) -> None:
+        cache: dict = {}
+        with (
+            mock.patch.object(runtime_ops_module, "listen_socket_inode_ports", return_value={}),
+            mock.patch.object(runtime_ops_module, "_all_proc_pids", return_value={10}),
+            mock.patch.object(runtime_ops_module, "_proc_process_tree_listeners", return_value=[]),
+            mock.patch.object(
+                runtime_ops_module,
+                "_ss_process_tree_listeners",
+                return_value=[{"pid": 10, "port": 7000, "source": "ss"}],
+            ) as ss_scan,
+        ):
+            runtime_ops_module.all_process_listeners(cache=cache)
+            runtime_ops_module.all_process_listeners(cache=cache)
+        self.assertEqual(ss_scan.call_count, 2)
+        self.assertEqual(cache, {})
+
+
+class DcgConfigStateRootScopeTests(unittest.TestCase):
+    """`.dcg.toml` must never be written by a run whose state root is foreign.
+
+    dcg 0.6.7 only ever reads `<git-repo-root>/.dcg.toml` (verified via
+    `dcg config --format json`: the `project` config source appears only when
+    the directory holding `.dcg.toml` also holds a `.git` marker). The file
+    therefore cannot be relocated under SKILLBOX_STATE_ROOT, so scoping is a
+    refusal: an isolated state root writes nothing at all.
+    """
+
+    def _repo(self, tmpdir: str, state_root: str) -> Path:
+        root = Path(tmpdir) / "repo"
+        (root / ".git").mkdir(parents=True)
+        (root / ".env").write_text(
+            f"SKILLBOX_STATE_ROOT={state_root}\nSKILLBOX_DCG_BIN=/usr/bin/dcg\n",
+            encoding="utf-8",
+        )
+        (root / ".dcg.toml").write_text(
+            "# live policy render\n[general]\nfail_closed = true\n",
+            encoding="utf-8",
+        )
+        return root
+
+    def _model(self, root: Path, state_root: Path) -> dict:
+        return {
+            "root_dir": str(root),
+            "env": {"SKILLBOX_DCG_BIN": "/usr/bin/dcg", "SKILLBOX_STATE_ROOT": str(state_root)},
+            "clients": [],
+            "storage": {
+                "state_root": str(state_root),
+                "default_state_root": "./.skillbox-state",
+            },
+        }
+
+    def test_isolated_state_root_refuses_and_leaves_repo_root_config_byte_identical(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = self._repo(tmpdir, "./.skillbox-state")
+            isolated = Path(tmpdir) / "isolated-state"
+            isolated.mkdir()
+            config = root / ".dcg.toml"
+            before = config.read_bytes()
+
+            actions = runtime_ops_module.sync_dcg_config(
+                self._model(root, isolated),
+                root,
+                dry_run=False,
+            )
+
+            self.assertEqual(len(actions), 1)
+            self.assertTrue(actions[0].startswith(f"skip: {config} (state root {isolated} "))
+            self.assertIn("refusing to write outside it", actions[0])
+            # The repo-root guard config is untouched...
+            self.assertEqual(config.read_bytes(), before)
+            # ...and nothing escaped INTO the isolated root either.
+            self.assertEqual(sorted(isolated.rglob("*")), [])
+
+    def test_isolated_state_root_refuses_in_dry_run_too(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = self._repo(tmpdir, "./.skillbox-state")
+            isolated = Path(tmpdir) / "isolated-state"
+            isolated.mkdir()
+            actions = runtime_ops_module.sync_dcg_config(
+                self._model(root, isolated),
+                root,
+                dry_run=True,
+            )
+        self.assertEqual(len(actions), 1)
+        self.assertIn("refusing to write outside it", actions[0])
+
+    def test_repo_own_state_root_still_renders_to_the_repo_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = self._repo(tmpdir, "./.skillbox-state")
+            own = root / ".skillbox-state"
+            own.mkdir()
+            config = root / ".dcg.toml"
+
+            actions = runtime_ops_module.sync_dcg_config(
+                self._model(root, own),
+                root,
+                dry_run=False,
+            )
+
+            self.assertEqual(
+                actions,
+                [f"render-dcg-config: {config} (packs: core.git, core.filesystem)"],
+            )
+            self.assertIn("[packs]", config.read_text(encoding="utf-8"))
+
+    def test_absolute_env_state_root_matching_the_repo_declaration_is_not_foreign(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "repo"
+            (root / ".git").mkdir(parents=True)
+            declared = root / "state"
+            (root / ".env").write_text(
+                f"SKILLBOX_STATE_ROOT={declared}\nSKILLBOX_DCG_BIN=/usr/bin/dcg\n",
+                encoding="utf-8",
+            )
+            declared.mkdir()
+
+            actions = runtime_ops_module.sync_dcg_config(
+                self._model(root, declared),
+                root,
+                dry_run=True,
+            )
+
+        self.assertEqual(
+            actions,
+            [f"render-dcg-config: {root / '.dcg.toml'} (packs: core.git, core.filesystem)"],
+        )
+
+    def test_unresolvable_state_root_pair_preserves_legacy_behaviour(self) -> None:
+        # No .env on disk and no storage summary: there is no override to
+        # detect, so the historical repo-root render is preserved.
+        model = {"env": {"SKILLBOX_DCG_BIN": "dcg"}, "clients": []}
+        with mock.patch("runtime_manager.runtime_ops._dcg_config_current", return_value=False):
+            self.assertEqual(
+                runtime_ops_module.sync_dcg_config(model, Path("/repo"), dry_run=True),
+                ["render-dcg-config: /repo/.dcg.toml (packs: core.git, core.filesystem)"],
+            )
 
 
 if __name__ == "__main__":

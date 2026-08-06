@@ -42,6 +42,7 @@ KNOWN_ENTRYPOINTS = frozenset(
         "mcp_server.py",
         "pulse.py",
         "Makefile",
+        "clipboard-paste",
     }
 )
 # Minimum node kinds from the agent_ops_brain backend spec graph contract.
@@ -282,6 +283,8 @@ REQUIRED_TIER2_IDS = frozenset(
         "runtime.evidence",
         "runtime.skills",
         "runtime.skill_lint",
+        "runtime.skill_resolve",
+        "runtime.skill_pull",
         "runtime.skill_why",
         "runtime.skill_on",
         "runtime.skill_off",
@@ -302,6 +305,9 @@ REQUIRED_TIER2_IDS = frozenset(
         "box.status",
         "box.up",
         "box.down",
+        "clipboard.status",
+        "clipboard.doctor",
+        "clipboard.explain",
     }
 )
 REQUIRED_COMMAND_IDS = REQUIRED_TIER1_IDS | REQUIRED_TIER2_IDS
@@ -337,6 +343,29 @@ def validate_registry(specs: Iterable[CommandSpec]) -> list[str]:
 
 _REGISTRY_TEST = "python3 -m unittest tests.test_agent_ops_command_registry"
 _FORMAT_JSON_TEXT = "enum[json|text]?"
+_CLIPBOARD_INPUTS = {
+    "profile": "string?",
+    "route_path": "string?",
+    "probe_target": "boolean?",
+    "json": "boolean?",
+}
+_CLIPBOARD_STATUS_OUTPUTS = {
+    "schema_version": "integer",
+    "state": "enum[ready|configured|degraded|stale|unsupported|ambiguous|offline]",
+    "version": "string?",
+    "profile": "string",
+    "target": "string?",
+    "target_probe": "object",
+    "install": "object",
+    "route": "object",
+    "capabilities": "object",
+    "fallback": "object",
+    "agent": "object",
+    "checks": "object[]",
+    "last_receipt": "string?",
+    "generated_at": "number",
+    "redaction": "string",
+}
 
 
 def default_registry() -> tuple[CommandSpec, ...]:
@@ -379,6 +408,7 @@ def default_registry() -> tuple[CommandSpec, ...]:
             outputs={
                 "ok": "boolean",
                 "context": "object",
+                "cautions": "object[]",
                 "recommendations": "object[]",
                 "blockers": "object[]",
             },
@@ -537,6 +567,66 @@ def default_registry() -> tuple[CommandSpec, ...]:
             examples=("python3 .env-manager/manage.py status --format json",),
             validations=("python3 -m unittest tests.test_cli_units",),
             graph_nodes=("service", "task", "repo", "check"),
+        ),
+        CommandSpec(
+            id="clipboard.status",
+            tier=2,
+            surface=("cli",),
+            summary="Report exact-route seamless-paste readiness with redacted evidence.",
+            inputs=_CLIPBOARD_INPUTS,
+            outputs=_CLIPBOARD_STATUS_OUTPUTS,
+            side_effect="network",
+            risk="low",
+            entrypoint="clipboard-paste",
+            scopes=("profile",),
+            examples=("clipboard-paste status --profile d3 --json",),
+            validations=(
+                "python3 -m unittest tests.test_clipboard_status tests.test_agent_ops_command_registry",
+            ),
+            graph_nodes=("command", "check", "evidence"),
+        ),
+        CommandSpec(
+            id="clipboard.doctor",
+            tier=2,
+            surface=("cli",),
+            summary="Diagnose seamless-paste installation, containment, and exact-route readiness.",
+            inputs=_CLIPBOARD_INPUTS,
+            outputs=_CLIPBOARD_STATUS_OUTPUTS,
+            side_effect="network",
+            risk="low",
+            entrypoint="clipboard-paste",
+            scopes=("profile",),
+            examples=("clipboard-paste doctor --profile d3 --probe-target --json",),
+            validations=(
+                "python3 -m unittest tests.test_clipboard_status tests.test_agent_ops_command_registry",
+            ),
+            graph_nodes=("command", "check", "evidence"),
+        ),
+        CommandSpec(
+            id="clipboard.explain",
+            tier=2,
+            surface=("cli",),
+            summary="Explain the exact evidence, risks, and fallback for seamless paste.",
+            inputs=_CLIPBOARD_INPUTS,
+            outputs={
+                "schema_version": "integer",
+                "state": "enum[ready|ambiguous|unsupported]",
+                "image_action": "enum[registered_route|refuse_upload]",
+                "text_action": "enum[native_paste]",
+                "confidence": "number",
+                "evidence": "string[]",
+                "risks": "string[]",
+                "repair": "string?",
+            },
+            side_effect="network",
+            risk="low",
+            entrypoint="clipboard-paste",
+            scopes=("profile",),
+            examples=("clipboard-paste explain --profile d3 --json",),
+            validations=(
+                "python3 -m unittest tests.test_clipboard_status tests.test_agent_ops_command_registry",
+            ),
+            graph_nodes=("command", "check", "evidence"),
         ),
         CommandSpec(
             id="runtime.state_backup",
@@ -772,6 +862,64 @@ def default_registry() -> tuple[CommandSpec, ...]:
             scopes=("cwd",),
             examples=("python3 .env-manager/manage.py skill why wiki --cwd \"$PWD\" --format json",),
             validations=("python3 -m unittest tests.test_skill_overrides",),
+            graph_nodes=("skill", "repo", "command"),
+        ),
+        CommandSpec(
+            id="runtime.skill_resolve",
+            tier=2,
+            surface=("cli",),
+            summary="Resolve the admitted host skill catalog with canonical policy and content identities.",
+            inputs={
+                "cwd": "string?",
+                "format": "enum[json]?",
+            },
+            outputs={
+                "schema_version": "string",
+                "repository": "object",
+                "policy": "object",
+                "skills": "object[]",
+                "selected_names": "string[]",
+                "totals": "object",
+                "receipt_sha256": "string",
+            },
+            side_effect="none",
+            risk="low",
+            entrypoint="manage.py",
+            owner_binary="sbp",
+            scopes=("cwd",),
+            examples=("python3 .env-manager/manage.py skill resolve --cwd \"$PWD\" --format json",),
+            validations=("python3 -m unittest tests.test_skill_pull",),
+            graph_nodes=("skill", "repo", "command"),
+        ),
+        CommandSpec(
+            id="runtime.skill_pull",
+            tier=2,
+            surface=("cli",),
+            summary="Read one admitted host skill as a verified current-session packet without mutation.",
+            inputs={
+                "skill_name": "string",
+                "cwd": "string?",
+                "format": "enum[json]?",
+            },
+            outputs={
+                "ok": "boolean",
+                "schema_version": "string",
+                "name": "string",
+                "lifecycle": "string",
+                "entry_text": "string",
+                "tree_sha256": "string",
+                "entry_sha256": "string",
+                "receipt_sha256": "string",
+                "source_classification": "string",
+                "instructions": "string",
+            },
+            side_effect="none",
+            risk="low",
+            entrypoint="manage.py",
+            owner_binary="sbp",
+            scopes=("cwd",),
+            examples=("python3 .env-manager/manage.py skill pull sbp --cwd \"$PWD\" --format json",),
+            validations=("python3 -m unittest tests.test_skill_pull",),
             graph_nodes=("skill", "repo", "command"),
         ),
         CommandSpec(

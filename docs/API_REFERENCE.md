@@ -7,7 +7,7 @@
 Generated from command registry ABI `2026-06-11+agent_ops_brain`.
 Do not edit by hand; run `python3 .env-manager/manage.py registry-docs --write`.
 
-Registry entries: 41.
+Registry entries: 46.
 
 ## Tier 1
 
@@ -131,6 +131,7 @@ Rank the highest-leverage next actions with reasons, claim commands, and validat
 | Name | Type | Required |
 |---|---|---|
 | `blockers` | `object[]` | yes |
+| `cautions` | `object[]` | yes |
 | `context` | `object` | yes |
 | `ok` | `boolean` | yes |
 | `recommendations` | `object[]` | yes |
@@ -1164,6 +1165,100 @@ python3 -m unittest tests.test_skill_overrides
 
 **Graph Nodes**: `skill`, `repo`, `command`
 
+#### runtime.skill_pull
+
+Read one admitted host skill as a verified current-session packet without mutation.
+
+- Surfaces: `cli`
+- Scopes: `cwd`
+- Side effect: `none`
+- Risk: `low`
+- Entrypoint: `manage.py`
+- Owner binary: `sbp`
+- MCP mirror: None
+
+**Inputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `cwd` | `string?` | no |
+| `format` | `enum[json]?` | no |
+| `skill_name` | `string` | yes |
+
+**Outputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `entry_sha256` | `string` | yes |
+| `entry_text` | `string` | yes |
+| `instructions` | `string` | yes |
+| `lifecycle` | `string` | yes |
+| `name` | `string` | yes |
+| `ok` | `boolean` | yes |
+| `receipt_sha256` | `string` | yes |
+| `schema_version` | `string` | yes |
+| `source_classification` | `string` | yes |
+| `tree_sha256` | `string` | yes |
+
+**Examples**
+
+```bash
+python3 .env-manager/manage.py skill pull sbp --cwd "$PWD" --format json
+```
+
+**Validation**
+
+```bash
+python3 -m unittest tests.test_skill_pull
+```
+
+**Graph Nodes**: `skill`, `repo`, `command`
+
+#### runtime.skill_resolve
+
+Resolve the admitted host skill catalog with canonical policy and content identities.
+
+- Surfaces: `cli`
+- Scopes: `cwd`
+- Side effect: `none`
+- Risk: `low`
+- Entrypoint: `manage.py`
+- Owner binary: `sbp`
+- MCP mirror: None
+
+**Inputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `cwd` | `string?` | no |
+| `format` | `enum[json]?` | no |
+
+**Outputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `policy` | `object` | yes |
+| `receipt_sha256` | `string` | yes |
+| `repository` | `object` | yes |
+| `schema_version` | `string` | yes |
+| `selected_names` | `string[]` | yes |
+| `skills` | `object[]` | yes |
+| `totals` | `object` | yes |
+
+**Examples**
+
+```bash
+python3 .env-manager/manage.py skill resolve --cwd "$PWD" --format json
+```
+
+**Validation**
+
+```bash
+python3 -m unittest tests.test_skill_pull
+```
+
+**Graph Nodes**: `skill`, `repo`, `command`
+
 #### runtime.skill_what_if
 
 Purely simulate effective skill visibility for repo, overlay, pin, opt-out, and machine inputs.
@@ -1860,3 +1955,163 @@ make dev-sanity
 None
 
 **Graph Nodes**: `check`
+
+### clipboard
+
+#### clipboard.doctor
+
+Diagnose seamless-paste installation, containment, and exact-route readiness.
+
+- Surfaces: `cli`
+- Scopes: `profile`
+- Side effect: `network`
+- Risk: `low`
+- Entrypoint: `clipboard-paste`
+- Owner binary: None
+- MCP mirror: None
+
+**Inputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `json` | `boolean?` | no |
+| `probe_target` | `boolean?` | no |
+| `profile` | `string?` | no |
+| `route_path` | `string?` | no |
+
+**Outputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `agent` | `object` | yes |
+| `capabilities` | `object` | yes |
+| `checks` | `object[]` | yes |
+| `fallback` | `object` | yes |
+| `generated_at` | `number` | yes |
+| `install` | `object` | yes |
+| `last_receipt` | `string?` | no |
+| `profile` | `string` | yes |
+| `redaction` | `string` | yes |
+| `route` | `object` | yes |
+| `schema_version` | `integer` | yes |
+| `state` | `enum[ready\|configured\|degraded\|stale\|unsupported\|ambiguous\|offline]` | yes |
+| `target` | `string?` | no |
+| `target_probe` | `object` | yes |
+| `version` | `string?` | no |
+
+**Examples**
+
+```bash
+clipboard-paste doctor --profile d3 --probe-target --json
+```
+
+**Validation**
+
+```bash
+python3 -m unittest tests.test_clipboard_status tests.test_agent_ops_command_registry
+```
+
+**Graph Nodes**: `command`, `check`, `evidence`
+
+#### clipboard.explain
+
+Explain the exact evidence, risks, and fallback for seamless paste.
+
+- Surfaces: `cli`
+- Scopes: `profile`
+- Side effect: `network`
+- Risk: `low`
+- Entrypoint: `clipboard-paste`
+- Owner binary: None
+- MCP mirror: None
+
+**Inputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `json` | `boolean?` | no |
+| `probe_target` | `boolean?` | no |
+| `profile` | `string?` | no |
+| `route_path` | `string?` | no |
+
+**Outputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `confidence` | `number` | yes |
+| `evidence` | `string[]` | yes |
+| `image_action` | `enum[registered_route\|refuse_upload]` | yes |
+| `repair` | `string?` | no |
+| `risks` | `string[]` | yes |
+| `schema_version` | `integer` | yes |
+| `state` | `enum[ready\|ambiguous\|unsupported]` | yes |
+| `text_action` | `enum[native_paste]` | yes |
+
+**Examples**
+
+```bash
+clipboard-paste explain --profile d3 --json
+```
+
+**Validation**
+
+```bash
+python3 -m unittest tests.test_clipboard_status tests.test_agent_ops_command_registry
+```
+
+**Graph Nodes**: `command`, `check`, `evidence`
+
+#### clipboard.status
+
+Report exact-route seamless-paste readiness with redacted evidence.
+
+- Surfaces: `cli`
+- Scopes: `profile`
+- Side effect: `network`
+- Risk: `low`
+- Entrypoint: `clipboard-paste`
+- Owner binary: None
+- MCP mirror: None
+
+**Inputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `json` | `boolean?` | no |
+| `probe_target` | `boolean?` | no |
+| `profile` | `string?` | no |
+| `route_path` | `string?` | no |
+
+**Outputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `agent` | `object` | yes |
+| `capabilities` | `object` | yes |
+| `checks` | `object[]` | yes |
+| `fallback` | `object` | yes |
+| `generated_at` | `number` | yes |
+| `install` | `object` | yes |
+| `last_receipt` | `string?` | no |
+| `profile` | `string` | yes |
+| `redaction` | `string` | yes |
+| `route` | `object` | yes |
+| `schema_version` | `integer` | yes |
+| `state` | `enum[ready\|configured\|degraded\|stale\|unsupported\|ambiguous\|offline]` | yes |
+| `target` | `string?` | no |
+| `target_probe` | `object` | yes |
+| `version` | `string?` | no |
+
+**Examples**
+
+```bash
+clipboard-paste status --profile d3 --json
+```
+
+**Validation**
+
+```bash
+python3 -m unittest tests.test_clipboard_status tests.test_agent_ops_command_registry
+```
+
+**Graph Nodes**: `command`, `check`, `evidence`

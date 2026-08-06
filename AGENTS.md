@@ -36,8 +36,9 @@ Main entry points:
 - Runtime services: `make runtime-up CLIENT=<id> PROFILE=<name>`, `make runtime-down CLIENT=<id> PROFILE=<name>`, `make runtime-status`
 - Box lifecycle: `make box-up BOX=<id>`, `make box-down BOX=<id>`, `make box-status`, `make box-list`, `make box-ssh BOX=<id>`
 - Release/upgrade scripts: `install.sh`, `scripts/06-upgrade-release.sh`, `scripts/07-build-and-push-binary.sh`; verify arguments before use.
-- Clipboard bootstrap: `scripts/clipboard-bootstrap --profile local|d3|sweet|jeremy|conference1 [--dry-run|--apply-remote]`; bundle in `scripts/clipboard/`; closeout `scripts/clipboard-closeout.sh`; design `docs/clipboard-bootstrap.md`.
-- CI: `.github/workflows/ci.yml` runs Ruff, ShellCheck, compose config validation, `python3 scripts/04-reconcile.py render`, and the Python unittest matrix on push/PR.
+- Clipboard bootstrap (explicit manual step; not run by `install.sh`/`box.py`): `scripts/clipboard-bootstrap --profile local|d3|sweet|jeremy|conference1 [--dry-run|--apply-remote]` — remote profiles print a plan by default and only write with `--apply-remote`. Canonical flow: "New-host clipboard adoption" in `docs/operations.md`; bundle in `scripts/clipboard/`; closeout `scripts/clipboard-closeout.sh`; design `docs/clipboard-bootstrap.md`.
+- Canonical local CI gate: `make self-test` (or `./scripts/self-test.sh --rev <rev>`) runs Ruff, ShellCheck, compose config validation, `scripts/04-reconcile.py render`, and the pinned 3.11/3.12/3.13 unittest matrix with 3.12 coverage against an isolated checkout of an exact SHA, then writes a receipt under `.skillbox-state/self-test/receipts/`. `.githooks/pre-push` runs it and blocks the push on failure (`make install-hooks`).
+- CI: `.github/workflows/ci.yml` runs the same lanes for `pull_request` and `workflow_dispatch` only — trusted-main pushes are gated locally, not on Actions. `.github/workflows/release.yml` is unchanged (`v*` tags + manual, OIDC keyless signing). See "Local CI gate" in `docs/operations.md`.
 - Python lint: `python3 -m ruff check .`
 - Shell lint: `shellcheck --severity=warning scripts/*.sh install.sh`
 
@@ -103,6 +104,14 @@ Monitor with an until-loop: `until <check>; do sleep 2; done` — you get a
 notification when the loop exits. Only use `sleep` in a poll loop when no
 notification mechanism is available.
 
+## Deferred Tools
+
+Common tools (TaskCreate, TaskUpdate, WebSearch, WebFetch, Monitor) are
+deferred and unusable until their schemas are fetched. If you expect to need
+any of them, batch-load them with a single ToolSearch call in your first turn
+(e.g. `select:TaskCreate,TaskUpdate,WebSearch,WebFetch,Monitor`) instead of
+paying one ToolSearch round-trip per tool later.
+
 ## Network Posture
 
 Managed boxes default to `tailnet_only`: public SSH is a temporary bootstrap
@@ -113,6 +122,10 @@ public SSH is closed. `posture-proof` verifies the box-level result with
 service bind exposure is verified by the runtime exposure lint. Do not bind
 services to `0.0.0.0` on tailnet-only boxes — use loopback or Tailnet IP. See
 `docs/tailnet-only-lifecycle.md` for recovery and exposure rules.
+For the Conference1 heavy-build box (tailnet Serve URLs, read-only status,
+Swimmers remote Rust lane), use `sbp conference1`. Real host metadata lives in
+the operator's private hosts registry (`SKILLBOX_CLIPBOARD_HOSTS`); the tracked
+`scripts/clipboard/hosts.json` ships sanitized `.example` values.
 
 ## Coding Notes
 
@@ -153,19 +166,42 @@ services to `0.0.0.0` on tailnet-only boxes — use loopback or Tailnet IP. See
 - Avoid editing generated/runtime state unless the bug is specifically in that
   state contract.
 
+## Orb bootstrap (AO-005)
+
+Hardened Amp Orb lane for shell/Python validation (substitute for skillbox-config,
+which is Orb-denied).
+
+- **Setup:** run `.agents/setup`. It is idempotent, checks fixed Orb disk
+  headroom before work, compiles `.env-manager`/`scripts`/`tests`, then runs
+  `python3 -m unittest tests.test_agent_ops_adapters -q`.
+- **Resume:** run `.agents/resume` on wake. It performs only fast checks
+  (Python/git/toolchain presence and disk headroom) and backgrounds optional
+  repair so it stays inside Amp's 10s non-blocking wake budget.
+- **Status/logs:** setup writes `.agents/state/setup-status.json` and
+  `.agents/logs/setup.log`; resume writes `.agents/state/resume-status.json` and
+  `.agents/logs/resume.log`. Final stderr lines are prefixed
+  `AGENT_SETUP_RESULT_JSON` or `AGENT_RESUME_RESULT_JSON`.
+- **Typed failures:** `setup=10`, `dependency=20`, `capacity=30`, `auth=40`,
+  `validation=50`. Capacity failures mean the fixed 40GB Orb disk does not have
+  enough free space for safe setup/resume.
+- **Broader tests (optional):** `python3 -m unittest discover -s tests` is
+  heavier and not required for bootstrap smoke.
+- **Do not:** start Docker monoserver, load operator `.env` secrets, or touch
+  production box lifecycle on the Orb.
+
 <!-- br-agent-instructions-v1 -->
 
 ---
 
 ## Beads Workflow Integration
 
-This project uses [beads_rust](https://github.com/example/beads_rust) (`br`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
+This project uses beads_rust (`br`/`bd`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
 
 ### Essential Commands
 
 ```bash
 # View ready issues (open, unblocked, not deferred)
-br ready
+br ready              # or: bd ready
 
 # List and search
 br list --status=open # All open issues
@@ -219,100 +255,3 @@ git push                # Push to remote
 - Always sync before ending session
 
 <!-- end-br-agent-instructions -->
-
-<!-- bv-agent-instructions-v2 -->
-
----
-
-## Beads Workflow Integration
-
-This project uses [beads_rust](https://github.com/example/beads_rust) (`br`) for issue tracking and [beads_viewer](https://github.com/example/beads_viewer) (`bv`) for graph-aware triage. Issues are stored in `.beads/` and tracked in git.
-
-### Using bv as an AI sidecar
-
-bv is a graph-aware triage engine for Beads projects (.beads/beads.jsonl). Instead of parsing JSONL or hallucinating graph traversal, use robot flags for deterministic, dependency-aware outputs with precomputed metrics (PageRank, betweenness, critical path, cycles, HITS, eigenvector, k-core).
-
-**Scope boundary:** bv handles *what to work on* (triage, priority, planning). `br` handles creating, modifying, and closing beads.
-
-**CRITICAL: Use ONLY --robot-* flags. Bare bv launches an interactive TUI that blocks your session.**
-
-#### The Workflow: Start With Triage
-
-**`bv --robot-triage` is your single entry point.** It returns everything you need in one call:
-- `quick_ref`: at-a-glance counts + top 3 picks
-- `recommendations`: ranked actionable items with scores, reasons, unblock info
-- `quick_wins`: low-effort high-impact items
-- `blockers_to_clear`: items that unblock the most downstream work
-- `project_health`: status/type/priority distributions, graph metrics
-- `commands`: copy-paste shell commands for next steps
-
-```bash
-bv --robot-triage        # THE MEGA-COMMAND: start here
-bv --robot-next          # Minimal: just the single top pick + claim command
-
-# Token-optimized output (TOON) for lower LLM context usage:
-bv --robot-triage --format toon
-```
-
-Before claiming, verify current state with `br show <id> --json` or `br ready --json`. `recommendations` can include graph-important blocked or assigned work; only `quick_ref.top_picks` and non-empty `claim_command` fields represent claimable work.
-
-#### Other bv Commands
-
-| Command | Returns |
-|---------|---------|
-| `--robot-plan` | Parallel execution tracks with unblocks lists |
-| `--robot-priority` | Priority misalignment detection with confidence |
-| `--robot-insights` | Full metrics: PageRank, betweenness, HITS, eigenvector, critical path, cycles, k-core |
-| `--robot-alerts` | Stale issues, blocking cascades, priority mismatches |
-| `--robot-suggest` | Hygiene: duplicates, missing deps, label suggestions, cycle breaks |
-| `--robot-diff --diff-since <ref>` | Changes since ref: new/closed/modified issues |
-| `--robot-graph [--graph-format=json\|dot\|mermaid]` | Dependency graph export |
-
-#### Scoping & Filtering
-
-```bash
-bv --robot-plan --label backend              # Scope to label's subgraph
-bv --robot-insights --as-of HEAD~30          # Historical point-in-time
-bv --recipe actionable --robot-plan          # Pre-filter: ready to work (no blockers)
-bv --recipe high-impact --robot-triage       # Pre-filter: top PageRank scores
-```
-
-### br Commands for Issue Management
-
-```bash
-br ready              # Show issues ready to work (no blockers)
-br list --status=open # All open issues
-br show <id>          # Full issue details with dependencies
-br create --title="..." --type=task --priority=2
-br update <id> --status=in_progress
-br close <id> --reason="Completed"
-br close <id1> <id2>  # Close multiple issues at once
-br sync --flush-only  # Export DB to JSONL
-```
-
-### Workflow Pattern
-
-1. **Triage**: Run `bv --robot-triage` to find the highest-impact actionable work
-2. **Claim**: Use `br update <id> --status=in_progress`
-3. **Work**: Implement the task
-4. **Complete**: Use `br close <id>`
-5. **Sync**: Always run `br sync --flush-only` at session end
-
-### Key Concepts
-
-- **Dependencies**: Issues can block other issues. `br ready` shows only unblocked work.
-- **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog (use numbers 0-4, not words)
-- **Types**: task, bug, feature, epic, chore, docs, question
-- **Blocking**: `br dep add <issue> <depends-on>` to add dependencies
-
-### Session Protocol
-
-```bash
-git status              # Check what changed
-git add <files>         # Stage code changes
-br sync --flush-only    # Export beads changes to JSONL
-git commit -m "..."     # Commit everything
-git push                # Push to remote
-```
-
-<!-- end-bv-agent-instructions -->

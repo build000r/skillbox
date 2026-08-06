@@ -1,0 +1,84 @@
+[
+  {
+    "name": "unknown_pack",
+    "code": "DCG_POLICY_UNKNOWN_PACK",
+    "overlays": [{"id": "acme", "packs": ["core.gti"]}]
+  },
+  {
+    "name": "unapproved_pack",
+    "code": "DCG_POLICY_UNKNOWN_PACK",
+    "overlays": [{"id": "acme", "packs": ["payment.stripe"]}]
+  },
+  {
+    "name": "malformed_pack_type",
+    "code": "DCG_POLICY_MALFORMED_PACK",
+    "overlays": [{"id": "acme", "packs": [17]}]
+  },
+  {
+    "name": "malformed_allowlist_type",
+    "code": "DCG_POLICY_MALFORMED_ALLOWLIST",
+    "overlays": [{"id": "acme", "allowlist": [{"pattern": "rm -rf /"}]}]
+  },
+  {
+    "name": "malformed_allowlist_not_a_list",
+    "code": "DCG_POLICY_MALFORMED_ALLOWLIST",
+    "overlays": [{"id": "acme", "allowlist": "rm -rf /tmp/acme"}]
+  },
+  {
+    "name": "malformed_allowlist_blank",
+    "code": "DCG_POLICY_MALFORMED_ALLOWLIST",
+    "overlays": [{"id": "acme", "allowlist": ["   "]}]
+  },
+  {
+    "name": "broad_allowlist_wildcard",
+    "code": "DCG_POLICY_BROAD_ALLOWLIST",
+    "overlays": [{"id": "acme", "allowlist": [".*"]}]
+  },
+  {
+    "name": "unaudited_fail_open",
+    "code": "DCG_POLICY_UNAUDITED_FAIL_OPEN",
+    "overlays": [{"id": "acme", "fail_closed": false}]
+  },
+  {
+    "name": "partially_audited_fail_open",
+    "code": "DCG_POLICY_UNAUDITED_FAIL_OPEN",
+    "overlays": [
+      {
+        "id": "acme",
+        "fail_closed": false,
+        "fail_closed_exception": {"ticket": "SEC-4417", "approved_by": "", "expires": "2099-01-01", "reason": "x"}
+      }
+    ]
+  },
+  {
+    "name": "expired_exception",
+    "code": "DCG_POLICY_EXPIRED_EXCEPTION",
+    "overlays": [
+      {
+        "id": "acme",
+        "fail_closed": false,
+        "fail_closed_exception": {
+          "ticket": "SEC-0001",
+          "approved_by": "skillbox-security-lead",
+          "expires": "2020-01-01",
+          "reason": "expired waiver must not survive a re-render"
+        }
+      }
+    ]
+  },
+  {
+    "name": "unknown_overlay_key",
+    "code": "DCG_POLICY_MALFORMED_OVERLAY",
+    "overlays": [{"id": "acme", "disable_packs": ["core.git"]}]
+  },
+  {
+    "name": "exception_without_fail_open",
+    "code": "DCG_POLICY_MALFORMED_OVERLAY",
+    "overlays": [
+      {
+        "id": "acme",
+        "fail_closed_exception": {"ticket": "SEC-4417", "approved_by": "lead", "expires": "2099-01-01", "reason": "x"}
+      }
+    ]
+  }
+]

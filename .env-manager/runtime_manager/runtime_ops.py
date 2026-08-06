@@ -4,6 +4,7 @@ import http.client
 import io
 import json
 import os
+import re
 import selectors
 import shlex
 import signal
@@ -14,6 +15,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from collections.abc import Iterable
 
 from .shared import *
 from .validation import *
@@ -33,6 +36,7 @@ from lib.runtime_model import (
     STATE_ROOT_WRONG_FILESYSTEM,
     STATE_ROOT_WRONG_OWNERSHIP,
     is_runtime_absolute_path,
+    load_env_file,
 )
 from lib.paths import BoxPath, PathTranslationError, PathTranslator
 
@@ -2114,6 +2118,94 @@ def _sync_existing_or_manual_env_file(
     return [f"skip: {path} (sync mode {state['sync_mode']})"]
 
 
+# ---------------------------------------------------------------------------
+# .dcg.toml state-root scoping
+#
+# ``.dcg.toml`` stays at the REPO ROOT because that is the only place dcg looks.
+# Verified against dcg 0.6.7 on this box: ``dcg config --format json`` reports
+# its project config source as ``<git-repo-root>/.dcg.toml``. Discovery walks up
+# from the process cwd to the nearest ancestor holding a ``.git`` marker and
+# reads ``.dcg.toml`` THERE. Probe: a ``.dcg.toml`` in a plain directory is NOT
+# picked up (only the user config at ~/.config/dcg/config.toml is listed); after
+# ``mkdir .git`` in that same directory it appears as the ``project`` source.
+# There is no state-root, ``--config``, or ``DCG_CONFIG`` affordance.
+#
+# So the file cannot be relocated under ``SKILLBOX_STATE_ROOT`` without silently
+# disarming the guard. State-root scoping is therefore a REFUSAL, not a
+# relocation: a sync whose effective state root is not the one this repo
+# declares for itself is running against foreign state and must not touch the
+# repo's live guard config. Nothing is written anywhere, so an isolated
+# ``SKILLBOX_STATE_ROOT`` can no longer produce a write outside its own root.
+#
+# The effective state root is read the way the ``manage.sync`` boundary in
+# ``state_mutation.MANIFEST`` declares it (``state_root_source=
+# "runtime_model.root_dir"``): the compiled ``model["storage"]["state_root"]``,
+# already resolved against ``root_dir``. The declared state root is recomputed
+# from the repo's own ``.env``/``.env.example`` so a process-environment
+# override is visible as a divergence instead of being merged away by
+# ``load_runtime_env``.
+# ---------------------------------------------------------------------------
+
+
+def _dcg_resolved_state_root(root_dir: Path, raw: str) -> Path | None:
+    raw = str(raw or "").strip()
+    if not raw:
+        return None
+    try:
+        return host_path_to_absolute_path(root_dir, raw)
+    except (OSError, ValueError):
+        return None
+
+
+def _dcg_effective_state_root(model: dict[str, Any], root_dir: Path) -> Path | None:
+    """State root this sync run is actually operating against."""
+    storage = model.get("storage")
+    if isinstance(storage, dict):
+        resolved = _dcg_resolved_state_root(root_dir, str(storage.get("state_root") or ""))
+        if resolved is not None:
+            return resolved
+    env = model.get("env") or {}
+    resolved = _dcg_resolved_state_root(root_dir, str(env.get("SKILLBOX_STATE_ROOT") or ""))
+    if resolved is not None:
+        return resolved
+    return _dcg_resolved_state_root(root_dir, str(os.environ.get("SKILLBOX_STATE_ROOT") or ""))
+
+
+def _dcg_declared_state_root(model: dict[str, Any], root_dir: Path) -> Path | None:
+    """State root this repo checkout declares on disk, ignoring the process env."""
+    try:
+        declared = load_env_file(root_dir / ".env.example") | load_env_file(root_dir / ".env")
+    except (OSError, RuntimeError):
+        declared = {}
+    resolved = _dcg_resolved_state_root(root_dir, str(declared.get("SKILLBOX_STATE_ROOT") or ""))
+    if resolved is not None:
+        return resolved
+    storage = model.get("storage")
+    if isinstance(storage, dict):
+        return _dcg_resolved_state_root(root_dir, str(storage.get("default_state_root") or ""))
+    return None
+
+
+def _dcg_foreign_state_root_skip(
+    model: dict[str, Any],
+    root_dir: Path,
+    dcg_config_path: Path,
+) -> str:
+    """Refusal line when the run's state root is not this repo's own, else ``""``.
+
+    Only a *known* divergence refuses. If either side is unresolvable there is
+    no override to detect and the legacy behaviour is preserved.
+    """
+    effective = _dcg_effective_state_root(model, root_dir)
+    declared = _dcg_declared_state_root(model, root_dir)
+    if effective is None or declared is None or effective == declared:
+        return ""
+    return (
+        f"skip: {dcg_config_path} (state root {effective} is not this repo's "
+        f"declared state root {declared}; refusing to write outside it)"
+    )
+
+
 def sync_dcg_config(model: dict[str, Any], root_dir: Path, dry_run: bool) -> list[str]:
     """Render .dcg.toml from env and client overlay dcg settings."""
     env = model.get("env") or {}
@@ -2121,9 +2213,13 @@ def sync_dcg_config(model: dict[str, Any], root_dir: Path, dry_run: bool) -> lis
     if not dcg_bin:
         return ["skip: .dcg.toml (dcg not configured)"]
 
+    dcg_config_path = root_dir / ".dcg.toml"
+    refusal = _dcg_foreign_state_root_skip(model, root_dir, dcg_config_path)
+    if refusal:
+        return [refusal]
+
     packs, allowlist = _dcg_packs_and_allowlist(model, env)
     content = _dcg_config_content(packs, allowlist)
-    dcg_config_path = root_dir / ".dcg.toml"
     if _dcg_config_current(dcg_config_path, content):
         return [f"exists: {dcg_config_path}"]
 
@@ -2334,37 +2430,211 @@ def _sync_repos(model: dict[str, Any], dry_run: bool) -> list[str]:
     return actions
 
 
+def _sync_log_dir(log_item: dict[str, Any], dry_run: bool) -> list[str]:
+    path = Path(str(log_item["host_path"]))
+    if path.exists():
+        return [f"exists: {path}"]
+    ensure_directory(path, dry_run)
+    return [f"ensure-directory: {path}"]
+
+
 def _sync_log_dirs(model: dict[str, Any], dry_run: bool) -> list[str]:
     actions: list[str] = []
     for log_item in model["logs"]:
-        path = Path(str(log_item["host_path"]))
-        if path.exists():
-            actions.append(f"exists: {path}")
-            continue
-        ensure_directory(path, dry_run)
-        actions.append(f"ensure-directory: {path}")
+        actions.extend(_sync_log_dir(log_item, dry_run))
     return actions
+
+
+# ---------------------------------------------------------------------------
+# Sync action records
+#
+# ``sync --format json`` emits ``.actions`` as a list of OBJECTS, never bare
+# strings. Every record carries a stable ``id`` plus the verbatim
+# human-readable ``text`` the text renderer prints, so display consumers
+# migrate by reading ``.text`` while machine consumers assert on
+# ``.id`` / ``.action`` / ``.kind``.
+#
+# The canonical record shape is the one already returned by
+# ``dcg_distribution.sync_action()`` (``id``/``action``/``state``/``version``/
+# ``verified``/...). Producers that hand back a mapping pass through untouched
+# apart from the defaulted ``id``/``kind``/``text`` keys, so a converge record
+# keeps its provenance fields verbatim.
+# ---------------------------------------------------------------------------
+
+_ACTION_VERB_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+
+
+def _split_action_detail(body: str) -> tuple[str, str]:
+    """Split a trailing ``(detail)`` suffix off an action string.
+
+    Detail text may itself contain balanced parens (``2 service(s)``), so the
+    opening paren is found by scanning backwards with a depth counter.
+    """
+    if not body.endswith(")"):
+        return body, ""
+    depth = 0
+    for index in range(len(body) - 1, -1, -1):
+        char = body[index]
+        if char == ")":
+            depth += 1
+        elif char == "(":
+            depth -= 1
+            if depth == 0:
+                head = body[:index].rstrip()
+                if not head:
+                    return body, ""
+                return head, body[index + 1 : -1]
+    return body, ""
+
+
+def _action_subject_id(source: str, target: str) -> str:
+    """Derive a stable id from an action's subject.
+
+    Absolute paths collapse to their basename (``/opt/bin/dcg`` -> ``dcg``);
+    anything else is slugified whole so distinct subjects stay distinct
+    (``build000r/skills`` -> ``build000r-skills``).
+    """
+    subject = (source or target).strip()
+    if not subject:
+        return ""
+    if subject.startswith(("/", "~")):
+        subject = subject.rstrip("/").rsplit("/", 1)[-1] or subject
+    slug = re.sub(r"[^a-z0-9]+", "-", subject.lower()).strip("-")
+    return slug
+
+
+def action_record(text: str, *, action_id: str = "", kind: str = "") -> dict[str, Any]:
+    """Parse one human-readable sync action string into a record.
+
+    ``text`` is preserved verbatim; the parsed fields are best-effort and an
+    explicit ``action_id`` from the caller (a model entity id) always wins over
+    the id derived from the string.
+    """
+    text = str(text)
+    verb = ""
+    rest = text
+    head, separator, tail = text.partition(": ")
+    if separator and _ACTION_VERB_RE.match(head):
+        verb = head
+        rest = tail
+    elif not separator and _ACTION_VERB_RE.match(text.strip()):
+        verb = text.strip()
+        rest = ""
+
+    body, detail = _split_action_detail(rest.strip())
+    source, arrow, target = body.partition(" -> ")
+    if not arrow:
+        source, target = "", body
+
+    return {
+        "id": action_id or _action_subject_id(source, target) or verb or "action",
+        "action": verb,
+        "kind": kind,
+        "text": text,
+        "source": source,
+        "target": target,
+        "detail": detail,
+    }
+
+
+def normalize_action_record(
+    value: Any,
+    *,
+    action_id: str = "",
+    kind: str = "",
+) -> dict[str, Any]:
+    """Coerce a producer's action (string or mapping) into a record."""
+    if isinstance(value, dict):
+        record = dict(value)
+        if not str(record.get("id") or "").strip():
+            record["id"] = action_id or "action"
+        record.setdefault("kind", kind)
+        if not str(record.get("text") or "").strip():
+            target = str(record.get("path") or record.get("target") or "").strip()
+            verb = str(record.get("action") or "").strip()
+            record["text"] = f"{verb}: {target}".strip(": ") or str(record["id"])
+        return record
+    return action_record(str(value), action_id=action_id, kind=kind)
+
+
+def action_records(
+    actions: Iterable[Any],
+    *,
+    action_id: str = "",
+    kind: str = "",
+) -> list[dict[str, Any]]:
+    return [normalize_action_record(action, action_id=action_id, kind=kind) for action in actions]
+
+
+def action_texts(records: Iterable[Any]) -> list[str]:
+    """Human-readable lines for a record list; strings pass through unchanged."""
+    return [
+        str(record.get("text", "")) if isinstance(record, dict) else str(record)
+        for record in records
+    ]
+
+
+def sync_runtime_records(model: dict[str, Any], dry_run: bool) -> list[dict[str, Any]]:
+    """Converge the runtime and return structured action records.
+
+    Order is identical to :func:`sync_runtime`, which is the string façade over
+    this function kept for the in-process callers (``pulse``, ``workflows``,
+    ``cli`` up/bootstrap/restart) that only render text.
+    """
+    records: list[dict[str, Any]] = []
+    for repo in model["repos"]:
+        records.extend(
+            action_records(
+                _sync_repo(model, repo, dry_run),
+                action_id=str(repo.get("id") or ""),
+                kind="repo",
+            )
+        )
+    for artifact in model["artifacts"]:
+        records.extend(
+            action_records(
+                sync_artifact(artifact, dry_run=dry_run),
+                action_id=str(artifact.get("id") or ""),
+                kind="artifact",
+            )
+        )
+
+    for env_file in model["env_files"]:
+        records.extend(
+            action_records(
+                sync_env_file(env_file, dry_run=dry_run),
+                action_id=str(env_file.get("id") or ""),
+                kind="env-file",
+            )
+        )
+
+    records.extend(action_records(sync_port_contracts(model, dry_run=dry_run), kind="port-contract"))
+    for log_item in model["logs"]:
+        records.extend(
+            action_records(
+                _sync_log_dir(log_item, dry_run),
+                action_id=str(log_item.get("id") or ""),
+                kind="log",
+            )
+        )
+    records.extend(action_records(sync_skill_repo_sets(model, dry_run=dry_run), kind="skill-repo"))
+    records.extend(action_records(_sync_distributor_sources(model, dry_run=dry_run), kind="distributor"))
+    records.extend(action_records(sync_skill_sets(model, dry_run=dry_run), kind="skill"))
+    records.extend(
+        action_records(
+            sync_dcg_config(model, Path(str(model["root_dir"])), dry_run=dry_run),
+            action_id="dcg-config",
+            kind="dcg",
+        )
+    )
+    records.extend(action_records(sync_ingress_artifacts(model, dry_run=dry_run), kind="ingress"))
+    if not dry_run:
+        _log_model_runtime_event(model, "sync.completed", "runtime", {"action_count": len(records)})
+    return records
 
 
 def sync_runtime(model: dict[str, Any], dry_run: bool) -> list[str]:
-    actions: list[str] = []
-    actions.extend(_sync_repos(model, dry_run))
-    for artifact in model["artifacts"]:
-        actions.extend(sync_artifact(artifact, dry_run=dry_run))
-
-    for env_file in model["env_files"]:
-        actions.extend(sync_env_file(env_file, dry_run=dry_run))
-
-    actions.extend(sync_port_contracts(model, dry_run=dry_run))
-    actions.extend(_sync_log_dirs(model, dry_run))
-    actions.extend(sync_skill_repo_sets(model, dry_run=dry_run))
-    actions.extend(_sync_distributor_sources(model, dry_run=dry_run))
-    actions.extend(sync_skill_sets(model, dry_run=dry_run))
-    actions.extend(sync_dcg_config(model, Path(str(model["root_dir"])), dry_run=dry_run))
-    actions.extend(sync_ingress_artifacts(model, dry_run=dry_run))
-    if not dry_run:
-        _log_model_runtime_event(model, "sync.completed", "runtime", {"action_count": len(actions)})
-    return actions
+    return action_texts(sync_runtime_records(model, dry_run))
 
 
 def runtime_log_map(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -3535,32 +3805,45 @@ def _parse_proc_stat_ppid(stat_text: str) -> int | None:
         return None
 
 
-def _process_tree_pids(root_pid: int) -> set[int]:
-    pids: set[int] = {int(root_pid)}
+def _proc_pid_ppid_map() -> dict[int, int]:
+    """Snapshot /proc once as a pid -> ppid map."""
+    pid_map: dict[int, int] = {}
     proc_root = Path("/proc")
     if not proc_root.is_dir():
-        return pids
+        return pid_map
+    for child in proc_root.iterdir():
+        if not child.name.isdigit():
+            continue
+        try:
+            pid = int(child.name)
+        except ValueError:
+            continue
+        try:
+            ppid = _parse_proc_stat_ppid((child / "stat").read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        if ppid is not None:
+            pid_map[pid] = ppid
+    return pid_map
 
-    changed = True
-    while changed:
-        changed = False
-        for child in proc_root.iterdir():
-            if not child.name.isdigit():
-                continue
-            try:
-                pid = int(child.name)
-            except ValueError:
-                continue
-            if pid in pids:
-                continue
-            try:
-                ppid = _parse_proc_stat_ppid((child / "stat").read_text(encoding="utf-8", errors="replace"))
-            except OSError:
-                continue
-            if ppid in pids:
-                pids.add(pid)
-                changed = True
+
+def _forest_pids_from_map(root_pids: set[int], pid_map: dict[int, int]) -> set[int]:
+    pids = set(root_pids)
+    children: dict[int, list[int]] = {}
+    for pid, ppid in pid_map.items():
+        children.setdefault(ppid, []).append(pid)
+    frontier = list(pids)
+    while frontier:
+        parent = frontier.pop()
+        for child_pid in children.get(parent, ()):  # descendants only
+            if child_pid not in pids:
+                pids.add(child_pid)
+                frontier.append(child_pid)
     return pids
+
+
+def _process_tree_pids(root_pid: int) -> set[int]:
+    return process_forest_pids([int(root_pid)])
 
 
 def _all_proc_pids() -> set[int]:
@@ -3581,6 +3864,19 @@ def _all_proc_pids() -> set[int]:
 def process_tree_pids(root_pid: int) -> set[int]:
     """Return the root process and descendants visible through /proc."""
     return _process_tree_pids(root_pid)
+
+
+def process_forest_pids(root_pids: list[int] | set[int]) -> set[int]:
+    """Return the given processes plus all descendants from one /proc pass.
+
+    Callers with several root pids (e.g. the pulse tick walking every managed
+    service) should prefer this over per-root ``process_tree_pids`` calls so
+    /proc is only walked once.
+    """
+    roots = {int(pid) for pid in root_pids}
+    if not roots:
+        return set()
+    return _forest_pids_from_map(roots, _proc_pid_ppid_map())
 
 
 def _parse_listener_port(raw_local_address: str) -> int | None:
@@ -3666,10 +3962,20 @@ def _proc_socket_inode(fd_path: Path) -> str | None:
     return match.group(1) if match else None
 
 
-def _proc_process_tree_listeners(target_pids: set[int]) -> list[dict[str, Any]]:
+def listen_socket_inode_ports() -> dict[str, int]:
+    """Read the kernel's listening TCP socket inode -> port map (cheap)."""
     inode_to_port: dict[str, int] = {}
     inode_to_port.update(_proc_net_tcp_listen_inodes(Path("/proc/net/tcp")))
     inode_to_port.update(_proc_net_tcp_listen_inodes(Path("/proc/net/tcp6")))
+    return inode_to_port
+
+
+def _proc_process_tree_listeners(
+    target_pids: set[int],
+    inode_to_port: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    if inode_to_port is None:
+        inode_to_port = listen_socket_inode_ports()
     if not inode_to_port:
         return []
 
@@ -3716,18 +4022,32 @@ def process_tree_listener_snapshot(pid: int) -> dict[str, Any]:
     return _process_tree_listener_snapshot(pid)
 
 
-def all_process_listeners() -> list[dict[str, Any]]:
-    """Return visible listening sockets keyed by owning process pid."""
+def all_process_listeners(*, cache: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Return visible listening sockets keyed by owning process pid.
+
+    ``cache`` is a caller-owned dict that memoizes the previous scan: the
+    listen-socket inode map is read first (two small /proc/net files) and the
+    expensive per-process fd readlink walk is skipped whenever that map is
+    unchanged since the cached scan.
+    """
+    inode_to_port = listen_socket_inode_ports()
+    inode_key = frozenset(inode_to_port.items())
+    if cache is not None and inode_to_port and cache.get("inode_key") == inode_key:
+        return [dict(item) for item in cache.get("listeners") or []]
     pids = _all_proc_pids()
     if not pids:
         return []
-    listeners = _proc_process_tree_listeners(pids)
+    listeners = _proc_process_tree_listeners(pids, inode_to_port)
     if not listeners:
         listeners = _ss_process_tree_listeners(pids)
-    return sorted(
+    listeners = sorted(
         listeners,
         key=lambda item: (int(item.get("port") or 0), int(item.get("pid") or 0)),
     )
+    if cache is not None and inode_to_port:
+        cache["inode_key"] = inode_key
+        cache["listeners"] = [dict(item) for item in listeners]
+    return listeners
 
 
 def _service_port_guard_disabled() -> bool:

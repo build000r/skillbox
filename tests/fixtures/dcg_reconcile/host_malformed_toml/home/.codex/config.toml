@@ -1,0 +1,3 @@
+model = "gpt-5.6-sol"
+[projects."/srv/repos/cfo"
+trust_level = "trusted"

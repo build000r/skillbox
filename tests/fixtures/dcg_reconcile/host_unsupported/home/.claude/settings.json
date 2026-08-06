@@ -1,0 +1,8 @@
+{
+  "hooks": {
+    "PreToolUse": {
+      "matcher": "Bash",
+      "command": "dcg"
+    }
+  }
+}

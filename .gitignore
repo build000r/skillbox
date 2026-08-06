@@ -4,6 +4,12 @@
 .vscode/
 .cache/
 .claude/
+# The unanchored `.claude/` above also swallowed committed test fixtures
+# (tests/fixtures/**/home/.claude/...), so `git archive` extracts — which is
+# what the self-test gate runs against — silently lacked them and the
+# dcg_reconcile suite failed only under the gate. Re-include fixture trees.
+!tests/fixtures/**/.claude/
+!tests/fixtures/**/.claude/**
 .mcp.json
 __pycache__/
 *.pyc
@@ -39,6 +45,10 @@ data/
 sand/
 # Keep only runtime state ignored; .skillbox/ contains committed repo policy.
 .skillbox-state/
+# The state-root mutation lease locks a SIBLING of the state root, never a path
+# inside it, because state_backup renames the root during restore. The dir-only
+# rule above therefore does not cover it.
+*.mutation-lease.lock
 /.codex/
 /.ntm/
 /MODES_CONTEXT_PACK.md
@@ -61,3 +71,9 @@ refactor/
 
 # local private config (symlinks to host-private paths)
 .buildoo[o]r/
+
+# Runtime lock/port artifacts (generated; never commit)
+.skillbox-port.env
+workspace/.focus.json.lock
+.skillbox/skill-overrides.yaml.lock
+docs/field-reports/reports.jsonl

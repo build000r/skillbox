@@ -1,0 +1,28 @@
+# Second synthetic client overlay.
+#
+# `client.label` is an ALLOWLISTED field that nonetheless contains a
+# secret-shaped assignment. It therefore reaches the projection stage, and the
+# redaction pass -- not the allowlist -- is what must scrub it. This is the case
+# that proves redaction is actually applied rather than assumed.
+version: 1
+
+client:
+  id: bravo
+  label: "Bravo AUTH_TOKEN=bravo-label-secret-value"
+
+  repos:
+    - id: bravo-app
+      kind: repo
+      repo_path: /synthetic/beta/repos/bravo-app
+
+  context:
+    cwd_match:
+      - /synthetic/beta/repos/bravo-app
+    plans:
+      plan_root: plans/bravo
+    repo_landscape:
+      scan_roots:
+        - /synthetic/beta/repos
+      repos:
+        - id: bravo-app
+          path: /synthetic/beta/repos/bravo-app

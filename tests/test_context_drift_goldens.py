@@ -55,7 +55,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tests.helpers import PRESSURE_HEADING, PRESSURE_PLACEHOLDER, normalize_golden
+from tests.helpers import (
+    PRESSURE_HEADING,
+    PRESSURE_PLACEHOLDER,
+    normalize_golden,
+    normalize_sync_verbs,
+)
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -256,6 +261,12 @@ class ContextDriftGoldenTests(unittest.TestCase):
     _regen = bool(os.environ.get(REGEN_ENV))
 
     def _check(self, name: str, actual: str) -> None:
+        # The sync verb ("exists:" vs "symlink-context:") depends on whether the
+        # link is already present, which differs between a working checkout and
+        # the `git archive` extract the canonical gate runs in. Normalize BOTH
+        # sides here so every golden — markdown and JSON alike — is compared on
+        # the same footing; callers already normalize pressure/root upstream.
+        actual = normalize_sync_verbs(actual)
         path = GOLDENS_DIR / name
         if self._regen:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -265,7 +276,7 @@ class ContextDriftGoldenTests(unittest.TestCase):
             f"Missing golden {path}. Regenerate with "
             f"{REGEN_ENV}=1 python3 -m unittest tests.test_context_drift_goldens",
         )
-        expected = path.read_text(encoding="utf-8")
+        expected = normalize_sync_verbs(path.read_text(encoding="utf-8"))
         self.assertEqual(
             expected,
             actual,
@@ -294,6 +305,22 @@ class ContextDriftGoldenTests(unittest.TestCase):
         payload = _dry_run_json_actions()
         rendered = json.dumps(payload, indent=2, sort_keys=True) + "\n"
         self._check("context_dry_run.json", rendered)
+
+    def test_dry_run_actions_use_only_known_sync_verbs(self) -> None:
+        # The verb itself is normalized in the golden (it depends on whether the
+        # link already exists), so this keeps the coverage that normalization
+        # would otherwise cost: a renamed or invented verb still fails here.
+        known = {"exists", "symlink-context", "write-context", "install-skill"}
+        actions = _dry_run_json_actions().get("actions") or []
+        self.assertTrue(actions, "dry-run produced no actions to check")
+        for action in actions:
+            verb = str(action).split(":", 1)[0].strip()
+            self.assertIn(
+                verb,
+                known,
+                f"unknown sync verb {verb!r} in dry-run actions; if this verb is "
+                f"intentional, add it to this set AND to _SYNC_VERB_RE in tests/helpers.py",
+            )
 
     def test_pressure_section_is_normalized_in_goldens(self) -> None:
         # Guard the guard: the volatile pressure body must not leak host state

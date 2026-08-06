@@ -31,6 +31,11 @@ class CliWrapperTests(unittest.TestCase):
         self.assertIn("sbp beads", result.stdout)
         self.assertIn("sbp launch", result.stdout)
         self.assertIn("Alias for launch", result.stdout)
+        self.assertIn("sbp skill resolve", result.stdout)
+        self.assertIn("sbp skill pull NAME", result.stdout)
+        self.assertIn("without linking or activation", result.stdout)
+        self.assertIn("sbp skill activate NAME", result.stdout)
+        self.assertIn("mutates links", result.stdout)
 
     def test_sbo_help_uses_sbo_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -54,6 +59,7 @@ class CliWrapperTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["tool"], "skillbox-sbp")
+        self.assertEqual(payload["mode"], "host")
         self.assertIn("stdout_stderr_contract", payload)
         self.assertTrue(any(command["name"] == "candidates" for command in payload["commands"]))
         verbs = payload["skill_verbs"]
@@ -85,6 +91,19 @@ class CliWrapperTests(unittest.TestCase):
         self.assertTrue(verbs["on"]["returns_packet"])
         self.assertEqual(verbs["recalibrate"]["mutates"], "none")
         self.assertEqual(verbs["activate"]["mutates"], "cwd-ephemeral")
+        self.assertEqual(
+            verbs["pull"],
+            {
+                "purpose": "Read one admitted skill as a verified current-session packet.",
+                "mutates": "none",
+                "links_disk": False,
+                "returns_packet": True,
+                "scope": "current cwd host policy",
+                "survives_recalibrate": False,
+                "when_to_use": "Use when the skill is needed now but durable visibility is not wanted.",
+                "do_NOT": "Do not treat pull as activation, linking, or a durable policy decision.",
+            },
+        )
         self.assertIn("default", verbs)
         self.assertEqual(verbs["default"]["mutates"], "repo_or_operator_policy")
         self.assertFalse(verbs["default"]["links_disk"])
@@ -104,14 +123,27 @@ class CliWrapperTests(unittest.TestCase):
         match = re.search(r"\{([^}]+)\}", help_result.stdout)
         self.assertIsNotNone(match, help_result.stdout)
         dispatched_skill_verbs = set(match.group(1).split(",")) if match else set()
-        self.assertLessEqual(dispatched_skill_verbs, set(verbs))
+        receipt_only_skill_actions = {"resolve"}
+        self.assertEqual(dispatched_skill_verbs - set(verbs), receipt_only_skill_actions)
+        self.assertLessEqual(dispatched_skill_verbs - receipt_only_skill_actions, set(verbs))
         launch = next(command for command in payload["commands"] if command["name"] == "launch")
         bulk = next(command for command in payload["commands"] if command["name"] == "bulk")
         recalibrate = next(command for command in payload["commands"] if command["name"] == "recalibrate")
+        pull_commands = [command for command in payload["commands"] if command["name"] == "skill-pull"]
         self.assertEqual(launch["aliases"], ["bulk"])
         self.assertEqual(bulk["alias_for"], "launch")
         self.assertTrue(recalibrate["json"])
         self.assertEqual(recalibrate["safe_first_try"], "sbp recalibrate --json")
+        self.assertEqual(
+            pull_commands,
+            [
+                {
+                    "name": "skill-pull",
+                    "json": True,
+                    "safe_first_try": "sbp skill pull <skill> --format json",
+                }
+            ],
+        )
         self.assertIn("sbp down <profile> <service> --dry-run --json", payload["safety"]["dry_run_first"])
         self.assertIn("sbp launch <dir> <dir> --request '<prompt>' --dry-run --json", payload["safety"]["dry_run_first"])
         self.assertIn("sbp bulk <dir> <dir> --request '<prompt>' --dry-run --json", payload["safety"]["dry_run_first"])
@@ -163,6 +195,51 @@ class CliWrapperTests(unittest.TestCase):
                     "json",
                 ],
             )
+
+    def test_sbp_skill_resolve_and_pull_route_without_profile_or_client(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            downstream = root / "downstream"
+            explicit_cwd = root / "explicit"
+            downstream.mkdir()
+            explicit_cwd.mkdir()
+
+            cases = (
+                (
+                    ("skill", "resolve", "--format", "json"),
+                    ["skill", "resolve", "--cwd", str(downstream), "--format", "json"],
+                ),
+                (
+                    ("skill", "pull", "sbp", "--cwd", str(explicit_cwd), "--format", "json"),
+                    [
+                        "skill",
+                        "pull",
+                        "--cwd",
+                        str(explicit_cwd),
+                        "sbp",
+                        "--format",
+                        "json",
+                    ],
+                ),
+            )
+            for index, (args, expected) in enumerate(cases):
+                with self.subTest(args=args):
+                    record_path = root / f"record-{index}.json"
+                    result = self._run_wrapper(
+                        SBP,
+                        *args,
+                        fake_root=fake_root,
+                        invoke_cwd=downstream,
+                        extra_env={"SKILLBOX_CLIENT": "must-not-forward"},
+                        record_path=record_path,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    record = json.loads(record_path.read_text(encoding="utf-8"))
+                    self.assertEqual(record["argv"], expected)
+                    self.assertNotIn("--profile", record["argv"])
+                    self.assertNotIn("--client", record["argv"])
+                    self.assertEqual(record["argv"].count("--cwd"), 1)
 
     def test_sbp_recalibrate_auto_fix_yes_repairs_missing_skill_in_one_outer_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -309,6 +386,7 @@ class CliWrapperTests(unittest.TestCase):
         self.assertIn("Skill verb contract:", result.stdout)
         self.assertIn("sbp capabilities --json | jq .skill_verbs", result.stdout)
         self.assertIn("activate (mutates=cwd-ephemeral, returns_packet=true)", result.stdout)
+        self.assertIn("pull (mutates=none, links_disk=false, returns_packet=true)", result.stdout)
 
     def test_sbp_launch_maps_to_swimmers_launch_without_profile_consuming_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -468,6 +546,30 @@ class CliWrapperTests(unittest.TestCase):
         self.assertEqual(logs.returncode, 2)
         self.assertIn("Exact command: sbp logs <profile> <service> --json", logs.stderr)
         self.assertIn("List services first: sbp status --json", logs.stderr)
+
+    def test_sbp_genuinely_unknown_command_omits_misleading_suggestion(self) -> None:
+        # gkso: a canned "Did you mean: status" for a command with no plausible
+        # match misleads agents. Genuinely-unknown commands point only at capabilities.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+
+            unknown = self._run_wrapper(SBP, "totally-bogus-xyz", fake_root=fake_root)
+
+        self.assertEqual(unknown.returncode, 2)
+        self.assertEqual(unknown.stdout, "")
+        self.assertNotIn("Did you mean:", unknown.stderr)
+        self.assertIn("Discover commands: sbp capabilities --json", unknown.stderr)
+
+    def test_sbp_close_typo_still_suggests_exact_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+
+            recal = self._run_wrapper(SBP, "recalibrat", fake_root=fake_root)
+
+        self.assertEqual(recal.returncode, 2)
+        self.assertIn("Did you mean: sbp recalibrate --json", recal.stderr)
 
     def test_sbp_skills_infers_client_from_downstream_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1208,6 +1310,56 @@ class CliWrapperTests(unittest.TestCase):
             self.assertEqual((bin_dir / "sbp").resolve(), SBP)
             self.assertEqual((bin_dir / "sbo").resolve(), SBO)
             self.assertIn("installed wrappers:", result.stdout)
+
+    def _run_pulse(self, *args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["python3", str(ROOT_DIR / ".env-manager" / "pulse.py"), *args],
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+
+    def test_pulse_bare_invocation_defaults_to_read_only_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self._run_pulse("--root-dir", tmpdir)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("pulse: not running", result.stdout)
+            # Read-only: the bare default must not daemonize or write a pidfile.
+            self.assertEqual(
+                [str(p) for p in Path(tmpdir).rglob("pulse.pid")], [],
+            )
+
+    def test_pulse_start_verifies_pidfile_and_stop_tears_down(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                result = self._run_pulse("--root-dir", tmpdir, "start", "--interval", "30")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("[pulse] started (pid ", result.stdout)
+                self.assertIn("pulse.log", result.stdout)
+                pid_files = list(Path(tmpdir).rglob("pulse.pid"))
+                self.assertEqual(len(pid_files), 1, pid_files)
+
+                again = self._run_pulse("--root-dir", tmpdir, "start")
+                self.assertEqual(again.returncode, 0, again.stderr)
+                self.assertIn("already running", again.stdout)
+            finally:
+                stop = self._run_pulse("--root-dir", tmpdir, "stop")
+            self.assertEqual(stop.returncode, 0, stop.stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores directory write bits")
+    def test_pulse_start_returns_nonzero_when_state_dir_unwritable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "ro-root"
+            root.mkdir()
+            root.chmod(0o555)
+            try:
+                result = self._run_pulse("--root-dir", str(root), "start")
+            finally:
+                root.chmod(0o755)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("[pulse]", result.stderr)
 
     def _make_fake_skillbox(self, root: Path) -> Path:
         env_dir = root / ".env-manager"

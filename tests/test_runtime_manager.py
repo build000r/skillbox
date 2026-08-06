@@ -412,9 +412,19 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertTrue((repo / ".skillbox-state" / "home" / ".local" / "bin" / "swimmers").is_file())
             self.assertFalse((repo / ".skillbox-state" / "home" / ".claude" / "skills" / "personal-skill").exists())
             self.assertTrue((repo / "workspace" / "skill-repos.lock.json").is_file())
-            self.assertTrue(any("copy-if-missing:" in action for action in actions))
-            self.assertTrue(any("install-skill:" in action for action in actions))
-            self.assertTrue(any("write-lockfile:" in action for action in actions))
+            # `sync --format json` emits `.actions` as OBJECTS: every record has a
+            # stable `id`, the parsed `action` verb, and the verbatim human-readable
+            # `text`. See runtime_ops.action_record().
+            self.assertTrue(all(isinstance(action, dict) for action in actions), actions)
+            self.assertTrue(all(str(action.get("id") or "").strip() for action in actions), actions)
+            verbs = [action["action"] for action in actions]
+            self.assertIn("copy-if-missing", verbs)
+            self.assertIn("install-skill", verbs)
+            self.assertIn("write-lockfile", verbs)
+            self.assertTrue(
+                any(action["text"].startswith("install-skill: ") for action in actions),
+                actions,
+            )
 
     def test_render_resolves_runtime_placeholders_and_clients(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -727,7 +737,7 @@ class RuntimeManagerTests(unittest.TestCase):
             reconcile = self._run(repo, "sync", "--format", "json")
             self.assertEqual(reconcile.returncode, 0, reconcile.stderr)
             actions = json.loads(reconcile.stdout)["actions"]
-            self.assertTrue(any("copy-reconcile:" in action for action in actions), actions)
+            self.assertTrue(any(action["action"] == "copy-reconcile" for action in actions), actions)
             self.assertEqual(target_path.read_text(encoding="utf-8"), source_path.read_text(encoding="utf-8"))
 
             status = self._run(repo, "status", "--format", "json")
@@ -978,7 +988,7 @@ class RuntimeManagerTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             actions = json.loads(result.stdout)["actions"]
-            self.assertTrue(any("clone-reconcile:" in action for action in actions), actions)
+            self.assertTrue(any(action["action"] == "clone-reconcile" for action in actions), actions)
             self.assertTrue((target_repo / ".git").is_dir())
             self.assertTrue((target_repo / "README.md").is_file())
             self.assertEqual((target_repo / ".env").read_text(encoding="utf-8"), "API_TOKEN=from-source\n")
@@ -1320,7 +1330,7 @@ class RuntimeManagerTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {
                 "SKILLBOX_BOX_SELF": "true",
                 "SKILLBOX_BOX_ID": "worker-devbox",
-                "SKILLBOX_BOX_TAILSCALE_IP": "100.86.253.9",
+                "SKILLBOX_BOX_TAILSCALE_IP": "100.100.253.9",
                 "SKILLBOX_BOX_TAILSCALE_HOSTNAME": "worker-devbox",
                 "SKILLBOX_SWIMMERS_PORT": "3210",
             }):
@@ -1328,10 +1338,10 @@ class RuntimeManagerTests(unittest.TestCase):
                 json_result = self._run(repo, "status", "--format", "json", "--compact")
 
             self.assertEqual(text_result.returncode, 0, text_result.stderr)
-            self.assertIn("Open this on phone: http://100.86.253.9:3210/", text_result.stdout)
+            self.assertIn("Open this on phone: http://100.100.253.9:3210/", text_result.stdout)
             payload = json.loads(json_result.stdout)
             self.assertTrue(payload["box_access"]["self"])
-            self.assertEqual(payload["box_access"]["phone_url"], "http://100.86.253.9:3210/")
+            self.assertEqual(payload["box_access"]["phone_url"], "http://100.100.253.9:3210/")
 
     def test_up_skips_status_only_services_and_logs_show_recent_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2022,7 +2032,9 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(sync.returncode, 0, sync.stderr)
             self.assertTrue((repo / ".skillbox-state" / "monoserver" / "app" / "README.md").is_file())
             self.assertTrue((repo / ".skillbox-state" / "logs" / "clients" / "acme-studio" / "services").is_dir())
-            self.assertTrue(any("clone-if-missing:" in action for action in json.loads(sync.stdout)["actions"]))
+            self.assertTrue(
+                any(action["action"] == "clone-if-missing" for action in json.loads(sync.stdout)["actions"])
+            )
 
     def test_client_init_with_blueprint_scaffolds_client_scoped_connectors(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2242,7 +2254,7 @@ class RuntimeManagerTests(unittest.TestCase):
             sync = self._run(repo, "sync", "--client", "acme-studio", "--format", "json")
             self.assertEqual(sync.returncode, 0, sync.stderr)
             sync_payload = json.loads(sync.stdout)
-            self.assertTrue(any("hydrate-env:" in action for action in sync_payload["actions"]))
+            self.assertTrue(any(action["action"] == "hydrate-env" for action in sync_payload["actions"]))
 
             env_target = repo / ".skillbox-state" / "monoserver" / "app" / ".env.local"
             self.assertTrue(env_target.is_file())
@@ -4056,7 +4068,12 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads(result.stdout)
             actions = payload["actions"]
-            self.assertTrue(any("write-context:" in a for a in actions))
+            # Context actions folded into `sync` are normalized into the same
+            # object schema (kind="context") as the rest of `.actions`.
+            self.assertTrue(
+                any(action["action"] == "write-context" and action["kind"] == "context" for action in actions),
+                actions,
+            )
 
             claude_md = repo / "home" / ".claude" / "CLAUDE.md"
             agents_md = repo / "home" / ".codex" / "AGENTS.md"

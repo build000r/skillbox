@@ -44,8 +44,10 @@ TICK_STALE_S="${SBP_SEND_LATER_TICK_STALE_S:-180}"
 # captured tail is STABLE across ticks (not streaming), matches an idle footer,
 # and does NOT match a busy/working indicator. Tunable per-job via --idle-regex
 # / --busy-regex, or globally via the env vars below.
-DEFAULT_IDLE_RE="${SBP_SEND_LATER_IDLE_RE:-Shift\\+Tab:mode|Ctrl\\+\\.:shortcuts|Grok Composer|\\? for shortcuts}"
+DEFAULT_IDLE_RE="${SBP_SEND_LATER_IDLE_RE:-Shift\\+Tab:mode|Ctrl\\+\\.:shortcuts|Grok Composer|\\? for shortcuts|^[[:space:]]*›([[:space:]]|$)}"
 DEFAULT_BUSY_RE="${SBP_SEND_LATER_BUSY_RE:-esc to interrupt|Esc to interrupt|esc to cancel|ctrl-c to interrupt|Ctrl\\+c:cancel|Ctrl\\+Enter:interject|Waiting…|Thinking…|Generating…|tokens/s|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏}"
+GATE_FOOTER_LINES="${SBP_SEND_LATER_GATE_FOOTER_LINES:-12}"
+[[ "$GATE_FOOTER_LINES" =~ ^[1-9][0-9]*$ ]] || GATE_FOOTER_LINES=12
 CAPTURE_LINES="${SBP_SEND_LATER_CAPTURE_LINES:-40}"
 
 usage() {
@@ -152,6 +154,41 @@ fmt_utc() {
 fmt_local() {
   [[ "${1:-0}" -gt 0 ]] || { printf 'never'; return 0; }
   date -d "@$1" +'%Y-%m-%d %H:%M %Z' 2>/dev/null || printf '?'
+}
+# Format a non-negative second-count as a countdown clock: [Nd ]HH:MM:SS.
+fmt_eta() {
+  local secs="${1:-}"
+  [[ "$secs" =~ ^[0-9]+$ ]] || { printf '-'; return 0; }
+  local d=$(( secs / 86400 )) h=$(( (secs % 86400) / 3600 ))
+  local m=$(( (secs % 3600) / 60 )) s=$(( secs % 60 ))
+  if (( d > 0 )); then
+    printf '%dd %02d:%02d:%02d' "$d" "$h" "$m" "$s"
+  else
+    printf '%02d:%02d:%02d' "$h" "$m" "$s"
+  fi
+}
+# Human "time until it fires" label for a job, by status. Recurring jobs have no
+# scheduled next-fire time -- once past DUE_EPOCH they are ARMED and fire on the
+# next cron tick their gate allows -- so a countdown there is meaningless.
+#   pending  -> HH:MM:SS remaining until the first-eligible time
+#   recurring-> armed  (eligible now; fires next allowed tick)
+#   due      -> now    (should fire this tick)
+#   overdue  -> overdue
+#   done     -> -
+# args: status due_epoch now
+eta_label() {
+  local status="$1" due_epoch="$2" now="$3"
+  case "$status" in
+    done|done:*) printf '-'; return 0 ;;
+    recurring)   printf 'armed'; return 0 ;;
+    due)         printf 'now'; return 0 ;;
+    overdue)     printf 'overdue'; return 0 ;;
+  esac
+  if [[ "$due_epoch" =~ ^[0-9]+$ ]] && (( due_epoch > now )); then
+    fmt_eta "$(( due_epoch - now ))"
+  else
+    printf 'now'
+  fi
 }
 
 # Resolve a wall-clock time expression to an epoch, optionally in a given TZ.
@@ -599,13 +636,18 @@ capture_norm() {
 #   unknown  -> stable but no recognizable footer (do not send)
 state_of_capture() {
   local cur="$1" prev="$2" idle_re="$3" busy_re="$4"
-  if printf '%s\n' "$cur" | grep -Eq -- "$busy_re" 2>/dev/null; then
+  local footer
+  # Interactive UIs retain old prompts and spinner text in their scrollback.
+  # Classify only the current footer so transcript history cannot make an idle
+  # pane look busy (or make an unknown pane look idle).
+  footer="$(printf '%s\n' "$cur" | tail -n "$GATE_FOOTER_LINES")"
+  if printf '%s\n' "$footer" | grep -Eq -- "$busy_re" 2>/dev/null; then
     printf 'running'; return 0
   fi
   if [[ "$cur" != "$prev" ]]; then
     printf 'running'; return 0
   fi
-  if printf '%s\n' "$cur" | grep -Eq -- "$idle_re" 2>/dev/null; then
+  if printf '%s\n' "$footer" | grep -Eq -- "$idle_re" 2>/dev/null; then
     printf 'waiting'; return 0
   fi
   printf 'unknown'
@@ -907,11 +949,15 @@ list_jobs() {
   if [[ "$json" == "true" ]]; then
     need_jq
     if [[ -z "$records" ]]; then echo '{"jobs":[],"count":0}'; return 0; fi
-    printf '%s\n' "$records" | jq -R -s '
+    local now; now="$(date -u +%s)"
+    printf '%s\n' "$records" | jq -R -s --argjson now "$now" '
       split("\n") | map(select(length > 0)) | map(split(""))
       | map({
           id:.[0], mode:.[1], recurring:(.[2]=="true"), gate:(.[3]=="true"),
           due_utc:.[4], due_epoch:(.[5]|tonumber),
+          eta_s:(if (.[6]|startswith("done")) then null
+                 elif (.[5]|tonumber) > $now then ((.[5]|tonumber) - $now)
+                 else 0 end),
           status:.[6],
           last_fire_utc:(if (.[7]|tonumber) > 0 then (.[7]|tonumber|todate) else null end),
           last_status:(if .[8]=="-" then null else .[8] end),
@@ -931,11 +977,12 @@ list_jobs() {
     echo "next: sbp send-later new   (interactive)   |   sbp send-later panes   (list targets)"
     return 0
   fi
-  printf '  %-26s %-9s %-10s %-20s %s\n' "ID" "STATUS" "MODE" "DUE (local)" "DEST"
+  local now; now="$(date -u +%s)"
+  printf '  %-26s %-9s %-10s %-20s %-13s %s\n' "ID" "STATUS" "MODE" "DUE (local)" "ETA" "DEST"
   local id mode recurring gate due_utc due_epoch status _lfe lstat ovd fires _maxf _exp dest
   while IFS=$'\x1f' read -r id mode recurring gate due_utc due_epoch status _lfe lstat ovd fires _maxf _exp dest; do
     [[ -n "$id" ]] || continue
-    printf '  %-26s %-9s %-10s %-20s %s\n' "$id" "$status" "$mode" "$(fmt_local "$due_epoch")" "$dest"
+    printf '  %-26s %-9s %-10s %-20s %-13s %s\n' "$id" "$status" "$mode" "$(fmt_local "$due_epoch")" "$(eta_label "$status" "$due_epoch" "$now")" "$dest"
   done <<< "$records"
   echo "next: sbp send-later doctor | new | panes | cancel ID | fire ID | run-pending"
 }

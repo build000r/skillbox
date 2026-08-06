@@ -57,6 +57,7 @@ import os as _os
 _SKILL_VISIBILITY_HEADER = """\
 from __future__ import annotations
 
+import errno
 import fnmatch
 import fcntl
 import glob

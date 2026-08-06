@@ -27,6 +27,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
@@ -784,7 +785,8 @@ def load_dotenv(path: Path) -> None:
 # These are consumed host-side only; they must live OUTSIDE the `.:/workspace` bind
 # mount so in-container agents cannot read them. Canonical home is
 # ${SKILLBOX_STATE_ROOT}/operator/ (the state root is mounted only at specific
-# subpaths, never wholesale). Repo-root copies are deprecated and warn.
+# subpaths, never wholesale). Repo-root copies are refused outright — loading a
+# secret file from inside the workspace mount is a hard error, never a fallback.
 # NOTE: workspace/boxes.json is NOT a credential (droplet IDs/IPs/topology only),
 # so it intentionally stays in the workspace mount.
 OPERATOR_SECRET_FILENAMES = (".env", ".env.box")
@@ -800,10 +802,11 @@ def operator_secret_dir() -> Path:
 
 
 def load_operator_secret(name: str) -> None:
-    """Load an operator secret file, preferring the relocated state-root copy.
+    """Load an operator secret file from the sanctioned state-root location.
 
-    Falls back to the deprecated repo-root location (inside the workspace mount)
-    with a loud stderr warning; no-op when neither file exists.
+    Refuses (SystemExit) when only the legacy repo-root copy exists: that path
+    sits inside the workspace bind mount, so loading it would hand live
+    credentials to any in-container agent. No-op when neither file exists.
     """
     new_path = operator_secret_dir() / name
     legacy_path = REPO_ROOT / name
@@ -811,14 +814,12 @@ def load_operator_secret(name: str) -> None:
         load_dotenv(new_path)
         return
     if legacy_path.is_file():
-        sys.stderr.write(
-            f"[skillbox] DEPRECATED secret location: {legacy_path} is inside the workspace "
-            f"bind mount and readable by in-container agents.\n"
-            f"[skillbox] Move it out of the mount with:\n"
-            f"    mkdir -p {operator_secret_dir()} && mv {legacy_path} {new_path}\n"
+        raise SystemExit(
+            f"[skillbox] REFUSING to load secrets from {legacy_path}: it is inside the "
+            f"workspace bind mount and readable by any in-container agent.\n"
+            f"[skillbox] Move it to the sanctioned operator location, then re-run:\n"
+            f"    mkdir -p {operator_secret_dir()} && mv {legacy_path} {new_path} && chmod 600 {new_path}"
         )
-        load_dotenv(legacy_path)
-        return
     # neither present: leave os.environ untouched; existing missing-credential UX handles it.
 
 
@@ -857,6 +858,9 @@ def _process_probe_metadata(result: subprocess.CompletedProcess[str] | Any) -> d
     failure_class = raw.get("failure_class", attrs.get("failure_class") if isinstance(attrs, dict) else None)
     if failure_class:
         payload["failure_class"] = failure_class
+    error_code = raw.get("error_code", attrs.get("error_code") if isinstance(attrs, dict) else None)
+    if error_code:
+        payload["error_code"] = str(error_code)
     if raw.get("deadline_exhausted"):
         payload["deadline_exhausted"] = True
     return payload
@@ -1254,7 +1258,7 @@ class BoxProfile:
     image: str = "ubuntu-24-04-x64"
     ssh_user: str = "skillbox"
     tailscale_hostname_prefix: str = "skillbox"
-    skillbox_repo: str = "https://github.com/example/skillbox.git"
+    skillbox_repo: str = "https://github.com/build000r/skillbox.git"
     skillbox_branch: str = "main"
     storage: "BoxProfileStorage | None" = None
 
@@ -1848,7 +1852,7 @@ def load_profile(name: str) -> BoxProfile:
         image=data.get("image", "ubuntu-24-04-x64"),
         ssh_user=data.get("ssh_user", "skillbox"),
         tailscale_hostname_prefix=data.get("tailscale_hostname_prefix", "skillbox"),
-        skillbox_repo=data.get("skillbox_repo", "https://github.com/example/skillbox.git"),
+        skillbox_repo=data.get("skillbox_repo", "https://github.com/build000r/skillbox.git"),
         skillbox_branch=data.get("skillbox_branch", "main"),
         storage=storage,
     )
@@ -2173,6 +2177,164 @@ def registration_payload(box: Box, probe: dict[str, Any], *, host: str) -> dict[
 # DigitalOcean operations
 # ---------------------------------------------------------------------------
 
+
+class ProviderOutcome(str, Enum):
+    """Semantic result of a read-only provider observation."""
+
+    FOUND = "found"
+    CONFIRMED_NOT_FOUND = "confirmed-not-found"
+    RETRYABLE_FAILURE = "retryable-failure"
+    PERMANENT_FAILURE = "permanent-failure"
+    MALFORMED_RESPONSE = "malformed-response"
+
+
+@dataclass(frozen=True)
+class ProviderObservation:
+    """Redacted provider evidence used by lifecycle reducers."""
+
+    outcome: ProviderOutcome
+    operation: str
+    resource_id: str
+    resource: dict[str, Any] | None = None
+    returncode: int | None = None
+    error_code: str | None = None
+    attempts: int = 1
+    failure_class: str | None = None
+    summary: str = ""
+
+    @property
+    def retryable(self) -> bool:
+        return self.outcome == ProviderOutcome.RETRYABLE_FAILURE
+
+    def with_attempts(self, attempts: int) -> ProviderObservation:
+        return ProviderObservation(
+            outcome=self.outcome,
+            operation=self.operation,
+            resource_id=self.resource_id,
+            resource=self.resource,
+            returncode=self.returncode,
+            error_code=self.error_code,
+            attempts=max(1, attempts),
+            failure_class=self.failure_class,
+            summary=self.summary,
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "outcome": self.outcome.value,
+            "operation": self.operation,
+            "resource_id": self.resource_id,
+            "attempts": self.attempts,
+            "retryable": self.retryable,
+        }
+        if self.returncode is not None:
+            payload["returncode"] = self.returncode
+        if self.error_code:
+            payload["error_code"] = self.error_code
+        if self.failure_class:
+            payload["failure_class"] = self.failure_class
+        if self.summary:
+            payload["summary"] = self.summary
+        return payload
+
+
+_PROVIDER_NETWORK_ERROR_PATTERNS = (
+    "connection aborted",
+    "connection refused",
+    "connection reset",
+    "connection timed out",
+    "context deadline exceeded",
+    "dial tcp",
+    "i/o timeout",
+    "network is unreachable",
+    "no such host",
+    "server misbehaving",
+    "temporary failure",
+    "tls handshake timeout",
+    "unexpected eof",
+)
+
+
+def _provider_error_summary(result: subprocess.CompletedProcess[str]) -> str:
+    # `run()` sources these strings from opslib's redacted result. Keep only a
+    # compact single line so provider diagnostics cannot become a log dump.
+    text = " ".join(f"{result.stderr} {result.stdout}".split())
+    return text[:240]
+
+
+def _provider_error_outcome(result: subprocess.CompletedProcess[str]) -> ProviderOutcome:
+    text = _provider_error_summary(result).lower()
+    metadata = _process_probe_metadata(result)
+    error_code = str(metadata.get("error_code") or "").upper()
+
+    # DigitalOcean's error contract maps the structured `not_found` id to HTTP
+    # 404. doctl may render either the JSON id or `...: 404 ...` on stderr.
+    # Requiring one of those status-bearing forms avoids treating a resource ID
+    # that merely contains 404 as proof of absence.
+    if re.search(r'"id"\s*:\s*"not_found"', text) or re.search(r":\s*404(?:\s|$)", text):
+        return ProviderOutcome.CONFIRMED_NOT_FOUND
+
+    retryable_status = re.search(r":\s*(?:429|5\d\d)(?:\s|$)", text)
+    retryable_id = re.search(r'"id"\s*:\s*"(?:too_many_requests|server_error)"', text)
+    if (
+        error_code == "TIMEOUT"
+        or metadata.get("retryable_hint")
+        or retryable_status
+        or retryable_id
+        or any(pattern in text for pattern in _PROVIDER_NETWORK_ERROR_PATTERNS)
+    ):
+        return ProviderOutcome.RETRYABLE_FAILURE
+    return ProviderOutcome.PERMANENT_FAILURE
+
+
+def _droplet_observation_from_result(
+    droplet_id: str,
+    result: subprocess.CompletedProcess[str],
+) -> ProviderObservation:
+    metadata = _process_probe_metadata(result)
+    common = {
+        "operation": "digitalocean.droplet.get",
+        "resource_id": str(droplet_id),
+        "returncode": int(result.returncode),
+        "error_code": metadata.get("error_code"),
+        "attempts": int(metadata.get("attempts") or 1),
+        "failure_class": metadata.get("failure_class"),
+    }
+    if result.returncode != 0:
+        return ProviderObservation(
+            outcome=_provider_error_outcome(result),
+            summary=_provider_error_summary(result),
+            **common,
+        )
+
+    try:
+        decoded = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError):
+        return ProviderObservation(
+            outcome=ProviderOutcome.MALFORMED_RESPONSE,
+            summary="provider returned invalid JSON",
+            **common,
+        )
+    if not isinstance(decoded, list) or len(decoded) != 1 or not isinstance(decoded[0], dict):
+        return ProviderObservation(
+            outcome=ProviderOutcome.MALFORMED_RESPONSE,
+            summary="provider returned an empty or unexpected resource shape",
+            **common,
+        )
+    resource = decoded[0]
+    if str(resource.get("id") or "") != str(droplet_id):
+        return ProviderObservation(
+            outcome=ProviderOutcome.MALFORMED_RESPONSE,
+            summary="provider resource ID did not match the requested droplet",
+            **common,
+        )
+    return ProviderObservation(
+        outcome=ProviderOutcome.FOUND,
+        resource=resource,
+        summary="droplet remains present",
+        **common,
+    )
+
 def do_create_droplet(
     name: str,
     *,
@@ -2197,15 +2359,41 @@ def do_create_droplet(
     return droplets[0]
 
 
-def do_get_droplet(droplet_id: str) -> dict[str, Any] | None:
-    result = run(
-        ["doctl", "compute", "droplet", "get", droplet_id, "--output", "json"],
-        check=False,
-    )
-    if result.returncode != 0:
-        return None
-    droplets = json.loads(result.stdout)
-    return droplets[0] if droplets else None
+def do_get_droplet(droplet_id: str) -> ProviderObservation:
+    operation = "digitalocean.droplet.get"
+    resource_id = str(droplet_id)
+    try:
+        result = run(
+            ["doctl", "compute", "droplet", "get", resource_id, "--output", "json"],
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return ProviderObservation(
+            ProviderOutcome.RETRYABLE_FAILURE,
+            operation,
+            resource_id,
+            error_code="TIMEOUT",
+            failure_class="provider_timeout",
+            summary="provider read timed out",
+        )
+    except FileNotFoundError:
+        return ProviderObservation(
+            ProviderOutcome.PERMANENT_FAILURE,
+            operation,
+            resource_id,
+            error_code="COMMAND_NOT_FOUND",
+            failure_class="provider_cli_unavailable",
+            summary="provider CLI is unavailable",
+        )
+    except Exception:
+        return ProviderObservation(
+            ProviderOutcome.PERMANENT_FAILURE,
+            operation,
+            resource_id,
+            failure_class="provider_read_exception",
+            summary="provider read failed before a response was available",
+        )
+    return _droplet_observation_from_result(resource_id, result)
 
 
 def do_delete_droplet(droplet_id: str) -> bool:
@@ -2228,31 +2416,59 @@ def confirm_droplet_absent(
     *,
     attempts: int = CONFIRM_DROPLET_ABSENT_ATTEMPTS,
     backoff_seconds: float = CONFIRM_DROPLET_ABSENT_BACKOFF_SECONDS,
-    sleep: Any = time.sleep,
-) -> bool:
+    sleep: Any | None = None,
+) -> ProviderObservation:
     """Read-after-delete confirmation that a droplet is truly gone.
 
-    Returns True only after `doctl compute droplet get` reports the droplet is
-    absent (404 / empty result -> do_get_droplet returns None). If the droplet is
-    still listed after a bounded number of attempts, returns False so the caller
-    keeps the inventory in a truthful pending state instead of lying `destroyed`.
-    A read error (doctl failure that is not a clean not-found) is treated as
-    *not confirmed* — we never assume absence we did not observe.
+    Returns typed provider evidence. Only an explicit confirmed-not-found
+    observation may advance the lifecycle to `destroyed`. Found and transient
+    failures receive bounded read-only retries; permanent and malformed results
+    stop immediately and remain non-confirming.
     """
     if not str(droplet_id or "").strip():
-        # Nothing to confirm; absence is vacuously true.
-        return True
+        return ProviderObservation(
+            ProviderOutcome.MALFORMED_RESPONSE,
+            "digitalocean.droplet.get",
+            "",
+            summary="no droplet ID exists to query for absence evidence",
+        )
     last_attempt = max(1, attempts)
+    sleep_fn = sleep or time.sleep
+    observation = ProviderObservation(
+        ProviderOutcome.RETRYABLE_FAILURE,
+        "digitalocean.droplet.get",
+        str(droplet_id),
+        summary="provider confirmation was not attempted",
+    )
     for attempt in range(1, last_attempt + 1):
         try:
-            droplet = do_get_droplet(droplet_id)
+            candidate = do_get_droplet(droplet_id)
         except Exception:
-            droplet = {"_confirm_read_error": True}
-        if droplet is None:
-            return True
+            candidate = ProviderObservation(
+                ProviderOutcome.RETRYABLE_FAILURE,
+                "digitalocean.droplet.get",
+                str(droplet_id),
+                failure_class="provider_read_exception",
+                summary="provider confirmation read raised unexpectedly",
+            )
+        if not isinstance(candidate, ProviderObservation):
+            candidate = ProviderObservation(
+                ProviderOutcome.MALFORMED_RESPONSE,
+                "digitalocean.droplet.get",
+                str(droplet_id),
+                summary="provider reader violated its typed result contract",
+            )
+        observation = candidate.with_attempts(attempt)
+        if observation.outcome == ProviderOutcome.CONFIRMED_NOT_FOUND:
+            return observation
+        if observation.outcome in {
+            ProviderOutcome.PERMANENT_FAILURE,
+            ProviderOutcome.MALFORMED_RESPONSE,
+        }:
+            return observation
         if attempt < last_attempt:
-            sleep(backoff_seconds * attempt)
-    return False
+            sleep_fn(backoff_seconds * attempt)
+    return observation
 
 
 def do_droplet_public_ip(droplet: dict[str, Any]) -> str | None:
@@ -2437,6 +2653,57 @@ def do_get_firewall(firewall_id: str) -> dict[str, Any] | None:
         return None
     firewalls = json.loads(result.stdout or "[]")
     return firewalls[0] if firewalls else None
+
+
+FIREWALL_ANY_CIDRS = ("0.0.0.0/0", "::/0")
+
+
+def _firewall_rule_covers_port(ports: str, port: int) -> bool:
+    """Whether a DO inbound-rule ports spec ("22", "8000-9000", "all", "0") covers a port.
+
+    Unparseable specs count as covering the port so posture checks fail closed.
+    """
+    spec = str(ports or "").strip().lower()
+    if spec in ("all", "0"):
+        return True
+    if "-" in spec:
+        start, _, end = spec.partition("-")
+        try:
+            return int(start) <= port <= int(end)
+        except ValueError:
+            return True
+    try:
+        return int(spec) == port
+    except ValueError:
+        return True
+
+
+def firewall_allows_public_ssh(firewall: dict[str, Any]) -> bool:
+    """True when any inbound rule admits TCP port 22 from an any-CIDR source."""
+    for rule in firewall.get("inbound_rules") or []:
+        if str(rule.get("protocol") or "").lower() != "tcp":
+            continue
+        if not _firewall_rule_covers_port(str(rule.get("ports") or ""), 22):
+            continue
+        addresses = (rule.get("sources") or {}).get("addresses") or []
+        if any(str(addr).strip() in FIREWALL_ANY_CIDRS for addr in addresses):
+            return True
+    return False
+
+
+def assert_cloud_firewall_locked_down(firewall_id: str, *, posture: str) -> None:
+    """Re-read a firewall after lockdown and fail closed unless public SSH is gone."""
+    firewall = do_get_firewall(firewall_id)
+    if firewall is None:
+        raise RuntimeError(
+            f"Cloud firewall {firewall_id} could not be re-read after lockdown; refusing to "
+            f"advance under {posture} posture while port 22 may still be world-reachable."
+        )
+    if firewall_allows_public_ssh(firewall):
+        raise RuntimeError(
+            f"Cloud firewall {firewall_id} still allows inbound SSH from {' or '.join(FIREWALL_ANY_CIDRS)} "
+            f"after lockdown; refusing to advance under {posture} posture."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2694,6 +2961,7 @@ def _create_box_droplet(context: BoxUpContext, *, ssh_key_id: str) -> str:
     droplet_id_str = str(droplet["id"])
     posture = resolve_network_posture(context.box)
     fw_id: str | None = None
+    fw_error: str | None = None
     if posture_requires_cloud_firewall(posture):
         try:
             fw = do_create_firewall(
@@ -2708,9 +2976,10 @@ def _create_box_droplet(context: BoxUpContext, *, ssh_key_id: str) -> str:
                 "posture": posture,
             })
         except Exception as exc:
+            fw_error = str(exc)[:200]
             context.steps.append({
                 "stage": "cloud_firewall_bootstrap",
-                "error": str(exc)[:200],
+                "error": fw_error,
                 "posture": posture,
             })
     update_box(
@@ -2722,6 +2991,14 @@ def _create_box_droplet(context: BoxUpContext, *, ssh_key_id: str) -> str:
     )
     context.boxes.append(context.box)
     save_inventory(context.boxes)
+    if posture_requires_cloud_firewall(posture) and not fw_id:
+        # Fail closed: without a cloud firewall the later lockdown stage has
+        # nothing to lock, leaving port 22 open to the world under tailnet_only.
+        raise RuntimeError(
+            f"Cloud firewall bootstrap failed under {posture} posture"
+            + (f": {fw_error}" if fw_error else " (doctl returned no firewall id)")
+            + f". Refusing to continue provisioning; run box down {context.box_id} and retry."
+        )
     return f"droplet {droplet['id']} at {ip}"
 
 
@@ -2843,25 +3120,40 @@ def _enroll_box_tailscale(context: BoxUpContext, *, ts_authkey: str) -> str:
             "tailnet_only_ssh": tailnet_only_ssh,
             "ufw_output": ufw_check.stdout[:500] if ufw_check.returncode == 0 else "ufw check failed",
         })
-    if posture_requires_cloud_firewall(posture) and context.box.cloud_firewall_id:
+    if posture_requires_cloud_firewall(posture):
+        fw_id = str(context.box.cloud_firewall_id or "").strip()
+        if not fw_id:
+            # Fail closed: no firewall means nothing was ever locked down and
+            # port 22 is still open to the world from the bootstrap rules.
+            raise RuntimeError(
+                f"No cloud firewall is associated with this box under {posture} posture; "
+                f"refusing to advance while port 22 may be world-reachable. "
+                f"Run box down {context.box_id} and re-provision."
+            )
         droplet_id_str = str(context.box.droplet_id or "")
         try:
             do_update_firewall_lockdown(
-                context.box.cloud_firewall_id,
+                fw_id,
                 f"skillbox-{context.box_id}",
                 [droplet_id_str],
             )
-            context.steps.append({
-                "stage": "cloud_firewall_lockdown",
-                "firewall_id": context.box.cloud_firewall_id,
-                "posture": posture,
-            })
         except Exception as exc:
             context.steps.append({
                 "stage": "cloud_firewall_lockdown",
                 "error": str(exc)[:200],
                 "posture": posture,
             })
+            raise RuntimeError(
+                f"Cloud firewall lockdown failed under {posture} posture; refusing to advance "
+                f"while port 22 is world-reachable: {exc}"
+            ) from exc
+        assert_cloud_firewall_locked_down(fw_id, posture=posture)
+        context.steps.append({
+            "stage": "cloud_firewall_lockdown",
+            "firewall_id": fw_id,
+            "posture": posture,
+            "verified": True,
+        })
     update_box(context.box, state="deploying")
     save_inventory(context.boxes)
     return f"tailscale {context.ts_hostname} at {ts_ip or 'unknown'}"
@@ -3819,16 +4111,56 @@ DESTROY_PENDING = "destroy-pending"
 DESTROY_FAILED = "delete-failed"
 
 
-def _destroy_box_droplet(box: Box, steps: list[dict[str, Any]], *, is_json: bool) -> str:
+@dataclass(frozen=True)
+class DestroyDropletResult:
+    status: str
+    observation: ProviderObservation | None = None
+
+
+def _droplet_confirmation_message(observation: ProviderObservation) -> str:
+    droplet_id = observation.resource_id or "<none>"
+    if observation.outcome == ProviderOutcome.CONFIRMED_NOT_FOUND:
+        return f"droplet {droplet_id} confirmed absent via API read"
+    if observation.outcome == ProviderOutcome.FOUND:
+        return f"droplet {droplet_id} remains API-listed; not marking destroyed"
+    return (
+        f"droplet {droplet_id} absence is unconfirmed: "
+        f"provider observation was {observation.outcome.value}"
+    )
+
+
+def _record_droplet_confirmation(
+    steps: list[dict[str, Any]],
+    observation: ProviderObservation,
+    *,
+    is_json: bool,
+) -> None:
+    status = "ok" if observation.outcome == ProviderOutcome.CONFIRMED_NOT_FOUND else "warn"
+    _box_down_step(
+        steps,
+        is_json,
+        "confirm",
+        status,
+        _droplet_confirmation_message(observation),
+    )
+    steps[-1]["provider_observation"] = observation.to_payload()
+
+
+def _destroy_box_droplet(
+    box: Box,
+    steps: list[dict[str, Any]],
+    *,
+    is_json: bool,
+) -> DestroyDropletResult:
     """Delete the droplet, then CONFIRM absence via read-after-delete.
 
-    Returns one of:
+    Returns a typed result whose status is one of:
       - DESTROY_CONFIRMED_ABSENT: doctl delete succeeded AND a follow-up
-        `doctl compute droplet get` reported the droplet gone (404/empty). Only
+        `doctl compute droplet get` returned explicit not-found evidence. Only
         this result lets the caller write the `destroyed` state.
-      - DESTROY_PENDING: delete succeeded but the droplet is still API-listed
-        after a bounded confirm-retry; inventory must stay truthful (the droplet
-        may still bill). Caller parks the box in `destroy-pending`.
+      - DESTROY_PENDING: delete succeeded but absence is not confirmed after a
+        bounded confirm-retry; inventory must stay truthful (the droplet may
+        still bill). Caller parks the box in `destroy-pending`.
       - DESTROY_FAILED: the delete call itself failed (non-zero / exception);
         inventory state is preserved for a clean retry.
 
@@ -3837,7 +4169,7 @@ def _destroy_box_droplet(box: Box, steps: list[dict[str, Any]], *, is_json: bool
     """
     if not box.droplet_id:
         _box_down_step(steps, is_json, "destroy", "skip", "no droplet id")
-        return DESTROY_CONFIRMED_ABSENT
+        return DestroyDropletResult(DESTROY_CONFIRMED_ABSENT)
 
     try:
         if not is_json:
@@ -3845,11 +4177,11 @@ def _destroy_box_droplet(box: Box, steps: list[dict[str, Any]], *, is_json: bool
         deleted = do_delete_droplet(box.droplet_id)
     except Exception as exc:
         _box_down_step(steps, is_json, "destroy", "fail", str(exc))
-        return DESTROY_FAILED
+        return DestroyDropletResult(DESTROY_FAILED)
 
     if not deleted:
         _box_down_step(steps, is_json, "destroy", "fail", "doctl delete returned non-zero")
-        return DESTROY_FAILED
+        return DestroyDropletResult(DESTROY_FAILED)
 
     _box_down_step(steps, is_json, "destroy", "ok", f"droplet {box.droplet_id} delete requested")
 
@@ -3858,20 +4190,11 @@ def _destroy_box_droplet(box: Box, steps: list[dict[str, Any]], *, is_json: bool
     # expensive lie — an inventory that says `destroyed` while DO still bills.
     if not is_json:
         print(f"[...] confirm  Verifying droplet {box.droplet_id} is gone...")
-    if confirm_droplet_absent(box.droplet_id):
-        _box_down_step(
-            steps, is_json, "confirm", "ok", f"droplet {box.droplet_id} confirmed absent via API read"
-        )
-        return DESTROY_CONFIRMED_ABSENT
-
-    _box_down_step(
-        steps,
-        is_json,
-        "confirm",
-        "warn",
-        f"droplet {box.droplet_id} delete requested but still API-listed; not marking destroyed",
-    )
-    return DESTROY_PENDING
+    observation = confirm_droplet_absent(box.droplet_id)
+    _record_droplet_confirmation(steps, observation, is_json=is_json)
+    if observation.outcome == ProviderOutcome.CONFIRMED_NOT_FOUND:
+        return DestroyDropletResult(DESTROY_CONFIRMED_ABSENT, observation)
+    return DestroyDropletResult(DESTROY_PENDING, observation)
 
 
 def _cleanup_box_volume(box: Box, steps: list[dict[str, Any]], *, is_json: bool) -> bool:
@@ -3953,28 +4276,43 @@ def _emit_box_down_destroy_failure(box: Box, box_id: str, steps: list[dict[str, 
     return EXIT_ERROR
 
 
-def _emit_box_down_destroy_pending(boxes: list[Box], box: Box, box_id: str, steps: list[dict[str, Any]], *, is_json: bool) -> int:
+def _emit_box_down_destroy_pending(
+    boxes: list[Box],
+    box: Box,
+    box_id: str,
+    steps: list[dict[str, Any]],
+    *,
+    is_json: bool,
+    observation: ProviderObservation | None = None,
+) -> int:
     update_box(box, state="destroy-pending")
     save_inventory(boxes)
+    if observation is not None and observation.outcome != ProviderOutcome.FOUND:
+        reason = f"provider confirmation is unavailable ({observation.outcome.value})"
+    else:
+        reason = "DigitalOcean still lists the droplet"
     message = (
-        f"Droplet delete was requested for box {box_id!r}, but DigitalOcean still lists the "
-        f"droplet (read-after-delete not yet confirmed). Inventory stays {box.state!r} so it does "
-        "not falsely report destroyed while the droplet may still bill."
+        f"Droplet delete was requested for box {box_id!r}, but {reason}. "
+        f"Inventory stays {box.state!r} so it does not falsely report destroyed while the "
+        "droplet may still bill."
     )
-    next_actions = [f"box status {box_id}", f"box down {box_id}", "box list"]
+    retry_command = f"python3 scripts/box.py down {box_id} --confirm {box_id} --format json"
+    next_actions = [f"box status {box_id}", retry_command, "box list"]
     payload = {
         "box_id": box_id,
         "dry_run": False,
         "steps": steps,
         "next_actions": next_actions,
     }
+    if observation is not None:
+        payload["provider_observation"] = observation.to_payload()
     payload.update(
         structured_error(
             message,
             error_type="destroy_pending",
             recovery_hint=(
-                "DigitalOcean delete is eventually consistent. Re-run box down to re-confirm "
-                "absence; if it persists, verify the droplet in the DO console."
+                "Re-run the identity-confirmed command to observe provider state again; if the "
+                "result persists, verify the droplet and provider access in the DO console."
             ),
             next_actions=next_actions,
         )
@@ -4102,12 +4440,19 @@ def _finish_box_down_destroy_phase(
       - DESTROY_PENDING: park in destroy-pending (truthful; droplet may bill).
       - DESTROY_CONFIRMED_ABSENT: safe to proceed to volume cleanup.
     """
-    destroy_status = _destroy_box_droplet(box, steps, is_json=is_json)
-    if destroy_status == DESTROY_FAILED:
+    destroy_result = _destroy_box_droplet(box, steps, is_json=is_json)
+    if destroy_result.status == DESTROY_FAILED:
         save_inventory(boxes)
         return _emit_box_down_destroy_failure(box, box_id, steps, is_json=is_json)
-    if destroy_status == DESTROY_PENDING:
-        return _emit_box_down_destroy_pending(boxes, box, box_id, steps, is_json=is_json)
+    if destroy_result.status == DESTROY_PENDING:
+        return _emit_box_down_destroy_pending(
+            boxes,
+            box,
+            box_id,
+            steps,
+            is_json=is_json,
+            observation=destroy_result.observation,
+        )
     return _finish_box_down_after_droplet_gone(boxes, box, box_id, steps, is_json=is_json)
 
 
@@ -4120,21 +4465,18 @@ def _resume_box_down_confirm_destroy(
     confirmation to converge. If the droplet is gone we proceed to volume
     cleanup; otherwise the box stays in destroy-pending.
     """
-    if not box.droplet_id or confirm_droplet_absent(box.droplet_id):
-        detail = (
-            "no droplet id" if not box.droplet_id
-            else f"droplet {box.droplet_id} confirmed absent via API read"
-        )
-        _box_down_step(steps, is_json, "confirm", "ok", detail)
+    observation = confirm_droplet_absent(str(box.droplet_id or ""))
+    _record_droplet_confirmation(steps, observation, is_json=is_json)
+    if observation.outcome == ProviderOutcome.CONFIRMED_NOT_FOUND:
         return _finish_box_down_after_droplet_gone(boxes, box, box_id, steps, is_json=is_json)
-    _box_down_step(
+    return _emit_box_down_destroy_pending(
+        boxes,
+        box,
+        box_id,
         steps,
-        is_json,
-        "confirm",
-        "warn",
-        f"droplet {box.droplet_id} still API-listed; staying in destroy-pending",
+        is_json=is_json,
+        observation=observation,
     )
-    return _emit_box_down_destroy_pending(boxes, box, box_id, steps, is_json=is_json)
 
 
 def _finish_box_down_after_droplet_gone(

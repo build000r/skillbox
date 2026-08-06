@@ -1,0 +1,13 @@
+{
+  "fixture_skill_count_minimum": 500,
+  "measured_run_count": 20,
+  "p95_index": 18,
+  "requested_skill": "sbp",
+  "schema_version": "skill-pull-performance-contract/v1",
+  "thresholds_ns": {
+    "SLO-HOST-001": 250000000,
+    "SLO-HOST-002": 2000000000,
+    "SLO-HOST-003": 5000000000,
+    "SLO-HOST-004": 1000000000
+  }
+}

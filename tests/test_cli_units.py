@@ -33,6 +33,41 @@ def _assert_elapsed_meta(testcase: unittest.TestCase, payload: dict[str, object]
     testcase.assertGreaterEqual(float(elapsed), 0.0)
 
 
+def _assert_component_meta(
+    testcase: unittest.TestCase,
+    payload: dict[str, object],
+    *,
+    expect_adapters: bool,
+) -> dict[str, object]:
+    """Assert meta separates end-to-end wall time from in-process compute.
+
+    ``meta.elapsed_ms`` alone hid ~10s of adapter/startup wall behind a ~2ms
+    number; these keys are what makes that visible.
+    """
+    meta = payload.get("meta")
+    testcase.assertIsInstance(meta, dict)
+    assert isinstance(meta, dict)
+    for key in ("compute_ms", "end_to_end_ms", "elapsed_ms"):
+        testcase.assertIn(key, meta)
+        testcase.assertIsInstance(meta[key], (int, float))
+        testcase.assertNotIsInstance(meta[key], bool)
+    testcase.assertEqual(meta["compute_ms"], meta["elapsed_ms"])
+    testcase.assertGreaterEqual(float(meta["end_to_end_ms"]), float(meta["compute_ms"]))
+    timing = meta.get("timing")
+    testcase.assertIsInstance(timing, dict)
+    assert isinstance(timing, dict)
+    testcase.assertIsInstance(timing.get("phases"), dict)
+    testcase.assertIn(timing.get("process_start_source"), {"proc_self_stat", "module_import"})
+    testcase.assertGreaterEqual(int(timing.get("invocation_index", 0)), 1)
+    if expect_adapters:
+        testcase.assertIn("adapter_collection_ms", meta)
+    else:
+        # An omitted phase is honest: --no-adapters really has no adapter cost,
+        # and a fabricated 0.0 would read as "adapters are free".
+        testcase.assertNotIn("adapter_collection_ms", meta)
+    return meta
+
+
 def _assert_error_envelope(testcase: unittest.TestCase, payload: dict[str, object], code: str) -> None:
     testcase.assertIs(payload["ok"], False)
     error = payload.get("error")
@@ -200,6 +235,80 @@ class CliUnitTests(unittest.TestCase):
         self.assertEqual(payloads[4]["snapshot_id"], "golden-fixture")
         for payload in payloads[:4]:
             _assert_elapsed_meta(self, payload)
+            meta = _assert_component_meta(self, payload, expect_adapters=False)
+            # Startup and model build are the wall time elapsed_ms never saw.
+            # These are one-shot processes, so both are strictly positive.
+            self.assertEqual(meta["timing"]["invocation_index"], 1)
+            self.assertGreater(float(meta["startup_ms"]), 0.0)
+            self.assertGreater(float(meta["model_ms"]), 0.0)
+            self.assertGreater(float(meta["end_to_end_ms"]), float(meta["startup_ms"]))
+
+    def test_next_reports_component_breakdown_without_building_the_model_twice(self) -> None:
+        real_build = CLI.build_runtime_model
+        builds: list[object] = []
+
+        def counting_build(root_dir: Path) -> dict[str, object]:
+            builds.append(root_dir)
+            return real_build(root_dir)
+
+        stdout = StringIO()
+        with mock.patch.object(CLI, "build_runtime_model", side_effect=counting_build):
+            with redirect_stdout(stdout):
+                code = CLI.main(["next", "--format", "json", "--no-adapters", "--limit", "1"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(builds), 1, "model_ms must not cost a second runtime model build")
+        payload = json.loads(stdout.getvalue())
+        meta = _assert_component_meta(self, payload, expect_adapters=False)
+        self.assertGreater(float(meta["model_ms"]), 0.0)
+        self.assertEqual(meta["timing"]["phases"]["model_ms"], meta["model_ms"])
+        # main() re-entered in-process: startup was already paid by an earlier
+        # invocation, so charging it again would inflate the number.
+        self.assertGreaterEqual(float(meta["startup_ms"]), 0.0)
+        if meta["timing"]["invocation_index"] > 1:
+            self.assertEqual(float(meta["startup_ms"]), 0.0)
+
+    def test_warm_in_process_reentry_does_not_recharge_startup(self) -> None:
+        # The MCP server calls cli.main() repeatedly in one long-lived process.
+        # Charging call N with the server's whole process age would report an
+        # end_to_end_ms orders of magnitude larger than the actual work.
+        metas = []
+        for _ in range(2):
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                self.assertEqual(CLI.main(["capabilities", "--format", "json", "--no-adapters"]), 0)
+            metas.append(json.loads(stdout.getvalue())["meta"])
+
+        first, second = metas
+        self.assertEqual(
+            second["timing"]["invocation_index"],
+            first["timing"]["invocation_index"] + 1,
+        )
+        self.assertEqual(float(second["startup_ms"]), 0.0)
+        # A warm capabilities call is sub-second work, not process age.
+        self.assertLess(float(second["end_to_end_ms"]), 30_000.0)
+
+    def test_next_with_adapters_attributes_adapter_wall_time(self) -> None:
+        from runtime_manager import agent_adapters as ADAPT
+
+        def fake_run(_command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(["stub"], 0, stdout="{}", stderr="")
+
+        stdout = StringIO()
+        with mock.patch.object(ADAPT.subprocess, "run", side_effect=fake_run):
+            with redirect_stdout(stdout):
+                code = CLI.main(["next", "--format", "json", "--limit", "1"])
+
+        self.assertEqual(code, 0)
+        payload = json.loads(stdout.getvalue())
+        meta = _assert_component_meta(self, payload, expect_adapters=True)
+        adapters = meta["timing"]["adapters"]
+        self.assertGreaterEqual(adapters["adapter_count"], 5)
+        self.assertIn("br_ready", adapters["statuses"])
+        self.assertIn("durations_ms", adapters)
+        self.assertIn("timeouts", adapters)
+        self.assertIn("unavailable", adapters)
+        self.assertEqual(meta["adapter_collection_ms"], adapters["collection_ms"])
 
     def test_explain_bare_brain_command_alias_resolves_to_command_node(self) -> None:
         result = _run_manage("explain", "next", "--format", "json", "--no-adapters")
@@ -210,8 +319,26 @@ class CliUnitTests(unittest.TestCase):
         self.assertEqual(payload["target"], "command:brain.next")
         self.assertEqual(payload["kind"], "command")
 
-    def test_snap_without_action_returns_structured_usage_payload(self) -> None:
-        result = _run_manage("snap", "--format", "json")
+    def test_snap_bare_json_creates_snapshot_like_siblings(self) -> None:
+        # skillbox-ej24: bare `snap --format json` (no verb) creates a read-only
+        # snapshot directly, matching sibling read-side surfaces (status/render).
+        result = _run_manage("snap", "--format", "json", "--no-adapters")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertIn("snapshot_id", payload)
+        self.assertIn("inputs", payload)
+        self.assertNotIn("error", payload)
+
+    def test_snap_bare_text_creates_snapshot(self) -> None:
+        # Bare `snap` in text mode also creates a snapshot (consistent default action).
+        result = _run_manage("snap", "--format", "text", "--no-adapters")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("snapshot:", result.stdout)
+
+    def test_snap_actions_returns_structured_usage_payload(self) -> None:
+        result = _run_manage("snap", "actions", "--format", "json")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
@@ -219,20 +346,14 @@ class CliUnitTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertNotIn("error", payload)
         self.assertTrue(payload["read_only_default"])
+        self.assertEqual(payload["default_action"], "create")
         self.assertEqual([item["name"] for item in payload["subcommands"]], ["create", "diff", "replay"])
         self.assertEqual(payload["actions"], payload["subcommands"])
         self.assertEqual(payload["subcommands"][0]["writes_only_with"], "--write")
         self.assertIn(
-            "snap --format json replay tests/goldens/agent_ops_snapshot.json",
+            "snap --format json",
             payload["next_actions"][0],
         )
-
-    def test_snap_without_action_text_mode_keeps_nonzero_usage_error(self) -> None:
-        result = _run_manage("snap", "--format", "text")
-
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("snap requires an action", result.stderr)
-        self.assertEqual(result.stdout, "")
 
     def test_snap_flag_first_replay_json(self) -> None:
         result = _run_manage(
@@ -546,11 +667,28 @@ class CliUnitTests(unittest.TestCase):
         bare_snap_args = mcp_server.build_args("snap", {})
         self.assertEqual(bare_snap_args, ["snap", "--format", "json"])
 
-    def test_skillbox_snap_without_action_returns_usage_payload(self) -> None:
+    def test_skillbox_snap_without_action_creates_snapshot_matching_cli(self) -> None:
+        # skillbox-ej24: bare `snap` (CLI) and omitted-action `skillbox_snap` (MCP)
+        # both now create a read-only snapshot. Parity between the two surfaces holds;
+        # discovery moved to `snap actions`.
         mcp_server = _load_mcp_server_module()
 
-        cli_usage = json.loads(_run_manage("snap", "--format", "json").stdout)
-        mcp_usage = mcp_server.dispatch_tool("skillbox_snap", {})
+        cli_bare = json.loads(_run_manage("snap", "--format", "json", "--no-adapters").stdout)
+        mcp_bare = mcp_server.dispatch_tool("skillbox_snap", {"no_adapters": True})
+        mcp_bare_payload = json.loads(mcp_bare["content"][0]["text"])
+
+        self.assertNotIn("isError", mcp_bare)
+        self.assertEqual(mcp_bare_payload["_exit_code"], 0)
+        self.assertIn("snapshot_id", cli_bare)
+        self.assertIn("snapshot_id", mcp_bare_payload)
+        self.assertIn("inputs", cli_bare)
+        self.assertIn("inputs", mcp_bare_payload)
+
+    def test_skillbox_snap_actions_returns_usage_payload(self) -> None:
+        mcp_server = _load_mcp_server_module()
+
+        cli_usage = json.loads(_run_manage("snap", "actions", "--format", "json").stdout)
+        mcp_usage = mcp_server.dispatch_tool("skillbox_snap", {"action": "actions"})
         mcp_usage_payload = json.loads(mcp_usage["content"][0]["text"])
 
         self.assertNotIn("isError", mcp_usage)
@@ -671,9 +809,9 @@ class CliUnitTests(unittest.TestCase):
         self.assertIn("active_profiles", payload)
         self.assertIn("Interpreting --jsno as --format json", result.stderr)
 
-    def test_unknown_command_error_suggests_correct_command_and_capabilities(self) -> None:
+    def test_unknown_command_error_text_mode_suggests_correct_command(self) -> None:
         result = subprocess.run(
-            [sys.executable, ".env-manager/manage.py", "statu", "--json"],
+            [sys.executable, ".env-manager/manage.py", "statu"],
             cwd=ROOT_DIR,
             capture_output=True,
             text=True,
@@ -685,6 +823,27 @@ class CliUnitTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertIn("Did you mean: `manage.py status`?", result.stderr)
         self.assertIn("manage.py capabilities --json", result.stderr)
+
+    def test_unknown_command_error_json_mode_returns_parseable_envelope(self) -> None:
+        # gkso: --format json usage errors return a parseable JSON error envelope on
+        # stdout (exit 2, clean stderr) instead of a plain-text usage block agents
+        # would have to scrape.
+        result = subprocess.run(
+            [sys.executable, ".env-manager/manage.py", "statu", "--json"],
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "PYTHONPATH": str(ENV_MANAGER_DIR)},
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip(), "")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["code"], "USAGE_ERROR")
+        self.assertEqual(payload["suggestions"][0]["command"], "status")
+        self.assertIn("manage.py status --format json", payload["next_actions"])
+        self.assertIn("manage.py capabilities --format json", payload["next_actions"])
 
     def test_cli_import_does_not_require_distribution_crypto_modules(self) -> None:
         code = r"""
@@ -1381,14 +1540,43 @@ except RuntimeError as exc:
         root = Path("/tmp/skillbox")
         model = {"services": [{"id": "api"}], "tasks": [{"id": "bootstrap"}]}
 
+        # `_handle_sync` emits `.actions` as OBJECTS. `sync_runtime_records` is the
+        # structured producer; context actions are normalized into the same schema.
         with (
-            mock.patch.object(CLI, "sync_runtime", return_value=["sync"]),
-            mock.patch.object(CLI, "sync_context", return_value=["context"]),
+            mock.patch.object(
+                CLI,
+                "sync_runtime_records",
+                return_value=[CLI.action_record("exists: /srv/box", action_id="box", kind="repo")],
+            ),
+            mock.patch.object(CLI, "sync_context", return_value=["write-context: home/.claude/CLAUDE.md"]),
             mock.patch.object(CLI, "resolve_context_dir", return_value=None),
             mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
         ):
             self.assertEqual(CLI._handle_sync(_ns(context_dir=None, format="json"), root, model, "reuse"), CLI.EXIT_OK)
-        self.assertEqual(emitted[-1]["actions"], ["sync", "context"])
+        self.assertEqual(
+            [(action["id"], action["kind"], action["text"]) for action in emitted[-1]["actions"]],
+            [
+                ("box", "repo", "exists: /srv/box"),
+                ("home-claude-claude-md", "context", "write-context: home/.claude/CLAUDE.md"),
+            ],
+        )
+
+        with (
+            mock.patch.object(
+                CLI,
+                "sync_runtime_records",
+                return_value=[CLI.action_record("exists: /srv/box", action_id="box", kind="repo")],
+            ),
+            mock.patch.object(CLI, "sync_context", return_value=["write-context: home/.claude/CLAUDE.md"]),
+            mock.patch.object(CLI, "resolve_context_dir", return_value=None),
+            redirect_stdout(StringIO()) as sync_stdout,
+        ):
+            self.assertEqual(CLI._handle_sync(_ns(context_dir=None, format="text"), root, model, "reuse"), CLI.EXIT_OK)
+        # Text output stays the verbatim human-readable lines, not record reprs.
+        self.assertEqual(
+            sync_stdout.getvalue(),
+            "exists: /srv/box\nwrite-context: home/.claude/CLAUDE.md\n",
+        )
 
         with (
             mock.patch.object(CLI, "sync_context", return_value=["context"]),

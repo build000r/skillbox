@@ -93,6 +93,17 @@ class DefaultRegistryTests(unittest.TestCase):
         for command_id in ("brain.next", "brain.graph", "brain.explain", "brain.search"):
             self.assertEqual(registry[command_id].side_effect, "none", command_id)
 
+    def test_clipboard_cli_surfaces_have_distinct_real_output_contracts(self) -> None:
+        registry = REG.load_default_registry()
+        status = registry["clipboard.status"]
+        doctor = registry["clipboard.doctor"]
+        explain = registry["clipboard.explain"]
+        self.assertEqual(status.entrypoint, "clipboard-paste")
+        self.assertEqual(doctor.outputs, status.outputs)
+        self.assertIn("target_probe", status.outputs)
+        self.assertNotIn("target_probe", explain.outputs)
+        self.assertIn("image_action", explain.outputs)
+
     def test_missing_required_entry_is_reported(self) -> None:
         specs = [s for s in REG.default_registry() if s.id != "brain.next"]
         issues = REG.validate_registry(specs)

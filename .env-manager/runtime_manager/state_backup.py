@@ -139,7 +139,6 @@ def _scan_state_root(state_root: Path, excludes: tuple[str, ...]) -> tuple[list[
 
     for current_root, dir_names, file_names in os.walk(state_root, topdown=True, followlinks=False):
         current = Path(current_root)
-        rel_current = current.relative_to(state_root)
 
         kept_dirs: list[str] = []
         for name in sorted(dir_names):

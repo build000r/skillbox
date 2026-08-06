@@ -47,10 +47,11 @@ The wrapper discovery contract. Agents should start here to learn the stable com
 | `contract_version` | CONTRACT | Version tag for this wrapper capabilities contract. |
 | `cwd` | CONTRACT | Invocation cwd used by the wrapper. |
 | `entrypoint` | CONTRACT | Wrapper entrypoint path relative to the skillbox repo. |
+| `mode` | CONTRACT | Execution environment mode; exactly host for this wrapper contract. |
 | `next_actions` | info | Common first follow-up commands. |
 | `ok` | CONTRACT | True when the wrapper emitted a complete capabilities payload. |
 | `safety` | CONTRACT | Dry-run and confirmation guidance for mutating commands. |
-| `skill_verbs` | CONTRACT | Machine-readable skill verb decision map; every dispatched skill subcommand has an entry. |
+| `skill_verbs` | CONTRACT | Machine-readable skill decision-verb map; receipt-only resolve is outside this map. |
 | `stdout_stderr_contract` | CONTRACT | Where JSON and diagnostics are emitted. |
 | `tool` | CONTRACT | Tool identity, e.g. skillbox-sbp. |
 
@@ -62,7 +63,7 @@ The wrapper discovery contract. Agents should start here to learn the stable com
 | `links_disk` | CONTRACT | True when the verb may create/remove skill links on disk. |
 | `mutates` | CONTRACT | Stable mutation class: none, cwd-ephemeral, disk-links, or repo-state+disk-links. |
 | `purpose` | CONTRACT | One-line meaning of the verb. |
-| `returns_packet` | CONTRACT | True when success includes an activation_packet for immediate session use. |
+| `returns_packet` | CONTRACT | True when success returns immediate-use skill content, either an activation or verified pull packet. |
 | `scope` | CONTRACT | Scope the verb operates on. |
 | `survives_recalibrate` | CONTRACT | True when the verb writes durable repo state that recalibrate/prune should preserve. |
 | `when_to_use` | info | Human/agent guidance for choosing this verb. |
@@ -154,6 +155,11 @@ The wrapper discovery contract. Agents should start here to learn the stable com
     },
     {
       "json": true,
+      "name": "skill-pull",
+      "safe_first_try": "sbp skill pull <skill> --format json"
+    },
+    {
+      "json": true,
       "name": "skill-togglable",
       "safe_first_try": "sbp skill togglable --json"
     },
@@ -204,6 +210,26 @@ The wrapper discovery contract. Agents should start here to learn the stable com
       "safe_first_try": "sbp send-later list --json"
     },
     {
+      "aliases": [
+        "load-guard",
+        "swarm-safe"
+      ],
+      "json": true,
+      "name": "safe",
+      "notes": "One-shot load gate; pass SECONDS to watch (sbp safe 10). Exit 0=GO, 1=NO-GO.",
+      "safe_first_try": "sbp safe --json"
+    },
+    {
+      "aliases": [
+        "conf1",
+        "tailnet"
+      ],
+      "json": true,
+      "name": "conference1",
+      "notes": "urls/status/helper are read-only; expose/remove require --yes; Funnel refused.",
+      "safe_first_try": "sbp conference1 status --json"
+    },
+    {
       "json": true,
       "name": "recalibrate",
       "safe_first_try": "sbp recalibrate --json"
@@ -212,6 +238,7 @@ The wrapper discovery contract. Agents should start here to learn the stable com
   "contract_version": "2026-05-11",
   "cwd": "<RUNTIME_ROOT>",
   "entrypoint": "scripts/sbp",
+  "mode": "host",
   "next_actions": [
     "sbp status --json",
     "sbp skills --issues-only --json",
@@ -335,6 +362,16 @@ The wrapper discovery contract. Agents should start here to learn the stable com
       "scope": "global, project, or all selected installs",
       "survives_recalibrate": false,
       "when_to_use": "Use after dry-run to remove drift that policy does not allow."
+    },
+    "pull": {
+      "do_NOT": "Do not treat pull as activation, linking, or a durable policy decision.",
+      "links_disk": false,
+      "mutates": "none",
+      "purpose": "Read one admitted skill as a verified current-session packet.",
+      "returns_packet": true,
+      "scope": "current cwd host policy",
+      "survives_recalibrate": false,
+      "when_to_use": "Use when the skill is needed now but durable visibility is not wanted."
     },
     "recalibrate": {
       "do_NOT": "Do not treat bare recalibrate as a mutator; --auto-fix previews and --auto-fix --yes applies heal.",

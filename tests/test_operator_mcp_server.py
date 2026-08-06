@@ -24,6 +24,32 @@ def _content_payload(result: dict) -> dict:
     return json.loads(result["content"][0]["text"])
 
 
+def _dcg_allow_record() -> dict:
+    """A deterministic 'guard allowed' record for tests that are not about DCG.
+
+    Tests below this helper exercise the box_exec policy gate, not the guard.
+    They stub the guard to a stable allow so they neither shell out to a real
+    binary nor accidentally assert fail-closed behaviour as a regression.
+    """
+    return {
+        "verdict": "allow",
+        "reason_code": "guard_allowed",
+        "reason": "stubbed allow",
+        "available": True,
+        "fail_closed": False,
+        "decision": "allow",
+        "dcg_version": MODULE.DCG_PINNED_VERSION,
+        "expected_version": MODULE.DCG_PINNED_VERSION,
+        "interface": MODULE.DCG_INTERFACE,
+    }
+
+
+def _patch_dcg_allow():
+    return mock.patch.object(
+        MODULE, "evaluate_command_with_dcg", side_effect=lambda *a, **k: _dcg_allow_record()
+    )
+
+
 class OperatorMcpServerTests(unittest.TestCase):
     def test_operator_provision_schema_surfaces_spaps_auth_blueprint(self) -> None:
         tool = next(item for item in MODULE.TOOLS if item["name"] == "operator_provision")
@@ -286,6 +312,71 @@ class OperatorMcpServerTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(payload["error"]["type"], "bad_args")
 
+    def test_run_script_dispatches_read_only_box_commands_in_process(self) -> None:
+        class FakeBox:
+            @staticmethod
+            def main(argv: list[str]) -> int:
+                print(json.dumps({"ok": True, "argv": list(argv)}))
+                return 0
+
+        with mock.patch.object(MODULE, "_BOX_MODULE", FakeBox), mock.patch.object(
+            MODULE.subprocess,
+            "run",
+            side_effect=AssertionError("read-only box.py command must not spawn a subprocess"),
+        ):
+            ok, code, payload = MODULE.run_script(MODULE.BOX_PY, ["list", "--format", "json"])
+
+        self.assertTrue(ok)
+        self.assertEqual(code, 0)
+        self.assertEqual(payload, {"ok": True, "argv": ["list", "--format", "json"]})
+
+    def test_run_script_in_process_crash_mirrors_subprocess_failure(self) -> None:
+        class FakeBox:
+            @staticmethod
+            def main(argv: list[str]) -> int:
+                raise ValueError("boom")
+
+        stderr_capture = io.StringIO()
+        with mock.patch.object(MODULE, "_BOX_MODULE", FakeBox), mock.patch.object(
+            sys, "stderr", stderr_capture
+        ):
+            ok, code, payload = MODULE.run_script(MODULE.BOX_PY, ["profiles", "--format", "json"])
+
+        self.assertFalse(ok)
+        self.assertEqual(code, 1)
+        self.assertEqual(payload, {"exit_code": 1})
+
+    def test_run_script_falls_back_to_subprocess_when_box_import_fails(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["python3"],
+            0,
+            stdout='{"ok": true}',
+            stderr="",
+        )
+        with mock.patch.object(
+            MODULE, "_box_module", side_effect=ModuleNotFoundError("box")
+        ), mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run:
+            ok, code, payload = MODULE.run_script(MODULE.BOX_PY, ["list", "--format", "json"])
+
+        self.assertTrue(ok)
+        self.assertEqual(code, 0)
+        self.assertEqual(payload, {"ok": True})
+        run.assert_called_once()
+
+    def test_run_script_mutating_box_commands_stay_on_subprocess(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["python3"],
+            0,
+            stdout='{"ok": true}',
+            stderr="",
+        )
+        with mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run:
+            ok, _code, payload = MODULE.run_script(MODULE.BOX_PY, ["up", "alpha", "--format", "json"])
+
+        self.assertTrue(ok)
+        self.assertEqual(payload, {"ok": True})
+        run.assert_called_once()
+
     def test_read_only_tool_handlers_and_event_journal_use_structured_outputs(self) -> None:
         with mock.patch.object(
             MODULE,
@@ -538,7 +629,7 @@ class OperatorMcpServerTests(unittest.TestCase):
             return_value={
                 "id": "alpha",
                 "state": "ready",
-                "tailscale_ip": "100.64.0.8",
+                "tailscale_ip": "100.100.0.8",
                 "tailscale_hostname": "skillbox-alpha",
                 "ssh_user": "skillbox",
             },
@@ -546,14 +637,14 @@ class OperatorMcpServerTests(unittest.TestCase):
             MODULE,
             "run_ssh",
             return_value=(True, 0, {"stdout": "ok"}),
-        ) as run_ssh:
+        ) as run_ssh, _patch_dcg_allow():
             result = MODULE.handle_operator_box_exec(
                 {"box_id": "alpha", "command": "pwd", "timeout": 15}
             )
 
         payload = _content_payload(result)
         self.assertEqual(payload["stdout"], "ok")
-        run_ssh.assert_called_once_with("skillbox", "100.64.0.8", "pwd", timeout=15)
+        run_ssh.assert_called_once_with("skillbox", "100.100.0.8", "pwd", timeout=15)
 
     def test_handle_operator_compose_up_covers_success_and_build_failure(self) -> None:
         with mock.patch.object(
@@ -923,12 +1014,12 @@ class OperatorMcpSshHardeningTests(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         with mock.patch.object(MODULE.subprocess, "run", side_effect=fake_run):
-            MODULE.run_ssh("skillbox", "100.64.0.1", "echo ok")
+            MODULE.run_ssh("skillbox", "100.100.0.1", "echo ok")
 
         cmd = captured["cmd"]
         self.assertEqual(cmd[0], "ssh")
         self.assertIn("--", cmd)
-        self.assertLess(cmd.index("--"), cmd.index("skillbox@100.64.0.1"))
+        self.assertLess(cmd.index("--"), cmd.index("skillbox@100.100.0.1"))
 
     def test_box_exec_rejects_flag_injection_host(self) -> None:
         poisoned = {
@@ -951,7 +1042,7 @@ class OperatorMcpSshHardeningTests(unittest.TestCase):
         poisoned = {
             "id": "alpha",
             "state": "ready",
-            "tailscale_ip": "100.64.0.8",
+            "tailscale_ip": "100.100.0.8",
             "ssh_user": "root; id;",
         }
         with mock.patch.object(MODULE, "find_box", return_value=poisoned), mock.patch.object(
@@ -968,18 +1059,18 @@ class OperatorMcpSshHardeningTests(unittest.TestCase):
         clean = {
             "id": "alpha",
             "state": "ready",
-            "tailscale_ip": "100.64.0.8",
+            "tailscale_ip": "100.100.0.8",
             "ssh_user": "skillbox",
         }
         with mock.patch.object(MODULE, "find_box", return_value=clean), mock.patch.object(
             MODULE, "run_ssh", return_value=(True, 0, {"stdout": "ok"})
-        ) as run_ssh:
+        ) as run_ssh, _patch_dcg_allow():
             result = MODULE.handle_operator_box_exec(
                 {"box_id": "alpha", "command": "pwd", "timeout": 15}
             )
 
         self.assertEqual(_content_payload(result)["stdout"], "ok")
-        run_ssh.assert_called_once_with("skillbox", "100.64.0.8", "pwd", timeout=15)
+        run_ssh.assert_called_once_with("skillbox", "100.100.0.8", "pwd", timeout=15)
 
 
 class OperatorBoxExecCommandPolicyTests(unittest.TestCase):
@@ -1116,7 +1207,7 @@ class OperatorBoxExecGateTests(unittest.TestCase):
     READY_BOX = {
         "id": "alpha",
         "state": "ready",
-        "tailscale_ip": "100.64.0.8",
+        "tailscale_ip": "100.100.0.8",
         "ssh_user": "skillbox",
     }
 
@@ -1124,8 +1215,10 @@ class OperatorBoxExecGateTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self._repo_root_patch = mock.patch.object(MODULE, "REPO_ROOT", Path(self._tmp.name))
         self._repo_root_patch.start()
-        # dcg is optional and absent in CI; make that explicit + deterministic.
-        self._dcg_patch = mock.patch.object(MODULE.shutil, "which", return_value=None)
+        # These tests cover the marker/classifier gate, not the guard. Stub the
+        # DCG adapter to a deterministic allow so they never shell out to a real
+        # binary; guard behaviour itself is covered by DcgAdapterTests.
+        self._dcg_patch = _patch_dcg_allow()
         self._dcg_patch.start()
 
     def tearDown(self) -> None:
@@ -1147,7 +1240,7 @@ class OperatorBoxExecGateTests(unittest.TestCase):
             result = MODULE.handle_operator_box_exec({"box_id": "alpha", "command": "docker ps"})
 
         self.assertEqual(_content_payload(result)["stdout"], "ok")
-        run_ssh.assert_called_once_with("skillbox", "100.64.0.8", "docker ps", timeout=120)
+        run_ssh.assert_called_once_with("skillbox", "100.100.0.8", "docker ps", timeout=120)
         # Acceptance (4): an audit event is recorded.
         events = self._journal_events()
         self.assertEqual(len(events), 1)
@@ -1294,6 +1387,390 @@ class OperatorBoxExecGateTests(unittest.TestCase):
         self.assertEqual(payload["error"]["type"], "invalid_parameter")
         self.assertIn("dry_run", payload["error"]["message"])
         run_ssh.assert_not_called()
+
+
+class DcgAdapterTests(unittest.TestCase):
+    """skillbox-dcg-operator-adapter-scpz — the operator DCG adapter.
+
+    Contract under test:
+
+    * The adapter speaks the supported DCG 0.6.7 robot surface
+      (``dcg test --robot --format json``), NOT the removed
+      ``dcg check --stdin`` advisory path.
+    * The safe fixture allows; the destructive fixture denies with structure.
+    * Missing binary, missing pin, spawn failure, timeout, malformed JSON,
+      incompatible version/schema, and an unrecognized decision ALL fail closed
+      on the authoritative path. "No verdict" is not expressible.
+    * Exactly one call site is non-authoritative — the ``operator_box_exec``
+      dry-run preview, declared in ``MODULE.DCG_ADVISORY_SITES`` — and it is
+      tested as such.
+
+    RISK GATE (bead ``risk_gate: payload runner remains inert``): no test in
+    this class executes the command it inspects.
+
+    1. The destructive fixture is *textually* destructive but *referentially*
+       inert: its ``rm -rf`` targets a path that does not exist, and its only
+       creative clause is ``touch <sentinel>`` inside a throwaway temp dir. If
+       it ever ran, the worst case would be one empty file in a temp dir.
+    2. :meth:`tearDown` asserts that sentinel is still ABSENT after every test,
+       so any accidental execution fails the suite loudly.
+    3. ``run_ssh`` is mocked everywhere and asserted un-called on deny paths.
+    4. :meth:`test_adapter_passes_command_as_one_argv_element_never_a_shell`
+       proves the payload reaches ``dcg test`` as a single argv element, so no
+       shell ever parses it.
+    """
+
+    READY_BOX = {
+        "id": "alpha",
+        "state": "ready",
+        "tailscale_ip": "100.100.0.8",
+        "ssh_user": "skillbox",
+    }
+
+    SAFE_FIXTURE = "ls -la /var/log"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._repo_root_patch = mock.patch.object(MODULE, "REPO_ROOT", Path(self._tmp.name))
+        self._repo_root_patch.start()
+        # Execution sentinel: created ONLY if the destructive payload is ever
+        # actually run by a shell. tearDown asserts it never appears.
+        self.sentinel = Path(self._tmp.name) / "dcg-payload-executed.sentinel"
+        # Inert-by-construction destructive fixture (see class docstring).
+        self.destructive_fixture = (
+            "rm -rf /nonexistent-skillbox-dcg-fixture-does-not-exist "
+            f"; touch {self.sentinel}"
+        )
+
+    def tearDown(self) -> None:
+        sentinel_present = self.sentinel.exists()
+        self._repo_root_patch.stop()
+        self._tmp.cleanup()
+        self.assertFalse(
+            sentinel_present,
+            "RISK GATE VIOLATION: the destructive fixture was executed "
+            "(execution sentinel exists). The adapter must only INSPECT.",
+        )
+
+    # -- helpers ---------------------------------------------------------
+
+    @staticmethod
+    def _robot(**fields) -> str:
+        report = {
+            "schema_version": MODULE.DCG_ROBOT_SCHEMA_VERSION,
+            "dcg_version": MODULE.DCG_PINNED_VERSION.lstrip("v"),
+            "robot_mode": True,
+        }
+        report.update(fields)
+        return json.dumps(report)
+
+    def _patch_run_checked(self, *, rc: int = 0, stdout: str = "", **extra):
+        result = {"rc": rc, "stdout": stdout, "stderr_redacted": "", "elapsed": 0.01}
+        result.update(extra)
+        return mock.patch.object(MODULE, "run_checked", return_value=result)
+
+    @staticmethod
+    def _patch_binary(path: str = "/opt/pinned/dcg"):
+        return mock.patch.object(MODULE, "_dcg_binary_path", return_value=path)
+
+    # -- the supported interface ----------------------------------------
+
+    def test_no_production_reference_to_obsolete_dcg_check_stdin(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn("check", source.split("DCG_INTERFACE =")[1].split("\n")[0])
+        for line in source.splitlines():
+            self.assertNotRegex(
+                line,
+                r"dcg.*check.*--stdin",
+                "the removed `dcg check --stdin` interface must not reappear",
+            )
+        self.assertEqual(MODULE.DCG_INTERFACE, "dcg test --robot --format json")
+
+    def test_version_pin_is_consumed_from_dcg_distribution(self) -> None:
+        # The pin must NOT be re-declared here; it is imported from the single
+        # source of truth in .env-manager/runtime_manager/dcg_distribution.py.
+        sys.path.insert(0, str(ROOT_DIR / ".env-manager"))
+        try:
+            from runtime_manager import dcg_distribution
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(MODULE.DCG_PINNED_VERSION, dcg_distribution.DCG_VERSION)
+        self.assertEqual(MODULE.DCG_PINNED_VERSION, "v0.6.7")
+        self.assertEqual(MODULE.DCG_PIN_IMPORT_ERROR, "")
+
+    def test_adapter_passes_command_as_one_argv_element_never_a_shell(self) -> None:
+        captured: dict = {}
+
+        def fake_run_checked(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["kwargs"] = kwargs
+            return {"rc": 1, "stdout": self._robot(decision="deny"), "stderr_redacted": ""}
+
+        with self._patch_binary(), mock.patch.object(
+            MODULE, "run_checked", side_effect=fake_run_checked
+        ):
+            MODULE.evaluate_command_with_dcg(self.destructive_fixture)
+
+        cmd = captured["cmd"]
+        self.assertEqual(cmd[0], "/opt/pinned/dcg")
+        self.assertEqual(cmd[1], "test")
+        self.assertIn("--robot", cmd)
+        self.assertIn("--format", cmd)
+        self.assertIn("json", cmd)
+        # `--` separator then the payload as EXACTLY ONE argv element.
+        self.assertEqual(cmd[-2], "--")
+        self.assertEqual(cmd[-1], self.destructive_fixture)
+        self.assertEqual(cmd.count(self.destructive_fixture), 1)
+        # No shell, and the payload is never piped into anything's stdin.
+        self.assertNotIn("shell", captured["kwargs"])
+        self.assertIsNone(captured["kwargs"].get("input_text"))
+
+    # -- allow / deny ----------------------------------------------------
+
+    def test_safe_fixture_allows(self) -> None:
+        with self._patch_binary(), self._patch_run_checked(
+            rc=0, stdout=self._robot(decision="allow")
+        ):
+            verdict = MODULE.evaluate_command_with_dcg(self.SAFE_FIXTURE)
+        self.assertEqual(verdict["verdict"], "allow")
+        self.assertTrue(verdict["available"])
+        self.assertFalse(verdict["fail_closed"])
+        self.assertFalse(MODULE.dcg_blocks_execution(verdict))
+
+    def test_warn_decision_is_a_supported_allow(self) -> None:
+        with self._patch_binary(), self._patch_run_checked(
+            rc=2, stdout=self._robot(decision="warn")
+        ):
+            verdict = MODULE.evaluate_command_with_dcg(self.SAFE_FIXTURE)
+        self.assertEqual(verdict["verdict"], "allow")
+        self.assertTrue(verdict["warned"])
+
+    def test_destructive_fixture_denies_with_structure(self) -> None:
+        with self._patch_binary(), self._patch_run_checked(
+            rc=1,
+            stdout=self._robot(
+                decision="deny",
+                rule_id="core.filesystem:rm-rf-general",
+                pack_id="core.filesystem",
+                severity="critical",
+                reason="rm -rf outside a temp subtree is destructive",
+            ),
+        ):
+            verdict = MODULE.evaluate_command_with_dcg(self.destructive_fixture)
+        self.assertEqual(verdict["verdict"], "deny")
+        self.assertEqual(verdict["rule_id"], "core.filesystem:rm-rf-general")
+        self.assertEqual(verdict["pack_id"], "core.filesystem")
+        self.assertEqual(verdict["severity"], "critical")
+        self.assertFalse(verdict["fail_closed"])
+        self.assertTrue(MODULE.dcg_blocks_execution(verdict))
+
+    # -- fail-closed probes ---------------------------------------------
+
+    def test_missing_binary_fails_closed(self) -> None:
+        with mock.patch.object(MODULE, "_dcg_binary_path", return_value=""):
+            verdict = MODULE.evaluate_command_with_dcg(self.SAFE_FIXTURE)
+        self.assertEqual(verdict["verdict"], "unavailable")
+        self.assertEqual(verdict["reason_code"], "binary_missing")
+        self.assertTrue(verdict["fail_closed"])
+        self.assertTrue(MODULE.dcg_blocks_execution(verdict))
+
+    def test_missing_pin_fails_closed(self) -> None:
+        with mock.patch.object(MODULE, "DCG_PINNED_VERSION", ""), mock.patch.object(
+            MODULE, "DCG_PIN_IMPORT_ERROR", "ImportError: no runtime_manager"
+        ):
+            verdict = MODULE.evaluate_command_with_dcg(self.SAFE_FIXTURE)
+        self.assertEqual(verdict["reason_code"], "pin_unavailable")
+        self.assertTrue(MODULE.dcg_blocks_execution(verdict))
+
+    def test_timeout_fails_closed(self) -> None:
+        with self._patch_binary(), self._patch_run_checked(
+            rc=-1, stdout="", error_code="TIMEOUT"
+        ):
+            verdict = MODULE.evaluate_command_with_dcg(self.destructive_fixture)
+        self.assertEqual(verdict["reason_code"], "timeout")
+        self.assertTrue(verdict["fail_closed"])
+        self.assertTrue(MODULE.dcg_blocks_execution(verdict))
+
+    def test_spawn_failure_fails_closed(self) -> None:
+        with self._patch_binary(), self._patch_run_checked(
+            rc=-1, stdout="", error_code="COMMAND_NOT_FOUND"
+        ):
+            verdict = MODULE.evaluate_command_with_dcg(self.destructive_fixture)
+        self.assertEqual(verdict["reason_code"], "invocation_failed")
+        self.assertTrue(MODULE.dcg_blocks_execution(verdict))
+
+    def test_malformed_json_fails_closed(self) -> None:
+        for stdout in ("", "not json at all", "[1, 2, 3]", '{"decision": "allow"'):
+            with self.subTest(stdout=stdout):
+                with self._patch_binary(), self._patch_run_checked(rc=0, stdout=stdout):
+                    verdict = MODULE.evaluate_command_with_dcg(self.destructive_fixture)
+                self.assertEqual(verdict["verdict"], "unavailable")
+                self.assertEqual(verdict["reason_code"], "malformed_output")
+                self.assertTrue(MODULE.dcg_blocks_execution(verdict))
+
+    def test_incompatible_version_fails_closed(self) -> None:
+        with self._patch_binary(), self._patch_run_checked(
+            rc=0, stdout=self._robot(decision="allow", dcg_version="0.5.1")
+        ):
+            verdict = MODULE.evaluate_command_with_dcg(self.SAFE_FIXTURE)
+        self.assertEqual(verdict["verdict"], "unavailable")
+        self.assertEqual(verdict["reason_code"], "incompatible_version")
+        self.assertIn("v0.5.1", verdict["reason"])
+        self.assertTrue(MODULE.dcg_blocks_execution(verdict))
+
+    def test_unreadable_version_fails_closed(self) -> None:
+        with self._patch_binary(), self._patch_run_checked(
+            rc=0, stdout=self._robot(decision="allow", dcg_version="")
+        ):
+            verdict = MODULE.evaluate_command_with_dcg(self.SAFE_FIXTURE)
+        self.assertEqual(verdict["reason_code"], "incompatible_version")
+        self.assertTrue(MODULE.dcg_blocks_execution(verdict))
+
+    def test_incompatible_schema_version_fails_closed(self) -> None:
+        payload = json.loads(self._robot(decision="allow"))
+        payload["schema_version"] = 2
+        with self._patch_binary(), self._patch_run_checked(rc=0, stdout=json.dumps(payload)):
+            verdict = MODULE.evaluate_command_with_dcg(self.SAFE_FIXTURE)
+        self.assertEqual(verdict["reason_code"], "incompatible_version")
+        self.assertTrue(MODULE.dcg_blocks_execution(verdict))
+
+    def test_unsupported_decision_fails_closed(self) -> None:
+        for decision in ("maybe", "", "unknown"):
+            with self.subTest(decision=decision):
+                with self._patch_binary(), self._patch_run_checked(
+                    rc=0, stdout=self._robot(decision=decision)
+                ):
+                    verdict = MODULE.evaluate_command_with_dcg(self.destructive_fixture)
+                self.assertEqual(verdict["reason_code"], "unsupported_response")
+                self.assertTrue(MODULE.dcg_blocks_execution(verdict))
+
+    def test_none_verdict_blocks(self) -> None:
+        # There is no "no verdict" outcome; even a None can only ever block.
+        self.assertTrue(MODULE.dcg_blocks_execution(None))
+        self.assertTrue(MODULE.dcg_blocks_execution({}))
+
+    # -- authoritative call sites ---------------------------------------
+
+    def test_authoritative_readonly_path_denies_when_guard_unavailable(self) -> None:
+        # AUTHORITATIVE site 1: the read-only allowlist fast path.
+        with mock.patch.object(MODULE, "find_box", return_value=self.READY_BOX), mock.patch.object(
+            MODULE, "run_ssh"
+        ) as run_ssh, mock.patch.object(MODULE, "_dcg_binary_path", return_value=""):
+            result = MODULE.handle_operator_box_exec({"box_id": "alpha", "command": "docker ps"})
+
+        payload = _content_payload(result)
+        self.assertTrue(result["isError"])
+        self.assertEqual(payload["error"]["type"], "dcg_unavailable")
+        self.assertFalse(payload["error"]["executed"])
+        self.assertEqual(payload["error"]["dcg"]["reason_code"], "binary_missing")
+        run_ssh.assert_not_called()
+
+    def test_authoritative_marker_path_denies_destructive_fixture(self) -> None:
+        # AUTHORITATIVE site 2: a mutating command WITH a valid dry-run marker.
+        # The marker proves the operator previewed it; the guard still denies.
+        deny_stdout = self._robot(
+            decision="deny",
+            rule_id="core.filesystem:rm-rf-general",
+            pack_id="core.filesystem",
+            severity="critical",
+            reason="rm -rf outside a temp subtree is destructive",
+        )
+        with mock.patch.object(MODULE, "find_box", return_value=self.READY_BOX), mock.patch.object(
+            MODULE, "run_ssh"
+        ) as run_ssh, self._patch_binary(), self._patch_run_checked(rc=1, stdout=deny_stdout):
+            preview = MODULE.handle_operator_box_exec(
+                {"box_id": "alpha", "command": self.destructive_fixture, "dry_run": True}
+            )
+            self.assertTrue(_content_payload(preview)["dry_run"])
+            result = MODULE.handle_operator_box_exec(
+                {"box_id": "alpha", "command": self.destructive_fixture}
+            )
+
+        payload = _content_payload(result)
+        self.assertTrue(result["isError"])
+        self.assertEqual(payload["error"]["type"], "dcg_denied")
+        self.assertEqual(payload["error"]["dcg"]["rule_id"], "core.filesystem:rm-rf-general")
+        self.assertFalse(payload["error"]["executed"])
+        run_ssh.assert_not_called()
+        # And the audit trail records the guard deny (never the raw payload).
+        journal = Path(self._tmp.name) / "logs" / "runtime" / "journal.jsonl"
+        events = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines() if line]
+        self.assertEqual(events[-1]["detail"]["verdict"], "deny-dcg-marker")
+
+    def test_authoritative_marker_path_allows_safe_fixture(self) -> None:
+        # Safe-allow is preserved end to end: preview, then a real run.
+        allow_stdout = self._robot(decision="allow")
+        with mock.patch.object(MODULE, "find_box", return_value=self.READY_BOX), mock.patch.object(
+            MODULE, "run_ssh", return_value=(True, 0, {"stdout": "ok"})
+        ) as run_ssh, self._patch_binary(), self._patch_run_checked(rc=0, stdout=allow_stdout):
+            MODULE.handle_operator_box_exec(
+                {"box_id": "alpha", "command": "systemctl restart nginx", "dry_run": True}
+            )
+            result = MODULE.handle_operator_box_exec(
+                {"box_id": "alpha", "command": "systemctl restart nginx"}
+            )
+        self.assertEqual(_content_payload(result)["stdout"], "ok")
+        run_ssh.assert_called_once()
+
+    # -- the ONE non-authoritative call site -----------------------------
+
+    def test_declared_advisory_sites_are_exactly_the_dry_run_preview(self) -> None:
+        self.assertEqual(
+            MODULE.DCG_ADVISORY_SITES, ("operator_box_exec:dry_run_preview",)
+        )
+        with self.assertRaises(ValueError):
+            MODULE.dcg_advisory("ls", site="operator_box_exec:real_run")
+
+    def test_dry_run_preview_is_non_authoritative_and_does_not_block(self) -> None:
+        # NON-AUTHORITATIVE site: a preview executes nothing, so an unavailable
+        # guard annotates the preview instead of failing it — while flagging
+        # that the real run WILL be blocked.
+        with mock.patch.object(MODULE, "find_box", return_value=self.READY_BOX), mock.patch.object(
+            MODULE, "run_ssh"
+        ) as run_ssh, mock.patch.object(MODULE, "_dcg_binary_path", return_value=""):
+            preview = MODULE.handle_operator_box_exec(
+                {"box_id": "alpha", "command": self.destructive_fixture, "dry_run": True}
+            )
+
+        payload = _content_payload(preview)
+        self.assertFalse(preview.get("isError", False))
+        self.assertTrue(payload["dry_run"])
+        self.assertEqual(payload["would_run"]["command"], self.destructive_fixture)
+        dcg = payload["dcg"]
+        self.assertFalse(dcg["authoritative"])
+        self.assertEqual(dcg["site"], "operator_box_exec:dry_run_preview")
+        self.assertFalse(dcg["blocks_execution_here"])
+        self.assertTrue(dcg["blocks_real_run"])
+        self.assertEqual(dcg["reason_code"], "binary_missing")
+        run_ssh.assert_not_called()
+
+    def test_preview_advisory_does_not_let_the_real_run_through(self) -> None:
+        # The advisory preview stamps a marker; the authoritative gate still
+        # denies the real run, so advisory never becomes a false green.
+        with mock.patch.object(MODULE, "find_box", return_value=self.READY_BOX), mock.patch.object(
+            MODULE, "run_ssh"
+        ) as run_ssh, mock.patch.object(MODULE, "_dcg_binary_path", return_value=""):
+            MODULE.handle_operator_box_exec(
+                {"box_id": "alpha", "command": self.destructive_fixture, "dry_run": True}
+            )
+            result = MODULE.handle_operator_box_exec(
+                {"box_id": "alpha", "command": self.destructive_fixture}
+            )
+        self.assertEqual(_content_payload(result)["error"]["type"], "dcg_unavailable")
+        run_ssh.assert_not_called()
+
+    # -- against the real pinned binary (skipped when absent) ------------
+
+    @unittest.skipUnless(MODULE._dcg_binary_path(), "pinned dcg binary not installed")
+    def test_real_pinned_binary_allows_safe_and_denies_destructive(self) -> None:
+        allow = MODULE.evaluate_command_with_dcg(self.SAFE_FIXTURE)
+        self.assertEqual(allow["verdict"], "allow", allow)
+        self.assertEqual(allow["dcg_version"], MODULE.DCG_PINNED_VERSION)
+
+        deny = MODULE.evaluate_command_with_dcg(self.destructive_fixture)
+        self.assertEqual(deny["verdict"], "deny", deny)
+        self.assertTrue(deny["rule_id"])
+        # tearDown proves the payload was inspected, never executed.
 
 
 if __name__ == "__main__":
