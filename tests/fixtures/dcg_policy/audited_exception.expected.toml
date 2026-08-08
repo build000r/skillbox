@@ -11,3 +11,6 @@ fail_closed = false
 
 [packs]
 enabled = ["core.git", "core.filesystem", "containers.docker"]
+
+[overrides]
+block = [{ pattern = "(?i)\\btmux\\s+capture-pane\\b", reason = "Direct `tmux capture-pane` polling is disabled. Use `ntm --ssh HOST --robot-is-working=SESSION --robot-terse` for status, `ntm --ssh HOST --robot-wait=SESSION --wait-until=idle --timeout=2h` for completion, or `ntm --ssh HOST --robot-tail=SESSION --lines=20` for output. The `vibing-with-ntm` skill is available for command selection and recovery. NTM pane indexes are not tmux pane ids; omit `--panes` unless you inspected the NTM mapping." }]

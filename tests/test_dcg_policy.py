@@ -59,12 +59,16 @@ class DefaultPolicyTests(unittest.TestCase):
         self.assertEqual(policy.packs, ("core.git", "core.filesystem"))
         self.assertTrue(policy.fail_closed)
         self.assertEqual(policy.allowlist, ())
+        self.assertEqual(policy.blocklist, DP.DEFAULT_BLOCK_RULES)
         self.assertIsNone(policy.exception)
 
-    def test_default_render_has_no_permissive_allowlist_block(self) -> None:
+    def test_default_render_has_ntm_redirect_without_a_permissive_allowlist(self) -> None:
         text = DP.render()
-        self.assertNotIn("[overrides]", text)
+        self.assertIn("[overrides]", text)
         self.assertNotIn("allow =", text)
+        self.assertIn("block =", text)
+        self.assertIn("vibing-with-ntm", text)
+        self.assertIn("--robot-wait", text)
 
     def test_render_preserves_the_generated_ownership_marker(self) -> None:
         text = DP.render()

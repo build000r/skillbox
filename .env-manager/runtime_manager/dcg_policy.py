@@ -100,6 +100,17 @@ MIN_ALLOWLIST_ANCHOR_CHARS = 3
 
 MAX_ALLOWLIST_RULE_LENGTH = 200
 
+TMUX_CAPTURE_PANE_PATTERN = r"(?i)\btmux\s+capture-pane\b"
+TMUX_CAPTURE_PANE_REASON = (
+    "Direct `tmux capture-pane` polling is disabled. Use "
+    "`ntm --ssh HOST --robot-is-working=SESSION --robot-terse` for status, "
+    "`ntm --ssh HOST --robot-wait=SESSION --wait-until=idle --timeout=2h` "
+    "for completion, or `ntm --ssh HOST --robot-tail=SESSION --lines=20` "
+    "for output. The `vibing-with-ntm` skill is available for command "
+    "selection and recovery. NTM pane indexes are not tmux pane ids; omit "
+    "`--panes` unless you inspected the NTM mapping."
+)
+
 # Overlay keys we accept. Anything else is a malformed overlay, not a hint.
 OVERLAY_KEYS: frozenset[str] = frozenset(
     {"id", "packs", "allowlist", "fail_closed", "fail_closed_exception"}
@@ -115,6 +126,7 @@ UPSTREAM_KEY_PATHS: frozenset[tuple[str, ...]] = frozenset(
         ("general", "fail_closed"),
         ("packs", "enabled"),
         ("overrides", "allow"),
+        ("overrides", "block"),
     }
 )
 
@@ -122,6 +134,7 @@ UPSTREAM_KEY_PATHS: frozenset[tuple[str, ...]] = frozenset(
 DCG_POLICY_UNKNOWN_PACK = "DCG_POLICY_UNKNOWN_PACK"
 DCG_POLICY_MALFORMED_PACK = "DCG_POLICY_MALFORMED_PACK"
 DCG_POLICY_MALFORMED_ALLOWLIST = "DCG_POLICY_MALFORMED_ALLOWLIST"
+DCG_POLICY_MALFORMED_BLOCKLIST = "DCG_POLICY_MALFORMED_BLOCKLIST"
 DCG_POLICY_BROAD_ALLOWLIST = "DCG_POLICY_BROAD_ALLOWLIST"
 DCG_POLICY_MALFORMED_OVERLAY = "DCG_POLICY_MALFORMED_OVERLAY"
 DCG_POLICY_UNAUDITED_FAIL_OPEN = "DCG_POLICY_UNAUDITED_FAIL_OPEN"
@@ -132,6 +145,7 @@ DCG_POLICY_ERROR_CODES: tuple[str, ...] = (
     DCG_POLICY_BROAD_ALLOWLIST,
     DCG_POLICY_EXPIRED_EXCEPTION,
     DCG_POLICY_MALFORMED_ALLOWLIST,
+    DCG_POLICY_MALFORMED_BLOCKLIST,
     DCG_POLICY_MALFORMED_OVERLAY,
     DCG_POLICY_MALFORMED_PACK,
     DCG_POLICY_UNAUDITED_FAIL_OPEN,
@@ -159,11 +173,28 @@ class FailOpenException:
 
 
 @dataclass(frozen=True)
+class DcgBlockRule:
+    """A structured DCG command block with actionable remediation."""
+
+    pattern: str
+    reason: str
+
+    def to_payload(self) -> dict[str, str]:
+        return {"pattern": self.pattern, "reason": self.reason}
+
+
+DEFAULT_BLOCK_RULES: tuple[DcgBlockRule, ...] = (
+    DcgBlockRule(TMUX_CAPTURE_PANE_PATTERN, TMUX_CAPTURE_PANE_REASON),
+)
+
+
+@dataclass(frozen=True)
 class DcgPolicy:
     """A validated, render-ready DCG policy."""
 
     packs: tuple[str, ...]
     allowlist: tuple[str, ...]
+    blocklist: tuple[DcgBlockRule, ...]
     fail_closed: bool
     exception: FailOpenException | None = None
     version: int = POLICY_VERSION
@@ -174,6 +205,7 @@ class DcgPolicy:
             "fail_closed": self.fail_closed,
             "packs": list(self.packs),
             "allowlist": list(self.allowlist),
+            "blocklist": [rule.to_payload() for rule in self.blocklist],
         }
         if self.exception is not None:
             payload["fail_closed_exception"] = self.exception.to_payload()
@@ -265,6 +297,34 @@ def _normalize_allowlist_rule(raw: Any, *, source: str) -> str:
             min_anchor_chars=MIN_ALLOWLIST_ANCHOR_CHARS,
         )
     return rule
+
+
+def _normalize_block_rule(raw: Any, *, source: str) -> DcgBlockRule:
+    if not isinstance(raw, Mapping) or set(raw) != {"pattern", "reason"}:
+        raise _reject(
+            DCG_POLICY_MALFORMED_BLOCKLIST,
+            f"DCG block rules from {source} require exactly pattern and reason.",
+            source=source,
+        )
+    values: dict[str, str] = {}
+    for field in ("pattern", "reason"):
+        value = raw.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise _reject(
+                DCG_POLICY_MALFORMED_BLOCKLIST,
+                f"DCG block rule {field} from {source} must be non-empty.",
+                source=source,
+                field=field,
+            )
+        if any(char in value for char in "\n\r\t") or not value.isprintable():
+            raise _reject(
+                DCG_POLICY_MALFORMED_BLOCKLIST,
+                f"DCG block rule {field} from {source} contains control characters.",
+                source=source,
+                field=field,
+            )
+        values[field] = value.strip()
+    return DcgBlockRule(**values)
 
 
 def _normalize_exception(raw: Any, *, source: str) -> FailOpenException:
@@ -427,6 +487,7 @@ def build_policy(
     return DcgPolicy(
         packs=tuple(packs),
         allowlist=tuple(allowlist),
+        blocklist=DEFAULT_BLOCK_RULES,
         fail_closed=fail_closed,
         exception=exception,
     )
@@ -444,6 +505,14 @@ def _toml_string(value: str) -> str:
 
 def _toml_array(values: Sequence[str]) -> str:
     return "[" + ", ".join(_toml_string(value) for value in values) + "]"
+
+
+def _toml_block_array(values: Sequence[DcgBlockRule]) -> str:
+    entries = (
+        f"{{ pattern = {_toml_string(rule.pattern)}, reason = {_toml_string(rule.reason)} }}"
+        for rule in values
+    )
+    return "[" + ", ".join(entries) + "]"
 
 
 def render_policy(policy: DcgPolicy) -> str:
@@ -466,14 +535,12 @@ def render_policy(policy: DcgPolicy) -> str:
             f"enabled = {_toml_array(policy.packs)}",
         ]
     )
-    if policy.allowlist:
-        lines.extend(
-            [
-                "",
-                "[overrides]",
-                f"allow = {_toml_array(policy.allowlist)}",
-            ]
-        )
+    if policy.allowlist or policy.blocklist:
+        lines.extend(["", "[overrides]"])
+        if policy.allowlist:
+            lines.append(f"allow = {_toml_array(policy.allowlist)}")
+        if policy.blocklist:
+            lines.append(f"block = {_toml_block_array(policy.blocklist)}")
     return "\n".join(lines) + "\n"
 
 
@@ -547,7 +614,22 @@ def validate_rendered(text: str) -> DcgPolicy:
         )
 
     packs = (document.get("packs") or {}).get("enabled") or []
-    allowlist = (document.get("overrides") or {}).get("allow") or []
+    overrides = document.get("overrides") or {}
+    allowlist = overrides.get("allow") or []
+    raw_blocklist = overrides.get("block") or []
+    if isinstance(raw_blocklist, (str, bytes)) or not isinstance(raw_blocklist, Sequence):
+        raise _reject(
+            DCG_POLICY_MALFORMED_BLOCKLIST,
+            "Rendered DCG block override must be a list.",
+        )
+    blocklist = tuple(
+        _normalize_block_rule(rule, source="rendered") for rule in raw_blocklist
+    )
+    if blocklist != DEFAULT_BLOCK_RULES:
+        raise _reject(
+            DCG_POLICY_UPSTREAM_MISMATCH,
+            "Rendered DCG policy is missing or changes the canonical block rules.",
+        )
     overlay: dict[str, Any] = {"id": "rendered", "packs": packs, "allowlist": allowlist}
     if not fail_closed:
         overlay["fail_closed"] = False
@@ -702,12 +784,15 @@ __all__ = [
     "DCG_POLICY_ERROR_CODES",
     "DCG_POLICY_EXPIRED_EXCEPTION",
     "DCG_POLICY_MALFORMED_ALLOWLIST",
+    "DCG_POLICY_MALFORMED_BLOCKLIST",
     "DCG_POLICY_MALFORMED_OVERLAY",
     "DCG_POLICY_MALFORMED_PACK",
     "DCG_POLICY_UNAUDITED_FAIL_OPEN",
     "DCG_POLICY_UNKNOWN_PACK",
     "DCG_POLICY_UPSTREAM_MISMATCH",
+    "DEFAULT_BLOCK_RULES",
     "DEFAULT_PACKS",
+    "DcgBlockRule",
     "DcgPolicy",
     "EXCEPTION_FIELDS",
     "FailOpenException",
