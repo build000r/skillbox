@@ -338,7 +338,9 @@ Do not treat a clean `/acl/validate` response as live connectivity proof.
 
 ### Rotate the Orb bootstrap auth key
 
-Target old auth-key ID: `REDACTEDOLDKEYIDCNTRL`. This checklist creates a 90-day
+The old auth-key ID is discovered from the live tailnet, not hardcoded — a
+pinned ID goes stale the moment a rotation succeeds, and the `DELETE` step then
+fails *after* the new secret has already been written. This checklist creates a 90-day
 reusable, ephemeral, preauthorized `tag:orb` replacement, writes the returned
 key directly into the Amp user-level secret `TAILSCALE_AUTHKEY`, then revokes
 the old credential. Mint-before-revoke avoids losing bootstrap access when key
@@ -352,8 +354,27 @@ removed by the exit trap; never print or retain its `key` field.
   umask 077
   : "${TAILSCALE_API_KEY:?load TAILSCALE_API_KEY from the Mac credential store}"
 
-  old_key_id='REDACTEDOLDKEYIDCNTRL'
   keys_url='https://api.tailscale.com/api/v2/tailnet/-/keys'
+
+  # Resolve the currently-valid Orb bootstrap key BEFORE minting, so the
+  # replacement created below is never a candidate for its own revocation.
+  old_key_id="$(
+    curl -fsS -H "Authorization: Bearer ${TAILSCALE_API_KEY}" "${keys_url}?all=true" |
+      python3 -c '
+import json, sys
+hits = [
+    k["id"]
+    for k in json.load(sys.stdin).get("keys", [])
+    if not k.get("invalid")
+    and k.get("description") == "Amp Orb bootstrap"
+    and (k.get("capabilities") or {}).get("devices", {}).get("create", {}).get("tags") == ["tag:orb"]
+]
+if len(hits) != 1:
+    raise SystemExit(f"expected exactly 1 live Orb bootstrap key, found {len(hits)}: {hits}")
+print(hits[0])
+'
+  )"
+
   old_key_url="${keys_url}/${old_key_id}"
   key_rotation_tmp="$(mktemp -d)"
   request_file="${key_rotation_tmp}/request.json"
@@ -445,7 +466,8 @@ PY
 
   # Tailscale keeps deleted keys as audit tombstones: post-delete GET returns
   # HTTP 200 with invalid:true + revoked:<ts>, NOT 404 (asserting 404 fails
-  # every successful rotation — observed live 2026-07-31 on REDACTEDOLDKEYIDCNTRL).
+  # every successful rotation — observed live 2026-07-31, reconfirmed 2026-08-07
+  # rotating kKm7i6sPpE11CNTRL -> kdZjyuSrAD11CNTRL).
   after_invalid="$(curl -fsS -H "Authorization: Bearer ${TAILSCALE_API_KEY}" \
     "$old_key_url" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("invalid"))')"
   test "$after_invalid" = "True" || {
