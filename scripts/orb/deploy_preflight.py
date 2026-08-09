@@ -7,8 +7,10 @@ import importlib.util
 import json
 import os
 import re
+import secrets
+import stat
 import sys
-import tempfile
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -116,8 +118,9 @@ def collect(
         if previous_deploy_manifest is not None
         else None
     )
+    environment = os.environ if env is None else env
     credentials = [
-        {"name": name, "configured": bool((env or os.environ).get(name, "").strip())}
+        {"name": name, "configured": bool(environment.get(name, "").strip())}
         for name in overlay["credential_preflight"]["environment_names"]
     ]
     current_artifact = _artifact(current)
@@ -159,26 +162,119 @@ def collect(
     }
 
 
-def write_receipt(path: Path, payload: dict[str, Any]) -> None:
-    if path.is_symlink() or (path.exists() and not path.is_file()):
-        raise ValueError("deploy receipt destination must be a regular file")
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.parent.is_symlink() or not path.parent.is_dir():
-        raise ValueError("deploy receipt parent must be a real directory")
-    os.chmod(path.parent, 0o700)
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+def _open_private_directory(path: Path) -> int:
+    absolute = path.absolute()
+    if any(part in {"", ".", ".."} for part in absolute.parts[1:]):
+        raise ValueError("deploy receipt path is invalid")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_fd = os.open(absolute.anchor, flags)
     try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        os.chmod(path, 0o600)
+        for part in absolute.parts[1:]:
+            try:
+                next_fd = os.open(part, flags, dir_fd=directory_fd)
+            except FileNotFoundError:
+                os.mkdir(part, mode=0o700, dir_fd=directory_fd)
+                next_fd = os.open(part, flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        details = os.fstat(directory_fd)
+        if details.st_uid != os.geteuid():
+            raise ValueError("deploy receipt directory must be owned by this user")
+        os.fchmod(directory_fd, 0o700)
+        return directory_fd
+    except Exception:
+        os.close(directory_fd)
+        raise
+
+
+def _open_receipt_parent(store_root: Path, parent: Path) -> int:
+    store = store_root.absolute()
+    destination_parent = parent.absolute()
+    try:
+        relative = destination_parent.relative_to(store)
+    except ValueError as exc:
+        raise ValueError("deploy receipt output must remain in the declared receipt store") from exc
+    if ".." in relative.parts:
+        raise ValueError("deploy receipt output must remain in the declared receipt store")
+    try:
+        directory_fd = _open_private_directory(store)
+    except OSError as exc:
+        raise ValueError("deploy receipt store ancestors must be real directories") from exc
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        for part in relative.parts:
+            if part in {"", ".", ".."}:
+                raise ValueError("deploy receipt path is invalid")
+            try:
+                next_fd = os.open(part, flags, dir_fd=directory_fd)
+            except FileNotFoundError:
+                os.mkdir(part, mode=0o700, dir_fd=directory_fd)
+                next_fd = os.open(part, flags, dir_fd=directory_fd)
+            except OSError as exc:
+                raise ValueError("deploy receipt store ancestors must be real directories") from exc
+            os.close(directory_fd)
+            directory_fd = next_fd
+            details = os.fstat(directory_fd)
+            if details.st_uid != os.geteuid():
+                raise ValueError("deploy receipt directory must be owned by this user")
+            os.fchmod(directory_fd, 0o700)
+        return directory_fd
+    except Exception:
+        os.close(directory_fd)
+        raise
+
+
+def write_receipt(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    store_root: Path | None = None,
+) -> None:
+    if not path.name or path.name in {".", ".."}:
+        raise ValueError("deploy receipt destination must name a regular file")
+    temporary = f".{path.name}.{secrets.token_hex(12)}"
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    directory_fd = _open_receipt_parent(store_root or path.parent, path.parent)
+    file_fd = -1
+    try:
+        try:
+            details = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISREG(details.st_mode):
+                raise ValueError("deploy receipt destination must be a regular file")
+        file_fd = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        os.fchmod(file_fd, 0o600)
+        view = memoryview(body)
+        while view:
+            written = os.write(file_fd, view)
+            if written == 0:
+                raise OSError("deploy receipt write made no progress")
+            view = view[written:]
+        os.fsync(file_fd)
+        os.close(file_fd)
+        file_fd = -1
+        os.replace(
+            temporary,
+            path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
     finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+        if file_fd >= 0:
+            with suppress(OSError):
+                os.close(file_fd)
+        with suppress(OSError):
+            os.unlink(temporary, dir_fd=directory_fd)
+        with suppress(OSError):
+            os.close(directory_fd)
 
 
 def receipt_destination(
@@ -187,18 +283,17 @@ def receipt_destination(
     requested: Path | None,
 ) -> Path:
     store_relative = Path(overlay["receipt_store"]["root"])
-    raw_root = ROOT / store_relative
-    cursor = ROOT
-    for part in store_relative.parts:
-        cursor /= part
-        if cursor.is_symlink():
-            raise ValueError("deploy receipt store cannot contain symlinks")
-    store = raw_root.resolve(strict=False)
+    if store_relative.is_absolute() or ".." in store_relative.parts:
+        raise ValueError("deploy receipt store must be repository-relative")
+    store = (ROOT / store_relative).absolute()
     if requested is None:
         return store / f"preflight-{payload['artifact']['archive_sha256']}.json"
-    candidate = requested if requested.is_absolute() else ROOT / requested
-    destination = candidate.resolve(strict=False)
-    if destination.parent != store and store not in destination.parents:
+    destination = (requested if requested.is_absolute() else ROOT / requested).absolute()
+    try:
+        relative = destination.relative_to(store)
+    except ValueError as exc:
+        raise ValueError("deploy receipt output must remain in the declared receipt store") from exc
+    if ".." in relative.parts:
         raise ValueError("deploy receipt output must remain in the declared receipt store")
     return destination
 
@@ -219,7 +314,9 @@ def main() -> int:
             previous_deploy_manifest=args.previous_deploy_manifest,
         )
         overlay = _load_overlay(args.overlay)
-        write_receipt(receipt_destination(overlay, payload, args.output), payload)
+        destination = receipt_destination(overlay, payload, args.output)
+        store_root = ROOT / overlay["receipt_store"]["root"]
+        write_receipt(destination, payload, store_root=store_root)
         print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
         return 0 if payload["state"] == "configured" else 2
     except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as exc:

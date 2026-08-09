@@ -375,6 +375,20 @@ class SbpdCliTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             SBPD.main(["--bind", "100.100.0.10", "--port", "0", "--require-auth"])
 
+    def test_authenticated_startup_rejects_multiple_allowed_projects(self) -> None:
+        with self.assertRaises(SystemExit):
+            SBPD.main(
+                [
+                    "--require-auth",
+                    "--allowed-project-id",
+                    "project-one",
+                    "--allowed-project-id",
+                    "project-two",
+                    "--project-alias",
+                    "build000r/skillbox",
+                ]
+            )
+
     def test_ipv6_server_class_uses_ipv6_socket_family(self) -> None:
         self.assertEqual(SBPD.ThreadingHTTPServerV6.address_family, SBPD.socket.AF_INET6)
 
@@ -478,10 +492,19 @@ class SbpdAuthTests(unittest.TestCase):
         )
 
     def verifier(self, opener=None, **kwargs):
+        kwargs.setdefault("allowed_project_ids", ("project",))
         return SBPD.JWKSVerifier(
             opener=opener or SequenceJWKSOpener({"keys": [self.jwk]}),
             **kwargs,
         )
+
+    def test_verifier_requires_exactly_one_allowed_project(self) -> None:
+        for project_ids in ((), ("project-one", "project-two")):
+            with self.subTest(project_ids=project_ids), self.assertRaisesRegex(
+                ValueError,
+                "exactly one allowed project",
+            ):
+                self.verifier(allowed_project_ids=project_ids)
 
     def test_valid_token_allows_data_endpoint_and_log_includes_sub(self) -> None:
         fixture = ServerFixture(require_auth=True, authenticator=self.verifier())
