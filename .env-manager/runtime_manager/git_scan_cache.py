@@ -9,7 +9,18 @@ without spawning a single git subprocess.
 Contract
 --------
 * Stored shape: ``{"written_at": <ISO-8601 UTC>, "envelope": <sbp-git/v1
-  dict>}`` at ``<state_root>/git-scan/last-scan.json``.
+  dict>, "previous"?: {"written_at", "envelope"}}`` at
+  ``<state_root>/git-scan/last-scan.json``. ONE prior generation is retained
+  in the SAME file (``previous``): a single ``os.replace`` keeps the
+  current+previous pair torn-proof (two sibling files cannot be replaced
+  atomically together), and :func:`load_scan_cache` reads only
+  ``written_at``/``envelope``, so every current-generation reader
+  (structure_doctor's git_hygiene gate, ``--cached``, the home view) is
+  untouched by the extra key. Legacy single-generation files load fine --
+  ``previous`` is simply absent.
+* :func:`load_previous_scan` returns the retained prior generation with the
+  same validation and ``(envelope, age)`` shape as :func:`load_scan_cache`;
+  a legacy file, or an invalid ``previous`` subtree, reads as ABSENT.
 * State root resolution matches the Makefile (``${SKILLBOX_STATE_ROOT:-
   ./.skillbox-state}`` relative to the repo root): the ``SKILLBOX_STATE_ROOT``
   env var wins (relative values resolve against the cwd, exactly like
@@ -45,6 +56,7 @@ __all__ = [
     "CACHE_TTL_SECONDS",
     "cache_path",
     "home_view_line",
+    "load_previous_scan",
     "load_scan_cache",
     "resolve_state_root",
     "write_scan_cache",
@@ -98,13 +110,24 @@ def write_scan_cache(
 ) -> Path:
     """Atomically persist ``envelope`` as the last scan. Raises ``OSError`` on
     write failure -- callers degrade (a failed cache write must never fail the
-    scan that produced the envelope)."""
+    scan that produced the envelope).
+
+    Rotation: the generation that was current before this write is retained
+    once as ``previous`` (its own ``previous``, if any, is dropped -- exactly
+    two generations ever exist). An invalid/absent current file rotates to no
+    ``previous`` at all.
+    """
     target = cache_path(runtime_root)
     target.parent.mkdir(parents=True, exist_ok=True)
     stamp = (now or datetime.now(timezone.utc)).isoformat()
-    payload = json.dumps(
-        {"written_at": stamp, "envelope": envelope}, ensure_ascii=False, indent=2
-    )
+    record: dict[str, Any] = {"written_at": stamp, "envelope": envelope}
+    displaced = _valid_generation(_read_cache_json(target))
+    if displaced is not None:
+        record["previous"] = {
+            "written_at": displaced[0],
+            "envelope": displaced[1],
+        }
+    payload = json.dumps(record, ensure_ascii=False, indent=2)
     fd, tmp_name = tempfile.mkstemp(
         dir=str(target.parent), prefix=".last-scan.", suffix=".tmp"
     )
@@ -136,6 +159,49 @@ def _parse_written_at(raw: Any) -> datetime | None:
     return parsed
 
 
+def _read_cache_json(target: Path) -> Any:
+    """Best-effort JSON payload of the cache file; ``None`` on ANY problem."""
+    try:
+        raw = target.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return None
+
+
+def _valid_generation(data: Any) -> tuple[str, dict[str, Any]] | None:
+    """``(written_at_raw, envelope)`` when ``data`` is one valid generation.
+
+    A generation is ``{"written_at": parseable ISO, "envelope": dict with
+    schema == sbp-git/v1}``; anything else (including a v2 envelope) is
+    invalid and reads as ABSENT -- the same pinned contract for the current
+    and the ``previous`` generation.
+    """
+    if not isinstance(data, dict):
+        return None
+    envelope = data.get("envelope")
+    if not isinstance(envelope, dict) or envelope.get("schema") != CACHE_SCHEMA:
+        return None
+    if _parse_written_at(data.get("written_at")) is None:
+        return None
+    return str(data["written_at"]), envelope
+
+
+def _generation_with_age(
+    data: Any, now: datetime | None
+) -> tuple[dict[str, Any], float] | None:
+    generation = _valid_generation(data)
+    if generation is None:
+        return None
+    written_at = _parse_written_at(generation[0])
+    assert written_at is not None  # _valid_generation guarantees it
+    reference = now or datetime.now(timezone.utc)
+    age = max(0.0, (reference - written_at).total_seconds())
+    return generation[1], age
+
+
 def load_scan_cache(
     runtime_root: str | os.PathLike[str] | None = None,
     *,
@@ -147,28 +213,28 @@ def load_scan_cache(
     file, invalid JSON, non-dict payload/envelope, envelope schema !=
     ``sbp-git/v1``, missing or unparseable ``written_at``. A clock that ran
     backwards (future ``written_at``) clamps to age 0 rather than going
-    negative.
+    negative. Always the CURRENT generation: the additive ``previous`` key is
+    invisible here.
     """
-    target = cache_path(runtime_root)
-    try:
-        raw = target.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        return None
+    return _generation_with_age(_read_cache_json(cache_path(runtime_root)), now)
+
+
+def load_previous_scan(
+    runtime_root: str | os.PathLike[str] | None = None,
+    *,
+    now: datetime | None = None,
+) -> tuple[dict[str, Any], float] | None:
+    """``(envelope, age_seconds)`` for the retained PRIOR generation, or
+    ``None`` when absent.
+
+    Same never-raise / never-partial contract as :func:`load_scan_cache`,
+    applied to the ``previous`` subtree: a legacy single-generation file, a
+    missing file, or an invalid ``previous`` all read as ABSENT.
+    """
+    data = _read_cache_json(cache_path(runtime_root))
     if not isinstance(data, dict):
         return None
-    envelope = data.get("envelope")
-    if not isinstance(envelope, dict) or envelope.get("schema") != CACHE_SCHEMA:
-        return None
-    written_at = _parse_written_at(data.get("written_at"))
-    if written_at is None:
-        return None
-    reference = now or datetime.now(timezone.utc)
-    age = max(0.0, (reference - written_at).total_seconds())
-    return envelope, age
+    return _generation_with_age(data.get("previous"), now)
 
 
 # --------------------------------------------------------------------------- #

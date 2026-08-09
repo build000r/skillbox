@@ -62,7 +62,11 @@ from .evidence import *
 from .forge import *
 from .swimmers_launch import launch_swimmers_batch, swimmers_launch_text_lines
 from .structure_doctor import run_structure_doctor, structure_doctor_text_lines
-from .git_estate import build_report as git_estate_report, report_text_lines as git_estate_text_lines
+from .git_estate import (
+    build_report as git_estate_report,
+    compute_scan_delta as git_estate_compute_scan_delta,
+    report_text_lines as git_estate_text_lines,
+)
 from .git_inventory import DEFAULT_DEPTH as GIT_ESTATE_DEFAULT_DEPTH
 from .git_scan_cache import (
     CACHE_TTL_SECONDS as GIT_SCAN_CACHE_TTL_SECONDS,
@@ -601,7 +605,21 @@ def _build_parser() -> argparse.ArgumentParser:
             "instead of scanning; never spawns git. Stale/absent cache exits "
             "0 with a 'no recent scan' note. Scan-scoping flags (--root, "
             "--depth, --only, --cwd) are ignored: the last envelope is "
-            "replayed verbatim."
+            "replayed verbatim. Incompatible with --delta (exit 2): a delta "
+            "needs a live scan."
+        ),
+    )
+    git_status_parser.add_argument(
+        "--delta",
+        action="store_true",
+        help=(
+            "After the normal live scan (which also write-throughs as "
+            "usual), diff it against the previous scan generation: newly "
+            "dirty/ahead/mid-op/diverged/blocked rows, resolved rows, and "
+            "appeared/disappeared repos. Additive `delta` JSON object / a "
+            "delta banner on tty; no previous scan -> a loud 'delta "
+            "unavailable' one-liner. Composes with --json; --cached is "
+            "rejected (exit 2) because a delta needs a live scan."
         ),
     )
 
@@ -3942,9 +3960,24 @@ def _handle_git_status(args: argparse.Namespace, root_dir: Path) -> int:
     `--live` (opt-in) delegates an origin comparison to the reconcile skill
     AFTER the local scan; it only ever adds fields/notes and never changes
     the exit code (delegation failures degrade to a loud note, exit 0).
+
+    `--delta` (opt-in) diffs the fresh scan against the generation that was
+    current BEFORE this run (loaded ahead of the write-through, so a failed
+    cache write still yields a delta). The delta object is attached AFTER
+    the write-through: cached envelopes never embed deltas, so `--cached`
+    replays and future baselines stay delta-free. `--cached --delta` is a
+    usage error (exit 2): a delta needs a live scan.
     """
+    delta_requested = bool(getattr(args, "delta", False))
     if getattr(args, "cached", False):
+        if delta_requested:
+            print(
+                "git-status: --delta needs a live scan; drop --cached",
+                file=sys.stderr,
+            )
+            return _EXIT_USAGE
         return _serve_cached_git_status(args, root_dir)
+    baseline = load_git_scan_cache(root_dir) if delta_requested else None
     cwd = str(getattr(args, "cwd", None) or os.getcwd())
     try:
         report = git_estate_report(
@@ -3961,6 +3994,11 @@ def _handle_git_status(args: argparse.Namespace, root_dir: Path) -> int:
         write_git_scan_cache(report, root_dir)
     except OSError as exc:
         print(f"git-status: cache write failed (scan unaffected): {exc}", file=sys.stderr)
+    if delta_requested:
+        if baseline is None:
+            report["delta"] = {"available": False, "reason": "no previous scan"}
+        else:
+            report["delta"] = git_estate_compute_scan_delta(report, baseline[0])
     if args.format == "json":
         emit_json(report)
     else:

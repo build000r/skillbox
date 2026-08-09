@@ -148,6 +148,120 @@ class WriteReadRoundTripTests(StateRootCase):
         self.assertEqual(siblings, ["last-scan.json"], "tmp file not cleaned up")
 
 
+class TwoGenerationRotationTests(StateRootCase):
+    """Write rotation keeps EXACTLY one prior generation in the same file.
+
+    ``load_scan_cache`` must keep returning the CURRENT generation exactly as
+    before (the ``previous`` key is invisible to it -- structure_doctor's
+    git_hygiene gate and ``--cached`` replay are pinned on that), while
+    ``load_previous_scan`` serves the retained prior generation with the same
+    validation contract.
+    """
+
+    def test_write_rotates_current_into_previous(self) -> None:
+        first = _envelope(repo_count=1)
+        second = _envelope(repo_count=2)
+        git_scan_cache.write_scan_cache(first)
+        git_scan_cache.write_scan_cache(second)
+
+        stored = json.loads(self.cache_file().read_text(encoding="utf-8"))
+        self.assertEqual(stored["envelope"], second)
+        self.assertEqual(stored["previous"]["envelope"], first)
+        self.assertIn("written_at", stored["previous"])
+
+        current = git_scan_cache.load_scan_cache()
+        self.assertIsNotNone(current)
+        self.assertEqual(current[0], second)
+
+        previous = git_scan_cache.load_previous_scan()
+        self.assertIsNotNone(previous)
+        self.assertEqual(previous[0], first)
+
+    def test_third_write_drops_the_oldest_generation(self) -> None:
+        for count in (1, 2, 3):
+            git_scan_cache.write_scan_cache(_envelope(repo_count=count))
+        stored = json.loads(self.cache_file().read_text(encoding="utf-8"))
+        self.assertEqual(stored["envelope"]["repo_count"], 3)
+        self.assertEqual(stored["previous"]["envelope"]["repo_count"], 2)
+        self.assertNotIn("previous", stored["previous"], "only two generations ever")
+
+    def test_previous_age_is_measured_from_its_own_written_at(self) -> None:
+        first_written = datetime.now(timezone.utc) - timedelta(seconds=900)
+        git_scan_cache.write_scan_cache(_envelope(repo_count=1), now=first_written)
+        git_scan_cache.write_scan_cache(_envelope(repo_count=2))
+        previous = git_scan_cache.load_previous_scan()
+        self.assertIsNotNone(previous)
+        self.assertAlmostEqual(previous[1], 900.0, delta=5)
+
+    def test_legacy_single_generation_file_loads_with_no_previous(self) -> None:
+        # Old writers stored only {written_at, envelope}: current loads fine,
+        # previous is simply absent.
+        legacy = _envelope(repo_count=7)
+        self.write_raw(
+            json.dumps(
+                {
+                    "written_at": datetime.now(timezone.utc).isoformat(),
+                    "envelope": legacy,
+                }
+            )
+        )
+        loaded = git_scan_cache.load_scan_cache()
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded[0], legacy)
+        self.assertIsNone(git_scan_cache.load_previous_scan())
+
+    def test_write_over_legacy_file_retains_it_as_previous(self) -> None:
+        legacy = _envelope(repo_count=7)
+        self.write_raw(
+            json.dumps(
+                {
+                    "written_at": datetime.now(timezone.utc).isoformat(),
+                    "envelope": legacy,
+                }
+            )
+        )
+        git_scan_cache.write_scan_cache(_envelope(repo_count=8))
+        previous = git_scan_cache.load_previous_scan()
+        self.assertIsNotNone(previous)
+        self.assertEqual(previous[0], legacy)
+
+    def test_invalid_previous_subtree_reads_absent_current_still_served(self) -> None:
+        current = _envelope(repo_count=2)
+        for bad_previous in (
+            "not-a-dict",
+            {"written_at": "yesterday-ish", "envelope": _envelope()},
+            {"written_at": datetime.now(timezone.utc).isoformat(), "envelope": []},
+            {
+                "written_at": datetime.now(timezone.utc).isoformat(),
+                "envelope": _envelope(schema="sbp-git/v2"),
+            },
+        ):
+            with self.subTest(bad_previous=bad_previous):
+                self.write_raw(
+                    json.dumps(
+                        {
+                            "written_at": datetime.now(timezone.utc).isoformat(),
+                            "envelope": current,
+                            "previous": bad_previous,
+                        }
+                    )
+                )
+                self.assertIsNone(git_scan_cache.load_previous_scan())
+                loaded = git_scan_cache.load_scan_cache()
+                self.assertIsNotNone(loaded)
+                self.assertEqual(loaded[0], current)
+
+    def test_write_over_corrupt_file_rotates_to_no_previous(self) -> None:
+        self.write_raw("{torn json")
+        git_scan_cache.write_scan_cache(_envelope(repo_count=1))
+        stored = json.loads(self.cache_file().read_text(encoding="utf-8"))
+        self.assertNotIn("previous", stored)
+        self.assertIsNone(git_scan_cache.load_previous_scan())
+
+    def test_missing_file_has_no_previous(self) -> None:
+        self.assertIsNone(git_scan_cache.load_previous_scan())
+
+
 class TtlTests(StateRootCase):
     def test_age_is_measured_from_written_at(self) -> None:
         written = datetime.now(timezone.utc) - timedelta(seconds=240)

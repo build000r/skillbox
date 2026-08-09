@@ -67,6 +67,23 @@ fields exist and output is byte-identical to before. Any delegation failure
 (script absent, overall timeout, unexpected exit, unparseable output)
 degrades loudly -- one ``live comparison unavailable: <reason>`` note in
 ``notes`` (tty + JSON) and local-only rows, never a hard failure.
+
+Delta mode (``--delta``, opt-in) and the reconcile receipt join
+----------------------------------------------------------------
+``compute_scan_delta`` diffs a fresh envelope against the previous cache
+generation (see ``git_scan_cache.load_previous_scan``): newly-<band> rows,
+resolved rows, appeared/disappeared repos, plus honesty notes when the
+baseline used different roots/filters. The result is the additive ``delta``
+object -- absent without ``--delta``, so default output stays byte-identical.
+
+The reconcile receipt join reads the receipts store ONCE per scan (env
+``SKILLBOX_RECONCILE_RECEIPTS_DIR``, else ``~/.local/state/reconcile/
+receipts``; per-receipt shape per the reconcile skill's
+``reconcile_receipts.py``) and stamps each row with ``last_reconcile`` (ISO
+timestamp of the newest PASSED receipt, or null). The store being absent
+adds NOTHING (goldens pin the store-less envelope); an unreadable store is
+ONE note; a non-clean row with a receipt older than 30 days gets the
+``[last safe sync Nd ago]`` glance marker. Never invokes git or the skill.
 """
 
 from __future__ import annotations
@@ -95,11 +112,14 @@ __all__ = [
     "DEFAULT_LIVE_TIMEOUT_S",
     "FILTER_CLASSES",
     "LIVE_DRIFT_STATES",
+    "RECEIPTS_DIR_ENV",
+    "RECEIPT_STALE_SECONDS",
     "REGISTRATION_FILTER_CLASSES",
     "RISK_BAND_NAMES",
     "SCHEMA",
     "apply_live_comparison",
     "build_report",
+    "compute_scan_delta",
     "fix_commands",
     "parse_only",
     "report_text_lines",
@@ -181,6 +201,18 @@ _LIVE_OK_EXITS = frozenset({0, 1, 3})
 LIVE_DRIFT_STATES = frozenset(
     {"behind-origin", "diverged-from-origin", "origin-newer", "origin-differs"}
 )
+
+#: Env override for the reconcile receipts store (tests point at a fixture);
+#: falls back to the reconcile skill's state dir
+#: (``~/.local/state/reconcile/receipts`` -- the skill's loader,
+#: ``reconcile_receipts.py``, is path-agnostic, so the store lives under the
+#: skill state next to ``residuals.json``).
+RECEIPTS_DIR_ENV = "SKILLBOX_RECONCILE_RECEIPTS_DIR"
+#: A non-clean row whose last passed reconcile receipt is older than this
+#: gets the at-a-glance ``[last safe sync Nd ago]`` marker.
+RECEIPT_STALE_SECONDS = 30 * 86400
+#: Per-receipt file size cap: the join must stay a cheap glance read.
+_RECEIPT_MAX_BYTES = 1 << 20
 
 
 # --------------------------------------------------------------------------- #
@@ -732,6 +764,195 @@ def apply_live_comparison(
 
 
 # --------------------------------------------------------------------------- #
+# --delta: diff a fresh scan against the previous cache generation
+# --------------------------------------------------------------------------- #
+
+
+def _band_by_path(envelope: dict[str, Any]) -> dict[str, str]:
+    """{row path: risk_band} over an envelope's ``repos`` rows (defensive:
+    malformed rows are skipped, a missing band defaults to ``clean``)."""
+    bands: dict[str, str] = {}
+    for row in envelope.get("repos") or []:
+        if not isinstance(row, dict):
+            continue
+        path = row.get("path")
+        if isinstance(path, str) and path:
+            bands[path] = str(row.get("risk_band") or "clean")
+    return bands
+
+
+def compute_scan_delta(
+    current: dict[str, Any],
+    baseline: dict[str, Any],
+    *,
+    baseline_written_at: str | None = None,
+) -> dict[str, Any]:
+    """Diff two ``sbp-git/v1`` envelopes -> the additive ``delta`` object.
+
+    ``baseline`` is the generation that was current BEFORE the scan that
+    produced ``current`` (both self-describe their roots/filters).
+
+    * ``newly``: per risk band, paths present in both scans whose band
+      CHANGED to that (non-clean) band -- so ``newly.dirty``, ``newly.ahead``,
+      ``newly.mid-op`` / ``diverged`` / ``blocked``, etc.
+    * ``resolved``: paths that were non-clean in the baseline and are now
+      clean or gone (a gone non-clean row also appears in ``disappeared``;
+      the overlap is deliberate -- "resolved" answers *was the problem
+      cleared*, "disappeared" answers *is the repo still scanned*).
+    * ``appeared`` / ``disappeared``: row-set membership changes.
+    * ``notes``: honesty flags -- when the baseline was scanned with
+      different roots or ``--only`` filters the diff is still shown, but the
+      membership changes are expected noise and say so.
+
+    ``baseline_written_at`` defaults to the baseline envelope's own
+    ``generated_at`` (scan end == cache write, to within milliseconds).
+    """
+    current_bands = _band_by_path(current)
+    baseline_bands = _band_by_path(baseline)
+
+    appeared = sorted(set(current_bands) - set(baseline_bands))
+    disappeared = sorted(set(baseline_bands) - set(current_bands))
+
+    newly: dict[str, list[str]] = {}
+    resolved: list[str] = []
+    for path, old_band in sorted(baseline_bands.items()):
+        new_band = current_bands.get(path)
+        if old_band != "clean" and (new_band is None or new_band == "clean"):
+            resolved.append(path)
+        if new_band is not None and new_band != old_band and new_band != "clean":
+            newly.setdefault(new_band, []).append(path)
+
+    notes: list[str] = []
+    if sorted(current.get("roots") or []) != sorted(baseline.get("roots") or []):
+        notes.append("delta baseline used different roots")
+    if list(current.get("filters") or []) != list(baseline.get("filters") or []):
+        notes.append("delta baseline used different --only filters")
+
+    return {
+        "available": True,
+        "baseline_written_at": baseline_written_at
+        or str(baseline.get("generated_at") or ""),
+        "newly": {band: sorted(paths) for band, paths in newly.items()},
+        "resolved": resolved,
+        "appeared": appeared,
+        "disappeared": disappeared,
+        "notes": notes,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Reconcile receipt join (read-only glance data, never invokes the skill)
+# --------------------------------------------------------------------------- #
+
+
+def _receipts_dir() -> Path:
+    """The reconcile receipts store: env override, else the skill state dir."""
+    override = str(os.environ.get(RECEIPTS_DIR_ENV) or "").strip()
+    if override:
+        return Path(os.path.expandvars(os.path.expanduser(override)))
+    return Path.home() / ".local" / "state" / "reconcile" / "receipts"
+
+
+def _receipt_timestamp(payload: Any) -> tuple[str, datetime] | None:
+    """(subject id, created_at) of one PASSED receipt; None for anything else.
+
+    Shape authority: the reconcile skill's ``reconcile_receipts.py`` --
+    receipts are JSON objects with ``state`` (passed/failed/skipped),
+    ``created_at`` (RFC 3339 with timezone), and ``subject: {kind, id}``.
+    Only a *passed* receipt counts as a safe sync. Malformed files are
+    skipped silently (per-file note spam would drown the glance).
+    """
+    if not isinstance(payload, dict) or payload.get("state") != "passed":
+        return None
+    subject = payload.get("subject")
+    if not isinstance(subject, dict):
+        return None
+    subject_id = subject.get("id")
+    if not isinstance(subject_id, str) or not subject_id:
+        return None
+    raw = payload.get("created_at")
+    if not isinstance(raw, str):
+        return None
+    try:
+        created = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if created.tzinfo is None:
+        return None
+    return subject_id, created
+
+
+def _load_reconcile_receipts() -> tuple[dict[str, str], str | None, bool]:
+    """One pass over the receipts store -> ``(index, error, store_present)``.
+
+    ``index`` maps a receipt subject id to the newest passed ``created_at``
+    (ISO string). The whole store absent (no reconcile skill state on this
+    box) is NOT an error: ``({}, None, False)`` and the join stays entirely
+    silent. An unreadable store (present but unlistable) degrades to ONE
+    note via ``error``. Cheap by contract: every ``*.json`` file is read at
+    most once per scan and nothing here ever spawns git or the skill.
+    """
+    store = _receipts_dir()
+    if not store.is_dir():
+        return {}, None, False
+    newest: dict[str, tuple[datetime, str]] = {}
+    try:
+        entries = sorted(store.iterdir())
+    except OSError as exc:
+        return {}, f"cannot read {store}: {exc}", True
+    for entry in entries:
+        if entry.suffix != ".json" or not entry.is_file():
+            continue
+        try:
+            if entry.stat().st_size > _RECEIPT_MAX_BYTES:
+                continue
+            payload = json.loads(entry.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue  # one bad receipt must not poison the glance
+        parsed = _receipt_timestamp(payload)
+        if parsed is None:
+            continue
+        subject_id, created = parsed
+        known = newest.get(subject_id)
+        if known is None or created > known[0]:
+            newest[subject_id] = (created, str(payload["created_at"]))
+    return {key: value[1] for key, value in newest.items()}, None, True
+
+
+def _last_reconcile_for(row: dict[str, Any], index: dict[str, str]) -> str | None:
+    """Join a scan row to the receipt index by path, realpath, then repo id
+    (basename) -- receipt subject ids are identifiers, not always paths."""
+    path = str(row.get("path") or "")
+    for key in (path, os.path.realpath(path), os.path.basename(path)):
+        if key and key in index:
+            return index[key]
+    return None
+
+
+def _apply_reconcile_receipts(report: dict[str, Any]) -> None:
+    """Mutate ``report`` with the additive per-row ``last_reconcile`` field.
+
+    Store absent -> NOTHING is added (the default envelope stays
+    byte-identical, which the goldens pin). Store present -> every row (and
+    the cwd detail row) gains ``last_reconcile`` (ISO timestamp or null);
+    unreadable store -> one note and null everywhere. Never raises.
+    """
+    index, error, store_present = _load_reconcile_receipts()
+    if not store_present:
+        return
+    if error:
+        report.setdefault("notes", []).append(
+            f"reconcile receipts unavailable: {error}"
+        )
+    for row in report.get("repos") or []:
+        if isinstance(row, dict):
+            row["last_reconcile"] = _last_reconcile_for(row, index)
+    cwd_repo = report.get("cwd_repo")
+    if isinstance(cwd_repo, dict):
+        cwd_repo["last_reconcile"] = _last_reconcile_for(cwd_repo, index)
+
+
+# --------------------------------------------------------------------------- #
 # Report (the sbp-git/v1 envelope; text rendering reads it, JSON emits it)
 # --------------------------------------------------------------------------- #
 
@@ -841,6 +1062,7 @@ def build_report(
         "repo_count": len(filtered),
         "elapsed_seconds": round(elapsed, 3),
     }
+    _apply_reconcile_receipts(report)
     if live:
         apply_live_comparison(report, timeout_s=live_timeout_s)
     return report
@@ -882,6 +1104,68 @@ def _relative_age(timestamp: str | None, now: str | None) -> str | None:
     return "<1h"
 
 
+def _age_seconds(timestamp: str | None, now: str | None) -> float | None:
+    """Seconds between two envelope-style ISO8601 strings; None on any parse
+    problem (callers degrade to age-free output, never crash the render)."""
+    if not timestamp or not now:
+        return None
+    try:
+        seconds = (
+            datetime.fromisoformat(now) - datetime.fromisoformat(timestamp)
+        ).total_seconds()
+    except (ValueError, TypeError):
+        return None
+    return max(0.0, seconds)
+
+
+def _format_span(seconds: float) -> str:
+    """``34s`` / ``12m`` / ``5h`` / ``3d`` -- the delta banner's age unit."""
+    span = max(0, int(seconds))
+    if span < 60:
+        return f"{span}s"
+    if span < 3600:
+        return f"{span // 60}m"
+    if span < 86400:
+        return f"{span // 3600}h"
+    return f"{span // 86400}d"
+
+
+#: Repo names listed inline in the delta banner before folding to "+N more".
+_DELTA_NAME_CAP = 5
+
+
+def _delta_names(paths: list[str]) -> str:
+    """Glance listing: repo basenames, capped -- JSON carries full paths."""
+    names = [os.path.basename(path.rstrip("/")) or path for path in paths]
+    if len(names) > _DELTA_NAME_CAP:
+        shown = ", ".join(names[:_DELTA_NAME_CAP])
+        return f"{shown}, +{len(names) - _DELTA_NAME_CAP} more"
+    return ", ".join(names)
+
+
+def _delta_lines(delta: dict[str, Any], now: str | None) -> list[str]:
+    """tty rendering of the additive ``delta`` object (absent by default)."""
+    if not delta.get("available"):
+        return [f"delta unavailable: {delta.get('reason') or 'no previous scan'}"]
+    age = _age_seconds(delta.get("baseline_written_at"), now)
+    versus = f"scan {_format_span(age)} ago" if age is not None else "previous scan"
+    segments: list[str] = []
+    newly = delta.get("newly") or {}
+    for band in RISK_BAND_NAMES:  # deterministic band order, riskiest first
+        paths = newly.get(band) or []
+        if paths:
+            segments.append(f"{len(paths)} newly {band} ({_delta_names(paths)})")
+    for label in ("resolved", "appeared", "disappeared"):
+        paths = delta.get(label) or []
+        if paths:
+            segments.append(f"{len(paths)} {label} ({_delta_names(paths)})")
+    body = "; ".join(segments) if segments else "no changes"
+    lines = [f"delta vs {versus}: {body}"]
+    for note in delta.get("notes") or []:
+        lines.append(f"  note: {note}")
+    return lines
+
+
 def _unpushed_listing(row: dict[str, Any]) -> str:
     return ", ".join(
         f"{entry['name']} (+{entry['ahead']})"
@@ -921,6 +1205,12 @@ def _cwd_detail_lines(
         lines.append(f"  mid-op: {cwd_repo['mid_op']} in flight")
     if cwd_repo.get("origin_state") in LIVE_DRIFT_STATES:
         lines.append(f"  origin: {cwd_repo['origin_state']} (live)")
+    # Reconcile receipt join: the line exists only when a receipt exists (a
+    # missing receipt -- or the whole store -- stays blank, never an error).
+    if cwd_repo.get("last_reconcile"):
+        sync_age = _relative_age(cwd_repo["last_reconcile"], now)
+        if sync_age:
+            lines.append(f"  last safe sync: {sync_age} ago (reconcile receipt)")
     if cwd_repo.get("registration") == "unregistered":
         lines.append("  registration: unregistered (not in registry, not ignore-matched)")
     return lines
@@ -962,6 +1252,13 @@ def _table_lines(
             oldest = _relative_age(row.get("stash_oldest"), now)
             if newest and oldest:
                 marker += f"  [stash newest {newest}, oldest {oldest}]"
+        # Reconcile receipt staleness at a glance: only when a receipt EXISTS,
+        # the row is non-clean, and the last safe sync is over the 30d
+        # threshold -- rows without receipts stay blank (zero noise).
+        if band != "clean" and row.get("last_reconcile"):
+            sync_seconds = _age_seconds(row["last_reconcile"], now)
+            if sync_seconds is not None and sync_seconds > RECEIPT_STALE_SECONDS:
+                marker += f"  [last safe sync {int(sync_seconds // 86400)}d ago]"
         lines.append(
             f"  {_paint(f'{band:{band_w}s}', band, color)}  "
             f"{ab:>5s}  {counts:>7s}  "
@@ -1005,6 +1302,13 @@ def report_text_lines(report: dict[str, Any], *, color: bool = False) -> list[st
             f"{reg.get('unregistered', 0)} unregistered, "
             f"{reg.get('stale_registered', 0)} stale-registered"
         )
+
+    # --delta section (additive: the key only exists on --delta runs), shown
+    # between the estate header and the table so the change summary leads.
+    delta = report.get("delta")
+    if isinstance(delta, dict):
+        lines.append("")
+        lines.extend(_delta_lines(delta, now))
 
     # Clean rows collapse to one count line unless clean-current was asked
     # for -- except a locally-clean row whose live origin has newer commits
