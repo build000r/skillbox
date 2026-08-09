@@ -52,6 +52,11 @@ _REGISTRY_DOCTOR_STANDIN = textwrap.dedent(
 
 
     def normalize_registry(payload, root_overrides):
+        repos = []
+        for item in payload.get("repos") or []:
+            item = dict(item)
+            item["path"] = normalize_path(item["path"])
+            repos.append(item)
         ignore = []
         for item in payload.get("ignore") or []:
             item = dict(item)
@@ -64,7 +69,7 @@ _REGISTRY_DOCTOR_STANDIN = textwrap.dedent(
             "roots": [],
             "max_depth": None,
             "prune_dir_names": set(),
-            "repos": [],
+            "repos": repos,
             "ignore": ignore,
         }
 
@@ -156,6 +161,34 @@ class RiskSortTests(unittest.TestCase):
         a = _record("/r/a", classes=frozenset({"dirty"}), primary_class="dirty", untracked=1)
         self.assertEqual([r.path for r in git_estate.risk_sorted([b, a])], ["/r/a", "/r/b"])
 
+    def test_unregistered_outranks_registered_within_a_band(self) -> None:
+        a = _record("/r/a", classes=frozenset({"dirty"}), primary_class="dirty", untracked=1)
+        b = _record("/r/b", classes=frozenset({"dirty"}), primary_class="dirty", untracked=1)
+        registration = {"/r/a": "registered", "/r/b": "unregistered"}
+        self.assertEqual(
+            [r.path for r in git_estate.risk_sorted([a, b], registration)],
+            ["/r/b", "/r/a"],
+        )
+
+    def test_registration_tiebreak_never_crosses_bands(self) -> None:
+        # An unregistered clean repo must NOT outrank a registered dirty one.
+        clean = _record("/r/clean")
+        dirty = _record("/r/dirty", classes=frozenset({"dirty"}), primary_class="dirty", unstaged=1)
+        registration = {"/r/clean": "unregistered", "/r/dirty": "registered"}
+        self.assertEqual(
+            [r.path for r in git_estate.risk_sorted([clean, dirty], registration)],
+            ["/r/dirty", "/r/clean"],
+        )
+
+    def test_unknown_registration_ties_with_registered_by_path(self) -> None:
+        a = _record("/r/a", classes=frozenset({"dirty"}), primary_class="dirty", untracked=1)
+        b = _record("/r/b", classes=frozenset({"dirty"}), primary_class="dirty", untracked=1)
+        registration = {"/r/a": "unknown", "/r/b": "registered"}
+        self.assertEqual(
+            [r.path for r in git_estate.risk_sorted([b, a], registration)],
+            ["/r/a", "/r/b"],
+        )
+
 
 class FixCommandTests(unittest.TestCase):
     def test_ahead_gets_push(self) -> None:
@@ -225,19 +258,49 @@ class FixCommandTests(unittest.TestCase):
     def test_clean_has_no_fix(self) -> None:
         self.assertEqual(git_estate.fix_commands(_record("/r/clean")), [])
 
+    def test_unregistered_gets_registry_handoff_after_work_fixes(self) -> None:
+        record = _record("/r/dirty", classes=frozenset({"dirty"}), primary_class="dirty", unstaged=1)
+        fixes = git_estate.fix_commands(record, "unregistered", "/cfg/registry/repos.yaml")
+        self.assertEqual(
+            fixes,
+            [
+                "git -C /r/dirty add -p && git -C /r/dirty commit",
+                "register in /cfg/registry/repos.yaml or add an ignore rule there",
+            ],
+        )
+
+    def test_registered_row_gets_no_registry_handoff(self) -> None:
+        record = _record("/r/dirty", classes=frozenset({"dirty"}), primary_class="dirty", unstaged=1)
+        fixes = git_estate.fix_commands(record, "registered", "/cfg/registry/repos.yaml")
+        self.assertFalse(any("register in" in fix for fix in fixes))
+
+    def test_blocked_stays_inspect_only_even_when_unregistered(self) -> None:
+        record = _record(
+            "/r/blk", classes=frozenset({"blocked"}), primary_class="blocked", upstream=None, error="probe died"
+        )
+        self.assertEqual(
+            git_estate.fix_commands(record, "unregistered", "/cfg/registry/repos.yaml"),
+            ["inspect: probe died"],
+        )
+
 
 class OnlyFilterTests(unittest.TestCase):
     def test_unknown_token_raises_with_vocabulary(self) -> None:
         with self.assertRaises(ValueError) as ctx:
             git_estate.parse_only(["bogus"])
         message = str(ctx.exception)
-        for token in git_estate.FILTER_CLASSES + git_estate.RESERVED_FILTER_CLASSES:
+        for token in git_estate.FILTER_CLASSES + git_estate.REGISTRATION_FILTER_CLASSES:
             self.assertIn(token, message)
 
-    def test_reserved_tokens_parse_as_reserved(self) -> None:
-        active, reserved = git_estate.parse_only(["unregistered,stale-registered"])
+    def test_registration_tokens_parse_separately_from_classes(self) -> None:
+        active, registration = git_estate.parse_only(["unregistered,stale-registered"])
         self.assertEqual(active, ())
-        self.assertEqual(reserved, ("unregistered", "stale-registered"))
+        self.assertEqual(registration, ("unregistered", "stale-registered"))
+
+    def test_classes_and_registration_tokens_split(self) -> None:
+        active, registration = git_estate.parse_only(["dirty,unregistered"])
+        self.assertEqual(active, ("dirty",))
+        self.assertEqual(registration, ("unregistered",))
 
     def test_comma_and_repeat_forms_merge(self) -> None:
         active, reserved = git_estate.parse_only(["dirty,stash", "dirty", "mid-op"])
@@ -282,6 +345,39 @@ class OnlyFilterTests(unittest.TestCase):
         clean = _record("/r/clean")
         kept = git_estate._apply_only([dirty, midop, clean], ("dirty", "mid-op"))
         self.assertEqual({r.path for r in kept}, {"/r/dirty", "/r/mid"})
+
+    def test_unregistered_filters_rows_by_registration_state(self) -> None:
+        reg = _record("/r/reg")
+        unreg = _record("/r/unreg")
+        registration = {"/r/reg": "registered", "/r/unreg": "unregistered"}
+        kept = git_estate._apply_only([reg, unreg], ("unregistered",), registration)
+        self.assertEqual([r.path for r in kept], ["/r/unreg"])
+
+    def test_registration_and_class_tokens_compose_as_a_union(self) -> None:
+        dirty = _record("/r/dirty", classes=frozenset({"dirty"}), primary_class="dirty", unstaged=1)
+        unreg = _record("/r/unreg")
+        clean = _record("/r/clean")
+        registration = {
+            "/r/dirty": "registered",
+            "/r/unreg": "unregistered",
+            "/r/clean": "registered",
+        }
+        kept = git_estate._apply_only(
+            [dirty, unreg, clean], ("dirty", "unregistered"), registration
+        )
+        self.assertEqual({r.path for r in kept}, {"/r/dirty", "/r/unreg"})
+
+    def test_stale_registered_matches_no_scanned_row(self) -> None:
+        reg = _record("/r/reg")
+        unreg = _record("/r/unreg")
+        registration = {"/r/reg": "registered", "/r/unreg": "unregistered"}
+        kept = git_estate._apply_only([reg, unreg], ("stale-registered",), registration)
+        self.assertEqual(kept, [])
+
+    def test_unknown_state_never_matches_registration_tokens(self) -> None:
+        # Degrade: no registration map means every row is "unknown".
+        row = _record("/r/any")
+        self.assertEqual(git_estate._apply_only([row], ("unregistered",)), [])
 
 
 class GitEstateFixtureCase(unittest.TestCase):
@@ -355,7 +451,11 @@ class GitEstateFixtureCase(unittest.TestCase):
         self.git(self.tmp, "clone", "-q", f"file://{origin}", str(clone))
         return clone
 
-    def write_config_fixture(self, ignore: list[dict] | None = None) -> None:
+    def write_config_fixture(
+        self,
+        ignore: list[dict] | None = None,
+        repos: list[dict] | None = None,
+    ) -> None:
         scripts = self.config_root / "scripts"
         scripts.mkdir(parents=True, exist_ok=True)
         (scripts / "registry_doctor.py").write_text(_REGISTRY_DOCTOR_STANDIN, encoding="utf-8")
@@ -363,8 +463,12 @@ class GitEstateFixtureCase(unittest.TestCase):
         registry.mkdir(parents=True, exist_ok=True)
         # JSON is valid YAML: keeps the fixture hermetic (no PyYAML needed).
         (registry / "repos.yaml").write_text(
-            json.dumps({"repos": [], "ignore": ignore or []}), encoding="utf-8"
+            json.dumps({"repos": repos or [], "ignore": ignore or []}), encoding="utf-8"
         )
+
+    @property
+    def registry_yaml(self) -> str:
+        return str(self.config_root / "registry" / "repos.yaml")
 
 
 class BuildReportTests(GitEstateFixtureCase):
@@ -375,7 +479,15 @@ class BuildReportTests(GitEstateFixtureCase):
         clean = self.make_clean_clone("c-clean")
         ignored = self.make_repo("z-ignored")
         (ignored / "junk.txt").write_text("junk\n", encoding="utf-8")
-        self.write_config_fixture(ignore=[{"path": str(ignored), "reason": "fixture"}])
+        gone = self.estate / "gone-checkout"  # registered, never created on disk
+        self.write_config_fixture(
+            ignore=[{"path": str(ignored), "reason": "fixture"}],
+            repos=[
+                {"id": "b-ahead", "path": str(ahead)},
+                {"id": "c-clean", "path": str(clean)},
+                {"id": "gone", "path": str(gone)},
+            ],
+        )
 
         report = git_estate.build_report(
             roots=[str(self.estate)], depth=2, cwd=str(dirty)
@@ -409,28 +521,84 @@ class BuildReportTests(GitEstateFixtureCase):
 
         rows = {row["path"]: row for row in report["repos"]}
         self.assertEqual(rows[str(dirty)]["risk_band"], "dirty")
+        # Registration joins from the same registry parse as the ignore rules.
+        self.assertEqual(rows[str(dirty)]["registration"], "unregistered")
+        self.assertEqual(rows[str(ahead)]["registration"], "registered")
+        self.assertEqual(rows[str(clean)]["registration"], "registered")
         # The local-only fixture repo has no upstream, so the dirty row also
-        # carries the no-remote handoff.
+        # carries the no-remote handoff; unregistered adds the registry
+        # handoff (exact file path) after the work-securing fixes.
         self.assertEqual(
             rows[str(dirty)]["fix"],
             [
                 f"git -C {dirty} add -p && git -C {dirty} commit",
                 "add a remote or register intent",
+                f"register in {self.registry_yaml} or add an ignore rule there",
             ],
         )
         self.assertEqual(rows[str(ahead)]["fix"], [f"git -C {ahead} push"])
         self.assertEqual(rows[str(clean)]["fix"], [])
 
-        # cwd detail probes the enclosing repo root, even from a subdirectory.
+        # Estate-level registration summary + the stale-registered section.
+        self.assertEqual(
+            report["registration_summary"],
+            {"registered": 2, "unregistered": 1, "unknown": 0, "stale_registered": 1},
+        )
+        self.assertEqual(
+            report["stale_registered"],
+            [
+                {
+                    "path": str(gone),
+                    "id": "gone",
+                    "registration": "stale-registered",
+                    "fix": [f"remove or repoint the registry entry in {self.registry_yaml}"],
+                }
+            ],
+        )
+
+        # cwd detail probes the enclosing repo root, even from a subdirectory,
+        # and carries its registration state.
         sub = dirty / "nested"
         sub.mkdir()
         nested = git_estate.build_report(roots=[str(self.estate)], depth=2, cwd=str(sub))
         self.assertEqual(nested["cwd_repo"]["path"], str(dirty))
         self.assertEqual(nested["cwd_repo"]["risk_band"], "dirty")
+        self.assertEqual(nested["cwd_repo"]["registration"], "unregistered")
 
         # Deterministic: a second scan yields the same row order.
         again = git_estate.build_report(roots=[str(self.estate)], depth=2, cwd=str(dirty))
         self.assertEqual([row["path"] for row in again["repos"]], paths)
+
+    def test_ignore_matched_repo_is_not_counted_unregistered(self) -> None:
+        ignored = self.make_repo("z-ignored")
+        registered = self.make_repo("a-registered")
+        self.write_config_fixture(
+            ignore=[{"path": str(ignored), "reason": "fixture"}],
+            repos=[{"id": "a", "path": str(registered)}],
+        )
+        report = git_estate.build_report(roots=[str(self.estate)], depth=2)
+        self.assertEqual(report["ignored_count"], 1)
+        self.assertEqual(
+            report["registration_summary"],
+            {"registered": 1, "unregistered": 0, "unknown": 0, "stale_registered": 0},
+        )
+
+    def test_unregistered_outranks_registered_within_a_band(self) -> None:
+        registered = self.make_repo("a-dirty")  # path-sorts FIRST
+        (registered / "loose.txt").write_text("loose\n", encoding="utf-8")
+        unregistered = self.make_repo("b-dirty")
+        (unregistered / "loose.txt").write_text("loose\n", encoding="utf-8")
+        self.write_config_fixture(repos=[{"id": "a", "path": str(registered)}])
+
+        report = git_estate.build_report(roots=[str(self.estate)], depth=2)
+        self.assertEqual(
+            [row["path"] for row in report["repos"]],
+            [str(unregistered), str(registered)],
+        )
+        self.assertEqual(
+            [row["registration"] for row in report["repos"]],
+            ["unregistered", "registered"],
+        )
 
     def test_registry_absent_degrades_loudly_and_unfiltered(self) -> None:
         repo = self.make_repo("solo")
@@ -446,12 +614,37 @@ class BuildReportTests(GitEstateFixtureCase):
             ),
             report["notes"],
         )
+        # Registration degrades to "unknown" everywhere, never a crash.
+        self.assertEqual(report["repos"][0]["registration"], "unknown")
+        self.assertEqual(
+            report["registration_summary"],
+            {"registered": 0, "unregistered": 0, "unknown": 1, "stale_registered": 0},
+        )
+        self.assertEqual(report["stale_registered"], [])
 
-    def test_only_filter_and_reserved_tokens(self) -> None:
+    def test_registry_absent_registration_filter_notes_and_empties(self) -> None:
+        self.make_repo("solo")
+        report = git_estate.build_report(
+            roots=[str(self.estate)], depth=2, only=["unregistered"]
+        )
+        self.assertEqual(report["repos"], [])
+        self.assertEqual(report["repo_count"], 0)
+        self.assertTrue(
+            any("registration unknown" in note for note in report["notes"]),
+            report["notes"],
+        )
+
+    def test_only_filter_composes_classes_and_registration(self) -> None:
         dirty = self.make_repo("a-dirty")
         (dirty / "loose.txt").write_text("loose\n", encoding="utf-8")
-        self.make_clean_clone("b-clean")
-        self.write_config_fixture()
+        clean = self.make_clean_clone("b-clean")
+        gone = self.estate / "gone-checkout"
+        self.write_config_fixture(
+            repos=[
+                {"id": "a-dirty", "path": str(dirty)},
+                {"id": "gone", "path": str(gone)},
+            ],
+        )
 
         only_dirty = git_estate.build_report(
             roots=[str(self.estate)], depth=2, only=["dirty"]
@@ -459,21 +652,33 @@ class BuildReportTests(GitEstateFixtureCase):
         self.assertEqual([row["path"] for row in only_dirty["repos"]], [str(dirty)])
         self.assertEqual(only_dirty["filters"], ["dirty"])
 
-        reserved = git_estate.build_report(
+        # `unregistered` is a REAL row filter now: the unregistered clean
+        # clone matches, the registered dirty repo does not.
+        only_unreg = git_estate.build_report(
             roots=[str(self.estate)], depth=2, only=["unregistered"]
         )
-        self.assertEqual(reserved["repos"], [])
-        self.assertEqual(reserved["repo_count"], 0)
-        self.assertTrue(
-            any(git_estate.REGISTRATION_NOTE in note for note in reserved["notes"]),
-            reserved["notes"],
+        self.assertEqual([row["path"] for row in only_unreg["repos"]], [str(clean)])
+        self.assertEqual(only_unreg["repos"][0]["registration"], "unregistered")
+        self.assertEqual(only_unreg["notes"], [])
+
+        # `stale-registered` filters rows to nothing (stale entries are not
+        # scanned rows) while the envelope still carries the stale section.
+        only_stale = git_estate.build_report(
+            roots=[str(self.estate)], depth=2, only=["stale-registered"]
+        )
+        self.assertEqual(only_stale["repos"], [])
+        self.assertEqual(
+            [entry["path"] for entry in only_stale["stale_registered"]], [str(gone)]
         )
 
+        # Union with git classes, matching every other --only token.
         mixed = git_estate.build_report(
-            roots=[str(self.estate)], depth=2, only=["dirty", "stale-registered"]
+            roots=[str(self.estate)], depth=2, only=["dirty", "unregistered"]
         )
-        self.assertEqual([row["path"] for row in mixed["repos"]], [str(dirty)])
-        self.assertTrue(any(git_estate.REGISTRATION_NOTE in note for note in mixed["notes"]))
+        self.assertEqual(
+            {row["path"] for row in mixed["repos"]}, {str(dirty), str(clean)}
+        )
+        self.assertEqual(mixed["filters"], ["dirty", "unregistered"])
 
         with self.assertRaises(ValueError):
             git_estate.build_report(roots=[str(self.estate)], depth=2, only=["bogus"])
@@ -525,6 +730,61 @@ class TextRenderingTests(GitEstateFixtureCase):
         text = "\n".join(git_estate.report_text_lines(report))
         self.assertIn("registry unavailable:", text)
         self.assertNotIn("ignored by registry rules", text)
+        # No registration summary line without a registry to join against.
+        self.assertNotIn("registration:", text)
+
+    def test_registration_summary_line_and_unregistered_marker(self) -> None:
+        registered = self.make_repo("a-dirty")
+        (registered / "loose.txt").write_text("loose\n", encoding="utf-8")
+        unregistered = self.make_repo("b-dirty")
+        (unregistered / "loose.txt").write_text("loose\n", encoding="utf-8")
+        self.write_config_fixture(repos=[{"id": "a", "path": str(registered)}])
+
+        report = git_estate.build_report(roots=[str(self.estate)], depth=2)
+        text = "\n".join(git_estate.report_text_lines(report, color=False))
+        self.assertIn("registration: 1 registered, 1 unregistered, 0 stale-registered", text)
+        self.assertIn(f"{unregistered}  [unregistered]", text)
+        self.assertNotIn(f"{registered}  [unregistered]", text)
+        self.assertIn(
+            f"register in {self.registry_yaml} or add an ignore rule there", text
+        )
+
+    def test_stale_section_renders_by_default_and_under_its_own_filter(self) -> None:
+        dirty = self.make_repo("a-dirty")
+        (dirty / "loose.txt").write_text("loose\n", encoding="utf-8")
+        gone = self.estate / "gone-checkout"
+        self.write_config_fixture(
+            repos=[{"id": "a", "path": str(dirty)}, {"id": "gone", "path": str(gone)}]
+        )
+
+        default = git_estate.build_report(roots=[str(self.estate)], depth=2)
+        default_text = "\n".join(git_estate.report_text_lines(default))
+        self.assertIn("stale-registered: 1 registry entries with no repo on disk", default_text)
+        self.assertIn(
+            f"  - {gone}  -> remove or repoint the registry entry in {self.registry_yaml}",
+            default_text,
+        )
+
+        asked = git_estate.build_report(
+            roots=[str(self.estate)], depth=2, only=["stale-registered"]
+        )
+        asked_text = "\n".join(git_estate.report_text_lines(asked))
+        self.assertIn("stale-registered: 1 registry entries", asked_text)
+
+        # An unrelated --only view keeps its focus: no stale section.
+        narrowed = git_estate.build_report(
+            roots=[str(self.estate)], depth=2, only=["dirty"]
+        )
+        narrowed_text = "\n".join(git_estate.report_text_lines(narrowed))
+        self.assertNotIn("stale-registered: 1", narrowed_text)
+
+    def test_cwd_detail_shows_unregistered_state(self) -> None:
+        dirty = self.make_repo("a-dirty")
+        (dirty / "loose.txt").write_text("loose\n", encoding="utf-8")
+        self.write_config_fixture()
+        report = git_estate.build_report(roots=[str(self.estate)], depth=2, cwd=str(dirty))
+        text = "\n".join(git_estate.report_text_lines(report))
+        self.assertIn("registration: unregistered (not in registry, not ignore-matched)", text)
 
 
 class WrapperAliasTests(GitEstateFixtureCase):
@@ -582,6 +842,26 @@ class WrapperAliasTests(GitEstateFixtureCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("valid classes:", result.stderr)
         self.assertIn("diverged-clean", result.stderr)
+
+    def test_only_unregistered_yields_real_rows_through_wrapper(self) -> None:
+        registered = self.make_repo("a-registered")
+        unregistered = self.make_repo("b-unregistered")
+        self.write_config_fixture(repos=[{"id": "a", "path": str(registered)}])
+
+        result = self.run_sbp(
+            "git", "--json", "--only", "unregistered", *self.scan_args()
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["schema"], "sbp-git/v1")
+        self.assertEqual(
+            [row["path"] for row in payload["repos"]], [str(unregistered)]
+        )
+        self.assertEqual(payload["repos"][0]["registration"], "unregistered")
+        self.assertEqual(
+            payload["registration_summary"],
+            {"registered": 1, "unregistered": 1, "unknown": 0, "stale_registered": 0},
+        )
 
     def test_piped_output_is_plain_text(self) -> None:
         dirty = self.make_repo("a-dirty")

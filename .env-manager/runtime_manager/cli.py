@@ -556,7 +556,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Filter rows to matching classes (repeatable or comma-joined): "
             "dirty, stash, ahead, behind, diverged-clean, mid-op, no-remote, "
-            "clean-current, blocked; unregistered/stale-registered are reserved."
+            "clean-current, blocked; plus registration states from the "
+            "registry join: unregistered, stale-registered."
         ),
     )
     git_status_parser.add_argument(
