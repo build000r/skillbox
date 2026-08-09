@@ -376,6 +376,203 @@ class RepoAtlasFrontDoorGateTests(unittest.TestCase):
         self.assertIn("sbp repo status . --json", spec.fix_command)
 
 
+def _git_row(
+    path,
+    classes=(),
+    registration="registered",
+    ahead=0,
+    behind=0,
+    mid_op=None,
+    stash_count=0,
+):
+    """One sbp-git/v1 repos row with the fields the gate consumes."""
+    return {
+        "path": path,
+        "classes": sorted(classes),
+        "primary_class": (sorted(classes) or ["clean-current"])[0],
+        "branch": "main",
+        "upstream": "origin/main",
+        "ahead": ahead,
+        "behind": behind,
+        "stash_count": stash_count,
+        "staged": 0,
+        "unstaged": 0,
+        "untracked": 0,
+        "mid_op": mid_op,
+        "bare": False,
+        "error": None,
+        "risk_band": "clean",
+        "registration": registration,
+        "fix": [],
+    }
+
+
+def _git_envelope(rows, filters=()):
+    return {
+        "schema": "sbp-git/v1",
+        "repos": list(rows),
+        "filters": list(filters),
+        "summary": {},
+        "registration_summary": {},
+        "repo_count": len(rows),
+    }
+
+
+class GitHygieneGateTests(unittest.TestCase):
+    """The git_hygiene gate reads ONLY the sbp git TTL cache — it never scans.
+
+    Absent/stale cache is INCO (verdict unknowable), ordinary drift (dirty /
+    ahead / behind / stash) is an advisory PASS-with-warnings, and only the
+    loss-risk classes FAIL: mid-op, diverged, dirty+unregistered — each FAIL
+    carrying its exact `sbp git --only ...` handoff.
+    """
+
+    def _run(self, loaded):
+        """Run the gate with the cache loader canned to ``loaded``."""
+        with mock.patch.object(SD, "load_scan_cache", return_value=loaded):
+            # The gate must not spawn ANY subprocess — cache-fed only.
+            with mock.patch.object(
+                SD.subprocess, "run", side_effect=AssertionError("gate scanned!")
+            ):
+                return SD._run_git_hygiene(_stub_context())
+
+    def test_absent_cache_is_inco_with_exact_advisory(self):
+        status, detail = self._run(None)
+        self.assertEqual(status, STATUS_INCO)
+        self.assertEqual(detail, "no recent scan — run sbp git")
+
+    def test_stale_cache_is_inco_not_fail(self):
+        # A stale envelope full of loss-risk rows must still be INCO: the gate
+        # may not pass judgment on a scan older than the TTL.
+        envelope = _git_envelope([_git_row("/x/r1", {"mid-op", "dirty"}, mid_op="rebase")])
+        status, detail = self._run((envelope, SD.GIT_SCAN_TTL_SECONDS + 1))
+        self.assertEqual(status, STATUS_INCO)
+        self.assertIn("no recent scan — run sbp git", detail)
+
+    def test_fresh_clean_estate_is_pass_with_age(self):
+        envelope = _git_envelope(
+            [_git_row("/x/r1", {"clean-current"}), _git_row("/x/r2", {"clean-current"})]
+        )
+        status, detail = self._run((envelope, 240.0))
+        self.assertEqual(status, STATUS_PASS)
+        self.assertIn("scan 4m old", detail)  # age always surfaced
+        self.assertIn("clean estate (2 repos)", detail)
+
+    def test_ordinary_drift_is_pass_with_warning_counts(self):
+        envelope = _git_envelope(
+            [
+                _git_row("/x/r1", {"dirty"}),
+                _git_row("/x/r2", {"dirty", "stash"}, stash_count=2),
+                _git_row("/x/r3", {"ahead"}, ahead=3),
+                _git_row("/x/r4", {"behind"}, behind=1),
+            ]
+        )
+        status, detail = self._run((envelope, 30.0))
+        self.assertEqual(status, STATUS_PASS)
+        self.assertIn("scan 30s old", detail)
+        self.assertIn("2 dirty", detail)
+        self.assertIn("1 ahead", detail)
+        self.assertIn("1 behind", detail)
+        self.assertIn("1 stash", detail)
+        self.assertIn("advisory", detail)
+
+    def test_mid_op_is_fail_naming_repo_and_handoff(self):
+        envelope = _git_envelope(
+            [
+                _git_row("/x/clean", {"clean-current"}),
+                _git_row("/x/surgery", {"mid-op", "dirty"}, mid_op="rebase"),
+            ]
+        )
+        status, detail = self._run((envelope, 120.0))
+        self.assertEqual(status, STATUS_FAIL)
+        self.assertIn("/x/surgery", detail)
+        self.assertIn("sbp git --only mid-op", detail)
+        self.assertIn("scan 2m old", detail)
+
+    def test_diverged_is_fail(self):
+        envelope = _git_envelope(
+            [_git_row("/x/split", {"ahead", "behind", "diverged-clean"}, ahead=2, behind=3)]
+        )
+        status, detail = self._run((envelope, 10.0))
+        self.assertEqual(status, STATUS_FAIL)
+        self.assertIn("/x/split", detail)
+        self.assertIn("diverged", detail)
+        self.assertIn("sbp git --only diverged-clean", detail)
+
+    def test_dirty_diverged_also_fails(self):
+        # diverged-clean is a clean-only class; a DIRTY diverged repo is
+        # strictly worse, so the gate detects divergence from ahead/behind.
+        envelope = _git_envelope(
+            [_git_row("/x/worse", {"ahead", "behind", "dirty"}, ahead=1, behind=1)]
+        )
+        status, detail = self._run((envelope, 10.0))
+        self.assertEqual(status, STATUS_FAIL)
+        self.assertIn("/x/worse", detail)
+
+    def test_dirty_unregistered_is_fail_with_handoff(self):
+        envelope = _git_envelope(
+            [_git_row("/x/orphan", {"dirty"}, registration="unregistered")]
+        )
+        status, detail = self._run((envelope, 10.0))
+        self.assertEqual(status, STATUS_FAIL)
+        self.assertIn("/x/orphan", detail)
+        self.assertIn("sbp git --only dirty,unregistered", detail)
+
+    def test_dirty_with_unknown_registration_is_pass(self):
+        # 'unknown' means the registry was unavailable at scan time — that must
+        # NOT count as unregistered; a dirty repo alone is ordinary drift.
+        envelope = _git_envelope([_git_row("/x/r1", {"dirty"}, registration="unknown")])
+        status, detail = self._run((envelope, 10.0))
+        self.assertEqual(status, STATUS_PASS)
+        self.assertIn("1 dirty", detail)
+
+    def test_clean_unregistered_is_not_a_failure(self):
+        # Only dirty AND unregistered is loss-risk; a clean unregistered repo
+        # is registry housekeeping, not a doctor FAIL.
+        envelope = _git_envelope(
+            [_git_row("/x/r1", {"clean-current"}, registration="unregistered")]
+        )
+        status, _ = self._run((envelope, 10.0))
+        self.assertEqual(status, STATUS_PASS)
+
+    def test_filtered_envelope_is_flagged_partial(self):
+        envelope = _git_envelope([_git_row("/x/r1", {"dirty"})], filters=["dirty"])
+        status, detail = self._run((envelope, 10.0))
+        self.assertEqual(status, STATUS_PASS)
+        self.assertIn("filtered view", detail)
+
+    def test_gate_makes_no_subprocess_calls_even_on_absent_cache(self):
+        # Both the INCO path and the fresh-envelope path run with subprocess
+        # booby-trapped inside _run(); this asserts the trap stayed unsprung
+        # for a mixed envelope too.
+        envelope = _git_envelope(
+            [
+                _git_row("/x/surgery", {"mid-op"}, mid_op="merge"),
+                _git_row("/x/split", {"diverged-clean", "ahead", "behind"}, ahead=1, behind=1),
+                _git_row("/x/orphan", {"dirty"}, registration="unregistered"),
+            ]
+        )
+        status, detail = self._run((envelope, 60.0))
+        self.assertEqual(status, STATUS_FAIL)
+        # All three loss-risk handoffs fire together, each with its fix.
+        self.assertIn("sbp git --only mid-op", detail)
+        self.assertIn("sbp git --only diverged-clean", detail)
+        self.assertIn("sbp git --only dirty,unregistered", detail)
+
+    def test_gate_is_registered_as_structure_before_repo_atlas(self):
+        specs = SD._gate_specs()
+        names = [s.name for s in specs]
+        self.assertIn("git_hygiene", names)
+        self.assertLess(names.index("git_hygiene"), names.index("repo_atlas_front_door"))
+        spec = {s.name: s for s in specs}["git_hygiene"]
+        self.assertEqual(spec.kind, KIND_STRUCTURE)
+        self.assertEqual(spec.cap_s, SD.CAP_FAST_LINT)
+        self.assertEqual(
+            spec.fix_command,
+            "sbp git  # rescan, then sbp git --only mid-op,diverged-clean",
+        )
+
+
 class StructureInvariantGateTests(unittest.TestCase):
     def test_missing_config_root_is_inco(self):
         ctx = DoctorContext(runtime_root=ROOT_DIR, config_root=None, cwd=ROOT_DIR)

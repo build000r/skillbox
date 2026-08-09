@@ -59,6 +59,11 @@ from .validation import (
 )
 from .skill_visibility import collect_skill_visibility
 from .mcp_visibility import collect_mcp_audit
+from .git_scan_cache import (
+    CACHE_TTL_SECONDS as GIT_SCAN_TTL_SECONDS,
+    format_age as _format_scan_age,
+    load_scan_cache,
+)
 
 # Gate kinds and statuses are part of the JSON contract; keep them as constants
 # so the CLI renderer and tests share one source of truth.
@@ -348,6 +353,124 @@ def _run_skill_drift(ctx: DoctorContext) -> tuple[str, str]:
     return STATUS_PASS, note
 
 
+# --------------------------------------------------------------------------- #
+# git_hygiene gate — fed EXCLUSIVELY from the sbp git TTL scan cache
+# --------------------------------------------------------------------------- #
+
+#: Advisory detail for the absent/stale-cache path — the exact 'run the scan'
+#: handoff the home view uses, so every ambient surface says the same thing.
+GIT_HYGIENE_NO_SCAN = "no recent scan — run sbp git"
+
+#: Ordinary-drift classes: normal working state, surfaced as a PASS-with-
+#: warnings summary, never a FAIL. (A merely dirty repo must not redline the
+#: board.)
+_GIT_WARN_CLASSES = ("dirty", "ahead", "behind", "stash")
+
+
+def _short_repo_path(path: str) -> str:
+    """``~``-abbreviate home so FAIL details stay readable in the table."""
+    home = str(Path.home())
+    if home and path.startswith(home + os.sep):
+        return "~" + path[len(home):]
+    return path
+
+
+def _name_repos(paths: list[str], limit: int = 3) -> str:
+    shown = ", ".join(_short_repo_path(p) for p in paths[:limit])
+    extra = len(paths) - limit
+    return shown + (f" +{extra} more" if extra > 0 else "")
+
+
+def _run_git_hygiene(ctx: DoctorContext) -> tuple[str, str]:
+    """STRUCTURE gate: loss-risk git drift, read from the last-scan cache ONLY.
+
+    This gate NEVER scans (no git, no subprocess) — doctor's structure budget
+    stays intact. It replays the ``sbp-git/v1`` envelope the last live
+    ``sbp git`` write-through'd to the TTL cache:
+
+    * Cache absent or stale (> TTL): INCO with the 'no recent scan — run sbp
+      git' advisory — the verdict is unknowable without a scan, and INCO is
+      never a failure. (Schema-version mismatch is the loader's job: it reads
+      as ABSENT and lands here too.)
+    * Ordinary drift (dirty / ahead / behind / stash): PASS with a warnings
+      summary in the detail — normal working state, advisory only.
+    * FAIL only for loss-risk classes, each carrying its exact ``--only``
+      handoff: (a) mid-op — the envelope carries no per-repo mid-op age, so
+      ANY cached mid-op fails (a mid-op is always a paused surgery; recency
+      cannot be verified from the cache); (b) diverged — ``ahead > 0 and
+      behind > 0``, a deliberate superset of the clean-only ``diverged-clean``
+      class so a dirty diverged repo (strictly worse) also fires; (c) dirty
+      AND ``registration == "unregistered"``. Registration ``unknown``
+      (registry unavailable at scan time) never counts as unregistered.
+
+    The cache age always appears in the detail (``scan 4m old: ...``) so the
+    reader knows how stale the verdict is; a filtered envelope (``sbp git
+    --only ...`` also write-throughs) is flagged as a partial view.
+    """
+    loaded = load_scan_cache(ctx.runtime_root)
+    if loaded is None:
+        return STATUS_INCO, GIT_HYGIENE_NO_SCAN
+    envelope, age = loaded
+    if age > GIT_SCAN_TTL_SECONDS:
+        return STATUS_INCO, (
+            f"{GIT_HYGIENE_NO_SCAN} (last scan {_format_scan_age(age)} old, "
+            f"TTL {int(GIT_SCAN_TTL_SECONDS) // 60}m)"
+        )
+
+    mid_op: list[str] = []
+    diverged: list[str] = []
+    dirty_unregistered: list[str] = []
+    warn_counts: dict[str, int] = {cls: 0 for cls in _GIT_WARN_CLASSES}
+    rows = envelope.get("repos")
+    row_count = 0
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        row_count += 1
+        raw_classes = row.get("classes")
+        classes = set(raw_classes) if isinstance(raw_classes, list) else set()
+        path = str(row.get("path") or "?")
+        if "mid-op" in classes or row.get("mid_op"):
+            mid_op.append(path)
+        ahead, behind = row.get("ahead"), row.get("behind")
+        if isinstance(ahead, int) and isinstance(behind, int) and ahead > 0 and behind > 0:
+            diverged.append(path)
+        if "dirty" in classes and row.get("registration") == "unregistered":
+            dirty_unregistered.append(path)
+        for cls in _GIT_WARN_CLASSES:
+            if cls in classes:
+                warn_counts[cls] += 1
+
+    prefix = f"scan {_format_scan_age(age)} old"
+    filters = envelope.get("filters")
+    if isinstance(filters, list) and filters:
+        prefix += f" [filtered view: --only {','.join(str(f) for f in filters)}]"
+
+    failures: list[str] = []
+    if mid_op:
+        failures.append(f"mid-op: {_name_repos(mid_op)} — sbp git --only mid-op")
+    if diverged:
+        # `diverged` is not an --only token; `diverged-clean` is the closest
+        # class filter (the detail names dirty diverged repos directly).
+        failures.append(
+            f"diverged: {_name_repos(diverged)} — sbp git --only diverged-clean"
+        )
+    if dirty_unregistered:
+        failures.append(
+            f"dirty+unregistered: {_name_repos(dirty_unregistered)} — "
+            "sbp git --only dirty,unregistered"
+        )
+    if failures:
+        return STATUS_FAIL, f"{prefix}: " + "; ".join(failures)
+
+    warnings = [f"{count} {cls}" for cls, count in warn_counts.items() if count]
+    if warnings:
+        return STATUS_PASS, (
+            f"{prefix}: {', '.join(warnings)} — ordinary drift, advisory only"
+        )
+    return STATUS_PASS, f"{prefix}: clean estate ({row_count} repos)"
+
+
 def _repo_atlas_engine_path() -> Path:
     """Resolve the private Repo Atlas engine the same way the sbp wrapper does."""
     override = str(os.environ.get("SKILLBOX_REPO_ATLAS_CLI") or "").strip()
@@ -542,6 +665,15 @@ def _gate_specs() -> tuple[_GateSpec, ...]:
             cap_s=CAP_FAST_LINT,
             fix_command="sbp recalibrate  # review skill add/remove for this cwd",
             runner=_run_skill_drift,
+        ),
+        _GateSpec(
+            name="git_hygiene",
+            kind=KIND_STRUCTURE,
+            # Reads one small JSON file (the sbp git TTL cache) — sub-
+            # millisecond; the fast-lint cap is pure headroom. Never scans.
+            cap_s=CAP_FAST_LINT,
+            fix_command="sbp git  # rescan, then sbp git --only mid-op,diverged-clean",
+            runner=_run_git_hygiene,
         ),
         _GateSpec(
             name="repo_atlas_front_door",
