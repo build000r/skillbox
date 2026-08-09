@@ -581,6 +581,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Directory depth under each root to search for .git entries.",
     )
     git_status_parser.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "After the normal local scan, add an origin comparison delegated "
+            "to the reconcile skill's fleet_convergence.py (never fetches "
+            "locally, never mutates). Additive JSON fields only (live + "
+            "per-row origin_state/origin_head). If the delegation is "
+            "unavailable, times out, or returns garbage, one 'live "
+            "comparison unavailable' note is emitted and output stays "
+            "local-only with exit 0."
+        ),
+    )
+    git_status_parser.add_argument(
         "--cached",
         action="store_true",
         help=(
@@ -3925,6 +3938,10 @@ def _handle_git_status(args: argparse.Namespace, root_dir: Path) -> int:
     `--cached` replays that envelope when fresh (<= TTL) without spawning a
     single git subprocess; a stale/absent cache exits 0 with a 'no recent
     scan' pointer instead of silently falling back to a slow live scan.
+
+    `--live` (opt-in) delegates an origin comparison to the reconcile skill
+    AFTER the local scan; it only ever adds fields/notes and never changes
+    the exit code (delegation failures degrade to a loud note, exit 0).
     """
     if getattr(args, "cached", False):
         return _serve_cached_git_status(args, root_dir)
@@ -3935,6 +3952,7 @@ def _handle_git_status(args: argparse.Namespace, root_dir: Path) -> int:
             depth=int(getattr(args, "depth", GIT_ESTATE_DEFAULT_DEPTH)),
             cwd=cwd,
             only=list(getattr(args, "only", []) or []),
+            live=bool(getattr(args, "live", False)),
         )
     except ValueError as exc:
         print(f"git-status: {exc}", file=sys.stderr)

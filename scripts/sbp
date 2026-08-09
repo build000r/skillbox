@@ -453,11 +453,14 @@ Usage:
                               Exits nonzero on FAIL only.
   __WRAPPER__ registry doctor [args...] Check registry/repos.yaml against local Git repos
   __WRAPPER__ repo [args...]           Read repository dossiers through private Repo Atlas
-  __WRAPPER__ git [--only CLASS[,CLASS]] [--root PATH] [--depth N] [--cached] [--json]
+  __WRAPPER__ git [--only CLASS[,CLASS]] [--root PATH] [--depth N] [--cached] [--live] [--json]
                               Read-only risk-sorted git status across ~/repos
                               (aliases: gs, git status; never fetches or pushes)
                               --cached replays the last scan when <=10m old
                               (never scans; stale cache says so and exits 0)
+                              --live adds an origin comparison delegated to the
+                              reconcile skill (fleet_convergence; still never
+                              fetches locally; degrades loudly to local-only)
                               CLASS: dirty stash ahead behind diverged-clean
                               mid-op no-remote clean-current blocked
                               unregistered stale-registered
@@ -851,6 +854,9 @@ Estate git read:
   Filter with --only CLASS[,CLASS]: dirty, stash, ahead, behind, diverged-clean,
   mid-op, no-remote, clean-current, blocked, unregistered, stale-registered.
   Scope with --root PATH and --depth N. Aliases: ${wrapper_name} gs, ${wrapper_name} git status.
+  Opt-in --live delegates an origin comparison to the reconcile skill's
+  fleet_convergence (additive origin_state/origin_head fields; still no local
+  fetch; unavailable delegation degrades to a loud note + local-only, exit 0).
 
 Safe mutation pattern:
   ${wrapper_name} up <profile> <service> --dry-run --json
@@ -1013,7 +1019,7 @@ case "${1:-}" in
       shift
     elif [[ -n "${1:-}" && "${1}" != -* ]]; then
       echo "${wrapper_name} git: read-only status viewer; refusing to proxy 'git ${1}'" >&2
-      echo "Usage: ${wrapper_name} git [status] [--only CLASS[,CLASS]] [--root PATH] [--depth N] [--cached] [--json]" >&2
+      echo "Usage: ${wrapper_name} git [status] [--only CLASS[,CLASS]] [--root PATH] [--depth N] [--cached] [--live] [--json]" >&2
       echo "Run real git directly: git ${1} ..." >&2
       exit 2
     fi
