@@ -62,6 +62,8 @@ from .evidence import *
 from .forge import *
 from .swimmers_launch import launch_swimmers_batch, swimmers_launch_text_lines
 from .structure_doctor import run_structure_doctor, structure_doctor_text_lines
+from .git_estate import build_report as git_estate_report, report_text_lines as git_estate_text_lines
+from .git_inventory import DEFAULT_DEPTH as GIT_ESTATE_DEFAULT_DEPTH
 from .skill_pull import SkillPullError, pull_host_skill, resolve_host_skills
 from .command_registry import registry_payload
 from .registry_docs import registry_docs_payload
@@ -529,6 +531,47 @@ def _build_parser() -> argparse.ArgumentParser:
         "--cwd",
         default=None,
         help="Directory to evaluate cwd-scoped gates (skill/MCP drift) against. Defaults to $PWD.",
+    )
+
+    git_status_parser = subparsers.add_parser(
+        "git-status",
+        help=(
+            "Read-only estate git status (surfaced as `sbp git`): risk-sorted "
+            "multi-repo scan with registry ignore rules, --only class filters, "
+            "and per-row fix commands. Never fetches, never mutates; "
+            "ahead/behind counts are relative to the last-fetched upstream."
+        ),
+    )
+    git_status_parser.add_argument("--format", choices=("text", "json"), default="text")
+    git_status_parser.add_argument(
+        "--cwd",
+        default=None,
+        help="Directory whose enclosing repo gets the detail block. Defaults to $PWD.",
+    )
+    git_status_parser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="CLASS[,CLASS]",
+        help=(
+            "Filter rows to matching classes (repeatable or comma-joined): "
+            "dirty, stash, ahead, behind, diverged-clean, mid-op, no-remote, "
+            "clean-current, blocked; unregistered/stale-registered are reserved."
+        ),
+    )
+    git_status_parser.add_argument(
+        "--root",
+        action="append",
+        default=[],
+        dest="roots",
+        metavar="PATH",
+        help="Scan root (repeatable). Defaults to ~/repos.",
+    )
+    git_status_parser.add_argument(
+        "--depth",
+        type=int,
+        default=GIT_ESTATE_DEFAULT_DEPTH,
+        help="Directory depth under each root to search for .git entries.",
     )
 
     status_parser = subparsers.add_parser(
@@ -3851,6 +3894,32 @@ def _handle_structure_doctor(args: argparse.Namespace, root_dir: Path) -> int:
     return int(payload.get("exit_code", 0))
 
 
+def _handle_git_status(args: argparse.Namespace, root_dir: Path) -> int:
+    """`sbp git` — read-only estate git status.
+
+    Never fetches or mutates (git_inventory's contract); the presentation
+    layer only sorts, filters, and hands back fix command strings. Unknown
+    --only classes are a usage error (exit 2) before any scan runs.
+    """
+    cwd = str(getattr(args, "cwd", None) or os.getcwd())
+    try:
+        report = git_estate_report(
+            roots=list(getattr(args, "roots", []) or []) or None,
+            depth=int(getattr(args, "depth", GIT_ESTATE_DEFAULT_DEPTH)),
+            cwd=cwd,
+            only=list(getattr(args, "only", []) or []),
+        )
+    except ValueError as exc:
+        print(f"git-status: {exc}", file=sys.stderr)
+        return _EXIT_USAGE
+    if args.format == "json":
+        emit_json(report)
+    else:
+        for line in git_estate_text_lines(report, color=sys.stdout.isatty()):
+            print(line)
+    return EXIT_OK
+
+
 def _load_sbp_evidence_module():
     """Best-effort import of the skillbox-config evidence backend.
 
@@ -3983,6 +4052,7 @@ _EARLY_COMMANDS: tuple[tuple[str, EarlyCommandHandler, str], ...] = (
     ("swimmers-launch", _handle_swimmers_launch, "Launch Swimmers agent sessions for directories."),
     ("mmdx", _handle_mmdx, "Open or create MMDX diagrams."),
     ("structure-doctor", _handle_structure_doctor, "Run structural gates without mutating runtime state."),
+    ("git-status", _handle_git_status, "Read-only risk-sorted git status across the repo estate."),
 )
 
 

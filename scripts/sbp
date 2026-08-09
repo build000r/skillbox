@@ -132,6 +132,301 @@ configure_operator_defaults() {
   fi
 }
 
+repo_atlas_failure() {
+  echo "${wrapper_name} repo: private Repo Atlas engine unavailable or incompatible" >&2
+  return 2
+}
+
+repo_atlas_preflight() {
+  local engine="$1"
+  [[ -f "${engine}" && -r "${engine}" ]] || return 1
+  env \
+    PYTHONDONTWRITEBYTECODE=1 \
+    GIT_OPTIONAL_LOCKS=0 \
+    GIT_TERMINAL_PROMPT=0 \
+    GCM_INTERACTIVE=never \
+    SSH_ASKPASS_REQUIRE=never \
+    python3 - "${engine}" <<'PY'
+from __future__ import annotations
+
+import json
+import math
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+import unicodedata
+
+ENGINE = sys.argv[1]
+MAX_CAPABILITY_BYTES = 262_144
+MAX_CAPABILITY_DEPTH = 32
+MAX_CAPABILITY_NODES = 4_096
+CAPABILITY_TIMEOUT_SECONDS = 10.0
+EXPECTED_SCHEMA = "repo-atlas-command/v1"
+EXPECTED_ENCODING = {
+    "array_order": "preserved",
+    "charset": "utf-8",
+    "line_termination": "LF",
+    "non_finite_numbers": "rejected",
+    "object_keys": "sorted",
+}
+EXPECTED_COMMANDS = [
+    "status", "cwd", "locate", "list", "host", "doctor", "explain",
+    "capabilities",
+]
+EXPECTED_OPTIONS = ["--json", "--timeout-seconds N"]
+EXPECTED_SELECTORS = ["repo:", "host:", "origin:", "path:", "cwd"]
+EXPECTED_EXIT_CODES = {
+    "blocked": 1,
+    "clean": 0,
+    "partial_or_unreachable": 3,
+    "usage_or_config": 2,
+}
+EXPECTED_REASONS = [
+    "ABSENT",
+    "AMP_AUTHORITY_UNREACHABLE",
+    "AMP_SNAPSHOT_UNAVAILABLE",
+    "CAPSULE_INDETERMINATE",
+    "CHECKOUT_ROOT_UNKNOWN",
+    "COMMAND_TIMEOUT",
+    "DECLARED_AVAILABLE_MISSING",
+    "DECLARED_NOT_INSTALLED",
+    "DECLARED_UNKNOWN",
+    "DISCOVERED_UNREGISTERED",
+    "HOST_COLLECTION_FAILED",
+    "HOST_UNREACHABLE",
+    "IDENTITY_AMBIGUOUS",
+    "IDENTITY_CONFLICT",
+    "IDENTITY_NOT_FOUND",
+    "IDENTITY_UNKNOWN",
+    "IDENTITY_UNREACHABLE",
+    "LINKED_WORKTREE",
+    "LIVE_ORIGIN_FAILED",
+    "NOT_APPLICABLE",
+    "PROJECT_ABSENT",
+    "REGISTRY_DRIFT",
+    "REGISTRY_INDETERMINATE",
+    "RUNTIME_AUTHORITY_UNKNOWN",
+    "STALE_AMP_THREAD_SNAPSHOT",
+    "STALE_EVIDENCE",
+    "TOTAL_BUDGET_EXCEEDED",
+    "WRITER_BLOCKED",
+]
+EXPECTED_ROUTING_CAPABILITIES = [
+    "repo.read.doctor",
+    "repo.read.explain",
+    "repo.read.host",
+    "repo.read.list",
+    "repo.read.status",
+]
+
+
+def reject_constant(_value: str) -> object:
+    raise ValueError
+
+
+def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError
+        result[key] = value
+    return result
+
+
+def safe_json(value: object) -> None:
+    """Bound and validate all known and additive JSON without recursion."""
+    stack: list[tuple[object, int]] = [(value, 0)]
+    nodes = 0
+    while stack:
+        item, depth = stack.pop()
+        nodes += 1
+        if nodes > MAX_CAPABILITY_NODES or depth > MAX_CAPABILITY_DEPTH:
+            raise ValueError
+        if item is None or type(item) in {bool, int}:
+            continue
+        if type(item) is float:
+            if not math.isfinite(item):
+                raise ValueError
+            continue
+        if type(item) is str:
+            if any(unicodedata.category(char).startswith("C") for char in item):
+                raise ValueError
+            continue
+        if type(item) is list:
+            stack.extend((child, depth + 1) for child in reversed(item))
+            continue
+        if type(item) is dict:
+            for key, child in reversed(tuple(item.items())):
+                if type(key) is not str:
+                    raise ValueError
+                stack.append((child, depth + 1))
+                stack.append((key, depth + 1))
+            continue
+        raise ValueError
+
+
+def exact_string_list(value: object, expected: list[str]) -> None:
+    if type(value) is not list or any(type(item) is not str for item in value):
+        raise ValueError
+    if value != expected or len(value) != len(set(value)):
+        raise ValueError
+
+
+def exact_object(value: object, expected: dict[str, object]) -> None:
+    if type(value) is not dict or set(value) != set(expected):
+        raise ValueError
+    for key, expected_value in expected.items():
+        actual = value[key]
+        if type(actual) is not type(expected_value) or actual != expected_value:
+            raise ValueError
+
+
+def process_group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def terminate_group_and_reap(process: subprocess.Popen[bytes]) -> bool:
+    """Bound TERM/KILL for the probe's private group, then reap its leader."""
+    pgid = process.pid
+    if pgid <= 1 or pgid == os.getpgrp():
+        raise ValueError
+    group_existed = process_group_exists(pgid)
+    if group_existed:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        term_deadline = time.monotonic() + 0.25
+        while process_group_exists(pgid) and time.monotonic() < term_deadline:
+            time.sleep(0.01)
+        if process_group_exists(pgid):
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            kill_deadline = time.monotonic() + 0.25
+            while process_group_exists(pgid) and time.monotonic() < kill_deadline:
+                time.sleep(0.01)
+    try:
+        process.wait(timeout=0.25)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=0.25)
+    return group_existed
+
+
+def read_capabilities() -> bytes:
+    """Acquire at most MAX+1 bytes under one launch-to-reap deadline."""
+    deadline = time.monotonic() + CAPABILITY_TIMEOUT_SECONDS
+    process = subprocess.Popen(
+        [sys.executable, ENGINE, "capabilities", "--json"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    if process.stdout is None:
+        terminate_group_and_reap(process)
+        raise ValueError
+    raw = bytearray()
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, CAPABILITY_TIMEOUT_SECONDS)
+            readable, _, _ = select.select(
+                [process.stdout], [], [], min(remaining, 0.05),
+            )
+            if not readable:
+                if process.poll() is not None:
+                    if terminate_group_and_reap(process):
+                        raise ValueError
+                    break
+                continue
+            chunk = os.read(
+                process.stdout.fileno(),
+                min(65_536, MAX_CAPABILITY_BYTES + 1 - len(raw)),
+            )
+            if not chunk:
+                break
+            raw.extend(chunk)
+            if len(raw) > MAX_CAPABILITY_BYTES:
+                raise ValueError
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, CAPABILITY_TIMEOUT_SECONDS)
+        try:
+            returncode = process.wait(timeout=min(remaining, 0.05))
+        except subprocess.TimeoutExpired:
+            terminate_group_and_reap(process)
+            raise ValueError from None
+        if terminate_group_and_reap(process):
+            raise ValueError
+        if returncode != 0 or not raw:
+            raise ValueError
+        return bytes(raw)
+    except BaseException:
+        terminate_group_and_reap(process)
+        raise
+    finally:
+        process.stdout.close()
+
+
+try:
+    raw = read_capabilities()
+    value = json.loads(
+        raw.decode("utf-8"),
+        object_pairs_hook=strict_object,
+        parse_constant=reject_constant,
+    )
+    safe_json(value)
+    if type(value) is not dict:
+        raise ValueError
+    if value.get("schema_version") != EXPECTED_SCHEMA:
+        raise ValueError
+    if type(value.get("exit_code")) is not int or value["exit_code"] != 0:
+        raise ValueError
+    exact_object(value.get("encoding"), EXPECTED_ENCODING)
+    payload = value.get("payload")
+    if type(payload) is not dict:
+        raise ValueError
+    if payload.get("schema") != "repo-atlas-cli/v1":
+        raise ValueError
+    if payload.get("command_schema_version") != EXPECTED_SCHEMA:
+        raise ValueError
+    exact_object(payload.get("encoding"), EXPECTED_ENCODING)
+    if payload.get("read_only") is not True or payload.get("fetch") is not False:
+        raise ValueError
+    exact_string_list(payload.get("commands"), EXPECTED_COMMANDS)
+    exact_string_list(payload.get("global_options"), EXPECTED_OPTIONS)
+    exact_string_list(payload.get("selectors"), EXPECTED_SELECTORS)
+    exact_object(payload.get("exit_codes"), EXPECTED_EXIT_CODES)
+    exact_string_list(payload.get("reason_codes"), EXPECTED_REASONS)
+    exact_string_list(
+        payload.get("reason_routing_capabilities"),
+        EXPECTED_ROUTING_CAPABILITIES,
+    )
+    exact_object(payload.get("default"), {"command": "status", "selector": "."})
+except (
+    OSError, RecursionError, subprocess.SubprocessError, UnicodeError,
+    ValueError, TypeError,
+):
+    raise SystemExit(1)
+PY
+}
+
 print_help() {
   cat <<'EOF' | sed "s/__WRAPPER__/${wrapper_name}/g"
 __WRAPPER__ - personal skillbox runtime and skill helper
@@ -157,6 +452,10 @@ Usage:
                               (INCO/FAIL/PASS); complements `make doctor`.
                               Exits nonzero on FAIL only.
   __WRAPPER__ registry doctor [args...] Check registry/repos.yaml against local Git repos
+  __WRAPPER__ repo [args...]           Read repository dossiers through private Repo Atlas
+  __WRAPPER__ git [--only CLASS] [--root PATH] [--depth N]
+                              Read-only risk-sorted git status across ~/repos
+                              (aliases: gs, git status; never fetches or pushes)
   __WRAPPER__ cass status|search|rebuild|doctor  Remote Cass front door.
                               Use status/search for active tasks; treat rebuild as
                               coordinated maintenance, not degraded-mode fallback.
@@ -468,6 +767,8 @@ payload = {
         {"name": "candidates", "json": True, "safe_first_try": f"{wrapper} candidates --json"},
         {"name": "mcp", "json": True, "safe_first_try": f"{wrapper} mcp --json"},
         {"name": "registry", "json": True, "safe_first_try": f"{wrapper} registry doctor --json"},
+        {"name": "repo", "json": True, "safe_first_try": f"{wrapper} repo status . --json"},
+        {"name": "git", "json": True, "safe_first_try": f"{wrapper} git --json", "aliases": ["gs"], "notes": "Read-only estate git status viewer; never proxies mutating git subcommands."},
         {
             "name": "cass",
             "json": True,
@@ -681,6 +982,25 @@ case "${1:-}" in
     action="structure-doctor"
     shift
     ;;
+  repo)
+    action="repo-atlas"
+    shift
+    ;;
+  git|gs)
+    action="git-status"
+    shift
+    # `sbp git`, `sbp gs`, and `sbp git status` are pure aliases; drop the
+    # redundant `status` token. This is a status VIEWER, never a git shim:
+    # any other subcommand (push, pull, commit, ...) is refused, not proxied.
+    if [[ "${1:-}" == "status" ]]; then
+      shift
+    elif [[ -n "${1:-}" && "${1}" != -* ]]; then
+      echo "${wrapper_name} git: read-only status viewer; refusing to proxy 'git ${1}'" >&2
+      echo "Usage: ${wrapper_name} git [status] [--only CLASS[,CLASS]] [--root PATH] [--depth N] [--json]" >&2
+      echo "Run real git directly: git ${1} ..." >&2
+      exit 2
+    fi
+    ;;
   registry|repos|repo-registry)
     action="repo-registry"
     shift
@@ -777,7 +1097,7 @@ case "${1:-}" in
     ;;
 esac
 
-if [[ "${action}" != "mmdx" && "${action}" != "swimmers-launch" ]]; then
+if [[ "${action}" != "mmdx" && "${action}" != "swimmers-launch" && "${action}" != "repo-atlas" ]]; then
   case "${1:-}" in
     all|local-all)
       profile="local-all"
@@ -822,7 +1142,7 @@ append_passthrough_token() {
           ;;
       esac
       ;;
-    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|mcp-sync|structure-doctor|repo-registry|cass|cass-evidence|oracle|cron|send-later|safe|conference1|beads|mmdx|operator-booking|swimmers-launch|fleet)
+    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|mcp-sync|structure-doctor|git-status|repo-atlas|repo-registry|cass|cass-evidence|oracle|cron|send-later|safe|conference1|beads|mmdx|operator-booking|swimmers-launch|fleet)
       passthrough_args+=("${token}")
       ;;
     *)
@@ -841,6 +1161,9 @@ append_json_flag() {
       runtime_args+=(--format json)
       ;;
     capabilities|robot-triage)
+      ;;
+    repo-atlas)
+      passthrough_args+=(--json)
       ;;
     repo-registry|cass|oracle|cron|safe|send-later)
       passthrough_args+=(--json)
@@ -1046,7 +1369,7 @@ while [[ $# -gt 0 ]]; do
       fi
       append_input_token "$1"
       ;;
-    --wait-seconds|--mode|--lines|--limit)
+    --wait-seconds|--mode|--lines|--limit|--only|--root|--depth)
       if [[ $# -lt 2 ]]; then
         echo "${wrapper_name}: ${1} requires a value" >&2
         exit 2
@@ -1069,7 +1392,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-if [[ ! -t 0 && "${action}" != "home" && "${action}" != "help" && "${action}" != "send-later" && "${action}" != "safe" && "${action}" != "conference1" ]]; then
+if [[ ! -t 0 && "${action}" != "home" && "${action}" != "help" && "${action}" != "repo-atlas" && "${action}" != "git-status" && "${action}" != "send-later" && "${action}" != "safe" && "${action}" != "conference1" ]]; then
   while IFS= read -r line; do
     line="${line//,/ }"
     # Intentional shell-word splitting for simple pipe-friendly wrapper input.
@@ -1255,6 +1578,9 @@ PY
   structure-doctor)
     python3 .env-manager/manage.py structure-doctor --cwd "${invoke_cwd}" "${passthrough_args[@]}"
     ;;
+  git-status)
+    python3 .env-manager/manage.py git-status --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    ;;
   cass)
     config_root="${SKILLBOX_CONFIG_ROOT:-${HOME}/repos/skillbox-config}"
     cass_wrapper="${config_root}/scripts/sbp_cass.py"
@@ -1355,6 +1681,32 @@ PY
       exit 1
     fi
     bash "${safe_wrapper}" "${passthrough_args[@]}"
+    ;;
+  repo-atlas)
+    if [[ -n "${SKILLBOX_REPO_ATLAS_CLI+x}" ]]; then
+      repo_atlas_cli="${SKILLBOX_REPO_ATLAS_CLI}"
+    else
+      repo_atlas_cli="${SKILLBOX_MONOSERVER_ROOT}/skills-private/reconcile/scripts/repo_atlas_cli.py"
+    fi
+    if ! repo_atlas_preflight "${repo_atlas_cli}"; then
+      repo_atlas_failure
+      exit 2
+    fi
+    repo_atlas_args=("${passthrough_args[@]}")
+    if [[ ${#repo_atlas_args[@]} -eq 0 ]]; then
+      repo_atlas_args=(status .)
+    fi
+    (
+      cd "${invoke_cwd}"
+      exec env \
+        PYTHONDONTWRITEBYTECODE=1 \
+        GIT_OPTIONAL_LOCKS=0 \
+        GIT_TERMINAL_PROMPT=0 \
+        GCM_INTERACTIVE=never \
+        SSH_ASKPASS_REQUIRE=never \
+        python3 "${repo_atlas_cli}" "${repo_atlas_args[@]}"
+    )
+    exit $?
     ;;
   repo-registry)
     config_root="${SKILLBOX_CONFIG_ROOT:-${HOME}/repos/skillbox-config}"

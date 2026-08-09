@@ -82,7 +82,7 @@ class SbpWrapperContractTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("skill add: demo-skill (dry-run)", result.stdout)
-        self.assertIn(f"source: {source}", result.stdout)
+        self.assertIn(f"source: {source.resolve()}", result.stdout)
 
     def test_recalibrate_auto_fix_returns_nonzero_when_heal_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -7,7 +7,7 @@
 Generated from command registry ABI `2026-06-11+agent_ops_brain`.
 Do not edit by hand; run `python3 .env-manager/manage.py registry-docs --write`.
 
-Registry entries: 46.
+Registry entries: 47.
 
 ## Tier 1
 
@@ -626,6 +626,53 @@ python3 -m pytest tests/test_fleet_relink.py
 ```
 
 **Graph Nodes**: `skill`, `repo`, `command`
+
+#### runtime.git_status
+
+Read-only risk-sorted git status across the repo estate with registry ignore rules, --only filters, and per-row fix commands.
+
+- Surfaces: `cli`
+- Scopes: `cwd`
+- Side effect: `none`
+- Risk: `low`
+- Entrypoint: `manage.py`
+- Owner binary: `sbp`
+- MCP mirror: None
+
+**Inputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `cwd` | `string?` | no |
+| `depth` | `integer?` | no |
+| `format` | `enum[json\|text]?` | no |
+| `only` | `string[]?` | no |
+| `root` | `string[]?` | no |
+
+**Outputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `elapsed_seconds` | `number` | yes |
+| `ignored_count` | `integer` | yes |
+| `repo_count` | `integer` | yes |
+| `repos` | `object[]` | yes |
+| `schema` | `string` | yes |
+| `summary` | `object` | yes |
+
+**Examples**
+
+```bash
+python3 .env-manager/manage.py git-status --cwd "$PWD" --format json
+```
+
+**Validation**
+
+```bash
+python3 -m unittest tests.test_git_estate
+```
+
+**Graph Nodes**: `repo`
 
 #### runtime.logs
 
