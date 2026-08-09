@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -372,6 +373,16 @@ class DiscoveryTests(GitFixtureCase):
         with self.assertRaises(ValueError):
             git_inventory.discover_repos([self.tmp], depth=0)
 
+    def test_scan_accepts_workers_and_stays_correct(self) -> None:
+        root = self.tmp / "workersroot"
+        root.mkdir()
+        repo = self.make_repo("workersroot/solo")
+        records = git_inventory.scan([root], depth=2, workers=1)
+        self.assertEqual([r.path for r in records], [str(repo)])
+        self.assertEqual(records[0].primary_class, "no-remote")
+        with self.assertRaises(ValueError):
+            git_inventory.scan([root], depth=2, workers=0)
+
     def test_scan_end_to_end(self) -> None:
         root = self.tmp / "scanroot"
         root.mkdir()
@@ -390,6 +401,137 @@ class DiscoveryTests(GitFixtureCase):
             git_inventory.primary_class_counts(records),
             {"blocked": 1, "dirty": 1},
         )
+
+
+class ConcurrentScanTests(GitFixtureCase):
+    """Parallel-probe contract: determinism, deadlines, ScanResult surface."""
+
+    def _build_estate(self, count: int) -> tuple[Path, list[Path]]:
+        root = self.tmp / "estate"
+        root.mkdir()
+        repos = [self.make_repo(f"estate/repo-{i:02d}") for i in range(count)]
+        return root, repos
+
+    def test_deterministic_ordering_under_concurrency(self) -> None:
+        root, repos = self._build_estate(10)
+        expected = sorted(str(r) for r in repos)
+
+        # Skew completion order: make the lexicographically-first repos the
+        # slowest so completion order inverts path order.
+        real_run_git = git_inventory._run_git
+
+        def skewed(path: str, args, timeout_s: float):
+            if path.endswith(("repo-00", "repo-01", "repo-02")):
+                time.sleep(0.05)
+            return real_run_git(path, args, timeout_s)
+
+        with mock.patch.object(git_inventory, "_run_git", side_effect=skewed):
+            records = git_inventory.scan([root], depth=2, workers=8)
+        self.assertEqual([r.path for r in records], expected)
+        self.assertTrue(all(r.error is None for r in records))
+
+        # Same order again on a second, differently-parallel run.
+        rerun = git_inventory.scan([root], depth=2, workers=3)
+        self.assertEqual([r.path for r in rerun], expected)
+
+    def test_wedged_repo_becomes_blocked_not_hang(self) -> None:
+        root, repos = self._build_estate(4)
+        wedged = str(repos[1])
+        real_run_git = git_inventory._run_git
+
+        def wedge(path: str, args, timeout_s: float):
+            if path == wedged:
+                time.sleep(1.0)  # every call outlasts the whole repo deadline
+            return real_run_git(path, args, timeout_s)
+
+        # The deadline is generous enough for the healthy repos (a fixture
+        # probe is ~0.1s) but is exhausted by the wedged repo's first call.
+        start = time.monotonic()
+        with mock.patch.object(git_inventory, "_run_git", side_effect=wedge):
+            records = git_inventory.scan(
+                [root], depth=2, workers=4, deadline_s=0.75
+            )
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 5.0, "wedged repo must not stall the scan")
+
+        by_path = {r.path: r for r in records}
+        self.assertEqual([r.path for r in records], sorted(by_path))
+        self.assertEqual(by_path[wedged].primary_class, "blocked")
+        self.assertIn("deadline", by_path[wedged].error or "")
+        for path, record in by_path.items():
+            if path != wedged:
+                self.assertIsNone(record.error, f"{path} should probe cleanly")
+
+    def test_deadline_exhausted_between_calls(self) -> None:
+        repo = self.make_repo("deadline-between")
+        real_run_git = git_inventory._run_git
+
+        def slow(path: str, args, timeout_s: float):
+            time.sleep(0.06)  # deadline is spent before the next call starts
+            return real_run_git(path, args, timeout_s)
+
+        with mock.patch.object(git_inventory, "_run_git", side_effect=slow):
+            record = git_inventory.probe_repo(repo, deadline_s=0.05)
+        self.assertEqual(record.primary_class, "blocked")
+        self.assertIn("deadline", record.error or "")
+
+    def test_probe_repo_rejects_nonpositive_deadline(self) -> None:
+        repo = self.make_repo("bad-deadline")
+        with self.assertRaises(ValueError):
+            git_inventory.probe_repo(repo, deadline_s=0)
+        # None disables the overall deadline entirely.
+        record = git_inventory.probe_repo(repo, deadline_s=None)
+        self.assertIsNone(record.error)
+
+    def test_scan_estate_result_surface(self) -> None:
+        root, repos = self._build_estate(3)
+        result = git_inventory.scan_estate([root], depth=2, workers=4)
+
+        self.assertIsInstance(result, git_inventory.ScanResult)
+        self.assertGreaterEqual(result.elapsed_seconds, 0.0)
+        self.assertEqual(result.repo_count, len(result.records))
+        self.assertEqual(result.repo_count, len(repos))
+        self.assertEqual(result.roots, [str(root)])
+        self.assertEqual(result.depth, 2)
+        self.assertEqual(result.workers, 4)
+        self.assertEqual(
+            [r.path for r in result.records], sorted(str(r) for r in repos)
+        )
+
+        # scan() is the same scan minus the metadata wrapper.
+        self.assertEqual(
+            [r.path for r in git_inventory.scan([root], depth=2, workers=4)],
+            [r.path for r in result.records],
+        )
+
+        payload = json.loads(json.dumps(result.to_dict()))
+        self.assertEqual(payload["repo_count"], result.repo_count)
+        self.assertEqual(payload["depth"], 2)
+        self.assertEqual(len(payload["records"]), result.repo_count)
+        self.assertIsInstance(payload["elapsed_seconds"], float)
+
+    def test_scan_estate_empty_estate(self) -> None:
+        root = self.tmp / "empty-estate"
+        root.mkdir()
+        result = git_inventory.scan_estate([root], depth=2)
+        self.assertEqual(result.records, [])
+        self.assertEqual(result.repo_count, 0)
+        self.assertGreaterEqual(result.elapsed_seconds, 0.0)
+
+    def test_default_workers_is_sane(self) -> None:
+        workers = git_inventory.DEFAULT_WORKERS
+        self.assertGreaterEqual(workers, 8)
+        self.assertLessEqual(workers, 32)
+
+    def test_git_env_is_fresh_per_call(self) -> None:
+        """Workers must never share a mutable env dict across probes."""
+        first = git_inventory._git_env()
+        second = git_inventory._git_env()
+        self.assertIsNot(first, second)
+        self.assertEqual(first, second)
+        first["GIT_OPTIONAL_LOCKS"] = "tampered"
+        self.assertEqual(git_inventory._git_env()["GIT_OPTIONAL_LOCKS"], "0")
+        self.assertEqual(git_inventory.READ_ONLY_GIT_ENV["GIT_OPTIONAL_LOCKS"], "0")
 
 
 if __name__ == "__main__":

@@ -16,8 +16,15 @@ bug.
 
 **Never crashes the scan.** Unreadable directories are skipped during
 discovery; any probe failure (not a repo, wedged git subprocess hitting the
-per-call timeout, missing git binary, unexpected exception) collapses to a
-``blocked`` record carrying an error string.
+per-call timeout or the per-repo overall deadline, missing git binary,
+unexpected exception) collapses to a ``blocked`` record carrying an error
+string.
+
+**Fast.** :func:`scan` / :func:`scan_estate` probe repositories concurrently
+with a thread pool (git probes are subprocess/IO-bound, so threads suffice);
+output ordering stays deterministic (sorted by path) regardless of completion
+order. Each worker's probe builds its own environment dict and holds no shared
+mutable state, so probes are thread-safe by construction.
 
 **Worktree-aware.** Mid-operation markers (``rebase-merge``, ``MERGE_HEAD``,
 ``CHERRY_PICK_HEAD``, ...) are looked up under ``git rev-parse
@@ -65,9 +72,11 @@ are not reported as estate repos of their own.
 Public API
 ----------
 ``GitRepoRecord``                 frozen dataclass, ``to_dict()`` is JSON-safe.
+``ScanResult``                    records + elapsed_seconds/repo_count/roots/depth.
 ``probe_repo(path, ...)``         one read-only probe -> one record.
 ``discover_repos(roots, ...)``    root/depth-injectable repo discovery.
-``scan(roots, ...)``              discover + probe every repo.
+``scan(roots, ...)``              discover + probe every repo -> list of records.
+``scan_estate(roots, ...)``       same scan, returns a :class:`ScanResult`.
 ``primary_class_counts(records)`` summary counts by primary class.
 """
 
@@ -75,6 +84,8 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -83,17 +94,21 @@ __all__ = [
     "ALL_CLASSES",
     "BRANCH_DETACHED",
     "DEFAULT_DEPTH",
+    "DEFAULT_REPO_DEADLINE_S",
     "DEFAULT_TIMEOUT_S",
+    "DEFAULT_WORKERS",
     "GitRepoRecord",
     "PRIMARY_CLASSES",
     "PRUNE_DIR_NAMES",
     "READ_ONLY_GIT_ENV",
     "STASH_HEAVY_THRESHOLD",
+    "ScanResult",
     "default_scan_roots",
     "discover_repos",
     "primary_class_counts",
     "probe_repo",
     "scan",
+    "scan_estate",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -106,6 +121,21 @@ DEFAULT_DEPTH = 3
 #: Per-git-subprocess timeout so a wedged repo (dead NFS mount, fsmonitor hang)
 #: cannot stall the whole scan. A timeout classifies the repo as ``blocked``.
 DEFAULT_TIMEOUT_S = 5.0
+
+#: Per-repo *overall* wall-clock deadline across every git call in one probe.
+#: The per-call timeout alone still allows every call in a probe to burn its
+#: full 5s against a single wedged repo (network filesystem, stuck lock); this
+#: caps the whole probe so such a repo becomes ``blocked`` with a reason
+#: instead of dragging the scan.
+DEFAULT_REPO_DEADLINE_S = 15.0
+
+#: Default probe concurrency. Probes are subprocess-bound: each worker spends
+#: nearly all its time blocked in ``subprocess.run`` waiting on a git child
+#: (GIL released), so threads oversubscribe CPUs 4x to keep cores fed. The
+#: floor of 8 keeps small-CPU machines parallel enough to matter; the cap of
+#: 32 bounds concurrent git child processes (one per worker at a time) and
+#: sits past the point of diminishing returns for fork/exec-dominated work.
+DEFAULT_WORKERS = min(32, max(8, (os.cpu_count() or 4) * 4))
 
 #: ``stash_count`` at which the *primary* class becomes ``stash-heavy``
 #: (repo_inventory.sh's threshold). The class set flags ``stash`` from 1.
@@ -218,6 +248,33 @@ class GitRepoRecord:
         }
 
 
+@dataclass(frozen=True)
+class ScanResult:
+    """One full estate scan: the records plus scan-level metadata.
+
+    ``records`` is the exact list :func:`scan` returns (sorted by path);
+    ``elapsed_seconds`` covers discovery + all probes, wall clock.
+    """
+
+    records: list[GitRepoRecord]
+    elapsed_seconds: float
+    repo_count: int
+    roots: list[str]
+    depth: int
+    workers: int
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe projection (records via ``GitRepoRecord.to_dict``)."""
+        return {
+            "elapsed_seconds": self.elapsed_seconds,
+            "repo_count": self.repo_count,
+            "roots": list(self.roots),
+            "depth": self.depth,
+            "workers": self.workers,
+            "records": [record.to_dict() for record in self.records],
+        }
+
+
 # --------------------------------------------------------------------------- #
 # Git subprocess plumbing
 # --------------------------------------------------------------------------- #
@@ -259,6 +316,41 @@ def _first_stderr_line(proc: subprocess.CompletedProcess[str]) -> str:
     return ""
 
 
+class _RepoDeadlineExceeded(Exception):
+    """A probe's overall per-repo deadline is exhausted (wedged repo)."""
+
+
+class _ProbeClock:
+    """Wall-clock budget for one ``probe_repo`` call.
+
+    One instance is created per probe and never shared across workers, so it
+    needs no locking. Each git call's timeout is the per-call ``timeout_s``
+    clipped to whatever remains of the per-repo deadline; once the deadline is
+    spent, :meth:`call_timeout` raises :class:`_RepoDeadlineExceeded` and the
+    probe collapses to a ``blocked`` record.
+    """
+
+    __slots__ = ("timeout_s", "_deadline")
+
+    def __init__(self, timeout_s: float, deadline_s: float | None) -> None:
+        self.timeout_s = timeout_s
+        self._deadline = (
+            None if deadline_s is None else time.monotonic() + deadline_s
+        )
+
+    def expired(self) -> bool:
+        return self._deadline is not None and time.monotonic() >= self._deadline
+
+    def call_timeout(self) -> float:
+        """Timeout for the next git call; raises when the deadline is spent."""
+        if self._deadline is None:
+            return self.timeout_s
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise _RepoDeadlineExceeded()
+        return min(self.timeout_s, remaining)
+
+
 # --------------------------------------------------------------------------- #
 # Probe
 # --------------------------------------------------------------------------- #
@@ -273,25 +365,29 @@ def _blocked(path: str, error: str) -> GitRepoRecord:
     )
 
 
-def _probe_branch(repo: str, timeout_s: float) -> str:
-    head = _run_git(repo, ["rev-parse", "--abbrev-ref", "HEAD"], timeout_s)
+def _probe_branch(repo: str, clock: _ProbeClock) -> str:
+    head = _run_git(repo, ["rev-parse", "--abbrev-ref", "HEAD"], clock.call_timeout())
     branch = head.stdout.strip()
     if head.returncode == 0 and branch and branch != "HEAD":
         return branch
     # ``--abbrev-ref HEAD`` reports the literal "HEAD" both when detached and
     # when HEAD is an unborn branch (fresh init / fresh bare). Only a truly
     # detached HEAD is not a symbolic ref, so symbolic-ref disambiguates.
-    sym = _run_git(repo, ["symbolic-ref", "--short", "--quiet", "HEAD"], timeout_s)
+    sym = _run_git(
+        repo, ["symbolic-ref", "--short", "--quiet", "HEAD"], clock.call_timeout()
+    )
     unborn = sym.stdout.strip()
     if sym.returncode == 0 and unborn:
         return unborn
     return BRANCH_DETACHED
 
 
-def _probe_status_counts(repo: str, timeout_s: float) -> tuple[int, int, int]:
+def _probe_status_counts(repo: str, clock: _ProbeClock) -> tuple[int, int, int]:
     """(staged, unstaged, untracked) entry counts from porcelain v1 status."""
     status = _run_git(
-        repo, ["status", "--porcelain=v1", "--untracked-files=normal"], timeout_s
+        repo,
+        ["status", "--porcelain=v1", "--untracked-files=normal"],
+        clock.call_timeout(),
     )
     staged = unstaged = untracked = 0
     if status.returncode != 0:
@@ -310,11 +406,10 @@ def _probe_status_counts(repo: str, timeout_s: float) -> tuple[int, int, int]:
     return staged, unstaged, untracked
 
 
-def _probe_mid_op(repo: str, timeout_s: float) -> str | None:
-    """Mid-operation kind, resolved via the real (worktree-aware) git dir."""
-    proc = _run_git(repo, ["rev-parse", "--absolute-git-dir"], timeout_s)
-    git_dir = proc.stdout.strip()
-    if proc.returncode != 0 or not git_dir:
+def _probe_mid_op(git_dir: str) -> str | None:
+    """Mid-operation kind from marker files under the (worktree-aware) git
+    dir, which the identity probe already resolved -- no extra git call."""
+    if not git_dir:
         return None
     base = Path(git_dir)
     for kind, marker, is_dir in _MID_OP_MARKERS:
@@ -328,22 +423,80 @@ def _probe_mid_op(repo: str, timeout_s: float) -> str | None:
     return None
 
 
-def _probe_stash_count(repo: str, timeout_s: float) -> int:
-    proc = _run_git(repo, ["stash", "list"], timeout_s)
+def _probe_stash_count(repo: str, clock: _ProbeClock) -> int:
+    proc = _run_git(repo, ["stash", "list"], clock.call_timeout())
     if proc.returncode != 0:
         return 0
     return sum(1 for line in proc.stdout.splitlines() if line.strip())
 
 
-def _probe_upstream(repo: str, timeout_s: float) -> tuple[str | None, int, int]:
+def _parse_status_v2(stdout: str) -> tuple[str, str | None, int, int, int, int, int]:
+    """Parse ``git status --porcelain=v2 --branch`` output.
+
+    Returns ``(branch, upstream, ahead, behind, staged, unstaged, untracked)``
+    with exactly the same field semantics as the individual probes it
+    replaces (one subprocess instead of up to five):
+
+    * ``branch``: ``# branch.head``; ``(detached)`` maps to
+      :data:`BRANCH_DETACHED`, an unborn branch reports its name (matching the
+      old ``symbolic-ref`` fallback).
+    * ``upstream``: ``# branch.upstream``, but only honoured when
+      ``# branch.ab`` is also present -- a configured-but-gone upstream omits
+      ``branch.ab``, matching the old ``rev-parse @{upstream}`` failure that
+      classified such repos ``no-remote``.
+    * counts: ``1``/``2``/``u`` entries split staged/unstaged on the XY
+      columns (``.`` = unmodified; unmerged entries count on both sides, as
+      the porcelain-v1 parser did), ``?`` entries count as untracked.
+    """
+    branch = BRANCH_DETACHED
+    upstream: str | None = None
+    have_ab = False
+    ahead = behind = 0
+    staged = unstaged = untracked = 0
+    for line in stdout.splitlines():
+        if line.startswith("# branch.head "):
+            head = line[len("# branch.head ") :].strip()
+            if head and head != "(detached)":
+                branch = head
+        elif line.startswith("# branch.upstream "):
+            upstream = line[len("# branch.upstream ") :].strip() or None
+        elif line.startswith("# branch.ab "):
+            parts = line.split()
+            if len(parts) == 4:
+                try:
+                    ahead, behind = int(parts[2]), abs(int(parts[3]))
+                    have_ab = True
+                except ValueError:
+                    ahead = behind = 0
+        elif line.startswith("? "):
+            untracked += 1
+        elif line.startswith(("1 ", "2 ", "u ")):
+            fields = line.split(" ", 2)
+            xy = fields[1] if len(fields) > 2 else ""
+            if len(xy) == 2:
+                if xy[0] != ".":
+                    staged += 1
+                if xy[1] != ".":
+                    unstaged += 1
+    if not have_ab:
+        upstream = None
+        ahead = behind = 0
+    return branch, upstream, ahead, behind, staged, unstaged, untracked
+
+
+def _probe_upstream(repo: str, clock: _ProbeClock) -> tuple[str | None, int, int]:
     """(upstream, ahead, behind); upstream is None when HEAD has no upstream."""
-    proc = _run_git(repo, ["rev-parse", "--abbrev-ref", "@{upstream}"], timeout_s)
+    proc = _run_git(
+        repo, ["rev-parse", "--abbrev-ref", "@{upstream}"], clock.call_timeout()
+    )
     upstream = proc.stdout.strip()
     if proc.returncode != 0 or not upstream:
         return None, 0, 0
     ahead = behind = 0
     counts = _run_git(
-        repo, ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"], timeout_s
+        repo,
+        ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+        clock.call_timeout(),
     )
     parts = counts.stdout.split()
     if counts.returncode == 0 and len(parts) == 2:
@@ -403,15 +556,37 @@ def _classify(
 
 
 def probe_repo(
-    path: str | os.PathLike[str], *, timeout_s: float = DEFAULT_TIMEOUT_S
+    path: str | os.PathLike[str],
+    *,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+    deadline_s: float | None = DEFAULT_REPO_DEADLINE_S,
 ) -> GitRepoRecord:
     """Read-only probe of one repository. Never raises, never fetches, never
-    writes; any failure yields a ``blocked`` record with an error string."""
+    writes; any failure yields a ``blocked`` record with an error string.
+
+    ``timeout_s`` bounds each individual git call; ``deadline_s`` bounds the
+    whole probe's wall clock (``None`` disables it), so a wedged repo -- dead
+    network filesystem, stuck lock -- becomes ``blocked`` with a reason instead
+    of consuming a full per-call timeout for every one of its git calls.
+    Thread-safe: each call builds its own clock and env dict and shares no
+    mutable state, so probes may run concurrently across pool workers.
+    """
     repo = str(path)
+    if deadline_s is not None and deadline_s <= 0:
+        raise ValueError(f"deadline_s must be positive or None: {deadline_s}")
+    clock = _ProbeClock(timeout_s, deadline_s)
     try:
-        return _probe(repo, timeout_s)
+        return _probe(repo, clock)
+    except _RepoDeadlineExceeded:
+        return _blocked(
+            repo, f"repo probe exceeded {deadline_s}s overall deadline (wedged repo?)"
+        )
     except subprocess.TimeoutExpired as exc:
         cmd = exc.cmd if isinstance(exc.cmd, str) else " ".join(map(str, exc.cmd or []))
+        if clock.expired():
+            return _blocked(
+                repo, f"repo probe exceeded {deadline_s}s overall deadline: {cmd}"
+            )
         return _blocked(repo, f"git timed out after {timeout_s}s: {cmd}")
     except OSError as exc:
         return _blocked(repo, f"probe failed: {exc}")
@@ -419,28 +594,65 @@ def probe_repo(
         return _blocked(repo, f"unexpected probe failure: {exc!r}")
 
 
-def _probe(repo: str, timeout_s: float) -> GitRepoRecord:
-    inside = _run_git(repo, ["rev-parse", "--is-inside-work-tree"], timeout_s)
-    if inside.returncode != 0:
-        detail = _first_stderr_line(inside)
+def _probe(repo: str, clock: _ProbeClock) -> GitRepoRecord:
+    # One combined identity call (rev-parse prints one line per query, in
+    # argument order) replaces three separate rev-parse spawns.
+    ident = _run_git(
+        repo,
+        [
+            "rev-parse",
+            "--is-inside-work-tree",
+            "--is-bare-repository",
+            "--absolute-git-dir",
+        ],
+        clock.call_timeout(),
+    )
+    lines = ident.stdout.splitlines()
+    if ident.returncode != 0 or len(lines) < 3:
+        detail = _first_stderr_line(ident)
         error = "not a git work tree" + (f": {detail}" if detail else "")
         return _blocked(repo, error)
+    inside_work_tree = lines[0].strip() == "true"
+    is_bare = lines[1].strip() == "true"
+    git_dir = lines[2].strip()
+    if not inside_work_tree and not is_bare:
+        return _blocked(repo, "not a git work tree")
+    bare = not inside_work_tree
 
-    bare = False
-    if inside.stdout.strip() != "true":
-        bare_proc = _run_git(repo, ["rev-parse", "--is-bare-repository"], timeout_s)
-        if bare_proc.returncode == 0 and bare_proc.stdout.strip() == "true":
-            bare = True
-        else:
-            return _blocked(repo, "not a git work tree")
-
-    branch = _probe_branch(repo, timeout_s)
+    # One porcelain-v2 status call yields branch + upstream + ahead/behind +
+    # staged/unstaged/untracked together (was up to five calls). Bare repos
+    # (no work tree, so no status) and any unexpected status failure fall back
+    # to the original per-field probes, preserving their exact semantics.
+    branch = BRANCH_DETACHED
+    upstream: str | None = None
+    ahead = behind = 0
     staged = unstaged = untracked = 0
+    consolidated = False
     if not bare:
-        staged, unstaged, untracked = _probe_status_counts(repo, timeout_s)
-    mid_op = _probe_mid_op(repo, timeout_s)
-    stash_count = _probe_stash_count(repo, timeout_s)
-    upstream, ahead, behind = _probe_upstream(repo, timeout_s)
+        status = _run_git(
+            repo,
+            ["status", "--porcelain=v2", "--branch", "--untracked-files=normal"],
+            clock.call_timeout(),
+        )
+        if status.returncode == 0:
+            (
+                branch,
+                upstream,
+                ahead,
+                behind,
+                staged,
+                unstaged,
+                untracked,
+            ) = _parse_status_v2(status.stdout)
+            consolidated = True
+    if not consolidated:
+        branch = _probe_branch(repo, clock)
+        if not bare:
+            staged, unstaged, untracked = _probe_status_counts(repo, clock)
+        upstream, ahead, behind = _probe_upstream(repo, clock)
+
+    mid_op = _probe_mid_op(git_dir)
+    stash_count = _probe_stash_count(repo, clock)
 
     dirty = (staged + unstaged + untracked) > 0
     classes, primary = _classify(
@@ -563,17 +775,83 @@ def _walk(directory: Path, *, remaining: int, is_root: bool, found: set[str]) ->
 # --------------------------------------------------------------------------- #
 
 
+def scan_estate(
+    roots: Iterable[str | os.PathLike[str]] | None = None,
+    *,
+    depth: int = DEFAULT_DEPTH,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+    deadline_s: float | None = DEFAULT_REPO_DEADLINE_S,
+    workers: int | None = None,
+) -> ScanResult:
+    """Discover and probe every repo under ``roots``; read-only throughout.
+
+    Repos are probed concurrently on a thread pool of ``workers`` threads
+    (default :data:`DEFAULT_WORKERS`; discovery stays sequential -- it is a
+    scandir walk measured at ~0.1s for a 100-repo estate, so parallelism buys
+    nothing there). ``records`` is deterministically sorted by path regardless
+    of probe completion order, because discovery output is sorted and
+    ``ThreadPoolExecutor.map`` preserves input order. ``elapsed_seconds`` is
+    the wall clock for discovery plus all probes.
+    """
+    if workers is None:
+        workers = DEFAULT_WORKERS
+    if workers < 1:
+        raise ValueError(f"workers must be a positive integer: {workers}")
+    resolved_roots = [
+        os.path.expanduser(str(root))
+        for root in (default_scan_roots() if roots is None else roots)
+    ]
+
+    start = time.monotonic()
+    repos = discover_repos(resolved_roots, depth=depth)
+
+    def _probe_one(repo: str) -> GitRepoRecord:
+        return probe_repo(repo, timeout_s=timeout_s, deadline_s=deadline_s)
+
+    records: list[GitRepoRecord]
+    if not repos:
+        records = []
+    elif workers == 1 or len(repos) == 1:
+        records = [_probe_one(repo) for repo in repos]
+    else:
+        pool_size = min(workers, len(repos))
+        with ThreadPoolExecutor(
+            max_workers=pool_size, thread_name_prefix="git-inventory"
+        ) as pool:
+            records = list(pool.map(_probe_one, repos))
+
+    elapsed = time.monotonic() - start
+    return ScanResult(
+        records=records,
+        elapsed_seconds=elapsed,
+        repo_count=len(records),
+        roots=resolved_roots,
+        depth=depth,
+        workers=workers,
+    )
+
+
 def scan(
     roots: Iterable[str | os.PathLike[str]] | None = None,
     *,
     depth: int = DEFAULT_DEPTH,
     timeout_s: float = DEFAULT_TIMEOUT_S,
+    deadline_s: float | None = DEFAULT_REPO_DEADLINE_S,
+    workers: int | None = None,
 ) -> list[GitRepoRecord]:
-    """Discover every repo under ``roots`` and probe each one, read-only."""
-    return [
-        probe_repo(repo, timeout_s=timeout_s)
-        for repo in discover_repos(roots, depth=depth)
-    ]
+    """Discover every repo under ``roots`` and probe each one, read-only.
+
+    Thin wrapper over :func:`scan_estate` keeping the original
+    ``list[GitRepoRecord]`` return shape; use :func:`scan_estate` when the
+    caller also wants ``elapsed_seconds`` and the other scan metadata.
+    """
+    return scan_estate(
+        roots,
+        depth=depth,
+        timeout_s=timeout_s,
+        deadline_s=deadline_s,
+        workers=workers,
+    ).records
 
 
 def primary_class_counts(records: Iterable[GitRepoRecord]) -> dict[str, int]:
