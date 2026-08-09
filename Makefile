@@ -39,7 +39,7 @@ DEV_SHIM_BINS := npm pnpm yarn vite next astro
 
 E2E_SMOKE_ARGS := $(if $(strip $(FORMAT)),--format $(FORMAT),) $(if $(filter 1 true yes,$(STRICT)),--strict,) $(ARGS)
 
-.PHONY: help bootstrap-env install-hooks self-test self-test-worktree self-test-refresh render doctor acceptance runtime-render runtime-sync runtime-status runtime-skills runtime-skill-audit runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context dev-sanity e2e-smoke python-cov-xml wrappers-install dev-shims-install build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles box-register box-unregister
+.PHONY: help bootstrap-env install-hooks self-test self-test-worktree self-test-refresh render doctor acceptance runtime-render runtime-sync runtime-status runtime-skills runtime-skill-audit runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context dev-sanity e2e-smoke git-estate-e2e python-cov-xml wrappers-install dev-shims-install build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles box-register box-unregister
 
 help:
 	@printf "  make bootstrap-env  Seed .skillbox-state/operator/.env from .env.example if missing\n"
@@ -68,6 +68,7 @@ help:
 	@printf "  make pulse-status   Show pulse daemon status, supervised services, and recent heals\n"
 	@printf "  make dev-sanity     Validate runtime graph, paths, and skill integrity (optional CLIENT=name PROFILE=name)\n"
 	@printf "  make e2e-smoke      Run opt-in read-only e2e smoke (FORMAT=json STRICT=1 supported)\n"
+	@printf "  make git-estate-e2e Run the read-only sbp git front-door e2e against a temp fixture estate\n"
 	@printf "  make wrappers-install Install sbp/sbo symlinks into WRAPPER_BIN_DIR (default ~/.local/bin)\n"
 	@printf "  make dev-shims-install Install dev-command guard shims into DEV_SHIM_BIN_DIR\n"
 	@printf "  make build          Build the workspace image\n"
@@ -169,6 +170,9 @@ dev-sanity:
 
 e2e-smoke:
 	@./scripts/e2e-smoke.sh $(E2E_SMOKE_ARGS)
+
+git-estate-e2e:
+	@./scripts/git-estate-e2e.sh
 
 python-cov-xml:
 	@python3 -m coverage erase

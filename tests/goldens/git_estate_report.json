@@ -1,0 +1,225 @@
+{
+  "schema": "sbp-git/v1",
+  "generated_at": "1970-01-01T00:00:00+00:00",
+  "roots": [
+    "/GOLDEN_TMP/estate"
+  ],
+  "cwd_repo": {
+    "path": "/GOLDEN_TMP/estate/b-dirty",
+    "classes": [
+      "dirty"
+    ],
+    "primary_class": "dirty",
+    "branch": "main",
+    "upstream": "origin/main",
+    "ahead": 0,
+    "behind": 0,
+    "stash_count": 0,
+    "staged": 1,
+    "unstaged": 1,
+    "untracked": 1,
+    "mid_op": null,
+    "bare": false,
+    "error": null,
+    "risk_band": "dirty",
+    "registration": "registered",
+    "fix": [
+      "git -C /GOLDEN_TMP/estate/b-dirty add -p && git -C /GOLDEN_TMP/estate/b-dirty commit"
+    ]
+  },
+  "filters": [],
+  "notes": [],
+  "ignored_count": 1,
+  "registry_applied": true,
+  "repos": [
+    {
+      "path": "/GOLDEN_TMP/estate/e-midop",
+      "classes": [
+        "dirty",
+        "mid-op",
+        "no-remote"
+      ],
+      "primary_class": "mid-op",
+      "branch": "main",
+      "upstream": null,
+      "ahead": 0,
+      "behind": 0,
+      "stash_count": 0,
+      "staged": 1,
+      "unstaged": 1,
+      "untracked": 0,
+      "mid_op": "merge",
+      "bare": false,
+      "error": null,
+      "risk_band": "mid-op",
+      "registration": "registered",
+      "fix": [
+        "git -C /GOLDEN_TMP/estate/e-midop status  # finish or abort the merge",
+        "git -C /GOLDEN_TMP/estate/e-midop add -p && git -C /GOLDEN_TMP/estate/e-midop commit",
+        "add a remote or register intent"
+      ]
+    },
+    {
+      "path": "/GOLDEN_TMP/estate/b-dirty",
+      "classes": [
+        "dirty"
+      ],
+      "primary_class": "dirty",
+      "branch": "main",
+      "upstream": "origin/main",
+      "ahead": 0,
+      "behind": 0,
+      "stash_count": 0,
+      "staged": 1,
+      "unstaged": 1,
+      "untracked": 1,
+      "mid_op": null,
+      "bare": false,
+      "error": null,
+      "risk_band": "dirty",
+      "registration": "registered",
+      "fix": [
+        "git -C /GOLDEN_TMP/estate/b-dirty add -p && git -C /GOLDEN_TMP/estate/b-dirty commit"
+      ]
+    },
+    {
+      "path": "/GOLDEN_TMP/estate/c-ahead",
+      "classes": [
+        "ahead"
+      ],
+      "primary_class": "ahead-clean",
+      "branch": "main",
+      "upstream": "origin/main",
+      "ahead": 1,
+      "behind": 0,
+      "stash_count": 0,
+      "staged": 0,
+      "unstaged": 0,
+      "untracked": 0,
+      "mid_op": null,
+      "bare": false,
+      "error": null,
+      "risk_band": "ahead",
+      "registration": "registered",
+      "fix": [
+        "git -C /GOLDEN_TMP/estate/c-ahead push"
+      ]
+    },
+    {
+      "path": "/GOLDEN_TMP/estate/g-unregistered",
+      "classes": [
+        "no-remote"
+      ],
+      "primary_class": "no-remote",
+      "branch": "main",
+      "upstream": null,
+      "ahead": 0,
+      "behind": 0,
+      "stash_count": 0,
+      "staged": 0,
+      "unstaged": 0,
+      "untracked": 0,
+      "mid_op": null,
+      "bare": false,
+      "error": null,
+      "risk_band": "no-remote",
+      "registration": "unregistered",
+      "fix": [
+        "add a remote or register intent",
+        "register in /GOLDEN_TMP/config/registry/repos.yaml or add an ignore rule there"
+      ]
+    },
+    {
+      "path": "/GOLDEN_TMP/estate/f-noremote",
+      "classes": [
+        "no-remote"
+      ],
+      "primary_class": "no-remote",
+      "branch": "main",
+      "upstream": null,
+      "ahead": 0,
+      "behind": 0,
+      "stash_count": 0,
+      "staged": 0,
+      "unstaged": 0,
+      "untracked": 0,
+      "mid_op": null,
+      "bare": false,
+      "error": null,
+      "risk_band": "no-remote",
+      "registration": "registered",
+      "fix": [
+        "add a remote or register intent"
+      ]
+    },
+    {
+      "path": "/GOLDEN_TMP/estate/d-stash",
+      "classes": [
+        "stash"
+      ],
+      "primary_class": "clean-current",
+      "branch": "main",
+      "upstream": "origin/main",
+      "ahead": 0,
+      "behind": 0,
+      "stash_count": 1,
+      "staged": 0,
+      "unstaged": 0,
+      "untracked": 0,
+      "mid_op": null,
+      "bare": false,
+      "error": null,
+      "risk_band": "stash-only",
+      "registration": "registered",
+      "fix": [
+        "git -C /GOLDEN_TMP/estate/d-stash stash list  # git-stash-janitor pass"
+      ]
+    },
+    {
+      "path": "/GOLDEN_TMP/estate/a-clean",
+      "classes": [
+        "clean-current"
+      ],
+      "primary_class": "clean-current",
+      "branch": "main",
+      "upstream": "origin/main",
+      "ahead": 0,
+      "behind": 0,
+      "stash_count": 0,
+      "staged": 0,
+      "unstaged": 0,
+      "untracked": 0,
+      "mid_op": null,
+      "bare": false,
+      "error": null,
+      "risk_band": "clean",
+      "registration": "registered",
+      "fix": []
+    }
+  ],
+  "summary": {
+    "ahead-clean": 1,
+    "clean-current": 2,
+    "dirty": 1,
+    "mid-op": 1,
+    "no-remote": 2
+  },
+  "registration_summary": {
+    "registered": 6,
+    "unregistered": 1,
+    "unknown": 0,
+    "stale_registered": 1
+  },
+  "stale_registered": [
+    {
+      "path": "/GOLDEN_TMP/estate/gone-checkout",
+      "id": "gone",
+      "registration": "stale-registered",
+      "fix": [
+        "remove or repoint the registry entry in /GOLDEN_TMP/config/registry/repos.yaml"
+      ]
+    }
+  ],
+  "repo_count": 7,
+  "elapsed_seconds": 0.0
+}
