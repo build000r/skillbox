@@ -368,6 +368,22 @@ the server gate is authoritative.
 > Note: `posture-proof` and `box status` probes shell out through `box.py`'s
 > own SSH helpers, **not** through `operator_box_exec`, so this gate adds no
 > friction to fleet posture/health automation.
+
+## Estate Git Boundary
+
+Three surfaces split estate git work; keep them in their lanes:
+
+| Surface | Role |
+|---|---|
+| `sbp git` (aliases `gs`, `git status`) | The glance: read-only risk-sorted status across the estate, `--json` for machines (sbp-git/v1). Never fetches, never mutates, never proxies git subcommands. |
+| `/reconcile` (skills-private reconcile skill) | The act: the no-loss sync flow across live repos — stashes, unpushed commits, and uncommitted work survive. |
+| `fleet_convergence.py` (reconcile skill script) | The convergence gate: cross-host convergence verdict (exit 0 converged, 1 blocked/diverged, 3 partial/unreachable). |
+
+`sbp git` reports drift and prints the exact fix command per repo; it never
+runs one. Do not hand-push or hand-pull to "fix" drift the glance surfaces —
+`/reconcile` owns the no-loss flow, and `fleet_convergence.py` proves the
+estate converged afterwards.
+
 ## Local CI gate
 
 `scripts/self-test.sh` is the canonical authority for trusted-main checks. It

@@ -3552,6 +3552,7 @@ Useful command families:
   rch-report --format json      RCH worker/hook readiness without mutation.
   rch-stage --dry-run -- ...    Plan a no-sudo RCH staging lane.
   sbh-report --format json      SBH observe-first storage guard posture.
+  git-status --format json      Read-only estate git status (sbp git); never fetches.
   skills --issues-only          Skill visibility issues for the current cwd.
   cass-evidence --format json   Skill invocations per repo from Cass (sbp evidence).
   mcp-audit --format json       Claude/Codex MCP parity audit.

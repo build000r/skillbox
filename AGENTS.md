@@ -28,6 +28,7 @@ Main entry points:
 - Agent graph/search: `python3 .env-manager/manage.py graph --format json`, `python3 .env-manager/manage.py explain brain.next --format json`, `python3 .env-manager/manage.py search "<query>" --format json`
 - Agent snapshots: `python3 .env-manager/manage.py snap replay tests/goldens/agent_ops_snapshot.json --format json`; `snap create --write` writes redacted local state under `.skillbox-state/`
 - Agent brain latency proof: `python3 tests/perf/brain_proof.py --cycles 5` (standalone, outside default unittest discovery)
+- Estate git status: `sbp git` (aliases `sbp gs`, `sbp git status`) — read-only risk-sorted git status across the repo estate; never fetches, never proxies git subcommands; `sbp git --json` for machines (sbp-git/v1 envelope)
 - Run tests: `python3 -m unittest discover -s tests`
 - Coverage: `make python-cov-xml`
 - Build image: `make build`
