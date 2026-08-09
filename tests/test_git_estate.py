@@ -412,6 +412,9 @@ class GitEstateFixtureCase(unittest.TestCase):
                 "GIT_TERMINAL_PROMPT": "0",
                 "GIT_OPTIONAL_LOCKS": "0",
                 "SKILLBOX_CONFIG_ROOT": str(self.config_root),
+                # Wrapper runs write-through the scan cache; keep it out of the
+                # real state root so tests never seed the live home view.
+                "SKILLBOX_STATE_ROOT": str(self.tmp / "state"),
             },
         )
         patcher.start()

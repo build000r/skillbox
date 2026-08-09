@@ -643,6 +643,7 @@ Read-only risk-sorted git status across the repo estate with registry ignore rul
 
 | Name | Type | Required |
 |---|---|---|
+| `cached` | `boolean?` | no |
 | `cwd` | `string?` | no |
 | `depth` | `integer?` | no |
 | `format` | `enum[json\|text]?` | no |

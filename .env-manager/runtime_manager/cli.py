@@ -64,6 +64,12 @@ from .swimmers_launch import launch_swimmers_batch, swimmers_launch_text_lines
 from .structure_doctor import run_structure_doctor, structure_doctor_text_lines
 from .git_estate import build_report as git_estate_report, report_text_lines as git_estate_text_lines
 from .git_inventory import DEFAULT_DEPTH as GIT_ESTATE_DEFAULT_DEPTH
+from .git_scan_cache import (
+    CACHE_TTL_SECONDS as GIT_SCAN_CACHE_TTL_SECONDS,
+    format_age as git_scan_cache_format_age,
+    load_scan_cache as load_git_scan_cache,
+    write_scan_cache as write_git_scan_cache,
+)
 from .skill_pull import SkillPullError, pull_host_skill, resolve_host_skills
 from .command_registry import registry_payload
 from .registry_docs import registry_docs_payload
@@ -573,6 +579,17 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=GIT_ESTATE_DEFAULT_DEPTH,
         help="Directory depth under each root to search for .git entries.",
+    )
+    git_status_parser.add_argument(
+        "--cached",
+        action="store_true",
+        help=(
+            "Serve the last scan from the cache when fresh (<= 10 minutes) "
+            "instead of scanning; never spawns git. Stale/absent cache exits "
+            "0 with a 'no recent scan' note. Scan-scoping flags (--root, "
+            "--depth, --only, --cwd) are ignored: the last envelope is "
+            "replayed verbatim."
+        ),
     )
 
     status_parser = subparsers.add_parser(
@@ -3902,7 +3919,15 @@ def _handle_git_status(args: argparse.Namespace, root_dir: Path) -> int:
     Never fetches or mutates (git_inventory's contract); the presentation
     layer only sorts, filters, and hands back fix command strings. Unknown
     --only classes are a usage error (exit 2) before any scan runs.
+
+    Every live scan write-throughs its envelope to the git-scan cache (write
+    failure degrades to a stderr note; stdout is byte-identical either way).
+    `--cached` replays that envelope when fresh (<= TTL) without spawning a
+    single git subprocess; a stale/absent cache exits 0 with a 'no recent
+    scan' pointer instead of silently falling back to a slow live scan.
     """
+    if getattr(args, "cached", False):
+        return _serve_cached_git_status(args, root_dir)
     cwd = str(getattr(args, "cwd", None) or os.getcwd())
     try:
         report = git_estate_report(
@@ -3914,11 +3939,56 @@ def _handle_git_status(args: argparse.Namespace, root_dir: Path) -> int:
     except ValueError as exc:
         print(f"git-status: {exc}", file=sys.stderr)
         return _EXIT_USAGE
+    try:
+        write_git_scan_cache(report, root_dir)
+    except OSError as exc:
+        print(f"git-status: cache write failed (scan unaffected): {exc}", file=sys.stderr)
     if args.format == "json":
         emit_json(report)
     else:
         for line in git_estate_text_lines(report, color=sys.stdout.isatty()):
             print(line)
+    return EXIT_OK
+
+
+def _serve_cached_git_status(args: argparse.Namespace, root_dir: Path) -> int:
+    """`sbp git --cached` — replay the last scan envelope, never scan.
+
+    Fresh cache: --json prints the stored sbp-git/v1 envelope verbatim plus
+    an additive ``cache_age_seconds`` field; tty renders it through the
+    normal renderer under a 'cached Ns ago' banner. Stale or absent cache:
+    exit 0 with ``git: no recent scan — run sbp git`` (tty) /
+    ``{"cached": false, ...}`` (json) so callers can cheaply probe without
+    triggering a scan.
+    """
+    loaded = load_git_scan_cache(root_dir)
+    if loaded is not None:
+        envelope, age = loaded
+        if age <= GIT_SCAN_CACHE_TTL_SECONDS:
+            if args.format == "json":
+                payload = dict(envelope)
+                payload["cache_age_seconds"] = round(age, 3)
+                emit_json(payload)
+            else:
+                print(
+                    f"cached {git_scan_cache_format_age(age)} ago — "
+                    "run sbp git for a live rescan"
+                )
+                for line in git_estate_text_lines(
+                    envelope, color=sys.stdout.isatty()
+                ):
+                    print(line)
+            return EXIT_OK
+    if args.format == "json":
+        emit_json(
+            {
+                "cached": False,
+                "note": "no recent scan — run sbp git",
+                "ttl_seconds": GIT_SCAN_CACHE_TTL_SECONDS,
+            }
+        )
+    else:
+        print("git: no recent scan — run sbp git")
     return EXIT_OK
 
 

@@ -453,9 +453,11 @@ Usage:
                               Exits nonzero on FAIL only.
   __WRAPPER__ registry doctor [args...] Check registry/repos.yaml against local Git repos
   __WRAPPER__ repo [args...]           Read repository dossiers through private Repo Atlas
-  __WRAPPER__ git [--only CLASS[,CLASS]] [--root PATH] [--depth N] [--json]
+  __WRAPPER__ git [--only CLASS[,CLASS]] [--root PATH] [--depth N] [--cached] [--json]
                               Read-only risk-sorted git status across ~/repos
                               (aliases: gs, git status; never fetches or pushes)
+                              --cached replays the last scan when <=10m old
+                              (never scans; stale cache says so and exits 0)
                               CLASS: dirty stash ahead behind diverged-clean
                               mid-op no-remote clean-current blocked
                               unregistered stale-registered
@@ -1011,7 +1013,7 @@ case "${1:-}" in
       shift
     elif [[ -n "${1:-}" && "${1}" != -* ]]; then
       echo "${wrapper_name} git: read-only status viewer; refusing to proxy 'git ${1}'" >&2
-      echo "Usage: ${wrapper_name} git [status] [--only CLASS[,CLASS]] [--root PATH] [--depth N] [--json]" >&2
+      echo "Usage: ${wrapper_name} git [status] [--only CLASS[,CLASS]] [--root PATH] [--depth N] [--cached] [--json]" >&2
       echo "Run real git directly: git ${1} ..." >&2
       exit 2
     fi
@@ -1483,6 +1485,11 @@ case "${action}" in
   home)
     echo "${wrapper_name}: ${client:-auto} ${profile}"
     echo "cwd: ${invoke_cwd}"
+    # Ambient git line, sourced from the last-scan cache ONLY (git_scan_cache
+    # is stdlib-only and never scans/spawns git — a cold cache prints the
+    # 'no recent scan' pointer instead of paying the ~2s estate scan here).
+    python3 -c 'import sys; sys.path.insert(0, ".env-manager"); from runtime_manager.git_scan_cache import home_view_line; print(home_view_line())' 2>/dev/null \
+      || echo "git: no recent scan — sbp git"
     python3 .env-manager/manage.py skills "${client_flags[@]}" --profile "${profile}" --cwd "${invoke_cwd}" --issues-only --limit 20 --no-global || true
     echo
     echo "next:"

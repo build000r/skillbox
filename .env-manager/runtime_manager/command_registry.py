@@ -742,6 +742,7 @@ def default_registry() -> tuple[CommandSpec, ...]:
                 "only": "string[]?",
                 "root": "string[]?",
                 "depth": "integer?",
+                "cached": "boolean?",
             },
             outputs={
                 "schema": "string",
