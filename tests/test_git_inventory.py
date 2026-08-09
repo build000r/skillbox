@@ -149,6 +149,9 @@ class ProbeClassificationTests(GitFixtureCase):
         self.assertNotIn("dirty", record.classes)
         # Below the >=5 threshold the primary falls through (here: no-remote).
         self.assertEqual(record.primary_class, "no-remote")
+        # A single stash reports the same timestamp as newest and oldest.
+        self.assertIsNotNone(record.stash_newest)
+        self.assertEqual(record.stash_newest, record.stash_oldest)
 
     def test_stash_heavy_primary_at_threshold(self) -> None:
         repo = self.make_repo("stash-heavy")
@@ -277,6 +280,172 @@ class ProbeClassificationTests(GitFixtureCase):
         self.assertEqual(record.primary_class, "no-remote")
 
 
+class EnrichmentProbeTests(GitFixtureCase):
+    """Stash ages + unpushed-branch signals: additive, class-vocabulary-free."""
+
+    def stash_with_date(self, repo: Path, content: str, date: str) -> None:
+        """One stash entry whose committer date is pinned via the env (stash
+        timestamps come from the stash commit's committer date)."""
+        (repo / "tracked.txt").write_text(content, encoding="utf-8")
+        with mock.patch.dict(os.environ, {"GIT_COMMITTER_DATE": date}):
+            self.git(repo, "stash", "push", "-q", "-m", content.strip())
+
+    def test_stash_ages_from_pinned_committer_dates(self) -> None:
+        repo = self.make_repo("stash-aged")
+        self.stash_with_date(repo, "oldest\n", "2026-01-01T00:00:00+00:00")
+        self.stash_with_date(repo, "newest\n", "2026-02-05T12:30:00+00:00")
+        record = git_inventory.probe_repo(repo)
+        self.assertEqual(record.stash_count, 2)
+        self.assertEqual(record.stash_newest, "2026-02-05T12:30:00+00:00")
+        self.assertEqual(record.stash_oldest, "2026-01-01T00:00:00+00:00")
+        # Enrichment never touches the class vocabulary.
+        self.assertLessEqual(record.classes, git_inventory.ALL_CLASSES)
+
+    def test_stash_ages_truthful_when_backdated_out_of_order(self) -> None:
+        # stash@{0} is the newest ENTRY, but a backdated committer date must
+        # not be reported as "newest": max/min over timestamps, not list order.
+        repo = self.make_repo("stash-backdated")
+        self.stash_with_date(repo, "first\n", "2026-03-01T00:00:00+00:00")
+        self.stash_with_date(repo, "second-backdated\n", "2026-01-01T00:00:00+00:00")
+        record = git_inventory.probe_repo(repo)
+        self.assertEqual(record.stash_newest, "2026-03-01T00:00:00+00:00")
+        self.assertEqual(record.stash_oldest, "2026-01-01T00:00:00+00:00")
+
+    def test_no_stash_yields_null_ages(self) -> None:
+        repo = self.make_repo("stashless")
+        record = git_inventory.probe_repo(repo)
+        self.assertEqual(record.stash_count, 0)
+        self.assertIsNone(record.stash_newest)
+        self.assertIsNone(record.stash_oldest)
+
+    def test_unpushed_branch_without_upstream(self) -> None:
+        _, clone = self.make_clone_pair("parked")
+        self.git(clone, "checkout", "-q", "-b", "parked-work")
+        (clone / "parked.txt").write_text("parked\n", encoding="utf-8")
+        self.git(clone, "add", "parked.txt")
+        self.git(clone, "commit", "-q", "-m", "parked work")
+        self.git(clone, "checkout", "-q", "main")
+        record = git_inventory.probe_repo(clone)
+        self.assertEqual(record.unpushed_branches, (("parked-work", 1),))
+        self.assertIsNone(record.branch_scan_note)
+        # HEAD itself is clean and current: the silent-loss class does not
+        # bleed into classes/primary (schema additive, no vocabulary change).
+        self.assertEqual(record.classes, frozenset({"clean-current"}))
+        self.assertEqual(record.primary_class, "clean-current")
+
+    def test_unpushed_branch_with_upstream_uses_track_not_rev_list(self) -> None:
+        _, clone = self.make_clone_pair("tracked")
+        self.git(clone, "checkout", "-q", "-b", "feat", "--track", "origin/main")
+        for i in range(2):
+            (clone / f"feat-{i}.txt").write_text(f"{i}\n", encoding="utf-8")
+            self.git(clone, "add", f"feat-{i}.txt")
+            self.git(clone, "commit", "-q", "-m", f"feat {i}")
+        self.git(clone, "checkout", "-q", "main")
+
+        calls: list[list[str]] = []
+        real_run_git = git_inventory._run_git
+
+        def spy(path: str, args, timeout_s: float):
+            calls.append(list(args))
+            return real_run_git(path, args, timeout_s)
+
+        with mock.patch.object(git_inventory, "_run_git", side_effect=spy):
+            record = git_inventory.probe_repo(clone)
+        self.assertEqual(record.unpushed_branches, (("feat", 2),))
+        # %(upstream:track) supplied the count: no rev-list subprocess spawned.
+        self.assertFalse(
+            any("rev-list" in args for args in calls),
+            f"track path must not rev-list: {calls}",
+        )
+
+    def test_gone_upstream_falls_back_to_rev_list(self) -> None:
+        origin = self.make_repo("gone-origin")
+        self.git(origin, "checkout", "-q", "-b", "feat")
+        (origin / "feat.txt").write_text("feat\n", encoding="utf-8")
+        self.git(origin, "add", "feat.txt")
+        self.git(origin, "commit", "-q", "-m", "feat on origin")
+        self.git(origin, "checkout", "-q", "main")
+        clone = self.tmp / "gone-clone"
+        self.git(self.tmp, "clone", "-q", f"file://{origin}", str(clone))
+        self.git(clone, "checkout", "-q", "feat")  # auto-tracks origin/feat
+        (clone / "local.txt").write_text("local\n", encoding="utf-8")
+        self.git(clone, "add", "local.txt")
+        self.git(clone, "commit", "-q", "-m", "local feat work")
+        self.git(clone, "checkout", "-q", "main")
+        # The upstream ref disappears: %(upstream:track) reports [gone], so
+        # the batched rev-list must carry the branch instead of the track path.
+        self.git(clone, "update-ref", "-d", "refs/remotes/origin/feat")
+        record = git_inventory.probe_repo(clone)
+        # origin/main still holds the base commit; the origin-side feat commit
+        # and the local one are absent from every remaining remote ref.
+        self.assertEqual(record.unpushed_branches, (("feat", 2),))
+
+    def test_fully_pushed_branch_is_not_flagged(self) -> None:
+        _, clone = self.make_clone_pair("pushed")
+        # Same tip as origin/main: reachable from a remote, nothing unpushed.
+        self.git(clone, "branch", "twin")
+        record = git_inventory.probe_repo(clone)
+        self.assertEqual(record.unpushed_branches, ())
+        self.assertIsNone(record.branch_scan_note)
+
+    def test_head_branch_is_never_listed(self) -> None:
+        _, clone = self.make_clone_pair("headwork")
+        (clone / "local.txt").write_text("local\n", encoding="utf-8")
+        self.git(clone, "add", "local.txt")
+        self.git(clone, "commit", "-q", "-m", "local work")
+        record = git_inventory.probe_repo(clone)
+        # HEAD's unpushed work is the existing `ahead` signal, not a branch row.
+        self.assertEqual((record.ahead, record.behind), (1, 0))
+        self.assertEqual(record.unpushed_branches, ())
+
+    def test_multiple_unpushed_branches_sorted_by_name(self) -> None:
+        _, clone = self.make_clone_pair("multi")
+        for name in ("zeta", "alpha"):
+            self.git(clone, "checkout", "-q", "-b", name)
+            (clone / f"{name}.txt").write_text(f"{name}\n", encoding="utf-8")
+            self.git(clone, "add", f"{name}.txt")
+            self.git(clone, "commit", "-q", "-m", name)
+            self.git(clone, "checkout", "-q", "main")
+        record = git_inventory.probe_repo(clone)
+        self.assertEqual(record.unpushed_branches, (("alpha", 1), ("zeta", 1)))
+
+    def test_branch_scan_skipped_past_limit(self) -> None:
+        repo = self.make_repo("many-branches")
+        # main + BRANCH_SCAN_LIMIT extras = one past the limit. Plain refs at
+        # HEAD (no commits) keep the fixture fast.
+        for i in range(git_inventory.BRANCH_SCAN_LIMIT):
+            self.git(repo, "branch", f"b-{i:03d}")
+        record = git_inventory.probe_repo(repo)
+        self.assertEqual(record.unpushed_branches, ())
+        self.assertEqual(
+            record.branch_scan_note,
+            f"branch scan skipped: {git_inventory.BRANCH_SCAN_LIMIT + 1} local branches",
+        )
+
+    def test_bare_repo_skips_branch_scan(self) -> None:
+        bare = self.tmp / "bare-branches.git"
+        bare.mkdir()
+        self.git(bare, "init", "-q", "--bare", "-b", "main")
+        record = git_inventory.probe_repo(bare)
+        self.assertTrue(record.bare)
+        self.assertEqual(record.unpushed_branches, ())
+        self.assertIsNone(record.branch_scan_note)
+
+    def test_track_ahead_parser(self) -> None:
+        cases = {
+            "": 0,
+            "[ahead 2]": 2,
+            "[behind 3]": 0,
+            "[ahead 4, behind 1]": 4,
+            "[gone]": 0,
+            "[garbage nonsense]": 0,
+        }
+        for track, expected in cases.items():
+            self.assertEqual(
+                git_inventory._parse_track_ahead(track), expected, repr(track)
+            )
+
+
 class ReadOnlyContractTests(GitFixtureCase):
     def test_probe_never_fetches_and_sets_readonly_env(self) -> None:
         repo = self.make_repo("readonly")
@@ -308,17 +477,22 @@ class RecordSerializationTests(GitFixtureCase):
     def test_to_dict_is_json_safe_deterministic_and_sorted(self) -> None:
         repo = self.make_repo("serialize")
         (repo / "loose.txt").write_text("loose\n", encoding="utf-8")
+        # A parked branch so the unpushed_branches projection is non-trivial.
+        self.git(repo, "branch", "parked")
         record = git_inventory.probe_repo(repo)
         payload = record.to_dict()
         self.assertEqual(
             list(payload),
             [
                 "path", "classes", "primary_class", "branch", "upstream",
-                "ahead", "behind", "stash_count", "staged", "unstaged",
-                "untracked", "mid_op", "bare", "error",
+                "ahead", "behind", "stash_count", "stash_newest",
+                "stash_oldest", "staged", "unstaged", "untracked", "mid_op",
+                "unpushed_branches", "branch_scan_note", "bare", "error",
             ],
         )
         self.assertEqual(payload["classes"], sorted(payload["classes"]))
+        # (name, ahead) pairs project as JSON-friendly {name, ahead} objects.
+        self.assertEqual(payload["unpushed_branches"], [{"name": "parked", "ahead": 1}])
         round_trip = json.loads(json.dumps(payload))
         self.assertEqual(round_trip, payload)
 

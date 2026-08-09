@@ -19,6 +19,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -258,6 +259,20 @@ class FixCommandTests(unittest.TestCase):
     def test_clean_has_no_fix(self) -> None:
         self.assertEqual(git_estate.fix_commands(_record("/r/clean")), [])
 
+    def test_unpushed_branches_get_branch_listing_fix(self) -> None:
+        record = _record("/r/up", unpushed_branches=(("feat", 2), ("wip", 1)))
+        self.assertEqual(
+            git_estate.fix_commands(record),
+            ["git -C /r/up branch -vv  # 2 unpushed branches: feat(+2), wip(+1)"],
+        )
+
+    def test_single_unpushed_branch_fix_is_singular(self) -> None:
+        record = _record("/r/up", unpushed_branches=(("parked", 3),))
+        self.assertEqual(
+            git_estate.fix_commands(record),
+            ["git -C /r/up branch -vv  # 1 unpushed branch: parked(+3)"],
+        )
+
     def test_unregistered_gets_registry_handoff_after_work_fixes(self) -> None:
         record = _record("/r/dirty", classes=frozenset({"dirty"}), primary_class="dirty", unstaged=1)
         fixes = git_estate.fix_commands(record, "unregistered", "/cfg/registry/repos.yaml")
@@ -472,6 +487,81 @@ class GitEstateFixtureCase(unittest.TestCase):
     @property
     def registry_yaml(self) -> str:
         return str(self.config_root / "registry" / "repos.yaml")
+
+
+class RelativeAgeTests(unittest.TestCase):
+    NOW = "2026-08-09T12:00:00+00:00"
+
+    def test_day_and_hour_floors(self) -> None:
+        self.assertEqual(
+            git_estate._relative_age("2026-08-06T11:00:00+00:00", self.NOW), "3d"
+        )
+        self.assertEqual(
+            git_estate._relative_age("2026-08-09T07:00:00+00:00", self.NOW), "5h"
+        )
+        self.assertEqual(
+            git_estate._relative_age("2026-08-09T11:30:00+00:00", self.NOW), "<1h"
+        )
+
+    def test_future_timestamp_clamps_instead_of_negative(self) -> None:
+        self.assertEqual(
+            git_estate._relative_age("2026-08-10T12:00:00+00:00", self.NOW), "<1h"
+        )
+
+    def test_degrades_to_none_on_any_parse_problem(self) -> None:
+        self.assertIsNone(git_estate._relative_age(None, self.NOW))
+        self.assertIsNone(git_estate._relative_age("2026-08-06T11:00:00+00:00", None))
+        self.assertIsNone(git_estate._relative_age("garbage", self.NOW))
+        # naive/aware mix raises TypeError inside; must degrade, not crash.
+        self.assertIsNone(
+            git_estate._relative_age("2026-08-06T11:00:00", self.NOW)
+        )
+
+
+class BandPlacementFixtureTests(GitEstateFixtureCase):
+    """Real-git dirty+behind / dirty+diverged fixtures asserting band
+    placement (closes the tests-bead audit gap: these combinations were
+    previously covered only by synthetic records in RiskSortTests)."""
+
+    def make_behind_clone(self, name: str) -> Path:
+        """Clone stepped one commit behind its origin, no fetch involved."""
+        origin = self.make_repo(f"{name}-origin", parent=self.origins)
+        (origin / "second.txt").write_text("two\n", encoding="utf-8")
+        self.git(origin, "add", "second.txt")
+        self.git(origin, "commit", "-q", "-m", "second")
+        clone = self.estate / name
+        self.git(self.tmp, "clone", "-q", f"file://{origin}", str(clone))
+        self.git(clone, "reset", "-q", "--hard", "HEAD~1")
+        return clone
+
+    def test_dirty_behind_band_from_real_repo(self) -> None:
+        clone = self.make_behind_clone("a-dirty-behind")
+        (clone / "tracked.txt").write_text("dirt\n", encoding="utf-8")
+        self.write_config_fixture()
+        report = git_estate.build_report(roots=[str(self.estate)], depth=2)
+        row = next(r for r in report["repos"] if r["path"] == str(clone))
+        self.assertEqual(row["risk_band"], "dirty-behind")
+        self.assertEqual((row["ahead"], row["behind"]), (0, 1))
+        self.assertIn("dirty", row["classes"])
+        self.assertIn("behind", row["classes"])
+
+    def test_dirty_diverged_band_from_real_repo(self) -> None:
+        clone = self.make_behind_clone("a-dirty-diverged")
+        (clone / "local.txt").write_text("local\n", encoding="utf-8")
+        self.git(clone, "add", "local.txt")
+        self.git(clone, "commit", "-q", "-m", "local work")
+        (clone / "tracked.txt").write_text("dirt\n", encoding="utf-8")
+        self.write_config_fixture()
+        report = git_estate.build_report(roots=[str(self.estate)], depth=2)
+        row = next(r for r in report["repos"] if r["path"] == str(clone))
+        # ahead+behind wins the band whatever the tree state; the dirty tree
+        # keeps diverged-clean OUT of the class set.
+        self.assertEqual(row["risk_band"], "diverged")
+        self.assertEqual((row["ahead"], row["behind"]), (1, 1))
+        self.assertIn("dirty", row["classes"])
+        self.assertNotIn("diverged-clean", row["classes"])
+        # Diverged rows keep the reconcile handoff, never push/pull.
+        self.assertIn("sbp doctor / reconcile skill — do not hand-merge", row["fix"])
 
 
 class BuildReportTests(GitEstateFixtureCase):
@@ -788,6 +878,94 @@ class TextRenderingTests(GitEstateFixtureCase):
         report = git_estate.build_report(roots=[str(self.estate)], depth=2, cwd=str(dirty))
         text = "\n".join(git_estate.report_text_lines(report))
         self.assertIn("registration: unregistered (not in registry, not ignore-matched)", text)
+
+    def stash_with_age(self, repo: Path, content: str, age: timedelta) -> None:
+        """One stash entry backdated by ``age`` (committer date pinned via
+        GIT_COMMITTER_DATE; stash timestamps come from the stash commit)."""
+        (repo / "tracked.txt").write_text(content, encoding="utf-8")
+        date = (datetime.now(timezone.utc) - age).isoformat()
+        with mock.patch.dict(os.environ, {"GIT_COMMITTER_DATE": date}):
+            self.git(repo, "stash", "push", "-q", "-m", content.strip())
+
+    def add_parked_branch(self, repo: Path, name: str = "parked-work") -> None:
+        self.git(repo, "checkout", "-q", "-b", name)
+        (repo / f"{name}.txt").write_text("parked\n", encoding="utf-8")
+        self.git(repo, "add", f"{name}.txt")
+        self.git(repo, "commit", "-q", "-m", "parked work")
+        self.git(repo, "checkout", "-q", "main")
+
+    def test_clean_row_with_unpushed_branch_stays_visible(self) -> None:
+        clone = self.make_clean_clone("a-parked")
+        self.add_parked_branch(clone)
+        self.write_config_fixture(repos=[{"id": "a-parked", "path": str(clone)}])
+        report = git_estate.build_report(roots=[str(self.estate)], depth=2)
+
+        row = next(r for r in report["repos"] if r["path"] == str(clone))
+        self.assertEqual(row["risk_band"], "clean")  # HEAD is clean-current
+        self.assertEqual(
+            row["unpushed_branches"], [{"name": "parked-work", "ahead": 1}]
+        )
+        self.assertIsNone(row["branch_scan_note"])
+
+        text = "\n".join(git_estate.report_text_lines(report, color=False))
+        # The silent-loss class must not fold away with the clean rows.
+        self.assertIn(f"{clone}  [+1 unpushed branch]", text)
+        self.assertNotIn("rows folded", text)
+        # It joins next_actions without inventing an issue band.
+        self.assertNotIn("issues:", text)
+        self.assertIn("next_actions:", text)
+        self.assertIn(
+            f"git -C {clone} branch -vv  # 1 unpushed branch: parked-work(+1)", text
+        )
+
+    def test_stash_only_row_carries_age_marker(self) -> None:
+        clone = self.make_clean_clone("a-stash-aged")
+        self.stash_with_age(clone, "old stash\n", timedelta(days=40, hours=2))
+        self.stash_with_age(clone, "new stash\n", timedelta(days=3, hours=2))
+        self.write_config_fixture(repos=[{"id": "a-stash-aged", "path": str(clone)}])
+        report = git_estate.build_report(roots=[str(self.estate)], depth=2)
+        text = "\n".join(git_estate.report_text_lines(report, color=False))
+        self.assertIn(f"{clone}  [stash newest 3d, oldest 40d]", text)
+
+    def test_cwd_detail_shows_stash_ages_and_unpushed_branches(self) -> None:
+        repo = self.make_repo("a-mixed")
+        self.stash_with_age(repo, "old stash\n", timedelta(days=40, hours=2))
+        self.stash_with_age(repo, "new stash\n", timedelta(days=3, hours=2))
+        self.add_parked_branch(repo, "parked-work")
+        self.write_config_fixture()
+        report = git_estate.build_report(
+            roots=[str(self.estate)], depth=2, cwd=str(repo)
+        )
+        text = "\n".join(git_estate.report_text_lines(report, color=False))
+        self.assertIn("  stash: 2 (newest 3d, oldest 40d)", text)
+        # No remote at all: every parked commit is absent from any remote,
+        # so the count covers the branch's whole history (base + parked).
+        self.assertIn("  unpushed branches: parked-work (+2)", text)
+
+    def test_cwd_detail_renders_branch_scan_note(self) -> None:
+        # Synthetic report: the note render needs no 51-branch fixture.
+        record = _record(
+            "/r/many", branch_scan_note="branch scan skipped: 73 local branches"
+        )
+        report = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "roots": ["/r"],
+            "repos": [],
+            "cwd_repo": git_estate._row(record),
+        }
+        text = "\n".join(git_estate.report_text_lines(report, color=False))
+        self.assertIn("  note: branch scan skipped: 73 local branches", text)
+
+    def test_stash_age_absent_keeps_plain_count_line(self) -> None:
+        dirty = self.make_repo("a-dirty")
+        (dirty / "loose.txt").write_text("loose\n", encoding="utf-8")
+        self.write_config_fixture()
+        report = git_estate.build_report(
+            roots=[str(self.estate)], depth=2, cwd=str(dirty)
+        )
+        text = "\n".join(git_estate.report_text_lines(report, color=False))
+        self.assertIn("  stash: 0", text)
+        self.assertNotIn("(newest", text)
 
 
 class WrapperAliasTests(GitEstateFixtureCase):

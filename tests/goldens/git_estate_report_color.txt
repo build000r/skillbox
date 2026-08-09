@@ -5,18 +5,19 @@ cwd repo: /GOLDEN_TMP/estate/b-dirty [[33mdirty[0m]
   tree: 1 staged, 1 unstaged, 1 untracked
   stash: 0
 
-estate: 7 repos under /GOLDEN_TMP/estate
+estate: 8 repos under /GOLDEN_TMP/estate
   1 ignored by registry rules
-  registration: 6 registered, 1 unregistered, 1 stale-registered
+  registration: 7 registered, 1 unregistered, 1 stale-registered
 
   BAND          A/B    S/U/?  STASH  BRANCH  PATH
   -----------------------------------------------
-  [31mmid-op    [0m    0/0    1/1/0      0  main    /GOLDEN_TMP/estate/e-midop
+  [31mmid-op    [0m    0/0    1/1/0      0  main    /GOLDEN_TMP/estate/e-midop  [+1 unpushed branch]
   [33mdirty     [0m    0/0    1/1/1      0  main    /GOLDEN_TMP/estate/b-dirty
   [36mahead     [0m    1/0    0/0/0      0  main    /GOLDEN_TMP/estate/c-ahead
   [35mno-remote [0m    0/0    0/0/0      0  main    /GOLDEN_TMP/estate/g-unregistered  [unregistered]
   [35mno-remote [0m    0/0    0/0/0      0  main    /GOLDEN_TMP/estate/f-noremote
-  [36mstash-only[0m    0/0    0/0/0      1  main    /GOLDEN_TMP/estate/d-stash
+  [36mstash-only[0m    0/0    0/0/0      2  main    /GOLDEN_TMP/estate/d-stash  [stash newest 3d, oldest 40d]
+  [32mclean     [0m    0/0    0/0/0      0  main    /GOLDEN_TMP/estate/i-unpushed  [+1 unpushed branch]
   1 clean-current repos (rows folded; --only clean-current to list)
 
 stale-registered: 1 registry entries with no repo on disk
@@ -31,6 +32,7 @@ issues:
 next_actions:
   - git -C /GOLDEN_TMP/estate/e-midop status  # finish or abort the merge
   - git -C /GOLDEN_TMP/estate/e-midop add -p && git -C /GOLDEN_TMP/estate/e-midop commit
+  - git -C /GOLDEN_TMP/estate/e-midop branch -vv  # 1 unpushed branch: feature(+2)
   - add a remote or register intent
   - git -C /GOLDEN_TMP/estate/b-dirty add -p && git -C /GOLDEN_TMP/estate/b-dirty commit
   - git -C /GOLDEN_TMP/estate/c-ahead push

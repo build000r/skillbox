@@ -1,7 +1,8 @@
 """Golden-output tests for ``sbp git`` -- byte-stable tty + JSON envelopes.
 
 A FIXED fixture estate (one repo per interesting class: clean clone, dirty
-staged+unstaged+untracked, ahead, stash, mid-op merge, no-remote, an
+staged+unstaged+untracked, ahead, aged stashes (pinned committer dates),
+mid-op merge, no-remote, a clean repo with an unpushed non-HEAD branch, an
 unregistered repo, a stale registry entry, and an ignore-rule hit) is built
 from real ``git init`` repos inside a TemporaryDirectory, scanned once via
 ``git_estate.build_report``, and the result is pinned against goldens in
@@ -17,6 +18,10 @@ Normalization rules (what makes the goldens commit-able)
   with the stable placeholder ``/GOLDEN_TMP`` (covers repo paths, roots, fix
   commands, and the registry path inside fix strings);
 * ``generated_at`` is replaced with the fixed ``1970-01-01T00:00:00+00:00``;
+* ``stash_newest`` / ``stash_oldest`` (wall-clock committer timestamps) are
+  replaced with placeholders pinned exactly 3 and 40 days BEFORE the
+  ``generated_at`` placeholder, so the renderer's relative ages come out as
+  a stable ``(newest 3d, oldest 40d)`` on every machine;
 * ``elapsed_seconds`` is replaced with ``0.0``;
 * git-version-dependent strings are pinned at the fixture level:
   ``init.defaultBranch=main`` via a hermetic ``GIT_CONFIG_GLOBAL`` (plus
@@ -63,6 +68,10 @@ UPDATE_ENV = "UPDATE_GOLDENS"
 PATH_PLACEHOLDER = "/GOLDEN_TMP"
 #: Stable stand-in for the wall-clock ``generated_at`` timestamp.
 GENERATED_AT_PLACEHOLDER = "1970-01-01T00:00:00+00:00"
+#: Stash-age placeholders: exactly 3d / 40d before GENERATED_AT_PLACEHOLDER,
+#: so the tty rendering (relative ages vs generated_at) is byte-stable.
+STASH_NEWEST_PLACEHOLDER = "1969-12-29T00:00:00+00:00"
+STASH_OLDEST_PLACEHOLDER = "1969-11-22T00:00:00+00:00"
 
 # Same faithful registry_doctor.py stand-in as tests/test_git_estate.py: the
 # three entry points git_estate loads, same rule semantics, JSON body instead
@@ -131,7 +140,9 @@ def _normalize_report(report: dict[str, Any], tmp_root: str) -> dict[str, Any]:
     """Deep-copy ``report`` with every machine-dependent value replaced.
 
     Path prefix -> :data:`PATH_PLACEHOLDER`, ``generated_at`` ->
-    :data:`GENERATED_AT_PLACEHOLDER`, ``elapsed_seconds`` -> ``0.0``.
+    :data:`GENERATED_AT_PLACEHOLDER`, non-null ``stash_newest`` /
+    ``stash_oldest`` -> the fixed 3d/40d-before-generated_at placeholders,
+    ``elapsed_seconds`` -> ``0.0``.
     """
 
     def swap(value: Any) -> Any:
@@ -140,7 +151,15 @@ def _normalize_report(report: dict[str, Any], tmp_root: str) -> dict[str, Any]:
         if isinstance(value, list):
             return [swap(item) for item in value]
         if isinstance(value, dict):
-            return {key: swap(item) for key, item in value.items()}
+            out: dict[str, Any] = {}
+            for key, item in value.items():
+                if key == "stash_newest" and isinstance(item, str):
+                    out[key] = STASH_NEWEST_PLACEHOLDER
+                elif key == "stash_oldest" and isinstance(item, str):
+                    out[key] = STASH_OLDEST_PLACEHOLDER
+                else:
+                    out[key] = swap(item)
+            return out
         return value
 
     normalized = swap(report)
@@ -250,10 +269,19 @@ class GitEstateGoldenTests(unittest.TestCase):
         cls._git(c_ahead, "add", "local.txt")
         cls._git(c_ahead, "commit", "-q", "-m", "local work")
 
-        # d-stash: clone with one stash and a clean tree -> stash-only band.
+        # d-stash: clone with two AGED stashes and a clean tree -> stash-only
+        # band. Committer dates are pinned via GIT_COMMITTER_DATE (stash
+        # timestamps come from the stash commit); the exact values are
+        # irrelevant because the normalizer replaces them with the fixed
+        # 3d/40d-before-generated_at placeholders.
         d_stash = cls._make_clone("d-stash")
-        (d_stash / "tracked.txt").write_text("stash me\n", encoding="utf-8")
-        cls._git(d_stash, "stash", "-q")
+        for date, content in (
+            ("2026-01-01T00:00:00+00:00", "old stash"),
+            ("2026-02-01T00:00:00+00:00", "new stash"),
+        ):
+            (d_stash / "tracked.txt").write_text(f"{content}\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"GIT_COMMITTER_DATE": date}):
+                cls._git(d_stash, "stash", "push", "-q", "-m", content)
 
         # e-midop: merge conflict in flight (mid-op + dirty + no-remote).
         e_midop = cls._make_repo("e-midop")
@@ -272,6 +300,17 @@ class GitEstateGoldenTests(unittest.TestCase):
 
         # g-unregistered: scanned repo absent from the registry.
         cls._make_repo("g-unregistered")
+
+        # i-unpushed: clean-current clone whose work is parked on a non-HEAD
+        # branch with no upstream -- the silent-loss class. The row stays
+        # visible (never folded with the clean rows) and carries the
+        # [+1 unpushed branch] marker + branch -vv fix line.
+        i_unpushed = cls._make_clone("i-unpushed")
+        cls._git(i_unpushed, "checkout", "-q", "-b", "parked-work")
+        (i_unpushed / "parked.txt").write_text("parked\n", encoding="utf-8")
+        cls._git(i_unpushed, "add", "parked.txt")
+        cls._git(i_unpushed, "commit", "-q", "-m", "parked work")
+        cls._git(i_unpushed, "checkout", "-q", "main")
 
         # z-ignored: repo matched by a registry ignore rule (never a row).
         z_ignored = cls._make_repo("z-ignored")
@@ -298,6 +337,7 @@ class GitEstateGoldenTests(unittest.TestCase):
                         {"id": "d-stash", "path": str(d_stash)},
                         {"id": "e-midop", "path": str(e_midop)},
                         {"id": "f-noremote", "path": str(f_noremote)},
+                        {"id": "i-unpushed", "path": str(i_unpushed)},
                         {"id": "gone", "path": str(gone)},
                     ],
                     "ignore": [{"path": str(z_ignored), "reason": "fixture"}],
@@ -373,6 +413,19 @@ class GitEstateGoldenTests(unittest.TestCase):
         self.assertEqual(
             (dirty["staged"], dirty["unstaged"], dirty["untracked"]), (1, 1, 1)
         )
+        # Stash-aged fixture: two stashes whose timestamps normalized to the
+        # fixed 3d/40d-before-generated_at placeholders.
+        stash = next(row for row in rows if row["path"].endswith("d-stash"))
+        self.assertEqual(stash["stash_count"], 2)
+        self.assertEqual(stash["stash_newest"], STASH_NEWEST_PLACEHOLDER)
+        self.assertEqual(stash["stash_oldest"], STASH_OLDEST_PLACEHOLDER)
+        # Unpushed-branch fixture: clean HEAD, work parked on a non-HEAD
+        # branch with no upstream (the silent-loss class).
+        unpushed = next(row for row in rows if row["path"].endswith("i-unpushed"))
+        self.assertEqual(unpushed["risk_band"], "clean")
+        self.assertEqual(
+            unpushed["unpushed_branches"], [{"name": "parked-work", "ahead": 1}]
+        )
         self.assertEqual(self.normalized["ignored_count"], 1)
         self.assertEqual(
             [entry["id"] for entry in self.normalized["stale_registered"]],
@@ -380,11 +433,14 @@ class GitEstateGoldenTests(unittest.TestCase):
         )
         self.assertEqual(
             self.normalized["registration_summary"],
-            {"registered": 6, "unregistered": 1, "unknown": 0, "stale_registered": 1},
+            {"registered": 7, "unregistered": 1, "unknown": 0, "stale_registered": 1},
         )
-        # Placeholder discipline: no tmpdir path survives normalization.
+        # Placeholder discipline: no tmpdir path and no raw fixture stash
+        # timestamp survives normalization.
         blob = json.dumps(self.normalized)
         self.assertNotIn(str(self.tmp), blob)
+        self.assertNotIn("2026-01-01", blob)
+        self.assertNotIn("2026-02-01", blob)
         self.assertIn(PATH_PLACEHOLDER, blob)
 
 

@@ -26,6 +26,18 @@ output ordering stays deterministic (sorted by path) regardless of completion
 order. Each worker's probe builds its own environment dict and holds no shared
 mutable state, so probes are thread-safe by construction.
 
+**Enrichment signals (schema-additive).** Stash ages (``stash_newest`` /
+``stash_oldest``, ISO8601 UTC) ride the existing ``stash list`` call via
+``--format=%ct`` -- zero extra subprocesses. Unpushed non-HEAD branches
+(``unpushed_branches``: work parked on a branch you forgot) cost one
+``for-each-ref`` call per non-bare repo; ``%(upstream:track)`` supplies ahead
+counts for branches with a live upstream, and upstream-less (or gone)
+branches share ONE batched ``rev-list --parents <tips> --not --remotes``
+call whose subgraph is walked in Python for exact per-branch counts. Past
+:data:`BRANCH_SCAN_LIMIT` local branches the branch scan is skipped and
+``branch_scan_note`` says so. None of these fields changes ``classes`` or
+``primary_class``.
+
 **Worktree-aware.** Mid-operation markers (``rebase-merge``, ``MERGE_HEAD``,
 ``CHERRY_PICK_HEAD``, ...) are looked up under ``git rev-parse
 --absolute-git-dir`` so linked worktrees are classified against their real
@@ -87,12 +99,14 @@ import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 __all__ = [
     "ALL_CLASSES",
     "BRANCH_DETACHED",
+    "BRANCH_SCAN_LIMIT",
     "DEFAULT_DEPTH",
     "DEFAULT_REPO_DEADLINE_S",
     "DEFAULT_TIMEOUT_S",
@@ -143,6 +157,13 @@ STASH_HEAVY_THRESHOLD = 5
 
 #: Branch reported when HEAD is detached (matches repo_inventory.sh).
 BRANCH_DETACHED = "DETACHED"
+
+#: Local-branch count above which the unpushed-branch scan is skipped for a
+#: repo (the record carries ``branch_scan_note`` instead of results). The
+#: ``for-each-ref`` listing itself is one cheap call; the bound exists because
+#: each branch WITHOUT an upstream costs one extra ``rev-list --count``
+#: subprocess, and a 50+-branch repo would blow the estate perf budget.
+BRANCH_SCAN_LIMIT = 50
 
 #: Heavy non-repo trees pruned during discovery (matches repo_inventory.sh).
 PRUNE_DIR_NAMES = frozenset(
@@ -211,7 +232,22 @@ _MID_OP_MARKERS: tuple[tuple[str, str, bool], ...] = (
 
 @dataclass(frozen=True)
 class GitRepoRecord:
-    """One read-only classification of a single repository."""
+    """One read-only classification of a single repository.
+
+    Enrichment fields (all additive; none affects ``classes`` or
+    ``primary_class``):
+
+    * ``stash_newest`` / ``stash_oldest``: committer timestamps (ISO8601 UTC,
+      same style as the envelope's ``generated_at``) of the newest and oldest
+      stash entries; ``None`` when the repo has no stash.
+    * ``unpushed_branches``: non-HEAD local branches whose commits are absent
+      from every remote, as ``(name, ahead)`` pairs (``to_dict`` projects
+      ``[{"name", "ahead"}]``); the silent-loss class of work parked on a
+      branch you forgot.
+    * ``branch_scan_note``: non-``None`` when the unpushed-branch scan was
+      skipped (e.g. ``"branch scan skipped: 73 local branches"`` past
+      :data:`BRANCH_SCAN_LIMIT`); doubles as the skipped flag.
+    """
 
     path: str
     classes: frozenset[str] = field(default_factory=frozenset)
@@ -221,10 +257,14 @@ class GitRepoRecord:
     ahead: int = 0
     behind: int = 0
     stash_count: int = 0
+    stash_newest: str | None = None
+    stash_oldest: str | None = None
     staged: int = 0
     unstaged: int = 0
     untracked: int = 0
     mid_op: str | None = None
+    unpushed_branches: tuple[tuple[str, int], ...] = ()
+    branch_scan_note: str | None = None
     bare: bool = False
     error: str | None = None
 
@@ -239,10 +279,17 @@ class GitRepoRecord:
             "ahead": self.ahead,
             "behind": self.behind,
             "stash_count": self.stash_count,
+            "stash_newest": self.stash_newest,
+            "stash_oldest": self.stash_oldest,
             "staged": self.staged,
             "unstaged": self.unstaged,
             "untracked": self.untracked,
             "mid_op": self.mid_op,
+            "unpushed_branches": [
+                {"name": name, "ahead": ahead}
+                for name, ahead in self.unpushed_branches
+            ],
+            "branch_scan_note": self.branch_scan_note,
             "bare": self.bare,
             "error": self.error,
         }
@@ -423,11 +470,141 @@ def _probe_mid_op(git_dir: str) -> str | None:
     return None
 
 
-def _probe_stash_count(repo: str, clock: _ProbeClock) -> int:
-    proc = _run_git(repo, ["stash", "list"], clock.call_timeout())
+def _probe_stash(repo: str, clock: _ProbeClock) -> tuple[int, str | None, str | None]:
+    """(stash_count, newest, oldest) from ONE ``stash list`` call.
+
+    ``--format=%ct`` swaps the default listing for one committer-date epoch
+    per stash entry, so the age enrichment costs zero extra subprocesses.
+    Timestamps are ISO8601 UTC (the envelope's ``generated_at`` style);
+    ``(0, None, None)`` on any failure, matching the old count-only probe.
+    Newest/oldest use max/min rather than list order so backdated stash
+    commits (GIT_COMMITTER_DATE) still report truthfully.
+    """
+    proc = _run_git(repo, ["stash", "list", "--format=%ct"], clock.call_timeout())
     if proc.returncode != 0:
-        return 0
-    return sum(1 for line in proc.stdout.splitlines() if line.strip())
+        return 0, None, None
+    count = 0
+    epochs: list[int] = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        count += 1
+        try:
+            epochs.append(int(line))
+        except ValueError:
+            continue  # unparseable line still counts as a stash entry
+    if not epochs:
+        return count, None, None
+
+    def _iso(epoch: int) -> str:
+        return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+
+    return count, _iso(max(epochs)), _iso(min(epochs))
+
+
+def _parse_track_ahead(track: str) -> int:
+    """Ahead count out of a ``%(upstream:track)`` string.
+
+    Formats: `` `` (in sync), ``[ahead 2]``, ``[behind 1]``,
+    ``[ahead 2, behind 1]``, ``[gone]``. Anything unparseable reads as 0.
+    """
+    inner = track.strip().strip("[]")
+    for part in inner.split(","):
+        words = part.split()
+        if len(words) == 2 and words[0] == "ahead":
+            try:
+                return int(words[1])
+            except ValueError:
+                return 0
+    return 0
+
+
+def _probe_unpushed_branches(
+    repo: str, head_branch: str, clock: _ProbeClock
+) -> tuple[tuple[tuple[str, int], ...], str | None]:
+    """(unpushed non-HEAD branches as (name, ahead) pairs, skip note).
+
+    At most TWO subprocesses per repo, whatever the branch count:
+
+    * one ``for-each-ref refs/heads`` call lists every local branch with its
+      tip, upstream, and ``%(upstream:track)`` -- branches WITH a live
+      upstream get their ahead count straight from the track string;
+    * branches without an upstream (or with a gone one) share ONE batched
+      ``rev-list --parents <tips...> --not --remotes`` call, and per-branch
+      ahead counts come from walking that unpushed subgraph in Python. The
+      walk is exact: any path from a candidate tip to an unpushed commit
+      stays inside the subgraph (a remote-reachable intermediate commit
+      would make all its ancestors remote-reachable too), so the count
+      equals what per-branch ``rev-list --count <branch> --not --remotes``
+      would report -- commits absent from EVERY remote.
+
+    Past :data:`BRANCH_SCAN_LIMIT` local branches the whole scan is skipped
+    and the note names the count. Read-only like every other probe.
+    """
+    refs = _run_git(
+        repo,
+        [
+            "for-each-ref",
+            "refs/heads",
+            "--format=%(refname:short)%09%(objectname)%09%(upstream:short)%09%(upstream:track)",
+        ],
+        clock.call_timeout(),
+    )
+    if refs.returncode != 0:
+        return (), None
+    lines = [line for line in refs.stdout.splitlines() if line.strip()]
+    if len(lines) > BRANCH_SCAN_LIMIT:
+        return (), f"branch scan skipped: {len(lines)} local branches"
+    unpushed: list[tuple[str, int]] = []
+    candidates: list[tuple[str, str]] = []  # (name, tip) needing the rev-list
+    for line in lines:
+        parts = line.split("\t")
+        name = parts[0].strip()
+        tip = parts[1].strip() if len(parts) > 1 else ""
+        upstream = parts[2].strip() if len(parts) > 2 else ""
+        track = parts[3].strip() if len(parts) > 3 else ""
+        if not name or name == head_branch:
+            continue
+        if upstream and track != "[gone]":
+            ahead = _parse_track_ahead(track)
+            if ahead > 0:
+                unpushed.append((name, ahead))
+            continue
+        if tip:
+            candidates.append((name, tip))
+    if candidates:
+        # With no remotes at all, ``--remotes`` matches nothing and the whole
+        # branch history counts -- honest for a local-only repo's parked work.
+        proc = _run_git(
+            repo,
+            [
+                "rev-list",
+                "--parents",
+                *sorted({tip for _, tip in candidates}),
+                "--not",
+                "--remotes",
+            ],
+            clock.call_timeout(),
+        )
+        if proc.returncode == 0:
+            parents: dict[str, list[str]] = {}
+            for row in proc.stdout.splitlines():
+                shas = row.split()
+                if shas:
+                    parents[shas[0]] = shas[1:]
+            for name, tip in candidates:
+                if tip not in parents:
+                    continue  # tip is remote-reachable: fully pushed
+                seen = {tip}
+                stack = [tip]
+                while stack:
+                    for parent in parents.get(stack.pop(), ()):
+                        if parent in parents and parent not in seen:
+                            seen.add(parent)
+                            stack.append(parent)
+                unpushed.append((name, len(seen)))
+    return tuple(sorted(unpushed)), None
 
 
 def _parse_status_v2(stdout: str) -> tuple[str, str | None, int, int, int, int, int]:
@@ -652,7 +829,15 @@ def _probe(repo: str, clock: _ProbeClock) -> GitRepoRecord:
         upstream, ahead, behind = _probe_upstream(repo, clock)
 
     mid_op = _probe_mid_op(git_dir)
-    stash_count = _probe_stash_count(repo, clock)
+    stash_count, stash_newest, stash_oldest = _probe_stash(repo, clock)
+    # Bare repos are skipped: they usually ARE the remote, and "work parked on
+    # a forgotten local branch" is a working-checkout risk, not a bare one.
+    unpushed_branches: tuple[tuple[str, int], ...] = ()
+    branch_scan_note: str | None = None
+    if not bare:
+        unpushed_branches, branch_scan_note = _probe_unpushed_branches(
+            repo, branch, clock
+        )
 
     dirty = (staged + unstaged + untracked) > 0
     classes, primary = _classify(
@@ -672,10 +857,14 @@ def _probe(repo: str, clock: _ProbeClock) -> GitRepoRecord:
         ahead=ahead,
         behind=behind,
         stash_count=stash_count,
+        stash_newest=stash_newest,
+        stash_oldest=stash_oldest,
         staged=staged,
         unstaged=unstaged,
         untracked=untracked,
         mid_op=mid_op,
+        unpushed_branches=unpushed_branches,
+        branch_scan_note=branch_scan_note,
         bare=bare,
         error=None,
     )

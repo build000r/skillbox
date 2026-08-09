@@ -24,6 +24,18 @@ Within a band, unregistered rows outrank registered ones (dirty+unregistered
 is work that exists nowhere in the estate model -- the highest-loss-risk
 object in the estate), then rows sort by path.
 
+Enrichment surfacing (no new bands, no new columns)
+---------------------------------------------------
+Stash ages render as relative ages computed against ``generated_at``: the cwd
+detail says ``stash: 2 (newest 3d, oldest 40d)`` and stash-only band rows get
+an inline ``[stash newest .., oldest ..]`` marker. Unpushed non-HEAD branches
+render as an inline ``[+N unpushed branches]`` row marker plus a
+``git -C .. branch -vv`` fix line naming each branch; a clean row carrying
+them stays visible instead of folding (the silent-loss class hides behind a
+clean HEAD) and joins the next_actions footer without joining the issue band
+counts. JSON carries the raw fields (``stash_newest``/``stash_oldest``,
+``unpushed_branches``, ``branch_scan_note``) untransformed.
+
 Registry join (ignore rules + registration states)
 --------------------------------------------------
 Never reimplemented: ``skillbox-config/scripts/registry_doctor.py`` is loaded
@@ -256,6 +268,15 @@ def fix_commands(
         fixes.append(f"git -C {path} add -p && git -C {path} commit")
     if record.stash_count >= 1:
         fixes.append(f"git -C {path} stash list  # git-stash-janitor pass")
+    if record.unpushed_branches:
+        count = len(record.unpushed_branches)
+        noun = "branch" if count == 1 else "branches"
+        listing = ", ".join(
+            f"{name}(+{ahead})" for name, ahead in record.unpushed_branches
+        )
+        fixes.append(
+            f"git -C {path} branch -vv  # {count} unpushed {noun}: {listing}"
+        )
     if "no-remote" in record.classes:
         fixes.append("add a remote or register intent")
     if registration == "unregistered":
@@ -836,7 +857,41 @@ def _paint(text: str, band: str, color: bool) -> str:
     return f"{_BAND_COLORS.get(band, '')}{text}{_ANSI_RESET}"
 
 
-def _cwd_detail_lines(cwd_repo: dict[str, Any], color: bool) -> list[str]:
+def _relative_age(timestamp: str | None, now: str | None) -> str | None:
+    """Coarse age (``3d`` / ``5h`` / ``<1h``) of ``timestamp`` vs ``now``.
+
+    Both are ISO8601 strings (the envelope's ``generated_at`` style, which
+    the stash timestamps share). ``None`` on any parse problem so callers
+    degrade to their age-free line instead of crashing the render.
+    """
+    if not timestamp or not now:
+        return None
+    try:
+        seconds = (
+            datetime.fromisoformat(now) - datetime.fromisoformat(timestamp)
+        ).total_seconds()
+    except (ValueError, TypeError):  # unparseable, or naive/aware mix
+        return None
+    seconds = max(0.0, seconds)
+    days = int(seconds // 86400)
+    if days >= 1:
+        return f"{days}d"
+    hours = int(seconds // 3600)
+    if hours >= 1:
+        return f"{hours}h"
+    return "<1h"
+
+
+def _unpushed_listing(row: dict[str, Any]) -> str:
+    return ", ".join(
+        f"{entry['name']} (+{entry['ahead']})"
+        for entry in row.get("unpushed_branches") or []
+    )
+
+
+def _cwd_detail_lines(
+    cwd_repo: dict[str, Any], color: bool, now: str | None = None
+) -> list[str]:
     band = str(cwd_repo.get("risk_band", "clean"))
     lines = [f"cwd repo: {cwd_repo.get('path')} [{_paint(band, band, color)}]"]
     if cwd_repo.get("error"):
@@ -852,7 +907,16 @@ def _cwd_detail_lines(cwd_repo: dict[str, Any], color: bool) -> list[str]:
         f"{cwd_repo.get('unstaged', 0)} unstaged, "
         f"{cwd_repo.get('untracked', 0)} untracked"
     )
-    lines.append(f"  stash: {cwd_repo.get('stash_count', 0)}")
+    stash_line = f"  stash: {cwd_repo.get('stash_count', 0)}"
+    newest = _relative_age(cwd_repo.get("stash_newest"), now)
+    oldest = _relative_age(cwd_repo.get("stash_oldest"), now)
+    if newest and oldest:
+        stash_line += f" (newest {newest}, oldest {oldest})"
+    lines.append(stash_line)
+    if cwd_repo.get("unpushed_branches"):
+        lines.append(f"  unpushed branches: {_unpushed_listing(cwd_repo)}")
+    if cwd_repo.get("branch_scan_note"):
+        lines.append(f"  note: {cwd_repo['branch_scan_note']}")
     if cwd_repo.get("mid_op"):
         lines.append(f"  mid-op: {cwd_repo['mid_op']} in flight")
     if cwd_repo.get("origin_state") in LIVE_DRIFT_STATES:
@@ -862,7 +926,9 @@ def _cwd_detail_lines(cwd_repo: dict[str, Any], color: bool) -> list[str]:
     return lines
 
 
-def _table_lines(rows: list[dict[str, Any]], color: bool) -> list[str]:
+def _table_lines(
+    rows: list[dict[str, Any]], color: bool, now: str | None = None
+) -> list[str]:
     if not rows:
         return []
     band_w = max(len("BAND"), *(len(str(r["risk_band"])) for r in rows))
@@ -882,6 +948,20 @@ def _table_lines(rows: list[dict[str, Any]], color: bool) -> list[str]:
         # --live origin drift is a marker too (absent without --live).
         if row.get("origin_state") in LIVE_DRIFT_STATES:
             marker += f"  [{row['origin_state']}]"
+        # Unpushed non-HEAD branches: the silent-loss class. A marker, not a
+        # column -- table widths stay unchanged; the fix line names branches.
+        unpushed = row.get("unpushed_branches") or []
+        if unpushed:
+            noun = "branch" if len(unpushed) == 1 else "branches"
+            marker += f"  [+{len(unpushed)} unpushed {noun}]"
+        # Stash age matters most where the stash IS the story (stash-only
+        # band); elsewhere the band's own signal leads and the cwd detail /
+        # JSON fields carry the ages.
+        if band == "stash-only":
+            newest = _relative_age(row.get("stash_newest"), now)
+            oldest = _relative_age(row.get("stash_oldest"), now)
+            if newest and oldest:
+                marker += f"  [stash newest {newest}, oldest {oldest}]"
         lines.append(
             f"  {_paint(f'{band:{band_w}s}', band, color)}  "
             f"{ab:>5s}  {counts:>7s}  "
@@ -895,10 +975,11 @@ def report_text_lines(report: dict[str, Any], *, color: bool = False) -> list[st
     """Human view: cwd detail first, risk-sorted rollup with clean repos
     folded to one count line, then the issues:/next_actions: footer."""
     lines = ["sbp git — read-only estate git status (counts vs last-fetched upstream)", ""]
+    now = report.get("generated_at")
 
     cwd_repo = report.get("cwd_repo")
     if cwd_repo:
-        lines.extend(_cwd_detail_lines(cwd_repo, color))
+        lines.extend(_cwd_detail_lines(cwd_repo, color, now))
         lines.append("")
 
     rows = list(report.get("repos") or [])
@@ -926,8 +1007,9 @@ def report_text_lines(report: dict[str, Any], *, color: bool = False) -> list[st
         )
 
     # Clean rows collapse to one count line unless clean-current was asked
-    # for -- except a locally-clean row whose live origin has newer commits:
-    # under --live that IS the news, so it stays visible.
+    # for -- except a locally-clean row whose live origin has newer commits
+    # or that carries unpushed non-HEAD branches: that IS the news (the
+    # silent-loss class hides behind a clean HEAD), so it stays visible.
     show_clean = "clean-current" in filters
     visible = [
         r
@@ -935,11 +1017,12 @@ def report_text_lines(report: dict[str, Any], *, color: bool = False) -> list[st
         if show_clean
         or r["risk_band"] != "clean"
         or r.get("origin_state") in LIVE_DRIFT_STATES
+        or r.get("unpushed_branches")
     ]
     clean_hidden = len(rows) - len(visible)
     if visible:
         lines.append("")
-        lines.extend(_table_lines(visible, color))
+        lines.extend(_table_lines(visible, color, now))
     if clean_hidden:
         lines.append(
             f"  {clean_hidden} clean-current repos (rows folded; "
@@ -958,16 +1041,23 @@ def report_text_lines(report: dict[str, Any], *, color: bool = False) -> list[st
         for stale in stale_rows:
             lines.append(f"  - {stale['path']}  -> {stale['fix'][0]}")
 
-    issue_rows = [r for r in rows if r["risk_band"] != "clean"]
+    # Clean rows with unpushed branches carry a real next_action (the branch
+    # listing) without being an issue band, so they join the footer's action
+    # rows but never the band counts.
+    issue_rows = [
+        r for r in rows if r["risk_band"] != "clean" or r.get("unpushed_branches")
+    ]
     if issue_rows:
         counts: dict[str, int] = {}
         for row in issue_rows:
-            counts[row["risk_band"]] = counts.get(row["risk_band"], 0) + 1
+            if row["risk_band"] != "clean":
+                counts[row["risk_band"]] = counts.get(row["risk_band"], 0) + 1
         lines.append("")
-        lines.append("issues:")
-        for band in RISK_BAND_NAMES:
-            if band in counts:
-                lines.append(f"  - {band}: {counts[band]}")
+        if counts:
+            lines.append("issues:")
+            for band in RISK_BAND_NAMES:
+                if band in counts:
+                    lines.append(f"  - {band}: {counts[band]}")
         lines.append("next_actions:")
         for row in issue_rows[:_NEXT_ACTION_ROW_CAP]:
             for fix in row["fix"]:
