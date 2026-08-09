@@ -36,6 +36,7 @@ subprocesses, so it never re-implements a gate that already exists.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
@@ -347,6 +348,69 @@ def _run_skill_drift(ctx: DoctorContext) -> tuple[str, str]:
     return STATUS_PASS, note
 
 
+def _repo_atlas_engine_path() -> Path:
+    """Resolve the private Repo Atlas engine the same way the sbp wrapper does."""
+    override = str(os.environ.get("SKILLBOX_REPO_ATLAS_CLI") or "").strip()
+    if override:
+        return Path(os.path.expandvars(os.path.expanduser(override)))
+    root = str(os.environ.get("SKILLBOX_MONOSERVER_ROOT") or "").strip()
+    base = Path(os.path.expandvars(os.path.expanduser(root))) if root else Path.home() / "repos"
+    return base / "skills-private" / "reconcile" / "scripts" / "repo_atlas_cli.py"
+
+
+# The probe is a single-repo read; the wrapper's own capability preflight is
+# capped at 10s, so 15s covers preflight + one local status collection.
+REPO_ATLAS_PROBE_TIMEOUT_S = 15.0
+
+
+def _run_repo_atlas_front_door(ctx: DoctorContext) -> tuple[str, str]:
+    """STRUCTURE gate: the `sbp repo` (Repo Atlas) front door must not fail silently.
+
+    The atlas engine once shipped with no production dependency wiring, so every
+    real command exited 2 with an EMPTY usage-or-config envelope while ``--help``
+    and ``capabilities`` kept working — invisible until a human ran it (bead
+    skillbox-sbp-repo-atlas-repair-2gbo). This gate probes the real front door
+    with a well-formed read-only invocation, for which usage-or-config is never
+    a legitimate answer.
+
+    INCO when the wrapper or the engine checkout is absent on this box (verdict
+    unknowable); FAIL on exit 2 or non-JSON ``--json`` output; PASS on exit
+    0/1/3 with a JSON envelope — drift and reachability verdicts are live
+    front-door answers, not front-door failures.
+    """
+    wrapper = ctx.runtime_root / "scripts" / "sbp"
+    if not wrapper.is_file():
+        return STATUS_INCO, f"no sbp wrapper at {wrapper}"
+    engine = _repo_atlas_engine_path()
+    if not engine.is_file():
+        return STATUS_INCO, "Repo Atlas engine not present on this box (skills-private checkout absent)"
+    try:
+        proc = subprocess.run(
+            [str(wrapper), "repo", "status", ".", "--json"],
+            cwd=str(ctx.runtime_root),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=REPO_ATLAS_PROBE_TIMEOUT_S,
+        )
+    except FileNotFoundError:
+        return STATUS_INCO, "unable to execute the sbp wrapper"
+    except subprocess.TimeoutExpired:
+        return STATUS_INCO, f"repo atlas probe exceeded {REPO_ATLAS_PROBE_TIMEOUT_S:.0f}s"
+    if proc.returncode == 2:
+        tail = _last_meaningful_line((proc.stderr or "") + "\n" + (proc.stdout or ""))
+        return STATUS_FAIL, f"usage-or-config for a well-formed probe: {tail or 'empty output'}"
+    try:
+        json.loads(proc.stdout)
+    except ValueError:
+        return (
+            STATUS_FAIL,
+            f"non-JSON --json output (exit={proc.returncode}): "
+            f"{_last_meaningful_line(proc.stdout) or 'empty stdout'}",
+        )
+    return STATUS_PASS, f"front door live (exit={proc.returncode})"
+
+
 def _run_runtime_doctor(ctx: DoctorContext) -> tuple[str, str]:
     """RUNTIME gate: invoke the existing runtime `make doctor`, don't duplicate it.
 
@@ -478,6 +542,17 @@ def _gate_specs() -> tuple[_GateSpec, ...]:
             cap_s=CAP_FAST_LINT,
             fix_command="sbp recalibrate  # review skill add/remove for this cwd",
             runner=_run_skill_drift,
+        ),
+        _GateSpec(
+            name="repo_atlas_front_door",
+            kind=KIND_STRUCTURE,
+            cap_s=CAP_FAST_LINT,
+            fix_command=(
+                "sbp repo status . --json  # inspect; engine wiring lives in "
+                "skills-private/reconcile/scripts/repo_atlas_cli.py "
+                "(bead skillbox-sbp-repo-atlas-repair-2gbo)"
+            ),
+            runner=_run_repo_atlas_front_door,
         ),
         _GateSpec(
             name="runtime_doctor",

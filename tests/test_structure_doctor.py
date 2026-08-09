@@ -17,7 +17,9 @@ estate (which may legitimately have real structural drift).
 from __future__ import annotations
 
 import json
+import os
 import sys
+import tempfile
 import time
 import unittest
 from contextlib import redirect_stdout
@@ -296,6 +298,82 @@ class RuntimeGateReachabilityTests(unittest.TestCase):
         with mock.patch.object(SD.subprocess, "run", return_value=fake):
             status, _ = SD._run_runtime_doctor(ctx)
         self.assertEqual(status, STATUS_PASS)
+
+
+class RepoAtlasFrontDoorGateTests(unittest.TestCase):
+    """`sbp repo` must never fail silently: exit 2 on a well-formed probe is FAIL.
+
+    Absence of the wrapper or of the private engine checkout is INCO (verdict
+    unknowable on this box), and live verdict exits (0/1/3) are PASS — drift is
+    reconcile's business, not the front door gate's.
+    """
+
+    def _engine_env(self, engine_path: str):
+        return mock.patch.dict(os.environ, {"SKILLBOX_REPO_ATLAS_CLI": engine_path})
+
+    def test_missing_wrapper_is_inco(self):
+        ctx = DoctorContext(
+            runtime_root=Path("/nonexistent-xyz"), config_root=None, cwd=ROOT_DIR
+        )
+        status, detail = SD._run_repo_atlas_front_door(ctx)
+        self.assertEqual(status, STATUS_INCO)
+        self.assertIn("sbp wrapper", detail)
+
+    def test_missing_engine_is_inco(self):
+        with self._engine_env("/nonexistent-engine/repo_atlas_cli.py"):
+            status, detail = SD._run_repo_atlas_front_door(_stub_context())
+        self.assertEqual(status, STATUS_INCO)
+        self.assertIn("engine not present", detail)
+
+    def test_usage_or_config_exit_is_fail(self):
+        fake = mock.Mock(
+            returncode=2,
+            stdout="",
+            stderr="sbp repo: private Repo Atlas engine unavailable or incompatible\n",
+        )
+        with tempfile.NamedTemporaryFile(suffix=".py") as engine:
+            with self._engine_env(engine.name):
+                with mock.patch.object(SD.subprocess, "run", return_value=fake):
+                    status, detail = SD._run_repo_atlas_front_door(_stub_context())
+        self.assertEqual(status, STATUS_FAIL)
+        self.assertIn("usage-or-config", detail)
+        self.assertIn("unavailable or incompatible", detail)
+
+    def test_non_json_probe_output_is_fail(self):
+        fake = mock.Mock(returncode=0, stdout="not-json\n", stderr="")
+        with tempfile.NamedTemporaryFile(suffix=".py") as engine:
+            with self._engine_env(engine.name):
+                with mock.patch.object(SD.subprocess, "run", return_value=fake):
+                    status, detail = SD._run_repo_atlas_front_door(_stub_context())
+        self.assertEqual(status, STATUS_FAIL)
+        self.assertIn("non-JSON", detail)
+
+    def test_live_verdict_exits_pass(self):
+        envelope = json.dumps({"schema_version": "repo-atlas-command/v1", "exit_code": 0})
+        for exit_code in (0, 1, 3):
+            fake = mock.Mock(returncode=exit_code, stdout=envelope, stderr="")
+            with tempfile.NamedTemporaryFile(suffix=".py") as engine:
+                with self._engine_env(engine.name):
+                    with mock.patch.object(SD.subprocess, "run", return_value=fake):
+                        status, detail = SD._run_repo_atlas_front_door(_stub_context())
+            self.assertEqual(status, STATUS_PASS, f"exit {exit_code} must PASS: {detail}")
+            self.assertIn(f"exit={exit_code}", detail)
+
+    def test_probe_timeout_is_inco(self):
+        timeout = SD.subprocess.TimeoutExpired(cmd="sbp repo", timeout=15)
+        with tempfile.NamedTemporaryFile(suffix=".py") as engine:
+            with self._engine_env(engine.name):
+                with mock.patch.object(SD.subprocess, "run", side_effect=timeout):
+                    status, detail = SD._run_repo_atlas_front_door(_stub_context())
+        self.assertEqual(status, STATUS_INCO)
+        self.assertIn("exceeded", detail)
+
+    def test_gate_is_registered_as_structure(self):
+        specs = {s.name: s for s in SD._gate_specs()}
+        self.assertIn("repo_atlas_front_door", specs)
+        spec = specs["repo_atlas_front_door"]
+        self.assertEqual(spec.kind, KIND_STRUCTURE)
+        self.assertIn("sbp repo status . --json", spec.fix_command)
 
 
 class StructureInvariantGateTests(unittest.TestCase):
