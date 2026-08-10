@@ -1,0 +1,360 @@
+<!-- mmdx
+{
+  "entry": "main",
+  "links": [
+    {"from":"main","label":"Startup / identity","to":"startup-identity","title":"Startup and identity sequence"},
+    {"from":"main","label":"DSR flow","to":"dsr-inheritance","title":"DSR inheritance, audit, and review"},
+    {"from":"main","label":"Staging release","to":"staging-deployment","title":"Exact-artifact staging and promotion"},
+    {"from":"main","label":"Legend / status","to":"authority-legend","title":"Authority and trust legend"},
+    {"from":"startup-identity","label":"Overall topology","to":"main","title":"Back to overall topology"},
+    {"from":"dsr-inheritance","label":"Overall topology","to":"main","title":"Back to overall topology"},
+    {"from":"staging-deployment","label":"Overall topology","to":"main","title":"Back to overall topology"},
+    {"from":"authority-legend","label":"Overall topology","to":"main","title":"Back to overall topology"}
+  ]
+}
+-->
+
+## chart main A. Staging Amp Orb and Runner Topology
+```mermaid
+flowchart TB
+  subgraph CP["AMP CONTROL PLANE — structural routing authority"]
+    projects["Project definitions<br/>repo route + project UUID + environment resource"]
+    thread["Thread/task identity<br/>T-* is work identity, not machine identity"]
+    oidc["Short-lived Amp workload JWT / OIDC<br/>authentication, not authority by itself"]
+    admission["CURRENT LIMIT<br/>external project OIDC policies reported unverified"]
+  end
+
+  subgraph GIT["CANONICAL GIT SOURCES — reviewed durable authority"]
+    skillbox["Skillbox integration/control repo<br/>runtime + SBP + setup/resume + policy"]
+    skills["Existing skill catalog<br/>sources + refs + picks"]
+    dsr["DSR canonical registry repo<br/>shards + schemas + audit runtime"]
+    sweet["Sweet Potato application/integration repo<br/>service/auth/release contracts"]
+    consumer["Consumer application/design repos<br/>tokens + assets + components + adapters"]
+    review["Proposal / job branch / PR admission<br/>no automatic merge or canonical mutation"]
+  end
+
+  subgraph ORBS["DISPOSABLE PROJECT ORBS — fresh checkout + local caches"]
+    so["Skillbox project Orb"]
+    do["DSR project Orb"]
+    wo["Sweet Potato project Orb"]
+    co["Consumer project Orb<br/>cold DSR binding UNPROVEN"]
+    sbp["Project-local sbp / thin client"]
+    select["Skill selection<br/>picks + generated locks + floor policy<br/>repo-local overrides"]
+    projection["Project projections<br/>.claude + .codex implemented<br/>.agents target PROVISIONAL here"]
+    mmdxLocal["Baseline MMDX local render<br/>selected mmdx source + local parser/viewer<br/>no remote request or credential needed"]
+    evidence["Sanitized local evidence<br/>status + hashes + expiry/class<br/>never secret values"]
+  end
+
+  subgraph STAGE["PERSISTENT NON-PRODUCTION / STAGING ROLES — outlive Orbs"]
+    runners["Owned runner candidates<br/>host + runner-id + fixed workdir<br/>specification-only; disabled/uninstalled"]
+    sbpd["sbpd on registered Skillbox host<br/>read-only GET + verified skill bundles<br/>project-claim hardening UNPROVEN"]
+    spapsMmdx["Universal SPAPS MMDX publish surface<br/>POST /api/v1/app-links<br/>create-owned-link only; no PATCH/admin/deploy"]
+    sweetStage["Sweet Potato staging service role<br/>authenticated API or bounded task<br/>no canonical staging hostname; live proof UNPROVEN"]
+    target["Application staging target role<br/>overlay owns endpoint, health, artifact,<br/>receipt, and rollback contract"]
+    receipts["Durable sanitized receipts<br/>source SHA + artifact digest + health/state<br/>previous release + rollback metadata"]
+  end
+
+  subgraph PROD["PRODUCTION — OUT OF STAGING SCOPE"]
+    sweetProd["sweet-potato-prod<br/>runner exclusion / DO-NOT-ENABLE"]
+    promote["Separate production admission<br/>UNIMPLEMENTED / unexercised"]
+    prodSecrets["Production/provider/admin credentials<br/>never ordinary Orb inputs"]
+  end
+
+  projects -->|"[RO] project checkout"| so
+  projects -->|"[RO] project checkout"| do
+  projects -->|"[RO] project checkout"| wo
+  projects -->|"[RO] project checkout"| co
+  thread --> so
+  admission -.-> projects
+  oidc -.->|"PROVISIONAL relying-party auth"| sbpd
+  oidc -.->|"PROVISIONAL Tailnet federation"| runners
+
+  skillbox -->|"Git checkout"| so
+  dsr -->|"Git checkout"| do
+  sweet -->|"Git checkout"| wo
+  consumer -->|"Git checkout"| co
+  skills -->|"selected source"| select
+  skillbox -->|"picks / overlay / policy"| select
+  select -->|"deliberate local projection"| projection
+  projection --> so
+  projection --> do
+  projection --> wo
+  projection --> co
+  so --> mmdxLocal
+  do --> mmdxLocal
+  wo --> mmdxLocal
+  co --> mmdxLocal
+  mmdxLocal ==>|"explicit publish only<br/>URL + publishable key + short-lived user bearer"| spapsMmdx
+  spapsMmdx -->|"owned short link / publication result"| mmdxLocal
+  so --> sbp --> projection
+  sbp -.->|"[RO] SBP_REMOTE + short-lived bearer"| sbpd
+  sbpd -->|"skill source + content/receipt hash"| sbp
+
+  projects -.->|"PROVISIONAL named-runner placement"| runners
+  co -.->|"[RO/TASK] service credential"| sweetStage
+  wo -.->|"[RO/TASK] service credential"| sweetStage
+  sweetStage -->|"bounded result / asset descriptor"| co
+  co -.->|"app deploy grant only"| target
+  runners -.-> target
+
+  dsr -->|"immutable snapshot/provenance contract"| co
+  consumer -->|"design tokens/assets/components"| co
+  co -->|"audit findings / proposal"| review
+  do -->|"DSR evidence / proposal"| review
+  so -->|"integration proposal"| review
+  wo -->|"application proposal"| review
+  review ==>|"reviewed mutation"| skillbox
+  review ==>|"DSR admission only"| dsr
+  review ==>|"app review only"| sweet
+  review ==>|"project review only"| consumer
+
+  so --> evidence
+  do --> evidence
+  wo --> evidence
+  co --> evidence
+  target --> receipts -->|"sanitized feedback"| review
+  target -.->|"same artifact candidate; no implicit promotion"| promote
+  promote -.-> sweetProd
+  prodSecrets -.->|"FORBIDDEN"| co
+  prodSecrets -.->|"FORBIDDEN"| evidence
+  spapsMmdx -.->|"FORBIDDEN authority expansion"| prodSecrets
+
+  class projects,thread,skillbox,skills,dsr,sweet,consumer,review auth
+  class so,do,wo,co,sbp,mmdxLocal runtime
+  class select,projection cache
+  class runners,sbpd,spapsMmdx,sweetStage,target,receipts staging
+  class oidc identity
+  class evidence artifact
+  class admission provisional
+  class sweetProd,promote,prodSecrets forbidden
+  classDef auth fill:#dbeafe,stroke:#1d4ed8,stroke-width:2px,color:#172554
+  classDef runtime fill:#dcfce7,stroke:#15803d,stroke-width:2px,color:#052e16
+  classDef staging fill:#fef3c7,stroke:#b45309,stroke-width:2px,color:#451a03
+  classDef identity fill:#ede9fe,stroke:#7c3aed,stroke-width:2px,color:#2e1065
+  classDef cache fill:#f1f5f9,stroke:#64748b,color:#0f172a
+  classDef artifact fill:#cffafe,stroke:#0e7490,stroke-width:2px,color:#083344
+  classDef provisional fill:#fff7ed,stroke:#ea580c,stroke-width:2px,stroke-dasharray:5 5,color:#431407
+  classDef forbidden fill:#fee2e2,stroke:#b91c1c,stroke-width:3px,color:#450a0a
+```
+
+## chart startup-identity B. Fresh Orb Startup and Identity
+```mermaid
+sequenceDiagram
+  autonumber
+  participant CP as Amp project/control plane
+  participant O as Fresh disposable project Orb
+  participant G as Canonical Git repo
+  participant S as Project-local SBP/thin client
+  participant I as Workload identity issuer
+  participant T as Optional Tailnet relying party
+  participant D as Registered sbpd
+  participant P as SPAPS app-link API
+  participant W as Sweet Potato service role
+  participant E as Evidence/proposal path
+
+  CP->>O: Create checkout for registered repository route
+  Note over CP,O: Registration is not execution authority, external OIDC route admission is unverified
+  O->>G: Read task branch/ref
+  G-->>O: Source + setup/resume + project policy
+  O->>O: Local setup, focused validation, sanitized status
+  O->>S: Resolve source, picks, overlay, lock, floor policy
+  S-->>O: Local links / verified current-session skill packet
+  Note over O,S: Claude/Codex roots work here, Amp third root remains provisional
+  O->>O: Resolve and render MMDX locally
+  O->>O: Presence-check URL, publishable key, and short-lived user bearer
+  Note over O,P: Setup makes no SPAPS request and emits configured booleans only
+  opt User explicitly publishes MMDX
+    O->>P: POST /api/v1/app-links with application key + ordinary-user bearer
+    P-->>O: User-owned app-link result
+    Note over O,P: Create only, no PATCH, admin, deployment, provider, or production authority
+  end
+  opt Authenticated read-only sbpd is configured
+    O->>I: Mint short-lived audience-bound JWT
+    I-->>O: Private temporary token handling
+    opt Optional Tailnet path
+      O->>T: Federate identity for ephemeral least-privilege route
+      T-->>O: Private transport only
+    end
+    O->>D: GET Cass/status/search or skill bundle
+    D-->>O: Read-only result + content hash
+    Note over O,D: JWT verification exists, workspace/project/token_use authorization is a hardening gate
+  end
+  opt Sweet Potato task is explicitly configured
+    O->>W: Authenticated application/service request or bounded task
+    W-->>O: Scoped result / asset descriptor
+    Note over O,W: No local Sweet Potato stack, service authority is not deploy/admin authority
+  end
+  O->>E: Status, hashes, expiry/class, findings, proposed diff
+  Note over O,E: No raw JWTs, keys, tokens, headers, private paths, or secret values
+  E-->>G: Job-branch proposal only with explicit Git write authority
+  Note over E,G: Read != proposal write != protected merge/tag/release
+```
+
+## chart dsr-inheritance C. DSR Inheritance, Audit, and Review
+```mermaid
+flowchart LR
+  subgraph DA["DSR-OWNED AUTHORITY"]
+    shards["registry.d index + item shards"]
+    schemas["consumer + snapshot + lock + proof schemas"]
+    audit["Canonical usage-audit skill<br/>audit alias delegates; no invented DSR CLI"]
+    snapshotContract["Immutable snapshot/provenance contract<br/>exact source commit + closure + hashes"]
+    approved["Approved live immutable snapshot<br/>NOT checked in / stable pointer absent<br/>synthetic fixture is not release truth"]
+    dsrReview["DSR review/admission"]
+  end
+  subgraph OW["DISPOSABLE ORB WORK"]
+    dsrOrb["DSR project Orb"]
+    consumerOrb["Consumer project Orb"]
+    findings["Multidimensional findings<br/>hashes + blockers + evidence"]
+  end
+  subgraph PA["PROJECT-OWNED DESIGN STATE"]
+    manifest["design-system.registry.json<br/>consumer declaration"]
+    lock["Consumer lock role<br/>exact closure + file hashes<br/>current/prior snapshot"]
+    design["Product visuals + tokens + assets<br/>components + thin adapters"]
+    proof["Consumer build/visual/native proof"]
+    projectReview["Consumer PR review"]
+  end
+
+  shards --> schemas --> snapshotContract
+  shards --> snapshotContract
+  snapshotContract -.->|"PROVISIONAL until approved pointer exists"| approved
+  audit --> dsrOrb
+  audit --> consumerOrb
+  approved -.->|"deliberate verified pin/materialization"| lock
+  manifest -->|"roots + exact versions + drift policy"| lock
+  lock --> design --> proof --> consumerOrb
+  manifest --> consumerOrb
+  consumerOrb --> findings
+  findings -->|"project-owned fix"| projectReview
+  projectReview ==>|"project review only"| manifest
+  projectReview ==>|"project review only"| design
+  findings -->|"DSR gap/evidence/proposal"| dsrReview
+  dsrOrb -->|"validated DSR proposal"| dsrReview
+  dsrReview ==>|"DSR admission only"| shards
+  consumerOrb -.->|"FORBIDDEN automatic mutation"| shards
+  approved -.->|"rollback identity"| lock
+
+  class shards,schemas,audit,snapshotContract,dsrReview auth
+  class manifest,lock,design,proof,projectReview project
+  class dsrOrb,consumerOrb runtime
+  class findings artifact
+  class approved provisional
+  classDef auth fill:#dbeafe,stroke:#1d4ed8,stroke-width:2px,color:#172554
+  classDef project fill:#dcfce7,stroke:#15803d,stroke-width:2px,color:#052e16
+  classDef runtime fill:#f1f5f9,stroke:#64748b,stroke-width:2px,color:#0f172a
+  classDef artifact fill:#cffafe,stroke:#0e7490,stroke-width:2px,color:#083344
+  classDef provisional fill:#fff7ed,stroke:#ea580c,stroke-width:2px,stroke-dasharray:5 5,color:#431407
+```
+
+## chart staging-deployment D. Exact-Artifact Staging and Promotion Boundary
+```mermaid
+flowchart TB
+  subgraph SOURCE["SOURCE + METHOD AUTHORITY"]
+    ref["Application repo<br/>approved ref → full immutable SHA"]
+    method["SBP-selected deploy method<br/>generic standard; not picked by default"]
+    overlay["Application deployment overlay<br/>target + gate + transport + credential probe<br/>health/state + receipt + rollback"]
+  end
+  subgraph LANE["TRUSTED STAGING RELEASE LANE — persistent role"]
+    preflight["Clean worktree + canonical gate<br/>destination identity + capacity + rollback artifact"]
+    creds["Deployment-only credentials<br/>provider/registry/SSH lane only<br/>Cloudflare names are generic examples"]
+    build["Build exactly once<br/>bind full SHA to checksum/digest/build ID"]
+    artifact["Immutable artifact<br/>archive / image digest / static build / package"]
+    activate["Authenticated staging transport<br/>activate without rebuild"]
+    stage["Staging endpoint/host ROLE<br/>no canonical hostname declared"]
+    verify["Behavior + state proof<br/>health/smoke + deployed identity<br/>negative authority probes"]
+    receipt["Sanitized durable receipt<br/>artifact + config fingerprint + prior release"]
+    rollback["Retained prior artifact/config<br/>schema or backup/restore classification"]
+  end
+  subgraph FEEDBACK["REVIEW / FEEDBACK"]
+    proposal["Findings / proposal / PR"]
+    decision["Human application admission<br/>accept, fix, rollback, or reject"]
+  end
+  subgraph PROD["PRODUCTION — SEPARATE, OUT OF SCOPE"]
+    promotion["Same-artifact promotion boundary<br/>separate approval + credentials<br/>UNIMPLEMENTED / unproven"]
+    prod["Production target role"]
+    prodReceipt["Production proof + rollback history"]
+  end
+
+  ref --> preflight
+  method --> preflight
+  overlay --> preflight
+  creds --> preflight
+  preflight --> build --> artifact
+  artifact ==>|"STAGING MUTATION"| activate --> stage --> verify --> receipt
+  receipt --> proposal --> decision
+  decision -->|"fix"| ref
+  decision -->|"rollback staging"| rollback
+  rollback ==>|"activate prior / restore as classified"| activate
+  decision -.->|"PROVISIONAL"| promotion
+  artifact -.->|"same candidate artifact; never rebuild"| promotion
+  promotion -.-> prod -.-> prodReceipt
+  creds -.->|"FORBIDDEN"| receipt
+  creds -.->|"FORBIDDEN"| proposal
+  stage -.->|"service/task authority is not deploy/admin"| creds
+
+  class ref,method,overlay auth
+  class preflight,build,activate,stage,verify staging
+  class artifact,receipt,rollback artifactClass
+  class creds identity
+  class proposal,decision feedback
+  class promotion,prod,prodReceipt forbidden
+  classDef auth fill:#dbeafe,stroke:#1d4ed8,stroke-width:2px,color:#172554
+  classDef staging fill:#fef3c7,stroke:#b45309,stroke-width:2px,color:#451a03
+  classDef artifactClass fill:#cffafe,stroke:#0e7490,stroke-width:2px,color:#083344
+  classDef identity fill:#ede9fe,stroke:#7c3aed,stroke-width:2px,color:#2e1065
+  classDef feedback fill:#dcfce7,stroke:#15803d,stroke-width:2px,color:#052e16
+  classDef forbidden fill:#fee2e2,stroke:#b91c1c,stroke-width:3px,stroke-dasharray:5 5,color:#450a0a
+```
+
+## chart authority-legend E. Authority, Trust, and Current Status
+```mermaid
+flowchart TB
+  subgraph ARROWS["ARROWS"]
+    a["Source/service"] -->|"[RO] read / checkout / fetch"| b["Consumer/cache"]
+    c["Reviewed proposal"] ==>|"[MUTATION] admitted write/activation"| d["Owning authority"]
+    e["Declared role"] -.->|"PROVISIONAL / unimplemented / unproven"| f["Target role"]
+  end
+  subgraph TRUST["NON-EQUIVALENCES"]
+    t1["Registered project/machine/runner ≠ admitted execution authority"]
+    t2["Authenticated JWT/Tailnet/service credential ≠ broader authorization"]
+    t3["SPAPS MMDX create + Sweet Potato task authority ≠ deploy/admin authority"]
+    t4["Git read ≠ proposal write ≠ protected merge/tag/release"]
+    t5["DSR owns registry/schema/snapshot admission<br/>consumer owns product visuals/adapters/app state"]
+    t6["Repos/logs/prompts/caches/receipts contain no secret values"]
+  end
+  subgraph OPEN["PROVISIONAL / UNIMPLEMENTED"]
+    p1["Real SPAPS MMDX injection + Origin/policy + live publish proof"]
+    p2["Hardened sbpd project/token_use authorization"]
+    p3["OIDC Tailnet from fresh consumer Orb"]
+    p4["Cold consumer DSR bootstrap + approved snapshot binding"]
+    p5["Staging overlay/provider credentials + live endpoint"]
+    p6["Production promotion/rollback proof"]
+    p7["Enabled persistent non-production named runners"]
+    p8["Live authenticated non-MMDX Sweet Potato read proof"]
+  end
+  subgraph COLORS["COLORS"]
+    blue["Blue: authoritative source/decision"]
+    green["Green: runtime or project-owned state"]
+    amber["Amber: persistent staging role"]
+    purple["Purple: identity/credential boundary"]
+    gray["Gray: disposable cache/projection/Orb"]
+    cyan["Cyan: artifact/evidence/rollback metadata"]
+    orange["Orange dashed: provisional"]
+    red["Red: production/out-of-scope/forbidden"]
+  end
+  class p1,p2,p3,p4,p5,p6,p7,p8,e,f,orange provisional
+  class blue auth
+  class green runtime
+  class amber staging
+  class purple identity
+  class gray cache
+  class cyan artifact
+  class red forbidden
+  classDef auth fill:#dbeafe,stroke:#1d4ed8,stroke-width:2px,color:#172554
+  classDef runtime fill:#dcfce7,stroke:#15803d,stroke-width:2px,color:#052e16
+  classDef staging fill:#fef3c7,stroke:#b45309,stroke-width:2px,color:#451a03
+  classDef identity fill:#ede9fe,stroke:#7c3aed,stroke-width:2px,color:#2e1065
+  classDef cache fill:#f1f5f9,stroke:#64748b,color:#0f172a
+  classDef artifact fill:#cffafe,stroke:#0e7490,stroke-width:2px,color:#083344
+  classDef provisional fill:#fff7ed,stroke:#ea580c,stroke-width:2px,stroke-dasharray:5 5,color:#431407
+  classDef forbidden fill:#fee2e2,stroke:#b91c1c,stroke-width:3px,color:#450a0a
+```
