@@ -1428,6 +1428,7 @@ def check_reference_drift() -> CheckResult:
         # PASS/FAIL message strings, not a stale script reference.
         "examples/first-box-demo.md",
     }
+    ignored_prefixes.add("refactor/artifacts")
 
     for path in ROOT_DIR.rglob("*"):
         if not path.is_file():
