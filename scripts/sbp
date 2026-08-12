@@ -451,6 +451,9 @@ Usage:
   __WRAPPER__ doctor [--format json]  One front door for all STRUCTURAL gates
                               (INCO/FAIL/PASS); complements `make doctor`.
                               Exits nonzero on FAIL only.
+  __WRAPPER__ family health [--json|--family ID|--criteria]
+                              Read-only Amp family health contract
+  __WRAPPER__ family dashboard Print the family dashboard URL on port 6969
   __WRAPPER__ registry doctor [args...] Check registry/repos.yaml against local Git repos
   __WRAPPER__ repo [args...]           Read repository dossiers through private Repo Atlas
   __WRAPPER__ git [--only CLASS[,CLASS]] [--root PATH] [--depth N] [--cached] [--live] [--delta] [--json]
@@ -776,6 +779,7 @@ payload = {
         {"name": "skill-heal", "json": True, "safe_first_try": f"{wrapper} skill heal <skill> --dry-run --format json"},
         {"name": "candidates", "json": True, "safe_first_try": f"{wrapper} candidates --json"},
         {"name": "mcp", "json": True, "safe_first_try": f"{wrapper} mcp --json"},
+        {"name": "family", "json": True, "safe_first_try": f"{wrapper} family health --json", "notes": "Canonical read-only Amp family health contract; dashboard prints the port 6969 URL."},
         {"name": "registry", "json": True, "safe_first_try": f"{wrapper} registry doctor --json"},
         {"name": "repo", "json": True, "safe_first_try": f"{wrapper} repo status . --json"},
         {"name": "git", "json": True, "safe_first_try": f"{wrapper} git --json", "aliases": ["gs"], "notes": "Read-only estate git status viewer; never proxies mutating git subcommands."},
@@ -1029,6 +1033,10 @@ case "${1:-}" in
       exit 2
     fi
     ;;
+  family|families)
+    action="family"
+    shift
+    ;;
   registry|repos|repo-registry)
     action="repo-registry"
     shift
@@ -1170,7 +1178,7 @@ append_passthrough_token() {
           ;;
       esac
       ;;
-    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|mcp-sync|structure-doctor|git-status|repo-atlas|repo-registry|cass|cass-evidence|oracle|cron|send-later|safe|conference1|beads|mmdx|operator-booking|swimmers-launch|fleet)
+    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|mcp-sync|structure-doctor|family|git-status|repo-atlas|repo-registry|cass|cass-evidence|oracle|cron|send-later|safe|conference1|beads|mmdx|operator-booking|swimmers-launch|fleet)
       passthrough_args+=("${token}")
       ;;
     *)
@@ -1190,10 +1198,7 @@ append_json_flag() {
       ;;
     capabilities|robot-triage)
       ;;
-    repo-atlas)
-      passthrough_args+=(--json)
-      ;;
-    repo-registry|cass|oracle|cron|safe|send-later)
+    family|repo-atlas|repo-registry|cass|oracle|cron|safe|send-later)
       passthrough_args+=(--json)
       ;;
     *)
@@ -1740,6 +1745,15 @@ PY
         python3 "${repo_atlas_cli}" "${repo_atlas_args[@]}"
     )
     exit $?
+    ;;
+  family)
+    config_root="${SKILLBOX_CONFIG_ROOT:-${HOME}/repos/skillbox-config}"
+    family_health="${config_root}/scripts/amp_family_health.py"
+    if [[ ! -f "${family_health}" ]]; then
+      echo "${wrapper_name} family: missing helper at ${family_health}" >&2
+      exit 1
+    fi
+    python3 "${family_health}" "${passthrough_args[@]}"
     ;;
   repo-registry)
     config_root="${SKILLBOX_CONFIG_ROOT:-${HOME}/repos/skillbox-config}"
