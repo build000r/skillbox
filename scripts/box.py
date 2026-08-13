@@ -101,6 +101,7 @@ BOX_COMMAND_NAMES = {
     "import",
     "inventory-rebuild",
     "list",
+    "place",
     "profiles",
     "register",
     "robot-docs",
@@ -502,6 +503,7 @@ def _box_agent_command(name: str) -> dict[str, Any]:
         "import": "python3 scripts/box.py profiles --format json",
         "inventory-rebuild": "python3 scripts/box.py status <box-id> --history --format json",
         "list": "python3 scripts/box.py list --format json",
+        "place": "python3 scripts/box.py place --need os:linux --format json",
         "profiles": "python3 scripts/box.py profiles --format json",
         "register": "python3 scripts/box.py profiles --format json",
         "robot-docs": "python3 scripts/box.py robot-docs guide",
@@ -579,6 +581,7 @@ def box_capabilities_payload() -> dict[str, Any]:
                 "opt_in": "python3 scripts/box.py status --write-cache --format json updates cached last_ssh_target values",
             },
             "list": "does not write workspace/boxes.json",
+            "place": "does not write workspace/boxes.json; zero lifecycle side effects",
         },
         "mcp_equivalents": {
             "profiles": "operator_profiles",
@@ -5054,14 +5057,131 @@ def _teardown_pending_hint(box: Box) -> dict[str, Any] | None:
     return None
 
 
-def cmd_list(*, fmt: str) -> int:
+def _load_placement():
+    """Lazy runtime_manager import. Never runs at module import time."""
+    env_manager = str(REPO_ROOT / ".env-manager")
+    if env_manager not in sys.path:
+        sys.path.insert(0, env_manager)
+    from runtime_manager import machines as machines_mod
+    from runtime_manager import placement as placement_mod
+
+    return placement_mod, machines_mod
+
+
+def _place_envelope(decision: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(decision)
+    payload["ok"] = True
+    payload["kind"] = decision.get("kind")
+    payload["next_actions"] = list(decision.get("next_actions") or [])
+    return payload
+
+
+def render_place_text(decision: dict[str, Any]) -> str:
+    """Selected / checkmark reasons / Rejected lines, verbatim from decide()."""
+    lines: list[str] = []
+    machine_id = decision.get("machine_id")
+    if machine_id:
+        lines.append(f"Selected {machine_id}")
+    for reason in decision.get("reasons") or []:
+        lines.append(f"  ✓ {reason}")
+    for row in decision.get("rejected") or []:
+        rid = row.get("id")
+        reasons = list(row.get("reasons") or [])
+        extra = row.get("reason")
+        if extra and extra not in reasons:
+            reasons.append(extra)
+        for reason in reasons:
+            lines.append(f"Rejected: {rid} — {reason}")
+    for action in decision.get("next_actions") or []:
+        lines.append(str(action))
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _derive_machine_view_kind(row: dict[str, Any], box: Any) -> str:
+    caps = [str(token) for token in (row.get("caps") or [])]
+    darwin = any(token == "os:darwin" or token.startswith("os:darwin") for token in caps)
+    declared = "machines.yaml" in list(row.get("sources") or [])
+    trust = row.get("trust")
+    if declared and box is None:
+        if darwin or trust == "local":
+            return "physical"
+        return "persistent"
+    if declared:
+        return "physical" if darwin and box is None else "persistent"
+    mode = getattr(box, "management_mode", None) if box is not None else None
+    if mode == "external":
+        return "persistent"
+    return "ephemeral"
+
+
+def _collect_machine_view(
+    boxes: list[Any],
+    *,
+    machine: str | None = None,
+) -> list[dict[str, Any]]:
+    placement_mod, machines_mod = _load_placement()
+    config = machines_mod.load_machines_config()
+    rows = placement_mod.machine_view(config, boxes, list_profiles())
+    box_map = {box.id: box for box in boxes}
+    rendered: list[dict[str, Any]] = []
+    for row in rows:
+        if machine and row.get("id") != machine:
+            continue
+        item = dict(row)
+        item["kind"] = _derive_machine_view_kind(item, box_map.get(item.get("id")))
+        rendered.append(item)
+    return rendered
+
+
+def cmd_place(
+    *,
+    needs: list[str] | None,
+    need_trust: str | None = None,
+    allow_provision: bool = False,
+    allow_unverified: bool = False,
+    fmt: str = "text",
+) -> int:
+    placement_mod, machines_mod = _load_placement()
+    config = machines_mod.load_machines_config()
+    boxes = load_inventory()
+    current_id = config.detect_machine_id()
+    observations = placement_mod.gather_observations(current_id, boxes)
+    decision = placement_mod.decide(
+        {
+            "caps": list(needs or []),
+            "trust": need_trust,
+            "allow_provision": allow_provision,
+            "allow_unverified": allow_unverified,
+        },
+        config,
+        boxes,
+        observations,
+        list_profiles(),
+        current_id,
+    )
+    payload = _place_envelope(decision)
+    if fmt == "json":
+        emit_json(payload)
+    else:
+        print(render_place_text(decision), end="")
+    return EXIT_OK
+
+
+def cmd_list(*, fmt: str, machine: str | None = None) -> int:
     boxes = load_inventory()
     active = [b for b in boxes if b.state != "destroyed"]
+    if machine:
+        active = [b for b in active if b.id == machine]
     pending = [hint for hint in (_teardown_pending_hint(b) for b in active) if hint]
+    try:
+        machine_rows = _collect_machine_view(boxes, machine=machine)
+    except Exception:
+        machine_rows = []
 
     if fmt == "json":
         payload: dict[str, Any] = {
             "boxes": [asdict(b) for b in active],
+            "machine_view": machine_rows,
             "next_actions": ["box up <id> --profile <name>", "box register <id> --host <tailscale-hostname>"] if not active else [],
         }
         if pending:
@@ -5081,6 +5201,17 @@ def cmd_list(*, fmt: str) -> int:
                 )
             for hint in pending:
                 print(f"    ! {hint['box_id']} teardown pending ({hint['state']}); retry: {hint['next_action']}")
+        if machine_rows:
+            print("Machines:")
+            for row in machine_rows:
+                caps = ",".join(str(token) for token in (row.get("caps") or [])) or "n/a"
+                trust = row.get("trust") or "n/a"
+                box_state = row.get("box_state") or "n/a"
+                sources = ",".join(str(src) for src in (row.get("sources") or [])) or "n/a"
+                print(
+                    f"  {row.get('id')}  kind={row.get('kind')}  caps={caps}  "
+                    f"trust={trust}  box_state={box_state}  sources={sources}"
+                )
     return EXIT_OK
 
 
@@ -5306,9 +5437,30 @@ def build_parser() -> argparse.ArgumentParser:
     unregister_parser.add_argument("box_id", type=_validate_box_id, help="Box identifier.")
     unregister_parser.add_argument("--format", choices=("text", "json"), default="text")
 
-    subparsers.add_parser("list", help="List all active boxes.").add_argument(
-        "--format", choices=("text", "json"), default="text",
+    list_parser = subparsers.add_parser("list", help="List all active boxes and the machine union view.")
+    list_parser.add_argument("--format", choices=("text", "json"), default="text")
+    list_parser.add_argument("--machine", default=None, help="Filter the machine_view union to one id.")
+
+    place_parser = subparsers.add_parser(
+        "place",
+        help="Choose a machine for job needs without provisioning.",
     )
+    place_parser.add_argument(
+        "--need",
+        action="append",
+        default=[],
+        dest="needs",
+        help="Required capability token (repeatable).",
+    )
+    place_parser.add_argument(
+        "--need-trust",
+        default=None,
+        dest="need_trust",
+        help="Trust floor: local, allowlisted, or explicit.",
+    )
+    place_parser.add_argument("--allow-provision", action="store_true")
+    place_parser.add_argument("--allow-unverified", action="store_true")
+    place_parser.add_argument("--format", choices=("text", "json"), default="text")
 
     subparsers.add_parser("profiles", help="List available box profiles.").add_argument(
         "--format", choices=("text", "json"), default="text",
@@ -5431,7 +5583,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "unregister":
             return cmd_unregister(args.box_id, fmt=args.format)
         if args.command == "list":
-            return cmd_list(fmt=args.format)
+            return cmd_list(fmt=args.format, machine=getattr(args, "machine", None))
+        if args.command == "place":
+            return cmd_place(
+                needs=list(args.needs or []),
+                need_trust=args.need_trust,
+                allow_provision=args.allow_provision,
+                allow_unverified=args.allow_unverified,
+                fmt=args.format,
+            )
         if args.command == "profiles":
             return cmd_profiles(fmt=args.format)
     except InventoryCorruptError as exc:
