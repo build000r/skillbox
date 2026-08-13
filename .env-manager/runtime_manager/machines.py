@@ -4,8 +4,9 @@ Standalone loader for ``skillbox-config/machines.yaml``. It lets policy readers
 stop branching on ``socket.gethostname()`` and stop hard-coding root paths like
 ``/srv/skillbox/repos`` vs ``/Users/operator/repos`` all over the place.
 
-This module is intentionally **standalone**: it is NOT wired into policy
-evaluation or any existing code path yet. Consumers land in sibling beads.
+This module is the durable machine-identity store. Current-host detection and
+root translation live here. Placement decisions live in
+``runtime_manager.placement`` and consume the loaded profiles.
 
 Public API
 ----------
@@ -60,6 +61,11 @@ PRIVATE_CONFIG_DIR_NAME = "skillbox-config"
 
 SUPPORTED_CONFIG_VERSION = 1
 
+# Closed capability token set. ``os:*`` / ``arch:*`` prefixes are open-ended
+# within those families; every other token must be one of CLOSED_CAP_NAMES.
+CLOSED_CAP_NAMES = frozenset({"xcode", "docker", "gpu", "tailnet", "durable"})
+TRUST_VALUES = frozenset({"local", "allowlisted", "explicit"})
+
 
 class MachinesConfigError(RuntimeError):
     """Raised when machines.yaml is missing, unparseable, or malformed."""
@@ -85,6 +91,10 @@ class MachineProfile:
     ``repo_roots`` and ``projects_roots`` are ordered; the first entry is the
     *canonical* root for that category on this machine and is what root
     translation maps between machines.
+
+    ``caps`` is a closed token tuple (``os:*``, ``arch:*``, plus named tokens
+    in ``CLOSED_CAP_NAMES``). ``trust`` is stored, not derived:
+    ``local`` | ``allowlisted`` | ``explicit``, or ``None`` when omitted.
     """
 
     machine_id: str
@@ -93,6 +103,8 @@ class MachineProfile:
     managed_home: str | None = None
     repo_roots: tuple[str, ...] = ()
     projects_roots: tuple[str, ...] = ()
+    caps: tuple[str, ...] = ()
+    trust: str | None = None
 
     @property
     def canonical_repo_root(self) -> str | None:
@@ -500,6 +512,8 @@ def _build_profile(machine_id: str, body: Any) -> MachineProfile:
         managed_home=_optional_path(body.get("managed_home")),
         repo_roots=_path_tuple(body.get("repo_roots")),
         projects_roots=_path_tuple(body.get("projects_roots")),
+        caps=_cap_tuple(body.get("caps")),
+        trust=_trust_value(body.get("trust"), machine_id=machine_id),
     )
 
 
@@ -792,3 +806,45 @@ def _optional_path(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def is_closed_cap(token: str) -> bool:
+    """True when ``token`` is in the closed capability set."""
+    text = str(token or "").strip()
+    if not text:
+        return False
+    if text in CLOSED_CAP_NAMES:
+        return True
+    if text.startswith("os:") and text != "os:":
+        return True
+    if text.startswith("arch:") and text != "arch:":
+        return True
+    return False
+
+
+def _cap_tuple(value: Any) -> tuple[str, ...]:
+    """Load caps, keeping closed tokens in declaration order and dropping the rest."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in _string_tuple(value):
+        token = str(item).strip()
+        if not is_closed_cap(token) or token in seen:
+            continue
+        seen.add(token)
+        ordered.append(token)
+    return tuple(ordered)
+
+
+def _trust_value(value: Any, *, machine_id: str) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text not in TRUST_VALUES:
+        allowed = ", ".join(sorted(TRUST_VALUES))
+        raise MachinesConfigError(
+            f"machines.yaml machine {machine_id!r} has unsupported trust "
+            f"{text!r} (expected {allowed})."
+        )
+    return text

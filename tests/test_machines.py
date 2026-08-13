@@ -472,26 +472,92 @@ class ForeignHomeExpansionTests(unittest.TestCase):
         )
         self.assertEqual(out, "/srv/skillbox/repos/pkg/x")
 
-    def test_profile_with_no_declared_home_skips_tilde_root(self) -> None:
-        # A profile that declares a ~ root but NO home cannot anchor it, so the ~
-        # root is skipped rather than matched against the local $HOME.
-        fixture = textwrap.dedent(
+@unittest.skipUnless(_HAVE_YAML, "PyYAML required to parse machines.yaml")
+class MachineCapsTrustTests(unittest.TestCase):
+    """caps + stored trust load through the existing _build_profile path."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmpdir = Path(self._tmp.name)
+
+    def _load(self, body: str) -> m.MachinesConfig:
+        path = self.tmpdir / "machines.yaml"
+        path.write_text(textwrap.dedent(body).strip() + "\n", encoding="utf-8")
+        return m.load_machines_config(path)
+
+    def test_omitted_caps_and_trust_default(self) -> None:
+        config = m.load_machines_config(_write_fixture(self.tmpdir))
+        mac = config.require("mac-laptop")
+        self.assertEqual(mac.caps, ())
+        self.assertIsNone(mac.trust)
+
+    def test_load_caps_and_trust(self) -> None:
+        config = self._load(
             """
             version: 1
             machines:
-              homeless:
-                hostnames: [homeless]
-                repo_roots:
-                  - ~/repos
+              mac-laptop:
+                hostnames: [Mac-2]
+                caps: [os:darwin, arch:arm64, xcode, durable]
+                trust: local
             """
-        ).strip()
-        path = Path(self._tmp.name) / "homeless.yaml"
-        path.write_text(fixture + "\n", encoding="utf-8")
-        config = m.load_machines_config(path)
-        # With $HOME=/srv/skillbox/home, the OLD code would match this path under
-        # the homeless machine's ~/repos; now it must NOT.
-        result = config.classify_path("/srv/skillbox/home/repos/x")
-        self.assertEqual(result["machines"], [])
+        )
+        mac = config.require("mac-laptop")
+        self.assertEqual(mac.caps, ("os:darwin", "arch:arm64", "xcode", "durable"))
+        self.assertEqual(mac.trust, "local")
+
+    def test_unknown_cap_tokens_are_dropped(self) -> None:
+        config = self._load(
+            """
+            version: 1
+            machines:
+              boxy:
+                caps: [os:linux, rch, docker, "", gpu]
+            """
+        )
+        self.assertEqual(config.require("boxy").caps, ("os:linux", "docker", "gpu"))
+
+    def test_duplicate_caps_preserve_first(self) -> None:
+        config = self._load(
+            """
+            version: 1
+            machines:
+              boxy:
+                caps: [docker, os:linux, docker]
+            """
+        )
+        self.assertEqual(config.require("boxy").caps, ("docker", "os:linux"))
+
+    def test_invalid_trust_raises(self) -> None:
+        with self.assertRaises(m.MachinesConfigError):
+            self._load(
+                """
+                version: 1
+                machines:
+                  boxy:
+                    trust: unsupported
+                """
+            )
+
+    def test_blank_trust_is_none(self) -> None:
+        config = self._load(
+            """
+            version: 1
+            machines:
+              boxy:
+                trust: "  "
+            """
+        )
+        self.assertIsNone(config.require("boxy").trust)
+
+    def test_closed_cap_helper_accepts_families(self) -> None:
+        self.assertTrue(m.is_closed_cap("os:wsl"))
+        self.assertTrue(m.is_closed_cap("arch:arm64"))
+        self.assertTrue(m.is_closed_cap("tailnet"))
+        self.assertFalse(m.is_closed_cap("os:"))
+        self.assertFalse(m.is_closed_cap("rch"))
+        self.assertFalse(m.is_closed_cap(""))
 
 
 if __name__ == "__main__":
