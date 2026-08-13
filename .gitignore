@@ -77,3 +77,4 @@ refactor/
 workspace/.focus.json.lock
 .skillbox/skill-overrides.yaml.lock
 docs/field-reports/reports.jsonl
+.beads/*.bak*
