@@ -404,6 +404,11 @@ def _fleet_example(fn: Callable[["FixtureFleetT", str], dict[str, Any]]) -> dict
     tmp = tempfile.mkdtemp()
     try:
         fleet = build_fixture_fleet(tmp)
+        fixture_bin = Path(tmp) / "fixture-bin"
+        fixture_bin.mkdir()
+        fixture_br = fixture_bin / "br"
+        fixture_br.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fixture_br.chmod(0o755)
         source_roots = (str(fleet.skills_root), str(fleet.skills_private_root))
         machines_config = MachinesConfig(
             machines={
@@ -444,6 +449,9 @@ def _fleet_example(fn: Callable[["FixtureFleetT", str], dict[str, Any]]) -> dict
                 "declared_machines": sorted(machines_config.machines),
             },
             create=True,
+        ), mock.patch.dict(
+            os.environ,
+            {"PATH": f"{fixture_bin}{os.pathsep}{os.environ.get('PATH', '')}"},
         ):
             payload = fn(fleet, tmp)
         replacements = [
@@ -451,9 +459,7 @@ def _fleet_example(fn: Callable[["FixtureFleetT", str], dict[str, Any]]) -> dict
             ("/fake-mac-root", REMOTE_ROOT_PLACEHOLDER),
             (tmp, FLEET_PLACEHOLDER),
         ]
-        br_bin = shutil.which("br")
-        if br_bin:
-            replacements.append((br_bin, BR_BIN_PLACEHOLDER))
+        replacements.append((str(fixture_br), BR_BIN_PLACEHOLDER))
         return _norm(payload, replacements)
     finally:
         # Best-effort cleanup; the temp tree carries no operator state.

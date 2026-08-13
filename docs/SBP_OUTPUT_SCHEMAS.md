@@ -160,6 +160,12 @@ The wrapper discovery contract. Agents should start here to learn the stable com
     },
     {
       "json": true,
+      "name": "dws-complete",
+      "notes": "Authenticated Orb result intake; accepted means pending host reconciliation, not delivered or closed.",
+      "safe_first_try": "sbp dws complete --handoff <file> --outcome <status> --tests <status>"
+    },
+    {
+      "json": true,
       "name": "skill-togglable",
       "safe_first_try": "sbp skill togglable --json"
     },
@@ -187,6 +193,20 @@ The wrapper discovery contract. Agents should start here to learn the stable com
       "json": true,
       "name": "registry",
       "safe_first_try": "sbp registry doctor --json"
+    },
+    {
+      "json": true,
+      "name": "repo",
+      "safe_first_try": "sbp repo status . --json"
+    },
+    {
+      "aliases": [
+        "gs"
+      ],
+      "json": true,
+      "name": "git",
+      "notes": "Read-only estate git status viewer; never proxies mutating git subcommands.",
+      "safe_first_try": "sbp git --json"
     },
     {
       "fallback": "If status is error/degraded/stale during active work, report degraded_cass evidence mode and use the local transcript scanner; do not rebuild Cass mid-task.",
@@ -495,7 +515,7 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
   ],
   "beads": {
     "beads_dir": "<FLEET>/repos_real/overlay-repo/.beads",
-    "br": null,
+    "br": "<FLEET>/fixture-bin/br",
     "initialized": false,
     "issues": [],
     "next_actions": [],
@@ -735,14 +755,9 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
   ],
   "beads": {
     "beads_dir": "<FLEET>/repos_real/healthy/.beads",
-    "br": null,
+    "br": "<FLEET>/fixture-bin/br",
     "initialized": false,
     "issues": [
-      {
-        "code": "missing_br",
-        "hint": "install beads_rust, then rerun sbp recalibrate",
-        "message": "BEADS DRIFT: beads-aware skills are active, but `br` is not on PATH"
-      },
       {
         "code": "no_beads_dir",
         "hint": "sbp beads init --cwd <FLEET>/repos_real/healthy",
@@ -750,7 +765,6 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       }
     ],
     "next_actions": [
-      "install beads_rust, then rerun sbp recalibrate",
       "sbp beads init --cwd <FLEET>/repos_real/healthy"
     ],
     "ok": false,
@@ -884,7 +898,6 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
   ],
   "next_actions": [
     "doctor --format json",
-    "install beads_rust, then rerun sbp recalibrate",
     "sbp beads init --cwd <FLEET>/repos_real/healthy"
   ],
   "occurrences": [
@@ -1024,7 +1037,7 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
   "summary": {
     "archive_source_skills": 0,
     "archive_sources": 0,
-    "beads_issues": 2,
+    "beads_issues": 1,
     "beads_required_skills": 1,
     "broken_by_class": {
       "dangling": 0,
@@ -1307,7 +1320,7 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
 {
   "beads": {
     "beads_dir": "<FLEET>/repos_real/overlay-repo/.beads",
-    "br": null,
+    "br": "<FLEET>/fixture-bin/br",
     "initialized": false,
     "issues": [],
     "next_actions": [],

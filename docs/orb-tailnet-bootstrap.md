@@ -467,7 +467,7 @@ PY
   # Tailscale keeps deleted keys as audit tombstones: post-delete GET returns
   # HTTP 200 with invalid:true + revoked:<ts>, NOT 404 (asserting 404 fails
   # every successful rotation — observed live 2026-07-31, reconfirmed 2026-08-07
-  # rotating kKm7i6sPpE11CNTRL -> kdZjyuSrAD11CNTRL).
+  # rotating <REDACTED_OLD_KEY_ID> -> <REDACTED_NEW_KEY_ID>).
   after_invalid="$(curl -fsS -H "Authorization: Bearer ${TAILSCALE_API_KEY}" \
     "$old_key_url" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("invalid"))')"
   test "$after_invalid" = "True" || {

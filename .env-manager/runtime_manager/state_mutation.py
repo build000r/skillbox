@@ -185,6 +185,10 @@ STATE_ROOT_SOURCES: Mapping[str, str] = {
         "scripts/self-test.sh:178 ${SKILLBOX_STATE_ROOT:-${REPO_ROOT}/.skillbox-state} "
         "(REPO-RELATIVE — disagrees with the cwd-relative resolvers above)"
     ),
+    "git_scan_cache.state_root": (
+        "git_scan_cache.py:87 resolve_state_root -> env SKILLBOX_STATE_ROOT else "
+        "<runtime-root>/.skillbox-state; relative env values resolve against Path.cwd()"
+    ),
     "runtime_model.root_dir": (
         "runtime model root_dir (scripts/lib/runtime_model.py:539 default './.skillbox-state' for "
         "storage.state_root); repo-tracked paths under <root_dir>, not a state root"
@@ -427,6 +431,22 @@ _MANAGE_BOUNDARIES: tuple[Boundary, ...] = tuple(
             "importing sbp_cass has no module-level side effect that writes: its only "
             "module-level calls are Path(...)/frozenset(...)/socket.gethostname()/os.path.isdir "
             "(sbp_cass.py:21, 78, 103, 123, 125, 164-167)",
+        ),
+    ),
+    _b(
+        SURFACE_MANAGE, "git-status", CONDITIONAL_MUTATION,
+        state_root_source="git_scan_cache.state_root",
+        dry_run_predicate=(
+            "`--cached` returns through cli.py _serve_cached_git_status before scanning or "
+            "writing; every live scan calls write_git_scan_cache"
+        ),
+        nested_call_policy="leaf; optional --live reconciliation remains read-only",
+        lease_span="single_write after the live estate scan",
+        lock_owner=UNOWNED,
+        writes=("git-scan/last-scan.json (current plus one previous generation)",),
+        evidence=(
+            "cli.py _handle_git_status -> git_scan_cache.write_scan_cache",
+            "git_scan_cache.py write_scan_cache: mkdir, mkstemp, os.replace",
         ),
     ),
     _b(
@@ -1413,6 +1433,15 @@ _MAKE_BOUNDARIES: tuple[Boundary, ...] = (
     _make_read_delegate("box-list", "box.list"),
     _make_read_delegate("box-profiles", "box.profiles"),
     _make_read_delegate("pulse-status", "pulse.status"),
+    _make_delegate(
+        "git-estate-e2e",
+        "manage.git-status",
+        UNCONDITIONAL_MUTATION,
+        extra=(
+            "The fixture estate is temporary, but each live sbp git invocation writes the "
+            "repo state-root cache; the target exposes no cached/read-only mode."
+        ),
+    ),
     _read(SURFACE_MAKE, "swimmers-status", "Makefile swimmers-status -> `./scripts/05-swimmers.sh status`; depends on bootstrap-env, which mutates"),
     _read(SURFACE_MAKE, "swimmers-logs", "Makefile swimmers-logs -> `./scripts/05-swimmers.sh logs`; depends on bootstrap-env, which mutates"),
     _b(
