@@ -387,6 +387,7 @@ class GateBehaviorTests(unittest.TestCase):
         *extra: str,
         plant: str = "",
         toolchain: Path | None = None,
+        git_hook_env: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         receipts = Path(tempfile.mkdtemp(dir=self._tmp.name))
         env = dict(os.environ)
@@ -395,6 +396,10 @@ class GateBehaviorTests(unittest.TestCase):
         env["SKILLBOX_SELF_TEST_RECEIPT_DIR"] = str(receipts)
         env["SELFTEST_PLANT"] = plant
         env.pop("SKILLBOX_STATE_ROOT", None)
+        if git_hook_env:
+            env["GIT_DIR"] = str(self.repo / ".git")
+            env["GIT_WORK_TREE"] = str(self.repo)
+            env["GIT_PREFIX"] = ""
         result = subprocess.run(
             ["bash", str(self.repo / "scripts" / "self-test.sh"), *extra],
             capture_output=True,
@@ -447,6 +452,26 @@ class GateBehaviorTests(unittest.TestCase):
             self.assertEqual(self.head_sha, receipt["commit"])
         finally:
             planted.unlink()
+
+    def test_hook_git_environment_cannot_redirect_the_isolated_checkout(self) -> None:
+        branch_before = subprocess.run(
+            ["git", "-C", str(self.repo), "symbolic-ref", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        result, receipts = self._run_gate(
+            "--trigger", "pre-push-fixture", git_hook_env=True
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("pass", self._receipt(receipts)["status"])
+        branch_after = subprocess.run(
+            ["git", "-C", str(self.repo), "symbolic-ref", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(branch_before, branch_after)
 
     def test_worktree_mode_is_marked_non_canonical(self) -> None:
         result, receipts = self._run_gate("--worktree")

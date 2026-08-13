@@ -180,6 +180,16 @@ done
 command -v git >/dev/null 2>&1 || die "git is required"
 command -v docker >/dev/null 2>&1 || die "docker is required for the compose lane"
 
+# Git hooks export repository-local variables such as GIT_DIR. If those leak
+# into the isolated clone below, `git -C "${SRC}" checkout` still targets the
+# caller's worktree: it detaches the real checkout and leaves SRC empty. Resolve
+# the script-owned root first, then clear exactly Git's documented local vars.
+GIT_LOCAL_ENV_VARS="$(git -C "${REPO_ROOT}" rev-parse --local-env-vars 2>/dev/null || true)"
+for git_local_env in ${GIT_LOCAL_ENV_VARS}; do
+  unset "${git_local_env}"
+done
+unset GIT_LOCAL_ENV_VARS git_local_env
+
 STATE_ROOT="${SKILLBOX_STATE_ROOT:-${REPO_ROOT}/.skillbox-state}"
 TOOLCHAIN_DIR="${SKILLBOX_SELF_TEST_TOOLCHAIN_DIR:-${STATE_ROOT}/self-test/toolchain}"
 RECEIPT_DIR="${SKILLBOX_SELF_TEST_RECEIPT_DIR:-${STATE_ROOT}/self-test/receipts}"
