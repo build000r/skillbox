@@ -71,6 +71,7 @@ __all__ = [
     'overlay_scoped_skill_names',
     'SKILL_VISIBILITY_SIMULATION_KEY',
     '_skill_visibility_simulation',
+    '_simulated_repo_override_policy',
     '_simulated_machine_id',
     '_resolve_registry_repo_ref',
     'SKILL_OVERRIDES_REL',
