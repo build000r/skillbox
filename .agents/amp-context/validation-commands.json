@@ -1,0 +1,56 @@
+{
+  "protocol_version": "repo-validation-commands/v1",
+  "source": "AGENTS.md Core Commands and Testing Expectations",
+  "commands": [
+    {
+      "id": "unit-tests",
+      "cwd": ".",
+      "command": "python3 -m unittest discover -s tests",
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "python-lint",
+      "cwd": ".",
+      "command": "python3 -m ruff check .",
+      "timeout_seconds": 600
+    },
+    {
+      "id": "shell-lint",
+      "cwd": ".",
+      "command": "shellcheck --severity=warning scripts/*.sh install.sh",
+      "timeout_seconds": 600
+    },
+    {
+      "id": "outer-doctor",
+      "cwd": ".",
+      "command": "make doctor",
+      "timeout_seconds": 900
+    },
+    {
+      "id": "runtime-sanity",
+      "cwd": ".",
+      "command": "make dev-sanity",
+      "timeout_seconds": 900
+    },
+    {
+      "id": "diff-check",
+      "cwd": ".",
+      "command": "git diff --check",
+      "timeout_seconds": 300
+    }
+  ],
+  "forbidden_commands": [
+    "make build",
+    "make up",
+    "make down",
+    "make runtime-sync",
+    "make runtime-up",
+    "make box-up",
+    "make box-down",
+    "install.sh",
+    "git push",
+    "release",
+    "production",
+    "prod"
+  ]
+}
