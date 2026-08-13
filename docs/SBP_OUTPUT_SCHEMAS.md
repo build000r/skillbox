@@ -185,8 +185,28 @@ The wrapper discovery contract. Agents should start here to learn the stable com
     },
     {
       "json": true,
+      "name": "family",
+      "notes": "Canonical read-only Amp family health contract; dashboard prints the port 6969 URL.",
+      "safe_first_try": "sbp family health --json"
+    },
+    {
+      "json": true,
       "name": "registry",
       "safe_first_try": "sbp registry doctor --json"
+    },
+    {
+      "json": true,
+      "name": "repo",
+      "safe_first_try": "sbp repo status . --json"
+    },
+    {
+      "aliases": [
+        "gs"
+      ],
+      "json": true,
+      "name": "git",
+      "notes": "Read-only estate git status viewer; never proxies mutating git subcommands.",
+      "safe_first_try": "sbp git --json"
     },
     {
       "fallback": "If status is error/degraded/stale during active work, report degraded_cass evidence mode and use the local transcript scanner; do not rebuild Cass mid-task.",
@@ -495,7 +515,7 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
   ],
   "beads": {
     "beads_dir": "<FLEET>/repos_real/overlay-repo/.beads",
-    "br": null,
+    "br": "<BR_BIN>",
     "initialized": false,
     "issues": [],
     "next_actions": [],
@@ -735,14 +755,9 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
   ],
   "beads": {
     "beads_dir": "<FLEET>/repos_real/healthy/.beads",
-    "br": null,
+    "br": "<BR_BIN>",
     "initialized": false,
     "issues": [
-      {
-        "code": "missing_br",
-        "hint": "install beads_rust, then rerun sbp recalibrate",
-        "message": "BEADS DRIFT: beads-aware skills are active, but `br` is not on PATH"
-      },
       {
         "code": "no_beads_dir",
         "hint": "sbp beads init --cwd <FLEET>/repos_real/healthy",
@@ -750,7 +765,6 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       }
     ],
     "next_actions": [
-      "install beads_rust, then rerun sbp recalibrate",
       "sbp beads init --cwd <FLEET>/repos_real/healthy"
     ],
     "ok": false,
@@ -884,7 +898,6 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
   ],
   "next_actions": [
     "doctor --format json",
-    "install beads_rust, then rerun sbp recalibrate",
     "sbp beads init --cwd <FLEET>/repos_real/healthy"
   ],
   "occurrences": [
@@ -1024,7 +1037,7 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
   "summary": {
     "archive_source_skills": 0,
     "archive_sources": 0,
-    "beads_issues": 2,
+    "beads_issues": 1,
     "beads_required_skills": 1,
     "broken_by_class": {
       "dangling": 0,
@@ -1267,6 +1280,7 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
 | `cwd` | CONTRACT | Absolute resolved cwd being recalibrated. |
 | `matched_scope_rules` | CONTRACT | Rules in force for this cwd. |
 | `matched_project_categories` | CONTRACT | Project categories for this cwd. |
+| `effective` | CONTRACT | Authoritative visible skill rows for this cwd, including the winning layer and state. |
 | `issues` | CONTRACT | The drift to heal, grouped by kind (the issues-only view's payload). |
 | `beads` | CONTRACT | required / required_skills / repo_root / initialized / br / issues. |
 | `summary` | CONTRACT | Counters incl. beads_required_skills + beads_issues. |
@@ -1307,7 +1321,7 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
 {
   "beads": {
     "beads_dir": "<FLEET>/repos_real/overlay-repo/.beads",
-    "br": null,
+    "br": "<BR_BIN>",
     "initialized": false,
     "issues": [],
     "next_actions": [],
@@ -1317,6 +1331,25 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
     "required_skills": []
   },
   "cwd": "<FLEET>/repos_real/overlay-repo",
+  "effective": [
+    {
+      "availability": "installed",
+      "has_skill_md": true,
+      "layer": "project:claude:<FLEET>/repos_real/overlay-repo",
+      "layer_label": "project claude",
+      "layer_rank": 40,
+      "link_target": "<FLEET>/private-skills/tiny-marketing",
+      "name": "tiny-marketing",
+      "path": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-marketing",
+      "scope": "installed",
+      "shadowed_count": 0,
+      "source": "<FLEET>/private-skills/tiny-marketing",
+      "source_bucket": "external",
+      "source_kind": "directory",
+      "state": "ok",
+      "winning_layer": "project:claude:<FLEET>/repos_real/overlay-repo"
+    }
+  ],
   "fixes": [
     {
       "command": "sbp skill on tiny-ui --cwd $PWD",
