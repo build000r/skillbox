@@ -1,9 +1,11 @@
-"""Read-only HTTP bridge for host Cass search and skill pull."""
+"""Authenticated HTTP bridge for allowlisted SBP reads and DWS result intake."""
 
 from __future__ import annotations
 
 import argparse
+import errno
 import gzip
+import hashlib
 import io
 import ipaddress
 import json
@@ -11,6 +13,7 @@ import os
 import re
 import selectors
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
@@ -62,8 +65,19 @@ MAX_TOKEN_TTL_SECONDS = 3600
 MAX_JWKS_BYTES = 1024 * 1024
 MAX_CASS_STDOUT_BYTES = 4 * 1024 * 1024
 MAX_CASS_STDERR_BYTES = 64 * 1024
-PROTECTED_PATH_PREFIXES = ("/v1/orb-kit", "/v1/cass/", "/v1/skill/")
+MAX_DWS_RESULT_BYTES = 128 * 1024
+DWS_RESULT_SCHEMA = "dws-worker-result/v1"
+PROTECTED_PATH_PREFIXES = (
+    "/v1/orb-kit",
+    "/v1/cass/",
+    "/v1/skill/",
+    "/v1/dws/",
+)
+IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}")
+SHA_RE = re.compile(r"[0-9a-f]{40}")
+DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 ORB_KIT_FILES = (
+    ("sbp", Path("scripts/orb/sbp"), 0o755),
     ("lib/sbp_client.py", Path("scripts/lib/sbp_client.py"), 0o644),
     ("runtime_manager/__init__.py", Path(".env-manager/runtime_manager/__init__.py"), 0o644),
     (
@@ -82,7 +96,9 @@ ORB_KIT_README = (
     b"Run orb/join-tailnet.sh to join the Skillbox tailnet.\n"
     b'Export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" and '
     b'SBP_REMOTE="http://<skillbox-tailnet-ip>:8443".\n'
-    b"Run python3 lib/sbp_client.py cass status --json.\n"
+    b"Run ./sbp cass status --json.\n"
+    b"For a sealed DWS handoff, run ./sbp dws complete --handoff <file> "
+    b"--outcome <success|failed|indeterminate> --tests <passed|failed|indeterminate>.\n"
 )
 
 
@@ -152,8 +168,8 @@ class JWKSVerifier:
         allowed_workspace_ids: tuple[str, ...] = (),
     ) -> None:
         _require_https_jwks_url(jwks_url)
-        if len(allowed_project_ids) != 1:
-            raise ValueError("exactly one allowed project identity is required")
+        if not allowed_project_ids:
+            raise ValueError("at least one allowed project identity is required")
         for label, values in (
             ("project", allowed_project_ids),
             ("user", allowed_user_ids),
@@ -169,7 +185,7 @@ class JWKSVerifier:
         self.kid_refresh_cooldown_seconds = kid_refresh_cooldown_seconds
         self.opener = opener
         self.clock = clock
-        self.allowed_project_id = allowed_project_ids[0]
+        self.allowed_project_ids = frozenset(allowed_project_ids)
         self.allowed_user_ids = tuple(allowed_user_ids)
         self.allowed_workspace_ids = tuple(allowed_workspace_ids)
         self._keys: dict[str, dict[str, Any]] = {}
@@ -289,7 +305,7 @@ class JWKSVerifier:
         workspace = claims.get("workspace_id")
         if workspace is not None and (not isinstance(workspace, str) or not workspace.strip()):
             raise AuthenticationError("invalid workspace identity")
-        if claims["project_id"] != self.allowed_project_id:
+        if claims["project_id"] not in self.allowed_project_ids:
             raise AuthenticationError("project is not allowed")
         if self.allowed_user_ids and claims["user_id"] not in self.allowed_user_ids:
             raise AuthenticationError("user is not allowed")
@@ -572,8 +588,285 @@ def pull_skill_bundle(name: str) -> tuple[bytes, dict[str, Any]]:
         raise ServiceError(status, exc.envelope()) from exc
 
 
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _validate_worker_result(
+    value: Any,
+    *,
+    admission_id: str,
+    project_id: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ServiceError(
+            HTTPStatus.BAD_REQUEST,
+            {"ok": False, "error": "worker_result_invalid"},
+        )
+    required = {
+        "schema_version",
+        "outcome",
+        "repo_id",
+        "base_sha",
+        "commit_sha",
+        "pushed_sha",
+        "selected_project_id",
+        "admission_id",
+        "bead_id",
+        "lease_id",
+        "fencing_token",
+        "handoff_digest",
+        "tests",
+        "finished_at",
+        "result_digest",
+    }
+    if set(value) != required:
+        raise ServiceError(
+            HTTPStatus.BAD_REQUEST,
+            {"ok": False, "error": "worker_result_fields_invalid"},
+        )
+    if value.get("schema_version") != DWS_RESULT_SCHEMA:
+        raise ServiceError(
+            HTTPStatus.BAD_REQUEST,
+            {"ok": False, "error": "worker_result_version_invalid"},
+        )
+    if value.get("outcome") not in {"success", "failed", "indeterminate"}:
+        raise ServiceError(
+            HTTPStatus.BAD_REQUEST,
+            {"ok": False, "error": "worker_result_outcome_invalid"},
+        )
+    identifiers = ("repo_id", "selected_project_id", "admission_id", "bead_id", "lease_id")
+    if any(IDENTIFIER_RE.fullmatch(str(value.get(key, ""))) is None for key in identifiers):
+        raise ServiceError(
+            HTTPStatus.BAD_REQUEST,
+            {"ok": False, "error": "worker_result_identity_invalid"},
+        )
+    if value["admission_id"] != admission_id:
+        raise ServiceError(
+            HTTPStatus.CONFLICT,
+            {"ok": False, "error": "worker_result_admission_mismatch"},
+        )
+    if value["selected_project_id"] != project_id:
+        raise ServiceError(
+            HTTPStatus.FORBIDDEN,
+            {"ok": False, "error": "worker_result_project_mismatch"},
+        )
+    if SHA_RE.fullmatch(str(value.get("base_sha", ""))) is None:
+        raise ServiceError(
+            HTTPStatus.BAD_REQUEST,
+            {"ok": False, "error": "worker_result_base_sha_invalid"},
+        )
+    commit_sha, pushed_sha = value.get("commit_sha"), value.get("pushed_sha")
+    for name, sha in (("commit", commit_sha), ("pushed", pushed_sha)):
+        if sha is not None and SHA_RE.fullmatch(str(sha)) is None:
+            raise ServiceError(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": f"worker_result_{name}_sha_invalid"},
+            )
+    if value["outcome"] == "success" and (
+        commit_sha is None or pushed_sha is None or commit_sha != pushed_sha
+    ):
+        raise ServiceError(
+            HTTPStatus.BAD_REQUEST,
+            {"ok": False, "error": "worker_result_success_sha_invalid"},
+        )
+    if DIGEST_RE.fullmatch(str(value.get("handoff_digest", ""))) is None:
+        raise ServiceError(
+            HTTPStatus.BAD_REQUEST,
+            {"ok": False, "error": "worker_result_handoff_digest_invalid"},
+        )
+    if type(value.get("fencing_token")) is not int or value["fencing_token"] <= 0:
+        raise ServiceError(
+            HTTPStatus.BAD_REQUEST,
+            {"ok": False, "error": "worker_result_fence_invalid"},
+        )
+    finished_at = value.get("finished_at")
+    if type(finished_at) is not int or finished_at <= 0 or finished_at > int(time.time()) + 60:
+        raise ServiceError(
+            HTTPStatus.BAD_REQUEST,
+            {"ok": False, "error": "worker_result_time_invalid"},
+        )
+    tests = value.get("tests")
+    if not isinstance(tests, dict) or set(tests) != {"status", "summary"}:
+        raise ServiceError(
+            HTTPStatus.BAD_REQUEST,
+            {"ok": False, "error": "worker_result_tests_invalid"},
+        )
+    if tests.get("status") not in {"passed", "failed", "indeterminate"}:
+        raise ServiceError(
+            HTTPStatus.BAD_REQUEST,
+            {"ok": False, "error": "worker_result_tests_invalid"},
+        )
+    if not isinstance(tests.get("summary"), str) or len(tests["summary"].encode("utf-8")) > 8192:
+        raise ServiceError(
+            HTTPStatus.BAD_REQUEST,
+            {"ok": False, "error": "worker_result_tests_invalid"},
+        )
+    body = dict(value)
+    claimed = body.pop("result_digest", None)
+    observed = hashlib.sha256(_canonical_json(body)).hexdigest()
+    if claimed != observed:
+        raise ServiceError(
+            HTTPStatus.BAD_REQUEST,
+            {"ok": False, "error": "worker_result_digest_invalid"},
+        )
+    return value
+
+
+def _read_worker_result(handler: BaseHTTPRequestHandler) -> Any:
+    content_types = handler.headers.get_all("Content-Type", [])
+    if len(content_types) != 1 or content_types[0].split(";", 1)[0].strip().lower() != "application/json":
+        raise ServiceError(
+            HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+            {"ok": False, "error": "content_type_invalid"},
+        )
+    if handler.headers.get_all("Transfer-Encoding", []):
+        raise ServiceError(
+            HTTPStatus.BAD_REQUEST,
+            {"ok": False, "error": "transfer_encoding_forbidden"},
+        )
+    values = handler.headers.get_all("Content-Length", [])
+    if len(values) != 1:
+        raise ServiceError(
+            HTTPStatus.LENGTH_REQUIRED,
+            {"ok": False, "error": "content_length_required"},
+        )
+    try:
+        length = int(values[0])
+    except ValueError as exc:
+        raise ServiceError(
+            HTTPStatus.BAD_REQUEST,
+            {"ok": False, "error": "content_length_invalid"},
+        ) from exc
+    if length <= 0 or length > MAX_DWS_RESULT_BYTES:
+        raise ServiceError(
+            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            {"ok": False, "error": "worker_result_too_large"},
+        )
+    body = handler.rfile.read(length)
+    if len(body) != length:
+        raise ServiceError(
+            HTTPStatus.BAD_REQUEST,
+            {"ok": False, "error": "worker_result_truncated"},
+        )
+    try:
+        return json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ServiceError(
+            HTTPStatus.BAD_REQUEST,
+            {"ok": False, "error": "worker_result_json_invalid"},
+        ) from exc
+
+
+def _read_inbox_entry(directory_fd: int, filename: str) -> bytes | None:
+    try:
+        descriptor = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ServiceError(
+                HTTPStatus.CONFLICT,
+                {"ok": False, "error": "worker_result_destination_invalid"},
+            ) from exc
+        raise
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode) or details.st_size > MAX_DWS_RESULT_BYTES:
+            raise ServiceError(
+                HTTPStatus.CONFLICT,
+                {"ok": False, "error": "worker_result_destination_invalid"},
+            )
+        chunks: list[bytes] = []
+        observed = 0
+        while True:
+            chunk = os.read(descriptor, min(64 * 1024, MAX_DWS_RESULT_BYTES + 1 - observed))
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+            observed += len(chunk)
+            if observed > MAX_DWS_RESULT_BYTES:
+                raise ServiceError(
+                    HTTPStatus.CONFLICT,
+                    {"ok": False, "error": "worker_result_destination_invalid"},
+                )
+    finally:
+        os.close(descriptor)
+
+
+def store_worker_result(inbox: Path, value: dict[str, Any]) -> bool:
+    body = _canonical_json(value) + b"\n"
+    filename = f"{value['admission_id']}.json"
+    directory_fd = os.open(inbox, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    temporary = (
+        f".{filename}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}"
+    )
+    try:
+        directory_details = os.fstat(directory_fd)
+        if (
+            directory_details.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_details.st_mode) & 0o077
+        ):
+            raise ServiceError(
+                HTTPStatus.CONFLICT,
+                {"ok": False, "error": "worker_result_inbox_invalid"},
+            )
+        existing = _read_inbox_entry(directory_fd, filename)
+        if existing is not None:
+            if existing == body:
+                return True
+            raise ServiceError(
+                HTTPStatus.CONFLICT,
+                {"ok": False, "error": "worker_result_conflict"},
+            )
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        try:
+            with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                stream.write(body)
+                stream.flush()
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            os.link(
+                temporary,
+                filename,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            existing = _read_inbox_entry(directory_fd, filename)
+            if existing == body:
+                return True
+            raise ServiceError(
+                HTTPStatus.CONFLICT,
+                {"ok": False, "error": "worker_result_conflict"},
+            )
+        os.fsync(directory_fd)
+        return False
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except OSError as exc:
+            if exc.errno != errno.ENOENT:
+                raise
+        os.close(directory_fd)
+
+
 class Handler(BaseHTTPRequestHandler):
-    """Exact GET-only sbpd v1 route table."""
+    """Allowlisted sbpd v1 reads plus one fenced DWS result intake."""
 
     server_version = "sbpd/1"
 
@@ -745,6 +1038,58 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
 
+    def do_POST(self) -> None:
+        request = urlsplit(self.path)
+        try:
+            if not self._authenticate(request.path):
+                return
+            prefix = "/v1/dws/complete/"
+            if not request.path.startswith(prefix) or request.query:
+                self._method_not_allowed()
+                return
+            if not bool(getattr(self.server, "worker_writes_enabled", False)):
+                raise ServiceError(
+                    HTTPStatus.NOT_FOUND,
+                    {"ok": False, "error": "worker_result_intake_disabled"},
+                )
+            inbox = getattr(self.server, "worker_result_inbox", None)
+            claims = getattr(self, "auth_claims", None)
+            if not isinstance(inbox, Path) or not isinstance(claims, dict):
+                raise ServiceError(
+                    HTTPStatus.FORBIDDEN,
+                    {"ok": False, "error": "worker_result_auth_required"},
+                )
+            admission_id = unquote(request.path[len(prefix) :])
+            if IDENTIFIER_RE.fullmatch(admission_id) is None:
+                raise ServiceError(
+                    HTTPStatus.BAD_REQUEST,
+                    {"ok": False, "error": "worker_result_admission_invalid"},
+                )
+            value = _validate_worker_result(
+                _read_worker_result(self),
+                admission_id=admission_id,
+                project_id=claims["project_id"],
+            )
+            replayed = store_worker_result(inbox, value)
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "schema_version": "dws-worker-result-acceptance/v1",
+                    "status": "accepted_pending_reconciliation",
+                    "admission_id": admission_id,
+                    "result_digest": value["result_digest"],
+                    "idempotent_replay": replayed,
+                },
+            )
+        except ServiceError as exc:
+            self._send_json(exc.status, exc.payload)
+        except Exception:  # noqa: BLE001 -- HTTP boundary must not leak internals
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"ok": False, "error": "internal_error", "message": "sbpd request failed"},
+            )
+
     def _method_not_allowed(self) -> None:
         request = urlsplit(self.path)
         if not self._authenticate(request.path):
@@ -759,7 +1104,6 @@ class Handler(BaseHTTPRequestHandler):
 
     do_DELETE = _method_not_allowed
     do_PATCH = _method_not_allowed
-    do_POST = _method_not_allowed
     do_PUT = _method_not_allowed
 
     def log_message(self, fmt: str, *args: Any) -> None:
@@ -788,6 +1132,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allowed-user-id", action="append", default=[])
     parser.add_argument("--allowed-workspace-id", action="append", default=[])
     parser.add_argument("--project-alias")
+    parser.add_argument(
+        "--enable-worker-writes",
+        action="store_true",
+        help="Enable the bounded authenticated DWS result intake",
+    )
+    parser.add_argument(
+        "--worker-result-inbox",
+        type=Path,
+        help="Existing private directory for DWS worker result envelopes",
+    )
     return parser
 
 
@@ -796,8 +1150,19 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not ipaddress.ip_address(args.bind).is_loopback and not args.require_auth:
         parser.error("Tailnet binds require --require-auth")
-    if args.require_auth and (len(args.allowed_project_id) != 1 or not args.project_alias):
-        parser.error("--require-auth requires exactly one --allowed-project-id and --project-alias")
+    if args.require_auth and (not args.allowed_project_id or not args.project_alias):
+        parser.error("--require-auth requires --allowed-project-id and --project-alias")
+    if args.enable_worker_writes and not args.require_auth:
+        parser.error("--enable-worker-writes requires --require-auth")
+    if args.enable_worker_writes and args.worker_result_inbox is None:
+        parser.error("--enable-worker-writes requires --worker-result-inbox")
+    if args.worker_result_inbox is not None:
+        inbox = args.worker_result_inbox
+        if not inbox.is_absolute() or inbox.is_symlink() or not inbox.is_dir():
+            parser.error("--worker-result-inbox must be an existing absolute non-symlink directory")
+        details = inbox.stat()
+        if details.st_uid != os.geteuid() or stat.S_IMODE(details.st_mode) & 0o077:
+            parser.error("--worker-result-inbox must be owned by this user and private")
     if args.project_alias and PROJECT_ALIAS_RE.fullmatch(args.project_alias) is None:
         parser.error("--project-alias has invalid characters")
     server_class = (
@@ -808,6 +1173,8 @@ def main(argv: list[str] | None = None) -> int:
     server = server_class((args.bind, args.port), Handler)
     server.require_auth = args.require_auth
     server.project_alias = args.project_alias
+    server.worker_writes_enabled = args.enable_worker_writes
+    server.worker_result_inbox = args.worker_result_inbox
     server.authenticator = JWKSVerifier(
         allowed_project_ids=tuple(args.allowed_project_id),
         allowed_user_ids=tuple(args.allowed_user_id),

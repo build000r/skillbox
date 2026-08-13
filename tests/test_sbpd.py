@@ -193,6 +193,7 @@ class SbpdDelegateTests(unittest.TestCase):
             self.assertEqual(
                 archive.getnames(),
                 [
+                    "sbp",
                     "lib/sbp_client.py",
                     "runtime_manager/__init__.py",
                     "runtime_manager/distribution/__init__.py",
@@ -203,7 +204,8 @@ class SbpdDelegateTests(unittest.TestCase):
             )
             readme = archive.extractfile("README.txt")
             assert readme is not None
-            self.assertEqual(len(readme.read().decode("utf-8").splitlines()), 3)
+            self.assertEqual(len(readme.read().decode("utf-8").splitlines()), 4)
+            self.assertEqual(archive.getmember("sbp").mode, 0o755)
             self.assertEqual(archive.getmember("orb/join-tailnet.sh").mode, 0o755)
             self.assertTrue(all(member.mtime == 0 for member in archive.getmembers()))
 
@@ -375,19 +377,19 @@ class SbpdCliTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             SBPD.main(["--bind", "100.100.0.10", "--port", "0", "--require-auth"])
 
-    def test_authenticated_startup_rejects_multiple_allowed_projects(self) -> None:
-        with self.assertRaises(SystemExit):
-            SBPD.main(
-                [
-                    "--require-auth",
-                    "--allowed-project-id",
-                    "project-one",
-                    "--allowed-project-id",
-                    "project-two",
-                    "--project-alias",
-                    "build000r/skillbox",
-                ]
-            )
+    def test_authenticated_startup_parses_multiple_exact_allowed_projects(self) -> None:
+        args = SBPD.build_parser().parse_args(
+            [
+                "--require-auth",
+                "--allowed-project-id",
+                "project-one",
+                "--allowed-project-id",
+                "project-two",
+                "--project-alias",
+                "build000r/skillbox",
+            ]
+        )
+        self.assertEqual(args.allowed_project_id, ["project-one", "project-two"])
 
     def test_ipv6_server_class_uses_ipv6_socket_family(self) -> None:
         self.assertEqual(SBPD.ThreadingHTTPServerV6.address_family, SBPD.socket.AF_INET6)
@@ -498,13 +500,11 @@ class SbpdAuthTests(unittest.TestCase):
             **kwargs,
         )
 
-    def test_verifier_requires_exactly_one_allowed_project(self) -> None:
-        for project_ids in ((), ("project-one", "project-two")):
-            with self.subTest(project_ids=project_ids), self.assertRaisesRegex(
-                ValueError,
-                "exactly one allowed project",
-            ):
-                self.verifier(allowed_project_ids=project_ids)
+    def test_verifier_requires_nonempty_exact_project_allowlist(self) -> None:
+        with self.assertRaisesRegex(ValueError, "at least one allowed project"):
+            self.verifier(allowed_project_ids=())
+        verifier = self.verifier(allowed_project_ids=("project", "project-two"))
+        self.assertEqual(verifier.verify(self.token())["project_id"], "project")
 
     def test_valid_token_allows_data_endpoint_and_log_includes_sub(self) -> None:
         fixture = ServerFixture(require_auth=True, authenticator=self.verifier())

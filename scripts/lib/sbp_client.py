@@ -27,9 +27,11 @@ TOKEN_TIMEOUT_SECONDS = 10.0
 MAX_CASS_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_SKILL_BUNDLE_BYTES = 16 * 1024 * 1024
 MAX_SKILL_LOCK_BYTES = 128 * 1024
+MAX_DWS_RESULT_BYTES = 128 * 1024
 AMP_ISSUER = "https://ampcode.com/api/workload-identity"
 PULL_SCHEMA = "skill-pull-result/v1"
 ERROR_SCHEMA = "skill-error/v1"
+DWS_RESULT_SCHEMA = "dws-worker-result/v1"
 SKILL_NAME_PATTERN = "^[a-z0-9][a-z0-9-]{0,127}$"
 PROJECT_ALIAS_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}/[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
 TAILSCALE_V4 = ipaddress.ip_network("100.64.0.0/10")
@@ -285,6 +287,35 @@ def _request_headers(accept: str, token: str | None = None) -> dict[str, str]:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return headers
+
+
+def _post_authenticated(
+    remote: str,
+    url: str,
+    body: bytes,
+    *,
+    timeout: float,
+    opener: Callable[..., object],
+    token_minter: Callable[[str, str], str] | None = None,
+) -> object:
+    token, _claims = _auth(remote, token_minter=token_minter)
+
+    def make_request(value: str | None) -> urllib.request.Request:
+        headers = _request_headers("application/json", value)
+        headers["Content-Type"] = "application/json"
+        return urllib.request.Request(url, data=body, headers=headers, method="POST")
+
+    try:
+        response = opener(make_request(token), timeout=timeout)
+        _response_origin_matches(response, remote)
+        return response
+    except urllib.error.HTTPError as exc:
+        if exc.code != 401:
+            raise
+        token, _claims = _auth(remote, token_minter=token_minter)
+        response = opener(make_request(token), timeout=timeout)
+        _response_origin_matches(response, remote)
+        return response
 
 
 def run_remote_cass(
@@ -748,6 +779,142 @@ def _emit_cached(cache_dir: Path, remote: str, name: str, output: BinaryIO) -> i
         return 1
 
 
+def _read_handoff(path: str, stdin: BinaryIO) -> dict[str, object]:
+    if path == "-":
+        body = stdin.read(MAX_DWS_RESULT_BYTES + 1)
+    else:
+        source = Path(path)
+        if source.is_symlink() or not source.is_file():
+            raise ValueError("DWS handoff must be a regular file or stdin")
+        if source.stat().st_size > MAX_DWS_RESULT_BYTES:
+            raise ValueError("DWS handoff exceeds the maximum size")
+        body = source.read_bytes()
+    if len(body) > MAX_DWS_RESULT_BYTES:
+        raise ValueError("DWS handoff exceeds the maximum size")
+    try:
+        value = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("DWS handoff is not valid JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError("DWS handoff is not an object")
+    return value
+
+
+def _worker_result(
+    args: Sequence[str],
+    *,
+    stdin: BinaryIO,
+    now: Callable[[], float] = time.time,
+) -> dict[str, object]:
+    remaining = list(args)
+    if not remaining or remaining.pop(0) != "complete":
+        raise ValueError("remote dws only supports complete")
+    parser = argparse.ArgumentParser(prog="sbp dws complete", add_help=False)
+    parser.add_argument("--handoff", required=True)
+    parser.add_argument("--outcome", choices=("success", "failed", "indeterminate"), required=True)
+    parser.add_argument("--commit-sha")
+    parser.add_argument("--pushed-sha")
+    parser.add_argument("--tests", choices=("passed", "failed", "indeterminate"), required=True)
+    parser.add_argument("--test-summary", default="")
+    parser.add_argument("--format", choices=("json",), default="json")
+    try:
+        parsed = parser.parse_args(remaining)
+    except SystemExit as exc:
+        raise ValueError("invalid sbp dws complete arguments") from exc
+    handoff = _read_handoff(parsed.handoff, stdin)
+    work = handoff.get("work")
+    lease = handoff.get("lease")
+    if not isinstance(work, dict) or not isinstance(lease, dict):
+        raise ValueError("DWS handoff is missing work or lease identity")
+    fields = {
+        "repo_id": handoff.get("repo"),
+        "base_sha": handoff.get("base_sha"),
+        "selected_project_id": handoff.get("selected_project_id"),
+        "admission_id": handoff.get("admission_id"),
+        "bead_id": work.get("bead_id"),
+        "lease_id": lease.get("lease_id"),
+        "fencing_token": lease.get("fencing_token"),
+        "handoff_digest": handoff.get("handoff_digest"),
+    }
+    identifier = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}")
+    for name in ("repo_id", "selected_project_id", "admission_id", "bead_id", "lease_id"):
+        if not isinstance(fields[name], str) or identifier.fullmatch(fields[name]) is None:
+            raise ValueError(f"DWS handoff has invalid {name}")
+    if not isinstance(fields["base_sha"], str) or re.fullmatch(r"[0-9a-f]{40}", fields["base_sha"]) is None:
+        raise ValueError("DWS handoff has invalid base_sha")
+    if not isinstance(fields["handoff_digest"], str) or re.fullmatch(r"[0-9a-f]{64}", fields["handoff_digest"]) is None:
+        raise ValueError("DWS handoff has invalid handoff_digest")
+    if type(fields["fencing_token"]) is not int or fields["fencing_token"] <= 0:
+        raise ValueError("DWS handoff has invalid fencing_token")
+    for name, value in (("commit", parsed.commit_sha), ("pushed", parsed.pushed_sha)):
+        if value is not None and re.fullmatch(r"[0-9a-f]{40}", value) is None:
+            raise ValueError(f"DWS result has invalid {name} SHA")
+    if parsed.outcome == "success" and (
+        parsed.commit_sha is None
+        or parsed.pushed_sha is None
+        or parsed.commit_sha != parsed.pushed_sha
+    ):
+        raise ValueError("successful DWS result requires one identical commit/pushed SHA")
+    if len(parsed.test_summary.encode("utf-8")) > 8192:
+        raise ValueError("DWS test summary exceeds the maximum size")
+    result: dict[str, object] = {
+        "schema_version": DWS_RESULT_SCHEMA,
+        "outcome": parsed.outcome,
+        **fields,
+        "commit_sha": parsed.commit_sha,
+        "pushed_sha": parsed.pushed_sha,
+        "tests": {"status": parsed.tests, "summary": parsed.test_summary},
+        "finished_at": int(now()),
+    }
+    result["result_digest"] = hashlib.sha256(_canonical(result)).hexdigest()
+    return result
+
+
+def run_remote_dws_complete(
+    remote: str,
+    args: Sequence[str],
+    *,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    opener: Callable[..., object] = _NO_REDIRECT_OPEN,
+    stdin: BinaryIO | None = None,
+    stdout: BinaryIO | None = None,
+    stderr: object | None = None,
+    token_minter: Callable[[str, str], str] | None = None,
+) -> int:
+    input_stream = stdin if stdin is not None else sys.stdin.buffer
+    output = stdout if stdout is not None else sys.stdout.buffer
+    errors = stderr if stderr is not None else sys.stderr
+    try:
+        remote = _canonical_remote(remote)
+        result = _worker_result(args, stdin=input_stream)
+        body = _canonical(result)
+        admission_id = urllib.parse.quote(str(result["admission_id"]), safe="")
+        url = f"{remote.rstrip('/')}/v1/dws/complete/{admission_id}"
+        response = _post_authenticated(
+            remote,
+            url,
+            body,
+            timeout=timeout,
+            opener=opener,
+            token_minter=token_minter,
+        )
+        output.write(_read_bounded(response, MAX_DWS_RESULT_BYTES, "DWS result response"))
+        return 0
+    except ValueError as exc:
+        print(f"sbp remote: {exc}", file=errors)
+        return 2
+    except urllib.error.HTTPError as exc:
+        response_body = exc.read(MAX_DWS_RESULT_BYTES + 1)
+        if response_body:
+            output.write(response_body)
+        else:
+            print(f"sbp remote: HTTP {exc.code} from {exc.url}", file=errors)
+        return 1
+    except (OSError, urllib.error.URLError) as exc:
+        print(f"sbp remote: request failed: {exc}", file=errors)
+        return 1
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -755,7 +922,7 @@ def main(
 ) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--remote")
-    parser.add_argument("command", choices=("cass", "skill"))
+    parser.add_argument("command", choices=("cass", "skill", "dws"))
     parser.add_argument("args", nargs=argparse.REMAINDER)
     parsed = parser.parse_args(argv)
     env = os.environ if environ is None else environ
@@ -764,7 +931,9 @@ def main(
         parser.error("--remote or SBP_REMOTE is required")
     if parsed.command == "cass":
         return run_remote_cass(remote, parsed.args)
-    return run_remote_skill_pull(remote, parsed.args)
+    if parsed.command == "skill":
+        return run_remote_skill_pull(remote, parsed.args)
+    return run_remote_dws_complete(remote, parsed.args)
 
 
 if __name__ == "__main__":

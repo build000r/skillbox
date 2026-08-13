@@ -532,6 +532,26 @@ sbp cass status
 sbp cass search 'tailnet'
 ```
 
+The Orb kit also carries a minimal `./sbp` front door. A DWS worker does not
+construct the private delivery-receipt schema. It submits a compact result for
+host reconciliation instead:
+
+```bash
+./sbp dws complete \
+  --handoff /tmp/dws-handoff.json \
+  --outcome success \
+  --commit-sha "$(git rev-parse HEAD)" \
+  --pushed-sha "$(git rev-parse HEAD)" \
+  --tests passed \
+  --test-summary 'focused validation passed'
+```
+
+The host must opt in with `sbpd --enable-worker-writes
+--worker-result-inbox <private-directory>`. Acceptance means only
+`accepted_pending_reconciliation`: DWS still validates the exact handoff,
+decides the Bead outcome, and releases or quarantines the lease. Exact replay
+is idempotent; a different result for the same admission is refused.
+
 `SBP_REMOTE` is an endpoint, not a credential. Access still depends on the
 Orb's `tag:orb` identity and tailnet grants. When `sbpd --require-auth` is in
 use, the client additionally mints an in-memory, audience-`sbpd` Amp workload
@@ -543,9 +563,10 @@ started with both `--allowed-project-id <immutable-id>` and
 Do not change `sbpd` to `0.0.0.0`; bind it to loopback and/or the box's literal
 Tailscale address.
 
-Only fixed GET service/API reads are exposed: health, Cass status/search, and
-validated skill pull. Mutating verbs and arbitrary path/command delegation are
-denied. This route is not proof that the distinct hosted Sweet Potato/SPAPS
+Fixed GET service/API reads expose health, Cass status/search, and validated
+skill pull. The only write is the default-off, authenticated, bounded DWS
+result inbox above; arbitrary path/command delegation remains denied. This
+route is not proof that the distinct hosted Sweet Potato/SPAPS
 relying party accepts Amp identity; that requires its own live verifier
 contract and sanitized allow/deny receipt. Never start `spaps local` as a
 substitute.

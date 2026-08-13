@@ -497,6 +497,7 @@ Skills:
   __WRAPPER__ skill add NAME          Link NAME into global/project/category roots
   __WRAPPER__ skill resolve           Resolve admitted host skills without mutation
   __WRAPPER__ skill pull NAME         Read one admitted skill now without linking or activation
+  __WRAPPER__ dws complete ...        Submit one sealed Orb result for host reconciliation
   __WRAPPER__ skill activate NAME     Link NAME and return a session packet (mutates links)
   __WRAPPER__ skill why NAME          Explain visibility layers and exact fixes
   __WRAPPER__ skill togglable         List cwd-flippable skills and exact flip commands
@@ -771,6 +772,7 @@ payload = {
         {"name": "skills", "json": True, "safe_first_try": f"{wrapper} skills --issues-only --json"},
         {"name": "skill-why", "json": True, "safe_first_try": f"{wrapper} skill why <skill> --json"},
         {"name": "skill-pull", "json": True, "safe_first_try": f"{wrapper} skill pull <skill> --format json"},
+        {"name": "dws-complete", "json": True, "safe_first_try": f"{wrapper} dws complete --handoff <file> --outcome <status> --tests <status>", "notes": "Authenticated Orb result intake; accepted means pending host reconciliation, not delivered or closed."},
         {"name": "skill-togglable", "json": True, "safe_first_try": f"{wrapper} skill togglable --json"},
         {"name": "skill-what-if", "json": True, "safe_first_try": f"{wrapper} skill what-if --repo <repo-id-or-path> --overlay <overlay> --json"},
         {"name": "skill-heal", "json": True, "safe_first_try": f"{wrapper} skill heal <skill> --dry-run --format json"},
@@ -1037,6 +1039,10 @@ case "${1:-}" in
     action="cass"
     shift
     ;;
+  dws)
+    action="dws"
+    shift
+    ;;
   oracle|ask)
     action="oracle"
     shift
@@ -1170,7 +1176,7 @@ append_passthrough_token() {
           ;;
       esac
       ;;
-    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|mcp-sync|structure-doctor|git-status|repo-atlas|repo-registry|cass|cass-evidence|oracle|cron|send-later|safe|conference1|beads|mmdx|operator-booking|swimmers-launch|fleet)
+    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|mcp-sync|structure-doctor|git-status|repo-atlas|repo-registry|cass|dws|cass-evidence|oracle|cron|send-later|safe|conference1|beads|mmdx|operator-booking|swimmers-launch|fleet)
       passthrough_args+=("${token}")
       ;;
     *)
@@ -1488,6 +1494,15 @@ if [[ -n "${SBP_REMOTE:-}" && "${action}" == "skill" && "${passthrough_args[0]:-
   python3 "${script_dir}/lib/sbp_client.py" \
     --remote "${SBP_REMOTE}" skill "${passthrough_args[@]}"
   exit $?
+fi
+if [[ -n "${SBP_REMOTE:-}" && "${action}" == "dws" && "${passthrough_args[0]:-}" == "complete" ]]; then
+  python3 "${script_dir}/lib/sbp_client.py" \
+    --remote "${SBP_REMOTE}" dws "${passthrough_args[@]}"
+  exit $?
+fi
+if [[ "${action}" == "dws" ]]; then
+  echo "${wrapper_name} dws: SBP_REMOTE is required" >&2
+  exit 2
 fi
 
 cd "${skillbox_root}"

@@ -722,6 +722,72 @@ class SbpClientUnitTests(unittest.TestCase):
 
 
 class SbpDispatchTests(unittest.TestCase):
+    def test_sbp_remote_dispatches_dws_complete_over_http(self) -> None:
+        response_body = b'{"ok":true,"status":"accepted_pending_reconciliation"}'
+        seen: list[tuple[str, dict[str, object]]] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers["Content-Length"])
+                seen.append((self.path, json.loads(self.rfile.read(length))))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response_body)))
+                self.end_headers()
+                self.wfile.write(response_body)
+
+            def log_message(self, _format: str, *args: object) -> None:
+                del args
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        with tempfile.TemporaryDirectory() as temporary:
+            handoff_path = Path(temporary) / "handoff.json"
+            handoff_path.write_text(
+                json.dumps(
+                    {
+                        "repo": "fixture-repo",
+                        "base_sha": "a" * 40,
+                        "selected_project_id": "project-one",
+                        "admission_id": "dws-admission-fixture",
+                        "handoff_digest": "b" * 64,
+                        "work": {"bead_id": "fixture-bead"},
+                        "lease": {"lease_id": "dws-lease-fixture", "fencing_token": 7},
+                    }
+                )
+            )
+            env = os.environ.copy()
+            env["SBP_REMOTE"] = f"http://127.0.0.1:{server.server_port}"
+            result = subprocess.run(
+                [
+                    str(SBP_PATH),
+                    "dws",
+                    "complete",
+                    "--handoff",
+                    str(handoff_path),
+                    "--outcome",
+                    "success",
+                    "--commit-sha",
+                    "c" * 40,
+                    "--pushed-sha",
+                    "c" * 40,
+                    "--tests",
+                    "passed",
+                ],
+                cwd=ROOT,
+                env=env,
+                check=False,
+                capture_output=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual(result.stdout, response_body)
+        self.assertEqual(seen[0][0], "/v1/dws/complete/dws-admission-fixture")
+        self.assertEqual(seen[0][1]["schema_version"], "dws-worker-result/v1")
+        self.assertNotIn("proofs", seen[0][1])
+
     def test_sbp_remote_dispatches_search_over_http(self) -> None:
         body = b'{"status":"ok","result":{"hits":[{"id":"box"}]}}'
         seen_paths: list[str] = []

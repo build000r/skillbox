@@ -33,6 +33,7 @@ class CliWrapperTests(unittest.TestCase):
         self.assertIn("Alias for launch", result.stdout)
         self.assertIn("sbp skill resolve", result.stdout)
         self.assertIn("sbp skill pull NAME", result.stdout)
+        self.assertIn("sbp dws complete", result.stdout)
         self.assertIn("without linking or activation", result.stdout)
         self.assertIn("sbp skill activate NAME", result.stdout)
         self.assertIn("mutates links", result.stdout)
@@ -130,6 +131,7 @@ class CliWrapperTests(unittest.TestCase):
         bulk = next(command for command in payload["commands"] if command["name"] == "bulk")
         recalibrate = next(command for command in payload["commands"] if command["name"] == "recalibrate")
         pull_commands = [command for command in payload["commands"] if command["name"] == "skill-pull"]
+        dws_commands = [command for command in payload["commands"] if command["name"] == "dws-complete"]
         self.assertEqual(launch["aliases"], ["bulk"])
         self.assertEqual(bulk["alias_for"], "launch")
         self.assertTrue(recalibrate["json"])
@@ -144,6 +146,8 @@ class CliWrapperTests(unittest.TestCase):
                 }
             ],
         )
+        self.assertEqual(len(dws_commands), 1)
+        self.assertIn("pending host reconciliation", dws_commands[0]["notes"])
         self.assertIn("sbp down <profile> <service> --dry-run --json", payload["safety"]["dry_run_first"])
         self.assertIn("sbp launch <dir> <dir> --request '<prompt>' --dry-run --json", payload["safety"]["dry_run_first"])
         self.assertIn("sbp bulk <dir> <dir> --request '<prompt>' --dry-run --json", payload["safety"]["dry_run_first"])
