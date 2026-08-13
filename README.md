@@ -2,16 +2,25 @@
 
 # skillbox
 
-**Give your coding agents a real computer.**
+**For solo operators tired of rebuilding Claude/Codex context: one durable,
+private Linux workstation.**
 
-One private Linux box with persistent Claude/Codex homes, repo state, client overlays, logs, and checks.
-Not a platform. Not a sandbox that forgets you. A machine.
+`skillbox` is the source-available reference implementation: persistent agent
+homes, repos, client overlays, logs, and runtime checks—without making a hosted
+control plane or an ephemeral sandbox the center of the work.
 
-Built and dogfooded daily by one operator and his agents — see [Proof](#proof).
+**[Inspect the captured, commit-bound first-box proof →](examples/first-box-demo.md)**
+
+Captured on 2026-07-05 at commit `e6f21b0`, it resolved the declared runtime,
+focused a two-service demo client, kept its app on loopback, and ended with 15
+checks passed, one warning, and zero failures. This is operator evidence, not
+current-`main` or customer proof.
+
+Reading and reference only. No public grant permits installation, execution,
+modification, or redistribution. See [License](#license).
 
 ![runtime](https://img.shields.io/badge/runtime-Docker-2496ED?style=flat-square&logo=docker&logoColor=white)
 ![access](https://img.shields.io/badge/access-Tailscale-242424?style=flat-square&logo=tailscale&logoColor=white)
-![shape](https://img.shields.io/badge/shape-thin%20starter-6E7781?style=flat-square)
 ![doctor](https://img.shields.io/badge/doctor-manifest%20checks-2ea44f?style=flat-square)
 
 <!-- Hero demo placeholder: an asciinema->gif is being produced separately as
@@ -21,55 +30,27 @@ asset exists so the README never renders a broken image. -->
 
 </div>
 
-## Install
+## What changes with `skillbox`?
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/build000r/skillbox/main/install.sh | bash
-```
+| Before | With `skillbox` |
+|---|---|
+| Rebuild agent homes and repo context session by session | Mount durable homes, repos, logs, and client overlays back into one workspace |
+| Re-derive which services, skills, and checks belong to a client | Declare the runtime and activate one client context with inspectable commands |
+| Choose between a raw host and a remote-dev platform | Keep an operator-owned host while adding repeatable render, doctor, and focus flows |
+| Expose a public workspace or trust an opaque control plane | Use a Tailnet-first access model with explicit bind and posture checks |
 
-One command. It clones the repo, hydrates your `.env`, initializes durable state under `.skillbox-state/`, builds the workspace container, starts it, and leaves you a client-ready surface at `sand/personal/`.
+The product is deliberately narrow: one operator, one private workstation, and
+coding agents working against durable state. Read the honest comparison guide:
+[private coding-agent workstation vs. raw VPS, DevPod, and Coder](docs/private-coding-agent-workstation.md).
 
-Cautious? Append `--dry-run` to see the full plan before anything runs.
+## How it works
 
-### Seamless image paste
-
-On the operator Mac, install the reversible local + d3 bundle once from this
-checkout:
-
-```bash
-# Preview only; no remote writes.
-scripts/clipboard-bootstrap --profile d3 --dry-run
-
-# Install the local router and remote receiver.
-scripts/clipboard-bootstrap --profile d3 --apply-remote
-```
-
-Bootstrap never reloads a running tmux server. If `d2`/`d3` was already open,
-relaunch that one surface once so it picks up the managed fragment. Then copy
-an image, focus the Codex pane launched through `d2` or `d3`, and press `Cmd+V`
-(or `Ctrl+V`) once. The router uploads the image and
-injects its readable remote path into that exact pane; Codex renders it as an
-attachment. It does not choose a host, switch sessions, or press Enter.
-
-If paste does not attach, inspect the exact current route without contacting a
-host, then request one explicit reachability probe only if needed:
-
-```bash
-clipboard-paste status --profile d3
-clipboard-paste doctor --profile d3
-clipboard-paste doctor --profile d3 --probe-target
-```
-
-`clipimg-put d` is recovery only: it uploads the image and replaces the Mac
-clipboard with the remote path for a manual paste. Reverse the managed changes
-with `scripts/clipboard-bootstrap rollback`, or remove both sides with
-`scripts/clipboard-bootstrap uninstall --profile d3 --apply-remote`.
-
-The macOS + Ghostty + tracked tmux lane has real `devbox-1` image evidence;
-the remaining transport/support-matrix rows are still rollout gates. See
-[clipboard bootstrap](docs/clipboard-bootstrap.md) for the proof boundary,
-privacy model, diagnosis, fallback, lifecycle details, and the
-[future-host configuration recipe](docs/clipboard-bootstrap.md#future-host-no-new-clipboard-code).
+1. **Declare the box.** Repos, services, checks, logs, skills, and clients live
+   in inspectable manifests.
+2. **Focus the work.** Client focus syncs the relevant runtime and writes agent
+   context instead of making the operator reconstruct it by hand.
+3. **Prove the state.** Doctor, status, graph, and posture commands return
+   explicit checks and structured output.
 
 ## TL;DR
 
@@ -82,19 +63,23 @@ control plane.
 That is the whole product: a durable, private, agent-first machine — not a
 platform, not an ephemeral sandbox.
 
-`skillbox` gives you a cloneable starter for a Tailnet-first dev box with a
+`skillbox` is a reference implementation for a Tailnet-first dev box with a
 Docker workspace, durable state under `.skillbox-state/`, client overlays,
 explicit runtime graphs, and compact operator commands.
 
 ### Why Use `skillbox`?
 
 **Durable.**
-- Runtime state lives under `.skillbox-state/`, mounted back into the box so agent homes, logs, and client overlays survive rebuilds.
-- `workspace/runtime.yaml` plus `make doctor` keep docs, config, and the live runtime in agreement.
+- Runtime state lives outside the workspace container under `.skillbox-state/`
+  and is mounted back in. Agent homes, logs, and client overlays are intended to
+  survive workspace-container rebuilds; the dated proof below does not test
+  retention or every rebuild path.
+- `workspace/runtime.yaml` plus `make doctor` check and report whether docs,
+  config, and the live runtime agree.
 
 **Private.**
 - Managed boxes default to `tailnet_only`: public SSH is temporary during bootstrap/enroll, then host SSH and the DigitalOcean firewall lock to Tailnet access.
-- Operator secrets stay outside the workspace mount; in-box agents never see them.
+- The default state layout keeps the operator `.env` outside the workspace mount.
 
 **Agent-first.**
 - Persistent Claude/Codex homes, declared service graphs, and one-command client `focus` that syncs, starts services, and writes enriched agent context in a single pass.
@@ -104,7 +89,9 @@ Full needs-to-answers table → [docs/faq.md#why-use-skillbox](docs/faq.md#why-u
 
 ## Proof
 
-Measured in [examples/first-box-demo.md](examples/first-box-demo.md) (captured 2026-07-05):
+Measured in [examples/first-box-demo.md](examples/first-box-demo.md) (captured
+2026-07-05 from commit `e6f21b0`; current behavior should be rechecked before a
+release claim):
 
 - `make render` resolved 4 repos, 11 services, 7 logs, and 18 checks before the box started.
 - A demo client reached focus with 2 services running.
@@ -112,7 +99,12 @@ Measured in [examples/first-box-demo.md](examples/first-box-demo.md) (captured 2
 - Final doctor after cleanup: 15 passed, 1 warning, 0 failed.
 - Operator secrets stayed outside the workspace mount.
 
-Reproduce the proof: follow [examples/first-box-demo.md](examples/first-box-demo.md) from a clean clone.
+Inspect the captured proof and its exact commands in
+[examples/first-box-demo.md](examples/first-box-demo.md).
+
+There are no permissioned customer reports yet. The project does not substitute
+invented testimonials for that gap; the [field-report contract](docs/field-reports/README.md)
+defines what can become public proof.
 
 ## Why `skillbox` Exists
 
@@ -121,26 +113,6 @@ computer for one operator and their agents, with persistent homes, repo overlays
 explicit runtime state, and low operational ceremony.
 
 For the deeper thesis, see [docs/VISION.md](docs/VISION.md).
-
-## From A Local Checkout
-
-Prefer to drive it by hand? Clone and run the make sequence instead of the one-liner:
-
-```bash
-git clone https://github.com/build000r/skillbox.git
-cd skillbox
-make bootstrap-env
-make render
-make runtime-sync
-make doctor
-make dev-sanity
-make build
-make up
-make shell
-```
-
-For a captured zero-to-focused-client walkthrough with real expected output, see
-[examples/first-box-demo.md](examples/first-box-demo.md).
 
 ## When Not To Use `skillbox`
 
@@ -154,6 +126,41 @@ For a captured zero-to-focused-client walkthrough with real expected output, see
 
 `skillbox` is best when the problem is narrower: one operator-owned machine that
 should feel durable, legible, and agent-friendly.
+
+## Offer and cost
+
+The repository defines no paid plan, trial, hosted service, or support SLA.
+The reference design assumes an operator-managed compatible Docker host and a
+Tailnet-first access model. The code is source-available, not OSI-licensed; read
+the [license boundary](#license) before any action beyond inspection.
+
+## Questions operators ask while evaluating
+
+### Why not use a raw VPS and shell scripts?
+
+A raw host is the fastest way to start. Use `skillbox` when durable agent homes,
+client-scoped overlays, declared services, and repeatable checks are worth
+maintaining as one system instead of re-deriving them manually.
+
+### Why not use DevPod, Coder, Gitpod, Daytona, or E2B?
+
+Those tools solve adjacent jobs. `skillbox` is for one operator who wants a
+durable private workstation, not a browser IDE, a multi-user control plane, or
+an ephemeral execution substrate. See the [decision guide](docs/private-coding-agent-workstation.md)
+for a category-level comparison that avoids unverified performance claims.
+
+### Does “private” mean independently security-certified?
+
+No. “Private” describes the intended Tailnet-first topology and operator-owned
+infrastructure. It is not a certification or universal security guarantee.
+Inspect the [Tailnet-only lifecycle](docs/tailnet-only-lifecycle.md), bind checks,
+and proof commands for the controls that actually exist.
+
+### Does Skillbox send product analytics?
+
+No acquisition or product analytics contract is implemented in this repo.
+Runtime metrics and checks describe the operator's own box; they are not a
+central marketing telemetry feed.
 
 ## Command Surface
 
@@ -179,6 +186,7 @@ should feel durable, legible, and agent-friendly.
 | Tailnet-only lifecycle and recovery | [docs/tailnet-only-lifecycle.md](docs/tailnet-only-lifecycle.md) |
 | Tailnet ingress | [docs/tailnet-ingress.md](docs/tailnet-ingress.md) |
 | Vision and market map | [docs/VISION.md](docs/VISION.md) |
+| Private agent-workstation decision guide | [docs/private-coding-agent-workstation.md](docs/private-coding-agent-workstation.md) |
 | Full command/API reference | [docs/API_REFERENCE.md](docs/API_REFERENCE.md) |
 
 ## Quick Example
@@ -224,10 +232,6 @@ Moved to [docs/faq.md#design-stance](docs/faq.md#design-stance).
 ## Comparison
 
 Moved to [docs/faq.md#comparison](docs/faq.md#comparison).
-
-## Installation
-
-Moved to [docs/clients.md#installation](docs/clients.md#installation).
 
 ## Command Reference
 
