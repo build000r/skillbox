@@ -94,10 +94,24 @@ proposals under the state root, while callers interact through a stable contract
 
 ```bash
 python3 .env-manager/manage.py worker-submit analysis "Inspect this repo" --client skills --cwd "$PWD" --format json
+python3 .env-manager/manage.py worker-submit analysis "Inspect this repo" --client skills --cwd "$PWD" \
+  --need os:darwin --need xcode --need-trust local --format json
 python3 .env-manager/manage.py worker-status wr_YYYYMMDD_HHMMSS_abcdef --format json
 python3 .env-manager/manage.py worker-artifacts wr_YYYYMMDD_HHMMSS_abcdef --format json
 python3 .env-manager/manage.py worker-promote-learning lp_001 --target-kind skill --target-location opensource/skills/report-analyst --format json
 ```
+
+`--need` is a repeatable capability token (`os:darwin`, `xcode`, `docker`),
+not a KEY=VALUE pair. Optional `--need-trust local|allowlisted|explicit`,
+`--allow-unverified`, and `--idempotency-key` are also accepted. When needs
+are given, `create_worker_run` calls `placement.decide`, writes the full
+`machine-placement/v1` block onto `run.json` before launch, and starts the
+local Hermes broker only if the selected machine is this host. Otherwise the
+command fails with `PLACEMENT_NOT_LOCAL` (decision + `python3 scripts/box.py ssh <id>`
+in `next_actions`) and does not fabricate a run. A repeated
+`--idempotency-key` returns the existing `run_id` with `duplicate: true`.
+`worker-status` reprints the placement block when present. The broker does
+not SSH.
 
 The first runtime id is `hermes`, kept behind the broker contract. A resolved
 run writes `task.json`, then launches the first configured command from
@@ -273,6 +287,9 @@ MCP config symlinks report `broken_symlink`, and stale managed skill installs
 can report missing shared support files until `runtime-sync` repairs them.
 ## Fleet Management
 
+`manage.py fleet-converge` is skill/MCP heal, not computer inventory. Computers
+are `box`. Placement is `box place`. Runs are `worker`.
+
 The operator MCP server (`scripts/operator_mcp_server.py`) exposes box
 lifecycle as native agent tools, so Claude Code on the operator machine can
 provision, inspect, and tear down remote boxes without leaving the
@@ -292,6 +309,26 @@ make box-list
 make box-ssh BOX=acme-prod
 make box-down BOX=acme-prod
 ```
+
+Place work and inspect the machine union without provisioning. `box place`
+is read-only: it lazy-imports `placement.decide` and prints `Selected <id>`,
+checkmark reasons, and `Rejected: <id> — <reason>` from that decision.
+
+```bash
+python3 scripts/box.py place --need os:linux --format text
+python3 scripts/box.py place --need os:linux --need-trust allowlisted --allow-unverified --format json
+python3 scripts/box.py place --need docker --allow-provision --format json
+python3 scripts/box.py list --format json
+python3 scripts/box.py list --machine portfolio-devbox --format json
+python3 scripts/box.py register existing-host --host skillbox-existing --format json
+make box-register BOX=existing-host HOST=skillbox-existing
+```
+
+`box list` JSON includes `machine_view` (`id`, `kind` physical|persistent|ephemeral,
+`caps`, `trust`, `box_state`, `sources`). Text mode prints a `Machines:`
+section after the box rows. `--machine <id>` filters that union. `box
+register` admits an existing shared or manually created host into
+`workspace/boxes.json`; it is not `box up`.
 
 Available MCP tools:
 
@@ -481,6 +518,8 @@ Details that matter:
 | `make box-list` | List all boxes from inventory |
 | `make box-ssh` | SSH into a remote box |
 | `make box-profiles` | List available box profiles |
+| `make box-register` | Register an existing shared or external host into local inventory (`BOX=id HOST=name`) |
+| `make box-unregister` | Remove a registered external box from local inventory (`BOX=id`) |
 
 ### Scripts
 
@@ -488,6 +527,9 @@ Details that matter:
 |---|---|---|
 | `scripts/01-bootstrap-do.sh` | Bootstrap a fresh Ubuntu or DigitalOcean host | `sudo ./scripts/01-bootstrap-do.sh` |
 | `scripts/02-install-tailscale.sh` | Join the tailnet and harden SSH. Standalone default keeps public SSH for recovery; managed `box up` passes `TAILNET_ONLY_SSH=true` for `tailnet_only` boxes. | `sudo TAILSCALE_AUTHKEY="tskey-..." TAILNET_ONLY_SSH=true ./scripts/02-install-tailscale.sh` |
+| `scripts/box.py place` | Read-only placement (`decide()` over machines ∪ boxes; no provision) | `python3 scripts/box.py place --need os:linux --format text` |
+| `scripts/box.py list` | Active boxes plus `machine_view` union; `--machine <id>` filters | `python3 scripts/box.py list --machine portfolio-devbox --format json` |
+| `scripts/box.py register` | Admit an existing host into `workspace/boxes.json` | `python3 scripts/box.py register <id> --host <tailscale-hostname> --format json` |
 | `scripts/04-reconcile.py render` | Print the resolved sandbox model | `python3 scripts/04-reconcile.py render --with-compose` |
 | `scripts/04-reconcile.py doctor` | Run drift and readiness checks | `python3 scripts/04-reconcile.py doctor` |
 | `scripts/05-swimmers.sh` | Manage the workspace-local swimmers install and process lifecycle | `./scripts/05-swimmers.sh status` |

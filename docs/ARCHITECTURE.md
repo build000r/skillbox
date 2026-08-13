@@ -122,12 +122,13 @@ runtime-manager Python modules.
 | `graph_cycle_evidence.py` | Pure shared cycle/SCC leaf used by validation and graph algorithms. | `normalize_graph`, `strongly_connected_components`, `cycle_evidence` |
 | `inventory.py` | Skill source discovery, installed occurrence inventory, global-home resolution, and parity. | `resolve_global_homes`, `global_home_surfaces_report`, `collect_skill_parity` |
 | `lifecycle.py` | Mutating skill lifecycle plans: link, unlink, sync, prune, and overlay activation. | `skill_lifecycle_plan`, `apply_skill_lifecycle_plan`, `activate_overlay_scoped_skills` |
-| `machines.py` | Machine profile loading, current-machine detection, alias canonicalization, and cross-machine path translation. | `MachinesConfig`, `MachineProfile`, `load_machines_config`, `detect_machine_id` |
+| `machines.py` | Machine identity store: profile loading, stored caps/trust, current-machine detection, alias canonicalization, and cross-machine path translation. | `MachinesConfig`, `MachineProfile`, `load_machines_config`, `detect_machine_id` |
 | `mcp_render.py` | Single-source MCP renderer for `.mcp.json` and `.codex/config.toml`. | `canonical_server_map`, `collect_mcp_render`, `render_mcp_sync` |
 | `mcp_visibility.py` | Claude/Codex MCP parity audit against declared `kind:mcp` runtime services. | `collect_mcp_audit`, `print_mcp_audit_text` |
 | `mmdx_open.py` | Fuzzy finder/opener for repo-local Mermaid/MMDX diagrams. | `mmdx_open_payload`, `mmdx_error_payload`, `print_mmdx_payload_text` |
 | `operator_booking.py` | Client-configured human-operator booking/availability surface. | `operator_booking_payload`, `operator_booking_error_payload` |
 | `parity_report.py` | Read-only dev/prod parity report for one client runtime graph. | `collect_dev_prod_parity_report`, `emit_dev_prod_parity_report` |
+| `placement.py` | Pure machine-placement decision over declared machines ∪ boxes. No I/O, no provider calls. | `decide`, `machine_view`, `gather_observations` |
 | `policy_eval.py` | Skill scope policy, overlays, machine/registry resolution, and effective overlay state. | `active_overlays`, `overlay_scoped_skill_names` |
 | `port_registry.py` | Machine-readable port registry built conservatively from resolved services, ingress, and env surfaces. | `build_port_registry`, `port_registry_payload`, `port_registry_text_lines` |
 | `pressure_report.py` | Disk pressure and storage guard posture report. | `collect_pressure_report`, `pressure_report_text_lines` |
@@ -323,7 +324,52 @@ the delegate sources, so `state_mutation.inventory_complete()` now returns
 | `manage.cass-evidence` | **`read`.** `--proposals` is a print-only mode (`sbp_evidence.py:812-813`); `proposals()` computes, prints JSON and returns (`:747-787`). An AST sweep of the delegate found exactly one `open()`, in read mode (`:724`), and zero write primitives and zero `subprocess`. Its only child process is a fixed `cass search … --json` over ssh, and `search` is on the read-only verb allowlist. |
 | `manage.mmdx` | **`conditional_mutation`,** with a bounded window. The default invocation writes nothing: the detached bridge is spawned only under `--tmux` (`mmd.py:3015`), and without it the browser opens a remote URL with no local endpoint. Under `--tmux`, a detached grandchild serves `POST /source/write` (`mmd.py:923`) for at most `DEFAULT_HANDOFF_TTL_SECONDS` = 600s (`mmd.py:54`, enforced at `:1081` and `:931-933`), admitted by exact `Origin` plus a `secrets.token_urlsafe(24)` match, bound to one resolved path, capped at 512 KiB. |
 
-## 7. Extension Recipes
+## 7. Machine fabric
+
+One operator, one durable box remains the local-first unit of truth.
+Multiple Skillbox-managed machines can participate in one provider-neutral
+execution fabric without surrendering machine-local truth. Computers are
+`box`. Runs are `worker`. `fleet` stays skill/MCP heal (`fleet_converge.py`).
+
+| Layer | Store / module | Role |
+|---|---|---|
+| Identity | `skillbox-config/machines.yaml` + `machines.py` | Durable `machine_id`. `MachineProfile` loads stored `caps` (`os:*`, `arch:*`, `xcode`, `docker`, `gpu`, `tailnet`, `durable`) and stored `trust` (`local` / `allowlisted` / `explicit`). Hostnames are hints. `SKILLBOX_MACHINE` overrides only when it names a declared machine. |
+| Instance | `workspace/boxes.json` + `scripts/box.py` | Lifecycle. `box up` provisions. `box register --host` admits an existing host. Join to identity is exact id equality. |
+| Placement | `runtime_manager/placement.py` | The only machine chooser. `decide(...)` is snapshot-in / `kind=machine-placement/v1` out (`selected`, `no_match`, `provision_proposed`, `denied`) with `reasons[]`, complete `rejected[]`, and `next_actions`. Zero I/O. `gather_observations()` is the only helper that reads inventory: current host → `source=self`; box `state==ready` → `source=inventory-state`; unknown is unverified, not available. |
+| Executors | existing paths | Local worker broker; `box.py ssh` / `operator_box_exec`; `rch-report --target-box`. Chosen as a derived string, not a class. |
+| Proof | `.skillbox-state/worker-runs/<wr_*>/run.json` | When `worker-submit` is given `--need`, the full `decide()` block is written onto the run before launch. Existing box/provider receipts stay on the box lifecycle path. |
+
+One placement authority: `box place` and `worker-submit --need` both call
+`placement.decide`. Amp/Orb placement stays a separate Amp-lane authority and
+is not re-implemented here.
+
+Provision ≠ selection ≠ execution. `decide` never calls a provider. With
+`--allow-provision` and no eligible machine it may emit one
+`python3 scripts/box.py up <profile> --profile <profile> --dry-run --format json`
+next-action. `box up` still provisions. `worker-submit` launches the local
+Hermes broker only when `decision.machine_id` equals the current machine;
+otherwise it raises `PLACEMENT_NOT_LOCAL` with the decision and a
+`python3 scripts/box.py ssh <id>` next-action, and fabricates no run state.
+Live remote dispatch from the broker is not implemented.
+
+Physical machines are first-class. A declared `machines.yaml` row with
+`os:darwin` or `trust=local` and no box is `kind=physical` in `box list`'s
+`machine_view`. `box register` puts an existing host into `boxes.json` so it
+joins the union. Box-only managed rows are `ephemeral`;
+`management_mode=external` is `persistent`.
+
+DigitalOcean is the current `BoxProfile.provider` default. Lifecycle reducers
+already consume `ProviderObservation` (`found`, `confirmed-not-found`,
+`retryable-failure`, `permanent-failure`, `malformed-response`). Placement
+never branches on a provider string. A future provider is another
+`BoxProfile.provider` value plus observation functions that return that same
+shape.
+
+Deliberately out of scope in this slice: machine leases / fence epochs,
+capability TTLs, wake-on-LAN / sleep verbs, DO budget caps, and live remote
+dispatch from the worker broker.
+
+## 8. Extension Recipes
 
 ### Add a Command
 
