@@ -24,7 +24,7 @@ import urllib.request
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 try:
     import yaml
@@ -133,6 +133,8 @@ WORKER_ERROR_CODES = (
     "WORKER_RESULT_NOT_READY",
     "WORKER_LEARNING_REVIEW_REQUIRED",
     "WORKER_WRITEBACK_REJECTED",
+    "WORKER_RUN_EXISTS",
+    "PLACEMENT_NOT_LOCAL",
 )
 
 WORKER_CONTEXT_UNRESOLVED = "WORKER_CONTEXT_UNRESOLVED"
@@ -150,6 +152,28 @@ WORKER_RESULT_NOT_READY = "WORKER_RESULT_NOT_READY"
 WORKER_LEARNING_REVIEW_REQUIRED = "WORKER_LEARNING_REVIEW_REQUIRED"
 
 WORKER_WRITEBACK_REJECTED = "WORKER_WRITEBACK_REJECTED"
+
+WORKER_RUN_EXISTS = "WORKER_RUN_EXISTS"
+
+PLACEMENT_NOT_LOCAL = "PLACEMENT_NOT_LOCAL"
+
+REMOTE_RESULT_COMPLETED = "completed"
+
+REMOTE_RESULT_UNAVAILABLE = "result_unavailable"
+
+REMOTE_RESULT_COMMAND_FAILED = "command_failed"
+
+# Mirrored from scripts/box.py DEFAULT_SSH_OPTS. Do not import scripts/lib.
+WORKER_SSH_OPTS = (
+    "-o",
+    "StrictHostKeyChecking=accept-new",
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "BatchMode=yes",
+)
+
+WORKER_DEFAULT_SSH_USER = "skillbox"
 
 WORKER_DEFAULT_RUNTIME_ID = "hermes"
 
@@ -213,14 +237,58 @@ class WorkerRun:
     blocked_reason: str | None
 
 def worker_runtime_error_payload(exc: WorkerRuntimeError) -> dict[str, Any]:
+    next_actions = None
+    if isinstance(exc.details, dict):
+        raw_actions = exc.details.get("next_actions")
+        if isinstance(raw_actions, list):
+            next_actions = [str(item) for item in raw_actions]
     payload = structured_error(
         str(exc),
         error_type=exc.code,
         recoverable=exc.recoverable,
+        next_actions=next_actions,
     )
     if exc.details:
         payload["error"]["details"] = exc.details
     return payload
+
+
+def classify_remote_result(exit_code: int | None, transport_failure: bool) -> str:
+    """Classify a remote dispatch outcome without mutating worker state.
+
+    Truth table (opslib.classify_ssh_failure semantics, no scripts/lib import):
+    exit 0 and not transport_failure → completed;
+    transport_failure after dispatch (rc 255 / TIMEOUT) → result_unavailable;
+    nonzero remote rc → command_failed.
+    """
+    if transport_failure:
+        return REMOTE_RESULT_UNAVAILABLE
+    try:
+        code = int(exit_code) if exit_code is not None else -1
+    except (TypeError, ValueError):
+        code = -1
+    if code == 0:
+        return REMOTE_RESULT_COMPLETED
+    return REMOTE_RESULT_COMMAND_FAILED
+
+
+def build_remote_submit_command(
+    decision: Mapping[str, Any] | None,
+    task_argv: list[str] | tuple[str, ...] | None,
+) -> list[str]:
+    """Compose an ssh argv from a placement decision. Never executes it."""
+    payload = decision if isinstance(decision, Mapping) else {}
+    target = str(payload.get("box_id") or payload.get("machine_id") or "").strip()
+    remote_parts = [str(part) for part in (task_argv or ())]
+    command = [
+        "ssh",
+        *WORKER_SSH_OPTS,
+        "--",
+        f"{WORKER_DEFAULT_SSH_USER}@{target}",
+    ]
+    if remote_parts:
+        command.append(" ".join(shlex.quote(part) for part in remote_parts))
+    return command
 
 def _worker_now() -> float:
     return time.time()
@@ -285,6 +353,191 @@ def worker_runs_root(root_dir: Path) -> Path:
     if state_root:
         return Path(state_root).expanduser() / "worker-runs"
     return root_dir / ".skillbox-state" / "worker-runs"
+
+
+def _normalize_worker_needs(
+    needs: list[str] | dict[str, Any] | None,
+    need_trust: str | None,
+    allow_unverified: bool,
+) -> dict[str, Any] | None:
+    caps: list[str] = []
+    trust = str(need_trust or "").strip() or None
+    unverified = bool(allow_unverified)
+    given = False
+    if isinstance(needs, dict):
+        given = True
+        for item in needs.get("caps") or ():
+            token = str(item).strip()
+            if token and token not in caps:
+                caps.append(token)
+        raw_trust = needs.get("trust")
+        if raw_trust not in (None, ""):
+            trust = str(raw_trust).strip() or trust
+        if "allow_unverified" in needs:
+            unverified = bool(needs.get("allow_unverified"))
+    elif needs:
+        given = True
+        for item in needs:
+            token = str(item).strip()
+            if not token:
+                continue
+            if "=" in token and ":" not in token.split("=", 1)[0]:
+                key, value = token.split("=", 1)
+                token = f"{key.strip()}:{value.strip()}"
+            if token and token not in caps:
+                caps.append(token)
+    if trust or unverified:
+        given = True
+    if not given:
+        return None
+    return {
+        "caps": caps,
+        "trust": trust,
+        "allow_unverified": unverified,
+        "allow_provision": False,
+    }
+
+
+def _load_worker_boxes(root_dir: Path) -> list[Any]:
+    path = root_dir / "workspace" / "boxes.json"
+    if not path.is_file():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if isinstance(payload, dict):
+        boxes = payload.get("boxes")
+        return boxes if isinstance(boxes, list) else []
+    return payload if isinstance(payload, list) else []
+
+
+def _load_worker_box_profiles(root_dir: Path) -> list[dict[str, Any]]:
+    profiles_dir = root_dir / "workspace" / "box-profiles"
+    if yaml is None or not profiles_dir.is_dir():
+        return []
+    profiles: list[dict[str, Any]] = []
+    for path in sorted(profiles_dir.glob("*.yaml")):
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, Exception):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        profiles.append(
+            {
+                "id": str(raw.get("id") or path.stem),
+                "image": raw.get("image"),
+                "size": raw.get("size"),
+            }
+        )
+    return profiles
+
+
+def _decide_worker_placement(
+    root_dir: Path,
+    needs: dict[str, Any],
+) -> tuple[dict[str, Any], str | None]:
+    from runtime_manager import machines as machines_mod
+    from runtime_manager.placement import decide, gather_observations
+
+    machines_path = root_dir / machines_mod.MACHINES_FILE_NAME
+    try:
+        if machines_path.is_file():
+            config = machines_mod.load_machines_config(machines_path)
+        else:
+            config = machines_mod.load_machines_config(root_dir=root_dir)
+    except machines_mod.MachinesConfigError as exc:
+        raise WorkerRuntimeError(
+            WORKER_POLICY_BLOCKED,
+            f"Cannot decide placement: {exc}",
+            details={"field": "needs"},
+        ) from exc
+    boxes = _load_worker_boxes(root_dir)
+    profiles = _load_worker_box_profiles(root_dir)
+    current_id = machines_mod.detect_machine_id(config)
+    observations = gather_observations(current_id, boxes)
+    return decide(needs, config, boxes, observations, profiles, current_id), current_id
+
+
+def _placement_not_local_next_actions(decision: Mapping[str, Any]) -> list[str]:
+    actions: list[str] = []
+    for item in decision.get("next_actions") or ():
+        text = str(item).strip()
+        if text and text not in actions:
+            actions.append(text)
+    target = str(decision.get("box_id") or decision.get("machine_id") or "").strip()
+    if target:
+        ssh_line = f"python3 scripts/box.py ssh {target}"
+        if ssh_line not in actions:
+            actions.append(ssh_line)
+    if not actions:
+        actions.append("python3 scripts/box.py place --format json")
+    return actions
+
+
+def _raise_placement_not_local(decision: Mapping[str, Any]) -> None:
+    next_actions = _placement_not_local_next_actions(decision)
+    raise WorkerRuntimeError(
+        PLACEMENT_NOT_LOCAL,
+        "Placement selected a machine that is not the current host.",
+        recoverable=True,
+        details={
+            "decision": dict(decision),
+            "next_actions": next_actions,
+        },
+    )
+
+
+def _worker_idempotency_path(root_dir: Path, key: str) -> Path:
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return worker_runs_root(root_dir) / "idempotency" / digest
+
+
+def _claim_worker_idempotency_key(root_dir: Path, key: str, run_id: str) -> str | None:
+    """O_EXCL claim. Returns the existing run_id on duplicate, else None."""
+    path = _worker_idempotency_path(root_dir, key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"key": key, "run_id": run_id}, sort_keys=True) + "\n"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(str(path), flags, 0o644)
+    except FileExistsError:
+        try:
+            existing = load_json_file(path)
+        except RuntimeError:
+            existing = {}
+        return str(existing.get("run_id") or "").strip()
+    try:
+        os.write(descriptor, payload.encode("utf-8"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return None
+
+
+def _ensure_new_worker_run_path(run_path: Path, run_id: str) -> None:
+    if run_path.exists():
+        raise WorkerRuntimeError(
+            WORKER_RUN_EXISTS,
+            f"Worker run already exists: {run_id}",
+            recoverable=True,
+            details={"run_id": run_id, "path": str(run_path)},
+        )
+    run_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(str(run_path), flags, 0o644)
+    except FileExistsError:
+        raise WorkerRuntimeError(
+            WORKER_RUN_EXISTS,
+            f"Worker run already exists: {run_id}",
+            recoverable=True,
+            details={"run_id": run_id, "path": str(run_path)},
+        ) from None
+    os.close(descriptor)
 
 def worker_run_paths(root_dir: Path, run_id: str) -> dict[str, Path]:
     normalized_run_id = _normalize_worker_run_id(run_id)
@@ -856,6 +1109,10 @@ def create_worker_run(
     harness_session_ref: str | None = None,
     inputs: list[dict[str, Any]] | None = None,
     run_id: str | None = None,
+    needs: list[str] | dict[str, Any] | None = None,
+    need_trust: str | None = None,
+    allow_unverified: bool = False,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     normalized_task_class = _normalize_worker_choice(
         task_class,
@@ -886,7 +1143,30 @@ def create_worker_run(
         default=WORKER_DEFAULT_MEMORY_SCOPE,
         error_code=WORKER_POLICY_BLOCKED,
     )
+    placement_needs = _normalize_worker_needs(needs, need_trust, allow_unverified)
+    placement_block: dict[str, Any] | None = None
+    if placement_needs is not None:
+        placement_block, current_id = _decide_worker_placement(root_dir, placement_needs)
+        selected = str(placement_block.get("machine_id") or "").strip()
+        current = str(current_id or "").strip()
+        if (
+            placement_block.get("decision") != "selected"
+            or not selected
+            or selected != current
+        ):
+            _raise_placement_not_local(placement_block)
     normalized_run_id = _normalize_worker_run_id(str(run_id or ""))
+    normalized_idempotency_key = str(idempotency_key or "").strip()
+    if normalized_idempotency_key:
+        existing_run_id = _claim_worker_idempotency_key(
+            root_dir, normalized_idempotency_key, normalized_run_id
+        )
+        if existing_run_id:
+            existing = _reconcile_worker_payload(
+                root_dir, read_worker_run(root_dir, existing_run_id)
+            )
+            existing["duplicate"] = True
+            return existing
     normalized_client_id = _normalize_worker_client_id(client_id)
     normalized_cwd = str(cwd or "").strip()
     normalized_repo_hint = str(repo_hint or "").strip()
@@ -921,6 +1201,7 @@ def create_worker_run(
         blocked_reason=blocked_reason,
     )
     paths = worker_run_paths(root_dir, normalized_run_id)
+    _ensure_new_worker_run_path(paths["run_path"], normalized_run_id)
     launch = {
         "attempted": False,
         "blocked_reason": blocked_reason,
@@ -949,6 +1230,9 @@ def create_worker_run(
         },
         "next_actions": [f"worker-status {normalized_run_id} --format json"],
     }
+    if placement_block is not None:
+        payload["placement"] = placement_block
+        payload["machine_id"] = placement_block.get("machine_id")
 
     write_json_file(paths["run_path"], payload)
     _append_jsonl(
@@ -973,7 +1257,7 @@ def worker_status_payload(root_dir: Path, run_id: str) -> dict[str, Any]:
     payload = _reconcile_worker_payload(root_dir, read_worker_run(root_dir, run_id))
     run = payload.get("run") or {}
     state = _worker_payload_state(payload)
-    return {
+    status: dict[str, Any] = {
         "run_id": payload["run_id"],
         "runtime": payload.get("runtime") or run.get("runtime"),
         "state": state,
@@ -983,6 +1267,11 @@ def worker_status_payload(root_dir: Path, run_id: str) -> dict[str, Any]:
         "learning_review_required": _worker_learning_review_required(payload),
         "run": run,
     }
+    if payload.get("placement"):
+        status["placement"] = payload["placement"]
+    if payload.get("machine_id"):
+        status["machine_id"] = payload["machine_id"]
+    return status
 
 def worker_artifacts_payload(root_dir: Path, run_id: str) -> dict[str, Any]:
     payload = _reconcile_worker_payload(root_dir, read_worker_run(root_dir, run_id))

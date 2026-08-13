@@ -2436,6 +2436,27 @@ def _build_parser() -> argparse.ArgumentParser:
     worker_submit_parser.add_argument("--memory-scope", choices=WORKER_MEMORY_SCOPES, default=WORKER_DEFAULT_MEMORY_SCOPE)
     worker_submit_parser.add_argument("--artifact-policy", default=WORKER_DEFAULT_ARTIFACT_POLICY)
     worker_submit_parser.add_argument("--harness-session-ref", default="", help="Opaque caller correlation id.")
+    worker_submit_parser.add_argument(
+        "--need",
+        action="append",
+        default=[],
+        help="Repeatable placement capability token (e.g. xcode, os:darwin).",
+    )
+    worker_submit_parser.add_argument(
+        "--need-trust",
+        default="",
+        help="Minimum stored trust floor: local, allowlisted, or explicit.",
+    )
+    worker_submit_parser.add_argument(
+        "--allow-unverified",
+        action="store_true",
+        help="Allow placement of machines without a reachability observation.",
+    )
+    worker_submit_parser.add_argument(
+        "--idempotency-key",
+        default="",
+        help="Reuse an existing worker run when this key was already submitted.",
+    )
     worker_submit_parser.add_argument("--format", choices=("text", "json"), default="text")
 
     worker_status_parser = subparsers.add_parser(
@@ -3231,6 +3252,10 @@ def _handle_worker_submit(args: argparse.Namespace, root_dir: Path) -> int:
             write_scope=args.write_scope,
             memory_scope=args.memory_scope,
             harness_session_ref=args.harness_session_ref,
+            needs=list(args.need or []),
+            need_trust=args.need_trust or None,
+            allow_unverified=bool(args.allow_unverified),
+            idempotency_key=args.idempotency_key or None,
         ),
     )
     return _emit_worker_cli_payload(args, exit_code, payload, _worker_submit_text)
@@ -3273,11 +3298,16 @@ def _worker_submit_text(payload: dict[str, Any]) -> list[str]:
 
 
 def _worker_status_text(payload: dict[str, Any]) -> list[str]:
-    return [
+    lines = [
         f"worker run: {payload['run_id']}",
         f"state: {payload['state']}",
         f"runtime: {payload['runtime']}",
     ]
+    placement = payload.get("placement") or {}
+    machine_id = payload.get("machine_id") or placement.get("machine_id")
+    if machine_id:
+        lines.append(f"machine: {machine_id}")
+    return lines
 
 
 def _worker_artifacts_text(payload: dict[str, Any]) -> list[str]:
