@@ -167,6 +167,8 @@ DCG_RECONCILE_WRITE_FAILED = "DCG_RECONCILE_WRITE_FAILED"
 DCG_RECONCILE_NO_BACKUP = "DCG_RECONCILE_NO_BACKUP"
 DCG_RECONCILE_BYPASS_FORBIDDEN = "DCG_RECONCILE_BYPASS_FORBIDDEN"
 DCG_RECONCILE_BAD_ARGUMENT = "DCG_RECONCILE_BAD_ARGUMENT"
+DCG_RECONCILE_SITE_POLICY_REQUIRED = "DCG_RECONCILE_SITE_POLICY_REQUIRED"
+DCG_RECONCILE_POLICY_ADOPTION_MISMATCH = "DCG_RECONCILE_POLICY_ADOPTION_MISMATCH"
 
 CODEX_TRUST_ABSENT = "absent"
 CODEX_TRUST_STALE = "stale"
@@ -845,8 +847,163 @@ def _codex_trust_state(
     }
 
 
-def _policy_text() -> str:
-    return _policy.render()
+def _policy_text(policy: _policy.DcgPolicy) -> str:
+    return _policy.render_policy(policy)
+
+
+def _site_policy_receipt(sites: Sequence[_policy.DcgSitePolicy]) -> dict[str, Any]:
+    """Metadata safe for ledgers and command output; never rule bodies or paths."""
+    return {
+        "required": bool(sites),
+        "sites": [site.to_receipt() for site in sites],
+    }
+
+
+def _load_site_policies(
+    paths: Sequence[Path | str], ledger_entry: Mapping[str, Any]
+) -> tuple[_policy.DcgSitePolicy, ...]:
+    """Load explicit private input before any write planning.
+
+    Once a home has adopted a site policy, omission is a hard error. A changed
+    digest for the same site id is an ordinary policy update; silently changing
+    the owning site identity is not.
+    """
+    recorded = ledger_entry.get("site_policy") or {}
+    required = bool(recorded.get("required")) if isinstance(recorded, Mapping) else False
+    if required and not paths:
+        raise ValidationError(
+            DCG_RECONCILE_SITE_POLICY_REQUIRED,
+            "This managed home requires its private DCG site policy input.",
+            next_actions=[
+                "Re-run with the same `--site-policy` source used for adoption."
+            ],
+            recoverable=False,
+        )
+    sites = tuple(_policy.load_site_policy_file(Path(path)) for path in paths)
+    if required:
+        prior_sites = recorded.get("sites") or []
+        prior_ids = [
+            str(item.get("site_id") or "")
+            for item in prior_sites
+            if isinstance(item, Mapping)
+        ]
+        current_ids = [site.site_id for site in sites]
+        if prior_ids != current_ids:
+            raise ValidationError(
+                DCG_RECONCILE_SITE_POLICY_REQUIRED,
+                "The private DCG site-policy identity differs from the adopted owner.",
+                context={"expected_site_ids": prior_ids, "actual_site_ids": current_ids},
+                next_actions=[
+                    "Restore the adopted site-policy source; use a reviewed migration for owner changes."
+                ],
+                recoverable=False,
+            )
+    return sites
+
+
+def _semantic_pattern(pattern: str) -> str:
+    """Collapse the one harmless quote escape used by the pre-owner live TOML."""
+    return pattern.replace(r'\"', '"')
+
+
+def _adoption_mismatches(existing_text: str, desired_text: str) -> list[str]:
+    """Return policy sections that a generated takeover would weaken or alter."""
+    try:
+        existing = tomllib.loads(existing_text)
+        desired = tomllib.loads(desired_text)
+    except tomllib.TOMLDecodeError:
+        return ["toml"]
+    allowed_paths = _policy.UPSTREAM_KEY_PATHS
+    if not _policy.key_paths(existing).issubset(allowed_paths):
+        return ["unknown-keys"]
+
+    mismatches: list[str] = []
+    if existing.get("general") != desired.get("general"):
+        mismatches.append("general")
+
+    existing_packs = list((existing.get("packs") or {}).get("enabled") or [])
+    desired_packs = list((desired.get("packs") or {}).get("enabled") or [])
+    missing_packs = [pack for pack in existing_packs if pack not in desired_packs]
+    added_packs = [pack for pack in desired_packs if pack not in existing_packs]
+    if missing_packs or any(pack not in _policy.DEFAULT_PACKS for pack in added_packs):
+        mismatches.append("packs")
+
+    existing_overrides = existing.get("overrides") or {}
+    desired_overrides = desired.get("overrides") or {}
+    if list(existing_overrides.get("allow") or []) != list(desired_overrides.get("allow") or []):
+        mismatches.append("allowlist")
+
+    def blocks(document: Mapping[str, Any]) -> list[tuple[str, str]]:
+        raw = (document.get("overrides") or {}).get("block") or []
+        return [
+            (_semantic_pattern(str(item.get("pattern") or "")), str(item.get("reason") or ""))
+            for item in raw
+            if isinstance(item, Mapping)
+        ]
+
+    if blocks(existing) != blocks(desired):
+        mismatches.append("blocklist")
+    if existing.get("agents") != desired.get("agents"):
+        mismatches.append("agents")
+    return mismatches
+
+
+def _validate_marker_owned_policy(text: str) -> None:
+    """Validate stale owned bytes without requiring the previous private source.
+
+    The ledger intentionally stores no private rule bodies. Therefore a valid
+    site-policy update can only prove the old render structurally: pinned keys,
+    fail-closed type, canonical public block prefix, and no duplicate patterns.
+    The new desired composition is validated exactly before it replaces this.
+    """
+    try:
+        document = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise _malformed(Path(POLICY_RELPATH), f"policy is not valid TOML: {exc}") from exc
+    if not _policy.key_paths(document).issubset(_policy.UPSTREAM_KEY_PATHS):
+        raise ValidationError(
+            DCG_RECONCILE_MALFORMED_CONFIG,
+            "Marker-owned DCG policy contains keys outside the pinned schema.",
+            recoverable=False,
+        )
+    if not isinstance((document.get("general") or {}).get("fail_closed"), bool):
+        raise ValidationError(
+            DCG_RECONCILE_MALFORMED_CONFIG,
+            "Marker-owned DCG policy lacks boolean fail_closed.",
+            recoverable=False,
+        )
+    raw_blocks = (document.get("overrides") or {}).get("block") or []
+    if not isinstance(raw_blocks, list):
+        raise ValidationError(
+            DCG_RECONCILE_MALFORMED_CONFIG,
+            "Marker-owned DCG policy blocklist is not an array.",
+            recoverable=False,
+        )
+    blocks = [
+        (
+            _semantic_pattern(str(item.get("pattern") or "")),
+            str(item.get("reason") or ""),
+        )
+        for item in raw_blocks
+        if isinstance(item, Mapping)
+    ]
+    public_prefix = [
+        (_semantic_pattern(rule.pattern), rule.reason)
+        for rule in _policy.DEFAULT_BLOCK_RULES
+    ]
+    if len(blocks) != len(raw_blocks) or blocks[: len(public_prefix)] != public_prefix:
+        raise ValidationError(
+            DCG_RECONCILE_MALFORMED_CONFIG,
+            "Marker-owned DCG policy is missing or changes the public block-rule prefix.",
+            recoverable=False,
+        )
+    patterns = [pattern for pattern, _reason in blocks]
+    if len(patterns) != len(set(patterns)):
+        raise ValidationError(
+            DCG_RECONCILE_MALFORMED_CONFIG,
+            "Marker-owned DCG policy contains duplicate block patterns.",
+            recoverable=False,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -940,30 +1097,56 @@ def _plan_hook_file(
     )
 
 
-def _plan_policy(layout_: Layout, ledger_entry: Mapping[str, Any]) -> _AgentPlan:
+def _plan_policy(
+    layout_: Layout,
+    ledger_entry: Mapping[str, Any],
+    *,
+    desired_policy: _policy.DcgPolicy,
+    sites: Sequence[_policy.DcgSitePolicy],
+    adopt_policy: bool,
+) -> _AgentPlan:
     path = layout_.policy_config
     raw = _read_text(path)
-    desired = _policy_text()
+    desired = _policy_text(desired_policy)
+    site_receipt = _site_policy_receipt(sites)
     if raw is not None and not raw.startswith(_policy.GENERATED_MARKER):
-        return _AgentPlan(
-            agent="policy",
-            path=path,
-            state=STATE_NEEDS_OPERATOR,
-            detail="user DCG config is hand-owned (no generated marker); left untouched",
-            extra={
-                "operator_action": (
-                    f"Review {path}; remove it to let Skillbox own the rendered policy, or keep it as-is."
+        if adopt_policy:
+            mismatches = _adoption_mismatches(raw, desired)
+            if mismatches:
+                raise ValidationError(
+                    DCG_RECONCILE_POLICY_ADOPTION_MISMATCH,
+                    "Generated DCG policy adoption would change or drop hand-owned behavior.",
+                    context={"mismatched_sections": mismatches},
+                    next_actions=[
+                        "Repair the private site policy until the semantic before/after audit is lossless."
+                    ],
+                    recoverable=False,
                 )
-            },
-            ledger=dict(ledger_entry),
-        )
+        else:
+            return _AgentPlan(
+                agent="policy",
+                path=path,
+                state=STATE_NEEDS_OPERATOR,
+                detail="user DCG config is hand-owned (no generated marker); left untouched",
+                extra={
+                    "site_policy": site_receipt,
+                    "operator_action": (
+                        "Review the policy and re-run with `--adopt-policy` only after "
+                        "the private site source preserves every existing section."
+                    ),
+                },
+                ledger=dict(ledger_entry),
+            )
     if raw is not None:
         # Ours: it must still parse and satisfy every policy invariant.
         _load_toml_file(path)
+        if raw.startswith(_policy.GENERATED_MARKER):
+            _validate_marker_owned_policy(raw)
     write = _plan_write(path, desired.encode("utf-8"))
     ledger_record = {
         "created_file": bool(ledger_entry.get("created_file")) or raw is None,
         "marker": _policy.GENERATED_MARKER,
+        "site_policy": site_receipt,
     }
     if write.is_noop:
         return _AgentPlan(
@@ -971,14 +1154,20 @@ def _plan_policy(layout_: Layout, ledger_entry: Mapping[str, Any]) -> _AgentPlan
             path=path,
             state=STATE_HEALTHY,
             detail=f"policy v{_policy.POLICY_VERSION} already rendered",
+            extra={"site_policy": site_receipt},
             ledger=ledger_record,
         )
     return _AgentPlan(
         agent="policy",
         path=path,
         state=STATE_CHANGED,
-        detail=("rendered user policy" if raw is None else "re-rendered stale user policy"),
+        detail=(
+            "rendered user policy"
+            if raw is None
+            else ("adopted lossless hand-owned policy" if adopt_policy and not raw.startswith(_policy.GENERATED_MARKER) else "re-rendered stale user policy")
+        ),
         write=write,
+        extra={"site_policy": site_receipt},
         ledger=ledger_record,
     )
 
@@ -1069,6 +1258,8 @@ def _apply_or_verify(
     home: Path | str,
     *,
     binary: Path | str | None = None,
+    site_policy_paths: Sequence[Path | str] = (),
+    adopt_policy: bool = False,
     dry_run: bool = False,
     platform: str | None = None,
     action: str = "apply",
@@ -1095,6 +1286,11 @@ def _apply_or_verify(
 
     ledger = _load_ledger(layout_.ledger)
     ledger_agents = ledger.get("agents") if isinstance(ledger.get("agents"), dict) else {}
+    ledger_policy = ledger.get("policy") if isinstance(ledger.get("policy"), dict) else {}
+    sites = _load_site_policies(site_policy_paths, ledger_policy)
+    desired_policy = _policy.build_policy(site_policies=sites)
+    desired_text = _policy_text(desired_policy)
+    _policy.validate_rendered(desired_text, expected_policy=desired_policy)
     # The binary this home was last converged against is still ours to adopt,
     # even after the pinned path moves.
     owned_commands = _owned_commands(layout_, ledger)
@@ -1125,7 +1321,13 @@ def _apply_or_verify(
             owned_commands=owned_commands,
         ),
     ]
-    policy_plan = _plan_policy(layout_, ledger.get("policy") or {})
+    policy_plan = _plan_policy(
+        layout_,
+        ledger_policy,
+        desired_policy=desired_policy,
+        sites=sites,
+        adopt_policy=adopt_policy,
+    )
     binary_info = _binary_report(layout_, pin)
     link_info = _plan_binary_link(layout_, ledger.get("binary_link") or {})
 
@@ -1295,21 +1497,41 @@ def apply(
     home: Path | str,
     *,
     binary: Path | str | None = None,
+    site_policy_paths: Sequence[Path | str] = (),
+    adopt_policy: bool = False,
     dry_run: bool = False,
     platform: str | None = None,
 ) -> dict[str, Any]:
     """Converge a managed home. Atomic, merge-safe, idempotent."""
-    return _apply_or_verify(home, binary=binary, dry_run=dry_run, platform=platform, action="apply")
+    return _apply_or_verify(
+        home,
+        binary=binary,
+        site_policy_paths=site_policy_paths,
+        adopt_policy=adopt_policy,
+        dry_run=dry_run,
+        platform=platform,
+        action="apply",
+    )
 
 
 def verify(
     home: Path | str,
     *,
     binary: Path | str | None = None,
+    site_policy_paths: Sequence[Path | str] = (),
+    adopt_policy: bool = False,
     platform: str | None = None,
 ) -> dict[str, Any]:
     """Report convergence and health without writing anything."""
-    return _apply_or_verify(home, binary=binary, dry_run=True, platform=platform, action="verify")
+    return _apply_or_verify(
+        home,
+        binary=binary,
+        site_policy_paths=site_policy_paths,
+        adopt_policy=adopt_policy,
+        dry_run=True,
+        platform=platform,
+        action="verify",
+    )
 
 
 def relinquish(
@@ -1618,6 +1840,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("action", choices=("apply", "verify", "relinquish", "rollback"))
     parser.add_argument("--home", required=True, help="managed home to converge (never inferred)")
     parser.add_argument("--binary", default="", help="pinned dcg binary path")
+    parser.add_argument(
+        "--site-policy",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="private v1 site-policy JSON; repeatable and required after adoption",
+    )
+    parser.add_argument(
+        "--adopt-policy",
+        action="store_true",
+        help="replace a hand-owned policy only after a lossless semantic audit",
+    )
     parser.add_argument("--platform", default="", help="os/machine override")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -1631,9 +1865,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     binary = args.binary or None
     try:
         if args.action == "apply":
-            payload = apply(args.home, binary=binary, dry_run=args.dry_run, platform=args.platform or None)
+            payload = apply(
+                args.home,
+                binary=binary,
+                site_policy_paths=args.site_policy,
+                adopt_policy=args.adopt_policy,
+                dry_run=args.dry_run,
+                platform=args.platform or None,
+            )
         elif args.action == "verify":
-            payload = verify(args.home, binary=binary, platform=args.platform or None)
+            payload = verify(
+                args.home,
+                binary=binary,
+                site_policy_paths=args.site_policy,
+                adopt_policy=args.adopt_policy,
+                platform=args.platform or None,
+            )
         elif args.action == "relinquish":
             payload = relinquish(args.home, binary=binary, dry_run=args.dry_run, purge=args.purge)
         else:

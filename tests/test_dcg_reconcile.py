@@ -422,6 +422,182 @@ class MalformedConfigTests(_HomeCase):
         self.assertEqual(_tree(home), before)
 
 
+class SitePolicyReconcileTests(_HomeCase):
+    TRUST_HASH = "a" * 64
+
+    def _site_payload(self, *, reason: str = "Use the reviewed safe path.") -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "id": "generic-estate",
+            "packs": ["strict_git"],
+            "allowlist": ["cargo test --package safe-fixture"],
+            "blocklist": [
+                {"pattern": r"\bsite-danger\b", "reason": reason},
+            ],
+            "agents": {
+                "default": {"trust_level": "medium"},
+                "unknown": {
+                    "trust_level": "low",
+                    "disabled_allowlist": False,
+                    "extra_packs": ["strict_git"],
+                },
+            },
+        }
+
+    def _write_site(self, path: Path, payload: dict[str, object] | None = None) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload or self._site_payload(), indent=2) + "\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+        return path
+
+    def _desired(self, site: Path) -> str:
+        loaded = DP.load_site_policy_file(site)
+        return DP.render(site_policies=[loaded])
+
+    def _hand_owned(self, desired: str) -> str:
+        return "\n".join(
+            line
+            for line in desired.splitlines()
+            if not line.startswith("#")
+        ).lstrip("\n") + "\n"
+
+    def _write_trust(self, home: Path, value: str) -> None:
+        config = home / DR.CODEX_CONFIG_RELPATH
+        config.parent.mkdir(parents=True, exist_ok=True)
+        base = config.read_text(encoding="utf-8") if config.is_file() else 'model = "fixture"\n'
+        base = base.split('[hooks.state.')[0].rstrip("\n")
+        config.write_text(
+            base
+            + f'\n\n[hooks.state."user:PreToolUse:0"]\nenabled = true\ntrusted_hash = "{value}"\n',
+            encoding="utf-8",
+        )
+
+    def test_lossless_adoption_is_idempotent_and_rollback_restores_hand_owned_bytes(self) -> None:
+        home, binary = self.materialize("empty")
+        site = self._write_site(home.parent / "private" / "site.json")
+        policy_path = home / DR.POLICY_RELPATH
+        policy_path.parent.mkdir(parents=True, exist_ok=True)
+        hand_owned = self._hand_owned(self._desired(site))
+        policy_path.write_text(hand_owned, encoding="utf-8")
+
+        first = DR.apply(
+            home,
+            binary=binary,
+            site_policy_paths=[site],
+            adopt_policy=True,
+        )
+        self.assertEqual(first["result"], DR.RESULT_CHANGED)
+        self.assertTrue(policy_path.read_text(encoding="utf-8").startswith(DP.GENERATED_MARKER))
+        self.assertEqual(
+            DR.apply(home, binary=binary, site_policy_paths=[site])["result"],
+            DR.RESULT_UNCHANGED,
+        )
+
+        ledger = json.loads((home / DR.LEDGER_RELPATH).read_text(encoding="utf-8"))
+        serialized = json.dumps(ledger["policy"]["site_policy"], sort_keys=True)
+        self.assertIn("generic-estate", serialized)
+        self.assertNotIn(str(site), serialized)
+        self.assertNotIn("site-danger", serialized)
+
+        DR.rollback(home, binary=binary)
+        self.assertEqual(policy_path.read_text(encoding="utf-8"), hand_owned)
+
+    def test_adoption_rejects_every_lossy_section_without_writing(self) -> None:
+        mutations = {
+            "general": lambda text: text.replace("fail_closed = true", "fail_closed = false"),
+            "packs": lambda text: text.replace(
+                'enabled = ["core.git", "core.filesystem", "strict_git"]',
+                'enabled = ["core.git", "core.filesystem", "strict_git", "remote.ssh"]',
+            ),
+            "allowlist": lambda text: text.replace("safe-fixture", "different-fixture"),
+            "blocklist": lambda text: text.replace("Use the reviewed safe path.", "Different reason."),
+            "agents": lambda text: text.replace('trust_level = "medium"', 'trust_level = "high"', 1),
+        }
+        for section, mutate in mutations.items():
+            with self.subTest(section=section):
+                home, binary = self.materialize("empty", home_name=f"home-{section}")
+                site = self._write_site(home.parent / f"private-{section}" / "site.json")
+                policy_path = home / DR.POLICY_RELPATH
+                policy_path.parent.mkdir(parents=True, exist_ok=True)
+                policy_path.write_text(
+                    mutate(self._hand_owned(self._desired(site))), encoding="utf-8"
+                )
+                before = _tree(home)
+                with self.assertRaises(ValidationError) as caught:
+                    DR.apply(
+                        home,
+                        binary=binary,
+                        site_policy_paths=[site],
+                        adopt_policy=True,
+                    )
+                self.assertEqual(
+                    caught.exception.code, DR.DCG_RECONCILE_POLICY_ADOPTION_MISMATCH
+                )
+                self.assertIn(section, caught.exception.context["mismatched_sections"])
+                self.assertEqual(_tree(home), before)
+
+    def test_adopted_site_input_is_required_and_malformed_input_writes_nothing(self) -> None:
+        home, binary = self.materialize("empty")
+        site = self._write_site(home.parent / "private" / "site.json")
+        DR.apply(home, binary=binary, site_policy_paths=[site])
+        before = _tree(home)
+        with self.assertRaises(ValidationError) as caught:
+            DR.apply(home, binary=binary)
+        self.assertEqual(caught.exception.code, DR.DCG_RECONCILE_SITE_POLICY_REQUIRED)
+        self.assertEqual(_tree(home), before)
+
+        site.write_text("{not json", encoding="utf-8")
+        site.chmod(0o600)
+        with self.assertRaises(ValidationError):
+            DR.apply(home, binary=binary, site_policy_paths=[site])
+        self.assertEqual(_tree(home), before)
+
+    def test_policy_only_site_change_preserves_hooks_and_codex_trust(self) -> None:
+        home, binary = self.materialize("container_home")
+        site = self._write_site(home.parent / "private" / "site.json")
+        DR.apply(home, binary=binary, site_policy_paths=[site])
+        self._write_trust(home, self.TRUST_HASH)
+        trusted = DR.apply(home, binary=binary, site_policy_paths=[site])
+        self.assertEqual(trusted["codex_trust"], DR.CODEX_TRUST_TRUSTED)
+        hook_bytes = {
+            relpath: (home / relpath).read_bytes()
+            for relpath in (
+                DR.CLAUDE_SETTINGS_RELPATH,
+                DR.CODEX_HOOKS_RELPATH,
+                DR.GROK_HOOK_RELPATH,
+                DR.CODEX_CONFIG_RELPATH,
+            )
+        }
+
+        self._write_site(site, self._site_payload(reason="Use the revised safe path."))
+        changed = DR.apply(home, binary=binary, site_policy_paths=[site])
+        self.assertEqual(changed["result"], DR.RESULT_CHANGED)
+        self.assertEqual(changed["codex_trust"], DR.CODEX_TRUST_TRUSTED)
+        for relpath, before in hook_bytes.items():
+            self.assertEqual((home / relpath).read_bytes(), before)
+
+    def test_same_site_renders_identical_policy_across_homes_and_survives_relinquish(self) -> None:
+        site_root = Path(tempfile.mkdtemp(prefix="dcg-private-site-"))
+        self.addCleanup(shutil.rmtree, site_root, ignore_errors=True)
+        site = self._write_site(site_root / "site.json")
+        rendered: list[bytes] = []
+        for name in ("first-home", "second-home"):
+            home, binary = self.materialize("empty", home_name=name)
+            DR.apply(home, binary=binary, site_policy_paths=[site])
+            rendered.append((home / DR.POLICY_RELPATH).read_bytes())
+        self.assertEqual(rendered[0], rendered[1])
+
+        home, binary = self.materialize("empty", home_name="source-in-home")
+        in_home_site = self._write_site(home / ".config/dcg/skillbox-site-policy.json")
+        source_before = in_home_site.read_bytes()
+        DR.apply(home, binary=binary, site_policy_paths=[in_home_site])
+        DR.relinquish(home, binary=binary, purge=True)
+        self.assertEqual(in_home_site.read_bytes(), source_before)
+
+
 class UnsupportedShapeTests(_HomeCase):
     def test_unsupported_claude_shape_is_reported_and_left_alone(self) -> None:
         home, binary = self.materialize("host_unsupported")

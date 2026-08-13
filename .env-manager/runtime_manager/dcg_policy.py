@@ -27,12 +27,17 @@ CLI::
 
     python3 -m runtime_manager.dcg_policy render --output .dcg.toml --format json
     python3 -m runtime_manager.dcg_policy render --overlay client.json
+    python3 -m runtime_manager.dcg_policy render --site-policy private-site.json
     python3 -m runtime_manager.dcg_policy validate --config .dcg.toml
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import re
+import stat
 import sys
 import tomllib
 from dataclasses import dataclass
@@ -44,6 +49,7 @@ from .errors import SkillboxError, ValidationError
 
 
 POLICY_VERSION = 1
+SITE_POLICY_SCHEMA_VERSION = 1
 
 # Ownership marker preserved verbatim from the legacy renderer so an existing
 # .dcg.toml is still recognizable as generated (and never hand-edited).
@@ -74,15 +80,21 @@ APPROVED_PACKS: frozenset[str] = frozenset(
         "containers.docker",
         "containers.compose",
         "containers.podman",
+        # Upstream category selectors used by the operator site policy.
+        "containers",
         # Datastores that appear in box profiles.
         "database.postgresql",
         "database.sqlite",
         "database.redis",
+        "database",
         # Fleet/deploy surfaces.
         "kubernetes.kubectl",
         "infrastructure.terraform",
         "remote.rsync",
         "remote.ssh",
+        "remote.scp",
+        "platform.github",
+        "cdn.cloudflare_workers",
         # Publish paths that can unpublish/yank.
         "package_managers",
         # Paranoid git for repos that want it.
@@ -100,6 +112,20 @@ MIN_ALLOWLIST_ANCHOR_CHARS = 3
 
 MAX_ALLOWLIST_RULE_LENGTH = 200
 
+# A site policy is deliberately small, private, and additive. These bounds keep
+# it reviewable and prevent an accidentally selected corpus/log from becoming
+# policy input.
+MAX_SITE_POLICY_BYTES = 256 * 1024
+MAX_SITE_POLICIES = 8
+MAX_SITE_ID_LENGTH = 64
+MAX_SITE_PACKS = 64
+MAX_BLOCKLIST_RULES = 64
+MAX_BLOCK_PATTERN_LENGTH = 8_192
+MAX_BLOCK_REASON_LENGTH = 2_000
+MAX_AGENT_EXTRA_PACKS = 32
+SITE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+TRUST_LEVELS: frozenset[str] = frozenset({"low", "medium", "high"})
+
 TMUX_CAPTURE_PANE_PATTERN = r"(?i)\btmux\s+capture-pane\b"
 TMUX_CAPTURE_PANE_REASON = (
     "Direct `tmux capture-pane` polling is disabled. Use "
@@ -111,9 +137,52 @@ TMUX_CAPTURE_PANE_REASON = (
     "`--panes` unless you inspected the NTM mapping."
 )
 
+# Match only write-shaped shell commands whose destination is one of the agent
+# memory roots. Reads remain available so an agent can inspect and promote old
+# material. This is intentionally a command-text guard, not a filesystem ACL.
+AGENT_MEMORY_ROOT_PATTERN = (
+    r"[\"']?(?:~|\$(?:HOME|\{HOME\})|/(?:Users|home)/[^/\s\"';&|]+|/root)/\."
+    r"(?:claude/projects/[^/\s\"';&|]+/memory|codex/memories)"
+    r"(?:/[^\s;&|]*)?[\"']?"
+)
+AGENT_MEMORY_WRITE_PATTERN = (
+    r"(?i)(?:"
+    r"(?:[0-9]*>>?|&>>?)\s*" + AGENT_MEMORY_ROOT_PATTERN + r"\s*(?:$|[;&|])"
+    r"|\btee(?:\s+-\S+)*\s+" + AGENT_MEMORY_ROOT_PATTERN + r"(?:\s|$|[;&|])"
+    r"|\binstall\b[^;&|\n]*(?:-t\s+|--target-directory(?:=|\s+))"
+    + AGENT_MEMORY_ROOT_PATTERN
+    + r"(?:\s|$|[;&|])"
+    r"|\b(?:cp|mv|install|ln|rsync|scp|truncate)\b[^;&|\n]*\s+"
+    + AGENT_MEMORY_ROOT_PATTERN
+    + r"\s*(?:$|[;&|])"
+    r"|\bsed\b[^;&|\n]*\s(?:-i\S*|--in-place(?:=\S*)?)\s+[^;&|\n]*"
+    + AGENT_MEMORY_ROOT_PATTERN
+    + r"\s*(?:$|[;&|])"
+    r"|\bperl\b[^;&|\n]*\s-(?:[A-Za-z]*i[A-Za-z]*|i\.\S+)\s+[^;&|\n]*"
+    + AGENT_MEMORY_ROOT_PATTERN
+    + r"\s*(?:$|[;&|])"
+    r"|\b(?:touch|mkdir)\b[^;&|\n]*\s+" + AGENT_MEMORY_ROOT_PATTERN
+    + r"(?:\s|$|[;&|])"
+    r")"
+)
+AGENT_MEMORY_WRITE_REASON = (
+    "Agent memory is not a second operating authority. Durable estate, runbook, "
+    "recovery, access-path, command, and policy knowledge belongs in the relevant "
+    "canonical skill; use `skill-issue` to promote it. Memory may retain only a "
+    "thin pointer after promotion. DCG protects Bash/PreToolUse only; other writers "
+    "must enforce the same estate-knowledge-in-skills rule."
+)
+
 # Overlay keys we accept. Anything else is a malformed overlay, not a hint.
 OVERLAY_KEYS: frozenset[str] = frozenset(
     {"id", "packs", "allowlist", "fail_closed", "fail_closed_exception"}
+)
+SITE_POLICY_KEYS: frozenset[str] = frozenset(
+    {"schema_version", "id", "packs", "allowlist", "blocklist", "agents"}
+)
+SITE_AGENT_KEYS: frozenset[str] = frozenset({"default", "unknown"})
+SITE_AGENT_PROFILE_KEYS: frozenset[str] = frozenset(
+    {"trust_level", "extra_packs", "disabled_allowlist"}
 )
 
 # Fields an audited fail-open exception must carry, all non-empty.
@@ -127,6 +196,12 @@ UPSTREAM_KEY_PATHS: frozenset[tuple[str, ...]] = frozenset(
         ("packs", "enabled"),
         ("overrides", "allow"),
         ("overrides", "block"),
+        ("agents", "default", "trust_level"),
+        ("agents", "default", "extra_packs"),
+        ("agents", "default", "disabled_allowlist"),
+        ("agents", "unknown", "trust_level"),
+        ("agents", "unknown", "extra_packs"),
+        ("agents", "unknown", "disabled_allowlist"),
     }
 )
 
@@ -140,6 +215,10 @@ DCG_POLICY_MALFORMED_OVERLAY = "DCG_POLICY_MALFORMED_OVERLAY"
 DCG_POLICY_UNAUDITED_FAIL_OPEN = "DCG_POLICY_UNAUDITED_FAIL_OPEN"
 DCG_POLICY_EXPIRED_EXCEPTION = "DCG_POLICY_EXPIRED_EXCEPTION"
 DCG_POLICY_UPSTREAM_MISMATCH = "DCG_POLICY_UPSTREAM_MISMATCH"
+DCG_POLICY_MALFORMED_SITE_POLICY = "DCG_POLICY_MALFORMED_SITE_POLICY"
+DCG_POLICY_DUPLICATE_BLOCK_PATTERN = "DCG_POLICY_DUPLICATE_BLOCK_PATTERN"
+DCG_POLICY_SITE_POLICY_IO = "DCG_POLICY_SITE_POLICY_IO"
+DCG_POLICY_UNSAFE_SITE_POLICY_FILE = "DCG_POLICY_UNSAFE_SITE_POLICY_FILE"
 
 DCG_POLICY_ERROR_CODES: tuple[str, ...] = (
     DCG_POLICY_BROAD_ALLOWLIST,
@@ -148,9 +227,13 @@ DCG_POLICY_ERROR_CODES: tuple[str, ...] = (
     DCG_POLICY_MALFORMED_BLOCKLIST,
     DCG_POLICY_MALFORMED_OVERLAY,
     DCG_POLICY_MALFORMED_PACK,
+    DCG_POLICY_MALFORMED_SITE_POLICY,
+    DCG_POLICY_DUPLICATE_BLOCK_PATTERN,
+    DCG_POLICY_SITE_POLICY_IO,
     DCG_POLICY_UNAUDITED_FAIL_OPEN,
     DCG_POLICY_UNKNOWN_PACK,
     DCG_POLICY_UPSTREAM_MISMATCH,
+    DCG_POLICY_UNSAFE_SITE_POLICY_FILE,
 )
 
 
@@ -183,8 +266,63 @@ class DcgBlockRule:
         return {"pattern": self.pattern, "reason": self.reason}
 
 
+@dataclass(frozen=True)
+class DcgAgentProfile:
+    """Pinned subset of an upstream DCG agent profile.
+
+    ``None`` means that the key was not supplied and therefore must not be
+    rendered. This preserves upstream defaults while still representing the
+    operator's explicit ``default`` and ``unknown`` profiles exactly.
+    """
+
+    trust_level: str | None = None
+    extra_packs: tuple[str, ...] = ()
+    disabled_allowlist: bool | None = None
+
+    def to_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if self.trust_level is not None:
+            payload["trust_level"] = self.trust_level
+        if self.extra_packs:
+            payload["extra_packs"] = list(self.extra_packs)
+        if self.disabled_allowlist is not None:
+            payload["disabled_allowlist"] = self.disabled_allowlist
+        return payload
+
+
+@dataclass(frozen=True)
+class DcgSitePolicy:
+    """Validated additive policy loaded from a private site-owned JSON file."""
+
+    site_id: str
+    packs: tuple[str, ...] = ()
+    allowlist: tuple[str, ...] = ()
+    blocklist: tuple[DcgBlockRule, ...] = ()
+    default_agent: DcgAgentProfile | None = None
+    unknown_agent: DcgAgentProfile | None = None
+    digest: str = ""
+    schema_version: int = SITE_POLICY_SCHEMA_VERSION
+
+    def to_receipt(self) -> dict[str, Any]:
+        """Return metadata only: never paths, regexes, reasons, or allow rules."""
+        return {
+            "site_id": self.site_id,
+            "digest": self.digest,
+            "counts": {
+                "packs": len(self.packs),
+                "allowlist": len(self.allowlist),
+                "blocklist": len(self.blocklist),
+                "agent_profiles": sum(
+                    profile is not None
+                    for profile in (self.default_agent, self.unknown_agent)
+                ),
+            },
+        }
+
+
 DEFAULT_BLOCK_RULES: tuple[DcgBlockRule, ...] = (
     DcgBlockRule(TMUX_CAPTURE_PANE_PATTERN, TMUX_CAPTURE_PANE_REASON),
+    DcgBlockRule(AGENT_MEMORY_WRITE_PATTERN, AGENT_MEMORY_WRITE_REASON),
 )
 
 
@@ -197,6 +335,8 @@ class DcgPolicy:
     blocklist: tuple[DcgBlockRule, ...]
     fail_closed: bool
     exception: FailOpenException | None = None
+    default_agent: DcgAgentProfile | None = None
+    unknown_agent: DcgAgentProfile | None = None
     version: int = POLICY_VERSION
 
     def to_payload(self) -> dict[str, Any]:
@@ -209,7 +349,28 @@ class DcgPolicy:
         }
         if self.exception is not None:
             payload["fail_closed_exception"] = self.exception.to_payload()
+        agents: dict[str, Any] = {}
+        if self.default_agent is not None:
+            agents["default"] = self.default_agent.to_payload()
+        if self.unknown_agent is not None:
+            agents["unknown"] = self.unknown_agent.to_payload()
+        if agents:
+            payload["agents"] = agents
         return payload
+
+    def to_receipt(self) -> dict[str, Any]:
+        """Privacy-safe composition metadata for CLI write receipts."""
+        return {
+            "counts": {
+                "packs": len(self.packs),
+                "allowlist": len(self.allowlist),
+                "blocklist": len(self.blocklist),
+                "agent_profiles": sum(
+                    profile is not None
+                    for profile in (self.default_agent, self.unknown_agent)
+                ),
+            },
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +457,37 @@ def _normalize_allowlist_rule(raw: Any, *, source: str) -> str:
             rule=rule,
             min_anchor_chars=MIN_ALLOWLIST_ANCHOR_CHARS,
         )
+    try:
+        _validate_dcg_regex(rule)
+    except ValueError as exc:
+        raise _reject(
+            DCG_POLICY_MALFORMED_ALLOWLIST,
+            f"DCG allowlist rule from {source} is not a supported regular expression.",
+            source=source,
+            regex_error=str(exc),
+        ) from exc
     return rule
+
+
+def _validate_dcg_regex(pattern: str) -> None:
+    """Conservatively validate the Rust-regex subset accepted by DCG."""
+    unsupported = (
+        "(?=",  # lookahead
+        "(?!",  # negative lookahead
+        "(?<=",  # lookbehind
+        "(?<!",  # negative lookbehind
+        "(?P<",  # Python named capture
+        "(?>",  # atomic group
+        "(?(",  # conditional group
+    )
+    if any(token in pattern for token in unsupported) or re.search(
+        r"(?<!\\)(?:\\\\)*\\[1-9]", pattern
+    ):
+        raise ValueError("construct is unsupported by DCG's Rust regex engine")
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _normalize_block_rule(raw: Any, *, source: str) -> DcgBlockRule:
@@ -324,6 +515,29 @@ def _normalize_block_rule(raw: Any, *, source: str) -> DcgBlockRule:
                 field=field,
             )
         values[field] = value.strip()
+    if len(values["pattern"]) > MAX_BLOCK_PATTERN_LENGTH:
+        raise _reject(
+            DCG_POLICY_MALFORMED_BLOCKLIST,
+            f"DCG block pattern from {source} exceeds {MAX_BLOCK_PATTERN_LENGTH} characters.",
+            source=source,
+            length=len(values["pattern"]),
+        )
+    if len(values["reason"]) > MAX_BLOCK_REASON_LENGTH:
+        raise _reject(
+            DCG_POLICY_MALFORMED_BLOCKLIST,
+            f"DCG block reason from {source} exceeds {MAX_BLOCK_REASON_LENGTH} characters.",
+            source=source,
+            length=len(values["reason"]),
+        )
+    try:
+        _validate_dcg_regex(values["pattern"])
+    except ValueError as exc:
+        raise _reject(
+            DCG_POLICY_MALFORMED_BLOCKLIST,
+            f"DCG block pattern from {source} is not a valid regular expression.",
+            source=source,
+            regex_error=str(exc),
+        ) from exc
     return DcgBlockRule(**values)
 
 
@@ -367,6 +581,256 @@ def _normalize_exception(raw: Any, *, source: str) -> FailOpenException:
     return FailOpenException(**values)
 
 
+def _site_reject(message: str, *, field: str | None = None) -> ValidationError:
+    """Reject private site input without copying its values into diagnostics."""
+    return _reject(
+        DCG_POLICY_MALFORMED_SITE_POLICY,
+        message,
+        field=field,
+    )
+
+
+def _site_sequence(raw: Any, *, field: str, maximum: int) -> Sequence[Any]:
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, list):
+        raise _site_reject(f"Site policy {field!r} must be a JSON array.", field=field)
+    if len(raw) > maximum:
+        raise _site_reject(
+            f"Site policy {field!r} exceeds its {maximum}-entry bound.", field=field
+        )
+    return raw
+
+
+def _normalize_agent_profile(raw: Any, *, field: str) -> DcgAgentProfile:
+    if not isinstance(raw, Mapping):
+        raise _site_reject(f"Site policy {field!r} must be an object.", field=field)
+    unknown = sorted(set(raw) - SITE_AGENT_PROFILE_KEYS)
+    if unknown or not raw:
+        raise _site_reject(
+            f"Site policy {field!r} must use only pinned, non-empty profile keys.",
+            field=field,
+        )
+    trust_level = raw.get("trust_level")
+    if trust_level is not None and (
+        not isinstance(trust_level, str) or trust_level not in TRUST_LEVELS
+    ):
+        raise _site_reject(
+            f"Site policy {field!r}.trust_level must be low, medium, or high.",
+            field=f"{field}.trust_level",
+        )
+    disabled_allowlist = raw.get("disabled_allowlist")
+    if "disabled_allowlist" in raw and not isinstance(disabled_allowlist, bool):
+        raise _site_reject(
+            f"Site policy {field!r}.disabled_allowlist must be a boolean.",
+            field=f"{field}.disabled_allowlist",
+        )
+    raw_extra = raw.get("extra_packs", [])
+    extra = _site_sequence(
+        raw_extra,
+        field=f"{field}.extra_packs",
+        maximum=MAX_AGENT_EXTRA_PACKS,
+    )
+    packs: list[str] = []
+    for entry in extra:
+        pack = _normalize_pack(entry, source=field)
+        if pack not in packs:
+            packs.append(pack)
+    return DcgAgentProfile(
+        trust_level=trust_level,
+        extra_packs=tuple(packs),
+        disabled_allowlist=disabled_allowlist
+        if "disabled_allowlist" in raw
+        else None,
+    )
+
+
+def parse_site_policy(raw: Any) -> DcgSitePolicy:
+    """Validate the public ``skillbox-dcg-site-policy/v1`` JSON shape."""
+    if not isinstance(raw, Mapping):
+        raise _site_reject("Site policy root must be a JSON object.")
+    unknown = sorted(set(raw) - SITE_POLICY_KEYS)
+    missing = sorted({"schema_version", "id"} - set(raw))
+    if unknown or missing:
+        raise _site_reject(
+            "Site policy root must contain exactly known v1 keys.",
+            field="root",
+        )
+    schema_version = raw["schema_version"]
+    if type(schema_version) is not int or schema_version != SITE_POLICY_SCHEMA_VERSION:
+        raise _site_reject(
+            f"Site policy schema_version must equal {SITE_POLICY_SCHEMA_VERSION}.",
+            field="schema_version",
+        )
+    site_id = raw["id"]
+    if (
+        not isinstance(site_id, str)
+        or len(site_id) > MAX_SITE_ID_LENGTH
+        or SITE_ID_RE.fullmatch(site_id) is None
+    ):
+        raise _site_reject(
+            "Site policy id must be a bounded lowercase slug.", field="id"
+        )
+
+    packs: list[str] = []
+    for entry in _site_sequence(
+        raw.get("packs", []), field="packs", maximum=MAX_SITE_PACKS
+    ):
+        pack = _normalize_pack(entry, source=f"site:{site_id}")
+        if pack not in packs:
+            packs.append(pack)
+
+    allowlist: list[str] = []
+    for entry in _site_sequence(
+        raw.get("allowlist", []),
+        field="allowlist",
+        maximum=MAX_ALLOWLIST_RULES,
+    ):
+        rule = _normalize_allowlist_rule(entry, source=f"site:{site_id}")
+        if rule not in allowlist:
+            allowlist.append(rule)
+
+    blocklist = tuple(
+        _normalize_block_rule(entry, source=f"site:{site_id}")
+        for entry in _site_sequence(
+            raw.get("blocklist", []),
+            field="blocklist",
+            maximum=MAX_BLOCKLIST_RULES - len(DEFAULT_BLOCK_RULES),
+        )
+    )
+    patterns = [rule.pattern for rule in blocklist]
+    if len(patterns) != len(set(patterns)):
+        raise _reject(
+            DCG_POLICY_DUPLICATE_BLOCK_PATTERN,
+            "Site policy contains duplicate block patterns.",
+            site_id=site_id,
+        )
+
+    raw_agents = raw.get("agents", {})
+    if not isinstance(raw_agents, Mapping):
+        raise _site_reject("Site policy 'agents' must be an object.", field="agents")
+    if set(raw_agents) - SITE_AGENT_KEYS:
+        raise _site_reject(
+            "Site policy agents may contain only default and unknown profiles.",
+            field="agents",
+        )
+    default_agent = (
+        _normalize_agent_profile(raw_agents["default"], field="agents.default")
+        if "default" in raw_agents
+        else None
+    )
+    unknown_agent = (
+        _normalize_agent_profile(raw_agents["unknown"], field="agents.unknown")
+        if "unknown" in raw_agents
+        else None
+    )
+
+    canonical = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    digest = "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return DcgSitePolicy(
+        site_id=site_id,
+        packs=tuple(packs),
+        allowlist=tuple(allowlist),
+        blocklist=blocklist,
+        default_agent=default_agent,
+        unknown_agent=unknown_agent,
+        digest=digest,
+    )
+
+
+def load_site_policy_file(path: Path) -> DcgSitePolicy:
+    """Load a private JSON site policy with fail-closed file checks.
+
+    The path is intentionally absent from all diagnostics and receipts.
+    """
+    try:
+        before = path.lstat()
+    except FileNotFoundError as exc:
+        raise _reject(
+            DCG_POLICY_SITE_POLICY_IO,
+            "Explicitly requested DCG site policy does not exist.",
+        ) from exc
+    except OSError as exc:
+        raise _reject(
+            DCG_POLICY_UNSAFE_SITE_POLICY_FILE,
+            "DCG site policy metadata could not be inspected.",
+            os_error=exc.errno,
+        ) from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise _reject(
+            DCG_POLICY_UNSAFE_SITE_POLICY_FILE,
+            "DCG site policy must be a regular, non-symlink file.",
+        )
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError as exc:
+        raise _reject(
+            DCG_POLICY_SITE_POLICY_IO,
+            "Explicitly requested DCG site policy does not exist.",
+        ) from exc
+    except OSError as exc:
+        raise _reject(
+            DCG_POLICY_UNSAFE_SITE_POLICY_FILE,
+            "DCG site policy could not be opened as a non-symlink file.",
+            os_error=exc.errno,
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_dev != before.st_dev
+            or metadata.st_ino != before.st_ino
+        ):
+            raise _reject(
+                DCG_POLICY_UNSAFE_SITE_POLICY_FILE,
+                "DCG site policy changed identity while it was opened.",
+            )
+        if metadata.st_uid != os.getuid():
+            raise _reject(
+                DCG_POLICY_UNSAFE_SITE_POLICY_FILE,
+                "DCG site policy must be owned by the current user.",
+            )
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise _reject(
+                DCG_POLICY_UNSAFE_SITE_POLICY_FILE,
+                "DCG site policy must not grant group or other permissions.",
+            )
+        if metadata.st_size <= 0 or metadata.st_size > MAX_SITE_POLICY_BYTES:
+            raise _reject(
+                DCG_POLICY_UNSAFE_SITE_POLICY_FILE,
+                "DCG site policy file size is outside the accepted bounds.",
+                size=metadata.st_size,
+                max_size=MAX_SITE_POLICY_BYTES,
+            )
+        chunks: list[bytes] = []
+        remaining = MAX_SITE_POLICY_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) > MAX_SITE_POLICY_BYTES:
+            raise _reject(
+                DCG_POLICY_UNSAFE_SITE_POLICY_FILE,
+                "DCG site policy file exceeds the accepted size bound.",
+                max_size=MAX_SITE_POLICY_BYTES,
+            )
+    finally:
+        os.close(descriptor)
+    try:
+        raw = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _reject(
+            DCG_POLICY_MALFORMED_SITE_POLICY,
+            "DCG site policy must be valid UTF-8 JSON.",
+        ) from exc
+    return parse_site_policy(raw)
+
+
 # ---------------------------------------------------------------------------
 # Policy construction
 # ---------------------------------------------------------------------------
@@ -376,6 +840,7 @@ def build_policy(
     overlays: Iterable[Mapping[str, Any]] = (),
     *,
     base_packs: Sequence[str] = DEFAULT_PACKS,
+    site_policies: Iterable[DcgSitePolicy] = (),
     now: date | None = None,
 ) -> DcgPolicy:
     """Merge ``overlays`` onto the fail-closed defaults and validate the result.
@@ -393,8 +858,51 @@ def build_policy(
             packs.append(normalized)
 
     allowlist: list[str] = []
+    blocklist: list[DcgBlockRule] = list(DEFAULT_BLOCK_RULES)
+    default_agent: DcgAgentProfile | None = None
+    unknown_agent: DcgAgentProfile | None = None
     fail_closed = True
     exception: FailOpenException | None = None
+
+    sites = list(site_policies)
+    if len(sites) > MAX_SITE_POLICIES:
+        raise _site_reject(
+            f"At most {MAX_SITE_POLICIES} site policies may be composed.", field="sites"
+        )
+    site_ids: set[str] = set()
+    block_patterns = {rule.pattern for rule in blocklist}
+    for index, site in enumerate(sites):
+        if not isinstance(site, DcgSitePolicy):
+            raise _site_reject(
+                f"Site policy #{index} must be a validated DcgSitePolicy.", field="sites"
+            )
+        if site.site_id in site_ids:
+            raise _site_reject("Site policy ids must be unique.", field="site_id")
+        site_ids.add(site.site_id)
+        for pack in site.packs:
+            normalized = _normalize_pack(pack, source=f"site:{site.site_id}")
+            if normalized not in packs:
+                packs.append(normalized)
+        for rule in site.allowlist:
+            normalized = _normalize_allowlist_rule(rule, source=f"site:{site.site_id}")
+            if normalized not in allowlist:
+                allowlist.append(normalized)
+        for rule in site.blocklist:
+            normalized = _normalize_block_rule(
+                rule.to_payload(), source=f"site:{site.site_id}"
+            )
+            if normalized.pattern in block_patterns:
+                raise _reject(
+                    DCG_POLICY_DUPLICATE_BLOCK_PATTERN,
+                    "Site block pattern duplicates a default or earlier site pattern.",
+                    site_id=site.site_id,
+                )
+            block_patterns.add(normalized.pattern)
+            blocklist.append(normalized)
+        if site.default_agent is not None:
+            default_agent = site.default_agent
+        if site.unknown_agent is not None:
+            unknown_agent = site.unknown_agent
 
     for index, overlay in enumerate(overlays):
         if not isinstance(overlay, Mapping):
@@ -471,6 +979,14 @@ def build_policy(
             rule_count=len(allowlist),
             max_rules=MAX_ALLOWLIST_RULES,
         )
+    if len(blocklist) > MAX_BLOCKLIST_RULES:
+        raise _reject(
+            DCG_POLICY_MALFORMED_BLOCKLIST,
+            f"DCG blocklist has {len(blocklist)} rules; the policy ceiling is "
+            f"{MAX_BLOCKLIST_RULES}.",
+            rule_count=len(blocklist),
+            max_rules=MAX_BLOCKLIST_RULES,
+        )
 
     if not fail_closed and exception is not None:
         today = now or date.today()
@@ -487,9 +1003,11 @@ def build_policy(
     return DcgPolicy(
         packs=tuple(packs),
         allowlist=tuple(allowlist),
-        blocklist=DEFAULT_BLOCK_RULES,
+        blocklist=tuple(blocklist),
         fail_closed=fail_closed,
         exception=exception,
+        default_agent=default_agent,
+        unknown_agent=unknown_agent,
     )
 
 
@@ -513,6 +1031,21 @@ def _toml_block_array(values: Sequence[DcgBlockRule]) -> str:
         for rule in values
     )
     return "[" + ", ".join(entries) + "]"
+
+
+def _render_agent_profile(
+    lines: list[str], name: str, profile: DcgAgentProfile | None
+) -> None:
+    if profile is None:
+        return
+    lines.extend(["", f"[agents.{name}]"])
+    if profile.trust_level is not None:
+        lines.append(f"trust_level = {_toml_string(profile.trust_level)}")
+    if profile.extra_packs:
+        lines.append(f"extra_packs = {_toml_array(profile.extra_packs)}")
+    if profile.disabled_allowlist is not None:
+        value = "true" if profile.disabled_allowlist else "false"
+        lines.append(f"disabled_allowlist = {value}")
 
 
 def render_policy(policy: DcgPolicy) -> str:
@@ -541,6 +1074,8 @@ def render_policy(policy: DcgPolicy) -> str:
             lines.append(f"allow = {_toml_array(policy.allowlist)}")
         if policy.blocklist:
             lines.append(f"block = {_toml_block_array(policy.blocklist)}")
+    _render_agent_profile(lines, "default", policy.default_agent)
+    _render_agent_profile(lines, "unknown", policy.unknown_agent)
     return "\n".join(lines) + "\n"
 
 
@@ -548,10 +1083,18 @@ def render(
     overlays: Iterable[Mapping[str, Any]] = (),
     *,
     base_packs: Sequence[str] = DEFAULT_PACKS,
+    site_policies: Iterable[DcgSitePolicy] = (),
     now: date | None = None,
 ) -> str:
     """Build + render in one step (the common caller path)."""
-    return render_policy(build_policy(overlays, base_packs=base_packs, now=now))
+    return render_policy(
+        build_policy(
+            overlays,
+            base_packs=base_packs,
+            site_policies=site_policies,
+            now=now,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -575,7 +1118,9 @@ def key_paths(document: Mapping[str, Any]) -> set[tuple[str, ...]]:
     return paths
 
 
-def validate_rendered(text: str) -> DcgPolicy:
+def validate_rendered(
+    text: str, *, expected_policy: DcgPolicy | None = None
+) -> DcgPolicy:
     """Parse rendered policy text back and re-assert every policy invariant.
 
     This is the upstream-syntax gate: the document must parse as TOML, must use
@@ -625,19 +1170,79 @@ def validate_rendered(text: str) -> DcgPolicy:
     blocklist = tuple(
         _normalize_block_rule(rule, source="rendered") for rule in raw_blocklist
     )
-    if blocklist != DEFAULT_BLOCK_RULES:
+    if len(blocklist) > MAX_BLOCKLIST_RULES:
         raise _reject(
-            DCG_POLICY_UPSTREAM_MISMATCH,
-            "Rendered DCG policy is missing or changes the canonical block rules.",
+            DCG_POLICY_MALFORMED_BLOCKLIST,
+            "Rendered DCG block override exceeds the policy ceiling.",
+            rule_count=len(blocklist),
+            max_rules=MAX_BLOCKLIST_RULES,
+        )
+    patterns = [rule.pattern for rule in blocklist]
+    if len(patterns) != len(set(patterns)):
+        raise _reject(
+            DCG_POLICY_DUPLICATE_BLOCK_PATTERN,
+            "Rendered DCG policy contains duplicate block patterns.",
         )
     overlay: dict[str, Any] = {"id": "rendered", "packs": packs, "allowlist": allowlist}
     if not fail_closed:
         overlay["fail_closed"] = False
         overlay["fail_closed_exception"] = _exception_from_comments(text)
-    # Re-running the builder proves the rendered artifact is itself admissible;
-    # expiry is intentionally not re-checked here so an already-shipped config
-    # validates the same way on any day.
-    return build_policy([overlay], now=date.min)
+    # Re-running the builder proves packs, allowlist, and fail-closed state are
+    # admissible. Expiry is intentionally not re-checked here so an already-
+    # shipped config validates the same way on any day.
+    base = build_policy([overlay], base_packs=(), now=date.min)
+
+    raw_agents = document.get("agents") or {}
+    if not isinstance(raw_agents, Mapping) or set(raw_agents) - SITE_AGENT_KEYS:
+        raise _reject(
+            DCG_POLICY_UPSTREAM_MISMATCH,
+            "Rendered DCG policy uses an unpinned agent profile.",
+        )
+    default_agent = (
+        _normalize_agent_profile(raw_agents["default"], field="agents.default")
+        if "default" in raw_agents
+        else None
+    )
+    unknown_agent = (
+        _normalize_agent_profile(raw_agents["unknown"], field="agents.unknown")
+        if "unknown" in raw_agents
+        else None
+    )
+    candidate = DcgPolicy(
+        packs=base.packs,
+        allowlist=base.allowlist,
+        blocklist=blocklist,
+        fail_closed=base.fail_closed,
+        exception=base.exception,
+        default_agent=default_agent,
+        unknown_agent=unknown_agent,
+    )
+    if expected_policy is None:
+        # Backward-compatible overlay validation: packs/allow/fail-closed may
+        # vary, but site-only blocks and agent profiles require the caller to
+        # supply the exact composition they expected.
+        if blocklist != DEFAULT_BLOCK_RULES or any(
+            profile is not None for profile in (default_agent, unknown_agent)
+        ):
+            raise _reject(
+                DCG_POLICY_UPSTREAM_MISMATCH,
+                "Rendered site policy requires its expected composed policy.",
+            )
+        expected = candidate
+    else:
+        expected = expected_policy
+    if candidate != expected:
+        raise _reject(
+            DCG_POLICY_UPSTREAM_MISMATCH,
+            "Rendered DCG policy does not match the expected composed policy.",
+        )
+    canonical = render_policy(expected)
+    if text != canonical:
+        raise _reject(
+            DCG_POLICY_UPSTREAM_MISMATCH,
+            "Rendered DCG policy is not the canonical deterministic rendering.",
+        )
+    return candidate
 
 
 def _exception_from_comments(text: str) -> dict[str, str]:
@@ -652,7 +1257,9 @@ def _exception_from_comments(text: str) -> dict[str, str]:
     return values
 
 
-def load_policy_file(path: Path) -> DcgPolicy:
+def load_policy_file(
+    path: Path, *, expected_policy: DcgPolicy | None = None
+) -> DcgPolicy:
     """Validate an on-disk ``.dcg.toml`` rendered by this module."""
     try:
         text = path.read_text(encoding="utf-8")
@@ -662,7 +1269,7 @@ def load_policy_file(path: Path) -> DcgPolicy:
             f"Cannot read DCG policy at {path}: {exc}",
             path=str(path),
         ) from exc
-    return validate_rendered(text)
+    return validate_rendered(text, expected_policy=expected_policy)
 
 
 # ---------------------------------------------------------------------------
@@ -721,6 +1328,13 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="JSON overlay file (object or list of objects). Repeatable, order-significant.",
     )
+    render_cmd.add_argument(
+        "--site-policy",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Private v1 JSON site policy. Repeatable; defaults-first and order-significant.",
+    )
     _add_format(render_cmd, default=argparse.SUPPRESS)
 
     validate_cmd = sub.add_parser("validate", help="Validate a rendered .dcg.toml.")
@@ -728,6 +1342,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--config",
         default=".dcg.toml",
         help="Path to the rendered policy (default: .dcg.toml).",
+    )
+    validate_cmd.add_argument(
+        "--site-policy",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Private v1 JSON site policy expected in the rendered config. Repeatable.",
     )
     _add_format(validate_cmd, default=argparse.SUPPRESS)
     return parser
@@ -745,30 +1366,44 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:
+        sites = [load_site_policy_file(Path(path)) for path in args.site_policy]
         if args.command == "render":
             overlays: list[Mapping[str, Any]] = []
             for path in args.overlay:
                 overlays.extend(_load_overlay_file(path))
-            policy = build_policy(overlays)
+            policy = build_policy(overlays, site_policies=sites)
             content = render_policy(policy)
-            validate_rendered(content)
-            payload = policy.to_payload()
+            validate_rendered(content, expected_policy=policy)
+            payload = policy.to_receipt() if sites else policy.to_payload()
+            if sites:
+                payload["site_policies"] = [site.to_receipt() for site in sites]
             if args.output:
                 out = Path(args.output)
                 if out.parent != Path(""):
                     out.parent.mkdir(parents=True, exist_ok=True)
                 out.write_text(content, encoding="utf-8")
-                payload["output"] = str(out)
-                _emit(payload, [f"render-dcg-policy: {out}"], args.format)
+                if not sites:
+                    payload["output"] = str(out)
+                text_receipt = "render-dcg-policy: private-site-composition-written" if sites else f"render-dcg-policy: {out}"
+                _emit(payload, [text_receipt], args.format)
             else:
-                payload["content"] = content
+                # JSON is a receipt surface for private site composition and
+                # must not embed the rendered allow/block bodies. Text mode is
+                # the explicit content stream for callers that need stdout.
+                if not sites:
+                    payload["content"] = content
                 _emit(payload, [content.rstrip("\n")], args.format)
             return 0
 
-        policy = load_policy_file(Path(args.config))
-        payload = policy.to_payload()
-        payload["config"] = args.config
-        _emit(payload, [f"ok: {args.config}"], args.format)
+        expected = build_policy(site_policies=sites)
+        policy = load_policy_file(Path(args.config), expected_policy=expected)
+        payload = policy.to_receipt() if sites else policy.to_payload()
+        if sites:
+            payload["site_policies"] = [site.to_receipt() for site in sites]
+        if not sites:
+            payload["config"] = args.config
+        text_receipt = "ok: private-site-composition" if sites else f"ok: {args.config}"
+        _emit(payload, [text_receipt], args.format)
         return 0
     except SkillboxError as exc:
         if args.format == "json":
@@ -779,6 +1414,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
+    "AGENT_MEMORY_ROOT_PATTERN",
+    "AGENT_MEMORY_WRITE_PATTERN",
+    "AGENT_MEMORY_WRITE_REASON",
     "APPROVED_PACKS",
     "DCG_POLICY_BROAD_ALLOWLIST",
     "DCG_POLICY_ERROR_CODES",
@@ -787,25 +1425,36 @@ __all__ = [
     "DCG_POLICY_MALFORMED_BLOCKLIST",
     "DCG_POLICY_MALFORMED_OVERLAY",
     "DCG_POLICY_MALFORMED_PACK",
+    "DCG_POLICY_MALFORMED_SITE_POLICY",
+    "DCG_POLICY_DUPLICATE_BLOCK_PATTERN",
+    "DCG_POLICY_SITE_POLICY_IO",
     "DCG_POLICY_UNAUDITED_FAIL_OPEN",
     "DCG_POLICY_UNKNOWN_PACK",
+    "DCG_POLICY_UNSAFE_SITE_POLICY_FILE",
     "DCG_POLICY_UPSTREAM_MISMATCH",
     "DEFAULT_BLOCK_RULES",
     "DEFAULT_PACKS",
     "DcgBlockRule",
+    "DcgAgentProfile",
     "DcgPolicy",
+    "DcgSitePolicy",
     "EXCEPTION_FIELDS",
     "FailOpenException",
     "GENERATED_MARKER",
     "MAX_ALLOWLIST_RULES",
+    "MAX_BLOCKLIST_RULES",
+    "MAX_SITE_POLICY_BYTES",
     "OVERLAY_KEYS",
     "POLICY_MARKER",
     "POLICY_VERSION",
+    "SITE_POLICY_SCHEMA_VERSION",
     "UPSTREAM_KEY_PATHS",
     "build_policy",
     "key_paths",
     "load_policy_file",
+    "load_site_policy_file",
     "main",
+    "parse_site_policy",
     "render",
     "render_policy",
     "validate_rendered",
