@@ -5885,7 +5885,11 @@ class DcgConfigStateRootScopeTests(unittest.TestCase):
             )
 
             self.assertEqual(len(actions), 1)
-            self.assertTrue(actions[0].startswith(f"skip: {config} (state root {isolated} "))
+            self.assertTrue(
+                actions[0].startswith(
+                    f"skip: {config} (state root {isolated.resolve()} "
+                )
+            )
             self.assertIn("refusing to write outside it", actions[0])
             # The repo-root guard config is untouched...
             self.assertEqual(config.read_bytes(), before)
@@ -5922,7 +5926,11 @@ class DcgConfigStateRootScopeTests(unittest.TestCase):
                 actions,
                 [f"render-dcg-config: {config} (packs: core.git, core.filesystem)"],
             )
-            self.assertIn("[packs]", config.read_text(encoding="utf-8"))
+            rendered = config.read_text(encoding="utf-8")
+            self.assertEqual(rendered, runtime_ops_module.render_dcg_policy())
+            self.assertIn("\nfail_closed = true\n", rendered)
+            self.assertIn("[overrides]", rendered)
+            self.assertIn("skill-issue", rendered)
 
     def test_absolute_env_state_root_matching_the_repo_declaration_is_not_foreign(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

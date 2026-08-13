@@ -34,6 +34,45 @@ REPO_DCG_TOML = ROOT_DIR / ".dcg.toml"
 DCG_BIN = shutil.which("dcg")
 
 
+def _site_payload(site_id: str = "operator-test") -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "id": site_id,
+        "packs": [
+            "strict_git",
+            "containers",
+            "database",
+            "platform.github",
+            "cdn.cloudflare_workers",
+            "remote.rsync",
+            "remote.ssh",
+            "remote.scp",
+            "system.permissions",
+            "system.services",
+        ],
+        "allowlist": [r"^rm -rf /tmp/agent-scratch/[a-z0-9-]+$"],
+        "blocklist": [
+            {
+                "pattern": r"(?i)\bsite-delete\b",
+                "reason": "Use the bounded site cleanup workflow.",
+            }
+        ],
+        "agents": {
+            "default": {"trust_level": "medium"},
+            "unknown": {
+                "trust_level": "low",
+                "disabled_allowlist": False,
+                "extra_packs": ["strict_git", "database", "system.disk"],
+            },
+        },
+    }
+
+
+def _write_site(path: Path, payload: object, *, mode: int = 0o600) -> None:
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(mode)
+
+
 def _overlays(case: str) -> list[dict[str, object]]:
     return json.loads((FIXTURES / f"{case}.overlays.json").read_text(encoding="utf-8"))
 
@@ -69,6 +108,18 @@ class DefaultPolicyTests(unittest.TestCase):
         self.assertIn("block =", text)
         self.assertIn("vibing-with-ntm", text)
         self.assertIn("--robot-wait", text)
+
+    def test_default_render_carries_the_agent_memory_write_guard(self) -> None:
+        text = DP.render()
+        document = tomllib.loads(text)
+        self.assertIn(
+            DP.AGENT_MEMORY_WRITE_PATTERN,
+            [rule["pattern"] for rule in document["overrides"]["block"]],
+        )
+        self.assertIn("relevant canonical skill", text)
+        self.assertIn("`skill-issue`", text)
+        self.assertIn("thin pointer after promotion", text)
+        self.assertIn("Bash/PreToolUse only", text)
 
     def test_render_preserves_the_generated_ownership_marker(self) -> None:
         text = DP.render()
@@ -181,6 +232,211 @@ class InvalidInputTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, DP.DCG_POLICY_MALFORMED_OVERLAY)
 
 
+class SitePolicyTests(unittest.TestCase):
+    def test_live_shaped_site_policy_composes_defaults_first_and_renders_agents(self) -> None:
+        site = DP.parse_site_policy(_site_payload())
+        policy = DP.build_policy(site_policies=[site])
+        self.assertEqual(policy.packs[:2], DP.DEFAULT_PACKS)
+        self.assertEqual(policy.packs[2:], tuple(_site_payload()["packs"]))
+        self.assertEqual(policy.blocklist[: len(DP.DEFAULT_BLOCK_RULES)], DP.DEFAULT_BLOCK_RULES)
+        self.assertEqual(policy.blocklist[-1].pattern, r"(?i)\bsite-delete\b")
+        text = DP.render(site_policies=[site])
+        document = tomllib.loads(text)
+        self.assertEqual(document["agents"]["default"], {"trust_level": "medium"})
+        self.assertEqual(document["agents"]["unknown"]["trust_level"], "low")
+        self.assertFalse(document["agents"]["unknown"]["disabled_allowlist"])
+        self.assertEqual(DP.validate_rendered(text, expected_policy=policy), policy)
+
+    def test_site_order_is_deterministic_and_profiles_are_last_explicit_site_wins(self) -> None:
+        first_payload = _site_payload("first")
+        first_payload["packs"] = ["containers"]
+        first_payload["allowlist"] = ["first safe command"]
+        first_payload["agents"] = {"default": {"trust_level": "medium"}}
+        second_payload = _site_payload("second")
+        second_payload["packs"] = ["database"]
+        second_payload["allowlist"] = ["second safe command"]
+        second_payload["blocklist"] = [
+            {"pattern": r"\bsecond-block\b", "reason": "Use second-safe instead."}
+        ]
+        second_payload["agents"] = {"default": {"trust_level": "high"}}
+        sites = [DP.parse_site_policy(first_payload), DP.parse_site_policy(second_payload)]
+        one = DP.build_policy(site_policies=sites)
+        two = DP.build_policy(site_policies=sites)
+        self.assertEqual(one, two)
+        self.assertEqual(one.packs, (*DP.DEFAULT_PACKS, "containers", "database"))
+        self.assertEqual(one.allowlist, ("first safe command", "second safe command"))
+        assert one.default_agent is not None
+        self.assertEqual(one.default_agent.trust_level, "high")
+        self.assertEqual(DP.render_policy(one), DP.render_policy(two))
+
+    def test_duplicate_block_patterns_fail_closed_including_defaults(self) -> None:
+        payload = _site_payload()
+        payload["blocklist"] = [
+            {
+                "pattern": DP.DEFAULT_BLOCK_RULES[0].pattern,
+                "reason": "Duplicate must not silently replace a default.",
+            }
+        ]
+        site = DP.parse_site_policy(payload)
+        with self.assertRaises(ValidationError) as ctx:
+            DP.build_policy(site_policies=[site])
+        self.assertEqual(ctx.exception.code, DP.DCG_POLICY_DUPLICATE_BLOCK_PATTERN)
+
+    def test_site_schema_rejects_unknown_keys_wrong_types_bounds_and_bad_regex(self) -> None:
+        cases: list[tuple[str, dict[str, object], str]] = []
+        unknown = _site_payload()
+        unknown["secret_path"] = "/private/operator"
+        cases.append(("unknown", unknown, DP.DCG_POLICY_MALFORMED_SITE_POLICY))
+        wrong_version = _site_payload()
+        wrong_version["schema_version"] = True
+        cases.append(("version", wrong_version, DP.DCG_POLICY_MALFORMED_SITE_POLICY))
+        float_version = _site_payload()
+        float_version["schema_version"] = 1.0
+        cases.append(("float-version", float_version, DP.DCG_POLICY_MALFORMED_SITE_POLICY))
+        wrong_agents = _site_payload()
+        wrong_agents["agents"] = {"claude-code": {"trust_level": "high"}}
+        cases.append(("agents", wrong_agents, DP.DCG_POLICY_MALFORMED_SITE_POLICY))
+        too_many_packs = _site_payload()
+        too_many_packs["packs"] = ["strict_git"] * (DP.MAX_SITE_PACKS + 1)
+        cases.append(("pack-bound", too_many_packs, DP.DCG_POLICY_MALFORMED_SITE_POLICY))
+        bad_regex = _site_payload()
+        bad_regex["blocklist"] = [{"pattern": "(", "reason": "Invalid regex."}]
+        cases.append(("regex", bad_regex, DP.DCG_POLICY_MALFORMED_BLOCKLIST))
+        unsupported_regex = _site_payload()
+        unsupported_regex["blocklist"] = [
+            {"pattern": r"danger(?=ous)", "reason": "Lookaround is unsupported."}
+        ]
+        cases.append(
+            ("unsupported-regex", unsupported_regex, DP.DCG_POLICY_MALFORMED_BLOCKLIST)
+        )
+        bad_allow_regex = _site_payload()
+        bad_allow_regex["allowlist"] = ["safe("]
+        cases.append(
+            ("allow-regex", bad_allow_regex, DP.DCG_POLICY_MALFORMED_ALLOWLIST)
+        )
+        for name, payload, code in cases:
+            with self.subTest(name=name):
+                with self.assertRaises(ValidationError) as ctx:
+                    DP.parse_site_policy(payload)
+                self.assertEqual(ctx.exception.code, code)
+
+    def test_site_receipt_contains_metadata_only(self) -> None:
+        site = DP.parse_site_policy(_site_payload())
+        receipt = site.to_receipt()
+        self.assertEqual(set(receipt), {"site_id", "digest", "counts"})
+        serialized = json.dumps(receipt)
+        self.assertNotIn("site-delete", serialized)
+        self.assertNotIn("bounded site cleanup", serialized)
+        self.assertNotIn("allowlist", serialized.replace('"allowlist": 1', ""))
+        self.assertNotIn("path", serialized.lower())
+
+    def test_secure_loader_accepts_0600_and_rejects_missing_symlink_and_open_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            valid = root / "site.json"
+            _write_site(valid, _site_payload())
+            loaded = DP.load_site_policy_file(valid)
+            self.assertEqual(loaded, DP.parse_site_policy(_site_payload()))
+
+            missing = root / "missing.json"
+            with self.assertRaises(ValidationError) as ctx:
+                DP.load_site_policy_file(missing)
+            self.assertEqual(ctx.exception.code, DP.DCG_POLICY_SITE_POLICY_IO)
+            self.assertNotIn(str(missing), str(ctx.exception.to_payload()))
+
+            link = root / "link.json"
+            link.symlink_to(valid)
+            with self.assertRaises(ValidationError) as ctx:
+                DP.load_site_policy_file(link)
+            self.assertEqual(ctx.exception.code, DP.DCG_POLICY_UNSAFE_SITE_POLICY_FILE)
+
+            valid.chmod(0o640)
+            with self.assertRaises(ValidationError) as ctx:
+                DP.load_site_policy_file(valid)
+            self.assertEqual(ctx.exception.code, DP.DCG_POLICY_UNSAFE_SITE_POLICY_FILE)
+
+    def test_direct_file_and_cli_render_paths_have_byte_parity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            site_path = root / "site.json"
+            output = root / "dcg.toml"
+            _write_site(site_path, _site_payload())
+            site = DP.load_site_policy_file(site_path)
+            direct = DP.render(site_policies=[site])
+            result = _run_cli(
+                "render",
+                "--site-policy",
+                str(site_path),
+                "--output",
+                str(output),
+                "--format",
+                "json",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(output.read_text(encoding="utf-8"), direct)
+            receipt = json.loads(result.stdout)
+            self.assertEqual(receipt["site_policies"], [site.to_receipt()])
+            self.assertNotIn("site-delete", result.stdout)
+            self.assertNotIn(str(site_path), result.stdout)
+            self.assertNotIn(str(output), result.stdout)
+
+            receipt_only = _run_cli(
+                "render",
+                "--site-policy",
+                str(site_path),
+                "--format",
+                "json",
+            )
+            self.assertEqual(receipt_only.returncode, 0, receipt_only.stderr)
+            self.assertNotIn("content", json.loads(receipt_only.stdout))
+            self.assertNotIn("site-delete", receipt_only.stdout)
+
+            validated = _run_cli(
+                "validate",
+                "--site-policy",
+                str(site_path),
+                "--config",
+                str(output),
+                "--format",
+                "json",
+            )
+            self.assertEqual(validated.returncode, 0, validated.stderr)
+            self.assertNotIn(str(site_path), validated.stdout)
+            self.assertNotIn(str(output), validated.stdout)
+
+    def test_expected_composition_detects_a_valid_but_different_policy(self) -> None:
+        site = DP.parse_site_policy(_site_payload())
+        expected = DP.build_policy(site_policies=[site])
+        default_text = DP.render()
+        with self.assertRaises(ValidationError) as ctx:
+            DP.validate_rendered(default_text, expected_policy=expected)
+        self.assertEqual(ctx.exception.code, DP.DCG_POLICY_UPSTREAM_MISMATCH)
+
+    @unittest.skipIf(DCG_BIN is None, "dcg binary not installed")
+    def test_composed_site_block_is_enforced_by_real_dcg(self) -> None:
+        site = DP.parse_site_policy(_site_payload())
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "dcg.toml"
+            config.write_text(DP.render(site_policies=[site]), encoding="utf-8")
+            result = subprocess.run(
+                [
+                    str(DCG_BIN),
+                    "test",
+                    "--config",
+                    str(config),
+                    "--format",
+                    "json",
+                    "site-delete everything",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["decision"], "deny", payload)
+        self.assertIn("site cleanup", payload["reason"])
+
+
 class UpstreamValidationTests(unittest.TestCase):
     def test_rendered_documents_only_use_pinned_upstream_keys(self) -> None:
         for case in GOLDEN_CASES:
@@ -221,7 +477,12 @@ class UpstreamValidationTests(unittest.TestCase):
             check=True,
         )
         upstream = {pack["id"] for pack in json.loads(result.stdout)["packs"]}
-        self.assertEqual(sorted(DP.APPROVED_PACKS - upstream), [])
+        valid = {
+            pack
+            for pack in DP.APPROVED_PACKS
+            if pack in upstream or any(item.startswith(f"{pack}.") for item in upstream)
+        }
+        self.assertEqual(sorted(DP.APPROVED_PACKS - valid), [])
 
     @unittest.skipIf(DCG_BIN is None, "dcg binary not installed")
     def test_rendered_default_policy_denies_a_destructive_git_command(self) -> None:
@@ -238,6 +499,77 @@ class UpstreamValidationTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["decision"], "deny")
         self.assertEqual(payload["pack_id"], "core.git")
+
+    @unittest.skipIf(DCG_BIN is None, "dcg binary not installed")
+    def test_rendered_default_policy_blocks_agent_memory_writes_only(self) -> None:
+        denied = (
+            "echo durable-note > ~/.claude/projects/-Users-alice-repos/memory/note.md",
+            "printf durable-note >> /Users/alice/.codex/memories/MEMORY.md",
+            "printf durable-note | tee -a ~/.codex/memories/MEMORY.md",
+            "tee $HOME/.codex/memories/one.md /tmp/copy.md",
+            "cp /tmp/note.md /home/agent/.claude/projects/project/memory/note.md",
+            "mv /tmp/note.md /root/.codex/memories/note.md",
+            "touch ~/.claude/projects/project/memory/note.md",
+            "install /tmp/note.md ~/.codex/memories/note.md",
+            "install -t ~/.codex/memories /tmp/note.md",
+            "truncate -s 0 ~/.codex/memories/MEMORY.md",
+            "ln -s /tmp/note.md ~/.codex/memories/note.md",
+            "rsync /tmp/note.md ~/.codex/memories/note.md",
+            "scp /tmp/note.md /Users/alice/.codex/memories/note.md",
+            "sed -i.bak -e s/old/new/ ~/.codex/memories/MEMORY.md",
+            "perl -pi -e s/old/new/ /home/agent/.codex/memories/MEMORY.md",
+            "mkdir -p /Users/alice/.claude/projects/project/memory/topic",
+        )
+        allowed = (
+            "cat ~/.codex/memories/MEMORY.md",
+            "rg estate ~/.claude/projects/project/memory",
+            "find /Users/alice/.codex/memories -type f",
+            "cp ~/.codex/memories/MEMORY.md /tmp/MEMORY.md",
+            "rsync ~/.codex/memories/MEMORY.md /tmp/MEMORY.md",
+            "git status -- ~/.codex/memories/MEMORY.md",
+            "echo durable-note > /tmp/note.md",
+            "mkdir -p /tmp/memory",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "dcg.toml"
+            config.write_text(DP.render(), encoding="utf-8")
+            for command in denied:
+                with self.subTest(decision="deny", command=command):
+                    result = subprocess.run(
+                        [
+                            str(DCG_BIN),
+                            "test",
+                            "--config",
+                            str(config),
+                            "--format",
+                            "json",
+                            command,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    payload = json.loads(result.stdout)
+                    self.assertEqual(payload["decision"], "deny", payload)
+                    self.assertIn("skill-issue", payload["reason"])
+            for command in allowed:
+                with self.subTest(decision="allow", command=command):
+                    result = subprocess.run(
+                        [
+                            str(DCG_BIN),
+                            "test",
+                            "--config",
+                            str(config),
+                            "--format",
+                            "json",
+                            command,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    payload = json.loads(result.stdout)
+                    self.assertEqual(payload["decision"], "allow", payload)
 
 
 class CliTests(unittest.TestCase):
