@@ -13,6 +13,21 @@ if str(ENV_MANAGER_DIR) not in sys.path:
 from runtime_manager import command_registry as REG  # noqa: E402
 
 
+def _live_mcp_tool_names() -> set[str]:
+    """Tool names the in-box MCP server actually serves, read from the source.
+
+    Loaded by path rather than imported: ``mcp_server.py`` lives outside the
+    ``runtime_manager`` package and this module must stay stdlib-only.
+    """
+    from importlib.machinery import SourceFileLoader
+
+    module = SourceFileLoader(
+        "skillbox_mcp_server_for_registry_tests",
+        str(ENV_MANAGER_DIR / "mcp_server.py"),
+    ).load_module()
+    return {tool["name"] for tool in module.TOOLS}
+
+
 def _valid_spec(**changes: object) -> REG.CommandSpec:
     base = REG.CommandSpec(
         id="brain.example",
@@ -24,7 +39,9 @@ def _valid_spec(**changes: object) -> REG.CommandSpec:
         side_effect="none",
         risk="low",
         entrypoint="manage.py",
-        mcp_tool="skillbox_example",
+        # Must be a real name from the frozen in-box MCP inventory: the surface is
+        # deprecated and closed, so validate_spec rejects invented tool names.
+        mcp_tool="skillbox_status",
         scopes=("client",),
         examples=("python3 .env-manager/manage.py example --format json",),
         validations=("python3 -m unittest tests.test_agent_ops_command_registry",),
@@ -82,6 +99,57 @@ class DefaultRegistryTests(unittest.TestCase):
             "skillbox_snap",
         ):
             self.assertIn(tool, declared)
+
+    def test_every_declared_mcp_tool_exists_on_the_live_server(self) -> None:
+        """No ghosts. A declaration that the server does not serve is a lie.
+
+        ``runtime.explain`` used to declare ``skillbox_explain_skill``, a tool the
+        in-box server never exposed, and the generated API reference published it
+        to agents as an "MCP mirror". This test is the guard that keeps a ghost
+        from reaching docs again.
+        """
+        live = _live_mcp_tool_names()
+        declared = {spec.mcp_tool for spec in REG.default_registry() if spec.mcp_tool}
+        self.assertTrue(
+            declared <= live,
+            f"registry declares MCP tools the server does not expose: {sorted(declared - live)}",
+        )
+        self.assertNotIn("skillbox_explain_skill", declared)
+
+    def test_frozen_inventory_matches_the_live_server(self) -> None:
+        """The freeze is only honest if it names the real inventory."""
+        self.assertEqual(
+            set(REG.MCP_FROZEN_TOOLS),
+            _live_mcp_tool_names(),
+            "MCP_FROZEN_TOOLS drifted from mcp_server.TOOLS. The in-box MCP surface "
+            "is deprecated and frozen — if a tool was legitimately added or removed, "
+            "update the inventory deliberately and say so in CHANGELOG.md.",
+        )
+
+    def test_retained_read_only_cluster_is_part_of_the_frozen_inventory(self) -> None:
+        self.assertTrue(REG.MCP_RETAINED_TOOLS <= REG.MCP_FROZEN_TOOLS)
+        for spec_id in ("runtime.capabilities", "brain.next", "brain.graph",
+                        "brain.explain", "brain.search", "brain.snap"):
+            spec = REG.load_default_registry()[spec_id]
+            self.assertIn(spec.mcp_tool, REG.MCP_RETAINED_TOOLS, spec_id)
+
+    def test_new_mcp_tools_are_rejected_because_the_surface_is_frozen(self) -> None:
+        issues = REG.validate_spec(_valid_spec(mcp_tool="skillbox_brand_new_idea"))
+        joined = "\n".join(issues)
+        self.assertIn("frozen in-box MCP inventory", joined)
+        self.assertIn("robot CLI", joined)
+
+    def test_mcp_surface_payload_announces_the_deprecation(self) -> None:
+        payload = REG.registry_payload()["mcp_surface"]
+        self.assertEqual(payload["status"], "deprecated")
+        self.assertTrue(payload["frozen"])
+        self.assertIn("DEPRECATED", payload["notice"])
+        self.assertTrue(any("--format json" in item for item in payload["canonical_path"]))
+        self.assertTrue(set(payload["declared_tools"]) <= set(REG.MCP_FROZEN_TOOLS))
+        self.assertEqual(payload["counts"]["frozen_tools"], len(REG.MCP_FROZEN_TOOLS))
+
+    def test_registry_text_header_carries_the_deprecation(self) -> None:
+        self.assertIn("deprecated", REG.registry_text_lines()[0])
 
     def test_destructive_entries_carry_destructive_risk(self) -> None:
         for spec in REG.default_registry():
@@ -313,8 +381,8 @@ class ValidationTests(unittest.TestCase):
         self.assertTrue(any("duplicate command id" in i for i in issues))
 
     def test_duplicate_mcp_tools_are_reported(self) -> None:
-        first = _valid_spec(id="brain.first", mcp_tool="skillbox_shared")
-        second = _valid_spec(id="brain.second", mcp_tool="skillbox_shared")
+        first = _valid_spec(id="brain.first", mcp_tool="skillbox_doctor")
+        second = _valid_spec(id="brain.second", mcp_tool="skillbox_doctor")
         issues = REG.validate_registry(
             list(REG.default_registry()) + [first, second]
         )

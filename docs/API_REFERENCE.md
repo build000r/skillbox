@@ -485,13 +485,13 @@ python3 -m unittest tests.test_runtime_evidence
 
 Explain skill visibility provenance for one skill at one cwd: layer, scope rule, losers, and ranked fixes.
 
-- Surfaces: `cli`, `mcp`
+- Surfaces: `cli`
 - Scopes: `client`, `profile`, `cwd`
 - Side effect: `none`
 - Risk: `low`
 - Entrypoint: `manage.py`
 - Owner binary: `sbp`
-- MCP mirror: `skillbox_explain_skill`
+- MCP mirror: None
 
 **Inputs**
 

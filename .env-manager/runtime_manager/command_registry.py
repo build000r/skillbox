@@ -69,6 +69,83 @@ GRAPH_NODE_KINDS = frozenset(
     }
 )
 
+# ---------------------------------------------------------------------------
+# In-box MCP surface: DEPRECATED and FROZEN (see docs/ARCHITECTURE.md)
+# ---------------------------------------------------------------------------
+# The in-box MCP server (.env-manager/mcp_server.py) is no longer the agent
+# front door. The canonical agent path is the robot CLI plus skills. This
+# registry keeps the MCP declarations honest rather than growing them: the
+# frozen inventory below is the complete set of tool names the live server
+# exposes, and ``validate_spec`` rejects any ``mcp_tool`` outside it.
+MCP_SURFACE_STATUS = "deprecated"
+MCP_DEPRECATION_NOTICE = (
+    "The in-box MCP surface is DEPRECATED and FROZEN — no new tools. "
+    "Canonical agent path: python3 .env-manager/manage.py <command> --format json "
+    "(or `sbp <command> --format json`), with `robot-docs guide` for the workflow "
+    "and `capabilities --json` for the machine-readable contract."
+)
+# Every tool name the live server declares in ``mcp_server.TOOLS``. Frozen: new
+# entries are a contract change, not a routine addition. Kept in sync by
+# tests/test_agent_ops_command_registry.py, which diffs it against the live
+# server so a ghost declaration can never reach generated docs again.
+MCP_FROZEN_TOOLS = frozenset(
+    {
+        "skillbox_acceptance",
+        "skillbox_bootstrap",
+        "skillbox_capabilities",
+        "skillbox_client_diff",
+        "skillbox_client_init",
+        "skillbox_context",
+        "skillbox_doctor",
+        "skillbox_down",
+        "skillbox_events",
+        "skillbox_explain",
+        "skillbox_focus",
+        "skillbox_graph",
+        "skillbox_logs",
+        "skillbox_mcp_audit",
+        "skillbox_mmdx_open",
+        "skillbox_next",
+        "skillbox_onboard",
+        "skillbox_operator_booking",
+        "skillbox_overlay",
+        "skillbox_parity_report",
+        "skillbox_ports",
+        "skillbox_pulse",
+        "skillbox_render",
+        "skillbox_restart",
+        "skillbox_search",
+        "skillbox_session_end",
+        "skillbox_session_event",
+        "skillbox_session_resume",
+        "skillbox_session_start",
+        "skillbox_session_status",
+        "skillbox_skill",
+        "skillbox_skill_audit",
+        "skillbox_skills",
+        "skillbox_snap",
+        "skillbox_status",
+        "skillbox_sync",
+        "skillbox_up",
+        "skillbox_worker_artifacts",
+        "skillbox_worker_promote_learning",
+        "skillbox_worker_status",
+        "skillbox_worker_submit",
+    }
+)
+# Read-only brain mirrors kept for one more release so orientation still works
+# over MCP while callers migrate. Everything else is frozen and deprecated.
+MCP_RETAINED_TOOLS = frozenset(
+    {
+        "skillbox_capabilities",
+        "skillbox_explain",
+        "skillbox_graph",
+        "skillbox_next",
+        "skillbox_search",
+        "skillbox_snap",
+    }
+)
+
 _ID_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _MCP_TOOL_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 _TYPE_PATTERN = re.compile(
@@ -237,6 +314,12 @@ def validate_spec(spec: CommandSpec) -> list[str]:
             issues.append(f"{ref}: mcp_tool must match {_MCP_TOOL_PATTERN.pattern}")
         if "mcp" not in spec.surface:
             issues.append(f"{ref}: mcp_tool is set but surface does not include mcp")
+        if spec.mcp_tool not in MCP_FROZEN_TOOLS:
+            issues.append(
+                f"{ref}: mcp_tool {spec.mcp_tool!r} is not in the frozen in-box MCP inventory. "
+                "That surface is deprecated and closed to new tools — expose the command "
+                "through the robot CLI instead (manage.py <command> --format json)."
+            )
     for scope in spec.scopes:
         if scope not in SCOPE_KINDS:
             issues.append(f"{ref}: unknown scope {scope!r}")
@@ -1109,7 +1192,12 @@ def default_registry() -> tuple[CommandSpec, ...]:
         CommandSpec(
             id="runtime.explain",
             tier=2,
-            surface=("cli", "mcp"),
+            # CLI only. This entry used to declare mcp_tool="skillbox_explain_skill",
+            # a tool the in-box MCP server never exposed; the ghost was published
+            # to agents as an "MCP mirror" in the generated API reference. The
+            # in-box MCP surface is deprecated and frozen, so the honest fix is to
+            # drop the claim rather than mint the tool.
+            surface=("cli",),
             summary="Explain skill visibility provenance for one skill at one cwd: layer, scope rule, losers, and ranked fixes.",
             inputs={
                 "target": "string",
@@ -1130,7 +1218,6 @@ def default_registry() -> tuple[CommandSpec, ...]:
             risk="low",
             entrypoint="manage.py",
             owner_binary="sbp",
-            mcp_tool="skillbox_explain_skill",
             scopes=("client", "profile", "cwd"),
             examples=("python3 .env-manager/manage.py explain wiki --cwd \"$PWD\" --format json",),
             validations=("python3 -m pytest tests/ -k explain",),
@@ -1447,7 +1534,36 @@ def registry_payload(specs: Iterable[CommandSpec] | None = None) -> dict[str, An
             "tier1": sum(1 for spec in specs if spec.tier == 1),
             "tier2": sum(1 for spec in specs if spec.tier == 2),
         },
+        "mcp_surface": mcp_surface_payload(specs),
         "capabilities": [spec.to_payload() for spec in specs],
+    }
+
+
+def mcp_surface_payload(specs: Iterable[CommandSpec] | None = None) -> dict[str, Any]:
+    """Machine-readable status of the in-box MCP surface.
+
+    Emitted inside ``capabilities`` so an agent reading the contract learns the
+    surface is deprecated without having to read a markdown file first.
+    """
+    if specs is None:
+        specs = default_registry()
+    declared = sorted({spec.mcp_tool for spec in specs if spec.mcp_tool})
+    return {
+        "status": MCP_SURFACE_STATUS,
+        "notice": MCP_DEPRECATION_NOTICE,
+        "canonical_path": [
+            "python3 .env-manager/manage.py <command> --format json",
+            "python3 .env-manager/manage.py robot-docs guide",
+            "python3 .env-manager/manage.py capabilities --json",
+        ],
+        "frozen": True,
+        "retained_read_only": sorted(MCP_RETAINED_TOOLS),
+        "declared_tools": declared,
+        "counts": {
+            "frozen_tools": len(MCP_FROZEN_TOOLS),
+            "declared_tools": len(declared),
+            "retained_read_only": len(MCP_RETAINED_TOOLS),
+        },
     }
 
 
@@ -1459,7 +1575,8 @@ def registry_text_lines(specs: Iterable[CommandSpec] | None = None) -> list[str]
     tier1 = sum(1 for spec in specs if spec.tier == 1)
     lines = [
         f"command registry {REGISTRY_ABI_VERSION} "
-        f"({len(specs)} entries; tier1 {tier1}, tier2 {len(specs) - tier1})"
+        f"({len(specs)} entries; tier1 {tier1}, tier2 {len(specs) - tier1}) "
+        f"[in-box MCP surface: {MCP_SURFACE_STATUS} and frozen — use the CLI entries below]"
     ]
     for spec in specs:
         surfaces = ",".join(spec.surface)
@@ -1484,6 +1601,10 @@ __all__ = [
     "OWNER_BINARIES",
     "KNOWN_ENTRYPOINTS",
     "GRAPH_NODE_KINDS",
+    "MCP_SURFACE_STATUS",
+    "MCP_DEPRECATION_NOTICE",
+    "MCP_FROZEN_TOOLS",
+    "MCP_RETAINED_TOOLS",
     "REQUIRED_TIER1_IDS",
     "REQUIRED_TIER2_IDS",
     "REQUIRED_COMMAND_IDS",
@@ -1495,6 +1616,7 @@ __all__ = [
     "default_registry",
     "load_default_registry",
     "registry_payload",
+    "mcp_surface_payload",
     "registry_text_lines",
     "replace_spec",
 ]
