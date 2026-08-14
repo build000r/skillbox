@@ -428,137 +428,14 @@ PY
 }
 
 print_help() {
-  cat <<'EOF' | sed "s/__WRAPPER__/${wrapper_name}/g"
-__WRAPPER__ - personal skillbox runtime and skill helper
-
-Usage:
-  __WRAPPER__                         Compact home view for this cwd
-  __WRAPPER__ help                    Show this help
-  __WRAPPER__ help --human [FILTER]   Operator console: grouped command atlas +
-                              live runtime/git/skill panels (TTY-only live
-                              reads; --live/--no-live override; FILTER narrows)
-  __WRAPPER__ capabilities --json     Print the wrapper machine contract
-  __WRAPPER__ robot-docs guide        Print agent-facing command guidance
-  __WRAPPER__ robot-triage            Print compact first actions
-  __WRAPPER__ up [profile] [service]  Start services (default profile: local-all)
-  __WRAPPER__ down [profile] [svc]    Stop services
-  __WRAPPER__ restart [profile] [svc] Restart services
-  __WRAPPER__ status [profile]        Runtime status
-  __WRAPPER__ logs [profile] service  Show service logs
-  __WRAPPER__ launch DIR... --request "..."  Launch one Swimmers agent per dir
-  __WRAPPER__ bulk DIR... --request "..."    Alias for launch
-  __WRAPPER__ recalibrate [args...]   Read cwd skill drift; --auto-fix previews heal, --yes applies
-  __WRAPPER__ candidates [args...]    Explore linkable skill sources for this cwd
-  __WRAPPER__ mcp [args...]           Read-only Claude JSON / Codex TOML MCP audit
-  __WRAPPER__ mcp sync [args...]     Render .mcp.json + .codex/config.toml from declaration (--dry-run default)
-  __WRAPPER__ doctor [--format json]  One front door for all STRUCTURAL gates
-                              (INCO/FAIL/PASS); complements `make doctor`.
-                              Exits nonzero on FAIL only.
-  __WRAPPER__ registry doctor [args...] Check registry/repos.yaml against local Git repos
-  __WRAPPER__ repo [args...]           Read repository dossiers through private Repo Atlas
-  __WRAPPER__ git [--only CLASS[,CLASS]] [--root PATH] [--depth N] [--cached] [--live] [--delta] [--json]
-                              Read-only risk-sorted git status across ~/repos
-                              (aliases: gs, git status; never fetches or pushes)
-                              --cached replays the last scan when <=10m old
-                              (never scans; stale cache says so and exits 0)
-                              --delta diffs the live scan against the previous
-                              one (newly dirty/resolved/appeared; not --cached)
-                              --live adds an origin comparison delegated to the
-                              reconcile skill (fleet_convergence; still never
-                              fetches locally; degrades loudly to local-only)
-                              CLASS: dirty stash ahead behind diverged-clean
-                              mid-op no-remote clean-current blocked
-                              unregistered stale-registered
-  __WRAPPER__ cass status|search|rebuild|doctor  Remote Cass front door.
-                              Use status/search for active tasks; treat rebuild as
-                              coordinated maintenance, not degraded-mode fallback.
-  __WRAPPER__ oracle "question" [args...]  Ask GPT-5 Pro; answer on stdout.
-                              Hidden browser, no paste. --model instant while
-                              iterating so Pro usage is not spent on tests;
-                              --project files the thread in a ChatGPT Project.
-  __WRAPPER__ evidence [--repo P|--skill N] --format json  Measure skill invocations per
-                              repo from Cass (contamination-safe), joined to current policy
-  __WRAPPER__ cron [status|apply]     Declared crontab + script links from skillbox-config
-  __WRAPPER__ send-later [list|doctor|new|panes] Schedule/inspect delayed/recurring tmux/NTM sends (--json on list/doctor/panes)
-  __WRAPPER__ safe [SECONDS]          Swarm load GO/NO-GO tick (wraps swarm-load-guard; e.g. safe 10)
-  __WRAPPER__ conference1 [urls|status|helper] Conference1 tailnet Serve endpoints, live
-                              read-only Serve/portproxy status over SSH, and the
-                              Swimmers heavy-build lane (aliases: conf1, tailnet;
-                              expose/remove require --yes; Funnel refused)
-  __WRAPPER__ beads [status|init|sync] Check or initialize repo-local beads state
-  __WRAPPER__ mmdx QUERY              Fuzzy-find and open .mmdx/.mmd from this cwd
-  __WRAPPER__ mmdx                    List recent .mmdx/.mmd files from this repo
-  __WRAPPER__ hire times              Show configured human-operator availability
-  __WRAPPER__ hire book [args...]     Send magic-link/signup email and create x402 hold
-                              Set SPAPS_AUTH_ACCESS_TOKEN to bind to a verified account.
-
-Skills:
-  __WRAPPER__ skills [args...]        Show effective skills for this cwd
-  __WRAPPER__ skills --issues-only    Compact skill drift/policy view
-  __WRAPPER__ skills audit            Scan downstream repos for skill policy drift
-  __WRAPPER__ skill plan NAME         Preview where NAME would be linked
-  __WRAPPER__ skill add NAME          Link NAME into global/project/category roots
-  __WRAPPER__ skill resolve           Resolve admitted host skills without mutation
-  __WRAPPER__ skill pull NAME         Read one admitted skill now without linking or activation
-  __WRAPPER__ skill activate NAME     Link NAME and return a session packet (mutates links)
-  __WRAPPER__ skill why NAME          Explain visibility layers and exact fixes
-  __WRAPPER__ skill togglable         List cwd-flippable skills and exact flip commands
-  __WRAPPER__ skill what-if --repo R  Simulate overlay/pin visibility with zero writes
-  __WRAPPER__ skill on NAME           Durably pin NAME on for this repo
-  __WRAPPER__ skill off NAME          Durably pin NAME off for this repo
-  __WRAPPER__ skill default on NAME --repo --dry-run
-  __WRAPPER__ skill default on NAME --repos app,app-server --dry-run
-  __WRAPPER__ skill default on NAME --category frontend --dry-run
-                                      Preview repo/cross-repo/global default policy edits
-  __WRAPPER__ skill heal NAME         Resolve source, pin on, link, and print activation packet
-  __WRAPPER__ skill sync --dry-run    Link cwd-required missing skills
-  __WRAPPER__ skill prune --dry-run   Preview policy-violation unlinks
-  __WRAPPER__ sync /path/to/skill     Legacy shorthand for global skill add
-
-Overlays:
-  __WRAPPER__ m                       Toggle the marketing overlay on/off in
-                              this repo's .skillbox/skill-overrides.yaml.
-                              Pass --keep to preserve them.
-  __WRAPPER__ overlay                 List active overlays
-  __WRAPPER__ overlay on NAME         Enable overlay for this repo
-  __WRAPPER__ overlay off NAME        Disable overlay for this repo
-  __WRAPPER__ overlay off NAME --keep Disable overlay for this repo
-  __WRAPPER__ overlay toggle NAME     Flip overlay state for this repo
-
-Profiles:
-  all | local-all, core | local-core, minimal | mini | local-minimal,
-  backend | local-backend, frontend | front | local-frontend,
-  openclaw | claw | local-openclaw
-
-Examples:
-  __WRAPPER__
-  __WRAPPER__ status core --json
-  __WRAPPER__ down core api --dry-run --json
-  __WRAPPER__ skills --issues-only
-  __WRAPPER__ candidates --json
-  __WRAPPER__ recalibrate
-  __WRAPPER__ recalibrate --auto-fix
-  __WRAPPER__ mcp
-  __WRAPPER__ beads status
-  __WRAPPER__ beads init
-  __WRAPPER__ recalibrate --fleet --limit 20
-  __WRAPPER__ skill plan mcp-server-design
-  __WRAPPER__ skill add ui --to category --category frontend
-  __WRAPPER__ skill why wiki --json
-  __WRAPPER__ skill togglable --json
-  __WRAPPER__ skill what-if --repo . --overlay marketing --json
-  __WRAPPER__ skill on wiki --verify
-  __WRAPPER__ skill off wiki --dry-run
-  __WRAPPER__ skill default on wiki --repo --dry-run
-  __WRAPPER__ skill default on wiki --category frontend --dry-run
-  __WRAPPER__ skill lint             Lint .skillbox/skill-overrides.yaml
-  __WRAPPER__ mmdx review
-  __WRAPPER__ mmdx skill review --no-open
-  __WRAPPER__ launch ../api ../web --request 'Audit auth drift' --dry-run --json
-  __WRAPPER__ hire times --limit 3
-  __WRAPPER__ hire book --date 2026-05-06 --slot AM --email person@example.com --name "Person" --send-magic-link
-  __WRAPPER__ up backend spaps
-EOF
+  # Single-source help: the command inventory lives in lib/sbp_help_human.py's
+  # atlas(); this renders it flat (no ANSI, no groups) for agents and pipes,
+  # while `help --human` renders the same atlas as the operator console.
+  python3 "${script_dir}/lib/sbp_help_human.py" \
+    --wrapper "${wrapper_name}" \
+    --root "${skillbox_root:-${script_dir}/..}" \
+    --cwd "${invoke_cwd}" \
+    --plain
 }
 
 print_capabilities() {

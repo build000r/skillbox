@@ -26,6 +26,19 @@ def _run_sbp(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _load_atlas_module():
+    import importlib.util
+    import sys
+
+    lib_path = ROOT_DIR / "scripts" / "lib" / "sbp_help_human.py"
+    spec = importlib.util.spec_from_file_location("sbp_help_atlas", lib_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["sbp_help_atlas"] = module  # dataclasses needs the module registered
+    spec.loader.exec_module(module)
+    return module
+
+
 class SbpHelpHumanTests(unittest.TestCase):
     def test_plain_help_advertises_human_mode(self) -> None:
         result = _run_sbp("help")
@@ -65,6 +78,56 @@ class SbpHelpHumanTests(unittest.TestCase):
         missed = _run_sbp("help", "--human", "zzz-not-a-command")
         self.assertEqual(missed.returncode, 0, missed.stderr)
         self.assertIn("no commands match", missed.stdout)
+
+    def test_plain_help_is_rendered_from_the_atlas(self) -> None:
+        # Single-source help: plain `sbp help` and `help --human` both render
+        # lib/sbp_help_human.py's atlas(). Every atlas invocation must appear
+        # verbatim in plain help — a missing row means the wiring regressed to
+        # a hand-maintained copy.
+        module = _load_atlas_module()
+
+        plain = _run_sbp("help").stdout
+        self.assertNotIn("\x1b[", plain)
+        self.assertIn("Examples:", plain)
+        for group in module.atlas("sbp"):
+            for cmd in group.cmds:
+                self.assertIn(cmd.invocation, plain, f"atlas row missing from plain help: {cmd.invocation}")
+
+    def test_atlas_and_capabilities_agree_on_the_verb_set(self) -> None:
+        # The atlas (help) and capabilities (machine contract) are the two
+        # remaining inventories. Compare their top-level verb sets exactly,
+        # with every deliberate difference named here — silent drift fails.
+        module = _load_atlas_module()
+
+        atlas_verbs = set()
+        for group in module.atlas("sbp"):
+            for cmd in group.cmds:
+                tokens = cmd.invocation.split()
+                if not tokens or tokens[0] != "sbp":
+                    continue  # info rows like the bare `profiles` line
+                if len(tokens) == 1:
+                    continue  # bare `sbp` home view
+                atlas_verbs.add(tokens[1])
+
+        capabilities = json.loads(_run_sbp("capabilities", "--json").stdout)
+        caps_verbs = set()
+        for entry in capabilities["commands"]:
+            name = entry["name"]
+            if name.startswith("skill-"):
+                name = "skill"  # skill-why/pull/... are skill subverbs
+            if name == "bulk":
+                name = "launch"  # documented alias
+            caps_verbs.add(name)
+
+        # Deliberate one-sided entries (update alongside a real surface change):
+        atlas_only = {
+            "m",     # marketing-overlay toggle shorthand; capability is `overlay`
+            "sync",  # deprecated legacy shorthand for skill add; kept out of the machine contract
+        }
+        self.assertEqual(
+            atlas_verbs - atlas_only, caps_verbs,
+            "help atlas and capabilities drifted — add the verb to both (or to the allowlist above)",
+        )
 
     def test_capabilities_declares_help_command(self) -> None:
         result = _run_sbp("capabilities", "--json")

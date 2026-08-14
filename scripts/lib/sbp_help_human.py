@@ -361,6 +361,66 @@ def render(wrapper: str, root: str, cwd: str, client: str, profile: str, mode: s
     return "\n".join(out)
 
 
+PLAIN_TAIL = """
+Profiles:
+  all | local-all, core | local-core, minimal | mini | local-minimal,
+  backend | local-backend, frontend | front | local-frontend,
+  openclaw | claw | local-openclaw
+
+Examples:
+  {w}
+  {w} status core --json
+  {w} down core api --dry-run --json
+  {w} skills --issues-only
+  {w} candidates --json
+  {w} recalibrate --auto-fix
+  {w} mcp
+  {w} beads status
+  {w} skill plan mcp-server-design
+  {w} skill why wiki --json
+  {w} skill togglable --json
+  {w} skill what-if --repo . --overlay marketing --json
+  {w} skill on wiki --verify
+  {w} skill default on wiki --repo --dry-run
+  {w} skill lint
+  {w} mmdx review
+  {w} launch ../api ../web --request 'Audit auth drift' --dry-run --json
+  {w} hire book --date 2026-05-06 --slot AM --email person@example.com --name "Person" --send-magic-link
+  {w} up backend spaps
+"""
+
+
+def render_plain(wrapper: str) -> str:
+    """Flat, ANSI-free rendering of the SAME atlas `--human` uses.
+
+    This is the agent-facing `sbp help`: one inventory (atlas()), two
+    renderers. No colors, no groups, no pills, no live reads — just
+    `invocation  description` rows plus the static Profiles/Examples tail.
+    """
+    width = 100
+    invocation_col = 38
+    out = [
+        f"{wrapper} - personal skillbox runtime and skill helper",
+        "",
+        f"Operator console: {wrapper} help --human   (grouped, colorized, live panels, FILTER)",
+        "",
+        "Usage:",
+    ]
+    for group in atlas(wrapper):
+        for cmd in group.cmds:
+            desc_lines = wrap_desc(cmd.desc, invocation_col + 3, width) or [""]
+            if len(cmd.invocation) <= invocation_col:
+                out.append(f"  {cmd.invocation.ljust(invocation_col)} {desc_lines[0]}")
+            else:
+                out.append(f"  {cmd.invocation}")
+                out.append(f"  {' ' * invocation_col} {desc_lines[0]}")
+            for extra in desc_lines[1:]:
+                out.append(f"  {' ' * invocation_col} {extra}")
+    out.append(PLAIN_TAIL.replace("{w}", wrapper).rstrip())
+    out.append("")
+    return "\n".join(out)
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="sbp-help-human", add_help=False)
     parser.add_argument("--wrapper", default="sbp")
@@ -371,8 +431,13 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--mode", default="reuse")
     parser.add_argument("--live", dest="live", action="store_true", default=None)
     parser.add_argument("--no-live", dest="live", action="store_false")
+    parser.add_argument("--plain", action="store_true")
     parser.add_argument("filters", nargs="*", default=[])
     args = parser.parse_args(argv)
+
+    if args.plain:
+        print(render_plain(args.wrapper))
+        return 0
 
     live_default = sys.stdout.isatty() and os.environ.get("SBP_HELP_LIVE", "") != "0"
     want_live = live_default if args.live is None else args.live
