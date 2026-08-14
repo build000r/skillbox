@@ -36,6 +36,51 @@ class SkillboxMcpServerTests(unittest.TestCase):
         self.assertEqual(payload["capabilities"]["logging"], {})
         self.assertIn("skillbox_events", payload["instructions"])
 
+    def test_handle_initialize_leads_with_the_deprecation_and_a_migration_pointer(self) -> None:
+        """An agent reads instructions before its first tool call — say it there."""
+        instructions = MODULE.handle_initialize({})["instructions"]
+        self.assertIn("DEPRECATED", instructions)
+        self.assertIn("FROZEN", instructions)
+        self.assertIn("manage.py <command> --format json", instructions)
+        self.assertIn("robot-docs guide", instructions)
+        self.assertIn("capabilities --json", instructions)
+
+    def test_every_tool_description_carries_the_deprecation_marker(self) -> None:
+        """tools/list is the only surface some agents ever read."""
+        tools = MODULE.handle_tools_list()["tools"]
+        self.assertEqual(len(tools), 41, "the in-box MCP surface is frozen at 41 tools")
+        for tool in tools:
+            with self.subTest(tool=tool["name"]):
+                self.assertIn("DEPRECATED", tool["description"])
+                self.assertIn("manage.py <command> --format json", tool["description"])
+
+    def test_retained_read_only_tools_are_marked_retained_not_merely_frozen(self) -> None:
+        by_name = {tool["name"]: tool for tool in MODULE.TOOLS}
+        self.assertEqual(
+            MODULE.RETAINED_TOOLS,
+            frozenset(
+                {
+                    "skillbox_capabilities",
+                    "skillbox_explain",
+                    "skillbox_graph",
+                    "skillbox_next",
+                    "skillbox_search",
+                    "skillbox_snap",
+                }
+            ),
+        )
+        for name in MODULE.RETAINED_TOOLS:
+            self.assertIn("RETAINED READ-ONLY", by_name[name]["description"], name)
+        self.assertNotIn("RETAINED READ-ONLY", by_name["skillbox_up"]["description"])
+
+    def test_deprecation_marker_is_stamped_once_and_is_idempotent(self) -> None:
+        before = [dict(tool) for tool in MODULE.TOOLS]
+        MODULE._stamp_deprecation_markers(MODULE.TOOLS)  # noqa: SLF001
+        self.assertEqual([tool["description"] for tool in MODULE.TOOLS],
+                         [tool["description"] for tool in before])
+        for tool in MODULE.TOOLS:
+            self.assertEqual(tool["description"].count("[DEPRECATED"), 1, tool["name"])
+
     def test_handle_logging_set_level_updates_threshold_and_rejects_invalid_values(self) -> None:
         result = MODULE.handle_logging_set_level({"level": "debug"})
         self.assertEqual(result, {})

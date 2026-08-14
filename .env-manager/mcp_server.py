@@ -1,11 +1,25 @@
 #!/usr/bin/env python3
 """
-skillbox MCP server — the runtime graph as native agent tools.
+skillbox MCP server — DEPRECATED AND FROZEN. Use the robot CLI instead.
+
+This surface is no longer the agent front door. It mirrors a lagging subset of
+manage.py, and keeping that mirror in parity is pure tax the CLI does not pay.
+The canonical agent path is:
+
+    python3 .env-manager/manage.py <command> --format json   (or `sbp ...`)
+    python3 .env-manager/manage.py robot-docs guide          (workflow)
+    python3 .env-manager/manage.py capabilities --json       (machine contract)
+
+plus skills for task-level guidance. The server is NOT being deleted and no
+existing tool is being removed — it is frozen: no new tools, and callers should
+migrate. The six read-only orientation tools in ``RETAINED_TOOLS`` are kept for
+one more release. See docs/ARCHITECTURE.md §9 for the deprecation record and
+runtime_manager/command_registry.py for the enforced frozen inventory.
 
 Exposes manage.py commands as MCP tools over stdio (JSON-RPC 2.0, MCP 2024-11-05).
 Claude Code loads this automatically via home/.claude/settings.json mcpServers config.
 
-Discipline the server enforces: assess → scope → dry-run → act → verify.
+Discipline the server still enforces for existing callers: assess → scope → dry-run → act → verify.
   1. Always run skillbox_status before mutating.
   2. Always pass dry_run=true first for sync/up/down/restart/onboard.
   3. Scope with client= and service= to avoid unintended side effects.
@@ -1357,6 +1371,65 @@ TOOLS: list[dict] = [
 ]
 
 # ---------------------------------------------------------------------------
+# Deprecation: this surface is frozen (see docs/ARCHITECTURE.md §9)
+# ---------------------------------------------------------------------------
+# The tool list above is closed. It is a lagging subset of manage.py and every
+# addition costs parity maintenance the CLI does not, so the canonical agent
+# path is the robot CLI plus skills. Rather than bury that in a doc no agent
+# reads at connect time, stamp it onto the surface itself: the initialize
+# instructions lead with it, and every tool description carries it, so an agent
+# that only ever calls tools/list still learns where to go.
+
+MCP_DEPRECATION_STATUS = "deprecated"
+_CLI_POINTER = (
+    "use `python3 .env-manager/manage.py <command> --format json` "
+    "(or `sbp <command> --format json`); "
+    "`manage.py robot-docs guide` for the workflow, "
+    "`manage.py capabilities --json` for the machine contract"
+)
+# The read-only orientation cluster stays one more release so agents can still
+# get their bearings over MCP mid-migration. Mirrors command_registry.MCP_RETAINED_TOOLS.
+RETAINED_TOOLS = frozenset(
+    {
+        "skillbox_capabilities",
+        "skillbox_explain",
+        "skillbox_graph",
+        "skillbox_next",
+        "skillbox_search",
+        "skillbox_snap",
+    }
+)
+_RETAINED_MARKER = (
+    "[DEPRECATED SURFACE — RETAINED READ-ONLY THIS RELEASE] "
+    "The in-box MCP is frozen; this read-only tool is kept for one more release "
+    f"so orientation keeps working while callers migrate. For everything else, {_CLI_POINTER}."
+)
+_FROZEN_MARKER = (
+    "[DEPRECATED — FROZEN] "
+    "The in-box MCP surface is deprecated and closed to new tools. "
+    f"Prefer the canonical agent path: {_CLI_POINTER}."
+)
+
+
+def deprecation_marker(tool_name: str) -> str:
+    """Return the deprecation sentence stamped onto ``tool_name``'s description."""
+    return _RETAINED_MARKER if tool_name in RETAINED_TOOLS else _FROZEN_MARKER
+
+
+def _stamp_deprecation_markers(tools: list[dict]) -> None:
+    """Append the deprecation marker to every tool description, in place."""
+    for tool in tools:
+        marker = deprecation_marker(tool.get("name", ""))
+        description = (tool.get("description") or "").rstrip()
+        if marker in description:
+            continue
+        tool["description"] = f"{description} {marker}".strip()
+
+
+_stamp_deprecation_markers(TOOLS)
+
+
+# ---------------------------------------------------------------------------
 # manage.py invocation
 # ---------------------------------------------------------------------------
 
@@ -2669,7 +2742,17 @@ def handle_initialize(_params: dict, _request_id: Any = None) -> dict:
         "capabilities": capabilities,
         "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
         "instructions": (
-            "skillbox runtime manager. "
+            "skillbox runtime manager — THIS MCP SURFACE IS DEPRECATED AND FROZEN. "
+            "It is a lagging subset of the CLI and takes no new tools. "
+            "Canonical agent path: python3 .env-manager/manage.py <command> --format json "
+            "(or `sbp <command> --format json`) — real exit codes, full command coverage. "
+            "Start with `manage.py robot-docs guide` for the workflow and "
+            "`manage.py capabilities --json` for the machine-readable contract; "
+            "skills carry the task-level guidance. "
+            "Retained read-only this release: skillbox_capabilities, skillbox_next, "
+            "skillbox_graph, skillbox_explain, skillbox_search, skillbox_snap. "
+            "Everything else is frozen — prefer the CLI. "
+            "If you are still calling this surface, the discipline below still applies. "
             "Discipline: assess → scope → dry-run → act → verify. "
             "1. Run skillbox_status before any mutation. "
             "2. Pass dry_run=true first for sync/up/down/restart/bootstrap/onboard. "
