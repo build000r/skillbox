@@ -95,6 +95,12 @@ The wrapper discovery contract. Agents should start here to learn the stable com
       "safe_first_try": "sbp capabilities --json"
     },
     {
+      "json": false,
+      "name": "help",
+      "notes": "help --human renders the operator console (grouped atlas + live NOW panel on a TTY); agents should prefer capabilities/robot-docs.",
+      "safe_first_try": "sbp help"
+    },
+    {
       "json": true,
       "name": "robot-docs",
       "safe_first_try": "sbp robot-docs guide --json"
@@ -187,6 +193,20 @@ The wrapper discovery contract. Agents should start here to learn the stable com
       "json": true,
       "name": "registry",
       "safe_first_try": "sbp registry doctor --json"
+    },
+    {
+      "json": true,
+      "name": "repo",
+      "safe_first_try": "sbp repo status . --json"
+    },
+    {
+      "aliases": [
+        "gs"
+      ],
+      "json": true,
+      "name": "git",
+      "notes": "Read-only estate git status viewer; never proxies mutating git subcommands.",
+      "safe_first_try": "sbp git --json"
     },
     {
       "fallback": "If status is error/degraded/stale during active work, report degraded_cass evidence mode and use the local transcript scanner; do not rebuild Cass mid-task.",
@@ -494,28 +514,28 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
     "core"
   ],
   "beads": {
-    "beads_dir": "<FLEET>/repos_real/overlay-repo/.beads",
-    "br": null,
+    "beads_dir": "/private<FLEET>/repos_real/overlay-repo/.beads",
+    "br": "<BR_BIN>",
     "initialized": false,
     "issues": [],
     "next_actions": [],
     "ok": true,
-    "repo_root": "<FLEET>/repos_real/overlay-repo",
+    "repo_root": "/private<FLEET>/repos_real/overlay-repo",
     "required": false,
     "required_skills": []
   },
-  "cwd": "<FLEET>/repos_real/overlay-repo",
+  "cwd": "/private<FLEET>/repos_real/overlay-repo",
   "effective": [
     {
       "availability": "installed",
-      "layer": "project:claude:<FLEET>/repos_real/overlay-repo",
+      "layer": "project:claude:/private<FLEET>/repos_real/overlay-repo",
       "name": "tiny-marketing",
-      "path": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-marketing",
+      "path": "/private<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-marketing",
       "shadowed_count": 0,
-      "source": "<FLEET>/private-skills/tiny-marketing",
+      "source": "/private<FLEET>/private-skills/tiny-marketing",
       "source_bucket": "external",
       "state": "ok",
-      "winning_layer": "project:claude:<FLEET>/repos_real/overlay-repo"
+      "winning_layer": "project:claude:/private<FLEET>/repos_real/overlay-repo"
     }
   ],
   "issues": {
@@ -527,7 +547,7 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
     "missing_for_cwd": [
       {
         "allowed_paths": [
-          "<FLEET>/repos_real/overlay-repo"
+          "/private<FLEET>/repos_real/overlay-repo"
         ],
         "categories": [
           "frontend"
@@ -535,10 +555,10 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
         "fix_command": "sbp skill on tiny-ui --cwd $PWD",
         "name": "tiny-ui",
         "origin": null,
-        "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
+        "policy_path": "/private<FLEET>/skillbox-config/skill-scope.yaml",
         "reason": "skill is expected for this cwd but is not currently effective",
         "rule_id": "frontend-local",
-        "scope_policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
+        "scope_policy_path": "/private<FLEET>/skillbox-config/skill-scope.yaml",
         "scope_rule": "frontend-local",
         "type": "missing_for_cwd"
       }
@@ -550,12 +570,12 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
   "matched_project_categories": [
     {
       "id": "frontend",
-      "match": "<FLEET>/repos_real/overlay-repo",
+      "match": "/private<FLEET>/repos_real/overlay-repo",
       "notes": "",
       "paths": [
-        "<FLEET>/repos_real/overlay-repo"
+        "/private<FLEET>/repos_real/overlay-repo"
       ],
-      "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml"
+      "policy_path": "/private<FLEET>/skillbox-config/skill-scope.yaml"
     }
   ],
   "matched_scope_rules": [
@@ -567,17 +587,17 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
       ],
       "default": "on",
       "id": "frontend-local",
-      "match": "<FLEET>/repos_real/overlay-repo",
+      "match": "/private<FLEET>/repos_real/overlay-repo",
       "notes": "",
       "overlay": "",
       "path_match": "prefix",
       "paths": [
-        "<FLEET>/repos_real/overlay-repo"
+        "/private<FLEET>/repos_real/overlay-repo"
       ],
       "patterns": [
         "tiny-ui"
       ],
-      "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
+      "policy_path": "/private<FLEET>/skillbox-config/skill-scope.yaml",
       "repos": [],
       "unknown_categories": []
     }
@@ -588,24 +608,24 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
   "parity": {},
   "policy": {
     "files": [
-      "<FLEET>/skillbox-config/skill-scope.yaml"
+      "/private<FLEET>/skillbox-config/skill-scope.yaml"
     ],
     "project_categories": [
       {
         "id": "cli",
         "notes": "",
         "paths": [
-          "<FLEET>/repos_real/healthy"
+          "/private<FLEET>/repos_real/healthy"
         ],
-        "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml"
+        "policy_path": "/private<FLEET>/skillbox-config/skill-scope.yaml"
       },
       {
         "id": "frontend",
         "notes": "",
         "paths": [
-          "<FLEET>/repos_real/overlay-repo"
+          "/private<FLEET>/repos_real/overlay-repo"
         ],
-        "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml"
+        "policy_path": "/private<FLEET>/skillbox-config/skill-scope.yaml"
       }
     ]
   },
@@ -613,13 +633,13 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
     {
       "action": "add_project_skill",
       "allowed_paths": [
-        "<FLEET>/repos_real/overlay-repo"
+        "/private<FLEET>/repos_real/overlay-repo"
       ],
       "fix_command": "sbp skill on tiny-ui --cwd $PWD",
       "hint": "Add this skill to the active client's skill-repos.yaml, or durably pin it for this repo with `sbp skill on <skill> --cwd $PWD`. Use `sbp overlay activate <name> --cwd <repo>` for a one-session/cwd policy-evaluated flip, or `sbp overlay on <name>` to PERSIST the overlay across sessions until `overlay off`.",
       "issue_type": "missing_for_cwd",
       "origin": null,
-      "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
+      "policy_path": "/private<FLEET>/skillbox-config/skill-scope.yaml",
       "rule_id": "frontend-local",
       "scope_rule": "frontend-local",
       "skill": "tiny-ui",
@@ -666,23 +686,23 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
       "availability": "override",
       "layer": "repo-override-file",
       "name": "tiny-cli",
-      "path": "<FLEET>/repos_real/overlay-repo",
+      "path": "/private<FLEET>/repos_real/overlay-repo",
       "shadowed_count": 0,
-      "source": "<FLEET>/skills/tiny-cli",
+      "source": "/private<FLEET>/skills/tiny-cli",
       "source_bucket": "external",
       "state": "disabled",
       "winning_layer": "repo-override-file"
     },
     {
       "availability": "installed",
-      "layer": "project:claude:<FLEET>/repos_real/overlay-repo",
+      "layer": "project:claude:/private<FLEET>/repos_real/overlay-repo",
       "name": "tiny-marketing",
-      "path": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-marketing",
+      "path": "/private<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-marketing",
       "shadowed_count": 0,
-      "source": "<FLEET>/private-skills/tiny-marketing",
+      "source": "/private<FLEET>/private-skills/tiny-marketing",
       "source_bucket": "external",
       "state": "ok",
-      "winning_layer": "project:claude:<FLEET>/repos_real/overlay-repo"
+      "winning_layer": "project:claude:/private<FLEET>/repos_real/overlay-repo"
     }
   ]
 }
@@ -734,37 +754,31 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
     "core"
   ],
   "beads": {
-    "beads_dir": "<FLEET>/repos_real/healthy/.beads",
-    "br": null,
+    "beads_dir": "/private<FLEET>/repos_real/healthy/.beads",
+    "br": "<BR_BIN>",
     "initialized": false,
     "issues": [
       {
-        "code": "missing_br",
-        "hint": "install beads_rust, then rerun sbp recalibrate",
-        "message": "BEADS DRIFT: beads-aware skills are active, but `br` is not on PATH"
-      },
-      {
         "code": "no_beads_dir",
-        "hint": "sbp beads init --cwd <FLEET>/repos_real/healthy",
+        "hint": "sbp beads init --cwd /private<FLEET>/repos_real/healthy",
         "message": "BEADS DRIFT: 1 active skill(s) require .beads/ in this repo"
       }
     ],
     "next_actions": [
-      "install beads_rust, then rerun sbp recalibrate",
-      "sbp beads init --cwd <FLEET>/repos_real/healthy"
+      "sbp beads init --cwd /private<FLEET>/repos_real/healthy"
     ],
     "ok": false,
-    "repo_root": "<FLEET>/repos_real/healthy",
+    "repo_root": "/private<FLEET>/repos_real/healthy",
     "required": true,
     "required_skills": [
       {
         "layer": "repo-override-file",
         "name": "needs-beads",
-        "source": "<FLEET>/private-skills/needs-beads"
+        "source": "/private<FLEET>/private-skills/needs-beads"
       }
     ]
   },
-  "cwd": "<FLEET>/repos_real/healthy",
+  "cwd": "/private<FLEET>/repos_real/healthy",
   "effective": [
     {
       "availability": "override",
@@ -773,11 +787,11 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "layer_rank": 60,
       "name": "needs-beads",
       "override_action": "pin_on",
-      "path": "<FLEET>/repos_real/healthy",
-      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "path": "/private<FLEET>/repos_real/healthy",
+      "policy_path": "/private<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
       "scope": "repo",
       "shadowed_count": 0,
-      "source": "<FLEET>/private-skills/needs-beads",
+      "source": "/private<FLEET>/private-skills/needs-beads",
       "source_bucket": "external",
       "state": "pinned",
       "winning_layer": "repo-override-file"
@@ -785,19 +799,19 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
     {
       "availability": "installed",
       "has_skill_md": true,
-      "layer": "project:claude:<FLEET>/repos_real/healthy",
+      "layer": "project:claude:/private<FLEET>/repos_real/healthy",
       "layer_label": "project claude",
       "layer_rank": 40,
-      "link_target": "<FLEET>/skills/tiny-cli",
+      "link_target": "/private<FLEET>/skills/tiny-cli",
       "name": "tiny-cli",
-      "path": "<FLEET>/repos_real/healthy/.claude/skills/tiny-cli",
+      "path": "/private<FLEET>/repos_real/healthy/.claude/skills/tiny-cli",
       "scope": "installed",
       "shadowed_count": 0,
-      "source": "<FLEET>/skills/tiny-cli",
+      "source": "/private<FLEET>/skills/tiny-cli",
       "source_bucket": "external",
       "source_kind": "directory",
       "state": "ok",
-      "winning_layer": "project:claude:<FLEET>/repos_real/healthy"
+      "winning_layer": "project:claude:/private<FLEET>/repos_real/healthy"
     }
   ],
   "global_surfaces": [],
@@ -814,22 +828,22 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
   "layers": [
     {
       "broken_count": 0,
-      "id": "project:claude:<FLEET>/repos_real/healthy",
+      "id": "project:claude:/private<FLEET>/repos_real/healthy",
       "kind": "installed",
       "label": "project claude",
       "non_skill_count": 0,
-      "path": "<FLEET>/repos_real/healthy/.claude/skills",
+      "path": "/private<FLEET>/repos_real/healthy/.claude/skills",
       "present": true,
       "rank": 40,
       "skill_count": 1
     },
     {
       "broken_count": 0,
-      "id": "project:codex:<FLEET>/repos_real/healthy",
+      "id": "project:codex:/private<FLEET>/repos_real/healthy",
       "kind": "installed",
       "label": "project codex",
       "non_skill_count": 0,
-      "path": "<FLEET>/repos_real/healthy/.codex/skills",
+      "path": "/private<FLEET>/repos_real/healthy/.codex/skills",
       "present": true,
       "rank": 40,
       "skill_count": 0
@@ -838,7 +852,7 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "id": "repo-override-file",
       "kind": "override",
       "label": "repo override file",
-      "path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "path": "/private<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
       "present": true,
       "rank": 60,
       "scope": "repo",
@@ -850,12 +864,12 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
   "matched_project_categories": [
     {
       "id": "cli",
-      "match": "<FLEET>/repos_real/healthy",
+      "match": "/private<FLEET>/repos_real/healthy",
       "notes": "",
       "paths": [
-        "<FLEET>/repos_real/healthy"
+        "/private<FLEET>/repos_real/healthy"
       ],
-      "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml"
+      "policy_path": "/private<FLEET>/skillbox-config/skill-scope.yaml"
     }
   ],
   "matched_scope_rules": [
@@ -867,38 +881,37 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       ],
       "default": "on",
       "id": "cli-local",
-      "match": "<FLEET>/repos_real/healthy",
+      "match": "/private<FLEET>/repos_real/healthy",
       "notes": "",
       "overlay": "",
       "path_match": "prefix",
       "paths": [
-        "<FLEET>/repos_real/healthy"
+        "/private<FLEET>/repos_real/healthy"
       ],
       "patterns": [
         "tiny-cli"
       ],
-      "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
+      "policy_path": "/private<FLEET>/skillbox-config/skill-scope.yaml",
       "repos": [],
       "unknown_categories": []
     }
   ],
   "next_actions": [
     "doctor --format json",
-    "install beads_rust, then rerun sbp recalibrate",
-    "sbp beads init --cwd <FLEET>/repos_real/healthy"
+    "sbp beads init --cwd /private<FLEET>/repos_real/healthy"
   ],
   "occurrences": [
     {
       "availability": "installed",
       "has_skill_md": true,
-      "layer": "project:claude:<FLEET>/repos_real/healthy",
+      "layer": "project:claude:/private<FLEET>/repos_real/healthy",
       "layer_label": "project claude",
       "layer_rank": 40,
-      "link_target": "<FLEET>/skills/tiny-cli",
+      "link_target": "/private<FLEET>/skills/tiny-cli",
       "name": "tiny-cli",
-      "path": "<FLEET>/repos_real/healthy/.claude/skills/tiny-cli",
+      "path": "/private<FLEET>/repos_real/healthy/.claude/skills/tiny-cli",
       "scope": "installed",
-      "source": "<FLEET>/skills/tiny-cli",
+      "source": "/private<FLEET>/skills/tiny-cli",
       "source_bucket": "external",
       "source_kind": "directory",
       "state": "ok"
@@ -910,10 +923,10 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "layer_rank": 60,
       "name": "needs-beads",
       "override_action": "pin_on",
-      "path": "<FLEET>/repos_real/healthy",
-      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "path": "/private<FLEET>/repos_real/healthy",
+      "policy_path": "/private<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
       "scope": "repo",
-      "source": "<FLEET>/private-skills/needs-beads",
+      "source": "/private<FLEET>/private-skills/needs-beads",
       "source_bucket": "external",
       "state": "pinned"
     },
@@ -924,10 +937,10 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "layer_rank": 60,
       "name": "tiny-marketing",
       "override_action": "pin_off",
-      "path": "<FLEET>/repos_real/healthy",
-      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "path": "/private<FLEET>/repos_real/healthy",
+      "policy_path": "/private<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
       "scope": "repo",
-      "source": "<FLEET>/private-skills/tiny-marketing",
+      "source": "/private<FLEET>/private-skills/tiny-marketing",
       "source_bucket": "external",
       "state": "disabled"
     },
@@ -938,8 +951,8 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "layer_rank": 35,
       "name": "fixture-global-optout",
       "override_action": "opt_out_global",
-      "path": "<FLEET>/repos_real/healthy",
-      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "path": "/private<FLEET>/repos_real/healthy",
+      "policy_path": "/private<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
       "scope": "repo",
       "source": null,
       "source_bucket": null,
@@ -957,7 +970,7 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
         "layer_label": "repo override file",
         "layer_rank": 60,
         "name": "marketing",
-        "source": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+        "source": "/private<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
         "why": "repo-file"
       },
       {
@@ -966,7 +979,7 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
         "layer_label": "repo override file",
         "layer_rank": 60,
         "name": "swarm",
-        "source": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+        "source": "/private<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
         "why": "repo-file"
       }
     ],
@@ -977,44 +990,44 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
   "parity": {},
   "policy": {
     "files": [
-      "<FLEET>/skillbox-config/skill-scope.yaml"
+      "/private<FLEET>/skillbox-config/skill-scope.yaml"
     ],
     "project_categories": [
       {
         "id": "cli",
         "notes": "",
         "paths": [
-          "<FLEET>/repos_real/healthy"
+          "/private<FLEET>/repos_real/healthy"
         ],
-        "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml"
+        "policy_path": "/private<FLEET>/skillbox-config/skill-scope.yaml"
       },
       {
         "id": "frontend",
         "notes": "",
         "paths": [
-          "<FLEET>/repos_real/overlay-repo"
+          "/private<FLEET>/repos_real/overlay-repo"
         ],
-        "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml"
+        "policy_path": "/private<FLEET>/skillbox-config/skill-scope.yaml"
       }
     ]
   },
   "recommendations": [],
   "source_roots": [
     {
-      "id": "source:<FLEET>/private-skills",
+      "id": "source:/private<FLEET>/private-skills",
       "kind": "source",
-      "label": "<FLEET>/private-skills",
-      "path": "<FLEET>/private-skills",
+      "label": "/private<FLEET>/private-skills",
+      "path": "/private<FLEET>/private-skills",
       "present": true,
       "rank": 0,
       "skill_count": 2,
       "undefined_count": 0
     },
     {
-      "id": "source:<FLEET>/skills",
+      "id": "source:/private<FLEET>/skills",
       "kind": "source",
-      "label": "<FLEET>/skills",
-      "path": "<FLEET>/skills",
+      "label": "/private<FLEET>/skills",
+      "path": "/private<FLEET>/skills",
       "present": true,
       "rank": 0,
       "skill_count": 2,
@@ -1024,7 +1037,7 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
   "summary": {
     "archive_source_skills": 0,
     "archive_sources": 0,
-    "beads_issues": 2,
+    "beads_issues": 1,
     "beads_required_skills": 1,
     "broken_by_class": {
       "dangling": 0,
@@ -1063,8 +1076,8 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "layer_rank": 35,
       "name": "fixture-global-optout",
       "override_action": "opt_out_global",
-      "path": "<FLEET>/repos_real/healthy",
-      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "path": "/private<FLEET>/repos_real/healthy",
+      "policy_path": "/private<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
       "scope": "repo",
       "shadowed_count": 0,
       "source": null,
@@ -1079,11 +1092,11 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "layer_rank": 60,
       "name": "needs-beads",
       "override_action": "pin_on",
-      "path": "<FLEET>/repos_real/healthy",
-      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "path": "/private<FLEET>/repos_real/healthy",
+      "policy_path": "/private<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
       "scope": "repo",
       "shadowed_count": 0,
-      "source": "<FLEET>/private-skills/needs-beads",
+      "source": "/private<FLEET>/private-skills/needs-beads",
       "source_bucket": "external",
       "state": "pinned",
       "winning_layer": "repo-override-file"
@@ -1091,19 +1104,19 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
     {
       "availability": "installed",
       "has_skill_md": true,
-      "layer": "project:claude:<FLEET>/repos_real/healthy",
+      "layer": "project:claude:/private<FLEET>/repos_real/healthy",
       "layer_label": "project claude",
       "layer_rank": 40,
-      "link_target": "<FLEET>/skills/tiny-cli",
+      "link_target": "/private<FLEET>/skills/tiny-cli",
       "name": "tiny-cli",
-      "path": "<FLEET>/repos_real/healthy/.claude/skills/tiny-cli",
+      "path": "/private<FLEET>/repos_real/healthy/.claude/skills/tiny-cli",
       "scope": "installed",
       "shadowed_count": 0,
-      "source": "<FLEET>/skills/tiny-cli",
+      "source": "/private<FLEET>/skills/tiny-cli",
       "source_bucket": "external",
       "source_kind": "directory",
       "state": "ok",
-      "winning_layer": "project:claude:<FLEET>/repos_real/healthy"
+      "winning_layer": "project:claude:/private<FLEET>/repos_real/healthy"
     },
     {
       "availability": "override",
@@ -1112,11 +1125,11 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "layer_rank": 60,
       "name": "tiny-marketing",
       "override_action": "pin_off",
-      "path": "<FLEET>/repos_real/healthy",
-      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "path": "/private<FLEET>/repos_real/healthy",
+      "policy_path": "/private<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
       "scope": "repo",
       "shadowed_count": 0,
-      "source": "<FLEET>/private-skills/tiny-marketing",
+      "source": "/private<FLEET>/private-skills/tiny-marketing",
       "source_bucket": "external",
       "state": "disabled",
       "winning_layer": "repo-override-file"
@@ -1173,8 +1186,8 @@ Claude (`.mcp.json`) vs Codex (`.codex/config.toml`) MCP-server reconciliation. 
 
 ```json
 {
-  "config_root": "<FLEET>/repos_real/healthy",
-  "cwd": "<FLEET>/repos_real/healthy",
+  "config_root": "/private<FLEET>/repos_real/healthy",
+  "cwd": "/private<FLEET>/repos_real/healthy",
   "declared_servers": [
     "skillbox"
   ],
@@ -1182,8 +1195,8 @@ Claude (`.mcp.json`) vs Codex (`.codex/config.toml`) MCP-server reconciliation. 
     "skillbox"
   ],
   "next_actions": [
-    "add skillbox to <FLEET>/repos_real/healthy/.mcp.json",
-    "add skillbox to <FLEET>/repos_real/healthy/.codex/config.toml"
+    "add skillbox to /private<FLEET>/repos_real/healthy/.mcp.json",
+    "add skillbox to /private<FLEET>/repos_real/healthy/.codex/config.toml"
   ],
   "parity": {
     "claude_only": [],
@@ -1221,7 +1234,7 @@ Claude (`.mcp.json`) vs Codex (`.codex/config.toml`) MCP-server reconciliation. 
         "skillbox"
       ],
       "name": "claude",
-      "path": "<FLEET>/repos_real/healthy/.mcp.json",
+      "path": "/private<FLEET>/repos_real/healthy/.mcp.json",
       "present": false,
       "servers": [],
       "symlink_target": null,
@@ -1240,7 +1253,7 @@ Claude (`.mcp.json`) vs Codex (`.codex/config.toml`) MCP-server reconciliation. 
         "skillbox"
       ],
       "name": "codex",
-      "path": "<FLEET>/repos_real/healthy/.codex/config.toml",
+      "path": "/private<FLEET>/repos_real/healthy/.codex/config.toml",
       "present": false,
       "servers": [],
       "symlink_target": null,
@@ -1306,17 +1319,17 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
 ```json
 {
   "beads": {
-    "beads_dir": "<FLEET>/repos_real/overlay-repo/.beads",
-    "br": null,
+    "beads_dir": "/private<FLEET>/repos_real/overlay-repo/.beads",
+    "br": "<BR_BIN>",
     "initialized": false,
     "issues": [],
     "next_actions": [],
     "ok": true,
-    "repo_root": "<FLEET>/repos_real/overlay-repo",
+    "repo_root": "/private<FLEET>/repos_real/overlay-repo",
     "required": false,
     "required_skills": []
   },
-  "cwd": "<FLEET>/repos_real/overlay-repo",
+  "cwd": "/private<FLEET>/repos_real/overlay-repo",
   "fixes": [
     {
       "command": "sbp skill on tiny-ui --cwd $PWD",
@@ -1326,16 +1339,16 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
           {
             "blocked_reason": "",
             "category": null,
-            "destination": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui",
+            "destination": "/private<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui",
             "existing": {
               "state": "missing"
             },
             "op": "link",
-            "repo_path": "<FLEET>/repos_real/overlay-repo",
-            "root": "<FLEET>/repos_real/overlay-repo/.claude/skills",
+            "repo_path": "/private<FLEET>/repos_real/overlay-repo",
+            "root": "/private<FLEET>/repos_real/overlay-repo/.claude/skills",
             "scope": "project",
             "skill": "tiny-ui",
-            "source": "<FLEET>/skills/tiny-ui",
+            "source": "/private<FLEET>/skills/tiny-ui",
             "source_bucket": "external",
             "status": "would_link",
             "surface": "claude"
@@ -1343,16 +1356,16 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
           {
             "blocked_reason": "",
             "category": null,
-            "destination": "<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui",
+            "destination": "/private<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui",
             "existing": {
               "state": "missing"
             },
             "op": "link",
-            "repo_path": "<FLEET>/repos_real/overlay-repo",
-            "root": "<FLEET>/repos_real/overlay-repo/.codex/skills",
+            "repo_path": "/private<FLEET>/repos_real/overlay-repo",
+            "root": "/private<FLEET>/repos_real/overlay-repo/.codex/skills",
             "scope": "project",
             "skill": "tiny-ui",
-            "source": "<FLEET>/skills/tiny-ui",
+            "source": "/private<FLEET>/skills/tiny-ui",
             "source_bucket": "external",
             "status": "would_link",
             "surface": "codex"
@@ -1360,16 +1373,16 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
           {
             "blocked_reason": "",
             "category": null,
-            "destination": "<FLEET>/repos_real/overlay-repo/.agents/skills/tiny-ui",
+            "destination": "/private<FLEET>/repos_real/overlay-repo/.agents/skills/tiny-ui",
             "existing": {
               "state": "missing"
             },
             "op": "link",
-            "repo_path": "<FLEET>/repos_real/overlay-repo",
-            "root": "<FLEET>/repos_real/overlay-repo/.agents/skills",
+            "repo_path": "/private<FLEET>/repos_real/overlay-repo",
+            "root": "/private<FLEET>/repos_real/overlay-repo/.agents/skills",
             "scope": "project",
             "skill": "tiny-ui",
-            "source": "<FLEET>/skills/tiny-ui",
+            "source": "/private<FLEET>/skills/tiny-ui",
             "source_bucket": "external",
             "status": "would_link",
             "surface": "agents"
@@ -1379,23 +1392,23 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
           "instructions": "Use this SKILL.md content immediately in the current agent session. The filesystem links make the skill visible to future compatible agent sessions.",
           "name": "tiny-ui",
           "skill_md": "---\nname: tiny-ui\ndescription: Tiny fixture skill tiny-ui.\n---\n\n# tiny-ui\n\nFixture skill body for tiny-ui.\n",
-          "skill_md_path": "<FLEET>/skills/tiny-ui/SKILL.md",
+          "skill_md_path": "/private<FLEET>/skills/tiny-ui/SKILL.md",
           "skill_md_sha256": "953824e6b88a4753851d0309b740812747d507dd780b037e47fdcea540a41e04",
-          "source": "<FLEET>/skills/tiny-ui",
+          "source": "/private<FLEET>/skills/tiny-ui",
           "source_bucket": "external",
           "surface_targets": {
             "agents": [
-              "<FLEET>/repos_real/overlay-repo/.agents/skills/tiny-ui"
+              "/private<FLEET>/repos_real/overlay-repo/.agents/skills/tiny-ui"
             ],
             "claude": [
-              "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui"
+              "/private<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui"
             ],
             "codex": [
-              "<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui"
+              "/private<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui"
             ]
           }
         },
-        "cwd": "<FLEET>/repos_real/overlay-repo",
+        "cwd": "/private<FLEET>/repos_real/overlay-repo",
         "dry_run": true,
         "skill": "tiny-ui",
         "summary": {
@@ -1411,26 +1424,26 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
       },
       "links": [
         {
-          "destination": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui",
+          "destination": "/private<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui",
           "scope": "project",
           "skill": "tiny-ui",
-          "source": "<FLEET>/skills/tiny-ui",
+          "source": "/private<FLEET>/skills/tiny-ui",
           "status": "would_link",
           "surface": "claude"
         },
         {
-          "destination": "<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui",
+          "destination": "/private<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui",
           "scope": "project",
           "skill": "tiny-ui",
-          "source": "<FLEET>/skills/tiny-ui",
+          "source": "/private<FLEET>/skills/tiny-ui",
           "status": "would_link",
           "surface": "codex"
         },
         {
-          "destination": "<FLEET>/repos_real/overlay-repo/.agents/skills/tiny-ui",
+          "destination": "/private<FLEET>/repos_real/overlay-repo/.agents/skills/tiny-ui",
           "scope": "project",
           "skill": "tiny-ui",
-          "source": "<FLEET>/skills/tiny-ui",
+          "source": "/private<FLEET>/skills/tiny-ui",
           "status": "would_link",
           "surface": "agents"
         }
@@ -1439,19 +1452,19 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
         "instructions": "Use this SKILL.md content immediately in the current agent session. The filesystem links make the skill visible to future compatible agent sessions.",
         "name": "tiny-ui",
         "skill_md": "---\nname: tiny-ui\ndescription: Tiny fixture skill tiny-ui.\n---\n\n# tiny-ui\n\nFixture skill body for tiny-ui.\n",
-        "skill_md_path": "<FLEET>/skills/tiny-ui/SKILL.md",
+        "skill_md_path": "/private<FLEET>/skills/tiny-ui/SKILL.md",
         "skill_md_sha256": "953824e6b88a4753851d0309b740812747d507dd780b037e47fdcea540a41e04",
-        "source": "<FLEET>/skills/tiny-ui",
+        "source": "/private<FLEET>/skills/tiny-ui",
         "source_bucket": "external",
         "surface_targets": {
           "agents": [
-            "<FLEET>/repos_real/overlay-repo/.agents/skills/tiny-ui"
+            "/private<FLEET>/repos_real/overlay-repo/.agents/skills/tiny-ui"
           ],
           "claude": [
-            "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui"
+            "/private<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui"
           ],
           "codex": [
-            "<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui"
+            "/private<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui"
           ]
         }
       },
@@ -1468,7 +1481,7 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
     "missing_for_cwd": [
       {
         "allowed_paths": [
-          "<FLEET>/repos_real/overlay-repo"
+          "/private<FLEET>/repos_real/overlay-repo"
         ],
         "categories": [
           "frontend"
@@ -1476,10 +1489,10 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
         "fix_command": "sbp skill on tiny-ui --cwd $PWD",
         "name": "tiny-ui",
         "origin": null,
-        "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
+        "policy_path": "/private<FLEET>/skillbox-config/skill-scope.yaml",
         "reason": "skill is expected for this cwd but is not currently effective",
         "rule_id": "frontend-local",
-        "scope_policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
+        "scope_policy_path": "/private<FLEET>/skillbox-config/skill-scope.yaml",
         "scope_rule": "frontend-local",
         "type": "missing_for_cwd"
       }
@@ -1490,12 +1503,12 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
   "matched_project_categories": [
     {
       "id": "frontend",
-      "match": "<FLEET>/repos_real/overlay-repo",
+      "match": "/private<FLEET>/repos_real/overlay-repo",
       "notes": "",
       "paths": [
-        "<FLEET>/repos_real/overlay-repo"
+        "/private<FLEET>/repos_real/overlay-repo"
       ],
-      "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml"
+      "policy_path": "/private<FLEET>/skillbox-config/skill-scope.yaml"
     }
   ],
   "matched_scope_rules": [
@@ -1507,17 +1520,17 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
       ],
       "default": "on",
       "id": "frontend-local",
-      "match": "<FLEET>/repos_real/overlay-repo",
+      "match": "/private<FLEET>/repos_real/overlay-repo",
       "notes": "",
       "overlay": "",
       "path_match": "prefix",
       "paths": [
-        "<FLEET>/repos_real/overlay-repo"
+        "/private<FLEET>/repos_real/overlay-repo"
       ],
       "patterns": [
         "tiny-ui"
       ],
-      "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
+      "policy_path": "/private<FLEET>/skillbox-config/skill-scope.yaml",
       "repos": [],
       "unknown_categories": []
     }
@@ -1529,13 +1542,13 @@ Machine-actionable cwd recalibration. `sbp recalibrate --json` emits the issues-
     {
       "action": "add_project_skill",
       "allowed_paths": [
-        "<FLEET>/repos_real/overlay-repo"
+        "/private<FLEET>/repos_real/overlay-repo"
       ],
       "fix_command": "sbp skill on tiny-ui --cwd $PWD",
       "hint": "Add this skill to the active client's skill-repos.yaml, or durably pin it for this repo with `sbp skill on <skill> --cwd $PWD`. Use `sbp overlay activate <name> --cwd <repo>` for a one-session/cwd policy-evaluated flip, or `sbp overlay on <name>` to PERSIST the overlay across sessions until `overlay off`.",
       "issue_type": "missing_for_cwd",
       "origin": null,
-      "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
+      "policy_path": "/private<FLEET>/skillbox-config/skill-scope.yaml",
       "rule_id": "frontend-local",
       "scope_rule": "frontend-local",
       "skill": "tiny-ui",
@@ -1625,7 +1638,7 @@ Read-only provenance for ONE skill at ONE cwd, including absence. Same payload s
 {
   "active_clients": [],
   "active_overlays": [],
-  "cwd": "<FLEET>/repos_real/overlay-repo",
+  "cwd": "/private<FLEET>/repos_real/overlay-repo",
   "inactive_overlay_rules": [],
   "layer": null,
   "layer_family": null,
@@ -1640,23 +1653,23 @@ Read-only provenance for ONE skill at ONE cwd, including absence. Same payload s
     ],
     "machine_id": "devbox-like",
     "resolved": true,
-    "source_path": "<FLEET>/skillbox-config/machines.yaml"
+    "source_path": "/private<FLEET>/skillbox-config/machines.yaml"
   },
   "matched_clients": [],
   "matched_project_categories": [
     {
       "id": "frontend",
-      "match": "<FLEET>/repos_real/overlay-repo",
+      "match": "/private<FLEET>/repos_real/overlay-repo",
       "notes": "",
       "paths": [
-        "<FLEET>/repos_real/overlay-repo"
+        "/private<FLEET>/repos_real/overlay-repo"
       ],
-      "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml"
+      "policy_path": "/private<FLEET>/skillbox-config/skill-scope.yaml"
     }
   ],
   "next_actions": [
     "sbp skill on needs-beads --cwd $PWD",
-    "edit skill-scope.yaml: add a rule with skills:[needs-beads] and a path/category covering <FLEET>/repos_real/overlay-repo"
+    "edit skill-scope.yaml: add a rule with skills:[needs-beads] and a path/category covering /private<FLEET>/repos_real/overlay-repo"
   ],
   "occurrences": [],
   "reason": "'needs-beads' is NOT visible here, but a source exists and it can be activated",
@@ -1668,16 +1681,16 @@ Read-only provenance for ONE skill at ONE cwd, including absence. Same payload s
     {
       "command": "sbp skill on needs-beads --cwd $PWD",
       "kind": "on",
-      "manage_command": "python3 .env-manager/manage.py skill on needs-beads --cwd <FLEET>/repos_real/overlay-repo",
+      "manage_command": "python3 .env-manager/manage.py skill on needs-beads --cwd /private<FLEET>/repos_real/overlay-repo",
       "rank": 1,
-      "resolved_command": "sbp skill on needs-beads --cwd <FLEET>/repos_real/overlay-repo",
-      "why": "a source for 'needs-beads' exists (<FLEET>/private-skills/needs-beads); turning it on pins it for this repo, links it, and returns the SKILL.md packet"
+      "resolved_command": "sbp skill on needs-beads --cwd /private<FLEET>/repos_real/overlay-repo",
+      "why": "a source for 'needs-beads' exists (/private<FLEET>/private-skills/needs-beads); turning it on pins it for this repo, links it, and returns the SKILL.md packet"
     },
     {
-      "command": "edit skill-scope.yaml: add a rule with skills:[needs-beads] and a path/category covering <FLEET>/repos_real/overlay-repo",
+      "command": "edit skill-scope.yaml: add a rule with skills:[needs-beads] and a path/category covering /private<FLEET>/repos_real/overlay-repo",
       "kind": "rule_edit",
       "policy_files": [
-        "<FLEET>/skillbox-config/skill-scope.yaml"
+        "/private<FLEET>/skillbox-config/skill-scope.yaml"
       ],
       "rank": 3,
       "why": "no skill-scope rule currently matches 'needs-beads' for this cwd, so the resolver does not consider it in-scope here"
@@ -1688,7 +1701,7 @@ Read-only provenance for ONE skill at ONE cwd, including absence. Same payload s
   "skill": "needs-beads",
   "source_options": [
     {
-      "source": "<FLEET>/private-skills/needs-beads",
+      "source": "/private<FLEET>/private-skills/needs-beads",
       "source_bucket": "external"
     }
   ],
@@ -1794,16 +1807,16 @@ Durable repo-local pin ON plus disk links. Writes `pin_on` to `.skillbox/skill-o
     {
       "blocked_reason": "",
       "category": null,
-      "destination": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui",
+      "destination": "/private<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui",
       "existing": {
         "state": "missing"
       },
       "op": "link",
-      "repo_path": "<FLEET>/repos_real/overlay-repo",
-      "root": "<FLEET>/repos_real/overlay-repo/.claude/skills",
+      "repo_path": "/private<FLEET>/repos_real/overlay-repo",
+      "root": "/private<FLEET>/repos_real/overlay-repo/.claude/skills",
       "scope": "project",
       "skill": "tiny-ui",
-      "source": "<FLEET>/skills/tiny-ui",
+      "source": "/private<FLEET>/skills/tiny-ui",
       "source_bucket": "external",
       "status": "would_link",
       "surface": "claude"
@@ -1811,16 +1824,16 @@ Durable repo-local pin ON plus disk links. Writes `pin_on` to `.skillbox/skill-o
     {
       "blocked_reason": "",
       "category": null,
-      "destination": "<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui",
+      "destination": "/private<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui",
       "existing": {
         "state": "missing"
       },
       "op": "link",
-      "repo_path": "<FLEET>/repos_real/overlay-repo",
-      "root": "<FLEET>/repos_real/overlay-repo/.codex/skills",
+      "repo_path": "/private<FLEET>/repos_real/overlay-repo",
+      "root": "/private<FLEET>/repos_real/overlay-repo/.codex/skills",
       "scope": "project",
       "skill": "tiny-ui",
-      "source": "<FLEET>/skills/tiny-ui",
+      "source": "/private<FLEET>/skills/tiny-ui",
       "source_bucket": "external",
       "status": "would_link",
       "surface": "codex"
@@ -1828,16 +1841,16 @@ Durable repo-local pin ON plus disk links. Writes `pin_on` to `.skillbox/skill-o
     {
       "blocked_reason": "",
       "category": null,
-      "destination": "<FLEET>/repos_real/overlay-repo/.agents/skills/tiny-ui",
+      "destination": "/private<FLEET>/repos_real/overlay-repo/.agents/skills/tiny-ui",
       "existing": {
         "state": "missing"
       },
       "op": "link",
-      "repo_path": "<FLEET>/repos_real/overlay-repo",
-      "root": "<FLEET>/repos_real/overlay-repo/.agents/skills",
+      "repo_path": "/private<FLEET>/repos_real/overlay-repo",
+      "root": "/private<FLEET>/repos_real/overlay-repo/.agents/skills",
       "scope": "project",
       "skill": "tiny-ui",
-      "source": "<FLEET>/skills/tiny-ui",
+      "source": "/private<FLEET>/skills/tiny-ui",
       "source_bucket": "external",
       "status": "would_link",
       "surface": "agents"
@@ -1847,32 +1860,32 @@ Durable repo-local pin ON plus disk links. Writes `pin_on` to `.skillbox/skill-o
     "instructions": "Use this SKILL.md content immediately in the current agent session. The filesystem links make the skill visible to future compatible agent sessions.",
     "name": "tiny-ui",
     "skill_md": "---\nname: tiny-ui\ndescription: Tiny fixture skill tiny-ui.\n---\n\n# tiny-ui\n\nFixture skill body for tiny-ui.\n",
-    "skill_md_path": "<FLEET>/skills/tiny-ui/SKILL.md",
+    "skill_md_path": "/private<FLEET>/skills/tiny-ui/SKILL.md",
     "skill_md_sha256": "953824e6b88a4753851d0309b740812747d507dd780b037e47fdcea540a41e04",
-    "source": "<FLEET>/skills/tiny-ui",
+    "source": "/private<FLEET>/skills/tiny-ui",
     "source_bucket": "external",
     "surface_targets": {
       "agents": [
-        "<FLEET>/repos_real/overlay-repo/.agents/skills/tiny-ui"
+        "/private<FLEET>/repos_real/overlay-repo/.agents/skills/tiny-ui"
       ],
       "claude": [
-        "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui"
+        "/private<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-ui"
       ],
       "codex": [
-        "<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui"
+        "/private<FLEET>/repos_real/overlay-repo/.codex/skills/tiny-ui"
       ]
     }
   },
   "categories": [],
   "changed": false,
-  "cwd": "<FLEET>/repos_real/overlay-repo",
+  "cwd": "/private<FLEET>/repos_real/overlay-repo",
   "dry_run": true,
   "from_scope": "all",
   "noop": false,
   "override": {
     "changed": false,
     "pin": "pin_on",
-    "policy_path": "<FLEET>/repos_real/overlay-repo/.skillbox/skill-overrides.yaml",
+    "policy_path": "/private<FLEET>/repos_real/overlay-repo/.skillbox/skill-overrides.yaml",
     "would_change": true
   },
   "requested_to": "project",
@@ -1880,8 +1893,8 @@ Durable repo-local pin ON plus disk links. Writes `pin_on` to `.skillbox/skill-o
   "selected_source": {
     "explicit": false,
     "name": "tiny-ui",
-    "root": "<FLEET>/skills",
-    "source": "<FLEET>/skills/tiny-ui",
+    "root": "/private<FLEET>/skills",
+    "source": "/private<FLEET>/skills/tiny-ui",
     "source_bucket": "external"
   },
   "skill": "tiny-ui",
@@ -1890,8 +1903,8 @@ Durable repo-local pin ON plus disk links. Writes `pin_on` to `.skillbox/skill-o
     {
       "explicit": false,
       "name": "tiny-ui",
-      "root": "<FLEET>/skills",
-      "source": "<FLEET>/skills/tiny-ui",
+      "root": "/private<FLEET>/skills",
+      "source": "/private<FLEET>/skills/tiny-ui",
       "source_bucket": "external"
     }
   ],
@@ -1988,19 +2001,19 @@ Durable repo-local pin OFF plus project unlink. Writes `pin_off` to `.skillbox/s
   "action": "off",
   "actions": [
     {
-      "destination": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-marketing",
+      "destination": "/private<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-marketing",
       "existing": {
-        "link_target": "<FLEET>/private-skills/tiny-marketing",
-        "resolved": "<FLEET>/private-skills/tiny-marketing",
+        "link_target": "/private<FLEET>/private-skills/tiny-marketing",
+        "resolved": "/private<FLEET>/private-skills/tiny-marketing",
         "state": "different_link"
       },
-      "layer": "project:claude:<FLEET>/repos_real/overlay-repo",
+      "layer": "project:claude:/private<FLEET>/repos_real/overlay-repo",
       "op": "unlink",
       "reason": "pin_off",
-      "repo_path": "<FLEET>/repos_real/overlay-repo",
+      "repo_path": "/private<FLEET>/repos_real/overlay-repo",
       "scope": "project",
       "skill": "tiny-marketing",
-      "source": "<FLEET>/private-skills/tiny-marketing",
+      "source": "/private<FLEET>/private-skills/tiny-marketing",
       "status": "would_unlink",
       "surface": "claude"
     }
@@ -2008,14 +2021,14 @@ Durable repo-local pin OFF plus project unlink. Writes `pin_off` to `.skillbox/s
   "activation_packet": null,
   "categories": [],
   "changed": false,
-  "cwd": "<FLEET>/repos_real/overlay-repo",
+  "cwd": "/private<FLEET>/repos_real/overlay-repo",
   "dry_run": true,
   "from_scope": "project",
   "noop": false,
   "override": {
     "changed": false,
     "pin": "pin_off",
-    "policy_path": "<FLEET>/repos_real/overlay-repo/.skillbox/skill-overrides.yaml",
+    "policy_path": "/private<FLEET>/repos_real/overlay-repo/.skillbox/skill-overrides.yaml",
     "would_change": true
   },
   "requested_to": "project",
@@ -2070,24 +2083,24 @@ Write-affordance switchboard for one cwd: every skill the policy marks as flippa
 
 ```json
 {
-  "cwd": "<FLEET>/repos_real/overlay-repo",
+  "cwd": "/private<FLEET>/repos_real/overlay-repo",
   "items": [
     {
-      "command_to_flip": "sbp skill on tiny-cli --cwd <FLEET>/repos_real/overlay-repo",
+      "command_to_flip": "sbp skill on tiny-cli --cwd /private<FLEET>/repos_real/overlay-repo",
       "pinned_by": "override",
       "skill": "tiny-cli",
       "source": null,
       "state": "pinned_off"
     },
     {
-      "command_to_flip": "sbp skill off tiny-marketing --cwd <FLEET>/repos_real/overlay-repo",
+      "command_to_flip": "sbp skill off tiny-marketing --cwd /private<FLEET>/repos_real/overlay-repo",
       "pinned_by": "policy",
       "skill": "tiny-marketing",
-      "source": "<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-marketing",
+      "source": "/private<FLEET>/repos_real/overlay-repo/.claude/skills/tiny-marketing",
       "state": "on"
     },
     {
-      "command_to_flip": "sbp skill on tiny-ui --cwd <FLEET>/repos_real/overlay-repo",
+      "command_to_flip": "sbp skill on tiny-ui --cwd /private<FLEET>/repos_real/overlay-repo",
       "pinned_by": "policy",
       "skill": "tiny-ui",
       "source": null,
@@ -2146,7 +2159,7 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
   "active_overlays": [
     "marketing"
   ],
-  "cwd": "<FLEET>/repos_real/healthy",
+  "cwd": "/private<FLEET>/repos_real/healthy",
   "inactive_overlay_rules": [],
   "layer": "repo-override-file",
   "layer_family": "OVERRIDE",
@@ -2160,9 +2173,9 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
       "layer_label": "repo override file",
       "layer_rank": 60,
       "override_action": "pin_on",
-      "path": "<FLEET>/repos_real/healthy",
-      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
-      "source": "<FLEET>/private-skills/needs-beads",
+      "path": "/private<FLEET>/repos_real/healthy",
+      "policy_path": "/private<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "source": "/private<FLEET>/private-skills/needs-beads",
       "source_bucket": "external",
       "state": "pinned",
       "wins": true,
@@ -2177,18 +2190,18 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
     ],
     "machine_id": "devbox-like",
     "resolved": true,
-    "source_path": "<FLEET>/skillbox-config/machines.yaml"
+    "source_path": "/private<FLEET>/skillbox-config/machines.yaml"
   },
   "matched_clients": [],
   "matched_project_categories": [
     {
       "id": "cli",
-      "match": "<FLEET>/repos_real/healthy",
+      "match": "/private<FLEET>/repos_real/healthy",
       "notes": "",
       "paths": [
-        "<FLEET>/repos_real/healthy"
+        "/private<FLEET>/repos_real/healthy"
       ],
-      "policy_path": "<FLEET>/skillbox-config/skill-scope.yaml"
+      "policy_path": "/private<FLEET>/skillbox-config/skill-scope.yaml"
     }
   ],
   "next_actions": [
@@ -2202,9 +2215,9 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
       "layer_label": "repo override file",
       "layer_rank": 60,
       "override_action": "pin_on",
-      "path": "<FLEET>/repos_real/healthy",
-      "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
-      "source": "<FLEET>/private-skills/needs-beads",
+      "path": "/private<FLEET>/repos_real/healthy",
+      "policy_path": "/private<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+      "source": "/private<FLEET>/private-skills/needs-beads",
       "source_bucket": "external",
       "state": "pinned",
       "wins": true,
@@ -2222,7 +2235,7 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
   "skill": "needs-beads",
   "source_options": [
     {
-      "source": "<FLEET>/private-skills/needs-beads",
+      "source": "/private<FLEET>/private-skills/needs-beads",
       "source_bucket": "external"
     }
   ],
@@ -2234,9 +2247,9 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
     "layer_label": "repo override file",
     "layer_rank": 60,
     "override_action": "pin_on",
-    "path": "<FLEET>/repos_real/healthy",
-    "policy_path": "<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
-    "source": "<FLEET>/private-skills/needs-beads",
+    "path": "/private<FLEET>/repos_real/healthy",
+    "policy_path": "/private<FLEET>/repos_real/healthy/.skillbox/skill-overrides.yaml",
+    "source": "/private<FLEET>/private-skills/needs-beads",
     "source_bucket": "external",
     "state": "pinned",
     "wins": true,
@@ -2385,15 +2398,15 @@ ONE diffable, PLAN-ONLY heal plan across the deduped canonical fleet (the same c
     "policy",
     "mcp"
   ],
-  "cwd": "<FLEET>/repos_real/overlay-repo",
+  "cwd": "/private<FLEET>/repos_real/overlay-repo",
   "dry_run": true,
   "kind": "fleet-converge-plan",
   "max_depth": 3,
   "next_actions": [
-    "[relink] ln -sfn <FLEET>/skills/tiny-ui <FLEET>/repos_real/other-machine/.claude/skills/tiny-ui",
-    "[prune] rm <FLEET>/repos_real/dangling/.claude/skills/ghost  # prune dead link 'ghost'",
-    "[sync] manage.py skill sync tiny-ui --cwd <FLEET>/repos_real/overlay-repo --dry-run",
-    "[policy] manage.py skill prune --cwd <FLEET>/repos_real/other-machine --from project --dry-run"
+    "[relink] ln -sfn /private<FLEET>/skills/tiny-ui /private<FLEET>/repos_real/other-machine/.claude/skills/tiny-ui",
+    "[prune] rm /private<FLEET>/repos_real/dangling/.claude/skills/ghost  # prune dead link 'ghost'",
+    "[sync] manage.py skill sync tiny-ui --cwd /private<FLEET>/repos_real/overlay-repo --dry-run",
+    "[policy] manage.py skill prune --cwd /private<FLEET>/repos_real/other-machine --from project --dry-run"
   ],
   "repos": [
     {
@@ -2403,10 +2416,10 @@ ONE diffable, PLAN-ONLY heal plan across the deduped canonical fleet (the same c
         "prune": [
           {
             "class": "prune",
-            "command": "rm <FLEET>/repos_real/dangling/.claude/skills/ghost  # prune dead link 'ghost'",
-            "link_target": "<FLEET>/deleted-source",
+            "command": "rm /private<FLEET>/repos_real/dangling/.claude/skills/ghost  # prune dead link 'ghost'",
+            "link_target": "/private<FLEET>/deleted-source",
             "origin": "dangling",
-            "path": "<FLEET>/repos_real/dangling/.claude/skills/ghost",
+            "path": "/private<FLEET>/repos_real/dangling/.claude/skills/ghost",
             "skill": "ghost",
             "suggested_action": "prune"
           }
@@ -2423,9 +2436,9 @@ ONE diffable, PLAN-ONLY heal plan across the deduped canonical fleet (the same c
         "sync": 0
       },
       "matched_scope_rules": [],
-      "path": "<FLEET>/repos_real/dangling",
+      "path": "/private<FLEET>/repos_real/dangling",
       "sources": [
-        "scan_root:<FLEET>/repos_real"
+        "scan_root:/private<FLEET>/repos_real"
       ],
       "state": "ok",
       "total": 1
@@ -2436,14 +2449,14 @@ ONE diffable, PLAN-ONLY heal plan across the deduped canonical fleet (the same c
         "policy": [
           {
             "allowed_paths": [
-              "<FLEET>/repos_real/overlay-repo"
+              "/private<FLEET>/repos_real/overlay-repo"
             ],
             "class": "policy",
-            "command": "manage.py skill prune --cwd <FLEET>/repos_real/other-machine --from project --dry-run",
-            "path": "<FLEET>/repos_real/other-machine/.claude/skills/tiny-ui",
-            "policy_edit": "edit rule 'frontend-local' in <FLEET>/skillbox-config/skill-scope.yaml to allow 'tiny-ui' at <FLEET>/repos_real/other-machine",
+            "command": "manage.py skill prune --cwd /private<FLEET>/repos_real/other-machine --from project --dry-run",
+            "path": "/private<FLEET>/repos_real/other-machine/.claude/skills/tiny-ui",
+            "policy_edit": "edit rule 'frontend-local' in /private<FLEET>/skillbox-config/skill-scope.yaml to allow 'tiny-ui' at /private<FLEET>/repos_real/other-machine",
             "reason": "installed outside allowed repo path",
-            "scope_policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
+            "scope_policy_path": "/private<FLEET>/skillbox-config/skill-scope.yaml",
             "scope_rule": "frontend-local",
             "skill": "tiny-ui"
           }
@@ -2452,10 +2465,10 @@ ONE diffable, PLAN-ONLY heal plan across the deduped canonical fleet (the same c
         "relink": [
           {
             "class": "relink",
-            "command": "ln -sfn <FLEET>/skills/tiny-ui <FLEET>/repos_real/other-machine/.claude/skills/tiny-ui",
-            "link_target": "<REMOTE_ROOT>/skills/tiny-ui",
+            "command": "ln -sfn /private<FLEET>/skills/tiny-ui /private<FLEET>/repos_real/other-machine/.claude/skills/tiny-ui",
+            "link_target": "/private<REMOTE_ROOT>/skills/tiny-ui",
             "origin": "moved",
-            "path": "<FLEET>/repos_real/other-machine/.claude/skills/tiny-ui",
+            "path": "/private<FLEET>/repos_real/other-machine/.claude/skills/tiny-ui",
             "skill": "tiny-ui",
             "suggested_action": "relink"
           }
@@ -2471,9 +2484,9 @@ ONE diffable, PLAN-ONLY heal plan across the deduped canonical fleet (the same c
         "sync": 0
       },
       "matched_scope_rules": [],
-      "path": "<FLEET>/repos_real/other-machine",
+      "path": "/private<FLEET>/repos_real/other-machine",
       "sources": [
-        "scan_root:<FLEET>/repos_real"
+        "scan_root:/private<FLEET>/repos_real"
       ],
       "state": "ok",
       "total": 2
@@ -2487,9 +2500,9 @@ ONE diffable, PLAN-ONLY heal plan across the deduped canonical fleet (the same c
         "sync": [
           {
             "class": "sync",
-            "command": "manage.py skill sync tiny-ui --cwd <FLEET>/repos_real/overlay-repo --dry-run",
+            "command": "manage.py skill sync tiny-ui --cwd /private<FLEET>/repos_real/overlay-repo --dry-run",
             "reason": "skill is expected for this cwd but is not currently effective",
-            "scope_policy_path": "<FLEET>/skillbox-config/skill-scope.yaml",
+            "scope_policy_path": "/private<FLEET>/skillbox-config/skill-scope.yaml",
             "scope_rule": "frontend-local",
             "skill": "tiny-ui"
           }
@@ -2508,17 +2521,17 @@ ONE diffable, PLAN-ONLY heal plan across the deduped canonical fleet (the same c
       "matched_scope_rules": [
         "frontend-local"
       ],
-      "path": "<FLEET>/repos_real/overlay-repo",
+      "path": "/private<FLEET>/repos_real/overlay-repo",
       "sources": [
         "category:frontend",
-        "scan_root:<FLEET>/repos_real"
+        "scan_root:/private<FLEET>/repos_real"
       ],
       "state": "ok",
       "total": 1
     }
   ],
   "scan_roots": [
-    "<FLEET>/repos_real"
+    "/private<FLEET>/repos_real"
   ],
   "summary": {
     "actions_total": 4,
