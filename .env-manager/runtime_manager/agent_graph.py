@@ -16,7 +16,7 @@ from .runtime_ops import (
 )
 from .workflows import requested_mcp_servers
 
-GRAPH_SCHEMA_VERSION = "2026-06-11+agent_ops_brain.graph"
+GRAPH_SCHEMA_VERSION = "2026-08-14+agent_ops_brain.graph"
 
 PHASE_A_NODE_KINDS = frozenset(
     {
@@ -83,7 +83,12 @@ class AgentGraph:
         nodes = sorted(self.nodes, key=lambda node: node.id)
         edges = sorted(self.edges, key=lambda edge: (edge.source, edge.kind, edge.target))
         return {
-            "ok": not self.warnings,
+            # ok mirrors brain.next semantics: the payload was produced. Degraded
+            # inputs (adapter timeouts, stale pulse state) live in warnings[] and
+            # flip degraded, never ok — agents gate success on ok, health on
+            # degraded/warnings.
+            "ok": True,
+            "degraded": bool(self.warnings),
             "schema_version": GRAPH_SCHEMA_VERSION,
             "node_count": len(nodes),
             "edge_count": len(edges),

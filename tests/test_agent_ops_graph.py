@@ -113,8 +113,31 @@ class AgentGraphTests(unittest.TestCase):
             },
         )
 
-        self.assertFalse(payload["ok"])
+        # ok-parity with brain.next: a produced payload is ok:true even when
+        # degraded by adapter warnings; health is reported via degraded/warnings.
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["degraded"])
         self.assertTrue(any(w["code"] == "ADAPTER_TIMEOUT" for w in payload["warnings"]))
+
+    def test_graph_ok_parity_with_next_under_warnings(self) -> None:
+        clean = GRAPH.build_agent_graph_payload(make_runtime_model())
+        degraded = GRAPH.build_agent_graph_payload(
+            make_runtime_model(),
+            adapters={
+                "bv_triage": {
+                    "source": "bv",
+                    "ok": False,
+                    "status": "timeout",
+                    "warnings": [{"code": "ADAPTER_TIMEOUT", "message": "bv timed out"}],
+                }
+            },
+        )
+
+        # brain.graph must never flip ok on degraded inputs (brain.next contract).
+        self.assertTrue(clean["ok"])
+        self.assertFalse(clean["degraded"])
+        self.assertTrue(degraded["ok"])
+        self.assertTrue(degraded["degraded"])
 
 
 if __name__ == "__main__":

@@ -52,6 +52,7 @@ def _graph_payload(graph: AgentGraph | Mapping[str, Any]) -> dict[str, Any]:
     normalized_payload.update(
         {
             "ok": bool(payload.get("ok", True)) if isinstance(payload, Mapping) else True,
+            "degraded": bool(warnings) if isinstance(warnings, list) else False,
             "node_count": len(normalized.nodes),
             "edge_count": len(normalized.edges),
             "node_kinds": sorted(
