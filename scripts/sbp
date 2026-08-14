@@ -434,6 +434,9 @@ __WRAPPER__ - personal skillbox runtime and skill helper
 Usage:
   __WRAPPER__                         Compact home view for this cwd
   __WRAPPER__ help                    Show this help
+  __WRAPPER__ help --human [FILTER]   Operator console: grouped command atlas +
+                              live runtime/git/skill panels (TTY-only live
+                              reads; --live/--no-live override; FILTER narrows)
   __WRAPPER__ capabilities --json     Print the wrapper machine contract
   __WRAPPER__ robot-docs guide        Print agent-facing command guidance
   __WRAPPER__ robot-triage            Print compact first actions
@@ -759,6 +762,7 @@ payload = {
     "aliases": ["sbo"] if wrapper == "sbp" else ["sbp"],
     "commands": [
         {"name": "capabilities", "json": True, "safe_first_try": f"{wrapper} capabilities --json"},
+        {"name": "help", "json": False, "safe_first_try": f"{wrapper} help", "notes": "help --human renders the operator console (grouped atlas + live NOW panel on a TTY); agents should prefer capabilities/robot-docs."},
         {"name": "robot-docs", "json": True, "safe_first_try": f"{wrapper} robot-docs guide --json"},
         {"name": "robot-triage", "json": True, "safe_first_try": f"{wrapper} --robot-triage"},
         {"name": "status", "json": True, "safe_first_try": f"{wrapper} status --json"},
@@ -1170,7 +1174,7 @@ append_passthrough_token() {
           ;;
       esac
       ;;
-    skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|mcp-sync|structure-doctor|git-status|repo-atlas|repo-registry|cass|cass-evidence|oracle|cron|send-later|safe|conference1|beads|mmdx|operator-booking|swimmers-launch|fleet)
+    help|skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|mcp-sync|structure-doctor|git-status|repo-atlas|repo-registry|cass|cass-evidence|oracle|cron|send-later|safe|conference1|beads|mmdx|operator-booking|swimmers-launch|fleet)
       passthrough_args+=("${token}")
       ;;
     *)
@@ -1516,7 +1520,34 @@ case "${action}" in
     echo "  ${wrapper_name} help          command reference"
     ;;
   help)
-    print_help
+    human_help="false"
+    help_live_flags=()
+    help_filters=()
+    for help_token in "${passthrough_args[@]}"; do
+      case "${help_token}" in
+        --human|-H|human)
+          human_help="true"
+          ;;
+        --live|--no-live)
+          help_live_flags+=("${help_token}")
+          ;;
+        *)
+          help_filters+=("${help_token}")
+          ;;
+      esac
+    done
+    if [[ "${human_help}" == "true" ]]; then
+      python3 "${script_dir}/lib/sbp_help_human.py" \
+        --wrapper "${wrapper_name}" \
+        --root "${skillbox_root}" \
+        --cwd "${invoke_cwd}" \
+        --client "${client}" \
+        --profile "${profile}" \
+        --mode "${mode}" \
+        "${help_live_flags[@]}" -- "${help_filters[@]}"
+    else
+      print_help
+    fi
     ;;
   capabilities)
     print_capabilities
