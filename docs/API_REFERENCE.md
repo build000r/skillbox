@@ -9,6 +9,12 @@ Do not edit by hand; run `python3 .env-manager/manage.py registry-docs --write`.
 
 Registry entries: 47.
 
+> **The in-box MCP surface is deprecated and frozen.**
+> The in-box MCP surface is DEPRECATED and FROZEN — no new tools. Canonical agent path: python3 .env-manager/manage.py <command> --format json (or `sbp <command> --format json`), with `robot-docs guide` for the workflow and `capabilities --json` for the machine-readable contract.
+> Every `MCP mirror` line below is a legacy surface, not a recommendation.
+> The read-only orientation tools `skillbox_capabilities`, `skillbox_explain`, `skillbox_graph`, `skillbox_next`, `skillbox_search`, `skillbox_snap` are retained for one more release; the rest are frozen.
+> See `docs/ARCHITECTURE.md` for the deprecation record.
+
 ## Tier 1
 
 ### brain
@@ -23,7 +29,7 @@ Explain one graph node - command, check, service, bead, skill, or MCP tool - wit
 - Risk: `low`
 - Entrypoint: `manage.py`
 - Owner binary: None
-- MCP mirror: `skillbox_explain`
+- MCP mirror: `skillbox_explain` (deprecated surface; retained read-only for one more release)
 
 **Inputs**
 
@@ -68,7 +74,7 @@ Expose the typed runtime graph and algorithm outputs such as cycles and critical
 - Risk: `low`
 - Entrypoint: `manage.py`
 - Owner binary: None
-- MCP mirror: `skillbox_graph`
+- MCP mirror: `skillbox_graph` (deprecated surface; retained read-only for one more release)
 
 **Inputs**
 
@@ -115,7 +121,7 @@ Rank the highest-leverage next actions with reasons, claim commands, and validat
 - Risk: `low`
 - Entrypoint: `manage.py`
 - Owner binary: None
-- MCP mirror: `skillbox_next`
+- MCP mirror: `skillbox_next` (deprecated surface; retained read-only for one more release)
 
 **Inputs**
 
@@ -160,7 +166,7 @@ Find commands, graph nodes, docs, Beads, checks, logs, and evidence by query.
 - Risk: `low`
 - Entrypoint: `manage.py`
 - Owner binary: None
-- MCP mirror: `skillbox_search`
+- MCP mirror: `skillbox_search` (deprecated surface; retained read-only for one more release)
 
 **Inputs**
 
@@ -201,7 +207,7 @@ Record, diff, and replay runtime observation snapshots inside declared snapshot 
 - Risk: `low`
 - Entrypoint: `manage.py`
 - Owner binary: None
-- MCP mirror: `skillbox_snap`
+- MCP mirror: `skillbox_snap` (deprecated surface; retained read-only for one more release)
 
 **Inputs**
 
@@ -264,7 +270,7 @@ List agent-facing commands and tools with risk, side effects, and output contrac
 - Risk: `low`
 - Entrypoint: `manage.py`
 - Owner binary: `sbp`
-- MCP mirror: `skillbox_capabilities`
+- MCP mirror: `skillbox_capabilities` (deprecated surface; retained read-only for one more release)
 
 **Inputs**
 
@@ -363,7 +369,7 @@ Validate the internal repos/skills/logs/check graph for the selected scope.
 - Risk: `low`
 - Entrypoint: `manage.py`
 - Owner binary: None
-- MCP mirror: `skillbox_doctor`
+- MCP mirror: `skillbox_doctor` (deprecated and frozen — prefer the CLI entrypoint above)
 
 **Inputs**
 
@@ -405,7 +411,7 @@ Stop manageable services, stopping selected dependents before their prerequisite
 - Risk: `medium`
 - Entrypoint: `manage.py`
 - Owner binary: None
-- MCP mirror: `skillbox_down`
+- MCP mirror: `skillbox_down` (deprecated and frozen — prefer the CLI entrypoint above)
 
 **Inputs**
 
@@ -685,7 +691,7 @@ Print recent log output for declared services.
 - Risk: `low`
 - Entrypoint: `manage.py`
 - Owner binary: None
-- MCP mirror: `skillbox_logs`
+- MCP mirror: `skillbox_logs` (deprecated and frozen — prefer the CLI entrypoint above)
 
 **Inputs**
 
@@ -725,7 +731,7 @@ Audit Claude/Codex MCP config parity; only undeclared servers count as drift.
 - Risk: `low`
 - Entrypoint: `manage.py`
 - Owner binary: None
-- MCP mirror: `skillbox_mcp_audit`
+- MCP mirror: `skillbox_mcp_audit` (deprecated and frozen — prefer the CLI entrypoint above)
 
 **Inputs**
 
@@ -809,7 +815,7 @@ List the machine-readable port registry for the active scope: owner, source, bin
 - Risk: `low`
 - Entrypoint: `manage.py`
 - Owner binary: None
-- MCP mirror: `skillbox_ports`
+- MCP mirror: `skillbox_ports` (deprecated and frozen — prefer the CLI entrypoint above)
 
 **Inputs**
 
@@ -947,7 +953,7 @@ Print the resolved internal runtime graph.
 - Risk: `low`
 - Entrypoint: `manage.py`
 - Owner binary: None
-- MCP mirror: `skillbox_render`
+- MCP mirror: `skillbox_render` (deprecated and frozen — prefer the CLI entrypoint above)
 
 **Inputs**
 
@@ -1411,7 +1417,7 @@ Show effective skill visibility across global, client, and project-local layers.
 - Risk: `low`
 - Entrypoint: `manage.py`
 - Owner binary: `sbp`
-- MCP mirror: `skillbox_skills`
+- MCP mirror: `skillbox_skills` (deprecated and frozen — prefer the CLI entrypoint above)
 
 **Inputs**
 
@@ -1604,7 +1610,7 @@ Summarize repo, artifact, skill, task, service, log, and health state for the ac
 - Risk: `low`
 - Entrypoint: `manage.py`
 - Owner binary: None
-- MCP mirror: `skillbox_status`
+- MCP mirror: `skillbox_status` (deprecated and frozen — prefer the CLI entrypoint above)
 
 **Inputs**
 
@@ -1689,7 +1695,7 @@ Create managed repo/artifact/log directories and install declared skills for the
 - Risk: `medium`
 - Entrypoint: `manage.py`
 - Owner binary: None
-- MCP mirror: `skillbox_sync`
+- MCP mirror: `skillbox_sync` (deprecated and frozen — prefer the CLI entrypoint above)
 
 **Inputs**
 
@@ -1728,7 +1734,7 @@ Sync runtime state, run service bootstrap tasks, and start manageable services.
 - Risk: `medium`
 - Entrypoint: `manage.py`
 - Owner binary: None
-- MCP mirror: `skillbox_up`
+- MCP mirror: `skillbox_up` (deprecated and frozen — prefer the CLI entrypoint above)
 
 **Inputs**
 

@@ -232,10 +232,11 @@ this order: dispatcher floor policy first, then the repo override file, then
 global defaults from `skill-scope.yaml`. The floor currently includes the
 dispatcher/control-plane skills, so repo overrides cannot disable floor skills.
 
-The same view is available to agents as the read-only `skillbox_skills` MCP
-tool. Run it before adding, moving, or globally installing skills so the agent
-can keep global utilities global and project/category skills local to the repos
-where they belong.
+Agents should run `python3 .env-manager/manage.py skills --format json` before
+adding, moving, or globally installing skills, so they keep global utilities
+global and project/category skills local to the repos where they belong. (The
+read-only `skillbox_skills` MCP tool mirrors this view but is frozen — see the
+[MCP deprecation](ARCHITECTURE.md#9-deprecations).)
 
 Use the singular `skill` command when you want to apply that policy:
 
@@ -357,10 +358,12 @@ POST to the running Swimmers `/v1/sessions/batch` API, creating one agent
 session per directory. Use `--dry-run --json` first to inspect the exact
 payload; set `--base-url` or `SWIMMERS_TUI_URL` for a non-default Swimmers API.
 
-Agents can apply the same flow through the `skillbox_skill` and
-`skillbox_overlay` MCP tools after a dry-run review. For diagrams, use
-`skillbox_mmdx_open` with `open=false` to resolve/list candidates before
-launching the viewer.
+Agents apply the same flow through the CLI after a dry-run review:
+`manage.py skill <action> --dry-run --format json`, `manage.py overlay <action>
+--dry-run --format json`, and `manage.py mmdx --no-open --format json` to
+resolve/list diagram candidates before launching the viewer. The equivalent
+`skillbox_skill`, `skillbox_overlay`, and `skillbox_mmdx_open` MCP tools still
+work but are frozen — see the [MCP deprecation](ARCHITECTURE.md#9-deprecations).
 ### Generated skill lockfiles
 
 `make runtime-sync` writes `workspace/skill-repos.lock.json` for the shared

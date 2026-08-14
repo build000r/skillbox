@@ -41,7 +41,7 @@ control plane.
 | A sane way to let the box grow over time | `workspace/runtime.yaml` plus `.env-manager/manage.py` manage the core machine plus client-specific repos, artifacts, installed skills, logs, and checks |
 | Service graphs that do not devolve into shell folklore | Declared `depends_on` edges let `up`, `down`, and `restart` expand and order service graphs automatically |
 | Live drift detection and auto-healing | The pulse daemon monitors services on a fixed interval, auto-restarts crashes, and appends human-readable events to `logs/runtime/runtime.log` |
-| Runtime history plus durable work notes | `focus` surfaces recent runtime activity, while `skillbox_session_*` tools and `cm` carry longer-lived work context |
+| Runtime history plus durable work notes | `focus` surfaces recent runtime activity, while `manage.py session-start` / `session-event` / `session-end` and `cm` carry longer-lived work context |
 | One-command client activation | `focus` syncs, bootstraps, starts services, collects live state, and writes enriched agent context in a single pass |
 | Fleet management from the operator machine | The operator MCP server provisions DO droplets, enrolls Tailscale, and runs commands on remote boxes as native agent tools |
 | Reproducible default skills | `skill-repos.yaml` declares GitHub repos and local paths; `sync` clones and filtered-installs skills |
@@ -243,9 +243,12 @@ so recent activity can be surfaced without another public activity service.
 
 ### How should agents store durable notes or memory?
 
-Use the `skillbox_session_*` MCP tools for client-scoped session timelines and
-`cm` for longer-lived procedural memory. `focus` reads recent runtime activity
-from `runtime.log`; no separate public sidecar flow is required.
+Use `manage.py session-start` / `session-event` / `session-end` (with
+`--format json`) for client-scoped session timelines and `cm` for longer-lived
+procedural memory. `focus` reads recent runtime activity from `runtime.log`; no
+separate public sidecar flow is required. The `skillbox_session_*` MCP tools
+still work but are frozen — see the
+[MCP deprecation](ARCHITECTURE.md#9-deprecations).
 
 ### How does the destructive-op guard work?
 

@@ -5,7 +5,13 @@ import hashlib
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from .command_registry import REGISTRY_ABI_VERSION, CommandSpec, default_registry
+from .command_registry import (
+    MCP_DEPRECATION_NOTICE,
+    MCP_RETAINED_TOOLS,
+    REGISTRY_ABI_VERSION,
+    CommandSpec,
+    default_registry,
+)
 
 API_REFERENCE_RELATIVE_PATH = Path("docs") / "API_REFERENCE.md"
 _DOMAIN_ORDER = ("brain", "runtime", "outer", "box", "make")
@@ -30,6 +36,14 @@ def render_api_reference(specs: Iterable[CommandSpec] | None = None) -> str:
         "Do not edit by hand; run `python3 .env-manager/manage.py registry-docs --write`.",
         "",
         f"Registry entries: {len(specs)}.",
+        "",
+        "> **The in-box MCP surface is deprecated and frozen.**",
+        f"> {MCP_DEPRECATION_NOTICE}",
+        "> Every `MCP mirror` line below is a legacy surface, not a recommendation.",
+        "> The read-only orientation tools "
+        + ", ".join(f"`{tool}`" for tool in sorted(MCP_RETAINED_TOOLS))
+        + " are retained for one more release; the rest are frozen.",
+        "> See `docs/ARCHITECTURE.md` for the deprecation record.",
         "",
     ]
 
@@ -103,7 +117,7 @@ def _render_spec(spec: CommandSpec) -> list[str]:
         f"- Risk: `{spec.risk}`",
         f"- Entrypoint: `{spec.entrypoint}`",
         f"- Owner binary: `{spec.owner_binary}`" if spec.owner_binary else "- Owner binary: None",
-        f"- MCP mirror: `{spec.mcp_tool}`" if spec.mcp_tool else "- MCP mirror: None",
+        _mcp_mirror_line(spec),
         "",
         "**Inputs**",
         "",
@@ -119,6 +133,21 @@ def _render_spec(spec: CommandSpec) -> list[str]:
         lines.extend(["", f"**Graph Nodes**: {_join_code(spec.graph_nodes)}"])
     lines.append("")
     return lines
+
+
+def _mcp_mirror_line(spec: CommandSpec) -> str:
+    """Render the MCP mirror bullet with its deprecation status attached.
+
+    The mirror is a legacy surface. Printing the tool name bare read as an
+    endorsement, so each line now says which half of the freeze it is in.
+    """
+    if not spec.mcp_tool:
+        return "- MCP mirror: None"
+    if spec.mcp_tool in MCP_RETAINED_TOOLS:
+        status = "deprecated surface; retained read-only for one more release"
+    else:
+        status = "deprecated and frozen — prefer the CLI entrypoint above"
+    return f"- MCP mirror: `{spec.mcp_tool}` ({status})"
 
 
 def _schema_table(schema: Mapping[str, Any]) -> list[str]:

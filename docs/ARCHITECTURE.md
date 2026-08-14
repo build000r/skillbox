@@ -39,7 +39,7 @@ flowchart TB
     validation["runtime_manager/validation.py<br/>filter + validate"]
     ops["runtime_manager/runtime_ops.py<br/>sync, doctor, status, lifecycle ops"]
     pulse[".env-manager/pulse.py<br/>live reconciliation daemon"]
-    inmcp[".env-manager/mcp_server.py<br/>in-box MCP tools"]
+    inmcp[".env-manager/mcp_server.py<br/>in-box MCP tools<br/>DEPRECATED + FROZEN"]
   end
 
   subgraph brain["Agent ops brain"]
@@ -376,8 +376,8 @@ dispatch from the worker broker.
 1. Put new behavior in the narrowest leaf module; keep `cli.py` as parsing and dispatch glue.
 2. Add argparse wiring in `cli.py`; use `_EARLY_COMMANDS` if the command does not need a filtered runtime model and `_MODEL_COMMANDS` if it does.
 3. Add a `CommandSpec` in `command_registry.default_registry()` with surfaces, side effect, risk, scopes, examples, validations, and graph node references.
-4. Add an in-box MCP mirror in `.env-manager/mcp_server.py` only when agents should call it as a tool; if it mutates, wire it into the dry-run marker gate.
-5. Update focused tests: `tests/test_cli_dispatch.py`, `tests/test_agent_ops_command_registry.py`, MCP tests when mirrored, and golden/API-reference tests if the registry output changes.
+4. Do **not** add an in-box MCP mirror. That surface is deprecated and frozen (see [§9](#9-deprecations)); `command_registry.validate_spec` rejects an `mcp_tool` outside `MCP_FROZEN_TOOLS`. Agents reach the command through `manage.py <command> --format json` and skills.
+5. Update focused tests: `tests/test_cli_dispatch.py`, `tests/test_agent_ops_command_registry.py`, and golden/API-reference tests if the registry output changes.
 6. Verify with `python3 -m unittest tests.test_agent_ops_command_registry tests.test_cli_dispatch` plus the feature-specific test file.
 
 ### Add a Service
@@ -403,3 +403,68 @@ dispatch from the worker broker.
 3. If it introduces new parameters, extend `agent_graph_engine.graph_command_payload()` validation and `cli.py` parser flags.
 4. Update the `brain.graph` `CommandSpec` enum/examples in `command_registry.py` when the public algorithm name changes.
 5. Verify with `tests/test_agent_ops_graph_algorithms.py`, `tests/test_agent_ops_graph_engine.py`, and the registry/golden tests when the public ABI changes.
+
+## 9. Deprecations
+
+### In-box MCP server — deprecated and frozen
+
+**Status:** deprecated as of 2026-08-14. Frozen, not deleted. No removal date set.
+
+`.env-manager/mcp_server.py` is no longer the agent front door. The canonical
+agent path is the **robot CLI plus skills**:
+
+| Need | Canonical path |
+|---|---|
+| Run any command, machine-readable | `python3 .env-manager/manage.py <command> --format json` (or `sbp <command> --format json`) — real exit codes |
+| Learn the workflow | `python3 .env-manager/manage.py robot-docs guide` |
+| Machine-readable contract | `python3 .env-manager/manage.py capabilities --json` (see the `registry.mcp_surface` block) |
+| Task-level guidance | skills |
+
+**Why.** The MCP tool list is a lagging subset of `manage.py`: 41 tools against
+a much larger command surface, and the mirror only ever covers what someone
+remembered to mirror. The CLI already gives agents structured JSON and exit
+codes, so the mirror bought nothing and cost continuous parity maintenance.
+The registry made that concrete — it declared a tool (`skillbox_explain_skill`)
+the server never exposed, and the generated API reference published the ghost
+to agents as a real surface.
+
+**What changed.**
+
+- Nothing was removed. All 41 tools still list and dispatch; existing callers
+  keep working.
+- `command_registry.MCP_FROZEN_TOOLS` pins the exact live inventory, and
+  `validate_spec` now rejects any `mcp_tool` outside it. Adding an MCP tool is
+  a deliberate contract change, not a routine addition.
+- The ghost declaration is gone; a test diffs the registry against the live
+  server so one cannot come back.
+- The deprecation is stamped on the runtime surface, not just here: the
+  `initialize` instructions lead with it, every `tools/list` description carries
+  it, and `capabilities --json` reports it under `registry.mcp_surface`.
+
+**Retained read-only cluster (one more release).** Orientation still works over
+MCP while callers migrate: `skillbox_capabilities`, `skillbox_next`,
+`skillbox_graph`, `skillbox_explain`, `skillbox_search`, `skillbox_snap`. These
+are the tier-1 brain mirrors, all read-only. Everything else is frozen — reach
+for the CLI.
+
+**If you are adding a command:** see [§8 Add a Command](#add-a-command). Step 4
+is now "do not add a mirror".
+
+### Operator MCP server — retained, slated for review
+
+`scripts/operator_mcp_server.py` (server `skillbox-operator`, `operator_*` tools)
+is **not** covered by this deprecation. It is retained because it is the surface
+that enforces the dry-run marker gate on mutating `operator_box_exec`,
+`operator_teardown`, and `operator_compose_down` — deleting it today would
+remove the gate, not just the transport.
+
+It is slated for review once both of these exist:
+
+1. `scripts/box.py` exposes equivalent robot JSON plus exit codes for
+   provision / teardown / exec.
+2. A thin operator skill covers the same gating discipline (dry-run, confirm,
+   execute) without a server in the loop.
+
+Note for that review: `operator_mcp_server.py` is intentionally standalone and
+imports nothing from the shared modules, and its tests mock by module namespace.
+Only pure helpers may hoist into `shared.py`. Do not refactor it opportunistically.

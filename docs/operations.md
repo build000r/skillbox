@@ -83,9 +83,12 @@ What it does each cycle:
 - writes every state change to the plain-text runtime log at `logs/runtime/runtime.log`
 - persists a state snapshot at `logs/runtime/pulse.state.json` for the MCP tool to read
 
-For durable, work-specific notes, use the `skillbox_session_*` MCP tools for
-client-scoped session timelines and `cm` for procedural memory. `focus`
-surfaces recent runtime activity directly from `runtime.log`.
+For durable, work-specific notes, use `manage.py session-start` /
+`session-event` / `session-end` (with `--format json`) for client-scoped session
+timelines and `cm` for procedural memory. `focus` surfaces
+recent runtime activity directly from `runtime.log`. (The `skillbox_session_*`
+MCP tools still work but are frozen — see
+[MCP Integration](#mcp-integration).)
 ## Worker Runtime Broker
 
 Skillbox can accept open-ended worker tasks without becoming the chat harness.
@@ -268,10 +271,12 @@ prints a redacted snapshot by default and writes under `.skillbox-state/` only
 when `--write` is passed.
 
 Use `--no-adapters` when you need deterministic local output without invoking
-optional `br`, `bv`, `sbp`, or NTM probes. The MCP mirrors are
-`skillbox_capabilities`, `skillbox_next`, `skillbox_graph`,
-`skillbox_explain`, `skillbox_search`, and `skillbox_snap`, with the same
-read-only/default-write behavior.
+optional `br`, `bv`, `sbp`, or NTM probes. These six commands also have MCP
+mirrors — `skillbox_capabilities`, `skillbox_next`, `skillbox_graph`,
+`skillbox_explain`, `skillbox_search`, `skillbox_snap` — with the same
+read-only/default-write behavior. Those mirrors are the read-only cluster
+retained through the [MCP deprecation](#mcp-integration); the CLI above is the
+canonical path.
 
 Focused validation for this surface:
 
@@ -609,12 +614,31 @@ include the same pressure/offload advisory. Protected buckets such as
 candidate caches are inventory, not an auto-delete list.
 ## MCP Integration
 
-Skillbox exposes two MCP servers for different contexts:
+Skillbox exposes two MCP servers for different contexts. The in-box one is
+deprecated; the operator one is retained.
 
-### Inside the box (agent tools)
+### Inside the box (agent tools) — DEPRECATED AND FROZEN
 
-`.env-manager/mcp_server.py` runs inside the workspace container and gives
-agents tools to manage their own environment:
+> **Do not build on this surface.** `.env-manager/mcp_server.py` is no longer
+> the agent front door. It is frozen: no new tools, no removals, callers should
+> migrate. The canonical agent path is the robot CLI plus skills:
+>
+> ```bash
+> python3 .env-manager/manage.py <command> --format json   # or: sbp <command> --format json
+> python3 .env-manager/manage.py robot-docs guide          # the workflow
+> python3 .env-manager/manage.py capabilities --json       # machine-readable contract
+> ```
+>
+> The CLI covers every command with real exit codes; the MCP tool list only ever
+> covered what someone remembered to mirror. See
+> [ARCHITECTURE.md §9](ARCHITECTURE.md#9-deprecations) for the record.
+>
+> **Retained read-only for one more release** so orientation keeps working
+> mid-migration: `skillbox_capabilities`, `skillbox_next`, `skillbox_graph`,
+> `skillbox_explain`, `skillbox_search`, `skillbox_snap`. Everything else in the
+> table below is frozen — reach for the CLI equivalent instead.
+
+The frozen inventory, for callers that still need it:
 
 | Tool | Purpose |
 |---|---|
@@ -642,14 +666,21 @@ agents tools to manage their own environment:
 | `skillbox_worker_submit` / `skillbox_worker_status` | Submit open-ended worker tasks and poll broker state |
 | `skillbox_worker_artifacts` / `skillbox_worker_promote_learning` | Read terminal run artifacts and explicitly promote reviewed learning proposals |
 
-Opened client surfaces always include the `skillbox` MCP. Core surfaces also
-include `cm` for procedural memory, and connector-capable surfaces add `fwc`
-and `dcg` on top of that.
+Opened client surfaces still include the `skillbox` MCP so existing callers do
+not break, but new work should not depend on it. Core surfaces also include `cm`
+for procedural memory, and connector-capable surfaces add `fwc` and `dcg` on top
+of that.
 
-### Outside the box (operator tools)
+### Outside the box (operator tools) — retained
 
 `scripts/operator_mcp_server.py` runs on the operator machine and provides
 fleet lifecycle tools. See the [Fleet Management](operations.md#fleet-management) section.
+
+This server is **not** deprecated. It is the surface that enforces the dry-run
+marker gate on mutating `operator_box_exec`, `operator_teardown`, and
+`operator_compose_down`, so removing it would remove the gate and not just the
+transport. It is slated for review once `scripts/box.py` exposes equivalent
+robot JSON and a thin operator skill carries the same gating discipline.
 
 ## Clipboard bootstrap
 

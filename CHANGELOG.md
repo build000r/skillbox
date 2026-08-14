@@ -13,6 +13,51 @@ repository currently has no git tags and `gh release list` returned no GitHub
 Releases, so this changelog uses dated development waves instead of versioned
 release buckets.
 
+## Deprecations
+
+### In-box MCP server — deprecated and frozen (2026-08-14)
+
+`.env-manager/mcp_server.py` is no longer the agent front door. The canonical
+agent path is the **robot CLI plus skills**:
+
+```bash
+python3 .env-manager/manage.py <command> --format json   # or: sbp <command> --format json
+python3 .env-manager/manage.py robot-docs guide          # the workflow
+python3 .env-manager/manage.py capabilities --json       # machine-readable contract
+```
+
+**Nothing is removed.** All 41 in-box tools still list and dispatch, so existing
+callers keep working. The surface is *frozen*: no new tools, and callers should
+migrate.
+
+Why: the MCP tool list was a lagging subset of `manage.py` and only ever covered
+what someone remembered to mirror, while the CLI already returns structured JSON
+with real exit codes. The parity mirror bought nothing and cost continuous
+maintenance — concretely, the command registry declared an `skillbox_explain_skill`
+tool the server never exposed, and the generated `docs/API_REFERENCE.md`
+published that ghost to agents as a real surface.
+
+What to expect:
+
+- `command_registry.MCP_FROZEN_TOOLS` pins the exact live inventory; declaring an
+  `mcp_tool` outside it is now a registry validation error.
+- The ghost declaration is gone. `runtime.explain` is `cli`-only, and a test
+  diffs the registry against the live server so a ghost cannot return.
+- The deprecation is stamped on the runtime surface: MCP `initialize`
+  instructions lead with it, every `tools/list` description carries it, and
+  `capabilities --json` reports it under `registry.mcp_surface`.
+- **Retained read-only for one more release** so orientation keeps working
+  mid-migration: `skillbox_capabilities`, `skillbox_next`, `skillbox_graph`,
+  `skillbox_explain`, `skillbox_search`, `skillbox_snap`.
+
+Not affected: `scripts/operator_mcp_server.py` (`operator_*` tools) is retained.
+It enforces the dry-run marker gate on mutating `operator_box_exec`,
+`operator_teardown`, and `operator_compose_down`; it is slated for review once
+`scripts/box.py` exposes equivalent robot JSON and a thin operator skill carries
+the same gating discipline.
+
+Full record: [docs/ARCHITECTURE.md §9](docs/ARCHITECTURE.md#9-deprecations).
+
 ## Version Timeline
 
 `Kind` distinguishes a published release from a plain git tag.

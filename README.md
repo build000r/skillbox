@@ -98,7 +98,7 @@ explicit runtime graphs, and compact operator commands.
 
 **Agent-first.**
 - Persistent Claude/Codex homes, declared service graphs, and one-command client `focus` that syncs, starts services, and writes enriched agent context in a single pass.
-- In-box and operator MCP tools expose the machine to your agents as native, structured tools.
+- A robot CLI as the agent front door: every command speaks `--format json` with real exit codes, and skills carry the task-level guidance. (The in-box MCP server is deprecated and frozen; operator MCP tools still expose fleet lifecycle with server-side safety gates.)
 
 Full needs-to-answers table → [docs/faq.md#why-use-skillbox](docs/faq.md#why-use-skillbox).
 
@@ -163,7 +163,8 @@ should feel durable, legible, and agent-friendly.
 | `.env-manager/manage.py` | Runtime graph, client focus, services, logs, skill visibility, search, snapshots, and MCP rendering. | [API reference](docs/API_REFERENCE.md) |
 | `scripts/box.py` | DigitalOcean/Tailscale box lifecycle, posture proof, status, and recovery-oriented box operations. | [API reference](docs/API_REFERENCE.md) |
 | `scripts/sbp` / `scripts/sbo` | Skill policy, overlays, MCP visibility, wrapper ergonomics, and repo-local skill decisions. | [API reference](docs/API_REFERENCE.md) |
-| MCP tools | In-box and operator tools exposed to coding agents with structured outputs and server-side safety gates. | [API reference](docs/API_REFERENCE.md) |
+| Operator MCP tools | Fleet lifecycle exposed to coding agents with structured outputs and server-side safety gates. | [API reference](docs/API_REFERENCE.md) |
+| In-box MCP tools | **Deprecated and frozen.** Use the robot CLI (`manage.py <command> --format json`) plus skills instead. | [Deprecation record](docs/ARCHITECTURE.md#9-deprecations) |
 
 ## Documentation Map
 
