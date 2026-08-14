@@ -16,7 +16,10 @@ Main entry points:
 - `.env-manager/manage.py` re-exports `runtime_manager` and runs the runtime CLI.
 - `.env-manager/runtime_manager/cli.py` defines runtime subcommands.
 - `scripts/box.py` manages DigitalOcean/Tailscale box lifecycle.
-- `scripts/operator_mcp_server.py` exposes operator lifecycle tools over MCP.
+- `scripts/operator_mcp_server.py` exposes operator lifecycle tools over MCP (retained).
+- `.env-manager/mcp_server.py` is the in-box MCP server — **deprecated and frozen**.
+  The agent front door is the robot CLI (`manage.py <command> --format json`)
+  plus skills. See [docs/ARCHITECTURE.md §9](docs/ARCHITECTURE.md#9-deprecations).
 - `scripts/stub_api.py` and `scripts/stub_web.py` are optional local surfaces.
 
 ## Core Commands
@@ -136,13 +139,15 @@ the operator's private hosts registry (`SKILLBOX_CLIPBOARD_HOSTS`); the tracked
 - Python is standard-library first; PyYAML is optional but required for YAML
   commands.
 - Tests are `unittest` style and often import scripts by path with mocks around subprocess, Docker, network, and filesystem side effects.
-- Keep CLI/MCP output structured and compact. Many handlers return JSON payloads
+- Keep CLI output structured and compact. Many handlers return JSON payloads
   with `ok`, `steps`, `checks`, `next_actions`, or structured error objects.
 - Runtime commands should respect `--client`, repeatable `--profile`, and repeatable `--service`/`--task` scoping where applicable.
 - New agent-facing commands should be registered in
-  `.env-manager/runtime_manager/command_registry.py`, exposed through both CLI
-  and in-box MCP when useful, and covered by focused `tests/test_agent_ops_*`
-  tests when they touch graph, search, decision, snapshot, or registry behavior.
+  `.env-manager/runtime_manager/command_registry.py`, exposed through the CLI
+  with `--format json`, and covered by focused `tests/test_agent_ops_*` tests
+  when they touch graph, search, decision, snapshot, or registry behavior. Do
+  not add an in-box MCP mirror — that surface is frozen and `validate_spec`
+  rejects an `mcp_tool` outside `MCP_FROZEN_TOOLS`.
 - Preserve user/local state. This repo commonly has dirty generated state and
   local secrets; do not clean ignored directories as part of code edits.
 

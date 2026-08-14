@@ -58,6 +58,10 @@ UPGRADE_SCRIPT = SCRIPT_DIR / "06-upgrade-release.sh"
 INSTALL_SCRIPT = REPO_ROOT / "install.sh"
 DEFAULT_BOX_CLIENT_ROOT = "${SKILLBOX_MONOSERVER_ROOT}"
 DEFAULT_FIRST_BOX_BLUEPRINT = "git-repo-http-service-bootstrap-spaps-auth"
+# The in-box "skillbox" MCP server is DEPRECATED AND FROZEN (docs/ARCHITECTURE.md §9).
+# New boxes still get it so nothing breaks mid-migration; agents on the box should
+# use the robot CLI (`python3 .env-manager/manage.py <command> --format json`) plus
+# skills. Drop this default once no consumer depends on the surface.
 DEFAULT_ROOT_MCP_CONFIG = {
     "mcpServers": {
         "skillbox": {

@@ -1112,6 +1112,9 @@ def mcp_server_name_for_service(service: dict[str, Any]) -> str:
 
 
 def requested_mcp_servers(model: dict[str, Any]) -> list[dict[str, Any]]:
+    # The built-in "skillbox" server is DEPRECATED AND FROZEN (docs/ARCHITECTURE.md §9)
+    # but still requested so existing callers do not break. Do not add new
+    # always-on entries here; agents reach commands through the robot CLI.
     requested: list[dict[str, Any]] = [{"name": "skillbox", "service_id": None}]
     seen = {"skillbox"}
     for service in model.get("services") or []:
