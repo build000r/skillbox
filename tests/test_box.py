@@ -837,6 +837,9 @@ class BoxTests(unittest.TestCase):
             }), encoding="utf-8")
 
             env = self._env_with_inventory(tmpdir)
+            # Real (non-dry-run) upgrade sits behind the CLI mutation gate;
+            # these tests exercise manifest/state validation past it.
+            env["SKILLBOX_CLI_MUTATION_GATE"] = "skip"
             result = self._run(
                 "upgrade",
                 "client_a",
@@ -879,6 +882,9 @@ class BoxTests(unittest.TestCase):
             }), encoding="utf-8")
 
             env = self._env_with_inventory(tmpdir)
+            # Real (non-dry-run) upgrade sits behind the CLI mutation gate;
+            # these tests exercise manifest/state validation past it.
+            env["SKILLBOX_CLI_MUTATION_GATE"] = "skip"
             result = self._run(
                 "upgrade",
                 "client_a",

@@ -626,7 +626,7 @@ class BoxLifecycleTests(unittest.TestCase):
             mock.patch.object(BOX_MODULE, "save_inventory"),
             mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
         ):
-            result = BOX_MODULE.cmd_down("box-1", dry_run=False, fmt="json")
+            result = BOX_MODULE.cmd_down("box-1", dry_run=False, fmt="json", confirmed=True)
 
         self.assertEqual(result, BOX_MODULE.EXIT_OK)
         self.assertEqual(box.state, "destroyed")
@@ -772,7 +772,7 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
             mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
         ):
             fake_time.sleep = mock.Mock()  # bounded retry must not actually sleep
-            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json")
+            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json", confirmed=True)
 
         self.assertEqual(result, BOX_MODULE.EXIT_ERROR)
         self.assertEqual(box.state, "destroy-pending")
@@ -808,7 +808,7 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
             mock.patch.object(BOX_MODULE, "save_inventory"),
             mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
         ):
-            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json")
+            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json", confirmed=True)
 
         self.assertEqual(result, BOX_MODULE.EXIT_OK)
         self.assertEqual(box.state, "destroyed")
@@ -837,7 +837,7 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
             mock.patch.object(BOX_MODULE, "save_inventory"),
             mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
         ):
-            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json")
+            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json", confirmed=True)
 
         self.assertEqual(result, BOX_MODULE.EXIT_ERROR)
         self.assertEqual(box.state, "volume-cleanup-failed")
@@ -869,7 +869,7 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
             mock.patch.object(BOX_MODULE, "save_inventory"),
             mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
         ):
-            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json")
+            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json", confirmed=True)
 
         self.assertEqual(result, BOX_MODULE.EXIT_OK)
         self.assertEqual(box.state, "destroyed")
@@ -902,7 +902,7 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
             mock.patch.object(BOX_MODULE, "save_inventory"),
             mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
         ):
-            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json")
+            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json", confirmed=True)
 
         self.assertEqual(result, BOX_MODULE.EXIT_OK)
         self.assertEqual(box.state, "destroyed")
@@ -933,7 +933,7 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
             mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
         ):
             fake_time.sleep = mock.Mock()
-            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json")
+            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json", confirmed=True)
 
         self.assertEqual(result, BOX_MODULE.EXIT_ERROR)
         self.assertEqual(box.state, "destroy-pending")
@@ -962,7 +962,7 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
             mock.patch.object(BOX_MODULE, "save_inventory"),
             mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
         ):
-            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json")
+            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json", confirmed=True)
 
         self.assertEqual(result, BOX_MODULE.EXIT_OK)
         self.assertEqual(box.state, "destroyed")
@@ -1004,7 +1004,7 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
             mock.patch.object(BOX_MODULE, "save_inventory"),
             mock.patch.object(BOX_MODULE, "emit_json"),
         ):
-            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json")
+            result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json", confirmed=True)
 
         self.assertEqual(result, BOX_MODULE.EXIT_OK)
         self.assertIn("confirm_read", order)
@@ -1160,7 +1160,7 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
                 mock.patch.object(BOX_MODULE, "save_inventory"),
                 mock.patch.object(BOX_MODULE, "emit_json", side_effect=payloads.append),
             ):
-                result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json")
+                result = BOX_MODULE.cmd_down("teardown", dry_run=False, fmt="json", confirmed=True)
 
             self.assertEqual(result, BOX_MODULE.EXIT_ERROR)
             self.assertEqual(box.state, "destroy-pending")

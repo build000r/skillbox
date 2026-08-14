@@ -427,7 +427,7 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(BOX, "do_get_droplet", return_value=_droplet_absent()), \
             mock.patch.object(BOX, "save_inventory"), \
             mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
-            result = BOX.cmd_down("teardown", dry_run=False, fmt="json")
+            result = BOX.cmd_down("teardown", dry_run=False, fmt="json", confirmed=True)
 
         self.assertEqual(result, BOX.EXIT_OK)
         self.assertEqual(box.state, "destroyed")
@@ -454,7 +454,7 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(BOX, "do_delete_droplet", return_value=False), \
             mock.patch.object(BOX, "save_inventory"), \
             mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
-            result = BOX.cmd_down("teardown", dry_run=False, fmt="json")
+            result = BOX.cmd_down("teardown", dry_run=False, fmt="json", confirmed=True)
 
         self.assertEqual(result, BOX.EXIT_ERROR)
         self.assertNotEqual(box.state, "destroyed")
@@ -507,7 +507,7 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(BOX, "do_delete_volume", side_effect=delete_volume), \
             mock.patch.object(BOX, "save_inventory"), \
             mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
-            result = BOX.cmd_down("teardown", dry_run=False, fmt="json")
+            result = BOX.cmd_down("teardown", dry_run=False, fmt="json", confirmed=True)
 
         self.assertEqual(result, BOX.EXIT_OK)
         self.assertEqual(box.state, "destroyed")
@@ -542,7 +542,7 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(BOX, "do_delete_volume") as delete_volume, \
             mock.patch.object(BOX, "save_inventory"), \
             mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
-            result = BOX.cmd_down("teardown", dry_run=False, fmt="json")
+            result = BOX.cmd_down("teardown", dry_run=False, fmt="json", confirmed=True)
 
         self.assertEqual(result, BOX.EXIT_ERROR)
         self.assertEqual(box.state, "volume-cleanup-failed")
@@ -574,7 +574,7 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(BOX, "do_delete_volume", return_value=True), \
             mock.patch.object(BOX, "save_inventory"), \
             mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
-            result = BOX.cmd_down("teardown", dry_run=False, fmt="json")
+            result = BOX.cmd_down("teardown", dry_run=False, fmt="json", confirmed=True)
 
         self.assertEqual(result, BOX.EXIT_OK)
         self.assertEqual(box.state, "destroyed")
@@ -591,7 +591,7 @@ class BoxRefactorTests(unittest.TestCase):
 
         with mock.patch.object(BOX, "load_inventory", return_value=[]), \
             mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
-            result = BOX.cmd_down("ghost", dry_run=False, fmt="json")
+            result = BOX.cmd_down("ghost", dry_run=False, fmt="json", confirmed=True)
 
         self.assertEqual(result, BOX.EXIT_ERROR)
         self.assertEqual(payloads[-1]["error"]["type"], "not_found")
@@ -602,7 +602,7 @@ class BoxRefactorTests(unittest.TestCase):
 
         with mock.patch.object(BOX, "load_inventory", return_value=[box]), \
             mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
-            result = BOX.cmd_down("shared-pal", dry_run=False, fmt="json")
+            result = BOX.cmd_down("shared-pal", dry_run=False, fmt="json", confirmed=True)
 
         self.assertEqual(result, BOX.EXIT_ERROR)
         self.assertEqual(payloads[-1]["error"]["type"], "invalid_state")
@@ -633,7 +633,7 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(BOX, "resolve_box_ssh_target", return_value=None), \
             mock.patch.object(BOX, "save_inventory"), \
             mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
-            result = BOX.cmd_down("teardown", dry_run=False, fmt="json")
+            result = BOX.cmd_down("teardown", dry_run=False, fmt="json", confirmed=True)
 
         self.assertEqual(result, BOX.EXIT_OK)
         self.assertEqual(
@@ -666,7 +666,7 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(BOX, "do_delete_droplet", side_effect=RuntimeError("delete failed")), \
             mock.patch.object(BOX, "save_inventory"), \
             mock.patch("builtins.print") as print_mock:
-            result = BOX.cmd_down("teardown", dry_run=False, fmt="text")
+            result = BOX.cmd_down("teardown", dry_run=False, fmt="text", confirmed=True)
 
         self.assertEqual(result, BOX.EXIT_ERROR)
         self.assertNotEqual(box.state, "destroyed")
@@ -809,7 +809,7 @@ class BoxRefactorTests(unittest.TestCase):
                 mock.patch.object(BOX, "ssh_cmd", return_value=_completed(returncode=1)), \
                 mock.patch.object(BOX, "box_network_health", return_value=network), \
                 mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
-                result = BOX.cmd_status(None, fmt="json")
+                result = BOX.cmd_status(None, fmt="json", write_cache=True)
 
             saved = json.loads(inventory.read_text(encoding="utf-8"))
 

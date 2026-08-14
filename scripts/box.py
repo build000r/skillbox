@@ -4058,6 +4058,134 @@ def cmd_upgrade(
 
 
 # ---------------------------------------------------------------------------
+# CLI mutation gates (parity with operator_mcp_server)
+#
+# The operator MCP enforces three things before a real teardown that the direct
+# CLI historically did not: a fresh dry-run preview (marker), a clean working
+# tree, and explicit confirmation. Until the MCP retires, both surfaces share
+# the SAME marker store (.skillbox-state/dryrun-markers, identical filenames
+# and TTL), so a preview through either surface authorizes the other and an
+# agent can migrate mid-flow. The gates live in the CLI dispatch path — direct
+# Python callers (tests, orchestration) pass confirmed= explicitly and are
+# expected to have done their own previewing.
+# ---------------------------------------------------------------------------
+
+CLI_DRYRUN_MARKER_TTL_SECONDS = 600  # keep in lockstep with operator_mcp_server
+
+
+def _cli_marker_ttl_seconds() -> int:
+    raw_ttl = str(os.environ.get("SKILLBOX_DRYRUN_MARKER_TTL_SECONDS") or "").strip()
+    if raw_ttl:
+        try:
+            parsed = int(raw_ttl)
+            if parsed > 0:
+                return parsed
+        except ValueError:
+            pass
+    return CLI_DRYRUN_MARKER_TTL_SECONDS
+
+
+def _cli_dryrun_marker_path(tool_name: str, key: str) -> Path:
+    # Same directory + filename shape as operator_mcp_server so markers interop.
+    return REPO_ROOT / ".skillbox-state" / "dryrun-markers" / f".skillbox-dryrun-{tool_name}-{key}"
+
+
+def stamp_cli_dryrun_marker(tool_name: str, key: str) -> None:
+    marker = _cli_dryrun_marker_path(tool_name, key)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "tool": tool_name,
+        "key": key,
+        "source": "box-cli",
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "note": f"dry-run completed for {tool_name} key={key}",
+    }
+    marker.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def cli_dryrun_marker_valid(tool_name: str, key: str) -> bool:
+    marker = _cli_dryrun_marker_path(tool_name, key)
+    try:
+        age = time.time() - marker.stat().st_mtime
+    except OSError:
+        return False
+    return 0 <= age <= _cli_marker_ttl_seconds()
+
+
+def clear_cli_dryrun_marker(tool_name: str, key: str) -> None:
+    try:
+        _cli_dryrun_marker_path(tool_name, key).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _repo_tree_dirty() -> str:
+    """Return a short description of uncommitted changes, or '' when clean.
+
+    Mirrors the operator MCP's uncommitted-changes gate: a teardown from a
+    dirty tree cannot be tied to a reviewable SHA. Git being unavailable is
+    reported as dirty (fail closed) with the probe error as the description.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"git status probe failed: {exc}"
+    if proc.returncode != 0:
+        return f"git status probe failed: {proc.stderr.strip() or proc.returncode}"
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    return f"{len(lines)} uncommitted path(s), e.g. {lines[0].strip()}"
+
+
+def cli_mutation_gate(tool_name: str, box_id: str, *, fmt: str, command_hint: str) -> int | None:
+    """Shared pre-mutation gate for real (non-dry-run) destructive verbs.
+
+    Returns None when the mutation may proceed, or an exit code after emitting
+    a structured refusal. Order matters: tree cleanliness first (cheap, and a
+    dry-run doesn't fix it), then the marker requirement.
+
+    SKILLBOX_CLI_MUTATION_GATE=skip disables both checks — for hermetic tests
+    and break-glass recovery only; every skip is announced on stderr.
+    """
+    is_json = fmt == "json"
+    if os.environ.get("SKILLBOX_CLI_MUTATION_GATE", "").strip().lower() == "skip":
+        print(
+            f"WARNING: {tool_name} mutation gate skipped via SKILLBOX_CLI_MUTATION_GATE=skip",
+            file=sys.stderr,
+        )
+        return None
+    dirty = _repo_tree_dirty()
+    if dirty:
+        return emit_error_or_print(
+            f"Refusing real {tool_name}: repository has uncommitted changes ({dirty}). "
+            "Destructive operations must run from a committed state.",
+            is_json=is_json,
+            error_type="dirty_tree_refused",
+            next_actions=[
+                "git status --short",
+                "commit or stash the changes, then re-run",
+            ],
+        )
+    if not cli_dryrun_marker_valid(tool_name, box_id):
+        ttl_minutes = _cli_marker_ttl_seconds() // 60
+        return emit_error_or_print(
+            f"Refusing real {tool_name} for {box_id!r}: no fresh dry-run preview. "
+            f"Preview first, then re-run the identical command within {ttl_minutes} minutes.",
+            is_json=is_json,
+            error_type="dryrun_marker_required",
+            next_actions=[
+                command_hint,
+                "then re-run this command without changes",
+            ],
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # box down
 # ---------------------------------------------------------------------------
 
@@ -4388,7 +4516,7 @@ def cmd_down(
     *,
     dry_run: bool,
     fmt: str,
-    confirmed: bool = True,
+    confirmed: bool = False,
     confirmation_mismatch: bool = False,
 ) -> int:
     is_json = fmt == "json"
@@ -4727,7 +4855,7 @@ def cmd_inventory_rebuild(*, from_journal: bool, fmt: str) -> int:
 # box status
 # ---------------------------------------------------------------------------
 
-def cmd_status(box_id: str | None, *, fmt: str, write_cache: bool = True, history: bool = False) -> int:
+def cmd_status(box_id: str | None, *, fmt: str, write_cache: bool = False, history: bool = False) -> int:
     is_json = fmt == "json"
     boxes = load_inventory()
     ssh_target_snapshot = inventory_ssh_target_snapshot(boxes)
@@ -5552,20 +5680,51 @@ def main(argv: list[str] | None = None) -> int:
                 fmt=args.format,
             )
         if args.command == "down":
-            return cmd_down(
+            if not args.dry_run and down_confirmed:
+                refused = cli_mutation_gate(
+                    "operator_teardown",
+                    args.box_id,
+                    fmt=args.format,
+                    command_hint=f"python3 scripts/box.py down {args.box_id} --dry-run --format json",
+                )
+                if refused is not None:
+                    return refused
+            result = cmd_down(
                 args.box_id,
                 dry_run=args.dry_run,
                 fmt=args.format,
                 confirmed=down_confirmed,
                 confirmation_mismatch=confirmation_mismatch,
             )
+            if args.dry_run and result == EXIT_OK:
+                stamp_cli_dryrun_marker("operator_teardown", args.box_id)
+            elif not args.dry_run and down_confirmed and result == EXIT_OK:
+                clear_cli_dryrun_marker("operator_teardown", args.box_id)
+            return result
         if args.command == "upgrade":
-            return cmd_upgrade(
+            if not args.dry_run:
+                refused = cli_mutation_gate(
+                    "operator_upgrade",
+                    args.box_id,
+                    fmt=args.format,
+                    command_hint=(
+                        f"python3 scripts/box.py upgrade {args.box_id} "
+                        f"--deploy-manifest {args.deploy_manifest} --dry-run --format json"
+                    ),
+                )
+                if refused is not None:
+                    return refused
+            result = cmd_upgrade(
                 args.box_id,
                 deploy_manifest=args.deploy_manifest,
                 dry_run=args.dry_run,
                 fmt=args.format,
             )
+            if args.dry_run and result == EXIT_OK:
+                stamp_cli_dryrun_marker("operator_upgrade", args.box_id)
+            elif not args.dry_run and result == EXIT_OK:
+                clear_cli_dryrun_marker("operator_upgrade", args.box_id)
+            return result
         if args.command == "status":
             return cmd_status(args.box_id, fmt=args.format, write_cache=args.write_cache, history=args.history)
         if args.command == "inventory-rebuild":
