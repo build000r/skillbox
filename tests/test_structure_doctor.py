@@ -124,6 +124,23 @@ class ExitCodeSemanticsTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["summary"]["fail"], 0)
 
+    def test_payload_carries_doctor_family_routing(self):
+        # R-208: sbp doctor is the family front door; its payload must route
+        # agents to the sibling doctors it did NOT run.
+        payload = self._run(
+            {
+                "structure_invariants": (KIND_STRUCTURE, STATUS_PASS, "ok"),
+                "runtime_doctor": (KIND_RUNTIME, STATUS_PASS, "ok"),
+            }
+        )
+        coverage = payload["coverage"]
+        self.assertEqual(coverage["front_door"], "sbp doctor")
+        siblings = {row["doctor"] for row in coverage["siblings_not_run"]}
+        self.assertIn("sbp registry doctor", siblings)
+        self.assertIn("make self-test", siblings)
+        for row in coverage["siblings_not_run"]:
+            self.assertTrue(row["symptom"])
+
     def test_any_fail_exits_nonzero(self):
         payload = self._run(
             {

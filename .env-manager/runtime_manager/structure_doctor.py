@@ -821,6 +821,25 @@ def run_structure_doctor(
             "structure_within_budget": structure_duration < STRUCTURE_BUDGET_S,
         },
         "exit_code": exit_code,
+        # Doctor-family routing: what this run covered and which sibling
+        # doctors were NOT run, so an agent with a symptom can route without
+        # out-of-band knowledge. sbp doctor is the front door — its
+        # runtime_doctor gate embeds `make doctor` (which embeds
+        # `manage.py doctor`); the siblings listed here are the satellites.
+        "coverage": {
+            "front_door": "sbp doctor",
+            "includes": [
+                "structural gates (this run)",
+                "make doctor via runtime_doctor gate (manifest/compose/skill-sync, embeds manage.py doctor)",
+            ],
+            "siblings_not_run": [
+                {"doctor": "sbp registry doctor", "symptom": "repos.yaml vs on-disk git estate drift"},
+                {"doctor": "sbp cass doctor", "symptom": "remote Cass index health"},
+                {"doctor": "sbp send-later doctor", "symptom": "scheduler tick/queue health"},
+                {"doctor": "sbp beads status", "symptom": "beads db/jsonl health"},
+                {"doctor": "make self-test", "symptom": "canonical CI gate on an exact SHA"},
+            ],
+        },
     }
 
 

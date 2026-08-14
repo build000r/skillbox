@@ -1688,6 +1688,11 @@ def print_doctor_text(results: list[CheckResult]) -> None:
         f"{counts['warn']} warnings, "
         f"{counts['fail']} failed"
     )
+    # Doctor-family routing: this doctor covers manifest/compose/skill-sync
+    # drift only. The superset front door (structural gates + this doctor via
+    # its runtime_doctor gate) is `sbp doctor`; its JSON carries the full
+    # sibling-doctor routing table in a `coverage` field.
+    print("structural gates not checked here — front door: sbp doctor --format json")
 
 
 def doctor_results(skip_compose: bool, skip_skill_sync: bool) -> list[CheckResult]:
@@ -1831,6 +1836,12 @@ Safe validation pattern:
   check, then run full doctor when Docker and manage.py dry-run checks are safe.
   The skill sync check is a dry-run command:
   python3 .env-manager/manage.py sync --dry-run --format json
+
+Doctor-family routing:
+  This doctor covers manifest/compose/skill-sync drift only. The front door of
+  the doctor family is `sbp doctor --format json` (structural gates + this
+  doctor via its runtime_doctor gate); its JSON `coverage` field routes to the
+  satellite doctors (registry, cass, send-later, beads, self-test).
 """
 
 

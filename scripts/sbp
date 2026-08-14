@@ -906,6 +906,7 @@ payload = {
     "tool": f"skillbox-{wrapper}",
     "quick_ref": [
         f"{wrapper} status --json",
+        f"{wrapper} doctor --format json",
         f"{wrapper} git --json",
         f"{wrapper} skills --issues-only --json",
         f"{wrapper} candidates --json",
@@ -915,6 +916,7 @@ payload = {
     ],
     "recommendations": [
         {"id": "runtime-status", "command": f"{wrapper} status --json", "why": "Fastest runtime state read."},
+        {"id": "doctor-front-door", "command": f"{wrapper} doctor --format json", "why": "THE doctor front door: structural gates + make doctor (which embeds the runtime doctor); its coverage field routes to satellite doctors."},
         {"id": "estate-git", "command": f"{wrapper} git --json", "why": "THE estate git read: read-only risk-sorted status with per-repo fix commands; never fetches."},
         {"id": "skill-drift", "command": f"{wrapper} skills --issues-only --json", "why": "Compact cwd skill-policy view."},
         {"id": "skill-candidates", "command": f"{wrapper} candidates --json", "why": "Explore linkable source skills before declaring the cwd surface complete."},
