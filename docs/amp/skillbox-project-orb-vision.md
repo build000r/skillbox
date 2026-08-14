@@ -165,11 +165,15 @@ The only currently accepted Skillbox-owned remote surface is the fixed GET-only
 - `GET /healthz` for service health;
 - authenticated `GET /v1/orb-kit` for the deterministic bootstrap client;
 - `GET /v1/cass/status`;
-- `GET /v1/cass/search?q=<one nonempty query>`; and
+- `GET /v1/cass/search?q=<one nonempty query>`;
+- `GET /v1/wiki/status[?vault=<one registered wiki>]`;
+- `GET /v1/wiki/search?q=<one nonempty query>[&vault=<one registered wiki>]`;
+- `GET /v1/wiki/page?slug=<one page slug>[&vault=<one registered wiki>]`;
+- `GET /v1/wiki/log[?limit=<bounded integer>][&vault=<one registered wiki>]`; and
 - `GET /v1/skill/pull/<one validated skill name>`.
 
 There is no arbitrary command or path delegation. POST, PUT, PATCH, and DELETE
-return 405 without calling Cass or skill code. Binding is limited to loopback
+return 405 without calling Cass, wiki, or skill code. Binding is limited to loopback
 or a literal Tailnet address; public/wildcard binds are forbidden.
 
 Hosted SPAPS is Sweet Potato-owned and is a distinct relying party. The

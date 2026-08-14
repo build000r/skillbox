@@ -118,6 +118,176 @@ class SbpdHttpTests(unittest.TestCase):
                 self.assertEqual(status, 400)
                 self.assertEqual(json.loads(body)["error"], "missing_query")
 
+    def test_wiki_routes_delegate_only_fixed_read_only_commands(self) -> None:
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        def fake_run(command: str, **kwargs: object):
+            calls.append((command, kwargs))
+            return {"ok": True, "contract": "wiki-central-sbp-v1", "command": command}
+
+        with patch.object(SBPD, "run_wiki", side_effect=fake_run):
+            for path in (
+                "/v1/wiki/status",
+                "/v1/wiki/search?q=needle%20with%20spaces&vault=house",
+                "/v1/wiki/page?slug=some-page&vault=house",
+                "/v1/wiki/log?vault=house&limit=25",
+            ):
+                with self.subTest(path=path):
+                    status, headers, body = self.fixture.request("GET", path)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(
+                        headers["Content-Type"],
+                        "application/json; charset=utf-8",
+                    )
+                    self.assertEqual(json.loads(body)["contract"], "wiki-central-sbp-v1")
+
+        self.assertEqual(
+            calls,
+            [
+                ("status", {"vault": None}),
+                ("search", {"query": "needle with spaces", "vault": "house"}),
+                ("page", {"slug": "some-page", "vault": "house"}),
+                ("log", {"vault": "house", "limit": 25}),
+            ],
+        )
+
+    def test_wiki_status_scopes_to_one_vault_when_asked(self) -> None:
+        """Documented as GET /v1/wiki/status?vault=<id> — it must reach argv."""
+        with patch.object(SBPD, "run_wiki", return_value={"ok": True}) as wiki:
+            status, _headers, _body = self.fixture.request(
+                "GET",
+                "/v1/wiki/status?vault=house",
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(wiki.call_args.kwargs["vault"], "house")
+
+        with patch.object(SBPD, "run_wiki") as wiki:
+            for query in ("vault=", "vault=--limit", "vault=a%20b", "vault=../etc"):
+                with self.subTest(query=query):
+                    status, _headers, body = self.fixture.request(
+                        "GET",
+                        f"/v1/wiki/status?{query}",
+                    )
+                    self.assertEqual(status, 400)
+                    self.assertEqual(json.loads(body)["error"], "invalid_vault")
+        wiki.assert_not_called()
+
+    def test_wiki_page_slug_is_a_bare_name_not_a_path(self) -> None:
+        """The network edge fails closed on traversal, like `vault` already did."""
+        with patch.object(SBPD, "run_wiki") as wiki:
+            for query in (
+                "slug=../../../../etc/passwd",
+                "slug=%2e%2e%2fescape",
+                "slug=../other-client/SECRET",
+                "slug=/etc/passwd",
+                "slug=_concepts/nested",
+                "slug=..",
+                "slug=a..b",
+                "slug=.hidden",
+                "slug=~%2f.ssh%2fid_ed25519",
+                "slug=semi;colon",
+                "slug=%00",
+                "slug=" + "x" * 129,
+            ):
+                with self.subTest(query=query):
+                    status, _headers, body = self.fixture.request(
+                        "GET",
+                        f"/v1/wiki/page?{query}",
+                    )
+                    self.assertEqual(status, 400)
+                    self.assertEqual(json.loads(body)["error"], "invalid_slug")
+        wiki.assert_not_called()
+
+        with patch.object(SBPD, "run_wiki", return_value={"ok": True}) as wiki:
+            for query, expected in (
+                ("slug=skill-as-workflow", "skill-as-workflow"),
+                ("slug=bufett%20formula", "bufett formula"),
+                ("slug=dotted.name_v2", "dotted.name_v2"),
+            ):
+                with self.subTest(query=query):
+                    status, _headers, _body = self.fixture.request(
+                        "GET",
+                        f"/v1/wiki/page?{query}",
+                    )
+                    self.assertEqual(status, 200)
+                    self.assertEqual(wiki.call_args.kwargs["slug"], expected)
+
+    def test_wiki_search_and_page_require_exactly_one_nonempty_selector(self) -> None:
+        cases = {
+            "/v1/wiki/search": "missing_query",
+            "/v1/wiki/search?q=": "missing_query",
+            "/v1/wiki/search?q=one&q=two": "missing_query",
+            "/v1/wiki/page": "missing_slug",
+            "/v1/wiki/page?slug=": "missing_slug",
+            "/v1/wiki/page?slug=one&slug=two": "missing_slug",
+        }
+        with patch.object(SBPD, "run_wiki") as wiki:
+            for path, error in cases.items():
+                with self.subTest(path=path):
+                    status, _headers, body = self.fixture.request("GET", path)
+                    self.assertEqual(status, 400)
+                    self.assertEqual(json.loads(body)["error"], error)
+        wiki.assert_not_called()
+
+    def test_wiki_log_limit_is_a_bounded_integer(self) -> None:
+        with patch.object(SBPD, "run_wiki") as wiki:
+            for query in ("limit=0", "limit=201", "limit=abc", "limit=", "limit=-1"):
+                with self.subTest(query=query):
+                    status, _headers, body = self.fixture.request(
+                        "GET",
+                        f"/v1/wiki/log?{query}",
+                    )
+                    self.assertEqual(status, 400)
+                    self.assertEqual(json.loads(body)["error"], "invalid_limit")
+            wiki.assert_not_called()
+
+            wiki.return_value = {"ok": True}
+            for query, expected in (("limit=1", 1), ("limit=200", 200)):
+                with self.subTest(query=query):
+                    status, _headers, _body = self.fixture.request(
+                        "GET",
+                        f"/v1/wiki/log?{query}",
+                    )
+                    self.assertEqual(status, 200)
+                    self.assertEqual(wiki.call_args.kwargs["limit"], expected)
+
+    def test_wiki_vault_rejects_argv_flag_injection(self) -> None:
+        with patch.object(SBPD, "run_wiki") as wiki:
+            for path in (
+                "/v1/wiki/log?vault=--limit",
+                "/v1/wiki/search?q=needle&vault=a%20b",
+                "/v1/wiki/page?slug=page&vault=",
+            ):
+                with self.subTest(path=path):
+                    status, _headers, body = self.fixture.request("GET", path)
+                    self.assertEqual(status, 400)
+                    self.assertEqual(json.loads(body)["error"], "invalid_vault")
+        wiki.assert_not_called()
+
+    def test_unknown_wiki_verb_is_not_found_without_delegation(self) -> None:
+        with patch.object(SBPD, "run_wiki") as wiki:
+            status, _headers, body = self.fixture.request("GET", "/v1/wiki/refresh")
+            self.assertEqual(status, 404)
+            self.assertEqual(
+                json.loads(body),
+                {"ok": False, "error": "not_found", "path": "/v1/wiki/refresh"},
+            )
+        wiki.assert_not_called()
+
+    def test_wiki_is_protected_and_rejects_mutating_methods(self) -> None:
+        self.assertIn("/v1/wiki/", SBPD.PROTECTED_PATH_PREFIXES)
+        with patch.object(SBPD, "run_wiki") as wiki:
+            for method in ("POST", "PUT", "PATCH", "DELETE"):
+                with self.subTest(method=method):
+                    status, headers, body = self.fixture.request(
+                        method,
+                        "/v1/wiki/search?q=needle",
+                    )
+                    self.assertEqual(status, 405)
+                    self.assertEqual(headers["Allow"], "GET")
+                    self.assertEqual(json.loads(body)["error"], "method_not_allowed")
+        wiki.assert_not_called()
+
     def test_skill_pull_streams_tarball_with_identity_header(self) -> None:
         bundle = b"\x1f\x8btest-bundle"
         result = {"tree_sha256": "a" * 64}
@@ -245,6 +415,104 @@ class SbpdDelegateTests(unittest.TestCase):
                 SBPD.run_cass("status")
         self.assertEqual(failed.exception.status, 502)
         self.assertEqual(failed.exception.payload["exit_code"], 7)
+
+    def test_run_wiki_uses_canonical_wrapper_and_fences_every_caller_value(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='{"contract":"wiki-central-sbp-v1"}',
+            stderr="",
+        )
+        with patch.object(SBPD, "_run_bounded_process", return_value=completed) as run:
+            payload = SBPD.run_wiki(
+                "search",
+                query="--max-bytes; rm -rf nope",
+                vault="house",
+            )
+        self.assertEqual(payload, {"contract": "wiki-central-sbp-v1"})
+        argv = run.call_args.args[0]
+        self.assertEqual(
+            argv[:3],
+            [SBPD.sys.executable, str(SBPD.SBP_WIKI_SCRIPT), "search"],
+        )
+        self.assertIn("--json", argv)
+        self.assertEqual(argv[argv.index("--timeout-seconds") + 1], "90")
+        self.assertEqual(argv[argv.index("--vault") + 1], "house")
+        self.assertEqual(argv[-2:], ["--", "--max-bytes; rm -rf nope"])
+        self.assertNotIn("shell", run.call_args.kwargs)
+        self.assertEqual(run.call_args.kwargs["timeout"], SBPD.WIKI_PROCESS_TIMEOUT_SECONDS)
+        self.assertEqual(
+            run.call_args.kwargs["stdout_limit"],
+            SBPD.MAX_WIKI_STDOUT_BYTES,
+        )
+
+        for command, kwargs, tail in (
+            ("status", {}, ["--timeout-seconds", "90"]),
+            ("status", {"vault": "house"}, ["--vault", "house"]),
+            ("page", {"slug": "-dash-slug"}, ["--", "-dash-slug"]),
+            ("log", {"limit": 5}, ["--limit", "5"]),
+        ):
+            with self.subTest(command=command):
+                with patch.object(SBPD, "_run_bounded_process", return_value=completed) as run:
+                    SBPD.run_wiki(command, **kwargs)
+                self.assertEqual(run.call_args.args[0][-2:], tail)
+
+        with self.assertRaises(ValueError):
+            SBPD.run_wiki("refresh")
+
+    def test_run_wiki_maps_every_wrapper_failure_to_a_typed_envelope(self) -> None:
+        with patch.object(
+            SBPD,
+            "_run_bounded_process",
+            side_effect=subprocess.TimeoutExpired(["wiki"], 95),
+        ), self.assertRaises(SBPD.ServiceError) as timeout:
+            SBPD.run_wiki("status")
+        self.assertEqual(timeout.exception.status, 504)
+        self.assertEqual(timeout.exception.payload["error"], "wiki_timeout")
+
+        with patch.object(
+            SBPD,
+            "_run_bounded_process",
+            side_effect=SBPD.ProcessOutputLimitExceeded("stdout"),
+        ), self.assertRaises(SBPD.ServiceError) as oversized:
+            SBPD.run_wiki("status")
+        self.assertEqual(oversized.exception.status, 502)
+        self.assertEqual(oversized.exception.payload["error"], "wiki_response_too_large")
+
+        with patch.object(
+            SBPD,
+            "_run_bounded_process",
+            side_effect=FileNotFoundError(2, "No such file or directory"),
+        ), self.assertRaises(SBPD.ServiceError) as missing:
+            SBPD.run_wiki("status")
+        self.assertEqual(missing.exception.status, 502)
+        self.assertEqual(missing.exception.payload["error"], "wiki_unavailable")
+        self.assertEqual(
+            missing.exception.payload["message"],
+            "Unable to execute sbp_wiki.py",
+        )
+
+        invalid = subprocess.CompletedProcess(args=[], returncode=0, stdout="not json", stderr="")
+        with patch.object(SBPD, "_run_bounded_process", return_value=invalid):  # noqa: SIM117
+            with self.assertRaises(SBPD.ServiceError) as malformed:
+                SBPD.run_wiki("status")
+        self.assertEqual(malformed.exception.status, 502)
+        self.assertEqual(malformed.exception.payload["error"], "wiki_invalid_response")
+
+        failed_run = subprocess.CompletedProcess(
+            args=[],
+            returncode=4,
+            stdout='{"status":"error"}',
+            stderr="vault missing",
+        )
+        with patch.object(SBPD, "_run_bounded_process", return_value=failed_run):  # noqa: SIM117
+            with self.assertRaises(SBPD.ServiceError) as failed:
+                SBPD.run_wiki("status")
+        self.assertEqual(failed.exception.status, 502)
+        self.assertEqual(failed.exception.payload["error"], "wiki_failed")
+        self.assertEqual(failed.exception.payload["exit_code"], 4)
+        self.assertEqual(failed.exception.payload["result"], {"status": "error"})
+        self.assertEqual(failed.exception.payload["stderr"], "vault missing")
 
     def test_bounded_process_terminates_oversized_child_output(self) -> None:
         with self.assertRaises(SBPD.ProcessOutputLimitExceeded) as oversized:
@@ -525,6 +793,35 @@ class SbpdAuthTests(unittest.TestCase):
         self.assertEqual(json.loads(body), {"ok": True})
         self.assertNotIn("private@example.invalid", log.getvalue())
         self.assertNotIn("sub=", log.getvalue())
+
+    def test_wiki_reads_are_the_same_auth_class_as_cass(self) -> None:
+        fixture = ServerFixture(require_auth=True, authenticator=self.verifier())
+        try:
+            with patch.object(SBPD, "run_wiki", return_value={"ok": True}) as wiki:
+                for path in (
+                    "/v1/wiki/status",
+                    "/v1/wiki/search?q=needle",
+                    "/v1/wiki/page?slug=page",
+                    "/v1/wiki/log",
+                ):
+                    with self.subTest(path=path):
+                        status, headers, _body = fixture.request("GET", path)
+                        self.assertEqual(status, 401)
+                        self.assertEqual(
+                            headers["WWW-Authenticate"],
+                            'Bearer realm="sbpd"',
+                        )
+                wiki.assert_not_called()
+
+                status, _headers, body = fixture.request(
+                    "GET",
+                    "/v1/wiki/status",
+                    headers={"Authorization": f"Bearer {self.token()}"},
+                )
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body), {"ok": True})
+        finally:
+            fixture.close()
 
     def test_project_allowlist_and_amp_claim_schema_fail_closed(self) -> None:
         allowed = self.verifier(allowed_project_ids=("project",))

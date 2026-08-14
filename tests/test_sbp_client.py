@@ -132,6 +132,155 @@ class SbpClientUnitTests(unittest.TestCase):
             "http://127.0.0.1:8443/v1/cass/status",
         )
 
+    def test_wiki_reads_map_to_v1_wiki_routes_and_copy_the_envelope(self) -> None:
+        body = b'{ "contract": "wiki-central-sbp-v1",\n  "result": {"hits": []} }\n'
+        cases = {
+            ("status", "--json"): "http://127.0.0.1:8443/v1/wiki/status",
+            ("status", "--json", "--vault", "house"): (
+                "http://127.0.0.1:8443/v1/wiki/status?vault=house"
+            ),
+            ("status", "--vault=house"): (
+                "http://127.0.0.1:8443/v1/wiki/status?vault=house"
+            ),
+            ("search", "exact phrase", "--json"): (
+                "http://127.0.0.1:8443/v1/wiki/search?q=exact+phrase"
+            ),
+            ("search", "needle", "--vault", "house"): (
+                "http://127.0.0.1:8443/v1/wiki/search?q=needle&vault=house"
+            ),
+            ("page", "some-page", "--vault=house"): (
+                "http://127.0.0.1:8443/v1/wiki/page?slug=some-page&vault=house"
+            ),
+            ("log",): "http://127.0.0.1:8443/v1/wiki/log",
+            ("log", "--limit", "25", "--vault", "house"): (
+                "http://127.0.0.1:8443/v1/wiki/log?limit=25&vault=house"
+            ),
+        }
+        for args, expected in cases.items():
+            with self.subTest(args=args):
+                output = io.BytesIO()
+                opener = mock.Mock(return_value=Response(body))
+                result = SBP_CLIENT.run_remote_wiki(
+                    "http://127.0.0.1:8443/",
+                    list(args),
+                    opener=opener,
+                    stdout=output,
+                )
+                self.assertEqual(result, 0)
+                self.assertEqual(output.getvalue(), body)
+                self.assertEqual(opener.call_args.args[0].full_url, expected)
+                self.assertEqual(opener.call_args.kwargs["timeout"], 90.0)
+
+    def test_wiki_rejects_unsupported_verbs_and_options_before_any_request(self) -> None:
+        cases = {
+            ("refresh",): "does not support 'refresh'",
+            ("publish", "page"): "does not support 'publish'",
+            (): "wiki requires one of",
+            # --vault is now supported for status (the documented
+            # GET /v1/wiki/status?vault=<id>); nothing else is.
+            ("status", "--limit", "5"): "status v1 does not support --limit",
+            ("status", "--all"): "status v1 does not support --all",
+            ("status", "-a"): "status v1 does not support '-a'",
+            ("status", "--vault"): "--vault requires a value",
+            ("status", "--vault", "a", "--vault", "b"): "accepts one --vault",
+            ("status", "extra"): "status only supports --json and --vault",
+            ("search",): "search requires a query",
+            ("search", "needle", "--limit", "5"): "search v1 does not support --limit",
+            ("search", "needle", "-C", "3"): "search v1 does not support '-C'",
+            ("page",): "page requires exactly one slug",
+            ("page", "one", "two"): "page requires exactly one slug",
+            ("page", "one", "--max-bytes", "10"): "page v1 does not support --max-bytes",
+            ("log", "extra"): "log does not take positional arguments",
+            ("log", "--limit", "0"): "--limit must be an integer between 1 and 200",
+            ("log", "--limit", "201"): "--limit must be an integer between 1 and 200",
+            ("log", "--limit", "abc"): "--limit must be an integer between 1 and 200",
+            ("log", "--vault"): "--vault requires a value",
+            ("log", "--vault", "a", "--vault", "b"): "accepts one --vault",
+        }
+        for args, expected in cases.items():
+            with self.subTest(args=args):
+                opener = mock.Mock()
+                errors = io.StringIO()
+                result = SBP_CLIENT.run_remote_wiki(
+                    TAILNET_REMOTE,
+                    list(args),
+                    opener=opener,
+                    stdout=io.BytesIO(),
+                    stderr=errors,
+                )
+                self.assertEqual(result, 2)
+                self.assertIn(expected, errors.getvalue())
+                opener.assert_not_called()
+
+    def test_wiki_copies_server_error_envelopes_and_bounds_the_response(self) -> None:
+        envelope = b'{"ok":false,"error":"wiki_timeout","message":"Wiki request exceeded 90s"}'
+        output = io.BytesIO()
+        errors = io.StringIO()
+        http_error = urllib.error.HTTPError(
+            "http://127.0.0.1:8443/v1/wiki/status",
+            504,
+            "Gateway Timeout",
+            {},
+            io.BytesIO(envelope),
+        )
+        result = SBP_CLIENT.run_remote_wiki(
+            "http://127.0.0.1:8443",
+            ["status"],
+            opener=mock.Mock(side_effect=http_error),
+            stdout=output,
+            stderr=errors,
+        )
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), envelope)
+        self.assertEqual(errors.getvalue(), "")
+
+        oversized = io.StringIO()
+        result = SBP_CLIENT.run_remote_wiki(
+            "http://127.0.0.1:8443",
+            ["status"],
+            opener=mock.Mock(
+                return_value=ShortReadResponse(
+                    b"x" * (SBP_CLIENT.MAX_WIKI_RESPONSE_BYTES + 1)
+                )
+            ),
+            stdout=io.BytesIO(),
+            stderr=oversized,
+        )
+        self.assertEqual(result, 1)
+        self.assertIn("maximum response size", oversized.getvalue())
+
+    def test_wiki_response_cannot_change_transport_origin(self) -> None:
+        token, _claims = self._token()
+        errors = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=True):
+            result = SBP_CLIENT.run_remote_wiki(
+                TAILNET_REMOTE,
+                ["status"],
+                opener=mock.Mock(
+                    return_value=RedirectedResponse(
+                        b"{}",
+                        f"{TAILNET_REMOTE.replace('0.10', '0.11')}/v1/wiki/status",
+                    )
+                ),
+                stdout=io.BytesIO(),
+                stderr=errors,
+                token_minter=lambda _audience, _ttl: token,
+            )
+        self.assertEqual(result, 1)
+        self.assertIn("changed transport origin", errors.getvalue())
+
+    def test_client_cli_routes_the_wiki_command_to_the_wiki_reader(self) -> None:
+        with mock.patch.object(SBP_CLIENT, "run_remote_wiki", return_value=0) as wiki:
+            code = SBP_CLIENT.main(
+                ["wiki", "search", "needle", "--json"],
+                environ={"SBP_REMOTE": "http://127.0.0.1:8443"},
+            )
+        self.assertEqual(code, 0)
+        wiki.assert_called_once_with(
+            "http://127.0.0.1:8443",
+            ["search", "needle", "--json"],
+        )
+
     def test_unsupported_remote_verb_fails_without_http_request(self) -> None:
         opener = mock.Mock()
         errors = io.StringIO()

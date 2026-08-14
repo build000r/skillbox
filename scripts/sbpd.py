@@ -1,4 +1,4 @@
-"""Read-only HTTP bridge for host Cass search and skill pull."""
+"""Read-only HTTP bridge for host Cass search, central wiki reads, and skill pull."""
 
 from __future__ import annotations
 
@@ -47,6 +47,11 @@ CASS_PROCESS_TIMEOUT_SECONDS = CASS_TIMEOUT_SECONDS + 5
 SBP_CASS_SCRIPT = Path(
     "/srv/skillbox/repos/skillbox-config/scripts/sbp_cass.py"
 )
+WIKI_TIMEOUT_SECONDS = 90
+WIKI_PROCESS_TIMEOUT_SECONDS = WIKI_TIMEOUT_SECONDS + 5
+SBP_WIKI_SCRIPT = Path(
+    "/srv/skillbox/repos/skillbox-config/scripts/sbp_wiki.py"
+)
 TAILSCALE_V4 = ipaddress.ip_network("100.64.0.0/10")
 TAILSCALE_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
 AMP_JWKS_URL = "https://ampcode.com/api/workload-identity/jwks.json"
@@ -62,7 +67,19 @@ MAX_TOKEN_TTL_SECONDS = 3600
 MAX_JWKS_BYTES = 1024 * 1024
 MAX_CASS_STDOUT_BYTES = 4 * 1024 * 1024
 MAX_CASS_STDERR_BYTES = 64 * 1024
-PROTECTED_PATH_PREFIXES = ("/v1/orb-kit", "/v1/cass/", "/v1/skill/")
+MAX_WIKI_STDOUT_BYTES = 4 * 1024 * 1024
+MAX_WIKI_STDERR_BYTES = 64 * 1024
+WIKI_PATH_PREFIX = "/v1/wiki/"
+WIKI_VAULT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+# A page slug is a bare page name, never a path: the wrapper joins it into a
+# filesystem path on the serving host, so `/` or a `..` segment would read
+# outside the vault. Same discipline as WIKI_VAULT_RE (anchored fullmatch,
+# alphanumeric first character, bounded length); the character class is wider
+# only because real page names contain spaces and punctuation.
+WIKI_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._,?()+-]{0,127}")
+WIKI_LOG_LIMIT_MIN = 1
+WIKI_LOG_LIMIT_MAX = 200
+PROTECTED_PATH_PREFIXES = ("/v1/orb-kit", "/v1/cass/", "/v1/skill/", "/v1/wiki/")
 ORB_KIT_FILES = (
     ("lib/sbp_client.py", Path("scripts/lib/sbp_client.py"), 0o644),
     ("runtime_manager/__init__.py", Path(".env-manager/runtime_manager/__init__.py"), 0o644),
@@ -82,7 +99,7 @@ ORB_KIT_README = (
     b"Run orb/join-tailnet.sh to join the Skillbox tailnet.\n"
     b'Export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" and '
     b'SBP_REMOTE="http://<skillbox-tailnet-ip>:8443".\n'
-    b"Run python3 lib/sbp_client.py cass status --json.\n"
+    b"Run python3 lib/sbp_client.py cass status --json (or wiki status --json).\n"
 )
 
 
@@ -359,7 +376,12 @@ def build_orb_kit(root_dir: Path = ROOT_DIR) -> bytes:
     return output.getvalue()
 
 
-def _json_from_process(stdout: str) -> Any:
+def _json_from_process(
+    stdout: str,
+    *,
+    error: str = "cass_invalid_response",
+    source: str = "sbp_cass.py",
+) -> Any:
     try:
         return json.loads(stdout)
     except json.JSONDecodeError as exc:
@@ -367,8 +389,8 @@ def _json_from_process(stdout: str) -> Any:
             HTTPStatus.BAD_GATEWAY,
             {
                 "ok": False,
-                "error": "cass_invalid_response",
-                "message": "sbp_cass.py did not return valid JSON",
+                "error": error,
+                "message": f"{source} did not return valid JSON",
             },
         ) from exc
 
@@ -498,6 +520,192 @@ def run_cass(command: str, *, query: str | None = None) -> Any:
             },
         )
     return payload
+
+
+def run_wiki(
+    command: str,
+    *,
+    query: str | None = None,
+    slug: str | None = None,
+    vault: str | None = None,
+    limit: int | None = None,
+) -> Any:
+    """Run one fixed read-only wiki command through the canonical front door.
+
+    Every caller-supplied value travels as its own argv item (never a shell
+    string), and positional values are fenced behind ``--`` so a value that
+    starts with a dash can never become a wrapper flag.
+    """
+    argv = [
+        sys.executable,
+        str(SBP_WIKI_SCRIPT),
+        command,
+        "--json",
+        "--timeout-seconds",
+        str(WIKI_TIMEOUT_SECONDS),
+    ]
+    if vault is not None:
+        argv += ["--vault", vault]
+
+    if command == "status":
+        pass
+    elif command == "search" and query:
+        argv += ["--", query]
+    elif command == "page" and slug:
+        argv += ["--", slug]
+    elif command == "log":
+        if limit is not None:
+            argv += ["--limit", str(limit)]
+    else:
+        raise ValueError(f"unsupported wiki command: {command}")
+
+    try:
+        completed = _run_bounded_process(
+            argv,
+            timeout=WIKI_PROCESS_TIMEOUT_SECONDS,
+            stdout_limit=MAX_WIKI_STDOUT_BYTES,
+            stderr_limit=MAX_WIKI_STDERR_BYTES,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ServiceError(
+            HTTPStatus.GATEWAY_TIMEOUT,
+            {
+                "ok": False,
+                "error": "wiki_timeout",
+                "message": f"Wiki request exceeded {WIKI_TIMEOUT_SECONDS}s",
+            },
+        ) from exc
+    except ProcessOutputLimitExceeded as exc:
+        raise ServiceError(
+            HTTPStatus.BAD_GATEWAY,
+            {
+                "ok": False,
+                "error": "wiki_response_too_large",
+                "message": f"Wiki {exc.stream} exceeded its size limit",
+            },
+        ) from exc
+    except OSError as exc:
+        raise ServiceError(
+            HTTPStatus.BAD_GATEWAY,
+            {
+                "ok": False,
+                "error": "wiki_unavailable",
+                "message": "Unable to execute sbp_wiki.py",
+            },
+        ) from exc
+
+    payload = _json_from_process(
+        completed.stdout,
+        error="wiki_invalid_response",
+        source="sbp_wiki.py",
+    )
+    if completed.returncode != 0:
+        raise ServiceError(
+            HTTPStatus.BAD_GATEWAY,
+            {
+                "ok": False,
+                "error": "wiki_failed",
+                "exit_code": completed.returncode,
+                "result": payload,
+                "stderr": completed.stderr.strip()[-2000:],
+            },
+        )
+    return payload
+
+
+def _wiki_bad_request(error: str, message: str) -> ServiceError:
+    return ServiceError(
+        HTTPStatus.BAD_REQUEST,
+        {"ok": False, "error": error, "message": message},
+    )
+
+
+def _wiki_required_param(
+    params: dict[str, list[str]],
+    name: str,
+    error: str,
+) -> str:
+    values = params.get(name, [])
+    value = values[0].strip() if len(values) == 1 else ""
+    if not value:
+        raise _wiki_bad_request(
+            error,
+            f"Exactly one non-empty {name} parameter is required",
+        )
+    return value
+
+
+def _wiki_vault_param(params: dict[str, list[str]]) -> str | None:
+    values = params.get("vault", [])
+    if not values:
+        return None
+    value = values[0].strip() if len(values) == 1 else ""
+    if not value or WIKI_VAULT_RE.fullmatch(value) is None:
+        raise _wiki_bad_request(
+            "invalid_vault",
+            "vault must be one registry wiki id",
+        )
+    return value
+
+
+def _wiki_slug_param(params: dict[str, list[str]]) -> str:
+    value = _wiki_required_param(params, "slug", "missing_slug")
+    if ".." in value or WIKI_SLUG_RE.fullmatch(value) is None:
+        raise _wiki_bad_request(
+            "invalid_slug",
+            "slug must be a bare page name (no '/', no '..', no leading dot)",
+        )
+    return value
+
+
+def _wiki_limit_param(params: dict[str, list[str]]) -> int | None:
+    values = params.get("limit", [])
+    if not values:
+        return None
+    value = values[0].strip() if len(values) == 1 else ""
+    if not value.isdigit():
+        raise _wiki_bad_request(
+            "invalid_limit",
+            f"limit must be an integer between {WIKI_LOG_LIMIT_MIN} and {WIKI_LOG_LIMIT_MAX}",
+        )
+    limit = int(value)
+    if not WIKI_LOG_LIMIT_MIN <= limit <= WIKI_LOG_LIMIT_MAX:
+        raise _wiki_bad_request(
+            "invalid_limit",
+            f"limit must be an integer between {WIKI_LOG_LIMIT_MIN} and {WIKI_LOG_LIMIT_MAX}",
+        )
+    return limit
+
+
+def wiki_route(path: str, query_string: str) -> Any:
+    """Map one GET /v1/wiki/* request onto a fixed read-only wiki command."""
+    params = parse_qs(query_string, keep_blank_values=True)
+    verb = path[len(WIKI_PATH_PREFIX) :]
+
+    if verb == "status":
+        return run_wiki("status", vault=_wiki_vault_param(params))
+    if verb == "search":
+        return run_wiki(
+            "search",
+            query=_wiki_required_param(params, "q", "missing_query"),
+            vault=_wiki_vault_param(params),
+        )
+    if verb == "page":
+        return run_wiki(
+            "page",
+            slug=_wiki_slug_param(params),
+            vault=_wiki_vault_param(params),
+        )
+    if verb == "log":
+        return run_wiki(
+            "log",
+            vault=_wiki_vault_param(params),
+            limit=_wiki_limit_param(params),
+        )
+    raise ServiceError(
+        HTTPStatus.NOT_FOUND,
+        {"ok": False, "error": "not_found", "path": path},
+    )
 
 
 def pull_skill_bundle(name: str) -> tuple[bytes, dict[str, Any]]:
@@ -692,6 +900,13 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return
                 self._send_json(HTTPStatus.OK, run_cass("search", query=query))
+                return
+
+            if request.path.startswith(WIKI_PATH_PREFIX):
+                self._send_json(
+                    HTTPStatus.OK,
+                    wiki_route(request.path, request.query),
+                )
                 return
 
             prefix = "/v1/skill/pull/"

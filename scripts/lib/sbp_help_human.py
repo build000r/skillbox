@@ -138,6 +138,7 @@ def atlas(w: str) -> list[Group]:
             Cmd(f"{w} launch DIR... --request '...'", "launch one Swimmers agent per dir (alias: bulk)", ("mut", "dry", "json")),
             Cmd(f"{w} oracle \"question\"", "ask GPT-5 Pro; answer on stdout (--model instant while iterating)", ("remote",)),
             Cmd(f"{w} cass status|search|rebuild|doctor", "remote Cass front door; rebuild is coordinated maintenance", ("remote", "json")),
+            Cmd(f"{w} wiki status|search|page|log|list|raw", "read-only central wiki front door; never writes", ("remote", "json")),
             Cmd(f"{w} send-later list|doctor|new|panes", "schedule/inspect delayed or recurring tmux/NTM sends", ("json",)),
             Cmd(f"{w} safe [SECONDS]", "swarm load GO/NO-GO tick; exit 0=GO 1=NO-GO", ("json",)),
             Cmd(f"{w} cron status|apply", "declared crontab + script links from skillbox-config", ("mut",)),

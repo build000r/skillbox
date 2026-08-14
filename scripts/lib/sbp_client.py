@@ -25,6 +25,10 @@ from typing import BinaryIO
 DEFAULT_TIMEOUT_SECONDS = 90.0
 TOKEN_TIMEOUT_SECONDS = 10.0
 MAX_CASS_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_WIKI_RESPONSE_BYTES = 4 * 1024 * 1024
+WIKI_VERBS = ("status", "search", "page", "log")
+WIKI_LOG_LIMIT_MIN = 1
+WIKI_LOG_LIMIT_MAX = 200
 MAX_SKILL_BUNDLE_BYTES = 16 * 1024 * 1024
 MAX_SKILL_LOCK_BYTES = 128 * 1024
 AMP_ISSUER = "https://ampcode.com/api/workload-identity"
@@ -156,6 +160,98 @@ def _cass_url(remote: str, args: Sequence[str]) -> str:
         return f"{base}/v1/cass/search?{urllib.parse.urlencode({'q': query})}"
 
     raise ValueError(f"remote cass v1 does not support {verb!r}")
+
+
+def _wiki_options(
+    verb: str,
+    args: Sequence[str],
+    allowed: Sequence[str],
+) -> tuple[dict[str, str], list[str]]:
+    """Split one remote wiki verb's argv into allowed options and positionals."""
+    supported = ", ".join(f"--{name}" for name in allowed) if allowed else "--json only"
+    options: dict[str, str] = {}
+    positional: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg.startswith("--"):
+            name, separator, value = arg[2:].partition("=")
+            if name not in allowed:
+                raise ValueError(
+                    f"remote wiki {verb} v1 does not support --{name} "
+                    f"(supported: {supported})"
+                )
+            if not separator:
+                index += 1
+                if index >= len(args):
+                    raise ValueError(f"remote wiki {verb} --{name} requires a value")
+                value = args[index]
+            if name in options:
+                raise ValueError(f"remote wiki {verb} accepts one --{name}")
+            if not value.strip():
+                raise ValueError(f"remote wiki {verb} --{name} requires a value")
+            options[name] = value.strip()
+        elif arg.startswith("-") and arg != "-":
+            raise ValueError(
+                f"remote wiki {verb} v1 does not support {arg!r} "
+                f"(supported: {supported})"
+            )
+        else:
+            positional.append(arg)
+        index += 1
+    return options, positional
+
+
+def _wiki_url(remote: str, args: Sequence[str]) -> str:
+    normalized_args = [arg for arg in args if arg != "--json"]
+    if not normalized_args:
+        raise ValueError(f"wiki requires one of: {', '.join(WIKI_VERBS)}")
+
+    verb, *verb_args = normalized_args
+    base = remote.rstrip("/")
+    if verb not in WIKI_VERBS:
+        raise ValueError(
+            f"remote wiki v1 does not support {verb!r} "
+            f"(supported verbs: {', '.join(WIKI_VERBS)})"
+        )
+
+    # Every wiki verb — status included — scopes to one registered vault.
+    allowed = ("vault",)
+    if verb == "log":
+        allowed = ("vault", "limit")
+    options, positional = _wiki_options(verb, verb_args, allowed)
+    query: dict[str, str] = {}
+
+    if verb == "status":
+        if positional:
+            raise ValueError("remote wiki status only supports --json and --vault")
+    elif verb == "search":
+        if not positional:
+            raise ValueError("remote wiki search requires a query")
+        query["q"] = " ".join(positional)
+    elif verb == "page":
+        if len(positional) != 1:
+            raise ValueError("remote wiki page requires exactly one slug")
+        query["slug"] = positional[0]
+    else:
+        if positional:
+            raise ValueError("remote wiki log does not take positional arguments")
+        limit = options.pop("limit", None)
+        if limit is not None:
+            if not limit.isdigit() or not (
+                WIKI_LOG_LIMIT_MIN <= int(limit) <= WIKI_LOG_LIMIT_MAX
+            ):
+                raise ValueError(
+                    "remote wiki log --limit must be an integer between "
+                    f"{WIKI_LOG_LIMIT_MIN} and {WIKI_LOG_LIMIT_MAX}"
+                )
+            query["limit"] = limit
+
+    vault = options.pop("vault", None)
+    if vault is not None:
+        query["vault"] = vault
+    suffix = f"?{urllib.parse.urlencode(query)}" if query else ""
+    return f"{base}/v1/wiki/{verb}{suffix}"
 
 
 def _jwt_claims(token: str, audience: str) -> dict[str, object]:
@@ -322,6 +418,51 @@ def run_remote_cass(
         return 1
     except urllib.error.HTTPError as exc:
         body = exc.read(MAX_CASS_RESPONSE_BYTES + 1)
+        if body:
+            output.write(body)
+        else:
+            print(f"sbp remote: HTTP {exc.code} from {exc.url}", file=errors)
+        return 1
+    except (OSError, urllib.error.URLError) as exc:
+        print(f"sbp remote: request failed: {exc}", file=errors)
+        return 1
+
+
+def run_remote_wiki(
+    remote: str,
+    args: Sequence[str],
+    *,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    opener: Callable[..., object] = _NO_REDIRECT_OPEN,
+    stdout: BinaryIO | None = None,
+    stderr: object | None = None,
+    token_minter: Callable[[str, str], str] | None = None,
+) -> int:
+    """Run one remote wiki read and copy the server envelope byte-for-byte."""
+    output = stdout if stdout is not None else sys.stdout.buffer
+    errors = stderr if stderr is not None else sys.stderr
+    try:
+        remote = _canonical_remote(remote)
+        url = _wiki_url(remote, args)
+    except ValueError as exc:
+        print(f"sbp remote: {exc}", file=errors)
+        return 2
+    try:
+        response, _claims = _open_authenticated(
+            remote,
+            url,
+            "application/json",
+            timeout=timeout,
+            opener=opener,
+            token_minter=token_minter,
+        )
+        output.write(_read_bounded(response, MAX_WIKI_RESPONSE_BYTES, "Wiki response"))
+        return 0
+    except (TypeError, ValueError) as exc:
+        print(f"sbp remote: {exc}", file=errors)
+        return 1
+    except urllib.error.HTTPError as exc:
+        body = exc.read(MAX_WIKI_RESPONSE_BYTES + 1)
         if body:
             output.write(body)
         else:
@@ -755,7 +896,7 @@ def main(
 ) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--remote")
-    parser.add_argument("command", choices=("cass", "skill"))
+    parser.add_argument("command", choices=("cass", "skill", "wiki"))
     parser.add_argument("args", nargs=argparse.REMAINDER)
     parsed = parser.parse_args(argv)
     env = os.environ if environ is None else environ
@@ -764,6 +905,8 @@ def main(
         parser.error("--remote or SBP_REMOTE is required")
     if parsed.command == "cass":
         return run_remote_cass(remote, parsed.args)
+    if parsed.command == "wiki":
+        return run_remote_wiki(remote, parsed.args)
     return run_remote_skill_pull(remote, parsed.args)
 
 
