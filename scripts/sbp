@@ -1729,8 +1729,16 @@ PY
         GCM_INTERACTIVE=never \
         SSH_ASKPASS_REQUIRE=never \
         python3 "${repo_atlas_cli}" "${repo_atlas_args[@]}"
-    )
-    exit $?
+    ) || repo_atlas_rc=$?
+    repo_atlas_rc="${repo_atlas_rc:-0}"
+    if [[ ${repo_atlas_rc} -ne 0 ]]; then
+      # The engine's error envelope can be message-less (error.kind only).
+      # Teach the next step on stderr; stdout stays the engine's JSON.
+      echo "${wrapper_name} repo: Repo Atlas engine exited ${repo_atlas_rc}." >&2
+      echo "diagnose: ${wrapper_name} doctor --format json  (repo_atlas_front_door gate)" >&2
+      echo "known repair thread: bead skillbox-sbp-repo-atlas-repair-2gbo (br show skillbox-sbp-repo-atlas-repair-2gbo)" >&2
+    fi
+    exit ${repo_atlas_rc}
     ;;
   repo-registry)
     config_root="${SKILLBOX_CONFIG_ROOT:-${HOME}/repos/skillbox-config}"
