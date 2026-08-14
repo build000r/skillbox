@@ -1,8 +1,8 @@
 {
   "schema_version": "1.1.0",
   "tool_name": "skillbox",
-  "tool_repo": "/srv/skillbox/repos/opensource/skillbox",
-  "audit_workspace": "/srv/skillbox/repos/opensource/skillbox/agent_ergonomics_audit",
+  "tool_repo": "/Users/b/repos/opensource/skillbox",
+  "audit_workspace": "/Users/b/repos/opensource/skillbox/agent_ergonomics_audit",
   "rubric_version": "agent-ergonomics-and-intuitiveness-maximization-for-cli-tools@local-2026-06-25",
   "passes": [
     {
@@ -41,6 +41,42 @@
         "handoff": "audit/HANDOFF.md",
         "simulations_pre": "audit/agent_simulations/pre_pass_N/",
         "simulations_post": "audit/agent_simulations/post_pass_N/"
+      }
+    },
+    {
+      "pass": 2,
+      "started_at": "2026-08-14T10:15:00Z",
+      "completed_at": "2026-08-14T17:21:09Z",
+      "mode": "full",
+      "target_sha": "3b41382ca52aaa257a4f6ecb24b3ec2e49778575",
+      "end_sha": "4996a30f8a5fd0f1437f9d6ac9ab4cc3c3982b88",
+      "target_branch": "main",
+      "feature_branch": null,
+      "summary": {
+        "surfaces_inventoried": 56,
+        "surfaces_scored": 56,
+        "findings_total": 39,
+        "parity_gaps": 7,
+        "doctor_gaps": 8,
+        "recommendations_total": 11,
+        "recommendations_applied": 10,
+        "recommendations_deferred_to_beads": 1,
+        "extra_user_requested_changes": 1,
+        "substantive_commits": 11,
+        "dimensions_touched": 8,
+        "p0_findings": 1,
+        "p0_fixed": 1,
+        "ambition_bar_met": true,
+        "ambition_bar_self_prompt_run": false,
+        "fresh_eyes_rounds": "in-flight at manifest write; result recorded in HANDOFF/scorecard"
+      },
+      "artifacts": {
+        "partials": "audit/partial/pass2/",
+        "scorecard": "audit/scorecard_pass_2.md",
+        "applied_changes": "audit/applied_changes.jsonl",
+        "recommendations": "audit/recommendations.jsonl",
+        "handoff": "audit/HANDOFF.md",
+        "scope_decision": "audit/phase0_scope_decision.md"
       }
     }
   ],
