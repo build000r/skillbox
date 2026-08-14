@@ -795,7 +795,20 @@ payload = {
         {"name": "safe", "json": True, "safe_first_try": f"{wrapper} safe --json", "aliases": ["load-guard", "swarm-safe"], "notes": "One-shot load gate; pass SECONDS to watch (sbp safe 10). Exit 0=GO, 1=NO-GO."},
         {"name": "conference1", "json": True, "safe_first_try": f"{wrapper} conference1 status --json", "aliases": ["conf1", "tailnet"], "notes": "urls/status/helper are read-only; expose/remove require --yes; Funnel refused."},
         {"name": "recalibrate", "json": True, "safe_first_try": f"{wrapper} recalibrate --json"},
+        {"name": "doctor", "json": True, "safe_first_try": f"{wrapper} doctor --format json", "notes": "Doctor-family front door: structural gates + make doctor via runtime_doctor gate; JSON coverage field routes to sibling doctors."},
+        {"name": "beads", "json": False, "safe_first_try": f"{wrapper} beads status"},
+        {"name": "overlay", "json": True, "safe_first_try": f"{wrapper} overlay --json"},
+        {"name": "mmdx", "json": False, "safe_first_try": f"{wrapper} mmdx"},
+        {"name": "oracle", "json": False, "safe_first_try": f"{wrapper} oracle \"<question>\" --model instant", "notes": "Remote GPT-5 Pro call; --model instant while iterating so Pro usage is not spent on tests."},
+        {"name": "hire", "json": False, "safe_first_try": f"{wrapper} hire times --limit 3", "notes": "Remote availability read; hire book mutates (sends email, creates x402 hold)."},
     ],
+    "role": {
+        "canonical_front_door": True,
+        "notes": (
+            "The in-box MCP server is deprecated and frozen; this wrapper is the canonical curated "
+            f"agent surface. Full structured surface: python3 .env-manager/manage.py <command> --format json."
+        ),
+    },
     "agent_surfaces": {
         "capabilities": f"{wrapper} capabilities --json",
         "robot_docs": f"{wrapper} robot-docs guide",
@@ -835,6 +848,11 @@ PY
 print_robot_docs() {
   cat <<EOF
 Skillbox wrapper agent guide
+
+Role:
+  ${wrapper_name} is the CANONICAL agent front door for skillbox. The in-box
+  MCP server is deprecated and frozen; prefer this wrapper (curated surface)
+  or python3 .env-manager/manage.py <command> --format json (full surface).
 
 Primary entrypoint:
   ${wrapper_name} <command> [options]
@@ -1602,6 +1620,22 @@ case "${action}" in
     print_capabilities
     ;;
   robot-docs)
+    robot_docs_topic=""
+    for robot_docs_token in "${passthrough_args[@]}" "${services[@]}"; do
+      case "${robot_docs_token}" in
+        --*|json) ;;
+        *)
+          robot_docs_topic="${robot_docs_token}"
+          break
+          ;;
+      esac
+    done
+    if [[ -n "${robot_docs_topic}" && "${robot_docs_topic}" != "guide" ]]; then
+      echo "${wrapper_name}: unknown robot-docs topic '${robot_docs_topic}'" >&2
+      echo "available topics: guide" >&2
+      echo "Exact command: ${wrapper_name} robot-docs guide" >&2
+      exit 2
+    fi
     if [[ " ${passthrough_args[*]} " == *" --format json "* ]]; then
       python3 - "${wrapper_name}" "$(print_robot_docs)" <<'PY'
 from __future__ import annotations

@@ -25,7 +25,7 @@ SBP = ROOT_DIR / "scripts" / "sbp"
 
 # Surfaces that talk to remote systems (tailnet, devbox, browser); their
 # contract is asserted by their own suites, not a local smoke test.
-REMOTE_COMMANDS = {"cass", "oracle", "conference1"}
+REMOTE_COMMANDS = {"cass", "oracle", "conference1", "hire"}
 
 # Known-broken safe_first_try entries, each pinned to the bead tracking the
 # repair. Remove the row when the bead closes; the smoke test then guards it.

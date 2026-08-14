@@ -108,6 +108,7 @@ FIELD_NOTES: dict[str, dict[str, tuple[str, str]]] = {
         "skill_verbs": (CONTRACT, "Machine-readable skill decision-verb map; receipt-only resolve is outside this map."),
         "stdout_stderr_contract": (CONTRACT, "Where JSON and diagnostics are emitted."),
         "safety": (CONTRACT, "Dry-run and confirmation guidance for mutating commands."),
+        "role": (CONTRACT, "Canonical front-door declaration post MCP deprecation; canonical_front_door is stable."),
         "next_actions": (INFO, "Common first follow-up commands."),
     },
     "capabilities.skill_verb": {
@@ -244,6 +245,7 @@ FIELD_NOTES: dict[str, dict[str, tuple[str, str]]] = {
         "gates": (CONTRACT, "One row per gate in declaration order; see the gate field table."),
         "summary": (CONTRACT, "Gate counters + structure budget; structure_within_budget guards the <60s promise."),
         "exit_code": (CONTRACT, "1 iff any gate FAILed, else 0 (INCO never flips it)."),
+        "coverage": (CONTRACT, "Doctor-family routing: front_door, what this run includes, and symptom-keyed siblings_not_run."),
     },
     "doctor.gate": {
         "name": (CONTRACT, "Gate id (e.g. structure_invariants, mcp_parity, runtime_doctor)."),

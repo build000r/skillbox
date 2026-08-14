@@ -50,6 +50,7 @@ The wrapper discovery contract. Agents should start here to learn the stable com
 | `mode` | CONTRACT | Execution environment mode; exactly host for this wrapper contract. |
 | `next_actions` | info | Common first follow-up commands. |
 | `ok` | CONTRACT | True when the wrapper emitted a complete capabilities payload. |
+| `role` | CONTRACT | Canonical front-door declaration post MCP deprecation; canonical_front_door is stable. |
 | `safety` | CONTRACT | Dry-run and confirmation guidance for mutating commands. |
 | `skill_verbs` | CONTRACT | Machine-readable skill decision-verb map; receipt-only resolve is outside this map. |
 | `stdout_stderr_contract` | CONTRACT | Where JSON and diagnostics are emitted. |
@@ -253,6 +254,39 @@ The wrapper discovery contract. Agents should start here to learn the stable com
       "json": true,
       "name": "recalibrate",
       "safe_first_try": "sbp recalibrate --json"
+    },
+    {
+      "json": true,
+      "name": "doctor",
+      "notes": "Doctor-family front door: structural gates + make doctor via runtime_doctor gate; JSON coverage field routes to sibling doctors.",
+      "safe_first_try": "sbp doctor --format json"
+    },
+    {
+      "json": false,
+      "name": "beads",
+      "safe_first_try": "sbp beads status"
+    },
+    {
+      "json": true,
+      "name": "overlay",
+      "safe_first_try": "sbp overlay --json"
+    },
+    {
+      "json": false,
+      "name": "mmdx",
+      "safe_first_try": "sbp mmdx"
+    },
+    {
+      "json": false,
+      "name": "oracle",
+      "notes": "Remote GPT-5 Pro call; --model instant while iterating so Pro usage is not spent on tests.",
+      "safe_first_try": "sbp oracle \"<question>\" --model instant"
+    },
+    {
+      "json": false,
+      "name": "hire",
+      "notes": "Remote availability read; hire book mutates (sends email, creates x402 hold).",
+      "safe_first_try": "sbp hire times --limit 3"
     }
   ],
   "contract_version": "2026-05-11",
@@ -267,6 +301,10 @@ The wrapper discovery contract. Agents should start here to learn the stable com
     "sbp up <profile> <service> --dry-run --json"
   ],
   "ok": true,
+  "role": {
+    "canonical_front_door": true,
+    "notes": "The in-box MCP server is deprecated and frozen; this wrapper is the canonical curated agent surface. Full structured surface: python3 .env-manager/manage.py <command> --format json."
+  },
   "safety": {
     "confirm_with_user_before": [
       "sbp down <profile> <service>"
@@ -2279,6 +2317,7 @@ The structural verification front door. Runs every gate read-only and returns `{
 | `gates` | CONTRACT | One row per gate in declaration order; see the gate field table. |
 | `summary` | CONTRACT | Gate counters + structure budget; structure_within_budget guards the <60s promise. |
 | `exit_code` | CONTRACT | 1 iff any gate FAILed, else 0 (INCO never flips it). |
+| `coverage` | CONTRACT | Doctor-family routing: front_door, what this run includes, and symptom-keyed siblings_not_run. |
 
 #### `gates[]` (one gate outcome)
 
@@ -2298,6 +2337,35 @@ The structural verification front door. Runs every gate read-only and returns `{
 ```json
 {
   "config_root": null,
+  "coverage": {
+    "front_door": "sbp doctor",
+    "includes": [
+      "structural gates (this run)",
+      "make doctor via runtime_doctor gate (manifest/compose/skill-sync, embeds manage.py doctor)"
+    ],
+    "siblings_not_run": [
+      {
+        "doctor": "sbp registry doctor",
+        "symptom": "repos.yaml vs on-disk git estate drift"
+      },
+      {
+        "doctor": "sbp cass doctor",
+        "symptom": "remote Cass index health"
+      },
+      {
+        "doctor": "sbp send-later doctor",
+        "symptom": "scheduler tick/queue health"
+      },
+      {
+        "doctor": "sbp beads status",
+        "symptom": "beads db/jsonl health"
+      },
+      {
+        "doctor": "make self-test",
+        "symptom": "canonical CI gate on an exact SHA"
+      }
+    ]
+  },
   "cwd": "<RUNTIME_ROOT>/sample-repo",
   "exit_code": 1,
   "gates": [

@@ -65,6 +65,24 @@ class SbpWrapperContractTests(unittest.TestCase):
         self.assertIn("sbp recalibrate --json", payload["error"]["next_actions"])
         self.assertIn("fixes[].command", payload["error"]["next_actions"][1])
 
+    def test_robot_docs_rejects_unknown_topics(self) -> None:
+        # R-210/F-sbp-05: `robot-docs bogus` used to print the guide, exit 0.
+        result = _run_sbp("robot-docs", "bogus")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("unknown robot-docs topic 'bogus'", result.stderr)
+        self.assertIn("available topics: guide", result.stderr)
+
+    def test_capabilities_declares_front_door_role(self) -> None:
+        # R-210/F-sbp-08: post MCP-deprecation, sbp states its canonical role.
+        result = _run_sbp("capabilities", "--json")
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["role"]["canonical_front_door"])
+        self.assertIn("deprecated", payload["role"]["notes"])
+        names = {command["name"] for command in payload["commands"]}
+        for expected in ("doctor", "beads", "overlay", "mmdx", "oracle", "hire"):
+            self.assertIn(expected, names)
+
     def test_unknown_flags_are_rejected_with_did_you_mean(self) -> None:
         # R-204: unknown --flags used to fall into the service-token bucket and
         # get silently swallowed (`status --jsonn` ran in text mode, exit 0).
